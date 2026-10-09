@@ -3,6 +3,7 @@
 //! Reading a file is [`super::read`]. Everything that moves, makes or removes
 //! a path goes through here, so one place decides what is refused and says why.
 
+use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,8 @@ use thiserror::Error;
 /// What a name may not contain. A rename box takes a name, not a path: moving
 /// a file somewhere else is not something it should do by accident.
 const SEPARATORS: [char; 2] = ['/', '\\'];
+/// What a typed folder starts with to begin at the home directory.
+const HOME: char = '~';
 
 #[derive(Debug, Error)]
 pub enum OpsError {
@@ -24,6 +27,34 @@ pub enum OpsError {
     Exists(String),
     #[error("{name}: {source}")]
     Failed { name: String, source: io::Error },
+    #[error("Give the folder's whole path, starting at / or ~")]
+    NotAbsolute,
+    #[error("{0} is not a folder")]
+    NotFolder(String),
+}
+
+/// The folder of this machine `typed` names, resolved to the one path every
+/// other spelling of it shares. A leading `~` is the home directory. Anything
+/// else has to start at the root, since no one folder is the obvious place
+/// to read a relative path from.
+pub fn folder(typed: &str) -> Result<PathBuf, OpsError> {
+    let typed = typed.trim();
+    let path = match typed.strip_prefix(HOME).zip(env::home_dir()) {
+        Some((rest, home)) if rest.is_empty() || rest.starts_with(SEPARATORS) => {
+            home.join(rest.trim_start_matches(SEPARATORS))
+        }
+        _ => PathBuf::from(typed),
+    };
+    if !path.is_absolute() {
+        return Err(OpsError::NotAbsolute);
+    }
+    let folder = path
+        .canonicalize()
+        .map_err(|source| failed(typed, source))?;
+    match folder.is_dir() {
+        true => Ok(folder),
+        false => Err(OpsError::NotFolder(typed.to_owned())),
+    }
 }
 
 /// Renames `path` to `name`, beside whatever it was next to.
@@ -102,7 +133,8 @@ fn failed(name: &str, source: io::Error) -> OpsError {
 
 #[cfg(test)]
 mod tests {
-    use super::{OpsError, count_under, create_dir, create_file, delete, rename};
+    use super::{OpsError, count_under, create_dir, create_file, delete, folder, rename};
+    use std::env;
     use std::fs;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -115,6 +147,10 @@ mod tests {
     const NOT_MADE: &str = "the path the name asked for is not there";
     const STILL_THERE: &str = "the path is still on disk after being deleted";
     const ALLOWED: &str = "a name that cannot be used must be refused with a reason";
+    const NOT_RESOLVED: &str = "a folder must resolve to the one path every spelling shares";
+    const SUB: &str = "sub";
+    const ROUNDABOUT: &str = "sub/../sub/";
+    const MISSING: &str = "gone";
 
     fn project() -> TempDir {
         let dir = TempDir::new().expect("a temporary directory");
@@ -172,5 +208,45 @@ mod tests {
 
         assert!(!sub.exists(), "{STILL_THERE}");
         assert!(dir.path().join(ORIGINAL).exists(), "{STILL_THERE}");
+    }
+
+    #[test]
+    fn a_folder_resolves_to_its_one_true_path() {
+        let dir = project();
+        fs::create_dir(dir.path().join(SUB)).expect("a folder");
+        let typed = format!("  {}  ", dir.path().join(ROUNDABOUT).display());
+
+        let resolved = folder(&typed).expect("a folder");
+
+        let expected = dir.path().join(SUB).canonicalize().expect("a real path");
+        assert_eq!(resolved, expected, "{NOT_RESOLVED}");
+    }
+
+    #[test]
+    fn a_tilde_starts_at_the_home_directory() {
+        let Some(home) = env::home_dir().and_then(|home| home.canonicalize().ok()) else {
+            return;
+        };
+
+        assert_eq!(
+            folder("~").expect("the home folder"),
+            home,
+            "{NOT_RESOLVED}"
+        );
+    }
+
+    #[test_case("", false => matches OpsError::NotAbsolute ; "nothing typed")]
+    #[test_case(SUB, false => matches OpsError::NotAbsolute ; "a relative path has nowhere to start")]
+    #[test_case(ORIGINAL, true => matches OpsError::NotFolder(_) ; "a file is not a folder")]
+    #[test_case(MISSING, true => matches OpsError::Failed { .. } ; "a folder has to be there")]
+    fn a_folder_that_cannot_be_listed_is_refused(name: &str, absolute: bool) -> OpsError {
+        let dir = project();
+        fs::create_dir(dir.path().join(SUB)).expect("a folder");
+        let typed = match absolute {
+            true => dir.path().join(name),
+            false => name.into(),
+        };
+
+        folder(&typed.to_string_lossy()).expect_err(ALLOWED)
     }
 }

@@ -285,8 +285,14 @@ fn shared_id(checkout: &Checkout) -> String {
 /// `cwd` means a session started in a subdirectory shares the repository's
 /// scratch, which is the same reason [`project_root`] exists.
 pub fn project_scratch_dir(cwd: &Path) -> Result<PathBuf, std::io::Error> {
-    let root = crate::paths::scratch_root()?;
-    ensure_private_dir(&root.join(project_scratch_name(&project_root(cwd))))
+    crate::paths::scratch_root()?;
+    ensure_private_dir(&project_scratch_path(cwd)?)
+}
+
+/// Where [`project_scratch_dir`] keeps `cwd`'s scratch, resolved without
+/// creating anything, for a reader that only lists what is already there.
+pub fn project_scratch_path(cwd: &Path) -> Result<PathBuf, std::io::Error> {
+    Ok(crate::paths::scratch_root_path()?.join(project_scratch_name(&project_root(cwd))))
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -751,6 +757,19 @@ mod tests {
             scratch.parent(),
             Some(crate::paths::scratch_root().unwrap().as_path())
         );
+    }
+
+    #[test]
+    fn the_scratch_path_names_the_scratch_directory_without_making_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("unvisited");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let path = project_scratch_path(&cwd).unwrap();
+
+        assert!(!path.exists());
+        assert_eq!(project_scratch_dir(&cwd).unwrap(), path);
+        std::fs::remove_dir(&path).unwrap();
     }
 
     /// Scratch keeps the readable prefix and drops the hash, so it names the

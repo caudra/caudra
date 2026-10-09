@@ -440,7 +440,11 @@ pub fn cache_dir_path() -> Result<PathBuf, std::io::Error> {
 /// Resolving this fixes the temp root for the process, which is why the redirect
 /// that points `TMPDIR` inside it must call this before setting the variable.
 pub fn scratch_root() -> Result<PathBuf, std::io::Error> {
-    ensure_private_dir(&resolve().map_err(err)?.scratch)
+    ensure_private_dir(&scratch_root_path()?)
+}
+
+pub fn scratch_root_path() -> Result<PathBuf, std::io::Error> {
+    Ok(resolve().map_err(err)?.scratch.clone())
 }
 
 /// The single directory name every platform root is namespaced by, including

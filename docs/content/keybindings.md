@@ -283,7 +283,9 @@ Some pickers add extra bindings on top of the defaults:
 | Decisions | `y` | Copy the selected decision as JSON, or the visible section |
 | Decisions | `Ctrl+R` | Read the decision log again |
 | Workbench Explorer | `Ctrl+X h` | Show hidden files |
-| Workbench Explorer | `C` | Fold the tree back to its top level |
+| Workbench Explorer | `C` | Fold the section the cursor is in back to its top level |
+| Workbench Explorer | `Ctrl+X ↑` / `Ctrl+X ↓` | Shrink / grow the section the cursor is in |
+| Workbench Explorer | `Ctrl+X d` | Add a folder of this machine to the explorer |
 | Workbench Editor | `Ctrl+S` | Save the active file |
 | Workbench Editor | `Ctrl+R` | Discard edits and take what is on disk |
 | Workbench Editor | `Ctrl+F` / `Ctrl+G` | Find in file / go to line |

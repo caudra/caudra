@@ -1677,7 +1677,17 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single(wb::COLLAPSE_ALL.label),
-        description: "Fold the tree back to its top level",
+        description: "Fold the section the cursor is in back to its top level",
+        context: KeybindContext::WorkbenchExplorer,
+    },
+    Keybind {
+        label: KeyLabel::Alt(wb::SHRINK_SECTION.label, wb::GROW_SECTION.label),
+        description: "Shrink / grow the section the cursor is in",
+        context: KeybindContext::WorkbenchExplorer,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::ADD_FOLDER.label),
+        description: "Add a folder of this machine to the explorer",
         context: KeybindContext::WorkbenchExplorer,
     },
     Keybind {

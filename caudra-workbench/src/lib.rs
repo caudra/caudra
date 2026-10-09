@@ -9,6 +9,7 @@
 mod action;
 mod chrome;
 mod editor;
+mod explorer;
 mod fs;
 pub mod keys;
 mod menu;
@@ -31,6 +32,7 @@ pub use fs::backend::{
     WorkspaceFilesystem,
 };
 pub use fs::read::LocalSourceError;
+pub use fs::tree::HostMount;
 pub use pointer::Clicks;
 pub use style::WorkbenchStyles;
 use unicode_width::UnicodeWidthStr;
@@ -52,9 +54,10 @@ use editor::Editor;
 use editor::Tab;
 use editor::buffer::Cursor;
 use editor::text_field::{EditCommand, FieldKind, TextCommand, TextField, TextKey, decode};
+use explorer::{Explorer, ExplorerSection};
 use fs::ops;
 use fs::tree::Tree;
-use fs::watch::Watch;
+use fs::watch::{HostWatch, Watch};
 use menu::{Action as MenuAction, Menu, Target};
 use quick_open::QuickOpen;
 use scm::backend::{
@@ -95,6 +98,7 @@ const CANCEL_LABEL: &str = "Cancel";
 const RENAME_PROMPT: &str = "Rename: ";
 const NEW_FILE_PROMPT: &str = "New file: ";
 const NEW_FOLDER_PROMPT: &str = "New folder: ";
+const ADD_FOLDER_PROMPT: &str = "Add folder: ";
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 const WATCH_WARNING: &str = "Remote live updates are unavailable; manual refresh still works";
 const LISTING_INCOMPLETE: &str =
@@ -108,6 +112,8 @@ const SCM_SYNTHETIC_ROOT: &str = ".caudra-scm";
 const DOCUMENT_ROOT: &str = ".caudra-document";
 /// Every document is Markdown, which is what earns it a rendered view.
 const DOCUMENT_EXTENSION: &str = "md";
+const HOST_FILE_UNMENTIONABLE: &str =
+    "Files on this machine cannot be mentioned in a workspace session";
 const RENDERED_READ_ONLY: &str = "The rendered view is read-only";
 const NO_RENDERED_VIEW: &str = "Only a Markdown file has a rendered view";
 /// Chords that land the caret somewhere in the text. The rendered view has no
@@ -168,6 +174,12 @@ pub struct Layout {
     /// Whether the editor breaks long lines onto more rows instead of panning.
     pub wrap: bool,
     pub scm: ScmLayout,
+    /// The explorer's sections in stacking order, zipped back like the source
+    /// control ones.
+    pub explorer: Vec<SectionLayout>,
+    /// Folders of this machine added to the explorer, in the order they were
+    /// added. One that has gone is kept, and listed again once it is back.
+    pub folders: Vec<PathBuf>,
 }
 
 /// How the source control pane was arranged. The sections are a list rather
@@ -201,6 +213,8 @@ impl Default for Layout {
             show_hidden: false,
             wrap: false,
             scm: ScmLayout::default(),
+            explorer: explorer::default_frames().to_vec(),
+            folders: Vec::new(),
         }
     }
 }
@@ -256,6 +270,9 @@ struct PaneRects {
     /// Where the source control sections landed, in stacking order. Empty in
     /// every other view.
     sections: [SectionRect; Section::COUNT],
+    /// Where the explorer's sections landed, each body already less its
+    /// scrollbar. Empty in every other view, and for a section not shown.
+    explorer: [SectionRect; ExplorerSection::COUNT],
 }
 
 /// One band of the source control pane. The header is always drawn; the body
@@ -385,6 +402,25 @@ enum InputKind {
     Rename,
     NewFile,
     NewFolder,
+    /// A folder of this machine to list beside the project, typed as a path.
+    AddFolder,
+}
+
+/// A path a confirmed delete removes. A workspace path goes with the revision
+/// it was listed at, so the workspace refuses it if it moved in the meantime.
+#[derive(Debug, Clone)]
+enum DeleteTarget {
+    Local(PathBuf),
+    Remote(ResourceEntry),
+}
+
+impl DeleteTarget {
+    fn path(&self) -> WorkbenchPath {
+        match self {
+            Self::Local(path) => WorkbenchPath::Local(path.clone()),
+            Self::Remote(entry) => entry.path.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,6 +444,7 @@ impl InputKind {
             Self::Rename => RENAME_PROMPT,
             Self::NewFile => NEW_FILE_PROMPT,
             Self::NewFolder => NEW_FOLDER_PROMPT,
+            Self::AddFolder => ADD_FOLDER_PROMPT,
         }
     }
 }
@@ -422,20 +459,28 @@ enum Drag {
     Text,
     /// Resizing the border above this section's header, which doubles as the
     /// section's own fold handle when the pointer never moves.
-    Section(usize),
+    Section(Stack, usize),
     /// A press the context menu took. The release finishes nothing, so it must
     /// not be read as the end of a selection.
     Menu,
 }
 
-/// Which bar a grab is holding. The sidebar's three views share one, because
-/// only one of them is ever drawn.
+/// Which pane a stack of sections belongs to, since both stack them alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stack {
+    Scm,
+    Explorer,
+}
+
+/// Which bar a grab is holding. Search shares the sidebar's, because only one
+/// list fills the sidebar there; the stacked panes have one per section.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Bar {
     Sidebar,
     Palette,
     Text,
     Section(Section),
+    Explorer(ExplorerSection),
 }
 
 #[derive(Default)]
@@ -444,6 +489,7 @@ struct Bars {
     palette: Scrollbar,
     text: Scrollbar,
     sections: [Scrollbar; Section::COUNT],
+    explorer: [Scrollbar; ExplorerSection::COUNT],
 }
 
 impl Bars {
@@ -453,6 +499,7 @@ impl Bars {
             Bar::Palette => &mut self.palette,
             Bar::Text => &mut self.text,
             Bar::Section(section) => &mut self.sections[section.index()],
+            Bar::Explorer(section) => &mut self.explorer[section.index()],
         }
     }
 }
@@ -492,7 +539,10 @@ pub struct Workbench {
     /// One per bar drawn, so a grab knows which pane it is holding and a drag
     /// survives the pointer wandering out of that pane's column.
     bars: Bars,
+    /// The project's own tree, which everything bound to the session reads.
     tree: Tree,
+    /// The sections stacked under the project, and where the cursor is.
+    explorer: Explorer,
     editor: Editor,
     palette: QuickOpen,
     scm: Scm,
@@ -510,10 +560,16 @@ pub struct Workbench {
     /// lists what it changed. Only a workspace session ever sets it; a local
     /// repository answers the same question in the same breath.
     pending_commit_detail: Option<String>,
-    delete_target: Option<ResourceEntry>,
+    /// What the delete question standing over everything is about, held from
+    /// the moment it is asked so nothing that moves underneath the dialog can
+    /// change what a yes removes.
+    delete_target: Option<DeleteTarget>,
     /// Started when the workbench opens and dropped when it closes, so a tree
     /// nobody is looking at costs no kernel handles.
     watch: Option<Watch>,
+    /// The watch over this machine's folders outside the project, kept on
+    /// the same terms as the project's own and in every kind of session.
+    host_watch: Option<HostWatch>,
     /// Files that changed on disk while the workbench was open, which in
     /// practice is what Caudra wrote underneath it.
     touched: HashSet<PathBuf>,
@@ -579,6 +635,7 @@ impl Workbench {
             panes: PaneRects::default(),
             bars: Bars::default(),
             tree: Tree::default(),
+            explorer: Explorer::default(),
             editor: Editor::default(),
             palette: QuickOpen::default(),
             scm: Scm::default(),
@@ -595,6 +652,7 @@ impl Workbench {
             pending_commit_detail: None,
             delete_target: None,
             watch: None,
+            host_watch: None,
             touched: HashSet::new(),
             drag: Drag::None,
             drag_at: (0, 0),
@@ -675,6 +733,7 @@ impl Workbench {
             tab.remote_reload = false;
         }
         self.watch = None;
+        self.host_watch = None;
         // A clean document says nothing the host does not already hold, and
         // left open it would go stale behind the next change to the host's copy.
         self.editor
@@ -771,12 +830,24 @@ impl Workbench {
             self.bind_workspace(session)?;
         }
         self.open = true;
+        self.watch_host();
         if let Some(driver) = &mut self.remote_backend {
             driver.open_watch();
             let request = driver.list(driver.root().clone(), true);
             self.remote_pending.insert(request);
         }
+        self.refresh_host_tabs();
         Ok(())
+    }
+
+    /// Catches up the tabs on files of this machine in a workspace session,
+    /// which no workspace watch or listing ever reports on.
+    fn refresh_host_tabs(&mut self) {
+        for tab in self.editor.tabs_mut() {
+            if tab.path.local().is_some() && tab.refresh_if_changed().is_err() {
+                tab.conflict = true;
+            }
+        }
     }
 
     pub fn bind_local(&mut self) {
@@ -832,6 +903,7 @@ impl Workbench {
         let watch_ms = lap();
         self.apply_marks();
         self.open = true;
+        self.watch_host();
         tracing::info!(
             reused,
             tree_ms,
@@ -855,22 +927,53 @@ impl Workbench {
     /// Opens `path` in the editor, selecting `lines` when given. This is what a
     /// click on an `@path:L12-L20` mention lands on, so it opens the workbench
     /// if it was closed rather than requiring two gestures.
+    ///
+    /// A relative path names a project file. In a workspace session an
+    /// absolute one is a file of this machine, which is never the workspace's
+    /// to serve, so it opens here without disturbing the binding.
     pub fn open_at(&mut self, root: &Path, path: &Path, lines: Option<RangeInclusive<usize>>) {
-        if self.remote_backend.is_some() {
-            match caudra_workspace::WorkspacePath::new(path.to_string_lossy().into_owned()) {
-                Ok(path) => self.open_remote_at(path, lines),
-                Err(error) => self.flash = Some(error.to_string()),
+        let path = match &self.remote_backend {
+            Some(_) if path.is_absolute() => {
+                self.open = true;
+                self.watch_host();
+                WorkbenchPath::Local(path.to_path_buf())
+            }
+            Some(_) => {
+                match caudra_workspace::WorkspacePath::new(path.to_string_lossy().into_owned()) {
+                    Ok(path) => WorkbenchPath::Remote(path),
+                    Err(error) => {
+                        self.flash = Some(error.to_string());
+                        return;
+                    }
+                }
+            }
+            None => {
+                if !self.open || self.root != root {
+                    self.open(root);
+                }
+                // A mention names a path relative to the project, and the tree
+                // only reveals what it can strip its own root from.
+                WorkbenchPath::Local(self.root.join(path))
+            }
+        };
+        self.open_file(&path, lines);
+    }
+
+    /// Opens `path` in the workbench the host has already put up, selecting
+    /// `lines` when given, and points the explorer at it. Where the path lives
+    /// decides how it is read, so a file of this machine opened in a
+    /// workspace session never reaches the workspace.
+    pub fn open_file(&mut self, path: &WorkbenchPath, lines: Option<RangeInclusive<usize>>) {
+        let WorkbenchPath::Local(local) = path else {
+            if let Some(remote) = path.remote() {
+                self.open_remote_at(remote.clone(), lines);
             }
             return;
-        }
-        if !self.open || self.root != root {
-            self.open(root);
-        }
-        // A mention names a path relative to the project, and the tree only
-        // reveals what it can strip its own root from.
-        self.open_path(&self.root.join(path));
+        };
+        self.open_path(local);
         self.show_explorer();
-        let Some(tab) = self.editor.active_mut() else {
+        self.reveal_in_explorer(path, true);
+        let Some(tab) = self.editor.active_mut().filter(|tab| &tab.path == path) else {
             return;
         };
         match lines {
@@ -895,37 +998,13 @@ impl Workbench {
             return;
         }
         self.open = true;
+        self.watch_host();
         let path = WorkbenchPath::Remote(path);
         self.open_workbench_path(&path, OpenPurpose::Open);
         if let Some(lines) = lines {
             self.pending_lines.insert(path.clone(), lines);
         }
         self.show_explorer();
-    }
-
-    /// Opens a file the host keeps for itself, such as the plan, under a name
-    /// that says what it is. Unlike a mention it leaves the cursor where the
-    /// reader last had it and the sidebar on whatever it was showing, because
-    /// coming back to the plan is picking up where the reading stopped.
-    ///
-    /// A workbench on a remote workspace refuses rather than flashing, because
-    /// it stays closed and a closed workbench says nothing until it next opens.
-    pub fn open_labelled(
-        &mut self,
-        root: &Path,
-        path: &Path,
-        label: TabLabel,
-    ) -> Result<(), BackendError> {
-        if self.remote_backend.is_some() {
-            return Err(BackendError::WrongBackend);
-        }
-        if !self.open || self.root != root {
-            self.open(root);
-        }
-        self.open_path(path);
-        self.editor
-            .label(&WorkbenchPath::Local(path.to_path_buf()), label);
-        Ok(())
     }
 
     /// Rereads the tabs on files something wrote where the watch cannot see,
@@ -1110,10 +1189,11 @@ impl Workbench {
         let remote = self.drain_remote_backend();
         let remote_scm = self.drain_remote_scm();
         let watched = self.absorb_changes();
+        let host_watched = self.absorb_host_changes();
         let searched = self.search.tick();
         let scrolled = self.edge_scroll();
         (
-            remote || remote_scm || watched || searched || scrolled,
+            remote || remote_scm || watched || host_watched || searched || scrolled,
             self.flash.take(),
         )
     }
@@ -1165,7 +1245,10 @@ impl Workbench {
     }
 
     fn drain_remote_backend(&mut self) -> bool {
-        let visible = self.sidebar_rows().max(1);
+        let visible = (self.panes.explorer[ExplorerSection::Project.index()]
+            .body
+            .height as usize)
+            .max(1);
         let Some(backend) = &mut self.remote_backend else {
             return false;
         };
@@ -1356,13 +1439,18 @@ impl Workbench {
                     self.remote_pending.remove(&request);
                     let path = self.pending_count.remove(&request);
                     match (path, result) {
-                        (Some(path), Ok(count)) => {
-                            self.delete_target = self.mutation_resource(&path);
-                            self.confirm = Some(Confirm {
-                                ask: Ask::Delete(count),
-                                choice: Choice::Cancel,
-                            });
-                        }
+                        (Some(path), Ok(count)) => match self.mutation_resource(&path) {
+                            Some(entry) => {
+                                self.delete_target = Some(DeleteTarget::Remote(entry));
+                                self.confirm = Some(Confirm {
+                                    ask: Ask::Delete(count),
+                                    choice: Choice::Cancel,
+                                });
+                            }
+                            None => {
+                                self.flash = Some(BackendError::MissingRevision.to_string());
+                            }
+                        },
                         (Some(_), Err(error)) => self.flash = Some(error.to_string()),
                         (None, _) => {}
                     }
@@ -1786,6 +1874,8 @@ impl Workbench {
                     .map(|(height, collapsed)| SectionLayout { height, collapsed })
                     .collect(),
             },
+            explorer: self.explorer.saved(),
+            folders: self.explorer.folder_roots(),
         }
     }
 
@@ -1803,6 +1893,9 @@ impl Workbench {
         self.show_hidden = layout.show_hidden;
         self.wrap = layout.wrap;
         self.tree.set_show_hidden(self.show_hidden);
+        self.explorer.set_show_hidden(self.show_hidden);
+        self.explorer.restore(&layout.explorer);
+        self.explorer.set_folders(layout.folders);
         let sections: Vec<(u16, bool)> = layout
             .scm
             .sections
@@ -2009,11 +2102,18 @@ impl Workbench {
         if let Some(offset) = taken(self.bars.sidebar.handle(event)) {
             if let Some(offset) = offset {
                 let rows = self.panes.rows.height as usize;
-                match self.sidebar {
-                    SidebarView::Explorer => self.tree.set_scroll(offset as usize, rows),
-                    SidebarView::Search => self.search.set_scroll(offset as usize, rows),
-                    SidebarView::SourceControl | SidebarView::Transfer => {}
-                }
+                self.search.set_scroll(offset as usize, rows);
+            }
+            return Some(WorkbenchAction::Consumed);
+        }
+        let explored = ExplorerSection::ALL.into_iter().find_map(|section| {
+            taken(self.bars.explorer[section.index()].handle(event)).map(|offset| (section, offset))
+        });
+        if let Some((section, offset)) = explored {
+            if let Some(offset) = offset {
+                let rows = self.panes.explorer[section.index()].body.height as usize;
+                self.section_tree_mut(section)
+                    .set_scroll(offset as usize, rows);
             }
             return Some(WorkbenchAction::Consumed);
         }
@@ -2061,10 +2161,22 @@ impl Workbench {
             .sidebar
             .is_some_and(|rect| rect.contains(at.into()))
         {
-            let rows = self.sidebar_rows();
             match self.sidebar {
-                SidebarView::Explorer => self.tree.scroll_by(delta, rows),
-                SidebarView::Search => self.search.scroll_by(delta, rows),
+                SidebarView::Explorer => {
+                    // A lone project fills the pane, so the wheel anywhere on
+                    // it scrolls it; stacked, it answers to the section under
+                    // the pointer, as source control's does.
+                    let project = ExplorerSection::Project;
+                    let hit = self.explorer_body_at_row(row).or_else(|| {
+                        (!self.explorer.is_stacked())
+                            .then(|| (project, self.panes.explorer[project.index()].body))
+                    });
+                    if let Some((section, body)) = hit {
+                        self.section_tree_mut(section)
+                            .scroll_by(delta, body.height as usize);
+                    }
+                }
+                SidebarView::Search => self.search.scroll_by(delta, self.sidebar_rows()),
                 SidebarView::SourceControl | SidebarView::Transfer => {}
             }
         } else if self.panes.text.contains(at.into()) {
@@ -2172,16 +2284,13 @@ impl Workbench {
         if self.sidebar == SidebarView::SourceControl && self.press_scm(at) {
             return WorkbenchAction::Consumed;
         }
-        if self.panes.rows.contains(position) {
-            // Only the explorer paints a handle there. Search results keep
-            // their leftmost columns for the path, so a press on them is a
-            // press on the result.
-            if self.sidebar == SidebarView::Explorer && view::on_menu_mark(at.0, self.panes.rows.x)
-            {
-                self.open_menu_at(at);
-            } else {
-                self.press_row((at.1 - self.panes.rows.y) as usize, clicks);
-            }
+        if self.sidebar == SidebarView::Explorer
+            && let Some(action) = self.press_explorer(at, clicks)
+        {
+            return action;
+        }
+        if self.sidebar == SidebarView::Search && self.panes.rows.contains(position) {
+            self.press_result((at.1 - self.panes.rows.y) as usize);
             return WorkbenchAction::Consumed;
         }
         if self.panes.text.contains(position) {
@@ -2240,18 +2349,9 @@ impl Workbench {
                 .map(|tab| Menu::for_tab(tab, hit.index, at, self.renders(tab)));
             return;
         }
-        if self.sidebar != SidebarView::Explorer || !self.panes.rows.contains(position) {
-            return;
+        if self.sidebar == SidebarView::Explorer {
+            self.explorer_menu_at(at);
         }
-        let row = self.tree.scroll() + (at.1 - self.panes.rows.y) as usize;
-        self.tree.select_index(row);
-        // Selecting refuses a row past the end, so the air under a short tree
-        // opens nothing rather than a menu for whatever was last selected.
-        if self.tree.selected_index() != row {
-            return;
-        }
-        self.focus = Focus::Sidebar;
-        self.menu = self.tree.selected().map(|row| Menu::for_row(row, at));
     }
 
     /// The menu for wherever the cursor already is, which is how the keyboard
@@ -2262,15 +2362,7 @@ impl Workbench {
             return;
         }
         match self.focus {
-            Focus::Sidebar if self.sidebar == SidebarView::Explorer => {
-                let rows = self.panes.rows;
-                let offset = self
-                    .tree
-                    .selected_index()
-                    .saturating_sub(self.tree.scroll());
-                let at = (rows.x, rows.y + offset as u16);
-                self.menu = self.tree.selected().map(|row| Menu::for_row(row, at));
-            }
+            Focus::Sidebar if self.sidebar == SidebarView::Explorer => self.explorer_menu(),
             Focus::Editor => {
                 let index = self.editor.active_index();
                 let at = (self.panes.tabs.x, self.panes.tabs.y);
@@ -2323,12 +2415,13 @@ impl Workbench {
         match target {
             Target::Row(path) => self.run_on_row(action, path.clone()),
             Target::Tab(index) => self.run_on_tab(action, *index),
+            Target::Header => self.run_on_header(action),
         }
     }
 
     fn run_on_row(&mut self, action: MenuAction, path: WorkbenchPath) -> WorkbenchAction {
         match action {
-            MenuAction::Open => self.open_workbench_path(&path, OpenPurpose::Open),
+            MenuAction::Open => return self.open_row(&path, false),
             MenuAction::CopyPath => return self.copy(path.display().to_string()),
             MenuAction::CopyRelative => {
                 return self.copy(self.relative_path(&path));
@@ -2337,16 +2430,27 @@ impl Workbench {
             MenuAction::Rename => self.ask_for_name(InputKind::Rename, path),
             MenuAction::NewFile => self.ask_for_name(InputKind::NewFile, self.holder(&path)),
             MenuAction::NewFolder => self.ask_for_name(InputKind::NewFolder, self.holder(&path)),
-            MenuAction::Delete => {
-                if let Some(backend) = &mut self.remote_backend {
+            MenuAction::Delete => match path {
+                WorkbenchPath::Local(local) => {
+                    self.confirm = Some(Confirm {
+                        ask: Ask::Delete(ops::count_under(&local)),
+                        choice: Choice::Cancel,
+                    });
+                    self.delete_target = Some(DeleteTarget::Local(local));
+                }
+                WorkbenchPath::Remote(_) => {
+                    let Some(backend) = &mut self.remote_backend else {
+                        self.flash = Some(BackendError::WrongBackend.to_string());
+                        return WorkbenchAction::Consumed;
+                    };
                     let request = backend.count(path.clone());
                     self.remote_pending.insert(request);
                     self.pending_count.insert(request, path);
-                } else if let Some(path) = path.local() {
-                    self.confirm = Some(Confirm {
-                        ask: Ask::Delete(ops::count_under(path)),
-                        choice: Choice::Cancel,
-                    });
+                }
+            },
+            MenuAction::RemoveFolder => {
+                if let WorkbenchPath::Local(root) = &path {
+                    self.remove_folder(root);
                 }
             }
             // Every other action belongs to the tab menu, which no row opens.
@@ -2388,12 +2492,8 @@ impl Workbench {
         let Some(input) = self.input.clone() else {
             return;
         };
-        if self.remote_backend.is_some() {
+        let WorkbenchPath::Local(at) = &input.at else {
             self.commit_remote_input(input);
-            return;
-        }
-        let Some(at) = input.at.local() else {
-            self.flash = Some(BackendError::WrongBackend.to_string());
             return;
         };
         let name = input.value.text();
@@ -2403,8 +2503,9 @@ impl Workbench {
                 self.open_path(&path);
             }),
             InputKind::NewFolder => ops::create_dir(at, &name).map(|path| {
-                self.tree.reveal(&path);
+                self.reveal_in_explorer(&WorkbenchPath::Local(path), true);
             }),
+            InputKind::AddFolder => self.add_folder(&name),
         };
         match done {
             Ok(()) => {
@@ -2423,7 +2524,9 @@ impl Workbench {
                 .parent()
                 .unwrap_or_else(|| self.backend_root())
                 .join(&name),
-            InputKind::NewFile | InputKind::NewFolder => input.at.join(&name),
+            InputKind::NewFile | InputKind::NewFolder | InputKind::AddFolder => {
+                input.at.join(&name)
+            }
         };
         let destination = match destination {
             Ok(path) => path,
@@ -2434,6 +2537,7 @@ impl Workbench {
         };
         let entry = self.mutation_resource(&input.at);
         let Some(backend) = &mut self.remote_backend else {
+            self.flash = Some(BackendError::WrongBackend.to_string());
             return;
         };
         let request = match input.kind {
@@ -2446,6 +2550,9 @@ impl Workbench {
             }
             InputKind::NewFile => backend.create_file(destination),
             InputKind::NewFolder => backend.create_dir(destination),
+            // A folder to add is asked about this machine, so it never gets
+            // here.
+            InputKind::AddFolder => return,
         };
         self.remote_pending.insert(request);
         if input.kind != InputKind::Rename {
@@ -2460,15 +2567,18 @@ impl Workbench {
         let moved = ops::rename(path, name)?;
         self.editor.rename(path, &moved, self.theme_generation);
         self.tree.reload();
-        self.tree.reveal(&moved);
+        self.explorer.reload();
+        self.reveal_in_explorer(&WorkbenchPath::Local(moved), true);
         Ok(())
     }
 
-    /// Reads the project again after the workbench itself changed it. The
-    /// watcher would catch up on its own, and waiting for it leaves the tree
-    /// showing a path that is no longer there.
+    /// Reads the project and this machine's own folders again after the
+    /// workbench itself changed one. The watchers would catch up on their
+    /// own, and waiting for them leaves a tree showing a path that is no
+    /// longer there.
     fn reread(&mut self) {
         self.tree.reload();
+        self.explorer.reload();
         self.scm.refresh();
         self.palette.invalidate();
         self.apply_marks();
@@ -2498,7 +2608,7 @@ impl Workbench {
             MenuAction::RevealInExplorer => {
                 self.show_explorer();
                 self.focus = Focus::Sidebar;
-                self.tree.reveal_workbench_path(&path);
+                self.reveal_in_explorer(&path, true);
             }
             MenuAction::CopyPath => return self.copy(path.display().to_string()),
             MenuAction::CopyRelative => {
@@ -2573,7 +2683,7 @@ impl Workbench {
             }
             // Armed rather than acted on: the same press starts a resize, and
             // only the release can tell the two apart.
-            self.drag = Drag::Section(index);
+            self.drag = Drag::Section(Stack::Scm, index);
             return true;
         }
         let Some((section, body)) = self.section_under(at) else {
@@ -2685,38 +2795,14 @@ impl Workbench {
             .map(|index| (Section::ALL[index], self.panes.sections[index].body))
     }
 
-    /// A press on the sidebar's list, which does whatever `Enter` would have
-    /// done to the row under it. One click on a file only previews it: the
-    /// tab stays until the next single click takes it over, so walking a tree
-    /// leaves no trail of tabs behind. Two clicks keep it.
-    fn press_row(&mut self, offset: usize, clicks: u8) {
+    /// A press on a search result, which opens it. Search results keep their
+    /// leftmost columns for the path, so there is no menu handle to miss.
+    fn press_result(&mut self, offset: usize) {
         self.focus = Focus::Sidebar;
-        match self.sidebar {
-            SidebarView::Explorer => {
-                let row = self.tree.scroll() + offset;
-                self.tree.select_index(row);
-                // Selecting refuses a row past the end, so the empty space
-                // under a short list opens nothing rather than whatever the
-                // cursor happened to be left on.
-                if self.tree.selected_index() != row {
-                    return;
-                }
-                match self.tree.selected().is_some_and(fs::tree::Row::is_dir) {
-                    true => drop(self.tree.toggle_selected()),
-                    false if clicks == 1 => self.preview_selected(),
-                    false => self.open_selected(),
-                }
-            }
-            // Source control routes through `press_scm`: its rows belong to a
-            // section rather than to one list filling the sidebar.
-            SidebarView::SourceControl | SidebarView::Transfer => {}
-            SidebarView::Search => {
-                let row = self.search.scroll() + offset;
-                self.search.select_index(row);
-                if self.search.selected_index() == row {
-                    self.open_search_selection();
-                }
-            }
+        let row = self.search.scroll() + offset;
+        self.search.select_index(row);
+        if self.search.selected_index() == row {
+            self.open_search_selection();
         }
     }
 
@@ -2820,9 +2906,9 @@ impl Workbench {
                 self.drag_at = at;
                 self.extend_to(at);
             }
-            Drag::Section(index) => {
+            Drag::Section(stack, index) => {
                 self.drag_at = at;
-                self.drag_border(index, at.1);
+                self.drag_border(stack, index, at.1);
             }
             // A drag takes the menu down before it reaches here, so a press it
             // took has nothing left to follow.
@@ -2833,16 +2919,21 @@ impl Workbench {
     /// Moves the border above section `index` to `row`, by resizing the nearest
     /// open section above it. Whatever flexes below takes up the difference,
     /// so one border only ever moves one section's own height.
-    fn drag_border(&mut self, index: usize, row: u16) {
-        let Some(above) = (0..index)
-            .rev()
-            .find(|above| self.panes.sections[*above].body.height > 0)
-        else {
+    fn drag_border(&mut self, stack: Stack, index: usize, row: u16) {
+        let rects: &[SectionRect] = match stack {
+            Stack::Scm => &self.panes.sections,
+            Stack::Explorer => &self.panes.explorer,
+        };
+        let Some(above) = (0..index).rev().find(|above| rects[*above].body.height > 0) else {
             return;
         };
-        let top = self.panes.sections[above].body.y;
-        self.scm
-            .set_height(Section::ALL[above], row.saturating_sub(top));
+        let height = row.saturating_sub(rects[above].body.y);
+        match stack {
+            Stack::Scm => self.scm.set_height(Section::ALL[above], height),
+            Stack::Explorer => self
+                .explorer
+                .set_height(ExplorerSection::ALL[above], height),
+        }
     }
 
     /// The button came back up. A press that never moved was a click, which is
@@ -2853,10 +2944,13 @@ impl Workbench {
     /// while it is open, so the terminal underneath can no longer copy a
     /// selection the way it would from the transcript.
     fn release(&mut self) -> Option<String> {
-        if let Drag::Section(index) = self.drag
+        if let Drag::Section(stack, index) = self.drag
             && self.drag_at == self.drag_from
         {
-            self.scm.toggle_collapsed(Section::ALL[index]);
+            match stack {
+                Stack::Scm => self.scm.toggle_collapsed(Section::ALL[index]),
+                Stack::Explorer => self.explorer.toggle_collapsed(ExplorerSection::ALL[index]),
+            }
         }
         let held = self.drag;
         self.drag = Drag::None;
@@ -3049,6 +3143,7 @@ impl Workbench {
                 // longer lists and be closed.
                 self.invalidate_remote(None);
                 self.refresh_remote_tree();
+                self.refresh_host_tabs();
             } else {
                 self.tree.reload();
                 self.scm.refresh();
@@ -3136,6 +3231,7 @@ impl Workbench {
         if keys::TOGGLE_HIDDEN.matches(key) {
             self.show_hidden = !self.show_hidden;
             self.tree.set_show_hidden(self.show_hidden);
+            self.explorer.set_show_hidden(self.show_hidden);
             // The walk the palette cached was taken under the old answer, so
             // it would go on offering hidden files after they were turned off.
             self.palette.invalidate();
@@ -3160,7 +3256,8 @@ impl Workbench {
             && match self.sidebar {
                 SidebarView::SourceControl => self.scm_leader(key),
                 SidebarView::Search => self.search_leader(key),
-                SidebarView::Explorer | SidebarView::Transfer => false,
+                SidebarView::Explorer => self.explorer_leader(key),
+                SidebarView::Transfer => false,
             };
         match claimed {
             true => WorkbenchAction::Consumed,
@@ -3255,9 +3352,9 @@ impl Workbench {
             if let Some(document) = self.editor.active()?.document.clone() {
                 return Some(WorkbenchAction::RevertDocument(document));
             }
-            if self.remote_backend.is_some() {
-                let path = self.editor.active()?.path.clone();
-                self.request_remote_path(path, OpenPurpose::Discard);
+            let path = self.editor.active()?.path.clone();
+            if path.remote().is_some() {
+                self.open_workbench_path(&path, OpenPurpose::Discard);
                 return Some(WorkbenchAction::Consumed);
             }
             let outcome = self.editor.active_mut()?.discard_and_reload();
@@ -3546,31 +3643,12 @@ impl Workbench {
             return WorkbenchAction::Consumed;
         }
         match self.sidebar {
-            SidebarView::Explorer => self.explorer_key(key),
+            SidebarView::Explorer => return self.explorer_key(key),
             SidebarView::SourceControl => self.source_control_key(key),
             SidebarView::Search => return self.search_key(key),
             SidebarView::Transfer => return self.transfer.key(key),
         }
         WorkbenchAction::Consumed
-    }
-
-    fn explorer_key(&mut self, key: KeyEvent) {
-        if keys::COLLAPSE_ALL.matches(key) {
-            self.tree.collapse_all();
-            return;
-        }
-        let page = self.sidebar_rows().max(1) as isize;
-        match key.code {
-            KeyCode::Up => self.tree.move_selection(-1),
-            KeyCode::Down => self.tree.move_selection(1),
-            KeyCode::PageUp => self.tree.move_selection(-page),
-            KeyCode::PageDown => self.tree.move_selection(page),
-            KeyCode::Home => self.tree.select_first(),
-            KeyCode::End => self.tree.select_last(),
-            KeyCode::Left => self.tree.collapse_or_parent(),
-            KeyCode::Right | KeyCode::Enter => self.enter_selected(),
-            _ => {}
-        }
     }
 
     fn source_control_key(&mut self, key: KeyEvent) {
@@ -4144,14 +4222,6 @@ impl Workbench {
         self.tree.set_agent_touched(&self.touched);
     }
 
-    /// Right and Enter mean the same thing on a row: step into the directory,
-    /// or open the file.
-    fn enter_selected(&mut self) {
-        if !self.tree.toggle_selected() {
-            self.open_selected();
-        }
-    }
-
     fn editor_key(&mut self, key: KeyEvent) -> WorkbenchAction {
         let rows = self.panes.text.height as usize;
         let Some(tab) = self.editor.active_mut() else {
@@ -4197,53 +4267,27 @@ impl Workbench {
         }
     }
 
-    fn open_selected(&mut self) {
-        let Some(path) = self.tree.selected().map(|row| row.path.clone()) else {
-            return;
-        };
-        self.open_workbench_path(&path, OpenPurpose::Open);
-    }
-
-    /// Puts the selected file up without leaving the tree, which is what one
-    /// click does. The cursor stays in the sidebar so the next arrow key walks
-    /// on from where it was.
-    fn preview_selected(&mut self) {
-        let Some(path) = self.tree.selected().map(|row| row.path.clone()) else {
-            return;
-        };
-        if self.remote_backend.is_some() {
-            self.open_workbench_path(&path, OpenPurpose::Preview);
-            return;
-        }
-        let Some(path) = path.local() else {
-            self.flash = Some(BackendError::WrongBackend.to_string());
-            return;
-        };
-        match self.editor.preview(path, self.theme_generation) {
-            Ok(()) => {
-                // The tree is already on this row, but source control is not.
-                self.reveal_active();
-                self.follow_cursor();
-            }
-            Err(error) => self.flash = Some(error.to_string()),
-        }
-    }
-
     fn open_path(&mut self, path: &Path) {
         self.open_workbench_path(&WorkbenchPath::Local(path.to_path_buf()), OpenPurpose::Open);
     }
 
+    /// Goes where the path itself lives rather than where the session does: a
+    /// remote session still keeps files of this machine, such as the plan or a
+    /// workflow, and those read and write here.
     fn open_workbench_path(&mut self, path: &WorkbenchPath, purpose: OpenPurpose) {
-        if self.remote_backend.is_some() {
-            if matches!(purpose, OpenPurpose::Open | OpenPurpose::Preview) {
-                self.cancel_pending_opens();
+        let path = match path {
+            WorkbenchPath::Remote(_) if self.remote_backend.is_none() => {
+                self.flash = Some(BackendError::WrongBackend.to_string());
+                return;
             }
-            self.request_remote_path(path.clone(), purpose);
-            return;
-        }
-        let Some(path) = path.local() else {
-            self.flash = Some(BackendError::WrongBackend.to_string());
-            return;
+            WorkbenchPath::Remote(_) => {
+                if matches!(purpose, OpenPurpose::Open | OpenPurpose::Preview) {
+                    self.cancel_pending_opens();
+                }
+                self.request_remote_path(path.clone(), purpose);
+                return;
+            }
+            WorkbenchPath::Local(path) => path,
         };
         let started = Instant::now();
         let mut phase_start = started;
@@ -4286,34 +4330,27 @@ impl Workbench {
         WorkbenchAction::Consumed
     }
 
-    /// The path is the tree's own selection, which the menu landed on before
-    /// it opened and the dialog has held still ever since.
     fn resolve_delete(&mut self, choice: Choice) {
+        let target = self.delete_target.take();
         if choice != Choice::Discard {
-            self.delete_target = None;
             return;
         }
-        if let Some(entry) = self.delete_target.take() {
-            let entry = self.mutation_resource(&entry.path).unwrap_or(entry);
-            if let Some(backend) = &mut self.remote_backend {
-                let request = backend.delete(entry);
-                self.remote_pending.insert(request);
+        match target {
+            Some(DeleteTarget::Remote(entry)) => {
+                let entry = self.mutation_resource(&entry.path).unwrap_or(entry);
+                if let Some(backend) = &mut self.remote_backend {
+                    let request = backend.delete(entry);
+                    self.remote_pending.insert(request);
+                }
             }
-            return;
-        }
-        let Some(path) = self.tree.selected().map(|row| row.path.clone()) else {
-            return;
-        };
-        let Some(local) = path.local() else {
-            self.flash = Some(BackendError::WrongBackend.to_string());
-            return;
-        };
-        match ops::delete(local) {
-            Ok(()) => {
-                self.close_tabs_under(&path);
-                self.reread();
-            }
-            Err(error) => self.flash = Some(error.to_string()),
+            Some(DeleteTarget::Local(local)) => match ops::delete(&local) {
+                Ok(()) => {
+                    self.close_tabs_under(&WorkbenchPath::Local(local));
+                    self.reread();
+                }
+                Err(error) => self.flash = Some(error.to_string()),
+            },
+            None => {}
         }
     }
 
@@ -4411,7 +4448,7 @@ impl Workbench {
     /// click on a `#hash` in the transcript lands. A commit the graph is not
     /// showing says so rather than opening the pane on something else.
     pub fn open_at_commit(&mut self, root: &Path, id: &str) {
-        if !self.open || self.root != root {
+        if self.remote_backend.is_none() && (!self.open || self.root != root) {
             self.open(root);
         }
         self.sidebar = SidebarView::SourceControl;
@@ -4433,7 +4470,7 @@ impl Workbench {
         let Some(path) = self.editor.active().map(|tab| tab.path.clone()) else {
             return;
         };
-        self.tree.reveal_workbench_path(&path);
+        self.reveal_in_explorer(&path, false);
         // Change paths are relative to the repository, which is not the
         // workbench root when the workbench was opened below it.
         let relative = path.local().and_then(|path| {
@@ -4495,12 +4532,16 @@ impl Workbench {
     }
 
     /// How a path leaves for the composer, which is the same wherever the path
-    /// came from.
+    /// came from. A workspace session's agent resolves every path against the
+    /// workspace, so a file of this machine would name the wrong file or none.
     fn mention(
         &self,
         path: &WorkbenchPath,
         lines: Option<RangeInclusive<usize>>,
     ) -> WorkbenchAction {
+        if self.is_host_file(path) {
+            return WorkbenchAction::Flash(HOST_FILE_UNMENTIONABLE.to_owned());
+        }
         WorkbenchAction::SendToComposer {
             path: match path {
                 WorkbenchPath::Local(path) => {
@@ -4523,14 +4564,11 @@ impl Workbench {
             }
             let path = match self.sidebar {
                 SidebarView::SourceControl => {
-                    return Some(self.mention(
-                        &WorkbenchPath::Local(self.scm.selected_change()?.path.clone()),
-                        None,
-                    ));
+                    WorkbenchPath::Local(self.scm.selected_change()?.path.clone())
                 }
-                _ => &self.tree.selected()?.path,
+                _ => self.explorer_selection()?,
             };
-            return Some(self.mention(path, None));
+            return Some(self.mention(&path, None));
         }
         let tab = self.editor.active()?;
         if let Some(action) = hand_back(tab, true) {
@@ -4565,11 +4603,30 @@ impl Workbench {
             .collect()
     }
 
+    /// Whether `path` is a real file of this machine in a workspace session.
+    /// The tabs such a session synthesises from the repository carry relative
+    /// local names, and those stay the workspace's.
+    fn is_host_file(&self, path: &WorkbenchPath) -> bool {
+        self.remote_backend.is_some() && path.local().is_some_and(Path::is_absolute)
+    }
+
     fn relative<'a>(&'a self, path: &'a Path) -> &'a Path {
         path.strip_prefix(&self.root).unwrap_or(path)
     }
 
+    /// A path as the pane listing it would spell it: from the project root,
+    /// or from the mount a file of this machine is listed under.
     fn relative_path(&self, path: &WorkbenchPath) -> String {
+        if let Some(local) = path.local()
+            && !self.tree.contains(path)
+            && let Some(mount) = self.explorer.mount_of(local)
+        {
+            return local
+                .strip_prefix(&mount.root)
+                .unwrap_or(local)
+                .display()
+                .to_string();
+        }
         path.display_relative(&self.backend_root())
     }
 
@@ -4603,7 +4660,10 @@ impl Workbench {
     }
 
     fn sidebar_rows(&self) -> usize {
-        self.panes.rows.height as usize
+        match self.sidebar {
+            SidebarView::Explorer => self.explorer_rows(),
+            _ => self.panes.rows.height as usize,
+        }
     }
 
     /// The rows a page key moves by in the source control pane, which is the
@@ -4620,7 +4680,7 @@ impl Workbench {
     /// What the sidebar header's button does for the view that painted it.
     fn press_header_button(&mut self) {
         match self.sidebar {
-            SidebarView::Explorer => self.tree.collapse_all(),
+            SidebarView::Explorer => self.section_tree_mut(self.explorer.active()).collapse_all(),
             SidebarView::SourceControl => self.scm.toggle_flat(),
             SidebarView::Search | SidebarView::Transfer => {}
         }
@@ -4693,28 +4753,30 @@ fn layout(area: Rect, sidebar_width: u16, collapsed: bool) -> PaneRects {
     }
 }
 
-/// Stacks the source control sections into `area`.
+/// Stacks sections into `area`, each asking for a height and whether it is
+/// folded. A `None` section is not shown at all and gets empty rects.
 ///
-/// Every section keeps its header, so three rows are spoken for before any
-/// body is drawn. Each expanded section then takes the height it asked for,
-/// except the last one, which takes whatever is left: that leaves exactly one
-/// section absorbing a terminal resize, so the others keep the size they were
-/// dragged to.
-fn layout_sections(
+/// Every shown section keeps its header, so those rows are spoken for before
+/// any body is drawn. Each expanded section then takes the height it asked
+/// for, except the last one, which takes whatever is left: that leaves exactly
+/// one section absorbing a terminal resize, so the others keep the size they
+/// were dragged to.
+fn layout_sections<const N: usize>(
     area: Rect,
-    wanted: [(u16, bool); Section::COUNT],
-) -> [SectionRect; Section::COUNT] {
-    let mut rects = [SectionRect::default(); Section::COUNT];
-    let headers = SECTION_HEADER_ROWS * Section::COUNT as u16;
+    wanted: [Option<(u16, bool)>; N],
+) -> [SectionRect; N] {
+    let mut rects = [SectionRect::default(); N];
+    let open = |want: &Option<(u16, bool)>| want.is_some_and(|(_, collapsed)| !collapsed);
+    let headers = SECTION_HEADER_ROWS * wanted.iter().flatten().count() as u16;
     let mut room = area.height.saturating_sub(headers);
-    let last_open = wanted
-        .iter()
-        .rposition(|(_, collapsed)| !collapsed)
-        .unwrap_or_default();
+    let last_open = wanted.iter().rposition(open).unwrap_or_default();
 
     let mut y = area.y;
-    for (index, (height, collapsed)) in wanted.into_iter().enumerate() {
-        // A frame too short for three headers draws the ones that fit and
+    for (index, want) in wanted.into_iter().enumerate() {
+        let Some((height, collapsed)) = want else {
+            continue;
+        };
+        // A frame too short for every header draws the ones that fit and
         // stops, rather than wrapping a section off the bottom of the pane.
         if y >= area.bottom() {
             break;
@@ -4728,10 +4790,7 @@ fn layout_sections(
         if collapsed || room == 0 {
             continue;
         }
-        let below = wanted[index + 1..]
-            .iter()
-            .filter(|(_, collapsed)| !collapsed)
-            .count() as u16;
+        let below = wanted[index + 1..].iter().filter(|want| open(want)).count() as u16;
         let body = match index == last_open {
             true => room,
             false => height.clamp(
@@ -4756,11 +4815,12 @@ fn layout_sections(
 mod tests {
     use super::{
         Ask, Choice, Confirm, Cursor, DEFAULT_SIDEBAR_WIDTH, DISCARD_LABEL, DocumentKey, Drag,
-        EDGE_SCROLL_LINES, Focus, Input, InputKind, Layout, LocalSourceError, MAX_SIDEBAR_WIDTH,
-        MIN_EDITOR_WIDTH, MIN_SECTION_ROWS, MIN_SIDEBAR_WIDTH, MenuAction, NEW_FILE_PROMPT,
-        NO_RENDERED_VIEW, PaintedMarkdown, RENDERED_READ_ONLY, SCROLL_COLUMNS, SCROLL_LINES,
-        ScmLayout, Section, SidebarView, Tab, TabLabel, Target, Toggle, Workbench, WorkbenchAction,
-        WorkbenchPath, WorkbenchStyles, keys, layout, layout_sections, scm,
+        EDGE_SCROLL_LINES, ExplorerSection, Focus, HOST_FILE_UNMENTIONABLE, Input, InputKind,
+        Layout, LocalSourceError, MAX_SIDEBAR_WIDTH, MIN_EDITOR_WIDTH, MIN_SECTION_ROWS,
+        MIN_SIDEBAR_WIDTH, MenuAction, NEW_FILE_PROMPT, NO_RENDERED_VIEW, PaintedMarkdown,
+        RENDERED_READ_ONLY, SCROLL_COLUMNS, SCROLL_LINES, ScmLayout, Section, SectionRect,
+        SidebarView, Tab, TabLabel, Target, Toggle, Workbench, WorkbenchAction, WorkbenchPath,
+        WorkbenchStyles, keys, layout, layout_sections, scm,
     };
     use crate::chrome::ELLIPSIS;
     use crate::editor::{VisualRow, buffer::Buffer, render};
@@ -4810,6 +4870,17 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     const CLOSED_START: &str = "a fresh workbench must not be on screen";
+    const HOST_FILE: &str = "host.md";
+    const HOST_TEXT: &str = "kept on this machine\n";
+    const HOST_REPLACEMENT: &str = "rewritten on this machine\n";
+    const HOST_MADE: &str = "made.md";
+    const HOST_RENAMED: &str = "renamed.md";
+    const HOST_COMMIT: &str = "abc1234";
+    const HOST_BINDING_DROPPED: &str = "a file of this machine dropped the workspace binding";
+    const HOST_ASKED_REMOTELY: &str = "a file of this machine was asked of the workspace";
+    const HOST_NOT_OPENED: &str = "the file of this machine did not open";
+    const HOST_NOT_WRITTEN: &str = "the file of this machine was not written there";
+    const HOST_TAB_STALE: &str = "the tab on a file of this machine did not catch up";
     const WORKSPACE_CHANGE_BLOCKED: &str = "an idle clean workbench must allow workspace changes";
     const WORKSPACE_CHANGE_UNGUARDED: &str =
         "unsaved buffers and outstanding operations must block workspace changes";
@@ -5040,7 +5111,6 @@ mod tests {
     const LABEL_SHARED: &str = "the name the host gave one tab is still on another";
     const CURSOR_MOVED: &str = "coming back to a labelled tab moved the reader";
     const SIDEBAR_MOVED: &str = "coming back to a labelled tab switched the sidebar";
-    const LOCAL_OPEN: &str = "a local workbench opens a local file";
     const MARKDOWN_FILE: &str = "notes.md";
     /// The first line of [`INDEXED_TEXT`].
     const FIRST_LINE: &str = "one";
@@ -5076,13 +5146,13 @@ mod tests {
         "a clean document is still showing what the host has moved on from";
     const NOT_ASKED_BACK: &str = "reverting a document must ask the host for its copy";
 
-    fn key(code: KeyCode) -> KeyEvent {
+    pub(crate) fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
     /// A key event for `bind`. For a leader bind that is only its second half,
     /// which is what [`Workbench::handle_leader`] expects.
-    fn press(bind: keys::Bind) -> KeyEvent {
+    pub(crate) fn press(bind: keys::Bind) -> KeyEvent {
         KeyEvent::new(bind.code, bind.modifiers)
     }
 
@@ -5102,11 +5172,11 @@ mod tests {
         }
     }
 
-    fn click(column: u16, row: u16) -> MouseEvent {
+    pub(crate) fn click(column: u16, row: u16) -> MouseEvent {
         mouse(MouseEventKind::Down(MouseButton::Left), column, row)
     }
 
-    fn wheel(column: u16, row: u16) -> MouseEvent {
+    pub(crate) fn wheel(column: u16, row: u16) -> MouseEvent {
         mouse(MouseEventKind::ScrollDown, column, row)
     }
 
@@ -5122,11 +5192,11 @@ mod tests {
         mouse(MouseEventKind::Moved, column, row)
     }
 
-    fn drag(column: u16, row: u16) -> MouseEvent {
+    pub(crate) fn drag(column: u16, row: u16) -> MouseEvent {
         mouse(MouseEventKind::Drag(MouseButton::Left), column, row)
     }
 
-    fn release(column: u16, row: u16) -> MouseEvent {
+    pub(crate) fn release(column: u16, row: u16) -> MouseEvent {
         mouse(MouseEventKind::Up(MouseButton::Left), column, row)
     }
 
@@ -5198,9 +5268,20 @@ mod tests {
         workbench.handle_key(key(KeyCode::Char(EDIT)));
     }
 
+    /// The rows of whichever list the sidebar showed in the last frame: the
+    /// project's tree in the explorer, the results in search.
+    pub(crate) fn list_rows(workbench: &Workbench) -> Rect {
+        match workbench.sidebar {
+            SidebarView::Explorer => {
+                workbench.panes.explorer[ExplorerSection::Project.index()].body
+            }
+            _ => workbench.panes.rows,
+        }
+    }
+
     /// Paints one frame, which is also what fills in the pane geometry the
     /// mouse tests measure themselves against.
-    fn paint(workbench: &mut Workbench, width: u16, height: u16) -> Surface {
+    pub(crate) fn paint(workbench: &mut Workbench, width: u16, height: u16) -> Surface {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test terminal");
         terminal
             .draw(|frame| workbench.view(frame, frame.area()))
@@ -5224,7 +5305,7 @@ mod tests {
 
     /// A column that is the row itself rather than the handle at its margin,
     /// found the same way the pointer tells the two apart.
-    fn row_body(rows: Rect) -> u16 {
+    pub(crate) fn row_body(rows: Rect) -> u16 {
         (rows.x..rows.right())
             .find(|column| !on_menu_mark(*column, rows.x))
             .expect("a column past the handle")
@@ -5269,7 +5350,7 @@ mod tests {
 
     /// A root holding `a.txt` and `sub/b.txt`. Directories sort first, so the
     /// cursor starts on `sub`.
-    fn project() -> (TempDir, Workbench) {
+    pub(crate) fn project() -> (TempDir, Workbench) {
         let dir = TempDir::new().expect("a temporary directory");
         fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").expect("a file");
         fs::create_dir(dir.path().join("sub")).expect("a directory");
@@ -5841,7 +5922,7 @@ mod tests {
     fn one_click_previews_a_file_and_the_next_takes_its_tab() {
         let (_dir, mut workbench) = project();
         paint(&mut workbench, 80, 24);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
         let body = row_body(rows);
         workbench.handle_mouse(click(body, rows.y));
         workbench.handle_mouse(click(body, rows.y + 1));
@@ -5857,7 +5938,7 @@ mod tests {
     fn a_second_click_keeps_the_tab_the_first_borrowed() {
         let (_dir, mut workbench) = project();
         paint(&mut workbench, 80, 24);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
         let body = row_body(rows);
         workbench.handle_mouse(click(body, rows.y + 1));
         workbench.handle_mouse(click(body, rows.y + 1));
@@ -5872,7 +5953,7 @@ mod tests {
     fn typing_in_a_preview_keeps_the_tab_it_was_shown_in() {
         let (_dir, mut workbench) = project();
         paint(&mut workbench, 80, 24);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
         let body = row_body(rows);
         workbench.handle_mouse(click(body, rows.y + 1));
         workbench.handle_key(key(KeyCode::Tab));
@@ -6936,7 +7017,7 @@ mod tests {
         dir
     }
 
-    fn tick_until(
+    pub(crate) fn tick_until(
         workbench: &mut Workbench,
         ready: impl Fn(&Workbench, bool) -> bool,
         failure: &str,
@@ -7782,7 +7863,7 @@ mod tests {
     #[test]
     fn every_section_keeps_its_header_and_the_last_open_one_takes_the_rest() {
         let area = Rect::new(0, 0, 20, 20);
-        let rects = layout_sections(area, [(4, false), (4, false), (4, false)]);
+        let rects = layout_sections(area, [Some((4, false)), Some((4, false)), Some((4, false))]);
 
         assert_eq!(rects[0].header.height, 1, "{WRONG_GEOMETRY}");
         assert_eq!(rects[0].body.height, 4, "{WRONG_GEOMETRY}");
@@ -7793,7 +7874,10 @@ mod tests {
 
     #[test]
     fn a_folded_section_gives_its_body_away_and_keeps_its_header() {
-        let rects = layout_sections(Rect::new(0, 0, 20, 20), [(4, true), (4, false), (4, false)]);
+        let rects = layout_sections(
+            Rect::new(0, 0, 20, 20),
+            [Some((4, true)), Some((4, false)), Some((4, false))],
+        );
 
         assert_eq!(rects[0].header.height, 1, "{WRONG_GEOMETRY}");
         assert_eq!(rects[0].body.height, 0, "{WRONG_GEOMETRY}");
@@ -7802,10 +7886,26 @@ mod tests {
     }
 
     #[test]
+    fn a_hidden_section_takes_neither_a_header_nor_a_body() {
+        let area = Rect::new(0, 0, 20, 20);
+        let rects = layout_sections(area, [Some((4, false)), None, Some((4, false))]);
+
+        assert_eq!(rects[1], SectionRect::default(), "{WRONG_GEOMETRY}");
+        assert_eq!(rects[0].body.height, 4, "{WRONG_GEOMETRY}");
+        assert_eq!(
+            rects[2].header.y,
+            rects[0].body.bottom(),
+            "{WRONG_GEOMETRY}"
+        );
+        assert_eq!(rects[2].body.bottom(), area.bottom(), "{WRONG_GEOMETRY}");
+    }
+
+    #[test]
     fn the_sections_never_reach_past_the_room_they_were_given() {
         for height in 0..12u16 {
             let area = Rect::new(0, 0, 20, height);
-            let rects = layout_sections(area, [(8, false), (8, false), (8, false)]);
+            let rects =
+                layout_sections(area, [Some((8, false)), Some((8, false)), Some((8, false))]);
             for rect in rects {
                 assert!(rect.header.bottom() <= area.bottom(), "{WRONG_GEOMETRY}");
                 assert!(rect.body.bottom() <= area.bottom(), "{WRONG_GEOMETRY}");
@@ -7817,7 +7917,7 @@ mod tests {
     fn a_section_asking_for_more_than_there_is_leaves_the_ones_below_a_row() {
         let rects = layout_sections(
             Rect::new(0, 0, 20, 8),
-            [(40, false), (4, false), (4, false)],
+            [Some((40, false)), Some((4, false)), Some((4, false))],
         );
 
         assert_eq!(rects[0].body.height, 3, "{WRONG_GEOMETRY}");
@@ -8378,7 +8478,7 @@ mod tests {
     /// Writes `text` and moves the file's time well away from when it was
     /// read, so a check against that time cannot miss the write for landing in
     /// the same clock tick as the read.
-    fn rewrite(path: &Path, text: &str) {
+    pub(crate) fn rewrite(path: &Path, text: &str) {
         fs::write(path, text).expect("a file");
         fs::File::options()
             .write(true)
@@ -8398,14 +8498,12 @@ mod tests {
     }
 
     /// Opens `plan` the way the host opens its own, under [`PLAN_TITLE`].
-    fn open_plan(workbench: &mut Workbench, root: &Path, plan: &Path) {
+    fn open_plan(workbench: &mut Workbench, plan: &Path) {
         let label = TabLabel {
             title: PLAN_TITLE.to_owned(),
             status: PLAN_STATUS.to_owned(),
         };
-        workbench
-            .open_labelled(root, plan, label)
-            .expect(LOCAL_OPEN);
+        workbench.open_host_file(plan, Some(label), false);
     }
 
     /// Checks the tab took up [`REWRITTEN_TEXT`] when it was clean, and kept
@@ -8453,9 +8551,9 @@ mod tests {
     #[test_case(false ; "a clean tab rereads")]
     #[test_case(true ; "a dirty tab raises its conflict")]
     fn a_reported_write_outside_the_tree_reaches_its_tab(dirty: bool) {
-        let (dir, mut workbench) = project();
+        let (_dir, mut workbench) = project();
         let (_state, plan) = outside_plan();
-        open_plan(&mut workbench, dir.path(), &plan);
+        open_plan(&mut workbench, &plan);
         if dirty {
             workbench.handle_key(key(KeyCode::Char(EDIT)));
         }
@@ -8471,9 +8569,9 @@ mod tests {
     #[test_case(true, REWRITTEN_TEXT ; "removed_file_lf_snapshot")]
     #[test_case(false, "" ; "empty_snapshot")]
     fn replace_file_uses_committed_text_without_reading_disk(removed: bool, text: &str) {
-        let (dir, mut workbench) = project();
+        let (_dir, mut workbench) = project();
         let (_state, plan) = outside_plan();
-        open_plan(&mut workbench, dir.path(), &plan);
+        open_plan(&mut workbench, &plan);
         workbench.sidebar = SidebarView::Search;
         workbench.focus = Focus::Sidebar;
         let tab = workbench.editor.active_mut().expect(NO_TAB);
@@ -8504,9 +8602,9 @@ mod tests {
 
     #[test_case(())]
     fn replace_file_preserves_dirty_edits_selection_history_and_baseline(_: ()) {
-        let (dir, mut workbench) = project();
+        let (_dir, mut workbench) = project();
         let (_state, plan) = outside_plan();
-        open_plan(&mut workbench, dir.path(), &plan);
+        open_plan(&mut workbench, &plan);
         let tab = workbench.editor.active_mut().expect(NO_TAB);
         let edit = tab.buffer.insert(DRAFT_TEXT);
         assert!(tab.record(edit));
@@ -8622,9 +8720,9 @@ mod tests {
     #[test_case(Some(NEWER_DRAFT), false ; "newer_disk_bytes_conflict")]
     #[test_case(None, false ; "removed_file_conflicts")]
     fn replace_file_saves_only_over_the_supplied_content(disk: Option<&str>, can_save: bool) {
-        let (dir, mut workbench) = project();
+        let (_dir, mut workbench) = project();
         let (_state, plan) = outside_plan();
-        open_plan(&mut workbench, dir.path(), &plan);
+        open_plan(&mut workbench, &plan);
         let original_modified = fs::metadata(&plan).unwrap().modified().unwrap();
         assert!(workbench.replace_file(&plan, REWRITTEN_TEXT));
         match disk {
@@ -8664,9 +8762,9 @@ mod tests {
 
     #[test]
     fn a_labelled_tab_goes_by_its_label_and_no_other_tab_keeps_it() {
-        let (dir, mut workbench) = project();
+        let (_dir, mut workbench) = project();
         let (state, plan) = outside_plan();
-        open_plan(&mut workbench, dir.path(), &plan);
+        open_plan(&mut workbench, &plan);
 
         let surface = paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
         assert!(
@@ -8680,22 +8778,22 @@ mod tests {
 
         let newer = state.path().join(NEWER_PLAN_FILE);
         fs::write(&newer, INDEXED_TEXT).expect("a plan");
-        open_plan(&mut workbench, dir.path(), &newer);
+        open_plan(&mut workbench, &newer);
         let headings: Vec<&str> = workbench.editor.tabs().iter().map(Tab::heading).collect();
         assert_eq!(headings, [PLAN_FILE, PLAN_TITLE], "{LABEL_SHARED}");
     }
 
     #[test]
     fn coming_back_to_a_labelled_tab_keeps_the_reader_where_they_were() {
-        let (dir, mut workbench) = project();
+        let (_dir, mut workbench) = project();
         let (_state, plan) = outside_plan();
-        open_plan(&mut workbench, dir.path(), &plan);
+        open_plan(&mut workbench, &plan);
         workbench.handle_key(key(KeyCode::Down));
         workbench.handle_key(key(KeyCode::Down));
         let cursor = workbench.editor.active().expect(NO_TAB).buffer.cursor();
         workbench.handle_leader(press(keys::VIEW_SOURCE_CONTROL));
 
-        open_plan(&mut workbench, dir.path(), &plan);
+        open_plan(&mut workbench, &plan);
 
         let tab = workbench.editor.active().expect(NO_TAB);
         assert_eq!(tab.buffer.cursor(), cursor, "{CURSOR_MOVED}");
@@ -9705,7 +9803,7 @@ mod tests {
     fn a_file_opens_on_the_first_click() {
         let (_dir, mut workbench) = project();
         draw(&mut workbench, 80, 24);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
 
         workbench.handle_mouse(click(row_body(rows), rows.y + 1));
 
@@ -9720,7 +9818,7 @@ mod tests {
     fn a_press_under_the_last_row_opens_nothing() {
         let (_dir, mut workbench) = project();
         draw(&mut workbench, 80, 24);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
         let below = rows.y + workbench.tree.rows().len() as u16;
 
         workbench.handle_mouse(click(rows.x + 1, below));
@@ -9732,7 +9830,7 @@ mod tests {
     fn a_directory_opens_on_the_first_click() {
         let (_dir, mut workbench) = project();
         draw(&mut workbench, 80, 24);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
         let before = workbench.tree.rows().len();
 
         workbench.handle_mouse(click(row_body(rows), rows.y));
@@ -9823,7 +9921,7 @@ mod tests {
         open_file(&dir, &mut workbench);
         workbench.handle_key(KeyEvent::new(keys::SELECT_ALL.code, KeyModifiers::CONTROL));
         draw(&mut workbench, 80, 24);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
 
         workbench.handle_mouse(click(rows.x, rows.y));
         let action = workbench.handle_mouse(release(rows.x, rows.y));
@@ -9909,7 +10007,7 @@ mod tests {
         let (_dir, mut workbench) = scrolling_project(sidebar);
         workbench.set_scrollbars(scrollbars);
         draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
         let selected = sidebar_position(&workbench).0;
         let caret = cursor(&workbench);
         let tabs = workbench.editor.tabs().len();
@@ -10062,7 +10160,7 @@ mod tests {
     fn sidebar_bar_positioning_and_row_clicks_survive_redraws(sidebar: SidebarView) {
         let (_dir, mut workbench) = scrolling_project(sidebar);
         draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
         let selected = sidebar_position(&workbench).0;
         let bottom = rows.bottom() - 1;
 
@@ -10148,7 +10246,7 @@ mod tests {
 
         assert_eq!(painted.contains(SCROLLBAR_THUMB), expected, "{WRONG_BAR}");
         assert_eq!(
-            workbench.panes.rows.right() == workbench.panes.rows.x + DEFAULT_SIDEBAR_WIDTH,
+            list_rows(&workbench).right() == list_rows(&workbench).x + DEFAULT_SIDEBAR_WIDTH,
             !expected,
             "{WRONG_BAR}"
         );
@@ -10212,7 +10310,7 @@ mod tests {
     fn dragging_the_tree_bar_scrolls_without_moving_the_selection() {
         let (_dir, mut workbench) = tall_project();
         draw(&mut workbench, 80, 24);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
         let selected = workbench.tree.selected_index();
 
         workbench.handle_mouse(click(rows.right(), rows.y + 1));
@@ -10228,7 +10326,7 @@ mod tests {
     fn releasing_the_bar_keeps_the_window_until_keyboard_navigation() {
         let (_dir, mut workbench) = tall_project();
         draw(&mut workbench, 80, 24);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
 
         workbench.handle_mouse(click(rows.right(), rows.y + 1));
         workbench.handle_mouse(drag(rows.right(), rows.bottom() - 1));
@@ -10249,7 +10347,7 @@ mod tests {
     fn the_scrollbar_column_is_not_a_row_hit() {
         let (_dir, mut workbench) = tall_project();
         draw(&mut workbench, 80, 24);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
         let before = workbench.tree.selected_index();
 
         workbench.handle_mouse(click(rows.right(), rows.y + 3));
@@ -10396,7 +10494,7 @@ mod tests {
         workbench.handle_key(key(KeyCode::Char('x')));
         workbench.handle_leader(press(keys::CLOSE_TAB));
         draw(&mut workbench, 80, 24);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
 
         workbench.handle_mouse(click(rows.x, rows.y));
 
@@ -10470,7 +10568,7 @@ mod tests {
         let (dir, mut workbench) = project();
         search_for(&mut workbench, "three");
         draw(&mut workbench, 80, 24);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
 
         workbench.handle_mouse(click(rows.x + 1, rows.y + 1));
 
@@ -10488,7 +10586,7 @@ mod tests {
     fn the_pointer_marks_the_row_it_is_resting_on() {
         let (_dir, mut workbench) = project();
         draw(&mut workbench, 80, 24);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
         let unselected = (rows.x + 1, rows.y + 1);
         let plain = cell_style(&mut workbench, unselected);
 
@@ -10536,7 +10634,7 @@ mod tests {
         open_file(&dir, &mut workbench);
         assert_eq!(workbench.focus, Focus::Editor, "{NOT_TRACKED}");
         draw(&mut workbench, 80, 24);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
         let column = row_body(rows);
 
         let opened = cell_style(&mut workbench, (column, rows.y + 1));
@@ -10559,7 +10657,7 @@ mod tests {
     fn the_pointer_leaves_the_selected_row_alone() {
         let (_dir, mut workbench) = project();
         draw(&mut workbench, 80, 24);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
         let selected = (row_body(rows), rows.y);
         let before = cell_style(&mut workbench, selected);
 
@@ -10579,7 +10677,7 @@ mod tests {
     fn a_press_on_a_row_handle_opens_its_menu() {
         let (dir, mut workbench) = project();
         draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
         let column = painted_column(&mut workbench, rows, rows.y, MENU_MARK);
 
         workbench.handle_mouse(click(column, rows.y));
@@ -10598,7 +10696,7 @@ mod tests {
     fn a_press_on_a_row_handle_leaves_the_row_closed() {
         let (_dir, mut workbench) = project();
         draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
         let before = workbench.tree.rows().len();
 
         workbench.handle_mouse(click(rows.x, rows.y));
@@ -10611,7 +10709,7 @@ mod tests {
         let (dir, mut workbench) = project();
         select_file(&dir, &mut workbench);
         paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
 
         workbench.handle_mouse(right_click(rows.x, rows.y));
 
@@ -10661,7 +10759,7 @@ mod tests {
         let (dir, mut workbench) = project();
         select_file(&dir, &mut workbench);
         paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
         workbench.handle_mouse(right_click(rows.x, rows.y));
         paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
         let text = workbench.panes.text;
@@ -10997,7 +11095,7 @@ mod tests {
         let (dir, mut workbench) = project();
         select_file(&dir, &mut workbench);
         paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
 
         workbench.handle_mouse(right_click(rows.x, rows.y));
         let released = workbench.handle_mouse(right_release(rows.x, rows.y));
@@ -11259,7 +11357,7 @@ mod tests {
         let (_dir, mut workbench) = tall_project();
         workbench.sidebar_width = MAX_SIDEBAR_WIDTH;
         paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(&workbench);
         let column = rows.right() - 1;
         workbench.handle_mouse(right_click(column, rows.y));
         paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
@@ -11318,7 +11416,7 @@ mod tests {
     /// the tip is read from, returning where the pointer rests.
     fn hover_name(workbench: &mut Workbench, name: &str) -> (u16, u16) {
         paint(workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
-        let rows = workbench.panes.rows;
+        let rows = list_rows(workbench);
         let index = workbench
             .tree
             .rows()
@@ -11341,7 +11439,7 @@ mod tests {
             let row = Rect {
                 y: at.1,
                 height: 1,
-                ..workbench.panes.rows
+                ..list_rows(&workbench)
             };
             assert_eq!(rect, row, "{TIP_MISSING}");
             text
@@ -12323,5 +12421,166 @@ mod tests {
         assert!(replacement_control.scm_calls() >= 6);
 
         assert_eq!(crate::LocalFilesystem::call_count(), 0);
+    }
+
+    /// A workbench bound to a workspace, and a file of this machine beside it.
+    pub(crate) fn bound_beside_host() -> (Workbench, RemoteControl, TempDir, PathBuf) {
+        let (session, control) = crate::fs::backend::tests::widget_fixture();
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.toggle_workspace(session).unwrap();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        let host = TempDir::new().expect("a temporary directory");
+        let file = host.path().join(HOST_FILE);
+        fs::write(&file, HOST_TEXT).expect("a file of this machine");
+        (workbench, control, host, file)
+    }
+
+    /// The binding survived, and nothing was put to the workspace.
+    pub(crate) fn assert_still_bound(workbench: &Workbench) {
+        assert!(
+            workbench.remote_backend.is_some() && workbench.remote_scm.is_some(),
+            "{HOST_BINDING_DROPPED}"
+        );
+        assert!(
+            workbench.pending_open.is_empty()
+                && workbench.pending_save.is_empty()
+                && workbench.pending_create.is_empty()
+                && workbench.pending_count.is_empty(),
+            "{HOST_ASKED_REMOTELY}"
+        );
+    }
+
+    fn open_as_mention(workbench: &mut Workbench, file: &Path) {
+        workbench.open_at(Path::new(""), file, None);
+    }
+
+    fn open_as_path(workbench: &mut Workbench, file: &Path) {
+        workbench.open_file(&WorkbenchPath::Local(file.to_path_buf()), None);
+    }
+
+    fn open_as_labelled(workbench: &mut Workbench, file: &Path) {
+        let label = TabLabel {
+            title: PLAN_TITLE.to_owned(),
+            status: PLAN_STATUS.to_owned(),
+        };
+        workbench.open_host_file(file, Some(label), false);
+    }
+
+    #[test_case(open_as_mention; "absolute_mention")]
+    #[test_case(open_as_path; "explicit_path")]
+    #[test_case(open_as_labelled; "labelled")]
+    fn a_host_file_opens_beside_a_bound_workspace(open: fn(&mut Workbench, &Path)) {
+        let (mut workbench, _control, _host, file) = bound_beside_host();
+
+        open(&mut workbench, &file);
+
+        let tab = workbench.editor.active().expect(HOST_NOT_OPENED);
+        assert_eq!(tab.path, WorkbenchPath::Local(file), "{HOST_NOT_OPENED}");
+        assert_eq!(tab.contents(), HOST_TEXT, "{HOST_NOT_OPENED}");
+        assert_still_bound(&workbench);
+    }
+
+    #[test]
+    fn a_host_tab_saves_and_reverts_on_this_machine_in_a_workspace_session() {
+        let (mut workbench, _control, _host, file) = bound_beside_host();
+        open_as_path(&mut workbench, &file);
+
+        workbench.editor_key(key(KeyCode::Char('X')));
+        workbench.save_active();
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            format!("X{HOST_TEXT}"),
+            "{HOST_NOT_WRITTEN}"
+        );
+
+        workbench.editor_key(key(KeyCode::Char('Y')));
+        fs::write(&file, HOST_REPLACEMENT).unwrap();
+        workbench.buffer_key(press(keys::REVERT));
+
+        let tab = workbench.editor.active().expect(HOST_NOT_OPENED);
+        assert_eq!(tab.contents(), HOST_REPLACEMENT, "{HOST_TAB_STALE}");
+        assert!(!tab.is_dirty(), "{HOST_TAB_STALE}");
+        assert_still_bound(&workbench);
+    }
+
+    #[test]
+    fn host_paths_are_made_renamed_and_deleted_here_in_a_workspace_session() {
+        let (mut workbench, _control, host, _file) = bound_beside_host();
+        let made = host.path().join(HOST_MADE);
+        let renamed = host.path().join(HOST_RENAMED);
+
+        workbench.ask_for_name(
+            InputKind::NewFile,
+            WorkbenchPath::Local(host.path().to_path_buf()),
+        );
+        workbench.input.as_mut().unwrap().value.set_text(HOST_MADE);
+        workbench.commit_input();
+        assert!(made.is_file(), "{HOST_NOT_WRITTEN}");
+
+        workbench.ask_for_name(InputKind::Rename, WorkbenchPath::Local(made.clone()));
+        workbench
+            .input
+            .as_mut()
+            .unwrap()
+            .value
+            .set_text(HOST_RENAMED);
+        workbench.commit_input();
+        assert!(!made.exists() && renamed.is_file(), "{HOST_NOT_WRITTEN}");
+
+        workbench.run_on_row(MenuAction::Delete, WorkbenchPath::Local(renamed.clone()));
+        assert_eq!(
+            workbench.confirm.map(|confirm| confirm.ask),
+            Some(Ask::Delete(0))
+        );
+        workbench.resolve_delete(Choice::Discard);
+        assert!(!renamed.exists(), "{HOST_NOT_WRITTEN}");
+        assert_still_bound(&workbench);
+    }
+
+    #[test]
+    fn refresh_catches_up_a_host_tab_in_a_workspace_session() {
+        let (mut workbench, _control, _host, file) = bound_beside_host();
+        open_as_path(&mut workbench, &file);
+        fs::write(&file, HOST_REPLACEMENT).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .and_then(|written| written.set_modified(SystemTime::now() + Duration::from_secs(60)))
+            .unwrap();
+
+        workbench.handle_key(press(keys::REFRESH));
+
+        let tab = workbench.editor.active().expect(HOST_NOT_OPENED);
+        assert_eq!(tab.contents(), HOST_REPLACEMENT, "{HOST_TAB_STALE}");
+    }
+
+    #[test_case(true; "workspace_session_refuses")]
+    #[test_case(false; "local_session_mentions_by_path")]
+    fn a_host_file_is_mentioned_only_in_a_local_session(bound: bool) {
+        let (workbench, _control, _host, file) = bound_beside_host();
+        let workbench = match bound {
+            true => workbench,
+            false => Workbench::new(WorkbenchStyles::default()),
+        };
+        let path = WorkbenchPath::Local(file);
+
+        let expected = match bound {
+            true => WorkbenchAction::Flash(HOST_FILE_UNMENTIONABLE.to_owned()),
+            false => WorkbenchAction::SendToComposer {
+                path: path.clone(),
+                lines: None,
+            },
+        };
+        assert_eq!(workbench.mention(&path, None), expected);
+    }
+
+    #[test]
+    fn opening_a_commit_keeps_the_workspace_binding() {
+        let (mut workbench, _control, host, _file) = bound_beside_host();
+
+        workbench.open_at_commit(host.path(), HOST_COMMIT);
+
+        assert_eq!(workbench.sidebar, SidebarView::SourceControl);
+        assert_still_bound(&workbench);
     }
 }

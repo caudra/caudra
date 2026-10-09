@@ -6,7 +6,7 @@
 //! which files were written, whether the tree changed shape, and whether the
 //! repository's own state moved.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::mem;
 use std::path::{Path, PathBuf};
@@ -17,9 +17,9 @@ use flume::Receiver;
 use ignore::WalkBuilder;
 use notify::event::ModifyKind;
 use notify::{
-    Event, EventKind, RecommendedWatcher, RecursiveMode, Result as Watched, Watcher as _,
+    ErrorKind, Event, EventKind, RecommendedWatcher, RecursiveMode, Result as Watched, Watcher as _,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::fs::tree::GIT_DIR;
 
@@ -76,10 +76,7 @@ impl GitMetadata {
     }
 
     fn update_watches(&self, watcher: &mut RecommendedWatcher, event: &Event) {
-        if !matches!(
-            event.kind,
-            EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
-        ) {
+        if !reshapes(&event.kind) {
             return;
         }
         for root in &self.roots {
@@ -262,8 +259,113 @@ impl Watch {
                 self.git.update_watches(watcher, event);
             }
         });
-        self.settle.absorb(fold(events, &self.git), now);
+        self.settle.absorb(fold(events, Some(&self.git)), now);
         self.settle.take(now)
+    }
+}
+
+/// What became of a directory [`HostWatch::sync`] was asked to watch.
+enum Placement {
+    Watched,
+    /// Absent when last asked, so each sync spends one `stat` on whether it
+    /// has appeared since.
+    Missing,
+    /// Present but refused, for permissions or the watch limit, and not asked
+    /// again while it stays listed.
+    Refused,
+}
+
+/// A watch over directories outside the project: Caudra's own, the session's
+/// scratch space, a folder the user added.
+///
+/// These sit wherever the machine keeps them, a home directory among them, so
+/// each is watched on its own and never recursively. Every watch is then a
+/// single `inotify_add_watch`, which leaves nothing for a registration thread
+/// to do. A repository one of them belongs to is not the project's, so nothing
+/// here asks git anything and [`Changes::git`] is never set.
+///
+/// Paths are reported as `notify` spells them under the directory passed to
+/// [`HostWatch::sync`], so a caller that keys tabs by path should pass
+/// directories spelled the way those keys are.
+///
+/// Dropping this stops every watch.
+pub struct HostWatch {
+    events: Receiver<Watched<Event>>,
+    settle: Settle,
+    /// Held only to keep the watches alive; every event arrives on the channel.
+    watcher: RecommendedWatcher,
+    placements: HashMap<PathBuf, Placement>,
+}
+
+impl HostWatch {
+    pub fn start() -> Option<Self> {
+        let (sender, events) = flume::unbounded();
+        let watcher = notify::recommended_watcher(sender).ok()?;
+        Some(Self {
+            events,
+            settle: Settle::default(),
+            watcher,
+            placements: HashMap::new(),
+        })
+    }
+
+    /// Watches exactly `dirs` from now on. A directory already watched or
+    /// already refused costs nothing, so this can run whenever the listing
+    /// might have changed.
+    pub fn sync(&mut self, dirs: &HashSet<PathBuf>) {
+        self.placements.retain(|dir, placement| {
+            let listed = dirs.contains(dir);
+            if !listed && matches!(placement, Placement::Watched) {
+                let _ = self.watcher.unwatch(dir);
+            }
+            listed
+        });
+        for dir in dirs {
+            let retry = match self.placements.get(dir) {
+                None => true,
+                Some(Placement::Missing) => dir.is_dir(),
+                Some(Placement::Watched | Placement::Refused) => false,
+            };
+            if retry {
+                self.placements
+                    .insert(dir.clone(), place(&mut self.watcher, dir));
+            }
+        }
+    }
+
+    /// Empty until the directories have been quiet for [`SETTLE`], like
+    /// [`Watch::drain`].
+    pub fn drain(&mut self) -> Changes {
+        let now = Instant::now();
+        let events: Vec<_> = self.events.try_iter().flatten().collect();
+        // The kernel drops a watch along with its directory, and one made again
+        // in its place is a new directory to watch, so a listed entry that
+        // appeared, vanished or moved is placed afresh.
+        for event in events.iter().filter(|event| reshapes(&event.kind)) {
+            for path in &event.paths {
+                let Some(placement) = self.placements.get_mut(path) else {
+                    continue;
+                };
+                if matches!(placement, Placement::Watched) {
+                    let _ = self.watcher.unwatch(path);
+                }
+                *placement = place(&mut self.watcher, path);
+            }
+        }
+        self.settle.absorb(fold(events.into_iter(), None), now);
+        self.settle.take(now)
+    }
+}
+
+/// Watches `dir` itself, never what sits under it.
+fn place(watcher: &mut RecommendedWatcher, dir: &Path) -> Placement {
+    match watcher.watch(dir, RecursiveMode::NonRecursive) {
+        Ok(()) => Placement::Watched,
+        Err(error) if matches!(error.kind, ErrorKind::PathNotFound) => Placement::Missing,
+        Err(error) => {
+            warn!(%error, "workbench host directory refused a watch");
+            Placement::Refused
+        }
     }
 }
 
@@ -304,24 +406,33 @@ fn source_watches(mut pending: Vec<PathBuf>, git: &GitMetadata) -> Vec<(PathBuf,
     watches
 }
 
+/// Whether an entry appeared, vanished or moved, rather than changed in place.
+fn reshapes(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+    )
+}
+
 /// Kept apart from the watch so the classification can be tested against
 /// events built by hand rather than against a real tree and a sleep.
-fn fold(events: impl Iterator<Item = Event>, git: &GitMetadata) -> Changes {
+///
+/// `git` is the project's repository. Without one, as for a directory outside
+/// the project, paths under `.git` are dropped rather than reported as
+/// repository state, since no pane shows that repository.
+fn fold(events: impl Iterator<Item = Event>, git: Option<&GitMetadata>) -> Changes {
     let mut changes = Changes::default();
     for event in events {
-        let structural = match event.kind {
-            EventKind::Create(_)
-            | EventKind::Remove(_)
-            | EventKind::Modify(ModifyKind::Name(_)) => true,
-            EventKind::Modify(_) => false,
-            _ => continue,
-        };
+        let structural = reshapes(&event.kind);
+        if !structural && !matches!(event.kind, EventKind::Modify(_)) {
+            continue;
+        }
         for path in event.paths {
-            if git.ignored(&path) {
+            if git.is_some_and(|git| git.ignored(&path)) {
                 continue;
             }
-            if git.contains(&path) || in_git_dir(&path) {
-                changes.git = true;
+            if in_git_dir(&path) || git.is_some_and(|git| git.contains(&path)) {
+                changes.git |= git.is_some();
                 continue;
             }
             changes.structural |= structural;
@@ -339,6 +450,7 @@ fn in_git_dir(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
@@ -351,7 +463,9 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
-    use super::{Changes, GitMetadata, SETTLE, Settle, Watch, fold, source_watches, subtrees};
+    use super::{
+        Changes, GitMetadata, HostWatch, SETTLE, Settle, Watch, fold, source_watches, subtrees,
+    };
 
     /// Bounds a failure rather than pacing a success: a working watch answers in
     /// tens of milliseconds and the test ends there, while a broken one is only
@@ -385,6 +499,14 @@ mod tests {
     const SOURCE_CONTENT: &str = "fn main() {}\n";
     #[cfg(unix)]
     const WORKTREE_ALIAS: &str = "alias";
+    const SENTINEL_FILE: &str = "sentinel.rs";
+    const KEPT: &str = "kept";
+    const DROPPED: &str = "dropped";
+    const NESTED: &str = "nested";
+    const LATER: &str = "later";
+    const STILL_WATCHED: &str = "a directory dropped from the set was still reported";
+    const TOO_DEEP: &str = "a host directory was watched recursively";
+    const GIT_REFRESHED: &str = "a directory outside the project refreshed source control";
 
     const CONTENT: EventKind = EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any));
     const CREATED: EventKind = EventKind::Create(CreateKind::File);
@@ -397,7 +519,7 @@ mod tests {
     }
 
     fn drained(events: Vec<Event>) -> Changes {
-        fold(events.into_iter(), &GitMetadata::default())
+        fold(events.into_iter(), Some(&GitMetadata::default()))
     }
 
     fn external_repository() -> TempDir {
@@ -451,6 +573,33 @@ mod tests {
         }
     }
 
+    fn listed(dirs: &[&Path]) -> HashSet<PathBuf> {
+        dirs.iter().map(|dir| dir.to_path_buf()).collect()
+    }
+
+    fn host_watch(dirs: &[&Path]) -> HostWatch {
+        let mut watch = HostWatch::start().unwrap();
+        watch.sync(&listed(dirs));
+        watch
+    }
+
+    /// Everything drained until `path` shows up. A single inotify queue keeps
+    /// its events in order, so a path written before `path` and missing from
+    /// this was never reported, which is how a test proves a negative without
+    /// waiting out a guess.
+    fn host_change(watch: &mut HostWatch, path: &Path) -> Changes {
+        let deadline = Instant::now() + DELIVERY_DEADLINE;
+        let mut seen = Changes::default();
+        loop {
+            seen.merge(watch.drain());
+            if seen.files.contains(path) {
+                return seen;
+            }
+            assert!(Instant::now() < deadline, "{NOT_DELIVERED}");
+            thread::sleep(POLL);
+        }
+    }
+
     #[test_case("HEAD", CONTENT ; "head")]
     #[test_case("index", RENAMED ; "index_replacement")]
     #[test_case("packed-refs", RENAMED ; "packed_refs_replacement")]
@@ -461,7 +610,7 @@ mod tests {
         let root = PathBuf::from(METADATA);
         let changes = fold(
             [Event::new(kind).add_path(root.join(relative))].into_iter(),
-            &GitMetadata { roots: vec![root] },
+            Some(&GitMetadata { roots: vec![root] }),
         );
         assert!(changes.git, "{NOT_DELIVERED}");
         assert!(changes.files.is_empty(), "{GIT_LEAKED}");
@@ -475,7 +624,7 @@ mod tests {
         let root = PathBuf::from(super::GIT_DIR);
         let changes = fold(
             [Event::new(CREATED).add_path(root.join(relative))].into_iter(),
-            &GitMetadata { roots: vec![root] },
+            Some(&GitMetadata { roots: vec![root] }),
         );
         assert!(changes.is_empty(), "{OBJECT_CHURN}");
     }
@@ -781,5 +930,137 @@ mod tests {
         let mut settle = Settle::default();
         settle.absorb(Changes::default(), start);
         assert!(settle.take(start + SETTLE * 2).is_empty(), "{TOO_EAGER}");
+    }
+
+    #[test]
+    fn without_a_repository_git_paths_are_dropped() {
+        let changes = fold(
+            [
+                event(CONTENT, "/root/.git/index"),
+                event(CREATED, "/root/.git/refs/heads/main"),
+            ]
+            .into_iter(),
+            None,
+        );
+        assert!(changes.is_empty(), "{GIT_REFRESHED}");
+    }
+
+    #[test]
+    fn a_write_in_a_host_directory_is_listed_without_disturbing_the_tree() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join(SOURCE_FILE);
+        fs::write(&file, SOURCE_CONTENT).unwrap();
+        let mut watch = host_watch(&[tmp.path()]);
+        fs::write(&file, SOURCE_CONTENT).unwrap();
+        let changes = host_change(&mut watch, &file);
+        assert!(!changes.structural, "{WRONG_SHAPE}");
+        assert!(!changes.git, "{GIT_REFRESHED}");
+    }
+
+    #[test_case(false ; "created")]
+    #[test_case(true ; "removed")]
+    fn an_entry_appearing_or_leaving_a_host_directory_makes_the_tree_stale(remove: bool) {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join(SOURCE_FILE);
+        if remove {
+            fs::write(&file, SOURCE_CONTENT).unwrap();
+        }
+        let mut watch = host_watch(&[tmp.path()]);
+        if remove {
+            fs::remove_file(&file).unwrap();
+        } else {
+            fs::write(&file, SOURCE_CONTENT).unwrap();
+        }
+        assert!(host_change(&mut watch, &file).structural, "{WRONG_SHAPE}");
+    }
+
+    #[test]
+    fn a_directory_dropped_from_the_set_is_no_longer_reported() {
+        let tmp = TempDir::new().unwrap();
+        let kept = tmp.path().join(KEPT);
+        let dropped = tmp.path().join(DROPPED);
+        fs::create_dir(&kept).unwrap();
+        fs::create_dir(&dropped).unwrap();
+        let mut watch = host_watch(&[&kept, &dropped]);
+        let early = dropped.join(SOURCE_FILE);
+        fs::write(&early, SOURCE_CONTENT).unwrap();
+        host_change(&mut watch, &early);
+
+        watch.sync(&listed(&[&kept]));
+        let late = dropped.join(SENTINEL_FILE);
+        fs::write(&late, SOURCE_CONTENT).unwrap();
+        let sentinel = kept.join(SENTINEL_FILE);
+        fs::write(&sentinel, SOURCE_CONTENT).unwrap();
+        assert!(
+            !host_change(&mut watch, &sentinel).files.contains(&late),
+            "{STILL_WATCHED}"
+        );
+    }
+
+    #[test]
+    fn a_host_directory_is_not_watched_recursively() {
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join(NESTED);
+        fs::create_dir(&nested).unwrap();
+        let mut watch = host_watch(&[tmp.path()]);
+        let deep = nested.join(SOURCE_FILE);
+        fs::write(&deep, SOURCE_CONTENT).unwrap();
+        let sentinel = tmp.path().join(SENTINEL_FILE);
+        fs::write(&sentinel, SOURCE_CONTENT).unwrap();
+        assert!(
+            !host_change(&mut watch, &sentinel).files.contains(&deep),
+            "{TOO_DEEP}"
+        );
+    }
+
+    #[test]
+    fn a_directory_missing_at_sync_is_watched_once_it_exists() {
+        let tmp = TempDir::new().unwrap();
+        let later = tmp.path().join(LATER);
+        let mut watch = host_watch(&[&later]);
+        fs::create_dir(&later).unwrap();
+        watch.sync(&listed(&[&later]));
+        let file = later.join(SOURCE_FILE);
+        fs::write(&file, SOURCE_CONTENT).unwrap();
+        host_change(&mut watch, &file);
+    }
+
+    /// The kernel drops a watch along with its directory, so a directory
+    /// removed and made again would otherwise fall silent while still listed.
+    #[test]
+    fn a_recreated_host_directory_is_watched_again() {
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join(NESTED);
+        fs::create_dir(&nested).unwrap();
+        let mut watch = host_watch(&[tmp.path(), &nested]);
+        fs::remove_dir(&nested).unwrap();
+        host_change(&mut watch, &nested);
+        fs::create_dir(&nested).unwrap();
+        host_change(&mut watch, &nested);
+        let file = nested.join(SOURCE_FILE);
+        fs::write(&file, SOURCE_CONTENT).unwrap();
+        host_change(&mut watch, &file);
+    }
+
+    #[test]
+    fn a_repository_outside_the_project_never_refreshes_git() {
+        let tmp = TempDir::new().unwrap();
+        let repository = tmp.path();
+        let mut watch = host_watch(&[repository]);
+        gix::init(repository).unwrap();
+        let metadata = repository.join(super::GIT_DIR);
+        watch.sync(&listed(&[repository, &metadata]));
+        fs::write(metadata.join(HEAD), HEAD_CONTENT).unwrap();
+        let sentinel = repository.join(SENTINEL_FILE);
+        fs::write(&sentinel, SOURCE_CONTENT).unwrap();
+        let changes = host_change(&mut watch, &sentinel);
+        assert!(!changes.git, "{GIT_REFRESHED}");
+        assert!(
+            changes
+                .files
+                .iter()
+                .all(|path| !path.starts_with(&metadata)),
+            "{GIT_LEAKED}"
+        );
     }
 }

@@ -4,6 +4,7 @@
 //! reaches outside its own state leaves as one of these.
 
 use std::ops::RangeInclusive;
+use std::path::PathBuf;
 
 use crate::editor::DocumentKey;
 use crate::fs::backend::WorkbenchPath;
@@ -39,6 +40,15 @@ pub enum WorkbenchAction {
     /// `Ctrl+R` means over a file. The host answers with
     /// [`revert_document`](crate::Workbench::revert_document).
     RevertDocument(DocumentKey),
+    /// Open a file from the Caudra section. The host knows which of its files
+    /// is a plan or a policy and opens each as what it is, through
+    /// [`open_host_file`](crate::Workbench::open_host_file) for the rest.
+    /// `preview` is set for a single click, which shows the file without
+    /// keeping its tab.
+    OpenHostFile {
+        path: PathBuf,
+        preview: bool,
+    },
     /// Put text on the system clipboard.
     Copy(String),
     /// Say something in the status bar.

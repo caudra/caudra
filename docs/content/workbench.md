@@ -45,12 +45,12 @@ The workbench takes the mouse the way an IDE does.
 | Click `TREE` or `FLAT` | Switch how source control lists paths |
 | Click `Aa`, `ab`, or `.*` | Turn that search toggle on or off |
 | Click a key in the status row | Press that key |
-| Click a source control header | Fold or unfold that section |
+| Click a section header | Fold or unfold that section |
 | Click `+` or `-` on a source control row | Stage or unstage that path |
 | Click `↗` on a file | Open the file instead of its diff |
 | Click `↺` twice on an unstaged file | Discard its changes |
 | Click `↺` on an unstaged folder or header | Ask before discarding everything it lists |
-| Drag a source control header | Resize the section above it |
+| Drag a section header | Resize the section above it |
 | Drag the divider | Resize the sidebar |
 | Wheel over a pane | Scroll that pane |
 | Alt and the wheel | Scroll four times as far |
@@ -84,7 +84,7 @@ Every explorer row and every tab carries a `⋮` at its left. Click it to open a
 
 Arrow keys walk the menu, `Home` and `End` jump to either end, `Enter` takes the highlighted item, and `Esc` closes it. A press off the panel closes the menu and is swallowed, so the press that dismisses a menu does not also act on what is under it.
 
-An explorer row offers Open, New File, New Folder, Copy Path, Copy Relative Path, Send to Composer, Rename, and Delete. A folder has no Open, because pressing one expands it. Something new lands inside the folder you asked from, and beside the file you asked from.
+An explorer row offers Open, New File, New Folder, Copy Path, Copy Relative Path, Send to Composer, Rename, and Delete. A folder has no Open, because pressing one expands it. Something new lands inside the folder you asked from, and beside the file you asked from. A row under [files outside the project](#files-outside-the-project) can offer less, as that section explains. The header of an explorer section offers [Add Folder](#folders-of-your-own).
 
 Rename, New File, and New Folder ask for a name in the status row, and a rename starts from the name the path already has. `Enter` commits and `Esc` cancels. A name that is empty, holds a path separator, or is already taken is refused with the reason in the status row, and what you typed stays in the box to be corrected.
 
@@ -109,6 +109,35 @@ In a remote workspace, the top-level entries arrive first and the rest of the tr
 Remote pages use a bounded, short-lived metadata inventory rather than walking the tree again for every page. They describe the tree when that inventory was captured. Watches and manual refresh reconcile later changes, while saves and other mutations still check the selected file's current revision.
 
 `Ctrl+P` opens a fuzzy file picker over the whole project. Type part of a path, `Enter` opens it. Before you type anything it lists your other open tabs first, most recent before the rest, so `Ctrl+P` then `Enter` goes back to the file you came from. The project is walked once and reused, and walked again after `F5`, after `Ctrl+X h`, or when a file appears or disappears on disk.
+
+### Files outside the project
+
+Caudra keeps some of its own files outside the project. A `CAUDRA` section under the project lists them, so you can read and change them without leaving the workbench:
+
+| Folder | What it holds |
+|--------|---------------|
+| `Config` | Your [config directory](/docs/configuration/#directory-layout), with `caudra.toml`, `permissions.toml`, system prompts, skills, workflows, and automations |
+| `Plans` | The plans written in this project |
+| `Memories` | This project's [memory notes](/docs/memory/) |
+| `Scratch` | This project's scratch directory, for temporary files |
+
+A folder that does not exist yet is left out until it does.
+
+The section starts folded. Click its header, or press `Enter` on it, to unfold it. Once there is more than one section, the project has a header as well, and every section folds, resizes, and scrolls on its own. Drag a header to resize the section above it, the way [source control](#source-control) works, or press `Ctrl+X ↑` and `Ctrl+X ↓` to resize the section the cursor is in. `Up` and `Down` walk from the last row of one section onto the next header, and `Left` and `Right` on a header fold and unfold it. `C` and `FOLD` fold only the section the cursor is in.
+
+A file opens as what it is. A policy file Caudra has loaded opens in the editor that checks it, as [Edit source](/docs/permissions/#editing-policy-sources) does. This session's plan opens in a tab named `Plan`, and a note in a tab named after the note, as they do from `Ctrl+O` and `/memory`. Anything else opens as an ordinary file. These folders are watched like the project, so a change made elsewhere reaches the tree and any open tab.
+
+A folder at the top of the section cannot be renamed or deleted, because Caudra decides where it is. Search, `Ctrl+P`, and source control cover only the project.
+
+In a [remote workspace](/docs/remote-workspaces/) these files stay on your machine and are read from there. `Plans` lists this session's plans and `Memories` the workspace's notes, both from the local document store, and there is no `Scratch`. The store names the files in those two folders, so their rows offer no New File, New Folder, Rename, or Delete, and a plan or note opens as the same document `Ctrl+O` and `/memory` open. The agent works in the workspace and cannot read a file of your machine, so no row here offers Send to Composer, and `Ctrl+X Enter` over one of their tabs says so instead.
+
+### Folders of your own
+
+Any folder on your machine can join the explorer, in a `FOLDERS` section under `CAUDRA`. Press `Ctrl+X d` in the explorer, or pick Add Folder from the context menu of a section header, and type the folder's path in the status row. The path starts at `/`, or at `~` for your home directory. A folder the explorer lists already, in the project or under `CAUDRA`, is shown where it is rather than added a second time.
+
+An added folder is watched, and you can create, rename, and delete inside it as you would in the project. Its files open as ordinary files. The folder's own row offers Remove Folder where other rows offer Rename and Delete. Removing a folder takes it out of the explorer and leaves it on disk, along with any tab open on one of its files. Search, `Ctrl+P`, and source control still cover only the project.
+
+The added folders are [remembered](#what-is-remembered) per project. A folder that has gone is left out of the section and listed again once it is back. A workbench on a [remote workspace](/docs/remote-workspaces/) keeps them only while Caudra runs. The agent there cannot read your machine, so their rows offer no Send to Composer.
 
 ## Editor
 
@@ -311,7 +340,7 @@ Caudra opens its own text here as well. Each tab is named for what it holds, and
 - **Memory notes.** `Enter` on a note in the [`/memory` inspector](/docs/memory/#the-inspector), or a click on a note the `memory` tool shows in the transcript, opens it in a tab named after the note.
 - **The prompt draft.** `Ctrl+X e` in the composer opens what you have typed in a tab named `Prompt`, with every folded paste spelled out. `Ctrl+S` puts the draft back in the composer and keeps the workbench open. `Ctrl+X Enter` puts it back and closes the workbench, so you can send it.
 
-The plan and the notes live in the state directory, outside the project. When the agent rewrites the plan or saves a note, its tab reloads from that tool call, under the same rules as a [watched file](#when-the-agent-writes-the-same-file).
+The plan and the notes live in the state directory, outside the project, and the explorer lists them under [files outside the project](#files-outside-the-project). When the agent rewrites the plan or saves a note, its tab reloads from that tool call, under the same rules as a [watched file](#when-the-agent-writes-the-same-file).
 
 In a [remote workspace](/docs/remote-workspaces/) the plan and the notes stay on your machine, as documents addressed by reference rather than by path. They open here all the same, and `Ctrl+S` writes them back to where they came from. The plan's status row shows the start of its reference where a local plan shows its file name. A save only goes through when nothing else has written the document since its tab last read it. Otherwise the status bar says the document changed, your edits stay in the tab, and `Ctrl+R` replaces them with the newer copy.
 
@@ -319,7 +348,7 @@ A prompt draft is not a file. Each chat has its own, and a draft only goes back 
 
 ## What is remembered
 
-Open tabs, the active tab, the sidebar view, its width, whether hidden files are shown, and how the source control sections were sized and folded are stored per project directory. Reopening the workbench in the same checkout restores them once per run. Files that have since been deleted are skipped. Diff tabs are not restored, because they are built from the repository rather than read from a path. Prompt drafts and the plan and notes of a remote workspace are not stored either, and a restored plan tab is named after its file.
+Open tabs, the active tab, the sidebar view, its width, whether hidden files are shown, how the explorer and source control sections were sized and folded, and the [folders you added](#folders-of-your-own) are stored per project directory. Reopening the workbench in the same checkout restores them once per run. Files that have since been deleted are skipped. Diff tabs are not restored, because they are built from the repository rather than read from a path. Prompt drafts are not stored either, and a restored plan tab is named after its file. A workbench on a [remote workspace](/docs/remote-workspaces/) stores no layout.
 
 Two clones of the same repository keep separate layouts.
 

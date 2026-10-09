@@ -188,6 +188,8 @@ pub const SHRINK_SIDEBAR: Bind = leader!(KeyCode::Char('-'), "-");
 pub const GROW_SIDEBAR: Bind = leader!(KeyCode::Char('='), "=");
 pub const SHRINK_SECTION: Bind = leader!(KeyCode::Up, "↑");
 pub const GROW_SECTION: Bind = leader!(KeyCode::Down, "↓");
+/// Emacs' `C-x d`, which opens a directory.
+pub const ADD_FOLDER: Bind = leader!(KeyCode::Char('d'), "d");
 pub const NEXT_FIELD: Bind = leader!(KeyCode::Char('i'), "i");
 /// `m` belongs to the host's model picker, which stays reachable while the
 /// workbench is up.
@@ -295,6 +297,7 @@ pub const LEADER_BINDS: &[Bind] = &[
     GROW_SIDEBAR,
     SHRINK_SECTION,
     GROW_SECTION,
+    ADD_FOLDER,
     NEXT_FIELD,
     MENU,
     TOGGLE_CASE,

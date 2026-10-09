@@ -50,7 +50,7 @@ use crate::agent::ModelSlot;
 use crate::agent::SharedMode;
 use crate::agent::ToolsPreviewSource;
 use crate::app::tasks::TaskOutcome;
-use crate::app::workbench::StoredDocument;
+use crate::app::workbench::{MountScope, StoredDocument};
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT, format_with_images};
 use crate::clipboard::{ClipboardState, CopyResult};
@@ -532,6 +532,8 @@ pub struct App {
     /// The layout last read or written, so a tick only reaches storage when
     /// something actually moved. `None` until the workbench first opens.
     pub(super) workbench_layout: Option<WorkbenchLayout>,
+    /// What the workbench's Caudra section was last pointed at.
+    workbench_mounts: Option<MountScope>,
     /// The plans and notes from the local document store that workbench tabs
     /// hold, by the key of each one's tab.
     stored_documents: HashMap<DocumentKey, StoredDocument>,
@@ -812,6 +814,7 @@ impl App {
             workbench: Workbench::new(workbench_styles()),
             workbench_theme_gen: crate::theme::generation(),
             workbench_layout: None,
+            workbench_mounts: None,
             stored_documents: HashMap::new(),
             status_bar,
             status_hits: Vec::new(),
@@ -2672,6 +2675,9 @@ impl App {
                 self.save_document(&key, text, close);
             }
             WorkbenchAction::RevertDocument(key) => self.revert_document(&key),
+            WorkbenchAction::OpenHostFile { path, preview } => {
+                self.open_caudra_path(&path, preview);
+            }
             WorkbenchAction::SendToComposer { path, lines } => {
                 self.close_permission_source();
                 let text = match path {
@@ -3148,6 +3154,9 @@ impl App {
             }
         } else {
             self.workbench.toggle(&cwd);
+        }
+        if opening {
+            self.sync_workbench_mounts();
         }
         if !opening || self.workbench_layout.is_some() {
             return;
@@ -6216,19 +6225,23 @@ impl App {
         // The workbench paints its own bars, so the setting reaches it here
         // rather than through the shared helper every other surface calls.
         self.workbench.set_scrollbars(scrollbar::enabled());
+        let moved = self.sync_workbench_mounts();
         let (dirty, flash) = self.workbench.tick();
         if let Some(flash) = flash {
             self.status_bar.flash(flash);
         }
         self.persist_workbench_layout();
-        parked_dirty | Dirty::from(dirty)
+        parked_dirty | Dirty::from(dirty || moved)
     }
 
     /// A layout moves when a tab opens or a pane resizes, which is rare enough
     /// to write on the change itself rather than on a timer or on each of the
     /// several ways an overlay can leave the screen.
+    ///
+    /// A workspace session stores nothing: its layout was never read back, and
+    /// would be filed under a path that names no directory of this machine.
     fn persist_workbench_layout(&mut self) {
-        if self.parked_workbench.is_some() {
+        if self.parked_workbench.is_some() || self.workspace_session.is_some() {
             return;
         }
         let layout = self.workbench.layout();

@@ -13,11 +13,14 @@
 use std::path::{Path, PathBuf};
 
 use caudra_agent::ToolDoneEvent;
+use caudra_agent::permissions::VerifiedLocalSourceLocator;
 use caudra_agent::tools::MEMORY_TOOL_NAME;
 use caudra_agent::tools::native::plan::{PlanTarget, PlanWriteResult};
-use caudra_storage::local_documents::{DocumentRevision, LocalDocument, LocalDocumentError};
-use caudra_storage::projects::project_document_dirs;
-use caudra_workbench::{DocumentKey, TabLabel};
+use caudra_storage::local_documents::{
+    DocumentRevision, LocalDocument, LocalDocumentError, LocalDocumentStore,
+};
+use caudra_storage::projects::{project_document_dirs, project_scratch_path};
+use caudra_workbench::{DocumentKey, HostMount, TabLabel};
 use caudra_workspace::{LocalDocumentRef, MemoryRef, PlanRef};
 
 use super::tasks::MAIN_TASK_ID;
@@ -37,6 +40,10 @@ const LOCAL_SOURCE_OPEN: &str = "Close the local policy source first";
 const DRAFT_OTHER_COMPOSER: &str = "This draft is for another chat: switch back to it to apply it";
 const STORE_UNAVAILABLE: &str = "Plans and notes are unavailable in this workspace";
 const STORED_CHANGED: &str = "Changed since it was opened: Ctrl+R takes the newer copy";
+const CONFIG_MOUNT: &str = "Config";
+const PLANS_MOUNT: &str = "Plans";
+const MEMORIES_MOUNT: &str = "Memories";
+const SCRATCH_MOUNT: &str = "Scratch";
 /// How much of a plan's reference its status row shows: enough to tell two
 /// plans apart, the way a short commit hash does, and little enough to leave
 /// the row room to say it is a plan.
@@ -61,6 +68,16 @@ impl StoredDocument {
             || (matches!(self.reference, LocalDocumentRef::Memory(_))
                 && &*done.tool == MEMORY_TOOL_NAME)
     }
+}
+
+/// What the workbench's Caudra section was last worked out for: the session
+/// files its plans, the directory keys its notes and scratch, and a remote
+/// workspace keeps both in a store of its own.
+#[derive(PartialEq, Eq)]
+pub(super) struct MountScope {
+    session: String,
+    cwd: String,
+    remote: bool,
 }
 
 impl App {
@@ -92,17 +109,16 @@ impl App {
             self.flash(PLAN_NOT_WRITTEN.into());
             return;
         }
-        let name = plan.file_name().unwrap_or_default().to_string_lossy();
-        let label = TabLabel {
-            title: PLAN_TITLE.to_owned(),
-            status: format!("{PLAN_TITLE} · {name}"),
-        };
-        self.open_caudra_file(&plan, label);
+        self.open_caudra_file(&plan, Some(plan_label(&plan)), false);
     }
 
     /// A note from `/memory` or a memory card, under its name within the notes
     /// directory rather than the path to it.
     pub(super) fn open_memory_note(&mut self, note: &Path) {
+        self.open_local_note(note, false);
+    }
+
+    fn open_local_note(&mut self, note: &Path, preview: bool) {
         self.memory_inspector.close();
         let [_, notes] = project_document_dirs(&self.storage, Path::new(&self.state.session.cwd));
         let name = note
@@ -116,18 +132,111 @@ impl App {
             status: format!("{MEMORY_TITLE} · {name}"),
             title: name,
         };
-        self.open_caudra_file(note, label);
+        self.open_caudra_file(note, Some(label), preview);
     }
 
-    fn open_caudra_file(&mut self, path: &Path, label: TabLabel) {
+    fn open_caudra_file(&mut self, path: &Path, label: Option<TabLabel>, preview: bool) {
         if self.workbench_lent() {
             return;
         }
         self.sync_workbench_theme();
-        let cwd = PathBuf::from(&self.state.session.cwd);
-        if let Err(error) = self.workbench.open_labelled(&cwd, path, label) {
-            self.flash(error.to_string());
+        if !self.raise_workbench() {
+            return;
         }
+        self.workbench.open_host_file(path, label, preview);
+    }
+
+    /// A file the Caudra section asked for, opened as what it is: a policy
+    /// file in the editor that checks it, a remote workspace's plan or note
+    /// through its store, the plan and the notes under their labels, and
+    /// anything else as a file like any other.
+    pub(super) fn open_caudra_path(&mut self, path: &Path, preview: bool) {
+        if let Some(locator) = self.policy_source(path) {
+            self.open_permission_source(locator);
+            return;
+        }
+        if let Some(store) = self.remote_document_store().cloned() {
+            let session = self.state.session.id.to_string();
+            match store.reference_for_path(store.project_key(), &session, path) {
+                Ok(Some(LocalDocumentRef::Plan(plan))) => self.open_stored_plan(plan),
+                Ok(Some(LocalDocumentRef::Memory(note))) => self.open_stored_note(note),
+                Ok(None) => self.open_caudra_file(path, None, preview),
+                Err(error) => self.flash(error.to_string()),
+            }
+            return;
+        }
+        if self.state.plan.path() == Some(path) {
+            self.open_caudra_file(path, Some(plan_label(path)), preview);
+            return;
+        }
+        let [_, notes] = project_document_dirs(&self.storage, Path::new(&self.state.session.cwd));
+        match path.starts_with(&notes) {
+            true => self.open_local_note(path, preview),
+            false => self.open_caudra_file(path, None, preview),
+        }
+    }
+
+    /// The verified policy file at `path`, which only the permission editor
+    /// may change, so that what is written is checked before it takes effect.
+    fn policy_source(&self, path: &Path) -> Option<VerifiedLocalSourceLocator> {
+        self.permissions
+            .active_policy()
+            .into_iter()
+            .filter_map(|policy| policy.verified_local_source_locator)
+            .find(|locator| locator.path() == path)
+    }
+
+    /// Points the Caudra section at this session's own directories once they
+    /// may have moved, and reports whether they did. Working them out walks
+    /// the disk for the project's checkout, so the same scope is not asked
+    /// twice. A lent workbench is the policy file's, which lists no others.
+    pub(super) fn sync_workbench_mounts(&mut self) -> bool {
+        if self.parked_workbench.is_some() {
+            return false;
+        }
+        let store = self.remote_document_store().cloned();
+        let scope = MountScope {
+            session: self.state.session.id.to_string(),
+            cwd: self.state.session.cwd.clone(),
+            remote: store.is_some(),
+        };
+        if self.workbench_mounts.as_ref() == Some(&scope) {
+            return false;
+        }
+        let mounts = self.caudra_mounts(store.as_deref(), &scope.session);
+        self.workbench.set_caudra_mounts(mounts);
+        self.workbench_mounts = Some(scope);
+        true
+    }
+
+    /// The config directory, then the plans and notes wherever this session
+    /// keeps them. A remote workspace's are its store's, which owns their
+    /// names; a local session's are plain folders, beside its scratch.
+    fn caudra_mounts(&self, store: Option<&LocalDocumentStore>, session: &str) -> Vec<HostMount> {
+        let config = caudra_storage::paths::config_dir_path()
+            .ok()
+            .map(|root| mount(CONFIG_MOUNT, root, false));
+        let documents = match store {
+            Some(store) => vec![
+                mount(PLANS_MOUNT, store.plan_dir(session), true),
+                mount(MEMORIES_MOUNT, store.memories_dir(), true),
+            ],
+            None => {
+                let cwd = Path::new(&self.state.session.cwd);
+                let [plans, notes] = project_document_dirs(&self.storage, cwd);
+                let scratch = project_scratch_path(cwd)
+                    .ok()
+                    .map(|root| mount(SCRATCH_MOUNT, root, false));
+                [
+                    mount(PLANS_MOUNT, plans, false),
+                    mount(MEMORIES_MOUNT, notes, false),
+                ]
+                .into_iter()
+                .chain(scratch)
+                .collect()
+            }
+        };
+        config.into_iter().chain(documents).collect()
     }
 
     /// A remote workspace's plan, which the store keeps by reference.
@@ -440,6 +549,22 @@ impl App {
     }
 }
 
+fn plan_label(plan: &Path) -> TabLabel {
+    let name = plan.file_name().unwrap_or_default().to_string_lossy();
+    TabLabel {
+        title: PLAN_TITLE.to_owned(),
+        status: format!("{PLAN_TITLE} · {name}"),
+    }
+}
+
+fn mount(label: &str, root: PathBuf, managed: bool) -> HostMount {
+    HostMount {
+        label: label.to_owned(),
+        root,
+        managed,
+    }
+}
+
 /// Names a plan or note from the store, so its one tab can be found again.
 fn stored_key(reference: &LocalDocumentRef) -> DocumentKey {
     let (prefix, id) = match reference {
@@ -464,6 +589,9 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
+    use caudra_agent::permissions::{
+        PermissionManager, PluginRuleStore, VerifiedLocalSourceLocator,
+    };
     use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
     use caudra_agent::tools::{
         BATCH_TOOL_NAME, FILE_WRITE_TOOL_NAME, MEMORY_TOOL_NAME, ToolEffect,
@@ -472,9 +600,11 @@ mod tests {
         AgentEvent, AgentMode, BatchProgressEvent, BatchToolEntry, BatchToolStatus, TextOutput,
         ToolAccounting, ToolDoneEvent, ToolOutput, ToolStartEvent,
     };
+    use caudra_config::{Effect, PermissionRule, PermissionsConfig, ToolKey};
     use caudra_storage::StateDir;
     use caudra_storage::local_documents::LocalDocumentStore;
     use caudra_storage::plans::PlanFile;
+    use caudra_storage::projects::{project_document_dirs, project_scratch_path};
     use caudra_workbench::{Layout as WorkbenchLayout, Workbench, keys as workbench_keys};
     use caudra_workspace::{LocalDocumentRef, MemoryRef};
     use crossterm::event::KeyCode;
@@ -482,8 +612,9 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        DRAFT_OTHER_COMPOSER, FLASH_NO_PLAN, LOCAL_SOURCE_OPEN, PLAN_NOT_WRITTEN, PLAN_UNSAVED,
-        SHORT_REFERENCE, STORED_CHANGED, stored_key,
+        CONFIG_MOUNT, DRAFT_OTHER_COMPOSER, FLASH_NO_PLAN, LOCAL_SOURCE_OPEN, MEMORIES_MOUNT,
+        PLAN_NOT_WRITTEN, PLAN_UNSAVED, PLANS_MOUNT, SCRATCH_MOUNT, SHORT_REFERENCE,
+        STORED_CHANGED, stored_key,
     };
     use crate::app::mode::PLAN_COPY_FAILED;
     use crate::app::permission_editor::tests::workbench_workspace;
@@ -543,6 +674,18 @@ mod tests {
     const PLAN_NOT_ADOPTED: &str = "the new session did not take the plan over as its own";
     const BLOCKED_STATE: &str = "not-a-directory";
     const REMOTE_SESSION: &str = "a session in a remote workspace";
+    const MARKDOWN_EXTENSION: &str = "md";
+    const POLICY_SOURCE: &str = "policy.lua";
+    const POLICY_TOOL: &str = "policy-test-shell";
+    const POLICY_PLUGIN: &str = "policy-test-plugin";
+    const CONFIG_FILE: &str = "caudra.toml";
+    const POLICY_UNCHECKED: &str =
+        "a verified policy file opened outside the editor that checks it";
+    const STORE_BYPASSED: &str = "a stored document opened as a plain file";
+    const OPENED_AS_SOMETHING_ELSE: &str = "a plain file opened under a label it does not have";
+    const WRONG_MOUNTS: &str = "the Caudra section names the wrong directories";
+    const MOUNTS_REREAD: &str = "the same scope worked its mounts out again";
+    const LAYOUT_STORED: &str = "a remote workbench stored a layout for a path of another machine";
     const SEND: Bind = Bind::from_workbench(workbench_keys::SEND_TO_COMPOSER);
     const REVERT: Bind = Bind::from_workbench(workbench_keys::REVERT);
 
@@ -1503,6 +1646,198 @@ mod tests {
         assert!(
             rendered(&mut remote.app).contains(REWRITTEN_PLAN),
             "{STALE_NOTE}"
+        );
+    }
+
+    #[test]
+    fn the_plan_from_the_caudra_section_opens_under_its_label() {
+        let Planned {
+            plan,
+            mut app,
+            _dirs,
+        } = planned(Draft::Written);
+
+        app.open_caudra_path(&plan, false);
+
+        assert_eq!(app.workbench.layout().tabs, [plan], "{PLAN_NOT_OPENED}");
+        assert!(rendered(&mut app).contains(PLAN_STATUS), "{NOT_LABELLED}");
+    }
+
+    #[test]
+    fn a_note_from_the_caudra_section_opens_under_its_name() {
+        let project = private_tempdir();
+        let mut app = test_app();
+        app.state.session_mut().cwd = project.path().to_string_lossy().into_owned();
+        let [_, notes] = project_document_dirs(&app.storage, project.path());
+        fs::create_dir_all(&notes).expect(WRITTEN);
+        let note = notes.join(NOTE_FILE);
+        fs::write(&note, PLAN_TEXT).expect(WRITTEN);
+
+        app.open_caudra_path(&note, false);
+
+        assert_eq!(app.workbench.layout().tabs, [note], "{NOTE_NOT_OPENED}");
+        assert!(rendered(&mut app).contains(NOTE_STATUS), "{NOT_LABELLED}");
+    }
+
+    #[test]
+    fn any_other_caudra_file_opens_as_itself() {
+        let config = private_tempdir();
+        let file = config.path().join(CONFIG_FILE);
+        fs::write(&file, PLAN_TEXT).expect(WRITTEN);
+        let mut app = test_app();
+
+        app.open_caudra_path(&file, false);
+
+        assert_eq!(
+            app.workbench.layout().tabs,
+            [file],
+            "{OPENED_AS_SOMETHING_ELSE}"
+        );
+        let frame = rendered(&mut app);
+        assert!(
+            !frame.contains(PLAN_STATUS_PREFIX) && !frame.contains(NOTE_STATUS),
+            "{OPENED_AS_SOMETHING_ELSE}"
+        );
+    }
+
+    #[test]
+    fn a_verified_policy_file_opens_in_the_editor_that_checks_it() {
+        let directory = private_tempdir();
+        let path = directory.path().join(POLICY_SOURCE);
+        fs::write(&path, PLAN_TEXT).expect(WRITTEN);
+        let locator =
+            VerifiedLocalSourceLocator::from_loaded_entrypoint(&path, PLAN_TEXT.as_bytes())
+                .expect(WRITTEN);
+        let plugins = Arc::new(PluginRuleStore::default());
+        let rule = PermissionRule {
+            tool: ToolKey::native(POLICY_TOOL),
+            scope: None,
+            effect: Effect::Deny,
+        };
+        plugins.replace_with_source(POLICY_PLUGIN, vec![rule], Some(locator));
+        let mut app = test_app();
+        app.permissions = Arc::new(PermissionManager::new_persistent_in(
+            PermissionsConfig::default(),
+            directory.path().to_path_buf(),
+            plugins,
+            app.storage.clone(),
+        ));
+        app.toggle_workbench();
+
+        app.open_caudra_path(&path, false);
+        app.finish_permission_jobs();
+
+        assert!(app.parked_workbench.is_some(), "{POLICY_UNCHECKED}");
+    }
+
+    /// The store's own file for `document`, which is what the Caudra section
+    /// lists in a remote session.
+    fn stored_path(remote: &Remote, document: &LocalDocumentRef) -> PathBuf {
+        match document {
+            LocalDocumentRef::Plan(plan) => remote
+                .store
+                .plan_dir(&remote.session())
+                .join(plan.as_str())
+                .with_extension(MARKDOWN_EXTENSION),
+            LocalDocumentRef::Memory(_) => remote.store.memories_dir().join(NOTE_FILE),
+        }
+    }
+
+    #[test_case(true ; "plan")]
+    #[test_case(false ; "note")]
+    fn a_stored_document_from_the_caudra_section_opens_through_its_store(plan: bool) {
+        let (mut remote, document) = match plan {
+            true => remote_plan(PLAN_TEXT),
+            false => {
+                let remote = remote();
+                let note = LocalDocumentRef::Memory(remote.note(PLAN_TEXT));
+                (remote, note)
+            }
+        };
+        let path = stored_path(&remote, &document);
+
+        remote.app.open_caudra_path(&path, false);
+
+        assert!(
+            remote.app.workbench.has_document(&stored_key(&document)),
+            "{STORE_BYPASSED}"
+        );
+        type_edit(&mut remote.app);
+        save(&mut remote.app);
+        assert_eq!(
+            remote.text(&document),
+            format!("{EDIT}{PLAN_TEXT}"),
+            "{NOT_STORED}"
+        );
+    }
+
+    #[test_case(false ; "local")]
+    #[test_case(true ; "remote")]
+    fn the_caudra_section_names_this_sessions_own_directories(remote_session: bool) {
+        let remote = remote();
+        let local = test_app();
+        let app = if remote_session { &remote.app } else { &local };
+        let store = remote_session.then(|| Arc::clone(&remote.store));
+        let session = app.state.session.id.to_string();
+
+        let mounts = app.caudra_mounts(store.as_deref(), &session);
+
+        let cwd = Path::new(&app.state.session.cwd);
+        let [plans, notes] = project_document_dirs(&app.storage, cwd);
+        let expected = match &store {
+            Some(store) => vec![
+                (PLANS_MOUNT, store.plan_dir(&session), true),
+                (MEMORIES_MOUNT, store.memories_dir(), true),
+            ],
+            None => vec![
+                (PLANS_MOUNT, plans, false),
+                (MEMORIES_MOUNT, notes, false),
+                (
+                    SCRATCH_MOUNT,
+                    project_scratch_path(cwd).expect(WRONG_MOUNTS),
+                    false,
+                ),
+            ],
+        };
+        let config = caudra_storage::paths::config_dir_path().expect(WRONG_MOUNTS);
+        let listed: Vec<_> = mounts
+            .into_iter()
+            .map(|mount| (mount.label, mount.root, mount.managed))
+            .collect();
+        let expected: Vec<_> = [(CONFIG_MOUNT, config, false)]
+            .into_iter()
+            .chain(expected)
+            .map(|(label, root, managed)| (label.to_owned(), root, managed))
+            .collect();
+        assert_eq!(listed, expected, "{WRONG_MOUNTS}");
+    }
+
+    #[test]
+    fn the_mounts_are_worked_out_again_only_once_the_session_moves() {
+        let mut app = test_app();
+        let elsewhere = private_tempdir();
+
+        assert!(app.sync_workbench_mounts(), "{WRONG_MOUNTS}");
+        assert!(!app.sync_workbench_mounts(), "{MOUNTS_REREAD}");
+        app.state.session_mut().cwd = elsewhere.path().to_string_lossy().into_owned();
+        assert!(app.sync_workbench_mounts(), "{WRONG_MOUNTS}");
+    }
+
+    #[test]
+    fn a_remote_workbench_stores_no_layout() {
+        let mut remote = remote();
+        let host = private_tempdir();
+        let file = host.path().join(STORED_FILE);
+        fs::write(&file, PLAN_TEXT).expect(WRITTEN);
+        let cwd = PathBuf::from(&remote.app.state.session.cwd);
+        remote.app.toggle_workbench();
+        remote.app.workbench.open_host_file(&file, None, false);
+
+        let _ = remote.app.tick_workbench();
+
+        assert!(
+            caudra_storage::workbench::read::<WorkbenchLayout>(&remote.app.storage, &cwd).is_none(),
+            "{LAYOUT_STORED}"
         );
     }
 }

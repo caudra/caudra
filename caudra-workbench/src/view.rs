@@ -19,6 +19,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::editor::rendered::PaintMarkdown;
 use crate::editor::text_field::TextField;
 use crate::editor::{DiffKind, Editor, Tab, VisualRow, render};
+use crate::explorer::{Explorer, ExplorerSection};
 use crate::fs::backend::WorkbenchPath;
 use crate::fs::tree::{GitMark, Row as TreeRow};
 use crate::menu::{Item, Menu};
@@ -31,8 +32,8 @@ use crate::scroll::ScrollHint;
 use crate::search::engine::Hit;
 use crate::search::{Field as SearchField, Row as SearchRow, Search};
 use crate::{
-    Ask, Bar, Choice, Drag, Focus, FocusedField, SidebarView, Workbench, WorkbenchStyles, chrome,
-    keys, layout, layout_sections,
+    Ask, Bar, Choice, DeleteTarget, Drag, Focus, FocusedField, SidebarView, Workbench,
+    WorkbenchStyles, chrome, keys, layout, layout_sections,
 };
 
 pub(crate) const HINT_GAP: &str = "  ";
@@ -341,8 +342,13 @@ impl Workbench {
             chrome::status_line(switcher, right, header.width, self.styles.dim),
         );
 
+        if self.sidebar != SidebarView::Explorer {
+            for section in ExplorerSection::ALL {
+                self.scrollbar(buf, Bar::Explorer(section), None, 0, 0);
+            }
+        }
         match self.sidebar {
-            SidebarView::Explorer => self.render_tree(buf, body),
+            SidebarView::Explorer => self.render_explorer(buf, body),
             SidebarView::SourceControl => self.render_scm(buf, body),
             SidebarView::Search => self.render_search(buf, body, focused),
             SidebarView::Transfer => self.render_transfer_sidebar(buf, body),
@@ -350,17 +356,22 @@ impl Workbench {
     }
 
     /// What the sidebar header prints on its right: the branch for source
-    /// control, the project's own name for the rest. The header's button is
+    /// control, the project's own name for the rest. A stacked explorer names
+    /// the project on its own section instead. The header's button is
     /// measured against it, so the hit test asks for it too.
     pub(crate) fn header_context(&self) -> String {
         match self.sidebar {
             SidebarView::SourceControl => self.scm.head().unwrap_or_default().to_owned(),
-            _ => self
-                .root
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            SidebarView::Explorer if self.explorer.is_stacked() => String::new(),
+            _ => self.project_name(),
         }
+    }
+
+    fn project_name(&self) -> String {
+        self.root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 
     /// The one button the header offers for the view that is up. The explorer
@@ -468,10 +479,10 @@ impl Workbench {
             return;
         }
         let wanted = Section::ALL.map(|section| {
-            (
+            Some((
                 self.scm.height(section),
                 self.scm.is_collapsed(section) || self.scm.count(section) == 0,
-            )
+            ))
         });
         self.panes.sections = layout_sections(area, wanted);
 
@@ -567,43 +578,84 @@ impl Workbench {
         }
     }
 
-    fn render_tree(&mut self, buf: &mut Surface, area: Rect) {
+    /// The project's tree alone fills the pane, as it always has. Once other
+    /// sections stand beside it, each gets a pinned title over a list that
+    /// scrolls under it, the way source control stacks its own.
+    fn render_explorer(&mut self, buf: &mut Surface, area: Rect) {
         grab_scope!("workbench_explorer", area);
-        let height = area.height as usize;
-        self.tree.clamp_scroll(height);
-        if self.tree.rows().is_empty() {
-            self.panes.rows = area;
-            let notice = if self.remote_backend.is_some() && !self.remote_pending.is_empty() {
-                LOADING_TREE
-            } else {
-                EMPTY_TREE
-            };
-            placeholder(buf, area, notice, self.styles.dim);
+        if !self.explorer.is_stacked() {
+            let project = ExplorerSection::Project;
+            self.panes.explorer = Default::default();
+            self.panes.explorer[project.index()].body = self.render_tree(buf, project, area);
+            for section in [ExplorerSection::Caudra, ExplorerSection::Folders] {
+                self.scrollbar(buf, Bar::Explorer(section), None, 0, 0);
+            }
             return;
         }
-        let (rows, bar) = scroll_column(self.scrollbars, area, self.tree.rows().len());
-        self.panes.rows = rows;
-        let scroll = self.tree.scroll();
-        let selected = self.tree.selected_index();
+        let wanted = ExplorerSection::ALL.map(|section| self.explorer.wanted(section));
+        self.panes.explorer = layout_sections(area, wanted);
+        let project = self.project_name();
+        for section in ExplorerSection::ALL {
+            let rects = self.panes.explorer[section.index()];
+            if rects.header.is_empty() {
+                self.scrollbar(buf, Bar::Explorer(section), None, 0, 0);
+                continue;
+            }
+            let chosen = self.explorer.active() == section && self.explorer.on_header();
+            let line = explorer_header(
+                &Explorer::title(section, &project),
+                self.explorer.is_collapsed(section),
+                chosen,
+                &self.styles,
+                rects.header.width,
+            );
+            let pointed = self.hovering(rects.header).is_some();
+            let line = emphasize(line, pointed && !chosen, &self.styles);
+            chrome::render_line(buf, rects.header, line);
+            self.panes.explorer[section.index()].body = self.render_tree(buf, section, rects.body);
+        }
+    }
+
+    /// Reports the rows it drew into, which is `area` less whatever its
+    /// scrollbar took.
+    fn render_tree(&mut self, buf: &mut Surface, section: ExplorerSection, area: Rect) -> Rect {
+        grab_scope!("workbench_explorer_section", area);
+        let height = area.height as usize;
+        let bar = Bar::Explorer(section);
+        if height == 0 {
+            self.scrollbar(buf, bar, None, 0, 0);
+            return area;
+        }
+        self.section_tree_mut(section).clamp_scroll(height);
+        let tree = self.explorer.tree(&self.tree, section);
+        if tree.rows().is_empty() {
+            let loading = section == ExplorerSection::Project
+                && self.remote_backend.is_some()
+                && !self.remote_pending.is_empty();
+            let notice = if loading { LOADING_TREE } else { EMPTY_TREE };
+            placeholder(buf, area, notice, self.styles.dim);
+            self.scrollbar(buf, bar, None, 0, 0);
+            return area;
+        }
+        let total = tree.rows().len();
+        let (rows, column) = scroll_column(self.scrollbars, area, total);
+        let scroll = tree.scroll();
+        let selected = tree.selected_index();
+        // Only the section the cursor is in marks a row: every tree keeps a
+        // selection of its own, and three marked rows would say nothing.
+        let active = self.explorer.active() == section && !self.explorer.on_header();
         let pointed = self.hovered_row(rows);
         let on_mark = self
             .hovering(rows)
             .is_some_and(|at| on_menu_mark(at.0, rows.x));
-        for (offset, row) in self
-            .tree
-            .rows()
-            .iter()
-            .skip(scroll)
-            .take(height)
-            .enumerate()
-        {
+        for (offset, row) in tree.rows().iter().skip(scroll).take(height).enumerate() {
             // Not gated on the focus. The row is what the editor is showing as
             // much as it is where the arrow keys are, and a pane that drops the
             // mark the moment anything else is focused cannot answer the only
             // question it is ever asked from the editor: where am I? Which pane
             // has the focus is already on the header, which prints the view it
             // is showing in bold only while it holds it.
-            let chosen = scroll + offset == selected;
+            let chosen = active && scroll + offset == selected;
             let marked = on_mark && pointed == Some(offset);
             let (line, cut) = tree_row(row, chosen, marked, &self.styles, rows.width);
             let line = emphasize(line, pointed == Some(offset) && !chosen, &self.styles);
@@ -613,7 +665,8 @@ impl Workbench {
             }
             chrome::render_line(buf, line_at(rows, offset), line);
         }
-        self.scrollbar(buf, Bar::Sidebar, bar, self.tree.rows().len(), scroll);
+        self.scrollbar(buf, bar, column, total, scroll);
+        rows
     }
 
     fn render_editor(&mut self, buf: &mut Surface, area: Rect) {
@@ -805,15 +858,10 @@ impl Workbench {
     /// Names what goes, relative to the project so a deep path is still one
     /// line, and counts what goes with it when it is a folder.
     fn delete_question(&self, under: usize) -> String {
-        let path = self
-            .delete_target
-            .as_ref()
-            .map(|entry| entry.path.clone())
-            .or_else(|| self.tree.selected().map(|row| row.path.clone()));
-        let Some(path) = path else {
+        let Some(path) = self.delete_target.as_ref().map(DeleteTarget::path) else {
             return String::new();
         };
-        let named = path.display_relative(&self.backend_root());
+        let named = self.relative_path(&path);
         match under {
             0 => format!("{DELETE_QUESTION}{named}{ONE_PATH}"),
             _ => format!("{DELETE_QUESTION}{named}{WITH_MORE}{under}{MORE_PATHS}"),
@@ -1654,6 +1702,27 @@ fn section_header(
     chrome::status_line(left, right, width, styles.background)
 }
 
+/// An explorer section's pinned title: the fold marker and the name.
+fn explorer_header(
+    title: &str,
+    collapsed: bool,
+    selected: bool,
+    styles: &WorkbenchStyles,
+    width: u16,
+) -> Line<'static> {
+    let marker = match collapsed {
+        true => COLLAPSED_MARK,
+        false => EXPANDED_MARK,
+    };
+    let style = match selected {
+        true => styles.selected,
+        false => styles.title,
+    };
+    let label = format!("{marker}{title}");
+    let left = vec![Span::styled(chrome::fit(&label, width as usize), style)];
+    chrome::status_line(left, Vec::new(), width, styles.background)
+}
+
 /// The painted row, and the whole name or path of a row whose name was cut.
 fn scm_row(
     scm: &Scm,
@@ -2386,7 +2455,7 @@ mod tests {
     };
     use crate::fs::backend::WorkbenchPath;
     use crate::fs::tree::EntryKind;
-    use crate::menu::Menu;
+    use crate::menu::{Menu, RowOffer};
 
     const WRONG_TAB: &str = "the column does not fall on the tab the strip painted there";
     const WRONG_CONTROL: &str = "the column does not fall on the control the row painted there";
@@ -2865,7 +2934,7 @@ mod tests {
     }
 
     fn menu(at: (u16, u16)) -> Menu {
-        Menu::for_row(&entry(EntryKind::File, 0), at)
+        Menu::for_row(&entry(EntryKind::File, 0), at, &RowOffer::ALL)
     }
 
     #[test]

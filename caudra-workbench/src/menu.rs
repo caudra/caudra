@@ -25,6 +25,8 @@ pub(crate) enum Action {
     SendToComposer,
     Rename,
     Delete,
+    AddFolder,
+    RemoveFolder,
     Close,
     CloseOthers,
     CloseRight,
@@ -48,6 +50,8 @@ impl Action {
             Self::SendToComposer => "Send to Composer",
             Self::Rename => "Rename",
             Self::Delete => "Delete",
+            Self::AddFolder => "Add Folder",
+            Self::RemoveFolder => "Remove Folder",
             Self::Close => "Close",
             Self::CloseOthers => "Close Others",
             Self::CloseRight => "Close to the Right",
@@ -70,12 +74,38 @@ pub(crate) enum Item {
     Separator,
 }
 
+/// What a row's menu offers beyond reading it. A project row offers all of it;
+/// a row of this machine's own folders holds some of it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RowOffer {
+    /// Making a file or a folder beside or inside the row.
+    pub(crate) create: bool,
+    /// Renaming or deleting the row itself.
+    pub(crate) mutate: bool,
+    /// Naming the row in the composer.
+    pub(crate) mention: bool,
+    /// Taking a folder added by hand back out of the explorer.
+    pub(crate) remove: bool,
+}
+
+#[cfg(test)]
+impl RowOffer {
+    pub(crate) const ALL: Self = Self {
+        create: true,
+        mutate: true,
+        mention: true,
+        remove: true,
+    };
+}
+
 /// What the menu was opened on. Captured when it opens: any other input closes
 /// the menu, so neither the row nor the strip can move underneath it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Target {
     Row(WorkbenchPath),
     Tab(usize),
+    /// An explorer section's header, which stands for the explorer itself.
+    Header,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,22 +120,35 @@ pub(crate) struct Menu {
 impl Menu {
     /// The menu for a tree row. A folder has nothing to open, since pressing
     /// one expands it.
-    pub(crate) fn for_row(row: &Row, at: (u16, u16)) -> Self {
+    pub(crate) fn for_row(row: &Row, at: (u16, u16), offer: &RowOffer) -> Self {
+        let groups: [&[(bool, Action)]; 3] = [
+            &[
+                (!row.is_dir(), Action::Open),
+                (offer.create, Action::NewFile),
+                (offer.create, Action::NewFolder),
+            ],
+            &[
+                (true, Action::CopyPath),
+                (true, Action::CopyRelative),
+                (offer.mention, Action::SendToComposer),
+            ],
+            &[
+                (offer.mutate, Action::Rename),
+                (offer.mutate, Action::Delete),
+                (offer.remove, Action::RemoveFolder),
+            ],
+        ];
         let mut items = Vec::with_capacity(ITEMS);
-        if !row.is_dir() {
-            items.push(Item::Action(Action::Open));
+        for group in groups {
+            let mut offered = group
+                .iter()
+                .filter_map(|(shown, action)| shown.then_some(Item::Action(*action)))
+                .peekable();
+            if offered.peek().is_some() && !items.is_empty() {
+                items.push(Item::Separator);
+            }
+            items.extend(offered);
         }
-        items.extend([
-            Item::Action(Action::NewFile),
-            Item::Action(Action::NewFolder),
-            Item::Separator,
-            Item::Action(Action::CopyPath),
-            Item::Action(Action::CopyRelative),
-            Item::Action(Action::SendToComposer),
-            Item::Separator,
-            Item::Action(Action::Rename),
-            Item::Action(Action::Delete),
-        ]);
         Self::new(items, at, Target::Row(row.path.clone()))
     }
 
@@ -149,6 +192,12 @@ impl Menu {
             ]);
         }
         Self::new(items, at, Target::Tab(index))
+    }
+
+    /// The menu for an explorer section's header, which is where a folder of
+    /// this machine joins the explorer.
+    pub(crate) fn for_header(at: (u16, u16)) -> Self {
+        Self::new(vec![Item::Action(Action::AddFolder)], at, Target::Header)
     }
 
     fn new(items: Vec<Item>, at: (u16, u16), target: Target) -> Self {
@@ -234,7 +283,7 @@ impl Menu {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, Item, Menu, Target};
+    use super::{Action, Item, Menu, RowOffer, Target};
     use crate::editor::Tab;
     use crate::fs::backend::WorkbenchPath;
     use crate::fs::tree::{EntryKind, Row};
@@ -286,7 +335,7 @@ mod tests {
     #[test_case(EntryKind::File, true ; "a file can be opened")]
     #[test_case(EntryKind::Directory, false ; "a folder expands instead")]
     fn a_row_offers_open_only_when_there_is_something_to_open(kind: EntryKind, expected: bool) {
-        let menu = Menu::for_row(&row(kind), ANYWHERE);
+        let menu = Menu::for_row(&row(kind), ANYWHERE, &RowOffer::ALL);
 
         assert_eq!(
             actions(&menu).contains(&Action::Open),
@@ -298,7 +347,7 @@ mod tests {
 
     #[test]
     fn every_row_can_be_renamed_copied_and_thrown_away() {
-        let menu = Menu::for_row(&row(EntryKind::Directory), ANYWHERE);
+        let menu = Menu::for_row(&row(EntryKind::Directory), ANYWHERE, &RowOffer::ALL);
         let offered = actions(&menu);
 
         for action in [
@@ -312,6 +361,40 @@ mod tests {
         ] {
             assert!(offered.contains(&action), "{WRONG_ITEMS}: {action:?}");
         }
+    }
+
+    #[test_case(RowOffer { create: false, ..RowOffer::ALL }, &[Action::NewFile, Action::NewFolder] ; "no creating")]
+    #[test_case(RowOffer { mutate: false, ..RowOffer::ALL }, &[Action::Rename, Action::Delete] ; "no renaming or deleting")]
+    #[test_case(RowOffer { mention: false, ..RowOffer::ALL }, &[Action::SendToComposer] ; "no mentioning")]
+    #[test_case(RowOffer { remove: false, ..RowOffer::ALL }, &[Action::RemoveFolder] ; "no removing")]
+    fn a_row_holds_back_what_it_may_not_offer(offer: RowOffer, withheld: &[Action]) {
+        let menu = Menu::for_row(&row(EntryKind::File), ANYWHERE, &offer);
+        let offered = actions(&menu);
+
+        for action in withheld {
+            assert!(!offered.contains(action), "{WRONG_ITEMS}: {action:?}");
+        }
+        assert!(offered.contains(&Action::CopyPath), "{WRONG_ITEMS}");
+    }
+
+    #[test]
+    fn a_row_offering_only_reads_draws_no_stray_rule() {
+        let offer = RowOffer {
+            create: false,
+            mutate: false,
+            mention: false,
+            remove: false,
+        };
+        let menu = Menu::for_row(&row(EntryKind::Directory), ANYWHERE, &offer);
+
+        assert_eq!(
+            menu.items(),
+            [
+                Item::Action(Action::CopyPath),
+                Item::Action(Action::CopyRelative)
+            ],
+            "{WRONG_ITEMS}"
+        );
     }
 
     #[test]
@@ -386,7 +469,7 @@ mod tests {
 
     #[test]
     fn the_cursor_steps_over_the_rules_between_groups() {
-        let mut menu = Menu::for_row(&row(EntryKind::File), ANYWHERE);
+        let mut menu = Menu::for_row(&row(EntryKind::File), ANYWHERE, &RowOffer::ALL);
         let mut landed = vec![menu.selected().expect(RULE_PICKED)];
 
         for _ in 1..actions(&menu).len() {
@@ -399,19 +482,19 @@ mod tests {
 
     #[test]
     fn the_cursor_stops_at_both_ends() {
-        let mut menu = Menu::for_row(&row(EntryKind::File), ANYWHERE);
+        let mut menu = Menu::for_row(&row(EntryKind::File), ANYWHERE, &RowOffer::ALL);
 
         menu.step(-1);
         assert_eq!(menu.selected(), Some(Action::Open), "{RULE_PICKED}");
 
         menu.select_last();
         menu.step(1);
-        assert_eq!(menu.selected(), Some(Action::Delete), "{RULE_PICKED}");
+        assert_eq!(menu.selected(), Some(Action::RemoveFolder), "{RULE_PICKED}");
     }
 
     #[test]
     fn a_rule_is_never_where_the_cursor_lands() {
-        let mut menu = Menu::for_row(&row(EntryKind::File), ANYWHERE);
+        let mut menu = Menu::for_row(&row(EntryKind::File), ANYWHERE, &RowOffer::ALL);
         let rule = menu
             .items()
             .iter()
@@ -427,7 +510,7 @@ mod tests {
 
     #[test]
     fn the_panel_is_as_wide_as_its_longest_label() {
-        let menu = Menu::for_row(&row(EntryKind::File), ANYWHERE);
+        let menu = Menu::for_row(&row(EntryKind::File), ANYWHERE, &RowOffer::ALL);
 
         assert_eq!(
             menu.width(),

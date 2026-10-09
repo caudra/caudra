@@ -159,7 +159,7 @@ impl LocalDocumentStore {
         content: &str,
     ) -> Result<PlanRef, LocalDocumentError> {
         self.validate_project(project)?;
-        let dir = self.plan_write_dir(session_id);
+        let dir = self.plan_dir(session_id);
         for _ in 0..10 {
             let reference = PlanRef::new(format!("{PLAN_REF_PREFIX}{}", random_id()))
                 .map_err(|_| LocalDocumentError::InvalidReference)?;
@@ -417,6 +417,45 @@ impl LocalDocumentStore {
         Ok(())
     }
 
+    /// Where this session's plans are written, for browsing. Nothing is
+    /// created, and reading or writing a plan still goes through its
+    /// reference.
+    pub fn plan_dir(&self, session_id: &str) -> PathBuf {
+        self.project_write_dir()
+            .join(PLANS_DIR)
+            .join(PLAN_SESSIONS_DIR)
+            .join(session_directory(session_id))
+    }
+
+    /// Where notes are written, for browsing. Nothing is created, and
+    /// reading or writing a note still goes through its reference.
+    pub fn memories_dir(&self) -> PathBuf {
+        self.project_write_dir().join(MEMORIES_DIR)
+    }
+
+    /// The reference [`Self::read`] resolves to the file at `path`, so a
+    /// document browsed to keeps its revision checks. `None` for any other
+    /// file, among them another session's plan, a note an earlier read
+    /// directory shadows, and anything reached through a symbolic link.
+    pub fn reference_for_path(
+        &self,
+        project: &ProjectKey,
+        session_id: &str,
+        path: &Path,
+    ) -> Result<Option<LocalDocumentRef>, LocalDocumentError> {
+        self.validate_project(project)?;
+        if ensure_no_symlink_ancestors(path).is_err() {
+            return Ok(None);
+        }
+        Ok([plan_candidate(path), self.memory_candidate(path)]
+            .into_iter()
+            .flatten()
+            .find(|reference| {
+                self.resolve(project, Some(session_id), reference)
+                    .is_ok_and(|(resolved, _)| resolved == path)
+            }))
+    }
+
     fn resolve(
         &self,
         project: &ProjectKey,
@@ -487,8 +526,10 @@ impl LocalDocumentStore {
             .collect()
     }
 
-    fn plan_write_dir(&self, session_id: &str) -> PathBuf {
-        let project = match &self.aliases {
+    /// The project directory writes go to, as `ensure_write_subdir` would
+    /// create it.
+    fn project_write_dir(&self) -> PathBuf {
+        match &self.aliases {
             DocumentProjectScope::Local(aliases) => aliases
                 .resolve_existing(&self.state_dir)
                 .unwrap_or_else(|| {
@@ -499,11 +540,7 @@ impl LocalDocumentStore {
             DocumentProjectScope::Remote { subdir, .. } => {
                 self.state_dir.persistent_path().join(subdir)
             }
-        };
-        project
-            .join(PLANS_DIR)
-            .join(PLAN_SESSIONS_DIR)
-            .join(session_directory(session_id))
+        }
     }
 
     fn memory_read_dirs(&self) -> Vec<PathBuf> {
@@ -541,6 +578,17 @@ impl LocalDocumentStore {
     fn memory_write_dir(&self) -> Result<PathBuf, LocalDocumentError> {
         let project = self.aliases.ensure_write_subdir(&self.state_dir)?;
         secure_directory(&project.join(MEMORIES_DIR))
+    }
+
+    /// The reference a note under a read directory would have, whether or
+    /// not one is there.
+    fn memory_candidate(&self, path: &Path) -> Option<LocalDocumentRef> {
+        let relative = self
+            .memory_read_dirs()
+            .iter()
+            .find_map(|root| path.strip_prefix(root).ok())?;
+        let name = normalized_name(&memory_relative(relative.to_str()?).ok()?);
+        self.memory_ref(&name).ok().map(LocalDocumentRef::Memory)
     }
 
     fn memory_ref(&self, name: &str) -> Result<MemoryRef, LocalDocumentError> {
@@ -594,6 +642,12 @@ fn validate_ref(reference: &str, prefix: &str) -> Result<(), LocalDocumentError>
 fn document_path(dir: &Path, reference: &str) -> Result<PathBuf, LocalDocumentError> {
     validate_ref(reference, PLAN_REF_PREFIX)?;
     Ok(dir.join(reference).with_extension(MARKDOWN_EXTENSION))
+}
+
+fn plan_candidate(path: &Path) -> Option<LocalDocumentRef> {
+    PlanRef::new(path.file_stem()?.to_str()?)
+        .ok()
+        .map(LocalDocumentRef::Plan)
 }
 
 fn validate_size(content: &str) -> Result<(), LocalDocumentError> {
@@ -776,6 +830,21 @@ mod tests {
     const UNLISTED: &str = "draft.txt";
     const MISSING_NOTE: &str = "missing.md";
     const ESCAPING_NOTE: &str = "../escape.md";
+    const TRAVERSING_NOTE: &str = "nested/../note.md";
+    const NESTED_DIR: &str = "nested";
+    const INVALID_PLAN: &str = "plan-not-hex.md";
+    const TEXT_EXTENSION: &str = "txt";
+    #[cfg(unix)]
+    const LINK_TARGET: &str = "outside";
+    const OWNER_FIELDS: [&str; 7] = [
+        "origin",
+        "server",
+        "workspace",
+        "generation",
+        "namespace",
+        "principal",
+        PROJECT,
+    ];
     const MODIFIED_MS: u64 = 1_700_000_000_000;
     #[cfg(unix)]
     const LEGACY_MODE: u32 = 0o644;
@@ -809,7 +878,7 @@ mod tests {
                 super::PrivateFileError::TooLarge
             ))
         ));
-        assert!(!store.plan_write_dir(SESSION).exists());
+        assert!(!store.plan_dir(SESSION).exists());
     }
 
     #[cfg(unix)]
@@ -856,7 +925,7 @@ mod tests {
         assert!(
             matches!(store.adopt_legacy_plan(&project, SESSION, &path), Err(LocalDocumentError::PrivateFile(error)) if error == expected)
         );
-        assert!(!store.plan_write_dir(SESSION).exists());
+        assert!(!store.plan_dir(SESSION).exists());
         assert_eq!(
             fs::metadata(&source).unwrap().permissions().mode(),
             before.permissions().mode()
@@ -1102,6 +1171,18 @@ mod tests {
         (root, store, project)
     }
 
+    fn remote_store() -> (tempfile::TempDir, LocalDocumentStore, ProjectKey) {
+        let root = tempdir();
+        let owner = binding(OWNER_FIELDS, SESSION);
+        let store =
+            LocalDocumentStore::remote(StateDir::from_path(root.path().join("state")), &owner);
+        (root, store, owner.project().key().clone())
+    }
+
+    fn store_for(remote: bool) -> (tempfile::TempDir, LocalDocumentStore, ProjectKey) {
+        if remote { remote_store() } else { store() }
+    }
+
     #[cfg(unix)]
     #[test_case(NOTE; "flat_note")]
     #[test_case(NESTED_NOTE; "nested_note")]
@@ -1206,7 +1287,7 @@ mod tests {
         let created = store.create_plan_with_content(&project, SESSION, &"x".repeat(size));
 
         assert_eq!(created.unwrap_err().to_string(), expected.to_string());
-        assert!(!store.plan_write_dir(SESSION).exists());
+        assert!(!store.plan_dir(SESSION).exists());
     }
 
     #[test]
@@ -1449,5 +1530,173 @@ mod tests {
             ));
             assert!(outside.join("victim.md").exists());
         }
+    }
+
+    #[test_case(false; "local")]
+    #[test_case(true; "remote")]
+    fn browsing_dirs_are_where_writes_land_and_create_nothing(remote: bool) {
+        let (_root, store, project) = store_for(remote);
+
+        let plans = store.plan_dir(SESSION);
+        let notes = store.memories_dir();
+
+        assert!(!store.state_dir.persistent_path().exists());
+        let plan = LocalDocumentRef::Plan(store.create_plan(&project, SESSION).unwrap());
+        store.write_memory(&project, NOTE, REMOTE_CONTENT).unwrap();
+        let (plan_path, _) = store.resolve(&project, Some(SESSION), &plan).unwrap();
+        assert_eq!(plan_path.parent(), Some(plans.as_path()));
+        assert!(notes.join(NOTE).is_file());
+        assert_eq!(
+            (store.plan_dir(SESSION), store.memories_dir()),
+            (plans, notes)
+        );
+    }
+
+    #[test_case(false; "local")]
+    #[test_case(true; "remote")]
+    fn a_plan_path_maps_to_the_reference_that_reads_it(remote: bool) {
+        let (_root, store, project) = store_for(remote);
+        let reference = store
+            .create_plan_with_content(&project, SESSION, REMOTE_CONTENT)
+            .unwrap();
+        let path = super::document_path(&store.plan_dir(SESSION), reference.as_str()).unwrap();
+
+        let mapped = store.reference_for_path(&project, SESSION, &path).unwrap();
+
+        assert_eq!(mapped, Some(LocalDocumentRef::Plan(reference)));
+        assert_eq!(
+            store
+                .read(&project, Some(SESSION), &mapped.unwrap())
+                .unwrap()
+                .content,
+            REMOTE_CONTENT
+        );
+        assert_eq!(
+            store
+                .reference_for_path(&project, OTHER_SESSION, &path)
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            store.reference_for_path(&ProjectKey::new(OTHER_PROJECT).unwrap(), SESSION, &path),
+            Err(LocalDocumentError::WrongProject)
+        ));
+    }
+
+    #[test_case(NOTE, false; "top_level_local")]
+    #[test_case(NESTED_NOTE, false; "nested_local")]
+    #[test_case(NOTE, true; "top_level_remote")]
+    #[test_case(NESTED_NOTE, true; "nested_remote")]
+    fn a_note_path_maps_to_the_reference_that_reads_it(name: &str, remote: bool) {
+        let (_root, store, project) = store_for(remote);
+        let written = store.write_memory(&project, name, REMOTE_CONTENT).unwrap();
+
+        let mapped = store
+            .reference_for_path(&project, SESSION, &store.memories_dir().join(name))
+            .unwrap();
+
+        assert_eq!(mapped, Some(LocalDocumentRef::Memory(written)));
+        assert_eq!(
+            store
+                .read(&project, None, &mapped.unwrap())
+                .unwrap()
+                .content,
+            REMOTE_CONTENT
+        );
+    }
+
+    #[test_case(|plan, _| plan.with_extension(TEXT_EXTENSION), true; "wrong_extension")]
+    #[test_case(|plan, _| plan.with_file_name(INVALID_PLAN), true; "invalid_plan_name")]
+    #[test_case(|_, notes| notes.join(UNLISTED), true; "unlisted_note")]
+    #[test_case(|_, notes| notes.join(NESTED_DIR), false; "directory")]
+    #[test_case(|_, notes| notes.join(MISSING_NOTE), false; "missing_note")]
+    #[test_case(|_, notes| notes.join(TRAVERSING_NOTE), false; "traversal")]
+    #[test_case(|_, notes| notes.with_file_name(NOTE), true; "outside")]
+    fn a_path_read_would_not_open_maps_to_nothing(
+        locate: fn(&Path, &Path) -> PathBuf,
+        create: bool,
+    ) {
+        let (_root, store, project) = remote_store();
+        let plan = store.create_plan(&project, SESSION).unwrap();
+        let plan = super::document_path(&store.plan_dir(SESSION), plan.as_str()).unwrap();
+        store.write_memory(&project, NOTE, REMOTE_CONTENT).unwrap();
+        store
+            .write_memory(&project, NESTED_NOTE, REMOTE_CONTENT)
+            .unwrap();
+        let path = locate(&plan, &store.memories_dir());
+        if create {
+            fs::write(&path, CANARY).unwrap();
+        }
+
+        assert_eq!(
+            store.reference_for_path(&project, SESSION, &path).unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test_case(true, |path| path.to_path_buf(); "plan_file")]
+    #[test_case(true, |path| path.parent().unwrap().to_path_buf(); "plan_directory")]
+    #[test_case(false, |path| path.to_path_buf(); "note_file")]
+    #[test_case(false, |path| path.parent().unwrap().to_path_buf(); "note_directory")]
+    fn a_document_reached_through_a_symlink_maps_to_nothing(
+        plan: bool,
+        linked: fn(&Path) -> PathBuf,
+    ) {
+        let (root, store, project) = remote_store();
+        let path = if plan {
+            let reference = store.create_plan(&project, SESSION).unwrap();
+            super::document_path(&store.plan_dir(SESSION), reference.as_str()).unwrap()
+        } else {
+            store.write_memory(&project, NOTE, REMOTE_CONTENT).unwrap();
+            store.memories_dir().join(NOTE)
+        };
+        let link = linked(&path);
+        let target = root.path().join(LINK_TARGET);
+        fs::rename(&link, &target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(path.is_file());
+        assert_eq!(
+            store.reference_for_path(&project, SESSION, &path).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_note_shadowed_by_an_earlier_read_directory_maps_to_nothing() {
+        let (root, store, project) = store();
+        store.write_memory(&project, NOTE, REMOTE_CONTENT).unwrap();
+        let legacy = store
+            .state_dir
+            .persistent_path()
+            .join(LocalProjectAliases::new(root.path(), project.clone()).legacy_subdir())
+            .join(MEMORIES_DIR);
+        create_dir_all(&legacy);
+        fs::write(legacy.join(NOTE), CANARY).unwrap();
+        fs::write(legacy.join(LEGACY_NOTE), LEGACY_CONTENT).unwrap();
+
+        let shadowing = store
+            .reference_for_path(&project, SESSION, &store.memories_dir().join(NOTE))
+            .unwrap();
+        let shadowed = store
+            .reference_for_path(&project, SESSION, &legacy.join(NOTE))
+            .unwrap();
+        let unshadowed = store
+            .reference_for_path(&project, SESSION, &legacy.join(LEGACY_NOTE))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            shadowing,
+            Some(LocalDocumentRef::Memory(
+                store.memory_reference(&project, NOTE).unwrap()
+            ))
+        );
+        assert_eq!(shadowed, None);
+        assert_eq!(
+            store.read(&project, None, &unshadowed).unwrap().content,
+            LEGACY_CONTENT
+        );
     }
 }
