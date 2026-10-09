@@ -134,8 +134,8 @@ version = 1
 # Type: u64.
 # which_key_delay_ms = 250
 
-# Show a tooltip when the mouse rests on a footer chip, an icon, a cut-off name
-# or a paste token.
+# Show a tooltip when the mouse rests on a footer chip, a composer or queue
+# control, an icon, a cut-off name or a paste token.
 # Type: bool.
 # tooltips = true
 

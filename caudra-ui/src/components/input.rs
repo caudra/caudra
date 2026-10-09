@@ -76,11 +76,34 @@ const ADMISSION_OPTIONS: [(&str, &str, PromptAdmission); 3] = [
         PromptAdmission::Interrupt,
     ),
 ];
+const TIP_NEXT: &str = "Waits until this run and its background work finish";
+const TIP_GUIDE: &str = "Joins this run before its next model request, without stopping it";
+const TIP_REPLACE: &str = "Stops this run and its background work, then sends this instead";
+pub(crate) const CLICK_OR_PRESS: &str = "Click or press ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AdmissionHit {
     pub area: Rect,
     pub admission: PromptAdmission,
+}
+
+impl AdmissionHit {
+    /// What sending this way does, and the key that does it without the mouse.
+    pub(crate) fn tip(self) -> Option<Tip> {
+        let (key, _, _) = ADMISSION_OPTIONS
+            .iter()
+            .find(|(_, _, admission)| *admission == self.admission)?;
+        let meaning = match self.admission {
+            PromptAdmission::Queue => TIP_NEXT,
+            PromptAdmission::Steer => TIP_GUIDE,
+            PromptAdmission::Interrupt => TIP_REPLACE,
+        };
+        Some(Tip::at(
+            TipKey::Admission(self.admission),
+            self.area,
+            format!("{meaning}\n{CLICK_OR_PRESS}{key}"),
+        ))
+    }
 }
 
 /// A chord the composer's top row advertises when nothing louder wants it.

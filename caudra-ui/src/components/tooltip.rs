@@ -8,6 +8,7 @@
 
 use std::time::{Duration, Instant};
 
+use caudra_agent::PromptAdmission;
 use caudra_grab::grab_scope;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -16,6 +17,8 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Widget};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::components::input::ChordHint;
+use crate::components::queue_panel::QueueHitTarget;
 use crate::components::status_bar::StatusBarHitTarget;
 use crate::input_document::PasteId;
 use crate::repaint::Cadence;
@@ -46,6 +49,11 @@ pub(crate) enum TipKey {
     /// A list row, named by where it is drawn: rows have no identity that
     /// outlives a scroll, and a scrolled row is a different row to the reader.
     Row(Rect),
+    Admission(PromptAdmission),
+    Chord(ChordHint),
+    Queue(QueueHitTarget),
+    TodoHeader,
+    UpdateClose,
 }
 
 /// Where the box hangs from.
@@ -62,6 +70,30 @@ pub(crate) struct Tip {
     pub key: TipKey,
     pub anchor: Anchor,
     pub text: String,
+}
+
+impl Tip {
+    pub(crate) fn at(key: TipKey, area: Rect, text: String) -> Self {
+        Self {
+            key,
+            anchor: Anchor::Area(area),
+            text,
+        }
+    }
+}
+
+/// A row drawn shorter than its text, with the text it lost.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CutRow {
+    pub area: Rect,
+    pub text: String,
+}
+
+/// The whole text of the cut row under the pointer.
+pub(crate) fn cut_row_tip(rows: &[CutRow], pointer: Option<Position>) -> Option<Tip> {
+    let pointer = pointer?;
+    let row = rows.iter().find(|row| row.area.contains(pointer))?;
+    Some(Tip::at(TipKey::Row(row.area), row.area, row.text.clone()))
 }
 
 struct Armed {
@@ -89,6 +121,12 @@ impl Tooltip {
 
     pub(crate) fn pointer_moved(&mut self, at: Position) {
         self.pointer = Some(at);
+    }
+
+    /// For targets that keep no hover of their own: `None` once anything but
+    /// a move has happened since, so a stale position never raises a box.
+    pub(crate) fn pointer(&self) -> Option<Position> {
+        self.pointer
     }
 
     pub(crate) fn dismiss(&mut self) {

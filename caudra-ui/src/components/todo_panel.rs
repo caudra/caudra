@@ -17,11 +17,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
+use crate::components::tooltip::{self, CutRow, Tip, TipKey};
 use crate::components::{apply_scroll_delta, hover_style};
 use crate::theme;
 
 const TITLE: &str = "Todos";
 const ELLIPSIS: &str = "…";
+const TIP_HEADER: &str = "The steps the model keeps for its current work\nClick to hide the list";
+const TIP_PROGRESS_OF: &str = " of ";
+const TIP_PROGRESS_DONE: &str = " todo items done";
 
 /// Beyond this the panel would crowd out the transcript; the list scrolls to
 /// keep the in-progress item in view instead.
@@ -50,6 +54,8 @@ pub struct TodoPanel {
     header: Rect,
     header_down: bool,
     header_hover: bool,
+    /// Items drawn shorter than they are, for a tooltip with the whole text.
+    cut_rows: Vec<CutRow>,
 }
 
 impl TodoPanel {
@@ -72,6 +78,7 @@ impl TodoPanel {
         self.header = Rect::default();
         self.header_down = false;
         self.header_hover = false;
+        self.cut_rows.clear();
     }
 
     pub fn is_visible(&self) -> bool {
@@ -103,6 +110,30 @@ impl TodoPanel {
             return None;
         }
         Some(format!("{}/{}", self.completed(), self.items.len()))
+    }
+
+    /// The closed panel's counter in words, for its tooltip.
+    pub(crate) fn progress_tip(&self) -> String {
+        format!(
+            "{}{TIP_PROGRESS_OF}{}{TIP_PROGRESS_DONE}",
+            self.completed(),
+            self.items.len()
+        )
+    }
+
+    /// The header's close control, or the whole of an item drawn short.
+    pub(crate) fn hover_tip(&self, pointer: Option<Position>) -> Option<Tip> {
+        if !self.is_visible() {
+            return None;
+        }
+        if self.header_hover {
+            return Some(Tip::at(
+                TipKey::TodoHeader,
+                self.header,
+                TIP_HEADER.to_owned(),
+            ));
+        }
+        tooltip::cut_row_tip(&self.cut_rows, pointer)
     }
 
     fn completed(&self) -> usize {
@@ -196,6 +227,7 @@ impl TodoPanel {
         if !self.is_visible() || area.width < 2 || area.height < 2 {
             self.area = Rect::default();
             self.header = Rect::default();
+            self.cut_rows.clear();
             return;
         }
         grab_scope!("todo_panel", area);
@@ -238,9 +270,21 @@ impl TodoPanel {
             Paragraph::new(Line::from(title)).style(hover_style(t.panel_title, self.header_hover)),
             header,
         );
+        self.cut_rows.clear();
+        let width = usize::from(content.width);
         let lines = self.items[start..end]
             .iter()
-            .map(|item| row(item, content.width as usize))
+            .enumerate()
+            .map(|(offset, item)| {
+                let (line, cut) = row(item, width);
+                if cut {
+                    self.cut_rows.push(CutRow {
+                        area: Rect::new(content.x, content.y + offset as u16, content.width, 1),
+                        text: item.content.clone(),
+                    });
+                }
+                line
+            })
             .collect::<Vec<_>>();
         frame.render_widget(
             Paragraph::new(lines).style(Style::new().fg(t.foreground)),
@@ -249,7 +293,8 @@ impl TodoPanel {
     }
 }
 
-fn row(item: &TodoItem, width: usize) -> Line<'static> {
+/// The drawn row, and whether it had to be cut to fit.
+fn row(item: &TodoItem, width: usize) -> (Line<'static>, bool) {
     let t = theme::current();
     let style = match item.status {
         TodoStatus::Completed => t.todo_completed,
@@ -259,7 +304,8 @@ fn row(item: &TodoItem, width: usize) -> Line<'static> {
     };
     let marker = item.status.marker();
     let text = format!("{marker} {}", item.content);
-    Line::from(Span::styled(truncate(&text, width), style))
+    let cut = text.width() > width;
+    (Line::from(Span::styled(truncate(&text, width), style)), cut)
 }
 
 fn truncate(text: &str, width: usize) -> String {

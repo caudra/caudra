@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::sync::atomic::Ordering;
 
 use crate::components::Overlay;
-use crate::components::input::{self, ChordHint, Placeholder};
+use crate::components::input::{self, Placeholder};
 use crate::components::keybindings;
 #[cfg(test)]
 use crate::components::keybindings::KeybindContext;
@@ -28,6 +28,7 @@ use ratatui::widgets::{Block, Borders, Clear, Widget};
 
 use super::permission_editor::LOCAL_SOURCE_NOTICE;
 use super::sandbox::attached_sandbox_instance;
+use super::tooltip::ChordTopic;
 use super::{App, Mode};
 
 const MAIN_GUTTER_WIDE: u16 = 2;
@@ -66,6 +67,7 @@ impl App {
         grab_scope!("app", frame.area());
         self.sync_subagent_input_target();
         self.queue_hits.clear();
+        self.queue_cut_rows.clear();
         self.admission_hits.clear();
         self.chord_hint_hit = None;
         self.update_close = None;
@@ -393,7 +395,7 @@ impl App {
             let together = self
                 .active_queue_delivery()
                 .map(|delivery| delivery == caudra_agent::QueueDelivery::TogetherNextTurn);
-            self.queue_hits = queue_panel::view(
+            let drawn = queue_panel::view(
                 frame,
                 layout.queue_area,
                 &queue_title,
@@ -405,6 +407,8 @@ impl App {
                     hovered: self.queue_hover,
                 },
             );
+            self.queue_hits = drawn.hits;
+            self.queue_cut_rows = drawn.cut_rows;
             self.todo_panel.view(frame, layout.todo_area);
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
@@ -444,7 +448,7 @@ impl App {
             let together = self
                 .active_queue_delivery()
                 .map(|delivery| delivery == caudra_agent::QueueDelivery::TogetherNextTurn);
-            self.queue_hits = queue_panel::view(
+            let drawn = queue_panel::view(
                 frame,
                 layout.queue_area,
                 &queue_title,
@@ -456,6 +460,8 @@ impl App {
                     hovered: self.queue_hover,
                 },
             );
+            self.queue_hits = drawn.hits;
+            self.queue_cut_rows = drawn.cut_rows;
             self.todo_panel.view(frame, layout.todo_area);
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
@@ -907,19 +913,26 @@ impl App {
     /// before the task picker, so the hit recorded here is the only control the
     /// row holds this frame.
     fn chord_hint(&mut self, area: Rect) -> Option<Line<'static>> {
-        let (target, text) = if self.state.mode == Mode::Plan
-            && let Some(label) = self.plan_form.hint_label()
-        {
-            (ChordHint::PlanOrTodo, label.to_string())
-        } else if let Some(progress) = self.todo_panel.hint_label() {
-            (ChordHint::PlanOrTodo, progress)
-        } else {
-            (ChordHint::Tasks, self.task_hint_text()?)
-        };
+        let (topic, text) = self.chord_subject()?;
+        let target = topic.target();
         let hovered = self.chord_hint_hover == Some(target);
         let (line, hit) = input::chord_hint(area, &text, target, hovered);
         self.chord_hint_hit = Some(hit);
         Some(line)
+    }
+
+    /// What the chord hint is about and the label it reads, for the hint and
+    /// its tooltip alike, so the two cannot disagree.
+    pub(super) fn chord_subject(&self) -> Option<(ChordTopic, String)> {
+        if self.state.mode == Mode::Plan
+            && let Some(label) = self.plan_form.hint_label()
+        {
+            Some((ChordTopic::Plan, label.to_string()))
+        } else if let Some(progress) = self.todo_panel.hint_label() {
+            Some((ChordTopic::Todo, progress))
+        } else {
+            Some((ChordTopic::Tasks, self.task_hint_text()?))
+        }
     }
 
     fn lua_hint_line(&self) -> Option<Line<'static>> {

@@ -640,6 +640,7 @@ impl App {
         self.task_queue_selection = None;
         self.task_queue_viewport = 0;
         self.queue_hits.clear();
+        self.queue_cut_rows.clear();
         self.queue_mouse_down = None;
         self.queue_hover = None;
         self.todo_panel.reset();

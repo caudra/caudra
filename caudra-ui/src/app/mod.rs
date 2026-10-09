@@ -111,7 +111,7 @@ use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::thinking_picker::{ThinkingPicker, ThinkingPickerAction};
 use crate::components::todo_panel::TodoPanel;
 use crate::components::tools_modal::{ToolsModal, ToolsScope};
-use crate::components::tooltip::Tooltip;
+use crate::components::tooltip::{CutRow, Tooltip};
 use crate::components::usage_modal::{UsageFetchState, UsageModal, UsageScope};
 use crate::components::which_key::WhichKey;
 use crate::components::workbench::{paint_markdown, styles as workbench_styles};
@@ -542,6 +542,7 @@ pub struct App {
     pub(super) queue_hits: Vec<QueueHit>,
     pub(super) queue_mouse_down: Option<QueueHit>,
     pub(super) queue_hover: Option<QueueHitTarget>,
+    pub(super) queue_cut_rows: Vec<CutRow>,
     pub(super) admission_hits: Vec<AdmissionHit>,
     pub(super) admission_mouse_down: Option<AdmissionHit>,
     pub(super) admission_hover: Option<PromptAdmission>,
@@ -819,6 +820,7 @@ impl App {
             queue_hits: Vec::new(),
             queue_mouse_down: None,
             queue_hover: None,
+            queue_cut_rows: Vec::new(),
             admission_hits: Vec::new(),
             admission_mouse_down: None,
             admission_hover: None,

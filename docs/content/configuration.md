@@ -156,7 +156,7 @@ To keep using `init.lua`, set `lua_plugins = true` under `[experimental]`. Its `
 | `mermaid` | string | `unicode` | - | - | How mermaid flowcharts render: unicode (draw them with box-drawing characters) or off (leave the fence as code) |
 | `flash_duration_ms` | u64 | `10000` | - | - | Duration of ordinary status-bar messages (ms). Confirmation prompts use a fixed 3-second window |
 | `which_key_delay_ms` | u64 | `250` | - | - | How long Ctrl+X waits before listing the chords it can still reach (ms). 0 shows the list at once |
-| `tooltips` | bool | `true` | - | - | Show a tooltip when the mouse rests on a footer chip, an icon, a cut-off name or a paste token |
+| `tooltips` | bool | `true` | - | - | Show a tooltip when the mouse rests on a footer chip, a composer or queue control, an icon, a cut-off name or a paste token |
 | `typewriter_ms_per_char` | u64 | `4` | - | - | Typewriter effect speed (ms/char) |
 | `mouse_scroll_lines` | u32 | `3` | - | 1 | Lines per mouse wheel scroll |
 | `scroll_card_lines` | u32 | `10` | - | - | Rows of body a shell, python_execution or task card draws. The window follows new output while it sits at the bottom and pauses when scrolled up. Click inside a window to give it the wheel, which passes back to the transcript at either edge, and drag the bar in its last column to move it directly. `0` turns scrolling off, restoring the `ui.tool_output_lines` budget for those tools. A write is never windowed: it is drawn whole at any setting, as the file it created or as the diff of what it replaced |

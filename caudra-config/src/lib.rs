@@ -2182,7 +2182,7 @@ pub struct UiConfig {
 
     #[config(
         default = true,
-        desc = "Show a tooltip when the mouse rests on a footer chip, an icon, a cut-off name or a paste token"
+        desc = "Show a tooltip when the mouse rests on a footer chip, a composer or queue control, an icon, a cut-off name or a paste token"
     )]
     pub tooltips: bool,
 

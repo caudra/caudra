@@ -10,6 +10,7 @@ use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use super::hover_style;
+use super::tooltip::{CutRow, Tip, TipKey};
 use crate::theme;
 
 const ELLIPSIS: &str = "...";
@@ -22,6 +23,12 @@ const REPLACING_SECTION: &str = "Replacing";
 const SEPARATE_LABEL: &str = "[Mode: Separate]";
 const TOGETHER_LABEL: &str = "[Mode: Together]";
 const UP_NEXT_SECTION: &str = "Up next";
+pub(crate) const TIP_SEPARATE: &str = "Separate: each waiting prompt runs in its own turn";
+pub(crate) const TIP_TOGETHER: &str =
+    "Together: compatible waiting prompts share one model turn, then this resets";
+const CLICK_TOGGLE: &str = "Click or press b in the queue to switch";
+const TIP_MENU: &str = "Actions for this prompt, like edit, move or delete";
+const CLICK_MENU: &str = "Click or press . on the focused row";
 
 pub struct QueueEntry<'a> {
     pub id: QueueItemId,
@@ -55,6 +62,38 @@ pub struct QueueHit {
     pub target: QueueHitTarget,
 }
 
+impl QueueHit {
+    /// What the control means and how to reach it without the mouse. A row
+    /// says itself; only one drawn short has more to say, see [`QueueView`].
+    pub(crate) fn tip(self, together: bool) -> Option<Tip> {
+        let (meaning, click) = match self.target {
+            QueueHitTarget::ToggleTogether if together => (TIP_TOGETHER, CLICK_TOGGLE),
+            QueueHitTarget::ToggleTogether => (TIP_SEPARATE, CLICK_TOGGLE),
+            QueueHitTarget::Item {
+                action: QueueAction::Menu,
+                ..
+            } => (TIP_MENU, CLICK_MENU),
+            QueueHitTarget::Item {
+                action: QueueAction::Select,
+                ..
+            } => return None,
+        };
+        Some(Tip::at(
+            TipKey::Queue(self.target),
+            self.area,
+            format!("{meaning}\n{click}"),
+        ))
+    }
+}
+
+/// What a frame of the panel left behind for the pointer.
+#[derive(Default)]
+pub(crate) struct QueueView {
+    pub hits: Vec<QueueHit>,
+    /// Prompts too long for their row, for a tooltip with the whole text.
+    pub cut_rows: Vec<CutRow>,
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct QueuePanelState {
     pub focus: Option<usize>,
@@ -82,15 +121,15 @@ pub fn max_visible_entries() -> usize {
     MAX_VISIBLE_ENTRIES
 }
 
-pub fn view(
+pub(crate) fn view(
     frame: &mut Frame,
     area: Rect,
     title: &str,
     entries: &[QueueEntry],
     state: QueuePanelState,
-) -> Vec<QueueHit> {
+) -> QueueView {
     if entries.is_empty() || area.width < 2 || area.height < 2 {
-        return Vec::new();
+        return QueueView::default();
     }
     grab_scope!("queue_panel", area);
 
@@ -113,6 +152,7 @@ pub fn view(
     let start = window_start(&rows, state, visible_rows);
     let end = start.saturating_add(visible_rows).min(rows.len());
     let mut hits = Vec::new();
+    let mut cut_rows = Vec::new();
     let lines = rows
         .get(start..end)
         .unwrap_or_default()
@@ -136,6 +176,7 @@ pub fn view(
                     state.hovered,
                     row_area,
                     &mut hits,
+                    &mut cut_rows,
                 ),
             }
         })
@@ -192,7 +233,7 @@ pub fn view(
         Paragraph::new(lines).style(Style::new().fg(theme::current().foreground)),
         content_area,
     );
-    hits
+    QueueView { hits, cut_rows }
 }
 
 fn entry_line(
@@ -201,6 +242,7 @@ fn entry_line(
     hovered: Option<QueueHitTarget>,
     row: Rect,
     hits: &mut Vec<QueueHit>,
+    cut_rows: &mut Vec<CutRow>,
 ) -> Line<'static> {
     let select_target = QueueHitTarget::Item {
         id: entry.id,
@@ -219,13 +261,26 @@ fn entry_line(
         target: menu_target,
     });
 
-    let available = usize::from(row.width).saturating_sub(MENU_LABEL.width() + MENU_GAP.width());
+    let text_offset = MENU_LABEL.width() + MENU_GAP.width();
+    let available = usize::from(row.width).saturating_sub(text_offset);
     let style = if selected {
         theme::current().item_selected
     } else {
         hover_style(Style::new().fg(entry.color), hovered == Some(select_target))
     };
-    let text = truncate_span(&entry.text.replace('\n', " "), available, style);
+    let flat = entry.text.replace('\n', " ");
+    let text = truncate_span(&flat, available, style);
+    if flat.width() > available && available > 0 {
+        cut_rows.push(CutRow {
+            area: Rect::new(
+                row.x.saturating_add(text_offset as u16),
+                row.y,
+                available as u16,
+                1,
+            ),
+            text: flat,
+        });
+    }
     let padding = available.saturating_sub(text.content.width());
     Line::from(vec![
         Span::styled(
@@ -351,6 +406,9 @@ mod tests {
 
     const PANEL_TITLE: &str = "Queue - Main";
     const PROMPT: &str = "queued prompt";
+    const LONG_PROMPT: &str = "a queued prompt far too long\nfor the narrow row it is drawn on";
+    const CUT_MISSED: &str = "a prompt drawn short must keep its whole text for a tooltip";
+    const CUT_SPURIOUS: &str = "a prompt drawn whole has nothing more to show";
 
     fn entry(text: &'static str, admission: Option<PromptAdmission>) -> QueueEntry<'static> {
         QueueEntry {
@@ -369,13 +427,13 @@ mod tests {
         entries: &[QueueEntry<'_>],
         state: QueuePanelState,
         size: (u16, u16),
-    ) -> (Vec<String>, Vec<QueueHit>) {
+    ) -> (Vec<String>, QueueView) {
         let backend = TestBackend::new(size.0, size.1);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let mut hits = Vec::new();
+        let mut drawn = QueueView::default();
         terminal
             .draw(|frame| {
-                hits = view(frame, frame.area(), PANEL_TITLE, entries, state);
+                drawn = view(frame, frame.area(), PANEL_TITLE, entries, state);
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
@@ -386,7 +444,7 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
-        (rows, hits)
+        (rows, drawn)
     }
 
     fn shows(rows: &[String], text: &str) -> bool {
@@ -439,7 +497,7 @@ mod tests {
     fn queue_uses_the_shared_panel_grid() {
         let entries = [entry(PROMPT, Some(PromptAdmission::Queue))];
 
-        let (rendered, hits) = draw(
+        let (rendered, QueueView { hits, .. }) = draw(
             &entries,
             QueuePanelState {
                 together: Some(false),
@@ -493,7 +551,8 @@ mod tests {
             entry("queued", Some(PromptAdmission::Queue)),
         ];
 
-        let (rendered, hits) = draw(&entries, QueuePanelState::default(), (60, 8));
+        let (rendered, QueueView { hits, .. }) =
+            draw(&entries, QueuePanelState::default(), (60, 8));
 
         let menu_hits = hits
             .iter()
@@ -517,6 +576,65 @@ mod tests {
         }
     }
 
+    #[test_case(LONG_PROMPT, 30, true ; "long_prompt_is_cut")]
+    #[test_case(PROMPT, 60, false ; "short_prompt_is_whole")]
+    fn a_cut_row_keeps_its_whole_text_beside_the_menu(text: &'static str, width: u16, cut: bool) {
+        let entries = [entry(text, Some(PromptAdmission::Queue))];
+
+        let (_, drawn) = draw(&entries, QueuePanelState::default(), (width, 4));
+
+        if !cut {
+            assert!(drawn.cut_rows.is_empty(), "{CUT_SPURIOUS}");
+            return;
+        }
+        let [row] = drawn.cut_rows.as_slice() else {
+            panic!("{CUT_MISSED}");
+        };
+        assert_eq!(row.text, text.replace('\n', " "), "{CUT_MISSED}");
+        let menu = drawn
+            .hits
+            .iter()
+            .find(|hit| {
+                matches!(
+                    hit.target,
+                    QueueHitTarget::Item {
+                        action: QueueAction::Menu,
+                        ..
+                    }
+                )
+            })
+            .expect(CUT_MISSED);
+        assert!(row.area.x > menu.area.right(), "{CUT_MISSED}");
+        assert_eq!(row.area.y, menu.area.y, "{CUT_MISSED}");
+    }
+
+    #[test_case(QueueHitTarget::ToggleTogether, false, Some(TIP_SEPARATE) ; "separate")]
+    #[test_case(QueueHitTarget::ToggleTogether, true, Some(TIP_TOGETHER) ; "together")]
+    #[test_case(
+        QueueHitTarget::Item { id: QueueItemId::new(), action: QueueAction::Menu },
+        false,
+        Some(TIP_MENU) ;
+        "menu"
+    )]
+    #[test_case(
+        QueueHitTarget::Item { id: QueueItemId::new(), action: QueueAction::Select },
+        false,
+        None ;
+        "row_says_itself"
+    )]
+    fn a_control_tip_names_what_it_does(
+        target: QueueHitTarget,
+        together: bool,
+        meaning: Option<&str>,
+    ) {
+        let hit = QueueHit {
+            area: Rect::new(1, 1, 4, 1),
+            target,
+        };
+        let tip = hit.tip(together).map(|tip| tip.text);
+        assert_eq!(tip.as_deref().and_then(|text| text.lines().next()), meaning);
+    }
+
     #[test]
     fn menu_hover_reverses_the_glyph_only() {
         let entries = [entry(PROMPT, Some(PromptAdmission::Queue))];
@@ -538,7 +656,8 @@ mod tests {
                         hovered: Some(target),
                         ..QueuePanelState::default()
                     },
-                );
+                )
+                .hits;
             })
             .unwrap();
         let hit = hits.iter().find(|hit| hit.target == target).unwrap();
@@ -571,7 +690,7 @@ mod tests {
             entry("third", Some(PromptAdmission::Queue)),
         ];
 
-        let (rendered, hits) = draw(
+        let (rendered, QueueView { hits, .. }) = draw(
             &entries,
             QueuePanelState {
                 focus: Some(3),

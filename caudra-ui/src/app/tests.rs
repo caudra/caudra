@@ -511,7 +511,7 @@ pub(crate) fn test_app() -> App {
 
 /// A `test_app` past its idle splash, whose animation would mask every
 /// other cadence.
-fn app_without_splash() -> App {
+pub(crate) fn app_without_splash() -> App {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
@@ -3930,7 +3930,7 @@ pub(crate) fn press_chord(app: &mut App, chord: Bind) -> Vec<Action> {
     app.update(Msg::Key(chord.to_key_event()))
 }
 
-fn type_and_submit(app: &mut App, text: &str) -> Vec<Action> {
+pub(crate) fn type_and_submit(app: &mut App, text: &str) -> Vec<Action> {
     for c in text.chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
     }
@@ -8071,7 +8071,7 @@ fn share_notice(app: &mut App) -> Arc<UpdateNotice> {
     notice
 }
 
-fn announced(setup: fn() -> App) -> (App, Arc<UpdateNotice>) {
+pub(crate) fn announced(setup: fn() -> App) -> (App, Arc<UpdateNotice>) {
     let mut app = setup();
     let notice = share_notice(&mut app);
     notice.publish(preview_release());
@@ -8360,13 +8360,13 @@ fn click_at(app: &mut App, hit: Rect) -> Vec<Action> {
 
 /// A listed task that no longer works, so the tasks hint keeps the row: while
 /// one works a prompt would queue and the admission controls take it instead.
-fn app_with_finished_subagent() -> App {
+pub(crate) fn app_with_finished_subagent() -> App {
     let mut app = app_with_subagent();
     finish_subagent_task(&mut app, false);
     app
 }
 
-fn app_with_todos() -> App {
+pub(crate) fn app_with_todos() -> App {
     let mut app = test_app();
     app.todo_panel.set_items(vec![TodoItem {
         content: "write the test".into(),
