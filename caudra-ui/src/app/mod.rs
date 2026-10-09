@@ -29,6 +29,7 @@ mod task_history;
 pub(crate) mod tasks;
 #[cfg(test)]
 pub(crate) mod tests;
+mod tooltip;
 mod transfer;
 pub(crate) mod view;
 mod workbench;
@@ -110,6 +111,7 @@ use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::thinking_picker::{ThinkingPicker, ThinkingPickerAction};
 use crate::components::todo_panel::TodoPanel;
 use crate::components::tools_modal::{ToolsModal, ToolsScope};
+use crate::components::tooltip::Tooltip;
 use crate::components::usage_modal::{UsageFetchState, UsageModal, UsageScope};
 use crate::components::which_key::WhichKey;
 use crate::components::workbench::{paint_markdown, styles as workbench_styles};
@@ -169,7 +171,7 @@ use caudra_storage::tool_ledger::{ToolCall, ToolLedger, ToolStats};
 use caudra_storage::usage_ledger::{LedgerPurpose, LifetimeUsage, TurnUsage, UsageLedger};
 use caudra_storage::view::ViewMode;
 use caudra_workspace::WorkspaceChangeService;
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use flume::{Receiver, TryRecvError};
 use serde_json::Value;
 use smol::Task;
@@ -449,6 +451,7 @@ pub struct App {
     pub(super) review: ReviewModal,
     pub(super) help_modal: HelpModal,
     pub(super) which_key: WhichKey,
+    pub(super) tooltip: Tooltip,
     pub(super) usage_modal: UsageModal,
     pub(super) context_modal: ContextModal,
     pub(super) logs_modal: LogsModal,
@@ -744,6 +747,7 @@ impl App {
             review: ReviewModal::new(),
             help_modal: HelpModal::new(),
             which_key: WhichKey::new(ui_config.which_key_delay()),
+            tooltip: Tooltip::new(ui_config.tooltips),
             usage_modal: UsageModal::new(),
             context_modal: ContextModal::new(),
             logs_modal: LogsModal::new(max_log_files),
@@ -1588,6 +1592,16 @@ impl App {
         self.sync_execution_mode();
         if crate::sandbox::transfer::active() && !matches!(msg, Msg::Agent(_)) {
             return self.transfer_input(msg);
+        }
+        match &msg {
+            Msg::Mouse(event) if event.kind == MouseEventKind::Moved => {
+                self.tooltip
+                    .pointer_moved(Position::new(event.column, event.row));
+            }
+            Msg::Key(_) | Msg::Paste(_) | Msg::Mouse(_) | Msg::Scroll { .. } => {
+                self.tooltip.dismiss();
+            }
+            _ => {}
         }
         match msg {
             Msg::Key(key) => {
@@ -6001,6 +6015,12 @@ impl App {
             .then_some(Notification::QuestionRequested)
     }
 
+    /// A resize moves every anchor, so a box drawn for the old layout would
+    /// point at whatever took its place.
+    pub(crate) fn dismiss_tooltip(&mut self) {
+        self.tooltip.dismiss();
+    }
+
     pub fn has_modal_overlay(&self) -> bool {
         self.overlays().iter().any(|o| o.is_open() && o.is_modal())
     }
@@ -6438,6 +6458,7 @@ impl App {
             Cadence::when(self.autoscroll.is_some(), Cadence::SMOOTH),
             Cadence::any(self.chats.iter().map(Chat::cadence)),
             self.which_key.cadence(),
+            self.tooltip.cadence(Instant::now()),
             self.automation_cadence(),
             self.memory_cadence(),
             // The `#` popup is not an overlay, so its spinner has to be asked

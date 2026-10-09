@@ -72,6 +72,7 @@ pub(crate) mod thinking_picker;
 pub(crate) mod todo_panel;
 pub(crate) mod tool_display;
 pub(crate) mod tools_modal;
+pub(crate) mod tooltip;
 pub(crate) mod usage_modal;
 pub(crate) mod which_key;
 pub(crate) mod workbench;
@@ -214,6 +215,11 @@ pub(crate) trait Overlay {
     /// so this is the only place one has to say so.
     fn cadence(&self) -> crate::repaint::Cadence {
         crate::repaint::Cadence::IDLE
+    }
+    /// What the pointer rests on inside the overlay, when that deserves a
+    /// tooltip. Asked only of overlays that are open.
+    fn tooltip(&self) -> Option<tooltip::Tip> {
+        None
     }
 }
 

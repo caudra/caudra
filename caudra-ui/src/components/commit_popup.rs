@@ -28,6 +28,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::completion::{self, Completion, MouseOutcome, PAD};
+use crate::components::list_picker::truncate_label;
+use crate::components::tooltip::{Anchor, Tip, TipKey};
 use crate::repaint::{Cadence, Dirty};
 use crate::theme;
 
@@ -37,6 +39,7 @@ const SCOPE: &str = "commit_popup";
 /// would be pushed off a narrow composer.
 const SUBJECT_WIDTH: usize = 60;
 const GAP: &str = "  ";
+const DESCRIPTION_SEPARATOR: &str = " \u{b7} ";
 const DATE_FORMAT: &str = "%Y-%m-%d %H:%M";
 const UNKNOWN_DATE: &str = "unknown date";
 /// Shown while the log is being read, so a `#` answers at once in a project
@@ -109,29 +112,38 @@ impl CommitIndex {
         }
     }
 
-    /// The subject of the commit `id` abbreviates, for the status bar. A window
-    /// that has not arrived knows no subjects, so a hovered hash shows itself.
-    pub fn subject(&self, id: &str) -> Option<&str> {
-        self.commits()
+    /// The subject, author and date of the commit `id` abbreviates, for the
+    /// status bar. A window that has not arrived knows none of them, so a
+    /// hovered hash shows itself.
+    pub fn describe(&self, id: &str) -> Option<String> {
+        let commit = self
+            .commits()
             .iter()
-            .find(|commit| commit.id.starts_with(id))
-            .map(|commit| commit.subject.as_str())
+            .find(|commit| commit.id.starts_with(id))?;
+        let date = datetime(commit.committed_unix_seconds, &TimeZone::system());
+        Some(format!(
+            "{}{DESCRIPTION_SEPARATOR}{}{DESCRIPTION_SEPARATOR}{date}",
+            commit.subject, commit.author
+        ))
     }
 }
 
 struct CommitRow {
     hash: String,
     text: String,
+    /// The subject whole, kept only when the row had to cut it.
+    cut_subject: Option<String>,
 }
 
 impl CommitRow {
     fn new(commit: &CommitSummary, zone: &TimeZone) -> Self {
         let hash = commit.short().to_owned();
         let date = datetime(commit.committed_unix_seconds, zone);
-        let subject = truncate(&commit.subject, SUBJECT_WIDTH);
+        let subject = truncate_label(&commit.subject, SUBJECT_WIDTH);
         Self {
             text: format!("{hash}{GAP}{date}{GAP}{subject}{GAP}{}", commit.author),
             hash,
+            cut_subject: (commit.subject.width() > SUBJECT_WIDTH).then(|| commit.subject.clone()),
         }
     }
 }
@@ -196,6 +208,18 @@ impl CommitPopup {
     /// frames that move it. A list moves only when the reader does.
     pub fn cadence(&self) -> Cadence {
         Cadence::when(self.is_loading(), Cadence::SPINNER)
+    }
+
+    /// The whole subject of the row under the pointer, when the row cut it.
+    pub(crate) fn tooltip(&self) -> Option<Tip> {
+        let session = self.session.as_ref()?;
+        let (row, query) = session.completion.hovered()?;
+        let subject = session.rows.get(query)?.cut_subject.clone()?;
+        Some(Tip {
+            key: TipKey::Row(row),
+            anchor: Anchor::Area(row),
+            text: subject,
+        })
     }
 
     pub fn close(&mut self) {
@@ -414,18 +438,11 @@ fn datetime(seconds: i64, zone: &TimeZone) -> String {
         .unwrap_or_else(|_| UNKNOWN_DATE.to_owned())
 }
 
-fn truncate(text: &str, width: usize) -> String {
-    match text.chars().count() > width {
-        true => text.chars().take(width - 1).collect::<String>() + "\u{2026}",
-        false => text.to_owned(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        CommitAction, CommitIndex, CommitPopup, CommitRow, SUBJECT_WIDTH, UNKNOWN_DATE, datetime,
-        haystack,
+        CommitAction, CommitIndex, CommitPopup, CommitRow, GAP, SUBJECT_WIDTH, UNKNOWN_DATE,
+        datetime, haystack,
     };
     use caudra_agent::commits::repo::CommitSummary;
     use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -434,8 +451,10 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
     use test_case::test_case;
+    use unicode_width::UnicodeWidthStr;
 
     use crate::components::key;
+    use crate::components::tooltip::{Anchor, Tip, TipKey};
     use crate::repaint::Cadence;
 
     const FIRST: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
@@ -472,6 +491,12 @@ mod tests {
     const LOADING_LINGERED: &str = "the spinner outlived the window it was waiting for";
     const STALE_WINDOW: &str = "the popup kept listing the log from before the refresh";
     const SPINNER_FROZEN: &str = "a spinning popup must ask for the frames that turn it";
+    const TIP_ONLY_WHEN_CUT: &str =
+        "a hovered row offers its whole subject exactly when it was cut";
+    const WIDE_GLYPH: &str = "\u{4e2d}";
+    const ELLIPSIS: char = '\u{2026}';
+    const NOT_CUT_BY_COLUMNS: &str =
+        "a subject must be cut by the columns it takes, not its characters";
 
     fn summary(id: &str, subject: &str) -> CommitSummary {
         CommitSummary {
@@ -728,6 +753,59 @@ mod tests {
         );
     }
 
+    fn long_subject() -> String {
+        format!("{} {HIDDEN_WORD}", "x".repeat(SUBJECT_WIDTH))
+    }
+
+    /// The tip a popup listing a cut subject and then a whole one offers with
+    /// the pointer moved to `row` of its list.
+    fn hovered(row: u16) -> Option<Tip> {
+        let mut popup = CommitPopup::new();
+        let index = CommitIndex::loaded(vec![
+            summary(FIRST, &long_subject()),
+            summary(SECOND, SUBJECT),
+        ]);
+        popup.sync("#", 1, &index);
+        popup.settle();
+        popup
+            .session
+            .as_mut()
+            .expect(NO_SESSION)
+            .completion
+            .set_area(AREA);
+        popup.handle_mouse(event(MouseEventKind::Moved, row));
+        popup.tooltip()
+    }
+
+    #[test_case(0, true ; "a_cut_subject")]
+    #[test_case(1, false ; "a_subject_that_fits")]
+    #[test_case(AREA.height, false ; "off_the_rows")]
+    fn a_hovered_row_offers_its_subject_only_when_cut(row: u16, offered: bool) {
+        let drawn = Rect {
+            y: AREA.y + row,
+            height: 1,
+            ..AREA
+        };
+        let expected = offered.then(|| Tip {
+            key: TipKey::Row(drawn),
+            anchor: Anchor::Area(drawn),
+            text: long_subject(),
+        });
+        assert_eq!(hovered(row), expected, "{TIP_ONLY_WHEN_CUT}");
+    }
+
+    /// As many wide glyphs as the row has columns for narrow ones: the count
+    /// fits and the width does not.
+    #[test]
+    fn a_wide_subject_is_cut_by_the_columns_it_takes() {
+        let subject = WIDE_GLYPH.repeat(SUBJECT_WIDTH);
+        let row = CommitRow::new(&summary(FIRST, &subject), &TimeZone::UTC);
+        let drawn = row.text.split(GAP).nth(2).expect(MISSING_ROW);
+        assert!(drawn.width() <= SUBJECT_WIDTH, "{NOT_CUT_BY_COLUMNS}");
+        assert!(drawn.ends_with(ELLIPSIS), "{NOT_CUT_BY_COLUMNS}");
+        assert_eq!(row.cut_subject, Some(subject), "{TIP_ONLY_WHEN_CUT}");
+    }
+
     #[test_case(COMMITTED, 0, UTC_DATETIME ; "utc")]
     #[test_case(COMMITTED, OFFSET_SECONDS, OFFSET_DATETIME ; "offset_crosses_midnight")]
     #[test_case(i64::MAX, 0, UNKNOWN_DATE ; "unrepresentable")]
@@ -782,7 +860,9 @@ mod tests {
     }
 
     #[test]
-    fn the_index_names_the_subject_behind_an_abbreviation() {
-        assert_eq!(index().subject("a1b2c3d"), Some(SUBJECT));
+    fn the_index_describes_the_commit_behind_an_abbreviation() {
+        let described = index().describe("a1b2c3d").expect("a listed commit");
+        assert!(described.starts_with(SUBJECT), "{described}");
+        assert!(described.contains(AUTHOR), "{described}");
     }
 }

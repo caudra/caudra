@@ -55,6 +55,9 @@ pub(crate) struct Completion {
     /// The row the button went down on. A release only takes a row when it is
     /// the row the press started on.
     pressed: Option<String>,
+    /// Where the pointer last moved over the rows, for a tooltip. Cleared by
+    /// anything else the pointer or the keys do.
+    pointer: Option<Position>,
 }
 
 impl Completion {
@@ -67,6 +70,7 @@ impl Completion {
             query,
             area: Rect::default(),
             pressed: None,
+            pointer: None,
         }
     }
 
@@ -148,6 +152,7 @@ impl Completion {
     }
 
     pub fn step(&mut self, delta: isize) {
+        self.pointer = None;
         if self.matches.is_empty() {
             return;
         }
@@ -159,8 +164,10 @@ impl Completion {
         let position = Position::new(event.column, event.row);
         if !self.area.contains(position) {
             self.pressed = None;
+            self.pointer = None;
             return MouseOutcome::Outside;
         }
+        self.pointer = (event.kind == MouseEventKind::Moved).then_some(position);
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.pressed = None;
@@ -193,6 +200,16 @@ impl Completion {
             }
             _ => MouseOutcome::Consumed,
         }
+    }
+
+    /// The match under the pointer and the row it was drawn on, for a tooltip.
+    pub fn hovered(&self) -> Option<(Rect, &str)> {
+        let pointer = self
+            .pointer
+            .filter(|pointer| self.area.contains(*pointer))?;
+        let index = self.row_at(pointer)?;
+        let row = Rect::new(self.area.x, pointer.y, self.area.width, 1);
+        Some((row, &self.matches[index]))
     }
 
     /// Draws the list above `input_area` and reports where it landed.

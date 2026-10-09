@@ -8,6 +8,7 @@ use ratatui::layout::{Position, Rect};
 
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::components::tooltip::Tip;
 use crate::repaint::Cadence;
 
 const TITLE: &str = " System prompts ";
@@ -121,6 +122,10 @@ impl Overlay for PromptProfilePicker {
 
     fn cadence(&self) -> Cadence {
         self.picker.cadence()
+    }
+
+    fn tooltip(&self) -> Option<Tip> {
+        self.picker.tooltip()
     }
 }
 

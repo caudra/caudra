@@ -14,6 +14,7 @@ use caudra_providers::{Model, ModelPurpose};
 
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::components::tooltip::Tip;
 use crate::components::{Hint, Overlay};
 use crate::repaint::{Cadence, Dirty, Watch};
 
@@ -679,6 +680,10 @@ impl Overlay for ModelPicker {
 
     fn cadence(&self) -> Cadence {
         self.picker.cadence()
+    }
+
+    fn tooltip(&self) -> Option<Tip> {
+        self.picker.tooltip()
     }
 }
 

@@ -8,6 +8,7 @@ use ratatui::layout::{Position, Rect};
 
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::components::tooltip::Tip;
 use crate::repaint::{Cadence, Dirty};
 
 pub(crate) const TITLE: &str = " Thinking ";
@@ -223,6 +224,10 @@ impl Overlay for ThinkingPicker {
             Some(deadline) => Cadence::due(deadline.saturating_duration_since(Instant::now())),
             None => self.picker.cadence(),
         }
+    }
+
+    fn tooltip(&self) -> Option<Tip> {
+        self.picker.tooltip()
     }
 }
 

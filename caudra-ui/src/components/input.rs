@@ -31,6 +31,7 @@ use ratatui::widgets::{Block, Paragraph};
 
 use super::commit_popup::CommitIndex;
 use super::scrollbar::{Scrollbar, ScrollbarMouse};
+use super::tooltip::{self, Anchor, Tip, TipKey};
 use super::{SELECTION, apply_scroll_delta, hover_style};
 
 #[cfg(test)]
@@ -828,6 +829,19 @@ impl InputBox {
 
     pub(crate) fn clear_hover(&mut self) {
         self.hover = None;
+    }
+
+    /// The opening lines of a summarized paste under the pointer, so the
+    /// reader can tell two pastes apart without opening the editor.
+    pub(crate) fn hover_tip(&self) -> Option<Tip> {
+        let Some(InputHit::Paste(id)) = self.hover else {
+            return None;
+        };
+        Some(Tip {
+            key: TipKey::Paste(id),
+            anchor: Anchor::Pointer,
+            text: tooltip::preview(self.paste_text(id)?),
+        })
     }
 
     /// Convert a mouse click at terminal (row, col) within the input content

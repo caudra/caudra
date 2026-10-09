@@ -14,6 +14,7 @@ use crate::components::command::{CommandRow, ParsedCommand};
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction};
 use crate::components::modal::Modal;
+use crate::components::tooltip::Tip;
 use crate::components::{
     CHEVRON, Hint, HintBar, Overlay, chevron_span, field_styles, input_text_style,
     visual_line_count,
@@ -285,6 +286,13 @@ impl Overlay for CommandModal {
         match &self.stage {
             Stage::Pick(picker) => picker.cadence(),
             Stage::Closed | Stage::Args { .. } => Cadence::IDLE,
+        }
+    }
+
+    fn tooltip(&self) -> Option<Tip> {
+        match &self.stage {
+            Stage::Pick(picker) => picker.tooltip(),
+            Stage::Closed | Stage::Args { .. } => None,
         }
     }
 }

@@ -182,6 +182,7 @@ impl Workbench {
         self.panes = layout(area, self.sidebar_width, self.sidebar_collapsed);
         let panes = self.panes;
         self.switcher.clear();
+        self.cut_rows.clear();
         let buf = frame.buffer_mut();
         chrome::fill(buf, area, self.styles.background);
 
@@ -445,8 +446,12 @@ impl Workbench {
             .enumerate()
         {
             let chosen = focused && scroll + offset == selected;
-            let line = search_row(&self.search, *row, &root, chosen, &self.styles, rows.width);
+            let (line, cut) =
+                search_row(&self.search, *row, &root, chosen, &self.styles, rows.width);
             let line = emphasize(line, pointed == Some(offset) && !chosen, &self.styles);
+            if let Some(path) = cut {
+                self.cut_rows.push((line_at(rows, offset), path));
+            }
             chrome::render_line(buf, line_at(rows, offset), line);
         }
         self.scrollbar(buf, Bar::Sidebar, bar, total, scroll);
@@ -518,7 +523,7 @@ impl Workbench {
             let row = self.scm.rows(section)[scroll + offset];
             let chosen = cursor.section == section && cursor.row == Some(scroll + offset);
             let on_row = pointer.filter(|at| (at.1 - rows.y) as usize == offset);
-            let line = scm_row(
+            let (line, cut) = scm_row(
                 &self.scm,
                 section,
                 row,
@@ -528,6 +533,9 @@ impl Workbench {
                 rows.width,
             );
             let line = emphasize(line, on_row.is_some() && !chosen, &self.styles);
+            if let Some(path) = cut {
+                self.cut_rows.push((line_at(rows, offset), path));
+            }
             chrome::render_line(buf, line_at(rows, offset), line);
         }
         self.scrollbar(buf, Bar::Section(section), bar, total, scroll);
@@ -597,8 +605,12 @@ impl Workbench {
             // is showing in bold only while it holds it.
             let chosen = scroll + offset == selected;
             let marked = on_mark && pointed == Some(offset);
-            let line = tree_row(row, chosen, marked, &self.styles, rows.width);
+            let (line, cut) = tree_row(row, chosen, marked, &self.styles, rows.width);
             let line = emphasize(line, pointed == Some(offset) && !chosen, &self.styles);
+            if cut {
+                self.cut_rows
+                    .push((line_at(rows, offset), row.name.clone()));
+            }
             chrome::render_line(buf, line_at(rows, offset), line);
         }
         self.scrollbar(buf, Bar::Sidebar, bar, self.tree.rows().len(), scroll);
@@ -1521,13 +1533,14 @@ fn digits(count: usize) -> u16 {
     count.max(1).ilog10() as u16 + 1
 }
 
+/// The painted row, and whether its name had to be cut to fit.
 fn tree_row(
     row: &TreeRow,
     selected: bool,
     marked: bool,
     styles: &WorkbenchStyles,
     width: u16,
-) -> Line<'static> {
+) -> (Line<'static>, bool) {
     let marker = match (row.is_dir(), row.expanded) {
         (true, true) => EXPANDED_MARK,
         (true, false) => COLLAPSED_MARK,
@@ -1563,7 +1576,10 @@ fn tree_row(
         Span::styled(guides, styles.border),
         Span::styled(chrome::fit(&label, budget), style),
     ];
-    chrome::status_line(left, right, width, styles.background)
+    (
+        chrome::status_line(left, right, width, styles.background),
+        chrome::overflows(&label, budget),
+    )
 }
 
 /// The columns every row keeps at its left for the menu handle, which is the
@@ -1638,6 +1654,7 @@ fn section_header(
     chrome::status_line(left, right, width, styles.background)
 }
 
+/// The painted row, and the whole name or path of a row whose name was cut.
 fn scm_row(
     scm: &Scm,
     section: Section,
@@ -1646,35 +1663,43 @@ fn scm_row(
     strip: Strip,
     styles: &WorkbenchStyles,
     width: u16,
-) -> Line<'static> {
+) -> (Line<'static>, Option<String>) {
     match row {
         ScmRow::Directory(index) => match scm.dir(section, index) {
-            Some(dir) => directory_row(
-                dir,
-                selected,
-                section == Section::Staged,
-                strip,
-                styles,
-                width,
-            ),
-            None => Line::default(),
+            Some(dir) => {
+                let (line, cut) = directory_row(
+                    dir,
+                    selected,
+                    section == Section::Staged,
+                    strip,
+                    styles,
+                    width,
+                );
+                (line, cut.then(|| dir.label.clone()))
+            }
+            None => (Line::default(), None),
         },
         ScmRow::Change { index, depth } => match scm.change(index) {
             Some(change) => {
-                change_row(change, depth, scm.is_flat(), selected, strip, styles, width)
+                let (line, cut) =
+                    change_row(change, depth, scm.is_flat(), selected, strip, styles, width);
+                (line, cut.then(|| change.relative.clone()))
             }
-            None => Line::default(),
+            None => (Line::default(), None),
         },
         ScmRow::Commit(index) => match (scm.commit(index), scm.rail(index)) {
-            (Some(commit), Some(rail)) => commit_row(
-                commit,
-                rail,
-                scm.is_expanded(index),
-                selected,
-                styles,
-                width,
+            (Some(commit), Some(rail)) => (
+                commit_row(
+                    commit,
+                    rail,
+                    scm.is_expanded(index),
+                    selected,
+                    styles,
+                    width,
+                ),
+                None,
             ),
-            _ => Line::default(),
+            _ => (Line::default(), None),
         },
         ScmRow::CommitFile {
             commit,
@@ -1682,11 +1707,13 @@ fn scm_row(
             depth,
         } => match (scm.commit_file(commit, index), scm.rail(commit)) {
             (Some(file), Some(rail)) => {
-                commit_file_row(file, rail, depth, scm.is_flat(), selected, styles, width)
+                let (line, cut) =
+                    commit_file_row(file, rail, depth, scm.is_flat(), selected, styles, width);
+                (line, cut.then(|| file.relative.clone()))
             }
-            _ => Line::default(),
+            _ => (Line::default(), None),
         },
-        ScmRow::Note(text) => note_row(text, styles, width),
+        ScmRow::Note(text) => (note_row(text, styles, width), None),
     }
 }
 
@@ -1697,7 +1724,7 @@ fn directory_row(
     strip: Strip,
     styles: &WorkbenchStyles,
     width: u16,
-) -> Line<'static> {
+) -> (Line<'static>, bool) {
     let marker = match dir.expanded {
         true => EXPANDED_MARK,
         false => COLLAPSED_MARK,
@@ -1712,14 +1739,18 @@ fn directory_row(
         dir.label,
         indent = dir.depth * DEPTH_INDENT
     );
-    if strip.controls.is_empty() {
-        return Line::from(Span::styled(chrome::fit(&label, width as usize), style))
-            .style(styles.background);
-    }
     let budget = (width as usize).saturating_sub(control_reserve(strip));
+    let cut = chrome::overflows(&label, budget);
+    if strip.controls.is_empty() {
+        let line = Line::from(Span::styled(chrome::fit(&label, budget), style));
+        return (line.style(styles.background), cut);
+    }
     let left = vec![Span::styled(chrome::fit(&label, budget), style)];
     let right = control_spans(staged, strip, styles);
-    chrome::status_line(left, right, width, styles.background)
+    (
+        chrome::status_line(left, right, width, styles.background),
+        cut,
+    )
 }
 
 /// The path, and its git letter on the right. Tree mode indents and shows only
@@ -1733,7 +1764,7 @@ fn change_row(
     strip: Strip,
     styles: &WorkbenchStyles,
     width: u16,
-) -> Line<'static> {
+) -> (Line<'static>, bool) {
     let style = match selected {
         true => styles.selected,
         false => styles.text,
@@ -1744,31 +1775,36 @@ fn change_row(
         git_style(change.mark, styles),
     ));
     let budget = (width as usize).saturating_sub(CHANGE_TRAILING as usize + control_reserve(strip));
-    let left = match flat {
-        true => vec![Span::styled(
-            chrome::fit_end(&format!("{LEAF_INDENT}{}", change.relative), budget),
-            style,
-        )],
+    let (label, cut) = match flat {
+        true => {
+            let label = format!("{LEAF_INDENT}{}", change.relative);
+            (
+                chrome::fit_end(&label, budget),
+                chrome::overflows(&label, budget),
+            )
+        }
         false => {
             let name = change
                 .relative
                 .rsplit(SEPARATOR)
                 .next()
                 .unwrap_or(&change.relative);
-            vec![Span::styled(
-                chrome::fit(
-                    &format!(
-                        "{:indent$}{LEAF_INDENT}{name}",
-                        "",
-                        indent = depth * DEPTH_INDENT
-                    ),
-                    budget,
-                ),
-                style,
-            )]
+            let label = format!(
+                "{:indent$}{LEAF_INDENT}{name}",
+                "",
+                indent = depth * DEPTH_INDENT
+            );
+            (
+                chrome::fit(&label, budget),
+                chrome::overflows(&label, budget),
+            )
         }
     };
-    chrome::status_line(left, right, width, styles.background)
+    let left = vec![Span::styled(label, style)];
+    (
+        chrome::status_line(left, right, width, styles.background),
+        cut,
+    )
 }
 
 /// Author on the right, rail, fold marker, hash and summary on the left, so a
@@ -1822,7 +1858,7 @@ fn commit_file_row(
     selected: bool,
     styles: &WorkbenchStyles,
     width: u16,
-) -> Line<'static> {
+) -> (Line<'static>, bool) {
     let style = match selected {
         true => styles.selected,
         false => styles.text,
@@ -1836,26 +1872,33 @@ fn commit_file_row(
         git_style(file.mark, styles),
     )];
     let budget = (width as usize).saturating_sub(CHANGE_TRAILING as usize + mark.width());
-    let label = match flat {
-        true => chrome::fit_end(&file.relative, budget),
+    let (label, cut) = match flat {
+        true => (
+            chrome::fit_end(&file.relative, budget),
+            chrome::overflows(&file.relative, budget),
+        ),
         false => {
             let name = file
                 .relative
                 .rsplit(SEPARATOR)
                 .next()
                 .unwrap_or(&file.relative);
-            chrome::fit(
-                &format!(
-                    "{:indent$}{LEAF_INDENT}{name}",
-                    "",
-                    indent = depth * DEPTH_INDENT
-                ),
-                budget,
+            let label = format!(
+                "{:indent$}{LEAF_INDENT}{name}",
+                "",
+                indent = depth * DEPTH_INDENT
+            );
+            (
+                chrome::fit(&label, budget),
+                chrome::overflows(&label, budget),
             )
         }
     };
     let left = vec![Span::styled(mark, styles.dim), Span::styled(label, style)];
-    chrome::status_line(left, right, width, styles.background)
+    (
+        chrome::status_line(left, right, width, styles.background),
+        cut,
+    )
 }
 
 /// What an expanded commit says instead of a path, when it has none to list.
@@ -1948,6 +1991,7 @@ fn toggle_row(
     )
 }
 
+/// The painted row, and the whole path of a file row whose path was cut.
 fn search_row(
     search: &Search,
     row: SearchRow,
@@ -1955,22 +1999,29 @@ fn search_row(
     selected: bool,
     styles: &WorkbenchStyles,
     width: u16,
-) -> Line<'static> {
+) -> (Line<'static>, Option<String>) {
     match row {
         SearchRow::File(index) => match search.file(index) {
-            Some(path) => Line::from(Span::styled(
-                chrome::fit_end(&path.display_relative(root), width as usize),
-                if selected {
-                    styles.selected
-                } else {
-                    styles.directory
-                },
-            )),
-            None => Line::default(),
+            Some(path) => {
+                let shown = path.display_relative(root);
+                let line = Line::from(Span::styled(
+                    chrome::fit_end(&shown, width as usize),
+                    if selected {
+                        styles.selected
+                    } else {
+                        styles.directory
+                    },
+                ));
+                (
+                    line,
+                    chrome::overflows(&shown, width as usize).then_some(shown),
+                )
+            }
+            None => (Line::default(), None),
         },
         SearchRow::Hit(index) => match search.hit(index) {
-            Some(hit) => hit_row(hit, selected, styles, width),
-            None => Line::default(),
+            Some(hit) => (hit_row(hit, selected, styles, width), None),
+            None => (Line::default(), None),
         },
     }
 }
@@ -2697,6 +2748,7 @@ mod tests {
     /// What a row reads as once painted, without the filler that pads it out.
     fn painted(row: &TreeRow) -> String {
         tree_row(row, false, false, &WorkbenchStyles::default(), TREE_WIDTH)
+            .0
             .spans
             .iter()
             .map(|span| span.content.as_ref())
@@ -2763,7 +2815,7 @@ mod tests {
             mark: GitMark::Modified,
         };
 
-        let line = commit_file_row(
+        let (line, _) = commit_file_row(
             &file,
             rail,
             1,
@@ -2783,7 +2835,7 @@ mod tests {
     #[test]
     fn the_rules_are_faint_so_the_name_is_still_what_the_row_says() {
         let styles = WorkbenchStyles::default();
-        let line = tree_row(
+        let (line, _) = tree_row(
             &entry(EntryKind::File, 2),
             false,
             false,

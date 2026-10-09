@@ -40,6 +40,7 @@ use crate::components::permission_prompt::{
 };
 use crate::components::permission_scope::editor::{EditorEvent, EditorLaunch, ScopeEditor};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
+use crate::components::tooltip::Tip;
 use crate::components::{
     Hint, HintBar, ModalScroll, Overlay, counted, escape_terminal_controls, format_elapsed,
     format_iec_bytes,
@@ -1352,6 +1353,15 @@ impl Overlay for PermissionsPicker {
         self.toolbar_hits = FooterHits::default();
         self.tabs_hits = FooterHits::default();
         self.picker.close();
+    }
+
+    /// A narrow manager hides the list behind whatever holds the focus, and a
+    /// hidden list must not answer for the rows it last drew.
+    fn tooltip(&self) -> Option<Tip> {
+        if self.editor.is_some() || self.has_pending_confirmation() || self.detail_focused {
+            return None;
+        }
+        self.picker.tooltip()
     }
 }
 

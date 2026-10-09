@@ -10,10 +10,15 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 pub const ELLIPSIS: char = '…';
 pub const VERTICAL: &str = "│";
 
+/// Whether [`fit`] or [`fit_end`] would cut `text` to get it into `width`.
+pub fn overflows(text: &str, width: usize) -> bool {
+    UnicodeWidthStr::width(text) > width
+}
+
 /// Truncates on display width rather than bytes, so a CJK path or an emoji in a
 /// filename cannot overflow the pane it is drawn into.
 pub fn fit(text: &str, width: usize) -> String {
-    if UnicodeWidthStr::width(text) <= width {
+    if !overflows(text, width) {
         return text.to_owned();
     }
     if width == 0 {
@@ -36,7 +41,7 @@ pub fn fit(text: &str, width: usize) -> String {
 /// Truncates from the left, keeping the tail. Paths are more recognisable by
 /// their filename than by the repository root they all share.
 pub fn fit_end(text: &str, width: usize) -> String {
-    if UnicodeWidthStr::width(text) <= width {
+    if !overflows(text, width) {
         return text.to_owned();
     }
     if width == 0 {

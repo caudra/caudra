@@ -6,6 +6,7 @@ use ratatui::layout::{Position, Rect};
 
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::components::tooltip::Tip;
 use crate::components::{Hint, Overlay};
 use crate::repaint::Cadence;
 
@@ -172,6 +173,10 @@ impl Overlay for StashPicker {
 
     fn cadence(&self) -> Cadence {
         self.picker.cadence()
+    }
+
+    fn tooltip(&self) -> Option<Tip> {
+        self.picker.tooltip()
     }
 }
 

@@ -19,6 +19,7 @@ use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::Modal;
+use crate::components::tooltip::Tip;
 use crate::components::{
     Overlay, SubscriptionProvider, chevron_span, field_styles, input_text_style,
 };
@@ -974,6 +975,16 @@ impl Overlay for LoginPicker {
 
     fn close(&mut self) {
         self.step = Step::Closed;
+    }
+
+    fn tooltip(&self) -> Option<Tip> {
+        match &self.step {
+            Step::PickProvider(picker) => picker.tooltip(),
+            Step::PickAuthMethod { picker, .. } => picker.tooltip(),
+            Step::PickPlan { picker, .. } => picker.tooltip(),
+            Step::CustomProtocol { picker, .. } => picker.tooltip(),
+            _ => None,
+        }
     }
 }
 

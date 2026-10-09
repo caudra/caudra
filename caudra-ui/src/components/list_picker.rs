@@ -9,6 +9,7 @@ use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::keybindings::key;
 use crate::components::modal::{CHROME_LINES, Modal};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
+use crate::components::tooltip::{Anchor, Tip, TipKey};
 use crate::components::{Hint, HintBar, Overlay, chevron_span, field_styles, input_text_style};
 use crate::repaint::Cadence;
 use crate::theme;
@@ -33,6 +34,7 @@ const SEARCH_ROW: u16 = 1;
 const DETAIL_RIGHT_PAD: u16 = 1;
 /// The blank a row keeps between its label and its detail.
 const LABEL_DETAIL_GAP: usize = 1;
+const BADGE_DETAIL_GAP: &str = "  ";
 /// What a row keeps for its label whatever its detail costs. A row that spends
 /// every column on the detail names nothing the reader can pick, and picking is
 /// what the row is for.
@@ -126,6 +128,9 @@ struct State<T> {
     popup_area: Rect,
     row_hits: Vec<PickerRowHit>,
     mouse_down: Option<usize>,
+    /// Where the pointer last moved to, for the tooltip. `None` after a key, a
+    /// press or a scroll, which leave the reader looking elsewhere.
+    pointer: Option<Position>,
     scrollbar: Scrollbar,
     footer: HintBar,
     enabled: Option<Vec<bool>>,
@@ -139,6 +144,8 @@ struct PickerRowHit {
     area: Rect,
     filtered_index: usize,
     item_index: usize,
+    /// Whether the row was drawn short of its label or its detail.
+    clipped: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -169,6 +176,7 @@ impl<T: PickerItem> State<T> {
             popup_area: Rect::default(),
             row_hits: Vec::new(),
             mouse_down: None,
+            pointer: None,
             scrollbar: Scrollbar::default(),
             footer: HintBar::default(),
             enabled: None,
@@ -564,6 +572,8 @@ impl<T: PickerItem> ListPicker<T> {
         let Some(state) = self.state.as_mut() else {
             return PickerAction::Close;
         };
+        state.pointer =
+            (event.kind == MouseEventKind::Moved).then_some(Position::new(event.column, event.row));
         match state.scrollbar.handle(&event) {
             ScrollbarMouse::Ignored => {}
             ScrollbarMouse::Consumed => return PickerAction::Consumed,
@@ -654,6 +664,7 @@ impl<T: PickerItem> ListPicker<T> {
             .as_mut()
             .expect("handle_ready_key called without state");
         s.invalidate_mouse_geometry();
+        s.pointer = None;
 
         if key::SCROLL_HALF_UP.matches(key) {
             s.page_up();
@@ -749,6 +760,23 @@ impl<T: PickerItem> ListPicker<T> {
         self.state.as_ref().and_then(|s| s.items.get(idx))
     }
 
+    /// The whole label and detail of the row under the pointer, when the row
+    /// was drawn short of either. A row that fits says nothing a box could add.
+    pub(crate) fn tooltip(&self) -> Option<Tip> {
+        let state = self.state.as_ref()?;
+        let pointer = state.pointer?;
+        let hit = state
+            .row_hits
+            .iter()
+            .find(|hit| hit.area.contains(pointer))
+            .filter(|hit| hit.clipped)?;
+        Some(Tip {
+            key: TipKey::Row(hit.area),
+            anchor: Anchor::Area(hit.area),
+            text: uncut_text(state.items.get(hit.item_index)?),
+        })
+    }
+
     pub fn handle_paste(&mut self, text: &str) -> bool {
         let Some(s) = self.state.as_mut() else {
             return false;
@@ -764,6 +792,7 @@ impl<T: PickerItem> ListPicker<T> {
             return;
         };
         s.invalidate_mouse_geometry();
+        s.pointer = None;
         if delta > 0 {
             s.scroll_offset = s.scroll_offset.saturating_sub(delta as usize);
         } else {
@@ -814,6 +843,10 @@ impl<T: PickerItem> Overlay for ListPicker<T> {
 
     fn cadence(&self) -> Cadence {
         self.cadence()
+    }
+
+    fn tooltip(&self) -> Option<Tip> {
+        self.tooltip()
     }
 }
 
@@ -1148,6 +1181,17 @@ pub(super) fn truncate_label(label: &str, max_width: usize) -> String {
     result
 }
 
+/// A row as it would read with room for all of it: the label, and under it
+/// whatever stands to its right.
+fn uncut_text<T: PickerItem>(item: &T) -> String {
+    let label = item.label();
+    match (item.badge(), item.detail()) {
+        (Some(badge), Some(detail)) => format!("{label}\n{badge}{BADGE_DETAIL_GAP}{detail}"),
+        (Some(trailing), None) | (None, Some(trailing)) => format!("{label}\n{trailing}"),
+        (None, None) => label.to_owned(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_list<T: PickerItem>(
     frame: &mut Frame,
@@ -1202,12 +1246,7 @@ fn render_list<T: PickerItem>(
             break;
         }
 
-        row_hits.push(PickerRowHit {
-            area: Rect::new(area.x, area.y + lines.len() as u16, area.width, 1),
-            filtered_index: i,
-            item_index: item_idx,
-        });
-
+        let row_area = Rect::new(area.x, area.y + lines.len() as u16, area.width, 1);
         let highlighted = item.is_highlighted();
         let t = theme::current();
         let (mut style, mut detail_style) = match (i == selected, highlighted) {
@@ -1249,20 +1288,22 @@ fn render_list<T: PickerItem>(
             item.detail()
         };
         let trailing = item.badge().map(|badge| match detail {
-            Some(detail) => format!("{badge}  {detail}"),
+            Some(detail) => format!("{badge}{BADGE_DETAIL_GAP}{detail}"),
             None => badge.to_owned(),
         });
         let detail = trailing.as_deref().or(detail);
         let suffix_gap = 2usize;
         let suffix_w = suffix.map(|s| s.width()).unwrap_or(0);
         let trailing_gap = suffix_w + if suffix_w > 0 { suffix_gap } else { 0 };
-        let line = match detail {
+        let (line, clipped) = match detail {
             Some(detail) => {
                 let row = if item.badge().is_some() {
                     badge_row(&label, detail, trailing_gap, area.width)
                 } else {
                     detail_row(&label, detail, trailing_gap, area.width)
                 };
+                let clipped =
+                    row.label.width() < label.width() || row.detail.width() < detail.width();
                 let mut spans = Vec::with_capacity(7);
                 if let Some(cb) = checkbox {
                     spans.push(cb);
@@ -1275,9 +1316,12 @@ fn render_list<T: PickerItem>(
                 spans.push(Span::styled(" ".repeat(row.pad), style));
                 spans.push(Span::styled(row.detail, detail_style));
                 spans.push(Span::styled(" ".repeat(DETAIL_RIGHT_PAD as usize), style));
-                Line::from(spans)
+                (Line::from(spans), clipped)
             }
+            // Nothing cuts a label without a detail, so the row's own edge does.
             None => {
+                let checkbox_width = checkbox.as_ref().map_or(0, Span::width);
+                let clipped = checkbox_width + label.width() > usize::from(area.width);
                 let mut spans: Vec<Span> = Vec::with_capacity(4);
                 if let Some(cb) = checkbox {
                     spans.push(cb);
@@ -1287,9 +1331,15 @@ fn render_list<T: PickerItem>(
                     spans.push(Span::styled(" ".repeat(suffix_gap), style));
                     spans.push(Span::styled(s.to_string(), theme::dim_style(style, 0.4)));
                 }
-                Line::from(spans)
+                (Line::from(spans), clipped)
             }
         };
+        row_hits.push(PickerRowHit {
+            area: row_area,
+            filtered_index: i,
+            item_index: item_idx,
+            clipped,
+        });
         lines.push(line);
         i += 1;
     }
@@ -1355,6 +1405,8 @@ mod tests {
     const LABEL_COLOURED: &str = "a label's colours paint exactly the characters they match";
     const OWN_COLOURS_PAINTED: &str = "a row drawn in its own colours paints its label's colours";
     const MARKED_ROW_PLAIN: &str = "a selected or disabled row draws its label in the row's style";
+    const TIP_ONLY_WHEN_CUT: &str = "a hovered row offers its whole text exactly when it was cut";
+    const TIP_OFF_THE_ROWS: &str = "a pointer that left the rows still offered a tip";
 
     fn ready_state<T>(p: &ListPicker<T>) -> &State<T> {
         p.state.as_ref().expect("expected open state")
@@ -1701,6 +1753,59 @@ mod tests {
         picker.handle_mouse(mouse(MouseEventKind::Moved, hit.area));
 
         assert_eq!(ready_state(&picker).selected, 2);
+    }
+
+    /// The tip a single-row picker offers with the pointer moved to `at` its
+    /// row, and the row.
+    fn hovered_tip(entry: Entry, at: fn(Rect) -> Rect) -> (Option<Tip>, Rect) {
+        let mut picker = ListPicker::new();
+        picker.open(vec![entry], " Test ");
+        render(&mut picker);
+        let row = ready_state(&picker).row_hits[0].area;
+        picker.handle_mouse(mouse(MouseEventKind::Moved, at(row)));
+        (picker.tooltip(), row)
+    }
+
+    #[test_case(LONG_DETAIL, None, Some(LONG_DETAIL.to_owned()); "label_past_the_edge")]
+    #[test_case(SUFFIX, Some(LONG_DETAIL), Some(format!("{SUFFIX}\n{LONG_DETAIL}")); "detail_cut")]
+    #[test_case(SUFFIX, Some(SHORT_DETAIL), None; "row_that_fits")]
+    fn a_hovered_row_offers_its_whole_text_only_when_cut(
+        label: &str,
+        detail: Option<&str>,
+        expected: Option<String>,
+    ) {
+        let entry = Entry {
+            detail: detail.map(str::to_owned),
+            ..Entry::new(label)
+        };
+        let (tip, _) = hovered_tip(entry, |row| row);
+        assert_eq!(tip.map(|tip| tip.text), expected, "{TIP_ONLY_WHEN_CUT}");
+    }
+
+    #[test]
+    fn a_hovered_cut_row_hangs_its_tip_from_the_row() {
+        let (tip, row) = hovered_tip(Entry::new(LONG_DETAIL), |row| row);
+        let tip = tip.expect(TIP_ONLY_WHEN_CUT);
+        assert_eq!(tip.key, TipKey::Row(row));
+        assert_eq!(tip.anchor, Anchor::Area(row));
+    }
+
+    #[test_case(|row| Rect { y: row.y - 1, ..row }; "above_the_rows")]
+    #[test_case(|_| Rect::default(); "outside_the_popup")]
+    fn moving_off_the_rows_offers_no_tip(at: fn(Rect) -> Rect) {
+        let (tip, _) = hovered_tip(Entry::new(LONG_DETAIL), at);
+        assert_eq!(tip, None, "{TIP_OFF_THE_ROWS}");
+    }
+
+    #[test]
+    fn a_key_takes_the_tip_away() {
+        let mut picker = ListPicker::new();
+        picker.open(vec![Entry::new(LONG_DETAIL)], " Test ");
+        render(&mut picker);
+        let row = ready_state(&picker).row_hits[0].area;
+        picker.handle_mouse(mouse(MouseEventKind::Moved, row));
+        picker.handle_key(key(KeyCode::Down));
+        assert_eq!(picker.tooltip(), None, "{TIP_OFF_THE_ROWS}");
     }
 
     #[test]

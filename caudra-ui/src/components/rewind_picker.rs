@@ -1,5 +1,6 @@
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::components::tooltip::Tip;
 use crate::repaint::Cadence;
 
 use caudra_grab::grab_scope;
@@ -157,6 +158,10 @@ impl Overlay for RewindPicker {
 
     fn cadence(&self) -> Cadence {
         self.picker.cadence()
+    }
+
+    fn tooltip(&self) -> Option<Tip> {
+        self.picker.tooltip()
     }
 }
 

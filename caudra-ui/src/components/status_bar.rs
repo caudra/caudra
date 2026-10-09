@@ -4,6 +4,7 @@ use std::path::{MAIN_SEPARATOR, Path};
 use std::time::{Duration, Instant};
 
 use super::command::ChatScope;
+use super::tooltip::{Anchor, Tip, TipKey};
 use super::{RetryInfo, Status, escape_terminal_controls, format_elapsed, hover_style};
 
 use crate::animation::spinner_frame;
@@ -93,6 +94,43 @@ const NOT_BILLED_MARK: &str = "~";
 /// Joins the model a pending mode switch leaves to the one it arrives on,
 /// matching the glyph the mode label uses for the same switch.
 const MODEL_TRANSITION_ARROW: &str = "\u{2192}";
+const TIP_BACK_TO_MAIN: &str = "Back to the main conversation";
+const TIP_BASH: &str = "The composer runs this line as a shell command";
+const TIP_MODE: &str = "Mode: ";
+const TIP_MODEL_PENDING: &str = "\nThe switch lands with the next message";
+const TIP_THINKING: &str = "Reasoning level: ";
+const TIP_TASK_SETTING: &str = "Set by the task's own model";
+const TIP_GOAL_CHECKS: &str = "checks";
+const TIP_TASKS: &str = "background tasks running";
+const TIP_SHELLS: &str = "background shells running";
+const TIP_CONTEXT: &str = "Context: ";
+const TIP_COMPACTS: &str = "Compacts at ";
+const TIP_CHAT_SPEND: &str = "This chat: ";
+const TIP_SESSION_SPEND: &str = "Whole session: ";
+const TIP_NOT_BILLED: &str = "~ marks spend your subscription covers";
+const TIP_RETRY: &str = "Attempt ";
+const TIP_RESUME: &str = "Click to follow new output again";
+const TIP_YOLO: &str = "YOLO: tool calls run without asking. Deny rules still apply";
+const TIP_AUTO: &str = "Auto: the decision engine approves calls no rule covers";
+const TIP_FAST: &str = "Fast mode is on";
+const TIP_SANDBOX: &str = "Attached sandbox: ";
+const TIP_DECISIONS: &str = "The decision engine is unreachable";
+const TIP_AUTOMATIONS_ARMED: &str = "armed";
+const TIP_AUTOMATIONS_FAILED: &str = "failed since you last looked";
+const CLICK_MODE: &str = "Click to switch between plan and build";
+pub(crate) const CLICK_MODEL: &str = "Click to pick a model";
+const CLICK_THINKING: &str = "Click to change it";
+const CLICK_GOAL: &str = "Click to open the goal";
+const CLICK_BROWSE: &str = "Click to browse them";
+const CLICK_CONTEXT: &str = "Click for the breakdown";
+const CLICK_USAGE: &str = "Click for usage and limits";
+const CLICK_WORKFLOWS: &str = "Click to open workflows";
+const CLICK_RETRY: &str = "Click to retry now";
+const CLICK_ASK: &str = "Click to go back to Ask";
+const CLICK_FAST: &str = "Click to turn it off";
+const CLICK_SANDBOX: &str = "Click to manage it";
+const CLICK_DECISIONS: &str = "Click for details";
+const CLICK_AUTOMATIONS: &str = "Click to open automations";
 /// Cells in the context gauge. Each fills in eighths, so the gauge resolves
 /// the window to one part in eighty.
 const GAUGE_CELLS: u8 = 10;
@@ -831,6 +869,9 @@ pub struct StatusBar {
     cwd: Option<String>,
     marquee: Marquee,
     automations: AutomationChip,
+    /// The hovered control's tooltip as of the last frame, built from the
+    /// context that drew it so the box and the chip never disagree.
+    hover_tip: Option<(StatusBarHitTarget, Rect, String)>,
 }
 
 #[derive(Default)]
@@ -916,7 +957,16 @@ impl StatusBar {
             cwd: (!remote).then(|| cwd.to_owned()),
             marquee: Marquee::default(),
             automations: AutomationChip::default(),
+            hover_tip: None,
         }
+    }
+
+    pub(crate) fn hover_tip(&self) -> Option<Tip> {
+        self.hover_tip.as_ref().map(|(target, area, text)| Tip {
+            key: TipKey::Status(*target),
+            anchor: Anchor::Area(*area),
+            text: text.clone(),
+        })
     }
 
     /// Whether the chip changed, so a caller feeding it every tick repaints
@@ -1039,6 +1089,14 @@ impl StatusBar {
             self.single_row(frame, area, ctx, &mut hits);
         }
         self.marquee.finish_frame();
+        self.hover_tip = ctx.hovered.and_then(|target| {
+            let hit = hits.iter().find(|hit| hit.target == target)?;
+            Some((
+                target,
+                hit.area,
+                chip_tip(target, ctx, &self.automations, &self.cwd_branch)?,
+            ))
+        });
         hits
     }
 
@@ -1753,6 +1811,125 @@ fn hoverable(ctx: &StatusBarContext<'_>, target: StatusBarHitTarget) -> bool {
         target,
         StatusBarHitTarget::ChatName | StatusBarHitTarget::Cwd
     ) || clickable(ctx, target)
+}
+
+/// What a chip means and what a click on it does. The click line appears only
+/// where the bar takes the click, so a task's footer never promises one.
+fn chip_tip(
+    target: StatusBarHitTarget,
+    ctx: &StatusBarContext<'_>,
+    automations: &AutomationChip,
+    cwd_branch: &str,
+) -> Option<String> {
+    let body = match target {
+        StatusBarHitTarget::BackToMain => TIP_BACK_TO_MAIN.to_owned(),
+        StatusBarHitTarget::Mode if ctx.bash_input => TIP_BASH.to_owned(),
+        StatusBarHitTarget::Mode => format!("{TIP_MODE}{}", ctx.mode.full.trim()),
+        StatusBarHitTarget::Model => match &ctx.pending_model {
+            Some(leaving) => format!(
+                "{leaving} {MODEL_TRANSITION_ARROW} {}{TIP_MODEL_PENDING}",
+                ctx.model_id
+            ),
+            None => ctx.model_id.to_owned(),
+        },
+        StatusBarHitTarget::Thinking => {
+            let level = ctx.thinking.as_deref()?;
+            match ctx.main_chat {
+                true => format!("{TIP_THINKING}{level}"),
+                false => format!("{TIP_THINKING}{level}\n{TIP_TASK_SETTING}"),
+            }
+        }
+        StatusBarHitTarget::Goal => {
+            let goal = ctx.goal?;
+            format!(
+                "{}\n{} {TIP_GOAL_CHECKS} \u{b7} {}",
+                goal.condition,
+                goal.evaluations,
+                format_goal_elapsed(goal.elapsed())
+            )
+        }
+        StatusBarHitTarget::Tasks => format!("{} {TIP_TASKS}", ctx.active_tasks),
+        StatusBarHitTarget::Shells => format!("{} {TIP_SHELLS}", ctx.active_shells),
+        StatusBarHitTarget::Context => context_tip(&ctx.stats),
+        StatusBarHitTarget::Usage => usage_tip(&ctx.stats)?,
+        StatusBarHitTarget::Workflows => ctx.workflows.as_ref()?.named.trim().to_owned(),
+        StatusBarHitTarget::Retry => {
+            let retry = ctx.retry_info?;
+            format!("{TIP_RETRY}{}: {}", retry.attempt, retry.message)
+        }
+        StatusBarHitTarget::ChatName => ctx.chat_name?.to_owned(),
+        StatusBarHitTarget::Cwd => cwd_branch.to_owned(),
+        StatusBarHitTarget::ResumeAutoScroll => TIP_RESUME.to_owned(),
+        StatusBarHitTarget::Yolo => TIP_YOLO.to_owned(),
+        StatusBarHitTarget::Auto => TIP_AUTO.to_owned(),
+        StatusBarHitTarget::Fast => TIP_FAST.to_owned(),
+        StatusBarHitTarget::Sandbox => format!("{TIP_SANDBOX}{}", ctx.sandbox?),
+        StatusBarHitTarget::Decisions => TIP_DECISIONS.to_owned(),
+        StatusBarHitTarget::Automations => match automations.unseen_failures {
+            0 => format!("{} {TIP_AUTOMATIONS_ARMED}", automations.armed),
+            failures => format!(
+                "{} {TIP_AUTOMATIONS_ARMED}\n{failures} {TIP_AUTOMATIONS_FAILED}",
+                automations.armed
+            ),
+        },
+    };
+    Some(match click_tip(target).filter(|_| clickable(ctx, target)) {
+        Some(click) => format!("{body}\n{click}"),
+        None => body,
+    })
+}
+
+fn click_tip(target: StatusBarHitTarget) -> Option<&'static str> {
+    Some(match target {
+        StatusBarHitTarget::Mode => CLICK_MODE,
+        StatusBarHitTarget::Model => CLICK_MODEL,
+        StatusBarHitTarget::Thinking => CLICK_THINKING,
+        StatusBarHitTarget::Goal => CLICK_GOAL,
+        StatusBarHitTarget::Tasks | StatusBarHitTarget::Shells => CLICK_BROWSE,
+        StatusBarHitTarget::Context => CLICK_CONTEXT,
+        StatusBarHitTarget::Usage => CLICK_USAGE,
+        StatusBarHitTarget::Workflows => CLICK_WORKFLOWS,
+        StatusBarHitTarget::Retry => CLICK_RETRY,
+        StatusBarHitTarget::Yolo | StatusBarHitTarget::Auto => CLICK_ASK,
+        StatusBarHitTarget::Fast => CLICK_FAST,
+        StatusBarHitTarget::Sandbox => CLICK_SANDBOX,
+        StatusBarHitTarget::Decisions => CLICK_DECISIONS,
+        StatusBarHitTarget::Automations => CLICK_AUTOMATIONS,
+        StatusBarHitTarget::BackToMain
+        | StatusBarHitTarget::ChatName
+        | StatusBarHitTarget::Cwd
+        | StatusBarHitTarget::ResumeAutoScroll => return None,
+    })
+}
+
+fn context_tip(stats: &UsageStats) -> String {
+    let used = format!(
+        "{TIP_CONTEXT}{} / {} ({}%)",
+        format_tokens(stats.context_size),
+        format_tokens(stats.context_window),
+        context_share(stats.context_size, stats.context_window)
+    );
+    match stats.compaction_border {
+        Some(border) => format!(
+            "{used}\n{TIP_COMPACTS}{} ({}%)",
+            format_tokens(border),
+            context_share(border, stats.context_window)
+        ),
+        None => used,
+    }
+}
+
+fn usage_tip(stats: &UsageStats) -> Option<String> {
+    let chat = spend(stats.cost, stats.subscription_cost)?;
+    let mut lines = vec![format!("{TIP_CHAT_SPEND}{chat}")];
+    let session = spend(stats.global_cost, stats.global_subscription_cost);
+    if let Some(session) = session.as_ref().filter(|_| stats.show_global) {
+        lines.push(format!("{TIP_SESSION_SPEND}{session}"));
+    }
+    if lines.iter().any(|line| line.contains(NOT_BILLED_MARK)) {
+        lines.push(TIP_NOT_BILLED.to_owned());
+    }
+    Some(lines.join("\n"))
 }
 
 /// A control rather than a label: `/decisions` names what the engine last
@@ -4875,5 +5052,68 @@ mod tests {
                 .expect(UNKNOWN_COMMAND_MSG);
             assert_eq!(target.scope(), command.scope, "{SCOPE_DRIFT_MSG}: {name}");
         }
+    }
+
+    const TIP_MISSING: &str = "the chip's tooltip leaves out what it means";
+    const TIP_PROMISES_CLICK: &str = "a chip the bar draws inert must not offer a click";
+    const TIP_CWD: &str = "~/project:main";
+
+    fn tip_for(target: StatusBarHitTarget, fixture: Fixture<'_>) -> String {
+        let ctx = fixture.into_ctx();
+        chip_tip(target, &ctx, &AutomationChip::default(), TIP_CWD).expect(TIP_MISSING)
+    }
+
+    #[test_case(StatusBarHitTarget::Model, true, &[MODEL_ID], Some(CLICK_MODEL); "model_on_main")]
+    #[test_case(StatusBarHitTarget::Model, false, &[MODEL_ID], None; "model_on_a_task")]
+    #[test_case(StatusBarHitTarget::Yolo, false, &[TIP_YOLO], Some(CLICK_ASK); "yolo_on_a_task")]
+    #[test_case(StatusBarHitTarget::Context, true, &[TIP_CONTEXT], Some(CLICK_CONTEXT); "context")]
+    #[test_case(StatusBarHitTarget::Cwd, true, &[TIP_CWD], None; "cwd")]
+    fn a_chip_tip_says_what_it_means_and_offers_only_real_clicks(
+        target: StatusBarHitTarget,
+        main_chat: bool,
+        meaning: &[&str],
+        click: Option<&str>,
+    ) {
+        let tip = tip_for(
+            target,
+            Fixture {
+                main_chat,
+                ..Default::default()
+            },
+        );
+        for part in meaning {
+            assert!(tip.contains(part), "{TIP_MISSING}: {tip}");
+        }
+        match click {
+            Some(click) => assert!(tip.ends_with(click), "{TIP_MISSING}: {tip}"),
+            None => assert!(!tip.contains(CLICK_MODEL), "{TIP_PROMISES_CLICK}: {tip}"),
+        }
+    }
+
+    #[test]
+    fn the_context_tip_names_the_compaction_point() {
+        let tip = tip_for(
+            StatusBarHitTarget::Context,
+            Fixture {
+                compaction_border: Some(HALF_WINDOW),
+                ..Default::default()
+            },
+        );
+        assert!(tip.contains(TIP_COMPACTS), "{TIP_MISSING}: {tip}");
+    }
+
+    #[test]
+    fn the_hovered_chip_leaves_its_tip_anchored_on_its_hit() {
+        let mut bar = StatusBar::new(FLASH_TTL, ".", false);
+        let ctx = Fixture {
+            hovered: Some(StatusBarHitTarget::Model),
+            ..Default::default()
+        }
+        .into_ctx();
+        let drawn = draw_bar(&mut bar, &ctx, BAR_WIDTH, SPLIT_ROWS);
+        let hit = drawn.hit(StatusBarHitTarget::Model);
+        let tip = bar.hover_tip().expect(TIP_MISSING);
+        assert_eq!(tip.key, TipKey::Status(StatusBarHitTarget::Model));
+        assert_eq!(tip.anchor, Anchor::Area(hit.area));
     }
 }

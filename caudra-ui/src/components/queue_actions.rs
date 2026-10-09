@@ -1,6 +1,7 @@
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::queue_panel::QueueEntry;
+use crate::components::tooltip::Tip;
 use crate::repaint::Cadence;
 
 use caudra_agent::{PromptAdmission, QueueItemId};
@@ -169,6 +170,10 @@ impl Overlay for QueueActions {
 
     fn cadence(&self) -> Cadence {
         self.picker.cadence()
+    }
+
+    fn tooltip(&self) -> Option<Tip> {
+        self.picker.tooltip()
     }
 }
 

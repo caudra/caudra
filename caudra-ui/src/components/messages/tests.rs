@@ -866,6 +866,7 @@ const COMMIT_ID: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
 const COMMIT_HASH: &str = "#a1b2c3d";
 const COMMIT_PROSE: &str = "landed in #a1b2c3d yesterday";
 const COMMIT_SUBJECT: &str = "Fix login crash";
+const COMMIT_AUTHOR: &str = "Ada Lovelace";
 const COMMIT_UNIX_SECONDS: i64 = 1_700_003_600;
 const COMMIT_MISSED: &str = "the pointer sat on a commit the panel did not resolve";
 const COMMIT_CLAIMED: &str = "a message the reader did not write answered with a commit";
@@ -4042,7 +4043,7 @@ fn message_link_hit_testing_accounts_for_segment_chrome() {
     let column = area.x + segment.chrome(80).left;
 
     panel.update_hover(row, column, area, false, Path::new(NO_PROJECT));
-    assert_eq!(panel.hovered_hint(), Some("https://example.com"));
+    assert_eq!(panel.hovered_hint().as_deref(), Some("https://example.com"));
     panel.update_hover(row, column + 4, area, false, Path::new(NO_PROJECT));
     assert_eq!(panel.hovered_hint(), None);
 }
@@ -4075,7 +4076,7 @@ fn commit_hover(role: DisplayRole) -> (MessagesPanel, Rect, u16, u16) {
     panel.set_commit_index(CommitIndex::loaded(vec![CommitSummary {
         id: COMMIT_ID.to_owned(),
         subject: COMMIT_SUBJECT.to_owned(),
-        author: "Ada Lovelace".to_owned(),
+        author: COMMIT_AUTHOR.to_owned(),
         committed_unix_seconds: COMMIT_UNIX_SECONDS,
     }]));
     (panel, area, row, column)
@@ -4119,7 +4120,11 @@ fn hovering_a_mention_marks_the_status_bar_and_no_glyph() {
         Path::new(env!("CARGO_MANIFEST_DIR")),
     );
 
-    assert_eq!(panel.hovered_hint(), Some(MENTION), "{MENTION_MISSED}");
+    assert_eq!(
+        panel.hovered_hint().as_deref(),
+        Some(MENTION),
+        "{MENTION_MISSED}"
+    );
     let segment = panel.cache.get(0).expect("a segment");
     assert!(
         panel.hover_feedback_for_segment(segment).is_none(),
@@ -4159,11 +4164,9 @@ fn hovering_a_commit_shows_its_subject_and_marks_no_glyph() {
 
     panel.update_hover(row, column, area, false, Path::new(NO_PROJECT));
 
-    assert_eq!(
-        panel.hovered_hint(),
-        Some(COMMIT_SUBJECT),
-        "{COMMIT_MISSED}"
-    );
+    let hint = panel.hovered_hint().expect(COMMIT_MISSED);
+    assert!(hint.starts_with(COMMIT_SUBJECT), "{COMMIT_MISSED}");
+    assert!(hint.contains(COMMIT_AUTHOR), "{COMMIT_MISSED}");
     let segment = panel.cache.get(0).expect("a segment");
     assert!(
         panel.hover_feedback_for_segment(segment).is_none(),

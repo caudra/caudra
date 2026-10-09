@@ -19,6 +19,7 @@ use crate::components::code_view::{WrappedRows, truncation_line};
 use crate::components::keybindings::{Bind, key};
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::Modal;
+use crate::components::tooltip::Tip;
 use crate::components::{HISTORY_HINTS, Hint, Overlay, escape_terminal_controls, task_card};
 use crate::repaint::Cadence;
 use crate::theme;
@@ -391,6 +392,10 @@ impl Overlay for TaskPicker {
 
     fn cadence(&self) -> Cadence {
         self.picker.cadence()
+    }
+
+    fn tooltip(&self) -> Option<Tip> {
+        self.picker.tooltip()
     }
 }
 

@@ -556,6 +556,9 @@ pub struct Workbench {
     /// Where the status row's hints landed in the last frame, and the key a
     /// press on each one stands in for.
     hint_hits: Vec<(Rect, keys::Bind)>,
+    /// The sidebar rows the last frame had to cut a name on, and the whole
+    /// name each one stands for, which is what [`Workbench::hover_tip`] offers.
+    cut_rows: Vec<(Rect, String)>,
 }
 
 impl Workbench {
@@ -608,11 +611,30 @@ impl Workbench {
             transfer: transfer::TransferState::default(),
             switcher: Vec::new(),
             hint_hits: Vec::new(),
+            cut_rows: Vec::new(),
         }
     }
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// The row the pointer rests on and the whole of the name the last frame
+    /// had to cut on it. Nothing while anything is drawn over the sidebar or
+    /// asks for an answer first.
+    pub fn hover_tip(&self) -> Option<(Rect, String)> {
+        if self.menu.is_some()
+            || self.confirm.is_some()
+            || self.input.is_some()
+            || self.palette.is_open()
+        {
+            return None;
+        }
+        let at = self.hover?;
+        self.cut_rows
+            .iter()
+            .find(|(row, _)| row.contains(at.into()))
+            .cloned()
     }
 
     pub fn open_local_source<Identity: ?Sized>(
@@ -4840,6 +4862,10 @@ mod tests {
     const CHANGE_MISSING: &str = "the change the test made is not under the cursor";
     const MARK_MISSING: &str = "the explorer row is missing its source control mark";
     const DIFF_EDITABLE: &str = "a diff tab must be read-only";
+    const TIP_MISSING: &str = "a name the tree had to cut must be offered whole on its row";
+    const STRAY_TIP: &str = "nothing may be offered while a popup stands over the tree";
+    const CUT_NAME: &str = "a-file-name-far-too-long-for-any-sidebar-to-show-whole.txt";
+    const SHORT_NAME: &str = "b.txt";
     const REMOTE_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
     const REMOTE_TEST_FILE: &str = "same-name.txt";
     const REMOTE_TEST_NESTED: &str = "src/lib.rs";
@@ -11276,6 +11302,83 @@ mod tests {
         workbench.handle_leader(press(keys::MENU));
 
         assert!(workbench.menu.is_none(), "{MODAL_LEAKED}");
+    }
+
+    fn named_project() -> (TempDir, Workbench) {
+        let dir = TempDir::new().expect("a temporary directory");
+        for name in [CUT_NAME, SHORT_NAME] {
+            fs::write(dir.path().join(name), "").expect("a file");
+        }
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.open(dir.path());
+        (dir, workbench)
+    }
+
+    /// Rests the pointer on the tree row naming `name` and paints the frame
+    /// the tip is read from, returning where the pointer rests.
+    fn hover_name(workbench: &mut Workbench, name: &str) -> (u16, u16) {
+        paint(workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let rows = workbench.panes.rows;
+        let index = workbench
+            .tree
+            .rows()
+            .iter()
+            .position(|row| row.name == name)
+            .expect("a row naming the file");
+        let at = (row_body(rows), rows.y + index as u16);
+        workbench.handle_mouse(moved(at.0, at.1));
+        paint(workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        at
+    }
+
+    #[test_case(CUT_NAME => Some(CUT_NAME.to_owned()) ; "a_cut_name_is_offered_whole")]
+    #[test_case(SHORT_NAME => None ; "a_name_that_fits_offers_nothing")]
+    fn a_tree_row_offers_its_name_only_when_it_was_cut(name: &str) -> Option<String> {
+        let (_dir, mut workbench) = named_project();
+        let at = hover_name(&mut workbench, name);
+
+        workbench.hover_tip().map(|(rect, text)| {
+            let row = Rect {
+                y: at.1,
+                height: 1,
+                ..workbench.panes.rows
+            };
+            assert_eq!(rect, row, "{TIP_MISSING}");
+            text
+        })
+    }
+
+    fn raise_menu(workbench: &mut Workbench, at: (u16, u16)) {
+        workbench.handle_mouse(right_click(at.0, at.1));
+    }
+
+    fn raise_dialog(workbench: &mut Workbench, at: (u16, u16)) {
+        raise_menu(workbench, at);
+        menu_action(workbench, MenuAction::Delete);
+    }
+
+    fn raise_prompt(workbench: &mut Workbench, at: (u16, u16)) {
+        raise_menu(workbench, at);
+        menu_action(workbench, MenuAction::NewFile);
+    }
+
+    fn raise_palette(workbench: &mut Workbench, _at: (u16, u16)) {
+        workbench.handle_key(press(keys::QUICK_OPEN));
+    }
+
+    #[test_case(raise_menu ; "a_menu")]
+    #[test_case(raise_dialog ; "a_dialog")]
+    #[test_case(raise_prompt ; "a_name_prompt")]
+    #[test_case(raise_palette ; "the_palette")]
+    fn a_popup_over_the_tree_suppresses_the_tip(raise: fn(&mut Workbench, (u16, u16))) {
+        let (_dir, mut workbench) = named_project();
+        let at = hover_name(&mut workbench, CUT_NAME);
+        assert!(workbench.hover_tip().is_some(), "{TIP_MISSING}");
+
+        raise(&mut workbench, at);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+
+        assert_eq!(workbench.hover_tip(), None, "{STRAY_TIP}");
     }
 
     #[test]

@@ -91,6 +91,7 @@ impl App {
         self.register_zones(&layout, overlay_rect);
         self.apply_selection(frame, render_chat);
         self.render_autoscroll_origin(frame);
+        self.render_tooltip(frame);
     }
 
     fn render_autoscroll_origin(&self, frame: &mut Frame) {
@@ -142,6 +143,7 @@ impl App {
                 self.zones.push_overlay(rect);
             }
         }
+        self.render_tooltip(frame);
     }
 
     /// The docked prompts take the foot of the workbench the way they take the
@@ -738,6 +740,9 @@ impl App {
                     .unwrap_or(&self.state.applied_model)
             });
         let activity = self.task_activity();
+        let hover_hint = (!self.has_modal_overlay())
+            .then(|| chat.hovered_hint())
+            .flatten();
         let (context_size, context_window) = self.context_usage(
             chat,
             effective_model.as_deref(),
@@ -792,9 +797,7 @@ impl App {
             hovered: (!self.has_modal_overlay())
                 .then_some(self.status_hover)
                 .flatten(),
-            hover_hint: (!self.has_modal_overlay())
-                .then(|| chat.hovered_hint())
-                .flatten(),
+            hover_hint: hover_hint.as_deref(),
         };
         self.status_hits = self.status_bar.view(frame, status_area, &ctx);
     }

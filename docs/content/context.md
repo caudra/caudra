@@ -103,7 +103,7 @@ Before the first window arrives there is nothing to check against, so a hash spe
 
 Mentioned files and mentioned commits share one budget per turn, so a message carrying both cannot send more than a message carrying either. A commit past the budget, or one the log no longer holds, is reported to the model as a short note rather than dropped in silence.
 
-A sent hash stays clickable in the transcript. Hovering one puts the commit subject in the status bar, which is more use than the hash you are already looking at, and clicking it opens [source control](/docs/workbench/) in the workbench with the cursor on that commit. Only your own messages answer, so a hash the model quotes back is left as text.
+A sent hash stays clickable in the transcript. Hovering one puts the commit subject, author, and date in the status bar, which is more use than the hash you are already looking at, and clicking it opens [source control](/docs/workbench/) in the workbench with the cursor on that commit. Only your own messages answer, so a hash the model quotes back is left as text.
 
 In a [remote workspace](/docs/remote-workspaces/) or a [sandbox](/docs/sandboxes/), `#` works the same way. The history lives on the far side, so the popup lists the log source control already read from the workspace rather than walking a repository on your machine, and the commit itself is fetched from the workspace when you send. That is one round trip, not two: the same read serves the popup and the source control pane.
 

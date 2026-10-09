@@ -3587,6 +3587,7 @@ impl<'t> EventLoop<'t> {
             Event::Resize(..) => {
                 for runtime in &mut self.sessions {
                     runtime.app.peer_manager.invalidate_layout();
+                    runtime.app.dismiss_tooltip();
                 }
                 self.wake_appearance();
                 (None, None)

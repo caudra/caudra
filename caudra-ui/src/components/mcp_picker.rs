@@ -10,6 +10,7 @@ use caudra_grab::grab_scope;
 
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::components::tooltip::Tip;
 use crate::components::{Hint, Overlay, escape_terminal_controls};
 use crate::repaint::{Cadence, Dirty, Watch};
 
@@ -436,6 +437,10 @@ impl Overlay for McpPicker {
 
     fn cadence(&self) -> Cadence {
         self.picker.cadence()
+    }
+
+    fn tooltip(&self) -> Option<Tip> {
+        self.picker.tooltip()
     }
 }
 

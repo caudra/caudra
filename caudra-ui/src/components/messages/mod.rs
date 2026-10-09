@@ -60,6 +60,7 @@ use crossterm::event::MouseEvent;
 
 use super::scrollbar::{ScrollHint, Scrollbar, ScrollbarMouse};
 use super::streaming_content::StreamingContent;
+use super::tooltip::{Anchor, Tip, TipKey};
 use caudra_agent::background::BackgroundTasks;
 use caudra_agent::commits::{self, CommitRef};
 use caudra_agent::mentions::{self, Mention};
@@ -82,6 +83,8 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use tracing::warn;
 
+/// The actions glyph is a bare `⋮`, so its tooltip names what is behind it.
+const MESSAGE_ACTION_TIP: &str = "Message actions: review, fork or revert from here";
 const THOUGHT_PREFIX: &str = "Thought";
 const INJECTED_FALLBACK_TITLE: &str = "injected message";
 const INJECTED_SEARCH_PREFIX: &str = "injected> ";
@@ -3209,17 +3212,36 @@ impl MessagesPanel {
     /// What the status bar says about whatever the pointer is over. Neither
     /// target marks its own glyphs, so this line is the only sign either of
     /// them is there.
-    pub(crate) fn hovered_hint(&self) -> Option<&str> {
+    pub(crate) fn hovered_hint(&self) -> Option<Cow<'_, str>> {
         match &self.hover {
-            Some(HoverTarget::Link(target)) => Some(target),
-            Some(HoverTarget::Mention(mention)) => Some(&mention.raw),
-            // A hash names nothing on its own, so the bar shows the subject the
-            // reader would otherwise have to open the commit to read.
-            Some(HoverTarget::Commit(commit)) => {
-                Some(self.commit_index.subject(&commit.id).unwrap_or(&commit.raw))
-            }
+            Some(HoverTarget::Link(target)) => Some(Cow::Borrowed(target)),
+            Some(HoverTarget::Mention(mention)) => Some(Cow::Borrowed(&mention.raw)),
+            // A hash names nothing on its own, so the bar shows what the reader
+            // would otherwise have to open the commit to read.
+            Some(HoverTarget::Commit(commit)) => Some(
+                self.commit_index
+                    .describe(&commit.id)
+                    .map_or(Cow::Borrowed(commit.raw.as_str()), Cow::Owned),
+            ),
             _ => None,
         }
+    }
+
+    /// The floating tooltip for an icon under the pointer. Links, mentions and
+    /// commits answer on the status line instead, through [`Self::hovered_hint`].
+    pub(crate) fn hover_tip(&self) -> Option<Tip> {
+        let Some(HoverTarget::MessageAction(index)) = self.hover else {
+            return None;
+        };
+        let hit = self
+            .message_action_hits
+            .iter()
+            .find(|hit| hit.target.segment_index == index)?;
+        Some(Tip {
+            key: TipKey::MessageAction(index),
+            anchor: Anchor::Area(hit.area),
+            text: MESSAGE_ACTION_TIP.to_owned(),
+        })
     }
 
     pub(crate) fn terminal_links(&self) -> &[TerminalLink] {

@@ -1,6 +1,7 @@
 //! Rebuilds display messages from stored sessions. Tool outputs get syntax
 //! highlighted, missing outputs fall back to plain text from `ToolResult`.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use crate::components::commit_popup::CommitIndex;
 use crate::components::messages::MessagesPanel;
 use crate::components::prompt_progress::PromptProgress;
 use crate::components::tool_display::append_annotation;
+use crate::components::tooltip::Tip;
 use crate::components::workflow_card::CardHit;
 use crate::components::{
     DisplayMessage, DisplayRole, DisplaySource, RetryInfo, ToolRole, ToolStatus, workflow_card,
@@ -646,8 +648,12 @@ impl Chat {
         self.messages_panel.clear_hover();
     }
 
-    pub(crate) fn hovered_hint(&self) -> Option<&str> {
+    pub(crate) fn hovered_hint(&self) -> Option<Cow<'_, str>> {
         self.messages_panel.hovered_hint()
+    }
+
+    pub(crate) fn hover_tip(&self) -> Option<Tip> {
+        self.messages_panel.hover_tip()
     }
 
     pub(crate) fn terminal_links(&self) -> &[crate::markdown::TerminalLink] {

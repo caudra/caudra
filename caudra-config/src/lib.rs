@@ -1042,6 +1042,7 @@ pub struct UiFileConfig {
     pub mermaid: Option<MermaidStyle>,
     pub flash_duration_ms: Option<u64>,
     pub which_key_delay_ms: Option<u64>,
+    pub tooltips: Option<bool>,
     pub typewriter_ms_per_char: Option<u64>,
     pub mouse_scroll_lines: Option<u32>,
     pub scroll_card_lines: Option<u32>,
@@ -1071,6 +1072,7 @@ impl UiFileConfig {
             notifications,
             flash_duration_ms,
             which_key_delay_ms,
+            tooltips,
             typewriter_ms_per_char,
             mouse_scroll_lines,
             scroll_card_lines,
@@ -2178,6 +2180,12 @@ pub struct UiConfig {
     )]
     pub which_key_delay_ms: u64,
 
+    #[config(
+        default = true,
+        desc = "Show a tooltip when the mouse rests on a footer chip, an icon, a cut-off name or a paste token"
+    )]
+    pub tooltips: bool,
+
     #[config(default = DEFAULT_TYPEWRITER_MS_PER_CHAR, desc = "Typewriter effect speed (ms/char)")]
     pub typewriter_ms_per_char: u64,
 
@@ -2269,6 +2277,7 @@ impl UiConfig {
             mermaid: f.mermaid.unwrap_or_default(),
             flash_duration_ms: f.flash_duration_ms.unwrap_or(DEFAULT_FLASH_DURATION_MS),
             which_key_delay_ms: f.which_key_delay_ms.unwrap_or(DEFAULT_WHICH_KEY_DELAY_MS),
+            tooltips: f.tooltips.unwrap_or(true),
             typewriter_ms_per_char: f
                 .typewriter_ms_per_char
                 .unwrap_or(DEFAULT_TYPEWRITER_MS_PER_CHAR),

@@ -32,6 +32,7 @@ use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::Modal;
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::task_card::{self, fact, literal_body, literal_code, status_style};
+use crate::components::tooltip::Tip;
 use crate::components::{
     HISTORY_HINTS, Hint, HintBar, ModalScroll, Overlay, escape_terminal_controls, format_elapsed,
 };
@@ -666,6 +667,13 @@ impl Overlay for ShellModal {
                 Cadence::CLOCK,
             ),
             None => self.picker.cadence(),
+        }
+    }
+
+    fn tooltip(&self) -> Option<Tip> {
+        match self.page {
+            Some(_) => None,
+            None => self.picker.tooltip(),
         }
     }
 }

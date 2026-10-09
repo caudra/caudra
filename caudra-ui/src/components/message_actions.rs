@@ -1,4 +1,5 @@
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::components::tooltip::Tip;
 use crate::components::{DisplaySource, Overlay};
 use crate::repaint::Cadence;
 
@@ -171,6 +172,10 @@ impl Overlay for MessageActions {
 
     fn cadence(&self) -> Cadence {
         self.picker.cadence()
+    }
+
+    fn tooltip(&self) -> Option<Tip> {
+        self.picker.tooltip()
     }
 }
 

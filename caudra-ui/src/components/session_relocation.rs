@@ -13,6 +13,7 @@ use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
+use super::tooltip::Tip;
 use super::{Hint, Overlay};
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
@@ -611,6 +612,10 @@ impl Overlay for SessionRelocationPicker {
 
     fn cadence(&self) -> Cadence {
         self.cadence()
+    }
+
+    fn tooltip(&self) -> Option<Tip> {
+        self.picker.tooltip()
     }
 }
 
