@@ -101,6 +101,15 @@ impl Release {
     }
 }
 
+/// Whether a release lookup may answer from the shared cache. A fresh lookup
+/// still takes the cache lock and refreshes the entry it bypassed, so later
+/// cached lookups see what it found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lookup {
+    Cached,
+    Fresh,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum VersionError {
     #[error("HTTP request failed: {0}")]
@@ -418,7 +427,10 @@ impl CacheEntry {
     }
 }
 
-pub fn fetch_release_cached(channel: UpdateChannel) -> Result<Option<Release>, VersionError> {
+pub fn fetch_release_cached(
+    channel: UpdateChannel,
+    lookup: Lookup,
+) -> Result<Option<Release>, VersionError> {
     let channel = channel.resolve()?;
     let target = current_target()?;
     let now = SystemTime::now()
@@ -430,15 +442,21 @@ pub fn fetch_release_cached(channel: UpdateChannel) -> Result<Option<Release>, V
         channel.clone(),
         target,
         now,
+        lookup,
         || fetch_release(channel),
     )
 }
 
+/// `Ok(None)` means another process holds the lock and is already looking,
+/// never that the installed version is current. A fresh lookup that fails
+/// leaves the entry it bypassed in place, so a transient error cannot replace
+/// a good answer with an hour of silence.
 fn cached_at(
     directory: &Path,
     channel: UpdateChannel,
     target: &str,
     now: u64,
+    lookup: Lookup,
     fetch: impl FnOnce() -> Result<Release, VersionError>,
 ) -> Result<Option<Release>, VersionError> {
     fs::create_dir_all(directory)?;
@@ -448,15 +466,21 @@ fn cached_at(
     else {
         return Ok(None);
     };
-    if let Some(entry) = File::open(&path)
-        .ok()
-        .and_then(|file| read_bounded(file, MAX_CACHE_BYTES).ok())
-        .and_then(|bytes| serde_json::from_slice::<CacheEntry>(&bytes).ok())
-        .filter(|entry| entry.usable(&channel, target, now))
+    if lookup == Lookup::Cached
+        && let Some(entry) = File::open(&path)
+            .ok()
+            .and_then(|file| read_bounded(file, MAX_CACHE_BYTES).ok())
+            .and_then(|bytes| serde_json::from_slice::<CacheEntry>(&bytes).ok())
+            .filter(|entry| entry.usable(&channel, target, now))
     {
         return Ok(entry.release);
     }
     let result = fetch();
+    if lookup == Lookup::Fresh
+        && let Err(error) = result
+    {
+        return Err(error);
+    }
     let entry = CacheEntry {
         schema: CACHE_SCHEMA,
         channel,
@@ -483,6 +507,7 @@ fn cached_at(
 mod tests {
     use std::cell::Cell;
     use std::fs;
+    use std::path::Path;
     use std::time::Instant;
 
     use serde_json::{Value, json};
@@ -491,9 +516,10 @@ mod tests {
 
     use super::{
         CACHE_SCHEMA, CACHE_TTL, CHECKSUM_ASSET, CacheEntry, DISCOVERY_TIMEOUT, DOWNLOAD_URL,
-        FAILURE_COOLDOWN, LOCK_MODE, MAX_CACHE_BYTES, MAX_PAGES, MAX_RESPONSE_BYTES, PAGE_SIZE,
-        Release, UNIX_INSTALLER, UPLOADED, UpdateChannel, VersionError, WINDOWS_INSTALLER,
-        cached_at, discover, is_newer, read_bounded, remaining, tag_version, target_for,
+        FAILURE_COOLDOWN, LOCK_MODE, Lookup, MAX_CACHE_BYTES, MAX_PAGES, MAX_RESPONSE_BYTES,
+        PAGE_SIZE, Release, UNIX_INSTALLER, UPLOADED, UpdateChannel, VersionError,
+        WINDOWS_INSTALLER, cached_at, discover, is_newer, read_bounded, remaining, tag_version,
+        target_for,
     };
     use crate::try_exclusive_state_lock;
 
@@ -501,6 +527,12 @@ mod tests {
     const WINDOWS: &str = "x86_64-pc-windows-msvc";
     const TAG: &str = "v1.2.0";
     const VERSION: &str = "1.2.0";
+    const NEWER_TAG: &str = "v1.3.0";
+    const NEWER_VERSION: &str = "1.3.0";
+    const FRESH_READ_CACHE: &str = "a fresh lookup must ask GitHub rather than read the cache";
+    const FRESH_NOT_SAVED: &str = "later cached lookups must see what a fresh lookup found";
+    const FRESH_FAILURE_CLOBBERED: &str =
+        "a failed fresh lookup must leave the cached success in place";
     const NOW: u64 = 1_800_000_000;
     const PUBLISHED: &str = "2026-01-01T00:00:00Z";
     const UNAVAILABLE: u16 = 503;
@@ -509,6 +541,13 @@ mod tests {
         Release {
             tag: TAG.to_owned(),
             version: VERSION.to_owned(),
+        }
+    }
+
+    fn newer_release() -> Release {
+        Release {
+            tag: NEWER_TAG.to_owned(),
+            version: NEWER_VERSION.to_owned(),
         }
     }
 
@@ -944,7 +983,15 @@ mod tests {
         };
         for now in [NOW, NOW + CACHE_TTL.as_secs() - 1] {
             assert_eq!(
-                cached_at(directory.path(), UpdateChannel::Stable, LINUX, now, fetch).unwrap(),
+                cached_at(
+                    directory.path(),
+                    UpdateChannel::Stable,
+                    LINUX,
+                    now,
+                    Lookup::Cached,
+                    fetch
+                )
+                .unwrap(),
                 Some(release())
             );
         }
@@ -954,6 +1001,7 @@ mod tests {
             UpdateChannel::Stable,
             LINUX,
             NOW + CACHE_TTL.as_secs(),
+            Lookup::Cached,
             fetch,
         )
         .unwrap();
@@ -963,9 +1011,14 @@ mod tests {
     #[test]
     fn failures_are_cooled_down_without_stale_success() {
         let directory = tempdir().unwrap();
-        cached_at(directory.path(), UpdateChannel::Stable, LINUX, NOW, || {
-            Ok(release())
-        })
+        cached_at(
+            directory.path(),
+            UpdateChannel::Stable,
+            LINUX,
+            NOW,
+            Lookup::Cached,
+            || Ok(release()),
+        )
         .unwrap();
         let expired = NOW + CACHE_TTL.as_secs();
         assert!(matches!(
@@ -974,6 +1027,7 @@ mod tests {
                 UpdateChannel::Stable,
                 LINUX,
                 expired,
+                Lookup::Cached,
                 || Err(VersionError::Status(UNAVAILABLE))
             ),
             Err(VersionError::Status(UNAVAILABLE))
@@ -988,6 +1042,7 @@ mod tests {
             UpdateChannel::Stable,
             LINUX,
             expired + FAILURE_COOLDOWN.as_secs() - 1,
+            Lookup::Cached,
             fetch,
         )
         .unwrap();
@@ -998,6 +1053,7 @@ mod tests {
             UpdateChannel::Stable,
             LINUX,
             expired + FAILURE_COOLDOWN.as_secs(),
+            Lookup::Cached,
             fetch,
         )
         .unwrap();
@@ -1013,10 +1069,17 @@ mod tests {
             (UpdateChannel::Preview, LINUX),
             (UpdateChannel::Stable, WINDOWS),
         ] {
-            cached_at(directory.path(), channel, target, NOW, || {
-                calls.set(calls.get() + 1);
-                Ok(release())
-            })
+            cached_at(
+                directory.path(),
+                channel,
+                target,
+                NOW,
+                Lookup::Cached,
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(release())
+                },
+            )
             .unwrap();
         }
         assert_eq!(calls.get(), 3);
@@ -1029,9 +1092,14 @@ mod tests {
         let path = directory.path().join(format!("stable-{LINUX}.json"));
         fs::write(&path, bytes).unwrap();
         assert_eq!(
-            cached_at(directory.path(), UpdateChannel::Stable, LINUX, NOW, || Ok(
-                release()
-            ))
+            cached_at(
+                directory.path(),
+                UpdateChannel::Stable,
+                LINUX,
+                NOW,
+                Lookup::Cached,
+                || Ok(release())
+            )
             .unwrap(),
             Some(release())
         );
@@ -1064,16 +1132,24 @@ mod tests {
         )
         .unwrap();
         let calls = Cell::new(0);
-        cached_at(directory.path(), UpdateChannel::Stable, LINUX, NOW, || {
-            calls.set(calls.get() + 1);
-            Ok(release())
-        })
+        cached_at(
+            directory.path(),
+            UpdateChannel::Stable,
+            LINUX,
+            NOW,
+            Lookup::Cached,
+            || {
+                calls.set(calls.get() + 1);
+                Ok(release())
+            },
+        )
         .unwrap();
         assert_eq!(calls.get(), 1);
     }
 
-    #[test]
-    fn concurrent_cache_check_does_not_fetch_or_block() {
+    #[test_case(Lookup::Cached; "cached")]
+    #[test_case(Lookup::Fresh; "fresh")]
+    fn concurrent_cache_check_does_not_fetch_or_block(lookup: Lookup) {
         let directory = tempdir().unwrap();
         let lock_path = directory.path().join(format!("stable-{LINUX}.lock"));
         let lock = try_exclusive_state_lock(&lock_path, LOCK_MODE)
@@ -1085,15 +1161,98 @@ mod tests {
             Ok(release())
         };
         assert_eq!(
-            cached_at(directory.path(), UpdateChannel::Stable, LINUX, NOW, fetch).unwrap(),
+            cached_at(
+                directory.path(),
+                UpdateChannel::Stable,
+                LINUX,
+                NOW,
+                lookup,
+                fetch
+            )
+            .unwrap(),
             None
         );
         assert_eq!(calls.get(), 0);
         drop(lock);
         assert_eq!(
-            cached_at(directory.path(), UpdateChannel::Stable, LINUX, NOW, fetch).unwrap(),
+            cached_at(
+                directory.path(),
+                UpdateChannel::Stable,
+                LINUX,
+                NOW,
+                lookup,
+                fetch
+            )
+            .unwrap(),
             Some(release())
         );
         assert_eq!(calls.get(), 1);
+    }
+
+    fn stable_lookup(
+        directory: &Path,
+        now: u64,
+        lookup: Lookup,
+        fetch: impl FnOnce() -> Result<Release, VersionError>,
+    ) -> Result<Option<Release>, VersionError> {
+        cached_at(directory, UpdateChannel::Stable, LINUX, now, lookup, fetch)
+    }
+
+    #[test]
+    fn fresh_lookup_bypasses_and_refreshes_a_valid_cache() {
+        let directory = tempdir().unwrap();
+        stable_lookup(directory.path(), NOW, Lookup::Cached, || Ok(release())).unwrap();
+        assert_eq!(
+            stable_lookup(directory.path(), NOW + 1, Lookup::Fresh, || Ok(
+                newer_release()
+            ))
+            .unwrap(),
+            Some(newer_release()),
+            "{FRESH_READ_CACHE}"
+        );
+        let calls = Cell::new(0);
+        let cached = stable_lookup(directory.path(), NOW + 2, Lookup::Cached, || {
+            calls.set(calls.get() + 1);
+            Ok(release())
+        })
+        .unwrap();
+        assert_eq!(cached, Some(newer_release()), "{FRESH_NOT_SAVED}");
+        assert_eq!(calls.get(), 0, "{FRESH_NOT_SAVED}");
+    }
+
+    #[test]
+    fn fresh_lookup_bypasses_a_failure_cooldown() {
+        let directory = tempdir().unwrap();
+        assert!(
+            stable_lookup(directory.path(), NOW, Lookup::Cached, || Err(
+                VersionError::Status(UNAVAILABLE)
+            ))
+            .is_err()
+        );
+        assert_eq!(
+            stable_lookup(directory.path(), NOW + 1, Lookup::Fresh, || Ok(release())).unwrap(),
+            Some(release()),
+            "{FRESH_READ_CACHE}"
+        );
+    }
+
+    #[test]
+    fn failed_fresh_lookup_keeps_the_cached_success() {
+        let directory = tempdir().unwrap();
+        stable_lookup(directory.path(), NOW, Lookup::Cached, || Ok(release())).unwrap();
+        assert!(matches!(
+            stable_lookup(directory.path(), NOW + 1, Lookup::Fresh, || Err(
+                VersionError::Status(UNAVAILABLE)
+            )),
+            Err(VersionError::Status(UNAVAILABLE))
+        ));
+        let calls = Cell::new(0);
+        let cached = stable_lookup(directory.path(), NOW + 2, Lookup::Cached, || {
+            calls.set(calls.get() + 1);
+            Ok(newer_release())
+        })
+        .unwrap();
+        assert_eq!(cached, Some(release()), "{FRESH_FAILURE_CLOBBERED}");
+        assert_eq!(calls.get(), 0, "{FRESH_FAILURE_CLOBBERED}");
     }
 }

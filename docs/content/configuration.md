@@ -165,7 +165,7 @@ To keep using `init.lua`, set `lua_plugins = true` under `[experimental]`. Its `
 | `thinking_lines` | u32 | `10` | - | - | Rows of body an open reasoning block draws. The window follows the reasoning while it streams and pauses when scrolled up, and a footer reports how much sits above and below. Click inside a window to give it the wheel, which passes back to the transcript at either edge, and drag the bar in its last column to move it directly. Click the footer to follow again. A finished block rests on its last rows until you move it. `0` draws every block whole |
 | `show_reminders` | bool | `true` | - | - | Show the messages Caudra writes into the conversation on your behalf: standing reminders, goal check-ins, nudges, and continuations. Each is one dim row that expands on click to the exact text the model was sent. Turn this off to keep the transcript to the conversation alone |
 | `clock_format` | String | `system` | - | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
-| `update_check` | bool | `true` | `CAUDRA_ENABLE_UPDATE_CHECK` | - | Check GitHub releases in the background at interactive startup and show an update notice. Uses a shared 24-hour cache and never installs automatically. Set false to disable |
+| `update_check` | bool | `true` | `CAUDRA_ENABLE_UPDATE_CHECK` | - | Check GitHub releases in the background at interactive startup and show a banner above the prompt when a newer version is available. Uses a shared 24-hour cache and never installs automatically. Set false to disable |
 | `update_channel` | string | `auto` | - | - | Release channel: `auto` follows stable from a stable build and preview from a prerelease, including graduation to stable. `stable` excludes prereleases. `preview` includes prereleases and stable releases |
 | `theme` | string | unset | - | - | Name of the color theme to load at startup, overriding the theme you last picked with `/theme`. Unset keeps your last pick |
 | `theme_light` | string | unset | - | - | Light theme to pair with `theme`, in place of the one from the pairing table or for a theme that has no pair. `theme` becomes the dark half |
@@ -204,17 +204,19 @@ Leave `ui.theme` unset to pair the light theme with whatever you last picked fro
 
 ### `ui.update_check`
 
-Enabled by default in the interactive UI. Caudra checks GitHub releases in the background at startup and shows a notice when a newer version is available. A shared on-disk cache reuses successful checks for 24 hours across processes, with backoff after failures. Headless and ACP runs do not start an update check. Nothing is installed automatically.
+Enabled by default in the interactive UI. Caudra checks GitHub releases in the background at startup. When a newer version is available, a one-line banner above the prompt names it and the command that installs it, in every session of that process. A shared on-disk cache reuses successful checks for 24 hours across processes, with backoff after failures. Headless and ACP runs do not start an update check. Nothing is installed automatically.
+
+Click the banner's `×` or run `/dismiss-update` to hide it in every session until Caudra exits. The dismissal is not saved, so the next start shows the banner again while the release is still newer.
 
 GitHub receives your source IP address and normal request metadata, including a `caudra` user agent. The check sends no session data, machine identifier, or current version.
 
-Set `ui.update_check = false` to disable startup checks. `CAUDRA_ENABLE_UPDATE_CHECK=0` disables them for one run, and `CAUDRA_ENABLE_UPDATE_CHECK=1` enables them even when the config says false. An empty value leaves the config in effect. A normal run still contacts your model provider, fetches the public [models.dev](https://models.dev/) model catalog when the cached copy is more than a day old, and sends web searches to Exa when the agent uses `websearch`.
+Set `ui.update_check = false` to disable startup checks. `CAUDRA_ENABLE_UPDATE_CHECK=0` disables them for one run. `CAUDRA_ENABLE_UPDATE_CHECK=1` checks even when the config says false, and it asks GitHub instead of reading the cache, so a release published since the last check shows at once. Its answer refreshes the cache for later starts. An empty value leaves the config in effect. A normal run still contacts your model provider, fetches the public [models.dev](https://models.dev/) model catalog when the cached copy is more than a day old, and sends web searches to Exa when the agent uses `websearch`.
 
 ### `ui.update_channel`
 
 The default, `"auto"`, follows stable releases from a stable build and preview releases from a prerelease build. `"stable"` excludes prereleases. `"preview"` includes both prereleases and stable releases, so a preview can graduate to its stable release. After graduation, `"auto"` follows stable releases.
 
-Run `caudra update --channel auto`, `caudra update --channel stable`, or `caudra update --channel preview` to update manually. An explicit update bypasses the startup cache and opt-out. The splash notice includes the configured channel in its command.
+Run `caudra update --channel auto`, `caudra update --channel stable`, or `caudra update --channel preview` to update manually. An explicit update bypasses the startup cache and opt-out. The banner's command names the channel the check used, with `auto` resolved to `stable` or `preview`.
 
 ### `ui.tool_output_lines`
 

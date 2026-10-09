@@ -511,6 +511,14 @@ impl App {
             self.clear_control_hovers();
             return Vec::new();
         }
+        if !self.has_modal_overlay()
+            && event.kind == MouseEventKind::Down(MouseButton::Left)
+            && self.update_close.is_some_and(|close| close.contains(at))
+        {
+            self.clear_control_hovers();
+            self.dismiss_update();
+            return Vec::new();
+        }
         // Ahead of the selection below, which would otherwise read a press on
         // a bar as the start of a sweep down the surface behind it. Both
         // columns sit outside the areas selection measures against, so nothing

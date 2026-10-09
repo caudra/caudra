@@ -112,6 +112,7 @@ use crate::herdr::{
 use crate::input::InputReader;
 use crate::repaint::{Dirty, FrameLimiter, IDLE_POLL};
 use crate::theme;
+use crate::update::UpdateNotice;
 use crate::{
     AppSession, ChangeServiceFactory, PatternSuggestionLoader, PermissionAuthorityFactory,
     SessionRelocationHandoff, SessionTab,
@@ -1113,6 +1114,7 @@ struct SpawnCtx {
     /// One slot shared by every runtime: an `App` can only see its own
     /// session, so the loop publishes the rest here for the picker to read.
     live_sessions: Arc<ArcSwap<Vec<SessionRow>>>,
+    update_notice: Arc<UpdateNotice>,
     workspace_session: Option<caudra_workspace::WorkspaceSession>,
     /// The directory Caudra itself runs in, kept only for a sandbox session:
     /// there `{cwd}` names a path inside the VM, and the host checkout is a
@@ -1398,6 +1400,7 @@ impl SpawnCtx {
         app.reconcile_loaded_session(changes.first, false);
         app.refresh_record_index();
         app.live_sessions = Arc::clone(&self.live_sessions);
+        app.update_notice = Arc::clone(&self.update_notice);
         app.state.system_prompt_profile_name = system_prompt_profile_name;
         app.state.system_prompt_profile = system_prompt_profile;
         app.state.system_prompt_profile_override = self.prompt_profile_override.is_some();
@@ -1850,6 +1853,7 @@ impl<'t> EventLoop<'t> {
             default_prompt_profile,
             prompt_profile_override,
             live_sessions: Arc::default(),
+            update_notice: crate::update::notice(),
             host_cwd: workspace_session.as_ref().map(|_| cwd.clone()),
             workspace_session,
             local_documents,
@@ -5174,6 +5178,7 @@ mod tests {
             default_prompt_profile: None,
             prompt_profile_override: None,
             live_sessions: Arc::default(),
+            update_notice: Arc::default(),
             workspace_session: None,
             host_cwd: None,
             local_documents: None,

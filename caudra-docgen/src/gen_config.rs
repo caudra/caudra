@@ -345,10 +345,19 @@ fn write_update_check_section(out: &mut String) {
     writeln!(
         out,
         "Enabled by default in the interactive UI. Caudra checks GitHub releases \
-         in the background at startup and shows a notice when a newer version \
-         is available. A shared on-disk cache reuses successful checks for \
-         24 hours across processes, with backoff after failures. Headless and \
-         ACP runs do not start an update check. Nothing is installed automatically.\n"
+         in the background at startup. When a newer version is available, a \
+         one-line banner above the prompt names it and the command that \
+         installs it, in every session of that process. A shared on-disk cache \
+         reuses successful checks for 24 hours across processes, with backoff \
+         after failures. Headless and ACP runs do not start an update check. \
+         Nothing is installed automatically.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "Click the banner's `×` or run `/dismiss-update` to hide it in every \
+         session until Caudra exits. The dismissal is not saved, so the next \
+         start shows the banner again while the release is still newer.\n"
     )
     .unwrap();
     writeln!(
@@ -361,9 +370,11 @@ fn write_update_check_section(out: &mut String) {
     writeln!(
         out,
         "Set `ui.update_check = false` to disable startup checks. \
-         `CAUDRA_ENABLE_UPDATE_CHECK=0` disables them for one run, and \
-         `CAUDRA_ENABLE_UPDATE_CHECK=1` enables them even when the config says \
-         false. An empty value leaves the config in effect. A normal run \
+         `CAUDRA_ENABLE_UPDATE_CHECK=0` disables them for one run. \
+         `CAUDRA_ENABLE_UPDATE_CHECK=1` checks even when the config says false, \
+         and it asks GitHub instead of reading the cache, so a release published \
+         since the last check shows at once. Its answer refreshes the cache for \
+         later starts. An empty value leaves the config in effect. A normal run \
          still contacts your model provider, fetches the public \
          [models.dev](https://models.dev/) model catalog when the cached copy \
          is more than a day old, and sends web searches to Exa when the agent \
@@ -380,8 +391,9 @@ fn write_update_check_section(out: &mut String) {
          `\"auto\"` follows stable releases.\n\n\
          Run `caudra update --channel auto`, `caudra update --channel stable`, \
          or `caudra update --channel preview` to update manually. An explicit \
-         update bypasses the startup cache and opt-out. The splash notice \
-         includes the configured channel in its command.\n"
+         update bypasses the startup cache and opt-out. The banner's command \
+         names the channel the check used, with `auto` resolved to `stable` or \
+         `preview`.\n"
     )
     .unwrap();
 }

@@ -189,9 +189,9 @@ version = 1
 # Type: String.
 # clock_format = "system"
 
-# Check GitHub releases in the background at interactive startup and show an
-# update notice. Uses a shared 24-hour cache and never installs automatically.
-# Set false to disable.
+# Check GitHub releases in the background at interactive startup and show a
+# banner above the prompt when a newer version is available. Uses a shared
+# 24-hour cache and never installs automatically. Set false to disable.
 # Type: bool. Env: CAUDRA_ENABLE_UPDATE_CHECK.
 # update_check = true
 

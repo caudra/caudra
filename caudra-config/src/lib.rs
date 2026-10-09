@@ -2225,7 +2225,7 @@ pub struct UiConfig {
     #[config(
         default = true,
         env = "CAUDRA_ENABLE_UPDATE_CHECK",
-        desc = "Check GitHub releases in the background at interactive startup and show an update notice. Uses a shared 24-hour cache and never installs automatically. Set false to disable"
+        desc = "Check GitHub releases in the background at interactive startup and show a banner above the prompt when a newer version is available. Uses a shared 24-hour cache and never installs automatically. Set false to disable"
     )]
     pub update_check: bool,
 

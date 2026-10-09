@@ -210,6 +210,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         features: &[],
     },
     BuiltinCommand {
+        name: "/dismiss-update",
+        description: "Hide the update banner until Caudra restarts",
+        max_args: 0,
+        scope: ChatScope::Any,
+        features: &[],
+    },
+    BuiltinCommand {
         name: "/memory",
         description: "Inspect project memory: the view, its summary tree, and the notes",
         max_args: 0,

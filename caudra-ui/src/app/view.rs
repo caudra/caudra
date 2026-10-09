@@ -13,6 +13,7 @@ use crate::components::tools_modal::ToolsModalContext;
 use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
+use crate::update;
 use caudra_grab::grab_scope;
 use caudra_lua::Split;
 use caudra_providers::RequestOptions;
@@ -38,6 +39,7 @@ pub(crate) const AUTOSCROLL_ORIGIN: &str = "\u{2295}";
 
 struct ViewLayout {
     msg_area: Rect,
+    banner_area: Rect,
     bottom_area: Rect,
     status_area: Rect,
     queue_area: Rect,
@@ -66,6 +68,7 @@ impl App {
         self.queue_hits.clear();
         self.admission_hits.clear();
         self.chord_hint_hit = None;
+        self.update_close = None;
         if self.workbench.is_open() {
             self.render_workbench(frame);
             return;
@@ -75,6 +78,7 @@ impl App {
 
         self.render_background(frame);
         self.render_messages(frame, &layout, render_chat);
+        self.render_update_banner(frame, layout.banner_area);
         self.render_bottom_panel(frame, &layout);
         self.render_splits(frame, &layout);
         let above_footer = Rect {
@@ -262,10 +266,19 @@ impl App {
                 }
         };
 
+        // A short terminal keeps the transcript's minimum before the banner.
+        let banner_height = u16::from(
+            self.update_banner.get().is_some()
+                && inner.height.saturating_sub(bottom_height) > MIN_CHAT_ROWS,
+        );
         // The `below` split lives outside `inner` (drawn by render_splits), so
         // the bottom panel only ever splits the chat region.
-        let [msg_region, bottom_area] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_height)]).areas(inner);
+        let [msg_region, banner_area, bottom_area] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(banner_height),
+            Constraint::Length(bottom_height),
+        ])
+        .areas(inner);
         let msg_area = message_content_area(msg_region);
 
         let panel_reqs = if bottom_takeover {
@@ -309,6 +322,7 @@ impl App {
 
         ViewLayout {
             msg_area,
+            banner_area,
             bottom_area,
             status_area: main_content_area(status_area),
             queue_area,
@@ -338,6 +352,27 @@ impl App {
             self.selection_state.is_some(),
             render_chat == 0,
         );
+    }
+
+    /// Drawn before the bottom panel, so the composer's popups, which open
+    /// upwards over this row, stay on top of it.
+    fn render_update_banner(&mut self, frame: &mut Frame, area: Rect) {
+        let Some(available) = self.update_banner.get() else {
+            return;
+        };
+        if area.height == 0 {
+            return;
+        }
+        grab_scope!("update_banner", area);
+        let close_width = Span::raw(update::CLOSE).width() as u16;
+        let [text, close] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(close_width)]).areas(area);
+        frame.render_widget(update::banner_line(available, text.width), text);
+        frame.render_widget(
+            Span::styled(update::CLOSE, theme::current().status_dim),
+            close,
+        );
+        self.update_close = Some(close);
     }
 
     fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) {

@@ -1,5 +1,5 @@
 use crate::components::keybindings::key;
-use crate::repaint::{Cadence, Dirty};
+use crate::repaint::Cadence;
 use crate::theme::{self, lerp_u8};
 use crate::update;
 use ratatui::buffer::Buffer;
@@ -328,7 +328,6 @@ pub struct Splash {
     seed: u64,
     animate: bool,
     tip_idx: usize,
-    update_notice: Option<&'static str>,
 }
 
 impl Default for Splash {
@@ -347,20 +346,7 @@ impl Splash {
             seed,
             animate,
             tip_idx: (seed >> u32::BITS) as usize % TIPS.len(),
-            update_notice: None,
         }
-    }
-
-    /// The update check answers long after the splash is first painted, and
-    /// storing its answer wakes nothing. Reading it in [`Self::render`] would
-    /// put a version on screen that no poller ever saw, so a still splash
-    /// (`splash_animation = false`) would never show the notice at all.
-    pub fn poll_update(&mut self, latest: Option<&'static str>) -> Dirty {
-        if self.update_notice == latest {
-            return Dirty::NO;
-        }
-        self.update_notice = latest;
-        Dirty::YES
     }
 
     /// Routes keep being selected for as long as the splash is up. With the
@@ -405,7 +391,7 @@ impl Splash {
         render_centered_faded(area, buf, fade, 0.75, tag_y, TAGLINE);
         self.render_help(area, buf, fade, help_y, accent);
         self.render_tip(area, buf, fade, tip_y, accent);
-        render_version(area, buf, fade, area.y, self.update_notice);
+        render_version(area, buf, fade, area.y);
     }
 
     /// The wave field fills the area, and candidate routes bend with it as they
@@ -923,16 +909,13 @@ fn smoothstep(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-fn render_version(area: Rect, buf: &mut Buffer, fade: f32, y: u16, notice: Option<&str>) {
+fn render_version(area: Rect, buf: &mut Buffer, fade: f32, y: u16) {
     if y >= area.y + area.height {
         return;
     }
     let theme = theme::current();
     let bg = theme.background;
-    let text = match notice {
-        Some(notice) => format!("v{} {notice}", update::CURRENT),
-        None => format!("v{}", update::CURRENT),
-    };
+    let text = format!("v{}", update::CURRENT);
     let style = faded_style(
         extract_rgb(bg, BG_FALLBACK),
         extract_rgb(theme.foreground, FG_FALLBACK),
@@ -1008,7 +991,6 @@ fn ease_out_cubic(t: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::components::buffer_text;
-    use crate::repaint::expect::{OWED, QUIET};
     use ratatui::buffer::Cell;
     use std::time::Duration;
     use test_case::test_case;
@@ -1045,10 +1027,9 @@ mod tests {
         assert_eq!(done, (10, 20, 30));
     }
 
-    const NEW_VERSION: &str = "99.9.9";
-    const UPDATE_NOTICE: &str = "run caudra update --channel preview to get v99.9.9";
-    const UNPOLLED: &str = "an unpolled version must not appear on screen";
-    const POLLED: &str = "a polled version must appear on screen";
+    const VERSION_UNSHOWN: &str = "the start screen must name the installed version";
+    const UPDATE_DUPLICATED: &str = "the update banner, not the start screen, announces releases";
+    const UPDATE_WORD: &str = "update";
 
     const AREA: Rect = Rect {
         x: 0,
@@ -1075,29 +1056,17 @@ mod tests {
         buffer_text(&painted(splash, at_phase(0.0)))
     }
 
-    /// The check answers on its own, so the notice only reaches the screen
-    /// because a poll reported it. A still splash owes no other frame, so
-    /// reading the answer in `render` would hide it until the user typed.
     #[test]
-    fn an_update_notice_reaches_the_screen_only_after_a_poll() {
-        let mut splash = Splash::new(false);
-        assert_eq!(splash.poll_update(None), Dirty::NO, "{QUIET}");
-        assert!(!rendered(&splash).contains(NEW_VERSION), "{UNPOLLED}");
-
-        assert_eq!(
-            splash.poll_update(Some(UPDATE_NOTICE)),
-            Dirty::YES,
-            "{OWED}"
+    fn the_start_screen_names_the_installed_version_alone() {
+        let screen = rendered(&Splash::new(false));
+        assert!(
+            screen.contains(&format!("v{}", update::CURRENT)),
+            "{VERSION_UNSHOWN}"
         );
-        assert_eq!(
-            splash.poll_update(Some(UPDATE_NOTICE)),
-            Dirty::NO,
-            "{QUIET}"
+        assert!(
+            !screen.to_lowercase().contains(UPDATE_WORD),
+            "{UPDATE_DUPLICATED}"
         );
-
-        let screen = rendered(&splash);
-        assert!(screen.contains(UPDATE_NOTICE), "{POLLED}");
-        assert!(screen.contains(NEW_VERSION), "{POLLED}");
     }
 
     const DOCS_COMMAND: &str = "/docs";

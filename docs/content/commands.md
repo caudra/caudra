@@ -28,6 +28,7 @@ A command with an Experiment entry exists only while that switch is on under `[e
 | `/stash` | Park the current prompt draft for later |  |  |
 | `/stash-pop` | Restore the most recently stashed prompt |  |  |
 | `/stash-list` | Browse stashed prompts |  |  |
+| `/dismiss-update` | Hide the update banner until Caudra restarts |  |  |
 | `/memory` | Inspect project memory: the view, its summary tree, and the notes |  |  |
 | `/tasks` | Browse tasks and steer running subagents |  |  |
 | `/shells` | Browse shell commands and stop running ones |  |  |

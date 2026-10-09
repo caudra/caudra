@@ -175,7 +175,8 @@ use serde_json::Value;
 use smol::Task;
 
 use crate::storage_writer::StorageWriter;
-use ratatui::layout::Position;
+use crate::update::{Available, UpdateNotice};
+use ratatui::layout::{Position, Rect};
 
 pub(crate) use crate::agent::QueuedMessage;
 pub use crate::components::RestoreMode;
@@ -223,6 +224,7 @@ const YOLO_ON_MSG: &str = "YOLO mode enabled";
 const YOLO_OFF_MSG: &str = "YOLO mode disabled";
 const AUTO_ON_MSG: &str = "Auto permission mode enabled";
 const AUTO_OFF_MSG: &str = "Auto permission mode disabled";
+const NO_UPDATE_MSG: &str = "No update notice to dismiss";
 const AUTO_VIEW_MSG: &str = "View: auto (the newest card stays open)";
 const COMPACT_VIEW_MSG: &str = "View: compact";
 const EXPANDED_VIEW_MSG: &str = "View: expanded";
@@ -509,6 +511,12 @@ pub struct App {
     /// sibling sessions. Polled while the picker is open.
     pub(crate) live_sessions: Arc<ArcSwap<Vec<SessionRow>>>,
     live_session_watch: Watch<Vec<SessionRow>>,
+    /// Set by the event loop after construction, like `live_sessions`: one
+    /// notice for every session, so dismissing it anywhere hides it everywhere.
+    pub(crate) update_notice: Arc<UpdateNotice>,
+    update_banner: Watch<Available>,
+    /// The banner's close control as last drawn, `None` while it is not.
+    pub(super) update_close: Option<Rect>,
     /// The picker's other half comes from a disk query, which no publisher
     /// covers; see [`StorageWriter::generation`].
     stored_session_generation: u64,
@@ -788,6 +796,9 @@ impl App {
             worktree_picker: WorktreePicker::new(),
             live_sessions: Arc::default(),
             live_session_watch: Watch::default(),
+            update_notice: Arc::default(),
+            update_banner: Watch::default(),
+            update_close: None,
             stored_session_generation: 0,
             question_subagent: None,
             stash_picker: StashPicker::new(),
@@ -5294,6 +5305,10 @@ impl App {
             "/stash" => self.run_builtin(BuiltinAction::StashPush),
             "/stash-pop" => self.run_builtin(BuiltinAction::StashPop),
             "/stash-list" => self.run_builtin(BuiltinAction::StashList),
+            "/dismiss-update" => {
+                self.dismiss_update();
+                vec![]
+            }
             "/memory" => self.open_memory_inspector(),
             "/tasks" => self.execute_task_control(&cmd.args),
             "/shells" => self.shells_browse(),
@@ -5997,6 +6012,18 @@ impl App {
         self.overlays_mut().iter_mut().for_each(|o| o.close());
     }
 
+    /// Hides the update banner in every session until Caudra restarts. Nothing
+    /// is saved, so the next start announces the same release again.
+    pub(super) fn dismiss_update(&mut self) {
+        if self.update_banner.get().is_none() {
+            self.flash(NO_UPDATE_MSG.into());
+            return;
+        }
+        self.update_notice.dismiss();
+        self.update_banner = Watch::default();
+        self.update_close = None;
+    }
+
     /// Every poller that feeds the screen, in one place and never in `view`;
     /// see [`crate::repaint`] for why.
     pub fn tick(&mut self) -> Dirty {
@@ -6023,6 +6050,7 @@ impl App {
             | self.poll_tools_snapshot()
             | self.logs_modal.poll()
             | self.hints.poll(self.hint_reader.load_full())
+            | self.update_banner.poll(self.update_notice.latest())
             | self.tick_file_picker()
             | self.mention_popup.tick()
             | self.commit_popup.tick()

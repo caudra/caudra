@@ -106,6 +106,7 @@ use caudra_storage::state::{self as stored_state, SCOPE_GLOBAL, StateKey};
 use caudra_storage::thinking::StoredThinking;
 use caudra_storage::tool_outputs::{ToolOutputError, ToolOutputStore};
 use caudra_storage::usage_ledger::{LedgerPurpose, TurnUsage, UsageLedger};
+use caudra_storage::version::UpdateChannel;
 use caudra_storage::view::ViewMode;
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_workbench::keys as workbench_keys;
@@ -8038,6 +8039,160 @@ fn rendered_wide(app: &mut App, width: u16) -> String {
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal.draw(|frame| app.view(frame)).unwrap();
     buffer_text(terminal.backend().buffer())
+}
+
+const UPDATE_VERSION: &str = "99.9.9";
+const UPDATE_HEADLINE: &str = "Update available: v99.9.9";
+const UPDATE_COMMAND: &str = "caudra update --channel preview";
+const DISMISS_UPDATE_COMMAND: &str = "/dismiss-update";
+const NARROW_SCREEN: u16 = 40;
+const BANNER_MISSING: &str = "an available release must be on screen";
+const BANNER_UNPOLLED: &str = "a release no poller has seen must not be on screen";
+const BANNER_RETURNED: &str = "a dismissed release must stay hidden for the rest of the process";
+const BANNER_TEXT_INERT: &str = "the banner's text is no control";
+const BANNER_OVER_INPUT: &str = "the banner must sit above the composer, never on it";
+const BANNER_UNDER_MODAL: &str = "a press meant for a modal must not reach the banner";
+
+fn preview_release() -> Available {
+    Available {
+        version: UPDATE_VERSION.into(),
+        channel: UpdateChannel::Preview,
+    }
+}
+
+/// Shares one notice into `app`, the way the event loop hands the process's
+/// notice to every session it spawns.
+fn share_notice(app: &mut App) -> Arc<UpdateNotice> {
+    let notice = Arc::new(UpdateNotice::default());
+    app.update_notice = Arc::clone(&notice);
+    notice
+}
+
+fn announced(setup: fn() -> App) -> (App, Arc<UpdateNotice>) {
+    let mut app = setup();
+    let notice = share_notice(&mut app);
+    notice.publish(preview_release());
+    let _ = app.tick();
+    (app, notice)
+}
+
+fn mid_reply_app() -> App {
+    let mut app = streaming_app();
+    app.update(agent_msg(AgentEvent::TextDelta { text: "hi".into() }));
+    app
+}
+
+/// The check answers long after the first frame and wakes nothing, so a still
+/// start screen only shows the release because a tick went and looked.
+#[test]
+fn a_late_release_reaches_an_idle_start_screen() {
+    let mut app = test_app();
+    let notice = share_notice(&mut app);
+    assert_eq!(app.tick(), Dirty::NO, "{QUIET}");
+
+    notice.publish(preview_release());
+    assert!(
+        !rendered(&mut app).contains(UPDATE_HEADLINE),
+        "{BANNER_UNPOLLED}"
+    );
+    assert_eq!(app.tick(), Dirty::YES, "{OWED}");
+    assert_eq!(app.tick(), Dirty::NO, "{QUIET}");
+
+    let screen = rendered(&mut app);
+    assert!(screen.contains(UPDATE_HEADLINE), "{BANNER_MISSING}");
+    assert!(screen.contains(UPDATE_COMMAND), "{BANNER_MISSING}");
+}
+
+#[test_case(test_app; "new")]
+#[test_case(app_without_splash; "settled")]
+#[test_case(mid_reply_app; "streaming")]
+fn every_conversation_shows_the_banner(setup: fn() -> App) {
+    let (mut app, _notice) = announced(setup);
+    assert!(
+        rendered(&mut app).contains(UPDATE_HEADLINE),
+        "{BANNER_MISSING}"
+    );
+}
+
+#[test]
+fn dismissing_in_one_session_hides_the_banner_in_every_session() {
+    let (mut first, notice) = announced(app_without_splash);
+    let mut second = app_without_splash();
+    second.update_notice = Arc::clone(&notice);
+    let _ = second.tick();
+    assert!(
+        rendered(&mut second).contains(UPDATE_HEADLINE),
+        "{BANNER_MISSING}"
+    );
+
+    first.execute_command(cmd(DISMISS_UPDATE_COMMAND), 0);
+    assert_eq!(first.status_bar.flash_text(), None);
+    assert_eq!(second.tick(), Dirty::YES, "{OWED}");
+    for app in [&mut first, &mut second] {
+        let _ = app.tick();
+        assert!(
+            !rendered(app).contains(UPDATE_HEADLINE),
+            "{BANNER_RETURNED}"
+        );
+    }
+}
+
+#[test]
+fn dismissing_without_a_banner_says_so() {
+    let mut app = app_without_splash();
+    app.execute_command(cmd(DISMISS_UPDATE_COMMAND), 0);
+    assert_eq!(app.status_bar.flash_text(), Some(NO_UPDATE_MSG));
+}
+
+#[test]
+fn only_the_close_control_dismisses_the_banner() {
+    let (mut app, notice) = announced(app_without_splash);
+    let _ = rendered(&mut app);
+    let close = app.update_close.expect(BANNER_MISSING);
+    let input = rendered_zone(&mut app, SelectionZone::Input);
+    assert!(close.bottom() <= input.y, "{BANNER_OVER_INPUT}");
+
+    let press = MouseEventKind::Down(MouseButton::Left);
+    app.update(mouse_event(press, close.x.saturating_sub(1), close.y));
+    assert!(notice.latest().is_some(), "{BANNER_TEXT_INERT}");
+
+    app.update(mouse_event(press, close.x, close.y));
+    assert_eq!(notice.latest(), None, "{BANNER_RETURNED}");
+    let _ = app.tick();
+    assert!(
+        !rendered(&mut app).contains(UPDATE_HEADLINE),
+        "{BANNER_RETURNED}"
+    );
+}
+
+#[test]
+fn a_modal_keeps_the_press_and_the_banner_survives_it() {
+    let (mut app, notice) = announced(app_without_splash);
+    let _ = rendered(&mut app);
+    let close = app.update_close.expect(BANNER_MISSING);
+    app.execute_command(cmd("/help"), 0);
+    let _ = rendered(&mut app);
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        close.x,
+        close.y,
+    ));
+    assert!(notice.latest().is_some(), "{BANNER_UNDER_MODAL}");
+    app.help_modal.close();
+    assert!(
+        rendered(&mut app).contains(UPDATE_HEADLINE),
+        "{BANNER_MISSING}"
+    );
+}
+
+#[test]
+fn a_narrow_screen_drops_the_command_and_keeps_the_version() {
+    let (mut app, _notice) = announced(app_without_splash);
+    let screen = rendered_wide(&mut app, NARROW_SCREEN);
+    assert!(screen.contains(UPDATE_HEADLINE), "{BANNER_MISSING}");
+    assert!(!screen.contains(UPDATE_COMMAND));
+    assert!(app.update_close.is_some(), "{BANNER_MISSING}");
 }
 
 fn message_action_position(app: &mut App) -> (u16, u16) {

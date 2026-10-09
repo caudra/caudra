@@ -42,7 +42,6 @@ use crate::render_worker::RenderWorker;
 use crate::selection::Selection;
 use crate::splash::{ColorTransition, Splash};
 use crate::theme;
-use crate::update;
 use caudra_agent::types::WorkflowRunCard;
 use caudra_config::{ClockFormat, ToolOutputLines, UiConfig};
 use caudra_grab::grab_leaf;
@@ -3871,11 +3870,7 @@ impl MessagesPanel {
     /// run inside [`Self::view`], which is why a running tool had to claim it
     /// was animating: it was the only way to keep them fed.
     pub fn tick(&mut self) -> Dirty {
-        let mut dirty = self.drain_highlights() | self.poll_live_bufs();
-        if self.show_idle_splash() {
-            dirty |= self.idle_splash.poll_update(update::latest_notice());
-        }
-        dirty
+        self.drain_highlights() | self.poll_live_bufs()
     }
 
     pub fn cadence(&self) -> Cadence {
