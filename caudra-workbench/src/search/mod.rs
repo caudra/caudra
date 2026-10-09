@@ -44,6 +44,7 @@ pub struct Search {
     rows: Vec<Row>,
     selected: usize,
     scroll: usize,
+    follow_selection: bool,
     run: Option<Run>,
     truncated: bool,
     error: Option<String>,
@@ -68,6 +69,7 @@ impl Default for Search {
             rows: Vec::new(),
             selected: 0,
             scroll: 0,
+            follow_selection: false,
             run: None,
             truncated: false,
             error: None,
@@ -285,6 +287,7 @@ impl Search {
     }
 
     pub fn move_selection(&mut self, delta: isize) {
+        self.follow_selection = true;
         let Some(last) = self.rows.len().checked_sub(1) else {
             return;
         };
@@ -292,37 +295,47 @@ impl Search {
     }
 
     pub fn select_first(&mut self) {
+        self.follow_selection = true;
         self.selected = 0;
     }
 
     pub fn select_last(&mut self) {
+        self.follow_selection = true;
         self.selected = self.rows.len().saturating_sub(1);
     }
 
     pub fn select_index(&mut self, index: usize) {
         if index < self.rows.len() {
             self.selected = index;
+            self.follow_selection = true;
         }
     }
 
     pub fn clamp_scroll(&mut self, viewport: usize) {
+        let max = self.rows.len().saturating_sub(viewport);
+        self.scroll = self.scroll.min(max);
         if viewport == 0 {
             return;
         }
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        } else if self.selected >= self.scroll + viewport {
-            self.scroll = self.selected + 1 - viewport;
+        if self.follow_selection {
+            if self.selected < self.scroll {
+                self.scroll = self.selected;
+            } else if self.selected.saturating_sub(self.scroll) >= viewport {
+                self.scroll = self.selected + 1 - viewport;
+            }
+            self.scroll = self.scroll.min(max);
+            self.follow_selection = false;
         }
-        self.scroll = self.scroll.min(self.rows.len().saturating_sub(viewport));
     }
 
     pub fn scroll_by(&mut self, delta: isize, viewport: usize) {
+        self.follow_selection = false;
         let max = self.rows.len().saturating_sub(viewport);
         self.scroll = self.scroll.saturating_add_signed(delta).min(max);
     }
 
     pub fn set_scroll(&mut self, top: usize, viewport: usize) {
+        self.follow_selection = false;
         self.scroll = top.min(self.rows.len().saturating_sub(viewport));
     }
 
@@ -360,6 +373,7 @@ impl Search {
         self.rows.clear();
         self.selected = 0;
         self.scroll = 0;
+        self.follow_selection = false;
         self.truncated = false;
         self.error = None;
     }
@@ -379,12 +393,19 @@ impl Search {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use test_case::test_case;
 
     use super::{Field, Hit, Row, Search};
 
     const GROUPING_WRONG: &str = "hits must be grouped under one heading per file";
     const SELECTION_WRONG: &str = "the cursor is not on the row the test put it on";
     const STALE_WRONG: &str = "the pane disagrees about whether its results are current";
+    const SCROLL_HITS: u64 = 20;
+    const SCROLL_VIEWPORT: usize = 5;
+    const MANUAL_SCROLL: usize = 8;
+    const SCROLL_PATH: &str = "/scroll.rs";
+    const SCROLL_WRONG: &str = "manual scrolling must persist until explicit selection navigation";
+    const FOLLOW_WRONG: &str = "navigation must reveal selection once a viewport is available";
 
     fn type_query(search: &mut Search, text: &str) {
         search.input_mut(Field::Query).insert_text(text);
@@ -406,6 +427,110 @@ mod tests {
             search.push(hit);
         }
         search
+    }
+
+    fn scrolling_pane() -> Search {
+        pane(
+            (1..=SCROLL_HITS)
+                .map(|line| hit(SCROLL_PATH, line))
+                .collect(),
+        )
+    }
+
+    #[test_case(false, SCROLL_VIEWPORT; "wheel")]
+    #[test_case(true, SCROLL_VIEWPORT; "bar")]
+    #[test_case(false, 0; "wheel_without_viewport")]
+    #[test_case(true, 0; "bar_without_viewport")]
+    fn manual_scroll_survives_redraws(bar: bool, viewport: usize) {
+        let mut search = scrolling_pane();
+        search.select_first();
+        if bar {
+            search.set_scroll(MANUAL_SCROLL, viewport);
+        } else {
+            search.scroll_by(MANUAL_SCROLL as isize, viewport);
+        }
+        search.clamp_scroll(viewport);
+        search.clamp_scroll(SCROLL_VIEWPORT);
+        search.clamp_scroll(SCROLL_VIEWPORT);
+        assert_eq!(search.scroll(), MANUAL_SCROLL, "{SCROLL_WRONG}");
+        assert_eq!(search.selected_index(), 0, "{SELECTION_WRONG}");
+    }
+
+    #[test_case(Search::select_first, false; "home")]
+    #[test_case(Search::select_last, true; "end")]
+    #[test_case(|search: &mut Search| search.move_selection(-1), false; "up_at_start")]
+    #[test_case(|search: &mut Search| search.move_selection(1), true; "down_at_end")]
+    #[test_case(|search: &mut Search| search.select_index(search.selected_index()), false; "same_index")]
+    fn boundary_navigation_follows_once(action: fn(&mut Search), last: bool) {
+        let mut search = scrolling_pane();
+        if last {
+            search.select_last();
+        }
+        search.set_scroll(MANUAL_SCROLL, SCROLL_VIEWPORT);
+        action(&mut search);
+        search.clamp_scroll(SCROLL_VIEWPORT);
+        let expected = if last {
+            search.rows().len() - SCROLL_VIEWPORT
+        } else {
+            0
+        };
+        assert_eq!(search.scroll(), expected, "{FOLLOW_WRONG}");
+        search.clamp_scroll(search.rows().len());
+        search.clamp_scroll(SCROLL_VIEWPORT);
+        assert_eq!(search.scroll(), 0, "{SCROLL_WRONG}");
+    }
+
+    #[test_case(1; "single_row")]
+    #[test_case(SCROLL_VIEWPORT; "several_rows")]
+    fn zero_viewport_retains_navigation(viewport: usize) {
+        let mut search = scrolling_pane();
+        search.select_last();
+        search.clamp_scroll(0);
+        search.clamp_scroll(0);
+        assert_eq!(search.scroll(), 0, "{FOLLOW_WRONG}");
+        search.clamp_scroll(viewport);
+        assert_eq!(
+            search.scroll(),
+            search.rows().len() - viewport,
+            "{FOLLOW_WRONG}"
+        );
+    }
+
+    #[test_case(SCROLL_VIEWPORT, MANUAL_SCROLL; "same_viewport")]
+    #[test_case(SCROLL_HITS as usize, 1; "larger_viewport")]
+    #[test_case(usize::MAX, 0; "oversized_viewport")]
+    fn resizing_only_bounds_manual_scroll(viewport: usize, expected: usize) {
+        let mut search = scrolling_pane();
+        search.set_scroll(MANUAL_SCROLL, SCROLL_VIEWPORT);
+        search.clamp_scroll(viewport);
+        search.clamp_scroll(SCROLL_VIEWPORT);
+        assert_eq!(search.scroll(), expected, "{SCROLL_WRONG}");
+    }
+
+    #[test_case(SCROLL_PATH; "same_file")]
+    #[test_case("/another.rs"; "new_file")]
+    fn result_growth_preserves_manual_scroll(path: &str) {
+        let mut search = scrolling_pane();
+        search.set_scroll(MANUAL_SCROLL, SCROLL_VIEWPORT);
+        for line in 1..=SCROLL_HITS {
+            search.push(hit(path, line));
+            search.clamp_scroll(SCROLL_VIEWPORT);
+            assert_eq!(search.scroll(), MANUAL_SCROLL, "{SCROLL_WRONG}");
+        }
+        assert_eq!(search.selected_index(), 0, "{SELECTION_WRONG}");
+    }
+
+    #[test_case(0; "hidden")]
+    #[test_case(SCROLL_VIEWPORT; "visible")]
+    fn clearing_results_resets_scroll_and_pending_follow(viewport: usize) {
+        let mut search = scrolling_pane();
+        search.set_scroll(MANUAL_SCROLL, SCROLL_VIEWPORT);
+        search.select_last();
+        search.clear();
+        search.clamp_scroll(viewport);
+        assert_eq!(search.scroll(), 0, "{SCROLL_WRONG}");
+        assert_eq!(search.selected_index(), 0, "{SELECTION_WRONG}");
+        assert!(!search.follow_selection, "{FOLLOW_WRONG}");
     }
 
     #[test]

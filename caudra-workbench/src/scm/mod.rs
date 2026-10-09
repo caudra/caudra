@@ -137,6 +137,7 @@ struct SectionState {
     /// last expanded section flexes to fill whatever is left.
     height: u16,
     scroll: usize,
+    follow_pending: bool,
     rows: Vec<Row>,
     dirs: Vec<Dir>,
     /// Paths or commits behind the rows, which is what the header counts. Rows
@@ -150,6 +151,7 @@ impl Default for SectionState {
             collapsed: false,
             height: DEFAULT_SECTION_ROWS,
             scroll: 0,
+            follow_pending: false,
             rows: Vec::new(),
             dirs: Vec::new(),
             count: 0,
@@ -197,6 +199,7 @@ impl Scm {
         self.sections = carried.1;
         for state in &mut self.sections {
             state.scroll = 0;
+            state.follow_pending = false;
             state.rows.clear();
             state.dirs.clear();
         }
@@ -206,6 +209,7 @@ impl Scm {
             // Opening the pane lands on something actionable rather than on a
             // title, so the first key does what it looks like it will.
             self.select_first_row();
+            self.follow_cursor();
         }
     }
 
@@ -216,6 +220,7 @@ impl Scm {
         self.sections = carried.1;
         for state in &mut self.sections {
             state.scroll = 0;
+            state.follow_pending = false;
             state.rows.clear();
             state.dirs.clear();
         }
@@ -480,6 +485,7 @@ impl Scm {
         self.flat = !self.flat;
         let previous = self.anchor();
         self.rebuild(previous);
+        self.follow_cursor();
     }
 
     pub fn set_collapsed(&mut self, section: Section, collapsed: bool) {
@@ -492,6 +498,7 @@ impl Scm {
         if !collapsed && section == Section::Graph && self.log.is_empty() {
             self.refresh();
         }
+        self.follow_cursor();
     }
 
     pub fn toggle_collapsed(&mut self, section: Section) {
@@ -500,6 +507,7 @@ impl Scm {
 
     pub fn set_height(&mut self, section: Section, height: u16) {
         self.sections[section.index()].height = height.max(MIN_SECTION_ROWS);
+        self.follow_cursor();
     }
 
     /// Moves by `delta` cursor stops, counting a section's header as one and
@@ -514,21 +522,33 @@ impl Scm {
             .position(|stop| *stop == self.cursor)
             .unwrap_or_default();
         self.cursor = stops[current.saturating_add_signed(delta).min(last)];
+        self.follow_cursor();
     }
 
     pub fn select_first(&mut self) {
         self.cursor = self.stops().first().copied().unwrap_or_default();
+        self.follow_cursor();
     }
 
     pub fn select_last(&mut self) {
         self.cursor = self.stops().last().copied().unwrap_or_default();
+        self.follow_cursor();
     }
 
     /// Puts the cursor on the first row of the first section that has one,
     /// leaving it where it was when every section is empty.
     fn select_first_row(&mut self) {
         if let Some(stop) = self.stops().into_iter().find(|stop| stop.row.is_some()) {
+            if self.cursor.section != stop.section {
+                self.sections[self.cursor.section.index()].follow_pending = false;
+            }
             self.cursor = stop;
+        }
+    }
+
+    fn follow_cursor(&mut self) {
+        for section in Section::ALL {
+            self.sections[section.index()].follow_pending = section == self.cursor.section;
         }
     }
 
@@ -546,6 +566,7 @@ impl Scm {
             .and_then(|row| self.identity(self.cursor.section, row))
             .is_some_and(|identity| identity == relative);
         if on_it {
+            self.follow_cursor();
             return;
         }
         let Some(section) = self.section_of(relative) else {
@@ -556,6 +577,9 @@ impl Scm {
             self.rebuild(previous);
         }
         if let Some(row) = self.row_of(section, relative) {
+            if self.is_collapsed(section) {
+                self.set_collapsed(section, false);
+            }
             self.select(section, Some(row));
         }
     }
@@ -594,6 +618,7 @@ impl Scm {
         let cursor = Cursor { section, row };
         if self.stops().contains(&cursor) {
             self.cursor = cursor;
+            self.follow_cursor();
         }
     }
 
@@ -601,28 +626,29 @@ impl Scm {
     /// show the cursor when the cursor is in this section.
     pub fn clamp_scroll(&mut self, section: Section, viewport: usize) {
         let state = &mut self.sections[section.index()];
-        if viewport == 0 {
-            state.scroll = 0;
-            return;
-        }
-        if let Some(row) = self.cursor.row.filter(|_| self.cursor.section == section) {
-            if row < state.scroll {
-                state.scroll = row;
-            } else if row >= state.scroll + viewport {
-                state.scroll = row + 1 - viewport;
+        if viewport > 0 && !state.collapsed && state.follow_pending {
+            if let Some(row) = self.cursor.row.filter(|_| self.cursor.section == section) {
+                if row < state.scroll {
+                    state.scroll = row;
+                } else if row >= state.scroll.saturating_add(viewport) {
+                    state.scroll = row - (viewport - 1);
+                }
             }
+            state.follow_pending = false;
         }
         state.scroll = state.scroll.min(state.rows.len().saturating_sub(viewport));
     }
 
     pub fn scroll_by(&mut self, section: Section, delta: isize, viewport: usize) {
         let state = &mut self.sections[section.index()];
+        state.follow_pending = false;
         let max = state.rows.len().saturating_sub(viewport);
         state.scroll = state.scroll.saturating_add_signed(delta).min(max);
     }
 
     pub fn set_scroll(&mut self, section: Section, top: usize, viewport: usize) {
         let state = &mut self.sections[section.index()];
+        state.follow_pending = false;
         state.scroll = top.min(state.rows.len().saturating_sub(viewport));
     }
 
@@ -630,6 +656,7 @@ impl Scm {
     /// what `Left` means in a tree, and it is the only way back to a header
     /// without walking the whole section.
     pub fn fold(&mut self) {
+        self.follow_cursor();
         let section = self.cursor.section;
         let Some(row) = self.cursor.row else {
             self.set_collapsed(section, true);
@@ -652,6 +679,7 @@ impl Scm {
     /// Unfolds what the cursor is on. Reports whether it had anything to open,
     /// so the caller can fall through to opening a file instead.
     pub fn unfold(&mut self) -> bool {
+        self.follow_cursor();
         let section = self.cursor.section;
         let Some(row) = self.cursor.row else {
             let collapsed = self.is_collapsed(section);
@@ -675,6 +703,7 @@ impl Scm {
     /// Folds or unfolds whatever the cursor is on. Reports whether it was
     /// something foldable, so `Enter` can go on to open a file.
     pub fn toggle_fold(&mut self) -> bool {
+        self.follow_cursor();
         let section = self.cursor.section;
         let Some(row) = self.cursor.row else {
             self.toggle_collapsed(section);
@@ -904,6 +933,7 @@ impl Scm {
             state.height = (*height).max(MIN_SECTION_ROWS);
             state.collapsed = *collapsed;
         }
+        self.follow_cursor();
     }
 
     /// Every place the cursor can rest, in the order the pane draws them.
@@ -1104,6 +1134,9 @@ impl Scm {
         let Some(id) = self.log.get(commit).map(|entry| entry.id.clone()) else {
             return false;
         };
+        if self.cursor.section == Section::Graph {
+            self.follow_cursor();
+        }
         if fold {
             let was_open = self.opened.remove(&id).is_some();
             // The folders under it are gone with it, and leaving their keys
@@ -1159,10 +1192,12 @@ impl Scm {
         }) else {
             return false;
         };
+        self.set_collapsed(Section::Graph, false);
         self.cursor = Cursor {
             section: Section::Graph,
             row: Some(row),
         };
+        self.follow_cursor();
         true
     }
 
@@ -1314,6 +1349,14 @@ mod tests {
     const NO_MESSAGE: &str = "the commit does not say what its message says";
     const AUTHOR_EMAIL: &str = "author@example.test";
     const COMMITTED: i64 = 1_700_000_000;
+    const SCROLL_ROWS: usize = 10;
+    const VIEWPORT: usize = 3;
+    const MANUAL_TOP: usize = 4;
+    const CLAMP_PASSES: usize = 2;
+    const WRONG_SCROLL: &str =
+        "the section must retain manual scroll unless explicitly followed or bounded";
+    const WRONG_FOLLOW: &str =
+        "cursor follow must remain pending only until a visible viewport consumes it";
 
     fn scm_revision(value: &str) -> ScmRevision {
         ScmRevision::new(value).expect("valid revision")
@@ -1819,6 +1862,346 @@ mod tests {
         scm.clamp_scroll(Section::Unstaged, 4);
 
         assert_eq!(scm.scroll(Section::Unstaged), 0, "{WRONG_STOP}");
+    }
+
+    fn scrollable() -> Scm {
+        let mut scm = pane(
+            [false, true]
+                .into_iter()
+                .flat_map(|staged| {
+                    (0..SCROLL_ROWS)
+                        .map(move |n| change(&format!("f{n}.rs"), staged, GitMark::Modified))
+                })
+                .collect(),
+        );
+        scm.log = (0..SCROLL_ROWS).map(|n| commit(&format!("f{n}"))).collect();
+        scm.rebuild(None);
+        scm
+    }
+
+    #[test_case(Section::Staged; "staged")]
+    #[test_case(Section::Unstaged; "unstaged")]
+    #[test_case(Section::Graph; "graph")]
+    fn manual_scroll_cancels_follow_and_survives_repeated_clamps(section: Section) {
+        let mut scm = scrollable();
+        scm.select(section, Some(0));
+        scm.scroll_by(section, MANUAL_TOP as isize, VIEWPORT);
+        for _ in 0..CLAMP_PASSES {
+            scm.clamp_scroll(section, VIEWPORT);
+            assert_eq!(scm.scroll(section), MANUAL_TOP, "{WRONG_SCROLL}");
+        }
+        scm.select(section, Some(SCROLL_ROWS - 1));
+        scm.set_scroll(section, 0, VIEWPORT);
+        for _ in 0..CLAMP_PASSES {
+            scm.clamp_scroll(section, VIEWPORT);
+            assert_eq!(scm.scroll(section), 0, "{WRONG_SCROLL}");
+        }
+        assert!(
+            !scm.sections[section.index()].follow_pending,
+            "{WRONG_FOLLOW}"
+        );
+    }
+
+    #[test_case(Section::Staged, Some(0), 1, Some(1), 1; "upward_follow")]
+    #[test_case(Section::Graph, Some(8), 1, Some(9), 7; "downward_follow")]
+    #[test_case(Section::Graph, Some(9), 1, Some(9), 7; "last_row_boundary")]
+    #[test_case(Section::Staged, None, -1, None, MANUAL_TOP; "first_header_boundary")]
+    fn explicit_movement_follows_even_at_boundaries(
+        section: Section,
+        row: Option<usize>,
+        delta: isize,
+        expected_row: Option<usize>,
+        expected_scroll: usize,
+    ) {
+        let mut scm = scrollable();
+        scm.select(section, row);
+        scm.set_scroll(section, MANUAL_TOP, VIEWPORT);
+        scm.move_cursor(delta);
+        scm.clamp_scroll(section, VIEWPORT);
+        assert_eq!(
+            scm.cursor(),
+            Cursor {
+                section,
+                row: expected_row
+            },
+            "{WRONG_STOP}"
+        );
+        assert_eq!(scm.scroll(section), expected_scroll, "{WRONG_SCROLL}");
+        assert!(
+            !scm.sections[section.index()].follow_pending,
+            "{WRONG_FOLLOW}"
+        );
+    }
+
+    #[test_case(Scm::select_first, Section::Staged, None, MANUAL_TOP; "first_header")]
+    #[test_case(Scm::select_last, Section::Graph, Some(SCROLL_ROWS - 1), SCROLL_ROWS - VIEWPORT; "last_row")]
+    fn endpoint_selection_requests_follow_even_when_already_selected(
+        navigate: fn(&mut Scm),
+        section: Section,
+        row: Option<usize>,
+        expected_scroll: usize,
+    ) {
+        let mut scm = scrollable();
+        for _ in 0..CLAMP_PASSES {
+            scm.set_scroll(section, MANUAL_TOP, VIEWPORT);
+            navigate(&mut scm);
+            assert_eq!(scm.cursor(), Cursor { section, row }, "{WRONG_STOP}");
+            assert!(
+                scm.sections[section.index()].follow_pending,
+                "{WRONG_FOLLOW}"
+            );
+            scm.clamp_scroll(section, VIEWPORT);
+            assert_eq!(scm.scroll(section), expected_scroll, "{WRONG_SCROLL}");
+        }
+    }
+
+    #[test_case(Section::Staged, false; "already_selected_staged")]
+    #[test_case(Section::Unstaged, false; "already_selected_unstaged")]
+    #[test_case(Section::Graph, false; "already_selected_commit")]
+    #[test_case(Section::Unstaged, true; "collapsed_changes")]
+    #[test_case(Section::Graph, true; "collapsed_graph")]
+    fn explicit_reveal_follows_and_opens_the_target(section: Section, collapsed: bool) {
+        let mut scm = scrollable();
+        scm.select(section, Some(0));
+        scm.set_scroll(section, MANUAL_TOP, VIEWPORT);
+        if collapsed {
+            scm.set_collapsed(section, true);
+        }
+        if section == Section::Graph {
+            assert!(scm.reveal_commit("f0"), "{NOT_REVEALED}");
+        } else {
+            scm.reveal("f0.rs");
+        }
+        scm.clamp_scroll(section, VIEWPORT);
+        assert_eq!(
+            scm.cursor(),
+            Cursor {
+                section,
+                row: Some(0)
+            },
+            "{NOT_REVEALED}"
+        );
+        assert!(!scm.is_collapsed(section), "{NOT_REVEALED}");
+        assert_eq!(scm.scroll(section), 0, "{WRONG_SCROLL}");
+    }
+
+    #[test_case(Section::Staged; "staged")]
+    #[test_case(Section::Unstaged; "unstaged")]
+    #[test_case(Section::Graph; "graph")]
+    fn zero_viewport_defers_follow_without_resetting_scroll(section: Section) {
+        let mut scm = scrollable();
+        scm.set_scroll(section, MANUAL_TOP, VIEWPORT);
+        scm.select(section, Some(SCROLL_ROWS - 1));
+        scm.clamp_scroll(section, 0);
+        assert_eq!(scm.scroll(section), MANUAL_TOP, "{WRONG_SCROLL}");
+        assert!(
+            scm.sections[section.index()].follow_pending,
+            "{WRONG_FOLLOW}"
+        );
+        scm.clamp_scroll(section, VIEWPORT);
+        assert_eq!(
+            scm.scroll(section),
+            SCROLL_ROWS - VIEWPORT,
+            "{WRONG_SCROLL}"
+        );
+        assert!(
+            !scm.sections[section.index()].follow_pending,
+            "{WRONG_FOLLOW}"
+        );
+        scm.clamp_scroll(section, 1);
+        assert_eq!(
+            scm.scroll(section),
+            SCROLL_ROWS - VIEWPORT,
+            "{WRONG_SCROLL}"
+        );
+    }
+
+    #[test_case(0; "hidden")]
+    #[test_case(VIEWPORT; "visible")]
+    fn collapsed_sections_keep_pending_follow_until_expanded(viewport: usize) {
+        let mut scm = scrollable();
+        let section = Section::Unstaged;
+        scm.select(section, Some(0));
+        scm.set_scroll(section, MANUAL_TOP, VIEWPORT);
+        scm.set_collapsed(section, true);
+        scm.clamp_scroll(section, viewport);
+        assert_eq!(scm.scroll(section), MANUAL_TOP, "{WRONG_SCROLL}");
+        assert!(
+            scm.sections[section.index()].follow_pending,
+            "{WRONG_FOLLOW}"
+        );
+        scm.unfold();
+        scm.clamp_scroll(section, VIEWPORT);
+        assert_eq!(scm.scroll(section), MANUAL_TOP, "{WRONG_SCROLL}");
+        assert!(
+            !scm.sections[section.index()].follow_pending,
+            "{WRONG_FOLLOW}"
+        );
+    }
+
+    #[test]
+    fn section_switches_discard_old_follow_without_touching_other_scroll_positions() {
+        let mut scm = scrollable();
+        for section in Section::ALL {
+            scm.set_scroll(section, MANUAL_TOP + section.index(), VIEWPORT);
+        }
+        scm.select(Section::Staged, Some(0));
+        scm.select(Section::Graph, Some(SCROLL_ROWS - 1));
+        scm.scroll_by(Section::Unstaged, 1, VIEWPORT);
+        for section in Section::ALL {
+            scm.clamp_scroll(section, VIEWPORT);
+        }
+        assert_eq!(scm.scroll(Section::Staged), MANUAL_TOP, "{WRONG_SCROLL}");
+        assert_eq!(
+            scm.scroll(Section::Unstaged),
+            MANUAL_TOP + 2,
+            "{WRONG_SCROLL}"
+        );
+        assert_eq!(
+            scm.scroll(Section::Graph),
+            SCROLL_ROWS - VIEWPORT,
+            "{WRONG_SCROLL}"
+        );
+        assert!(
+            scm.sections.iter().all(|state| !state.follow_pending),
+            "{WRONG_FOLLOW}"
+        );
+    }
+
+    #[test_case(SCROLL_ROWS, VIEWPORT; "unchanged")]
+    #[test_case(5, VIEWPORT; "shorter_list")]
+    #[test_case(0, VIEWPORT; "empty_list")]
+    #[test_case(SCROLL_ROWS, SCROLL_ROWS; "larger_viewport")]
+    #[test_case(2, 0; "hidden_shorter_list")]
+    fn passive_rebuilds_only_bound_manual_scroll(rows: usize, viewport: usize) {
+        let mut scm = scrollable();
+        scm.select(Section::Unstaged, Some(0));
+        for section in Section::ALL {
+            scm.set_scroll(section, MANUAL_TOP, VIEWPORT);
+        }
+        let previous = scm.anchor();
+        scm.changes
+            .retain(|change| (0..rows).any(|n| change.relative == format!("f{n}.rs")));
+        scm.log.truncate(rows);
+        scm.rebuild(previous);
+        for section in Section::ALL {
+            scm.clamp_scroll(section, viewport);
+            assert_eq!(
+                scm.scroll(section),
+                MANUAL_TOP.min(rows.saturating_sub(viewport)),
+                "{WRONG_SCROLL}"
+            );
+            assert!(
+                !scm.sections[section.index()].follow_pending,
+                "{WRONG_FOLLOW}"
+            );
+        }
+    }
+
+    #[test_case(Some(0); "selected_row")]
+    #[test_case(None; "selected_header")]
+    fn workspace_refresh_keeps_manual_scroll_even_when_selecting_a_first_row(row: Option<usize>) {
+        let mut scm = scrollable();
+        let mut snapshot = commit_snapshot(
+            scm.log
+                .iter()
+                .map(|commit| ScmCommit {
+                    id: scm_revision(&commit.id),
+                    parents: Vec::new(),
+                    author_name: commit.author.clone(),
+                    author_email: commit.email.clone(),
+                    committed_unix_seconds: commit.committed,
+                    summary: commit.summary.clone(),
+                    body: commit.body.clone(),
+                })
+                .collect(),
+        );
+        snapshot.status = (0..SCROLL_ROWS)
+            .map(|n| ScmStatusEntry {
+                path: WorkspacePath::new(format!("f{n}.rs")).expect("valid path"),
+                staged: Some(ScmChangeKind::Modified),
+                unstaged: Some(ScmChangeKind::Modified),
+                untracked: false,
+                conflicted: false,
+            })
+            .collect();
+        scm.select(Section::Graph, row);
+        for section in Section::ALL {
+            scm.set_scroll(section, MANUAL_TOP, VIEWPORT);
+        }
+        scm.apply_workspace_snapshot(snapshot);
+        for section in Section::ALL {
+            scm.clamp_scroll(section, VIEWPORT);
+            assert_eq!(scm.scroll(section), MANUAL_TOP, "{WRONG_SCROLL}");
+            assert!(
+                !scm.sections[section.index()].follow_pending,
+                "{WRONG_FOLLOW}"
+            );
+        }
+    }
+
+    #[test]
+    fn arriving_commit_files_do_not_revive_cancelled_follow() {
+        let mut scm = scrollable();
+        scm.select(Section::Graph, Some(0));
+        scm.unfold();
+        scm.set_scroll(Section::Graph, MANUAL_TOP, VIEWPORT);
+        scm.open_workspace_commit("f0", touched(&["src/a.rs"]));
+        scm.clamp_scroll(Section::Graph, VIEWPORT);
+        assert_eq!(scm.scroll(Section::Graph), MANUAL_TOP, "{WRONG_SCROLL}");
+    }
+
+    #[test_case(Scm::fold; "fold")]
+    #[test_case(|scm| { scm.unfold(); }; "unfold_already_open")]
+    #[test_case(|scm| { scm.toggle_fold(); }; "toggle_fold")]
+    fn folder_actions_follow_the_selected_folder(action: fn(&mut Scm)) {
+        let mut scm = nested();
+        let section = Section::Unstaged;
+        scm.select(section, Some(0));
+        scm.set_scroll(section, VIEWPORT, 1);
+        action(&mut scm);
+        scm.clamp_scroll(section, 1);
+        assert_eq!(scm.scroll(section), 0, "{WRONG_SCROLL}");
+        scm.set_scroll(section, 1, 1);
+        scm.unfold();
+        scm.clamp_scroll(section, 1);
+        assert_eq!(scm.scroll(section), 0, "{WRONG_SCROLL}");
+    }
+
+    #[test_case(Scm::toggle_flat; "tree_layout")]
+    #[test_case(|scm| scm.set_height(Section::Staged, VIEWPORT as u16); "section_height")]
+    #[test_case(|scm| scm.set_collapsed(Section::Staged, true); "other_section_collapsed")]
+    fn explicit_layout_changes_follow_only_the_current_section(action: fn(&mut Scm)) {
+        let mut scm = scrollable();
+        scm.select(Section::Unstaged, Some(0));
+        for section in Section::ALL {
+            scm.set_scroll(section, MANUAL_TOP, VIEWPORT);
+        }
+        action(&mut scm);
+        for section in Section::ALL {
+            scm.clamp_scroll(section, VIEWPORT);
+            let expected = if section == Section::Unstaged {
+                0
+            } else {
+                MANUAL_TOP
+            };
+            assert_eq!(scm.scroll(section), expected, "{WRONG_SCROLL}");
+        }
+    }
+
+    #[test_case(0; "zero_viewport")]
+    #[test_case(VIEWPORT; "visible_viewport")]
+    #[test_case(usize::MAX; "oversized_viewport")]
+    fn manual_scroll_extremes_stay_bounded(viewport: usize) {
+        let mut scm = scrollable();
+        let section = Section::Unstaged;
+        let max = SCROLL_ROWS.saturating_sub(viewport);
+        scm.set_scroll(section, usize::MAX, viewport);
+        assert_eq!(scm.scroll(section), max, "{WRONG_SCROLL}");
+        scm.scroll_by(section, isize::MIN, viewport);
+        assert_eq!(scm.scroll(section), 0, "{WRONG_SCROLL}");
+        scm.scroll_by(section, isize::MAX, viewport);
+        assert_eq!(scm.scroll(section), max, "{WRONG_SCROLL}");
     }
 
     #[test]

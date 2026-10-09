@@ -101,6 +101,7 @@ pub struct Tree {
     rows: Vec<Row>,
     selected: usize,
     scroll: usize,
+    follow_selection: bool,
 }
 
 impl Default for Tree {
@@ -114,6 +115,7 @@ impl Default for Tree {
             rows: Vec::new(),
             selected: 0,
             scroll: 0,
+            follow_selection: false,
         }
     }
 }
@@ -129,6 +131,7 @@ impl Tree {
             rows: Vec::new(),
             selected: 0,
             scroll: 0,
+            follow_selection: false,
         };
         tree.reload();
         tree
@@ -171,7 +174,7 @@ impl Tree {
         }
         self.rebuild_rows();
         if let Some(path) = selected {
-            self.select_workbench_path(&path);
+            self.restore_selection(&path);
         }
     }
 
@@ -221,11 +224,12 @@ impl Tree {
         }
         self.rebuild_rows();
         if let Some(path) = selected {
-            self.select_workbench_path(&path);
+            self.restore_selection(&path);
         }
     }
 
     pub fn move_selection(&mut self, delta: isize) {
+        self.follow_selection = true;
         if self.rows.is_empty() {
             return;
         }
@@ -234,16 +238,19 @@ impl Tree {
     }
 
     pub fn select_first(&mut self) {
+        self.follow_selection = true;
         self.selected = 0;
     }
 
     pub fn select_last(&mut self) {
+        self.follow_selection = true;
         self.selected = self.rows.len().saturating_sub(1);
     }
 
     pub fn select_index(&mut self, index: usize) {
         if index < self.rows.len() {
             self.selected = index;
+            self.follow_selection = true;
         }
     }
 
@@ -293,7 +300,8 @@ impl Tree {
             }
         }
         self.rebuild_rows();
-        self.select_workbench_path(path);
+        self.restore_selection(path);
+        self.follow_selection = true;
     }
 
     pub fn resource(&self, path: &WorkbenchPath) -> Option<&ResourceEntry> {
@@ -320,7 +328,8 @@ impl Tree {
             self.load_children(&path);
         }
         self.rebuild_rows();
-        self.select_workbench_path(&path);
+        self.restore_selection(&path);
+        self.follow_selection = true;
         true
     }
 
@@ -328,6 +337,7 @@ impl Tree {
     /// nearest ancestor still listed, so it stays on the branch it was in
     /// rather than landing wherever the shorter list happens to reach.
     pub fn collapse_all(&mut self) {
+        self.follow_selection = true;
         let selected = self.selected().map(|row| row.path.clone());
         self.expanded.clear();
         self.rebuild_rows();
@@ -337,7 +347,7 @@ impl Tree {
         let mut showing = Some(path);
         while let Some(candidate) = showing {
             if self.rows.iter().any(|row| row.path == candidate) {
-                self.select_workbench_path(&candidate);
+                self.restore_selection(&candidate);
                 break;
             }
             showing = candidate.parent();
@@ -347,6 +357,7 @@ impl Tree {
     /// Collapses the selected directory, or jumps to the parent of a file. The
     /// left arrow means "out of here" either way.
     pub fn collapse_or_parent(&mut self) {
+        self.follow_selection = true;
         let Some(row) = self.rows.get(self.selected) else {
             return;
         };
@@ -358,7 +369,7 @@ impl Tree {
             return;
         };
         if parent != self.root {
-            self.select_workbench_path(&parent);
+            self.restore_selection(&parent);
         }
     }
 
@@ -407,30 +418,35 @@ impl Tree {
         }
     }
 
-    /// Keeps the cursor inside the window, and the window inside the rows.
     pub fn clamp_scroll(&mut self, viewport: usize) {
+        let max = self.rows.len().saturating_sub(viewport);
+        self.scroll = self.scroll.min(max);
         if viewport == 0 {
             return;
         }
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        } else if self.selected >= self.scroll + viewport {
-            self.scroll = self.selected + 1 - viewport;
+        if self.follow_selection {
+            if self.selected < self.scroll {
+                self.scroll = self.selected;
+            } else if self.selected.saturating_sub(self.scroll) >= viewport {
+                self.scroll = self.selected + 1 - viewport;
+            }
+            self.scroll = self.scroll.min(max);
+            self.follow_selection = false;
         }
-        let max = self.rows.len().saturating_sub(viewport);
-        self.scroll = self.scroll.min(max);
     }
 
     pub fn scroll_by(&mut self, delta: isize, viewport: usize) {
+        self.follow_selection = false;
         let max = self.rows.len().saturating_sub(viewport);
         self.scroll = self.scroll.saturating_add_signed(delta).min(max);
     }
 
     pub fn set_scroll(&mut self, top: usize, viewport: usize) {
+        self.follow_selection = false;
         self.scroll = top.min(self.rows.len().saturating_sub(viewport));
     }
 
-    fn select_workbench_path(&mut self, path: &WorkbenchPath) {
+    fn restore_selection(&mut self, path: &WorkbenchPath) {
         if let Some(index) = self.rows.iter().position(|row| &row.path == path) {
             self.selected = index;
         } else {
@@ -743,6 +759,11 @@ mod tests {
     const REMOTE_CHILDREN: usize = 16;
     const REMOTE_PAGE: usize = 32;
     const REMOTE_LINEAR: &str = "remote indexing must touch only changed entries and visible rows";
+    const SCROLL_ROWS: usize = 12;
+    const SCROLL_VIEWPORT: usize = 3;
+    const MANUAL_SCROLL: usize = 5;
+    const SCROLL_WRONG: &str = "manual scrolling must persist until explicit selection navigation";
+    const FOLLOW_WRONG: &str = "navigation must reveal selection once a viewport is available";
     const MARKS: [GitMark; 5] = [
         GitMark::Modified,
         GitMark::Added,
@@ -820,6 +841,148 @@ mod tests {
 
     fn names(tree: &Tree) -> Vec<String> {
         tree.rows().iter().map(|row| row.name.clone()).collect()
+    }
+
+    fn scrolling_tree() -> Tree {
+        let mut tree = Tree::remote(WorkbenchPath::Remote(WorkspacePath::root()), false);
+        let entries = (0..SCROLL_ROWS)
+            .map(|index| ResourceEntry {
+                path: WorkbenchPath::Remote(
+                    WorkspacePath::new(format!("file-{index:02}")).unwrap(),
+                ),
+                resource_id: None,
+                revision: None,
+                kind: ResourceKind::File,
+                size_bytes: None,
+            })
+            .collect::<Vec<_>>();
+        tree.update_remote(&entries, &[]);
+        tree
+    }
+
+    #[test_case(false, SCROLL_VIEWPORT; "wheel")]
+    #[test_case(true, SCROLL_VIEWPORT; "bar")]
+    #[test_case(false, 0; "wheel_without_viewport")]
+    #[test_case(true, 0; "bar_without_viewport")]
+    fn manual_scroll_survives_redraws(bar: bool, viewport: usize) {
+        let mut tree = scrolling_tree();
+        tree.select_first();
+        if bar {
+            tree.set_scroll(MANUAL_SCROLL, viewport);
+        } else {
+            tree.scroll_by(MANUAL_SCROLL as isize, viewport);
+        }
+        tree.clamp_scroll(viewport);
+        tree.clamp_scroll(SCROLL_VIEWPORT);
+        tree.clamp_scroll(SCROLL_VIEWPORT);
+        assert_eq!(tree.scroll(), MANUAL_SCROLL, "{SCROLL_WRONG}");
+        assert_eq!(tree.selected_index(), 0, "{CURSOR_ADRIFT}");
+    }
+
+    #[test_case(Tree::select_first, false; "home")]
+    #[test_case(Tree::select_last, true; "end")]
+    #[test_case(|tree: &mut Tree| tree.move_selection(-1), false; "up_at_start")]
+    #[test_case(|tree: &mut Tree| tree.move_selection(1), true; "down_at_end")]
+    #[test_case(|tree: &mut Tree| tree.select_index(tree.selected_index()), false; "same_index")]
+    #[test_case(Tree::collapse_or_parent, false; "parent_at_root")]
+    #[test_case(Tree::collapse_all, false; "already_folded")]
+    fn boundary_navigation_follows_once(action: fn(&mut Tree), last: bool) {
+        let mut tree = scrolling_tree();
+        if last {
+            tree.select_last();
+        }
+        tree.set_scroll(MANUAL_SCROLL, SCROLL_VIEWPORT);
+        action(&mut tree);
+        tree.clamp_scroll(SCROLL_VIEWPORT);
+        let expected = if last {
+            SCROLL_ROWS - SCROLL_VIEWPORT
+        } else {
+            0
+        };
+        assert_eq!(tree.scroll(), expected, "{FOLLOW_WRONG}");
+        tree.clamp_scroll(SCROLL_ROWS);
+        tree.clamp_scroll(SCROLL_VIEWPORT);
+        assert_eq!(tree.scroll(), 0, "{SCROLL_WRONG}");
+    }
+
+    #[test_case(1; "single_row")]
+    #[test_case(SCROLL_VIEWPORT; "several_rows")]
+    fn zero_viewport_retains_navigation(viewport: usize) {
+        let mut tree = scrolling_tree();
+        tree.select_last();
+        tree.clamp_scroll(0);
+        tree.clamp_scroll(0);
+        assert_eq!(tree.scroll(), 0, "{FOLLOW_WRONG}");
+        tree.clamp_scroll(viewport);
+        assert_eq!(tree.scroll(), SCROLL_ROWS - viewport, "{FOLLOW_WRONG}");
+    }
+
+    #[test_case(0; "hidden")]
+    #[test_case(SCROLL_VIEWPORT - 1; "partly_visible")]
+    #[test_case(SCROLL_VIEWPORT; "visible")]
+    fn remote_removal_bounds_manual_scroll_without_following(viewport: usize) {
+        let mut tree = scrolling_tree();
+        tree.set_scroll(MANUAL_SCROLL, SCROLL_VIEWPORT);
+        let removed = tree.rows()[SCROLL_VIEWPORT..]
+            .iter()
+            .map(|row| row.path.clone())
+            .collect::<Vec<_>>();
+        tree.update_remote(&[], &removed);
+        tree.clamp_scroll(viewport);
+        assert_eq!(tree.scroll(), SCROLL_VIEWPORT - viewport, "{SCROLL_WRONG}");
+        assert_eq!(tree.selected_index(), 0, "{CURSOR_ADRIFT}");
+    }
+
+    #[test_case(false; "metadata_update")]
+    #[test_case(true; "insertion_before_selection")]
+    fn remote_updates_preserve_manual_scroll(insert: bool) {
+        let mut tree = scrolling_tree();
+        let selected = tree.selected().unwrap().path.clone();
+        let mut entry = tree.selected().unwrap().resource.clone().unwrap();
+        if insert {
+            entry.path = WorkbenchPath::Remote(WorkspacePath::new("before-files").unwrap());
+        }
+        tree.set_scroll(MANUAL_SCROLL, SCROLL_VIEWPORT);
+        tree.update_remote(&[entry], &[]);
+        tree.clamp_scroll(SCROLL_VIEWPORT);
+        assert_eq!(tree.scroll(), MANUAL_SCROLL, "{SCROLL_WRONG}");
+        assert_eq!(tree.selected().unwrap().path, selected, "{CURSOR_ADRIFT}");
+        tree.clamp_scroll(tree.rows().len() - 1);
+        assert_eq!(tree.scroll(), 1, "{SCROLL_WRONG}");
+    }
+
+    #[test_case(false; "unchanged")]
+    #[test_case(true; "selected_file_removed")]
+    fn reload_restores_selection_without_following(remove: bool) {
+        let tmp = fixture();
+        let mut tree = Tree::new(tmp.path(), true);
+        tree.reveal(&tmp.path().join("Cargo.toml"));
+        tree.set_scroll(0, 1);
+        if remove {
+            fs::remove_file(tmp.path().join("Cargo.toml")).unwrap();
+        }
+        tree.reload();
+        tree.clamp_scroll(1);
+        tree.clamp_scroll(1);
+        assert_eq!(tree.scroll(), 0, "{SCROLL_WRONG}");
+        assert!(tree.selected_index() > 0, "{CURSOR_ADRIFT}");
+    }
+
+    #[test_case(false; "reveal")]
+    #[test_case(true; "toggle")]
+    fn explicit_tree_actions_reveal_selection(toggle: bool) {
+        let tmp = fixture();
+        let mut tree = Tree::new(tmp.path(), true);
+        let path = tmp.path().join("src");
+        tree.reveal(&path);
+        tree.set_scroll(tree.rows().len() - 1, 1);
+        if toggle {
+            assert!(tree.toggle_selected(), "{FOLLOW_WRONG}");
+        } else {
+            tree.reveal(&path);
+        }
+        tree.clamp_scroll(1);
+        assert_eq!(tree.scroll(), tree.selected_index(), "{FOLLOW_WRONG}");
     }
 
     #[test]

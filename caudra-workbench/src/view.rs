@@ -416,11 +416,7 @@ impl Workbench {
         );
 
         let height = body.height as usize;
-        // A bar drag is the user moving the window on purpose, so the cursor
-        // stays where it is rather than dragging the window back to itself.
-        if !self.bars.sidebar.is_dragging() {
-            self.search.clamp_scroll(height);
-        }
+        self.search.clamp_scroll(height);
         if !self.search.has_results() {
             self.panes.rows = body;
             let notice = match (self.search.error(), self.search.is_running()) {
@@ -509,9 +505,7 @@ impl Workbench {
     fn render_section(&mut self, buf: &mut Surface, section: Section, area: Rect) -> Rect {
         grab_scope!("workbench_source_control_section", area);
         let height = area.height as usize;
-        if !self.bars.sections[section.index()].is_dragging() {
-            self.scm.clamp_scroll(section, height);
-        }
+        self.scm.clamp_scroll(section, height);
         if height == 0 {
             return area;
         }
@@ -568,9 +562,7 @@ impl Workbench {
     fn render_tree(&mut self, buf: &mut Surface, area: Rect) {
         grab_scope!("workbench_explorer", area);
         let height = area.height as usize;
-        if !self.bars.sidebar.is_dragging() {
-            self.tree.clamp_scroll(height);
-        }
+        self.tree.clamp_scroll(height);
         if self.tree.rows().is_empty() {
             self.panes.rows = area;
             let notice = if self.remote_backend.is_some() && !self.remote_pending.is_empty() {

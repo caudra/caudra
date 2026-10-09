@@ -2027,7 +2027,11 @@ impl Workbench {
         {
             // Each section scrolls on its own, so the wheel answers to the one
             // the pointer is over rather than to whichever was last touched.
-            if let Some((section, body)) = self.section_under(at) {
+            if let Some(section) = Section::ALL.into_iter().find(|section| {
+                let body = self.panes.sections[section.index()].body;
+                (body.y..body.bottom()).contains(&row)
+            }) {
+                let body = self.panes.sections[section.index()].body;
                 self.scm.scroll_by(section, delta, body.height as usize);
             }
         } else if self
@@ -4745,7 +4749,7 @@ mod tests {
     use crate::fs::read::SaveError;
     use crate::fs::tree::GitMark;
     use crate::menu::Item as MenuItem;
-    use crate::scm::backend::DiffResult;
+    use crate::scm::backend::{DiffResult, Snapshot};
     use crate::scm::repo::Commit;
     use crate::scroll::SCROLLBAR_THUMB;
     use crate::search;
@@ -4755,7 +4759,11 @@ mod tests {
         STAGE_MARK, TabHit, TabPart, UNSTAGE_MARK, button_at, confirm_at, header_at, on_menu_mark,
         tab_at, toggle_at, visible_range,
     };
-    use caudra_workspace::{ResourceKind, ScmDiffTarget, WorkspaceError, WorkspacePath};
+    use crate::{ResourceEntry, SearchMatch, SearchResult};
+    use caudra_workspace::{
+        ResourceId, ResourceKind, ScmChangeKind, ScmCommit, ScmDiffTarget, ScmRepository,
+        ScmRepositoryRevisions, ScmRevision, ScmStatusEntry, WorkspaceError, WorkspacePath,
+    };
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
@@ -4900,6 +4908,12 @@ mod tests {
     const TAB_OFF_STRIP: &str = "the strip is not showing the tab the editor is on";
     const NO_OVERFLOW_MARK: &str = "the strip does not say which end it cut tabs off";
     const WRONG_BAR: &str = "the pane is not saying how much of its content is off screen";
+    const SCROLL_SNAPPED: &str = "redrawing must preserve the manually scrolled viewport";
+    const SCROLL_CHANGED_SELECTION: &str = "scrolling must not change selection, focus, or editor";
+    const SCROLL_FILE: &str = "file0.txt";
+    const SCROLL_ITEMS: usize = 40;
+    const SCROLL_REQUEST: u64 = 1;
+    const SCROLL_REVISION: &str = "scroll-test";
     const WRONG_ORDER: &str = "the palette is not offering the project the way it should";
     const NO_CONTROL: &str = "the hovered row is not offering the control it should";
     const STRAY_CONTROL: &str = "the row is offering a control it has no business offering";
@@ -5571,6 +5585,90 @@ mod tests {
         let mut workbench = Workbench::new(WorkbenchStyles::default());
         workbench.open(dir.path());
         (dir, workbench)
+    }
+
+    fn scrolling_project(sidebar: SidebarView) -> (TempDir, Workbench) {
+        let (dir, mut workbench) = tall_project();
+        let path = dir.path().join(SCROLL_FILE);
+        workbench.open_path(&path);
+        workbench.sidebar = sidebar;
+        match sidebar {
+            SidebarView::Search => {
+                workbench.search.begin_remote(SCROLL_REQUEST);
+                workbench.search.apply_remote(
+                    SCROLL_REQUEST,
+                    SearchResult {
+                        hits: (1..=SCROLL_ITEMS)
+                            .map(|line| SearchMatch {
+                                entry: ResourceEntry {
+                                    path: path.clone().into(),
+                                    resource_id: None,
+                                    revision: None,
+                                    kind: ResourceKind::File,
+                                    size_bytes: None,
+                                },
+                                line: line as u32,
+                                text: SCROLL_FILE.to_owned(),
+                            })
+                            .collect(),
+                        continuation: None,
+                        truncated: false,
+                        incomplete: false,
+                    },
+                );
+            }
+            SidebarView::SourceControl => {
+                let revision = ScmRevision::new(SCROLL_REVISION).expect("a revision");
+                let resource = ResourceId::new(SCROLL_REVISION).expect("a resource");
+                workbench.scm.apply_workspace_snapshot(Snapshot {
+                    repository: ScmRepository {
+                        handle: resource.clone(),
+                        resource_id: resource,
+                        root: WorkspacePath::root(),
+                        identity: revision.clone(),
+                        revisions: ScmRepositoryRevisions {
+                            repository: revision.clone(),
+                            head: revision.clone(),
+                            index: revision.clone(),
+                            worktree: revision,
+                        },
+                    },
+                    status: (0..SCROLL_ITEMS)
+                        .map(|index| ScmStatusEntry {
+                            path: WorkspacePath::new(format!("file{index}.txt")).expect("a path"),
+                            staged: Some(ScmChangeKind::Modified),
+                            unstaged: Some(ScmChangeKind::Modified),
+                            untracked: false,
+                            conflicted: false,
+                        })
+                        .collect(),
+                    commits: (0..SCROLL_ITEMS)
+                        .map(|index| ScmCommit {
+                            id: ScmRevision::new(format!("commit-{index}")).expect("a commit"),
+                            parents: Vec::new(),
+                            author_name: String::new(),
+                            author_email: String::new(),
+                            committed_unix_seconds: 0,
+                            summary: format!("commit {index}"),
+                            body: None,
+                        })
+                        .collect(),
+                    warnings: Vec::new(),
+                });
+                workbench.scm.set_collapsed(Section::Graph, false);
+            }
+            SidebarView::Explorer | SidebarView::Transfer => {}
+        }
+        workbench.focus = Focus::Editor;
+        (dir, workbench)
+    }
+
+    fn sidebar_position(workbench: &Workbench) -> (usize, usize) {
+        match workbench.sidebar {
+            SidebarView::Explorer => (workbench.tree.selected_index(), workbench.tree.scroll()),
+            SidebarView::Search => (workbench.search.selected_index(), workbench.search.scroll()),
+            SidebarView::SourceControl | SidebarView::Transfer => unreachable!(),
+        }
     }
 
     /// Puts the cursor on `a.txt`, which is what the editing tests want open.
@@ -9588,6 +9686,243 @@ mod tests {
         );
     }
 
+    #[test_case(SidebarView::Explorer, true; "files_with_bar")]
+    #[test_case(SidebarView::Explorer, false; "files_without_bar")]
+    #[test_case(SidebarView::Search, true; "search_with_bar")]
+    #[test_case(SidebarView::Search, false; "search_without_bar")]
+    fn sidebar_wheel_scrolling_survives_redraws(sidebar: SidebarView, scrollbars: bool) {
+        let (_dir, mut workbench) = scrolling_project(sidebar);
+        workbench.set_scrollbars(scrollbars);
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let rows = workbench.panes.rows;
+        let selected = sidebar_position(&workbench).0;
+        let caret = cursor(&workbench);
+        let tabs = workbench.editor.tabs().len();
+
+        for aggregated in [false, true] {
+            let delta = if aggregated {
+                SCROLL_LINES * 2
+            } else {
+                SCROLL_LINES
+            };
+            for direction in [1, -1] {
+                if aggregated {
+                    workbench.scroll(rows.x, rows.y, delta * direction);
+                } else {
+                    let kind = if direction > 0 {
+                        MouseEventKind::ScrollDown
+                    } else {
+                        MouseEventKind::ScrollUp
+                    };
+                    workbench.handle_mouse(mouse(kind, rows.x, rows.y));
+                }
+                let expected = if direction > 0 { delta as usize } else { 0 };
+                for _ in 0..2 {
+                    draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+                    assert_eq!(
+                        sidebar_position(&workbench),
+                        (selected, expected),
+                        "{SCROLL_SNAPPED}"
+                    );
+                    assert_eq!(
+                        workbench.focus(),
+                        Focus::Editor,
+                        "{SCROLL_CHANGED_SELECTION}"
+                    );
+                    assert_eq!(cursor(&workbench), caret, "{SCROLL_CHANGED_SELECTION}");
+                    assert_eq!(
+                        workbench.editor.active().expect(NO_TAB).scroll(),
+                        0,
+                        "{SCROLL_CHANGED_SELECTION}"
+                    );
+                    assert_eq!(
+                        workbench.editor.tabs().len(),
+                        tabs,
+                        "{SCROLL_CHANGED_SELECTION}"
+                    );
+                }
+            }
+        }
+        workbench.scroll(rows.x, rows.y, isize::MAX);
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let total = match sidebar {
+            SidebarView::Explorer => workbench.tree.rows().len(),
+            _ => workbench.search.rows().len(),
+        };
+        assert_eq!(
+            sidebar_position(&workbench).1,
+            total - rows.height as usize,
+            "{SCROLL_SNAPPED}"
+        );
+        workbench.focus = Focus::Sidebar;
+        workbench.handle_key(key(KeyCode::Up));
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        assert_eq!(
+            sidebar_position(&workbench),
+            (selected, 0),
+            "{SCROLL_SNAPPED}"
+        );
+    }
+
+    #[test_case(Section::Staged, true; "staged_with_bar")]
+    #[test_case(Section::Unstaged, true; "unstaged_with_bar")]
+    #[test_case(Section::Graph, true; "graph_with_bar")]
+    #[test_case(Section::Staged, false; "staged_without_bar")]
+    #[test_case(Section::Unstaged, false; "unstaged_without_bar")]
+    #[test_case(Section::Graph, false; "graph_without_bar")]
+    fn git_wheel_scrolling_survives_redraws(section: Section, scrollbars: bool) {
+        let (_dir, mut workbench) = scrolling_project(SidebarView::SourceControl);
+        workbench.set_scrollbars(scrollbars);
+        workbench.scm.select(section, Some(0));
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let body = body_of(&workbench, section);
+        let sidebar = workbench.panes.sidebar.expect("a sidebar");
+        let selected = workbench.scm.cursor();
+        let caret = cursor(&workbench);
+
+        for column in [body.x, sidebar.right() - 1] {
+            for aggregated in [false, true] {
+                let delta = if aggregated {
+                    SCROLL_LINES * 2
+                } else {
+                    SCROLL_LINES
+                };
+                for direction in [1, -1] {
+                    if aggregated {
+                        workbench.scroll(column, body.y, delta * direction);
+                    } else {
+                        let kind = if direction > 0 {
+                            MouseEventKind::ScrollDown
+                        } else {
+                            MouseEventKind::ScrollUp
+                        };
+                        workbench.handle_mouse(mouse(kind, column, body.y));
+                    }
+                    let expected = if direction > 0 { delta as usize } else { 0 };
+                    for _ in 0..2 {
+                        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+                        for candidate in Section::ALL {
+                            assert_eq!(
+                                workbench.scm.scroll(candidate),
+                                if candidate == section { expected } else { 0 },
+                                "{SCROLL_SNAPPED}"
+                            );
+                        }
+                        assert_eq!(
+                            workbench.scm.cursor(),
+                            selected,
+                            "{SCROLL_CHANGED_SELECTION}"
+                        );
+                        assert_eq!(
+                            workbench.focus(),
+                            Focus::Editor,
+                            "{SCROLL_CHANGED_SELECTION}"
+                        );
+                        assert_eq!(cursor(&workbench), caret, "{SCROLL_CHANGED_SELECTION}");
+                        assert_eq!(
+                            workbench.editor.active().expect(NO_TAB).scroll(),
+                            0,
+                            "{SCROLL_CHANGED_SELECTION}"
+                        );
+                    }
+                }
+            }
+        }
+        let header = header_of(&workbench, section);
+        workbench.scroll(header.x, header.y, SCROLL_LINES);
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        assert_eq!(workbench.scm.scroll(section), 0, "{SCROLL_SNAPPED}");
+        workbench.scm.set_collapsed(section, true);
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let header = header_of(&workbench, section);
+        workbench.scroll(header.x, header.y, SCROLL_LINES);
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        for candidate in Section::ALL {
+            assert_eq!(workbench.scm.scroll(candidate), 0, "{SCROLL_SNAPPED}");
+        }
+    }
+
+    #[test_case(SidebarView::Explorer; "files")]
+    #[test_case(SidebarView::Search; "search")]
+    fn sidebar_bar_positioning_and_row_clicks_survive_redraws(sidebar: SidebarView) {
+        let (_dir, mut workbench) = scrolling_project(sidebar);
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let rows = workbench.panes.rows;
+        let selected = sidebar_position(&workbench).0;
+        let bottom = rows.bottom() - 1;
+
+        workbench.handle_mouse(click(rows.right(), bottom));
+        workbench.handle_mouse(release(rows.right(), bottom));
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        assert!(sidebar_position(&workbench).1 > 0, "{SCROLL_SNAPPED}");
+        assert_eq!(
+            sidebar_position(&workbench).0,
+            selected,
+            "{SCROLL_CHANGED_SELECTION}"
+        );
+        workbench.handle_mouse(click(rows.right(), rows.y + 1));
+        workbench.handle_mouse(drag(rows.right(), bottom));
+        workbench.handle_mouse(release(rows.right(), bottom));
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let offset = sidebar_position(&workbench).1;
+        assert!(offset > 0, "{SCROLL_SNAPPED}");
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        assert_eq!(
+            sidebar_position(&workbench),
+            (selected, offset),
+            "{SCROLL_SNAPPED}"
+        );
+        assert_eq!(
+            workbench.focus(),
+            Focus::Editor,
+            "{SCROLL_CHANGED_SELECTION}"
+        );
+
+        workbench.handle_mouse(click(row_body(rows), rows.y));
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        assert_eq!(sidebar_position(&workbench).0, offset, "{WRONG_CLICK}");
+    }
+
+    #[test_case(Section::Staged; "staged")]
+    #[test_case(Section::Unstaged; "unstaged")]
+    #[test_case(Section::Graph; "graph")]
+    fn git_bar_position_survives_release_until_navigation(section: Section) {
+        let (_dir, mut workbench) = scrolling_project(SidebarView::SourceControl);
+        workbench.scm.select(section, Some(0));
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let body = body_of(&workbench, section);
+        let selected = workbench.scm.cursor();
+        let bottom = body.bottom() - 1;
+
+        workbench.handle_mouse(click(body.right(), bottom));
+        workbench.handle_mouse(release(body.right(), bottom));
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        assert!(workbench.scm.scroll(section) > 0, "{SCROLL_SNAPPED}");
+        workbench.handle_mouse(click(body.right(), body.y));
+        workbench.handle_mouse(drag(body.right(), bottom));
+        workbench.handle_mouse(release(body.right(), bottom));
+        let offset = workbench.scm.scroll(section);
+        assert!(offset > 0, "{SCROLL_SNAPPED}");
+        for _ in 0..2 {
+            draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+            assert_eq!(workbench.scm.scroll(section), offset, "{SCROLL_SNAPPED}");
+            assert_eq!(
+                workbench.scm.cursor(),
+                selected,
+                "{SCROLL_CHANGED_SELECTION}"
+            );
+            assert_eq!(
+                workbench.focus(),
+                Focus::Editor,
+                "{SCROLL_CHANGED_SELECTION}"
+            );
+        }
+        workbench.focus = Focus::Sidebar;
+        workbench.handle_key(key(KeyCode::Down));
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        assert_eq!(workbench.scm.scroll(section), 1, "{SCROLL_SNAPPED}");
+    }
+
     #[test_case(true, true ; "a tree taller than its pane draws one")]
     #[test_case(false, false ; "turning them off gives the column back")]
     fn a_scrollbar_says_how_far_down_the_tree_is(scrollbars: bool, expected: bool) {
@@ -9674,10 +10009,8 @@ mod tests {
         assert_eq!(workbench.tree.selected_index(), selected, "{WRONG_CLICK}");
     }
 
-    /// Releasing hands the pane back, so the next keyboard move is free to pull
-    /// the window to the selection again.
     #[test]
-    fn releasing_the_bar_lets_the_selection_pull_the_window_back() {
+    fn releasing_the_bar_keeps_the_window_until_keyboard_navigation() {
         let (_dir, mut workbench) = tall_project();
         draw(&mut workbench, 80, 24);
         let rows = workbench.panes.rows;
@@ -9685,6 +10018,11 @@ mod tests {
         workbench.handle_mouse(click(rows.right(), rows.y + 1));
         workbench.handle_mouse(drag(rows.right(), rows.bottom() - 1));
         workbench.handle_mouse(release(rows.right(), rows.bottom() - 1));
+        draw(&mut workbench, 80, 24);
+
+        let max = workbench.tree.rows().len() - rows.height as usize;
+        assert_eq!(workbench.tree.scroll(), max, "{WRONG_BAR}");
+        workbench.handle_key(key(KeyCode::Up));
         draw(&mut workbench, 80, 24);
 
         assert_eq!(workbench.tree.scroll(), 0, "{WRONG_BAR}");
