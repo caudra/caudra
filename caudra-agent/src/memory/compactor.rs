@@ -1,18 +1,17 @@
-//! The background summarizer: builds the tree's lines with a Fast model.
+//! The background summarizer: builds the tree's lines with the Memory model.
 //!
 //! A runtime keeps one [`Pump`] per memory. The pump folds the view, takes
 //! the nodes [`Tree::work`](super::tree::Tree::work) offers, most urgent
 //! first, leases each so other runtimes on the same journal leave it alone,
-//! asks the model for its line and stores it. Only a model chosen for the
-//! Memory purpose writes lines, never the chat model standing in for one:
-//! background spend nobody configured is spend nobody expects. The choice
-//! follows the session's chat model, so a switch reaches the next line.
+//! asks the model for its line and stores it. The Memory job resolves
+//! against the session's chat model, so a switch reaches the next line.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use caudra_config::ModelPolicy;
+use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::{Provider, from_model_async};
 use caudra_providers::{
     AgentError, CacheKey, ContentBlock, MIN_THINKING_BUDGET, Message, Model, ModelError,
@@ -141,9 +140,9 @@ pub struct Summarizer {
 }
 
 impl Summarizer {
-    /// The Memory purpose resolved against the chat model, off the executor.
-    /// `None`, logged, when nothing chose a model for it, so the chat model
-    /// would only stand in, or when the chosen one will not load.
+    /// The Memory job resolved against the chat model, off the executor.
+    /// `None`, logged, when a Memory binding does not resolve or its model
+    /// will not load.
     pub async fn resolve(
         chat_provider: &Arc<dyn Provider>,
         chat_model: &Model,
@@ -152,27 +151,18 @@ impl Summarizer {
     ) -> Option<Self> {
         let (anchor, policy) = (chat_model.clone(), policy.clone());
         let resolved =
-            smol::unblock(move || Model::resolve_dedicated(ModelPurpose::Memory, &anchor, &policy))
-                .await;
+            smol::unblock(move || Model::resolve(ModelPurpose::Memory, &anchor, &policy)).await;
         Self::load(resolved, chat_provider, chat_model, timeouts).await
     }
 
     async fn load(
-        resolved: Result<Option<Model>, ModelError>,
+        resolved: Result<Model, ModelError>,
         chat_provider: &Arc<dyn Provider>,
         chat_model: &Model,
         timeouts: Timeouts,
     ) -> Option<Self> {
         let mut model = match resolved {
-            Ok(Some(model)) => model,
-            Ok(None) => {
-                info!(
-                    chat_model = %chat_model.spec(),
-                    purpose = %ModelPurpose::Memory,
-                    "memory summaries off: no model is chosen for memory work and the provider names no fast one"
-                );
-                return None;
-            }
+            Ok(model) => model,
             Err(error) => {
                 warn!(
                     %error,
@@ -219,26 +209,47 @@ fn resolver(policy: Arc<ModelPolicy>, timeouts: Timeouts) -> Resolve {
     })
 }
 
-/// The summarizer for the chat model last seen, looked up again only when
-/// the session switches chat model or provider. Lines in progress keep the
-/// summarizer they started with.
+/// What the summarizer was chosen from: the chat model, its provider, and
+/// every job binding, since the Memory job may follow another job's.
+struct Seen {
+    provider: Arc<dyn Provider>,
+    spec: String,
+    bindings: [Option<Binding>; ModelPurpose::ALL.len()],
+}
+
+impl Seen {
+    fn now(provider: Arc<dyn Provider>, spec: String) -> Self {
+        Self {
+            provider,
+            spec,
+            bindings: ModelPurpose::ALL.map(model_registry::binding),
+        }
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.provider, &other.provider)
+            && self.spec == other.spec
+            && self.bindings == other.bindings
+    }
+}
+
+/// The summarizer last chosen, looked up again only when the session
+/// switches chat model or provider, or a job binding changes. Lines in
+/// progress keep the summarizer they started with.
 #[derive(Default)]
 struct Choice {
-    chat: Option<(Arc<dyn Provider>, String)>,
+    seen: Option<Seen>,
     summarizer: Option<Arc<Summarizer>>,
 }
 
 impl Choice {
-    /// True when the chat model changed since the last look, and with it,
-    /// perhaps, the summarizer.
+    /// True when the chat model or a binding changed since the last look,
+    /// and with it, perhaps, the summarizer.
     async fn follow(&mut self, chat: &ModelResolver, resolve: &Resolve) -> bool {
         let (provider, model) = chat();
         let spec = model.spec();
-        if self
-            .chat
-            .as_ref()
-            .is_some_and(|(seen, seen_spec)| Arc::ptr_eq(seen, &provider) && *seen_spec == spec)
-        {
+        let seen = Seen::now(Arc::clone(&provider), spec.clone());
+        if self.seen.as_ref().is_some_and(|last| last.same(&seen)) {
             return false;
         }
         self.summarizer = resolve(Arc::clone(&provider), Model::clone(&model))
@@ -252,7 +263,7 @@ impl Choice {
                 "memory summaries follow the chat model"
             );
         }
-        self.chat = Some((provider, spec));
+        self.seen = Some(seen);
         true
     }
 }
@@ -372,6 +383,8 @@ enum Wake {
     Built(Part, Result<(), BuildError>),
     /// A node that failed for a passing reason may be tried again.
     Due(Part),
+    /// A lease another runtime held on a needed node ran out.
+    Lapsed,
 }
 
 /// What a pump's builds share.
@@ -413,6 +426,7 @@ impl Shared {
         let mut held: HashSet<Part> = HashSet::new();
         let mut warned: HashSet<Part> = HashSet::new();
         let mut choice = Choice::default();
+        let mut lapse: Option<Task<()>> = None;
         // Kept across wakes, so a nudge that lands while one is handled waits
         // its turn instead of being lost.
         let mut nudged = nudge.listen();
@@ -422,13 +436,16 @@ impl Shared {
             }
             if let Some(summarizer) = &choice.summarizer {
                 match self.load().await {
-                    Ok(state) => self.start(
-                        &state,
-                        summarizer,
-                        &mut building,
-                        |part| cooling.contains_key(part) || held.contains(part),
-                        &wake_tx,
-                    ),
+                    Ok(state) => {
+                        let lapses = self.start(
+                            &state,
+                            summarizer,
+                            &mut building,
+                            |part| cooling.contains_key(part) || held.contains(part),
+                            &wake_tx,
+                        );
+                        lapse = lapses.map(|expires| self.lapse(expires, &wake_tx));
+                    }
                     Err(error) => {
                         warn!(scope = self.store.scope(), %error, "memory not loaded for summaries")
                     }
@@ -461,6 +478,9 @@ impl Shared {
                 Some(Wake::Due(part)) => {
                     cooling.remove(&part);
                 }
+                Some(Wake::Lapsed) => {
+                    lapse.take();
+                }
                 None => {
                     nudged = nudge.listen();
                     held.clear();
@@ -471,7 +491,7 @@ impl Shared {
 
     /// Starts the nodes the view needs, most urgent first, while fewer than
     /// [`JOBS`] build. Skips nodes another pump holds and those `waiting`
-    /// keeps back.
+    /// keeps back. Returns when the first lease it skipped runs out.
     fn start(
         self: &Arc<Self>,
         state: &MemoryState,
@@ -479,17 +499,19 @@ impl Shared {
         building: &mut HashMap<Part, Task<()>>,
         waiting: impl Fn(&Part) -> bool,
         wake: &Sender<Wake>,
-    ) {
+    ) -> Option<i64> {
         let parts = state.tree.fold(VIEW);
         let now_ms = self.timer.now_ms();
+        let mut lapses: Option<i64> = None;
         for part in state.tree.work(&parts) {
             if building.len() >= JOBS {
                 break;
             }
-            if building.contains_key(&part)
-                || waiting(&part)
-                || self.leased_elsewhere(&state.nodes, &part, now_ms)
-            {
+            if building.contains_key(&part) || waiting(&part) {
+                continue;
+            }
+            if let Some(expires) = self.leased_elsewhere(&state.nodes, &part, now_ms) {
+                lapses = Some(lapses.map_or(expires, |first| first.min(expires)));
                 continue;
             }
             let Some(job) = Job::new(state, &parts, part.clone(), summarizer) else {
@@ -505,6 +527,7 @@ impl Shared {
             });
             building.insert(part, task);
         }
+        lapses
     }
 
     fn cool(&self, part: Part, wake: &Sender<Wake>) -> Task<()> {
@@ -515,18 +538,30 @@ impl Shared {
         })
     }
 
-    fn leased_elsewhere(&self, nodes: &[StoredNode], part: &Part, now_ms: i64) -> bool {
-        nodes.iter().any(|node| {
-            node.level == part.level
-                && node.index == part.index
-                && node.text.is_none()
-                && node
-                    .lease_owner
-                    .as_deref()
-                    .is_some_and(|owner| owner != self.owner)
-                && node
-                    .lease_expires_ms
-                    .is_some_and(|expires| expires > now_ms)
+    /// When another runtime's live lease on the node runs out.
+    fn leased_elsewhere(&self, nodes: &[StoredNode], part: &Part, now_ms: i64) -> Option<i64> {
+        nodes
+            .iter()
+            .filter(|node| {
+                node.level == part.level
+                    && node.index == part.index
+                    && node.text.is_none()
+                    && node
+                        .lease_owner
+                        .as_deref()
+                        .is_some_and(|owner| owner != self.owner)
+            })
+            .find_map(|node| node.lease_expires_ms.filter(|&expires| expires > now_ms))
+    }
+
+    /// A wake for when a lease this pump skipped runs out, since a runtime
+    /// that died holding it never says so.
+    fn lapse(&self, expires_ms: i64, wake: &Sender<Wake>) -> Task<()> {
+        let delay = Duration::from_millis((expires_ms - self.timer.now_ms()).max(0) as u64);
+        let (wait, wake) = (self.timer.after(delay), wake.clone());
+        smol::spawn(async move {
+            wait.await;
+            let _ = wake.send(Wake::Lapsed);
         })
     }
 
@@ -707,7 +742,7 @@ fn compress(note: &str) -> String {
 fn merge(first: &str, second: &str) -> String {
     step(
         &format!(
-            "{MERGE}, in at most {NODE} bytes, about {} for each, keeping every note name from both",
+            "{MERGE}, in at most {NODE} bytes, about {} for each",
             NODE / 2
         ),
         &format!("{}\n{}", flat(first), flat(second)),
@@ -723,8 +758,8 @@ fn step(task: &str, material: &str) -> String {
 /// rewrite: asked where it had to end, models copied the cut, mid-word.
 fn feedback(reply: &str) -> String {
     format!(
-        "That line is {} bytes, {} over the limit of {NODE}. Rewrite all of it shorter, keeping \
-         every note name, rather than ending it early. This much of it fits:\n{}{LIMIT_MARK}",
+        "That line is {} bytes, {} over the limit of {NODE}. Rewrite all of it shorter, cutting \
+         the least valuable items rather than ending it early. This much of it fits:\n{}{LIMIT_MARK}",
         reply.len(),
         reply.len() - NODE,
         fitting(reply)
@@ -756,8 +791,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::ops::Range;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicI64, Ordering};
 
-    use caudra_providers::model_registry::{self, Binding};
     use caudra_providers::provider::BoxFuture;
     use caudra_providers::{ModelInfo, ProviderEvent, StopReason, StreamResponse};
     use caudra_storage::memory_journal::EntryOrigin;
@@ -777,7 +812,7 @@ mod tests {
     const CWD: &str = "/work/project";
     const CHAT_SPEC: &str = "openai/gpt-5.6-sol";
     const FAST_SPEC: &str = "openai/gpt-5.6-luna";
-    /// Puts the chat model's fast default out of reach.
+    /// Refuses a binding to the OpenAI Fast model.
     const ONLY_ANTHROPIC: &str = "anthropic/*";
     /// Four leaves, the two merges over them, and the one over those.
     const NOTES: u64 = 4;
@@ -799,10 +834,11 @@ mod tests {
     const WIDE: &str = "é";
     const WIDE_CHARS: usize = 300;
     const OVERLONG_FEEDBACK: &str = "That line is 601 bytes, 89 over the limit of 512. Rewrite all \
-        of it shorter, keeping every note name, rather than ending it early. This much of it fits:\n";
+        of it shorter, cutting the least valuable items rather than ending it early. This much of \
+        it fits:\n";
     const COMPRESS_TASK: &str = "Compress this note into one line, in at most 512 bytes:";
-    const MERGE_TASK: &str = "Merge these two lines into one, in at most 512 bytes, about 256 for \
-        each, keeping every note name from both:";
+    const MERGE_TASK: &str =
+        "Merge these two lines into one, in at most 512 bytes, about 256 for each:";
     const FIRST: &str = "flaky-tests: retry the socket test";
     const SECOND: &str = "release: tag after CI";
     const WORD: &str = "word ";
@@ -819,8 +855,11 @@ mod tests {
     const ONE_CONVERSATION: &str = "every try of a node is one conversation";
     const RETRIED_EARLY: &str = "a passing failure was tried again before its timer fired";
     const LEASE_KEPT: &str = "a failed node kept its lease";
-    const STOOD_IN: &str = "a chat model with no model chosen for memory work got a summarizer";
     const SWITCH_MISSED: &str = "a line after a chat model switch went to the old summarizer";
+    const BINDING_MISSED: &str = "a new Memory binding did not change the summarizer";
+    const DEAD_OWNER: &str = "a-runtime-that-died";
+    const LEASE_IGNORED: &str = "a node another runtime holds was built before its lease ran out";
+    const LEASE_STALLED: &str = "a node whose lease ran out was never built";
 
     /// Answers with its script, then with a fresh line each request, and
     /// keeps every request with the line it answered.
@@ -871,9 +910,10 @@ mod tests {
         }
     }
 
-    /// Time stands still, and a wait ends only when the test fires it.
+    /// Time moves only when the test advances it, and a wait ends only when
+    /// the test fires it.
     struct ManualTimer {
-        now_ms: i64,
+        now_ms: AtomicI64,
         waits: Mutex<Vec<(Duration, Sender<()>)>>,
         started: Sender<Duration>,
     }
@@ -882,11 +922,16 @@ mod tests {
         fn new() -> (Arc<Self>, Receiver<Duration>) {
             let (started, waits) = flume::unbounded();
             let timer = Self {
-                now_ms: now_ms(),
+                now_ms: AtomicI64::new(now_ms()),
                 waits: Mutex::default(),
                 started,
             };
             (Arc::new(timer), waits)
+        }
+
+        fn advance(&self, by: Duration) {
+            self.now_ms
+                .fetch_add(by.as_millis() as i64, Ordering::SeqCst);
         }
 
         /// Ends every wait of `delay` begun so far.
@@ -903,7 +948,7 @@ mod tests {
 
     impl Timer for ManualTimer {
         fn now_ms(&self) -> i64 {
-            self.now_ms
+            self.now_ms.load(Ordering::SeqCst)
         }
 
         fn after(&self, delay: Duration) -> Boxed<()> {
@@ -1301,12 +1346,16 @@ mod tests {
         });
     }
 
-    /// The chat model never stands in: with nothing chosen for memory work,
-    /// or a choice that does not resolve, there is no summarizer to start a
-    /// node with.
-    #[test_case(None ; "nothing_chosen")]
-    #[test_case(Some(FAST_SPEC) ; "choice_not_allowed")]
-    fn without_a_model_for_memory_work_none_is_chosen(bound: Option<&str>) {
+    /// Unbound, the Memory job takes the chat model, as compaction does; a
+    /// binding replaces it, and one the policy refuses pauses summaries.
+    #[test_case(None, &[], Some(CHAT_SPEC) ; "unbound_takes_the_chat_model")]
+    #[test_case(Some(FAST_SPEC), &[], Some(FAST_SPEC) ; "a_binding_replaces_it")]
+    #[test_case(Some(FAST_SPEC), &[ONLY_ANTHROPIC], None ; "a_refused_binding_pauses")]
+    fn the_memory_job_picks_the_summarizer(
+        bound: Option<&str>,
+        allowed: &[&str],
+        expected: Option<&str>,
+    ) {
         smol::block_on(async {
             let state = TempDir::new().unwrap();
             let state = StateDir::from_path(state.path().to_path_buf());
@@ -1320,17 +1369,73 @@ mod tests {
                 let model = Model::from_spec(CHAT_SPEC).unwrap();
                 (Arc::clone(&provider), Arc::new(model))
             });
-            let policy = ModelPolicy::new(&[ONLY_ANTHROPIC.to_owned()], &[]).unwrap();
+            let allowed: Vec<String> = allowed.iter().map(|spec| (*spec).to_owned()).collect();
+            let policy = ModelPolicy::new(&allowed, &[]).unwrap();
             let resolve = resolver(Arc::new(policy), Timeouts::default());
             let mut choice = Choice::default();
 
-            let looked = choice.follow(&chat, &resolve).await;
+            choice.follow(&chat, &resolve).await;
 
             if bound.is_some() {
                 model_registry::clear_binding_and_persist(ModelPurpose::Memory, &state).unwrap();
             }
-            assert!(looked);
-            assert!(choice.summarizer.is_none(), "{STOOD_IN}");
+            let chosen = choice.summarizer.map(|summarizer| summarizer.model.spec());
+            assert_eq!(chosen.as_deref(), expected);
+        });
+    }
+
+    /// A runtime that dies holding a lease never releases it, so a pump that
+    /// skipped the node wakes when the lease runs out and builds it.
+    #[test]
+    fn a_lease_left_by_a_dead_runtime_is_taken_once_it_runs_out() {
+        smol::block_on(async {
+            let fixture = Fixture::new(1);
+            let (timer, waits) = ManualTimer::new();
+            let claimed = fixture
+                .store
+                .journal()
+                .claim(SCOPE, 0, 0, DEAD_OWNER, timer.now_ms(), LEASE_MS)
+                .unwrap();
+            let provider = ScriptedProvider::new([]);
+            let (events_tx, events) = flume::unbounded();
+            let store = Arc::clone(&fixture.store);
+            let _pump = spawn(store, &provider, &timer, events_tx, None);
+            while waits.recv_async().await.unwrap() != LEASE {}
+            assert!(claimed);
+            assert!(provider.calls().is_empty(), "{LEASE_IGNORED}");
+
+            timer.advance(LEASE);
+            timer.fire(LEASE);
+            stored(&events, 1, &[]).await;
+
+            assert_eq!(provider.calls().len(), 1, "{LEASE_STALLED}");
+        });
+    }
+
+    /// Binding the Memory job mid-session changes the summarizer, with the
+    /// chat model left as it was.
+    #[test]
+    fn a_new_binding_is_followed_without_a_chat_switch() {
+        smol::block_on(async {
+            let state = TempDir::new().unwrap();
+            let state = StateDir::from_path(state.path().to_path_buf());
+            let provider: Arc<dyn Provider> = ScriptedProvider::new([]);
+            let chat: ModelResolver = Arc::new(move || {
+                let model = Model::from_spec(CHAT_SPEC).unwrap();
+                (Arc::clone(&provider), Arc::new(model))
+            });
+            let resolve = resolver(Arc::new(ModelPolicy::default()), Timeouts::default());
+            let mut choice = Choice::default();
+            choice.follow(&chat, &resolve).await;
+
+            let binding = Binding::Exact(FAST_SPEC.to_owned());
+            model_registry::set_binding_and_persist(ModelPurpose::Memory, binding, &state).unwrap();
+            let looked = choice.follow(&chat, &resolve).await;
+            model_registry::clear_binding_and_persist(ModelPurpose::Memory, &state).unwrap();
+
+            let chosen = choice.summarizer.map(|summarizer| summarizer.model.spec());
+            assert!(looked, "{BINDING_MISSED}");
+            assert_eq!(chosen.as_deref(), Some(FAST_SPEC), "{BINDING_MISSED}");
         });
     }
 

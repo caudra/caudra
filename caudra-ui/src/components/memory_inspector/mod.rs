@@ -329,7 +329,8 @@ impl MemoryInspector {
     }
 
     /// Takes a fresh read of the journal, keeping the cursor on the node it
-    /// was on. The first read puts it on the newest line of the view.
+    /// was on. The first read puts it on the oldest line of the view, at the
+    /// top.
     pub(crate) fn fill(
         &mut self,
         loaded: Result<MemorySnapshot, String>,
@@ -360,7 +361,7 @@ impl MemoryInspector {
                 .iter()
                 .position(|row| row.part == part)
                 .unwrap_or(self.cursor),
-            None => last,
+            None => 0,
         }
         .min(last);
         self.reveal_cursor = true;
@@ -1750,13 +1751,16 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn the_cursor_starts_on_the_newest_line_of_the_view() {
+    fn the_cursor_starts_on_the_oldest_line_at_the_top() {
         let snapshot = Fixture::notes(ENTRIES).summarized().snapshot();
-        let newest = snapshot.view.last().cloned().unwrap();
+        let oldest = snapshot.view.first().cloned().unwrap();
+        let mut inspector = opened(snapshot);
+        let mut terminal = terminal(WIDE);
 
-        let inspector = opened(snapshot);
+        draw(&mut inspector, &mut terminal);
 
-        assert_eq!(selected_part(&inspector), newest);
+        assert_eq!(selected_part(&inspector), oldest);
+        assert_eq!(inspector.outline_scroll.offset(), 0);
     }
 
     #[test]
@@ -1854,6 +1858,7 @@ pub(super) mod tests {
     #[test]
     fn enter_on_a_leaf_opens_its_note() {
         let mut inspector = opened(Fixture::notes(ENTRIES).summarized().snapshot());
+        let _ = press(&mut inspector, KeyCode::End);
         let leaf = selected_part(&inspector);
         assert_eq!(leaf.level, 0);
 
@@ -2048,6 +2053,7 @@ pub(super) mod tests {
     #[test_case(FORGET_LABEL ; "forget")]
     fn delete_and_forget_take_a_second_press(label: &str) {
         let mut inspector = opened(Fixture::notes(ENTRIES).summarized().snapshot());
+        let _ = press(&mut inspector, KeyCode::End);
         let name = note_name(selected_part(&inspector).index);
         let expected = match label {
             DELETE_LABEL => MemoryAction::Delete(name),
@@ -2087,6 +2093,7 @@ pub(super) mod tests {
             .snapshot();
         let newest = snapshot.view.last().cloned().unwrap();
         let mut inspector = opened(snapshot);
+        let _ = press(&mut inspector, KeyCode::End);
         let mut terminal = terminal(width);
 
         draw(&mut inspector, &mut terminal);

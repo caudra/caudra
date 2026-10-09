@@ -725,6 +725,6 @@ The `memory` tool keeps project notes as Markdown files under the state director
 
 `…/state/caudra/projects/<project-id>/memories/`
 
-That is `~/.local/state/caudra/…` on Linux and macOS and `%APPDATA%\caudra\…` on Windows. A Fast model summarizes the notes in the background for the view in the system prompt. Set [`agent.summarize_memory`](#agent) to `false` to stop that spend. [Memory](/docs/memory/) covers the journal, the view, and the `/memory` inspector.
+That is `~/.local/state/caudra/…` on Linux and macOS and `%APPDATA%\caudra\…` on Windows. The Memory model summarizes the notes in the background for the view in the system prompt. Set [`agent.summarize_memory`](#agent) to `false` to stop that spend. [Memory](/docs/memory/) covers the journal, the view, and the `/memory` inspector.
 
 Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/providers/#providers-toml).

@@ -22,7 +22,7 @@ Bindings are saved globally in the `model.purposes` row of Caudra's SQLite state
 | Title | Fast |
 | Goal | Fast |
 | Extract | Fast |
-| Memory | Fast |
+| Memory | The model currently running the caller |
 | Fast | Provider `fast` config, curated preferred small model, cheapest priced model, fewest-parameter model, then the anchor |
 | Best | Provider `best` config, curated flagship, then the anchor |
 

@@ -23,7 +23,7 @@ Removing a project's `memories/` directory clears its journal at the next turn, 
 
 ## The summary tree
 
-A Fast model builds a binary tree of one-line summaries over the journal, in the background. It first compresses each entry into a line of at most 512 bytes. Then it merges adjacent lines in pairs: two lines become one line covering both, two of those become one covering four, and so on up. An entry or a pair of lines short enough to fit in 512 bytes is kept word for word, with no model call.
+The Memory model builds a binary tree of one-line summaries over the journal, in the background. It first compresses each entry into a line of at most 512 bytes. Then it merges adjacent lines in pairs: two lines become one line covering both, two of those become one covering four, and so on up. An entry or a pair of lines short enough to fit in 512 bytes is kept word for word, with no model call.
 
 Each line has an address, `id+n`, for the `n` entries from entry `id` on. `n` is always a power of two and `id` a multiple of it, so `368+8` covers entries 368 to 375 and was merged from `368+4` and `372+4`.
 
@@ -115,7 +115,7 @@ Subagents get the `memory` tool without the view.
 
 ## Summaries and spend
 
-The summaries come from the Memory model job. It follows Fast unless you bind it to another model in `/model`, as [Model jobs](/docs/providers/#model-jobs) describes. It never falls back to the Chat model. When neither job is bound and the Chat model's provider offers no Fast model of its own, or when the model cannot be loaded, nothing is summarized. The model is chosen again each time you switch the Chat model, and the next line uses it, while a line being written finishes on the model it started with. Switching to a Chat model with no Memory model pauses summaries until you switch to one that has. A new binding applies after your next Chat model switch, or in the next session.
+The summaries come from the Memory model job. Unbound, it uses the same model as compaction, the one running the session, because a summary line stands in for its notes for months. A stronger model costs several times more per line than a Fast one. To spend less, bind Memory to Fast or to an exact model in `/model`, as [Model jobs](/docs/providers/#model-jobs) describes. The model is chosen again each time you switch the Chat model or change a binding in `/model`, and the next line uses it, while a line being written finishes on the model it started with. Other Caudra processes that are already running see a binding change only after they restart. When a Memory binding cannot be resolved or its model cannot be loaded, summaries pause until the next switch or the next session.
 
 Summaries are written while a TUI, SDK, or [ACP](/docs/acp/) session runs, two at a time. A one-shot `--print` run reads the view and writes notes, and leaves the summaries to the next long-running session.
 
