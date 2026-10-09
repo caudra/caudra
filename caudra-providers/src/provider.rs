@@ -20,7 +20,8 @@ use crate::providers::aperture::{self, Aperture};
 use crate::providers::catalog::{
     OPENCODE_FAMILY_SLUGS, available_if_warm, catalog_providers, catalog_providers_if_available,
 };
-use crate::providers::copilot::Copilot;
+use crate::providers::copilot::auth::CopilotIdentity;
+use crate::providers::copilot::{self, Copilot};
 use crate::providers::deepseek::DeepSeek;
 use crate::providers::dynamic;
 use crate::providers::google::Google;
@@ -52,6 +53,7 @@ pub enum ProviderKind {
     OpenAi,
     Google,
     Copilot,
+    CopilotEnterprise,
     Ollama,
     LlamaCpp,
     Mistral,
@@ -76,7 +78,8 @@ impl ProviderKind {
             Self::Anthropic => "Anthropic",
             Self::OpenAi => "OpenAI",
             Self::Google => "Google",
-            Self::Copilot => "Copilot",
+            Self::Copilot => CopilotIdentity::Public.display_name(),
+            Self::CopilotEnterprise => CopilotIdentity::Enterprise.display_name(),
             Self::Ollama => "Ollama",
             Self::LlamaCpp => "LlamaCpp",
             Self::Mistral => "Mistral",
@@ -96,7 +99,8 @@ impl ProviderKind {
             Self::Anthropic => "ANTHROPIC_API_KEY",
             Self::OpenAi => "OPENAI_API_KEY",
             Self::Google => "GEMINI_API_KEY",
-            Self::Copilot => "GH_COPILOT_TOKEN",
+            Self::Copilot => copilot::PUBLIC_TOKEN_ENV,
+            Self::CopilotEnterprise => copilot::ENTERPRISE_TOKEN_ENV,
             Self::Ollama => "OLLAMA_API_KEY",
             Self::LlamaCpp => "LLAMA_CPP_API_KEY",
             Self::Mistral => "MISTRAL_API_KEY",
@@ -119,6 +123,7 @@ impl ProviderKind {
             Self::Copilot => {
                 "https://api.githubcopilot.com (or GraphQL-discovered Copilot API endpoint)"
             }
+            Self::CopilotEnterprise => "https://copilot-api.<enterprise-host>",
             Self::Ollama => "http://localhost:11434/v1",
             Self::LlamaCpp => "http://localhost:8080/v1",
             Self::Mistral => "https://api.mistral.ai/v1",
@@ -140,6 +145,9 @@ impl ProviderKind {
             }
             Self::Google => Some("Native Gemini API with thinking support"),
             Self::Copilot => Some("Native Copilot Chat HTTP API with model endpoint discovery"),
+            Self::CopilotEnterprise => {
+                Some("Native Copilot Chat HTTP API for one GitHub Enterprise host")
+            }
             Self::Ollama => {
                 Some("Local or remote inference via OLLAMA_HOST, cloud fallback via OLLAMA_API_KEY")
             }
@@ -172,7 +180,7 @@ impl ProviderKind {
             Self::Anthropic => ModelFamily::Claude,
             Self::OpenAi => ModelFamily::Gpt,
             Self::Google => ModelFamily::Gemini,
-            Self::Copilot => ModelFamily::Generic,
+            Self::Copilot | Self::CopilotEnterprise => ModelFamily::Generic,
             Self::Ollama => ModelFamily::Generic,
             Self::LlamaCpp => ModelFamily::Generic,
             Self::Mistral => ModelFamily::Generic,
@@ -197,7 +205,7 @@ impl ProviderKind {
             Self::Anthropic => Some(128_000),
             Self::OpenAi => Some(100_000),
             Self::Google => Some(65_536),
-            Self::Copilot => Some(100_000),
+            Self::Copilot | Self::CopilotEnterprise => Some(100_000),
             Self::Ollama => Some(16_384),
             Self::LlamaCpp => None,
             Self::Mistral => None,
@@ -217,7 +225,7 @@ impl ProviderKind {
             Self::Anthropic => 200_000,
             Self::OpenAi => 200_000,
             Self::Google => 1_000_000,
-            Self::Copilot => 200_000,
+            Self::Copilot | Self::CopilotEnterprise => 200_000,
             Self::Ollama => 128_000,
             Self::LlamaCpp => 128_000,
             Self::Mistral => 128_000,
@@ -243,7 +251,11 @@ impl ProviderKind {
             }
             Self::OpenAi => Ok(Box::new(OpenAi::new(timeouts)?)),
             Self::Google => Ok(Box::new(Google::new(timeouts)?)),
-            Self::Copilot => Ok(Box::new(Copilot::new(timeouts)?)),
+            Self::Copilot => Ok(Box::new(Copilot::new(CopilotIdentity::Public, timeouts)?)),
+            Self::CopilotEnterprise => Ok(Box::new(Copilot::new(
+                CopilotIdentity::Enterprise,
+                timeouts,
+            )?)),
             Self::Ollama => Ok(Box::new(LocalEndpoint::new(&OLLAMA, timeouts)?)),
             Self::LlamaCpp => Ok(Box::new(LocalEndpoint::new(&LLAMACPP, timeouts)?)),
             Self::Mistral => Ok(Box::new(Mistral::new(timeouts)?)),

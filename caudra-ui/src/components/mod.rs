@@ -96,6 +96,7 @@ use caudra_agent::{
     ToolOutput,
 };
 use caudra_config::InboundPolicy;
+use caudra_providers::copilot_auth::CopilotIdentity;
 use caudra_providers::model_registry::Binding;
 use caudra_providers::{
     AutomationEventOrigin, CaudraId, HistoryItem, ModelPurpose, PeerMessageOrigin, TaskEventOrigin,
@@ -892,6 +893,7 @@ pub struct LoadedSession {
 pub enum SubscriptionProvider {
     Anthropic,
     OpenAi,
+    Copilot(CopilotIdentity),
 }
 
 impl SubscriptionProvider {
@@ -899,6 +901,7 @@ impl SubscriptionProvider {
         match self {
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
+            Self::Copilot(identity) => identity.slug(),
         }
     }
 
@@ -906,7 +909,14 @@ impl SubscriptionProvider {
         match self {
             Self::Anthropic => "Anthropic",
             Self::OpenAi => "OpenAI",
+            Self::Copilot(identity) => identity.display_name(),
         }
+    }
+
+    /// Copilot signs in with GitHub only: its tokens come from OAuth, and the
+    /// enterprise host is asked for during login rather than in a key form.
+    pub(crate) const fn offers_api_key(self) -> bool {
+        !matches!(self, Self::Copilot(_))
     }
 }
 

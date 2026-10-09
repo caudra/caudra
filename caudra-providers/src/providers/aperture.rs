@@ -181,6 +181,7 @@ fn default_path_prefix(kind: Option<ProviderKind>) -> &'static str {
             | ProviderKind::TensorX
             | ProviderKind::OpenAi
             | ProviderKind::Copilot
+            | ProviderKind::CopilotEnterprise
             | ProviderKind::Opencode
             | ProviderKind::Xai
             | ProviderKind::Aperture,
@@ -633,6 +634,7 @@ mod tests {
     #[test_case("anthropic", Some(ProviderKind::Anthropic) ; "known_anthropic")]
     #[test_case("google", Some(ProviderKind::Google) ; "known_google")]
     #[test_case("copilot", None ; "copilot_excluded")]
+    #[test_case("copilot-enterprise", None ; "copilot_enterprise_excluded")]
     #[test_case("aperture", None ; "aperture_no_recurse")]
     #[test_case("gemini", None ; "gemini_vendor_unparsable_without_override")]
     fn routed_kind_without_overrides(provider_id: &str, expected: Option<ProviderKind>) {

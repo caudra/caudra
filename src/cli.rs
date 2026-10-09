@@ -1327,9 +1327,13 @@ pub enum AuthAction {
     Login {
         /// Provider slug (e.g. zai, openai, xai). Omit for interactive selection.
         provider: Option<String>,
-        /// Authentication method for Anthropic or OpenAI
+        /// Authentication method: oauth or api-key for Anthropic and OpenAI, oauth or import for
+        /// copilot and copilot-enterprise
         #[arg(long, value_enum, requires = "provider")]
         method: Option<AuthMethod>,
+        /// GitHub Enterprise hostname for copilot-enterprise (e.g. company.ghe.com)
+        #[arg(long, requires = "provider")]
+        hostname: Option<String>,
     },
     /// Remove stored credentials for a provider
     Logout {
@@ -1517,6 +1521,8 @@ pub struct SandboxTransferArgs {
 pub enum AuthMethod {
     Oauth,
     ApiKey,
+    /// Copy a token from the gh CLI, the Copilot client, or the system keyring
+    Import,
 }
 
 /// MCP names arrive already qualified (`server.tool`, `server.*`) and are
@@ -2441,9 +2447,44 @@ mod tests {
                 action: AuthAction::Login {
                     provider: Some(provider),
                     method: Some(AuthMethod::ApiKey),
+                    hostname: None,
                 }
             }) if provider == "openai"
         ));
+    }
+
+    #[test]
+    fn copilot_enterprise_hostname_parses() {
+        let cli = Cli::try_parse_from([
+            "caudra",
+            "auth",
+            "login",
+            "copilot-enterprise",
+            "--method",
+            "import",
+            "--hostname",
+            "company.ghe.com",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(Command::Auth {
+                action: AuthAction::Login {
+                    method: Some(AuthMethod::Import),
+                    hostname: Some(hostname),
+                    ..
+                }
+            }) if hostname == "company.ghe.com"
+        ));
+    }
+
+    #[test]
+    fn hostname_requires_provider() {
+        assert!(
+            Cli::try_parse_from(["caudra", "auth", "login", "--hostname", "company.ghe.com"])
+                .is_err()
+        );
     }
 
     #[test]

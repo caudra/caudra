@@ -9,6 +9,7 @@ use caudra_config::providers::{
 };
 use caudra_grab::grab_scope;
 use caudra_providers::catalog_providers_if_available;
+use caudra_providers::copilot_auth::{self, CopilotIdentity};
 use caudra_storage::StateDir;
 use caudra_storage::auth::{
     ProviderAuthKind, ProviderCredentials, save_provider_credentials, try_load_provider_auth,
@@ -59,7 +60,11 @@ impl PickerItem for ProviderItem {
         if self.stored_auth == Some(ProviderAuthKind::OAuth) {
             Some("oauth")
         } else if self.stored_auth == Some(ProviderAuthKind::ApiKey) {
-            Some("saved key")
+            Some(if CopilotIdentity::from_slug(&self.slug).is_some() {
+                "saved token"
+            } else {
+                "saved key"
+            })
         } else if self.has_env {
             Some("env")
         } else if self.configured {
@@ -232,7 +237,10 @@ impl LoginPicker {
                     .ok()
                     .flatten()
                     .map(|auth| auth.kind());
-                let has_env = std::env::var(b.default_api_key_env).is_ok();
+                let has_env = match CopilotIdentity::from_slug(b.slug) {
+                    Some(identity) => copilot_auth::env_override(identity).is_some(),
+                    None => std::env::var(b.default_api_key_env).is_ok(),
+                };
                 let configured = stored_auth.is_none()
                     && !has_env
                     && config.get(b.slug).is_some_and(|d| d.base_url.is_some());
@@ -604,7 +612,11 @@ impl LoginPicker {
                 } else if item.slug == "custom" {
                     StepAction::GoCustomName
                 } else if let Some(provider) = subscription_provider(&item.slug) {
-                    StepAction::GoPickAuthMethod { provider }
+                    if provider.offers_api_key() {
+                        StepAction::GoPickAuthMethod { provider }
+                    } else {
+                        StepAction::GoOauth { provider }
+                    }
                 } else {
                     let slug = item.slug.clone();
                     let config = providers::ProvidersConfig::load();
@@ -741,6 +753,7 @@ impl LoginPicker {
                         detail: match provider {
                             SubscriptionProvider::Anthropic => "Claude subscription",
                             SubscriptionProvider::OpenAi => "ChatGPT/Codex subscription",
+                            SubscriptionProvider::Copilot(_) => "GitHub Copilot subscription",
                         },
                     },
                     AuthMethodItem {
@@ -984,7 +997,7 @@ fn subscription_provider(slug: &str) -> Option<SubscriptionProvider> {
     match slug {
         "anthropic" => Some(SubscriptionProvider::Anthropic),
         "openai" => Some(SubscriptionProvider::OpenAi),
-        _ => None,
+        _ => CopilotIdentity::from_slug(slug).map(SubscriptionProvider::Copilot),
     }
 }
 
@@ -1126,6 +1139,50 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test_case(CopilotIdentity::Public ; "public")]
+    #[test_case(CopilotIdentity::Enterprise ; "enterprise")]
+    fn copilot_goes_straight_to_github_sign_in(identity: CopilotIdentity) {
+        let mut provider_picker = ListPicker::new();
+        provider_picker.open(
+            vec![ProviderItem {
+                slug: identity.slug().into(),
+                display_name: identity.display_name().into(),
+                stored_auth: None,
+                has_env: false,
+                configured: false,
+                section: None,
+            }],
+            TITLE,
+        );
+        let mut picker = LoginPicker::new();
+        picker.step = Step::PickProvider(provider_picker);
+
+        let action = picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            action,
+            LoginPickerAction::AuthenticateProvider {
+                provider: SubscriptionProvider::Copilot(selected),
+                model_spec,
+            } if selected == identity && model_spec.starts_with(&format!("{}/", identity.slug()))
+        ));
+    }
+
+    #[test_case(CopilotIdentity::Public.slug(), "saved token" ; "copilot_token")]
+    #[test_case(CopilotIdentity::Enterprise.slug(), "saved token" ; "enterprise_token")]
+    #[test_case("zai", "saved key" ; "api_key")]
+    fn stored_credentials_are_labelled_by_kind(slug: &str, expected: &str) {
+        let item = ProviderItem {
+            slug: slug.into(),
+            display_name: slug.into(),
+            stored_auth: Some(ProviderAuthKind::ApiKey),
+            has_env: false,
+            configured: false,
+            section: None,
+        };
+        assert_eq!(item.detail(), Some(expected));
     }
 
     #[test]

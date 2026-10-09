@@ -410,7 +410,7 @@ A remote selector is required. `remote` is available when `experimental.sandboxe
 ### `caudra auth`
 
 ```bash
-caudra auth login [provider] [--method oauth|api-key]
+caudra auth login [provider] [--method oauth|api-key|import] [--hostname HOST]
 caudra auth logout <provider>
 caudra auth status
 caudra auth workcell set <NAME> [--stdin]
@@ -424,9 +424,11 @@ caudra auth sandbox delete <NAME>
 
 `login` stores credentials under the state directory and can write plan or base URL choices into `providers.toml` (see [Configuration](/docs/configuration/#directory-layout) for the platform path). The picker asks for subscription OAuth or an API key when you choose Anthropic or OpenAI. Named Anthropic and OpenAI logins default to OAuth. Pass `--method api-key` to store a key instead.
 
-Anthropic OAuth is experimental. The command explains the Anthropic terms limitation before opening the browser. OpenAI uses a device authorization flow. xAI and Copilot retain their dedicated named login flows. Other providers prompt for an API key and a plan when more than one plan exists. The interactive picker can also create custom providers.
+Anthropic OAuth is experimental. The command explains the Anthropic terms limitation before opening the browser. OpenAI uses a device authorization flow. xAI retains its dedicated named login flow. Other providers prompt for an API key and a plan when more than one plan exists. The interactive picker can also create custom providers.
 
-The TUI `/login` command offers the same method choice for Anthropic and OpenAI. `status` distinguishes saved OAuth, saved API keys, environment credentials, configured endpoints, and missing credentials.
+`copilot` and `copilot-enterprise` sign in with GitHub through a device code. Pass `--method import` to copy a token from the gh CLI, the Copilot editor plugin, or the system keyring instead. `copilot-enterprise` also needs the GitHub Enterprise host. Pass it with `--hostname company.ghe.com`, or answer the prompt. Without a terminal and without `--hostname`, the command stops with an error. The two providers keep separate credentials, so logging out of one leaves the other signed in. See [Copilot Enterprise](/docs/providers/#copilot-enterprise).
+
+The TUI `/login` command offers the same method choice for Anthropic and OpenAI, and starts the GitHub sign-in directly for both Copilot providers. `status` distinguishes saved OAuth, saved API keys, saved Copilot tokens with their enterprise host, environment credentials, configured endpoints, and missing credentials.
 
 `auth workcell set` reads a bearer token from a hidden terminal prompt, or from stdin with `--stdin`. It stores or replaces a named credential, referenced as `credential:NAME`. `list` shows names and update times without bearer values. Credentials are stored in owner-only local files, without OS-keyring encryption. They are separate from provider login and MCP OAuth credentials. `auth workcell` needs `experimental.remote_workcell`.
 

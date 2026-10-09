@@ -32,6 +32,7 @@ getrandom = { workspace = true }
 open = { workspace = true }
 keyring = { workspace = true }
 tiktoken-rs = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }

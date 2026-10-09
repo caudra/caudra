@@ -388,8 +388,12 @@ pub fn dispatch(mut cli: Cli, startup: Result<Startup, ConfigFileError>) -> Resu
             let storage = StateDir::resolve().context("resolve data directory")?;
             match action {
                 AuthAction::Sandbox { action } => sandbox::auth(action, &storage)?,
-                AuthAction::Login { provider, method } => {
-                    subcmd::auth_login(provider.as_deref(), method, &storage)?
+                AuthAction::Login {
+                    provider,
+                    method,
+                    hostname,
+                } => {
+                    subcmd::auth_login(provider.as_deref(), method, hostname.as_deref(), &storage)?
                 }
                 AuthAction::Logout { provider } => subcmd::auth_logout(&provider, &storage)?,
                 AuthAction::Status => subcmd::auth_status(&storage)?,

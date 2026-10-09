@@ -118,8 +118,8 @@ const GOOGLE: ProviderManifest = ProviderManifest {
 };
 
 const COPILOT: ProviderManifest = ProviderManifest {
-    slug: "copilot",
-    display_name: "Copilot",
+    slug: copilot::PUBLIC_SLUG,
+    display_name: copilot::PUBLIC_DISPLAY_NAME,
     family: ModelFamily::Generic,
     supports_thinking: false,
     accepts_arbitrary_models: true,
@@ -130,6 +130,14 @@ const COPILOT: ProviderManifest = ProviderManifest {
     serves_fast_mode: false,
     pricing_schedule: None,
     catalog_slug: Some("github-copilot"),
+};
+
+/// Shares Copilot's model table under its own slug, so discovered metadata
+/// for one account never lands on the other.
+const COPILOT_ENTERPRISE: ProviderManifest = ProviderManifest {
+    slug: copilot::ENTERPRISE_SLUG,
+    display_name: copilot::ENTERPRISE_DISPLAY_NAME,
+    ..COPILOT
 };
 
 const OLLAMA: ProviderManifest = ProviderManifest {
@@ -317,6 +325,7 @@ const BUILTINS: &[ProviderManifest] = &[
     OPENAI,
     GOOGLE,
     COPILOT,
+    COPILOT_ENTERPRISE,
     OLLAMA,
     LLAMA_CPP,
     MISTRAL,

@@ -102,7 +102,9 @@ use crate::components::session_picker::{SessionActivity, SessionRow};
 use crate::components::storage_modal::{StorageFetchState, StorageReport};
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::worktree_picker::{WorktreeOverview, WorktreeView};
-use crate::components::{Action, ExitRequest, ForkDraft, ForkedSession, PlanHandoff, Status};
+use crate::components::{
+    Action, ExitRequest, ForkDraft, ForkedSession, PlanHandoff, Status, SubscriptionProvider,
+};
 use crate::herdr::{
     HerdrObservation, HerdrReporterHandle, HerdrResume, HerdrStatus, aggregate_observations,
 };
@@ -152,15 +154,20 @@ const WORKTREE_REPOSITORY_ERR: &str =
 const SESSION_OPEN_ELSEWHERE: &str =
     "Another Caudra has that session open, so only its workspace was focused";
 const NO_CHANGE_STORES: &str = "The file change record stores could not be opened";
-const ANTHROPIC_LOGIN_ARGS: [&str; 5] = ["auth", "login", "anthropic", "--method", "oauth"];
+const AUTH_LOGIN_ARGS: [&str; 2] = ["auth", "login"];
+const OAUTH_METHOD_ARGS: [&str; 2] = ["--method", "oauth"];
 const AUTH_EXECUTABLE_ERR: &str = "could not locate the Caudra executable for login";
 const AUTH_PROCESS_ERR: &str = "could not run the OAuth login process";
 const AUTH_EXIT_ERR: &str = "OAuth login process failed";
 
-fn anthropic_login_command() -> Result<Command> {
+/// Runs the CLI login in a child so its prompts and stdin readers end with it
+/// instead of competing with the TUI for input.
+fn oauth_login_command(provider: SubscriptionProvider) -> Result<Command> {
     let mut command = Command::new(env::current_exe().wrap_err(AUTH_EXECUTABLE_ERR)?);
     command
-        .args(ANTHROPIC_LOGIN_ARGS)
+        .args(AUTH_LOGIN_ARGS)
+        .arg(provider.slug())
+        .args(OAUTH_METHOD_ARGS)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -4427,11 +4434,11 @@ impl<'t> EventLoop<'t> {
                     }
                 };
                 let result = terminal::with_normal_terminal(self.terminal, || match provider {
-                    crate::components::SubscriptionProvider::Anthropic => {
-                        anthropic_login_command().and_then(run_oauth_login)
-                    }
-                    crate::components::SubscriptionProvider::OpenAi => {
+                    SubscriptionProvider::OpenAi => {
                         caudra_providers::openai_auth::login(&storage).map_err(Into::into)
+                    }
+                    SubscriptionProvider::Anthropic | SubscriptionProvider::Copilot(_) => {
+                        oauth_login_command(provider).and_then(run_oauth_login)
                     }
                 });
                 drop(pause);
@@ -4442,16 +4449,16 @@ impl<'t> EventLoop<'t> {
 
                 match result {
                     Ok(()) => {
-                        if let Err(error) =
-                            self.change_model_with(&model_spec, App::select_setup_model)
-                        {
-                            self.sessions[idx].app.flash(error);
-                        }
+                        let activated =
+                            self.change_model_with(&model_spec, App::select_setup_model);
                         self.refresh_models();
-                        self.sessions[idx].app.flash(format!(
-                            "Authenticated with {} subscription",
-                            provider.display_name()
-                        ));
+                        self.sessions[idx].app.flash(match activated {
+                            Ok(()) => format!(
+                                "Authenticated with {} subscription",
+                                provider.display_name()
+                            ),
+                            Err(error) => error,
+                        });
                     }
                     Err(error) => self.sessions[idx].app.flash(format!(
                         "{} login failed: {error:#}",
@@ -4963,6 +4970,7 @@ mod tests {
     use caudra_config::providers::{Protocol, ProviderDef};
     use caudra_config::sandbox::Revision;
     use caudra_config::{FeatureFlags, PermissionsConfig, ToolKey};
+    use caudra_providers::copilot_auth::CopilotIdentity;
     use caudra_providers::provider::BoxFuture;
     use caudra_providers::{
         AgentError, CacheKey, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
@@ -5021,13 +5029,18 @@ mod tests {
         assert!(!should_open_startup_login(false, &providers));
     }
 
-    #[test]
-    fn anthropic_login_uses_current_executable_and_explicit_oauth() {
-        let command = anthropic_login_command().unwrap();
+    #[test_case(SubscriptionProvider::Anthropic, "anthropic" ; "anthropic")]
+    #[test_case(SubscriptionProvider::Copilot(CopilotIdentity::Public), "copilot" ; "copilot")]
+    #[test_case(SubscriptionProvider::Copilot(CopilotIdentity::Enterprise), "copilot-enterprise" ; "copilot_enterprise")]
+    fn login_child_uses_current_executable_and_explicit_oauth(
+        provider: SubscriptionProvider,
+        slug: &str,
+    ) {
+        let command = oauth_login_command(provider).unwrap();
         assert_eq!(command.get_program(), env::current_exe().unwrap());
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
-            ["auth", "login", "anthropic", "--method", "oauth"]
+            ["auth", "login", slug, "--method", "oauth"]
         );
         assert_eq!(command.get_envs().count(), 0);
         assert!(command.get_current_dir().is_none());

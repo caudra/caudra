@@ -1,6 +1,6 @@
 use std::env;
 use std::fmt::Write as _;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -31,6 +31,7 @@ use caudra_config::{
     AgentConfig, Config, DefaultEffect, ModelPolicy, PermissionsConfig, ProfileToolPolicy,
     ProfileToolSource, ToolKey,
 };
+use caudra_providers::copilot_auth::{CopilotAccount, CopilotIdentity, EnterpriseHost};
 use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::{fetch_all_models, seed_setup_thinking};
 use caudra_providers::{
@@ -59,6 +60,13 @@ const AUTH_STATUS_EMPTY: &str = "       ";
 const AUTH_STATUS_ENV: &str = "\x1b[33m~ env  \x1b[0m";
 const AUTH_STATUS_KEY: &str = "\x1b[32m✓ key  \x1b[0m";
 const AUTH_STATUS_OAUTH: &str = "\x1b[32m✓ oauth\x1b[0m";
+const AUTH_STATUS_TOKEN: &str = "\x1b[32m✓ token\x1b[0m";
+const METHOD_SCOPE_ERR: &str = "--method is supported only for Anthropic, OpenAI, and Copilot";
+const COPILOT_METHOD_ERR: &str = "Copilot supports --method oauth or --method import";
+const HOSTNAME_SCOPE_ERR: &str = "--hostname is supported only for copilot-enterprise";
+const ENTERPRISE_HOST_PROMPT: &str = "  GitHub Enterprise hostname (e.g. company.ghe.com): ";
+const ENTERPRISE_HOST_REQUIRED: &str =
+    "copilot-enterprise needs a hostname; pass --hostname company.ghe.com";
 const PROVIDER_SLUG_WIDTH: usize = 14;
 const MODEL_COLUMN_GAP: &str = "  ";
 const MODEL_JOB_HEADING: &str = "Job";
@@ -77,17 +85,19 @@ enum LoginRoute {
     AnthropicOauth,
     OpenAiOauth,
     XaiOauth,
-    Copilot,
+    CopilotOauth(CopilotIdentity),
+    CopilotImport(CopilotIdentity),
     ApiKey,
 }
 
 pub fn auth_login(
     provider: Option<&str>,
     method: Option<AuthMethod>,
+    hostname: Option<&str>,
     storage: &StateDir,
 ) -> Result<()> {
     match provider {
-        Some(provider) => login_slug(&slugify(provider), method, storage)?,
+        Some(provider) => login_slug(&slugify(provider), method, hostname, storage)?,
         None => login_interactive(storage)?,
     }
     Ok(())
@@ -147,18 +157,40 @@ pub fn workcell_credential_delete(name: &WorkcellCredentialName, storage: &State
     Ok(())
 }
 
-fn login_slug(slug: &str, method: Option<AuthMethod>, storage: &StateDir) -> Result<()> {
-    match login_route(slug, method)? {
+fn login_slug(
+    slug: &str,
+    method: Option<AuthMethod>,
+    hostname: Option<&str>,
+    storage: &StateDir,
+) -> Result<()> {
+    let route = login_route(slug, method, hostname.is_some())?;
+    match route {
         LoginRoute::AnthropicOauth => anthropic_auth::login(storage)?,
         LoginRoute::OpenAiOauth => openai_auth::login(storage)?,
         LoginRoute::XaiOauth => xai_auth::login(storage)?,
-        LoginRoute::Copilot => copilot_auth::login(storage)?,
+        LoginRoute::CopilotOauth(identity) => {
+            copilot_auth::login(storage, &copilot_account(identity, hostname)?)?
+        }
+        LoginRoute::CopilotImport(identity) => {
+            copilot_auth::import(storage, &copilot_account(identity, hostname)?)?
+        }
         LoginRoute::ApiKey => login_api_key_slug(slug, storage)?,
     }
     Ok(())
 }
 
-fn login_route(slug: &str, method: Option<AuthMethod>) -> Result<LoginRoute> {
+fn login_route(slug: &str, method: Option<AuthMethod>, has_hostname: bool) -> Result<LoginRoute> {
+    let copilot = CopilotIdentity::from_slug(slug);
+    if has_hostname && copilot != Some(CopilotIdentity::Enterprise) {
+        bail!(HOSTNAME_SCOPE_ERR);
+    }
+    if let Some(identity) = copilot {
+        return match method {
+            None | Some(AuthMethod::Oauth) => Ok(LoginRoute::CopilotOauth(identity)),
+            Some(AuthMethod::Import) => Ok(LoginRoute::CopilotImport(identity)),
+            Some(AuthMethod::ApiKey) => Err(eyre!(COPILOT_METHOD_ERR)),
+        };
+    }
     match (slug, method) {
         ("anthropic", Some(AuthMethod::ApiKey)) | ("openai", Some(AuthMethod::ApiKey)) => {
             Ok(LoginRoute::ApiKey)
@@ -166,11 +198,38 @@ fn login_route(slug: &str, method: Option<AuthMethod>) -> Result<LoginRoute> {
         ("anthropic", None | Some(AuthMethod::Oauth)) => Ok(LoginRoute::AnthropicOauth),
         ("openai", None | Some(AuthMethod::Oauth)) => Ok(LoginRoute::OpenAiOauth),
         ("xai", None) => Ok(LoginRoute::XaiOauth),
-        ("copilot", None) => Ok(LoginRoute::Copilot),
-        (_, Some(_)) => {
-            bail!("--method is supported only for Anthropic and OpenAI");
-        }
+        (_, Some(_)) => Err(eyre!(METHOD_SCOPE_ERR)),
         _ => Ok(LoginRoute::ApiKey),
+    }
+}
+
+fn copilot_account(identity: CopilotIdentity, hostname: Option<&str>) -> Result<CopilotAccount> {
+    Ok(match (identity, hostname) {
+        (CopilotIdentity::Public, _) => CopilotAccount::Public,
+        (CopilotIdentity::Enterprise, Some(hostname)) => {
+            CopilotAccount::Enterprise(EnterpriseHost::parse(hostname)?)
+        }
+        (CopilotIdentity::Enterprise, None) => {
+            CopilotAccount::Enterprise(prompt_enterprise_host()?)
+        }
+    })
+}
+
+fn prompt_enterprise_host() -> Result<EnterpriseHost> {
+    if !io::stdin().is_terminal() {
+        bail!(ENTERPRISE_HOST_REQUIRED);
+    }
+    print!("{ENTERPRISE_HOST_PROMPT}");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(EnterpriseHost::parse(&input)?)
+}
+
+fn env_credential(slug: &str, default_env: &'static str) -> Option<&'static str> {
+    match CopilotIdentity::from_slug(slug) {
+        Some(identity) => copilot_auth::env_override(identity),
+        None => env::var(default_env).is_ok().then_some(default_env),
     }
 }
 
@@ -322,8 +381,11 @@ fn login_interactive(storage: &StateDir) -> Result<()> {
     for (i, b) in builtins.iter().enumerate() {
         let status = match try_load_provider_auth(storage, b.slug) {
             Ok(Some(ProviderAuth::OAuth(_))) => AUTH_STATUS_OAUTH,
+            Ok(Some(ProviderAuth::ApiKey(_))) if CopilotIdentity::from_slug(b.slug).is_some() => {
+                AUTH_STATUS_TOKEN
+            }
             Ok(Some(ProviderAuth::ApiKey(_))) => AUTH_STATUS_KEY,
-            _ if env::var(b.default_api_key_env).is_ok() => AUTH_STATUS_ENV,
+            _ if env_credential(b.slug, b.default_api_key_env).is_some() => AUTH_STATUS_ENV,
             _ => AUTH_STATUS_EMPTY,
         };
         let number = i + 1;
@@ -381,7 +443,7 @@ fn login_interactive(storage: &StateDir) -> Result<()> {
             ))?),
             _ => None,
         };
-        login_slug(slug, method, storage)?;
+        login_slug(slug, method, None, storage)?;
     } else if choice <= builtins.len() + custom_slugs.len() {
         let slug = custom_slugs[choice - builtins.len() - 1];
         login_provider(slug, storage)?;
@@ -587,11 +649,14 @@ fn prompt_api_key(url: Option<&str>, display_name: &str, optional: bool) -> Resu
 
 pub fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
     let slug = slugify(provider);
+    if let Some(identity) = CopilotIdentity::from_slug(&slug) {
+        copilot_auth::logout(storage, identity)?;
+        return Ok(());
+    }
     match slug.as_str() {
         "anthropic" => anthropic_auth::logout(storage)?,
         "openai" => openai_auth::logout(storage)?,
         "xai" => xai_auth::logout(storage)?,
-        "copilot" => copilot_auth::logout(storage)?,
         _ => {
             let mut config = ProvidersConfig::load();
             let deleted =
@@ -624,21 +689,21 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
         if matches!(&auth, Some(ProviderAuth::OAuth(_))) {
             println!("  \x1b[32m✓\x1b[0m {:<14} {} (oauth)", b.slug, display);
         } else if let Some(ProviderAuth::ApiKey(creds)) = &auth {
-            let plan_info = def
-                .and_then(|d| d.plan.as_deref())
-                .map(|p| format!(" ({p})"))
-                .unwrap_or_default();
+            let (label, detail) = match CopilotIdentity::from_slug(b.slug) {
+                Some(_) => ("token", creds.host.as_deref()),
+                None => ("key", def.and_then(|d| d.plan.as_deref())),
+            };
+            let detail = detail.map(|d| format!(" ({d})")).unwrap_or_default();
             println!(
-                "  \x1b[32m✓\x1b[0m {:<14} {} (key: {}){}",
+                "  \x1b[32m✓\x1b[0m {:<14} {} ({label}: {}){detail}",
                 b.slug,
                 display,
                 creds.masked_api_key(),
-                plan_info
             );
-        } else if env::var(b.default_api_key_env).is_ok() {
+        } else if let Some(env_var) = env_credential(b.slug, b.default_api_key_env) {
             println!(
-                "  \x1b[33m~\x1b[0m {:<14} {} (via {})",
-                b.slug, display, b.default_api_key_env
+                "  \x1b[33m~\x1b[0m {:<14} {} (via {env_var})",
+                b.slug, display
             );
         } else if def.is_some_and(|d| d.base_url.is_some()) {
             println!("  \x1b[34m●\x1b[0m {:<14} {} (configured)", b.slug, display);
@@ -1782,15 +1847,42 @@ mod auth_tests {
     #[test_case("openai", Some(AuthMethod::ApiKey), LoginRoute::ApiKey ; "openai_api_key")]
     #[test_case("anthropic", Some(AuthMethod::ApiKey), LoginRoute::ApiKey ; "anthropic_api_key")]
     #[test_case("xAI", None, LoginRoute::XaiOauth ; "normalized_xai")]
-    #[test_case("Copilot", None, LoginRoute::Copilot ; "normalized_copilot")]
+    #[test_case("Copilot", None, LoginRoute::CopilotOauth(CopilotIdentity::Public) ; "normalized_copilot_defaults_to_oauth")]
+    #[test_case("copilot", Some(AuthMethod::Import), LoginRoute::CopilotImport(CopilotIdentity::Public) ; "copilot_import")]
+    #[test_case("Copilot Enterprise", None, LoginRoute::CopilotOauth(CopilotIdentity::Enterprise) ; "normalized_enterprise_defaults_to_oauth")]
+    #[test_case("copilot-enterprise", Some(AuthMethod::Oauth), LoginRoute::CopilotOauth(CopilotIdentity::Enterprise) ; "enterprise_oauth")]
+    #[test_case("copilot-enterprise", Some(AuthMethod::Import), LoginRoute::CopilotImport(CopilotIdentity::Enterprise) ; "enterprise_import")]
     #[test_case("google", None, LoginRoute::ApiKey ; "ordinary_provider")]
     fn provider_login_routes(raw: &str, method: Option<AuthMethod>, expected: LoginRoute) {
-        assert_eq!(login_route(&slugify(raw), method).unwrap(), expected);
+        assert_eq!(login_route(&slugify(raw), method, false).unwrap(), expected);
+    }
+
+    #[test_case("google", Some(AuthMethod::Oauth), false, METHOD_SCOPE_ERR ; "oauth_on_non_subscription_provider")]
+    #[test_case("anthropic", Some(AuthMethod::Import), false, METHOD_SCOPE_ERR ; "import_on_anthropic")]
+    #[test_case("copilot", Some(AuthMethod::ApiKey), false, COPILOT_METHOD_ERR ; "api_key_on_copilot")]
+    #[test_case("copilot", None, true, HOSTNAME_SCOPE_ERR ; "hostname_on_public_copilot")]
+    #[test_case("openai", None, true, HOSTNAME_SCOPE_ERR ; "hostname_on_openai")]
+    fn invalid_login_options_are_rejected(
+        slug: &str,
+        method: Option<AuthMethod>,
+        has_hostname: bool,
+        expected: &str,
+    ) {
+        let error = login_route(slug, method, has_hostname).unwrap_err();
+        assert_eq!(error.to_string(), expected);
     }
 
     #[test]
-    fn oauth_method_rejects_non_subscription_provider() {
-        assert!(login_route("google", Some(AuthMethod::Oauth)).is_err());
+    fn enterprise_hostname_is_validated() {
+        let account = copilot_account(
+            CopilotIdentity::Enterprise,
+            Some("https://Company.ghe.com/"),
+        )
+        .unwrap();
+        assert_eq!(account.host(), "company.ghe.com");
+        assert!(
+            copilot_account(CopilotIdentity::Enterprise, Some("http://company.ghe.com")).is_err()
+        );
     }
 
     #[test]

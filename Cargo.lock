@@ -1249,6 +1249,7 @@ dependencies = [
  "tiktoken-rs",
  "toml 1.1.5+spec-1.1.0",
  "tracing",
+ "url",
  "wait-timeout",
 ]
 

@@ -33,6 +33,7 @@ const PROVIDER_PRIORITY: &[&str] = &[
     "openai",
     "xai",
     "copilot",
+    "copilot-enterprise",
     "zai",
     "synthetic",
     "deepseek",

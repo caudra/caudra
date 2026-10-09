@@ -78,7 +78,7 @@ base_url = "http://xxxx:1234/v1"
 
 The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those.
 
-Ollama reads `OLLAMA_HOST` and llama.cpp reads `LLAMA_CPP_HOST`. Neither reads `<SLUG>_BASE_URL`. A `base_url` in `providers.toml` wins over the host variable, and Caudra appends `/v1` to either, so leave it off. Aperture reads `APERTURE_HOST`, which wins over the file. Copilot asks GitHub for the API endpoint of your account and ignores both settings.
+Ollama reads `OLLAMA_HOST` and llama.cpp reads `LLAMA_CPP_HOST`. Neither reads `<SLUG>_BASE_URL`. A `base_url` in `providers.toml` wins over the host variable, and Caudra appends `/v1` to either, so leave it off. Aperture reads `APERTURE_HOST`, which wins over the file. Copilot asks GitHub for the API endpoint of your account, Copilot Enterprise derives it from the host you signed in with, and both ignore these settings.
 
 ## Built-in Providers
 
@@ -179,7 +179,7 @@ Routing defaults: gemini-2.0-flash-lite (Fast), gemini-2.5-pro (Best)
 
 ### Copilot
 
-- **Env var**: `GH_COPILOT_TOKEN` (or run `caudra auth login copilot` to import a token from gh CLI, the Copilot client, or the system keyring)
+- **Env var**: `GH_COPILOT_TOKEN` or `COPILOT_GITHUB_TOKEN` (or run `caudra auth login copilot` to sign in with GitHub)
 - **API**: `https://api.githubcopilot.com (or GraphQL-discovered Copilot API endpoint)`
 - **Features**: Native Copilot Chat HTTP API with model endpoint discovery
 
@@ -215,6 +215,22 @@ Routing defaults: gemini-2.0-flash-lite (Fast), gemini-2.5-pro (Best)
 |  | grok-4.6 | $2.00 / $6.00 | 200K ctx / 100K out |
 
 Routing defaults: gpt-5.6-luna (Fast), claude-opus-5 (Best)
+
+Run `caudra auth login copilot` to sign in with GitHub. Caudra prints a URL and a one-time code, opens the browser when it can, and waits until you approve the code on GitHub. The login uses the same public GitHub OAuth app as OpenCode and asks only for the `read:user` scope. GitHub issues a token that does not expire, so there is no refresh. When GitHub revokes it, run the login again.
+
+To reuse a token from the gh CLI, the Copilot editor plugin, or the system keyring instead, add `--method import`. Caudra stores the token in its state directory and labels it `token` in `caudra auth status`. `GH_COPILOT_TOKEN` or `COPILOT_GITHUB_TOKEN` wins over the saved token.
+
+### Copilot Enterprise
+
+- **Env var**: `GH_COPILOT_ENTERPRISE_TOKEN` with `GH_COPILOT_ENTERPRISE_HOST` (or run `caudra auth login copilot-enterprise` to sign in with GitHub)
+- **API**: `https://copilot-api.<enterprise-host>`
+- **Features**: Native Copilot Chat HTTP API for one GitHub Enterprise host
+
+Copilot Enterprise is a separate provider, so a GitHub Enterprise account and a personal account can stay signed in together. Run `caudra auth login copilot-enterprise --hostname company.ghe.com`, or leave out `--hostname` and Caudra asks for it. The login runs against that host and saves the token together with the host. `--method import` reads gh CLI and Copilot plugin tokens for that host only.
+
+Caudra sends requests to `https://copilot-api.<host>` and never falls back to public GitHub. This follows the endpoint scheme OpenCode uses for GitHub Enterprise Cloud with data residency. Other deployments may not serve Copilot there. For CI, set `GH_COPILOT_ENTERPRISE_TOKEN` and `GH_COPILOT_ENTERPRISE_HOST` together. The token variable alone is an error, never a public GitHub token.
+
+The models are the ones Copilot lists above, under `copilot-enterprise/`, such as `copilot-enterprise/gpt-5.6-terra`. Your organization's policy decides which of them your account can use.
 
 ### Ollama
 
@@ -563,7 +579,7 @@ To add a custom provider or proxy, drop an executable script into the config `pr
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `synthetic`, `tensorx`, `opencode`, `xai`, `aperture`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `copilot-enterprise`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `synthetic`, `tensorx`, `opencode`, `xai`, `aperture`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 

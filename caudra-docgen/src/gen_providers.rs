@@ -3,6 +3,7 @@ use std::fmt::Write;
 use caudra_config::example;
 use caudra_config::files;
 use caudra_config::providers::BUILTIN_IGNORED_FIELDS;
+use caudra_providers::copilot_auth::ENTERPRISE_HOST_ENV;
 use caudra_providers::manifest::{ManifestRegistry, ProviderManifest};
 use caudra_providers::model::ModelEntry;
 use caudra_providers::provider::ProviderKind;
@@ -85,7 +86,7 @@ base_url = "http://xxxx:1234/v1"
 
 The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those.
 
-Ollama reads `OLLAMA_HOST` and llama.cpp reads `LLAMA_CPP_HOST`. Neither reads `<SLUG>_BASE_URL`. A `base_url` in `providers.toml` wins over the host variable, and Caudra appends `/v1` to either, so leave it off. Aperture reads `APERTURE_HOST`, which wins over the file. Copilot asks GitHub for the API endpoint of your account and ignores both settings."#;
+Ollama reads `OLLAMA_HOST` and llama.cpp reads `LLAMA_CPP_HOST`. Neither reads `<SLUG>_BASE_URL`. A `base_url` in `providers.toml` wins over the host variable, and Caudra appends `/v1` to either, so leave it off. Aperture reads `APERTURE_HOST`, which wins over the file. Copilot asks GitHub for the API endpoint of your account, Copilot Enterprise derives it from the host you signed in with, and both ignore these settings."#;
 
 const LONG_CONTEXT_NOTE: &str = r#"Recent Claude models accept up to 1M tokens. Caudra runs them at a 372k working window, which keeps cost and latency bounded. That window is an input budget: the model's output allowance sits on top of it rather than inside it, so Caudra holds back less of it before compaction. Add `-1m` to a model id, like `claude-sonnet-4-6-1m`, to open the full 1M window instead. Set `context_window` in `providers.toml` to pick any other size."#;
 
@@ -111,6 +112,16 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 const XAI_OAUTH_NOTE: &str = r#"OAuth uses the same first-party xAI client as the official Grok CLI (`caudra auth login xai`). Browser login (PKCE) is the desktop default; device code is recommended over SSH or in a container. Tokens refresh automatically. After login, Caudra fetches your account catalog from `GET /v1/models-v2` on the Grok CLI proxy and caches it for 15 minutes. `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth proxy.
 
 If `~/.grok/auth.json` already exists, login offers to reuse it without writing that file."#;
+
+const COPILOT_OAUTH_NOTE: &str = r#"Run `caudra auth login copilot` to sign in with GitHub. Caudra prints a URL and a one-time code, opens the browser when it can, and waits until you approve the code on GitHub. The login uses the same public GitHub OAuth app as OpenCode and asks only for the `read:user` scope. GitHub issues a token that does not expire, so there is no refresh. When GitHub revokes it, run the login again.
+
+To reuse a token from the gh CLI, the Copilot editor plugin, or the system keyring instead, add `--method import`. Caudra stores the token in its state directory and labels it `token` in `caudra auth status`. `GH_COPILOT_TOKEN` or `COPILOT_GITHUB_TOKEN` wins over the saved token."#;
+
+const COPILOT_ENTERPRISE_NOTE: &str = r#"Copilot Enterprise is a separate provider, so a GitHub Enterprise account and a personal account can stay signed in together. Run `caudra auth login copilot-enterprise --hostname company.ghe.com`, or leave out `--hostname` and Caudra asks for it. The login runs against that host and saves the token together with the host. `--method import` reads gh CLI and Copilot plugin tokens for that host only.
+
+Caudra sends requests to `https://copilot-api.<host>` and never falls back to public GitHub. This follows the endpoint scheme OpenCode uses for GitHub Enterprise Cloud with data residency. Other deployments may not serve Copilot there. For CI, set `GH_COPILOT_ENTERPRISE_TOKEN` and `GH_COPILOT_ENTERPRISE_HOST` together. The token variable alone is an error, never a public GitHub token.
+
+The models are the ones Copilot lists above, under `copilot-enterprise/`, such as `copilot-enterprise/gpt-5.6-terra`. Your organization's policy decides which of them your account can use."#;
 
 const OPENCODE_FREE_MODELS_NOTE: &str = r#"By default Caudra hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.config/caudra/providers.toml`:
 
@@ -491,7 +502,20 @@ fn build_sections() -> Vec<ProviderSection> {
                     kind,
                     name: kind.display_name(),
                     auth_line: format!(
-                        "{} (or run `caudra auth login copilot` to import a token from gh CLI, the Copilot client, or the system keyring)",
+                        "{} or `COPILOT_GITHUB_TOKEN` (or run `caudra auth login copilot` to sign in with GitHub)",
+                        format_auth(kind)
+                    ),
+                    urls: vec![kind.base_url()],
+                    features: kind.features(),
+                    manifest: ManifestRegistry::get(&kind.to_string()).unwrap(),
+                });
+            }
+            ProviderKind::CopilotEnterprise => {
+                sections.push(ProviderSection {
+                    kind,
+                    name: kind.display_name(),
+                    auth_line: format!(
+                        "{} with `{ENTERPRISE_HOST_ENV}` (or run `caudra auth login copilot-enterprise` to sign in with GitHub)",
                         format_auth(kind)
                     ),
                     urls: vec![kind.base_url()],
@@ -666,10 +690,19 @@ fn write_section(out: &mut String, section: &ProviderSection) {
 
     let _ = writeln!(out);
 
+    if section.kind == ProviderKind::CopilotEnterprise {
+        let _ = writeln!(out, "{COPILOT_ENTERPRISE_NOTE}");
+        return;
+    }
+
     if section.manifest.models.is_empty() {
         let _ = writeln!(out, "{}", no_catalog_note(section.kind));
     } else {
         write_model_table(out, section.manifest);
+    }
+
+    if section.kind == ProviderKind::Copilot {
+        let _ = writeln!(out, "\n{COPILOT_OAUTH_NOTE}");
     }
 
     if section.name == "Anthropic" {

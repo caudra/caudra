@@ -24,17 +24,36 @@ use crate::{
 
 pub mod auth;
 
+use auth::CopilotIdentity;
+
 const DEFAULT_API_ENDPOINT: &str = "https://api.githubcopilot.com";
+pub(crate) const PUBLIC_SLUG: &str = "copilot";
+pub(crate) const PUBLIC_DISPLAY_NAME: &str = "Copilot";
+pub(crate) const PUBLIC_TOKEN_ENV: &str = "GH_COPILOT_TOKEN";
+pub(crate) const ENTERPRISE_SLUG: &str = "copilot-enterprise";
+pub(crate) const ENTERPRISE_DISPLAY_NAME: &str = "Copilot Enterprise";
+pub(crate) const ENTERPRISE_TOKEN_ENV: &str = "GH_COPILOT_ENTERPRISE_TOKEN";
 
 inventory::submit!(caudra_config::providers::BuiltInProvider {
-    slug: "copilot",
-    display_name: "Copilot",
+    slug: PUBLIC_SLUG,
+    display_name: PUBLIC_DISPLAY_NAME,
     protocol: caudra_config::providers::Protocol::Openai,
     default_base_url: DEFAULT_API_ENDPOINT,
-    default_api_key_env: "GH_COPILOT_TOKEN",
+    default_api_key_env: PUBLIC_TOKEN_ENV,
     default_model: "copilot/gpt-5.6-terra",
     plans: None,
     login_url: Some("https://github.com/settings/copilot"),
+    needs_url: false,
+});
+inventory::submit!(caudra_config::providers::BuiltInProvider {
+    slug: ENTERPRISE_SLUG,
+    display_name: ENTERPRISE_DISPLAY_NAME,
+    protocol: caudra_config::providers::Protocol::Openai,
+    default_base_url: "",
+    default_api_key_env: ENTERPRISE_TOKEN_ENV,
+    default_model: "copilot-enterprise/gpt-5.6-terra",
+    plans: None,
+    login_url: None,
     needs_url: false,
 });
 const GRAPHQL_QUERY: &str = "query { viewer { copilotEndpoints { api } } }";
@@ -626,37 +645,41 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
     MODELS
 }
 
+/// Where a Copilot instance gets its token: a native credential slot, or the
+/// Bearer and base URL a dynamic provider script resolved.
+enum AuthSource {
+    Stored(CopilotIdentity),
+    Resolved(Arc<Mutex<super::ResolvedAuth>>),
+}
+
 pub struct Copilot {
     client: HttpClient,
     stream_timeout: Duration,
     auth: Arc<Mutex<Option<CopilotAuth>>>,
-    resolved_auth: Option<Arc<Mutex<super::ResolvedAuth>>>,
+    source: AuthSource,
     system_prefix: Option<String>,
     models: Arc<Mutex<HashMap<String, CopilotModel>>>,
 }
 
 impl Copilot {
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        auth::load_token()?;
-        Ok(Self {
-            client: super::http_client(timeouts),
-            stream_timeout: timeouts.stream,
-            auth: Arc::default(),
-            resolved_auth: None,
-            system_prefix: None,
-            models: Arc::default(),
-        })
+    pub fn new(identity: CopilotIdentity, timeouts: super::Timeouts) -> Result<Self, AgentError> {
+        auth::load_token(identity)?;
+        Ok(Self::with_source(AuthSource::Stored(identity), timeouts))
     }
 
     pub(crate) fn with_auth(
         auth: Arc<Mutex<super::ResolvedAuth>>,
         timeouts: super::Timeouts,
     ) -> Self {
+        Self::with_source(AuthSource::Resolved(auth), timeouts)
+    }
+
+    fn with_source(source: AuthSource, timeouts: super::Timeouts) -> Self {
         Self {
             client: super::http_client(timeouts),
             stream_timeout: timeouts.stream,
             auth: Arc::default(),
-            resolved_auth: Some(auth),
+            source,
             system_prefix: None,
             models: Arc::default(),
         }
@@ -669,24 +692,30 @@ impl Copilot {
 
     /// The auth a send would use, without discovering the API endpoint.
     fn cached_auth(&self) -> Result<Option<CopilotAuth>, AgentError> {
-        if let Some(auth) = &self.resolved_auth {
-            return copilot_auth_from_resolved(&auth.lock().unwrap()).map(Some);
+        match &self.source {
+            AuthSource::Resolved(auth) => {
+                copilot_auth_from_resolved(&auth.lock().unwrap()).map(Some)
+            }
+            AuthSource::Stored(_) => Ok(self.auth.lock().unwrap().clone()),
         }
-        Ok(self.auth.lock().unwrap().clone())
     }
 
     async fn auth(&self) -> Result<CopilotAuth, AgentError> {
-        if let Some(auth) = self.cached_auth()? {
+        let identity = match &self.source {
+            AuthSource::Resolved(auth) => {
+                return copilot_auth_from_resolved(&auth.lock().unwrap());
+            }
+            AuthSource::Stored(identity) => *identity,
+        };
+        let cached = self.auth.lock().unwrap().clone();
+        if let Some(auth) = cached {
             return Ok(auth);
         }
 
-        let creds = auth::load_token()?;
-        let host = creds.host.as_deref().unwrap_or("github.com");
-        let endpoint =
-            discover_api_endpoint(&self.client, &creds.api_key, &auth::graphql_url(host)).await;
+        let creds = auth::load_token(identity)?;
         let auth = CopilotAuth {
-            token: creds.api_key,
-            endpoint,
+            endpoint: resolve_endpoint(&self.client, &creds).await,
+            token: creds.token,
         };
         *self.auth.lock().unwrap() = Some(auth.clone());
         Ok(auth)
@@ -741,16 +770,7 @@ impl Copilot {
 
     async fn fetch_models(&self) -> Result<Vec<CopilotModel>, AgentError> {
         let auth = self.auth().await?;
-        let request = copilot_request(
-            Request::builder()
-                .method("GET")
-                .uri(format!("{}{MODELS_PATH}", auth.endpoint)),
-            &auth,
-            None,
-        )
-        .body(())?;
-
-        let mut response = self.client.send_async(request).await?;
+        let mut response = self.client.send_async(models_request(&auth)?).await?;
         if !response.status().is_success() {
             return Err(AgentError::from_response(response).await);
         }
@@ -1079,6 +1099,26 @@ struct GraphQlViewer {
 #[derive(Deserialize)]
 struct GraphQlCopilotEndpoints {
     api: String,
+}
+
+/// Public accounts ask GitHub for their endpoint and fall back to the public
+/// API. An enterprise host derives its own and never touches public GitHub.
+async fn resolve_endpoint(client: &HttpClient, creds: &auth::CopilotCredentials) -> String {
+    match &creds.host {
+        Some(host) => host.api_endpoint(),
+        None => discover_api_endpoint(client, &creds.token, auth::PUBLIC_GRAPHQL_URL).await,
+    }
+}
+
+fn models_request(auth: &CopilotAuth) -> Result<Request<()>, AgentError> {
+    Ok(copilot_request(
+        Request::builder()
+            .method("GET")
+            .uri(format!("{}{MODELS_PATH}", auth.endpoint)),
+        auth,
+        None,
+    )
+    .body(())?)
 }
 
 async fn discover_api_endpoint(client: &HttpClient, token: &str, graphql_url: &str) -> String {
@@ -1672,5 +1712,90 @@ mod tests {
             ..enabled
         };
         assert!(!disabled.is_enabled_chat_model());
+    }
+
+    const ENTERPRISE_HOST: &str = "myco.ghe.com";
+    const ENTERPRISE_ENDPOINT: &str = "https://copilot-api.myco.ghe.com";
+
+    fn enterprise_credentials() -> auth::CopilotCredentials {
+        auth::CopilotCredentials {
+            token: TEST_TOKEN.into(),
+            host: Some(auth::EnterpriseHost::parse(ENTERPRISE_HOST).unwrap()),
+        }
+    }
+
+    fn enterprise_provider() -> Copilot {
+        let provider = Copilot::with_source(
+            AuthSource::Stored(CopilotIdentity::Enterprise),
+            Timeouts::default(),
+        );
+        *provider.auth.lock().unwrap() = Some(CopilotAuth {
+            token: TEST_TOKEN.into(),
+            endpoint: ENTERPRISE_ENDPOINT.into(),
+        });
+        provider
+    }
+
+    /// The enterprise branch returns before any request, so no public GraphQL
+    /// call and no public fallback can happen.
+    #[test]
+    fn enterprise_endpoint_is_derived_without_discovery() {
+        let client = crate::providers::http_client(Timeouts::default());
+
+        let endpoint = smol::block_on(resolve_endpoint(&client, &enterprise_credentials()));
+
+        assert_eq!(endpoint, ENTERPRISE_ENDPOINT);
+    }
+
+    #[test_case(MESSAGES_PATH ; "messages")]
+    #[test_case(RESPONSES_PATH ; "responses")]
+    #[test_case(CHAT_COMPLETIONS_PATH ; "chat_completions")]
+    fn enterprise_sends_post_to_its_own_endpoint(path: &str) {
+        let provider = enterprise_provider();
+        let model = Model::from_spec("copilot-enterprise/gpt-5.4").unwrap();
+        cache_model(&provider, &model.id, path);
+
+        let wire = dry_run(&provider, &model).unwrap();
+
+        assert_eq!(wire.url, format!("{ENTERPRISE_ENDPOINT}{path}"));
+    }
+
+    #[test]
+    fn models_request_uses_the_account_endpoint_and_token() {
+        let auth = enterprise_provider().cached_auth().unwrap().unwrap();
+
+        let request = models_request(&auth).unwrap();
+
+        assert_eq!(
+            request.uri().to_string(),
+            format!("{ENTERPRISE_ENDPOINT}{MODELS_PATH}")
+        );
+        assert_eq!(
+            request.headers()["authorization"],
+            format!("Bearer {TEST_TOKEN}")
+        );
+    }
+
+    #[test]
+    fn reload_clears_the_cached_endpoint_and_models() {
+        let provider = enterprise_provider();
+        cache_model(&provider, OTHER_MODEL_ID, CHAT_COMPLETIONS_PATH);
+
+        smol::block_on(provider.reload_auth()).unwrap();
+
+        assert!(provider.cached_auth().unwrap().is_none());
+        assert!(provider.models.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn enterprise_specs_share_static_facts_but_keep_their_provider() {
+        let public = Model::from_spec("copilot/gpt-5.6-luna").unwrap();
+        let enterprise = Model::from_spec("copilot-enterprise/gpt-5.6-luna").unwrap();
+
+        assert_eq!(&*enterprise.provider, ENTERPRISE_SLUG);
+        assert_eq!(enterprise.id, public.id);
+        assert_eq!(enterprise.pricing.input, public.pricing.input);
+        assert_eq!(enterprise.pricing.output, public.pricing.output);
+        assert_eq!(enterprise.context_window, public.context_window);
     }
 }
