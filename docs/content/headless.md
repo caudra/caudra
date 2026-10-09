@@ -31,6 +31,8 @@ caudra --print --output-format json --prompt "fix the tests"
 
 JSON output includes `type`, `subtype`, `is_error`, `duration_ms`, `num_turns`, `result`, `stop_reason`, `session_id`, `total_cost_usd`, `subscription_cost_usd`, and `usage`.
 
+Caudra exits with code 1 when the run ends in an error, such as a provider refusing the request or a goal that was not met. That is every run whose JSON result has `is_error: true`, whatever the output format. A successful run exits with 0.
+
 `total_cost_usd` is money owed. When a subscription covers the run, its list
 price lands in `subscription_cost_usd` instead, and the two are never added
 together. See [Token economy](/docs/token-economy/#spend-on-a-subscription).

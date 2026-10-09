@@ -8,6 +8,7 @@
 //! Check their docs before changing anything here.
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -182,7 +183,7 @@ pub fn run(
     workspace_session: Option<caudra_workspace::WorkspaceSession>,
     remote_project_context: Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
     local_documents: Option<Arc<caudra_storage::local_documents::LocalDocumentStore>>,
-) -> Result<()> {
+) -> Result<ExitCode> {
     let prompt = prompt_arg.ok_or_else(|| eyre!(NO_PROMPT))?;
 
     let images = load_images(&image_paths)?;
@@ -544,7 +545,11 @@ pub fn run(
         }
     }
 
-    Ok(())
+    Ok(if is_error {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn print_goal(prompt: String) -> Result<(String, GoalHandle)> {

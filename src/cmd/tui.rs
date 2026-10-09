@@ -1505,7 +1505,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
             .map(caudra_providers::ThinkingConfig::from)
             .unwrap_or_default();
         let timeouts = stack.timeouts();
-        crate::print::run(
+        return crate::print::run(
             &stack.model,
             initial_prompt,
             cli.images,
@@ -1534,8 +1534,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
             workcell_runtime.remote_project_context().cloned(),
             workcell_runtime.local_documents().cloned(),
         )
-        .context("run print mode")?;
-        return Ok(ExitCode::SUCCESS);
+        .context("run print mode");
     }
 
     let session_cwd = workcell_runtime
