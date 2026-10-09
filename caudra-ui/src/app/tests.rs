@@ -3535,6 +3535,87 @@ fn the_interrupt_chord_replaces_active_run_and_preserves_pending_queue() {
     assert_eq!(app.status, Status::Streaming);
 }
 
+const ADMISSION_WHILE_TASKS_RUN: &str = "fold in the audit finding";
+
+/// The main agent rests while a task works, so `Enter` would queue the prompt
+/// and the guide and replace chords must take it too.
+fn idle_app_with_working_task() -> App {
+    let mut app = app_with_subagent();
+    app.status = Status::Idle;
+    app.input_box.set_input(ADMISSION_WHILE_TASKS_RUN.into());
+    app
+}
+
+#[test]
+fn the_steer_chord_guides_while_tasks_run() {
+    let mut app = idle_app_with_working_task();
+
+    let actions = press_chord(&mut app, chord::STEER_PROMPT);
+
+    assert!(actions.is_empty());
+    assert_eq!(
+        app.queue
+            .pending_prompts()
+            .into_iter()
+            .map(|prompt| (prompt.text, prompt.admission))
+            .collect::<Vec<_>>(),
+        [(
+            ADMISSION_WHILE_TASKS_RUN.to_owned(),
+            caudra_agent::PromptAdmission::Steer
+        )]
+    );
+}
+
+#[test]
+fn the_interrupt_chord_replaces_while_tasks_run() {
+    let mut app = idle_app_with_working_task();
+
+    let actions = press_chord(&mut app, chord::INTERRUPT_PROMPT);
+
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::CancelAgent { .. }))
+    );
+    assert_eq!(
+        app.queue
+            .pending_prompts()
+            .into_iter()
+            .map(|prompt| (prompt.text, prompt.admission))
+            .collect::<Vec<_>>(),
+        [(
+            ADMISSION_WHILE_TASKS_RUN.to_owned(),
+            caudra_agent::PromptAdmission::Interrupt
+        )]
+    );
+}
+
+#[test]
+fn admission_controls_take_the_row_while_tasks_run() {
+    let mut app = idle_app_with_working_task();
+
+    admission_hit(&mut app, caudra_agent::PromptAdmission::Steer);
+    admission_hit(&mut app, caudra_agent::PromptAdmission::Interrupt);
+
+    assert!(app.chord_hint_hit.is_none());
+}
+
+#[test]
+fn the_steer_chord_is_no_chord_when_nothing_runs() {
+    let mut app = test_app();
+    app.input_box.set_input(ADMISSION_WHILE_TASKS_RUN.into());
+
+    let actions = press_chord(&mut app, chord::STEER_PROMPT);
+
+    assert!(actions.is_empty());
+    assert!(app.queue.is_empty());
+    assert!(
+        app.status_bar
+            .flash_text()
+            .is_some_and(|text| text.contains(FLASH_NO_CHORD))
+    );
+}
+
 #[test]
 fn newest_pending_replacement_wins() {
     let mut app = test_app();
@@ -8119,6 +8200,14 @@ fn click_at(app: &mut App, hit: Rect) -> Vec<Action> {
     ))
 }
 
+/// A listed task that no longer works, so the tasks hint keeps the row: while
+/// one works a prompt would queue and the admission controls take it instead.
+fn app_with_finished_subagent() -> App {
+    let mut app = app_with_subagent();
+    finish_subagent_task(&mut app, false);
+    app
+}
+
 fn app_with_todos() -> App {
     let mut app = test_app();
     app.todo_panel.set_items(vec![TodoItem {
@@ -8131,7 +8220,7 @@ fn app_with_todos() -> App {
 
 #[test]
 fn clicking_the_task_hint_opens_the_task_picker() {
-    let mut app = app_with_subagent();
+    let mut app = app_with_finished_subagent();
     let hit = chord_hint(&mut app, ChordHint::Tasks);
 
     assert!(click_at(&mut app, hit).is_empty());
@@ -8141,7 +8230,7 @@ fn clicking_the_task_hint_opens_the_task_picker() {
 
 #[test]
 fn releasing_off_the_task_hint_leaves_the_picker_shut() {
-    let mut app = app_with_subagent();
+    let mut app = app_with_finished_subagent();
     let hit = chord_hint(&mut app, ChordHint::Tasks);
 
     app.update(mouse_event(
@@ -8192,7 +8281,7 @@ fn clicking_the_plan_hint_reopens_the_dismissed_form() {
     assert!(app.plan_form.is_visible());
 }
 
-#[test_case(ChordHint::Tasks, app_with_subagent ; "tasks")]
+#[test_case(ChordHint::Tasks, app_with_finished_subagent ; "tasks")]
 #[test_case(ChordHint::PlanOrTodo, app_with_todos ; "todos")]
 fn chord_hint_hover_excludes_the_padding_around_it(target: ChordHint, build: fn() -> App) {
     let mut app = build();
@@ -8216,7 +8305,7 @@ fn chord_hint_hover_excludes_the_padding_around_it(target: ChordHint, build: fn(
 /// has to go with the hint that no longer renders.
 #[test]
 fn the_chord_hint_stops_taking_clicks_once_streaming_takes_the_row() {
-    let mut app = app_with_subagent();
+    let mut app = app_with_finished_subagent();
     let _ = chord_hint(&mut app, ChordHint::Tasks);
 
     app.status = Status::Streaming;
@@ -8230,7 +8319,7 @@ fn the_chord_hint_stops_taking_clicks_once_streaming_takes_the_row() {
 #[test]
 fn a_press_never_fires_the_hint_that_replaced_the_one_it_landed_on() {
     const FIRED_ANYWAY: &str = "a press outlived the hint it was taken against";
-    let mut app = app_with_subagent();
+    let mut app = app_with_finished_subagent();
     let pressed = chord_hint(&mut app, ChordHint::Tasks);
     app.update(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
@@ -10710,6 +10799,12 @@ fn help_modal_consumes_keys_and_esc_closes() {
     &[KeybindContext::General, KeybindContext::Streaming, KeybindContext::Editing],
     &[]
     ; "streaming"
+)]
+#[test_case(
+    |app: &mut App| { app.queue_and_notify(queued_msg("q")); },
+    &[KeybindContext::General, KeybindContext::Streaming, KeybindContext::Editing],
+    &[]
+    ; "idle_with_queued_prompt"
 )]
 #[test_case(
     |app: &mut App| { app.state.mode = Mode::Plan; app.plan_form.on_plan_ready(); },

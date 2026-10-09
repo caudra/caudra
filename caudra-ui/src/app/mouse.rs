@@ -670,7 +670,7 @@ impl App {
                     self.link_mouse_down = None;
                     self.mention_mouse_down = None;
                     self.chord_hint_down = None;
-                    return self.handle_streaming_admission(pressed.admission);
+                    return self.handle_deferred_admission(pressed.admission);
                 }
                 if !self.has_modal_overlay()
                     && let Some(pressed) = self.chord_hint_down.take()

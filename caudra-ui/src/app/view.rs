@@ -27,7 +27,7 @@ use ratatui::widgets::{Block, Borders, Clear, Widget};
 
 use super::permission_editor::LOCAL_SOURCE_NOTICE;
 use super::sandbox::attached_sandbox_instance;
-use super::{App, Mode, Status};
+use super::{App, Mode};
 
 const MAIN_GUTTER_WIDE: u16 = 2;
 const MAIN_GUTTER_NARROW: u16 = 1;
@@ -423,16 +423,17 @@ impl App {
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
             }
+            let defers = self.prompt_defers();
             let placeholder = if self.queue_editor_active() {
                 Placeholder::QueueEdit
-            } else if self.status == Status::Streaming {
+            } else if defers {
                 Placeholder::Queue
             } else if crate::session_history_head(&self.state.session).is_none() {
                 Placeholder::Suggestion
             } else {
                 Placeholder::Blank
             };
-            let panel_hint = if self.status == Status::Streaming && !self.queue_editor_active() {
+            let panel_hint = if defers && !self.queue_editor_active() {
                 let (hint, hits) = input::admission_hint(layout.input_area, self.admission_hover);
                 self.admission_hits = hits;
                 Some(hint)
@@ -938,7 +939,7 @@ impl App {
         } else if self.file_picker.is_open() {
             contexts.push(KeybindContext::FilePicker);
         } else {
-            if self.status == Status::Streaming {
+            if self.prompt_defers() {
                 contexts.push(KeybindContext::Streaming);
             }
             contexts.push(KeybindContext::Editing);

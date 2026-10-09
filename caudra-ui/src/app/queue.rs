@@ -1036,6 +1036,16 @@ impl App {
         self.submit_prepared(submission, admission)
     }
 
+    /// True when a submitted prompt waits in the queue instead of starting a
+    /// run, which is also when it can guide or replace the current one.
+    pub(super) fn prompt_defers(&self) -> bool {
+        self.status == Status::Streaming
+            || (self.status == Status::Idle
+                && (self.has_session_work()
+                    || self.queue.is_processing()
+                    || !self.queue.is_empty()))
+    }
+
     fn submit_prepared(
         &mut self,
         submission: PromptSubmission,
@@ -1044,11 +1054,7 @@ impl App {
         if let Some(error) = self.submission_error(&submission) {
             return SubmitOutcome::Rejected(error);
         }
-        let deferred = self.status == Status::Streaming
-            || (self.status == Status::Idle
-                && (self.has_session_work()
-                    || self.queue.is_processing()
-                    || !self.queue.is_empty()));
+        let deferred = self.prompt_defers();
         if deferred && !self.queue.is_connected() {
             return SubmitOutcome::Rejected(NO_QUEUE_ERR);
         }

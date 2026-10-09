@@ -3421,13 +3421,13 @@ impl App {
             self.active_chat().enable_auto_scroll();
             return vec![];
         }
-        if self.status == Status::Streaming {
+        if self.prompt_defers() {
             for (bind, admission) in [
                 (leader::STEER_PROMPT, PromptAdmission::Steer),
                 (leader::INTERRUPT_PROMPT, PromptAdmission::Interrupt),
             ] {
                 if bind.matches(key) {
-                    return self.handle_streaming_admission(admission);
+                    return self.handle_deferred_admission(admission);
                 }
             }
         }
@@ -3459,7 +3459,7 @@ impl App {
             ];
         }
         let mut contexts = vec![KeybindContext::General, KeybindContext::Editing];
-        if self.status == Status::Streaming {
+        if self.prompt_defers() {
             contexts.push(KeybindContext::Streaming);
         }
         contexts
@@ -3952,8 +3952,8 @@ impl App {
         self.handle_submit_with_admission(sub, PromptAdmission::Queue)
     }
 
-    fn handle_streaming_admission(&mut self, admission: PromptAdmission) -> Vec<Action> {
-        if !self.is_main_chat() || self.status != Status::Streaming || self.queue_editor_active() {
+    fn handle_deferred_admission(&mut self, admission: PromptAdmission) -> Vec<Action> {
+        if !self.is_main_chat() || !self.prompt_defers() || self.queue_editor_active() {
             return Vec::new();
         }
         if !self.queue.is_connected() {
