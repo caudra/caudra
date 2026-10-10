@@ -38,11 +38,11 @@ Run [`caudra tools`](/docs/cli/) to see the resulting set, including which rule 
 
 ## Tools loaded on demand
 
-The default loading policy lets 11 built-in tools start outside the request array. The model sees a `tool_search` entry instead, and one call with a query loads the matching tools for the rest of the session. Sessions that never need them never pay for their descriptions. An explicit profile policy can make other native, local or remote Workcell, Lua/plugin, local callback, or MCP tools lazy too. A known-name direct call to an eligible lazy tool is valid and loads its schema. `tool_search` disappears when no eligible pending tools remain.
+The default loading policy lets 10 built-in tools start outside the request array. The model sees a `tool_search` entry instead, and one call with a query loads the matching tools for the rest of the session. Sessions that never need them never pay for their descriptions. An explicit profile policy can make other native, local or remote Workcell, Lua/plugin, local callback, or MCP tools lazy too. A known-name direct call to an eligible lazy tool is valid and loads its schema. `tool_search` disappears when no eligible pending tools remain.
 
 `code_map`, `code_context`, `code_refs`, `code_impact`, and `code_expand` load together as the code graph bundle, limited to eligible lazy members. Profile policy groups do not create additional loading bundles.
 
-`execution_environment`, `image_generate`, `python_execution`, `plan`, `workflow`, and `automation` load on their own.
+`execution_environment`, `image_generate`, `python_execution`, `workflow`, and `automation` load on their own.
 
 Loading changes the tool array, so the provider's prompt cache prefix resets and the next request re-reads the history as fresh input. Caudra posts a notice naming what loaded when it happens.
 
@@ -403,7 +403,7 @@ Create or update a structured todo list to track tasks.
 |-----------|------|----------|-------------|
 | `todos` | array | yes | The updated todo list |
 
-### `plan` <span class="badge">on demand</span> {#plan}
+### `plan` {#plan}
 
 Read or replace this session's plan. Use action='read' to inspect it or action='write' with the complete content to save it. Any agent may read the plan; only the main agent may replace it. The target is supplied by the host; paths and references are not accepted. Saving does not approve the plan or switch modes.
 

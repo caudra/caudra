@@ -371,7 +371,9 @@ pub const CODE_GRAPH_GROUP: &str = "code graph";
 /// its size as well as its rate: its manual for Monty's Python subset is the
 /// largest definition in the array, and `shell`'s own description already tells
 /// the model a code execution tool exists. Everything else is either used
-/// constantly or is the only way to do something.
+/// constantly or is the only way to do something. `plan` is the only way to
+/// write the plan in Plan mode, and a small model that never searches for it
+/// cannot save one.
 ///
 /// Tools sharing a group load together. A name here must also appear in one of
 /// the registration lists above, or it defers something that does not exist.
@@ -389,7 +391,6 @@ pub const DEFERRED_BUILTIN_TOOLS: &[DeferredBuiltin] = &[
     DeferredBuiltin::alone("execution_environment"),
     DeferredBuiltin::alone("image_generate"),
     DeferredBuiltin::alone("python_execution"),
-    DeferredBuiltin::alone("plan"),
     DeferredBuiltin::alone("workflow"),
     DeferredBuiltin::alone("automation"),
 ];
