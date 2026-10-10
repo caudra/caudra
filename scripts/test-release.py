@@ -590,29 +590,61 @@ class ReleaseTests(unittest.TestCase):
     def test_prepare_reuses_matching_draft_without_mutation(self):
         with (
             patch.object(RELEASE, "existing_draft", return_value=DRAFT),
+            patch.object(RELEASE, "api") as api,
             patch.object(RELEASE, "gh") as gh,
         ):
             RELEASE.prepare(TAG, COMMIT)
+            api.assert_not_called()
             gh.assert_not_called()
 
-    def test_prepare_creates_explicit_preview_not_latest(self):
+    def create_draft(self, stored):
+        created = []
+
+        def fake_api(path, payload=None, method="PATCH"):
+            if path.startswith("git/ref/tags/"):
+                return {"object": {"type": "commit", "sha": COMMIT}}
+            if path == "releases":
+                created.append((method, payload))
+                return {"id": DRAFT["id"]}
+            self.assertEqual((path, payload), (f"releases/{DRAFT['id']}", None))
+            return copy.deepcopy(stored)
+
         with (
-            patch.object(RELEASE, "existing_draft", side_effect=[None, DRAFT]),
+            patch.object(RELEASE, "existing_draft", side_effect=[None]),
+            patch.object(RELEASE, "api", side_effect=fake_api),
             patch.object(RELEASE, "gh") as gh,
         ):
             RELEASE.prepare(TAG, COMMIT)
-            arguments = gh.call_args.args
-            self.assertIn("--verify-tag", arguments)
-            self.assertIn("--draft", arguments)
-            self.assertIn("--latest=false", arguments)
-            self.assertIn("--prerelease=true", arguments)
-            self.assertEqual(arguments[arguments.index("--target") + 1], COMMIT)
-            self.assertEqual(arguments[arguments.index("--title") + 1], TITLE)
-            self.assertNotIn("--generate-notes", arguments)
-            self.assertEqual(
-                arguments[arguments.index("--notes") + 1],
-                RELEASE.release_notes(TAG),
-            )
+        gh.assert_not_called()
+        return created
+
+    def test_prepare_creates_explicit_preview_not_latest(self):
+        self.assertEqual(
+            self.create_draft(DRAFT),
+            [
+                (
+                    "POST",
+                    {
+                        "tag_name": TAG,
+                        "target_commitish": COMMIT,
+                        "name": TITLE,
+                        "body": RELEASE.release_notes(TAG),
+                        "draft": True,
+                        "prerelease": True,
+                        "make_latest": "false",
+                    },
+                )
+            ],
+        )
+
+    def test_prepare_checks_the_created_draft_by_id_not_the_release_list(self):
+        for field, value in (
+            ("draft", False),
+            ("target_commitish", OTHER_COMMIT),
+            ("body", ""),
+        ):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.create_draft({**DRAFT, field: value})
 
     def test_latest_uses_semver_not_lexical_or_release_creation_order(self):
         def stable(tag, **overrides):

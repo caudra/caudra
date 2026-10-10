@@ -169,10 +169,10 @@ def gh(*arguments: str) -> str:
     return subprocess.check_output(["gh", *arguments], text=True)
 
 
-def api(path: str, payload: dict | None = None):
+def api(path: str, payload: dict | None = None, method: str = "PATCH"):
     command = ["gh", "api", f"repos/{REPOSITORY}/{path}"]
     if payload is not None:
-        command += ["--method", "PATCH", "--input", "-"]
+        command += ["--method", method, "--input", "-"]
     result = subprocess.run(
         command,
         input=json.dumps(payload) if payload is not None else None,
@@ -240,26 +240,20 @@ def prepare(tag: str, sha: str, layout: str = "compact") -> None:
     notes = release_notes(tag, layout)
     release = existing_draft(tag, sha)
     if release is None:
-        gh(
-            "release",
-            "create",
-            tag,
-            "--repo",
-            REPOSITORY,
-            "--verify-tag",
-            "--target",
-            sha,
-            "--draft",
-            f"--prerelease={str(version(tag)[1] is not None).lower()}",
-            "--latest=false",
-            "--title",
-            release_title(tag),
-            "--notes",
-            notes,
+        created = api(
+            "releases",
+            {
+                "tag_name": tag,
+                "target_commitish": sha,
+                "name": release_title(tag),
+                "body": notes,
+                "draft": True,
+                "prerelease": version(tag)[1] is not None,
+                "make_latest": "false",
+            },
+            method="POST",
         )
-        release = existing_draft(tag, sha)
-    if release is None:
-        raise ValueError("Draft creation did not produce a release")
+        release = guard(created["id"], tag, sha)
     assert_release_policy(release, layout)
 
 
