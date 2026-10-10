@@ -1,3 +1,7 @@
+use std::cmp::Reverse;
+
+use caudra_storage::permission_state::wildcard_component;
+use caudra_workspace::path_components::component_prefixes;
 use thiserror::Error;
 
 use super::executables::runs_given_code;
@@ -5,8 +9,13 @@ use super::structured::{BROAD_SHELL_PHRASE, PermissionCaution};
 
 pub(super) const MAX_PATTERN_TOKENS: usize = 8;
 const MAX_PREFIX_LITERALS: usize = 3;
+/// How many starts of one word a ladder offers, deepest first. A real path
+/// stays well under it; the bound is on what a request serializes to.
+const MAX_COMPONENT_RUNGS: usize = 8;
 const WILDCARD_TOKEN: &str = "*";
-pub(super) const WILDCARD_SUFFIX: &str = " *";
+const WILDCARD_SUFFIX: &str = " *";
+const PARENT_COMPONENT: &str = "..";
+const COMPONENT_SEPARATORS: [char; 2] = ['/', '\\'];
 const SED: &str = "sed";
 
 pub(crate) const BUILTIN_ASK_PATTERNS: &[&str] = &[
@@ -41,9 +50,45 @@ enum Quote {
     Double,
 }
 
-struct Pattern<'a> {
-    literals: Vec<&'a str>,
-    wildcard: bool,
+/// A command pattern read into its parts: the words it fixes, the start of the
+/// word after them it leaves open, and whether any arguments may follow.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PatternParts<'a> {
+    pub literals: Vec<&'a str>,
+    pub component: Option<&'a str>,
+    pub wildcard: bool,
+}
+
+impl<'a> PatternParts<'a> {
+    pub fn parse(pattern: &'a str) -> Option<Self> {
+        let mut tokens: Vec<_> = pattern.split_whitespace().collect();
+        if tokens.is_empty() || tokens.len() > MAX_PATTERN_TOKENS {
+            return None;
+        }
+        let wildcard = tokens.last() == Some(&WILDCARD_TOKEN);
+        if wildcard {
+            tokens.pop();
+        }
+        let component = tokens
+            .last()
+            .copied()
+            .and_then(wildcard_component)
+            .filter(|prefix| is_pattern_literal(prefix));
+        if component.is_some() {
+            tokens.pop();
+        }
+        let named = !tokens.is_empty() || (wildcard && component.is_none());
+        (named && tokens.iter().all(|token| is_pattern_literal(token))).then_some(Self {
+            literals: tokens,
+            component,
+            wildcard,
+        })
+    }
+
+    /// Every word the pattern pins, the open one by the start it fixes.
+    pub fn fixed_words(&self) -> impl Iterator<Item = &'a str> + '_ {
+        self.literals.iter().copied().chain(self.component)
+    }
 }
 
 pub(crate) fn tokenize(command: &str) -> Option<Vec<&str>> {
@@ -105,15 +150,14 @@ pub(crate) fn tokenize(command: &str) -> Option<Vec<&str>> {
 }
 
 pub(crate) fn matches(pattern: &str, command: &str) -> bool {
-    let Some(pattern) = parse_pattern(pattern) else {
+    let Some(pattern) = PatternParts::parse(pattern) else {
         return false;
     };
     let Some(command_tokens) = tokenize(command) else {
         return false;
     };
-    if command_tokens.len() < pattern.literals.len()
-        || (!pattern.wildcard && command_tokens.len() != pattern.literals.len())
-    {
+    let fixed = pattern.literals.len() + usize::from(pattern.component.is_some());
+    if command_tokens.len() < fixed || (!pattern.wildcard && command_tokens.len() != fixed) {
         return false;
     }
 
@@ -123,10 +167,29 @@ pub(crate) fn matches(pattern: &str, command: &str) -> bool {
         .zip(&command_tokens)
         .all(|(literal, token)| decode_static_token(token).as_deref() == Some(*literal));
     prefix_matches
+        && pattern
+            .component
+            .is_none_or(|prefix| continues(prefix, command_tokens[pattern.literals.len()]))
         && (!pattern.wildcard
-            || command_tokens[pattern.literals.len()..]
+            || command_tokens[fixed..]
                 .iter()
                 .all(|token| !contains_unquoted_shell_operator(token)))
+}
+
+/// Whether a word is `prefix` and then one plain run of components: an
+/// argument the shell passes as written, with no blank in it and no `..`
+/// climbing back out of what the prefix names.
+fn continues(prefix: &str, token: &str) -> bool {
+    !contains_unquoted_shell_operator(token)
+        && decode_static_token(token).is_some_and(|word| {
+            word.strip_prefix(prefix).is_some_and(|rest| {
+                !rest
+                    .contains(|character: char| character.is_whitespace() || character.is_control())
+                    && !rest
+                        .split(COMPONENT_SEPARATORS)
+                        .any(|component| component == PARENT_COMPONENT)
+            })
+        })
 }
 
 /// `matches` rejects operators, separators, newlines, and path-qualified
@@ -188,6 +251,12 @@ pub(crate) fn reusable_prefix(command: &str) -> Option<String> {
 /// `.`, which keeps `--edition 2024` together and `--check f.rs` apart.
 /// Decoding stops where `reusable_prefix` stops, and the bare executable is
 /// offered only when the words after it cannot be code it runs.
+///
+/// Between two of those prefixes sit the starts of the word they differ by,
+/// cut where a path component ends, so `gh api repos/a/b` climbs through
+/// `repos/a/` and `repos/`. Each start is offered for that word alone and with
+/// any arguments after it. An executable that runs code gets none, because a
+/// start of its word is a start of the code.
 pub(crate) fn ancestor_prefixes(command: &str) -> Vec<String> {
     let Some(tokens) = tokenize(command) else {
         return Vec::new();
@@ -212,8 +281,8 @@ pub(crate) fn ancestor_prefixes(command: &str) -> Vec<String> {
     if literals.len() == tokens.len() {
         ends.pop();
     }
-    ends.into_iter()
-        .rev()
+    let mut rungs: Vec<String> = ends
+        .into_iter()
         .map(|end| &literals[..end])
         .filter(|prefix| {
             (bare || prefix.len() > 1)
@@ -221,8 +290,40 @@ pub(crate) fn ancestor_prefixes(command: &str) -> Vec<String> {
                 && !overlaps_builtin_ask(prefix)
         })
         .map(|prefix| format!("{}{WILDCARD_SUFFIX}", prefix.join(" ")))
-        .filter(|pattern| matches(pattern, command))
-        .collect()
+        .collect();
+    if bare {
+        for (index, word) in decoded.iter().enumerate().take(literals.len() + 1).skip(1) {
+            for start in component_prefixes(word)
+                .into_iter()
+                .rev()
+                .filter(|start| is_pattern_literal(start))
+                .take(MAX_COMPONENT_RUNGS)
+            {
+                let named = &literals[..index];
+                if overlaps_builtin_ask(&[named, &[start]].concat()) {
+                    continue;
+                }
+                let alone = format!("{} {start}{WILDCARD_TOKEN}", named.join(" "));
+                rungs.push(format!("{alone}{WILDCARD_SUFFIX}"));
+                rungs.push(alone);
+            }
+        }
+    }
+    rungs.retain(|pattern| matches(pattern, command));
+    rungs.sort_by_key(|pattern| Reverse(ladder_rank(pattern)));
+    rungs
+}
+
+/// Where a rung sits on its command's ladder, the narrowest greatest: more
+/// whole words first, then a longer start of the word after them, then the
+/// rung that lets nothing follow that word before the one that does.
+pub(crate) fn ladder_rank(pattern: &str) -> Option<(usize, Option<usize>, bool)> {
+    let parts = PatternParts::parse(pattern)?;
+    Some((
+        parts.literals.len(),
+        parts.component.map(str::len),
+        !parts.wildcard,
+    ))
 }
 
 /// How many words each successive unit of a command ends after.
@@ -313,8 +414,10 @@ pub enum PatternFault {
     TooManyTokens,
     #[error("tokens may only contain letters, digits, and . _ / @ : = + -")]
     NonLiteralToken,
-    #[error("end the pattern with ` *`")]
+    #[error("end the pattern with ` *`, or its last word with `/*`")]
     MissingWildcard,
+    #[error("a `*` inside a word must end the last word, right after / = : or @")]
+    MisplacedWildcard,
     #[error("the pattern must match the command on this row")]
     DoesNotMatch,
 }
@@ -338,30 +441,54 @@ pub struct PatternGrade {
 /// invocation of an interpreter, which is arbitrary execution wearing one name.
 /// The exception is a pattern Caudra itself suggests for this command: `ls *` is
 /// offered as a rung one keypress away, so typing it out cannot be graver than
-/// picking it.
+/// picking it. A start of a word after that one literal, as in `cat /etc/*`,
+/// narrows it enough to drop the grade, unless the executable runs code.
 pub fn grade_command_pattern(pattern: &str, command: &str) -> Result<PatternGrade, PatternFault> {
     let mut literals: Vec<&str> = pattern.split_whitespace().collect();
     if literals.len() > MAX_PATTERN_TOKENS {
         return Err(PatternFault::TooManyTokens);
     }
-    if literals.pop() != Some(WILDCARD_TOKEN) {
-        return Err(PatternFault::MissingWildcard);
+    let normalized = literals.join(" ");
+    let wildcard = literals.last() == Some(&WILDCARD_TOKEN);
+    if wildcard {
+        literals.pop();
     }
-    if literals.is_empty() {
+    let component = literals.last().copied().and_then(wildcard_component);
+    if component.is_some() {
+        literals.pop();
+    }
+    let misplaced = literals.iter().any(|token| token.contains(WILDCARD_TOKEN));
+    if !wildcard && component.is_none() {
+        return Err(match misplaced {
+            true => PatternFault::MisplacedWildcard,
+            false => PatternFault::MissingWildcard,
+        });
+    }
+    let Some(executable) = literals.first() else {
         return Err(PatternFault::Empty);
+    };
+    if misplaced {
+        return Err(PatternFault::MisplacedWildcard);
     }
-    if !literals.iter().all(|token| is_pattern_literal(token)) {
+    if !literals
+        .iter()
+        .copied()
+        .chain(component)
+        .all(is_pattern_literal)
+    {
         return Err(PatternFault::NonLiteralToken);
     }
     if !matches(pattern, command) {
         return Err(PatternFault::DoesNotMatch);
     }
-    let normalized = literals.join(" ") + WILDCARD_SUFFIX;
+    let single = literals.len() == 1
+        && (component.is_none()
+            || runs_given_code(executable.rsplit('/').next().unwrap_or(executable)));
     let caution = if reusable_prefix(command).as_deref() == Some(normalized.as_str()) {
         None
-    } else if literals.len() == 1 {
+    } else if single {
         Some(PermissionCaution::Danger)
-    } else if overlaps_builtin_ask(&literals) {
+    } else if overlaps_builtin_ask(&[literals.as_slice(), component.as_slice()].concat()) {
         Some(PermissionCaution::Warn)
     } else {
         None
@@ -373,29 +500,11 @@ pub fn grade_command_pattern(pattern: &str, command: &str) -> Result<PatternGrad
 }
 
 pub(crate) fn specificity(pattern: &str) -> Option<(usize, usize)> {
-    let pattern = parse_pattern(pattern)?;
+    let pattern = PatternParts::parse(pattern)?;
     Some((
-        pattern.literals.len(),
-        pattern.literals.iter().map(|literal| literal.len()).sum(),
+        pattern.fixed_words().count(),
+        pattern.fixed_words().map(str::len).sum(),
     ))
-}
-
-fn parse_pattern(pattern: &str) -> Option<Pattern<'_>> {
-    let mut tokens: Vec<_> = pattern.split_whitespace().collect();
-    if tokens.is_empty() || tokens.len() > MAX_PATTERN_TOKENS {
-        return None;
-    }
-    let wildcard = tokens.last() == Some(&"*");
-    if wildcard {
-        tokens.pop();
-    }
-    if (!wildcard && tokens.is_empty()) || !tokens.iter().all(|token| is_pattern_literal(token)) {
-        return None;
-    }
-    Some(Pattern {
-        literals: tokens,
-        wildcard,
-    })
 }
 
 fn is_pattern_literal(token: &str) -> bool {
@@ -490,25 +599,84 @@ fn decode_static_token(token: &str) -> Option<String> {
 mod tests {
     use test_case::test_case;
 
+    use caudra_storage::permission_state::validate_command_pattern;
+
     use super::{
-        BROAD_SHELL_PHRASE, BUILTIN_ALLOW_PATTERNS, BUILTIN_ASK_PATTERNS, PatternFault,
-        PatternGrade, PermissionCaution, ancestor_prefixes, builtin_allowed, grade_command_pattern,
-        matches, reusable_prefix, specificity, tokenize,
+        BROAD_SHELL_PHRASE, BUILTIN_ALLOW_PATTERNS, BUILTIN_ASK_PATTERNS, MAX_COMPONENT_RUNGS,
+        PatternFault, PatternGrade, PatternParts, PermissionCaution, ancestor_prefixes,
+        builtin_allowed, grade_command_pattern, matches, reusable_prefix, specificity, tokenize,
     };
 
     const SED_SLICE: &str = "sed -n 1,140p src/main.rs";
+    const TIMELINE: &str = "gh api repos/tensorninja/ninfer-4090/issues/1/timeline";
+    const TIMELINE_LADDER: &[&str] = &[
+        "gh api repos/tensorninja/ninfer-4090/issues/1/*",
+        "gh api repos/tensorninja/ninfer-4090/issues/1/* *",
+        "gh api repos/tensorninja/ninfer-4090/issues/*",
+        "gh api repos/tensorninja/ninfer-4090/issues/* *",
+        "gh api repos/tensorninja/ninfer-4090/*",
+        "gh api repos/tensorninja/ninfer-4090/* *",
+        "gh api repos/tensorninja/*",
+        "gh api repos/tensorninja/* *",
+        "gh api repos/*",
+        "gh api repos/* *",
+        "gh api *",
+        "gh *",
+    ];
+    const QUERY: &str = "gh api 'repos/x/issues?per_page=1'";
+    const QUERY_LADDER: &[&str] = &[
+        "gh api repos/x/*",
+        "gh api repos/x/* *",
+        "gh api repos/*",
+        "gh api repos/* *",
+        "gh api *",
+        "gh *",
+    ];
+    const UNSTORABLE: &str = "a rung the ladder offers must be one storage accepts";
 
     #[test_case("rustfmt --edition 2024 --check f.rs", &["rustfmt --edition 2024 --check *", "rustfmt --edition 2024 *", "rustfmt *"] ; "a_flag_keeps_its_value")]
     #[test_case("git log -1 --format='%h %ci'", &["git log -1 *", "git log *"] ; "a_word_no_pattern_holds_ends_the_ladder")]
-    #[test_case("docker -H tcp://h run x", &["docker -H tcp://h run *", "docker -H tcp://h *", "docker -H *", "docker *"] ; "a_path_is_no_flag_value")]
+    #[test_case("docker -H tcp://h run x", &["docker -H tcp://h run *", "docker -H tcp://h *", "docker -H tcp://* *", "docker -H *", "docker *"] ; "a_path_is_no_flag_value")]
     #[test_case("python3 x.py", &[] ; "an_interpreter_has_no_bare_rung")]
     #[test_case("python3 -m pytest tests/", &["python3 -m pytest *"] ; "an_interpreter_keeps_its_module")]
     #[test_case(SED_SLICE, &["sed -n *"] ; "a_sed_script_that_only_prints")]
     #[test_case("sed -i s/a/b/ f.rs", &[] ; "a_sed_script_that_writes")]
     #[test_case("git push origin main", &[] ; "an_ask_family_is_never_widened")]
+    #[test_case("git push origin/main", &[] ; "an_ask_family_is_never_cut_into")]
+    #[test_case("curl https://example.com/a", &[] ; "a_url_under_an_ask_family")]
     #[test_case("ls", &[] ; "a_lone_executable_has_no_ancestor")]
+    #[test_case(TIMELINE, TIMELINE_LADDER ; "a_path_climbs_one_component_at_a_time")]
+    #[test_case(QUERY, QUERY_LADDER ; "a_word_no_pattern_holds_still_offers_its_components")]
+    #[test_case("cat /etc/hosts", &["cat /etc/*", "cat /etc/* *", "cat /*", "cat /* *", "cat *"] ; "an_absolute_path")]
+    #[test_case("cp a/b c", &["cp a/b *", "cp a/* *", "cp *"] ; "a_word_with_more_after_it_offers_only_its_arguments_rung")]
+    #[test_case("gh pr list --repo=o/r", &["gh pr list --repo=o/*", "gh pr list --repo=o/* *", "gh pr list --repo=*", "gh pr list --repo=* *", "gh pr list *", "gh pr *", "gh *"] ; "a_flag_value")]
+    #[test_case("bash scripts/run.sh", &[] ; "a_start_of_code_is_never_offered")]
+    #[test_case("node ./bin/a/b/c", &[] ; "an_interpreter_gets_no_component_rungs")]
     fn ancestors_widen_one_unit_at_a_time(command: &str, expected: &[&str]) {
-        assert_eq!(ancestor_prefixes(command), expected);
+        let ladder = ancestor_prefixes(command);
+        assert_eq!(ladder, expected);
+        for rung in &ladder {
+            assert_eq!(
+                validate_command_pattern(rung),
+                Ok(()),
+                "{UNSTORABLE}: {rung}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deep_path_offers_its_deepest_starts() {
+        let components = (1..=12).map(|n| format!("s{n}")).collect::<Vec<_>>();
+        let ladder = ancestor_prefixes(&format!("ls {}", components.join("/")));
+        let starts = ladder
+            .iter()
+            .filter(|rung| PatternParts::parse(rung).is_some_and(|parts| parts.component.is_some()))
+            .count();
+        assert_eq!(starts, 2 * MAX_COMPONENT_RUNGS);
+        assert_eq!(
+            ladder[0],
+            format!("ls {}/*", components[..components.len() - 1].join("/"))
+        );
     }
 
     #[test_case("sed -n *", SED_SLICE, None ; "flag_prefix_is_plain")]
@@ -519,6 +687,10 @@ mod tests {
     #[test_case("ls *", "ls -la", None ; "typing_the_suggestion_grades_like_the_rung")]
     #[test_case("wc *", "wc -l a.rs b/*.rs", None ; "suggestion_over_a_globbed_operand")]
     #[test_case("ls   *", "ls -la", None ; "spacing_does_not_change_the_grade")]
+    #[test_case("gh api repos/x/*", "gh api repos/x/y", None ; "a_start_of_a_word")]
+    #[test_case("cat /etc/*", "cat /etc/hosts", None ; "a_start_of_a_word_narrows_a_lone_executable")]
+    #[test_case("python3 scripts/*", "python3 scripts/x.py", Some(PermissionCaution::Danger) ; "a_start_of_code_is_still_grave")]
+    #[test_case("git push origin/* *", "git push origin/main", Some(PermissionCaution::Warn) ; "a_start_inside_an_ask_family_warns")]
     fn a_typed_pattern_is_graded_by_how_much_it_reaches(
         pattern: &str,
         command: &str,
@@ -540,6 +712,11 @@ mod tests {
     #[test_case("", SED_SLICE, PatternFault::MissingWildcard ; "nothing_typed")]
     #[test_case("sed -n '1,140p' *", SED_SLICE, PatternFault::NonLiteralToken ; "quoted_token")]
     #[test_case("a b c d e f g h i *", SED_SLICE, PatternFault::TooManyTokens ; "past_the_token_cap")]
+    #[test_case("sed -n*", SED_SLICE, PatternFault::MisplacedWildcard ; "mid_word")]
+    #[test_case("sed src/* -n", SED_SLICE, PatternFault::MisplacedWildcard ; "not_the_last_word")]
+    #[test_case("sed -n 1,140p src/* *", SED_SLICE, PatternFault::NonLiteralToken ; "a_literal_before_the_start")]
+    #[test_case("src/*", SED_SLICE, PatternFault::Empty ; "a_start_of_the_executable")]
+    #[test_case("sed -n 1/*", SED_SLICE, PatternFault::DoesNotMatch ; "a_start_the_word_does_not_have")]
     fn a_typed_pattern_is_refused_with_the_reason_to_show(
         pattern: &str,
         command: &str,
@@ -581,6 +758,15 @@ mod tests {
     #[test_case("git status *", "git status")]
     #[test_case("git status *", "git status --short")]
     #[test_case("git status *", r#"git status "$FORMAT""#)]
+    #[test_case("gh api repos/x/*", "gh api repos/x/y"; "a word under the start")]
+    #[test_case("gh api repos/x/*", "gh api repos/x/y/z"; "a word deeper under the start")]
+    #[test_case("gh api repos/x/*", "gh api repos/x/"; "the start itself")]
+    #[test_case("gh api repos/x/*", "gh api 'repos/x/y'"; "a quoted word")]
+    #[test_case("gh api repos/x/*", "gh api 'repos/x/y?a=1&b=2'"; "a quoted query")]
+    #[test_case("gh api repos/x/*", "gh api repos/x/a..b"; "dots inside a name")]
+    #[test_case("gh api repos/x/* *", "gh api repos/x/y"; "nothing after the word")]
+    #[test_case("gh api repos/x/* *", "gh api repos/x/y --paginate -q .id"; "arguments after the word")]
+    #[test_case("docker -H tcp://* *", "docker -H tcp://h run x"; "a run of separators")]
     fn patterns_match_static_literals_and_optional_wildcard(pattern: &str, command: &str) {
         assert!(matches(pattern, command));
     }
@@ -603,6 +789,21 @@ mod tests {
     #[test_case("git status *", r#"git status "$(id)""#; "quoted command substitution")]
     #[test_case("git status *", "git status `id`"; "backtick substitution")]
     #[test_case("git status *", r#"git status "`id`""#; "quoted backtick substitution")]
+    #[test_case("gh api repos/x/*", "gh api repos/x/y --paginate"; "arguments after a lone word")]
+    #[test_case("gh api repos/x/*", "gh api"; "no word to start")]
+    #[test_case("gh api repos/x/*", "gh api repos/xy"; "a longer name is not under the start")]
+    #[test_case("gh api repos/x/*", "gh api repos/x/../../y"; "climbing out of the start")]
+    #[test_case("gh api repos/x/*", "gh api repos/x/.."; "the parent of the start")]
+    #[test_case("gh api repos/x/*", r"gh api 'repos/x/..\y'"; "climbing out with a backslash")]
+    #[test_case("gh api repos/x/*", "gh api repos/x/$(id)"; "a substitution under the start")]
+    #[test_case("gh api repos/x/*", "gh api repos/x/a;id"; "a separator under the start")]
+    #[test_case("gh api repos/x/*", "gh api repos/x/a|sh"; "a pipe under the start")]
+    #[test_case("gh api repos/x/*", "gh api 'repos/x/a b'"; "a blank under the start")]
+    #[test_case("gh api repos/x/*", "gh api repos/x/*.json"; "a glob under the start")]
+    #[test_case("gh api repos/x/* *", "gh api repos/x/y > out"; "a redirect after the word")]
+    #[test_case("gh api repos/x/* *", "gh repos/x/y"; "a missing literal")]
+    #[test_case("git status*", "git status/x"; "a start that ends in no separator")]
+    #[test_case("/usr/*", "/usr/bin"; "a start of the executable")]
     fn patterns_reject_invalid_or_nonliteral_matches(pattern: &str, command: &str) {
         assert!(!matches(pattern, command));
     }
@@ -667,6 +868,11 @@ mod tests {
         assert_eq!(specificity("git * status"), None);
         assert_eq!(specificity("echo comma,"), None);
         assert_eq!(specificity("azAZ09._/@:=+-"), Some((1, 14)));
+        assert_eq!(specificity("gh api repos/*"), Some((3, 11)));
+        assert_eq!(specificity("gh api repos/* *"), Some((3, 11)));
+        assert_eq!(specificity("gh api repos/* repos/*"), None);
+        assert_eq!(specificity("/usr/*"), None);
+        assert_eq!(specificity("echo comma,*"), None);
     }
 
     #[test]

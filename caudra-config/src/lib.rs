@@ -5671,6 +5671,8 @@ mod tests {
     #[test_case("git status *" ; "bare_final_wildcard")]
     #[test_case("./bin_tool@host:key=value+next-1" ; "all_literal_characters")]
     #[test_case("a b c d e f g h" ; "eight_tokens")]
+    #[test_case("gh api repos/tensorninja/*" ; "path_component")]
+    #[test_case("gh api repos/tensorninja/* *" ; "path_component_and_any_arguments")]
     fn shell_command_pattern_accepts_token_grammar(pattern: &str) {
         assert_eq!(validate_shell_command_pattern(pattern), Ok(()));
     }

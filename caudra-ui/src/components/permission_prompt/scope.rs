@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use caudra_agent::permissions::{
-    PermissionArgumentConstraint, PermissionCapabilityFamily, PermissionExecutorKind,
+    PatternParts, PermissionArgumentConstraint, PermissionCapabilityFamily, PermissionExecutorKind,
     PermissionLifetime, PermissionRequest, PermissionResourceAccess, PermissionResourceConstraint,
     PermissionResourceKind, PermissionResourceSelector, PermissionReview, PermissionReviewResource,
     PermissionRuleOption, PermissionSubject, StructuredPermissionRule,
@@ -25,7 +25,6 @@ const POSSIBLE_WORKDIRS_ATTRIBUTE: &str = "possible_workdirs";
 const WORKDIR_ATTRIBUTE: &str = "workdir";
 const UNAVAILABLE: &str = "unavailable";
 const OMITTED_MARKER: &str = "[omitted:";
-const WILDCARD_SUFFIX: &str = " *";
 const HTTPS_SCHEME: &str = "https://";
 const FOLDER_SEPARATOR: char = '/';
 const HIDDEN: &str = "Caudra can't show";
@@ -146,9 +145,24 @@ fn url_place(url: &str) -> String {
 }
 
 fn pattern_words(pattern: &str) -> String {
-    match pattern.strip_suffix(WILDCARD_SUFFIX) {
-        Some(prefix) => format!("`{}` with any arguments", review_text(prefix)),
-        None => format!("exactly `{}`", review_text(pattern)),
+    let Some(parts) = PatternParts::parse(pattern) else {
+        return format!("exactly `{}`", review_text(pattern));
+    };
+    if parts.literals.is_empty() {
+        return "any command".into();
+    }
+    let named = review_text(&parts.literals.join(" "));
+    match (parts.component, parts.wildcard) {
+        (Some(start), true) => format!(
+            "`{named}` on anything starting with `{}`, with any arguments after it",
+            review_text(start)
+        ),
+        (Some(start), false) => format!(
+            "`{named}` on anything starting with `{}`",
+            review_text(start)
+        ),
+        (None, true) => format!("`{named}` with any arguments"),
+        (None, false) => format!("exactly `{named}`"),
     }
 }
 

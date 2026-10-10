@@ -664,7 +664,9 @@ pub(super) fn configured_selector(
             root: root.to_owned(),
         };
     }
-    if *kind == PermissionResourceKind::Command && scope.ends_with(command_pattern::WILDCARD_SUFFIX)
+    if *kind == PermissionResourceKind::Command
+        && command_pattern::PatternParts::parse(scope)
+            .is_some_and(|parts| parts.wildcard || parts.component.is_some())
     {
         return PermissionResourceSelector::CommandPattern {
             pattern: scope.to_owned(),

@@ -90,7 +90,7 @@ A prompt asks one question, such as `Allow shell command?` or `Allow fetching a 
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
-The phrase between `‹` and `›` is the scope a remembered answer covers. A command offers `this exact command`, any suggested templates such as `cargo check -p <value>`, and its token prefixes from the longest to the shortest, such as `cargo test -p caudra-agent *`, `cargo test *`, and `cargo *`. It starts on a suggested template, else on the [derived prefix](#shell-parsing), else on the exact command. A web page starts on `this page and below`, and a file read on `this file`. `Left` broadens the scope and `Right` narrows it before you answer, and the answers change with it. Blanket grants such as `any shell command` are offered only in [Customize](#customize).
+The phrase between `‹` and `›` is the scope a remembered answer covers. A command offers `this exact command`, any suggested templates such as `cargo check -p <value>`, and its token prefixes from the longest to the shortest, such as `cargo test -p caudra-agent *`, `cargo test *`, and `cargo *`. A word that holds a path also offers its [folders](#path-components), such as `gh api repos/acme/*`. It starts on a suggested template, else on the [derived prefix](#shell-parsing), else on the exact command. A web page starts on `this page and below`, and a file read on `this file`. `Left` broadens the scope and `Right` narrows it before you answer, and the answers change with it. Blanket grants such as `any shell command` are offered only in [Customize](#customize).
 
 A scope that is a template [learned from earlier commands](#suggested-patterns) adds a muted line under the answers that remember it, such as `Learned from 4 similar commands. <value> is caudra-agent or caudra-ui.` The count includes the command being asked about. In a batch the line describes the focused command, and it disappears when `Left` or `Right` moves the scope off the template.
 
@@ -183,7 +183,7 @@ Some scopes reach far enough that Caudra asks again before it stores them. Choos
 
 | Phrase | Scope |
 |---|---|
-| `ALLOW BROAD SHELL ACCESS` | Any shell command, any command in a folder, a whole program such as `cargo *`, or a pattern of your own with one literal word |
+| `ALLOW BROAD SHELL ACCESS` | Any shell command, any command in a folder, a whole program such as `cargo *`, or a pattern of your own [graded as a whole program](#writing-your-own-pattern) |
 | `ALLOW OUTSIDE HOME` | A folder that takes in your home directory |
 | `ALLOW DIRECTORY CHANGES` | Changes anywhere below a folder |
 | `ALLOW FILE CHANGES` | Changes to the files of this request |
@@ -243,7 +243,7 @@ A shell line can run several commands. When it does, the prompt gives each comma
 
 More than three allowed rows fold into one line, such as `+ 5 already allowed`, and Details lists them.
 
-`▸` marks the focused row. `Tab` and `Shift-Tab` move between the new rows. `Left` moves the focused row one step broader and `Right` one step narrower, and `<` and `>` do the same for every new row. A row at the end of its ladder stays put. Each ladder runs narrowest first: `this time only`, `this exact command`, suggested templates, then token prefixes from the longest to the shortest. The shortest prefix names the program alone, such as `cargo *`, and needs [confirmation](#confirming-broad-grants). A row starts on its suggested template, else on its derived prefix, else on the exact command.
+`▸` marks the focused row. `Tab` and `Shift-Tab` move between the new rows. `Left` moves the focused row one step broader and `Right` one step narrower, and `<` and `>` do the same for every new row. A row at the end of its ladder stays put. Each ladder runs narrowest first: `this time only`, `this exact command`, suggested templates, then token prefixes from the longest to the shortest, with the [path components](#path-components) of a word between the two prefixes it separates. The shortest prefix names the program alone, such as `cargo *`, and needs [confirmation](#confirming-broad-grants). A row starts on its suggested template, else on its derived prefix, else on the exact command.
 
 Answers 2 and 3 count the rows they remember, as in `these 3 commands`, or name the scope when only one row is remembered. With every row on `this time only`, they are left out. Answer 2 remembers each row for this conversation, and answer 3 in this project. The [step-through](#step-through) gives each command its own lifetime.
 
@@ -347,11 +347,11 @@ Regex uses Rust's finite-automata regular-expression engine, with whole-argument
 
 ### Writing your own pattern
 
-To remember a token prefix of your own, choose `your own pattern…` in Customize or `Your own pattern…` on a step-through page. A prefix must end in `*`, hold at least one literal token before it, use at most eight tokens, and match the command. The line under the field says whether it matches or names the reason it is refused. `Enter` accepts a matching pattern and `Esc` leaves the field. Caudra validates the text without running it.
+To remember a token prefix of your own, choose `your own pattern…` in Customize or `Your own pattern…` on a step-through page. A prefix must end in a bare `*` or end its last word in `*` right after `/`, `=`, `:`, or `@`, as in `gh api repos/acme/*`. It must hold at least one literal token before the wildcard, use at most eight tokens, and match the command. The line under the field says whether it matches or names the reason it is refused. `Enter` accepts a matching pattern and `Esc` leaves the field. Caudra validates the text without running it.
 
 Two patterns are accepted with a caution:
 
-- A pattern with one literal covers a whole program, such as `python *`. It reads `⚠ Any use of this program.` and needs the same [confirmation](#confirming-broad-grants) as `any shell command`. Typing a pattern Caudra offers for that command, such as `ls *`, is graded like the offered scope rather than as a broad grant.
+- A pattern with one literal covers a whole program, such as `python *`. It reads `⚠ Any use of this program.` and needs the same [confirmation](#confirming-broad-grants) as `any shell command`. Typing a pattern Caudra offers for that command, such as `ls *`, is graded like the offered scope rather than as a broad grant. A path after the one literal, as in `cat /etc/*`, drops the caution unless the program can run code, as `python3 scripts/*` can.
 - A pattern overlapping a builtin always-ask family, such as `git push *`, reads `⚠ Overlaps commands Caudra always asks about.` It is allowed because those are often the commands worth shortcutting, so read it before confirming.
 
 Grading is structural. It checks the shape of the pattern and that it matches the command, and it cannot know what a program does with its arguments. `sed -n *` grades clean, yet GNU `sed` can run shell commands through the `e` escape. Write patterns for programs whose arguments you understand.
@@ -512,7 +512,7 @@ Builtin policy, remote policy, and entries without a verified local source or su
 
 Project and global prompt decisions are stored in the `permission.rules` row of Caudra's owner-only SQLite state database. Authorization uses SHA-256 digests for exact input and resource constraints. Selected-input authorities use JSON pointers and a digest. Host-derived command patterns are clear-text policy, such as `git diff *`.
 
-Argument patterns and names-only browse grants use new durable selector or capability tags. Older binaries cannot open permission state containing those grants. There is no backward-compatibility layer. Update every Caudra process sharing the database before using these scopes, including sessions in other projects.
+Argument patterns and names-only browse grants use new durable selector or capability tags, and a token prefix that ends inside a [path component](#path-components) uses new pattern syntax. Older binaries cannot open permission state containing those grants. There is no backward-compatibility layer. Update every Caudra process sharing the database before using these scopes, including sessions in other projects.
 
 The permission manager also upgrades the database schema to fence delayed session saves. The upgrade requires other database users to close and creates a backup before changing the schema. It preserves existing rules without rebinding their authority. Older binaries cannot reopen the upgraded database.
 
@@ -606,7 +606,7 @@ deny = ["admin_delete"]
 
 <!-- /caudra-docgen:permissions-keys -->
 
-Shell allow and ask patterns use literal tokens followed by an optional bare `*` token. The wildcard matches zero or more complete arguments. It must be separated by a space, so `git status *` is valid and `git status*` is rejected. `allow = true` is the all-command `*` pattern for native shell tools. Patterns contain at most eight tokens and 256 bytes. Literal tokens may contain ASCII letters, digits, `.`, `_`, `/`, `@`, `:`, `=`, `+`, and `-`.
+Shell allow and ask patterns use literal tokens followed by an optional bare `*` token. The wildcard matches zero or more complete arguments. It must be separated by a space, so `git status *` is valid and `git status*` is rejected. The last literal token may instead end in `*` right after `/`, `=`, `:`, or `@`, which leaves the rest of that one argument open as a [path component](#path-components) does. `gh api repos/acme/*` matches `gh api repos/acme/tool` with nothing after it, and `gh api repos/acme/* *` also allows more arguments. `allow = true` is the all-command `*` pattern for native shell tools. Patterns contain at most eight tokens and 256 bytes. Literal tokens may contain ASCII letters, digits, `.`, `_`, `/`, `@`, `:`, `=`, `+`, and `-`.
 
 Token prefix patterns do not authorize redirects to ordinary files or heredocs. These produce a protected request carrying the complete original command. Literal `/dev/null` redirects and file descriptor duplication such as `2>&1` can remain reviewable when their effects are understood. Argument patterns exclude all redirects. Path-qualified executables remain path-qualified, so `git status *` does not authorize `/tmp/git status`.
 
@@ -627,6 +627,8 @@ A configured scope matches glob-like, whatever its effect:
 | `*` or `**` | Any scope |
 | `prefix*` | Values starting with the prefix |
 | `cmd *` | Bare `cmd` or `cmd` followed by arguments |
+| `cmd dir/*` | `cmd` with one argument under `dir/`, for a shell scope |
+| `cmd dir/* *` | The same argument, followed by any arguments |
 | `dir/**` | The directory and descendants, using path components |
 | Other | Exact text |
 
@@ -680,7 +682,7 @@ In [Customize](#customize), the TUI can allow a whole MCP tool with any argument
 
 Bash analysis starts from the normalized initial working directory and tracks the possible directory at each command. Basic `&&`, `||`, `;`, and pipeline expressions can receive per-command scopes when control flow and context are proven. Reusable argument patterns require one known effective workdir. Unknown or ambiguous context falls back to manual exact-call review instead of assuming a directory or learning a sequence template.
 
-The parser preserves executable directory prefixes for allow matching. `/usr/bin/git status --short` therefore does not inherit `git status *` authority. Deny and ask rules also check the normalized executable name, so `rm *` still restricts `/bin/rm`. Quotes keep argument boundaries, and a wildcard consumes complete arguments rather than arbitrary text.
+The parser preserves executable directory prefixes for allow matching. `/usr/bin/git status --short` therefore does not inherit `git status *` authority. Deny and ask rules also check the normalized executable name, so `rm *` still restricts `/bin/rm`. Quotes keep argument boundaries, and a wildcard consumes complete arguments, or the rest of one argument after a [path component](#path-components), rather than arbitrary text.
 
 A shell prompt can offer a token prefix derived from the reviewed command. A curated table names the families whose first operand is data rather than a subcommand, so `rg needle src/` offers `rg *` and keeps the search term out of the rule. The table also names the families whose subcommand sits behind a namespace token, so `npm run build` offers `npm run build *`. Outside the table the leading lowercase words become the prefix, so `git commit -m "message"` offers `git commit *`. This prefix heuristic is separate from generic argument-pattern recognition.
 
@@ -731,6 +733,26 @@ The initial working directory is context, not confinement. An approved shell com
 The builtin read-only classifier is conservative about mutation flags, executable paths, expansions, and named file operands. For example, `git branch -D`, tag creation, and reflog expiration do not receive read-only authority. A path-qualified executable such as `./cat` does not inherit the builtin reader allowance, and an explicitly named protected operand such as `.env` requires review. These checks do not guarantee containment of recursive reads, program configuration, or repository code. Build and test commands are not read-only exemptions.
 
 `execution_environment` still requires explicit approval under normal prompting policy. Its fixed probes can invoke sudo policy hooks or refresh credentials. A remembered exact grant can avoid repeated prompts without treating the tool as a pure read. Plan mode asks before running it as well, and [Plan mode](#plan-mode) describes which grants apply there.
+
+### Path components
+
+Between two token prefixes, a ladder also cuts the word they differ by wherever a path component ends. It cuts after `/`, `=`, `:`, or `@`, where `Ctrl+W` also stops in the composer. A dot, a dash, or an underscore never cuts a word, so `file.tar.gz` and `kebab-case` stay whole. Each cut is offered twice. `gh api repos/acme/*` allows one word under `repos/acme/` with nothing after it, and `gh api repos/acme/* *` also allows any arguments after that word. `gh api repos/acme/tool/issues` climbs like this:
+
+```
+this exact command
+gh api repos/acme/tool/*
+gh api repos/acme/tool/* *
+gh api repos/acme/*
+gh api repos/acme/* *
+gh api repos/*
+gh api repos/* *
+gh api *
+gh *
+```
+
+Cuts never change where the row starts. A word followed by more words offers only the rungs ending in ` *`, so `docker -H tcp://host run nginx` offers `docker -H tcp://* *`. A flag value is cut too, so `gh pr list --repo=acme/tool` offers `gh pr list --repo=acme/*` and `gh pr list --repo=*`, and still starts on `gh pr list *`. A word offers at most its eight deepest cuts.
+
+The open part of the word must reach the command exactly as written. It cannot hold a blank, a `..` component, or anything the shell would expand or read as an operator, so `gh api repos/acme/*` covers neither `gh api repos/acme/../other` nor `gh api repos/acme/$(id)`. Quoting is fine, so `gh api 'repos/acme/tool?state=open'` is covered. Shells, interpreters, wrappers, and privileged and indirect commands get no cuts, because the start of their word can be the start of the code they run. Cuts that overlap a default ask family are left out, as prefixes are. Older binaries cannot open permission state that remembers a cut, as [Storage and recovery](#storage-and-recovery) describes.
 
 ## Plugin rules
 

@@ -10,7 +10,9 @@
 
 use std::ops::Range;
 
-use super::words::{component_boundary_left, component_boundary_right, is_word};
+use caudra_workspace::path_components::{component_boundary_left, component_boundary_right};
+
+use super::words::is_word;
 
 const INDENT_WIDTH: usize = 4;
 const TAB: char = '\t';

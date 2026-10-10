@@ -174,6 +174,22 @@ mod tests {
         assert_eq!(covered("pwdx 1"), [false]);
     }
 
+    #[test_case("gh api repos/x/y", true ; "a_word_under_the_start")]
+    #[test_case("gh api repos/x/y --paginate", false ; "arguments_after_the_word")]
+    #[test_case("gh api repos/xy", false ; "a_longer_name")]
+    #[test_case("gh api repos/x/../y", false ; "climbing_out")]
+    fn a_configured_start_of_a_word_covers_only_words_under_it(command: &str, expected: bool) {
+        let manager = mgr_with(
+            make_config(vec![shell_policy_rule("gh api repos/x/*", Effect::Allow)]),
+            PathBuf::from("/tmp"),
+        );
+        let request = shell_request(&[command], workcell_shell_subject());
+        assert_eq!(
+            covered_flags(&coverage_with(&manager, &request, false, &[])),
+            [expected]
+        );
+    }
+
     #[test]
     fn normalized_executable_names_apply_only_to_restrictive_shell_policy() {
         let manager = mgr_with(
@@ -498,6 +514,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selector, original);
+    }
+
+    #[test_case("git status *", true ; "any_arguments")]
+    #[test_case("gh api repos/x/*", true ; "a_start_of_a_word")]
+    #[test_case("gh api repos/x/* *", true ; "a_start_and_any_arguments")]
+    #[test_case("git status", false ; "an_exact_command")]
+    #[test_case("git sta*", false ; "a_raw_prefix")]
+    fn a_configured_command_scope_with_a_pattern_wildcard_is_a_pattern(scope: &str, pattern: bool) {
+        assert_eq!(
+            matches!(
+                configured_selector(scope, &PermissionResourceKind::Command),
+                PermissionResourceSelector::CommandPattern { .. }
+            ),
+            pattern
+        );
     }
 
     #[cfg(unix)]

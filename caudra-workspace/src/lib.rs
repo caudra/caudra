@@ -8,6 +8,7 @@ mod changes;
 mod error;
 mod identity;
 mod path;
+pub mod path_components;
 mod resource;
 mod service;
 mod transfer;

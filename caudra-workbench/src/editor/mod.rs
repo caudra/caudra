@@ -7,7 +7,7 @@ pub mod history;
 pub mod render;
 pub mod rendered;
 pub mod text_field;
-pub mod words;
+mod words;
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};

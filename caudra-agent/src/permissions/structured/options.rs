@@ -20,7 +20,9 @@ use super::{
     trusted_command_observation,
 };
 use crate::permissions::{
-    command_pattern::{ancestor_prefixes, grade_command_pattern, reusable_prefix},
+    command_pattern::{
+        PatternParts, ancestor_prefixes, grade_command_pattern, ladder_rank, reusable_prefix,
+    },
     manager::PatternCandidates,
     pattern_matching::CompiledPattern,
     pattern_recognition::{
@@ -61,6 +63,8 @@ pub const COMMAND_EXACT_PREFIX: &str = "command_exact_";
 pub const COMMAND_PATTERN_PREFIX: &str = "command_pattern_";
 pub const COMMAND_TEMPLATE_PREFIX: &str = "command_template_";
 const COMMAND_PREFIX_PREFIX: &str = "command_prefix_";
+const COMPONENT_RUNG_MARK: &str = "_c";
+const ARGUMENTS_RUNG_MARK: &str = "_args";
 
 pub(super) const EXACT_COMMAND_CHIP: &str = "this command";
 
@@ -246,8 +250,9 @@ fn prune_incomparable_prefixes(options: &mut Vec<PermissionRuleOption>) {
     let incomparable: Vec<bool> = options
         .iter()
         .map(|option| {
-            let Some(words) =
-                fixed_words(option).filter(|_| option.id.starts_with(COMMAND_PREFIX_PREFIX))
+            let Some(rung) = command_pattern(option)
+                .filter(|_| option.id.starts_with(COMMAND_PREFIX_PREFIX))
+                .and_then(PatternParts::parse)
             else {
                 return false;
             };
@@ -257,41 +262,62 @@ fn prune_incomparable_prefixes(options: &mut Vec<PermissionRuleOption>) {
                     template.id.starts_with(COMMAND_TEMPLATE_PREFIX)
                         && option_row(template) == option_row(option)
                 })
-                .filter_map(fixed_words)
-                .any(|fixed| !fixed.starts_with(&words))
+                .filter_map(template_definition)
+                .any(|definition| !rung_contains(&rung, definition))
         })
         .collect();
     let mut incomparable = incomparable.into_iter();
     options.retain(|_| !incomparable.next().unwrap_or_default());
 }
 
-fn literal_head(option: &PermissionRuleOption) -> Option<usize> {
-    fixed_words(option).map(|words| words.len())
+/// Whether every command a template names starts with the words a rung fixes,
+/// and has no more words than the rung lets through.
+fn rung_contains(rung: &PatternParts, template: &PatternDefinition) -> bool {
+    let fixed = template_fixed_words(template);
+    fixed.starts_with(&rung.literals)
+        && rung.component.is_none_or(|start| {
+            fixed
+                .get(rung.literals.len())
+                .is_some_and(|word| word.starts_with(start))
+        })
+        && (rung.wildcard || template.argv.len() == rung.fixed_words().count())
 }
 
-/// The literal words a command rung fixes before it matches anything, so the
-/// fewer it fixes the wider it reaches.
-fn fixed_words(option: &PermissionRuleOption) -> Option<Vec<&str>> {
+/// How many words a command rung fixes before it matches anything, a word it
+/// fixes only the start of among them, so the fewer it fixes the wider it
+/// reaches.
+fn literal_head(option: &PermissionRuleOption) -> Option<usize> {
+    match command_pattern(option) {
+        Some(pattern) => PatternParts::parse(pattern).map(|parts| parts.fixed_words().count()),
+        None => {
+            template_definition(option).map(|definition| template_fixed_words(definition).len())
+        }
+    }
+}
+
+fn command_pattern(option: &PermissionRuleOption) -> Option<&str> {
     match &option.rule.resources.first()?.selector {
-        PermissionResourceSelector::CommandPattern { pattern } => Some(
-            pattern
-                .strip_suffix(" *")
-                .unwrap_or(pattern)
-                .split_whitespace()
-                .collect(),
-        ),
-        PermissionResourceSelector::CommandTemplate { definition } => Some(
-            definition
-                .argv
-                .iter()
-                .map_while(|token| match token {
-                    PatternToken::Exact { value, .. } => Some(value.as_str()),
-                    PatternToken::Slot { .. } => None,
-                })
-                .collect(),
-        ),
+        PermissionResourceSelector::CommandPattern { pattern } => Some(pattern),
         _ => None,
     }
+}
+
+fn template_definition(option: &PermissionRuleOption) -> Option<&PatternDefinition> {
+    match &option.rule.resources.first()?.selector {
+        PermissionResourceSelector::CommandTemplate { definition } => Some(definition),
+        _ => None,
+    }
+}
+
+fn template_fixed_words(definition: &PatternDefinition) -> Vec<&str> {
+    definition
+        .argv
+        .iter()
+        .map_while(|token| match token {
+            PatternToken::Exact { value, .. } => Some(value.as_str()),
+            PatternToken::Slot { .. } => None,
+        })
+        .collect()
 }
 
 /// Each command's ladder starts on its suggested template, else its reusable
@@ -922,13 +948,12 @@ pub(super) fn add_command_options(
             .filter(|pattern| Some(pattern) != default.as_ref())
             .chain(default.clone())
             .collect();
-        patterns.sort_by_key(|pattern| Reverse(pattern.split_whitespace().count()));
+        patterns.sort_by_key(|pattern| Reverse(ladder_rank(pattern)));
         for pattern in patterns {
             let id = if Some(&pattern) == default.as_ref() {
                 format!("{COMMAND_PATTERN_PREFIX}{index}")
             } else {
-                let literals = pattern.split_whitespace().count() - 1;
-                format!("{COMMAND_PREFIX_PREFIX}{index}_{literals}")
+                prefix_rung_id(index, &pattern)
             };
             let confirmation = grade_command_pattern(&pattern, &resource.value)
                 .ok()
@@ -950,6 +975,21 @@ pub(super) fn add_command_options(
             });
         }
     }
+}
+
+/// A rung's ID names its row and how much of the command it fixes, so the
+/// same rung keeps its ID however the ladder around it changes: `gh api *` on
+/// row 0 is `command_prefix_0_2`, `gh api repos/*` is `command_prefix_0_2_c6`,
+/// and `gh api repos/* *` is `command_prefix_0_2_c6_args`.
+fn prefix_rung_id(row: usize, pattern: &str) -> String {
+    let parts = PatternParts::parse(pattern);
+    let literals = parts.as_ref().map_or(0, |parts| parts.literals.len());
+    let open = match parts.and_then(|parts| Some((parts.component?, parts.wildcard))) {
+        Some((start, true)) => format!("{COMPONENT_RUNG_MARK}{}{ARGUMENTS_RUNG_MARK}", start.len()),
+        Some((start, false)) => format!("{COMPONENT_RUNG_MARK}{}", start.len()),
+        None => String::new(),
+    };
+    format!("{COMMAND_PREFIX_PREFIX}{row}_{literals}{open}")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2805,6 +2845,27 @@ mod tests {
     #[test_case("python3 x.py", &[
         ("command_exact_0", EXACT_COMMAND_CHIP, true, false),
     ]; "an_interpreter_never_reaches_its_bare_rung")]
+    #[test_case("gh api repos/acme/tool/issues", &[
+        ("command_exact_0", EXACT_COMMAND_CHIP, true, false),
+        ("command_prefix_0_2_c16", "gh api repos/acme/tool/*", false, false),
+        ("command_prefix_0_2_c16_args", "gh api repos/acme/tool/* *", false, false),
+        ("command_prefix_0_2_c11", "gh api repos/acme/*", false, false),
+        ("command_prefix_0_2_c11_args", "gh api repos/acme/* *", false, false),
+        ("command_prefix_0_2_c6", "gh api repos/*", false, false),
+        ("command_prefix_0_2_c6_args", "gh api repos/* *", false, false),
+        ("command_prefix_0_2", "gh api *", false, false),
+        ("command_prefix_0_1", "gh *", false, true),
+    ]; "a_path_climbs_one_component_at_a_time")]
+    #[test_case("gh pr list --repo=acme/tool", &[
+        ("command_exact_0", EXACT_COMMAND_CHIP, false, false),
+        ("command_prefix_0_3_c12", "gh pr list --repo=acme/*", false, false),
+        ("command_prefix_0_3_c12_args", "gh pr list --repo=acme/* *", false, false),
+        ("command_prefix_0_3_c7", "gh pr list --repo=*", false, false),
+        ("command_prefix_0_3_c7_args", "gh pr list --repo=* *", false, false),
+        ("command_pattern_0", "gh pr list *", true, false),
+        ("command_prefix_0_2", "gh pr *", false, false),
+        ("command_prefix_0_1", "gh *", false, true),
+    ]; "a_cut_never_moves_the_start_off_the_reusable_prefix")]
     fn a_row_climbs_its_ancestors_to_a_broad_bare_rung(
         command: &str,
         expected: &[(&str, &str, bool, bool)],

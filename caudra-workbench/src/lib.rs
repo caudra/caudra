@@ -24,7 +24,7 @@ mod view;
 
 pub use action::WorkbenchAction;
 pub use editor::rendered::{PaintMarkdown, PaintedMarkdown};
-pub use editor::{DocumentKey, TabLabel, buffer, history, render, text_field, words};
+pub use editor::{DocumentKey, TabLabel, buffer, history, render, text_field};
 pub use fs::backend::{
     BackendDriver, BackendError, BackendEvent, BackendRevision, ListResult, LoadedFile,
     LocalFilesystem, MutationGate, RequestId, ResourceEntry, SearchMatch, SearchResult,

@@ -15,7 +15,7 @@ pub use caudra_storage::permission_state::{
     PermissionReview, PermissionReviewResource, PermissionReviewSource,
 };
 pub use caudra_storage::sessions::PermissionMode;
-pub use command_pattern::{PatternFault, PatternGrade, grade_command_pattern};
+pub use command_pattern::{PatternFault, PatternGrade, PatternParts, grade_command_pattern};
 pub use sed_script::{sed_only_prints, sed_written_files};
 use structured::NORMALIZED_COMMAND_ATTRIBUTE;
 pub(crate) use structured::hex_encode;

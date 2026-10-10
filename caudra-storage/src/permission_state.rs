@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use caudra_workspace::path_components::is_separator;
 use caudra_workspace::{
     AuthenticatedPrincipalId, AuthorityIdentity, ProjectIdentity, SessionWorkspaceBinding,
 };
@@ -48,6 +49,8 @@ pub const FILESYSTEM_BROWSE_CONTRACTS: &[&str] = &["file.read.v1", "file.glob.v1
 pub const RAW_RESOURCE_VALUES_NOT_DURABLE: &str = "raw resource values cannot be stored durably";
 pub const COMMAND_PATTERN_MAX_BYTES: usize = 256;
 pub const COMMAND_PATTERN_MAX_TOKENS: usize = 8;
+pub const COMMAND_PATTERN_WILDCARD: &str = "*";
+pub const MISPLACED_COMMAND_WILDCARD: &str = "command pattern wildcard must be a bare final token separated by a space, or end the last word right after / = : or @";
 const SHA256_HEX_LEN: usize = 64;
 const STALE_INVENTORY: &str = "permission inventory changed; create and review a fresh preview";
 pub const REVIEW_MAX_STRING_BYTES: usize = 4096;
@@ -1200,19 +1203,20 @@ pub fn validate_command_pattern(pattern: &str) -> Result<(), String> {
             "command pattern must contain 1 to {COMMAND_PATTERN_MAX_TOKENS} tokens"
         ));
     }
+    let words = tokens.len() - usize::from(tokens.last() == Some(&COMMAND_PATTERN_WILDCARD));
     for (index, token) in tokens.iter().enumerate() {
-        if *token == "*" {
+        if *token == COMMAND_PATTERN_WILDCARD {
             if index + 1 != tokens.len() {
                 return Err("command pattern wildcard must be the final token".into());
             }
             continue;
         }
-        if token.contains('*') {
-            return Err(
-                "command pattern wildcard must be a bare final token separated by a space".into(),
-            );
-        }
-        if !token.bytes().all(|byte| {
+        let literal = match wildcard_component(token) {
+            Some(prefix) if index > 0 && index + 1 == words => prefix,
+            _ if token.contains('*') => return Err(MISPLACED_COMMAND_WILDCARD.into()),
+            _ => token,
+        };
+        if !literal.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()
                 || matches!(byte, b'.' | b'_' | b'/' | b'@' | b':' | b'=' | b'+' | b'-')
         }) {
@@ -1220,6 +1224,15 @@ pub fn validate_command_pattern(pattern: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The start of a word a pattern's last word leaves open: `repos/x/` in
+/// `repos/x/*`. The `*` may only follow a path separator, so a pattern cuts a
+/// word where a component delete would and never mid-name, as `status*` would.
+pub fn wildcard_component(token: &str) -> Option<&str> {
+    token
+        .strip_suffix(COMMAND_PATTERN_WILDCARD)
+        .filter(|prefix| prefix.ends_with(is_separator))
 }
 
 fn validate_digest(digest: &str) -> Result<(), PermissionStateError> {
@@ -1258,17 +1271,18 @@ mod tests {
 
     use super::{
         COMMAND_PATTERN_MAX_BYTES, FAMILY_REQUIRES_FILESYSTEM_KIND, FAMILY_REQUIRES_MCP_SUBJECT,
-        FAMILY_REQUIRES_READ_ACCESS, FAMILY_REQUIRES_RESOURCES, INVALID_REVIEW, PERMISSION_RULES,
-        PermissionArgumentConstraint, PermissionCapabilityFamily, PermissionExecutorKind,
-        PermissionLifetime, PermissionResourceAccess, PermissionResourceConstraint,
-        PermissionResourceKind, PermissionResourceSelector, PermissionReview,
-        PermissionReviewResource, PermissionReviewSource, PermissionRuleRecord, PermissionState,
-        PermissionStateError, PermissionSubject, RAW_RESOURCE_VALUES_NOT_DURABLE,
-        REVIEW_MAX_ATTRIBUTES, REVIEW_MAX_INPUT_BYTES, REVIEW_MAX_INPUT_DEPTH,
-        REVIEW_MAX_INPUT_NODES, REVIEW_MAX_JSON_BYTES, REVIEW_MAX_RESOURCES,
-        REVIEW_MAX_STRING_BYTES, RemotePermissionIdentity, SHA256_HEX_LEN, STALE_INVENTORY,
-        StructuredPermissionEffect, StructuredPermissionRule, inventory_fingerprint,
-        read_inventory, replace_reviewed, validate_command_pattern, validate_conversation_record,
+        FAMILY_REQUIRES_READ_ACCESS, FAMILY_REQUIRES_RESOURCES, INVALID_REVIEW,
+        MISPLACED_COMMAND_WILDCARD, PERMISSION_RULES, PermissionArgumentConstraint,
+        PermissionCapabilityFamily, PermissionExecutorKind, PermissionLifetime,
+        PermissionResourceAccess, PermissionResourceConstraint, PermissionResourceKind,
+        PermissionResourceSelector, PermissionReview, PermissionReviewResource,
+        PermissionReviewSource, PermissionRuleRecord, PermissionState, PermissionStateError,
+        PermissionSubject, RAW_RESOURCE_VALUES_NOT_DURABLE, REVIEW_MAX_ATTRIBUTES,
+        REVIEW_MAX_INPUT_BYTES, REVIEW_MAX_INPUT_DEPTH, REVIEW_MAX_INPUT_NODES,
+        REVIEW_MAX_JSON_BYTES, REVIEW_MAX_RESOURCES, REVIEW_MAX_STRING_BYTES,
+        RemotePermissionIdentity, SHA256_HEX_LEN, STALE_INVENTORY, StructuredPermissionEffect,
+        StructuredPermissionRule, inventory_fingerprint, read_inventory, replace_reviewed,
+        validate_command_pattern, validate_conversation_record,
     };
     use crate::id::CaudraId;
     use crate::sessions::{SESSIONS_DB_FILE, SessionLease};
@@ -1728,6 +1742,12 @@ mod tests {
             "git status *",
             "cargo-test_1 ./src /tmp/foo user@host key=value +flag foo:bar",
             "one two three four five six seven *",
+            "gh api repos/tensorninja/*",
+            "gh api repos/tensorninja/* *",
+            "docker -H tcp://* *",
+            "gh pr --repo=*",
+            "scp user@*",
+            "scp host:*",
             maximum_length.as_str(),
         ] {
             assert!(
@@ -1752,6 +1772,12 @@ mod tests {
             "git\nstatus",
             "git café",
             "git $(pwd)",
+            "/usr/bin/*",
+            "gh api repos/* issues",
+            "gh api repos/* repos/*",
+            "gh api repos/**",
+            "gh api repos/*/x/*",
+            "gh api a,*",
             too_long.as_str(),
         ] {
             assert!(
@@ -1759,6 +1785,16 @@ mod tests {
                 "pattern should be rejected: {pattern:?}"
             );
         }
+    }
+
+    #[test_case("git status*" ; "mid_name")]
+    #[test_case("gh api repos/* issues" ; "not_the_last_word")]
+    #[test_case("/usr/bin/*" ; "the_executable")]
+    fn a_misplaced_wildcard_says_where_it_may_go(pattern: &str) {
+        assert_eq!(
+            validate_command_pattern(pattern),
+            Err(MISPLACED_COMMAND_WILDCARD.to_owned())
+        );
     }
 
     #[test]

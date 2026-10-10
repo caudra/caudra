@@ -3,7 +3,7 @@ use std::ops::Range;
 use caudra_workbench::buffer::{Buffer, Cursor, Edit};
 use caudra_workbench::history::History;
 use caudra_workbench::text_field::{self, EditCommand, FieldKind, Motion, TextCommand, TextKey};
-use caudra_workbench::words::{component_boundary_left, component_boundary_right};
+use caudra_workspace::path_components::{component_boundary_left, component_boundary_right};
 use crossterm::event::KeyEvent;
 
 use crate::highlight::TAB_SPACES;
