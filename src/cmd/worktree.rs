@@ -11,7 +11,7 @@ use std::process::Stdio;
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 
-use caudra_agent::herdr::{HerdrEnv, resume_command_line};
+use caudra_agent::herdr::{HerdrEnv, OpenedWorkspace, resume_command_line};
 use caudra_agent::worktree::{
     self, Backend, CreateRequest, Removal, RemoveRequest, Request, counterpart, label,
 };
@@ -137,12 +137,13 @@ fn create(
         }
     };
     let moved = format!("This session moved into worktree {name}");
-    match (created.pane, backend.herdr()) {
-        (Some(pane), Some(herdr)) => {
+    match (created.workspace, backend.herdr()) {
+        (Some(workspace), Some(herdr)) => {
             let hand_off = HandOff {
                 id: request.session,
                 relocation: &relocation,
-                pane: &pane,
+                workspace: &workspace,
+                name: &name,
                 herdr,
             };
             hand_off.run(tabs, focused, storage, notes, moved)
@@ -166,13 +167,16 @@ fn create(
 struct HandOff<'a> {
     id: CaudraId,
     relocation: &'a SessionRelocation,
-    pane: &'a str,
+    workspace: &'a OpenedWorkspace,
+    /// What the new tab and pane are labelled, the worktree's branch.
+    name: &'a str,
     herdr: &'a HerdrEnv,
 }
 
 impl HandOff<'_> {
     /// Moves the session while its tab still holds it, lets go of it, and has
-    /// Herdr resume it in the new pane.
+    /// Herdr resume it in the new pane. A process left without tabs exits once
+    /// the session runs there; otherwise it stays to say how to resume it.
     fn run(
         self,
         mut tabs: Vec<SessionTab>,
@@ -192,11 +196,31 @@ impl HandOff<'_> {
                 focused -= 1;
             }
         }
+        let cli = self.herdr.cli();
+        let OpenedWorkspace {
+            tab_id, pane_id, ..
+        } = self.workspace;
+        if let Err(error) = cli
+            .tab_rename(tab_id, self.name)
+            .and_then(|()| cli.pane_rename(pane_id, self.name))
+        {
+            tracing::warn!(%error, tab = tab_id, pane = pane_id, "Herdr did not label the new tab and pane");
+        }
         let command = resume_command_line(&self.id.to_string());
-        notes.push(match self.herdr.cli().pane_run(self.pane, &command) {
-            Ok(()) => format!("{moved} and went on in its Herdr workspace"),
-            Err(error) => format!("{PANE_FAILED}: {error}. Resume it there with: {command}"),
-        });
+        match cli.pane_run(pane_id, &command) {
+            Ok(()) => {
+                notes.push(format!("{moved} and went on in its Herdr workspace"));
+                if tabs.is_empty() {
+                    return Executed {
+                        handled: Handled::Exit,
+                        notes,
+                    };
+                }
+            }
+            Err(error) => notes.push(format!(
+                "{PANE_FAILED}: {error}. Resume it there with: {command}"
+            )),
+        }
         let focused = focused.min(tabs.len().saturating_sub(1));
         Executed::resumed(tabs, focused, notes)
     }
@@ -448,7 +472,7 @@ mod tests {
     use std::process::Command;
     use std::sync::Arc;
 
-    use caudra_agent::herdr::{HerdrEnv, resume_command_line};
+    use caudra_agent::herdr::{HerdrEnv, OpenedWorkspace, resume_command_line};
     use caudra_agent::worktree::{
         Backend, Changes, CreateRequest, RemoveRequest, Request, checkout_path,
     };
@@ -460,7 +484,8 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        CREATE_FAILED, Executed, HandOff, Handled, REMOVAL_KEPT, execute, relocate, relocation,
+        CREATE_FAILED, Executed, HandOff, Handled, PANE_FAILED, REMOVAL_KEPT, execute, relocate,
+        relocation,
     };
 
     const MODEL: &str = "test/model";
@@ -469,8 +494,13 @@ mod tests {
     const MISSING_BASE: &str = "missing-revision";
     const LINKED: &str = "linked";
     const WORKTREES: &str = "worktrees";
+    const WORKSPACE: &str = "w2";
+    const TAB: &str = "w2:t1";
     const PANE: &str = "w2:p1";
+    const LABEL: &str = "login";
     const RECORD: &str = "argv";
+    const HERDR_SUCCEEDS: &str = "exit 0";
+    const HERDR_FAILS: &str = "echo 'no such pane' >&2; exit 1";
     const MOVED: &str = "This session moved";
     const RELOCATION_NOTE: &str = "Session relocation was not committed";
 
@@ -578,14 +608,15 @@ mod tests {
                 .unwrap()
         }
 
-        /// A Herdr that records what it was asked and answers nothing.
-        fn herdr(&self) -> HerdrEnv {
+        /// A Herdr that records every call it gets, one argument per line,
+        /// then runs `outcome`.
+        fn herdr(&self, outcome: &str) -> HerdrEnv {
             let binary = self.base.join("herdr");
             let record = self.base.join(RECORD);
             fs::write(
                 &binary,
                 format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n{outcome}\n",
                     record.display()
                 ),
             )
@@ -597,6 +628,43 @@ mod tests {
                 pane_id: PANE.into(),
                 workspace_id: None,
             }
+        }
+
+        fn herdr_calls(&self) -> Vec<String> {
+            fs::read_to_string(self.base.join(RECORD))
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+
+        /// Hands session `moved` to the root pane of a new worktree's
+        /// workspace, through a Herdr that runs `outcome` for every call.
+        fn hand_off(
+            &self,
+            tabs: Vec<SessionTab>,
+            focused: usize,
+            moved: CaudraId,
+            outcome: &str,
+        ) -> (Executed, PathBuf) {
+            let worktree = self.worktree();
+            let herdr = self.herdr(outcome);
+            let request = relocation(&self.storage, &[moved], &worktree).unwrap();
+            let workspace = OpenedWorkspace {
+                workspace_id: WORKSPACE.into(),
+                tab_id: TAB.into(),
+                pane_id: PANE.into(),
+                already_open: false,
+            };
+            let hand_off = HandOff {
+                id: moved,
+                relocation: &request,
+                workspace: &workspace,
+                name: LABEL,
+                herdr: &herdr,
+            };
+            let executed = hand_off.run(tabs, focused, &self.storage, Vec::new(), MOVED.into());
+            (executed, worktree)
         }
     }
 
@@ -722,21 +790,12 @@ mod tests {
         refocused: usize,
     ) {
         let repository = Repository::new();
-        let worktree = repository.worktree();
         let tabs: Vec<_> = (0..3).map(|_| repository.tab(&repository.root)).collect();
         let original = ids(&tabs);
         let moved = original[moving];
-        let herdr = repository.herdr();
-        let request = relocation(&repository.storage, &[moved], &worktree).unwrap();
-        let hand_off = HandOff {
-            id: moved,
-            relocation: &request,
-            pane: PANE,
-            herdr: &herdr,
-        };
 
-        let Executed { handled, .. } =
-            hand_off.run(tabs, focused, &repository.storage, Vec::new(), MOVED.into());
+        let (Executed { handled, .. }, worktree) =
+            repository.hand_off(tabs, focused, moved, HERDR_SUCCEEDS);
 
         let Handled::Continue { tabs, focused } = handled else {
             panic!("the tabs left here carry on");
@@ -746,10 +805,37 @@ mod tests {
         assert_eq!(tabs[focused].session.id, original[refocused]);
         assert_eq!(repository.stored_cwd(moved), worktree.to_string_lossy());
         assert!(SessionLease::acquire(&repository.storage, moved).is_ok());
-        let record = fs::read_to_string(repository.base.join(RECORD)).unwrap();
+        let resume = resume_command_line(&moved.to_string());
         assert_eq!(
-            record.lines().last(),
-            Some(resume_command_line(&moved.to_string()).as_str())
+            repository.herdr_calls(),
+            [
+                "tab", "rename", TAB, LABEL, "pane", "rename", PANE, LABEL, "pane", "run", PANE,
+                &resume
+            ]
         );
+    }
+
+    /// The pane is left to its shell only once the session runs elsewhere;
+    /// until then this process stays, and says how to resume it.
+    #[test_case(HERDR_SUCCEEDS, true ; "session_started")]
+    #[test_case(HERDR_FAILS, false ; "session_not_started")]
+    fn handing_off_the_last_session_exits_once_it_runs_there(outcome: &str, exits: bool) {
+        let repository = Repository::new();
+        let tab = repository.tab(&repository.root);
+        let moved = tab.session.id;
+
+        let (Executed { handled, notes }, worktree) =
+            repository.hand_off(vec![tab], 0, moved, outcome);
+
+        match handled {
+            Handled::Exit => assert!(exits, "{notes:?}"),
+            Handled::Continue { tabs, .. } => {
+                assert!(!exits && tabs.is_empty(), "{notes:?}");
+                assert!(notes.iter().any(|note| note.starts_with(PANE_FAILED)));
+            }
+            Handled::Relocate { .. } => panic!("Herdr hand-offs never relocate this process"),
+        }
+        assert_eq!(repository.stored_cwd(moved), worktree.to_string_lossy());
+        assert!(repository.herdr_calls().iter().any(|call| call == "run"));
     }
 }

@@ -158,6 +158,8 @@ impl WorktreeListing {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenedWorkspace {
     pub workspace_id: String,
+    /// The tab holding `pane_id`, whose label Herdr's tab bar shows.
+    pub tab_id: String,
     pub pane_id: String,
     /// Herdr only focused a workspace that was open already, so the pane is
     /// one the user has been working in.
@@ -173,6 +175,7 @@ pub struct OpenedWorktree {
 #[derive(Deserialize)]
 struct Opened {
     workspace: WorkspaceRef,
+    tab: TabRef,
     root_pane: PaneRef,
     #[serde(default)]
     worktree: Option<HerdrWorktree>,
@@ -183,6 +186,11 @@ struct Opened {
 #[derive(Deserialize)]
 struct WorkspaceRef {
     workspace_id: String,
+}
+
+#[derive(Deserialize)]
+struct TabRef {
+    tab_id: String,
 }
 
 #[derive(Deserialize)]
@@ -212,6 +220,7 @@ impl Opened {
         (
             OpenedWorkspace {
                 workspace_id: self.workspace.workspace_id,
+                tab_id: self.tab.tab_id,
                 pane_id: self.root_pane.pane_id,
                 already_open: self.already_open,
             },
@@ -303,6 +312,18 @@ impl HerdrCli {
     /// Types `command_line` into the shell of `pane_id` and presses Enter.
     pub fn pane_run(&self, pane_id: &str, command_line: &str) -> Result<(), HerdrError> {
         self.run(&pane_run_args(pane_id, command_line), LAYOUT_TIMEOUT)
+            .map(drop)
+    }
+
+    /// Sets the label Herdr shows for `pane_id`.
+    pub fn pane_rename(&self, pane_id: &str, label: &str) -> Result<(), HerdrError> {
+        self.run(&rename_args("pane", pane_id, label), LAYOUT_TIMEOUT)
+            .map(drop)
+    }
+
+    /// Sets the label Herdr's tab bar shows for `tab_id`.
+    pub fn tab_rename(&self, tab_id: &str, label: &str) -> Result<(), HerdrError> {
+        self.run(&rename_args("tab", tab_id, label), LAYOUT_TIMEOUT)
             .map(drop)
     }
 
@@ -433,6 +454,15 @@ fn pane_run_args(pane_id: &str, command_line: &str) -> Vec<OsString> {
     ])
 }
 
+fn rename_args(kind: &str, id: &str, label: &str) -> Vec<OsString> {
+    argv([
+        kind.as_ref(),
+        "rename".as_ref(),
+        id.as_ref(),
+        label.as_ref(),
+    ])
+}
+
 fn pane_args(subcommand: &str, pane_id: &str) -> Vec<OsString> {
     [
         "pane", subcommand, pane_id, "--source", SOURCE, "--agent", AGENT,
@@ -498,8 +528,10 @@ mod tests {
     const MAIN_ROOT: &str = "/work/app";
     const WORKTREE_PATH: &str = "/data/worktrees/app/feature-login";
     const BRANCH: &str = "feature/login";
+    const SPACED_LABEL: &str = "my checkout";
     const BASE: &str = "0123456789abcdef0123456789abcdef01234567";
     const WORKSPACE: &str = "w2";
+    const TAB: &str = "w2:t1";
     const ROOT_PANE: &str = "w2:p2";
     #[cfg(unix)]
     const SPLIT_PANE: &str = "w2:p3";
@@ -629,12 +661,21 @@ mod tests {
         assert_eq!(strings(worktree_remove_args(WORKSPACE, force)), expected);
     }
 
+    #[test_case("pane", ROOT_PANE ; "pane")]
+    #[test_case("tab", TAB ; "tab")]
+    fn a_rename_passes_the_label_as_one_argument(kind: &str, id: &str) {
+        assert_eq!(
+            strings(rename_args(kind, id, SPACED_LABEL)),
+            [kind, "rename", id, SPACED_LABEL]
+        );
+    }
+
     #[test]
     fn a_created_worktree_names_its_workspace_pane_and_path() {
         let result = serde_json::json!({
             "type": "worktree_created",
             "workspace": {"workspace_id": WORKSPACE, "label": "app"},
-            "tab": {"tab_id": "w2:t1"},
+            "tab": {"tab_id": TAB},
             "root_pane": {"pane_id": ROOT_PANE, "focused": true},
             "worktree": {"path": WORKTREE_PATH, "branch": BRANCH, "open_workspace_id": WORKSPACE},
         });
@@ -649,6 +690,7 @@ mod tests {
             OpenedWorktree {
                 workspace: OpenedWorkspace {
                     workspace_id: WORKSPACE.into(),
+                    tab_id: TAB.into(),
                     pane_id: ROOT_PANE.into(),
                     already_open: false,
                 },
@@ -665,6 +707,7 @@ mod tests {
     fn a_created_workspace_is_not_a_worktree() {
         let result = serde_json::json!({
             "workspace": {"workspace_id": WORKSPACE},
+            "tab": {"tab_id": TAB},
             "root_pane": {"pane_id": ROOT_PANE},
         });
 

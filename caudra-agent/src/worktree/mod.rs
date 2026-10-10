@@ -14,7 +14,7 @@ use caudra_storage::{paths, random_task_id};
 use thiserror::Error;
 use tracing::warn;
 
-use crate::herdr::{HerdrEnv, HerdrError, NOT_LINKED_WORKTREE};
+use crate::herdr::{HerdrEnv, HerdrError, NOT_LINKED_WORKTREE, OpenedWorkspace};
 use git::{Git, GitError};
 
 /// Starts every branch Caudra names itself, so its worktrees stand out.
@@ -123,8 +123,8 @@ pub enum Request {
 pub struct Created {
     pub root: PathBuf,
     pub branch: Option<String>,
-    /// The Herdr pane the session continues in.
-    pub pane: Option<String>,
+    /// The Herdr workspace whose root pane the session continues in.
+    pub workspace: Option<OpenedWorkspace>,
     /// Why the source's uncommitted changes did not come along.
     pub carry_failed: Option<String>,
 }
@@ -179,7 +179,7 @@ fn add(
             Ok(Created {
                 root: canonical(opened.worktree.path)?,
                 branch: opened.worktree.branch,
-                pane: Some(opened.workspace.pane_id),
+                workspace: Some(opened.workspace),
                 carry_failed: None,
             })
         }
@@ -208,7 +208,7 @@ fn add(
             Ok(Created {
                 root: canonical(path)?,
                 branch: Some(branch),
-                pane: None,
+                workspace: None,
                 carry_failed: None,
             })
         }

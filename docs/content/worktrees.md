@@ -48,11 +48,13 @@ The form has these fields:
 
 The session that created the worktree moves into it. It works in the same subdirectory there when that subdirectory exists, and otherwise at the worktree root. The session ID and conversation stay the same, and so does its plan, because the project state is shared. Permissions approved for the conversation and YOLO mode are detached, because they were granted for the directory the session left.
 
+Caudra checks that the session can [move](/docs/sessions/#moving-sessions-to-another-directory) before it creates anything. An active or paused workflow of the session stops the worktree. So does a pending revert of the session, or a pending file revert of another session in the same directory. The notice names that session. Unrevert there or send it a prompt, then try again.
+
 Uncommitted changes carry over through `git stash`. The stash is taken in the current checkout and applied in the new worktree, so the changes leave the current checkout. Carrying works only when the worktree starts at `HEAD`, because that is the one commit where the changes are sure to apply. If applying fails anyway, the changes go back to the current checkout and the worktree is kept.
 
 Outside Herdr, git creates the worktree under `worktrees.directory` as `<directory>/<repository>/<branch>`, with the branch turned into one path component. A branch named for you starts with `caudra/`. The process then follows the session into the worktree and reloads the project config there. See [`[worktrees]`](/docs/configuration/#worktrees) for the settings.
 
-Inside Herdr, Herdr creates the worktree and a workspace grouped with the repository's own. Herdr names the branch when you leave it empty. The session continues in the root pane of the new workspace, and its tab closes in the current pane. A fresh session opens there when that tab was the last one.
+Inside Herdr, Herdr creates the worktree and a workspace grouped with the repository's own. Herdr names the branch when you leave it empty. The session continues in the root pane of the new workspace. Caudra labels that pane and its Herdr tab with the branch. Its tab closes in the current pane. When that tab was the last one, Caudra exits and the pane returns to its shell. If Herdr cannot start the session in the new pane, Caudra stays open with a fresh session and shows the command that resumes it.
 
 The new pane runs the same Caudra executable. If an upgrade replaced it while Caudra was running, the pane runs the replacement at that path. If neither file remains, the pane runs `caudra` from `PATH`.
 

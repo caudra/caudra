@@ -2890,6 +2890,17 @@ impl SessionDatabase {
         Ok(locations)
     }
 
+    /// The session whose pending revert keeps `moving` from leaving `cwd`,
+    /// which [`Self::relocate_sessions`] refuses with
+    /// [`SessionError::RelocationBlocked`].
+    pub fn relocation_revert_blocker(
+        &self,
+        cwd: &str,
+        moving: &[CaudraId],
+    ) -> Result<Option<CaudraId>, SessionError> {
+        relocation_revert_blocker_on(&self.connection, cwd, |id| moving.contains(&id))
+    }
+
     pub fn relocate_sessions(
         &mut self,
         request: &SessionRelocation,
@@ -2960,21 +2971,15 @@ impl SessionDatabase {
             if root.cwd == request.destination {
                 continue;
             }
-            if !sources.contains_key(expected.cwd.as_str()) {
-                let pending = transaction
-                    .query_row(
-                        "SELECT id FROM sessions WHERE cwd = ?1 AND workspace_source IN ('', ?2) \
-                     AND json_extract(metadata, '$.pending_revert') IS NOT NULL LIMIT 1",
-                        params![expected.cwd, local.trust_anchor().as_str()],
-                        |row| row.get::<_, Vec<u8>>(0),
-                    )
-                    .optional()?;
-                if let Some(id) = pending {
-                    return Err(SessionError::RelocationBlocked {
-                        id: id_from_bytes(&id, "sessions.id")?,
-                        reason: RELOCATION_PENDING_REVERT,
-                    });
-                }
+            if !sources.contains_key(expected.cwd.as_str())
+                && let Some(id) = relocation_revert_blocker_on(&transaction, &expected.cwd, |id| {
+                    ids.contains(&id)
+                })?
+            {
+                return Err(SessionError::RelocationBlocked {
+                    id,
+                    reason: RELOCATION_PENDING_REVERT,
+                });
             }
             let workflow_pending: bool = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM workflow_runs WHERE session_id = ?1 \
@@ -5911,6 +5916,32 @@ fn clear_children(transaction: &Transaction<'_>, id: CaudraId) -> Result<(), Ses
     Ok(())
 }
 
+/// A session moving out of `cwd` with a pending revert of its own could not
+/// settle it after the move. Another session's revert blocks only when it
+/// put back files, which leave the checkout in the reverted state a moving
+/// session could carry off. A revert of its conversation alone stays in its
+/// history and concerns no one else.
+fn relocation_revert_blocker_on(
+    connection: &Connection,
+    cwd: &str,
+    is_moving: impl Fn(CaudraId) -> bool,
+) -> Result<Option<CaudraId>, SessionError> {
+    let local = StoredWorkspaceBinding::local_from_cwd("");
+    let mut statement = connection.prepare(
+        "SELECT id, json_extract(metadata, '$.pending_revert.file_status') IS NOT NULL \
+         FROM sessions WHERE cwd = ?1 AND workspace_source IN ('', ?2) \
+         AND json_extract(metadata, '$.pending_revert') IS NOT NULL",
+    )?;
+    let mut rows = statement.query(params![cwd, local.trust_anchor().as_str()])?;
+    while let Some(row) = rows.next()? {
+        let id = id_from_bytes(&row.get::<_, Vec<u8>>(0)?, "sessions.id")?;
+        if row.get::<_, bool>(1)? || is_moving(id) {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
 fn is_tombstoned(transaction: &Transaction<'_>, id: CaudraId) -> Result<bool, SessionError> {
     Ok(transaction
         .query_row(
@@ -6589,6 +6620,8 @@ mod tests {
     const TRIM_DROPS_COVERAGE: &str = "the transcript tier must not keep record coverage";
     const VERSION_UNCHANGED: &str = "mark_opened must not bump write_version";
     const RELOCATION_DESTINATION: &str = "/destination with spaces";
+    const CONVERSATION_REVERT: &str = "{}";
+    const FILE_REVERT: &str = r#"{"file_status":{}}"#;
     const RELOCATION_NESTED: &str = "/project/nested";
     const RELOCATION_DRAFT: &str = "draft with /project/reference";
     const RELOCATION_PLAN: &str = "/project/plan.md";
@@ -9431,28 +9464,53 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         );
     }
 
-    #[test_case(false; "affected_session_revert")]
-    #[test_case(true; "source_sibling_restore")]
-    fn relocation_rejects_pending_source_revert_metadata(sibling: bool) {
+    /// A moving session's own revert would be stranded, and another session's
+    /// file revert leaves the checkout reverted. Another session's
+    /// conversation revert is its own history, so the move goes ahead.
+    #[test_case(false, CONVERSATION_REVERT, true; "own_conversation_revert")]
+    #[test_case(false, FILE_REVERT, true; "own_file_revert")]
+    #[test_case(true, FILE_REVERT, true; "sibling_file_revert")]
+    #[test_case(true, CONVERSATION_REVERT, false; "sibling_conversation_revert")]
+    fn relocation_blocks_only_the_reverts_a_move_could_strand(
+        sibling: bool,
+        pending: &str,
+        blocked: bool,
+    ) {
         let (_temp, state_dir) = state_dir();
         let mut database = SessionDatabase::open(&state_dir).unwrap();
         let session = TestSession::new(MODEL, CWD);
         database.save(&session, None).unwrap();
         let request = relocation_request(&database, CWD, false);
-        let blocker = if sibling {
-            TestSession::new(MODEL, CWD)
+        let reverted = if sibling {
+            let sibling = TestSession::new(MODEL, CWD);
+            database.save(&sibling, None).unwrap();
+            sibling.id
         } else {
-            session
+            session.id
         };
-        if sibling {
-            database.save(&blocker, None).unwrap();
-        }
-        database.connection.execute("UPDATE sessions SET metadata = json_set(metadata, '$.pending_revert', json(?1)) WHERE id = ?2", params![if sibling { r#"{"file_status":{}}"# } else { "{}" }, blocker.id.as_bytes().as_slice()]).unwrap();
+        database.connection.execute("UPDATE sessions SET metadata = json_set(metadata, '$.pending_revert', json(?1)) WHERE id = ?2", params![pending, reverted.as_bytes().as_slice()]).unwrap();
         let before = database.local_session_locations().unwrap();
-        assert!(
-            matches!(database.relocate_sessions(&request), Err(SessionError::RelocationBlocked { id, reason: RELOCATION_PENDING_REVERT }) if id == blocker.id)
+
+        assert_eq!(
+            database
+                .relocation_revert_blocker(CWD, &[session.id])
+                .unwrap(),
+            blocked.then_some(reverted)
         );
-        assert_eq!(database.local_session_locations().unwrap(), before);
+        let result = database.relocate_sessions(&request);
+
+        if blocked {
+            assert!(
+                matches!(result, Err(SessionError::RelocationBlocked { id, reason: RELOCATION_PENDING_REVERT }) if id == reverted)
+            );
+            assert_eq!(database.local_session_locations().unwrap(), before);
+        } else {
+            result.unwrap();
+            assert_eq!(
+                root_on(&database.connection, session.id).unwrap().cwd,
+                RELOCATION_DESTINATION
+            );
+        }
     }
 
     #[test_case(WorkflowRunStatus::Active, true, false; "active")]

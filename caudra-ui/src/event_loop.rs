@@ -129,6 +129,10 @@ const FAST_SCROLL_FACTOR: u32 = 4;
 /// One row of finger travel moves the content one row.
 const TOUCH_SCROLL_LINES: u32 = 1;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Other processes sharing the database can hold its lock for seconds, a
+/// write waits up to five for it, and the writer runs its writes one after
+/// another. A move that gave up sooner would fail under ordinary contention.
+const RELOCATION_STORAGE_TIMEOUT: Duration = Duration::from_secs(30);
 const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const DELETE_BUSY_ERR: &str = "wait for the session to become idle before deleting it";
 const MODEL_POLICY_ERR: &str = "Model is not allowed by policy";
@@ -144,6 +148,7 @@ const UNBOUND_FLASH: &str = "default";
 const RELOCATION_LOCAL_ERR: &str = "Session relocation requires persistent local sessions";
 const RELOCATION_WORKBENCH_ERR: &str =
     "Save workbench buffers and wait for workbench operations before moving sessions";
+const SOURCE_REVERT_ERR: &str = "has reverted files in this directory, so no session can move out of it yet. Open that session, then unrevert or send a prompt there";
 const RELOCATION_CHANGED_ERR: &str = "Session selection changed; reopen the relocation picker";
 const RELOCATION_WORKFLOW_ERR: &str = "Stop active or paused workflows before moving sessions";
 const RELOCATION_SHUTDOWN_ERR: &str = "Session relocation aborted before changing directories";
@@ -895,6 +900,31 @@ fn refuse_resumable_workflows(database: &SessionDatabase, id: CaudraId) -> Resul
         return Err(format!("{RELOCATION_WORKFLOW_ERR}: {id}"));
     }
     Ok(())
+}
+
+/// The move storage would refuse for a pending revert, asked before a new
+/// worktree is created for a session that could not move into it.
+fn refuse_pending_source_revert(
+    database: &SessionDatabase,
+    cwd: &str,
+    moving: CaudraId,
+) -> Result<(), String> {
+    let Some(blocker) = database
+        .relocation_revert_blocker(cwd, &[moving])
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+    let title = database
+        .session_facts(Some(cwd))
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|facts| facts.id == blocker)
+        .map(|facts| facts.title)
+        .unwrap_or_default();
+    Err(format!(
+        "Session \"{title}\" ({blocker}) {SOURCE_REVERT_ERR}"
+    ))
 }
 
 /// Opens the checkout at `root` in a Herdr workspace grouped with its
@@ -4139,6 +4169,17 @@ impl<'t> EventLoop<'t> {
             let database = SessionDatabase::open_state(&self.ctx.storage)
                 .map_err(|error| error.to_string())?;
             refuse_resumable_workflows(&database, create.session)?;
+            if let Some(runtime) = self
+                .sessions
+                .iter()
+                .find(|runtime| runtime.id() == create.session)
+            {
+                refuse_pending_source_revert(
+                    &database,
+                    &runtime.app.state.session.cwd,
+                    create.session,
+                )?;
+            }
         }
         let mut workflows = Vec::with_capacity(self.sessions.len());
         for runtime in &self.sessions {
@@ -4858,7 +4899,7 @@ impl<'t> EventLoop<'t> {
                 && let Err(error) = self
                     .ctx
                     .storage_writer
-                    .save_sync_timeout(Arc::clone(&app.state.session), AGENT_SHUTDOWN_TIMEOUT)
+                    .save_sync_timeout(Arc::clone(&app.state.session), RELOCATION_STORAGE_TIMEOUT)
             {
                 relocation_error = Some(format!(
                     "failed to save session {}: {error}",
@@ -4885,7 +4926,7 @@ impl<'t> EventLoop<'t> {
         let mcp_shutdown_ms = lap();
         match Arc::try_unwrap(self.ctx.storage_writer) {
             Ok(writer) if relocating => {
-                if let Err(error) = writer.shutdown_checked(AGENT_SHUTDOWN_TIMEOUT) {
+                if let Err(error) = writer.shutdown_checked(RELOCATION_STORAGE_TIMEOUT) {
                     relocation_error = Some(error.to_string());
                 }
             }
@@ -5009,6 +5050,7 @@ mod tests {
     use caudra_storage::sessions::PendingConversationRevert;
     use caudra_workspace::WorkspacePath;
     use crossterm::event::{ColorScheme, KeyCode};
+    use serde_json::Value;
     use std::process;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -5382,6 +5424,7 @@ mod tests {
     const REMOTE_ROOT: &str = "remote-root";
     const REMOTE_OTHER: &str = "remote-other";
     const RELOCATION_MODEL: &str = "test-model";
+    const SIBLING_TITLE: &str = "Subagent connection failures";
     const RELOCATION_SOURCE: &str = "/relocation-source";
     const RELOCATION_DESTINATION: &str = "/relocation-destination";
     const RELOCATION_DRAFT: &str = "draft before moving";
@@ -5696,6 +5739,51 @@ mod tests {
             serde_json::to_value(load_app_session(donor.id, &storage).unwrap()).unwrap(),
             session_before
         );
+    }
+
+    /// Another session's reverted files would block the move, so a new
+    /// worktree is refused before it is created. A revert of its
+    /// conversation alone does not.
+    #[test_case(false, None, false; "clean_source_allowed")]
+    #[test_case(true, None, false; "sibling_conversation_revert_allowed")]
+    #[test_case(true, Some(json!({})), true; "sibling_file_revert_refused")]
+    fn a_new_worktree_waits_for_pending_reverts_in_its_source(
+        pending: bool,
+        file_status: Option<Value>,
+        refused: bool,
+    ) {
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let workspace = TempDir::new().unwrap();
+        let cwd = workspace.path().canonicalize().unwrap();
+        let cwd = cwd.to_str().unwrap();
+        let mut moving = AppSession::new(RELOCATION_MODEL, cwd);
+        moving.save(&storage).unwrap();
+        let mut sibling = AppSession::new(RELOCATION_MODEL, cwd);
+        sibling.title = SIBLING_TITLE.into();
+        if pending {
+            sibling.meta.pending_revert = Some(PendingConversationRevert {
+                original_head: None,
+                target_head: None,
+                file_status,
+            });
+        }
+        sibling.save(&storage).unwrap();
+        let database = SessionDatabase::open_state(&storage).unwrap();
+
+        let result = refuse_pending_source_revert(&database, cwd, moving.id);
+
+        if refused {
+            assert_eq!(
+                result,
+                Err(format!(
+                    "Session \"{SIBLING_TITLE}\" ({}) {SOURCE_REVERT_ERR}",
+                    sibling.id
+                ))
+            );
+        } else {
+            result.unwrap();
+        }
     }
 
     #[test_case(KeyModifiers::NONE, 3 ; "a plain notch is the configured size")]
