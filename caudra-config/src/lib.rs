@@ -92,6 +92,7 @@ pub const MAX_SERVER_NAME_LEN: usize = 64;
 
 pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
 pub const DEFAULT_BACKGROUND_REMINDER_TURNS: u32 = 0;
+pub const DEFAULT_WORK_NUDGE_COMPACTIONS: u32 = 2;
 pub const DEFAULT_SHELL_ASYNC_THRESHOLD_SECS: u64 = 120;
 pub const MIN_SHELL_ASYNC_THRESHOLD_SECS: u64 = 1;
 const TASK_ASYNC_UNSUPPORTED: &str = "task_execution = async requires a frontend with task delivery support; use a supported session or change agent.task_execution";
@@ -1388,6 +1389,7 @@ pub struct AgentFileConfig {
     pub compaction_requirements: Option<bool>,
     pub background_reminder_turns: Option<u32>,
     pub todo_reminder: Option<bool>,
+    pub work_nudge_compactions: Option<u32>,
     pub task_execution: Option<ExecutionMode>,
     pub shell_execution: Option<ExecutionMode>,
     pub shell_async_threshold_secs: Option<u64>,
@@ -1423,6 +1425,7 @@ impl AgentFileConfig {
             compaction_requirements,
             background_reminder_turns,
             todo_reminder,
+            work_nudge_compactions,
             task_execution,
             shell_execution,
             shell_async_threshold_secs,
@@ -2602,6 +2605,12 @@ pub struct AgentConfig {
     )]
     pub todo_reminder: bool,
 
+    #[config(
+        default = DEFAULT_WORK_NUDGE_COMPACTIONS,
+        desc = "Compactions within one request, with no work started since it, before Caudra reminds the agent to act: make a change or delegate one in build mode, write the plan or ask in plan mode, report in a read-only task. Repeated at every compaction after that. 0 disables"
+    )]
+    pub work_nudge_compactions: u32,
+
     #[config(default = ExecutionMode::Auto, ty = "string", default_doc = "auto", desc = "Task delivery: sync waits for the completed result, auto lets the model choose, async returns an admission receipt")]
     pub task_execution: ExecutionMode,
 
@@ -2741,6 +2750,9 @@ impl AgentConfig {
                 .background_reminder_turns
                 .unwrap_or(DEFAULT_BACKGROUND_REMINDER_TURNS),
             todo_reminder: file.todo_reminder.unwrap_or(true),
+            work_nudge_compactions: file
+                .work_nudge_compactions
+                .unwrap_or(DEFAULT_WORK_NUDGE_COMPACTIONS),
             generate_titles: file.generate_titles.unwrap_or(true),
             summarize_memory: file.summarize_memory.unwrap_or(true),
             stale_read_check: file.stale_read_check.unwrap_or(true),
@@ -4136,6 +4148,7 @@ mod tests {
     const CUSTOM_BACKGROUND_REMINDER_TURNS: u32 = 13;
     const UNSIGNED_REMINDER_ERROR: &str = "expected u32";
     const TODO_REMINDER_FIELD: &str = "todo_reminder";
+    const WORK_NUDGE_FIELD: &str = "work_nudge_compactions";
     const BOOLEAN_EXPECTED_ERROR: &str = "expected a boolean";
     const SHELL_THRESHOLD_FIELD: &str = "shell_async_threshold_secs";
     const SHELL_WORKDIR_REDIRECT_FIELD: &str = "shell_workdir_redirect";
@@ -5437,6 +5450,63 @@ mod tests {
         assert_eq!(
             field.default.format_default(),
             AgentConfig::default().todo_reminder.to_string()
+        );
+    }
+
+    #[test_case("", DEFAULT_WORK_NUDGE_COMPACTIONS ; "enabled_by_default")]
+    #[test_case("work_nudge_compactions = 0", 0 ; "disabled")]
+    #[test_case("work_nudge_compactions = 5", 5 ; "custom")]
+    fn work_nudge_config(source: &str, expected: u32) {
+        let raw: RawConfig = toml::from_str(&format!("[agent]\n{source}")).unwrap();
+        let config = raw.into_config(false).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.agent.work_nudge_compactions, expected);
+        assert_eq!(
+            serde_json::to_value(&config.agent).unwrap()[WORK_NUDGE_FIELD],
+            expected
+        );
+    }
+
+    #[test_case(Some(0), None, 0 ; "omitted_overlay_keeps_disabled")]
+    #[test_case(Some(0), Some(3), 3 ; "overlay_reenables")]
+    #[test_case(None, Some(0), 0 ; "overlay_disables")]
+    fn work_nudge_config_merge(base: Option<u32>, overlay: Option<u32>, expected: u32) {
+        let layer = |work_nudge_compactions| RawConfig {
+            agent: AgentFileConfig {
+                work_nudge_compactions,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut raw = layer(base);
+        raw.merge(layer(overlay));
+        assert_eq!(
+            raw.into_config(false).unwrap().agent.work_nudge_compactions,
+            expected
+        );
+    }
+
+    #[test_case("-1" ; "negative")]
+    #[test_case("\"off\"" ; "string")]
+    fn work_nudge_config_rejects_non_count(value: &str) {
+        let source = format!("[agent]\n{WORK_NUDGE_FIELD} = {value}");
+        let error = toml::from_str::<RawConfig>(&source).unwrap_err();
+        assert!(
+            error.to_string().contains(UNSIGNED_REMINDER_ERROR),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn work_nudge_metadata_matches_runtime_default() {
+        let field = AgentConfig::FIELDS
+            .iter()
+            .find(|field| field.name == WORK_NUDGE_FIELD)
+            .unwrap();
+        assert_eq!(field.ty, "u32");
+        assert_eq!(
+            field.default.format_default(),
+            AgentConfig::default().work_nudge_compactions.to_string()
         );
     }
 

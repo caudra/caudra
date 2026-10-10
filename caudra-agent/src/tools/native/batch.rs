@@ -52,6 +52,7 @@ const ENTRY_NO_TOOL: &str = "batch entry missing 'tool'";
 const ENTRY_NO_PARAMS: &str = "batch entry missing 'parameters'";
 const PARAMS_NOT_OBJECT: &str = "'parameters' must be an object when flat fields are also present";
 const CALLS_NOT_ARRAY: &str = "tool_calls must be an array";
+const CALLS_FIELD: &str = "tool_calls";
 const TOOL_FIELD: &str = "tool";
 const PARAMETERS_FIELD: &str = "parameters";
 const FUNCTIONS_PREFIX: &str = "functions.";
@@ -65,7 +66,7 @@ static CALLS_PARAM: ParamSchema = ParamSchema::Array {
     items: &CALL_PARAM,
     description: "Array of tool calls to execute in parallel",
 };
-static PROPERTIES: &[Property] = &[("tool_calls", &CALLS_PARAM, true, &[])];
+static PROPERTIES: &[Property] = &[(CALLS_FIELD, &CALLS_PARAM, true, &[])];
 static SCHEMA: ParamSchema = ParamSchema::Object {
     properties: PROPERTIES,
     description: "",
@@ -104,7 +105,7 @@ impl Tool for BatchTool {
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
         let input = validate(&SCHEMA, input.clone())?;
         let calls = input
-            .get("tool_calls")
+            .get(CALLS_FIELD)
             .and_then(Value::as_array)
             .ok_or_else(|| ParseError::custom(CALLS_NOT_ARRAY))?;
         let mut children = calls
@@ -468,6 +469,24 @@ pub(crate) fn child_index(parent: &str, id: &str) -> Option<usize> {
         .strip_prefix(CHILD_ID_SEPARATOR)?
         .parse()
         .ok()
+}
+
+/// The `(tool, params)` of every child a batch called with `input` ran, read
+/// from a call already in history. Empty when the batch refused its input.
+pub(crate) fn child_calls(input: &Value) -> Vec<(String, Value)> {
+    let Some(calls) = input.get(CALLS_FIELD).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    calls
+        .iter()
+        .map(normalize)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_default()
+        .into_iter()
+        .take(MAX_BATCH_SIZE)
+        .filter(|child| child.rejection.is_none())
+        .map(|child| (child.tool, child.params))
+        .collect()
 }
 
 /// The call one element describes, or `None` when it is one this tool refuses

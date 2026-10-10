@@ -296,6 +296,13 @@ version = 1
 # Type: bool.
 # todo_reminder = true
 
+# Compactions within one request, with no work started since it, before Caudra
+# reminds the agent to act: make a change or delegate one in build mode, write
+# the plan or ask in plan mode, report in a read-only task. Repeated at every
+# compaction after that. 0 disables.
+# Type: u32.
+# work_nudge_compactions = 2
+
 # Task delivery: sync waits for the completed result, auto lets the model
 # choose, async returns an admission receipt.
 # Type: string.

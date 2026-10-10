@@ -40,6 +40,7 @@ use super::steering::{
 use super::streaming::{StreamError, StreamRetry, stream_with_retry};
 use super::title;
 use super::tool_dispatch::{self, RecentCalls, ResponseObservations};
+use super::work_nudge;
 use crate::agent::change_recording::ChangeRecorder;
 use crate::automation::handle::AutomationHandle;
 use crate::automation::outbox::claim_message;
@@ -3004,6 +3005,14 @@ impl<'h> Agent<'h> {
         self.push_injected(Message::synthetic(compaction::continue_message(
             &self.config,
         )));
+        if let Some(nudge) = work_nudge::reminder(
+            self.history,
+            &self.mode,
+            self.tool_name_aliases.as_ref(),
+            self.config.work_nudge_compactions,
+        ) {
+            self.push_injected(nudge);
+        }
         self.publish_prepared_context();
         Ok(())
     }
@@ -3687,9 +3696,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use caudra_config::CompactionBuffer;
     use caudra_config::decisions::DecisionsConfig;
     use caudra_config::steering::SteeringConfig;
+    use caudra_config::{CompactionBuffer, DEFAULT_WORK_NUDGE_COMPACTIONS};
     use caudra_decision::{
         ChoiceAnswer, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, NoulAnswer,
         Usage,
@@ -8402,6 +8411,49 @@ mod tests {
                 ContentBlock::Text { text } if text.ends_with(POST) && text != POST
             ));
         });
+    }
+
+    const STALLED_WORK_HEADING: &str = "# Start the work";
+    const NUDGE_AFTER_CONTINUATION: &str =
+        "the stalled-work reminder follows the continuation it counts";
+    const NUDGE_SHOWN: &str = "the stalled-work reminder reaches the transcript as an injected row";
+
+    #[test_case(DEFAULT_WORK_NUDGE_COMPACTIONS => true ; "second_compaction_without_work")]
+    #[test_case(0 => false ; "disabled")]
+    fn do_compact_nudges_a_request_stalled_across_compactions(threshold: u32) -> bool {
+        smol::block_on(async {
+            let mut history = History::new(vec![
+                Message::user("go".into()),
+                Message::synthetic(compaction::CONTINUE_AFTER_COMPACT.into()),
+            ]);
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.config.work_nudge_compactions = threshold;
+            agent.do_compact().await.unwrap();
+            drop(agent);
+
+            let shown = drain_events(&event_rx).into_iter().any(|envelope| {
+                matches!(&envelope.event, AgentEvent::Injected { text, .. } if text.contains(STALLED_WORK_HEADING))
+            });
+            let texts: Vec<_> = history
+                .as_slice()
+                .iter()
+                .rev()
+                .take(2)
+                .map(|message| message.first_text_content().unwrap_or_default())
+                .collect();
+            let nudged = texts[0].contains(STALLED_WORK_HEADING);
+            assert_eq!(shown, nudged, "{NUDGE_SHOWN}");
+            if nudged {
+                assert!(
+                    texts[1].starts_with(compaction::CONTINUE_AFTER_COMPACT),
+                    "{NUDGE_AFTER_CONTINUATION}"
+                );
+            }
+            nudged
+        })
     }
 
     #[test]

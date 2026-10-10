@@ -167,6 +167,12 @@ pub const OPEN_TODOS_PROMPT: &str = include_str!("prompts/open_todos.md");
 pub const OPEN_TODOS_SLOT: &str = "{open}";
 pub const TOTAL_TODOS_SLOT: &str = "{total}";
 pub const TODOS_SLOT: &str = "{todos}";
+/// Follows a compaction once a request has outlasted enough of them with no
+/// work started, one wording per mode because each has its own way to act.
+pub const WORK_NUDGE_BUILD_PROMPT: &str = include_str!("prompts/work_nudge_build.md");
+pub const WORK_NUDGE_PLAN_PROMPT: &str = include_str!("prompts/work_nudge_plan.md");
+pub const WORK_NUDGE_REPORT_PROMPT: &str = include_str!("prompts/work_nudge_report.md");
+pub const COMPACTIONS_SLOT: &str = "{compactions}";
 /// Two fragments rather than one with a substituted clause, because the claim
 /// that differs is the useful one: locally the scratch directory is where
 /// `TMPDIR` already points and a command falls into it by itself, and on a

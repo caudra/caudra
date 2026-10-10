@@ -28,7 +28,7 @@ use crate::{
     AgentError, AgentEvent, BackgroundReminderContext, DoneReason, EventSender, TurnCompleteEvent,
 };
 
-const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
+pub(super) const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
 /// The turn the summary answers. It has to be in the history for the roles to
 /// alternate, and the transcript already draws that seam as a border, so the
 /// UI skips it by this exact text rather than drawing it twice.

@@ -21,6 +21,7 @@ mod tool_delegation;
 pub mod tool_dispatch;
 mod tool_preview;
 mod tool_roster;
+mod work_nudge;
 
 pub(crate) use compaction::compaction_reserve;
 pub use compaction::{

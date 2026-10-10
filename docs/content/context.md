@@ -192,6 +192,7 @@ Part of what the model reads was written by Caudra rather than typed by you. The
 | Continuation | After a nudge or a compaction, to say what the model should pick up |
 | Background work | Before an already-scheduled main request when task/workflow state changes or the configured response interval expires, and after successful compaction of a session with background work |
 | Open todo items | When the main agent is about to hand control back while its todo list has pending or in-progress items and no background work is running, at most once per run |
+| Stalled work | After a compaction, when a request has gone through `work_nudge_compactions` compactions with no work started |
 
 These runtime snapshots arrive as messages, keeping the cached system prefix stable. Most are sent only when their content changes. Background-work snapshots can also repeat at a configured interval or after compaction.
 
@@ -233,6 +234,27 @@ To turn it off:
 ```toml
 [agent]
 todo_reminder = false
+```
+
+### Stalled work after compaction
+
+A model that thinks at length can keep investigating until the window fills, compact, and start investigating again. Each compaction replaces what it gathered with a summary, so the loop can run for a long time without progress. When a request reaches its second compaction with no work started, Caudra adds a reminder right after the compaction and asks the model to act on what it knows.
+
+What counts as work depends on the mode:
+
+| Mode | Counts as work | The reminder asks for |
+|------|----------------------------|-----------------------|
+| Build | A file write, edit, or patch, including one inside a batch. Also a task that does not run in plan mode, or a started workflow | The first change, or delegation of it. If no change is needed, the answer. If the model is blocked, a specific question |
+| Plan | Writing the plan, or asking a question | The plan with its assumptions marked, or the question that blocks it |
+| Read-only task | Nothing | A report of what the task found and what it has not verified |
+
+A failed attempt still counts as work. Shell commands never count, so an agent that edits through the shell can still get the reminder. The count starts again at each message you send, and it applies to subagents as well as the main agent. The reminder repeats after every later compaction, with the current count, until work starts. A `/compact` you run while the session is idle does not count.
+
+Set the number of compactions, or `0` to turn the reminder off:
+
+```toml
+[agent]
+work_nudge_compactions = 3
 ```
 
 ## Four places to put knowledge
