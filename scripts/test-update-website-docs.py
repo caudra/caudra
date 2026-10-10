@@ -557,6 +557,22 @@ class UpdateTests(unittest.TestCase):
         self.assertNotIn("GH_DEBUG", env)
         self.assertNotIn("WEBSITE_TOKEN", env)
 
+    def test_gh_endpoint_has_no_trailing_slash(self):
+        result = subprocess.CompletedProcess(
+            [], 0, stdout="HTTP/2.0 200 OK\r\n\r\n{}", stderr=""
+        )
+        for repo, path, endpoint in (
+            ("caudra/website", "", "repos/caudra/website"),
+            ("caudra/website", "pulls/3", "repos/caudra/website/pulls/3"),
+            (None, "user", "user"),
+        ):
+            with (
+                self.subTest(endpoint=endpoint),
+                patch.object(UPDATER.subprocess, "run", return_value=result) as run,
+            ):
+                UPDATER.GitHub("selected").request(repo, path)
+                self.assertEqual(run.call_args.args[0][-1], endpoint)
+
     def test_wrong_workflow_and_missing_or_duplicate_jobs(self):
         for key, value in (
             ("path", ".github/workflows/other.yml"),

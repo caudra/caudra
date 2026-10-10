@@ -81,7 +81,7 @@ class GitHub:
         self.token = token
 
     def request(self, repo, path, method="GET", data=None, missing=False):
-        endpoint = f"repos/{repo}/{path}" if repo else path
+        endpoint = "/".join(part for part in (repo and f"repos/{repo}", path) if part)
         command = [
             "gh",
             "api",
