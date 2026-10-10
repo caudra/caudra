@@ -18,7 +18,7 @@
     "THIRD_PARTY_LICENSES/additional/provenance.json"
   ],
   "packages": {
-    "caudra-highlight@0.2.0-preview.3": {
+    "caudra-highlight@0.2.0-preview.4": {
       "expression": "Apache-2.0 AND MPL-2.0",
       "reason": "The first-party highlighting implementation remains Apache-2.0. The embedded sublime-rhai grammar and local modifications remain MPL-2.0. Preserve its upstream license and ship the complete caudra-highlight source, including the modified grammar, using the existing MPL source-archive mechanism. This aggregate expression does not relicense individual files.",
       "files": [
