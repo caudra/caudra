@@ -23,9 +23,9 @@ use caudra_agent::tools::{
     ToolAudience, ToolFilter, ToolRegistry, ToolState, builtin_report, execution, is_tool_enabled,
 };
 use caudra_config::providers::{
-    Protocol, ProviderDef, ProvidersConfig, all_builtins, builtin_provider, custom_provider_slug,
-    resolve_api_key_env, resolve_base_url, resolve_default_model, resolve_display_name,
-    resolve_login_url, slugify,
+    Protocol, ProviderDef, ProvidersConfig, ProvidersFile, all_builtins, builtin_provider,
+    custom_provider_slug, resolve_api_key_env, resolve_base_url, resolve_default_model,
+    resolve_display_name, resolve_login_url, slugify,
 };
 use caudra_config::{
     AgentConfig, Config, DefaultEffect, ModelPolicy, PermissionsConfig, ProfileToolPolicy,
@@ -277,7 +277,7 @@ fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
         return Ok(());
     }
 
-    let mut config = ProvidersConfig::load();
+    let mut config = ProvidersFile::load()?;
     let def = config.get(slug).cloned();
 
     let plan = select_plan(slug, builtin, def.as_ref())?;
@@ -539,7 +539,7 @@ fn login_custom(storage: &StateDir) -> Result<()> {
     io::stdin().read_line(&mut key_input)?;
     let api_key = key_input.trim().to_string();
 
-    let mut config = ProvidersConfig::load();
+    let mut config = ProvidersFile::load()?;
     let provider_def = ProviderDef {
         display_name: Some(display_name),
         protocol: Some(protocol),
@@ -658,7 +658,7 @@ pub fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
         "openai" => openai_auth::logout(storage)?,
         "xai" => xai_auth::logout(storage)?,
         _ => {
-            let mut config = ProvidersConfig::load();
+            let mut config = ProvidersFile::load()?;
             let deleted =
                 delete_provider_credentials(storage, &slug).context("delete credentials")?;
             if deleted {

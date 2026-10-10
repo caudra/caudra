@@ -799,6 +799,26 @@ const CONFIG_FILES_COMMANDS: &str = "\n`caudra config files` lists where each fi
     machine and whether it is there. `caudra config example FILE` prints the reference of a TOML \
     file, such as `caudra config example mcp`. See [`caudra config`](/docs/cli/#caudra-config).\n";
 
+const ENVIRONMENT_SECTION: &str = r#"## Environment variables
+
+A string value in a global config file can read an environment variable. Write `{env:NAME}` where the value goes, and Caudra puts the value of `NAME` there when it reads the file. This keeps a secret or a machine-specific value out of the file:
+
+```toml
+[telemetry]
+endpoint = "https://{env:OTEL_HOST}"
+headers = { authorization = "Bearer {env:OTEL_TOKEN}" }
+```
+
+- It works in the global `caudra.toml`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `workcell.toml`. `sandboxes.toml` keeps every value as written.
+- A reference can be the whole value or part of it, and one value can hold several. Only string values expand, so keys, numbers, and booleans cannot come from the environment.
+- Caudra looks in the process environment first, then in the global `.env`. A project `.env` never supplies a value.
+- An unset variable is an error that names the file, the line, and the variable. A bad `caudra.toml` stops startup and a bad `providers.toml` exits. A bad `permissions.toml` fails closed and denies every tool call. A bad `mcp.toml` loads none of its servers, and `/mcp` shows the error.
+- A project file under `.caudra/` cannot hold a reference, and Caudra refuses to load it. A project MCP server on a public HTTPS URL connects without review, so a reference there could send your secret to a server the repository chose.
+- `${env:NAME}`, the PowerShell form, stays as written, so shell commands and permission patterns can use it.
+- When Caudra writes a file, such as `/mcp` turning a server off or `caudra auth login` adding a provider, the reference stays in the file rather than its value.
+
+"#;
+
 fn write_config_files_section(out: &mut String) {
     out.push_str(CONFIG_FILES_INTRO);
     for file in CONFIG_FILES {
@@ -918,6 +938,7 @@ For every setting in one file, with its type, default, and description, see [Ref
         reference = gen_reference_configs::link(&files::CAUDRA),
     )
     .unwrap();
+    out.push_str(ENVIRONMENT_SECTION);
     write_experimental_section(&mut out);
     write_migration_section(&mut out);
 
@@ -1059,6 +1080,7 @@ Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/pro
 #[cfg(test)]
 mod tests {
     use caudra_config::config_file::GlobalConfigFile;
+    use caudra_config::interpolation::Lookup;
     use caudra_config::{
         AgentConfig, ConfigValue, DecisionsConfig, Feature, SteeringConfig,
         decisions::RawDecisionsConfig,
@@ -1076,6 +1098,10 @@ mod tests {
     const RULE_COUNT: usize = 9;
     const TOML_FENCE: &str = "```toml\n";
     const FENCE_END: &str = "```";
+    /// A reference needs a real environment, and caudra-config tests those.
+    /// The examples only have to be valid settings once it is gone.
+    const ENV_REFERENCE: &str = "{env:";
+    const ENV_PLACEHOLDER: &str = "{";
 
     #[test]
     fn experimental_reference_lists_every_switch_off() {
@@ -1100,7 +1126,8 @@ mod tests {
             .collect();
         assert!(!examples.is_empty());
         for example in examples {
-            if let Err(error) = GlobalConfigFile::parse(example) {
+            let shape = example.replace(ENV_REFERENCE, ENV_PLACEHOLDER);
+            if let Err(error) = GlobalConfigFile::parse(&shape, Lookup::Refused) {
                 panic!("{error}\n{example}");
             }
         }

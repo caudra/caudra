@@ -1,17 +1,20 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::Error;
+use std::io::{self, ErrorKind};
 use std::path::PathBuf;
 use std::process;
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
+use thiserror::Error;
+use toml::de::Error as TomlError;
 use tracing::debug;
 
 use caudra_storage::paths;
 use caudra_storage::thinking::ReasoningOptions;
 
 use crate::config_version::{CONFIG_VERSION_KEY, ConfigVersion};
+use crate::interpolation::{self, Lookup};
 use crate::{ConfigField, ConfigValue};
 
 pub(crate) const PROVIDERS_FILE: &str = "providers.toml";
@@ -789,7 +792,7 @@ impl ProviderDef {
             min: None,
             max: None,
             env: None,
-            description: "An API key, stored as plain text. Caudra tries the environment variable and saved credentials first",
+            description: "An API key, stored as plain text unless you write `{env:NAME}` to read it from your environment. Caudra tries the environment variable and saved credentials first",
         },
         ConfigField {
             name: "default_model",
@@ -884,9 +887,10 @@ pub struct ProvidersConfig {
 }
 
 impl ProvidersConfig {
-    /// Read and parse `providers.toml`. Hard-exits on parse errors so a typo
-    /// in a purpose or pricing surfaces immediately instead of silently dropping
-    /// every provider and starting caudra with an empty registry.
+    /// Read and parse `providers.toml`, with its `{env:NAME}` references
+    /// expanded. Hard-exits on parse errors so a typo in a purpose or pricing
+    /// surfaces immediately instead of silently dropping every provider and
+    /// starting caudra with an empty registry.
     pub fn load() -> Self {
         let path = providers_file_path(paths::config_dir_path());
         if !path.exists() {
@@ -899,7 +903,7 @@ impl ProvidersConfig {
                 return Self::default();
             }
         };
-        match toml::from_str::<ProvidersConfig>(&content) {
+        match interpolation::from_str::<ProvidersConfig>(&content, Lookup::Global(&path)) {
             Ok(config) => {
                 debug!(path = %path.display(), "loaded providers config");
                 config
@@ -911,18 +915,6 @@ impl ProvidersConfig {
         }
     }
 
-    pub fn save(&self) -> Result<(), std::io::Error> {
-        let path = providers_file_path(paths::config_dir());
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let content = toml::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        fs::write(&path, content)?;
-        debug!(path = %path.display(), "saved providers config");
-        Ok(())
-    }
-
     pub fn get(&self, slug: &str) -> Option<&ProviderDef> {
         self.providers.get(slug)
     }
@@ -930,13 +922,80 @@ impl ProvidersConfig {
     pub fn upsert(&mut self, slug: String, def: ProviderDef) {
         self.providers.insert(slug, def);
     }
+}
+
+#[derive(Debug, Error)]
+pub enum ProvidersFileError {
+    #[error("read {}: {source}", path.display())]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("invalid {}: {source}", path.display())]
+    Invalid {
+        path: PathBuf,
+        #[source]
+        source: Box<TomlError>,
+    },
+}
+
+/// `providers.toml` as written, `{env:NAME}` references included, for the
+/// commands that change it. Saving what [`ProvidersConfig::load`] returned
+/// would write every expanded secret into the file.
+#[derive(Debug, Default)]
+pub struct ProvidersFile(ProvidersConfig);
+
+impl ProvidersFile {
+    /// A file that cannot be read is an error rather than an empty one, since
+    /// saving after that would drop every provider in it.
+    pub fn load() -> Result<Self, ProvidersFileError> {
+        let path = providers_file_path(paths::config_dir_path());
+        match fs::read_to_string(&path) {
+            Ok(content) => Self::parse(&content).map_err(|source| ProvidersFileError::Invalid {
+                path,
+                source: Box::new(source),
+            }),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(Self::default()),
+            Err(source) => Err(ProvidersFileError::Read { path, source }),
+        }
+    }
+
+    pub fn save(&self) -> Result<(), io::Error> {
+        let path = providers_file_path(paths::config_dir());
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = self
+            .render()
+            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+        fs::write(&path, content)?;
+        debug!(path = %path.display(), "saved providers config");
+        Ok(())
+    }
+
+    fn parse(text: &str) -> Result<Self, TomlError> {
+        toml::from_str(text).map(Self)
+    }
+
+    fn render(&self) -> Result<String, toml::ser::Error> {
+        toml::to_string_pretty(&self.0)
+    }
+
+    pub fn get(&self, slug: &str) -> Option<&ProviderDef> {
+        self.0.get(slug)
+    }
+
+    pub fn upsert(&mut self, slug: String, def: ProviderDef) {
+        self.0.upsert(slug, def);
+    }
 
     pub fn remove(&mut self, slug: &str) -> bool {
-        self.providers.remove(slug).is_some()
+        self.0.providers.remove(slug).is_some()
     }
 }
 
-fn providers_file_path(directory: Result<PathBuf, Error>) -> PathBuf {
+fn providers_file_path(directory: Result<PathBuf, io::Error>) -> PathBuf {
     directory
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(PROVIDERS_FILE)
@@ -1582,5 +1641,25 @@ best = "gpt-4.1"
         let error = toml::from_str::<ProvidersConfig>(&document).unwrap_err();
 
         assert!(error.to_string().contains(&expected.to_string()), "{error}");
+    }
+
+    #[test]
+    fn saving_keeps_references_as_written() {
+        const REFERENCED: &str = "proxy";
+        const ADDED: &str = "added";
+        const API_KEY: &str = "{env:PROXY_API_KEY}";
+        const BASE_URL: &str = "https://{env:PROXY_HOST}/v1";
+        let mut file = ProvidersFile::parse(&format!(
+            "[{REFERENCED}]\nprotocol = \"openai\"\napi_key = \"{API_KEY}\"\nbase_url = \"{BASE_URL}\"\n"
+        ))
+        .unwrap();
+        file.upsert(ADDED.into(), ProviderDef::default());
+
+        let reparsed = ProvidersFile::parse(&file.render().unwrap()).unwrap();
+        let referenced = reparsed.get(REFERENCED).unwrap();
+
+        assert_eq!(referenced.api_key.as_deref(), Some(API_KEY));
+        assert_eq!(referenced.base_url.as_deref(), Some(BASE_URL));
+        assert!(reparsed.get(ADDED).is_some());
     }
 }

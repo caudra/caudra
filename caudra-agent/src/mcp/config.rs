@@ -15,6 +15,7 @@ use url::{Host, Url};
 use super::error::McpError;
 use crate::tools::is_builtin_tool;
 use caudra_config::config_version::ConfigVersion;
+use caudra_config::interpolation::{self, ConfigTextError, Lookup};
 use caudra_config::mcp::{DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, MCP_FILE, MCP_VERSION};
 use caudra_config::{global_config_dir, is_valid_server_name};
 
@@ -603,7 +604,7 @@ fn merge_config(
     path: &Path,
     source: McpConfigSource,
 ) {
-    match read_config(path) {
+    match read_config(path, source) {
         Ok(None) => {}
         Ok(Some(cfg)) => {
             tracing::info!(
@@ -711,7 +712,13 @@ pub fn persist_enabled(
     Ok(())
 }
 
-fn read_config(path: &Path) -> Result<Option<McpConfig>, McpConfigError> {
+/// Only the global file may read the environment: a project file runs no
+/// review before an HTTPS server connects, so it could send a secret anywhere.
+fn read_config(path: &Path, source: McpConfigSource) -> Result<Option<McpConfig>, McpConfigError> {
+    let lookup = match source {
+        McpConfigSource::Global => Lookup::Global(path),
+        McpConfigSource::Project | McpConfigSource::Runtime => Lookup::Refused,
+    };
     let content = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -734,7 +741,8 @@ fn read_config(path: &Path) -> Result<Option<McpConfig>, McpConfigError> {
         }
     };
     ConfigVersion::<MCP_VERSION>::check_document(&content)
-        .and_then(|_| toml::from_str(&content))
+        .map_err(ConfigTextError::from)
+        .and_then(|_| interpolation::from_str(&content, lookup))
         .inspect_err(|e| {
             tracing::warn!(
                 path = %path.display(),
@@ -767,6 +775,8 @@ mod tests {
     const GLOBAL_SERVER: &str = "global-server";
     const PROJECT_CANARY: &str = "project-canary";
     const SERVERS_TABLE: &str = "mcp";
+    const TOKEN_VARIABLE: &str = "CAUDRA_TEST_MCP_TOKEN";
+    const TOKEN_VALUE: &str = "test-token";
 
     fn stdio_raw(cmd: &[&str]) -> RawServerConfig {
         RawServerConfig {
@@ -994,10 +1004,15 @@ command = ["project"]
         )
         .unwrap();
 
-        let project_cfg = read_config(&project_caudra_dir.join("mcp.toml"))
+        let project_cfg = read_config(
+            &project_caudra_dir.join("mcp.toml"),
+            McpConfigSource::Project,
+        )
+        .unwrap()
+        .unwrap();
+        let global_cfg = read_config(&global_dir.join("mcp.toml"), McpConfigSource::Global)
             .unwrap()
             .unwrap();
-        let global_cfg = read_config(&global_dir.join("mcp.toml")).unwrap().unwrap();
 
         let mut merged = McpConfig::default();
         merged.mcp.extend(global_cfg.mcp);
@@ -1199,7 +1214,7 @@ enabled = true
         let path = dir.path().join("mcp.toml");
         fs::create_dir(&path).unwrap();
         assert!(matches!(
-            read_config(&path),
+            read_config(&path, McpConfigSource::Global),
             Err(McpConfigError::Read { .. })
         ));
     }
@@ -1210,7 +1225,7 @@ enabled = true
         let path = dir.path().join("mcp.toml");
         fs::write(&path, "this is not valid toml {{").unwrap();
         assert!(matches!(
-            read_config(&path),
+            read_config(&path, McpConfigSource::Global),
             Err(McpConfigError::Parse { .. })
         ));
     }
@@ -1226,8 +1241,77 @@ command = ["echo", "hello"]
 "#,
         )
         .unwrap();
-        let cfg = read_config(&path).unwrap().unwrap();
+        let cfg = read_config(&path, McpConfigSource::Global)
+            .unwrap()
+            .unwrap();
         assert!(cfg.mcp.contains_key("valid"));
+    }
+
+    fn write_header_reference(dir: &Path) -> PathBuf {
+        let path = dir.join(MCP_FILE);
+        fs::write(
+            &path,
+            format!(
+                "[mcp.{GLOBAL_SERVER}]\nurl = 'https://mcp.example.test'\nheaders = {{ Authorization = 'Bearer {{env:{TOKEN_VARIABLE}}}' }}\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn global_config_reads_the_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_header_reference(dir.path());
+        fs::write(
+            dir.path().join(".env"),
+            format!("{TOKEN_VARIABLE}={TOKEN_VALUE}\n"),
+        )
+        .unwrap();
+
+        let config = read_config(&path, McpConfigSource::Global)
+            .unwrap()
+            .unwrap();
+
+        let RawTransport::Http(http) = &config.mcp[GLOBAL_SERVER].transport else {
+            panic!("expected an HTTP server");
+        };
+        assert_eq!(
+            http.headers["Authorization"],
+            format!("Bearer {TOKEN_VALUE}")
+        );
+    }
+
+    #[test]
+    fn project_config_cannot_read_the_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_header_reference(dir.path());
+        fs::write(
+            dir.path().join(".env"),
+            format!("{TOKEN_VARIABLE}={TOKEN_VALUE}\n"),
+        )
+        .unwrap();
+
+        let error = read_config(&path, McpConfigSource::Project)
+            .err()
+            .expect("a project file is refused");
+
+        assert!(matches!(
+            &error,
+            McpConfigError::Parse { error, .. }
+                if error.contains(TOKEN_VARIABLE) && !error.contains(TOKEN_VALUE)
+        ));
+    }
+
+    #[test]
+    fn persist_enabled_keeps_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_header_reference(dir.path());
+
+        persist_enabled(&path, GLOBAL_SERVER, false).unwrap();
+
+        let reference = format!("{{env:{TOKEN_VARIABLE}}}");
+        assert!(fs::read_to_string(&path).unwrap().contains(&reference));
     }
 
     fn write_versioned_config(version: u32) -> (tempfile::TempDir, PathBuf) {
@@ -1247,7 +1331,9 @@ command = ["echo", "hello"]
     fn read_config_loads_servers_from_the_current_version() {
         let (_dir, path) = write_versioned_config(MCP_VERSION);
 
-        let config = read_config(&path).unwrap().unwrap();
+        let config = read_config(&path, McpConfigSource::Global)
+            .unwrap()
+            .unwrap();
 
         assert!(config.mcp.contains_key(GLOBAL_SERVER));
     }
@@ -1263,7 +1349,7 @@ command = ["echo", "hello"]
         .to_string();
 
         assert!(matches!(
-            read_config(&path),
+            read_config(&path, McpConfigSource::Global),
             Err(McpConfigError::Parse { error, .. }) if error.contains(&expected)
         ));
     }
@@ -1272,7 +1358,9 @@ command = ["echo", "hello"]
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(MCP_FILE);
         fs::write(&path, example::mcp::document().render(render)).unwrap();
-        read_config(&path).unwrap().unwrap()
+        read_config(&path, McpConfigSource::Global)
+            .unwrap()
+            .unwrap()
     }
 
     /// What Caudra acts on, with each unset option replaced by the default

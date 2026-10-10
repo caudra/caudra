@@ -16,6 +16,7 @@ use serde::Serialize;
 use thiserror::Error;
 use url::{Host, Url};
 
+use crate::interpolation::{self, ConfigTextError, InterpolationError, Lookup};
 use crate::{ConfigField, ConfigValue};
 
 pub(crate) const WORKCELL_PROFILE_FILE: &str = "workcell.toml";
@@ -309,6 +310,8 @@ pub enum WorkcellProfileError {
     Read(#[source] io::Error),
     #[error("local Workcell profile file is not valid strict v1 TOML")]
     Parse,
+    #[error("local Workcell profile file: {0}")]
+    Environment(#[source] InterpolationError),
     #[error("unsupported local Workcell profile version {0}; expected version 1")]
     Version(u32),
     #[error(transparent)]
@@ -456,12 +459,18 @@ pub fn load_workcell_profiles_from(
     if content.len() as u64 > MAX_PROFILE_FILE_BYTES {
         return Err(WorkcellProfileError::FileTooLarge);
     }
-    parse_profile_file(&content)
+    parse_profile_file(&content, Lookup::Global(&path))
 }
 
-fn parse_profile_file(content: &str) -> Result<WorkcellProfiles, WorkcellProfileError> {
+fn parse_profile_file(
+    content: &str,
+    lookup: Lookup<'_>,
+) -> Result<WorkcellProfiles, WorkcellProfileError> {
     let raw: WorkcellProfileFile =
-        toml::from_str(content).map_err(|_| WorkcellProfileError::Parse)?;
+        interpolation::from_str(content, lookup).map_err(|error| match error {
+            ConfigTextError::Toml(_) => WorkcellProfileError::Parse,
+            ConfigTextError::Environment(error) => WorkcellProfileError::Environment(error),
+        })?;
     WorkcellProfiles::try_from(raw)
 }
 
@@ -620,12 +629,14 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
+    use crate::ENV_FILE;
     use crate::example::{self, Render};
 
     const PROFILE_NAME: &str = "production";
     const CREDENTIAL_REF: &str = "credential:production";
     const SECRET_ENDPOINT: &str = "https://workcell.example/private/tenant";
     const SERVER_ID: &str = "server-private-id";
+    const ENDPOINT_VARIABLE: &str = "CAUDRA_TEST_WORKCELL_ENDPOINT";
     const VALID_PROFILE: &str = r#"
 version = 1
 
@@ -663,7 +674,11 @@ expected_workspace_id = "workspace-1"
     }
 
     fn reference(render: Render) -> WorkcellProfiles {
-        parse_profile_file(&example::workcell::document().render(render)).expect("reference")
+        parse_profile_file(
+            &example::workcell::document().render(render),
+            Lookup::Refused,
+        )
+        .expect("reference")
     }
 
     #[test]
@@ -715,6 +730,49 @@ expected_workspace_id = "workspace-1"
                 .map(ExpectedWorkcellId::as_str),
             Some("server-1")
         );
+    }
+
+    #[test]
+    fn profiles_read_the_global_environment() {
+        let directory = TempDir::new().expect("tempdir");
+        fs::write(
+            directory.path().join(ENV_FILE),
+            format!("{ENDPOINT_VARIABLE}={SECRET_ENDPOINT}\n"),
+        )
+        .expect("write .env");
+        write_profiles(
+            directory.path(),
+            &VALID_PROFILE.replace(
+                "\"https://workcell.example/api\"",
+                &format!("\"{{env:{ENDPOINT_VARIABLE}}}\""),
+            ),
+        );
+        let profiles = load_workcell_profiles_from(directory.path()).expect("valid profiles");
+        let name = WorkcellProfileName::new(PROFILE_NAME).expect("valid name");
+
+        assert_eq!(
+            profiles
+                .get(&name)
+                .expect("profile")
+                .endpoint
+                .as_url()
+                .as_str(),
+            SECRET_ENDPOINT
+        );
+    }
+
+    #[test]
+    fn an_unset_variable_is_named() {
+        let error = load_content(
+            &VALID_PROFILE.replace("\"server-1\"", &format!("\"{{env:{ENDPOINT_VARIABLE}}}\"")),
+        )
+        .expect_err("unset variable");
+
+        assert!(matches!(
+            error,
+            WorkcellProfileError::Environment(InterpolationError::Unset { line: 8, ref name })
+                if name == ENDPOINT_VARIABLE
+        ));
     }
 
     #[test_case(

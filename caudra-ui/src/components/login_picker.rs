@@ -5,7 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use caudra_config::providers::{
-    self, Protocol, ProviderDef, ProviderSlugError, ProvidersConfig, custom_provider_slug,
+    self, Protocol, ProviderDef, ProviderSlugError, ProvidersConfig, ProvidersFile,
+    custom_provider_slug,
 };
 use caudra_grab::grab_scope;
 use caudra_providers::catalog_providers_if_available;
@@ -434,7 +435,14 @@ impl LoginPicker {
                         }
                     }
 
-                    let mut config = ProvidersConfig::load();
+                    let mut config = match ProvidersFile::load() {
+                        Ok(config) => config,
+                        Err(e) => {
+                            return self.transition(StepAction::GoError {
+                                message: format!("Error: {e}"),
+                            });
+                        }
+                    };
 
                     if let Some(info) = &custom_c {
                         let api_key_env =

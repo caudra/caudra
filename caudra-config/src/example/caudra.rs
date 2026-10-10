@@ -208,6 +208,7 @@ mod tests {
     use crate::decisions::DecisionProtocol;
     use crate::example::Render;
     use crate::experimental::FeatureFlags;
+    use crate::interpolation::Lookup;
     use crate::{Config, RawConfig};
     use test_case::test_case;
     use toml::Value;
@@ -239,7 +240,9 @@ mod tests {
 
     #[test]
     fn the_reference_is_a_global_config_that_changes_nothing() {
-        let reference = GlobalConfigFile::parse(&document().render(Render::Reference)).unwrap();
+        let reference =
+            GlobalConfigFile::parse(&document().render(Render::Reference), Lookup::Refused)
+                .unwrap();
         assert_eq!(reference.features, FeatureFlags::default());
         let config = reference.settings.into_config(false).unwrap();
         assert_eq!(settings(&config), settings(&defaults()));
@@ -248,7 +251,7 @@ mod tests {
     #[test]
     fn every_stated_default_is_the_built_in_one() {
         let live = document().render(Render::Live { defaults: true });
-        let example = GlobalConfigFile::parse(&live).unwrap();
+        let example = GlobalConfigFile::parse(&live, Lookup::Refused).unwrap();
         assert_eq!(example.features, FeatureFlags::default());
         let mut config = example.settings.into_config(false).unwrap();
         let defaults = defaults();
@@ -289,7 +292,7 @@ mod tests {
         assert!(!decisions.contains_key("model"));
         assert!(!decisions.contains_key("api_key_env"));
         decisions.insert("protocol".into(), Value::String(protocol.as_str().into()));
-        let config = GlobalConfigFile::parse(&toml::to_string(&example).unwrap())
+        let config = GlobalConfigFile::parse(&toml::to_string(&example).unwrap(), Lookup::Refused)
             .unwrap()
             .settings
             .into_config(false)

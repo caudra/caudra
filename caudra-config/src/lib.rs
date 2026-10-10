@@ -20,6 +20,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::config_version::ConfigVersion;
+use crate::interpolation::Lookup;
 
 const PROJECT_DIR: &str = ".caudra";
 const PERMISSIONS_FILE: &str = "permissions.toml";
@@ -61,6 +62,7 @@ pub mod decisions;
 pub mod example;
 pub mod experimental;
 pub mod files;
+pub mod interpolation;
 pub mod mcp;
 pub mod profile_tools;
 pub mod providers;
@@ -4057,7 +4059,7 @@ fn load_permissions_scoped(
     let mut global_perms = PermissionsFileConfig::default();
     if let Some(dir) = global_dir {
         let path = dir.join(PERMISSIONS_FILE);
-        match read_permissions_file(&path) {
+        match read_permissions_file(&path, Lookup::Global(&path)) {
             Ok(Some(permissions)) => global_perms = permissions,
             Ok(None) => {}
             Err(error) => {
@@ -4071,7 +4073,7 @@ fn load_permissions_scoped(
         return build_permissions(global_perms, PermissionsFileConfig::default());
     }
     let project_path = cwd.join(PROJECT_DIR).join(PERMISSIONS_FILE);
-    let project_perms = match read_permissions_file(&project_path) {
+    let project_perms = match read_permissions_file(&project_path, Lookup::Refused) {
         Ok(Some(permissions)) => permissions,
         Ok(None) => PermissionsFileConfig::default(),
         Err(error) => {
@@ -4083,7 +4085,12 @@ fn load_permissions_scoped(
     build_permissions(global_perms, project_perms)
 }
 
-fn read_permissions_file(path: &Path) -> Result<Option<PermissionsFileConfig>, String> {
+/// `lookup` is settled on the path as named, since a symlinked file still
+/// belongs to the directory that holds the link.
+fn read_permissions_file(
+    path: &Path,
+    lookup: Lookup<'_>,
+) -> Result<Option<PermissionsFileConfig>, String> {
     let path = match fs::canonicalize(path) {
         Ok(path) => path,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -4091,8 +4098,8 @@ fn read_permissions_file(path: &Path) -> Result<Option<PermissionsFileConfig>, S
     };
     let content =
         fs::read_to_string(&path).map_err(|error| format!("cannot read permissions: {error}"))?;
-    let mut config: PermissionsFileConfig =
-        toml::from_str(&content).map_err(|error| format!("cannot parse permissions: {error}"))?;
+    let mut config: PermissionsFileConfig = interpolation::from_str(&content, lookup)
+        .map_err(|error| format!("cannot parse permissions: {error}"))?;
     config.loaded_file = Some((path, permission_source_digest(content.as_bytes())));
     Ok(Some(config))
 }
@@ -4696,6 +4703,47 @@ mod tests {
             )
         };
         assert!(config.loaded_sources.is_empty());
+    }
+
+    #[test]
+    fn global_permissions_read_the_environment() {
+        const REMOTE: &str = "CAUDRA_TEST_PERMISSIONS_REMOTE";
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join(ENV_FILE), format!("{REMOTE}=origin\n")).unwrap();
+        fs::write(
+            temp.path().join(PERMISSIONS_FILE),
+            format!("[shell]\nallow = ['git push {{env:{REMOTE}}}']\n"),
+        )
+        .unwrap();
+        let config = load_permissions_scoped(temp.path(), Some(temp.path()), false);
+        assert!(
+            config
+                .rules
+                .iter()
+                .any(|rule| rule.scope.as_deref() == Some("git push origin")),
+            "{:?}",
+            config.rules
+        );
+    }
+
+    #[test]
+    fn project_permissions_that_read_the_environment_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join(PROJECT_DIR);
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join(PERMISSIONS_FILE),
+            "[shell]\nallow = ['git push {env:HOME}']\n",
+        )
+        .unwrap();
+        let config = load_permissions_scoped(temp.path(), None, true);
+        assert_eq!(config.default, DefaultEffect::Deny);
+        assert!(
+            config
+                .rules
+                .iter()
+                .all(|rule| rule.tool == ToolKey::Wildcard && rule.effect == Effect::Deny)
+        );
     }
 
     #[test_case("12000", CompactionBuffer::Tokens(12_000) ; "tokens_number")]

@@ -22,7 +22,7 @@ command = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 
 [mcp.github]
 command = ["gh", "mcp-server"]
-environment = { GITHUB_TOKEN = "ghp_xxxx" }
+environment = { GITHUB_PERSONAL_ACCESS_TOKEN = "{env:GITHUB_TOKEN}" }
 timeout = 10000
 enabled = false
 ```
@@ -32,8 +32,10 @@ enabled = false
 ```toml
 [mcp.analytics]
 url = "https://mcp.example.com/mcp"
-headers = { Authorization = "Bearer tok123" }
+headers = { Authorization = "Bearer {env:ANALYTICS_TOKEN}" }
 ```
+
+In the global `mcp.toml`, `{env:NAME}` takes a value from your environment or the global `.env`, so the token stays out of the file. A project `mcp.toml` cannot read the environment, and Caudra loads none of its servers while it holds a reference. See [Environment variables](/docs/configuration/#environment-variables).
 
 Some HTTP servers need OAuth but have no dynamic client registration. For those, give Caudra a static client:
 
@@ -53,9 +55,9 @@ oauth = { client_id = "acme-client", client_secret = "s3cret", callback_port = 3
 | `timeout` | integer | `30000` | 1 | 300000 | Milliseconds to wait for each response from the server |
 | `always_load` | bool | `false` | - | - | Load every tool of the server up front instead of through `tool_search` |
 | `command` | string[] | required | - | - | Stdio servers: the program and its arguments. It must not be empty. When `url` is also set, `command` wins |
-| `environment` | table | `{}` | - | - | Stdio servers: environment variables for the server process, such as `{ GITHUB_TOKEN = "..." }`. Values are stored as plain text |
+| `environment` | table | `{}` | - | - | Stdio servers: environment variables for the server process, such as `{ GITHUB_TOKEN = "{env:GITHUB_TOKEN}" }`. In the global file, `{env:NAME}` reads a value from your environment. Other values are stored as plain text |
 | `url` | string | required | - | - | HTTP servers: the server URL. It must start with `http://` or `https://` |
-| `headers` | table | `{}` | - | - | HTTP servers: headers sent with every request, such as `{ Authorization = "Bearer ..." }`. Values are stored as plain text |
+| `headers` | table | `{}` | - | - | HTTP servers: headers sent with every request, such as `{ Authorization = "Bearer {env:GITHUB_TOKEN}" }`. In the global file, `{env:NAME}` reads a value from your environment. Other values are stored as plain text |
 | `oauth` | table | unset | - | - | HTTP servers: a static OAuth client, for a server that has no dynamic client registration |
 
 <!-- /caudra-docgen:mcp-server-fields -->
@@ -150,7 +152,7 @@ Open `/mcp` to review a parked server. The picker shows the command or URL, conf
 | `p` | Confirm trust for this exact configuration and project |
 | `r` | Confirm rejection and disable the server |
 
-Persistent trust is stored in the user state directory using the canonical project, server name, and SHA-256 configuration digest. Changing the command, arguments, environment, URL, headers, or OAuth client configuration requires review again.
+Persistent trust is stored in the user state directory using the canonical project, server name, and SHA-256 configuration digest. Changing the command, arguments, environment, URL, headers, or OAuth client configuration requires review again. The digest covers values after `{env:NAME}` expands, so a global server that needs review, such as a local stdio server in a remote workspace, asks again when a variable it reads changes.
 
 MCP and OAuth HTTP requests do not follow redirects. OAuth discovery and token endpoints are resolved and pinned too. A private OAuth endpoint is accepted only on the reviewed MCP origin.
 
@@ -189,7 +191,7 @@ Servers without dynamic client registration need a client you registered yoursel
 | Field | Type | Default | Max | Description |
 |-------|------|---------|-----|-------------|
 | `client_id` | string | required | - | The client ID of the app you registered with the server |
-| `client_secret` | string | unset | - | The client secret, for a confidential client. It is stored as plain text |
+| `client_secret` | string | unset | - | The client secret, for a confidential client. It is stored as plain text unless the global file reads it from your environment with `{env:NAME}` |
 | `callback_port` | integer | unset | 65535 | Pin the loopback port of the redirect URI, so you can register the URI in advance. Unset tries the default port, then any free port, so the URI can change between runs |
 | `callback_path` | string | `/mcp/oauth/callback` | - | The path of the redirect URI. It must start with `/` |
 | `callback_hostname` | string | `127.0.0.1` | - | The host name of the redirect URI, such as `localhost` when the server registered that form. The listener still binds to 127.0.0.1 |

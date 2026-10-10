@@ -10,6 +10,7 @@ use toml::de::{DeTable, Deserializer as TomlDeserializer, Error as TomlError};
 
 use crate::config_version::ConfigVersion;
 use crate::experimental::FeatureFlags;
+use crate::interpolation::{self, ConfigTextError, InterpolationError, Lookup};
 use crate::{PROJECT_DIR, RawConfig};
 
 pub const CONFIG_FILE: &str = "caudra.toml";
@@ -33,6 +34,12 @@ pub enum ConfigFileError {
         path: PathBuf,
         #[source]
         source: Box<TomlError>,
+    },
+    #[error("invalid {}: {source}", path.display())]
+    Environment {
+        path: PathBuf,
+        #[source]
+        source: InterpolationError,
     },
     #[error(
         "invalid {}: [experimental] is global-only; move it to the global caudra.toml",
@@ -71,8 +78,8 @@ pub fn project_init_lua_path(cwd: &Path) -> PathBuf {
 }
 
 impl GlobalConfigFile {
-    pub fn parse(text: &str) -> Result<Self, TomlError> {
-        let (features, settings) = parse(text)?;
+    pub fn parse(text: &str, lookup: Lookup<'_>) -> Result<Self, ConfigTextError> {
+        let (features, settings) = parse(text, lookup)?;
         Ok(Self {
             features: features.unwrap_or_default(),
             settings,
@@ -83,18 +90,19 @@ impl GlobalConfigFile {
 /// A missing file means every default, including every experiment off.
 pub fn load_global_config(path: &Path) -> Result<GlobalConfigFile, ConfigFileError> {
     match read(path)? {
-        Some(text) => GlobalConfigFile::parse(&text).map_err(|source| invalid(path, source)),
+        Some(text) => GlobalConfigFile::parse(&text, Lookup::Global(path))
+            .map_err(|source| invalid(path, source)),
         None => Ok(GlobalConfigFile::default()),
     }
 }
 
-/// A repository must never opt its users into an experiment, so the table is
-/// refused outright rather than ignored.
+/// A repository must never opt its users into an experiment or read their
+/// environment, so both are refused outright rather than ignored.
 pub fn load_project_config(path: &Path) -> Result<RawConfig, ConfigFileError> {
     let Some(text) = read(path)? else {
         return Ok(RawConfig::default());
     };
-    match parse(&text).map_err(|source| invalid(path, source))? {
+    match parse(&text, Lookup::Refused).map_err(|source| invalid(path, source))? {
         (Some(_), _) => Err(ConfigFileError::ProjectExperimental {
             path: path.to_path_buf(),
         }),
@@ -113,16 +121,23 @@ fn read(path: &Path) -> Result<Option<String>, ConfigFileError> {
     }
 }
 
-fn invalid(path: &Path, source: TomlError) -> ConfigFileError {
-    ConfigFileError::Invalid {
-        path: path.to_path_buf(),
-        source: Box::new(source),
+fn invalid(path: &Path, error: ConfigTextError) -> ConfigFileError {
+    let path = path.to_path_buf();
+    match error {
+        ConfigTextError::Toml(source) => ConfigFileError::Invalid {
+            path,
+            source: Box::new(source),
+        },
+        ConfigTextError::Environment(source) => ConfigFileError::Environment { path, source },
     }
 }
 
 /// The envelope keys come off a spanned table before the settings are read,
 /// so `RawConfig` keeps rejecting unknown keys and every error keeps its line.
-fn parse(text: &str) -> Result<(Option<FeatureFlags>, RawConfig), TomlError> {
+fn parse(
+    text: &str,
+    lookup: Lookup<'_>,
+) -> Result<(Option<FeatureFlags>, RawConfig), ConfigTextError> {
     ConfigVersion::<CONFIG_VERSION>::check_document(text)?;
     let located = |mut error: TomlError| {
         error.set_input(Some(text));
@@ -136,6 +151,7 @@ fn parse(text: &str) -> Result<(Option<FeatureFlags>, RawConfig), TomlError> {
         .map(|table| FeatureFlags::deserialize(table.into_deserializer()))
         .transpose()
         .map_err(located)?;
+    interpolation::expand(root.get_mut(), text, lookup)?;
     let settings = RawConfig::deserialize(TomlDeserializer::from(root)).map_err(located)?;
     Ok((features, settings))
 }
@@ -147,10 +163,14 @@ mod tests {
     use super::{
         CONFIG_FILE, ConfigFileError, load_global_config, load_project_config, project_config_path,
     };
-    use crate::InboundPolicy;
     use crate::experimental::{Feature, FeatureFlags};
+    use crate::{ENV_FILE, InboundPolicy};
     use test_case::test_case;
 
+    const ENDPOINT_HOST: &str = "CAUDRA_TEST_CONFIG_FILE_ENDPOINT_HOST";
+    const UNSET_THEME: &str = "CAUDRA_TEST_CONFIG_FILE_UNSET_THEME";
+    const GLOBAL_SCOPE: &str = "global";
+    const PROJECT_SCOPE: &str = "project";
     const EVERY_FLAG: &str = "[experimental]\nworkflows = true\nsandboxes = true\nremote_workcell = true\nlua_plugins = true\ndecision_engine = true\ncross_session_messaging = true\nautomations = true\n";
 
     fn write(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -267,6 +287,49 @@ mod tests {
             load_project_config(&path).unwrap().agent.todo_reminder,
             Some(false)
         );
+    }
+
+    #[test]
+    fn global_settings_read_the_environment() {
+        let (dir, path) = write(&format!(
+            "[telemetry]\nendpoint = \"https://{{env:{ENDPOINT_HOST}}}/v1\"\n"
+        ));
+        fs::write(
+            dir.path().join(ENV_FILE),
+            format!("{ENDPOINT_HOST}=otel.test\n"),
+        )
+        .unwrap();
+        let settings = load_global_config(&path).unwrap().settings;
+        assert_eq!(
+            settings.telemetry.endpoint.as_deref(),
+            Some("https://otel.test/v1")
+        );
+    }
+
+    #[test_case(GLOBAL_SCOPE; "global_unset")]
+    #[test_case(PROJECT_SCOPE; "project_refused")]
+    fn environment_errors_name_the_file_and_line(scope: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = project_config_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            format!("version = 1\n[ui]\ntheme = \"{{env:{UNSET_THEME}}}\"\n"),
+        )
+        .unwrap();
+        let error = if scope == GLOBAL_SCOPE {
+            load_global_config(&path).unwrap_err()
+        } else {
+            load_project_config(&path).unwrap_err()
+        };
+        assert!(
+            matches!(error, ConfigFileError::Environment { .. }),
+            "{error}"
+        );
+        let message = error.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("line 3"), "{message}");
+        assert!(message.contains(UNSET_THEME), "{message}");
     }
 
     #[test]

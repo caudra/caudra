@@ -643,7 +643,7 @@ mod tests {
         use std::env;
         use std::process::Command;
 
-        use caudra_config::providers::ProvidersConfig;
+        use caudra_config::providers::{ProvidersConfig, ProvidersFile};
         use caudra_storage::auth::now_millis;
         use caudra_storage::paths;
         use tempfile::TempDir;
@@ -689,7 +689,7 @@ mod tests {
             assert!(!config_path.exists());
             assert!(!cache_path.exists());
 
-            config.save().unwrap();
+            ProvidersFile::load().unwrap().save().unwrap();
             assert!(config_path.is_dir());
             assert!(ProvidersConfig::load().providers.is_empty());
             let models = normalize_catalog_payload(VALID_PAYLOAD).unwrap();

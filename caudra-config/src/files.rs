@@ -135,7 +135,7 @@ pub const ENV: ConfigFile = ConfigFile {
     holds: "environment variables, such as API keys, for any the environment does not set",
     separate_because: "It holds secrets",
     feature: None,
-    docs: "/docs/configuration/#config-files",
+    docs: "/docs/configuration/#environment-variables",
     example: None,
 };
 

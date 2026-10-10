@@ -34,7 +34,7 @@ Remote sessions load only the client's global configuration. They skip both proj
 | [`workcell.toml`](/docs/remote-workspaces/#configure-a-profile) | global | profiles for direct remote Workcell connections (needs `experimental.remote_workcell`) | It decides where credentials go, so it has to be a private file | [`caudra config example workcell`](/docs/reference-configs/#workcell-toml) |
 | [`sandboxes.toml`](/docs/sandboxes/#configuration-schema) | global | managed sandbox providers, networks, transfers, and profiles (needs `experimental.sandboxes`) | The `/sandbox` manager writes it, and it has to be a private file | [`caudra config example sandboxes`](/docs/reference-configs/#sandboxes-toml) |
 | [`init.lua`](/docs/plugins/) | global, project | Lua code that sets up plugins (needs `experimental.lua_plugins`) | It is a program, not settings | - |
-| [`.env`](/docs/configuration/#config-files) | global, project | environment variables, such as API keys, for any the environment does not set | It holds secrets | - |
+| [`.env`](/docs/configuration/#environment-variables) | global, project | environment variables, such as API keys, for any the environment does not set | It holds secrets | - |
 | [`commands/`](/docs/commands/#custom-commands) | global, project | custom slash commands, one Markdown file each | Each command is a file of its own | - |
 
 `caudra config files` lists where each file lives on your machine and whether it is there. `caudra config example FILE` prints the reference of a TOML file, such as `caudra config example mcp`. See [`caudra config`](/docs/cli/#caudra-config).
@@ -74,6 +74,24 @@ All fields are optional. A file may start with `version = 1`, and a file without
 For every setting in one file, with its type, default, and description, see [Reference configs](/docs/reference-configs/#caudra-toml) or run [`caudra config example`](/docs/cli/#caudra-config).
 
 `provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `opencode/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list. Omit it to inherit, or use `[]` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `caudra models`.
+
+## Environment variables
+
+A string value in a global config file can read an environment variable. Write `{env:NAME}` where the value goes, and Caudra puts the value of `NAME` there when it reads the file. This keeps a secret or a machine-specific value out of the file:
+
+```toml
+[telemetry]
+endpoint = "https://{env:OTEL_HOST}"
+headers = { authorization = "Bearer {env:OTEL_TOKEN}" }
+```
+
+- It works in the global `caudra.toml`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `workcell.toml`. `sandboxes.toml` keeps every value as written.
+- A reference can be the whole value or part of it, and one value can hold several. Only string values expand, so keys, numbers, and booleans cannot come from the environment.
+- Caudra looks in the process environment first, then in the global `.env`. A project `.env` never supplies a value.
+- An unset variable is an error that names the file, the line, and the variable. A bad `caudra.toml` stops startup and a bad `providers.toml` exits. A bad `permissions.toml` fails closed and denies every tool call. A bad `mcp.toml` loads none of its servers, and `/mcp` shows the error.
+- A project file under `.caudra/` cannot hold a reference, and Caudra refuses to load it. A project MCP server on a public HTTPS URL connects without review, so a reference there could send your secret to a server the repository chose.
+- `${env:NAME}`, the PowerShell form, stays as written, so shell commands and permission patterns can use it.
+- When Caudra writes a file, such as `/mcp` turning a server off or `caudra auth login` adding a provider, the reference stays in the file rather than its value.
 
 ## Experimental features
 
