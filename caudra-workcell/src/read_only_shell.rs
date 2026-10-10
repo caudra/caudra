@@ -15,7 +15,10 @@ use caudra_agent::permissions::{
 };
 #[cfg(test)]
 use workcell::shell::ShellCommandAnalysis;
-use workcell::shell::{ShellCommandScope, ShellWord, bash::BashCwdSet};
+use workcell::shell::{
+    ShellCommandScope, ShellWord,
+    bash::{BashCwdSet, VariableEffect, variable_effect},
+};
 
 use crate::shell_glob::expand_glob;
 
@@ -252,6 +255,13 @@ const SORT_READ_SHORT_FLAGS: &str = "urnhgfbdiMsVcCz";
 const SED: &str = "sed";
 const END_OF_FLAGS: &str = "--";
 const CD: &str = "cd";
+const UNSET: &str = "unset";
+const SET: &str = "set";
+/// The variables Bash itself reads to find commands, directories, and startup files. Without
+/// `PATH` it looks in the working directory, so `unset PATH; make` runs `./make`.
+pub(crate) const SHELL_STATE_VARIABLES: &[&str] = &[
+    "PATH", "HOME", "CDPATH", "PWD", "OLDPWD", "IFS", "ENV", "BASH_ENV",
+];
 /// `awk` is absent on purpose rather than deny-listed: `system()` and `print >`
 /// are reached from inside the script, so no flag list can exclude them. The
 /// same is true of `sed`, which is why `sed` is recognized by its script rather
@@ -394,6 +404,7 @@ pub(crate) fn shell_read_only_verdict(
             .first()
             .is_some_and(|format| !format.starts_with('-') || *format == "--"),
         executable @ (LOOKUP_COMMAND | LOOKUP_TYPE) => name_lookup(executable, &arguments),
+        executable @ (UNSET | SET) => inert_variables(executable, &arguments),
         executable if READ_ONLY_COMMANDS.contains(&executable) => true,
         _ => return Err(NotReadOnly::UnknownCommand),
     };
@@ -427,6 +438,17 @@ fn version_probe(executable: &str, arguments: &[&str]) -> bool {
     VERSION_PROBES
         .iter()
         .any(|(probed, flags)| *probed == name && flags.contains(flag))
+}
+
+/// Whether `unset` or `set` changes nothing a later command reads: it clears
+/// variables other than those Bash itself reads, or sets options that only
+/// decide when the line stops and whether it is traced. Printing every
+/// variable is not inert, because their values include credentials.
+pub(crate) fn inert_variables(executable: &str, arguments: &[&str]) -> bool {
+    let argv = [&[executable], arguments].concat();
+    variable_effect(&argv).is_some_and(|effect| {
+        effect != VariableEffect::Prints && effect.keeps(SHELL_STATE_VARIABLES)
+    })
 }
 
 /// `command -v|-V NAME…` and `type [-afptP] NAME…` only report what each name
@@ -570,10 +592,10 @@ pub(crate) fn confined_read(
         && directories.iter().all(|directory| {
             directory.starts_with(project)
                 && resolves_inside("", directory, project)
-                && if scope.executable == CD {
-                    cd_target(scope, directory, project).is_some()
-                } else {
-                    scope_stays_in_project(scope, globs, directory, project)
+                && match scope.executable.as_str() {
+                    CD => cd_target(scope, directory, project).is_some(),
+                    UNSET | SET => true,
+                    _ => scope_stays_in_project(scope, globs, directory, project),
                 }
         })
 }

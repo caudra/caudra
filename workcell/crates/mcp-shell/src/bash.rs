@@ -10,11 +10,16 @@ use tree_sitter::{Node, ParseOptions, ParseState, Parser, Point, Range, Tree};
 
 mod contexts;
 mod lower;
+mod variables;
 
 pub use contexts::{
     BashCommandContext, BashCommandContexts, BashContextAssumptions, BashContextDiagnostic,
     BashContextError, BashContextIssue, BashCwdSet, MAX_CONTEXT_BYTES, MAX_CWD_PATH_BYTES,
     MAX_CWD_STATES,
+};
+pub use variables::{
+    VariableEffect, names_variables, plain_identifier, variable_builtin, variable_effect,
+    variable_name,
 };
 
 pub const BASH_ANALYSIS_VERSION: u16 = 2;
@@ -623,6 +628,10 @@ mod tests {
         "cat >",
         "echo a\r\necho b",
         "echo a\0b",
+        "export A=1 B 'C=2' # note",
+        "unset -v A 2>/dev/null; declare -a arr=(1 2)",
+        "for x in a; do unset X; done",
+        "export A=$(id)",
     ];
 
     #[test]
@@ -714,6 +723,45 @@ mod tests {
                 .iter()
                 .any(|covered| matches!(covered.role, BashCoverageKind::Operator(_)))
         );
+    }
+
+    /// The builtin, not the shell, reads a declaration's operands, so `A=1` after `export` is an
+    /// argument rather than an assignment the shell makes before running a command.
+    #[test]
+    fn variable_builtins_lower_to_commands_whose_operands_are_arguments() {
+        for (source, argv) in [
+            ("unset A B", &["unset", "A", "B"][..]),
+            ("unset -v 'a[1]'", &["unset", "-v", "a[1]"][..]),
+            ("export A=1 B 'C=2'", &["export", "A=1", "B", "C=2"][..]),
+            ("local -r x=1", &["local", "-r", "x=1"][..]),
+            ("readonly", &["readonly"][..]),
+            ("typeset -i n=1+1 # note", &["typeset", "-i", "n=1+1"][..]),
+        ] {
+            let program = parse_bash(source).unwrap();
+            assert!(
+                program.is_complete(),
+                "{source:?}: {:?}",
+                program.diagnostics()
+            );
+            let command = first_command(&program);
+            assert_eq!(command.static_argv().unwrap(), argv, "{source:?}");
+            assert!(command.assignments.is_empty(), "{source:?}");
+            assert_coverage(&program);
+        }
+
+        let program = parse_bash("export A=\"$HOME\" B").unwrap();
+        assert!(program.is_complete(), "{:?}", program.diagnostics());
+        let command = first_command(&program);
+        assert_eq!(command.words[1].literal, None);
+        assert_eq!(program.text(&command.words[1].span), Some("A=\"$HOME\""));
+
+        let program = parse_bash("unset A 2>/dev/null && declare -p A | cat").unwrap();
+        assert!(program.is_complete(), "{:?}", program.diagnostics());
+        assert_eq!(
+            grouping(&program, program.root()),
+            "(unset A && (declare -p A | cat))"
+        );
+        assert_eq!(first_command(&program).redirects.len(), 1);
     }
 
     #[test]
@@ -1121,6 +1169,14 @@ mod tests {
             (
                 "cat <<EOF\n$(sudo id)\nEOF\n",
                 vec![named("cat", Some("cat")), named("sudo", Some("sudo id"))],
+            ),
+            (
+                "for x in a; do unset -v 'a[$(id)]' B; done",
+                vec![named("unset", Some("unset -v a[$(id)] B"))],
+            ),
+            (
+                "export A=$(id) B=1",
+                vec![named("export", None), named("id", Some("id"))],
             ),
         ] {
             let program = parse_bash(source).unwrap();

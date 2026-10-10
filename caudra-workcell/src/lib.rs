@@ -6360,6 +6360,9 @@ mod tests {
     #[test_case("python3 -c 'print(1)'", Some(INLINE_PYTHON); "interpreter_code")]
     #[test_case("echo $(date)", Some(ShellOpacity::Dynamic); "a_substitution")]
     #[test_case("cat <<'EOF'\nnotes\nEOF\n", Some(ShellOpacity::Redirect); "a_heredoc")]
+    #[test_case("unset FOO; git status --short", None; "clearing_a_variable")]
+    #[test_case("export A=1; git status --short", Some(ShellOpacity::Dynamic); "exporting_a_variable")]
+    #[test_case("unset 'a[$(id)]'", Some(ShellOpacity::Unparsed); "a_subscript_in_an_unset_name")]
     fn only_the_whole_line_resource_names_its_opacity(
         command: &str,
         expected: Option<ShellOpacity>,
@@ -6509,6 +6512,11 @@ mod tests {
     #[test_case("wc --files0-from=paths" => false ; "wc_indirect_file_operands")]
     #[test_case("du --files0-f=paths" => false ; "du_abbreviated_indirect_operands")]
     #[test_case("echo src/*" => false ; "echo_prints_the_names_a_glob_matches")]
+    #[test_case("unset FOO && cat Cargo.toml" => true ; "clearing_a_variable_before_a_read")]
+    #[test_case("set -eu; cat Cargo.toml" => true ; "options_that_only_stop_the_line")]
+    #[test_case("unset PATH; cat Cargo.toml" => false ; "clearing_the_command_search_path")]
+    #[test_case("export A=1; cat Cargo.toml" => false ; "exporting_before_a_read")]
+    #[test_case("set" => false ; "printing_every_variable")]
     fn shell_preflight_marks_only_a_confined_read(command: &str) -> bool {
         let root = TempDir::new().expect("tempdir");
         confined_read_preflight_marks(root.path(), command)
@@ -6920,6 +6928,40 @@ mod tests {
         !rows.is_empty() && rows.iter().all(|resource| *resource)
     }
 
+    /// A variable builtin that changes nothing a later command reads is allowed
+    /// as a read, so every other command on the line keeps a row of its own.
+    #[test_case(
+        "unset FOO BAR; make gen-docs && git diff --stat",
+        &[("unset FOO BAR", true), ("make gen-docs", false), ("git diff --stat", true)];
+        "clearing_variables"
+    )]
+    #[test_case(
+        "set -euo pipefail; cargo test",
+        &[("set -euo pipefail", true), ("cargo test", false)];
+        "options_that_only_stop_the_line"
+    )]
+    #[test_case("export -p", &[("export -p", false)]; "printing_variables_still_asks")]
+    fn a_variable_builtin_leaves_the_line_reviewable(command: &str, expected: &[(&str, bool)]) {
+        let root = TempDir::new().expect("tempdir");
+        let intent = shell_preflight_intent(root.path(), command);
+        let rows: Vec<_> = intent
+            .resources
+            .iter()
+            .map(|resource| {
+                (
+                    resource.value.as_str(),
+                    resource
+                        .attributes
+                        .get(CONFINED_READ_ATTRIBUTE)
+                        .map(String::as_str)
+                        == Some(CONFINED_READ_VALUE),
+                )
+            })
+            .collect();
+        assert_eq!(rows, expected);
+        assert!(intent.resources.iter().all(|resource| !resource.protected));
+    }
+
     /// The attribute is what the builtin rule turns on, and it is set per
     /// resource, so only a call through the real preflight shows that a command
     /// which executes stops tainting the observers beside it. Every row was
@@ -7039,6 +7081,10 @@ mod tests {
     #[test_case("hash -p ./cargo cargo; cargo check"; "builtin_command_resolution_state")]
     #[test_case("pwd -P; cargo check"; "builtin_flags_need_positive_classification")]
     #[test_case("umask 000; cargo check"; "builtin_process_state")]
+    #[test_case("unset PATH; cargo check"; "clearing_the_command_search_path")]
+    #[test_case("export RUSTFLAGS=-Dwarnings; cargo check"; "exporting_a_variable")]
+    #[test_case("set -k; cargo check"; "an_option_that_changes_the_shell")]
+    #[test_case("unset 'a[0]'; cargo check"; "a_subscript_in_an_unset_name")]
     fn shell_preflight_requires_exact_source_for_unaccounted_effects(command: &str) {
         let root = TempDir::new().expect("tempdir");
         let intent = shell_preflight_intent(root.path(), command);
@@ -7620,6 +7666,8 @@ mod tests {
     #[test_case("cargo check &&", AutoNote::AlwaysAsks(ShellOpacity::Unparsed); "a_syntax_error")]
     #[test_case("$EDITOR notes.md", AutoNote::AlwaysAsks(ShellOpacity::Unparsed); "a_dynamic_executable")]
     #[test_case("git status > status.txt", AutoNote::EngineNeeded; "a_screenable_line_waits_for_an_engine")]
+    #[test_case("export A=1; make", AutoNote::EngineNeeded; "a_declaration_waits_for_an_engine")]
+    #[test_case("declare 'a[$(id)]=1'", AutoNote::AlwaysAsks(ShellOpacity::Unparsed); "a_subscript_in_a_declared_name")]
     fn auto_always_asks_for_privilege_indirect_and_unparsed(command: &str, note: AutoNote) {
         smol::block_on(async {
             let root = TempDir::new().expect("project");

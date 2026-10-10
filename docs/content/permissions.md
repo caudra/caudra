@@ -696,12 +696,12 @@ Some lines cannot be checked command by command. Caudra then reviews the whole l
 |---|---|---|---|
 | Loops and conditions | `for`, `while`, `if`, `case`, functions | `Uses loops or conditions that rules can't check` | Screened |
 | File redirects | `> out.txt`, or data in a heredoc such as `cat <<'EOF'` | `Redirects input or output in ways rules can't check` | Screened |
-| Words built at run time | `$(…)`, `<(…)`, `$((…))`, `$HOME`, assignments, `cd` to a computed path, globs such as `*.rs` or `~/x*` | `Builds part of the command only when it runs` | Screened |
+| Words built at run time | `$(…)`, `<(…)`, `$((…))`, `$HOME`, assignments, declarations such as `export A=1`, `cd` to a computed path, globs such as `*.rs` or `~/x*`, `unset PATH`, `set` options other than the [inert ones](#inert-variable-builtins) | `Builds part of the command only when it runs` | Screened |
 | Wrappers | `env`, `time`, `xargs`, `command`, `builtin`, `coproc`, `bash script.sh` | `Runs a command through another program` | Screened |
 | Inline scripts | A heredoc or here-string fed to an interpreter, `python3 -c`, `node -e`, `bash -c` | `Runs inline Python that Caudra can't check`, naming the language | Screened |
 | Indirect code | `eval`, `source`, `.` | `Runs code through eval or source` | Always asks |
 | Privilege | `sudo`, `su`, `doas` | `Runs with elevated privileges` | Always asks |
-| Unreadable | Syntax errors, an executable that is not literal, other unsupported syntax | `Caudra couldn't read this command line` | Always asks |
+| Unreadable | Syntax errors, an executable that is not literal, a subscript or computed name in `unset` or a declaration such as `unset 'a[$i]'`, other unsupported syntax | `Caudra couldn't read this command line` | Always asks |
 
 The most severe cause names the line, so `eval` in a loop always asks. A redirect to `/dev/null` or between descriptors, such as `2>&1`, keeps a line checkable. Caudra looks inside loops, conditions, and substitutions for the commands they run. It also parses literal shell code given to `bash -c` or fed to a shell on standard input, up to two shells deep. Code that is not literal, or nested deeper, is unreadable. [Auto mode](#auto-mode) describes screening.
 
@@ -723,6 +723,12 @@ Routine probes count as read-only, so they do not ask. A name lookup qualifies w
 | `deno`, `bun`, `ruby`, `gcc`, `clang`, `make`, `cmake`, `git`, `just`, `rg`, `jq`, `uv`, `pip`, `pip3`, `nix`, `docker` | `--version` |
 
 Versioned names such as `python3.12` count as their interpreter. `python -v` starts a verbose interpreter and `ruby -v` reads a program from standard input, so neither is listed. A path-qualified executable such as `/usr/bin/python3 --version` still asks.
+
+### Inert variable builtins
+
+Clearing a variable or setting an error option also counts as read-only, so `unset FOO; set -euo pipefail; cargo test` gets one row, for `cargo test`. `unset` qualifies when every operand is a plain name and none is a variable Bash itself reads: `PATH`, `HOME`, `CDPATH`, `PWD`, `OLDPWD`, `IFS`, `ENV`, or `BASH_ENV`. Without `PATH`, for example, Bash looks commands up in the working directory, so `unset PATH; make` runs `./make`. `set` qualifies when it only turns `-e`, `-u`, `-x`, `pipefail`, `errexit`, `nounset`, or `xtrace` on or off. Configured ask and deny rules for `unset` and `set` still apply.
+
+Declarations that set or mark a variable, such as `export A=1`, `export A`, `declare -x A`, `readonly A`, and `local x=1`, build the command at run time, because any variable can change what a later program does, as `GIT_SSH_COMMAND` and `LD_PRELOAD` do. Bash evaluates a subscript such as `a[$(id)]` as arithmetic, so a name that is not plain makes the line unreadable. Forms that only print variables, such as bare `set`, `export -p`, and `declare -p HOME`, get a row like `printenv`, because their output can show credentials.
 
 Caudra executes the reviewed command text unchanged. Workcell may reduce completed shell output before the model receives it. The TUI shows raw output while the command runs, then switches to a labelled filtered view that the user can toggle back to raw.
 

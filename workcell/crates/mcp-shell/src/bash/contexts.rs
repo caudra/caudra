@@ -6,7 +6,10 @@ use std::{
 
 use serde::Serialize;
 
-use super::{BashCommand, BashNodeId, BashNodeKind, BashOperatorKind, BashParseError, BashProgram};
+use super::{
+    BashCommand, BashNodeId, BashNodeKind, BashOperatorKind, BashParseError, BashProgram,
+    variable_effect,
+};
 
 pub const MAX_CWD_STATES: usize = 32;
 pub const MAX_CWD_PATH_BYTES: usize = 4096;
@@ -15,6 +18,8 @@ const CONTEXT_DIAGNOSTICS_PER_NODE: usize = 3;
 const INITIAL_CONTEXT_DIAGNOSTICS: usize = 3;
 const TYPE_FLAGS: &str = "afptP";
 const EXPANSION: char = '$';
+/// The variables `cd` reads, so clearing one changes where a later `cd` goes.
+const CD_VARIABLES: &[&str] = &["CDPATH", "HOME", "PWD", "OLDPWD"];
 const BASH_BUILTINS: &[&str] = &[
     ".",
     ":",
@@ -420,6 +425,9 @@ impl ContextBuilder {
                 ":" | "true" | "false" | "echo" => Outcomes::unchanged(incoming),
                 "pwd" if argv.len() == 1 => Outcomes::unchanged(incoming),
                 "command" | "type" if looks_up_names(&argv) => Outcomes::unchanged(incoming),
+                _ if variable_effect(&argv).is_some_and(|effect| effect.keeps(CD_VARIABLES)) => {
+                    Outcomes::unchanged(incoming)
+                }
                 _ => self.unknown_effect(id),
             };
         }
@@ -511,7 +519,20 @@ mod tests {
     fn every_builtin_is_unknown_unless_its_state_behavior_is_explicitly_supported() {
         for builtin in super::BASH_BUILTINS {
             let result = contexts(&format!("'{builtin}'; cat note"));
-            let supported = matches!(*builtin, ":" | "true" | "false" | "echo" | "pwd");
+            let supported = matches!(
+                *builtin,
+                ":" | "true"
+                    | "false"
+                    | "echo"
+                    | "pwd"
+                    | "declare"
+                    | "export"
+                    | "local"
+                    | "readonly"
+                    | "set"
+                    | "typeset"
+                    | "unset"
+            );
             assert_eq!(result.complete, supported, "{builtin}");
             assert_eq!(
                 result.commands.last().unwrap().complete,
@@ -659,6 +680,27 @@ mod tests {
     }
 
     #[test]
+    fn a_variable_builtin_that_leaves_cd_alone_keeps_the_working_directory() {
+        for (source, expected) in [
+            ("unset FOO BAR; cd left; cat note", paths(&["", "left"])),
+            ("unset -v PATH && cd left && cat note", paths(&["left"])),
+            ("set -euo pipefail; cd left && cat note", paths(&["left"])),
+            ("set +x\ncat note", paths(&[""])),
+            ("export -p; cat note", paths(&[""])),
+            ("declare -p HOME; cat note", paths(&[""])),
+            ("unset FOO 2>/dev/null; cat note", paths(&[""])),
+        ] {
+            let result = contexts(source);
+            assert!(result.complete, "{source:?}: {:?}", result.diagnostics);
+            assert_eq!(
+                result.commands.last().unwrap().incoming,
+                expected,
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
     fn an_external_command_keeps_the_cwd_whatever_its_globs_match() {
         for source in [
             "ls src/* && cat note",
@@ -773,6 +815,18 @@ mod tests {
             "cd left/*; cat note",
             "ls src/* > $out; cat note",
             "MODE=fast ls src/*; cat note",
+            "unset CDPATH; cd left; cat note",
+            "unset -v OLDPWD; cat note",
+            "unset -f f; cat note",
+            "unset 'a[0]'; cat note",
+            "set -P; cd left; cat note",
+            "set -- a; cat note",
+            "export CDPATH=/outside; cd left; cat note",
+            "export A; cat note",
+            "declare -x A; cat note",
+            "local x=1; cat note",
+            "readonly A; cat note",
+            "export A=\"$B\"; cat note",
         ] {
             let result = contexts(source);
             assert!(!result.complete, "{source:?}");

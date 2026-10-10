@@ -17,6 +17,10 @@ const HERESTRING_OPERATOR: &str = "<<<";
 const DELIMITER_QUOTES: [char; 3] = ['\'', '"', '\\'];
 const BODY_EXPANSIONS: [char; 3] = ['$', '`', '\\'];
 const BACKTICK: char = '`';
+/// Builtins the grammar parses as statements of their own rather than as commands. The keyword is
+/// their command name, and every operand an argument, an assignment included, because the builtin
+/// rather than the shell reads it.
+const BUILTIN_STATEMENTS: [&str; 2] = ["declaration_command", "unset_command"];
 
 pub(super) fn lower(source: &str, root: Node<'_>) -> BashProgram {
     let mut program = BashProgram {
@@ -51,6 +55,10 @@ fn trivia(source: &str) -> bool {
         };
     }
     true
+}
+
+fn command_statement(kind: &str) -> bool {
+    matches!(kind, "command" | "redirected_statement") || BUILTIN_STATEMENTS.contains(&kind)
 }
 
 fn unsupported(node: Node<'_>) -> BashDiagnosticKind {
@@ -226,7 +234,7 @@ impl BashProgram {
                 self.nodes[id.0].span = command_line(&command);
                 Ok(BashNodeKind::Command { command })
             }
-            "command" | "redirected_statement" => {
+            kind if command_statement(kind) => {
                 let mut command = new_command();
                 self.command_parts(node, id, &mut command)?;
                 Ok(BashNodeKind::Command {
@@ -659,7 +667,7 @@ impl BashProgram {
         {
             return Err(BashDiagnosticKind::SourceGap);
         }
-        if !matches!(statement.kind(), "command" | "redirected_statement") {
+        if !command_statement(statement.kind()) {
             return Err(unsupported(statement));
         }
         self.command_parts(statement, id, command)
@@ -745,7 +753,9 @@ impl BashProgram {
         let mut stack = vec![node];
         while let Some(current) = stack.pop() {
             match current.kind() {
-                "command" => self.record_region_command(current, region),
+                kind if kind == "command" || BUILTIN_STATEMENTS.contains(&kind) => {
+                    self.record_region_command(current, region)
+                }
                 "heredoc_redirect" if self.hides_commands(current) => {
                     self.regions.complete = false;
                 }
@@ -780,9 +790,12 @@ impl BashProgram {
                     .collect()
             })
             .flatten();
-        let executable = node
-            .child_by_field_name("name")
-            .and_then(|name| decode_static_word(&self.source[name.byte_range()]));
+        let name = if BUILTIN_STATEMENTS.contains(&node.kind()) {
+            node.child(0)
+        } else {
+            node.child_by_field_name("name")
+        };
+        let executable = name.and_then(|name| decode_static_word(&self.source[name.byte_range()]));
         self.regions.commands.push(BashRegionCommand {
             region,
             span: BashSpan::of(node),
@@ -799,16 +812,19 @@ impl BashProgram {
         let mut node = command;
         loop {
             omitted.extend(self.omitted(node));
+            let builtin = BUILTIN_STATEMENTS.contains(&node.kind());
             for (index, child) in children(node).into_iter().enumerate() {
                 match child.kind() {
                     "file_redirect" => {
                         words.extend(field_children(child, "destination").into_iter().skip(1));
                     }
                     "heredoc_redirect" => words.extend(field_children(child, "argument")),
-                    _ if matches!(
-                        node.field_name_for_child(index as u32),
-                        Some("name" | "argument")
-                    ) =>
+                    "comment" => continue,
+                    _ if builtin
+                        || matches!(
+                            node.field_name_for_child(index as u32),
+                            Some("name" | "argument")
+                        ) =>
                     {
                         words.push(child);
                         continue;
@@ -912,9 +928,12 @@ impl BashProgram {
             return Err(BashDiagnosticKind::SourceGap);
         }
         reject_substitutions(node)?;
+        let builtin = BUILTIN_STATEMENTS.contains(&node.kind());
         for (index, child) in children(node).into_iter().enumerate() {
             match child.kind() {
-                "command" | "redirected_statement" if node.kind() == "redirected_statement" => {
+                "comment" => self.claim(BashSpan::of(child), id, BashCoverageKind::Trivia),
+                _ if builtin => self.command_word(child, id, command),
+                kind if command_statement(kind) && node.kind() == "redirected_statement" => {
                     self.command_parts(child, id, command)?
                 }
                 "command_name" => self.command_word(child, id, command),
@@ -926,7 +945,6 @@ impl BashProgram {
                 }
                 "file_redirect" => self.redirect(child, id, command)?,
                 "herestring_redirect" => self.herestring(child, id, command)?,
-                "comment" => self.claim(BashSpan::of(child), id, BashCoverageKind::Trivia),
                 _ if node.field_name_for_child(index as u32) == Some("argument") => {
                     self.command_word(child, id, command)
                 }

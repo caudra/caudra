@@ -19,11 +19,12 @@ use workcell::shell::{
     bash::{
         BashCommand, BashCommandContext, BashCommandContexts, BashCoverageKind, BashCwdSet,
         BashDiagnosticKind, BashNodeKind, BashParseError, BashProgram, BashRedirect,
-        BashRedirectKind, BashRegionCommand, parse_bash,
+        BashRedirectKind, BashRegionCommand, names_variables, parse_bash, plain_identifier,
+        variable_builtin, variable_effect, variable_name,
     },
 };
 
-use crate::read_only_shell::{decimal, name_lookup};
+use crate::read_only_shell::{SHELL_STATE_VARIABLES, decimal, name_lookup};
 use crate::shell_glob::safe_glob;
 
 pub use caudra_agent::permissions::COMMAND_OBSERVATION_ATTRIBUTE;
@@ -43,6 +44,7 @@ const SHELL_VALUE_OPTIONS: &[&str] = &["--rcfile", "--init-file"];
 const SHELL_VALUE_FLAGS: [char; 2] = ['o', 'O'];
 const SHELL_OPTION_PREFIXES: [char; 2] = ['-', '+'];
 const STDIN_OPERAND: &str = "-";
+const ASSIGNMENT: char = '=';
 const MAX_SHELL_NESTING: usize = 2;
 const INLINE_SHELL: ShellOpacity = ShellOpacity::InlineScript {
     language: ScriptLanguage::Shell,
@@ -437,7 +439,14 @@ pub(crate) fn shell_facts<'a>(
     let mut unaccounted = !program.is_complete() || !contexts.complete;
     for (id, command) in program.commands() {
         let words = literal_words(command);
-        let cause = command_opacity(&words, 0).max(fed_shell(command, &words));
+        let sources: Vec<_> = command
+            .words
+            .iter()
+            .map(|word| program.text(&word.span))
+            .collect();
+        let cause = command_opacity(&words, 0)
+            .max(fed_shell(command, &words))
+            .max(variable_opacity(&words, &sources));
         inline_code = inline_code
             .max(inline_script(&words))
             .max(fed_script(command, &words));
@@ -567,10 +576,53 @@ fn region_command_opacity(command: &BashRegionCommand) -> Option<ShellOpacity> {
     match &command.argv {
         Some(argv) => {
             let words: Vec<_> = argv.iter().map(|word| Some(word.as_str())).collect();
-            command_opacity(&words, 0).max(inline_script(&words))
+            command_opacity(&words, 0)
+                .max(inline_script(&words))
+                .max(variable_opacity(&words, &words))
         }
-        None => command_opacity(&[Some(executable), None], 0).max(Some(ShellOpacity::Dynamic)),
+        None => {
+            let words = [Some(executable), None];
+            command_opacity(&words, 0)
+                .max(variable_opacity(&words, &words))
+                .max(Some(ShellOpacity::Dynamic))
+        }
     }
+}
+
+/// What a variable builtin leaves the commands after it. Clearing a variable Bash itself reads,
+/// such as `PATH`, changes how it runs later commands, and setting any variable can change what a
+/// later program runs, as an assignment can. A name that is not a plain identifier, or that the
+/// source does not spell out, can hold a subscript, which Bash evaluates as arithmetic and so runs
+/// any substitution inside.
+fn variable_opacity(words: &[Option<&str>], sources: &[Option<&str>]) -> Option<ShellOpacity> {
+    let builtin = words.first().copied().flatten()?;
+    if !variable_builtin(builtin) {
+        return None;
+    }
+    let hides_code = names_variables(builtin)
+        && words
+            .iter()
+            .zip(sources)
+            .skip(1)
+            .any(|(word, source)| match word {
+                Some(option) if option.starts_with(SHELL_OPTION_PREFIXES) => false,
+                Some(operand) => !plain_identifier(variable_name(builtin, operand)),
+                None => source.is_none_or(|source| {
+                    !source.contains(ASSIGNMENT)
+                        || !plain_identifier(variable_name(builtin, source))
+                }),
+            });
+    if hides_code {
+        return Some(ShellOpacity::Unparsed);
+    }
+    let inert = words
+        .iter()
+        .copied()
+        .collect::<Option<Vec<_>>>()
+        .is_some_and(|argv| {
+            variable_effect(&argv).is_some_and(|effect| effect.keeps(SHELL_STATE_VARIABLES))
+        });
+    (!inert).then_some(ShellOpacity::Dynamic)
 }
 
 /// A command runs where the analysis says, somewhere a state change before it
@@ -1633,6 +1685,27 @@ mod tests {
     #[test_case("bash -c 'if true; then ls; fi'", Some(ShellOpacity::Unparsed); "shell_code_that_does_not_lower")]
     #[test_case("bash -c \"bash -c 'bash -c ls'\"", Some(ShellOpacity::Unparsed); "shell_code_three_shells_deep")]
     #[test_case("sudo ls; $EDITOR notes.md", Some(ShellOpacity::Unparsed); "unparsed_outranks_privilege")]
+    #[test_case("unset FOO BAR; cargo check", None; "clearing_variables")]
+    #[test_case("set -euo pipefail; cargo test", None; "options_that_only_stop_the_line")]
+    #[test_case("export -p", None; "printing_exported_variables")]
+    #[test_case("declare -p HOME", None; "printing_a_variable")]
+    #[test_case("unset PATH; make", Some(ShellOpacity::Dynamic); "clearing_the_command_search_path")]
+    #[test_case("unset FOO IFS; make", Some(ShellOpacity::Dynamic); "clearing_the_word_separators")]
+    #[test_case("unset BASH_ENV", Some(ShellOpacity::Dynamic); "clearing_the_startup_file")]
+    #[test_case("unset -f f", Some(ShellOpacity::Dynamic); "clearing_a_function")]
+    #[test_case("export A=1; make", Some(ShellOpacity::Dynamic); "exporting_a_variable")]
+    #[test_case("export PATH=\"$PATH:/opt/bin\"; make", Some(ShellOpacity::Dynamic); "extending_the_search_path")]
+    #[test_case("declare -i n=1", Some(ShellOpacity::Dynamic); "declaring_an_integer")]
+    #[test_case("readonly A", Some(ShellOpacity::Dynamic); "a_readonly_variable")]
+    #[test_case("local x=1", Some(ShellOpacity::Dynamic); "a_local_variable")]
+    #[test_case("set -k; make", Some(ShellOpacity::Dynamic); "an_option_that_moves_assignments")]
+    #[test_case("set -- x", Some(ShellOpacity::Dynamic); "positional_parameters")]
+    #[test_case("for f in a; do unset X; done", Some(ShellOpacity::ControlFlow); "clearing_a_variable_in_a_loop")]
+    #[test_case("unset 'a[$(id)]'", Some(ShellOpacity::Unparsed); "a_subscript_in_an_unset_name")]
+    #[test_case("declare 'a[$(id)]=1'", Some(ShellOpacity::Unparsed); "a_subscript_in_a_declared_name")]
+    #[test_case("unset \"$name\"", Some(ShellOpacity::Unparsed); "an_unset_name_built_at_run_time")]
+    #[test_case("export \"$assignment\"", Some(ShellOpacity::Unparsed); "a_declaration_built_at_run_time")]
+    #[test_case("for f in a; do unset 'a[$(id)]'; done", Some(ShellOpacity::Unparsed); "a_subscript_in_a_loop")]
     fn opacity_takes_the_most_severe_cause(source: &str, expected: Option<ShellOpacity>) {
         let program = parse_bash(source).expect(ANALYSIS_EXPECTED);
         let contexts =

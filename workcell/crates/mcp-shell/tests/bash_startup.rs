@@ -303,7 +303,20 @@ async fn the_running_bash_builtin_surface_is_not_mistaken_for_external_commands(
             .await
             .unwrap();
         let contexts = prepared.bash_command_contexts().unwrap();
-        let supported = matches!(builtin, ":" | "echo" | "true" | "false" | "pwd");
+        let supported = matches!(
+            builtin,
+            ":" | "echo"
+                | "true"
+                | "false"
+                | "pwd"
+                | "declare"
+                | "export"
+                | "local"
+                | "readonly"
+                | "set"
+                | "typeset"
+                | "unset"
+        );
         assert_eq!(contexts.complete, supported, "{builtin}");
         assert_eq!(
             contexts.commands.last().unwrap().complete,

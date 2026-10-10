@@ -773,7 +773,7 @@ mod tests {
     #[test]
     fn a_command_with_no_arguments_differs_from_one_never_enumerated() {
         assert_eq!(first_scope("pwd").arguments, Some(Vec::new()));
-        assert_eq!(first_scope("unset EDITOR").arguments, None);
+        assert_eq!(first_scope("for f in a; do cat f; done").arguments, None);
         assert_eq!(first_scope("cat `cat pointer`").arguments, None);
     }
 

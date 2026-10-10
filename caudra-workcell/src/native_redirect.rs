@@ -18,7 +18,7 @@ use workcell::shell::{
 };
 
 use crate::pattern_analysis::CommandFacts;
-use crate::read_only_shell::literal_arguments;
+use crate::read_only_shell::{inert_variables, literal_arguments};
 
 const END_OF_FLAGS: &str = "--";
 const GREP: Native = Native::new("file_grep", "pattern, path, include, -A/-B/-C, head_limit");
@@ -184,6 +184,7 @@ fn role(scope: &ShellCommandScope) -> Role {
         "head" => head_role(&arguments),
         "find" => find_role(&arguments),
         "cd" | "echo" | "true" | ":" => Role::Glue,
+        executable if inert_variables(executable, &arguments) => Role::Glue,
         _ => Role::Distinct,
     }
 }
@@ -408,6 +409,8 @@ mod tests {
     #[test_case("cd src && rg needle"; "a search reached by changing directory")]
     #[test_case("cat notes.txt | rg needle"; "a file poured into a search")]
     #[test_case("rg needle | head -20"; "a search bounded by head")]
+    #[test_case("set -euo pipefail; rg needle"; "a search after options that only stop the line")]
+    #[test_case("unset GREP_COLORS && rg needle"; "a search after clearing a variable")]
     fn a_line_a_native_tool_covers_is_refused(command: &str) {
         assert!(
             refusal(command).is_some(),
@@ -439,6 +442,10 @@ mod tests {
     #[test_case("cat notes.txt > copy.txt"; "a read that is really a copy")]
     #[test_case("cat > notes.txt <<'EOF'\nhi\nEOF\n"; "a heredoc writing a whole file")]
     #[test_case("rg \"$PATTERN\" src"; "a pattern the shell will expand")]
+    #[test_case("unset PATH; rg needle"; "a search for a program found without PATH")]
+    #[test_case("export RIPGREP_CONFIG_PATH=rg.conf; rg needle"; "a search a variable configures")]
+    #[test_case("set -o posix; rg needle"; "a search after an option that changes the shell")]
+    #[test_case("unset GREP_COLORS"; "glue that only clears a variable")]
     fn a_line_needing_a_shell_is_left_alone(command: &str) {
         assert_eq!(
             refusal(command),
