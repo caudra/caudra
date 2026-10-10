@@ -2,6 +2,14 @@
   <img src="https://caudra.ai/social-card.png" alt="Caudra. Open source, for your terminal. A coding agent that turns smart context into effective action." width="100%">
 </p>
 
+<p align="center">
+  <a href="https://github.com/caudra/caudra/actions/workflows/rust.yml?query=branch%3Amain"><img src="https://github.com/caudra/caudra/actions/workflows/rust.yml/badge.svg?branch=main&event=push" alt="CI status"></a>
+  <a href="https://github.com/caudra/caudra/releases"><img src="https://img.shields.io/github/v/release/caudra/caudra?include_prereleases&sort=semver" alt="Latest release"></a>
+  <a href="#license"><img src="https://img.shields.io/github/license/caudra/caudra" alt="License"></a>
+  <a href="https://caudra.ai/docs/"><img src="https://img.shields.io/badge/docs-caudra.ai-blue" alt="Documentation"></a>
+  <a href="https://github.com/caudra/caudra/discussions"><img src="https://img.shields.io/badge/discussions-GitHub-blue?logo=github" alt="GitHub Discussions"></a>
+</p>
+
 # Caudra
 
 **A coding agent that turns smart context into effective action.**
@@ -22,9 +30,9 @@ curl -fsSL https://caudra.ai/install.sh | sh
 >
 > Caudra is that binary, and I push more than 20 billion tokens a month through it. With another agent, my local history grew by more than 1 GB a day. Caudra keeps over a month of my complete history in less than 2 GB, and a 10k-turn session still loads in under a second.
 >
-> **Thorsten Born**, software engineer and data architect, maintainer of Caudra
+> **Thorsten Born**, software engineer and data architect, creator and maintainer of Caudra
 
-In the same daily use, about 97% of Anthropic and 94% of OpenAI prompt tokens came from cache. These figures are the maintainer's own measurements, not benchmarks. Timings were measured by hand, and results depend on models, projects, and hardware.
+In the same daily use, about 97% of Anthropic and 94% of OpenAI prompt tokens came from cache. These figures are the creator's own measurements, not benchmarks. Timings were measured by hand, and results depend on models, projects, and hardware.
 
 ## Why the name
 
@@ -98,7 +106,7 @@ Smaller local models such as Qwen3.8-27B need more help to finish a task. Caudra
 max_attempts = 4
 ```
 
-In daily use, the `abandoned_turn` rule matched 35 of 386 final Qwen3.8-27B replies and none of 2,185 from Claude and GPT models, as [measured by the maintainer](#why-caudra-exists).
+In daily use, the `abandoned_turn` rule matched 35 of 386 final Qwen3.8-27B replies and none of 2,185 from Claude and GPT models, as [measured by Caudra's creator](#why-caudra-exists).
 
 A nudge is a message to the model. It cannot run or approve a tool, and every real tool call still passes through validation and your permission rules.
 
@@ -209,7 +217,7 @@ Shell commands start from a cleared environment and receive only [a short list o
 
 Telemetry stays off unless you send it to a collector you run. The interactive UI checks GitHub for updates in the background by default, with a shared 24-hour cache. GitHub receives your IP address and normal request metadata, but no session data, machine identifier, or installed version. Set `ui.update_check = false` or `CAUDRA_ENABLE_UPDATE_CHECK=0` to disable these checks. Updates are never installed automatically. See [updating and release channels](https://caudra.ai/docs/cli/#caudra-update-caudra-rollback).
 
-Caudra also works offline with a local model. Use Ollama or llama.cpp, or point a `providers.toml` entry at [ninfer-4090](https://github.com/tensorninja/ninfer-4090), the maintainer's custom inference engine for Qwen3.8-27B on a single RTX 4090. Otherwise, a normal run contacts your provider, refreshes the public [models.dev](https://models.dev) catalog at most once a day, and reaches Exa when the agent searches the web.
+Caudra also works offline with a local model. Use Ollama or llama.cpp, or point a `providers.toml` entry at [ninfer-4090](https://github.com/tensorninja/ninfer-4090), a custom inference engine by Caudra's creator for Qwen3.8-27B on a single RTX 4090. Otherwise, a normal run contacts your provider, refreshes the public [models.dev](https://models.dev) catalog at most once a day, and reaches Exa when the agent searches the web.
 
 ## Documentation
 
@@ -231,6 +239,8 @@ For a complete setup to copy from, see the [example config](https://github.com/c
 
 Caudra is under active development, and bug reports help a lot. Issues and pull requests are welcome on [GitHub](https://github.com/caudra/caudra/issues). Please read [CONTRIBUTING.md](CONTRIBUTING.md) before you start on a larger change.
 
+Ask questions in [Discussions](https://github.com/caudra/caudra/discussions/categories/q-a), and see [SUPPORT.md](SUPPORT.md) for where each kind of request goes. Everyone who takes part in the project follows the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 Caudra is a Rust workspace, and the `Makefile` holds the everyday commands. It requires GNU Make, Bash, and Python 3. On Windows, use Git Bash with GNU Make installed separately. Python defaults to `python3`, overridable with `make PYTHON=python <target>`.
 
 ```sh
@@ -247,7 +257,7 @@ Canonical docs live in `docs/content/`, with navigation in `docs/navigation.json
 
 ## Credits
 
-Caudra is developed and maintained by [Thorsten Born](https://thorstenborn.com). It stands on the shoulders of [Maki](https://github.com/tontinton/maki) by [Tony Solomonik](https://github.com/tontinton) and has grown in its own direction since the fork. The repository keeps Maki's history and includes work by Maki contributors. Caudra is independently maintained and is not affiliated with or endorsed by the original project.
+Caudra was created by [Thorsten Born](https://thorstenborn.com), who develops and maintains it. It stands on the shoulders of [Maki](https://github.com/tontinton/maki) and has grown in its own direction since the fork. The repository keeps Maki's history and includes work by Maki contributors. Caudra is independently maintained and is not affiliated with or endorsed by the original project.
 
 Caudra builds on ideas from these open-source projects, with thanks:
 

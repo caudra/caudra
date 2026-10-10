@@ -1,0 +1,29 @@
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The manual at [caudra.ai/docs](https://caudra.ai/docs/), also available as `/docs` inside Caudra, may already answer your question. To report a bug, please [open an issue](https://github.com/caudra/caudra/issues/new/choose) instead.
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What are you trying to do or understand?
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What you tried
+      description: Commands, config snippets, or docs pages you already looked at.
+  - type: input
+    id: version
+    attributes:
+      label: Caudra version
+      description: The output of `caudra --version`.
+      placeholder: caudra 0.2.0-preview.4
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, terminal, and the provider and model you use, where they matter.
+      placeholder: Ubuntu 24.04, Ghostty, anthropic/claude-sonnet-4-6

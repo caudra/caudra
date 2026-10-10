@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Ask a question
+    url: https://github.com/caudra/caudra/discussions/categories/q-a
+    about: Get help with setup, configuration, or usage in Discussions.
+  - name: Share an idea
+    url: https://github.com/caudra/caudra/discussions/categories/ideas
+    about: Talk through an early idea before it becomes a feature request.
+  - name: Read the docs
+    url: https://caudra.ai/docs/
+    about: The manual, also available offline with /docs inside Caudra.
+  - name: Report a security vulnerability
+    url: https://github.com/caudra/caudra/security/advisories/new
+    about: Report security problems privately. Please do not open a public issue for them.

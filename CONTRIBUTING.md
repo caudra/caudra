@@ -4,11 +4,13 @@ Thank you for helping with Caudra. Bug reports, fixes, documentation, and new fe
 
 Caudra is an independent fork, developed at [github.com/caudra/caudra](https://github.com/caudra/caudra). Issues and pull requests go there.
 
+Everyone who takes part in the project follows the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Before you start
 
-Search open and closed issues before you open a new one. Someone may already be working on it.
+Search open and closed issues before you open a new one. Someone may already be working on it. Questions about setup or usage fit [Discussions Q&A](https://github.com/caudra/caudra/discussions/categories/q-a) better than an issue.
 
-A good bug report names the version you run (`caudra --version`), your operating system and terminal, what you did, and what you expected instead. Logs help a lot, and `caudra logs` prints the latest records. Logs leave out prompt text, model output, and tool input. Provider error messages are kept in full, so read the log before you paste it into an issue.
+A good bug report names the version you run (`caudra --version`), your operating system and terminal, what you did, and what you expected instead. The issue forms ask for each of these. Logs help a lot, and `caudra logs` prints the latest records. Logs leave out prompt text, model output, and tool input. Provider error messages are kept in full, so read the log before you paste it into an issue.
 
 Do not report a security vulnerability in a public issue. [SECURITY.md](SECURITY.md) explains how to report one privately.
 
@@ -185,7 +187,7 @@ docs(messaging): give cross-session messaging its own page
 feat(ui)!: rename the default themes to caudra-dark and caudra-light
 ```
 
-In the pull request, describe what changed and why, and link the issue. Say how you tested it. For a change to the terminal UI, a screenshot or a short recording helps a lot. If an AI agent wrote part of the change, say so and describe how you used it, with prompts where they help a reviewer follow the change.
+In the pull request, describe what changed and why, and link the issue. Say how you tested it. For a change to the terminal UI, a screenshot or a short recording helps a lot. If an AI agent wrote part of the change, say so and describe how you used it, with prompts where they help a reviewer follow the change. The pull request template has a section for each of these.
 
 CI runs on every pull request. It checks Rust and Lua formatting, runs clippy and the tests, checks the generated docs and unused dependencies, and builds on Linux, macOS, and Windows. Changes to the Python scripts or the Nix files start their own workflows.
 

@@ -2,9 +2,12 @@
 
 ## Report a vulnerability
 
-Report a security problem in Caudra through GitHub's private vulnerability reporting. Open the [Security tab](https://github.com/caudra/caudra/security) of the repository and choose **Report a vulnerability**. Only you and the maintainers can see the report and the discussion that follows it.
+Report a security problem in Caudra privately, in one of two ways:
 
-Please keep the details out of public issues and pull requests until a fix is released. Caudra has no security email address yet, so this form is the only private channel.
+- Through GitHub's private vulnerability reporting, which is preferred because it keeps the report, the discussion, and the fix in one place. Open the [Security tab](https://github.com/caudra/caudra/security) of the repository and choose **Report a vulnerability**. Only you and the maintainers can see the report and the discussion that follows it.
+- By email to [security@caudra.ai](mailto:security@caudra.ai).
+
+Please keep the details out of public issues and pull requests until a fix is released.
 
 ## What to include
 

@@ -1,0 +1,42 @@
+name: Feature request
+description: Suggest a concrete change or a new capability for Caudra.
+type: Feature
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for the suggestion. If you plan to build a larger change yourself, agree on the approach here before you write code, as [CONTRIBUTING.md](https://github.com/caudra/caudra/blob/main/CONTRIBUTING.md) explains.
+        Open-ended ideas fit [Discussions Ideas](https://github.com/caudra/caudra/discussions/categories/ideas) better.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you request
+      options:
+        - label: I searched existing issues and discussions and found none for this request.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How Caudra could solve it. Commands, keys, config, or screenshots of other tools help.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and workarounds
+      description: Other approaches you considered, and what you do today instead.
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I would like to implement this.

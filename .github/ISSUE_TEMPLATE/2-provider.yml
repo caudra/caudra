@@ -1,0 +1,79 @@
+name: Provider or model problem
+description: Sign-in failures, API errors, missing models, or a model that cannot use Caudra's tools.
+type: Bug
+labels: [bug, provider]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a provider problem. Please search [open and closed issues](https://github.com/caudra/caudra/issues?q=is%3Aissue) first. Never paste API keys, tokens, or sign-in codes into this form.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you report
+      options:
+        - label: I searched existing issues and found none for this problem.
+          required: true
+        - label: The problem happens with the latest release. `caudra update` installs it.
+          required: true
+  - type: input
+    id: model
+    attributes:
+      label: Provider and model
+      description: The model as `provider/model_id`. For a custom endpoint, name the API it speaks.
+      placeholder: anthropic/claude-sonnet-4-6
+    validations:
+      required: true
+  - type: dropdown
+    id: sign-in
+    attributes:
+      label: Sign-in method
+      options:
+        - OAuth or device code sign-in
+        - API key
+        - Imported token
+        - No sign-in, such as a local server or custom endpoint
+    validations:
+      required: true
+  - type: input
+    id: auth-status
+    attributes:
+      label: Auth status
+      description: The line for this provider from `caudra auth status`. It shows the provider and the sign-in method, and no secrets.
+      placeholder: "✓ xai  xAI (oauth)"
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Include the exact error message, such as the HTTP status and the text the provider returned.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. `caudra auth login xai`
+        2. `echo "Say OK." | caudra -p -m xai/grok-4.6`
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Caudra version
+      description: The output of `caudra --version`.
+      placeholder: caudra 0.2.0-preview.4
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and architecture
+      placeholder: macOS 26.1, arm64
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        The output of `caudra logs -n 100 -l warn`. Provider error messages are kept in full, so read the log and remove anything secret before you paste it.
+      render: text

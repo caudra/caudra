@@ -1,0 +1,29 @@
+name: Documentation
+description: A docs page is wrong, unclear, or missing something.
+labels: [documentation]
+body:
+  - type: input
+    id: page
+    attributes:
+      label: Page or section
+      description: The URL of the page or section, or its name in `/docs`.
+      placeholder: https://caudra.ai/docs/permissions/#plan-mode
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is wrong or missing
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested text
+      description: How the page could read instead, if you have an idea.
+  - type: input
+    id: version
+    attributes:
+      label: Caudra version
+      description: If you read the page in `/docs`, the output of `caudra --version`.
+      placeholder: caudra 0.2.0-preview.4
