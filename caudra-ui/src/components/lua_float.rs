@@ -310,6 +310,28 @@ impl FloatManager {
         true
     }
 
+    pub(crate) fn handle_keyboard_text(&self, text: &str) -> bool {
+        let Some(win) = self
+            .windows
+            .iter()
+            .find(|win| Some(win.id) == self.focused_id)
+        else {
+            return false;
+        };
+        let mut chars = text.chars();
+        let event = match (chars.next(), chars.next()) {
+            (None, _) => return true,
+            (Some(_), None) => WinEvent::Key {
+                key: text.to_owned(),
+            },
+            (Some(_), Some(_)) => WinEvent::Text {
+                text: text.to_owned(),
+            },
+        };
+        let _ = win.event_tx.try_send(event);
+        true
+    }
+
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         let mut union = Rect::default();
 
@@ -1397,6 +1419,44 @@ mod tests {
     fn handle_paste_returns_false_when_empty() {
         let mgr = FloatManager::new();
         assert!(!mgr.handle_paste("x"), "{EXPECT_PASTE_FALSE}");
+    }
+
+    #[test_case("q"; "quit_key")]
+    #[test_case("j"; "navigation_key")]
+    #[test_case("Q"; "uppercase_quit_key")]
+    #[test_case("J"; "uppercase_navigation_key")]
+    #[test_case("!"; "punctuation")]
+    #[test_case("é"; "precomposed_character")]
+    #[test_case("界"; "non_ascii_character")]
+    #[test_case("\u{10400}"; "supplementary_scalar")]
+    fn single_scalar_keyboard_text_is_one_literal_key(text: &str) {
+        let mut mgr = FloatManager::new();
+        let (event_rx, _cmd_tx) = open_with_lines(&mut mgr, &[]);
+        assert!(mgr.handle_keyboard_text(text));
+        let events: Vec<_> = event_rx.drain().collect();
+        assert!(matches!(events.as_slice(), [WinEvent::Key { key }] if key == text));
+    }
+
+    #[test_case("enter"; "named_key_stays_text")]
+    #[test_case("qj"; "plugin_shortcuts_stay_text")]
+    #[test_case("e\u{301}"; "combining_sequence_stays_atomic")]
+    #[test_case("漢字"; "multi_character_commit_stays_atomic")]
+    fn multi_scalar_keyboard_text_is_one_atomic_text_event(text: &str) {
+        let mut mgr = FloatManager::new();
+        let (event_rx, _cmd_tx) = open_with_lines(&mut mgr, &[]);
+        assert!(mgr.handle_keyboard_text(text));
+        let events: Vec<_> = event_rx.drain().collect();
+        assert!(
+            matches!(events.as_slice(), [WinEvent::Text { text: received }] if received == text)
+        );
+    }
+
+    #[test]
+    fn empty_keyboard_text_sends_no_event() {
+        let mut mgr = FloatManager::new();
+        let (event_rx, _cmd_tx) = open_with_lines(&mut mgr, &[]);
+        assert!(mgr.handle_keyboard_text(""));
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[test]

@@ -512,7 +512,7 @@ fn terminal_focus_event(_event: &Event) -> Option<bool> {
 #[cfg(not(windows))]
 fn terminal_input_proves_focus(event: &Event) -> bool {
     match event {
-        Event::Key(key) => key.kind == KeyEventKind::Press,
+        Event::Key(key) | Event::KeyWithText { key, .. } => key.kind == KeyEventKind::Press,
         Event::Paste(_) | Event::Mouse(_) => true,
         _ => false,
     }
@@ -710,7 +710,7 @@ fn aggregate_program_status(statuses: impl IntoIterator<Item = ProgramStatus>) -
 
 fn acknowledges_program_status(event: &Event) -> bool {
     match event {
-        Event::Key(key) => key.kind != KeyEventKind::Release,
+        Event::Key(key) | Event::KeyWithText { key, .. } => key.kind != KeyEventKind::Release,
         Event::Paste(_) => true,
         Event::Mouse(mouse) => matches!(
             mouse.kind,
@@ -3645,6 +3645,7 @@ impl<'t> EventLoop<'t> {
                 (None, None)
             }
             Event::Key(key) => (Some(Msg::Key(key)), None),
+            Event::KeyWithText { key, text } => (Some(Msg::KeyWithText { key, text }), None),
             Event::Paste(text) => (Some(Msg::Paste(text)), None),
             Event::Mouse(mouse) => self.translate_mouse(mouse),
             // Reattaching a multiplexer to another terminal resizes the
@@ -5087,7 +5088,7 @@ mod tests {
     use caudra_providers::{ImageMediaType, ImageSource, TokenUsage};
     use caudra_storage::sessions::PendingConversationRevert;
     use caudra_workspace::WorkspacePath;
-    use crossterm::event::{ColorScheme, KeyCode};
+    use crossterm::event::{ColorScheme, KeyCode, KeyEvent};
     use serde_json::Value;
     use std::process;
     use tempfile::TempDir;
@@ -6008,6 +6009,8 @@ mod tests {
     #[test_case(Event::FocusGained, false; "focus_is_not_acknowledgment")]
     #[test_case(Event::Resize(80, 24), false; "resize_is_not_acknowledgment")]
     #[test_case(Event::Key(key(KeyCode::Enter)), true; "key_acknowledges")]
+    #[test_case(Event::KeyWithText { key: key(KeyCode::Enter), text: None }, true; "associated_key_acknowledges")]
+    #[test_case(Event::KeyWithText { key: KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release), text: None }, false; "associated_release_does_not_acknowledge")]
     #[test_case(Event::Paste(PLANNED_PROMPT.into()), true; "paste_acknowledges")]
     fn program_outcome_requires_user_interaction(event: Event, expected: bool) {
         assert_eq!(acknowledges_program_status(&event), expected);

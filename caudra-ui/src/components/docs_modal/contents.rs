@@ -96,8 +96,8 @@ impl Contents {
         self.selected = 0;
     }
 
-    pub(super) fn paste(&mut self, text: &str) {
-        self.filter.paste(text);
+    pub(super) fn handle_text(&mut self, text: &str, paste: bool) {
+        self.filter.handle_text(text, paste);
         self.selected = 0;
     }
 

@@ -305,10 +305,17 @@ impl QuestionForm {
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
+        self.handle_text(text, true)
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) -> bool {
         if self.mode != Mode::EditingCustom {
             return false;
         }
-        self.custom.paste(text);
+        if !paste {
+            self.follow_cursor = true;
+        }
+        self.custom.handle_text(text, paste);
         true
     }
 

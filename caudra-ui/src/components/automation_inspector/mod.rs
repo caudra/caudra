@@ -868,17 +868,21 @@ impl AutomationInspector {
     /// A paste lands in the editor, or in the filter when it has the focus.
     /// `None` when the inspector did not take it.
     pub fn handle_paste(&mut self, text: &str) -> Option<AutomationAction> {
+        self.handle_text(text, true)
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) -> Option<AutomationAction> {
         if !self.open {
             return None;
         }
         if let Some(editor) = &mut self.editor {
-            editor.handle_paste(text);
+            editor.handle_text(text, paste);
             return Some(AutomationAction::None);
         }
         if !self.filter_focused {
             return None;
         }
-        self.filter.paste(text);
+        self.filter.handle_text(text, paste);
         Some(self.settle_selection())
     }
 

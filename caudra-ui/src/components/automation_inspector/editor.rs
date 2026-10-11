@@ -225,8 +225,8 @@ impl Editor {
         self.field.handle_key(key)
     }
 
-    pub(super) fn handle_paste(&mut self, text: &str) {
-        self.field.handle_paste(text);
+    pub(super) fn handle_text(&mut self, text: &str, paste: bool) {
+        self.field.handle_text(text, paste);
     }
 
     pub(super) fn handle_mouse(&mut self, event: &MouseEvent) -> EditorMouse {

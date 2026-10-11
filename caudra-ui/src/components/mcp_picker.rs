@@ -186,7 +186,21 @@ impl McpPicker {
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
-        self.picker.handle_paste(text)
+        self.handle_text(text, true)
+    }
+
+    pub(crate) fn text_key(&self, key: Option<KeyEvent>) -> bool {
+        self.pending_confirmation.is_none()
+            && !(key.is_some_and(|key| {
+                key.modifiers.is_empty() && matches!(key.code, KeyCode::Char('o' | 'p' | 'r'))
+            }) && self
+                .picker
+                .selected_item()
+                .is_some_and(|entry| entry.status == McpServerStatus::AwaitingTrust))
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) -> bool {
+        self.picker.handle_text(text, paste)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> McpPickerAction {
@@ -597,6 +611,22 @@ mod tests {
             picker.handle_key(key(KeyCode::Enter)),
             McpPickerAction::Consumed
         ));
+    }
+
+    #[test]
+    fn text_without_a_command_filters_but_does_not_edit_a_trust_confirmation() {
+        let mut picker = McpPicker::new(
+            awaiting_trust_snapshot(),
+            McpConfigErrors::new(PathBuf::new()),
+        );
+        picker.open();
+        assert!(picker.text_key(None));
+        assert!(!picker.text_key(Some(key(KeyCode::Char('o')))));
+        picker.handle_text("project", false);
+        assert_eq!(picker.picker.search_text(), "project");
+        picker.handle_key(key(KeyCode::Char('p')));
+        assert!(!picker.text_key(None));
+        assert!(picker.pending_confirmation.is_some());
     }
 
     #[test_case('p', "project" ; "trust_project")]

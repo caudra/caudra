@@ -442,13 +442,17 @@ impl MemoryInspector {
     /// A paste lands in the search field when it has the focus, and nowhere
     /// else while the inspector is open. `None` when it is closed.
     pub(crate) fn handle_paste(&mut self, text: &str) -> Option<MemoryAction> {
+        self.handle_text(text, true)
+    }
+
+    pub(crate) fn handle_text(&mut self, text: &str, paste: bool) -> Option<MemoryAction> {
         if !self.open {
             return None;
         }
         if !self.search_focused {
             return Some(MemoryAction::Consumed);
         }
-        match self.search.paste(text) {
+        match self.search.handle_text(text, paste) {
             TextKey::Changed => Some(self.search_changed()),
             _ => Some(MemoryAction::Consumed),
         }

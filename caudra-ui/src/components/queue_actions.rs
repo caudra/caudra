@@ -116,7 +116,11 @@ impl QueueActions {
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
-        self.picker.handle_paste(text)
+        self.handle_text(text, true)
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) -> bool {
+        self.picker.handle_text(text, paste)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> QueueActionsAction {

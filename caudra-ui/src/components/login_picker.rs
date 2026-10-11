@@ -324,16 +324,20 @@ impl LoginPicker {
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
+        self.handle_text(text, true)
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) -> bool {
         match &mut self.step {
-            Step::PickProvider(picker) => picker.handle_paste(text),
-            Step::PickAuthMethod { picker, .. } => picker.handle_paste(text),
-            Step::PickPlan { picker, .. } => picker.handle_paste(text),
-            Step::CustomProtocol { picker, .. } => picker.handle_paste(text),
+            Step::PickProvider(picker) => picker.handle_text(text, paste),
+            Step::PickAuthMethod { picker, .. } => picker.handle_text(text, paste),
+            Step::PickPlan { picker, .. } => picker.handle_text(text, paste),
+            Step::CustomProtocol { picker, .. } => picker.handle_text(text, paste),
             Step::EnterKey { input, .. }
             | Step::CustomName { input }
             | Step::CustomUrl { input, .. }
             | Step::BuiltinUrl { input, .. } => {
-                input.paste(text);
+                input.handle_text(text, paste);
                 true
             }
             Step::Closed | Step::Done { .. } => false,

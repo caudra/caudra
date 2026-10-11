@@ -785,9 +785,14 @@ impl ScopeEditor {
         None
     }
 
+    #[cfg(test)]
     pub(crate) fn handle_paste(&mut self, text: &str) {
+        self.handle_text(text, true)
+    }
+
+    pub(crate) fn handle_text(&mut self, text: &str, paste: bool) {
         if !self.suspended && self.editing.is_some() {
-            self.field.paste(text);
+            self.field.handle_text(text, paste);
         }
     }
 

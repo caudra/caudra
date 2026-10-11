@@ -657,17 +657,21 @@ impl WorkflowInspector {
     /// A paste lands in the filter when it has the focus. `None` when the
     /// inspector did not take it.
     pub fn handle_paste(&mut self, text: &str) -> Option<InspectorAction> {
+        self.handle_text(text, true)
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) -> Option<InspectorAction> {
         if !self.open {
             return None;
         }
         if let Some(prompt) = &mut self.budget {
-            prompt.input.paste(text);
+            prompt.input.handle_text(text, paste);
             return Some(InspectorAction::Consumed);
         }
         if !self.filter_focused {
             return None;
         }
-        self.filter.paste(text);
+        self.filter.handle_text(text, paste);
         Some(self.settle_selection())
     }
 

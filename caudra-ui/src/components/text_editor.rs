@@ -122,6 +122,10 @@ impl TextEditor {
         self.within(limit, |editor| editor.paste(text)) != TextKey::Refused
     }
 
+    pub fn handle_text_bounded(&mut self, text: &str, limit: usize, paste: bool) -> bool {
+        self.within(limit, |editor| editor.insert_text(text, paste)) != TextKey::Refused
+    }
+
     /// [`Self::handle_key`], with `Err` for an edit that would have grown the
     /// text past `limit` bytes and was taken back.
     pub fn handle_key_bounded(&mut self, key: KeyEvent, limit: usize) -> Result<EditorKey, ()> {
@@ -172,12 +176,21 @@ impl TextEditor {
         }
     }
 
+    #[cfg(test)]
     pub fn handle_paste(&mut self, text: &str) {
         self.paste(text);
     }
 
+    pub fn handle_text(&mut self, text: &str, paste: bool) {
+        self.insert_text(text, paste);
+    }
+
     fn paste(&mut self, text: &str) -> TextKey {
-        let pasted = self.field.paste(text);
+        self.insert_text(text, true)
+    }
+
+    fn insert_text(&mut self, text: &str, paste: bool) -> TextKey {
+        let pasted = self.field.handle_text(text, paste);
         self.follow_cursor |= pasted.changed();
         pasted
     }

@@ -299,10 +299,14 @@ impl InputBox {
         InputAction::PaletteSync(self.buffer.palette_text())
     }
 
-    fn handle_plain_paste(&mut self, text: &str) -> InputAction {
+    pub(crate) fn handle_keyboard_text(&mut self, text: &str) -> InputAction {
         self.follow_cursor = true;
         self.buffer.insert_text(text);
         InputAction::PaletteSync(self.buffer.palette_text())
+    }
+
+    fn handle_plain_paste(&mut self, text: &str) -> InputAction {
+        self.handle_keyboard_text(text)
     }
 
     /// Inserting a file path mid-word looks broken ("read/tmp/x" instead of

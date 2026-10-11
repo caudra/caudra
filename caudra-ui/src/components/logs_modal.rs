@@ -334,7 +334,11 @@ impl LogsModal {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
-        if self.query_focused && self.query.paste(text).changed() {
+        self.handle_text(text, true)
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) {
+        if self.query_focused && self.query.handle_text(text, paste).changed() {
             self.apply_query();
         }
     }

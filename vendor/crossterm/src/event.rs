@@ -280,8 +280,6 @@ bitflags! {
     /// Represents special flags that tell compatible terminals to add extra information to keyboard events.
     ///
     /// See <https://sw.kovidgoyal.net/kitty/keyboard-protocol/#progressive-enhancement> for more information.
-    ///
-    /// Alternate keys and Unicode codepoints are not yet supported by crossterm.
     #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(transparent))]
     #[derive(Debug, PartialOrd, PartialEq, Eq, Clone, Copy, Hash)]
     pub struct KeyboardEnhancementFlags: u8 {
@@ -292,16 +290,12 @@ bitflags! {
         /// [`KeyEventKind::Release`] when keys are autorepeated or released.
         const REPORT_EVENT_TYPES = 0b0000_0010;
         /// Send [alternate keycodes](https://sw.kovidgoyal.net/kitty/keyboard-protocol/#key-codes)
-        /// in addition to the base keycode. The alternate keycode overrides the base keycode in
-        /// resulting `KeyEvent`s.
+        /// in addition to the base keycode.
         const REPORT_ALTERNATE_KEYS = 0b0000_0100;
         /// Represent all keyboard events as CSI-u sequences. This is required to get repeat/release
         /// events for plain-text keys.
         const REPORT_ALL_KEYS_AS_ESCAPE_CODES = 0b0000_1000;
-        // Send the Unicode codepoint as well as the keycode.
-        //
-        // *Note*: this is not yet supported by crossterm.
-        // const REPORT_ASSOCIATED_TEXT = 0b0001_0000;
+        const REPORT_ASSOCIATED_TEXT = 0b0001_0000;
     }
 }
 
@@ -589,7 +583,6 @@ pub enum ColorScheme {
 /// Represents an event.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "derive-more", derive(IsVariant))]
-#[cfg_attr(not(feature = "bracketed-paste"), derive(Copy))]
 #[derive(Debug, PartialOrd, Ord, PartialEq, Eq, Clone, Hash)]
 pub enum Event {
     ColorSchemeChanged(ColorScheme),
@@ -598,7 +591,12 @@ pub enum Event {
     /// The terminal lost focus
     FocusLost,
     /// A single key event with additional pressed modifiers.
+    #[cfg_attr(feature = "derive-more", is_variant(ignore))]
     Key(KeyEvent),
+    KeyWithText {
+        key: KeyEvent,
+        text: Option<String>,
+    },
     /// A single mouse event with additional pressed modifiers.
     Mouse(MouseEvent),
     /// A string that was pasted into the terminal. Only emitted if bracketed paste has been
@@ -611,6 +609,12 @@ pub enum Event {
 }
 
 impl Event {
+    #[cfg(feature = "derive-more")]
+    #[inline]
+    pub fn is_key(&self) -> bool {
+        self.as_key_event().is_some()
+    }
+
     /// Returns `true` if the event is a key press event.
     ///
     /// This is useful for waiting for any key press event, regardless of the key that was pressed.
@@ -631,37 +635,19 @@ impl Event {
     /// ```
     #[inline]
     pub fn is_key_press(&self) -> bool {
-        matches!(
-            self,
-            Event::Key(KeyEvent {
-                kind: KeyEventKind::Press,
-                ..
-            })
-        )
+        self.as_key_event().is_some_and(|key| key.is_press())
     }
 
     /// Returns `true` if the event is a key release event.
     #[inline]
     pub fn is_key_release(&self) -> bool {
-        matches!(
-            self,
-            Event::Key(KeyEvent {
-                kind: KeyEventKind::Release,
-                ..
-            })
-        )
+        self.as_key_event().is_some_and(|key| key.is_release())
     }
 
     /// Returns `true` if the event is a key repeat event.
     #[inline]
     pub fn is_key_repeat(&self) -> bool {
-        matches!(
-            self,
-            Event::Key(KeyEvent {
-                kind: KeyEventKind::Repeat,
-                ..
-            })
-        )
+        self.as_key_event().is_some_and(|key| key.is_repeat())
     }
 
     /// Returns the key event if the event is a key event, otherwise `None`.
@@ -683,7 +669,7 @@ impl Event {
     #[inline]
     pub fn as_key_event(&self) -> Option<KeyEvent> {
         match self {
-            Event::Key(event) => Some(*event),
+            Event::Key(event) | Event::KeyWithText { key: event, .. } => Some(*event),
             _ => None,
         }
     }
@@ -709,28 +695,19 @@ impl Event {
     /// }
     #[inline]
     pub fn as_key_press_event(&self) -> Option<KeyEvent> {
-        match self {
-            Event::Key(event) if self.is_key_press() => Some(*event),
-            _ => None,
-        }
+        self.as_key_event().filter(KeyEvent::is_press)
     }
 
     /// Returns an Option containing the `KeyEvent` if the event is a key release event.
     #[inline]
     pub fn as_key_release_event(&self) -> Option<KeyEvent> {
-        match self {
-            Event::Key(event) if self.is_key_release() => Some(*event),
-            _ => None,
-        }
+        self.as_key_event().filter(KeyEvent::is_release)
     }
 
     /// Returns an Option containing the `KeyEvent` if the event is a key repeat event.
     #[inline]
     pub fn as_key_repeat_event(&self) -> Option<KeyEvent> {
-        match self {
-            Event::Key(event) if self.is_key_repeat() => Some(*event),
-            _ => None,
-        }
+        self.as_key_event().filter(KeyEvent::is_repeat)
     }
 
     /// Returns the mouse event if the event is a mouse event, otherwise `None`.
@@ -1532,11 +1509,58 @@ mod color_scheme_tests {
 mod tests {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+    use test_case::test_case;
 
     use super::*;
     use KeyCode::*;
     use MediaKeyCode::*;
     use ModifierKeyCode::*;
+
+    #[test_case(KeyEventKind::Press, None; "press_without_text")]
+    #[test_case(KeyEventKind::Repeat, None; "repeat_without_text")]
+    #[test_case(KeyEventKind::Release, None; "release_without_text")]
+    #[test_case(KeyEventKind::Press, Some("e\u{301}"); "press_with_text")]
+    #[test_case(KeyEventKind::Repeat, Some("e\u{301}"); "repeat_with_text")]
+    #[test_case(KeyEventKind::Release, Some("e\u{301}"); "release_with_text")]
+    fn associated_text_key_helpers(kind: KeyEventKind, text: Option<&str>) {
+        let key = KeyEvent::new_with_kind(KeyCode::Char('e'), KeyModifiers::NONE, kind);
+        let event = Event::KeyWithText {
+            key,
+            text: text.map(str::to_owned),
+        };
+        #[cfg(feature = "derive-more")]
+        {
+            assert!(event.is_key());
+            assert!(event.is_key_with_text());
+        }
+        assert_eq!(event.as_key_event(), Some(key));
+        assert_eq!(event.is_key_press(), kind == KeyEventKind::Press);
+        assert_eq!(event.is_key_repeat(), kind == KeyEventKind::Repeat);
+        assert_eq!(event.is_key_release(), kind == KeyEventKind::Release);
+        assert_eq!(event.as_key_press_event(), key.is_press().then_some(key));
+        assert_eq!(event.as_key_repeat_event(), key.is_repeat().then_some(key));
+        assert_eq!(
+            event.as_key_release_event(),
+            key.is_release().then_some(key)
+        );
+        assert_eq!(event.as_mouse_event(), None);
+        assert_eq!(event.as_resize_event(), None);
+        #[cfg(feature = "bracketed-paste")]
+        assert_eq!(event.as_paste_event(), None);
+    }
+
+    #[test]
+    fn associated_text_keyboard_flags_command() {
+        let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            | KeyboardEnhancementFlags::REPORT_ASSOCIATED_TEXT;
+        let mut output = String::new();
+        PushKeyboardEnhancementFlags(flags)
+            .write_ansi(&mut output)
+            .unwrap();
+        assert_eq!(output, "\x1b[>27u");
+    }
 
     #[test]
     fn test_equality() {

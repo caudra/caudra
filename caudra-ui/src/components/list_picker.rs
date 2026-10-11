@@ -777,11 +777,16 @@ impl<T: PickerItem> ListPicker<T> {
         })
     }
 
+    #[cfg(test)]
     pub fn handle_paste(&mut self, text: &str) -> bool {
+        self.handle_text(text, true)
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) -> bool {
         let Some(s) = self.state.as_mut() else {
             return false;
         };
-        if s.search.paste(text).changed() {
+        if s.search.handle_text(text, paste).changed() {
             s.update_search_and_clamp();
         }
         true

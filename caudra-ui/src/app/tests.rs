@@ -116,7 +116,8 @@ use caudra_workspace::{
     WorkspaceCursor, WorkspaceError, WorkspaceHandle, WorkspaceServices, WorkspaceSession,
 };
 use crossterm::event::{
-    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, ModifierKeyCode, MouseButton,
+    MouseEventKind,
 };
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -131,6 +132,7 @@ use std::slice::from_ref;
 use std::time::Duration;
 use tempfile::{Builder, TempDir};
 use test_case::test_case;
+use unicode_width::UnicodeWidthStr;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const PROGRAM_STATUS_DECISION: &str = "User decisions must remain distinct from automatic work";
@@ -208,6 +210,10 @@ const PROJECT_PERMISSION_TEST_SCOPE: &str = "cargo check -p caudra-ui";
 const REPORTED_PERMISSION_FIRST: &str = "physical-first";
 const REPORTED_PERMISSION_SECOND: &str = "physical-second";
 const REPORTED_PERMISSION_COMMAND: &str = "cargo check";
+const KEYBOARD_COMMIT: &str = "é東京";
+const KEYBOARD_IMAGE_PATH: &str = "/tmp/keyboard-image.png";
+const KEYBOARD_MULTILINE: &str = "one\ntwo\nthree\nfour";
+const KEYBOARD_MCP_SERVER: &str = "project-srv";
 const PERMISSION_TITLE: &str = "Allow shell command?";
 const PERMISSION_ALLOW_HINT: &str = "1. Yes";
 const PERMISSION_GUIDANCE_KEY: char = 'n';
@@ -20193,6 +20199,466 @@ fn dispatch_reported_key(app: &mut App, mut key: KeyEvent, kind: KeyEventKind) -
     app.update(Msg::Key(key))
 }
 
+fn associated_key(key: KeyEvent, text: Option<&str>) -> Msg {
+    Msg::KeyWithText {
+        key,
+        text: text.map(str::to_owned),
+    }
+}
+
+fn rendered_visible_text(app: &mut App) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(TEST_AREA.width, TEST_AREA.height)).unwrap();
+    terminal.draw(|frame| app.view(frame)).unwrap();
+    let mut text = String::new();
+    for row in terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(usize::from(TEST_AREA.width))
+    {
+        let mut column = 0;
+        while column < row.len() {
+            let symbol = row[column].symbol();
+            text.push_str(symbol);
+            column += symbol.width().max(1);
+        }
+        text.push('\n');
+    }
+    text
+}
+
+#[test_case(KeyCode::Char('a'), KeyModifiers::SHIFT, KeyEventState::NONE, Some("A"); "shift_uppercase")]
+#[test_case(KeyCode::Char('1'), KeyModifiers::SHIFT, KeyEventState::NONE, Some("!"); "shift_punctuation")]
+#[test_case(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventState::CAPS_LOCK, Some("A"); "caps_lock")]
+#[test_case(KeyCode::Char('q'), KeyModifiers::CONTROL.union(KeyModifiers::ALT), KeyEventState::NONE, Some("@"); "altgr")]
+#[test_case(KeyCode::Null, KeyModifiers::NONE, KeyEventState::NONE, Some(KEYBOARD_COMMIT); "ime_commit")]
+#[test_case(KeyCode::Null, KeyModifiers::CONTROL, KeyEventState::NONE, Some(KEYBOARD_COMMIT); "ime_has_no_shortcut_identity")]
+#[test_case(KeyCode::Char('\''), KeyModifiers::NONE, KeyEventState::NONE, None; "dead_key")]
+fn associated_text_is_inserted_once_per_press_or_repeat(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    state: KeyEventState,
+    text: Option<&str>,
+) {
+    let mut app = test_app();
+    let mut event = KeyEvent::new(code, modifiers);
+    event.state = state;
+    app.update(associated_key(event, text));
+    assert_eq!(app.input_box.expanded_text(), text.unwrap_or_default());
+    event.kind = KeyEventKind::Repeat;
+    app.update(associated_key(event, text));
+    assert_eq!(
+        app.input_box.expanded_text(),
+        text.unwrap_or_default().repeat(2)
+    );
+    event.kind = KeyEventKind::Release;
+    app.update(associated_key(event, text));
+    assert_eq!(
+        app.input_box.expanded_text(),
+        text.unwrap_or_default().repeat(2)
+    );
+    assert!(app.image_paste_rx.is_empty());
+    assert_eq!(app.exit_request, ExitRequest::None);
+}
+
+#[test_case(KEYBOARD_MULTILINE; "no_paste_chip")]
+#[test_case(KEYBOARD_IMAGE_PATH; "no_image_heuristics")]
+fn associated_text_is_not_a_paste(text: &str) {
+    let mut app = test_app();
+    app.update(associated_key(key(KeyCode::Null), Some(text)));
+    assert_eq!(app.input_box.buffer.value(), text);
+    assert_eq!(app.input_box.expanded_text(), text);
+    assert!(app.image_paste_rx.is_empty());
+}
+
+#[test]
+fn associated_control_shortcut_selects_before_generated_text_replaces_selection() {
+    let mut app = test_app();
+    app.input_box.buffer.insert_text(REPEAT_WORDS);
+    app.update(associated_key(kb::SELECT_ALL.to_key_event(), Some("a")));
+    assert_eq!(app.input_box.selected_text().as_deref(), Some(REPEAT_WORDS));
+    app.update(associated_key(key(KeyCode::Null), Some(KEYBOARD_COMMIT)));
+    assert_eq!(app.input_box.expanded_text(), KEYBOARD_COMMIT);
+}
+
+#[test_case(KeyEventKind::Press; "press")]
+#[test_case(KeyEventKind::Repeat; "repeat")]
+#[test_case(KeyEventKind::Release; "release")]
+fn associated_modifier_events_do_not_consume_a_leader_suffix(kind: KeyEventKind) {
+    let mut app = test_app();
+    app.update(associated_key(kb::LEADER.to_key_event(), None));
+    let modifier = KeyEvent::new_with_kind(
+        KeyCode::Modifier(ModifierKeyCode::LeftShift),
+        KeyModifiers::SHIFT,
+        kind,
+    );
+    app.update(associated_key(modifier, None));
+    assert!(app.which_key.is_armed());
+    app.update(associated_key(
+        chord::MODEL_PICKER.to_key_event(),
+        Some("m"),
+    ));
+    assert!(app.model_picker.is_open());
+    assert!(app.input_box.is_empty());
+}
+
+#[test]
+fn associated_shifted_slash_opens_leader_help() {
+    let mut app = test_app();
+    app.update(associated_key(kb::LEADER.to_key_event(), None));
+    app.update(associated_key(
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::SHIFT),
+        Some("?"),
+    ));
+    assert!(app.help_modal.is_open());
+    assert!(!app.which_key.is_armed());
+    assert!(app.input_box.is_empty());
+}
+
+#[test_case(None; "missing_text")]
+#[test_case(Some(""); "empty_text")]
+#[test_case(Some(KEYBOARD_COMMIT); "multiple_scalars")]
+#[test_case(Some("\n"); "control_scalar")]
+fn associated_invalid_leader_suffix_keeps_the_chord_pending(text: Option<&str>) {
+    let mut app = test_app();
+    app.update(associated_key(kb::LEADER.to_key_event(), None));
+    app.update(associated_key(chord::MODEL_PICKER.to_key_event(), text));
+    assert!(app.which_key.is_armed());
+    assert!(!app.model_picker.is_open());
+    assert!(app.input_box.is_empty());
+    app.update(associated_key(
+        chord::MODEL_PICKER.to_key_event(),
+        Some("m"),
+    ));
+    assert!(app.model_picker.is_open());
+    assert!(!app.which_key.is_armed());
+    assert!(app.input_box.is_empty());
+}
+
+#[test_case(true; "release_before_request")]
+#[test_case(false; "release_after_request")]
+fn associated_enter_release_rearms_initial_permission(release_before: bool) {
+    let mut app = test_app();
+    app.input_box
+        .buffer
+        .insert_text(REPORTED_PERMISSION_COMMAND);
+    let enter = key(KeyCode::Enter);
+    assert!(matches!(
+        app.update(associated_key(enter, None)).as_slice(),
+        [Action::SendMessage(_)]
+    ));
+    let release =
+        KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release);
+    if release_before {
+        app.update(associated_key(release, None));
+    }
+    app.update(agent_msg(permission_event(
+        REPORTED_PERMISSION_FIRST,
+        REPORTED_PERMISSION_COMMAND,
+    )));
+    if !release_before {
+        app.update(associated_key(release, None));
+    }
+    rendered(&mut app);
+    app.update(associated_key(enter, None));
+    assert!(!app.permission_prompt.is_open());
+    assert!(app.input_box.is_empty());
+}
+
+#[test_case(KeyModifiers::SHIFT, "Y"; "uppercase")]
+#[test_case(KeyModifiers::CONTROL.union(KeyModifiers::ALT), "¥"; "altgr")]
+fn associated_text_keeps_physical_permission_release_identity(modifiers: KeyModifiers, text: &str) {
+    let mut app = streaming_app();
+    let pressed = KeyEvent::new(KeyCode::Char('y'), modifiers);
+    app.update(associated_key(pressed, Some(text)));
+    app.update(agent_msg(permission_event(
+        REPORTED_PERMISSION_FIRST,
+        REPORTED_PERMISSION_COMMAND,
+    )));
+    rendered(&mut app);
+    app.update(associated_key(key(KeyCode::Char('y')), Some("y")));
+    assert!(app.permission_prompt.is_open());
+    let release = KeyEvent::new_with_kind(
+        KeyCode::Char('y'),
+        KeyModifiers::NONE,
+        KeyEventKind::Release,
+    );
+    app.update(associated_key(release, None));
+    app.update(associated_key(key(KeyCode::Char('y')), Some("y")));
+    assert!(!app.permission_prompt.is_open());
+    assert_eq!(app.input_box.expanded_text(), text);
+}
+
+#[test]
+fn associated_ime_text_cannot_choose_a_permission() {
+    let mut app = test_app();
+    app.permission_prompt.open(
+        REPORTED_PERMISSION_FIRST.into(),
+        ToolKey::native("bash"),
+        vec![REPORTED_PERMISSION_COMMAND.into()],
+        None,
+    );
+    rendered(&mut app);
+    app.update(associated_key(key(KeyCode::Null), Some("y")));
+    assert!(app.permission_prompt.is_open());
+    assert!(app.input_box.is_empty());
+    app.update(associated_key(key(KeyCode::Char('n')), Some("n")));
+    assert!(app.permission_prompt.is_open());
+    app.update(associated_key(key(KeyCode::Null), Some(KEYBOARD_COMMIT)));
+    assert!(rendered_visible_text(&mut app).contains(KEYBOARD_COMMIT));
+    assert!(app.input_box.is_empty());
+}
+
+#[test_case(None; "missing_text")]
+#[test_case(Some(""); "empty_text")]
+#[test_case(Some(KEYBOARD_COMMIT); "multiple_scalars")]
+fn associated_invalid_approval_text_cannot_choose_a_permission(text: Option<&str>) {
+    let mut app = test_app();
+    app.permission_prompt.open(
+        REPORTED_PERMISSION_FIRST.into(),
+        ToolKey::native("bash"),
+        vec![REPORTED_PERMISSION_COMMAND.into()],
+        None,
+    );
+    rendered(&mut app);
+    assert!(
+        app.update(associated_key(key(KeyCode::Char('y')), text))
+            .is_empty()
+    );
+    assert_eq!(
+        app.permission_prompt.request_id(),
+        Some(REPORTED_PERMISSION_FIRST)
+    );
+    assert!(app.input_box.is_empty());
+}
+
+#[test]
+fn associated_text_edits_the_paste_editor_not_the_composer() {
+    let mut app = test_app();
+    let id = app.input_box.buffer.insert_paste(PERMISSION_EDITOR_DRAFT);
+    app.open_paste_editor(id);
+    app.update(associated_key(kb::SELECT_ALL.to_key_event(), None));
+    app.update(associated_key(key(KeyCode::Null), Some(KEYBOARD_COMMIT)));
+    app.update(associated_key(kb::SAVE.to_key_event(), None));
+    assert_eq!(app.input_box.paste_text(id), Some(KEYBOARD_COMMIT));
+    assert_eq!(app.input_box.expanded_text(), format!("{KEYBOARD_COMMIT} "));
+}
+
+#[test_case(open_help_modal; "help")]
+#[test_case(open_goal_modal; "goal")]
+#[test_case(open_context_modal; "context")]
+#[test_case(open_model_picker; "model_filter")]
+#[test_case(open_command_modal; "command_filter")]
+#[test_case(open_docs_modal; "docs")]
+#[test_case(open_logs_modal; "logs")]
+fn associated_text_never_leaks_through_an_overlay(open: fn(&mut App)) {
+    let mut app = test_app();
+    open(&mut app);
+    app.update(associated_key(key(KeyCode::Null), Some(KEYBOARD_COMMIT)));
+    assert!(app.input_box.is_empty());
+}
+
+#[test_case(open_search; "transcript_search")]
+#[test_case(open_repeat_test_session_picker; "session_filter")]
+#[test_case(open_command_modal; "command_filter")]
+fn associated_text_updates_the_owning_filter(open: fn(&mut App)) {
+    let mut app = test_app();
+    open(&mut app);
+    app.update(associated_key(key(KeyCode::Char('\'')), None));
+    app.update(associated_key(
+        key(KeyCode::Char('x')),
+        Some(KEYBOARD_COMMIT),
+    ));
+    assert!(rendered_visible_text(&mut app).contains(KEYBOARD_COMMIT));
+    assert!(app.input_box.is_empty());
+}
+
+#[test_case(open_docs_modal; "docs_search")]
+#[test_case(open_logs_modal; "logs_search")]
+fn associated_logical_shortcut_opens_a_field_without_inserting_its_text(open: fn(&mut App)) {
+    let mut app = test_app();
+    open(&mut app);
+    app.update(associated_key(
+        key(KeyCode::Char('/')),
+        Some(KEYBOARD_IMAGE_PATH),
+    ));
+    assert!(!app.docs_modal.text_input_active());
+    assert!(!app.logs_modal.text_input_active());
+    app.update(associated_key(key(KeyCode::Char('/')), Some("/")));
+    assert!(app.docs_modal.text_input_active() || app.logs_modal.text_input_active());
+    app.update(associated_key(key(KeyCode::Null), Some(KEYBOARD_COMMIT)));
+    let screen = rendered_visible_text(&mut app);
+    assert!(screen.contains(KEYBOARD_COMMIT));
+    assert!(!screen.contains(KEYBOARD_IMAGE_PATH));
+    assert!(app.input_box.is_empty());
+}
+
+#[test]
+fn associated_text_edits_the_workbench_document_and_keeps_commands_physical() {
+    let (_dir, path, mut app) = workbench_repeat_editor();
+    app.update(associated_key(kb::SELECT_ALL.to_key_event(), Some("a")));
+    app.update(associated_key(key(KeyCode::Char('\'')), None));
+    app.update(associated_key(key(KeyCode::Null), Some(KEYBOARD_COMMIT)));
+    app.update(associated_key(kb::SAVE.to_key_event(), Some("s")));
+    assert_eq!(fs::read_to_string(path).unwrap(), KEYBOARD_COMMIT);
+    assert!(app.input_box.is_empty());
+}
+
+#[test]
+fn associated_altgr_characters_do_not_run_selection_shortcuts() {
+    let mut app = test_app();
+    open_question(&mut app);
+    app.update(associated_key(
+        KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+        Some(KEYBOARD_COMMIT),
+    ));
+    assert!(app.question_form.is_open());
+    assert!(app.input_box.is_empty());
+    app.question_form.close();
+    open_goal_modal(&mut app);
+    app.update(associated_key(
+        KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+        Some("@"),
+    ));
+    assert!(app.goal_modal.is_open());
+    assert!(app.input_box.is_empty());
+}
+
+#[test]
+fn associated_text_edits_the_question_answer_not_the_composer() {
+    let mut app = test_app();
+    open_question(&mut app);
+    app.update(associated_key(key(KeyCode::Down), None));
+    app.update(associated_key(key(KeyCode::Enter), None));
+    assert!(app.question_form.text_input_active());
+    app.update(associated_key(key(KeyCode::Null), Some(KEYBOARD_COMMIT)));
+    assert!(rendered_visible_text(&mut app).contains(KEYBOARD_COMMIT));
+    assert!(app.input_box.is_empty());
+}
+
+#[test_case(KeyCode::BackTab; "legacy_backtab")]
+#[test_case(KeyCode::Tab; "enhanced_shift_tab")]
+fn associated_shift_tab_navigates_questions_backward(code: KeyCode) {
+    let mut app = test_app();
+    app.question_form.open(
+        [QUESTION_TEXT, QUESTION_BTW_REPLACEMENT]
+            .into_iter()
+            .map(|question| AskedQuestion {
+                question: question.into(),
+                header: QUESTION_HEADER.into(),
+                options: vec![QuestionOption {
+                    label: QUESTION_OPTION.into(),
+                    description: String::new(),
+                }],
+                multiple: false,
+            })
+            .collect(),
+    );
+    let first = rendered_question(&mut app);
+    app.update(associated_key(key(KeyCode::Tab), None));
+    assert_ne!(rendered_question(&mut app), first);
+    app.update(associated_key(
+        KeyEvent::new(code, KeyModifiers::SHIFT),
+        None,
+    ));
+    assert_eq!(rendered_question(&mut app), first);
+    assert!(app.question_form.is_open());
+    assert!(app.input_box.is_empty());
+}
+
+#[test_case(KeyCode::BackTab; "legacy_backtab")]
+#[test_case(KeyCode::Tab; "enhanced_shift_tab")]
+fn associated_shift_tab_navigates_from_workbench_sidebar_to_editor(code: KeyCode) {
+    let (_dir, path, mut app) = workbench_repeat_editor();
+    press_chord(
+        &mut app,
+        Bind::from_workbench(workbench_keys::VIEW_EXPLORER),
+    );
+    assert!(!app.workbench.text_input_active());
+    app.update(associated_key(
+        KeyEvent::new(code, KeyModifiers::SHIFT),
+        None,
+    ));
+    assert!(app.workbench.text_input_active());
+    assert!(app.workbench.is_open());
+    assert_eq!(fs::read_to_string(path).unwrap(), REPEAT_FIELD_TEXT);
+    assert!(app.input_box.is_empty());
+}
+
+#[test_case(None, false; "missing_text")]
+#[test_case(Some(""), false; "empty_text")]
+#[test_case(Some(KEYBOARD_COMMIT), false; "multiple_scalars")]
+#[test_case(Some("o"), true; "generated_trust_once")]
+fn associated_mcp_trust_once_requires_its_logical_character(text: Option<&str>, trusts: bool) {
+    let mut app = test_app();
+    app.mcp_picker = awaiting_mcp_picker();
+    app.execute_command(cmd("/mcp"), 0);
+    let actions = app.update(associated_key(key(KeyCode::Char('o')), text));
+    if trusts {
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::TrustMcpOnce(server)] if server == KEYBOARD_MCP_SERVER
+        ));
+    } else {
+        assert!(actions.is_empty());
+        assert!(app.mcp_picker.is_open());
+        if text == Some(KEYBOARD_COMMIT) {
+            assert!(rendered_visible_text(&mut app).contains(KEYBOARD_COMMIT));
+        }
+    }
+    assert!(app.input_box.is_empty());
+}
+
+#[test_case(None; "missing_text")]
+#[test_case(Some(""); "empty_text")]
+#[test_case(Some(KEYBOARD_COMMIT); "multiple_scalars")]
+#[test_case(Some("x"); "different_character")]
+fn associated_mcp_project_trust_requires_a_logical_confirmation(text: Option<&str>) {
+    let mut app = test_app();
+    app.mcp_picker = awaiting_mcp_picker();
+    app.execute_command(cmd("/mcp"), 0);
+    assert!(
+        app.update(associated_key(key(KeyCode::Char('p')), Some("p")))
+            .is_empty()
+    );
+    assert!(
+        app.update(associated_key(key(KeyCode::Char('y')), text))
+            .is_empty()
+    );
+    assert!(app.mcp_picker.is_open());
+    let actions = app.update(associated_key(key(KeyCode::Char('y')), Some("y")));
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::TrustMcpProject(server)] if server == KEYBOARD_MCP_SERVER
+    ));
+    assert!(app.input_box.is_empty());
+}
+
+#[test]
+fn associated_composed_text_over_a_model_reset_key_edits_the_filter() {
+    let mut app = test_app();
+    app.model_picker.open_purpose(
+        &app.state.model,
+        &ModelPolicy::default(),
+        ModelPurpose::Plan,
+    );
+    assert!(
+        app.update(associated_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::SHIFT),
+            Some(KEYBOARD_COMMIT),
+        ))
+        .is_empty()
+    );
+    assert!(rendered_visible_text(&mut app).contains(KEYBOARD_COMMIT));
+    assert!(app.input_box.is_empty());
+}
+
 fn open_permission_test_editor(app: &mut App) {
     let id = app.input_box.buffer.insert_paste(PERMISSION_EDITOR_DRAFT);
     app.open_paste_editor(id);
@@ -20315,7 +20781,45 @@ fn permission_guidance_owns_paste_instead_of_the_hidden_editor(workbench: bool) 
     assert!(app.paste_editor.is_open());
 }
 
+#[test_case(true; "release_before_permission_arrives")]
+#[test_case(false; "release_after_permission_arrives")]
+fn fresh_enter_accepts_initial_permission_after_submitting_a_message(release_before: bool) {
+    let mut app = test_app();
+    app.update(Msg::Paste(REPORTED_PERMISSION_COMMAND.into()));
+    let actions = dispatch_reported_key(&mut app, key(KeyCode::Enter), KeyEventKind::Press);
+    assert!(matches!(actions.as_slice(), [Action::SendMessage(input)]
+        if input.message == REPORTED_PERMISSION_COMMAND));
+    assert_eq!(app.status, Status::Streaming);
+    assert!(app.input_box.is_empty());
+    if release_before {
+        assert!(
+            dispatch_reported_key(&mut app, key(KeyCode::Enter), KeyEventKind::Release).is_empty()
+        );
+    }
+    app.update(agent_msg(permission_event(
+        REPORTED_PERMISSION_FIRST,
+        REPORTED_PERMISSION_COMMAND,
+    )));
+    if !release_before {
+        assert!(
+            dispatch_reported_key(&mut app, key(KeyCode::Enter), KeyEventKind::Release).is_empty()
+        );
+    }
+    assert_eq!(
+        app.permission_prompt.request_id(),
+        Some(REPORTED_PERMISSION_FIRST)
+    );
+    let screen = rendered(&mut app);
+    assert!(screen.contains(PERMISSION_TITLE));
+    assert!(screen.contains(PERMISSION_ALLOW_HINT));
+    assert!(dispatch_reported_key(&mut app, key(KeyCode::Enter), KeyEventKind::Press).is_empty());
+    assert!(!app.permission_prompt.is_open());
+    assert!(app.input_box.is_empty());
+    assert_eq!(app.exit_request, ExitRequest::None);
+}
+
 #[test_case(KeyCode::Char('y'); "queued_approval_requires_release_and_fresh_press")]
+#[test_case(KeyCode::Enter; "queued_enter_requires_release_and_fresh_press")]
 fn reported_permission_keys_preserve_physical_release(approval: KeyCode) {
     let mut app = test_app();
     app.status = Status::Streaming;
@@ -20384,6 +20888,7 @@ fn a_key_held_before_the_first_permission_needs_rearming(shortcut: char, kind: K
 }
 
 #[test_case(KeyCode::Char('y'); "approval")]
+#[test_case(KeyCode::Enter; "initial_choice")]
 #[test_case(KeyCode::Esc; "denial")]
 fn physical_release_between_requests_rearms_the_next_prompt(code: KeyCode) {
     let mut app = test_app();
@@ -20433,7 +20938,9 @@ fn reported_key_routing_preserves_composer_editing(kind: KeyEventKind) {
     let mut app = test_app();
     app.update(Msg::Paste("ab".into()));
     dispatch_reported_key(&mut app, key(KeyCode::Left), kind);
+    dispatch_reported_key(&mut app, key(KeyCode::Left), KeyEventKind::Release);
     dispatch_reported_key(&mut app, key(KeyCode::Char('X')), kind);
+    dispatch_reported_key(&mut app, key(KeyCode::Char('X')), KeyEventKind::Release);
     assert_eq!(app.input_box.buffer.value(), "aXb");
     dispatch_reported_key(&mut app, key(KeyCode::Backspace), kind);
     assert_eq!(app.input_box.buffer.value(), "ab");

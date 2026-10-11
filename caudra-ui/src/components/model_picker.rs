@@ -450,11 +450,19 @@ impl ModelPicker {
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
-        self.track_anchor(|p| p.picker.handle_paste(text))
+        self.handle_text(text, true)
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) -> bool {
+        self.track_anchor(|p| p.picker.handle_text(text, paste))
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ModelPickerAction {
         self.track_anchor(|p| p.handle_key_inner(key))
+    }
+
+    pub(crate) fn text_key(&self, key: Option<KeyEvent>) -> bool {
+        !(key.is_some_and(is_reset_key) && matches!(self.page, PickerPage::Job(_)))
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent) -> ModelPickerAction {
@@ -1215,6 +1223,17 @@ mod tests {
         ));
         assert_eq!(p.page, PickerPage::Job(ModelPurpose::Plan));
         assert!(p.is_open());
+    }
+
+    #[test]
+    fn a_job_filter_accepts_text_without_a_command_key() {
+        let mut picker = ModelPicker::new(test_models());
+        open_job_picker(&mut picker, SONNET_SPEC, ModelPurpose::Plan);
+        assert!(picker.text_key(None));
+        picker.handle_text(MODEL_QUERY, false);
+        assert_eq!(picker.picker.search_text(), MODEL_QUERY);
+        assert!(!picker.text_key(Some(key(KeyCode::Char('R')))));
+        assert_eq!(picker.page, PickerPage::Job(ModelPurpose::Plan));
     }
 
     #[test]

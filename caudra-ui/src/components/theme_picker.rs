@@ -103,7 +103,11 @@ impl ThemePicker {
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
-        let consumed = self.picker.handle_paste(text);
+        self.handle_text(text, true)
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) -> bool {
+        let consumed = self.picker.handle_text(text, paste);
         if consumed {
             self.apply_preview();
         }

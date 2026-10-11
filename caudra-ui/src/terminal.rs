@@ -38,7 +38,9 @@ const PROGRAM_STATUS_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 const TMUX_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 const KEYBOARD_ENHANCEMENTS: KeyboardEnhancementFlags =
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-        .union(KeyboardEnhancementFlags::REPORT_EVENT_TYPES);
+        .union(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+        .union(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES)
+        .union(KeyboardEnhancementFlags::REPORT_ASSOCIATED_TEXT);
 /// Termux exports this from v0.107, but not on every install or upgrade path,
 /// so it confirms Termux and never rules it out.
 const TERMUX_VERSION: &str = "TERMUX_VERSION";
@@ -600,7 +602,7 @@ mod tests {
 
     const WRONG_TERMUX: &str = "the environment was read as the wrong terminal";
     const TERMUX_PREFIX: &str = "/data/data/com.termux/files/usr";
-    const EXPECTED_KEYBOARD_ENHANCEMENTS: &str = "\u{1b}[>3u";
+    const EXPECTED_KEYBOARD_ENHANCEMENTS: &str = "\u{1b}[>27u";
     const APPEARANCE_SUBSCRIBE: &[u8] = b"\x1b[?2031h\x1b[?996n";
     const APPEARANCE_UNSUBSCRIBE: &[u8] = b"\x1b[?2031l";
     const PROGRAM_STATUS_SEQUENCE_LIMIT: usize = 4096;

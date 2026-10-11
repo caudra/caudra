@@ -1163,13 +1163,19 @@ impl TransferState {
     }
 
     pub(crate) fn paste(&mut self, text: &str) {
+        self.handle_text(text, true);
+    }
+
+    pub(crate) fn handle_text(&mut self, text: &str, paste: bool) {
         if self.pending || self.draining {
             return;
         }
         let Some(prompt) = &mut self.prompt else {
             return;
         };
-        if text.chars().any(char::is_control) || prompt.text.paste(text) == TextKey::Refused {
+        if text.chars().any(char::is_control)
+            || prompt.text.handle_text(text, paste) == TextKey::Refused
+        {
             self.notice = Some(Notice::Error(INPUT_REJECTED.to_owned()));
         }
     }

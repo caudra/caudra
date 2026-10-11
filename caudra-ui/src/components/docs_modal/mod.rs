@@ -238,10 +238,14 @@ impl DocsModal {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
+        self.handle_text(text, true);
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) {
         let text = text.replace(['\r', '\n'], " ");
         match self.pane {
-            Pane::Contents => self.contents.paste(&text),
-            Pane::Search => self.search.paste(&text, self.library()),
+            Pane::Contents => self.contents.handle_text(&text, paste),
+            Pane::Search => self.search.handle_text(&text, self.library(), paste),
             Pane::Reader => {}
         }
     }

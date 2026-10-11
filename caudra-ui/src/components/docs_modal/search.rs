@@ -57,8 +57,8 @@ impl SearchView {
         self.run(library);
     }
 
-    pub(super) fn paste(&mut self, text: &str, library: &Library) {
-        if self.query.paste(text).changed() {
+    pub(super) fn handle_text(&mut self, text: &str, library: &Library, paste: bool) {
+        if self.query.handle_text(text, paste).changed() {
             self.run(library);
         }
     }

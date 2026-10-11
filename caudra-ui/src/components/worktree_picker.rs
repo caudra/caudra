@@ -242,6 +242,12 @@ impl WorktreePicker {
         self.flow.is_some()
     }
 
+    pub(crate) fn text_input_active(&self) -> bool {
+        self.flow
+            .as_ref()
+            .is_some_and(|flow| matches!(flow.stage, Stage::Edit(..) | Stage::List))
+    }
+
     pub fn close(&mut self) {
         self.flow = None;
         self.picker.close();
@@ -343,13 +349,17 @@ impl WorktreePicker {
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
+        self.handle_text(text, true)
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) -> bool {
         match self.flow.as_mut().map(|flow| &mut flow.stage) {
             Some(Stage::Edit(_, _, field)) => {
-                field.paste(text);
+                field.handle_text(text, paste);
                 self.sync_edit();
                 true
             }
-            Some(Stage::List) => self.picker.handle_paste(text),
+            Some(Stage::List) => self.picker.handle_text(text, paste),
             Some(_) => true,
             None => false,
         }

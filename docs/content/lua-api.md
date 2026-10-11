@@ -4776,7 +4776,8 @@ Win:recv({timeout_ms?})
 Waits for the next event from this window. Call this in a loop to build an interactive UI. Returns nil once the window is closed or the channel disconnects. Pass {timeout_ms} to also get `{type="timeout"}` events so your plugin can animate while idle.
 
 Event tables by type:
-- `{type="key", key}` -- keypress. Key is a string like "q", "j", or "esc".
+- `{type="key", key}` -- keypress. Key is a string like "q", "j", or "esc". Generated keyboard text containing exactly one Unicode scalar produces one key event with that literal scalar, preserving case and omitting physical modifiers.
+- `{type="text", text}` -- generated keyboard text containing multiple Unicode scalars, including combining sequences. Each commit produces one text event and no key event. Insert the complete string as text, even if it matches a key name like "enter". Empty generated text produces no event.
 - `{type="resize", width, height}` -- terminal was resized.
 - `{type="paste", text}` -- bracketed paste.
 - `{type="close"}` -- window was closed externally.

@@ -508,9 +508,17 @@ impl ShellModal {
     /// The details page has nothing to paste into, but it still owns the
     /// screen, so a paste never reaches the composer behind it.
     pub fn handle_paste(&mut self, text: &str) -> bool {
+        self.handle_text(text, true)
+    }
+
+    pub(crate) fn text_input_active(&self) -> bool {
+        self.page.is_none()
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) -> bool {
         match self.page {
             Some(_) => self.picker.is_open(),
-            None => self.picker.handle_paste(text),
+            None => self.picker.handle_text(text, paste),
         }
     }
 

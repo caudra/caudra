@@ -185,10 +185,14 @@ impl ReviewModal {
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
+        self.handle_text(text, true)
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) -> bool {
         if !matches!(self.mode, Mode::Note { .. }) {
             return false;
         }
-        self.note.handle_paste(text);
+        self.note.handle_text(text, paste);
         true
     }
 

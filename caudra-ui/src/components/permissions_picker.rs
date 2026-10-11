@@ -833,15 +833,26 @@ impl PermissionsPicker {
     }
 
     pub(crate) fn handle_paste(&mut self, text: &str) -> bool {
+        self.handle_text(text, true)
+    }
+
+    pub(crate) fn text_input_active(&self) -> bool {
+        match &self.editor {
+            Some(editor) => editor.is_editing(),
+            None => !self.detail_focused && !self.has_pending_confirmation(),
+        }
+    }
+
+    pub(crate) fn handle_text(&mut self, text: &str, paste: bool) -> bool {
         if let Some(editor) = &mut self.editor {
-            editor.handle_paste(text);
+            editor.handle_text(text, paste);
             return true;
         }
         if self.detail_focused || self.has_pending_confirmation() {
             return true;
         }
         let selected = self.picker.selected_index();
-        let consumed = self.picker.handle_paste(text);
+        let consumed = self.picker.handle_text(text, paste);
         self.selection_changed(selected);
         consumed
     }

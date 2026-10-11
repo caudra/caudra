@@ -1,5 +1,7 @@
 use caudra_agent::permissions::PermissionAnswer;
-use caudra_workbench::text_field::{FieldKind, TextCommand, TextKey, decode};
+use caudra_workbench::text_field::{
+    FieldKind, TextCommand, TextKey, command_key, decode, keyboard_text,
+};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -111,6 +113,21 @@ impl PermissionPrompt {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<PermissionDecision> {
+        self.handle_keyboard(key, None)
+    }
+
+    pub(crate) fn handle_keyboard(
+        &mut self,
+        key: KeyEvent,
+        text: Option<Option<&str>>,
+    ) -> Option<PermissionDecision> {
+        if matches!(key.code, KeyCode::Modifier(_)) {
+            return None;
+        }
+        if key.code == KeyCode::Null {
+            self.insert_keyboard_text(key, text);
+            return None;
+        }
         match key.kind {
             KeyEventKind::Release => {
                 self.input_freshness.release(key);
@@ -119,6 +136,10 @@ impl PermissionPrompt {
             KeyEventKind::Repeat => {
                 self.input_freshness.last_press = Some(key.code);
                 self.input_freshness.barrier();
+                if self.insert_keyboard_text(key, text) {
+                    return None;
+                }
+                let key = command_key(key, text)?;
                 if self.is_open() {
                     self.handle_repeat(key);
                 }
@@ -130,6 +151,10 @@ impl PermissionPrompt {
         if !self.is_open() {
             return None;
         }
+        if self.insert_keyboard_text(key, text) {
+            return None;
+        }
+        let key = command_key(key, text)?;
         if !fresh {
             self.handle_repeat(key);
             return None;
@@ -146,6 +171,22 @@ impl PermissionPrompt {
             self.invalidate_controls();
         }
         decision
+    }
+
+    fn insert_keyboard_text(&mut self, key: KeyEvent, text: Option<Option<&str>>) -> bool {
+        if !self.is_open() || !self.field_focused() {
+            return false;
+        }
+        let Some(text) = keyboard_text(key, text) else {
+            return false;
+        };
+        if !text.is_empty() {
+            self.field.insert_text(text);
+            if self.inspector.is_some() && self.panel != Panel::Details {
+                self.refresh_inspector(None);
+            }
+        }
+        true
     }
 
     /// A held key may move and scroll, and edit a field, but never answer.
@@ -787,7 +828,8 @@ mod tests {
         PermissionRequest, PermissionResourceAccess, PermissionRowGrant, RuleOrigin,
     };
     use crossterm::event::{
-        KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        KeyCode, KeyEvent, KeyEventKind, KeyModifiers, ModifierKeyCode, MouseButton, MouseEvent,
+        MouseEventKind,
     };
     use ratatui::layout::Rect;
     use test_case::test_case;
@@ -832,6 +874,7 @@ mod tests {
     const MATCHING_PATTERN: &str = "cargo test -p *";
     const SHORTCUT_LETTERS: &str = "yn?e";
     const REPEAT_COUNT: usize = 10;
+    const KEYBOARD_TEXT: &str = "é東京";
 
     fn hit(prompt: &PermissionPrompt, target: &PromptTarget) -> Rect {
         prompt
@@ -1300,6 +1343,17 @@ mod tests {
             assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
         }
         assert!(draw(&mut prompt).contains(REARM_MESSAGE));
+        for kind in [
+            KeyEventKind::Press,
+            KeyEventKind::Repeat,
+            KeyEventKind::Release,
+        ] {
+            prompt.handle_key(with_kind(
+                KeyCode::Modifier(ModifierKeyCode::LeftShift),
+                kind,
+            ));
+            assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
+        }
         let modified = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
         assert!(prompt.handle_key(modified).is_none());
         prompt.handle_key(with_kind(KeyCode::Enter, KeyEventKind::Release));
@@ -1495,6 +1549,157 @@ mod tests {
         }
         prompt.handle_key(key(KeyCode::Up));
         assert!(prompt.handle_key(key(KeyCode::Char('y'))).is_some());
+    }
+
+    #[test_case(true, None; "legacy_release_before_opening")]
+    #[test_case(false, None; "legacy_release_after_opening")]
+    #[test_case(true, Some(None); "enhanced_release_before_opening")]
+    #[test_case(false, Some(None); "enhanced_release_after_opening")]
+    fn fresh_enter_accepts_the_initially_highlighted_choice(
+        release_before: bool,
+        text: Option<Option<&str>>,
+    ) {
+        let mut prompt = PermissionPrompt::new();
+        prompt.handle_keyboard(key(KeyCode::Enter), text);
+        if release_before {
+            prompt.handle_keyboard(with_kind(KeyCode::Enter, KeyEventKind::Release), text);
+        }
+        prompt.enqueue(Box::new(native_shell_request(SINGLE_COMMAND)), None);
+        if !release_before {
+            prompt.handle_keyboard(with_kind(KeyCode::Enter, KeyEventKind::Release), text);
+        }
+        draw(&mut prompt);
+        assert_eq!(prompt.highlight, Choice::Once);
+        assert_eq!(
+            prompt
+                .handle_keyboard(key(KeyCode::Enter), text)
+                .unwrap()
+                .answer,
+            prompt.choice_answer(Choice::Once).unwrap()
+        );
+    }
+
+    #[test_case(KeyCode::Char('y'), KeyModifiers::NONE, None, false; "no_text")]
+    #[test_case(KeyCode::Char('y'), KeyModifiers::NONE, Some(""), false; "empty_text")]
+    #[test_case(KeyCode::Char('y'), KeyModifiers::NONE, Some(KEYBOARD_TEXT), false; "multiple_scalars")]
+    #[test_case(KeyCode::Char('y'), KeyModifiers::NONE, Some("x"), false; "different_character")]
+    #[test_case(KeyCode::Char('y'), KeyModifiers::CONTROL.union(KeyModifiers::ALT), Some("y"), false; "altgr")]
+    #[test_case(KeyCode::Null, KeyModifiers::NONE, Some("y"), false; "no_physical_key")]
+    #[test_case(KeyCode::Char('y'), KeyModifiers::NONE, Some("y"), true; "generated_approval")]
+    fn enhanced_approval_requires_one_generated_command(
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        text: Option<&str>,
+        approves: bool,
+    ) {
+        let mut prompt = shell_prompt(SINGLE_COMMAND);
+        draw(&mut prompt);
+        let expected = prompt.choice_answer(Choice::Once).unwrap();
+        let answer = prompt
+            .handle_keyboard(KeyEvent::new(code, modifiers), Some(text))
+            .map(|decision| decision.answer);
+        assert_eq!(answer, approves.then_some(expected));
+    }
+
+    #[test]
+    fn enhanced_question_mark_keeps_physical_release_matching() {
+        let mut prompt = shell_prompt(SINGLE_COMMAND);
+        draw(&mut prompt);
+        let physical = KeyEvent::new(KeyCode::Char('/'), KeyModifiers::SHIFT);
+        assert!(prompt.handle_keyboard(physical, Some(Some("?"))).is_none());
+        assert_eq!(prompt.panel, Panel::Details);
+        assert_eq!(prompt.input_freshness.last_press, Some(physical.code));
+        prompt.input_freshness.barrier();
+        prompt.handle_keyboard(
+            KeyEvent {
+                kind: KeyEventKind::Release,
+                ..physical
+            },
+            Some(None),
+        );
+        assert_eq!(prompt.input_freshness.last_press, None);
+        assert_eq!(prompt.input_freshness.blocked_key, None);
+        prompt.handle_keyboard(physical, Some(Some("?")));
+        assert_eq!(prompt.panel, Panel::Main);
+    }
+
+    #[test_case(None, Choice::Once; "no_text_does_not_navigate")]
+    #[test_case(Some(KEYBOARD_TEXT), Choice::Once; "multiple_scalars_do_not_navigate")]
+    #[test_case(Some("j"), Choice::Conversation; "generated_repeat_navigates")]
+    fn enhanced_repeats_use_generated_navigation(text: Option<&str>, expected: Choice) {
+        let mut prompt = shell_prompt(SINGLE_COMMAND);
+        draw(&mut prompt);
+        prompt.handle_keyboard(
+            with_kind(KeyCode::Char('k'), KeyEventKind::Repeat),
+            Some(text),
+        );
+        assert_eq!(prompt.highlight, expected);
+        assert_eq!(prompt.input_freshness.blocked_key, Some(KeyCode::Char('k')));
+    }
+
+    #[test_case(KeyEventKind::Press; "press")]
+    #[test_case(KeyEventKind::Repeat; "repeat")]
+    fn keyboard_text_without_physical_identity_does_not_clear_the_approval_barrier(
+        kind: KeyEventKind,
+    ) {
+        let mut prompt = broad_pending(PermissionLifetime::Project);
+        prompt.state = PromptState::Guidance;
+        let blocked = prompt.input_freshness.blocked_key;
+        assert!(blocked.is_some());
+        prompt.handle_keyboard(with_kind(KeyCode::Null, kind), Some(Some(KEYBOARD_TEXT)));
+        assert_eq!(prompt.field.text(), KEYBOARD_TEXT);
+        assert_eq!(prompt.input_freshness.blocked_key, blocked);
+        prompt.handle_keyboard(
+            with_kind(KeyCode::Null, KeyEventKind::Release),
+            Some(Some(KEYBOARD_TEXT)),
+        );
+        assert_eq!(prompt.field.text(), KEYBOARD_TEXT);
+        assert_eq!(prompt.input_freshness.blocked_key, blocked);
+    }
+
+    #[test]
+    fn keyboard_text_uses_physical_freshness_and_never_inserts_a_dead_key() {
+        let mut prompt = shell_prompt(SINGLE_COMMAND);
+        prompt.state = PromptState::Guidance;
+        let physical = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SHIFT);
+        prompt.handle_keyboard(physical, Some(Some(KEYBOARD_TEXT)));
+        assert_eq!(prompt.field.text(), KEYBOARD_TEXT);
+        assert_eq!(prompt.input_freshness.last_press, Some(physical.code));
+        prompt.handle_keyboard(with_kind(physical.code, KeyEventKind::Release), Some(None));
+        assert_eq!(prompt.input_freshness.last_press, None);
+        prompt.handle_keyboard(key(KeyCode::Char('\'')), Some(None));
+        assert_eq!(prompt.field.text(), KEYBOARD_TEXT);
+    }
+
+    #[test_case(KeyEventKind::Press, true; "modifier_press_before_opening")]
+    #[test_case(KeyEventKind::Repeat, true; "modifier_repeat_before_opening")]
+    #[test_case(KeyEventKind::Release, true; "modifier_release_before_opening")]
+    #[test_case(KeyEventKind::Press, false; "modifier_press_after_opening")]
+    #[test_case(KeyEventKind::Repeat, false; "modifier_repeat_after_opening")]
+    #[test_case(KeyEventKind::Release, false; "modifier_release_after_opening")]
+    fn modifier_events_do_not_rearm_a_held_enter(kind: KeyEventKind, before_opening: bool) {
+        let mut prompt = PermissionPrompt::new();
+        prompt.handle_key(key(KeyCode::Enter));
+        let modifier = with_kind(KeyCode::Modifier(ModifierKeyCode::LeftShift), kind);
+        if before_opening {
+            prompt.handle_key(modifier);
+        }
+        prompt.enqueue(Box::new(native_shell_request(SINGLE_COMMAND)), None);
+        draw(&mut prompt);
+        if !before_opening {
+            prompt.handle_key(modifier);
+        }
+        assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
+        assert!(
+            prompt
+                .handle_key(with_kind(KeyCode::Enter, KeyEventKind::Repeat))
+                .is_none()
+        );
+        prompt.handle_key(with_kind(KeyCode::Enter, KeyEventKind::Release));
+        assert_eq!(
+            prompt.handle_key(key(KeyCode::Enter)).unwrap().answer,
+            prompt.choice_answer(Choice::Once).unwrap()
+        );
     }
 
     #[test]

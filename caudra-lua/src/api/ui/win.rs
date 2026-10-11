@@ -75,6 +75,11 @@ fn event_table(lua: &Lua, event: WinEvent) -> LuaResult<Table> {
             tbl.set("key", key)?;
             Ok(tbl)
         }
+        WinEvent::Text { text } => {
+            let tbl = tagged(lua, "text")?;
+            tbl.set("text", text)?;
+            Ok(tbl)
+        }
         WinEvent::Resize { width, height } => {
             let tbl = tagged(lua, "resize")?;
             tbl.set("width", width)?;
@@ -99,7 +104,8 @@ const recv__doc: FnDoc = FnDoc {
         channel disconnects. Pass {timeout_ms} to also get `{type=\"timeout\"}` \
         events so your plugin can animate while idle.\n\n\
         Event tables by type:\n\
-        - `{type=\"key\", key}` -- keypress. Key is a string like \"q\", \"j\", or \"esc\".\n\
+        - `{type=\"key\", key}` -- keypress. Key is a string like \"q\", \"j\", or \"esc\". Generated keyboard text containing exactly one Unicode scalar produces one key event with that literal scalar, preserving case and omitting physical modifiers.\n\
+        - `{type=\"text\", text}` -- generated keyboard text containing multiple Unicode scalars, including combining sequences. Each commit produces one text event and no key event. Insert the complete string as text, even if it matches a key name like \"enter\". Empty generated text produces no event.\n\
         - `{type=\"resize\", width, height}` -- terminal was resized.\n\
         - `{type=\"paste\", text}` -- bracketed paste.\n\
         - `{type=\"close\"}` -- window was closed externally.\n\
@@ -349,6 +355,9 @@ lua_class! {
 mod tests {
     use super::*;
     use crate::api::util::command::FloatConfig;
+    use test_case::test_case;
+
+    const TEXT_EVENT: &str = "text";
 
     fn make_channels() -> (
         flume::Sender<WinEvent>,
@@ -433,6 +442,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got, "key:enter");
+    }
+
+    #[test_case("enter"; "text_is_not_a_named_key")]
+    #[test_case("e\u{301}"; "composed_text_stays_atomic")]
+    fn recv_delivers_keyboard_text_without_a_key(text: &str) {
+        let lua = mlua::Lua::new();
+        let (event_tx, _cmd_rx, handle) = make_channels();
+        event_tx
+            .try_send(WinEvent::Text { text: text.into() })
+            .unwrap();
+        lua.globals().set("win", handle).unwrap();
+        let (kind, received, key): (String, String, Option<String>) = smol::block_on(
+            lua.load("local ev = win:recv(1000) return ev.type, ev.text, ev.key")
+                .eval_async(),
+        )
+        .unwrap();
+        assert_eq!(kind, TEXT_EVENT);
+        assert_eq!(received, text);
+        assert!(key.is_none());
     }
 
     #[test]

@@ -151,11 +151,15 @@ impl CommandModal {
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
+        self.handle_text(text, true)
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) -> bool {
         match &mut self.stage {
             Stage::Closed => false,
-            Stage::Pick(picker) => picker.handle_paste(text),
+            Stage::Pick(picker) => picker.handle_text(text, paste),
             Stage::Args { input, .. } => {
-                input.paste(text);
+                input.handle_text(text, paste);
                 true
             }
         }

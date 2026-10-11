@@ -646,11 +646,34 @@ impl SandboxManager {
     }
 
     pub(crate) fn handle_paste(&mut self, text: &str) -> bool {
+        self.handle_text(text, true)
+    }
+
+    pub(crate) fn text_input_active(&self) -> bool {
+        self.state.as_ref().is_some_and(|state| {
+            state.open
+                && state.confirmation.is_none()
+                && state.reader_focus.is_none()
+                && state.live_pending.is_none()
+                && if let Some(form) = &state.live_form {
+                    form.picker.is_none() && !form.fields.is_empty()
+                } else if state.references.is_some() {
+                    true
+                } else if let Some(document) = &state.document {
+                    document.destination.is_some() || document.mode == DocumentMode::Import
+                } else {
+                    state.focus == Focus::Search
+                        || state.form.as_ref().is_some_and(|form| form.editing)
+                }
+        })
+    }
+
+    pub(crate) fn handle_text(&mut self, text: &str, paste: bool) -> bool {
         let Some(state) = self.state.as_mut().filter(|state| state.open) else {
             return false;
         };
         if state.confirmation.is_none() && state.reader_focus.is_none() {
-            state.paste(text);
+            state.insert_text(text, paste);
         }
         true
     }
@@ -1776,7 +1799,7 @@ impl Manager {
         }
     }
 
-    fn paste(&mut self, text: &str) {
+    fn insert_text(&mut self, text: &str, paste: bool) {
         if self.live_pending.is_some() {
             return;
         }
@@ -1793,10 +1816,11 @@ impl Manager {
                     "API key must be visible ASCII without whitespace; paste only the key.".into();
                 return;
             }
-            if !field
-                .editor
-                .handle_paste_bounded(text, crate::sandbox::MAX_LIVE_PREVIEW_BYTES)
-            {
+            if !field.editor.handle_text_bounded(
+                text,
+                crate::sandbox::MAX_LIVE_PREVIEW_BYTES,
+                paste,
+            ) {
                 self.status = TOO_LARGE.into();
             }
             return;
@@ -1804,7 +1828,7 @@ impl Manager {
         if let Some(picker) = self.references.as_mut() {
             if !picker
                 .search
-                .handle_paste_bounded(text, MAX_SANDBOX_RECORD_BYTES)
+                .handle_text_bounded(text, MAX_SANDBOX_RECORD_BYTES, paste)
             {
                 self.status = TOO_LARGE.into();
                 return;
@@ -1831,7 +1855,7 @@ impl Manager {
         } else {
             return;
         };
-        if !editor.handle_paste_bounded(text, limit) {
+        if !editor.handle_text_bounded(text, limit, paste) {
             self.status = TOO_LARGE.into();
             return;
         }

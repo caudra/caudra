@@ -306,13 +306,20 @@ impl SessionPicker {
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
+        self.handle_text(text, true)
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) -> bool {
+        if !paste && self.rename.is_none() {
+            self.clear_pending();
+        }
         match &mut self.rename {
             Some((_, field)) => {
-                field.paste(text);
+                field.handle_text(text, paste);
                 self.sync_rename_text();
                 true
             }
-            None => self.picker.handle_paste(text),
+            None => self.picker.handle_text(text, paste),
         }
     }
 

@@ -13,7 +13,7 @@ use caudra_config::Feature;
 use caudra_config::sandbox::persistence::SandboxStore;
 use caudra_sandbox::Controller;
 use caudra_workbench::{
-    WorkbenchAction,
+    WorkbenchAction, text_field,
     transfer::{
         TransferAction, TransferAvailability, TransferDirection, TransferEffect, TransferEntry,
         TransferExclusion, TransferFileOutcome, TransferNodeKind, TransferOutcome,
@@ -24,7 +24,7 @@ use caudra_workbench::{
 };
 use caudra_workcell::TransferReport;
 use caudra_workspace::{OperationId, TransferDigest, WorkspacePath};
-use crossterm::event::{KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
 use super::{Action, App, Msg, sandbox::attached_sandbox_instance};
 use crate::components::{
@@ -458,6 +458,9 @@ impl App {
         if owned_prompt {
             match msg {
                 Msg::Key(key) => self.permission_prompt_key(key),
+                Msg::KeyWithText { key, text } => {
+                    self.permission_prompt_keyboard(key, Some(text.as_deref()))
+                }
                 Msg::Mouse(event) => {
                     if let PromptMouse::Decided(decision) =
                         self.permission_prompt.handle_mouse(event)
@@ -481,16 +484,10 @@ impl App {
             return Vec::new();
         }
         let action = match msg {
-            Msg::Key(event) if event.kind == KeyEventKind::Release => WorkbenchAction::Consumed,
-            Msg::Key(event) if self.which_key.is_armed() => {
-                self.which_key.disarm();
-                self.workbench_leader(keybindings::normalize_leader_key(event))
+            Msg::KeyWithText { key: event, text } => {
+                self.transfer_keyboard(event, Some(text.as_deref()))
             }
-            Msg::Key(event) if key::LEADER.matches(event) => {
-                self.which_key.arm();
-                WorkbenchAction::Consumed
-            }
-            Msg::Key(event) => self.workbench.handle_key(event),
+            Msg::Key(event) => self.transfer_keyboard(event, None),
             Msg::Mouse(event) => self.workbench.handle_mouse(event),
             Msg::Paste(text) => {
                 self.workbench.paste(&text);
@@ -503,6 +500,44 @@ impl App {
             Msg::Agent(_) => WorkbenchAction::Consumed,
         };
         self.handle_workbench_action(action)
+    }
+
+    fn transfer_keyboard(
+        &mut self,
+        event: KeyEvent,
+        text: Option<Option<&str>>,
+    ) -> WorkbenchAction {
+        if event.kind == KeyEventKind::Release || matches!(event.code, KeyCode::Modifier(_)) {
+            return WorkbenchAction::Consumed;
+        }
+        if self.which_key.is_armed() {
+            if event.kind != KeyEventKind::Press {
+                return WorkbenchAction::Consumed;
+            }
+            let Some(event) = text_field::command_key(event, text) else {
+                return WorkbenchAction::Consumed;
+            };
+            self.which_key.disarm();
+            return self.workbench_leader(keybindings::normalize_leader_key(event));
+        }
+        if key::LEADER.matches(event) {
+            if event.kind == KeyEventKind::Press {
+                self.which_key.arm();
+            }
+            return WorkbenchAction::Consumed;
+        }
+        if let Some(text) = text_field::keyboard_text(event, text)
+            && self.workbench.text_input_active()
+        {
+            if !text.is_empty() {
+                self.workbench.handle_text(text, false);
+            }
+            return WorkbenchAction::Consumed;
+        }
+        let Some(event) = text_field::command_key(event, text) else {
+            return WorkbenchAction::Consumed;
+        };
+        self.workbench.handle_key(event)
     }
 }
 
@@ -914,6 +949,32 @@ mod tests {
         assert!(app.sandbox_live.snapshot.is_none());
         assert!(app.sandbox_live.scope.is_none());
         assert!(app.sandbox_live.transfer.is_none());
+    }
+
+    #[test_case(None; "absent_text")]
+    #[test_case(Some(""); "empty_text")]
+    #[test_case(Some("12"); "multiple_scalars")]
+    fn enhanced_transfer_leader_waits_for_a_command(text: Option<&str>) {
+        let mut app = attached();
+        assert!(app.workbench.open_transfer());
+        app.which_key.arm();
+        app.transfer_keyboard(
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+            Some(text),
+        );
+        assert!(app.which_key.is_armed());
+        assert!(app.workbench.transfer_input_active());
+        let action = app.transfer_keyboard(
+            KeyEvent::new(KeyCode::Char('&'), KeyModifiers::SHIFT),
+            Some(Some("1")),
+        );
+        assert!(!app.which_key.is_armed());
+        assert_eq!(
+            action,
+            WorkbenchAction::Transfer(TransferAction::Cancel {
+                generation: app.workbench.transfer_generation(),
+            })
+        );
     }
 
     #[test]

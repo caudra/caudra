@@ -397,6 +397,7 @@ pub(super) enum PendingInput {
 
 pub enum Msg {
     Key(KeyEvent),
+    KeyWithText { key: KeyEvent, text: Option<String> },
     Paste(String),
     Mouse(MouseEvent),
     Scroll { column: u16, row: u16, delta: i32 },
@@ -1639,6 +1640,10 @@ impl App {
     }
 
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
+        if matches!(&msg, Msg::Key(key) | Msg::KeyWithText { key, .. } if matches!(key.code, KeyCode::Modifier(_)))
+        {
+            return vec![];
+        }
         self.sync_execution_mode();
         if crate::sandbox::transfer::active() && !matches!(msg, Msg::Agent(_)) {
             return self.transfer_input(msg);
@@ -1648,7 +1653,11 @@ impl App {
                 self.tooltip
                     .pointer_moved(Position::new(event.column, event.row));
             }
-            Msg::Key(_) | Msg::Paste(_) | Msg::Mouse(_) | Msg::Scroll { .. } => {
+            Msg::Key(_)
+            | Msg::KeyWithText { .. }
+            | Msg::Paste(_)
+            | Msg::Mouse(_)
+            | Msg::Scroll { .. } => {
                 self.tooltip.dismiss();
             }
             _ => {}
@@ -1661,6 +1670,11 @@ impl App {
                 // it.
                 self.thinking_picker.clear_flash();
                 self.handle_key(key)
+            }
+            Msg::KeyWithText { key, text } => {
+                self.autoscroll = None;
+                self.thinking_picker.clear_flash();
+                self.handle_keyboard(key, Some(text.as_deref()))
             }
             Msg::Paste(text) => {
                 if self.mode_submission.is_open()
@@ -1849,7 +1863,11 @@ impl App {
     }
 
     pub(super) fn permission_prompt_key(&mut self, key: KeyEvent) {
-        if let Some(decision) = self.permission_prompt.handle_key(key) {
+        self.permission_prompt_keyboard(key, None);
+    }
+
+    fn permission_prompt_keyboard(&mut self, key: KeyEvent, text: Option<Option<&str>>) {
+        if let Some(decision) = self.permission_prompt.handle_keyboard(key, text) {
             self.apply_permission_decision(decision);
         }
         if let Some(text) = self.permission_prompt.take_copied() {
@@ -2203,27 +2221,56 @@ impl App {
         }
     }
 
-    fn dispatch_overlay(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+    fn dispatch_overlay(
+        &mut self,
+        key: KeyEvent,
+        text: Option<Option<&str>>,
+    ) -> Option<Vec<Action>> {
+        let generated = text_field::keyboard_text(key, text);
+        let physical_key = key;
+        let command_key = text_field::command_key(key, text);
+        let key = command_key.unwrap_or(key);
+        macro_rules! keyboard_text {
+            ($owner:ident, $editing:expr) => {
+                if $editing && let Some(text) = generated {
+                    if !text.is_empty() {
+                        self.$owner.handle_text(text, false);
+                    }
+                    return Some(vec![]);
+                }
+            };
+        }
         if self.mode_submission.is_open()
             && !self.permission_prompt_holds_input()
             && !self.question_form.is_open()
         {
+            if command_key.is_none() {
+                return Some(vec![]);
+            }
             let action = self.mode_submission.handle_key(key);
             return Some(self.handle_mode_submission(action));
         }
         if self.sandbox_manager.is_open() {
+            keyboard_text!(sandbox_manager, self.sandbox_manager.text_input_active());
+            if command_key.is_none() {
+                return Some(vec![]);
+            }
             let action = self.sandbox_manager.handle_key(key);
             self.handle_sandbox_action(action);
             return Some(vec![]);
         }
         macro_rules! guard_repeat {
             ($editing:expr) => {
+                if command_key.is_none() {
+                    return Some(vec![]);
+                }
                 if key.kind == KeyEventKind::Repeat && !Self::repeat_key_allowed(key, $editing) {
                     return Some(vec![]);
                 }
             };
         }
         if self.paste_editor.is_open() {
+            keyboard_text!(paste_editor, true);
             guard_repeat!(true);
             match self.paste_editor.handle_key(key) {
                 PasteEditorAction::Consumed => {}
@@ -2245,7 +2292,7 @@ impl App {
         }
 
         if self.peer_manager.is_open() {
-            let action = self.peer_manager.handle_key(key);
+            let action = self.peer_manager.handle_keyboard(physical_key, text);
             return Some(self.handle_peer_manager_action(action));
         }
 
@@ -2278,6 +2325,7 @@ impl App {
         }
 
         if self.logs_modal.is_open() {
+            keyboard_text!(logs_modal, self.logs_modal.text_input_active());
             guard_repeat!(self.logs_modal.text_input_active());
             let action = self.logs_modal.handle_key(key);
             self.handle_logs_action(action);
@@ -2285,6 +2333,7 @@ impl App {
         }
 
         if self.docs_modal.is_open() {
+            keyboard_text!(docs_modal, self.docs_modal.text_input_active());
             guard_repeat!(self.docs_modal.text_input_active());
             let action = self.docs_modal.handle_key(key);
             return Some(self.handle_docs_action(action));
@@ -2361,6 +2410,7 @@ impl App {
         }
 
         if self.stream_modal.is_open() {
+            keyboard_text!(stream_modal, self.stream_modal.text_input_active());
             guard_repeat!(self.stream_modal.text_input_active());
             match self.stream_modal.handle_key(key) {
                 StreamAction::Ignored | StreamAction::Consumed => {}
@@ -2371,6 +2421,10 @@ impl App {
         }
 
         if Overlay::is_open(&self.float_mgr) {
+            if let Some(text) = generated {
+                self.float_mgr.handle_keyboard_text(text);
+                return Some(vec![]);
+            }
             guard_repeat!(false);
         }
         if self.float_mgr.handle_key(key) {
@@ -2378,18 +2432,32 @@ impl App {
         }
 
         if self.search_modal.is_open() {
+            if let Some(text) = generated {
+                if !text.is_empty() {
+                    self.search_modal.handle_text(text, false);
+                    let chat = &mut self.chats[self.active_chat];
+                    let texts = chat.segment_search_texts();
+                    self.search_modal.update_matches(&texts);
+                    sync_search_highlight(&self.search_modal, chat);
+                }
+                return Some(vec![]);
+            }
             guard_repeat!(true);
             let action = self.search_modal.handle_key(key);
             return Some(self.handle_search_action(action));
         }
 
         if self.file_picker.is_open() {
+            keyboard_text!(file_picker, true);
             guard_repeat!(true);
             let action = self.file_picker.handle_key(key);
             return Some(self.handle_file_picker_action(action));
         }
 
         if self.queue_editor_active() {
+            if let Some(text) = generated {
+                return Some(self.composer_keyboard_text(text));
+            }
             guard_repeat!(true);
             return Some(self.handle_queue_editor_key(key));
         }
@@ -2397,6 +2465,7 @@ impl App {
         // Ahead of the focused queue itself: the menu is drawn over the panel
         // it acts on, so it answers first.
         if self.queue_actions.is_open() {
+            keyboard_text!(queue_actions, true);
             guard_repeat!(false);
             let action = self.queue_actions.handle_key(key);
             return Some(self.handle_queue_actions_action(action));
@@ -2461,18 +2530,21 @@ impl App {
         }
 
         if self.rewind_picker.is_open() {
+            keyboard_text!(rewind_picker, true);
             guard_repeat!(false);
             let action = self.rewind_picker.handle_key(key);
             return Some(self.handle_rewind_picker_action(action));
         }
 
         if self.message_actions.is_open() {
+            keyboard_text!(message_actions, true);
             guard_repeat!(false);
             let action = self.message_actions.handle_key(key);
             return Some(self.handle_message_actions_action(action));
         }
 
         if self.review.is_open() {
+            keyboard_text!(review, self.review.text_input_active());
             guard_repeat!(self.review.text_input_active());
             let action = self.review.handle_key(key);
             // The note editor hands back only the chord it must not swallow, so
@@ -2484,48 +2556,59 @@ impl App {
         }
 
         if self.command_modal.is_open() {
+            keyboard_text!(command_modal, true);
             guard_repeat!(true);
             let action = self.command_modal.handle_key(key);
             return Some(self.handle_command_modal_action(action));
         }
 
         if self.theme_picker.is_open() {
+            keyboard_text!(theme_picker, true);
             guard_repeat!(false);
             let action = self.theme_picker.handle_key(key);
             return Some(self.handle_theme_picker_action(action));
         }
 
         if self.prompt_profile_picker.is_open() {
+            keyboard_text!(prompt_profile_picker, true);
             guard_repeat!(false);
             let action = self.prompt_profile_picker.handle_key(key);
             return Some(self.handle_prompt_profile_picker_action(action));
         }
 
         if self.thinking_picker.is_open() {
+            keyboard_text!(thinking_picker, true);
             guard_repeat!(false);
             let action = self.thinking_picker.handle_key(key);
             return Some(self.handle_thinking_picker_action(action));
         }
 
         if self.model_picker.is_open() {
+            keyboard_text!(model_picker, self.model_picker.text_key(command_key));
             guard_repeat!(false);
             let action = self.model_picker.handle_key(key);
             return Some(self.handle_model_picker_action(action));
         }
 
         if self.login_picker.is_open() {
+            keyboard_text!(login_picker, true);
             guard_repeat!(self.login_picker.text_input_active());
             let action = self.login_picker.handle_key(key);
             return Some(self.handle_login_picker_action(action));
         }
 
         if self.mcp_picker.is_open() {
+            keyboard_text!(mcp_picker, self.mcp_picker.text_key(command_key));
             guard_repeat!(false);
             let action = self.mcp_picker.handle_key(key);
             return Some(self.handle_mcp_picker_action(action));
         }
 
         if self.permissions_picker.is_open() {
+            keyboard_text!(
+                permissions_picker,
+                self.permissions_picker.text_input_active()
+            );
             guard_repeat!(
                 self.permissions_picker
                     .editor_mut()
@@ -2536,6 +2619,7 @@ impl App {
         }
 
         if self.stash_picker.is_open() {
+            keyboard_text!(stash_picker, true);
             guard_repeat!(false);
             let action = self.stash_picker.handle_key(key);
             return Some(self.handle_stash_picker_action(action));
@@ -2543,6 +2627,13 @@ impl App {
 
         if self.question_form.is_open() {
             let typing = self.question_form.text_input_active();
+            if typing && let Some(text) = generated {
+                self.claim_question_form();
+                if !text.is_empty() {
+                    self.question_form.handle_text(text, false);
+                }
+                return Some(vec![]);
+            }
             guard_repeat!(typing);
             // The form is docked, not modal: keys that only move the
             // transcript keep working while it waits for an answer, except
@@ -2556,46 +2647,88 @@ impl App {
             return Some(self.handle_question_form_action(action));
         }
         if self.session_picker.is_open() {
+            keyboard_text!(session_picker, true);
             guard_repeat!(true);
             let action = self.session_picker.handle_key(key);
             return Some(self.handle_session_picker_action(action));
         }
         if self.session_relocation_picker.is_open() {
+            keyboard_text!(
+                session_relocation_picker,
+                self.session_relocation_picker.text_input_active()
+            );
             guard_repeat!(self.session_relocation_picker.text_input_active());
             let action = self.session_relocation_picker.handle_key(key);
             return Some(self.handle_session_relocation_action(action));
         }
         if self.worktree_picker.is_open() {
+            keyboard_text!(worktree_picker, self.worktree_picker.text_input_active());
             guard_repeat!(true);
             let action = self.worktree_picker.handle_key(key);
             return Some(self.handle_worktree_action(action));
         }
         if self.task_picker.is_open() {
+            keyboard_text!(task_picker, true);
             guard_repeat!(false);
             let action = self.task_picker.handle_key(key);
             return Some(self.handle_task_picker_action(action));
         }
         if self.shell_modal.is_open() {
+            keyboard_text!(shell_modal, self.shell_modal.text_input_active());
             guard_repeat!(false);
             let action = self.shell_modal.handle_key(key);
             return Some(self.handle_shell_modal_action(action));
         }
         if self.memory_inspector.is_open() {
+            if self.memory_inspector.text_input_active()
+                && let Some(text) = generated
+            {
+                if !text.is_empty()
+                    && let Some(action) = self.memory_inspector.handle_text(text, false)
+                {
+                    return Some(self.handle_memory_action(action));
+                }
+                return Some(vec![]);
+            }
             guard_repeat!(self.memory_inspector.text_input_active());
             let action = self.memory_inspector.handle_key(key);
             return Some(self.handle_memory_action(action));
         }
         if self.workflow_inspector.is_open() {
+            if self.workflow_inspector.text_input_active()
+                && let Some(text) = generated
+            {
+                if !text.is_empty()
+                    && let Some(action) = self.workflow_inspector.handle_text(text, false)
+                {
+                    return Some(self.handle_workflow_inspector_action(action));
+                }
+                return Some(vec![]);
+            }
             guard_repeat!(self.workflow_inspector.text_input_active());
             let action = self.workflow_inspector.handle_key(key);
             return Some(self.handle_workflow_inspector_action(action));
         }
         if self.workflow_catalog_picker.is_open() {
+            keyboard_text!(
+                workflow_catalog_picker,
+                self.workflow_catalog_picker.text_input_active()
+            );
             guard_repeat!(false);
             let action = self.workflow_catalog_picker.handle_key(key);
             return Some(self.handle_workflow_catalog_action(action));
         }
         if self.automation_inspector.is_open() {
+            if self.automation_inspector.text_input_active()
+                && let Some(text) = generated
+            {
+                if !text.is_empty()
+                    && let Some(action) = self.automation_inspector.handle_text(text, false)
+                {
+                    self.handle_automation_action(action);
+                }
+                return Some(vec![]);
+            }
             guard_repeat!(self.automation_inspector.text_input_active());
             // The editor hands back only the chord it must not swallow, so
             // `Ctrl+C` with nothing selected still reaches the app.
@@ -2614,8 +2747,17 @@ impl App {
         // the keyboard from behind an opaque screen and a permission prompt
         // becomes unanswerable.
         if self.workbench.is_open() {
+            if let Some(text) = generated
+                && self.workbench.text_input_active()
+            {
+                if !text.is_empty() {
+                    self.workbench.handle_text(text, false);
+                }
+                return Some(vec![]);
+            }
             guard_repeat!(self.workbench.text_input_active());
             match self.workbench.handle_key(key) {
+                WorkbenchAction::Passthrough if generated.is_some() => return Some(vec![]),
                 WorkbenchAction::Passthrough => {}
                 action => return Some(self.handle_workbench_action(action)),
             }
@@ -3357,9 +3499,16 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        self.handle_keyboard(key, None)
+    }
+
+    fn handle_keyboard(&mut self, key: KeyEvent, text: Option<Option<&str>>) -> Vec<Action> {
+        if matches!(key.code, KeyCode::Modifier(_)) {
+            return vec![];
+        }
         if self.permission_prompt_holds_input() {
             if key.kind != KeyEventKind::Press || !self.claim_deciding_permission() {
-                self.permission_prompt_key(key);
+                self.permission_prompt_keyboard(key, text);
             }
             return vec![];
         }
@@ -3370,6 +3519,20 @@ impl App {
             if self.permission_mutation_pending() {
                 return vec![];
             }
+            if self
+                .permissions_picker
+                .editor_mut()
+                .is_some_and(|editor| editor.is_editing())
+                && let Some(text) = text_field::keyboard_text(key, text)
+            {
+                if !text.is_empty() {
+                    self.permissions_picker.handle_text(text, false);
+                }
+                return vec![];
+            }
+            let Some(key) = text_field::command_key(key, text) else {
+                return vec![];
+            };
             let action = self.permissions_picker.handle_key(key);
             return self.handle_permissions_picker_action(action);
         }
@@ -3379,7 +3542,7 @@ impl App {
                 return self.handle_peer_manager_action(action);
             }
             KeyEventKind::Release => return vec![],
-            KeyEventKind::Repeat => return self.handle_key_repeat(key),
+            KeyEventKind::Repeat => return self.handle_key_repeat(key, text),
             KeyEventKind::Press => {}
         }
         #[cfg(debug_assertions)]
@@ -3396,14 +3559,22 @@ impl App {
         // Ahead of the overlays: a pending chord owns the next key outright, so
         // it can never leak into the composer or a picker behind the panel.
         if self.which_key.is_armed() {
+            let Some(key) = text_field::command_key(key, text) else {
+                return vec![];
+            };
             self.which_key.disarm();
             return self.resolve_leader(keybindings::normalize_leader_key(key));
         }
 
-        if let Some(actions) = self.dispatch_overlay(key) {
+        if let Some(actions) = self.dispatch_overlay(key, text) {
             self.last_exit = None;
             return actions;
         }
+
+        let generated = text_field::keyboard_text(key, text);
+        let Some(key) = text_field::command_key(key, text) else {
+            return generated.map_or_else(Vec::new, |text| self.composer_keyboard_text(text));
+        };
 
         // After the overlays, so the workbench editor keeps `Ctrl+X` for a cut
         // whenever there is a selection to cut.
@@ -3421,6 +3592,10 @@ impl App {
 
         if let Some(actions) = self.handle_global_key(key) {
             return actions;
+        }
+
+        if let Some(text) = generated {
+            return self.composer_keyboard_text(text);
         }
 
         // Anything the transcript did not claim is on its way to the composer,
@@ -3477,15 +3652,21 @@ impl App {
         self.handle_main_chat_key(key)
     }
 
-    fn handle_key_repeat(&mut self, key: KeyEvent) -> Vec<Action> {
+    fn handle_key_repeat(&mut self, key: KeyEvent, text: Option<Option<&str>>) -> Vec<Action> {
         if self.which_key.is_armed() {
             return vec![];
         }
         self.clear_selection_unless_pending_copy();
         self.sync_subagent_input_target();
-        if let Some(actions) = self.dispatch_overlay(key) {
+        if let Some(actions) = self.dispatch_overlay(key, text) {
             return actions;
         }
+        if let Some(text) = text_field::keyboard_text(key, text) {
+            return self.composer_keyboard_text(text);
+        }
+        let Some(key) = text_field::command_key(key, text) else {
+            return vec![];
+        };
         if self.scroll_transcript(key)
             || !self.composer_is_interactive()
             || !Self::repeat_key_allowed(key, true)
@@ -3505,6 +3686,18 @@ impl App {
         } else {
             self.handle_subagent_chat_key(key)
         }
+    }
+
+    fn composer_keyboard_text(&mut self, text: &str) -> Vec<Action> {
+        if self.composer_is_interactive() && !text.is_empty() {
+            self.key_focus = KeyFocus::Composer;
+            if let InputAction::PaletteSync(value) =
+                self.active_input_box_mut().handle_keyboard_text(text)
+            {
+                self.sync_dropdowns(&value);
+            }
+        }
+        vec![]
     }
 
     /// A held key keeps acting when holding it means something: a navigation

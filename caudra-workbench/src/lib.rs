@@ -1940,8 +1940,12 @@ impl Workbench {
     /// rendered view takes it only to refuse it, since the composer it would
     /// otherwise reach is hidden behind the workbench.
     pub fn paste(&mut self, text: &str) -> bool {
+        self.handle_text(text, true)
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) -> bool {
         if self.transfer_input_active() {
-            self.transfer.paste(text);
+            self.transfer.handle_text(text, paste);
             return true;
         }
         if let Some(field) = self.focused_field() {
@@ -1951,7 +1955,10 @@ impl Workbench {
                 }
                 _ => Cow::Borrowed(text),
             };
-            if let Some(pasted) = self.field_mut(field).map(|typing| typing.paste(&text)) {
+            if let Some(pasted) = self
+                .field_mut(field)
+                .map(|typing| typing.handle_text(&text, paste))
+            {
                 self.typed(field, pasted);
             }
             return true;
@@ -1974,9 +1981,21 @@ impl Workbench {
         if !tab.is_editable() {
             return false;
         }
+        if text.is_empty() {
+            return true;
+        }
+        let before = tab.revision();
         let edit = tab.buffer.insert(text);
         tab.record(edit);
-        tab.break_undo_group();
+        if tab.revision() != before {
+            tab.preview = false;
+            if tab.find.is_open() {
+                tab.refresh_find();
+            }
+        }
+        if paste {
+            tab.break_undo_group();
+        }
         self.follow_cursor();
         true
     }
@@ -5949,15 +5968,22 @@ mod tests {
         assert_eq!(workbench.editor.tabs().len(), 2, "{PREVIEW_TOOK_OVER}");
     }
 
-    #[test]
-    fn typing_in_a_preview_keeps_the_tab_it_was_shown_in() {
+    #[test_case(None; "legacy_key")]
+    #[test_case(Some(false); "generated_text")]
+    #[test_case(Some(true); "paste")]
+    fn typing_in_a_preview_keeps_the_tab_it_was_shown_in(paste: Option<bool>) {
         let (_dir, mut workbench) = project();
         paint(&mut workbench, 80, 24);
         let rows = list_rows(&workbench);
         let body = row_body(rows);
         workbench.handle_mouse(click(body, rows.y + 1));
         workbench.handle_key(key(KeyCode::Tab));
-        workbench.handle_key(key(KeyCode::Char('x')));
+        if let Some(paste) = paste {
+            workbench.handle_text("x", paste);
+        } else {
+            workbench.handle_key(key(KeyCode::Char('x')));
+        }
+        assert!(!workbench.editor.active().expect(NO_TAB).preview);
 
         workbench.handle_mouse(click(body, rows.y));
         workbench.handle_mouse(click(body, rows.y + 1));

@@ -12,7 +12,7 @@ use caudra_config::InboundPolicy;
 use caudra_grab::grab_scope;
 use caudra_providers::PEER_SCRIPT_SENDER;
 use caudra_storage::sessions::StoredPeerControls;
-use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
+use caudra_workbench::text_field::{FieldKind, TextField, TextKey, command_key, keyboard_text};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -1584,10 +1584,32 @@ impl PeerManager {
     }
 
     pub fn handle_key(&mut self, event: KeyEvent) -> PeerManagerAction {
-        let fresh = self.freshness.accept(event);
+        self.handle_keyboard(event, None)
+    }
+
+    pub(crate) fn handle_keyboard(
+        &mut self,
+        event: KeyEvent,
+        text: Option<Option<&str>>,
+    ) -> PeerManagerAction {
+        if matches!(event.code, KeyCode::Modifier(_)) {
+            return PeerManagerAction::Consumed;
+        }
+        let fresh = event.code != KeyCode::Null && self.freshness.accept(event);
         if !self.open || event.kind == KeyEventKind::Release {
             return PeerManagerAction::Consumed;
         }
+        if (self.filter_focused || self.field_focused())
+            && let Some(text) = keyboard_text(event, text)
+        {
+            if !text.is_empty() {
+                self.handle_text(text, false);
+            }
+            return PeerManagerAction::Consumed;
+        }
+        let Some(event) = command_key(event, text) else {
+            return PeerManagerAction::Consumed;
+        };
         if self.filter_focused {
             if event.kind == KeyEventKind::Repeat
                 && matches!(event.code, KeyCode::Esc | KeyCode::Enter)
@@ -1744,17 +1766,23 @@ impl PeerManager {
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
+        self.handle_text(text, true)
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) -> bool {
         if !self.open {
             return false;
         }
         if self.filter_focused {
-            self.browser_mut().filter.paste(&literal(text, false));
+            self.browser_mut()
+                .filter
+                .handle_text(&literal(text, false), paste);
             self.browser_mut().offset = 0;
             self.invalidate_layout();
         } else if self.field_focused()
             && let Some(panel) = &mut self.panel
         {
-            panel.field.paste(&literal(text, false));
+            panel.field.handle_text(&literal(text, false), paste);
             panel.error = None;
             self.invalidate_layout();
         }
@@ -4700,6 +4728,41 @@ mod tests {
     }
 
     #[test]
+    fn enhanced_shift_tab_moves_backwards_through_the_panel_and_field() {
+        let mut manager = session_panel(&[PATTERN]);
+        assert_eq!(panel(&manager).focus, PanelFocus::Policy);
+        let backwards = KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT);
+        manager.handle_keyboard(backwards, Some(None));
+        assert_eq!(panel(&manager).focus, PanelFocus::Field);
+        manager.handle_keyboard(backwards, Some(None));
+        assert_eq!(panel(&manager).focus, PanelFocus::Broadcasts);
+    }
+
+    #[test_case(false; "pattern_field")]
+    #[test_case(true; "filter")]
+    fn enhanced_text_reaches_fields_before_command_mapping(filter: bool) {
+        let mut manager = session_panel(&[PATTERN]);
+        if filter {
+            manager.panel = None;
+            manager.filter_focused = true;
+        } else {
+            for _ in 0..PATTERN_FIELD_TABS {
+                manager.handle_key(press(KeyCode::Tab));
+            }
+        }
+        let physical = press(KeyCode::Char('y'));
+        manager.handle_keyboard(physical, Some(Some(ADDED)));
+        manager.handle_keyboard(press(KeyCode::Char('\'')), Some(None));
+        let text = if filter {
+            manager.browser().filter.text()
+        } else {
+            panel(&manager).field.text()
+        };
+        assert_eq!(text, ADDED);
+        assert_eq!(manager.active, PeerView::Held);
+    }
+
+    #[test]
     fn escape_clears_the_field_before_leaving_the_panel() {
         let mut manager = session_panel(&[PATTERN]);
         for _ in 0..PATTERN_FIELD_TABS {
@@ -4943,7 +5006,9 @@ mod tests {
         };
         use caudra_config::InboundPolicy;
         use caudra_storage::{id::CaudraId, sessions::PermissionMode};
-        use crossterm::event::{KeyCode, KeyEventKind, MouseButton, MouseEventKind};
+        use crossterm::event::{
+            KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+        };
         use tempfile::TempDir;
         use test_case::test_case;
 
@@ -5038,6 +5103,48 @@ mod tests {
                 manager.handle_key(repeat),
                 PeerManagerAction::Consumed
             ));
+        }
+
+        #[test_case(KeyCode::Char('y'), KeyModifiers::NONE, None, false; "no_text")]
+        #[test_case(KeyCode::Char('y'), KeyModifiers::NONE, Some(""), false; "empty_text")]
+        #[test_case(KeyCode::Char('y'), KeyModifiers::NONE, Some("yes"), false; "multiple_scalars")]
+        #[test_case(KeyCode::Char('y'), KeyModifiers::NONE, Some("x"), false; "different_character")]
+        #[test_case(KeyCode::Char('y'), KeyModifiers::CONTROL.union(KeyModifiers::ALT), Some("y"), false; "altgr")]
+        #[test_case(KeyCode::Null, KeyModifiers::NONE, Some("y"), false; "no_physical_key")]
+        #[test_case(KeyCode::Char('y'), KeyModifiers::NONE, Some("y"), true; "generated_approval")]
+        #[test_case(KeyCode::Char('x'), KeyModifiers::SHIFT, Some("y"), true; "mapped_approval_keeps_physical_identity")]
+        fn enhanced_review_approval_uses_generated_text(
+            code: KeyCode,
+            modifiers: KeyModifiers,
+            text: Option<&str>,
+            approves: bool,
+        ) {
+            let (_directory, _host, receiver, mut manager) = reviewing();
+            let physical = KeyEvent::new(code, modifiers);
+            let action = manager.handle_keyboard(physical, Some(text));
+            if approves {
+                let PeerManagerAction::Decide { token, decision } = action else {
+                    panic!("expected an exact peer decision");
+                };
+                assert_eq!(decision, PeerDecision::Approve);
+                assert_eq!(manager.freshness.blocked, Some(code));
+                assert_eq!(manager.freshness.last, Some(code));
+                manager.handle_keyboard(
+                    KeyEvent {
+                        kind: KeyEventKind::Release,
+                        ..physical
+                    },
+                    Some(None),
+                );
+                assert_eq!(manager.freshness.blocked, None);
+                assert_eq!(manager.freshness.last, None);
+                manager.finish_decision(receiver.decide_held(&token, decision));
+                assert!(receiver.has_pending());
+            } else {
+                assert!(matches!(action, PeerManagerAction::Consumed));
+                assert!(manager.can_decide(true));
+                assert!(!receiver.has_pending());
+            }
         }
 
         #[test]

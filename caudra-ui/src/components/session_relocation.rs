@@ -273,15 +273,19 @@ impl SessionRelocationPicker {
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
+        self.handle_text(text, true)
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) -> bool {
         match self.flow.as_mut().map(|flow| &mut flow.stage) {
             Some(Stage::Custom(field)) => {
-                field.paste(text);
+                field.handle_text(text, paste);
                 self.sync_custom();
                 true
             }
             Some(Stage::Confirm(..)) => true,
             Some(_) => {
-                let handled = self.picker.handle_paste(text);
+                let handled = self.picker.handle_text(text, paste);
                 self.sync_selection();
                 handled
             }
@@ -415,12 +419,11 @@ impl SessionRelocationPicker {
         }
     }
 
-    /// Whether keys are typing into the custom directory.
+    /// Whether keys edit a destination or a picker's filter.
     pub fn text_input_active(&self) -> bool {
-        matches!(
-            self.flow.as_ref().map(|flow| &flow.stage),
-            Some(Stage::Custom(_))
-        )
+        self.flow
+            .as_ref()
+            .is_some_and(|flow| !matches!(flow.stage, Stage::Confirm(..)))
     }
 
     fn preview(&mut self, input: String, donor: Option<(CaudraId, String)>) {

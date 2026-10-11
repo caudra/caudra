@@ -15,7 +15,7 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 use caudra_highlight::TAB_SPACES;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::style::Style;
 use ratatui::text::Line;
 
@@ -149,6 +149,56 @@ pub fn decode(key: KeyEvent, kind: FieldKind) -> Option<TextCommand> {
         return control_chord(key.code, kind, extend);
     }
     plain_key(key.code, kind, extend)
+}
+
+pub fn keyboard_text(key: KeyEvent, text: Option<Option<&str>>) -> Option<&str> {
+    let text = text?;
+    if key.kind == KeyEventKind::Release
+        || !matches!(key.code, KeyCode::Char(_) | KeyCode::Null)
+        || key
+            .modifiers
+            .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META)
+    {
+        return None;
+    }
+    let chords = key.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT);
+    if key.code != KeyCode::Null
+        && !chords.is_empty()
+        && chords != (KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+    Some(text.unwrap_or_default())
+}
+
+/// Maps enhanced typing to a command character without changing shortcut chords
+/// or the physical identity needed to match releases.
+pub fn command_key(mut key: KeyEvent, text: Option<Option<&str>>) -> Option<KeyEvent> {
+    if text.is_none() || key.kind == KeyEventKind::Release {
+        return Some(key);
+    }
+    if matches!(key.code, KeyCode::Null | KeyCode::Modifier(_)) {
+        return None;
+    }
+    if key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT) {
+        key.code = KeyCode::BackTab;
+    }
+    if let Some(text) = keyboard_text(key, text) {
+        if key
+            .modifiers
+            .contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return None;
+        }
+        let mut characters = text.chars();
+        let character = characters.next()?;
+        if character.is_control() || characters.next().is_some() {
+            return None;
+        }
+        key.code = KeyCode::Char(character);
+        key.modifiers.remove(KeyModifiers::SHIFT);
+    }
+    Some(key)
 }
 
 /// `Shift+Enter`, `Ctrl+Enter` and `Ctrl+J`, the keys that break a line in a
@@ -451,10 +501,18 @@ impl TextField {
 
     /// A paste, which undo takes back in one step of its own.
     pub fn paste(&mut self, text: &str) -> TextKey {
-        self.history.break_group();
-        let pasted = self.insert_text(text);
-        self.history.break_group();
-        pasted
+        self.handle_text(text, true)
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) -> TextKey {
+        if paste {
+            self.history.break_group();
+        }
+        let outcome = self.insert_text(text);
+        if paste {
+            self.history.break_group();
+        }
+        outcome
     }
 
     pub fn undo(&mut self) -> bool {
@@ -676,14 +734,14 @@ fn paint_placeholder(
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, ModifierKeyCode};
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::Line;
     use test_case::test_case;
 
     use super::{
         Cursor, EditCommand, FieldKind, FieldStyles, Motion, TextCommand, TextField, TextKey,
-        decode, is_newline_key,
+        command_key, decode, is_newline_key, keyboard_text,
     };
     use crate::keys::{self, Bind};
 
@@ -697,6 +755,7 @@ mod tests {
     const BIND_DRIFT: &str = "a documented chord no longer decodes to the command it names";
     const LEAKED_SECRET: &str = "a secret field handed its text out";
     const CARET_HIDDEN: &str = "the caret must stay on screen";
+    const GENERATED_TEXT: &str = "é東京";
 
     fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -967,6 +1026,74 @@ mod tests {
         field.undo();
 
         assert_eq!(field.text(), "a", "{WRONG_TEXT}");
+    }
+
+    #[test_case(false, ""; "keyboard_typing_shares_the_undo_group")]
+    #[test_case(true, "a"; "bracketed_paste_is_a_separate_undo_group")]
+    fn text_origin_preserves_undo_semantics(paste: bool, remaining: &str) {
+        let mut field = field(LINE, "");
+        field.handle_key(plain(KeyCode::Char('a')));
+        field.handle_text(GENERATED_TEXT, paste);
+        assert_eq!(field.text(), format!("a{GENERATED_TEXT}"));
+        field.undo();
+        assert_eq!(field.text(), remaining);
+    }
+
+    #[test]
+    fn generated_text_is_refused_as_a_whole_at_the_field_limit() {
+        let mut field = field(LINE, "").limited_to(GENERATED_TEXT.len() - 1);
+        assert_eq!(field.handle_text(GENERATED_TEXT, false), TextKey::Refused);
+        assert!(field.text().is_empty());
+        assert!(!field.undo());
+    }
+
+    #[test_case(plain(KeyCode::Char('x')), None => None; "legacy_character_is_not_associated_text")]
+    #[test_case(plain(KeyCode::Char('x')), Some(None) => Some(""); "dead_key_has_no_character_fallback")]
+    #[test_case(shift(KeyCode::Char('x')), Some(Some("X")) => Some("X"); "shift_does_not_change_physical_identity")]
+    #[test_case(ctrl(KeyCode::Char('a')), Some(Some("a")) => None; "control_shortcut_is_preserved")]
+    #[test_case(press(KeyCode::Char('a'), KeyModifiers::ALT), Some(Some("a")) => None; "alt_shortcut_is_preserved")]
+    #[test_case(press(KeyCode::Char('q'), KeyModifiers::CONTROL.union(KeyModifiers::ALT)), Some(Some("@")) => Some("@"); "altgr_text_is_authoritative")]
+    #[test_case(KeyEvent::new_with_kind(KeyCode::Null, KeyModifiers::NONE, KeyEventKind::Release), Some(Some(GENERATED_TEXT)) => None; "release_never_types")]
+    fn associated_text_classification(key: KeyEvent, text: Option<Option<&str>>) -> Option<&str> {
+        keyboard_text(key, text)
+    }
+
+    #[test_case(plain(KeyCode::Char('y')), None => Some(plain(KeyCode::Char('y'))); "legacy_character")]
+    #[test_case(shift(KeyCode::Tab), None => Some(shift(KeyCode::Tab)); "legacy_tab")]
+    #[test_case(plain(KeyCode::Char('y')), Some(None) => None; "no_generated_text")]
+    #[test_case(plain(KeyCode::Char('y')), Some(Some("")) => None; "empty_generated_text")]
+    #[test_case(plain(KeyCode::Char('y')), Some(Some("\n")) => None; "control_scalar")]
+    #[test_case(plain(KeyCode::Char('y')), Some(Some(GENERATED_TEXT)) => None; "multiple_scalars")]
+    #[test_case(plain(KeyCode::Char('y')), Some(Some("e\u{301}")) => None; "one_grapheme_multiple_scalars")]
+    #[test_case(plain(KeyCode::Char('y')), Some(Some("x")) => Some(plain(KeyCode::Char('x'))); "generated_character_wins")]
+    #[test_case(plain(KeyCode::Char('y')), Some(Some("é")) => Some(plain(KeyCode::Char('é'))); "one_unicode_scalar")]
+    #[test_case(shift(KeyCode::Char('/')), Some(Some("?")) => Some(plain(KeyCode::Char('?'))); "shifted_character")]
+    #[test_case(shift(KeyCode::Tab), Some(None) => Some(shift(KeyCode::BackTab)); "enhanced_shift_tab")]
+    #[test_case(plain(KeyCode::Enter), Some(None) => Some(plain(KeyCode::Enter)); "non_character")]
+    #[test_case(plain(KeyCode::Null), Some(Some("y")) => None; "text_without_physical_key")]
+    #[test_case(plain(KeyCode::Modifier(ModifierKeyCode::LeftShift)), Some(Some("y")) => None; "modifier")]
+    #[test_case(press(KeyCode::Char('y'), KeyModifiers::CONTROL.union(KeyModifiers::ALT)), Some(Some("y")) => None; "altgr_never_commands")]
+    fn enhanced_command_mapping(key: KeyEvent, text: Option<Option<&str>>) -> Option<KeyEvent> {
+        command_key(key, text)
+    }
+
+    #[test_case(KeyModifiers::CONTROL; "control")]
+    #[test_case(KeyModifiers::ALT; "alt")]
+    #[test_case(KeyModifiers::SUPER; "super_modifier")]
+    #[test_case(KeyModifiers::HYPER; "hyper")]
+    #[test_case(KeyModifiers::META; "meta")]
+    #[test_case(KeyModifiers::ALT.union(KeyModifiers::SHIFT); "shift_alt")]
+    fn enhanced_shortcuts_ignore_generated_text(modifiers: KeyModifiers) {
+        let key = press(KeyCode::Char('x'), modifiers);
+        assert_eq!(command_key(key, Some(Some("y"))), Some(key));
+        assert_eq!(command_key(key, Some(None)), Some(key));
+    }
+
+    #[test_case(KeyCode::Char('/'); "character")]
+    #[test_case(KeyCode::Tab; "tab")]
+    fn enhanced_releases_keep_the_physical_key(code: KeyCode) {
+        let key = KeyEvent::new_with_kind(code, KeyModifiers::SHIFT, KeyEventKind::Release);
+        assert_eq!(command_key(key, Some(Some("?"))), Some(key));
     }
 
     #[test]

@@ -392,6 +392,7 @@ pub struct FloatConfigPatch {
 
 pub enum WinEvent {
     Key { key: String },
+    Text { text: String },
     Resize { width: u16, height: u16 },
     Paste { text: String },
     Close,

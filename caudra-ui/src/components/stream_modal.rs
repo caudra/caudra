@@ -718,10 +718,14 @@ impl StreamModal {
 
     /// A paste lands in the input, flattened to the one line it has.
     pub fn handle_paste(&mut self, text: &str) -> bool {
+        self.handle_text(text, true)
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) -> bool {
         if !self.text_input_active() {
             return false;
         }
-        self.input.paste(text);
+        self.input.handle_text(text, paste);
         true
     }
 

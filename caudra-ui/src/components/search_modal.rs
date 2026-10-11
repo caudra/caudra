@@ -131,7 +131,11 @@ impl SearchModal {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
-        self.search.paste(text);
+        self.handle_text(text, true)
+    }
+
+    pub fn handle_text(&mut self, text: &str, paste: bool) {
+        self.search.handle_text(text, paste);
         self.invalidate_mouse_geometry();
     }
 
