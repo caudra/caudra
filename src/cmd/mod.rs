@@ -20,9 +20,8 @@ use std::sync::Arc;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
-use caudra_agent::herdr::{HerdrEnv, herdr_skill};
 use caudra_agent::tools::ToolRegistry;
-use caudra_agent::tools::native::skill::install_builtin_skill;
+use caudra_agent::tools::native::skill::{host_skill, install_builtin_skill};
 use caudra_config::config_file::{
     self, ConfigFileError, global_init_lua_path, project_init_lua_path,
 };
@@ -369,8 +368,9 @@ fn reconcile_worktrees(storage: &StateDir, cwd: &Path) -> Vec<String> {
 /// effect, and how an experiment that is off keeps its authoring skill out of
 /// sight. The `caudra-plugin-dev` skill is rendered from the live Lua API
 /// docs, so only `caudra-lua` can build it, and `caudra-docs` reads the user
-/// docs this binary embeds. The `herdr` skill exists only inside a Herdr pane,
-/// the one place its CLI reaches a session.
+/// docs this binary embeds. A terminal host's skill, such as `herdr` or
+/// `orca`, exists only inside that host, the one place its CLI reaches a
+/// session.
 fn configure_native_tools(agent: &AgentConfig) {
     if agent.builtin_skills.plugin_dev && agent.features.enabled(Feature::LuaPlugins) {
         install_builtin_skill(caudra_lua::docs_render::plugin_dev_skill());
@@ -384,8 +384,8 @@ fn configure_native_tools(agent: &AgentConfig) {
     if agent.builtin_skills.docs {
         install_builtin_skill(docs::skill());
     }
-    if let Some(herdr) = HerdrEnv::detect() {
-        install_builtin_skill(herdr_skill(herdr));
+    if let Some(skill) = caudra_terminal_host::detect().and_then(|host| host.skill()) {
+        install_builtin_skill(host_skill(skill));
     }
     caudra_agent::tools::native::task::set_max_concurrent(agent.task_max_concurrent);
 }

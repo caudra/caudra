@@ -101,9 +101,9 @@ version = 1
 # touch = "auto"
 
 # Terminal notification method: auto, osc9, bell, or off. Auto reports OSC 7501
-# program status when supported, otherwise uses OSC 9 or BEL. Native Herdr
-# reporting takes precedence in a Herdr pane. Explicit osc9, bell, and off skip
-# program status detection.
+# program status when supported, otherwise uses OSC 9 or BEL. Native Herdr or
+# Orca reporting takes precedence in their panes. Explicit osc9, bell, and off
+# skip program status detection.
 # Type: string.
 # notifications = "auto"
 
@@ -909,7 +909,8 @@ version = 1
 [worktrees]
 
 # What creates and removes worktrees for `/worktree`: `auto` uses Herdr inside
-# a Herdr pane and git elsewhere, `git` always runs git.
+# a Herdr pane, Orca inside an Orca terminal, and git elsewhere, `git` always
+# runs git.
 # Type: string.
 # backend = "auto"
 

@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-use std::env;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,17 +6,16 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use super::cli::{HerdrCli, HerdrError};
+use super::HOST;
+use super::cli::HerdrCli;
 use super::env::HerdrEnv;
+use crate::error::HostError;
+use crate::status::PaneMetadata;
 
 pub const SOURCE: &str = "custom:caudra";
 pub const AGENT: &str = "caudra";
-/// What a restored pane types into its shell. Herdr accepts only a bare command
-/// name there, so this is the name Caudra is installed under.
-pub const RESUME_COMMAND: &str = "caudra";
 /// How Herdr refuses to remove a workspace it did not open as a worktree.
 pub const NOT_LINKED_WORKTREE: &str = "not_linked_worktree";
-const SESSION_FLAG: &str = "--session";
 const RESUME_SEPARATOR: &str = "--";
 const MODEL_TOKEN: &str = "model";
 const CONTEXT_TOKEN: &str = "context";
@@ -28,8 +25,6 @@ const WORKTREE_TIMEOUT: Duration = Duration::from_secs(600);
 /// Opening a workspace or a pane, or typing into one.
 const LAYOUT_TIMEOUT: Duration = Duration::from_secs(15);
 const SPLIT_DIRECTION: &str = "right";
-/// Linux appends this when a running executable has been replaced or removed.
-const REPLACED_EXE_SUFFIX: &str = " (deleted)";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentState {
@@ -55,34 +50,6 @@ pub struct AgentReport<'a> {
     pub resume: Option<&'a [String]>,
 }
 
-/// What the Herdr sidebar shows for the pane besides its state.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PaneMetadata<'a> {
-    pub title: Cow<'a, str>,
-    pub model: Cow<'a, str>,
-    pub context_percent: Option<u32>,
-}
-
-impl PaneMetadata<'_> {
-    pub fn into_owned(self) -> PaneMetadata<'static> {
-        PaneMetadata {
-            title: Cow::Owned(self.title.into_owned()),
-            model: Cow::Owned(self.model.into_owned()),
-            context_percent: self.context_percent,
-        }
-    }
-}
-
-/// The command that reopens `session`, or starts afresh without one. A session
-/// that was never saved has nothing to reopen.
-pub fn resume_argv(session: Option<&str>) -> Vec<String> {
-    let mut argv = vec![RESUME_COMMAND.to_owned()];
-    if let Some(session) = session {
-        argv.extend([SESSION_FLAG.to_owned(), session.to_owned()]);
-    }
-    argv
-}
-
 /// The pane Caudra runs in, addressed as the agent Herdr tracks there.
 #[derive(Clone, Debug)]
 pub struct HerdrPane {
@@ -98,23 +65,23 @@ impl HerdrPane {
         }
     }
 
-    pub fn report_agent(&self, report: &AgentReport<'_>, seq: u64) -> Result<(), HerdrError> {
+    pub fn report_agent(&self, report: &AgentReport<'_>, seq: u64) -> Result<(), HostError> {
         self.run(report_agent_args(&self.pane_id, report, seq))
     }
 
-    pub fn report_metadata(&self, metadata: &PaneMetadata<'_>, seq: u64) -> Result<(), HerdrError> {
+    pub fn report_metadata(&self, metadata: &PaneMetadata<'_>, seq: u64) -> Result<(), HostError> {
         self.run(report_metadata_args(&self.pane_id, metadata, seq))
     }
 
     /// Tells Herdr the agent left the pane, which also forgets its resume
     /// command.
-    pub fn release_agent(&self, seq: u64) -> Result<(), HerdrError> {
+    pub fn release_agent(&self, seq: u64) -> Result<(), HostError> {
         let mut args = pane_args("release-agent", &self.pane_id);
         push_seq(&mut args, seq);
         self.run(args)
     }
 
-    fn run(&self, args: Vec<OsString>) -> Result<(), HerdrError> {
+    fn run(&self, args: Vec<OsString>) -> Result<(), HostError> {
         self.cli.run(&args, REPORT_TIMEOUT).map(drop)
     }
 }
@@ -228,13 +195,13 @@ impl Opened {
         )
     }
 
-    fn worktree(self) -> Result<OpenedWorktree, HerdrError> {
+    fn worktree(self) -> Result<OpenedWorktree, HostError> {
         match self.workspace() {
             (workspace, Some(worktree)) => Ok(OpenedWorktree {
                 workspace,
                 worktree,
             }),
-            (_, None) => Err(missing_field("worktree")),
+            (_, None) => Err(HostError::missing_field(HOST, "worktree")),
         }
     }
 }
@@ -242,7 +209,7 @@ impl Opened {
 /// The calls behind `/worktree`, which never pass `--trust-repository`: that
 /// has Herdr's git add a `safe.directory` exception.
 impl HerdrCli {
-    pub fn worktree_list(&self, main_root: &Path) -> Result<WorktreeListing, HerdrError> {
+    pub fn worktree_list(&self, main_root: &Path) -> Result<WorktreeListing, HostError> {
         self.call(&worktree_list_args(main_root), WORKTREE_TIMEOUT)
     }
 
@@ -255,7 +222,7 @@ impl HerdrCli {
         main_root: &Path,
         branch: Option<&str>,
         base: &str,
-    ) -> Result<OpenedWorktree, HerdrError> {
+    ) -> Result<OpenedWorktree, HostError> {
         self.call::<Opened>(
             &worktree_create_args(main_root, branch, base),
             WORKTREE_TIMEOUT,
@@ -269,14 +236,14 @@ impl HerdrCli {
         &self,
         main_root: &Path,
         path: &Path,
-    ) -> Result<OpenedWorktree, HerdrError> {
+    ) -> Result<OpenedWorktree, HostError> {
         self.call::<Opened>(&worktree_open_args(main_root, path), WORKTREE_TIMEOUT)?
             .worktree()
     }
 
     /// Removes the checkout open in `workspace_id`, keeping its branch, and
     /// closes the workspace.
-    pub fn worktree_remove(&self, workspace_id: &str, force: bool) -> Result<(), HerdrError> {
+    pub fn worktree_remove(&self, workspace_id: &str, force: bool) -> Result<(), HostError> {
         self.run(&worktree_remove_args(workspace_id, force), WORKTREE_TIMEOUT)
             .map(drop)
     }
@@ -287,7 +254,7 @@ impl HerdrCli {
         self.command(&worktree_remove_args(workspace_id, force))
     }
 
-    pub fn workspace_create(&self, cwd: &Path) -> Result<OpenedWorkspace, HerdrError> {
+    pub fn workspace_create(&self, cwd: &Path) -> Result<OpenedWorkspace, HostError> {
         Ok(self
             .call::<Opened>(&workspace_create_args(cwd), LAYOUT_TIMEOUT)?
             .workspace()
@@ -296,33 +263,33 @@ impl HerdrCli {
 
     /// Opens a pane in `cwd` beside the focused one of `workspace_id`, and
     /// focuses it.
-    pub fn split_workspace(&self, workspace_id: &str, cwd: &Path) -> Result<String, HerdrError> {
+    pub fn split_workspace(&self, workspace_id: &str, cwd: &Path) -> Result<String, HostError> {
         let listing: PaneListing = self.call(&pane_list_args(workspace_id), LAYOUT_TIMEOUT)?;
         let target = listing
             .panes
             .iter()
             .find(|pane| pane.focused)
             .or_else(|| listing.panes.first())
-            .ok_or_else(|| missing_field("panes"))?;
+            .ok_or_else(|| HostError::missing_field(HOST, "panes"))?;
         let answer: PaneAnswer =
             self.call(&pane_split_args(&target.pane_id, cwd), LAYOUT_TIMEOUT)?;
         Ok(answer.pane.pane_id)
     }
 
     /// Types `command_line` into the shell of `pane_id` and presses Enter.
-    pub fn pane_run(&self, pane_id: &str, command_line: &str) -> Result<(), HerdrError> {
+    pub fn pane_run(&self, pane_id: &str, command_line: &str) -> Result<(), HostError> {
         self.run(&pane_run_args(pane_id, command_line), LAYOUT_TIMEOUT)
             .map(drop)
     }
 
     /// Sets the label Herdr shows for `pane_id`.
-    pub fn pane_rename(&self, pane_id: &str, label: &str) -> Result<(), HerdrError> {
+    pub fn pane_rename(&self, pane_id: &str, label: &str) -> Result<(), HostError> {
         self.run(&rename_args("pane", pane_id, label), LAYOUT_TIMEOUT)
             .map(drop)
     }
 
     /// Sets the label Herdr's tab bar shows for `tab_id`.
-    pub fn tab_rename(&self, tab_id: &str, label: &str) -> Result<(), HerdrError> {
+    pub fn tab_rename(&self, tab_id: &str, label: &str) -> Result<(), HostError> {
         self.run(&rename_args("tab", tab_id, label), LAYOUT_TIMEOUT)
             .map(drop)
     }
@@ -331,34 +298,10 @@ impl HerdrCli {
         &self,
         args: &[OsString],
         timeout: Duration,
-    ) -> Result<T, HerdrError> {
+    ) -> Result<T, HostError> {
         let result = self.run(args, timeout)?.unwrap_or_default();
-        serde_json::from_value(result).map_err(HerdrError::Output)
+        serde_json::from_value(result).map_err(|error| HostError::Output(HOST, error))
     }
-}
-
-/// Resumes `session` with this executable, its replacement at the same path,
-/// or the installed `caudra` when neither file remains.
-pub fn resume_command_line(session: &str) -> String {
-    let program = resume_program(env::current_exe().ok());
-    shell_words::join([program.as_str(), SESSION_FLAG, session])
-}
-
-fn resume_program(exe: Option<PathBuf>) -> String {
-    exe.and_then(|path| {
-        if path.is_file() {
-            return Some(path.to_string_lossy().into_owned());
-        }
-        let replacement = path.to_str()?.strip_suffix(REPLACED_EXE_SUFFIX)?;
-        Path::new(replacement)
-            .is_file()
-            .then(|| replacement.to_owned())
-    })
-    .unwrap_or_else(|| RESUME_COMMAND.to_owned())
-}
-
-fn missing_field(field: &'static str) -> HerdrError {
-    HerdrError::Output(serde::de::Error::missing_field(field))
 }
 
 fn argv<const N: usize>(values: [&OsStr; N]) -> Vec<OsString> {
@@ -519,6 +462,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::resume::{RESUME_COMMAND, resume_argv};
 
     const PANE: &str = "w1:p2";
     const MESSAGE: &str = "Permission requested: shell";
@@ -535,7 +479,6 @@ mod tests {
     const ROOT_PANE: &str = "w2:p2";
     #[cfg(unix)]
     const SPLIT_PANE: &str = "w2:p3";
-    const RESUME_BINARY: &str = "caudra build";
 
     fn strings(args: Vec<OsString>) -> Vec<String> {
         args.into_iter()
@@ -601,12 +544,6 @@ mod tests {
                 "7",
             ]
         );
-    }
-
-    #[test_case(None, &[RESUME_COMMAND] ; "unsaved_session_starts_fresh")]
-    #[test_case(Some(SESSION), &[RESUME_COMMAND, "--session", SESSION] ; "saved_session_resumes")]
-    fn resume_command_names_saved_sessions_only(session: Option<&str>, expected: &[&str]) {
-        assert_eq!(resume_argv(session), expected);
     }
 
     #[test]
@@ -713,7 +650,7 @@ mod tests {
 
         assert!(matches!(
             serde_json::from_value::<Opened>(result).unwrap().worktree(),
-            Err(HerdrError::Output(_))
+            Err(HostError::Output(..))
         ));
     }
 
@@ -735,66 +672,6 @@ mod tests {
 
         assert_eq!(listing.workspace_of(&root), Some(WORKSPACE));
         assert_eq!(listing.workspace_of(&root.join("nested")), None);
-    }
-
-    #[test]
-    fn the_resume_line_runs_this_executable_on_the_session() {
-        let words = shell_words::split(&resume_command_line(SESSION)).unwrap();
-
-        assert_eq!(
-            words,
-            [
-                env::current_exe().unwrap().to_string_lossy().as_ref(),
-                SESSION_FLAG,
-                SESSION
-            ]
-        );
-    }
-
-    #[test_case(false, true ; "current_executable")]
-    #[test_case(true, true ; "replaced_executable")]
-    #[test_case(false, false ; "missing_executable")]
-    #[test_case(true, false ; "deleted_without_replacement")]
-    fn a_resume_uses_a_remaining_executable_or_path(replaced: bool, installed: bool) {
-        let temp = TempDir::new().unwrap();
-        let installed_path = temp.path().join(RESUME_BINARY);
-        if installed {
-            fs::write(&installed_path, []).unwrap();
-        }
-        let mut running_path = installed_path.as_os_str().to_owned();
-        if replaced {
-            running_path.push(REPLACED_EXE_SUFFIX);
-        }
-
-        let program = resume_program(Some(running_path.into()));
-
-        let expected = if installed {
-            installed_path.to_string_lossy().into_owned()
-        } else {
-            RESUME_COMMAND.to_owned()
-        };
-        assert_eq!(program, expected);
-    }
-
-    #[test_case(false ; "only_literal_name_exists")]
-    #[test_case(true ; "both_names_exist")]
-    fn an_existing_executable_keeps_a_literal_deleted_suffix(unsuffixed_exists: bool) {
-        let temp = TempDir::new().unwrap();
-        let path = temp
-            .path()
-            .join(format!("{RESUME_BINARY}{REPLACED_EXE_SUFFIX}"));
-        fs::write(&path, []).unwrap();
-        if unsuffixed_exists {
-            fs::write(temp.path().join(RESUME_BINARY), []).unwrap();
-        }
-
-        assert_eq!(resume_program(Some(path.clone())), path.to_string_lossy());
-    }
-
-    #[test_case(None ; "current_exe_unavailable")]
-    #[test_case(Some(PathBuf::new()) ; "empty_path")]
-    fn an_unavailable_executable_uses_path(exe: Option<PathBuf>) {
-        assert_eq!(resume_program(exe), RESUME_COMMAND);
     }
 
     #[cfg(unix)]

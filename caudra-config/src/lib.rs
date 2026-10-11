@@ -13,6 +13,7 @@ use caudra_storage::paths;
 use caudra_storage::retention::{GroupBy, KeepPolicy};
 use caudra_storage::thinking::{StoredThinking, ThinkingParseError};
 use caudra_storage::version::UpdateChannel;
+use caudra_terminal_host::PANE_ENVIRONMENT;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -47,15 +48,9 @@ const DEFAULT_ALWAYS_COLLAPSED: &[&str] = &[
     "file_index",
     "webfetch",
 ];
-const PROCESS_ONLY_ENV_VARS: &[&str] = &[
-    "HERDR_ENV",
-    "HERDR_PANE_ID",
-    "HERDR_BIN_PATH",
-    "HERDR_SOCKET_PATH",
-    "HERDR_WORKSPACE_ID",
-    "HERDR_TAB_ID",
-    "WORKCELL_MCP_CODE_WORKER",
-];
+/// Set only by the process that starts Caudra, never by a `.env` file, like
+/// every terminal host's pane variables.
+const PROCESS_ONLY_ENV_VARS: &[&str] = &["WORKCELL_MCP_CODE_WORKER"];
 static PROJECT_ENV_FALLBACKS: Mutex<Option<HashMap<String, Option<String>>>> = Mutex::new(None);
 static ENV_FILE_KEYS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
@@ -2229,7 +2224,7 @@ pub struct UiConfig {
         default = NotificationMethod::Auto,
         ty = "string",
         default_doc = "auto",
-        desc = "Terminal notification method: auto, osc9, bell, or off. Auto reports OSC 7501 program status when supported, otherwise uses OSC 9 or BEL. Native Herdr reporting takes precedence in a Herdr pane. Explicit osc9, bell, and off skip program status detection"
+        desc = "Terminal notification method: auto, osc9, bell, or off. Auto reports OSC 7501 program status when supported, otherwise uses OSC 9 or BEL. Native Herdr or Orca reporting takes precedence in their panes. Explicit osc9, bell, and off skip program status detection"
     )]
     pub notifications: NotificationMethod,
 
@@ -3450,7 +3445,7 @@ impl TelemetryConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WorktreeBackend {
-    /// Herdr inside a Herdr pane, git everywhere else.
+    /// The terminal host (Herdr or Orca) inside its pane, git everywhere else.
     #[default]
     Auto,
     Git,
@@ -3461,7 +3456,7 @@ pub enum WorktreeBackend {
 #[config(section = "worktrees")]
 pub struct WorktreesConfig {
     #[config(default = None, ty = "string", default_doc = "auto",
-             desc = "What creates and removes worktrees for `/worktree`: `auto` uses Herdr inside a Herdr pane and git elsewhere, `git` always runs git")]
+             desc = "What creates and removes worktrees for `/worktree`: `auto` uses Herdr inside a Herdr pane, Orca inside an Orca terminal, and git elsewhere, `git` always runs git")]
     pub backend: Option<WorktreeBackend>,
 
     #[config(default = None, ty = "string", default_varies = "`<data dir>/worktrees`",
@@ -4168,7 +4163,7 @@ fn global_dir() -> Option<PathBuf> {
 }
 
 fn env_file_var_is_allowed(key: &str) -> bool {
-    !PROCESS_ONLY_ENV_VARS.contains(&key)
+    !PROCESS_ONLY_ENV_VARS.contains(&key) && !PANE_ENVIRONMENT.contains(&key)
 }
 
 fn load_env_files_with_global(cwd: &Path, global: Option<&Path>) {
@@ -6965,6 +6960,9 @@ mod tests {
     #[test_case("HERDR_SOCKET_PATH", false ; "herdr_socket_path_is_process_only")]
     #[test_case("HERDR_WORKSPACE_ID", false ; "herdr_workspace_id_is_process_only")]
     #[test_case("HERDR_TAB_ID", false ; "herdr_tab_id_is_process_only")]
+    #[test_case("ORCA_PANE_KEY", false ; "orca_pane_key_is_process_only")]
+    #[test_case("ORCA_WORKTREE_ID", false ; "orca_worktree_id_is_process_only")]
+    #[test_case("ORCA_CLI_COMMAND", false ; "orca_cli_command_is_process_only")]
     #[test_case("WORKCELL_MCP_CODE_WORKER", false ; "workcell_worker_is_process_only")]
     #[test_case("TEST_CAUDRA_ENV_FILE_VAR", true ; "ordinary_env_file_var_is_allowed")]
     fn env_file_var_loading_policy(key: &str, expected: bool) {

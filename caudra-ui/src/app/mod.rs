@@ -136,7 +136,6 @@ use crate::input_document::InputDraft;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::sandbox::{SandboxWorkers, StoreReply};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
-use crate::terminal::{ProgramBlockKind, ProgramStatus};
 use crate::{AppSession, PatternDiscoveryMode, PatternDiscoveryOutcome, PatternSuggestionLoader};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use caudra_agent::agent::task_runner::WorkflowHostContext;
@@ -144,7 +143,6 @@ use caudra_agent::autopilot::DecisionKind;
 use caudra_agent::background::{BackgroundTasks, ShellSnapshot};
 use caudra_agent::commits::repo;
 use caudra_agent::context::{ContextKey, ContextSnapshot, ContextStore};
-use caudra_agent::herdr::PaneMetadata;
 use caudra_agent::mcp::McpSnapshot;
 use caudra_agent::mentions;
 use caudra_agent::permissions::{AutopilotNote, PermissionManager, PermissionPolicyError};
@@ -181,6 +179,7 @@ use caudra_storage::model::persist_model;
 use caudra_storage::tool_ledger::{ToolCall, ToolLedger, ToolStats};
 use caudra_storage::usage_ledger::{LedgerPurpose, LifetimeUsage, TurnUsage, UsageLedger};
 use caudra_storage::view::ViewMode;
+use caudra_terminal_host::status::{BlockKind, PaneMetadata, PaneState, PaneStatus};
 use caudra_workspace::WorkspaceChangeService;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use flume::{Receiver, TryRecvError};
@@ -266,6 +265,8 @@ const QUESTION_DISMISSED: &str = "dismissed";
 const LOGIN_BLOCKER: &str = "Provider login required";
 const MCP_TRUST_BLOCKER: &str = "MCP trust required";
 const PROJECT_PERMISSION_CONFIG_TRUST_BLOCKER: &str = "Project permission config trust required";
+const SANDBOX_DRAFT_BLOCKER: &str =
+    "Open /sandbox and Save or Discard the unsaved configuration draft";
 const PATTERN_DISCOVERY_DISABLED: &str =
     "Local history discovery is disabled for remote or ephemeral sessions.";
 const PATTERN_WORKER_UNAVAILABLE: &str =
@@ -1237,9 +1238,10 @@ impl App {
         )
     }
 
-    /// The session as Herdr's sidebar shows it: its title, the model the main
-    /// chat runs on, and how full that model's window is.
-    pub(crate) fn herdr_metadata(&self) -> PaneMetadata<'_> {
+    /// The session as a terminal host shows it: its title, the model the
+    /// main chat runs on, and how full that model's window is. Each host
+    /// takes only what it discloses.
+    pub(crate) fn pane_metadata(&self) -> PaneMetadata<'_> {
         let chat = &self.chats[0];
         let effective_model = self.status_main_model();
         let snapshot = self.main_context_snapshot();
@@ -6383,8 +6385,8 @@ impl App {
             && self.question_form.autopilot_note() != Some(&AutopilotNote::Deciding)
     }
 
-    /// Prompts read the way their notifications do, so Herdr's sidebar names
-    /// the tool waiting for permission rather than only that one is.
+    /// What keeps this session from closing or changing, read the way its
+    /// notifications do.
     pub(crate) fn lifecycle_blocker(&self) -> Option<Cow<'static, str>> {
         if self.sandbox_network_reconciliation_pending() {
             return Some(Cow::Borrowed(
@@ -6402,9 +6404,7 @@ impl App {
             ));
         }
         if self.sandbox_manager.dirty() {
-            return Some(Cow::Borrowed(
-                "Open /sandbox and Save or Discard the unsaved configuration draft",
-            ));
+            return Some(Cow::Borrowed(SANDBOX_DRAFT_BLOCKER));
         }
         if self.permission_mutation_pending() {
             return Some(Cow::Borrowed(
@@ -6431,61 +6431,85 @@ impl App {
         .find_map(|(blocked, message)| blocked.then_some(Cow::Borrowed(message)))
     }
 
-    pub(crate) fn program_status(&self) -> ProgramStatus {
-        let block = match self.attention() {
-            Some(Notification::PermissionRequested { .. })
-                if !self.permission_mutation_pending() =>
-            {
-                Some(ProgramBlockKind::Permission)
-            }
-            Some(Notification::AuthenticationRequired) => Some(ProgramBlockKind::Auth),
-            Some(Notification::QuestionRequested | Notification::PlanReady) => {
-                Some(ProgramBlockKind::Question)
-            }
-            Some(Notification::AutopilotNeedsYou {
-                wait: DecisionKind::Permission,
-                ..
-            }) if !self.permission_mutation_pending() => Some(ProgramBlockKind::Permission),
-            Some(Notification::AutopilotNeedsYou { wait, .. })
-                if wait != DecisionKind::Permission =>
-            {
-                Some(ProgramBlockKind::Question)
-            }
-            Some(
+    /// What the pane shows for this session. The user acting is the only way
+    /// out of a blocked state, which names what waits for them; Caudra
+    /// waiting on itself is work.
+    pub(crate) fn pane_status(&self) -> PaneStatus {
+        let attention = self.attention().and_then(|attention| {
+            let kind = match &attention {
+                Notification::PermissionRequested { .. } if !self.permission_mutation_pending() => {
+                    BlockKind::Permission
+                }
+                Notification::AuthenticationRequired => BlockKind::Auth,
+                Notification::QuestionRequested | Notification::PlanReady => BlockKind::Question,
+                Notification::AutopilotNeedsYou {
+                    wait: DecisionKind::Permission,
+                    ..
+                } if !self.permission_mutation_pending() => BlockKind::Permission,
+                Notification::AutopilotNeedsYou { wait, .. }
+                    if *wait != DecisionKind::Permission =>
+                {
+                    BlockKind::Question
+                }
                 Notification::PermissionRequested { .. }
                 | Notification::AutopilotNeedsYou { .. }
                 | Notification::TurnComplete { .. }
                 | Notification::AutomationNotice { .. }
-                | Notification::AutopilotEnded { .. },
-            )
-            | None => None,
-        };
-        if let Some(block) = block {
-            return ProgramStatus::Blocked(Some(block));
+                | Notification::AutopilotEnded { .. } => return None,
+            };
+            Some((Some(kind), Cow::Owned(attention.message())))
+        });
+        let blocker = attention.or_else(|| {
+            [
+                (
+                    self.question_form_waits(),
+                    Some(BlockKind::Question),
+                    QUESTION_BLOCKER,
+                ),
+                (
+                    self.mcp_picker.is_open() && self.mcp_picker.has_awaiting_trust(),
+                    Some(BlockKind::Permission),
+                    MCP_TRUST_BLOCKER,
+                ),
+                (
+                    self.permissions_picker.is_open()
+                        && !self.permission_mutation_pending()
+                        && self.permissions.needs_project_permission_config_trust(),
+                    Some(BlockKind::Permission),
+                    PROJECT_PERMISSION_CONFIG_TRUST_BLOCKER,
+                ),
+                (
+                    self.login_picker.is_open(),
+                    Some(BlockKind::Auth),
+                    LOGIN_BLOCKER,
+                ),
+                (
+                    self.sandbox_manager.dirty() && !self.sandbox_manager.pending(),
+                    None,
+                    SANDBOX_DRAFT_BLOCKER,
+                ),
+            ]
+            .into_iter()
+            .find_map(|(blocked, kind, label)| blocked.then_some((kind, Cow::Borrowed(label))))
+        });
+        if let Some((kind, label)) = blocker {
+            return PaneStatus {
+                label: Some(label),
+                ..PaneStatus::new(PaneState::Blocked(kind))
+            };
         }
-        if self.question_form_waits() {
-            return ProgramStatus::Blocked(Some(ProgramBlockKind::Question));
-        }
-        if (self.mcp_picker.is_open() && self.mcp_picker.has_awaiting_trust())
-            || (self.permissions_picker.is_open()
-                && !self.permission_mutation_pending()
-                && self.permissions.needs_project_permission_config_trust())
-        {
-            return ProgramStatus::Blocked(Some(ProgramBlockKind::Permission));
-        }
-        if self.sandbox_manager.dirty() && !self.sandbox_manager.pending() {
-            return ProgramStatus::Blocked(None);
-        }
-        if self.has_lifecycle_work()
-            || self.sandbox_network_reconciliation_pending()
-            || crate::sandbox::transfer::active()
-            || self.sandbox_manager.pending()
-            || self.permission_mutation_pending()
-        {
-            ProgramStatus::Working
-        } else {
-            ProgramStatus::Idle
-        }
+        PaneStatus::new(
+            if self.has_lifecycle_work()
+                || self.sandbox_network_reconciliation_pending()
+                || crate::sandbox::transfer::active()
+                || self.sandbox_manager.pending()
+                || self.permission_mutation_pending()
+            {
+                PaneState::Working
+            } else {
+                PaneState::Idle
+            },
+        )
     }
 
     pub(crate) fn has_lifecycle_work(&self) -> bool {

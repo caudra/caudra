@@ -14,6 +14,7 @@ use std::sync::{Arc, LazyLock};
 
 use crate::remote_project_context::RemoteSkill;
 use arc_swap::{ArcSwap, ArcSwapOption};
+use caudra_terminal_host::skill::SkillSource;
 use serde_json::Value;
 
 use crate::tools::registry::{
@@ -537,6 +538,23 @@ fn read_skill(skill: &Skill, builtins: &[Arc<BuiltinSkill>]) -> Result<(String, 
     Ok((body, relative_path(&skill.location)))
 }
 
+/// The skill a terminal host prints with its own CLI, offered only inside
+/// that host. A disk skill of the same name still wins, like every builtin.
+pub fn host_skill(source: SkillSource) -> BuiltinSkill {
+    BuiltinSkill {
+        name: source.name.to_owned(),
+        description: source.description.to_owned(),
+        resolve: Box::new(move || {
+            let body = source.fetch().map_or_else(
+                |unavailable| unavailable,
+                |printed| parse_frontmatter(&printed).1,
+            );
+            (body, None)
+        }),
+        pages: None,
+    }
+}
+
 /// Only the scalar `key: value` pairs are read: `name` and `description` are
 /// all a skill header is allowed to carry, and a full YAML parse would accept
 /// shapes the rest of the code cannot use.
@@ -641,6 +659,7 @@ mod tests {
     use test_case::test_case;
 
     const BUILTIN_NAME: &str = "caudra-plugin-dev";
+    const HOST_SKILL_BODY: &str = "# Host\n\nRun host pane list.";
     const BUILTIN_BODY: &str = "how to write plugins";
     const BUILTIN_DESC: &str = "author plugins";
     const SHARED_SKILL: &str = "isolation-shared";
@@ -655,6 +674,32 @@ mod tests {
     const LATE_SKILLS_DIR: &str = ".caudra/skills";
     const LATE_SKILL: &str = "release";
     const LATE_SKILL_FILE: &str = "---\ndescription: cut a release\n---\nbody\n";
+
+    #[cfg(unix)]
+    #[test]
+    fn a_host_skill_is_what_the_host_prints_without_its_header() {
+        let source = SkillSource {
+            host: "Host",
+            name: "host",
+            description: "Control the host.",
+            command: Arc::new(|| {
+                let mut command = std::process::Command::new("sh");
+                command.args([
+                    "-c",
+                    &format!("printf -- '---\\nname: host\\ndescription: x\\n---\\n\\n{HOST_SKILL_BODY}\\n'"),
+                ]);
+                command
+            }),
+            fallback: "Run `host --help`.",
+        };
+
+        let skill = host_skill(source);
+        let (body, reference) = (skill.resolve)();
+
+        assert_eq!(skill.name, "host");
+        assert_eq!(body, HOST_SKILL_BODY);
+        assert!(reference.is_none());
+    }
 
     fn remote_skill() -> RemoteSkill {
         let authority = AuthorityIdentity::new(

@@ -13,6 +13,7 @@ caudra-agent = { workspace = true }
 caudra-automation = { workspace = true }
 caudra-config = { workspace = true }
 caudra-storage = { workspace = true }
+caudra-terminal-host = { workspace = true }
 caudra-workspace = { workspace = true }
 async-trait = { workspace = true }
 event-listener = { workspace = true }

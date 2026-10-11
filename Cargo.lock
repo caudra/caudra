@@ -859,6 +859,7 @@ dependencies = [
  "caudra-providers",
  "caudra-sandbox",
  "caudra-storage",
+ "caudra-terminal-host",
  "caudra-ui",
  "caudra-workcell",
  "caudra-workflow",
@@ -926,6 +927,7 @@ dependencies = [
  "caudra-otel",
  "caudra-providers",
  "caudra-storage",
+ "caudra-terminal-host",
  "caudra-workflow",
  "caudra-workspace",
  "color-eyre",
@@ -989,6 +991,7 @@ version = "0.2.0-preview.5"
 dependencies = [
  "caudra-config-macro",
  "caudra-storage",
+ "caudra-terminal-host",
  "caudra-workspace",
  "dotenvy",
  "globset",
@@ -1323,6 +1326,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "caudra-terminal-host"
+version = "0.2.0-preview.5"
+dependencies = [
+ "base64 0.23.1",
+ "flume",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "tempfile",
+ "test-case",
+ "thiserror 2.0.18",
+ "tracing",
+ "wait-timeout",
+]
+
+[[package]]
 name = "caudra-ui"
 version = "0.2.0-preview.5"
 dependencies = [
@@ -1346,6 +1365,7 @@ dependencies = [
  "caudra-providers",
  "caudra-sandbox",
  "caudra-storage",
+ "caudra-terminal-host",
  "caudra-workbench",
  "caudra-workcell",
  "caudra-workflow",
@@ -1426,6 +1446,7 @@ dependencies = [
  "caudra-automation",
  "caudra-config",
  "caudra-storage",
+ "caudra-terminal-host",
  "caudra-workbench",
  "caudra-workspace",
  "event-listener",

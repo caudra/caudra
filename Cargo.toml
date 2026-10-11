@@ -28,6 +28,7 @@ caudra-config = { workspace = true }
 caudra-sandbox = { workspace = true }
 caudra-providers = { workspace = true }
 caudra-storage = { workspace = true }
+caudra-terminal-host = { workspace = true }
 caudra-lua = { workspace = true }
 caudra-otel = { workspace = true }
 caudra-workcell = { workspace = true }
@@ -84,6 +85,7 @@ members = [
   "caudra-storage",
   "caudra-config-macro",
   "caudra-lua-macro",
+  "caudra-terminal-host",
   "caudra-ui",
   "caudra-workbench",
   "caudra-workcell",
@@ -134,6 +136,7 @@ caudra-providers = { path = "caudra-providers" }
 caudra-script = { path = "caudra-script", default-features = false }
 caudra-automation = { path = "caudra-automation" }
 caudra-storage = { path = "caudra-storage" }
+caudra-terminal-host = { path = "caudra-terminal-host" }
 caudra-ui = { path = "caudra-ui" }
 caudra-lua = { path = "caudra-lua" }
 caudra-config-macro = { path = "caudra-config-macro" }

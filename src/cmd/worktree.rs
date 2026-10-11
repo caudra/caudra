@@ -1,6 +1,7 @@
 //! Carries out a `/worktree` change between two UI generations, once every
 //! session is saved and its agent has stopped. Part of it moves this process
-//! and part of it hands sessions to another Herdr pane, neither of which a
+//! and part of it hands sessions to another pane of the terminal host,
+//! neither of which a
 //! running UI can do.
 
 #[cfg(unix)]
@@ -11,13 +12,14 @@ use std::process::Stdio;
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 
-use caudra_agent::herdr::{HerdrEnv, OpenedWorkspace, resume_command_line};
 use caudra_agent::worktree::{
     self, Backend, CreateRequest, Removal, RemoveRequest, Request, counterpart, label,
 };
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::{SessionDatabase, SessionRelocation};
+use caudra_terminal_host::resume::resume_command_line;
+use caudra_terminal_host::workspaces::{HostLocation, Opened, PaneSite, Workspaces};
 use caudra_ui::{SessionRelocationHandoff, SessionTab};
 
 const CREATE_FAILED: &str = "Could not create the worktree";
@@ -26,7 +28,8 @@ const MOVE_FAILED: &str = "The session stayed where it was";
 const REMOVE_FAILED: &str = "Could not remove worktree";
 const REMOVAL_KEPT: &str =
     "The worktree was kept, because the sessions working in it could not move out";
-const PANE_FAILED: &str = "Herdr could not start the session in its new pane";
+const PANE_FAILED: &str = "could not start the session in its new pane";
+const HOST_DECLINED: &str = "Git made the worktree instead";
 const NOT_SAVED: &str = "is not saved";
 
 pub(super) struct Executed {
@@ -49,7 +52,7 @@ pub(super) enum Handled {
         handoff: SessionRelocationHandoff,
         follow_up: Box<FollowUp>,
     },
-    /// The sessions went on in another Herdr pane, and this one closes.
+    /// The sessions went on in another pane of the host, and this one closes.
     Exit,
 }
 
@@ -125,6 +128,11 @@ fn create(
     )];
     notes.extend(
         created
+            .host_declined
+            .map(|reason| format!("{HOST_DECLINED}: {reason}")),
+    );
+    notes.extend(
+        created
             .carry_failed
             .map(|reason| format!("{CARRY_FAILED}: {reason}")),
     );
@@ -137,14 +145,14 @@ fn create(
         }
     };
     let moved = format!("This session moved into worktree {name}");
-    match (created.workspace, backend.herdr()) {
-        (Some(workspace), Some(herdr)) => {
+    match (created.opened, backend.host()) {
+        (Some(opened), Some(host)) => {
             let hand_off = HandOff {
                 id: request.session,
                 relocation: &relocation,
-                workspace: &workspace,
+                opened: &opened,
                 name: &name,
-                herdr,
+                host,
             };
             hand_off.run(tabs, focused, storage, notes, moved)
         }
@@ -163,19 +171,19 @@ fn create(
     }
 }
 
-/// A session moving into a new worktree that Herdr opened a pane for.
+/// A session moving into a new worktree that the host opened a pane for.
 struct HandOff<'a> {
     id: CaudraId,
     relocation: &'a SessionRelocation,
-    workspace: &'a OpenedWorkspace,
-    /// What the new tab and pane are labelled, the worktree's branch.
+    opened: &'a Opened,
+    /// What the new pane is labelled, the worktree's branch.
     name: &'a str,
-    herdr: &'a HerdrEnv,
+    host: &'a dyn Workspaces,
 }
 
 impl HandOff<'_> {
     /// Moves the session while its tab still holds it, lets go of it, and has
-    /// Herdr resume it in the new pane. A process left without tabs exits once
+    /// the host resume it in the new pane. A process left without tabs exits once
     /// the session runs there; otherwise it stays to say how to resume it.
     fn run(
         self,
@@ -196,20 +204,11 @@ impl HandOff<'_> {
                 focused -= 1;
             }
         }
-        let cli = self.herdr.cli();
-        let OpenedWorkspace {
-            tab_id, pane_id, ..
-        } = self.workspace;
-        if let Err(error) = cli
-            .tab_rename(tab_id, self.name)
-            .and_then(|()| cli.pane_rename(pane_id, self.name))
-        {
-            tracing::warn!(%error, tab = tab_id, pane = pane_id, "Herdr did not label the new tab and pane");
-        }
+        let host = self.host.host();
         let command = resume_command_line(&self.id.to_string());
-        match cli.pane_run(pane_id, &command) {
+        match self.host.run(&self.opened.pane, &command, Some(self.name)) {
             Ok(()) => {
-                notes.push(format!("{moved} and went on in its Herdr workspace"));
+                notes.push(format!("{moved} and went on in its {host} workspace"));
                 if tabs.is_empty() {
                     return Executed {
                         handled: Handled::Exit,
@@ -218,7 +217,7 @@ impl HandOff<'_> {
                 }
             }
             Err(error) => notes.push(format!(
-                "{PANE_FAILED}: {error}. Resume it there with: {command}"
+                "{host} {PANE_FAILED}: {error}. Resume it there with: {command}"
             )),
         }
         let focused = focused.min(tabs.len().saturating_sub(1));
@@ -265,13 +264,13 @@ fn remove(
         |(_, cwd)| counterpart(cwd, &removal.root, &removal.main_root),
     );
     let ids: Vec<_> = working.iter().map(|(id, _)| *id).collect();
-    if let (Some(herdr), Some(workspace)) = (backend.herdr(), removal.workspace.as_deref())
-        && herdr.workspace_id.as_deref() == Some(workspace)
+    if let (Some(host), Some(location)) = (backend.host(), removal.location.as_ref())
+        && host.holds_this_pane(location)
     {
         let leaving = Leaving {
-            herdr,
+            host,
             removal: &removal,
-            workspace,
+            location,
             name: &name,
             destination: &destination,
         };
@@ -307,13 +306,13 @@ fn remove(
     }
 }
 
-/// Leaving the Herdr workspace of a checkout being removed, which Herdr
+/// Leaving the host's workspace of a checkout being removed, which the host
 /// closes along with this pane.
 struct Leaving<'a> {
-    herdr: &'a HerdrEnv,
+    host: &'a dyn Workspaces,
     removal: &'a Removal,
-    /// The workspace Herdr closes, which holds this pane.
-    workspace: &'a str,
+    /// Where the host has the checkout open, which holds this pane.
+    location: &'a HostLocation,
     name: &'a str,
     destination: &'a Path,
 }
@@ -330,14 +329,14 @@ impl Leaving<'_> {
         storage: &StateDir,
         mut notes: Vec<String>,
     ) -> Executed {
-        let cli = self.herdr.cli();
-        let pane = match &self.removal.source_workspace {
-            Some(workspace) => cli.split_workspace(workspace, self.destination),
-            None => cli
-                .workspace_create(self.destination)
-                .map(|opened| opened.pane_id),
+        let site = match &self.removal.main_location {
+            Some(location) => PaneSite::Beside {
+                location,
+                cwd: self.destination,
+            },
+            None => PaneSite::NewWorkspace(self.destination),
         };
-        let pane = match pane {
+        let pane = match self.host.pane(site) {
             Ok(pane) => pane,
             Err(error) => {
                 notes.push(format!("{REMOVE_FAILED} {}: {error}", self.name));
@@ -355,9 +354,10 @@ impl Leaving<'_> {
         drop(tabs);
         if let Some(id) = resumed {
             let command = resume_command_line(&id.to_string());
-            if let Err(error) = cli.pane_run(&pane, &command) {
+            if let Err(error) = self.host.run(&pane, &command, None) {
                 notes.push(format!(
-                    "{PANE_FAILED}: {error}. Resume it there with: {command}"
+                    "{} {PANE_FAILED}: {error}. Resume it there with: {command}",
+                    self.host.host()
                 ));
                 notes.push(REMOVAL_KEPT.into());
                 return Executed {
@@ -374,12 +374,9 @@ impl Leaving<'_> {
     }
 
     /// Starts the removal in a process group of its own, which outlives this
-    /// pane when Herdr closes it.
+    /// pane when the host closes it.
     fn start_removal(&self) -> String {
-        let mut command = self
-            .herdr
-            .cli()
-            .worktree_remove_command(self.workspace, self.removal.force);
+        let mut command = self.host.remove_command(self.location, self.removal.force);
         command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -466,19 +463,21 @@ fn session_count(count: usize) -> String {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::Arc;
 
-    use caudra_agent::herdr::{HerdrEnv, OpenedWorkspace, resume_command_line};
     use caudra_agent::worktree::{
         Backend, Changes, CreateRequest, RemoveRequest, Request, checkout_path,
     };
     use caudra_storage::StateDir;
     use caudra_storage::id::CaudraId;
     use caudra_storage::sessions::{SessionDatabase, SessionLease};
+    use caudra_terminal_host::resume::resume_command_line;
+    use caudra_terminal_host::workspaces::{HostLocation, HostPane, Opened, Workspaces};
     use caudra_ui::{AppSession, SessionTab};
     use tempfile::TempDir;
     use test_case::test_case;
@@ -529,9 +528,7 @@ mod tests {
             }
             Self {
                 storage: StateDir::from_path(base.join("state")),
-                backend: Backend::Git {
-                    directory: Some(base.join(WORKTREES)),
-                },
+                backend: Backend::git(Some(base.join(WORKTREES))),
                 _temp: temp,
                 base,
                 root,
@@ -610,7 +607,7 @@ mod tests {
 
         /// A Herdr that records every call it gets, one argument per line,
         /// then runs `outcome`.
-        fn herdr(&self, outcome: &str) -> HerdrEnv {
+        fn herdr(&self, outcome: &str) -> Arc<dyn Workspaces> {
             let binary = self.base.join("herdr");
             let record = self.base.join(RECORD);
             fs::write(
@@ -622,12 +619,16 @@ mod tests {
             )
             .unwrap();
             fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
-            HerdrEnv {
-                binary: binary.into(),
-                socket_path: self.base.join("herdr.sock").into(),
-                pane_id: PANE.into(),
-                workspace_id: None,
-            }
+            let socket = self.base.join("herdr.sock");
+            caudra_terminal_host::detect_from(|name| match name {
+                "HERDR_ENV" => Some("1".into()),
+                "HERDR_PANE_ID" => Some(PANE.into()),
+                "HERDR_SOCKET_PATH" => Some(socket.clone().into()),
+                "HERDR_BIN_PATH" => Some(OsString::from(&binary)),
+                _ => None,
+            })
+            .and_then(|host| host.workspaces())
+            .unwrap()
         }
 
         fn herdr_calls(&self) -> Vec<String> {
@@ -650,18 +651,22 @@ mod tests {
             let worktree = self.worktree();
             let herdr = self.herdr(outcome);
             let request = relocation(&self.storage, &[moved], &worktree).unwrap();
-            let workspace = OpenedWorkspace {
-                workspace_id: WORKSPACE.into(),
-                tab_id: TAB.into(),
-                pane_id: PANE.into(),
+            let opened = Opened {
+                location: HostLocation(WORKSPACE.into()),
+                root: worktree.clone(),
+                branch: Some(BRANCH.into()),
+                pane: HostPane::Open {
+                    pane: PANE.into(),
+                    tab: Some(TAB.into()),
+                },
                 already_open: false,
             };
             let hand_off = HandOff {
                 id: moved,
                 relocation: &request,
-                workspace: &workspace,
+                opened: &opened,
                 name: LABEL,
-                herdr: &herdr,
+                host: herdr.as_ref(),
             };
             let executed = hand_off.run(tabs, focused, &self.storage, Vec::new(), MOVED.into());
             (executed, worktree)
@@ -831,7 +836,7 @@ mod tests {
             Handled::Exit => assert!(exits, "{notes:?}"),
             Handled::Continue { tabs, .. } => {
                 assert!(!exits && tabs.is_empty(), "{notes:?}");
-                assert!(notes.iter().any(|note| note.starts_with(PANE_FAILED)));
+                assert!(notes.iter().any(|note| note.contains(PANE_FAILED)));
             }
             Handled::Relocate { .. } => panic!("Herdr hand-offs never relocate this process"),
         }

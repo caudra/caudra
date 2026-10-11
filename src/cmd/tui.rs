@@ -16,7 +16,6 @@ use flume::{RecvTimeoutError as PatternRecvError, Sender as ChannelSender};
 
 use caudra_agent::command::{self, CustomCommand};
 use caudra_agent::decisions::Decisions;
-use caudra_agent::herdr::HerdrEnv;
 use caudra_agent::peers::topics::add_patterns;
 use caudra_agent::peers::{MAX_MEMBERSHIPS, PeerHost, TOO_MANY_MEMBERSHIPS};
 use caudra_agent::permissions::pattern_recognition::{PatternCandidate, RecognitionExclusion};
@@ -38,10 +37,11 @@ use caudra_storage::sessions::{
 use caudra_storage::state::{WorkspaceTabs, read_workspace_tabs};
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_storage::{StateClass, StateDir};
+use caudra_terminal_host::reporter::Reporter;
 use caudra_ui::{
-    AppSession, ChangeServiceFactory, ExitSummary, HerdrReporter, PatternDiscoveryMode,
-    PatternDiscoveryOutcome, PatternDiscoveryReport, PatternSuggestionLoader,
-    PermissionAuthorityBinding, RunOutcome, SessionRelocationHandoff, SessionTab,
+    AppSession, ChangeServiceFactory, ExitSummary, PatternDiscoveryMode, PatternDiscoveryOutcome,
+    PatternDiscoveryReport, PatternSuggestionLoader, PermissionAuthorityBinding, RunOutcome,
+    SessionRelocationHandoff, SessionTab,
 };
 use caudra_workcell::editor_adapter::{
     PermissionEditorContext, PermissionEditorRuntime, permission_authority_provider,
@@ -794,7 +794,7 @@ fn local_runtime_cwd(
 
 /// `--session` resumes a local session where it works, whichever directory it
 /// was typed in, so config, plugins and MCP servers come from its project. A
-/// Herdr restore types it into whatever directory the pane's shell was left in.
+/// host's restore types it into whatever directory the pane's shell was left in.
 /// A session left in a removed worktree is moved back first, which is also
 /// what the returned messages report.
 fn resumed_session_cwd(cli: &Cli, storage: &StateDir) -> Result<(Option<PathBuf>, Vec<String>)> {
@@ -1597,7 +1597,8 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
         ));
     }
     let mut teardown = Teardown::default();
-    let mut herdr_reporter = HerdrReporter::from_env();
+    let terminal_host = caudra_terminal_host::detect();
+    let mut host_reporter = terminal_host.as_deref().and_then(Reporter::for_host);
     crate::progress::uninstall();
     let mut sweeper = RetentionSweeper::spawn(storage.clone(), stack.config.storage);
     let mut committed_relocation: Option<String> = None;
@@ -1741,7 +1742,10 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 });
                 factory
             });
-        let worktrees = Backend::select(&stack.config.worktrees, HerdrEnv::detect());
+        let worktrees = Backend::select(
+            &stack.config.worktrees,
+            terminal_host.as_ref().and_then(|host| host.workspaces()),
+        );
         let outcome = caudra_ui::run(
             caudra_ui::EventLoopParams {
                 model,
@@ -1807,7 +1811,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 prompt_profiles: Arc::clone(&stack.prompt_profiles),
                 default_prompt_profile: stack.default_prompt_profile.clone(),
                 prompt_profile_override: cli.system_prompt_profile.clone(),
-                herdr_reporter: herdr_reporter.as_ref().map(HerdrReporter::handle),
+                host_reporter: host_reporter.as_ref().map(Reporter::handle),
                 peer_host: peer_host.clone(),
                 worktrees: worktrees.clone(),
                 workspace_session: workcell_runtime.workspace_session().cloned(),
@@ -1973,7 +1977,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                     teardown_ms = started.elapsed().as_millis() as u64 - stack_ms,
                     "plugin host and teardown joined"
                 );
-                if let Some(reporter) = herdr_reporter.take() {
+                if let Some(reporter) = host_reporter.take() {
                     reporter.release();
                 }
                 // Returning the code instead of exiting here keeps every guard
@@ -2026,7 +2030,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                         drop(sweeper);
                         drop(stack);
                         teardown.join();
-                        if let Some(reporter) = herdr_reporter.take() {
+                        if let Some(reporter) = host_reporter.take() {
                             reporter.release();
                         }
                         return Ok(ExitCode::SUCCESS);
@@ -2109,7 +2113,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
             if restart_for_env && let Some(committed) = &committed_relocation {
                 drop(sweeper);
                 teardown.join();
-                if let Some(reporter) = herdr_reporter.take() {
+                if let Some(reporter) = host_reporter.take() {
                     reporter.release();
                 }
                 if worktree_change {

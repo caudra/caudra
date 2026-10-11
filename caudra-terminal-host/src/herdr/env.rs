@@ -1,28 +1,15 @@
-use std::env::{self, consts::EXE_SUFFIX};
 use std::ffi::{OsStr, OsString};
 
 use super::cli::HerdrCli;
 
-const HERDR_ENV: &str = "HERDR_ENV";
-const HERDR_PANE_ID: &str = "HERDR_PANE_ID";
-const HERDR_BIN_PATH: &str = "HERDR_BIN_PATH";
-pub(super) const HERDR_SOCKET_PATH: &str = "HERDR_SOCKET_PATH";
-const HERDR_WORKSPACE_ID: &str = "HERDR_WORKSPACE_ID";
-const HERDR_TAB_ID: &str = "HERDR_TAB_ID";
-/// What Herdr exports to every process in its pane. Shell commands receive it
-/// too, so the model's `herdr` calls see the pane the way any other process in
-/// it would.
-pub const PANE_ENVIRONMENT: &[&str] = &[
-    HERDR_ENV,
-    HERDR_PANE_ID,
-    HERDR_TAB_ID,
-    HERDR_WORKSPACE_ID,
-    HERDR_SOCKET_PATH,
-    HERDR_BIN_PATH,
-];
+pub(crate) const HERDR_ENV: &str = "HERDR_ENV";
+pub(crate) const HERDR_PANE_ID: &str = "HERDR_PANE_ID";
+pub(crate) const HERDR_BIN_PATH: &str = "HERDR_BIN_PATH";
+pub(crate) const HERDR_SOCKET_PATH: &str = "HERDR_SOCKET_PATH";
+pub(crate) const HERDR_WORKSPACE_ID: &str = "HERDR_WORKSPACE_ID";
+pub(crate) const HERDR_TAB_ID: &str = "HERDR_TAB_ID";
 const ENABLED_MARKER: &str = "1";
 const DEFAULT_BINARY: &str = "herdr";
-const PATH: &str = "PATH";
 
 /// The pane Caudra runs in, as Herdr announces it to every process it starts
 /// there. Reporting needs the marker, the pane and the socket together, so a
@@ -36,10 +23,6 @@ pub struct HerdrEnv {
 }
 
 impl HerdrEnv {
-    pub fn detect() -> Option<Self> {
-        Self::from_env(|name| env::var_os(name))
-    }
-
     pub fn from_env(get: impl Fn(&str) -> Option<OsString>) -> Option<Self> {
         if get(HERDR_ENV).as_deref() != Some(OsStr::new(ENABLED_MARKER)) {
             return None;
@@ -63,30 +46,15 @@ fn text(value: Option<OsString>) -> Option<String> {
     value?.into_string().ok().filter(|value| !value.is_empty())
 }
 
-/// Whether a shell would find `name` on `PATH`. Herdr types a restored pane's
-/// command into its shell, so a command that only runs through an absolute path
-/// cannot be offered to it.
-pub fn command_on_path(name: &str) -> bool {
-    env::var_os(PATH).is_some_and(|paths| command_in(&paths, name))
-}
-
-fn command_in(paths: &OsStr, name: &str) -> bool {
-    let file = format!("{name}{EXE_SUFFIX}");
-    env::split_paths(paths).any(|dir| dir.join(&file).is_file())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::TempDir;
     use test_case::test_case;
 
     const PANE: &str = "w1:p2";
     const WORKSPACE: &str = "w1";
     const BINARY: &str = "/opt/herdr/bin/herdr";
     const SOCKET: &str = "/tmp/herdr.sock";
-    const COMMAND: &str = "caudra";
 
     fn detect(values: &[(&str, &str)]) -> Option<HerdrEnv> {
         HerdrEnv::from_env(|name| {
@@ -165,26 +133,5 @@ mod tests {
         values[1] = (HERDR_PANE_ID, "");
 
         assert_eq!(detect(&values), None);
-    }
-
-    #[test_case(true ; "present")]
-    #[test_case(false ; "absent")]
-    fn command_lookup_scans_every_path_entry(present: bool) {
-        let empty = TempDir::new().unwrap();
-        let bin = TempDir::new().unwrap();
-        if present {
-            fs::write(bin.path().join(format!("{COMMAND}{EXE_SUFFIX}")), "").unwrap();
-        }
-        let paths = env::join_paths([empty.path(), bin.path()]).unwrap();
-
-        assert_eq!(command_in(&paths, COMMAND), present);
-    }
-
-    #[test]
-    fn a_directory_named_like_the_command_does_not_count() {
-        let bin = TempDir::new().unwrap();
-        fs::create_dir(bin.path().join(format!("{COMMAND}{EXE_SUFFIX}"))).unwrap();
-
-        assert!(!command_in(bin.path().as_os_str(), COMMAND));
     }
 }

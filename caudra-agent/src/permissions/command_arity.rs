@@ -46,6 +46,8 @@ const CURATED_PREFIXES: &[(&[&str], usize)] = &[
     (&["make"], 2),
     (&["npm"], 2),
     (&["npm", "run"], 3),
+    (&["orca"], 3),
+    (&["orca-ide"], 3),
     (&["pip"], 2),
     (&["pnpm"], 2),
     (&["pnpm", "run"], 3),
@@ -107,6 +109,8 @@ mod tests {
     #[test_case("git stash pop", Some((2, 3)); "namespaced git subcommand")]
     #[test_case("sed -n 1,140p f.rs", Some((2, 2)); "an entry may name a flag")]
     #[test_case("herdr pane read w1:p2 --lines 40", Some((1, 3)); "herdr keeps the pane id out")]
+    #[test_case("orca terminal send --terminal term_1 --text ls", Some((1, 3)); "orca keeps the terminal out")]
+    #[test_case("orca-ide worktree list --json", Some((1, 3)); "orca under its long name")]
     #[test_case("git commit -m x", None; "uncurated git subcommand")]
     #[test_case("cargo nextest run", None; "heuristic handles cargo")]
     #[test_case("npm", Some((1, 2)); "prefix matches without enough operands")]

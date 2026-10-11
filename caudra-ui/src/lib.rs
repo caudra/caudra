@@ -18,11 +18,10 @@ mod exit_summary;
 pub use exit_summary::ExitSummary;
 mod highlight;
 pub use highlight::highlight_ansi;
-mod herdr;
-pub use herdr::{HerdrReporter, HerdrReporterHandle};
 pub mod image;
 mod input_document;
 mod markdown;
+mod pane_signals;
 mod provenance;
 mod render_worker;
 pub mod repaint;
@@ -285,7 +284,7 @@ pub enum RunOutcome {
     },
     /// Every session is saved and stopped for a `/worktree` change, which only
     /// the caller can carry out: it may move this process or hand sessions to
-    /// another Herdr pane.
+    /// another pane of the terminal host.
     Worktree {
         tabs: Vec<SessionTab>,
         focused: usize,

@@ -16,6 +16,8 @@ Caudra takes no positional argument. A bare word is read as a subcommand, so `ca
 
 When interactive Caudra starts in a Herdr pane, it automatically reports native `caudra` lifecycle state through Herdr's inherited environment and public custom-agent API. `--print` and SDK mode do not claim pane lifecycle authority. The report names the prompt that blocks the agent, and the sidebar shows the focused session's title, model and context usage. Each report also carries a resume command, so Herdr can restore the pane after a restart. It is `caudra --session <id>` for the focused session once that session is saved, and a bare `caudra` before then. Herdr receives the command only when `caudra` is on `PATH`, because Herdr types it into the pane's shell. Exiting Caudra withdraws it. A hangup or a stopped Herdr server leaves it in place. See [Worktrees](/docs/worktrees/#herdr-integration).
 
+In an Orca terminal, interactive Caudra reports its state to Orca in the terminal output instead. The report carries the state, the model and the label of the blocking prompt, with no resume command. See [Notifications](/docs/notifications/#orca).
+
 `caudra --session <id>` opens a local session in the directory it works in, wherever you run the command, so project config, plugins and MCP servers come from that directory. A session left in a removed worktree moves back to a remaining checkout first.
 
 Some flags and subcommands belong to [experimental features](/docs/configuration/#experimental-features), which stay off until the global `caudra.toml` turns them on. While a feature is off, `--help` does not list them. Using one anyway stops Caudra with an error that names the `experimental.*` key to set. The exception is `--no-jit`, which has no effect without Lua. `caudra update`, `caudra rollback`, `caudra logs`, and `caudra config` do not read settings, so a broken `caudra.toml` cannot stop them.
@@ -233,6 +235,7 @@ Commands start from a cleared environment. They receive only these variables, ea
 - `PATH`, `HOME`, `USER`, `LOGNAME`, `TMPDIR`, `TMP`, `TEMP`, `LANG`, `LC_ALL`, and `TERM`.
 - `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` in uppercase and lowercase, with any credentials in their URLs.
 - `HERDR_ENV`, `HERDR_PANE_ID`, `HERDR_TAB_ID`, `HERDR_WORKSPACE_ID`, `HERDR_SOCKET_PATH`, and `HERDR_BIN_PATH`, so a command sees the [Herdr pane](/docs/worktrees/#herdr-integration) Caudra runs in.
+- `ORCA_PANE_KEY`, `ORCA_TAB_ID`, `ORCA_WORKTREE_ID`, `ORCA_WORKSPACE_ID`, `ORCA_TERMINAL_HANDLE`, `ORCA_USER_DATA_PATH`, `ORCA_CLI_COMMAND`, `ORCA_CLI_BIN_DIR`, `ORCA_REMOTE_CLI_BIN_DIR`, `ORCA_RELAY_DIR`, `ORCA_RELAY_NODE_PATH`, and `ORCA_RELAY_SOCKET_PATH`, so a command sees the [Orca terminal](/docs/worktrees/#orca-integration) Caudra runs in. Orca's hook and launch tokens and its cloud credentials are not forwarded.
 - `ComSpec`, `SystemRoot`, and `WINDIR` on Windows.
 
 Commands also get `NO_COLOR=1` and `CLICOLOR=0`, so tools that honor those conventions print no color codes. An explicit flag such as `--color=always` still wins. Other host variables and startup hooks are not forwarded unless you [forward them](#forwarding-more-variables).

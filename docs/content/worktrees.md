@@ -1,11 +1,11 @@
 ---
 title: "Worktrees"
-description: "Create, open and remove git worktrees, with or without Herdr."
+description: "Create, open and remove git worktrees, with or without Herdr or Orca."
 ---
 
 A git worktree is another checkout of the same repository, with its own branch and its own directory. Caudra treats every checkout of a repository as one project. They share memory notes and plans, and a session can move from one checkout to another. `/worktree` creates, opens and removes worktrees from inside a session.
 
-Inside a [Herdr](https://herdr.dev) pane, Herdr creates and removes the worktrees and opens each one in a workspace grouped with the repository. Everywhere else, Caudra runs git itself. The commands are the same in both cases.
+Inside a [Herdr](https://herdr.dev) pane, Herdr creates and removes the worktrees and opens each one in a workspace grouped with the repository. Inside an [Orca](#orca-integration) terminal, Orca does the same for repositories you added to Orca. Everywhere else, Caudra runs git itself. The commands are the same in every case.
 
 ## One project per repository
 
@@ -30,7 +30,7 @@ A worktree may have notes and plans of its own from an older Caudra release. The
 
 `/worktree new` starts creating a worktree as `Ctrl+N` does, and `/worktree new <branch>` names the branch up front. `/worktree remove` opens the removal of the checkout the session works in. The main checkout cannot be removed.
 
-Opening a checkout outside Herdr moves every open tab into it, as [`/cd`](/docs/commands/) does. Inside Herdr, Caudra asks Herdr to open the checkout in its workspace. Herdr focuses the workspace when it is already open.
+Opening a checkout outside Herdr moves every open tab into it, as [`/cd`](/docs/commands/) does. Inside Herdr, Caudra asks Herdr to open the checkout in its workspace. Herdr focuses the workspace when it is already open. Inside Orca, Caudra switches to a terminal Orca has open in the checkout, or opens one there.
 
 ## Creating a worktree
 
@@ -56,11 +56,13 @@ Outside Herdr, git creates the worktree under `worktrees.directory` as `<directo
 
 Inside Herdr, Herdr creates the worktree and a workspace grouped with the repository's own. Herdr names the branch when you leave it empty. The session continues in the root pane of the new workspace. Caudra labels that pane and its Herdr tab with the branch. Its tab closes in the current pane. When that tab was the last one, Caudra exits and the pane returns to its shell. If Herdr cannot start the session in the new pane, Caudra stays open with a fresh session and shows the command that resumes it.
 
+Inside Orca, Orca creates the worktree and lists it in its sidebar. Orca needs a name, so Caudra generates one starting with `caudra/` when you leave it empty. Orca may adjust the name it is given. The session continues in a new Orca terminal in the worktree, titled with the branch, and the current terminal behaves as it does in Herdr. When Orca does not know the repository, git creates the worktree as it does outside Orca, and the notice says so.
+
 The new pane runs the same Caudra executable. If an upgrade replaced it while Caudra was running, the pane runs the replacement at that path. If neither file remains, the pane runs `caudra` from `PATH`.
 
 ## Removing a worktree
 
-Removal always keeps the branch. When the worktree has uncommitted changes, the confirmation offers two ways forward:
+Removal keeps the branch, except [inside Orca](#orca-integration). When the worktree has uncommitted changes, the confirmation offers two ways forward:
 
 - **Stash uncommitted changes, then remove.** The changes are saved with `git stash`. Stashes are shared by every checkout of the repository, so `git stash apply` brings them back in any of them.
 - **Discard uncommitted changes and remove.** The worktree is removed with `--force`.
@@ -68,6 +70,8 @@ Removal always keeps the branch. When the worktree has uncommitted changes, the 
 Sessions that work in the worktree move back before it goes. They go to the same subdirectory of the main checkout when it exists, and otherwise to the main checkout root. If they cannot move, the worktree is kept and Caudra says why.
 
 Inside Herdr, removing a worktree also closes its workspace. When the current pane is in that workspace, Caudra first opens a pane in the repository's workspace, or in a new workspace when the repository has none open. The focused session continues in that pane, and Caudra exits. The removal then runs in its own process, because Herdr closes the pane that started it.
+
+Inside Orca, Orca removes the worktree. When the current terminal is in that worktree, the focused session first continues in a new terminal in the repository's main worktree, and Caudra exits. Orca also deletes the worktree's branch when it is fully merged, so removal keeps only unmerged branches.
 
 ## Moving back after a removal
 
@@ -81,7 +85,7 @@ A session goes to the checkout git moved the worktree to, if it was moved rather
 
 ## Sessions in other checkouts
 
-`/sessions` lists the sessions of the current directory first. Below them, it lists the sessions of each other checkout of the repository, one section per checkout. Opening one of those sessions outside Herdr moves the tabs into its checkout, as `/cd` does, and then focuses the session. Inside Herdr, Caudra opens the checkout in its Herdr workspace and resumes the session in a pane there. When another Caudra process already has the session open, only the workspace is focused. See [Sessions](/docs/sessions/#moving-sessions-to-another-directory) for other ways to move sessions.
+`/sessions` lists the sessions of the current directory first. Below them, it lists the sessions of each other checkout of the repository, one section per checkout. Opening one of those sessions outside Herdr moves the tabs into its checkout, as `/cd` does, and then focuses the session. Inside Herdr, Caudra opens the checkout in its Herdr workspace and resumes the session in a pane there. When another Caudra process already has the session open, only the workspace is focused. Inside Orca, Caudra resumes the session in a new terminal in that checkout. See [Sessions](/docs/sessions/#moving-sessions-to-another-directory) for other ways to move sessions.
 
 ## Trust across checkouts
 
@@ -97,6 +101,8 @@ When a session moves to another directory, the model is told the old and the new
 
 Inside Herdr, the `herdr` skill is available through the [`skill` tool](/docs/skills/). Its content is what `herdr --skill` prints, so it matches the installed Herdr release. A skill named `herdr` on disk takes precedence. Shell commands get the variables Herdr sets in the pane, such as `HERDR_ENV` and `HERDR_PANE_ID`, so the skill's own Herdr check passes and its examples address this pane. Commands on a remote workspace do not get them. Suggested permission patterns for `herdr` keep three words, so approving `herdr pane read w1:p2` offers `herdr pane read *` rather than a rule for one pane.
 
+Inside Orca, the `orca` skill works the same way. Its content is what `orca skills get orca-cli` prints. Shell commands get the variables Orca sets in the terminal, such as `ORCA_TERMINAL_HANDLE` and `ORCA_WORKTREE_ID`. Orca's hook and launch tokens and its cloud credentials are never passed on. Suggested permission patterns for `orca` also keep three words, so approving `orca terminal send --terminal t1` offers `orca terminal send *`.
+
 ## Herdr integration
 
 Caudra detects Herdr from the environment Herdr gives every process it starts in a pane. Besides worktrees, Caudra reports to Herdr:
@@ -108,3 +114,9 @@ Caudra detects Herdr from the environment Herdr gives every process it starts in
 After a Herdr restart, Herdr runs that command in the restored pane, so the focused tab comes back. Other tabs stay available in `/sessions`. See [CLI](/docs/cli/) for how reporting works and [Notifications](/docs/notifications/#herdr) for how notifications change inside Herdr.
 
 Native Herdr reporting takes precedence over [OSC 7501 pane status](/docs/notifications/#persistent-pane-status), so Caudra does not probe for or send OSC 7501 while the native reporter is active.
+
+## Orca integration
+
+Caudra detects [Orca](https://github.com/stablyai/orca) from the variables Orca sets in each terminal, `ORCA_PANE_KEY` or `ORCA_TERMINAL_HANDLE`. Herdr running inside Orca counts as Herdr. Besides worktrees, Caudra reports the agent state, the model and the label of the blocking prompt. See [Notifications](/docs/notifications/#orca) for what the report contains and how notifications change inside Orca.
+
+Orca cannot restore a Caudra terminal after a restart. Your sessions stay available in `/sessions` and through `caudra --session <id>`.

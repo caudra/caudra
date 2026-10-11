@@ -22668,17 +22668,21 @@ fn lifecycle_blocker_reads_like_the_notification() {
     );
 }
 
-#[test_case(Status::Idle, ProgramStatus::Idle; "idle")]
-#[test_case(Status::Streaming, ProgramStatus::Working; "streaming")]
-fn program_status_without_user_decisions(status: Status, expected: ProgramStatus) {
+#[test_case(Status::Idle, PaneState::Idle; "idle")]
+#[test_case(Status::Streaming, PaneState::Working; "streaming")]
+fn pane_status_without_user_decisions(status: Status, expected: PaneState) {
     let mut app = test_app();
     app.status = status;
-    assert_eq!(app.program_status(), expected, "{PROGRAM_STATUS_AUTOMATIC}");
+    assert_eq!(
+        app.pane_status().state,
+        expected,
+        "{PROGRAM_STATUS_AUTOMATIC}"
+    );
 }
 
 #[test_case(ToolKey::native(SHELL_TOOL_NAME); "named_tool")]
 #[test_case(ToolKey::Wildcard; "wildcard_tool")]
-fn program_status_permission_outranks_auth_and_streaming(tool: ToolKey) {
+fn pane_status_permission_outranks_auth_and_streaming(tool: ToolKey) {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.pending_input = PendingInput::AuthRetry {
@@ -22691,23 +22695,23 @@ fn program_status_permission_outranks_auth_and_streaming(tool: ToolKey) {
         None,
     );
     assert_eq!(
-        app.program_status(),
-        ProgramStatus::Blocked(Some(ProgramBlockKind::Permission)),
+        app.pane_status().state,
+        PaneState::Blocked(Some(BlockKind::Permission)),
         "{PROGRAM_STATUS_DECISION}"
     );
     app.permission_prompt.close();
     assert_eq!(
-        app.program_status(),
-        ProgramStatus::Blocked(Some(ProgramBlockKind::Auth)),
+        app.pane_status().state,
+        PaneState::Blocked(Some(BlockKind::Auth)),
         "{PROGRAM_STATUS_DECISION}"
     );
     app.pending_input = PendingInput::None;
-    assert_eq!(app.program_status(), ProgramStatus::Working);
+    assert_eq!(app.pane_status().state, PaneState::Working);
 }
 
 #[test_case(Status::Idle; "idle_question")]
 #[test_case(Status::Streaming; "streaming_question")]
-fn program_status_question_form_requires_a_decision(status: Status) {
+fn pane_status_question_form_requires_a_decision(status: Status) {
     let mut app = test_app();
     app.status = status;
     app.question_form.open(vec![AskedQuestion {
@@ -22720,25 +22724,25 @@ fn program_status_question_form_requires_a_decision(status: Status) {
         multiple: false,
     }]);
     assert_eq!(
-        app.program_status(),
-        ProgramStatus::Blocked(Some(ProgramBlockKind::Question)),
+        app.pane_status().state,
+        PaneState::Blocked(Some(BlockKind::Question)),
         "{PROGRAM_STATUS_DECISION}"
     );
     app.question_form.close();
     assert_eq!(
-        app.program_status(),
+        app.pane_status().state,
         if app.status == Status::Streaming {
-            ProgramStatus::Working
+            PaneState::Working
         } else {
-            ProgramStatus::Idle
+            PaneState::Idle
         }
     );
 }
 
-#[test_case(Status::Idle, true, ProgramStatus::Blocked(Some(ProgramBlockKind::Question)); "ready_plan")]
-#[test_case(Status::Streaming, true, ProgramStatus::Working; "plan_still_running")]
-#[test_case(Status::Idle, false, ProgramStatus::Idle; "hidden_plan")]
-fn program_status_plan_decision(status: Status, visible: bool, expected: ProgramStatus) {
+#[test_case(Status::Idle, true, PaneState::Blocked(Some(BlockKind::Question)); "ready_plan")]
+#[test_case(Status::Streaming, true, PaneState::Working; "plan_still_running")]
+#[test_case(Status::Idle, false, PaneState::Idle; "hidden_plan")]
+fn pane_status_plan_decision(status: Status, visible: bool, expected: PaneState) {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from(HANDOFF_PLAN_FILE));
@@ -22747,12 +22751,16 @@ fn program_status_plan_decision(status: Status, visible: bool, expected: Program
         app.plan_form.hide();
     }
     app.status = status;
-    assert_eq!(app.program_status(), expected, "{PROGRAM_STATUS_DECISION}");
+    assert_eq!(
+        app.pane_status().state,
+        expected,
+        "{PROGRAM_STATUS_DECISION}"
+    );
 }
 
 #[test_case(false; "mcp_trust")]
 #[test_case(true; "project_permission_trust")]
-fn program_status_trust_requires_an_open_decision(project_permissions: bool) {
+fn pane_status_trust_requires_an_open_decision(project_permissions: bool) {
     let mut app = if project_permissions {
         app_awaiting_permission_config_trust()
     } else {
@@ -22760,7 +22768,7 @@ fn program_status_trust_requires_an_open_decision(project_permissions: bool) {
         app.mcp_picker = awaiting_mcp_picker();
         app
     };
-    assert_eq!(app.program_status(), ProgramStatus::Idle);
+    assert_eq!(app.pane_status().state, PaneState::Idle);
     if project_permissions {
         app.open_awaiting_permission_config_trust(false);
         app.finish_permission_jobs();
@@ -22768,31 +22776,73 @@ fn program_status_trust_requires_an_open_decision(project_permissions: bool) {
         app.open_awaiting_mcp_trust(false);
     }
     assert_eq!(
-        app.program_status(),
-        ProgramStatus::Blocked(Some(ProgramBlockKind::Permission)),
+        app.pane_status().state,
+        PaneState::Blocked(Some(BlockKind::Permission)),
         "{PROGRAM_STATUS_DECISION}"
     );
     app.permissions_picker.close();
     app.mcp_picker.close();
-    assert_eq!(app.program_status(), ProgramStatus::Idle);
+    assert_eq!(app.pane_status().state, PaneState::Idle);
 }
 
-#[test_case("/login"; "login")]
 #[test_case("/permissions"; "permissions_settings")]
 #[test_case("/mcp"; "mcp_settings")]
-fn program_status_settings_are_not_user_blockers(command: &str) {
+fn pane_status_settings_are_not_user_blockers(command: &str) {
     let mut app = test_app();
     app.execute_command(cmd(command), 0);
     app.finish_permission_jobs();
     assert!(app.any_overlay_open());
-    assert_eq!(app.program_status(), ProgramStatus::Idle);
+    assert_eq!(app.pane_status().state, PaneState::Idle);
     app.status = Status::Streaming;
-    assert_eq!(app.program_status(), ProgramStatus::Working);
+    assert_eq!(app.pane_status().state, PaneState::Working);
+}
+
+/// Herdr always showed an open login picker as blocked; the OSC 7501 status
+/// now does too, since only the user can sign in.
+#[test]
+fn pane_status_login_waits_for_the_user() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.execute_command(cmd("/login"), 0);
+
+    assert_eq!(
+        app.pane_status(),
+        PaneStatus {
+            label: Some(LOGIN_BLOCKER.into()),
+            ..PaneStatus::new(PaneState::Blocked(Some(BlockKind::Auth)))
+        }
+    );
+}
+
+#[test]
+fn pane_status_names_the_tool_waiting_for_permission() {
+    let mut app = test_app();
+    app.permission_prompt.open(
+        PREVIEW_PERMISSION_ID.into(),
+        ToolKey::native(SHELL_TOOL_NAME),
+        vec![PREVIEW_PERMISSION_COMMAND.into()],
+        None,
+    );
+
+    assert_eq!(
+        app.pane_status().label.as_deref(),
+        app.attention()
+            .map(|attention| attention.message())
+            .as_deref()
+    );
+}
+
+#[test]
+fn pane_status_work_carries_no_label() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+
+    assert_eq!(app.pane_status(), PaneStatus::new(PaneState::Working));
 }
 
 #[test_case(false; "restoring")]
 #[test_case(true; "subagent_retry")]
-fn program_status_background_lifecycle_work(retrying: bool) {
+fn pane_status_background_lifecycle_work(retrying: bool) {
     let mut app = if retrying {
         app_with_retrying_subagent()
     } else {
@@ -22801,15 +22851,15 @@ fn program_status_background_lifecycle_work(retrying: bool) {
     app.status = Status::Idle;
     app.restoring.store(!retrying, Ordering::Relaxed);
     assert_eq!(
-        app.program_status(),
-        ProgramStatus::Working,
+        app.pane_status().state,
+        PaneState::Working,
         "{PROGRAM_STATUS_AUTOMATIC}"
     );
 }
 
-#[test_case(false, ProgramStatus::Idle; "passive_float")]
-#[test_case(true, ProgramStatus::Blocked(Some(ProgramBlockKind::Question)); "input_float")]
-fn program_status_float_attention(needs_input: bool, expected: ProgramStatus) {
+#[test_case(false, PaneState::Idle; "passive_float")]
+#[test_case(true, PaneState::Blocked(Some(BlockKind::Question)); "input_float")]
+fn pane_status_float_attention(needs_input: bool, expected: PaneState) {
     let mut app = test_app();
     let buffer = Arc::new(SharedBuf::new());
     let config = FloatConfig {
@@ -22820,12 +22870,16 @@ fn program_status_float_attention(needs_input: bool, expected: ProgramStatus) {
     let (_command_tx, command_rx) = flume::bounded(1);
     app.float_mgr
         .open(buffer, config, true, event_tx, command_rx);
-    assert_eq!(app.program_status(), expected, "{PROGRAM_STATUS_DECISION}");
+    assert_eq!(
+        app.pane_status().state,
+        expected,
+        "{PROGRAM_STATUS_DECISION}"
+    );
 }
 
 #[test_case(StreamFooter::FollowUp; "follow_up")]
 #[test_case(StreamFooter::Close; "close")]
-fn program_status_stream_modal_is_working(footer: StreamFooter) {
+fn pane_status_stream_modal_is_working(footer: StreamFooter) {
     let mut app = test_app();
     let (_sender, receiver) = flume::bounded(1);
     let (trigger, _cancel) = CancelToken::new();
@@ -22838,15 +22892,15 @@ fn program_status_stream_modal_is_working(footer: StreamFooter) {
     );
     assert_eq!(app.status, Status::Idle);
     assert_eq!(
-        app.program_status(),
-        ProgramStatus::Working,
+        app.pane_status().state,
+        PaneState::Working,
         "{PROGRAM_STATUS_AUTOMATIC}"
     );
 }
 
 #[test_case(false; "visible_picker")]
 #[test_case(true; "closed_picker")]
-fn program_status_permission_persistence_is_automatic(closed: bool) {
+fn pane_status_permission_persistence_is_automatic(closed: bool) {
     let mut app = test_app();
     app.permissions = Arc::new(PermissionManager::new_persistent_in(
         PermissionsConfig::default(),
@@ -22885,8 +22939,8 @@ fn program_status_permission_persistence_is_automatic(closed: bool) {
         None,
     );
     assert_eq!(
-        app.program_status(),
-        ProgramStatus::Blocked(Some(ProgramBlockKind::Permission))
+        app.pane_status().state,
+        PaneState::Blocked(Some(BlockKind::Permission))
     );
     app.request_permission_answer(PermissionDecision {
         request_id: PREVIEW_PERMISSION_ID.into(),
@@ -22899,8 +22953,8 @@ fn program_status_permission_persistence_is_automatic(closed: bool) {
         app.permissions_picker.close();
     }
     assert_eq!(
-        app.program_status(),
-        ProgramStatus::Working,
+        app.pane_status().state,
+        PaneState::Working,
         "{PROGRAM_STATUS_AUTOMATIC}"
     );
     app.finish_permission_jobs();
@@ -22913,13 +22967,13 @@ fn program_status_permission_persistence_is_automatic(closed: bool) {
             .iter()
             .any(|record| record.rule.lifetime == PermissionLifetime::Project)
     );
-    assert_eq!(app.program_status(), ProgramStatus::Idle);
+    assert_eq!(app.pane_status().state, PaneState::Idle);
 }
 
 #[cfg(unix)]
-#[test_case(false, ProgramStatus::Blocked(None); "unsaved_draft")]
-#[test_case(true, ProgramStatus::Working; "draft_awaiting_persistence")]
-fn program_status_sandbox_draft_and_save(pending: bool, expected: ProgramStatus) {
+#[test_case(false, PaneState::Blocked(None); "unsaved_draft")]
+#[test_case(true, PaneState::Working; "draft_awaiting_persistence")]
+fn pane_status_sandbox_draft_and_save(pending: bool, expected: PaneState) {
     let (_directory, _store, manager) = sandbox_manager_fixture();
     let mut app = test_app();
     app.sandbox_manager = manager;
@@ -22936,13 +22990,17 @@ fn program_status_sandbox_draft_and_save(pending: bool, expected: ProgramStatus)
         );
     }
     assert_eq!(app.sandbox_manager.pending(), pending);
-    assert_eq!(app.program_status(), expected, "{PROGRAM_STATUS_DECISION}");
+    assert_eq!(
+        app.pane_status().state,
+        expected,
+        "{PROGRAM_STATUS_DECISION}"
+    );
 }
 
 #[cfg(unix)]
-#[test_case(false, ProgramStatus::Working; "reconciling")]
-#[test_case(true, ProgramStatus::Blocked(Some(ProgramBlockKind::Permission)); "permission_during_reconciliation")]
-fn program_status_network_reconciliation(permission: bool, expected: ProgramStatus) {
+#[test_case(false, PaneState::Working; "reconciling")]
+#[test_case(true, PaneState::Blocked(Some(BlockKind::Permission)); "permission_during_reconciliation")]
+fn pane_status_network_reconciliation(permission: bool, expected: PaneState) {
     let (_directory, store, _manager) = sandbox_manager_fixture();
     let mut app = test_app();
     let (_sender, receiver) = flume::bounded(1);
@@ -22956,7 +23014,11 @@ fn program_status_network_reconciliation(permission: bool, expected: ProgramStat
             None,
         );
     }
-    assert_eq!(app.program_status(), expected, "{PROGRAM_STATUS_DECISION}");
+    assert_eq!(
+        app.pane_status().state,
+        expected,
+        "{PROGRAM_STATUS_DECISION}"
+    );
 }
 
 #[test]
@@ -25352,7 +25414,7 @@ mod autopilot {
         press_esc_twice_during_a_run, start_a_run,
     };
     use super::{
-        App, Msg, Notification, PlanState, ProgramBlockKind, ProgramStatus, agent_msg,
+        App, BlockKind, Msg, Notification, PaneState, PaneStatus, PlanState, agent_msg,
         btw_ready_app, build_app, cancel_app, click_status, done_event, drain_writer, key,
         open_question, plan_app, queued_msg, rendered, sent_input, subagent_msg, tempdir_app,
         test_app, test_model, test_writer,
@@ -25970,14 +26032,14 @@ mod autopilot {
     }
 
     #[test_case(deciding_permission, None ; "permission_while_deciding")]
-    #[test_case(escalated_permission, Some((DecisionKind::Permission, ProgramBlockKind::Permission)) ; "permission_once_escalated")]
+    #[test_case(escalated_permission, Some((DecisionKind::Permission, BlockKind::Permission)) ; "permission_once_escalated")]
     #[test_case(deciding_question, None ; "question_while_deciding")]
-    #[test_case(escalated_question, Some((DecisionKind::Question, ProgramBlockKind::Question)) ; "question_once_escalated")]
+    #[test_case(escalated_question, Some((DecisionKind::Question, BlockKind::Question)) ; "question_once_escalated")]
     #[test_case(deciding_plan, None ; "plan_while_deciding")]
-    #[test_case(escalated_plan, Some((DecisionKind::Plan, ProgramBlockKind::Question)) ; "plan_once_escalated")]
+    #[test_case(escalated_plan, Some((DecisionKind::Plan, BlockKind::Question)) ; "plan_once_escalated")]
     fn a_card_waits_on_the_user_only_once_autopilot_left_it(
         card: fn(&mut App),
-        wait: Option<(DecisionKind, ProgramBlockKind)>,
+        wait: Option<(DecisionKind, BlockKind)>,
     ) {
         let mut app = running_app();
 
@@ -25987,7 +26049,7 @@ mod autopilot {
             assert_eq!(app.attention(), None, "{NO_NOTICE_WHILE_DECIDING}");
             assert!(!app.awaiting_input(), "{NO_NOTICE_WHILE_DECIDING}");
             assert_eq!(app.lifecycle_blocker(), None, "{NO_NOTICE_WHILE_DECIDING}");
-            assert_eq!(app.program_status(), ProgramStatus::Working);
+            assert_eq!(app.pane_status(), PaneStatus::new(PaneState::Working));
             return;
         };
         let notice = Notification::AutopilotNeedsYou { wait: kind };
@@ -25998,7 +26060,7 @@ mod autopilot {
             Some(notice.message().as_str())
         );
         assert_eq!(app.attention(), Some(notice));
-        assert_eq!(app.program_status(), ProgramStatus::Blocked(Some(block)));
+        assert_eq!(app.pane_status().state, PaneState::Blocked(Some(block)));
     }
 
     /// A card autopilot is deciding leaves the modal the user is in alone and

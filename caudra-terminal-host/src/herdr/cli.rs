@@ -4,37 +4,15 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
-use thiserror::Error;
 
+use super::HOST;
 use super::env::HERDR_SOCKET_PATH;
-use crate::bounded_process::{self, ProcessError};
+use crate::bounded_process;
+use crate::error::HostError;
 
 /// How the CLI answers arguments it cannot parse, which is also how a release
 /// that predates a subcommand or flag answers it.
 const USAGE_EXIT_CODE: i32 = 2;
-
-#[derive(Debug, Error)]
-pub enum HerdrError {
-    #[error("herdr: {0}")]
-    Run(#[source] ProcessError),
-    #[error("herdr refused the request ({code}): {message}")]
-    Api { code: String, message: String },
-    #[error("this Herdr predates the request, update Herdr: {0}")]
-    Unsupported(String),
-    #[error("herdr exited with {status}: {stderr}")]
-    Failed { status: ExitStatus, stderr: String },
-    #[error("herdr answered with unreadable output: {0}")]
-    Output(#[source] serde_json::Error),
-}
-
-impl HerdrError {
-    pub fn code(&self) -> Option<&str> {
-        match self {
-            Self::Api { code, .. } => Some(code),
-            _ => None,
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct HerdrCli {
@@ -68,9 +46,9 @@ impl HerdrCli {
 
     /// Runs one command without a shell and returns its `result`, or `None`
     /// for the commands that print nothing on success, such as reports.
-    pub fn run(&self, args: &[OsString], timeout: Duration) -> Result<Option<Value>, HerdrError> {
-        let finished =
-            bounded_process::run(&mut self.command(args), timeout).map_err(HerdrError::Run)?;
+    pub fn run(&self, args: &[OsString], timeout: Duration) -> Result<Option<Value>, HostError> {
+        let finished = bounded_process::run(&mut self.command(args), timeout)
+            .map_err(|error| HostError::Run(HOST, error))?;
         interpret(finished.status, &finished.stdout, &finished.stderr)
     }
 
@@ -83,11 +61,7 @@ impl HerdrCli {
     }
 }
 
-fn interpret(
-    status: ExitStatus,
-    stdout: &[u8],
-    stderr: &[u8],
-) -> Result<Option<Value>, HerdrError> {
+fn interpret(status: ExitStatus, stdout: &[u8], stderr: &[u8]) -> Result<Option<Value>, HostError> {
     if status.success() {
         let stdout = stdout.trim_ascii();
         if stdout.is_empty() {
@@ -95,28 +69,34 @@ fn interpret(
         }
         return serde_json::from_slice::<Success>(stdout)
             .map(|success| Some(success.result))
-            .map_err(HerdrError::Output);
+            .map_err(|error| HostError::Output(HOST, error));
     }
     if let Some(Failure { error }) = stderr
         .split(|byte| *byte == b'\n')
         .rev()
         .find_map(|line| serde_json::from_slice(line.trim_ascii()).ok())
     {
-        return Err(HerdrError::Api {
+        return Err(HostError::Refused {
+            host: HOST,
             code: error.code,
             message: error.message,
         });
     }
     let stderr = String::from_utf8_lossy(stderr.trim_ascii()).into_owned();
     if status.code() == Some(USAGE_EXIT_CODE) {
-        return Err(HerdrError::Unsupported(stderr));
+        return Err(HostError::Unsupported(HOST, stderr));
     }
-    Err(HerdrError::Failed { status, stderr })
+    Err(HostError::Failed {
+        host: HOST,
+        status,
+        stderr,
+    })
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::bounded_process::ProcessError;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
@@ -211,7 +191,7 @@ mod tests {
 
         let error = cli.run(&[], TIMEOUT).unwrap_err();
 
-        assert_eq!(matches!(error, HerdrError::Unsupported(_)), unsupported);
+        assert_eq!(matches!(error, HostError::Unsupported(..)), unsupported);
         assert!(error.to_string().contains(USAGE_MESSAGE), "{error}");
     }
 
@@ -220,7 +200,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cli = fake_herdr(dir.path(), "echo 'not json'");
 
-        assert!(matches!(cli.run(&[], TIMEOUT), Err(HerdrError::Output(_))));
+        assert!(matches!(cli.run(&[], TIMEOUT), Err(HostError::Output(..))));
     }
 
     #[test]
@@ -230,7 +210,7 @@ mod tests {
 
         assert!(matches!(
             cli.run(&[], SHORT_TIMEOUT),
-            Err(HerdrError::Run(ProcessError::Timeout(SHORT_TIMEOUT)))
+            Err(HostError::Run(_, ProcessError::Timeout(SHORT_TIMEOUT)))
         ));
     }
 
@@ -241,7 +221,7 @@ mod tests {
 
         assert!(matches!(
             cli.run(&[], TIMEOUT),
-            Err(HerdrError::Run(ProcessError::Spawn(_)))
+            Err(HostError::Run(_, ProcessError::Spawn(_)))
         ));
     }
 }

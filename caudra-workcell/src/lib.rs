@@ -4953,7 +4953,6 @@ mod tests {
     use caudra_agent::agent::tool_dispatch::{self, Emit};
     use caudra_agent::background::{BackgroundTasks, JobScope, ShellLive};
     use caudra_agent::cancel::CancelToken;
-    use caudra_agent::herdr::PANE_ENVIRONMENT;
     use caudra_agent::permissions::pattern_recognition::{CommandObservation, ShellEffectStatus};
     use caudra_agent::permissions::{
         AutoNote, COMMAND_EXACT_PREFIX, COMMAND_TEMPLATE_PREFIX, ComposedRow, PermissionAnswer,
@@ -4990,6 +4989,7 @@ mod tests {
         sessions::SessionDatabase,
         tool_outputs::ToolOutputStore,
     };
+    use caudra_terminal_host::PANE_ENVIRONMENT;
     use caudra_workspace::{OperationHandle, OperationId, OperationProgress, SequenceMetadata};
     use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
     use serde_json::json;
@@ -5092,8 +5092,8 @@ mod tests {
     const LEADING_CD_COMMAND: &str = "cd ../workcell-mcp && grep -rn --include=*.rs -E";
     /// Names the child test a parent re-runs this binary for.
     const CHILD_TEST_ENV: &str = "CAUDRA_WORKCELL_CHILD_TEST";
-    const HERDR_PANE_CHILD: &str = "tests::herdr_pane_environment_child";
-    const HERDR_PANE_CHILD_PASSED: &str = "the herdr pane environment reached the command";
+    const HOST_PANE_CHILD: &str = "tests::host_pane_environment_child";
+    const HOST_PANE_CHILD_PASSED: &str = "the host pane environment reached the command";
     const PANE_CANARY_SUFFIX: &str = "-canary";
     const SHELL_ENV_CHILD: &str = "tests::configured_shell_environment_child";
     const SHELL_ENV_CHILD_PASSED: &str = "the configured shell environment reached the command";
@@ -8323,14 +8323,15 @@ mod tests {
         format!("{name}{PANE_CANARY_SUFFIX}")
     }
 
-    /// The `herdr` skill stops unless a command sees `HERDR_ENV`, and it
-    /// addresses the pane through the other variables. Setting them in this
-    /// process takes `unsafe`, so a copy of this binary runs the command.
+    /// A host's skill stops unless a command sees the host's pane, such as
+    /// `HERDR_ENV` or `ORCA_PANE_KEY`, and its CLI addresses the pane through
+    /// the other variables. Setting them in this process takes `unsafe`, so a
+    /// copy of this binary runs the command.
     #[test]
-    fn shell_commands_see_the_herdr_pane_they_run_in() {
+    fn shell_commands_see_the_host_pane_they_run_in() {
         let child = Command::new(std::env::current_exe().expect("test binary"))
-            .args(["--exact", HERDR_PANE_CHILD, "--nocapture"])
-            .env(CHILD_TEST_ENV, HERDR_PANE_CHILD)
+            .args(["--exact", HOST_PANE_CHILD, "--nocapture"])
+            .env(CHILD_TEST_ENV, HOST_PANE_CHILD)
             .envs(
                 PANE_ENVIRONMENT
                     .iter()
@@ -8341,15 +8342,15 @@ mod tests {
         let stdout = String::from_utf8_lossy(&child.stdout);
 
         assert!(
-            child.status.success() && stdout.contains(HERDR_PANE_CHILD_PASSED),
+            child.status.success() && stdout.contains(HOST_PANE_CHILD_PASSED),
             "{stdout}{}",
             String::from_utf8_lossy(&child.stderr)
         );
     }
 
     #[test]
-    fn herdr_pane_environment_child() {
-        if std::env::var(CHILD_TEST_ENV).as_deref() != Ok(HERDR_PANE_CHILD) {
+    fn host_pane_environment_child() {
+        if std::env::var(CHILD_TEST_ENV).as_deref() != Ok(HOST_PANE_CHILD) {
             return;
         }
         let root = TempDir::new().expect("tempdir");
@@ -8372,7 +8373,7 @@ mod tests {
             .map(|&name| pane_canary(name))
             .collect();
         assert_eq!(output.stdout.lines().collect::<Vec<_>>(), expected);
-        println!("{HERDR_PANE_CHILD_PASSED}");
+        println!("{HOST_PANE_CHILD_PASSED}");
     }
 
     /// `[agent.shell_env]` forwards exact names and prefixes, lets `set` win,

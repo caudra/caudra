@@ -3,10 +3,10 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use caudra_agent::herdr::PANE_ENVIRONMENT;
 use caudra_config::shell_env::GlobalShellEnvFile;
 use caudra_config::{EnvSource, env_source, shell_visible_environment};
 use caudra_providers::catalog_providers_if_available;
+use caudra_terminal_host::PANE_ENVIRONMENT;
 use workcell_tool_contract::shell_env::{
     BASE_ALLOWLIST, EnvPattern, is_shell_startup_variable, is_valid_variable_name, looks_secret,
 };
@@ -25,7 +25,7 @@ pub(super) const CONFIG_BADGE: &str = "config";
 pub(super) const PROCESS_BADGE: &str = "process";
 pub(super) const GLOBAL_ENV_BADGE: &str = "global .env";
 pub(super) const PROJECT_ENV_BADGE: &str = "project .env";
-pub(super) const HERDR_STATE: &str = "Herdr pane";
+pub(super) const HOST_PANE_STATE: &str = "host pane";
 pub(super) const SET_STATE: &str = "set";
 pub(super) const UNSET_STATE: &str = "unset";
 pub(super) const PROJECT_STATE: &str = "repository";
@@ -35,7 +35,8 @@ pub(super) const PROJECT_NOTE: &str =
 pub(super) const STARTUP_NOTE: &str =
     "Decides how Bash starts, so no shell command can receive it.";
 const INVALID_NAME_NOTE: &str = "Not a name a shell variable can have.";
-const HERDR_NOTE: &str = "Herdr's pane variables reach every command run in a Herdr pane.";
+const HOST_PANE_NOTE: &str =
+    "Herdr and Orca pane variables reach every command run in their panes.";
 
 pub(crate) struct HostVariable {
     pub(crate) value: String,
@@ -154,7 +155,7 @@ pub(super) fn local_rows(environment: &LocalEnvironment) -> Vec<EnvRow> {
         let fixed = if BASE_ALLOWLIST.contains(&name.as_str()) {
             Some((BUILT_IN_STATE, BUILT_IN_NOTE))
         } else if PANE_ENVIRONMENT.contains(&name.as_str()) {
-            Some((HERDR_STATE, HERDR_NOTE))
+            Some((HOST_PANE_STATE, HOST_PANE_NOTE))
         } else {
             None
         };

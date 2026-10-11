@@ -8,8 +8,9 @@ when you move to another terminal while Caudra works.
 
 Notifications are enabled by default. In the interactive TUI, `auto` uses
 persistent pane status when the immediate terminal supports OSC 7501. Otherwise,
-it uses the legacy notifications described below. Native Herdr reporting takes
-precedence. This does not change headless or ACP behavior.
+it uses the legacy notifications described below. Native [Herdr](#herdr) and
+[Orca](#orca) reporting take precedence. This does not change headless or ACP
+behavior.
 
 ## Configuration
 
@@ -22,16 +23,17 @@ notifications = "auto"
 
 | Value | Behavior |
 | --- | --- |
-| `auto` | Prefer native Herdr reporting, then OSC 7501 status when supported. Otherwise use OSC 9 in a supported terminal or BEL. |
+| `auto` | Prefer native Herdr or Orca reporting, then OSC 7501 status when supported. Otherwise use OSC 9 in a supported terminal or BEL. |
 | `osc9` | Always send an OSC 9 notification. |
 | `bell` | Always send the terminal bell. |
 | `off` | Do not send notifications. |
 
 Explicit `osc9`, `bell`, and `off` settings do not probe for or use OSC 7501.
+Native Herdr and Orca status keeps working with every setting, including `off`.
 
 ## Persistent pane status
 
-Outside native Herdr reporting, the interactive TUI with `auto` probes its
+Outside Herdr and Orca, the interactive TUI with `auto` probes its
 immediate terminal once for OSC 7501 support. A supporting receiver gets
 persistent `idle`, `working`, `blocked`, `done`, or `error` status. A blocked
 status can identify the kind as `permission`, `question`, or `auth`. The receiver
@@ -43,6 +45,12 @@ trees. Priority is `blocked` > `working` > unacknowledged `error` > unacknowledg
 `done` > `idle`. Cancellation returns that session to idle after its remaining
 work settles. Completed outcomes are acknowledged when you interact with the
 Caudra session that owns them. Focus alone does not acknowledge them.
+
+`blocked` means you must act: a permission, question, plan approval, or held
+[peer messages](/docs/messaging/#find-peers-and-review-messages) waiting for you. An open login picker is
+`blocked` with kind `auth`. While Caudra waits on its own work, such as saving
+a permission choice, acknowledging a sandbox, or transferring files, the status
+is `working`. Herdr and Orca read the same status.
 
 While [autopilot](/docs/autopilot/) decides a prompt, question, or plan for
 you, the pane reads as `working`. When autopilot leaves one to you, the pane
@@ -85,8 +93,9 @@ focus. OSC 9 uses these messages:
   `continuation limit reached`. An end caused by an error reads as `error`.
 
 Automation `notify()` and the end of autopilot remain explicit notifications
-through this route, even when OSC 7501 status is active. They do not become
-pane status updates.
+through this route, even when OSC 7501, Herdr, or Orca status is active. They do
+not become pane status updates. With `auto`, they use OSC 9 or BEL as described
+above.
 
 Response previews and automation notices can appear in your operating system's
 notification history. Caudra does not include tool arguments, permission scopes,
@@ -120,15 +129,37 @@ Caudra sends OSC 9 directly through Zellij.
 ## Herdr
 
 When native Herdr reporting is active, it remains authoritative. `auto` sends
-no separate notifications and does not probe for or use OSC 7501. Caudra reports
-its state to Herdr, and Herdr shows its own notice when the agent finishes or
-waits for you. The notice names the prompt that is waiting, such as
-`Permission requested: shell`. An explicit `osc9` or `bell` setting still
+no separate notices for turns and prompts, and it does not probe for or use
+OSC 7501. Caudra reports its state to Herdr, and Herdr shows its own notice when
+the agent finishes or waits for you. The notice names the prompt that is
+waiting, such as `Permission requested: shell`. Held peer messages show as
+`Peer messages await approval`. A finished or failed turn shows as idle, since
+Herdr has no separate done state. An explicit `osc9` or `bell` setting still
 applies.
 
 Remote Caudra over SSH without native Herdr reporting can use OSC 7501 if its
 immediate receiver supports it. See [Worktrees](/docs/worktrees/#herdr-integration)
 for what else Caudra reports through the native integration.
+
+## Orca
+
+Inside an [Orca](https://github.com/stablyai/orca) terminal, Caudra reports its
+status to Orca as OSC 9999, the sequence Orca reads from agent output. Orca shows
+the agent state and raises its own notice when the agent finishes or waits for
+you. `auto` then sends no separate notices for turns and prompts,
+and it does not probe for OSC 7501. An explicit `osc9` or `bell` setting still
+applies.
+
+Each report carries the state, the model, and the label of the prompt that
+blocks the agent, such as `Permission requested: shell`. It never carries the
+session title, prompt or response text, tool arguments, or error details. Orca
+has no field for context usage. Starting idle and exiting on purpose report a
+session boundary, so Orca does not announce a finished task.
+
+Caudra wraps OSC 9999 for tmux and GNU screen. Inside tmux, set
+`allow-passthrough on` or `all`. Zellij drops the sequence, so Caudra sends no
+status to Orca when it runs under Zellij. Herdr running inside an Orca terminal
+counts as Herdr.
 
 ## Focus on Windows
 

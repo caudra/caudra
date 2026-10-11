@@ -39,7 +39,7 @@ const DISCARD_AND_REMOVE: &str = "Discard uncommitted changes and remove";
 const MAIN_NOT_REMOVABLE: &str = "The main checkout cannot be removed.";
 const ALREADY_HERE: &str = "This session already works in that checkout.";
 const LIST_HINT_GIT: &str = "Enter moves every open tab into the checkout, as /cd does.";
-const LIST_HINT_HERDR: &str = "Enter opens the checkout in its Herdr workspace.";
+const LIST_HINT_HOST: &str = "Enter opens the checkout in its workspace in";
 const CREATE_HINT: &str = "The session moves into the new worktree and back once it is removed.";
 const CARRY_HINT: &str = "Carried changes leave this checkout.";
 const BRANCH_HINT: &str =
@@ -98,7 +98,8 @@ pub struct WorktreeOverview {
     pub checkouts: Vec<CheckoutSessions>,
     /// Whether the current checkout has uncommitted changes.
     pub dirty: bool,
-    pub herdr: bool,
+    /// The terminal host that opens checkouts, when there is one.
+    pub host: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -406,14 +407,13 @@ impl WorktreePicker {
                 }
             })
             .collect();
-        let hint = if overview.herdr {
-            LIST_HINT_HERDR
-        } else {
-            LIST_HINT_GIT
-        };
+        let hint = overview.host.map_or_else(
+            || LIST_HINT_GIT.to_owned(),
+            |host| format!("{LIST_HINT_HOST} {host}."),
+        );
         let current = overview.current.clone();
         self.picker.set_error_text(None);
-        self.picker.set_info_text(Some(hint.into()));
+        self.picker.set_info_text(Some(hint));
         self.picker.set_footer_builder(list_footer);
         self.picker.open(entries, LIST_TITLE);
         self.picker.select_item_by(
@@ -729,7 +729,7 @@ mod tests {
                 checkout(LINKED, BRANCH, true),
             ],
             dirty,
-            herdr: false,
+            host: None,
         }
     }
 

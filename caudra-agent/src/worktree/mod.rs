@@ -1,20 +1,22 @@
-//! Git worktrees `/worktree` creates and removes: through Herdr when Caudra
-//! runs in one of its panes, so each lands in a workspace of its own, and
-//! through git otherwise.
+//! Git worktrees `/worktree` creates and removes: through the terminal host
+//! Caudra runs in when it manages worktrees, so each lands in a workspace of
+//! its own, and through git otherwise.
 
 pub mod git;
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use caudra_config::{WorktreeBackend, WorktreesConfig};
 use caudra_storage::id::CaudraId;
 use caudra_storage::{paths, random_task_id};
+use caudra_terminal_host::HostError;
+use caudra_terminal_host::workspaces::{HostLocation, Opened, Workspaces};
 use thiserror::Error;
 use tracing::warn;
 
-use crate::herdr::{HerdrEnv, HerdrError, NOT_LINKED_WORKTREE, OpenedWorkspace};
 use git::{Git, GitError};
 
 /// Starts every branch Caudra names itself, so its worktrees stand out.
@@ -32,7 +34,7 @@ pub enum WorktreeError {
     #[error(transparent)]
     Git(#[from] GitError),
     #[error(transparent)]
-    Herdr(#[from] HerdrError),
+    Host(#[from] HostError),
     #[error("cannot prepare {}: {source}", path.display())]
     Directory {
         path: PathBuf,
@@ -47,31 +49,42 @@ pub enum WorktreeError {
     CarryNeedsHead,
 }
 
+/// Who creates and removes worktrees: the terminal host when there is one
+/// that manages them, and a session moved into one continues in the host's
+/// pane; else git, and this process follows the session. Git also takes
+/// over a repository the host does not manage.
 #[derive(Clone, Debug)]
-pub enum Backend {
-    /// Herdr creates, groups and removes worktrees, and a session moved into
-    /// one continues in the new workspace's pane.
-    Herdr(HerdrEnv),
-    /// Git does, and this process follows the session. `directory` is where
-    /// checkouts go when configured, else under the data directory.
-    Git { directory: Option<PathBuf> },
+pub struct Backend {
+    host: Option<Arc<dyn Workspaces>>,
+    /// Where git puts checkouts when configured, else under the data
+    /// directory.
+    directory: Option<PathBuf>,
 }
 
 impl Backend {
-    pub fn select(config: &WorktreesConfig, herdr: Option<HerdrEnv>) -> Self {
-        match (config.backend.unwrap_or_default(), herdr) {
-            (WorktreeBackend::Auto, Some(herdr)) => Self::Herdr(herdr),
-            _ => Self::Git {
-                directory: config.directory.as_deref().map(expand_home),
-            },
+    pub fn select(config: &WorktreesConfig, host: Option<Arc<dyn Workspaces>>) -> Self {
+        Self {
+            host: host.filter(|_| config.backend.unwrap_or_default() == WorktreeBackend::Auto),
+            directory: config.directory.as_deref().map(expand_home),
         }
     }
 
-    pub fn herdr(&self) -> Option<&HerdrEnv> {
-        match self {
-            Self::Herdr(herdr) => Some(herdr),
-            Self::Git { .. } => None,
+    pub fn git(directory: Option<PathBuf>) -> Self {
+        Self {
+            host: None,
+            directory,
         }
+    }
+
+    pub fn with_host(self, host: Arc<dyn Workspaces>) -> Self {
+        Self {
+            host: Some(host),
+            ..self
+        }
+    }
+
+    pub fn host(&self) -> Option<&dyn Workspaces> {
+        self.host.as_deref()
     }
 }
 
@@ -123,8 +136,10 @@ pub enum Request {
 pub struct Created {
     pub root: PathBuf,
     pub branch: Option<String>,
-    /// The Herdr workspace whose root pane the session continues in.
-    pub workspace: Option<OpenedWorkspace>,
+    /// Where the host opened it, whose pane the session continues in.
+    pub opened: Option<Opened>,
+    /// Why git made it although there is a host.
+    pub host_declined: Option<String>,
     /// Why the source's uncommitted changes did not come along.
     pub carry_failed: Option<String>,
 }
@@ -170,49 +185,66 @@ fn add(
     branch: Option<String>,
     base: &str,
 ) -> Result<Created, WorktreeError> {
-    match backend {
-        Backend::Herdr(herdr) => {
-            let opened =
-                herdr
-                    .cli()
-                    .worktree_create(&request.main_root, branch.as_deref(), base)?;
-            Ok(Created {
-                root: canonical(opened.worktree.path)?,
-                branch: opened.worktree.branch,
-                workspace: Some(opened.workspace),
-                carry_failed: None,
-            })
+    let Some(host) = backend.host() else {
+        return add_with_git(backend, request, branch, base);
+    };
+    let branch = match branch {
+        None if !host.names_branches() => {
+            Some(generated_branch().map_err(WorktreeError::BranchName)?)
         }
-        Backend::Git { directory } => {
-            let branch = match branch {
-                Some(branch) => branch,
-                None => generated_branch().map_err(WorktreeError::BranchName)?,
-            };
-            let directory = checkout_directory(directory.as_deref()).map_err(|source| {
-                WorktreeError::Directory {
-                    path: PathBuf::from(WORKTREES_DIR),
-                    source,
-                }
-            })?;
-            let path = checkout_path(&directory, &request.main_root, &branch);
-            if path.exists() {
-                return Err(WorktreeError::Exists(path));
-            }
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|source| WorktreeError::Directory {
-                    path: parent.to_path_buf(),
-                    source,
-                })?;
-            }
-            Git::new(&request.source).add_worktree(&path, &branch, base)?;
-            Ok(Created {
-                root: canonical(path)?,
-                branch: Some(branch),
-                workspace: None,
-                carry_failed: None,
-            })
+        branch => branch,
+    };
+    match host.create(&request.main_root, branch.as_deref(), base) {
+        Ok(opened) => Ok(Created {
+            root: canonical(opened.root.clone())?,
+            branch: opened.branch.clone(),
+            opened: Some(opened),
+            host_declined: None,
+            carry_failed: None,
+        }),
+        Err(error @ HostError::UnknownRepository { .. }) => {
+            let mut created = add_with_git(backend, request, branch, base)?;
+            created.host_declined = Some(error.to_string());
+            Ok(created)
         }
+        Err(error) => Err(error.into()),
     }
+}
+
+fn add_with_git(
+    backend: &Backend,
+    request: &CreateRequest,
+    branch: Option<String>,
+    base: &str,
+) -> Result<Created, WorktreeError> {
+    let branch = match branch {
+        Some(branch) => branch,
+        None => generated_branch().map_err(WorktreeError::BranchName)?,
+    };
+    let directory = checkout_directory(backend.directory.as_deref()).map_err(|source| {
+        WorktreeError::Directory {
+            path: PathBuf::from(WORKTREES_DIR),
+            source,
+        }
+    })?;
+    let path = checkout_path(&directory, &request.main_root, &branch);
+    if path.exists() {
+        return Err(WorktreeError::Exists(path));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| WorktreeError::Directory {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    Git::new(&request.source).add_worktree(&path, &branch, base)?;
+    Ok(Created {
+        root: canonical(path)?,
+        branch: Some(branch),
+        opened: None,
+        host_declined: None,
+        carry_failed: None,
+    })
 }
 
 /// Applies `stash` in `root` and drops it, or puts it back into the source
@@ -238,22 +270,22 @@ fn restore(source: &Git<'_>, stash: &str) -> Result<(), GitError> {
     source.stash_drop(stash)
 }
 
-/// How a checkout goes: through Herdr when it has the checkout open as a
-/// worktree workspace, which it then closes, else through git.
+/// How a checkout goes: through the host when it has the checkout open as a
+/// worktree, which it then closes, else through git.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Removal {
     pub root: PathBuf,
     pub main_root: PathBuf,
     pub force: bool,
-    /// The Herdr workspace the checkout is open in.
-    pub workspace: Option<String>,
-    /// The Herdr workspace the repository's own checkout is open in.
-    pub source_workspace: Option<String>,
+    /// Where the host has the checkout open.
+    pub location: Option<HostLocation>,
+    /// Where the host has the repository's own checkout open.
+    pub main_location: Option<HostLocation>,
 }
 
 impl Removal {
     /// Stashes the checkout's changes when `request` asks to, returning the
-    /// stash, and finds where Herdr has it open.
+    /// stash, and finds where the host has it open.
     pub fn prepare(
         backend: &Backend,
         request: &RemoveRequest,
@@ -262,34 +294,30 @@ impl Removal {
             Changes::Stash => Git::new(&request.root).stash_push(REMOVAL_MESSAGE)?,
             Changes::None | Changes::Discard => None,
         };
-        let listing = backend.herdr().and_then(|herdr| {
-            herdr
-                .cli()
-                .worktree_list(&request.main_root)
-                .inspect_err(|error| warn!(%error, "Herdr did not list the worktrees"))
-                .ok()
-        });
+        let located = backend
+            .host()
+            .and_then(|host| {
+                host.locate(&request.main_root, &request.root)
+                    .inspect_err(|error| warn!(%error, host = host.host(), "the host did not list the worktrees"))
+                    .ok()
+            })
+            .unwrap_or_default();
         let removal = Self {
             root: request.root.clone(),
             main_root: request.main_root.clone(),
             force: request.changes == Changes::Discard,
-            workspace: listing
-                .as_ref()
-                .and_then(|listing| listing.workspace_of(&request.root))
-                .map(str::to_owned),
-            source_workspace: listing.and_then(|listing| listing.source.source_workspace_id),
+            location: located.checkout,
+            main_location: located.main,
         };
         Ok((removal, stash))
     }
 
     /// Removes the checkout, keeping its branch.
     pub fn run(&self, backend: &Backend) -> Result<(), WorktreeError> {
-        if let (Some(herdr), Some(workspace)) = (backend.herdr(), &self.workspace) {
-            match herdr.cli().worktree_remove(workspace, self.force) {
-                Ok(()) => return Ok(()),
-                Err(error) if error.code() == Some(NOT_LINKED_WORKTREE) => {}
-                Err(error) => return Err(error.into()),
-            }
+        if let (Some(host), Some(location)) = (backend.host(), &self.location)
+            && host.remove(location, self.force)?
+        {
+            return Ok(());
         }
         Ok(Git::new(&self.main_root).remove_worktree(&self.root, self.force)?)
     }
@@ -389,9 +417,7 @@ mod tests {
     const WORKTREES: &str = "worktrees";
 
     fn git_backend(repository: &Repository) -> Backend {
-        Backend::Git {
-            directory: Some(repository.sibling(WORKTREES)),
-        }
+        Backend::git(Some(repository.sibling(WORKTREES)))
     }
 
     fn create_request(repository: &Repository, base: &str, carry: bool) -> CreateRequest {

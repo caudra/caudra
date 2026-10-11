@@ -2,12 +2,10 @@ use shell_words::split;
 use std::io::{self, Write, stdout};
 use std::num::NonZeroU16;
 use std::path::Path;
-use std::process::{Command as ProcessCommand, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
-use caudra_config::NotificationMethod;
+use caudra_terminal_host::alert::visible_text;
+use caudra_terminal_host::mux::TerminalMux;
 use color_eyre::Result;
 use crossterm::Command;
 use crossterm::ExecutableCommand;
@@ -22,8 +20,6 @@ use crossterm::event::{DisableFocusChange, EnableFocusChange};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::buffer::{Cell, CellDiffOption};
 
-const FALLBACK_NOTIFICATION_MESSAGE: &str = "Caudra needs attention";
-const BELL_SEQUENCE: &str = "\u{7}";
 /// XTPUSHTITLE saves whatever title the shell left on the window, so the
 /// matching XTPOPTITLE on exit or editor handoff hands it back and no plugin
 /// title outlives the session. Terminals without a title stack ignore both.
@@ -32,10 +28,6 @@ const POP_WINDOW_TITLE_SEQUENCE: &str = "\u{1b}[23;2t";
 const OSC8_OPEN: &str = "\u{1b}]8;;";
 const OSC8_CLOSE: &str = "\u{1b}]8;;\u{1b}\\";
 const STRING_TERMINATOR: &str = "\u{1b}\\";
-const PROGRAM_STATUS_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
-/// Raw mode is already on when the tmux query runs, so a wedged tmux server
-/// must not be able to hang startup with Ctrl-C disabled.
-const TMUX_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 const KEYBOARD_ENHANCEMENTS: KeyboardEnhancementFlags =
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         .union(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
@@ -53,149 +45,6 @@ const TERMUX_PACKAGE: &str = "/com.termux/";
 
 pub(crate) struct TerminalGuard;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TerminalMux {
-    Zellij,
-    Tmux,
-    Screen,
-    None,
-}
-
-#[derive(Default)]
-struct TerminalEnvironment<'a> {
-    term_program: Option<&'a str>,
-    wezterm: bool,
-    iterm: bool,
-    kitty: bool,
-    term: Option<&'a str>,
-}
-
-struct TmuxClient {
-    term_type: String,
-    term_name: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ResolvedNotifier {
-    Osc9,
-    Bell,
-}
-
-pub(crate) struct TerminalNotifier {
-    notifier: ResolvedNotifier,
-    mux: TerminalMux,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProgramStatus {
-    Idle,
-    Working,
-    Blocked(Option<ProgramBlockKind>),
-    Done,
-    Error,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProgramBlockKind {
-    Permission,
-    Question,
-    Auth,
-}
-
-pub(crate) struct ProgramStatusReporter {
-    last_written: Option<ProgramStatus>,
-}
-
-impl ProgramStatusReporter {
-    pub(crate) fn detect(configured: NotificationMethod, herdr: bool) -> Option<Self> {
-        Self::detect_with(configured, herdr, |timeout| {
-            #[cfg(unix)]
-            {
-                crossterm::event::query_program_status(timeout)
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = timeout;
-                Ok(false)
-            }
-        })
-    }
-
-    fn detect_with(
-        configured: NotificationMethod,
-        herdr: bool,
-        query: impl FnOnce(Duration) -> io::Result<bool>,
-    ) -> Option<Self> {
-        if configured != NotificationMethod::Auto || herdr {
-            return None;
-        }
-        query(PROGRAM_STATUS_QUERY_TIMEOUT)
-            .unwrap_or(false)
-            .then_some(Self { last_written: None })
-    }
-
-    pub(crate) fn observe(&mut self, status: ProgramStatus) -> io::Result<()> {
-        self.observe_with(status, &mut stdout().lock())
-    }
-
-    fn observe_with(&mut self, status: ProgramStatus, output: &mut impl Write) -> io::Result<()> {
-        if self.last_written == Some(status) {
-            return Ok(());
-        }
-        output.write_all(program_status_sequence(status).as_bytes())?;
-        output.flush()?;
-        self.last_written = Some(status);
-        Ok(())
-    }
-
-    pub(crate) fn invalidate(&mut self) {
-        self.last_written = None;
-    }
-}
-
-fn program_status_sequence(status: ProgramStatus) -> String {
-    let (state, kind, message) = match status {
-        ProgramStatus::Idle => ("idle", "", "Ready"),
-        ProgramStatus::Working => ("working", "", "Working"),
-        ProgramStatus::Blocked(None) => ("blocked", "", "Waiting for input"),
-        ProgramStatus::Blocked(Some(ProgramBlockKind::Permission)) => {
-            ("blocked", ":kind=permission", "Waiting for permission")
-        }
-        ProgramStatus::Blocked(Some(ProgramBlockKind::Question)) => {
-            ("blocked", ":kind=question", "Waiting for an answer")
-        }
-        ProgramStatus::Blocked(Some(ProgramBlockKind::Auth)) => {
-            ("blocked", ":kind=auth", "Authentication required")
-        }
-        ProgramStatus::Done => ("done", "", "Task complete"),
-        ProgramStatus::Error => ("error", "", "Task failed"),
-    };
-    let message = STANDARD.encode(message);
-    format!("\u{1b}]7501;state={state}{kind}:app=caudra:msg={message}{STRING_TERMINATOR}")
-}
-
-impl TerminalNotifier {
-    pub(crate) fn new(configured: NotificationMethod, herdr: bool) -> Option<Self> {
-        let notifier = resolve_notifier(configured, herdr, detect_osc9_support)?;
-        Some(Self {
-            notifier,
-            mux: TerminalMux::detect(),
-        })
-    }
-
-    pub(crate) fn notifier(&self) -> ResolvedNotifier {
-        self.notifier
-    }
-
-    pub(crate) fn supports_focus_reporting(&self) -> bool {
-        self.mux != TerminalMux::Screen
-    }
-
-    pub(crate) fn notify(&self, message: &str) -> std::io::Result<()> {
-        write_sequence(&notification_sequence(self.notifier, self.mux, message))
-    }
-}
-
 /// Whether the pointer is a finger. Termux is the only terminal that both runs
 /// Caudra and reports touch, and it identifies itself in the environment, so
 /// there is nothing to query the terminal about.
@@ -210,137 +59,9 @@ fn is_termux(version: bool, prefix: Option<&str>) -> bool {
     version || prefix.is_some_and(|prefix| prefix.contains(TERMUX_PACKAGE))
 }
 
-fn detect_osc9_support() -> bool {
-    let term_program = std::env::var("TERM_PROGRAM").ok();
-    let term = std::env::var("TERM").ok();
-    let env = TerminalEnvironment {
-        term_program: term_program.as_deref(),
-        wezterm: std::env::var_os("WEZTERM_VERSION").is_some(),
-        iterm: std::env::var_os("ITERM_SESSION_ID").is_some()
-            || std::env::var_os("ITERM_PROFILE").is_some()
-            || std::env::var_os("ITERM_PROFILE_NAME").is_some(),
-        kitty: std::env::var_os("KITTY_WINDOW_ID").is_some(),
-        term: term.as_deref(),
-    };
-    let tmux = env
-        .term_program
-        .filter(|value| normalize_terminal_id(value) == "tmux")
-        .and_then(|_| query_tmux_client());
-    auto_supports_osc9(&env, tmux.as_ref())
-}
-
-fn normalize_terminal_id(value: &str) -> String {
-    value
-        .trim()
-        .chars()
-        .filter(|c| !matches!(c, ' ' | '-' | '_' | '.'))
-        .collect::<String>()
-        .to_ascii_lowercase()
-}
-
-fn supports_osc9(value: &str) -> bool {
-    matches!(
-        normalize_terminal_id(value).as_str(),
-        "ghostty"
-            | "iterm"
-            | "iterm2"
-            | "itermapp"
-            | "kitty"
-            | "warp"
-            | "warpterminal"
-            | "wezterm"
-            | "xtermghostty"
-            | "xtermkitty"
-    )
-}
-
-/// Herdr raises its own toast when an agent it tracks blocks or finishes, so
-/// `auto` stays quiet in a Herdr pane rather than announcing everything twice.
-fn resolve_notifier(
-    configured: NotificationMethod,
-    herdr: bool,
-    auto_supports_osc9: impl FnOnce() -> bool,
-) -> Option<ResolvedNotifier> {
-    match configured {
-        NotificationMethod::Off => None,
-        NotificationMethod::Osc9 => Some(ResolvedNotifier::Osc9),
-        NotificationMethod::Bell => Some(ResolvedNotifier::Bell),
-        NotificationMethod::Auto if herdr => None,
-        NotificationMethod::Auto => Some(if auto_supports_osc9() {
-            ResolvedNotifier::Osc9
-        } else {
-            ResolvedNotifier::Bell
-        }),
-    }
-}
-
-fn auto_supports_osc9(env: &TerminalEnvironment<'_>, tmux: Option<&TmuxClient>) -> bool {
-    if let Some(term_program) = env.term_program.filter(|value| !value.trim().is_empty()) {
-        if normalize_terminal_id(term_program) == "tmux" {
-            return tmux.is_some_and(|client| {
-                client
-                    .term_type
-                    .split_whitespace()
-                    .next()
-                    .is_some_and(supports_osc9)
-                    || supports_osc9(&client.term_name)
-            });
-        }
-        return supports_osc9(term_program);
-    }
-    env.wezterm || env.iterm || env.kitty || env.term.is_some_and(supports_osc9)
-}
-
-fn query_tmux_client() -> Option<TmuxClient> {
-    let mut child = ProcessCommand::new("tmux")
-        .args([
-            "display-message",
-            "-p",
-            "#{client_termtype}\t#{client_termname}",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    match wait_timeout::ChildExt::wait_timeout(&mut child, TMUX_QUERY_TIMEOUT) {
-        Ok(Some(status)) if status.success() => {}
-        _ => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-    }
-    let output = child.wait_with_output().ok()?;
-    let output = String::from_utf8(output.stdout).ok()?;
-    let (term_type, term_name) = output.trim_end().split_once('\t')?;
-    Some(TmuxClient {
-        term_type: term_type.into(),
-        term_name: term_name.into(),
-    })
-}
-
-fn sanitize_notification_message(message: &str) -> String {
-    let sanitized = visible_text(message);
-    if sanitized.is_empty() {
-        FALLBACK_NOTIFICATION_MESSAGE.into()
-    } else {
-        sanitized
-    }
-}
-
-/// Control bytes would terminate the OSC payload early or inject new
-/// sequences; whitespace runs collapse so spinner frames stay tidy.
-fn visible_text(text: &str) -> String {
-    text.split(|c: char| c.is_whitespace() || c.is_control())
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// OSC 2 sets the window title only; OSC 0 would stomp the icon name too.
 fn window_title_sequence(mux: TerminalMux, title: &str) -> String {
-    mux.wrap_for_mux(format!("\u{1b}]2;{}\u{7}", visible_text(title)))
+    mux.wrap(format!("\u{1b}]2;{}\u{7}", visible_text(title)))
 }
 
 pub(crate) fn set_window_title(title: &str) -> std::io::Result<()> {
@@ -348,7 +69,7 @@ pub(crate) fn set_window_title(title: &str) -> std::io::Result<()> {
 }
 
 fn write_mux_sequence(sequence: &str) {
-    let _ = write_sequence(&TerminalMux::detect().wrap_for_mux(sequence.into()));
+    let _ = write_sequence(&TerminalMux::detect().wrap(sequence.into()));
 }
 
 fn write_sequence(sequence: &str) -> std::io::Result<()> {
@@ -391,48 +112,6 @@ pub(crate) fn local_url_opener_available() -> bool {
     ]
     .iter()
     .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
-}
-
-fn notification_sequence(notifier: ResolvedNotifier, mux: TerminalMux, message: &str) -> String {
-    match notifier {
-        ResolvedNotifier::Osc9 => {
-            let message = sanitize_notification_message(message);
-            mux.wrap_for_mux(format!("\u{1b}]9;{message}\u{7}"))
-        }
-        ResolvedNotifier::Bell => BELL_SEQUENCE.to_string(),
-    }
-}
-
-impl TerminalMux {
-    fn detect() -> Self {
-        if std::env::var_os("ZELLIJ").is_some() {
-            Self::Zellij
-        } else if std::env::var_os("TMUX").is_some() {
-            Self::Tmux
-        } else if std::env::var_os("STY").is_some() {
-            Self::Screen
-        } else {
-            Self::None
-        }
-    }
-
-    // tmux and screen need DCS-passthrough with every internal ESC doubled.
-    // Without doubling, the `ESC \` in an OSC52 ST terminator would close
-    // the DCS wrapper early and truncate the payload.
-    // Zellij intercepts OSC52 natively, so we just emit the raw sequence.
-    fn wrap_for_mux(&self, sequence: String) -> String {
-        match self {
-            Self::Zellij | Self::None => sequence,
-            Self::Tmux => {
-                let escaped = sequence.replace('\u{1b}', "\u{1b}\u{1b}");
-                format!("\u{1b}Ptmux;{escaped}\u{1b}\\")
-            }
-            Self::Screen => {
-                let escaped = sequence.replace('\u{1b}', "\u{1b}\u{1b}");
-                format!("\u{1b}P{escaped}\u{1b}\\")
-            }
-        }
-    }
 }
 
 impl TerminalGuard {
@@ -584,7 +263,7 @@ pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), String> {
     CopyToClipboard::to_clipboard_from(text)
         .write_ansi(&mut sequence)
         .map_err(|e| e.to_string())?;
-    let sequence = TerminalMux::detect().wrap_for_mux(sequence);
+    let sequence = TerminalMux::detect().wrap(sequence);
     let mut stdout = stdout().lock();
     stdout
         .write_all(sequence.as_bytes())
@@ -595,6 +274,7 @@ pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_terminal_host::mux::parse_dcs_passthrough;
     use ratatui::backend::{Backend, CrosstermBackend};
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
@@ -605,149 +285,6 @@ mod tests {
     const EXPECTED_KEYBOARD_ENHANCEMENTS: &str = "\u{1b}[>27u";
     const APPEARANCE_SUBSCRIBE: &[u8] = b"\x1b[?2031h\x1b[?996n";
     const APPEARANCE_UNSUBSCRIBE: &[u8] = b"\x1b[?2031l";
-    const PROGRAM_STATUS_SEQUENCE_LIMIT: usize = 4096;
-    const IDLE_STATUS_SEQUENCE: &[u8] = b"\x1b]7501;state=idle:app=caudra:msg=UmVhZHk=\x1b\\";
-    const WORKING_STATUS_SEQUENCE: &[u8] =
-        b"\x1b]7501;state=working:app=caudra:msg=V29ya2luZw==\x1b\\";
-
-    #[test_case(ProgramStatus::Idle, IDLE_STATUS_SEQUENCE; "idle")]
-    #[test_case(ProgramStatus::Working, WORKING_STATUS_SEQUENCE; "working")]
-    #[test_case(ProgramStatus::Blocked(None), b"\x1b]7501;state=blocked:app=caudra:msg=V2FpdGluZyBmb3IgaW5wdXQ=\x1b\\"; "blocked")]
-    #[test_case(ProgramStatus::Blocked(Some(ProgramBlockKind::Permission)), b"\x1b]7501;state=blocked:kind=permission:app=caudra:msg=V2FpdGluZyBmb3IgcGVybWlzc2lvbg==\x1b\\"; "permission")]
-    #[test_case(ProgramStatus::Blocked(Some(ProgramBlockKind::Question)), b"\x1b]7501;state=blocked:kind=question:app=caudra:msg=V2FpdGluZyBmb3IgYW4gYW5zd2Vy\x1b\\"; "question")]
-    #[test_case(ProgramStatus::Blocked(Some(ProgramBlockKind::Auth)), b"\x1b]7501;state=blocked:kind=auth:app=caudra:msg=QXV0aGVudGljYXRpb24gcmVxdWlyZWQ=\x1b\\"; "auth")]
-    #[test_case(ProgramStatus::Done, b"\x1b]7501;state=done:app=caudra:msg=VGFzayBjb21wbGV0ZQ==\x1b\\"; "done")]
-    #[test_case(ProgramStatus::Error, b"\x1b]7501;state=error:app=caudra:msg=VGFzayBmYWlsZWQ=\x1b\\"; "error")]
-    fn program_status_reports_are_raw_bounded_and_deduplicated(
-        status: ProgramStatus,
-        expected: &[u8],
-    ) {
-        let mut reporter = ProgramStatusReporter { last_written: None };
-        let mut output = Vec::new();
-        reporter.observe_with(status, &mut output).unwrap();
-        reporter.observe_with(status, &mut output).unwrap();
-        assert_eq!(output, expected);
-        assert!(output.len() <= PROGRAM_STATUS_SEQUENCE_LIMIT);
-
-        let sequence = String::from_utf8(output.clone()).unwrap();
-        let (_, message) = sequence.split_once(":msg=").unwrap();
-        let message = STANDARD
-            .decode(message.strip_suffix(STRING_TERMINATOR).unwrap())
-            .unwrap();
-        assert!(
-            message
-                .iter()
-                .all(|byte| byte.is_ascii() && !byte.is_ascii_control())
-        );
-
-        reporter.invalidate();
-        reporter.observe_with(status, &mut output).unwrap();
-        assert_eq!(output, [expected, expected].concat());
-    }
-
-    #[test_case(NotificationMethod::Off, false; "off")]
-    #[test_case(NotificationMethod::Off, true; "off_inside_herdr")]
-    #[test_case(NotificationMethod::Bell, false; "bell")]
-    #[test_case(NotificationMethod::Bell, true; "bell_inside_herdr")]
-    #[test_case(NotificationMethod::Osc9, false; "osc9")]
-    #[test_case(NotificationMethod::Osc9, true; "osc9_inside_herdr")]
-    #[test_case(NotificationMethod::Auto, true; "auto_inside_herdr")]
-    fn program_status_routing_skips_probe(configured: NotificationMethod, herdr: bool) {
-        assert!(
-            ProgramStatusReporter::detect_with(configured, herdr, |_| {
-                panic!("program status probe must not run")
-            })
-            .is_none()
-        );
-    }
-
-    #[test_case(Some(true), true; "supported")]
-    #[test_case(Some(false), false; "unsupported_or_timeout")]
-    #[test_case(None, false; "unavailable")]
-    fn program_status_auto_probes_raw_immediate_terminal(reply: Option<bool>, expected: bool) {
-        let reporter =
-            ProgramStatusReporter::detect_with(NotificationMethod::Auto, false, |timeout| {
-                assert_eq!(timeout, Duration::from_millis(500));
-                reply.ok_or_else(|| io::ErrorKind::BrokenPipe.into())
-            });
-        assert_eq!(reporter.is_some(), expected);
-    }
-
-    #[test_case(None, Some(ProgramBlockKind::Permission); "generic_to_permission")]
-    #[test_case(Some(ProgramBlockKind::Permission), Some(ProgramBlockKind::Question); "permission_to_question")]
-    #[test_case(Some(ProgramBlockKind::Question), Some(ProgramBlockKind::Auth); "question_to_auth")]
-    fn program_status_deduplication_includes_block_kind(
-        first: Option<ProgramBlockKind>,
-        second: Option<ProgramBlockKind>,
-    ) {
-        let mut reporter = ProgramStatusReporter { last_written: None };
-        let mut output = Vec::new();
-        for status in [
-            ProgramStatus::Blocked(first),
-            ProgramStatus::Blocked(second),
-        ] {
-            reporter.observe_with(status, &mut output).unwrap();
-        }
-        assert_eq!(
-            output,
-            format!(
-                "{}{}",
-                program_status_sequence(ProgramStatus::Blocked(first)),
-                program_status_sequence(ProgramStatus::Blocked(second))
-            )
-            .as_bytes()
-        );
-    }
-
-    struct FailingStatusWriter {
-        fail_on_flush: bool,
-    }
-
-    impl Write for FailingStatusWriter {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            if self.fail_on_flush {
-                Ok(bytes.len())
-            } else {
-                Err(io::ErrorKind::BrokenPipe.into())
-            }
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Err(io::ErrorKind::BrokenPipe.into())
-        }
-    }
-
-    #[test_case(false; "write_failure")]
-    #[test_case(true; "flush_failure")]
-    fn program_status_failed_writes_preserve_last_success_and_retry(fail_on_flush: bool) {
-        let mut reporter = ProgramStatusReporter { last_written: None };
-        let mut output = Vec::new();
-        reporter
-            .observe_with(ProgramStatus::Idle, &mut output)
-            .unwrap();
-        let error = reporter
-            .observe_with(
-                ProgramStatus::Working,
-                &mut FailingStatusWriter { fail_on_flush },
-            )
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
-        assert_eq!(reporter.last_written, Some(ProgramStatus::Idle));
-        reporter
-            .observe_with(ProgramStatus::Idle, &mut output)
-            .unwrap();
-        assert_eq!(output, IDLE_STATUS_SEQUENCE);
-        reporter
-            .observe_with(ProgramStatus::Working, &mut output)
-            .unwrap();
-        reporter
-            .observe_with(ProgramStatus::Working, &mut output)
-            .unwrap();
-        assert_eq!(
-            output,
-            [IDLE_STATUS_SEQUENCE, WORKING_STATUS_SEQUENCE].concat()
-        );
-    }
 
     #[test_case(true, APPEARANCE_SUBSCRIBE; "subscribe_then_query")]
     #[test_case(false, APPEARANCE_UNSUBSCRIBE; "unsubscribe")]
@@ -888,183 +425,6 @@ mod tests {
         assert_eq!(positions, [(0, 0), (1, 0)]);
     }
 
-    fn env<'a>(term_program: Option<&'a str>) -> TerminalEnvironment<'a> {
-        TerminalEnvironment {
-            term_program,
-            ..TerminalEnvironment::default()
-        }
-    }
-
-    // Simulates DCS-passthrough parsing: `ESC ESC` becomes one ESC,
-    // `ESC \` ends the DCS. Panics on bad input so tests fail loudly.
-    fn parse_dcs_passthrough(wrapped: &str, prefix: &str) -> String {
-        let body = wrapped
-            .strip_prefix(prefix)
-            .unwrap_or_else(|| panic!("missing DCS prefix {prefix:?} in {wrapped:?}"));
-        let bytes = body.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len());
-        let mut i = 0;
-        loop {
-            match bytes.get(i) {
-                None => panic!("DCS body missing ST terminator: {body:?}"),
-                Some(&0x1B) => match bytes.get(i + 1) {
-                    Some(&0x1B) => {
-                        out.push(0x1B);
-                        i += 2;
-                    }
-                    Some(&b'\\') => {
-                        assert_eq!(
-                            i + 2,
-                            bytes.len(),
-                            "unexpected trailing bytes after DCS ST: {:?}",
-                            &bytes[i + 2..]
-                        );
-                        return String::from_utf8(out).expect("utf-8 body");
-                    }
-                    Some(b) => panic!("unexpected byte 0x{b:02x} after ESC inside DCS"),
-                    None => panic!("lone trailing ESC in DCS body"),
-                },
-                Some(&b) => {
-                    out.push(b);
-                    i += 1;
-                }
-            }
-        }
-    }
-
-    // Uses the ST terminator that crossterm emits, which puts ESC bytes
-    // at the start and in the middle of the payload.
-    const OSC52_WITH_ST: &str = "\u{1b}]52;c;SGVsbG8=\u{1b}\\";
-
-    #[test_case(NotificationMethod::Osc9, false, Some(ResolvedNotifier::Osc9) ; "osc9")]
-    #[test_case(NotificationMethod::Bell, false, Some(ResolvedNotifier::Bell) ; "bell")]
-    #[test_case(NotificationMethod::Off, false, None ; "off")]
-    #[test_case(NotificationMethod::Osc9, true, Some(ResolvedNotifier::Osc9) ; "osc9_inside_herdr")]
-    #[test_case(NotificationMethod::Bell, true, Some(ResolvedNotifier::Bell) ; "bell_inside_herdr")]
-    #[test_case(NotificationMethod::Auto, true, None ; "auto_inside_herdr")]
-    fn notification_method_resolves_without_detection(
-        configured: NotificationMethod,
-        herdr: bool,
-        expected: Option<ResolvedNotifier>,
-    ) {
-        assert_eq!(
-            resolve_notifier(configured, herdr, || panic!("auto detection ran")),
-            expected
-        );
-    }
-
-    #[test_case(true, ResolvedNotifier::Osc9 ; "osc9_terminal")]
-    #[test_case(false, ResolvedNotifier::Bell ; "other_terminal")]
-    fn auto_outside_herdr_detects_the_terminal(osc9: bool, expected: ResolvedNotifier) {
-        assert_eq!(
-            resolve_notifier(NotificationMethod::Auto, false, || osc9),
-            Some(expected)
-        );
-    }
-
-    #[test]
-    fn screen_is_the_only_mux_without_focus_reporting() {
-        let notifier = |mux| TerminalNotifier {
-            notifier: ResolvedNotifier::Osc9,
-            mux,
-        };
-
-        assert!(!notifier(TerminalMux::Screen).supports_focus_reporting());
-        for mux in [TerminalMux::None, TerminalMux::Tmux, TerminalMux::Zellij] {
-            assert!(notifier(mux).supports_focus_reporting());
-        }
-    }
-
-    #[test]
-    fn auto_supports_known_osc9_terminals() {
-        for value in ["Ghostty", "iTerm.app", "kitty", "WarpTerminal", "WezTerm"] {
-            assert!(
-                auto_supports_osc9(&env(Some(value)), None),
-                "terminal: {value}"
-            );
-        }
-    }
-
-    #[test]
-    fn term_program_precedes_terminal_specific_variables() {
-        let terminal = TerminalEnvironment {
-            term_program: Some("Alacritty"),
-            wezterm: true,
-            ..TerminalEnvironment::default()
-        };
-        assert!(!auto_supports_osc9(&terminal, None));
-    }
-
-    #[test]
-    fn auto_uses_specific_variables_and_term_fallbacks() {
-        for terminal in [
-            TerminalEnvironment {
-                wezterm: true,
-                ..TerminalEnvironment::default()
-            },
-            TerminalEnvironment {
-                iterm: true,
-                ..TerminalEnvironment::default()
-            },
-            TerminalEnvironment {
-                kitty: true,
-                ..TerminalEnvironment::default()
-            },
-            TerminalEnvironment {
-                term: Some("xterm-kitty"),
-                ..TerminalEnvironment::default()
-            },
-            TerminalEnvironment {
-                term: Some("xterm-ghostty"),
-                ..TerminalEnvironment::default()
-            },
-        ] {
-            assert!(auto_supports_osc9(&terminal, None));
-        }
-        let terminal = TerminalEnvironment {
-            term: Some("xterm-256color"),
-            ..TerminalEnvironment::default()
-        };
-        assert!(!auto_supports_osc9(&terminal, None));
-    }
-
-    #[test]
-    fn auto_inside_tmux_checks_client_terminal() {
-        let terminal = env(Some("tmux"));
-        let ghostty = TmuxClient {
-            term_type: "ghostty 1.2.3".into(),
-            term_name: "xterm-256color".into(),
-        };
-        assert!(auto_supports_osc9(&terminal, Some(&ghostty)));
-        let ghostty_name = TmuxClient {
-            term_type: "xterm-256color".into(),
-            term_name: "xterm-ghostty".into(),
-        };
-        assert!(auto_supports_osc9(&terminal, Some(&ghostty_name)));
-        assert!(!auto_supports_osc9(&terminal, None));
-    }
-
-    #[test]
-    fn notification_sequences_encode_message_and_keep_bell_raw() {
-        const MESSAGE: &str = "Task complete";
-        const OSC9_SEQUENCE: &str = "\u{1b}]9;Task complete\u{7}";
-
-        assert_eq!(
-            notification_sequence(ResolvedNotifier::Osc9, TerminalMux::None, MESSAGE),
-            OSC9_SEQUENCE
-        );
-        assert_eq!(
-            notification_sequence(ResolvedNotifier::Bell, TerminalMux::Tmux, MESSAGE),
-            BELL_SEQUENCE
-        );
-    }
-
-    #[test_case("\0Task\t\u{7f}complete\u{85}\nnow\u{2003}", "Task complete now" ; "strips_controls_and_collapses_whitespace")]
-    #[test_case("\0\t\u{7f}\u{85}\n\u{2003}", FALLBACK_NOTIFICATION_MESSAGE ; "all_control_input_falls_back")]
-    fn sanitize_notification_message_cases(message: &str, expected: &str) {
-        assert_eq!(sanitize_notification_message(message), expected);
-    }
-
     #[test]
     fn window_title_sequence_encodes_sanitized_title() {
         const TITLE: &str = "◐ building";
@@ -1098,64 +458,12 @@ mod tests {
     }
 
     #[test]
-    fn osc9_roundtrips_mux_passthrough() {
-        const MESSAGE: &str = "Task complete";
-        const OSC9_SEQUENCE: &str = "\u{1b}]9;Task complete\u{7}";
-
-        let tmux = notification_sequence(ResolvedNotifier::Osc9, TerminalMux::Tmux, MESSAGE);
-        let screen = notification_sequence(ResolvedNotifier::Osc9, TerminalMux::Screen, MESSAGE);
-        assert_eq!(parse_dcs_passthrough(&tmux, "\u{1b}Ptmux;"), OSC9_SEQUENCE);
-        assert_eq!(parse_dcs_passthrough(&screen, "\u{1b}P"), OSC9_SEQUENCE);
-    }
-
-    #[test]
-    fn none_is_identity() {
-        assert_eq!(
-            TerminalMux::None.wrap_for_mux(OSC52_WITH_ST.to_string()),
-            OSC52_WITH_ST
-        );
-    }
-
-    #[test]
-    fn zellij_is_identity_because_it_intercepts_osc52() {
-        // Zellij handles OSC52 itself; DCS-wrapping would eat the sequence.
-        assert_eq!(
-            TerminalMux::Zellij.wrap_for_mux(OSC52_WITH_ST.to_string()),
-            OSC52_WITH_ST
-        );
-    }
-
-    #[test]
-    fn tmux_wrap_survives_tmux_passthrough_parser() {
-        let wrapped = TerminalMux::Tmux.wrap_for_mux(OSC52_WITH_ST.to_string());
-        assert_eq!(
-            parse_dcs_passthrough(&wrapped, "\u{1b}Ptmux;"),
-            OSC52_WITH_ST
-        );
-    }
-
-    #[test]
-    fn screen_wrap_survives_screen_passthrough_parser() {
-        let wrapped = TerminalMux::Screen.wrap_for_mux(OSC52_WITH_ST.to_string());
-        assert_eq!(parse_dcs_passthrough(&wrapped, "\u{1b}P"), OSC52_WITH_ST);
-    }
-
-    // Multiple interior ESC bytes: if any gets left undoubled, the first
-    // bare `ESC \` would close the DCS early and truncate everything after.
-    #[test]
-    fn tmux_preserves_payload_with_multiple_interior_esc_bytes() {
-        let payload = "\u{1b}A\u{1b}B\u{1b}C\u{1b}\\";
-        let wrapped = TerminalMux::Tmux.wrap_for_mux(payload.to_string());
-        assert_eq!(parse_dcs_passthrough(&wrapped, "\u{1b}Ptmux;"), payload);
-    }
-
-    #[test]
     fn tmux_wrap_roundtrips_crossterm_osc52_output() {
         let mut sequence = String::new();
         CopyToClipboard::to_clipboard_from("hello, world!")
             .write_ansi(&mut sequence)
             .expect("crossterm write_ansi");
-        let wrapped = TerminalMux::Tmux.wrap_for_mux(sequence.clone());
+        let wrapped = TerminalMux::Tmux.wrap(sequence.clone());
         assert_eq!(parse_dcs_passthrough(&wrapped, "\u{1b}Ptmux;"), sequence);
     }
 }

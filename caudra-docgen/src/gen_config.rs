@@ -473,7 +473,8 @@ fn write_worktrees_section(out: &mut String) {
     writeln!(
         out,
         "Inside a Herdr pane, `auto` asks Herdr to create and remove worktrees, so each one \
-         opens as a grouped Herdr workspace. `directory` applies only to worktrees git \
+         opens as a grouped Herdr workspace. Inside an Orca terminal, `auto` asks Orca, so \
+         each one appears in Orca's worktree list. `directory` applies only to worktrees git \
          creates. See [Worktrees](/docs/worktrees/) for what `/worktree` does with each \
          backend.\n"
     )

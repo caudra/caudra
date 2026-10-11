@@ -7,7 +7,6 @@
 //! waits on every event source at once and wakes the moment a plugin action,
 //! agent event, or keypress arrives instead of sleeping in `event::poll`.
 
-use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
 use std::env;
 use std::fs;
@@ -36,7 +35,6 @@ use caudra_agent::automation::frontend::wake_origin;
 use caudra_agent::background::BackgroundTransition;
 use caudra_agent::command::CustomCommand;
 use caudra_agent::config_watch::ConfigSource;
-use caudra_agent::herdr::{HerdrEnv, resume_command_line};
 use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::{
     BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile,
@@ -115,9 +113,6 @@ use crate::components::{
     Action, ExitRequest, ForkDraft, ForkedSession, PlanHandoff, Status, SubscriptionProvider,
 };
 use crate::config_problems::ConfigProblems;
-use crate::herdr::{
-    HerdrObservation, HerdrReporterHandle, HerdrResume, HerdrStatus, aggregate_observations,
-};
 use crate::input::InputReader;
 use crate::repaint::{Dirty, FrameLimiter, IDLE_POLL};
 use crate::theme;
@@ -128,11 +123,18 @@ use crate::{
 };
 use crate::{load_app_session, open_app_session_with_cursor};
 
+use crate::pane_signals::PaneSignals;
 use crate::storage_writer::StorageWriter;
-use crate::terminal::{self, ProgramBlockKind, ProgramStatus, ProgramStatusReporter};
+use crate::terminal;
+use caudra_terminal_host::reporter::ReporterHandle;
+use caudra_terminal_host::resume::{resume_argv, resume_command_line};
+use caudra_terminal_host::status::{self as pane, BlockKind, PaneState, PaneStatus};
+use caudra_terminal_host::workspaces::{PaneSite, Workspaces};
 
 /// Max events handled per frame so a flood cannot starve rendering.
 const DRAIN_BUDGET: usize = 256;
+/// Messages from other sessions wait for the user to let them in.
+const PEER_MESSAGES_BLOCKER: &str = "Peer messages await approval";
 /// How much further one notch of an Alt-held wheel carries.
 const FAST_SCROLL_FACTOR: u32 = 4;
 /// One row of finger travel moves the content one row.
@@ -277,7 +279,9 @@ pub struct EventLoopParams {
     pub prompt_profiles: Arc<PromptProfileCatalog>,
     pub default_prompt_profile: Option<Arc<SystemPromptProfile>>,
     pub prompt_profile_override: Option<String>,
-    pub herdr_reporter: Option<HerdrReporterHandle>,
+    /// Reports to the terminal host Caudra runs in, which outlives this
+    /// loop.
+    pub host_reporter: Option<ReporterHandle>,
     pub worktrees: Backend,
     pub workspace_session: Option<caudra_workspace::WorkspaceSession>,
     pub remote_project_context:
@@ -315,7 +319,7 @@ enum PendingCompletion {
 struct RunNotificationState {
     response_candidate: Option<String>,
     pending_completion: Option<PendingCompletion>,
-    outcome: Option<ProgramStatus>,
+    outcome: Option<PaneState>,
     last_attention: Option<Notification>,
     /// The newest `notify()` text since the last reconcile.
     pending_notice: Option<Notification>,
@@ -343,14 +347,14 @@ impl RunNotificationState {
                     response: self.response_candidate.take(),
                 },
                 match reason {
-                    DoneReason::EndTurn => Some(ProgramStatus::Done),
+                    DoneReason::EndTurn => Some(PaneState::Done),
                     DoneReason::Cancelled => None,
-                    DoneReason::MaxTurns | DoneReason::MaxTokens => Some(ProgramStatus::Error),
+                    DoneReason::MaxTurns | DoneReason::MaxTokens => Some(PaneState::Error),
                 },
             ),
             AgentEvent::Error { .. } => {
                 self.response_candidate = None;
-                (Notification::error_completion(), Some(ProgramStatus::Error))
+                (Notification::error_completion(), Some(PaneState::Error))
             }
             _ => return,
         };
@@ -372,17 +376,19 @@ impl RunNotificationState {
         self.outcome = None;
     }
 
-    fn program_status(&self, status: ProgramStatus, busy: bool) -> ProgramStatus {
-        if matches!(status, ProgramStatus::Blocked(_)) {
+    fn pane_status(&self, status: PaneStatus, busy: bool) -> PaneStatus {
+        if status.state.is_blocked() {
             status
-        } else if status == ProgramStatus::Working || busy {
-            ProgramStatus::Working
+        } else if status.state == PaneState::Working || busy {
+            PaneStatus::new(PaneState::Working)
         } else {
-            self.outcome.unwrap_or(ProgramStatus::Idle)
+            PaneStatus::new(self.outcome.unwrap_or(PaneState::Idle))
         }
     }
 
-    fn reconcile_program_status(&mut self, terminal_focused: bool) -> Option<Notification> {
+    /// Turn alerts belong to the status host, so only notices are raised and
+    /// every completion is let go of.
+    fn reconcile_notices(&mut self, terminal_focused: bool) -> Option<Notification> {
         let notice = self.pending_notice.take();
         self.reconcile(None, SessionStatus::Idle, true, true);
         (!terminal_focused).then_some(notice).flatten()
@@ -651,30 +657,22 @@ impl SessionRuntime {
         self.app.deliver_automation_item()
     }
 
-    fn herdr_observation(&self) -> HerdrObservation {
-        runtime_observation(
-            self.app.lifecycle_blocker(),
-            self.app.has_lifecycle_work(),
-            self.handles.queue.is_empty(),
-            self.handles.queue.is_processing(),
-            self.handles.active_background_tasks(),
-            self.app.shell.active_ids().len(),
-        )
-    }
-
-    fn program_status(&self) -> ProgramStatus {
-        self.program_status_with_agent_stopped(
+    fn pane_status(&self) -> PaneStatus {
+        self.pane_status_with_agent_stopped(
             self.handles.is_finished() && self.handles.agent_rx.is_empty(),
         )
     }
 
-    fn program_status_with_agent_stopped(&self, agent_stopped: bool) -> ProgramStatus {
+    fn pane_status_with_agent_stopped(&self, agent_stopped: bool) -> PaneStatus {
         let status = if self.holds_peer_messages() {
-            ProgramStatus::Blocked(Some(ProgramBlockKind::Permission))
+            PaneStatus {
+                label: Some(PEER_MESSAGES_BLOCKER.into()),
+                ..PaneStatus::new(PaneState::Blocked(Some(BlockKind::Permission)))
+            }
         } else {
-            self.app.program_status()
+            self.app.pane_status()
         };
-        self.notifications.program_status(
+        self.notifications.pane_status(
             status,
             runtime_busy(
                 self.app.has_session_work(),
@@ -694,26 +692,7 @@ impl SessionRuntime {
     }
 }
 
-fn aggregate_program_status(statuses: impl IntoIterator<Item = ProgramStatus>) -> ProgramStatus {
-    statuses
-        .into_iter()
-        .fold(ProgramStatus::Idle, |selected, candidate| {
-            let priority = |status| match status {
-                ProgramStatus::Idle => 0,
-                ProgramStatus::Done => 1,
-                ProgramStatus::Error => 2,
-                ProgramStatus::Working => 3,
-                ProgramStatus::Blocked(_) => 4,
-            };
-            if priority(candidate) > priority(selected) {
-                candidate
-            } else {
-                selected
-            }
-        })
-}
-
-fn acknowledges_program_status(event: &Event) -> bool {
+fn acknowledges_pane_status(event: &Event) -> bool {
     match event {
         Event::Key(key) | Event::KeyWithText { key, .. } => key.kind != KeyEventKind::Release,
         Event::Paste(_) => true,
@@ -725,13 +704,13 @@ fn acknowledges_program_status(event: &Event) -> bool {
     }
 }
 
-fn exit_program_status(status: ProgramStatus, exit_on_done: bool, failed: bool) -> ProgramStatus {
+fn exit_pane_state(state: PaneState, exit_on_done: bool, failed: bool) -> PaneState {
     if failed {
-        ProgramStatus::Error
-    } else if exit_on_done && matches!(status, ProgramStatus::Done | ProgramStatus::Error) {
-        status
+        PaneState::Error
+    } else if exit_on_done && matches!(state, PaneState::Done | PaneState::Error) {
+        state
     } else {
-        ProgramStatus::Idle
+        PaneState::Idle
     }
 }
 
@@ -743,29 +722,6 @@ fn runtime_busy(
     shell_commands: usize,
 ) -> bool {
     app_working || !queue_empty || queue_processing || background_tasks > 0 || shell_commands > 0
-}
-
-fn runtime_observation(
-    blocker: Option<Cow<'static, str>>,
-    app_working: bool,
-    queue_empty: bool,
-    queue_processing: bool,
-    background_tasks: usize,
-    shell_commands: usize,
-) -> HerdrObservation {
-    if let Some(message) = blocker {
-        HerdrObservation::blocked(message)
-    } else if runtime_busy(
-        app_working,
-        queue_empty,
-        queue_processing,
-        background_tasks,
-        shell_commands,
-    ) {
-        HerdrObservation::working()
-    } else {
-        HerdrObservation::idle()
-    }
 }
 
 #[cfg(test)]
@@ -943,51 +899,53 @@ fn refuse_pending_source_revert(
     ))
 }
 
-/// Opens the checkout at `root` in a Herdr workspace grouped with its
-/// repository's, or focuses the one it is open in.
-fn open_in_herdr(herdr: &HerdrEnv, root: &Path) -> Result<String, String> {
+/// Opens the checkout at `root` in the host's workspace for it, or focuses
+/// the one it is open in.
+fn open_in_host(host: &dyn Workspaces, root: &Path) -> Result<String, String> {
     let checkout = checkout::discover(root).ok_or(WORKTREE_REPOSITORY_ERR)?;
-    let opened = herdr
-        .cli()
-        .worktree_open(&checkout.main_root, &checkout.root)
+    let opened = host
+        .show(&checkout.main_root, &checkout.root)
         .map_err(|error| error.to_string())?;
     Ok(format!(
-        "Opened {} in Herdr",
-        label(opened.worktree.branch.as_deref(), &checkout.root)
+        "Opened {} in {}",
+        label(opened.branch.as_deref(), &checkout.root),
+        host.host()
     ))
 }
 
-/// Resumes session `id` in the Herdr workspace of the checkout `cwd` is in:
-/// in its root pane when the workspace has just opened, else in a new pane
-/// beside the focused one. A session another Caudra has open only has its
-/// workspace focused.
-fn resume_in_herdr(
-    herdr: &HerdrEnv,
+/// Resumes session `id` in the host's workspace of the checkout `cwd` is in:
+/// in its pane when the workspace has just opened, else in a new pane beside
+/// the focused one. A session another Caudra has open only has its workspace
+/// focused.
+fn resume_in_host(
+    host: &dyn Workspaces,
     storage: &StateDir,
     id: CaudraId,
     cwd: &Path,
 ) -> Result<String, String> {
     let checkout = checkout::discover(cwd).ok_or(WORKTREE_REPOSITORY_ERR)?;
-    let cli = herdr.cli();
-    let opened = cli
-        .worktree_open(&checkout.main_root, &checkout.root)
+    let opened = host
+        .show(&checkout.main_root, &checkout.root)
         .map_err(|error| error.to_string())?;
     match SessionLease::acquire(storage, id) {
         Ok(_) => {}
         Err(SessionError::SessionInUse { .. }) => return Ok(SESSION_OPEN_ELSEWHERE.into()),
         Err(error) => return Err(format!("Failed to open session: {error}")),
     }
-    let pane = if opened.workspace.already_open {
-        cli.split_workspace(&opened.workspace.workspace_id, cwd)
-            .map_err(|error| error.to_string())?
+    let pane = if opened.already_open {
+        host.pane(PaneSite::Beside {
+            location: &opened.location,
+            cwd,
+        })
+        .map_err(|error| error.to_string())?
     } else {
-        opened.workspace.pane_id
+        opened.pane
     };
-    cli.pane_run(&pane, &resume_command_line(&id.to_string()))
+    host.run(&pane, &resume_command_line(&id.to_string()), None)
         .map_err(|error| error.to_string())?;
     Ok(format!(
         "Resumed the session in {}",
-        label(opened.worktree.branch.as_deref(), &checkout.root)
+        label(opened.branch.as_deref(), &checkout.root)
     ))
 }
 
@@ -1566,8 +1524,7 @@ pub(crate) struct EventLoop<'t> {
     last_focused: Option<CaudraId>,
     last_workspace_tabs: Option<WorkspaceTabsSnapshot>,
     terminal_focused: bool,
-    notifier: Option<terminal::TerminalNotifier>,
-    program_status_reporter: Option<ProgramStatusReporter>,
+    pane_signals: PaneSignals,
     ctx: SpawnCtx,
     input: InputReader,
     auto_theme: Option<AutoSwitch>,
@@ -1576,7 +1533,6 @@ pub(crate) struct EventLoop<'t> {
     title_rx: flume::Receiver<GeneratedTitle>,
     title_tx: flume::Sender<GeneratedTitle>,
     ui_action_rx: flume::Receiver<UiAction>,
-    herdr_reporter: Option<HerdrReporterHandle>,
     worktrees: Backend,
     _model_fetch_task: smol::Task<()>,
     relocation: Option<PendingRelocation>,
@@ -1821,7 +1777,7 @@ impl<'t> EventLoop<'t> {
             prompt_profiles,
             default_prompt_profile,
             prompt_profile_override,
-            herdr_reporter,
+            host_reporter,
             worktrees,
             workspace_session,
             remote_project_context: _,
@@ -1880,10 +1836,7 @@ impl<'t> EventLoop<'t> {
 
         caudra_workbench::scroll::set_touch(ui_config.touch.enabled(terminal::detect_touch));
 
-        let notifier =
-            terminal::TerminalNotifier::new(ui_config.notifications, herdr_reporter.is_some());
-        let program_status_reporter =
-            ProgramStatusReporter::detect(ui_config.notifications, herdr_reporter.is_some());
+        let pane_signals = PaneSignals::new(ui_config.notifications, host_reporter);
         let mut ctx = SpawnCtx {
             peer_host: peer_host.filter(|_| {
                 config.features.enabled(Feature::CrossSessionMessaging)
@@ -2001,8 +1954,7 @@ impl<'t> EventLoop<'t> {
             last_focused: None,
             last_workspace_tabs: None,
             terminal_focused: false,
-            notifier,
-            program_status_reporter,
+            pane_signals,
             ctx,
             input,
             auto_theme,
@@ -2011,7 +1963,6 @@ impl<'t> EventLoop<'t> {
             title_rx,
             title_tx,
             ui_action_rx,
-            herdr_reporter,
             worktrees,
             _model_fetch_task: bg.task,
             relocation: None,
@@ -2047,15 +1998,19 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn herdr_resume(&self) -> HerdrResume {
+    /// What a host that restores the pane runs in it: nothing outlives an
+    /// ephemeral run, and a session never saved has nothing to reopen, so a
+    /// session handed to another pane is never resumed twice.
+    fn pane_resume(&self) -> Option<Vec<String>> {
         let session = &self.sessions[self.focused].app.state.session;
-        if self.ctx.storage.is_ephemeral() {
-            HerdrResume::Never
-        } else if session.is_persisted() {
-            HerdrResume::Session(session.id)
-        } else {
-            HerdrResume::Fresh
-        }
+        (!self.ctx.storage.is_ephemeral()).then(|| {
+            resume_argv(
+                session
+                    .is_persisted()
+                    .then(|| session.id.to_string())
+                    .as_deref(),
+            )
+        })
     }
 
     pub(crate) fn run(mut self, mut initial_prompt: Option<String>) -> Result<ShutdownReport> {
@@ -2126,7 +2081,7 @@ impl<'t> EventLoop<'t> {
                 // A backgrounded session can finish an `exit_on_done` turn;
                 // focus it so shutdown reports its exit code and id.
                 self.focused = i;
-                self.emit_notifications();
+                self.emit_pane_signals();
                 break Ok(());
             }
 
@@ -2156,12 +2111,12 @@ impl<'t> EventLoop<'t> {
         };
         // Fatal errors still save every session, kill MCP process groups,
         // and drain the storage writer before the process exits.
-        let status = exit_program_status(
-            self.program_status(),
+        let state = exit_pane_state(
+            self.pane_status().state,
             self.sessions[self.focused].app.exit_on_done,
             result.is_err(),
         );
-        let report = self.shutdown(status)?;
+        let report = self.shutdown(state)?;
         result.map(|()| report)
     }
 
@@ -2827,17 +2782,7 @@ impl<'t> EventLoop<'t> {
         self.emit_status_changes();
         self.publish_live_sessions();
         dirty |= self.emit_task_changes();
-        self.emit_program_status();
-        self.emit_notifications();
-        if let Some(reporter) = &self.herdr_reporter {
-            reporter.observe(HerdrStatus {
-                observation: aggregate_observations(
-                    self.sessions.iter().map(SessionRuntime::herdr_observation),
-                ),
-                resume: self.herdr_resume(),
-            });
-            reporter.describe(self.sessions[self.focused].app.herdr_metadata());
-        }
+        self.emit_pane_signals();
         // An `exit_on_done` exit waits on `QueueDrained`; a dead agent loop
         // can never send it, so fail instead of hanging forever.
         if let Some(runtime) = self.sessions.iter().find(|rt| {
@@ -2963,9 +2908,7 @@ impl<'t> EventLoop<'t> {
             terminal::open_in_editor(path, self.terminal)
         };
         self.terminal_focused = false;
-        if let Some(reporter) = &mut self.program_status_reporter {
-            reporter.invalidate();
-        }
+        self.pane_signals.invalidate();
         match result {
             Ok(code) => code,
             Err(e) => {
@@ -3032,50 +2975,51 @@ impl<'t> EventLoop<'t> {
         dirty | self.focused_app().refresh_task_picker()
     }
 
-    fn program_status(&self) -> ProgramStatus {
-        aggregate_program_status(self.sessions.iter().map(SessionRuntime::program_status))
+    fn pane_status(&self) -> PaneStatus {
+        pane::aggregate(self.sessions.iter().map(SessionRuntime::pane_status))
     }
 
-    fn emit_program_status(&mut self) {
-        if self.program_status_reporter.is_none() {
+    /// Reports the pane's status to whichever host receives it, then raises
+    /// the alerts that are due. Both are written here, between frames, so no
+    /// sequence lands inside one the UI is drawing.
+    fn emit_pane_signals(&mut self) {
+        if self.pane_signals.reports_status() {
+            let status = PaneStatus {
+                resume: self.pane_resume(),
+                ..self.pane_status()
+            };
+            self.pane_signals
+                .report(status, self.sessions[self.focused].app.pane_metadata());
+        }
+        if !self.pane_signals.alerts_notices() {
             return;
         }
-        let status = self.program_status();
-        if let Some(reporter) = &mut self.program_status_reporter
-            && let Err(error) = reporter.observe(status)
-        {
-            warn!(%error, "program status reporting disabled after write failure");
-            self.program_status_reporter = None;
-        }
-    }
-
-    fn emit_notifications(&mut self) {
-        let Some(notifier) = &self.notifier else {
-            return;
-        };
+        let alerts_turns = self.pane_signals.alerts_turns();
         let mut selected = None;
         for rt in &mut self.sessions {
             if let Some(notice) = rt.app.take_autopilot_notice() {
                 rt.notifications.pending_notice = Some(notice);
             }
-            let candidate = if self.program_status_reporter.is_some() {
-                rt.notifications
-                    .reconcile_program_status(self.terminal_focused)
-            } else {
+            let candidate = if alerts_turns {
                 rt.notifications.reconcile(
                     rt.app.attention(),
                     rt.last_status,
                     rt.handles.queue.is_empty(),
                     self.terminal_focused,
                 )
+            } else {
+                rt.notifications.reconcile_notices(self.terminal_focused)
             };
             selected = select_notification(selected, candidate);
         }
-        if let Some(notification) = selected
-            && let Err(error) = notifier.notify(&notification.message())
-        {
-            warn!(notifier = ?notifier.notifier(), %error, "terminal notifications disabled after write failure");
-            self.notifier = None;
+        let Some(notification) = selected else {
+            return;
+        };
+        let message = notification.message();
+        if matches!(notification, Notification::AutomationNotice { .. }) {
+            self.pane_signals.alert_notice(&message);
+        } else {
+            self.pane_signals.alert_turn(&message);
         }
     }
 
@@ -3639,11 +3583,11 @@ impl<'t> EventLoop<'t> {
         let mut pending = Some(raw);
         while let Some(ev) = pending.take() {
             let runtime = &self.sessions[self.focused];
-            let acknowledge = (self.program_status_reporter.is_some()
-                && acknowledges_program_status(&ev)
+            let acknowledge = (self.pane_signals.reports_status()
+                && acknowledges_pane_status(&ev)
                 && matches!(
-                    runtime.program_status(),
-                    ProgramStatus::Done | ProgramStatus::Error
+                    runtime.pane_status().state,
+                    PaneState::Done | PaneState::Error
                 ))
             .then_some(runtime.id());
             let (msg, leftover) = self.translate(ev);
@@ -3660,10 +3604,7 @@ impl<'t> EventLoop<'t> {
     }
 
     fn translate(&mut self, raw: Event) -> (Option<Msg>, Option<Event>) {
-        let supports_focus_reporting = self
-            .notifier
-            .as_ref()
-            .is_some_and(terminal::TerminalNotifier::supports_focus_reporting);
+        let supports_focus_reporting = self.pane_signals.reports_focus();
         if let Some(focused) = terminal_focus_event(&raw) {
             if supports_focus_reporting {
                 self.terminal_focused = focused;
@@ -4137,12 +4078,13 @@ impl<'t> EventLoop<'t> {
     }
 
     /// Opens a session that works in another checkout of this repository.
-    /// Inside Herdr it resumes in that checkout's workspace; otherwise this
-    /// process changes directory there first, as `/cd` would, and a session
-    /// another Caudra has open is refused before anything moves.
+    /// Inside a host that manages worktrees it resumes in that checkout's
+    /// workspace; otherwise this process changes directory there first, as
+    /// `/cd` would, and a session another Caudra has open is refused before
+    /// anything moves.
     fn open_session_elsewhere(&mut self, idx: usize, id: CaudraId, cwd: &Path) {
-        if let Some(herdr) = self.worktrees.herdr() {
-            let outcome = resume_in_herdr(herdr, &self.ctx.storage, id, cwd);
+        if let Some(host) = self.worktrees.host() {
+            let outcome = resume_in_host(host, &self.ctx.storage, id, cwd);
             self.sessions[idx]
                 .app
                 .flash(outcome.unwrap_or_else(|error| error));
@@ -4195,15 +4137,15 @@ impl<'t> EventLoop<'t> {
             main_root: current.main_root,
             checkouts,
             dirty,
-            herdr: self.worktrees.herdr().is_some(),
+            host: self.worktrees.host().map(Workspaces::host),
         })
     }
 
-    /// Inside Herdr the checkout opens in its own workspace; otherwise every
-    /// tab moves into it, as `/cd` would take them.
+    /// Inside a host that manages worktrees the checkout opens in its own
+    /// workspace; otherwise every tab moves into it, as `/cd` would take them.
     fn open_worktree(&mut self, idx: usize, root: &Path) {
-        if let Some(herdr) = self.worktrees.herdr() {
-            let outcome = open_in_herdr(herdr, root);
+        if let Some(host) = self.worktrees.host() {
+            let outcome = open_in_host(host, root);
             self.sessions[idx]
                 .app
                 .flash(outcome.unwrap_or_else(|error| error));
@@ -4574,9 +4516,7 @@ impl<'t> EventLoop<'t> {
                 });
                 drop(pause);
                 self.terminal_focused = false;
-                if let Some(reporter) = &mut self.program_status_reporter {
-                    reporter.invalidate();
-                }
+                self.pane_signals.invalidate();
 
                 match result {
                     Ok(()) => {
@@ -4887,7 +4827,7 @@ impl<'t> EventLoop<'t> {
         drained
     }
 
-    fn shutdown(mut self, status: ProgramStatus) -> Result<ShutdownReport> {
+    fn shutdown(mut self, state: PaneState) -> Result<ShutdownReport> {
         let started = Instant::now();
         let relocating =
             self.relocation.is_some() || self.sandbox.is_some() || self.sandbox_control.is_some();
@@ -5034,15 +4974,12 @@ impl<'t> EventLoop<'t> {
             total_ms = started.elapsed().as_millis() as u64,
             "ui shutdown phases"
         );
-        if let Some(reporter) = &mut self.program_status_reporter
-            && let Err(error) = reporter.observe(if relocation_error.is_some() {
-                ProgramStatus::Error
+        self.pane_signals
+            .report_final(PaneStatus::new(if relocation_error.is_some() {
+                PaneState::Error
             } else {
-                status
-            })
-        {
-            warn!(%error, "failed to report final program status");
-        }
+                state
+            }));
         if let Some(error) = relocation_error {
             return Err(eyre!("{RELOCATION_SHUTDOWN_ERR}: {error}"));
         }
@@ -5508,7 +5445,7 @@ mod tests {
 
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";
-    const HERDR_BLOCKER: &str = "Permission requested";
+    const HOST_BLOCKER: &str = "Permission requested";
     const WRONG_STEP: &str = "a notch of the wheel carried the wrong distance";
     const REMOTE_ROOT: &str = "remote-root";
     const REMOTE_OTHER: &str = "remote-other";
@@ -5919,13 +5856,13 @@ mod tests {
         state
     }
 
-    #[test_case(DoneReason::EndTurn, ProgramStatus::Done; "completed")]
-    #[test_case(DoneReason::Cancelled, ProgramStatus::Idle; "cancelled")]
-    #[test_case(DoneReason::MaxTurns, ProgramStatus::Error; "turn_limit")]
-    #[test_case(DoneReason::MaxTokens, ProgramStatus::Error; "token_limit")]
+    #[test_case(DoneReason::EndTurn, PaneState::Done; "completed")]
+    #[test_case(DoneReason::Cancelled, PaneState::Idle; "cancelled")]
+    #[test_case(DoneReason::MaxTurns, PaneState::Error; "turn_limit")]
+    #[test_case(DoneReason::MaxTokens, PaneState::Error; "token_limit")]
     fn program_outcome_waits_for_drain_and_survives_notification_delivery(
         reason: DoneReason,
-        expected: ProgramStatus,
+        expected: PaneState,
     ) {
         let mut state = RunNotificationState::default();
         state.on_done(&AgentEvent::Done {
@@ -5934,12 +5871,19 @@ mod tests {
             reason,
         });
         assert_eq!(
-            state.program_status(ProgramStatus::Idle, state.waiting_for_drain()),
-            ProgramStatus::Working
+            state
+                .pane_status(PaneStatus::new(PaneState::Idle), state.waiting_for_drain())
+                .state,
+            PaneState::Working
         );
         state.on_drain();
         state.reconcile(None, SessionStatus::Idle, true, true);
-        assert_eq!(state.program_status(ProgramStatus::Idle, false), expected);
+        assert_eq!(
+            state
+                .pane_status(PaneStatus::new(PaneState::Idle), false)
+                .state,
+            expected
+        );
     }
 
     #[test]
@@ -5949,18 +5893,24 @@ mod tests {
             message: STATUS_ERROR.into(),
         });
         assert_eq!(
-            state.program_status(ProgramStatus::Idle, state.waiting_for_drain()),
-            ProgramStatus::Working
+            state
+                .pane_status(PaneStatus::new(PaneState::Idle), state.waiting_for_drain())
+                .state,
+            PaneState::Working
         );
         state.on_drain();
         assert_eq!(
-            state.program_status(ProgramStatus::Idle, false),
-            ProgramStatus::Error
+            state
+                .pane_status(PaneStatus::new(PaneState::Idle), false)
+                .state,
+            PaneState::Error
         );
         state.on_queue_item_consumed();
         assert_eq!(
-            state.program_status(ProgramStatus::Idle, false),
-            ProgramStatus::Idle
+            state
+                .pane_status(PaneStatus::new(PaneState::Idle), false)
+                .state,
+            PaneState::Idle
         );
     }
 
@@ -5974,8 +5924,10 @@ mod tests {
         assert!(!state.waiting_for_drain());
         assert_eq!(state.outcome, None);
         assert_eq!(
-            state.program_status(ProgramStatus::Working, false),
-            ProgramStatus::Working
+            state
+                .pane_status(PaneStatus::new(PaneState::Working), false)
+                .state,
+            PaneState::Working
         );
     }
 
@@ -5990,8 +5942,10 @@ mod tests {
         interrupt(&mut state);
         state.on_drain();
         assert_eq!(
-            state.program_status(ProgramStatus::Idle, false),
-            ProgramStatus::Idle
+            state
+                .pane_status(PaneStatus::new(PaneState::Idle), false)
+                .state,
+            PaneState::Idle
         );
     }
 
@@ -6001,58 +5955,71 @@ mod tests {
         let mut state = due_completion();
         state.on_automation_event(&notice_event(Some(NOTICE_FIRE_ID)));
         assert_eq!(
-            state.reconcile_program_status(focused),
+            state.reconcile_notices(focused),
             (!focused).then(automation_notice)
         );
-        assert_eq!(state.reconcile_program_status(false), None);
+        assert_eq!(state.reconcile_notices(false), None);
         assert_eq!(
-            state.program_status(ProgramStatus::Idle, false),
-            ProgramStatus::Done
+            state
+                .pane_status(PaneStatus::new(PaneState::Idle), false)
+                .state,
+            PaneState::Done
         );
     }
 
-    #[test_case(ProgramStatus::Working, false, ProgramStatus::Working; "app_work")]
-    #[test_case(ProgramStatus::Idle, true, ProgramStatus::Working; "background_work")]
-    #[test_case(ProgramStatus::Blocked(None), true, ProgramStatus::Blocked(None); "blocked_while_busy")]
+    #[test_case(PaneState::Working, false, PaneState::Working; "app_work")]
+    #[test_case(PaneState::Idle, true, PaneState::Working; "background_work")]
+    #[test_case(PaneState::Blocked(None), true, PaneState::Blocked(None); "blocked_while_busy")]
     fn live_work_outranks_a_pending_program_outcome(
-        status: ProgramStatus,
+        status: PaneState,
         busy: bool,
-        expected: ProgramStatus,
+        expected: PaneState,
     ) {
         let state = due_completion();
-        assert_eq!(state.program_status(status, busy), expected);
         assert_eq!(
-            state.program_status(ProgramStatus::Idle, false),
-            ProgramStatus::Done
+            state.pane_status(PaneStatus::new(status), busy).state,
+            expected
+        );
+        assert_eq!(
+            state
+                .pane_status(PaneStatus::new(PaneState::Idle), false)
+                .state,
+            PaneState::Done
         );
     }
 
-    #[test_case(ProgramStatus::Idle, ProgramStatus::Done, ProgramStatus::Done; "done_over_idle")]
-    #[test_case(ProgramStatus::Done, ProgramStatus::Error, ProgramStatus::Error; "error_over_done")]
-    #[test_case(ProgramStatus::Error, ProgramStatus::Working, ProgramStatus::Working; "work_over_error")]
-    #[test_case(ProgramStatus::Working, ProgramStatus::Blocked(None), ProgramStatus::Blocked(None); "blocked_over_work")]
+    #[test_case(PaneState::Idle, PaneState::Done, PaneState::Done; "done_over_idle")]
+    #[test_case(PaneState::Done, PaneState::Error, PaneState::Error; "error_over_done")]
+    #[test_case(PaneState::Error, PaneState::Working, PaneState::Working; "work_over_error")]
+    #[test_case(PaneState::Working, PaneState::Blocked(None), PaneState::Blocked(None); "blocked_over_work")]
     fn pane_program_status_aggregates_all_sessions(
-        first: ProgramStatus,
-        second: ProgramStatus,
-        expected: ProgramStatus,
+        first: PaneState,
+        second: PaneState,
+        expected: PaneState,
     ) {
-        assert_eq!(aggregate_program_status([first, second]), expected);
-        assert_eq!(aggregate_program_status([second, first]), expected);
+        assert_eq!(
+            pane::aggregate([first, second].map(PaneStatus::new)).state,
+            expected
+        );
+        assert_eq!(
+            pane::aggregate([second, first].map(PaneStatus::new)).state,
+            expected
+        );
     }
 
-    #[test_case(ProgramStatus::Done, true, false, ProgramStatus::Done; "exit_on_done")]
-    #[test_case(ProgramStatus::Error, true, false, ProgramStatus::Error; "exit_on_error")]
-    #[test_case(ProgramStatus::Working, false, false, ProgramStatus::Idle; "manual_exit_working")]
-    #[test_case(ProgramStatus::Blocked(None), false, false, ProgramStatus::Idle; "manual_exit_blocked")]
-    #[test_case(ProgramStatus::Done, false, false, ProgramStatus::Idle; "manual_exit_done")]
-    #[test_case(ProgramStatus::Working, false, true, ProgramStatus::Error; "fatal_ui_error")]
+    #[test_case(PaneState::Done, true, false, PaneState::Done; "exit_on_done")]
+    #[test_case(PaneState::Error, true, false, PaneState::Error; "exit_on_error")]
+    #[test_case(PaneState::Working, false, false, PaneState::Idle; "manual_exit_working")]
+    #[test_case(PaneState::Blocked(None), false, false, PaneState::Idle; "manual_exit_blocked")]
+    #[test_case(PaneState::Done, false, false, PaneState::Idle; "manual_exit_done")]
+    #[test_case(PaneState::Working, false, true, PaneState::Error; "fatal_ui_error")]
     fn program_status_exit_lifetime(
-        status: ProgramStatus,
+        status: PaneState,
         exit_on_done: bool,
         failed: bool,
-        expected: ProgramStatus,
+        expected: PaneState,
     ) {
-        assert_eq!(exit_program_status(status, exit_on_done, failed), expected);
+        assert_eq!(exit_pane_state(status, exit_on_done, failed), expected);
     }
 
     #[test_case(true, false, false, false => true; "clean_start")]
@@ -6076,7 +6043,7 @@ mod tests {
     #[test_case(Event::KeyWithText { key: KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release), text: None }, false; "associated_release_does_not_acknowledge")]
     #[test_case(Event::Paste(PLANNED_PROMPT.into()), true; "paste_acknowledges")]
     fn program_outcome_requires_user_interaction(event: Event, expected: bool) {
-        assert_eq!(acknowledges_program_status(&event), expected);
+        assert_eq!(acknowledges_pane_status(&event), expected);
     }
 
     #[test_case(STATUS_RUN_ID, false, true; "current_parent")]
@@ -6310,46 +6277,39 @@ mod tests {
         background_tasks: usize,
         shell_commands: usize,
     ) {
-        assert_eq!(
-            runtime_observation(
-                None,
-                app_working,
-                queue_empty,
-                queue_processing,
-                background_tasks,
-                shell_commands,
-            ),
-            HerdrObservation::working()
-        );
         let state = due_completion();
         assert_eq!(
-            state.program_status(
-                ProgramStatus::Idle,
-                runtime_busy(
-                    app_working,
-                    queue_empty,
-                    queue_processing,
-                    background_tasks,
-                    shell_commands
-                ),
-            ),
-            ProgramStatus::Working,
+            state
+                .pane_status(
+                    PaneStatus::new(PaneState::Idle),
+                    runtime_busy(
+                        app_working,
+                        queue_empty,
+                        queue_processing,
+                        background_tasks,
+                        shell_commands
+                    ),
+                )
+                .state,
+            PaneState::Working,
         );
     }
 
     #[test]
-    fn blocker_outranks_active_work() {
-        assert_eq!(
-            runtime_observation(Some(HERDR_BLOCKER.into()), true, false, true, 1, 1),
-            HerdrObservation::blocked(HERDR_BLOCKER)
-        );
+    fn blocker_outranks_active_work_and_keeps_its_label() {
+        let blocked = PaneStatus {
+            label: Some(HOST_BLOCKER.into()),
+            ..PaneStatus::new(PaneState::Blocked(Some(BlockKind::Permission)))
+        };
+
+        assert_eq!(due_completion().pane_status(blocked.clone(), true), blocked);
     }
 
     #[test]
     fn quiescent_runtime_reports_idle() {
         assert_eq!(
-            runtime_observation(None, false, true, false, 0, 0),
-            HerdrObservation::idle()
+            RunNotificationState::default().pane_status(PaneStatus::new(PaneState::Idle), false),
+            PaneStatus::new(PaneState::Idle)
         );
     }
 
@@ -6495,25 +6455,25 @@ mod tests {
             .unwrap()
     }
 
-    #[test_case(|_| {}, ProgramStatus::Done; "settled")]
-    #[test_case(start_a_run, ProgramStatus::Working; "new_work")]
-    #[test_case(open_a_permission_prompt, ProgramStatus::Blocked(Some(ProgramBlockKind::Permission)); "permission")]
+    #[test_case(|_| {}, PaneState::Done; "settled")]
+    #[test_case(start_a_run, PaneState::Working; "new_work")]
+    #[test_case(open_a_permission_prompt, PaneState::Blocked(Some(BlockKind::Permission)); "permission")]
     fn runtime_program_status_reconciles_live_app_and_outcome(
         change: fn(&mut SessionRuntime),
-        expected: ProgramStatus,
+        expected: PaneState,
     ) {
         let mut runtime = idle_runtime();
         runtime.notifications = due_completion();
         change(&mut runtime);
-        assert_eq!(runtime.program_status(), expected);
+        assert_eq!(runtime.pane_status().state, expected);
         runtime.handles.cancel();
     }
 
-    #[test_case(false, ProgramStatus::Working; "live_agent_must_drain")]
-    #[test_case(true, ProgramStatus::Error; "stopped_agent_cannot_drain")]
+    #[test_case(false, PaneState::Working; "live_agent_must_drain")]
+    #[test_case(true, PaneState::Error; "stopped_agent_cannot_drain")]
     fn startup_failure_without_exit_on_done_resolves_program_status(
         agent_stopped: bool,
-        expected: ProgramStatus,
+        expected: PaneState,
     ) {
         let mut runtime = idle_runtime();
         assert!(!runtime.app.exit_on_done);
@@ -6521,7 +6481,7 @@ mod tests {
             message: STATUS_ERROR.into(),
         });
         assert_eq!(
-            runtime.program_status_with_agent_stopped(agent_stopped),
+            runtime.pane_status_with_agent_stopped(agent_stopped).state,
             expected
         );
         runtime.handles.cancel();

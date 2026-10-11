@@ -3,14 +3,13 @@
 pub mod agent;
 pub mod background;
 mod background_reminder;
-pub mod bounded_process;
 pub use background_reminder::BackgroundReminderContext;
+pub use caudra_terminal_host::bounded_process;
 pub mod cancel;
 pub mod child_guard;
 pub mod nudge;
 pub use child_guard::ChildGuard;
 pub mod headless;
-pub mod herdr;
 pub mod mailbox;
 pub mod mcp;
 pub mod memory;
