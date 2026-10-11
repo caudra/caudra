@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use super::hover_style;
-use super::tooltip::{CutRow, Tip, TipKey};
+use super::tooltip::{Tip, TipArea, TipKey};
 use crate::theme;
 
 const ELLIPSIS: &str = "...";
@@ -91,7 +91,7 @@ impl QueueHit {
 pub(crate) struct QueueView {
     pub hits: Vec<QueueHit>,
     /// Prompts too long for their row, for a tooltip with the whole text.
-    pub cut_rows: Vec<CutRow>,
+    pub cut_rows: Vec<TipArea>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -242,7 +242,7 @@ fn entry_line(
     hovered: Option<QueueHitTarget>,
     row: Rect,
     hits: &mut Vec<QueueHit>,
-    cut_rows: &mut Vec<CutRow>,
+    cut_rows: &mut Vec<TipArea>,
 ) -> Line<'static> {
     let select_target = QueueHitTarget::Item {
         id: entry.id,
@@ -271,7 +271,7 @@ fn entry_line(
     let flat = entry.text.replace('\n', " ");
     let text = truncate_span(&flat, available, style);
     if flat.width() > available && available > 0 {
-        cut_rows.push(CutRow {
+        cut_rows.push(TipArea {
             area: Rect::new(
                 row.x.saturating_add(text_offset as u16),
                 row.y,

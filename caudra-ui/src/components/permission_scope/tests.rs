@@ -651,3 +651,22 @@ fn export_scope_visual_review() {
     }
     println!("{}", directory.keep().display());
 }
+
+#[test_case(ScopeControl::Disclosure(Disclosure::Evidence), Some("for reference only") ; "evidence")]
+#[test_case(ScopeControl::Target(1), Some("Target 2:") ; "target")]
+#[test_case(ScopeControl::Slot(SlotId(3)), Some("Slot ◆3:") ; "slot")]
+#[test_case(ScopeControl::Scroll(1), None ; "paging")]
+fn advanced_controls_explain_themselves_except_paging(
+    control: ScopeControl,
+    expected: Option<&str>,
+) {
+    let tip = ScopeView::tip(&control);
+    assert_eq!(
+        tip.is_some(),
+        expected.is_some(),
+        "paging is already text and needs no tooltip"
+    );
+    if let (Some(tip), Some(expected)) = (tip, expected) {
+        assert!(tip.contains(expected), "wrong tooltip: {tip}");
+    }
+}

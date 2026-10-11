@@ -52,16 +52,10 @@ impl App {
             .into_iter()
             .filter(|overlay| overlay.is_open());
         match (open.count(), self.workbench.is_open()) {
-            (0, _) => self
-                .commit_popup
-                .tooltip()
-                .or_else(|| self.active_input_box().hover_tip())
-                .or_else(|| self.composer_hint_tip())
-                .or_else(|| self.queue_tip())
-                .or_else(|| self.todo_panel.hover_tip(self.tooltip.pointer()))
-                .or_else(|| self.update_close_tip())
-                .or_else(|| self.status_bar_tip())
-                .or_else(|| self.chats[self.active_chat].hover_tip()),
+            (0, _) => self.surface_tip(),
+            (1, _) if self.permission_prompt.is_open() => {
+                self.permission_prompt.hover_tip(self.tooltip.pointer()?)
+            }
             (1, true) => self
                 .workbench
                 .hover_tip()
@@ -72,6 +66,19 @@ impl App {
                 .filter(|overlay| overlay.is_open())
                 .find_map(Overlay::tooltip),
         }
+    }
+
+    /// What the screen under no overlay explains.
+    fn surface_tip(&self) -> Option<Tip> {
+        self.commit_popup
+            .tooltip()
+            .or_else(|| self.active_input_box().hover_tip())
+            .or_else(|| self.composer_hint_tip())
+            .or_else(|| self.queue_tip())
+            .or_else(|| self.todo_panel.hover_tip(self.tooltip.pointer()))
+            .or_else(|| self.update_close_tip())
+            .or_else(|| self.status_bar_tip())
+            .or_else(|| self.chats[self.active_chat].hover_tip())
     }
 
     /// The bar builds its tip for whatever it drew hovered, so a hover the app
@@ -126,7 +133,7 @@ impl App {
                 .find(|hit| hit.target == hovered)?
                 .tip(together)
         });
-        control.or_else(|| tooltip::cut_row_tip(&self.queue_cut_rows, self.tooltip.pointer()))
+        control.or_else(|| tooltip::area_tip(&self.queue_cut_rows, self.tooltip.pointer()))
     }
 
     fn update_close_tip(&self) -> Option<Tip> {
@@ -147,6 +154,7 @@ mod tests {
 
     use caudra_agent::PromptAdmission;
     use caudra_agent::types::{TodoItem, TodoPriority, TodoStatus};
+    use caudra_config::ToolKey;
     use crossterm::event::MouseButton;
 
     use super::super::tests::{
@@ -166,6 +174,7 @@ mod tests {
 
     const WIDE: (u16, u16) = (80, 24);
     const NARROW: (u16, u16) = (40, 12);
+    const MEDIUM: (u16, u16) = (60, 24);
     const SHOWN: &str = "the tooltip must be on screen whole once the dwell is over";
     const EARLY: &str = "the tooltip must wait for the dwell";
     const LINGERED: &str = "the tooltip outlived what dismisses it";
@@ -179,6 +188,10 @@ mod tests {
     const LONG_QUEUED: &str = "a queued prompt much too long to fit the row of a narrow terminal";
     const LONG_TODO: &str = "an item the model wrote far too long for a narrow todo panel row";
     const TODO_TITLE: &str = "Todos \u{b7} ";
+    const PERMISSION_ID: &str = "ask";
+    const PERMISSION_COMMAND: &str = "cargo test";
+    const FIRST_ANSWER: &str = "1. Yes";
+    const FIRST_ANSWER_KEYS: &str = "1 or y.";
 
     fn screen(app: &mut App, (width, height): (u16, u16)) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -280,6 +293,47 @@ mod tests {
         let mut app = test_app();
         rest_on_model(&mut app, WIDE);
         app.help_modal.toggle();
+        assert_eq!(
+            row_of(&screen(&mut app, WIDE), CLICK_MODEL),
+            None,
+            "{LINGERED}"
+        );
+    }
+
+    fn app_asking(size: (u16, u16)) -> App {
+        let mut app = test_app();
+        app.permission_prompt.open(
+            PERMISSION_ID.into(),
+            ToolKey::native("bash"),
+            vec![PERMISSION_COMMAND.into()],
+            None,
+        );
+        let _ = screen(&mut app, size);
+        app
+    }
+
+    #[test_case(WIDE ; "wide")]
+    #[test_case(MEDIUM ; "medium")]
+    fn a_permission_answer_explains_itself_inside_the_frame(size: (u16, u16)) {
+        let mut app = app_asking(size);
+        let rows = screen(&mut app, size);
+        let row = row_of(&rows, FIRST_ANSWER).expect(CONTROL_MISSING);
+        let column = rows[row].find(FIRST_ANSWER).expect(CONTROL_MISSING);
+        let column = rows[row][..column].chars().count() as u16;
+        let rows = rest_at(&mut app, size, Rect::new(column, row as u16, 1, 1));
+        assert!(row_of(&rows, FIRST_ANSWER_KEYS).is_some(), "{SHOWN}");
+        app.update(Msg::Key(key(KeyCode::Down)));
+        assert_eq!(
+            row_of(&screen(&mut app, size), FIRST_ANSWER_KEYS),
+            None,
+            "{LINGERED}"
+        );
+    }
+
+    #[test]
+    fn a_permission_prompt_takes_the_footer_tooltips_with_its_clicks() {
+        let mut app = app_asking(WIDE);
+        rest_on_model(&mut app, WIDE);
         assert_eq!(
             row_of(&screen(&mut app, WIDE), CLICK_MODEL),
             None,

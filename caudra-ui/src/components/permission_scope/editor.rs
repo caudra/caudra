@@ -2215,6 +2215,7 @@ impl ScopeEditor {
                 let selected = template.slots.get(self.slot).map(|slot| slot.id);
                 self.hits.extend(
                     ScopeView::pattern_chips(&template, selected, chips, frame.buffer_mut(), theme)
+                        .0
                         .into_iter()
                         .filter_map(|hit| {
                             if let ScopeControl::Slot(id) = hit.control {

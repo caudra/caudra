@@ -17,7 +17,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
-use crate::components::tooltip::{self, CutRow, Tip, TipKey};
+use crate::components::tooltip::{self, Tip, TipArea, TipKey};
 use crate::components::{apply_scroll_delta, hover_style};
 use crate::theme;
 
@@ -55,7 +55,7 @@ pub struct TodoPanel {
     header_down: bool,
     header_hover: bool,
     /// Items drawn shorter than they are, for a tooltip with the whole text.
-    cut_rows: Vec<CutRow>,
+    cut_rows: Vec<TipArea>,
 }
 
 impl TodoPanel {
@@ -133,7 +133,7 @@ impl TodoPanel {
                 TIP_HEADER.to_owned(),
             ));
         }
-        tooltip::cut_row_tip(&self.cut_rows, pointer)
+        tooltip::area_tip(&self.cut_rows, pointer)
     }
 
     fn completed(&self) -> usize {
@@ -278,7 +278,7 @@ impl TodoPanel {
             .map(|(offset, item)| {
                 let (line, cut) = row(item, width);
                 if cut {
-                    self.cut_rows.push(CutRow {
+                    self.cut_rows.push(TipArea {
                         area: Rect::new(content.x, content.y + offset as u16, content.width, 1),
                         text: item.content.clone(),
                     });

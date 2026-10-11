@@ -82,18 +82,23 @@ impl Tip {
     }
 }
 
-/// A row drawn shorter than its text, with the text it lost.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct CutRow {
+/// Where something is drawn and what its tooltip says: the text a row lost
+/// to its width, or what a control without a hit of its own means.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TipArea {
     pub area: Rect,
     pub text: String,
 }
 
-/// The whole text of the cut row under the pointer.
-pub(crate) fn cut_row_tip(rows: &[CutRow], pointer: Option<Position>) -> Option<Tip> {
+/// The tip of the area under the pointer.
+pub(crate) fn area_tip(areas: &[TipArea], pointer: Option<Position>) -> Option<Tip> {
     let pointer = pointer?;
-    let row = rows.iter().find(|row| row.area.contains(pointer))?;
-    Some(Tip::at(TipKey::Row(row.area), row.area, row.text.clone()))
+    let found = areas.iter().find(|tip| tip.area.contains(pointer))?;
+    Some(Tip::at(
+        TipKey::Row(found.area),
+        found.area,
+        found.text.clone(),
+    ))
 }
 
 struct Armed {

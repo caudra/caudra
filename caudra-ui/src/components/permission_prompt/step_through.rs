@@ -11,7 +11,7 @@ use super::decision::{
 use super::notes::{RowStatus, row_status};
 use super::{Panel, PermissionDecision, PermissionPrompt, PromptState, RowChoice, front_request};
 
-const REMEMBER_AS_LISTED: &str = "Yes, and remember as listed";
+pub(super) const REMEMBER_AS_LISTED: &str = "Yes, and remember as listed";
 const RUN_THEM_ONCE: &str = "Yes, run them once";
 const MORE_OPTIONS: &str = "More options for the whole script…";
 pub(super) const OWN_PATTERN: &str = "Your own pattern…";

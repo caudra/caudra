@@ -10,6 +10,8 @@ use std::collections::BTreeSet;
 use super::controls::domain_name;
 use super::model::{literal, safe};
 use super::view::{ScopeControl, ScopeView, tuple_rows};
+use crate::components::input::CLICK_OR_PRESS;
+use crate::components::tooltip::TipArea;
 use crate::theme::Theme;
 
 pub(crate) const PATTERN_CHIP_ROWS: u16 = 3;
@@ -20,6 +22,31 @@ const DATA_OPTIONS: &str = "Values that look like options are allowed only where
 pub(crate) const SAME_VALUE: &str = "A ◆ value that appears twice must be the same in both places.";
 const FIELD_LABEL_WIDTH: u16 = 20;
 const FIELD_HEADER_ROWS: u16 = 1;
+const TIP_NAME: &str = "A display label only. It doesn't change what matches.";
+const TIP_SLOT: &str = "The variable argument being edited, numbered ◆ in the chips above.";
+const TIP_SLOT_NAME: &str = "A label such as <package>, for display only.";
+const TIP_VALUES: &str = "Values: only the selected values seen before.";
+const TIP_EXACT: &str = "Exact: one exact literal value.";
+const TIP_GLOB: &str = "Glob: one whole argument matched by a glob. * stops at /, ** crosses it.";
+const TIP_REGEX: &str = "Regex: one whole argument matched by a regular expression, without look-around or backreferences.";
+const TIP_ANY: &str = "Any: any one literal argument. Values that look like options stay refused.";
+const TIP_WIDENED: &str = "Glob, Regex and Any need Enter again before they're stored.";
+const TIP_CONSTRAINT: &str = "The values, glob or expression this slot accepts.";
+const TIP_TUPLES: &str = "Only combinations of values seen together are allowed.";
+const TIP_INDEPENDENT: &str =
+    "Each slot's values combine freely, new pairs included. Needs Enter again before it's stored.";
+const TIP_OBSERVATIONS: &str = "Values this slot was seen with, for reference.";
+const TIP_OBSERVED_VALUE: &str = "[x] values are allowed, [ ] values are left out.";
+const TIP_TOGGLE: &str = "Click to include or exclude it.";
+const TIP_SLOT_CHIP: &str = "a variable argument.";
+const TIP_EDIT: &str = "Click to edit it.";
+const KEYS_NAME: &str = "N to edit it";
+const KEYS_SLOT: &str = "↑ ↓ to pick another";
+const KEYS_SLOT_NAME: &str = "n to edit it";
+const KEYS_MODE: &str = "← → or 1-5 to change it";
+const KEYS_CONSTRAINT: &str = "e to edit it";
+const KEYS_COMBINATIONS: &str = "c to switch";
+const KEYS_OBSERVATIONS: &str = "o to show or hide them";
 
 /// How a slot treats values that start with a dash.
 pub(crate) fn option_values(policy: &OptionLikePolicy) -> &'static str {
@@ -198,7 +225,7 @@ impl PatternPanel {
         buffer: &mut Buffer,
         theme: &Theme,
         focused: Option<&PatternControl>,
-    ) -> Vec<(Rect, PatternControl)> {
+    ) -> (Vec<(Rect, PatternControl)>, Vec<TipArea>) {
         let mut hits = Vec::new();
         let mut y = area.y;
         if let Some(caution) = &self.caution {
@@ -215,17 +242,15 @@ impl PatternPanel {
             ..area
         };
         let selected = self.definition.slots.get(self.slot).map(|slot| slot.id);
-        hits.extend(
-            ScopeView::pattern_chips(&self.definition, selected, chips, buffer, theme)
-                .into_iter()
-                .filter_map(|hit| {
-                    if let ScopeControl::Slot(id) = hit.control {
-                        Some((hit.area, PatternControl::SelectSlot(id)))
-                    } else {
-                        None
-                    }
-                }),
-        );
+        let (chip_hits, tips) =
+            ScopeView::pattern_chips(&self.definition, selected, chips, buffer, theme);
+        hits.extend(chip_hits.into_iter().filter_map(|hit| {
+            if let ScopeControl::Slot(id) = hit.control {
+                Some((hit.area, PatternControl::SelectSlot(id)))
+            } else {
+                None
+            }
+        }));
         y += chips.height;
         if y < area.bottom() {
             Paragraph::new("Field               Setting")
@@ -282,7 +307,44 @@ impl PatternPanel {
                 },
                 buffer,
             );
-        hits
+        (hits, tips)
+    }
+
+    /// What a control means and how to change it, for its tooltip.
+    pub(crate) fn tip(&self, control: &PatternControl) -> Option<String> {
+        let slot = self.definition.slots.get(self.slot);
+        let (meaning, keys) = match control {
+            PatternControl::Name => (TIP_NAME.into(), KEYS_NAME),
+            PatternControl::Slot => (TIP_SLOT.into(), KEYS_SLOT),
+            PatternControl::SlotName => (TIP_SLOT_NAME.into(), KEYS_SLOT_NAME),
+            PatternControl::Mode => {
+                let mode = match &slot?.domain {
+                    ArgumentDomain::ObservedSet { .. } => TIP_VALUES,
+                    ArgumentDomain::Exact { .. } => TIP_EXACT,
+                    ArgumentDomain::Glob { .. } => TIP_GLOB,
+                    ArgumentDomain::Regex { .. } => TIP_REGEX,
+                    ArgumentDomain::AnyLiteralArgument => TIP_ANY,
+                };
+                (format!("{mode}\n{TIP_WIDENED}"), KEYS_MODE)
+            }
+            PatternControl::Constraint => (TIP_CONSTRAINT.into(), KEYS_CONSTRAINT),
+            PatternControl::Combinations => (
+                match self.definition.combinations {
+                    SlotCombinations::ObservedTuples { .. } => TIP_TUPLES,
+                    SlotCombinations::Independent => TIP_INDEPENDENT,
+                }
+                .into(),
+                KEYS_COMBINATIONS,
+            ),
+            PatternControl::Observations => (TIP_OBSERVATIONS.into(), KEYS_OBSERVATIONS),
+            PatternControl::ObservedValue(_) => {
+                return Some(format!("{TIP_OBSERVED_VALUE}\n{TIP_TOGGLE}"));
+            }
+            PatternControl::SelectSlot(id) => {
+                return Some(format!("Slot ◆{}: {TIP_SLOT_CHIP}\n{TIP_EDIT}", id.0));
+            }
+        };
+        Some(format!("{meaning}\n{CLICK_OR_PRESS}{keys}."))
     }
 }
 
@@ -298,15 +360,21 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use caudra_storage::permission_patterns::{ArgumentRole, PatternToken, SlotId};
+    use caudra_storage::permission_patterns::{
+        ArgumentDomain, ArgumentRole, PatternToken, SlotCombinations, SlotId,
+    };
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use test_case::test_case;
 
-    use super::{PatternControl, PatternPanel};
+    use super::{
+        KEYS_MODE, PatternControl, PatternPanel, TIP_ANY, TIP_EXACT, TIP_GLOB, TIP_INDEPENDENT,
+        TIP_REGEX, TIP_TUPLES, TIP_VALUES,
+    };
     use crate::components::buffer_text;
+    use crate::components::input::CLICK_OR_PRESS;
     use crate::components::permission_scope::tests::template;
-    use crate::components::permission_scope::view::ALLOWED_COMBINATIONS;
+    use crate::components::permission_scope::view::{ALLOWED_COMBINATIONS, TIP_EXECUTABLE};
     use crate::theme;
 
     const WIDTH: u16 = 80;
@@ -315,6 +383,9 @@ mod tests {
     const EVIDENCE: &str = "Host-supplied proposal evidence";
     const EMPTY_LITERAL: &str = "\"\"";
     const TUPLE_PATH: &str = "src/main.rs";
+    const GLOB: &str = "src/*.rs";
+    const NO_TIP: &str = "this control must raise a tooltip";
+    const WRONG_TIP: &str = "the tooltip does not describe the control's current setting";
 
     fn panel() -> PatternPanel {
         PatternPanel {
@@ -338,7 +409,7 @@ mod tests {
         let theme = theme::load_by_name(name).unwrap();
         let area = Rect::new(0, 0, width, panel.height(width, &theme));
         let mut buffer = Buffer::empty(area);
-        let hits = panel.render(area, &mut buffer, &theme, Some(&PatternControl::Mode));
+        let (hits, _) = panel.render(area, &mut buffer, &theme, Some(&PatternControl::Mode));
         assert!(buffer_text(&buffer).contains(EMPTY_LITERAL));
         let linked: Vec<_> = hits
             .iter()
@@ -396,5 +467,49 @@ mod tests {
         assert_eq!(text.contains(EVIDENCE), disclosed);
         assert_eq!(text.contains(ALLOWED_COMBINATIONS), disclosed);
         assert_eq!(panel.definition, original);
+    }
+
+    #[test_case(ArgumentDomain::ObservedSet { values: Default::default() }, TIP_VALUES ; "values")]
+    #[test_case(ArgumentDomain::Exact { value: SECRET.into() }, TIP_EXACT ; "exact")]
+    #[test_case(ArgumentDomain::Glob { pattern: GLOB.into() }, TIP_GLOB ; "glob")]
+    #[test_case(ArgumentDomain::Regex { pattern: GLOB.into() }, TIP_REGEX ; "regex")]
+    #[test_case(ArgumentDomain::AnyLiteralArgument, TIP_ANY ; "any")]
+    fn the_match_tip_explains_the_current_mode(domain: ArgumentDomain, meaning: &str) {
+        let mut panel = panel();
+        panel.definition.slots[0].domain = domain;
+        let text = panel.tip(&PatternControl::Mode).expect(NO_TIP);
+        assert!(text.starts_with(meaning), "{WRONG_TIP}: {text}");
+        assert!(
+            text.ends_with(&format!("{CLICK_OR_PRESS}{KEYS_MODE}.")),
+            "{WRONG_TIP}: {text}"
+        );
+    }
+
+    #[test_case(SlotCombinations::Independent, TIP_INDEPENDENT ; "independent")]
+    #[test_case(SlotCombinations::ObservedTuples { tuples: Default::default() }, TIP_TUPLES ; "tuples")]
+    fn the_combinations_tip_follows_the_setting(combinations: SlotCombinations, meaning: &str) {
+        let mut panel = panel();
+        panel.definition.combinations = combinations;
+        let text = panel.tip(&PatternControl::Combinations).expect(NO_TIP);
+        assert!(text.starts_with(meaning), "{WRONG_TIP}: {text}");
+    }
+
+    #[test]
+    fn fixed_chips_explain_their_role_and_slots_stay_controls() {
+        let panel = panel();
+        let theme = theme::load_by_name("ayu_dark").unwrap();
+        let area = Rect::new(0, 0, WIDTH, panel.height(WIDTH, &theme));
+        let mut buffer = Buffer::empty(area);
+        let (hits, tips) = panel.render(area, &mut buffer, &theme, None);
+        assert!(
+            tips.iter().any(|tip| tip.text == TIP_EXECUTABLE),
+            "{NO_TIP}"
+        );
+        for tip in &tips {
+            assert!(
+                !hits.iter().any(|(hit, _)| hit.intersects(tip.area)),
+                "a fixed chip must not overlap a slot chip"
+            );
+        }
     }
 }

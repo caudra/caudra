@@ -19,6 +19,7 @@ use super::model::{
 };
 use super::pattern::{EVIDENCE_LABEL, INDEPENDENT_VALUES, SAME_VALUE};
 use crate::components::command_text::scope_spans;
+use crate::components::tooltip::TipArea;
 use crate::theme::Theme;
 
 pub(crate) const ALLOWED_COMBINATIONS: &str = "Allowed combinations";
@@ -39,6 +40,20 @@ const DISCLOSURES: [(Disclosure, &str); 4] = [
     (Disclosure::Identity, "[ID]"),
     (Disclosure::Evidence, "[Evidence]"),
 ];
+const TIP_TARGET: &str = "a resource the rule covers.";
+const TIP_SLOT: &str = "a variable argument.";
+const TIP_CONDITIONS: &str = "Every condition a call must meet for each target.";
+const TIP_COMBINATIONS: &str = "Which slot values may appear together.";
+const TIP_IDENTITY: &str = "What the stored rule binds to: tool, executor, family and targets.";
+const TIP_EVIDENCE: &str = "What the request showed, for reference only.";
+const TIP_CLICK: &str = "Click to show it.";
+pub(crate) const TIP_EXECUTABLE: &str = "The program. It can't change.";
+const TIP_OPERATION: &str = "A subcommand. It can't change.";
+const TIP_FLAG: &str = "A fixed flag.";
+const TIP_DATA: &str = "A fixed data argument.";
+const TIP_UNKNOWN: &str =
+    "An argument whose role Caudra can't prove. Widening it could select other operations.";
+const TIP_HIDDEN: &str = "A sensitive value, never shown.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Disclosure {
@@ -69,9 +84,30 @@ pub(crate) struct ScopeView {
     pub(crate) disclosure: Option<Disclosure>,
     pub(crate) offset: u16,
     pub(crate) hits: Vec<ScopeHit>,
+    /// What the fixed chips of the last draw stand for.
+    pub(crate) tips: Vec<TipArea>,
     focus: usize,
     pressed: Option<ScopeHit>,
     area: Rect,
+}
+
+/// What a chip of a template is: a slot to select, or a fixed word with
+/// what its role means.
+enum Chip {
+    Control(ScopeControl),
+    Fixed(&'static str),
+}
+
+/// What a fixed chip's role means, for its tooltip.
+fn role_tip(role: &ArgumentRole) -> &'static str {
+    match role {
+        ArgumentRole::Executable => TIP_EXECUTABLE,
+        ArgumentRole::Operation => TIP_OPERATION,
+        ArgumentRole::Flag | ArgumentRole::OptionTerminator => TIP_FLAG,
+        ArgumentRole::Data => TIP_DATA,
+        ArgumentRole::Unknown => TIP_UNKNOWN,
+        ArgumentRole::Sensitive | ArgumentRole::Payload => TIP_HIDDEN,
+    }
 }
 
 impl ScopeView {
@@ -117,14 +153,31 @@ impl ScopeView {
         area: Rect,
         buffer: &mut Buffer,
         theme: &Theme,
-    ) -> Vec<ScopeHit> {
+    ) -> (Vec<ScopeHit>, Vec<TipArea>) {
         let mut view = Self {
             slot: selected,
             ..Self::default()
         };
         let mut y = area.y;
         view.chips(definition, area, &mut y, buffer, theme);
-        view.hits
+        (view.hits, view.tips)
+    }
+
+    /// What a control does, for its tooltip. Paging is already text.
+    pub(crate) fn tip(control: &ScopeControl) -> Option<String> {
+        let meaning = match control {
+            ScopeControl::Scroll(_) => return None,
+            ScopeControl::Target(index) => format!("Target {}: {TIP_TARGET}", index + 1),
+            ScopeControl::Slot(id) => format!("Slot ◆{}: {TIP_SLOT}", id.0),
+            ScopeControl::Disclosure(disclosure) => match disclosure {
+                Disclosure::Conditions => TIP_CONDITIONS,
+                Disclosure::Combinations => TIP_COMBINATIONS,
+                Disclosure::Identity => TIP_IDENTITY,
+                Disclosure::Evidence => TIP_EVIDENCE,
+            }
+            .into(),
+        };
+        Some(format!("{meaning}\n{TIP_CLICK}"))
     }
     pub(crate) fn activate(&mut self, control: ScopeControl) {
         match control {
@@ -234,6 +287,7 @@ impl ScopeView {
         }
         self.area = area;
         self.hits.clear();
+        self.tips.clear();
         if area.is_empty() {
             return;
         }
@@ -539,7 +593,11 @@ impl ScopeView {
                     } else {
                         literal(value)
                     };
-                    (format!("[{tag} {value}]"), theme.inline_code, None)
+                    (
+                        format!("[{tag} {value}]"),
+                        theme.inline_code,
+                        Chip::Fixed(role_tip(role)),
+                    )
                 }
                 PatternToken::Slot { id, .. } => {
                     let label = pattern
@@ -555,11 +613,12 @@ impl ScopeView {
                     (
                         format!("[◆{} {label}]", id.0),
                         style,
-                        Some(ScopeControl::Slot(*id)),
+                        Chip::Control(ScopeControl::Slot(*id)),
                     )
                 }
             };
-            let width = (label.width() as u16).min(area.width);
+            let full_width = label.width() as u16;
+            let width = full_width.min(area.width);
             let next_y = (*y).saturating_add(u16::from(x + width > area.right()));
             if next_y >= area.bottom() || next_y >= start + CHIP_ROWS {
                 break;
@@ -569,13 +628,21 @@ impl ScopeView {
             }
             *y = next_y;
             let cell = Rect::new(x, *y, width, 1);
-            Paragraph::new(label).style(style).render(cell, buffer);
-            if let Some(control) = control {
-                self.hits.push(ScopeHit {
+            match control {
+                Chip::Control(control) => self.hits.push(ScopeHit {
                     area: cell,
                     control,
-                });
+                }),
+                Chip::Fixed(meaning) => self.tips.push(TipArea {
+                    area: cell,
+                    text: if full_width > width {
+                        format!("{label}\n{meaning}")
+                    } else {
+                        meaning.into()
+                    },
+                }),
             }
+            Paragraph::new(label).style(style).render(cell, buffer);
             x += width + 1;
         }
         *y = (*y).saturating_add(1).min(area.bottom());

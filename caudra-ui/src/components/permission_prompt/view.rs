@@ -30,6 +30,7 @@ use super::step_through::{
     PageItem, REVIEW_CHOICES, ReviewChoice, StepThrough, item_label, lifetime_phrase,
     rung_lifetimes,
 };
+use super::tips::{COLLAPSED, NewRow, key_tip, review_row_tip, row_tip};
 use super::{Panel, PermissionPrompt, PromptHit, PromptState, PromptTarget};
 use crate::components::command_text::{
     code_spans_in, command_lines, command_spans, ellipsize_spans, marked_spans, overlay, pad_spans,
@@ -39,6 +40,7 @@ use crate::components::permission_scope::model::ScopeModel;
 use crate::components::permission_scope::pattern::PatternPanel;
 use crate::components::permission_scope::view::ScopeView;
 use crate::components::tab_bar::{Tab, tab_spans};
+use crate::components::tooltip::TipArea;
 use crate::components::{
     Hint, field_styles, hanging_lines, hanging_spans, hint_hits, hint_line_hovered, hover_style,
 };
@@ -126,6 +128,10 @@ impl KeyHint {
         }
     }
 
+    fn tip(&self) -> String {
+        key_tip(self.label, self.description, self.code.is_some())
+    }
+
     fn hint(&self, compact: bool) -> Hint {
         let description = if compact { "" } else { self.description };
         match self.code {
@@ -148,6 +154,7 @@ struct Body {
     width: u16,
     lines: Vec<Line<'static>>,
     hits: Vec<PromptHit>,
+    tips: Vec<TipArea>,
     inserts: Vec<(Rect, Insert)>,
     /// The rows to keep in sight: the highlighted choice, or a field.
     reveal: Option<(u16, u16)>,
@@ -161,10 +168,19 @@ impl Body {
             width,
             lines: Vec::new(),
             hits: Vec::new(),
+            tips: Vec::new(),
             inserts: Vec::new(),
             reveal: None,
             action_rows: 0,
         }
+    }
+
+    /// A tooltip for the next row pushed.
+    fn tip_next_row(&mut self, text: String) {
+        self.tips.push(TipArea {
+            area: Rect::new(0, self.row(), self.width, 1),
+            text,
+        });
     }
 
     fn row(&self) -> u16 {
@@ -407,7 +423,7 @@ fn tab_label(command: &str) -> String {
     }
 }
 
-fn row_command(request: &PermissionRequest, row: usize) -> String {
+pub(super) fn row_command(request: &PermissionRequest, row: usize) -> String {
     request
         .resources
         .get(row)
@@ -473,6 +489,7 @@ impl PermissionPrompt {
         }
         if self.current().is_none() {
             self.hits.clear();
+            self.tip_areas.clear();
             return;
         }
         let pressed_area = self.mouse_down.as_ref().and_then(|target| {
@@ -508,6 +525,7 @@ impl PermissionPrompt {
         let Body {
             lines,
             hits: body_hits,
+            mut tips,
             inserts,
             reveal,
             ..
@@ -527,21 +545,20 @@ impl PermissionPrompt {
                         area: hit.area,
                         target: PromptTarget::VisualScope(hit.control.clone()),
                     }));
+                    tips.extend(self.scope_view.tips.iter().cloned());
                 }
                 Insert::Pattern(panel) => {
                     let focused = match self.hover.as_ref().or(self.focus.as_ref()) {
                         Some(PromptTarget::Inspector(control)) => Some(control.clone()),
                         _ => None,
                     };
-                    hits.extend(
-                        panel
-                            .render(rect, &mut buffer, t, focused.as_ref())
-                            .into_iter()
-                            .map(|(area, control)| PromptHit {
-                                area,
-                                target: PromptTarget::Inspector(control),
-                            }),
-                    );
+                    let (controls, chip_tips) =
+                        panel.render(rect, &mut buffer, t, focused.as_ref());
+                    hits.extend(controls.into_iter().map(|(area, control)| PromptHit {
+                        area,
+                        target: PromptTarget::Inspector(control),
+                    }));
+                    tips.extend(chip_tips);
                 }
             }
         }
@@ -571,21 +588,34 @@ impl PermissionPrompt {
             total,
             offset,
         );
-        self.hits.clear();
         let viewport = Rect::new(0, offset, body_area.width, body_area.height);
-        for hit in hits {
-            let clipped = hit.area.intersection(viewport);
-            if !clipped.is_empty() {
-                self.hits.push(PromptHit {
-                    area: Rect {
-                        x: body_area.x + clipped.x,
-                        y: body_area.y + clipped.y - offset,
-                        ..clipped
-                    },
+        let on_screen = |area: Rect| {
+            let clipped = area.intersection(viewport);
+            (!clipped.is_empty()).then(|| Rect {
+                x: body_area.x + clipped.x,
+                y: body_area.y + clipped.y - offset,
+                ..clipped
+            })
+        };
+        self.hits = hits
+            .into_iter()
+            .filter_map(|hit| {
+                Some(PromptHit {
+                    area: on_screen(hit.area)?,
                     target: hit.target,
-                });
-            }
-        }
+                })
+            })
+            .collect();
+        self.tip_areas = tips
+            .into_iter()
+            .filter_map(|tip| {
+                Some(TipArea {
+                    area: on_screen(tip.area)?,
+                    text: tip.text,
+                })
+            })
+            .collect();
+        self.tip_areas.extend(self.place_tip(area));
         self.draw_footer(frame, footer_area, t);
         self.awaiting_review = false;
         if let Some(pressed_area) = pressed_area
@@ -703,7 +733,7 @@ impl PermissionPrompt {
 
     /// Who asks, where this prompt stands in the queue, and how many of a
     /// batch's commands need an answer.
-    fn place(&self) -> String {
+    pub(super) fn place(&self) -> String {
         let mut parts = Vec::new();
         if let Some(requester) = self.requester_name() {
             parts.push(review_text(requester));
@@ -896,8 +926,9 @@ impl PermissionPrompt {
                 Span::styled(if focused { ROW_FOCUS } else { NO_POINTER }, t.accent),
                 Span::styled(pad(status.word().into(), STATUS_WIDTH), status_style),
             ];
+            let command = row_command(request, row);
             spans.extend(command_cell(
-                &row_command(request, row),
+                &command,
                 command_width,
                 hover_style(command_style, hovered),
             ));
@@ -911,6 +942,15 @@ impl PermissionPrompt {
                 ),
                 scope_width,
             ));
+            body.tip_next_row(row_tip(
+                (command.width() > command_width).then_some(command),
+                status,
+                new.then(|| NewRow {
+                    focused,
+                    remembered: self.row_grant(row).is_some(),
+                }),
+                &scope,
+            ));
             let line = Line::from(spans);
             if new {
                 body.control(target, vec![line], focused);
@@ -919,6 +959,7 @@ impl PermissionPrompt {
             }
         }
         if collapse {
+            body.tip_next_row(COLLAPSED.into());
             body.push([Line::styled(
                 format!("{NO_POINTER}+ {allowed} {ALREADY_ALLOWED}"),
                 t.tool_dim,
@@ -1123,11 +1164,14 @@ impl PermissionPrompt {
                 RowStatus::Asks => (ASKS_EVERY_TIME.into(), coverage(), t.tool_warning, false),
                 RowStatus::Allowed => (ALREADY_ALLOWED.into(), coverage(), t.tool_dim, false),
             };
-            let mut spans = command_cell(
-                &row_command(request, row),
-                command_width,
-                settled(style, status),
-            );
+            let command = row_command(request, row);
+            let cut = command.width() > command_width
+                || scope.width() > scope_width
+                || how_long.width() > rest;
+            if let Some(tip) = review_row_tip(cut, &command, status, &scope, &how_long) {
+                body.tip_next_row(tip);
+            }
+            let mut spans = command_cell(&command, command_width, settled(style, status));
             spans.push(Span::styled(COLUMN_GAP, style));
             spans.extend(pad_spans(
                 ellipsize_spans(
@@ -1348,7 +1392,7 @@ impl PermissionPrompt {
     }
 
     /// Whether `←` `→` can move the main view's scope.
-    fn scope_movable(&self) -> bool {
+    pub(super) fn scope_movable(&self) -> bool {
         let Some(request) = self.current() else {
             return false;
         };
@@ -1462,19 +1506,31 @@ impl PermissionPrompt {
             );
             return;
         }
-        let hints = self.footer_hints();
-        let full: Vec<Hint> = hints.iter().map(|hint| hint.hint(false)).collect();
-        let hints = if hint_hits(&full, area).len() == full.len() {
-            full
-        } else {
-            hints
+        let key_hints = self.footer_hints();
+        let full: Vec<Hint> = key_hints.iter().map(|hint| hint.hint(false)).collect();
+        let compact = hint_hits(&full, area).len() < full.len();
+        let hints = if compact {
+            key_hints
                 .iter()
                 .enumerate()
-                .map(|(index, hint)| hint.hint(index + 1 < hints.len()))
+                .map(|(index, hint)| hint.hint(index + 1 < key_hints.len()))
                 .collect()
+        } else {
+            full
         };
         let hits = hint_hits(&hints, area);
         let shown = &hints[..hits.len()];
+        if compact {
+            self.tip_areas.extend(
+                hits.iter()
+                    .zip(&key_hints)
+                    .take(key_hints.len().saturating_sub(1))
+                    .map(|(area, hint)| TipArea {
+                        area: *area,
+                        text: hint.tip(),
+                    }),
+            );
+        }
         let hovered = self.hover.as_ref().or(self.focus.as_ref());
         let hovered = shown.iter().position(|hint| {
             hint.press()

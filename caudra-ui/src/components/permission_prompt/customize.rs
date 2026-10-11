@@ -156,7 +156,7 @@ fn fallback_lifetime(lifetimes: &[PermissionLifetime]) -> PermissionLifetime {
 }
 
 /// The option a listed scope stands on.
-fn item_option<'a>(
+pub(super) fn item_option<'a>(
     request: &'a PermissionRequest,
     row: Option<usize>,
     item: &ScopeItem,

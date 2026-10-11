@@ -10,6 +10,7 @@ use ratatui::layout::Rect;
 
 use crate::components::permission_scope::view::{ScopeControl, ScopeView};
 use crate::components::scrollbar::Scrollbar;
+use crate::components::tooltip::TipArea;
 use crate::components::{ModalScroll, Overlay};
 
 mod choices;
@@ -21,6 +22,7 @@ mod inspector;
 mod notes;
 mod scope;
 mod step_through;
+mod tips;
 mod view;
 
 use choices::Choice;
@@ -139,6 +141,9 @@ pub struct PermissionPrompt {
     inspector: Option<PatternInspector>,
     scope_view: ScopeView,
     hits: Vec<PromptHit>,
+    /// Tooltips for what the last draw laid out without a hit of its own, or
+    /// whose text depends on how it was cut.
+    tip_areas: Vec<TipArea>,
     mouse_down: Option<PromptTarget>,
     hover: Option<PromptTarget>,
     focus: Option<PromptTarget>,
@@ -187,6 +192,7 @@ impl PermissionPrompt {
             inspector: None,
             scope_view: ScopeView::default(),
             hits: Vec::new(),
+            tip_areas: Vec::new(),
             mouse_down: None,
             hover: None,
             focus: None,
@@ -365,6 +371,7 @@ impl PermissionPrompt {
     fn invalidate_controls(&mut self) {
         self.awaiting_review = true;
         self.hits.clear();
+        self.tip_areas.clear();
         self.mouse_down = None;
         self.hover = None;
         self.scrollbar = Scrollbar::default();

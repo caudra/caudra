@@ -40,6 +40,15 @@ impl Choice {
         }
     }
 
+    pub(super) fn letter(self) -> char {
+        match self {
+            Self::Once => 'y',
+            Self::Conversation => 's',
+            Self::Project => 'a',
+            Self::Deny => 'n',
+        }
+    }
+
     pub(super) fn lifetime(self) -> Option<PermissionLifetime> {
         match self {
             Self::Conversation => Some(PermissionLifetime::Conversation),
