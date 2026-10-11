@@ -18,6 +18,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use caudra_agent::peers::PeerSession;
+use caudra_storage::autopilot::StoredAutopilotDecision;
 use caudra_storage::id::CaudraId;
 use caudra_storage::permission_state::mutation::{
     PermissionCommitReceipt, PermissionMutationError, PermissionOwner, PreparedPermissionMutation,
@@ -70,6 +71,9 @@ type PendingWorkspaceTabs = Arc<Mutex<Option<WorkspaceTabsRequest>>>;
 type PendingUsage = Arc<Mutex<Vec<QueuedUsage>>>;
 /// The same, for the ledger that sums what tools did.
 type PendingToolCalls = Arc<Mutex<Vec<QueuedToolCall>>>;
+/// Written after the snapshots queued with them, so the session row a
+/// decision references is on disk first.
+type PendingDecisions = Arc<Mutex<Vec<QueuedDecision>>>;
 
 type DeleteCallback = Box<dyn FnOnce(Result<(), SessionError>) + Send>;
 type SaveCallback = flume::Sender<Result<(), SessionError>>;
@@ -139,6 +143,11 @@ struct QueuedToolCall {
     enqueued_at: u64,
 }
 
+struct QueuedDecision {
+    session_id: CaudraId,
+    decision: StoredAutopilotDecision,
+}
+
 pub struct StorageWriter {
     pending: Pending,
     seeded_cursors: SeededCursors,
@@ -146,6 +155,7 @@ pub struct StorageWriter {
     workspace_tabs: PendingWorkspaceTabs,
     usage: PendingUsage,
     tool_calls: PendingToolCalls,
+    autopilot_decisions: PendingDecisions,
     done_rx: flume::Receiver<Result<(), SessionError>>,
     thread: JoinHandle<()>,
     generation: Arc<AtomicU64>,
@@ -164,6 +174,8 @@ impl StorageWriter {
         let writer_usage = Arc::clone(&usage);
         let tool_calls: PendingToolCalls = Arc::default();
         let writer_tool_calls = Arc::clone(&tool_calls);
+        let autopilot_decisions: PendingDecisions = Arc::default();
+        let writer_autopilot_decisions = Arc::clone(&autopilot_decisions);
         let (wake, wake_rx) = flume::bounded::<()>(1);
         let wake = Arc::new(wake);
         let (done_tx, done_rx) = flume::bounded(1);
@@ -183,6 +195,7 @@ impl StorageWriter {
                     tool_ledger: None,
                     cursors: HashMap::new(),
                     seeded_cursors: writer_seeded_cursors,
+                    autopilot_decisions: writer_autopilot_decisions,
                     deleted_sessions: HashMap::new(),
                     failing: HashSet::new(),
                     workspace_tabs_errors: HashMap::new(),
@@ -220,6 +233,7 @@ impl StorageWriter {
             workspace_tabs,
             usage,
             tool_calls,
+            autopilot_decisions,
             done_rx,
             thread,
             generation,
@@ -269,6 +283,28 @@ impl StorageWriter {
             Ok(()) | Err(flume::TrySendError::Full(())) => {}
             Err(flume::TrySendError::Disconnected(())) => {
                 warn!("storage writer unavailable; tool activity may not be recorded");
+            }
+        }
+    }
+
+    /// Logs a decision autopilot made in `session_id`, whose row must already
+    /// exist or be queued. Never coalesced: the log keeps every decision.
+    pub fn record_autopilot_decision(
+        &self,
+        session_id: CaudraId,
+        decision: StoredAutopilotDecision,
+    ) {
+        self.autopilot_decisions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(QueuedDecision {
+                session_id,
+                decision,
+            });
+        match self.wake.try_send(()) {
+            Ok(()) | Err(flume::TrySendError::Full(())) => {}
+            Err(flume::TrySendError::Disconnected(())) => {
+                warn!(%session_id, "storage writer unavailable; an autopilot decision may not be recorded");
             }
         }
     }
@@ -430,6 +466,7 @@ struct Writer {
     tool_ledger: Option<ToolLedger>,
     cursors: HashMap<CaudraId, SessionCursor>,
     seeded_cursors: SeededCursors,
+    autopilot_decisions: PendingDecisions,
     /// Explicit recreation capability retained only by the writer that
     /// completed an ordered delete; ordinary stale saves cannot cross tombstones.
     deleted_sessions: HashMap<CaudraId, SessionRecreation>,
@@ -612,12 +649,53 @@ impl Writer {
         }
     }
 
+    fn claim_autopilot_decisions(&self) -> Vec<QueuedDecision> {
+        mem::take(
+            &mut *self
+                .autopilot_decisions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
+    }
+
+    /// A decision that fails to write is dropped with a warning: the log
+    /// mirrors what the transcript already showed, and a session that is gone
+    /// would refuse it on every retry.
+    fn write_autopilot_decisions(&mut self, decisions: Vec<QueuedDecision>) {
+        if decisions.is_empty() {
+            return;
+        }
+        if self.database.is_none() {
+            match SessionDatabase::open(&self.dir) {
+                Ok(database) => self.database = Some(database),
+                Err(error) => {
+                    warn!(%error, decisions = decisions.len(), "session database unavailable; autopilot decisions dropped");
+                    return;
+                }
+            }
+        }
+        let Some(database) = &self.database else {
+            return;
+        };
+        for QueuedDecision {
+            session_id,
+            decision,
+        } in decisions
+        {
+            if let Err(error) = database.insert_autopilot_decision(session_id, &decision) {
+                warn!(%error, %session_id, seq = decision.seq, "autopilot decision write failed");
+            }
+        }
+    }
+
     /// One pass over everything queued. The tabs request is claimed before the
     /// snapshots are written, because `write_workspace_tabs` keeps only the ids
     /// the database still holds and the slot is emptied by the claim. Reading
     /// it afterwards let a delete queued ahead of the request land behind it,
     /// leaving a tab pointing at a session that was on its way out and no
-    /// second request to correct it.
+    /// second request to correct it. Autopilot decisions are claimed first too:
+    /// the save of the session row each one references was queued ahead of it,
+    /// so that save is among the snapshots this pass writes before them.
     fn drain(
         &mut self,
         pending: &Pending,
@@ -626,7 +704,9 @@ impl Writer {
         tool_calls: &PendingToolCalls,
     ) {
         let request = tabs.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let decisions = self.claim_autopilot_decisions();
         self.flush(pending);
+        self.write_autopilot_decisions(decisions);
         self.flush_permissions();
         if let Some(request) = request {
             self.flush_workspace_tabs(request);
@@ -984,6 +1064,10 @@ mod tests {
     const MONTH_START: &str = "2020-02-01T00:00:00";
     const PREVIOUS_MONTH: &str = "2020-01";
     const NEXT_MONTH: &str = "2020-02";
+    const DECISION_KIND: &str = "permission";
+    const DECISION_ACTION: &str = "allow";
+    const DECISION_SUBJECT: &str = "bash";
+    const DECISION_REASON: &str = "read-only listing";
 
     fn conversation_permission() -> PermissionRuleRecord {
         PermissionRuleRecord::conversation(StructuredPermissionRule {
@@ -1309,6 +1393,7 @@ mod tests {
             tool_ledger: None,
             cursors: HashMap::new(),
             seeded_cursors: Arc::default(),
+            autopilot_decisions: Arc::default(),
             deleted_sessions: HashMap::new(),
             failing: HashSet::new(),
             workspace_tabs_errors: HashMap::new(),
@@ -1645,6 +1730,47 @@ mod tests {
 
         assert!(AppSession::load(a_id, &dir).is_ok());
         assert_eq!(AppSession::load(b_id, &dir).unwrap().title, "renamed");
+    }
+
+    fn decision(seq: u64) -> StoredAutopilotDecision {
+        StoredAutopilotDecision {
+            seq,
+            at_ms: seq,
+            kind: DECISION_KIND.into(),
+            action: DECISION_ACTION.into(),
+            subject: DECISION_SUBJECT.into(),
+            reason: DECISION_REASON.into(),
+            agent: None,
+            tool_use_id: None,
+            history_len: 0,
+            model: None,
+            usage: None,
+            cost: None,
+        }
+    }
+
+    #[test_case(true; "after_the_session_save_queued_ahead_of_them")]
+    #[test_case(false; "dropped_without_a_session_row")]
+    fn autopilot_decisions_are_logged_in_order(saved: bool) {
+        let (_tmp, dir) = state_dir();
+        let (writer, _warn_rx) = writer(&dir);
+        let session = AppSession::new(MODEL, CWD);
+        let id = session.id;
+        if saved {
+            writer.send(Arc::new(session));
+        }
+        let logged = [decision(0), decision(1)];
+        for decision in &logged {
+            writer.record_autopilot_decision(id, decision.clone());
+        }
+        writer.shutdown(DRAIN_TIMEOUT);
+
+        let stored = SessionDatabase::open(&dir)
+            .unwrap()
+            .load_autopilot_decisions(id)
+            .unwrap();
+        let expected: &[StoredAutopilotDecision] = if saved { &logged } else { &[] };
+        assert_eq!(stored, expected);
     }
 
     #[test]

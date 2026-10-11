@@ -62,12 +62,13 @@ const SANDBOX_LIMITS: SandboxLimits = SandboxLimits {
     max_array_size: 65_536,
     max_map_size: 65_536,
 };
-const DEFAULT_INPUTS: [InputKind; 5] = [
+const DEFAULT_INPUTS: [InputKind; 6] = [
     InputKind::Permission,
     InputKind::Question,
     InputKind::Plan,
     InputKind::Auth,
     InputKind::Plugin,
+    InputKind::Autopilot,
 ];
 const DEFAULT_VERDICTS: [GoalVerdict; 3] = [
     GoalVerdict::Met,
@@ -1026,6 +1027,7 @@ let ask = switch event.input {
     "permission" => "approve " + event.tool,
     "plan" => "review a plan",
     "auth" => "sign in again",
+    "autopilot" => "take over from autopilot",
     _ => "answer a " + event.input,
 };
 http(#{
@@ -1125,7 +1127,7 @@ state.requests = requests;
     description: "Probe the header",
     triggers: [
         #{ kind: "idle", after: "90s" },
-        #{ kind: "needs_input", after: "5m", inputs: ["messages", "plan"] },
+        #{ kind: "needs_input", after: "5m", inputs: ["messages", "plan", "autopilot"] },
         #{ kind: "goal_finished", verdicts: ["impossible"] },
         #{ kind: "message_received", audiences: ["topic"], topics: ["swarm.*"], senders: ["@worker-*", "*"], admissions: ["held"], from_automations: true },
         #{ kind: "work_finished", states: ["paused"] },
@@ -1243,6 +1245,7 @@ skip("done");
             InputKind::Plan,
             InputKind::Auth,
             InputKind::Plugin,
+            InputKind::Autopilot,
         ]
     }
 
@@ -1517,7 +1520,7 @@ skip("done");
                     },
                     Trigger::NeedsInput {
                         delay: Duration::from_mins(5),
-                        inputs: vec![InputKind::Messages, InputKind::Plan],
+                        inputs: vec![InputKind::Messages, InputKind::Plan, InputKind::Autopilot],
                     },
                     Trigger::GoalFinished {
                         verdicts: vec![GoalVerdict::Impossible],

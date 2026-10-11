@@ -636,6 +636,8 @@ async fn prepare_session(
         host_cwd: None,
         local_documents: runtime.local_documents.clone(),
         automations: None,
+        // The client owns the permission prompts, so no delegate answers them.
+        autopilot: None,
     })
     .await
     .map_err(|error| AcpError::internal_error().data(json_str(&error)))?;

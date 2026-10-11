@@ -4,9 +4,10 @@ use crate::experimental::{Feature, FeatureFlags};
 use crate::files::{self, CONFIG_FILES};
 use crate::steering::{SteeringConfig, SteeringRule, SteeringRulesConfig};
 use crate::{
-    AgentConfig, AutomationsConfig, ConfigValue, DEFAULT_BUILTINS, MIN_TOOL_OUTPUT_LINES,
-    MessagingConfig, NATIVE_PLUGIN_OPTIONS, ProviderConfig, RetentionConfig, SnapshotsConfig,
-    StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig, WorktreesConfig,
+    AgentConfig, AutomationsConfig, AutopilotConfig, ConfigValue, DEFAULT_BUILTINS,
+    MIN_TOOL_OUTPUT_LINES, MessagingConfig, NATIVE_PLUGIN_OPTIONS, ProviderConfig, RetentionConfig,
+    SnapshotsConfig, StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
+    WorktreesConfig,
 };
 
 use super::{Document, Entry, Header, Table, code_list, global_location, preamble};
@@ -39,6 +40,8 @@ const DECISION_FEATURES_ABOUT: &str = "`off` turns a feature off, `shadow` colle
 const THRESHOLDS_ABOUT: &str = "Probabilities between 0 and 1. Flags trigger at or above their \
      threshold, and goal prescreening skips at or below its own.";
 const AUTOMATIONS_ABOUT: &str = "Limits for automations, which need `automations = true` under \
+     [experimental]. Only the global caudra.toml may hold this table.";
+const AUTOPILOT_ABOUT: &str = "Limits for autopilot, which needs `autopilot = true` under \
      [experimental]. Only the global caudra.toml may hold this table.";
 
 /// Every `caudra.toml` setting with its default, type, bounds, and
@@ -133,6 +136,8 @@ fn tables() -> Vec<Table> {
             AutomationsConfig::FIELDS,
         )
         .about(AUTOMATIONS_ABOUT),
+        Table::of(Header::Fixed("autopilot".into()), AutopilotConfig::FIELDS)
+            .about(AUTOPILOT_ABOUT),
         Table::new(Header::Fixed("plugins".into()), Vec::new()).about(plugins_about()),
     ]);
     tables.extend(

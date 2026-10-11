@@ -14,6 +14,7 @@ use super::{
     policy::validate_compiled_templates,
     structured::trusted_command_observation,
 };
+use crate::autopilot::AutopilotHandle;
 use crate::decisions::{DecisionContext, Decisions};
 use caudra_config::{Effect, PermissionRule, PermissionsConfig, ToolKey};
 use caudra_storage::id::CaudraId;
@@ -234,6 +235,9 @@ pub struct PermissionManager {
     pub(super) plugin_rules: Arc<PluginRuleStore>,
     patterns: Arc<Mutex<BTreeMap<PathBuf, PatternDiscovery>>>,
     pattern_dismissals: Arc<Mutex<PatternDismissals>>,
+    /// The session's autopilot, which every agent sharing this manager asks.
+    /// A fork starts without it, so no other session inherits an engagement.
+    autopilot: RwLock<Option<AutopilotHandle>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -419,6 +423,7 @@ impl PermissionManager {
             plugin_rules,
             patterns: Arc::default(),
             pattern_dismissals: Arc::new(Mutex::new(pattern_dismissals)),
+            autopilot: RwLock::new(None),
         }
     }
 
@@ -537,6 +542,7 @@ impl PermissionManager {
             plugin_rules: Arc::clone(&self.plugin_rules),
             patterns: Arc::clone(&self.patterns),
             pattern_dismissals: Arc::clone(&self.pattern_dismissals),
+            autopilot: RwLock::new(None),
         }
     }
 
@@ -615,6 +621,21 @@ impl PermissionManager {
             .unwrap_or_else(|error| error.into_inner()) = decisions;
         self.broker.revoke_passive_decisions();
         self.notify_policy_changed("");
+    }
+
+    pub fn autopilot(&self) -> Option<AutopilotHandle> {
+        self.autopilot
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// Set on each root manager a session builds, and never on a fork.
+    pub fn set_autopilot(&self, autopilot: Option<AutopilotHandle>) {
+        *self
+            .autopilot
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = autopilot;
     }
 
     pub fn set_seed_mode(&self, seed: PermissionMode) {
@@ -1294,6 +1315,7 @@ mod tests {
 
     use test_case::test_case;
 
+    use crate::autopilot::AutopilotHandle;
     use crate::permissions::tests::{
         PLUGIN_EDIT_PATH, SHELL_WORKDIR, allows_without_prompt, answer_enforcement, default_mgr,
         denied_by_rule, deny_rule, enforce_shell_without_prompt, legacy_request, make_config,
@@ -1314,6 +1336,7 @@ mod tests {
 
     const META_KEY: &str = "request_id";
     const UNATTRIBUTED: &str = "";
+    const FORK_INHERITED: &str = "another session must never inherit an engagement";
 
     #[test]
     fn decision_context_uses_the_canonical_project() {
@@ -1354,6 +1377,28 @@ mod tests {
         assert_eq!(fork.mode(), seed);
         assert_eq!(fork.persisted_mode(), None);
         assert_eq!(manager.persisted_mode(), stored);
+    }
+
+    /// Subagents, workflow agents and background tasks hold the root manager
+    /// itself, while another session gets a fork.
+    #[test]
+    fn autopilot_reaches_agents_sharing_the_manager_but_never_a_fork() {
+        let root = Arc::new(default_mgr());
+        let autopilot = AutopilotHandle::default();
+        autopilot.engage(false);
+        root.set_autopilot(Some(autopilot));
+        let agent = Arc::clone(&root);
+
+        assert!(agent.autopilot().is_some_and(|handle| handle.is_engaged()));
+        assert!(root.fork().autopilot().is_none(), "{FORK_INHERITED}");
+        assert!(
+            root.fork_session(CaudraId::generate())
+                .autopilot()
+                .is_none(),
+            "{FORK_INHERITED}"
+        );
+        root.set_autopilot(None);
+        assert!(agent.autopilot().is_none());
     }
 
     #[test_case(None; "seeded_auto")]

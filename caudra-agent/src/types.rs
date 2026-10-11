@@ -8,10 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use caudra_providers::{
-    AgentError, AutomationEventOrigin, Billing, ContentBlock, DocumentSource, Message,
-    PEER_SCRIPT_SENDER, PEER_SESSION_SENDER, PeerMessageOrigin, Role, StopReason, TaskEventOrigin,
-    TokenUsage, estimate_tokens_cached, token_label,
+    AgentError, AutomationEventOrigin, AutopilotOrigin, Billing, ContentBlock, DocumentSource,
+    Message, PEER_SCRIPT_SENDER, PEER_SESSION_SENDER, PeerMessageOrigin, Role, StopReason,
+    TaskEventOrigin, TokenUsage, estimate_tokens_cached, token_label,
 };
+use caudra_storage::autopilot::AutopilotEnd;
 use caudra_storage::background::{JobKind, JobOwner, ShellJobMetadata};
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::UnrecordedCall;
@@ -29,6 +30,7 @@ use serde_json::{Value, json};
 use strum::Display;
 
 use crate::agent::{GoalResult, GoalVerdict};
+use crate::autopilot::{AutopilotDecision, DecisionKind};
 use crate::peers::{
     AssignedWork, PeerHistoryPage, PeerSummary, PublishReceipt, STATUS_HELD, STATUS_QUEUED,
     STATUS_RATE_LIMITED, STATUS_REFUSED, STATUS_UNAVAILABLE, SendReceipt, TopicActivity,
@@ -48,6 +50,9 @@ pub const BACKGROUND_EVENT_RUN_ID: u64 = u64::MAX - 2;
 /// The `run_id` the memory summarizer's events carry. It works between turns,
 /// so they belong to none.
 pub const MEMORY_EVENT_RUN_ID: u64 = u64::MAX - 3;
+/// The `run_id` of an autopilot event a headless frontend raised itself, such
+/// as an engagement a control started or an interrupt ended. It is no run's.
+pub const AUTOPILOT_EVENT_RUN_ID: u64 = u64::MAX - 4;
 /// How much of a run's report or result a transcript card quotes.
 pub const MAX_CARD_PREVIEW_BYTES: usize = 2048;
 /// Log lines a card keeps under its roster while the run works.
@@ -271,8 +276,23 @@ pub struct QuestionOption {
     pub description: String,
 }
 
-/// What the user picked for one question. `labels` is empty when the question
-/// was skipped, and may hold text the user typed rather than an offered label.
+/// Who answered a permission prompt or a question.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Answerer {
+    #[default]
+    User,
+    Autopilot,
+}
+
+impl Answerer {
+    pub fn is_user(&self) -> bool {
+        *self == Self::User
+    }
+}
+
+/// What was picked for one question. `labels` is empty when the question was
+/// skipped, and may hold text typed rather than an offered label.
 ///
 /// `question` and `options` are what the pick was made against, so a card can
 /// redraw the form rather than the picks alone. Both are skipped by serde
@@ -280,6 +300,9 @@ pub struct QuestionOption {
 /// copy under the result could only disagree with it, and a restored answer is
 /// filled back in from the input. That is also what lets a session written
 /// before the card drew a form render the same as one written after.
+///
+/// `by` is stored with the picks only when autopilot made them, so a user's
+/// answer keeps the shape every earlier session stored it in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {
     pub header: String,
@@ -288,6 +311,8 @@ pub struct Answer {
     pub question: String,
     #[serde(skip)]
     pub options: Vec<QuestionOption>,
+    #[serde(default, skip_serializing_if = "Answerer::is_user")]
+    pub by: Answerer,
 }
 
 /// The run has parked on a question. The front end that shows the form answers
@@ -2484,6 +2509,13 @@ impl ToolDoneEvent {
                 .and_then(plan::parse_write_result)
         })
     }
+
+    /// Whether this call, or a call it batched, wrote the plan.
+    pub fn wrote_plan(&self) -> bool {
+        self.plan_write_result().is_some()
+            || matches!(&self.output, ToolOutput::Batch { entries, .. }
+                if entries.iter().any(|entry| entry.plan_write_result().is_some()))
+    }
 }
 
 fn append_model_suffix(content: &mut String, model_suffix: Option<&str>) {
@@ -2566,6 +2598,33 @@ impl From<Option<StopReason>> for DoneReason {
     }
 }
 
+/// What autopilot did, for frontends to show, store and notify.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum AutopilotEvent {
+    Engaged,
+    Deciding {
+        seq: u32,
+        kind: DecisionKind,
+        subject: String,
+    },
+    Decided(Box<AutopilotDecision>),
+    /// A retryable provider error ended a run, and it starts again after
+    /// `delay_ms`.
+    Retrying {
+        attempt: u32,
+        limit: u32,
+        delay_ms: u64,
+        error: String,
+    },
+    ImplementPlan {
+        seq: u32,
+    },
+    Ended {
+        reason: AutopilotEnd,
+    },
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -2643,6 +2702,9 @@ pub enum AgentEvent {
     },
     GoalFinished {
         result: GoalResult,
+        /// Whether autopilot owned the goal, read as it finished: the end of an owned goal
+        /// ends autopilot before a frontend sees this event.
+        autopilot_owned: bool,
     },
     GoalDeferred {
         active_background_tasks: usize,
@@ -2667,7 +2729,10 @@ pub enum AgentEvent {
     GoalClearedAfterError {
         condition: String,
         message: String,
+        /// Whether autopilot owned the goal, read before the error ended autopilot.
+        autopilot_owned: bool,
     },
+    Autopilot(AutopilotEvent),
     TurnComplete(Box<TurnCompleteEvent>),
     ModelUsage {
         usage: TokenUsage,
@@ -2729,6 +2794,9 @@ pub enum AgentEvent {
     PermissionRequestResolved {
         request_id: String,
         source_request_id: String,
+        /// Who answered, when that was not the user at the prompt's card.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        by: Option<Answerer>,
     },
     StreamReset,
     AuthRequired,
@@ -2751,6 +2819,8 @@ pub enum AgentEvent {
         peer_event: Option<PeerMessageOrigin>,
         #[serde(skip_serializing_if = "Option::is_none")]
         automation_event: Option<AutomationEventOrigin>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        autopilot_event: Option<AutopilotOrigin>,
     },
     /// Deferred tools moved into the request array. Reported because the user
     /// is paying for it: the tools array changes, so the provider's prompt
@@ -2808,6 +2878,12 @@ pub enum AgentEvent {
     /// A workflow run moved. Always sent under [`WORKFLOW_EVENT_RUN_ID`] with
     /// the run's provenance on the envelope.
     Workflow(Box<caudra_workflow::WorkflowEvent>),
+}
+
+impl From<AutopilotEvent> for AgentEvent {
+    fn from(event: AutopilotEvent) -> Self {
+        Self::Autopilot(event)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -3581,6 +3657,8 @@ mod tests {
     const PLAN_WRITE_PATH: &str = "/plans/committed.md";
     const PLAN_WRITE_REFERENCE: &str = "plan-committed";
     const PLAN_WRITE_CONTENT: &str = "# Committed plan";
+    const RESOLVED_REQUEST: &str = "resolved-request";
+    const AUTOPILOT_ANSWERER: &str = "autopilot";
 
     fn shell_output() -> ShellOutput {
         ShellOutput {
@@ -5860,5 +5938,22 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rx.recv().unwrap().task.as_deref(), Some(&foreign));
+    }
+
+    #[test_case(None, None; "a_user_answer_leaves_it_out")]
+    #[test_case(Some(Answerer::Autopilot), Some(AUTOPILOT_ANSWERER); "an_autopilot_answer_names_it")]
+    fn a_resolved_prompt_names_who_answered_only_when_set(
+        by: Option<Answerer>,
+        expected: Option<&str>,
+    ) {
+        let event = AgentEvent::PermissionRequestResolved {
+            request_id: RESOLVED_REQUEST.into(),
+            source_request_id: String::new(),
+            by,
+        };
+
+        let json = serde_json::to_value(&event).unwrap();
+
+        assert_eq!(json.get("by").and_then(Value::as_str), expected);
     }
 }

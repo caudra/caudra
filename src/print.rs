@@ -4,36 +4,48 @@
 //! unchanged. Keep `PrintResult` fields a strict subset of theirs. `StreamJson`
 //! is JSONL with the same shape, `Text` prints the raw response only.
 //!
-//! We adopt new fields when Claude Code adds them but never invent our own.
-//! Check their docs before changing anything here.
+//! We adopt new fields when Claude Code adds them but never invent our own,
+//! save for what a Caudra-only flag such as `--autopilot` reports, and only
+//! when it is passed. Check their docs before changing anything here.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use caudra_agent::autopilot::{ActionName, AutopilotHandle};
 use caudra_agent::headless::{HeadlessHandle, HeadlessParams};
 use caudra_agent::permissions::PluginRuleStore;
 use caudra_agent::tools::QUESTION_TOOL_NAME;
+use caudra_agent::types::AutopilotEvent;
 use caudra_agent::{
     AgentConfig, AgentEvent, DoneReason, Envelope, GoalHandle, GoalVerdict, ImageSource,
     PermissionsConfig,
 };
 use caudra_config::decisions::DecisionsConfig;
-use caudra_config::{ModelPolicy, SnapshotsConfig};
+use caudra_config::{AutopilotConfig, ModelPolicy, SnapshotsConfig};
 use caudra_lua::EventHandle;
 use caudra_providers::model::Model;
 use caudra_providers::{Billing, TokenUsage, add_cost};
+use caudra_storage::autopilot::{AutopilotBudget, AutopilotEnd};
 use caudra_storage::id::SessionRef;
 use caudra_storage::sessions::PermissionMode;
+use caudra_storage::usage_ledger::LedgerPurpose;
 use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::sdk_mode::{AUTOPILOT_SYSTEM_SUBTYPE, AutopilotSystemPayload};
+
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const NO_PROMPT: &str = "no prompt: pass --prompt \"<text>\" or pipe text on stdin";
+const SYSTEM_EVENT: &str = "system";
+const AUTOPILOT_ENDED: &str = "Autopilot ended";
+const CONTINUATIONS_SPENT: &str = "continuation limit reached";
+const COST_SPENT: &str = "cost limit reached";
+const TIME_SPENT: &str = "time limit reached";
 
 // Fails fast: silently dropping an image the caller explicitly attached
 // would be worse than erroring.
@@ -84,6 +96,134 @@ struct PrintResult {
     /// `total_cost_usd` and never added to it, which stays actual spend.
     subscription_cost_usd: f64,
     usage: TokenUsage,
+    /// Only when `--autopilot` engaged the run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    autopilot: Option<AutopilotSummary>,
+}
+
+/// How autopilot fared over the run: whether it ended and why, the
+/// continuations it spent, and the decisions it made, escalations included.
+#[derive(Debug, PartialEq, Serialize)]
+struct AutopilotSummary {
+    ended: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end: Option<AutopilotEnd>,
+    continuations: u32,
+    decisions: u32,
+    escalations: u32,
+}
+
+/// An autopilot event, in the body an SDK client reads it in.
+#[derive(Serialize)]
+struct AutopilotSystemEvent<'a> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    subtype: &'static str,
+    #[serde(flatten)]
+    payload: AutopilotSystemPayload<'a>,
+    session_id: &'a SessionRef,
+}
+
+/// What the run's autopilot events add up to.
+#[derive(Default)]
+struct AutopilotTally {
+    decisions: u32,
+    escalations: u32,
+    ended: Option<AutopilotEnd>,
+}
+
+impl AutopilotTally {
+    fn observe(&mut self, event: &AutopilotEvent) {
+        match event {
+            AutopilotEvent::Decided(decision) => {
+                self.decisions += 1;
+                if decision.action == ActionName::Escalate {
+                    self.escalations += 1;
+                }
+            }
+            AutopilotEvent::Ended { reason } => self.ended = Some(reason.clone()),
+            _ => {}
+        }
+    }
+
+    /// Why autopilot fails the run: a limit or an error ended it. A goal it
+    /// gave up on fails as the goal's own result, and a stop does not fail.
+    fn failure(&self) -> Option<String> {
+        let reason = match self.ended.as_ref()? {
+            AutopilotEnd::Budget {
+                kind: AutopilotBudget::Continuations,
+            } => CONTINUATIONS_SPENT,
+            AutopilotEnd::Budget {
+                kind: AutopilotBudget::Cost,
+            } => COST_SPENT,
+            AutopilotEnd::Budget {
+                kind: AutopilotBudget::Time,
+            } => TIME_SPENT,
+            AutopilotEnd::Error { message } => message,
+            AutopilotEnd::Stopped { .. } | AutopilotEnd::GoalMet | AutopilotEnd::GoalImpossible => {
+                return None;
+            }
+        };
+        Some(format!("{AUTOPILOT_ENDED}: {reason}"))
+    }
+
+    fn summary(self, autopilot: &AutopilotHandle) -> AutopilotSummary {
+        AutopilotSummary {
+            ended: self.ended.is_some(),
+            end: self.ended,
+            continuations: autopilot
+                .stored()
+                .map_or(0, |engagement| engagement.continuations),
+            decisions: self.decisions,
+            escalations: self.escalations,
+        }
+    }
+}
+
+/// The autopilot `--autopilot` engages for the run, under the `[autopilot]`
+/// limits read once at startup. It owns the goal a `/goal <condition>` prompt
+/// set.
+fn launch_autopilot(
+    limits: AutopilotConfig,
+    goal: &GoalHandle,
+) -> (AutopilotHandle, Option<AutopilotEvent>) {
+    let autopilot = AutopilotHandle::default();
+    autopilot.set_limits(limits);
+    let engaged = autopilot.engage(goal.snapshot().is_some());
+    (autopilot, engaged)
+}
+
+/// What a subagent spent, which an engaged autopilot counts as the goal does,
+/// and the end it reached. The delegate's spend is counted where it is made.
+fn subagent_spend(
+    autopilot: Option<&AutopilotHandle>,
+    cost: Option<f64>,
+    billing: Billing,
+    purpose: LedgerPurpose,
+) -> Option<AutopilotEvent> {
+    autopilot
+        .filter(|_| purpose != LedgerPurpose::Autopilot)
+        .and_then(|autopilot| autopilot.record_spend(cost, billing, &autopilot.limits()))
+}
+
+/// Counts an autopilot event towards the result, and shows it where the run
+/// shows its events.
+fn note_autopilot(
+    event: &AutopilotEvent,
+    tally: &mut AutopilotTally,
+    out: Option<&mut VerboseOutput>,
+    session_id: &SessionRef,
+) -> Result<()> {
+    tally.observe(event);
+    match (out, AutopilotSystemPayload::from_event(event)) {
+        (Some(out), Some(payload)) => out.emit(&AutopilotSystemEvent {
+            event_type: SYSTEM_EVENT,
+            subtype: AUTOPILOT_SYSTEM_SUBTYPE,
+            payload,
+            session_id,
+        }),
+        _ => Ok(()),
+    }
 }
 
 #[derive(Serialize)]
@@ -183,11 +323,15 @@ pub fn run(
     workspace_session: Option<caudra_workspace::WorkspaceSession>,
     remote_project_context: Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
     local_documents: Option<Arc<caudra_storage::local_documents::LocalDocumentStore>>,
+    autopilot_limits: Option<AutopilotConfig>,
 ) -> Result<ExitCode> {
     let prompt = prompt_arg.ok_or_else(|| eyre!(NO_PROMPT))?;
 
     let images = load_images(&image_paths)?;
     let (prompt, goal) = print_goal(prompt)?;
+    let (autopilot, engaged) = autopilot_limits
+        .map(|limits| launch_autopilot(limits, &goal))
+        .unzip();
 
     // Print mode mints a throwaway session id and never opens a session store,
     // so a generated title would have nowhere to land.
@@ -254,6 +398,7 @@ pub fn run(
         workspace_session,
         remote_project_context,
         local_documents,
+        autopilot: autopilot.clone(),
     })?;
 
     let HeadlessHandle {
@@ -282,6 +427,10 @@ pub fn run(
             tools: &tool_names,
             model: &model.id,
         })?;
+    }
+    let mut tally = AutopilotTally::default();
+    if let Some(engaged) = engaged.flatten() {
+        note_autopilot(&engaged, &mut tally, verbose_out.as_mut(), &session_id)?;
     }
 
     let mut result_text = String::new();
@@ -340,6 +489,9 @@ pub fn run(
             | AgentEvent::ToolsLoaded { .. }
             | AgentEvent::Unrecorded { .. }
             | AgentEvent::PromptProgress { .. } => {}
+            AgentEvent::Autopilot(event) => {
+                note_autopilot(event, &mut tally, verbose_out.as_mut(), &session_id)?;
+            }
             AgentEvent::Injected {
                 text, peer_event, ..
             } => {
@@ -371,7 +523,7 @@ pub fn run(
             } => {
                 add_spend(&mut cost, &mut subscription_cost, *goal_cost, *billing);
             }
-            AgentEvent::GoalFinished { result } => {
+            AgentEvent::GoalFinished { result, .. } => {
                 if result.verdict != GoalVerdict::Met {
                     is_error = true;
                     result_text = format!("Goal could not be achieved: {}", result.reason);
@@ -410,7 +562,9 @@ pub fn run(
                     result_text = format!("Goal evaluation #{evaluation} failed: {message}");
                 }
             }
-            AgentEvent::GoalClearedAfterError { condition, message } => {
+            AgentEvent::GoalClearedAfterError {
+                condition, message, ..
+            } => {
                 is_error = true;
                 result_text =
                     format!("Goal cleared after an unrecoverable error: {condition} ({message})");
@@ -436,6 +590,11 @@ pub fn run(
                 add_spend(&mut cost, &mut subscription_cost, tc.cost, tc.billing);
                 if parent_tool_use_id.is_some() {
                     goal.record_external_usage(tc.usage, tc.cost, tc.billing);
+                    if let Some(ended) =
+                        subagent_spend(autopilot.as_ref(), tc.cost, tc.billing, tc.purpose)
+                    {
+                        note_autopilot(&ended, &mut tally, verbose_out.as_mut(), &session_id)?;
+                    }
                 }
                 if let Some(out) = &mut verbose_out {
                     let content_value = serde_json::to_value(&tc.message.content)?;
@@ -456,11 +615,17 @@ pub fn run(
                 usage: repair_usage,
                 cost: repair_cost,
                 billing,
+                purpose,
                 ..
             } => {
                 add_spend(&mut cost, &mut subscription_cost, *repair_cost, *billing);
                 if parent_tool_use_id.is_some() {
                     goal.record_external_usage(*repair_usage, *repair_cost, *billing);
+                    if let Some(ended) =
+                        subagent_spend(autopilot.as_ref(), *repair_cost, *billing, *purpose)
+                    {
+                        note_autopilot(&ended, &mut tally, verbose_out.as_mut(), &session_id)?;
+                    }
                 } else {
                     usage += *repair_usage;
                 }
@@ -512,6 +677,14 @@ pub fn run(
         .await;
     });
 
+    if let Some(failure) = tally.failure() {
+        if !is_error {
+            result_text = failure;
+        }
+        is_error = true;
+    }
+    let autopilot = autopilot.map(|autopilot| tally.summary(&autopilot));
+
     let duration_ms = start.elapsed().as_millis();
     // Zero on an unpriced model, which is what its turns reported too.
     let total_cost_usd = cost.unwrap_or_default();
@@ -534,6 +707,7 @@ pub fn run(
                 total_cost_usd,
                 subscription_cost_usd,
                 usage,
+                autopilot,
             };
             match verbose_out {
                 Some(VerboseOutput::Json(mut events)) => {
@@ -578,7 +752,9 @@ fn print_goal(prompt: String) -> Result<(String, GoalHandle)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_agent::autopilot::{AutopilotDecision, DecisionKind};
     use caudra_providers::TokenUsage;
+    use caudra_storage::autopilot::AutopilotStopper;
     use test_case::test_case;
 
     const RETRY_PARENT_ID: &str = "toolu_task_1";
@@ -639,6 +815,7 @@ mod tests {
             total_cost_usd: 0.003,
             subscription_cost_usd: 0.0,
             usage: TokenUsage::default(),
+            autopilot: None,
         };
         let json: Value = serde_json::to_value(&result).unwrap();
         for field in PRINT_RESULT_FIELDS {
@@ -693,5 +870,201 @@ mod tests {
         .unwrap();
         json.get(PARENT_KEY)
             .map(|id| id.as_str().expect("serialized as a string").to_owned())
+    }
+
+    const GOAL_CONDITION: &str = "the tests pass";
+    const PLAIN_PROMPT: &str = "fix the tests";
+    const AUTOPILOT_FAILURE: &str = "the delegate kept failing";
+    const AUTOPILOT_SEQ: u32 = 4;
+    const AUTOPILOT_SUBJECT: &str = "cargo test";
+    const MAX_COST: f64 = 0.5;
+    const SPEND: f64 = 0.75;
+    const RETRY_ATTEMPT: u32 = 1;
+    const RETRY_LIMIT: u32 = 3;
+    const RETRY_DELAY: u64 = 1_000;
+    const AUTOPILOT_KEY: &str = "autopilot";
+
+    fn decided(action: ActionName) -> AutopilotEvent {
+        AutopilotEvent::Decided(Box::new(AutopilotDecision {
+            seq: AUTOPILOT_SEQ,
+            at_ms: 0,
+            kind: DecisionKind::Permission,
+            action,
+            subject: AUTOPILOT_SUBJECT.into(),
+            reason: String::new(),
+            agent: None,
+            tool_use_id: None,
+            history_len: 0,
+            model: None,
+            usage: None,
+            cost: None,
+        }))
+    }
+
+    fn retried() -> AutopilotEvent {
+        AutopilotEvent::Retrying {
+            attempt: RETRY_ATTEMPT,
+            limit: RETRY_LIMIT,
+            delay_ms: RETRY_DELAY,
+            error: RETRY_ERROR.into(),
+        }
+    }
+
+    fn ended(reason: AutopilotEnd) -> AutopilotEvent {
+        AutopilotEvent::Ended { reason }
+    }
+
+    fn budget(kind: AutopilotBudget) -> AutopilotEnd {
+        AutopilotEnd::Budget { kind }
+    }
+
+    #[test_case(None => None; "still_engaged")]
+    #[test_case(Some(budget(AutopilotBudget::Continuations)) => Some(format!("{AUTOPILOT_ENDED}: {CONTINUATIONS_SPENT}")); "continuations_spent")]
+    #[test_case(Some(budget(AutopilotBudget::Cost)) => Some(format!("{AUTOPILOT_ENDED}: {COST_SPENT}")); "cost_spent")]
+    #[test_case(Some(budget(AutopilotBudget::Time)) => Some(format!("{AUTOPILOT_ENDED}: {TIME_SPENT}")); "time_spent")]
+    #[test_case(Some(AutopilotEnd::Error { message: AUTOPILOT_FAILURE.into() }) => Some(format!("{AUTOPILOT_ENDED}: {AUTOPILOT_FAILURE}")); "an_error")]
+    #[test_case(Some(AutopilotEnd::Stopped { by: AutopilotStopper::Interrupt }) => None; "a_stop")]
+    #[test_case(Some(AutopilotEnd::GoalMet) => None; "a_met_goal")]
+    #[test_case(Some(AutopilotEnd::GoalImpossible) => None; "an_impossible_goal_fails_as_the_goal")]
+    fn only_a_spent_limit_or_an_error_fails_the_run(end: Option<AutopilotEnd>) -> Option<String> {
+        let mut tally = AutopilotTally::default();
+        tally.observe(&retried());
+        tally.observe(&decided(ActionName::Allow));
+        if let Some(reason) = end {
+            tally.observe(&ended(reason));
+        }
+        tally.failure()
+    }
+
+    #[test]
+    fn the_summary_counts_decisions_escalations_and_continuations() {
+        let (autopilot, _) = launch_autopilot(AutopilotConfig::default(), &GoalHandle::default());
+        autopilot.try_continue(&autopilot.limits()).unwrap();
+        let mut tally = AutopilotTally::default();
+        for event in [
+            retried(),
+            decided(ActionName::Allow),
+            decided(ActionName::Escalate),
+            decided(ActionName::Deny),
+            ended(AutopilotEnd::GoalMet),
+        ] {
+            tally.observe(&event);
+        }
+
+        assert_eq!(
+            tally.summary(&autopilot),
+            AutopilotSummary {
+                ended: true,
+                end: Some(AutopilotEnd::GoalMet),
+                continuations: 1,
+                decisions: 3,
+                escalations: 1,
+            }
+        );
+    }
+
+    #[test_case(None => None; "without_autopilot")]
+    #[test_case(Some(AutopilotSummary { ended: true, end: Some(AutopilotEnd::GoalMet), continuations: 2, decisions: 3, escalations: 1 }) => Some(json!({"ended": true, "end": {"reason": "goal_met"}, "continuations": 2, "decisions": 3, "escalations": 1})); "ended")]
+    #[test_case(Some(AutopilotSummary { ended: false, end: None, continuations: 0, decisions: 0, escalations: 0 }) => Some(json!({"ended": false, "continuations": 0, "decisions": 0, "escalations": 0})); "still_engaged")]
+    fn the_result_reports_autopilot_only_when_it_engaged(
+        autopilot: Option<AutopilotSummary>,
+    ) -> Option<Value> {
+        let result = PrintResult {
+            result_type: "result",
+            subtype: "success",
+            is_error: false,
+            duration_ms: 0,
+            num_turns: 1,
+            result: String::new(),
+            stop_reason: Some(DoneReason::EndTurn),
+            session_id: SessionRef::generate(),
+            total_cost_usd: 0.0,
+            subscription_cost_usd: 0.0,
+            usage: TokenUsage::default(),
+            autopilot,
+        };
+        serde_json::to_value(&result)
+            .unwrap()
+            .get(AUTOPILOT_KEY)
+            .cloned()
+    }
+
+    #[test_case(format!("/goal {GOAL_CONDITION}") => (Some(GOAL_CONDITION.to_owned()), true); "a_goal_prompt_is_owned")]
+    #[test_case(PLAIN_PROMPT.to_owned() => (None, false); "a_plain_prompt_sets_no_goal")]
+    fn autopilot_engages_once_owning_the_goal_prompt(prompt: String) -> (Option<String>, bool) {
+        let (_, goal) = print_goal(prompt).unwrap();
+        let (autopilot, engaged) = launch_autopilot(AutopilotConfig::default(), &goal);
+
+        assert_eq!(engaged, Some(AutopilotEvent::Engaged));
+        assert_eq!(autopilot.engage(false), None);
+        (goal.active_condition(), autopilot.owns_goal())
+    }
+
+    #[test_case(LedgerPurpose::Chat => true; "a_subagent_turn_counts")]
+    #[test_case(LedgerPurpose::Autopilot => false; "the_delegate_counts_where_it_is_made")]
+    fn a_subagent_s_spend_reaches_the_cost_limit(purpose: LedgerPurpose) -> bool {
+        let (autopilot, _) = launch_autopilot(
+            AutopilotConfig {
+                max_cost: Some(MAX_COST),
+                ..AutopilotConfig::default()
+            },
+            &GoalHandle::default(),
+        );
+
+        let ended = subagent_spend(Some(&autopilot), Some(SPEND), Billing::Api, purpose);
+
+        assert_eq!(ended.is_some(), !autopilot.is_engaged());
+        ended
+            == Some(AutopilotEvent::Ended {
+                reason: budget(AutopilotBudget::Cost),
+            })
+    }
+
+    #[test]
+    fn a_verbose_run_shows_autopilot_events_as_an_sdk_client_reads_them() {
+        let session_id = SessionRef::generate();
+        let mut out = VerboseOutput::Json(Vec::new());
+        let mut tally = AutopilotTally::default();
+
+        for event in [
+            AutopilotEvent::Engaged,
+            AutopilotEvent::ImplementPlan { seq: AUTOPILOT_SEQ },
+            decided(ActionName::Escalate),
+        ] {
+            note_autopilot(&event, &mut tally, Some(&mut out), &session_id).unwrap();
+        }
+
+        let VerboseOutput::Json(events) = out else {
+            unreachable!("built as Json");
+        };
+        let shown: Vec<_> = events
+            .iter()
+            .map(|event| {
+                (
+                    event["type"].clone(),
+                    event["subtype"].clone(),
+                    event["kind"].clone(),
+                    event["decision"]["action"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (
+                    json!(SYSTEM_EVENT),
+                    json!(AUTOPILOT_SYSTEM_SUBTYPE),
+                    json!("engaged"),
+                    Value::Null,
+                ),
+                (
+                    json!(SYSTEM_EVENT),
+                    json!(AUTOPILOT_SYSTEM_SUBTYPE),
+                    json!("decided"),
+                    json!(ActionName::Escalate.name()),
+                ),
+            ]
+        );
+        assert_eq!((tally.decisions, tally.escalations), (1, 1));
     }
 }

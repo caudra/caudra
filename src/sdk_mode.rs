@@ -17,9 +17,10 @@ use std::time::Instant;
 
 use caudra_agent::automation::clock::SystemClock;
 use caudra_agent::automation::handle::AutomationHandle;
+use caudra_agent::autopilot::{AutopilotDecision, AutopilotHandle, DecisionKind};
 use caudra_agent::background::BackgroundTasks;
 use caudra_agent::headless::{
-    self, AutomationParams, InteractiveHandle, InteractiveParams, InteractiveRun,
+    self, AutomationParams, AutopilotParams, InteractiveHandle, InteractiveParams, InteractiveRun,
 };
 use caudra_agent::mcp;
 use caudra_agent::permissions::{
@@ -28,7 +29,9 @@ use caudra_agent::permissions::{
 use caudra_agent::prompt::ResolvedSlots;
 use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog};
 use caudra_agent::tools::QUESTION_TOOL_NAME;
-use caudra_agent::types::{BACKGROUND_EVENT_RUN_ID, TaskProvenance, WorkflowProvenance};
+use caudra_agent::types::{
+    AutopilotEvent, BACKGROUND_EVENT_RUN_ID, TaskProvenance, WorkflowProvenance,
+};
 use caudra_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, GoalHandle, GoalResult,
     GoalSnapshot, GoalStatus, GoalVerdict, History, PermissionsConfig, StoredSession,
@@ -40,14 +43,16 @@ use caudra_automation::request::{
 use caudra_automation::snapshot::{ArmOrigin, AutomationEvent, FiringSummary, PauseSource};
 use caudra_config::decisions::DecisionsConfig;
 use caudra_config::{
-    AutomationsConfig, ExecutionMode, Feature, FeatureDisabled, ModelPolicy, SnapshotsConfig,
-    effective_shell_execution, effective_task_execution,
+    AutomationsConfig, AutopilotConfig, ExecutionMode, Feature, FeatureDisabled, ModelPolicy,
+    SnapshotsConfig, effective_shell_execution, effective_task_execution,
 };
 use caudra_providers::model::Model;
 use caudra_providers::{
-    AutomationEventOrigin, Billing, HistoryItem, HistoryItemKind, ImageSource, Message, StopReason,
-    ThinkingConfig, Timeouts, TokenUsage, WorkflowEventOrigin, add_cost,
+    AutomationEventOrigin, AutopilotMessageKind, Billing, HistoryItem, HistoryItemKind,
+    ImageSource, Message, StopReason, ThinkingConfig, Timeouts, TokenUsage, WorkflowEventOrigin,
+    add_cost,
 };
+use caudra_storage::autopilot::{AutopilotEnd, AutopilotStopper, StoredAutopilot};
 use caudra_storage::id::SessionRef;
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::permission_state::PermissionRuleRecord;
@@ -114,6 +119,16 @@ const GOAL_CONTROLS: &[&str] = &[GOAL_SET, GOAL_CLEAR, GOAL_STATUS];
 const GOAL_ACTIVE: &str = "active";
 const GOAL_FINISHED: &str = "finished";
 const NO_GOAL: &str = "none";
+pub(crate) const AUTOPILOT_SYSTEM_SUBTYPE: &str = "autopilot";
+const AUTOPILOT_START: &str = "autopilot_start";
+const AUTOPILOT_STOP: &str = "autopilot_stop";
+const AUTOPILOT_STATUS: &str = "autopilot_status";
+/// Every `control_request` subtype autopilot answers, as the init message
+/// advertises them while `experimental.autopilot` is on.
+const AUTOPILOT_CONTROLS: &[&str] = &[AUTOPILOT_START, AUTOPILOT_STOP, AUTOPILOT_STATUS];
+const AUTOPILOT_ENGAGED: &str = "engaged";
+const AUTOPILOT_ENDED: &str = "ended";
+const NO_AUTOPILOT: &str = "none";
 const SESSION_CLOSED: &str = "the session is closed";
 const AUTOMATION_FIRED_SUBTYPE: &str = "automation_fired";
 const AUTOMATION_NOTICE_SUBTYPE: &str = "automation_notice";
@@ -473,7 +488,7 @@ impl<'a> GoalSystemPayload<'a> {
             } => Self::Deferred {
                 active_background_tasks: *active_background_tasks,
             },
-            AgentEvent::GoalFinished { result } => Self::Finished(result.into()),
+            AgentEvent::GoalFinished { result, .. } => Self::Finished(result.into()),
             AgentEvent::GoalLoopCap {
                 evaluations,
                 continuations,
@@ -486,9 +501,9 @@ impl<'a> GoalSystemPayload<'a> {
             AgentEvent::GoalTurnLimit { evaluations } => Self::TurnLimit {
                 evaluations: *evaluations,
             },
-            AgentEvent::GoalClearedAfterError { condition, message } => {
-                Self::ClearedAfterError { condition, message }
-            }
+            AgentEvent::GoalClearedAfterError {
+                condition, message, ..
+            } => Self::ClearedAfterError { condition, message },
             _ => return None,
         })
     }
@@ -560,6 +575,97 @@ struct GoalClearReply<'a> {
 struct GoalSetRequest {
     condition: String,
     continuation_limit: Option<u32>,
+    kickoff: Option<bool>,
+}
+
+/// The `system` / `autopilot` body: one autopilot event, named by `kind`. A
+/// decision and an end keep the shapes the session stores them in, so
+/// `-p --verbose` and stream-json print the same body.
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum AutopilotSystemPayload<'a> {
+    Engaged,
+    Deciding {
+        decision: DecidingReport<'a>,
+    },
+    /// An escalation is a decision whose action is `escalate`.
+    Decided {
+        decision: &'a AutopilotDecision,
+    },
+    Retrying {
+        attempt: u32,
+        limit: u32,
+        delay_ms: u64,
+        error: &'a str,
+    },
+    Ended {
+        end: &'a AutopilotEnd,
+    },
+}
+
+/// A decision the delegate is still making, under the names its `decided`
+/// event uses.
+#[derive(Serialize)]
+pub(crate) struct DecidingReport<'a> {
+    seq: u32,
+    kind: DecisionKind,
+    subject: &'a str,
+}
+
+impl<'a> AutopilotSystemPayload<'a> {
+    /// `None` for the implement handoff, which the session acts on itself.
+    pub(crate) fn from_event(event: &'a AutopilotEvent) -> Option<Self> {
+        Some(match event {
+            AutopilotEvent::Engaged => Self::Engaged,
+            AutopilotEvent::Deciding { seq, kind, subject } => Self::Deciding {
+                decision: DecidingReport {
+                    seq: *seq,
+                    kind: *kind,
+                    subject,
+                },
+            },
+            AutopilotEvent::Decided(decision) => Self::Decided { decision },
+            AutopilotEvent::Retrying {
+                attempt,
+                limit,
+                delay_ms,
+                error,
+            } => Self::Retrying {
+                attempt: *attempt,
+                limit: *limit,
+                delay_ms: *delay_ms,
+                error,
+            },
+            AutopilotEvent::Ended { reason } => Self::Ended { end: reason },
+            AutopilotEvent::ImplementPlan { .. } => return None,
+        })
+    }
+}
+
+/// What `autopilot_status` answers, and `autopilot_start` and
+/// `autopilot_stop` once they acted: the engagement as the session stores
+/// it, and the limits it runs under.
+#[derive(Serialize)]
+struct AutopilotStatusReply {
+    status: &'static str,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    engagement: Option<StoredAutopilot>,
+    limits: AutopilotLimits,
+}
+
+/// The `[autopilot]` limits a client can measure an engagement against.
+#[derive(Serialize)]
+struct AutopilotLimits {
+    max_continuations: u32,
+    max_cost: Option<f64>,
+    max_minutes: Option<u32>,
+}
+
+/// A client's `/autopilot [goal]`. With a goal, autopilot owns it, and
+/// `kickoff`, which defaults to true, sends it as `goal_set` does.
+#[derive(Deserialize)]
+struct AutopilotStartRequest {
+    goal: Option<String>,
     kickoff: Option<bool>,
 }
 
@@ -1031,6 +1137,7 @@ pub struct SdkParams {
         Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
     pub local_documents: Option<Arc<LocalDocumentStore>>,
     pub automations: AutomationsConfig,
+    pub autopilot: AutopilotConfig,
 }
 
 struct Shared {
@@ -1048,6 +1155,13 @@ struct Shared {
 impl Shared {
     fn agent_mode(&mut self, cwd: &Path) -> AgentMode {
         self.agent_mode_for(self.permission_mode, cwd)
+    }
+
+    /// Plan mode gives way to default, as implementing a plan leaves it.
+    fn leave_plan(&mut self) {
+        if self.permission_mode == PermissionMode::Plan {
+            self.permission_mode = PermissionMode::Default;
+        }
     }
 
     fn agent_mode_for(&mut self, permission_mode: PermissionMode, cwd: &Path) -> AgentMode {
@@ -1138,6 +1252,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         remote_project_context,
         local_documents,
         automations,
+        autopilot,
     } = params;
     cli.warn_ignored_flags();
     if let Some(max) = cli.max_turns {
@@ -1318,6 +1433,14 @@ pub fn run(params: SdkParams) -> Result<()> {
                 http: automation_http_client(),
                 user_config_dir: None,
             }),
+        autopilot: config
+            .features
+            .enabled(Feature::Autopilot)
+            .then(|| AutopilotParams {
+                limits: autopilot,
+                mode: workflow_mode.clone(),
+                fast,
+            }),
         workflow_mode: Some(workflow_mode),
         workspace_binding: workspace_binding.clone(),
         remote_environment: remote_environment.clone(),
@@ -1358,6 +1481,9 @@ pub fn run(params: SdkParams) -> Result<()> {
         .iter()
         .map(|t| caudra_to_claude_tool_name(t))
         .collect();
+    if cli.autopilot {
+        handle.engage_autopilot(false);
+    }
     writer.emit_system(
         "init",
         init_payload(
@@ -1373,6 +1499,7 @@ pub fn run(params: SdkParams) -> Result<()> {
             }),
             handle.workflow.is_some(),
             handle.automations.is_some(),
+            handle.autopilot.as_ref(),
             &config,
             handle.background.is_some(),
         ),
@@ -2268,10 +2395,28 @@ fn handle_control_request(
         }
         GOAL_SET => writer.emit_answer(
             &cr.request_id,
-            goal_set(&cr.request.extra, &handle.goal, prompts, &handle.input_tx),
+            goal_set(
+                &cr.request.extra,
+                &handle.goal,
+                handle.autopilot.as_ref(),
+                prompts,
+                &handle.input_tx,
+            ),
         ),
-        GOAL_CLEAR => writer.emit_answer(&cr.request_id, goal_clear(&handle.goal)),
+        GOAL_CLEAR => writer.emit_answer(
+            &cr.request_id,
+            goal_clear(&handle.goal, handle.autopilot.as_ref()),
+        ),
         GOAL_STATUS => writer.emit_answer(&cr.request_id, goal_status(&handle.goal)),
+        AUTOPILOT_START => writer.emit_answer(
+            &cr.request_id,
+            autopilot_start(&cr.request.extra, handle, prompts),
+        ),
+        AUTOPILOT_STOP => writer.emit_answer(&cr.request_id, autopilot_stop(handle)),
+        AUTOPILOT_STATUS => writer.emit_answer(
+            &cr.request_id,
+            session_autopilot(handle).and_then(autopilot_status),
+        ),
         other => {
             if let Some(request) = automation_request(other, &cr.request.extra) {
                 return answer_automation_control(
@@ -2359,11 +2504,13 @@ fn handle_task_control_request(
 
 /// `/goal <condition>` for a client. The condition is validated as `/goal`
 /// validates it, the limit clamped as the TUI clamps it, and an active goal
-/// replaced as `/goal` replaces it. Unless `kickoff` is false, the kickoff
-/// goes out as `/goal` sends it, along the path a typed prompt takes.
+/// replaced as `/goal` replaces it, which leaves an engaged autopilot without
+/// a goal of its own. Unless `kickoff` is false, the kickoff goes out as
+/// `/goal` sends it, along the path a typed prompt takes.
 fn goal_set(
     extra: &Value,
     goal: &GoalHandle,
+    autopilot: Option<&AutopilotHandle>,
     prompts: &PromptContext,
     input_tx: &Sender<AgentInput>,
 ) -> Result<Value, String> {
@@ -2372,24 +2519,100 @@ fn goal_set(
     let active = goal
         .set(&request.condition)
         .map_err(|error| error.to_string())?;
+    if let Some(autopilot) = autopilot {
+        autopilot.drop_goal_ownership();
+    }
     if let Some(limit) = request.continuation_limit {
         goal.set_continuation_limit(limit);
     }
     if request.kickoff.unwrap_or(true) {
-        let mut input = prompts.input(active.condition.to_string(), Vec::new());
-        input
-            .preamble
-            .push(Message::synthetic(goal_kickoff_message(&active.condition)));
-        input_tx
-            .send(input)
-            .map_err(|_| SESSION_CLOSED.to_owned())?;
+        send_goal_kickoff(&active.condition, prompts, input_tx)?;
     }
     goal_status(goal)
 }
 
+/// The kickoff `/goal` sends, along the path a typed prompt takes.
+fn send_goal_kickoff(
+    condition: &str,
+    prompts: &PromptContext,
+    input_tx: &Sender<AgentInput>,
+) -> Result<(), String> {
+    let mut input = prompts.input(condition.to_owned(), Vec::new());
+    input
+        .preamble
+        .push(Message::synthetic(goal_kickoff_message(condition)));
+    input_tx.send(input).map_err(|_| SESSION_CLOSED.to_owned())
+}
+
+/// The session's autopilot, refused while `experimental.autopilot` is off.
+fn session_autopilot(handle: &InteractiveHandle) -> Result<&AutopilotHandle, String> {
+    handle
+        .autopilot
+        .as_ref()
+        .ok_or_else(|| FeatureDisabled(Feature::Autopilot).to_string())
+}
+
+/// `/autopilot [goal]` for a client. A goal is set as `goal_set` sets it and
+/// owned by autopilot, which engages before the kickoff goes out, so the
+/// kickoff's run already answers for the client. Already engaged, it only
+/// takes such a goal on.
+fn autopilot_start(
+    extra: &Value,
+    handle: &InteractiveHandle,
+    prompts: &PromptContext,
+) -> Result<Value, String> {
+    let autopilot = session_autopilot(handle)?;
+    let request = AutopilotStartRequest::deserialize(extra)
+        .map_err(|error| format!("{AUTOPILOT_START}: {error}"))?;
+    let Some(condition) = request.goal else {
+        handle.engage_autopilot(false);
+        return autopilot_status(autopilot);
+    };
+    let active = handle
+        .goal
+        .set(&condition)
+        .map_err(|error| error.to_string())?;
+    handle.engage_autopilot(true);
+    if request.kickoff.unwrap_or(true) {
+        send_goal_kickoff(&active.condition, prompts, &handle.input_tx)?;
+    }
+    autopilot_status(autopilot)
+}
+
+/// `/autopilot off` for a client: an engagement ends as stopped by the SDK.
+fn autopilot_stop(handle: &InteractiveHandle) -> Result<Value, String> {
+    let autopilot = session_autopilot(handle)?;
+    handle.end_autopilot(AutopilotStopper::Sdk);
+    autopilot_status(autopilot)
+}
+
+fn autopilot_status(autopilot: &AutopilotHandle) -> Result<Value, String> {
+    let engagement = autopilot.stored();
+    let status = match &engagement {
+        Some(stored) if stored.engaged => AUTOPILOT_ENGAGED,
+        Some(_) => AUTOPILOT_ENDED,
+        None => NO_AUTOPILOT,
+    };
+    let limits = autopilot.limits();
+    serde_json::to_value(AutopilotStatusReply {
+        status,
+        engagement,
+        limits: AutopilotLimits {
+            max_continuations: limits.max_continuations,
+            max_cost: limits.max_cost,
+            max_minutes: limits.max_minutes,
+        },
+    })
+    .map_err(|error| error.to_string())
+}
+
 /// `/goal clear`: the active goal stops, and a finished one stays on record.
-fn goal_clear(goal: &GoalHandle) -> Result<Value, String> {
+/// An engaged autopilot stays, without a goal of its own.
+fn goal_clear(goal: &GoalHandle, autopilot: Option<&AutopilotHandle>) -> Result<Value, String> {
     let cleared = goal.clear();
+    if let Some(autopilot) = autopilot {
+        autopilot.drop_goal_ownership();
+    }
     serde_json::to_value(GoalClearReply {
         cleared: cleared.as_ref().map(|goal| &*goal.condition),
     })
@@ -2415,14 +2638,20 @@ fn goal_status(goal: &GoalHandle) -> Result<Value, String> {
 /// shape: `workflows` and `automations` say whether those runtimes are
 /// attached, and `workflow_controls`, `automation_controls` and
 /// `goal_controls` name the `control_request` subtypes the runtimes and the
-/// session goal answer.
+/// session goal answer. While `experimental.autopilot` is on,
+/// `autopilot_controls` names autopilot's and `autopilot` is its status.
 fn init_payload(
     mut payload: Value,
     workflows: bool,
     automations: bool,
+    autopilot: Option<&AutopilotHandle>,
     config: &AgentConfig,
     jobs: bool,
 ) -> Value {
+    if let Some(status) = autopilot.and_then(|autopilot| autopilot_status(autopilot).ok()) {
+        payload["autopilot_controls"] = serde_json::json!(AUTOPILOT_CONTROLS);
+        payload["autopilot"] = status;
+    }
     let workflow_controls: &[&str] = if workflows { WORKFLOW_CONTROLS } else { &[] };
     let automation_controls: &[&str] = if automations {
         AUTOMATION_CONTROLS
@@ -2961,6 +3190,15 @@ impl EventPump {
         }
     }
 
+    fn emit_autopilot(&self, event: &AutopilotEvent) -> Result<()> {
+        match AutopilotSystemPayload::from_event(event) {
+            Some(payload) => self
+                .writer
+                .emit_system(AUTOPILOT_SYSTEM_SUBTYPE, serde_json::to_value(payload)?),
+            None => Ok(()),
+        }
+    }
+
     fn reset_turn(&mut self) {
         self.synth.reset();
         self.result_text.clear();
@@ -3113,11 +3351,22 @@ impl EventPump {
             | AgentEvent::ToolsLoaded { .. }
             | AgentEvent::Unrecorded { .. }
             | AgentEvent::PromptProgress { .. } => {}
+            AgentEvent::Autopilot(event) => self.emit_autopilot(event)?,
             // The claims a run starts with are on record already and come back
             // here as its preamble lands; a guide item joins the run mid-way.
             AgentEvent::Injected {
-                automation_event, ..
+                automation_event,
+                autopilot_event,
+                ..
             } => {
+                // The session left plan mode to implement the plan autopilot chose.
+                if parent_event
+                    && autopilot_event
+                        .as_ref()
+                        .is_some_and(|origin| origin.kind == AutopilotMessageKind::Implement)
+                {
+                    self.shared.lock().unwrap().leave_plan();
+                }
                 if parent_event
                     && let Some(origin) = automation_event
                     && let Some(run) = self
@@ -3400,9 +3649,11 @@ mod tests {
     use caudra_agent::automation::manager::{AutomationRuntime, PAUSED_BY_SDK, RuntimeDeps};
     use caudra_agent::automation::testing::{AutomationFixture, FakeWorkflows};
     use caudra_agent::automation::workflows::Workflows;
+    use caudra_agent::autopilot::ActionName;
     use caudra_agent::permissions::PermissionRequest;
     use caudra_agent::tools::PermissionScopes;
-    use caudra_agent::types::WORKFLOW_EVENT_RUN_ID;
+    use caudra_agent::types::{Answerer, WORKFLOW_EVENT_RUN_ID};
+    use caudra_storage::autopilot::AutopilotBudget;
     use std::time::Duration;
 
     use caudra_agent::{
@@ -3415,7 +3666,7 @@ mod tests {
     use caudra_automation::replay::{Answer, DRY_RUN_ID};
     use caudra_automation::request::{GoalClaim, REPLAY_NOT_FINISHED, UNAVAILABLE};
     use caudra_automation::snapshot::{ErrorView, FiringStatus, StateOutcome};
-    use caudra_providers::{ContentBlock, Message, Role, TaskEventOrigin};
+    use caudra_providers::{AutopilotOrigin, ContentBlock, Message, Role, TaskEventOrigin};
     use caudra_storage::background::{JobPayload, ShellJobMetadata, TaskRecord};
     use caudra_storage::id::CaudraId;
     use caudra_storage::sessions::{
@@ -3468,7 +3719,8 @@ mod tests {
                     shell_execution: shell.clone(),
                     ..Default::default()
                 };
-                let payload = init_payload(serde_json::json!({}), false, false, &config, jobs);
+                let payload =
+                    init_payload(serde_json::json!({}), false, false, None, &config, jobs);
                 assert_eq!(
                     payload["task_execution"]["configured"],
                     serde_json::json!(task)
@@ -5816,6 +6068,7 @@ mod tests {
             serde_json::json!({"cwd": "/tmp"}),
             workflows,
             false,
+            None,
             &AgentConfig::default(),
             false,
         );
@@ -5918,6 +6171,7 @@ mod tests {
             "finished" => (
                 AgentEvent::GoalFinished {
                     result: goal_result(),
+                    autopilot_owned: false,
                 },
                 serde_json::json!({
                     "condition": GOAL_CONDITION,
@@ -5953,6 +6207,7 @@ mod tests {
                 AgentEvent::GoalClearedAfterError {
                     condition: GOAL_CONDITION.into(),
                     message: GOAL_FAILURE.into(),
+                    autopilot_owned: false,
                 },
                 serde_json::json!({"condition": GOAL_CONDITION, "message": GOAL_FAILURE}),
                 None,
@@ -6015,7 +6270,7 @@ mod tests {
         goal.set(OTHER_GOAL_CONDITION).unwrap();
         let (input_tx, input_rx) = flume::unbounded();
 
-        let reply = goal_set(&request, &goal, &goal_prompts(&shared), &input_tx).unwrap();
+        let reply = goal_set(&request, &goal, None, &goal_prompts(&shared), &input_tx).unwrap();
 
         assert_eq!(goal.active_condition().as_deref(), Some(GOAL_CONDITION));
         assert_eq!(reply["status"], GOAL_ACTIVE);
@@ -6050,6 +6305,7 @@ mod tests {
         let refusal = goal_set(
             &serde_json::json!({"condition": condition}),
             &goal,
+            None,
             &goal_prompts(&shared),
             &input_tx,
         )
@@ -6066,13 +6322,13 @@ mod tests {
     #[test]
     fn goal_clear_answers_the_goal_it_stopped_and_keeps_a_finished_one() {
         let goal = GoalHandle::default();
-        assert_eq!(goal_clear(&goal).unwrap()["cleared"], Value::Null);
+        assert_eq!(goal_clear(&goal, None).unwrap()["cleared"], Value::Null);
         goal.set(GOAL_CONDITION).unwrap();
-        assert_eq!(goal_clear(&goal).unwrap()["cleared"], GOAL_CONDITION);
+        assert_eq!(goal_clear(&goal, None).unwrap()["cleared"], GOAL_CONDITION);
         assert!(goal.snapshot().is_none());
 
         goal.restore_finished(goal_result());
-        assert_eq!(goal_clear(&goal).unwrap()["cleared"], Value::Null);
+        assert_eq!(goal_clear(&goal, None).unwrap()["cleared"], Value::Null);
         assert_eq!(goal_status(&goal).unwrap()["status"], GOAL_FINISHED);
     }
 
@@ -6382,6 +6638,7 @@ mod tests {
             serde_json::json!({}),
             false,
             automations,
+            None,
             &AgentConfig::default(),
             false,
         );
@@ -6507,7 +6764,7 @@ mod tests {
             continuation_limit: None,
             replace: false,
         };
-        set_claimed_goal(&goal, &claim).expect(GOAL_KEPT)
+        set_claimed_goal(&goal, &claim, false).expect(GOAL_KEPT)
     }
 
     #[test_case(NOTICE_TEXT.to_owned(), Some(FIRE_ID); "a_script_notice")]
@@ -6564,6 +6821,7 @@ mod tests {
                 task_event: None,
                 peer_event: None,
                 automation_event: Some(origin.clone()),
+                autopilot_event: None,
             },
             subagent,
             run_id,
@@ -7062,5 +7320,336 @@ mod tests {
                 reason: ArmedReason::Unpaused
             }
         );
+    }
+
+    const AUTOPILOT_SEQ: u32 = 7;
+    const AUTOPILOT_SUBJECT: &str = "cargo test";
+    const AUTOPILOT_REASON: &str = "the tests only read the tree";
+    const AUTOPILOT_LIMIT: u32 = 12;
+    const AUTOPILOT_MAX_COST: f64 = 2.5;
+    const AUTOPILOT_MAX_MINUTES: u32 = 30;
+    const RETRY_ATTEMPT: u32 = 1;
+    const RETRY_LIMIT: u32 = 3;
+    const SDK_PERMISSION_ID: &str = "req_autopilot";
+    const DECIDED: &str = "decided";
+    const ESCALATE: &str = "escalate";
+
+    fn autopilot_session(state: &TempDir, autopilot: Option<AutopilotHandle>) -> InteractiveHandle {
+        let mut session = control_session(
+            &StateDir::from_path(state.path().to_path_buf()),
+            SessionRef::generate().id(),
+            None,
+        );
+        session.autopilot = autopilot;
+        session
+    }
+
+    fn engaged_autopilot(owns_goal: bool) -> AutopilotHandle {
+        let autopilot = AutopilotHandle::default();
+        autopilot.engage(owns_goal);
+        autopilot
+    }
+
+    fn autopilot_decision(action: ActionName) -> AutopilotDecision {
+        AutopilotDecision {
+            seq: AUTOPILOT_SEQ,
+            at_ms: 0,
+            kind: DecisionKind::Permission,
+            action,
+            subject: AUTOPILOT_SUBJECT.into(),
+            reason: AUTOPILOT_REASON.into(),
+            agent: None,
+            tool_use_id: None,
+            history_len: 0,
+            model: None,
+            usage: None,
+            cost: None,
+        }
+    }
+
+    /// An autopilot event named for its test case, and the body its message must carry.
+    fn autopilot_event(case: &str) -> (AutopilotEvent, Value) {
+        let decided = |action| {
+            let decision = autopilot_decision(action);
+            let body = serde_json::json!({"kind": DECIDED, "decision": decision});
+            (AutopilotEvent::Decided(Box::new(decision)), body)
+        };
+        match case {
+            "engaged" => (
+                AutopilotEvent::Engaged,
+                serde_json::json!({"kind": AUTOPILOT_ENGAGED}),
+            ),
+            "deciding" => (
+                AutopilotEvent::Deciding {
+                    seq: AUTOPILOT_SEQ,
+                    kind: DecisionKind::Permission,
+                    subject: AUTOPILOT_SUBJECT.into(),
+                },
+                serde_json::json!({
+                    "kind": "deciding",
+                    "decision": {
+                        "seq": AUTOPILOT_SEQ,
+                        "kind": DecisionKind::Permission.name(),
+                        "subject": AUTOPILOT_SUBJECT,
+                    },
+                }),
+            ),
+            "decided" => decided(ActionName::Allow),
+            "escalated" => decided(ActionName::Escalate),
+            "retrying" => (
+                AutopilotEvent::Retrying {
+                    attempt: RETRY_ATTEMPT,
+                    limit: RETRY_LIMIT,
+                    delay_ms: RETRY_DELAY_MS,
+                    error: RETRY_ERROR.into(),
+                },
+                serde_json::json!({
+                    "kind": "retrying",
+                    "attempt": RETRY_ATTEMPT,
+                    "limit": RETRY_LIMIT,
+                    "delay_ms": RETRY_DELAY_MS,
+                    "error": RETRY_ERROR,
+                }),
+            ),
+            "ended" => (
+                AutopilotEvent::Ended {
+                    reason: AutopilotEnd::Budget {
+                        kind: AutopilotBudget::Continuations,
+                    },
+                },
+                serde_json::json!({
+                    "kind": AUTOPILOT_ENDED,
+                    "end": {"reason": "budget", "kind": "continuations"},
+                }),
+            ),
+            other => unreachable!("no autopilot event is named {other}"),
+        }
+    }
+
+    fn parent_envelope(event: AgentEvent) -> Envelope {
+        Envelope {
+            event,
+            subagent: None,
+            run_id: 1,
+            task: None,
+            workflow: None,
+        }
+    }
+
+    #[test_case(AUTOPILOT_START; "start")]
+    #[test_case(AUTOPILOT_STOP; "stop")]
+    #[test_case(AUTOPILOT_STATUS; "status")]
+    fn without_the_experiment_an_autopilot_control_is_refused(subtype: &str) {
+        let state = TempDir::new().unwrap();
+        let session = autopilot_session(&state, None);
+        let (writer, out_rx) = sdk_writer();
+
+        send_control(&writer, &session, subtype, serde_json::json!({}));
+
+        let reply = next_message(&out_rx);
+        assert_eq!(reply["response"]["subtype"], "error");
+        assert_eq!(
+            reply["response"]["error"],
+            FeatureDisabled(Feature::Autopilot).to_string()
+        );
+        assert!(out_rx.is_empty());
+    }
+
+    #[test_case(serde_json::json!({}), None, false, 0; "engaged_alone")]
+    #[test_case(serde_json::json!({"goal": GOAL_CONDITION}), Some(GOAL_CONDITION), true, 1; "owning_a_goal_it_kicks_off")]
+    #[test_case(serde_json::json!({"goal": GOAL_CONDITION, "kickoff": false}), Some(GOAL_CONDITION), true, 0; "owning_a_goal_without_kickoff")]
+    fn autopilot_start_engages_and_owns_the_goal_it_sets(
+        request: Value,
+        goal: Option<&str>,
+        owns_goal: bool,
+        kickoffs: usize,
+    ) {
+        let state = TempDir::new().unwrap();
+        let mut session = autopilot_session(&state, Some(AutopilotHandle::default()));
+        let (input_tx, input_rx) = flume::unbounded();
+        session.input_tx = input_tx;
+        let (writer, out_rx) = sdk_writer();
+
+        send_control(&writer, &session, AUTOPILOT_START, request);
+
+        let reply = next_message(&out_rx);
+        assert_eq!(reply["response"]["subtype"], "success");
+        let status = &reply["response"]["response"];
+        assert_eq!(status["status"], AUTOPILOT_ENGAGED);
+        assert_eq!(status["engaged"], true);
+        assert_eq!(status["owns_goal"], owns_goal);
+        assert_eq!(session.goal.active_condition().as_deref(), goal);
+        assert_eq!(input_rx.try_iter().count(), kickoffs);
+    }
+
+    #[test]
+    fn autopilot_stop_ends_the_engagement_as_stopped_by_the_sdk() {
+        let state = TempDir::new().unwrap();
+        let session = autopilot_session(&state, Some(engaged_autopilot(false)));
+        let (writer, out_rx) = sdk_writer();
+
+        send_control(&writer, &session, AUTOPILOT_STOP, serde_json::json!({}));
+
+        let status = &next_message(&out_rx)["response"]["response"];
+        assert_eq!(status["status"], AUTOPILOT_ENDED);
+        assert_eq!(status["engaged"], false);
+        assert_eq!(
+            status["last_end"],
+            serde_json::to_value(AutopilotEnd::Stopped {
+                by: AutopilotStopper::Sdk
+            })
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn autopilot_status_names_the_limits_an_engagement_runs_under() {
+        let state = TempDir::new().unwrap();
+        let autopilot = AutopilotHandle::default();
+        autopilot.set_limits(AutopilotConfig {
+            max_continuations: AUTOPILOT_LIMIT,
+            max_cost: Some(AUTOPILOT_MAX_COST),
+            max_minutes: Some(AUTOPILOT_MAX_MINUTES),
+            ..AutopilotConfig::default()
+        });
+        let session = autopilot_session(&state, Some(autopilot));
+        let (writer, out_rx) = sdk_writer();
+
+        send_control(&writer, &session, AUTOPILOT_STATUS, serde_json::json!({}));
+
+        assert_eq!(
+            next_message(&out_rx)["response"]["response"],
+            serde_json::json!({
+                "status": NO_AUTOPILOT,
+                "limits": {
+                    "max_continuations": AUTOPILOT_LIMIT,
+                    "max_cost": AUTOPILOT_MAX_COST,
+                    "max_minutes": AUTOPILOT_MAX_MINUTES,
+                },
+            })
+        );
+    }
+
+    #[test_case(true; "a_replaced_goal")]
+    #[test_case(false; "a_cleared_goal")]
+    fn a_goal_changed_by_hand_leaves_an_engaged_autopilot_without_a_goal_of_its_own(
+        replaced: bool,
+    ) {
+        let shared = shared_with_pending(HashMap::new());
+        let goal = GoalHandle::default();
+        goal.set(OTHER_GOAL_CONDITION).unwrap();
+        let autopilot = engaged_autopilot(true);
+        let (input_tx, _input_rx) = flume::unbounded();
+
+        if replaced {
+            goal_set(
+                &serde_json::json!({"condition": GOAL_CONDITION, "kickoff": false}),
+                &goal,
+                Some(&autopilot),
+                &goal_prompts(&shared),
+                &input_tx,
+            )
+        } else {
+            goal_clear(&goal, Some(&autopilot))
+        }
+        .unwrap();
+
+        assert!(autopilot.is_engaged());
+        assert!(!autopilot.owns_goal());
+    }
+
+    #[test_case(true => (serde_json::json!(AUTOPILOT_CONTROLS), serde_json::json!(AUTOPILOT_ENGAGED)); "while_the_experiment_is_on")]
+    #[test_case(false => (Value::Null, Value::Null); "while_it_is_off")]
+    fn init_advertises_autopilot_only_while_the_experiment_is_on(on: bool) -> (Value, Value) {
+        let autopilot = engaged_autopilot(false);
+        let payload = init_payload(
+            serde_json::json!({}),
+            false,
+            false,
+            on.then_some(&autopilot),
+            &AgentConfig::default(),
+            false,
+        );
+        (
+            payload["autopilot_controls"].clone(),
+            payload["autopilot"]["status"].clone(),
+        )
+    }
+
+    /// An escalation is a `decided` message whose action is `escalate`.
+    #[test_case("engaged" => Value::Null; "engaged")]
+    #[test_case("deciding" => Value::Null; "deciding")]
+    #[test_case("decided" => serde_json::json!(ActionName::Allow.name()); "decided")]
+    #[test_case("escalated" => serde_json::json!(ESCALATE); "escalated")]
+    #[test_case("retrying" => Value::Null; "retrying")]
+    #[test_case("ended" => Value::Null; "ended")]
+    fn an_autopilot_event_is_an_autopilot_system_message(case: &str) -> Value {
+        let (event, body) = autopilot_event(case);
+        let (mut pump, out_rx, _) =
+            permission_event_pump(permission_manager(), PermissionMode::Default);
+
+        pump.handle(parent_envelope(AgentEvent::Autopilot(event)))
+            .unwrap();
+
+        let message = next_message(&out_rx);
+        assert_eq!(message["type"], "system");
+        assert_eq!(message["subtype"], AUTOPILOT_SYSTEM_SUBTYPE);
+        for (key, value) in body.as_object().unwrap() {
+            assert_eq!(&message[key], value, "{case}.{key}");
+        }
+        assert!(out_rx.is_empty());
+        message["decision"]["action"].clone()
+    }
+
+    #[test]
+    fn the_implement_handoff_writes_no_message_and_leaves_plan_mode() {
+        let (mut pump, out_rx, shared) =
+            permission_event_pump(permission_manager(), PermissionMode::Plan);
+
+        pump.handle(parent_envelope(AgentEvent::Autopilot(
+            AutopilotEvent::ImplementPlan { seq: AUTOPILOT_SEQ },
+        )))
+        .unwrap();
+        assert!(out_rx.is_empty());
+        assert_eq!(shared.lock().unwrap().permission_mode, PermissionMode::Plan);
+        pump.handle(parent_envelope(AgentEvent::Injected {
+            text: AUTOPILOT_SUBJECT.into(),
+            task_event: None,
+            peer_event: None,
+            automation_event: None,
+            autopilot_event: Some(AutopilotOrigin {
+                seq: AUTOPILOT_SEQ,
+                kind: AutopilotMessageKind::Implement,
+            }),
+        }))
+        .unwrap();
+
+        assert_eq!(
+            shared.lock().unwrap().permission_mode,
+            PermissionMode::Default
+        );
+    }
+
+    #[test]
+    fn an_autopilot_answer_cancels_the_client_s_permission_request() {
+        let (mut pump, out_rx, shared) =
+            permission_event_pump(permission_manager(), PermissionMode::Default);
+        shared
+            .lock()
+            .unwrap()
+            .pending
+            .insert(SDK_PERMISSION_ID.into(), CAUDRA_REQUEST_ID.into());
+
+        pump.handle(parent_envelope(AgentEvent::PermissionRequestResolved {
+            request_id: CAUDRA_REQUEST_ID.into(),
+            source_request_id: CAUDRA_REQUEST_ID.into(),
+            by: Some(Answerer::Autopilot),
+        }))
+        .unwrap();
+
+        let cancelled = next_message(&out_rx);
+        assert_eq!(cancelled["type"], "control_cancel_request");
+        assert_eq!(cancelled["request_id"], SDK_PERMISSION_ID);
+        assert!(shared.lock().unwrap().pending.is_empty());
     }
 }

@@ -5,6 +5,7 @@
 //! `AgentHandles::respawn`. Everything else only reads it.
 
 pub(crate) mod automation;
+pub(crate) mod autopilot;
 pub(crate) mod background_delivery;
 mod btw;
 mod decisions;
@@ -55,6 +56,7 @@ use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT, format_with_images};
 use crate::clipboard::{ClipboardState, CopyResult};
 use crate::components::automation_inspector::{AutomationAction, AutomationInspector};
+use crate::components::autopilot_panel::AutopilotPanel;
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand, disabled_feature};
 use crate::components::command_modal::{CommandModal, CommandModalAction};
 use crate::components::commit_popup::{CommitAction, CommitIndex, CommitPopup};
@@ -132,13 +134,14 @@ use crate::terminal::{ProgramBlockKind, ProgramStatus};
 use crate::{AppSession, PatternDiscoveryMode, PatternDiscoveryOutcome, PatternSuggestionLoader};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use caudra_agent::agent::task_runner::WorkflowHostContext;
+use caudra_agent::autopilot::DecisionKind;
 use caudra_agent::background::{BackgroundTasks, ShellSnapshot};
 use caudra_agent::commits::repo;
 use caudra_agent::context::{ContextKey, ContextSnapshot, ContextStore};
 use caudra_agent::herdr::PaneMetadata;
 use caudra_agent::mcp::McpSnapshot;
 use caudra_agent::mentions;
-use caudra_agent::permissions::{PermissionManager, PermissionPolicyError};
+use caudra_agent::permissions::{AutopilotNote, PermissionManager, PermissionPolicyError};
 use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::tools::ToolAudience;
 use caudra_agent::tools::native::plan::{self, PlanTarget};
@@ -164,6 +167,7 @@ use caudra_providers::{
     ResolvedThinking, ThinkingConfig, TokenUsage, add_cost, project_messages,
 };
 use caudra_storage::StateDir;
+use caudra_storage::autopilot::AutopilotStopper;
 use caudra_storage::background::JobKind;
 use caudra_storage::id::SessionRef;
 use caudra_storage::input_history::InputHistory;
@@ -238,11 +242,17 @@ const SHELL_PASTE_EXPANDED_MSG: &str = "Expanded pasted text; press Enter again 
 const IMPLEMENT_VERB: &str = "Implement";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_CAPTURE_FAILED: &str = "Cannot implement plan";
+/// The `/goal` arguments that clear the goal rather than name one.
+const GOAL_CLEAR_ARGS: [&str; 6] = ["clear", "stop", "off", "reset", "none", "cancel"];
+/// The argument `/goal` and `/autopilot` take to bind their model.
+const MODEL_ARG: &str = "model";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 const PERMISSION_BLOCKER: &str = "Permission requested";
 const AUTH_BLOCKER: &str = "Authentication required";
 const PLAN_BLOCKER: &str = "Plan ready";
 const QUESTION_BLOCKER: &str = "Question requested";
+const AUTOPILOT_BLOCKER: &str = "Autopilot needs you";
+const AUTOPILOT_ENDED_NOTICE: &str = "Autopilot ended";
 const AUTOMATION_NOTICE_PREFIX: &str = "automation";
 /// Never valid JSON, so the tool reads it as the dismissal it is.
 const QUESTION_DISMISSED: &str = "dismissed";
@@ -284,14 +294,22 @@ pub(crate) enum Notification {
         automation: String,
         text: String,
     },
+    /// A card autopilot left to the user. Its reason is the delegate's own
+    /// text, so it stays on the card.
+    AutopilotNeedsYou {
+        wait: DecisionKind,
+    },
+    AutopilotEnded {
+        reason: &'static str,
+    },
 }
 
 impl Notification {
-    /// Prompts blocking the agent outrank turn completions and automation notices.
+    /// Prompts blocking the agent outrank turn completions and notices.
     pub(crate) fn is_urgent(&self) -> bool {
         !matches!(
             self,
-            Self::TurnComplete { .. } | Self::AutomationNotice { .. }
+            Self::TurnComplete { .. } | Self::AutomationNotice { .. } | Self::AutopilotEnded { .. }
         )
     }
 
@@ -310,6 +328,8 @@ impl Notification {
             Self::AutomationNotice { automation, text } => {
                 format!("{AUTOMATION_NOTICE_PREFIX} {automation}: {text}")
             }
+            Self::AutopilotNeedsYou { wait } => format!("{AUTOPILOT_BLOCKER}: {}", wait.name()),
+            Self::AutopilotEnded { reason } => format!("{AUTOPILOT_ENDED_NOTICE}: {reason}"),
         }
     }
 
@@ -475,6 +495,7 @@ pub struct App {
     /// not loaded yet or unreadable; the modal tells those apart by scope.
     pub(super) tool_stats: Option<ToolStats>,
     pub(super) goal_modal: GoalModal,
+    pub(super) autopilot_panel: AutopilotPanel,
     pub(super) stream_modal: StreamModal,
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
@@ -597,6 +618,16 @@ pub struct App {
     pub(crate) cancelling_run: Option<u64>,
     replacement_item: Option<QueueItemId>,
     goal_deferred: bool,
+    /// A resumed engaged session owes its goal one check-in once it settles.
+    autopilot_checkin_due: bool,
+    /// The implement handoff autopilot chose, with the run that chose it. It
+    /// starts once that run is done, and any other run's end drops it.
+    autopilot_implement: Option<(u64, u32)>,
+    /// Decisions autopilot announced and has not made yet, by seq. A
+    /// permission card carries its own state, so none is kept here.
+    autopilot_deciding: Vec<(u32, DecisionKind)>,
+    /// The end of an engagement, for the terminal to announce.
+    autopilot_notice: Option<Notification>,
     pub(super) zones: ZoneRegistry,
     #[cfg(debug_assertions)]
     grab: grab::GrabState,
@@ -776,6 +807,7 @@ impl App {
             lifetime_usage: None,
             tool_stats: None,
             goal_modal: GoalModal::default(),
+            autopilot_panel: AutopilotPanel::default(),
             stream_modal: StreamModal::new(typewriter),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
@@ -872,6 +904,10 @@ impl App {
             cancelling_run: None,
             replacement_item: None,
             goal_deferred: false,
+            autopilot_checkin_due: false,
+            autopilot_implement: None,
+            autopilot_deciding: Vec::new(),
+            autopilot_notice: None,
             zones: ZoneRegistry::new(),
             #[cfg(debug_assertions)]
             grab: grab::GrabState::default(),
@@ -1628,15 +1664,17 @@ impl App {
             }
             Msg::Paste(text) => {
                 if self.mode_submission.is_open()
-                    && !self.permission_prompt.is_open()
+                    && !self.permission_prompt_holds_input()
                     && !self.question_form.is_open()
                 {
                     return Vec::new();
                 }
                 self.sync_subagent_input_target();
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                if self.permission_prompt.is_open() {
-                    self.permission_prompt.handle_paste(&text);
+                if self.permission_prompt_holds_input() {
+                    if !self.claim_deciding_permission() {
+                        self.permission_prompt.handle_paste(&text);
+                    }
                     return vec![];
                 }
                 if self.sandbox_manager.handle_paste(&text) {
@@ -1696,8 +1734,16 @@ impl App {
                 }
                 vec![]
             }
-            Msg::Mouse(event) if self.permission_prompt.is_open() => {
+            Msg::Mouse(event) if self.permission_prompt_holds_input() => {
                 self.autoscroll = None;
+                if matches!(event.kind, MouseEventKind::Down(_))
+                    && self
+                        .permission_prompt
+                        .contains(Position::new(event.column, event.row))
+                    && self.claim_deciding_permission()
+                {
+                    return vec![];
+                }
                 if let PromptMouse::Decided(decision) = self.permission_prompt.handle_mouse(event) {
                     self.apply_permission_decision(decision);
                 }
@@ -1706,7 +1752,7 @@ impl App {
             Msg::Mouse(event) => self.handle_mouse(event),
             Msg::Scroll { column, row, delta } => {
                 self.autoscroll = None;
-                if self.permission_prompt.is_open() {
+                if self.permission_prompt_holds_input() {
                     if self.permission_prompt.contains(Position::new(column, row)) {
                         self.permission_prompt.scroll(delta);
                     } else {
@@ -1763,7 +1809,7 @@ impl App {
             // path, and the run only moves again when the user says so.
             QuestionFormAction::Cancel => {
                 self.question_form.close();
-                self.pause_automations();
+                self.user_stopped(AutopilotStopper::QuestionCancel);
                 return match self.question_subagent.take() {
                     Some(task_id) => self.cancel_subagent(task_id),
                     None => self.handle_cancel(),
@@ -1809,6 +1855,33 @@ impl App {
         if let Some(text) = self.permission_prompt.take_copied() {
             self.copy_to_clipboard(&text);
         }
+    }
+
+    /// A card the user has to answer takes the screen from the views it
+    /// would otherwise sit behind.
+    fn make_way_for_permission_prompt(&mut self) {
+        self.context_modal.close();
+        self.tools_modal.close();
+        self.decisions_modal.close();
+        self.skills_modal.close();
+        self.storage_modal.close();
+        self.system_prompt_modal.close();
+        self.projection_modal.close();
+        self.docs_modal.close();
+        if self.permissions_picker.is_open() {
+            self.suspend_permission_editor();
+            self.permission_config_trust_deferred =
+                self.permissions.needs_project_permission_config_trust();
+        }
+    }
+
+    /// The card takes every key and click, except one autopilot is still
+    /// deciding: that one waits behind an open modal rather than take its
+    /// input.
+    pub(super) fn permission_prompt_holds_input(&self) -> bool {
+        self.permission_prompt.is_open()
+            && !(self.permission_prompt.autopilot_note() == Some(&AutopilotNote::Deciding)
+                && self.has_modal_overlay())
     }
 
     fn scroll_at(&mut self, column: u16, row: u16, delta: i32) -> Option<SelectionZone> {
@@ -1879,6 +1952,10 @@ impl App {
         }
         if self.goal_modal.is_open() {
             self.goal_modal.scroll(delta);
+            return None;
+        }
+        if self.autopilot_panel.is_open() {
+            self.autopilot_panel.scroll(delta);
             return None;
         }
         if self.float_mgr.is_open() && self.float_mgr.contains(pos) {
@@ -2002,7 +2079,7 @@ impl App {
             }
             return Some(if !self.is_main_chat() || self.input_box.is_empty() {
                 if self.status == Status::Streaming {
-                    self.pause_automations();
+                    self.user_stopped(AutopilotStopper::Interrupt);
                     return Some(self.handle_cancel());
                 }
                 self.quit()
@@ -2128,7 +2205,7 @@ impl App {
 
     fn dispatch_overlay(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
         if self.mode_submission.is_open()
-            && !self.permission_prompt.is_open()
+            && !self.permission_prompt_holds_input()
             && !self.question_form.is_open()
         {
             let action = self.mode_submission.handle_key(key);
@@ -2175,6 +2252,7 @@ impl App {
         // plan_form is non-modal: Passthrough falls through to the rest of dispatch
         if self.plan_form_takes_input() {
             guard_repeat!(false);
+            self.claim_plan_card();
             let action = self.plan_form.handle_key(key);
             if action != PlanFormAction::Passthrough {
                 return Some(self.handle_plan_form_action(action));
@@ -2270,6 +2348,16 @@ impl App {
                 self.state.goal.set_continuation_limit(limit);
             }
             return Some(vec![]);
+        }
+
+        if self.autopilot_panel.is_open() {
+            guard_repeat!(false);
+            return Some(
+                self.autopilot_panel
+                    .handle_key(key)
+                    .map(|action| self.on_autopilot_panel(action))
+                    .unwrap_or_default(),
+            );
         }
 
         if self.stream_modal.is_open() {
@@ -2463,6 +2551,7 @@ impl App {
             if !caret_key && self.scroll_transcript(key) {
                 return Some(vec![]);
             }
+            self.claim_question_form();
             let action = self.question_form.handle_key(key);
             return Some(self.handle_question_form_action(action));
         }
@@ -3268,11 +3357,15 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Vec<Action> {
-        if self.permission_prompt.is_open() {
-            self.permission_prompt_key(key);
+        if self.permission_prompt_holds_input() {
+            if key.kind != KeyEventKind::Press || !self.claim_deciding_permission() {
+                self.permission_prompt_key(key);
+            }
             return vec![];
         }
-        self.permission_prompt.handle_key(key);
+        if !self.permission_prompt.is_open() {
+            self.permission_prompt.handle_key(key);
+        }
         if self.permissions_picker.is_open() && self.permissions_picker.editor_mut().is_some() {
             if self.permission_mutation_pending() {
                 return vec![];
@@ -3996,7 +4089,7 @@ impl App {
                             && t.elapsed() < CONFIRMATION_DURATION
                         {
                             if streaming || self.has_session_work() {
-                                self.pause_automations();
+                                self.user_stopped(AutopilotStopper::Interrupt);
                                 self.handle_cancel()
                             } else {
                                 self.open_rewind_picker()
@@ -4348,6 +4441,14 @@ impl App {
                 other => envelope.event = other,
             }
         }
+        // Hoisted like the workflow events above: a workflow agent's prompt is
+        // decided under the workflow's run id.
+        if let AgentEvent::Autopilot(event) = envelope.event {
+            if session_owned || envelope.workflow.is_some() || envelope.run_id == self.run_id {
+                self.on_autopilot_event(event, envelope.run_id);
+            }
+            return vec![];
+        }
         if envelope.run_id == RESTORE_RUN_ID {
             let (id, snapshot, theme_gen, is_header) = match envelope.event {
                 AgentEvent::ToolSnapshot {
@@ -4394,7 +4495,7 @@ impl App {
                 cost,
                 billing,
             );
-            self.state.goal.record_external_usage(usage, cost, billing);
+            self.record_external_spend(usage, cost, billing, LedgerPurpose::Title);
             if let Some(title) = title {
                 self.state.session_mut().set_title_if_auto(title);
             }
@@ -4606,6 +4707,7 @@ impl App {
                 &envelope.event,
                 AgentEvent::Done { .. } | AgentEvent::Error { .. }
             );
+        let run_id = envelope.run_id;
         let automation_run_end = (run_ended && envelope.task.is_none() && self.has_automations())
             .then(|| automation::run_end(&envelope.event))
             .flatten();
@@ -4758,24 +4860,7 @@ impl App {
             delay_ms,
         } = envelope.event
         {
-            self.chats[chat_idx].stream_reset();
-            self.discard_stream_delegations(chat_idx);
-            let Some(deadline) = Instant::now().checked_add(Duration::from_millis(delay_ms)) else {
-                self.chats[chat_idx].clear_retry();
-                tracing::warn!(
-                    delay_ms,
-                    attempt,
-                    chat_idx,
-                    "retry deadline is not representable"
-                );
-                self.flash(RETRY_COUNTDOWN_UNAVAILABLE.into());
-                return vec![];
-            };
-            self.chats[chat_idx].set_retry(RetryInfo {
-                attempt,
-                message,
-                deadline,
-            });
+            self.wait_out_retry(chat_idx, attempt, message, delay_ms);
             return vec![];
         }
 
@@ -4792,9 +4877,7 @@ impl App {
                 self.automation_turn_complete(&tc.message);
             }
             if subagent_id.is_some() {
-                self.state
-                    .goal
-                    .record_external_usage(tc.usage, tc.cost, tc.billing);
+                self.record_external_spend(tc.usage, tc.cost, tc.billing, tc.purpose);
             }
             self.record_model_usage(
                 &tc.provider,
@@ -4855,7 +4938,7 @@ impl App {
                 self.add_session_spend(cost, billing);
                 add_chat_spend(&mut self.chats[chat_idx], cost, billing);
                 if subagent_id.is_some() {
-                    self.state.goal.record_external_usage(usage, cost, billing);
+                    self.record_external_spend(usage, cost, billing, purpose);
                 }
                 self.record_model_usage(&provider, &model, purpose, usage, cost, billing);
                 return vec![];
@@ -4886,8 +4969,11 @@ impl App {
                 }
                 return vec![];
             }
-            AgentEvent::GoalFinished { result } => {
-                self.automation_goal_finished(&result);
+            AgentEvent::GoalFinished {
+                result,
+                autopilot_owned,
+            } => {
+                self.automation_goal_finished(&result, autopilot_owned);
                 let (role, label) = match result.verdict {
                     GoalVerdict::Met => (DisplayRole::Done, "Goal achieved"),
                     GoalVerdict::Impossible | GoalVerdict::NotMet => {
@@ -4955,8 +5041,12 @@ impl App {
                 }
                 return vec![];
             }
-            AgentEvent::GoalClearedAfterError { condition, message } => {
-                self.automation_goal_cleared(&condition, &message);
+            AgentEvent::GoalClearedAfterError {
+                condition,
+                message,
+                autopilot_owned,
+            } => {
+                self.automation_goal_cleared(&condition, &message, autopilot_owned);
                 self.main_chat().push(DisplayMessage::new(
                     DisplayRole::Error,
                     format!("Goal cleared after an unrecoverable error: {condition} ({message})"),
@@ -5026,18 +5116,8 @@ impl App {
         }
 
         if let ChatEventResult::PermissionRequest(request) = result {
-            self.context_modal.close();
-            self.tools_modal.close();
-            self.decisions_modal.close();
-            self.skills_modal.close();
-            self.storage_modal.close();
-            self.system_prompt_modal.close();
-            self.projection_modal.close();
-            self.docs_modal.close();
-            if self.permissions_picker.is_open() {
-                self.suspend_permission_editor();
-                self.permission_config_trust_deferred =
-                    self.permissions.needs_project_permission_config_trust();
+            if request.presentation.autopilot != Some(AutopilotNote::Deciding) {
+                self.make_way_for_permission_prompt();
             }
             let call_id = request.id.clone();
             if self
@@ -5050,7 +5130,13 @@ impl App {
         }
 
         if let ChatEventResult::PermissionRequestUpdated(request) = result {
-            self.permission_prompt.update(request);
+            let escalated = matches!(
+                request.presentation.autopilot,
+                Some(AutopilotNote::Escalated { .. })
+            );
+            if self.permission_prompt.update(request) && escalated {
+                self.make_way_for_permission_prompt();
+            }
             return vec![];
         }
 
@@ -5158,11 +5244,47 @@ impl App {
         }
         if run_ended {
             self.refresh_record_index();
+            self.autopilot_run_ended();
         }
         if let Some((outcome, error)) = automation_run_end {
             self.automation_run_ended(outcome, error);
         }
+        if run_ended
+            && let Some((chosen_by, seq)) = self.autopilot_implement.take()
+            && chosen_by == run_id
+        {
+            return self.implement_for_autopilot(seq);
+        }
         vec![]
+    }
+
+    /// A stream waits out a backoff: what it streamed is dropped, and the
+    /// countdown takes its place until the next event from that stream.
+    pub(super) fn wait_out_retry(
+        &mut self,
+        chat_idx: usize,
+        attempt: u32,
+        message: String,
+        delay_ms: u64,
+    ) {
+        self.chats[chat_idx].stream_reset();
+        self.discard_stream_delegations(chat_idx);
+        let Some(deadline) = Instant::now().checked_add(Duration::from_millis(delay_ms)) else {
+            self.chats[chat_idx].clear_retry();
+            tracing::warn!(
+                delay_ms,
+                attempt,
+                chat_idx,
+                "retry deadline is not representable"
+            );
+            self.flash(RETRY_COUNTDOWN_UNAVAILABLE.into());
+            return;
+        };
+        self.chats[chat_idx].set_retry(RetryInfo {
+            attempt,
+            message,
+            deadline,
+        });
     }
 
     fn resolve_or_create_chat(&mut self, subagent: &SubagentInfo) -> usize {
@@ -5373,6 +5495,7 @@ impl App {
             "/goal" => self.execute_goal(&cmd.args),
             "/goal-clear" => self.clear_goal(),
             "/goal-model" => self.open_goal_model_picker(),
+            "/autopilot" => self.execute_autopilot(&cmd.args),
             "/continue" => self.continue_run(),
             "/new" => vec![Action::RequestNewSession],
             "/queue" => {
@@ -5543,13 +5666,10 @@ impl App {
             self.goal_modal.open();
             return vec![];
         }
-        if condition.eq_ignore_ascii_case("model") {
+        if condition.eq_ignore_ascii_case(MODEL_ARG) {
             return self.open_goal_model_picker();
         }
-        if matches!(
-            condition.to_ascii_lowercase().as_str(),
-            "clear" | "stop" | "off" | "reset" | "none" | "cancel"
-        ) {
+        if is_goal_clear(condition) {
             return self.clear_goal();
         }
 
@@ -5566,6 +5686,7 @@ impl App {
     }
 
     fn clear_goal(&mut self) -> Vec<Action> {
+        self.state.autopilot.drop_goal_ownership();
         let message = self.state.goal.clear().map_or_else(
             || "No goal set".to_string(),
             |goal| format!("Goal cleared: {}", goal.condition),
@@ -5849,7 +5970,7 @@ impl App {
         }
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 45] {
+    fn overlays(&self) -> [&dyn Overlay; 46] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -5864,6 +5985,7 @@ impl App {
             &self.system_prompt_modal,
             &self.projection_modal,
             &self.goal_modal,
+            &self.autopilot_panel,
             &self.stream_modal,
             &self.float_mgr,
             &self.search_modal,
@@ -5899,7 +6021,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 45] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 46] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -5914,6 +6036,7 @@ impl App {
             &mut self.system_prompt_modal,
             &mut self.projection_modal,
             &mut self.goal_modal,
+            &mut self.autopilot_panel,
             &mut self.stream_modal,
             &mut self.float_mgr,
             &mut self.search_modal,
@@ -5956,10 +6079,17 @@ impl App {
     /// True when the agent is parked on user input. Drives the `needs_input`
     /// session status.
     pub(crate) fn awaiting_input(&self) -> bool {
-        self.permission_prompt.is_open()
+        (self.permission_prompt.is_open()
+            && self.permission_prompt.autopilot_note() != Some(&AutopilotNote::Deciding))
             || self.pending_input != PendingInput::None
             || self.float_mgr.needs_input()
-            || self.question_form.is_open()
+            || self.question_form_waits()
+    }
+
+    /// The question form waits on the user unless autopilot is deciding it.
+    fn question_form_waits(&self) -> bool {
+        self.question_form.is_open()
+            && self.question_form.autopilot_note() != Some(&AutopilotNote::Deciding)
     }
 
     /// Prompts read the way their notifications do, so Herdr's sidebar names
@@ -5994,7 +6124,7 @@ impl App {
             return Some(Cow::Owned(attention.message()));
         }
         [
-            (self.question_form.is_open(), QUESTION_BLOCKER),
+            (self.question_form_waits(), QUESTION_BLOCKER),
             (self.login_picker.is_open(), LOGIN_BLOCKER),
             (
                 self.mcp_picker.is_open() && self.mcp_picker.has_awaiting_trust(),
@@ -6021,17 +6151,28 @@ impl App {
             Some(Notification::QuestionRequested | Notification::PlanReady) => {
                 Some(ProgramBlockKind::Question)
             }
+            Some(Notification::AutopilotNeedsYou {
+                wait: DecisionKind::Permission,
+                ..
+            }) if !self.permission_mutation_pending() => Some(ProgramBlockKind::Permission),
+            Some(Notification::AutopilotNeedsYou { wait, .. })
+                if wait != DecisionKind::Permission =>
+            {
+                Some(ProgramBlockKind::Question)
+            }
             Some(
                 Notification::PermissionRequested { .. }
+                | Notification::AutopilotNeedsYou { .. }
                 | Notification::TurnComplete { .. }
-                | Notification::AutomationNotice { .. },
+                | Notification::AutomationNotice { .. }
+                | Notification::AutopilotEnded { .. },
             )
             | None => None,
         };
         if let Some(block) = block {
             return ProgramStatus::Blocked(Some(block));
         }
-        if self.question_form.is_open() {
+        if self.question_form_waits() {
             return ProgramStatus::Blocked(Some(ProgramBlockKind::Question));
         }
         if (self.mcp_picker.is_open() && self.mcp_picker.has_awaiting_trust())
@@ -6087,11 +6228,16 @@ impl App {
     }
 
     pub(crate) fn goal_checkin_due(&self) -> bool {
-        self.goal_deferred && self.state.goal.snapshot().is_some()
+        (self.goal_deferred || self.autopilot_checkin_due) && self.state.goal.snapshot().is_some()
     }
 
     pub(crate) fn attention(&self) -> Option<Notification> {
-        if let Some(tool) = self.permission_prompt.tool() {
+        if let Some(wait) = self.autopilot_wait() {
+            return Some(wait);
+        }
+        if let Some(tool) = self.permission_prompt.tool()
+            && self.permission_prompt.autopilot_note().is_none()
+        {
             let tool = (!matches!(tool, caudra_config::ToolKey::Wildcard))
                 .then(|| normalize_preview(&tool.to_string()))
                 .flatten();
@@ -6530,9 +6676,7 @@ impl App {
             spend.cost,
             spend.billing,
         );
-        self.state
-            .goal
-            .record_external_usage(spend.usage, spend.cost, spend.billing);
+        self.record_external_spend(spend.usage, spend.cost, spend.billing, spend.purpose);
         self.settle_btw(done.answer);
         true
     }
@@ -6623,7 +6767,7 @@ impl App {
 
     fn route_text_paste(&mut self, text: &str) {
         if self.mode_submission.is_open()
-            && !self.permission_prompt.is_open()
+            && !self.permission_prompt_holds_input()
             && !self.question_form.is_open()
         {
             return;
@@ -6757,6 +6901,7 @@ impl App {
             PlanFormAction::Consumed | PlanFormAction::Passthrough => vec![],
             PlanFormAction::Hide => {
                 self.plan_form.hide();
+                self.arm_autopilot_stop();
                 vec![]
             }
             PlanFormAction::OpenEditor => {
@@ -6779,13 +6924,7 @@ impl App {
                 return vec![];
             }
         };
-        let mut header = match &snapshot.target {
-            PlanTarget::Local(path) => format!("{IMPLEMENT_MSG_PREFIX} from `{}`.", path.display()),
-            PlanTarget::Remote(_) => format!("{IMPLEMENT_VERB} {}.", plan::SESSION_PLAN_LABEL),
-        };
-        if self.plan_form.parallel() {
-            header = format!("{header} {IMPLEMENT_PARALLEL_HINT}");
-        }
+        let header = self.implement_header(&snapshot.target);
         let msg = QueuedMessage {
             text: format!("{header}\n\n{}", snapshot.content),
             images: Vec::new(),
@@ -6814,6 +6953,18 @@ impl App {
             return vec![];
         }
         self.finish_plan_handoff(handoff)
+    }
+
+    fn implement_header(&self, target: &PlanTarget) -> String {
+        let header = match target {
+            PlanTarget::Local(path) => format!("{IMPLEMENT_MSG_PREFIX} from `{}`.", path.display()),
+            PlanTarget::Remote(_) => format!("{IMPLEMENT_VERB} {}.", plan::SESSION_PLAN_LABEL),
+        };
+        if self.plan_form.parallel() {
+            format!("{header} {IMPLEMENT_PARALLEL_HINT}")
+        } else {
+            header
+        }
     }
 
     /// For the session a Clear-and-Implement leaves behind: its plan goes
@@ -6869,6 +7020,12 @@ impl App {
 /// common case still reads as the model alone.
 fn session_usage_model(provider: &str, model: &str) -> String {
     format!("{provider}/{model}")
+}
+
+fn is_goal_clear(args: &str) -> bool {
+    GOAL_CLEAR_ARGS
+        .iter()
+        .any(|clear| args.eq_ignore_ascii_case(clear))
 }
 
 /// Names a workflow agent the way the inspector does, by phase and label,

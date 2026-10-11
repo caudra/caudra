@@ -99,7 +99,7 @@ While the terminal UI runs, Caudra watches its config files, skill and command d
 
 | What changed | When it applies |
 |--------------|-----------------|
-| `caudra.toml` | `[agent]` settings from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
+| `caudra.toml` | `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
 | `permissions.toml` | Before the next tool call. |
 | `mcp.toml` | At once. New servers start, even when Caudra started with none. Removed and disabled servers stop, and changed servers restart. The other servers keep running. `defer_tools` applies after `/reload`. |
 | `providers.toml` | The next time Caudra reads it, such as when a model list opens. |
@@ -263,6 +263,7 @@ decision_engine = true
 | `decision_engine` | `false` | The [decision engine](#decisions), [Auto mode](/docs/permissions/#auto-mode), `caudra decisions`, and workflow [`decide()` calls](/docs/workflows/#typed-decisions). |
 | `cross_session_messaging` | `false` | Local [cross-session messaging](/docs/messaging/): the `list_sessions`, `send_message`, `publish_message`, `read_topic`, and `work_assignment` tools, `/peers`, `/messages`, `/topics`, `/groups`, `caudra message`, live session inboxes, consumer groups, and the message history. Both processes must opt in. |
 | `automations` | `false` | [Automations](/docs/automations/): scripts that act on session events when their conditions hold, within the limits in [`[automations]`](#automations), and the `caudra-automation-dev` skill. Messaging triggers and actions also need `cross_session_messaging`, and workflow triggers and actions also need `workflows`. |
+| `autopilot` | `false` | [Autopilot](/docs/autopilot/): keep a session moving toward its goal unattended, answering permission prompts and questions within the limits in [`[autopilot]`](#autopilot). |
 
 Each switch is independent, so turning one on never turns on another. A missing file, table, or key leaves a switch off, and an unknown key is an error. `caudra remote` and `/remote` work when either `sandboxes` or `remote_workcell` is on, and each session checks the switch for its own source.
 
@@ -773,7 +774,7 @@ With `agent.shell_execution = "auto"`, Enforce estimates can select synchronous 
 
 `question_tool_nudge` defaults to `off` and supports `off`, `shadow`, and `advise`. It checks an attempted final prose reply for a live request for the user to clarify, choose, supply information, or approve a next step. It needs a configured engine and a usable `question` tool with an answer channel in the main session. Subagents and frontends without that channel are excluded. YOLO does not disable it.
 
-In `shadow`, the prediction leaves the reply unchanged. In `advise`, a score at or above `decisions.thresholds.question_tool_nudge` (default `0.85`) adds a normal system reminder asking the assistant to use `question` for the outstanding answer. The original reply stays in history. The reminder follows the `show_reminders` display preference and can occur at most once per genuine user-input episode. Synthetic reminders, retries, and resume do not renew that allowance. It never fabricates a tool call, an answer, or approval.
+In `shadow`, the prediction leaves the reply unchanged. In `advise`, a score at or above `decisions.thresholds.question_tool_nudge` (default `0.85`) adds a normal system reminder asking the assistant to use `question` for the outstanding answer. The original reply stays in history. The reminder follows the `show_reminders` display preference and can occur at most once per genuine user-input episode. Synthetic reminders, retries, and resume do not renew that allowance. It never fabricates a tool call, an answer, or approval. While [autopilot](/docs/autopilot/#questions) is engaged, its delegate answers the form that the reminder leads to.
 
 The request contains redacted excerpts of the current visible reply and relevant user request within the 1,500-byte serialized state limit. Long replies retain an opening and a larger tail, so questions in the omitted middle can be missed. Errors, timeouts, invalid answers, and scores below the threshold leave the reply unchanged.
 
@@ -790,6 +791,17 @@ Only the permission question set currently supports a user-global file override:
 | `allow_private_network` | bool | `false` | - | - | Let `http()` in automations reach loopback and private network hosts. Without it, automations reach public hosts only |
 
 [Automations](/docs/automations/) are experimental and need `automations = true` under [`[experimental]`](#experimental-features). Only the global `caudra.toml` may hold this table. Caudra rejects a project `.caudra/caudra.toml` that contains it, even an empty one, so a repository cannot raise these limits or let automations reach a private network.
+
+### `[autopilot]`
+
+| Field | Type | Default | Min | Max | Description |
+|-------|------|---------|-----|-----|-------------|
+| `max_continuations` | u32 | `100` | 1 | 10000 | Most continuations autopilot may send per engagement before it ends |
+| `max_cost` | f64 | unset | - | - | Most spending in USD per autopilot engagement, counting API-billed spend only. Must be positive, and unset means no cap |
+| `max_minutes` | u32 | unset | 1 | 525600 | Most wall-clock minutes per autopilot engagement while the session is open. Unset means no cap |
+| `error_retries` | u32 | `5` | 0 | 20 | Retries for transient provider errors during an autopilot engagement |
+
+[Autopilot](/docs/autopilot/) is experimental and needs `autopilot = true` under [`[experimental]`](#experimental-features). Only the global `caudra.toml` may hold this table. Caudra rejects a project `.caudra/caudra.toml` that contains it, even an empty one.
 
 ## Plugins
 

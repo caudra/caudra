@@ -1,8 +1,10 @@
+use crate::components::autopilot_panel::card_note;
 use crate::components::form::{footer_row, render_form, selected_prefix};
 use crate::components::keybindings::key;
 use crate::components::{Hint, HintBar, VisualRows, hanging_lines, visual_rows};
 use crate::theme;
 
+use caudra_agent::permissions::AutopilotNote;
 use caudra_grab::grab_scope;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -92,6 +94,8 @@ pub struct PlanForm {
     row_hits: Vec<PlanRowHit>,
     mouse_down: Option<usize>,
     hints: HintBar,
+    /// What autopilot is doing about the plan, drawn muted under the menu.
+    autopilot_note: Option<AutopilotNote>,
 }
 
 impl PlanForm {
@@ -103,7 +107,16 @@ impl PlanForm {
             row_hits: Vec::new(),
             mouse_down: None,
             hints: HintBar::default(),
+            autopilot_note: None,
         }
+    }
+
+    pub(crate) fn set_autopilot_note(&mut self, note: Option<AutopilotNote>) {
+        self.autopilot_note = note;
+    }
+
+    pub(crate) fn autopilot_note(&self) -> Option<&AutopilotNote> {
+        self.autopilot_note.as_ref()
     }
 
     pub fn is_visible(&self) -> bool {
@@ -148,6 +161,7 @@ impl PlanForm {
         self.invalidate_mouse_geometry();
         self.visibility = Visibility::Hidden;
         self.selected = 0;
+        self.autopilot_note = None;
     }
 
     /// What the composer's top row reads while the form is dismissed, so the
@@ -303,7 +317,8 @@ impl PlanForm {
     /// The menu as lines, paired with the option each line belongs to.
     /// Measuring and drawing both read this, so the rows reserved and the rows
     /// drawn can never disagree, and a click can name the option under it
-    /// however the text wrapped.
+    /// however the text wrapped. Autopilot's note closes the menu and belongs
+    /// to no option.
     ///
     /// A description rides on its label's row while it fits and hangs under a
     /// fixed indent when it does not. Hanging under the label itself would
@@ -340,6 +355,14 @@ impl PlanForm {
                 lines.push(line);
                 owners.push(index);
             }
+        }
+        if let Some(note) = &self.autopilot_note {
+            lines.push(Line::default());
+            lines.extend(hanging_lines(
+                Span::styled(DESC_INDENT, t.tool_dim),
+                Span::styled(card_note(note), t.tool_dim),
+                width,
+            ));
         }
         (lines, owners)
     }
@@ -770,5 +793,46 @@ mod tests {
         );
         assert!(form.row_hits.is_empty());
         assert!(form.mouse_down.is_none());
+    }
+
+    const ESCALATION: &str = "the plan needs the user's call";
+    const EXPECT_NOTE: &str = "the card must say what autopilot is doing about the plan";
+
+    /// The note closes the menu and belongs to no option, so every option
+    /// keeps the row it is clicked on.
+    #[test_case(AutopilotNote::Deciding ; "deciding")]
+    #[test_case(AutopilotNote::Escalated { reason: ESCALATION.into() } ; "left_to_you")]
+    fn the_card_says_what_autopilot_is_doing(note: AutopilotNote) {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        form.set_autopilot_note(Some(note.clone()));
+
+        let buffer = render(&mut form);
+
+        let screen: Vec<String> = (0..buffer.area.height)
+            .map(|y| row_text(&buffer, y))
+            .collect();
+        assert!(
+            screen.join(" ").contains(&card_note(&note)),
+            "{EXPECT_NOTE}\n{}",
+            screen.join("\n")
+        );
+        for (index, item) in MENU.iter().enumerate() {
+            let area = form.row_area(index).unwrap();
+            assert!(
+                row_text(&buffer, area.y).contains(item.label),
+                "{MISSING_OPTION}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reset_drops_the_note() {
+        let mut form = PlanForm::new();
+        form.set_autopilot_note(Some(AutopilotNote::Deciding));
+
+        form.reset();
+
+        assert_eq!(form.autopilot_note(), None);
     }
 }

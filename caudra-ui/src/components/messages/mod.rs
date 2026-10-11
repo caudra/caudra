@@ -13,8 +13,8 @@ use layout::{SegmentChrome, SegmentKind};
 
 use super::tool_display::{
     RenderCtx, ScrollTail, ToolLines, append_annotation, append_right_info, assistant_style,
-    build_instructions_lines, build_tool_lines, done_style, draws_live_script, error_style,
-    format_timestamp_now, names_tool, notice_style, shell_clock_ticks, thinking_style,
+    autopilot_style, build_instructions_lines, build_tool_lines, done_style, draws_live_script,
+    error_style, format_timestamp_now, names_tool, notice_style, shell_clock_ticks, thinking_style,
     truncate_to_header, user_style,
 };
 use super::{
@@ -268,7 +268,7 @@ fn markdown_inline(text: &str) -> String {
     escaped
 }
 
-fn markdown_code_span(text: &str) -> String {
+pub(crate) fn markdown_code_span(text: &str) -> String {
     if text.contains(['\n', '\r']) {
         let mut single_line = String::with_capacity(text.len());
         for character in text.chars() {
@@ -5769,7 +5769,8 @@ fn display_key(message: &DisplayMessage) -> Option<DisplayKey<'_>> {
         | DisplayRole::Assistant
         | DisplayRole::Thinking
         | DisplayRole::Notice
-        | DisplayRole::Injected => Some(DisplayKey::Text(
+        | DisplayRole::Injected
+        | DisplayRole::Autopilot => Some(DisplayKey::Text(
             mem::discriminant(&message.role),
             message.text.len(),
         )),
@@ -5893,7 +5894,8 @@ fn same_display_item(left: &DisplayMessage, right: &DisplayMessage) -> bool {
         | (DisplayRole::Assistant, DisplayRole::Assistant)
         | (DisplayRole::Thinking, DisplayRole::Thinking)
         | (DisplayRole::Notice, DisplayRole::Notice)
-        | (DisplayRole::Injected, DisplayRole::Injected) => left.text == right.text,
+        | (DisplayRole::Injected, DisplayRole::Injected)
+        | (DisplayRole::Autopilot, DisplayRole::Autopilot) => left.text == right.text,
         _ => false,
     }
 }
@@ -5961,7 +5963,9 @@ fn segment_kind(role: &DisplayRole) -> SegmentKind {
         DisplayRole::Thinking => SegmentKind::Thinking,
         DisplayRole::Error => SegmentKind::Error,
         DisplayRole::Done => SegmentKind::Done,
-        DisplayRole::Notice | DisplayRole::Injected => SegmentKind::Assistant,
+        DisplayRole::Notice | DisplayRole::Injected | DisplayRole::Autopilot => {
+            SegmentKind::Assistant
+        }
         DisplayRole::TaskDelivery(_) => SegmentKind::TaskDelivery,
         DisplayRole::AutomationDelivery(_) => SegmentKind::AutomationDelivery,
         DisplayRole::PeerMessage(_) => SegmentKind::PeerMessage,
@@ -6043,6 +6047,7 @@ fn build_message_lines(
         DisplayRole::Error => error_style(),
         DisplayRole::Done => done_style(),
         DisplayRole::Notice | DisplayRole::Injected => notice_style(),
+        DisplayRole::Autopilot => autopilot_style(),
         DisplayRole::Tool(_)
         | DisplayRole::TaskDelivery(_)
         | DisplayRole::AutomationDelivery(_)

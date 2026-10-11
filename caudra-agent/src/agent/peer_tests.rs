@@ -12,8 +12,8 @@ mod peer_tests {
     };
     use caudra_providers::provider::{BoxFuture, Provider};
     use caudra_providers::{
-        CacheKey, HistoryItem, HistoryItemKind, Message, Model, ModelInfo, PeerAudience,
-        PeerMessageOrigin, ProviderEvent, RequestOptions, StopReason, StreamResponse,
+        AutopilotMessageKind, CacheKey, HistoryItem, HistoryItemKind, Message, Model, ModelInfo,
+        PeerAudience, PeerMessageOrigin, ProviderEvent, RequestOptions, StopReason, StreamResponse,
     };
     use caudra_storage::id::CaudraId;
     use caudra_storage::sessions::{PermissionMode, TitleSource};
@@ -24,10 +24,11 @@ mod peer_tests {
 
     use super::{
         Agent, AnnouncedMode, ENVIRONMENT, History, MockProvider, PendingInput,
-        RequestCapturingProvider, default_input, environment_announcement, last_announced,
-        last_announced_mode, make_agent, mode_switch_notice, plan_announcement, standing_notice,
-        text_response, tool_use_response,
+        RequestCapturingProvider, TurnOutcome, answer, default_input, environment_announcement,
+        last_announced, last_announced_mode, make_agent, mode_switch_notice, plan_announcement,
+        standing_notice, text_response, tool_use_response,
     };
+    use crate::autopilot::AutopilotHandle;
     use crate::peers::{PeerDescriptor, PeerHost, PeerSession, SendReceipt};
     use crate::permissions::{
         PermissionAnswer, PermissionLifetime, PermissionManager, PermissionRisk,
@@ -69,6 +70,10 @@ mod peer_tests {
     const PEER_STREAM_BOUNDARY: &str = "the provider must stop at its post-arrival stream boundary";
     const PEER_CHECKPOINT_RUNS: usize = 2;
     const PEER_DIRECTORY_MODE: u32 = 0o700;
+    const PEER_QUESTION: &str = "Should the parser keep comments?";
+    const PEER_REPLY_VERDICT: &str =
+        r#"{"action":"reply","reason":"the user said so","text":"Keep them."}"#;
+    const PEER_WINS: &str = "a peer message waiting at a reply verdict must win over it";
 
     struct PeerFixture {
         directory: TempDir,
@@ -514,10 +519,12 @@ mod peer_tests {
                         peer_event: Some(saved),
                         task_event,
                         automation_event,
+                        autopilot_event,
                     } => {
                         assert_eq!(saved, &origin);
                         assert!(task_event.is_none());
                         assert!(automation_event.is_none());
+                        assert!(autopilot_event.is_none());
                         assert_eq!(shown, text);
                         Some(index)
                     }
@@ -961,6 +968,47 @@ mod peer_tests {
                 .await
                 .unwrap();
             assert_eq!(receipt.status, PEER_REFUSED);
+        });
+    }
+
+    #[test]
+    fn a_peer_message_waiting_at_a_reply_verdict_wins_over_it() {
+        smol::block_on(async {
+            let fixture = PeerFixture::new().await;
+            let origin = fixture.queue(PEER_TEXT).await;
+            let autopilot = AutopilotHandle::default();
+            autopilot.engage(false);
+            let mut history = History::new(vec![Message::user(PEER_FIRST_TURN.into())]);
+            let (mut agent, _events) = make_agent(
+                MockProvider::new(vec![answer(PEER_REPLY_VERDICT)]),
+                &mut history,
+            );
+            fixture.bind(&mut agent);
+            let mut agent = agent.with_autopilot(autopilot);
+            agent.observe_autopilot();
+            agent.response_text = Some(PEER_QUESTION.into());
+
+            assert!(matches!(
+                agent.review_turn_end().await.unwrap(),
+                Some(TurnOutcome::Continue)
+            ));
+            drop(agent);
+
+            assert_eq!(
+                history
+                    .as_slice()
+                    .last()
+                    .and_then(|message| message.peer_event.clone()),
+                Some(origin),
+                "{PEER_WINS}"
+            );
+            assert!(
+                history.as_slice().iter().all(|message| message
+                    .autopilot_event
+                    .as_ref()
+                    .is_none_or(|event| event.kind != AutopilotMessageKind::Reply)),
+                "{PEER_WINS}"
+            );
         });
     }
 }

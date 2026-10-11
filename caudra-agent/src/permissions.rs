@@ -21,20 +21,21 @@ use structured::NORMALIZED_COMMAND_ATTRIBUTE;
 pub(crate) use structured::hex_encode;
 pub use structured::review;
 pub use structured::{
-    AutoNote, COMMAND_EXACT_PREFIX, COMMAND_GROUP_PREFIX, COMMAND_OBSERVATION_ATTRIBUTE,
-    COMMAND_OBSERVATION_BINDING_ATTRIBUTE, COMMAND_PATTERN_PREFIX, COMMAND_TEMPLATE_PREFIX,
-    COMPOSABLE_SHELL_OPTIONS, CONFINED_READ_AUTHORITY, ComposedAnswerError, ComposedRow,
-    EngineFlag, OPACITY_ATTRIBUTE, PermissionAdvisory, PermissionArgumentConstraint,
-    PermissionAuthorityProfile, PermissionCapabilityFamily, PermissionCaution,
-    PermissionExecutorKind, PermissionLifetime, PermissionOptionGroup, PermissionPresentation,
-    PermissionRequest, PermissionResource, PermissionResourceAccess, PermissionResourceConstraint,
-    PermissionResourceKind, PermissionResourcePresentation, PermissionResourceSelector,
-    PermissionRisk, PermissionRowGrant, PermissionRuleOption, PermissionRuleRecord,
-    PermissionSubject, PolicyRule, PromptReason, RemotePermissionIdentity, ResourceCoverage,
-    ResourceStanding, RuleOrigin, ScriptLanguage, SelectedInputError, SelectedPermissionArgument,
-    ShellOpacity, StructuredPermissionDecision, StructuredPermissionEffect,
-    StructuredPermissionRule, UnknownShellOpacity, argument_constraint_matches, canonical_json,
-    canonical_json_sha256, escape_json_pointer_segment, evaluate_structured_permission_rules,
+    AutoNote, AutopilotNote, COMMAND_EXACT_PREFIX, COMMAND_GROUP_PREFIX,
+    COMMAND_OBSERVATION_ATTRIBUTE, COMMAND_OBSERVATION_BINDING_ATTRIBUTE, COMMAND_PATTERN_PREFIX,
+    COMMAND_TEMPLATE_PREFIX, COMPOSABLE_SHELL_OPTIONS, CONFINED_READ_AUTHORITY,
+    ComposedAnswerError, ComposedRow, EngineFlag, OPACITY_ATTRIBUTE, PermissionAdvisory,
+    PermissionArgumentConstraint, PermissionAuthorityProfile, PermissionCapabilityFamily,
+    PermissionCaution, PermissionExecutorKind, PermissionLifetime, PermissionOptionGroup,
+    PermissionPresentation, PermissionRequest, PermissionResource, PermissionResourceAccess,
+    PermissionResourceConstraint, PermissionResourceKind, PermissionResourcePresentation,
+    PermissionResourceSelector, PermissionRisk, PermissionRowGrant, PermissionRuleOption,
+    PermissionRuleRecord, PermissionSubject, PolicyRule, PromptReason, RemotePermissionIdentity,
+    ResourceCoverage, ResourceStanding, RuleOrigin, ScriptLanguage, SelectedInputError,
+    SelectedPermissionArgument, ShellOpacity, StructuredPermissionDecision,
+    StructuredPermissionEffect, StructuredPermissionRule, UnknownShellOpacity,
+    argument_constraint_matches, canonical_json, canonical_json_sha256,
+    escape_json_pointer_segment, evaluate_structured_permission_rules,
     filesystem_permission_resource, json_pointer, permission_rule_covers_request,
     permission_rule_covers_resource, permission_rule_intersects_request,
     permission_rules_cover_request, permission_rules_resource_standing, prepared_command_binding,
@@ -70,9 +71,10 @@ use enforce::RequestCoverage;
 mod answer;
 use answer::lifetime_name;
 pub use answer::{
-    DECISION_SOURCE_AUTO, DECISION_SOURCE_RULE, DECISION_SOURCE_USER_ABORT,
-    DECISION_SOURCE_USER_ALWAYS, DECISION_SOURCE_USER_ONCE, DECISION_SOURCE_USER_SESSION,
-    DECISION_SOURCE_YOLO, DEFAULT_DENY_GUIDANCE, PermissionAnswer,
+    DECISION_SOURCE_AUTO, DECISION_SOURCE_AUTOPILOT_DENY, DECISION_SOURCE_AUTOPILOT_ONCE,
+    DECISION_SOURCE_RULE, DECISION_SOURCE_USER_ABORT, DECISION_SOURCE_USER_ALWAYS,
+    DECISION_SOURCE_USER_ONCE, DECISION_SOURCE_USER_SESSION, DECISION_SOURCE_YOLO,
+    DEFAULT_DENY_GUIDANCE, PermissionAnswer,
 };
 mod diagnostics;
 use diagnostics::{

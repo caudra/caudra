@@ -343,6 +343,11 @@ fn loading_text(title: Option<&str>) -> String {
 }
 
 pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<RunOutcome> {
+    let initial_prompt = if params.launch_autopilot {
+        initial_prompt.map(app::autopilot::launch_prompt)
+    } else {
+        initial_prompt
+    };
     let report = {
         // Nothing between the last `caudra` startup phase and the first frame is
         // logged otherwise, so a slow open has nowhere left to hide.

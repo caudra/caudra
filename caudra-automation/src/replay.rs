@@ -368,6 +368,7 @@ mod tests {
                 status: SessionStatus::Idle,
                 status_since: AT,
                 goal: None,
+                autopilot: None,
                 cost: None,
                 groups: Vec::new(),
                 work: WorkView::default(),

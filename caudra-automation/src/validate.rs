@@ -147,6 +147,7 @@ fn canned_event(meta: &AutomationMeta, trigger: &Trigger, now_ms: i64) -> Event 
             evaluations: SMOKE_COUNT,
             duration_s: 0,
             cost: None,
+            autopilot: false,
         }),
         Trigger::MessageReceived(filter) => EventDetail::MessageReceived(canned_message(filter)),
         Trigger::WorkFinished { groups, states } => {
@@ -209,6 +210,7 @@ fn canned_event(meta: &AutomationMeta, trigger: &Trigger, now_ms: i64) -> Event 
             status,
             status_since: at,
             goal: None,
+            autopilot: None,
             cost: None,
             groups: Vec::new(),
             work: WorkView::default(),
@@ -324,6 +326,9 @@ if event.trigger == "idle" { send("@anyone", "hi"); }
     const DIVIDES_BY_ZERO: &str = r#"let meta = #{ name: "broken", description: "Fails on its smoke run", triggers: [#{ kind: "armed" }] };
 let ratio = 1 / 0;
 "#;
+    const LEFT_BY_AUTOPILOT: &str = r#"let meta = #{ name: "left-to-me", description: "Logs what autopilot left to the user", triggers: [#{ kind: "needs_input", inputs: ["autopilot"] }] };
+log(event.input);
+"#;
     const MUST_VALIDATE: &str = "the script validates";
     const MUST_COMMIT: &str = "the smoke run commits its args";
 
@@ -392,6 +397,21 @@ let ratio = 1 / 0;
                 "dry": false,
             } })
         );
+    }
+
+    #[test]
+    fn an_autopilot_wait_smoke_runs_without_a_tool() {
+        let report = validate(LEFT_BY_AUTOPILOT, NOW_MS).expect(MUST_VALIDATE);
+
+        assert_eq!(
+            canned_event(&report.meta, &report.meta.triggers[0], NOW_MS).detail,
+            EventDetail::NeedsInput {
+                input: InputKind::Autopilot,
+                tool: None,
+                waiting_s: 0,
+            }
+        );
+        assert_eq!(report.smoke[0].run.outcome.end, FiringEnd::Completed);
     }
 
     #[test]

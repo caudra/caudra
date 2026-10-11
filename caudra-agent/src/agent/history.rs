@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::mem;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -35,6 +36,9 @@ pub struct History {
     /// saw "ok" for one, so this is the one place the list survives. `None`
     /// until an update lands, which is not the same as a list emptied by one.
     todos: Option<Vec<TodoItem>>,
+    /// Whether a plan write was committed since [`Self::take_plan_written`]
+    /// last looked.
+    plan_written: bool,
 }
 
 impl History {
@@ -45,6 +49,7 @@ impl History {
             mirror: None,
             archived: Vec::new(),
             todos: None,
+            plan_written: false,
         }
     }
 
@@ -67,6 +72,7 @@ impl History {
             mirror: None,
             archived: Vec::new(),
             todos: None,
+            plan_written: false,
         })
     }
 
@@ -93,10 +99,11 @@ impl History {
         self.todos.as_deref()
     }
 
-    /// Keeps the list the last todo update among `results` set. Called with
-    /// the results about to be committed, while their typed outputs still
-    /// exist: committing reduces each to the text the model reads.
-    pub(crate) fn record_todos(&mut self, results: &[ToolDoneEvent]) {
+    /// Keeps the list the last todo update among `results` set, and notes a
+    /// plan write. Called with the results about to be committed, while their
+    /// typed outputs still exist: committing reduces each to the text the
+    /// model reads.
+    pub(crate) fn record_results(&mut self, results: &[ToolDoneEvent]) {
         if let Some(items) = results
             .iter()
             .rev()
@@ -104,6 +111,12 @@ impl History {
         {
             self.todos = Some(items.to_vec());
         }
+        self.plan_written |= results.iter().any(ToolDoneEvent::wrote_plan);
+    }
+
+    /// Whether a plan write was committed since the last call.
+    pub(crate) fn take_plan_written(&mut self) -> bool {
+        mem::take(&mut self.plan_written)
     }
 
     /// Every item a reader scrolls: the archive, then the active chain. Not a
@@ -769,8 +782,23 @@ pub(crate) fn sanitize_failed_history(
     rollback_len: usize,
     reason: &str,
 ) -> Option<String> {
-    let marker = format!("{RUN_FAILED_PREFIX}{}{RUN_FAILED_SUFFIX}", one_line(reason));
+    let marker = failure_marker(reason);
     close_run_with_marker(history, rollback_len, &marker).then_some(marker)
+}
+
+/// Settles what a failed attempt left behind for a retry that picks the run back up: a tool
+/// call still dangling is closed as failed, as [`sanitize_failed_history`] closes it, so the
+/// retry never runs it. No marker is written, since the run goes on.
+pub(crate) fn settle_failed_attempt(history: &mut History, reason: &str) {
+    let mut tail = history.as_slice().last().cloned().into_iter().collect();
+    close_dangling_tool_calls(&mut tail, &failure_marker(reason));
+    if tail.len() == 2 {
+        history.extend(tail.pop());
+    }
+}
+
+fn failure_marker(reason: &str) -> String {
+    format!("{RUN_FAILED_PREFIX}{}{RUN_FAILED_SUFFIX}", one_line(reason))
 }
 
 /// A provider can fail with a whole response body. The marker is one row of transcript, so it
@@ -1158,6 +1186,22 @@ mod tests {
 
         let last = history.as_slice().last().unwrap();
         assert_eq!(extract_error_ids(last), ["t1"]);
+    }
+
+    /// A retry goes on from the failed attempt, so a call it left dangling is closed as failed
+    /// rather than run again, and nothing settled is touched.
+    #[test_case(make_tool_use_msg(&["t1"]), &["t1"] ; "dangling_call")]
+    #[test_case(make_tool_result_msg(&["t1"]), &[] ; "settled_tail")]
+    fn a_retried_attempt_closes_only_a_dangling_call(tail: Message, closed: &[&str]) {
+        let mut history = History::new(vec![Message::user(GO.into()), tail]);
+
+        settle_failed_attempt(&mut history, FAILURE);
+
+        assert_eq!(history.len(), 2 + usize::from(!closed.is_empty()));
+        let last = history.as_slice().last().unwrap();
+        assert!(!is_run_marker(last));
+        assert!(matches!(last.role, Role::User));
+        assert_eq!(extract_error_ids(last), closed);
     }
 
     #[test]
@@ -1836,7 +1880,7 @@ mod tests {
     ) {
         let ids: Vec<&str> = results.iter().map(|done| done.id.as_str()).collect();
         history.push(make_tool_use_msg(&ids));
-        history.record_todos(&results);
+        history.record_results(&results);
         for done in &results {
             outputs.insert(done.id.clone(), done.output.clone());
         }

@@ -1989,6 +1989,7 @@ mod background_runtime {
                             task_event: None,
                             peer_event: None,
                             automation_event: None,
+                            autopilot_event: None,
                         } if text.contains(caudra_agent::prompt::ENVIRONMENT_MARKER) => {
                             assert!(summary_seen);
                             assert!(reminder.is_none(), "{SNAPSHOT_STAYS_LAST}");
@@ -1999,6 +2000,7 @@ mod background_runtime {
                             task_event: None,
                             peer_event: None,
                             automation_event: None,
+                            autopilot_event: None,
                         } => {
                             assert!(summary_seen);
                             assert!(!done);
@@ -5652,6 +5654,7 @@ fn main_only_commands_still_run_from_the_main_composer() {
 #[test_case("/sandbox", Feature::Sandboxes; "sandbox")]
 #[test_case("/decisions", Feature::DecisionEngine; "decisions")]
 #[test_case("/auto", Feature::DecisionEngine; "auto")]
+#[test_case("/autopilot", Feature::Autopilot; "autopilot")]
 fn a_command_whose_experiment_is_off_names_the_switch(command: &str, feature: Feature) {
     let mut app = test_app();
     app.features = FeatureFlags::all().without(feature);
@@ -9518,6 +9521,7 @@ fn clicking_task_delivery_opens_chat_named_by_typed_origin(restored: bool) {
                 task_event: Some(origin),
                 peer_event: None,
                 automation_event: None,
+                autopilot_event: None,
             },
             None,
         );
@@ -15243,6 +15247,7 @@ fn retry_preserves_partial_output_only_after_injected_settlement(
             task_event: None,
             peer_event: None,
             automation_event: None,
+            autopilot_event: None,
         }));
     }
     app.update(agent_msg(retry_event()));
@@ -20890,6 +20895,7 @@ fn covered_permission_event_removes_the_matching_queued_prompt() {
     app.update(agent_msg(AgentEvent::PermissionRequestResolved {
         request_id: "covered".into(),
         source_request_id: "first".into(),
+        by: None,
     }));
 
     assert_eq!(app.permission_prompt.pending_count(), 1);
@@ -20943,6 +20949,7 @@ fn resolve_by_rule(app: &mut App) {
     app.update(agent_msg(AgentEvent::PermissionRequestResolved {
         request_id: STAGED_CALL_ID.into(),
         source_request_id: STAGED_CALL_ID.into(),
+        by: None,
     }));
 }
 
@@ -23521,7 +23528,9 @@ pub(crate) mod automation_runtime {
 
     use caudra_agent::AgentEvent;
     use caudra_agent::automation::handle::AutomationHandle;
-    use caudra_agent::automation::manager::{AutomationRuntime, GOAL_ACTIVE, RuntimeDeps};
+    use caudra_agent::automation::manager::{
+        AutomationRuntime, GOAL_ACTIVE, GOAL_OWNED_BY_AUTOPILOT, RuntimeDeps,
+    };
     use caudra_agent::automation::testing::{AutomationFixture, until};
     use caudra_automation::event::{InputKind, SessionStatus};
     use caudra_automation::request::{AutomationError, AutomationRequest, GoalClaim, OutboxClaim};
@@ -23626,7 +23635,7 @@ pub(crate) mod automation_runtime {
             }
         }
 
-        fn idle(app: &mut App) -> Self {
+        pub(crate) fn idle(app: &mut App) -> Self {
             Self::new(app, AutomationFixture::default(), &[])
         }
 
@@ -23718,22 +23727,22 @@ pub(crate) mod automation_runtime {
         }
     }
 
-    fn start_a_run(app: &mut App) {
+    pub(super) fn start_a_run(app: &mut App) {
         app.status = Status::Streaming;
         app.run_id = RUN_ID;
     }
 
-    fn press_esc_twice_during_a_run(app: &mut App) {
+    pub(super) fn press_esc_twice_during_a_run(app: &mut App) {
         start_a_run(app);
         cancel_app(app);
     }
 
-    fn press_ctrl_c_during_a_run(app: &mut App) {
+    pub(super) fn press_ctrl_c_during_a_run(app: &mut App) {
         start_a_run(app);
         app.update(Msg::Key(kb::QUIT.to_key_event()));
     }
 
-    fn cancel_the_question(app: &mut App) {
+    pub(super) fn cancel_the_question(app: &mut App) {
         start_a_run(app);
         open_question(app);
         let _ = rendered(app);
@@ -23902,25 +23911,32 @@ pub(crate) mod automation_runtime {
         );
     }
 
-    #[test_case(false, OTHER_GOAL, true ; "keeps_it")]
-    #[test_case(true, GOAL, false ; "replaces_it_when_asked")]
+    #[test_case(false, false, OTHER_GOAL, Some(GOAL_ACTIVE) ; "keeps_it")]
+    #[test_case(true, false, GOAL, None ; "replaces_it_when_asked")]
+    #[test_case(true, true, OTHER_GOAL, Some(GOAL_OWNED_BY_AUTOPILOT) ; "keeps_one_autopilot_owns_even_when_asked")]
     fn an_active_goal_stays_unless_the_delivery_replaces_it(
         replace: bool,
+        autopilot_owns_goal: bool,
         expected: &str,
-        refused: bool,
+        refusal: Option<&str>,
     ) {
         let mut app = test_app();
         app.state.goal.set(OTHER_GOAL).unwrap();
+        app.engage_autopilot(autopilot_owns_goal);
 
         let actions = app.start_automation_run(goal_claim(replace));
 
         assert_eq!(goal_condition(&app).as_deref(), Some(expected));
-        assert_eq!(
-            app.status_bar
-                .flash_text()
-                .is_some_and(|flash| flash.contains(COURIER) && flash.ends_with(GOAL_ACTIVE)),
-            refused
-        );
+        let flashed = app
+            .status_bar
+            .flash_text()
+            .filter(|flash| flash.contains(COURIER))
+            .and_then(|flash| {
+                [GOAL_ACTIVE, GOAL_OWNED_BY_AUTOPILOT]
+                    .into_iter()
+                    .find(|refusal| flash.ends_with(refusal))
+            });
+        assert_eq!(flashed, refusal);
         assert!(
             matches!(&actions[..], [Action::SendMessage(_)]),
             "{TURN_STARTS}"
@@ -24108,6 +24124,7 @@ pub(crate) mod automation_runtime {
                     fire_id: fire_id.clone(),
                     seq: 0,
                 }),
+                autopilot_event: None,
             },
             None,
         );
@@ -24163,5 +24180,944 @@ pub(crate) mod automation_runtime {
             None,
             "{STOPPING_IS_NO_FAILURE}"
         );
+    }
+}
+
+/// The App's side of autopilot, with the experiment on.
+mod autopilot {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use caudra_agent::autopilot::{ActionName, AutopilotDecision, DecisionKind};
+    use caudra_agent::permissions::{AutopilotNote, PermissionRequest};
+    use caudra_agent::types::{Answerer, AutopilotEvent};
+    use caudra_agent::{AgentEvent, AgentMode, DoneReason};
+    use caudra_automation::event::{AutopilotView, InputKind, SessionStatus};
+    use caudra_automation::snapshot::PauseSource;
+    use caudra_config::{AutopilotConfig, Feature, FeatureFlags, ToolKey};
+    use caudra_providers::{AutopilotMessageKind, AutopilotOrigin, Billing, TokenUsage};
+    use caudra_storage::autopilot::{AutopilotBudget, AutopilotEnd, AutopilotStopper};
+    use caudra_storage::usage_ledger::LedgerPurpose;
+    use crossterm::event::{KeyCode, KeyEvent};
+    use test_case::test_case;
+
+    use super::automation_runtime::{
+        LinkedAutomations, cancel_the_question, press_ctrl_c_during_a_run,
+        press_esc_twice_during_a_run, start_a_run,
+    };
+    use super::{
+        App, Msg, Notification, PlanState, ProgramBlockKind, ProgramStatus, agent_msg,
+        btw_ready_app, build_app, cancel_app, click_status, done_event, drain_writer, key,
+        open_question, plan_app, queued_msg, rendered, sent_input, subagent_msg, tempdir_app,
+        test_app, test_model, test_writer,
+    };
+    use crate::AppSession;
+    use crate::app::Mode;
+    use crate::app::automation::InputWait;
+    use crate::app::autopilot::{
+        ENDED_ROW, ENGAGED_ROW, NOT_ENGAGED_MSG, PLAN_LEFT_TO_YOU, decision_row,
+    };
+    use crate::components::autopilot_panel::{
+        ENGAGED_STATE, ERROR_END, MODEL_KEY, STOP_KEY, STOPPED, WAITING_STATE, end_reason,
+    };
+    use crate::components::keybindings::key as kb;
+    use crate::components::status_bar::StatusBarHitTarget;
+    use crate::components::{Action, DisplayRole, Overlay};
+
+    const AUTOPILOT: &str = "/autopilot";
+    const AUTOPILOT_OFF: &str = "/autopilot off";
+    const AUTOPILOT_GOAL: &str = "/autopilot the tests pass";
+    const GOAL: &str = "the tests pass";
+    const HAND_SET_GOAL: &str = "/goal the build is green";
+    const GOAL_CLEAR: &str = "/goal clear";
+    const SUBAGENT_TASK: &str = "task-1";
+    const SUBAGENT_NAME: &str = "research";
+    const PROVIDER: &str = "anthropic";
+    const MODEL: &str = "claude-haiku-4-5";
+    const SPEND: f64 = 0.25;
+    const COST_LIMIT: f64 = 0.1;
+    const SEQ: u32 = 0;
+    /// The run `agent_msg` sends under.
+    const RUN_ID: u64 = 1;
+    const DECISION_SUBJECT: &str = "bash";
+    const DECISION_REASON: &str = "the tests need running";
+    const NOTHING_SPENT: f64 = 0.0;
+    const SHARED_HANDLE: &str = "the agents must read the session's own handle";
+    const STOP_IS_KEPT: &str = "only the user's stops end autopilot";
+    const PANEL_OPENS: &str = "an engaged session's bare /autopilot opens the panel";
+    const PERMISSION_ID: &str = "autopilot-permission";
+    const PERMISSION_TOOL: &str = "bash";
+    const PERMISSION_COMMAND: &str = "cargo test";
+    const ESCALATION_REASON: &str = "the user must choose";
+    const RETRY_ATTEMPT: u32 = 2;
+    const RETRY_LIMIT: u32 = 5;
+    const RETRY_DELAY_MS: u64 = 30_000;
+    const RETRY_ERROR: &str = "overloaded";
+    const PARTIAL_TEXT: &str = "partial reply";
+    const PARTIAL_THINKING: &str = "partial reasoning";
+    const ANY_KEY: char = 'y';
+    const CLAIMED: &str = "the first touch takes the card from autopilot";
+    const NOT_ANSWERED: &str = "the touch that took the card answers nothing";
+    const KEEPS_ITS_EFFECT: &str = "a key that takes a form still does what it does there";
+    const NO_NOTICE_WHILE_DECIDING: &str = "a card autopilot is deciding asks nothing of the user";
+    const DECIDING_KEEPS_FOCUS: &str = "a card autopilot is deciding takes nothing from the user";
+    const PERMISSION_DIR: &str = "/tmp";
+    const PLAN_FILE: &str = "plan.md";
+    const STATUS_SINCE: i64 = 0;
+    const NOT_HUMAN_INPUT: &str =
+        "what autopilot does in the user's place must leave the automation pause latch alone";
+    const TURN_STARTED: &str = "autopilot's turn must start";
+
+    fn autopilot_features(enabled: bool) -> FeatureFlags {
+        if enabled {
+            FeatureFlags::NONE.with(Feature::Autopilot)
+        } else {
+            FeatureFlags::NONE
+        }
+    }
+
+    fn enable(app: &mut App) {
+        app.features = autopilot_features(true);
+        app.restore_autopilot(AutopilotConfig::default());
+    }
+
+    fn autopilot_app() -> App {
+        let mut app = test_app();
+        enable(&mut app);
+        app
+    }
+
+    fn engaged_app() -> App {
+        let mut app = autopilot_app();
+        app.engage_autopilot(false);
+        app
+    }
+
+    fn command(app: &mut App, line: &str) {
+        app.run_cmdline(line, 0).unwrap();
+    }
+
+    fn stopped(by: AutopilotStopper) -> Option<AutopilotEnd> {
+        Some(AutopilotEnd::Stopped { by })
+    }
+
+    fn last_end(app: &App) -> Option<AutopilotEnd> {
+        app.state
+            .autopilot
+            .stored()
+            .and_then(|stored| stored.last_end)
+    }
+
+    fn decision(app: &App) -> AutopilotDecision {
+        AutopilotDecision {
+            seq: SEQ,
+            at_ms: app.state.autopilot.now_ms(),
+            kind: DecisionKind::Permission,
+            action: ActionName::Allow,
+            subject: DECISION_SUBJECT.into(),
+            reason: DECISION_REASON.into(),
+            agent: None,
+            tool_use_id: None,
+            history_len: 0,
+            model: None,
+            usage: None,
+            cost: None,
+        }
+    }
+
+    fn model_usage(cost: f64, purpose: LedgerPurpose) -> AgentEvent {
+        AgentEvent::ModelUsage {
+            usage: TokenUsage::default(),
+            cost: Some(cost),
+            billing: Billing::Api,
+            provider: PROVIDER.into(),
+            model: MODEL.into(),
+            purpose,
+        }
+    }
+
+    fn cancelled_run(app: &mut App) {
+        start_a_run(app);
+        app.update(agent_msg(AgentEvent::Done {
+            usage: TokenUsage::default(),
+            num_turns: 1,
+            reason: DoneReason::Cancelled,
+        }));
+    }
+
+    fn implements(actions: &[Action]) -> bool {
+        actions.iter().any(|action| {
+            matches!(action, Action::SendMessage(input)
+                if input.preamble.iter().any(|message| message.autopilot_event.is_some()))
+        })
+    }
+
+    #[test_case(false ; "experiment_off")]
+    #[test_case(true ; "experiment_on")]
+    fn the_handle_is_attached_only_with_the_experiment(enabled: bool) {
+        let mut app = test_app();
+        app.features = autopilot_features(enabled);
+
+        app.restore_autopilot(AutopilotConfig::default());
+
+        assert_eq!(app.permissions.autopilot().is_some(), enabled);
+    }
+
+    fn has_autopilot_row(app: &App, text: &str) -> bool {
+        let chat = &app.chats[0];
+        (0..chat.message_count())
+            .filter_map(|index| chat.message_at(index))
+            .any(|message| message.role == DisplayRole::Autopilot && message.text == text)
+    }
+
+    /// The last row of the main transcript, when it is autopilot's.
+    fn last_autopilot_row(app: &App) -> Option<String> {
+        let chat = &app.chats[0];
+        chat.message_at(chat.message_count().checked_sub(1)?)
+            .filter(|message| message.role == DisplayRole::Autopilot)
+            .map(|message| message.text.clone())
+    }
+
+    #[test]
+    fn bare_autopilot_engages_opens_the_panel_and_stops() {
+        let mut app = autopilot_app();
+
+        command(&mut app, AUTOPILOT);
+        assert_eq!(last_autopilot_row(&app).as_deref(), Some(ENGAGED_ROW));
+        assert!(
+            app.permissions
+                .autopilot()
+                .is_some_and(|attached| attached.is_engaged()),
+            "{SHARED_HANDLE}"
+        );
+
+        command(&mut app, AUTOPILOT);
+        assert!(app.autopilot_panel.is_open(), "{PANEL_OPENS}");
+        app.autopilot_panel.close();
+
+        command(&mut app, AUTOPILOT_OFF);
+        assert!(!app.state.autopilot.is_engaged());
+        assert_eq!(last_end(&app), stopped(AutopilotStopper::Command));
+
+        command(&mut app, AUTOPILOT_OFF);
+        assert_eq!(app.status_bar.flash_text(), Some(NOT_ENGAGED_MSG));
+    }
+
+    #[test_case(AUTOPILOT_GOAL, None, true ; "autopilot_sets_it")]
+    #[test_case(AUTOPILOT_GOAL, Some(HAND_SET_GOAL), false ; "replaced_by_hand")]
+    #[test_case(AUTOPILOT_GOAL, Some(GOAL_CLEAR), false ; "cleared_by_hand")]
+    #[test_case(AUTOPILOT, Some(HAND_SET_GOAL), false ; "set_by_hand_while_engaged")]
+    fn autopilot_owns_only_the_goal_it_set(engage: &str, by_hand: Option<&str>, owns: bool) {
+        let mut app = autopilot_app();
+
+        command(&mut app, engage);
+        if let Some(line) = by_hand {
+            command(&mut app, line);
+        }
+
+        assert!(app.state.autopilot.is_engaged());
+        assert_eq!(app.state.autopilot.owns_goal(), owns);
+    }
+
+    #[test_case(press_esc_twice_during_a_run, stopped(AutopilotStopper::Interrupt) ; "esc_esc_during_a_run")]
+    #[test_case(press_ctrl_c_during_a_run, stopped(AutopilotStopper::Interrupt) ; "ctrl_c_during_a_run")]
+    #[test_case(cancel_the_question, stopped(AutopilotStopper::QuestionCancel) ; "question_cancel")]
+    #[test_case(cancel_app, None ; "esc_esc_while_idle")]
+    #[test_case(cancelled_run, None ; "a_cancelled_run")]
+    fn only_the_users_stops_end_autopilot(stop: fn(&mut App), expected: Option<AutopilotEnd>) {
+        let mut app = engaged_app();
+
+        stop(&mut app);
+
+        assert_eq!(
+            app.state.autopilot.is_engaged(),
+            expected.is_none(),
+            "{STOP_IS_KEPT}"
+        );
+        assert_eq!(last_end(&app), expected);
+    }
+
+    #[test_case(true, LedgerPurpose::Chat, SPEND ; "a_subagent")]
+    #[test_case(true, LedgerPurpose::Autopilot, NOTHING_SPENT ; "the_delegate")]
+    #[test_case(false, LedgerPurpose::Chat, NOTHING_SPENT ; "the_main_agent")]
+    fn autopilot_counts_spend_outside_the_main_agent_and_its_delegate(
+        subagent: bool,
+        purpose: LedgerPurpose,
+        counted: f64,
+    ) {
+        let mut app = engaged_app();
+        let event = model_usage(SPEND, purpose);
+
+        app.update(if subagent {
+            subagent_msg(event, SUBAGENT_TASK, Some(SUBAGENT_NAME))
+        } else {
+            agent_msg(event)
+        });
+
+        assert_eq!(app.state.autopilot.stored().unwrap().cost_usd, counted);
+    }
+
+    #[test]
+    fn subagent_spend_past_the_cost_limit_ends_autopilot() {
+        let mut app = engaged_app();
+        app.state.autopilot.set_limits(AutopilotConfig {
+            max_cost: Some(COST_LIMIT),
+            ..AutopilotConfig::default()
+        });
+
+        app.update(subagent_msg(
+            model_usage(SPEND, LedgerPurpose::Chat),
+            SUBAGENT_TASK,
+            Some(SUBAGENT_NAME),
+        ));
+
+        assert_eq!(
+            last_end(&app),
+            Some(AutopilotEnd::Budget {
+                kind: AutopilotBudget::Cost
+            })
+        );
+    }
+
+    /// The decision's row lands after the session's, and a reload restores
+    /// both. With the experiment off the stored engagement is kept as it was.
+    #[test_case(false ; "experiment_off")]
+    #[test_case(true ; "experiment_on")]
+    fn an_engagement_and_its_decisions_survive_a_reload(enabled: bool) {
+        let (_tmp, dir, writer, mut app) = tempdir_app();
+        enable(&mut app);
+        app.state.goal.set(GOAL).unwrap();
+        app.engage_autopilot(true);
+        app.run_id = RUN_ID;
+        let decision = decision(&app);
+        app.update(agent_msg(AgentEvent::Autopilot(AutopilotEvent::Decided(
+            Box::new(decision.clone()),
+        ))));
+        let row = decision_row(
+            decision.kind.name(),
+            decision.action.name(),
+            &decision.subject,
+            &decision.reason,
+        );
+        assert_eq!(last_autopilot_row(&app), Some(row.clone()));
+        app.checkpoint_now();
+        let id = app.state.session.id;
+        drain_writer(app, writer);
+        let loaded = AppSession::load(id, &dir).unwrap();
+        let stored = loaded.meta.autopilot.clone();
+        assert!(
+            stored
+                .as_ref()
+                .is_some_and(|stored| stored.engaged && stored.owns_goal)
+        );
+
+        let mut restored = build_app(dir.clone(), Arc::new(test_writer(dir)));
+        restored.features = autopilot_features(enabled);
+        restored
+            .apply_loaded_session(loaded, &test_model())
+            .unwrap();
+
+        assert_eq!(restored.state.autopilot.is_engaged(), enabled);
+        assert_eq!(restored.goal_checkin_due(), enabled);
+        assert_eq!(has_autopilot_row(&restored, &row), enabled);
+        if !enabled {
+            restored.checkpoint_now();
+            assert_eq!(restored.state.session.meta.autopilot, stored);
+            return;
+        }
+        assert!(restored.state.autopilot.owns_goal());
+        assert_eq!(restored.state.autopilot.recent_decisions(), vec![decision]);
+        assert!(!restored.start_goal_checkin().is_empty());
+        assert_eq!(restored.state.autopilot.stored().unwrap().continuations, 1);
+        assert!(!restored.goal_checkin_due());
+    }
+
+    #[test]
+    fn a_new_session_starts_disengaged() {
+        let mut app = engaged_app();
+
+        app.reset_session();
+
+        assert!(app.state.autopilot.stored().is_none());
+        assert!(
+            app.permissions
+                .autopilot()
+                .is_some_and(|attached| attached.stored().is_none()),
+            "{SHARED_HANDLE}"
+        );
+    }
+
+    fn queue_input(app: &mut App) {
+        app.queue_and_notify(queued_msg(GOAL));
+    }
+
+    fn stop_autopilot(app: &mut App) {
+        command(app, AUTOPILOT_OFF);
+    }
+
+    /// The implement turn is autopilot's, so its text is an observation and
+    /// the turn counts as one of its continuations.
+    #[test]
+    fn autopilot_implements_the_plan_it_chose_once_the_run_ends() {
+        let mut app = plan_app();
+        enable(&mut app);
+        app.engage_autopilot(false);
+
+        app.update(agent_msg(AgentEvent::Autopilot(
+            AutopilotEvent::ImplementPlan { seq: SEQ },
+        )));
+        let actions = app.update(done_event());
+
+        let input = sent_input(&actions);
+        assert!(input.message.is_empty());
+        assert_eq!(input.mode, AgentMode::Build);
+        assert_eq!(
+            input
+                .preamble
+                .last()
+                .and_then(|message| message.autopilot_event.clone()),
+            Some(AutopilotOrigin {
+                seq: SEQ,
+                kind: AutopilotMessageKind::Implement,
+            })
+        );
+        assert_eq!(app.state.mode, Mode::Build);
+        assert_eq!(app.state.autopilot.stored().unwrap().continuations, 1);
+    }
+
+    /// A stop, or input the user queued while the run went on, leaves the
+    /// plan to the user.
+    #[test_case(stop_autopilot, false ; "stopped_first")]
+    #[test_case(queue_input, true ; "input_queued")]
+    fn the_user_gets_the_plan_back(before_the_end: fn(&mut App), left_to_you: bool) {
+        let mut app = plan_app();
+        enable(&mut app);
+        app.engage_autopilot(false);
+        app.update(agent_msg(AgentEvent::Autopilot(
+            AutopilotEvent::ImplementPlan { seq: SEQ },
+        )));
+
+        before_the_end(&mut app);
+        let actions = app.update(done_event());
+
+        assert!(!implements(&actions));
+        assert!(app.state.plan.is_ready());
+        assert_eq!(
+            app.status_bar.flash_text() == Some(PLAN_LEFT_TO_YOU),
+            left_to_you
+        );
+    }
+
+    fn noted_request(note: Option<AutopilotNote>) -> Box<PermissionRequest> {
+        let mut request = PermissionRequest::from_legacy(
+            PERMISSION_ID.into(),
+            ToolKey::native(PERMISSION_TOOL),
+            vec![PERMISSION_COMMAND.into()],
+            serde_json::json!({ "command": PERMISSION_COMMAND }),
+            Path::new(PERMISSION_DIR),
+            true,
+        );
+        request.presentation.autopilot = note;
+        Box::new(request)
+    }
+
+    fn escalation() -> AutopilotNote {
+        AutopilotNote::Escalated {
+            reason: ESCALATION_REASON.into(),
+        }
+    }
+
+    fn autopilot_event(app: &mut App, event: AutopilotEvent) {
+        app.update(agent_msg(AgentEvent::Autopilot(event)));
+    }
+
+    fn decide(app: &mut App, kind: DecisionKind, action: ActionName) {
+        let decided = AutopilotDecision {
+            kind,
+            action,
+            reason: ESCALATION_REASON.into(),
+            ..decision(app)
+        };
+        autopilot_event(app, AutopilotEvent::Decided(Box::new(decided)));
+    }
+
+    fn deciding(app: &mut App, kind: DecisionKind) {
+        autopilot_event(
+            app,
+            AutopilotEvent::Deciding {
+                seq: SEQ,
+                kind,
+                subject: DECISION_SUBJECT.into(),
+            },
+        );
+    }
+
+    fn running_app() -> App {
+        let mut app = engaged_app();
+        start_a_run(&mut app);
+        app
+    }
+
+    fn deciding_permission(app: &mut App) {
+        app.update(agent_msg(AgentEvent::PermissionRequest(noted_request(
+            Some(AutopilotNote::Deciding),
+        ))));
+    }
+
+    fn escalated_permission(app: &mut App) {
+        app.update(agent_msg(AgentEvent::PermissionRequest(noted_request(
+            Some(escalation()),
+        ))));
+    }
+
+    fn deciding_question(app: &mut App) {
+        open_question(app);
+        deciding(app, DecisionKind::Question);
+    }
+
+    fn escalated_question(app: &mut App) {
+        deciding_question(app);
+        decide(app, DecisionKind::Question, ActionName::Escalate);
+    }
+
+    fn deciding_plan(app: &mut App) {
+        app.state.mode = Mode::Plan;
+        app.state.plan = PlanState::Ready(PathBuf::from(PLAN_FILE));
+        app.plan_form.on_plan_ready();
+        deciding(app, DecisionKind::Plan);
+    }
+
+    fn escalated_plan(app: &mut App) {
+        deciding_plan(app);
+        decide(app, DecisionKind::Plan, ActionName::Escalate);
+    }
+
+    #[test]
+    fn a_retry_drops_the_streamed_text_and_waits_in_the_retry_chip() {
+        let mut app = running_app();
+        let (cmd_tx, cmd_rx) = flume::unbounded();
+        app.cmd_tx = Some(cmd_tx);
+        app.update(agent_msg(AgentEvent::TextDelta {
+            text: PARTIAL_TEXT.into(),
+        }));
+        app.update(agent_msg(AgentEvent::ThinkingDelta {
+            text: PARTIAL_THINKING.into(),
+        }));
+
+        autopilot_event(
+            &mut app,
+            AutopilotEvent::Retrying {
+                attempt: RETRY_ATTEMPT,
+                limit: RETRY_LIMIT,
+                delay_ms: RETRY_DELAY_MS,
+                error: RETRY_ERROR.into(),
+            },
+        );
+
+        let chat = &app.chats[0];
+        assert!(chat.retry().is_some());
+        assert!(chat.streaming_text_is_empty());
+        assert!(chat.streaming_thinking_is_empty());
+        assert!(last_autopilot_row(&app).is_some_and(|row| row.ends_with(RETRY_ERROR)));
+        assert!(click_status(&mut app, StatusBarHitTarget::Retry).is_empty());
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(crate::agent::AgentCommand::RetryNow)
+        ));
+    }
+
+    #[test]
+    fn the_chip_opens_the_panel_and_its_keys_stop_and_pick_the_model() {
+        let mut app = engaged_app();
+
+        assert!(click_status(&mut app, StatusBarHitTarget::Autopilot).is_empty());
+        assert!(app.autopilot_panel.is_open());
+        app.update(Msg::Key(key(KeyCode::Char(MODEL_KEY))));
+        assert!(!app.autopilot_panel.is_open());
+        assert!(app.model_picker.is_open());
+        app.model_picker.close();
+
+        command(&mut app, AUTOPILOT);
+        app.update(Msg::Key(key(KeyCode::Char(STOP_KEY))));
+
+        assert!(!app.autopilot_panel.is_open());
+        assert_eq!(last_end(&app), stopped(AutopilotStopper::Command));
+        assert_eq!(
+            last_autopilot_row(&app),
+            Some(format!(
+                "{ENDED_ROW}: {}",
+                end_reason(&AutopilotEnd::Stopped {
+                    by: AutopilotStopper::Command
+                })
+            ))
+        );
+    }
+
+    /// The engagement's end is announced, for a user who looked away.
+    #[test]
+    fn an_end_raises_a_notice() {
+        let mut app = engaged_app();
+
+        command(&mut app, AUTOPILOT_OFF);
+
+        let notice = app.take_autopilot_notice();
+        assert_eq!(
+            notice,
+            Some(Notification::AutopilotEnded { reason: STOPPED })
+        );
+        assert!(!notice.unwrap().is_urgent());
+    }
+
+    /// A notice can reach the system's notification history, so an error's
+    /// message stays in the transcript row.
+    #[test]
+    fn an_error_end_keeps_its_message_out_of_the_notice() {
+        let mut app = engaged_app();
+        app.run_id = RUN_ID;
+        let end = AutopilotEnd::Error {
+            message: RETRY_ERROR.into(),
+        };
+
+        autopilot_event(&mut app, AutopilotEvent::Ended { reason: end });
+
+        let notice = app.take_autopilot_notice().unwrap();
+        assert_eq!(notice, Notification::AutopilotEnded { reason: ERROR_END });
+        assert!(!notice.message().contains(RETRY_ERROR));
+        assert_eq!(
+            last_autopilot_row(&app),
+            Some(format!("{ENDED_ROW}: {RETRY_ERROR}"))
+        );
+    }
+
+    #[test_case(false ; "experiment_off")]
+    #[test_case(true ; "disengaged")]
+    fn there_is_no_chip_without_an_engagement(enabled: bool) {
+        let mut app = test_app();
+        app.features = autopilot_features(enabled);
+        app.engage_autopilot(false);
+        if enabled {
+            command(&mut app, AUTOPILOT_OFF);
+        }
+
+        assert_eq!(app.autopilot_chip(), None);
+    }
+
+    #[test_case(false ; "engaged")]
+    #[test_case(true ; "escalated")]
+    fn the_chip_counts_continuations_and_says_when_autopilot_waits(escalated: bool) {
+        let mut app = running_app();
+        if escalated {
+            escalated_permission(&mut app);
+        }
+
+        let chip = app.autopilot_chip().unwrap();
+
+        assert_eq!(chip.used, 0);
+        assert_eq!(chip.limit, AutopilotConfig::default().max_continuations);
+        assert_eq!(chip.escalated, escalated);
+        let state = if escalated {
+            WAITING_STATE
+        } else {
+            ENGAGED_STATE
+        };
+        assert!(chip.summary.starts_with(state), "{}", chip.summary);
+    }
+
+    #[test_case(deciding_permission, None ; "permission_while_deciding")]
+    #[test_case(escalated_permission, Some((DecisionKind::Permission, ProgramBlockKind::Permission)) ; "permission_once_escalated")]
+    #[test_case(deciding_question, None ; "question_while_deciding")]
+    #[test_case(escalated_question, Some((DecisionKind::Question, ProgramBlockKind::Question)) ; "question_once_escalated")]
+    #[test_case(deciding_plan, None ; "plan_while_deciding")]
+    #[test_case(escalated_plan, Some((DecisionKind::Plan, ProgramBlockKind::Question)) ; "plan_once_escalated")]
+    fn a_card_waits_on_the_user_only_once_autopilot_left_it(
+        card: fn(&mut App),
+        wait: Option<(DecisionKind, ProgramBlockKind)>,
+    ) {
+        let mut app = running_app();
+
+        card(&mut app);
+
+        let Some((kind, block)) = wait else {
+            assert_eq!(app.attention(), None, "{NO_NOTICE_WHILE_DECIDING}");
+            assert!(!app.awaiting_input(), "{NO_NOTICE_WHILE_DECIDING}");
+            assert_eq!(app.lifecycle_blocker(), None, "{NO_NOTICE_WHILE_DECIDING}");
+            assert_eq!(app.program_status(), ProgramStatus::Working);
+            return;
+        };
+        let notice = Notification::AutopilotNeedsYou { wait: kind };
+        assert!(notice.is_urgent());
+        assert!(!notice.message().contains(ESCALATION_REASON));
+        assert_eq!(
+            app.lifecycle_blocker().as_deref(),
+            Some(notice.message().as_str())
+        );
+        assert_eq!(app.attention(), Some(notice));
+        assert_eq!(app.program_status(), ProgramStatus::Blocked(Some(block)));
+    }
+
+    /// A card autopilot is deciding leaves the modal the user is in alone and
+    /// lets it keep its keys. Once left to the user, it takes the screen.
+    #[test]
+    fn a_deciding_card_waits_behind_a_modal_until_it_is_left_to_the_user() {
+        let mut app = running_app();
+        app.tools_modal.open();
+
+        deciding_permission(&mut app);
+        assert!(app.tools_modal.is_open(), "{DECIDING_KEEPS_FOCUS}");
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert!(!app.tools_modal.is_open(), "{DECIDING_KEEPS_FOCUS}");
+        assert_eq!(
+            app.permission_prompt.autopilot_note(),
+            Some(&AutopilotNote::Deciding),
+            "{DECIDING_KEEPS_FOCUS}"
+        );
+
+        app.tools_modal.open();
+        app.update(agent_msg(AgentEvent::PermissionRequestUpdated(
+            noted_request(Some(escalation())),
+        )));
+
+        assert!(!app.tools_modal.is_open());
+    }
+
+    #[test]
+    fn the_first_key_on_a_deciding_card_takes_it_and_answers_nothing() {
+        let mut app = running_app();
+        deciding_permission(&mut app);
+        let _ = rendered(&mut app);
+
+        app.update(Msg::Key(key(KeyCode::Char(ANY_KEY))));
+
+        assert_eq!(app.permission_prompt.autopilot_note(), None, "{CLAIMED}");
+        assert_eq!(
+            app.permission_prompt.request_id(),
+            Some(PERMISSION_ID),
+            "{NOT_ANSWERED}"
+        );
+    }
+
+    #[test]
+    fn a_card_autopilot_answered_goes_away() {
+        let mut app = running_app();
+        deciding_permission(&mut app);
+
+        app.update(agent_msg(AgentEvent::PermissionRequestResolved {
+            request_id: PERMISSION_ID.into(),
+            source_request_id: PERMISSION_ID.into(),
+            by: Some(Answerer::Autopilot),
+        }));
+
+        assert!(!app.permission_prompt.is_open());
+    }
+
+    #[test_case(key(KeyCode::Down), false ; "a_key")]
+    #[test_case(kb::QUESTION_ASK_BTW.to_key_event(), true ; "f2")]
+    fn the_first_key_takes_the_question_form_from_autopilot(pressed: KeyEvent, asks_btw: bool) {
+        let mut app = running_app();
+        app.btw_prompt = btw_ready_app().btw_prompt;
+        deciding_question(&mut app);
+        let _ = rendered(&mut app);
+
+        app.update(Msg::Key(pressed));
+        decide(&mut app, DecisionKind::Question, ActionName::Answer);
+
+        assert!(app.state.autopilot.question_claimed(), "{CLAIMED}");
+        assert_eq!(app.question_form.autopilot_note(), None, "{CLAIMED}");
+        assert!(app.question_form.is_open(), "{CLAIMED}");
+        assert_eq!(app.stream_modal.is_open(), asks_btw, "{KEEPS_ITS_EFFECT}");
+    }
+
+    #[test]
+    fn the_delegates_answer_closes_the_question_form() {
+        let mut app = running_app();
+        deciding_question(&mut app);
+
+        decide(&mut app, DecisionKind::Question, ActionName::Answer);
+
+        assert!(!app.question_form.is_open());
+    }
+
+    #[test]
+    fn the_first_key_takes_the_plan_card_from_autopilot() {
+        let mut app = running_app();
+        deciding_plan(&mut app);
+
+        app.update(Msg::Key(key(KeyCode::Down)));
+
+        assert!(app.state.autopilot.plan_claimed(), "{CLAIMED}");
+        assert_eq!(app.plan_form.autopilot_note(), None, "{CLAIMED}");
+    }
+
+    /// The plan card takes the first Esc to hide itself, which still counts
+    /// toward Esc Esc while autopilot runs.
+    #[test]
+    fn esc_esc_over_the_plan_card_stops_autopilot() {
+        let mut app = running_app();
+        deciding_plan(&mut app);
+
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        app.update(Msg::Key(key(KeyCode::Esc)));
+
+        assert_eq!(last_end(&app), stopped(AutopilotStopper::Interrupt));
+    }
+
+    /// A decision the run's end cut off is never made.
+    #[test]
+    fn a_run_end_clears_what_autopilot_was_deciding() {
+        let mut app = running_app();
+        deciding_plan(&mut app);
+
+        app.update(done_event());
+
+        assert_eq!(app.plan_form.autopilot_note(), None);
+    }
+
+    fn engaged_owning_its_goal(app: &mut App) {
+        enable(app);
+        command(app, AUTOPILOT_GOAL);
+    }
+
+    fn escalated_while_running(app: &mut App) {
+        enable(app);
+        app.engage_autopilot(false);
+        start_a_run(app);
+        escalated_permission(app);
+    }
+
+    fn view(owns_goal: bool, waiting: bool) -> Option<AutopilotView> {
+        Some(AutopilotView { owns_goal, waiting })
+    }
+
+    #[test_case(|app| { app.features = autopilot_features(false); app.engage_autopilot(false); }, None ; "experiment_off")]
+    #[test_case(enable, None ; "disengaged")]
+    #[test_case(|app| { enable(app); app.engage_autopilot(false); }, view(false, false) ; "engaged")]
+    #[test_case(engaged_owning_its_goal, view(true, false) ; "engaged_on_its_own_goal")]
+    #[test_case(escalated_while_running, view(false, true) ; "waiting_on_the_user")]
+    fn scripts_see_autopilot_only_while_it_is_engaged(
+        setup: fn(&mut App),
+        expected: Option<AutopilotView>,
+    ) {
+        let mut app = test_app();
+
+        setup(&mut app);
+
+        assert_eq!(
+            app.automation_facts(false, None, STATUS_SINCE).autopilot,
+            expected
+        );
+    }
+
+    #[test_case(deciding_permission, None, SessionStatus::Working ; "permission_while_deciding")]
+    #[test_case(escalated_permission, Some(PERMISSION_TOOL), SessionStatus::NeedsInput ; "permission_once_escalated")]
+    #[test_case(deciding_question, None, SessionStatus::Working ; "question_while_deciding")]
+    #[test_case(escalated_question, None, SessionStatus::NeedsInput ; "question_once_escalated")]
+    fn automations_see_a_card_wait_only_once_autopilot_left_it(
+        card: fn(&mut App),
+        tool: Option<&str>,
+        status: SessionStatus,
+    ) {
+        let mut app = running_app();
+
+        card(&mut app);
+
+        let escalated = status == SessionStatus::NeedsInput;
+        let expected = escalated.then(|| InputWait {
+            input: InputKind::Autopilot,
+            tool: tool.map(str::to_owned),
+        });
+        assert_eq!(app.input_wait(false), expected);
+        assert_eq!(app.awaiting_input(), escalated);
+        let facts = app.automation_facts(false, None, STATUS_SINCE);
+        assert_eq!(facts.status, status);
+        assert_eq!(facts.autopilot, view(false, escalated));
+    }
+
+    /// The run's end cuts a plan decision off, which leaves the card to the user as a plan; an
+    /// escalation stays autopilot's.
+    #[test_case(deciding_plan, InputKind::Plan ; "cut_off_while_deciding")]
+    #[test_case(escalated_plan, InputKind::Autopilot ; "escalated")]
+    fn a_plan_card_waits_once_the_run_ends(card: fn(&mut App), input: InputKind) {
+        let mut app = running_app();
+        card(&mut app);
+
+        app.update(done_event());
+
+        assert_eq!(app.input_wait(false), Some(InputWait { input, tool: None }));
+        assert_eq!(
+            app.automation_facts(false, None, STATUS_SINCE).status,
+            SessionStatus::Idle
+        );
+    }
+
+    fn escalated_permission_over_a_question(app: &mut App) {
+        escalated_question(app);
+        escalated_permission(app);
+    }
+
+    #[test_case(open_question, Some(InputKind::Question) ; "a_question")]
+    #[test_case(deciding_question, None ; "not_while_autopilot_decides")]
+    #[test_case(escalated_question, Some(InputKind::Autopilot) ; "once_autopilot_left_it")]
+    #[test_case(escalated_permission_over_a_question, None ; "not_a_prompt_waiting_ahead_of_it")]
+    fn working_through_a_question_renews_only_its_own_wait(
+        card: fn(&mut App),
+        renewed: Option<InputKind>,
+    ) {
+        let mut app = running_app();
+        let linked = LinkedAutomations::idle(&mut app);
+        card(&mut app);
+
+        app.observe_automations(false, None, Vec::new());
+
+        assert_eq!(app.question_wait().map(|wait| wait.input), renewed);
+        linked.stop();
+    }
+
+    fn the_delegate_answers_a_permission(app: &mut App) {
+        deciding_permission(app);
+        app.update(agent_msg(AgentEvent::PermissionRequestResolved {
+            request_id: PERMISSION_ID.into(),
+            source_request_id: PERMISSION_ID.into(),
+            by: Some(Answerer::Autopilot),
+        }));
+    }
+
+    fn the_delegate_answers_a_question(app: &mut App) {
+        deciding_question(app);
+        decide(app, DecisionKind::Question, ActionName::Answer);
+    }
+
+    fn autopilot_implements_the_plan(app: &mut App) {
+        autopilot_event(app, AutopilotEvent::ImplementPlan { seq: SEQ });
+        let actions = app.update(done_event());
+        assert!(implements(&actions), "{TURN_STARTED}");
+    }
+
+    fn autopilot_checks_in_on_resume(app: &mut App) {
+        app.update(done_event());
+        app.state.goal.set(GOAL).unwrap();
+        app.autopilot_checkin_due = true;
+        assert!(!app.start_goal_checkin().is_empty(), "{TURN_STARTED}");
+    }
+
+    #[test_case(the_delegate_answers_a_permission ; "a_permission_answer")]
+    #[test_case(the_delegate_answers_a_question ; "a_question_answer")]
+    #[test_case(autopilot_implements_the_plan ; "the_implement_turn")]
+    #[test_case(autopilot_checks_in_on_resume ; "the_resume_check_in")]
+    fn what_autopilot_does_for_the_user_is_no_human_input(act: fn(&mut App)) {
+        let mut app = plan_app();
+        enable(&mut app);
+        app.engage_autopilot(false);
+        let linked = LinkedAutomations::idle(&mut app);
+        app.pause_automations();
+
+        act(&mut app);
+
+        let pause = linked.state().session.controls.pause.clone();
+        assert_eq!(
+            pause.map(|latch| latch.source),
+            Some(PauseSource::User),
+            "{NOT_HUMAN_INPUT}"
+        );
+        linked.stop();
     }
 }

@@ -10,6 +10,7 @@ let ask = switch event.input {
     "permission" => "approve " + event.tool,
     "plan" => "review a plan",
     "auth" => "sign in again",
+    "autopilot" => "take over from autopilot",
     _ => "answer a " + event.input,
 };
 http(#{

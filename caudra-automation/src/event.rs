@@ -65,6 +65,8 @@ pub struct SessionView {
     /// Unix seconds.
     pub status_since: i64,
     pub goal: Option<GoalView>,
+    /// Absent while autopilot is off or not engaged.
+    pub autopilot: Option<AutopilotView>,
     /// USD.
     pub cost: Option<f64>,
     pub groups: Vec<String>,
@@ -75,6 +77,15 @@ pub struct SessionView {
 pub struct GoalView {
     pub condition: String,
     pub evaluations: u32,
+}
+
+/// An engaged autopilot. Scripts can see it and never engage it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutopilotView {
+    /// Whether the active goal is the one autopilot set.
+    pub owns_goal: bool,
+    /// Whether an item autopilot left to the user waits.
+    pub waiting: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +155,8 @@ pub enum StartedBy {
     Workflow,
     Goal,
     Mailbox,
+    /// Autopilot's implement turn, or its check-in on a resumed session.
+    Autopilot,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -166,6 +179,9 @@ pub struct GoalFinishedDetail {
     pub duration_s: u64,
     /// USD.
     pub cost: Option<f64>,
+    /// Whether the goal was the one autopilot set. Events stored before it existed read false.
+    #[serde(default)]
+    pub autopilot: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -263,6 +279,8 @@ pub enum InputKind {
     Auth,
     Plugin,
     Messages,
+    /// A permission prompt, a question or a plan autopilot left to the user.
+    Autopilot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -471,6 +489,8 @@ mod tests {
     const MUST_SERIALIZE: &str = "a value serializes";
     const NOT_A_MAP: &str = "expected a map";
     const NOT_TEXT: &str = "expected untrusted text";
+    const NOT_GOAL_FINISHED: &str = "expected a goal_finished event";
+    const AUTOPILOT_FIELD: &str = "autopilot";
 
     fn session() -> SessionView {
         SessionView {
@@ -484,6 +504,7 @@ mod tests {
                 condition: CONDITION.to_owned(),
                 evaluations: COUNT,
             }),
+            autopilot: Some(engaged_autopilot()),
             cost: Some(COST),
             groups: vec![GROUP.to_owned()],
             work: WorkView {
@@ -499,6 +520,13 @@ mod tests {
                     pause_reason: PauseReason::CompletionRequired,
                 }],
             },
+        }
+    }
+
+    fn engaged_autopilot() -> AutopilotView {
+        AutopilotView {
+            owns_goal: true,
+            waiting: false,
         }
     }
 
@@ -564,6 +592,7 @@ mod tests {
             evaluations: COUNT,
             duration_s: SECONDS,
             cost: None,
+            autopilot: true,
         })
     }
 
@@ -642,6 +671,7 @@ mod tests {
                 "status": "needs_input",
                 "status_since": AT,
                 "goal": {"condition": CONDITION, "evaluations": COUNT},
+                "autopilot": {"owns_goal": true, "waiting": false},
                 "cost": COST,
                 "groups": [GROUP],
                 "work": {
@@ -693,6 +723,7 @@ mod tests {
         "evaluations": COUNT,
         "duration_s": SECONDS,
         "cost": null,
+        "autopilot": true,
     }); "goal_finished")]
     #[test_case(message_received_detail() => json!({
         "trigger": "message_received",
@@ -776,8 +807,56 @@ mod tests {
     #[test_case(StartedBy::Workflow => json!({"kind": "workflow"}); "workflow")]
     #[test_case(StartedBy::Goal => json!({"kind": "goal"}); "goal")]
     #[test_case(StartedBy::Mailbox => json!({"kind": "mailbox"}); "mailbox")]
+    #[test_case(StartedBy::Autopilot => json!({"kind": "autopilot"}); "autopilot")]
     fn started_by_uses_the_plan_names(started_by: StartedBy) -> Value {
         serde_json::to_value(started_by).expect(MUST_SERIALIZE)
+    }
+
+    #[test_case(InputKind::Messages => json!("messages"); "messages")]
+    #[test_case(InputKind::Autopilot => json!("autopilot"); "autopilot")]
+    fn input_kinds_use_the_plan_names(input: InputKind) -> Value {
+        serde_json::to_value(input).expect(MUST_SERIALIZE)
+    }
+
+    #[test_case(None; "off_or_not_engaged")]
+    #[test_case(Some(engaged_autopilot()); "engaged")]
+    fn script_view_shows_autopilot_only_while_engaged(autopilot: Option<AutopilotView>) {
+        let mut shown = event(armed_detail());
+        shown.session.autopilot = autopilot.clone();
+        let view = shown
+            .to_dynamic()
+            .expect(MUST_CONVERT)
+            .try_cast::<ScriptMap>()
+            .expect(NOT_A_MAP);
+        let session = view["session"].read_lock::<ScriptMap>().expect(NOT_A_MAP);
+        let Some(autopilot) = autopilot else {
+            assert!(session[AUTOPILOT_FIELD].is_unit());
+            return;
+        };
+        let seen = session[AUTOPILOT_FIELD]
+            .read_lock::<ScriptMap>()
+            .expect(NOT_A_MAP);
+        assert_eq!(seen["owns_goal"].as_bool(), Ok(autopilot.owns_goal));
+        assert_eq!(seen["waiting"].as_bool(), Ok(autopilot.waiting));
+    }
+
+    #[test]
+    fn events_stored_before_autopilot_read_it_as_absent() {
+        let mut stored = event(goal_finished_detail()).to_tagged();
+        let fields = stored.as_object_mut().expect(NOT_A_MAP);
+        fields.shift_remove(AUTOPILOT_FIELD);
+        fields["session"]
+            .as_object_mut()
+            .expect(NOT_A_MAP)
+            .shift_remove(AUTOPILOT_FIELD);
+
+        let parsed = serde_json::from_value::<Event>(stored).expect(MUST_PARSE);
+
+        assert_eq!(parsed.session.autopilot, None);
+        let EventDetail::GoalFinished(goal) = parsed.detail else {
+            panic!("{NOT_GOAL_FINISHED}");
+        };
+        assert!(!goal.autopilot);
     }
 
     #[test_case(armed_detail(); "armed")]

@@ -101,6 +101,8 @@ pub const DROPPED_BY_HUMAN: &str = "dropped from the inspector";
 pub const OUTBOX_FULL: &str = "the outbox was full";
 pub const GOAL_ACTIVE: &str =
     "a goal is active or already queued; pass replace: true to replace it";
+pub const GOAL_OWNED_BY_AUTOPILOT: &str =
+    "autopilot owns the active goal, which an automation cannot replace";
 pub const CHANGED_SINCE_ARMED: &str =
     "the file changed after it was armed; arm it again to run the new version";
 pub const PAUSED_BY_USER: &str = "paused by the user";
@@ -2286,8 +2288,9 @@ impl Manager {
         .detach();
     }
 
-    /// Queues a `message` or `set_goal` item. `set_goal` fails with `goal_active` while a goal
-    /// is active or queued, unless it replaces it, and answers the condition the item holds.
+    /// Queues a `message` or `set_goal` item. `set_goal` fails with `goal_owned_by_autopilot`
+    /// while autopilot owns the active goal, and with `goal_active` while a goal is active or
+    /// queued unless it replaces it. It answers the condition the item holds.
     async fn queue_delivery(
         &mut self,
         name: &str,
@@ -2298,20 +2301,31 @@ impl Manager {
         expires_at: Option<i64>,
     ) -> HostResult<ActionReply> {
         let goal_pending = self.shared.outbox.lock().await.goal_pending();
-        if let ActionRequest::SetGoal(goal) = request
-            && !goal.replace
-            && (self.facts.goal.is_some() || goal_pending)
-        {
+        let autopilot_owns_goal = self.facts.goal.is_some()
+            && self
+                .facts
+                .autopilot
+                .as_ref()
+                .is_some_and(|autopilot| autopilot.owns_goal);
+        let refusal = match request {
+            ActionRequest::SetGoal(_) if autopilot_owns_goal => {
+                Some((FailureKind::GoalOwnedByAutopilot, GOAL_OWNED_BY_AUTOPILOT))
+            }
+            ActionRequest::SetGoal(goal)
+                if !goal.replace && (self.facts.goal.is_some() || goal_pending) =>
+            {
+                Some((FailureKind::GoalActive, GOAL_ACTIVE))
+            }
+            _ => None,
+        };
+        if let Some((kind, message)) = refusal {
             self.end_action(
                 fire_id,
                 seq,
-                action_end(ActionStatus::Failed, Some(GOAL_ACTIVE.to_owned())),
+                action_end(ActionStatus::Failed, Some(message.to_owned())),
             )
             .await;
-            return Err(HostError::Failure(Failure::new(
-                FailureKind::GoalActive,
-                GOAL_ACTIVE,
-            )));
+            return Err(HostError::Failure(Failure::new(kind, message)));
         }
         let now = self.shared.clock.now_ms();
         let Some(pending) = Pending::from_journal(name, fire_id, seq, journal, now, expires_at)
@@ -3278,7 +3292,8 @@ mod tests {
     use caudra_automation::catalog::Scope;
     use caudra_automation::engine::{DEFAULT_MAX_DELIVERIES, FiringError};
     use caudra_automation::event::{
-        GoalFinishedDetail, GoalVerdict, SessionStatus, StartedBy, TurnOutcome, WorkView,
+        AutopilotView, GoalFinishedDetail, GoalVerdict, GoalView, SessionStatus, StartedBy,
+        TurnOutcome, WorkView,
     };
     use caudra_automation::host::{
         ActionKind, HttpMethod, MAX_REQUEST_BODY_BYTES, MAX_RESPONSE_BYTES, MessageRequest,
@@ -4070,10 +4085,26 @@ state.seen = seen;"#;
             status: SessionStatus::Idle,
             status_since: START_MS / MILLIS_PER_SECOND,
             goal: None,
+            autopilot: None,
             cost: None,
             groups: Vec::new(),
             work: WorkView::default(),
         }
+    }
+
+    /// The session pursuing `GOAL`, which autopilot set when `autopilot_owns_goal`.
+    fn pursuing(autopilot_owns_goal: bool) -> SessionSignal {
+        SessionSignal::Facts(Box::new(SessionView {
+            goal: Some(GoalView {
+                condition: GOAL.into(),
+                evaluations: 0,
+            }),
+            autopilot: Some(AutopilotView {
+                owns_goal: autopilot_owns_goal,
+                waiting: false,
+            }),
+            ..facts()
+        }))
     }
 
     fn settled() -> SessionSignal {
@@ -4107,6 +4138,7 @@ state.seen = seen;"#;
             evaluations: 1,
             duration_s: 1,
             cost: None,
+            autopilot: false,
         }))
     }
 
@@ -4737,6 +4769,31 @@ state.seen = seen;"#
                     .and_then(|claim| claim.goal)
                     .map(|goal| goal.condition),
                 Some(GOAL.to_owned())
+            );
+            live.stop().await;
+        });
+    }
+
+    #[test_case(false, true, FailureKind::GoalOwnedByAutopilot.as_str(); "owned_kept_without_replace")]
+    #[test_case(true, true, FailureKind::GoalOwnedByAutopilot.as_str(); "owned_kept_even_when_replacing")]
+    #[test_case(true, false, GOAL; "a_goal_autopilot_does_not_own_is_replaced")]
+    fn set_goal_never_replaces_a_goal_autopilot_owns(
+        replace: bool,
+        autopilot_owns_goal: bool,
+        expected: &str,
+    ) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.script(GOALS, &[IDLE], &[], &goal_body(replace));
+            let live = fixture.spawn(&[GOALS]).await;
+
+            live.signal(pursuing(autopilot_owns_goal));
+            live.signal(settled());
+            live.firing(GOALS, FiringStatus::Completed).await;
+
+            assert_eq!(
+                live.state_of(GOALS).await.value,
+                seen(&[expected.to_owned()])
             );
             live.stop().await;
         });

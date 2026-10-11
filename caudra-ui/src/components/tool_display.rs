@@ -272,6 +272,7 @@ pub const TOOL_BODY_INDENT: &str = "  ";
 const INDICATOR_PAD: &str = "  ";
 const TOOL_BODY_INDENT_WIDTH: u16 = TOOL_BODY_INDENT.len() as u16;
 pub(crate) const NOTICE_PREFIX: &str = "· ";
+pub(crate) const AUTOPILOT_PREFIX: &str = "autopilot \u{203a} ";
 pub(crate) const SPINNER_STYLE_NAME: &str = "spinner";
 pub(crate) const SPINNER_STYLE_PREFIX: &str = "spinner:";
 
@@ -1217,6 +1218,18 @@ pub fn notice_style() -> RoleStyle {
         text_style: theme::current().status_dim.add_modifier(Modifier::ITALIC),
         prefix_style: theme::current().status_dim,
         use_markdown: false,
+        max_line_bytes: None,
+    }
+}
+
+/// A notice's quiet text under a prefix that says who acted, read as prose
+/// because a reply autopilot wrote is one.
+pub fn autopilot_style() -> RoleStyle {
+    RoleStyle {
+        prefix: AUTOPILOT_PREFIX,
+        text_style: theme::current().status_dim,
+        prefix_style: theme::current().status_notice,
+        use_markdown: true,
         max_line_bytes: None,
     }
 }

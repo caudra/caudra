@@ -89,6 +89,10 @@ version = 1
 # Type: bool.
 # automations = false
 
+# Turn on Autopilot runs.
+# Type: bool.
+# autopilot = false
+
 [ui]
 
 # Show splash animation on startup.
@@ -1092,6 +1096,28 @@ version = 1
 # it, automations reach public hosts only.
 # Type: bool.
 # allow_private_network = false
+
+[autopilot]
+# Limits for autopilot, which needs `autopilot = true` under [experimental].
+# Only the global caudra.toml may hold this table.
+
+# Most continuations autopilot may send per engagement before it ends.
+# Type: u32, 1 to 10000.
+# max_continuations = 100
+
+# Most spending in USD per autopilot engagement, counting API-billed spend
+# only. Must be positive, and unset means no cap.
+# Type: f64. Default: unset.
+# max_cost = <f64>
+
+# Most wall-clock minutes per autopilot engagement while the session is open.
+# Unset means no cap.
+# Type: u32, 1 to 525600. Default: unset.
+# max_minutes = <u32>
+
+# Retries for transient provider errors during an autopilot engagement.
+# Type: u32, 0 to 20.
+# error_retries = 5
 
 [plugins]
 # Bundled tools are on by default. Turn one off with `enabled = false` in its

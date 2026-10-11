@@ -448,6 +448,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         features: &[],
     },
     BuiltinCommand {
+        name: "/autopilot",
+        description: "Keep the session moving: answer prompts, questions, and plans for you (off, model)",
+        max_args: usize::MAX,
+        scope: ChatScope::MainOnly,
+        features: &[Feature::Autopilot],
+    },
+    BuiltinCommand {
         name: "/auto",
         description: "Toggle Auto permissions (skip unmatched prompts, keep safeguards)",
         max_args: 0,
@@ -1304,6 +1311,7 @@ mod tests {
     #[test_case("/groups", Feature::CrossSessionMessaging; "groups")]
     #[test_case("/deep-research", Feature::Workflows; "workflow_shortcut")]
     #[test_case("/automations", Feature::Automations; "automations")]
+    #[test_case("/autopilot", Feature::Autopilot; "autopilot")]
     #[test_case("/sandbox", Feature::Sandboxes; "sandbox")]
     #[test_case("/decisions", Feature::DecisionEngine; "decisions")]
     #[test_case("/auto", Feature::DecisionEngine; "auto")]

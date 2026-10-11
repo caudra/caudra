@@ -38,7 +38,8 @@ const NO_REFERENCE: &str = "this file has no reference";
 const AUTOMATION_FLAG: &str = "--automation";
 const AUTOMATION_ARGS_SEPARATOR: char = '=';
 const AUTOMATION_ARGS_FILE: char = '@';
-const AUTOMATION_ACP_CONFLICT: &str = "cannot be used with acp";
+const ACP_CONFLICT: &str = "cannot be used with acp";
+const AUTOPILOT_FLAG: &str = "--autopilot";
 const AUTOMATION_REPEATED: &str = "is given more than once";
 const AUTOMATION_NAME: &str = "automation name";
 const AUTOMATION_ARGS_UNREADABLE: &str = "cannot read the args file";
@@ -204,6 +205,10 @@ pub struct Cli {
     )]
     pub automations: Vec<ProfileArming>,
 
+    /// Engage autopilot in the initial session, which answers prompts, questions and plans until its goal is met. With a `/goal <condition>` prompt, autopilot owns that goal
+    #[arg(long)]
+    pub autopilot: bool,
+
     /// Pre-approve tools (comma-separated). Accepts PascalCase (Claude Code) or snake_case.
     #[arg(
         long,
@@ -330,6 +335,7 @@ impl Cli {
                 arg.hide(off(Feature::CrossSessionMessaging))
             })
             .mut_arg("automations", |arg| arg.hide(off(Feature::Automations)))
+            .mut_arg("autopilot", |arg| arg.hide(off(Feature::Autopilot)))
             .mut_arg("no_jit", |arg| arg.hide(off(Feature::LuaPlugins)))
             .mut_subcommand("sandbox", |command| command.hide(sandboxes_off))
             .mut_subcommand("remote", |command| {
@@ -356,7 +362,13 @@ impl Cli {
         if !self.automations.is_empty() && matches!(self.command, Some(Command::Acp { .. })) {
             return Err(Self::command().error(
                 ErrorKind::ArgumentConflict,
-                format!("{AUTOMATION_FLAG} {AUTOMATION_ACP_CONFLICT}"),
+                format!("{AUTOMATION_FLAG} {ACP_CONFLICT}"),
+            ));
+        }
+        if self.autopilot && matches!(self.command, Some(Command::Acp { .. })) {
+            return Err(Self::command().error(
+                ErrorKind::ArgumentConflict,
+                format!("{AUTOPILOT_FLAG} {ACP_CONFLICT}"),
             ));
         }
         let mut armed = HashSet::new();
@@ -1587,6 +1599,7 @@ mod tests {
     const OTHER_AUTOMATION: &str = "keep-going";
     const AUTOMATION_ARGS: &str = r#"{"goals":["The login tests pass"]}"#;
     const AUTOMATION_ARGS_FILE_NAME: &str = "goals.json";
+    const AUTOPILOT_ARG: &str = "autopilot";
 
     fn arming(name: &str, args: Option<&str>) -> ProfileArming {
         ProfileArming {
@@ -2150,6 +2163,38 @@ mod tests {
             command
                 .get_arguments()
                 .find(|arg| arg.get_id().as_str() == AUTOMATIONS_ARG)
+                .map(|arg| arg.is_hide_set()),
+            Some(hidden)
+        );
+    }
+
+    #[test_case(&[]; "interactive")]
+    #[test_case(&["--print"]; "print")]
+    #[test_case(&["--print", "--input-format", "stream-json"]; "sdk")]
+    fn autopilot_flag_parses_outside_acp(flags: &[&str]) {
+        let args = ["caudra", AUTOPILOT_FLAG].iter().chain(flags);
+        let cli = Cli::try_parse_from(args).and_then(Cli::validate).unwrap();
+        assert!(cli.autopilot);
+    }
+
+    #[test]
+    fn autopilot_flag_is_refused_with_acp() {
+        let error = Cli::try_parse_from(["caudra", AUTOPILOT_FLAG, "acp"])
+            .and_then(Cli::validate)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+        assert!(error.to_string().contains(ACP_CONFLICT), "{error}");
+    }
+
+    #[test_case(FeatureFlags::NONE, true; "experiment_off")]
+    #[test_case(FeatureFlags::NONE.with(Feature::Autopilot), false; "experiment_on")]
+    fn autopilot_flag_is_hidden_until_enabled(features: FeatureFlags, hidden: bool) {
+        let command = Cli::command_for(features);
+        assert_eq!(
+            command
+                .get_arguments()
+                .find(|arg| arg.get_id().as_str() == AUTOPILOT_ARG)
                 .map(|arg| arg.is_hide_set()),
             Some(hidden)
         );

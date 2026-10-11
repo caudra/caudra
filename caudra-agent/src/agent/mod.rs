@@ -4,6 +4,7 @@ mod compaction;
 mod goal;
 mod history;
 mod instructions;
+pub(crate) mod judging;
 pub mod mention_preamble;
 mod provider_projection;
 pub(crate) mod relative_paths;
@@ -34,6 +35,7 @@ pub use goal::{
     GoalVerdict, MAX_GOAL_CHARS, MAX_GOAL_CONTINUATION_LIMIT, goal_checkin_message,
     goal_kickoff_message,
 };
+pub(crate) use goal::{JudgeRole, ResolvedEvaluator, evaluator_request, resolve_evaluator};
 pub use history::{
     History, HistorySnapshot, SharedHistory, UNAVAILABLE_RESULT, is_run_failure_marker,
     stored_todos,
@@ -55,6 +57,6 @@ pub(crate) use run::{
     GOAL_MET_QUESTION, goal_prescreen_state, should_skip_goal, skill_questions, skill_shortlist,
     skill_state, suggested_skill,
 };
-pub(crate) use run::{last_announced, resolve_purpose_model_for_inspection};
+pub(crate) use run::{last_announced, resolve_purpose_model_for_inspection, standing_notice};
 pub use steering::EMPTY_RULE as EMPTY_RESPONSE_RULE;
 pub use surface::{PrefixKey, Settled, Surface, SurfaceBaseline};

@@ -123,7 +123,7 @@ When a tool stops at a limit or leaves something out, its result says what is mi
 
 Caudra has first-class support for Anthropic and OpenAI and ships 16 built-in providers, among them Google, GitHub Copilot, xAI, Mistral, DeepSeek, OpenRouter, Z.AI, Ollama, and llama.cpp. Custom endpoints that speak a supported API work as well.
 
-Nine model jobs decide which model serves each kind of work: Chat, Plan, Subagent, Compact, Title, Goal, Extract, Fast, and Best. Fast is the preferred small model, and session titles, `/goal` checks, and `/extract` run on it until you bind them. Best is the provider's flagship. In `/model`, you can pin any job to a model or let it follow Chat, Plan, Fast, or Best. A local endpoint can name its own Fast and Best models in `providers.toml`.
+Eleven model jobs decide which model serves each kind of work: Chat, Plan, Subagent, Compact, Title, Goal, Extract, Memory, Autopilot, Fast, and Best. Fast is the preferred small model, and session titles, `/goal` checks, and `/extract` run on it until you bind them. Best is the provider's flagship. In `/model`, you can pin any job to a model or let it follow Chat, Plan, Fast, or Best. A local endpoint can name its own Fast and Best models in `providers.toml`.
 
 You can sign in with a ChatGPT subscription, an existing GitHub Copilot sign-in, or an xAI account, or bring API keys. Claude subscription sign-in is experimental, and Anthropic's terms limit Pro and Max subscriptions to official clients.
 

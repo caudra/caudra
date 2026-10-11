@@ -21,7 +21,7 @@ use tracing::warn;
 use super::compaction::COMPACTION_ANCHOR;
 use crate::cancel::CancelToken;
 use crate::tools::QUESTION_TOOL_NAME;
-use crate::tools::native::question::asked_questions;
+use crate::tools::native::question::{answered_by_autopilot, asked_questions};
 use crate::types::AskedQuestion;
 
 /// Long enough for a list over a long session, short enough that a stalled
@@ -82,6 +82,12 @@ enum Entry {
     },
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Said<'a> {
+    Turn(&'a str),
+    Answers(&'a str),
+}
+
 /// One rendered entry: its agent block, droppable on its own, and its body.
 struct Rendered {
     agent: Option<String>,
@@ -89,10 +95,10 @@ struct Rendered {
 }
 
 impl RequirementsInput {
-    /// Reads user turns, answered questions, and the reply ahead of each turn
-    /// out of a history, in order. The items may cross compaction seams:
-    /// nothing here depends on the chain being a valid request.
-    pub fn from_items(items: &[HistoryItem]) -> Self {
+    /// Reads user turns, the questions the user answered, and the reply ahead
+    /// of each turn out of a history, in order. The items may cross compaction
+    /// seams: nothing here depends on the chain being a valid request.
+    pub fn from_items<'a>(items: impl IntoIterator<Item = &'a HistoryItem>) -> Self {
         let mut entries = Vec::new();
         let mut closing = None;
         let mut prior = None;
@@ -143,7 +149,9 @@ impl RequirementsInput {
                     is_error: false,
                     ..
                 } => {
-                    if let Some(questions) = pending.remove(call_id.as_str()) {
+                    if let Some(questions) = pending.remove(call_id.as_str())
+                        && !answered_by_autopilot(content)
+                    {
                         entries.push(Entry::Answered {
                             questions,
                             answers: content.trim().to_owned(),
@@ -176,6 +184,15 @@ impl RequirementsInput {
 
     pub fn answers(&self) -> usize {
         self.entries.len() - self.turns()
+    }
+
+    /// The user's own words, oldest first: their turns, and the answers they
+    /// gave to questions.
+    pub(crate) fn said(&self) -> impl DoubleEndedIterator<Item = Said<'_>> {
+        self.entries.iter().map(|entry| match entry {
+            Entry::Turn { text, .. } => Said::Turn(text),
+            Entry::Answered { answers, .. } => Said::Answers(answers),
+        })
     }
 
     /// The `# User requirements` block of the last compaction summary among
@@ -482,6 +499,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::tools::native::question::AUTOPILOT_ANSWERED;
 
     const FIRST: &str = "add a /extract command";
     const SECOND: &str = "default it to the fast model";
@@ -497,6 +515,7 @@ mod tests {
     const PREFILL_PROCESSED: u32 = 1_200;
     const PREFILL_TOTAL: u32 = 4_000;
     const PREFILL_CACHE: u32 = 900;
+    const NOT_THE_USERS: &str = "autopilot's answer must never pass for the user's words";
 
     fn item(kind: HistoryItemKind) -> HistoryItem {
         HistoryItem {
@@ -520,6 +539,7 @@ mod tests {
             peer_event: None,
             workflow_event: None,
             automation_event: None,
+            autopilot_event: None,
             standing_reminder: None,
             retained_output_refs: Vec::new(),
         })
@@ -846,6 +866,28 @@ mod tests {
             "[question]\n{HEADER}: {QUESTION}\n  - fast: cheap"
         )));
         assert!(transcript.ends_with(&format!("[answer]\n{ANSWER}")));
+    }
+
+    #[test]
+    fn an_autopilot_answer_is_not_the_users() {
+        let items = [
+            turn(FIRST),
+            question_call(CALL),
+            result(CALL, &format!("{AUTOPILOT_ANSWERED}\n{ANSWER}"), false),
+        ];
+
+        let input = RequirementsInput::from_items(&items);
+
+        assert_eq!(input.answers(), 0, "{NOT_THE_USERS}");
+        assert_eq!(
+            input.said().collect::<Vec<_>>(),
+            [Said::Turn(FIRST)],
+            "{NOT_THE_USERS}"
+        );
+        assert!(
+            !input.transcript(&model_with_window(WIDE)).contains(ANSWER),
+            "{NOT_THE_USERS}"
+        );
     }
 
     #[test]

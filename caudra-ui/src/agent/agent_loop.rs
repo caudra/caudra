@@ -41,7 +41,8 @@ use caudra_agent::{
 use caudra_config::{ModelPolicy, ProfileToolPolicy};
 use caudra_lua::EventHandle;
 use caudra_providers::{
-    AgentError, CacheKey, HistoryItem, Message, Model, ModelPurpose, RequestOptions, ThinkingConfig,
+    AgentError, Billing, CacheKey, HistoryItem, Message, Model, ModelPurpose, RequestOptions,
+    ThinkingConfig,
 };
 use caudra_storage::id::SessionRef;
 use caudra_storage::local_documents::LocalDocumentStore;
@@ -603,18 +604,31 @@ impl AgentLoop {
             },
         )
         .await?;
-        self.goal.record_external_usage(
-            spend.usage,
-            model.billed_cost(&spend.usage, false),
-            model.billing,
-        );
+        let cost = model.billed_cost(&spend.usage, false);
+        self.goal
+            .record_external_usage(spend.usage, cost, model.billing);
+        self.record_autopilot_spend(event_tx, cost, model.billing);
         if let Some(extraction) = spend.extraction {
             self.goal
                 .record_external_usage(extraction.usage, extraction.cost, extraction.billing);
+            self.record_autopilot_spend(event_tx, extraction.cost, extraction.billing);
         }
         let effective_slot = self.effective_model_slot.load();
         self.publish_prepared_context(&effective_slot);
         Ok(())
+    }
+
+    /// Spend outside the agent's own turns, which an engaged autopilot counts
+    /// as the goal does. A limit it reaches ends autopilot as the agent's own
+    /// spend would.
+    fn record_autopilot_spend(&self, event_tx: &EventSender, cost: Option<f64>, billing: Billing) {
+        if let Some(ended) = self
+            .permissions
+            .autopilot()
+            .and_then(|autopilot| autopilot.record_spend(cost, billing, &autopilot.limits()))
+        {
+            event_tx.try_send(ended);
+        }
     }
 
     async fn do_agent_run(
@@ -810,6 +824,9 @@ impl AgentLoop {
         .with_retry_now(self.retry_now.clone())
         .with_goal(self.goal.clone())
         .with_mcp(self.mcp.clone());
+        if let Some(autopilot) = self.permissions.autopilot() {
+            agent = agent.with_autopilot(autopilot);
+        }
 
         let result = if peer_wake {
             let Some(input) = inputs.pop() else {

@@ -1,4 +1,5 @@
 pub(crate) mod automation_inspector;
+pub(crate) mod autopilot_panel;
 pub(crate) mod code_view;
 pub mod command;
 pub(crate) mod command_modal;
@@ -1352,6 +1353,10 @@ impl DisplayMessage {
         Self::new(DisplayRole::AutomationDelivery(Box::new(origin)), text)
     }
 
+    pub(crate) fn autopilot(text: String) -> Self {
+        Self::new(DisplayRole::Autopilot, text)
+    }
+
     pub fn new(role: DisplayRole, text: String) -> Self {
         Self {
             role,
@@ -1477,6 +1482,9 @@ pub enum DisplayRole {
     /// has a body worth reading, so it collapses to its heading and opens on a
     /// click.
     Injected,
+    /// What autopilot did for the user: a decision, a retry, an engagement
+    /// starting or ending, or a message it wrote on their behalf.
+    Autopilot,
 }
 
 impl DisplayRole {

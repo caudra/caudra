@@ -5,6 +5,8 @@
 pub mod auth;
 #[path = "sessions/automation.rs"]
 pub mod automation;
+#[path = "sessions/autopilot.rs"]
+pub mod autopilot;
 pub mod background;
 pub mod checkout;
 pub mod decision_log;

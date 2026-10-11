@@ -39,8 +39,8 @@ use caudra_agent::{
 use caudra_config::{ToolOutputLines, UiConfig};
 use caudra_lua::WinView;
 use caudra_providers::{
-    AutomationEventOrigin, CaudraId, HistoryItem, HistoryItemKind, SteeringKind, SteeringOrigin,
-    UserOrigin,
+    AutomationEventOrigin, AutopilotMessageKind, CaudraId, HistoryItem, HistoryItemKind,
+    SteeringKind, SteeringOrigin, UserOrigin,
 };
 use caudra_storage::usage_ledger::LedgerPurpose;
 use caudra_storage::view::ViewMode;
@@ -63,6 +63,8 @@ const COMPACTION_BORDER_TEXT: &str =
 const BATCH_CHILD_ID_SEPARATOR: char = ':';
 const TOOLS_LOADED_PREFIX: &str = "Loaded ";
 const TOOLS_LOADED_SUFFIX: &str = " - the tools array changed, so the prompt cache prefix resets.";
+/// What parts an implement message's header from the plan it carries.
+const IMPLEMENT_HEADER_END: &str = "\n\n";
 
 pub enum ChatEventResult {
     Continue,
@@ -341,7 +343,8 @@ impl Chat {
             }
             AgentEvent::QueueDrained
             | AgentEvent::SessionTitle { .. }
-            | AgentEvent::MemoryChanged => {}
+            | AgentEvent::MemoryChanged
+            | AgentEvent::Autopilot(_) => {}
             AgentEvent::StreamReset
             | AgentEvent::TaskAdmitted(_)
             | AgentEvent::Retry { .. }
@@ -418,6 +421,19 @@ impl Chat {
                 self.messages_panel.flush();
                 self.messages_panel
                     .push(DisplayMessage::automation(text, origin));
+            }
+            AgentEvent::Injected {
+                text,
+                autopilot_event: Some(origin),
+                peer_event: None,
+                ..
+            } => {
+                self.messages_panel.flush();
+                self.messages_panel
+                    .push(DisplayMessage::autopilot(live_autopilot_text(
+                        text,
+                        origin.kind,
+                    )));
             }
             AgentEvent::Injected {
                 text,
@@ -1027,6 +1043,16 @@ fn plan_message(plan: &PlanWriteResult) -> DisplayMessage {
     DisplayMessage::plan(plan.content().to_owned(), plan_source(plan.target()))
 }
 
+/// A live implement message draws its header alone, under the plan card the
+/// handoff already drew, as a human's handoff does. Restored, it is one row
+/// with the plan in it, again as a human's is.
+fn live_autopilot_text(text: String, kind: AutopilotMessageKind) -> String {
+    match (kind, text.split_once(IMPLEMENT_HEADER_END)) {
+        (AutopilotMessageKind::Implement, Some((header, _))) => header.to_owned(),
+        _ => text,
+    }
+}
+
 fn is_stall_prompt(steering: &Option<SteeringOrigin>) -> bool {
     steering.as_ref().is_some_and(|origin| {
         origin.kind == SteeringKind::Recovery && origin.rule == EMPTY_RESPONSE_RULE
@@ -1039,6 +1065,28 @@ pub fn history_to_display(
     tool_output_lines: &ToolOutputLines,
     show_reminders: bool,
 ) -> (Vec<DisplayMessage>, Vec<caudra_lua::RestoreItem>) {
+    interleaved_history_to_display(
+        items,
+        tool_outputs,
+        tool_output_lines,
+        show_reminders,
+        Vec::new(),
+    )
+}
+
+/// [`history_to_display`] with rows kept outside the history, each placed
+/// after the first `n` items where `n` is the position it comes with. Rows
+/// sharing a position keep their order, and a position past the end lands
+/// after everything.
+pub fn interleaved_history_to_display(
+    items: &[HistoryItem],
+    tool_outputs: &HashMap<String, Arc<ToolOutput>>,
+    tool_output_lines: &ToolOutputLines,
+    show_reminders: bool,
+    mut inserts: Vec<(usize, DisplayMessage)>,
+) -> (Vec<DisplayMessage>, Vec<caudra_lua::RestoreItem>) {
+    inserts.sort_by_key(|(position, _)| *position);
+    let mut inserts = inserts.into_iter().peekable();
     let results = build_tool_results_map(items);
     let mut image_counts: HashMap<CaudraId, usize> = HashMap::new();
     for item in items {
@@ -1052,7 +1100,10 @@ pub fn history_to_display(
     let mut restore_items: Vec<caudra_lua::RestoreItem> = Vec::new();
     let mut displayed_user_groups = HashSet::new();
     let mut stall_row: Option<usize> = None;
-    for item in items {
+    for (index, item) in items.iter().enumerate() {
+        while let Some((_, row)) = inserts.next_if(|(position, _)| *position <= index) {
+            display.push(row);
+        }
         match &item.kind {
             HistoryItemKind::User {
                 text,
@@ -1071,6 +1122,14 @@ pub fn history_to_display(
             } => display.push(DisplayMessage::automation(
                 display_text.clone().unwrap_or_else(|| text.clone()),
                 origin.clone(),
+            )),
+            HistoryItemKind::User {
+                text,
+                display_text,
+                autopilot_event: Some(_),
+                ..
+            } => display.push(DisplayMessage::autopilot(
+                display_text.clone().unwrap_or_else(|| text.clone()),
             )),
             // An injected item is its own row rather than a candidate for the
             // turn's bubble, so it must not consume the group: a reminder and
@@ -1267,6 +1326,7 @@ pub fn history_to_display(
             | HistoryItemKind::ToolResult { .. } => {}
         }
     }
+    display.extend(inserts.map(|(_, row)| row));
     (display, restore_items)
 }
 
@@ -1470,6 +1530,7 @@ mod tests {
     };
     use caudra_agent::tools::native::peers::{LIST_NAME, PUBLISH_NAME, SEND_NAME, WORK_NAME};
     use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME};
+    use caudra_agent::types::Answerer;
     use caudra_agent::{
         AgentEvent, BatchProgressEvent, BatchToolEntry, BatchToolStatus, IndexLine,
         IndexLineSemantic, IndexOutput, IndexSourceRange, PeerOutput, SharedBuf, TextOutput,
@@ -1477,7 +1538,7 @@ mod tests {
     };
     use caudra_config::{InboundPolicy, UiConfig};
     use caudra_providers::{
-        Billing, ContentBlock, Message, PeerAudience, PeerMessageOrigin, Role,
+        AutopilotOrigin, Billing, ContentBlock, Message, PeerAudience, PeerMessageOrigin, Role,
         StandingReminderKind, TaskEventOrigin, estimate_tokens_cached, project_messages,
         token_label,
     };
@@ -2717,6 +2778,7 @@ mod tests {
                     task_event: None,
                     peer_event: None,
                     automation_event: None,
+                    autopilot_event: None,
                 },
                 None,
             ),
@@ -2759,6 +2821,7 @@ mod tests {
                 task_event: None,
                 peer_event: Some(origin.clone()),
                 automation_event: None,
+                autopilot_event: None,
             },
             None,
         );
@@ -2827,6 +2890,7 @@ mod tests {
                 task_event: Some(origin.clone()),
                 peer_event: None,
                 automation_event: None,
+                autopilot_event: None,
             },
             None,
         );
@@ -2923,6 +2987,7 @@ mod tests {
                 task_event: origin,
                 peer_event: None,
                 automation_event: None,
+                autopilot_event: None,
             },
             None,
         );
@@ -2961,6 +3026,7 @@ mod tests {
                 task_event: None,
                 peer_event: None,
                 automation_event: Some(origin.clone()),
+                autopilot_event: None,
             },
             None,
         );
@@ -3233,6 +3299,7 @@ mod tests {
                 labels: vec![ANSWER_PICKED.into()],
                 question: String::new(),
                 options: Vec::new(),
+                by: Answerer::User,
             })
             .collect();
         HashMap::from([("t1".to_owned(), Arc::new(ToolOutput::Answers(answers)))])
@@ -3417,6 +3484,7 @@ mod tests {
                 task_event: None,
                 peer_event: None,
                 automation_event: None,
+                autopilot_event: None,
             },
             None,
         );
@@ -3546,5 +3614,86 @@ mod tests {
         assert!(sub.is_finished());
         assert_eq!(sub.task_status(), TaskStatus::Error);
         assert_eq!(sub.task_id().map(|id| &**id), Some(TASK_ID));
+    }
+
+    const AUTOPILOT_TEXT: &str = "Autopilot replied: keep going";
+    const EARLY_ROW: &str = "permission allow: `cargo test`";
+    const LATE_ROW: &str = "ended: goal met";
+    const AUTOPILOT_SEQ: u32 = 4;
+
+    fn autopilot_origin() -> AutopilotOrigin {
+        AutopilotOrigin {
+            seq: AUTOPILOT_SEQ,
+            kind: AutopilotMessageKind::Reply,
+        }
+    }
+
+    /// A row made at history length `n` lands after the first `n` messages,
+    /// one past the end follows everything, and what autopilot wrote into
+    /// the conversation reads as its own row.
+    #[test]
+    fn autopilot_rows_interleave_with_the_history_they_were_made_at() {
+        let msgs = vec![
+            Message::user(USER_TEXT.into()),
+            Message::autopilot_observation(AUTOPILOT_TEXT.into(), autopilot_origin()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: REPLY_TEXT.into(),
+                }],
+                ..Default::default()
+            },
+        ];
+        let items = crate::history_items(&msgs);
+        let rows = vec![
+            (msgs.len(), DisplayMessage::autopilot(LATE_ROW.into())),
+            (1, DisplayMessage::autopilot(EARLY_ROW.into())),
+        ];
+
+        let (display, _) = interleaved_history_to_display(
+            &items,
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+            false,
+            rows,
+        );
+
+        let shown: Vec<(&DisplayRole, &str)> = display
+            .iter()
+            .map(|message| (&message.role, message.text.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (&DisplayRole::User, USER_TEXT),
+                (&DisplayRole::Autopilot, EARLY_ROW),
+                (&DisplayRole::Autopilot, AUTOPILOT_TEXT),
+                (&DisplayRole::Assistant, REPLY_TEXT),
+                (&DisplayRole::Autopilot, LATE_ROW),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_live_autopilot_message_is_autopilots_row() {
+        let mut chat = chat();
+        chat.show_reminders = false;
+
+        chat.handle_event(
+            AgentEvent::Injected {
+                text: AUTOPILOT_TEXT.into(),
+                task_event: None,
+                peer_event: None,
+                automation_event: None,
+                autopilot_event: Some(autopilot_origin()),
+            },
+            None,
+        );
+
+        let last = chat.message_at(chat.message_count() - 1).unwrap();
+        assert_eq!(
+            (&last.role, last.text.as_str()),
+            (&DisplayRole::Autopilot, AUTOPILOT_TEXT)
+        );
     }
 }

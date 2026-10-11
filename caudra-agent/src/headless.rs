@@ -17,18 +17,21 @@ use caudra_automation::untrusted::Untrusted;
 #[cfg(test)]
 use caudra_config::ToolKey;
 use caudra_config::decisions::DecisionsConfig;
-use caudra_config::{AutomationsConfig, Feature, FeatureFlags, ModelPolicy, SnapshotsConfig};
+use caudra_config::{
+    AutomationsConfig, AutopilotConfig, Feature, FeatureFlags, ModelPolicy, SnapshotsConfig,
+};
 use caudra_providers::Timeouts;
 use caudra_providers::model::{Billing, Model, ModelPurpose};
 use caudra_providers::pricing::settle_session;
 use caudra_providers::provider::{self, Provider};
 use caudra_providers::{
-    AutomationEventOrigin, CacheKey, HistoryItem, HistoryItemKind, Message, TokenUsage,
-    WorkflowEventOrigin, active_history_items, merge_history_items, resolve_history_head,
-    transcript_history_items,
+    AutomationEventOrigin, AutopilotMessageKind, AutopilotOrigin, CacheKey, HistoryItem,
+    HistoryItemKind, Message, TokenUsage, WorkflowEventOrigin, active_history_items,
+    merge_history_items, resolve_history_head, transcript_history_items,
 };
 #[cfg(test)]
 use caudra_providers::{ContentBlock, Role};
+use caudra_storage::autopilot::{AutopilotEnd, AutopilotStopper, StoredAutopilotDecision};
 use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::permission_state::PermissionRuleRecord;
@@ -63,16 +66,17 @@ use crate::agent::task_runner::{
 };
 use crate::agent::{self, History};
 use crate::automation::catalog::Frontend;
-use crate::automation::clock::Clock;
+use crate::automation::clock::{Clock, SystemClock};
 use crate::automation::frontend::{
-    SessionSignals, claim_next, delivery_due, goal_finished, launch_armings, mode_name, run_end,
-    saved_controls, set_claimed_goal, stop_runtime, wake_origin,
+    SessionSignals, autopilot_view, claim_next, delivery_due, goal_finished, launch_armings,
+    mode_name, run_end, saved_controls, set_claimed_goal, stop_runtime, wake_origin,
 };
 use crate::automation::handle::AutomationHandle;
 use crate::automation::http::HttpClient;
 use crate::automation::manager::{AutomationRuntime, RuntimeDeps as AutomationDeps};
 use crate::automation::outbox::claim_message;
 use crate::automation::workflows::Workflows;
+use crate::autopilot::{AutopilotDecision, AutopilotHandle};
 use crate::background::{BackgroundTasks, BackgroundTransition, SessionWork};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::commits;
@@ -85,12 +89,15 @@ use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
 use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile};
 use crate::template;
-use crate::tools::native::plan::PlanTarget;
+use crate::tools::native::plan::{self, PlanTarget, PlanWriteResult};
 use crate::tools::{
     BuiltinDeferral, DeferralSession, DeferredTool, DescriptionContext, FileReadTracker,
     LocalTools, PathLocks, ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
 };
-use crate::types::{BACKGROUND_EVENT_RUN_ID, MEMORY_EVENT_RUN_ID, TodoItem};
+use crate::types::{
+    AUTOPILOT_EVENT_RUN_ID, AutopilotEvent, BACKGROUND_EVENT_RUN_ID, BatchToolEntry,
+    MEMORY_EVENT_RUN_ID, TodoItem,
+};
 use crate::workflow::{RuntimeDeps, WorkflowHandle, WorkflowRuntime, WorkspaceRebind};
 use crate::{
     Agent, AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
@@ -120,6 +127,8 @@ const PERSIST_FAILED: &str = "Failed to persist session";
 /// runtime drops its own.
 const AUTOMATION_EVENT_CAPACITY: usize = 1024;
 const MILLIS_PER_SECOND: i64 = 1_000;
+const IMPLEMENT_VERB: &str = "Implement";
+const IMPLEMENT_PLAN_PREFIX: &str = "Implement the plan";
 
 struct SessionPermissionPublication {
     database: Arc<StdMutex<SessionDatabase>>,
@@ -177,6 +186,9 @@ struct SessionStore {
     /// The runtime serving the session, whose controls every save keeps; `None` leaves the
     /// stored controls as they are.
     automations: Option<AutomationHandle>,
+    /// The session's autopilot, whose engagement every save keeps; `None` leaves the stored
+    /// engagement as it is.
+    autopilot: Option<AutopilotHandle>,
 }
 
 impl SessionStore {
@@ -342,7 +354,21 @@ impl SessionStore {
             subagent_history,
             persisted_subagent_history,
             automations: None,
+            autopilot: None,
         }
+    }
+
+    /// The session database, opened again if it was unavailable before.
+    fn database(&mut self) -> Result<Arc<StdMutex<SessionDatabase>>, SessionError> {
+        if self.database.is_none() {
+            self.database = SessionDatabase::open(&self.dir)
+                .map_err(|error| warn!(%error, "session database unavailable"))
+                .ok()
+                .map(|database| Arc::new(StdMutex::new(database)));
+        }
+        self.database
+            .clone()
+            .ok_or_else(|| StorageError::Io(io::Error::other(SESSION_DATABASE_UNAVAILABLE)).into())
     }
 
     fn save(&mut self) -> Result<(), SessionError> {
@@ -355,15 +381,10 @@ impl SessionStore {
         if let Some(automations) = &self.automations {
             meta.automations = Some(saved_controls(automations));
         }
-        if self.database.is_none() {
-            self.database = SessionDatabase::open(&self.dir)
-                .map_err(|error| warn!(%error, "session database unavailable"))
-                .ok()
-                .map(|database| Arc::new(StdMutex::new(database)));
+        if let Some(autopilot) = &self.autopilot {
+            meta.autopilot = autopilot.stored().map(Box::new);
         }
-        let Some(database) = &self.database else {
-            return Err(StorageError::Io(io::Error::other(SESSION_DATABASE_UNAVAILABLE)).into());
-        };
+        let database = self.database()?;
         let mut database = database.lock().unwrap_or_else(|error| error.into_inner());
         database
             .permission_snapshot(PermissionOwner::Conversation(self.session.id))
@@ -403,6 +424,49 @@ impl SessionStore {
 
     fn sync_permissions(&mut self, permissions: &PermissionManager) {
         self.session.meta.permission_mode = permissions.persisted_mode();
+    }
+
+    /// Reopens the engagement the session stored, still engaged if it was, under `limits`.
+    /// Every save keeps it from then on.
+    fn restore_autopilot(&mut self, limits: AutopilotConfig) -> AutopilotHandle {
+        let handle = if self.session.meta.autopilot.is_some() {
+            let decisions = self.autopilot_decisions();
+            AutopilotHandle::from_meta(&self.session.meta, decisions, Arc::new(SystemClock::new()))
+        } else {
+            AutopilotHandle::default()
+        };
+        handle.set_limits(limits);
+        self.autopilot = Some(handle.clone());
+        handle
+    }
+
+    fn autopilot_decisions(&mut self) -> Vec<StoredAutopilotDecision> {
+        let session_id = self.session.id;
+        self.database()
+            .and_then(|database| {
+                database
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .load_autopilot_decisions(session_id)
+            })
+            .unwrap_or_else(|error| {
+                warn!(%error, %session_id, "autopilot decisions unreadable; resuming without them");
+                Vec::new()
+            })
+    }
+
+    /// The decision log is a record of what autopilot did, so a decision that cannot be
+    /// written is reported and the session carries on.
+    fn record_autopilot_decision(&mut self, decision: &AutopilotDecision) {
+        let session_id = self.session.id;
+        if let Err(error) = self.database().and_then(|database| {
+            database
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert_autopilot_decision(session_id, &decision.clone().into())
+        }) {
+            warn!(%error, %session_id, seq = decision.seq, "autopilot decision not recorded");
+        }
     }
 
     fn set_system_prompt_profile(&mut self, name: Option<&str>) {
@@ -644,6 +708,12 @@ impl SessionStore {
                 }
                 self.session.set_subagents(subagents);
             }
+            AgentEvent::Autopilot(AutopilotEvent::Decided(decision)) => {
+                self.record_autopilot_decision(decision);
+                return Ok(());
+            }
+            AgentEvent::Autopilot(AutopilotEvent::Engaged | AutopilotEvent::Ended { .. })
+                if self.autopilot.is_some() => {}
             _ => return Ok(()),
         }
         self.save()
@@ -836,6 +906,8 @@ pub struct HeadlessParams {
     /// where `{cwd}` names a path inside the VM and this one does not.
     pub host_cwd: Option<PathBuf>,
     pub local_documents: Option<Arc<LocalDocumentStore>>,
+    /// The run's autopilot, which answers the prompts no one is present for.
+    pub autopilot: Option<AutopilotHandle>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1530,6 +1602,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                 permissions.set_seed_mode(mode);
             }
             permissions.set_decisions(decisions.map(|service| service.for_session(session_id)));
+            permissions.set_autopilot(params.autopilot.clone());
             if let Err(error) = permissions.replace_remote_permission_asset(
                 params
                     .remote_project_context
@@ -1633,6 +1706,9 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
             .with_background_wait()
             .with_peer_exit()
             .with_mcp(mcp);
+            if let Some(autopilot) = params.autopilot {
+                agent = agent.with_autopilot(autopilot);
+            }
 
             let mentions = if params.remote_environment.is_some() {
                 mentions::scan_remote(&params.prompt)
@@ -1741,6 +1817,18 @@ pub struct InteractiveParams {
     pub local_documents: Option<Arc<LocalDocumentStore>>,
     /// `Some` serves the session's automations while `experimental.automations` is on.
     pub automations: Option<AutomationParams>,
+    /// `Some` gives the session an autopilot while `experimental.autopilot` is on.
+    pub autopilot: Option<AutopilotParams>,
+}
+
+/// What a session's autopilot needs from its host.
+pub struct AutopilotParams {
+    /// The `[autopilot]` limits every engagement of the session runs under.
+    pub limits: AutopilotConfig,
+    /// The mode the check-in a resumed engagement owes starts in, before a prompt sets the
+    /// session's mode, thinking and speed.
+    pub mode: ModeResolver,
+    pub fast: bool,
 }
 
 /// What a session's automation runtime needs from its host.
@@ -1779,6 +1867,10 @@ pub struct InteractiveHandle {
     /// What the runtime fired and what its scripts asked the host to show. Past its capacity
     /// the oldest event is dropped; disconnected once no runtime serves the session.
     pub automation_events: Receiver<AutomationEvent>,
+    /// The session's autopilot, when `autopilot` asked for one.
+    pub autopilot: Option<AutopilotHandle>,
+    /// Where an engagement change the host makes is announced; see [`announce_autopilot`].
+    autopilot_events: flume::WeakSender<Envelope>,
     mode_route: Arc<InteractiveModeRoute>,
     workspace_change_tx: flume::Sender<WorkspaceChangeRequest>,
     remote_workspace: Option<Arc<StdMutex<RemoteWorkspaceState>>>,
@@ -1872,6 +1964,124 @@ impl GoalDeferral {
         self.run_id
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+/// The plan autopilot chose to implement, as the event stream reports it.
+#[derive(Default)]
+struct PlanHandoff(StdMutex<HandoffState>);
+
+#[derive(Default)]
+struct HandoffState {
+    /// What the main agent last wrote to the session plan.
+    written: Option<PlanWriteResult>,
+    /// The main run whose review chose to implement it, and the decision's seq.
+    chosen: Option<(u64, u32)>,
+}
+
+impl PlanHandoff {
+    fn observe(&self, envelope: &Envelope) {
+        if envelope.subagent.is_some() || envelope.task.is_some() || envelope.workflow.is_some() {
+            return;
+        }
+        match &envelope.event {
+            AgentEvent::ToolDone(done) => {
+                let written = done.plan_write_result().or_else(|| match &done.output {
+                    ToolOutput::Batch { entries, .. } => entries
+                        .iter()
+                        .rev()
+                        .find_map(BatchToolEntry::plan_write_result),
+                    _ => None,
+                });
+                if let Some(written) = written {
+                    self.lock().written = Some(written);
+                }
+            }
+            AgentEvent::Autopilot(AutopilotEvent::ImplementPlan { seq }) => {
+                self.lock().chosen = Some((envelope.run_id, *seq));
+            }
+            _ => {}
+        }
+    }
+
+    fn chosen_by(&self, run_id: u64) -> bool {
+        self.lock().chosen.is_some_and(|(run, _)| run == run_id)
+    }
+
+    /// Takes the choice run `run_id` made, with the plan it chose, `None` when it made none
+    /// or the plan is empty.
+    fn take(&self, run_id: u64) -> Option<(u32, PlanWriteResult)> {
+        let mut state = self.lock();
+        let (_, seq) = state.chosen.take_if(|(run, _)| *run == run_id)?;
+        let plan = state
+            .written
+            .clone()
+            .filter(|plan| !plan.content().trim().is_empty())?;
+        Some((seq, plan))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HandoffState> {
+        self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+/// The implement run's opening, as the plan card's Implement words it. It is an autopilot
+/// observation rather than a message, so the run reads as no human's.
+fn implement_message(seq: u32, written: &PlanWriteResult) -> Message {
+    let header = match written.target() {
+        PlanTarget::Local(path) => format!("{IMPLEMENT_PLAN_PREFIX} from `{}`.", path.display()),
+        PlanTarget::Remote(_) => format!("{IMPLEMENT_VERB} {}.", plan::SESSION_PLAN_LABEL),
+    };
+    Message::autopilot_observation(
+        format!("{header}\n\n{}", written.content()),
+        AutopilotOrigin {
+            seq,
+            kind: AutopilotMessageKind::Implement,
+        },
+    )
+}
+
+/// Sends what autopilot announced outside any agent into the session's event stream, so it
+/// is recorded and passed on as an agent's event is. The sender is weak, so the session's
+/// forwarder still ends with its agents; past that the announcement has no one to reach.
+fn announce_autopilot(events: &flume::WeakSender<Envelope>, event: AutopilotEvent) {
+    if let Some(sender) = events.upgrade() {
+        EventSender::new(sender, AUTOPILOT_EVENT_RUN_ID).try_send(event);
+    }
+}
+
+/// Counts a run autopilot starts without a human. A budget that runs out ends autopilot,
+/// never the run.
+fn count_autopilot_continuation(autopilot: &AutopilotHandle, events: &flume::WeakSender<Envelope>) {
+    if let Err(ended) = autopilot.try_continue(&autopilot.limits()) {
+        announce_autopilot(events, ended);
+    }
+}
+
+/// What a subagent spent, which an engaged autopilot counts as the goal does. The main
+/// agent counts its own turns, and the delegate's spend is counted where it is made.
+fn record_subagent_autopilot_spend(
+    autopilot: &AutopilotHandle,
+    envelope: &Envelope,
+    events: &flume::WeakSender<Envelope>,
+) {
+    if envelope.subagent.is_none() {
+        return;
+    }
+    let (cost, billing) = match &envelope.event {
+        AgentEvent::TurnComplete(turn) if turn.purpose != LedgerPurpose::Autopilot => {
+            (turn.cost, turn.billing)
+        }
+        AgentEvent::ModelUsage {
+            cost,
+            billing,
+            purpose,
+            ..
+        } if *purpose != LedgerPurpose::Autopilot => (*cost, *billing),
+        _ => return,
+    };
+    if let Some(ended) = autopilot.record_spend(cost, billing, &autopilot.limits()) {
+        announce_autopilot(events, ended);
     }
 }
 
@@ -1986,12 +2196,14 @@ fn restored_cost(session: &StoredSession, model: &Model) -> Option<f64> {
 }
 
 /// The session as automation events show it. Headless sessions have no `@name`, no groups and
-/// no question tool, so they never wait on input.
+/// no question tool, so they never wait on input, nor on an item autopilot left to them.
+#[allow(clippy::too_many_arguments)]
 fn session_view(
     session_id: CaudraId,
     title: &str,
     mode: &AgentMode,
     goal: &GoalHandle,
+    autopilot: Option<&AutopilotHandle>,
     cost: Option<f64>,
     status: SessionStatus,
     status_since: i64,
@@ -2007,6 +2219,7 @@ fn session_view(
             condition: goal.condition.to_string(),
             evaluations: goal.evaluations,
         }),
+        autopilot: autopilot_view(autopilot, false),
         cost,
         groups: Vec::new(),
         work: WorkView::default(),
@@ -2049,6 +2262,8 @@ struct SessionAutomations {
     fast: bool,
     host: HostEvents,
     tally: StdMutex<AutomationTally>,
+    /// The session's autopilot, while `experimental.autopilot` is on.
+    autopilot: Option<AutopilotHandle>,
 }
 
 /// What the runtime heard from the session, so each signal goes out on a change only.
@@ -2084,6 +2299,7 @@ impl SessionAutomations {
                 title,
                 &mode,
                 goal,
+                self.autopilot.as_ref(),
                 tally.cost,
                 status,
                 tally.signals.status_since(status, now),
@@ -2122,10 +2338,19 @@ impl SessionAutomations {
                 && tally.signals.running()
                 && tally.run == Some(envelope.run_id);
             match &envelope.event {
-                AgentEvent::GoalFinished { result } => Some(goal_finished(result)),
-                AgentEvent::GoalClearedAfterError { condition, message } => {
-                    Some(tally.signals.goal_cleared(condition, message))
-                }
+                AgentEvent::GoalFinished {
+                    result,
+                    autopilot_owned,
+                } => Some(goal_finished(result, *autopilot_owned)),
+                AgentEvent::GoalClearedAfterError {
+                    condition,
+                    message,
+                    autopilot_owned,
+                } => Some(
+                    tally
+                        .signals
+                        .goal_cleared(condition, message, *autopilot_owned),
+                ),
                 AgentEvent::GoalEvaluation { .. } | AgentEvent::GoalEvaluationFailed { .. } => {
                     tally.signals.observe_goal(goal.snapshot());
                     None
@@ -2211,8 +2436,12 @@ impl SessionAutomations {
     /// Sets the goal a claim asks for; a refusal reaches the host as a notice, and the turn
     /// starts either way.
     fn set_goal(&self, goal: &GoalHandle, claim: &OutboxClaim) {
+        let autopilot_owns_goal = self
+            .autopilot
+            .as_ref()
+            .is_some_and(AutopilotHandle::owns_goal);
         if let Some(requested) = &claim.goal
-            && let Some(refusal) = set_claimed_goal(goal, requested)
+            && let Some(refusal) = set_claimed_goal(goal, requested, autopilot_owns_goal)
         {
             self.host.push(AutomationEvent::Notice {
                 automation: claim.automation.clone(),
@@ -2274,6 +2503,7 @@ struct PendingAutomations {
     deps: AutomationDeps,
     mode: ModeResolver,
     fast: bool,
+    autopilot: Option<AutopilotHandle>,
 }
 
 impl PendingAutomations {
@@ -2284,6 +2514,7 @@ impl PendingAutomations {
         store: &SessionStore,
         mode_route: &Arc<InteractiveModeRoute>,
         model: &Model,
+        autopilot: Option<AutopilotHandle>,
     ) -> Self {
         let session_id = store.session.id;
         let mode = routed_mode(mode_route, automation.mode);
@@ -2292,6 +2523,7 @@ impl PendingAutomations {
             &store.session.title,
             &mode(),
             &store.goal,
+            autopilot.as_ref(),
             restored_cost(&store.session, model),
             SessionStatus::Idle,
             automation.clock.now_ms() / MILLIS_PER_SECOND,
@@ -2320,6 +2552,7 @@ impl PendingAutomations {
             deps,
             mode,
             fast: automation.fast,
+            autopilot,
         }
     }
 
@@ -2338,6 +2571,7 @@ impl PendingAutomations {
             mut deps,
             mode,
             fast,
+            autopilot,
         } = self;
         deps.workflows = workflow.map(|workflow| Arc::new(workflow.clone()) as Arc<dyn Workflows>);
         let session_id = deps.session_id;
@@ -2362,6 +2596,7 @@ impl PendingAutomations {
                 signals: SessionSignals::new(facts),
                 run: None,
             }),
+            autopilot,
         };
         Some((runtime, automations, events))
     }
@@ -2427,6 +2662,8 @@ impl InteractiveHandle {
             goal: GoalHandle::default(),
             automations: None,
             automation_events: flume::unbounded().1,
+            autopilot: None,
+            autopilot_events: flume::unbounded().0.downgrade(),
             mode_route: Arc::default(),
             workspace_change_tx: flume::unbounded().0,
             remote_workspace: None,
@@ -2483,11 +2720,37 @@ impl InteractiveHandle {
                 by: PauseSource::Sdk,
             });
         }
+        self.end_autopilot(AutopilotStopper::Interrupt);
         self.mode_route.control_epoch.fetch_add(1, Ordering::AcqRel);
         let _admission = self.mode_route.admission.lock().await;
         self.mode_route.cancel_run();
         let _turn = self.mode_route.turn.lock().await;
         drain_session_work(self.background.as_ref(), self.workflow.as_ref()).await
+    }
+
+    /// Engages the session's autopilot, owning the active goal when the caller set it.
+    /// Already engaged, it only takes such a goal on, and announces nothing.
+    pub fn engage_autopilot(&self, owns_goal: bool) {
+        if let Some(engaged) = self
+            .autopilot
+            .as_ref()
+            .and_then(|autopilot| autopilot.engage(owns_goal))
+        {
+            announce_autopilot(&self.autopilot_events, engaged);
+        }
+    }
+
+    /// Whether there was an engagement to end.
+    pub fn end_autopilot(&self, by: AutopilotStopper) -> bool {
+        let ended = self
+            .autopilot
+            .as_ref()
+            .and_then(|autopilot| autopilot.end(AutopilotEnd::Stopped { by }));
+        let was_engaged = ended.is_some();
+        if let Some(ended) = ended {
+            announce_autopilot(&self.autopilot_events, ended);
+        }
+        was_engaged
     }
 
     pub fn workflow_control(
@@ -2865,6 +3128,7 @@ async fn spawn_prepared_session(
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
     let (run_tx, run_rx) = flume::unbounded();
     let (agent_tx, agent_rx) = flume::unbounded::<Envelope>();
+    let autopilot_events = agent_tx.downgrade();
     let (input_tx, input_rx) = flume::unbounded::<AgentInput>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
@@ -2872,12 +3136,30 @@ async fn spawn_prepared_session(
     let (workspace_change_tx, workspace_change_rx) = flume::unbounded::<WorkspaceChangeRequest>();
     let (workflow_wake_tx, workflow_wake_rx) = flume::bounded::<()>(1);
     let mode_route = Arc::new(InteractiveModeRoute::default());
+    let (autopilot, autopilot_fallback) = match params
+        .autopilot
+        .take()
+        .filter(|_| params.config.features.enabled(Feature::Autopilot))
+    {
+        Some(AutopilotParams { limits, mode, fast }) => (
+            Some(store.restore_autopilot(limits)),
+            Some((routed_mode(&mode_route, mode), fast)),
+        ),
+        None => (None, None),
+    };
     let pending_automations = params
         .automations
         .take()
         .filter(|_| params.config.features.enabled(Feature::Automations))
         .map(|automation| {
-            PendingAutomations::new(automation, &params, &store, &mode_route, &model)
+            PendingAutomations::new(
+                automation,
+                &params,
+                &store,
+                &mode_route,
+                &model,
+                autopilot.clone(),
+            )
         });
     let remote_workspace = params
         .workspace_session
@@ -2902,6 +3184,11 @@ async fn spawn_prepared_session(
         permissions.set_seed_mode(mode);
     }
     permissions.set_decisions(decisions.map(|service| service.for_session(session_id)));
+    permissions.set_autopilot(autopilot.clone());
+    // A resumed engagement owes an active goal one check-in, which is autopilot's.
+    let mut resumed_checkin =
+        autopilot.as_ref().is_some_and(AutopilotHandle::is_engaged) && goal.snapshot().is_some();
+    let plan_handoff = Arc::new(PlanHandoff::default());
     if let Err(error) = permissions.replace_remote_permission_asset(
         params
             .remote_project_context
@@ -3104,6 +3391,8 @@ async fn spawn_prepared_session(
         let remote_workspace = remote_workspace.clone();
         let goal = goal.clone();
         let automations = automations.clone();
+        let autopilot = autopilot.clone();
+        let autopilot_events = autopilot_events.clone();
         async move {
             let event_forwarder = smol::spawn({
                 let store = Arc::clone(&store);
@@ -3113,6 +3402,9 @@ async fn spawn_prepared_session(
                 let goal = goal.clone();
                 let goal_deferral = Arc::clone(&goal_deferral);
                 let automations = automations.clone();
+                let autopilot = autopilot.clone();
+                let autopilot_events = autopilot_events.clone();
+                let plan_handoff = Arc::clone(&plan_handoff);
                 async move {
                     while let Ok(envelope) = agent_rx.recv_async().await {
                         if (envelope.task.is_some() || envelope.run_id == BACKGROUND_EVENT_RUN_ID)
@@ -3123,6 +3415,15 @@ async fn spawn_prepared_session(
                             continue;
                         }
                         record_subagent_goal_usage(&goal, &envelope);
+                        if let Some(autopilot) = &autopilot {
+                            record_subagent_autopilot_spend(
+                                autopilot,
+                                &envelope,
+                                &autopilot_events,
+                            );
+                        }
+                        // Before the deferral wakes the implement watch, so it sees the choice.
+                        plan_handoff.observe(&envelope);
                         // Before the deferral wakes the settle watch, so it sees the run's end.
                         if let Some(automations) = &automations {
                             automations.forwarded(&envelope, &goal);
@@ -3196,18 +3497,20 @@ async fn spawn_prepared_session(
                     Background,
                     Workflow,
                     GoalCheckin,
+                    Implement,
                     Automation,
                 }
                 // The TUI's check-in rule: the last run deferred its goal
-                // evaluation, the goal is still active, nothing stopped the
-                // session since, no prompt waits, and the work it deferred
-                // behind has settled.
+                // evaluation, or a resumed engagement owes one, the goal is
+                // still active, nothing stopped the session since, no prompt
+                // waits, and the work it deferred behind has settled.
                 let checkin_due = || {
-                    run_id
-                        .checked_sub(1)
-                        .is_some_and(|last| goal_deferral.deferred(last))
+                    (resumed_checkin
+                        || run_id
+                            .checked_sub(1)
+                            .is_some_and(|last| goal_deferral.deferred(last)))
                         && mode_route.control_epoch.load(Ordering::Acquire) == run_epoch
-                        && continuation.is_some()
+                        && (continuation.is_some() || resumed_checkin)
                         && input_rx.is_empty()
                         && goal.snapshot().is_some()
                         && !SessionWork::capture(
@@ -3216,6 +3519,18 @@ async fn spawn_prepared_session(
                             base.subagent_cancels.active_count(),
                         )
                         .pending()
+                };
+                // The plan the last run's review chose to implement, while
+                // autopilot is still engaged, nothing stopped the session
+                // since, and no prompt waits to go first.
+                let implement_due = || {
+                    autopilot.as_ref().is_some_and(AutopilotHandle::is_engaged)
+                        && run_id
+                            .checked_sub(1)
+                            .is_some_and(|last| plan_handoff.chosen_by(last))
+                        && mode_route.control_epoch.load(Ordering::Acquire) == run_epoch
+                        && continuation.is_some()
+                        && input_rx.is_empty()
                 };
                 // What keeps the session from settling, as its automations see it. Completions
                 // keep the session busy and wait ahead of them only once a continuation lets a
@@ -3240,7 +3555,7 @@ async fn spawn_prepared_session(
                         [
                             (!input_rx.is_empty()).then_some(SettleBlocker::PromptQueued),
                             (wakes_deliver && completions).then_some(SettleBlocker::MailboxWake),
-                            (background_enabled && checkin_due())
+                            ((background_enabled || resumed_checkin) && checkin_due())
                                 .then_some(SettleBlocker::GoalCheckin),
                         ]
                         .into_iter()
@@ -3299,17 +3614,23 @@ async fn spawn_prepared_session(
                                         },
                                         futures_lite::future::or(
                                             async {
-                                                if !background_enabled {
-                                                    futures_lite::future::pending::<()>().await;
-                                                }
                                                 until_due(
-                                                    &checkin_due,
+                                                    || {
+                                                        implement_due()
+                                                            || ((background_enabled
+                                                                || resumed_checkin)
+                                                                && checkin_due())
+                                                    },
                                                     &goal_deferral,
                                                     background.as_ref(),
                                                     &base.subagent_cancels,
                                                 )
                                                 .await;
-                                                NextInput::GoalCheckin
+                                                if implement_due() {
+                                                    NextInput::Implement
+                                                } else {
+                                                    NextInput::GoalCheckin
+                                                }
                                             },
                                             async {
                                                 let Some(automations) = &automations else {
@@ -3358,10 +3679,17 @@ async fn spawn_prepared_session(
                     NextInput::Background
                         | NextInput::Workflow
                         | NextInput::GoalCheckin
+                        | NextInput::Implement
                         | NextInput::Automation
                 );
+                let autopilots_run = match next {
+                    NextInput::GoalCheckin => resumed_checkin,
+                    NextInput::Implement => true,
+                    _ => false,
+                };
                 let origin = match &next {
                     NextInput::Prompt(_) => Some(StartedBy::User),
+                    _ if autopilots_run => Some(StartedBy::Autopilot),
                     NextInput::GoalCheckin => Some(StartedBy::Goal),
                     _ => None,
                 };
@@ -3398,16 +3726,33 @@ async fn spawn_prepared_session(
                         automatic_input(continuation, Vec::new())
                     }
                     NextInput::GoalCheckin => {
-                        let (Some(continuation), Some(active)) = (&continuation, goal.snapshot())
+                        let resumed = autopilot_fallback
+                            .as_ref()
+                            .filter(|_| autopilots_run)
+                            .map(|(mode, fast)| (mode(), params.thinking.clone(), *fast));
+                        let (Some(continuation), Some(active)) =
+                            (continuation.clone().or(resumed), goal.snapshot())
                         else {
                             continue;
                         };
                         automatic_input(
-                            continuation,
+                            &continuation,
                             vec![Message::synthetic(agent::goal_checkin_message(
                                 &active.condition,
                             ))],
                         )
+                    }
+                    NextInput::Implement => {
+                        let (Some(continuation), Some((seq, plan))) = (
+                            &continuation,
+                            run_id
+                                .checked_sub(1)
+                                .and_then(|last| plan_handoff.take(last)),
+                        ) else {
+                            continue;
+                        };
+                        mode_route.mode.store(Some(Arc::new(AgentMode::Build)));
+                        automatic_input(continuation, vec![implement_message(seq, &plan)])
                     }
                     NextInput::Automation => {
                         let Some(automations) = &automations else {
@@ -3606,6 +3951,10 @@ async fn spawn_prepared_session(
                         .is_none_or(|delivery| delivery.messages.is_empty())
                 {
                     continue;
+                }
+                resumed_checkin = false;
+                if autopilots_run && let Some(autopilot) = &autopilot {
+                    count_autopilot_continuation(autopilot, &autopilot_events);
                 }
                 continuation.get_or_insert_with(|| {
                     (input.mode.clone(), input.thinking.clone(), input.fast)
@@ -3983,6 +4332,9 @@ async fn spawn_prepared_session(
                 .with_goal(goal.clone())
                 .with_interrupt_source(Arc::new(QueuedPrompts(input_rx.clone())))
                 .with_mcp(turn_mcp);
+                if let Some(autopilot) = &autopilot {
+                    agent = agent.with_autopilot(autopilot.clone());
+                }
 
                 let result = agent.run(input).await;
                 drop(agent);
@@ -4109,6 +4461,8 @@ async fn spawn_prepared_session(
         goal,
         automations: automations.map(|automations| automations.handle.clone()),
         automation_events,
+        autopilot,
+        autopilot_events,
         mode_route,
         workspace_change_tx,
         remote_workspace,
@@ -4312,12 +4666,13 @@ mod tests {
         ArmedReason, Event as FiredEvent, EventDetail, GoalVerdict as FinishedVerdict,
     };
     use caudra_automation::limits::ROLLING_WINDOW_MS;
-    use caudra_automation::request::{AutomationRequest, AutomationResponse};
+    use caudra_automation::request::{AutomationRequest, AutomationResponse, GoalClaim};
     use caudra_automation::snapshot::{ArmOrigin, FiringStatus, FiringSummary, WaitReason};
     use caudra_providers::{
         AgentError, ProviderEvent, RequestOptions, StandingReminderKind, StopReason,
         StreamResponse, TaskEventOrigin,
     };
+    use caudra_storage::autopilot::{AutopilotBudget, StoredAutopilot};
     use caudra_storage::background::TaskRecord;
     use caudra_storage::decision_log::DecisionLog;
     use caudra_storage::permission_state::PermissionRuleRecord;
@@ -4335,7 +4690,7 @@ mod tests {
     use crate::agent::subagent::TaskIdentity;
     use crate::agent::task_runner::TaskRequest;
     use crate::automation::clock::FakeClock;
-    use crate::automation::manager::{GOAL_ACTIVE, PAUSED_BY_SDK};
+    use crate::automation::manager::{GOAL_ACTIVE, GOAL_OWNED_BY_AUTOPILOT, PAUSED_BY_SDK};
     use crate::automation::testing::AutomationFixture;
     use crate::background::TaskDelivery;
     use crate::permissions::{
@@ -4348,7 +4703,7 @@ mod tests {
     use crate::tools::{PermissionScopes, TODOWRITE_TOOL_NAME};
     #[cfg(unix)]
     use crate::types::ToolDoneEvent;
-    use crate::types::{TodoPriority, TodoStatus};
+    use crate::types::{SubagentInfo, TodoPriority, TodoStatus};
     use crate::workflow::store::WorkflowStore;
     use crate::{GoalResult, GoalVerdict, TurnCompleteEvent};
 
@@ -5845,6 +6200,9 @@ complete(#{ report: first.output });
         started: flume::Receiver<()>,
         features: FeatureFlags,
         local_documents: Option<Arc<LocalDocumentStore>>,
+        /// The checkout a local session's plan lives in, which is otherwise the test's own
+        /// working directory.
+        host_cwd: Option<PathBuf>,
     }
 
     impl WorkflowSession {
@@ -5873,6 +6231,7 @@ complete(#{ report: first.output });
                 started,
                 features: FeatureFlags::all(),
                 local_documents: None,
+                host_cwd: None,
                 _temp: temp,
             }
         }
@@ -5895,7 +6254,7 @@ complete(#{ report: first.output });
             workspace: Option<WorkspaceSession>,
             background: bool,
         ) -> InteractiveHandle {
-            self.spawn_with(workflows, workspace, background, None)
+            self.spawn_with(workflows, workspace, background, None, None)
                 .await
         }
 
@@ -5905,6 +6264,7 @@ complete(#{ report: first.output });
             workspace: Option<WorkspaceSession>,
             background: bool,
             automations: Option<AutomationParams>,
+            autopilot: Option<AutopilotParams>,
         ) -> InteractiveHandle {
             let binding = workspace.as_ref().map(|workspace| {
                 StoredWorkspaceBinding::new_with_cursor(
@@ -5983,9 +6343,10 @@ complete(#{ report: first.output });
                 }),
                 workspace_session: workspace,
                 remote_project_context: context,
-                host_cwd: None,
+                host_cwd: self.host_cwd.clone(),
                 local_documents: self.local_documents.clone(),
                 automations,
+                autopilot,
             };
             spawn_prepared_session(
                 PreparedInteractive {
@@ -7561,6 +7922,7 @@ complete(#{ report: first.output });
     const GREETER: &str = "greeter";
     const WATCHER: &str = "watcher";
     const GOALS: &str = "goals";
+    const FIRE_ID: &str = "fire-1";
     const GUIDE: &str = "guide";
     const AUTOMATION_MESSAGE: &str = "check CI";
     const GUIDANCE: &str = "check the parser first";
@@ -7654,7 +8016,7 @@ complete(#{ report: first.output });
                 user_config_dir: Some(self.config_dir.path().to_path_buf()),
             };
             self.session
-                .spawn_with(true, None, true, Some(automations))
+                .spawn_with(true, None, true, Some(automations), None)
                 .await
         }
     }
@@ -7791,7 +8153,21 @@ complete(#{ report: first.output });
     /// keeps its controls.
     async fn served(
         fixture: &AutomationFixture,
+        store: SessionStore,
+    ) -> (
+        AutomationRuntime,
+        Arc<SessionAutomations>,
+        Receiver<AutomationEvent>,
+        Arc<Mutex<Option<SessionStore>>>,
+    ) {
+        served_beside(fixture, store, None).await
+    }
+
+    /// As [`served`], in a session with `autopilot`.
+    async fn served_beside(
+        fixture: &AutomationFixture,
         mut store: SessionStore,
+        autopilot: Option<AutopilotHandle>,
     ) -> (
         AutomationRuntime,
         Arc<SessionAutomations>,
@@ -7805,6 +8181,7 @@ complete(#{ report: first.output });
             },
             mode: Arc::new(|| AgentMode::Build),
             fast: false,
+            autopilot,
         };
         let (runtime, automations, host) =
             pending.spawn(None, &mut store).await.expect(NO_AUTOMATIONS);
@@ -8244,7 +8621,7 @@ complete(#{ report: first.output });
         });
     }
 
-    fn met_goal() -> AgentEvent {
+    fn met_goal(autopilot_owned: bool) -> AgentEvent {
         AgentEvent::GoalFinished {
             result: GoalResult {
                 condition: GOAL.into(),
@@ -8256,19 +8633,27 @@ complete(#{ report: first.output });
                 cost: None,
                 subscription_cost: None,
             },
+            autopilot_owned,
         }
     }
 
-    fn cleared_goal() -> AgentEvent {
+    fn cleared_goal(autopilot_owned: bool) -> AgentEvent {
         AgentEvent::GoalClearedAfterError {
             condition: GOAL.into(),
             message: TURN_FAILURE.into(),
+            autopilot_owned,
         }
     }
 
-    #[test_case(met_goal(), FinishedVerdict::Met; "met")]
-    #[test_case(cleared_goal(), FinishedVerdict::Cleared; "cleared_after_an_error")]
-    fn a_goal_that_ends_fires_goal_finished(event: AgentEvent, verdict: FinishedVerdict) {
+    #[test_case(met_goal(false), FinishedVerdict::Met, false; "met")]
+    #[test_case(met_goal(true), FinishedVerdict::Met, true; "met_while_autopilot_owned_it")]
+    #[test_case(cleared_goal(false), FinishedVerdict::Cleared, false; "cleared_after_an_error")]
+    #[test_case(cleared_goal(true), FinishedVerdict::Cleared, true; "cleared_while_autopilot_owned_it")]
+    fn a_goal_that_ends_fires_goal_finished(
+        event: AgentEvent,
+        verdict: FinishedVerdict,
+        autopilot: bool,
+    ) {
         smol::block_on(async {
             let fixture = AutomationFixture::default();
             write_script(
@@ -8291,9 +8676,49 @@ complete(#{ report: first.output });
             stop_runtime(runtime).await;
 
             assert_eq!(
-                (detail.verdict, detail.condition.as_str()),
-                (verdict, GOAL),
+                (detail.verdict, detail.condition.as_str(), detail.autopilot),
+                (verdict, GOAL, autopilot),
                 "{GOAL_REPORTED}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_claimed_goal_never_replaces_one_autopilot_owns() {
+        smol::block_on(async {
+            let fixture = AutomationFixture::default();
+            let autopilot = AutopilotHandle::default();
+            autopilot.engage(true);
+            let (runtime, automations, host, _) =
+                served_beside(&fixture, fixture_store(&fixture), Some(autopilot)).await;
+            let goal = GoalHandle::default();
+            goal.set(OTHER_GOAL).unwrap();
+            let claim = OutboxClaim {
+                automation: GOALS.into(),
+                fire_id: FIRE_ID.into(),
+                seq: 0,
+                text: GOAL.into(),
+                attach: None,
+                goal: Some(GoalClaim {
+                    condition: GOAL.into(),
+                    continuation_limit: None,
+                    replace: true,
+                }),
+            };
+
+            automations.set_goal(&goal, &claim);
+            let refused = notice(&host).await;
+            stop_runtime(runtime).await;
+
+            assert_eq!(goal.active_condition().as_deref(), Some(OTHER_GOAL));
+            assert_eq!(
+                refused,
+                (
+                    GOALS.to_owned(),
+                    Some(FIRE_ID.to_owned()),
+                    GOAL_OWNED_BY_AUTOPILOT.to_owned()
+                ),
+                "{REFUSAL_NOTICED}"
             );
         });
     }
@@ -8407,5 +8832,376 @@ complete(#{ report: first.output });
                 "{REARMS_ON_RESUME}"
             );
         });
+    }
+
+    const AUTOPILOT_CONTINUATIONS: u32 = 10;
+    const RESUMED_CONTINUATIONS: u32 = 2;
+    const PLAN_FILE: &str = "plan.md";
+    const PLAN_TEXT: &str = "# Plan: retry uploads\nWrap the upload in a retry loop.";
+    const OTHER_PLAN_TEXT: &str = "# Plan: a subagent's notes";
+    const PLAN_READY: &str = "The plan is written. Shall I implement it?";
+    const PLAN_WRITE_CALL: &str = "plan-write";
+    const IMPLEMENT_VERDICT: &str = r#"{"action":"implement","reason":"the plan covers it"}"#;
+    const IMPLEMENT_SEQ: u32 = 3;
+    #[cfg(unix)]
+    const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+    const IMPLEMENT_RUN: u64 = 4;
+    const CHILD_TASK: &str = "autopilot-child";
+    const NO_AUTOPILOT: &str = "the session must attach an autopilot while the experiment is on";
+    const ANNOUNCED_ONCE: &str = "an engagement must be announced once, and its end once";
+    const INTERRUPT_ENDS: &str = "an interrupt must end autopilot as the interrupt's stop";
+    const IMPLEMENTED: &str =
+        "the plan autopilot chose must run in build mode, opened by autopilot's implement message";
+    const COUNTED_ONCE: &str = "a run autopilot starts must count one continuation";
+    const RESUMED_ENGAGED: &str = "a resumed engagement must stay engaged with the budget it used";
+    const RESUMED_CHECKIN: &str = "a resumed engagement must owe its goal one check-in";
+    const MAIN_PLAN_ONLY: &str = "only the main agent's plan and choice may be implemented";
+    const SPEND_COUNTED: &str = "a subagent's spend must reach the autopilot cost limit";
+
+    fn autopilot_params() -> AutopilotParams {
+        AutopilotParams {
+            limits: AutopilotConfig {
+                max_continuations: AUTOPILOT_CONTINUATIONS,
+                ..AutopilotConfig::default()
+            },
+            mode: Arc::new(|| AgentMode::Build) as ModeResolver,
+            fast: false,
+        }
+    }
+
+    fn answer_text(text: &str) -> StreamResponse {
+        let mut response = text_answer();
+        response.message.content = vec![ContentBlock::Text { text: text.into() }];
+        response
+    }
+
+    fn plan_write_response() -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    PLAN_WRITE_CALL,
+                    plan::NAME,
+                    serde_json::json!({"action": "write", "content": PLAN_TEXT}),
+                )],
+                ..Default::default()
+            },
+            stop_reason: Some(StopReason::ToolUse),
+            ..Default::default()
+        }
+    }
+
+    async fn next_autopilot_event(events: &Receiver<Envelope>) -> AutopilotEvent {
+        loop {
+            if let AgentEvent::Autopilot(event) =
+                events.recv_async().await.expect(EVENTS_CLOSED).event
+            {
+                return event;
+            }
+        }
+    }
+
+    fn child() -> SubagentInfo {
+        SubagentInfo {
+            parent_tool_use_id: CHILD_TASK.into(),
+            task_id: CHILD_TASK.into(),
+            name: CHILD_TASK.into(),
+            prompt: None,
+            model: None,
+            thinking: None,
+            fast: false,
+            answer_tx: None,
+            steer_tx: None,
+        }
+    }
+
+    fn written_plan(content: &str) -> AgentEvent {
+        let mut done = crate::ToolDoneEvent::error(PLAN_WRITE_CALL.into(), "written");
+        done.tool = plan::NAME.into();
+        done.is_error = false;
+        done.annotation = Some(
+            PlanWriteResult::new(
+                PlanTarget::Local(Path::new(CWD).join(PLAN_FILE)),
+                content.into(),
+            )
+            .annotation()
+            .unwrap(),
+        );
+        AgentEvent::ToolDone(Box::new(done))
+    }
+
+    #[test]
+    fn an_engagement_is_announced_once_and_an_interrupt_ends_it() {
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let handle = session
+                .spawn_with(false, None, false, None, Some(autopilot_params()))
+                .await;
+            let autopilot = handle.autopilot.clone().expect(NO_AUTOPILOT);
+            let interrupted = AutopilotEnd::Stopped {
+                by: AutopilotStopper::Interrupt,
+            };
+
+            handle.engage_autopilot(false);
+            handle.engage_autopilot(true);
+            handle.interrupt().await.unwrap();
+
+            assert_eq!(
+                [
+                    next_autopilot_event(&handle.event_rx).await,
+                    next_autopilot_event(&handle.event_rx).await,
+                ],
+                [
+                    AutopilotEvent::Engaged,
+                    AutopilotEvent::Ended {
+                        reason: interrupted.clone(),
+                    },
+                ],
+                "{ANNOUNCED_ONCE}"
+            );
+            assert!(!autopilot.is_engaged(), "{INTERRUPT_ENDS}");
+            assert!(
+                !handle.end_autopilot(AutopilotStopper::Sdk),
+                "{ANNOUNCED_ONCE}"
+            );
+            shutdown_interactive(handle).await;
+            let stored = StoredSession::load(session_id(), &session.state_dir)
+                .unwrap()
+                .meta
+                .autopilot
+                .expect(INTERRUPT_ENDS);
+            assert_eq!(
+                (stored.engaged, stored.last_end),
+                (false, Some(interrupted)),
+                "{INTERRUPT_ENDS}"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_plan_autopilot_chose_runs_in_build_mode_under_its_implement_message() {
+        smol::block_on(async {
+            crate::tools::native::register(ToolRegistry::global(), FeatureFlags::all()).unwrap();
+            let mut session = WorkflowSession::new(false);
+            session.host_cwd = Some(session.project.clone());
+            for private in [session.state_dir.persistent_path(), &session.project] {
+                std::fs::set_permissions(private, Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+                    .unwrap();
+            }
+            let (responses, rx) = flume::unbounded();
+            *session.provider.responses.lock().unwrap() = Some(rx);
+            let handle = session
+                .spawn_with(false, None, false, None, Some(autopilot_params()))
+                .await;
+            let autopilot = handle.autopilot.clone().expect(NO_AUTOPILOT);
+            handle.engage_autopilot(false);
+            handle
+                .set_mode(
+                    AgentMode::Plan(session.project.join(PLAN_FILE)),
+                    PermissionMode::Yolo,
+                )
+                .await
+                .unwrap();
+            for response in [
+                plan_write_response(),
+                answer_text(PLAN_READY),
+                answer_text(IMPLEMENT_VERDICT),
+                text_answer(),
+            ] {
+                responses.send(response).unwrap();
+            }
+
+            handle.input_tx.send(prompt(PLANNING_PROMPT)).unwrap();
+            let planned = turn_events(&handle.event_rx).await;
+            let chosen: Vec<_> = planned
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::Autopilot(AutopilotEvent::ImplementPlan { seq }) => Some(*seq),
+                    _ => None,
+                })
+                .collect();
+            let [seq] = chosen[..] else {
+                panic!("{IMPLEMENTED}: {planned:?}");
+            };
+            wait_for_turn(&handle.event_rx).await;
+
+            let requests = session.provider.requests.lock().unwrap().clone();
+            let implement_run = requests.last().expect(IMPLEMENTED);
+            assert!(
+                implement_run.iter().any(|message| {
+                    message.autopilot_event
+                        == Some(AutopilotOrigin {
+                            seq,
+                            kind: AutopilotMessageKind::Implement,
+                        })
+                        && message
+                            .user_text()
+                            .is_some_and(|text| text.contains(PLAN_TEXT))
+                }),
+                "{IMPLEMENTED}"
+            );
+            assert_eq!(
+                handle.mode_route.mode.load_full().as_deref(),
+                Some(&AgentMode::Build),
+                "{IMPLEMENTED}"
+            );
+            assert_eq!(
+                autopilot.stored().map(|stored| stored.continuations),
+                Some(1),
+                "{COUNTED_ONCE}"
+            );
+            shutdown_interactive(handle).await;
+        });
+    }
+
+    #[test]
+    fn a_resumed_engagement_keeps_its_budget_and_owes_its_goal_one_checkin() {
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let (responses, rx) = flume::unbounded();
+            *session.provider.responses.lock().unwrap() = Some(rx);
+            let mut stored = SessionStore::open_in(
+                session.state_dir.clone(),
+                session_id(),
+                &session.project.to_string_lossy(),
+                MODEL_SPEC,
+            )
+            .unwrap();
+            stored.goal.set(GOAL).unwrap();
+            stored.session.meta.autopilot = Some(Box::new(StoredAutopilot {
+                engaged: true,
+                owns_goal: true,
+                engaged_at_ms: None,
+                continuations: RESUMED_CONTINUATIONS,
+                cost_usd: 0.0,
+                subscription_cost_usd: 0.0,
+                elapsed_ms: 0,
+                last_end: None,
+            }));
+            stored.save().unwrap();
+            drop(stored);
+
+            let handle = session
+                .spawn_with(false, None, false, None, Some(autopilot_params()))
+                .await;
+            let autopilot = handle.autopilot.clone().expect(NO_AUTOPILOT);
+            session.started.recv_async().await.unwrap();
+
+            let resumed = autopilot.stored().expect(RESUMED_ENGAGED);
+            assert_eq!(
+                (resumed.engaged, resumed.owns_goal, resumed.continuations),
+                (true, true, RESUMED_CONTINUATIONS + 1),
+                "{RESUMED_ENGAGED}"
+            );
+            let checkin = agent::goal_checkin_message(GOAL);
+            assert!(
+                session
+                    .provider
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message.first_text_content() == Some(checkin.as_str())),
+                "{RESUMED_CHECKIN}"
+            );
+            responses.send(text_answer()).unwrap();
+            responses.send(goal_met()).unwrap();
+            let checked = turn_events(&handle.event_rx).await;
+            assert!(
+                checked
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::GoalFinished { .. })),
+                "{RESUMED_CHECKIN}"
+            );
+            shutdown_interactive(handle).await;
+        });
+    }
+
+    #[test]
+    fn the_plan_handoff_takes_only_the_main_agent_s_choice_and_plan() {
+        let handoff = PlanHandoff::default();
+        let main = |event| Envelope {
+            event,
+            subagent: None,
+            run_id: IMPLEMENT_RUN,
+            task: None,
+            workflow: None,
+        };
+
+        handoff.observe(&main(written_plan(PLAN_TEXT)));
+        handoff.observe(&Envelope {
+            subagent: Some(child()),
+            ..main(written_plan(OTHER_PLAN_TEXT))
+        });
+        handoff.observe(&Envelope {
+            subagent: Some(child()),
+            ..main(AgentEvent::Autopilot(AutopilotEvent::ImplementPlan {
+                seq: IMPLEMENT_SEQ + 1,
+            }))
+        });
+        assert!(!handoff.chosen_by(IMPLEMENT_RUN), "{MAIN_PLAN_ONLY}");
+        handoff.observe(&main(AgentEvent::Autopilot(
+            AutopilotEvent::ImplementPlan { seq: IMPLEMENT_SEQ },
+        )));
+
+        assert!(
+            handoff.take(IMPLEMENT_RUN + 1).is_none(),
+            "{MAIN_PLAN_ONLY}"
+        );
+        let (seq, plan) = handoff.take(IMPLEMENT_RUN).expect(MAIN_PLAN_ONLY);
+        assert_eq!(
+            (seq, plan.content()),
+            (IMPLEMENT_SEQ, PLAN_TEXT),
+            "{MAIN_PLAN_ONLY}"
+        );
+        assert!(handoff.take(IMPLEMENT_RUN).is_none(), "{MAIN_PLAN_ONLY}");
+    }
+
+    #[test_case(true, LedgerPurpose::Chat => true; "a_subagent_turn")]
+    #[test_case(true, LedgerPurpose::Autopilot => false; "the_delegate_counted_where_it_is_made")]
+    #[test_case(false, LedgerPurpose::Chat => false; "the_main_agent_counting_its_own")]
+    fn a_subagent_s_spend_reaches_the_autopilot_cost_limit(
+        subagent: bool,
+        purpose: LedgerPurpose,
+    ) -> bool {
+        let autopilot = AutopilotHandle::default();
+        autopilot.set_limits(AutopilotConfig {
+            max_cost: Some(TURN_COST),
+            ..AutopilotConfig::default()
+        });
+        autopilot.engage(false);
+        let (events_tx, events) = flume::unbounded();
+        let AgentEvent::TurnComplete(mut turn) = answered(TURN_COST) else {
+            unreachable!("answered is a completed turn");
+        };
+        turn.purpose = purpose;
+
+        record_subagent_autopilot_spend(
+            &autopilot,
+            &Envelope {
+                event: AgentEvent::TurnComplete(turn),
+                subagent: subagent.then(child),
+                run_id: IMPLEMENT_RUN,
+                task: None,
+                workflow: None,
+            },
+            &events_tx.downgrade(),
+        );
+
+        let ended = events.try_iter().any(|envelope| {
+            matches!(
+                envelope.event,
+                AgentEvent::Autopilot(AutopilotEvent::Ended {
+                    reason: AutopilotEnd::Budget {
+                        kind: AutopilotBudget::Cost,
+                    },
+                })
+            )
+        });
+        assert_eq!(ended, !autopilot.is_engaged(), "{SPEND_COUNTED}");
+        ended
     }
 }

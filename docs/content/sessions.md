@@ -11,6 +11,8 @@ Managed sandbox sessions retain their sandbox source. `caudra --session ID` reso
 
 Resuming a session bound to a managed sandbox needs `experimental.sandboxes`, and one bound to a direct remote workspace needs `experimental.remote_workcell`. The rule covers `--continue`, `--session`, the session picker, the SDK, and ACP. Without the switch, resume fails with an error and never falls back to local execution. The session data stays intact, so the session resumes once the switch is on. See [Experimental features](/docs/configuration/#experimental-features).
 
+A session that ran under [autopilot](/docs/autopilot/#resume) resumes engaged, with the budget it has used, and so does one that [moved](#moving-sessions-to-another-directory) to another directory.
+
 ## Active sessions
 
 One Caudra runtime can own a session ID at a time. Opening that session from
@@ -182,7 +184,7 @@ The menu offers:
 | Completed tool | Includes the call and result | Empty |
 | Incomplete tool call | Includes the call; history repair supplies an unavailable result | Empty |
 
-The child receives a new session ID and a title such as `Original title (fork #1)`. It copies the selected ancestor path, reachable tool outputs and subagent histories, and model and execution settings. It also holds the parent's [file change records](#file-revert), so the child can revert files too, and it copies no file data. It gets its own copy of the parent's [plan](/docs/tools/#plan), ready to implement if the parent's was. If that copy fails, the child starts without a plan and Caudra shows a warning. Usage totals, goals, queues, pending revert state, conversation permission rules, and explicit YOLO state start clean. So do [automations](/docs/automations/#storage): the child copies none of their bindings, args, state, or firings.
+The child receives a new session ID and a title such as `Original title (fork #1)`. It copies the selected ancestor path, reachable tool outputs and subagent histories, and model and execution settings. It also holds the parent's [file change records](#file-revert), so the child can revert files too, and it copies no file data. It gets its own copy of the parent's [plan](/docs/tools/#plan), ready to implement if the parent's was. If that copy fails, the child starts without a plan and Caudra shows a warning. Usage totals, goals, queues, pending revert state, conversation permission rules, and explicit YOLO state start clean. So do [automations](/docs/automations/#storage): the child copies none of their bindings, args, state, or firings. [Autopilot](/docs/autopilot/) starts disengaged in the child, with an empty decision log.
 
 Subtasks are different from user-created forks. They share the root conversation's permission rules. Resuming that root restores its rules, while `/new` starts a clean root.
 

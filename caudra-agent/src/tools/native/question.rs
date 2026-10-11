@@ -8,16 +8,21 @@
 
 use std::borrow::Cow;
 
+use flume::Receiver;
+use futures_lite::future;
 use serde_json::Value;
+use tracing::debug;
 
-use crate::AgentEvent;
+use crate::autopilot::question::QuestionDelegate;
+use crate::autopilot::{DelegateAction, DelegateOutcome, DelegateOutput};
 use crate::tools::registry::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolFailure,
     ToolInvocation,
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{DescriptionContext, ToolAudience, ToolContext};
-use crate::types::{Answer, AskedQuestion, QuestionEvent, QuestionOption, ToolOutput};
+use crate::types::{Answer, Answerer, AskedQuestion, QuestionEvent, QuestionOption, ToolOutput};
+use crate::{AgentEvent, EventSender};
 
 pub const DESCRIPTION: &str = "Use this tool when you need to ask the user questions during execution. This allows you to:
 1. Gather user preferences or requirements
@@ -36,6 +41,11 @@ const NO_ANSWER: &str = "(no answer)";
 const NO_UI: &str = "no answer channel: the question tool needs an interactive front end";
 const CANCELLED: &str = "cancelled";
 const MULTI_SELECT_FIELD: &str = "multiSelect";
+/// Opens the result of a form autopilot answered, so the model never takes
+/// the picks for the user's own.
+pub const AUTOPILOT_ANSWERED: &str = "Autopilot answered on the user's behalf:";
+const UNFIT_ANSWER: &str = "the answer does not fit the form: it needs one list of labels per \
+question, each with a label, and a single label where the question takes one";
 
 static LABEL_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::String,
@@ -159,8 +169,27 @@ fn parse_option(raw: &Value) -> QuestionOption {
     }
 }
 
+/// Whether a `question` result is autopilot's answer, which is never the
+/// user's own words.
+pub fn answered_by_autopilot(result: &str) -> bool {
+    result
+        .strip_prefix(AUTOPILOT_ANSWERED)
+        .is_some_and(|rest| rest.starts_with('\n'))
+}
+
 struct QuestionCall {
     questions: Vec<AskedQuestion>,
+}
+
+/// What ended the wait for an answer.
+enum Reply {
+    Human(String),
+    Autopilot(Vec<Answer>),
+}
+
+enum Woken {
+    Human(Option<String>),
+    Delegate(Option<DelegateOutcome>),
 }
 
 impl ToolInvocation for QuestionCall {
@@ -179,26 +208,112 @@ impl ToolInvocation for QuestionCall {
             // taken before the ask goes out: nothing else may consume the
             // reply meant for this form.
             let guard = rx.lock().await;
+            let autopilot = ctx.permissions.autopilot();
+            if autopilot.is_some() {
+                drop_stale_replies(&guard);
+            }
+            let delegate = autopilot
+                .filter(|handle| asked_by_main_agent(ctx) && handle.is_engaged())
+                .map(|handle| {
+                    QuestionDelegate::new(handle, &self.questions, ctx.tool_use_id.clone())
+                });
             let _ = ctx
                 .event_tx
                 .send(AgentEvent::Question(Box::new(QuestionEvent {
                     questions: self.questions.clone(),
                 })));
-            let reply = ctx.cancel.race(guard.recv_async()).await;
+            let reply = ctx.cancel.race(self.wait(ctx, &guard, delegate)).await;
             drop(guard);
 
-            let raw = match reply {
-                Ok(Ok(raw)) => raw,
+            match reply {
+                Ok(Some(Reply::Human(raw))) => self.report(&raw),
+                Ok(Some(Reply::Autopilot(answers))) => self.answered(answers),
                 // A cancel and a dropped channel are both "no answer is
                 // coming"; the run is ending either way.
-                _ => return error(ToolFailure::Cancelled, CANCELLED),
-            };
-            self.report(&raw)
+                _ => error(ToolFailure::Cancelled, CANCELLED),
+            }
         })
     }
 }
 
+/// Autopilot answers only the main agent, the one the user is watching.
+fn asked_by_main_agent(ctx: &ToolContext) -> bool {
+    ctx.audience.contains(ToolAudience::MAIN) && ctx.root_tool_use_id.is_none()
+}
+
+/// In a session with autopilot, a front end replies only to a form it shows,
+/// and this form is not shown yet. A reply already waiting answered an earlier
+/// form, one autopilot answered while the human was still on it, and must not
+/// answer this one.
+fn drop_stale_replies(replies: &Receiver<String>) {
+    let stale = replies.drain().count();
+    if stale > 0 {
+        debug!(stale, "dropped replies to an earlier question");
+    }
+}
+
 impl QuestionCall {
+    /// Waits for the human, racing the delegate when autopilot may answer.
+    /// The human always wins: an answer of theirs ends the delegate's call,
+    /// and one that lands with the delegate's is taken over it. `None` when
+    /// the channel closed or the run was cancelled.
+    async fn wait(
+        &self,
+        ctx: &ToolContext,
+        replies: &Receiver<String>,
+        delegate: Option<QuestionDelegate>,
+    ) -> Option<Reply> {
+        if let Some(delegate) = delegate {
+            delegate.announce(&ctx.event_tx);
+            let woken = future::or(
+                async { Woken::Human(replies.recv_async().await.ok()) },
+                async { Woken::Delegate(delegate.decide(&ctx.event_tx, &ctx.cancel).await) },
+            )
+            .await;
+            match woken {
+                Woken::Human(reply) => return reply.map(Reply::Human),
+                Woken::Delegate(None) => return None,
+                Woken::Delegate(Some(outcome)) => {
+                    if let Some(answers) = self.conclude(&delegate, outcome, &ctx.event_tx) {
+                        return Some(
+                            replies
+                                .try_recv()
+                                .map_or(Reply::Autopilot(answers), Reply::Human),
+                        );
+                    }
+                }
+            }
+        }
+        replies.recv_async().await.ok().map(Reply::Human)
+    }
+
+    /// Takes the delegate's answers when the form accepts them and the human
+    /// has not taken the form first, and records the decision either way. An
+    /// answer the form does not accept is recorded as an escalation.
+    fn conclude(
+        &self,
+        delegate: &QuestionDelegate,
+        mut outcome: DelegateOutcome,
+        event_tx: &EventSender,
+    ) -> Option<Vec<Answer>> {
+        let answers = match &outcome.answer {
+            Ok(DelegateOutput {
+                action: DelegateAction::Answer { answers },
+                ..
+            }) => {
+                let fitting = delegated_answers(&self.questions, answers);
+                if fitting.is_none() {
+                    outcome.answer = Err(UNFIT_ANSWER.into());
+                }
+                fitting
+            }
+            _ => None,
+        };
+        let taken = answers.filter(|_| delegate.claim());
+        delegate.record(&outcome, event_tx);
+        taken
+    }
+
     /// The front end answers with one label list per question, in order. A
     /// reply that does not parse is a dismissal: the form is gone and there is
     /// nothing left to ask.
@@ -206,6 +321,10 @@ impl QuestionCall {
         let Some(answers) = parse_answers(&self.questions, raw) else {
             return ToolExecResult::from(Ok(ToolOutput::Plain(DISMISSED.into())));
         };
+        self.answered(answers)
+    }
+
+    fn answered(&self, answers: Vec<Answer>) -> ToolExecResult {
         let text = format_answers(&self.questions, &answers);
         ToolExecResult {
             model_output: Some(text),
@@ -219,24 +338,41 @@ impl QuestionCall {
 /// indexes by question number, never by answer position.
 fn parse_answers(questions: &[AskedQuestion], raw: &str) -> Option<Vec<Answer>> {
     let picked: Vec<Vec<String>> = serde_json::from_str(raw).ok()?;
-    Some(
-        questions
-            .iter()
-            .enumerate()
-            .map(|(index, question)| Answer {
-                header: question.header.clone(),
-                labels: picked.get(index).cloned().unwrap_or_default(),
-                question: question.question.clone(),
-                options: question.options.clone(),
-            })
-            .collect(),
-    )
+    Some(answers_to(questions, &picked, Answerer::User))
+}
+
+/// The delegate's picks as the answers a human reply would make, `None` when
+/// the form could not have sent them: one list per question, each with a
+/// label, and a single one where the question takes one. A label may be the
+/// delegate's own words, as the human's may be.
+fn delegated_answers(questions: &[AskedQuestion], picked: &[Vec<String>]) -> Option<Vec<Answer>> {
+    let fits = picked.len() == questions.len()
+        && questions.iter().zip(picked).all(|(question, labels)| {
+            !labels.is_empty()
+                && (question.multiple || labels.len() == 1)
+                && labels.iter().all(|label| !label.trim().is_empty())
+        });
+    fits.then(|| answers_to(questions, picked, Answerer::Autopilot))
+}
+
+fn answers_to(questions: &[AskedQuestion], picked: &[Vec<String>], by: Answerer) -> Vec<Answer> {
+    questions
+        .iter()
+        .enumerate()
+        .map(|(index, question)| Answer {
+            header: question.header.clone(),
+            labels: picked.get(index).cloned().unwrap_or_default(),
+            question: question.question.clone(),
+            options: question.options.clone(),
+            by,
+        })
+        .collect()
 }
 
 /// The questions sit in the tool input right above this result, and inputs
 /// outlive outputs through compaction, so only the picked labels are sent.
 fn format_answers(questions: &[AskedQuestion], answers: &[Answer]) -> String {
-    answers
+    let lines = answers
         .iter()
         .enumerate()
         .map(|(index, answer)| {
@@ -260,7 +396,11 @@ fn format_answers(questions: &[AskedQuestion], answers: &[Answer]) -> String {
                 .map(|q| format!("{}: {NO_ANSWER}", q.header)),
         )
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    if answers.iter().all(|answer| answer.by.is_user()) {
+        return lines;
+    }
+    format!("{AUTOPILOT_ANSWERED}\n{lines}")
 }
 
 fn error(failure: ToolFailure, message: &'static str) -> ToolExecResult {
@@ -269,19 +409,363 @@ fn error(failure: ToolFailure, message: &'static str) -> ToolExecResult {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::Arc;
 
-    use super::*;
-    use crate::AgentMode;
-    use crate::tools::test_support::stub_ctx;
+    use caudra_config::PermissionsConfig;
+    use caudra_storage::autopilot::{AutopilotEnd, AutopilotStopper};
     use serde_json::json;
     use test_case::test_case;
+
+    use super::*;
+    use crate::autopilot::{
+        ActionName, AutopilotDecision, AutopilotHandle, DecisionKind, GatedProvider,
+        ScriptedProvider, Step, engaged_handle,
+    };
+    use crate::permissions::PermissionManager;
+    use crate::tools::test_support::{stub_ctx, stub_ctx_with_permissions};
+    use crate::types::AutopilotEvent;
+    use crate::{AgentMode, Envelope};
 
     const PICK: &str = "Pick one";
     const HEADER: &str = "Choice";
     const YES: &str = "Yes";
     const NO: &str = "No";
     const CUSTOM: &str = "something else entirely";
+    const CWD: &str = "/tmp";
+    const TOOL_USE_ID: &str = "toolu_question";
+    const PARENT_CALL: &str = "toolu_task";
+    const ANSWER_YES: &str =
+        r#"{"action":"answer","reason":"the user asked for yes","answers":[["Yes"]]}"#;
+    const ANSWER_EACH: &str =
+        r#"{"action":"answer","reason":"one for each","answers":[["Yes"],["No"]]}"#;
+    const ANSWER_BOTH: &str =
+        r#"{"action":"answer","reason":"both apply","answers":[["Yes","No"]]}"#;
+    const ANSWER_NOTHING: &str = r#"{"action":"answer","reason":"no idea","answers":[[]]}"#;
+    const ANSWER_BLANK: &str = r#"{"action":"answer","reason":"blank","answers":[["  "]]}"#;
+    const ESCALATE_REASON: &str = "only the user can choose";
+    const ESCALATE: &str = r#"{"action":"escalate","reason":"only the user can choose"}"#;
+    const STOPPED: AutopilotEnd = AutopilotEnd::Stopped {
+        by: AutopilotStopper::Command,
+    };
+    const AUTOPILOT_WINS: &str = "the delegate must answer a form the human leaves alone";
+    const HUMAN_WINS: &str = "the human's answer must win over the delegate's";
+    const CUT_OFF: &str = "the human's answer must end the delegate's call";
+    const LEFT_TO_HUMAN: &str = "a form the delegate cannot answer must stay the human's";
+    const UNTOUCHED: &str = "without an engaged main autopilot the question must wait as before";
+    const STALE: &str = "a late reply to an earlier form must never answer this one";
+    const OLD_SHAPE: &str = "a user's answer must keep the shape older sessions stored";
+
+    /// A main-agent question context that answers on `replies` and reports on
+    /// `events`, with `autopilot` on its session's permissions.
+    struct Asked {
+        ctx: ToolContext,
+        events: Receiver<Envelope>,
+        replies: flume::Sender<String>,
+    }
+
+    impl Asked {
+        fn new(autopilot: Option<AutopilotHandle>) -> Self {
+            let permissions = Arc::new(PermissionManager::new_nonpersistent(
+                PermissionsConfig::default(),
+                PathBuf::from(CWD),
+                Arc::default(),
+            ));
+            permissions.set_autopilot(autopilot);
+            let mut ctx = stub_ctx_with_permissions(&AgentMode::Build, permissions);
+            let (raw_tx, events) = flume::unbounded();
+            ctx.event_tx = EventSender::new(raw_tx, 0);
+            ctx.tool_use_id = Some(TOOL_USE_ID.into());
+            let (replies, rx) = flume::unbounded();
+            ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(rx)));
+            Self {
+                ctx,
+                events,
+                replies,
+            }
+        }
+
+        fn ask(&self) -> ToolExecResult {
+            smol::block_on(call().execute(&self.ctx))
+        }
+
+        /// Asks, and runs `human` beside the wait.
+        fn ask_with<T>(&self, human: impl Future<Output = T>) -> (ToolExecResult, T) {
+            smol::block_on(future::zip(call().execute(&self.ctx), human))
+        }
+
+        async fn next(&self, wanted: impl Fn(&AgentEvent) -> bool) -> AgentEvent {
+            loop {
+                let event = self.events.recv_async().await.unwrap().event;
+                if wanted(&event) {
+                    return event;
+                }
+            }
+        }
+
+        async fn asked(&self) {
+            self.next(|event| matches!(event, AgentEvent::Question(_)))
+                .await;
+        }
+
+        async fn decided(&self) -> AutopilotDecision {
+            let event = self
+                .next(|event| matches!(event, AgentEvent::Autopilot(AutopilotEvent::Decided(_))))
+                .await;
+            let AgentEvent::Autopilot(AutopilotEvent::Decided(decision)) = event else {
+                unreachable!("only a decision is waited for");
+            };
+            *decision
+        }
+
+        fn reply(&self, labels: &[&str]) {
+            self.replies.send(json!([labels]).to_string()).unwrap();
+        }
+
+        fn autopilot_events(&self) -> Vec<AutopilotEvent> {
+            self.events
+                .drain()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::Autopilot(event) => Some(event),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    fn call() -> Box<QuestionCall> {
+        Box::new(QuestionCall {
+            questions: vec![question(HEADER, false)],
+        })
+    }
+
+    fn answers(result: ToolExecResult) -> Vec<Answer> {
+        let Ok(ToolOutput::Answers(answers)) = result.output else {
+            panic!("the question was answered");
+        };
+        answers
+    }
+
+    fn gated() -> (
+        Arc<GatedProvider>,
+        Receiver<Receiver<()>>,
+        flume::Sender<&'static str>,
+    ) {
+        let (started_tx, started) = flume::unbounded();
+        let (release, release_rx) = flume::unbounded();
+        let provider = Arc::new(GatedProvider {
+            started: started_tx,
+            release: release_rx,
+        });
+        (provider, started, release)
+    }
+
+    #[test]
+    fn the_delegate_answers_a_form_the_human_leaves_alone() {
+        let handle = engaged_handle(ScriptedProvider::new(vec![Step::Answer(ANSWER_YES)]));
+        let asked = Asked::new(Some(handle.clone()));
+
+        let result = asked.ask();
+
+        assert_eq!(
+            result.model_output.as_deref(),
+            Some(format!("{AUTOPILOT_ANSWERED}\n{HEADER}: {YES}").as_str()),
+            "{AUTOPILOT_WINS}"
+        );
+        let answers = answers(result);
+        assert_eq!(answers[0].labels, [YES], "{AUTOPILOT_WINS}");
+        assert_eq!(answers[0].by, Answerer::Autopilot, "{AUTOPILOT_WINS}");
+        assert!(handle.question_claimed(), "{AUTOPILOT_WINS}");
+        let events = asked.autopilot_events();
+        let [
+            AutopilotEvent::Deciding {
+                kind: DecisionKind::Question,
+                subject,
+                ..
+            },
+            AutopilotEvent::Decided(decision),
+        ] = events.as_slice()
+        else {
+            panic!("a decision must be announced and recorded: {events:?}");
+        };
+        assert_eq!(subject, HEADER);
+        assert_eq!(
+            (decision.kind, decision.action),
+            (DecisionKind::Question, ActionName::Answer)
+        );
+        assert_eq!(decision.tool_use_id.as_deref(), Some(TOOL_USE_ID));
+        assert_eq!(decision.agent, None);
+    }
+
+    #[test]
+    fn the_humans_answer_wins_and_ends_the_delegates_call() {
+        let (provider, started, _release) = gated();
+        let handle = engaged_handle(provider);
+        let asked = Asked::new(Some(handle.clone()));
+
+        let (result, running) = asked.ask_with(async {
+            let running = started.recv_async().await.unwrap();
+            asked.reply(&[NO]);
+            running
+        });
+
+        let answers = answers(result);
+        assert_eq!(answers[0].labels, [NO], "{HUMAN_WINS}");
+        assert_eq!(answers[0].by, Answerer::User, "{HUMAN_WINS}");
+        assert!(running.recv().is_err(), "{CUT_OFF}");
+        assert!(handle.recent_decisions().is_empty(), "{CUT_OFF}");
+    }
+
+    #[test]
+    fn a_claim_drops_the_delegates_answer_and_still_records_it() {
+        let (provider, started, release) = gated();
+        let handle = engaged_handle(provider);
+        let asked = Asked::new(Some(handle.clone()));
+
+        let (result, ()) = asked.ask_with(async {
+            let _running = started.recv_async().await.unwrap();
+            assert!(handle.claim_question(), "the human touched the form first");
+            release.send(ANSWER_YES).unwrap();
+            assert_eq!(asked.decided().await.action, ActionName::Answer);
+            asked.reply(&[NO]);
+        });
+
+        let answers = answers(result);
+        assert_eq!(answers[0].labels, [NO], "{HUMAN_WINS}");
+        assert_eq!(answers[0].by, Answerer::User, "{HUMAN_WINS}");
+        assert_eq!(handle.recent_decisions().len(), 1);
+    }
+
+    #[test_case(ANSWER_EACH, UNFIT_ANSWER ; "an_answer_for_a_question_not_asked")]
+    #[test_case(ANSWER_BOTH, UNFIT_ANSWER ; "two_labels_for_a_single_choice")]
+    #[test_case(ANSWER_NOTHING, UNFIT_ANSWER ; "a_question_left_without_a_label")]
+    #[test_case(ANSWER_BLANK, UNFIT_ANSWER ; "a_blank_label")]
+    #[test_case(ESCALATE, ESCALATE_REASON ; "an_escalation")]
+    fn a_form_the_delegate_cannot_answer_stays_the_humans(reply: &'static str, reason: &str) {
+        let handle = engaged_handle(ScriptedProvider::new(vec![Step::Answer(reply)]));
+        let asked = Asked::new(Some(handle));
+
+        let (result, ()) = asked.ask_with(async {
+            let decision = asked.decided().await;
+            assert_eq!(decision.action, ActionName::Escalate, "{LEFT_TO_HUMAN}");
+            assert_eq!(decision.reason, reason, "{LEFT_TO_HUMAN}");
+            asked.reply(&[NO]);
+        });
+
+        assert_eq!(
+            result.model_output.as_deref(),
+            Some(format!("{HEADER}: {NO}").as_str()),
+            "{LEFT_TO_HUMAN}"
+        );
+        assert_eq!(answers(result)[0].by, Answerer::User, "{LEFT_TO_HUMAN}");
+    }
+
+    #[test_case(None, None ; "without_autopilot")]
+    #[test_case(Some(false), None ; "with_autopilot_disengaged")]
+    #[test_case(Some(true), Some(PARENT_CALL) ; "for_a_subagent")]
+    fn only_an_engaged_main_autopilot_takes_part(engaged: Option<bool>, parent: Option<&str>) {
+        let provider = ScriptedProvider::new(Vec::new());
+        let handle = engaged.map(|engaged| {
+            let handle = engaged_handle(provider.clone());
+            if !engaged {
+                handle.end(STOPPED);
+            }
+            handle
+        });
+        let mut asked = Asked::new(handle);
+        asked.ctx.root_tool_use_id = parent.map(str::to_owned);
+
+        let (result, ()) = asked.ask_with(async {
+            asked.asked().await;
+            asked.reply(&[YES]);
+        });
+
+        assert_eq!(
+            result.model_output.as_deref(),
+            Some(format!("{HEADER}: {YES}").as_str()),
+            "{UNTOUCHED}"
+        );
+        assert_eq!(answers(result)[0].by, Answerer::User, "{UNTOUCHED}");
+        assert!(asked.autopilot_events().is_empty(), "{UNTOUCHED}");
+        assert!(provider.prompts().is_empty(), "{UNTOUCHED}");
+    }
+
+    #[test]
+    fn a_late_reply_to_a_form_autopilot_answered_never_answers_the_next() {
+        let handle = engaged_handle(ScriptedProvider::new(vec![Step::Answer(ANSWER_YES)]));
+        let asked = Asked::new(Some(handle.clone()));
+        assert_eq!(answers(asked.ask())[0].by, Answerer::Autopilot);
+        asked.reply(&[NO]);
+        handle.end(STOPPED);
+        asked.events.drain().for_each(drop);
+
+        let (result, ()) = asked.ask_with(async {
+            asked.asked().await;
+            asked.reply(&[CUSTOM]);
+        });
+
+        assert_eq!(answers(result)[0].labels, [CUSTOM], "{STALE}");
+    }
+
+    #[test]
+    fn without_autopilot_a_reply_sent_ahead_still_answers() {
+        let asked = Asked::new(None);
+        asked.reply(&[YES]);
+
+        assert_eq!(answers(asked.ask())[0].labels, [YES], "{UNTOUCHED}");
+    }
+
+    #[test_case(&[YES], true ; "an_offered_label")]
+    #[test_case(&[CUSTOM], true ; "the_delegates_own_words")]
+    #[test_case(&[YES, NO], false ; "two_labels_for_one_choice")]
+    #[test_case(&[], false ; "no_label")]
+    fn the_delegates_picks_fit_the_form_as_a_humans_would(labels: &[&str], fits: bool) {
+        let picked: Vec<Vec<String>> =
+            vec![labels.iter().map(|label| (*label).to_owned()).collect()];
+
+        let answers = delegated_answers(&[question(HEADER, false)], &picked);
+
+        assert_eq!(answers.is_some(), fits);
+    }
+
+    #[test]
+    fn several_labels_fit_a_multi_select() {
+        let picked = vec![vec![YES.to_owned(), NO.to_owned()]];
+
+        assert!(delegated_answers(&[question(HEADER, true)], &picked).is_some());
+    }
+
+    #[test]
+    fn a_users_answer_keeps_its_stored_shape_and_autopilots_says_so() {
+        let user = parse_answers(&[question(HEADER, false)], &json!([[YES]]).to_string()).unwrap();
+        let autopilot =
+            delegated_answers(&[question(HEADER, false)], &[vec![YES.to_owned()]]).unwrap();
+
+        let stored_user = serde_json::to_value(&user).unwrap();
+        let stored_autopilot = serde_json::to_value(&autopilot).unwrap();
+
+        assert_eq!(
+            stored_user,
+            json!([{ "header": HEADER, "labels": [YES] }]),
+            "{OLD_SHAPE}"
+        );
+        let restored: Vec<Answer> = serde_json::from_value(stored_user).unwrap();
+        assert_eq!(restored[0].by, Answerer::User, "{OLD_SHAPE}");
+        let restored: Vec<Answer> = serde_json::from_value(stored_autopilot).unwrap();
+        assert_eq!(restored[0].by, Answerer::Autopilot);
+    }
+
+    #[test]
+    fn only_a_result_autopilot_answered_reads_as_its() {
+        let questions = [question(AUTOPILOT_ANSWERED, false)];
+        let user = parse_answers(&questions, &json!([[YES]]).to_string()).unwrap();
+        let autopilot = delegated_answers(&questions, &[vec![YES.to_owned()]]).unwrap();
+
+        assert!(!answered_by_autopilot(&format_answers(&questions, &user)));
+        assert!(answered_by_autopilot(&format_answers(
+            &questions, &autopilot
+        )));
+    }
 
     fn question(header: &str, multiple: bool) -> AskedQuestion {
         AskedQuestion {

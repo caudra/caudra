@@ -426,6 +426,13 @@ pub(crate) fn write_target(ctx: &ToolContext) -> Result<PlanTarget, ToolError> {
     resolve_target(ctx, PlanAccess::Write)
 }
 
+/// The session plan as it stands, read from where the tool reads it.
+pub(crate) fn read(ctx: &ToolContext) -> Result<String, ToolError> {
+    let cwd = host_cwd(ctx);
+    let authority = PlanAuthority::from_context(ctx, &cwd);
+    authority.read_target(&authority.resolve_target(PlanAccess::Read)?)
+}
+
 fn resolve_target(ctx: &ToolContext, access: PlanAccess) -> Result<PlanTarget, ToolError> {
     PlanAuthority::from_context(ctx, &host_cwd(ctx)).resolve_target(access)
 }

@@ -6,7 +6,9 @@
 //! is rebuilt for every run while history outlives it, and a restored session
 //! has to arrive at the same count.
 
-use caudra_providers::{HistoryItemKind, Message, ToolNameAliases, UserOrigin};
+use caudra_providers::{
+    AutopilotMessageKind, AutopilotOrigin, HistoryItemKind, Message, ToolNameAliases, UserOrigin,
+};
 use serde_json::Value;
 
 use super::compaction::CONTINUE_AFTER_COMPACT;
@@ -44,9 +46,10 @@ pub(super) fn reminder(
 }
 
 /// Compactions since the latest request, or zero once anything since then
-/// started work. Counts the continuation each one leaves rather than its
-/// summary: the summary sits above the turns compaction keeps verbatim, which
-/// can include the request itself.
+/// started work. Autopilot's go-ahead to implement a plan is a request too, as
+/// the approval it stands in for would be. Counts the continuation each one
+/// leaves rather than its summary: the summary sits above the turns compaction
+/// keeps verbatim, which can include the request itself.
 fn stalled_compactions(
     history: &History,
     mode: &AgentMode,
@@ -57,6 +60,14 @@ fn stalled_compactions(
         match &item.kind {
             HistoryItemKind::User {
                 origin: UserOrigin::Turn,
+                ..
+            }
+            | HistoryItemKind::User {
+                autopilot_event:
+                    Some(AutopilotOrigin {
+                        kind: AutopilotMessageKind::Implement,
+                        ..
+                    }),
                 ..
             } => break,
             HistoryItemKind::User {
@@ -144,15 +155,17 @@ mod tests {
     const UNFILLED_SLOT: &str = "the count slot must be filled";
     const WRONG_WORDING: &str = "each mode gets its own wording";
     const NOT_SYNTHETIC: &str = "the reminder must read as Caudra's, not the user's";
+    const AUTOPILOT_SEQ: u32 = 1;
 
     enum Step {
         Request,
         Compacted,
         Synthetic(&'static str),
         Call(&'static str, Value),
+        Autopilot(AutopilotMessageKind),
     }
 
-    use Step::{Call, Compacted, Request, Synthetic};
+    use Step::{Autopilot, Call, Compacted, Request, Synthetic};
 
     fn messages(steps: Vec<Step>) -> Vec<Message> {
         steps
@@ -162,6 +175,13 @@ mod tests {
                 Request => vec![Message::user(REQUEST.into())],
                 Compacted => vec![Message::synthetic(CONTINUE_AFTER_COMPACT.into())],
                 Synthetic(text) => vec![Message::synthetic(text.into())],
+                Autopilot(kind) => vec![Message::autopilot_observation(
+                    REQUEST.into(),
+                    AutopilotOrigin {
+                        seq: AUTOPILOT_SEQ,
+                        kind,
+                    },
+                )],
                 Call(name, input) => {
                     let id = format!("call_{index}");
                     vec![
@@ -214,6 +234,12 @@ mod tests {
     #[test_case(vec![Request, Call(QUESTION_TOOL_NAME, json!({})), Compacted, Compacted], AgentMode::Build => 2 ; "asking_while_building_is_not_work")]
     #[test_case(vec![Request, Call(FILE_EDIT_TOOL_NAME, json!({})), Compacted, Compacted], plan() => 2 ; "an_edit_while_planning_is_not_work")]
     #[test_case(vec![Request, Call(TASK_TOOL_NAME, json!({ "prompt": REQUEST })), Compacted, Compacted], AgentMode::ReadOnly => 2 ; "a_read_only_agent_counts_compactions_alone")]
+    #[test_case(vec![Request, Compacted, Compacted, Autopilot(AutopilotMessageKind::Implement)], AgentMode::Build => 0 ; "an_autopilot_go_ahead_to_implement_resets_the_count")]
+    #[test_case(vec![Request, Call(PLAN_TOOL_NAME, json!({ "action": "write", "content": REQUEST })), Compacted, Autopilot(AutopilotMessageKind::Implement), Compacted], AgentMode::Build => 1 ; "counting_restarts_at_an_autopilot_go_ahead")]
+    #[test_case(vec![Request, Compacted, Compacted, Autopilot(AutopilotMessageKind::Reply)], AgentMode::Build => 2 ; "an_autopilot_reply_is_not_a_request")]
+    #[test_case(vec![Request, Compacted, Compacted, Autopilot(AutopilotMessageKind::Revision)], AgentMode::Build => 2 ; "an_autopilot_revision_is_not_a_request")]
+    #[test_case(vec![Request, Compacted, Compacted, Autopilot(AutopilotMessageKind::Guidance)], AgentMode::Build => 2 ; "autopilot_guidance_is_not_a_request")]
+    #[test_case(vec![Request, Compacted, Compacted, Autopilot(AutopilotMessageKind::Reminder)], AgentMode::Build => 2 ; "an_autopilot_reminder_is_not_a_request")]
     fn stalled_compactions_since_the_request(steps: Vec<Step>, mode: AgentMode) -> u32 {
         stalled_compactions(&History::new(messages(steps)), &mode, None)
     }

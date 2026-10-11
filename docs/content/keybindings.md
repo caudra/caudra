@@ -282,6 +282,9 @@ Some pickers add extra bindings on top of the defaults:
 | Decisions | `g` | Cycle the scope: this session, this project, every session |
 | Decisions | `y` | Copy the selected decision as JSON, or the visible section |
 | Decisions | `Ctrl+R` | Read the decision log again |
+| Autopilot Panel | `s` | Stop autopilot |
+| Autopilot Panel | `m` | Pick the model for the Autopilot job |
+| Autopilot Panel | `q` | Close, as Esc does |
 | Workbench Explorer | `Ctrl+X h` | Show hidden files |
 | Workbench Explorer | `C` | Fold the section the cursor is in back to its top level |
 | Workbench Explorer | `Ctrl+X ↑` / `Ctrl+X ↓` | Shrink / grow the section the cursor is in |
@@ -334,13 +337,14 @@ Some of these contexts belong to an [experimental feature](/docs/configuration/#
 - Workflow Catalog: `workflows`
 - Automation Inspector: `automations`
 - Decisions: `decision_engine`
+- Autopilot Panel: `autopilot`
 - Workbench Transfer: `sandboxes`
 
 ## Context Inheritance
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Session Picker, Session Relocation, Worktree Picker, Peer Manager, Workflow Inspector, Workflow Catalog, Automation Inspector, Decisions
+- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Session Picker, Session Relocation, Worktree Picker, Peer Manager, Workflow Inspector, Workflow Catalog, Automation Inspector, Decisions, Autopilot Panel
 - **Workbench** is the base for: Workbench Explorer, Workbench Editor, Workbench Source Control, Workbench Search, Workbench Transfer
 
 ## Overriding Keybindings

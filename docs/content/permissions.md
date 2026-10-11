@@ -858,3 +858,9 @@ An explicit `/yolo` choice is stored with the root conversation. A user-created 
 YOLO approves each call once and stores no rule, so turning it off brings back the prompts your rules do not cover. In plan mode it also skips the prompts for commands plan mode cannot prove read-only, for `send_message` and `publish_message`, and for `execution_environment`. Plan mode still refuses what it always refuses, such as file writes outside the plan.
 
 YOLO bypasses decision-engine permission advice, Auto screening, and permission-related shell-effect checks, including in plan mode. Shell duration, content screening, tool search, skill selection, goal prescreening, subagent routing, and the question-tool nudge still follow their feature settings. An unreachable engine can still show `[decisions offline]`. Deterministic denies and hard capability restrictions still apply.
+
+## Autopilot
+
+[Autopilot](/docs/autopilot/) is experimental. While it is engaged, a delegate model decides the prompts that reach you, in Ask, Auto, and plan mode. Your rules and Auto screening run first, unchanged, and YOLO leaves nothing to decide.
+
+The delegate may allow a call once, deny it with guidance, or leave it to you. It never stores a rule. It never allows prompts from plan mode, forced prompts, protected paths, privilege, indirect code, or lines Caudra cannot read, and it allows nothing while content screening has flagged the session. A prompt from an ask rule is not reserved, so the delegate may allow that call once. Any key or click on a card makes it yours. See [Permission prompts](/docs/autopilot/#permission-prompts) for the full table.

@@ -82,12 +82,13 @@ pub enum ModelPurpose {
     Goal,
     Extract,
     Memory,
+    Autopilot,
     Fast,
     Best,
 }
 
 impl ModelPurpose {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Chat,
         Self::Plan,
         Self::Subagent,
@@ -96,6 +97,7 @@ impl ModelPurpose {
         Self::Goal,
         Self::Extract,
         Self::Memory,
+        Self::Autopilot,
         Self::Fast,
         Self::Best,
     ];
@@ -118,6 +120,7 @@ impl ModelPurpose {
             Self::Goal => "Goal",
             Self::Extract => "Extract",
             Self::Memory => "Memory",
+            Self::Autopilot => "Autopilot",
             Self::Fast => "Fast",
             Self::Best => "Best",
         }
@@ -133,6 +136,7 @@ impl ModelPurpose {
             Self::Goal => "goal",
             Self::Extract => "extract",
             Self::Memory => "memory",
+            Self::Autopilot => "autopilot",
             Self::Fast => "fast",
             Self::Best => "best",
         }
@@ -158,7 +162,7 @@ impl FromStr for ModelPurpose {
 
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "unknown model purpose '{0}', expected one of: chat, plan, subagent, compact, title, goal, extract, memory, fast, best"
+    "unknown model purpose '{0}', expected one of: chat, plan, subagent, compact, title, goal, extract, memory, autopilot, fast, best"
 )]
 pub struct UnknownPurpose(pub String);
 
@@ -1494,6 +1498,7 @@ best = "gpt-4.1"
     #[test_case("goal", ModelPurpose::Goal ; "goal")]
     #[test_case("extract", ModelPurpose::Extract ; "extract")]
     #[test_case("memory", ModelPurpose::Memory ; "memory")]
+    #[test_case("autopilot", ModelPurpose::Autopilot ; "autopilot")]
     #[test_case("fast", ModelPurpose::Fast ; "fast")]
     #[test_case("best", ModelPurpose::Best ; "best")]
     fn purpose_parses_and_renders_the_same_name(input: &str, expected: ModelPurpose) {
@@ -1514,6 +1519,7 @@ best = "gpt-4.1"
                 ModelPurpose::Goal,
                 ModelPurpose::Extract,
                 ModelPurpose::Memory,
+                ModelPurpose::Autopilot,
                 ModelPurpose::Fast,
                 ModelPurpose::Best,
             ]

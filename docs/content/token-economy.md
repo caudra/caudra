@@ -156,6 +156,7 @@ Every row records why the model was called, so you can separate the conversation
 | `btw` | `/btw` questions asked beside the conversation |
 | `extract` | `/extract` lists and the requirements section of a compaction summary |
 | `memory` | Summarizing [project memory](/docs/memory/#summaries-and-spend) in the background |
+| `autopilot` | [Autopilot](/docs/autopilot/) decisions about prompts, questions, plans, and stalls |
 | `tool_json_repair` | Isolated syntax repair for malformed tool arguments |
 
 The model cannot answer that question on its own, because goals, compaction, and titles often run on the model already in use.

@@ -1,7 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 
 use caudra_agent::permissions::{
-    PermissionAnswer, PermissionLifetime, PermissionRequest, PermissionRowGrant,
+    AutopilotNote, PermissionAnswer, PermissionLifetime, PermissionRequest, PermissionRowGrant,
 };
 use caudra_config::ToolKey;
 use caudra_workbench::text_field::{FieldKind, TextField};
@@ -268,6 +268,25 @@ impl PermissionPrompt {
 
     pub(crate) fn request_id(&self) -> Option<&str> {
         self.current().map(|request| request.id.as_str())
+    }
+
+    /// What autopilot is doing about the card in front.
+    pub(crate) fn autopilot_note(&self) -> Option<&AutopilotNote> {
+        self.current()?.presentation.autopilot.as_ref()
+    }
+
+    /// The card in front's id when autopilot was deciding it, which it no
+    /// longer shows: the user took it.
+    pub(crate) fn take_deciding(&mut self) -> Option<String> {
+        let request = &mut self.requests.front_mut()?.request;
+        if request.presentation.autopilot != Some(AutopilotNote::Deciding) {
+            return None;
+        }
+        request.presentation.autopilot = None;
+        self.invalidate_controls();
+        self.requests
+            .front()
+            .map(|queued| queued.request.id.clone())
     }
 
     #[cfg(test)]

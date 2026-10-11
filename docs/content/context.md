@@ -194,6 +194,7 @@ Part of what the model reads was written by Caudra rather than typed by you. The
 | Background work | Before an already-scheduled main request when task/workflow state changes or the configured response interval expires, and after successful compaction of a session with background work |
 | Open todo items | When the main agent is about to hand control back while its todo list has pending or in-progress items and no background work is running, at most once per run |
 | Stalled work | After a compaction, when a request has gone through `work_nudge_compactions` compactions with no work started |
+| Autopilot | When [autopilot](/docs/autopilot/) engages, and again to withdraw that when it ends |
 
 These runtime snapshots arrive as messages, keeping the cached system prefix stable. Most are sent only when their content changes. Background-work snapshots can also repeat at a configured interval or after compaction.
 
@@ -249,7 +250,7 @@ What counts as work depends on the mode:
 | Plan | Writing the plan, or asking a question | The plan with its assumptions marked, or the question that blocks it |
 | Read-only task | Nothing | A report of what the task found and what it has not verified |
 
-A failed attempt still counts as work. Shell commands never count, so an agent that edits through the shell can still get the reminder. The count starts again at each message you send, and it applies to subagents as well as the main agent. The reminder repeats after every later compaction, with the current count, until work starts. A `/compact` you run while the session is idle does not count.
+A failed attempt still counts as work. Shell commands never count, so an agent that edits through the shell can still get the reminder. The count starts again at each message you send, and at the message with which [autopilot](/docs/autopilot/#plans) approves a plan. It applies to subagents as well as the main agent. The reminder repeats after every later compaction, with the current count, until work starts. A `/compact` you run while the session is idle does not count.
 
 Set the number of compactions, or `0` to turn the reminder off:
 

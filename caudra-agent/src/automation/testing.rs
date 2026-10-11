@@ -582,6 +582,7 @@ impl AutomationFixture {
                 status: SessionStatus::Idle,
                 status_since: START_MS / MILLIS_PER_SECOND,
                 goal: None,
+                autopilot: None,
                 cost: None,
                 groups: Vec::new(),
                 work: WorkView::default(),

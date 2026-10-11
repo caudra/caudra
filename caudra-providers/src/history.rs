@@ -8,9 +8,9 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::types::{
-    AutomationEventOrigin, ContentBlock, DocumentSource, ImageSource, Message, MessageKind,
-    PeerMessageOrigin, ReasoningSource, ResponsesReasoning, Role, StandingReminderKind,
-    SteeringOrigin, TaskEventOrigin, WorkflowEventOrigin,
+    AutomationEventOrigin, AutopilotOrigin, ContentBlock, DocumentSource, ImageSource, Message,
+    MessageKind, PeerMessageOrigin, ReasoningSource, ResponsesReasoning, Role,
+    StandingReminderKind, SteeringOrigin, TaskEventOrigin, WorkflowEventOrigin,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -84,6 +84,8 @@ pub enum HistoryItemKind {
         workflow_event: Option<WorkflowEventOrigin>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         automation_event: Option<AutomationEventOrigin>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        autopilot_event: Option<AutopilotOrigin>,
         /// Boxed because it is rare and inline it would enlarge every item.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         peer_event: Option<Box<PeerMessageOrigin>>,
@@ -659,6 +661,7 @@ fn user_kind(
         task_event: message.task_event.clone(),
         workflow_event: message.workflow_event.clone(),
         automation_event: message.automation_event.clone(),
+        autopilot_event: message.autopilot_event.clone(),
         peer_event: message.peer_event.clone().map(Box::new),
         standing_reminder: message.standing_reminder.clone(),
         retained_output_refs: message.retained_output_refs.clone(),
@@ -783,6 +786,7 @@ fn assistant_kind(
             task_event: None,
             workflow_event: None,
             automation_event: None,
+            autopilot_event: None,
             peer_event: None,
             standing_reminder: None,
             retained_output_refs: Vec::new(),
@@ -944,6 +948,7 @@ fn project_group(items: &[HistoryItem]) -> Message {
                 task_event,
                 workflow_event,
                 automation_event,
+                autopilot_event,
                 peer_event,
                 standing_reminder,
                 retained_output_refs,
@@ -958,6 +963,7 @@ fn project_group(items: &[HistoryItem]) -> Message {
                     message.task_event = task_event.clone();
                     message.workflow_event = workflow_event.clone();
                     message.automation_event = automation_event.clone();
+                    message.autopilot_event = autopilot_event.clone();
                     message.peer_event = peer_event.as_deref().cloned();
                     message.standing_reminder = standing_reminder.clone();
                     if let Some(origin) = task_event {
@@ -1117,7 +1123,7 @@ mod tests {
         peer_message_origin, task_event_origin, task_observation_with_output_refs,
         workflow_event_origin,
     };
-    use crate::types::{ImageMediaType, SteeringKind};
+    use crate::types::{AutopilotMessageKind, ImageMediaType, SteeringKind};
     use test_case::test_case;
 
     const CALL_ONE: &str = "call-one";
@@ -1148,6 +1154,8 @@ mod tests {
     const REFUSED_RESULT: &str = "permission denied";
     const REFUSED_CALLS_KEY: &str = "refused_calls";
     const REFUSED_TOOL_CALLS_KEY: &str = "refused_tool_calls";
+    const AUTOPILOT_EVENT_KEY: &str = "autopilot_event";
+    const AUTOPILOT_SEQ: u32 = 7;
 
     #[test_case(PEER_TEXT, true ; "plain_tail")]
     #[test_case(PEER_ATTACK, true ; "adversarial_tail")]
@@ -1400,6 +1408,31 @@ mod tests {
                 .all(|message| host_event_origins(message) == (None, None))
         );
         assert!(items.iter().any(|item| matches!(&item.kind, HistoryItemKind::User { workflow_event, automation_event, .. } if *workflow_event == origins.0 && *automation_event == origins.1)));
+    }
+
+    #[test_case(AutopilotMessageKind::Reply ; "reply")]
+    #[test_case(AutopilotMessageKind::Revision ; "revision")]
+    #[test_case(AutopilotMessageKind::Guidance ; "guidance")]
+    #[test_case(AutopilotMessageKind::Reminder ; "reminder")]
+    #[test_case(AutopilotMessageKind::Implement ; "implement")]
+    fn autopilot_origin_survives_message_and_canonical_history(kind: AutopilotMessageKind) {
+        let origin = AutopilotOrigin {
+            seq: AUTOPILOT_SEQ,
+            kind,
+        };
+        let message = Message::autopilot_observation(FIRST_TURN.into(), origin.clone());
+        let encoded = serde_json::to_value(&message).unwrap();
+        assert!(encoded.get(AUTOPILOT_EVENT_KEY).is_some());
+        let decoded: Message = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.autopilot_event, Some(origin.clone()));
+        let items = expand_message(&decoded, None);
+        let restored: Vec<HistoryItem> =
+            serde_json::from_value(serde_json::to_value(&items).unwrap()).unwrap();
+        assert_eq!(restored, items);
+        let projected = project_messages(&restored).unwrap();
+        assert_eq!(projected[0].autopilot_event, Some(origin));
+        assert!(projected[0].is_observation());
+        assert!(projected[0].first_user_text().is_none());
     }
 
     #[test_case(FIRST_TURN ; "plain_report")]
@@ -1756,6 +1789,7 @@ mod tests {
             task_event: None,
             workflow_event: None,
             automation_event: None,
+            autopilot_event: None,
             peer_event: None,
             standing_reminder: None,
             retained_output_refs: Vec::new(),

@@ -1489,6 +1489,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 }
             }),
             automations: stack.config.automations,
+            autopilot: stack.config.autopilot,
         })
         .context("run sdk mode")?;
         super::sandbox::remember_session_source(
@@ -1541,6 +1542,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
             workcell_runtime.workspace_session().cloned(),
             workcell_runtime.remote_project_context().cloned(),
             workcell_runtime.local_documents().cloned(),
+            cli.autopilot.then_some(stack.config.autopilot),
         )
         .context("run print mode");
     }
@@ -1627,6 +1629,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
     }
     let mut joined_groups = !cli.groups.is_empty();
     let mut launch_automations = std::mem::take(&mut cli.automations);
+    let mut launch_autopilot = std::mem::take(&mut cli.autopilot);
 
     loop {
         let runtime_cwd = if workcell_runtime.is_remote() {
@@ -1749,6 +1752,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 startup_warnings: std::mem::take(&mut warnings),
                 joined_groups: std::mem::take(&mut joined_groups),
                 launch_automations: std::mem::take(&mut launch_automations),
+                launch_autopilot: std::mem::take(&mut launch_autopilot),
                 storage: storage.clone(),
                 config: stack.config.agent.clone(),
                 settings_reloader: settings_reloader(
@@ -1758,6 +1762,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                     workcell_runtime.is_remote(),
                 ),
                 automations: stack.config.automations.clone(),
+                autopilot: stack.config.autopilot.clone(),
                 ui_config: stack.config.ui.clone(),
                 snapshots: stack.config.storage.snapshots,
                 change_factory,

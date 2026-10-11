@@ -153,6 +153,15 @@ impl AutoNote {
     }
 }
 
+/// What autopilot is doing about a prompt. Present only while autopilot holds
+/// the prompt or has left it to the user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutopilotNote {
+    Deciding,
+    Escalated { reason: String },
+}
+
 pub(super) fn presentation_for(
     tool: &ToolKey,
     risk: &PermissionRisk,
@@ -188,6 +197,7 @@ pub(super) fn presentation_for(
         project: None,
         advisories: Vec::new(),
         auto: None,
+        autopilot: None,
         resources: resources
             .iter()
             .map(|resource| {
@@ -292,20 +302,24 @@ pub(super) fn listed_commands<'a>(commands: impl ExactSizeIterator<Item = &'a st
 mod tests {
     use super::presentation_for;
     use caudra_config::ToolKey;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::path::PathBuf;
     use test_case::test_case;
 
     use crate::permissions::structured::tests::NARROW_ALLOW;
     use crate::permissions::structured::{
-        EngineFlag, PermissionAdvisory, PermissionPresentation, PermissionResourceAccess,
-        PermissionResourceKind, PermissionResourcePresentation, PermissionRisk, PromptReason,
-        ResourceCoverage, RuleOrigin, listed_commands, update_presentation_coverage,
+        AutopilotNote, EngineFlag, PermissionAdvisory, PermissionPresentation,
+        PermissionResourceAccess, PermissionResourceKind, PermissionResourcePresentation,
+        PermissionRisk, PromptReason, ResourceCoverage, RuleOrigin, listed_commands,
+        update_presentation_coverage,
     };
     use std::collections::HashSet;
 
     const DELETE_SUMMARY: &str = "May delete files (87%)";
     const HALF_ROUNDED_SUMMARY: &str = "May delete files (88%)";
+    const DECIDING_WIRE: &str = "deciding";
+    const ESCALATED_WIRE: &str = "escalated";
+    const ESCALATION_REASON: &str = "the command deletes the build cache";
 
     /// The wire carries each flag as the engine's own question id, and no two
     /// flags read the same, so a caution always says which one was raised.
@@ -351,6 +365,26 @@ mod tests {
         assert!(update_presentation_coverage(&mut presentation, &[]));
         assert_eq!(restored.project, presentation.project);
     }
+
+    #[test_case(None, None; "absent_while_autopilot_holds_nothing")]
+    #[test_case(Some(AutopilotNote::Deciding), Some(json!(DECIDING_WIRE)); "deciding")]
+    #[test_case(
+        Some(AutopilotNote::Escalated { reason: ESCALATION_REASON.into() }),
+        Some(json!({ESCALATED_WIRE: {"reason": ESCALATION_REASON}}));
+        "escalated_with_its_reason"
+    )]
+    fn presentation_autopilot_note_round_trips(note: Option<AutopilotNote>, wire: Option<Value>) {
+        let mut presentation =
+            presentation_for(&ToolKey::native("bash"), &PermissionRisk::High, &[]);
+        presentation.autopilot = note;
+
+        let serialized = serde_json::to_value(&presentation).unwrap();
+
+        assert_eq!(serialized.get("autopilot"), wire.as_ref());
+        let restored: PermissionPresentation = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored, presentation);
+    }
+
     #[test]
     fn listed_commands_cap_the_enumeration_and_escape_control_characters() {
         let commands = ["one", "two", "three", "four\nfive"];
@@ -388,6 +422,7 @@ mod tests {
             project: None,
             advisories: Vec::new(),
             auto: None,
+            autopilot: None,
         };
         let granted = ResourceCoverage {
             origin: RuleOrigin::Project,

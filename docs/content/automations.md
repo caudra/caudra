@@ -97,7 +97,7 @@ The agent can write one for you. The builtin `caudra-automation-dev` [skill](/do
 |------|------------|---------|
 | `armed` | the automation is armed: at launch, on resume, when you arm it again, and when the pause latch clears | none |
 | `idle` | the session settles after a busy period and stays settled for `after` | `after` |
-| `needs_input` | the session has waited on you for `after`, such as at a permission prompt, a question, or a plan | `after`, `inputs` |
+| `needs_input` | the session has waited on you for `after`, such as at a permission prompt, a question, a plan, or an item [autopilot](#autopilot) left to you | `after`, `inputs` |
 | `goal_finished` | the session goal ends as met, impossible, or cleared by an error | `verdicts` |
 | `schedule` | an occurrence comes due, `every` a period or `at` a time of day | `every` or `at`, `weekdays`, `catch_up` |
 | `message_received` | a message from another session or a script reaches this session | filters and `consume`, under [Messaging](#messaging) |
@@ -111,7 +111,7 @@ The agent can write one for you. The builtin `caudra-automation-dev` [skill](/do
 | Function | What it does |
 |----------|--------------|
 | `message(text)` | Queues trusted text for the model. `delivery: "guide"` joins a running turn, `attach` adds untrusted data, and `expires` drops a message that waited too long |
-| `set_goal(condition)` | Sets the session goal and queues its kickoff turn. `replace: true` replaces an active goal |
+| `set_goal(condition)` | Sets the session goal and queues its kickoff turn. `replace: true` replaces an active goal, unless [autopilot](#autopilot) owns it |
 | `notify(text)` | Flashes the text in the status bar and sends it as a [terminal notification](/docs/notifications/). SDK clients receive it as an `automation_notice` message |
 | `http(request)` | Sends one request to an origin in `meta.network`, with credentials from the variables in `meta.secrets` |
 | `send`, `reply`, `publish`, `broadcast` | Message other sessions, as [Messaging](#messaging) describes |
@@ -255,6 +255,16 @@ Each automation keeps its newest 100 finished firings per session, and waiting o
 Resuming a session restores its bindings, state, waiting events, and outbox, so the inspector shows the same history. Firings that were running when Caudra stopped end as `interrupted`. Waiting `armed`, `idle`, `needs_input`, and `schedule` events are dropped, because resume fires `armed` again and schedules catch up. Schedules, limit windows, and the `work_finished` cursor keep their marks, so a restart repeats no schedule occurrence or work outcome.
 
 A [fork](/docs/sessions/#fork-boundaries) starts with no automations, args, or state. [Trimming](/docs/sessions/#retention) a session deletes its firings, actions, and script versions, and keeps its bindings and state. [Moving a session](/docs/sessions/#moving-sessions-to-another-directory) to another directory is refused while a firing runs. The move interrupts waiting firings and disarms project scripts, because they belong to the old project. An [ephemeral session](/docs/sessions/#ephemeral-sessions) keeps its own `caudra.db`, which goes away at exit with everything in it.
+
+## Autopilot
+
+[Autopilot](/docs/autopilot/) is experimental and needs `experimental.autopilot`. Scripts can see it, and they cannot engage it.
+
+- `event.session.autopilot` is `()` while autopilot is off or not engaged. While it is engaged, it is a map. `owns_goal` is true when the active goal is the one autopilot set, and `waiting` is true while an item autopilot left to you waits.
+- A `goal_finished` event carries `autopilot`, which is true when the goal that finished was autopilot's.
+- `needs_input` fires with the kind `autopilot` when autopilot leaves a permission prompt, a question, or a plan to you. The kind is in the default `inputs`, so [page-me](#page-me) pages you for it. While autopilot is still deciding, the session does not wait on you, and nothing fires.
+- `set_goal()` fails with `goal_owned_by_autopilot` while autopilot owns the goal, even with `replace: true`. `try` can catch it. While autopilot is engaged and owns no goal, it keeps a goal that an automation set moving.
+- Autopilot's answers and the turns it starts are not your input. They do not clear the pause latch or reset the count for `max_unattended_turns`. Its turns do not pass through the outbox, so `turns_per_hour` does not limit them.
 
 ## Other frontends
 
@@ -416,6 +426,7 @@ let ask = switch event.input {
     "permission" => "approve " + event.tool,
     "plan" => "review a plan",
     "auth" => "sign in again",
+    "autopilot" => "take over from autopilot",
     _ => "answer a " + event.input,
 };
 http(#{

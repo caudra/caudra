@@ -496,6 +496,7 @@ pub async fn compact_with_session(
             task_event: None,
             peer_event: None,
             automation_event: None,
+            autopilot_event: None,
         })?;
     }
 

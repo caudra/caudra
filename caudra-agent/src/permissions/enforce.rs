@@ -1,29 +1,36 @@
 use super::decisions::{advisories, label_answer};
-use super::diagnostics::{answer_scope_kind, bounded_log_value};
+use super::diagnostics::{answer_scope_kind, bounded_log_value, resource_kind_name};
 use super::diagnostics::{prompt_reason, prompt_reason_message};
 use super::manager::{ObservedPatterns, PERMISSION_POLL_INTERVAL};
 use super::policy::TRUSTED_UNSCOPED_TOOLS;
 use super::structured::trusted_shell_request;
 use super::{
-    AutoNote, DECISION_SOURCE_AUTO, DECISION_SOURCE_RULE, DECISION_SOURCE_USER_ABORT,
-    DECISION_SOURCE_YOLO, DEFAULT_DENY_GUIDANCE, NORMALIZED_COMMAND_ATTRIBUTE,
-    PERMISSION_DENIED_PREFIX, PERMISSION_LOG_TARGET, PROMPT_LOG_MAX_RESOURCES, PendingDecision,
-    PendingPermission, PendingRegistration, PermissionAnswer, PermissionExecutorKind,
-    PermissionLifetime, PermissionManager, PermissionMode, PermissionPolicyError,
-    PermissionPresentation, PermissionRequest, PermissionResource, PermissionResourceAccess,
-    PermissionResourceKind, PermissionSubject, PolicyRule, PromptReason, ResourceCoverage,
-    RuleOrigin, ShellOpacity, StructuredPermissionDecision, StructuredPermissionEffect,
-    answer_log_fields, command_pattern, normalize_scope_path, permission_rule_intersects_request,
-    permission_rules_resource_standing, prompt_forcing_reason, remove_pending,
-    subject_kind_and_contract, uncovered_resource_summary, update_presentation_coverage,
+    AutoNote, AutopilotNote, DECISION_SOURCE_AUTO, DECISION_SOURCE_RULE,
+    DECISION_SOURCE_USER_ABORT, DECISION_SOURCE_YOLO, DEFAULT_DENY_GUIDANCE,
+    NORMALIZED_COMMAND_ATTRIBUTE, PERMISSION_DENIED_PREFIX, PERMISSION_LOG_TARGET,
+    PROMPT_LOG_MAX_RESOURCES, PendingDecision, PendingPermission, PendingRegistration,
+    PermissionAnswer, PermissionExecutorKind, PermissionLifetime, PermissionManager,
+    PermissionMode, PermissionPolicyError, PermissionPresentation, PermissionRequest,
+    PermissionResource, PermissionResourceAccess, PermissionResourceKind, PermissionSubject,
+    PolicyRule, PromptReason, ResourceCoverage, RuleOrigin, ShellOpacity,
+    StructuredPermissionDecision, StructuredPermissionEffect, answer_log_fields, command_pattern,
+    normalize_scope_path, permission_rule_intersects_request, permission_rules_resource_standing,
+    prompt_forcing_reason, remove_pending, subject_kind_and_contract, uncovered_resource_summary,
+    update_presentation_coverage,
 };
 use crate::CancelToken;
+use crate::autopilot::{
+    AutopilotHandle, DecisionKind, DecisionOrigin, DecisionRequest, DelegateAction,
+    DelegateOutcome, DelegateOutput, WireError, mode_label,
+};
 use crate::tools::native::plan::{self, PlanAccess, PlanTarget};
 use crate::tools::{PermissionIntent, PermissionScopes, ToolContext};
+use crate::types::{Answerer, AutopilotEvent};
 use crate::{AgentEvent, EventSender};
 use caudra_config::{DefaultEffect, FILE_WRITE_TOOLS, ToolKey};
 use serde_json::Value;
 use std::borrow::Cow;
+use std::fmt::Write;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -36,6 +43,32 @@ pub(super) const CURRENT_DEFAULT_DENIES_REQUEST: &str =
     "current permission default denies this request";
 const ACTIVE_PLAN_INTENT_MISMATCH: &str =
     "plan permission intent does not match the active target and requested action";
+const USER_GUIDANCE_LABEL: &str = "User guidance:";
+const AUTOPILOT_GUIDANCE_LABEL: &str = "Autopilot guidance:";
+/// What the model is told when autopilot escalates and no human can answer.
+const UNATTENDED_ESCALATION: &str = "Autopilot left this for a human, and none is present.";
+const TAINTED_RESERVATION: &str = "tainted";
+const MAX_ITEM_INPUT_BYTES: usize = 2 * 1024;
+const ITEM_TOOL_LABEL: &str = "tool:";
+const ITEM_INPUT_LABEL: &str = "input:";
+const ITEM_RESOURCES_LABEL: &str = "resources:";
+const ITEM_BULLET: &str = "-";
+const ITEM_PROTECTED: &str = "protected";
+const ITEM_MORE: &str = "more";
+const ITEM_REASON_LABEL: &str = "prompt reason:";
+const ITEM_AUTO_LABEL: &str = "auto note:";
+const ITEM_ADVISORIES_LABEL: &str = "engine advisories:";
+const ITEM_AGENT_LABEL: &str = "requesting agent:";
+const ITEM_MODE_LABEL: &str = "permission mode:";
+const ITEM_RESERVED_LABEL: &str = "reserved:";
+const ITEM_NOT_RESERVED: &str = "no";
+const ITEM_TRUNCATED: &str = " [truncated]";
+const ITEM_SEPARATOR: &str = ", ";
+const MAIN_AGENT: &str = "the main agent or one of its subagents";
+const WORKFLOW_AGENT: &str = "workflow run";
+const WORKFLOW_CALL: &str = "agent call";
+const WORKFLOW_PHASE: &str = "phase";
+const BACKGROUND_TASK_AGENT: &str = "background task";
 
 pub(super) fn active_plan_access(
     intent: &PermissionIntent,
@@ -110,7 +143,23 @@ fn is_unscoped_tool(tool: &ToolKey) -> bool {
 pub struct PermissionError {
     pub(super) tool: String,
     pub(super) scope: String,
-    pub(super) guidance: Option<String>,
+    pub(super) guidance: Option<Guidance>,
+}
+
+/// What the model is told to do instead, and who said it.
+#[derive(Debug)]
+pub(super) struct Guidance {
+    pub(super) text: String,
+    pub(super) by: Answerer,
+}
+
+impl Guidance {
+    fn label(&self) -> &'static str {
+        match self.by {
+            Answerer::User => USER_GUIDANCE_LABEL,
+            Answerer::Autopilot => AUTOPILOT_GUIDANCE_LABEL,
+        }
+    }
 }
 
 impl std::fmt::Display for PermissionError {
@@ -120,10 +169,9 @@ impl std::fmt::Display for PermissionError {
             "{} `{}` ({}).",
             PERMISSION_DENIED_PREFIX, self.tool, self.scope
         )?;
-        if let Some(g) = &self.guidance {
-            write!(f, " User guidance: {}", g)
-        } else {
-            write!(f, " {}", DEFAULT_DENY_GUIDANCE)
+        match &self.guidance {
+            Some(guidance) => write!(f, " {} {}", guidance.label(), guidance.text),
+            None => write!(f, " {DEFAULT_DENY_GUIDANCE}"),
         }
     }
 }
@@ -138,10 +186,14 @@ impl PermissionError {
     }
 
     pub(super) fn with_guidance(tool: &str, scope: &str, guidance: String) -> Self {
+        Self::guided_by(tool, scope, guidance, Answerer::User)
+    }
+
+    pub(super) fn guided_by(tool: &str, scope: &str, text: String, by: Answerer) -> Self {
         Self {
             tool: tool.to_string(),
             scope: scope.to_string(),
-            guidance: Some(guidance),
+            guidance: Some(Guidance { text, by }),
         }
     }
 }
@@ -196,6 +248,56 @@ impl CurrentPolicy {
             Some(AutoEligibility::Never(note)) => presentation.auto = Some(note),
             Some(AutoEligibility::Direct | AutoEligibility::NeedsEngine) => {}
         }
+    }
+}
+
+/// What woke a waiting prompt: the waiter's own sources, or autopilot's call
+/// ending, `None` when it was cut off.
+enum Woken {
+    Waiter(Option<PendingDecision>),
+    Delegate(Option<DelegateOutcome>),
+}
+
+/// Autopilot's part in one prompt: what the delegate is told about it, and
+/// the decision's place in the engagement.
+struct PromptDelegate {
+    handle: AutopilotHandle,
+    seq: u32,
+    /// Why autopilot may not allow the request, `None` when it may.
+    reservation: Option<&'static str>,
+    item: String,
+    origin: DecisionOrigin,
+}
+
+impl PromptDelegate {
+    fn announce(&self, event_tx: &EventSender) {
+        let _ = event_tx.send(AutopilotEvent::Deciding {
+            seq: self.seq,
+            kind: DecisionKind::Permission,
+            subject: self.origin.subject.clone(),
+        });
+    }
+
+    /// `None` when `cancel` fired first. The call is boxed because every
+    /// permission check embeds this future, and nested dispatch stacks checks.
+    async fn decide(
+        &self,
+        event_tx: &EventSender,
+        cancel: &CancelToken,
+    ) -> Option<DelegateOutcome> {
+        let reserved = self.reservation.is_some();
+        let request = DecisionRequest {
+            kind: DecisionKind::Permission,
+            reserved,
+            item: &self.item,
+        };
+        let outcome = Box::pin(self.handle.decide(&request, event_tx, cancel)).await?;
+        Some(screened(outcome, reserved))
+    }
+
+    fn record(&self, outcome: &DelegateOutcome, event_tx: &EventSender) {
+        let decision = outcome.decision(self.seq, self.handle.now_ms(), self.origin.clone());
+        let _ = event_tx.send(self.handle.record(decision));
     }
 }
 
@@ -598,17 +700,18 @@ impl PermissionManager {
         let scope_display = || scopes.scopes.join("; ");
         // Every deny is built here and every approval passes through
         // `allowed`, so reporting cannot drift from what the caller gets.
-        let deny = |source: &'static str, guidance: Option<String>| {
+        let deny_by = |source: &'static str, guidance: Option<String>, by: Answerer| {
             caudra_otel::emit::tool_decision(
                 &tool_string,
                 caudra_otel::emit::DECISION_REJECT,
                 source,
             );
             match guidance {
-                Some(g) => PermissionError::with_guidance(&tool_string, &scope_display(), g),
+                Some(g) => PermissionError::guided_by(&tool_string, &scope_display(), g, by),
                 None => PermissionError::new(&tool_string, &scope_display()),
             }
         };
+        let deny = |source, guidance| deny_by(source, guidance, Answerer::User);
         let allowed = |observed: ObservedPatterns<'_>, source: &'static str| {
             observed.keep();
             caudra_otel::emit::tool_decision(
@@ -741,15 +844,50 @@ impl PermissionManager {
         }
         let coverage = current.coverage;
         update_presentation_coverage(&mut request.presentation, &coverage.covered);
+        let delegate = self.prompt_delegate(&request, &context, event_tx);
 
         let Some(_) = user_response_rx else {
-            warn!(tool = %tool, scope = %scope_display(), "no permission response channel");
+            warn!(
+                tool = %tool,
+                scope = %scope_display(),
+                autopilot = delegate.is_some(),
+                "no permission response channel"
+            );
             if let Some(effect) = self.record_escalation(escalation, &context) {
                 effect.detach();
             }
-            return Err(deny(DECISION_SOURCE_USER_ABORT, None));
+            let Some(delegate) = delegate else {
+                return Err(deny(DECISION_SOURCE_USER_ABORT, None));
+            };
+            delegate.announce(event_tx);
+            let Some(outcome) = delegate.decide(event_tx, cancel).await else {
+                return Err(deny(DECISION_SOURCE_USER_ABORT, None));
+            };
+            delegate.record(&outcome, event_tx);
+            let answer = delegated_answer(&outcome).unwrap_or_else(|_| {
+                PermissionAnswer::DenyWithGuidance(UNATTENDED_ESCALATION.into())
+            });
+            let source = answer.decision_source_by(Answerer::Autopilot);
+            if !answer.is_allow() {
+                return Err(deny_by(
+                    source,
+                    answer.guidance().map(String::from),
+                    Answerer::Autopilot,
+                ));
+            }
+            if cancel.is_cancelled() {
+                return Err(deny(DECISION_SOURCE_USER_ABORT, None));
+            }
+            self.current_policy(&request, &context)
+                .map_err(|error| deny(DECISION_SOURCE_RULE, Some(error.to_string())))?;
+            return allowed(observed, source);
         };
 
+        let (delegate_stop, delegate_cancel) =
+            delegate.as_ref().map(|_| CancelToken::new()).unzip();
+        if delegate.is_some() {
+            request.presentation.autopilot = Some(AutopilotNote::Deciding);
+        }
         let (answer_tx, answer_rx) = flume::bounded(1);
         let (changed_tx, changed_rx) = flume::bounded(1);
         {
@@ -767,7 +905,9 @@ impl PermissionManager {
                     context_revision: reviewed_revision,
                     answering: false,
                     abandoned: false,
+                    claimed_by_human: false,
                     cancel: cancel.clone(),
+                    delegate_stop,
                     changed: changed_tx.clone(),
                     sender: answer_tx.clone(),
                 },
@@ -790,6 +930,9 @@ impl PermissionManager {
         }
         if let Some(effect) = self.record_escalation(escalation, &context) {
             effect.detach();
+        }
+        if let Some(delegate) = &delegate {
+            delegate.announce(event_tx);
         }
         let forcing_reason = prompt_forcing_reason(
             &request,
@@ -825,6 +968,8 @@ impl PermissionManager {
             forcing_reason,
             opacity = opacity.map(display),
             auto_note = request.presentation.auto.map(AutoNote::name),
+            autopilot_seq = delegate.as_ref().map(|delegate| delegate.seq),
+            autopilot_reservation = delegate.as_ref().and_then(|delegate| delegate.reservation),
             uncovered = %uncovered,
             offered_options = %request
                 .options
@@ -841,6 +986,10 @@ impl PermissionManager {
         let mut shell_advisory_task = self.shell_effect_advice(&request, context.plan_scoped);
         let wait = async {
             let mut source_request_id = String::new();
+            let mut delegate_call = delegate
+                .as_ref()
+                .zip(delegate_cancel.as_ref())
+                .map(|(delegate, stop)| Box::pin(delegate.decide(event_tx, stop)));
             loop {
                 while let Ok(source) = changed_rx.try_recv() {
                     source_request_id = source;
@@ -859,6 +1008,7 @@ impl PermissionManager {
                     let _ = event_tx.send(AgentEvent::PermissionRequestResolved {
                         request_id: request_id.to_owned(),
                         source_request_id,
+                        by: None,
                     });
                     return Ok(PendingDecision::MatchedRule);
                 }
@@ -921,10 +1071,31 @@ impl PermissionManager {
                         }
                     }
                     Ok(None)
-                })
-                .await?;
-                if let Some(decision) = wake {
-                    return Ok(decision);
+                });
+                let woken =
+                    futures_lite::future::race(async { wake.await.map(Woken::Waiter) }, async {
+                        let Some(call) = delegate_call.as_mut() else {
+                            return futures_lite::future::pending().await;
+                        };
+                        let outcome = call.await;
+                        delegate_call = None;
+                        Ok(Woken::Delegate(outcome))
+                    })
+                    .await?;
+                match woken {
+                    Woken::Waiter(Some(decision)) => return Ok(decision),
+                    Woken::Waiter(None) => {}
+                    Woken::Delegate(outcome) => {
+                        if let Some(delegate) = &delegate {
+                            self.conclude_delegate(
+                                delegate,
+                                outcome,
+                                &registration,
+                                &mut request,
+                                &context,
+                            );
+                        }
+                    }
                 }
             }
         };
@@ -933,7 +1104,14 @@ impl PermissionManager {
             Ok(Err(error)) => Some(PendingDecision::PolicyDenied(error.to_string())),
             Err(_) => None,
         };
-        if let Some(PendingDecision::Explicit(answer)) = &decision {
+        if let Some(PendingDecision::Explicit(_, Answerer::Autopilot)) = &decision {
+            let _ = event_tx.send(AgentEvent::PermissionRequestResolved {
+                request_id: request_id.to_owned(),
+                source_request_id: request_id.to_owned(),
+                by: Some(Answerer::Autopilot),
+            });
+        }
+        if let Some(PendingDecision::Explicit(answer, by)) = &decision {
             let label_advisory = self
                 .decisions()
                 .filter(|service| service.config().log)
@@ -942,6 +1120,7 @@ impl PermissionManager {
                 receipts,
                 label_advisory,
                 answer,
+                *by,
                 waiting_since.elapsed().as_millis() as u64,
             ) {
                 label.detach();
@@ -950,9 +1129,14 @@ impl PermissionManager {
         // Paired with `permission_prompt` by `request_id`: the two together give
         // the prompt rate, what authority the answer bought, and the wait cost.
         let (answer, option_id, lifetime, answer_source) = match &decision {
-            Some(PendingDecision::Explicit(explicit)) => {
+            Some(PendingDecision::Explicit(explicit, by)) => {
                 let (answer, option_id, lifetime) = answer_log_fields(explicit);
-                (answer, option_id, lifetime, explicit.decision_source())
+                (
+                    answer,
+                    option_id,
+                    lifetime,
+                    explicit.decision_source_by(*by),
+                )
             }
             Some(PendingDecision::MatchedRule) => {
                 ("matched_rule", Cow::Borrowed(""), "", DECISION_SOURCE_RULE)
@@ -977,7 +1161,7 @@ impl PermissionManager {
             tool = %request.tool,
             answer,
             scope_kind = match &decision {
-                Some(PendingDecision::Explicit(answer)) => answer_scope_kind(answer, &request),
+                Some(PendingDecision::Explicit(answer, _)) => answer_scope_kind(answer, &request),
                 Some(PendingDecision::MatchedRule | PendingDecision::PolicyDenied(_)) => "current_policy",
                 None => "abandoned",
             },
@@ -993,12 +1177,12 @@ impl PermissionManager {
         };
 
         let allow = match &decision {
-            PendingDecision::Explicit(answer) => answer.is_allow(),
+            PendingDecision::Explicit(answer, _) => answer.is_allow(),
             PendingDecision::MatchedRule => true,
             PendingDecision::PolicyDenied(_) => false,
         };
         let mut source = match &decision {
-            PendingDecision::Explicit(answer) => answer.decision_source(),
+            PendingDecision::Explicit(answer, by) => answer.decision_source_by(*by),
             PendingDecision::MatchedRule | PendingDecision::PolicyDenied(_) => DECISION_SOURCE_RULE,
         };
         if allow {
@@ -1014,7 +1198,7 @@ impl PermissionManager {
                 }
                 source = current.source;
             }
-            if let PendingDecision::Explicit(answer) = &decision {
+            if let PendingDecision::Explicit(answer, _) = &decision {
                 let remembered = match answer {
                     PermissionAnswer::AllowSession
                     | PermissionAnswer::AllowAlwaysLocal
@@ -1048,13 +1232,89 @@ impl PermissionManager {
         if allow {
             allowed(observed, source)
         } else {
-            let guidance = match decision {
-                PendingDecision::Explicit(answer) => answer.guidance().map(String::from),
-                PendingDecision::MatchedRule => None,
-                PendingDecision::PolicyDenied(guidance) => Some(guidance),
+            let (guidance, by) = match decision {
+                PendingDecision::Explicit(answer, by) => (answer.guidance().map(String::from), by),
+                PendingDecision::MatchedRule => (None, Answerer::User),
+                PendingDecision::PolicyDenied(guidance) => (Some(guidance), Answerer::User),
             };
-            Err(deny(source, guidance))
+            Err(deny_by(source, guidance, by))
         }
+    }
+}
+
+impl PermissionManager {
+    /// Autopilot's part in a prompt, when it is engaged on this manager. A
+    /// fork never carries it, so only the session that engaged it is asked.
+    fn prompt_delegate(
+        &self,
+        request: &PermissionRequest,
+        context: &EvaluationContext,
+        event_tx: &EventSender,
+    ) -> Option<PromptDelegate> {
+        let handle = self.autopilot().filter(AutopilotHandle::is_engaged)?;
+        let reservation = reserved_note(request, context)
+            .map(AutoNote::name)
+            .or_else(|| {
+                self.decisions()
+                    .is_some_and(|decisions| decisions.is_tainted())
+                    .then_some(TAINTED_RESERVATION)
+            });
+        let agent = requesting_agent(event_tx);
+        let item = decision_item(request, &self.mode(), agent.as_deref(), reservation);
+        let origin = DecisionOrigin {
+            subject: decision_subject(request),
+            agent,
+            tool_use_id: Some(request.id.clone()),
+            history_len: handle.snapshot().map_or(0, |snapshot| snapshot.history_len),
+        };
+        Some(PromptDelegate {
+            seq: handle.next_seq(),
+            handle,
+            reservation,
+            item,
+            origin,
+        })
+    }
+
+    /// Acts on autopilot's call for a waiting prompt. A call cut off by a
+    /// claim leaves the prompt to the human, an answer a human beat is still
+    /// recorded, and a request a reload superseded raises no escalation.
+    fn conclude_delegate(
+        &self,
+        delegate: &PromptDelegate,
+        outcome: Option<DelegateOutcome>,
+        registration: &PendingRegistration<'_>,
+        request: &mut PermissionRequest,
+        context: &EvaluationContext,
+    ) {
+        let Some(outcome) = outcome else {
+            registration.note_autopilot(request, None);
+            return;
+        };
+        let answer = delegated_answer(&outcome);
+        if answer.is_err() && self.superseded(context) {
+            return;
+        }
+        delegate.record(&outcome, registration.event_tx);
+        let note = match answer {
+            Ok(answer) => {
+                if self.answer_as(registration.request_id, answer, Answerer::Autopilot) {
+                    return;
+                }
+                None
+            }
+            Err(reason) => Some(AutopilotNote::Escalated { reason }),
+        };
+        registration.note_autopilot(request, note);
+    }
+
+    /// Whether a reload replaced the context the request was reviewed in.
+    fn superseded(&self, context: &EvaluationContext) -> bool {
+        *self
+            .context_revision
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            != context.revision
     }
 }
 
@@ -1081,42 +1341,59 @@ pub(super) fn contain_authority_to_the_plan(request: &mut PermissionRequest) {
     }
 }
 
+fn is_gated(resource: &PermissionResource) -> bool {
+    resource.protected || resource.requires_prompt
+}
+
+/// The reserved class a request falls in, which neither Auto nor autopilot
+/// may ever approve, in the precedence of the prompt's own reason. It reads
+/// only the request and how it was raised, so it applies in every mode.
+///
+/// A protected or prepared resource is reserved. The one exception is a whole
+/// command line the first-party shell could not review command by command,
+/// for a cause an engine reading the full text may screen. A cause that always
+/// asks is reserved from any source, but only the trusted shell's facts can
+/// lift the reservation.
+fn reserved_note(request: &PermissionRequest, context: &EvaluationContext) -> Option<AutoNote> {
+    let gated: Vec<_> = request
+        .resources
+        .iter()
+        .filter(|resource| is_gated(resource))
+        .map(ShellOpacity::of)
+        .collect();
+    let worst = gated.iter().flatten().max().copied();
+    if context.plan_scoped {
+        Some(AutoNote::Planning)
+    } else if context.forced {
+        Some(AutoNote::Forced)
+    } else if let Some(cause) = worst.filter(|cause| !cause.screenable()) {
+        Some(AutoNote::AlwaysAsks(cause))
+    } else if !gated.is_empty() && (gated.contains(&None) || !trusted_shell_request(request)) {
+        Some(AutoNote::Protected)
+    } else {
+        None
+    }
+}
+
 /// Whether Auto may settle a request the policy leaves to the user, or the
 /// first reason it may not, in the precedence of the prompt's own reason.
-///
-/// A protected or prepared resource normally means Auto never applies. The one
-/// exception is a whole command line the first-party shell could not review
-/// command by command, for a cause an engine reading the full text may screen.
-/// A cause that always asks restricts from any source, but only the trusted
-/// shell's facts can open the engine path.
+/// Past the reserved classes, only an engine may approve a gated line.
 fn auto_eligibility(
     request: &PermissionRequest,
     context: &EvaluationContext,
     coverage: &RequestCoverage,
     default: DefaultEffect,
 ) -> AutoEligibility {
-    let gated: Vec<_> = request
-        .resources
-        .iter()
-        .filter(|resource| resource.protected || resource.requires_prompt)
-        .map(ShellOpacity::of)
-        .collect();
-    let worst = gated.iter().flatten().max().copied();
-    let note = if context.plan_scoped {
-        AutoNote::Planning
-    } else if context.forced {
-        AutoNote::Forced
-    } else if let Some(cause) = worst.filter(|cause| !cause.screenable()) {
-        AutoNote::AlwaysAsks(cause)
-    } else if !gated.is_empty() && (gated.contains(&None) || !trusted_shell_request(request)) {
-        AutoNote::Protected
+    let gated = request.resources.iter().any(is_gated);
+    let note = if let Some(reserved) = reserved_note(request, context) {
+        reserved
     } else if coverage.must_prompt {
         AutoNote::RuleAsks
-    } else if gated.is_empty() && context.force_prompt {
+    } else if !gated && context.force_prompt {
         AutoNote::Forced
     } else if default != DefaultEffect::Prompt {
         AutoNote::ToolDefault
-    } else if gated.is_empty() {
+    } else if !gated {
         return AutoEligibility::Direct;
     } else {
         return AutoEligibility::NeedsEngine;
@@ -1124,18 +1401,186 @@ fn auto_eligibility(
     AutoEligibility::Never(note)
 }
 
+/// An action the request does not accept, such as a grant of a reserved
+/// request, is left to the human whatever let it through.
+fn screened(mut outcome: DelegateOutcome, reserved: bool) -> DelegateOutcome {
+    if let Ok(output) = &outcome.answer
+        && !outcome
+            .kind
+            .accepted_actions(reserved)
+            .contains(&output.action.name())
+    {
+        let refused = WireError::Refused {
+            kind: outcome.kind,
+            action: output.action.name().name().into(),
+        };
+        outcome.answer = Err(refused.to_string());
+    }
+    outcome
+}
+
+/// The answer the delegate gave, or why it left the prompt to the human.
+fn delegated_answer(outcome: &DelegateOutcome) -> Result<PermissionAnswer, String> {
+    match &outcome.answer {
+        Ok(DelegateOutput {
+            action: DelegateAction::Allow,
+            ..
+        }) => Ok(PermissionAnswer::AllowOnce),
+        Ok(DelegateOutput {
+            action: DelegateAction::Deny { guidance },
+            ..
+        }) => Ok(PermissionAnswer::DenyWithGuidance(guidance.clone())),
+        Ok(DelegateOutput { reason, .. }) | Err(reason) => Err(reason.clone()),
+    }
+}
+
+/// Who asked, as far as the sender says. The session's own agents share its
+/// stream, so they are `None`; workflow agents and background tasks are named.
+fn requesting_agent(event_tx: &EventSender) -> Option<String> {
+    if let Some(workflow) = event_tx.workflow() {
+        let mut agent = format!(
+            "{WORKFLOW_AGENT} {}{ITEM_SEPARATOR}{WORKFLOW_CALL} {}",
+            workflow.run_id, workflow.call_key
+        );
+        if let Some(phase) = &workflow.phase {
+            let _ = write!(agent, "{ITEM_SEPARATOR}{WORKFLOW_PHASE} {phase}");
+        }
+        return Some(agent);
+    }
+    event_tx
+        .task()
+        .map(|task| format!("{BACKGROUND_TASK_AGENT} {}", task.task_id))
+}
+
+/// What a decision row names: the tool and the first resource it asks for.
+fn decision_subject(request: &PermissionRequest) -> String {
+    match request.presentation.resources.split_first() {
+        None => request.tool.to_string(),
+        Some((first, [])) => format!("{}: {}", request.tool, first.summary),
+        Some((first, rest)) => format!(
+            "{}: {} +{} {ITEM_MORE}",
+            request.tool,
+            first.summary,
+            rest.len()
+        ),
+    }
+}
+
+/// The prompt as the delegate reads it, bounded: what is asked and why, who
+/// asked, and whether autopilot may allow it.
+fn decision_item(
+    request: &PermissionRequest,
+    mode: &PermissionMode,
+    agent: Option<&str>,
+    reservation: Option<&str>,
+) -> String {
+    let presentation = &request.presentation;
+    let input = request.input.to_string();
+    let cut = input.floor_char_boundary(MAX_ITEM_INPUT_BYTES);
+    let truncated = if cut < input.len() {
+        ITEM_TRUNCATED
+    } else {
+        ""
+    };
+    let mut item = format!(
+        "{ITEM_TOOL_LABEL} {}\n{ITEM_INPUT_LABEL} {}{truncated}\n{ITEM_RESOURCES_LABEL}\n",
+        request.tool,
+        &input[..cut]
+    );
+    for resource in presentation.resources.iter().take(PROMPT_LOG_MAX_RESOURCES) {
+        let _ = write!(
+            item,
+            "{ITEM_BULLET} {} {}",
+            resource_kind_name(&resource.kind),
+            resource.summary
+        );
+        if let Some(access) = &resource.access {
+            let _ = write!(item, " ({access:?})");
+        }
+        if resource.protected {
+            let _ = write!(item, " {ITEM_PROTECTED}");
+        }
+        item.push('\n');
+    }
+    let hidden = presentation
+        .resources
+        .len()
+        .saturating_sub(PROMPT_LOG_MAX_RESOURCES);
+    if hidden > 0 {
+        let _ = writeln!(item, "{ITEM_BULLET} +{hidden} {ITEM_MORE}");
+    }
+    let _ = writeln!(
+        item,
+        "{ITEM_REASON_LABEL} {}",
+        prompt_reason_message(&presentation.reason)
+    );
+    if let Some(auto) = presentation.auto {
+        let _ = writeln!(item, "{ITEM_AUTO_LABEL} {}", auto.phrase());
+    }
+    if !presentation.advisories.is_empty() {
+        let advisories = presentation
+            .advisories
+            .iter()
+            .map(|advisory| format!("{} {:.2}", advisory.flag.name(), advisory.probability))
+            .collect::<Vec<_>>()
+            .join(ITEM_SEPARATOR);
+        let _ = writeln!(item, "{ITEM_ADVISORIES_LABEL} {advisories}");
+    }
+    let _ = write!(
+        item,
+        "{ITEM_AGENT_LABEL} {}\n{ITEM_MODE_LABEL} {}\n{ITEM_RESERVED_LABEL} {}",
+        agent.unwrap_or(MAIN_AGENT),
+        mode_label(mode),
+        reservation.unwrap_or(ITEM_NOT_RESERVED)
+    );
+    item
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::{
-        ACTIVE_PLAN_INTENT_MISMATCH, AutoEligibility, CURRENT_DEFAULT_DENIES_REQUEST,
-        CURRENT_POLICY_DENIES_REQUEST, EvaluationContext, PendingDecision, PendingPermission,
-        PendingRegistration, contain_authority_to_the_plan, remove_pending,
+        ACTIVE_PLAN_INTENT_MISMATCH, AUTOPILOT_GUIDANCE_LABEL, AutoEligibility,
+        BACKGROUND_TASK_AGENT, CURRENT_DEFAULT_DENIES_REQUEST, CURRENT_POLICY_DENIES_REQUEST,
+        EvaluationContext, ITEM_ADVISORIES_LABEL, ITEM_AGENT_LABEL, ITEM_AUTO_LABEL, ITEM_BULLET,
+        ITEM_INPUT_LABEL, ITEM_MODE_LABEL, ITEM_MORE, ITEM_NOT_RESERVED, ITEM_PROTECTED,
+        ITEM_REASON_LABEL, ITEM_RESERVED_LABEL, ITEM_RESOURCES_LABEL, ITEM_SEPARATOR,
+        ITEM_TOOL_LABEL, ITEM_TRUNCATED, MAIN_AGENT, MAX_ITEM_INPUT_BYTES,
+        PROMPT_LOG_MAX_RESOURCES, PendingDecision, PendingPermission, PendingRegistration,
+        TAINTED_RESERVATION, UNATTENDED_ESCALATION, USER_GUIDANCE_LABEL, WORKFLOW_AGENT,
+        WORKFLOW_CALL, WORKFLOW_PHASE, contain_authority_to_the_plan, decision_item,
+        decision_subject, mode_label, prompt_reason_message, remove_pending, reserved_note,
+        screened,
     };
+    use crate::Envelope;
+    use crate::autopilot::{
+        ActionName, AutopilotDecision, DecisionKind, DelegateAction, DelegateOutcome,
+        DelegateOutput, GatedProvider, ScriptedProvider, Step, WireError, engaged_handle,
+    };
+    use crate::decisions::Decisions;
     use crate::permissions::tests::{
-        CONTROLLED_REQUEST, FIRST_COMMAND, SECOND_COMMAND, controlled_enforcement, remember_command,
+        CONTROLLED_REQUEST, FIRST_COMMAND, SECOND_COMMAND, controlled_enforcement,
+        opaque_line_intent, remember_command,
     };
+    use crate::permissions::{
+        AutopilotNote, DECISION_SOURCE_AUTOPILOT_DENY, DECISION_SOURCE_AUTOPILOT_ONCE,
+        DECISION_SOURCE_RULE, DECISION_SOURCE_USER_ABORT, DECISION_SOURCE_USER_ONCE,
+        DECISION_SOURCE_YOLO, EngineFlag, PermissionAdvisory, PermissionError,
+    };
+    use crate::types::Answerer;
+    use crate::types::{AutopilotEvent, TaskProvenance, WorkflowProvenance};
     use crate::{CancelToken, EventSender};
+    use caudra_config::decisions::DecisionsConfig;
+    use caudra_otel::logs::EVENT_TOOL_DECISION;
+    use caudra_providers::provider::Provider;
+    use caudra_providers::{Billing, TokenUsage};
+    use caudra_storage::id::CaudraId;
+    use futures_lite::future;
+    use std::fmt::Debug;
+    use std::sync::Mutex;
     use std::sync::atomic::Ordering;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
 
     use std::collections::BTreeMap;
 
@@ -1145,7 +1590,8 @@ pub(super) mod tests {
     use crate::tools::registry::Tool;
     use crate::tools::test_support::stub_ctx;
     use crate::tools::{
-        MEMORY_TOOL_NAME, PermissionIntent, PermissionScopes, ToolAudience, ToolContext,
+        MEMORY_TOOL_NAME, PermissionIntent, PermissionScopes, SHELL_TOOL_NAME, ToolAudience,
+        ToolContext,
     };
     use caudra_storage::id::SessionRef;
     use caudra_storage::local_documents::LocalDocumentStore;
@@ -1157,7 +1603,7 @@ pub(super) mod tests {
     use std::fs::Permissions;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use tempfile::{Builder, TempDir};
+    use tempfile::{Builder, TempDir, tempdir};
 
     use test_case::test_case;
 
@@ -1184,7 +1630,7 @@ pub(super) mod tests {
         PermissionPolicyError, PermissionPresentation, PermissionRequest, PermissionResource,
         PermissionResourceAccess, PermissionResourceKind, PermissionRisk, PermissionRowGrant,
         PermissionRuleRecord, PermissionSubject, PromptReason, RemotePermissionIdentity,
-        ResourceCoverage, RevokedRuleScope, RuleOrigin, StructuredPermissionDecision,
+        ResourceCoverage, RevokedRuleScope, RuleOrigin, ShellOpacity, StructuredPermissionDecision,
         StructuredPermissionEffect, builtin_structured_rules, canonical_json,
         canonical_json_sha256, filesystem_permission_resource, is_shell_tool, normalize_scope_path,
         prompt_forcing_reason,
@@ -1206,8 +1652,25 @@ pub(super) mod tests {
     const PLAN_CONTENT: &str = "The complete plan";
     const LOCAL_MEMORY_SCOPE: &str = "local-memory:read:architecture.md";
     const IMPOSTOR_PLUGIN: &str = "impostor";
+    const PRIVILEGED_LINE: &str = "sudo cargo build";
+    const DENY_GUIDANCE: &str = "run the narrower test instead";
     #[cfg(unix)]
     const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+    const DELEGATE_ALLOW: &str = r#"{"action":"allow","reason":"the user asked for the build"}"#;
+    const DELEGATE_DENY: &str = r#"{"action":"deny","reason":"outside the task","guidance":"run the narrower test instead"}"#;
+    const DELEGATE_ESCALATE: &str = r#"{"action":"escalate","reason":"the user must choose"}"#;
+    const DELEGATE_REASON: &str = "the user asked for the build";
+    const ESCALATION_REASON: &str = "the user must choose";
+    const TASK_ID: &str = "task-7";
+    const INVOCATION_ID: &str = "invocation-7";
+    const WORKFLOW_RUN_ID: &str = "run-3";
+    const WORKFLOW_EPOCH: u64 = 1;
+    const WORKFLOW_CALL_KEY: u64 = 4;
+    const WORKFLOW_PHASE_NAME: &str = "review";
+    const HIDDEN_RESOURCES: usize = 2;
+    const ADVISORY_PROBABILITY: f64 = 0.75;
+    const SOURCE_FIELD: &str = "source";
+    const UNUSED_SPAN: u64 = 1;
 
     enum PlanIntentMismatch {
         Target,
@@ -1337,7 +1800,7 @@ pub(super) mod tests {
                         CURRENT_DEFAULT_DENIES_REQUEST.into()
                     })
                     .to_string();
-                    assert_eq!(error.guidance, Some(expected));
+                    assert_eq!(error.guidance.map(|guidance| guidance.text), Some(expected));
                     assert!(receiver.is_empty());
                 } else {
                     assert!(enforcement.await.is_ok());
@@ -1390,7 +1853,10 @@ pub(super) mod tests {
                     .enforce_active_plan(&intent, &input, &ctx, CONTROLLED_REQUEST, None)
                     .await
                     .unwrap_err();
-                assert_eq!(error.guidance.as_deref(), Some(ACTIVE_PLAN_INTENT_MISMATCH));
+                assert_eq!(
+                    error.guidance.map(|guidance| guidance.text).as_deref(),
+                    Some(ACTIVE_PLAN_INTENT_MISMATCH)
+                );
             }
         });
     }
@@ -1457,7 +1923,8 @@ pub(super) mod tests {
                     .enforce_active_plan(&intent, &input, &ctx, CONTROLLED_REQUEST, None)
                     .await
                     .err()
-                    .and_then(|error| error.guidance);
+                    .and_then(|error| error.guidance)
+                    .map(|guidance| guidance.text);
                 assert_eq!(guidance.as_deref(), refusal);
             }
         });
@@ -1568,7 +2035,11 @@ pub(super) mod tests {
                     assert!(enforcement.await.is_err());
                 } else if effect == Some(Effect::Deny) {
                     assert_eq!(
-                        enforcement.await.unwrap_err().guidance,
+                        enforcement
+                            .await
+                            .unwrap_err()
+                            .guidance
+                            .map(|guidance| guidance.text),
                         Some(
                             PermissionPolicyError(CURRENT_POLICY_DENIES_REQUEST.into()).to_string()
                         )
@@ -1600,7 +2071,8 @@ pub(super) mod tests {
                     .enforce_active_plan(&intent, &input, &ctx, CONTROLLED_REQUEST, None)
                     .await
                     .unwrap_err()
-                    .guidance,
+                    .guidance
+                    .map(|guidance| guidance.text),
                 Some(PermissionPolicyError(CURRENT_POLICY_DENIES_REQUEST.into()).to_string())
             );
         });
@@ -3564,6 +4036,22 @@ pub(super) mod tests {
         });
     }
 
+    fn matrix_manager(rule: Option<Effect>) -> PermissionManager {
+        let rules = rule
+            .map(|effect| shell_policy_rule(FIRST_COMMAND, effect))
+            .into_iter()
+            .collect();
+        mgr_with(make_config(rules), PathBuf::from(SHELL_WORKDIR))
+    }
+
+    fn matrix_intent(forced: bool, plan_scoped: bool, protected: bool) -> PermissionIntent {
+        let mut intent = shell_intent(&[FIRST_COMMAND]);
+        intent.scopes.force_prompt = forced;
+        intent.scopes.plan_scoped = plan_scoped;
+        intent.resources[0].protected = protected;
+        intent
+    }
+
     #[test_case(Some(Effect::Ask), false, false, false, AutoNote::RuleAsks; "an_ask_rule")]
     #[test_case(None, true, false, false, AutoNote::Forced; "a_forced_prompt")]
     #[test_case(None, false, true, false, AutoNote::Planning; "plan_mode")]
@@ -3576,20 +4064,79 @@ pub(super) mod tests {
         note: AutoNote,
     ) {
         smol::block_on(async {
-            let rules = rule
-                .map(|effect| shell_policy_rule(FIRST_COMMAND, effect))
-                .into_iter()
-                .collect();
-            let manager = mgr_with(make_config(rules), PathBuf::from(SHELL_WORKDIR));
+            let manager = matrix_manager(rule);
             manager.set_session_mode(Some(PermissionMode::Auto));
-            let mut intent = shell_intent(&[FIRST_COMMAND]);
-            intent.scopes.force_prompt = forced;
-            intent.scopes.plan_scoped = plan_scoped;
-            intent.resources[0].protected = protected;
+            let intent = matrix_intent(forced, plan_scoped, protected);
             let prompt = shell_prompt(&manager, &intent, FIRST_COMMAND)
                 .await
                 .expect(SHELL_PROMPT_MISSING);
             assert_eq!(prompt.presentation.auto, Some(note));
+        });
+    }
+
+    /// Autopilot reads the reserved classes outside Auto too, and they are
+    /// exactly the notes Auto gives for them.
+    #[test_case(Some(Effect::Ask), matrix_intent(false, false, false), AutoNote::RuleAsks, false; "an_ask_rule")]
+    #[test_case(None, matrix_intent(true, false, false), AutoNote::Forced, true; "a_forced_prompt")]
+    #[test_case(None, matrix_intent(false, true, false), AutoNote::Planning, true; "plan_mode")]
+    #[test_case(None, matrix_intent(false, false, true), AutoNote::Protected, true; "a_protected_command")]
+    #[test_case(None, opaque_line_intent(PRIVILEGED_LINE, ShellOpacity::Privilege), AutoNote::AlwaysAsks(ShellOpacity::Privilege), true; "a_line_that_always_asks")]
+    fn reserved_note_agrees_with_auto(
+        rule: Option<Effect>,
+        intent: PermissionIntent,
+        note: AutoNote,
+        reserved: bool,
+    ) {
+        smol::block_on(async {
+            let manager = matrix_manager(rule);
+            let command = intent.scopes.scopes.last().unwrap().clone();
+            let asked = shell_prompt(&manager, &intent, &command)
+                .await
+                .expect(SHELL_PROMPT_MISSING);
+            manager.set_session_mode(Some(PermissionMode::Auto));
+            let auto = shell_prompt(&manager, &intent, &command)
+                .await
+                .expect(SHELL_PROMPT_MISSING);
+            let context = EvaluationContext {
+                revision: *manager.context_revision.read().unwrap(),
+                plan_scoped: intent.scopes.plan_scoped,
+                builtin_allows: true,
+                force_prompt: intent.scopes.force_prompt || intent.scopes.plan_scoped,
+                forced: intent.scopes.force_prompt,
+                exact_plan: None,
+            };
+
+            assert_eq!(asked.presentation.auto, None);
+            assert_eq!(auto.presentation.auto, Some(note));
+            assert_eq!(reserved_note(&asked, &context), reserved.then_some(note));
+        });
+    }
+
+    #[test_case(Answerer::User, USER_GUIDANCE_LABEL; "the_user")]
+    #[test_case(Answerer::Autopilot, AUTOPILOT_GUIDANCE_LABEL; "autopilot")]
+    fn deny_guidance_tells_the_model_who_gave_it(by: Answerer, label: &str) {
+        smol::block_on(async {
+            let manager = Arc::new(default_mgr());
+            let (call, events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                CONTROLLED_REQUEST,
+                "bash",
+                FIRST_COMMAND.into(),
+                json!({"command": FIRST_COMMAND}),
+            );
+            events.recv_async().await.unwrap();
+
+            assert!(manager.answer_as(
+                CONTROLLED_REQUEST,
+                PermissionAnswer::DenyWithGuidance(DENY_GUIDANCE.into()),
+                by,
+            ));
+
+            let refusal = call.await.unwrap_err().to_string();
+            assert!(
+                refusal.ends_with(&format!(" {label} {DENY_GUIDANCE}")),
+                "{refusal}"
+            );
         });
     }
     #[test_case(false; "stale_partial_refresh_preserves_replacement")]
@@ -3621,7 +4168,9 @@ pub(super) mod tests {
                 context_revision,
                 answering: false,
                 abandoned: false,
+                claimed_by_human: false,
                 cancel: CancelToken::none(),
+                delegate_stop: None,
                 changed,
                 sender: sender.clone(),
             },
@@ -3656,7 +4205,10 @@ pub(super) mod tests {
         assert!(
             answered
                 .sender
-                .try_send(PendingDecision::Explicit(PermissionAnswer::AllowOnce))
+                .try_send(PendingDecision::Explicit(
+                    PermissionAnswer::AllowOnce,
+                    Answerer::User
+                ))
                 .is_ok()
         );
         let replacement = make_request(vec![REPLACEMENT_COMMAND.into()]);
@@ -3671,7 +4223,9 @@ pub(super) mod tests {
                 context_revision,
                 answering: false,
                 abandoned: false,
+                claimed_by_human: false,
                 cancel: CancelToken::none(),
+                delegate_stop: None,
                 changed,
                 sender: new_sender.clone(),
             },
@@ -3697,11 +4251,791 @@ pub(super) mod tests {
         assert!(manager.answer(CONTROLLED_REQUEST, PermissionAnswer::Deny));
         assert!(matches!(
             new_receiver.try_recv(),
-            Ok(PendingDecision::Explicit(PermissionAnswer::Deny))
+            Ok(PendingDecision::Explicit(
+                PermissionAnswer::Deny,
+                Answerer::User
+            ))
         ));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(PendingDecision::Explicit(PermissionAnswer::AllowOnce))
+            Ok(PendingDecision::Explicit(
+                PermissionAnswer::AllowOnce,
+                Answerer::User
+            ))
         ));
+    }
+
+    /// The `source` of every tool decision reported on this thread while it
+    /// records.
+    #[derive(Clone, Default)]
+    struct DecisionSources(Arc<Mutex<Vec<String>>>);
+
+    impl DecisionSources {
+        fn during<T>(&self, run: impl FnOnce() -> T) -> T {
+            tracing::subscriber::with_default(self.clone(), run)
+        }
+
+        fn recorded(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl Subscriber for DecisionSources {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.target() == EVENT_TOOL_DECISION
+        }
+
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(UNUSED_SPAN)
+        }
+
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            event.record(&mut self.clone());
+        }
+
+        fn enter(&self, _: &Id) {}
+
+        fn exit(&self, _: &Id) {}
+    }
+
+    impl Visit for DecisionSources {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == SOURCE_FIELD {
+                self.0.lock().unwrap().push(value.to_owned());
+            }
+        }
+
+        fn record_debug(&mut self, _: &Field, _: &dyn Debug) {}
+    }
+
+    /// A manager whose prompts autopilot decides with `provider`, behind an
+    /// ask rule, so the call always prompts and is never reserved.
+    fn autopilot_manager(provider: Arc<dyn Provider>) -> PermissionManager {
+        let manager = matrix_manager(Some(Effect::Ask));
+        manager.set_autopilot(Some(engaged_handle(provider)));
+        manager
+    }
+
+    /// A provider that holds every call until it is dropped, the end of each
+    /// call it starts, and the release, kept so a held call never fails.
+    fn held_provider() -> (
+        Arc<GatedProvider>,
+        flume::Receiver<flume::Receiver<()>>,
+        flume::Sender<&'static str>,
+    ) {
+        let (started_tx, started) = flume::unbounded();
+        let (release, release_rx) = flume::unbounded();
+        let provider = GatedProvider {
+            started: started_tx,
+            release: release_rx,
+        };
+        (Arc::new(provider), started, release)
+    }
+
+    /// Raises `intent` as a first-party shell call, with a human to answer it
+    /// unless `unattended`.
+    async fn delegated_call(
+        manager: &PermissionManager,
+        intent: &PermissionIntent,
+        event_tx: &EventSender,
+        cancel: &CancelToken,
+        unattended: bool,
+    ) -> Result<(), PermissionError> {
+        let (_legacy_tx, legacy_rx) = flume::unbounded();
+        let legacy_rx = async_lock::Mutex::new(legacy_rx);
+        manager
+            .enforce_with_intent(
+                &ToolKey::native(SHELL_TOOL_NAME),
+                intent,
+                &json!({"command": intent.scopes.scopes.last(), "workdir": SHELL_WORKDIR}),
+                event_tx,
+                (!unattended).then_some(&legacy_rx),
+                CONTROLLED_REQUEST,
+                cancel,
+                None,
+                Some((workcell_shell_subject(), PermissionExecutorKind::Native)),
+                true,
+            )
+            .await
+    }
+
+    /// Waits for an event `wanted` accepts, keeping every event it passes.
+    async fn wait_for(
+        events: &flume::Receiver<Envelope>,
+        seen: &mut Vec<AgentEvent>,
+        wanted: impl Fn(&AgentEvent) -> bool,
+    ) {
+        loop {
+            let event = events.recv_async().await.unwrap().event;
+            let found = wanted(&event);
+            seen.push(event);
+            if found {
+                return;
+            }
+        }
+    }
+
+    fn events_of(events: &flume::Receiver<Envelope>) -> Vec<AgentEvent> {
+        events.drain().map(|envelope| envelope.event).collect()
+    }
+
+    fn decided(events: &[AgentEvent]) -> Vec<&AutopilotDecision> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Autopilot(AutopilotEvent::Decided(decision)) => Some(&**decision),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn escalated(events: &[AgentEvent]) -> bool {
+        events.iter().any(|event| {
+            matches!(event, AgentEvent::PermissionRequestUpdated(request)
+                if matches!(request.presentation.autopilot, Some(AutopilotNote::Escalated { .. })))
+        })
+    }
+
+    fn resolved_by(events: &[AgentEvent]) -> Vec<Option<Answerer>> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::PermissionRequestResolved { by, .. } => Some(*by),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn delegate_outcome(action: DelegateAction) -> DelegateOutcome {
+        DelegateOutcome {
+            kind: DecisionKind::Permission,
+            answer: Ok(DelegateOutput {
+                action,
+                reason: DELEGATE_REASON.into(),
+            }),
+            usage: TokenUsage::default(),
+            cost: None,
+            billing: Billing::default(),
+            model: None,
+        }
+    }
+
+    /// Autopilot is asked about every prompt, but a reserved one is never its
+    /// to allow in any mode: unattended, its allow becomes a denial.
+    #[test_case(PermissionMode::Ask, Some(Effect::Ask), matrix_intent(false, false, false), None; "ask_an_ask_rule")]
+    #[test_case(PermissionMode::Ask, None, matrix_intent(false, true, false), Some(AutoNote::Planning); "ask_plan_mode")]
+    #[test_case(PermissionMode::Ask, None, matrix_intent(true, false, false), Some(AutoNote::Forced); "ask_a_forced_prompt")]
+    #[test_case(PermissionMode::Ask, None, matrix_intent(false, false, true), Some(AutoNote::Protected); "ask_a_protected_command")]
+    #[test_case(PermissionMode::Ask, None, opaque_line_intent(PRIVILEGED_LINE, ShellOpacity::Privilege), Some(AutoNote::AlwaysAsks(ShellOpacity::Privilege)); "ask_a_line_that_always_asks")]
+    #[test_case(PermissionMode::Auto, Some(Effect::Ask), matrix_intent(false, false, false), None; "auto_an_ask_rule")]
+    #[test_case(PermissionMode::Auto, None, matrix_intent(false, true, false), Some(AutoNote::Planning); "auto_plan_mode")]
+    #[test_case(PermissionMode::Auto, None, matrix_intent(true, false, false), Some(AutoNote::Forced); "auto_a_forced_prompt")]
+    #[test_case(PermissionMode::Auto, None, matrix_intent(false, false, true), Some(AutoNote::Protected); "auto_a_protected_command")]
+    #[test_case(PermissionMode::Auto, None, opaque_line_intent(PRIVILEGED_LINE, ShellOpacity::Privilege), Some(AutoNote::AlwaysAsks(ShellOpacity::Privilege)); "auto_a_line_that_always_asks")]
+    fn autopilot_never_allows_a_reserved_request(
+        mode: PermissionMode,
+        rule: Option<Effect>,
+        intent: PermissionIntent,
+        reserved: Option<AutoNote>,
+    ) {
+        let provider = ScriptedProvider::new(vec![Step::Answer(DELEGATE_ALLOW)]);
+        let manager = matrix_manager(rule);
+        manager.set_session_mode(Some(mode));
+        manager.set_autopilot(Some(engaged_handle(provider.clone())));
+        let (event_tx, events) = flume::unbounded();
+        let event_tx = EventSender::new(event_tx, 0);
+
+        let result = smol::block_on(delegated_call(
+            &manager,
+            &intent,
+            &event_tx,
+            &CancelToken::none(),
+            true,
+        ));
+
+        let reservation = reserved.map_or(ITEM_NOT_RESERVED, AutoNote::name);
+        let [prompt] = provider.prompts().try_into().unwrap();
+        assert!(
+            prompt.contains(&format!("{ITEM_RESERVED_LABEL} {reservation}")),
+            "{prompt}"
+        );
+        let events = events_of(&events);
+        let decisions = decided(&events);
+        let [decision] = decisions.as_slice() else {
+            panic!("{decisions:?}");
+        };
+        if reserved.is_none() {
+            result.unwrap();
+            assert_eq!(decision.action, ActionName::Allow);
+            return;
+        }
+        let refused = WireError::Refused {
+            kind: DecisionKind::Permission,
+            action: ActionName::Allow.name().into(),
+        };
+        let guidance = result.unwrap_err().guidance.unwrap();
+        assert_eq!(
+            (guidance.text.as_str(), guidance.by),
+            (UNATTENDED_ESCALATION, Answerer::Autopilot)
+        );
+        assert_eq!(
+            (decision.action, decision.reason.clone()),
+            (ActionName::Escalate, refused.to_string())
+        );
+    }
+
+    /// Taint reserves a request no class reserves, yet autopilot still reads it.
+    #[test]
+    fn a_tainted_session_keeps_autopilot_from_allowing() {
+        let state = tempdir().unwrap();
+        let provider = ScriptedProvider::new(vec![Step::Answer(DELEGATE_ALLOW)]);
+        let manager = autopilot_manager(provider.clone());
+        let decisions = Decisions::new(
+            DecisionsConfig::default(),
+            &StateDir::from_path(state.path().into()),
+        )
+        .unwrap();
+        manager.set_decisions(Some(decisions));
+        manager.decisions().unwrap().mark_tainted();
+        let (event_tx, _events) = flume::unbounded();
+
+        let refusal = smol::block_on(delegated_call(
+            &manager,
+            &matrix_intent(false, false, false),
+            &EventSender::new(event_tx, 0),
+            &CancelToken::none(),
+            true,
+        ))
+        .unwrap_err();
+
+        let [prompt] = provider.prompts().try_into().unwrap();
+        assert!(
+            prompt.contains(&format!("{ITEM_RESERVED_LABEL} {TAINTED_RESERVATION}")),
+            "{prompt}"
+        );
+        assert_eq!(refusal.guidance.unwrap().text, UNATTENDED_ESCALATION);
+    }
+
+    /// With no human to ask, autopilot's answer stands, and an escalation is a
+    /// denial that says why.
+    #[test_case(DELEGATE_ALLOW, None, DECISION_SOURCE_AUTOPILOT_ONCE; "an_allow_runs_the_call")]
+    #[test_case(DELEGATE_DENY, Some(DENY_GUIDANCE), DECISION_SOURCE_AUTOPILOT_DENY; "a_denial_carries_its_guidance")]
+    #[test_case(DELEGATE_ESCALATE, Some(UNATTENDED_ESCALATION), DECISION_SOURCE_AUTOPILOT_DENY; "an_escalation_finds_no_human")]
+    fn an_unattended_prompt_takes_the_autopilot_answer(
+        answer: &'static str,
+        guidance: Option<&str>,
+        source: &str,
+    ) {
+        let manager = autopilot_manager(ScriptedProvider::new(vec![Step::Answer(answer)]));
+        let (event_tx, events) = flume::unbounded();
+        let event_tx = EventSender::new(event_tx, 0);
+        let sources = DecisionSources::default();
+
+        let result = sources.during(|| {
+            smol::block_on(delegated_call(
+                &manager,
+                &matrix_intent(false, false, false),
+                &event_tx,
+                &CancelToken::none(),
+                true,
+            ))
+        });
+
+        match guidance {
+            None => result.unwrap(),
+            Some(text) => {
+                let guidance = result.unwrap_err().guidance.unwrap();
+                assert_eq!(
+                    (guidance.text.as_str(), guidance.by),
+                    (text, Answerer::Autopilot)
+                );
+            }
+        }
+        assert_eq!(sources.recorded(), [source]);
+        let events = events_of(&events);
+        assert!(matches!(
+            events.first(),
+            Some(AgentEvent::Autopilot(AutopilotEvent::Deciding {
+                kind: DecisionKind::Permission,
+                ..
+            }))
+        ));
+        assert_eq!(decided(&events).len(), 1);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::PermissionRequest(_)))
+        );
+    }
+
+    /// Autopilot answers a waiting prompt for this one call: the prompt
+    /// resolves as autopilot's, and no rule is kept.
+    #[test_case(DELEGATE_ALLOW, ActionName::Allow, None, DECISION_SOURCE_AUTOPILOT_ONCE; "an_allow")]
+    #[test_case(DELEGATE_DENY, ActionName::Deny, Some(DENY_GUIDANCE), DECISION_SOURCE_AUTOPILOT_DENY; "a_denial")]
+    fn autopilot_answers_a_waiting_prompt(
+        answer: &'static str,
+        action: ActionName,
+        guidance: Option<&str>,
+        source: &str,
+    ) {
+        let manager = autopilot_manager(ScriptedProvider::new(vec![Step::Answer(answer)]));
+        let (event_tx, events) = flume::unbounded();
+        let event_tx = EventSender::new(event_tx, 0);
+        let sources = DecisionSources::default();
+
+        let result = sources.during(|| {
+            smol::block_on(delegated_call(
+                &manager,
+                &matrix_intent(false, false, false),
+                &event_tx,
+                &CancelToken::none(),
+                false,
+            ))
+        });
+
+        match guidance {
+            None => result.unwrap(),
+            Some(text) => {
+                let refusal = result.unwrap_err().to_string();
+                assert!(
+                    refusal.ends_with(&format!(" {AUTOPILOT_GUIDANCE_LABEL} {text}")),
+                    "{refusal}"
+                );
+            }
+        }
+        assert_eq!(sources.recorded(), [source]);
+        assert!(manager.structured_conversation_rules_snapshot().is_empty());
+        assert_eq!(manager.pending_count(), 0);
+        let events = events_of(&events);
+        let raised = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::PermissionRequest(request) => Some(request),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(raised.presentation.autopilot, Some(AutopilotNote::Deciding));
+        let decisions = decided(&events);
+        let [decision] = decisions.as_slice() else {
+            panic!("{decisions:?}");
+        };
+        assert_eq!(
+            (decision.action, decision.tool_use_id.as_deref()),
+            (action, Some(CONTROLLED_REQUEST))
+        );
+        assert_eq!(resolved_by(&events), [Some(Answerer::Autopilot)]);
+    }
+
+    /// An escalation leaves the prompt pending with autopilot's reason, and
+    /// the human's answer is the user's.
+    #[test]
+    fn an_escalation_leaves_the_prompt_to_the_human() {
+        let manager =
+            autopilot_manager(ScriptedProvider::new(vec![Step::Answer(DELEGATE_ESCALATE)]));
+        let (event_tx, events) = flume::unbounded();
+        let event_tx = EventSender::new(event_tx, 0);
+        let sources = DecisionSources::default();
+        let escalation = Some(AutopilotNote::Escalated {
+            reason: ESCALATION_REASON.into(),
+        });
+        let mut seen = Vec::new();
+
+        let (result, ()) = sources.during(|| {
+            smol::block_on(future::zip(
+                delegated_call(
+                    &manager,
+                    &matrix_intent(false, false, false),
+                    &event_tx,
+                    &CancelToken::none(),
+                    false,
+                ),
+                async {
+                    wait_for(&events, &mut seen, |event| {
+                        matches!(event, AgentEvent::PermissionRequestUpdated(request)
+                            if request.presentation.autopilot == escalation)
+                    })
+                    .await;
+                    let pending = manager.pending_request(CONTROLLED_REQUEST).unwrap();
+                    assert_eq!(pending.presentation.autopilot, escalation);
+                    assert!(manager.answer(CONTROLLED_REQUEST, PermissionAnswer::AllowOnce));
+                },
+            ))
+        });
+
+        result.unwrap();
+        assert_eq!(sources.recorded(), [DECISION_SOURCE_USER_ONCE]);
+        seen.extend(events_of(&events));
+        let decisions: Vec<_> = decided(&seen)
+            .iter()
+            .map(|decision| (decision.action, decision.reason.as_str()))
+            .collect();
+        assert_eq!(decisions, [(ActionName::Escalate, ESCALATION_REASON)]);
+        assert!(resolved_by(&seen).is_empty());
+    }
+
+    /// A human taking the prompt stops autopilot's call and clears its note,
+    /// and autopilot may no longer answer.
+    #[test]
+    fn a_claim_stands_the_delegate_down() {
+        let (provider, started, _release) = held_provider();
+        let manager = autopilot_manager(provider);
+        let (event_tx, events) = flume::unbounded();
+        let event_tx = EventSender::new(event_tx, 0);
+        let mut seen = Vec::new();
+
+        let (result, ()) = smol::block_on(future::zip(
+            delegated_call(
+                &manager,
+                &matrix_intent(false, false, false),
+                &event_tx,
+                &CancelToken::none(),
+                false,
+            ),
+            async {
+                let ended = started.recv_async().await.unwrap();
+                assert!(manager.claim(CONTROLLED_REQUEST));
+                assert!(ended.recv_async().await.is_err());
+                wait_for(&events, &mut seen, |event| {
+                    matches!(event, AgentEvent::PermissionRequestUpdated(request)
+                        if request.presentation.autopilot.is_none())
+                })
+                .await;
+                assert!(!manager.answer_as(
+                    CONTROLLED_REQUEST,
+                    PermissionAnswer::AllowOnce,
+                    Answerer::Autopilot
+                ));
+                assert!(manager.answer(CONTROLLED_REQUEST, PermissionAnswer::Deny));
+            },
+        ));
+
+        assert!(result.unwrap_err().guidance.is_none());
+        seen.extend(events_of(&events));
+        assert!(decided(&seen).is_empty());
+    }
+
+    enum PromptEnd {
+        Settled,
+        Cancelled,
+        Reloaded,
+    }
+
+    /// Whatever ends a waiting prompt ends autopilot's call for it, with no
+    /// row and no escalation, and the prompt never resolves as autopilot's.
+    #[test_case(PromptEnd::Settled, true, DECISION_SOURCE_YOLO; "a_matching_rule")]
+    #[test_case(PromptEnd::Cancelled, false, DECISION_SOURCE_USER_ABORT; "a_cancelled_run")]
+    #[test_case(PromptEnd::Reloaded, false, DECISION_SOURCE_RULE; "a_reload")]
+    fn the_delegate_stops_when_the_prompt_ends(end: PromptEnd, allowed: bool, source: &str) {
+        let (provider, started, _release) = held_provider();
+        let manager = autopilot_manager(provider);
+        let (event_tx, events) = flume::unbounded();
+        let event_tx = EventSender::new(event_tx, 0);
+        let (trigger, cancel) = CancelToken::new();
+        let mut trigger = Some(trigger);
+        let sources = DecisionSources::default();
+
+        let (result, ended) = sources.during(|| {
+            smol::block_on(future::zip(
+                delegated_call(
+                    &manager,
+                    &matrix_intent(false, false, false),
+                    &event_tx,
+                    &cancel,
+                    false,
+                ),
+                async {
+                    let ended = started.recv_async().await.unwrap();
+                    match end {
+                        PromptEnd::Settled => manager.set_session_mode(Some(PermissionMode::Yolo)),
+                        PromptEnd::Cancelled => trigger.take().unwrap().cancel(),
+                        PromptEnd::Reloaded => manager.set_project(Path::new(SHELL_WORKDIR)),
+                    }
+                    ended
+                },
+            ))
+        });
+
+        assert_eq!(result.is_ok(), allowed);
+        assert_eq!(sources.recorded(), [source]);
+        assert!(matches!(
+            ended.try_recv(),
+            Err(flume::TryRecvError::Disconnected)
+        ));
+        let events = events_of(&events);
+        assert!(decided(&events).is_empty());
+        assert!(!escalated(&events));
+        assert_eq!(resolved_by(&events), [None]);
+    }
+
+    enum Requester {
+        Session,
+        Task,
+        Workflow,
+    }
+
+    impl Requester {
+        fn sender(&self, tx: flume::Sender<Envelope>) -> EventSender {
+            let sender = EventSender::new(tx, 0);
+            match self {
+                Self::Session => sender,
+                Self::Task => sender.with_task(TaskProvenance {
+                    session_id: CaudraId::generate(),
+                    task_id: TASK_ID.into(),
+                    invocation_id: INVOCATION_ID.into(),
+                }),
+                Self::Workflow => sender.with_workflow(WorkflowProvenance {
+                    run_id: WORKFLOW_RUN_ID.into(),
+                    epoch: WORKFLOW_EPOCH,
+                    call_key: WORKFLOW_CALL_KEY,
+                    phase: Some(WORKFLOW_PHASE_NAME.into()),
+                }),
+            }
+        }
+
+        fn agent(&self) -> Option<String> {
+            match self {
+                Self::Session => None,
+                Self::Task => Some(format!("{BACKGROUND_TASK_AGENT} {TASK_ID}")),
+                Self::Workflow => Some(format!(
+                    "{WORKFLOW_AGENT} {WORKFLOW_RUN_ID}{ITEM_SEPARATOR}{WORKFLOW_CALL} \
+                     {WORKFLOW_CALL_KEY}{ITEM_SEPARATOR}{WORKFLOW_PHASE} {WORKFLOW_PHASE_NAME}"
+                )),
+            }
+        }
+    }
+
+    /// Every agent sharing the session's manager reaches its autopilot, and
+    /// the item and the row name who asked.
+    #[test_case(Requester::Session; "the_session")]
+    #[test_case(Requester::Task; "a_background_task")]
+    #[test_case(Requester::Workflow; "a_workflow_agent")]
+    fn every_agent_sharing_the_manager_reaches_autopilot(requester: Requester) {
+        let provider = ScriptedProvider::new(vec![Step::Answer(DELEGATE_ALLOW)]);
+        let manager = autopilot_manager(provider.clone());
+        let (event_tx, events) = flume::unbounded();
+
+        smol::block_on(delegated_call(
+            &manager,
+            &matrix_intent(false, false, false),
+            &requester.sender(event_tx),
+            &CancelToken::none(),
+            true,
+        ))
+        .unwrap();
+
+        let agent = requester.agent();
+        let [prompt] = provider.prompts().try_into().unwrap();
+        let named = agent.as_deref().unwrap_or(MAIN_AGENT);
+        assert!(
+            prompt.contains(&format!("{ITEM_AGENT_LABEL} {named}")),
+            "{prompt}"
+        );
+        let events = events_of(&events);
+        let agents: Vec<_> = decided(&events)
+            .iter()
+            .map(|decision| decision.agent.clone())
+            .collect();
+        assert_eq!(agents, [agent]);
+    }
+
+    /// A fork carries no autopilot, so its prompts are never delegated.
+    #[test]
+    fn a_fork_never_asks_autopilot() {
+        let provider = ScriptedProvider::new(Vec::new());
+        let fork = autopilot_manager(provider.clone()).fork();
+        let (event_tx, events) = flume::unbounded();
+
+        let refusal = smol::block_on(delegated_call(
+            &fork,
+            &matrix_intent(false, false, false),
+            &EventSender::new(event_tx, 0),
+            &CancelToken::none(),
+            true,
+        ))
+        .unwrap_err();
+
+        assert!(refusal.guidance.is_none());
+        assert!(provider.prompts().is_empty());
+        assert!(events.is_empty());
+    }
+
+    enum Interference {
+        HumanAnswering,
+        Reload,
+    }
+
+    /// A call that ends after the prompt moved on is still recorded, unless a
+    /// reload superseded its escalation, and it never escalates the prompt.
+    #[test_case(DelegateAction::Allow, Interference::HumanAnswering, true; "an_allow_a_human_beat")]
+    #[test_case(DelegateAction::Escalate, Interference::HumanAnswering, true; "an_escalation_a_human_beat")]
+    #[test_case(DelegateAction::Allow, Interference::Reload, true; "an_allow_a_reload_refused")]
+    #[test_case(DelegateAction::Escalate, Interference::Reload, false; "an_escalation_a_reload_superseded")]
+    fn a_late_call_never_escalates_the_prompt_it_lost(
+        action: DelegateAction,
+        interference: Interference,
+        recorded: bool,
+    ) {
+        let manager = autopilot_manager(ScriptedProvider::new(Vec::new()));
+        let mut request = shell_request(&[FIRST_COMMAND], workcell_shell_subject());
+        let request_id = request.id.clone();
+        let context = EvaluationContext {
+            revision: *manager.context_revision.read().unwrap(),
+            plan_scoped: false,
+            builtin_allows: true,
+            force_prompt: false,
+            forced: false,
+            exact_plan: None,
+        };
+        let (event_tx, events) = flume::unbounded();
+        let event_tx = EventSender::new(event_tx, 0);
+        let delegate = manager
+            .prompt_delegate(&request, &context, &event_tx)
+            .unwrap();
+        let (sender, _decisions) = flume::bounded(1);
+        let (changed, _changes) = flume::bounded(1);
+        manager.pending().entry(manager.id).or_default().insert(
+            request_id.clone(),
+            PendingPermission {
+                request: request.clone(),
+                evaluation: Some(context.clone()),
+                project: None,
+                context_revision: context.revision,
+                answering: matches!(interference, Interference::HumanAnswering),
+                abandoned: false,
+                claimed_by_human: false,
+                cancel: CancelToken::none(),
+                delegate_stop: None,
+                changed,
+                sender: sender.clone(),
+            },
+        );
+        if matches!(interference, Interference::Reload) {
+            manager.set_project(Path::new(SHELL_WORKDIR));
+        }
+        let registration = PendingRegistration {
+            manager: &manager,
+            request_id: &request_id,
+            sender,
+            event_tx: &event_tx,
+        };
+
+        manager.conclude_delegate(
+            &delegate,
+            Some(delegate_outcome(action)),
+            &registration,
+            &mut request,
+            &context,
+        );
+
+        let events = events_of(&events);
+        let rows = usize::from(recorded);
+        assert_eq!(decided(&events).len(), rows);
+        assert_eq!(manager.autopilot().unwrap().recent_decisions().len(), rows);
+        assert!(!escalated(&events));
+        assert_eq!(
+            manager
+                .pending_request(&request_id)
+                .map(|pending| pending.presentation.autopilot),
+            Some(None)
+        );
+    }
+
+    /// The screen refuses an action the request does not accept, whatever let
+    /// it through the wire.
+    #[test_case(DelegateAction::Allow, false, false; "an_allow_of_an_open_request")]
+    #[test_case(DelegateAction::Allow, true, true; "an_allow_of_a_reserved_request")]
+    #[test_case(DelegateAction::Deny { guidance: DENY_GUIDANCE.into() }, true, false; "a_denial_of_a_reserved_request")]
+    fn the_screen_refuses_what_the_request_does_not_accept(
+        action: DelegateAction,
+        reserved: bool,
+        refused: bool,
+    ) {
+        let outcome = delegate_outcome(action.clone());
+        let expected = if refused {
+            Err(WireError::Refused {
+                kind: DecisionKind::Permission,
+                action: action.name().name().into(),
+            }
+            .to_string())
+        } else {
+            outcome.answer.clone()
+        };
+
+        assert_eq!(screened(outcome, reserved).answer, expected);
+    }
+
+    /// The delegate reads the prompt bounded: the input clipped, the resources
+    /// capped, then why it asks, who asked, and whether it may allow.
+    #[test]
+    fn the_item_tells_the_delegate_what_it_decides() {
+        let commands: Vec<String> = (0..PROMPT_LOG_MAX_RESOURCES + HIDDEN_RESOURCES)
+            .map(|index| format!("{FIRST_COMMAND} {index}"))
+            .collect();
+        let commands: Vec<&str> = commands.iter().map(String::as_str).collect();
+        let mut request = shell_request(&commands, workcell_shell_subject());
+        request.input = json!({"command": FIRST_COMMAND.repeat(MAX_ITEM_INPUT_BYTES)});
+        request.presentation.resources[0].protected = true;
+        request.presentation.auto = Some(AutoNote::RuleAsks);
+        request.presentation.advisories = vec![PermissionAdvisory {
+            flag: EngineFlag::Deletes,
+            probability: ADVISORY_PROBABILITY,
+        }];
+
+        let item = decision_item(
+            &request,
+            &PermissionMode::Auto,
+            Some(TASK_ID),
+            Some(TAINTED_RESERVATION),
+        );
+
+        let lines: Vec<&str> = item.lines().collect();
+        assert_eq!(lines[0], format!("{ITEM_TOOL_LABEL} {}", request.tool));
+        assert!(lines[1].starts_with(ITEM_INPUT_LABEL) && lines[1].ends_with(ITEM_TRUNCATED));
+        assert!(
+            lines[1].len()
+                <= ITEM_INPUT_LABEL.len() + 1 + MAX_ITEM_INPUT_BYTES + ITEM_TRUNCATED.len()
+        );
+        assert_eq!(lines[2], ITEM_RESOURCES_LABEL);
+        let bullet = format!("{ITEM_BULLET} ");
+        let resources: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|line| line.starts_with(&bullet))
+            .collect();
+        assert_eq!(resources.len(), PROMPT_LOG_MAX_RESOURCES + 1);
+        assert!(resources[0].ends_with(ITEM_PROTECTED));
+        assert!(!resources[1].ends_with(ITEM_PROTECTED));
+        assert_eq!(
+            resources[PROMPT_LOG_MAX_RESOURCES],
+            format!("{ITEM_BULLET} +{HIDDEN_RESOURCES} {ITEM_MORE}")
+        );
+        let tail = [
+            format!(
+                "{ITEM_REASON_LABEL} {}",
+                prompt_reason_message(&request.presentation.reason)
+            ),
+            format!("{ITEM_AUTO_LABEL} {}", AutoNote::RuleAsks.phrase()),
+            format!(
+                "{ITEM_ADVISORIES_LABEL} {} {ADVISORY_PROBABILITY}",
+                EngineFlag::Deletes.name()
+            ),
+            format!("{ITEM_AGENT_LABEL} {TASK_ID}"),
+            format!("{ITEM_MODE_LABEL} {}", mode_label(&PermissionMode::Auto)),
+            format!("{ITEM_RESERVED_LABEL} {TAINTED_RESERVATION}"),
+        ];
+        assert_eq!(lines[lines.len() - tail.len()..], tail);
+        assert_eq!(
+            decision_subject(&request),
+            format!(
+                "{}: {} +{} {ITEM_MORE}",
+                request.tool,
+                request.presentation.resources[0].summary,
+                commands.len() - 1
+            )
+        );
     }
 }

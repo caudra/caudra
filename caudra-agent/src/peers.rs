@@ -40,6 +40,8 @@ pub use observe::{
     SendOrigin, StoredDelivery, WorkCursor, WorkPause, WorkReported,
 };
 use topics::{parse_pattern, parse_topic, pattern_matches, validate_patterns};
+#[cfg(all(test, unix))]
+pub(crate) use work::unix_tests::held_work;
 pub use work::{
     AssignedWork, COMPLETION_REQUIRED, INVALID_GROUP, MAX_MEMBERSHIPS, MAX_OUTCOME_BYTES,
     ManagedWork, NOT_MEMBER, PAUSED_BY_CANCEL, SkippedWork, TOO_MANY_MEMBERSHIPS, WorkAction,

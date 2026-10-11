@@ -104,7 +104,11 @@ pub(crate) struct Steering {
     truncations: u32,
     abandons: u32,
     responses: u64,
+    /// The responses the turn limit was last re-armed at.
+    turns_rearmed_at: u64,
     stalled: u32,
+    /// Empty-response nudges in the current episode that a re-arm forgave.
+    forgiven_nudges: u32,
     calls: VecDeque<(u64, ToolObservation)>,
     planning_since: u64,
     /// From the latest response only, so older evidence cannot raise a hint.
@@ -167,7 +171,9 @@ impl Steering {
             truncations: 0,
             abandons: 0,
             responses: 0,
+            turns_rearmed_at: 0,
             stalled: 0,
+            forgiven_nudges: 0,
             calls: VecDeque::new(),
             planning_since: 0,
             latest_paths: Vec::new(),
@@ -187,7 +193,28 @@ impl Steering {
     // Hard limits belong to the external invocation, not the short-lived Agent
     // used for each report correction. They also apply when steering is disabled.
     pub(super) fn turn_limit_reached(&self, max_turns: Option<u32>) -> bool {
-        max_turns.is_some_and(|max| self.responses >= u64::from(max))
+        max_turns.is_some_and(|max| {
+            self.responses.saturating_sub(self.turns_rearmed_at) >= u64::from(max)
+        })
+    }
+
+    /// Gives the run the turns its limit allows again, counted from now.
+    pub(super) fn rearm_turns(&mut self) {
+        self.turns_rearmed_at = self.responses;
+    }
+
+    /// Gives `rule` back its allowance, and the recoveries every rule shares.
+    /// The empty-response rule reads its episode from the history, so
+    /// `nudges` is the episode the history holds now, all of it forgiven.
+    pub(super) fn rearm(&mut self, rule: &str, nudges: u32) {
+        self.recoveries = 0;
+        match rule {
+            NO_PROGRESS_RULE => self.stalled = 0,
+            EMPTY_RULE => self.forgiven_nudges = nudges,
+            PROTOCOL_RULE => self.protocols = 0,
+            TRUNCATION_RULE => self.truncations = 0,
+            _ => {}
+        }
     }
 
     pub(super) fn repeat_threshold(&self) -> usize {
@@ -264,11 +291,12 @@ impl Steering {
         if !observed.abandoned {
             self.abandons = 0;
         }
-        self.stalled = if observed.productive {
-            0
+        if observed.productive {
+            self.stalled = 0;
+            self.forgiven_nudges = 0;
         } else {
-            self.stalled.saturating_add(1)
-        };
+            self.stalled = self.stalled.saturating_add(1);
+        }
         self.latest_paths = observed.paths;
         if !self.policy.enabled {
             return;
@@ -349,6 +377,7 @@ impl Steering {
                 nudges,
                 barren,
             } => {
+                let nudges = nudges.saturating_sub(self.forgiven_nudges);
                 let policy = &self.policy.rules.empty_response;
                 if !policy.enabled {
                     return Ok(RecoveryAction::Disabled);
@@ -675,7 +704,7 @@ pub(super) fn abandons_turn(text: &str) -> bool {
     if text.ends_with(':') {
         return true;
     }
-    if SOLICITS.is_match(&sanitize(text)) {
+    if solicits(text) {
         return false;
     }
     let Some(line) = text
@@ -698,6 +727,12 @@ pub(super) fn abandons_turn(text: &str) -> bool {
         return false;
     }
     PROMISE.is_match(sentence)
+}
+
+/// Whether a response asks the user for something, outside quotations and
+/// inline code. Such a turn handed control back on purpose.
+pub(super) fn solicits(text: &str) -> bool {
+    SOLICITS.is_match(&sanitize(text))
 }
 
 fn sanitize(text: &str) -> String {
@@ -797,12 +832,12 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        ABANDONED_FACT, ABANDONED_RULE, EMPTY_IDLE, EMPTY_RULE, Intervention, Observed,
-        PLANNING_PROMPT, PLANNING_RULE, PROTOCOL_FACT, PROTOCOL_RULE, RELATIVE_PATHS_FACT,
-        RELATIVE_PATHS_PROMPT, RELATIVE_PATHS_RULE, REMINDER_CLOSE, REPETITION_RULE, REPORT_RULE,
-        REPORT_STRUCTURED, REPORT_SUMMARY, Recovery, RecoveryAction, Steering, TEXT_BYTES_LIMIT,
-        TRUNCATION_FACT, TRUNCATION_PROMPT, TRUNCATION_RULE, abandons_turn, eligible_response,
-        normalized_message,
+        ABANDONED_FACT, ABANDONED_RULE, EMPTY_IDLE, EMPTY_RULE, Intervention, NO_PROGRESS_RULE,
+        Observed, PLANNING_PROMPT, PLANNING_RULE, PROTOCOL_FACT, PROTOCOL_RULE,
+        RELATIVE_PATHS_FACT, RELATIVE_PATHS_PROMPT, RELATIVE_PATHS_RULE, REMINDER_CLOSE,
+        REPETITION_RULE, REPORT_RULE, REPORT_STRUCTURED, REPORT_SUMMARY, Recovery, RecoveryAction,
+        Steering, TEXT_BYTES_LIMIT, TRUNCATION_FACT, TRUNCATION_PROMPT, TRUNCATION_RULE,
+        abandons_turn, eligible_response, normalized_message, solicits,
     };
     use crate::AgentError;
     use crate::agent::relative_paths::PathSuggestion;
@@ -814,6 +849,7 @@ mod tests {
     const CUSTOM: &str = "Custom guidance, not a rule identity.";
     const TOOL: &str = "file_read";
     const EXPECTED_CONTINUE: &str = "a charged recovery continues";
+    const SOLICITING_KEEPS_THE_TURN: &str = "a turn that asks the user never abandons it";
     const OTHER_MODEL: &str = "other-model";
     const TRUNCATION_ATTEMPTS: u32 = 3;
     const SHELL_TOOL: &str = "shell";
@@ -849,6 +885,7 @@ mod tests {
     const DEFAULT_MIN_SAVED_CHARS: usize = 12;
     const CUSTOM_MIN_SAVED_CHARS: usize = 30;
     const REMINDER_OPEN: &str = "<system-reminder>";
+    const REARMED: &str = "a re-armed allowance must start over from the re-arm";
 
     fn default_state() -> Steering {
         Steering::new(SteeringConfig::default().resolve(MODEL))
@@ -946,6 +983,58 @@ mod tests {
 
         observe_calls(&mut state, vec![call(0, ToolOutcome::Success)]);
         assert!(!state.no_progress());
+    }
+
+    #[test_case(PROTOCOL_RULE; "protocol")]
+    #[test_case(TRUNCATION_RULE; "truncation")]
+    #[test_case(EMPTY_RULE; "empty_response")]
+    fn a_rearmed_rule_gets_its_allowance_back(rule: &str) {
+        let recovery = |nudges| match rule {
+            PROTOCOL_RULE => Recovery::Protocol,
+            TRUNCATION_RULE => Recovery::Truncated,
+            _ => Recovery::Empty {
+                after_tools: false,
+                nudges,
+                barren: false,
+            },
+        };
+        let mut state = default_state();
+        let mut nudges = 0;
+        while matches!(
+            state.recover(recovery(nudges)),
+            Ok(RecoveryAction::Continue(_))
+        ) {
+            nudges += 1;
+        }
+
+        state.rearm(rule, nudges + 1);
+
+        assert!(
+            matches!(
+                state.recover(recovery(nudges + 1)),
+                Ok(RecoveryAction::Continue(Intervention { attempt: 1, .. }))
+            ),
+            "{REARMED}"
+        );
+        assert_eq!(state.recoveries, 1, "{REARMED}");
+    }
+
+    #[test]
+    fn a_rearm_counts_turns_from_the_rearm() {
+        let mut state = default_state();
+        let turns = state.policy.max_stalled_turns;
+        for _ in 0..turns {
+            observe_calls(&mut state, Vec::new());
+        }
+        assert!(state.turn_limit_reached(Some(turns)) && state.no_progress());
+
+        state.rearm_turns();
+        state.rearm(NO_PROGRESS_RULE, 0);
+
+        assert!(!state.turn_limit_reached(Some(turns)), "{REARMED}");
+        assert!(!state.no_progress(), "{REARMED}");
+        observe_calls(&mut state, Vec::new());
+        assert!(!state.turn_limit_reached(Some(turns)), "{REARMED}");
     }
 
     #[test_case(true; "master_disabled")]
@@ -1597,6 +1686,25 @@ mod tests {
     #[test_case("", false ; "empty")]
     fn abandonment_reads_the_tail_of_a_response(text: &str, expected: bool) {
         assert_eq!(abandons_turn(text), expected);
+    }
+
+    // Each phrase follows a promise, so whatever does not solicit is abandoned.
+    #[test_case("Let me wire the parser next. Which file holds it?", true ; "question_mark")]
+    #[test_case("I'll wire the parser when you're ready.", true ; "when_ready")]
+    #[test_case("I'll wire the parser whenever you’re ready.", true ; "whenever_ready")]
+    #[test_case("I'll wire the parser. Just say go.", true ; "just_say")]
+    #[test_case("I'll wire the parser. Let me know first.", true ; "let_me_know")]
+    #[test_case("I'll wire the parser. What would you like first", true ; "what_would_you_like")]
+    #[test_case("I'll wire the parser. Say the word", true ; "say_the_word")]
+    #[test_case("I'll wire the parser the guide calls \"ready?\"", false ; "question_inside_a_quotation")]
+    #[test_case("Let me run `parse?` on the input.", false ; "question_inside_inline_code")]
+    fn solicitation_agrees_with_abandonment(text: &str, expected: bool) {
+        assert_eq!(solicits(text), expected);
+        assert_eq!(
+            abandons_turn(text),
+            !expected,
+            "{SOLICITING_KEEPS_THE_TURN}"
+        );
     }
 
     /// The one recovery that gives up quietly: the response it corrects had

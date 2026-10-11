@@ -5,6 +5,7 @@ use super::{
     PermissionRowGrant, PermissionRuleRecord, StructuredPermissionEffect, StructuredPermissionRule,
     permission_rule_covers_request, permission_rule_intersects_request, review::review_for_rule,
 };
+use crate::types::Answerer;
 use caudra_storage::id::CaudraId;
 use caudra_storage::now_epoch;
 use caudra_storage::permission_state::mutation::{
@@ -31,6 +32,10 @@ pub const DECISION_SOURCE_USER_SESSION: &str = "user_session";
 pub const DECISION_SOURCE_USER_ALWAYS: &str = "user_always";
 
 pub const DECISION_SOURCE_USER_ABORT: &str = "user_abort";
+
+pub const DECISION_SOURCE_AUTOPILOT_ONCE: &str = "autopilot_once";
+
+pub const DECISION_SOURCE_AUTOPILOT_DENY: &str = "autopilot_deny";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionAnswer {
@@ -68,6 +73,22 @@ impl PermissionAnswer {
             PermissionLifetime::Conversation => DECISION_SOURCE_USER_SESSION,
             PermissionLifetime::Project | PermissionLifetime::Global => DECISION_SOURCE_USER_ALWAYS,
         }
+    }
+
+    pub(super) fn decision_source_by(&self, by: Answerer) -> &'static str {
+        match by {
+            Answerer::User => self.decision_source(),
+            Answerer::Autopilot if self.is_allow() => DECISION_SOURCE_AUTOPILOT_ONCE,
+            Answerer::Autopilot => DECISION_SOURCE_AUTOPILOT_DENY,
+        }
+    }
+
+    /// Autopilot answers one call at a time, so it never files a rule.
+    pub(super) fn autopilot_may_give(&self) -> bool {
+        matches!(
+            self,
+            Self::AllowOnce | Self::Deny | Self::DenyWithGuidance(_)
+        )
     }
 
     pub fn is_allow(&self) -> bool {
@@ -448,6 +469,7 @@ fn policy_error(error: impl Display) -> PermissionPolicyError {
 #[cfg(test)]
 mod tests {
     use super::{
+        DECISION_SOURCE_AUTOPILOT_DENY, DECISION_SOURCE_AUTOPILOT_ONCE,
         DECISION_SOURCE_USER_ALWAYS, DECISION_SOURCE_USER_ONCE, DECISION_SOURCE_USER_SESSION,
         PermissionRequest,
     };
@@ -459,8 +481,12 @@ mod tests {
     use crate::permissions::{
         ComposedRow, PermissionAnswer, PermissionLifetime, PermissionRowGrant,
     };
+    use crate::types::Answerer;
     use caudra_config::ToolKey;
     use std::sync::Arc;
+
+    const GUIDANCE: &str = "run the narrower test instead";
+
     #[test]
     fn permission_answer_roundtrip() {
         for a in [
@@ -499,6 +525,19 @@ mod tests {
         expected: &str,
     ) {
         assert_eq!(composed_answer(lifetimes).decision_source(), expected);
+    }
+
+    #[test_case::test_case(PermissionAnswer::AllowSession, Answerer::User, DECISION_SOURCE_USER_SESSION; "a_user_keeps_the_lifetime_source")]
+    #[test_case::test_case(PermissionAnswer::Deny, Answerer::User, DECISION_SOURCE_USER_ONCE; "a_user_denial")]
+    #[test_case::test_case(PermissionAnswer::AllowOnce, Answerer::Autopilot, DECISION_SOURCE_AUTOPILOT_ONCE; "an_autopilot_approval")]
+    #[test_case::test_case(PermissionAnswer::Deny, Answerer::Autopilot, DECISION_SOURCE_AUTOPILOT_DENY; "an_autopilot_denial")]
+    #[test_case::test_case(PermissionAnswer::DenyWithGuidance(GUIDANCE.into()), Answerer::Autopilot, DECISION_SOURCE_AUTOPILOT_DENY; "an_autopilot_denial_with_guidance")]
+    fn an_answer_is_sourced_from_who_gave_it(
+        answer: PermissionAnswer,
+        by: Answerer,
+        expected: &str,
+    ) {
+        assert_eq!(answer.decision_source_by(by), expected);
     }
 
     /// The point of per-row scopes: one answer, one rule, and only the rows

@@ -210,7 +210,7 @@ pub fn static_description(tool: &dyn Tool) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[cfg(unix)]
     use std::fs::Permissions;
     #[cfg(unix)]
@@ -250,7 +250,8 @@ mod tests {
     #[cfg(unix)]
     const DIRECTORY_MODE: u32 = 0o700;
 
-    pub(super) fn tempdir() -> TempDir {
+    /// A temporary directory only its owner may open, as private files need.
+    pub(crate) fn tempdir() -> TempDir {
         let builder = &mut Builder::new();
         #[cfg(unix)]
         builder.permissions(Permissions::from_mode(DIRECTORY_MODE));

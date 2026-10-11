@@ -1900,7 +1900,7 @@ pub(super) async fn process_tool_calls(
             results.push(adopted.finish().await);
         }
         *recent_calls = runs.recent();
-        history.record_todos(&results);
+        history.record_results(&results);
         let tool_msg = crate::types::tool_results(results);
         history.push(tool_msg.clone());
         event_tx.send(AgentEvent::ToolResultsSubmitted {
@@ -2000,7 +2000,7 @@ pub(super) async fn process_tool_calls(
 
     let mut all_results = results;
     all_results.extend(immediate_errors);
-    history.record_todos(&all_results);
+    history.record_results(&all_results);
     let tool_msg = crate::types::tool_results(all_results);
     event_tx.send(AgentEvent::ToolResultsSubmitted {
         message: Box::new(tool_msg.clone()),

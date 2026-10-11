@@ -221,6 +221,7 @@ mod tests {
             evaluations: 1,
             duration_s: 0,
             cost: None,
+            autopilot: false,
         })
     }
 

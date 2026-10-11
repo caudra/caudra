@@ -9,6 +9,7 @@ use crate::decisions::{
     DecisionContext, DecisionFeature, DecisionReceipt, Decisions, PermissionAction,
     PermissionDecision, PermissionPurpose,
 };
+use crate::types::Answerer;
 use crate::{AgentEvent, CancelToken};
 use caudra_config::decisions::FeatureMode;
 use caudra_storage::decision_log::{DecisionEffect, DecisionLabel};
@@ -399,13 +400,16 @@ impl PendingRegistration<'_> {
     }
 }
 
+/// Labels the engine's verdicts with what the user chose. Autopilot's answers
+/// are not the user's, so they label nothing.
 pub(super) fn label_answer(
     mut receipts: Vec<PermissionReceipt>,
     advisory: Option<AdvisoryTask>,
     answer: &PermissionAnswer,
+    by: Answerer,
     waited_ms: u64,
 ) -> Option<Task<()>> {
-    if receipts.is_empty() && advisory.is_none() {
+    if by == Answerer::Autopilot || (receipts.is_empty() && advisory.is_none()) {
         return None;
     }
     let label = DecisionLabel {
@@ -448,6 +452,7 @@ mod tests {
         ShellOpacity, filesystem_permission_resource,
     };
     use crate::tools::PermissionScopes;
+    use crate::types::Answerer;
     use crate::{AgentEvent, CancelToken, EventSender};
     use async_trait::async_trait;
     use caudra_config::decisions::{DecisionsConfig, FeatureMode};
@@ -480,6 +485,8 @@ mod tests {
     const OVERSIZED_STATE_BYTES: usize = 16_384;
     const SCREENABLE_LINE: &str = "cargo build > build.log";
     const SCRIPT_STEPS: usize = 24;
+    const AUTOPILOT_GUIDANCE: &str = "run the narrower test instead";
+    const AUTOPILOT_IS_NOT_THE_USER: &str = "an autopilot answer must never train the engine";
     const INLINE_PYTHON: ShellOpacity = ShellOpacity::InlineScript {
         language: ScriptLanguage::Python,
     };
@@ -1409,6 +1416,7 @@ mod tests {
             vec![(service.decisions.clone(), receipt)],
             None,
             &PermissionAnswer::Deny,
+            Answerer::User,
             0,
         )
         .unwrap()
@@ -1552,31 +1560,42 @@ mod tests {
         });
     }
 
+    async fn advised_receipt() -> (Service, DecisionReceipt) {
+        let mut config = DecisionsConfig {
+            base_url: Some(BASE_URL.parse().unwrap()),
+            timeout_ms: TIMEOUT_MS,
+            log: true,
+            ..Default::default()
+        };
+        config.features.permission_advice = FeatureMode::Advise;
+        let service = configured_service(Behavior::Probability(1.0), config, false);
+        let decision = service
+            .decisions
+            .permission(
+                PermissionPurpose::Advice,
+                &json!({"command": FIRST_COMMAND}),
+                &DecisionContext::default(),
+            )
+            .await
+            .unwrap();
+        let receipt = decision.evaluation.receipt.unwrap();
+        (service, receipt)
+    }
+
     #[test_case(PermissionAnswer::AllowOnce, true; "approval")]
     #[test_case(PermissionAnswer::Deny, false; "denial")]
     fn explicit_answers_attach_only_user_approval_labels(answer: PermissionAnswer, approves: bool) {
         smol::block_on(async {
-            let mut config = DecisionsConfig {
-                base_url: Some(BASE_URL.parse().unwrap()),
-                timeout_ms: TIMEOUT_MS,
-                log: true,
-                ..Default::default()
-            };
-            config.features.permission_advice = FeatureMode::Advise;
-            let service = configured_service(Behavior::Probability(1.0), config, false);
-            let decision = service
-                .decisions
-                .permission(
-                    PermissionPurpose::Advice,
-                    &json!({"command": FIRST_COMMAND}),
-                    &DecisionContext::default(),
-                )
-                .await
-                .unwrap();
-            let receipt = decision.evaluation.receipt.unwrap();
-            label_answer(vec![(service.decisions, receipt)], None, &answer, 0)
-                .unwrap()
-                .await;
+            let (service, receipt) = advised_receipt().await;
+            label_answer(
+                vec![(service.decisions, receipt)],
+                None,
+                &answer,
+                Answerer::User,
+                0,
+            )
+            .unwrap()
+            .await;
             let log = DecisionLog::open_existing(&StateDir::from_path(
                 service._state.path().to_path_buf(),
             ))
@@ -1586,6 +1605,24 @@ mod tests {
             assert_eq!(log.export_jsonl(&mut exported, None).unwrap(), 1);
             let row: Value = serde_json::from_slice(&exported).unwrap();
             assert_eq!(row["expected"], json!({"user_approves": approves}));
+        });
+    }
+
+    #[test_case(PermissionAnswer::AllowOnce; "approval")]
+    #[test_case(PermissionAnswer::DenyWithGuidance(AUTOPILOT_GUIDANCE.into()); "denial")]
+    fn autopilot_answers_attach_no_label(answer: PermissionAnswer) {
+        smol::block_on(async {
+            let (service, receipt) = advised_receipt().await;
+
+            let label = label_answer(
+                vec![(service.decisions, receipt)],
+                None,
+                &answer,
+                Answerer::Autopilot,
+                0,
+            );
+
+            assert!(label.is_none(), "{AUTOPILOT_IS_NOT_THE_USER}");
         });
     }
 }

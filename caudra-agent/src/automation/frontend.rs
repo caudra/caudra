@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use caudra_automation::event::{
-    ErrorKind, GoalFinishedDetail, GoalVerdict as FinishedVerdict, InputKind,
+    AutopilotView, ErrorKind, GoalFinishedDetail, GoalVerdict as FinishedVerdict, InputKind,
     MAX_LAST_RESPONSE_BYTES, SessionStatus, SessionView, StartedBy, TurnOutcome, cap_text,
 };
 use caudra_automation::host::DeliveryMode;
@@ -24,8 +24,9 @@ use tracing::{info, warn};
 
 use super::busy::{BusyTracker, RunEnd};
 use super::handle::AutomationHandle;
-use super::manager::{AutomationRuntime, GOAL_ACTIVE, LaunchArming};
+use super::manager::{AutomationRuntime, GOAL_ACTIVE, GOAL_OWNED_BY_AUTOPILOT, LaunchArming};
 use super::store::stored_controls;
+use crate::autopilot::AutopilotHandle;
 use crate::prompt::profile::SystemPromptProfile;
 use crate::{AgentEvent, AgentMode, DoneReason, GoalHandle, GoalResult, GoalSnapshot, GoalVerdict};
 
@@ -219,8 +220,14 @@ impl SessionSignals {
     }
 
     /// The agent clears the goal before it reports the error, so the goal's tally comes from
-    /// the last snapshot seen of it.
-    pub fn goal_cleared(&self, condition: &str, message: &str) -> SessionSignal {
+    /// the last snapshot seen of it. `autopilot_owned` is what the agent read before the error
+    /// ended autopilot.
+    pub fn goal_cleared(
+        &self,
+        condition: &str,
+        message: &str,
+        autopilot_owned: bool,
+    ) -> SessionSignal {
         let goal = self
             .goal
             .as_ref()
@@ -232,11 +239,14 @@ impl SessionSignals {
             evaluations: goal.map_or(0, |goal| goal.evaluations),
             duration_s: goal.map_or(0, |goal| goal.elapsed().as_secs()),
             cost: goal.and_then(|goal| goal.cost),
+            autopilot: autopilot_owned,
         }))
     }
 }
 
-pub fn goal_finished(result: &GoalResult) -> SessionSignal {
+/// `autopilot_owned` is what the agent read as the goal finished, since an owned goal's end
+/// ends autopilot before the frontend hears of it.
+pub fn goal_finished(result: &GoalResult, autopilot_owned: bool) -> SessionSignal {
     SessionSignal::GoalFinished(Box::new(GoalFinishedDetail {
         verdict: match result.verdict {
             GoalVerdict::Met => FinishedVerdict::Met,
@@ -247,14 +257,36 @@ pub fn goal_finished(result: &GoalResult) -> SessionSignal {
         evaluations: result.evaluations,
         duration_s: result.duration.as_secs(),
         cost: result.cost,
+        autopilot: autopilot_owned,
     }))
 }
 
+/// What `session.autopilot` shows: nothing unless `autopilot` is engaged. `waiting` is whether
+/// an item it left to the user waits.
+pub fn autopilot_view(autopilot: Option<&AutopilotHandle>, waiting: bool) -> Option<AutopilotView> {
+    autopilot
+        .filter(|autopilot| autopilot.is_engaged())
+        .map(|autopilot| AutopilotView {
+            owns_goal: autopilot.owns_goal(),
+            waiting,
+        })
+}
+
 /// Sets the goal a claimed item asks for. An active goal stays unless the item asked to replace
-/// it; the refusal comes back for the frontend to show, and the turn starts either way.
-pub fn set_claimed_goal(goal: &GoalHandle, claim: &GoalClaim) -> Option<String> {
-    if goal.snapshot().is_some() && !claim.replace {
-        return Some(GOAL_ACTIVE.to_owned());
+/// it, and one autopilot owns stays even then; the refusal comes back for the frontend to show,
+/// and the turn starts either way.
+pub fn set_claimed_goal(
+    goal: &GoalHandle,
+    claim: &GoalClaim,
+    autopilot_owns_goal: bool,
+) -> Option<String> {
+    if goal.snapshot().is_some() {
+        if autopilot_owns_goal {
+            return Some(GOAL_OWNED_BY_AUTOPILOT.to_owned());
+        }
+        if !claim.replace {
+            return Some(GOAL_ACTIVE.to_owned());
+        }
     }
     if let Err(error) = goal.set(&claim.condition) {
         return Some(error.to_string());
@@ -432,6 +464,8 @@ mod tests {
     const FIRE_ID: &str = "fire-1";
     const TOOL: &str = "bash";
     const DETAIL: &str = "try again";
+    const ACTIVE_GOAL: &str = "the tests pass";
+    const CLAIMED_GOAL: &str = "the build is green";
     const SETTLED_ONCE: &str = "a settled session must not report its settle again";
     const NOT_SETTLED: &str = "the settle after a run must report the period it closes";
 
@@ -536,6 +570,60 @@ mod tests {
             wait,
         };
         assert_eq!(deliverable(&item, NOW), expected);
+    }
+
+    fn goal_claim(replace: bool) -> GoalClaim {
+        GoalClaim {
+            condition: CLAIMED_GOAL.into(),
+            continuation_limit: None,
+            replace,
+        }
+    }
+
+    #[test_case(false, false, Some(GOAL_ACTIVE), ACTIVE_GOAL ; "kept_without_replace")]
+    #[test_case(true, false, None, CLAIMED_GOAL ; "replaced_when_asked")]
+    #[test_case(false, true, Some(GOAL_OWNED_BY_AUTOPILOT), ACTIVE_GOAL ; "owned_kept_without_replace")]
+    #[test_case(true, true, Some(GOAL_OWNED_BY_AUTOPILOT), ACTIVE_GOAL ; "owned_kept_even_when_replacing")]
+    fn a_claimed_goal_never_replaces_one_autopilot_owns(
+        replace: bool,
+        autopilot_owns_goal: bool,
+        refusal: Option<&str>,
+        kept: &str,
+    ) {
+        let goal = GoalHandle::default();
+        goal.set(ACTIVE_GOAL).unwrap();
+
+        assert_eq!(
+            set_claimed_goal(&goal, &goal_claim(replace), autopilot_owns_goal).as_deref(),
+            refusal
+        );
+        assert_eq!(
+            goal.snapshot()
+                .map(|goal| goal.condition.to_string())
+                .as_deref(),
+            Some(kept)
+        );
+    }
+
+    #[test_case(None, false ; "without_autopilot")]
+    #[test_case(Some(false), false ; "not_engaged")]
+    #[test_case(Some(true), true ; "engaged")]
+    fn session_autopilot_shows_only_an_engaged_autopilot(engaged: Option<bool>, shown: bool) {
+        let handle = engaged.map(|engaged| {
+            let handle = AutopilotHandle::default();
+            if engaged {
+                handle.engage(true);
+            }
+            handle
+        });
+
+        assert_eq!(
+            autopilot_view(handle.as_ref(), true),
+            shown.then_some(AutopilotView {
+                owns_goal: true,
+                waiting: true,
+            })
+        );
     }
 
     #[test_case(AgentError::api(401, DETAIL), ErrorKind::Auth ; "auth")]

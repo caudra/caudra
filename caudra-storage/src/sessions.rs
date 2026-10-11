@@ -17,6 +17,7 @@ use caudra_workspace::PlanRef;
 use rusqlite::Error as SqliteError;
 use tracing::warn;
 
+use crate::autopilot::StoredAutopilot;
 use crate::id::CaudraId;
 use crate::permission_state::PermissionRuleRecord;
 use crate::thinking::StoredThinking;
@@ -48,7 +49,7 @@ pub use database::{
     ToolLedgerEntry, TrimReport, UsageBucket, WAL_RETENTION_LIMIT_BYTES, WORKSPACE_CHANGES_DIR,
     eager_load_limit, set_eager_load_limit,
 };
-pub(crate) use database::{from_i64, id_from_row, to_i64};
+pub(crate) use database::{deserialize_json, from_i64, from_i64_usize, id_from_row, to_i64};
 pub use lease::SessionLease;
 pub use types::PermissionMode;
 
@@ -500,6 +501,8 @@ pub struct SessionMeta {
     pub goal_result: Option<Box<StoredGoalResult>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_continuation_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autopilot: Option<Box<StoredAutopilot>>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub automatic_wakes_suppressed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

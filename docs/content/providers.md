@@ -7,7 +7,7 @@ Caudra talks to LLM providers over their HTTP APIs. Model jobs decide which conf
 
 ## Model jobs
 
-Caudra routes work through ten jobs: **Chat**, **Plan**, **Subagent**, **Compact**, **Title**, **Goal**, **Extract**, **Memory**, **Fast**, and **Best**. A global binding can pin a job to an exact `provider/model-id` or make it follow Chat, Plan, Fast, or Best. Explicit bindings report an error when their model is unavailable or disallowed.
+Caudra routes work through eleven jobs: **Chat**, **Plan**, **Subagent**, **Compact**, **Title**, **Goal**, **Extract**, **Memory**, **Autopilot**, **Fast**, and **Best**. A global binding can pin a job to an exact `provider/model-id` or make it follow Chat, Plan, Fast, or Best. Explicit bindings report an error when their model is unavailable or disallowed.
 
 `/model` opens a Jobs overview and the model list. Selecting a model on this page changes Chat. Selecting the Chat row jumps to its current model. Select another job to open its assignment page, press `Esc` to return to the overview, and use uppercase `R` to clear the open job's binding. `/goal-model` opens Goal directly. Jobs are opened from the overview rather than cycled with `Tab`.
 
@@ -23,12 +23,13 @@ Bindings are saved globally in the `model.purposes` row of Caudra's SQLite state
 | Goal | Fast |
 | Extract | Fast |
 | Memory | The model currently running the caller |
+| Autopilot | Best |
 | Fast | Provider `fast` config, curated preferred small model, cheapest priced model, fewest-parameter model, then the anchor |
 | Best | Provider `best` config, curated flagship, then the anchor |
 
 The anchor is the selected Chat model when a main turn starts. A Plan binding can select a distinct model, which Caudra uses for main turns sent in Plan mode. An explicit global Subagent binding overrides parent inheritance. A prompt profile's `subagent_model` overrides the global Subagent binding for tasks using that profile. See [System Prompt Profiles](/docs/system-prompts/#configure-subagents).
 
-See [Sessions](/docs/sessions/#titles) for Title, [Completion goals](/docs/commands/#completion-goals) for Goal, [Requirements](/docs/commands/#requirements) for Extract, and [Memory](/docs/memory/#summaries-and-spend) for Memory.
+See [Sessions](/docs/sessions/#titles) for Title, [Completion goals](/docs/commands/#completion-goals) for Goal, [Requirements](/docs/commands/#requirements) for Extract, [Memory](/docs/memory/#summaries-and-spend) for Memory, and [Autopilot](/docs/autopilot/#the-model-and-its-cost) for Autopilot.
 
 ## Supply metadata
 

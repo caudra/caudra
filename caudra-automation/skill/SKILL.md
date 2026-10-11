@@ -108,7 +108,7 @@ Each trigger is a map with a `kind`. Durations are strings such as `"30s"`, `"2m
 |------|---------|------------|
 | `armed` | none | the automation is armed: at launch, on resume, when the user arms it again, and when the pause latch clears |
 | `idle` | `after`: default `"0s"`, at most `"24h"` | the session settles after a busy period and stays settled for `after` |
-| `needs_input` | `after`: as for `idle`. `inputs`: default `["permission", "question", "plan", "auth", "plugin"]` | the session has waited on a person for one of `inputs` for `after` |
+| `needs_input` | `after`: as for `idle`. `inputs`: default `["permission", "question", "plan", "auth", "plugin", "autopilot"]` | the session has waited on a person for one of `inputs` for `after` |
 | `goal_finished` | `verdicts`: default `["met", "impossible", "cleared"]` | the session goal ends with one of `verdicts` |
 | `message_received` | `audiences`, `topics`, `senders`, `scripts`, `admissions`, `from_automations`, and `consume`, under Messaging below | a message from another session or a script reaches this session |
 | `work_finished` | `groups`: every group by default. `states`: default `["completed", "failed", "cancelled"]`, and `"paused"` may join them | an item of consumer-group work that this session published reaches one of `states` |
@@ -116,7 +116,7 @@ Each trigger is a map with a `kind`. Durations are strings such as `"30s"`, `"2m
 | `schedule` | `every` or `at`, plus `weekdays` and `catch_up` | an occurrence is due |
 
 - `idle` and `needs_input` fire once per transition. The opposite edge cancels a pending `after` timer, so `after: "2m"` waits for two quiet minutes.
-- The `needs_input` kinds are a tool `permission` prompt, the `question` form, a ready `plan` awaiting approval, an `auth` prompt, and a `plugin` float. Add `"messages"` to `inputs` to fire while messages from other sessions wait for the user's review.
+- The `needs_input` kinds are a tool `permission` prompt, the `question` form, a ready `plan` awaiting approval, an `auth` prompt, a `plugin` float, and `autopilot`: a permission prompt, a question, or a plan that autopilot left to the user. While autopilot is still deciding a prompt, the session does not wait on a person, and nothing fires. Add `"messages"` to `inputs` to fire while messages from other sessions wait for the user's review.
 - `goal_finished` with `cleared` means an error cleared the goal. A goal that runs out of continuations or reaches the turn limit stays active and does not fire.
 - A schedule takes exactly one of `every` and `at`. `every` is a period of at least `"1m"`, counted from the moment the automation was armed. `at` is `"HH:MM"` on a 24-hour clock in `meta.timezone`, and `weekdays`, allowed only with `at`, limits it to days such as `["mon", "tue", "wed", "thu", "fri"]`.
 - Missed occurrences, for example while the session was closed, collapse into the latest one. Within a minute of its time it fires as usual. Later than that, `catch_up: "once"` (the default) fires it late, and `catch_up: "skip"` drops it.
@@ -248,7 +248,7 @@ Every event has these fields:
 | `trigger` | The trigger kind, such as `"idle"` |
 | `fire_id` | This firing's id |
 | `at` | When the event happened, in unix seconds |
-| `session` | `#{ id, title, name, mode, status, status_since, goal, cost, groups, work }` |
+| `session` | `#{ id, title, name, mode, status, status_since, goal, autopilot, cost, groups, work }` |
 
 In `session`:
 
@@ -257,6 +257,7 @@ In `session`:
 - `mode` is the session's mode, such as `"build"`.
 - `status` is `"working"`, `"needs_input"`, or `"idle"`, as other sessions see it: a message held for review counts as `"needs_input"`, and a ready plan does not. `status_since` is when it began, in unix seconds.
 - `goal` is `#{ condition, evaluations }` while a goal is active, and `()` otherwise.
+- `autopilot` is `#{ owns_goal, waiting }` while autopilot is engaged, and `()` otherwise, including while it is off. Autopilot is experimental (`experimental.autopilot`), and a script cannot engage it. `owns_goal` is `true` when the active goal is the one autopilot set, and `waiting` is `true` while a prompt it left to the user waits.
 - `cost` is the session's spend in USD, or `()` when it is unknown.
 - `groups` lists the consumer groups the session takes work from.
 - `work` is `#{ held, paused }`. `held` is the work item the session works on, as `#{ group, work, attempt, max_attempts }`, or `()`. `paused` lists the items it paused that still wait for an outcome, as `#{ group, work, pause_reason }`.
@@ -284,7 +285,7 @@ The fields of each trigger follow. Untrusted ones are marked U.
 - `error_kind`: `"rate_limit"`, `"overloaded"`, `"auth"`, `"timeout"`, `"network"`, `"other"`, or `()`
 - `error` U: the error message, or `()`
 - `last_response` U: the final response, at most 32 KiB
-- `started_by`: `#{ kind }` for the first run of the period. `kind` is `"user"`, `"automation"` (with `automation` and `fire_id`), `"peer"` (a message, with `message_id`, `sender`, `sender_kind`, `audience`, and `topic`), `"work"` (a work item, with `group`, `work`, `attempt`, `max_attempts`, `message_id`, and `topic`), `"background"`, `"workflow"`, `"goal"`, or `"mailbox"`. For `"peer"` and `"work"`, `message_id` is the id the model saw the message by, and a script's message has `sender: ()`.
+- `started_by`: `#{ kind }` for the first run of the period. `kind` is `"user"`, `"automation"` (with `automation` and `fire_id`), `"peer"` (a message, with `message_id`, `sender`, `sender_kind`, `audience`, and `topic`), `"work"` (a work item, with `group`, `work`, `attempt`, `max_attempts`, `message_id`, and `topic`), `"background"`, `"workflow"`, `"goal"`, `"mailbox"`, or `"autopilot"`. For `"peer"` and `"work"`, `message_id` is the id the model saw the message by, and a script's message has `sender: ()`.
 - `automations`: the names of the automations whose messages were delivered during the period
 - `runs`: how many runs it held
 - `busy_s`: its length in seconds
@@ -294,7 +295,7 @@ The fields of each trigger follow. Untrusted ones are marked U.
 `needs_input`:
 
 - `input`: the kind of prompt, one of `inputs`
-- `tool`: the tool a `permission` prompt is for, or `()`
+- `tool`: the tool a permission prompt is for, whether its kind is `permission` or `autopilot`, or `()`
 - `waiting_s`: how long the session has waited
 
 `goal_finished`:
@@ -303,6 +304,7 @@ The fields of each trigger follow. Untrusted ones are marked U.
 - `condition`: the goal's condition
 - `reason` U: the evaluator's reason, or for `cleared`, the error
 - `evaluations`, `duration_s`, and `cost` (USD, or `()`)
+- `autopilot`: `true` when the goal was the one autopilot set. Autopilot ends with its goal, so `event.session.autopilot` may already be `()`.
 
 `message_received`:
 
@@ -373,7 +375,7 @@ Sets the session goal and queues its kickoff turn like a `next` message. `condit
 | Option | Meaning |
 |--------|---------|
 | `continuation_limit` | A positive integer: the goal's automatic-continuation limit, as `/goal` shows it |
-| `replace` | `true` replaces an active goal. Without it, `set_goal` fails with kind `goal_active` while another goal is active. |
+| `replace` | `true` replaces an active goal. Without it, `set_goal` fails with kind `goal_active` while another goal is active. A goal autopilot set is never replaced: while autopilot owns the active goal, `set_goal` fails with kind `goal_owned_by_autopilot`, even with `replace: true`. |
 | `expires` | As for `message` |
 
 ### `skip(reason)`
@@ -524,7 +526,7 @@ Two kinds of error end a firing:
 | Kind | Examples | Effect |
 |------|----------|--------|
 | Stop | untrusted text in `message()` or `set_goal()`, the `${}` placeholder in any host function, a target, topic, or `reply()` that `meta.messaging` does not allow, a workflow outside `meta.workflows`, `reply()` or `release()` without a consumed message, a per-firing limit, an automation limit at the first action, a pause, a disarm | The firing ends at once and its `state` changes are discarded. `try`/`catch` cannot intercept it. |
-| Failure | `goal_active`, a messaging failure such as `unknown_recipient`, a `start_workflow()` failure such as `refused`, an invalid argument such as `delivery: "now"`, `throw`, and any ordinary Rhai error | `try { … } catch (err) { … }` catches it. Uncaught, the firing fails and its `state` changes are discarded. |
+| Failure | `goal_active`, `goal_owned_by_autopilot`, a messaging failure such as `unknown_recipient`, a `start_workflow()` failure such as `refused`, an invalid argument such as `delivery: "now"`, `throw`, and any ordinary Rhai error | `try { … } catch (err) { … }` catches it. Uncaught, the firing fails and its `state` changes are discarded. |
 
 In `catch (err)`, a host failure binds `#{ kind, message }`, where `kind` is a name such as `"goal_active"` or `"invalid_argument"`. An ordinary Rhai error binds Rhai's own map, which has `message` and `line` but no `kind`, so `err.kind` reads as `()`. `throw value` binds `value` itself.
 
@@ -661,7 +663,7 @@ Rhai looks like a small JavaScript with Rust flavour. These are the points that 
 
 1. Call `automation` with `action: "list"`. Note the two directories and check that the name is free.
 2. Write `<dir>/<name>.rhai` with `file_write`. The header comes first.
-3. Validate with `automation`, `action: "validate"`, and `name: "<name>"`. Validation parses the header, compiles the script, checks the args the body reads, and runs the body once per trigger against a canned event. Each run gets every arg's default or `example`, an empty `state`, and a session without a goal or a cost, and it performs nothing. A `message_received` run gets a message its trigger matches, consumed when the trigger consumes. A `workflow_finished` run gets a run of the first workflow its trigger names, or else the first in `meta.workflows`, with the first of its `statuses`. A stop or an uncaught failure fails the validation with its line and column. Each run follows one path, so branches that depend on real event values are not reached. Fix the file and validate again.
+3. Validate with `automation`, `action: "validate"`, and `name: "<name>"`. Validation parses the header, compiles the script, checks the args the body reads, and runs the body once per trigger against a canned event. Each run gets every arg's default or `example`, an empty `state`, and a session without a goal, a cost, or an engaged autopilot, and it performs nothing. A `message_received` run gets a message its trigger matches, consumed when the trigger consumes. A `workflow_finished` run gets a run of the first workflow its trigger names, or else the first in `meta.workflows`, with the first of its `statuses`. A stop or an uncaught failure fails the validation with its line and column. Each run follows one path, so branches that depend on real event values are not reached. Fix the file and validate again.
 4. Hand over. Trusting a project script, arming it, and choosing its args belong to the user. You can do none of them, so end your turn with what the user must do. A project script needs their trust in `/automations` first. Then give the exact line that arms it, with the args filled in:
 
    ```
@@ -1049,6 +1051,7 @@ The trigger consumes every direct message. A message from a script, which has no
 | `` message() has no option `deliver` `` | a misspelt option | `attach`, `delivery`, or `expires` |
 | `Variable not found: event` | a `fn` that reads an outer variable | Pass the value as an argument. |
 | `set_goal` fails with `goal_active` | another goal is active | Check `event.session.goal == ()` first, catch `goal_active`, or pass `replace: true`. |
+| `set_goal` fails with `goal_owned_by_autopilot` | autopilot owns the active goal, which `replace: true` cannot take | Check `event.session.autopilot?.owns_goal ?? false` first, or catch `goal_owned_by_autopilot` and try again on a later firing. |
 | `http() may reach only the origins in meta.network, not https://api.example.com` | a `url`, or the value of a `url_env`, at an origin the header does not declare | Add the origin to `meta.network`. |
 | `http() may read only the variables in meta.secrets, not GITHUB_TOKEN` | a variable in `url_env`, `bearer_env`, or `secret_headers` that the header does not declare | Add it to `meta.secrets`. |
 | `http` fails with `refused`: `GITHUB_TOKEN is unset or empty` | the user has not set the variable | Tell the user to set it in their environment or the global `.env` file. |

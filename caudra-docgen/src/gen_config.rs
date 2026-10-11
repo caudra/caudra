@@ -8,11 +8,11 @@ use caudra_config::example::Entry;
 use caudra_config::files::{self, CONFIG_FILES, Scope};
 use caudra_config::steering::{SteeringRule, SteeringRulesConfig};
 use caudra_config::{
-    AgentConfig, AutomationsConfig, ConfigField, ConfigValue, DEFAULT_MAX_LOG_FILES,
-    DEFAULT_MAX_OUTPUT_LINES, DEFAULT_MOUSE_SCROLL_LINES, DecisionsConfig, Feature, FeatureFlags,
-    MIN_TOOL_OUTPUT_LINES, MessagingConfig, NATIVE_PLUGIN_OPTIONS, ProviderConfig, RetentionConfig,
-    SnapshotsConfig, SteeringConfig, StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig,
-    ToolOutputLines, UiConfig, WorktreesConfig,
+    AgentConfig, AutomationsConfig, AutopilotConfig, ConfigField, ConfigValue,
+    DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES, DEFAULT_MOUSE_SCROLL_LINES, DecisionsConfig,
+    Feature, FeatureFlags, MIN_TOOL_OUTPUT_LINES, MessagingConfig, NATIVE_PLUGIN_OPTIONS,
+    ProviderConfig, RetentionConfig, SnapshotsConfig, SteeringConfig, StorageConfig,
+    TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig, WorktreesConfig,
 };
 use serde_json::{Value, json};
 
@@ -147,6 +147,10 @@ fn experiment_scope(feature: Feature) -> &'static str {
              conditions hold, within the limits in [`[automations]`](#automations), and the \
              `caudra-automation-dev` skill. Messaging triggers and actions also need \
              `cross_session_messaging`, and workflow triggers and actions also need `workflows`."
+        }
+        Feature::Autopilot => {
+            "[Autopilot](/docs/autopilot/): keep a session moving toward its goal unattended, \
+             answering permission prompts and questions within the limits in [`[autopilot]`](#autopilot)."
         }
     }
 }
@@ -474,6 +478,18 @@ fn write_automations_section(out: &mut String) {
     .unwrap();
 }
 
+fn write_autopilot_section(out: &mut String) {
+    write_section(out, "[autopilot]", AutopilotConfig::FIELDS);
+    writeln!(
+        out,
+        "[Autopilot](/docs/autopilot/) is experimental and needs `autopilot = true` under \
+         [`[experimental]`](#experimental-features). Only the global `caudra.toml` may hold this \
+         table. Caudra rejects a project `.caudra/caudra.toml` that contains it, even an empty \
+         one.\n"
+    )
+    .unwrap();
+}
+
 fn write_steering_section(out: &mut String) {
     out.push_str(
         "### `agent.steering`\n\n\
@@ -749,7 +765,9 @@ fn write_decisions_section(out: &mut String) {
          asking the assistant to use `question` for the outstanding answer. The original reply stays \
          in history. The reminder follows the `show_reminders` display preference and can occur at \
          most once per genuine user-input episode. Synthetic reminders, retries, and resume do not \
-         renew that allowance. It never fabricates a tool call, an answer, or approval.\n\n\
+         renew that allowance. It never fabricates a tool call, an answer, or approval. While \
+         [autopilot](/docs/autopilot/#questions) is engaged, its delegate answers the form that \
+         the reminder leads to.\n\n\
          The request contains redacted excerpts of the current visible reply and relevant user \
          request within the 1,500-byte serialized state limit. Long replies retain an opening and \
          a larger tail, so questions in the omitted middle can be missed. Errors, timeouts, invalid \
@@ -837,7 +855,7 @@ While the terminal UI runs, Caudra watches its config files, skill and command d
 
 | What changed | When it applies |
 |--------------|-----------------|
-| `caudra.toml` | `[agent]` settings from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
+| `caudra.toml` | `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
 | `permissions.toml` | Before the next tool call. |
 | `mcp.toml` | At once. New servers start, even when Caudra started with none. Removed and disabled servers stop, and changed servers restart. The other servers keep running. `defer_tools` applies after `/reload`. |
 | `providers.toml` | The next time Caudra reads it, such as when a model list opens. |
@@ -1147,6 +1165,7 @@ For every setting in one file, with its type, default, and description, see [Ref
     write_worktrees_section(&mut out);
     write_decisions_section(&mut out);
     write_automations_section(&mut out);
+    write_autopilot_section(&mut out);
 
     writeln!(out, "## Plugins\n").unwrap();
     writeln!(

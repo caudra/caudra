@@ -652,6 +652,12 @@ impl PeerSession {
         Ok(AssignedWork::from(&item))
     }
 
+    /// The name of the work a turn of this session took in and has not
+    /// reported yet.
+    pub fn taken_work(&self) -> Option<String> {
+        lock(&self.0.state).work.taken().map(|(name, _)| name)
+    }
+
     /// The work a turn of this session took in, then the paused work it last
     /// owned, newest first.
     pub async fn owned_work(&self) -> Result<Vec<AssignedWork>, String> {
@@ -930,7 +936,7 @@ mod tests {
 }
 
 #[cfg(all(test, unix))]
-mod unix_tests {
+pub(crate) mod unix_tests {
     use std::path::Path;
 
     use caudra_automation::event::WorkOutcome as ReportedOutcome;
@@ -1038,6 +1044,30 @@ mod unix_tests {
         worker.claim_wake().unwrap().commit();
     }
 
+    /// A member holding an item it took in and has not reported, for tests
+    /// of the turn that holds it. The rest keeps the group alive.
+    pub(crate) struct HeldWork {
+        _directory: TempDir,
+        _host: PeerHost,
+        _publisher: PeerSession,
+        pub(crate) worker: PeerSession,
+        pub(crate) work: String,
+    }
+
+    pub(crate) async fn held_work() -> HeldWork {
+        let (directory, host, publisher) = grouped().await;
+        let worker = member(&host, directory.path(), InboundPolicy::Auto);
+        let work = publish(&publisher).await;
+        start(&worker).await;
+        HeldWork {
+            _directory: directory,
+            _host: host,
+            _publisher: publisher,
+            worker,
+            work,
+        }
+    }
+
     #[test]
     fn claimed_work_wakes_one_turn_and_stays_owned_until_reported() {
         smol::block_on(async {
@@ -1047,6 +1077,7 @@ mod unix_tests {
             assert!(!worker.has_pending());
             assert!(worker.acquire_work().await.unwrap());
             assert!(worker.has_pending());
+            assert_eq!(worker.taken_work(), None);
             assert!(worker.claim().is_none());
             drop(worker.claim_wake().unwrap());
             let claim = worker.claim_wake().unwrap();
@@ -1062,6 +1093,7 @@ mod unix_tests {
             );
             claim.commit();
             assert!(!worker.has_pending());
+            assert_eq!(worker.taken_work().as_ref(), Some(&work));
             assert!(!worker.acquire_work().await.unwrap());
             let owned = worker.owned_work().await.unwrap();
             assert_eq!(owned.len(), 1);
@@ -1077,6 +1109,7 @@ mod unix_tests {
             );
             assert_eq!(worker.report_work(&work, outcome).await.unwrap(), reported);
             assert!(worker.owned_work().await.unwrap().is_empty());
+            assert_eq!(worker.taken_work(), None);
         });
     }
 

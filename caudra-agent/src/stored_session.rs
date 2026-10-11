@@ -216,7 +216,7 @@ pub(crate) mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::types::{Answer, QuestionOption};
+    use crate::types::{Answer, Answerer, QuestionOption};
     use crate::{
         IndexDirectoryEntry, IndexDirectoryEntryKind, IndexLine, IndexLineSemantic, IndexOutput,
         IndexSourceRange, ShellFilterInfo, ShellOutput,
@@ -769,6 +769,7 @@ pub(crate) mod tests {
                 label: ANSWER_LABEL.into(),
                 description: ANSWER_DESCRIPTION.into(),
             }],
+            by: Answerer::User,
         }]);
 
         let actual = answered_call(&storage, output);

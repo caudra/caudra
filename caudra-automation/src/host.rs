@@ -135,7 +135,8 @@ pub struct GoalRequest {
     pub condition: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continuation_limit: Option<u32>,
-    /// Replaces an active goal instead of failing with [`FailureKind::GoalActive`].
+    /// Replaces an active goal instead of failing with [`FailureKind::GoalActive`]. A goal
+    /// autopilot owns still fails, with [`FailureKind::GoalOwnedByAutopilot`].
     pub replace: bool,
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -358,6 +359,8 @@ pub enum FailureKind {
     NoReplyTarget,
     /// `set_goal` without `replace: true` while another goal is active.
     GoalActive,
+    /// `set_goal` while the active goal is the one autopilot set, even with `replace: true`.
+    GoalOwnedByAutopilot,
     InvalidArgument,
     /// An ordinary Rhai error.
     Script,
@@ -441,6 +444,7 @@ impl FailureKind {
             Self::ReadOnly => "read_only",
             Self::NoReplyTarget => "no_reply_target",
             Self::GoalActive => "goal_active",
+            Self::GoalOwnedByAutopilot => "goal_owned_by_autopilot",
             Self::InvalidArgument => "invalid_argument",
             Self::Script => "script",
         }
@@ -571,6 +575,7 @@ mod tests {
     #[test_case(FailureKind::NoReplyTarget; "no_reply_target")]
     #[test_case(FailureKind::GroupFull; "group_full")]
     #[test_case(FailureKind::GoalActive; "goal_active")]
+    #[test_case(FailureKind::GoalOwnedByAutopilot; "goal_owned_by_autopilot")]
     fn failure_kinds_serialize_as_their_script_names(kind: FailureKind) {
         assert_eq!(serde_json::to_value(kind).unwrap(), json!(kind.as_str()));
     }
@@ -585,6 +590,7 @@ mod tests {
     #[test_case(FailureKind::ReadOnly; "read_only")]
     #[test_case(FailureKind::NoReplyTarget; "no_reply_target")]
     #[test_case(FailureKind::GoalActive; "goal_active")]
+    #[test_case(FailureKind::GoalOwnedByAutopilot; "goal_owned_by_autopilot")]
     #[test_case(FailureKind::InvalidArgument; "invalid_argument")]
     #[test_case(FailureKind::Script; "script")]
     fn a_failure_parses_back_from_its_text(kind: FailureKind) {

@@ -205,6 +205,17 @@ pub const CONFIGURATION_CHANGED_PROMPT: &str = include_str!("prompts/configurati
 /// again. Shares the heading, and so the kind, with the notice it supersedes.
 pub const CONFIGURATION_RESTORED_PROMPT: &str = include_str!("prompts/configuration_restored.md");
 pub const CONFIGURATION_CHANGED_MARKER: &str = "# Configuration changed";
+pub const AUTOPILOT_PROMPT: &str = include_str!("prompts/autopilot.md");
+/// Standing while autopilot is engaged, and withdrawn by the ended text, which
+/// shares its heading and so its kind.
+pub const AUTOPILOT_ENGAGED_PROMPT: &str = include_str!("prompts/autopilot_engaged.md");
+pub const AUTOPILOT_ENDED_PROMPT: &str = include_str!("prompts/autopilot_ended.md");
+pub const AUTOPILOT_MARKER: &str = "# Autopilot";
+/// Holds a handoff once per group work item an engaged autopilot's session
+/// took in and has not reported.
+pub const AUTOPILOT_UNREPORTED_WORK_PROMPT: &str =
+    include_str!("prompts/autopilot_unreported_work.md");
+pub const WORK_SLOT: &str = "{work}";
 pub const CHANGES_SLOT: &str = "{changes}";
 pub const ENTRIES_SLOT: &str = "{entries}";
 pub const DIFF_SLOT: &str = "{diff}";
@@ -245,6 +256,7 @@ pub(crate) const STANDING_KINDS: &[&[&str]] = &[
     &[INSTRUCTIONS_CHANGED_MARKER],
     &[MEMORY_UPDATED_MARKER],
     &[CONFIGURATION_CHANGED_MARKER],
+    &[AUTOPILOT_MARKER],
     &[TASK_MODE_MARKER],
     MODE_MARKERS,
 ];

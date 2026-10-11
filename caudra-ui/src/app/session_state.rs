@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use caudra_agent::GoalHandle;
+use caudra_agent::autopilot::AutopilotHandle;
 use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, SystemPromptProfile};
 use caudra_config::ModelPolicy;
 use caudra_providers::provider::adjust_model;
@@ -49,6 +50,9 @@ pub(crate) struct SessionState {
     pub system_prompt_profile: Option<Arc<SystemPromptProfile>>,
     pub system_prompt_profile_override: bool,
     pub goal: GoalHandle,
+    /// Disengaged until the App restores the session's own, which needs the
+    /// decision log and the `experimental.autopilot` flag.
+    pub autopilot: AutopilotHandle,
 }
 
 const PLAN_FILE_MISSING_WARNING: &str = "Plan file was deleted \u{2014} started a new plan";
@@ -162,6 +166,7 @@ impl SessionState {
             system_prompt_profile: None,
             system_prompt_profile_override: false,
             goal,
+            autopilot: AutopilotHandle::default(),
             session: Arc::new(session),
             model,
             token_usage,

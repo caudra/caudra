@@ -57,6 +57,7 @@ mod tool_output;
 pub mod tools;
 pub use tools::ToolFilter;
 pub mod automation;
+pub mod autopilot;
 pub mod types;
 pub mod workflow;
 pub mod workspace_transfer;

@@ -3753,7 +3753,7 @@ mod tests {
     use caudra_agent::tools::{
         BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME, SKILL_TOOL_NAME, ToolEffect,
     };
-    use caudra_agent::types::QuestionOption;
+    use caudra_agent::types::{Answerer, QuestionOption};
     use caudra_agent::{
         ActivityChild, EnvironmentFact, GrepLine, GrepMatchGroup, ShellOutput, SubagentActivity,
         TextOutput,
@@ -4975,6 +4975,7 @@ mod tests {
                     description: (*description).to_owned(),
                 })
                 .collect(),
+            by: Answerer::User,
         }
     }
 
@@ -5045,6 +5046,7 @@ mod tests {
             labels: vec![Q_PICKED.into()],
             question: String::new(),
             options: Vec::new(),
+            by: Answerer::User,
         };
         let (lines, _) = render_answers(&[bare], UNBOUNDED);
 
@@ -8111,6 +8113,7 @@ mod tests {
                 label: LONG.to_owned(),
                 description: LONG.to_owned(),
             }]),
+            by: Answerer::User,
         }]))
     }
 

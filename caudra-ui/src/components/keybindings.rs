@@ -5,7 +5,9 @@ use std::fmt::Write;
 use strum::EnumIter;
 use unicode_width::UnicodeWidthStr;
 
-use crate::components::{automation_inspector, decisions_modal, workflow_inspector};
+use crate::components::{
+    automation_inspector, autopilot_panel, decisions_modal, workflow_inspector,
+};
 
 /// Spelled once because three tables quote it.
 const SHIFT_TAB_LABEL: &str = "Shift+Tab";
@@ -398,6 +400,7 @@ pub enum KeybindContext {
     WorkflowCatalogPicker,
     AutomationInspector,
     Decisions,
+    AutopilotPanel,
     SandboxManager,
     Workbench,
     WorkbenchExplorer,
@@ -438,6 +441,7 @@ impl KeybindContext {
             Self::WorkflowCatalogPicker => "Workflow Catalog",
             Self::AutomationInspector => "Automation Inspector",
             Self::Decisions => "Decisions",
+            Self::AutopilotPanel => "Autopilot Panel",
             Self::SandboxManager => "Sandbox Manager",
             Self::Workbench => "Workbench",
             Self::WorkbenchExplorer => "Workbench Explorer",
@@ -456,6 +460,7 @@ impl KeybindContext {
             Self::WorkflowInspector | Self::WorkflowCatalogPicker => Some(Feature::Workflows),
             Self::AutomationInspector => Some(Feature::Automations),
             Self::Decisions => Some(Feature::DecisionEngine),
+            Self::AutopilotPanel => Some(Feature::Autopilot),
             Self::SandboxManager | Self::WorkbenchTransfer => Some(Feature::Sandboxes),
             _ => None,
         }
@@ -478,7 +483,8 @@ impl KeybindContext {
             | Self::WorkflowInspector
             | Self::WorkflowCatalogPicker
             | Self::AutomationInspector
-            | Self::Decisions => Some(Self::Picker),
+            | Self::Decisions
+            | Self::AutopilotPanel => Some(Self::Picker),
             Self::WorkbenchExplorer
             | Self::WorkbenchEditor
             | Self::WorkbenchSourceControl
@@ -1604,6 +1610,21 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single(key::REFRESH.label),
         description: "Read the decision log again",
         context: KeybindContext::Decisions,
+    },
+    Keybind {
+        label: KeyLabel::Single(autopilot_panel::STOP_LABEL),
+        description: "Stop autopilot",
+        context: KeybindContext::AutopilotPanel,
+    },
+    Keybind {
+        label: KeyLabel::Single(autopilot_panel::MODEL_LABEL_KEY),
+        description: "Pick the model for the Autopilot job",
+        context: KeybindContext::AutopilotPanel,
+    },
+    Keybind {
+        label: KeyLabel::Single(autopilot_panel::CLOSE_LABEL),
+        description: "Close, as Esc does",
+        context: KeybindContext::AutopilotPanel,
     },
     Keybind {
         label: KeyLabel::Single(leader::WORKBENCH.label),

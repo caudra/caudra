@@ -6,7 +6,9 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use crate::app::tasks::TaskOutcome;
-use crate::chat::{CANCELLED_TEXT, Chat, DONE_TEXT, ERROR_TEXT, history_to_display};
+use crate::chat::{
+    CANCELLED_TEXT, Chat, DONE_TEXT, ERROR_TEXT, history_to_display, interleaved_history_to_display,
+};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::session_picker::{OtherCheckout, SessionPickerAction, SessionRow};
 use crate::components::session_relocation::SessionRelocationAction;
@@ -535,6 +537,7 @@ impl App {
             active_goal: goal.active,
             goal_result: goal.result,
             goal_continuation_limit: goal.continuation_limit,
+            autopilot: self.stored_autopilot(),
             automatic_wakes_suppressed: self.automatic_wakes_suppressed
                 || peer.as_ref().is_some_and(PeerSession::wakes_suppressed),
             permission_mode: self.permissions.persisted_mode(),
@@ -680,11 +683,12 @@ impl App {
                 Vec::new()
             }
         };
-        let (display_msgs, restore_items) = history_to_display(
+        let (display_msgs, restore_items) = interleaved_history_to_display(
             &active_history,
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
             self.ui_config.show_reminders,
+            self.autopilot_decision_rows(),
         );
         let mut reachable_subagents = reachable_subagent_ids(
             &active_history,
@@ -1061,6 +1065,7 @@ impl App {
         // whichever session is current.
         self.fire_session_autocmd("SessionReset", serde_json::json!({}));
         self.state.session = Arc::new(prepared.session);
+        self.restore_autopilot(self.state.autopilot.limits());
         self.automatic_wakes_suppressed = self.state.session.meta.automatic_wakes_suppressed;
         // After the swap: a remote plan document is filed under the session id
         // that will own it, and the retiring session must not be handed one.
@@ -1577,8 +1582,10 @@ impl App {
         self.permissions = permissions;
         self.conversation_permissions = conversation_permissions;
         self.apply_stored_permission_mode(&session.meta);
+        let autopilot_limits = self.state.autopilot.limits();
         self.state =
             SessionState::from_session(session, fallback_model, &self.storage, &self.model_policy);
+        self.restore_autopilot(autopilot_limits);
         let coverage = self.state.session.meta.record_coverage.clone();
         let first = self.bind_change_recorder();
         let covered_anew = self.state.session.meta.record_coverage != coverage;

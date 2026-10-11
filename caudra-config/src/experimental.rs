@@ -5,7 +5,7 @@ use serde::de::{self, Deserialize, Deserializer, MapAccess, Visitor};
 use thiserror::Error;
 
 /// Indexed by [`Feature`] discriminant, so the enum and its config keys stay one list.
-const FEATURE_KEYS: [&str; 7] = [
+const FEATURE_KEYS: [&str; 8] = [
     "workflows",
     "sandboxes",
     "remote_workcell",
@@ -13,6 +13,7 @@ const FEATURE_KEYS: [&str; 7] = [
     "decision_engine",
     "cross_session_messaging",
     "automations",
+    "autopilot",
 ];
 
 /// A first-party capability that stays off until the user opts in through the
@@ -26,10 +27,11 @@ pub enum Feature {
     DecisionEngine,
     CrossSessionMessaging,
     Automations,
+    Autopilot,
 }
 
 impl Feature {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Workflows,
         Self::Sandboxes,
         Self::RemoteWorkcell,
@@ -37,6 +39,7 @@ impl Feature {
         Self::DecisionEngine,
         Self::CrossSessionMessaging,
         Self::Automations,
+        Self::Autopilot,
     ];
 
     pub fn key(self) -> &'static str {
@@ -57,6 +60,7 @@ impl Feature {
             Self::DecisionEngine => "the decision engine and Auto mode",
             Self::CrossSessionMessaging => "cross-session messages",
             Self::Automations => "automations",
+            Self::Autopilot => "Autopilot runs",
         }
     }
 
@@ -196,6 +200,7 @@ mod tests {
     #[test_case(Feature::DecisionEngine, "experimental.decision_engine"; "decision_engine")]
     #[test_case(Feature::CrossSessionMessaging, "experimental.cross_session_messaging"; "cross_session_messaging")]
     #[test_case(Feature::Automations, "experimental.automations"; "automations")]
+    #[test_case(Feature::Autopilot, "experimental.autopilot"; "autopilot")]
     fn disabled_error_names_the_key(feature: Feature, key: &str) {
         let message = FeatureDisabled(feature).to_string();
         assert!(message.contains(&format!("`{key} = true`")), "{message}");

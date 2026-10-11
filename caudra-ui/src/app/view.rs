@@ -677,6 +677,12 @@ impl App {
                 overlay_rect = r;
             }
         }
+        if self.autopilot_panel.is_open() {
+            let r = self.draw_autopilot_panel(frame, full);
+            if r.width > 0 {
+                overlay_rect = r;
+            }
+        }
         let r = self.float_mgr.view(frame, full);
         if r.width > 0 {
             overlay_rect = r;
@@ -748,6 +754,7 @@ impl App {
                     .unwrap_or(&self.state.applied_model)
             });
         let activity = self.task_activity();
+        let autopilot = self.autopilot_chip();
         let hover_hint = (!self.has_modal_overlay())
             .then(|| chat.hovered_hint())
             .flatten();
@@ -801,6 +808,7 @@ impl App {
             restoring: self.restoring.load(Ordering::Relaxed),
             background_waiting: self.waiting_for_background(),
             goal: goal.as_ref(),
+            autopilot: autopilot.as_ref(),
             active_tasks: activity.agents,
             active_shells: activity.shells,
             bash_input: self.is_bash_input(),

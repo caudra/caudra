@@ -16,19 +16,22 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::{self, Provider};
 use caudra_providers::{
-    Billing, CacheKey, ContentBlock, DOCUMENT_TOKENS_PER_PAGE, HistoryItem, HistoryItemKind,
-    Message, Model, ModelError, ModelPurpose, ReasoningSource, RequestOptions, Role,
-    StandingReminderKind, StopReason, StreamResponse, Timeouts, TokenUsage, UserOrigin,
+    AutopilotMessageKind, Billing, CacheKey, ContentBlock, DOCUMENT_TOKENS_PER_PAGE, HistoryItem,
+    HistoryItemKind, Message, Model, ModelError, ModelPurpose, ReasoningSource, RequestOptions,
+    Role, StandingReminderKind, StopReason, StreamResponse, Timeouts, TokenUsage, UserOrigin,
     estimate_tokens_cached,
 };
 
 use super::commit_preamble;
 use super::compaction;
 use super::goal::{
-    Evaluator, GoalApply, GoalHandle, GoalStatus, GoalVerdict, ResolvedEvaluator,
-    continuation_message, is_unrecoverable, resolve_evaluator,
+    Evaluator, GOAL_EVALUATOR_ROLE, GoalApply, GoalHandle, GoalSnapshot, GoalStatus, GoalVerdict,
+    ResolvedEvaluator, continuation_message, is_unrecoverable, resolve_evaluator,
 };
-use super::history::{CANCEL_MARKER, History, sanitize_cancelled_history, sanitize_failed_history};
+use super::history::{
+    CANCEL_MARKER, History, sanitize_cancelled_history, sanitize_failed_history,
+    settle_failed_attempt,
+};
 use super::instructions::LoadedInstructions;
 use super::mention_preamble;
 use super::provider_projection;
@@ -44,6 +47,8 @@ use super::work_nudge;
 use crate::agent::change_recording::ChangeRecorder;
 use crate::automation::handle::AutomationHandle;
 use crate::automation::outbox::claim_message;
+use crate::autopilot::review::{self, Stall, TurnEnd, Verdict};
+use crate::autopilot::{self, AutopilotHandle, AutopilotSnapshot, ChatSession, DelegateAction};
 use crate::background::{BackgroundTasks, JobScope, SessionWork};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::context::{
@@ -61,12 +66,13 @@ use crate::peers::{PeerClaim, PeerSession};
 use crate::permissions::PermissionManager;
 use crate::template::Vars;
 use crate::tools::ToolFilter;
-use crate::tools::native::plan::PlanTarget;
+use crate::tools::native::peers::WORK_NAME;
+use crate::tools::native::plan::{self, PlanTarget};
 use crate::tools::native::skill::{self, SkillInventoryEntry};
 use crate::tools::{BATCH_TOOL_NAME, QUESTION_TOOL_NAME, SKILL_TOOL_NAME};
 use crate::tools::{BuiltinDeferral, DeferralSession, DeferredTool};
 use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolContext};
-use crate::types::TodoItem;
+use crate::types::{AutopilotEvent, TodoItem};
 use crate::workflow::WorkflowHandle;
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, BackgroundReminderContext,
@@ -77,6 +83,7 @@ use caudra_automation::request::AutomationError;
 use caudra_config::decisions::FeatureMode;
 use caudra_config::{Feature, ModelPolicy, ProfileToolPolicy, ToolOutputLines};
 use caudra_decision::{Answer, Question, QuestionSet, QuestionType};
+use caudra_storage::autopilot::AutopilotEnd;
 use caudra_storage::background::JobOwner;
 use caudra_storage::decision_log::{DecisionEffect, DecisionLabel};
 use caudra_storage::id::SessionRef;
@@ -499,6 +506,12 @@ pub struct Agent<'h> {
     goal_prescreen_skips: u32,
     todos_reminded: bool,
     wait_for_background: bool,
+    /// The session's autopilot. Only the main session acts for it.
+    autopilot: Option<AutopilotHandle>,
+    /// The history epoch and length autopilot last saw.
+    autopilot_observed: Option<(u64, usize)>,
+    /// The group work item this run last reminded autopilot's agent to report.
+    work_reminded: Option<String>,
 }
 
 impl<'h> Agent<'h> {
@@ -662,6 +675,9 @@ impl<'h> Agent<'h> {
             goal_prescreen_skips: 0,
             todos_reminded: false,
             wait_for_background: false,
+            autopilot: None,
+            autopilot_observed: None,
+            work_reminded: None,
         }
     }
 
@@ -725,6 +741,11 @@ impl<'h> Agent<'h> {
         rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
     ) -> Self {
         self.user_response_rx = Some(rx);
+        self
+    }
+
+    pub fn with_autopilot(mut self, autopilot: AutopilotHandle) -> Self {
+        self.autopilot = Some(autopilot);
         self
     }
 
@@ -852,6 +873,8 @@ impl<'h> Agent<'h> {
             .map_err(|message| AgentError::Config { message })?;
         self.goal_prescreen_skips = 0;
         self.todos_reminded = false;
+        self.work_reminded = None;
+        self.history.take_plan_written();
         self.response_text = None;
         self.continuing_response = false;
         if !self.shared_steering {
@@ -908,7 +931,7 @@ impl<'h> Agent<'h> {
         // Every frontend enters here, so busy time is measured here; a turn
         // that failed was still busy.
         let busy_since = Instant::now();
-        let mut result = self.run_loop(peer_wake).await;
+        let mut result = self.run_retrying(peer_wake).await;
         if let Some(suggestion) = skill_suggestion {
             suggestion.label(self.history).await;
         }
@@ -922,10 +945,7 @@ impl<'h> Agent<'h> {
                 warn!(%message, "owned command cleanup failed after agent error");
             }
         }
-        if let Some(runs) = self.speculative.clone() {
-            runs.abandon_unfinished();
-            self.drain_repair_usage(&runs.repair_state());
-        }
+        self.abandon_speculative();
         if top_level {
             caudra_otel::emit::active_time(busy_since.elapsed());
         }
@@ -938,19 +958,25 @@ impl<'h> Agent<'h> {
                         task_event: None,
                         peer_event: None,
                         automation_event: None,
+                        autopilot_event: None,
                     });
                 }
                 self.publish_prepared_context();
                 DoneReason::Cancelled
             }
             Err(e) => {
-                if is_unrecoverable(&e)
-                    && let Some(goal) = self.goal.clear()
-                {
-                    self.event_tx.send(AgentEvent::GoalClearedAfterError {
-                        condition: goal.condition.to_string(),
+                if is_unrecoverable(&e) {
+                    let autopilot_owned = self.autopilot_owns_goal();
+                    self.end_autopilot(AutopilotEnd::Error {
                         message: e.to_string(),
-                    })?;
+                    });
+                    if let Some(goal) = self.goal.clear() {
+                        self.event_tx.send(AgentEvent::GoalClearedAfterError {
+                            condition: goal.condition.to_string(),
+                            message: e.to_string(),
+                            autopilot_owned,
+                        })?;
+                    }
                 }
                 // The turn dies here, but whatever it already wrote stays. Closing it on a
                 // marker is what stops a reloaded session from ending mid-task on a tool
@@ -963,6 +989,7 @@ impl<'h> Agent<'h> {
                         task_event: None,
                         peer_event: None,
                         automation_event: None,
+                        autopilot_event: None,
                     });
                 }
                 self.publish_prepared_context();
@@ -1094,6 +1121,7 @@ impl<'h> Agent<'h> {
             crate::prompt::CONFIGURATION_CHANGED_MARKER,
             self.configuration.as_deref(),
         ));
+        standing.extend(self.autopilot_notice());
         standing.extend(standing_notice(
             self.history.as_slice(),
             crate::prompt::TASK_MODE_MARKER,
@@ -1154,6 +1182,11 @@ impl<'h> Agent<'h> {
                 Message::user_with_images(input.message, input.images)
             };
             self.history.push(message);
+        }
+        if !telemetry.is_empty()
+            && let Some(autopilot) = self.main_autopilot()
+        {
+            autopilot.human_input();
         }
         for message in standing {
             self.push_injected(message);
@@ -1353,19 +1386,92 @@ impl<'h> Agent<'h> {
         }
     }
 
-    async fn run_loop(&mut self, peer_wake: bool) -> Result<DoneReason, AgentError> {
-        let mut initial = true;
+    /// Runs the loop. While autopilot is engaged, a provider error the
+    /// transport's own retries gave up on runs it again from the settled
+    /// history after autopilot's backoff, with the fresh transport budget a
+    /// new invocation gets. Auth, context overflow and the other
+    /// unrecoverable errors are never retried.
+    async fn run_retrying(&mut self, peer_wake: bool) -> Result<DoneReason, AgentError> {
+        let mut attempt = 0;
+        loop {
+            let error = match Box::pin(self.run_loop(peer_wake, attempt == 0)).await {
+                Err(error) if error.is_retryable() && !is_unrecoverable(&error) => error,
+                result => return result,
+            };
+            attempt += 1;
+            self.wait_to_retry(attempt, error).await?;
+            self.stream_retry = StreamRetry::default();
+        }
+    }
+
+    /// Readies retry `attempt` of `error` and waits out its backoff. The
+    /// error comes back when no engaged autopilot retries it, or when its
+    /// retries or its budget are spent, which ends it.
+    async fn wait_to_retry(&mut self, attempt: u32, error: AgentError) -> Result<(), AgentError> {
+        let Some(autopilot) = self.engaged_autopilot().cloned() else {
+            return Err(error);
+        };
+        let limit = autopilot.limits().error_retries;
+        let Some(delay) = autopilot::retry_delay(attempt, limit) else {
+            self.end_autopilot(AutopilotEnd::Error {
+                message: error.to_string(),
+            });
+            return Err(error);
+        };
+        self.abandon_speculative();
+        settle_failed_attempt(self.history, &error.user_message());
+        self.count_continuation();
+        if !autopilot.is_engaged() {
+            return Err(error);
+        }
+        self.prepare_resume();
+        let wake = autopilot.sleep(delay);
+        let nudged = self.retry_now.listen();
+        let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        warn!(
+            attempt,
+            limit,
+            delay_ms,
+            error_kind = error.kind(),
+            status = error.status(),
+            "provider error outlasted the transport retries, autopilot retries the run"
+        );
+        self.event_tx.try_send(AutopilotEvent::Retrying {
+            attempt,
+            limit,
+            delay_ms,
+            error: error.user_message_without_wait(),
+        });
+        let waited = futures_lite::future::race(wake, nudged);
+        futures_lite::future::race(waited, self.cancel.cancelled()).await;
+        if self.cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        Ok(())
+    }
+
+    /// Drops what a finished attempt started early and never settled,
+    /// keeping the repair spend it made.
+    fn abandon_speculative(&mut self) {
+        if let Some(runs) = self.speculative.clone() {
+            runs.abandon_unfinished();
+            self.drain_repair_usage(&runs.repair_state());
+        }
+    }
+
+    async fn run_loop(
+        &mut self,
+        peer_wake: bool,
+        mut initial: bool,
+    ) -> Result<DoneReason, AgentError> {
         loop {
             if self.cancel.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
-            if steering::lock(&self.steering).turn_limit_reached(self.config.max_turns) {
-                if let Some(goal) = self.goal.snapshot() {
-                    self.event_tx.send(AgentEvent::GoalTurnLimit {
-                        evaluations: goal.evaluations,
-                    })?;
-                }
-                return Ok(DoneReason::MaxTurns);
+            let turn_limit_reached =
+                steering::lock(&self.steering).turn_limit_reached(self.config.max_turns);
+            if turn_limit_reached && let Some(reason) = Box::pin(self.stop_at_turn_limit()).await? {
+                return Ok(reason);
             }
             if initial {
                 self.catch_up_peers().await;
@@ -1382,7 +1488,13 @@ impl<'h> Agent<'h> {
                 self.inject_advisory();
                 initial = false;
             }
-            match self.turn().await? {
+            let outcome = match self.turn().await {
+                Err(AgentError::SteeringExhausted { rule }) => {
+                    Box::pin(self.review_exhausted_steering(rule)).await?
+                }
+                outcome => outcome?,
+            };
+            match outcome {
                 TurnOutcome::Continue => {}
                 TurnOutcome::Done(reason) => {
                     if reason == DoneReason::EndTurn
@@ -1418,6 +1530,112 @@ impl<'h> Agent<'h> {
     /// The conversation with a person, as opposed to a task's own run.
     fn is_main_session(&self) -> bool {
         self.audience.contains(ToolAudience::MAIN) && self.root_tool_use_id.is_none()
+    }
+
+    fn main_autopilot(&self) -> Option<&AutopilotHandle> {
+        self.autopilot.as_ref().filter(|_| self.is_main_session())
+    }
+
+    fn engaged_autopilot(&self) -> Option<&AutopilotHandle> {
+        self.main_autopilot()
+            .filter(|autopilot| autopilot.is_engaged())
+    }
+
+    /// The `# Autopilot` block the conversation should carry, `None` when it
+    /// already does.
+    fn autopilot_notice(&self) -> Option<Message> {
+        let handle = self.main_autopilot()?;
+        autopilot::standing_notice(self.history.as_slice(), handle.is_engaged())
+    }
+
+    /// Restates the `# Autopilot` block ahead of a continuation inside a run,
+    /// which [`Self::push_user_inputs`] never sees.
+    fn restate_autopilot(&mut self) {
+        if let Some(notice) = self.autopilot_notice() {
+            self.push_injected(notice);
+        }
+    }
+
+    /// Counts a continuation that starts without a human against an engaged
+    /// autopilot's budget, then restates the block it continues under. A
+    /// budget that runs out ends autopilot, never the continuation.
+    fn count_continuation(&mut self) {
+        if let Some(Err(ended)) = self
+            .engaged_autopilot()
+            .map(|autopilot| autopilot.try_continue(&autopilot.limits()))
+        {
+            self.event_tx.try_send(ended);
+        }
+        self.restate_autopilot();
+    }
+
+    /// Spend this agent made itself, which the goal and an engaged autopilot
+    /// both count.
+    fn record_spend(&self, usage: TokenUsage, cost: Option<f64>, billing: Billing) {
+        self.goal.record_usage(usage, cost, billing);
+        self.record_autopilot_spend(cost, billing);
+    }
+
+    fn record_autopilot_spend(&self, cost: Option<f64>, billing: Billing) {
+        if let Some(ended) = self
+            .engaged_autopilot()
+            .and_then(|autopilot| autopilot.record_spend(cost, billing, &autopilot.limits()))
+        {
+            self.event_tx.try_send(ended);
+        }
+    }
+
+    fn end_autopilot(&self, reason: AutopilotEnd) {
+        if let Some(ended) = self
+            .engaged_autopilot()
+            .and_then(|autopilot| autopilot.end(reason))
+        {
+            self.event_tx.try_send(ended);
+        }
+    }
+
+    /// Ends autopilot with the goal it set, met or impossible. A goal it does
+    /// not own leaves it engaged.
+    fn end_with_goal(&self, verdict: GoalVerdict) {
+        let reason = match verdict {
+            GoalVerdict::Met => AutopilotEnd::GoalMet,
+            GoalVerdict::Impossible => AutopilotEnd::GoalImpossible,
+            GoalVerdict::NotMet => return,
+        };
+        if self.autopilot_owns_goal() {
+            self.end_autopilot(reason);
+        }
+    }
+
+    /// Whether the active goal is the one an engaged autopilot set.
+    fn autopilot_owns_goal(&self) -> bool {
+        self.engaged_autopilot()
+            .is_some_and(AutopilotHandle::owns_goal)
+    }
+
+    /// Publishes the conversation to an engaged autopilot, unless it already
+    /// saw the history as it stands.
+    fn observe_autopilot(&mut self) {
+        let observed = (self.history.epoch(), self.history.len());
+        if self.autopilot_observed == Some(observed) {
+            return;
+        }
+        let Some(autopilot) = self.engaged_autopilot() else {
+            return;
+        };
+        autopilot.observe(AutopilotSnapshot::new(
+            self.history.as_slice(),
+            self.history.transcript(),
+            self.goal.snapshot().map(|goal| goal.condition),
+            self.permissions.mode(),
+            ChatSession {
+                provider: Arc::clone(&self.provider),
+                model: Arc::clone(&self.model),
+                timeouts: self.timeouts,
+                model_policy: Arc::clone(&self.model_policy),
+            },
+        ));
+        self.autopilot_observed = Some(observed);
     }
 
     fn can_nudge_question(&self) -> bool {
@@ -1490,6 +1708,34 @@ impl<'h> Agent<'h> {
         {
             return Ok(None);
         }
+        if let Some(outcome) = self.take_arrivals().await? {
+            return Ok(Some(outcome));
+        }
+        if !self.can_nudge_question()
+            || !self.permissions.passive_decision_is_current(revision)
+            || self
+                .workflow
+                .as_ref()
+                .is_some_and(|work| work.pending_completions() > 0)
+        {
+            return Ok(None);
+        }
+        self.response_text = None;
+        self.count_continuation();
+        self.push_injected(Message::synthetic(question_tool_nudge::REMINDER.into()));
+        if let Some(receipt) = &outcome.receipt {
+            decisions.record_effect_detached(receipt, DecisionEffect::Advised);
+        }
+        Ok(Some(TurnOutcome::Continue))
+    }
+
+    /// Takes in what arrived while a handoff step decided to reopen the turn:
+    /// automation guidance, a queued command, background arrivals and peer
+    /// messages. `Some` when one of them settles the turn instead, ending it
+    /// for a terminal report or pending input and continuing it for anything
+    /// taken in. `None` when nothing arrived and the step may reopen the turn
+    /// itself.
+    async fn take_arrivals(&mut self) -> Result<Option<TurnOutcome>, AgentError> {
         let head = self.history.item_head();
         self.inject_automation_guidance().await;
         let queued = self.handle_queued_command().await?;
@@ -1513,24 +1759,7 @@ impl<'h> Agent<'h> {
             .unwrap_or_default();
         self.push_arrivals(arrivals);
         self.inject_peer_messages();
-        if queued || self.history.item_head() != head {
-            return Ok(Some(TurnOutcome::Continue));
-        }
-        if !self.can_nudge_question()
-            || !self.permissions.passive_decision_is_current(revision)
-            || self
-                .workflow
-                .as_ref()
-                .is_some_and(|work| work.pending_completions() > 0)
-        {
-            return Ok(None);
-        }
-        self.response_text = None;
-        self.push_injected(Message::synthetic(question_tool_nudge::REMINDER.into()));
-        if let Some(receipt) = &outcome.receipt {
-            decisions.record_effect_detached(receipt, DecisionEffect::Advised);
-        }
-        Ok(Some(TurnOutcome::Continue))
+        Ok((queued || self.history.item_head() != head).then_some(TurnOutcome::Continue))
     }
 
     /// Holds a handoff back to the user, once per run, while the todo list
@@ -1554,8 +1783,229 @@ impl<'h> Agent<'h> {
         };
         self.todos_reminded = true;
         self.response_text = None;
+        self.count_continuation();
         self.push_injected(reminder);
         true
+    }
+
+    /// Holds a handoff once per group work item an engaged autopilot's
+    /// session took in and has not reported, while the agent may report it.
+    fn remind_unreported_work(&mut self) -> bool {
+        let Some(autopilot) = self.engaged_autopilot() else {
+            return false;
+        };
+        if self.mode.is_read_only() || !self.tool_context().tool_available(WORK_NAME) {
+            return false;
+        }
+        let Some(work) = self
+            .peers
+            .as_ref()
+            .and_then(PeerSession::taken_work)
+            .filter(|work| self.work_reminded.as_ref() != Some(work))
+        else {
+            return false;
+        };
+        let reminder = review::unreported_work(autopilot.next_seq(), &work);
+        self.work_reminded = Some(work);
+        self.response_text = None;
+        self.count_continuation();
+        self.push_injected(reminder);
+        true
+    }
+
+    /// The handoff steps that may settle the turn before it goes back to the
+    /// user, in order: the plan review, the question-tool nudge, and the reply
+    /// review. The first that settles it wins.
+    async fn review_turn_end(&mut self) -> Result<Option<TurnOutcome>, AgentError> {
+        if let Some(outcome) = self.review_plan().await? {
+            return Ok(Some(outcome));
+        }
+        if let Some(outcome) = self.remind_question_tool().await? {
+            return Ok(Some(outcome));
+        }
+        self.review_reply().await
+    }
+
+    /// An engaged autopilot a turn-end review may ask, `None` when a terminal
+    /// report or the user settles the turn anyway.
+    fn reviewing_autopilot(&self) -> Option<AutopilotHandle> {
+        self.stalled_autopilot().filter(|_| !self.deliveries_held())
+    }
+
+    /// An engaged autopilot a stall may be put to, `None` when a terminal
+    /// report, a cancel or the user settles the run anyway. Unlike a turn-end
+    /// review, it is asked past the turn limit, a stall in its own right.
+    fn stalled_autopilot(&self) -> Option<AutopilotHandle> {
+        self.engaged_autopilot()
+            .filter(|_| {
+                !self.terminal_report_ready()
+                    && !self.cancel.is_cancelled()
+                    && !self
+                        .interrupt_source
+                        .as_ref()
+                        .is_some_and(|source| source.has_pending_input())
+            })
+            .cloned()
+    }
+
+    async fn turn_end_verdict(
+        &mut self,
+        autopilot: &AutopilotHandle,
+        item: TurnEnd,
+    ) -> Result<Verdict, AgentError> {
+        self.observe_autopilot();
+        item.decide(autopilot, &self.event_tx, &self.cancel)
+            .await
+            .ok_or(AgentError::Cancelled)
+    }
+
+    /// Puts a stall that would stop the run to an engaged autopilot. `Some`
+    /// carries the guidance it goes on with. `None` leaves the run to stop as
+    /// it would without autopilot.
+    async fn review_stall(&mut self, stall: Stall<'_>) -> Result<Option<Message>, AgentError> {
+        let Some(autopilot) = self.stalled_autopilot() else {
+            return Ok(None);
+        };
+        let item = TurnEnd::stall(&stall, self.goal.snapshot().as_ref());
+        Ok(self.turn_end_verdict(&autopilot, item).await?.guidance())
+    }
+
+    /// Stops a run that used its turns, unless an engaged autopilot goes on,
+    /// which re-arms the limit. `None` when the run goes on.
+    async fn stop_at_turn_limit(&mut self) -> Result<Option<DoneReason>, AgentError> {
+        let turns = self.config.max_turns.unwrap_or_default();
+        let Some(guidance) = self.review_stall(Stall::TurnLimit { turns }).await? else {
+            if let Some(goal) = self.goal.snapshot() {
+                self.event_tx.send(AgentEvent::GoalTurnLimit {
+                    evaluations: goal.evaluations,
+                })?;
+            }
+            return Ok(Some(DoneReason::MaxTurns));
+        };
+        steering::lock(&self.steering).rearm_turns();
+        Ok(match self.continue_for_autopilot(guidance).await? {
+            TurnOutcome::Continue => {
+                self.publish_prepared_context();
+                None
+            }
+            TurnOutcome::Done(reason) => Some(reason),
+        })
+    }
+
+    /// Fails a run whose steering spent `rule`'s allowance, unless an engaged
+    /// autopilot goes on, which re-arms the rule.
+    async fn review_exhausted_steering(&mut self, rule: String) -> Result<TurnOutcome, AgentError> {
+        let Some(guidance) = self.review_stall(Stall::Steering { rule: &rule }).await? else {
+            return Err(AgentError::SteeringExhausted { rule });
+        };
+        let nudges = self.history.recent_nudges();
+        steering::lock(&self.steering).rearm(&rule, nudges);
+        let outcome = self.continue_for_autopilot(guidance).await?;
+        self.publish_prepared_context();
+        Ok(outcome)
+    }
+
+    /// Asks an engaged autopilot, once per goal generation, whether the
+    /// evaluator's impossible verdict on `goal` stands. `Some` carries the
+    /// guidance it goes on with instead, which makes the verdict `NotMet`.
+    async fn second_opinion(
+        &mut self,
+        goal: &GoalSnapshot,
+        evaluation: u32,
+        reason: &str,
+    ) -> Option<Message> {
+        let autopilot = self.stalled_autopilot().filter(|_| {
+            self.goal.is_generation_active(goal.generation) && self.goal_completion_ready()
+        })?;
+        if !autopilot.take_second_opinion(goal.generation) {
+            return None;
+        }
+        let item = TurnEnd::second_opinion(&goal.condition, evaluation, reason);
+        self.turn_end_verdict(&autopilot, item)
+            .await
+            .ok()?
+            .guidance()
+    }
+
+    /// Puts the plan this run wrote to an engaged autopilot before the turn
+    /// hands back in plan mode. A human claim on the plan card drops the
+    /// verdict and leaves the plan to the human. Implementing ends the run,
+    /// and the frontend starts the implement run.
+    async fn review_plan(&mut self) -> Result<Option<TurnOutcome>, AgentError> {
+        if !self.mode.is_planning() || !self.history.take_plan_written() {
+            return Ok(None);
+        }
+        let Some(autopilot) = self.reviewing_autopilot() else {
+            return Ok(None);
+        };
+        let Some(plan) = plan::read(&self.tool_context())
+            .ok()
+            .filter(|plan| !plan.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+        autopilot.reset_plan_claim();
+        let verdict = self
+            .turn_end_verdict(&autopilot, TurnEnd::plan(&plan))
+            .await?;
+        let ended = Ok(Some(TurnOutcome::Done(DoneReason::EndTurn)));
+        if !autopilot.claim_plan() {
+            return ended;
+        }
+        match verdict.action {
+            DelegateAction::Revise { feedback } => {
+                let revision =
+                    review::on_behalf(verdict.seq, AutopilotMessageKind::Revision, &feedback);
+                self.continue_for_autopilot(revision).await.map(Some)
+            }
+            DelegateAction::Implement => {
+                self.event_tx
+                    .try_send(AutopilotEvent::ImplementPlan { seq: verdict.seq });
+                ended
+            }
+            _ => ended,
+        }
+    }
+
+    /// Puts a reply that asks the user something to an engaged autopilot,
+    /// once the question-tool nudge left it alone. `done` lets the handoff go
+    /// on to its next step, and an escalation ends the run for the human.
+    async fn review_reply(&mut self) -> Result<Option<TurnOutcome>, AgentError> {
+        let Some(autopilot) = self.reviewing_autopilot() else {
+            return Ok(None);
+        };
+        let Some(item) = self
+            .response_text
+            .as_deref()
+            .filter(|reply| steering::solicits(reply))
+            .map(TurnEnd::reply)
+        else {
+            return Ok(None);
+        };
+        let verdict = self.turn_end_verdict(&autopilot, item).await?;
+        match verdict.action {
+            DelegateAction::Reply { text } => {
+                let reply = review::on_behalf(verdict.seq, AutopilotMessageKind::Reply, &text);
+                self.continue_for_autopilot(reply).await.map(Some)
+            }
+            DelegateAction::Done => Ok(None),
+            _ => Ok(Some(TurnOutcome::Done(DoneReason::EndTurn))),
+        }
+    }
+
+    /// Reopens the turn with what autopilot wrote, unless something that
+    /// arrived while the delegate decided settles the turn first.
+    async fn continue_for_autopilot(
+        &mut self,
+        message: Message,
+    ) -> Result<TurnOutcome, AgentError> {
+        if let Some(outcome) = self.take_arrivals().await? {
+            return Ok(outcome);
+        }
+        self.response_text = None;
+        self.count_continuation();
+        self.push_injected(message);
+        Ok(TurnOutcome::Continue)
     }
 
     fn child_jobs(&self) -> Option<JobScope> {
@@ -1919,7 +2369,7 @@ impl<'h> Agent<'h> {
         let usage = response.usage;
         self.total_usage += usage;
         self.emit_turn_complete(&response)?;
-        self.goal.record_usage(
+        self.record_spend(
             usage,
             self.model
                 .billed_cost(&usage, self.opts.clamped(&self.model).fast),
@@ -2028,6 +2478,7 @@ impl<'h> Agent<'h> {
                 && !queued
                 && stop_reason != Some(StopReason::MaxTokens)
             {
+                self.observe_autopilot();
                 return self.goal_completion(stop_reason.into()).await;
             }
             return Ok(TurnOutcome::Continue);
@@ -2150,9 +2601,12 @@ impl<'h> Agent<'h> {
         // Explicit user input and goal evaluation retain their own continuation policy.
         let handoff = !has_tools && !(compacted && stop_reason != Some(StopReason::MaxTokens));
         let done_reason = DoneReason::from(stop_reason);
+        if handoff {
+            self.observe_autopilot();
+        }
         if handoff
             && stop_reason == Some(StopReason::EndTurn)
-            && let Some(outcome) = self.remind_question_tool().await?
+            && let Some(outcome) = Box::pin(self.review_turn_end()).await?
         {
             self.publish_prepared_context();
             return Ok(outcome);
@@ -2160,7 +2614,10 @@ impl<'h> Agent<'h> {
         // Checked ahead of goal completion, which evaluates the goal or defers
         // it behind queued next prompts, so both follow the reminder. Returning
         // here keeps the reminder the last message of its request.
-        if handoff && done_reason == DoneReason::EndTurn && self.remind_open_todos() {
+        if handoff
+            && done_reason == DoneReason::EndTurn
+            && (self.remind_open_todos() || self.remind_unreported_work())
+        {
             self.publish_prepared_context();
             return Ok(TurnOutcome::Continue);
         }
@@ -2254,6 +2711,7 @@ impl<'h> Agent<'h> {
             }
             self.goal_blocks += 1;
             self.goal_prescreen_skips += 1;
+            self.count_continuation();
             self.push_injected(Message::synthetic(continuation_message(
                 &goal.condition,
                 GOAL_PRESCREEN_CONTINUATION,
@@ -2269,31 +2727,24 @@ impl<'h> Agent<'h> {
         let evaluation = goal.evaluations.saturating_add(1);
         self.event_tx
             .send(AgentEvent::GoalEvaluating { evaluation })?;
-        // Only an exactly bound evaluator is worth caching a provider for: any
-        // other binding can resolve elsewhere as the conversation model changes.
         let binding = caudra_providers::model_registry::binding(ModelPurpose::Goal);
-        let exactly_bound = matches!(binding, Some(Binding::Exact(_)));
         let binding_label = binding
             .as_ref()
             .map_or_else(|| UNBOUND_EVALUATOR.to_string(), Binding::to_string);
-        let cached_provider = self
-            .goal_evaluator
-            .as_ref()
-            .filter(|resolved| exactly_bound && resolved.binding == binding)
-            .map(|resolved| Arc::clone(&resolved.provider));
         let mut evaluator = match resolve_evaluator(
+            GOAL_EVALUATOR_ROLE,
             &self.provider,
             &self.model,
             binding,
             self.timeouts,
             &self.model_policy,
             &self.cancel,
-            cached_provider,
+            self.goal_evaluator.as_ref(),
         )
         .await
         {
             Ok(resolved) => {
-                self.goal_evaluator = exactly_bound.then_some(resolved.clone());
+                self.goal_evaluator = resolved.cacheable().then(|| resolved.clone());
                 resolved
             }
             Err(error) => {
@@ -2400,16 +2851,27 @@ impl<'h> Agent<'h> {
         self.total_usage += result.usage;
         self.goal
             .record_usage_for(goal.generation, result.usage, result.cost, result.billing);
+        self.record_autopilot_spend(result.cost, result.billing);
         let reason: Arc<str> = Arc::from(result.reason.as_str());
+        let guidance = if result.verdict == GoalVerdict::Impossible {
+            Box::pin(self.second_opinion(&goal, evaluation, &reason)).await
+        } else {
+            None
+        };
+        let verdict = if guidance.is_some() {
+            GoalVerdict::NotMet
+        } else {
+            result.verdict
+        };
         let deferred = !self.goal_completion_ready() || self.cancel.is_cancelled();
         let apply = if deferred {
             GoalApply::Stale
         } else {
             self.goal
-                .apply_evaluation(goal.generation, result.verdict, Arc::clone(&reason))
+                .apply_evaluation(goal.generation, verdict, Arc::clone(&reason))
         };
         self.event_tx.send(AgentEvent::GoalEvaluation {
-            verdict: result.verdict,
+            verdict,
             reason: result.reason.clone(),
             evaluation,
             applied: !matches!(apply, GoalApply::Stale),
@@ -2429,25 +2891,42 @@ impl<'h> Agent<'h> {
             GoalApply::Stale => Ok(TurnOutcome::Done(done_reason)),
             GoalApply::Terminal => {
                 if let Some(GoalStatus::Finished(result)) = self.goal.status() {
-                    self.event_tx.send(AgentEvent::GoalFinished { result })?;
+                    let verdict = result.verdict;
+                    let autopilot_owned = self.autopilot_owns_goal();
+                    self.event_tx.send(AgentEvent::GoalFinished {
+                        result,
+                        autopilot_owned,
+                    })?;
+                    self.end_with_goal(verdict);
                 }
                 Ok(TurnOutcome::Done(done_reason))
             }
             GoalApply::Continue { evaluation } => {
                 let continuation_limit = self.goal.continuation_limit();
                 if self.goal_blocks >= continuation_limit {
-                    self.event_tx.send(AgentEvent::GoalLoopCap {
-                        evaluations: evaluation,
+                    let stall = Stall::LoopCap {
                         continuations: self.goal_blocks,
-                        limit: continuation_limit,
-                    })?;
-                    return Ok(TurnOutcome::Done(done_reason));
+                    };
+                    let Some(guidance) = Box::pin(self.review_stall(stall)).await? else {
+                        self.event_tx.send(AgentEvent::GoalLoopCap {
+                            evaluations: evaluation,
+                            continuations: self.goal_blocks,
+                            limit: continuation_limit,
+                        })?;
+                        return Ok(TurnOutcome::Done(done_reason));
+                    };
+                    self.goal_blocks = 0;
+                    return Box::pin(self.continue_for_autopilot(guidance)).await;
                 }
                 self.goal_blocks += 1;
+                self.count_continuation();
                 self.push_injected(Message::synthetic(continuation_message(
                     &goal.condition,
                     &reason,
                 )));
+                if let Some(guidance) = guidance {
+                    self.push_injected(guidance);
+                }
                 Ok(TurnOutcome::Continue)
             }
         }
@@ -2540,6 +3019,7 @@ impl<'h> Agent<'h> {
         self.total_usage += failure.usage;
         self.goal
             .record_usage_for(generation, failure.usage, failure.cost, failure.billing);
+        self.record_autopilot_spend(failure.cost, failure.billing);
         self.event_tx.send(AgentEvent::GoalEvaluationFailed {
             evaluation,
             message: failure.error.to_string(),
@@ -2726,6 +3206,7 @@ impl<'h> Agent<'h> {
             ctx.json_repair.register_invalid(&id, invalid);
         }
         self.push_assistant_message(response.message);
+        self.observe_autopilot();
         let result = tool_dispatch::process_tool_calls(
             tool_uses,
             &mut self.recent_calls,
@@ -2785,8 +3266,7 @@ impl<'h> Agent<'h> {
     fn drain_repair_usage(&mut self, state: &RepairState) {
         for repair in state.take_usage() {
             self.total_usage += repair.usage;
-            self.goal
-                .record_usage(repair.usage, repair.cost, repair.billing);
+            self.record_spend(repair.usage, repair.cost, repair.billing);
             self.event_tx.try_send(AgentEvent::ModelUsage {
                 usage: repair.usage,
                 cost: repair.cost,
@@ -3008,11 +3488,10 @@ impl<'h> Agent<'h> {
         let usage = compacted.usage;
         let cost = compact_model.billed_cost(&usage, false);
         self.total_usage += usage;
-        self.goal.record_usage(usage, cost, compact_model.billing);
+        self.record_spend(usage, cost, compact_model.billing);
         if let Some(spend) = compacted.extraction {
             self.total_usage += spend.usage;
-            self.goal
-                .record_usage(spend.usage, spend.cost, spend.billing);
+            self.record_spend(spend.usage, spend.cost, spend.billing);
         }
         compacted.result?;
         self.measured = None;
@@ -3431,6 +3910,7 @@ pub(super) fn push_injected(history: &mut History, event_tx: &EventSender, messa
             task_event: message.task_event.clone(),
             peer_event: message.peer_event.clone(),
             automation_event: message.automation_event.clone(),
+            autopilot_event: message.autopilot_event.clone(),
         });
     }
     history.push(message);
@@ -3447,6 +3927,7 @@ pub(crate) fn last_announced<'a>(history: &'a [Message], markers: &[&str]) -> Op
                 && message.peer_event.is_none()
                 && message.workflow_event.is_none()
                 && message.automation_event.is_none()
+                && message.autopilot_event.is_none()
                 && message.standing_reminder.is_none()
         })
         .find_map(|message| {
@@ -3459,7 +3940,11 @@ pub(crate) fn last_announced<'a>(history: &'a [Message], markers: &[&str]) -> Op
 /// Restates `text` when the transcript does not already carry this exact block.
 /// Idempotent by construction, which is what covers a first turn, a change in
 /// the underlying value, and a rewind that took the last announcement with it.
-fn standing_notice(history: &[Message], marker: &str, text: Option<&str>) -> Option<Message> {
+pub(crate) fn standing_notice(
+    history: &[Message],
+    marker: &str,
+    text: Option<&str>,
+) -> Option<Message> {
     let text = text?;
     if last_announced(history, &[marker]) == Some(text) {
         return None;
@@ -3706,6 +4191,7 @@ fn add_opaque_blob_tokens(total: &mut u32, blob: &str) {
 #[cfg(test)]
 mod tests {
     include!("automation_tests.rs");
+    include!("autopilot_tests.rs");
     include!("owned_jobs_tests.rs");
     include!("peer_tests.rs");
     include!("question_nudge_tests.rs");
@@ -3724,9 +4210,10 @@ mod tests {
     };
     use caudra_providers::provider::{BoxFuture, Provider};
     use caudra_providers::{
-        AutomationEventOrigin, ContentBlock, InvalidToolInput, Message, Model, ModelInfo,
-        ProviderEvent, RequestOptions, Role, StandingReminderKind, SteeringKind, StopReason,
-        StreamResponse, TaskEventOrigin, TokenUsage, WorkflowEventOrigin, invalid_tool_input,
+        AutomationEventOrigin, AutopilotMessageKind, AutopilotOrigin, ContentBlock,
+        InvalidToolInput, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
+        StandingReminderKind, SteeringKind, StopReason, StreamResponse, TaskEventOrigin,
+        TokenUsage, WorkflowEventOrigin, invalid_tool_input,
     };
     use caudra_storage::StateDir;
     use caudra_storage::decision_log::{DecisionFilter, DecisionLog, StatsThresholds};
@@ -3779,6 +4266,7 @@ mod tests {
     const AUTOMATION: &str = "nightly-review";
     const AUTOMATION_FIRE_ID: &str = "opaque-firing";
     const AUTOMATION_SEQ: u32 = 1;
+    const AUTOPILOT_SEQ: u32 = 1;
 
     #[test]
     fn peer_wake_without_a_claim_does_not_request_the_model() {
@@ -6157,7 +6645,7 @@ mod tests {
             );
             assert!(events.iter().any(|event| matches!(
                 event,
-                AgentEvent::GoalFinished { result } if result.verdict == super::super::goal::GoalVerdict::Met
+                AgentEvent::GoalFinished { result, autopilot_owned: false } if result.verdict == super::super::goal::GoalVerdict::Met
             )));
             assert!(matches!(goal.status(), Some(GoalStatus::Finished(_))));
             assert_eq!(
@@ -6893,6 +7381,8 @@ mod tests {
     #[test_case(vec![turn(), environment_announcement(ENVIRONMENT), reply(), turn(), environment_announcement(ENVIRONMENT_NEXT_DAY), reply(), turn(), reply()], 6, &[4] ; "only_the_last_block_of_a_kind")]
     #[test_case(vec![turn(), plan_announcement(), Message::observation(crate::prompt::TASK_PLAN_CONTRACT.into()), Message::observation(INSTRUCTIONS_CHANGED.into()), environment_announcement(ENVIRONMENT), Message::observation(MEMORY_UPDATED.into()), reply()], 7, &[4, 3, 5, 2, 1] ; "everything_summarized_in_announcement_order")]
     #[test_case(vec![turn(), Message::observation(MEMORY_UPDATED.into()), reply(), turn(), reply()], 3, &[1] ; "a_memory_update_is_restated")]
+    #[test_case(vec![turn(), Message::observation(crate::prompt::AUTOPILOT_ENGAGED_PROMPT.into()), reply(), turn(), reply()], 3, &[1] ; "an_autopilot_notice_is_restated")]
+    #[test_case(vec![turn(), Message::observation(crate::prompt::AUTOPILOT_ENGAGED_PROMPT.into()), reply(), turn(), Message::observation(crate::prompt::AUTOPILOT_ENDED_PROMPT.into()), reply()], 3, &[] ; "an_ended_autopilot_in_the_tail_supersedes")]
     fn a_compaction_restates_the_kinds_its_tail_lacks(
         history: Vec<Message>,
         head_end: usize,
@@ -7020,6 +7510,36 @@ mod tests {
         assert!(matches!(last_announced_mode(&history), AnnouncedMode::Plan));
         assert_eq!(
             last_announced(&history, &[crate::prompt::ENVIRONMENT_MARKER]),
+            None
+        );
+    }
+
+    #[test]
+    fn autopilot_messages_cannot_pass_for_standing_notices() {
+        let history = [
+            plan_announcement(),
+            Message::autopilot_observation(
+                format!(
+                    "{}\n{}\n{}",
+                    crate::prompt::BUILD_MODE_MARKER,
+                    crate::prompt::ENVIRONMENT_MARKER,
+                    crate::prompt::AUTOPILOT_MARKER
+                ),
+                AutopilotOrigin {
+                    seq: AUTOPILOT_SEQ,
+                    kind: AutopilotMessageKind::Reply,
+                },
+            ),
+        ];
+        assert!(matches!(last_announced_mode(&history), AnnouncedMode::Plan));
+        assert_eq!(
+            last_announced(
+                &history,
+                &[
+                    crate::prompt::ENVIRONMENT_MARKER,
+                    crate::prompt::AUTOPILOT_MARKER
+                ]
+            ),
             None
         );
     }

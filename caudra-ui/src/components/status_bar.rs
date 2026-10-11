@@ -44,6 +44,10 @@ const TASKS_LABEL: &str = "tasks";
 const SHELLS_LABEL: &str = "shell";
 const AUTOMATIONS_CHIP_LABEL: &str = "auto";
 const AUTOMATION_FAILURES_LABEL: &str = "failed";
+const AUTOPILOT_CHIP_LABEL: &str = "autopilot";
+const AUTOPILOT_SHORT_LABEL: &str = "[ap]";
+/// Below this many columns the chip drops its name and count for `[ap]`.
+const AUTOPILOT_SHORT_BELOW_WIDTH: u16 = 80;
 /// Replaces the countdown under the pointer: the control has to say what a
 /// click does, and the seconds left stop mattering once you mean to skip them.
 const RETRY_NOW_LABEL: &str = " · retry now";
@@ -141,6 +145,7 @@ const CLICK_SANDBOX: &str = "Click to manage it";
 const CLICK_DETAILS: &str = "Click for details";
 const CLICK_TRUST_REVIEW: &str = "Click to review it";
 const CLICK_AUTOMATIONS: &str = "Click to open automations";
+const CLICK_AUTOPILOT: &str = "Click to open autopilot";
 /// Cells in the context gauge. Each fills in eighths, so the gauge resolves
 /// the window to one part in eighty.
 const GAUGE_CELLS: u8 = 10;
@@ -170,6 +175,17 @@ pub struct WorkflowChip {
 pub struct AutomationChip {
     pub armed: usize,
     pub unseen_failures: usize,
+}
+
+/// What the bar says about an engaged autopilot: the continuations it used
+/// against its limit, and whether an escalation waits on the user. `summary`
+/// is the tooltip's body, already worded by the App.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AutopilotChip {
+    pub used: u32,
+    pub limit: u32,
+    pub escalated: bool,
+    pub summary: String,
 }
 
 /// Project config whose trust is still undecided once its picker is out of
@@ -290,6 +306,7 @@ pub enum StatusBarHitTarget {
     ConfigProblems,
     TrustReview,
     Automations,
+    Autopilot,
 }
 
 impl StatusBarHitTarget {
@@ -331,6 +348,7 @@ impl StatusBarHitTarget {
             | Self::Goal
             | Self::Workflows
             | Self::Automations
+            | Self::Autopilot
             | Self::Fast
             | Self::Retry => ChatScope::MainOnly,
         }
@@ -414,6 +432,8 @@ pub struct StatusBarContext<'a> {
     pub restoring: bool,
     pub background_waiting: bool,
     pub goal: Option<&'a GoalSnapshot>,
+    /// `None` unless autopilot is engaged with the experiment on.
+    pub autopilot: Option<&'a AutopilotChip>,
     pub active_tasks: usize,
     pub active_shells: usize,
     /// The composer is running a shell line, so the chip names bash rather than
@@ -1156,6 +1176,7 @@ impl StatusBar {
         self.push_settings(&mut left, ctx, area.width);
         push_resume(&mut left, ctx);
         push_goal(&mut left, ctx);
+        push_autopilot(&mut left, ctx, area.width);
         push_activity(&mut left, ctx);
         push_automations(&mut left, ctx, &self.automations);
         if ctx.background_waiting {
@@ -1227,6 +1248,7 @@ impl StatusBar {
         let mut activity = Strip::default();
         activity.push(self.spinner_slot(ctx));
         push_goal(&mut activity, ctx);
+        push_autopilot(&mut activity, ctx, area.width);
         push_activity(&mut activity, ctx);
         push_automations(&mut activity, ctx, &self.automations);
         let mut messages = Strip::default();
@@ -1505,6 +1527,29 @@ fn push_goal(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>) {
             [Span::styled(label, theme::current().status_notice)],
         );
     }
+}
+
+/// `[autopilot · 12/100]`, `[ap]` on a narrow bar, amber while an
+/// escalation waits on the user.
+fn push_autopilot(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>, width: u16) {
+    let Some(chip) = ctx.autopilot else {
+        return;
+    };
+    let label = if width < AUTOPILOT_SHORT_BELOW_WIDTH {
+        AUTOPILOT_SHORT_LABEL.to_owned()
+    } else {
+        format!("[{AUTOPILOT_CHIP_LABEL} · {}/{}]", chip.used, chip.limit)
+    };
+    let style = if chip.escalated {
+        theme::current().todo_in_progress
+    } else {
+        control_style(ctx, StatusBarHitTarget::Autopilot)
+    };
+    strip.chip(
+        ctx,
+        StatusBarHitTarget::Autopilot,
+        [Span::styled(label, style)],
+    );
 }
 
 fn push_activity(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>) {
@@ -1914,6 +1959,7 @@ fn chip_tip(
                 automations.armed
             ),
         },
+        StatusBarHitTarget::Autopilot => ctx.autopilot?.summary.clone(),
     };
     Some(match click_tip(target).filter(|_| clickable(ctx, target)) {
         Some(click) => format!("{body}\n{click}"),
@@ -1938,6 +1984,7 @@ fn click_tip(target: StatusBarHitTarget) -> Option<&'static str> {
         StatusBarHitTarget::Decisions | StatusBarHitTarget::ConfigProblems => CLICK_DETAILS,
         StatusBarHitTarget::TrustReview => CLICK_TRUST_REVIEW,
         StatusBarHitTarget::Automations => CLICK_AUTOMATIONS,
+        StatusBarHitTarget::Autopilot => CLICK_AUTOPILOT,
         StatusBarHitTarget::BackToMain
         | StatusBarHitTarget::ChatName
         | StatusBarHitTarget::Cwd
@@ -2545,6 +2592,7 @@ mod tests {
         hovered: Option<StatusBarHitTarget>,
         hover_hint: Option<&'a str>,
         goal: Option<&'a GoalSnapshot>,
+        autopilot: Option<&'a AutopilotChip>,
         active_tasks: usize,
         active_shells: usize,
         background_waiting: bool,
@@ -2577,6 +2625,7 @@ mod tests {
                 hovered: None,
                 hover_hint: None,
                 goal: None,
+                autopilot: None,
                 active_tasks: 0,
                 active_shells: 0,
                 background_waiting: false,
@@ -2628,6 +2677,7 @@ mod tests {
                 restoring: false,
                 background_waiting: self.background_waiting,
                 goal: self.goal,
+                autopilot: self.autopilot,
                 active_tasks: self.active_tasks,
                 active_shells: self.active_shells,
                 bash_input: false,
@@ -2790,6 +2840,7 @@ mod tests {
             restoring: false,
             background_waiting: false,
             goal: None,
+            autopilot: None,
             active_tasks: 0,
             active_shells: 0,
             bash_input: false,
@@ -4014,6 +4065,85 @@ mod tests {
         }
     }
 
+    const AUTOPILOT_USED: u32 = 12;
+    const AUTOPILOT_LIMIT: u32 = 100;
+    const AUTOPILOT_SUMMARY: &str = "Engaged\n88 continuations left";
+    const NARROW_BAR_WIDTH: u16 = AUTOPILOT_SHORT_BELOW_WIDTH - 1;
+    const NO_AUTOPILOT_CHIP_MSG: &str = "a disengaged autopilot draws no chip";
+
+    fn autopilot_chip(escalated: bool) -> AutopilotChip {
+        AutopilotChip {
+            used: AUTOPILOT_USED,
+            limit: AUTOPILOT_LIMIT,
+            escalated,
+            summary: AUTOPILOT_SUMMARY.into(),
+        }
+    }
+
+    #[test_case(BAR_WIDTH, false; "wide")]
+    #[test_case(NARROW_BAR_WIDTH, false; "narrow")]
+    #[test_case(BAR_WIDTH, true; "an_escalation_turns_it_amber")]
+    fn autopilot_chip_counts_continuations_and_turns_amber_on_escalation(
+        width: u16,
+        escalated: bool,
+    ) {
+        let chip = autopilot_chip(escalated);
+        let label = if width < AUTOPILOT_SHORT_BELOW_WIDTH {
+            AUTOPILOT_SHORT_LABEL.to_owned()
+        } else {
+            format!("[{AUTOPILOT_CHIP_LABEL} · {AUTOPILOT_USED}/{AUTOPILOT_LIMIT}]")
+        };
+        let colour = if escalated {
+            theme::current().todo_in_progress.fg
+        } else {
+            theme::current().status_notice.fg
+        };
+        for rows in [SINGLE_ROW, SPLIT_ROWS] {
+            let drawn = render_fixture(
+                Fixture {
+                    width,
+                    autopilot: Some(&chip),
+                    ..Default::default()
+                },
+                rows,
+            );
+            let hit = drawn.hit(StatusBarHitTarget::Autopilot);
+            assert_eq!(drawn.glyphs(hit), label);
+            assert!(drawn.styles(hit).iter().all(|style| style.fg == colour));
+        }
+    }
+
+    #[test]
+    fn a_disengaged_autopilot_draws_no_chip() {
+        let (text, hits, _) = render_at(Fixture::default());
+        assert!(
+            hits.iter()
+                .all(|hit| hit.target != StatusBarHitTarget::Autopilot),
+            "{NO_AUTOPILOT_CHIP_MSG}"
+        );
+        assert!(
+            !text.contains(AUTOPILOT_CHIP_LABEL),
+            "{NO_AUTOPILOT_CHIP_MSG}"
+        );
+    }
+
+    /// A task's bar draws the chip inert, so its tip offers no click.
+    #[test_case(true; "on_main")]
+    #[test_case(false; "on_a_task")]
+    fn the_autopilot_tip_reads_its_summary(main_chat: bool) {
+        let chip = autopilot_chip(false);
+        let tip = tip_for(
+            StatusBarHitTarget::Autopilot,
+            Fixture {
+                main_chat,
+                autopilot: Some(&chip),
+                ..Default::default()
+            },
+        );
+        assert!(tip.starts_with(AUTOPILOT_SUMMARY), "{TIP_MISSING}: {tip}");
+        assert_eq!(tip.ends_with(CLICK_AUTOPILOT), main_chat);
+    }
+
     #[test]
     fn an_unchanged_automation_chip_asks_for_no_repaint() {
         let mut bar = StatusBar::new(FLASH_TTL, ".", false);
@@ -5123,12 +5253,13 @@ mod tests {
         );
     }
 
-    const ALL_CONTROLS: [StatusBarHitTarget; 10] = [
+    const ALL_CONTROLS: [StatusBarHitTarget; 11] = [
         StatusBarHitTarget::BackToMain,
         StatusBarHitTarget::Mode,
         StatusBarHitTarget::Model,
         StatusBarHitTarget::Thinking,
         StatusBarHitTarget::Goal,
+        StatusBarHitTarget::Autopilot,
         StatusBarHitTarget::Context,
         StatusBarHitTarget::Usage,
         StatusBarHitTarget::Workflows,
@@ -5154,6 +5285,7 @@ mod tests {
     #[test]
     fn a_task_bar_offers_only_the_controls_a_task_owns() {
         let goal = active_goal();
+        let autopilot = autopilot_chip(false);
         let retry = RetryInfo {
             attempt: RETRY_ATTEMPT,
             message: RETRY_MESSAGE.into(),
@@ -5163,6 +5295,7 @@ mod tests {
             width: TASK_BAR_WIDTH,
             main_chat: false,
             goal: Some(&goal),
+            autopilot: Some(&autopilot),
             retry_info: Some(&retry),
             workflows: ladder_workflows(),
             automations: AutomationChip {
@@ -5185,9 +5318,10 @@ mod tests {
     /// Every control that opens a command carries that command's scope, so the
     /// bar cannot refuse a click the palette accepts. `Mode`, `BackToMain`,
     /// `Retry` and `Thinking` are absent because their click runs no command.
-    const SCOPED_COMMANDS: [(StatusBarHitTarget, &str); 9] = [
+    const SCOPED_COMMANDS: [(StatusBarHitTarget, &str); 10] = [
         (StatusBarHitTarget::Model, "/model"),
         (StatusBarHitTarget::Goal, "/goal"),
+        (StatusBarHitTarget::Autopilot, "/autopilot"),
         (StatusBarHitTarget::Context, "/context"),
         (StatusBarHitTarget::Usage, "/usage"),
         (StatusBarHitTarget::Workflows, "/workflows"),

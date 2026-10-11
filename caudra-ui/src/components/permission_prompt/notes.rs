@@ -10,6 +10,7 @@ use caudra_agent::tools::native::plan;
 use super::PermissionPrompt;
 use super::details::{mask_secrets, redact_url_query, review_lines, review_text};
 use super::scope::requested_action;
+use crate::components::autopilot_panel::card_note;
 
 pub(super) const PLAN_NOTE: &str = "Plan mode asks before anything it can't prove read-only.";
 const PROTECTED_NOTE: &str = "Touches protected files such as keys and settings";
@@ -285,6 +286,57 @@ impl PermissionPrompt {
         if let Some(auto) = request.presentation.auto {
             notes.push(Note::muted(auto.phrase()));
         }
+        if let Some(note) = &request.presentation.autopilot {
+            notes.push(Note::muted(card_note(note)));
+        }
         notes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use caudra_agent::permissions::AutopilotNote;
+    use caudra_config::ToolKey;
+    use test_case::test_case;
+
+    use super::*;
+
+    const REQUEST_ID: &str = "autopilot-note";
+    const TOOL: &str = "bash";
+    const COMMAND: &str = "cargo test";
+    const PROJECT: &str = "/project";
+    const ESCALATION: &str = "the user must choose";
+
+    #[test_case(None ; "no_autopilot")]
+    #[test_case(Some(AutopilotNote::Deciding) ; "deciding")]
+    #[test_case(Some(AutopilotNote::Escalated { reason: ESCALATION.into() }) ; "left_to_you")]
+    fn the_card_says_what_autopilot_is_doing(note: Option<AutopilotNote>) {
+        let mut request = PermissionRequest::from_legacy(
+            REQUEST_ID.into(),
+            ToolKey::native(TOOL),
+            vec![COMMAND.into()],
+            serde_json::Value::Null,
+            Path::new(PROJECT),
+            true,
+        );
+        request.presentation.autopilot = note.clone();
+        let mut prompt = PermissionPrompt::new();
+        prompt.enqueue(Box::new(request), None);
+
+        let said: Vec<Note> = prompt
+            .notes()
+            .into_iter()
+            .filter(|said| {
+                note.as_ref()
+                    .is_some_and(|note| said.text == card_note(note))
+            })
+            .collect();
+
+        assert_eq!(
+            said,
+            note.iter()
+                .map(|note| Note::muted(card_note(note)))
+                .collect::<Vec<_>>()
+        );
     }
 }

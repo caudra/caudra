@@ -5064,6 +5064,7 @@ mod tests {
                 task_event: None,
                 peer_event: None,
                 automation_event: None,
+                autopilot_event: None,
             };
             assert!(fixture.tasks.owns_event(&envelope));
             fixture.tasks.rearm();

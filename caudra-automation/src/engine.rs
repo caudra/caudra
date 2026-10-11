@@ -1713,6 +1713,7 @@ mod tests {
                 status: SessionStatus::Idle,
                 status_since: AT,
                 goal: None,
+                autopilot: None,
                 cost: None,
                 groups: Vec::new(),
                 work: WorkView::default(),
@@ -1988,6 +1989,7 @@ mod tests {
     #[test_case(FailureKind::Timeout, r#"http(#{ method: "GET", url: "https://api.example.com/v1" })"#; "timeout")]
     #[test_case(FailureKind::Transport, r#"http(#{ method: "GET", url: "https://api.example.com/v1" })"#; "transport")]
     #[test_case(FailureKind::GoalActive, r#"set_goal("Ship it")"#; "goal_active")]
+    #[test_case(FailureKind::GoalOwnedByAutopilot, r#"set_goal("Ship it", #{ replace: true })"#; "goal_owned_by_autopilot")]
     #[test_case(FailureKind::Refused, r#"start_workflow("review-changes", #{})"#; "workflow_refused")]
     fn failures_bind_their_kind_and_untrusted_message(kind: FailureKind, call: &str) {
         let body = format!(

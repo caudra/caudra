@@ -197,6 +197,19 @@ pub const MAX_AUTOMATION_TURNS_PER_HOUR: u32 = 600;
 pub const MIN_MAX_UNATTENDED_TURNS: u32 = 1;
 pub const MAX_MAX_UNATTENDED_TURNS: u32 = 10_000;
 pub const DEFAULT_ALLOW_PRIVATE_NETWORK: bool = false;
+const AUTOPILOT_SECTION: &str = "autopilot";
+const MAX_CONTINUATIONS_FIELD: &str = "max_continuations";
+const MAX_COST_FIELD: &str = "max_cost";
+const MAX_MINUTES_FIELD: &str = "max_minutes";
+const ERROR_RETRIES_FIELD: &str = "error_retries";
+pub const DEFAULT_AUTOPILOT_MAX_CONTINUATIONS: u32 = 100;
+pub const MIN_AUTOPILOT_MAX_CONTINUATIONS: u32 = 1;
+pub const MAX_AUTOPILOT_MAX_CONTINUATIONS: u32 = 10_000;
+pub const DEFAULT_AUTOPILOT_ERROR_RETRIES: u32 = 5;
+pub const MIN_AUTOPILOT_ERROR_RETRIES: u32 = 0;
+pub const MAX_AUTOPILOT_ERROR_RETRIES: u32 = 20;
+pub const MIN_AUTOPILOT_MAX_MINUTES: u32 = 1;
+pub const MAX_AUTOPILOT_MAX_MINUTES: u32 = 525_600;
 
 pub const DEFAULT_BUILTINS: &[&str] = &[
     "bash",
@@ -612,6 +625,10 @@ pub enum ConfigError {
         "invalid project config: [automations] is global-only; move it to the global caudra.toml"
     )]
     ProjectAutomations,
+    #[error(
+        "invalid project config: [autopilot] is global-only; move it to the global caudra.toml"
+    )]
+    ProjectAutopilot,
     #[error(transparent)]
     Decisions(#[from] decisions::DecisionsConfigError),
     #[error("invalid config: agent.steering.{field}: {message}")]
@@ -630,6 +647,12 @@ pub enum ConfigError {
         value: u32,
         min: u32,
         max: u32,
+    },
+    #[error("invalid config: {section}.{field} = {value} must be positive and finite")]
+    OutOfRangeFloat {
+        section: &'static str,
+        field: &'static str,
+        value: f64,
     },
     #[error("invalid config: always_thinking: {0}")]
     Thinking(#[from] ThinkingParseError),
@@ -736,6 +759,9 @@ pub struct RawConfig {
     #[serde(skip)]
     #[doc(hidden)]
     pub project_automations_override: bool,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub project_autopilot_override: bool,
     pub always_fast: Option<bool>,
     pub always_thinking: Option<AlwaysThinking>,
     #[serde(default)]
@@ -748,6 +774,9 @@ pub struct RawConfig {
     /// `Some` for any `[automations]` table, even an empty one, so a project
     /// layer that holds one is refused.
     pub automations: Option<AutomationsFileConfig>,
+    /// `Some` for any `[autopilot]` table, even an empty one, so a project
+    /// layer that holds one is refused.
+    pub autopilot: Option<AutopilotFileConfig>,
     pub plugins: HashMap<String, PluginFileConfig>,
 }
 
@@ -762,6 +791,8 @@ impl RawConfig {
             .or(overlay.always_auto.map(|_| "always_auto"));
         self.project_automations_override |=
             overlay.project_automations_override || overlay.automations.is_some();
+        self.project_autopilot_override |=
+            overlay.project_autopilot_override || overlay.autopilot.is_some();
         self.decisions.restrict(mem::take(&mut overlay.decisions));
         let messaging = &mut overlay.agent.messaging;
         self.project_message_history_override = self
@@ -813,9 +844,13 @@ impl RawConfig {
             .project_message_history_override
             .or(overlay.project_message_history_override);
         self.project_automations_override |= overlay.project_automations_override;
+        self.project_autopilot_override |= overlay.project_autopilot_override;
         merge_option!(self, overlay, always_yolo, always_auto);
         if let Some(automations) = overlay.automations.take() {
             self.automations.get_or_insert_default().merge(automations);
+        }
+        if let Some(autopilot) = overlay.autopilot.take() {
+            self.autopilot.get_or_insert_default().merge(autopilot);
         }
         self.decisions.overlay(mem::take(&mut overlay.decisions));
         self.merge_shared(overlay);
@@ -848,6 +883,9 @@ impl RawConfig {
         if self.project_automations_override {
             return Err(ConfigError::ProjectAutomations);
         }
+        if self.project_autopilot_override {
+            return Err(ConfigError::ProjectAutopilot);
+        }
         self.validate_plugin_tables()?;
         let index_max_file_size_mb = self.index_max_file_size_mb()?;
         let task_max_concurrent = self.task_max_concurrent()?;
@@ -876,10 +914,12 @@ impl RawConfig {
             telemetry: self.telemetry,
             worktrees: self.worktrees,
             automations: AutomationsConfig::from_file(self.automations.unwrap_or_default()),
+            autopilot: AutopilotConfig::from_file(self.autopilot.unwrap_or_default()),
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::from_plugins(self.plugins),
         };
         config.automations.validate()?;
+        config.autopilot.validate()?;
         // Validate merged steering for every loader, without extending legacy field validation.
         config.agent.steering.validate()?;
         Ok(config)
@@ -2096,6 +2136,7 @@ pub struct Config {
     pub telemetry: TelemetryConfig,
     pub worktrees: WorktreesConfig,
     pub automations: AutomationsConfig,
+    pub autopilot: AutopilotConfig,
     pub permissions: PermissionsConfig,
     pub plugins: PluginsConfig,
 }
@@ -3489,6 +3530,132 @@ impl Default for AutomationsConfig {
     }
 }
 
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutopilotFileConfig {
+    pub max_continuations: Option<u32>,
+    pub max_cost: Option<f64>,
+    pub max_minutes: Option<u32>,
+    pub error_retries: Option<u32>,
+}
+
+impl AutopilotFileConfig {
+    fn merge(&mut self, overlay: Self) {
+        merge_option!(
+            self,
+            overlay,
+            max_continuations,
+            max_cost,
+            max_minutes,
+            error_retries
+        );
+    }
+}
+
+/// Session-wide limits on autopilot, set only in the global config so a
+/// repository cannot change them or start continuous runs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutopilotConfig {
+    pub max_continuations: u32,
+    pub max_cost: Option<f64>,
+    pub max_minutes: Option<u32>,
+    pub error_retries: u32,
+}
+
+impl AutopilotConfig {
+    pub const FIELDS: &[ConfigField] = &[
+        ConfigField {
+            name: MAX_CONTINUATIONS_FIELD,
+            ty: "u32",
+            default: ConfigValue::U64(DEFAULT_AUTOPILOT_MAX_CONTINUATIONS as u64),
+            min: Some(MIN_AUTOPILOT_MAX_CONTINUATIONS as u64),
+            max: Some(MAX_AUTOPILOT_MAX_CONTINUATIONS as u64),
+            env: None,
+            description: "Most continuations autopilot may send per engagement before it ends",
+        },
+        ConfigField {
+            name: MAX_COST_FIELD,
+            ty: "f64",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "Most spending in USD per autopilot engagement, counting API-billed spend only. Must be positive, and unset means no cap",
+        },
+        ConfigField {
+            name: MAX_MINUTES_FIELD,
+            ty: "u32",
+            default: ConfigValue::Unset,
+            min: Some(MIN_AUTOPILOT_MAX_MINUTES as u64),
+            max: Some(MAX_AUTOPILOT_MAX_MINUTES as u64),
+            env: None,
+            description: "Most wall-clock minutes per autopilot engagement while the session is open. Unset means no cap",
+        },
+        ConfigField {
+            name: ERROR_RETRIES_FIELD,
+            ty: "u32",
+            default: ConfigValue::U64(DEFAULT_AUTOPILOT_ERROR_RETRIES as u64),
+            min: Some(MIN_AUTOPILOT_ERROR_RETRIES as u64),
+            max: Some(MAX_AUTOPILOT_ERROR_RETRIES as u64),
+            env: None,
+            description: "Retries for transient provider errors during an autopilot engagement",
+        },
+    ];
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        check_range(
+            AUTOPILOT_SECTION,
+            MAX_CONTINUATIONS_FIELD,
+            self.max_continuations,
+            MIN_AUTOPILOT_MAX_CONTINUATIONS,
+            MAX_AUTOPILOT_MAX_CONTINUATIONS,
+        )?;
+        check_range(
+            AUTOPILOT_SECTION,
+            ERROR_RETRIES_FIELD,
+            self.error_retries,
+            MIN_AUTOPILOT_ERROR_RETRIES,
+            MAX_AUTOPILOT_ERROR_RETRIES,
+        )?;
+        if let Some(cost) = self.max_cost
+            && (!cost.is_finite() || cost <= 0.0)
+        {
+            return Err(ConfigError::OutOfRangeFloat {
+                section: AUTOPILOT_SECTION,
+                field: MAX_COST_FIELD,
+                value: cost,
+            });
+        }
+        if let Some(minutes) = self.max_minutes {
+            check_range(
+                AUTOPILOT_SECTION,
+                MAX_MINUTES_FIELD,
+                minutes,
+                MIN_AUTOPILOT_MAX_MINUTES,
+                MAX_AUTOPILOT_MAX_MINUTES,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn from_file(f: AutopilotFileConfig) -> Self {
+        Self {
+            max_continuations: f
+                .max_continuations
+                .unwrap_or(DEFAULT_AUTOPILOT_MAX_CONTINUATIONS),
+            max_cost: f.max_cost,
+            max_minutes: f.max_minutes,
+            error_retries: f.error_retries.unwrap_or(DEFAULT_AUTOPILOT_ERROR_RETRIES),
+        }
+    }
+}
+
+impl Default for AutopilotConfig {
+    fn default() -> Self {
+        Self::from_file(AutopilotFileConfig::default())
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PluginsConfig {
     pub enabled: bool,
@@ -4198,6 +4365,9 @@ mod tests {
     const UNKNOWN_FIELD_ERROR: &str = "unknown field";
     const CUSTOM_TURNS_PER_HOUR: u32 = 30;
     const CUSTOM_UNATTENDED_TURNS: u32 = 50;
+    const AUTOPILOT_TABLE: &str = "[autopilot]";
+    const CUSTOM_AUTOPILOT_CONTINUATIONS: u32 = 40;
+    const CUSTOM_AUTOPILOT_COST: f64 = 2.5;
     const DECISION_ENV_CHILD: &str = "CAUDRA_TEST_DECISION_ENV_CHILD";
     const DECISION_ENV_TEST: &str = "tests::decision_protocol_environment";
 
@@ -4553,6 +4723,125 @@ mod tests {
                 turns_per_hour: CUSTOM_TURNS_PER_HOUR,
                 max_unattended_turns: Some(CUSTOM_UNATTENDED_TURNS),
                 allow_private_network: true,
+            }
+        );
+    }
+
+    fn autopilot_layer(options: &str) -> RawConfig {
+        toml::from_str(&format!("{AUTOPILOT_TABLE}\n{options}")).unwrap()
+    }
+
+    #[test_case(""; "no_table")]
+    #[test_case(AUTOPILOT_TABLE; "empty_table")]
+    fn autopilot_defaults_to_continuations_and_retries_only(source: &str) {
+        let raw: RawConfig = toml::from_str(source).unwrap();
+        assert_eq!(
+            raw.into_config(false).unwrap().autopilot,
+            AutopilotConfig {
+                max_continuations: DEFAULT_AUTOPILOT_MAX_CONTINUATIONS,
+                max_cost: None,
+                max_minutes: None,
+                error_retries: DEFAULT_AUTOPILOT_ERROR_RETRIES,
+            }
+        );
+    }
+
+    #[test_case(MAX_CONTINUATIONS_FIELD, MIN_AUTOPILOT_MAX_CONTINUATIONS; "continuations_minimum")]
+    #[test_case(MAX_CONTINUATIONS_FIELD, MAX_AUTOPILOT_MAX_CONTINUATIONS; "continuations_maximum")]
+    #[test_case(MAX_MINUTES_FIELD, MIN_AUTOPILOT_MAX_MINUTES; "minutes_minimum")]
+    #[test_case(MAX_MINUTES_FIELD, MAX_AUTOPILOT_MAX_MINUTES; "minutes_maximum")]
+    #[test_case(ERROR_RETRIES_FIELD, MIN_AUTOPILOT_ERROR_RETRIES; "retries_minimum")]
+    #[test_case(ERROR_RETRIES_FIELD, MAX_AUTOPILOT_ERROR_RETRIES; "retries_maximum")]
+    fn autopilot_limits_accept_their_bounds(field: &str, value: u32) {
+        let autopilot = autopilot_layer(&format!("{field} = {value}"))
+            .into_config(false)
+            .unwrap()
+            .autopilot;
+        let resolved = match field {
+            MAX_CONTINUATIONS_FIELD => Some(autopilot.max_continuations),
+            MAX_MINUTES_FIELD => autopilot.max_minutes,
+            _ => Some(autopilot.error_retries),
+        };
+        assert_eq!(resolved, Some(value));
+    }
+
+    #[test_case(MAX_CONTINUATIONS_FIELD, MIN_AUTOPILOT_MAX_CONTINUATIONS - 1; "continuations_below_minimum")]
+    #[test_case(MAX_CONTINUATIONS_FIELD, MAX_AUTOPILOT_MAX_CONTINUATIONS + 1; "continuations_above_maximum")]
+    #[test_case(MAX_MINUTES_FIELD, MIN_AUTOPILOT_MAX_MINUTES - 1; "minutes_below_minimum")]
+    #[test_case(MAX_MINUTES_FIELD, MAX_AUTOPILOT_MAX_MINUTES + 1; "minutes_above_maximum")]
+    #[test_case(ERROR_RETRIES_FIELD, MAX_AUTOPILOT_ERROR_RETRIES + 1; "retries_above_maximum")]
+    fn autopilot_limits_out_of_range_are_rejected(field: &str, value: u32) {
+        let error = autopilot_layer(&format!("{field} = {value}"))
+            .into_config(false)
+            .err()
+            .expect("out-of-range autopilot limit");
+        assert!(
+            matches!(
+                error,
+                ConfigError::OutOfRange { section, field: refused, value: rejected, .. }
+                    if section == AUTOPILOT_SECTION && refused == field && rejected == value
+            ),
+            "{error}"
+        );
+    }
+
+    #[test_case(0.0; "zero")]
+    #[test_case(-1.0; "negative")]
+    #[test_case(f64::INFINITY; "infinite")]
+    fn autopilot_cost_must_be_positive_and_finite(cost: f64) {
+        let mut raw = autopilot_layer("");
+        raw.autopilot.as_mut().unwrap().max_cost = Some(cost);
+        let error = raw
+            .into_config(false)
+            .err()
+            .expect("invalid autopilot cost");
+        assert!(
+            matches!(
+                error,
+                ConfigError::OutOfRangeFloat { section, field, .. }
+                    if section == AUTOPILOT_SECTION && field == MAX_COST_FIELD
+            ),
+            "{error}"
+        );
+    }
+
+    #[test_case("max_continuation = 5", UNKNOWN_FIELD_ERROR; "unknown_field")]
+    #[test_case("max_continuations = -1", UNSIGNED_REMINDER_ERROR; "negative_continuations")]
+    fn invalid_autopilot_config_is_rejected(source: &str, expected: &str) {
+        let error = toml::from_str::<RawConfig>(&format!("{AUTOPILOT_TABLE}\n{source}"))
+            .expect_err("invalid autopilot option");
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    #[test_case(""; "empty_table")]
+    #[test_case("max_continuations = 1"; "lower_cap")]
+    #[test_case("max_cost = 1.0"; "cost_cap")]
+    fn project_layers_cannot_hold_autopilot(options: &str) {
+        let mut raw = RawConfig::default();
+        raw.merge(autopilot_layer(options));
+        raw.merge_global(RawConfig::default());
+        assert!(matches!(
+            raw.into_config(false),
+            Err(ConfigError::ProjectAutopilot)
+        ));
+    }
+
+    #[test]
+    fn global_layers_merge_autopilot_field_by_field() {
+        let mut raw = autopilot_layer(&format!(
+            "{MAX_CONTINUATIONS_FIELD} = {CUSTOM_AUTOPILOT_CONTINUATIONS}"
+        ));
+        raw.merge_global(autopilot_layer(&format!(
+            "{MAX_COST_FIELD} = {CUSTOM_AUTOPILOT_COST}"
+        )));
+        raw.merge(RawConfig::default());
+        assert_eq!(
+            raw.into_config(false).unwrap().autopilot,
+            AutopilotConfig {
+                max_continuations: CUSTOM_AUTOPILOT_CONTINUATIONS,
+                max_cost: Some(CUSTOM_AUTOPILOT_COST),
+                max_minutes: None,
+                error_retries: DEFAULT_AUTOPILOT_ERROR_RETRIES,
             }
         );
     }
@@ -5618,6 +5907,7 @@ mod tests {
             telemetry: TelemetryConfig::default(),
             worktrees: WorktreesConfig::default(),
             automations: AutomationsConfig::default(),
+            autopilot: AutopilotConfig::default(),
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::default(),
         };

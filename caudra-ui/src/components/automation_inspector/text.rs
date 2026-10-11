@@ -165,6 +165,7 @@ fn input_text(kind: InputKind) -> &'static str {
         InputKind::Auth => "a login",
         InputKind::Plugin => "a plugin prompt",
         InputKind::Messages => "held messages",
+        InputKind::Autopilot => "a prompt autopilot left to the user",
     }
 }
 

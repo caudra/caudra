@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -17,6 +16,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use strum::Display;
 
+use super::judging::{
+    self, INITIAL_TRANSCRIPT_PERCENT, ONE_JSON_OBJECT_ERROR, RETRY_TRANSCRIPT_PERCENT,
+    TOOL_CALL_LINE, ToolBlock, correction, drop_oldest_rounds, json_object, result_line,
+    truncate_output,
+};
 use super::run::estimate_message_tokens;
 use super::streaming::stream_silent_with_retry;
 use crate::cancel::CancelToken;
@@ -29,15 +33,13 @@ const EVALUATOR_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(30);
 const EVALUATOR_OUTPUT_TOKENS: u32 = 4_096;
 const MAX_EVALUATOR_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_VALIDATION_ATTEMPTS: u32 = 3;
-const INITIAL_TRANSCRIPT_PERCENT: u32 = 50;
-const RETRY_TRANSCRIPT_PERCENT: u32 = 25;
-const TOOL_CALL_LINE: &str = "[tool call]";
-const TOOL_RESULT_LINE: &str = "[tool result]";
-const TOOL_ERROR_LINE: &str = "[tool error]";
-const UNNAMED_TOOL: &str = "tool";
 const NO_TEXT_ERROR: &str = "evaluator returned no text";
 const OVERSIZE_ERROR: &str = "evaluator response was too large";
 const TOOL_CALL_ERROR: &str = "evaluator attempted to call a tool instead of answering";
+pub(crate) const GOAL_EVALUATOR_ROLE: JudgeRole = JudgeRole {
+    purpose: ModelPurpose::Goal,
+    label: "goal evaluator",
+};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum GoalError {
@@ -421,16 +423,31 @@ pub(crate) struct EvaluationError {
     pub model: String,
 }
 
+/// A side model that judges the conversation: the purpose its binding is read
+/// under, and the name its resolution errors give it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct JudgeRole {
+    pub purpose: ModelPurpose,
+    pub label: &'static str,
+}
+
 #[derive(Clone)]
 pub(crate) struct ResolvedEvaluator {
-    /// The Goal binding this was resolved from, or `None` when nothing is bound
-    /// and the default rule chose the model.
+    /// The binding this was resolved from, or `None` when nothing is bound and
+    /// the default rule chose the model.
     pub binding: Option<Binding>,
     pub provider: Arc<dyn Provider>,
     pub model: Model,
 }
 
 impl ResolvedEvaluator {
+    /// Only an exactly bound model is worth keeping for the next resolution:
+    /// any other binding can resolve elsewhere as the conversation model
+    /// changes.
+    pub(crate) fn cacheable(&self) -> bool {
+        matches!(self.binding, Some(Binding::Exact(_)))
+    }
+
     /// Only an unbound evaluator retreats to the chat model. A model the user
     /// named is reported instead, since silently substituting it would hide the
     /// choice they made.
@@ -454,24 +471,32 @@ impl ResolvedEvaluator {
     }
 }
 
+/// Resolves `role`'s model under `binding`, reusing `cached`'s provider when it
+/// was resolved from that same exact binding.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_evaluator(
+    role: JudgeRole,
     current_provider: &Arc<dyn Provider>,
     current_model: &Model,
     binding: Option<Binding>,
     timeouts: Timeouts,
     model_policy: &ModelPolicy,
     cancel: &CancelToken,
-    cached_provider: Option<Arc<dyn Provider>>,
+    cached: Option<&ResolvedEvaluator>,
 ) -> Result<ResolvedEvaluator, AgentError> {
+    let cached_provider = cached
+        .filter(|cached| cached.cacheable() && cached.binding == binding)
+        .map(|cached| Arc::clone(&cached.provider));
     let current_provider = Arc::clone(current_provider);
     let current_model = current_model.clone();
     let current_slug = Arc::clone(&current_model.provider);
     let model_policy = model_policy.clone();
     let bound = binding.clone();
     let (model, provider) = initialization_with_limits(cancel, async move {
-        let mut model =
-            smol::unblock(move || evaluator_model(bound.as_ref(), &current_model, &model_policy))
-                .await?;
+        let mut model = smol::unblock(move || {
+            evaluator_model(role, bound.as_ref(), &current_model, &model_policy)
+        })
+        .await?;
         let provider: Arc<dyn Provider> = if model.provider == current_slug {
             current_provider.adjust_model(&mut model);
             current_provider
@@ -519,15 +544,16 @@ async fn initialization_with_limits<T>(
 }
 
 fn evaluator_model(
+    role: JudgeRole,
     binding: Option<&Binding>,
     current_model: &Model,
     model_policy: &ModelPolicy,
 ) -> Result<Model, AgentError> {
-    Model::resolve_binding(ModelPurpose::Goal, binding, current_model, model_policy).map_err(
-        |error| AgentError::Config {
-            message: format!("cannot resolve the goal evaluator model: {error}"),
-        },
-    )
+    Model::resolve_binding(role.purpose, binding, current_model, model_policy).map_err(|error| {
+        AgentError::Config {
+            message: format!("cannot resolve the {} model: {error}", role.label),
+        }
+    })
 }
 
 #[derive(Deserialize)]
@@ -636,7 +662,7 @@ impl Evaluator<'_> {
     }
 }
 
-async fn evaluator_request(
+pub(crate) async fn evaluator_request(
     provider: &dyn Provider,
     model: &Model,
     messages: &[Message],
@@ -673,41 +699,16 @@ async fn evaluator_request(
 /// evaluator declares no tools while replaying a conversation full of them.
 ///
 /// Message count is preserved, which the omission notice in
-/// [`transcript_within_budget`] counts on, and no tool pair survives for
-/// [`truncate_oldest_round`] to orphan.
+/// [`transcript_within_budget`] counts on.
 fn flatten_tool_blocks(messages: &mut [Message]) {
-    let names: HashMap<String, String> = messages
-        .iter()
-        .flat_map(|message| message.tool_uses())
-        .map(|(id, name, _)| (id.to_owned(), name.to_owned()))
-        .collect();
-
-    for message in messages {
-        for block in &mut message.content {
-            let text = match block {
-                ContentBlock::ToolUse { name, input, .. } => {
-                    format!("{TOOL_CALL_LINE} {name} {input}")
-                }
-                ContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                    ..
-                } => {
-                    let line = if *is_error {
-                        TOOL_ERROR_LINE
-                    } else {
-                        TOOL_RESULT_LINE
-                    };
-                    // Unknown once the owning call is truncated away.
-                    let name = names.get(tool_use_id).map_or(UNNAMED_TOOL, String::as_str);
-                    format!("{line} {name}\n{content}")
-                }
-                _ => continue,
-            };
-            *block = ContentBlock::Text { text };
-        }
-    }
+    judging::flatten_tool_blocks(messages, |block| match block {
+        ToolBlock::Call { name, input } => format!("{TOOL_CALL_LINE} {name} {input}"),
+        ToolBlock::Result {
+            name,
+            content,
+            is_error,
+        } => format!("{} {name}\n{content}", result_line(is_error)),
+    });
 }
 
 fn transcript_within_budget(history: &[Message], model: &Model, percent: u32) -> Vec<Message> {
@@ -715,13 +716,9 @@ fn transcript_within_budget(history: &[Message], model: &Model, percent: u32) ->
     // Before budgeting, so the estimate measures what is actually sent.
     flatten_tool_blocks(&mut messages);
     let budget = model.context_window.saturating_mul(percent) / 100;
-    // Rescans the whole transcript per iteration. The token counts themselves
-    // are cached, so an iteration hashes the transcript rather than tokenizing
-    // it, but the walk is still proportional to its size. A running total is
-    // not worth the state here, and this runs once per goal evaluation rather
-    // than per turn.
-    while estimate_message_tokens(&messages) > budget && truncate_oldest_round(&mut messages) {}
-    let omitted = history.len().saturating_sub(messages.len());
+    let omitted = drop_oldest_rounds(&mut messages, |messages| {
+        estimate_message_tokens(messages) <= budget
+    });
     if omitted > 0 {
         messages.insert(
             0,
@@ -733,29 +730,6 @@ fn transcript_within_budget(history: &[Message], model: &Model, percent: u32) ->
     messages
 }
 
-fn truncate_oldest_round(messages: &mut Vec<Message>) -> bool {
-    if messages.len() <= 1 {
-        return false;
-    }
-    let next_user = messages
-        .iter()
-        .enumerate()
-        .skip(1)
-        .find(|(_, message)| matches!(message.role, caudra_providers::Role::User))
-        .map(|(index, _)| index)
-        .unwrap_or(1);
-    messages.drain(..next_user);
-    while messages.len() > 1
-        && matches!(
-            messages.first().map(|message| &message.role),
-            Some(caudra_providers::Role::Assistant)
-        )
-    {
-        messages.remove(0);
-    }
-    true
-}
-
 fn evaluator_prompt(
     condition: &str,
     evaluation: u32,
@@ -765,13 +739,8 @@ fn evaluator_prompt(
     let condition = serde_json::to_string(condition).unwrap_or_else(|_| "\"\"".into());
     let mut prompt = format!("Evaluation number: {evaluation}\nCondition: {condition}");
     if let Some(error) = previous_error {
-        prompt.push_str(&format!(
-            "\n\nYour previous response was invalid ({error})."
-        ));
-        if let Some(output) = previous_output {
-            prompt.push_str(&format!(" Previous response:\n{output}"));
-        }
-        prompt.push_str("\n\nReturn only the required JSON object.");
+        prompt.push_str("\n\n");
+        prompt.push_str(&correction(error, previous_output));
     }
     prompt
 }
@@ -800,12 +769,7 @@ fn response_text(message: &Message) -> Result<String, String> {
 }
 
 fn parse_evaluation(output: &str) -> Result<(GoalVerdict, String), String> {
-    let output = output.trim();
-    let candidate = strip_json_fence(output).unwrap_or(output);
-    if !candidate.starts_with('{') || !candidate.ends_with('}') {
-        return Err("response must contain exactly one JSON object".into());
-    }
-
+    let candidate = json_object(output).ok_or_else(|| ONE_JSON_OBJECT_ERROR.to_owned())?;
     let value =
         serde_json::from_str::<EvaluationWire>(candidate).map_err(|error| error.to_string())?;
     let reason = value.reason.trim();
@@ -823,17 +787,6 @@ fn parse_evaluation(output: &str) -> Result<(GoalVerdict, String), String> {
         GoalVerdict::NotMet
     };
     Ok((verdict, reason.to_string()))
-}
-
-fn strip_json_fence(output: &str) -> Option<&str> {
-    let output = output
-        .strip_prefix("```json")
-        .or_else(|| output.strip_prefix("```"))?;
-    output.strip_suffix("```").map(str::trim)
-}
-
-fn truncate_output(output: &str) -> String {
-    output.chars().take(2_000).collect()
 }
 
 /// Saturates rather than wraps: a goal left open for longer than `u64`
@@ -902,6 +855,7 @@ pub(crate) fn is_unrecoverable(error: &AgentError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::judging::{TOOL_ERROR_LINE, TOOL_RESULT_LINE, UNNAMED_TOOL};
     use caudra_providers::provider::BoxFuture;
     use caudra_providers::{
         CacheKey, ImageMediaType, ImageSource, ModelInfo, ProviderEvent, Role, StreamResponse,
@@ -1125,6 +1079,7 @@ mod tests {
             let current = Model::from_spec(CHAT_SPEC).unwrap();
 
             let auto = resolve_evaluator(
+                GOAL_EVALUATOR_ROLE,
                 &provider,
                 &current,
                 None,
@@ -1150,6 +1105,7 @@ mod tests {
             let current = Model::from_spec(CHAT_SPEC).unwrap();
 
             let exact = resolve_evaluator(
+                GOAL_EVALUATOR_ROLE,
                 &provider,
                 &current,
                 Some(Binding::Exact(OPUS_SPEC.into())),
@@ -1260,6 +1216,7 @@ mod tests {
             let policy = ModelPolicy::new(&[], &["anthropic/claude-opus*".into()]).unwrap();
 
             let disallowed = resolve_evaluator(
+                GOAL_EVALUATOR_ROLE,
                 &provider,
                 &current,
                 Some(Binding::Exact("anthropic/claude-opus-4-6".into())),

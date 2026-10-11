@@ -121,6 +121,7 @@ A state is one of `pending`, `leased`, `pausing`, `paused`, `completed`, `failed
 | `--exit-on-done` | yes | n/a (always exits) | n/a |
 | `--name`, `--topic`, `--receive-broadcasts`, `--group` | yes | no | no |
 | `--automation` | yes | no | no |
+| `--autopilot` | yes | yes | yes |
 | `--image` | no (use Ctrl+V paste) | yes | via wire protocol |
 | `--verbose`, `--output-format` | no | yes | stream only |
 | `--system-prompt`, `--append-system-prompt` | no | no | yes |
@@ -156,6 +157,7 @@ A state is one of `pending`, `leased`, `pausing`, `paused`, `completed`, `failed
 | `--receive-broadcasts` | Opt the initial TUI session in to [broadcasts](/docs/messaging/#topics-and-broadcasts). Needs `experimental.cross_session_messaging` |
 | `--group <GROUP>` | Let the initial TUI session take work from an existing [consumer group](/docs/messaging/#consumer-groups), in addition to its saved memberships (repeatable). Startup fails when the group does not exist. Needs `experimental.cross_session_messaging` |
 | `--automation <NAME[=JSON\|@FILE]>` | Arm an [automation](/docs/automations/#arm-one) in the initial TUI session (repeatable, once per name). `NAME=JSON` gives its args as a JSON object, and `NAME=@FILE` reads the object from a file. Without args, the stored args or the defaults apply. SDK hosts arm with the [`automation_arm` control](/docs/headless/#arming) instead. Needs `experimental.automations` |
+| `--autopilot` | Engage [autopilot](/docs/autopilot/) in the session Caudra starts with. With `-p`, a `/goal <condition>` prompt becomes the goal autopilot owns. `/reload` and `/cd` keep the engagement and its budget. Refused by `caudra acp`. Needs `experimental.autopilot` |
 | `--allowed-tools <LIST>` | Comma-separated allow list (PascalCase or snake_case) |
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
 | `--system-prompt-profile <NAME>` | Select a profile from the user `system-prompts` config directory. See [System Prompt Profiles](/docs/system-prompts/) |
@@ -444,7 +446,7 @@ caudra models --jobs --model anthropic/claude-sonnet-4-6
 
 The plain command streams every model Caudra currently knows about from built-ins, discovery, and catalogs. Each line starts with its model spec and may end with a Small, Fast, or Best supply marker. Warnings from discovery go to stderr.
 
-`--jobs` prints a table with **Job**, **Binding**, and **Resolved** columns for Chat, Plan, Subagent, Compact, Title, Goal, Extract, Memory, Fast, and Best. The optional global `--model` sets the anchor used to resolve the table and may appear before or after `models`. Without it, the normal saved, configured, or detected model becomes the anchor. It resolves from configuration and locally available model metadata, avoiding the all-provider discovery pass used by the plain command. See [Providers](/docs/providers/#model-jobs) for bindings, defaults, and marker meanings.
+`--jobs` prints a table with **Job**, **Binding**, and **Resolved** columns for Chat, Plan, Subagent, Compact, Title, Goal, Extract, Memory, Autopilot, Fast, and Best. The optional global `--model` sets the anchor used to resolve the table and may appear before or after `models`. Without it, the normal saved, configured, or detected model becomes the anchor. It resolves from configuration and locally available model metadata, avoiding the all-provider discovery pass used by the plain command. See [Providers](/docs/providers/#model-jobs) for bindings, defaults, and marker meanings.
 
 ### `caudra mcp`
 

@@ -54,7 +54,8 @@ use caudra_automation::snapshot::{AutomationEvent, SettleBlocker};
 use caudra_config::providers::ProvidersConfig;
 use caudra_config::sandbox::SandboxName;
 use caudra_config::{
-    AutomationsConfig, Feature, ModelPolicy, SnapshotsConfig, UiConfig, fail_closed_permissions,
+    AutomationsConfig, AutopilotConfig, Feature, ModelPolicy, SnapshotsConfig, UiConfig,
+    fail_closed_permissions,
 };
 use caudra_docs::DocsLibrary;
 use caudra_lua::{
@@ -234,10 +235,13 @@ pub struct EventLoopParams {
     pub joined_groups: bool,
     /// `--automation` entries, armed in the session focused at launch only.
     pub launch_automations: Vec<ProfileArming>,
+    /// `--autopilot`, engaged in the session focused at launch only.
+    pub launch_autopilot: bool,
     pub storage: StateDir,
     pub config: AgentConfig,
     pub settings_reloader: SettingsReloader,
     pub automations: AutomationsConfig,
+    pub autopilot: AutopilotConfig,
     pub ui_config: UiConfig,
     pub snapshots: SnapshotsConfig,
     /// Opens the change records of a local session's directory.
@@ -1115,6 +1119,7 @@ struct SpawnCtx {
     background_enabled: bool,
     config: AgentConfig,
     automations: AutomationsConfig,
+    autopilot: AutopilotConfig,
     ui_config: UiConfig,
     snapshots: SnapshotsConfig,
     change_factory: Option<ChangeServiceFactory>,
@@ -1444,6 +1449,7 @@ impl SpawnCtx {
         app.state.system_prompt_profile = system_prompt_profile;
         app.state.system_prompt_profile_override = self.prompt_profile_override.is_some();
         handles.apply_to_app(&mut app);
+        app.restore_autopilot(self.autopilot.clone());
         if restore_session {
             app.restore_resumed_session();
         }
@@ -1760,10 +1766,12 @@ impl<'t> EventLoop<'t> {
             mut startup_warnings,
             joined_groups,
             launch_automations,
+            launch_autopilot,
             storage,
             config,
             settings_reloader,
             automations,
+            autopilot,
             ui_config,
             snapshots,
             change_factory,
@@ -1863,6 +1871,7 @@ impl<'t> EventLoop<'t> {
             background_enabled: !exit_on_done,
             config,
             automations,
+            autopilot,
             ui_config,
             snapshots,
             change_factory,
@@ -1930,6 +1939,9 @@ impl<'t> EventLoop<'t> {
         }
         let focused = focused.min(runtimes.len() - 1);
         let app = &mut runtimes[focused].app;
+        if launch_autopilot {
+            app.engage_autopilot(false);
+        }
         app.install_initial_seed(initial_seed);
         app.exit_on_done = exit_on_done;
         let show_login =
@@ -2998,6 +3010,9 @@ impl<'t> EventLoop<'t> {
         };
         let mut selected = None;
         for rt in &mut self.sessions {
+            if let Some(notice) = rt.app.take_autopilot_notice() {
+                rt.notifications.pending_notice = Some(notice);
+            }
             let candidate = if self.program_status_reporter.is_some() {
                 rt.notifications
                     .reconcile_program_status(self.terminal_focused)
@@ -5206,6 +5221,7 @@ mod tests {
                 ..Default::default()
             },
             automations: AutomationsConfig::default(),
+            autopilot: AutopilotConfig::default(),
             ui_config: UiConfig::default(),
             snapshots: SnapshotsConfig::default(),
             change_factory: None,

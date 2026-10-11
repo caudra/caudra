@@ -1,6 +1,6 @@
-use super::{PermissionAnswer, PermissionManager, PermissionRequest};
-use crate::CancelToken;
-use crate::{AgentEvent, EventSender};
+use super::{AutopilotNote, PermissionAnswer, PermissionManager, PermissionRequest};
+use crate::types::Answerer;
+use crate::{AgentEvent, CancelToken, CancelTrigger, EventSender};
 use event_listener::Event;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -74,8 +74,42 @@ impl Drop for PendingRegistration<'_> {
             let _ = self.event_tx.send(AgentEvent::PermissionRequestResolved {
                 request_id: self.request_id.to_owned(),
                 source_request_id: String::new(),
+                by: None,
             });
         }
+    }
+}
+
+impl PendingRegistration<'_> {
+    /// Shows what autopilot is doing about this prompt, on the waiter's copy
+    /// and on the pending one, and tells the frontends. `false` once the
+    /// prompt is being answered or is gone.
+    pub(super) fn note_autopilot(
+        &self,
+        request: &mut PermissionRequest,
+        note: Option<AutopilotNote>,
+    ) -> bool {
+        {
+            let mut pending = self.manager.pending();
+            let Some(candidate) = pending
+                .get_mut(&self.manager.id)
+                .and_then(|requests| requests.get_mut(self.request_id))
+                .filter(|candidate| {
+                    !candidate.answering
+                        && !candidate.abandoned
+                        && candidate.sender.same_channel(&self.sender)
+                })
+            else {
+                return false;
+            };
+            candidate.request.presentation.autopilot.clone_from(&note);
+            request.presentation.autopilot = note;
+        }
+        self.event_tx
+            .send(AgentEvent::PermissionRequestUpdated(Box::new(
+                request.clone(),
+            )))
+            .is_ok()
     }
 }
 
@@ -86,13 +120,18 @@ pub(super) struct PendingPermission {
     pub(super) context_revision: u64,
     pub(super) answering: bool,
     pub(super) abandoned: bool,
+    /// A human took the prompt, so autopilot may no longer answer it.
+    pub(super) claimed_by_human: bool,
     pub(super) cancel: CancelToken,
+    /// Stops autopilot's call for this prompt. It fires when a human claims
+    /// the prompt, and when the entry is dropped, so settling stops it too.
+    pub(super) delegate_stop: Option<CancelTrigger>,
     pub(super) changed: flume::Sender<String>,
     pub(super) sender: flume::Sender<PendingDecision>,
 }
 
 pub(super) enum PendingDecision {
-    Explicit(PermissionAnswer),
+    Explicit(PermissionAnswer, Answerer),
     MatchedRule,
     PolicyDenied(String),
 }
@@ -125,6 +164,16 @@ impl PermissionManager {
     }
 
     pub fn answer(&self, request_id: &str, answer: PermissionAnswer) -> bool {
+        self.answer_as(request_id, answer, Answerer::User)
+    }
+
+    /// The first answer wins. Autopilot may only answer for this one call,
+    /// and never a prompt a human has claimed.
+    pub fn answer_as(&self, request_id: &str, answer: PermissionAnswer, by: Answerer) -> bool {
+        let autopilot = by == Answerer::Autopilot;
+        if autopilot && !answer.autopilot_may_give() {
+            return false;
+        }
         let context_revision = self
             .context_revision
             .read()
@@ -139,6 +188,7 @@ impl PermissionManager {
             };
             if candidate.answering
                 || candidate.abandoned
+                || (autopilot && candidate.claimed_by_human)
                 || candidate.cancel.is_cancelled()
                 || candidate.context_revision != *context_revision
             {
@@ -165,9 +215,29 @@ impl PermissionManager {
         let answered = remove_pending(&mut self.pending(), self.id, request_id);
         drop(context_revision);
         if let Some(answered) = answered {
-            let _ = answered.sender.try_send(PendingDecision::Explicit(answer));
+            let _ = answered
+                .sender
+                .try_send(PendingDecision::Explicit(answer, by));
         }
         self.notify_policy_changed(request_id);
+        true
+    }
+
+    /// A human took the prompt: autopilot may no longer answer it, and its
+    /// call for it stops. `false` once the prompt is being answered or is gone.
+    pub fn claim(&self, request_id: &str) -> bool {
+        let mut pending = self.pending();
+        let Some(candidate) = pending
+            .get_mut(&self.id)
+            .and_then(|requests| requests.get_mut(request_id))
+            .filter(|candidate| !candidate.answering && !candidate.abandoned)
+        else {
+            return false;
+        };
+        candidate.claimed_by_human = true;
+        if let Some(delegate_stop) = candidate.delegate_stop.take() {
+            delegate_stop.cancel();
+        }
         true
     }
 
@@ -217,17 +287,29 @@ mod tests {
         pending_scope_enforcement, pending_tool_enforcement, persistent_manager, remember_command,
     };
     use crate::permissions::{
-        ComposedRow, PermissionAnswer, PermissionLifetime, PermissionManager, PermissionMode,
-        PermissionRequest, PermissionRowGrant, PermissionRuleRecord,
+        AutopilotNote, ComposedRow, PermissionAnswer, PermissionError, PermissionLifetime,
+        PermissionManager, PermissionMode, PermissionRequest, PermissionRowGrant,
+        PermissionRuleRecord,
     };
-    use crate::{AgentEvent, EventSender};
+    use crate::types::Answerer;
+    use crate::{AgentEvent, CancelToken, Envelope, EventSender};
     use caudra_config::{Effect, PermissionRule, PermissionsConfig, ToolKey};
     use caudra_storage::StateDir;
+    use smol::Task;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
+    type PendingCall = (Task<Result<(), PermissionError>>, flume::Receiver<Envelope>);
+
     const ANSWERED_CALL: &str = "answered-call";
+    const UNKNOWN_REQUEST: &str = "unknown-request";
+    const DENY_GUIDANCE: &str = "run the narrower test instead";
+    const ESCALATION_REASON: &str = "the command deletes the build cache";
+    const PROMPT_MISSING: &str = "the call must raise a prompt first";
+    const SECOND_ANSWER_WON: &str = "the second answer must lose to the first";
+    const DELEGATE_KEPT_RUNNING: &str = "autopilot's call must stop once the prompt is taken";
+    const NOTE_UPDATE_MISSING: &str = "an autopilot note must reach frontends as an update";
 
     #[test]
     fn duplicate_request_id_does_not_replace_the_pending_request() {
@@ -302,7 +384,8 @@ mod tests {
                 second_events.recv_async().await.unwrap().event,
                 AgentEvent::PermissionRequestResolved {
                     request_id,
-                    source_request_id
+                    source_request_id,
+                    by: None,
                 } if request_id == "second" && source_request_id == "first"
             ));
         });
@@ -416,7 +499,8 @@ mod tests {
                 second_events.recv_async().await.unwrap().event,
                 AgentEvent::PermissionRequestResolved {
                     request_id,
-                    source_request_id
+                    source_request_id,
+                    by: None,
                 } if request_id == "second" && source_request_id == "first"
             ));
             assert!(first.await.is_ok());
@@ -1239,7 +1323,9 @@ mod tests {
                 context_revision: *manager.context_revision.read().unwrap(),
                 answering: true,
                 abandoned: false,
+                claimed_by_human: false,
                 cancel: crate::CancelToken::none(),
+                delegate_stop: None,
                 changed,
                 sender: sender.clone(),
             },
@@ -1277,5 +1363,171 @@ mod tests {
         assert!(!manager.answer(CONTROLLED_REQUEST, PermissionAnswer::AllowSession));
         assert_eq!(manager.pending_count(), 0);
         assert!(manager.structured_conversation_rules_snapshot().is_empty());
+    }
+
+    fn pending_call(manager: &Arc<PermissionManager>) -> PendingCall {
+        pending_tool_enforcement(
+            Arc::clone(manager),
+            CONTROLLED_REQUEST,
+            "bash",
+            FIRST_COMMAND.into(),
+            serde_json::json!({"command": FIRST_COMMAND}),
+        )
+    }
+
+    fn guided_denial() -> PermissionAnswer {
+        PermissionAnswer::DenyWithGuidance(DENY_GUIDANCE.into())
+    }
+
+    #[test_case(Answerer::User, Answerer::Autopilot; "the_user_first")]
+    #[test_case(Answerer::Autopilot, Answerer::User; "autopilot_first")]
+    fn the_first_answer_wins_between_the_user_and_autopilot(first: Answerer, second: Answerer) {
+        smol::block_on(async {
+            let manager = Arc::new(default_mgr());
+            let (call, events) = pending_call(&manager);
+            events.recv_async().await.unwrap();
+
+            assert!(manager.answer_as(CONTROLLED_REQUEST, guided_denial(), first));
+            assert!(
+                !manager.answer_as(CONTROLLED_REQUEST, PermissionAnswer::AllowOnce, second),
+                "{SECOND_ANSWER_WON}"
+            );
+
+            let guidance = call.await.unwrap_err().guidance.unwrap();
+            assert_eq!(guidance.by, first);
+        });
+    }
+
+    enum Refusal {
+        Claimed,
+        Answering,
+        Remembered,
+    }
+
+    #[test_case(Refusal::Claimed; "a_human_claimed_it")]
+    #[test_case(Refusal::Answering; "an_answer_is_being_committed")]
+    #[test_case(Refusal::Remembered; "the_answer_would_file_a_rule")]
+    fn autopilot_is_refused_and_the_prompt_stays_for_the_user(refusal: Refusal) {
+        smol::block_on(async {
+            let manager = Arc::new(default_mgr());
+            let (call, events) = pending_call(&manager);
+            events.recv_async().await.unwrap();
+            let set_answering = |answering: bool| {
+                manager
+                    .pending()
+                    .get_mut(&manager.id)
+                    .unwrap()
+                    .get_mut(CONTROLLED_REQUEST)
+                    .unwrap()
+                    .answering = answering;
+            };
+            let answer = match refusal {
+                Refusal::Claimed => {
+                    assert!(manager.claim(CONTROLLED_REQUEST));
+                    PermissionAnswer::AllowOnce
+                }
+                Refusal::Answering => {
+                    set_answering(true);
+                    PermissionAnswer::AllowOnce
+                }
+                Refusal::Remembered => PermissionAnswer::AllowSession,
+            };
+
+            assert!(!manager.answer_as(CONTROLLED_REQUEST, answer, Answerer::Autopilot));
+
+            set_answering(false);
+            assert_eq!(manager.pending_count(), 1);
+            assert!(manager.answer(CONTROLLED_REQUEST, guided_denial()));
+            assert_eq!(call.await.unwrap_err().guidance.unwrap().by, Answerer::User);
+        });
+    }
+
+    #[test]
+    fn nothing_answers_or_claims_an_unknown_prompt() {
+        let manager = default_mgr();
+
+        assert!(!manager.claim(UNKNOWN_REQUEST));
+        assert!(!manager.answer_as(
+            UNKNOWN_REQUEST,
+            PermissionAnswer::AllowOnce,
+            Answerer::Autopilot
+        ));
+    }
+
+    #[test_case(true; "a_claim")]
+    #[test_case(false; "an_answer")]
+    fn the_delegate_call_for_a_prompt_stops_when_it_is_taken(claim: bool) {
+        smol::block_on(async {
+            let manager = Arc::new(default_mgr());
+            let (call, events) = pending_call(&manager);
+            events.recv_async().await.unwrap();
+            let (delegate_stop, delegate_cancel) = CancelToken::new();
+            manager
+                .pending()
+                .get_mut(&manager.id)
+                .unwrap()
+                .get_mut(CONTROLLED_REQUEST)
+                .unwrap()
+                .delegate_stop = Some(delegate_stop);
+
+            if claim {
+                assert!(manager.claim(CONTROLLED_REQUEST));
+                assert!(manager.pending()[&manager.id][CONTROLLED_REQUEST].claimed_by_human);
+            } else {
+                assert!(manager.answer(CONTROLLED_REQUEST, PermissionAnswer::Deny));
+            }
+
+            assert!(delegate_cancel.is_cancelled(), "{DELEGATE_KEPT_RUNNING}");
+            if claim {
+                assert!(manager.answer(CONTROLLED_REQUEST, PermissionAnswer::Deny));
+            }
+            assert!(call.await.is_err());
+        });
+    }
+
+    #[test]
+    fn an_autopilot_note_updates_the_pending_prompt_and_its_frontends() {
+        smol::block_on(async {
+            let manager = Arc::new(default_mgr());
+            let (call, events) = pending_call(&manager);
+            let AgentEvent::PermissionRequest(mut request) =
+                events.recv_async().await.unwrap().event
+            else {
+                panic!("{PROMPT_MISSING}");
+            };
+            let (event_tx, updates) = flume::unbounded();
+            let event_tx = EventSender::new(event_tx, 0);
+            let registration = super::PendingRegistration {
+                manager: &manager,
+                request_id: CONTROLLED_REQUEST,
+                sender: manager.pending()[&manager.id][CONTROLLED_REQUEST]
+                    .sender
+                    .clone(),
+                event_tx: &event_tx,
+            };
+            let note = AutopilotNote::Escalated {
+                reason: ESCALATION_REASON.into(),
+            };
+
+            assert!(registration.note_autopilot(&mut request, Some(note.clone())));
+
+            let AgentEvent::PermissionRequestUpdated(updated) = updates.try_recv().unwrap().event
+            else {
+                panic!("{NOTE_UPDATE_MISSING}");
+            };
+            assert_eq!(updated.presentation.autopilot.as_ref(), Some(&note));
+            assert_eq!(
+                manager
+                    .pending_request(CONTROLLED_REQUEST)
+                    .unwrap()
+                    .presentation
+                    .autopilot,
+                Some(note)
+            );
+            assert!(manager.answer(CONTROLLED_REQUEST, PermissionAnswer::Deny));
+            assert!(!registration.note_autopilot(&mut request, None));
+            assert!(updates.is_empty());
+            assert!(call.await.is_err());
+        });
     }
 }

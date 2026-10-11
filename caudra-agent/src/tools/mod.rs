@@ -793,7 +793,7 @@ pub fn truncate_output(text: String, max_lines: usize, max_bytes: usize) -> Stri
 
 use caudra_providers::{CacheKey, Message, ProviderEvent, StreamResponse};
 
-struct NullProvider;
+pub(crate) struct NullProvider;
 
 impl Provider for NullProvider {
     fn stream_message<'a>(

@@ -43,8 +43,8 @@ const PROFILES_KEPT: &str = "a session using one keeps the version it loaded";
 const PERMISSIONS_FAILED_CLOSED: &str = "every tool call is denied until the file loads again";
 const PERMISSIONS_REVIEW: &str = "project rules wait for review in /permissions";
 const MCP_ERROR_PREFIX: &str = "MCP config error: ";
-/// The table whose settings a session adopts at its next turn.
-const LIVE_TABLE: &str = "agent";
+/// The tables whose settings a session adopts at its next turn.
+const LIVE_TABLES: [&str; 2] = ["agent", "autopilot"];
 /// The table read once, at startup.
 const STARTUP_TABLE: &str = "experimental";
 const LIVE_SUFFIX: &str = "from the next turn";
@@ -207,8 +207,8 @@ impl SettingsTables {
     }
 }
 
-/// When each changed key applies, by name only: `[agent]` from the next
-/// turn, `[experimental]` after a restart, everything else after `/reload`.
+/// When each changed key applies, by name only: `[agent]` and `[autopilot]`
+/// from the next turn, `[experimental]` after a restart, everything else after `/reload`.
 /// `None` when no key changed, as for an edit to a comment.
 fn settings_note(changed: &BTreeMap<String, bool>) -> Option<String> {
     let label = |key: &str, table: bool| {
@@ -223,7 +223,7 @@ fn settings_note(changed: &BTreeMap<String, bool>) -> Option<String> {
     let mut restart = Vec::new();
     for (key, &table) in changed {
         let bucket = match key.as_str() {
-            LIVE_TABLE => &mut live,
+            key if LIVE_TABLES.contains(&key) => &mut live,
             STARTUP_TABLE => &mut restart,
             _ => &mut reload,
         };
@@ -501,6 +501,14 @@ impl EventLoop<'_> {
             Ok(config) => {
                 self.ctx.config_problems.clear(SETTINGS_FILE);
                 self.ctx.config = config.agent;
+                for runtime in &self.sessions {
+                    runtime
+                        .app
+                        .state
+                        .autopilot
+                        .set_limits(config.autopilot.clone());
+                }
+                self.ctx.autopilot = config.autopilot;
                 if let Some(note) = settings_note(&self.config_reload.settings_changes(local)) {
                     report.reloaded.push(SETTINGS_FILE);
                     report.note(note);
@@ -779,6 +787,7 @@ mod tests {
         let changed = BTreeMap::from([
             ("agent".to_owned(), true),
             ("always_yolo".to_owned(), false),
+            ("autopilot".to_owned(), true),
             ("experimental".to_owned(), true),
             ("ui".to_owned(), true),
         ]);
@@ -786,7 +795,7 @@ mod tests {
         assert_eq!(
             settings_note(&changed).unwrap(),
             format!(
-                "[agent] {LIVE_SUFFIX}{LIST_SEPARATOR}always_yolo{LIST_SEPARATOR}[ui] {RELOAD_SUFFIX}{LIST_SEPARATOR}[experimental] {RESTART_SUFFIX}"
+                "[agent]{LIST_SEPARATOR}[autopilot] {LIVE_SUFFIX}{LIST_SEPARATOR}always_yolo{LIST_SEPARATOR}[ui] {RELOAD_SUFFIX}{LIST_SEPARATOR}[experimental] {RESTART_SUFFIX}"
             )
         );
     }

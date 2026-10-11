@@ -472,6 +472,24 @@ pub struct AutomationEventOrigin {
     pub seq: u32,
 }
 
+/// The autopilot decision that wrote a message on the user's behalf, and what
+/// the message is.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AutopilotOrigin {
+    pub seq: u32,
+    pub kind: AutopilotMessageKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutopilotMessageKind {
+    Reply,
+    Revision,
+    Guidance,
+    Reminder,
+    Implement,
+}
+
 /// Who a peer message was addressed to.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -598,6 +616,8 @@ pub struct Message {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub automation_event: Option<AutomationEventOrigin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autopilot_event: Option<AutopilotOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_event: Option<PeerMessageOrigin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub standing_reminder: Option<StandingReminderKind>,
@@ -696,11 +716,23 @@ impl Message {
         }
     }
 
+    pub fn autopilot_observation(text: String, origin: AutopilotOrigin) -> Self {
+        Self {
+            autopilot_event: Some(origin),
+            ..Self::observation(text)
+        }
+    }
+
     pub fn peer_observation(text: String, origin: PeerMessageOrigin) -> Self {
         let automation = origin
             .automation
             .as_ref()
-            .map(|automation| format!("sender_automation: {}\n", peer_literal(json!(automation))))
+            .map(|automation| {
+                format!(
+                    "sender_automation: {}\n",
+                    tag_safe_literal(&json!(automation))
+                )
+            })
             .unwrap_or_default();
         let mut framed = format!(
             "{PEER_MESSAGE_HEADER}\n\
@@ -714,14 +746,14 @@ impl Message {
              reply_to: {}\n\
              body: {}\n\
              {PEER_MESSAGE_FOOTER}",
-            peer_literal(json!(origin.message_id)),
-            peer_literal(json!(origin.audience.label())),
-            peer_literal(json!(origin.audience.topic())),
-            peer_literal(json!(origin.sender_kind())),
-            peer_literal(json!(origin.sender_name)),
-            peer_literal(json!(origin.reply_address())),
-            peer_literal(json!(origin.reply_to)),
-            peer_literal(json!(text)),
+            tag_safe_literal(&json!(origin.message_id)),
+            tag_safe_literal(&json!(origin.audience.label())),
+            tag_safe_literal(&json!(origin.audience.topic())),
+            tag_safe_literal(&json!(origin.sender_kind())),
+            tag_safe_literal(&json!(origin.sender_name)),
+            tag_safe_literal(&json!(origin.reply_address())),
+            tag_safe_literal(&json!(origin.reply_to)),
+            tag_safe_literal(&json!(text)),
         );
         if let Some(assignment) = &origin.assignment {
             framed.push_str(&format!(
@@ -731,8 +763,8 @@ impl Message {
                  attempt: {}\n\
                  max_attempts: {}\n\
                  {WORK_ASSIGNMENT_FOOTER}",
-                peer_literal(json!(assignment.group)),
-                peer_literal(json!(assignment.work)),
+                tag_safe_literal(&json!(assignment.group)),
+                tag_safe_literal(&json!(assignment.work)),
                 assignment.attempt,
                 assignment.max_attempts,
             ));
@@ -867,8 +899,11 @@ impl Message {
     }
 }
 
-fn peer_literal(value: Value) -> String {
-    let json = value.to_string();
+/// `value` as JSON with `<`, `>` and control characters escaped, so untrusted
+/// text framed with it can neither open nor close a tag around it.
+pub fn tag_safe_literal(value: &(impl Serialize + ?Sized)) -> String {
+    // A string or a `Value` always serializes; the fallback is unreachable for both.
+    let json = serde_json::to_string(value).unwrap_or_default();
     let mut literal = String::with_capacity(json.len());
     for ch in json.chars() {
         match ch {

@@ -66,7 +66,9 @@ use options::{
     EXACT_COMMAND_CHIP, MAX_URL_LADDER_RUNGS, OUTSIDE_HOME_PHRASE, URL_ORIGIN_OPTION_ID,
     URL_SUBTREE_OPTION_ID,
 };
-pub use presentation::{AutoNote, EngineFlag, PromptReason, update_presentation_coverage};
+pub use presentation::{
+    AutoNote, AutopilotNote, EngineFlag, PromptReason, update_presentation_coverage,
+};
 use presentation::{listed_commands, presentation_for, safe_summary};
 pub use resources::filesystem_permission_resource;
 #[cfg(test)]
@@ -360,6 +362,8 @@ pub struct PermissionPresentation {
     pub advisories: Vec<PermissionAdvisory>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto: Option<AutoNote>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autopilot: Option<AutopilotNote>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionRequest {

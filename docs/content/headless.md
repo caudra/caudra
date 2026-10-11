@@ -33,6 +33,15 @@ JSON output includes `type`, `subtype`, `is_error`, `duration_ms`, `num_turns`, 
 
 Caudra exits with code 1 when the run ends in an error, such as a provider refusing the request or a goal that was not met. That is every run whose JSON result has `is_error: true`, whatever the output format. A successful run exits with 0.
 
+With `--autopilot`, which needs `experimental.autopilot`, [autopilot](/docs/autopilot/#headless-and-ci) answers the run's permission prompts, and a prompt it leaves to a human is denied. A `/goal <condition>` prompt becomes the goal autopilot owns. The JSON result then carries an `autopilot` object:
+
+```json
+"autopilot":{"ended":true,"end":{"reason":"budget","kind":"continuations"},
+             "continuations":100,"decisions":37,"escalations":2}
+```
+
+`end` is absent while autopilot is still engaged, and its shapes are listed under [Autopilot events](#autopilot-events). An end for a spent budget or an error makes the run an error, as an impossible goal already does. A stall that autopilot recovered from does not. `--verbose` and `stream-json` also print each autopilot event as the `system` message the SDK sends.
+
 `total_cost_usd` is money owed. When a subscription covers the run, its list
 price lands in `subscription_cost_usd` instead, and the two are never added
 together. See [Token economy](/docs/token-economy/#spend-on-a-subscription).
@@ -370,6 +379,76 @@ Both controls answer with `controls`. Its `controls.pause` holds the pause with 
 `unattended.count` is the turn count that `max_unattended_turns` caps. `delivery_backoff.errors` counts the automation runs that ended in error since the last clean run or human input, and `delivery_backoff.until` is when the next delivery may go. `turn_window.turns` holds the start times of the automation turns in the rolling hour that `turns_per_hour` caps, and `blockers` lists what keeps the session from settling.
 
 Closing stdin never pauses automations. Once it closes, no automation run starts. Automations stop before the rest of the session's work, and firings still running end as `interrupted`. The session is then saved with any pause and its limit counters, and `--resume <ID>` restores both, so a session closed while paused stays paused until the next human input or `automation_resume`.
+
+### Autopilot
+
+[Autopilot](/docs/autopilot/) is experimental and needs `experimental.autopilot`. With it on, a stream-json session can hand its permission prompts, plans, and stalls to a delegate model while it works toward a goal. `--autopilot` engages the session Caudra starts with, and the client can engage it later through controls. The `init` message lists the controls and the current state:
+
+```json
+{"type":"system","subtype":"init",
+ "autopilot_controls":["autopilot_start","autopilot_stop","autopilot_status"],
+ "autopilot":{"status":"none","limits":{"max_continuations":100,"max_cost":null,"max_minutes":null}},...}
+```
+
+Both fields are absent while the switch is off.
+
+#### Autopilot controls
+
+| Subtype | Arguments | Effect |
+|---------|-----------|--------|
+| `autopilot_start` | `goal` (optional), `kickoff` (optional, default `true`) | Engage with a fresh budget. An engaged session keeps its engagement and budget. With `goal`, set it as `goal_set` does, and autopilot owns it. Unless `kickoff` is `false`, queue the goal as a prompt |
+| `autopilot_stop` | None | Disengage. The end reads as stopped by `sdk` |
+| `autopilot_status` | None | Read the engagement |
+
+All three reply with the engagement in `response.response`:
+
+```json
+{"status":"engaged","engaged":true,"owns_goal":true,"engaged_at_ms":1790000000000,
+ "continuations":12,"cost_usd":0.84,"subscription_cost_usd":0.0,"elapsed_ms":540000,
+ "limits":{"max_continuations":100,"max_cost":null,"max_minutes":null}}
+```
+
+`status` is `engaged`, `ended`, or `none`. A session that never engaged replies with `status` and `limits` alone. After an end, `last_end` holds the [end](#autopilot-events). `limits` are the [`[autopilot]`](/docs/configuration/#autopilot) values, which a stream-json session reads once at startup. While the switch is off, each control fails with an error that names it.
+
+`goal_set` and `goal_clear` leave autopilot engaged, and the goal they set or clear is no longer autopilot's.
+
+#### Autopilot events
+
+Every autopilot event arrives as a `system` message with subtype `autopilot`. `kind` names the event:
+
+```json
+{"type":"system","subtype":"autopilot","kind":"decided",
+ "decision":{"seq":4,"at_ms":1790000000000,"kind":"permission","action":"allow",
+  "subject":"shell: cargo test","reason":"the goal needs the tests run",
+  "agent":null,"tool_use_id":"toolu_01","history_len":38,
+  "model":"anthropic/claude-opus-4-6","usage":{...},"cost":0.0031}}
+```
+
+| `kind` | Fields | When |
+|--------|--------|------|
+| `engaged` | None | Autopilot engaged |
+| `deciding` | `decision` with `seq`, `kind`, and `subject` | The delegate started a decision |
+| `decided` | `decision` | The delegate decided. An escalation is a decision whose `action` is `escalate` |
+| `retrying` | `attempt`, `limit`, `delay_ms`, `error` | A provider error ended the run, and the run starts again after `delay_ms` |
+| `ended` | `end` | Autopilot ended |
+
+A decision's `kind` is `permission`, `question`, `reply`, `plan`, `review`, or `second_opinion`. `agent` names the subagent the decision was for, and is `null` for the main agent.
+
+An end has a `reason`:
+
+| `reason` | More fields |
+|----------|-------------|
+| `stopped` | `by`: `command`, `interrupt`, `question_cancel`, or `sdk` |
+| `goal_met` | None |
+| `goal_impossible` | None |
+| `budget` | `kind`: `continuations`, `cost`, or `time` |
+| `error` | `message` |
+
+When the delegate allows or denies a permission request, Caudra withdraws it from the client with a `control_cancel_request`, as for any request that something else answered. An escalated request stays with the client. When the delegate approves a plan, the session leaves plan mode and starts the implementation run by itself, with its own `turn_start` and `result`.
+
+The `interrupt` control ends autopilot as stopped by `interrupt`, in addition to its other effects. The session saves the engagement and its decision log with the rest of its state. `--resume <ID>` restores both, engaged, with the budget it has used. When a goal is active, one check-in run starts and counts as a continuation.
+
+Delegate spend counts in the engagement's `cost_usd` and in the run's `result`. Like the rest of a stream-json session's model jobs, it stays out of the lifetime ledger in `/usage`.
 
 ### Workflows
 

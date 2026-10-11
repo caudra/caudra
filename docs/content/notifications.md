@@ -44,6 +44,12 @@ trees. Priority is `blocked` > `working` > unacknowledged `error` > unacknowledg
 work settles. Completed outcomes are acknowledged when you interact with the
 Caudra session that owns them. Focus alone does not acknowledge them.
 
+While [autopilot](/docs/autopilot/) decides a prompt, question, or plan for
+you, the pane reads as `working`. When autopilot leaves one to you, the pane
+reads as `blocked`, with the kind `permission` for a permission prompt and
+`question` for a question or a plan. The end of autopilot remains an explicit
+notification, as automation `notify()` does.
+
 Status messages are fixed, generic text. They contain no prompt or response
 content, tool arguments, or error details. This privacy guarantee applies to
 OSC 7501 status, not the response previews in legacy OSC 9 notifications.
@@ -72,15 +78,21 @@ focus. OSC 9 uses these messages:
 - `automation <name>: <text>` when an [automation](/docs/automations/#actions)
   calls `notify()`, with the text cut to 200 characters. The status bar flashes
   it too.
+- `Autopilot needs you: <kind>` when [autopilot](/docs/autopilot/) leaves a
+  permission prompt, question, or plan to you. `<kind>` is `permission`,
+  `question`, or `plan`. While autopilot is still deciding, nothing is sent.
+- `Autopilot ended: <reason>` when autopilot ends, such as `goal met` or
+  `continuation limit reached`. An end caused by an error reads as `error`.
 
-Automation `notify()` remains an explicit notification through this route,
-even when OSC 7501 status is active. It does not become a pane status update.
+Automation `notify()` and the end of autopilot remain explicit notifications
+through this route, even when OSC 7501 status is active. They do not become
+pane status updates.
 
 Response previews and automation notices can appear in your operating system's
 notification history. Caudra does not include tool arguments, permission scopes,
-question bodies, plan content, or error details. Use `bell` for a message-free
-alert, or use `off` to disable notifications if that text should not reach
-notification history.
+question bodies, plan content, autopilot's reasons, or error details. Use `bell`
+for a message-free alert, or use `off` to disable notifications if that text
+should not reach notification history.
 
 ## tmux
 

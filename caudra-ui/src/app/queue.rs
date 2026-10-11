@@ -1,6 +1,7 @@
 //! Queue for messages typed while the agent is busy.
 
 use std::borrow::Cow;
+use std::mem;
 use std::ops::Range;
 
 use caudra_agent::{AgentInput, AgentMode};
@@ -1075,6 +1076,7 @@ impl App {
             if self.state.goal.set(goal).is_err() {
                 return SubmitOutcome::Rejected(GOAL_SUBMISSION_ERR);
             }
+            self.state.autopilot.drop_goal_ownership();
             self.flash(GOAL_SET.into());
         }
         if deferred {
@@ -1415,6 +1417,7 @@ impl App {
         }
         self.automation_queue_consumed();
         self.goal_deferred = false;
+        self.autopilot_checkin_due = false;
         self.queue.clamp_focus();
         self.status = Status::Streaming;
         self.main_chat()
@@ -1432,6 +1435,7 @@ impl App {
         }
         self.automation_queue_consumed();
         self.goal_deferred = false;
+        self.autopilot_checkin_due = false;
         self.queue.clamp_focus();
         self.status = Status::Streaming;
         let messages = items
@@ -1505,16 +1509,27 @@ impl App {
         self.submit_explicit_input(input, String::new())
     }
 
+    /// The check-in a resumed engaged session owes is autopilot's, and counts
+    /// as one of its continuations.
     pub(crate) fn start_goal_checkin(&mut self) -> Vec<Action> {
         let Some(goal) = self.state.goal.snapshot() else {
             self.goal_deferred = false;
+            self.autopilot_checkin_due = false;
             return vec![];
         };
+        let resumed = mem::take(&mut self.autopilot_checkin_due);
         let mut input = self.continuation_input();
         input.preamble.push(caudra_providers::Message::synthetic(
             caudra_agent::goal_checkin_message(&goal.condition),
         ));
-        self.start_run(input, String::new(), StartedBy::Goal)
+        if !resumed {
+            return self.start_run(input, String::new(), StartedBy::Goal);
+        }
+        let actions = self.start_run(input, String::new(), StartedBy::Autopilot);
+        if !actions.is_empty() {
+            self.count_autopilot_continuation();
+        }
+        actions
     }
 
     /// The one place a fresh run starts: every path that emits
@@ -1565,6 +1580,7 @@ impl App {
         }
         self.automation_run_started(started_by);
         self.goal_deferred = false;
+        self.autopilot_checkin_due = false;
         self.clear_exit_request();
         // New work supersedes text held for recovery after an agent error.
         self.recoverable_queue.clear();

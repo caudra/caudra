@@ -15,12 +15,13 @@ use caudra_agent::automation::busy::pause_reason;
 pub(crate) use caudra_agent::automation::frontend::InputWait;
 pub(super) use caudra_agent::automation::frontend::run_end;
 use caudra_agent::automation::frontend::{
-    SessionSignals, claim_next, delivery_due, goal_finished, mode_name, needs_input,
-    profile_armings, saved_controls, set_claimed_goal,
+    SessionSignals, autopilot_view, claim_next, delivery_due, goal_finished, mode_name,
+    needs_input, profile_armings, saved_controls, set_claimed_goal,
 };
 use caudra_agent::automation::handle::AutomationHandle;
 use caudra_agent::automation::outbox::claim_message;
 use caudra_agent::peers::{AssignedWork, WorkPause, WorkReported, WorkState};
+use caudra_agent::permissions::AutopilotNote;
 use caudra_automation::event::{
     GoalView, HeldWork, InputKind, PausedWork, SessionStatus, SessionView, StartedBy, TurnOutcome,
     WorkView,
@@ -180,6 +181,12 @@ impl App {
                 condition: goal.condition.to_string(),
                 evaluations: goal.evaluations,
             }),
+            autopilot: autopilot_view(
+                self.features
+                    .enabled(Feature::Autopilot)
+                    .then_some(&self.state.autopilot),
+                self.autopilot_wait().is_some(),
+            ),
             cost: self.state.cost,
             groups: self.automation.groups.clone(),
             work: self.automation.work.clone(),
@@ -228,30 +235,33 @@ impl App {
     }
 
     /// What the session waits on a person for, the run's own prompts first. A ready plan and
-    /// held messages come last: neither stops a run.
+    /// held messages come last: neither stops a run. A card autopilot is deciding waits on no
+    /// one, and one it left to the user waits as `Autopilot`.
     pub(crate) fn input_wait(&self, held_messages: bool) -> Option<InputWait> {
-        let input = if self.permission_prompt.is_open() {
+        if self.permission_prompt.is_open()
+            && let Some(input) = card_wait(
+                self.permission_prompt.autopilot_note(),
+                InputKind::Permission,
+            )
+        {
             return Some(InputWait {
-                input: InputKind::Permission,
+                input,
                 tool: self
                     .permission_prompt
                     .tool()
                     .filter(|tool| !matches!(tool, ToolKey::Wildcard))
                     .map(|tool| tool.to_string()),
             });
-        } else if self.question_form.is_open() {
-            InputKind::Question
-        } else if self.pending_input != PendingInput::None {
-            InputKind::Auth
-        } else if self.float_mgr.needs_input() {
-            InputKind::Plugin
-        } else if self.status != Status::Streaming && self.plan_form_active() {
-            InputKind::Plan
-        } else if held_messages {
-            InputKind::Messages
-        } else {
-            return None;
-        };
+        }
+        let question = self.question_card_wait();
+        let plan = (self.status != Status::Streaming && self.plan_form_active())
+            .then(|| card_wait(self.plan_form.autopilot_note(), InputKind::Plan))
+            .flatten();
+        let input = question
+            .or_else(|| (self.pending_input != PendingInput::None).then_some(InputKind::Auth))
+            .or_else(|| self.float_mgr.needs_input().then_some(InputKind::Plugin))
+            .or(plan)
+            .or_else(|| held_messages.then_some(InputKind::Messages))?;
         Some(InputWait { input, tool: None })
     }
 
@@ -527,12 +537,27 @@ impl App {
         }
     }
 
+    /// What the open question form waits on, by its autopilot note.
+    fn question_card_wait(&self) -> Option<InputKind> {
+        self.question_form
+            .is_open()
+            .then(|| card_wait(self.question_form.autopilot_note(), InputKind::Question))
+            .flatten()
+    }
+
+    /// The wait the runtime last heard of, when it is the open question form's own.
+    pub(super) fn question_wait(&self) -> Option<&InputWait> {
+        let asked = self.question_card_wait()?;
+        self.automation
+            .signals
+            .input()
+            .filter(|wait| wait.input == asked && wait.tool.is_none())
+    }
+
     /// Someone at the terminal is working through the open question, so its `after` delays
     /// start over.
     pub(super) fn renew_question_wait(&self) {
-        if let Some(wait) = self.automation.signals.input()
-            && wait.input == InputKind::Question
-        {
+        if let Some(wait) = self.question_wait() {
             self.signal_automations(needs_input(wait));
         }
     }
@@ -628,13 +653,22 @@ impl App {
         self.signal_automations(signal);
     }
 
-    pub(super) fn automation_goal_finished(&self, result: &GoalResult) {
-        self.signal_automations(goal_finished(result));
+    pub(super) fn automation_goal_finished(&self, result: &GoalResult, autopilot_owned: bool) {
+        self.signal_automations(goal_finished(result, autopilot_owned));
     }
 
-    pub(super) fn automation_goal_cleared(&self, condition: &str, message: &str) {
+    pub(super) fn automation_goal_cleared(
+        &self,
+        condition: &str,
+        message: &str,
+        autopilot_owned: bool,
+    ) {
         if self.has_automations() {
-            self.signal_automations(self.automation.signals.goal_cleared(condition, message));
+            self.signal_automations(self.automation.signals.goal_cleared(
+                condition,
+                message,
+                autopilot_owned,
+            ));
         }
     }
 
@@ -695,7 +729,8 @@ impl App {
     /// turn rate, cap and backoff already let it through.
     pub(super) fn start_automation_run(&mut self, claim: OutboxClaim) -> Vec<Action> {
         if let Some(goal) = &claim.goal
-            && let Some(refusal) = set_claimed_goal(&self.state.goal, goal)
+            && let Some(refusal) =
+                set_claimed_goal(&self.state.goal, goal, self.state.autopilot.owns_goal())
         {
             self.flash(format!(
                 "{AUTOMATION_NOTICE_PREFIX} {}: {refusal}",
@@ -780,6 +815,15 @@ fn paused_work(item: &AssignedWork) -> Option<PausedWork> {
         work: item.work.clone(),
         pause_reason: pause_reason(pause),
     })
+}
+
+/// What an open card of `kind` waits on, by its autopilot note.
+fn card_wait(note: Option<&AutopilotNote>, kind: InputKind) -> Option<InputKind> {
+    match note {
+        Some(AutopilotNote::Deciding) => None,
+        Some(AutopilotNote::Escalated { .. }) => Some(InputKind::Autopilot),
+        None => Some(kind),
+    }
 }
 
 /// Moves `work` by what became of one item: the session holds it no longer, and a pause its own
@@ -1179,6 +1223,7 @@ mod tests {
             task_event: None,
             peer_event: Some(origin),
             automation_event: None,
+            autopilot_event: None,
         }));
 
         assert_eq!(

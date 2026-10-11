@@ -11,9 +11,9 @@ use caudra_automation::engine::{
     ErrorKind, Firing, FiringEnd, FiringError, FiringLimits, FiringOutcome, run_firing,
 };
 use caudra_automation::event::{
-    Admission, ArmedReason, Audience, Delivery, ErrorKind as ProviderError, Event, EventDetail,
-    GoalFinishedDetail, GoalVerdict, GoalView, HeldWork, IdleDetail, InputKind, MessageDetail,
-    PauseReason, SenderKind, SessionStatus, SessionView, StartedBy, TurnOutcome,
+    Admission, ArmedReason, Audience, AutopilotView, Delivery, ErrorKind as ProviderError, Event,
+    EventDetail, GoalFinishedDetail, GoalVerdict, GoalView, HeldWork, IdleDetail, InputKind,
+    MessageDetail, PauseReason, SenderKind, SessionStatus, SessionView, StartedBy, TurnOutcome,
     WorkFinishedDetail, WorkOutcome, WorkReport, WorkState, WorkView, WorkflowFinishedDetail,
     WorkflowStatus,
 };
@@ -118,6 +118,9 @@ const GOAL_ACTIVE: &str = "another goal is active";
 const CHAIN_IMPOSSIBLE: &str = "goal-chain stopped: verdict impossible";
 const CHAIN_CLEARED: &str = "goal-chain stopped: verdict cleared";
 const CHAIN_DONE: &str = "goal-chain: all 3 goals are met";
+const GOAL_OWNED: &str = "autopilot owns the active goal";
+const CHAIN_SET_GOAL_LINE: u32 = 27;
+const CHAIN_SET_GOAL_COLUMN: u32 = 17;
 
 const BACKLOG_PROMPT: &str =
     "Continue with the next unchecked item in TODO.md. When none remain, reply with BACKLOG EMPTY.";
@@ -167,6 +170,7 @@ const APPROVE_SHELL: &str = "approve shell";
 const REVIEW_PLAN: &str = "review a plan";
 const SIGN_IN: &str = "sign in again";
 const ANSWER_QUESTION: &str = "answer a question";
+const TAKE_OVER: &str = "take over from autopilot";
 const WAITING_S: u64 = 600;
 
 const DEEP_RESEARCH: &str = "deep-research";
@@ -527,6 +531,7 @@ fn session() -> SessionView {
         status: SessionStatus::Idle,
         status_since: AT,
         goal: None,
+        autopilot: None,
         cost: None,
         groups: Vec::new(),
         work: WorkView::default(),
@@ -593,6 +598,11 @@ fn idle(detail: IdleDetail) -> Event {
 }
 
 fn goal_finished(verdict: GoalVerdict, condition: &str) -> Event {
+    owned_goal_finished(verdict, condition, false)
+}
+
+/// A goal finished, which autopilot set when `autopilot`.
+fn owned_goal_finished(verdict: GoalVerdict, condition: &str, autopilot: bool) -> Event {
     event(EventDetail::GoalFinished(GoalFinishedDetail {
         verdict,
         condition: condition.to_owned(),
@@ -600,6 +610,7 @@ fn goal_finished(verdict: GoalVerdict, condition: &str) -> Event {
         evaluations: EVALUATIONS,
         duration_s: GOAL_DURATION_S,
         cost: None,
+        autopilot,
     }))
 }
 
@@ -982,6 +993,48 @@ fn goal_chain_waits_out_a_goal_it_did_not_set() {
     assert_eq!(chain.state, json!({ "current": GOAL_A }));
 }
 
+/// The session's goal is autopilot's: the chain skips while it shows, fails on the refusal when
+/// autopilot set it after the event, and starts once it finishes.
+#[test]
+fn goal_chain_waits_out_a_goal_autopilot_owns() {
+    let mut chain = Automation::armed_with(GOAL_CHAIN, json!({ "goals": [GOAL_A] }));
+    let mut owned = pursuing(armed(ArmedReason::Launch), OTHER_GOAL);
+    owned.session.autopilot = Some(AutopilotView {
+        owns_goal: true,
+        waiting: false,
+    });
+    assert_eq!(
+        chain.fire(&owned, &ScriptedHost::default()),
+        (skipped(GOAL_ACTIVE), Vec::new())
+    );
+    let refusing = ScriptedHost::default().failing(
+        ActionKind::SetGoal,
+        FailureKind::GoalOwnedByAutopilot,
+        GOAL_OWNED,
+    );
+    assert_eq!(
+        chain.fire(&armed(ArmedReason::Launch), &refusing),
+        (
+            failed(
+                FailureKind::GoalOwnedByAutopilot,
+                GOAL_OWNED,
+                CHAIN_SET_GOAL_LINE,
+                CHAIN_SET_GOAL_COLUMN
+            ),
+            vec![goal_set(GOAL_A)]
+        )
+    );
+    assert_eq!(chain.state, json!({}));
+    assert_eq!(
+        chain.fire(
+            &owned_goal_finished(GoalVerdict::Met, OTHER_GOAL, true),
+            &ScriptedHost::default()
+        ),
+        (FiringEnd::Completed, vec![goal_set(GOAL_A)])
+    );
+    assert_eq!(chain.state, json!({ "current": GOAL_A }));
+}
+
 #[test]
 fn keep_going_continues_the_backlog_during_work_hours() {
     let mut keep_going = Automation::load(KEEP_GOING);
@@ -1187,6 +1240,7 @@ fn nightly_review_posts_the_report_of_the_run_it_started() {
 #[test_case(InputKind::Plan, None => paged(REVIEW_PLAN); "plan")]
 #[test_case(InputKind::Auth, None => paged(SIGN_IN); "auth")]
 #[test_case(InputKind::Question, None => paged(ANSWER_QUESTION); "question")]
+#[test_case(InputKind::Autopilot, Some(SHELL_TOOL) => paged(TAKE_OVER); "left_by_autopilot")]
 fn page_me_names_what_the_session_waits_for(input: InputKind, tool: Option<&str>) -> Fired {
     let mut page_me = Automation::load(PAGE_ME);
     let fired = page_me.fire(&needs_input(input, tool), &ScriptedHost::default());

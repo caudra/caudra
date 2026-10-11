@@ -95,7 +95,7 @@ pub(super) fn answer_scope_kind(
     }
 }
 
-fn resource_kind_name(kind: &PermissionResourceKind) -> &'static str {
+pub(super) fn resource_kind_name(kind: &PermissionResourceKind) -> &'static str {
     match kind {
         PermissionResourceKind::File => "File",
         PermissionResourceKind::Directory => "Directory",

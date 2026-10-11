@@ -68,7 +68,7 @@ fn autoscroll_rows(distance: i32) -> i32 {
 impl App {
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> Vec<Action> {
         if self.mode_submission.is_open()
-            && !self.permission_prompt.is_open()
+            && !self.permission_prompt_holds_input()
             && !self.question_form.is_open()
         {
             self.clear_control_hovers();
@@ -152,7 +152,7 @@ impl App {
         {
             return actions;
         }
-        if self.stream_modal.is_open() && !self.permission_prompt.is_open() {
+        if self.stream_modal.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
             match self.stream_modal.handle_mouse(&event) {
                 StreamAction::Ignored => {}
@@ -169,12 +169,15 @@ impl App {
         }
         if self.workbench.is_open()
             && !self.stream_modal.is_open()
-            && !self.permission_prompt.is_open()
+            && !self.permission_prompt_holds_input()
         {
             self.clear_control_hovers();
             if self.question_form.is_open()
                 && let Some(action) = self.question_form.handle_mouse(event)
             {
+                if matches!(event.kind, MouseEventKind::Down(_)) {
+                    self.claim_question_form();
+                }
                 return self.handle_question_form_action(action);
             }
             if self.question_form.contains(at) {
@@ -190,50 +193,50 @@ impl App {
             }
             return Vec::new();
         }
-        if self.logs_modal.is_open() && !self.permission_prompt.is_open() {
+        if self.logs_modal.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
             let action = self.logs_modal.handle_mouse(event);
             self.handle_logs_action(action);
             return Vec::new();
         }
-        if self.docs_modal.is_open() && !self.permission_prompt.is_open() {
+        if self.docs_modal.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
             let action = self.docs_modal.handle_mouse(event);
             return self.handle_docs_action(action);
         }
-        if self.context_modal.is_open() && !self.permission_prompt.is_open() {
+        if self.context_modal.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
             self.context_modal.handle_mouse(event);
             return Vec::new();
         }
-        if self.tools_modal.is_open() && !self.permission_prompt.is_open() {
+        if self.tools_modal.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
             self.tools_modal.handle_mouse(event);
             return Vec::new();
         }
-        if self.decisions_modal.is_open() && !self.permission_prompt.is_open() {
+        if self.decisions_modal.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
             let action = self.decisions_modal.handle_mouse(event);
             self.handle_decisions_action(action);
             return Vec::new();
         }
-        if self.skills_modal.is_open() && !self.permission_prompt.is_open() {
+        if self.skills_modal.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
             self.skills_modal.handle_mouse(event);
             return Vec::new();
         }
-        if self.storage_modal.is_open() && !self.permission_prompt.is_open() {
+        if self.storage_modal.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
             self.storage_modal.handle_mouse(event);
             return Vec::new();
         }
-        if self.system_prompt_modal.is_open() && !self.permission_prompt.is_open() {
+        if self.system_prompt_modal.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
             let action = self.system_prompt_modal.handle_mouse(event);
             self.handle_system_prompt_action(action);
             return Vec::new();
         }
-        if self.projection_modal.is_open() && !self.permission_prompt.is_open() {
+        if self.projection_modal.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
             let action = self.projection_modal.handle_mouse(event);
             self.handle_projection_action(action);
@@ -242,13 +245,21 @@ impl App {
         // The goal footer names session commands rather than modal state, and
         // `/goal-model` opens a picker this modal is drawn over, so the click
         // closes the modal before the command runs.
-        if self.goal_modal.is_open() && !self.permission_prompt.is_open() {
+        if self.goal_modal.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
             let Some(cmdline) = self.goal_modal.handle_mouse(event) else {
                 return Vec::new();
             };
             self.goal_modal.close();
             return self.run_footer_command(cmdline);
+        }
+        if self.autopilot_panel.is_open() && !self.permission_prompt_holds_input() {
+            self.clear_control_hovers();
+            return self
+                .autopilot_panel
+                .handle_mouse(event)
+                .map(|action| self.on_autopilot_panel(action))
+                .unwrap_or_default();
         }
         let passive_modal_open =
             self.help_modal.is_open() || self.usage_modal.is_open() || self.float_mgr.is_open();
@@ -274,7 +285,7 @@ impl App {
             if self.float_mgr.handle_mouse(&event) {
                 return Vec::new();
             }
-        } else if self.permission_prompt.is_open() {
+        } else if self.permission_prompt_holds_input() {
             self.clear_control_hovers();
             match self.permission_prompt.handle_mouse(event) {
                 PromptMouse::Passthrough => {}
@@ -468,6 +479,9 @@ impl App {
             let action = self.plan_form.handle_mouse(event);
             if action != crate::components::plan_form::PlanFormAction::Passthrough {
                 self.clear_control_hovers();
+                if matches!(event.kind, MouseEventKind::Down(_)) {
+                    self.claim_plan_card();
+                }
                 return self.handle_plan_form_action(action);
             }
         } else if self.command_palette.is_active() {
@@ -495,13 +509,16 @@ impl App {
         // pressing whatever it ended over.
         if self.question_form.is_open()
             && !self.stream_modal.is_open()
-            && !self.permission_prompt.is_open()
+            && !self.permission_prompt_holds_input()
             && !(event.kind == MouseEventKind::Up(MouseButton::Left) && self.dragging_selection())
             && let Some(action) = self.question_form.handle_mouse(event)
         {
             self.clear_control_hovers();
             if event.kind == MouseEventKind::Up(MouseButton::Left) {
                 self.selection_state = None;
+            }
+            if matches!(event.kind, MouseEventKind::Down(_)) {
+                self.claim_question_form();
             }
             return self.handle_question_form_action(action);
         }
@@ -923,7 +940,7 @@ impl App {
         // The wheel is aggregated into `Msg::Scroll` before `handle_mouse` ever
         // runs, so the workbench has to be offered it here as well or its panes
         // never see a wheel at all. Its rows count downwards.
-        if self.stream_modal.is_open() || self.permission_prompt.is_open() {
+        if self.stream_modal.is_open() || self.permission_prompt_holds_input() {
             self.scroll_at(column, row, delta);
             self.clear_selection_unless_pending_copy();
             return;
@@ -1210,6 +1227,11 @@ impl App {
                 self.goal_modal.open();
                 Vec::new()
             }
+            StatusBarHitTarget::Autopilot => {
+                self.clear_control_hovers();
+                self.autopilot_panel.open();
+                Vec::new()
+            }
             StatusBarHitTarget::Tasks => {
                 self.clear_control_hovers();
                 self.tasks_browse()
@@ -1328,7 +1350,7 @@ impl App {
     fn dismiss_at(&mut self, pos: Position) -> Option<Vec<Action>> {
         // Both take the mouse ahead of everything else, and the paste editor
         // holds edits that no stray press should throw away.
-        if self.paste_editor.is_open() || self.permission_prompt.is_open() {
+        if self.paste_editor.is_open() || self.permission_prompt_holds_input() {
             return None;
         }
 
@@ -1378,6 +1400,7 @@ impl App {
         dismiss!(self.system_prompt_modal);
         dismiss!(self.projection_modal);
         dismiss!(self.goal_modal);
+        dismiss!(self.autopilot_panel);
 
         dismiss!(self.command_modal);
         dismiss!(self.search_modal, {
@@ -1467,7 +1490,7 @@ impl App {
         )
     }
 
-    fn clear_control_hovers(&mut self) {
+    pub(super) fn clear_control_hovers(&mut self) {
         self.admission_hover = None;
         self.chord_hint_hover = None;
         self.queue_hover = None;

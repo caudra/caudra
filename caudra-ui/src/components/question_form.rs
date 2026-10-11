@@ -12,12 +12,14 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
+use caudra_agent::permissions::AutopilotNote;
 use caudra_agent::types::AskedQuestion;
 use caudra_grab::grab_scope;
 use caudra_workbench::buffer::Cursor;
 use caudra_workbench::render::Row;
 use caudra_workbench::text_field::{FieldKind, FieldStyles, TextField, TextKey, is_newline_key};
 
+use super::autopilot_panel::card_note;
 use super::form::render_form;
 use super::keybindings::{Bind, key};
 use super::tab_bar::{Tab, tab_spans};
@@ -44,6 +46,8 @@ const LINE_BREAK: &str = "\n";
 const ASK_HINT: Hint = Hint::bind(key::QUESTION_ASK_BTW, "Ask /btw");
 const COMPACT_ASK_HINT: Hint = Hint::bind(key::QUESTION_ASK_BTW, "Ask");
 const ASK_HINT_INDEX: usize = 0;
+/// Autopilot's note and the blank row under it.
+const NOTE_LINES: u16 = 2;
 
 const SHIFT_ENTER: Bind = Bind {
     code: KeyCode::Enter,
@@ -124,6 +128,8 @@ pub struct QuestionForm {
     /// act. Option rows are absent: hovering one moves the cursor, which
     /// already marks it, and reversing it too would say the same thing twice.
     hover: Option<FormTarget>,
+    /// What autopilot is doing about the form, drawn muted above it.
+    autopilot_note: Option<AutopilotNote>,
 }
 
 /// Everything on the form a click can name. The form is rebuilt from scratch
@@ -200,10 +206,12 @@ impl QuestionForm {
             area: Rect::default(),
             row_hits: Vec::new(),
             mouse_down: None,
+            autopilot_note: None,
         }
     }
 
     pub fn open(&mut self, questions: Vec<AskedQuestion>) {
+        self.autopilot_note = None;
         self.answers = vec![Vec::new(); questions.len()];
         self.questions = questions;
         self.mode = Mode::Selecting;
@@ -261,7 +269,16 @@ impl QuestionForm {
             .join("\n\n")
     }
 
+    pub(crate) fn set_autopilot_note(&mut self, note: Option<AutopilotNote>) {
+        self.autopilot_note = note;
+    }
+
+    pub(crate) fn autopilot_note(&self) -> Option<&AutopilotNote> {
+        self.autopilot_note.as_ref()
+    }
+
     pub fn close(&mut self) {
+        self.autopilot_note = None;
         self.questions.clear();
         self.answers.clear();
         self.row_hits.clear();
@@ -407,10 +424,15 @@ impl QuestionForm {
     /// in step with the spans themselves. A bar wide enough to wrap is left
     /// alone: past the fold a column no longer maps to the span under it.
     fn push_tab_hits(&mut self, rows: &VisualRows, form: Rect, visible: u16) {
-        if !self.has_review() || rows.height_of(0) != 1 {
+        let line = if self.autopilot_note.is_some() {
+            NOTE_LINES
+        } else {
+            0
+        };
+        if !self.has_review() || rows.height_of(line) != 1 {
             return;
         }
-        let Some(offset) = rows.row_of(0).checked_sub(self.scroll) else {
+        let Some(offset) = rows.row_of(line).checked_sub(self.scroll) else {
             return;
         };
         if offset >= visible {
@@ -798,10 +820,22 @@ impl QuestionForm {
         )
     }
 
+    /// A body that opens with autopilot's note, when the form carries one.
+    fn noted_body(&self) -> Body {
+        let mut body = Body::default();
+        if let Some(note) = &self.autopilot_note {
+            body.lines.extend([
+                Line::styled(format!(" {}", card_note(note)), theme::current().tool_dim),
+                Line::default(),
+            ]);
+        }
+        body
+    }
+
     fn selecting_body(&self, width: u16, focused: bool) -> Body {
         let t = theme::current();
         let question = self.question();
-        let mut body = Body::default();
+        let mut body = self.noted_body();
         if self.has_review() {
             body.lines.push(self.tab_bar());
             body.lines.push(Line::default());
@@ -924,7 +958,7 @@ impl QuestionForm {
 
     fn review_body(&self, width: u16) -> Body {
         let t = theme::current();
-        let mut body = Body::default();
+        let mut body = self.noted_body();
         body.lines.extend([
             self.tab_bar(),
             Line::default(),
@@ -2401,5 +2435,36 @@ mod tests {
             form.handle_key(key::QUESTION_ASK_BTW.to_key_event()),
             QuestionFormAction::Consumed
         ));
+    }
+
+    const ESCALATION: &str = "the user must choose";
+    const EXPECT_NOTE: &str = "the form must say what autopilot is doing about it";
+
+    /// The note sits above the tab bar, so the tabs must still be found
+    /// where they are drawn.
+    #[test_case(AutopilotNote::Deciding ; "deciding")]
+    #[test_case(AutopilotNote::Escalated { reason: ESCALATION.into() } ; "left_to_you")]
+    fn the_form_says_what_autopilot_is_doing(note: AutopilotNote) {
+        let mut form = opened(two_questions());
+        form.set_autopilot_note(Some(note.clone()));
+
+        let screen = painted(&mut form).join(LINE_BREAK);
+
+        assert!(
+            screen.contains(&card_note(&note)),
+            "{EXPECT_NOTE}\n{screen}"
+        );
+        click_target(&mut form, FormTarget::Tab(1));
+        assert_eq!(form.tab, 1, "{EXPECT_TAB_SWITCH}");
+    }
+
+    #[test]
+    fn a_new_form_drops_the_note() {
+        let mut form = opened(two_questions());
+        form.set_autopilot_note(Some(AutopilotNote::Deciding));
+
+        form.open(two_questions());
+
+        assert_eq!(form.autopilot_note(), None);
     }
 }
