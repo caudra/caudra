@@ -1,30 +1,28 @@
-//! The page being read. It is painted once for each page, width and theme, then
-//! restyled for the selected and hovered links and the search highlights, so a
-//! `Tab`, an `F3` or the pointer copies rows and never renders the Markdown
-//! again.
+//! A Markdown document being read, with links to follow and search terms to
+//! highlight, as `/docs` and `/changelog` show one. It is painted once for each
+//! document, width and theme, then restyled for the selected and hovered links
+//! and the search highlights, so a `Tab`, an `F3` or the pointer copies rows and
+//! never renders the Markdown again.
 
 use std::borrow::Cow;
 use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
 
-use caudra_docs::{Library, line_starts};
+use caudra_docs::line_starts;
 use caudra_markdown::render::SpanSource;
-use crossterm::event::{KeyEvent, MouseEvent};
+use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 
-use super::{PaneContext, Shown, clicked};
 use crate::components::document_view::{DocumentMouse, DocumentView, Jump, Painted};
 use crate::components::{highlight, hover_style, term_ranges};
 use crate::markdown::{LinkMap, text_to_rows};
 use crate::provenance::{LineProvenance, Provenance};
 use crate::selection::line_text;
 use crate::theme::{self, Theme};
-
-const HEADING_MARK: char = '#';
 
 /// Where the reader lands once rows exist for the width it is drawn at: a
 /// source line brought to the top, or the first highlighted row at or after
@@ -43,16 +41,17 @@ impl Landing {
     }
 }
 
-pub(super) enum ReaderMouse {
+pub(crate) enum ReaderMouse {
     Consumed,
     Copy(String),
     Follow(Arc<str>),
 }
 
-#[derive(Default)]
-pub(super) struct Reader {
-    page: Option<PageRows>,
-    document: DocumentView<RowsKey>,
+/// `K` names what is shown, such as a docs page: rows painted for one `K` are
+/// never taken for another's.
+pub(crate) struct Reader<K> {
+    page: Option<PageRows<K>>,
+    document: DocumentView<RowsKey<K>>,
     link: Option<usize>,
     /// Lowercase words to highlight, from the search result that opened the
     /// page.
@@ -69,8 +68,8 @@ pub(super) struct Reader {
 /// What the restyled rows depend on: the page rows, and the links and the
 /// highlights drawn over them.
 #[derive(PartialEq)]
-struct RowsKey {
-    shown: Shown,
+struct RowsKey<K> {
+    shown: K,
     width: u16,
     generation: u64,
     link: Option<usize>,
@@ -83,8 +82,8 @@ struct RowsKey {
 /// source line each row shows, the rows its headings open on, and its links.
 /// The rows are kept as painted, one span to a source span, which is what the
 /// provenance is zipped with.
-struct PageRows {
-    shown: Shown,
+struct PageRows<K> {
+    shown: K,
     width: u16,
     generation: u64,
     lines: Vec<Line<'static>>,
@@ -121,10 +120,25 @@ impl Link {
     }
 }
 
-impl Reader {
+impl<K> Default for Reader<K> {
+    fn default() -> Self {
+        Self {
+            page: None,
+            document: DocumentView::default(),
+            link: None,
+            terms: Vec::new(),
+            highlights: 0,
+            found: None,
+            landing: None,
+            pressed: None,
+        }
+    }
+}
+
+impl<K: Copy + PartialEq> Reader<K> {
     /// The source line at the top of the viewport, or the one a pending
     /// landing will bring there. A line survives a rewrap where a row does not.
-    pub(super) fn top_line(&self) -> usize {
+    pub(crate) fn top_line(&self) -> usize {
         if let Some(landing) = self.landing {
             return landing.line();
         }
@@ -136,7 +150,7 @@ impl Reader {
 
     /// Moves to `line` on the next frame, at the left margin. Leaving the page
     /// drops its highlights, which belonged to the search that opened it.
-    pub(super) fn land(&mut self, line: usize, leaving: bool) {
+    pub(crate) fn land(&mut self, line: usize, leaving: bool) {
         if leaving {
             self.set_terms(Vec::new());
         }
@@ -148,7 +162,7 @@ impl Reader {
     }
 
     /// Highlights `terms` and lands on the first of them at or after `line`.
-    pub(super) fn highlight(&mut self, terms: Vec<String>, line: usize) {
+    pub(crate) fn highlight(&mut self, terms: Vec<String>, line: usize) {
         self.set_terms(terms);
         self.found = None;
         self.landing = Some(Landing::Match(line));
@@ -159,27 +173,27 @@ impl Reader {
         self.highlights = self.highlights.wrapping_add(1);
     }
 
-    pub(super) fn has_links(&self) -> bool {
+    pub(crate) fn has_links(&self) -> bool {
         self.page
             .as_ref()
             .is_some_and(|page| !page.links.is_empty())
     }
 
-    pub(super) fn has_link_selected(&self) -> bool {
+    pub(crate) fn has_link_selected(&self) -> bool {
         self.shown_link().is_some()
     }
 
-    pub(super) fn has_highlights(&self) -> bool {
+    pub(crate) fn has_highlights(&self) -> bool {
         !self.terms.is_empty()
     }
 
-    pub(super) fn selected_target(&self) -> Option<Arc<str>> {
+    pub(crate) fn selected_target(&self) -> Option<Arc<str>> {
         self.target(self.shown_link()?)
     }
 
     /// The Markdown behind the sweep, as a sweep over the transcript copies it,
     /// or the text it covers where the rows cannot trace their source.
-    pub(super) fn selected_text(&self) -> Option<String> {
+    pub(crate) fn selected_text(&self) -> Option<String> {
         let (start, end) = self.document.sweep_ends()?;
         self.page
             .as_ref()
@@ -188,26 +202,26 @@ impl Reader {
             .or_else(|| self.document.selected_text())
     }
 
-    pub(super) fn scroll(&mut self, delta: i32) {
+    pub(crate) fn scroll(&mut self, delta: i32) {
         self.document.scroll(delta);
     }
 
-    pub(super) fn pan(&mut self, delta: i32) {
+    pub(crate) fn pan(&mut self, delta: i32) {
         self.document.pan(delta);
     }
 
-    pub(super) fn jump(&mut self, jump: Jump) {
+    pub(crate) fn jump(&mut self, jump: Jump) {
         self.document.jump(jump);
     }
 
-    pub(super) fn handle_scroll_key(&mut self, key: KeyEvent) {
+    pub(crate) fn handle_scroll_key(&mut self, key: KeyEvent) {
         self.document.handle_scroll_key(key);
     }
 
     /// Selects the next or previous link. The one selected counts only while
     /// it is on screen; otherwise the step starts from the viewport, so `Tab`
     /// after a scroll picks a link the reader can see.
-    pub(super) fn step_link(&mut self, forward: bool) -> bool {
+    pub(crate) fn step_link(&mut self, forward: bool) -> bool {
         let Some(page) = &self.page else {
             return false;
         };
@@ -238,7 +252,7 @@ impl Reader {
 
     /// Moves to the next or previous highlighted row, wrapping at either end.
     /// Like a link, the row moved to last counts only while it is on screen.
-    pub(super) fn step_match(&mut self, forward: bool) -> bool {
+    pub(crate) fn step_match(&mut self, forward: bool) -> bool {
         let rows = self.match_rows();
         let (Some(&first), Some(&last)) = (rows.first(), rows.last()) else {
             return false;
@@ -259,7 +273,7 @@ impl Reader {
 
     /// A press and release on the same link follows it, as a link in the
     /// transcript does. A drag sweeps and copies instead, wherever it started.
-    pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> ReaderMouse {
+    pub(crate) fn handle_mouse(&mut self, event: MouseEvent) -> ReaderMouse {
         let link = self.link_at(Position::new(event.column, event.row));
         let released = clicked(&mut self.pressed, event.kind, link);
         if let DocumentMouse::Copy(text) = self.document.handle_mouse(event) {
@@ -274,18 +288,21 @@ impl Reader {
     }
 
     /// Paints `shown` for `body` unless it already is, lands where the last
-    /// navigation asked, and draws. `bars` is what the scrollbars run along.
-    /// Returns where the link under the pointer leads, found once the rows
-    /// have settled, so a scroll or a landing under a still pointer moves it.
-    pub(super) fn draw(
+    /// navigation asked, and draws. `source` is the Markdown behind `shown` and
+    /// the lines its headings are on, asked for only when it is painted.
+    /// `bars` is what the scrollbars run along. Returns where the link under
+    /// `pointer` leads, found once the rows have settled, so a scroll or a
+    /// landing under a still pointer moves it.
+    pub(crate) fn draw<'a>(
         &mut self,
         frame: &mut Frame,
         bars: Rect,
         body: Rect,
-        context: &PaneContext,
-        shown: Shown,
+        pointer: Option<Position>,
+        shown: K,
+        source: impl FnOnce() -> (Cow<'a, str>, Vec<usize>),
     ) -> Option<Arc<str>> {
-        let (library, theme) = (context.library, context.theme);
+        let theme = &theme::current();
         let generation = theme::generation();
         let fresh = self.page.as_ref().is_some_and(|page| {
             page.shown == shown && page.width == body.width && page.generation == generation
@@ -297,7 +314,8 @@ impl Reader {
             }
             // A row number means nothing once the page is rewrapped.
             self.found = None;
-            self.page = Some(paint(library, shown, body.width, generation, theme));
+            let (text, headings) = source();
+            self.page = Some(paint(&text, headings, shown, body.width, generation, theme));
         }
         let landing = self.landing.take().map(|landing| self.resolve(landing));
         let rows = self.page.as_ref().map_or(0, |page| page.lines.len());
@@ -308,7 +326,7 @@ impl Reader {
                 self.document.reveal(row);
             }
         }
-        let hovered = context.pointer.and_then(|at| self.link_at(at));
+        let hovered = pointer.and_then(|at| self.link_at(at));
         if let Some(page) = &self.page {
             let (link, terms, found) = (self.link, &self.terms, self.found);
             let key = RowsKey {
@@ -367,7 +385,7 @@ impl Reader {
     }
 
     /// Whether `position` is on the page, as the last frame drew it.
-    pub(super) fn contains(&self, position: Position) -> bool {
+    pub(crate) fn contains(&self, position: Position) -> bool {
         self.document.cell_at(position).is_some()
     }
 
@@ -388,54 +406,42 @@ impl Reader {
     }
 
     #[cfg(test)]
-    pub(super) fn found(&self) -> Option<usize> {
+    pub(crate) fn found(&self) -> Option<usize> {
         self.found
     }
 
     #[cfg(test)]
-    pub(super) fn visible(&self) -> Range<usize> {
+    pub(crate) fn visible(&self) -> Range<usize> {
         self.document.visible()
     }
 
     #[cfg(test)]
-    pub(super) fn row_text(&self, row: usize) -> Option<String> {
+    pub(crate) fn row_text(&self, row: usize) -> Option<String> {
         Some(line_text(self.page.as_ref()?.lines.get(row)?))
     }
 
     /// The first row of the selected link, on screen or not.
     #[cfg(test)]
-    pub(super) fn link_row(&self) -> Option<usize> {
+    pub(crate) fn link_row(&self) -> Option<usize> {
         Some(self.page.as_ref()?.links.get(self.link?)?.row())
     }
 
     #[cfg(test)]
-    pub(super) fn content(&self) -> Rect {
+    pub(crate) fn content(&self) -> Rect {
         self.document.content()
     }
 }
 
-fn paint(library: &Library, shown: Shown, width: u16, generation: u64, theme: &Theme) -> PageRows {
-    let (text, headings): (Cow<'_, str>, Vec<usize>) = match shown {
-        Shown::Contents => {
-            let text = library.contents_markdown();
-            let headings = text
-                .lines()
-                .enumerate()
-                .filter(|(_, line)| line.starts_with(HEADING_MARK))
-                .map(|(line, _)| line)
-                .collect();
-            (Cow::Owned(text), headings)
-        }
-        Shown::Page(index) => {
-            let page = &library.pages()[index];
-            (
-                Cow::Borrowed(page.display.as_str()),
-                page.headings.iter().map(|heading| heading.line).collect(),
-            )
-        }
-    };
-    let (painted, source) = text_to_rows(&text, theme.assistant, width, Vec::new());
-    let row_lines = source_lines(&painted.provenance, &line_starts(&text));
+fn paint<K>(
+    text: &str,
+    headings: Vec<usize>,
+    shown: K,
+    width: u16,
+    generation: u64,
+    theme: &Theme,
+) -> PageRows<K> {
+    let (painted, source) = text_to_rows(text, theme.assistant, width, Vec::new());
+    let row_lines = source_lines(&painted.provenance, &line_starts(text));
     let mut anchors: Vec<usize> = headings
         .into_iter()
         .map(|line| row_of_line(&row_lines, line))
@@ -518,8 +524,8 @@ fn links(lines: &[Line<'static>], map: &LinkMap) -> Vec<Link> {
     links
 }
 
-fn restyle(
-    page: &PageRows,
+fn restyle<K>(
+    page: &PageRows<K>,
     link: Option<usize>,
     hovered: Option<usize>,
     terms: &[String],
@@ -547,6 +553,26 @@ fn restyle(
         }
     }
     Painted::new(lines, Vec::new(), page.anchors.clone())
+}
+
+/// The row a press and its release both landed on, which is what opens a list
+/// entry or follows a link. A release anywhere else opens nothing.
+pub(crate) fn clicked(
+    pressed: &mut Option<usize>,
+    kind: MouseEventKind,
+    row: Option<usize>,
+) -> Option<usize> {
+    match kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            *pressed = row;
+            None
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let pressed = pressed.take();
+            row.filter(|&row| pressed == Some(row))
+        }
+        _ => None,
+    }
 }
 
 /// The span drawn over display `column` of `line`.

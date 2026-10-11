@@ -619,6 +619,12 @@ impl App {
                 overlay_rect = r;
             }
         }
+        if self.changelog_modal.is_open() {
+            let r = self.changelog_modal.view(frame, full);
+            if r.width > 0 {
+                overlay_rect = r;
+            }
+        }
         if self.context_modal.is_open() {
             let snapshot = self.context_snapshot.get();
             let r = self.context_modal.view(frame, full, snapshot);

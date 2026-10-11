@@ -30,8 +30,8 @@ pub(crate) const MAX_ROWS: usize = u16::MAX as usize;
 /// The notice heading a document cut to [`MAX_ROWS`] takes one row.
 const NOTICE_ROWS: usize = 1;
 const TRUNCATED: &str = "Earlier rows are left out of this view; y copies everything.";
-const WIDTH_PERCENT: u16 = 78;
-const MAX_HEIGHT_PERCENT: u16 = 85;
+pub(crate) const WIDTH_PERCENT: u16 = 78;
+pub(crate) const MAX_HEIGHT_PERCENT: u16 = 85;
 /// Columns kept clear either side of the body.
 const H_PAD: u16 = 2;
 /// The footer keeps its own row rather than trailing the content: a document

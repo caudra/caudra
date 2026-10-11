@@ -7,6 +7,7 @@ mod cmd;
 mod docs;
 mod print;
 mod progress;
+mod release_notes;
 mod sdk_mode;
 mod setup;
 mod startup;

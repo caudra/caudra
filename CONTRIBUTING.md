@@ -158,7 +158,15 @@ The first public release is `0.2.0-preview.1`, tagged `v0.2.0-preview.1`. Each p
 
 A release tag must match the workspace version exactly. Pushing it to the canonical repository authorizes CI to verify the exact commit, build all supported targets, stage a draft with installers and checksums, and publish automatically after every required check passes. Prereleases carry GitHub's pre-release flag and cannot become Latest. A failed job leaves publication incomplete rather than exposing a partial release. Ordinary pushes to `main` do not publish binaries.
 
-Write reviewed release notes in `release-notes/<version>.md` before tagging. Describe user-visible changes, known limitations and migration steps. Link new users to the [Quick Start](https://caudra.ai/docs/quick-start/) and tell existing users how to update. The pipeline reads this file from the tagged commit and adds a status line. GitHub shows the title, tag and commit beside the notes, so the notes do not repeat them. Missing notes or unresolved placeholders stop validation. The same content is used for draft creation and publication, so manual draft edits are not the authoring workflow.
+Write reviewed release notes in `release-notes/<version>.md` before tagging. The same file is the GitHub release body and what Caudra shows after an update and in `/changelog`, so it holds only what changed:
+
+1. Start with one paragraph that summarizes the release.
+2. Put anything a user must do in a `> [!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`, `[!NOTE]` or `[!TIP]` alert, and say when it applies, such as "Before you update" or "After you update, restart".
+3. Group changes under `###` headings, never `#` or `##`.
+4. Start each bullet with a bold lead-in that names the change.
+5. Leave out install and update steps. The pipeline adds a "New to Caudra?" section with the [Quick Start](https://caudra.ai/docs/quick-start/), and an "Updating from" section that names the previous release and the update command for its channel.
+
+The pipeline reads this file from the tagged commit and adds a status line. GitHub shows the title, tag and commit beside the notes, so the notes do not repeat them. Missing notes, unresolved placeholders, and notes that break these rules stop validation, and the Rust tests check every file in `release-notes/` the same way. The same content is used for draft creation and publication, so manual draft edits are not the authoring workflow.
 
 Set the GitHub Actions repository variable `CAUDRA_RUNNER_PROFILE` to select a reviewed runner mapping. An unset value defaults to `github`, using standard GitHub-hosted runners. `blacksmith` selects accelerated runners where supported. `ubicloud-blacksmith` selects Ubicloud for Linux and Blacksmith for Apple Silicon macOS and Windows. Intel macOS and lightweight control jobs remain on GitHub. The mappings live in `scripts/ci-runners.py`. Unknown profiles stop validation.
 

@@ -388,6 +388,7 @@ pub enum KeybindContext {
     Search,
     Logs,
     Docs,
+    Changelog,
     Extract,
     Btw,
     FilePicker,
@@ -429,6 +430,7 @@ impl KeybindContext {
             Self::Search => "Search",
             Self::Logs => "Logs",
             Self::Docs => "Docs",
+            Self::Changelog => "What's New",
             Self::Extract => "Extract",
             Self::Btw => "Side Question",
             Self::FilePicker => "File Picker",
@@ -1175,6 +1177,46 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Alt("Esc", "q"),
         description: "Close, keeping the place for the next /docs",
         context: KeybindContext::Docs,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::SCOPE.label),
+        description: "Every release, or only what is new since the last run",
+        context: KeybindContext::Changelog,
+    },
+    Keybind {
+        label: KeyLabel::Single("o"),
+        description: "Open the release being read on GitHub",
+        context: KeybindContext::Changelog,
+    },
+    Keybind {
+        label: KeyLabel::Alt("n", "p"),
+        description: "Next or previous release",
+        context: KeybindContext::Changelog,
+    },
+    Keybind {
+        label: KeyLabel::Alt("Tab", SHIFT_TAB_LABEL),
+        description: "Select the next or previous link on screen",
+        context: KeybindContext::Changelog,
+    },
+    Keybind {
+        label: KeyLabel::Single("Enter"),
+        description: "Follow the link: into /docs for the docs, the browser for the rest",
+        context: KeybindContext::Changelog,
+    },
+    Keybind {
+        label: KeyLabel::Alt("\u{2190}", "\u{2192}"),
+        description: "Pan across a row too wide for the reader",
+        context: KeybindContext::Changelog,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::QUIT.label),
+        description: "Copy the selection, or close",
+        context: KeybindContext::Changelog,
+    },
+    Keybind {
+        label: KeyLabel::Alt("Esc", "q"),
+        description: "Close",
+        context: KeybindContext::Changelog,
     },
     Keybind {
         label: KeyLabel::Single("y"),

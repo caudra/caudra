@@ -73,6 +73,8 @@ Or download a pre-built binary from [GitHub Releases](https://github.com/caudra/
 
 The interactive UI checks for updates in the background by default. It never installs an update automatically. Set `ui.update_check = false` in your config or `CAUDRA_ENABLE_UPDATE_CHECK=0` for one run to disable the check. See [update settings](/docs/configuration/#ui-update-check) and [manual updates](/docs/cli/#caudra-update-caudra-rollback).
 
+After an update, the first interactive start shows what changed since the release you ran before. Read the notes again with `/changelog`, or every release with `/changelog all`. Set [`ui.changelog_on_update = false`](/docs/configuration/#ui-changelog-on-update) to keep them from opening on their own.
+
 ## Connect a provider
 
 ```bash

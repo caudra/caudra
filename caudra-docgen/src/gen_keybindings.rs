@@ -27,6 +27,7 @@ const MAIN_CONTEXTS: &[KeybindContext] = &[
     KeybindContext::FormInput,
     KeybindContext::Picker,
     KeybindContext::Docs,
+    KeybindContext::Changelog,
     KeybindContext::SandboxManager,
     KeybindContext::Workbench,
 ];

@@ -338,6 +338,7 @@ To keep using `init.lua`, set `lua_plugins = true` under `[experimental]`. Its `
 | `clock_format` | String | `system` | - | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
 | `update_check` | bool | `true` | `CAUDRA_ENABLE_UPDATE_CHECK` | - | Check GitHub releases in the background at interactive startup and show a banner above the prompt when a newer version is available. Uses a shared 24-hour cache and never installs automatically. Set false to disable |
 | `update_channel` | string | `auto` | - | - | Release channel: `auto` follows stable from a stable build and preview from a prerelease, including graduation to stable. `stable` excludes prereleases. `preview` includes prereleases and stable releases |
+| `changelog_on_update` | bool | `true` | - | - | After an update, show what is new in the releases since the one you last ran, once, the next time the terminal UI starts with nothing else to show. `/changelog` shows the notes at any time. Set false to keep them to `/changelog` |
 | `theme` | string | unset | - | - | Name of the color theme to load at startup, overriding the theme you last picked with `/theme`. Unset keeps your last pick |
 | `theme_light` | string | unset | - | - | Light theme to pair with `theme`, in place of the one from the pairing table or for a theme that has no pair. `theme` becomes the dark half |
 
@@ -388,6 +389,12 @@ Set `ui.update_check = false` to disable startup checks. `CAUDRA_ENABLE_UPDATE_C
 The default, `"auto"`, follows stable releases from a stable build and preview releases from a prerelease build. `"stable"` excludes prereleases. `"preview"` includes both prereleases and stable releases, so a preview can graduate to its stable release. After graduation, `"auto"` follows stable releases.
 
 Run `caudra update --channel auto`, `caudra update --channel stable`, or `caudra update --channel preview` to update manually. An explicit update bypasses the startup cache and opt-out. The banner's command names the channel the check used, with `auto` resolved to `stable` or `preview`.
+
+### `ui.changelog_on_update`
+
+Enabled by default. The first interactive start after an update opens the release notes for every release since the one that ran before. It opens once per update, even with several Caudra processes running. A start that runs a prompt from the command line, exits when it is done, or opens on a login or trust dialog leaves the notes to the next start. A new install shows no notes. Caudra reads this setting at startup.
+
+`/changelog` opens the same notes at any time, and `/changelog all` opens every release. Press `g` in the modal to switch between the two, and `o` to open the release you are reading on GitHub.
 
 ### `ui.tool_output_lines`
 

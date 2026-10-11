@@ -210,6 +210,13 @@ version = 1
 # Type: string.
 # update_channel = "auto"
 
+# After an update, show what is new in the releases since the one you last ran,
+# once, the next time the terminal UI starts with nothing else to show.
+# `/changelog` shows the notes at any time. Set false to keep them to
+# `/changelog`.
+# Type: bool.
+# changelog_on_update = true
+
 # Name of the color theme to load at startup, overriding the theme you last
 # picked with `/theme`. Unset keeps your last pick.
 # Type: string. Default: unset.

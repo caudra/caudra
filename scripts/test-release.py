@@ -47,7 +47,18 @@ UPLOAD_ERROR = "simulated interrupted upload"
 WORKFLOWS = Path(__file__).resolve().parent.parent / ".github/workflows"
 SMOKE_WORKER_WARNING = "Workcell python_execution is unavailable"
 SMOKE_STARTUP_ERROR = "resolve data directory: Permission denied"
-CURATED_NOTES = "### Highlights\n\nVersion-specific user-facing changes.\n"
+CURATED_NOTES = (
+    "This release summarizes itself.\n\n"
+    "### Highlights\n\n"
+    "- **Version-specific.** User-facing changes.\n"
+)
+GENERATED_NEW_USERS = "### New to Caudra?"
+GENERATED_FIRST_UPDATE = "### Updating\n"
+PREVIEW_CHANNEL = "caudra update --channel preview"
+STABLE_CHANNEL = "caudra update --channel stable"
+LEAD_ERROR = "lead paragraph"
+GENERATED_ERROR = "generated section"
+PAGE_HEADING_ERROR = "### headings"
 WORKER_ACTION = WORKFLOWS.parent / "actions/code-worker/action.yml"
 MUSL_WORKER_ACTION = WORKFLOWS.parent / "actions/musl-worker/action.yml"
 WORKER_CACHE_PATHS = (
@@ -358,6 +369,62 @@ class ReleaseTests(unittest.TestCase):
         path.symlink_to(self.root / "release-notes" / "0.2.0.md")
         with self.assertRaisesRegex(ValueError, "Missing version-specific"):
             RELEASE.release_notes(TAG)
+
+    def test_release_notes_add_install_and_update_steps(self):
+        first = RELEASE.release_notes(TAG)
+        for expected in (GENERATED_NEW_USERS, GENERATED_FIRST_UPDATE, PREVIEW_CHANNEL):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, first)
+        self.assertLess(
+            first.index(CURATED_NOTES.strip()), first.index(GENERATED_NEW_USERS)
+        )
+
+        stable = RELEASE.release_notes("v0.2.0")
+        self.assertIn("### Updating from 0.2 Preview 1\n", stable)
+        self.assertIn(STABLE_CHANNEL, stable)
+        self.assertNotIn(PREVIEW_CHANNEL, stable)
+
+    def test_update_steps_name_the_previous_release_by_precedence(self):
+        notes = self.root / "release-notes"
+        for name in ("0.2.0-preview.9", "0.2.0-preview.10", "0.1.9", "0.3.0", "draft"):
+            (notes / f"{name}.md").write_text(CURATED_NOTES, encoding="utf-8")
+        self.assertEqual(RELEASE.previous_release("v0.2.0"), "v0.2.0-preview.10")
+        self.assertEqual(
+            RELEASE.previous_release("v0.2.0-preview.10"), "v0.2.0-preview.9"
+        )
+        self.assertEqual(RELEASE.previous_release("v0.2.0-preview.1"), "v0.1.9")
+        self.assertIn(
+            "### Updating from 0.2 Preview 10\n", RELEASE.release_notes("v0.2.0")
+        )
+        self.assertLess(
+            RELEASE.precedence("v0.2.0-rc.1"), RELEASE.precedence("v0.2.0-rc.beta")
+        )
+        self.assertLess(
+            RELEASE.precedence("v0.2.0-rc"), RELEASE.precedence("v0.2.0-rc.1")
+        )
+
+    def test_notes_hold_only_what_changed(self):
+        path = self.root / "release-notes" / f"{TAG[1:]}.md"
+        lead = "A summary.\n\n"
+        for content, error in (
+            ("### Highlights\n\n- **A.** B.\n", LEAD_ERROR),
+            ("> [!IMPORTANT]\n> Restart.\n", LEAD_ERROR),
+            ("- **A.** B.\n", LEAD_ERROR),
+            (f"{lead}### New to Caudra?\n\nRead on.\n", GENERATED_ERROR),
+            (f"{lead}### Updating from Preview 1\n\nRun it.\n", GENERATED_ERROR),
+            (f"{lead}## Updating\n\nRun it.\n", GENERATED_ERROR),
+            (f"{lead}## Highlights\n\n- **A.** B.\n", PAGE_HEADING_ERROR),
+            (f"{lead}# Caudra\n", PAGE_HEADING_ERROR),
+        ):
+            with (
+                self.subTest(content=content),
+                self.assertRaisesRegex(ValueError, error),
+            ):
+                path.write_text(content, encoding="utf-8")
+                RELEASE.release_notes(TAG)
+        fenced = f"{lead}### Shell\n\n```sh\n# Updating the PATH\n## comment\n```\n"
+        path.write_text(fenced, encoding="utf-8")
+        self.assertIn("# Updating the PATH", RELEASE.release_notes(TAG))
 
     def test_attribution_variable_has_a_compact_default_and_strict_values(self):
         for value in ("", "false", "0", " FALSE ", "\t0\n"):

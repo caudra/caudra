@@ -322,6 +322,10 @@ mod tests {
             example["ui"]["update_channel"].as_str(),
             Some(config.ui.update_channel.to_string().as_str())
         );
+        assert_eq!(
+            example["ui"]["changelog_on_update"].as_bool(),
+            Some(config.ui.changelog_on_update)
+        );
     }
 
     #[test]

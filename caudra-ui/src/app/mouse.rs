@@ -204,6 +204,11 @@ impl App {
             let action = self.docs_modal.handle_mouse(event);
             return self.handle_docs_action(action);
         }
+        if self.changelog_modal.is_open() && !self.permission_prompt_holds_input() {
+            self.clear_control_hovers();
+            let action = self.changelog_modal.handle_mouse(event);
+            return self.handle_changelog_action(action);
+        }
         if self.context_modal.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
             self.context_modal.handle_mouse(event);
@@ -895,8 +900,8 @@ impl App {
     /// Offers a sideways wheel to the open modal. Only the ones that draw
     /// unwrapped lines can use it; the rest reflow, so there is nothing off
     /// screen for a pan to reach and the event is dropped as it was before.
-    /// `/logs` and `/docs` are absent because they answer the wheel in their own
-    /// `handle_mouse`, which runs long before this.
+    /// `/logs`, `/docs` and `/changelog` are absent because they answer the
+    /// wheel in their own `handle_mouse`, which runs long before this.
     fn pan_modal(&mut self, delta: i32) {
         if self.peer_manager.is_open() {
             self.peer_manager.pan(delta);
@@ -1392,6 +1397,10 @@ impl App {
         dismiss!(self.usage_modal);
         dismiss!(self.logs_modal);
         dismiss!(self.docs_modal);
+        dismiss!(
+            self.changelog_modal,
+            self.handle_changelog_action(self.changelog_modal.close_action())
+        );
         dismiss!(self.context_modal);
         dismiss!(self.tools_modal);
         dismiss!(self.decisions_modal);

@@ -48,6 +48,13 @@ COMPACT_FILES = {
     "attribution.tar.gz",
 }
 POLICY_PREFIX = "<!-- caudra-attribution-layout: "
+QUICK_START_URL = "https://caudra.ai/docs/quick-start/"
+FENCE = re.compile(r"^ {0,3}(```|~~~)")
+GENERATED_HEADING = re.compile(
+    r"^#{1,6}\s*(?:New to Caudra\?|Updating\b)", re.IGNORECASE
+)
+PAGE_HEADING = re.compile(r"^#{1,2}\s")
+LEAD_BLOCK = re.compile(r"^(?:#|>|[-*+]\s|\d+[.)]\s|\||<| {4}|```|~~~)")
 COMPACT_MARKER = b"CAUDRA-ATTRIBUTION compact-v2\n"
 GRAPH_IDENTITY = ("name", "package", "version", "default_features")
 
@@ -81,6 +88,84 @@ def release_title(tag: str) -> str:
     return f"Caudra {tag[1:]}"
 
 
+def precedence(tag: str) -> tuple:
+    """SemVer precedence: a release outranks its prereleases, numeric
+    identifiers compare as numbers and rank below alphanumeric ones, and a
+    longer run of equal identifiers ranks higher."""
+    core, prerelease = version(tag)
+    if prerelease is None:
+        return (core, 1, ())
+    identifiers = tuple(
+        (0, int(part), "") if part.isdigit() else (1, 0, part)
+        for part in prerelease.split(".")
+    )
+    return (core, 0, identifiers)
+
+
+def previous_release(tag: str) -> str | None:
+    """The newest tag below `tag` that has release notes."""
+    ranked = []
+    for path in (ROOT / "release-notes").glob("*.md"):
+        candidate = f"v{path.stem}"
+        try:
+            rank = precedence(candidate)
+        except ValueError:
+            continue
+        if rank < precedence(tag):
+            ranked.append((rank, candidate))
+    return max(ranked)[1] if ranked else None
+
+
+def check_notes_structure(content: str) -> None:
+    """Release notes are also what Caudra shows after an update, so they hold
+    only what changed: a lead paragraph, then `###` groups. The sections a
+    GitHub reader needs to install or update are added by `release_notes`."""
+    first = content.lstrip().splitlines()[0]
+    require(
+        LEAD_BLOCK.match(first) is None,
+        "Release notes must start with a lead paragraph that summarizes the release",
+    )
+    fenced = False
+    for line in content.splitlines():
+        if FENCE.match(line):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        require(
+            GENERATED_HEADING.match(line) is None,
+            f"Release notes must not write the generated section {line.strip()!r}; "
+            "release.py adds the install and update steps",
+        )
+        require(
+            PAGE_HEADING.match(line) is None,
+            f"Release notes group changes under ### headings, not {line.strip()!r}",
+        )
+
+
+def generated_sections(tag: str) -> str:
+    previous = previous_release(tag)
+    heading = (
+        f"Updating from {release_title(previous).removeprefix('Caudra ')}"
+        if previous
+        else "Updating"
+    )
+    channel = "preview" if version(tag)[1] is not None else "stable"
+    return f"""### New to Caudra?
+
+Follow the [Quick Start]({QUICK_START_URL}) to install Caudra, connect a provider, and run your first session.
+
+### {heading}
+
+Run:
+
+```sh
+caudra update --channel {channel}
+```
+
+Then confirm the installed version with `caudra --version`. If you installed through a package manager, update through that package manager instead."""
+
+
 def attribution_layout(value: str) -> str:
     normalized = value.strip().lower()
     require(
@@ -110,6 +195,7 @@ def release_notes(tag: str, layout: str = "compact") -> str:
         and POLICY_PREFIX not in content,
         "Release notes contain an unresolved placeholder or reserved policy marker",
     )
+    check_notes_structure(content)
     status = (
         "Preview / prerelease. Interfaces, configuration, "
         "and stored-data formats may change."
@@ -119,6 +205,8 @@ def release_notes(tag: str, layout: str = "compact") -> str:
     return f"""**Status:** {status}
 
 {content}
+
+{generated_sections(tag)}
 
 {POLICY_PREFIX}{layout} -->
 """

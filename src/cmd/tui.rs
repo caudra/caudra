@@ -57,6 +57,7 @@ use crate::cmd::permissions::discover::{
 };
 use crate::docs;
 use crate::progress::SandboxProgress;
+use crate::release_notes;
 use crate::setup;
 
 const LOGIN_PLACEHOLDER_PROVIDER: &str = "anthropic";
@@ -1770,6 +1771,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 input_history_size: stack.config.storage.input_history_size,
                 max_log_files: stack.config.storage.max_log_files,
                 docs: docs::library,
+                release_notes: release_notes::notes,
                 permissions,
                 pattern_suggestion_loader: pattern_suggestions
                     .as_ref()

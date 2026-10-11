@@ -10,6 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 memchr = { workspace = true }
+semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

@@ -1,5 +1,6 @@
 pub(crate) mod automation_inspector;
 pub(crate) mod autopilot_panel;
+pub(crate) mod changelog_modal;
 pub(crate) mod code_view;
 pub mod command;
 pub(crate) mod command_modal;
@@ -24,6 +25,7 @@ pub(crate) mod list_picker;
 pub(crate) mod login_picker;
 pub(crate) mod logs_modal;
 pub(crate) mod lua_float;
+pub(crate) mod markdown_reader;
 pub(crate) mod mcp_picker;
 pub(crate) mod memory_card;
 pub(crate) mod memory_inspector;

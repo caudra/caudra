@@ -1064,6 +1064,7 @@ name = "caudra-docs"
 version = "0.2.0-preview.5"
 dependencies = [
  "memchr",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",

@@ -1103,6 +1103,7 @@ pub struct UiFileConfig {
     pub max_input_lines: Option<u32>,
     pub update_check: Option<bool>,
     pub update_channel: Option<UpdateChannel>,
+    pub changelog_on_update: Option<bool>,
 }
 
 impl UiFileConfig {
@@ -1131,7 +1132,8 @@ impl UiFileConfig {
             clock_format,
             max_input_lines,
             update_check,
-            update_channel
+            update_channel,
+            changelog_on_update
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -2290,6 +2292,12 @@ pub struct UiConfig {
     pub update_channel: UpdateChannel,
 
     #[config(
+        default = true,
+        desc = "After an update, show what is new in the releases since the one you last ran, once, the next time the terminal UI starts with nothing else to show. `/changelog` shows the notes at any time. Set false to keep them to `/changelog`"
+    )]
+    pub changelog_on_update: bool,
+
+    #[config(
         ty = "string",
         default = "None",
         desc = "Name of the color theme to load at startup, overriding the theme you last picked with `/theme`. Unset keeps your last pick"
@@ -2345,6 +2353,7 @@ impl UiConfig {
             clock_format: f.clock_format.unwrap_or_default(),
             update_check: f.update_check.unwrap_or(true),
             update_channel: f.update_channel.unwrap_or_default(),
+            changelog_on_update: f.changelog_on_update.unwrap_or(true),
             theme: f.theme,
             theme_light: f.theme_light,
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
@@ -7038,6 +7047,26 @@ mod tests {
         assert!(
             config.ui.show_thinking,
             "reasoning is part of the answer and shows unless it is turned off"
+        );
+    }
+
+    #[test_case("" => true; "missing_defaults_on")]
+    #[test_case("[ui]\nchangelog_on_update = false\n" => false; "disabled")]
+    #[test_case("[ui]\nchangelog_on_update = true\n" => true; "enabled")]
+    fn changelog_on_update_deserializes(toml: &str) -> bool {
+        let raw: RawConfig = toml::from_str(toml).unwrap();
+        raw.into_config(false).unwrap().ui.changelog_on_update
+    }
+
+    #[test_case(true; "enabled")]
+    #[test_case(false; "disabled")]
+    fn changelog_on_update_overlay_wins(enabled: bool) {
+        let mut base: RawConfig =
+            toml::from_str(&format!("[ui]\nchangelog_on_update = {}\n", !enabled)).unwrap();
+        base.merge(toml::from_str(&format!("[ui]\nchangelog_on_update = {enabled}\n")).unwrap());
+        assert_eq!(
+            base.into_config(false).unwrap().ui.changelog_on_update,
+            enabled
         );
     }
 

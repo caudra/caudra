@@ -8,8 +8,9 @@
 //! `/docs` reopens where it was left.
 
 mod contents;
-mod reader;
 mod search;
+
+use std::borrow::Cow;
 
 use caudra_docs::{DocsLibrary, Library, Target};
 use caudra_grab::grab_scope;
@@ -24,6 +25,7 @@ use ratatui::widgets::Paragraph;
 use crate::components::document_view::{COPIED_SELECTION, Jump};
 use crate::components::keybindings::key;
 use crate::components::list_picker::truncate_label;
+use crate::components::markdown_reader::{Reader, ReaderMouse, clicked};
 use crate::components::modal::{CLOSE_HINT, ESC_LABEL, FooterHits, FooterLine, Modal, SEPARATOR};
 use crate::components::{
     Overlay, PAN_STEP, chevron_span, escape_terminal_controls, field_styles, input_text_style,
@@ -31,7 +33,6 @@ use crate::components::{
 };
 use crate::theme::{self, Theme};
 use contents::Contents;
-use reader::{Reader, ReaderMouse};
 use search::SearchView;
 
 const TITLE: &str = "Docs";
@@ -50,6 +51,7 @@ const READER_MIN_COLS: u16 = 64;
 const PAGE_TITLE_LEVEL: u8 = 1;
 const SECTION_LEVEL: u8 = 2;
 const KEY_GAP: &str = " ";
+const HEADING_MARK: char = '#';
 /// How the footer draws itself, widest first: glossed, then keys alone, then
 /// keys packed. Every key is on every rung, so a narrow terminal loses words
 /// and never a key.
@@ -148,7 +150,7 @@ pub struct DocsModal {
     back: Vec<Location>,
     forward: Vec<Location>,
     pane: Pane,
-    reader: Reader,
+    reader: Reader<Shown>,
     contents: Contents,
     search: SearchView,
     footer: FooterHits,
@@ -216,6 +218,12 @@ impl DocsModal {
 
     pub fn contains(&self, position: Position) -> bool {
         self.open && self.popup.contains(position)
+    }
+
+    /// Whether `target` is a place in the docs rather than an address for the
+    /// browser.
+    pub fn knows(&self, target: &str) -> bool {
+        self.library().locate(target).is_some()
     }
 
     pub(crate) fn text_input_active(&self) -> bool {
@@ -368,7 +376,11 @@ impl DocsModal {
                     width: inner.right().saturating_sub(main.x),
                     ..inner
                 };
-                self.reader.draw(frame, bars, main, &context, self.shown)
+                let shown = self.shown;
+                self.reader
+                    .draw(frame, bars, main, self.pointer, shown, || {
+                        page_source(library, shown)
+                    })
             }
         };
         let line = match link {
@@ -687,19 +699,26 @@ fn link_line(library: &Library, target: &str, width: u16, theme: &Theme) -> Line
     Line::from(Span::styled(place, theme.status_notice)).alignment(Alignment::Center)
 }
 
-/// The row a press and its release both landed on, which is what opens a list
-/// entry or follows a link. A release anywhere else opens nothing.
-fn clicked(pressed: &mut Option<usize>, kind: MouseEventKind, row: Option<usize>) -> Option<usize> {
-    match kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            *pressed = row;
-            None
+/// The Markdown `shown` reads, and the lines its headings are on.
+fn page_source(library: &Library, shown: Shown) -> (Cow<'_, str>, Vec<usize>) {
+    match shown {
+        Shown::Contents => {
+            let text = library.contents_markdown();
+            let headings = text
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| line.starts_with(HEADING_MARK))
+                .map(|(line, _)| line)
+                .collect();
+            (Cow::Owned(text), headings)
         }
-        MouseEventKind::Up(MouseButton::Left) => {
-            let pressed = pressed.take();
-            row.filter(|&row| pressed == Some(row))
+        Shown::Page(index) => {
+            let page = &library.pages()[index];
+            (
+                Cow::Borrowed(page.display.as_str()),
+                page.headings.iter().map(|heading| heading.line).collect(),
+            )
         }
-        _ => None,
     }
 }
 

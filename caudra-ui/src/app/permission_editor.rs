@@ -1118,7 +1118,7 @@ impl App {
         }
     }
 
-    pub(super) fn permission_job_pending(&self) -> bool {
+    pub(crate) fn permission_job_pending(&self) -> bool {
         self.permission_ui.pending.is_some()
     }
 

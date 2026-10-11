@@ -8,6 +8,7 @@ pub mod automation;
 #[path = "sessions/autopilot.rs"]
 pub mod autopilot;
 pub mod background;
+pub mod changelog;
 pub mod checkout;
 pub mod decision_log;
 pub mod digest_trust;

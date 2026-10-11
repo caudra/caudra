@@ -412,6 +412,20 @@ fn write_update_check_section(out: &mut String) {
          `preview`.\n"
     )
     .unwrap();
+    writeln!(out, "### `ui.changelog_on_update`\n").unwrap();
+    writeln!(
+        out,
+        "Enabled by default. The first interactive start after an update opens \
+         the release notes for every release since the one that ran before. It \
+         opens once per update, even with several Caudra processes running. A \
+         start that runs a prompt from the command line, exits when it is done, \
+         or opens on a login or trust dialog leaves the notes to the next start. \
+         A new install shows no notes. Caudra reads this setting at startup.\n\n\
+         `/changelog` opens the same notes at any time, and `/changelog all` \
+         opens every release. Press `g` in the modal to switch between the two, \
+         and `o` to open the release you are reading on GitHub.\n"
+    )
+    .unwrap();
 }
 
 fn write_retention_section(out: &mut String) {

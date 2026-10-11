@@ -7,6 +7,7 @@
 mod display;
 mod index;
 mod markdown;
+mod release_notes;
 mod search;
 mod slug;
 
@@ -18,6 +19,7 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 use thiserror::Error;
 
+pub use release_notes::{RELEASES_URL, Release, ReleaseNotes, ReleaseNotesSource};
 pub use search::{Correction, Hit, Search};
 
 pub const NAME: &str = "caudra-docs";

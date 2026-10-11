@@ -6,6 +6,7 @@ use crate::app::sandbox::attached_sandbox_instance;
 use crate::app::tasks::{MAIN_TASK_ID, TaskStatus};
 use crate::app::tooltip::ChordTopic;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
+use crate::components::changelog_modal::fixture as changelog_fixture;
 use crate::components::command::{BUILTIN_COMMANDS, CommandPalette, ParsedCommand};
 use crate::components::context_modal::{
     EXPANDED_TITLE as CONTEXT_EXPANDED_TITLE, TITLE as CONTEXT_TITLE,
@@ -89,6 +90,7 @@ use caudra_providers::{
     project_messages,
 };
 use caudra_storage::StateClass;
+use caudra_storage::changelog;
 use caudra_storage::id::CaudraId;
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::permission_patterns::{
@@ -382,6 +384,10 @@ const GOAL_CHIP_PREFIX: &str = "[goal \u{b7}";
 const CONTEXT_COMMAND: &str = "/context";
 const LOGS_COMMAND: &str = "/logs";
 const DOCS_COMMAND: &str = "/docs";
+const CHANGELOG_COMMAND: &str = "/changelog";
+const SINCE_CHANGELOG_TITLE: &str = "What's new since ";
+const ALL_CHANGELOG_TITLE: &str = "Release notes - all";
+const CHANGELOG_UNSETTLED: &str = "opening /changelog must settle the notes owed";
 const DOCS_ADDRESS: &str = "permissions#modes";
 const DOCS_QUERY: &str = "shell timeout";
 const IMAGE_PATH_PASTE: &str = "file:///tmp/nonexistent.png";
@@ -472,6 +478,7 @@ fn build_app_with_lua(
         100,
         caudra_storage::log::DEFAULT_MAX_FILES,
         docs_fixture::library,
+        changelog_fixture::notes,
         Arc::new(PermissionManager::new_nonpersistent(
             PermissionsConfig {
                 rules: vec![],
@@ -8004,6 +8011,83 @@ fn the_docs_command_opens_where_its_argument_points(args: &str, searching: bool)
     );
     assert!(app.docs_modal.is_open());
     assert_eq!(app.docs_modal.text_input_active(), searching);
+}
+
+fn open_changelog(app: &mut App, args: &str) {
+    app.execute_command(
+        ParsedCommand {
+            name: CHANGELOG_COMMAND.into(),
+            args: args.into(),
+        },
+        0,
+    );
+}
+
+#[test]
+fn the_changelog_command_shows_what_is_new_since_the_last_release_and_settles_it() {
+    let (_tmp, dir, _writer, mut app) = tempdir_app();
+    changelog::on_start(&dir, changelog_fixture::MIDDLE, false).unwrap();
+    changelog::on_start(&dir, update::CURRENT, false).unwrap();
+
+    open_changelog(&mut app, "");
+
+    let screen = rendered(&mut app);
+    let title = format!("{SINCE_CHANGELOG_TITLE}{}", changelog_fixture::MIDDLE);
+    assert!(screen.contains(&title), "{screen}");
+    assert!(
+        !changelog::read(&dir).unwrap().pending,
+        "{CHANGELOG_UNSETTLED}"
+    );
+}
+
+#[test_case("all", true ; "all_opens_every_release")]
+#[test_case("everything", false ; "other_words_flash_the_usage")]
+fn the_changelog_command_takes_only_all(args: &str, opens: bool) {
+    let mut app = test_app();
+    open_changelog(&mut app, args);
+    assert_eq!(
+        app.status_bar.flash_text(),
+        (!opens).then_some(CHANGELOG_USAGE)
+    );
+    let screen = rendered(&mut app);
+    assert_eq!(app.changelog_modal.is_open(), opens);
+    assert_eq!(screen.contains(ALL_CHANGELOG_TITLE), opens, "{screen}");
+}
+
+/// The first link is the newest release's GitHub page, then the notes' own.
+#[test_case(&[KeyCode::Tab, KeyCode::Tab, KeyCode::Enter], None ; "a_docs_link_opens_the_docs")]
+#[test_case(&[KeyCode::Tab, KeyCode::Tab, KeyCode::Tab, KeyCode::Enter], Some(changelog_fixture::EXTERNAL_LINK) ; "another_link_opens_the_browser")]
+fn a_link_in_the_release_notes_opens_where_it_leads(keys: &[KeyCode], browser: Option<&str>) {
+    let mut app = test_app();
+    open_changelog(&mut app, "all");
+    let _ = rendered(&mut app);
+
+    let actions: Vec<_> = keys
+        .iter()
+        .flat_map(|&code| app.update(Msg::Key(key(code))))
+        .collect();
+
+    match browser {
+        Some(url) => assert!(matches!(&actions[..], [Action::OpenUrl(target)] if target == url)),
+        None => assert!(actions.is_empty()),
+    }
+    assert_eq!(app.docs_modal.is_open(), browser.is_none());
+    assert_eq!(app.changelog_modal.is_open(), browser.is_some());
+}
+
+#[test]
+fn closing_notes_that_opened_on_their_own_says_how_to_read_them_again() {
+    let mut app = test_app();
+    app.open_changelog_after_update(Some(changelog_fixture::OLDEST.to_owned()));
+    assert!(app.changelog_modal.is_open());
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(!app.changelog_modal.is_open());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(changelog_modal::REOPEN_HINT)
+    );
 }
 
 const HELP_FOOTER_MISSING: &str = "the help footer must offer /docs";
@@ -18176,6 +18260,10 @@ fn open_docs_modal(app: &mut App) {
     app.execute_command(cmd(DOCS_COMMAND), 0);
 }
 
+fn open_changelog_modal(app: &mut App) {
+    open_changelog(app, "all");
+}
+
 fn open_tools_modal(app: &mut App) {
     app.tools_modal.open();
 }
@@ -18228,6 +18316,7 @@ fn open_argument_prompt(app: &mut App) {
 #[test_case(open_context_modal ; "context_modal")]
 #[test_case(open_logs_modal    ; "logs_modal")]
 #[test_case(open_docs_modal    ; "docs_modal")]
+#[test_case(open_changelog_modal ; "changelog_modal")]
 #[test_case(open_tools_modal   ; "tools_modal")]
 #[test_case(open_decisions_modal ; "decisions_modal")]
 #[test_case(open_skills_modal  ; "skills_modal")]
@@ -18261,6 +18350,7 @@ fn a_press_outside_a_modal_dismisses_it(open: fn(&mut App)) {
 #[test_case(open_context_modal ; "context_modal")]
 #[test_case(open_logs_modal    ; "logs_modal")]
 #[test_case(open_docs_modal    ; "docs_modal")]
+#[test_case(open_changelog_modal ; "changelog_modal")]
 #[test_case(open_tools_modal   ; "tools_modal")]
 #[test_case(open_decisions_modal ; "decisions_modal")]
 #[test_case(open_skills_modal  ; "skills_modal")]

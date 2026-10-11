@@ -22,6 +22,7 @@ A command with an Experiment entry exists only while that switch is on under `[e
 | `/storage` | Inspect what the state directory holds |  |  |
 | `/logs` | Browse the structured log |  |  |
 | `/docs` | Read Caudra's documentation, or search it |  |  |
+| `/changelog` | Show what's new in Caudra, or every release with `all` |  |  |
 | `/tools` | Show which tools the model can reach |  |  |
 | `/skills` | Show the skills the model can load and where they come from |  |  |
 | `/queue` | Inspect and edit queued prompts |  |  |

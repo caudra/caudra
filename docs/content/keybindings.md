@@ -158,6 +158,19 @@ These keys work the same in every text field: the composer, a picker's filter, f
 | `Ctrl+C` | Copy the selection, or close |
 | `Esc` / `q` | Close, keeping the place for the next /docs |
 
+## What's New
+
+| Key | Action |
+|-----|--------|
+| `g` | Every release, or only what is new since the last run |
+| `o` | Open the release being read on GitHub |
+| `n` / `p` | Next or previous release |
+| `Tab` / `Shift+Tab` | Select the next or previous link on screen |
+| `Enter` | Follow the link: into /docs for the docs, the browser for the rest |
+| `←` / `→` | Pan across a row too wide for the reader |
+| `Ctrl+C` | Copy the selection, or close |
+| `Esc` / `q` | Close |
+
 ## Sandbox Manager
 
 These keys exist only with `sandboxes = true` under `[experimental]`. See [Experimental features](/docs/configuration/#experimental-features).

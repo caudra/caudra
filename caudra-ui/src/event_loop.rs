@@ -57,7 +57,7 @@ use caudra_config::{
     AutomationsConfig, AutopilotConfig, Feature, ModelPolicy, SnapshotsConfig, UiConfig,
     fail_closed_permissions,
 };
-use caudra_docs::DocsLibrary;
+use caudra_docs::{DocsLibrary, ReleaseNotesSource};
 use caudra_lua::{
     EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, SessionRequest,
     TaskRequest, UiAction, UiReply,
@@ -68,6 +68,7 @@ use caudra_providers::provider::{Provider, fetch_all_models, from_model};
 use caudra_providers::{HistoryItem, Message, Model};
 use caudra_storage::StateDir;
 use caudra_storage::StorageError;
+use caudra_storage::changelog;
 use caudra_storage::checkout;
 use caudra_storage::id::{CaudraId, CaudraIdParseError, SessionRef};
 use caudra_storage::remote_operation_journal::RemoteOperationJournal;
@@ -119,7 +120,7 @@ use crate::herdr::{
 use crate::input::InputReader;
 use crate::repaint::{Dirty, FrameLimiter, IDLE_POLL};
 use crate::theme;
-use crate::update::UpdateNotice;
+use crate::update::{self, UpdateNotice};
 use crate::{
     AppSession, ChangeServiceFactory, PatternSuggestionLoader, PermissionAuthorityFactory,
     SessionRelocationHandoff, SessionTab,
@@ -250,6 +251,7 @@ pub struct EventLoopParams {
     pub input_history_size: usize,
     pub max_log_files: u32,
     pub docs: DocsLibrary,
+    pub release_notes: ReleaseNotesSource,
     pub permissions: Arc<PermissionManager>,
     pub pattern_suggestion_loader: Option<PatternSuggestionLoader>,
     pub permission_authority_factory: Option<PermissionAuthorityFactory>,
@@ -1127,6 +1129,7 @@ struct SpawnCtx {
     input_history_size: usize,
     max_log_files: u32,
     docs: DocsLibrary,
+    release_notes: ReleaseNotesSource,
     /// Prototype only: every runtime forks its own manager so session
     /// rules stay per-session.
     permissions: Arc<PermissionManager>,
@@ -1400,6 +1403,7 @@ impl SpawnCtx {
             self.input_history_size,
             self.max_log_files,
             self.docs,
+            self.release_notes,
             permissions,
             if self.no_commands {
                 Arc::from([])
@@ -1743,6 +1747,18 @@ fn spawn_model_fetch(
     }
 }
 
+/// The notes owed after an update open only on a start with nothing else on
+/// screen to do: no prompt from the command line, no exit once it finishes, and
+/// no dialog already waiting on the user.
+fn changelog_open_now(
+    enabled: bool,
+    has_initial_prompt: bool,
+    exit_on_done: bool,
+    dialog_open: bool,
+) -> bool {
+    enabled && !has_initial_prompt && !exit_on_done && !dialog_open
+}
+
 fn should_open_startup_login(needs_login: bool, providers: &ProvidersConfig) -> bool {
     needs_login
         && !providers.providers.iter().any(|(slug, definition)| {
@@ -1779,6 +1795,7 @@ impl<'t> EventLoop<'t> {
             input_history_size,
             max_log_files,
             docs,
+            release_notes,
             permissions,
             pattern_suggestion_loader,
             permission_authority_factory,
@@ -1879,6 +1896,7 @@ impl<'t> EventLoop<'t> {
             input_history_size,
             max_log_files,
             docs,
+            release_notes,
             permissions,
             pattern_suggestion_loader,
             permission_authority_factory,
@@ -2003,6 +2021,25 @@ impl<'t> EventLoop<'t> {
         &mut self.sessions[self.focused].app
     }
 
+    /// Records the release this start runs, and shows the notes owed for an
+    /// update when this start is the one to claim them.
+    fn open_changelog_if_owed(&mut self, has_initial_prompt: bool) {
+        let app = &self.sessions[self.focused].app;
+        let open_now = changelog_open_now(
+            self.ctx.ui_config.changelog_on_update,
+            has_initial_prompt,
+            app.exit_on_done,
+            // The trust review of a project's permissions opens once its
+            // inventory loads, after this.
+            app.any_overlay_open() || app.permission_job_pending(),
+        );
+        match changelog::on_start(&self.ctx.storage, update::CURRENT, open_now) {
+            Ok(Some(since)) => self.focused_app().open_changelog_after_update(since),
+            Ok(None) => {}
+            Err(error) => warn!(%error, open_now, "failed to record the release this start runs"),
+        }
+    }
+
     fn herdr_resume(&self) -> HerdrResume {
         let session = &self.sessions[self.focused].app.state.session;
         if self.ctx.storage.is_ephemeral() {
@@ -2024,6 +2061,7 @@ impl<'t> EventLoop<'t> {
         // until that frame is the one on screen.
         let mut limiter = FrameLimiter::default();
         let mut urgent = false;
+        self.open_changelog_if_owed(initial_prompt.is_some());
         let result = loop {
             if self.relocation.is_some() || self.sandbox.is_some() || self.sandbox_control.is_some()
             {
@@ -5070,6 +5108,7 @@ mod tests {
     use crate::app::tests::automation_runtime::{COURIER_MESSAGE, LinkedAutomations};
     use crate::app::tests::{plan_app, private_tempdir, test_app};
     use crate::app::{Mode, PlanState};
+    use crate::components::changelog_modal::fixture as changelog_fixture;
     use crate::components::docs_modal::fixture as docs_fixture;
     use crate::components::{key, test_model};
     use crate::sandbox::transfer::{TransferCommand, TransferLink, TransferScope};
@@ -5230,6 +5269,7 @@ mod tests {
             input_history_size: RELOCATION_INPUT_HISTORY,
             max_log_files: caudra_storage::log::DEFAULT_MAX_FILES,
             docs: docs_fixture::library,
+            release_notes: changelog_fixture::notes,
             permissions: Arc::clone(&source.permissions),
             pattern_suggestion_loader: None,
             permission_authority_factory: None,
@@ -5500,6 +5540,7 @@ mod tests {
             RELOCATION_INPUT_HISTORY,
             caudra_storage::log::DEFAULT_MAX_FILES,
             docs_fixture::library,
+            changelog_fixture::notes,
             Arc::new(PermissionManager::new_nonpersistent(
                 PermissionsConfig::default(),
                 cwd.to_path_buf(),
@@ -6004,6 +6045,20 @@ mod tests {
         expected: ProgramStatus,
     ) {
         assert_eq!(exit_program_status(status, exit_on_done, failed), expected);
+    }
+
+    #[test_case(true, false, false, false => true; "clean_start")]
+    #[test_case(false, false, false, false => false; "turned_off")]
+    #[test_case(true, true, false, false => false; "initial_prompt")]
+    #[test_case(true, false, true, false => false; "exit_on_done")]
+    #[test_case(true, false, false, true => false; "dialog_open")]
+    fn changelog_opens_only_on_a_clean_start(
+        enabled: bool,
+        has_initial_prompt: bool,
+        exit_on_done: bool,
+        dialog_open: bool,
+    ) -> bool {
+        changelog_open_now(enabled, has_initial_prompt, exit_on_done, dialog_open)
     }
 
     #[test_case(Event::FocusGained, false; "focus_is_not_acknowledgment")]

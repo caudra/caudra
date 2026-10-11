@@ -57,6 +57,9 @@ use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT, format
 use crate::clipboard::{ClipboardState, CopyResult};
 use crate::components::automation_inspector::{AutomationAction, AutomationInspector};
 use crate::components::autopilot_panel::AutopilotPanel;
+use crate::components::changelog_modal::{
+    self, ChangelogAction, ChangelogModal, View as ChangelogView,
+};
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand, disabled_feature};
 use crate::components::command_modal::{CommandModal, CommandModalAction};
 use crate::components::commit_popup::{CommitAction, CommitIndex, CommitPopup};
@@ -156,7 +159,7 @@ use caudra_config::{
     Feature, FeatureDisabled, FeatureFlags, ModelPolicy, PermissionsConfig, SnapshotsConfig,
     UiConfig,
 };
-use caudra_docs::DocsLibrary;
+use caudra_docs::{DocsLibrary, ReleaseNotesSource};
 use caudra_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
 };
@@ -182,7 +185,7 @@ use serde_json::Value;
 use smol::Task;
 
 use crate::storage_writer::StorageWriter;
-use crate::update::{Available, UpdateNotice};
+use crate::update::{self, Available, UpdateNotice};
 use ratatui::layout::{Position, Rect};
 
 pub(crate) use crate::agent::QueuedMessage;
@@ -212,6 +215,7 @@ const FLASH_NO_CHORD: &str = "is not a chord";
 const RETRY_COUNTDOWN_UNAVAILABLE: &str =
     "Retry countdown unavailable: delay exceeds the platform clock range";
 const CONTEXT_USAGE: &str = "Usage: /context [all]";
+const CHANGELOG_USAGE: &str = "Usage: /changelog [all]";
 const STORAGE_USAGE: &str = "Usage: /storage [all]";
 const TOOLS_USAGE: &str = "Usage: /tools";
 const SKILLS_USAGE: &str = "Usage: /skills";
@@ -478,6 +482,7 @@ pub struct App {
     pub(super) context_modal: ContextModal,
     pub(super) logs_modal: LogsModal,
     pub(super) docs_modal: DocsModal,
+    pub(super) changelog_modal: ChangelogModal,
     pub(super) tools_modal: ToolsModal,
     pub(super) decisions_modal: DecisionsModal,
     pub(super) skills_modal: SkillsModal,
@@ -735,6 +740,7 @@ impl App {
         input_history_size: usize,
         max_log_files: u32,
         docs: DocsLibrary,
+        release_notes: ReleaseNotesSource,
         permissions: Arc<PermissionManager>,
         custom_commands: Arc<[caudra_agent::command::CustomCommand]>,
         lua_event_handle: EventHandle,
@@ -794,6 +800,7 @@ impl App {
             context_modal: ContextModal::new(),
             logs_modal: LogsModal::new(max_log_files),
             docs_modal: DocsModal::new(docs),
+            changelog_modal: ChangelogModal::new(release_notes, update::CURRENT),
             tools_modal: ToolsModal::new(),
             decisions_modal: DecisionsModal::new(),
             skills_modal: SkillsModal::new(),
@@ -1890,6 +1897,7 @@ impl App {
         self.system_prompt_modal.close();
         self.projection_modal.close();
         self.docs_modal.close();
+        self.changelog_modal.close();
         if self.permissions_picker.is_open() {
             self.suspend_permission_editor();
             self.permission_config_trust_deferred =
@@ -1942,6 +1950,10 @@ impl App {
         }
         if self.docs_modal.is_open() {
             self.docs_modal.scroll_at(pos, delta);
+            return None;
+        }
+        if self.changelog_modal.is_open() {
+            self.changelog_modal.scroll(delta);
             return None;
         }
         if self.context_modal.is_open() {
@@ -2341,6 +2353,12 @@ impl App {
             guard_repeat!(self.docs_modal.text_input_active());
             let action = self.docs_modal.handle_key(key);
             return Some(self.handle_docs_action(action));
+        }
+
+        if self.changelog_modal.is_open() {
+            guard_repeat!(false);
+            let action = self.changelog_modal.handle_key(key);
+            return Some(self.handle_changelog_action(action));
         }
 
         if self.context_modal.is_open() {
@@ -4074,6 +4092,51 @@ impl App {
         vec![]
     }
 
+    /// A link into the docs opens there, in place of the notes; any other goes
+    /// to the browser.
+    pub(super) fn handle_changelog_action(&mut self, action: ChangelogAction) -> Vec<Action> {
+        match action {
+            ChangelogAction::Consumed => {}
+            ChangelogAction::Close { auto } => {
+                self.changelog_modal.close();
+                if auto {
+                    self.flash(changelog_modal::REOPEN_HINT.into());
+                }
+            }
+            ChangelogAction::Copy { text, label } => self.copy_labelled(&text, label),
+            ChangelogAction::Follow(target) if self.docs_modal.knows(&target) => {
+                self.changelog_modal.close();
+                self.docs_modal.open(&target);
+            }
+            ChangelogAction::Follow(target) => return vec![Action::OpenUrl(target)],
+        }
+        vec![]
+    }
+
+    /// `/changelog` opens on the releases since the one run before this,
+    /// which only holds while this is the release the mark was last advanced
+    /// to; `/changelog all` opens on every release.
+    fn execute_changelog(&mut self, args: &str) {
+        let view = match args.trim() {
+            "" => ChangelogView::Since,
+            arg if arg.eq_ignore_ascii_case("all") => ChangelogView::All,
+            _ => {
+                self.flash(CHANGELOG_USAGE.into());
+                return;
+            }
+        };
+        let since = caudra_storage::changelog::read(&self.storage)
+            .filter(|mark| mark.seen == update::CURRENT)
+            .and_then(|mark| mark.since);
+        caudra_storage::changelog::acknowledge(&self.storage);
+        self.changelog_modal.open(view, since);
+    }
+
+    /// Shows the notes owed after an update, claimed by this start.
+    pub(crate) fn open_changelog_after_update(&mut self, since: Option<String>) {
+        self.changelog_modal.open_after_update(since);
+    }
+
     /// Copies `text` and says so in `label`'s words. An empty copy stays
     /// quiet, since there was nothing to hand over.
     fn copy_labelled(&mut self, text: &str, label: &str) {
@@ -5674,6 +5737,10 @@ impl App {
                 self.docs_modal.open(&cmd.args);
                 vec![]
             }
+            "/changelog" => {
+                self.execute_changelog(&cmd.args);
+                vec![]
+            }
             "/tools" => {
                 self.execute_tools();
                 vec![]
@@ -6174,11 +6241,12 @@ impl App {
         }
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 46] {
+    fn overlays(&self) -> [&dyn Overlay; 47] {
         [
             &self.workbench,
             &self.logs_modal,
             &self.docs_modal,
+            &self.changelog_modal,
             &self.help_modal,
             &self.usage_modal,
             &self.context_modal,
@@ -6225,11 +6293,12 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 46] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 47] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
             &mut self.docs_modal,
+            &mut self.changelog_modal,
             &mut self.help_modal,
             &mut self.usage_modal,
             &mut self.context_modal,
