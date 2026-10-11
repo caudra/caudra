@@ -20,7 +20,9 @@ use crate::agent::{resolve_purpose_model, resolve_purpose_model_for_inspection};
 
 pub const BUILTIN_PROFILE_NAME: &str = "builtin";
 
-pub(crate) const PROFILE_DIR: &str = "system-prompts";
+pub const PROFILE_DIR: &str = "system-prompts";
+/// A profile is the file `{name}.{PROFILE_EXTENSION}` in [`PROFILE_DIR`].
+pub const PROFILE_EXTENSION: &str = "md";
 const MAX_PROFILE_BYTES: usize = 64 * 1024;
 const MAX_PROFILE_NAME_BYTES: usize = 64;
 const MAX_TASK_SUMMARY_ENTRIES: usize = 20;
@@ -138,6 +140,12 @@ impl SystemPromptProfile {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Whether `other` builds the same system prompt, as a file saved again
+    /// unchanged, or changed only outside its body and layout, does.
+    pub fn same_prompt(&self, other: &Self) -> bool {
+        self.layout == other.layout && self.body == other.body
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -204,7 +212,7 @@ impl PromptProfileCatalog {
         Self::discover_with(caudra_storage::paths::config_dir().ok().as_deref())
     }
 
-    pub(crate) fn discover_with(config_dir: Option<&Path>) -> Self {
+    pub fn discover_with(config_dir: Option<&Path>) -> Self {
         let mut catalog = Self::default();
         if let Some(dir) = caudra_storage::paths::user_config_dir(config_dir, PROFILE_DIR) {
             catalog.load_dir(&dir);
@@ -218,6 +226,41 @@ impl PromptProfileCatalog {
 
     pub fn get(&self, name: &str) -> Option<Arc<SystemPromptProfile>> {
         self.profiles.get(name).cloned()
+    }
+
+    /// Swaps `profile` for this catalog's copy of it. A profile the catalog
+    /// lost, deleted or broken, stays as it was loaded, so a session never
+    /// loses the prompt it runs on.
+    pub fn refresh(&self, profile: &mut Option<Arc<SystemPromptProfile>>) {
+        if let Some(fresh) = profile
+            .as_ref()
+            .and_then(|current| self.get(current.name()))
+        {
+            *profile = Some(fresh);
+        }
+    }
+
+    /// This catalog, holding `profile` as it was loaded where the catalog lost
+    /// it, so the session running on it, and the tasks it starts, go on
+    /// resolving it.
+    pub fn keeping(self: Arc<Self>, profile: Option<&Arc<SystemPromptProfile>>) -> Arc<Self> {
+        let Some(profile) = profile.filter(|profile| !self.profiles.contains_key(profile.name()))
+        else {
+            return self;
+        };
+        let mut catalog = Self::clone(&self);
+        catalog.invalid.remove(profile.name());
+        catalog
+            .profiles
+            .insert(Arc::clone(&profile.name), Arc::clone(profile));
+        Arc::new(catalog)
+    }
+
+    /// Profiles that failed to load, by name, with the reason.
+    pub fn invalid(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.invalid
+            .iter()
+            .map(|(name, reason)| (name.as_ref(), reason.as_ref()))
     }
 
     pub fn resolve(
@@ -344,7 +387,10 @@ impl PromptProfileCatalog {
         let mut paths = entries
             .filter_map(Result::ok)
             .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|extension| extension == "md"))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == PROFILE_EXTENSION)
+            })
             .filter(|path| fs::metadata(path).is_ok_and(|metadata| metadata.is_file()))
             .collect::<Vec<_>>();
         paths.sort();
@@ -760,6 +806,11 @@ mod tests {
     const NOT_KEBAB_CASE: &str = "Join_Swarm";
     /// The compact JSON around the string in `{k: …}` args.
     const ARGS_FRAME: &str = r#"{"k":""}"#;
+    const REVIEW: &str = "review";
+    const REVIEW_FILE: &str = "review.md";
+    const LOADED_BODY: &str = "Review carefully.";
+    const EDITED_BODY: &str = "Review every line.";
+    const BROKEN_PROFILE: &str = "---\nlayout: nope\n---\nReview carefully.";
 
     fn inspection_catalog(model: Option<&str>, thinking: Option<&str>) -> PromptProfileCatalog {
         let name: Arc<str> = Arc::from(INSPECTION_PROFILE);
@@ -1228,6 +1279,44 @@ mod tests {
 
         let error = discover(dir.path()).resolve(Some("bad")).unwrap_err();
         assert!(error.to_string().contains("is invalid"));
+    }
+
+    /// Loads `review` as `LOADED_BODY`, then reads the catalog again after
+    /// `saved` replaced the file, or deleted it when `None`.
+    fn loaded_then_saved(saved: Option<&str>) -> (Arc<SystemPromptProfile>, PromptProfileCatalog) {
+        let dir = TempDir::new().unwrap();
+        let file = profile_dir(&dir).join(REVIEW_FILE);
+        fs::write(&file, LOADED_BODY).unwrap();
+        let loaded = discover(dir.path()).get(REVIEW).unwrap();
+        match saved {
+            Some(text) => fs::write(&file, text).unwrap(),
+            None => fs::remove_file(&file).unwrap(),
+        }
+        (loaded, discover(dir.path()))
+    }
+
+    #[test_case(Some(EDITED_BODY), EDITED_BODY ; "an_edited_profile_is_swapped_in")]
+    #[test_case(Some(BROKEN_PROFILE), LOADED_BODY ; "a_broken_profile_stays_as_loaded")]
+    #[test_case(None, LOADED_BODY ; "a_deleted_profile_stays_as_loaded")]
+    fn refresh_follows_the_catalog_without_dropping_a_profile(saved: Option<&str>, body: &str) {
+        let (loaded, catalog) = loaded_then_saved(saved);
+        let mut profile = Some(loaded);
+
+        catalog.refresh(&mut profile);
+        let kept = Arc::new(catalog).keeping(profile.as_ref());
+
+        assert_eq!(profile.unwrap().body(), body);
+        assert_eq!(kept.resolve(Some(REVIEW)).unwrap().unwrap().body(), body);
+    }
+
+    #[test_case(LOADED_BODY, true ; "saved_unchanged")]
+    #[test_case("---\ndescription: Careful review\n---\nReview carefully.", true ; "frontmatter_only")]
+    #[test_case(EDITED_BODY, false ; "body_edited")]
+    #[test_case("---\nlayout: custom\n---\nReview carefully.", false ; "layout_changed")]
+    fn same_prompt_weighs_only_what_builds_the_prompt(saved: &str, same: bool) {
+        let (loaded, catalog) = loaded_then_saved(Some(saved));
+
+        assert_eq!(loaded.same_prompt(&catalog.get(REVIEW).unwrap()), same);
     }
 
     #[test]

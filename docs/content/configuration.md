@@ -8,7 +8,7 @@ Settings go in `caudra.toml`. It has two places, and both are optional:
 - **Global**: `~/.config/caudra/caudra.toml`
 - **Project**: `.caudra/caudra.toml` (relative to your working directory)
 
-When both exist, project settings override global ones field by field. A few settings are global-only, and their descriptions say so. `/reload` reads both files again, except for the [experimental switches](#experimental-features), which apply from startup.
+When both exist, project settings override global ones field by field. A few settings are global-only, and their descriptions say so. Caudra notices when either file changes while it runs, see [Hot reload](#hot-reload). `/reload` reads both files again, except for the [experimental switches](#experimental-features), which apply from startup.
 
 Settings apply in this order, and each layer overrides the ones before it:
 
@@ -88,10 +88,161 @@ headers = { authorization = "Bearer {env:OTEL_TOKEN}" }
 - It works in the global `caudra.toml`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `workcell.toml`. `sandboxes.toml` keeps every value as written.
 - A reference can be the whole value or part of it, and one value can hold several. Only string values expand, so keys, numbers, and booleans cannot come from the environment.
 - Caudra looks in the process environment first, then in the global `.env`. A project `.env` never supplies a value.
-- An unset variable is an error that names the file, the line, and the variable. A bad `caudra.toml` stops startup and a bad `providers.toml` exits. A bad `permissions.toml` fails closed and denies every tool call. A bad `mcp.toml` loads none of its servers, and `/mcp` shows the error.
+- An unset variable is an error that names the file, the line, and the variable. At startup, a bad `caudra.toml` stops startup and a bad `providers.toml` exits. A bad `permissions.toml` fails closed and denies every tool call. A bad `mcp.toml` loads none of its servers, and `/mcp` shows the error. An edit that breaks a file while Caudra runs follows the [hot reload](#hot-reload) rules instead.
 - A project file under `.caudra/` cannot hold a reference, and Caudra refuses to load it. A project MCP server on a public HTTPS URL connects without review, so a reference there could send your secret to a server the repository chose.
 - `${env:NAME}`, the PowerShell form, stays as written, so shell commands and permission patterns can use it.
 - When Caudra writes a file, such as `/mcp` turning a server off or `caudra auth login` adding a provider, the reference stays in the file rather than its value.
+
+## Hot reload
+
+While the terminal UI runs, Caudra watches its config files, skill and command directories, and [system prompt profiles](/docs/system-prompts/). It applies an edit shortly after you save it. One line in the footer then says what reloaded, what still needs `/reload` or a restart, and which file failed to load. For `caudra.toml` it names the tables whose values changed. It names files and keys and never shows a value from them. A save that changed nothing says nothing, and so do Caudra's own writes, such as turning a server off in `/mcp`. Headless runs and ACP read configuration once, at startup.
+
+| What changed | When it applies |
+|--------------|-----------------|
+| `caudra.toml` | `[agent]` settings from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
+| `permissions.toml` | Before the next tool call. |
+| `mcp.toml` | At once. New servers start, even when Caudra started with none. Removed and disabled servers stop, and changed servers restart. The other servers keep running. `defer_tools` applies after `/reload`. |
+| `providers.toml` | The next time Caudra reads it, such as when a model list opens. |
+| Skills | At once. |
+| System prompt profiles | From the next turn. |
+| Custom commands | At once. |
+| Workflows and automations | Caudra reads them again each time it lists, launches, or arms one. |
+| `workcell.toml` and `sandboxes.toml` | After `/reload`. |
+| `init.lua` | After `/reload`, which runs it again. A changed script never runs by itself. |
+| Global `.env` | `{env:NAME}` references follow it at once. Shell commands and keys read from the environment keep their startup values until a restart. |
+| Project `.env` | After a restart. |
+
+A [remote workspace](/docs/remote-workspaces/) session keeps the permissions and commands of its workspace. Its project files apply after `/reload`.
+
+### The prompt cache
+
+Every request starts with the tool definitions, then the system prompt, then the conversation. Providers cache that prefix, so a turn pays full price only for what is new since the previous request. A change to the tool definitions or the system prompt breaks the match at that point, and the provider reads the whole conversation again at full price. With Claude, a cached token costs a tenth of a fresh one and writing the cache costs a quarter more than a fresh one, so the prompt of that request costs about twelve times what a hit would. `/usage` shows it as a drop in the [cache hit rate](/docs/token-economy/#cache-hit-rate).
+
+So Caudra fixes the tool definitions and the system prompt when a conversation sends its first request, and keeps both byte for byte until it rebuilds them. What Caudra enforces follows your edits at once, whatever the model was told. Permissions, MCP servers, and which tools can run follow the files. The model learns of a change from a [reminder](#what-the-model-is-told) appended to the conversation, which costs only its own tokens.
+
+### When Caudra rebuilds
+
+A rebuild takes the configuration as it is at that moment. With nothing pending, that gives the same bytes, and the cache holds. With something pending, that one request reads the whole conversation at full price, however many edits are pending. Edits to [instruction files](/docs/context/#instruction-files) and notes that other sessions add to [memory](/docs/memory/#when-the-view-changes) count as pending too.
+
+Caudra rebuilds at these moments, where the request changes or the cache is gone anyway:
+
+| Moment | Why then |
+|--------|----------|
+| Compaction | The conversation is new. |
+| Switching model or provider | Each model keeps its own cache. |
+| Switching the system prompt profile | The system prompt changes with it. |
+| Changing the thinking level | Claude's cache of the conversation does not survive a change to the thinking settings. |
+| Switching mode | Plan mode declares no MCP tools, and the first switch to it adds the `plan` tool. |
+| The cache expires | Claude keeps a cache for five minutes after the last request that used it. Caudra counts from the end of the turn, so it rebuilds a little late rather than too early. Other APIs give no fixed lifetime, so Caudra never rebuilds on a timer for them. |
+
+It also rebuilds at moments you choose, where the cached conversation can still be warm:
+
+- a [conversation revert](/docs/sessions/#conversation-revert), which moves the conversation back to an earlier message
+- `/cd`, which loads the instruction files and memory of the new directory
+- `/reload`, which applies everything at once
+
+When Caudra started with no MCP servers, the first ones you add connect in the background. A rebuild that falls before they are up lacks their tools, so Caudra rebuilds once more when they are. A session that starts while servers connect waits for them before its first request instead.
+
+To keep the cache through a long task, save your edits and let the next rebuild take them in. When the model needs a change right away, such as a new MCP server, run `/reload` and pay for one full read.
+
+### What the model is told
+
+Until the next rebuild, a `# Configuration changed` [reminder](/docs/context/#what-caudra-writes-on-your-behalf) tells the model how the configuration differs from what it was given. It arrives with your next message and lists:
+
+- tools that are gone. A call to one fails.
+- tools that are new, with the first sentence of their description. They become callable at the next rebuild, and `tool_search` cannot load them before then.
+- tools whose definition changed, such as the `skill` tool when a skill appears. A call follows the current definition.
+- the system prompt, as a diff that the model applies to what it reads.
+
+Each reminder states the whole difference, so the newest one replaces the others. When the configuration matches what the model was given again, because you put a file back or a rebuild took the change in, a short reminder tells the model to disregard the earlier notice. Instruction files and memory have reminders of their own, `# Instructions changed` and `# Memory updated`, which follow the same rules.
+
+Between rebuilds, only the model changes the prefix. When it loads a deferred tool with `tool_search`, the definition joins the request, and that request reads the conversation again. See [Which models defer](/docs/tools/#which-models-defer).
+
+### When a file breaks
+
+An edit that fails to load keeps the last valid version in force, and the footer names the file and the error. A red chip such as `[caudra.toml invalid]` stays in the status bar until the file loads again. Click it to see the error and what Caudra does meanwhile. A system prompt profile that fails to load shows as `[system prompts invalid]`, and a session that uses it keeps the version it loaded. `permissions.toml` is the exception. Caudra denies every tool call until the file loads again, so a broken edit never leaves an older, looser policy in force.
+
+### Project files that grant access
+
+The agent and the repository can both write `.caudra/`, so a project change that grants access waits for you. An edit to the project rules in `permissions.toml` invalidates [project trust](/docs/permissions/#toml-policy), and its allows stay off until you review them in `/permissions`. A [project MCP server that needs review](/docs/mcp/#project-server-trust) waits in `/mcp` until you approve the changed definition. No dialog opens by itself while you work. A `[review permissions]` or `[review MCP]` chip in the status bar opens the review when you are ready. A change that only removes access applies at once.
+
+### Examples
+
+Each one starts in the middle of a session, with the cache warm.
+
+#### Add an MCP server
+
+You add the `analytics` server of the [HTTP example](/docs/mcp/#http) to `~/.config/caudra/mcp.toml`. The footer shows `Reloaded mcp.toml`, and the server starts at once. The tool definitions stay as they were, so the next request reads the conversation from the cache. With your next message the model gets this reminder:
+
+```text
+<system-reminder>
+# Configuration changed
+
+Caudra's configuration changed after your tool definitions and system prompt were fixed. They stay
+as they were so the prompt cache holds; what follows is how the current configuration differs from
+them. They are rebuilt after a compaction, on /reload, or once the cache has expired.
+
+Tools that exist now but are not declared; they become callable once the definitions are rebuilt:
+- analytics__run_query: Run a read-only SQL query against the warehouse.
+</system-reminder>
+```
+
+At the next rebuild the tools are declared, or join the `tool_search` catalog when your servers offer more than `defer_tools` tools. That request reads the conversation once at full price. Run `/reload` to make it happen now.
+
+#### Turn off an MCP server
+
+You turn a server off in `/mcp`. Caudra writes `mcp.toml` itself, so the footer stays quiet. The server stops at once. Its tools stay in the definitions until the next rebuild, so the cache holds. A call to one fails, `tool_search` no longer offers them, and the reminder lists them under "Declared tools that no longer exist".
+
+#### Switch to plan mode
+
+You press `Tab` to plan while MCP servers run. Plan mode declares no MCP tools, so the definitions change, and the next request reads the whole conversation at full price. The switch back to build declares them again at the same price. Without MCP servers, only the first switch to plan changes the definitions, by adding the `plan` tool.
+
+#### Disable a tool
+
+You add to `caudra.toml`:
+
+```toml
+[agent]
+disabled_tools = ["websearch", "analytics.*"]
+```
+
+The footer shows `Reloaded caudra.toml · [agent] from the next turn`. From the next turn Caudra refuses calls to `websearch` and to every tool of the `analytics` server. The definitions keep them until the next rebuild, and the reminder lists them as gone. The cache holds.
+
+#### Edit a system prompt profile
+
+You change a line in `~/.config/caudra/system-prompts/review.md` while a session uses the `review` profile. The footer shows `Reloaded system prompts`. The system prompt the model was given stays as it was, and the reminder carries the change as a diff:
+
+```text
+The system prompt changed. The diff below is authoritative: apply it to what the system prompt says, and follow the result.
+
++1 -1
+--- system prompt
++++ system prompt
+
+  Prioritize correctness bugs, regressions, and missing tests.
+- Do not edit files unless the user explicitly asks.
++ Do not edit files. Report each finding with its file and line.
+```
+
+Each later edit sends a new reminder with the whole difference so far. After a large rewrite, every small edit that follows repeats the long diff, so run `/reload` once to fold the rewrite into the system prompt.
+
+`/system-prompt` shows the prompt as the provider received it, so it keeps the old text until the next rebuild. A notice above it says that the profile changed since.
+
+#### Add a skill
+
+You create `~/.config/caudra/skills/git-release/SKILL.md`. The footer shows `Reloaded skills`. The list of skills is part of the `skill` tool's description, so the reminder shows that description as a diff with the new skill in it. The `skill` tool reads the skill directories each time it runs, so the model can load the new skill right away. The cache holds.
+
+#### Edit an instruction file
+
+You add a rule to `AGENTS.md`. The model gets an `# Instructions changed` reminder with the change as a diff, and the system prompt keeps the text it was built with until the next rebuild. The cache holds. See [Instruction files](/docs/context/#instruction-files).
+
+#### Break the permissions file
+
+A typo in `permissions.toml` leaves the definitions and the system prompt as they were, since neither carries your permission rules. Every tool call is denied until the file loads again, the footer names the error, and a red `[permissions.toml invalid]` chip stays in the status bar. The cache holds.
+
+#### Put a file back
+
+You save a change and put the file back before your next message. The model hears of neither. When a turn ran in between, the model got the reminder, and the next turn adds a short one telling it to disregard the earlier notice.
 
 ## Experimental features
 

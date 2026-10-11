@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Instant;
 use std::{env, sync::Arc};
 
 use crate::app::background_delivery::DeliveryFence;
@@ -6,6 +7,7 @@ use crate::app::file_revert::RecorderSlot;
 use arc_swap::ArcSwap;
 use caudra_agent::agent;
 use caudra_agent::agent::task_runner::{HostExtras, ModelResolver, WorkflowHostContext};
+use caudra_agent::agent::{PrefixKey, Surface, SurfaceBaseline};
 use caudra_agent::background::BackgroundTasks;
 use caudra_agent::context::{
     BuiltinToolsInput, ContextCapture, ContextInventory, ContextMcpInventory, ContextPublisher,
@@ -49,6 +51,7 @@ use serde_json::Value;
 use tracing::error;
 
 use super::cancel_map::RunCancelMap;
+use super::settings::{LiveSettings, Settings};
 use super::shared_queue::{QueueItem, QueueReceiver};
 use super::workflow::SharedMode;
 use super::{BtwPrompt, ModelSlot, SharedBtwPrompt, refresh_remote_context};
@@ -188,6 +191,7 @@ pub(super) struct AgentLoop {
     model_slot: Arc<ArcSwap<ModelSlot>>,
     effective_model_slot: Arc<ArcSwap<ModelSlot>>,
     config: AgentConfig,
+    settings: LiveSettings,
     tool_output_lines: ToolOutputLines,
     tool_output_store: Option<Arc<ToolOutputStore>>,
     vars: Vars,
@@ -200,6 +204,12 @@ pub(super) struct AgentLoop {
     /// Withheld from `tools` until `tool_search` loads them. Rebuilt with
     /// `tools`, so a model switch reconsiders both halves together.
     deferred: Vec<DeferredTool>,
+    /// The tools and system prompt every request of the conversation shares,
+    /// kept while the configuration changes under them.
+    surface: SurfaceBaseline,
+    /// The profile the fixed system prompt was built from, which only a
+    /// rebuild moves on.
+    bound_profile: Option<Arc<SystemPromptProfile>>,
     mcp: Option<McpSession>,
     history: History,
     history_restore_error: Option<String>,
@@ -253,6 +263,7 @@ impl AgentLoop {
         model_slot: Arc<ArcSwap<ModelSlot>>,
         effective_model_slot: Arc<ArcSwap<ModelSlot>>,
         config: AgentConfig,
+        settings: LiveSettings,
         tool_output_lines: ToolOutputLines,
         tool_output_store: Option<Arc<ToolOutputStore>>,
         initial_history: Vec<HistoryItem>,
@@ -324,6 +335,7 @@ impl AgentLoop {
             model_slot,
             effective_model_slot,
             config,
+            settings,
             tool_output_lines,
             tool_output_store,
             vars: Vars::default(),
@@ -332,6 +344,8 @@ impl AgentLoop {
             memory_pump: None,
             tools: Value::Null,
             deferred: Vec::new(),
+            surface: SurfaceBaseline::default(),
+            bound_profile: system_prompt_profile.clone(),
             mcp,
             history,
             history_restore_error,
@@ -647,6 +661,7 @@ impl AgentLoop {
         if !automatic && let Some(background) = &self.background {
             background.rearm();
         }
+        self.adopt_settings();
         let selected_slot = if automatic {
             self.effective_model_slot.load_full()
         } else {
@@ -674,25 +689,50 @@ impl AgentLoop {
             Arc::clone(&selected_slot)
         };
 
-        let instructions = if self.workspace_session.is_some() {
-            let current = self.read_instructions().await?;
-            self.instructions.drift(current, self.history.epoch())
-        } else {
+        let relocated = self.workspace_session.is_none() && {
             let old_cwd = self.vars.apply("{cwd}").into_owned();
             self.vars = template::env_vars();
-            if *self.vars.apply("{cwd}") != old_cwd {
-                self.reload_instructions().await?;
-                None
-            } else {
-                let current = self.read_instructions().await?;
-                self.instructions.drift(current, self.history.epoch())
-            }
+            *self.vars.apply("{cwd}") != old_cwd
         };
+        if relocated {
+            self.reload_instructions().await?;
+        }
+        let current = if relocated {
+            None
+        } else {
+            Some(self.read_instructions().await?)
+        };
+        let key = PrefixKey {
+            model: effective_slot.model.spec(),
+            chat_model: selected_slot.model.spec(),
+            thinking: input.thinking.clone(),
+            mode: input.mode.clone(),
+            plan: input.plan.clone(),
+            cwd: self.vars.apply("{cwd}").into_owned(),
+        };
+        let epoch = self.history.epoch();
+        let rebuild = self.surface.stale(
+            &key,
+            epoch,
+            effective_slot
+                .provider
+                .prompt_cache_ttl(&effective_slot.model),
+            self.mcp.as_ref().is_some_and(|mcp| mcp.connecting()),
+            Instant::now(),
+        );
+        let instructions = current.and_then(|current| {
+            if rebuild {
+                self.instructions.rebase(current, epoch)
+            } else {
+                self.instructions.drift(current, epoch)
+            }
+        });
         let memory = self
             .memory
             .refresh(
                 &self.history,
                 self.session_id.as_ref().map(SessionRef::as_str),
+                rebuild,
             )
             .await;
         self.mode.store(Arc::new(input.mode.clone()));
@@ -736,8 +776,10 @@ impl AgentLoop {
             .lua_handle
             .collect_prompt_slots_async(&self.config)
             .await;
-        let tool_filter = self.effective_tool_filter();
-        let system = self.build_system(&prompt_slots, &tool_filter);
+        let live_system = self.build_system(&prompt_slots, &self.effective_tool_filter());
+        let (system, retired, configuration) = self.fix_surface(live_system, rebuild, key);
+        let retired: Vec<&str> = retired.iter().map(String::as_str).collect();
+        let tool_filter = self.effective_tool_filter().excluding(&retired);
         self.context_system.clone_from(&system);
         self.context_options = opts.clone();
         self.publish_btw_prompt(&effective_slot, &system, opts.clone());
@@ -752,10 +794,12 @@ impl AgentLoop {
                 environment: Some(agent::environment_block(&self.vars, &effective_slot.model)),
                 instructions,
                 memory,
+                configuration,
                 mode_notice: None,
                 event_tx,
                 tools: self.tools.clone(),
                 deferred: self.deferred.clone(),
+                tools_fixed: true,
             },
         )
         .with_peer_checkpoint()
@@ -785,6 +829,7 @@ impl AgentLoop {
             agent.run_batch(first, inputs).await
         };
         drop(agent);
+        self.surface.touch(Instant::now());
         if let Some(pump) = &self.memory_pump {
             pump.nudge();
         }
@@ -978,6 +1023,67 @@ impl AgentLoop {
         .for_mode(&self.mode.load())
     }
 
+    /// Takes the settings published since the last turn. A profile that is no
+    /// longer on disk stays as it was loaded, and an MCP manager that started
+    /// after the session declares its tools from the next rebuild on.
+    fn adopt_settings(&mut self) {
+        let Some(Settings {
+            config,
+            prompt_profiles,
+            mcp,
+        }) = self.settings.take()
+        else {
+            return;
+        };
+        prompt_profiles.refresh(&mut self.system_prompt_profile);
+        if self.mcp.is_none() {
+            self.mcp = mcp.map(|handle| McpSession::new(handle, self.history.as_slice()));
+        }
+        self.mcp = self
+            .mcp
+            .take()
+            .map(|mcp| mcp.with_disabled_tools(&config.disabled_tools));
+        self.config = config;
+        self.prompt_profiles = prompt_profiles.keeping(self.system_prompt_profile.as_ref());
+    }
+
+    /// Fixes the prefix just built from the live configuration when `rebuild`,
+    /// and otherwise puts back the one already fixed. Leaves `tools`,
+    /// `deferred`, and MCP's pin on the prefix, and returns its system prompt,
+    /// the tools it retired, and the configuration notice the turn carries.
+    fn fix_surface(
+        &mut self,
+        system: String,
+        rebuild: bool,
+        key: PrefixKey,
+    ) -> (String, Vec<String>, Option<String>) {
+        let live = Surface::new(
+            system,
+            std::mem::take(&mut self.tools),
+            std::mem::take(&mut self.deferred),
+            self.mcp.as_ref(),
+        );
+        if rebuild {
+            self.bound_profile.clone_from(&self.system_prompt_profile);
+        }
+        let settled = self.surface.settle(
+            live,
+            rebuild,
+            key,
+            self.history.epoch(),
+            self.history.as_slice(),
+        );
+        self.tools = settled.surface.tools.clone();
+        self.deferred = settled.surface.deferred.clone();
+        let pinned = settled.surface.mcp.clone();
+        self.mcp = self.mcp.take().map(|mcp| mcp.pinned(pinned));
+        (
+            settled.surface.system.clone(),
+            settled.retired,
+            settled.notice,
+        )
+    }
+
     async fn read_instructions(&mut self) -> Result<Instructions, AgentError> {
         if let Some(workspace) = &self.workspace_session {
             let (context, cwd) = refresh_remote_context(
@@ -1104,6 +1210,7 @@ impl AgentLoop {
             system: system.to_owned(),
             tools: self.request_tools(mcp.as_ref()),
             opts,
+            profile: self.bound_profile.clone(),
         }));
     }
 

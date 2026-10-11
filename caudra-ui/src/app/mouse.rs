@@ -1246,6 +1246,17 @@ impl App {
                 self.execute_decisions("");
                 Vec::new()
             }
+            StatusBarHitTarget::ConfigProblems => {
+                if let Some(details) = self.config_problems.details() {
+                    self.flash(details);
+                }
+                Vec::new()
+            }
+            StatusBarHitTarget::TrustReview => {
+                self.clear_control_hovers();
+                self.review_pending_trust();
+                Vec::new()
+            }
             // The label goes as soon as the transcript follows again, so the
             // hover it was drawn under has nothing left to sit on.
             StatusBarHitTarget::ResumeAutoScroll => {

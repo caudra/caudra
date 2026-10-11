@@ -2,6 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use flume::Sender;
 use serde_json::Value;
@@ -44,6 +45,8 @@ const NO_FALLBACK_NOTE: &str = "no models listed";
 const NO_WIRE_BODY: &str = "this provider does not describe its wire body";
 const POST: &str = "POST";
 const SETUP_THINKING_EFFORT: &str = "medium";
+/// Anthropic's default `ephemeral` breakpoint lifetime, the only one Caudra sets.
+const EPHEMERAL_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString, EnumIter)]
 #[strum(serialize_all = "kebab-case")]
@@ -352,6 +355,14 @@ pub trait Provider: Send + Sync {
 
     fn reasoning_transport(&self, _model: &Model) -> ReasoningTransport {
         ReasoningTransport::Other
+    }
+
+    /// How long a cached prompt prefix outlives its last use, where the wire
+    /// protocol states it. `None` when it is unknown, which never counts as
+    /// expired.
+    fn prompt_cache_ttl(&self, model: &Model) -> Option<Duration> {
+        (self.reasoning_transport(model) == ReasoningTransport::AnthropicMessages)
+            .then_some(EPHEMERAL_CACHE_TTL)
     }
 }
 

@@ -198,6 +198,14 @@ pub const MEMORY_UPDATED_PROMPT: &str = include_str!("prompts/memory_updated.md"
 /// Shares the heading, and so the kind, with the update it supersedes.
 pub const MEMORY_REFRESHED_PROMPT: &str = include_str!("prompts/memory_refreshed.md");
 pub const MEMORY_UPDATED_MARKER: &str = "# Memory updated";
+/// The tool array and system prompt are fixed so the prompt stays cached, and
+/// configuration that changes afterwards arrives here as a difference from them.
+pub const CONFIGURATION_CHANGED_PROMPT: &str = include_str!("prompts/configuration_changed.md");
+/// Withdraws the difference once the fixed prefix matches the configuration
+/// again. Shares the heading, and so the kind, with the notice it supersedes.
+pub const CONFIGURATION_RESTORED_PROMPT: &str = include_str!("prompts/configuration_restored.md");
+pub const CONFIGURATION_CHANGED_MARKER: &str = "# Configuration changed";
+pub const CHANGES_SLOT: &str = "{changes}";
 pub const ENTRIES_SLOT: &str = "{entries}";
 pub const DIFF_SLOT: &str = "{diff}";
 pub const INSTRUCTIONS_SLOT: &str = "{instructions}";
@@ -236,6 +244,7 @@ pub(crate) const STANDING_KINDS: &[&[&str]] = &[
     &[ENVIRONMENT_MARKER],
     &[INSTRUCTIONS_CHANGED_MARKER],
     &[MEMORY_UPDATED_MARKER],
+    &[CONFIGURATION_CHANGED_MARKER],
     &[TASK_MODE_MARKER],
     MODE_MARKERS,
 ];

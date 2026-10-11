@@ -17,6 +17,7 @@ use crate::tools::is_builtin_tool;
 use caudra_config::config_version::ConfigVersion;
 use caudra_config::interpolation::{self, ConfigTextError, Lookup};
 use caudra_config::mcp::{DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, MCP_FILE, MCP_VERSION};
+use caudra_config::own_writes;
 use caudra_config::{global_config_dir, is_valid_server_name};
 
 #[derive(Debug, Clone)]
@@ -93,6 +94,8 @@ impl std::fmt::Display for McpConfigErrors {
         Ok(())
     }
 }
+
+impl std::error::Error for McpConfigErrors {}
 
 fn default_true() -> bool {
     true
@@ -624,13 +627,20 @@ fn merge_config(
 }
 
 pub fn load_config(cwd: &Path) -> (McpConfig, McpConfigErrors) {
+    load_config_from(cwd, global_config_dir().as_deref())
+}
+
+pub(super) fn load_config_from(
+    cwd: &Path,
+    global_dir: Option<&Path>,
+) -> (McpConfig, McpConfigErrors) {
     let mut merged = McpConfig {
         project_root: cwd.canonicalize().ok(),
         ..Default::default()
     };
     let mut errors = McpConfigErrors::new(cwd.to_path_buf());
 
-    if let Some(global_dir) = global_config_dir() {
+    if let Some(global_dir) = global_dir {
         let global_path = global_dir.join(MCP_FILE);
         merge_config(
             &mut merged,
@@ -649,11 +659,35 @@ pub fn load_config(cwd: &Path) -> (McpConfig, McpConfigErrors) {
     (merged, errors)
 }
 
+/// `load_config` for a reload. One unreadable or invalid file fails the whole
+/// load, so the caller keeps the servers it runs instead of dropping that file's.
+pub fn try_load_config(cwd: &Path) -> Result<McpConfig, McpConfigErrors> {
+    complete(load_config(cwd))
+}
+
+/// `try_load_config` for a manager started from `load_global_config`.
+pub fn try_load_global_config(cwd: &Path) -> Result<McpConfig, McpConfigErrors> {
+    complete(load_global_config(cwd))
+}
+
+pub(super) fn complete(
+    (config, errors): (McpConfig, McpConfigErrors),
+) -> Result<McpConfig, McpConfigErrors> {
+    if errors.is_empty() {
+        Ok(config)
+    } else {
+        Err(errors)
+    }
+}
+
 pub fn load_global_config(cwd: &Path) -> (McpConfig, McpConfigErrors) {
     load_global_config_from(cwd, global_config_dir().as_deref())
 }
 
-fn load_global_config_from(cwd: &Path, global_dir: Option<&Path>) -> (McpConfig, McpConfigErrors) {
+pub(super) fn load_global_config_from(
+    cwd: &Path,
+    global_dir: Option<&Path>,
+) -> (McpConfig, McpConfigErrors) {
     let mut merged = McpConfig {
         local_execution: LocalExecutionPolicy::RemoteLocal,
         ..Default::default()
@@ -707,8 +741,10 @@ pub fn persist_enabled(
         fs::create_dir_all(parent)
             .map_err(|e| McpError::Config(format!("cannot create dir: {e}")))?;
     }
-    fs::write(config_path, doc.to_string())
+    let rendered = doc.to_string();
+    fs::write(config_path, &rendered)
         .map_err(|e| McpError::Config(format!("cannot write {}: {e}", config_path.display())))?;
+    own_writes::record(config_path, rendered.as_bytes());
     Ok(())
 }
 
@@ -848,6 +884,30 @@ mod tests {
             config.sources.get(GLOBAL_SERVER),
             Some(&McpConfigSource::Global)
         );
+    }
+
+    #[test_case("this is not valid toml {{" ; "invalid_toml")]
+    #[test_case("[mcp.broken]\ncommand = ['{env:CAUDRA_TEST_MCP_RELOAD_UNSET}']\n" ; "unset_reference")]
+    fn a_reload_load_fails_whole_when_one_file_fails(global_toml: &str) {
+        let root = tempfile::tempdir().unwrap();
+        let global = root.path().join("global");
+        let project = root.path().join("project");
+        fs::create_dir_all(&global).unwrap();
+        fs::create_dir_all(project.join(".caudra")).unwrap();
+        fs::write(global.join(MCP_FILE), global_toml).unwrap();
+        fs::write(
+            project.join(".caudra").join(MCP_FILE),
+            format!("[mcp.{PROJECT_CANARY}]\ncommand = ['true']\n"),
+        )
+        .unwrap();
+
+        let (partial, _) = load_config_from(&project, Some(&global));
+        let Err(errors) = complete(load_config_from(&project, Some(&global))) else {
+            panic!("a broken global file must fail the reload load");
+        };
+
+        assert!(partial.mcp.contains_key(PROJECT_CANARY));
+        assert!(errors.to_string().contains(MCP_FILE));
     }
 
     #[test]

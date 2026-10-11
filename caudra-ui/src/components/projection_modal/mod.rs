@@ -592,6 +592,7 @@ mod tests {
                 system: SYSTEM.into(),
                 tools: Value::Array(tools),
                 opts: RequestOptions::default(),
+                profile: None,
             }),
             messages,
             running_calls,

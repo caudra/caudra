@@ -146,9 +146,9 @@ Each file arrives in the system prompt wrapped in a tag naming where it came fro
 
 `scope` is `project`, `local`, or `global`.
 
-Editing one of these files mid-session takes effect on your next message. The system prompt keeps the text it was built with, because rewriting it would invalidate the whole cached prefix on every save; the change reaches the model as a diff against that text instead. A session that started with no instruction files has nothing in its prompt for a diff to patch, so the first file to appear arrives whole. Compaction and `/undo` replace the conversation and have already given up that cache, so they quietly rebuild the system prompt from disk.
+Editing one of these files mid-session takes effect on your next message. The system prompt keeps the text it was built with, because rewriting it would invalidate the whole cached prefix on every save. The change reaches the model as a diff against that text instead. A session that started with no instruction files has nothing in its prompt for a diff to patch, so the first file to appear arrives whole. The system prompt takes the files in at the next rebuild, such as after a compaction or a model switch. See [When Caudra rebuilds](/docs/configuration/#when-caudra-rebuilds).
 
-Putting a file back the way it was withdraws the announcement rather than leaving it standing. Deleting a file that appeared does the same, and so does a compaction that rebuilds the system prompt while an announcement is outstanding. In each case the model is told to go back to following the system prompt as written.
+Putting a file back the way it was withdraws the announcement rather than leaving it standing. Deleting a file that appeared does the same, and so does a rebuild while an announcement is outstanding. In each case the model is told to go back to following the system prompt as written.
 
 Put coding conventions, repo quirks, and off-limits directories in these files. Keep them short, for the reason the next section gives.
 
@@ -188,6 +188,7 @@ Part of what the model reads was written by Caudra rather than typed by you. The
 | Mode announcement | On the first message after you switch between plan and build |
 | Instruction change | On the first message after you edit or create an instruction file, and again to withdraw that when you put the file back |
 | Memory update | On the first message after a note changes outside this session, and again to withdraw that once the [memory view](/docs/memory/#when-the-view-changes) is taken again |
+| Configuration change | On the first message after a config edit changes the tools or the system prompt the model was given, and again to withdraw that once they match again. See [What the model is told](/docs/configuration/#what-the-model-is-told) |
 | Goal check-in | While a goal is running, to report progress against it |
 | Continuation | After a nudge or a compaction, to say what the model should pick up |
 | Background work | Before an already-scheduled main request when task/workflow state changes or the configured response interval expires, and after successful compaction of a session with background work |

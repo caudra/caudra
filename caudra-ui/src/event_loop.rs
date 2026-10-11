@@ -8,7 +8,7 @@
 //! agent event, or keypress arrives instead of sleeping in `event::poll`.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,11 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod config_reload;
 mod peers;
+
+use config_reload::ConfigReload;
+pub use config_reload::SettingsReloader;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use caudra_agent::peers::PeerHost;
@@ -31,6 +35,7 @@ use crate::sandbox::{
 use caudra_agent::automation::frontend::wake_origin;
 use caudra_agent::background::BackgroundTransition;
 use caudra_agent::command::CustomCommand;
+use caudra_agent::config_watch::ConfigSource;
 use caudra_agent::herdr::{HerdrEnv, resume_command_line};
 use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::{
@@ -49,7 +54,7 @@ use caudra_automation::snapshot::{AutomationEvent, SettleBlocker};
 use caudra_config::providers::ProvidersConfig;
 use caudra_config::sandbox::SandboxName;
 use caudra_config::{
-    AutomationsConfig, Feature, ModelPolicy, SnapshotsConfig, UiConfig, load_permissions,
+    AutomationsConfig, Feature, ModelPolicy, SnapshotsConfig, UiConfig, fail_closed_permissions,
 };
 use caudra_docs::DocsLibrary;
 use caudra_lua::{
@@ -106,6 +111,7 @@ use crate::components::worktree_picker::{WorktreeOverview, WorktreeView};
 use crate::components::{
     Action, ExitRequest, ForkDraft, ForkedSession, PlanHandoff, Status, SubscriptionProvider,
 };
+use crate::config_problems::ConfigProblems;
 use crate::herdr::{
     HerdrObservation, HerdrReporterHandle, HerdrResume, HerdrStatus, aggregate_observations,
 };
@@ -230,6 +236,7 @@ pub struct EventLoopParams {
     pub launch_automations: Vec<ProfileArming>,
     pub storage: StateDir,
     pub config: AgentConfig,
+    pub settings_reloader: SettingsReloader,
     pub automations: AutomationsConfig,
     pub ui_config: UiConfig,
     pub snapshots: SnapshotsConfig,
@@ -1145,6 +1152,7 @@ struct SpawnCtx {
     /// session, so the loop publishes the rest here for the picker to read.
     live_sessions: Arc<ArcSwap<Vec<SessionRow>>>,
     update_notice: Arc<UpdateNotice>,
+    config_problems: Arc<ConfigProblems>,
     workspace_session: Option<caudra_workspace::WorkspaceSession>,
     /// The directory Caudra itself runs in, kept only for a sandbox session:
     /// there `{cwd}` names a path inside the VM, and the host checkout is a
@@ -1431,6 +1439,7 @@ impl SpawnCtx {
         app.refresh_record_index();
         app.live_sessions = Arc::clone(&self.live_sessions);
         app.update_notice = Arc::clone(&self.update_notice);
+        app.config_problems = Arc::clone(&self.config_problems);
         app.state.system_prompt_profile_name = system_prompt_profile_name;
         app.state.system_prompt_profile = system_prompt_profile;
         app.state.system_prompt_profile_override = self.prompt_profile_override.is_some();
@@ -1559,6 +1568,7 @@ pub(crate) struct EventLoop<'t> {
     sandbox: Option<SandboxAttachment>,
     sandbox_control: Option<SandboxControl>,
     sandbox_workflows: Vec<SessionTransition>,
+    config_reload: ConfigReload,
 }
 
 struct SessionTransition {
@@ -1641,6 +1651,7 @@ enum Wake {
     Shell(usize, ShellEvent),
     Warn(String),
     Title(GeneratedTitle),
+    Config(BTreeSet<ConfigSource>),
 }
 
 /// What a model-written title came back as, for the session that asked. The
@@ -1751,6 +1762,7 @@ impl<'t> EventLoop<'t> {
             launch_automations,
             storage,
             config,
+            settings_reloader,
             automations,
             ui_config,
             snapshots,
@@ -1884,6 +1896,7 @@ impl<'t> EventLoop<'t> {
             prompt_profile_override,
             live_sessions: Arc::default(),
             update_notice: crate::update::notice(),
+            config_problems: Arc::default(),
             host_cwd: workspace_session.as_ref().map(|_| cwd.clone()),
             workspace_session,
             local_documents,
@@ -1943,7 +1956,7 @@ impl<'t> EventLoop<'t> {
         let input = InputReader::spawn();
         terminal::set_appearance_reporting(true);
 
-        Ok(Self {
+        let mut event_loop = Self {
             terminal,
             sessions: runtimes,
             focused,
@@ -1968,7 +1981,10 @@ impl<'t> EventLoop<'t> {
             sandbox: None,
             sandbox_control: None,
             sandbox_workflows: Vec::new(),
-        })
+            config_reload: ConfigReload::new(settings_reloader, &cwd),
+        };
+        event_loop.check_config_files(&cwd);
+        Ok(event_loop)
     }
 
     fn focused_app(&mut self) -> &mut App {
@@ -2105,6 +2121,9 @@ impl<'t> EventLoop<'t> {
         }
         sel = sel.recv(&self.warn_rx, |res| res.ok().map(Wake::Warn));
         sel = sel.recv(&self.title_rx, |res| res.ok().map(Wake::Title));
+        sel = sel.recv(self.config_reload.changes(), |res| {
+            res.ok().map(Wake::Config)
+        });
         for (i, rt) in self.sessions.iter().enumerate() {
             sel = sel.recv(&rt.app.background_delivery.replies, move |res| {
                 res.ok().map(|reply| Wake::Delivery(i, Box::new(reply)))
@@ -2156,6 +2175,7 @@ impl<'t> EventLoop<'t> {
                 self.focused_app().flash(warning);
             }
             Wake::Title(GeneratedTitle { id, result }) => self.apply_generated_title(id, result),
+            Wake::Config(sources) => self.apply_config_changes(sources),
         }
         Ok(())
     }
@@ -4005,10 +4025,13 @@ impl<'t> EventLoop<'t> {
             self.sessions[idx].app.flash(format!("cd: {error}"));
             return false;
         }
-        let permissions = load_permissions(&cwd);
+        let permissions = self
+            .checked_permissions(&cwd)
+            .unwrap_or_else(|_| fail_closed_permissions());
         self.ctx
             .permissions
             .set_project_with_config(&cwd, permissions.clone());
+        self.config_reload.rewatch(&cwd);
         for runtime in &mut self.sessions {
             runtime.handles.shutdown_workflow();
             runtime
@@ -5222,6 +5245,7 @@ mod tests {
             prompt_profile_override: None,
             live_sessions: Arc::default(),
             update_notice: Arc::default(),
+            config_problems: Arc::default(),
             workspace_session: None,
             host_cwd: None,
             local_documents: None,

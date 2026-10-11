@@ -502,7 +502,7 @@ Matches this rule reports whether the draft covers that example. Effective polic
 
 ### Editing policy sources
 
-Edit source opens a verified local policy file or loaded plugin entrypoint in the local workbench. The host checks its path and loaded content before opening it. This edits local text, even from a remote workspace. Saving the file does not reload policy or grant fresh project-config trust. Reload and trust review are separate steps.
+Edit source opens a verified local policy file or loaded plugin entrypoint in the local workbench. The host checks its path and loaded content before opening it. This edits local text, even from a remote workspace. Saving a `permissions.toml` of a local session [reloads the policy](/docs/configuration/#hot-reload), but it never grants project-config trust. Changed project allows wait for trust review. Saving a plugin entrypoint changes nothing until `/reload`.
 
 Verified-source editing currently requires Unix. Saves check the retained file identity and contents and refuse changed sources or symlink substitutions. Existing dirty remote tabs remain separate and are restored when you return.
 
@@ -540,6 +540,8 @@ Caudra reads policy from:
 TOML supports `deny`, `ask`, and `allow`. Deny and ask rules are active from global and project config. Only validated shell allow patterns can grant authority. Global shell allows are active immediately and bind to Caudra's native Workcell shell contract. Other name-only allows remain inactive review candidates.
 
 Project shell allows require trust before they become active. On startup, the TUI opens `/permissions` and offers to trust the project policy digest for the canonical project. The digest covers project shell allows and every project deny or ask rule. Editing any of them invalidates trust, and `/permissions` can revoke trust explicitly. Non-interactive modes leave untrusted project allows inactive. Project deny and ask rules remain active without trust because they only restrict access. Changing projects with `/cd` reloads the destination policy before further tool calls.
+
+The TUI also reloads both files when they change on disk, before further tool calls. Deny and ask rules apply at once. An edit to the project rules invalidates trust, so project allows stay inactive until you review them in `/permissions`. A `[review permissions]` chip in the status bar opens the review. Neither the agent nor a repository can grant access by writing the file. A file that fails to load denies every tool call until it loads again, as at startup, and a red `[permissions.toml invalid]` chip stays in the status bar meanwhile. See [Hot reload](/docs/configuration/#hot-reload).
 
 A checkout of a git repository also accepts trust granted at the same place in a linked worktree or other checkout of that repository, as long as the digest is identical. The grant itself stays with the checkout where you made it. Revoking trust in any checkout revokes it at the same place in all of them. Project MCP servers and project workflows follow the same rule. See [Trust across checkouts](/docs/worktrees/#trust-across-checkouts).
 

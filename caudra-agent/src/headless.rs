@@ -1620,10 +1620,12 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                     environment: Some(agent::environment_block(&vars, &params.model)),
                     instructions: None,
                     memory: None,
+                    configuration: None,
                     mode_notice: None,
                     event_tx,
                     tools,
                     deferred,
+                    tools_fixed: false,
                 },
             )
             .with_loaded_instructions(instructions.loaded)
@@ -2812,6 +2814,7 @@ async fn spawn_prepared_session(
         background_enabled,
     );
     let mut baseline = agent::InstructionBaseline::adopt(instructions, history.epoch());
+    let mut surface = agent::SurfaceBaseline::default();
     let mut memory = MemoryBaseline::open(
         params.local_documents.clone(),
         Some(store.dir.clone()),
@@ -3865,7 +3868,7 @@ async fn spawn_prepared_session(
                     background.is_some(),
                     background.is_some(),
                 );
-                let turn_tool_filter = definitions.available_filter().for_mode(&input.mode);
+                let live_tool_filter = definitions.available_filter().for_mode(&input.mode);
                 let execution_slots = crate::tools::execution::execution_slots(
                     &params.prompt_slots,
                     &params.config,
@@ -3873,6 +3876,22 @@ async fn spawn_prepared_session(
                     background.is_some(),
                     &definitions.declared,
                     &definitions.deferred,
+                );
+                let prefix_key = agent::PrefixKey {
+                    model: turn_model.spec(),
+                    chat_model: model.spec(),
+                    thinking: input.thinking.clone(),
+                    mode: input.mode.clone(),
+                    plan: input.plan.clone(),
+                    cwd: vars.apply("{cwd}").into_owned(),
+                };
+                let epoch = history.epoch();
+                let rebuild = surface.stale(
+                    &prefix_key,
+                    epoch,
+                    turn_provider.prompt_cache_ttl(&turn_model),
+                    mcp.as_ref().is_some_and(|mcp| mcp.connecting()),
+                    Instant::now(),
                 );
                 let instructions = {
                     let current = match &params.remote_project_context {
@@ -3884,15 +3903,21 @@ async fn spawn_prepared_session(
                             smol::unblock(move || agent::load_instructions(&cwd)).await
                         }
                     };
-                    baseline.drift(current, history.epoch())
+                    if rebuild {
+                        baseline.rebase(current, epoch)
+                    } else {
+                        baseline.drift(current, epoch)
+                    }
                 };
-                let memory_notice = memory.refresh(&history, Some(&memory_origin)).await;
+                let memory_notice = memory
+                    .refresh(&history, Some(&memory_origin), rebuild)
+                    .await;
 
                 let mut system = params.system_prompt_override.clone().unwrap_or_else(|| {
                     agent::build_system_prompt(
                         baseline.text(),
                         &execution_slots,
-                        &turn_tool_filter,
+                        &live_tool_filter,
                         params.system_prompt_profile.as_deref(),
                         memory.view(),
                     )
@@ -3901,6 +3926,32 @@ async fn spawn_prepared_session(
                     system.push('\n');
                     system.push_str(append);
                 }
+                let settled = surface.settle(
+                    agent::Surface::new(
+                        system,
+                        definitions.declared,
+                        definitions.deferred,
+                        mcp.as_ref(),
+                    ),
+                    rebuild,
+                    prefix_key,
+                    epoch,
+                    history.as_slice(),
+                );
+                let definitions = ToolDefinitions {
+                    declared: settled.surface.tools.clone(),
+                    deferred: settled.surface.deferred.clone(),
+                };
+                let system = settled.surface.system.clone();
+                let turn_mcp = mcp
+                    .clone()
+                    .map(|mcp| mcp.pinned(settled.surface.mcp.clone()));
+                let retired: Vec<&str> = settled.retired.iter().map(String::as_str).collect();
+                let turn_tool_filter = definitions
+                    .available_filter()
+                    .excluding(&retired)
+                    .for_mode(&input.mode);
+                let configuration = settled.notice;
 
                 let mut agent = Agent::new(
                     AgentParams {
@@ -3917,10 +3968,12 @@ async fn spawn_prepared_session(
                         environment: Some(agent::environment_block(&vars, &turn_model)),
                         instructions,
                         memory: memory_notice.filter(|_| params.system_prompt_override.is_none()),
+                        configuration,
                         mode_notice: None,
                         event_tx,
                         tools: definitions.declared,
                         deferred: definitions.deferred,
+                        tools_fixed: true,
                     },
                 )
                 .with_loaded_instructions(baseline.loaded().clone())
@@ -3929,10 +3982,11 @@ async fn spawn_prepared_session(
                 .with_local_tools(Arc::clone(&params.local_tools))
                 .with_goal(goal.clone())
                 .with_interrupt_source(Arc::new(QueuedPrompts(input_rx.clone())))
-                .with_mcp(mcp.clone());
+                .with_mcp(turn_mcp);
 
                 let result = agent.run(input).await;
                 drop(agent);
+                surface.touch(Instant::now());
                 cancel_task.cancel().await;
                 if let Some(pump) = &memory_pump {
                     pump.nudge();

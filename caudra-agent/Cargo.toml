@@ -39,6 +39,7 @@ humantime = { workspace = true }
 smol = { workspace = true }
 async-process = { workspace = true }
 flume = { workspace = true }
+notify = { workspace = true }
 arc-swap = { workspace = true }
 bitflags = { workspace = true }
 event-listener = { workspace = true }

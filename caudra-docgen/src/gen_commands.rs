@@ -310,12 +310,12 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only). Caudra opens in plan mode, and a resumed session reopens in the mode it was left in. A toggle reaches the agent with your next message, so until you send one the status bar shows the pending switch as `[PLAN\u{2192}BUILD]`. It abbreviates this to `[P\u{2192}B]` when those columns preserve more useful footer detail. Each mode remembers the model it was last used with, so the toggle asks for that one too and the bar names the pair as `[claude-opus-5\u{2192}claude-sonnet-5]`, keeping the provider only when the two differ there. Binding the Plan job in `/model` decides what a plan run uses on its own, and turns the swap off."
+        "- **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only). Caudra opens in plan mode, and a resumed session reopens in the mode it was left in. A toggle reaches the agent with your next message, so until you send one the status bar shows the pending switch as `[PLAN\u{2192}BUILD]`. It abbreviates this to `[P\u{2192}B]` when those columns preserve more useful footer detail. Each mode remembers the model it was last used with, so the toggle asks for that one too and the bar names the pair as `[claude-opus-5\u{2192}claude-sonnet-5]`, keeping the provider only when the two differ there. Binding the Plan job in `/model` decides what a plan run uses on its own, and turns the swap off. Plan mode declares no MCP tools, so with MCP servers running each switch reads the whole conversation once at full price, see [Switch to plan mode](/docs/configuration/#switch-to-plan-mode)."
     )
     .unwrap();
     writeln!(
         out,
-        "- **`/reload`**: read `caudra.toml` again and rebuild plugins without leaving the app. The `[experimental]` switches apply from startup, so changing them needs a restart."
+        "- **`/reload`**: read every config file again, run `init.lua` again, and rebuild plugins without leaving the app. It also rebuilds the tool definitions and system prompt the model sees from the current configuration. When they changed, the next request reads the whole conversation at full price, see [When Caudra rebuilds](/docs/configuration/#when-caudra-rebuilds). Most edits apply without it, see [Hot reload](/docs/configuration/#hot-reload). The `[experimental]` switches apply from startup, so changing them needs a restart."
     )
     .unwrap();
     writeln!(

@@ -9,10 +9,11 @@ use crate::remote_project_context::RemoteAssetIdentity;
 
 /// Tier lists, highest priority first. The first directory that exists is the
 /// only one read, so a Caudra directory shuts out the compatibility ones.
-const PROJECT_COMMAND_DIRS: &[&str] =
+pub(crate) const PROJECT_COMMAND_DIRS: &[&str] =
     &[".caudra/commands", ".claude/commands", ".opencode/commands"];
-const GLOBAL_THIRD_PARTY_COMMAND_DIRS: &[&str] = &[".claude/commands", ".config/opencode/commands"];
-const COMMANDS_SUBDIR: &str = "commands";
+pub(crate) const GLOBAL_THIRD_PARTY_COMMAND_DIRS: &[&str] =
+    &[".claude/commands", ".config/opencode/commands"];
+pub(crate) const COMMANDS_SUBDIR: &str = "commands";
 const ARGUMENTS_PLACEHOLDER: &str = "$ARGUMENTS";
 
 #[derive(Debug, Default, Deserialize)]

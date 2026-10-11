@@ -510,7 +510,7 @@ It takes the same fields as a `models` entry apart from `id`, and applies to eve
 
 A `models` entry whose `id` matches no live model is logged once: every setting on it is ignored, which otherwise looks like Caudra disregarding the config.
 
-Custom slugs must not reuse a built-in provider name. A bad TOML parse exits with code 2 at startup so a typo cannot silently empty the registry.
+Custom slugs must not reuse a built-in provider name. A bad TOML parse exits with code 2 at startup so a typo cannot silently empty the registry. A bad edit while Caudra runs keeps the last valid file and shows the error, see [Hot reload](/docs/configuration/#hot-reload).
 
 You can also create a custom provider interactively with `caudra auth login` and choosing the custom option. That writes a starter entry to this file.
 

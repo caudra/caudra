@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, ErrorKind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::str::FromStr;
+use std::sync::{Mutex, PoisonError};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
@@ -15,6 +16,7 @@ use caudra_storage::thinking::ReasoningOptions;
 
 use crate::config_version::{CONFIG_VERSION_KEY, ConfigVersion};
 use crate::interpolation::{self, Lookup};
+use crate::own_writes;
 use crate::{ConfigField, ConfigValue};
 
 pub(crate) const PROVIDERS_FILE: &str = "providers.toml";
@@ -34,6 +36,13 @@ pub const BUILTIN_IGNORED_FIELDS: [&str; 5] = [
 const DISCOVERED_OR_PROTOCOL: &str = "discovered, or the protocol default";
 const OFF_UNLESS_DECLARED: &str = "false";
 const UNPRICED: &str = "0";
+
+/// The last `providers.toml` this process parsed, which a broken edit falls
+/// back to.
+static LAST_GOOD: Mutex<LastGood> = Mutex::new(LastGood {
+    config: None,
+    warned: None,
+});
 
 /// The keys of a `[SLUG.purposes]` table.
 pub(crate) const PURPOSE_FIELDS: &[ConfigField] = &[
@@ -886,31 +895,68 @@ pub struct ProvidersConfig {
     pub providers: HashMap<String, ProviderDef>,
 }
 
+struct LastGood {
+    config: Option<ProvidersConfig>,
+    /// The error already logged, since the file is read on every lookup.
+    warned: Option<String>,
+}
+
 impl ProvidersConfig {
     /// Read and parse `providers.toml`, with its `{env:NAME}` references
-    /// expanded. Hard-exits on parse errors so a typo in a purpose or pricing
-    /// surfaces immediately instead of silently dropping every provider and
-    /// starting caudra with an empty registry.
+    /// expanded. An edit that breaks the file keeps the last version that
+    /// parsed in this process. Before one did, it hard-exits, so a typo in a
+    /// purpose or pricing surfaces immediately instead of silently dropping
+    /// every provider and starting caudra with an empty registry.
     pub fn load() -> Self {
         let path = providers_file_path(paths::config_dir_path());
-        if !path.exists() {
-            return Self::default();
-        }
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "cannot read providers.toml");
-                return Self::default();
+        Self::load_from(&path, &LAST_GOOD).unwrap_or_else(|error| {
+            eprintln!("error: invalid {}: {error}", path.display());
+            process::exit(BAD_CONFIG_EXIT_CODE);
+        })
+    }
+
+    /// Why `providers.toml` as it is now does not parse, which [`Self::load`]
+    /// covers by keeping the last version that did.
+    pub fn check() -> Result<(), String> {
+        let path = providers_file_path(paths::config_dir_path());
+        Self::parse_file(&path)
+            .map(drop)
+            .map_err(|error| format!("{}: {error}", path.display()))
+    }
+
+    fn parse_file(path: &Path) -> Result<Self, String> {
+        match fs::read_to_string(path) {
+            Ok(content) => {
+                interpolation::from_str::<ProvidersConfig>(&content, Lookup::Global(path))
+                    .map_err(|error| error.to_string())
             }
-        };
-        match interpolation::from_str::<ProvidersConfig>(&content, Lookup::Global(&path)) {
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "cannot read providers.toml");
+                Ok(Self::default())
+            }
+        }
+    }
+
+    fn load_from(path: &Path, last_good: &Mutex<LastGood>) -> Result<Self, String> {
+        let parsed = Self::parse_file(path);
+        let mut last_good = last_good.lock().unwrap_or_else(PoisonError::into_inner);
+        match parsed {
             Ok(config) => {
                 debug!(path = %path.display(), "loaded providers config");
-                config
+                *last_good = LastGood {
+                    config: Some(config.clone()),
+                    warned: None,
+                };
+                Ok(config)
             }
-            Err(e) => {
-                eprintln!("error: invalid {}: {e}", path.display());
-                process::exit(BAD_CONFIG_EXIT_CODE);
+            Err(error) => {
+                let config = last_good.config.clone().ok_or_else(|| error.clone())?;
+                if last_good.warned.as_ref() != Some(&error) {
+                    tracing::warn!(path = %path.display(), %error, "invalid providers.toml, keeping the last valid one");
+                    last_good.warned = Some(error);
+                }
+                Ok(config)
             }
         }
     }
@@ -969,7 +1015,8 @@ impl ProvidersFile {
         let content = self
             .render()
             .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-        fs::write(&path, content)?;
+        fs::write(&path, &content)?;
+        own_writes::record(&path, content.as_bytes());
         debug!(path = %path.display(), "saved providers config");
         Ok(())
     }
@@ -1661,5 +1708,41 @@ best = "gpt-4.1"
         assert_eq!(referenced.api_key.as_deref(), Some(API_KEY));
         assert_eq!(referenced.base_url.as_deref(), Some(BASE_URL));
         assert!(reparsed.get(ADDED).is_some());
+    }
+
+    const KEPT_SLUG: &str = "kept";
+    const BROKEN_TOML: &str = "[kept\nprotocol = ";
+
+    fn fresh_last_good() -> Mutex<LastGood> {
+        Mutex::new(LastGood {
+            config: None,
+            warned: None,
+        })
+    }
+
+    #[test_case(true ; "after_a_valid_load")]
+    #[test_case(false ; "after_a_missing_file")]
+    fn a_broken_edit_keeps_the_last_valid_file(written: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PROVIDERS_FILE);
+        let last_good = fresh_last_good();
+        if written {
+            fs::write(&path, format!("[{KEPT_SLUG}]\nprotocol = \"openai\"\n")).unwrap();
+        }
+        ProvidersConfig::load_from(&path, &last_good).unwrap();
+
+        fs::write(&path, BROKEN_TOML).unwrap();
+        let kept = ProvidersConfig::load_from(&path, &last_good).unwrap();
+
+        assert_eq!(kept.get(KEPT_SLUG).is_some(), written);
+    }
+
+    #[test]
+    fn a_broken_file_with_nothing_to_keep_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PROVIDERS_FILE);
+        fs::write(&path, BROKEN_TOML).unwrap();
+
+        assert!(ProvidersConfig::load_from(&path, &fresh_last_good()).is_err());
     }
 }

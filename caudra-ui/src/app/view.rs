@@ -699,6 +699,8 @@ impl App {
 
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect, render_chat: usize) {
         grab_scope!("status_bar", status_area);
+        let pending_trust = self.pending_trust();
+        let config_problems = self.config_problems.load();
         let chat = &self.chats[render_chat];
         let goal = self.state.goal.snapshot();
         let chat_name = (self.chats.len() > 1).then_some(chat.name.as_str());
@@ -794,6 +796,8 @@ impl App {
             decisions_offline: self.permissions.decisions().is_some_and(|decisions| {
                 decisions.config().base_url.is_some() && decisions.status().reachable == Some(false)
             }),
+            config_problems: &config_problems,
+            pending_trust,
             restoring: self.restoring.load(Ordering::Relaxed),
             background_waiting: self.waiting_for_background(),
             goal: goal.as_ref(),

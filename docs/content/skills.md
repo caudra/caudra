@@ -9,7 +9,7 @@ Write one for anything you keep explaining: how you cut a release, how you write
 
 ## Where skills live
 
-A skill is a directory with a `SKILL.md` inside. Caudra looks for them every time the `skill` tool runs (and once at startup, to build the list).
+A skill is a directory with a `SKILL.md` inside. Caudra looks for them every time the `skill` tool runs. It builds the list the model reads at startup and again when a skill directory changes. The model sees a changed list as a reminder until its tools are next rebuilt, see [Add a skill](/docs/configuration/#add-a-skill).
 
 Personal skills come from one directory. Caudra takes the first of these that exists and reads nothing below it:
 

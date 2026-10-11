@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::{self, Write};
 use std::fs;
 use std::mem;
@@ -22,7 +22,7 @@ use tracing::warn;
 use crate::config_version::ConfigVersion;
 use crate::interpolation::Lookup;
 
-const PROJECT_DIR: &str = ".caudra";
+pub const PROJECT_DIR: &str = ".caudra";
 const PERMISSIONS_FILE: &str = "permissions.toml";
 const ENV_FILE: &str = ".env";
 pub const PERMISSIONS_VERSION: u32 = 1;
@@ -55,6 +55,7 @@ const PROCESS_ONLY_ENV_VARS: &[&str] = &[
     "WORKCELL_MCP_CODE_WORKER",
 ];
 static PROJECT_ENV_FALLBACKS: Mutex<Option<HashMap<String, Option<String>>>> = Mutex::new(None);
+static ENV_FILE_KEYS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 pub mod config_file;
 pub mod config_version;
@@ -64,6 +65,7 @@ pub mod experimental;
 pub mod files;
 pub mod interpolation;
 pub mod mcp;
+pub mod own_writes;
 pub mod profile_tools;
 pub mod providers;
 pub mod sandbox;
@@ -719,7 +721,7 @@ impl AlwaysThinking {
     }
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct RawConfig {
     pub decisions: decisions::RawDecisionsConfig,
@@ -1025,7 +1027,7 @@ impl RawConfig {
     }
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Clone)]
 #[serde(default)]
 pub struct PluginFileConfig {
     pub enabled: Option<bool>,
@@ -1035,7 +1037,7 @@ pub struct PluginFileConfig {
     pub opts: JsonMap<String, JsonValue>,
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct UiFileConfig {
     pub splash_animation: Option<bool>,
@@ -1278,7 +1280,7 @@ impl ImageModel {
     }
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct ToolOutputLinesFile {
     pub bash: Option<usize>,
@@ -1378,7 +1380,7 @@ impl<'de> Deserialize<'de> for CompactionBuffer {
     }
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentFileConfig {
     pub steering: Option<SteeringConfig>,
@@ -1452,7 +1454,7 @@ impl AgentFileConfig {
     }
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct MessagingFileConfig {
     pub inbound: Option<InboundPolicy>,
@@ -1545,7 +1547,7 @@ fn lowest(left: Option<usize>, right: Option<usize>) -> Option<usize> {
     }
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProviderFileConfig {
     pub default_model: Option<String>,
@@ -1569,7 +1571,7 @@ impl ProviderFileConfig {
     }
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageFileConfig {
     pub max_log_bytes_mb: Option<u64>,
@@ -1607,7 +1609,7 @@ impl StorageFileConfig {
     }
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct SnapshotsFileConfig {
     pub enabled: Option<bool>,
@@ -1631,7 +1633,7 @@ impl SnapshotsFileConfig {
 
 /// A project policy replaces the matching global policy whole, the way
 /// `provider.allowed_models` does, so a project cannot inherit half a rule set.
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct RetentionFileConfig {
     pub group_by: Option<GroupBy>,
@@ -3388,7 +3390,7 @@ impl WorktreesConfig {
     }
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct AutomationsFileConfig {
     pub turns_per_hour: Option<u32>,
@@ -3967,6 +3969,9 @@ fn load_env_files_scoped(cwd: &Path, global: Option<&Path>, include_project: boo
     let mut project_env_fallbacks = PROJECT_ENV_FALLBACKS
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    let mut env_file_keys = ENV_FILE_KEYS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     for (key, value) in vars {
         if env_file_var_is_allowed(&key) && std::env::var_os(&key).is_none() {
             if let Some(fallback) = project_fallbacks.remove(&key) {
@@ -3978,6 +3983,7 @@ fn load_env_files_scoped(cwd: &Path, global: Option<&Path>, include_project: boo
             }
             // SAFETY: single-threaded at startup, before any async runtime
             unsafe { std::env::set_var(&key, &value) };
+            env_file_keys.insert(key);
         }
     }
 }
@@ -4022,6 +4028,19 @@ pub fn global_env_value(key: &str) -> Result<Option<String>, std::env::VarError>
     }
 }
 
+/// `key` as the process inherited it. A key a `.env` file set reads as unset, so a reparse reads
+/// that file as it is now rather than its startup copy.
+fn inherited_env_value(key: &str) -> Result<Option<String>, std::env::VarError> {
+    let from_env_file = ENV_FILE_KEYS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains(key);
+    if from_env_file {
+        return Ok(None);
+    }
+    global_env_value(key)
+}
+
 pub fn load_global_env_file() {
     load_env_files_scoped(Path::new("."), global_dir().as_deref(), false);
 }
@@ -4056,33 +4075,42 @@ fn load_permissions_scoped(
     global_dir: Option<&Path>,
     include_project: bool,
 ) -> PermissionsConfig {
-    let mut global_perms = PermissionsFileConfig::default();
-    if let Some(dir) = global_dir {
-        let path = dir.join(PERMISSIONS_FILE);
-        match read_permissions_file(&path, Lookup::Global(&path)) {
-            Ok(Some(permissions)) => global_perms = permissions,
-            Ok(None) => {}
-            Err(error) => {
-                warn!(path = %path.display(), error, "permissions failed closed");
-                return fail_closed_permissions();
-            }
-        }
-    }
+    try_load_permissions_scoped(cwd, global_dir, include_project).unwrap_or_else(|error| {
+        warn!(error, "permissions failed closed");
+        fail_closed_permissions()
+    })
+}
 
+/// [`load_permissions`], with the reason a file failed to load instead of
+/// the policy that denies every tool call, for a reload to report it.
+pub fn try_load_permissions(cwd: &Path) -> Result<PermissionsConfig, String> {
+    try_load_permissions_scoped(cwd, global_dir().as_deref(), true)
+}
+
+fn try_load_permissions_scoped(
+    cwd: &Path,
+    global_dir: Option<&Path>,
+    include_project: bool,
+) -> Result<PermissionsConfig, String> {
+    fn read(path: &Path, lookup: Lookup<'_>) -> Result<Option<PermissionsFileConfig>, String> {
+        read_permissions_file(path, lookup).map_err(|error| format!("{}: {error}", path.display()))
+    }
+    let global_perms = match global_dir {
+        Some(dir) => {
+            let path = dir.join(PERMISSIONS_FILE);
+            read(&path, Lookup::Global(&path))?.unwrap_or_default()
+        }
+        None => PermissionsFileConfig::default(),
+    };
     if !include_project {
-        return build_permissions(global_perms, PermissionsFileConfig::default());
+        return Ok(build_permissions(
+            global_perms,
+            PermissionsFileConfig::default(),
+        ));
     }
     let project_path = cwd.join(PROJECT_DIR).join(PERMISSIONS_FILE);
-    let project_perms = match read_permissions_file(&project_path, Lookup::Refused) {
-        Ok(Some(permissions)) => permissions,
-        Ok(None) => PermissionsFileConfig::default(),
-        Err(error) => {
-            warn!(path = %project_path.display(), error, "permissions failed closed");
-            return fail_closed_permissions();
-        }
-    };
-
-    build_permissions(global_perms, project_perms)
+    let project_perms = read(&project_path, Lookup::Refused)?.unwrap_or_default();
+    Ok(build_permissions(global_perms, project_perms))
 }
 
 /// `lookup` is settled on the path as named, since a symlinked file still
@@ -4113,7 +4141,9 @@ fn permission_source_digest(bytes: &[u8]) -> String {
     output
 }
 
-fn fail_closed_permissions() -> PermissionsConfig {
+/// The policy a permissions file that fails to load leaves: every tool call
+/// denied.
+pub fn fail_closed_permissions() -> PermissionsConfig {
     PermissionsConfig {
         default: DefaultEffect::Deny,
         rules: vec![PermissionRule {

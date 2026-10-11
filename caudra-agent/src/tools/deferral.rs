@@ -639,7 +639,7 @@ fn catalog_listing(pending: &[&DeferredTool]) -> String {
 /// The first sentence of a description, derived rather than authored so the
 /// catalog cannot drift from the tool it advertises. A description with no
 /// full stop is short enough to use whole.
-fn summary(definition: &Value) -> &str {
+pub(crate) fn summary(definition: &Value) -> &str {
     let description = definition["description"]
         .as_str()
         .unwrap_or_default()

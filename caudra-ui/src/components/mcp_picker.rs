@@ -129,11 +129,27 @@ impl McpPicker {
         self.pending_confirmation = None;
         let _ = self.servers.poll(self.reader.load_full());
         let (entries, enabled, toggleable) = self.entries();
-        let errors = (!self.config_errors.is_empty()).then(|| self.config_errors.to_string());
-        self.picker.set_error_text(errors);
+        self.show_config_errors();
         self.picker
             .open_selectively_toggleable(entries, enabled, toggleable, TITLE);
         self.sync_review();
+    }
+
+    /// Adopts a restarted manager's reader. An open picker lists its servers
+    /// at the next [`Self::refresh`], which sees a snapshot it has not drawn.
+    pub(crate) fn set_reader(&mut self, reader: McpSnapshotReader) {
+        self.reader = reader;
+    }
+
+    /// Replaces what the banner reports, at once if the picker is open.
+    pub(crate) fn set_config_errors(&mut self, errors: McpConfigErrors) {
+        self.config_errors = errors;
+        self.show_config_errors();
+    }
+
+    fn show_config_errors(&mut self) {
+        let errors = (!self.config_errors.is_empty()).then(|| self.config_errors.to_string());
+        self.picker.set_error_text(errors);
     }
 
     pub fn refresh(&mut self) -> Dirty {
@@ -450,11 +466,14 @@ mod tests {
     use crate::components::buffer_text;
     use crate::components::key;
     use crate::components::keybindings::key as kb;
-    use caudra_agent::mcp::config::McpReviewSummary;
+    use caudra_agent::mcp::config::{McpReviewSummary, load_config};
     use caudra_agent::{McpServerInfo, McpSnapshot};
+    use caudra_config::PROJECT_DIR;
+    use caudra_config::mcp::MCP_FILE;
     use crossterm::event::{KeyCode, KeyEvent};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use std::fs;
     use std::path::PathBuf;
     use test_case::test_case;
 
@@ -651,5 +670,46 @@ mod tests {
         assert!(screen.contains("GITHUB_TOKEN"));
         assert!(screen.contains("Authorization"));
         assert!(screen.contains("Trust for process"));
+    }
+
+    const BROKEN_MCP_TOML: &str = "[mcp.broken\n";
+
+    fn no_errors() -> McpConfigErrors {
+        McpConfigErrors::new(PathBuf::new())
+    }
+
+    fn broken_config_errors() -> McpConfigErrors {
+        let project = tempfile::tempdir().unwrap();
+        let config_dir = project.path().join(PROJECT_DIR);
+        fs::create_dir(&config_dir).unwrap();
+        fs::write(config_dir.join(MCP_FILE), BROKEN_MCP_TOML).unwrap();
+        let (_, errors) = load_config(project.path());
+        assert!(!errors.is_empty());
+        errors
+    }
+
+    #[test]
+    fn replacing_config_errors_updates_an_open_banner_at_once() {
+        let errors = broken_config_errors();
+        let expected = errors.to_string();
+        let mut picker = McpPicker::new(McpSnapshotReader::empty(), no_errors());
+        picker.open();
+
+        picker.set_config_errors(errors);
+        assert_eq!(picker.picker.error_text(), Some(expected.as_str()));
+
+        picker.set_config_errors(no_errors());
+        assert_eq!(picker.picker.error_text(), None);
+    }
+
+    #[test]
+    fn an_adopted_reader_reaches_an_open_picker_at_the_next_refresh() {
+        let mut picker = McpPicker::new(McpSnapshotReader::empty(), no_errors());
+        picker.open();
+
+        picker.set_reader(awaiting_trust_snapshot());
+
+        assert_eq!(picker.refresh(), Dirty::YES);
+        assert!(picker.has_awaiting_trust());
     }
 }

@@ -2,6 +2,7 @@ mod agent_loop;
 mod automation;
 mod cancel_map;
 mod command_router;
+mod settings;
 pub(crate) mod shared_queue;
 mod workflow;
 
@@ -60,6 +61,8 @@ pub(crate) use self::agent_loop::ToolsPreviewSource;
 pub(crate) use self::agent_loop::tests::tools_preview_source;
 use self::automation::{AutomationSession, AutomationSpawn};
 use self::command_router::spawn_command_router;
+use self::settings::LiveSettings;
+pub(crate) use self::settings::Settings;
 pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
 pub(crate) use self::workflow::SharedMode;
 use self::workflow::{WorkflowSession, WorkflowSpawn, answer_channel};
@@ -186,6 +189,20 @@ pub(crate) struct BtwPrompt {
     pub(crate) system: String,
     pub(crate) tools: Value,
     pub(crate) opts: RequestOptions,
+    /// The profile `system` was built from. An edit on disk moves past it, and
+    /// `system` keeps it until the prompt is rebuilt.
+    pub(crate) profile: Option<Arc<SystemPromptProfile>>,
+}
+
+impl BtwPrompt {
+    /// Whether `current`, the profile as the session holds it now, builds
+    /// another prompt than the one `system` was built from.
+    pub(crate) fn outdated_by(&self, current: Option<&SystemPromptProfile>) -> bool {
+        match (self.profile.as_deref(), current) {
+            (Some(bound), Some(current)) => !bound.same_prompt(current),
+            (bound, current) => bound.is_some() != current.is_some(),
+        }
+    }
 }
 
 pub(crate) type SharedBtwPrompt = Arc<ArcSwap<BtwPrompt>>;
@@ -252,6 +269,7 @@ pub(crate) struct AgentHandles {
     /// where `{cwd}` names a path inside the VM and this one does not.
     host_cwd: Option<PathBuf>,
     local_documents: Option<Arc<LocalDocumentStore>>,
+    settings: LiveSettings,
     task: smol::Task<()>,
 }
 
@@ -337,6 +355,16 @@ impl AgentHandles {
 
     pub(crate) fn workflow_handle(&self) -> Option<WorkflowHandle> {
         self.workflow.as_ref().map(WorkflowSession::handle)
+    }
+
+    /// Settings the session's next turn starts with, and the next loop a
+    /// respawn starts.
+    pub(crate) fn publish_settings(&mut self, settings: Settings) {
+        self.prompt_profiles = Arc::clone(&settings.prompt_profiles);
+        if self.mcp_handle.is_none() {
+            self.mcp_handle.clone_from(&settings.mcp);
+        }
+        self.settings.publish(settings);
     }
 
     /// Interrupts every run of this session and waits for the runtimes to
@@ -813,6 +841,7 @@ fn spawn_agent_internal(
         system: String::new(),
         tools: Value::Null,
         opts: RequestOptions::default(),
+        profile: None,
     }));
     let context_store = ContextStore::new();
     let context_publisher = context_store.publisher(ContextKey::Main);
@@ -823,6 +852,7 @@ fn spawn_agent_internal(
     let mailbox = session_id
         .as_ref()
         .map(|session_id| SessionMailbox::register(session_id.id()));
+    let prompt_profiles = prompt_profiles.keeping(system_prompt_profile.as_ref());
     let task_prompt_profile_name: Arc<str> = Arc::from(
         system_prompt_profile
             .as_ref()
@@ -872,10 +902,12 @@ fn spawn_agent_internal(
         retry_now.clone(),
     );
 
+    let settings = LiveSettings::default();
     let agent_loop = AgentLoop::new(
         Arc::clone(model_slot),
         Arc::clone(&effective_model_slot),
         config,
+        settings.clone(),
         tool_output_lines,
         tool_output_store,
         initial_history,
@@ -960,6 +992,7 @@ fn spawn_agent_internal(
         remote_project_context,
         host_cwd,
         local_documents,
+        settings,
         task,
     }
 }
@@ -1078,6 +1111,7 @@ pub(crate) fn stored_subagent_history(session: &crate::AppSession) -> SubagentHi
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
     use std::time::Instant;
 
@@ -1085,6 +1119,9 @@ mod tests {
     use caudra_agent::automation::store::AutomationStore;
     use caudra_agent::automation::testing::AutomationFixture;
     use caudra_agent::automation::workflows::NO_WORKFLOWS;
+    use caudra_agent::prompt::profile::{PROFILE_DIR, PROFILE_EXTENSION};
+    use caudra_agent::prompt::{CONFIGURATION_CHANGED_MARKER, CONFIGURATION_RESTORED_PROMPT};
+    use caudra_agent::tools::TODOWRITE_TOOL_NAME;
     use caudra_agent::{AgentEvent, AgentInput, PromptAdmission};
     use caudra_automation::host::{Failure, FailureKind};
     use caudra_automation::request::{AutomationRequest, AutomationResponse};
@@ -1092,11 +1129,13 @@ mod tests {
     use caudra_config::{Feature, FeatureFlags, PermissionsConfig};
     use caudra_providers::provider::BoxFuture;
     use caudra_providers::{
-        AgentError, CacheKey, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
+        AgentError, CacheKey, ContentBlock, ModelInfo, ProviderEvent, RequestOptions, Role,
+        StopReason, StreamResponse,
     };
     use caudra_storage::sessions::PermissionMode;
     use caudra_workflow::{LaunchRequest, WorkflowRequest, WorkflowResponse};
     use caudra_workspace::PlanRef;
+    use tempfile::TempDir;
     use test_case::test_case;
 
     use crate::app::{Mode, PlanState};
@@ -1132,6 +1171,19 @@ mod tests {
     const RUN_REACHED: &str = "the start reached the session's workflow runtime";
     const NO_FIRING_FOR_TEARDOWN: &str =
         "a run interrupted by the shutdown must not reach automations that are going away";
+    const ANSWER_TEXT: &str = "answered";
+    const NO_REQUEST: &str = "the turn never reached the provider";
+    /// The run a loop admits until a respawn moves it on.
+    const FIRST_RUN: u64 = 0;
+    const PROFILE_NAME: &str = "review";
+    const LOADED_PROFILE: &str = "Review carefully.";
+    const EDITED_PROFILE: &str = "Review every line.";
+    /// Frontmatter that is never closed.
+    const BROKEN_PROFILE: &str = "---\nlayout: custom\nReview every line.";
+    const STALE_PROFILE: &str = "a respawned agent must build from the profile as last reloaded";
+    const PROFILE_DROPPED: &str = "a session must keep the profile it loaded once the file is lost";
+    const FROZEN_PROMPT: &str = "an edited profile must leave the cached prompt as it was";
+    const EDIT_UNNOTED: &str = "the bound prompt must say which profile built it";
 
     struct StubProvider(Option<flume::Sender<String>>);
 
@@ -1189,9 +1241,29 @@ mod tests {
         Arc<ArcSwap<ModelSlot>>,
         Arc<PermissionManager>,
     ) {
+        spawn_with_provider(
+            Arc::new(StubProvider(None)),
+            initial_history,
+            session_id,
+            session_lease,
+            state_dir,
+        )
+    }
+
+    fn spawn_with_provider(
+        provider: Arc<dyn Provider>,
+        initial_history: Vec<Message>,
+        session_id: Option<SessionRef>,
+        session_lease: Option<Arc<SessionLease>>,
+        state_dir: Option<StateDir>,
+    ) -> (
+        AgentHandles,
+        Arc<ArcSwap<ModelSlot>>,
+        Arc<PermissionManager>,
+    ) {
         let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
             model: crate::components::test_model(),
-            provider: Arc::new(StubProvider(None)),
+            provider,
         }));
         let permissions = Arc::new(PermissionManager::new_nonpersistent(
             PermissionsConfig::default(),
@@ -1236,6 +1308,290 @@ mod tests {
         (handles, model_slot, permissions)
     }
 
+    /// The cached prefix of one request, and the conversation that follows it.
+    struct Request {
+        tools: String,
+        system: String,
+        conversation: String,
+    }
+
+    /// Answers every request at once and reports what it was sent.
+    struct PrefixRecorder(flume::Sender<Request>);
+
+    impl Provider for PrefixRecorder {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            messages: &'a [Message],
+            system: &'a str,
+            tools: &'a serde_json::Value,
+            _event_tx: &'a flume::Sender<ProviderEvent>,
+            _opts: RequestOptions,
+            _cache_key: Option<&'a CacheKey>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                let conversation = messages
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.0
+                    .send(Request {
+                        tools: tools.to_string(),
+                        system: system.to_owned(),
+                        conversation,
+                    })
+                    .map_err(|_| AgentError::Channel)?;
+                Ok(StreamResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: ANSWER_TEXT.into(),
+                        }],
+                        ..Default::default()
+                    },
+                    stop_reason: Some(StopReason::EndTurn),
+                    ..Default::default()
+                })
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    /// Queues a prompt for the loop started at `run_id`, which a respawn moves
+    /// on, and returns the request it sent.
+    fn ask(handles: &AgentHandles, received: &flume::Receiver<Request>, run_id: u64) -> Request {
+        handles.queue.push(QueueItem::Message {
+            text: PROBE_TEXT.into(),
+            image_count: 0,
+            paste_ranges: Vec::new(),
+            input: Box::new(AgentInput {
+                message: PROBE_TEXT.into(),
+                mode: AgentMode::Build,
+                plan: None,
+                images: Vec::new(),
+                mentions: Vec::new(),
+                commits: Vec::new(),
+                preamble: Vec::new(),
+                thinking: Default::default(),
+                fast: false,
+                prompt: None,
+                resume: false,
+            }),
+            run_id,
+            admission: PromptAdmission::Queue,
+            displayed: true,
+        });
+        received.recv_timeout(LONG_TIMEOUT).expect(NO_REQUEST)
+    }
+
+    fn tool_names(tools: &str) -> Vec<String> {
+        let tools: Vec<Value> = serde_json::from_str(tools).unwrap();
+        tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn a_configuration_change_keeps_the_cached_prefix_until_a_rebuild() {
+        crate::components::register_native_tools();
+        let (requests, received) = flume::unbounded();
+        let (mut handles, model_slot, _permissions) = spawn_with_provider(
+            Arc::new(PrefixRecorder(requests)),
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        let first = ask(&handles, &received, FIRST_RUN);
+        assert!(tool_names(&first.tools).contains(&TODOWRITE_TOOL_NAME.to_owned()));
+
+        handles.publish_settings(Settings {
+            config: AgentConfig {
+                disabled_tools: [TODOWRITE_TOOL_NAME.to_owned()].into_iter().collect(),
+                summarize_memory: false,
+                ..Default::default()
+            },
+            prompt_profiles: Arc::default(),
+            mcp: None,
+        });
+        let kept = ask(&handles, &received, FIRST_RUN);
+
+        assert_eq!(kept.tools, first.tools);
+        assert_eq!(kept.system, first.system);
+        assert!(kept.conversation.contains(CONFIGURATION_CHANGED_MARKER));
+
+        let mut switched = crate::components::test_model();
+        switched.id = SELECTED_MODEL.into();
+        let provider = Arc::clone(&model_slot.load().provider);
+        model_slot.store(Arc::new(ModelSlot {
+            model: switched,
+            provider,
+        }));
+        let rebuilt = ask(&handles, &received, FIRST_RUN);
+
+        assert!(!tool_names(&rebuilt.tools).contains(&TODOWRITE_TOOL_NAME.to_owned()));
+        assert!(
+            rebuilt
+                .conversation
+                .contains(CONFIGURATION_RESTORED_PROMPT.trim())
+        );
+        smol::block_on(handles.into_task().cancel());
+    }
+
+    /// Saves `saved` as the `review` profile, or deletes it when `None`, and
+    /// reads the profiles again.
+    fn reread_profiles(dir: &TempDir, saved: Option<&str>) -> PromptProfileCatalog {
+        let profiles = dir.path().join(PROFILE_DIR);
+        let file = profiles.join(format!("{PROFILE_NAME}.{PROFILE_EXTENSION}"));
+        match saved {
+            Some(text) => {
+                fs::create_dir_all(&profiles).unwrap();
+                fs::write(&file, text).unwrap();
+            }
+            None => fs::remove_file(&file).unwrap(),
+        }
+        PromptProfileCatalog::discover_with(Some(dir.path()))
+    }
+
+    /// What the event loop does once the profiles are read again: every tab
+    /// takes them, and every agent gets them with the settings.
+    fn reload_profiles(handles: &mut AgentHandles, app: &mut App, catalog: PromptProfileCatalog) {
+        let catalog = Arc::new(catalog);
+        app.adopt_prompt_profiles(&catalog);
+        handles.publish_settings(Settings {
+            config: turns_only(),
+            prompt_profiles: catalog,
+            mcp: None,
+        });
+    }
+
+    /// A tab whose agent runs the `review` profile as first saved, and records
+    /// each request it sends.
+    fn running_loaded_profile(
+        dir: &TempDir,
+    ) -> (
+        AgentHandles,
+        Arc<ArcSwap<ModelSlot>>,
+        Arc<PermissionManager>,
+        App,
+        flume::Receiver<Request>,
+    ) {
+        crate::components::register_native_tools();
+        let (requests, received) = flume::unbounded();
+        let (mut handles, model_slot, permissions) = spawn_with_provider(
+            Arc::new(PrefixRecorder(requests)),
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        let mut app = crate::app::tests::test_app();
+        let loaded = reread_profiles(dir, Some(LOADED_PROFILE));
+        app.state.system_prompt_profile = loaded.get(PROFILE_NAME);
+        reload_profiles(&mut handles, &mut app, loaded);
+        respawn(&mut handles, &model_slot, &permissions, &mut app);
+        (handles, model_slot, permissions, app, received)
+    }
+
+    /// `/new` and `/cd` respawn the agent from the profile the tab holds, and a
+    /// respawn drops the settings the old agent had yet to adopt.
+    #[test]
+    fn a_respawned_agent_builds_from_the_profile_as_last_reloaded() {
+        let dir = TempDir::new().unwrap();
+        let (mut handles, model_slot, permissions, mut app, received) =
+            running_loaded_profile(&dir);
+        let loaded = ask(&handles, &received, app.run_id);
+        assert!(loaded.system.contains(LOADED_PROFILE));
+
+        reload_profiles(
+            &mut handles,
+            &mut app,
+            reread_profiles(&dir, Some(EDITED_PROFILE)),
+        );
+        respawn(&mut handles, &model_slot, &permissions, &mut app);
+
+        let respawned = ask(&handles, &received, app.run_id);
+        assert!(respawned.system.contains(EDITED_PROFILE), "{STALE_PROFILE}");
+        assert!(
+            !respawned.system.contains(LOADED_PROFILE),
+            "{STALE_PROFILE}"
+        );
+        smol::block_on(handles.into_task().cancel());
+    }
+
+    /// Each turn checks that the session's profile resolves, so profiles read
+    /// again without it must stop neither the session nor the agent `/new`
+    /// respawns.
+    #[test_case(None ; "deleted")]
+    #[test_case(Some(BROKEN_PROFILE) ; "broken")]
+    fn a_session_runs_on_the_profile_it_loaded_once_the_file_is_lost(saved: Option<&str>) {
+        let dir = TempDir::new().unwrap();
+        let (mut handles, model_slot, permissions, mut app, received) =
+            running_loaded_profile(&dir);
+        ask(&handles, &received, app.run_id);
+
+        reload_profiles(&mut handles, &mut app, reread_profiles(&dir, saved));
+        let adopted = ask(&handles, &received, app.run_id);
+        respawn(&mut handles, &model_slot, &permissions, &mut app);
+        let respawned = ask(&handles, &received, app.run_id);
+
+        assert!(adopted.system.contains(LOADED_PROFILE), "{PROFILE_DROPPED}");
+        assert!(
+            respawned.system.contains(LOADED_PROFILE),
+            "{PROFILE_DROPPED}"
+        );
+        smol::block_on(handles.into_task().cancel());
+    }
+
+    /// `/system-prompt` notes an edit by weighing the profile the bound prompt
+    /// was built from against the tab's, so the prompt keeps naming the old
+    /// profile for as long as it carries the old text.
+    #[test]
+    fn a_bound_prompt_names_its_profile_until_a_rebuild() {
+        let dir = TempDir::new().unwrap();
+        let (mut handles, model_slot, _permissions, mut app, received) =
+            running_loaded_profile(&dir);
+        ask(&handles, &received, app.run_id);
+        reload_profiles(
+            &mut handles,
+            &mut app,
+            reread_profiles(&dir, Some(EDITED_PROFILE)),
+        );
+        let outdated = || {
+            handles
+                .btw_prompt
+                .load()
+                .outdated_by(app.state.system_prompt_profile.as_deref())
+        };
+
+        let kept = ask(&handles, &received, app.run_id);
+        assert!(kept.system.contains(LOADED_PROFILE), "{FROZEN_PROMPT}");
+        assert!(kept.conversation.contains(CONFIGURATION_CHANGED_MARKER));
+        assert!(outdated(), "{EDIT_UNNOTED}");
+
+        let mut switched = crate::components::test_model();
+        switched.id = SELECTED_MODEL.into();
+        let provider = Arc::clone(&model_slot.load().provider);
+        model_slot.store(Arc::new(ModelSlot {
+            model: switched,
+            provider,
+        }));
+        let rebuilt = ask(&handles, &received, app.run_id);
+
+        assert!(rebuilt.system.contains(EDITED_PROFILE));
+        assert!(!outdated(), "{EDIT_UNNOTED}");
+        smol::block_on(handles.into_task().cancel());
+    }
+
     #[test]
     fn agent_task_holds_the_session_lease_until_termination() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -1259,6 +1615,17 @@ mod tests {
         assert!(SessionLease::acquire(&state_dir, id).is_ok());
     }
 
+    /// Settings under which an agent sends its provider nothing but its turns,
+    /// where a session's opening prompt would also ask for a title.
+    fn turns_only() -> AgentConfig {
+        AgentConfig {
+            features: FeatureFlags::NONE,
+            summarize_memory: false,
+            generate_titles: false,
+            ..Default::default()
+        }
+    }
+
     fn respawn(
         handles: &mut AgentHandles,
         model_slot: &Arc<ArcSwap<ModelSlot>>,
@@ -1268,11 +1635,7 @@ mod tests {
         handles.respawn(
             Vec::new(),
             model_slot,
-            AgentConfig {
-                features: FeatureFlags::NONE,
-                summarize_memory: false,
-                ..Default::default()
-            },
+            turns_only(),
             ToolOutputLines::default(),
             permissions,
             app,

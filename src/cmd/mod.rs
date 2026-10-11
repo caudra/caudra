@@ -13,7 +13,7 @@ mod workcell_runtime;
 mod worktree;
 
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -30,6 +30,7 @@ use caudra_config::{AgentConfig, Config, Feature, FeatureDisabled, FeatureFlags,
 use caudra_lua::PluginHost;
 use caudra_storage::sessions::PermissionMode;
 use caudra_storage::{EphemeralRoot, StateDir};
+use caudra_ui::SettingsReloader;
 
 use crate::cli::{AuthAction, Cli, Command, McpAction, WorkcellAuthAction, normalize_tool_name};
 use crate::docs;
@@ -77,26 +78,36 @@ fn cli_plugin_host(cli: &Cli, registry: Arc<ToolRegistry>) -> Result<PluginHost>
     plugin_host(cli.runs_lua(), cli.no_jit, registry)
 }
 
+/// What the `init.lua` files contributed to the settings, kept so a reload
+/// reads the TOML layers again without running a script.
+#[derive(Clone, Default)]
+struct LuaLayers {
+    global: Option<RawConfig>,
+    /// With the directory it was run in, since it belongs to that project only.
+    project: Option<(PathBuf, RawConfig)>,
+}
+
+enum InitLua<'a> {
+    Global(&'a Path),
+    Project,
+}
+
 /// Layers the ordinary settings, lowest first: the global `caudra.toml`, the
 /// global `init.lua`, the project `.caudra/caudra.toml`, then the project
 /// `init.lua`. A remote workspace has no local project, so it skips both
-/// project layers. The `init.lua` layers run only on a live Lua host, and no
-/// layer can turn an experiment on: that was settled at startup.
-fn load_settings(
-    plugin_host: &PluginHost,
+/// project layers. No layer can turn an experiment on: that was settled at
+/// startup.
+fn layer_settings(
     startup: &Startup,
     cwd: &Path,
     remote: bool,
+    mut init_lua: impl FnMut(InitLua<'_>) -> Result<Option<RawConfig>>,
 ) -> Result<RawConfig> {
     let mut settings = RawConfig::default();
     if let Some(config_dir) = &startup.config_dir {
         settings =
             config_file::load_global_config(&config_file::global_config_path(config_dir))?.settings;
-        if plugin_host.is_enabled()
-            && let Some(lua) = plugin_host
-                .run_global_init(config_dir)
-                .context("run the global init.lua")?
-        {
+        if let Some(lua) = init_lua(InitLua::Global(config_dir))? {
             settings.merge_global(lua);
         }
     }
@@ -104,15 +115,73 @@ fn load_settings(
         settings.merge(config_file::load_project_config(
             &config_file::project_config_path(cwd),
         )?);
-        if plugin_host.is_enabled()
-            && let Some(lua) = plugin_host
-                .run_project_init(cwd)
-                .context("run the project init.lua")?
-        {
+        if let Some(lua) = init_lua(InitLua::Project)? {
             settings.merge(lua);
         }
     }
     Ok(settings)
+}
+
+fn load_settings(
+    plugin_host: &PluginHost,
+    startup: &Startup,
+    cwd: &Path,
+    remote: bool,
+) -> Result<RawConfig> {
+    load_recorded_settings(plugin_host, startup, cwd, remote).map(|(settings, _)| settings)
+}
+
+/// [`layer_settings`], running the `init.lua` layers on a live Lua host and
+/// keeping what they returned.
+fn load_recorded_settings(
+    plugin_host: &PluginHost,
+    startup: &Startup,
+    cwd: &Path,
+    remote: bool,
+) -> Result<(RawConfig, LuaLayers)> {
+    let mut layers = LuaLayers::default();
+    let settings = layer_settings(startup, cwd, remote, |init| {
+        if !plugin_host.is_enabled() {
+            return Ok(None);
+        }
+        Ok(match init {
+            InitLua::Global(config_dir) => {
+                let lua = plugin_host
+                    .run_global_init(config_dir)
+                    .context("run the global init.lua")?;
+                layers.global.clone_from(&lua);
+                lua
+            }
+            InitLua::Project => {
+                let lua = plugin_host
+                    .run_project_init(cwd)
+                    .context("run the project init.lua")?;
+                layers.project = lua.clone().map(|lua| (cwd.to_path_buf(), lua));
+                lua
+            }
+        })
+    })?;
+    Ok((settings, layers))
+}
+
+/// The TOML layers as they are now, with the `init.lua` layers `layers`
+/// recorded. A project's `init.lua` layer applies in its own directory only.
+fn reload_settings(
+    startup: &Startup,
+    cwd: &Path,
+    remote: bool,
+    layers: &LuaLayers,
+) -> Result<RawConfig> {
+    layer_settings(startup, cwd, remote, |init| {
+        Ok(match init {
+            InitLua::Global(_) => layers.global.clone(),
+            InitLua::Project => layers
+                .project
+                .as_ref()
+                .filter(|(root, _)| root == cwd)
+                .map(|(_, lua)| lua.clone()),
+        })
+    })
 }
 
 /// What a settings load deliberately left out, worded for the user. Finding
@@ -153,36 +222,95 @@ fn apply_startup_policy(config: &mut Config, features: FeatureFlags) {
     config.permissions.decision_engine = features.enabled(Feature::DecisionEngine);
 }
 
+/// The command-line flags settings are resolved under, apart from `Cli` so a
+/// reload while the TUI runs resolves under them again.
+#[derive(Clone)]
+struct ConfigFlags {
+    features: FeatureFlags,
+    no_rtk: bool,
+    no_snapshots: bool,
+    yolo: bool,
+    max_turns: Option<u32>,
+    allowed_tools: Vec<String>,
+    disallowed_tools: Vec<String>,
+}
+
+impl ConfigFlags {
+    fn of(cli: &Cli) -> Self {
+        Self {
+            features: cli.startup.features,
+            no_rtk: cli.no_rtk,
+            no_snapshots: cli.no_snapshots,
+            yolo: cli.yolo,
+            max_turns: cli.max_turns,
+            allowed_tools: cli.allowed_tools.clone(),
+            disallowed_tools: cli.disallowed_tools.clone(),
+        }
+    }
+}
+
+/// Resolves the settings in `cwd` again under the same flags, merging the
+/// `init.lua` layers recorded at startup rather than running the scripts.
+fn settings_reloader(
+    startup: Startup,
+    flags: ConfigFlags,
+    layers: LuaLayers,
+    remote: bool,
+) -> SettingsReloader {
+    Arc::new(move |cwd: &Path| {
+        let config = reload_settings(&startup, cwd, remote, &layers)
+            .and_then(|settings| resolve_config(settings, &flags, cwd, remote))
+            .map_err(|error| format!("{error:#}"))?;
+        configure_native_tools(&config.agent);
+        Ok(config)
+    })
+}
+
 /// Every entry point resolves config here, so the CLI tool flags cannot apply
 /// in the TUI and silently go missing from `caudra tools`.
 fn load_config(plugin_host: &PluginHost, cli: &Cli, cwd: &Path, remote: bool) -> Result<Config> {
-    let mut config = load_settings(plugin_host, &cli.startup, cwd, remote)?
-        .into_config(cli.no_rtk)
+    resolve_config(
+        load_settings(plugin_host, &cli.startup, cwd, remote)?,
+        &ConfigFlags::of(cli),
+        cwd,
+        remote,
+    )
+}
+
+fn resolve_config(
+    settings: RawConfig,
+    flags: &ConfigFlags,
+    cwd: &Path,
+    remote: bool,
+) -> Result<Config> {
+    let mut config = settings
+        .into_config(flags.no_rtk)
         .context("invalid config")?;
-    config.storage.snapshots.enabled &= !cli.no_snapshots;
+    config.storage.snapshots.enabled &= !flags.no_snapshots;
     config.permissions = if remote {
         caudra_config::load_global_permissions()
     } else {
         caudra_config::load_permissions(cwd)
     };
-    apply_startup_policy(&mut config, cli.startup.features);
+    apply_startup_policy(&mut config, flags.features);
 
-    if cli.yolo || config.always_yolo {
+    if flags.yolo || config.always_yolo {
         config.permissions.yolo = true;
     }
-    if let Some(max) = cli.max_turns {
+    if let Some(max) = flags.max_turns {
         config.agent.max_turns = Some(max);
     }
-    if !cli.allowed_tools.is_empty() {
-        config.agent.allowed_tools = cli
+    if !flags.allowed_tools.is_empty() {
+        config.agent.allowed_tools = flags
             .allowed_tools
             .iter()
             .map(|t| normalize_tool_name(t))
             .collect::<Result<Vec<_>>>()?;
     }
-    if !cli.disallowed_tools.is_empty() {
+    if !flags.disallowed_tools.is_empty() {
         config.agent.disabled_tools.extend(
-            cli.disallowed_tools
+            flags
+                .disallowed_tools
                 .iter()
                 .map(|t| normalize_tool_name(t))
                 .collect::<Result<Vec<_>>>()?,

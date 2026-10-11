@@ -101,7 +101,7 @@ Sessions saved by this version that hold the new kinds of `memory` result, such 
 
 ## When the view changes
 
-The view in the system prompt is taken when the session starts, after a compaction, and when the working directory changes. In between it holds still. Writing a note never changes the system prompt mid-session, so the conversation the provider has cached stays valid.
+The view in the system prompt is taken when the session starts and again at each [rebuild](/docs/configuration/#when-caudra-rebuilds), such as after a compaction or when the working directory changes. In between it holds still. Writing a note never changes the system prompt mid-session, so the conversation the provider has cached stays valid.
 
 Entries written elsewhere, by other sessions or by edits outside the tool, reach the model as a `# Memory updated` [reminder](/docs/context/#what-caudra-writes-on-your-behalf) instead. It lists one row per entry, with the address, the kind, the note's name, and its first heading:
 
@@ -109,7 +109,7 @@ Entries written elsewhere, by other sessions or by edits outside the tool, reach
 - 548+1 note flaky-tests.md: Flaky tests
 ```
 
-The model can zoom into a row with `n` = 1 to read the entry whole. After the next compaction the view includes those entries, and the reminder is withdrawn.
+The model can zoom into a row with `n` = 1 to read the entry whole. At the next rebuild the view includes those entries, and the reminder is withdrawn.
 
 Subagents get the `memory` tool without the view.
 

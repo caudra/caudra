@@ -1197,14 +1197,13 @@ fn terminal_limits_suppress_background_continuation(reason: DoneReason) {
 
 mod background_runtime {
     use std::path::Path;
-    use std::sync::{Arc, Once};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use arc_swap::ArcSwap;
     use caudra_agent::background::ShellJobMetadata;
     use caudra_agent::prompt::profile::PromptProfileCatalog;
     use caudra_agent::tools::native::task::configure_background;
-    use caudra_agent::tools::{ToolRegistry, native};
     use caudra_agent::types::BACKGROUND_EVENT_RUN_ID;
     use caudra_agent::{
         AgentConfig, AgentEvent, DoneReason, Envelope, McpConfigErrors, SubagentHistoryStore,
@@ -1268,7 +1267,6 @@ mod background_runtime {
     const FAILED: &str = "failed";
     const RETRY_TASK: &str = "Retry the audit using its existing context.";
     const NEXT_TASK_DRAFT: &str = "Keep this newer guidance.";
-    static REGISTER: Once = Once::new();
 
     struct Request {
         messages: Vec<Message>,
@@ -1374,9 +1372,7 @@ mod background_runtime {
         }
 
         async fn after_final_with_options(show_reminders: bool, rearm: bool) -> Self {
-            REGISTER.call_once(|| {
-                native::register(ToolRegistry::global(), FeatureFlags::all()).unwrap()
-            });
+            crate::components::register_native_tools();
             let mut app = Box::new(test_app());
             app.ui_config.show_reminders = show_reminders;
             app.chats[0] = Chat::new(
@@ -16000,6 +15996,97 @@ fn closing_login_advances_mcp_then_project_trust() {
     assert!(app.permissions_picker.is_open());
 }
 
+const REVIEW_PERMISSIONS_CHIP: &str = "[review permissions]";
+const REVIEW_MCP_CHIP: &str = "[review MCP]";
+const REVIEW_BOTH_CHIP: &str = "[review permissions, MCP]";
+const REVIEW_CHIP_MISSING: &str = "pending trust must stay visible once its picker is dismissed";
+
+fn has_status_hit(app: &App, target: StatusBarHitTarget) -> bool {
+    app.status_hits.iter().any(|hit| hit.target == target)
+}
+
+/// The footer keeps asking until a picker that decides is on screen, and a
+/// click opens the one startup would have, MCP first.
+#[test_case(true,  false, REVIEW_PERMISSIONS_CHIP ; "permissions")]
+#[test_case(false, true,  REVIEW_MCP_CHIP         ; "mcp")]
+#[test_case(true,  true,  REVIEW_BOTH_CHIP        ; "both")]
+fn the_footer_asks_for_pending_trust_until_its_picker_opens(
+    permissions: bool,
+    mcp: bool,
+    chip: &str,
+) {
+    let mut app = match permissions {
+        true => app_awaiting_permission_config_trust(),
+        false => test_app(),
+    };
+    if mcp {
+        app.mcp_picker = awaiting_mcp_picker();
+    }
+    assert!(rendered(&mut app).contains(chip), "{REVIEW_CHIP_MISSING}");
+
+    assert!(click_status(&mut app, StatusBarHitTarget::TrustReview).is_empty());
+    app.finish_permission_jobs();
+
+    assert_eq!(app.mcp_picker.is_open(), mcp);
+    assert_eq!(app.permissions_picker.is_open(), !mcp);
+    let frame = rendered(&mut app);
+    assert_eq!(
+        has_status_hit(&app, StatusBarHitTarget::TrustReview),
+        permissions && mcp
+    );
+    if permissions && mcp {
+        assert!(
+            frame.contains(REVIEW_PERMISSIONS_CHIP),
+            "{REVIEW_CHIP_MISSING}"
+        );
+    }
+}
+
+#[test]
+fn nothing_pending_draws_no_trust_review() {
+    let mut app = test_app();
+
+    let _ = rendered(&mut app);
+
+    assert!(!has_status_hit(&app, StatusBarHitTarget::TrustReview));
+}
+
+const BROKEN_CONFIG_FILE: &str = "permissions.toml";
+const BROKEN_CONFIG_ERROR: &str = "expected `=`";
+const BROKEN_CONFIG_CONSEQUENCE: &str = "every tool call is denied";
+const BROKEN_CONFIG_DETAILS: &str = "permissions.toml: expected `=`; every tool call is denied";
+
+#[test]
+fn clicking_the_config_problems_chip_flashes_what_failed() {
+    let mut app = test_app();
+    app.config_problems.set(
+        BROKEN_CONFIG_FILE,
+        BROKEN_CONFIG_ERROR.into(),
+        BROKEN_CONFIG_CONSEQUENCE,
+    );
+
+    assert!(click_status(&mut app, StatusBarHitTarget::ConfigProblems).is_empty());
+
+    assert_eq!(app.status_bar.flash_text(), Some(BROKEN_CONFIG_DETAILS));
+}
+
+#[test]
+fn a_config_file_that_loads_again_leaves_the_footer() {
+    let mut app = test_app();
+    app.config_problems.set(
+        BROKEN_CONFIG_FILE,
+        BROKEN_CONFIG_ERROR.into(),
+        BROKEN_CONFIG_CONSEQUENCE,
+    );
+    let _ = rendered(&mut app);
+    assert!(has_status_hit(&app, StatusBarHitTarget::ConfigProblems));
+
+    app.config_problems.clear(BROKEN_CONFIG_FILE);
+    let _ = rendered(&mut app);
+
+    assert!(!has_status_hit(&app, StatusBarHitTarget::ConfigProblems));
+}
+
 #[test]
 fn permission_request_suspends_and_then_restores_project_trust() {
     let mut app = app_awaiting_permission_config_trust();
@@ -16729,6 +16816,7 @@ fn btw_ready_app() -> App {
         system: "system".into(),
         tools: serde_json::json!([]),
         opts: caudra_providers::RequestOptions::default(),
+        profile: None,
     })));
     app
 }

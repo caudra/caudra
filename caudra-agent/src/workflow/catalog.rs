@@ -23,7 +23,7 @@ use tracing::{debug, warn};
 use crate::remote_project_context::{RemoteAssetIdentity, RemoteProjectContext};
 
 const PROJECT_DIR: &str = ".caudra";
-const WORKFLOWS_SUBDIR: &str = "workflows";
+pub(crate) const WORKFLOWS_SUBDIR: &str = "workflows";
 const SCRIPT_EXTENSION: &str = "rhai";
 const BUILTINS: [(&str, &str); 3] = [
     (DEEP_RESEARCH_NAME, DEEP_RESEARCH_SOURCE),

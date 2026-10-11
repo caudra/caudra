@@ -118,14 +118,24 @@ impl MemoryBaseline {
     }
 
     /// [`Self::drift`] for the turn about to run on `history`, off the
-    /// executor. A turn dropped while it runs keeps the baseline it had.
-    pub async fn refresh(&mut self, history: &History, session: Option<&str>) -> Option<String> {
+    /// executor, taking the view again first when `retake`, for a turn whose
+    /// request rebuilds the cached prefix anyway. A turn dropped while it
+    /// runs keeps the baseline it had.
+    pub async fn refresh(
+        &mut self,
+        history: &History,
+        session: Option<&str>,
+        retake: bool,
+    ) -> Option<String> {
         let key = compaction_key(history.active_items());
         let announced =
             last_announced(history.as_slice(), &[MEMORY_UPDATED_MARKER]).map(str::to_owned);
         let session = session.map(str::to_owned);
         let mut next = self.clone();
         let (next, notice) = smol::unblock(move || {
+            if retake {
+                next = Self::adopt(next.store.take(), key);
+            }
             let notice = next.drift(key, session.as_deref(), announced.as_deref());
             (next, notice)
         })

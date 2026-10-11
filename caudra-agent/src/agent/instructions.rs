@@ -149,8 +149,19 @@ impl InstructionBaseline {
     /// differing, and `None` once the transcript and disk agree.
     pub fn drift(&mut self, current: Instructions, epoch: u64) -> Option<String> {
         let swapped = epoch != std::mem::replace(&mut self.epoch, epoch);
+        self.settle(current, swapped)
+    }
+
+    /// [`Self::drift`] for a turn whose request rebuilds the cached prefix
+    /// anyway, which adopts `current` whatever the epoch.
+    pub fn rebase(&mut self, current: Instructions, epoch: u64) -> Option<String> {
+        self.epoch = epoch;
+        self.settle(current, true)
+    }
+
+    fn settle(&mut self, current: Instructions, adopt: bool) -> Option<String> {
         if current.text != self.instructions.text {
-            if !swapped {
+            if !adopt {
                 self.drifted = true;
                 return Some(announcement(&self.instructions.text, &current.text));
             }

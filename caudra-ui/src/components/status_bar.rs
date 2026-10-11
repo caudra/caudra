@@ -8,6 +8,7 @@ use super::tooltip::{Anchor, Tip, TipKey};
 use super::{RetryInfo, Status, escape_terminal_controls, format_elapsed, hover_style};
 
 use crate::animation::spinner_frame;
+use crate::config_problems::ConfigProblem;
 use crate::theme;
 
 use caudra_providers::format_tokens;
@@ -56,6 +57,12 @@ const YOLO_SHORT_LABEL: &str = " [!]";
 const AUTO_LABEL: &str = " [auto]";
 const AUTO_SHORT_LABEL: &str = " [a]";
 const DECISIONS_OFFLINE_LABEL: &str = "[decisions offline]";
+/// `[permissions.toml invalid]` names the one file; past one, the count.
+const CONFIG_INVALID_LABEL: &str = "invalid";
+const CONFIG_FILES_INVALID_LABEL: &str = "config files invalid";
+const REVIEW_PERMISSIONS_LABEL: &str = "[review permissions]";
+const REVIEW_MCP_LABEL: &str = "[review MCP]";
+const REVIEW_BOTH_LABEL: &str = "[review permissions, MCP]";
 /// Says the transcript has stopped following, and clicking it starts again.
 const AUTO_SCROLL_PAUSED_LABEL: &str = "auto-scroll paused";
 /// A level narrower than this is already its own shortest unambiguous form, so
@@ -115,6 +122,8 @@ const TIP_AUTO: &str = "Auto: the decision engine approves calls no rule covers"
 const TIP_FAST: &str = "Fast mode is on";
 const TIP_SANDBOX: &str = "Attached sandbox: ";
 const TIP_DECISIONS: &str = "The decision engine is unreachable";
+const TIP_CONFIG_PROBLEMS: &str = "Config failed to load";
+const TIP_TRUST_REVIEW: &str = "Project config is waiting for your trust";
 const TIP_AUTOMATIONS_ARMED: &str = "armed";
 const TIP_AUTOMATIONS_FAILED: &str = "failed since you last looked";
 const CLICK_MODE: &str = "Click to switch between plan and build";
@@ -129,7 +138,8 @@ const CLICK_RETRY: &str = "Click to retry now";
 const CLICK_ASK: &str = "Click to go back to Ask";
 const CLICK_FAST: &str = "Click to turn it off";
 const CLICK_SANDBOX: &str = "Click to manage it";
-const CLICK_DECISIONS: &str = "Click for details";
+const CLICK_DETAILS: &str = "Click for details";
+const CLICK_TRUST_REVIEW: &str = "Click to review it";
 const CLICK_AUTOMATIONS: &str = "Click to open automations";
 /// Cells in the context gauge. Each fills in eighths, so the gauge resolves
 /// the window to one part in eighty.
@@ -160,6 +170,25 @@ pub struct WorkflowChip {
 pub struct AutomationChip {
     pub armed: usize,
     pub unseen_failures: usize,
+}
+
+/// Project config whose trust is still undecided once its picker is out of
+/// sight, so the bar is what tells the user it is waiting.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingTrust {
+    pub permissions: bool,
+    pub mcp: bool,
+}
+
+impl PendingTrust {
+    fn label(&self) -> Option<&'static str> {
+        match (self.permissions, self.mcp) {
+            (true, true) => Some(REVIEW_BOTH_LABEL),
+            (true, false) => Some(REVIEW_PERMISSIONS_LABEL),
+            (false, true) => Some(REVIEW_MCP_LABEL),
+            (false, false) => None,
+        }
+    }
 }
 
 /// `[wf: deep-research · Research 2/4]` for the one run working now,
@@ -258,6 +287,8 @@ pub enum StatusBarHitTarget {
     Fast,
     Sandbox,
     Decisions,
+    ConfigProblems,
+    TrustReview,
     Automations,
 }
 
@@ -291,7 +322,9 @@ impl StatusBarHitTarget {
             | Self::Tasks
             | Self::Shells
             | Self::Sandbox
-            | Self::Decisions => ChatScope::Any,
+            | Self::Decisions
+            | Self::ConfigProblems
+            | Self::TrustReview => ChatScope::Any,
             Self::Mode
             | Self::Model
             | Self::Thinking
@@ -375,6 +408,9 @@ pub struct StatusBarContext<'a> {
     pub workflows: Option<WorkflowChip>,
     pub permission_mode: PermissionMode,
     pub decisions_offline: bool,
+    /// Config files the session runs without because they failed to load.
+    pub config_problems: &'a [ConfigProblem],
+    pub pending_trust: PendingTrust,
     pub restoring: bool,
     pub background_waiting: bool,
     pub goal: Option<&'a GoalSnapshot>,
@@ -1130,6 +1166,8 @@ impl StatusBar {
         }
         push_retry(&mut left, ctx, Instant::now());
         push_decisions_status(&mut left, ctx);
+        push_config_problems(&mut left, ctx);
+        push_trust_review(&mut left, ctx);
         shorten_mode(&mut left, ctx, area.width, false);
         let right = match ctx.status {
             Status::Error { message, .. } => {
@@ -1207,6 +1245,8 @@ impl StatusBar {
             messages.push(flash);
         }
         push_decisions_status(&mut messages, ctx);
+        push_config_problems(&mut messages, ctx);
+        push_trust_review(&mut messages, ctx);
         let spend = SpendText::new(&ctx.stats);
         let budget = usize::from(area.width).saturating_sub(activity.width() + messages.width());
         let (fit, _) = fit_right(ctx, &spend, None, budget, Some(Band::Live));
@@ -1865,6 +1905,8 @@ fn chip_tip(
         StatusBarHitTarget::Fast => TIP_FAST.to_owned(),
         StatusBarHitTarget::Sandbox => format!("{TIP_SANDBOX}{}", ctx.sandbox?),
         StatusBarHitTarget::Decisions => TIP_DECISIONS.to_owned(),
+        StatusBarHitTarget::ConfigProblems => TIP_CONFIG_PROBLEMS.to_owned(),
+        StatusBarHitTarget::TrustReview => TIP_TRUST_REVIEW.to_owned(),
         StatusBarHitTarget::Automations => match automations.unseen_failures {
             0 => format!("{} {TIP_AUTOMATIONS_ARMED}", automations.armed),
             failures => format!(
@@ -1893,7 +1935,8 @@ fn click_tip(target: StatusBarHitTarget) -> Option<&'static str> {
         StatusBarHitTarget::Yolo | StatusBarHitTarget::Auto => CLICK_ASK,
         StatusBarHitTarget::Fast => CLICK_FAST,
         StatusBarHitTarget::Sandbox => CLICK_SANDBOX,
-        StatusBarHitTarget::Decisions => CLICK_DECISIONS,
+        StatusBarHitTarget::Decisions | StatusBarHitTarget::ConfigProblems => CLICK_DETAILS,
+        StatusBarHitTarget::TrustReview => CLICK_TRUST_REVIEW,
         StatusBarHitTarget::Automations => CLICK_AUTOMATIONS,
         StatusBarHitTarget::BackToMain
         | StatusBarHitTarget::ChatName
@@ -1943,6 +1986,37 @@ fn push_decisions_status(strip: &mut Strip, ctx: &StatusBarContext<'_>) {
                 DECISIONS_OFFLINE_LABEL,
                 theme::current().tool_warning,
             )],
+        );
+    }
+}
+
+/// A control rather than a label: the click flashes each file's error and
+/// what the session does without it, which the chip has no room to say.
+fn push_config_problems(strip: &mut Strip, ctx: &StatusBarContext<'_>) {
+    if let Some(label) = config_problems_label(ctx.config_problems) {
+        strip.chip(
+            ctx,
+            StatusBarHitTarget::ConfigProblems,
+            [Span::styled(label, theme::current().error)],
+        );
+    }
+}
+
+fn config_problems_label(problems: &[ConfigProblem]) -> Option<String> {
+    match problems {
+        [] => None,
+        [only] => Some(format!("[{} {CONFIG_INVALID_LABEL}]", only.file)),
+        several => Some(format!("[{} {CONFIG_FILES_INVALID_LABEL}]", several.len())),
+    }
+}
+
+/// A control rather than a label: the click opens the picker that decides.
+fn push_trust_review(strip: &mut Strip, ctx: &StatusBarContext<'_>) {
+    if let Some(label) = ctx.pending_trust.label() {
+        strip.chip(
+            ctx,
+            StatusBarHitTarget::TrustReview,
+            [Span::styled(label, theme::current().tool_warning)],
         );
     }
 }
@@ -2465,6 +2539,8 @@ mod tests {
         show_global: bool,
         permission_mode: PermissionMode,
         decisions_offline: bool,
+        config_problems: &'a [ConfigProblem],
+        pending_trust: PendingTrust,
         fast: bool,
         hovered: Option<StatusBarHitTarget>,
         hover_hint: Option<&'a str>,
@@ -2495,6 +2571,8 @@ mod tests {
                 show_global: false,
                 permission_mode: PermissionMode::Ask,
                 decisions_offline: false,
+                config_problems: &[],
+                pending_trust: PendingTrust::default(),
                 fast: false,
                 hovered: None,
                 hover_hint: None,
@@ -2545,6 +2623,8 @@ mod tests {
                 workflows: self.workflows,
                 permission_mode: self.permission_mode,
                 decisions_offline: self.decisions_offline,
+                config_problems: self.config_problems,
+                pending_trust: self.pending_trust,
                 restoring: false,
                 background_waiting: self.background_waiting,
                 goal: self.goal,
@@ -2705,6 +2785,8 @@ mod tests {
             workflows: ladder_workflows(),
             permission_mode: PermissionMode::Yolo,
             decisions_offline: false,
+            config_problems: &[],
+            pending_trust: PendingTrust::default(),
             restoring: false,
             background_waiting: false,
             goal: None,
@@ -4221,6 +4303,78 @@ mod tests {
         );
     }
 
+    const PERMISSIONS_FILE: &str = "permissions.toml";
+    const MCP_FILE: &str = "mcp.toml";
+    const ONE_PROBLEM_CHIP: &str = "[permissions.toml invalid]";
+    const TWO_PROBLEMS_CHIP: &str = "[2 config files invalid]";
+    const CONFIG_ERROR: &str = "expected `=`";
+    const CONFIG_CONSEQUENCE: &str = "every tool call is denied";
+
+    fn config_problem(file: &'static str) -> ConfigProblem {
+        ConfigProblem {
+            file,
+            error: CONFIG_ERROR.into(),
+            consequence: CONFIG_CONSEQUENCE,
+        }
+    }
+
+    #[test_case(&[], None; "none")]
+    #[test_case(&[PERMISSIONS_FILE], Some(ONE_PROBLEM_CHIP); "one_names_the_file")]
+    #[test_case(&[PERMISSIONS_FILE, MCP_FILE], Some(TWO_PROBLEMS_CHIP); "several_are_counted")]
+    fn the_config_problems_chip_names_one_file_and_counts_several(
+        files: &[&'static str],
+        expected: Option<&str>,
+    ) {
+        let problems: Vec<_> = files.iter().copied().map(config_problem).collect();
+        assert_eq!(config_problems_label(&problems).as_deref(), expected);
+    }
+
+    #[test_case(true, false, Some(REVIEW_PERMISSIONS_LABEL); "permissions")]
+    #[test_case(false, true, Some(REVIEW_MCP_LABEL); "mcp")]
+    #[test_case(true, true, Some(REVIEW_BOTH_LABEL); "both")]
+    #[test_case(false, false, None; "neither")]
+    fn the_trust_review_chip_names_what_waits(
+        permissions: bool,
+        mcp: bool,
+        expected: Option<&str>,
+    ) {
+        assert_eq!(PendingTrust { permissions, mcp }.label(), expected);
+    }
+
+    #[test_case(SINGLE_ROW; "single_row")]
+    #[test_case(SPLIT_ROWS; "split_rows")]
+    fn config_chips_are_controls_in_both_layouts(rows: u16) {
+        let problems = [config_problem(PERMISSIONS_FILE)];
+        let ctx = Fixture {
+            config_problems: &problems,
+            pending_trust: PendingTrust {
+                permissions: true,
+                mcp: true,
+            },
+            ..Default::default()
+        }
+        .into_ctx();
+        let drawn = draw(&ctx, BAR_WIDTH, rows);
+        let palette = theme::current();
+        for (target, label, style) in [
+            (
+                StatusBarHitTarget::ConfigProblems,
+                ONE_PROBLEM_CHIP,
+                palette.error,
+            ),
+            (
+                StatusBarHitTarget::TrustReview,
+                REVIEW_BOTH_LABEL,
+                palette.tool_warning,
+            ),
+        ] {
+            let hit = drawn.hit(target);
+            assert_eq!(drawn.glyphs(hit), label);
+            assert!(drawn.styles(hit).iter().all(|cell| cell.fg == style.fg));
+            assert!(hit.target.accepts_click());
+        }
+    }
+
     #[test_case(true; "main_chat")]
     #[test_case(false; "subagent_chat")]
     fn auto_permission_mode_has_its_own_footer_control(main_chat: bool) {
@@ -5031,7 +5185,7 @@ mod tests {
     /// Every control that opens a command carries that command's scope, so the
     /// bar cannot refuse a click the palette accepts. `Mode`, `BackToMain`,
     /// `Retry` and `Thinking` are absent because their click runs no command.
-    const SCOPED_COMMANDS: [(StatusBarHitTarget, &str); 7] = [
+    const SCOPED_COMMANDS: [(StatusBarHitTarget, &str); 9] = [
         (StatusBarHitTarget::Model, "/model"),
         (StatusBarHitTarget::Goal, "/goal"),
         (StatusBarHitTarget::Context, "/context"),
@@ -5039,6 +5193,8 @@ mod tests {
         (StatusBarHitTarget::Workflows, "/workflows"),
         (StatusBarHitTarget::Automations, "/automations"),
         (StatusBarHitTarget::Decisions, "/decisions"),
+        (StatusBarHitTarget::TrustReview, "/mcp"),
+        (StatusBarHitTarget::TrustReview, "/permissions"),
     ];
     const SCOPE_DRIFT_MSG: &str = "a control and its command must agree on which chat they act on";
     const UNKNOWN_COMMAND_MSG: &str = "a control names a command the builtin table does not have";
@@ -5068,6 +5224,8 @@ mod tests {
     #[test_case(StatusBarHitTarget::Yolo, false, &[TIP_YOLO], Some(CLICK_ASK); "yolo_on_a_task")]
     #[test_case(StatusBarHitTarget::Context, true, &[TIP_CONTEXT], Some(CLICK_CONTEXT); "context")]
     #[test_case(StatusBarHitTarget::Cwd, true, &[TIP_CWD], None; "cwd")]
+    #[test_case(StatusBarHitTarget::ConfigProblems, false, &[TIP_CONFIG_PROBLEMS], Some(CLICK_DETAILS); "config_problems_on_a_task")]
+    #[test_case(StatusBarHitTarget::TrustReview, false, &[TIP_TRUST_REVIEW], Some(CLICK_TRUST_REVIEW); "trust_review_on_a_task")]
     fn a_chip_tip_says_what_it_means_and_offers_only_real_clicks(
         target: StatusBarHitTarget,
         main_chat: bool,

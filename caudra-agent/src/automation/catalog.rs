@@ -25,7 +25,7 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 const PROJECT_DIR: &str = ".caudra";
-const AUTOMATIONS_SUBDIR: &str = "automations";
+pub(crate) const AUTOMATIONS_SUBDIR: &str = "automations";
 const SCRIPT_EXTENSION: &str = "rhai";
 const TRUST_DOMAIN: TrustDomain = TrustDomain::Automation;
 const NOT_UTF8: &str = "source is not valid UTF-8";

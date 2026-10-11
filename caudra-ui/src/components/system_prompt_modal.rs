@@ -34,6 +34,7 @@ const PROFILE_HINT: &str = " profile";
 const RAW_LABEL: &str = "r";
 const PROFILE_LABEL: &str = "p";
 const EMPTY: &str = "No system prompt has been published yet.";
+const EDITED: &str = "The profile changed after this prompt was built. The model reads the change as a reminder until the prompt is rebuilt, and /reload rebuilds it now.";
 pub(crate) const COPIED: &str = "Copied the system prompt";
 
 const RAW_TARGET: usize = 0;
@@ -61,6 +62,9 @@ pub struct SystemPromptModal {
     /// next turn bound its prompt.
     source: Arc<str>,
     title: String,
+    /// The session's profile builds another prompt than `source` now, which
+    /// the view says above it so the old text is not taken for the file.
+    edited: bool,
     raw: bool,
     /// Columns the numbers hold beside the body, fixed while the modal is open
     /// because the source it counts cannot change under it.
@@ -72,11 +76,12 @@ pub struct SystemPromptModal {
 }
 
 impl SystemPromptModal {
-    pub fn open(&mut self, source: Arc<str>, profile: &str) {
+    pub fn open(&mut self, source: Arc<str>, profile: &str, edited: bool) {
         self.gutter = gutter_width(&source);
         self.open = true;
         self.source = source;
         self.title = format!("{TITLE_PREFIX}{profile} ");
+        self.edited = edited;
         self.raw = false;
         self.document.reset();
         self.footer.clear();
@@ -185,7 +190,14 @@ impl SystemPromptModal {
         let width = body_width(area.width, self.gutter);
         self.document
             .ensure((self.raw, width, theme::generation()), self.gutter, || {
-                paint(&self.source, self.raw, width, self.gutter, &theme)
+                paint(
+                    &self.source,
+                    self.raw,
+                    self.edited,
+                    width,
+                    self.gutter,
+                    &theme,
+                )
             });
         let footer = footer(self.raw, &theme);
         self.popup = self
@@ -239,9 +251,14 @@ fn footer(raw: bool, theme: &Theme) -> FooterLine {
 }
 
 /// The view `raw` names, painted to `width`, with each row's source line number
-/// in the gutter beside it.
-fn paint(source: &str, raw: bool, width: u16, gutter: u16, theme: &Theme) -> Painted {
-    let (lines, numbers) = numbered_rows(source, raw, width, theme);
+/// in the gutter beside it, under a notice when the profile was `edited`.
+fn paint(source: &str, raw: bool, edited: bool, width: u16, gutter: u16, theme: &Theme) -> Painted {
+    let (mut lines, mut numbers) = numbered_rows(source, raw, width, theme);
+    if edited && !source.is_empty() {
+        let notice = edited_lines(width, theme);
+        numbers.splice(0..0, vec![None; notice.len()]);
+        lines.splice(0..0, notice);
+    }
     let cells = numbers
         .into_iter()
         .map(|number| gutter_line(number, gutter, theme.diff_line_nr))
@@ -270,6 +287,18 @@ fn notice_lines(theme: &Theme) -> Vec<Line<'static>> {
         Line::from(Span::styled(EMPTY, theme.status_dim)),
         Line::from(Span::styled(UNBOUND_HINT, theme.tool_dim)),
     ]
+}
+
+/// [`EDITED`] wrapped to `width`, and a blank row between it and the prompt.
+fn edited_lines(width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    let (mut painted, _) = text_to_wrapped(
+        EDITED,
+        theme.status_notice,
+        width,
+        caudra_markdown::render::TOOL_OUTPUT_MAX_LINE_BYTES,
+    );
+    painted.lines.push(Line::default());
+    painted.lines
 }
 
 /// The columns the numbers hold, sized to the whole source rather than to the
@@ -406,6 +435,12 @@ mod tests {
     const FOOTER_UNHEARD: &str = "a click on the footer must reach it while a sweep stands";
     const NOT_SCROLLED: &str = "the fixture must start a line down a prompt longer than the body";
     const CHORD_TAKEN: &str = "Ctrl+Y must scroll a line up, never copy";
+    /// Wide enough for the notice to hold one row, so it reads back whole.
+    const NOTICE_WIDTH: u16 = 400;
+    /// The notice's row and the blank under it.
+    const NOTICE_ROWS: usize = 2;
+    const NOTICE_MISSING: &str = "an edited profile must be noted above the prompt, and only then";
+    const NOTICE_NUMBERED: &str = "the notice must leave every line number to the prompt";
 
     fn prompt() -> String {
         format!("{HEADING}\n\n{BODY}\n\n{FENCE}\nlet x = 1;\n{FENCE}\n")
@@ -413,7 +448,7 @@ mod tests {
 
     fn opened() -> SystemPromptModal {
         let mut modal = SystemPromptModal::default();
-        modal.open(Arc::from(prompt().as_str()), PROFILE);
+        modal.open(Arc::from(prompt().as_str()), PROFILE, false);
         modal
     }
 
@@ -526,8 +561,49 @@ mod tests {
     #[test]
     fn an_unpublished_prompt_says_so() {
         let mut modal = SystemPromptModal::default();
-        modal.open(Arc::from(""), PROFILE);
+        modal.open(Arc::from(""), PROFILE, false);
         assert!(render(&mut modal).contains(EMPTY));
+    }
+
+    #[test_case(true, NOTICE_ROWS ; "edited")]
+    #[test_case(false, 0 ; "as_built")]
+    fn an_edited_profile_is_noted_above_the_prompt(edited: bool, notice_rows: usize) {
+        let source = prompt();
+        let painted = paint(
+            &source,
+            true,
+            edited,
+            NOTICE_WIDTH,
+            gutter_width(&source),
+            &theme::current(),
+        );
+
+        assert_eq!(
+            painted.lines()[0].to_string() == EDITED,
+            edited,
+            "{NOTICE_MISSING}"
+        );
+        assert_eq!(
+            painted.lines()[notice_rows].to_string(),
+            HEADING,
+            "{NOTICE_MISSING}"
+        );
+        let gutter: Vec<String> = painted
+            .gutter()
+            .iter()
+            .map(|cell| cell.to_string().trim().to_owned())
+            .collect();
+        assert!(
+            gutter[..notice_rows].iter().all(String::is_empty),
+            "{NOTICE_NUMBERED}"
+        );
+        assert_eq!(gutter[notice_rows], "1", "{NOTICE_NUMBERED}");
+    }
+
+    #[test]
+    fn an_unpublished_prompt_needs_no_edit_notice() {
+        let painted = paint("", false, true, NOTICE_WIDTH, 0, &theme::current());
+        assert_eq!(painted.lines()[0].to_string(), EMPTY, "{NOTICE_MISSING}");
     }
 
     #[test_case(key_ev(KeyCode::Esc)     ; "esc")]
@@ -566,7 +642,7 @@ mod tests {
     fn ctrl_y_scrolls_a_line_up_rather_than_copying() {
         let mut modal = SystemPromptModal::default();
         let source = format!("{}{}", prompt(), FILLER.repeat(FILLER_LINES));
-        modal.open(Arc::from(source.as_str()), PROFILE);
+        modal.open(Arc::from(source.as_str()), PROFILE, false);
         modal.handle_key(key_ev(KeyCode::Char('r')));
         render(&mut modal);
         modal.scroll(-1);

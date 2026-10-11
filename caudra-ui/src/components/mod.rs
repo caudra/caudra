@@ -1513,6 +1513,20 @@ pub(crate) fn test_pricing() -> ModelPricing {
     }
 }
 
+/// Registers every native tool in the global registry once per process, so
+/// tests that run a turn send a real tool array.
+#[cfg(test)]
+pub(crate) fn register_native_tools() {
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+    REGISTER.call_once(|| {
+        caudra_agent::tools::native::register(
+            caudra_agent::tools::ToolRegistry::global(),
+            caudra_config::FeatureFlags::all(),
+        )
+        .unwrap();
+    });
+}
+
 #[cfg(test)]
 pub(crate) fn test_model() -> caudra_providers::Model {
     caudra_providers::Model {

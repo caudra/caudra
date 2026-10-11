@@ -49,6 +49,11 @@ impl PromptProfilePicker {
         }
     }
 
+    /// Lists `catalog` from the next time the picker opens.
+    pub fn set_catalog(&mut self, catalog: Arc<PromptProfileCatalog>) {
+        self.catalog = catalog;
+    }
+
     pub fn open(&mut self, current: &str) {
         let mut entries = vec![ProfileItem {
             name: BUILTIN_PROFILE_NAME.to_owned(),
@@ -131,10 +136,40 @@ impl Overlay for PromptProfilePicker {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use caudra_agent::prompt::profile::{PROFILE_DIR, PROFILE_EXTENSION};
     use crossterm::event::KeyCode;
+    use tempfile::TempDir;
 
     use super::*;
     use crate::components::key;
+
+    const SAVED_LATER: &str = "review";
+    const SAVED_BODY: &str = "Review carefully.";
+
+    #[test]
+    fn a_profile_saved_after_the_picker_was_made_can_be_picked() {
+        let dir = TempDir::new().unwrap();
+        let profiles = dir.path().join(PROFILE_DIR);
+        fs::create_dir(&profiles).unwrap();
+        let mut picker = PromptProfilePicker::new(Arc::new(PromptProfileCatalog::default()));
+        fs::write(
+            profiles.join(format!("{SAVED_LATER}.{PROFILE_EXTENSION}")),
+            SAVED_BODY,
+        )
+        .unwrap();
+
+        picker.set_catalog(Arc::new(PromptProfileCatalog::discover_with(Some(
+            dir.path(),
+        ))));
+        picker.open(SAVED_LATER);
+
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Enter)),
+            PromptProfilePickerAction::Select(ref name) if name == SAVED_LATER
+        ));
+    }
 
     #[test]
     fn builtin_is_always_selectable() {

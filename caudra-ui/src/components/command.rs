@@ -645,6 +645,21 @@ impl CommandPalette {
 
     pub(crate) fn set_custom_commands(&mut self, commands: Arc<[CustomCommand]>) {
         self.custom = commands;
+        self.reindex();
+    }
+
+    /// Adopts a restarted MCP manager's reader. Its generations count from
+    /// zero again, so its prompts are read now rather than left to a
+    /// generation check that could mistake it for the manager it replaced.
+    pub(crate) fn set_mcp_reader(&mut self, reader: McpSnapshotReader) {
+        self.mcp_reader = reader;
+        let snapshot = self.mcp_reader.load_full();
+        self.mcp_generation = snapshot.generation;
+        self.mcp_prompts = snapshot.prompts.clone();
+        self.reindex();
+    }
+
+    fn reindex(&mut self) {
         self.nucleo = Self::build_nucleo(
             self.features,
             &self.custom,
@@ -1885,6 +1900,34 @@ mod tests {
             }
             _ => panic!("Should have MCP prompt"),
         }
+    }
+
+    const ADOPTED_PROMPTS_MSG: &str =
+        "a restarted manager's prompts must load even when its generation matches the old one";
+
+    #[test]
+    fn adopting_a_reader_at_the_same_generation_loads_its_prompts() {
+        let mut p = CommandPalette::new(
+            Arc::from([]),
+            McpSnapshotReader::empty(),
+            LuaCommandReader::empty(),
+            FeatureFlags::all(),
+        );
+        p.sync("/", false);
+
+        p.set_mcp_reader(sample_prompts());
+        p.sync("/", false);
+
+        let prompts = p
+            .filtered
+            .iter()
+            .filter(|f| matches!(f.command_type, CommandType::McpPrompt(_)))
+            .count();
+        assert_eq!(
+            prompts,
+            sample_prompts().load().prompts.len(),
+            "{ADOPTED_PROMPTS_MSG}"
+        );
     }
 
     #[test_case("/cmp", "/compact" ; "compact_fuzzy")]

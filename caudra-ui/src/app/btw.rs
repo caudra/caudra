@@ -628,6 +628,7 @@ mod tests {
             system: SYSTEM.into(),
             tools: json!([]),
             opts: RequestOptions::default(),
+            profile: None,
         }
     }
 

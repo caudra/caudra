@@ -10,10 +10,10 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock};
 
 use crate::remote_project_context::RemoteSkill;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use serde_json::Value;
 
 use crate::tools::registry::{
@@ -30,18 +30,18 @@ pub const DESCRIPTION: &str =
 const SKILL_FILE: &str = "SKILL.md";
 const NOT_FOUND: &str = "skill not found: ";
 const NO_SKILLS: &str = "No skills available.";
-const SKILLS_SUBDIR: &str = "skills";
+pub(crate) const SKILLS_SUBDIR: &str = "skills";
 const ADDRESS_SEPARATORS: [char; 2] = ['/', '?'];
 
 /// Tier lists, highest priority first. The first directory that exists is the
 /// only one read, so a Caudra directory shuts out the compatibility ones.
-const PROJECT_SKILL_DIRS: &[&str] = &[
+pub(crate) const PROJECT_SKILL_DIRS: &[&str] = &[
     ".caudra/skills",
     ".claude/skills",
     ".opencode/skills",
     ".agents/skills",
 ];
-const GLOBAL_SKILL_DIRS: &[&str] = &[
+pub(crate) const GLOBAL_SKILL_DIRS: &[&str] = &[
     ".claude/skills",
     ".config/opencode/skills",
     ".agents/skills",
@@ -174,65 +174,97 @@ struct SkillCatalog {
     entries: Vec<SkillInventoryEntry>,
 }
 
-pub struct SkillTool {
+type Locate = Box<dyn Fn() -> Vec<SkillDirCandidate> + Send + Sync>;
+
+/// One scan: where it looked and what it found there.
+struct Scanned {
     dirs: Vec<SkillDirCandidate>,
+    catalog: SkillCatalog,
+}
+
+pub struct SkillTool {
+    /// Run again on every scan, so a skills directory created since is read.
+    locate: Locate,
     remote_skills: Option<Arc<[RemoteSkill]>>,
-    /// Built on first use, not at registration: tools register before the
-    /// config that decides whether the builtin skill exists. Memoized so the
-    /// list the model was given cannot change under it mid-session.
-    catalog: OnceLock<SkillCatalog>,
+    /// Scanned on first use, not at registration: tools register before the
+    /// config that decides whether the builtin skill exists. Kept until
+    /// [`refresh`], so a list only changes when the disk is known to have.
+    scanned: ArcSwapOption<Scanned>,
 }
 
 impl Default for SkillTool {
     fn default() -> Self {
-        Self {
-            dirs: skill_dirs(),
-            remote_skills: None,
-            catalog: OnceLock::new(),
-        }
+        Self::new(skill_dirs, None)
     }
 }
 
 impl SkillTool {
-    pub fn remote(skills: &[RemoteSkill]) -> Self {
+    fn new(
+        locate: impl Fn() -> Vec<SkillDirCandidate> + Send + Sync + 'static,
+        remote_skills: Option<Arc<[RemoteSkill]>>,
+    ) -> Self {
         Self {
-            dirs: global_skill_dirs(),
-            remote_skills: Some(skills.into()),
-            catalog: OnceLock::new(),
+            locate: Box::new(locate),
+            remote_skills,
+            scanned: ArcSwapOption::empty(),
         }
     }
 
-    fn catalog(&self) -> &SkillCatalog {
-        self.catalog.get_or_init(|| {
-            let mut found = discover(&self.dirs, &installed_builtins());
-            for skill in self.remote_skills.iter().flat_map(|skills| skills.iter()) {
-                found.insert(
-                    skill.name.clone(),
-                    Skill {
-                        name: skill.name.clone(),
-                        description: skill.description.clone(),
-                        location: skill.source.source_label(),
-                        scope: SkillScope::Project,
-                    },
-                );
-            }
-            SkillCatalog {
-                description: format!("{DESCRIPTION}{}", skill_list(&found)),
-                entries: found
-                    .values()
-                    .map(|skill| SkillInventoryEntry {
-                        name: skill.name.clone(),
-                        description: skill.description.clone(),
-                        location: skill.location.clone(),
-                        scope: skill.scope,
-                    })
-                    .collect(),
-            }
-        })
+    pub fn remote(skills: &[RemoteSkill]) -> Self {
+        Self::new(global_skill_dirs, Some(skills.into()))
     }
 
-    pub fn inventory(&self) -> &[SkillInventoryEntry] {
-        &self.catalog().entries
+    fn scanned(&self) -> Arc<Scanned> {
+        if let Some(scanned) = self.scanned.load_full() {
+            return scanned;
+        }
+        let dirs = (self.locate)();
+        let catalog = self.catalog(&dirs);
+        let scanned = Arc::new(Scanned { dirs, catalog });
+        let previous = self
+            .scanned
+            .compare_and_swap(&None::<Arc<Scanned>>, Some(Arc::clone(&scanned)));
+        (*previous).clone().unwrap_or(scanned)
+    }
+
+    fn catalog(&self, dirs: &[SkillDirCandidate]) -> SkillCatalog {
+        let mut found = discover(dirs, &installed_builtins());
+        for skill in self.remote_skills.iter().flat_map(|skills| skills.iter()) {
+            found.insert(
+                skill.name.clone(),
+                Skill {
+                    name: skill.name.clone(),
+                    description: skill.description.clone(),
+                    location: skill.source.source_label(),
+                    scope: SkillScope::Project,
+                },
+            );
+        }
+        SkillCatalog {
+            description: format!("{DESCRIPTION}{}", skill_list(&found)),
+            entries: found
+                .values()
+                .map(|skill| SkillInventoryEntry {
+                    name: skill.name.clone(),
+                    description: skill.description.clone(),
+                    location: skill.location.clone(),
+                    scope: skill.scope,
+                })
+                .collect(),
+        }
+    }
+
+    fn dirs(&self) -> Vec<SkillDirCandidate> {
+        self.scanned().dirs.clone()
+    }
+
+    pub fn inventory(&self) -> Vec<SkillInventoryEntry> {
+        self.scanned().catalog.entries.clone()
+    }
+
+    /// Drops the scan, so the next use reads the disk again.
+    pub fn refresh(&self) {
+        self.scanned.store(None);
     }
 }
 
@@ -242,9 +274,20 @@ pub fn inventory(registry: &ToolRegistry) -> Vec<SkillInventoryEntry> {
         .and_then(|registered| {
             registered
                 .downcast_ref::<SkillTool>()
-                .map(|tool| tool.inventory().to_vec())
+                .map(SkillTool::inventory)
         })
         .unwrap_or_default()
+}
+
+/// Makes `registry`'s skill tool read the disk again on its next use. The
+/// description a conversation already declared stays put; the difference
+/// reaches the model as a configuration notice.
+pub fn refresh(registry: &ToolRegistry) {
+    if let Some(registered) = registry.get(SKILL_TOOL_NAME)
+        && let Some(tool) = registered.downcast_ref::<SkillTool>()
+    {
+        tool.refresh();
+    }
 }
 
 /// Every candidate directory with the state precedence gave it, so `/skills`
@@ -253,11 +296,7 @@ pub fn inventory(registry: &ToolRegistry) -> Vec<SkillInventoryEntry> {
 pub fn directories(registry: &ToolRegistry) -> Vec<SkillDirCandidate> {
     registry
         .get(SKILL_TOOL_NAME)
-        .and_then(|registered| {
-            registered
-                .downcast_ref::<SkillTool>()
-                .map(|tool| tool.dirs.clone())
-        })
+        .and_then(|registered| registered.downcast_ref::<SkillTool>().map(SkillTool::dirs))
         .unwrap_or_default()
 }
 
@@ -270,7 +309,7 @@ pub fn load(registry: &ToolRegistry, name: &str) -> Result<String, String> {
     {
         Some(tool) => SkillCall {
             name: name.into(),
-            dirs: tool.dirs.clone(),
+            dirs: tool.dirs(),
             remote_skills: tool.remote_skills.clone(),
         }
         .load(),
@@ -287,7 +326,7 @@ impl Tool for SkillTool {
     }
 
     fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
-        Cow::Borrowed(&self.catalog().description)
+        Cow::Owned(self.scanned().catalog.description.clone())
     }
 
     fn schema(&self) -> Value {
@@ -306,7 +345,7 @@ impl Tool for SkillTool {
             .ok_or_else(|| ParseError::custom("name is required"))?;
         Ok(Box::new(SkillCall {
             name: name.to_owned(),
-            dirs: self.dirs.clone(),
+            dirs: self.dirs(),
             remote_skills: self.remote_skills.clone(),
         }))
     }
@@ -613,6 +652,9 @@ mod tests {
     const PAGE_ADDRESS: &str = "/tools";
     const MISSING_PAGE: &str = "/missing";
     const PAGE_ERROR: &str = "unknown page: missing";
+    const LATE_SKILLS_DIR: &str = ".caudra/skills";
+    const LATE_SKILL: &str = "release";
+    const LATE_SKILL_FILE: &str = "---\ndescription: cut a release\n---\nbody\n";
 
     fn remote_skill() -> RemoteSkill {
         let authority = AuthorityIdentity::new(
@@ -650,23 +692,27 @@ mod tests {
         skill_dir(&project, LOCAL_ONLY_SKILL, LOCAL_BODY);
         let mut global_dir = skill_dir(&global, SHARED_SKILL, GLOBAL_BODY);
         global_dir.scope = SkillScope::User;
-        let embedded = SkillTool {
-            dirs: vec![global_dir.clone(), project_dir],
-            remote_skills: None,
-            catalog: OnceLock::new(),
-        };
+        let embedded_dirs = vec![global_dir.clone(), project_dir];
+        let embedded = SkillTool::new(move || embedded_dirs.clone(), None);
         let skills = if include_remote {
             vec![remote_skill()]
         } else {
             vec![]
         };
-        let mut remote = SkillTool::remote(&skills);
-        assert!(remote.dirs.iter().all(|dir| dir.scope == SkillScope::User));
-        remote.dirs = vec![global_dir];
+        assert!(
+            SkillTool::remote(&skills)
+                .dirs()
+                .iter()
+                .all(|dir| dir.scope == SkillScope::User)
+        );
+        let remote = SkillTool::new(
+            move || vec![global_dir.clone()],
+            Some(skills.as_slice().into()),
+        );
         let call = |tool: &SkillTool, name: &str| {
             SkillCall {
                 name: name.into(),
-                dirs: tool.dirs.clone(),
+                dirs: tool.dirs(),
                 remote_skills: tool.remote_skills.clone(),
             }
             .load()
@@ -689,10 +735,16 @@ mod tests {
         let error = call(&remote, LOCAL_ONLY_SKILL).unwrap_err().message;
         assert!(error.starts_with(NOT_FOUND));
         assert!(!error.contains(LOCAL_BODY));
-        assert!(!remote.catalog().description.contains(LOCAL_ONLY_SKILL));
-        assert!(!remote.catalog().description.contains(LOCAL_BODY));
+        assert!(
+            !remote
+                .scanned()
+                .catalog
+                .description
+                .contains(LOCAL_ONLY_SKILL)
+        );
+        assert!(!remote.scanned().catalog.description.contains(LOCAL_BODY));
         if include_remote {
-            assert!(remote.catalog().description.contains(REMOTE_BODY));
+            assert!(remote.scanned().catalog.description.contains(REMOTE_BODY));
         }
     }
 
@@ -859,28 +911,66 @@ mod tests {
     }
 
     #[test]
-    fn structured_inventory_is_the_same_memoized_catalog_the_model_sees() {
+    fn structured_inventory_is_the_same_kept_catalog_the_model_sees() {
         let temp = tempfile::tempdir().unwrap();
         let root = skill_dir(
             &temp,
             "deploy",
             "---\ndescription: ship safely\n---\nbody\n",
         );
-        let tool = SkillTool {
-            dirs: vec![root],
-            remote_skills: None,
-            catalog: OnceLock::new(),
-        };
+        let tool = SkillTool::new(move || vec![root.clone()], None);
 
-        let first = tool.inventory().to_vec();
+        let first = tool.inventory();
         skill_dir(&temp, "later", "---\ndescription: added later\n---\nbody\n");
 
         assert_eq!(tool.inventory(), first);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].name, "deploy");
         assert_eq!(first[0].description, "ship safely");
-        assert!(tool.catalog().description.contains("- deploy: ship safely"));
-        assert!(!tool.catalog().description.contains("later"));
+        assert!(
+            tool.scanned()
+                .catalog
+                .description
+                .contains("- deploy: ship safely")
+        );
+        assert!(!tool.scanned().catalog.description.contains("later"));
+    }
+
+    #[test]
+    fn a_refresh_reads_skills_and_directories_created_since() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(LATE_SKILLS_DIR);
+        let locate = {
+            let root = root.clone();
+            move || {
+                let state = if root.is_dir() {
+                    SkillDirState::Selected
+                } else {
+                    SkillDirState::Missing
+                };
+                vec![SkillDirCandidate {
+                    path: root.clone(),
+                    scope: SkillScope::Project,
+                    state,
+                }]
+            }
+        };
+        let tool = SkillTool::new(locate, None);
+        assert!(tool.inventory().is_empty());
+        let skill = root.join(LATE_SKILL);
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join(SKILL_FILE), LATE_SKILL_FILE).unwrap();
+        assert!(tool.inventory().is_empty());
+
+        tool.refresh();
+
+        let names: Vec<String> = tool
+            .inventory()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(names, [LATE_SKILL]);
+        assert!(tool.dirs().iter().all(SkillDirCandidate::is_selected));
     }
 
     #[test]
@@ -1021,11 +1111,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut root = skill_dir(&temp, "deploy", "---\ndescription: ship it\n---\nbody\n");
         root.scope = SkillScope::User;
-        let tool = SkillTool {
-            dirs: vec![root],
-            remote_skills: None,
-            catalog: OnceLock::new(),
-        };
+        let tool = SkillTool::new(move || vec![root.clone()], None);
 
         let entry = &tool.inventory()[0];
         assert_eq!(entry.scope, SkillScope::User);

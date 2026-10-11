@@ -384,6 +384,10 @@ pub struct AgentRunParams<'h> {
     /// view, or the withdrawal once it holds them. `None` for a subagent, which
     /// gets no view.
     pub memory: Option<String>,
+    /// How the configuration differs from the tool array and `system` the
+    /// conversation fixed, or the withdrawal once they match. `None` for a
+    /// subagent, whose prefix is built fresh at spawn.
+    pub configuration: Option<String>,
     /// The mode a task was granted. `None` for the interactive modes, which the
     /// user toggles and which are therefore derived from the transcript.
     pub mode_notice: Option<String>,
@@ -392,6 +396,10 @@ pub struct AgentRunParams<'h> {
     /// Definitions the request holds back until `tool_search` loads them.
     /// Built by the same caller as `tools`, from the same vars and filter.
     pub deferred: Vec<DeferredTool>,
+    /// Whether `tools` and `deferred` are the prefix the conversation fixed,
+    /// configured when it was fixed. They are then sent as given, and a call
+    /// to a tool that is no longer available fails at dispatch.
+    pub tools_fixed: bool,
 }
 
 pub struct Agent<'h> {
@@ -404,10 +412,12 @@ pub struct Agent<'h> {
     environment: Option<String>,
     instructions: Option<String>,
     memory: Option<String>,
+    configuration: Option<String>,
     mode_notice: Option<String>,
     event_tx: EventSender,
     tools: Value,
     deferral: DeferralSession,
+    tools_fixed: bool,
     mode: AgentMode,
     plan: Option<PlanTarget>,
     user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
@@ -578,10 +588,12 @@ impl<'h> Agent<'h> {
             environment: run.environment,
             instructions: run.instructions,
             memory: run.memory,
+            configuration: run.configuration,
             mode_notice: run.mode_notice,
             event_tx: run.event_tx,
             tools: run.tools,
             deferral,
+            tools_fixed: run.tools_fixed,
             mode: AgentMode::default(),
             plan: None,
             user_response_rx: None,
@@ -863,7 +875,9 @@ impl<'h> Agent<'h> {
         }
         self.rollback_len = self.history.len();
         let message = self.push_user_inputs(inputs, queued).await;
-        self.configure_profile_tools();
+        if !self.tools_fixed {
+            self.configure_profile_tools();
+        }
         let skill_suggestion = self.suggest_skill(&message).await;
 
         info!(
@@ -1074,6 +1088,11 @@ impl<'h> Agent<'h> {
             self.history.as_slice(),
             crate::prompt::MEMORY_UPDATED_MARKER,
             self.memory.as_deref(),
+        ));
+        standing.extend(standing_notice(
+            self.history.as_slice(),
+            crate::prompt::CONFIGURATION_CHANGED_MARKER,
+            self.configuration.as_deref(),
         ));
         standing.extend(standing_notice(
             self.history.as_slice(),
@@ -5604,10 +5623,12 @@ mod tests {
                 environment: None,
                 instructions: None,
                 memory: None,
+                configuration: None,
                 mode_notice: None,
                 event_tx: EventSender::new(raw_tx, 0),
                 tools: serde_json::json!([]),
                 deferred: Vec::new(),
+                tools_fixed: false,
             },
         );
         // The pause is real time, and a stall case would otherwise wait it out

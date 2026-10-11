@@ -14,6 +14,7 @@ pub mod speculative;
 pub(crate) mod steering;
 mod streaming;
 pub mod subagent;
+mod surface;
 pub mod task_runner;
 pub mod title;
 mod tool_body;
@@ -56,3 +57,4 @@ pub(crate) use run::{
 };
 pub(crate) use run::{last_announced, resolve_purpose_model_for_inspection};
 pub use steering::EMPTY_RULE as EMPTY_RESPONSE_RULE;
+pub use surface::{PrefixKey, Settled, Surface, SurfaceBaseline};

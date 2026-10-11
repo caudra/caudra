@@ -1,4 +1,5 @@
 use super::{MAX_SANDBOX_FILE_BYTES, SANDBOX_FILE, SandboxDraft, SandboxError, SavedSandboxes};
+use crate::own_writes;
 use caudra_storage::paths;
 use caudra_storage::private_file::{FileRevision, PrivateFile, PrivateFileError};
 use std::fmt;
@@ -141,6 +142,7 @@ impl SandboxStore {
         let file_revision = self
             .0
             .compare_exchange(&baseline.file_revision, Some(source.as_bytes()))?;
+        own_writes::record(self.0.path(), source.as_bytes());
         Ok(LoadedSandboxes {
             path: baseline.path.clone(),
             file_revision,

@@ -31,7 +31,7 @@ Do not edit files unless the user explicitly asks.
 
 `layout: overlay` is the default, so the frontmatter is optional. Caudra inserts the profile after runtime context and before the mode section.
 
-The system prompt is identical in plan and build mode, and carries no working directory, date, or model. All of those are announced in the conversation instead, and re-announced only when they change, so switching mode, crossing midnight, or changing model does not invalidate the prompt cache. Editing an instruction file mid-session is announced the same way, as a diff against the copy the prompt already carries. Task prompts follow the same rule: a subagent is told its environment and the mode it was granted in the conversation.
+The system prompt is identical in plan and build mode, and carries no working directory, date, or model. All of those are announced in the conversation instead, and re-announced only when they change, so switching mode, crossing midnight, or changing model leaves the system prompt as it was. A model switch still starts a new cache, and so does a mode switch while MCP servers run, since plan mode declares no MCP tools. See [When Caudra rebuilds](/docs/configuration/#when-caudra-rebuilds). Editing an instruction file mid-session is announced the same way, as a diff against the copy the prompt already carries. Task prompts follow the same rule: a subagent is told its environment and the mode it was granted in the conversation.
 
 Those announcements arrive wrapped in `<system-reminder>`. They are appended to the conversation and never edited, so a kind is restated only when its content changes or a compaction summarized the block in force, and earlier blocks of the same kind remain as history. The most recent block of a kind is the only one in force; the system prompt tells the model this, and that a reminder is not the user talking.
 
@@ -239,13 +239,13 @@ caudra --system-prompt-profile scheduler prompt --plan --tools
 
 `caudra tools` reports the initial eager, lazy, and disabled set. `caudra tools --schemas` and `caudra prompt --tools` show the initial request schemas, including one combined pending catalog when needed. They do not restore a session's previously loaded schemas. Inside a session, `/tools` provides a [mode-aware inventory](/docs/context/#inspect-the-active-window).
 
-Inside the TUI, run `/system-prompt` to read the prompt the current session is sending. The modal shows the text the agent bound, so it matches what the provider received rather than a fresh assembly of it. Press `r` to swap between rendered markdown and the source, `y` to copy, and `p` to open the profile picker.
+Inside the TUI, run `/system-prompt` to read the prompt the current session is sending. The modal shows the text the agent bound, so it matches what the provider received rather than a fresh assembly of it. After you edit the session's profile, it keeps that text until the prompt is rebuilt, under a notice that the profile changed. Run `/reload` to rebuild it now. Press `r` to swap between rendered markdown and the source, `y` to copy, and `p` to open the profile picker.
 
 Drag the pointer to select a passage, and releasing the mouse button copies it without the line numbers. Press `Ctrl+A` to select everything. With a selection standing, `y` and `Ctrl+C` copy it the same way. With nothing selected, `y` copies the whole prompt source and `Ctrl+C` closes the modal.
 
 Line numbers count source lines in both views. A rendered row is numbered by the line it draws from, so a heading row and the code inside a fence point at the text you would find at that line in the profile file. A line too long for the modal is folded across several rows and numbered once, at its head.
 
-Switching a profile from that picker stores the selected name with the session. Profile content stays in the config directory, so edits apply when the session is resumed or Caudra is reloaded.
+Switching a profile from that picker stores the selected name with the session and rebuilds the system prompt, so the next request reads the whole conversation at full price. Profile content stays in the config directory. In the TUI, a saved edit applies from the next turn, and the model reads the change as a reminder until its system prompt is rebuilt. See [Edit a system prompt profile](/docs/configuration/#edit-a-system-prompt-profile). Elsewhere, edits apply when the session is resumed. A profile deleted or broken while a session uses it stays loaded in that session as it was. A profile that fails to load shows a red `[system prompts invalid]` chip in the status bar until it loads again.
 
 A selected profile that is missing or invalid is rejected across the TUI, print/headless, SDK, and ACP. Caudra does not fall back to unrestricted built-in behavior. Select `builtin` explicitly to reset it.
 

@@ -101,7 +101,7 @@ use crate::components::shell_modal::ShellModal;
 use crate::components::skills_modal::SkillsModal;
 use crate::components::stash_picker::StashPicker;
 use crate::components::status_bar::{
-    StatusBar, StatusBarHit, StatusBarHitTarget, context_share, model_leaf,
+    PendingTrust, StatusBar, StatusBarHit, StatusBarHitTarget, context_share, model_leaf,
 };
 use crate::components::storage_modal::{StorageFetchState, StorageModal};
 use crate::components::stream_modal::{StreamAction, StreamModal};
@@ -122,6 +122,7 @@ use crate::components::{
     Action, DisplayMessage, DisplayRole, DisplaySource, ExitRequest, Overlay, PlanHandoff,
     RetryInfo, Status, is_ctrl,
 };
+use crate::config_problems::ConfigProblems;
 use crate::image;
 use crate::input_document::InputDraft;
 use crate::repaint::{Cadence, Dirty, Watch};
@@ -490,6 +491,9 @@ pub struct App {
     permission_ui: permission_editor::PermissionUi,
     parked_workbench: Option<Workbench>,
     permission_config_trust_deferred: bool,
+    /// Whether project permission config awaits trust, cached because asking
+    /// opens the trust store. `None` until the next frame asks again.
+    permission_review: Option<bool>,
     pub(super) memory_inspector: MemoryInspector,
     memory_reads: memory::MemoryReads,
     /// Set by the event loop after construction: whether a summarizer writes
@@ -518,6 +522,9 @@ pub struct App {
     /// notice for every session, so dismissing it anywhere hides it everywhere.
     pub(crate) update_notice: Arc<UpdateNotice>,
     update_banner: Watch<Available>,
+    /// Set by the event loop after construction, like `update_notice`: the
+    /// config files that failed to load, which every session reports.
+    pub(crate) config_problems: Arc<ConfigProblems>,
     /// The banner's close control as last drawn, `None` while it is not.
     pub(super) update_close: Option<Rect>,
     /// The picker's other half comes from a disk query, which no publisher
@@ -785,6 +792,7 @@ impl App {
             permission_ui: permission_editor::PermissionUi::default(),
             parked_workbench: None,
             permission_config_trust_deferred: false,
+            permission_review: None,
             memory_inspector: MemoryInspector::new(),
             memory_reads: memory::MemoryReads::default(),
             summarize_memory: true,
@@ -805,6 +813,7 @@ impl App {
             live_session_watch: Watch::default(),
             update_notice: Arc::default(),
             update_banner: Watch::default(),
+            config_problems: Arc::default(),
             update_close: None,
             stored_session_generation: 0,
             question_subagent: None,
@@ -2925,6 +2934,7 @@ impl App {
 
     pub(crate) fn open_awaiting_permission_config_trust(&mut self, needs_login: bool) {
         let needs_trust = self.permissions.needs_project_permission_config_trust();
+        self.permission_review = Some(needs_trust);
         if needs_login
             || self.mcp_picker.is_open()
             || self.permission_prompt.is_open()
@@ -2942,6 +2952,37 @@ impl App {
     fn open_permissions_picker(&mut self) -> Result<(), PermissionPolicyError> {
         self.request_permission_inventory();
         Ok(())
+    }
+
+    /// Trust the footer keeps asking for while its picker is out of sight.
+    /// The permission half is read again only after the picker closes or the
+    /// policy changes, since answering it opens the trust store.
+    fn pending_trust(&mut self) -> PendingTrust {
+        let permissions = match self.permissions_picker.is_open() {
+            true => {
+                self.permission_review = None;
+                false
+            }
+            false => *self
+                .permission_review
+                .get_or_insert_with(|| self.permissions.needs_project_permission_config_trust()),
+        };
+        PendingTrust {
+            permissions,
+            mcp: !self.mcp_picker.is_open() && self.mcp_picker.has_awaiting_trust(),
+        }
+    }
+
+    /// Opens whichever picker the trust chip names, MCP first as at startup.
+    fn review_pending_trust(&mut self) {
+        let pending = self.pending_trust();
+        if pending.mcp {
+            self.mcp_picker.open();
+        } else if pending.permissions
+            && let Err(error) = self.open_permissions_picker()
+        {
+            self.flash(error.to_string());
+        }
     }
 
     fn refresh_permission_suggestions(&mut self) {
@@ -3762,16 +3803,27 @@ impl App {
         self.skills_modal.open();
     }
 
+    /// Takes profiles read again from disk: the picker lists them, and the next
+    /// agent this tab spawns, after `/new` or `/cd`, builds from the edited
+    /// copy of its profile rather than the one the tab started with.
+    pub(crate) fn adopt_prompt_profiles(&mut self, catalog: &Arc<PromptProfileCatalog>) {
+        catalog.refresh(&mut self.state.system_prompt_profile);
+        self.prompt_profile_picker.set_catalog(Arc::clone(catalog));
+    }
+
     /// Shows the prompt the run bound, which is empty only until the agent has
-    /// published one. Rebuilding it here would show a prompt nothing was sent.
+    /// published one. Rebuilding it here would show a prompt nothing was sent,
+    /// so an edit to its profile since is noted above it instead.
     fn execute_system_prompt(&mut self) {
-        let system = self
-            .btw_prompt
+        let bound = self.btw_prompt.as_ref().map(|prompt| prompt.load_full());
+        let system = bound
             .as_ref()
-            .map(|prompt| Arc::from(prompt.load().system.as_str()))
+            .map(|prompt| Arc::from(prompt.system.as_str()))
             .unwrap_or_else(|| Arc::from(""));
+        let edited = bound
+            .is_some_and(|prompt| prompt.outdated_by(self.state.system_prompt_profile.as_deref()));
         self.system_prompt_modal
-            .open(system, &self.state.system_prompt_profile_name);
+            .open(system, &self.state.system_prompt_profile_name, edited);
     }
 
     fn handle_system_prompt_action(&mut self, action: SystemPromptAction) {
@@ -5670,6 +5722,7 @@ impl App {
         self.bound_workbench_mut().bind_local();
         self.suspend_permission_editor();
         self.permission_config_trust_deferred = false;
+        self.permission_review = None;
         self.permissions.set_project_with_config(cwd, permissions);
         self.state
             .session_mut()
@@ -5681,6 +5734,34 @@ impl App {
         self.sync_transcript_cwd();
         self.pending_pattern_suggestions = None;
         self.request_pattern_suggestions();
+    }
+
+    /// Adopts permissions files edited while the session runs. A remote
+    /// workspace's policy comes from the workspace, so it keeps that one.
+    pub(crate) fn reload_permissions(&mut self, cwd: &Path, permissions: PermissionsConfig) {
+        if self.workspace_session.is_none() {
+            self.permissions.set_project_with_config(cwd, permissions);
+            self.permission_review = None;
+        }
+    }
+
+    pub(crate) fn reload_commands(
+        &mut self,
+        commands: Arc<[caudra_agent::command::CustomCommand]>,
+    ) {
+        if self.workspace_session.is_none() {
+            self.command_palette.set_custom_commands(commands);
+        }
+    }
+
+    pub(crate) fn set_mcp_config_errors(&mut self, errors: McpConfigErrors) {
+        self.mcp_picker.set_config_errors(errors);
+    }
+
+    /// Points the MCP picker and the palette's prompts at a restarted manager.
+    pub(crate) fn adopt_mcp_reader(&mut self, reader: McpSnapshotReader) {
+        self.mcp_picker.set_reader(reader.clone());
+        self.command_palette.set_mcp_reader(reader);
     }
 
     pub(crate) fn install_remote_working_directory(
@@ -5722,6 +5803,7 @@ impl App {
         self.bind_change_recorder();
         self.refresh_record_index();
         self.invalidate_permission_authority();
+        self.permission_review = None;
         if let Some(workspace) = self.workspace_session.clone()
             && let Err(error) = self
                 .parked_workbench

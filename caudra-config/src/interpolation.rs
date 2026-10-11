@@ -11,7 +11,7 @@ use thiserror::Error;
 use toml::Spanned;
 use toml::de::{DeTable, DeValue, Deserializer, Error as TomlError};
 
-use crate::{ENV_FILE, collect_env_vars, env_file_var_is_allowed, global_env_value};
+use crate::{ENV_FILE, collect_env_vars, env_file_var_is_allowed, inherited_env_value};
 
 const REFERENCE_OPEN: &str = "{env:";
 const REFERENCE_CLOSE: char = '}';
@@ -48,8 +48,8 @@ pub enum ConfigTextError {
 /// Where a file's references read their values from.
 #[derive(Debug, Clone, Copy)]
 pub enum Lookup<'a> {
-    /// The global config file at this path: the process environment, then
-    /// the `.env` beside the file.
+    /// The global config file at this path: the environment the process
+    /// inherited, then the `.env` beside the file as it is now.
     Global(&'a Path),
     /// A file a repository wrote, which may not read the environment at all.
     Refused,
@@ -88,13 +88,14 @@ pub fn expand(
 }
 
 /// The global `.env` is read here rather than trusted to be loaded already,
-/// because some commands read config before they load it.
+/// because some commands read config before they load it, and a reparse must
+/// see the file's edits.
 fn global_value(
     name: &str,
     file: &Path,
     dotenv: &mut Option<HashMap<String, String>>,
 ) -> Result<String, Fault> {
-    match global_env_value(name) {
+    match inherited_env_value(name) {
         Ok(Some(value)) => return Ok(value),
         Ok(None) | Err(VarError::NotPresent) => {}
         Err(VarError::NotUnicode(_)) => return Err(Fault::NotUnicode),
@@ -215,6 +216,7 @@ mod tests {
         ConfigTextError, ENV_FILE, Fault, InterpolationError, Lookup, REFERENCE_OPEN, expand_table,
         from_str,
     };
+    use crate::{PROJECT_DIR, load_env_files_scoped};
 
     const CONFIG: &str = "caudra.toml";
     const TOKEN: &str = "TOKEN";
@@ -232,6 +234,14 @@ mod tests {
     const PROCESS_WINS: &str = "CAUDRA_TEST_INTERPOLATION_PROCESS_WINS";
     const FROM_DOTENV: &str = "from-dotenv";
     const FROM_PROCESS: &str = "from-process";
+    const FROM_EDIT: &str = "from-edit";
+    const FROM_PROJECT: &str = "from-project";
+    const EDITED: &str = "CAUDRA_TEST_INTERPOLATION_EDITED";
+    const REMOVED: &str = "CAUDRA_TEST_INTERPOLATION_REMOVED";
+    const INHERITED: &str = "CAUDRA_TEST_INTERPOLATION_INHERITED";
+    const PROJECT_ONLY: &str = "CAUDRA_TEST_INTERPOLATION_PROJECT_ONLY";
+    const PROJECT_SHADOWS: &str = "CAUDRA_TEST_INTERPOLATION_PROJECT_SHADOWS";
+    const KEY: &str = "a";
 
     fn expanded(text: &str) -> Result<Table, InterpolationError> {
         let mut root = DeTable::parse(text).unwrap();
@@ -249,6 +259,49 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join(ENV_FILE), dotenv).unwrap();
         dir
+    }
+
+    fn dotenv(name: &str, value: Option<&str>) -> String {
+        value.map_or_else(String::new, |value| format!("{name}={value}\n"))
+    }
+
+    /// At startup `name` is `process` in the environment, `global` in the
+    /// global `.env` and `project` in the project's; then the global `.env`
+    /// changes to `edited` and the global file is parsed again.
+    #[test_case(EDITED, None, Some(FROM_DOTENV), None, Some(FROM_EDIT), Some(FROM_EDIT); "edited_global_dotenv_is_reread")]
+    #[test_case(REMOVED, None, Some(FROM_DOTENV), None, None, None; "removed_global_key_is_unset")]
+    #[test_case(INHERITED, Some(FROM_PROCESS), Some(FROM_DOTENV), None, Some(FROM_EDIT), Some(FROM_PROCESS); "inherited_value_beats_the_dotenv")]
+    #[test_case(PROJECT_ONLY, None, None, Some(FROM_PROJECT), None, None; "project_dotenv_never_feeds_a_global_file")]
+    #[test_case(PROJECT_SHADOWS, None, Some(FROM_DOTENV), Some(FROM_PROJECT), Some(FROM_EDIT), Some(FROM_EDIT); "shadowed_global_key_is_reread")]
+    fn reparse_reads_the_current_global_dotenv(
+        name: &str,
+        process: Option<&str>,
+        global: Option<&str>,
+        project: Option<&str>,
+        edited: Option<&str>,
+        expected: Option<&str>,
+    ) {
+        let dir = global_dir(&dotenv(name, global));
+        let project_dir = dir.path().join(PROJECT_DIR);
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(project_dir.join(ENV_FILE), dotenv(name, project)).unwrap();
+        if let Some(value) = process {
+            unsafe { std::env::set_var(name, value) };
+        }
+        load_env_files_scoped(dir.path(), Some(dir.path()), true);
+        fs::write(dir.path().join(ENV_FILE), dotenv(name, edited)).unwrap();
+
+        let source = format!("{KEY} = '{{env:{name}}}'\n");
+        let parsed = from_str::<Table>(&source, Lookup::Global(&dir.path().join(CONFIG)));
+        unsafe { std::env::remove_var(name) };
+        let resolved = match parsed {
+            Ok(table) => table[KEY].as_str().map(str::to_owned),
+            Err(ConfigTextError::Environment(InterpolationError::Unset {
+                name: unset, ..
+            })) if unset == name => None,
+            Err(error) => panic!("{error}"),
+        };
+        assert_eq!(resolved.as_deref(), expected);
     }
 
     #[test_case("key = '{env:TOKEN}'", SECRET; "whole_value")]

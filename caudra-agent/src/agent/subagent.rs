@@ -630,12 +630,14 @@ impl Subagent {
                 environment: self.environment.clone(),
                 instructions: None,
                 memory: None,
+                configuration: None,
                 mode_notice: self.mode_notice.clone(),
                 history: &mut self.history,
                 system: self.system.clone(),
                 event_tx: self.sub_event_tx.clone(),
                 tools: self.tools.clone(),
                 deferred: self.deferred.clone(),
+                tools_fixed: false,
             },
         )
         .with_user_response_rx(Arc::clone(&self.answer_rx))

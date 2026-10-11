@@ -40,6 +40,7 @@ pub use caudra_config::{AgentConfig, PermissionsConfig, ToolOutputLines};
 pub use mailbox::{MailboxError, SessionMailbox};
 pub use nudge::Nudge;
 pub mod command;
+pub mod config_watch;
 pub mod context;
 pub mod decisions;
 pub mod diff;

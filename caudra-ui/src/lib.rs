@@ -13,6 +13,7 @@ mod color_compat;
 mod components;
 pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand, ChatScope};
 pub use components::keybindings;
+mod config_problems;
 mod exit_summary;
 pub use exit_summary::ExitSummary;
 mod highlight;
@@ -250,7 +251,7 @@ pub(crate) fn push_history_message(session: &mut AppSession, message: Message) {
 }
 
 pub(crate) use agent::AgentCommand;
-pub use event_loop::EventLoopParams;
+pub use event_loop::{EventLoopParams, SettingsReloader};
 
 pub struct SessionTab {
     pub session: AppSession,

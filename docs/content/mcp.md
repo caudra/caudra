@@ -14,6 +14,8 @@ Add servers under `[mcp.*]` in your MCP config:
 - **Global**: `~/.config/caudra/mcp.toml`
 - **Project**: `.caudra/mcp.toml`. A project server replaces a global server with the same name.
 
+The TUI applies an edit to either file while it runs. It starts new servers, including the first one when Caudra started with none. It stops removed or disabled ones, and restarts a server whose definition changed. Servers you did not touch keep their connection. A file that fails to load keeps the servers it last loaded, and the error shows in `/mcp`. A changed project server that needs review waits in `/mcp`, and a `[review MCP]` chip in the status bar opens it. The model sees the new tools after its next rebuild, see [Add an MCP server](/docs/configuration/#add-an-mcp-server).
+
 ### Stdio
 
 ```toml
@@ -214,4 +216,4 @@ MCP servers can expose prompts (reusable message templates). Caudra shows them a
 /review:code src tests      # multiple, positional
 ```
 
-Skip a required argument and Caudra shows a usage hint. Prompts are fetched at startup and on reconnect, so new ones need a restart. Only text content is supported.
+Skip a required argument and Caudra shows a usage hint. Prompts are fetched when a server starts or reconnects. Editing the server in `mcp.toml` restarts it, and so does turning it off and on in `/mcp`. Only text content is supported.

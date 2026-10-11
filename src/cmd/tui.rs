@@ -21,6 +21,7 @@ use caudra_agent::peers::topics::add_patterns;
 use caudra_agent::peers::{MAX_MEMBERSHIPS, PeerHost, TOO_MANY_MEMBERSHIPS};
 use caudra_agent::permissions::pattern_recognition::{PatternCandidate, RecognitionExclusion};
 use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
+use caudra_agent::tools::native::skill;
 use caudra_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
 use caudra_agent::worktree::Backend;
 use caudra_config::providers::builtin_provider;
@@ -48,8 +49,8 @@ use caudra_workcell::editor_adapter::{
 use caudra_workcell::{PatternObligationKind, RemoteConnectionStatus};
 
 use super::worktree::{self, Executed, Handled};
+use super::{ConfigFlags, LuaLayers, load_recorded_settings, resolve_config, settings_reloader};
 use crate::cli::Cli;
-use crate::cmd::load_config;
 use crate::cmd::permissions::discover::{
     DiscoveryLimits, DiscoveryReport, RECOGNIZER_CAPACITY, RECOGNIZER_ORDER_BIAS,
     discover_for_project_cancellable,
@@ -538,6 +539,7 @@ struct Stack {
     needs_login: bool,
     prompt_profiles: Arc<PromptProfileCatalog>,
     default_prompt_profile: Option<Arc<SystemPromptProfile>>,
+    lua_layers: LuaLayers,
 }
 
 type StackFallback = (
@@ -545,6 +547,7 @@ type StackFallback = (
     Model,
     Arc<PromptProfileCatalog>,
     Option<Arc<SystemPromptProfile>>,
+    LuaLayers,
 );
 
 impl Stack {
@@ -630,28 +633,31 @@ fn build_stack(
     let mut plugin_host = super::cli_plugin_host(cli, Arc::clone(ToolRegistry::global_arc()))?;
 
     let (fallback_config, fallback_model) = match fallback {
-        Some((config, model, profiles, selected)) => {
-            (Some((config, profiles, selected)), Some(model))
+        Some((config, model, profiles, selected, layers)) => {
+            (Some((config, profiles, selected, layers)), Some(model))
         }
         None => (None, None),
     };
     let reloading = fallback_model.is_some();
-    let loaded = load_config(&plugin_host, cli, cwd, remote).and_then(|config| {
-        let prompt_profiles = Arc::new(PromptProfileCatalog::discover_user());
-        let selected_name = cli
-            .system_prompt_profile
-            .as_deref()
-            .or(config.agent.system_prompt_profile.as_deref());
-        let default_prompt_profile = if cli.is_sdk_mode() {
-            None
-        } else {
-            prompt_profiles
-                .resolve(selected_name)
-                .context("resolve system prompt profile")?
-        };
-        Ok((config, prompt_profiles, default_prompt_profile))
-    });
-    let (config, prompt_profiles, default_prompt_profile) =
+    let loaded = load_recorded_settings(&plugin_host, &cli.startup, cwd, remote).and_then(
+        |(settings, lua_layers)| {
+            let config = resolve_config(settings, &ConfigFlags::of(cli), cwd, remote)?;
+            let prompt_profiles = Arc::new(PromptProfileCatalog::discover_user());
+            let selected_name = cli
+                .system_prompt_profile
+                .as_deref()
+                .or(config.agent.system_prompt_profile.as_deref());
+            let default_prompt_profile = if cli.is_sdk_mode() {
+                None
+            } else {
+                prompt_profiles
+                    .resolve(selected_name)
+                    .context("resolve system prompt profile")?
+            };
+            Ok((config, prompt_profiles, default_prompt_profile, lua_layers))
+        },
+    );
+    let (config, prompt_profiles, default_prompt_profile, lua_layers) =
         config_or_fallback(loaded, fallback_config, &mut warnings)?;
     let notices = super::settings_notices(cli, cwd, remote)
         .into_iter()
@@ -665,6 +671,7 @@ fn build_stack(
     }
     super::configure_native_tools(&config.agent);
     super::install_native_permission_rules(&plugin_host.plugin_rules(), cwd);
+    skill::refresh(ToolRegistry::global());
 
     if let Err(e) = plugin_host.load_production_builtins(&config.plugins) {
         let e = color_eyre::eyre::Report::from(e).wrap_err("load builtin plugins");
@@ -704,6 +711,7 @@ fn build_stack(
             needs_login,
             prompt_profiles,
             default_prompt_profile,
+            lua_layers,
         },
         warnings,
     ))
@@ -1743,6 +1751,12 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 launch_automations: std::mem::take(&mut launch_automations),
                 storage: storage.clone(),
                 config: stack.config.agent.clone(),
+                settings_reloader: settings_reloader(
+                    cli.startup.clone(),
+                    ConfigFlags::of(&cli),
+                    stack.lua_layers.clone(),
+                    workcell_runtime.is_remote(),
+                ),
                 automations: stack.config.automations.clone(),
                 ui_config: stack.config.ui.clone(),
                 snapshots: stack.config.storage.snapshots,
@@ -2054,6 +2068,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
             stack.model.clone(),
             Arc::clone(&stack.prompt_profiles),
             stack.default_prompt_profile.clone(),
+            stack.lua_layers.clone(),
         );
         stack.plugin_host.begin_shutdown();
         ToolRegistry::global().clear_lua();
@@ -2152,6 +2167,7 @@ fn exit_report(summary: &ExitSummary, rich: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::load_config;
     use caudra_agent::permissions::pattern_recognition::{
         CandidateEvidence, InvocationOutcome, ObservationProvenance, SupportCount,
     };

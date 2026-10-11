@@ -70,6 +70,7 @@ const DESCRIPTION_HIT_SCORE: usize = 1;
 const MAX_OVERFLOW_NAMES: usize = 20;
 const SEARCH_NO_MATCH: &str = "No deferred MCP tools matched";
 const SEARCH_OVERFLOW_PREFIX: &str = "Also matched but not loaded: ";
+const STARTUP_EPOCH: u64 = 0;
 pub(crate) use crate::tools::deferral::SEARCH_EMPTY_QUERY;
 
 /// Convert internal qualified name (`server.tool`) to wire format (`server__tool`)
@@ -146,6 +147,9 @@ struct ServerEntry {
     transport: Option<Arc<dyn McpTransport>>,
     tools: Vec<McpToolDef>,
     prompts: Vec<McpPromptDef>,
+    /// `STARTUP_EPOCH`, or the generation of the reload that built this entry.
+    /// A connect lands only on the entry it was started for, never on a successor.
+    epoch: u64,
 }
 
 #[derive(Clone)]
@@ -212,6 +216,8 @@ struct McpManagerInner {
     entries: Vec<ServerEntry>,
     state_dir: Option<StateDir>,
     generation: u64,
+    /// Fixed at startup: a reload may never relax how local servers run.
+    local_execution: LocalExecutionPolicy,
 }
 
 #[derive(Default)]
@@ -356,6 +362,10 @@ pub enum McpCommand {
     Reject {
         server: String,
     },
+    /// Diff-apply a freshly loaded config; see `McpHandle::reload`.
+    Reload {
+        config: McpConfig,
+    },
     /// Drain every running transport and stop the loop. The loop sends `()` on `ack` once
     /// every shutdown has finished, so callers can wait with a timeout.
     Shutdown {
@@ -393,6 +403,24 @@ pub struct McpSession {
     profile: Arc<ProfileToolPolicy>,
     ceiling: ToolFilter,
     inherited_profiles: Vec<Arc<ProfileToolPolicy>>,
+    /// What requests declare and searches load from while the conversation's
+    /// tool array is fixed. Calls always bind against the live index, so a
+    /// tool that left since fails rather than reaching a stale server.
+    pinned: Option<PinnedMcpTools>,
+}
+
+/// The MCP tools a conversation's fixed tool array was built from, with the
+/// policy that chose which of them it declares and which it defers, so a
+/// `disabled_tools` or profile edit changes no declaration until the array
+/// is rebuilt. The default pins none, for an array fixed before any manager
+/// ran.
+#[derive(Clone, Default)]
+pub struct PinnedMcpTools {
+    index: Arc<ToolIndex>,
+    disabled: Arc<[String]>,
+    profile: Arc<ProfileToolPolicy>,
+    ceiling: ToolFilter,
+    inherited_profiles: Vec<Arc<ProfileToolPolicy>>,
 }
 
 /// Immutable MCP state used to assemble and account for one model request.
@@ -409,14 +437,14 @@ pub struct McpRequestSnapshot {
 pub struct PreparedMcpSearch<'a> {
     session: &'a McpSession,
     query: &'a str,
-    index: Arc<ToolIndex>,
+    declaring: McpRequestSnapshot,
     ranking: Option<ToolSearchRanking<'a>>,
 }
 
 impl PreparedMcpSearch<'_> {
     pub fn commit(self) -> Result<SearchOutcome, String> {
-        let matches = self.session.search_matches(&self.index, self.query)?;
-        if !Arc::ptr_eq(&self.index, &self.session.handle.index.load_full()) {
+        let matches = self.session.search_matches(&self.declaring, self.query)?;
+        if !Arc::ptr_eq(&self.declaring.index, &self.session.declared_index()) {
             return self.session.search_tools(self.query);
         }
         Ok(self
@@ -454,7 +482,50 @@ impl McpSession {
             profile: Arc::default(),
             ceiling: ToolFilter::All,
             inherited_profiles: Vec::new(),
+            pinned: None,
         }
+    }
+
+    /// Fixes what requests declare to `pinned`.
+    pub fn pinned(mut self, pinned: PinnedMcpTools) -> Self {
+        self.pinned = Some(pinned);
+        self
+    }
+
+    /// The live tools and the policy that declares them, to pin.
+    pub fn live_tools(&self) -> PinnedMcpTools {
+        PinnedMcpTools {
+            index: self.handle.index.load_full(),
+            disabled: Arc::clone(&self.disabled),
+            profile: Arc::clone(&self.profile),
+            ceiling: self.ceiling.clone(),
+            inherited_profiles: self.inherited_profiles.clone(),
+        }
+    }
+
+    /// Every live definition this session's policy lets a request declare,
+    /// loaded or not, keyed by the name the model calls it by.
+    pub fn live_definitions(&self) -> Vec<(String, Value)> {
+        self.handle
+            .index
+            .load()
+            .descriptors
+            .iter()
+            .filter(|descriptor| !self.is_disabled(&descriptor.qualified_name))
+            .map(|descriptor| {
+                (
+                    descriptor.wire_name().to_owned(),
+                    descriptor.definition.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn declared_index(&self) -> Arc<ToolIndex> {
+        self.pinned.as_ref().map_or_else(
+            || self.handle.index.load_full(),
+            |pinned| Arc::clone(&pinned.index),
+        )
     }
 
     /// Config's `disabled_tools`, keeping only what can name an MCP tool.
@@ -503,20 +574,23 @@ impl McpSession {
         self
     }
 
-    /// Captures the published tool generation while the session's loaded set is stable.
+    /// Captures the published tool generation while the session's loaded set
+    /// is stable. A pinned session declares under the policy it pinned, while
+    /// calls, searches, and loads follow the live one.
     pub fn request_snapshot(&self) -> McpRequestSnapshot {
-        let (index, loaded) = {
+        let (declaring, loaded) = {
             let loaded = self.lock_loaded();
-            (self.handle.index.load_full(), loaded.clone())
+            let declaring = self.pinned.clone().unwrap_or_else(|| self.live_tools());
+            (declaring, loaded.clone())
         };
         McpRequestSnapshot {
-            index,
+            index: declaring.index,
             loaded,
-            disabled: Arc::clone(&self.disabled),
+            disabled: declaring.disabled,
             defer_tools: self.handle.defer_tools,
-            profile: Arc::clone(&self.profile),
-            ceiling: self.ceiling.clone(),
-            inherited_profiles: self.inherited_profiles.clone(),
+            profile: declaring.profile,
+            ceiling: declaring.ceiling,
+            inherited_profiles: declaring.inherited_profiles,
         }
     }
 
@@ -529,6 +603,7 @@ impl McpSession {
             profile: Arc::clone(&self.profile),
             ceiling: self.ceiling.clone(),
             inherited_profiles: self.inherited_profiles.clone(),
+            pinned: None,
         }
     }
 
@@ -536,15 +611,24 @@ impl McpSession {
     /// then name hits over description hits) and mark the top
     /// `MAX_SEARCH_LOADS` loaded; their definitions join the next request.
     pub fn search_tools(&self, query: &str) -> Result<SearchOutcome, String> {
-        let index = self.handle.index.load_full();
-        let matches = self.search_matches(&index, query)?;
+        let declaring = self.request_snapshot();
+        let matches = self.search_matches(&declaring, query)?;
         Ok(self.load_search_matches(query, matches, None))
     }
 
     pub fn has_exact_match(&self, query: &str) -> bool {
-        self.handle.index.load().descriptors.iter().any(|tool| {
-            !self.is_disabled(&tool.qualified_name) && tool.matches_exactly(query.trim())
+        let declaring = self.request_snapshot();
+        declaring.index.descriptors.iter().any(|tool| {
+            self.findable(&declaring, &tool.qualified_name) && tool.matches_exactly(query.trim())
         })
+    }
+
+    /// Whether a search may offer a tool: the requests' catalog lists it, a
+    /// server still serves it, and the configuration has not disabled it since.
+    fn findable(&self, declaring: &McpRequestSnapshot, qualified_name: &str) -> bool {
+        !declaring.is_disabled(qualified_name)
+            && !self.is_disabled(qualified_name)
+            && self.handle.has_tool(qualified_name)
     }
 
     pub async fn prepare_search_tools_with_decisions<'a>(
@@ -553,10 +637,10 @@ impl McpSession {
         decisions: Option<&'a Decisions>,
         context: &DecisionContext,
     ) -> Result<PreparedMcpSearch<'a>, String> {
-        let index = self.handle.index.load_full();
-        let matches = self.search_matches(&index, query)?;
-        let exact = index.descriptors.iter().any(|tool| {
-            !self.is_disabled(&tool.qualified_name) && tool.matches_exactly(query.trim())
+        let declaring = self.request_snapshot();
+        let matches = self.search_matches(&declaring, query)?;
+        let exact = declaring.index.descriptors.iter().any(|tool| {
+            self.findable(&declaring, &tool.qualified_name) && tool.matches_exactly(query.trim())
         });
         let ranking = if exact {
             None
@@ -574,14 +658,14 @@ impl McpSession {
         Ok(PreparedMcpSearch {
             session: self,
             query,
-            index,
+            declaring,
             ranking,
         })
     }
 
     fn search_matches<'a>(
         &self,
-        index: &'a ToolIndex,
+        declaring: &'a McpRequestSnapshot,
         query: &str,
     ) -> Result<Vec<(bool, usize, &'a ToolDescriptor)>, String> {
         let q = query.trim().to_lowercase();
@@ -592,12 +676,13 @@ impl McpSession {
         if tokens.is_empty() {
             return Err(SEARCH_EMPTY_QUERY.into());
         }
-        let mut matches: Vec<(bool, usize, &ToolDescriptor)> = index
+        let mut matches: Vec<(bool, usize, &ToolDescriptor)> = declaring
+            .index
             .descriptors
             .iter()
             .filter(|d| {
-                !self.is_disabled(&d.qualified_name)
-                    && profile_lazy(&self.profile, d, !d.always_load)
+                self.findable(declaring, &d.qualified_name)
+                    && profile_lazy(&declaring.profile, d, !d.always_load)
             })
             .filter_map(|d| {
                 let name = d.wire_name().to_lowercase();
@@ -873,8 +958,27 @@ impl McpHandle {
         let _ = self.ready_rx.recv_async().await;
     }
 
+    /// Whether the first connect pass is still running, so the tools of the
+    /// servers it has yet to reach are missing from the index.
+    pub fn connecting(&self) -> bool {
+        !self.ready_rx.is_disconnected()
+    }
+
     pub fn reader(&self) -> McpSnapshotReader {
         McpSnapshotReader(Arc::clone(&self.snapshot))
+    }
+
+    /// Moves the running servers onto `config`, loaded by `config::try_load_config`,
+    /// or `config::try_load_global_config` for a `start_global*` handle; a config
+    /// loaded under another execution policy is ignored. A server whose definition and
+    /// enabled state held keeps its connection; a removed or disabled one stops
+    /// and its tools leave the index; an added or changed one is rebuilt under
+    /// the startup rules, so one whose reviewed definition changed parks as
+    /// `AwaitingTrust` rather than starting. Runtime servers stay unless a file
+    /// now claims the name, and `defer_tools` keeps its startup value because it
+    /// shapes the tool array a conversation is pinned to.
+    pub fn reload(&self, config: McpConfig) {
+        self.send(McpCommand::Reload { config });
     }
 
     pub fn has_tool(&self, name: &str) -> bool {
@@ -1064,11 +1168,23 @@ fn start_with_config_and_state(
 /// Connect results ride the same loop as commands, so a `Shutdown` arriving
 /// mid-connect never waits for a slow `initialize`.
 enum Step {
-    Connected(usize, Result<StartResult, McpError>),
+    Connected(Connect),
     Command(McpCommand),
     /// Every handle is gone.
     Closed,
 }
+
+/// A finished connect, addressed by name and epoch because a reload reorders
+/// entries and may replace the one it was started for.
+struct Connect {
+    server: String,
+    epoch: u64,
+    result: Result<StartResult, McpError>,
+}
+
+/// Pending connects by server. Held, not detached: dropping one drops the
+/// transport it owns, which kills the child process group it just spawned.
+type Connects = HashMap<String, smol::Task<()>>;
 
 async fn run(
     mut inner: McpManagerInner,
@@ -1078,9 +1194,7 @@ async fn run(
     ready_tx: flume::Sender<Infallible>,
 ) {
     let (connected_tx, connected_rx) = flume::unbounded();
-    // Held, not detached: dropping a pending connect drops the transport it
-    // owns, which kills the child process group it just spawned.
-    let connects = spawn_connects(&inner, connected_tx);
+    let mut connects = spawn_connects(&inner, STARTUP_EPOCH, &connected_tx);
     let mut ready = Some(ready_tx);
 
     let mut ack: Option<flume::Sender<()>> = None;
@@ -1089,8 +1203,8 @@ async fn run(
         let step = futures_lite::future::or(
             async {
                 match connected_rx.recv_async().await {
-                    Ok((i, result)) => Step::Connected(i, result),
-                    // Every connect landed, so only commands wake us now.
+                    Ok(connect) => Step::Connected(connect),
+                    // `run` keeps a sender for reloads, so this never closes.
                     Err(_) => futures_lite::future::pending().await,
                 }
             },
@@ -1104,13 +1218,20 @@ async fn run(
         .await;
 
         match step {
-            Step::Connected(i, result) => {
-                // A toggle or reconnect that ran mid-connect owns the entry
-                // now, so a late result must not resurrect it. Dropping it
-                // kills the transport it carries.
-                if inner.entries[i].status == McpServerStatus::Connecting {
-                    let _ = apply_start_result(&mut inner.entries[i], result, "start");
+            Step::Connected(connect) => {
+                // A toggle, reconnect or reload that ran mid-connect owns the
+                // entry now, so a late result must not resurrect it. Dropping
+                // it kills the transport it carries.
+                if let Some(entry) = inner.entries.iter_mut().find(|entry| {
+                    entry.name == connect.server
+                        && entry.epoch == connect.epoch
+                        && entry.status == McpServerStatus::Connecting
+                }) {
+                    let _ = apply_start_result(entry, connect.result, "start");
                 }
+            }
+            Step::Command(McpCommand::Reload { config }) => {
+                handle_reload(&mut inner, &mut connects, &connected_tx, config).await;
             }
             Step::Command(McpCommand::Toggle { server, enabled }) => {
                 handle_toggle(&mut inner, &server, enabled).await;
@@ -1354,6 +1475,112 @@ async fn handle_reject(inner: &mut McpManagerInner, server_name: &str) {
         }
     }
     handle_toggle(inner, server_name, false).await;
+}
+
+/// Logs names and counts only: a definition may carry secrets from `{env:NAME}`.
+async fn handle_reload(
+    inner: &mut McpManagerInner,
+    connects: &mut Connects,
+    connected_tx: &flume::Sender<Connect>,
+    config: McpConfig,
+) {
+    if config.local_execution != inner.local_execution {
+        warn!(
+            servers = config.mcp.len(),
+            "ignoring MCP reload loaded under another execution policy"
+        );
+        return;
+    }
+    let epoch = inner.generation + 1;
+    let state_dir = inner.state_dir.clone();
+    let fresh = smol::unblock(move || parse_entries(config, state_dir).entries).await;
+    let mut current: HashMap<String, ServerEntry> = inner
+        .entries
+        .drain(..)
+        .map(|entry| (entry.name.clone(), entry))
+        .collect();
+    let (mut added, mut changed, mut unchanged) = (0, 0, 0);
+
+    for mut entry in fresh {
+        match current.remove(&entry.name) {
+            Some(running) if same_definition(&running, &entry) => {
+                unchanged += 1;
+                inner.entries.push(running);
+                continue;
+            }
+            Some(mut running) => {
+                changed += 1;
+                connects.remove(&running.name);
+                running.clear_connection().await;
+                inherit_session_trust(&mut entry, &running);
+                info!(server = %entry.name, "MCP server changed on reload");
+            }
+            None => {
+                added += 1;
+                info!(server = %entry.name, "MCP server added on reload");
+            }
+        }
+        entry.epoch = epoch;
+        inner.entries.push(entry);
+    }
+
+    let mut removed = 0;
+    for (name, mut running) in current {
+        if running.source == McpConfigSource::Runtime {
+            inner.entries.push(running);
+            continue;
+        }
+        removed += 1;
+        connects.remove(&name);
+        running.clear_connection().await;
+        info!(server = %name, "MCP server removed on reload");
+    }
+    inner.entries.sort_by(|a, b| a.name.cmp(&b.name));
+    connects.extend(spawn_connects(inner, epoch, connected_tx));
+
+    let awaiting_trust = inner
+        .entries
+        .iter()
+        .filter(|entry| entry.epoch == epoch && entry.status == McpServerStatus::AwaitingTrust)
+        .count();
+    info!(
+        added,
+        changed, removed, unchanged, awaiting_trust, "MCP config reloaded"
+    );
+}
+
+/// Whether `fresh` runs exactly what `running` runs. The authority digest
+/// covers provenance and every reviewed transport field, so only what review
+/// leaves out is compared besides. Disabled-ness, not status, is the enabled
+/// flag, so the file `/mcp` just wrote reads back as unchanged.
+fn same_definition(running: &ServerEntry, fresh: &ServerEntry) -> bool {
+    let unreviewed = |entry: &ServerEntry| {
+        entry
+            .config
+            .as_ref()
+            .map(|config| (config.timeout, config.always_load))
+    };
+    running.authority_digest == fresh.authority_digest
+        && unreviewed(running) == unreviewed(fresh)
+        && (running.status == McpServerStatus::Disabled)
+            == (fresh.status == McpServerStatus::Disabled)
+}
+
+/// A one-off trust covers the reviewed definition, so it outlives a reload
+/// that changed only what review leaves out. An HTTP server still needs the
+/// pinned address startup would demand.
+fn inherit_session_trust(fresh: &mut ServerEntry, running: &ServerEntry) {
+    if !running.trusted_once || running.authority_digest != fresh.authority_digest {
+        return;
+    }
+    fresh.trusted_once = true;
+    let unpinned = matches!(
+        fresh.config.as_ref().map(|config| &config.transport),
+        Some(Transport::Http { resolved, .. }) if resolved.is_empty()
+    );
+    if fresh.status == McpServerStatus::AwaitingTrust && !unpinned {
+        fresh.status = McpServerStatus::Connecting;
+    }
 }
 
 async fn shutdown_all(inner: &mut McpManagerInner) {
@@ -1616,6 +1843,7 @@ fn parse_entries(config: McpConfig, state_dir: Option<StateDir>) -> McpManagerIn
             transport: None,
             tools: Vec::new(),
             prompts: Vec::new(),
+            epoch: STARTUP_EPOCH,
         });
     }
 
@@ -1627,27 +1855,33 @@ fn parse_entries(config: McpConfig, state_dir: Option<StateDir>) -> McpManagerIn
         entries,
         state_dir,
         generation: 0,
+        local_execution,
     }
 }
 
-/// One task per enabled server, each reporting back as it lands, so `run`
-/// publishes a fast server's tools without waiting for the slowest.
-fn spawn_connects(
-    inner: &McpManagerInner,
-    tx: flume::Sender<(usize, Result<StartResult, McpError>)>,
-) -> Vec<smol::Task<()>> {
+/// One task per enabled server built in `epoch`, each reporting back as it
+/// lands, so `run` publishes a fast server's tools without waiting for the slowest.
+fn spawn_connects(inner: &McpManagerInner, epoch: u64, tx: &flume::Sender<Connect>) -> Connects {
     inner
         .entries
         .iter()
-        .enumerate()
-        .filter(|(_, e)| e.status == McpServerStatus::Connecting)
-        .filter(|(_, e)| entry_has_startup_trust(e, inner.state_dir.as_ref()))
-        .filter_map(|(i, e)| e.config.clone().map(|c| (i, c)))
-        .map(|(i, config)| {
+        .filter(|e| e.epoch == epoch && e.status == McpServerStatus::Connecting)
+        .filter(|e| entry_has_startup_trust(e, inner.state_dir.as_ref()))
+        .filter_map(|e| e.config.clone())
+        .map(|config| {
             let tx = tx.clone();
-            smol::spawn(async move {
-                let _ = tx.send_async((i, start_server(&config, true).await)).await;
-            })
+            let server = config.name.clone();
+            let task = smol::spawn(async move {
+                let result = start_server(&config, true).await;
+                let _ = tx
+                    .send_async(Connect {
+                        server: config.name,
+                        epoch,
+                        result,
+                    })
+                    .await;
+            });
+            (server, task)
         })
         .collect()
 }
@@ -1811,11 +2045,13 @@ pub fn stub_session(tools: &[(&str, &str)]) -> McpSession {
             })
             .collect(),
         prompts: Vec::new(),
+        epoch: STARTUP_EPOCH,
     };
     let inner = McpManagerInner {
         entries: vec![entry],
         state_dir: None,
         generation: 0,
+        local_execution: LocalExecutionPolicy::Embedded,
     };
     let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
     let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
@@ -1981,6 +2217,7 @@ mod tests {
     };
     use async_lock::Mutex as AsyncMutex;
     use caudra_config::decisions::FeatureMode;
+    use caudra_config::mcp::MCP_FILE;
     use caudra_providers::{Model, Role};
     use caudra_storage::sessions::SessionDatabase;
     use caudra_storage::state::project_scope;
@@ -2005,6 +2242,16 @@ mod tests {
     const TEST_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-6";
     const SEARCH_QUERY: &str = "inspect";
     const LAST_SEARCH_CHOICE: &str = "candidate_5";
+    const RELOAD_SERVER: &str = "srv";
+    const OTHER_SERVER: &str = "other";
+    const FAKE_TOOL: &str = "tool";
+    const SECRET_KEY: &str = "TOKEN";
+    const SECRET_VARIABLE: &str = "CAUDRA_TEST_MCP_RELOAD_SECRET";
+    const FIRST_SECRET: &str = "first-reload-secret";
+    const ROTATED_SECRET: &str = "rotated-reload-secret";
+    const CHANGED_ARGUMENT: &str = "--changed";
+    const CHANGED_TIMEOUT_MS: u64 = 5_000;
+    const ENV_FILE: &str = ".env";
 
     fn stdio_raw(cmd: &[&str]) -> RawServerConfig {
         RawServerConfig {
@@ -2060,6 +2307,7 @@ mod tests {
 
     const TOOL_NAME: &str = "srv.tool";
     const WIRE_TOOL_NAME: &str = "srv__tool";
+    const SERVER_WILDCARD: &str = "srv.*";
     const BUILTIN_DEFERRED: &str = "code_map";
     const BUILTIN_DESCRIPTION: &str = "Rank every symbol in a source tree.";
     const PLAN_PATH: &str = "/tmp/active-plan.md";
@@ -2156,6 +2404,7 @@ mod tests {
                 input_schema: json!({}),
             }],
             prompts: Vec::new(),
+            epoch: STARTUP_EPOCH,
         }
     }
 
@@ -2187,18 +2436,25 @@ mod tests {
             entries,
             state_dir: None,
             generation: 0,
+            local_execution: LocalExecutionPolicy::Embedded,
         };
+        let handle = published(&inner, defer_tools);
+        (inner, McpSession::new(handle, &[]))
+    }
+
+    /// A handle over what `inner` publishes, so tests read the same index and
+    /// snapshot the command loop would hand out.
+    fn published(inner: &McpManagerInner, defer_tools: usize) -> McpHandle {
         let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
         let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
-        publish(&inner, &index, &snapshot);
-        let handle = McpHandle {
+        publish(inner, &index, &snapshot);
+        McpHandle {
             cmd_tx: flume::unbounded().0,
             index,
             snapshot,
             defer_tools,
             ready_rx: flume::bounded(0).1,
-        };
-        (inner, McpSession::new(handle, &[]))
+        }
     }
 
     #[test]
@@ -2391,7 +2647,7 @@ mod tests {
         let (tx, _rx) = flume::unbounded();
 
         assert_eq!(inner.entries[0].status, McpServerStatus::AwaitingTrust);
-        assert!(spawn_connects(&inner, tx).is_empty());
+        assert!(spawn_connects(&inner, STARTUP_EPOCH, &tx).is_empty());
     }
 
     #[test_case(McpConfigSource::Global; "global")]
@@ -2413,7 +2669,7 @@ mod tests {
             );
             assert_eq!(entry.status, McpServerStatus::AwaitingTrust);
             let (tx, _rx) = flume::unbounded();
-            assert!(spawn_connects(&inner, tx).is_empty());
+            assert!(spawn_connects(&inner, STARTUP_EPOCH, &tx).is_empty());
             refresh_server(&mut inner, "remote-local").await.unwrap();
             assert_eq!(inner.entries[0].status, McpServerStatus::AwaitingTrust);
             handle_trust(&mut inner, "remote-local", false).await;
@@ -2484,7 +2740,7 @@ mod tests {
 
         assert_eq!(inner.entries[0].status, McpServerStatus::AwaitingTrust);
         let (tx, _rx) = flume::unbounded();
-        assert!(spawn_connects(&inner, tx).is_empty());
+        assert!(spawn_connects(&inner, STARTUP_EPOCH, &tx).is_empty());
     }
 
     #[test]
@@ -2679,6 +2935,72 @@ mod tests {
             .request_snapshot()
             .extend_tools(&mut tools);
         assert_eq!(tool_names(&tools), vec!["other__tool"]);
+    }
+
+    fn pinned_under(session: McpSession, pinned: &[String], live: &[String]) -> McpSession {
+        let session = session.with_disabled_tools(pinned);
+        let pin = session.live_tools();
+        session.pinned(pin).with_disabled_tools(live)
+    }
+
+    /// Editing `disabled_tools` mid-session must leave the declared array as
+    /// it was, or the provider's cache of the conversation is lost.
+    #[test_case(&[], &[SERVER_WILDCARD.to_owned()], &[WIRE_TOOL_NAME] ; "disabled_since_stays_declared")]
+    #[test_case(&[SERVER_WILDCARD.to_owned()], &[], &[] ; "enabled_since_stays_undeclared")]
+    fn a_pinned_session_declares_under_the_policy_it_pinned(
+        pinned: &[String],
+        live: &[String],
+        declared: &[&str],
+    ) {
+        let (_inner, session) = setup_with_defer(vec![fake_entry("srv", FakeTransport::new())], 1);
+        let session = pinned_under(session, pinned, live);
+        let mut tools = json!([]);
+        session.request_snapshot().extend_tools(&mut tools);
+
+        assert_eq!(tool_names(&tools), declared);
+        assert_eq!(session.is_disabled(TOOL_NAME), !live.is_empty());
+    }
+
+    #[test_case(&[], &[SERVER_WILDCARD.to_owned()] ; "disabled_since")]
+    #[test_case(&[SERVER_WILDCARD.to_owned()], &[] ; "enabled_since")]
+    fn a_pinned_session_searches_only_what_both_policies_allow(pinned: &[String], live: &[String]) {
+        let (_inner, session) = setup(vec![fake_entry("srv", FakeTransport::new())]);
+        let session = pinned_under(session, pinned, live);
+
+        assert!(!session.has_exact_match(WIRE_TOOL_NAME));
+        let outcome = session.search_tools(WIRE_TOOL_NAME).unwrap();
+        assert!(outcome.loaded.is_empty());
+        assert!(
+            outcome.message.starts_with(SEARCH_NO_MATCH),
+            "{}",
+            outcome.message
+        );
+    }
+
+    /// A stopped server's tools stay in the pinned catalog until the next
+    /// rebuild, but loading one would cost the cached conversation for a call
+    /// that fails.
+    #[test]
+    fn a_pinned_session_never_offers_a_tool_no_server_serves() {
+        let (mut inner, session) = setup(vec![fake_entry("srv", FakeTransport::new())]);
+        let pin = session.live_tools();
+        let session = session.pinned(pin);
+        inner.entries.clear();
+        inner.generation += 1;
+        publish(
+            &inner,
+            session.handle.index.as_ref(),
+            session.handle.snapshot.as_ref(),
+        );
+
+        assert!(!session.has_exact_match(WIRE_TOOL_NAME));
+        let outcome = session.search_tools(WIRE_TOOL_NAME).unwrap();
+        assert!(outcome.loaded.is_empty());
+        assert!(
+            outcome.message.starts_with(SEARCH_NO_MATCH),
+            "{}",
+            outcome.message
+        );
     }
 
     #[test]
@@ -3547,6 +3869,7 @@ mod tests {
                 ],
                 state_dir: None,
                 generation: 0,
+                local_execution: LocalExecutionPolicy::Embedded,
             };
             let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
             let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
@@ -3567,6 +3890,410 @@ mod tests {
             assert_eq!(t1.shutdowns(), 1);
             assert_eq!(t2.shutdowns(), 1);
             assert!(snapshot.load().infos.iter().all(|i| i.tool_count == 0));
+        });
+    }
+
+    fn stdio_with_secret(secret: &str) -> RawServerConfig {
+        let mut raw = stdio_raw(&[MISSING_PROGRAM]);
+        let RawTransport::Stdio(stdio) = &mut raw.transport else {
+            unreachable!();
+        };
+        stdio.environment.insert(SECRET_KEY.into(), secret.into());
+        raw
+    }
+
+    fn add_argument(raw: &mut RawServerConfig) {
+        if let RawTransport::Stdio(stdio) = &mut raw.transport {
+            stdio.command.push(CHANGED_ARGUMENT.into());
+        }
+    }
+
+    fn change_timeout(raw: &mut RawServerConfig) {
+        raw.timeout = CHANGED_TIMEOUT_MS;
+    }
+
+    fn load_always(raw: &mut RawServerConfig) {
+        raw.always_load = true;
+    }
+
+    /// Stands in for a connect that succeeded, so a test can watch the
+    /// connection survive or die without spawning a server.
+    fn connect_fake(inner: &mut McpManagerInner, server: &str) -> Arc<FakeTransport> {
+        let transport = FakeTransport::new();
+        inner
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == server)
+            .unwrap()
+            .populate(StartResult {
+                transport: transport.clone(),
+                tool_infos: vec![protocol::ToolInfo {
+                    name: FAKE_TOOL.into(),
+                    description: String::new(),
+                    input_schema: json!({}),
+                }],
+                prompt_infos: Vec::new(),
+            });
+        transport
+    }
+
+    fn entry<'a>(inner: &'a McpManagerInner, server: &str) -> &'a ServerEntry {
+        inner
+            .entries
+            .iter()
+            .find(|entry| entry.name == server)
+            .unwrap()
+    }
+
+    /// One reload step as `run` takes it. The returned connects must outlive
+    /// any receive, since dropping one cancels its start.
+    async fn reload(
+        inner: &mut McpManagerInner,
+        config: McpConfig,
+    ) -> (Connects, flume::Receiver<Connect>) {
+        let (tx, rx) = flume::unbounded();
+        let mut connects = Connects::new();
+        handle_reload(inner, &mut connects, &tx, config).await;
+        (connects, rx)
+    }
+
+    #[test]
+    fn reload_with_an_unchanged_config_keeps_the_connection() {
+        smol::block_on(async {
+            let config = || make_config(vec![(RELOAD_SERVER, stdio_raw(&[MISSING_PROGRAM]))]);
+            let mut inner = parse_entries(config(), None);
+            let transport = connect_fake(&mut inner, RELOAD_SERVER);
+
+            let (connects, rx) = reload(&mut inner, config()).await;
+
+            assert!(connects.is_empty() && rx.is_empty());
+            assert_eq!(transport.shutdowns(), 0);
+            assert_eq!(
+                entry(&inner, RELOAD_SERVER).status,
+                McpServerStatus::Running
+            );
+            assert!(published(&inner, 0).has_tool(TOOL_NAME));
+        });
+    }
+
+    #[test_case(false; "removed")]
+    #[test_case(true; "disabled")]
+    fn reload_stops_a_server_and_drops_its_tools(still_listed: bool) {
+        smol::block_on(async {
+            let mut inner = parse_entries(
+                make_config(vec![(RELOAD_SERVER, stdio_raw(&[MISSING_PROGRAM]))]),
+                None,
+            );
+            let transport = connect_fake(&mut inner, RELOAD_SERVER);
+            let mut disabled = stdio_raw(&[MISSING_PROGRAM]);
+            disabled.enabled = false;
+            let servers = if still_listed {
+                vec![(RELOAD_SERVER, disabled)]
+            } else {
+                Vec::new()
+            };
+
+            let (connects, _rx) = reload(&mut inner, make_config(servers)).await;
+
+            let handle = published(&inner, 0);
+            let statuses: Vec<McpServerStatus> = handle
+                .reader()
+                .load()
+                .infos
+                .iter()
+                .map(|info| info.status.clone())
+                .collect();
+            assert!(connects.is_empty());
+            assert_eq!(transport.shutdowns(), 1);
+            assert!(!handle.has_tool(TOOL_NAME));
+            assert_eq!(
+                statuses,
+                still_listed
+                    .then_some(McpServerStatus::Disabled)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            );
+        });
+    }
+
+    #[test_case(McpConfigSource::Global, true; "global_starts")]
+    #[test_case(McpConfigSource::Project, false; "project_awaits_trust")]
+    fn reload_starts_an_added_server_under_startup_rules(source: McpConfigSource, starts: bool) {
+        smol::block_on(async {
+            let running = (RELOAD_SERVER, stdio_raw(&[MISSING_PROGRAM]));
+            let mut inner = parse_entries(make_config(vec![running.clone()]), None);
+            let transport = connect_fake(&mut inner, RELOAD_SERVER);
+            let mut config =
+                make_config(vec![running, (OTHER_SERVER, stdio_raw(&[MISSING_PROGRAM]))]);
+            config.sources.insert(OTHER_SERVER.into(), source);
+
+            let (connects, rx) = reload(&mut inner, config).await;
+
+            assert_eq!(transport.shutdowns(), 0);
+            assert_eq!(connects.contains_key(OTHER_SERVER), starts);
+            let added = entry(&inner, OTHER_SERVER);
+            if starts {
+                assert_eq!(added.status, McpServerStatus::Connecting);
+                let connect = rx.recv_async().await.unwrap();
+                assert_eq!(
+                    (connect.server.as_str(), connect.epoch),
+                    (OTHER_SERVER, added.epoch)
+                );
+            } else {
+                assert_eq!(added.status, McpServerStatus::AwaitingTrust);
+                assert!(rx.is_empty());
+            }
+        });
+    }
+
+    #[test_case(add_argument; "command")]
+    #[test_case(change_timeout; "timeout")]
+    #[test_case(load_always; "always_load")]
+    fn reload_restarts_a_changed_server(change: fn(&mut RawServerConfig)) {
+        smol::block_on(async {
+            let mut raw = stdio_raw(&[MISSING_PROGRAM]);
+            let mut inner = parse_entries(make_config(vec![(RELOAD_SERVER, raw.clone())]), None);
+            let transport = connect_fake(&mut inner, RELOAD_SERVER);
+            change(&mut raw);
+
+            let (connects, rx) = reload(&mut inner, make_config(vec![(RELOAD_SERVER, raw)])).await;
+
+            assert_eq!(transport.shutdowns(), 1);
+            assert!(!published(&inner, 0).has_tool(TOOL_NAME));
+            assert_eq!(
+                entry(&inner, RELOAD_SERVER).status,
+                McpServerStatus::Connecting
+            );
+            assert!(connects.contains_key(RELOAD_SERVER));
+            assert_eq!(rx.recv_async().await.unwrap().server, RELOAD_SERVER);
+        });
+    }
+
+    /// Trust covers the reviewed definition: a rotated secret parks the server
+    /// exactly as a new untrusted one, a new timeout alone restarts it.
+    #[test_case(true, true; "project_trust_rotated_secret")]
+    #[test_case(false, true; "session_trust_rotated_secret")]
+    #[test_case(true, false; "project_trust_new_timeout")]
+    #[test_case(false, false; "session_trust_new_timeout")]
+    fn reload_rechecks_trust_against_the_reviewed_definition(persist: bool, rotate: bool) {
+        smol::block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let project = tmp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let state_dir = StateDir::from_path(tmp.path().join("state"));
+            let mut inner = parse_entries(
+                make_project_config(
+                    &project,
+                    vec![(RELOAD_SERVER, stdio_with_secret(FIRST_SECRET))],
+                ),
+                Some(state_dir),
+            );
+            handle_trust(&mut inner, RELOAD_SERVER, persist).await;
+            let transport = connect_fake(&mut inner, RELOAD_SERVER);
+            let mut changed = stdio_with_secret(if rotate { ROTATED_SECRET } else { FIRST_SECRET });
+            if !rotate {
+                change_timeout(&mut changed);
+            }
+
+            let (connects, rx) = reload(
+                &mut inner,
+                make_project_config(&project, vec![(RELOAD_SERVER, changed)]),
+            )
+            .await;
+
+            let handle = published(&inner, 0);
+            let infos = handle.reader().load_full().infos.clone();
+            let rendered = format!("{infos:?}");
+            assert_eq!(transport.shutdowns(), 1);
+            assert!(!handle.has_tool(TOOL_NAME));
+            assert_eq!(connects.contains_key(RELOAD_SERVER), !rotate);
+            assert_eq!(infos[0].review.environment_names, [SECRET_KEY]);
+            assert!(!rendered.contains(FIRST_SECRET) && !rendered.contains(ROTATED_SECRET));
+            if rotate {
+                assert_eq!(infos[0].status, McpServerStatus::AwaitingTrust);
+                assert!(rx.is_empty());
+            } else {
+                assert_eq!(infos[0].status, McpServerStatus::Connecting);
+                assert_eq!(rx.recv_async().await.unwrap().server, RELOAD_SERVER);
+            }
+        });
+    }
+
+    #[test]
+    fn reload_parks_a_remote_local_server_when_its_env_file_value_rotates() {
+        smol::block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let global = tmp.path().join("global");
+            std::fs::create_dir(&global).unwrap();
+            std::fs::write(
+                global.join(MCP_FILE),
+                format!(
+                    "[mcp.{RELOAD_SERVER}]\ncommand = ['{MISSING_PROGRAM}']\nenvironment = {{ {SECRET_KEY} = '{{env:{SECRET_VARIABLE}}}' }}\n"
+                ),
+            )
+            .unwrap();
+            let write_secret = |secret: &str| {
+                std::fs::write(
+                    global.join(ENV_FILE),
+                    format!("{SECRET_VARIABLE}={secret}\n"),
+                )
+                .unwrap();
+            };
+            let load = || {
+                config::complete(config::load_global_config_from(tmp.path(), Some(&global)))
+                    .unwrap()
+            };
+            write_secret(FIRST_SECRET);
+            let mut inner = parse_entries(load(), None);
+            handle_trust(&mut inner, RELOAD_SERVER, false).await;
+            let transport = connect_fake(&mut inner, RELOAD_SERVER);
+
+            let (connects, _rx) = reload(&mut inner, load()).await;
+            assert!(connects.is_empty());
+            assert_eq!(transport.shutdowns(), 0);
+
+            write_secret(ROTATED_SECRET);
+            let (connects, _rx) = reload(&mut inner, load()).await;
+            assert!(connects.is_empty());
+            assert_eq!(transport.shutdowns(), 1);
+            assert_eq!(
+                entry(&inner, RELOAD_SERVER).status,
+                McpServerStatus::AwaitingTrust
+            );
+        });
+    }
+
+    #[test_case(true; "toggled_off")]
+    #[test_case(false; "toggled_on")]
+    fn reload_of_the_file_a_toggle_wrote_is_a_no_op(initially_enabled: bool) {
+        smol::block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let global = tmp.path().join("global");
+            std::fs::create_dir(&global).unwrap();
+            std::fs::write(
+                global.join(MCP_FILE),
+                format!(
+                    "[mcp.{RELOAD_SERVER}]\ncommand = ['{MISSING_PROGRAM}']\nenabled = {initially_enabled}\n"
+                ),
+            )
+            .unwrap();
+            let load =
+                || config::complete(config::load_config_from(tmp.path(), Some(&global))).unwrap();
+            let mut inner = parse_entries(load(), None);
+            let transport = initially_enabled.then(|| connect_fake(&mut inner, RELOAD_SERVER));
+            // The toggle persists on a detached task; writing here instead
+            // leaves the file whole before it is read back.
+            let origin = std::mem::take(&mut inner.entries[0].origin);
+            handle_toggle(&mut inner, RELOAD_SERVER, !initially_enabled).await;
+            config::persist_enabled(&origin, RELOAD_SERVER, !initially_enabled).unwrap();
+            let status = entry(&inner, RELOAD_SERVER).status.clone();
+            let shutdowns = transport.as_ref().map(|transport| transport.shutdowns());
+
+            let (connects, rx) = reload(&mut inner, load()).await;
+
+            assert!(connects.is_empty() && rx.is_empty());
+            assert_eq!(entry(&inner, RELOAD_SERVER).status, status);
+            assert_eq!(
+                transport.as_ref().map(|transport| transport.shutdowns()),
+                shutdowns
+            );
+        });
+    }
+
+    #[test_case(false; "unclaimed")]
+    #[test_case(true; "claimed_by_a_file")]
+    fn reload_keeps_runtime_servers_unless_a_file_claims_the_name(claimed: bool) {
+        smol::block_on(async {
+            let mut config = make_config(Vec::new());
+            merge_runtime_servers(
+                &mut config,
+                vec![(
+                    RELOAD_SERVER.into(),
+                    stdio_raw(&[MISSING_PROGRAM]).transport,
+                )],
+            );
+            let mut inner = parse_entries(config, None);
+            let transport = connect_fake(&mut inner, RELOAD_SERVER);
+            let servers = if claimed {
+                vec![(RELOAD_SERVER, stdio_raw(&[MISSING_PROGRAM]))]
+            } else {
+                Vec::new()
+            };
+
+            let (_connects, _rx) = reload(&mut inner, make_config(servers)).await;
+
+            assert_eq!(transport.shutdowns(), usize::from(claimed));
+            assert_eq!(
+                entry(&inner, RELOAD_SERVER).source,
+                if claimed {
+                    McpConfigSource::Global
+                } else {
+                    McpConfigSource::Runtime
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn reload_under_another_execution_policy_is_ignored() {
+        smol::block_on(async {
+            let mut inner = parse_entries(
+                make_config(vec![(RELOAD_SERVER, stdio_raw(&[MISSING_PROGRAM]))]),
+                None,
+            );
+            let transport = connect_fake(&mut inner, RELOAD_SERVER);
+            let mut config = make_config(Vec::new());
+            config.local_execution = LocalExecutionPolicy::RemoteLocal;
+
+            let (connects, _rx) = reload(&mut inner, config).await;
+
+            assert!(connects.is_empty());
+            assert_eq!(transport.shutdowns(), 0);
+            assert!(published(&inner, 0).has_tool(TOOL_NAME));
+        });
+    }
+
+    /// Commands run in order, so the shutdown's ack proves the reload applied.
+    #[test]
+    fn reload_command_applies_before_a_later_shutdown() {
+        smol::block_on(async {
+            let mut inner = parse_entries(
+                make_config(vec![
+                    (RELOAD_SERVER, stdio_raw(&[MISSING_PROGRAM])),
+                    (OTHER_SERVER, stdio_raw(&[MISSING_PROGRAM])),
+                ]),
+                None,
+            );
+            let kept = connect_fake(&mut inner, RELOAD_SERVER);
+            let removed = connect_fake(&mut inner, OTHER_SERVER);
+            let handle = published(&inner, 0);
+            let (cmd_tx, cmd_rx) = flume::unbounded();
+            let handle = McpHandle { cmd_tx, ..handle };
+            let loop_task = smol::spawn(run(
+                inner,
+                Arc::clone(&handle.index),
+                Arc::clone(&handle.snapshot),
+                cmd_rx,
+                flume::bounded(0).0,
+            ));
+
+            handle.reload(make_config(vec![(
+                RELOAD_SERVER,
+                stdio_raw(&[MISSING_PROGRAM]),
+            )]));
+            handle.shutdown().await;
+            loop_task.await;
+
+            let names: Vec<String> = handle
+                .reader()
+                .load()
+                .infos
+                .iter()
+                .map(|info| info.name.clone())
+                .collect();
+            assert_eq!(names, [RELOAD_SERVER]);
+            assert_eq!(removed.shutdowns(), 1);
+            assert_eq!(kept.shutdowns(), 1);
         });
     }
 
