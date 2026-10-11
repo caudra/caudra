@@ -4,6 +4,7 @@ use crate::agent::tools_preview_source;
 use crate::app::permission_editor::tests::workbench_workspace;
 use crate::app::sandbox::attached_sandbox_instance;
 use crate::app::tasks::{MAIN_TASK_ID, TaskStatus};
+use crate::app::tooltip::ChordTopic;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::components::command::{BUILTIN_COMMANDS, CommandPalette, ParsedCommand};
 use crate::components::context_modal::{
@@ -135,6 +136,15 @@ use test_case::test_case;
 use unicode_width::UnicodeWidthStr;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const TODO_MAIN_TEXT: &str = "Review the main implementation";
+const TODO_FIRST_ID: &str = "sticky-todo-research";
+const TODO_FIRST_NAME: &str = "Research task-local state";
+const TODO_FIRST_TEXT: &str = "Inspect task history";
+const TODO_SECOND_ID: &str = "sticky-todo-validation";
+const TODO_SECOND_NAME: &str = "Validate task-local state";
+const TODO_SECOND_TEXT: &str = "Verify isolated progress";
+const TODO_NEXT_CALL: &str = "sticky-todo-next-call";
+const TODO_PANEL_WIDTH: u16 = 120;
 const PROGRAM_STATUS_DECISION: &str = "User decisions must remain distinct from automatic work";
 const PROGRAM_STATUS_AUTOMATIC: &str = "Automatic work must not request user intervention";
 #[cfg(unix)]
@@ -8379,6 +8389,517 @@ pub(crate) fn app_with_todos() -> App {
         priority: TodoPriority::default(),
     }]);
     app
+}
+
+fn sticky_todo(content: &str, status: TodoStatus) -> Vec<TodoItem> {
+    vec![TodoItem {
+        content: content.into(),
+        status,
+        priority: TodoPriority::default(),
+    }]
+}
+
+fn publish_sticky_todos(app: &mut App, task: Option<(&str, &str)>, items: Vec<TodoItem>) {
+    let id = format!(
+        "{}-todos-{}",
+        task.map_or(MAIN_TASK_ID, |(id, _)| id),
+        app.chats.iter().map(Chat::message_count).sum::<usize>()
+    );
+    for event in [
+        tool_start(&id, TODOWRITE_TOOL_NAME),
+        AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            id,
+            tool: TODOWRITE_TOOL_NAME.into(),
+            output: ToolOutput::TodoList(items),
+            is_error: false,
+            annotation: None,
+            written_path: None,
+            written_paths: Vec::new(),
+            remote_written_paths: false,
+            output_ref: None,
+            output_limits: None,
+            model_suffix: None,
+            model_output: None,
+            model_output_from_ref: false,
+            documents: Vec::new(),
+            accounting: ToolAccounting::default(),
+        })),
+    ] {
+        app.update(match task {
+            Some((id, name)) => subagent_msg(event, id, Some(name)),
+            None => agent_msg(event),
+        });
+    }
+}
+
+fn sticky_todo_app() -> App {
+    let mut app = streaming_app();
+    for (task, text, status) in [
+        (None, TODO_MAIN_TEXT, TodoStatus::Completed),
+        (
+            Some((TODO_FIRST_ID, TODO_FIRST_NAME)),
+            TODO_FIRST_TEXT,
+            TodoStatus::Pending,
+        ),
+        (
+            Some((TODO_SECOND_ID, TODO_SECOND_NAME)),
+            TODO_SECOND_TEXT,
+            TodoStatus::InProgress,
+        ),
+    ] {
+        publish_sticky_todos(&mut app, task, sticky_todo(text, status));
+    }
+    app
+}
+
+fn rendered_sticky_todos(app: &mut App) -> String {
+    let height = app.todo_panel.height().max(1);
+    let mut terminal = Terminal::new(TestBackend::new(TODO_PANEL_WIDTH, height)).unwrap();
+    terminal
+        .draw(|frame| app.todo_panel.view(frame, frame.area()))
+        .unwrap();
+    buffer_text(terminal.backend().buffer())
+}
+
+fn assert_sticky_todo_source(app: &mut App, task: Option<(&str, &str)>, items: &[TodoItem]) {
+    assert_eq!(app.chats[app.active_chat].todos(), items);
+    let completed = items
+        .iter()
+        .filter(|item| item.status == TodoStatus::Completed)
+        .count();
+    let progress = format!("{completed}/{}", items.len());
+    let tip = app.todo_panel.progress_tip();
+    let title = match task {
+        Some((id, name)) => {
+            assert!(tip.contains(id), "{tip}");
+            assert!(tip.contains(name), "{tip}");
+            format!("Todos · Task: {name} · {progress}")
+        }
+        None => {
+            assert!(!tip.contains(TODO_FIRST_ID), "{tip}");
+            assert!(!tip.contains(TODO_SECOND_ID), "{tip}");
+            format!("Todos · {progress}")
+        }
+    };
+    if items.is_empty() {
+        assert!(!app.todo_panel.is_visible());
+        assert!(app.todo_panel.hint_label().is_none());
+        assert!(rendered_sticky_todos(app).trim().is_empty());
+    } else if app.todo_panel.is_visible() {
+        let panel = rendered_sticky_todos(app);
+        assert!(panel.contains(&title), "{panel}");
+        for item in items {
+            assert!(panel.contains(&item.content), "{panel}");
+        }
+        for text in [TODO_MAIN_TEXT, TODO_FIRST_TEXT, TODO_SECOND_TEXT] {
+            if !items.iter().any(|item| item.content == text) {
+                assert!(!panel.contains(text), "{panel}");
+            }
+        }
+    } else {
+        let expected = task.map_or(progress.clone(), |(_, name)| {
+            format!("Task: {name} · {progress}")
+        });
+        assert_eq!(
+            app.todo_panel.hint_label().as_deref(),
+            Some(expected.as_str())
+        );
+    }
+}
+
+#[test]
+fn sticky_todos_live_updates_are_local_to_main_and_each_task() {
+    let mut app = sticky_todo_app();
+    let main = sticky_todo(TODO_MAIN_TEXT, TodoStatus::Completed);
+    let first = sticky_todo(TODO_FIRST_TEXT, TodoStatus::Pending);
+    let second = sticky_todo(TODO_SECOND_TEXT, TodoStatus::InProgress);
+    assert_eq!(app.chats[0].todos(), main);
+    assert_eq!(app.chats[1].todos(), first);
+    assert_eq!(app.chats[2].todos(), second);
+    press_chord(&mut app, chord::PLAN_TOGGLE);
+    assert!(app.todo_panel.is_visible());
+    assert_sticky_todo_source(&mut app, None, &main);
+
+    app.focus_task(TODO_FIRST_ID).unwrap();
+    let second = sticky_todo(TODO_SECOND_TEXT, TodoStatus::Completed);
+    publish_sticky_todos(
+        &mut app,
+        Some((TODO_SECOND_ID, TODO_SECOND_NAME)),
+        second.clone(),
+    );
+    let main = sticky_todo(TODO_MAIN_TEXT, TodoStatus::Pending);
+    publish_sticky_todos(&mut app, None, main.clone());
+    assert_sticky_todo_source(&mut app, Some((TODO_FIRST_ID, TODO_FIRST_NAME)), &first);
+    assert_eq!(app.chats[0].todos(), main);
+    assert_eq!(app.chats[2].todos(), second);
+
+    let first = sticky_todo(TODO_FIRST_TEXT, TodoStatus::Completed);
+    publish_sticky_todos(
+        &mut app,
+        Some((TODO_FIRST_ID, TODO_FIRST_NAME)),
+        first.clone(),
+    );
+    assert_sticky_todo_source(&mut app, Some((TODO_FIRST_ID, TODO_FIRST_NAME)), &first);
+    app.focus_task(TODO_SECOND_ID).unwrap();
+    assert_sticky_todo_source(&mut app, Some((TODO_SECOND_ID, TODO_SECOND_NAME)), &second);
+    app.focus_task(MAIN_TASK_ID).unwrap();
+    assert_sticky_todo_source(&mut app, None, &main);
+}
+
+#[test_case(false; "collapsed")]
+#[test_case(true; "revealed")]
+fn sticky_todos_chat_cycling_preserves_the_global_reveal_preference(revealed: bool) {
+    let mut app = sticky_todo_app();
+    if revealed {
+        press_chord(&mut app, chord::PLAN_TOGGLE);
+    }
+    for (action, task, text, status) in [
+        (
+            BuiltinAction::NextChat,
+            Some((TODO_FIRST_ID, TODO_FIRST_NAME)),
+            TODO_FIRST_TEXT,
+            TodoStatus::Pending,
+        ),
+        (
+            BuiltinAction::NextChat,
+            Some((TODO_SECOND_ID, TODO_SECOND_NAME)),
+            TODO_SECOND_TEXT,
+            TodoStatus::InProgress,
+        ),
+        (
+            BuiltinAction::PrevChat,
+            Some((TODO_FIRST_ID, TODO_FIRST_NAME)),
+            TODO_FIRST_TEXT,
+            TodoStatus::Pending,
+        ),
+        (
+            BuiltinAction::PrevChat,
+            None,
+            TODO_MAIN_TEXT,
+            TodoStatus::Completed,
+        ),
+    ] {
+        app.run_builtin(action);
+        assert_eq!(app.todo_panel.is_visible(), revealed);
+        assert_sticky_todo_source(&mut app, task, &sticky_todo(text, status));
+    }
+    app.focus_task(TODO_FIRST_ID).unwrap();
+    press_chord(&mut app, chord::PLAN_TOGGLE);
+    app.focus_task(MAIN_TASK_ID).unwrap();
+    assert_eq!(app.todo_panel.is_visible(), !revealed);
+    assert_sticky_todo_source(
+        &mut app,
+        None,
+        &sticky_todo(TODO_MAIN_TEXT, TodoStatus::Completed),
+    );
+}
+
+#[test_case(false; "escape")]
+#[test_case(true; "outside_click")]
+fn sticky_todos_picker_preview_and_cancel_restore_the_origin_source(outside_click: bool) {
+    let mut app = sticky_todo_app();
+    app.focus_task(TODO_FIRST_ID).unwrap();
+    press_chord(&mut app, chord::PLAN_TOGGLE);
+    app.tasks_browse();
+    let _ = rendered(&mut app);
+    app.update(Msg::Key(key(KeyCode::Up)));
+    assert_eq!(app.active_chat, 0);
+    assert_sticky_todo_source(
+        &mut app,
+        None,
+        &sticky_todo(TODO_MAIN_TEXT, TodoStatus::Completed),
+    );
+    if outside_click {
+        let (column, row) = OUTSIDE_MODAL;
+        app.update(mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+        ));
+    } else {
+        app.update(Msg::Key(key(KeyCode::Esc)));
+    }
+    assert!(!app.task_picker.is_open());
+    assert_eq!(app.active_chat, 1);
+    assert!(app.todo_panel.is_visible());
+    assert_sticky_todo_source(
+        &mut app,
+        Some((TODO_FIRST_ID, TODO_FIRST_NAME)),
+        &sticky_todo(TODO_FIRST_TEXT, TodoStatus::Pending),
+    );
+}
+
+#[test_case(false; "no_list")]
+#[test_case(true; "explicit_empty_list")]
+fn sticky_todos_empty_tasks_do_not_leak_another_chats_panel_or_count(explicit_empty: bool) {
+    let mut app = streaming_app();
+    let main = sticky_todo(TODO_MAIN_TEXT, TodoStatus::Completed);
+    publish_sticky_todos(&mut app, None, main.clone());
+    start_subagent(&mut app, TODO_FIRST_ID, TODO_FIRST_NAME);
+    press_chord(&mut app, chord::PLAN_TOGGLE);
+    if explicit_empty {
+        publish_sticky_todos(
+            &mut app,
+            Some((TODO_FIRST_ID, TODO_FIRST_NAME)),
+            sticky_todo(TODO_FIRST_TEXT, TodoStatus::Pending),
+        );
+    }
+    app.focus_task(TODO_FIRST_ID).unwrap();
+    if explicit_empty {
+        assert!(app.todo_panel.is_visible());
+        publish_sticky_todos(&mut app, Some((TODO_FIRST_ID, TODO_FIRST_NAME)), Vec::new());
+    }
+    assert_sticky_todo_source(&mut app, Some((TODO_FIRST_ID, TODO_FIRST_NAME)), &[]);
+    press_chord(&mut app, chord::PLAN_TOGGLE);
+    assert!(!app.todo_panel.is_visible());
+    app.focus_task(MAIN_TASK_ID).unwrap();
+    assert!(app.todo_panel.is_visible());
+    assert_sticky_todo_source(&mut app, None, &main);
+    publish_sticky_todos(&mut app, Some((TODO_FIRST_ID, TODO_FIRST_NAME)), Vec::new());
+    assert_sticky_todo_source(&mut app, None, &main);
+    publish_sticky_todos(&mut app, None, Vec::new());
+    assert_sticky_todo_source(&mut app, None, &[]);
+}
+
+#[test_case(false; "finished")]
+#[test_case(true; "failed")]
+fn sticky_todos_survive_task_completion_and_resumption(is_error: bool) {
+    let mut app = sticky_todo_app();
+    let expected = sticky_todo(TODO_FIRST_TEXT, TodoStatus::Pending);
+    app.focus_task(TODO_FIRST_ID).unwrap();
+    press_chord(&mut app, chord::PLAN_TOGGLE);
+    finish_subagent(&mut app, TODO_FIRST_ID, is_error);
+    assert!(app.chats[1].is_finished());
+    assert_sticky_todo_source(&mut app, Some((TODO_FIRST_ID, TODO_FIRST_NAME)), &expected);
+    app.focus_task(MAIN_TASK_ID).unwrap();
+    let mut continued = subagent_info(TODO_NEXT_CALL, TODO_FIRST_NAME);
+    continued.task_id = TODO_FIRST_ID.into();
+    app.update(subagent_msg_with_info(
+        AgentEvent::TextDelta {
+            text: TODO_FIRST_TEXT.into(),
+        },
+        continued,
+    ));
+    assert_eq!(app.chats.len(), 3);
+    assert!(!app.chats[1].is_finished());
+    assert_eq!(app.chats[1].todos(), expected);
+    app.focus_task(TODO_FIRST_ID).unwrap();
+    assert!(app.todo_panel.is_visible());
+    assert_sticky_todo_source(&mut app, Some((TODO_FIRST_ID, TODO_FIRST_NAME)), &expected);
+}
+
+#[test_case(false; "stable_id_lookup")]
+#[test_case(true; "cached_route")]
+fn sticky_todos_focused_resumption_refreshes_the_task_name(cached: bool) {
+    let mut app = sticky_todo_app();
+    app.focus_task(TODO_FIRST_ID).unwrap();
+    press_chord(&mut app, chord::PLAN_TOGGLE);
+    finish_subagent(&mut app, TODO_FIRST_ID, false);
+    if !cached {
+        app.chat_index.remove(TODO_FIRST_ID);
+    }
+    let mut continued = subagent_info(TODO_NEXT_CALL, TODO_SECOND_NAME);
+    continued.task_id = TODO_FIRST_ID.into();
+    app.update(subagent_msg_with_info(
+        AgentEvent::TextDelta {
+            text: TODO_FIRST_TEXT.into(),
+        },
+        continued,
+    ));
+    assert_sticky_todo_source(
+        &mut app,
+        Some((TODO_FIRST_ID, TODO_SECOND_NAME)),
+        &sticky_todo(TODO_FIRST_TEXT, TodoStatus::Pending),
+    );
+    assert!(!app.todo_panel.progress_tip().contains(TODO_FIRST_NAME));
+}
+
+#[test_case(false; "read_only_task")]
+#[test_case(true; "task_composer")]
+fn sticky_todos_collapsed_task_hint_renders_hovers_and_opens(composer: bool) {
+    let mut app = sticky_todo_app();
+    let (steer_tx, _steer_rx) = caudra_agent::steering_queue();
+    if composer {
+        app.subagent_steers.insert(TODO_FIRST_ID.into(), steer_tx);
+    }
+    app.focus_task(TODO_FIRST_ID).unwrap();
+    assert_eq!(app.active_subagent_has_composer(), composer);
+    let screen = rendered(&mut app);
+    assert!(
+        screen.contains(&format!("Task: {TODO_FIRST_NAME} · 0/1")),
+        "{screen}"
+    );
+    let hit = app.chord_hint_hit.expect(HINT_MISSING);
+    assert_eq!(hit.target, ChordHint::PlanOrTodo);
+    app.update(mouse_event(MouseEventKind::Moved, hit.area.x, hit.area.y));
+    let _ = rendered(&mut app);
+    app.tooltip.expire();
+    let screen = rendered(&mut app);
+    assert!(
+        screen.contains(&format!("Task ID: {TODO_FIRST_ID}")),
+        "{screen}"
+    );
+    assert!(click_at(&mut app, hit.area).is_empty());
+    let screen = rendered(&mut app);
+    assert!(
+        screen.contains(&format!("Todos · Task: {TODO_FIRST_NAME} · 0/1")),
+        "{screen}"
+    );
+    assert!(app.todo_panel.is_visible());
+}
+
+fn sticky_todo_history(call: &str) -> Vec<Message> {
+    vec![
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                call,
+                TODOWRITE_TOOL_NAME,
+                serde_json::json!({}),
+            )],
+            ..Default::default()
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: call.into(),
+                content: String::new(),
+                is_error: false,
+                output_ref: None,
+            }],
+            ..Default::default()
+        },
+    ]
+}
+
+#[test_case(false, false; "both_latest_lists")]
+#[test_case(false, true; "task_latest_empty")]
+#[test_case(true, false; "main_latest_empty")]
+#[test_case(true, true; "both_latest_empty")]
+fn sticky_todos_session_restore_uses_each_chats_latest_list(main_empty: bool, task_empty: bool) {
+    let (_temp, storage, _, mut app) = tempdir_app();
+    let main = if main_empty {
+        Vec::new()
+    } else {
+        sticky_todo(TODO_MAIN_TEXT, TodoStatus::Completed)
+    };
+    let task = if task_empty {
+        Vec::new()
+    } else {
+        sticky_todo(TODO_FIRST_TEXT, TodoStatus::InProgress)
+    };
+    let session = app.state.session_mut();
+    for (id, text, latest) in [
+        (MAIN_TASK_ID, TODO_MAIN_TEXT, &main),
+        (TODO_FIRST_ID, TODO_FIRST_TEXT, &task),
+    ] {
+        let latest_call = format!("{id}-{TODO_NEXT_CALL}");
+        let mut messages = sticky_todo_history(id);
+        messages.extend(sticky_todo_history(&latest_call));
+        let history = crate::history_items(&messages);
+        if id == MAIN_TASK_ID {
+            session.replace_messages(history);
+        } else {
+            session.set_subagent_messages(id.into(), history);
+        }
+        session.insert_tool_output(
+            id.into(),
+            ToolOutput::TodoList(sticky_todo(text, TodoStatus::Pending)),
+        );
+        session.insert_tool_output(latest_call, ToolOutput::TodoList(latest.clone()));
+    }
+    session.set_subagents(vec![StoredSubagent {
+        tool_use_id: TODO_FIRST_ID.into(),
+        parent_tool_use_id: None,
+        root_tool_use_id: None,
+        name: TODO_FIRST_NAME.into(),
+        model: None,
+        thinking: None,
+        fast: false,
+        outcome: StoredSubagentOutcome::Done,
+    }]);
+    session.save(&storage).unwrap();
+    app.state.session = Arc::new(AppSession::load(app.state.session.id, &storage).unwrap());
+    app.restore_display();
+    assert_eq!(app.chats.len(), 2);
+    assert_sticky_todo_source(&mut app, None, &main);
+    app.focus_task(TODO_FIRST_ID).unwrap();
+    assert_sticky_todo_source(&mut app, Some((TODO_FIRST_ID, TODO_FIRST_NAME)), &task);
+    if !task_empty {
+        press_chord(&mut app, chord::PLAN_TOGGLE);
+        assert!(app.todo_panel.is_visible());
+        assert_sticky_todo_source(&mut app, Some((TODO_FIRST_ID, TODO_FIRST_NAME)), &task);
+    }
+    app.focus_task(MAIN_TASK_ID).unwrap();
+    assert_sticky_todo_source(&mut app, None, &main);
+}
+
+#[test]
+fn sticky_todos_new_session_resets_lists_source_and_reveal_preference() {
+    let mut app = sticky_todo_app();
+    app.focus_task(TODO_FIRST_ID).unwrap();
+    press_chord(&mut app, chord::PLAN_TOGGLE);
+    app.reset_session();
+    assert_eq!(app.active_chat, 0);
+    assert_eq!(app.chats.len(), 1);
+    assert_sticky_todo_source(&mut app, None, &[]);
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let main = sticky_todo(TODO_MAIN_TEXT, TodoStatus::Pending);
+    publish_sticky_todos(&mut app, None, main.clone());
+    assert!(!app.todo_panel.is_visible());
+    assert_sticky_todo_source(&mut app, None, &main);
+}
+
+#[test_case(false; "dismissed_main_plan")]
+#[test_case(true; "visible_main_plan")]
+fn sticky_todos_task_chord_ignores_ready_main_plan_but_main_keeps_plan_priority(
+    plan_visible: bool,
+) {
+    let mut app = plan_app();
+    if !plan_visible {
+        app.plan_form.hide();
+    }
+    publish_sticky_todos(
+        &mut app,
+        None,
+        sticky_todo(TODO_MAIN_TEXT, TodoStatus::Completed),
+    );
+    publish_sticky_todos(
+        &mut app,
+        Some((TODO_FIRST_ID, TODO_FIRST_NAME)),
+        sticky_todo(TODO_FIRST_TEXT, TodoStatus::Pending),
+    );
+    app.focus_task(TODO_FIRST_ID).unwrap();
+    assert!(matches!(app.chord_subject(), Some((ChordTopic::Todo, _))));
+    press_chord(&mut app, chord::PLAN_TOGGLE);
+    assert!(app.todo_panel.is_visible());
+    assert_eq!(app.plan_form.is_visible(), plan_visible);
+    assert_sticky_todo_source(
+        &mut app,
+        Some((TODO_FIRST_ID, TODO_FIRST_NAME)),
+        &sticky_todo(TODO_FIRST_TEXT, TodoStatus::Pending),
+    );
+    let screen = rendered(&mut app);
+    assert!(
+        screen.contains(&format!("Todos · Task: {TODO_FIRST_NAME} · 0/1")),
+        "{screen}"
+    );
+    assert!(!app.plan_form_takes_input());
+    assert_eq!(app.plan_form_active(), plan_visible);
+    press_chord(&mut app, chord::PLAN_TOGGLE);
+    assert!(!app.todo_panel.is_visible());
+    assert_eq!(app.plan_form.is_visible(), plan_visible);
+    app.focus_task(MAIN_TASK_ID).unwrap();
+    if plan_visible {
+        press_chord(&mut app, chord::PLAN_TOGGLE);
+    }
+    assert!(!app.plan_form.is_visible());
+    assert!(matches!(app.chord_subject(), Some((ChordTopic::Plan, _))));
+    press_chord(&mut app, chord::PLAN_TOGGLE);
+    assert!(app.plan_form.is_visible());
+    assert!(!app.todo_panel.is_visible());
+    assert!(app.state.plan.is_ready());
 }
 
 #[test]

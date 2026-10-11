@@ -1449,11 +1449,15 @@ impl App {
         self.state.mode == Mode::Plan && self.plan_form.is_visible()
     }
 
+    fn plan_form_in_view(&self) -> bool {
+        self.is_main_chat() && self.plan_form_active()
+    }
+
     /// The form stays up while the plan is open in the workbench, but the
     /// workbench is what the reader is looking at. A form that kept the keys
     /// from behind it would implement the plan on the Enter meant for the text.
     fn plan_form_takes_input(&self) -> bool {
-        self.plan_form_active() && !self.workbench.is_open()
+        self.plan_form_in_view() && !self.workbench.is_open()
     }
 
     /// Reconciles the session to a model it was handed. Every live session is
@@ -2196,7 +2200,7 @@ impl App {
     /// `Input` zone in `register_zones`, so a click and a key agree on where
     /// the keyboard is.
     pub(super) fn composer_is_interactive(&self) -> bool {
-        !self.plan_form_active()
+        !self.plan_form_in_view()
             && !self.question_form.is_open()
             && (self.is_main_chat()
                 || self.active_subagent_has_composer()
@@ -3374,10 +3378,12 @@ impl App {
             BuiltinAction::PrevChat => {
                 self.leave_active_chat();
                 self.active_chat = self.active_chat.saturating_sub(1);
+                self.sync_todo_panel();
             }
             BuiltinAction::NextChat => {
                 self.leave_active_chat();
                 self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
+                self.sync_todo_panel();
             }
             BuiltinAction::ModelPicker => {
                 self.model_picker
@@ -3803,7 +3809,7 @@ impl App {
     /// `Ctrl+T` and `Ctrl+X t` both mean "show me the plan", and which panel
     /// that is depends on whether a plan is ready or a todo list is live.
     fn toggle_plan_or_todo(&mut self) {
-        if self.plan_toggle_ready() {
+        if self.is_main_chat() && self.plan_toggle_ready() {
             self.run_builtin(BuiltinAction::PlanToggle);
             return;
         }
@@ -5018,14 +5024,6 @@ impl App {
             self.state
                 .session_mut()
                 .insert_tool_output(e.id.clone(), e.output.clone());
-            // Subagents get `todo_write` too, but their plans are private:
-            // letting one repaint the panel would erase the main list the user
-            // is watching.
-            if subagent_id.is_none()
-                && let caudra_agent::types::ToolOutput::TodoList(items) = &e.output
-            {
-                self.todo_panel.set_items(items.clone());
-            }
             if subagent_id.is_none()
                 && let Some(task_id) = self.parent_task_ids.get(&e.id)
                 && !self.session_owns_task(task_id)
@@ -5254,7 +5252,11 @@ impl App {
         } else {
             None
         };
+        let todo_changed = matches!(&event, AgentEvent::ToolDone(e) if matches!(&e.output, ToolOutput::TodoList(_)));
         let result = self.chats[chat_idx].handle_event(event, plan_path);
+        if todo_changed && chat_idx == self.active_chat {
+            self.sync_todo_panel();
+        }
         if let Some((id, plan)) = plan_write {
             self.chats[chat_idx].plan_written(&id, &plan);
         }
@@ -5508,6 +5510,9 @@ impl App {
             chat.fast = subagent.fast;
             self.chat_index.insert(task_id.clone(), idx);
             self.sync_subagents();
+            if idx == self.active_chat {
+                self.sync_todo_panel();
+            }
             return idx;
         }
 
@@ -5524,6 +5529,9 @@ impl App {
                     chat.push_user_message(prompt);
                 }
                 self.sync_subagents();
+                if idx == self.active_chat {
+                    self.sync_todo_panel();
+                }
             } else if self.chats[idx].message_count() == 0
                 && let Some(prompt) = &subagent.prompt
             {
@@ -5568,6 +5576,9 @@ impl App {
         };
         self.chat_index.insert(task_id.clone(), idx);
         self.sync_subagents();
+        if idx == self.active_chat {
+            self.sync_todo_panel();
+        }
         idx
     }
 
@@ -6975,7 +6986,7 @@ impl App {
         if self.peer_manager.handle_paste(text) {
             return;
         }
-        if self.plan_form_active() {
+        if self.plan_form_in_view() {
             return;
         }
         if self.float_mgr.handle_paste(text) {

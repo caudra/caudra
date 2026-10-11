@@ -475,7 +475,7 @@ impl App {
             ) {
                 return actions;
             }
-        } else if self.plan_form_active() {
+        } else if self.plan_form_in_view() {
             let action = self.plan_form.handle_mouse(event);
             if action != crate::components::plan_form::PlanFormAction::Passthrough {
                 self.clear_control_hovers();

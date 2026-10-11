@@ -179,5 +179,6 @@ impl App {
         if self.active_chat >= idx {
             self.active_chat = self.active_chat.saturating_sub(1);
         }
+        self.sync_todo_panel();
     }
 }

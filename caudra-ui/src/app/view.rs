@@ -24,7 +24,7 @@ use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Widget};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
 use super::permission_editor::LOCAL_SOURCE_NOTICE;
 use super::sandbox::attached_sandbox_instance;
@@ -215,7 +215,7 @@ impl App {
         let question_open = self.question_form.is_open();
         // Both park the agent on the user, so both own the bottom outright.
         let blocking_form = permission_open || question_open;
-        let form_visible = blocking_form || self.plan_form_active();
+        let form_visible = blocking_form || self.plan_form_in_view();
 
         // Carve the full-width status bar first so the split carving below only
         // ever deals with the content region above it.
@@ -413,6 +413,7 @@ impl App {
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
             }
+            let panel_hint = self.chord_hint(layout.input_area);
             if self.active_subagent_has_composer() || self.queue_editor_active() {
                 self.subagent_input_box.view(
                     frame,
@@ -429,7 +430,7 @@ impl App {
                     },
                     self.separator_style(),
                     self.composer_holds_keys(),
-                    None,
+                    panel_hint,
                 );
                 self.command_palette.view(frame, layout.input_area);
                 self.mention_popup.view(frame, layout.input_area);
@@ -439,8 +440,14 @@ impl App {
                     .borders(Borders::TOP)
                     .border_style(self.separator_style());
                 frame.render_widget(sep, layout.input_area);
+                if let Some(hint) = panel_hint {
+                    frame.render_widget(
+                        Paragraph::new(hint.right_aligned()),
+                        input::top_right_hint_area(layout.input_area),
+                    );
+                }
             }
-        } else if self.plan_form_active() {
+        } else if self.plan_form_in_view() {
             self.plan_form.view(frame, layout.bottom_area);
         } else if layout.bottom_area.height > 0 {
             let queue_entries = self.queue.panel_entries();
@@ -842,7 +849,7 @@ impl App {
 
         if self.permission_prompt.is_open()
             || self.question_form.is_open()
-            || self.plan_form_active()
+            || self.plan_form_in_view()
         {
             self.zones.push_overlay(layout.bottom_area);
         }
@@ -936,7 +943,8 @@ impl App {
     /// What the chord hint is about and the label it reads, for the hint and
     /// its tooltip alike, so the two cannot disagree.
     pub(super) fn chord_subject(&self) -> Option<(ChordTopic, String)> {
-        if self.state.mode == Mode::Plan
+        if self.is_main_chat()
+            && self.state.mode == Mode::Plan
             && let Some(label) = self.plan_form.hint_label()
         {
             Some((ChordTopic::Plan, label.to_string()))
@@ -980,7 +988,7 @@ impl App {
             contexts.push(KeybindContext::PasteEditor);
         } else if self.review.is_open() {
             contexts.push(KeybindContext::Review);
-        } else if self.plan_form_active() {
+        } else if self.plan_form_in_view() {
             contexts.push(KeybindContext::FormInput);
         } else if self.queue_editor_active() {
             contexts.push(KeybindContext::Editing);

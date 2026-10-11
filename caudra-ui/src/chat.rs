@@ -30,7 +30,7 @@ use caudra_agent::tools::{
     BATCH_TOOL_NAME, FILE_WRITE_TOOL_NAME, ToolEffect, ToolInvocation, ToolRegistry,
     WORKFLOW_TOOL_NAME,
 };
-use caudra_agent::types::{Answer, QuestionEvent, WorkflowRunCard};
+use caudra_agent::types::{Answer, QuestionEvent, TodoItem, WorkflowRunCard};
 use caudra_agent::{
     AgentEvent, BatchToolEntry, BufferSnapshot, COMPACTION_ANCHOR, CallStage, CommitRef,
     EMPTY_RESPONSE_RULE, Mention, SubagentProgress, TaskCard, ToolDoneEvent, ToolOutput,
@@ -104,6 +104,7 @@ pub struct Chat {
     pub fast: bool,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
+    todos: Vec<TodoItem>,
     /// The ending and the index of the bubble announcing it, so a later, better
     /// informed outcome can fix that bubble instead of appending a second one.
     finish: Option<(TaskOutcome, usize)>,
@@ -149,6 +150,7 @@ impl Chat {
             stall_row: None,
             stall_pending: false,
             messages_panel: MessagesPanel::new(ui_config, lua_event_handle),
+            todos: Vec::new(),
             finish: None,
             task_id: None,
             parent_tool_use_id: None,
@@ -262,6 +264,9 @@ impl Chat {
                 }
             }
             AgentEvent::ToolDone(mut e) => {
+                if let ToolOutput::TodoList(items) = &e.output {
+                    self.todos.clone_from(items);
+                }
                 let native_plan = &*e.tool == plan::NAME;
                 let plan_write = plan_path.filter(|pp| !native_plan && e.wrote_to(pp));
                 if native_plan
@@ -905,7 +910,19 @@ impl Chat {
     }
 
     pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
+        self.todos = msgs
+            .iter()
+            .rev()
+            .find_map(|msg| match msg.tool_output.as_deref() {
+                Some(ToolOutput::TodoList(items)) => Some(items.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
         self.messages_panel.load_messages(msgs);
+    }
+
+    pub(crate) fn todos(&self) -> &[TodoItem] {
+        &self.todos
     }
 
     pub fn bind_sources(&mut self, messages: &[DisplayMessage]) {
@@ -1530,7 +1547,7 @@ mod tests {
     };
     use caudra_agent::tools::native::peers::{LIST_NAME, PUBLISH_NAME, SEND_NAME, WORK_NAME};
     use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME};
-    use caudra_agent::types::Answerer;
+    use caudra_agent::types::{Answerer, TodoPriority, TodoStatus};
     use caudra_agent::{
         AgentEvent, BatchProgressEvent, BatchToolEntry, BatchToolStatus, IndexLine,
         IndexLineSemantic, IndexOutput, IndexSourceRange, PeerOutput, SharedBuf, TextOutput,
@@ -1659,6 +1676,8 @@ mod tests {
     const AUTOMATION_TEXT: &str = "The nightly build failed on main.";
     const AUTOMATION_FRAMED: &str =
         "<automation name=\"ci-watch\">The nightly build failed on main.</automation>";
+    const TODO_TEXT: &str = "Verify the task-local todo list";
+    const TODO_CALL: &str = "todo-update";
 
     fn chat() -> Chat {
         Chat::new(
@@ -1690,6 +1709,38 @@ mod tests {
 
     fn text_delta(chat: &mut Chat, text: &str) {
         chat.handle_event(AgentEvent::TextDelta { text: text.into() }, None);
+    }
+
+    #[test_case(false; "main")]
+    #[test_case(true; "task")]
+    fn todo_snapshots_match_live_and_restored_replace_all_updates(task: bool) {
+        let mut live = if task { subagent_chat() } else { chat() };
+        let mut restored = if task { subagent_chat() } else { chat() };
+        let items = vec![TodoItem {
+            content: TODO_TEXT.into(),
+            status: TodoStatus::Pending,
+            priority: TodoPriority::default(),
+        }];
+        let mut history = Vec::new();
+        for items in [items.clone(), Vec::new(), items] {
+            let output = ToolOutput::TodoList(items.clone());
+            live.handle_event(tool_done(TODO_CALL, "todo_write", output.clone()), None);
+            let messages = tool_use_pair("todo_write", serde_json::json!({}), "ok", false);
+            let outputs = HashMap::from([("t1".into(), Arc::new(output))]);
+            history.extend(display_messages(&messages, &outputs).0);
+            history.push(DisplayMessage::new(
+                DisplayRole::Assistant,
+                REPLY_TEXT.into(),
+            ));
+            restored.load_messages(history.clone());
+            assert_eq!(live.todos(), items);
+            assert_eq!(restored.todos(), live.todos());
+        }
+        restored.load_messages(vec![DisplayMessage::new(
+            DisplayRole::User,
+            USER_TEXT.into(),
+        )]);
+        assert!(restored.todos().is_empty());
     }
 
     #[test]

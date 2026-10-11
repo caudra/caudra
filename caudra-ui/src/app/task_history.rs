@@ -246,6 +246,7 @@ impl App {
                         };
                         self.task_history.cached_chat = Some(id);
                         self.task_history.detail = Some(loaded.card);
+                        self.sync_todo_panel();
                         self.fire_restore_items(loaded.restore);
                     }
                     Ok(_) => {}
@@ -368,7 +369,8 @@ mod tests {
     use std::sync::Arc;
 
     use caudra_agent::background::BackgroundTasks;
-    use caudra_providers::Message;
+    use caudra_agent::types::{TodoItem, TodoPriority, TodoStatus, ToolOutput};
+    use caudra_providers::{ContentBlock, Message, Role};
     use caudra_storage::{
         background::{MAX_HISTORY_PAGE, TaskRecord},
         sessions::SessionDatabase,
@@ -382,15 +384,54 @@ mod tests {
     const HISTORY_TEXT: &str = "Inspect the archived implementation.";
     const TASK_PREFIX: &str = "archived-task";
     const SUCCEEDED: &str = "succeeded";
+    const TODO_CALL: &str = "archived-todos";
+    const CLEAR_CALL: &str = "archived-todos-cleared";
+    const TODO_TEXT: &str = "Review the archived task";
 
     async fn fixture() -> App {
         let mut app = test_app();
+        app.state.session_mut().insert_tool_output(
+            TODO_CALL.into(),
+            ToolOutput::TodoList(vec![TodoItem {
+                content: TODO_TEXT.into(),
+                status: TodoStatus::Completed,
+                priority: TodoPriority::default(),
+            }]),
+        );
+        app.state
+            .session_mut()
+            .insert_tool_output(CLEAR_CALL.into(), ToolOutput::TodoList(Vec::new()));
         app.storage_writer
             .save_sync(Arc::clone(&app.state.session))
             .unwrap();
         let database = SessionDatabase::open(&app.storage).unwrap();
         for index in 0..=MAX_HISTORY_PAGE {
             let id = format!("{TASK_PREFIX}-{index}");
+            let mut history = vec![Message::user(HISTORY_TEXT.into())];
+            let calls = if index == 0 {
+                &[TODO_CALL][..]
+            } else if index == MAX_HISTORY_PAGE {
+                &[TODO_CALL, CLEAR_CALL][..]
+            } else {
+                &[][..]
+            };
+            for call in calls {
+                history.push(Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::tool_use(*call, "todo_write", json!({}))],
+                    ..Default::default()
+                });
+                history.push(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: (*call).into(),
+                        content: String::new(),
+                        is_error: false,
+                        output_ref: None,
+                    }],
+                    ..Default::default()
+                });
+            }
             let record = TaskRecord {
                 payload: Default::default(),
                 owner: Default::default(),
@@ -408,7 +449,7 @@ mod tests {
                 request: json!({"call_id": id, "label": id}),
                 outcome: Some(json!({"success": true})),
                 output_ref: None,
-                history: json!([Message::user(HISTORY_TEXT.into())]),
+                history: json!(history),
                 spec: json!({}),
                 events: Vec::new(),
             };
@@ -467,6 +508,10 @@ mod tests {
                 return;
             }
             assert_eq!(app.chats.len(), 2);
+            assert_eq!(app.chats[app.active_chat].todos()[0].content, TODO_TEXT);
+            assert!(app.todo_panel.progress_tip().contains(&oldest));
+            app.todo_panel.toggle();
+            assert!(app.todo_panel.is_visible());
             assert_eq!(
                 app.chats[app.active_chat].message_at(0).unwrap().text,
                 HISTORY_TEXT
@@ -480,10 +525,19 @@ mod tests {
             app.preview_task(&latest);
             flush(&mut app).await;
             assert_eq!(app.chats.len(), 2);
+            assert!(app.chats[app.active_chat].todos().is_empty());
+            assert!(!app.todo_panel.is_visible());
+            assert!(app.todo_panel.hint_label().is_none());
             assert_eq!(
                 app.chats[app.active_chat].task_id().unwrap().as_ref(),
                 latest
             );
+            app.task_picker.select(&oldest);
+            app.preview_task(&oldest);
+            flush(&mut app).await;
+            assert_eq!(app.chats.len(), 2);
+            assert!(app.todo_panel.is_visible());
+            assert!(app.todo_panel.progress_tip().contains(&oldest));
             app.background.as_ref().unwrap().shutdown().await.unwrap();
         });
     }

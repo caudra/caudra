@@ -764,20 +764,8 @@ impl App {
                 subagent_versions.insert(subagent.tool_use_id.clone(), version_id.clone());
             }
         }
-        // `todo_write` replaces the whole list every call, so the last one in
-        // the transcript is the current plan.
-        if let Some(items) =
-            display_msgs
-                .iter()
-                .rev()
-                .find_map(|msg| match msg.tool_output.as_deref() {
-                    Some(caudra_agent::types::ToolOutput::TodoList(items)) => Some(items.clone()),
-                    _ => None,
-                })
-        {
-            self.todo_panel.set_items(items);
-        }
         self.main_chat().load_messages(display_msgs);
+        self.sync_todo_panel();
         let cost = self.state.cost;
         let context_size = self.state.context_size;
         let main = self.main_chat();

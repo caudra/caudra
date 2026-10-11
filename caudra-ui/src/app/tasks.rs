@@ -855,7 +855,14 @@ impl App {
                 .position(|chat| chat.task_id().is_some_and(|task_id| &**task_id == id))
                 .ok_or_else(|| format!("{UNKNOWN_TASK_ERR}{id}"))?
         };
+        self.sync_todo_panel();
         Ok(())
+    }
+
+    pub(super) fn sync_todo_panel(&mut self) {
+        let chat = &self.chats[self.active_chat];
+        let task = chat.task_id().map(|id| (id.as_ref(), chat.name.as_str()));
+        self.todo_panel.set_source(task, chat.todos());
     }
 
     /// Bookkeeping every chat switch shares: an edit in flight, a queue

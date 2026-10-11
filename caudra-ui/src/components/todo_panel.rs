@@ -15,6 +15,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::components::tooltip::{self, Tip, TipArea, TipKey};
@@ -22,6 +23,8 @@ use crate::components::{apply_scroll_delta, hover_style};
 use crate::theme;
 
 const TITLE: &str = "Todos";
+const TASK_LABEL: &str = "Task:";
+const TASK_ID_LABEL: &str = "Task ID:";
 const ELLIPSIS: &str = "…";
 const TIP_HEADER: &str = "The steps the model keeps for its current work\nClick to hide the list";
 const TIP_PROGRESS_OF: &str = " of ";
@@ -41,6 +44,7 @@ const CHROME_ROWS: u16 = 2;
 /// new session clears the flag.
 #[derive(Default)]
 pub struct TodoPanel {
+    source: Option<(String, String)>,
     items: Vec<TodoItem>,
     revealed: bool,
     scroll: u16,
@@ -60,6 +64,7 @@ pub struct TodoPanel {
 
 impl TodoPanel {
     /// Returns whether anything changed, so the caller can skip a repaint.
+    #[cfg(test)]
     pub fn set_items(&mut self, items: Vec<TodoItem>) -> bool {
         if self.items == items {
             return false;
@@ -69,11 +74,38 @@ impl TodoPanel {
         true
     }
 
+    pub(crate) fn set_source(&mut self, task: Option<(&str, &str)>, items: &[TodoItem]) -> bool {
+        let source_changed = self
+            .source
+            .as_ref()
+            .map(|(id, name)| (id.as_str(), name.as_str()))
+            != task;
+        let items_changed = self.items != items;
+        if !source_changed && !items_changed {
+            return false;
+        }
+        if source_changed {
+            self.source = task.map(|(id, name)| (id.to_owned(), name.to_owned()));
+            self.scroll = 0;
+        }
+        if items_changed {
+            self.items = items.to_vec();
+        }
+        self.follow_focus = true;
+        self.clear_pointer_state();
+        true
+    }
+
     pub fn reset(&mut self) {
+        self.source = None;
         self.items.clear();
         self.revealed = false;
         self.scroll = 0;
         self.follow_focus = true;
+        self.clear_pointer_state();
+    }
+
+    fn clear_pointer_state(&mut self) {
         self.area = Rect::default();
         self.header = Rect::default();
         self.header_down = false;
@@ -109,16 +141,44 @@ impl TodoPanel {
         if self.items.is_empty() || self.revealed {
             return None;
         }
-        Some(format!("{}/{}", self.completed(), self.items.len()))
+        let progress = format!("{}/{}", self.completed(), self.items.len());
+        Some(match &self.source {
+            Some((_, name)) => format!("{TASK_LABEL} {name} · {progress}"),
+            None => progress,
+        })
     }
 
     /// The closed panel's counter in words, for its tooltip.
     pub(crate) fn progress_tip(&self) -> String {
-        format!(
+        self.source_tip(&format!(
             "{}{TIP_PROGRESS_OF}{}{TIP_PROGRESS_DONE}",
             self.completed(),
             self.items.len()
-        )
+        ))
+    }
+
+    fn source_tip(&self, text: &str) -> String {
+        match &self.source {
+            Some((id, name)) => format!("{TASK_LABEL} {name}\n{TASK_ID_LABEL} {id}\n{text}"),
+            None => text.to_owned(),
+        }
+    }
+
+    fn title(&self, width: usize) -> String {
+        let progress = format!("{}/{}", self.completed(), self.items.len());
+        let Some((_, name)) = &self.source else {
+            return format!("{TITLE} · {progress}");
+        };
+        let prefix = format!("{TITLE} · {TASK_LABEL} ");
+        let suffix = format!(" · {progress}");
+        if width >= prefix.width() + ELLIPSIS.width() + suffix.width() {
+            let name = truncate(name, width - prefix.width() - suffix.width());
+            format!("{prefix}{name}{suffix}")
+        } else if width >= suffix.width() {
+            format!("{}{suffix}", truncate(&prefix, width - suffix.width()))
+        } else {
+            truncate(&progress, width)
+        }
     }
 
     /// The header's close control, or the whole of an item drawn short.
@@ -130,7 +190,7 @@ impl TodoPanel {
             return Some(Tip::at(
                 TipKey::TodoHeader,
                 self.header,
-                TIP_HEADER.to_owned(),
+                self.source_tip(TIP_HEADER),
             ));
         }
         tooltip::area_tip(&self.cut_rows, pointer)
@@ -225,9 +285,7 @@ impl TodoPanel {
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) {
         if !self.is_visible() || area.width < 2 || area.height < 2 {
-            self.area = Rect::default();
-            self.header = Rect::default();
-            self.cut_rows.clear();
+            self.clear_pointer_state();
             return;
         }
         grab_scope!("todo_panel", area);
@@ -248,13 +306,13 @@ impl TodoPanel {
         );
         let start = self.viewport();
         let end = (start + usize::from(content.height)).min(self.items.len());
-        let title = format!("{TITLE} · {}/{}", self.completed(), self.items.len());
+        let title = self.title(usize::from(content.width));
         // The control is the title, not the blank cells after it: a click
         // target the reader cannot see is not one they can aim at.
         let header = Rect::new(
             content.x,
             area.y,
-            (title.width() as u16).min(content.width),
+            title.width().min(usize::from(content.width)) as u16,
             1,
         );
         self.area = area;
@@ -309,19 +367,22 @@ fn row(item: &TodoItem, width: usize) -> (Line<'static>, bool) {
 }
 
 fn truncate(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
     if text.width() <= width {
         return text.to_owned();
     }
     let budget = width.saturating_sub(ELLIPSIS.width());
     let mut out = String::new();
     let mut used = 0;
-    for ch in text.chars() {
-        let w = ch.to_string().width();
+    for grapheme in text.graphemes(true) {
+        let w = grapheme.width();
         if used + w > budget {
             break;
         }
         used += w;
-        out.push(ch);
+        out.push_str(grapheme);
     }
     out.push_str(ELLIPSIS);
     out
@@ -339,6 +400,13 @@ mod tests {
     const HINT_STALE: &str = "the hint row must track the list while the panel is closed";
     const PROGRESS: &str = "1/2";
     const WIDE: u16 = 40;
+    const TASK_ID: &str = "task-first";
+    const OTHER_TASK_ID: &str = "task-second";
+    const TASK_NAME: &str = "Review";
+    const UNICODE_TASK_NAME: &str = "調査 e\u{301} 👩‍💻 長いタスク名を最後まで表示する";
+    const LONG_ITEM: &str = "A todo item long enough to require a tooltip in this panel";
+    const TASK_PROGRESS: &str = "Task: Review · 1/2";
+    const TASK_HEADER: &str = "Todos · Task: Review · 1/2";
 
     fn todo(content: &str, status: TodoStatus) -> TodoItem {
         TodoItem {
@@ -468,6 +536,164 @@ mod tests {
         let mut panel = panel(&[TodoStatus::Pending]);
         let same = vec![todo("task 0", TodoStatus::Pending)];
         assert!(!panel.set_items(same));
+    }
+
+    #[test_case(false ; "unchanged source keeps pointer and viewport")]
+    #[test_case(true ; "same name and items with different id resets state")]
+    fn source_identity_controls_viewport_and_pointer_state(change_id: bool) {
+        let todos = vec![todo(LONG_ITEM, TodoStatus::Pending); MAX_VISIBLE_ROWS * 2];
+        let mut panel = TodoPanel::default();
+        assert!(panel.set_source(Some((TASK_ID, TASK_NAME)), &todos));
+        assert!(panel.toggle());
+        panel.scroll(-1);
+        let _ = render(&mut panel, WIDE);
+        let area = panel.area;
+        let header = panel.header;
+        let pointer = Position::new(header.x, header.y);
+        let cut_rows = panel.cut_rows.clone();
+        assert!(!cut_rows.is_empty());
+        move_to(&mut panel, pointer);
+        assert!(panel.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), pointer)));
+
+        let id = if change_id { OTHER_TASK_ID } else { TASK_ID };
+        assert_eq!(panel.set_source(Some((id, TASK_NAME)), &todos), change_id);
+        assert!(panel.is_visible());
+        if change_id {
+            assert_eq!(panel.scroll, 0);
+            assert!(panel.follow_focus);
+            assert_eq!(panel.area, Rect::default());
+            assert_eq!(panel.header, Rect::default());
+            assert!(!panel.header_hover);
+            assert!(!panel.header_down);
+            assert!(panel.cut_rows.is_empty());
+            assert!(!panel.contains(pointer));
+            assert!(panel.hover_tip(Some(pointer)).is_none());
+        } else {
+            assert_eq!(panel.scroll, 1);
+            assert!(!panel.follow_focus);
+            assert_eq!(panel.area, area);
+            assert_eq!(panel.header, header);
+            assert!(panel.header_hover);
+            assert!(panel.header_down);
+            assert_eq!(panel.cut_rows, cut_rows);
+        }
+        let _ = render(&mut panel, WIDE);
+        assert_eq!(
+            panel.handle_mouse(mouse_at(MouseEventKind::Up(MouseButton::Left), pointer)),
+            !change_id
+        );
+        if change_id {
+            assert!(panel.is_visible());
+            assert!(click_at(&mut panel, pointer));
+        }
+        assert!(!panel.is_visible());
+    }
+
+    #[test_case(false ; "closed stays closed")]
+    #[test_case(true ; "open stays open")]
+    fn switching_sources_preserves_revealed_through_empty_lists(revealed: bool) {
+        let todos = items(&[TodoStatus::Completed, TodoStatus::Pending]);
+        let mut panel = TodoPanel::default();
+        assert!(panel.set_source(None, &todos));
+        if revealed {
+            assert!(panel.toggle());
+        }
+        for source in [
+            Some((TASK_ID, TASK_NAME)),
+            Some((OTHER_TASK_ID, TASK_NAME)),
+            None,
+        ] {
+            assert!(panel.set_source(source, &todos));
+            assert_eq!(panel.is_visible(), revealed);
+            assert_eq!(panel.hint_label().is_some(), !revealed);
+            assert!(panel.set_source(source, &[]));
+            assert!(!panel.is_visible());
+            assert_eq!(panel.height(), 0);
+            assert!(panel.hint_label().is_none());
+            assert!(!panel.toggle());
+            assert_eq!(panel.revealed, revealed);
+            assert!(!panel.set_source(source, &[]));
+        }
+        assert!(panel.set_source(None, &todos));
+        assert_eq!(panel.is_visible(), revealed);
+        if !revealed {
+            assert_eq!(panel.hint_label().as_deref(), Some(PROGRESS));
+        }
+    }
+
+    #[test]
+    fn resetting_a_task_source_clears_identity_and_revealed() {
+        let todos = items(&[TodoStatus::Completed, TodoStatus::Pending]);
+        let mut panel = TodoPanel::default();
+        panel.set_source(Some((TASK_ID, TASK_NAME)), &todos);
+        panel.toggle();
+        let _ = render(&mut panel, WIDE);
+        panel.reset();
+        assert!(panel.source.is_none());
+        assert!(!panel.revealed);
+        assert!(!panel.set_source(None, &[]));
+        panel.set_source(None, &todos);
+        assert_eq!(panel.hint_label().as_deref(), Some(PROGRESS));
+        assert!(!panel.progress_tip().contains(TASK_ID));
+    }
+
+    #[test]
+    fn task_header_and_closed_hint_name_the_source() {
+        let mut panel = TodoPanel::default();
+        panel.set_source(
+            Some((TASK_ID, TASK_NAME)),
+            &items(&[TodoStatus::Completed, TodoStatus::Pending]),
+        );
+        assert_eq!(panel.hint_label().as_deref(), Some(TASK_PROGRESS));
+        panel.toggle();
+        assert!(render(&mut panel, WIDE).contains(TASK_HEADER));
+        assert_eq!(usize::from(panel.header.width), TASK_HEADER.width());
+        let beside = Position::new(panel.header.right(), panel.header.y);
+        assert!(!click_at(&mut panel, beside));
+        assert!(panel.is_visible());
+        let inside = Position::new(panel.header.x, panel.header.y);
+        assert!(click_at(&mut panel, inside));
+        assert_eq!(panel.hint_label().as_deref(), Some(TASK_PROGRESS));
+    }
+
+    #[test_case(0 ; "no header space")]
+    #[test_case(3 ; "only progress fits")]
+    #[test_case(12 ; "abbreviated title")]
+    #[test_case(23 ; "wide graphemes")]
+    #[test_case(27 ; "combining and emoji graphemes")]
+    fn a_narrow_task_header_preserves_progress(width: usize) {
+        let mut panel = TodoPanel::default();
+        panel.set_source(
+            Some((TASK_ID, UNICODE_TASK_NAME)),
+            &items(&[TodoStatus::Completed, TodoStatus::Pending]),
+        );
+        let title = panel.title(width);
+        assert!(title.width() <= width, "{title}");
+        if width >= PROGRESS.width() {
+            assert!(title.ends_with(PROGRESS), "{title}");
+        }
+        panel.toggle();
+        let screen = render(&mut panel, WIDE);
+        assert!(screen.lines().next().unwrap().contains(PROGRESS));
+        assert!(screen.contains(ELLIPSIS));
+        let pointer = Position::new(panel.header.x, panel.header.y);
+        move_to(&mut panel, pointer);
+        let tip = panel.hover_tip(Some(pointer)).unwrap();
+        assert!(tip.text.contains(UNICODE_TASK_NAME));
+        assert!(tip.text.contains(TASK_ID));
+        assert!(tip.text.contains(TIP_HEADER));
+        let progress_tip = panel.progress_tip();
+        assert!(progress_tip.contains(UNICODE_TASK_NAME));
+        assert!(progress_tip.contains(TASK_ID));
+        assert!(progress_tip.contains(&format!("1{TIP_PROGRESS_OF}2{TIP_PROGRESS_DONE}")));
+    }
+
+    #[test_case("e\u{301}abc", 2, "e\u{301}…" ; "combining marks stay attached")]
+    #[test_case("👩‍💻abc", 3, "👩‍💻…" ; "joined emoji stays intact")]
+    #[test_case("調査abc", 2, "…" ; "wide character cannot consume ellipsis space")]
+    #[test_case("abc", 0, "" ; "no space means no ellipsis")]
+    fn truncation_preserves_graphemes(text: &str, width: usize, expected: &str) {
+        assert_eq!(truncate(text, width), expected);
     }
 
     #[test]
