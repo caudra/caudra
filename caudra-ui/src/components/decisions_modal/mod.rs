@@ -389,11 +389,11 @@ impl DecisionsModal {
         DecisionsAction::Consumed
     }
 
-    /// The wheel over the list walks the selection; anywhere else it scrolls
-    /// the body.
+    /// The wheel scrolls whichever pane is under the pointer. Over the list it
+    /// moves the view and leaves the selection where it is.
     pub fn scroll_at(&mut self, pos: Position, delta: i32) {
         match self.list_area.contains(pos) {
-            true => self.step(-(delta.signum() as isize)),
+            true => self.list_scroll.scroll(delta),
             false => self.body_scroll.scroll(delta),
         }
     }
@@ -774,7 +774,7 @@ impl DecisionsModal {
         self.list_scroll.update_dimensions(total, area.height);
         if self.reveal_cursor {
             self.list_scroll
-                .reveal(u16::try_from(cursor).unwrap_or(u16::MAX), 1);
+                .reveal_and_hold(u16::try_from(cursor).unwrap_or(u16::MAX), 1);
             self.reveal_cursor = false;
         }
         let offset = self.list_scroll.offset();
@@ -1036,6 +1036,8 @@ mod tests {
     const TALL: u16 = 60;
     const SHORT: u16 = 20;
     const WHEEL_DOWN: i32 = -3;
+    const MANY_DECISIONS: i64 = 40;
+    const CLICKED_ROW: u16 = 1;
     const DESCRIPTION_PREFIX: usize = 24;
     const NO_HIT: &str = "every footer key must answer a click";
     const NOT_COPIED: &str = "y must copy";
@@ -1144,6 +1146,26 @@ mod tests {
                 },
                 project(),
                 project(),
+            ],
+            session: SESSION.into(),
+            loaded_at: LOADED_AT.into(),
+        }))
+    }
+
+    /// The session logged more decisions than a short modal lists at once.
+    fn long_snapshot() -> DecisionsFetchState {
+        let recent = (1..=MANY_DECISIONS)
+            .rev()
+            .map(|id| decision(id, &DecisionFeature::PermissionAdvice, SESSION))
+            .collect();
+        DecisionsFetchState::Ready(Box::new(DecisionsSnapshot {
+            scopes: [
+                ScopeActivity {
+                    stats: vec![stats(&DecisionFeature::PermissionAdvice)],
+                    recent,
+                },
+                ScopeActivity::default(),
+                ScopeActivity::default(),
             ],
             session: SESSION.into(),
             loaded_at: LOADED_AT.into(),
@@ -1514,20 +1536,60 @@ mod tests {
     }
 
     #[test]
-    fn the_wheel_scrolls_the_body_and_walks_the_list() {
+    fn the_wheel_scrolls_the_pane_under_it() {
         let fixture = Fixture::new(true);
-        let mut modal = opened(snapshot());
+        let mut modal = opened(long_snapshot());
         draw(&mut modal, &fixture, WIDE, SHORT);
         let body = modal.body_area;
 
         modal.scroll_at(Position::new(body.x, body.y), WHEEL_DOWN);
 
         assert!(modal.body_scroll.offset() > 0);
-        let _ = type_char(&mut modal, '2');
+        let _ = type_char(&mut modal, '4');
+        draw(&mut modal, &fixture, WIDE, SHORT);
+        let selected = modal.selected;
+        let list = modal.list_area;
+        modal.scroll_at(Position::new(list.x, list.y), WHEEL_DOWN);
+        let scrolled = modal.list_scroll.offset();
+        draw(&mut modal, &fixture, WIDE, SHORT);
+        assert!(scrolled > 0);
+        assert_eq!(modal.list_scroll.offset(), scrolled);
+        assert_eq!(modal.selected, selected);
+        assert_eq!(modal.cursor(), 0);
+    }
+
+    #[test]
+    fn a_click_after_the_wheel_selects_the_row_under_the_pointer() {
+        let fixture = Fixture::new(true);
+        let mut modal = opened(long_snapshot());
+        let _ = type_char(&mut modal, '4');
         draw(&mut modal, &fixture, WIDE, SHORT);
         let list = modal.list_area;
         modal.scroll_at(Position::new(list.x, list.y), WHEEL_DOWN);
-        assert_eq!(modal.feature, 1);
+        let offset = modal.list_scroll.offset();
+
+        let _ = modal.handle_mouse(left_down(list.x, list.y + CLICKED_ROW));
+
+        assert_eq!(modal.cursor(), usize::from(offset + CLICKED_ROW));
+    }
+
+    /// The wheel pins a list it scrolls to the end, so a reveal that did not
+    /// let go of the end would be undone by the next frame.
+    #[test]
+    fn a_key_brings_back_a_list_the_wheel_left_at_its_end() {
+        let fixture = Fixture::new(true);
+        let mut modal = opened(long_snapshot());
+        let _ = type_char(&mut modal, '4');
+        draw(&mut modal, &fixture, WIDE, SHORT);
+        let list = modal.list_area;
+        modal.scroll_at(Position::new(list.x, list.y), -i32::from(u16::MAX));
+        assert!(modal.list_scroll.offset() > 0);
+
+        let _ = modal.handle_key(press(KeyCode::Home));
+        draw(&mut modal, &fixture, WIDE, SHORT);
+        draw(&mut modal, &fixture, WIDE, SHORT);
+
+        assert_eq!(modal.list_scroll.offset(), 0);
     }
 
     #[test]

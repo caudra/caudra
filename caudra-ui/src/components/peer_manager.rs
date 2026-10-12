@@ -331,7 +331,17 @@ struct Browser {
     filter: TextField,
     selected: Option<String>,
     offset: usize,
+    /// The list keeps the selection in view until the wheel scrolls it away.
+    /// Moving the selection hands it back.
+    follows: bool,
     pane: Pane,
+}
+
+impl Browser {
+    fn rewind(&mut self) {
+        self.offset = 0;
+        self.follows = true;
+    }
 }
 
 impl Default for Browser {
@@ -340,6 +350,7 @@ impl Default for Browser {
             filter: TextField::new(FieldKind::Line).limited_to(FILTER_LIMIT),
             selected: None,
             offset: 0,
+            follows: true,
             pane: Pane::List,
         }
     }
@@ -1508,7 +1519,9 @@ impl PeerManager {
         if self.browser().selected.as_ref() == Some(&selected) {
             return;
         }
-        self.browser_mut().selected = Some(selected);
+        let browser = self.browser_mut();
+        browser.selected = Some(selected);
+        browser.follows = true;
         self.review_request = None;
         match self.active {
             PeerView::Held => {
@@ -1533,6 +1546,7 @@ impl PeerManager {
     }
 
     fn step(&mut self, delta: isize) {
+        self.browser_mut().follows = true;
         let entries = self.entries();
         if entries.is_empty() {
             return;
@@ -1686,7 +1700,7 @@ impl PeerManager {
                 }
             }
         }
-        self.browser_mut().offset = 0;
+        self.browser_mut().rewind();
         self.invalidate_layout();
         PeerManagerAction::Consumed
     }
@@ -1739,7 +1753,7 @@ impl PeerManager {
             self.browser_mut()
                 .filter
                 .handle_text(&literal(text, false), paste);
-            self.browser_mut().offset = 0;
+            self.browser_mut().rewind();
             self.invalidate_layout();
         } else if self.field_focused()
             && let Some(panel) = &mut self.panel
@@ -2092,15 +2106,31 @@ impl PeerManager {
         PeerManagerAction::SetInbound(policy)
     }
 
-    pub fn scroll(&mut self, delta: i32) {
+    /// The wheel scrolls whichever pane is under the pointer. Over the list it
+    /// moves the view and leaves the selection where it is.
+    pub fn scroll_at(&mut self, position: Position, delta: i32) {
         if !self.open || self.confirmation.is_some() {
             return;
         }
-        if self.panel.is_none() && self.browser().pane == Pane::List {
-            self.step(-(delta.signum() as isize));
+        if self.list_area.contains(position) {
+            self.scroll_list(delta);
         } else {
             self.reader_mut().document.scroll(delta);
         }
+    }
+
+    /// `delta` counts rows, upwards, and the list scrolls by whole entries.
+    fn scroll_list(&mut self, delta: i32) {
+        let visible = usize::from(self.list_area.height / LIST_ROW_HEIGHT).max(1);
+        let last_top = self.entries().len().saturating_sub(visible);
+        let entries = (delta.unsigned_abs() as usize).div_ceil(usize::from(LIST_ROW_HEIGHT));
+        let browser = self.browser_mut();
+        browser.offset = match delta > 0 {
+            true => browser.offset.saturating_sub(entries),
+            false => browser.offset.saturating_add(entries).min(last_top),
+        };
+        browser.follows = false;
+        self.row_hits.clear();
     }
 
     pub fn pan(&mut self, delta: i32) {
@@ -2146,11 +2176,7 @@ impl PeerManager {
                     } else {
                         -WHEEL_STEP
                     };
-                    if self.list_area.contains(position) {
-                        self.step(-(delta.signum() as isize));
-                    } else {
-                        self.reader_mut().document.scroll(delta);
-                    }
+                    self.scroll_at(position, delta);
                 }
             }
             return PeerManagerAction::Consumed;
@@ -2427,7 +2453,9 @@ impl PeerManager {
             .iter()
             .position(|(id, _, _)| Some(id) == selected.as_ref());
         let browser = self.browser_mut();
-        if let Some(index) = selected_index {
+        if browser.follows
+            && let Some(index) = selected_index
+        {
             if index < browser.offset {
                 browser.offset = index;
             }
@@ -3287,6 +3315,8 @@ mod tests {
     const HEIGHT: u16 = 40;
     const SHORT: u16 = 24;
     const MANY_ROWS: usize = 100;
+    const MANY_PEERS: usize = 40;
+    const SELECTION_REVEALED: &str = "a key that moves the selection scrolls the list back to it";
     const TEST_RENDER: &str = "test backend renders";
     const SELECTED_REVIEW: &str = "review panel exists";
     const POLICY_DRAFT: &str = "policy draft exists";
@@ -3524,6 +3554,10 @@ mod tests {
             row: area.y,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    fn over_detail(manager: &PeerManager) -> Position {
+        Position::new(manager.detail_area.x, manager.detail_area.y)
     }
 
     fn draw(manager: &mut PeerManager, width: u16, height: u16) -> String {
@@ -3800,6 +3834,32 @@ mod tests {
     }
 
     #[test]
+    fn the_wheel_over_the_list_scrolls_it_and_keeps_the_selection() {
+        let mut manager = manager(PeerView::Sessions);
+        manager.set_sessions(Ok((0..MANY_PEERS)
+            .map(|index| peer(&format!("{FIRST_TARGET}-{index}")))
+            .collect()));
+        draw(&mut manager, WIDE, HEIGHT);
+        let selected = manager.session_browser.selected.clone();
+        let over_list = Position::new(manager.list_area.x, manager.list_area.y);
+
+        manager.scroll_at(over_list, -WHEEL_STEP);
+        let scrolled = manager.session_browser.offset;
+        draw(&mut manager, WIDE, HEIGHT);
+
+        assert!(scrolled > 0);
+        assert_eq!(manager.session_browser.offset, scrolled);
+        assert_eq!(manager.session_browser.selected, selected);
+        manager.handle_key(press(KeyCode::Down));
+        draw(&mut manager, WIDE, HEIGHT);
+        let moved = manager.session_browser.selected.as_ref();
+        assert!(
+            manager.row_hits.iter().any(|(_, id)| Some(id) == moved),
+            "{SELECTION_REVEALED}"
+        );
+    }
+
+    #[test]
     fn metadata_changes_preserve_complete_literal_body_scroll_and_selection() {
         let mut manager = reviewing();
         let body = (0..MANY_ROWS)
@@ -3809,7 +3869,7 @@ mod tests {
         manager.held_reader.set(body.clone());
         draw(&mut manager, WIDE, HEIGHT);
         manager.held_reader.document.select_all();
-        manager.scroll(-20);
+        manager.scroll_at(over_detail(&manager), -20);
         let top = manager.held_reader.document.top();
         let mut current = held(FIRST_MESSAGE);
         current.reason = BLOCKED_REASON.to_owned();
@@ -4428,7 +4488,7 @@ mod tests {
         );
         manager.handle_key(press(KeyCode::Tab));
         draw(&mut manager, WIDE, HEIGHT);
-        manager.scroll(scrolled);
+        manager.scroll_at(over_detail(&manager), scrolled);
         draw(&mut manager, WIDE, HEIGHT);
         let before = shown(&manager);
         manager.handle_key(press(KeyCode::Char('o')));

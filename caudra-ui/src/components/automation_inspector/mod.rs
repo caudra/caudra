@@ -563,7 +563,10 @@ pub struct AutomationInspector {
     folded: HashMap<FoldScope, HashSet<usize>>,
     scroll: ModalScroll,
     scrollbar: Scrollbar,
-    list_offset: u16,
+    list_scroll: ModalScroll,
+    /// The list keeps the selection in view until the wheel scrolls it away.
+    /// Moving the selection hands it back.
+    list_follows: bool,
     popup: Rect,
     list_area: Rect,
     body_area: Rect,
@@ -603,7 +606,8 @@ impl AutomationInspector {
             folded: HashMap::new(),
             scroll: ModalScroll::new_top(),
             scrollbar: Scrollbar::default(),
-            list_offset: 0,
+            list_scroll: ModalScroll::new_top(),
+            list_follows: true,
             popup: Rect::default(),
             list_area: Rect::default(),
             body_area: Rect::default(),
@@ -645,7 +649,8 @@ impl AutomationInspector {
         self.cursor = 0;
         self.folded.clear();
         self.scroll = ModalScroll::new_top();
-        self.list_offset = 0;
+        self.list_scroll = ModalScroll::new_top();
+        self.list_follows = true;
         self.pointer = None;
         self.reveal_cursor = false;
         self.footer_hits.reset();
@@ -886,19 +891,18 @@ impl AutomationInspector {
         Some(self.settle_selection())
     }
 
-    /// The wheel over the list walks the selection; anywhere else it scrolls
-    /// what is under it.
-    pub fn scroll_at(&mut self, pos: Position, delta: i32) -> AutomationAction {
+    /// The wheel scrolls whatever is under the pointer. Over the list it moves
+    /// the view and leaves the selection where it is.
+    pub fn scroll_at(&mut self, pos: Position, delta: i32) {
         if let Some(editor) = &mut self.editor {
             editor.scroll(delta);
-            return AutomationAction::None;
+        } else if self.list_area.contains(pos) {
+            self.list_scroll.scroll(delta);
+            self.list_follows = false;
+        } else {
+            self.scroll.scroll(delta);
+            self.reveal_cursor = false;
         }
-        if self.list_area.contains(pos) {
-            return self.step_selection(-delta.signum() as isize);
-        }
-        self.scroll.scroll(delta);
-        self.reveal_cursor = false;
-        AutomationAction::None
     }
 
     /// `runs` is the session's workflow mirror, which Enter opens a started run from.
@@ -1045,7 +1049,7 @@ impl AutomationInspector {
                 return AutomationAction::None;
             }
             self.pane = Pane::List;
-            let row = event.row - self.list_area.y + self.list_offset;
+            let row = event.row - self.list_area.y + self.list_scroll.offset();
             let hit = self
                 .list_rows
                 .iter()
@@ -1228,6 +1232,7 @@ impl AutomationInspector {
     }
 
     fn step_selection(&mut self, delta: isize) -> AutomationAction {
+        self.list_follows = true;
         let selections: Vec<Selection> =
             list::entries(&self.state, &self.sessions, &self.filter.text())
                 .iter()
@@ -1252,6 +1257,7 @@ impl AutomationInspector {
             return AutomationAction::None;
         }
         self.selection = selection;
+        self.list_follows = true;
         self.detail = None;
         self.read_at = None;
         self.trace = None;
@@ -1953,7 +1959,7 @@ impl AutomationInspector {
         let hovered = self
             .pointer
             .filter(|at| area.contains(*at))
-            .map(|at| at.y - area.y + self.list_offset);
+            .map(|at| at.y - area.y + self.list_scroll.offset());
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(entries.len() * 2);
         let mut rows = Vec::with_capacity(entries.len());
         let mut selected_row = None;
@@ -1993,15 +1999,16 @@ impl AutomationInspector {
         }
         self.list_rows = rows;
         let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-        if let Some(row) = selected_row {
-            if row < self.list_offset {
-                self.list_offset = row;
-            } else if row >= self.list_offset.saturating_add(area.height) {
-                self.list_offset = row.saturating_sub(area.height.saturating_sub(1));
-            }
+        self.list_scroll.update_dimensions(total, area.height);
+        if self.list_follows
+            && let Some(row) = selected_row
+        {
+            self.list_scroll.reveal_and_hold(row, 1);
         }
-        self.list_offset = self.list_offset.min(total.saturating_sub(area.height));
-        frame.render_widget(Paragraph::new(lines).scroll((self.list_offset, 0)), area);
+        frame.render_widget(
+            Paragraph::new(lines).scroll((self.list_scroll.offset(), 0)),
+            area,
+        );
     }
 
     fn render_tabs(&mut self, frame: &mut Frame, area: Rect) {
@@ -2382,6 +2389,8 @@ mod tests {
     const PROMPT_DRAWN: &str = "the confirmation names the digest it trusts";
     const REQUIRED_ARGS_TO_FILL: &str = "a required arg starts as null for the reader to fill in";
     const ROW_DRAWN: &str = "the list drew the row";
+    const SELECTION_REVEALED: &str = "a key that moves the selection scrolls the list back to it";
+    const MANY_SCRIPTS: usize = 60;
     const COMMAND_DRAWN: &str = "the footer drew the command";
     const HOVER_PLACES_THE_CURSOR: &str = "the pointer puts the cursor on the row under it";
     const UNFOCUSED_PASTE_PASSES: &str = "a paste with nothing focused is the app's";
@@ -2554,6 +2563,16 @@ mod tests {
                 outbox_item(SEQ + 1, None),
             ],
             recent: recent(),
+            ..AutomationState::default()
+        }
+    }
+
+    /// More scripts than the list has rows for.
+    fn long_catalog() -> AutomationState {
+        AutomationState {
+            automations: (0..MANY_SCRIPTS)
+                .map(|index| script(&format!("{SCRIPT}-{index}"), Availability::Available))
+                .collect(),
             ..AutomationState::default()
         }
     }
@@ -3019,7 +3038,7 @@ mod tests {
             .expect(ROW_DRAWN);
         Position::new(
             inspector.list_area.x,
-            inspector.list_area.y + row - inspector.list_offset,
+            inspector.list_area.y + row - inspector.list_scroll.offset(),
         )
     }
 
@@ -3523,13 +3542,31 @@ mod tests {
     }
 
     #[test]
-    fn the_wheel_over_the_list_walks_the_selection() {
-        let mut inspector = opened(catalog(), None);
-        draw(&mut inspector, &mut terminal());
+    fn the_wheel_over_the_list_scrolls_it_and_keeps_the_selection() {
+        let mut terminal = terminal();
+        let mut inspector = opened(long_catalog(), None);
+        draw(&mut inspector, &mut terminal);
+        let over_list = list_row(&inspector, &Selection::Session);
 
-        let action = inspector.scroll_at(list_row(&inspector, &Selection::Session), WHEEL_DOWN);
+        inspector.scroll_at(over_list, -i32::from(u16::MAX));
+        let scrolled = inspector.list_scroll.offset();
+        draw(&mut inspector, &mut terminal);
 
-        assert_eq!(action, AutomationAction::Request(inspect(SCRIPT)));
+        assert!(scrolled > 0);
+        assert_eq!(inspector.list_scroll.offset(), scrolled);
+        assert_eq!(inspector.selection, Selection::Session);
+        let _ = press(&mut inspector, KeyCode::Down);
+        draw(&mut inspector, &mut terminal);
+        let (selected_row, _) = inspector
+            .list_rows
+            .iter()
+            .find(|(_, listed)| *listed == inspector.selection)
+            .expect(ROW_DRAWN);
+        let top = inspector.list_scroll.offset();
+        assert!(
+            (top..top + inspector.list_area.height).contains(selected_row),
+            "{SELECTION_REVEALED}"
+        );
     }
 
     #[test]
@@ -3603,10 +3640,7 @@ mod tests {
 
         assert!(inspector.contains(outside), "{EDIT_KEEPS_PRESSES}");
         assert_eq!(click(&mut inspector, outside), AutomationAction::None);
-        assert_eq!(
-            inspector.scroll_at(outside, WHEEL_DOWN),
-            AutomationAction::None
-        );
+        inspector.scroll_at(outside, WHEEL_DOWN);
         assert_eq!(inspector.handle_paste(NOTE), Some(AutomationAction::None));
         let text = inspector.editor.as_ref().expect(EDITOR_OPENS).text();
         assert!(text.contains(NOTE), "{text}");

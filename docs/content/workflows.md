@@ -60,7 +60,7 @@ Workflow agents are ordinary subagents. They ask for permission through the norm
 
 ## The inspector
 
-`/workflow` (or `/workflow runs`, or the leader key followed by `k`) opens the inspector. Clicking a run card or the status bar chip opens it on that run. The left pane lists runs grouped as running, waiting, finished, and earlier sessions. Each row names the run, then its phase or the session that ran it, and holds its clock at the right edge. Type `/` to filter by name or session title. The pointer marks whatever it rests on: a run row or a section tab marks itself without acting, and a row inside a section takes the cursor, so a single click opens it. The right pane has four sections, reached with Tab, Shift+Tab, or the digits `1` to `4`:
+`/workflow` (or `/workflow runs`, or the leader key followed by `k`) opens the inspector. Clicking a run card or the status bar chip opens it on that run. The left pane lists runs grouped as running, waiting, finished, and earlier sessions. Each row names the run, then its phase or the session that ran it, and holds its clock at the right edge. Type `/` to filter by name or session title. The pointer marks whatever it rests on: a run row or a section tab marks itself without acting, and a row inside a section takes the cursor, so a single click opens it. The wheel scrolls the pane under the pointer and leaves the selected run where it is. The right pane has four sections, reached with Tab, Shift+Tab, or the digits `1` to `4`:
 
 | Section | Contents |
 |---------|----------|

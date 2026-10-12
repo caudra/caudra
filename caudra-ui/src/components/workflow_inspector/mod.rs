@@ -376,7 +376,10 @@ pub struct WorkflowInspector {
     expanded_call: Option<u64>,
     scroll: ModalScroll,
     scrollbar: Scrollbar,
-    list_offset: u16,
+    list_scroll: ModalScroll,
+    /// The list keeps the selection in view until the wheel scrolls it away.
+    /// Moving the selection hands it back.
+    list_follows: bool,
     popup: Rect,
     list_area: Rect,
     tabs_area: Rect,
@@ -466,7 +469,8 @@ impl WorkflowInspector {
             expanded_call: None,
             scroll: Section::Overview.scroll(),
             scrollbar: Scrollbar::default(),
-            list_offset: 0,
+            list_scroll: ModalScroll::new_top(),
+            list_follows: true,
             popup: Rect::default(),
             list_area: Rect::default(),
             tabs_area: Rect::default(),
@@ -500,6 +504,7 @@ impl WorkflowInspector {
         self.footer_hits.reset();
         self.pointer = None;
         self.reveal_cursor = false;
+        self.list_follows = true;
         let wanted = preferred
             .filter(|id| self.session_run(id).is_some())
             .map(str::to_owned);
@@ -643,15 +648,16 @@ impl WorkflowInspector {
         self.live.values().map(HashMap::len).sum()
     }
 
-    /// The wheel over the list walks the selection; over the body it scrolls
-    /// the section.
-    pub fn scroll_at(&mut self, pos: Position, delta: i32) -> InspectorAction {
+    /// The wheel scrolls whichever pane is under the pointer. Over the list it
+    /// moves the view and leaves the selection where it is.
+    pub fn scroll_at(&mut self, pos: Position, delta: i32) {
         if self.list_area.contains(pos) {
-            return self.step_selection(-delta.signum() as isize);
+            self.list_scroll.scroll(delta);
+            self.list_follows = false;
+        } else {
+            self.scroll.scroll(delta);
+            self.reveal_cursor = false;
         }
-        self.scroll.scroll(delta);
-        self.reveal_cursor = false;
-        InspectorAction::Consumed
     }
 
     /// A paste lands in the filter when it has the focus. `None` when the
@@ -824,7 +830,7 @@ impl WorkflowInspector {
                 return InspectorAction::Consumed;
             }
             self.pane = Pane::Runs;
-            let row = event.row - self.list_area.y + self.list_offset;
+            let row = event.row - self.list_area.y + self.list_scroll.offset();
             let hit = self
                 .list_rows
                 .iter()
@@ -913,6 +919,7 @@ impl WorkflowInspector {
     }
 
     fn step_selection(&mut self, delta: isize) -> InspectorAction {
+        self.list_follows = true;
         let ids: Vec<String> = self
             .entries()
             .iter()
@@ -936,6 +943,7 @@ impl WorkflowInspector {
             return InspectorAction::Consumed;
         }
         self.selected = run_id;
+        self.list_follows = true;
         self.detail = None;
         self.expanded_call = None;
         self.bodies.clear();
@@ -1680,7 +1688,7 @@ impl WorkflowInspector {
         let hovered = self
             .pointer
             .filter(|at| area.contains(*at))
-            .map(|at| at.y - area.y + self.list_offset);
+            .map(|at| at.y - area.y + self.list_scroll.offset());
         for entry in &entries {
             if group != Some(entry.group) {
                 group = Some(entry.group);
@@ -1713,16 +1721,16 @@ impl WorkflowInspector {
         }
         self.list_rows = rows;
         let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-        let max_offset = total.saturating_sub(area.height);
-        if let Some(row) = selected_row {
-            if row < self.list_offset {
-                self.list_offset = row;
-            } else if row >= self.list_offset.saturating_add(area.height) {
-                self.list_offset = row.saturating_sub(area.height.saturating_sub(1));
-            }
+        self.list_scroll.update_dimensions(total, area.height);
+        if self.list_follows
+            && let Some(row) = selected_row
+        {
+            self.list_scroll.reveal_and_hold(row, 1);
         }
-        self.list_offset = self.list_offset.min(max_offset);
-        frame.render_widget(Paragraph::new(lines).scroll((self.list_offset, 0)), area);
+        frame.render_widget(
+            Paragraph::new(lines).scroll((self.list_scroll.offset(), 0)),
+            area,
+        );
     }
 
     fn render_tabs(&mut self, frame: &mut Frame, area: Rect) {
@@ -2677,6 +2685,8 @@ mod tests {
     const CALL_ELAPSED: &str = "12s";
     const COLUMNS_LINE_UP: &str = "every timeline row must end its duration in the same column";
     const WHEEL_ROWS: i32 = 3;
+    const MANY_RUNS: usize = 40;
+    const SELECTION_REVEALED: &str = "a key that moves the selection scrolls the list back to it";
     const SCROLL_STICKS: &str = "a scrolled section must stay where the scroll put it";
     const TAIL_IS_FOLLOWED: &str = "a live timeline must keep showing its newest row";
     const POSITION_HINT: &str = "line 1/";
@@ -2991,7 +3001,7 @@ mod tests {
             .find(|(_, id)| id == run_id)
             .map(|(row, _)| *row)
             .expect(NO_SUCH_ROW);
-        inspector.list_area.y + row - inspector.list_offset
+        inspector.list_area.y + row - inspector.list_scroll.offset()
     }
 
     #[test]
@@ -3657,10 +3667,45 @@ mod tests {
         let before = inspector.scroll.offset();
         let over_body = Position::new(inspector.body_area.x, inspector.body_area.y);
 
-        let _ = inspector.scroll_at(over_body, -WHEEL_ROWS);
+        inspector.scroll_at(over_body, -WHEEL_ROWS);
         draw(&mut inspector, &mut terminal);
 
         assert!(inspector.scroll.offset() > before, "{SCROLL_STICKS}");
+    }
+
+    #[test]
+    fn the_wheel_over_the_list_scrolls_it_and_keeps_the_selection() {
+        let mut terminal = terminal();
+        let mut inspector = open_with(
+            (0..MANY_RUNS)
+                .map(|index| {
+                    run(
+                        &format!("{RUN_ID}-{index}"),
+                        RunStatus::Completed,
+                        Vec::new(),
+                    )
+                })
+                .collect(),
+        );
+        draw(&mut inspector, &mut terminal);
+        let selected = inspector.selected().map(str::to_owned).expect(NO_SUCH_ROW);
+        let over_list = Position::new(inspector.list_area.x, inspector.list_area.y);
+
+        inspector.scroll_at(over_list, -WHEEL_ROWS);
+        let scrolled = inspector.list_scroll.offset();
+        draw(&mut inspector, &mut terminal);
+
+        assert!(scrolled > 0, "{SCROLL_STICKS}");
+        assert_eq!(inspector.list_scroll.offset(), scrolled, "{SCROLL_STICKS}");
+        assert_eq!(inspector.selected(), Some(selected.as_str()));
+        let _ = inspector.handle_key(key_event(KeyCode::Down));
+        draw(&mut inspector, &mut terminal);
+        let moved = inspector.selected().map(str::to_owned).expect(NO_SUCH_ROW);
+        let row = screen_row_of(&inspector, &moved);
+        assert!(
+            (inspector.list_area.y..inspector.list_area.bottom()).contains(&row),
+            "{SELECTION_REVEALED}"
+        );
     }
 
     /// The section follows its tail, so the cursor is a place in the list
@@ -3708,7 +3753,7 @@ mod tests {
 
     fn scroll_by_wheel(inspector: &mut WorkflowInspector) {
         let over_body = Position::new(inspector.body_area.x, inspector.body_area.y);
-        let _ = inspector.scroll_at(over_body, WHEEL_ROWS);
+        inspector.scroll_at(over_body, WHEEL_ROWS);
     }
 
     fn scroll_by_bar(inspector: &mut WorkflowInspector) {

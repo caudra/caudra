@@ -1933,7 +1933,7 @@ impl App {
         }
         if self.peer_manager.is_open() {
             if self.peer_manager.contains(pos) {
-                self.peer_manager.scroll(delta);
+                self.peer_manager.scroll_at(pos, delta);
             }
             return None;
         }
@@ -2041,17 +2041,15 @@ impl App {
             self.memory_inspector.scroll_at(pos, delta);
             return None;
         }
-        // Not `try_picker!`: the wheel walks the run list or scrolls the
-        // section depending on which pane it is over.
+        // Not `try_picker!`: the wheel scrolls the run list or the section,
+        // whichever pane it is over.
         if self.workflow_inspector.is_open() {
-            let action = self.workflow_inspector.scroll_at(pos, delta);
-            self.handle_workflow_inspector_action(action);
+            self.workflow_inspector.scroll_at(pos, delta);
             return None;
         }
         try_picker!(self.workflow_catalog_picker);
         if self.automation_inspector.is_open() {
-            let action = self.automation_inspector.scroll_at(pos, delta);
-            self.handle_automation_action(action);
+            self.automation_inspector.scroll_at(pos, delta);
             return None;
         }
         // Not `try_picker!`: scrolling the task list previews the task behind
