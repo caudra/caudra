@@ -20,8 +20,10 @@ use std::{
 };
 use tokio::process::{Child, Command};
 
+#[cfg(unix)]
+use workcell_tool_contract::shell_env::BASH_EXECUTABLE_ENV;
 use workcell_tool_contract::shell_env::{
-    BASE_ALLOWLIST, BASH_EXECUTABLE_ENV, FORCED_VARIABLES, is_shell_startup_variable,
+    BASE_ALLOWLIST, FORCED_VARIABLES, is_shell_startup_variable,
 };
 
 use crate::bash::BashContextAssumptions;
