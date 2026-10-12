@@ -133,6 +133,13 @@ pub struct OpenedWorkspace {
     pub already_open: bool,
 }
 
+/// A tab Herdr opened, and the pane it starts with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenedTab {
+    pub tab_id: String,
+    pub pane_id: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenedWorktree {
     pub workspace: OpenedWorkspace,
@@ -148,6 +155,12 @@ struct Opened {
     worktree: Option<HerdrWorktree>,
     #[serde(default)]
     already_open: bool,
+}
+
+#[derive(Deserialize)]
+struct TabOpened {
+    tab: TabRef,
+    root_pane: PaneRef,
 }
 
 #[derive(Deserialize)]
@@ -261,6 +274,20 @@ impl HerdrCli {
             .0)
     }
 
+    /// Opens a tab in `cwd` in `workspace_id`, or in the active workspace,
+    /// and focuses it.
+    pub fn tab_create(
+        &self,
+        workspace_id: Option<&str>,
+        cwd: &Path,
+    ) -> Result<OpenedTab, HostError> {
+        let opened: TabOpened = self.call(&tab_create_args(workspace_id, cwd), LAYOUT_TIMEOUT)?;
+        Ok(OpenedTab {
+            tab_id: opened.tab.tab_id,
+            pane_id: opened.root_pane.pane_id,
+        })
+    }
+
     /// Opens a pane in `cwd` beside the focused one of `workspace_id`, and
     /// focuses it.
     pub fn split_workspace(&self, workspace_id: &str, cwd: &Path) -> Result<String, HostError> {
@@ -364,6 +391,15 @@ fn workspace_create_args(cwd: &Path) -> Vec<OsString> {
         cwd.as_os_str(),
         "--focus".as_ref(),
     ])
+}
+
+fn tab_create_args(workspace_id: Option<&str>, cwd: &Path) -> Vec<OsString> {
+    let mut args = argv(["tab".as_ref(), "create".as_ref()]);
+    if let Some(workspace_id) = workspace_id {
+        args.extend(["--workspace".into(), workspace_id.into()]);
+    }
+    args.extend(["--cwd".into(), cwd.into(), "--focus".into()]);
+    args
 }
 
 fn pane_list_args(workspace_id: &str) -> Vec<OsString> {
@@ -604,6 +640,41 @@ mod tests {
         assert_eq!(
             strings(rename_args(kind, id, SPACED_LABEL)),
             [kind, "rename", id, SPACED_LABEL]
+        );
+    }
+
+    #[test_case(Some(WORKSPACE), &["--workspace", WORKSPACE] ; "in_this_workspace")]
+    #[test_case(None, &[] ; "in_the_active_workspace")]
+    fn a_new_tab_opens_in_the_directory_and_takes_focus(
+        workspace: Option<&str>,
+        targeted: &[&str],
+    ) {
+        let mut expected = vec!["tab", "create"];
+        expected.extend(targeted);
+        expected.extend(["--cwd", MAIN_ROOT, "--focus"]);
+
+        assert_eq!(
+            strings(tab_create_args(workspace, Path::new(MAIN_ROOT))),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_created_tab_names_its_root_pane() {
+        let result = serde_json::json!({
+            "type": "tab_created",
+            "tab": {"tab_id": TAB, "workspace_id": WORKSPACE, "number": 2, "label": "2", "focused": true},
+            "root_pane": {"pane_id": ROOT_PANE, "tab_id": TAB, "workspace_id": WORKSPACE, "focused": true},
+        });
+
+        let opened = serde_json::from_value::<TabOpened>(result).unwrap();
+
+        assert_eq!(
+            (
+                opened.tab.tab_id.as_str(),
+                opened.root_pane.pane_id.as_str()
+            ),
+            (TAB, ROOT_PANE)
         );
     }
 

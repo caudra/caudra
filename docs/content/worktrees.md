@@ -111,7 +111,7 @@ Caudra detects Herdr from the environment Herdr gives every process it starts in
 - the title of the focused session, the model and the context usage, shown in the Herdr sidebar,
 - the command that resumes the focused session, `caudra --session <id>`.
 
-After a Herdr restart, Herdr runs that command in the restored pane, so the focused tab comes back. Other tabs stay available in `/sessions`. See [CLI](/docs/cli/) for how reporting works and [Notifications](/docs/notifications/#herdr) for how notifications change inside Herdr.
+After a Herdr restart, Herdr runs that command in the restored pane, so the focused tab comes back. Other tabs stay available in `/sessions`. A fork opens in a new Herdr tab with a Caudra of its own, as [Forks in Herdr and Orca](/docs/sessions/#forks-in-herdr-and-orca) describes. See [CLI](/docs/cli/) for how reporting works and [Notifications](/docs/notifications/#herdr) for how notifications change inside Herdr.
 
 Native Herdr reporting takes precedence over [OSC 7501 pane status](/docs/notifications/#persistent-pane-status), so Caudra does not probe for or send OSC 7501 while the native reporter is active.
 
@@ -119,4 +119,4 @@ Native Herdr reporting takes precedence over [OSC 7501 pane status](/docs/notifi
 
 Caudra detects [Orca](https://github.com/stablyai/orca) from the variables Orca sets in each terminal, `ORCA_PANE_KEY` or `ORCA_TERMINAL_HANDLE`. Herdr running inside Orca counts as Herdr. Besides worktrees, Caudra reports the agent state, the model and the label of the blocking prompt. See [Notifications](/docs/notifications/#orca) for what the report contains and how notifications change inside Orca.
 
-Orca cannot restore a Caudra terminal after a restart. Your sessions stay available in `/sessions` and through `caudra --session <id>`.
+Orca cannot restore a Caudra terminal after a restart. Your sessions stay available in `/sessions` and through `caudra --session <id>`. A fork opens in a new terminal in the current worktree, as [Forks in Herdr and Orca](/docs/sessions/#forks-in-herdr-and-orca) describes.

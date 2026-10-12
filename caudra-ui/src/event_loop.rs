@@ -16,10 +16,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod config_reload;
+mod fork_tab;
 mod peers;
 
 use config_reload::ConfigReload;
 pub use config_reload::SettingsReloader;
+use fork_tab::ForkLaunch;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use caudra_agent::peers::PeerHost;
@@ -283,6 +285,9 @@ pub struct EventLoopParams {
     /// loop.
     pub host_reporter: Option<ReporterHandle>,
     pub worktrees: Backend,
+    /// The terminal host's tabs, which forks open in whatever `[worktrees]`
+    /// says.
+    pub host_workspaces: Option<Arc<dyn Workspaces>>,
     pub workspace_session: Option<caudra_workspace::WorkspaceSession>,
     pub remote_project_context:
         Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
@@ -1507,6 +1512,7 @@ pub(crate) struct EventLoop<'t> {
     title_tx: flume::Sender<GeneratedTitle>,
     ui_action_rx: flume::Receiver<UiAction>,
     worktrees: Backend,
+    host_workspaces: Option<Arc<dyn Workspaces>>,
     _model_fetch_task: smol::Task<()>,
     relocation: Option<PendingRelocation>,
     sandbox: Option<SandboxAttachment>,
@@ -1752,6 +1758,7 @@ impl<'t> EventLoop<'t> {
             prompt_profile_override,
             host_reporter,
             worktrees,
+            host_workspaces,
             workspace_session,
             remote_project_context: _,
             local_documents,
@@ -1931,6 +1938,7 @@ impl<'t> EventLoop<'t> {
             title_tx,
             ui_action_rx,
             worktrees,
+            host_workspaces,
             _model_fetch_task: bg.task,
             relocation: None,
             sandbox: None,
@@ -4073,6 +4081,16 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    /// The host a fork from the session at `idx` opens a tab in, when a
+    /// Caudra there can load the fork.
+    fn fork_host(&self, idx: usize, fork: &AppSession) -> Option<&dyn Workspaces> {
+        let remote = self.sessions[idx].app.workspace_session.is_some();
+        let ephemeral = self.ctx.storage.is_ephemeral();
+        self.host_workspaces
+            .as_deref()
+            .filter(|_| fork_tab::opens_in_host_tab(fork, remote, ephemeral))
+    }
+
     fn open_worktrees(&mut self, idx: usize, view: WorktreeView) {
         let overview = self
             .relocation_available()
@@ -4314,14 +4332,37 @@ impl<'t> EventLoop<'t> {
                 if let Some(draft) = draft {
                     install_fork_draft(&mut session, draft);
                 }
-                let runtime = match self.ctx.spawn_runtime(
-                    SessionTab {
+                let id = session.id;
+                let (tab, host_warning) = match self.fork_host(idx, &session) {
+                    Some(host) => match fork_tab::open_in_host_tab(
+                        host,
+                        &self.ctx.storage_writer,
+                        &self.ctx.storage,
                         session,
                         lease,
-                        cursor: None,
+                    ) {
+                        ForkLaunch::Elsewhere(notice) => {
+                            if let Some(message) = fork_tab::joined([Some(notice), warning]) {
+                                self.sessions[idx].app.flash(message);
+                            }
+                            caudra_otel::emit::session_started(
+                                caudra_otel::emit::START_FORK,
+                                Some(&id.to_string()),
+                            );
+                            return;
+                        }
+                        ForkLaunch::Here(tab, host_warning) => (*tab, Some(host_warning)),
                     },
-                    Vec::new(),
-                ) {
+                    None => (
+                        SessionTab {
+                            session,
+                            lease,
+                            cursor: None,
+                        },
+                        None,
+                    ),
+                };
+                let runtime = match self.ctx.spawn_runtime(tab, Vec::new()) {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         self.sessions[idx].app.flash(error);
@@ -4329,9 +4370,8 @@ impl<'t> EventLoop<'t> {
                     }
                 };
                 let child = self.push_runtime(runtime);
-                let id = self.sessions[child].id();
-                if let Some(warning) = warning {
-                    self.sessions[child].app.flash(warning);
+                if let Some(message) = fork_tab::joined([host_warning, warning]) {
+                    self.sessions[child].app.flash(message);
                 }
                 self.sessions[child].app.checkpoint_now();
                 self.focused = child;

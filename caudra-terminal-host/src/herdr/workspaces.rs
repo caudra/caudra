@@ -82,6 +82,13 @@ impl Workspaces for HerdrWorkspaces {
                 tab: None,
             }),
             PaneSite::NewWorkspace(cwd) => cli.workspace_create(cwd).map(open_pane),
+            PaneSite::NewTab(cwd) => {
+                cli.tab_create(self.env.workspace_id.as_deref(), cwd)
+                    .map(|opened| HostPane::Open {
+                        pane: opened.pane_id,
+                        tab: Some(opened.tab_id),
+                    })
+            }
         }
     }
 

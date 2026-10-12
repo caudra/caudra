@@ -166,7 +166,7 @@ Click `⋮` in the gutter beside a message to open Message Actions. Right-clicki
 
 The menu offers:
 
-- **Fork here** creates and focuses a new session.
+- **Fork here** creates and focuses a new session. Inside Herdr or Orca it opens in a new tab there. See [Forks in Herdr and Orca](#forks-in-herdr-and-orca).
 - **Revert both** moves the conversation head and reverts the file changes recorded after the message.
 - **Revert conversation** moves only the conversation head.
 - **Revert files** reverts only the recorded file changes.
@@ -189,6 +189,14 @@ The child receives a new session ID and a title such as `Original title (fork #1
 Subtasks are different from user-created forks. They share the root conversation's permission rules. Resuming that root restores its rules, while `/new` starts a clean root.
 
 Forking does not restore files. The child uses the same working directory and sees its current contents. Use a revert action first when the workspace must match an older conversation point.
+
+### Forks in Herdr and Orca
+
+Inside a [Herdr](/docs/worktrees/#herdr-integration) pane or an [Orca](/docs/worktrees/#orca-integration) terminal, the child opens in a new tab of that host, which takes focus. Caudra saves the child and starts `caudra --session <id>` in the tab, so the child runs in a Caudra of its own. Herdr labels the tab with the child's title, and Orca titles the terminal with it. The parent stays open in the pane it was in.
+
+Remote and sandbox sessions, and sessions in an [ephemeral](#ephemeral-sessions) store, still open the child as a tab of the current Caudra, because a separate Caudra cannot load them. So does every fork outside Herdr and Orca. When the host cannot open the tab or start Caudra in it, the child opens in the current Caudra and a warning names the host's error.
+
+The new Caudra starts with only `--session` and the environment of the host's shell. Command-line options of the current process, such as `--model` or `--no-plugins`, do not carry over. Neither does a `CAUDRA_NAMESPACE` set for the current process alone, and the new Caudra then looks for the child in another store.
 
 ## Managed tool outputs
 

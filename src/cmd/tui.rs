@@ -1742,10 +1742,8 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 });
                 factory
             });
-        let worktrees = Backend::select(
-            &stack.config.worktrees,
-            terminal_host.as_ref().and_then(|host| host.workspaces()),
-        );
+        let host_workspaces = terminal_host.as_ref().and_then(|host| host.workspaces());
+        let worktrees = Backend::select(&stack.config.worktrees, host_workspaces.clone());
         let outcome = caudra_ui::run(
             caudra_ui::EventLoopParams {
                 model,
@@ -1814,6 +1812,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 host_reporter: host_reporter.as_ref().map(Reporter::handle),
                 peer_host: peer_host.clone(),
                 worktrees: worktrees.clone(),
+                host_workspaces,
                 workspace_session: workcell_runtime.workspace_session().cloned(),
                 remote_project_context: workcell_runtime.remote_project_context().cloned(),
                 local_documents: workcell_runtime.local_documents().cloned(),

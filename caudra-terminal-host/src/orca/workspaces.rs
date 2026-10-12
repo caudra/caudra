@@ -277,13 +277,23 @@ impl Workspaces for OrcaWorkspaces {
     }
 
     /// Orca opens a terminal only in a worktree, and only once it has a
-    /// command for it.
+    /// command for it. Each terminal is a tab of its own.
     fn pane(&self, site: PaneSite<'_>) -> Result<HostPane, HostError> {
         match site {
             PaneSite::Beside { location, cwd } => Ok(HostPane::Pending {
                 location: location.clone(),
                 cwd: cwd.to_path_buf(),
             }),
+            PaneSite::NewTab(cwd) => match &self.worktree_id {
+                Some(worktree_id) => Ok(HostPane::Pending {
+                    location: HostLocation(worktree_id.clone()),
+                    cwd: cwd.to_path_buf(),
+                }),
+                None => Err(HostError::UnknownRepository {
+                    host: HOST,
+                    path: cwd.to_path_buf(),
+                }),
+            },
             PaneSite::NewWorkspace(cwd) => Err(HostError::UnknownRepository {
                 host: HOST,
                 path: cwd.to_path_buf(),
@@ -584,6 +594,39 @@ mod tests {
                 location.0
             )]
         );
+    }
+
+    #[test]
+    fn a_new_tab_opens_a_terminal_in_this_worktree() {
+        let fixture = Fixture::new();
+        let orca = fixture.orca(&[(
+            "terminal create",
+            format!(r#"{{"ok":true,"result":{{"terminal":{{"handle":"{HANDLE}"}}}}}}"#),
+        )]);
+        let pane = orca.pane(PaneSite::NewTab(&fixture.main)).unwrap();
+
+        orca.run(&pane, COMMAND, Some(LABEL)).unwrap();
+
+        assert_eq!(
+            fixture.calls(),
+            [format!(
+                "terminal create --worktree id:{} --command {COMMAND} --title {LABEL} --focus --json",
+                fixture.id(&fixture.linked)
+            )]
+        );
+    }
+
+    #[test]
+    fn a_terminal_outside_a_worktree_opens_no_tab() {
+        let fixture = Fixture::new();
+        let mut orca = fixture.orca(&[]);
+        orca.worktree_id = None;
+
+        assert!(matches!(
+            orca.pane(PaneSite::NewTab(&fixture.main)),
+            Err(HostError::UnknownRepository { .. })
+        ));
+        assert!(fixture.calls().is_empty());
     }
 
     #[test]

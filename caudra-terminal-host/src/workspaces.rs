@@ -30,6 +30,9 @@ pub enum PaneSite<'a> {
     },
     /// In a workspace of its own, starting in the directory given.
     NewWorkspace(&'a Path),
+    /// In a tab of its own beside the one Caudra runs in, starting in the
+    /// directory given.
+    NewTab(&'a Path),
 }
 
 /// A checkout the host opened or focused.
