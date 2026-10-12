@@ -10,6 +10,7 @@ use std::num::{NonZeroU32, ParseIntError};
 use std::str::FromStr;
 use thiserror::Error;
 use url::Url;
+use workcell_tool_contract::shell_env::{EnvPatternError, ShellEnvironmentSelection};
 
 use crate::{ConfigField, ConfigValue};
 
@@ -78,6 +79,12 @@ pub enum SandboxError {
     },
     #[error("sandbox launch capability mismatch: {0}")]
     Capability(&'static str),
+    #[error("profile {profile} shell_env: {source}")]
+    ShellEnv {
+        profile: SandboxName,
+        #[source]
+        source: EnvPatternError,
+    },
 }
 
 fn field(field: &'static str, requirement: &'static str) -> SandboxError {
@@ -624,6 +631,8 @@ pub struct SandboxProfile {
     pub running_ttl_seconds: LeaseSeconds,
     #[serde(default)]
     pub on_exit: OnExit,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_env: Option<ShellEnvironmentSelection>,
 }
 
 fn persistent_default() -> bool {
@@ -731,7 +740,22 @@ impl SandboxProfile {
             env: None,
             description: "What happens to the sandbox when Caudra exits. `detach` is the only value",
         },
+        ConfigField {
+            name: "shell_env",
+            ty: "table",
+            default: ConfigValue::Varies("pass everything"),
+            min: None,
+            max: None,
+            env: None,
+            description: "Guest variables forwarded to shell commands in this sandbox, resolved inside the guest: pass takes names, NAME_* or *; set takes literal non-secret values. Workcell's own settings, Bash startup names, and proxies are never forwarded",
+        },
     ];
+
+    pub fn effective_shell_env(&self) -> ShellEnvironmentSelection {
+        self.shell_env
+            .clone()
+            .unwrap_or_else(ShellEnvironmentSelection::everything)
+    }
 
     pub fn resources(&self) -> Resources {
         Resources {
@@ -912,6 +936,14 @@ impl SandboxDraft {
             policy.normalize()?;
         }
         for (name, profile) in &draft.profiles {
+            if let Some(shell_env) = &profile.shell_env {
+                shell_env
+                    .validate()
+                    .map_err(|source| SandboxError::ShellEnv {
+                        profile: name.clone(),
+                        source,
+                    })?;
+            }
             for (kind, reference, exists) in [
                 (
                     RecordKind::Provider,
@@ -1350,8 +1382,12 @@ mod tests {
         SandboxOrigin, SandboxRecord, SavedSandboxes, TTL_CAPABILITY, TemplateCatalog,
         TemplateEntry, TlsMode, TransferPolicy,
     };
+    use std::collections::BTreeMap;
     use std::num::NonZeroU32;
     use test_case::test_case;
+    use workcell_tool_contract::shell_env::{
+        EnvPattern, EnvPatternError, ShellEnvironmentSelection,
+    };
 
     pub(super) const SAMPLE: &str = r#"# Client-owned launch defaults
 version = 1
@@ -1407,6 +1443,8 @@ running_ttl_seconds = 3600
     const TTL_LINE: &str = "running_ttl_seconds = 3600";
     const NO_EXPIRY_TTL_LINE: &str = "running_ttl_seconds = 0";
     const PROVIDER_TTL_CAP: u32 = 7200;
+    const SHELL_ENV_NAME: &str = "RUST_LOG";
+    const SHELL_ENV_VALUE: &str = "info";
 
     pub(super) fn name(value: &str) -> SandboxName {
         SandboxName::parse(value).unwrap()
@@ -1642,6 +1680,78 @@ running_ttl_seconds = 3600
             SandboxDraft::import(&SAMPLE.replace("version = 1", "version = 2")),
             Err(SandboxError::Version)
         );
+    }
+
+    #[test]
+    fn shell_env_defaults_to_everything_and_round_trips() {
+        let mut draft = draft();
+        let profile = draft.profiles.get_mut(&name(PROFILE)).unwrap();
+        assert_eq!(profile.shell_env, None);
+        assert_eq!(
+            profile.effective_shell_env(),
+            ShellEnvironmentSelection::everything()
+        );
+        let selection = ShellEnvironmentSelection {
+            pass: vec![EnvPattern::All, EnvPattern::parse("AWS_*").unwrap()],
+            set: BTreeMap::from([(SHELL_ENV_NAME.into(), SHELL_ENV_VALUE.into())]),
+        };
+        profile.shell_env = Some(selection.clone());
+        let imported = SandboxDraft::import(&draft.export().unwrap()).unwrap();
+        assert_eq!(imported, draft);
+        assert_eq!(
+            imported.profiles[&name(PROFILE)].effective_shell_env(),
+            selection
+        );
+        let section = format!(
+            "{TTL_LINE}\n\n[sandbox.profiles.dev.shell_env]\npass = [\"*\"]\nset = {{ {SHELL_ENV_NAME} = \"{SHELL_ENV_VALUE}\" }}"
+        );
+        assert_eq!(
+            SandboxDraft::import(&SAMPLE.replace(TTL_LINE, &section))
+                .unwrap()
+                .profiles[&name(PROFILE)]
+                .shell_env,
+            Some(ShellEnvironmentSelection {
+                pass: vec![EnvPattern::All],
+                set: BTreeMap::from([(SHELL_ENV_NAME.into(), SHELL_ENV_VALUE.into())]),
+            })
+        );
+    }
+
+    #[test_case("pass = ['BASH_*']", EnvPatternError::Reserved("BASH*".into()); "reserved_prefix")]
+    #[test_case("set = { IFS = 'x' }", EnvPatternError::Reserved("IFS".into()); "startup_name")]
+    #[test_case("set = { HTTPS_PROXY = 'x' }", EnvPatternError::Proxy("HTTPS_PROXY".into()); "proxy")]
+    #[test_case("set = { WORKCELL_ROOT = 'x' }", EnvPatternError::Server("WORKCELL_ROOT".into()); "server")]
+    #[test_case("set = { GITHUB_TOKEN = 'secret-canary-do-not-display' }", EnvPatternError::Secret("GITHUB_TOKEN".into()); "secret_name")]
+    #[test_case("set = { HOST = '{env:secret-canary-do-not-display}' }", EnvPatternError::Reference("HOST".into()); "reference")]
+    fn shell_env_refusals_name_the_variable_but_never_its_value(
+        source: &str,
+        expected: EnvPatternError,
+    ) {
+        let document = SAMPLE.replace(
+            TTL_LINE,
+            &format!("{TTL_LINE}\n\n[sandbox.profiles.dev.shell_env]\n{source}"),
+        );
+        let error = SandboxDraft::import(&document).unwrap_err();
+        assert_eq!(
+            error,
+            SandboxError::ShellEnv {
+                profile: name(PROFILE),
+                source: expected,
+            }
+        );
+        assert!(!format!("{error:?}: {error}").contains(CANARY));
+    }
+
+    #[test_case("pass = ['A*B']"; "invalid_pattern")]
+    #[test_case("pass = ['*']\nextra = 'secret-canary-do-not-display'"; "unknown_key")]
+    fn malformed_shell_env_is_a_redacted_parse_error(source: &str) {
+        let document = SAMPLE.replace(
+            TTL_LINE,
+            &format!("{TTL_LINE}\n\n[sandbox.profiles.dev.shell_env]\n{source}"),
+        );
+        let error = SandboxDraft::import(&document).unwrap_err();
+        assert!(matches!(error, SandboxError::Parse { .. }), "{error}");
+        assert!(!format!("{error:?}: {error}").contains(CANARY));
     }
 
     #[test_case("/etc/**")]

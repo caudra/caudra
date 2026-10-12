@@ -13,6 +13,21 @@ const BRAVE_API_KEY: &str = "BRAVE_API_KEY";
 const KAGI_API_KEY: &str = "KAGI_API_KEY";
 const SERPAPI_API_KEY: &str = "SERPAPI_API_KEY";
 const SERPAPI_ENGINE: &str = "SERPAPI_ENGINE";
+/// Every name web configuration may read, whichever backend is selected, so none reaches a
+/// forwarded shell environment even when the active backend never consulted it.
+pub const WEB_CONFIGURATION_VARIABLES: &[&str] = &[
+    BACKEND,
+    SEARXNG_URL,
+    SEARXNG_API_KEY,
+    SEARXNG_BEARER_TOKEN,
+    SEARXNG_USER,
+    SEARXNG_PASSWORD,
+    EXA_API_KEY,
+    BRAVE_API_KEY,
+    KAGI_API_KEY,
+    SERPAPI_API_KEY,
+    SERPAPI_ENGINE,
+];
 
 /// Resolve once at startup. Secret strings move directly into the web crate's
 /// redacting immutable configuration and are never retained here.

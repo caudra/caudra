@@ -11,6 +11,7 @@ pub(crate) mod context_modal;
 pub(crate) mod decisions_modal;
 pub(crate) mod docs_modal;
 pub(crate) mod document_view;
+pub(crate) mod env_modal;
 pub(crate) mod environment_card;
 pub(crate) mod file_picker;
 pub(crate) mod file_walk;

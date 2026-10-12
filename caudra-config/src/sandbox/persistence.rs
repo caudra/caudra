@@ -1,4 +1,7 @@
-use super::{MAX_SANDBOX_FILE_BYTES, SANDBOX_FILE, SandboxDraft, SandboxError, SavedSandboxes};
+use super::{
+    MAX_SANDBOX_FILE_BYTES, RecordKind, SANDBOX_FILE, SandboxDraft, SandboxError, SandboxName,
+    SavedSandboxes,
+};
 use crate::own_writes;
 use caudra_storage::paths;
 use caudra_storage::private_file::{FileRevision, PrivateFile, PrivateFileError};
@@ -6,6 +9,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use toml_edit::{DocumentMut, Item, Table};
+use workcell_tool_contract::shell_env::ShellEnvironmentSelection;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SandboxStoreError {
@@ -150,6 +154,26 @@ impl SandboxStore {
             document,
         })
     }
+
+    /// Replaces one saved profile's `shell_env`, where `None` restores the default of passing
+    /// everything, and commits only while the file still holds `baseline`.
+    pub fn save_profile_shell_env(
+        &self,
+        baseline: &LoadedSandboxes,
+        profile: &SandboxName,
+        shell_env: Option<ShellEnvironmentSelection>,
+    ) -> Result<LoadedSandboxes, SandboxStoreError> {
+        let mut draft = baseline.draft();
+        draft
+            .profiles
+            .get_mut(profile)
+            .ok_or_else(|| SandboxError::Missing {
+                kind: RecordKind::Profile,
+                name: profile.clone(),
+            })?
+            .shell_env = shell_env;
+        self.save(baseline, &draft)
+    }
 }
 
 fn merge_table(current: &mut Table, previous: &Table, desired: &Table) {
@@ -206,6 +230,7 @@ mod tests {
     };
     use crate::workcell::{WorkcellSelection, load_workcell_profiles_from, select_workcell};
     use caudra_storage::private_file::{FileRevision, PrivateFileError};
+    use std::collections::BTreeMap;
     use std::env;
     use std::fs::{self, Permissions};
     use std::io;
@@ -215,6 +240,7 @@ mod tests {
     use std::process::Command;
     use tempfile::{Builder, TempDir};
     use test_case::test_case;
+    use workcell_tool_contract::shell_env::{EnvPattern, ShellEnvironmentSelection};
 
     const FILE_MODE: u32 = 0o600;
     const DIRECTORY_MODE: u32 = 0o700;
@@ -372,6 +398,49 @@ mod tests {
         );
         let exported = committed.draft().export().unwrap();
         assert_eq!(SandboxDraft::import(&exported).unwrap(), draft);
+    }
+
+    #[test]
+    fn saves_one_profile_shell_env_and_keeps_the_rest_of_the_file() {
+        let temp = tempdir().unwrap();
+        write(temp.path(), SAMPLE);
+        let store = SandboxStore::from_config_dir(temp.path()).unwrap();
+        let loaded = store.load().unwrap();
+        let selection = ShellEnvironmentSelection {
+            pass: vec![EnvPattern::parse("CARGO_*").unwrap()],
+            set: BTreeMap::from([("RUST_LOG".into(), "info".into())]),
+        };
+        let saved = store
+            .save_profile_shell_env(&loaded, &name("dev"), Some(selection.clone()))
+            .unwrap();
+        let source = fs::read_to_string(temp.path().join(SANDBOX_FILE)).unwrap();
+        assert!(source.starts_with(SAMPLE.trim_end()), "{source}");
+        assert_eq!(
+            store.load().unwrap().draft().profiles[&name("dev")].shell_env,
+            Some(selection.clone())
+        );
+        assert_eq!(
+            store
+                .save_profile_shell_env(&loaded, &name("dev"), None)
+                .unwrap_err(),
+            SandboxStoreError::File(PrivateFileError::Conflict)
+        );
+        assert_eq!(
+            store
+                .save_profile_shell_env(&saved, &name("absent"), Some(selection))
+                .unwrap_err(),
+            SandboxStoreError::Configuration(SandboxError::Missing {
+                kind: RecordKind::Profile,
+                name: name("absent"),
+            })
+        );
+        store
+            .save_profile_shell_env(&saved, &name("dev"), None)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(temp.path().join(SANDBOX_FILE)).unwrap(),
+            SAMPLE
+        );
     }
 
     #[test_case(false; "comment_only_edit")]

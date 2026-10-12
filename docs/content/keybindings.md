@@ -247,6 +247,12 @@ Some pickers add extra bindings on top of the defaults:
 | Session Picker | `Ctrl+G` | Generate session title |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
 | Stash Picker | `Ctrl+D` | Delete stash entry (press twice) |
+| Environment | `Space` / `Enter` | Forward the selected variable to shell commands, or stop forwarding it |
+| Environment | `a` / `e` | Set a variable, or edit the selected set value |
+| Environment | `p` | Forward an exact name or a NAME_* prefix |
+| Environment | `d` | Delete the selected set value or pass pattern |
+| Environment | `v` | Reveal the selected value until the selection moves |
+| Environment | `Tab` | Switch between the Local and Sandbox tabs |
 | Peer Manager | `1` / `2` / `3` | Switch Sessions / Held messages / Messages outside filter editing |
 | Peer Manager | `/` | Edit the current view's filter; Enter keeps it, Esc clears it |
 | Peer Manager | `Tab` / `Shift+Tab` | Switch list/detail focus, or move between This session's controls |
@@ -357,7 +363,7 @@ Some of these contexts belong to an [experimental feature](/docs/configuration/#
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Session Picker, Session Relocation, Worktree Picker, Peer Manager, Workflow Inspector, Workflow Catalog, Automation Inspector, Decisions, Autopilot Panel
+- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Environment, Session Picker, Session Relocation, Worktree Picker, Peer Manager, Workflow Inspector, Workflow Catalog, Automation Inspector, Decisions, Autopilot Panel
 - **Workbench** is the base for: Workbench Explorer, Workbench Editor, Workbench Source Control, Workbench Search, Workbench Transfer
 
 ## Overriding Keybindings

@@ -7,6 +7,7 @@ mod native_redirect;
 mod pattern_analysis;
 mod read_only_shell;
 mod remote;
+mod shell_environment;
 mod shell_glob;
 mod shell_record_scope;
 mod transfer;
@@ -28,6 +29,8 @@ pub use remote::{
     RemotePreparedToolCall, RemoteToolResultEnvelope, RemoteWorkcellClient, RemoteWorkcellError,
 };
 use remote::{RemoteToolExecutionError, STALE_RESOURCE_CODE};
+pub use shell_environment::{GuestShellEnvironment, ShellEnvironmentTarget};
+use shell_environment::{forwarded_summary, local_shell_environment};
 pub use transfer::LocalTransferPublisher;
 pub use transfer_authorization::NativeTransferAuthorization;
 pub use transfer_inventory::{
@@ -47,7 +50,6 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use caudra_agent::herdr::PANE_ENVIRONMENT;
 use caudra_agent::patch;
 use caudra_agent::permissions::pattern_recognition::ObservationProvenance;
 use caudra_agent::permissions::{
@@ -235,6 +237,7 @@ const ENVIRONMENT_PACKAGES_LABEL: &str = "packages";
 const ENVIRONMENT_WORKSPACE_LABEL: &str = "workspace";
 const ENVIRONMENT_GROUPS_LABEL: &str = "groups";
 const ENVIRONMENT_INHERITANCE_LABEL: &str = "env";
+const ENVIRONMENT_FORWARDED_LABEL: &str = "forwarded";
 const ENVIRONMENT_LIST_SEPARATOR: &str = ", ";
 const ENVIRONMENT_NONE: &str = "none";
 /// A platform with no sudo to test says so; saying it on every Windows result
@@ -287,7 +290,6 @@ async fn code_graph_group(cwd: &Path) -> Result<Arc<CodeGraphToolGroup>, String>
 async fn shell_group(cwd: &Path) -> Result<ShellToolGroup, String> {
     ShellToolGroup::new_unconfined(cwd)
         .await
-        .map(|group| group.with_inherited_environment(PANE_ENVIRONMENT))
         .map_err(|error| error.to_string())
 }
 
@@ -1315,11 +1317,15 @@ impl WorkcellInvocation {
                 let cwd = project.clone();
                 let input = input.clone();
                 let output_filter = ctx.config.shell_output_filter;
+                let environment = local_shell_environment(&ctx.config.shell_env);
                 let (group, shell) = self
                     .host
                     .run(ctx, move |_| async move {
                         let groups = host.project_groups(cwd).await?;
-                        let group = groups.shell.with_output_filter(output_filter);
+                        let group = groups
+                            .shell
+                            .with_output_filter(output_filter)
+                            .with_environment(environment);
                         let prepared = group
                             .prepare(input)
                             .await
@@ -2498,7 +2504,7 @@ fn remote_result(
         | ToolKind::CodeExpand => {
             remote_code_graph_result(kind, structured_content, model_output.clone())
         }
-        ToolKind::Environment => environment_card(&structured_content)
+        ToolKind::Environment => environment_card(&structured_content, None)
             .map(|output| ToolExecResult::from(Ok::<_, String>(output))),
     };
     match parsed {
@@ -3378,7 +3384,9 @@ impl WorkcellInvocation {
                     })
                     .await
                 {
-                    Ok(Ok(result)) => environment_result(result),
+                    Ok(Ok(result)) => {
+                        environment_result(result, Some(forwarded_summary(&ctx.config.shell_env)))
+                    }
                     Ok(Err(error)) => failed(environment_error(error)),
                     Err(error) => failed(error),
                 }
@@ -4543,9 +4551,12 @@ fn code_outcome_result(
 /// same descriptor pretty-printed, which costs the model 168 lines to say what
 /// fourteen say, so the mapping renders the descriptor once and both the card
 /// and the model read that.
-fn environment_result(result: ExecutionEnvironmentResult) -> ToolExecResult {
+fn environment_result(
+    result: ExecutionEnvironmentResult,
+    forwarded: Option<String>,
+) -> ToolExecResult {
     serde_json::to_value(result.output)
-        .and_then(|value| environment_card(&value))
+        .and_then(|value| environment_card(&value, forwarded))
         .map_err(|error| format!("invalid Workcell environment result: {error}"))
         .into()
 }
@@ -4646,11 +4657,17 @@ struct EnvironmentGroups {
     code_graph: bool,
 }
 
-fn environment_card(value: &Value) -> Result<ToolOutput, serde_json::Error> {
+fn environment_card(
+    value: &Value,
+    forwarded: Option<String>,
+) -> Result<ToolOutput, serde_json::Error> {
     let output = EnvironmentPresentation::deserialize(value)?;
     let headline = environment_headline(&output.os);
     let summary = environment_summary(&output.execution);
-    let facts = environment_facts(&output);
+    let mut facts = environment_facts(&output);
+    if let Some(forwarded) = forwarded {
+        facts.push(fact(ENVIRONMENT_FORWARDED_LABEL, forwarded));
+    }
     Ok(ToolOutput::Environment {
         headline,
         summary,
@@ -4936,6 +4953,7 @@ mod tests {
     use caudra_agent::agent::tool_dispatch::{self, Emit};
     use caudra_agent::background::{BackgroundTasks, JobScope, ShellLive};
     use caudra_agent::cancel::CancelToken;
+    use caudra_agent::herdr::PANE_ENVIRONMENT;
     use caudra_agent::permissions::pattern_recognition::{CommandObservation, ShellEffectStatus};
     use caudra_agent::permissions::{
         AutoNote, COMMAND_EXACT_PREFIX, COMMAND_TEMPLATE_PREFIX, ComposedRow, PermissionAnswer,
@@ -4956,6 +4974,7 @@ mod tests {
         AgentMode, ContentBlock, Envelope, EventSender, History, Mention, Message, StoredSession,
         TaskCard, ToolFilter,
     };
+    use caudra_config::shell_env::ShellEnvConfig;
     use caudra_config::{
         AgentConfig, DefaultEffect, Effect, ExecutionMode, PermissionRule, PermissionsConfig,
         ToolKey,
@@ -5001,6 +5020,7 @@ mod tests {
         DEFAULT_TIMEOUT_MS as SHELL_DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_SECS as SHELL_MAX_TIMEOUT_SECS,
     };
     use workcell::web::{WebfetchFormat, WebfetchPdfAttachment, WebfetchPdfMode};
+    use workcell_tool_contract::shell_env::EnvPattern;
 
     const REQUIRED_CODE_WORKER: &str = "WORKCELL_REQUIRE_CODE_WORKER";
     const MISSING_REQUIRED_WORKER: &str = "the required worker was not embedded";
@@ -5075,6 +5095,15 @@ mod tests {
     const HERDR_PANE_CHILD: &str = "tests::herdr_pane_environment_child";
     const HERDR_PANE_CHILD_PASSED: &str = "the herdr pane environment reached the command";
     const PANE_CANARY_SUFFIX: &str = "-canary";
+    const SHELL_ENV_CHILD: &str = "tests::configured_shell_environment_child";
+    const SHELL_ENV_CHILD_PASSED: &str = "the configured shell environment reached the command";
+    const SHELL_ENV_EXACT: (&str, &str) = ("CAUDRA_SHELL_ENV_EXACT", "exact-canary");
+    const SHELL_ENV_PREFIX: &str = "CAUDRA_SHELL_ENV_PREFIX_";
+    const SHELL_ENV_PREFIXED: (&str, &str) = ("CAUDRA_SHELL_ENV_PREFIX_ONE", "prefixed-canary");
+    const SHELL_ENV_OVERRIDDEN: (&str, &str) = ("CAUDRA_SHELL_ENV_OVERRIDDEN", "host-canary");
+    const SHELL_ENV_CONFIGURED: &str = "configured-canary";
+    const SHELL_ENV_UNLISTED: (&str, &str) = ("CAUDRA_SHELL_ENV_UNLISTED", "unlisted-canary");
+    const SHELL_ENV_NO_COLOR: (&str, &str) = ("NO_COLOR", "1");
 
     async fn bounded_shell_test<T>(operation: impl Future<Output = T>) -> T {
         future::race(operation, async {
@@ -5730,10 +5759,13 @@ mod tests {
     fn remote_environment_card_matches_local_and_restores(populated: bool, is_error: bool) {
         let output = environment_fixture(populated);
         let structured_content = serde_json::to_value(&output).expect("serialized Workcell output");
-        let local = environment_result(ExecutionEnvironmentResult {
-            output,
-            model_text: REMOTE_ENVIRONMENT_MODEL_TEXT.into(),
-        });
+        let local = environment_result(
+            ExecutionEnvironmentResult {
+                output,
+                model_text: REMOTE_ENVIRONMENT_MODEL_TEXT.into(),
+            },
+            None,
+        );
         let remote = remote_result(
             ToolKind::Environment,
             &Input::Environment,
@@ -8341,6 +8373,79 @@ mod tests {
             .collect();
         assert_eq!(output.stdout.lines().collect::<Vec<_>>(), expected);
         println!("{HERDR_PANE_CHILD_PASSED}");
+    }
+
+    /// `[agent.shell_env]` forwards exact names and prefixes, lets `set` win,
+    /// and leaves every other host variable behind. A copy of this binary runs
+    /// the command, because setting variables in this process takes `unsafe`.
+    #[test]
+    fn shell_commands_see_the_configured_environment() {
+        let child = Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", SHELL_ENV_CHILD, "--nocapture"])
+            .env(CHILD_TEST_ENV, SHELL_ENV_CHILD)
+            .envs([
+                SHELL_ENV_EXACT,
+                SHELL_ENV_PREFIXED,
+                SHELL_ENV_OVERRIDDEN,
+                SHELL_ENV_UNLISTED,
+                (SHELL_ENV_NO_COLOR.0, ""),
+            ])
+            .output()
+            .expect("child test process");
+        let stdout = String::from_utf8_lossy(&child.stdout);
+
+        assert!(
+            child.status.success() && stdout.contains(SHELL_ENV_CHILD_PASSED),
+            "{stdout}{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
+
+    #[test]
+    fn configured_shell_environment_child() {
+        if std::env::var(CHILD_TEST_ENV).as_deref() != Ok(SHELL_ENV_CHILD) {
+            return;
+        }
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let mut ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        ctx.config.shell_env = ShellEnvConfig {
+            pass: vec![
+                EnvPattern::Exact(SHELL_ENV_EXACT.0.into()),
+                EnvPattern::Prefix(SHELL_ENV_PREFIX.into()),
+                EnvPattern::Exact(SHELL_ENV_OVERRIDDEN.0.into()),
+            ],
+            set: BTreeMap::from([(SHELL_ENV_OVERRIDDEN.0.into(), SHELL_ENV_CONFIGURED.into())]),
+        };
+        let names = [
+            SHELL_ENV_EXACT.0,
+            SHELL_ENV_PREFIXED.0,
+            SHELL_ENV_OVERRIDDEN.0,
+            SHELL_ENV_NO_COLOR.0,
+            SHELL_ENV_UNLISTED.0,
+        ];
+        let invocation = registry
+            .get("shell")
+            .expect("registered shell")
+            .tool
+            .parse(&json!({"command": format!("printenv {}", names.join(" "))}))
+            .expect("valid shell input");
+        smol::block_on(invocation.preflight(&ctx)).expect("shell preflight");
+        let ToolOutput::Shell(output) = smol::block_on(invocation.execute(&ctx)).output.unwrap()
+        else {
+            panic!("expected typed shell output");
+        };
+
+        assert_eq!(
+            output.stdout.lines().collect::<Vec<_>>(),
+            [
+                SHELL_ENV_EXACT.1,
+                SHELL_ENV_PREFIXED.1,
+                SHELL_ENV_CONFIGURED,
+                SHELL_ENV_NO_COLOR.1,
+            ]
+        );
+        println!("{SHELL_ENV_CHILD_PASSED}");
     }
 
     fn progress_chunk(stream: ShellStream, text: &str) -> ShellProgressChunk {

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::OsString;
 use std::fmt::{self, Write};
 use std::fs;
 use std::mem;
@@ -21,6 +22,7 @@ use tracing::warn;
 
 use crate::config_version::ConfigVersion;
 use crate::interpolation::Lookup;
+use crate::shell_env::{ShellEnvConfig, ShellEnvError, ShellEnvFileConfig};
 
 pub const PROJECT_DIR: &str = ".caudra";
 const PERMISSIONS_FILE: &str = "permissions.toml";
@@ -69,6 +71,7 @@ pub mod own_writes;
 pub mod profile_tools;
 pub mod providers;
 pub mod sandbox;
+pub mod shell_env;
 pub mod steering;
 pub mod workcell;
 
@@ -629,6 +632,16 @@ pub enum ConfigError {
         "invalid project config: [autopilot] is global-only; move it to the global caudra.toml"
     )]
     ProjectAutopilot,
+    #[error(
+        "invalid project config: [agent.shell_env] is global-only; move it to the global caudra.toml"
+    )]
+    ProjectShellEnv,
+    #[error("invalid config: {key}: {source}")]
+    ShellEnv {
+        key: String,
+        #[source]
+        source: ShellEnvError,
+    },
     #[error(transparent)]
     Decisions(#[from] decisions::DecisionsConfigError),
     #[error("invalid config: agent.steering.{field}: {message}")]
@@ -762,6 +775,9 @@ pub struct RawConfig {
     #[serde(skip)]
     #[doc(hidden)]
     pub project_autopilot_override: bool,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub project_shell_env_override: bool,
     pub always_fast: Option<bool>,
     pub always_thinking: Option<AlwaysThinking>,
     #[serde(default)]
@@ -793,6 +809,8 @@ impl RawConfig {
             overlay.project_automations_override || overlay.automations.is_some();
         self.project_autopilot_override |=
             overlay.project_autopilot_override || overlay.autopilot.is_some();
+        let holds_shell_env = overlay.agent.shell_env.take().is_some();
+        self.project_shell_env_override |= overlay.project_shell_env_override || holds_shell_env;
         self.decisions.restrict(mem::take(&mut overlay.decisions));
         let messaging = &mut overlay.agent.messaging;
         self.project_message_history_override = self
@@ -845,6 +863,7 @@ impl RawConfig {
             .or(overlay.project_message_history_override);
         self.project_automations_override |= overlay.project_automations_override;
         self.project_autopilot_override |= overlay.project_autopilot_override;
+        self.project_shell_env_override |= overlay.project_shell_env_override;
         merge_option!(self, overlay, always_yolo, always_auto);
         if let Some(automations) = overlay.automations.take() {
             self.automations.get_or_insert_default().merge(automations);
@@ -873,7 +892,7 @@ impl RawConfig {
         }
     }
 
-    pub fn into_config(self, no_rtk: bool) -> Result<Config, ConfigError> {
+    pub fn into_config(mut self, no_rtk: bool) -> Result<Config, ConfigError> {
         if let Some(field) = self.project_permission_mode_override {
             return Err(ConfigError::ProjectPermissionMode(field));
         }
@@ -886,6 +905,10 @@ impl RawConfig {
         if self.project_autopilot_override {
             return Err(ConfigError::ProjectAutopilot);
         }
+        if self.project_shell_env_override {
+            return Err(ConfigError::ProjectShellEnv);
+        }
+        let shell_env = ShellEnvConfig::from_file(self.agent.shell_env.take().unwrap_or_default())?;
         self.validate_plugin_tables()?;
         let index_max_file_size_mb = self.index_max_file_size_mb()?;
         let task_max_concurrent = self.task_max_concurrent()?;
@@ -908,6 +931,7 @@ impl RawConfig {
                 index_max_file_size_mb,
                 task_max_concurrent,
                 builtin_skills,
+                shell_env,
             ),
             provider: ProviderConfig::from_file(self.provider)?,
             storage: StorageConfig::from_file(self.storage),
@@ -1452,12 +1476,18 @@ pub struct AgentFileConfig {
     pub defer_builtin_tools: Option<DeferBuiltinTools>,
     pub image_model: Option<ImageModel>,
     pub disabled_tools: Option<Vec<String>>,
+    /// `Some` for any `[agent.shell_env]` table, even an empty one, so a
+    /// project layer that holds one is refused.
+    pub shell_env: Option<ShellEnvFileConfig>,
 }
 
 impl AgentFileConfig {
     fn merge(&mut self, overlay: AgentFileConfig) {
         if let Some(steering) = overlay.steering {
             self.steering.get_or_insert_default().merge(steering);
+        }
+        if let Some(shell_env) = overlay.shell_env {
+            self.shell_env.get_or_insert_default().merge(shell_env);
         }
         self.messaging.merge(overlay.messaging);
         merge_option!(
@@ -2606,6 +2636,9 @@ pub struct AgentConfig {
     #[config(skip, default = "MessagingConfig::default()")]
     pub messaging: MessagingConfig,
 
+    #[config(skip, default = "ShellEnvConfig::default()")]
+    pub shell_env: ShellEnvConfig,
+
     #[config(
         ty = "String",
         default = "None",
@@ -2782,11 +2815,13 @@ impl AgentConfig {
         index_max_file_size_mb: usize,
         task_max_concurrent: usize,
         builtin_skills: BuiltinSkills,
+        shell_env: ShellEnvConfig,
     ) -> Self {
         Self {
             no_rtk,
             steering: Arc::new(file.steering.unwrap_or_default()),
             messaging: file.messaging.resolve(),
+            shell_env,
             system_prompt_profile: file
                 .system_prompt_profile
                 .filter(|profile| profile != "builtin"),
@@ -4204,6 +4239,56 @@ pub fn global_env_value(key: &str) -> Result<Option<String>, std::env::VarError>
     }
 }
 
+/// Where Caudra's own value of a variable came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvSource {
+    Process,
+    GlobalEnvFile,
+    ProjectEnvFile,
+}
+
+pub fn env_source(name: &str) -> EnvSource {
+    let from_project = PROJECT_ENV_FALLBACKS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .is_some_and(|fallbacks| fallbacks.contains_key(name));
+    if from_project {
+        return EnvSource::ProjectEnvFile;
+    }
+    let from_env_file = ENV_FILE_KEYS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains(name);
+    if from_env_file {
+        EnvSource::GlobalEnvFile
+    } else {
+        EnvSource::Process
+    }
+}
+
+/// The process environment as shell commands may receive it, sorted by name. A variable the
+/// project's `.env` set reads as the global value it shadowed or is left out, so a repository
+/// never chooses the value of a variable the user forwards.
+pub fn shell_visible_environment() -> Vec<(String, OsString)> {
+    let mut visible: BTreeMap<String, OsString> = std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value)))
+        .collect();
+    if let Some(fallbacks) = PROJECT_ENV_FALLBACKS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+    {
+        for (name, fallback) in fallbacks {
+            match fallback {
+                Some(value) => visible.insert(name.clone(), value.into()),
+                None => visible.remove(name),
+            };
+        }
+    }
+    visible.into_iter().collect()
+}
+
 /// `key` as the process inherited it. A key a `.env` file set reads as unset, so a reparse reads
 /// that file as it is now rather than its startup copy.
 fn inherited_env_value(key: &str) -> Result<Option<String>, std::env::VarError> {
@@ -4333,6 +4418,13 @@ pub fn fail_closed_permissions() -> PermissionsConfig {
 
 pub fn global_config_dir() -> Option<PathBuf> {
     global_dir()
+}
+
+/// The global `caudra.toml`, resolved without creating its directory.
+pub fn global_config_path() -> Option<PathBuf> {
+    paths::config_dir_path()
+        .ok()
+        .map(|directory| config_file::global_config_path(&directory))
 }
 
 #[cfg(test)]

@@ -1,4 +1,9 @@
-use std::{collections::HashMap, fmt, path::Path};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fmt,
+    path::Path,
+    sync::{Mutex, PoisonError},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EnvironmentLoadError {
@@ -24,6 +29,7 @@ pub enum EnvironmentValueError {
 
 pub struct StartupEnvironment {
     file_values: HashMap<String, String>,
+    consulted: Mutex<BTreeSet<String>>,
 }
 
 impl fmt::Debug for StartupEnvironment {
@@ -40,27 +46,44 @@ impl fmt::Debug for StartupEnvironment {
 
 impl StartupEnvironment {
     pub fn load(path: Option<&Path>) -> Result<Self, EnvironmentLoadError> {
-        let Some(path) = path else {
-            return Ok(Self {
-                file_values: HashMap::new(),
-            });
-        };
-        let iterator = dotenvy::from_path_iter(path).map_err(|_| EnvironmentLoadError::Read)?;
         let mut file_values = HashMap::new();
-        for entry in iterator {
-            let (name, value) = entry.map_err(|_| EnvironmentLoadError::Parse)?;
-            file_values.insert(name, value);
+        if let Some(path) = path {
+            let iterator = dotenvy::from_path_iter(path).map_err(|_| EnvironmentLoadError::Read)?;
+            for entry in iterator {
+                let (name, value) = entry.map_err(|_| EnvironmentLoadError::Parse)?;
+                file_values.insert(name, value);
+            }
         }
-        Ok(Self { file_values })
+        Ok(Self {
+            file_values,
+            consulted: Mutex::default(),
+        })
     }
 
     /// Process values deliberately override file defaults.
     pub fn read(&self, name: &str) -> Result<Option<String>, EnvironmentValueError> {
+        self.consulted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(name.to_owned());
         match std::env::var(name) {
             Ok(value) => Ok(Some(value)),
             Err(std::env::VarError::NotPresent) => Ok(self.file_values.get(name).cloned()),
             Err(std::env::VarError::NotUnicode(_)) => Err(EnvironmentValueError::InvalidUnicode),
         }
+    }
+
+    /// Every name read so far plus every key the file defines: what configures this server, so
+    /// no shell command may receive it. Call after the last startup read.
+    #[must_use]
+    pub fn server_variables(&self) -> BTreeSet<String> {
+        let mut names = self
+            .consulted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        names.extend(self.file_values.keys().cloned());
+        names
     }
 }
 
@@ -120,6 +143,26 @@ mod tests {
         assert_eq!(
             environment.read("WORKCELL_MCP_HTTP_TOKEN").unwrap(),
             Some("private-password-canary-$-\"-'-\\-value".to_owned())
+        );
+    }
+
+    #[test]
+    fn server_variables_are_consulted_names_and_file_keys() {
+        const FILE_KEY: &str = "WORKCELL_TEST_FILE_ONLY";
+        const CONSULTED: &str = "WORKCELL_TEST_CONSULTED";
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("server.env");
+        fs::write(&path, format!("{FILE_KEY}=value\n")).expect("write dotenv fixture");
+
+        let environment = StartupEnvironment::load(Some(&path)).expect("load dotenv fixture");
+        assert_eq!(
+            environment.server_variables(),
+            BTreeSet::from([FILE_KEY.to_owned()])
+        );
+        environment.read(CONSULTED).unwrap();
+        assert_eq!(
+            environment.server_variables(),
+            BTreeSet::from([CONSULTED.to_owned(), FILE_KEY.to_owned()])
         );
     }
 

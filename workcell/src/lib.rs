@@ -11,11 +11,14 @@ pub mod logging;
 pub mod remote_host;
 pub mod root;
 pub mod server;
+pub mod shell_environment;
 pub mod transfer;
 pub mod transports;
 
 use cli::{CliOptions, Transport};
 use server::{ServerBehavior, ToolConfiguration, WorkcellServer};
+use shell_environment::ShellForwarding;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use transports::{TransportError, TransportOutcome, http::HttpAuthentication};
 use workcell_mcp_code::{CodeConfiguration, WorkerSource};
@@ -27,6 +30,7 @@ pub async fn run(
     web: WebsearchExecutionConfiguration,
     authentication: Option<HttpAuthentication>,
     shell_policy: ShellPermissionPolicy,
+    server_variables: BTreeSet<String>,
 ) -> Result<TransportOutcome, Box<dyn std::error::Error>> {
     let root =
         root::resolve_effective_root(options.root.as_deref(), &options.root_relative_subdirectory)?;
@@ -46,6 +50,9 @@ pub async fn run(
             proxy: options.proxy,
             shell_policy,
             shell_output_filter: options.shell_output_filter,
+            shell_environment: options
+                .shell_environment_ceiling
+                .map(|ceiling| ShellForwarding::new(ceiling, server_variables)),
             honor_gitignore: options.honor_gitignore,
             code: CodeConfiguration {
                 worker: options.code_worker.as_deref().map_or(

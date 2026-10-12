@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod shell_env;
+
 use std::fmt::Write;
 
 use serde::{Deserialize, Serialize};

@@ -10,6 +10,7 @@ pub(crate) mod background_delivery;
 mod btw;
 mod decisions;
 mod delegation;
+mod env;
 mod extract;
 pub(crate) mod file_revert;
 #[cfg(debug_assertions)]
@@ -50,6 +51,7 @@ use caudra_workbench::{DocumentKey, Layout as WorkbenchLayout, Workbench, Workbe
 use crate::agent::ModelSlot;
 use crate::agent::SharedMode;
 use crate::agent::ToolsPreviewSource;
+use crate::app::env::ShellEnvLink;
 use crate::app::tasks::TaskOutcome;
 use crate::app::workbench::{MountScope, StoredDocument};
 use crate::chat::Chat;
@@ -66,6 +68,7 @@ use crate::components::commit_popup::{CommitAction, CommitIndex, CommitPopup};
 use crate::components::context_modal::ContextModal;
 use crate::components::decisions_modal::{DecisionsFetchState, DecisionsModal};
 use crate::components::docs_modal::{DocsAction, DocsModal};
+use crate::components::env_modal::EnvModal;
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::goal_modal::GoalModal;
 use crate::components::help_modal::HelpModal;
@@ -469,6 +472,8 @@ pub struct App {
     pub(super) model_picker: ModelPicker,
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
+    pub(super) env_modal: EnvModal,
+    pub(crate) shell_env: ShellEnvLink,
     pub(super) rewind_picker: RewindPicker,
     pub(super) message_actions: MessageActions,
     pub(super) queue_actions: QueueActions,
@@ -787,6 +792,8 @@ impl App {
             model_picker: ModelPicker::new(available_models),
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
+            env_modal: EnvModal::new(),
+            shell_env: ShellEnvLink::default(),
             rewind_picker: RewindPicker::new(),
             message_actions: MessageActions::new(),
             queue_actions: QueueActions::new(),
@@ -2010,6 +2017,7 @@ impl App {
         try_picker!(self.search_modal);
         try_picker!(self.theme_picker);
         try_picker!(self.mcp_picker);
+        try_picker!(self.env_modal);
         try_picker!(self.login_picker);
         try_picker!(self.rewind_picker);
         try_picker!(self.message_actions);
@@ -2624,6 +2632,13 @@ impl App {
             guard_repeat!(false);
             let action = self.mcp_picker.handle_key(key);
             return Some(self.handle_mcp_picker_action(action));
+        }
+
+        if self.env_modal.is_open() {
+            keyboard_text!(env_modal, self.env_modal.text_key(command_key));
+            guard_repeat!(self.env_modal.text_input_active());
+            let action = self.env_modal.handle_key(key);
+            return Some(self.handle_env_action(action));
         }
 
         if self.permissions_picker.is_open() {
@@ -5838,6 +5853,7 @@ impl App {
                 self.mcp_picker.open();
                 vec![]
             }
+            "/env" => self.open_env(),
             "/permissions" => {
                 match self.open_permissions_picker() {
                     Ok(()) => {
@@ -6241,7 +6257,7 @@ impl App {
         }
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 47] {
+    fn overlays(&self) -> [&dyn Overlay; 48] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -6275,6 +6291,7 @@ impl App {
             &self.model_picker,
             &self.login_picker,
             &self.mcp_picker,
+            &self.env_modal,
             &self.permissions_picker,
             &self.sandbox_manager,
             &self.stash_picker,
@@ -6293,7 +6310,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 47] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 48] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -6327,6 +6344,7 @@ impl App {
             &mut self.model_picker,
             &mut self.login_picker,
             &mut self.mcp_picker,
+            &mut self.env_modal,
             &mut self.permissions_picker,
             &mut self.sandbox_manager,
             &mut self.stash_picker,
@@ -6574,6 +6592,7 @@ impl App {
             | self.poll_pattern_suggestions()
             | self.poll_permission_editor()
             | self.poll_sandbox()
+            | self.poll_env()
             | self.model_picker.refresh()
             | self.usage_modal.poll(&self.usage_slot)
             | self.storage_modal.poll(&self.storage_slot)
@@ -6975,6 +6994,7 @@ impl App {
             self.tooltip.cadence(Instant::now()),
             self.automation_cadence(),
             self.memory_cadence(),
+            Cadence::when(self.shell_env.reply.is_some(), Cadence::PENDING),
             // The `#` popup is not an overlay, so its spinner has to be asked
             // for here rather than through `overlays`.
             self.commit_popup.cadence(),
@@ -7098,6 +7118,7 @@ impl App {
         try_picker!(self.model_picker);
         try_picker!(self.thinking_picker);
         try_picker!(self.mcp_picker);
+        try_picker!(self.env_modal);
         try_picker!(self.permissions_picker);
         try_picker!(self.stash_picker);
         if let Some(action) = self.memory_inspector.handle_paste(text) {

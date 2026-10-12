@@ -1300,12 +1300,14 @@ fn render_list<T: PickerItem>(
         let suffix_gap = 2usize;
         let suffix_w = suffix.map(|s| s.width()).unwrap_or(0);
         let trailing_gap = suffix_w + if suffix_w > 0 { suffix_gap } else { 0 };
+        let checkbox_cols = u16::try_from(checkbox.as_ref().map_or(0, Span::width)).unwrap_or(0);
+        let row_width = area.width.saturating_sub(checkbox_cols);
         let (line, clipped) = match detail {
             Some(detail) => {
                 let row = if item.badge().is_some() {
-                    badge_row(&label, detail, trailing_gap, area.width)
+                    badge_row(&label, detail, trailing_gap, row_width)
                 } else {
-                    detail_row(&label, detail, trailing_gap, area.width)
+                    detail_row(&label, detail, trailing_gap, row_width)
                 };
                 let clipped =
                     row.label.width() < label.width() || row.detail.width() < detail.width();

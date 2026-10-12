@@ -386,6 +386,14 @@ impl App {
             ) {
                 return actions;
             }
+        } else if self.env_modal.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.env_modal.handle_mouse(event),
+                |app, action| app.handle_env_action(action),
+            ) {
+                return actions;
+            }
         } else if self.login_picker.is_open() {
             if let Some(actions) = self.route_overlay_mouse(
                 event,
@@ -1423,6 +1431,10 @@ impl App {
         dismiss!(
             self.mcp_picker,
             self.handle_mcp_picker_action(crate::components::mcp_picker::McpPickerAction::Close)
+        );
+        dismiss!(
+            self.env_modal,
+            self.handle_env_action(crate::components::env_modal::EnvAction::Close)
         );
         dismiss!(
             self.login_picker,

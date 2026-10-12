@@ -152,6 +152,7 @@ The implemented schema is in `caudra-config/src/sandbox.rs`: `SandboxProvider`, 
 | `persistent` | bool | `true` | - | Keep the disk when the sandbox pauses or its lease ends. Only a persistent sandbox can pause |
 | `running_ttl_seconds` | integer | required | - | Seconds the sandbox may run before its lease ends. `0` never ends, which needs a provider without a lease cap |
 | `on_exit` | string | `detach` | - | What happens to the sandbox when Caudra exits. `detach` is the only value |
+| `shell_env` | table | pass everything | - | Guest variables forwarded to shell commands in this sandbox, resolved inside the guest: pass takes names, NAME_* or *; set takes literal non-secret values. Workcell's own settings, Bash startup names, and proxies are never forwarded |
 
 `caudra config example sandboxes` prints every `sandboxes.toml` key with its default, all commented out. [Reference configs](/docs/reference-configs/#sandboxes-toml) shows the same text.
 
@@ -212,6 +213,26 @@ caudra sandbox images --provider local --request image-request.json --yes
 ```
 
 The first command previews only. The second executes the approved offline helper. The request schema is `AdminRequest` in `caudra-sandbox/src/local_admin.rs`: `helper` has `executable`, `qemu_img`, `database`, and `catalog_dir`, and `operation` has `action` (`import`, `build`, `inspect`, or `gc`) plus `input`. Import/Build inputs use the camelCase fields of `ImportRequest`/`BuildRequest`, while the template `Manifest` is in `caudra-sandbox/src/dto.rs`. These are different schemas from `sandboxes.toml`. The TUI forms avoid constructing them by hand.
+
+## Shell environment
+
+Shell commands in a sandbox run in the guest, so they receive the guest's variables rather than yours. Each profile chooses which ones:
+
+```toml
+[sandbox.profiles.dev.shell_env]
+pass = ["*"]
+set = { RUST_LOG = "info" }
+```
+
+- `pass` takes exact names, `NAME_*` prefixes, or `*`. A profile without a `shell_env` table forwards everything the guest allows, as if it said `pass = ["*"]`.
+- Values come from the guest's own environment. Caudra sends the guest names only, never a value from your machine, so your credentials stay on the client.
+- `set` holds literal values, kept as written. Caudra refuses an `{env:NAME}` reference, a name that looks like a credential, a proxy variable, a name that decides how Bash starts, and any `WORKCELL_*` or `SEARXNG_*` name. A secret belongs in the image.
+- The guest's Workcell never forwards its own settings or credentials, whatever `pass` says. This covers every `WORKCELL_*` and `SEARXNG_*` name, every variable it read at startup, its env file, and the proxy variables, which already reach commands from the guest. Its bearer token is one of them, so a command cannot call the guest's tools around your permission rules.
+- The image sets a ceiling with `WORKCELL_MCP_SHELL_ENV_CEILING`, and `pass` only reaches names inside it. A guest Workcell without a ceiling forwards nothing extra, and `/env` says so.
+
+`/env` shows a Sandbox tab in a sandbox session. It lists the guest's variables with their values masked, marks the ones its Workcell withholds without showing their values, and edits the profile. A change applies to the session from the next shell command and is saved to the profile for later attaches. The values it shows are kept only while the modal is open and are never given to the model.
+
+`[agent.shell_env]` in `caudra.toml` applies to [local sessions](/docs/cli/#forwarding-more-variables) only.
 
 ## Network policy
 

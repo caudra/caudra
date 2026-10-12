@@ -43,7 +43,7 @@ use workcell_mcp_files::{
     PreparedFileRead, PreparedFileWrite, PreparedWorkspaceMutation, WorkspaceWatchBatch,
     WorkspaceWatchFailure, WorkspaceWatcher,
 };
-use workcell_mcp_shell::PreparedShell;
+use workcell_mcp_shell::{PreparedShell, ShellEnvironment};
 use workcell_mcp_web::{PreparedWebfetchOperation, PreparedWebsearchOperation};
 use workcell_workspace_scm::PreparedScmMutation;
 use workcell_workspace_snapshot::{PreparedCleanup, PreparedRevert};
@@ -131,7 +131,11 @@ pub(crate) enum PreparedRemoteOperation {
     CodeExpand(PreparedCodeExpand),
     Websearch(PreparedWebsearchOperation),
     Webfetch(PreparedWebfetchOperation),
-    Shell(PreparedShell),
+    Shell {
+        prepared: PreparedShell,
+        /// Resolved when prepared; `None` runs with the group's own environment.
+        environment: Option<ShellEnvironment>,
+    },
     PythonExecution(PreparedCode),
     ExecutionEnvironment(PreparedExecutionEnvironment),
     WorkspaceMutation(PreparedWorkspaceMutation),
@@ -188,7 +192,18 @@ impl PreparedRemoteOperation {
             Self::CodeExpand(prepared) => prepared.retained_bytes(),
             Self::Websearch(prepared) => prepared.retained_bytes(),
             Self::Webfetch(prepared) => prepared.retained_bytes(),
-            Self::Shell(prepared) => prepared.retained_bytes(),
+            Self::Shell {
+                prepared,
+                environment,
+            } => prepared
+                .retained_bytes()
+                .saturating_add(environment.as_deref().map_or(0, |pairs| {
+                    size_of_val(pairs)
+                        + pairs
+                            .iter()
+                            .map(|(name, value)| name.len() + value.len())
+                            .sum::<usize>()
+                })),
             Self::PythonExecution(prepared) => prepared.retained_bytes(),
             Self::ExecutionEnvironment(prepared) => prepared.retained_bytes(),
             Self::WorkspaceMutation(prepared) => prepared.retained_bytes(),
@@ -3228,6 +3243,7 @@ mod tests {
                 changes: None,
                 control_plane: false,
                 control_plane_missing: Vec::new(),
+                shell_environment: None,
             },
         };
         RemoteHostState::new(descriptor, binding)

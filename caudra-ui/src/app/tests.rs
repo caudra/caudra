@@ -12,6 +12,7 @@ use crate::components::context_modal::{
     EXPANDED_TITLE as CONTEXT_EXPANDED_TITLE, TITLE as CONTEXT_TITLE,
 };
 use crate::components::docs_modal::fixture as docs_fixture;
+use crate::components::env_modal::PATTERN_KEY as ENV_PATTERN_KEY;
 use crate::components::file_walk::UNREADABLE_DIR_MSG;
 use crate::components::goal_modal::GoalTarget;
 use crate::components::help_modal::HelpTarget;
@@ -16392,6 +16393,33 @@ fn mcp_command_opens_picker() {
     let mut app = test_app();
     app.execute_command(cmd("/mcp"), 0);
     assert!(app.mcp_picker.is_open());
+}
+
+/// `/env` opens over a scratch global config, and a pattern added there lands in its
+/// `[agent.shell_env]` once the background write finishes.
+#[test]
+fn env_command_writes_a_pass_pattern_to_the_global_config() {
+    const CONFIG_FILE: &str = "caudra.toml";
+    const SECTION: &str = "[agent.shell_env]";
+    const PATTERN: &str = "CAUDRA_ENV_TEST_FLAG";
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join(CONFIG_FILE);
+    let mut app = test_app();
+    app.shell_env.config_path = Some(path.clone());
+
+    app.execute_command(cmd("/env"), 0);
+    assert!(app.env_modal.is_open());
+    app.finish_env_work();
+
+    app.update(Msg::Key(key(KeyCode::Char(ENV_PATTERN_KEY))));
+    app.update(Msg::Paste(PATTERN.into()));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    app.finish_env_work();
+
+    let written = fs::read_to_string(&path).unwrap();
+    assert!(written.contains(SECTION), "{written}");
+    assert!(written.contains(PATTERN), "{written}");
+    assert!(app.env_modal.is_open());
 }
 
 #[test]

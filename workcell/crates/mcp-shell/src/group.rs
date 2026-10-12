@@ -31,6 +31,7 @@ use rmcp::{
 #[cfg(feature = "mcp")]
 use serde_json::Value;
 use std::{
+    ffi::OsString,
     fmt,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
@@ -49,6 +50,9 @@ const ESCAPE_STAGE: &str = "escapes";
 const PROGRESS_STAGE: &str = "progress";
 
 const SHELL_CONCURRENCY: usize = 4;
+
+/// Resolved name and value pairs a group adds to every command, on top of the fixed allowlist.
+pub type ShellEnvironment = Arc<[(String, OsString)]>;
 // After child completion, allow trailing pipe data to reset this grace window before treating open
 // pipes as evidence of residual descendants.
 const PIPE_CLOSE_GRACE: Duration = Duration::from_millis(100);
@@ -64,7 +68,7 @@ pub struct ShellToolGroup {
     policy: ShellPermissionPolicy,
     confined: bool,
     output_filter: bool,
-    inherited_environment: &'static [&'static str],
+    environment: ShellEnvironment,
     launcher: SharedShellLauncher,
 }
 #[derive(Debug)]
@@ -153,7 +157,7 @@ impl ShellToolGroup {
             policy,
             confined,
             output_filter: true,
-            inherited_environment: &[],
+            environment: Arc::from([]),
             launcher: Arc::new(ShellLauncher::from_host().await),
         })
     }
@@ -170,14 +174,15 @@ impl ShellToolGroup {
         self
     }
 
-    /// Forwards the named host variables to every command this group executes, on top of the
-    /// fixed allowlist, for a host whose own environment carries context its commands need.
+    /// Adds these resolved variables to every command this group executes, on top of the fixed
+    /// allowlist, for a host whose commands need context from its own environment.
     ///
-    /// Names that decide which Bash runs or how it starts are dropped even when listed, because the
-    /// policy's startup assumptions hold only in their absence.
+    /// The host resolves values; the group forwards them unchanged. Names that decide which Bash
+    /// runs or how it starts are dropped even when present, because the policy's startup
+    /// assumptions hold only in their absence.
     #[must_use]
-    pub const fn with_inherited_environment(mut self, names: &'static [&'static str]) -> Self {
-        self.inherited_environment = names;
+    pub fn with_environment(mut self, environment: ShellEnvironment) -> Self {
+        self.environment = environment;
         self
     }
 
@@ -326,7 +331,7 @@ impl ShellToolGroup {
         // all per-execution resources inside the global concurrency budget.
         let _permit = tokio::select! {permit=concurrency().clone().acquire_owned()=>permit.map_err(|_|"Shell concurrency gate is unavailable".to_owned())?,()=cancellation.cancelled()=>return Ok(None)};
         let started = Instant::now();
-        let mut command = platform_command(launcher, &command_text, self.inherited_environment);
+        let mut command = platform_command(launcher, &command_text, &self.environment);
         command
             .current_dir(workdir.canonical())
             .stdin(Stdio::null())

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::SHELL_EXECUTION_TIMEOUT;
 use crate::transfer::PrivateStaging;
 use async_trait::async_trait;
+use caudra_agent::tools::SHELL_TOOL_NAME;
 use caudra_config::workcell::{RemoteWorkcellSelection, WorkcellEndpoint};
 use caudra_storage::auth::{WorkcellCredential, WorkcellCredentialName};
 use caudra_storage::id::CaudraId;
@@ -1657,6 +1658,9 @@ struct RemoteInner {
     operations: Mutex<OperationRegistry>,
     operation_slots: Event,
     mutation_journal: RemoteMutationJournal,
+    /// What a sandbox session asks its guest to forward to shell commands. Stays `None` for every
+    /// other host, whose environment its operator owns.
+    guest_shell_environment: Mutex<Option<contract::ShellEnvironmentSelection>>,
 }
 
 #[derive(Clone)]
@@ -1844,6 +1848,7 @@ impl RemoteWorkcellClient {
             operations: Mutex::new(OperationRegistry::new(operation_limit)),
             operation_slots: Event::new(),
             mutation_journal,
+            guest_shell_environment: Mutex::new(None),
         }));
         client.recover_pending_operations().await?;
         Ok(client)
@@ -1851,6 +1856,64 @@ impl RemoteWorkcellClient {
 
     pub fn descriptor(&self) -> &contract::RemoteHostDescriptor {
         &self.0.descriptor
+    }
+
+    /// `None` when the host's Workcell cannot forward its own variables to shell commands.
+    pub fn shell_environment_capability(&self) -> Option<&contract::ShellEnvironmentCapability> {
+        self.0.descriptor.capabilities.shell_environment.as_ref()
+    }
+
+    pub fn guest_shell_environment(&self) -> Option<contract::ShellEnvironmentSelection> {
+        self.0
+            .guest_shell_environment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Applies from the next shell preparation. Only a sandbox session sets one.
+    pub fn set_guest_shell_environment(
+        &self,
+        selection: Option<contract::ShellEnvironmentSelection>,
+    ) {
+        *self
+            .0
+            .guest_shell_environment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = selection;
+    }
+
+    /// The host's variables as `selection` would treat them, for display only. `None` when the
+    /// host does not serve the listing.
+    pub async fn list_guest_environment(
+        &self,
+        selection: &contract::ShellEnvironmentSelection,
+    ) -> Result<Option<contract::EnvironmentListResponse>, WorkspaceError> {
+        if !self
+            .shell_environment_capability()
+            .is_some_and(|capability| capability.list)
+        {
+            return Ok(None);
+        }
+        let request = contract::EnvironmentListRequest {
+            version: contract::ContractVersion::V1,
+            host: self.host_binding(),
+            selection: selection.clone(),
+        };
+        self.call(
+            contract::ENVIRONMENT_LIST_METHOD,
+            &request,
+            &self.0.cancellation.child_token(),
+        )
+        .await
+        .map(Some)
+    }
+
+    /// The selection a shell preparation carries: a sandbox's, and only when its guest serves it.
+    fn shell_environment_for(&self, tool: &str) -> Option<contract::ShellEnvironmentSelection> {
+        (tool == SHELL_TOOL_NAME && self.shell_environment_capability().is_some())
+            .then(|| self.guest_shell_environment())
+            .flatten()
     }
 
     pub fn host_binding(&self) -> contract::HostBinding {
@@ -4269,6 +4332,7 @@ impl WorkspaceToolService for RemoteWorkcellClient {
             tool: contract::ToolName::new(spec.name.clone()).map_err(|_| invalid_response())?,
             contract: contract_binding(spec)?,
             arguments: request.input.clone(),
+            shell_environment: self.shell_environment_for(&request.name),
         };
         wire.validate(max_arguments)
             .map_err(|_| invalid_response())?;
@@ -6771,14 +6835,14 @@ mod tests {
         OperationRegistry, PendingRemoteOperation, PreparedWorkspaceContext, RecoveryOperation,
         RemoteEvent, RemoteInner, RemoteMutationJournal, RemotePreparedToolCall, RemoteTransport,
         RemoteWorkcellClient, RemoteWorkcellError, ResourceCache, SHELL_CONTRACT_ID,
-        SHELL_EXECUTION_TIMEOUT, SSE_CRLF_DELIMITER, SSE_LF_DELIMITER, StoredOperation,
-        ToolListWire, WORKSPACE_MUTATION_KIND, WatchRegistry, canonical_journal_policy,
-        convert_status, execution_timeout, freeze_catalog, join_workspace_path, map_rpc_error,
-        numeric_loopback, pagination_flags, parse_content_range, project_asset_kind,
-        project_asset_trust, recovery_status, require_full_remote_parity, require_nonzero_within,
-        same_descriptor_except_instance, serialized_items_bytes, source_trust_anchor,
-        sse_event_end, unix_millis, validate_capabilities, validate_selector_id, watch_path_within,
-        workspace_capabilities,
+        SHELL_EXECUTION_TIMEOUT, SHELL_TOOL_NAME, SSE_CRLF_DELIMITER, SSE_LF_DELIMITER,
+        StoredOperation, ToolListWire, WORKSPACE_MUTATION_KIND, WatchRegistry,
+        canonical_journal_policy, convert_status, execution_timeout, freeze_catalog,
+        join_workspace_path, map_rpc_error, numeric_loopback, pagination_flags,
+        parse_content_range, project_asset_kind, project_asset_trust, recovery_status,
+        require_full_remote_parity, require_nonzero_within, same_descriptor_except_instance,
+        serialized_items_bytes, source_trust_anchor, sse_event_end, unix_millis,
+        validate_capabilities, validate_selector_id, watch_path_within, workspace_capabilities,
     };
     use crate::transfer::PrivateStaging;
     use crate::{
@@ -8596,6 +8660,7 @@ mod tests {
             operations: Mutex::new(operations),
             operation_slots: super::Event::new(),
             mutation_journal: coordinator,
+            guest_shell_environment: Mutex::new(None),
         }));
         let raw_input = json!({"filePath":"test", "content":"test"});
         let call = RemotePreparedToolCall {
@@ -9678,6 +9743,14 @@ mod tests {
         endpoint: &WorkcellEndpoint,
         state: &StateDir,
     ) -> RemoteWorkcellClient {
+        scripted_client_with(endpoint, state, scripted_descriptor())
+    }
+
+    fn scripted_client_with(
+        endpoint: &WorkcellEndpoint,
+        state: &StateDir,
+        descriptor: contract::RemoteHostDescriptor,
+    ) -> RemoteWorkcellClient {
         const CAPACITY: usize = 8;
         let seed = StoredWorkspaceBinding::local_from_cwd("scripted-workspace");
         let cursor = WorkspaceCursor::new(
@@ -9689,7 +9762,6 @@ mod tests {
         let stored = seed.with_cursor(cursor.clone()).unwrap();
         let binding = stored.binding().clone();
         let (transport, events) = RemoteTransport::new(endpoint, None).unwrap();
-        let descriptor = scripted_descriptor();
         RemoteWorkcellClient(Arc::new(RemoteInner {
             staging: PrivateStaging::new(super::transfer::negotiated_limits(
                 descriptor.capabilities.reviewed_transfer.as_ref(),
@@ -9727,7 +9799,52 @@ mod tests {
                 stored,
             )
             .unwrap(),
+            guest_shell_environment: Mutex::new(None),
         }))
+    }
+
+    const FILE_READ_TOOL: &str = "file_read";
+
+    fn shell_environment_capability() -> contract::ShellEnvironmentCapability {
+        contract::ShellEnvironmentCapability {
+            version: contract::ContractVersion::V1,
+            ceiling: vec![contract::EnvPattern::All],
+            list: true,
+            limits: contract::ShellEnvironmentLimits {
+                max_entries: 16,
+                max_response_bytes: 4096,
+            },
+        }
+    }
+
+    #[test_case(true, true, SHELL_TOOL_NAME, true ; "sandbox_shell_on_a_serving_guest")]
+    #[test_case(true, false, SHELL_TOOL_NAME, false ; "remote_profile_sets_no_selection")]
+    #[test_case(false, true, SHELL_TOOL_NAME, false ; "guest_without_the_capability")]
+    #[test_case(true, true, FILE_READ_TOOL, false ; "a_tool_other_than_shell")]
+    fn shell_preparations_carry_a_selection_only_for_a_serving_sandbox(
+        served: bool,
+        sandbox: bool,
+        tool: &str,
+        carried: bool,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let endpoint = WorkcellEndpoint::parse("http://127.0.0.1:1/mcp").unwrap();
+        let mut descriptor = scripted_descriptor();
+        descriptor.capabilities.shell_environment = served.then(shell_environment_capability);
+        let client = scripted_client_with(
+            &endpoint,
+            &StateDir::from_path(temp.path().join("state")),
+            descriptor,
+        );
+        if sandbox {
+            client.set_guest_shell_environment(Some(
+                contract::ShellEnvironmentSelection::everything(),
+            ));
+        }
+        assert_eq!(
+            client.shell_environment_for(tool),
+            carried.then(contract::ShellEnvironmentSelection::everything)
+        );
     }
 
     pub(super) fn host_refusal(code: &str) -> Value {
@@ -9942,6 +10059,7 @@ mod tests {
             operations: Mutex::new(OperationRegistry::new(8)),
             operation_slots: super::Event::new(),
             mutation_journal: coordinator,
+            guest_shell_environment: Mutex::new(None),
         }));
         let raw_input = json!({"command":"true"});
         let request = ToolPrepareRequest {

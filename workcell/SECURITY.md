@@ -462,11 +462,26 @@ for hosts that authorize paths and commands themselves:
   Permission policy stays fail-closed unless the host supplies its own, and deny rules still reject a
   request before any command runs.
 
-`ShellToolGroup::with_inherited_environment` forwards the host variables it names to every command,
+`ShellToolGroup::with_environment` forwards the resolved variables a host supplies to every command,
 unchanged, so any admitted command can read them. Names that decide which Bash runs or how it starts,
 including every `BASH*` name, `ENV`, `SHELLOPTS`, `POSIXLY_CORRECT`, `CDPATH`, `PWD`, `PS4`, and
-`WORKCELL_BASH_EXECUTABLE`, are dropped even when listed, because the command-context analysis a host
+`WORKCELL_BASH_EXECUTABLE`, are dropped even when supplied, because the command-context analysis a host
 authorizes against assumes Bash started without them.
+
+The standalone server forwards its own variables to remote shell commands only when the operator sets
+`WORKCELL_MCP_SHELL_ENV_CEILING` (or `--shell-env-ceiling`); unset, no capability is advertised and a
+prepare that asks for forwarding is refused. A client's selection can narrow the ceiling, never widen
+it. Whatever either admits, the server withholds a strip list it computes once at startup: every
+`WORKCELL_*` and `SEARXNG_*` name, every Bash startup name, the proxy names the allowlist already
+passes, every name the server read while configuring itself, every web search setting and credential
+whichever backend is selected, and every key in its `--env-file`. The reason is the bearer token.
+`WORKCELL_MCP_HTTP_TOKEN` authenticates the endpoint a client authorizes against, so a model-run
+command that could read it could call the server's tools directly and bypass the client's permission
+review; the same holds for web backend credentials such as `EXA_API_KEY`.
+`ai.workcell/environment-list` reports withheld names as `stripped` and never returns their values, nor
+values outside the ceiling. Any other variable inside the ceiling is readable by every admitted
+command once selected, and the listing shows its value to the authenticated client, so keep secrets
+the workload does not need out of the server's environment or outside the ceiling.
 
 Prepared operations exist so that authorization can happen before any effect. `prepare_apply_patch`,
 `ShellToolGroup::prepare`, and the web `prepare_*` methods disclose every path, command scope, query,

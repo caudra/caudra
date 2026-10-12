@@ -7,6 +7,8 @@ pub use transfer::*;
 
 use serde::{Deserialize, Deserializer, Serialize, de::SeqAccess};
 use serde_json::Value;
+use workcell_tool_contract::shell_env::MAX_SELECTION_PATTERNS;
+pub use workcell_tool_contract::shell_env::{EnvPattern, ShellEnvironmentSelection};
 
 pub const EXTENSION_ID: &str = "ai.workcell/remote-host";
 pub const PREPARE_METHOD: &str = "ai.workcell/prepare";
@@ -46,6 +48,7 @@ pub const CHANGES_PREPARE_UNREVERT_METHOD: &str = "ai.workcell/changes-prepare-u
 pub const CHANGES_ACKNOWLEDGE_METHOD: &str = "ai.workcell/changes-acknowledge";
 pub const CHANGES_STATUS_METHOD: &str = "ai.workcell/changes-status";
 pub const CHANGES_PREPARE_CLEANUP_METHOD: &str = "ai.workcell/changes-prepare-cleanup";
+pub const ENVIRONMENT_LIST_METHOD: &str = "ai.workcell/environment-list";
 pub const WORKSPACE_MUTATION_CONTRACT_ID: &str = "workspace.mutation.v1";
 pub const DIRECT_EXEC_CONTRACT_ID: &str = "workspace.exec.v1";
 pub const SCM_MUTATION_CONTRACT_ID: &str = "workspace.scm.mutation.v1";
@@ -120,6 +123,8 @@ pub const MAX_OPEN_RECORDS: usize = 1_024;
 pub const MAX_REVERT_RECORDS: usize = 10_000;
 pub const MAX_REVERT_JOURNALS: usize = 256;
 pub const MAX_REVERT_PREVIEW_PATHS: usize = MAX_PAGE_SIZE as usize;
+pub const MAX_ENVIRONMENT_ENTRIES: u32 = 1_024;
+pub const MAX_ENVIRONMENT_RESPONSE_BYTES: u64 = 512 * 1_024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -446,6 +451,29 @@ pub struct RemoteHostCapabilities {
     pub control_plane: bool,
     #[serde(deserialize_with = "deserialize_control_plane_missing")]
     pub control_plane_missing: Vec<Identifier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_environment: Option<ShellEnvironmentCapability>,
+}
+
+/// Shell commands may receive variables from the server's own environment, within `ceiling`.
+///
+/// The server always withholds its own configuration and secrets, whatever the ceiling admits.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ShellEnvironmentCapability {
+    pub version: ContractVersion,
+    #[serde(deserialize_with = "deserialize_env_patterns")]
+    pub ceiling: Vec<EnvPattern>,
+    /// Whether [`ENVIRONMENT_LIST_METHOD`] is served.
+    pub list: bool,
+    pub limits: ShellEnvironmentLimits,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ShellEnvironmentLimits {
+    pub max_entries: u32,
+    pub max_response_bytes: u64,
 }
 
 /// Per-call change records: what each tool call changed, and reverts that undo exactly that.
@@ -2067,6 +2095,55 @@ pub struct PrepareRequest {
     pub contract: ContractBinding,
     #[serde(deserialize_with = "deserialize_arguments")]
     pub arguments: Value,
+    /// Only for the shell tool, and only when the server advertises
+    /// [`RemoteHostCapabilities::shell_environment`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_environment: Option<ShellEnvironmentSelection>,
+}
+
+/// Host-only: what a selection would forward from the server's environment, for display.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EnvironmentListRequest {
+    pub version: ContractVersion,
+    pub host: HostBinding,
+    pub selection: ShellEnvironmentSelection,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EnvironmentListResponse {
+    pub version: ContractVersion,
+    /// Sorted by name.
+    #[serde(deserialize_with = "deserialize_environment_entries")]
+    pub entries: Vec<EnvironmentEntry>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EnvironmentEntry {
+    pub name: String,
+    /// Absent for [`EnvironmentEntryState::OutsideCeiling`] and
+    /// [`EnvironmentEntryState::Stripped`].
+    pub value: Option<String>,
+    pub state: EnvironmentEntryState,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EnvironmentEntryState {
+    /// Every command receives it from the fixed allowlist.
+    Allowlisted,
+    /// Inside the ceiling and matched by the selection.
+    Forwarded,
+    /// A literal from the selection.
+    Set,
+    /// Inside the ceiling but not selected.
+    Available,
+    OutsideCeiling,
+    /// Server configuration or a name that decides how Bash starts; never forwarded or shown.
+    Stripped,
 }
 
 impl PrepareRequest {
@@ -2702,6 +2779,22 @@ where
     deserialize_bounded_vec(deserializer, 16, "controlPlaneMissing")
 }
 
+fn deserialize_env_patterns<'de, D>(deserializer: D) -> Result<Vec<EnvPattern>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_SELECTION_PATTERNS, "ceiling")
+}
+
+fn deserialize_environment_entries<'de, D>(
+    deserializer: D,
+) -> Result<Vec<EnvironmentEntry>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_ENVIRONMENT_ENTRIES as usize, "entries")
+}
+
 fn deserialize_workspace_entries<'de, D>(deserializer: D) -> Result<Vec<WorkspaceEntry>, D::Error>
 where
     D: Deserializer<'de>,
@@ -3074,6 +3167,7 @@ mod tests {
                 result_version: Identifier::new("v1").unwrap(),
             },
             arguments: json!({"filePath": "a"}),
+            shell_environment: None,
         };
         assert!(
             request
@@ -3330,6 +3424,109 @@ mod tests {
             serde_json::from_value::<ScmCommit>(null_body).unwrap().body,
             None
         );
+    }
+
+    fn minimal_capabilities() -> Value {
+        let tool = json!({"version":"v1","limits":{"maxRequestBytes":1}});
+        json!({
+            "toolCatalog":tool, "toolExecution":tool, "controlPlane":false,
+            "controlPlaneMissing":[]
+        })
+    }
+
+    #[test]
+    fn capabilities_without_a_shell_environment_serialize_as_before() {
+        let capabilities =
+            serde_json::from_value::<RemoteHostCapabilities>(minimal_capabilities()).unwrap();
+        assert_eq!(capabilities.shell_environment, None);
+        let encoded = serde_json::to_value(&capabilities).unwrap();
+        assert!(encoded.get("shellEnvironment").is_none());
+    }
+
+    #[test]
+    fn shell_environment_capability_round_trips_its_ceiling_as_strings() {
+        let mut wire = minimal_capabilities();
+        wire["shellEnvironment"] = json!({
+            "version":"v1", "ceiling":["*","AWS_*","DOCKER_HOST"], "list":true,
+            "limits":{"maxEntries":MAX_ENVIRONMENT_ENTRIES,"maxResponseBytes":MAX_ENVIRONMENT_RESPONSE_BYTES}
+        });
+        let capabilities = serde_json::from_value::<RemoteHostCapabilities>(wire.clone()).unwrap();
+        let shell = capabilities.shell_environment.as_ref().unwrap();
+        assert_eq!(
+            shell.ceiling,
+            [
+                EnvPattern::All,
+                EnvPattern::Prefix("AWS_".into()),
+                EnvPattern::Exact("DOCKER_HOST".into())
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(&capabilities).unwrap()["shellEnvironment"],
+            wire["shellEnvironment"]
+        );
+    }
+
+    #[test_case(json!(["A*B"]) ; "an invalid pattern")]
+    #[test_case(json!(vec!["A"; MAX_SELECTION_PATTERNS + 1]) ; "too many patterns")]
+    fn shell_environment_capability_rejects(ceiling: Value) {
+        let mut wire = minimal_capabilities();
+        wire["shellEnvironment"] = json!({
+            "version":"v1", "ceiling":ceiling, "list":true,
+            "limits":{"maxEntries":1,"maxResponseBytes":1}
+        });
+        assert!(serde_json::from_value::<RemoteHostCapabilities>(wire).is_err());
+    }
+
+    #[test]
+    fn prepare_request_carries_a_shell_environment_only_when_given() {
+        let wire = json!({
+            "version":"v1", "host":binding(), "tool":"shell",
+            "contract":{"id":"shell.v1","version":"v1","resultVersion":"v1"},
+            "arguments":{"command":"env"}
+        });
+        let request = serde_json::from_value::<PrepareRequest>(wire.clone()).unwrap();
+        assert_eq!(request.shell_environment, None);
+        assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+
+        let mut selected = wire;
+        selected["shellEnvironment"] = json!({"pass":["*"],"set":{"RUST_LOG":"info"}});
+        let request = serde_json::from_value::<PrepareRequest>(selected.clone()).unwrap();
+        assert_eq!(
+            request.shell_environment.as_ref().unwrap().pass,
+            [EnvPattern::All]
+        );
+        assert_eq!(serde_json::to_value(&request).unwrap(), selected);
+    }
+
+    #[test]
+    fn environment_list_round_trips_and_withholds_values_it_does_not_show() {
+        let request = json!({
+            "version":"v1", "host":binding(), "selection":{"pass":["FOO_*"],"set":{}}
+        });
+        let parsed = serde_json::from_value::<EnvironmentListRequest>(request.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), request);
+
+        let response = json!({
+            "version":"v1", "truncated":false, "entries":[
+                {"name":"FOO_BAR","value":"bar","state":"forwarded"},
+                {"name":"OTHER","value":null,"state":"outsideCeiling"},
+                {"name":"WORKCELL_MCP_HTTP_TOKEN","value":null,"state":"stripped"}
+            ]
+        });
+        let parsed = serde_json::from_value::<EnvironmentListResponse>(response.clone()).unwrap();
+        assert_eq!(parsed.entries[2].state, EnvironmentEntryState::Stripped);
+        assert_eq!(parsed.entries[2].value, None);
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), response);
+    }
+
+    #[test]
+    fn environment_list_entries_are_bounded() {
+        let entry = json!({"name":"A","value":"a","state":"available"});
+        let response = json!({
+            "version":"v1", "truncated":true,
+            "entries":vec![entry; MAX_ENVIRONMENT_ENTRIES as usize + 1]
+        });
+        assert!(serde_json::from_value::<EnvironmentListResponse>(response).is_err());
     }
 
     fn binding() -> HostBinding {

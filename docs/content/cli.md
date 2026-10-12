@@ -235,7 +235,7 @@ Commands start from a cleared environment. They receive only these variables, ea
 - `HERDR_ENV`, `HERDR_PANE_ID`, `HERDR_TAB_ID`, `HERDR_WORKSPACE_ID`, `HERDR_SOCKET_PATH`, and `HERDR_BIN_PATH`, so a command sees the [Herdr pane](/docs/worktrees/#herdr-integration) Caudra runs in.
 - `ComSpec`, `SystemRoot`, and `WINDIR` on Windows.
 
-Commands also get `NO_COLOR=1` and `CLICOLOR=0`, so tools that honor those conventions print no color codes. An explicit flag such as `--color=always` still wins. Other host variables and startup hooks are not forwarded.
+Commands also get `NO_COLOR=1` and `CLICOLOR=0`, so tools that honor those conventions print no color codes. An explicit flag such as `--color=always` still wins. Other host variables and startup hooks are not forwarded unless you [forward them](#forwarding-more-variables).
 
 `WORKCELL_BASH_EXECUTABLE` selects an absolute Bash path in the execution host's environment. Runtime selection takes precedence over the same build-time variable. With neither set, Workcell tries `/bin/bash`, then `/usr/bin/bash`. An explicit empty, relative, missing, or invalid override fails instead of falling back. The selected executable is bound and revalidated before execution. A changed executable requires restarting the shell host.
 
@@ -244,6 +244,29 @@ WORKCELL_BASH_EXECUTABLE=/usr/bin/bash caudra
 ```
 
 Set this on the Workcell host for remote execution. It is host configuration, not a model tool argument or a Caudra CLI flag. Nix builds can supply an absolute store path through the build-time variable. See [Shell parsing](/docs/permissions/#shell-parsing) for authorization limits. A predictable shell startup is not a sandbox.
+
+### Forwarding more variables
+
+Run `/env` to see every variable Caudra can see, which ones reach shell commands, and to change that. The same settings live in the global `caudra.toml`:
+
+```toml
+[agent.shell_env]
+pass = ["DOCKER_HOST", "SSH_AUTH_SOCK", "AWS_*"]
+set = { AWS_PROFILE = "readonly", AGENT_TOKEN = "{env:CAUDRA_AGENT_TOKEN}" }
+```
+
+- `pass` forwards host variables by exact name or by a `NAME_*` prefix. A name that is unset is skipped. A bare `*` is refused, because the host environment holds your provider keys.
+- `set` gives a command a value of its own, so the agent can use a different Docker host or AWS profile from your terminal. `{env:NAME}` reads a value from Caudra's environment or the global `.env`, which keeps a secret out of the file.
+- `set` wins over `pass`, and both win over the variables listed above. `NO_COLOR` and `CLICOLOR` are always set last.
+- Names that decide how Bash starts, such as `BASH_ENV`, `ENV`, `IFS`, `PS4`, and `PWD`, are refused, and so is a prefix that would match one.
+- Values for `pass` come from the environment Caudra started with and the global `.env`. A project `.env` never supplies one, so a repository cannot choose the value of a variable you forward. Tools in the repository can still read its `.env` file themselves.
+- Only the global file may hold this table. A project `.caudra/caudra.toml` that holds it fails to load.
+- A change applies from the next shell command, with no restart.
+- The setting applies to local sessions. A [sandbox](/docs/sandboxes/#shell-environment) forwards its guest's own variables instead, and a [remote Workcell](/docs/remote-workspaces/) uses the environment its operator gives the server.
+
+The `execution_environment` tool lists the forwarded names without their values, so the agent can tell you when a command needs a variable you have not forwarded.
+
+Docker contexts already work without this: `docker context use` stores the choice under `~/.docker`, and `HOME` is forwarded.
 
 ## Subcommands
 

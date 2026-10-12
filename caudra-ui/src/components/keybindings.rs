@@ -6,7 +6,7 @@ use strum::EnumIter;
 use unicode_width::UnicodeWidthStr;
 
 use crate::components::{
-    automation_inspector, autopilot_panel, decisions_modal, workflow_inspector,
+    automation_inspector, autopilot_panel, decisions_modal, env_modal, workflow_inspector,
 };
 
 /// Spelled once because three tables quote it.
@@ -393,6 +393,7 @@ pub enum KeybindContext {
     Btw,
     FilePicker,
     StashPicker,
+    EnvModal,
     SessionPicker,
     SessionRelocation,
     WorktreePicker,
@@ -435,6 +436,7 @@ impl KeybindContext {
             Self::Btw => "Side Question",
             Self::FilePicker => "File Picker",
             Self::StashPicker => "Stash Picker",
+            Self::EnvModal => "Environment",
             Self::SessionPicker => "Session Picker",
             Self::SessionRelocation => "Session Relocation",
             Self::WorktreePicker => "Worktree Picker",
@@ -478,6 +480,7 @@ impl KeybindContext {
             | Self::Search
             | Self::FilePicker
             | Self::StashPicker
+            | Self::EnvModal
             | Self::SessionPicker
             | Self::SessionRelocation
             | Self::WorktreePicker
@@ -1412,6 +1415,36 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single(key::DELETE.label),
         description: "Delete stash entry (press twice)",
         context: KeybindContext::StashPicker,
+    },
+    Keybind {
+        label: KeyLabel::Alt("Space", "Enter"),
+        description: "Forward the selected variable to shell commands, or stop forwarding it",
+        context: KeybindContext::EnvModal,
+    },
+    Keybind {
+        label: KeyLabel::Alt(env_modal::ADD_LABEL, env_modal::EDIT_LABEL),
+        description: "Set a variable, or edit the selected set value",
+        context: KeybindContext::EnvModal,
+    },
+    Keybind {
+        label: KeyLabel::Single(env_modal::PATTERN_LABEL),
+        description: "Forward an exact name or a NAME_* prefix",
+        context: KeybindContext::EnvModal,
+    },
+    Keybind {
+        label: KeyLabel::Single(env_modal::DELETE_LABEL),
+        description: "Delete the selected set value or pass pattern",
+        context: KeybindContext::EnvModal,
+    },
+    Keybind {
+        label: KeyLabel::Single(env_modal::REVEAL_LABEL),
+        description: "Reveal the selected value until the selection moves",
+        context: KeybindContext::EnvModal,
+    },
+    Keybind {
+        label: KeyLabel::Single("Tab"),
+        description: "Switch between the Local and Sandbox tabs",
+        context: KeybindContext::EnvModal,
     },
     Keybind {
         label: KeyLabel::Multi(&["1", "2", "3"]),

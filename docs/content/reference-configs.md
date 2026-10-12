@@ -18,7 +18,8 @@ description: "Every TOML config file in full, with each key commented out and de
 # brackets, such as <string>, marks a setting that has no default. The global
 # file is ~/.config/caudra/caudra.toml, or %APPDATA%\caudra\caudra.toml on
 # Windows. A project .caudra/caudra.toml takes the same settings, except
-# [experimental], [automations], and the ones marked global-only.
+# [experimental], [automations], [agent.shell_env], and the ones marked
+# global-only.
 #
 # caudra.toml holds the settings only you write. Other files hold what Caudra
 # writes itself, or what needs rules of its own: permissions.toml (permission
@@ -440,6 +441,21 @@ version = 1
 # config only.
 # Type: u64, at least 1.
 # history_max_messages = 50000
+
+[agent.shell_env]
+# Variables local shell commands receive beyond the fixed allowlist. Only the
+# global caudra.toml may hold this table.
+
+# Host variables forwarded to local shell commands: exact names or NAME_*
+# prefixes, never a bare *. Values come from Caudra's environment and the
+# global .env, never a project .env.
+# Type: string[].
+# pass = []
+
+# Values set for local shell commands; {env:NAME} reads Caudra's environment.
+# Wins over pass.
+# Type: table.
+# set = {}
 
 [agent.steering]
 # Automatic steering repairs unusable model output and can add bounded guidance
@@ -1861,4 +1877,11 @@ version = 1
 # What happens to the sandbox when Caudra exits. `detach` is the only value.
 # Type: string.
 # on_exit = "detach"
+
+# Guest variables forwarded to shell commands in this sandbox, resolved inside
+# the guest: pass takes names, NAME_* or *; set takes literal non-secret
+# values. Workcell's own settings, Bash startup names, and proxies are never
+# forwarded.
+# Type: table. Default: pass everything.
+# shell_env = <table>
 ```

@@ -455,6 +455,15 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 | `history_days` | u64 | `30` | 1 | Days the shared message history keeps a message. The newest message on each topic outlives this until `history_max_messages` evicts it. Global config only |
 | `history_max_messages` | u64 | `50000` | 1 | Most messages the shared message history keeps; the oldest go first. Global config only |
 
+### `agent.shell_env`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `pass` | string[] | `[]` | Host variables forwarded to local shell commands: exact names or NAME_* prefixes, never a bare *. Values come from Caudra's environment and the global .env, never a project .env |
+| `set` | table | `{}` | Values set for local shell commands; {env:NAME} reads Caudra's environment. Wins over pass |
+
+These choose which host variables reach local [shell commands](/docs/cli/#forwarding-more-variables), and `/env` edits them. Only the global `caudra.toml` may hold this table. Caudra rejects a project `.caudra/caudra.toml` that contains it, even an empty one, so a repository cannot forward your credentials to the commands it asks for. A [sandbox](/docs/sandboxes/#shell-environment) forwards its guest's variables instead, set per profile.
+
 ### `agent.steering`
 
 Automatic steering repairs unusable model output and can add bounded guidance about repeated behavior or needlessly long tool paths. Every rule is enabled by default. Configure overrides in the `[agent.steering]` table. All fields are optional.

@@ -378,6 +378,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         features: &[],
     },
     BuiltinCommand {
+        name: "/env",
+        description: "View environment variables and choose which reach shell commands",
+        max_args: 0,
+        scope: ChatScope::Any,
+        features: &[],
+    },
+    BuiltinCommand {
         name: "/permissions",
         description: "Inspect active conversation permission rules",
         max_args: 0,

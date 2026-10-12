@@ -82,6 +82,7 @@ use caudra_storage::workflow::WorkflowRunStatus;
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_storage::worktrees;
 use caudra_workbench::WorkbenchAction;
+use caudra_workcell::ShellEnvironmentTarget;
 use caudra_workspace::WorkspaceControlCommand;
 use crossterm::event::KeyEventKind;
 use crossterm::event::{
@@ -263,6 +264,8 @@ pub struct EventLoopParams {
     /// because the selection that built the runtime already named it and the
     /// binding a session stores keeps only an opaque record id.
     pub sandbox_name: Option<SandboxName>,
+    /// Where shell commands run, which decides what `/env` lists and edits.
+    pub shell_environment: ShellEnvironmentTarget,
     pub timeouts: Timeouts,
     pub exit_on_done: bool,
     pub lua_command_reader: LuaCommandReader,
@@ -1139,6 +1142,7 @@ struct SpawnCtx {
     transfer_connector: Option<crate::sandbox::transfer::TransferConnector>,
     sandbox_readiness: Option<SandboxReadiness>,
     sandbox_name: Option<SandboxName>,
+    shell_environment: ShellEnvironmentTarget,
     network_gate: Arc<Mutex<NetworkGate>>,
     timeouts: Timeouts,
     custom_commands: Arc<[CustomCommand]>,
@@ -1424,6 +1428,7 @@ impl SpawnCtx {
         app.sandbox_live.transfer_connector = self.transfer_connector.clone();
         app.sandbox_live.readiness = self.sandbox_readiness.clone();
         app.sandbox_live.name = self.sandbox_name.clone();
+        app.shell_env.target = self.shell_environment.clone();
         app.sandbox_live.network_gate = self.network_gate.clone();
         app.conversation_permissions = conversation_permissions;
         app.permission_authority_factory = self.permission_authority_factory.clone();
@@ -1804,6 +1809,7 @@ impl<'t> EventLoop<'t> {
             initial_seed,
             sandbox_readiness,
             sandbox_name,
+            shell_environment,
             timeouts,
             exit_on_done,
             lua_command_reader,
@@ -1904,6 +1910,7 @@ impl<'t> EventLoop<'t> {
             transfer_connector,
             sandbox_readiness,
             sandbox_name,
+            shell_environment,
             timeouts,
             custom_commands: Arc::from(commands),
             network_gate: Arc::default(),
@@ -5277,6 +5284,7 @@ mod tests {
             transfer_connector: None,
             sandbox_readiness: None,
             sandbox_name: None,
+            shell_environment: ShellEnvironmentTarget::Local,
             network_gate: Arc::default(),
             timeouts: Timeouts::default(),
             custom_commands: Arc::from([]),

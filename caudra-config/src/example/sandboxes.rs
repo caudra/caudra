@@ -78,6 +78,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use serde::Serialize;
+    use workcell_tool_contract::shell_env::ShellEnvironmentSelection;
 
     use super::{NETWORK, PROFILE, PROVIDER, TRANSFER, document};
     use crate::example::Render;
@@ -118,10 +119,13 @@ mod tests {
 
     #[test]
     fn every_key_of_each_record_is_described() {
-        let draft = import(Render::Live { defaults: false });
+        let mut draft = import(Render::Live { defaults: false });
         assert_eq!(names(PROVIDER), keys(draft.providers.values()));
         assert_eq!(names(NETWORK), keys(draft.networks.values()));
         assert_eq!(names(TRANSFER), keys(draft.transfers.values()));
+        for profile in draft.profiles.values_mut() {
+            profile.shell_env = Some(ShellEnvironmentSelection::everything());
+        }
         assert_eq!(names(PROFILE), keys(draft.profiles.values()));
     }
 }

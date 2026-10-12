@@ -4,7 +4,9 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use workcell_mcp::{
-    cli::RawOptions, config::resolve_web_configuration_with, environment::StartupEnvironment,
+    cli::RawOptions,
+    config::{WEB_CONFIGURATION_VARIABLES, resolve_web_configuration_with},
+    environment::StartupEnvironment,
     logging, resolve_shell_policy, run, validate_http_authentication,
 };
 use workcell_mcp_web::WebsearchBackend;
@@ -49,6 +51,7 @@ async fn main() -> ExitCode {
         outbound_proxy = !options.proxy.is_direct(),
         shell_policy_configured = options.shell_policy_file.is_some(),
         shell_yolo = options.yolo,
+        shell_environment_ceiling = ?options.shell_environment_ceiling,
         // The worker path is operator configuration and is never logged, only its presence.
         code_worker_configured = options.code_worker.is_some(),
         code_type_check = options.code_type_check,
@@ -81,7 +84,9 @@ async fn main() -> ExitCode {
             "Shell permission policy parsed"
         );
     }
-    match run(options, web, authentication, shell_policy).await {
+    let mut server_variables = environment.server_variables();
+    server_variables.extend(WEB_CONFIGURATION_VARIABLES.iter().map(ToString::to_string));
+    match run(options, web, authentication, shell_policy, server_variables).await {
         Ok(outcome) => {
             tracing::info!(
                 operation = "mcp.stopped",

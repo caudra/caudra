@@ -52,6 +52,7 @@ A command with an Experiment entry exists only while that switch is on under `[e
 | `/theme` | Switch color theme |  |  |
 | `/view` | Cycle transcript: auto / compact / expanded |  |  |
 | `/mcp` | Configure MCP servers |  |  |
+| `/env` | View environment variables and choose which reach shell commands |  |  |
 | `/permissions` | Inspect active conversation permission rules |  |  |
 | `/login` | Authenticate with an LLM provider |  |  |
 | `/cd` | Change working directory |  |  |

@@ -741,6 +741,42 @@ Otherwise it stays false and `controlPlaneMissing` names the absent subcapabilit
 The optional `/files` byte route is unchanged: every request still presents the process bearer and is
 re-resolved and reauthorized.
 
+#### Shell environment forwarding
+
+By default a remote shell command receives only the fixed environment allowlist described under
+[`shell`](#shell). An operator may let clients forward variables from the server's own environment
+with `--shell-env-ceiling` or `WORKCELL_MCP_SHELL_ENV_CEILING`: comma-separated exact names, `NAME_*`
+prefixes, or `*`. An empty or unset value leaves forwarding off. An invalid pattern, or one that
+captures a name deciding how Bash starts, is a startup error, and the option requires the shell tool
+group. With a ceiling, discovery adds `capabilities.shellEnvironment` with the ceiling, `list: true`,
+and response limits; without one the key is absent.
+
+A shell `ai.workcell/prepare` may then carry `shellEnvironment: {"pass": [...], "set": {...}}`. The
+server forwards each of its variables matched by both the ceiling and a `pass` pattern, then applies
+the `set` literals, which win over a forwarded value. Values are resolved inside the server; the client
+sends names and literals only. Literals follow the same rules as the client's own configuration: no
+`{env:...}` references, credential-looking names, proxy, startup, or `WORKCELL_*` and `SEARXNG_*`
+names. A selection on any other tool, without the capability, or failing those rules is refused with
+`invalid_arguments`, `capability_unavailable`, or `invalid_shell_environment`, never ignored. The
+selection is part of the preparation's `argumentDigest`, and the resolved variables travel with the
+prepared operation, so execution runs exactly the environment that was prepared. A prepare without a
+selection behaves as before.
+
+The server always withholds its own configuration, whatever the ceiling or selection admits: every
+`WORKCELL_*` and `SEARXNG_*` name, every name that decides how Bash starts, every name the server read
+while configuring itself, every web search setting and credential such as `EXA_API_KEY` whichever
+backend is selected, and every key in the `--env-file`. `WORKCELL_MCP_HTTP_TOKEN` is the bearer for
+the endpoint a client authorizes against; a command that could read it could call this server's tools
+directly, around the client's permission review. Proxy names are withheld from forwarding too,
+because the allowlist already passes them, so a selection can neither add nor replace them.
+
+`ai.workcell/environment-list` takes the exact host binding and a selection, and returns the server's
+variables sorted by name with what that selection would do to each: `allowlisted`, `forwarded`, `set`,
+`available` (inside the ceiling, not selected), `outsideCeiling`, or `stripped`. Values are included
+for the first four states only; an `outsideCeiling` or `stripped` entry never carries one. Names that
+are not UTF-8 are skipped, and the response holds at most 1,024 entries and 512 KiB, reporting
+`truncated` past either bound. It is a host method for display, not a tool, and appears in no catalog.
+
 ## Web Configuration
 
 `websearch` uses Exa's credential-free hosted search by default; no API key is required. Search queries
@@ -1086,10 +1122,12 @@ arrives rendered, and `ShellOutput::{stdout,stderr}_redraws_collapsed` say by ho
 
 A shell child starts from the fixed environment allowlist described under [`shell`](#shell). A host
 whose own environment carries context its commands need, such as the terminal pane it runs in, adds
-names with `ShellToolGroup::with_inherited_environment`. Names that decide which Bash runs or how it
-starts, among them every `BASH*` name, `ENV`, `SHELLOPTS`, `CDPATH`, and `PWD`, are dropped even when
-listed, because `PreparedShell::bash_command_contexts` assumes Bash started without them. `NO_COLOR`
-and `CLICOLOR` keep Workcell's values.
+resolved name and value pairs with `ShellToolGroup::with_environment`. The group forwards them
+unchanged after the allowlist. Names that decide which Bash runs or how it starts, among them every
+`BASH*` name, `ENV`, `SHELLOPTS`, `CDPATH`, and `PWD`, are dropped even when supplied, because
+`PreparedShell::bash_command_contexts` assumes Bash started without them. `NO_COLOR` and `CLICOLOR`
+keep Workcell's values. The standalone server uses the same mechanism for
+[shell environment forwarding](#shell-environment-forwarding).
 
 ### Confinement is a host decision
 
@@ -1551,7 +1589,9 @@ through the same confined resolver the filesystem tools use and never opens a pa
 - The child receives a cleaned allowlist of environment variables rather than the complete Workcell
   environment. The allowlist covers `PATH`, home, locale, temporary-directory, and the conventional
   proxy variables, so a credentialed proxy URL is readable by any admitted command. An embedding host
-  can add names with `ShellToolGroup::with_inherited_environment`. Standard input is closed; stdout and
+  can add variables with `ShellToolGroup::with_environment`, and a remote-host client can forward
+  server variables within an operator ceiling, as described under
+  [shell environment forwarding](#shell-environment-forwarding). Standard input is closed; stdout and
   stderr are captured separately.
 - With an MCP progress token, decoded stdout and stderr chunks are sent as ordered
   `notifications/progress` messages before the final result. Without a token, output is still drained

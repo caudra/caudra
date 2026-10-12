@@ -5,8 +5,11 @@ use clap::{Parser, ValueEnum};
 // crate, which is the only group that performs egress.
 use workcell_mcp_web::ProxyConfiguration;
 
+use workcell_host_contract::EnvPattern;
+
 use crate::environment::StartupEnvironment;
 use crate::remote_host::RemoteHostConfiguration;
+use crate::shell_environment::{CEILING_ENV, parse_ceiling};
 
 pub const DEFAULT_PORT: u16 = 3001;
 const CODE_WORKER_CACHE_ENV: &str = "WORKCELL_MCP_CODE_WORKER_CACHE";
@@ -127,6 +130,11 @@ pub struct RawOptions {
     #[arg(long)]
     pub no_shell_output_filter: bool,
 
+    /// Comma-separated names, NAME_* prefixes, or * that remote-host clients may forward from
+    /// this server's environment to shell commands. Server configuration is always withheld.
+    #[arg(long)]
+    pub shell_env_ceiling: Option<String>,
+
     /// Traverse files a repository's `.gitignore` excludes.
     #[arg(long)]
     pub no_gitignore: bool,
@@ -221,6 +229,8 @@ pub struct CliOptions {
     pub shell_policy_file: Option<PathBuf>,
     pub yolo: bool,
     pub shell_output_filter: bool,
+    /// `None` leaves forwarding off.
+    pub shell_environment_ceiling: Option<Vec<EnvPattern>>,
     pub honor_gitignore: bool,
     pub code_worker: Option<PathBuf>,
     pub code_worker_cache: Option<PathBuf>,
@@ -261,6 +271,7 @@ impl fmt::Debug for CliOptions {
             )
             .field("yolo", &self.yolo)
             .field("shell_output_filter", &self.shell_output_filter)
+            .field("shell_environment_ceiling", &self.shell_environment_ceiling)
             .field("honor_gitignore", &self.honor_gitignore)
             .field(
                 "code_worker",
@@ -321,6 +332,7 @@ pub enum CliError {
     SnapshotRequiresWrite,
     SnapshotRequiresFiles,
     InvalidTransferRoot,
+    InvalidShellEnvironmentCeiling,
 }
 
 impl fmt::Display for CliError {
@@ -346,7 +358,7 @@ impl fmt::Display for CliError {
                 "--http-proxy, --no-proxy, and --no-http-proxy require the web tool group"
             }
             Self::ShellOptionRequiresShell => {
-                "--shell-policy, --yolo, and --no-shell-output-filter require the shell tool group"
+                "--shell-policy, --yolo, --no-shell-output-filter, and --shell-env-ceiling require the shell tool group"
             }
             Self::CodeOptionRequiresPythonExecution => {
                 "--code-worker, --code-worker-cache, and --no-code-type-check require the python_execution tool group"
@@ -380,6 +392,9 @@ impl fmt::Display for CliError {
                 "--snapshot-root requires the files tool group"
             }
             Self::InvalidTransferRoot => "--transfer-root requires Unix, authenticated remote-host discovery, --allow-write, and the transfer tool group",
+            Self::InvalidShellEnvironmentCeiling => {
+                "WORKCELL_MCP_SHELL_ENV_CEILING must list variable names, NAME_* prefixes, or *, separated by commas, and none may capture a name that decides how Bash starts"
+            }
         })
     }
 }
@@ -392,8 +407,10 @@ impl RawOptions {
             || self.http_bind.is_some()
             || self.http_token_file.is_some()
             || !self.allowed_hosts.is_empty();
-        let explicit_shell_options =
-            self.shell_policy.is_some() || self.yolo || self.no_shell_output_filter;
+        let explicit_shell_options = self.shell_policy.is_some()
+            || self.yolo
+            || self.no_shell_output_filter
+            || self.shell_env_ceiling.is_some();
         let explicit_code_options = self.code_worker.is_some()
             || self.code_worker_cache.is_some()
             || self.no_code_type_check;
@@ -500,6 +517,14 @@ impl RawOptions {
                 Some(_) => return Err(CliError::InvalidEnvironment),
             }
         };
+        let shell_environment_ceiling = match self.shell_env_ceiling {
+            Some(value) => Some(value),
+            None => environment_value(environment, CEILING_ENV)?,
+        }
+        .map(|value| parse_ceiling(&value))
+        .transpose()
+        .map_err(|_| CliError::InvalidShellEnvironmentCeiling)?
+        .flatten();
         let honor_gitignore = if self.no_gitignore {
             false
         } else {
@@ -648,7 +673,10 @@ impl RawOptions {
             return Err(CliError::ProxyOptionRequiresWeb);
         }
         if !groups.contains(&ToolGroup::Shell)
-            && (explicit_shell_options || shell_policy_file.is_some() || yolo)
+            && (explicit_shell_options
+                || shell_policy_file.is_some()
+                || yolo
+                || shell_environment_ceiling.is_some())
         {
             return Err(CliError::ShellOptionRequiresShell);
         }
@@ -688,6 +716,7 @@ impl RawOptions {
             shell_policy_file,
             yolo,
             shell_output_filter,
+            shell_environment_ceiling,
             honor_gitignore,
             code_worker,
             code_worker_cache: code_worker_cache.or_else(default_code_worker_cache),
@@ -837,6 +866,8 @@ fn valid_host(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
 
     #[test]
@@ -1224,6 +1255,44 @@ mod tests {
             raw.resolve(&environment).unwrap_err(),
             CliError::ShellOptionRequiresShell
         );
+    }
+
+    #[test_case(&["--tool-group", "web", "--shell-env-ceiling", "*"], Err(CliError::ShellOptionRequiresShell) ; "requires_the_shell_group")]
+    #[test_case(&["--shell-env-ceiling", "A*B", "/"], Err(CliError::InvalidShellEnvironmentCeiling) ; "invalid_pattern")]
+    #[test_case(&["--shell-env-ceiling", "", "/"], Ok(None) ; "empty_is_off")]
+    #[test_case(&["/"], Ok(None) ; "off_by_default")]
+    #[test_case(&["--shell-env-ceiling", "FOO_*", "/"], Ok(Some(vec![EnvPattern::Prefix("FOO_".into())])) ; "prefix")]
+    fn shell_environment_ceiling(
+        arguments: &[&str],
+        expected: Result<Option<Vec<EnvPattern>>, CliError>,
+    ) {
+        let raw = RawOptions::try_parse_from(
+            std::iter::once("workcell-mcp").chain(arguments.iter().copied()),
+        )
+        .unwrap();
+        let environment = StartupEnvironment::load(None).unwrap();
+        assert_eq!(
+            raw.resolve(&environment)
+                .map(|options| options.shell_environment_ceiling),
+            expected
+        );
+    }
+
+    #[test]
+    fn shell_environment_ceiling_is_read_from_the_environment_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.env");
+        std::fs::write(&path, format!("{CEILING_ENV}=*\n")).unwrap();
+        let environment = StartupEnvironment::load(Some(&path)).unwrap();
+        let options = RawOptions::try_parse_from(["workcell-mcp", "/"])
+            .unwrap()
+            .resolve(&environment)
+            .unwrap();
+        assert_eq!(
+            options.shell_environment_ceiling,
+            Some(vec![EnvPattern::All])
+        );
+        assert!(environment.server_variables().contains(CEILING_ENV));
     }
 
     #[test]

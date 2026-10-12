@@ -154,3 +154,10 @@ version = 1
 # What happens to the sandbox when Caudra exits. `detach` is the only value.
 # Type: string.
 # on_exit = "detach"
+
+# Guest variables forwarded to shell commands in this sandbox, resolved inside
+# the guest: pass takes names, NAME_* or *; set takes literal non-secret
+# values. Workcell's own settings, Bash startup names, and proxies are never
+# forwarded.
+# Type: table. Default: pass everything.
+# shell_env = <table>

@@ -2,7 +2,7 @@ use super::super::keybindings::key;
 use super::super::text_editor::TextEditor;
 use caudra_config::sandbox::{
     CidrRule, DomainRule, LeaseSeconds, MAX_NETWORK_RULES, RecordKind, SandboxDraft, SandboxError,
-    SandboxName, SandboxOrigin, SandboxRecord, TransferPolicy,
+    SandboxName, SandboxOrigin, SandboxProfile, SandboxRecord, TransferPolicy,
 };
 use caudra_storage::sandbox_auth::SandboxCredentialRef;
 use caudra_workspace::WorkspacePath;
@@ -378,7 +378,16 @@ impl Form {
         let name = SandboxName::parse(&self.text("name")).map_err(|error| error.to_string())?;
         let object = Value::Object(object);
         let record = match self.kind {
-            RecordKind::Profile => serde_json::from_value(object).map(SandboxRecord::Profile),
+            RecordKind::Profile => {
+                serde_json::from_value(object).map(|mut profile: SandboxProfile| {
+                    profile.shell_env = self
+                        .original
+                        .as_ref()
+                        .and_then(|original| draft.profiles.get(original))
+                        .and_then(|existing| existing.shell_env.clone());
+                    SandboxRecord::Profile(profile)
+                })
+            }
             RecordKind::Provider => serde_json::from_value(object).map(SandboxRecord::Provider),
             RecordKind::Network => serde_json::from_value(object).map(SandboxRecord::Network),
             RecordKind::Transfer => serde_json::from_value(object).map(SandboxRecord::Transfer),
@@ -507,8 +516,8 @@ fn default_text(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CIDR_HELP, DOMAIN_HELP, MAX_NETWORK_RULES, TextEditor, key, network_list_key, parse_cidrs,
-        parse_domains,
+        CIDR_HELP, DOMAIN_HELP, Form, MAX_NETWORK_RULES, RecordKind, SandboxDraft, SandboxName,
+        SandboxRecord, TextEditor, key, network_list_key, parse_cidrs, parse_domains,
     };
     use crate::components::keybindings::Bind;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -517,6 +526,58 @@ mod tests {
     const DOMAIN: &str = "api.example.com";
     const LINE_ERROR: &str = "Domain line 3:";
     const STALE_HELP: &str = "the rule-list help names a key that is no longer bound";
+    const PROFILE: &str = "dev";
+    const SHELL_ENV_DROPPED: &str = "saving the profile form must keep the profile's shell_env";
+    const PROFILE_WITH_SHELL_ENV: &str = r#"
+version = 1
+[sandbox.providers.local]
+kind = "e2b-libvirt"
+api_endpoint = "http://127.0.0.1:3000"
+proxy_endpoint = "http://127.0.0.1:49983"
+credential_ref = "sandbox-api:test"
+[sandbox.networks.deny]
+enforcement = "required"
+tls_mode = "sni-only"
+[sandbox.transfers.source]
+respect_gitignore = true
+initial_seed = "ask"
+delete_extraneous = false
+exclude = ["**/.env*", "**/.git/**"]
+[sandbox.profiles.dev]
+provider = "local"
+template = "rust"
+cpus = 2
+memory_mib = 2048
+disk_gib = 20
+cwd = "."
+network = "deny"
+transfer = "source"
+persistent = true
+running_ttl_seconds = 3600
+on_exit = "detach"
+[sandbox.profiles.dev.shell_env]
+pass = ["CARGO_*", "RUST_LOG"]
+set = { APP_MODE = "test" }
+"#;
+
+    #[test]
+    fn editing_a_profile_keeps_its_shell_env() {
+        let draft = SandboxDraft::import(PROFILE_WITH_SHELL_ENV).unwrap();
+        let name = SandboxName::parse(PROFILE).unwrap();
+        let profile = draft.profiles[&name].clone();
+        let mut form = Form::new(
+            RecordKind::Profile,
+            Some(name.clone()),
+            Some(SandboxRecord::Profile(profile.clone())),
+        )
+        .unwrap();
+        let saved = form.validate(&draft).unwrap();
+        assert!(profile.shell_env.is_some());
+        assert_eq!(
+            saved.profiles[&name].shell_env, profile.shell_env,
+            "{SHELL_ENV_DROPPED}"
+        );
+    }
 
     #[test_case(DOMAIN_HELP; "domains")]
     #[test_case(CIDR_HELP; "cidrs")]

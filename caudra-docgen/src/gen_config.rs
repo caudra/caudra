@@ -6,6 +6,7 @@ use caudra_config::config_file::CONFIG_VERSION;
 use caudra_config::decisions::{DecisionFeatures, DecisionThresholds, FeatureMode};
 use caudra_config::example::Entry;
 use caudra_config::files::{self, CONFIG_FILES, Scope};
+use caudra_config::shell_env::ShellEnvConfig;
 use caudra_config::steering::{SteeringRule, SteeringRulesConfig};
 use caudra_config::{
     AgentConfig, AutomationsConfig, AutopilotConfig, ConfigField, ConfigValue,
@@ -488,6 +489,19 @@ fn write_automations_section(out: &mut String) {
          table. Caudra rejects a project `.caudra/caudra.toml` that contains it, even an empty \
          one, so a repository cannot raise these limits or let automations reach a private \
          network.\n"
+    )
+    .unwrap();
+}
+
+fn write_shell_env_section(out: &mut String) {
+    write_section(out, "agent.shell_env", ShellEnvConfig::FIELDS);
+    writeln!(
+        out,
+        "These choose which host variables reach local [shell commands](/docs/cli/#forwarding-more-variables), \
+         and `/env` edits them. Only the global `caudra.toml` may hold this table. Caudra rejects a \
+         project `.caudra/caudra.toml` that contains it, even an empty one, so a repository cannot \
+         forward your credentials to the commands it asks for. A [sandbox](/docs/sandboxes/#shell-environment) \
+         forwards its guest's variables instead, set per profile.\n"
     )
     .unwrap();
 }
@@ -1170,6 +1184,7 @@ For every setting in one file, with its type, default, and description, see [Ref
     write_tool_output_section(&mut out);
     write_section(&mut out, "agent", AgentConfig::FIELDS);
     write_section(&mut out, "agent.messaging", MessagingConfig::FIELDS);
+    write_shell_env_section(&mut out);
     write_steering_section(&mut out);
     write_section(&mut out, "provider", ProviderConfig::FIELDS);
     write_section(&mut out, "storage", StorageConfig::FIELDS);

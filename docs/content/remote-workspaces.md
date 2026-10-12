@@ -34,6 +34,8 @@ Reviewed transfer also requires positive file, staging, I/O, lifetime, buffer an
 
 Missing capabilities fail startup, even if you disable the corresponding model tools. Keep execution-environment disclosure enabled. Do not pass `--no-expose-execution-environment`.
 
+Shell commands on the server receive the server's fixed variable list, taken from its own environment. Caudra forwards nothing from the client, and `[agent.shell_env]` applies only to [local sessions](/docs/cli/#forwarding-more-variables). Set what commands need in the server's environment. A server's `shellEnvironment` capability is used only by [sandboxes](/docs/sandboxes/#shell-environment).
+
 On the server, create private change record and transfer directories outside the exposed workspace. The paths below are examples to replace with your deployment paths. The token file must contain a bearer token of at least 32 bytes, supplied through your secret-management process.
 
 ```bash

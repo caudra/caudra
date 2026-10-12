@@ -20,31 +20,15 @@ use std::{
 };
 use tokio::process::{Child, Command};
 
+use workcell_tool_contract::shell_env::{
+    BASE_ALLOWLIST, BASH_EXECUTABLE_ENV, FORCED_VARIABLES, is_shell_startup_variable,
+};
+
 use crate::bash::BashContextAssumptions;
 
 const TERMINATION_GRACE: Duration = Duration::from_secs(3);
 #[cfg(unix)]
 const BASH_ARGUMENTS: [&str; 3] = ["--noprofile", "--norc", "-c"];
-const BASH_EXECUTABLE_ENV: &str = "WORKCELL_BASH_EXECUTABLE";
-/// Bash gives variables under this prefix special meaning, `BASH_ENV` and exported functions among
-/// them.
-const BASH_VARIABLE_PREFIX: &str = "BASH";
-/// Names that decide which Bash runs or how it starts. A host that lists one for forwarding does not
-/// get it, because the policy's startup assumptions hold only in their absence.
-const STARTUP_VARIABLES: &[&str] = &[
-    BASH_EXECUTABLE_ENV,
-    "ENV",
-    "SHELLOPTS",
-    "POSIXLY_CORRECT",
-    "CDPATH",
-    "PWD",
-    "OLDPWD",
-    "PROMPT_COMMAND",
-    "PS4",
-    "IFS",
-    "GLOBIGNORE",
-    "EXECIGNORE",
-];
 #[cfg(unix)]
 const DEFAULT_BASH_EXECUTABLES: &[&str] = &["/bin/bash", "/usr/bin/bash"];
 const MAX_LAUNCHER_PATH_BYTES: usize = 4096;
@@ -223,11 +207,11 @@ pub(crate) fn retained_launcher_bytes(launcher: &SharedShellLauncher) -> usize {
 pub(crate) fn platform_command(
     launcher: &ShellLauncher,
     script: &str,
-    inherited: &[&str],
+    environment: &[(String, OsString)],
 ) -> Command {
     let mut command = Command::new(&launcher.executable);
     command.args(BASH_ARGUMENTS).arg(script);
-    clean_environment(&mut command, inherited);
+    clean_environment(&mut command, environment);
     // A dedicated group lets cancellation target descendants that inherited the shell's group.
     command.as_std_mut().process_group(0);
     command
@@ -236,60 +220,31 @@ pub(crate) fn platform_command(
 pub(crate) fn platform_command(
     launcher: &ShellLauncher,
     script: &str,
-    inherited: &[&str],
+    environment: &[(String, OsString)],
 ) -> Command {
     let mut command = Command::new(&launcher.executable);
     command.arg("/D").arg("/S").arg("/C").arg(script);
-    clean_environment(&mut command, inherited);
+    clean_environment(&mut command, environment);
     command
 }
 
-fn clean_environment(command: &mut Command, inherited: &[&str]) {
-    clean_environment_with(command, inherited, |name: &str| std::env::var_os(name));
+fn clean_environment(command: &mut Command, environment: &[(String, OsString)]) {
+    clean_environment_with(command, environment, |name: &str| std::env::var_os(name));
 }
 
 fn clean_environment_with(
     command: &mut Command,
-    inherited: &[&str],
+    environment: &[(String, OsString)],
     read: impl Fn(&str) -> Option<OsString>,
 ) {
     command.env_clear();
-    let listed = inherited
-        .iter()
-        .copied()
-        .filter(|name| !decides_bash_startup(name));
-    for name in [
-        "PATH",
-        "HOME",
-        "USER",
-        "LOGNAME",
-        "TMPDIR",
-        "TMP",
-        "TEMP",
-        "LANG",
-        "LC_ALL",
-        "TERM",
-        "ComSpec",
-        "SystemRoot",
-        "WINDIR",
-        // Proxy selection is forwarded verbatim, credentials included. Under a sandbox whose only
-        // egress is an enforcing proxy, withholding it makes every network-using command fail
-        // closed; the accepted cost is that a credentialed proxy URL becomes readable by any
-        // admitted command. Both cases are listed because curl reads the lowercase names while
-        // most other clients read the uppercase ones.
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-        "NO_PROXY",
-        "no_proxy",
-    ]
-    .into_iter()
-    .chain(listed)
-    {
+    for &name in BASE_ALLOWLIST {
         if let Some(value) = read(name) {
+            command.env(name, value);
+        }
+    }
+    for (name, value) in environment {
+        if !is_shell_startup_variable(name) {
             command.env(name, value);
         }
     }
@@ -301,12 +256,9 @@ fn clean_environment_with(
     // command runs in, not how its output is rendered, and a caller who disables
     // filtering still sees exactly what the command wrote. An explicit
     // `--color=always` still wins, which is the intended behaviour.
-    command.env("NO_COLOR", "1");
-    command.env("CLICOLOR", "0");
-}
-
-fn decides_bash_startup(name: &str) -> bool {
-    name.starts_with(BASH_VARIABLE_PREFIX) || STARTUP_VARIABLES.contains(&name)
+    for (name, value) in FORCED_VARIABLES {
+        command.env(name, value);
+    }
 }
 
 pub(crate) async fn terminate_and_reap(
@@ -515,12 +467,17 @@ mod tests {
         for (name, value) in fixture {
             command.env(name, value);
         }
-        clean_environment_with(&mut command, listed, |name| {
+        let read = |name: &str| {
             fixture
                 .iter()
                 .find(|(candidate, _)| *candidate == name)
                 .map(|(_, value)| OsString::from(*value))
-        });
+        };
+        let environment: Vec<(String, OsString)> = listed
+            .iter()
+            .filter_map(|name| read(name).map(|value| ((*name).to_owned(), value)))
+            .collect();
+        clean_environment_with(&mut command, &environment, read);
         command
             .as_std()
             .get_envs()

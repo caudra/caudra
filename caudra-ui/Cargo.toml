@@ -24,6 +24,7 @@ caudra-workspace = { workspace = true }
 caudra-workcell = { workspace = true }
 caudra-workbench = { workspace = true }
 caudra-workflow = { workspace = true }
+workcell-tool-contract = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 color-eyre = { workspace = true }

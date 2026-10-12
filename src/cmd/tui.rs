@@ -1795,6 +1795,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                     })
                 }),
                 sandbox_name: sandbox_name.clone(),
+                shell_environment: workcell_runtime.shell_environment().clone(),
                 timeouts: stack.timeouts(),
                 exit_on_done: cli.exit_on_done,
                 lua_command_reader: stack.plugin_host.command_reader(),

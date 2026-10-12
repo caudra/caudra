@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use caudra_agent::mcp::config::{http_endpoints, load_global_config};
 use caudra_agent::tools::{RegistryError, ToolRegistry};
 use caudra_agent::workspace_transfer::RemoteRootIdentity;
-use caudra_config::sandbox::{Revision, SandboxName};
+use caudra_config::sandbox::{Revision, SandboxName, SandboxProfile, persistence::SandboxStore};
 use caudra_config::{
     Feature, FeatureDisabled, FeatureFlags, load_env_files, load_global_env_file,
     workcell::{
@@ -12,7 +12,7 @@ use caudra_config::{
         WorkcellSelectionError, WorkcellSourceRef, load_workcell_profiles, select_workcell,
     },
 };
-use caudra_sandbox::{Controller as SandboxController, ResumePolicy, RuntimeLease};
+use caudra_sandbox::{Controller as SandboxController, InstanceRecord, ResumePolicy, RuntimeLease};
 use caudra_storage::auth::WorkcellCredentialRef;
 use caudra_storage::auth::{
     WorkcellCredential, WorkcellCredentialName, WorkcellCredentialNameError,
@@ -25,9 +25,11 @@ use caudra_storage::remote_operation_journal::{
 };
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_storage::{StateDir, StorageError};
+use caudra_workcell::host_contract::ShellEnvironmentSelection;
 use caudra_workcell::{
-    HostError, NamedBearerCredential, RemoteConnectionStatus, RemoteHostRegistrationError,
-    RemoteWorkcellClient, RemoteWorkcellError, RemoteWorkcellHost, WorkcellHost,
+    GuestShellEnvironment, HostError, NamedBearerCredential, RemoteConnectionStatus,
+    RemoteHostRegistrationError, RemoteWorkcellClient, RemoteWorkcellError, RemoteWorkcellHost,
+    ShellEnvironmentTarget, WorkcellHost,
 };
 use caudra_workspace::{
     DirectoryNavigation, IdentifierError, SessionBindingId, WorkspaceCapability, WorkspaceError,
@@ -119,6 +121,7 @@ pub struct WorkcellRuntime {
     local_documents: Option<Arc<LocalDocumentStore>>,
     remote_project_context: Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
     display: WorkcellDisplay,
+    shell_environment: ShellEnvironmentTarget,
     _sandbox_lifecycle: Option<RuntimeLease>,
 }
 
@@ -225,7 +228,10 @@ impl WorkcellRuntime {
             client,
             binding,
             lease,
+            shell_environment: (profile, shell_selection),
         } = connect_sandbox(name, resume, storage, revision, features)?;
+        let guest =
+            GuestShellEnvironment::attach(client.clone(), name.clone(), profile, shell_selection);
         let mut runtime = Self::initialize_remote(
             selection,
             client,
@@ -236,6 +242,7 @@ impl WorkcellRuntime {
             features,
         )?;
         runtime.display.label = format!("sandbox '{name}'");
+        runtime.shell_environment = ShellEnvironmentTarget::Sandbox(guest);
         Ok(runtime)
     }
 
@@ -316,6 +323,9 @@ impl WorkcellRuntime {
                 client.descriptor().path_style.as_str()
             ),
         };
+        let shell_environment = ShellEnvironmentTarget::Remote {
+            label: display.label.clone(),
+        };
         let host = RemoteWorkcellHost::new(client);
         let (global_mcp, errors) = load_global_config(client_cwd);
         if !errors.is_empty() {
@@ -336,6 +346,7 @@ impl WorkcellRuntime {
             local_documents: Some(local_documents),
             remote_project_context: Some(remote_project_context),
             display,
+            shell_environment,
             _sandbox_lifecycle: sandbox_lifecycle,
         }
         .ready())
@@ -363,6 +374,7 @@ impl WorkcellRuntime {
             local_documents: None,
             remote_project_context: None,
             _sandbox_lifecycle: None,
+            shell_environment: ShellEnvironmentTarget::Local,
             display: WorkcellDisplay {
                 label: "embedded Workcell".to_owned(),
                 origin: WorkcellOrigin::Embedded,
@@ -417,6 +429,10 @@ impl WorkcellRuntime {
 
     pub fn display(&self) -> &WorkcellDisplay {
         &self.display
+    }
+
+    pub fn shell_environment(&self) -> &ShellEnvironmentTarget {
+        &self.shell_environment
     }
 
     pub fn connection_status(&self) -> Option<RemoteConnectionStatus> {
@@ -532,6 +548,7 @@ struct SandboxConnection {
     client: RemoteWorkcellClient,
     binding: StoredWorkspaceBinding,
     lease: RuntimeLease,
+    shell_environment: (Option<SandboxName>, ShellEnvironmentSelection),
 }
 
 fn connect_sandbox(
@@ -559,6 +576,7 @@ fn connect_sandbox(
         ))?
     };
     let mut selection = ticket.selection.clone();
+    let shell_environment = sandbox_shell_environment(&ticket.record);
     let credential = ephemeral_credential(ticket.take_token())?;
     selection.credential_ref = Some(WorkcellCredentialRef::new(credential.name().clone()));
     let client = connect_remote_with_credential(&selection, storage, Some(credential))?;
@@ -568,7 +586,33 @@ fn connect_sandbox(
         client,
         binding,
         lease,
+        shell_environment,
     })
+}
+
+/// The saved profile wins, so `/env` edits reach later attaches. The launch snapshot covers a
+/// profile deleted since, and an instance with neither forwards what its guest allows.
+fn sandbox_shell_environment(
+    record: &InstanceRecord,
+) -> (Option<SandboxName>, ShellEnvironmentSelection) {
+    let Some(launch) = record.launch.as_ref().map(|launch| launch.configuration()) else {
+        return (None, ShellEnvironmentSelection::everything());
+    };
+    let saved = SandboxStore::user_global()
+        .and_then(|store| store.load())
+        .ok()
+        .and_then(|loaded| {
+            loaded
+                .saved()
+                .configuration()
+                .profiles
+                .get(&launch.profile_name)
+                .map(SandboxProfile::effective_shell_env)
+        });
+    (
+        Some(launch.profile_name.clone()),
+        saved.unwrap_or_else(|| launch.profile.value().effective_shell_env()),
+    )
 }
 
 pub struct ControlConnection {

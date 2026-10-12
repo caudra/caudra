@@ -42,19 +42,20 @@ use workcell_host_contract::{
     ChangesPrepareRevertResponse, ChangesRecordsRequest, ChangesRecordsResponse,
     ChangesReleaseRequest, ChangesReleaseResponse, ChangesStatusResponse, ChangesTicketRequest,
     ContractBinding, ContractVersion, DIRECT_EXEC_CONTRACT_ID, DirectExecCapability, DisplayText,
-    ErrorText, HostBinding, Identifier, MAX_ARGUMENT_BYTES, OperationBinding, OperationIntent,
-    OperationKind, OutcomeKind, PROJECT_ASSET_MANIFEST_VERSION, ProjectAssetCapability,
-    ProjectAssetLimits, ProjectAssetMethods, RemoteHostCapabilities, RemoteHostCwd,
-    RemoteHostDescriptor, RemoteHostRevisions, RemoteHostToolCapability, RemoteHostToolLimits,
-    RemoteOperationCapability, RemoteOperationMethods, ResourceAccess, ResourceId, ResourceIntent,
-    RevertCounts, RevertDirection, RevertPreview, Revision, SCM_DIFF_METHOD, SCM_DISCOVER_METHOD,
-    SCM_LOG_METHOD, SCM_MUTATION_CONTRACT_ID, SCM_PREPARE_MUTATION_METHOD, SCM_READ_SIDE_METHOD,
-    SCM_STATUS_METHOD, ScmCapability, ScmDiffRequest, ScmDiscoverRequest, ScmLimits, ScmLogRequest,
-    ScmMethods, ScmMutation, ScmPrepareMutationRequest, ScmPrepareMutationResponse,
-    ScmReadSideRequest, ScmStatusRequest, StructuredOutcome, ToolResultContent, ToolResultEnvelope,
-    ToolResultText, WORKSPACE_MUTATION_CONTRACT_ID, WorkspaceCapability, WorkspaceLimits,
-    WorkspaceMethods, WorkspaceMutationCapability, WorkspacePath, WorkspaceRequestBinding,
-    WorkspaceWatchCapability, WorkspaceWatchLimits, WorkspaceWatchMethods,
+    ENVIRONMENT_LIST_METHOD, EnvironmentListRequest, EnvironmentListResponse, ErrorText,
+    HostBinding, Identifier, MAX_ARGUMENT_BYTES, OperationBinding, OperationIntent, OperationKind,
+    OutcomeKind, PROJECT_ASSET_MANIFEST_VERSION, ProjectAssetCapability, ProjectAssetLimits,
+    ProjectAssetMethods, RemoteHostCapabilities, RemoteHostCwd, RemoteHostDescriptor,
+    RemoteHostRevisions, RemoteHostToolCapability, RemoteHostToolLimits, RemoteOperationCapability,
+    RemoteOperationMethods, ResourceAccess, ResourceId, ResourceIntent, RevertCounts,
+    RevertDirection, RevertPreview, Revision, SCM_DIFF_METHOD, SCM_DISCOVER_METHOD, SCM_LOG_METHOD,
+    SCM_MUTATION_CONTRACT_ID, SCM_PREPARE_MUTATION_METHOD, SCM_READ_SIDE_METHOD, SCM_STATUS_METHOD,
+    ScmCapability, ScmDiffRequest, ScmDiscoverRequest, ScmLimits, ScmLogRequest, ScmMethods,
+    ScmMutation, ScmPrepareMutationRequest, ScmPrepareMutationResponse, ScmReadSideRequest,
+    ScmStatusRequest, ShellEnvironmentSelection, StructuredOutcome, ToolResultContent,
+    ToolResultEnvelope, ToolResultText, WORKSPACE_MUTATION_CONTRACT_ID, WorkspaceCapability,
+    WorkspaceLimits, WorkspaceMethods, WorkspaceMutationCapability, WorkspacePath,
+    WorkspaceRequestBinding, WorkspaceWatchCapability, WorkspaceWatchLimits, WorkspaceWatchMethods,
 };
 use workcell_mcp_code::{CodeBuildError, CodeConfiguration, CodeInput, CodeToolGroup};
 use workcell_mcp_code_graph::{
@@ -69,8 +70,8 @@ use workcell_mcp_files::{
     root_relative_resource_id, root_relative_resource_scope,
 };
 use workcell_mcp_shell::{
-    ShellInput, ShellPermissionPolicy, ShellProgressChunk, ShellProgressSink, ShellToolGroup,
-    mcp_progress_sink,
+    ShellEnvironment, ShellInput, ShellPermissionPolicy, ShellProgressChunk, ShellProgressSink,
+    ShellToolGroup, mcp_progress_sink,
 };
 use workcell_mcp_web::{
     PreparedWebOperation, ProxyConfiguration, WebOperationExecution, WebToolGroup, WebfetchError,
@@ -105,6 +106,7 @@ use crate::{
         WATCH_CLOSE_METHOD, WATCH_OPEN_METHOD, WATCH_POLL_METHOD, WatchCloseRequest,
         WatchOpenRequest, WatchPollRequest,
     },
+    shell_environment::ShellForwarding,
     transfer::TransferGroup,
 };
 
@@ -124,6 +126,8 @@ const WEB_PREPARATION_FAILED_CODE: &str = "web_preparation_failed";
 const SHELL_COMMAND_REFUSED_CODE: &str = "shell_command_refused";
 const PYTHON_PREPARATION_FAILED_CODE: &str = "python_preparation_failed";
 const PREPARATION_INTERNAL_CODE: &str = "preparation_internal_error";
+const INVALID_SHELL_ENVIRONMENT_CODE: &str = "invalid_shell_environment";
+const SHELL_TOOL: &str = "shell";
 /// A holder's stack of pending reverts, which a revert extends and an unrevert settles.
 const CHANGES_HOLDER_RESOURCE_PREFIX: &str = "workspace-changes:holder:";
 static PROCESS_INSTANCE_ID: OnceLock<Arc<str>> = OnceLock::new();
@@ -153,6 +157,8 @@ pub struct ToolConfiguration<'a> {
     pub proxy: ProxyConfiguration,
     pub shell_policy: ShellPermissionPolicy,
     pub shell_output_filter: bool,
+    /// What remote-host clients may forward from this process's environment to shell commands.
+    pub shell_environment: Option<ShellForwarding>,
     /// Applies to every group that traverses: the file tools and the code graph.
     pub honor_gitignore: bool,
     pub code: CodeConfiguration<'a>,
@@ -172,6 +178,7 @@ pub struct WorkcellServer {
     code_graph: Option<Arc<CodeGraphToolGroup>>,
     web: Option<WebToolGroup>,
     shell: Option<ShellToolGroup>,
+    shell_environment: Option<Arc<ShellForwarding>>,
     // The code group owns a worker pool, which is shared rather than cloned so every server clone
     // draws on the same bounded set of subprocesses.
     code: Option<Arc<CodeToolGroup>>,
@@ -247,7 +254,11 @@ impl WorkcellServer {
             .map(|group| group.as_str())
             .collect::<Vec<_>>();
         policy_groups.sort_unstable();
-        let policy_revision = CatalogRevision::for_serializable(&serde_json::json!({
+        let shell_environment = tools
+            .shell_environment
+            .filter(|_| groups.contains(&ToolGroup::Shell))
+            .map(Arc::new);
+        let mut policy = serde_json::json!({
             "version": "v1",
             "groups": policy_groups,
             "allowWrite": tools.allow_write,
@@ -258,8 +269,13 @@ impl WorkcellServer {
             "maxTransferBytes": groups.contains(&ToolGroup::Transfer).then_some(tools.max_transfer_bytes),
             "changes": tools.snapshot_root.is_some(),
             "reviewedTransfer": tools.transfer_root.is_some(),
-        }))
-        .map_err(|_| ServerBuildError::CatalogSerialization)?;
+        });
+        // Added only when configured, so a server without a ceiling keeps its revision.
+        if let Some(forwarding) = &shell_environment {
+            policy["shellEnvironmentCeiling"] = serde_json::json!(forwarding.ceiling());
+        }
+        let policy_revision = CatalogRevision::for_serializable(&policy)
+            .map_err(|_| ServerBuildError::CatalogSerialization)?;
         let filesystem_limits = FilesystemLimits {
             honor_gitignore: tools.honor_gitignore,
             ..FilesystemLimits::default()
@@ -403,6 +419,7 @@ impl WorkcellServer {
             code_graph,
             web,
             shell,
+            shell_environment,
             code,
             transfer,
             execution_environment,
@@ -776,6 +793,10 @@ impl WorkcellServer {
                 changes: snapshots.as_ref().map(|_| SnapshotManager::capability()),
                 control_plane,
                 control_plane_missing,
+                shell_environment: self
+                    .shell_environment
+                    .as_deref()
+                    .map(ShellForwarding::capability),
             },
         };
         self.workspace_files = Some(workspace_files);
@@ -935,6 +956,11 @@ impl WorkcellServer {
         request
             .validate(RemoteHostState::limits().max_argument_bytes)
             .map_err(|_| remote_error(crate::remote_host::RemoteOperationError::InvalidRequest))?;
+        let shell_environment = request
+            .shell_environment
+            .as_ref()
+            .map(|selection| self.resolve_shell_environment(request.tool.as_str(), selection))
+            .transpose()?;
         let reservation = remote
             .reserve_preparation_wait(preparation_reservation_bytes(request.tool.as_str()), token)
             .await
@@ -962,10 +988,21 @@ impl WorkcellServer {
         } else {
             request.arguments
         };
-        let argument_digest = argument_digest(&arguments)?;
-        let (operation, intent) = self
+        // The selection is part of what the binding names, and the resolved overlay travels with the
+        // prepared operation, so execution runs exactly the environment that was prepared.
+        let argument_digest = match &request.shell_environment {
+            Some(selection) => argument_digest(&serde_json::json!({
+                "arguments": arguments,
+                "shellEnvironment": selection,
+            }))?,
+            None => argument_digest(&arguments)?,
+        };
+        let (mut operation, intent) = self
             .prepare_operation(request.tool.as_str(), arguments)
             .await?;
+        if let PreparedRemoteOperation::Shell { environment, .. } = &mut operation {
+            *environment = shell_environment;
+        }
         let binding = OperationBinding {
             host: request.host,
             contract,
@@ -974,6 +1011,44 @@ impl WorkcellServer {
         remote
             .prepare_reserved(reservation, operation, binding, intent)
             .map_err(remote_error)
+    }
+
+    fn shell_forwarding(&self) -> Result<&ShellForwarding, ErrorData> {
+        self.shell_environment.as_deref().ok_or_else(|| {
+            symbolic_invalid_params(
+                "this host does not forward its environment to shell commands".to_owned(),
+                CAPABILITY_UNAVAILABLE_CODE,
+            )
+        })
+    }
+
+    /// A refused selection is an error, never ignored: running without the environment the
+    /// client asked for would differ from what it authorized.
+    fn resolve_shell_environment(
+        &self,
+        tool: &str,
+        selection: &ShellEnvironmentSelection,
+    ) -> Result<ShellEnvironment, ErrorData> {
+        if tool != SHELL_TOOL {
+            return Err(symbolic_invalid_params(
+                format!("{tool} does not take a shell environment"),
+                INVALID_ARGUMENTS_CODE,
+            ));
+        }
+        let forwarding = self.shell_forwarding()?;
+        validate_selection(selection)?;
+        Ok(forwarding.resolve(selection, std::env::vars_os()))
+    }
+
+    fn list_environment(
+        &self,
+        remote: &RemoteHostState,
+        request: &EnvironmentListRequest,
+    ) -> Result<EnvironmentListResponse, ErrorData> {
+        remote.validate_host(&request.host).map_err(remote_error)?;
+        let forwarding = self.shell_forwarding()?;
+        validate_selection(&request.selection)?;
+        Ok(forwarding.list(&request.selection, std::env::vars_os()))
     }
 
     async fn prepare_workspace_mutation(
@@ -1068,7 +1143,10 @@ impl WorkcellServer {
         remote
             .prepare_reserved(
                 reservation,
-                PreparedRemoteOperation::Shell(prepared),
+                PreparedRemoteOperation::Shell {
+                    prepared,
+                    environment: None,
+                },
                 binding,
                 OperationIntent {
                     kind: OperationKind::Execute,
@@ -1707,7 +1785,10 @@ impl WorkcellServer {
                     )?);
                 }
                 (
-                    PreparedRemoteOperation::Shell(prepared),
+                    PreparedRemoteOperation::Shell {
+                        prepared,
+                        environment: None,
+                    },
                     OperationKind::Execute,
                     true,
                     intents,
@@ -1898,17 +1979,21 @@ impl WorkcellServer {
                     .execute_prepared(PreparedWebOperation::Webfetch(prepared), cancellation)
                     .await,
             ),
-            PreparedRemoteOperation::Shell(prepared) => {
-                let execution = self
-                    .shell
-                    .as_ref()
-                    .ok_or_else(remote_invalid)?
-                    .execute_prepared(
-                        prepared,
-                        cancellation,
-                        progress.map(ToolProgressContext::into_sink),
-                    )
-                    .await;
+            PreparedRemoteOperation::Shell {
+                prepared,
+                environment,
+            } => {
+                let shell = self.shell.as_ref().ok_or_else(remote_invalid)?;
+                let execution = match environment {
+                    Some(environment) => Cow::Owned(shell.clone().with_environment(environment)),
+                    None => Cow::Borrowed(shell),
+                }
+                .execute_prepared(
+                    prepared,
+                    cancellation,
+                    progress.map(ToolProgressContext::into_sink),
+                )
+                .await;
                 match execution {
                     Ok(Some(execution)) => {
                         typed_tool_result(&execution.output, execution.model_text)
@@ -2251,6 +2336,7 @@ impl ServerHandler for WorkcellServer {
                     | CHANGES_ACKNOWLEDGE_METHOD
                     | CHANGES_STATUS_METHOD
                     | CHANGES_PREPARE_CLEANUP_METHOD
+                    | ENVIRONMENT_LIST_METHOD
             )
         {
             return Err(ErrorData::new(
@@ -2312,6 +2398,10 @@ impl ServerHandler for WorkcellServer {
             CANCEL_METHOD => {
                 let request = parse_custom::<CancelRequest>(params)?;
                 serde_json::to_value(remote.cancel(&request).map_err(remote_error)?)
+            }
+            ENVIRONMENT_LIST_METHOD => {
+                let request = parse_custom::<EnvironmentListRequest>(params)?;
+                serde_json::to_value(self.list_environment(remote, &request)?)
             }
             RESOLVE_DIRECTORY_METHOD => {
                 let request = parse_custom::<ResolveDirectoryRequest>(params)?;
@@ -2716,7 +2806,7 @@ impl FailureEffectPolicy {
             PreparedRemoteOperation::FileWrite(_)
             | PreparedRemoteOperation::FileEdit(_)
             | PreparedRemoteOperation::FileApplyPatch(_) => Self::FileMutation,
-            PreparedRemoteOperation::Shell(_) => Self::Shell,
+            PreparedRemoteOperation::Shell { .. } => Self::Shell,
             PreparedRemoteOperation::WorkspaceMutation(_) => Self::WorkspaceMutation,
             PreparedRemoteOperation::ScmMutation(_) => Self::ScmMutation,
             PreparedRemoteOperation::ChangesRevert(_) => Self::ChangesRevert,
@@ -3470,6 +3560,15 @@ fn symbolic_invalid_params(message: String, code: &str) -> ErrorData {
     ErrorData::invalid_params(message, Some(serde_json::json!({"code": code})))
 }
 
+fn validate_selection(selection: &ShellEnvironmentSelection) -> Result<(), ErrorData> {
+    selection.validate().map_err(|error| {
+        symbolic_invalid_params(
+            format!("shell environment selection is invalid: {error}"),
+            INVALID_SHELL_ENVIRONMENT_CODE,
+        )
+    })
+}
+
 fn workspace_error(error: WorkspaceError) -> ErrorData {
     let code = error.code();
     let mut data = serde_json::json!({"code": code});
@@ -3665,6 +3764,21 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+    use std::collections::{BTreeMap, BTreeSet};
+    use workcell_host_contract::{EnvPattern, EnvironmentEntryState, ToolName};
+
+    const PRINTENV: &str = "printenv";
+    const SHELL_ENVIRONMENT_CHILD_ENV: &str = "WORKCELL_TEST_SHELL_ENVIRONMENT_CHILD";
+    const SHELL_ENVIRONMENT_CHILD_TEST: &str = "server::tests::shell_environment_child";
+    const SHELL_ENVIRONMENT_CHILD_PASSED: &str = "shell environment child passed";
+    const FORWARDED_CANARY: &str = "FORWARDED_CANARY";
+    const OVERRIDDEN_SETTING: &str = "OVERRIDDEN_SETTING";
+    const OPERATOR_FILE_SETTING: &str = "OPERATOR_FILE_SETTING";
+    const OPERATOR_CONSULTED_SETTING: &str = "OPERATOR_CONSULTED_SETTING";
+    const HTTP_TOKEN_ENV: &str = "WORKCELL_MCP_HTTP_TOKEN";
+    const GUEST_VALUE: &str = "guest-value";
+    const LITERAL_VALUE: &str = "literal-value";
+    const SERVER_SECRET: &str = "server-secret-canary";
 
     const PATH_OUTSIDE_ROOT_CODE: &str = "path_outside_root";
     const NOT_FOUND_CODE: &str = "not_found";
@@ -3737,6 +3851,7 @@ mod tests {
             proxy: ProxyConfiguration::direct(),
             shell_policy: ShellPermissionPolicy::restricted(),
             shell_output_filter: true,
+            shell_environment: None,
             honor_gitignore: true,
             code: CodeConfiguration {
                 worker: WorkerSource::Discover {
@@ -5050,6 +5165,245 @@ mod tests {
             panic!("stored operation did not start")
         };
         *operation
+    }
+
+    async fn shell_environment_server(
+        root: &Path,
+        shell_environment: Option<ShellForwarding>,
+    ) -> WorkcellServer {
+        WorkcellServer::configured(
+            Some(root),
+            &[ToolGroup::Shell],
+            ServerBehavior::default(),
+            ToolConfiguration {
+                shell_policy: ShellPermissionPolicy::yolo(),
+                shell_environment,
+                ..test_tools()
+            },
+        )
+        .await
+        .unwrap()
+        .with_remote_host(remote_configuration())
+        .await
+        .unwrap()
+    }
+
+    async fn prepare_shell(
+        server: &WorkcellServer,
+        tool: &str,
+        selection: Option<ShellEnvironmentSelection>,
+    ) -> Result<workcell_host_contract::PrepareResponse, ErrorData> {
+        let remote = server.remote_host.as_ref().unwrap();
+        let shell = server
+            .catalog
+            .iter()
+            .find(|candidate| candidate.name == SHELL_TOOL)
+            .unwrap();
+        server
+            .prepare_remote(
+                remote,
+                PrepareRequest {
+                    version: ContractVersion::V1,
+                    host: remote.binding.clone(),
+                    cwd_handle: None,
+                    tool: ToolName::new(tool).unwrap(),
+                    contract: contract_binding(shell).unwrap(),
+                    arguments: json!({"command": PRINTENV}),
+                    shell_environment: selection,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+    }
+
+    async fn run_prepared_stdout(server: &WorkcellServer, preparation_id: Identifier) -> String {
+        let remote = server.remote_host.as_ref().unwrap();
+        let request = workcell_host_contract::ExecuteRequest {
+            version: ContractVersion::V1,
+            preparation_id,
+            invocation_id: Identifier::new("invocation").unwrap(),
+            host: remote.binding.clone(),
+        };
+        let BeginExecution::Start { operation, .. } =
+            remote.begin(&request, CancellationToken::new()).unwrap()
+        else {
+            panic!("prepared shell did not start")
+        };
+        let result = server
+            .execute_prepared_operation(*operation, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        result.structured_content.unwrap()["stdout"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn error_code(error: &ErrorData) -> &str {
+        error.data.as_ref().unwrap()["code"].as_str().unwrap()
+    }
+
+    #[tokio::test]
+    async fn without_a_ceiling_no_capability_is_advertised_and_a_selection_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let server = shell_environment_server(root.path(), None).await;
+        let remote = server.remote_host.as_ref().unwrap();
+        let descriptor = serde_json::to_value(&*remote.descriptor).unwrap();
+        assert!(descriptor["capabilities"].get("shellEnvironment").is_none());
+
+        let refused = prepare_shell(
+            &server,
+            SHELL_TOOL,
+            Some(ShellEnvironmentSelection::everything()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error_code(&refused), CAPABILITY_UNAVAILABLE_CODE);
+        let listing = server.list_environment(
+            remote,
+            &EnvironmentListRequest {
+                version: ContractVersion::V1,
+                host: remote.binding.clone(),
+                selection: ShellEnvironmentSelection::everything(),
+            },
+        );
+        assert_eq!(
+            error_code(&listing.unwrap_err()),
+            CAPABILITY_UNAVAILABLE_CODE
+        );
+        assert!(prepare_shell(&server, SHELL_TOOL, None).await.is_ok());
+    }
+
+    #[test_case("file_read", ShellEnvironmentSelection::everything(), INVALID_ARGUMENTS_CODE ; "another_tool")]
+    #[test_case(SHELL_TOOL, ShellEnvironmentSelection { pass: vec![EnvPattern::Prefix("BASH_".into())], ..ShellEnvironmentSelection::default() }, INVALID_SHELL_ENVIRONMENT_CODE ; "reserved_pattern")]
+    #[test_case(SHELL_TOOL, ShellEnvironmentSelection { pass: Vec::new(), set: [("GITHUB_TOKEN".to_owned(), String::new())].into() }, INVALID_SHELL_ENVIRONMENT_CODE ; "secret_literal")]
+    #[tokio::test]
+    async fn a_selection_is_refused(
+        tool: &str,
+        selection: ShellEnvironmentSelection,
+        expected_code: &str,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let forwarding = ShellForwarding::new(vec![EnvPattern::All], BTreeSet::new());
+        let server = shell_environment_server(root.path(), Some(forwarding)).await;
+        let capability = server
+            .remote_host
+            .as_ref()
+            .unwrap()
+            .descriptor
+            .capabilities
+            .shell_environment
+            .clone()
+            .unwrap();
+        assert_eq!(capability.ceiling, [EnvPattern::All]);
+        let refused = prepare_shell(&server, tool, Some(selection))
+            .await
+            .unwrap_err();
+        assert_eq!(error_code(&refused), expected_code);
+    }
+
+    /// The process environment cannot be changed safely from a test, so a copy of this binary
+    /// runs the assertions with the variables a guest server would have.
+    #[cfg(unix)]
+    #[test]
+    fn shell_commands_receive_forwarded_variables_but_never_server_configuration() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", SHELL_ENVIRONMENT_CHILD_TEST, "--nocapture"])
+            .env(SHELL_ENVIRONMENT_CHILD_ENV, SHELL_ENVIRONMENT_CHILD_TEST)
+            .env(FORWARDED_CANARY, GUEST_VALUE)
+            .env(OVERRIDDEN_SETTING, GUEST_VALUE)
+            .env(HTTP_TOKEN_ENV, SERVER_SECRET)
+            .env(OPERATOR_FILE_SETTING, SERVER_SECRET)
+            .env(OPERATOR_CONSULTED_SETTING, SERVER_SECRET)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        assert!(
+            child.status.success() && stdout.contains(SHELL_ENVIRONMENT_CHILD_PASSED),
+            "{stdout}{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_environment_child() {
+        if std::env::var_os(SHELL_ENVIRONMENT_CHILD_ENV).is_none() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let env_file = root.path().join("server.env");
+        std::fs::write(&env_file, format!("{OPERATOR_FILE_SETTING}=file\n")).unwrap();
+        let environment = crate::environment::StartupEnvironment::load(Some(&env_file)).unwrap();
+        environment.read(OPERATOR_CONSULTED_SETTING).unwrap();
+        let forwarding =
+            ShellForwarding::new(vec![EnvPattern::All], environment.server_variables());
+        let server = shell_environment_server(root.path(), Some(forwarding)).await;
+        let selection = ShellEnvironmentSelection {
+            pass: vec![EnvPattern::All],
+            set: [(OVERRIDDEN_SETTING.to_owned(), LITERAL_VALUE.to_owned())].into(),
+        };
+
+        let prepared = prepare_shell(&server, SHELL_TOOL, Some(selection.clone()))
+            .await
+            .unwrap();
+        let stdout = run_prepared_stdout(&server, prepared.preparation_id).await;
+        let variables = stdout
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(variables.get(FORWARDED_CANARY), Some(&GUEST_VALUE));
+        assert_eq!(variables.get(OVERRIDDEN_SETTING), Some(&LITERAL_VALUE));
+        for name in [
+            HTTP_TOKEN_ENV,
+            OPERATOR_FILE_SETTING,
+            OPERATOR_CONSULTED_SETTING,
+            SHELL_ENVIRONMENT_CHILD_ENV,
+        ] {
+            assert!(!variables.contains_key(name), "{name} reached the command");
+        }
+        assert!(!stdout.contains(SERVER_SECRET));
+
+        let unselected = prepare_shell(&server, SHELL_TOOL, None).await.unwrap();
+        let stdout = run_prepared_stdout(&server, unselected.preparation_id).await;
+        assert!(!stdout.contains(FORWARDED_CANARY));
+
+        let remote = server.remote_host.as_ref().unwrap();
+        let listing = server
+            .list_environment(
+                remote,
+                &EnvironmentListRequest {
+                    version: ContractVersion::V1,
+                    host: remote.binding.clone(),
+                    selection,
+                },
+            )
+            .unwrap();
+        let entry = |name: &str| {
+            listing
+                .entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .map(|entry| (entry.state, entry.value.as_deref()))
+                .unwrap()
+        };
+        assert_eq!(
+            entry(HTTP_TOKEN_ENV),
+            (EnvironmentEntryState::Stripped, None)
+        );
+        assert_eq!(
+            entry(OPERATOR_FILE_SETTING),
+            (EnvironmentEntryState::Stripped, None)
+        );
+        assert_eq!(
+            entry(FORWARDED_CANARY),
+            (EnvironmentEntryState::Forwarded, Some(GUEST_VALUE))
+        );
+        assert_eq!(
+            entry(OVERRIDDEN_SETTING),
+            (EnvironmentEntryState::Set, Some(LITERAL_VALUE))
+        );
+        println!("{SHELL_ENVIRONMENT_CHILD_PASSED}");
     }
 
     fn remote_configuration() -> RemoteHostConfiguration {

@@ -2,6 +2,7 @@ use crate::config_file::{CONFIG_FILE, CONFIG_VERSION};
 use crate::decisions::{DecisionFeatures, DecisionThresholds, DecisionsConfig, FeatureMode};
 use crate::experimental::{Feature, FeatureFlags};
 use crate::files::{self, CONFIG_FILES};
+use crate::shell_env::ShellEnvConfig;
 use crate::steering::{SteeringConfig, SteeringRule, SteeringRulesConfig};
 use crate::{
     AgentConfig, AutomationsConfig, AutopilotConfig, ConfigValue, DEFAULT_BUILTINS,
@@ -19,7 +20,9 @@ const USAGE: &str = "To change a setting, copy its line into your caudra.toml un
      [table] header, remove the \"#\", and set your value. A value in angle brackets, such as \
      <string>, marks a setting that has no default.";
 const PROJECT_SCOPE: &str = "A project .caudra/caudra.toml takes the same settings, except \
-     [experimental], [automations], and the ones marked global-only.";
+     [experimental], [automations], [agent.shell_env], and the ones marked global-only.";
+const SHELL_ENV_ABOUT: &str = "Variables local shell commands receive beyond the fixed \
+     allowlist. Only the global caudra.toml may hold this table.";
 const EXPERIMENTAL_ABOUT: &str = "Experimental features stay off until you turn them on, and each \
      switch is independent. Only the global caudra.toml may hold this table. Caudra reads it once \
      at startup, so a change needs a restart.";
@@ -90,6 +93,11 @@ fn tables() -> Vec<Table> {
             Header::Fixed("agent.messaging".into()),
             MessagingConfig::FIELDS,
         ),
+        Table::of(
+            Header::Fixed("agent.shell_env".into()),
+            ShellEnvConfig::FIELDS,
+        )
+        .about(SHELL_ENV_ABOUT),
         Table::of(
             Header::Fixed("agent.steering".into()),
             SteeringConfig::FIELDS,
