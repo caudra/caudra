@@ -6,6 +6,8 @@ CARGO ?= cargo
 PYTHON ?= python3
 ARGS ?=
 
+include scripts/cargo-cache.mk
+
 ifeq ($(OS),Windows_NT)
 MONTY_WORKER_NAME := monty.exe
 else
@@ -42,7 +44,8 @@ help:
 		'  make machete        Check unused dependencies' \
 		'  make ci             Run local application CI checks' \
 		'Cargo flags: make build ARGS="--release"' \
-		'Program arguments: make run ARGS="-- auth login"'
+		'Program arguments: make run ARGS="-- auth login"' \
+		'Compiler cache: Cargo runs through sccache when installed; opt out with SCCACHE='
 
 code-worker:
 	$(PYTHON) scripts/build-code-worker.py

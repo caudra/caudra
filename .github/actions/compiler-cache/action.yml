@@ -1,0 +1,22 @@
+name: Compiler cache
+description: Route Rust and cc-rs C/C++ compilation through sccache, stored in the GitHub Actions cache
+runs:
+  using: composite
+  steps:
+    # Downloads the release, verifies its published SHA-256, and reports hit/miss stats after the job.
+    - uses: mozilla-actions/sccache-action@v0.0.11
+      with:
+        version: v0.18.0
+    # Pull requests only read: they still reuse what main wrote, without spending the repository's
+    # cache quota on entries no other ref can see. RUSTC_WRAPPER covers direct Cargo, Make, and the
+    # worker build, and cc-rs follows it for C and C++.
+    - shell: bash
+      env:
+        RW_MODE: ${{ github.event_name == 'pull_request' && 'READ_ONLY' || 'READ_WRITE' }}
+      run: |
+        {
+          echo "RUSTC_WRAPPER=sccache"
+          echo "SCCACHE_GHA_ENABLED=true"
+          echo "SCCACHE_GHA_RW_MODE=$RW_MODE"
+          echo "SCCACHE_GHA_VERSION=caudra-v1"
+        } >> "$GITHUB_ENV"

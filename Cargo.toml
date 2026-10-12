@@ -342,22 +342,30 @@ strip = "symbols"
 lto = "thin"
 codegen-units = 1
 
-# `make install-fast`: local release testing trades binary size, cross-crate optimization, and
-# incremental-cache disk space for rebuild time. `off` rather than `false`, which still runs
-# ThinLTO across a crate's codegen units.
+# `make install-fast`: local release testing trades binary size and cross-crate optimization for
+# rebuild time. `off` rather than `false`, which still runs ThinLTO across a crate's codegen units.
+# No incremental cache: it grew past 25 GiB per checkout, and sccache cannot cache incremental
+# compilations.
 [profile.release-fast]
 inherits = "release"
 lto = "off"
 codegen-units = 16
-incremental = true
+incremental = false
 
 [profile.bench]
 debug = true
 strip = "none"
 
 # Dev rebuilds are linker bound, and debug info is most of what the linker
-# chews through. Our crates keep theirs so a debugger still works, the 600
-# dependencies do not need any.
+# chews through. Our crates keep line tables so backtraces still name files
+# and lines; a debugger session sets CARGO_PROFILE_DEV_DEBUG=2. Incremental
+# caches cost more disk than they save in rebuild time across worktrees, and
+# they rule out sccache. The test profile inherits all of this.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+# The 600+ dependencies need no debug info at all.
 [profile.dev.package."*"]
 debug = false
 

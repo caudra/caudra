@@ -38,6 +38,7 @@ RELEASE_PROFILE = {
     "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "1",
     "CARGO_PROFILE_RELEASE_PANIC": "unwind",
 }
+COMPILER_CACHE = {"RUSTC_WRAPPER": "sccache", "SCCACHE_DIRECT": "false"}
 
 
 class BuildCodeWorkerTests(unittest.TestCase):
@@ -304,6 +305,20 @@ class BuildCodeWorkerTests(unittest.TestCase):
                     self.run_mock.call_args_list[0].kwargs["env"][key], "-Cdebuginfo=2"
                 )
                 self.assertNotEqual(self.stamp.read_bytes(), stamp)
+
+    def test_compiler_cache_reaches_cargo_without_invalidating_worker(self):
+        self.build()
+        stamp = self.stamp.read_bytes()
+        os.environ.update(COMPILER_CACHE)
+        self.run_mock.reset_mock()
+
+        self.build()
+        self.run_mock.assert_not_called()
+
+        self.build(force=True)
+        cargo = self.run_mock.call_args_list[0]
+        self.assertEqual(cargo.kwargs["env"], COMPILER_CACHE | RELEASE_PROFILE)
+        self.assertEqual(self.stamp.read_bytes(), stamp)
 
     def test_changed_target_invalidates_fingerprint(self):
         self.build()

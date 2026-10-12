@@ -27,16 +27,38 @@ COMPILING_TARGETS = (
     "workcell-doc-test",
     "workcell-check-native",
 )
-PROBE = """import json, os, sys, tempfile
+CACHE_VARIABLES = (
+    "RUSTC_WRAPPER",
+    "SCCACHE_CACHE_SIZE",
+    "SCCACHE_CLIENT_SIDE",
+    "SCCACHE_DIRECT",
+    "CARGO_TARGET_DIR",
+)
+WRAPPER_VARIABLES = (
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+)
+SCCACHE_DEFAULTS = {
+    "RUSTC_WRAPPER": "sccache",
+    "SCCACHE_CACHE_SIZE": "10G",
+    "SCCACHE_CLIENT_SIDE": "1",
+    "SCCACHE_DIRECT": "false",
+}
+UNCACHED = dict.fromkeys(SCCACHE_DEFAULTS)
+SCCACHE_RAN = "sccache-ran"
+PROBE = f"""import json, os, sys, tempfile
 from pathlib import Path
 kind, *args = sys.argv[1:]
 worker = Path(os.environ['WORKCELL_BUNDLED_MONTY_WORKER'])
 is_worker = kind == 'python' and args == ['scripts/build-code-worker.py']
 with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
         dir=os.environ['TEST_RECORDS'], suffix='.json', delete=False) as record:
-    json.dump({'kind': 'worker' if is_worker else kind,
+    json.dump({{'kind': 'worker' if is_worker else kind,
         'args': args, 'worker': str(worker),
-        'required': os.environ.get('WORKCELL_REQUIRE_CODE_WORKER')}, record)
+        'required': os.environ.get('WORKCELL_REQUIRE_CODE_WORKER'),
+        'env': {{name: os.environ.get(name) for name in {CACHE_VARIABLES!r}}}}}, record)
 if is_worker:
     if os.environ.get('TEST_FAIL_WORKER'):
         sys.exit(7)
@@ -55,15 +77,37 @@ class MakeTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         shutil.copyfile(ROOT / "Makefile", self.root / "Makefile")
+        (self.root / "scripts").mkdir()
+        shutil.copyfile(
+            ROOT / "scripts/cargo-cache.mk", self.root / "scripts/cargo-cache.mk"
+        )
         self.probe = self.root / "probe.py"
         self.probe.write_text(PROBE)
         self.env: dict[str, str] = dict(os.environ)
-        for key in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL", "MAKEOVERRIDES"):
+        for key in (
+            "MAKEFLAGS",
+            "MFLAGS",
+            "MAKELEVEL",
+            "MAKEOVERRIDES",
+            "SCCACHE",
+            *CACHE_VARIABLES,
+            *WRAPPER_VARIABLES,
+        ):
             self.env.pop(key, None)
         (self.root / "workcell").mkdir()
         (self.root / "workcell/Makefile").write_text(
             "SHELL := bash\n.PHONY: check-native\n"
             "check-native:\n\t$(CARGO) native-feature-probe\n"
+        )
+        fake_tools = self.root / "fake tools"
+        fake_tools.mkdir()
+        fake_sccache = fake_tools / "sccache"
+        fake_sccache.write_text(
+            f'#!/bin/sh\ntouch "$TEST_RECORDS/{SCCACHE_RAN}"\nexit 1\n'
+        )
+        fake_sccache.chmod(0o755)
+        self.path_with_sccache = os.pathsep.join(
+            (str(fake_tools), self.env.get("PATH", ""))
         )
 
     def run_make(self, *arguments: str):
@@ -236,6 +280,95 @@ class MakeTests(unittest.TestCase):
         [cargo] = self.records()
         self.assertEqual(cargo["kind"], "cargo")
         self.assertEqual(cargo["args"], ["machete"])
+
+    def cache_environments(self, *arguments: str):
+        result = self.run_make(*arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.record_dir / SCCACHE_RAN).exists())
+        return [
+            {name: record["env"][name] for name in SCCACHE_DEFAULTS}
+            for record in self.records()
+        ]
+
+    def test_installed_sccache_wraps_worker_and_cargo_without_running_it(self):
+        self.env["PATH"] = self.path_with_sccache
+        self.assertEqual(self.cache_environments(), [])
+        self.assertEqual(
+            self.cache_environments("build"), [SCCACHE_DEFAULTS, SCCACHE_DEFAULTS]
+        )
+
+    def test_missing_sccache_leaves_cargo_unwrapped(self):
+        names = ("sccache", "sccache.exe")
+        self.env["PATH"] = os.pathsep.join(
+            directory
+            for directory in self.env.get("PATH", "").split(os.pathsep)
+            if not any((Path(directory) / name).is_file() for name in names)
+        )
+        if not shutil.which("bash", path=self.env["PATH"]):
+            self.skipTest("sccache shares a directory with bash")
+        self.assertEqual(self.cache_environments("build"), [UNCACHED, UNCACHED])
+
+    def test_sccache_selection_and_settings_can_be_overridden(self):
+        self.env["PATH"] = self.path_with_sccache
+        custom = "/opt/cache tools/sccache"
+        for arguments, environment, expected in (
+            (["SCCACHE="], {}, UNCACHED),
+            ([], {"SCCACHE": ""}, UNCACHED),
+            ([f"SCCACHE={custom}"], {}, SCCACHE_DEFAULTS | {"RUSTC_WRAPPER": custom}),
+            (
+                ["SCCACHE_CACHE_SIZE=20G"],
+                {"SCCACHE_DIRECT": "true"},
+                SCCACHE_DEFAULTS
+                | {"SCCACHE_CACHE_SIZE": "20G", "SCCACHE_DIRECT": "true"},
+            ),
+        ):
+            with self.subTest(arguments=arguments, environment=environment):
+                self.env.update(environment)
+                self.assertEqual(
+                    self.cache_environments("build", *arguments), [expected] * 2
+                )
+                for name in environment:
+                    del self.env[name]
+
+    def test_explicit_cargo_wrappers_win_over_detection(self):
+        self.env["PATH"] = self.path_with_sccache
+        for variable in WRAPPER_VARIABLES:
+            for value in ("", "custom-wrapper"):
+                with self.subTest(variable=variable, value=value):
+                    self.env[variable] = value
+                    wrapper = value if variable == "RUSTC_WRAPPER" else None
+                    self.assertEqual(
+                        self.cache_environments("build"),
+                        [UNCACHED | {"RUSTC_WRAPPER": wrapper}] * 2,
+                    )
+                    del self.env[variable]
+
+    def test_recursive_make_inherits_cache_settings(self):
+        self.env["PATH"] = self.path_with_sccache
+        self.assertEqual(
+            self.cache_environments("workcell-check-native"), [SCCACHE_DEFAULTS] * 2
+        )
+
+    def test_workcell_leaves_target_to_cargo_unless_overridden(self):
+        shutil.copyfile(ROOT / "workcell/Makefile", self.root / "workcell/Makefile")
+        worker = self.root / "worker"
+        worker.touch()
+        self.env |= {
+            "PATH": self.path_with_sccache,
+            "WORKCELL_BUNDLED_MONTY_WORKER": str(worker),
+        }
+        for arguments, target in (
+            ([], None),
+            (["CARGO_TARGET_DIR=custom target"], "custom target"),
+        ):
+            with self.subTest(target=target):
+                result = self.run_make("-C", "workcell", "build", *arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                [cargo] = self.records()
+                self.assertEqual(cargo["args"][0], "build")
+                self.assertEqual(
+                    cargo["env"], SCCACHE_DEFAULTS | {"CARGO_TARGET_DIR": target}
+                )
 
 
 if __name__ == "__main__":

@@ -75,6 +75,8 @@ jobs:
               - ".config/nextest.toml"
               - ".github/workflows/rust.yml"
               - ".github/actions/code-worker/**"
+              - ".github/actions/compiler-cache/**"
+              - "scripts/cargo-cache.mk"
               - ".cargo/config.toml"
 
   fmt:
@@ -125,6 +127,7 @@ jobs:
         with:
           python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/compiler-cache
       - uses: ./.github/actions/code-worker
       - run: make code-worker
       - run: cargo clippy --locked --all --tests -- -D warnings
@@ -145,6 +148,7 @@ jobs:
         with:
           python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/compiler-cache
       - uses: ./.github/actions/code-worker
       - uses: taiki-e/install-action@v2
         with:
@@ -187,6 +191,7 @@ jobs:
         with:
           python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/compiler-cache
       - uses: ./.github/actions/code-worker
       - run: python3 scripts/build-code-worker.py
       - run: make -C workcell check-native test-optional-features
@@ -207,6 +212,7 @@ jobs:
         with:
           python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/compiler-cache
       - uses: ./.github/actions/code-worker
       - run: make check build workcell-build ARGS=--locked
 

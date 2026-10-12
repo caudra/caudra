@@ -42,7 +42,9 @@ Read `Makefile` for more. It requires GNU Make, Bash, and Python 3. On Windows, 
 
 Cargo-compiling targets depend on `code-worker` automatically. `make code-worker` is an optional warmup, not a required bootstrap. Keep build logic in Cargo and Python.
 
-Dev builds skip debug info for deps and vendored C (our crates keep it); to debug into a dep set `[profile.dev.package.<name>] debug = true`.
+Dev and test builds keep only line tables and no incremental cache. For a debugger, set `CARGO_PROFILE_DEV_DEBUG=2`; to debug into a dep, set `[profile.dev.package.<name>] debug = true`.
+
+Make uses `sccache` when it is installed (`scripts/cargo-cache.mk`); `SCCACHE=` opts out. Never share `CARGO_TARGET_DIR` between worktrees.
 
 ## Nix
 

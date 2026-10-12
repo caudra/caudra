@@ -5,7 +5,11 @@ CARGO ?= cargo
 DOCKER ?= docker
 PYTHON ?= python3
 REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
-export CARGO_TARGET_DIR := $(REPO_ROOT)/target
+include $(dir $(lastword $(MAKEFILE_LIST)))../scripts/cargo-cache.mk
+# Cargo already resolves the root workspace's target from here. Exporting this would add an
+# absolute CARGO_* variable to every rustc environment, which sccache hashes, so Workcell builds
+# could never reuse the root Makefile's cache entries. An inherited override is still exported.
+CARGO_TARGET_DIR ?= $(REPO_ROOT)/target
 IMAGE ?= workcell-mcp
 TAG ?= local
 ROOT ?=
