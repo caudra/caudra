@@ -15,15 +15,26 @@ use caudra_storage::auth::{McpAuthData, load_mcp_auth, save_mcp_auth};
 use futures_lite::future;
 use isahc::HttpClient;
 use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
+use isahc::http::header::{ACCEPT, CONTENT_TYPE, WWW_AUTHENTICATE};
+use isahc::http::{Request, StatusCode};
 use isahc::net::dns::ResolveMap;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use url::{Host, Url};
 
 use self::callback::{CallbackResult, CallbackServer};
-use self::discovery::parse_www_authenticate;
+use self::discovery::{issuer_matches, parse_www_authenticate};
 use super::config::{OauthClientConfig, resolve_url_addresses, risky_ip};
 use super::error::McpError;
+use super::http::{ACCEPT_VALUE, CT_JSON, INITIALIZE_METHOD};
+use super::protocol::{JsonRpcRequest, initialize_params};
 
+/// Caudra's OAuth Client ID Metadata Document. Authorization servers that
+/// advertise `client_id_metadata_document_supported` fetch it to learn the
+/// redirect URIs, so this URL is Caudra's client ID everywhere and must stay.
+const CLIENT_METADATA_URL: &str = "https://caudra.ai/oauth/client-metadata.json";
+const OAUTH_DOCS_URL: &str = "https://caudra.ai/docs/mcp/#oauth";
+const PKCE_METHOD: &str = "S256";
+const PROBE_REQUEST_ID: u64 = 0;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(600);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// In-band refresh blocks requests waiting on the transport's auth lock, so it
@@ -76,7 +87,13 @@ pub async fn authenticate(
         }
     }
 
-    let www_auth = www_authenticate.and_then(parse_www_authenticate);
+    let probed = match www_authenticate {
+        Some(_) => None,
+        None => probe_challenge(server_url, server_addresses).await,
+    };
+    let www_auth = www_authenticate
+        .or(probed.as_deref())
+        .and_then(parse_www_authenticate);
 
     let resource_meta =
         discovery::discover_resource_metadata(server_url, www_auth.as_ref(), server_addresses)
@@ -93,17 +110,12 @@ pub async fn authenticate(
         discovery::discover_auth_server(&auth_server_url, server_url, server_addresses)
             .await
             .map_err(wrap)?;
+    require_pkce(&auth_server).map_err(wrap)?;
+    let issuer = auth_server
+        .issuer
+        .clone()
+        .unwrap_or_else(|| auth_server_url.clone());
 
-    if !auth_server.code_challenge_methods_supported.is_empty()
-        && !auth_server
-            .code_challenge_methods_supported
-            .iter()
-            .any(|m| m == "S256")
-    {
-        return Err(wrap(OAuthError::Other(
-            "server does not support S256 PKCE".into(),
-        )));
-    }
     build_http_client(
         &auth_server.authorization_endpoint,
         server_url,
@@ -125,31 +137,20 @@ pub async fn authenticate(
     .map_err(|e| wrap(OAuthError::Other(e)))?;
     let redirect_uri = callback.redirect_uri();
 
-    let reg = if let Some(c) = static_client {
-        registration::ClientRegistration {
-            client_id: c.client_id,
-            client_secret: c.client_secret,
-            client_secret_expires_at: None,
+    let stored = load_mcp_auth(storage, server_name, server_url);
+    let choice =
+        choose_client(static_client, stored, &redirect_uri, &issuer, &auth_server).map_err(wrap)?;
+    let reg = match choice {
+        ClientChoice::Known(reg) => reg,
+        ClientChoice::Register(endpoint) => {
+            let client = build_http_client(&endpoint, server_url, server_addresses, HTTP_TIMEOUT)
+                .map_err(wrap)?;
+            registration::register_client(&client, &endpoint, &redirect_uri)
+                .await
+                .map_err(wrap)?
         }
-    } else if let Some(existing) = load_mcp_auth(storage, server_name, server_url)
-        && existing.redirect_uri.as_deref() == Some(&redirect_uri)
-    {
-        registration::ClientRegistration {
-            client_id: existing.client_id,
-            client_secret: existing.client_secret,
-            client_secret_expires_at: existing.client_secret_expires_at,
-        }
-    } else if let Some(endpoint) = &auth_server.registration_endpoint {
-        let client = build_http_client(endpoint, server_url, server_addresses, HTTP_TIMEOUT)
-            .map_err(wrap)?;
-        registration::register_client(&client, endpoint, &redirect_uri)
-            .await
-            .map_err(wrap)?
-    } else {
-        return Err(wrap(OAuthError::Other(
-            "no stored client and server has no registration endpoint".into(),
-        )));
     };
+    info!(server = server_name, %issuer, client_id = %reg.client_id, "using OAuth client");
 
     let pkce = pkce::generate().map_err(wrap)?;
 
@@ -214,6 +215,12 @@ pub async fn authenticate(
         }
     }
     .map_err(|e| wrap(OAuthError::Other(e)))?;
+    check_response_issuer(
+        &issuer,
+        auth_server.authorization_response_iss_parameter_supported,
+        result.issuer.as_deref(),
+    )
+    .map_err(wrap)?;
 
     let token_client = build_http_client(
         &auth_server.token_endpoint,
@@ -243,6 +250,7 @@ pub async fn authenticate(
         client_secret_expires_at: reg.client_secret_expires_at,
         redirect_uri: Some(redirect_uri),
         token_endpoint: Some(auth_server.token_endpoint.clone()),
+        issuer: Some(issuer),
     };
 
     save_mcp_auth(storage, server_name, &data)
@@ -323,6 +331,123 @@ async fn discover_auth_server_for(
         .cloned()
         .unwrap_or_else(|| discovery::server_origin(server_url));
     discovery::discover_auth_server(&auth_server_url, server_url, server_addresses).await
+}
+
+enum ClientChoice {
+    Known(registration::ClientRegistration),
+    Register(String),
+}
+
+/// MCP client registration order: a configured client, then the client this
+/// issuer already gave us, then Caudra's Client ID Metadata Document, then
+/// dynamic registration. A stored client is bound to its issuer and redirect
+/// URI, since client IDs are unique per authorization server.
+fn choose_client(
+    static_client: Option<OauthClientConfig>,
+    stored: Option<McpAuthData>,
+    redirect_uri: &str,
+    issuer: &str,
+    auth_server: &discovery::AuthServerMetadata,
+) -> Result<ClientChoice, OAuthError> {
+    if let Some(client) = static_client {
+        return Ok(ClientChoice::Known(registration::ClientRegistration {
+            client_id: client.client_id,
+            client_secret: client.client_secret,
+            client_secret_expires_at: None,
+        }));
+    }
+    if let Some(existing) = stored
+        && existing.redirect_uri.as_deref() == Some(redirect_uri)
+        && existing
+            .issuer
+            .as_deref()
+            .is_some_and(|stored_issuer| issuer_matches(issuer, stored_issuer))
+    {
+        return Ok(ClientChoice::Known(registration::ClientRegistration {
+            client_id: existing.client_id,
+            client_secret: existing.client_secret,
+            client_secret_expires_at: existing.client_secret_expires_at,
+        }));
+    }
+    if auth_server.client_id_metadata_document_supported {
+        return Ok(ClientChoice::Known(registration::ClientRegistration {
+            client_id: CLIENT_METADATA_URL.into(),
+            client_secret: None,
+            client_secret_expires_at: None,
+        }));
+    }
+    match &auth_server.registration_endpoint {
+        Some(endpoint) => Ok(ClientChoice::Register(endpoint.clone())),
+        None => Err(OAuthError::Other(format!(
+            "authorization server {issuer} offers neither client ID metadata documents nor dynamic client registration; register a client with it and set `oauth = {{ client_id = \"...\" }}` for this server (see {OAUTH_DOCS_URL})"
+        ))),
+    }
+}
+
+/// OAuth 2.1 and the MCP spec: without advertised S256, refuse rather than
+/// send a code that an intercepting app could redeem.
+fn require_pkce(auth_server: &discovery::AuthServerMetadata) -> Result<(), OAuthError> {
+    if auth_server
+        .code_challenge_methods_supported
+        .iter()
+        .any(|method| method == PKCE_METHOD)
+    {
+        Ok(())
+    } else {
+        Err(OAuthError::Other(
+            "authorization server does not advertise S256 PKCE (code_challenge_methods_supported)"
+                .into(),
+        ))
+    }
+}
+
+/// RFC 9207: a code must come from the issuer the flow started with. `iss` is
+/// mandatory only when the server advertises it.
+fn check_response_issuer(
+    expected: &str,
+    advertised: bool,
+    received: Option<&str>,
+) -> Result<(), OAuthError> {
+    match received {
+        Some(found) if !issuer_matches(expected, found) => Err(OAuthError::Other(format!(
+            "authorization response came from issuer {found}, expected {expected}"
+        ))),
+        None if advertised => Err(OAuthError::Other(
+            "authorization response lacks the iss parameter its server advertises".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// An unauthenticated `initialize` draws the server's 401 challenge, which
+/// names its resource metadata and the scope to request. Any other outcome
+/// leaves discovery to the well-known URLs.
+async fn probe_challenge(server_url: &str, server_addresses: Option<&[IpAddr]>) -> Option<String> {
+    let client = build_http_client(server_url, server_url, server_addresses, HTTP_TIMEOUT).ok()?;
+    let body = serde_json::to_vec(&JsonRpcRequest::new(
+        PROBE_REQUEST_ID,
+        INITIALIZE_METHOD,
+        Some(initialize_params()),
+    ))
+    .ok()?;
+    let request = Request::post(server_url)
+        .header(CONTENT_TYPE, CT_JSON)
+        .header(ACCEPT, ACCEPT_VALUE)
+        .body(body)
+        .ok()?;
+    let response = smol::unblock(move || client.send(request))
+        .await
+        .inspect_err(|error| debug!(%error, "OAuth challenge probe failed"))
+        .ok()?;
+    if response.status() != StatusCode::UNAUTHORIZED {
+        debug!(status = %response.status(), "OAuth challenge probe got no 401");
+        return None;
+    }
+    response
+        .headers()
+        .get(WWW_AUTHENTICATE)
+        .and_then(|value| value.to_str().ok())
+        .map(String::from)
 }
 
 async fn auth_timeout() -> Result<CallbackResult, String> {
@@ -436,17 +561,134 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
 
-    use super::{OAuthError, build_authorization_url, build_http_client};
+    use caudra_storage::auth::McpAuthData;
     use test_case::test_case;
     use url::Url;
+
+    use super::discovery::AuthServerMetadata;
+    use super::{
+        CLIENT_METADATA_URL, ClientChoice, OAuthError, build_authorization_url, build_http_client,
+        check_response_issuer, choose_client, require_pkce,
+    };
+    use crate::mcp::config::OauthClientConfig;
 
     const CLIENT_ID: &str = "client-id";
     const REDIRECT_URI: &str = "http://127.0.0.1:8080/callback";
     const STATE: &str = "state-value";
     const CHALLENGE: &str = "challenge-value";
-
     const SCOPE: &str = "offline#access";
     const RESOURCE: &str = "https://example.com/resource a b";
+    const ISSUER: &str = "https://auth.example.com";
+    const OTHER_ISSUER: &str = "https://other.example.com";
+    const REGISTRATION_ENDPOINT: &str = "https://auth.example.com/register";
+    const STATIC_ID: &str = "static-client";
+    const STORED_ID: &str = "stored-client";
+    const REGISTER: &str = "register";
+
+    fn auth_server(metadata_documents: bool, registration: bool) -> AuthServerMetadata {
+        AuthServerMetadata {
+            issuer: Some(ISSUER.into()),
+            authorization_endpoint: format!("{ISSUER}/authorize"),
+            token_endpoint: format!("{ISSUER}/token"),
+            registration_endpoint: registration.then(|| REGISTRATION_ENDPOINT.into()),
+            code_challenge_methods_supported: vec!["S256".into()],
+            client_id_metadata_document_supported: metadata_documents,
+            authorization_response_iss_parameter_supported: false,
+        }
+    }
+
+    fn stored(redirect_uri: &str, issuer: Option<&str>) -> McpAuthData {
+        McpAuthData {
+            server_url: "https://mcp.example.com/mcp".into(),
+            tokens: None,
+            client_id: STORED_ID.into(),
+            client_secret: None,
+            client_secret_expires_at: None,
+            redirect_uri: Some(redirect_uri.into()),
+            token_endpoint: None,
+            issuer: issuer.map(String::from),
+        }
+    }
+
+    fn static_client() -> OauthClientConfig {
+        OauthClientConfig {
+            client_id: STATIC_ID.into(),
+            client_secret: None,
+            callback_port: None,
+            callback_path: None,
+            callback_hostname: None,
+        }
+    }
+
+    fn chosen(choice: ClientChoice) -> String {
+        match choice {
+            ClientChoice::Known(reg) => reg.client_id,
+            ClientChoice::Register(endpoint) => {
+                assert_eq!(endpoint, REGISTRATION_ENDPOINT);
+                REGISTER.into()
+            }
+        }
+    }
+
+    #[test_case(true,  Some(stored(REDIRECT_URI, Some(ISSUER))),       true,  true,  STATIC_ID           ; "static_client_wins")]
+    #[test_case(false, Some(stored(REDIRECT_URI, Some(ISSUER))),       true,  true,  STORED_ID           ; "stored_client_of_same_issuer")]
+    #[test_case(false, Some(stored(REDIRECT_URI, Some(OTHER_ISSUER))), false, true,  REGISTER            ; "stored_client_of_other_issuer_dropped")]
+    #[test_case(false, Some(stored(REDIRECT_URI, None)),               true,  false, CLIENT_METADATA_URL ; "stored_client_without_issuer_dropped")]
+    #[test_case(false, Some(stored("http://127.0.0.1:1/cb", Some(ISSUER))), false, true, REGISTER        ; "stored_client_of_other_redirect_dropped")]
+    #[test_case(false, None,                                           true,  true,  CLIENT_METADATA_URL ; "metadata_document_before_registration")]
+    #[test_case(false, None,                                           false, true,  REGISTER            ; "registration_without_metadata_document")]
+    fn chooses_client(
+        has_static: bool,
+        stored: Option<McpAuthData>,
+        metadata_documents: bool,
+        registration: bool,
+        expected: &str,
+    ) {
+        let choice = choose_client(
+            has_static.then(static_client),
+            stored,
+            REDIRECT_URI,
+            ISSUER,
+            &auth_server(metadata_documents, registration),
+        )
+        .unwrap_or_else(|e| panic!("expected a client, got {e}"));
+        assert_eq!(chosen(choice), expected);
+    }
+
+    #[test]
+    fn no_way_to_get_a_client_names_static_config() {
+        let Err(error) =
+            choose_client(None, None, REDIRECT_URI, ISSUER, &auth_server(false, false))
+        else {
+            panic!("expected an error");
+        };
+        let message = error.to_string();
+        assert!(message.contains(ISSUER));
+        assert!(message.contains("oauth = {"));
+    }
+
+    #[test_case(&[],                 false ; "absent_refused")]
+    #[test_case(&["plain"],          false ; "plain_only_refused")]
+    #[test_case(&["plain", "S256"],  true  ; "s256_accepted")]
+    fn pkce_support(methods: &[&str], should_pass: bool) {
+        let meta = AuthServerMetadata {
+            code_challenge_methods_supported: methods.iter().map(|m| m.to_string()).collect(),
+            ..auth_server(false, true)
+        };
+        assert_eq!(require_pkce(&meta).is_ok(), should_pass);
+    }
+
+    #[test_case(false, None,                         true  ; "not_advertised_absent")]
+    #[test_case(true,  None,                         false ; "advertised_absent")]
+    #[test_case(true,  Some(ISSUER),                 true  ; "advertised_matching")]
+    #[test_case(false, Some("https://auth.example.com/"), true ; "trailing_slash")]
+    #[test_case(false, Some(OTHER_ISSUER),           false ; "mismatch_refused_even_unadvertised")]
+    fn response_issuer(advertised: bool, received: Option<&str>, should_pass: bool) {
+        assert_eq!(
+            check_response_issuer(ISSUER, advertised, received).is_ok(),
+            should_pass
+        );
+    }
 
     fn query_pairs(url: &str) -> Vec<(String, String)> {
         let parsed = Url::parse(url).expect("built authorization URL should parse");

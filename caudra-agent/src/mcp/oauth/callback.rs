@@ -3,14 +3,28 @@ use futures_lite::AsyncWriteExt;
 use smol::net::TcpListener;
 
 const PREFERRED_PORT: u16 = 19876;
+const ISSUER_PARAM: &str = "iss";
 const MAX_HEADER_SIZE: usize = 8192;
 const SUCCESS_HTML: &str =
     "<html><body><h1>Authentication successful</h1><p>You can close this tab.</p></body></html>";
 const ERROR_HTML: &str =
     "<html><body><h1>Authentication failed</h1><p>Please try again.</p></body></html>";
 
+#[derive(Debug)]
 pub struct CallbackResult {
     pub code: String,
+    /// RFC 9207 `iss`, naming the authorization server that sent the code.
+    pub issuer: Option<String>,
+}
+
+impl CallbackResult {
+    pub(crate) fn from_params(code: String, params: &[(String, String)]) -> Self {
+        let issuer = params
+            .iter()
+            .find(|(k, _)| k == ISSUER_PARAM)
+            .map(|(_, v)| v.clone());
+        Self { code, issuer }
+    }
 }
 
 pub struct CallbackServer {
@@ -120,7 +134,7 @@ impl CallbackServer {
             };
 
             let _ = respond(&mut stream, 200, SUCCESS_HTML).await;
-            return Ok(CallbackResult { code });
+            return Ok(CallbackResult::from_params(code, &params));
         }
     }
 }
@@ -212,12 +226,13 @@ mod tests {
                 .await
                 .unwrap();
             let req = format!(
-                "GET {DEFAULT_CALLBACK_PATH}?code=auth-code&state=test-state HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                "GET {DEFAULT_CALLBACK_PATH}?code=auth-code&state=test-state&iss=https%3A%2F%2Fauth.example.com HTTP/1.1\r\nHost: localhost\r\n\r\n"
             );
             stream.write_all(req.as_bytes()).await.unwrap();
 
             let result = handle.await.unwrap();
             assert_eq!(result.code, "auth-code");
+            assert_eq!(result.issuer.as_deref(), Some("https://auth.example.com"));
         });
     }
 

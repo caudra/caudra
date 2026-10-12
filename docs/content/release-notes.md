@@ -39,6 +39,12 @@ Preview 6 adds autopilot, an experimental mode that answers permission prompts, 
 - **Cleaner header.** A card reads `server › tool` with the call's arguments beside it and an estimate of the tokens the result costs. Opening the card shows every argument.
 - **Code it ran.** When a call runs code, such as a `code` or `sql` argument, the card shows it numbered and highlighted above the result.
 
+### MCP OAuth
+
+- **Servers without client registration.** Caudra now logs in to servers that accept OAuth client ID metadata documents, such as Home Assistant, with no client to configure. Its document lives at `https://caudra.ai/oauth/client-metadata.json`. See [OAuth](/docs/mcp/#oauth).
+- **Discovery follows the MCP spec.** `caudra mcp auth` reads the server's login challenge first, and authorization server metadata must name the issuer Caudra asked for. Servers without S256 PKCE are refused. A home server on plain HTTP works when its login pages share its origin.
+- **Clients stay with their server.** A client is reused only with the authorization server that issued it, and the redirect checks the issuer when the server reports it. After this upgrade, the next interactive login gets a new client once. Stored tokens keep refreshing.
+
 ## Caudra 0.2 Preview 5 {#v0-2-0-preview-5}
 
 [v0.2.0-preview.5 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.5)

@@ -262,6 +262,10 @@ pub struct McpAuthData {
     /// cannot redirect the refresh token and client secret elsewhere.
     #[serde(default)]
     pub token_endpoint: Option<String>,
+    /// Authorization server that issued `client_id`. A stored client is only
+    /// reused with the same issuer, since client IDs are unique per server.
+    #[serde(default)]
+    pub issuer: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -657,6 +661,7 @@ mod tests {
             client_secret_expires_at: None,
             redirect_uri: None,
             token_endpoint: None,
+            issuer: None,
         }
     }
 

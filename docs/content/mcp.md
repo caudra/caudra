@@ -39,7 +39,7 @@ headers = { Authorization = "Bearer {env:ANALYTICS_TOKEN}" }
 
 In the global `mcp.toml`, `{env:NAME}` takes a value from your environment or the global `.env`, so the token stays out of the file. A project `mcp.toml` cannot read the environment, and Caudra loads none of its servers while it holds a reference. See [Environment variables](/docs/configuration/#environment-variables).
 
-Some HTTP servers need OAuth but have no dynamic client registration. For those, give Caudra a static client:
+Caudra gets an OAuth client from most servers on its own (see [OAuth](#oauth)). For a server it cannot, give Caudra a static client:
 
 ```toml
 [mcp.acme]
@@ -60,7 +60,7 @@ oauth = { client_id = "acme-client", client_secret = "s3cret", callback_port = 3
 | `environment` | table | `{}` | - | - | Stdio servers: environment variables for the server process, such as `{ GITHUB_TOKEN = "{env:GITHUB_TOKEN}" }`. In the global file, `{env:NAME}` reads a value from your environment. Other values are stored as plain text |
 | `url` | string | required | - | - | HTTP servers: the server URL. It must start with `http://` or `https://` |
 | `headers` | table | `{}` | - | - | HTTP servers: headers sent with every request, such as `{ Authorization = "Bearer {env:GITHUB_TOKEN}" }`. In the global file, `{env:NAME}` reads a value from your environment. Other values are stored as plain text |
-| `oauth` | table | unset | - | - | HTTP servers: a static OAuth client, for a server that has no dynamic client registration |
+| `oauth` | table | unset | - | - | HTTP servers: a static OAuth client, for a server Caudra cannot get a client from on its own |
 
 <!-- /caudra-docgen:mcp-server-fields -->
 
@@ -194,7 +194,16 @@ caudra mcp auth <server-name>     # manually trigger auth
 caudra mcp logout <server-name>   # remove stored tokens
 ```
 
-Servers without dynamic client registration need a client you registered yourself (e.g. your own app on their platform). Add it as `oauth` in the server table, or as a `[mcp.NAME.oauth]` table, so the auth flow uses it instead of trying to register:
+Before the login, Caudra asks the server where its authorization server is and finds that server's metadata, as the MCP authorization spec describes. Metadata that names a different issuer than the one asked for is rejected, and so is a server that does not support S256 PKCE. Authorization servers may use plain HTTP only on loopback or on the MCP server's own origin, such as a home server at `http://homeassistant.local:8123`.
+
+Caudra then picks the OAuth client in this order:
+
+1. The static client you set as `oauth` for the server.
+2. The client this authorization server gave Caudra at the last login.
+3. Caudra's client metadata document at `https://caudra.ai/oauth/client-metadata.json`, when the server supports client ID metadata documents. The server fetches that file to check the redirect URI, so it must be able to reach caudra.ai. The file lists the callback port 19876. When that port is busy, Caudra listens on another, which only servers that allow any loopback port accept.
+4. A new client from dynamic client registration, when the server offers it.
+
+A server that offers neither, or that cannot reach caudra.ai, needs a client you registered yourself (e.g. your own app on their platform). Add it as `oauth` in the server table, or as a `[mcp.NAME.oauth]` table:
 
 <!-- caudra-docgen:mcp-oauth -->
 

@@ -2,10 +2,17 @@ use std::io::Read;
 
 use isahc::http::Request;
 use serde::Deserialize;
+use tracing::warn;
+use url::{Host, Url};
 
 use super::OAuthError;
 
 const MAX_RESPONSE_BODY: usize = 1_048_576;
+const OAUTH_SERVER_WELL_KNOWN: &str = "oauth-authorization-server";
+const OIDC_WELL_KNOWN: &str = "openid-configuration";
+const LOOPBACK_NAME: &str = "localhost";
+const HTTPS: &str = "https";
+const HTTP: &str = "http";
 
 #[derive(Debug)]
 pub struct WwwAuthenticateInfo {
@@ -23,11 +30,16 @@ pub struct ResourceMetadata {
 
 #[derive(Debug, Deserialize)]
 pub struct AuthServerMetadata {
+    pub issuer: Option<String>,
     pub authorization_endpoint: String,
     pub token_endpoint: String,
     pub registration_endpoint: Option<String>,
     #[serde(default)]
     pub code_challenge_methods_supported: Vec<String>,
+    #[serde(default)]
+    pub client_id_metadata_document_supported: bool,
+    #[serde(default)]
+    pub authorization_response_iss_parameter_supported: bool,
 }
 
 pub fn parse_www_authenticate(header: &str) -> Option<WwwAuthenticateInfo> {
@@ -93,26 +105,81 @@ pub(super) fn server_origin(server_url: &str) -> String {
     origin(server_url)
 }
 
-fn validate_endpoint_url(url: &str) -> Result<(), OAuthError> {
-    if url.starts_with("https://")
-        || url.starts_with("http://127.0.0.1")
-        || url.starts_with("http://localhost")
-    {
+/// HTTPS, loopback HTTP, or plain HTTP on the reviewed MCP origin (a LAN
+/// server such as `http://homeassistant.local:8123`), as `build_http_client`
+/// accepts.
+fn validate_endpoint_url(url: &str, server_url: &str) -> Result<(), OAuthError> {
+    let parsed = Url::parse(url)
+        .map_err(|e| OAuthError::InvalidResponse(format!("invalid endpoint URL {url}: {e}")))?;
+    let loopback = match parsed.host() {
+        Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case(LOOPBACK_NAME),
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    let allowed = match parsed.scheme() {
+        HTTPS => true,
+        HTTP => loopback || super::same_origin(&parsed, server_url),
+        _ => false,
+    };
+    if allowed {
         Ok(())
     } else {
         Err(OAuthError::Other(format!(
-            "endpoint URL must use HTTPS: {url}"
+            "endpoint URL must use HTTPS or the MCP server's own origin: {url}"
         )))
     }
 }
 
-pub fn validate_auth_server(meta: &AuthServerMetadata) -> Result<(), OAuthError> {
-    validate_endpoint_url(&meta.authorization_endpoint)?;
-    validate_endpoint_url(&meta.token_endpoint)?;
+pub fn validate_auth_server(meta: &AuthServerMetadata, server_url: &str) -> Result<(), OAuthError> {
+    validate_endpoint_url(&meta.authorization_endpoint, server_url)?;
+    validate_endpoint_url(&meta.token_endpoint, server_url)?;
     if let Some(ref ep) = meta.registration_endpoint {
-        validate_endpoint_url(ep)?;
+        validate_endpoint_url(ep, server_url)?;
     }
     Ok(())
+}
+
+/// RFC 8414 3.3: the issuer must be the identifier the metadata URL was built
+/// from. One trailing slash is tolerated, since servers disagree on it.
+pub(super) fn issuer_matches(expected: &str, found: &str) -> bool {
+    expected.strip_suffix('/').unwrap_or(expected) == found.strip_suffix('/').unwrap_or(found)
+}
+
+/// Metadata without an issuer predates RFC 8414 checks; it is still used.
+fn check_issuer(expected: &str, found: Option<&str>) -> Result<(), OAuthError> {
+    match found {
+        Some(found) if !issuer_matches(expected, found) => Err(OAuthError::InvalidResponse(
+            format!("authorization server metadata names issuer {found}, expected {expected}"),
+        )),
+        Some(_) => Ok(()),
+        None => {
+            warn!(
+                issuer = expected,
+                "authorization server metadata has no issuer"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// MCP authorization server discovery order: path insertion for OAuth and
+/// OIDC, then OIDC path appending. An issuer without a path has only the two
+/// root documents; a root document never stands in for a path issuer, since
+/// one host can serve several authorization servers.
+fn auth_server_metadata_urls(issuer_url: &str) -> Vec<String> {
+    let mut urls: Vec<String> = [OAUTH_SERVER_WELL_KNOWN, OIDC_WELL_KNOWN]
+        .iter()
+        .map(|name| well_known_url(issuer_url, name))
+        .collect();
+    let parts = parse_url(issuer_url);
+    if !parts.path.is_empty() && parts.path != "/" {
+        urls.push(format!(
+            "{}/.well-known/{OIDC_WELL_KNOWN}",
+            issuer_url.trim_end_matches('/')
+        ));
+    }
+    urls
 }
 
 fn resource_metadata_urls(server_url: &str) -> Vec<String> {
@@ -189,31 +256,16 @@ pub async fn discover_auth_server(
     server_url: &str,
     server_addresses: Option<&[std::net::IpAddr]>,
 ) -> Result<AuthServerMetadata, OAuthError> {
-    let parts = parse_url(issuer_url);
-    let has_path = !parts.path.is_empty() && parts.path != "/";
-
-    let well_known_names = ["oauth-authorization-server", "openid-configuration"];
-    let mut candidates: Vec<String> = well_known_names
-        .iter()
-        .map(|name| well_known_url(issuer_url, name))
-        .collect();
-
-    if has_path {
-        for name in &well_known_names {
-            candidates.push(format!(
-                "{}{}/.well-known/{name}",
-                parts.scheme, parts.authority
-            ));
-        }
-    }
-
     let mut last_err = OAuthError::Other("no candidates".into());
-    for url in &candidates {
-        match fetch_json::<AuthServerMetadata>(url, server_url, server_addresses).await {
-            Ok(meta) => {
-                validate_auth_server(&meta)?;
-                return Ok(meta);
-            }
+    for url in auth_server_metadata_urls(issuer_url) {
+        match fetch_json::<AuthServerMetadata>(&url, server_url, server_addresses).await {
+            Ok(meta) => match check_issuer(issuer_url, meta.issuer.as_deref()) {
+                Ok(()) => {
+                    validate_auth_server(&meta, server_url)?;
+                    return Ok(meta);
+                }
+                Err(e) => last_err = e,
+            },
             Err(e) => last_err = e,
         }
     }
@@ -265,6 +317,9 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    const LAN_SERVER_URL: &str = "http://homeassistant.local:8123/api/mcp";
+    const ISSUER: &str = "https://executor.sh/api/auth";
 
     #[test_case(
         r#"Bearer realm="example", resource_metadata="https://rs.example.com/.well-known/oauth-protected-resource", scope="read write""#,
@@ -350,11 +405,62 @@ mod tests {
         );
     }
 
-    #[test_case("https://example.com/token",   true  ; "https_valid")]
-    #[test_case("http://127.0.0.1:8080/token", true  ; "localhost_valid")]
-    #[test_case("http://example.com/token",    false ; "http_rejected")]
-    #[test_case("ftp://example.com/token",     false ; "ftp_rejected")]
+    #[test_case("https://example.com/token",              true  ; "https_valid")]
+    #[test_case("http://127.0.0.1:8080/token",            true  ; "loopback_ip_valid")]
+    #[test_case("http://localhost:8080/token",            true  ; "localhost_valid")]
+    #[test_case("http://[::1]:8080/token",                true  ; "loopback_ipv6_valid")]
+    #[test_case("http://homeassistant.local:8123/token",  true  ; "same_origin_http_valid")]
+    #[test_case("http://homeassistant.local:9000/token",  false ; "other_port_http_rejected")]
+    #[test_case("http://127.0.0.1.evil.example/token",    false ; "loopback_prefix_rejected")]
+    #[test_case("http://example.com/token",               false ; "http_rejected")]
+    #[test_case("ftp://example.com/token",                false ; "ftp_rejected")]
+    #[test_case("/auth/token",                            false ; "relative_rejected")]
     fn endpoint_url_validation(url: &str, should_pass: bool) {
-        assert_eq!(validate_endpoint_url(url).is_ok(), should_pass);
+        assert_eq!(
+            validate_endpoint_url(url, LAN_SERVER_URL).is_ok(),
+            should_pass
+        );
+    }
+
+    #[test_case(
+        "https://auth.example.com/tenant1",
+        &[
+            "https://auth.example.com/.well-known/oauth-authorization-server/tenant1",
+            "https://auth.example.com/.well-known/openid-configuration/tenant1",
+            "https://auth.example.com/tenant1/.well-known/openid-configuration",
+        ]
+        ; "path_issuer_has_no_root_fallback"
+    )]
+    #[test_case(
+        "https://auth.example.com",
+        &[
+            "https://auth.example.com/.well-known/oauth-authorization-server",
+            "https://auth.example.com/.well-known/openid-configuration",
+        ]
+        ; "root_issuer"
+    )]
+    fn auth_server_metadata_url_candidates(issuer: &str, expected: &[&str]) {
+        assert_eq!(auth_server_metadata_urls(issuer), expected);
+    }
+
+    #[test_case(ISSUER, Some(ISSUER),                           true  ; "identical")]
+    #[test_case(ISSUER, Some("https://executor.sh/api/auth/"),  true  ; "trailing_slash")]
+    #[test_case(ISSUER, Some("https://signin.executor.sh"),     false ; "other_server")]
+    #[test_case(ISSUER, Some("https://executor.sh/api"),        false ; "parent_path")]
+    #[test_case(ISSUER, None,                                   true  ; "absent_tolerated")]
+    fn issuer_check(expected: &str, found: Option<&str>, should_pass: bool) {
+        assert_eq!(check_issuer(expected, found).is_ok(), should_pass);
+    }
+
+    #[test]
+    fn metadata_reads_registration_capabilities() {
+        let meta: AuthServerMetadata = serde_json::from_str(
+            r#"{"issuer":"https://executor.sh/api/auth","authorization_endpoint":"https://a/authorize","token_endpoint":"https://a/token","client_id_metadata_document_supported":true,"authorization_response_iss_parameter_supported":true}"#,
+        )
+        .unwrap();
+        assert_eq!(meta.issuer.as_deref(), Some(ISSUER));
+        assert!(meta.client_id_metadata_document_supported);
+        assert!(meta.authorization_response_iss_parameter_supported);
+        assert!(meta.registration_endpoint.is_none());
     }
 }

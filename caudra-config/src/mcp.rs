@@ -104,7 +104,7 @@ pub const HTTP_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
-        description: "HTTP servers: a static OAuth client, for a server that has no dynamic client registration",
+        description: "HTTP servers: a static OAuth client, for a server Caudra cannot get a client from on its own",
     },
 ];
 

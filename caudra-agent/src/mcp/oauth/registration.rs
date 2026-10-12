@@ -2,9 +2,12 @@ use std::io::Read;
 
 use isahc::HttpClient;
 use isahc::http::Request;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::OAuthError;
+
+const CLIENT_NAME: &str = "Caudra";
+const NATIVE_APPLICATION: &str = "native";
 
 pub struct ClientRegistration {
     pub client_id: String,
@@ -17,14 +20,7 @@ pub async fn register_client(
     registration_endpoint: &str,
     redirect_uri: &str,
 ) -> Result<ClientRegistration, OAuthError> {
-    let body = json!({
-        "client_name": "Caudra",
-        "redirect_uris": [redirect_uri],
-        "grant_types": ["authorization_code", "refresh_token"],
-        "response_types": ["code"],
-        "token_endpoint_auth_method": "none",
-    });
-
+    let body = registration_body(redirect_uri);
     let req = Request::post(registration_endpoint)
         .header("Content-Type", "application/json")
         .body(serde_json::to_vec(&body).map_err(|e| OAuthError::Other(e.to_string()))?)
@@ -72,4 +68,32 @@ pub async fn register_client(
         client_secret,
         client_secret_expires_at,
     })
+}
+
+/// `native` tells OIDC servers to accept the loopback redirect URI, which
+/// they refuse for the default `web` application type.
+fn registration_body(redirect_uri: &str) -> Value {
+    json!({
+        "client_name": CLIENT_NAME,
+        "redirect_uris": [redirect_uri],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "application_type": NATIVE_APPLICATION,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NATIVE_APPLICATION, registration_body};
+
+    const REDIRECT_URI: &str = "http://127.0.0.1:19876/mcp/oauth/callback";
+
+    #[test]
+    fn registers_as_native_public_client() {
+        let body = registration_body(REDIRECT_URI);
+        assert_eq!(body["application_type"], NATIVE_APPLICATION);
+        assert_eq!(body["redirect_uris"][0], REDIRECT_URI);
+        assert_eq!(body["token_endpoint_auth_method"], "none");
+    }
 }

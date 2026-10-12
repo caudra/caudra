@@ -24,11 +24,11 @@ use tracing::{info, warn};
 
 const SESSION_HEADER: &str = "mcp-session-id";
 const PROTOCOL_HEADER: &str = "mcp-protocol-version";
-const INITIALIZE_METHOD: &str = "initialize";
+pub(super) const INITIALIZE_METHOD: &str = "initialize";
 const PROTOCOL_VERSION_KEY: &str = "protocolVersion";
-const CT_JSON: &str = "application/json";
+pub(super) const CT_JSON: &str = "application/json";
 const CT_SSE: &str = "text/event-stream";
-const ACCEPT_VALUE: &str = "application/json, text/event-stream";
+pub(super) const ACCEPT_VALUE: &str = "application/json, text/event-stream";
 
 pub struct HttpTransport {
     name: Arc<str>,
@@ -572,6 +572,7 @@ mod tests {
             client_secret_expires_at: None,
             redirect_uri: None,
             token_endpoint: None,
+            issuer: None,
         }
     }
 
