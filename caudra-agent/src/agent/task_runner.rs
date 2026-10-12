@@ -812,6 +812,7 @@ impl WorkflowHostContext {
             steering_observations: None,
             steering_order: Vec::new(),
             speculative: None,
+            decision_focus: None,
         })
     }
 }

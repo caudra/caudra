@@ -7,6 +7,22 @@ Each release lists what changed, newest first. After an update, the first intera
 
 To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run [`caudra update`](/docs/cli/#caudra-update-caudra-rollback). Each release links to its GitHub page, which holds the downloads.
 
+## Caudra 0.2 Preview 8 {#v0-2-0-preview-8}
+
+[v0.2.0-preview.8 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.8)
+
+Preview 8 lets the experimental decision engine rerank memory notes, tool search, retained tool output, and code context, and gives workflows a `rerank()` function.
+
+> **Note**
+>
+> **If you raised `decisions.timeout_ms` for a slow decision engine and use `tool_search`, set `rerank_timeout_ms` as well.** Tool search now uses that deadline, which defaults to 2 seconds.
+
+### Decision engine
+
+- **Reranking features.** Six new experimental decision features use the engine as a reranker, and each is off by default. `memory_search` shows the memory search matches the engine judges relevant, best first, and names the ones it left out. `memory_recall` reminds the agent of up to three notes that may matter for your new message. `memory_duplicates` points out an existing note when a new one may repeat it. `compaction_retention` keeps the tool results that matter to the current goal, todos, and request when a session compacts, instead of only the newest three. `output_pointers` adds up to two lines to a truncated tool result that point at the omitted lines most likely to matter, with the `tool_output` call that reads them. `code_context` moves the most relevant rows of a `code_context` result to the top. Each asks one true or false question per candidate, up to 16 per request, with redacted and bounded candidate text. When the engine fails or times out, each behaves as if it were off. A new `rerank_timeout_ms` deadline (2 seconds) and `thresholds.relevance_floor` (`0.1`) apply to them. See [Reranking](/docs/configuration/#reranking).
+- **Tool search judges each candidate.** With `tool_search` enforced, the engine now scores each of the first 16 keyword matches instead of picking one from the whole list. It reorders them and never drops one. On the local evaluation set it got one more query right than the single pick, with no new wrong answers, at about 130 ms more per search.
+- **Workflows can rerank.** `rerank(query, candidates)` and `rerank(query, candidates, opts)` return `#{ index, score }` entries, most relevant first. Options are `model`, `timeout_ms`, `threshold`, and `top_k`. Each batch of 16 candidates is one journaled decision, so a resumed run asks only for the rest. A `decide()` or `rerank()` timeout may now reach the larger of `timeout_ms` and `rerank_timeout_ms`. See [Reranking candidates](/docs/workflows/#reranking-candidates).
+
 ## Caudra 0.2 Preview 7 {#v0-2-0-preview-7}
 
 [v0.2.0-preview.7 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.7)

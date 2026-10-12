@@ -201,11 +201,31 @@ let result = decide(#{ task: args.objective }, #{
 let job = if result.answers.deep_reasoning.noul >= 0.9 { "best" } else { "fast" };
 ```
 
-Question IDs map to definitions with `type`, `instructions`, and optional `criteria`. Types are `noul` (only a probability, in the answer's `noul` field), `choice` (a map from option name to description or `()`), and `score` (ordered array of 2 to 10 levels). Choice and score answers also carry `confidence`. Limits: 64 questions, 255 choice options, 512 total options. Optional `model` selects a decision model, not an agent model. Optional `timeout_ms` can shorten but cannot extend the user's configured deadline.
+Question IDs map to definitions with `type`, `instructions`, and optional `criteria`. Types are `noul` (only a probability, in the answer's `noul` field), `choice` (a map from option name to description or `()`), and `score` (ordered array of 2 to 10 levels). Choice and score answers also carry `confidence`. Limits: 64 questions, 255 choice options, 512 total options. Optional `model` selects a decision model, not an agent model. Optional `timeout_ms` replaces the default `timeout_ms` deadline and is capped at the larger of the user's `timeout_ms` and `rerank_timeout_ms`.
 
 Use short, non-sensitive states. The runtime redacts and bounds serialized states to 1,500 bytes. Oversized states and questions whose answer semantics would change under redaction are rejected. Endpoint failures and timeouts are catchable errors. Successful calls are committed before returning and replayed without network calls on resume. Failed or uncommitted calls can be retried. Decision request bodies are hidden from the workflow journal. Opt-in decision logging stores the redacted state sent to the endpoint.
 
 Calls count against the host-call limit, not the agent budget. Answers are data. Never treat them as permission grants or use them to bypass deterministic checks.
+
+### `rerank(query, candidates)` and `rerank(query, candidates, options)`
+
+Orders candidates by relevance to `query` through the same decision endpoint and returns `[#{ index, score }]`, best first. `index` points into `candidates`, `score` is the `noul` probability, and equal scores keep their input order. The same availability rules as `decide()` apply, so catch failures and keep your own order.
+
+```rhai
+let files = ["src/parser.rs", "src/lexer.rs", "docs/parser.md"];
+let picked = [];
+try {
+    for entry in rerank(args.objective, files, #{ threshold: 0.5, top_k: 2 }) {
+        picked.push(files[entry.index]);
+    }
+} catch (error) {
+    picked = files;
+}
+```
+
+`query` is a non-empty string. `candidates` holds strings or maps, and a map is sent as candidate data. Each candidate becomes one `noul` question that frames it as untrusted data to judge. Options: `model` and `timeout_ms` as for `decide()`, `threshold` (0 to 1, drops lower scores), and `top_k` (keeps at most that many). `threshold` and `top_k` apply after the answers arrive and are not part of the recorded request. Invalid arguments raise a catchable error before any call. An empty array returns `[]` without a call.
+
+Candidates go out 16 per call, one after another, and each batch is one journaled host call, so a resumed run replays the committed batches. Each candidate is redacted and bounded to 1,500 bytes together with the fixed relevance question, and an oversized candidate fails the call. One refused batch fails the whole call. Scores are data, like `decide()` answers.
 
 ### `json_encode(value)`
 

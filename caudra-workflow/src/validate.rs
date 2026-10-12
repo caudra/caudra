@@ -208,6 +208,8 @@ mod tests {
     };
 
     const META: &str = r#"let meta = #{ name: "t", description: "d" };"#;
+    const RERANK_CANDIDATES: usize = 17;
+    const RERANK_BATCHES: u64 = 2;
 
     #[test]
     fn decisions_smoke_run_with_deterministic_typed_answers() {
@@ -234,6 +236,22 @@ mod tests {
         assert_eq!(
             validate(&source).unwrap().smoke.outcome,
             report.smoke.outcome
+        );
+    }
+
+    #[test]
+    fn rerank_smoke_runs_one_host_call_per_batch() {
+        let source = format!(
+            r#"{META}
+            let candidates = [];
+            for i in 0..{RERANK_CANDIDATES} {{ candidates.push("candidate " + i); }}
+            complete(rerank(args.query, candidates).map(|entry| entry.index));"#
+        );
+        let report = validate(&source).unwrap();
+        assert_eq!(report.smoke.host_calls, RERANK_BATCHES);
+        assert_eq!(
+            report.smoke.outcome,
+            WorkflowOutcome::Completed(json!((0..RERANK_CANDIDATES).collect::<Vec<_>>()))
         );
     }
 

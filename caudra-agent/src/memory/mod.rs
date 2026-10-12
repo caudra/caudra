@@ -4,6 +4,7 @@
 
 pub mod baseline;
 pub mod compactor;
+pub mod relevance;
 pub mod search;
 pub mod snapshot;
 pub mod store;

@@ -449,6 +449,7 @@ fn child_context(ctx: &ToolContext, index: usize) -> ToolContext {
         .or_else(|| ctx.tool_use_id.clone());
     child.steering_order.push(index);
     child.live_sink = None;
+    child.decision_focus = None;
     child
 }
 
@@ -1409,6 +1410,13 @@ mod tests {
             child_context(&ctx, 0).live_sink.is_none(),
             "the live row belongs to the batch, not to a child"
         );
+    }
+
+    #[test]
+    fn a_child_never_points_into_omitted_output() {
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.decision_focus = Some(json!(BODY));
+        assert!(child_context(&ctx, 0).decision_focus.is_none());
     }
 
     #[test_case(None, "local-batch"; "direct_batch_uses_parent_call")]

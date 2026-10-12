@@ -21,7 +21,7 @@ pub mod skill;
 pub mod task;
 pub mod task_control;
 pub mod todo_write;
-mod tool_output;
+pub(crate) mod tool_output;
 mod view_image;
 pub mod workflow;
 

@@ -50,6 +50,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use caudra_agent::decisions::{CodeSymbol, rerank_code_context};
 use caudra_agent::patch;
 use caudra_agent::permissions::pattern_recognition::ObservationProvenance;
 use caudra_agent::permissions::{
@@ -87,17 +88,18 @@ use caudra_workspace::{
 };
 use futures_lite::future;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::Value;
+use serde_json::{Value, json};
+use smol::Timer;
 use tokio::runtime::{Builder, Runtime};
 use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use workcell::code::bundled_worker_available;
 use workcell::code::{CodeConfiguration, CodeExecution, CodeInput, Outcome, WorkerSource};
 use workcell::code_graph::{
-    CodeContextInput, CodeExpandInput, CodeGraphError, CodeGraphLimits, CodeGraphToolGroup,
-    CodeImpactInput, CodeMapInput, CodeRefsInput, GraphProgress, GraphProgressSink,
-    ModelText as CodeGraphModelText, RankedSymbol, ReachedSymbol, SelectorRefusal, SymbolRef,
-    crawl_filesystem_limits, fit,
+    CodeContextInput, CodeContextOutput, CodeExpandInput, CodeGraphError, CodeGraphLimits,
+    CodeGraphToolGroup, CodeImpactInput, CodeMapInput, CodeRefsInput, GraphProgress,
+    GraphProgressSink, ModelText as CodeGraphModelText, RankedSymbol, ReachedSymbol,
+    SelectorRefusal, SymbolRef, crawl_filesystem_limits, fit,
 };
 use workcell::environment::{
     ExecutionEnvironmentError, ExecutionEnvironmentResult, ToolGroupDisclosure,
@@ -250,6 +252,8 @@ const GIT_REPOSITORY_NO: &str = "no";
 const NOT_APPLIED: &str = "[not applied: nothing was written]";
 const CODE_ONE_LINE: &str = "1 line";
 const CODE_LINES: &str = "lines";
+const DECISION_TOOL_META: &str = "tool";
+const CODE_CONTEXT_TOOL: &str = "code_context";
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
@@ -3230,7 +3234,8 @@ impl WorkcellInvocation {
                     })
                     .await
                 {
-                    Ok(Ok(output)) => {
+                    Ok(Ok(mut output)) => {
+                        let reordered = rerank_context_rows(ctx, &mut output).await;
                         let annotation = format!(
                             "{} \u{b7} {} confidence",
                             shown_of(output.shown, output.total_matched, "matches"),
@@ -3252,6 +3257,7 @@ impl WorkcellInvocation {
                             graph_footer(&output),
                             annotation,
                         )
+                        .with_model_suffix(reordered)
                     }
                     Ok(Err(error)) => failed(code_graph_error(error)),
                     Err(error) => failed(error),
@@ -4430,6 +4436,45 @@ fn code_graph_result(
     .with_annotation(Some(annotation))
 }
 
+/// Moves the rows the decision engine judges relevant to the task to the top
+/// before `fit` keeps a prefix, within the call's own deadline. Workcell's
+/// headline and confidence still describe its own ranking; the returned note
+/// tells the model which rows moved.
+async fn rerank_context_rows(ctx: &ToolContext, output: &mut CodeContextOutput) -> Option<String> {
+    let decisions = ctx.permissions.decisions()?;
+    let remaining = ctx.deadline.remaining().ok()?;
+    let context = ctx
+        .permissions
+        .decision_context(json!({DECISION_TOOL_META: CODE_CONTEXT_TOOL}));
+    let rerank = rerank_code_context(
+        &mut output.results,
+        |row| CodeSymbol {
+            name: &row.name,
+            kind: &row.kind,
+            path: &row.path,
+            line_start: row.line_start,
+            line_end: row.line_end,
+            callers: row.callers,
+            calls: row.calls,
+        },
+        &output.task,
+        &decisions,
+        &context,
+        Some(ctx.permissions.as_ref()),
+        &ctx.cancel,
+    );
+    match remaining {
+        Some(remaining) => {
+            future::or(rerank, async {
+                Timer::after(remaining).await;
+                None
+            })
+            .await
+        }
+        None => rerank.await,
+    }
+}
+
 /// A refused selector is a successful call: the did-you-mean list is the useful
 /// answer, and an error envelope has nowhere to put it.
 fn selector_refusal_result(refusal: &SelectorRefusal) -> ToolExecResult {
@@ -4949,10 +4994,12 @@ impl ShellProgressSink for NativeProgressSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use caudra_agent::agent::mention_preamble;
     use caudra_agent::agent::tool_dispatch::{self, Emit};
     use caudra_agent::background::{BackgroundTasks, JobScope, ShellLive};
     use caudra_agent::cancel::CancelToken;
+    use caudra_agent::decisions::{Decisions, MAX_RERANK_BATCH, reordered_note};
     use caudra_agent::permissions::pattern_recognition::{CommandObservation, ShellEffectStatus};
     use caudra_agent::permissions::{
         AutoNote, COMMAND_EXACT_PREFIX, COMMAND_TEMPLATE_PREFIX, ComposedRow, PermissionAnswer,
@@ -4973,10 +5020,14 @@ mod tests {
         AgentMode, ContentBlock, Envelope, EventSender, History, Mention, Message, StoredSession,
         TaskCard, ToolFilter,
     };
+    use caudra_config::decisions::{DecisionsConfig, FeatureMode};
     use caudra_config::shell_env::ShellEnvConfig;
     use caudra_config::{
         AgentConfig, DefaultEffect, Effect, ExecutionMode, PermissionRule, PermissionsConfig,
         ToolKey,
+    };
+    use caudra_decision::{
+        Answer, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, NoulAnswer, Usage,
     };
     use caudra_storage::{
         StateDir,
@@ -5052,6 +5103,13 @@ mod tests {
     const BROWSE_CONTENT_SENTINEL: &str = "content_not_authorized_by_a_names_only_grant";
     const PATTERN_PACKAGES: [&str; 3] = ["alpha", "beta", "gamma"];
     const PATTERN_COMMAND: &str = "cargo check -p alpha --tests";
+    const CODE_CONTEXT_TASK: &str = "normalize sku item import";
+    const CODE_CONTEXT_COUNTS: [&str; 3] = ["shown", "totalMatched", "truncated"];
+    const DECISION_BASE_URL: &str = "http://127.0.0.1:1";
+    const RELEVANT_SCORE: f64 = 0.9;
+    const UNRELATED_SCORE: f64 = 0.0;
+    const NOTHING_TO_REORDER: &str = "the task must match more than one symbol";
+    const REORDER_ONLY: &str = "reranking reorders rows and never adds or drops one";
     const LEARNED_TEMPLATE: &str = "cargo check -p <value> --tests";
     const INTERPRETER_SIBLING: &str = "cargo check -p core && python3 -c 'print(1)'";
     const INLINE_PYTHON: ShellOpacity = ShellOpacity::InlineScript {
@@ -8137,8 +8195,29 @@ mod tests {
     }
 
     fn run_code_graph(root: &Path, tool: &str, input: Value) -> ToolExecResult {
+        run_code_graph_with(root, tool, input, None)
+    }
+
+    fn run_code_graph_with(
+        root: &Path,
+        tool: &str,
+        input: Value,
+        decisions: Option<Decisions>,
+    ) -> ToolExecResult {
         let (_host, registry) = host_and_registry(root);
-        let ctx = context(root, Arc::clone(&registry), CancelToken::none());
+        let mut ctx = context(root, Arc::clone(&registry), CancelToken::none());
+        if let Some(decisions) = decisions {
+            ctx.permissions = Arc::new(PermissionManager::new_nonpersistent(
+                PermissionsConfig {
+                    default: DefaultEffect::Allow,
+                    decision_engine: true,
+                    ..PermissionsConfig::default()
+                },
+                root.to_path_buf(),
+                Arc::default(),
+            ));
+            ctx.permissions.set_decisions(Some(decisions));
+        }
         let invocation = registry
             .get(tool)
             .unwrap_or_else(|| panic!("registered {tool}"))
@@ -8213,6 +8292,107 @@ mod tests {
 
         assert!(model_output.contains(LEGEND), "got {model_output:?}");
         assert!(model_output.contains("normalize_sku"));
+    }
+
+    /// Scores only the last candidate of each batch as relevant.
+    struct LastCandidateEngine;
+
+    #[async_trait]
+    impl DecisionEngine for LastCandidateEngine {
+        async fn decide(
+            &self,
+            request: &DecisionRequest,
+            _deadline: Instant,
+        ) -> Result<DecisionResponse, DecisionError> {
+            let last = request.questions.keys().last();
+            let answers = request
+                .questions
+                .keys()
+                .map(|id| {
+                    let noul = if Some(id) == last {
+                        RELEVANT_SCORE
+                    } else {
+                        UNRELATED_SCORE
+                    };
+                    (id.clone(), Answer::Noul(NoulAnswer { noul }))
+                })
+                .collect();
+            Ok(DecisionResponse {
+                model: request.model.clone(),
+                answers,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                cache_hit: false,
+            })
+        }
+    }
+
+    fn code_graph_parts(result: ToolExecResult) -> (Vec<String>, Value, String, Option<String>) {
+        let Ok(ToolOutput::CodeGraph {
+            rows,
+            state: Some(state),
+            ..
+        }) = result.output
+        else {
+            panic!("expected a code-graph card");
+        };
+        (
+            rows.into_iter().map(|row| row.name).collect(),
+            state,
+            result.model_output.expect("model output"),
+            result.model_suffix,
+        )
+    }
+
+    #[test_case(FeatureMode::Enforce, true; "enforced_moves_the_relevant_row_first")]
+    #[test_case(FeatureMode::Off, false; "off_keeps_workcells_order")]
+    fn code_context_rows_follow_decision_relevance(mode: FeatureMode, reordered: bool) {
+        let root = TempDir::new().expect("tempdir");
+        let state_dir = TempDir::new().expect("state tempdir");
+        code_graph_tree(root.path());
+        let input = json!({ "task": CODE_CONTEXT_TASK });
+        let mut config = DecisionsConfig {
+            base_url: Some(DECISION_BASE_URL.parse().expect("decision URL")),
+            ..DecisionsConfig::default()
+        };
+        config.features.code_context = mode;
+        let decisions = Decisions::with_engine(
+            config,
+            &StateDir::from_path(state_dir.path().into()),
+            LastCandidateEngine,
+        )
+        .expect("decision service");
+
+        let (names, state, text, suffix) =
+            code_graph_parts(run_code_graph(root.path(), "code_context", input.clone()));
+        let (actual_names, actual_state, actual_text, actual_suffix) = code_graph_parts(
+            run_code_graph_with(root.path(), "code_context", input, Some(decisions)),
+        );
+
+        assert!(names.len() > 1, "{NOTHING_TO_REORDER}: {names:?}");
+        assert_eq!(suffix, None);
+        for field in CODE_CONTEXT_COUNTS {
+            assert_eq!(actual_state[field], state[field], "{field}");
+        }
+        if reordered {
+            let head = names.len().min(MAX_RERANK_BATCH);
+            let mut expected = names.clone();
+            let moved = expected.remove(head - 1);
+            expected.insert(0, moved);
+            assert_eq!(actual_names, expected);
+            assert_eq!(actual_suffix, Some(reordered_note(head)));
+            let mut lines: Vec<&str> = text.lines().collect();
+            let mut actual_lines: Vec<&str> = actual_text.lines().collect();
+            lines.sort_unstable();
+            actual_lines.sort_unstable();
+            assert_eq!(actual_lines, lines, "{REORDER_ONLY}");
+        } else {
+            assert_eq!(actual_names, names);
+            assert_eq!(actual_text, text);
+            assert_eq!(actual_suffix, None);
+        }
     }
 
     #[test]

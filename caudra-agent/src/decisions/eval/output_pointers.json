@@ -1,0 +1,112 @@
+{
+  "k": 2,
+  "baseline": {"ndcg_at_k": 1.0, "recall_at_k": 1.0, "false_advice_rate": 0.0, "p50_ms": 711, "p95_ms": 895},
+  "baseline_note": "Synthetic, hand-labelled cases. Measured 2026-10-12 with protocol openai, endpoint http://127.0.0.1:8080/v1 (local ninfer), model systemone-decision-v7. The line order that the feature falls back to scored nDCG@k 0.222 and recall@k 0.250 on the same cases.",
+  "cases": [
+    {
+      "query": "cargo test --workspace\nThe parser tests fail after my change to tokenizer.rs, find out why and fix it.",
+      "candidates": [
+        "   Compiling tokenizer v0.4.0 (/work/tokenizer)\n   Compiling parser v0.4.0 (/work/parser)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 41.2s",
+        "running 48 tests\ntest lexer::tests::skips_comments ... ok\ntest lexer::tests::reads_numbers ... ok\ntest lexer::tests::reads_strings ... ok",
+        "test cache::tests::evicts_oldest ... ok\ntest cache::tests::keeps_recent ... ok\ntest result: ok. 48 passed; 0 failed; 0 ignored",
+        "running 31 tests\ntest parser::tests::parses_empty_block ... FAILED\ntest parser::tests::parses_nested_calls ... ok",
+        "---- parser::tests::parses_empty_block stdout ----\nthread 'parser::tests::parses_empty_block' panicked at parser/src/block.rs:88:9:\nassertion `left == right` failed\n  left: [LBrace, RBrace, Eof]\n right: [LBrace, RBrace]",
+        "test format::tests::pads_columns ... ok\ntest format::tests::wraps_long_lines ... ok\ntest result: ok. 22 passed; 0 failed; 0 ignored"
+      ],
+      "relevant": [3, 4]
+    },
+    {
+      "query": "npm run build\nThe production build breaks on the checkout page, figure out what is wrong.",
+      "candidates": [
+        "> shop@2.1.0 build\n> vite build\nvite v5.2.0 building for production...",
+        "src/pages/Checkout.tsx:57:14 - error TS2339: Property 'totalCents' does not exist on type 'Cart'.\n57     const total = cart.totalCents / 100;",
+        "transforming (412) src/components/Header.tsx\ntransforming (618) src/pages/Home.tsx\ntransforming (702) src/pages/Account.tsx",
+        "dist/assets/index-4f2a.css   48.21 kB | gzip: 9.80 kB\ndist/assets/vendor-91bc.js  312.40 kB | gzip: 98.11 kB",
+        "(!) Some chunks are larger than 500 kB after minification. Consider using dynamic import() to code-split the application.",
+        "src/pages/Checkout.tsx:91:3 - error TS2554: Expected 2 arguments, but got 1.\n91   applyCoupon(code);"
+      ],
+      "relevant": [1, 5]
+    },
+    {
+      "query": "pytest -q tests/\nWhy does the invoice export test time out on CI?",
+      "candidates": [
+        "============================= test session starts ==============================\nplatform linux -- Python 3.12.3, pytest-8.1.1\ncollected 214 items",
+        "tests/test_users.py ........................................ [ 18%]\ntests/test_auth.py ............................ [ 31%]",
+        "tests/test_reports.py ............................................ [ 58%]\ntests/test_search.py .................. [ 66%]",
+        "_____________________ test_export_invoices_csv _____________________\nE   Failed: Timeout >30.0s\nE   while waiting on socket recv from smtp.example.test:25 in invoices/export.py:142",
+        "-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\nDeprecationWarning: datetime.utcnow() is deprecated",
+        "FAILED tests/test_invoices.py::test_export_invoices_csv - Failed: Timeout >30.0s\n1 failed, 213 passed, 12 warnings in 61.02s"
+      ],
+      "relevant": [3, 5]
+    },
+    {
+      "query": "kubectl logs deploy/api --since=1h\nUsers report 502 errors on the orders endpoint since the last deploy, check the api logs.",
+      "candidates": [
+        "2026-03-02T10:05:13Z INFO GET /health 200 2ms\n2026-03-02T10:05:43Z INFO GET /health 200 1ms",
+        "2026-03-02T10:12:40Z ERROR POST /orders 502 upstream payment-gateway: connection refused (dial tcp 10.0.4.12:8443)",
+        "2026-03-02T10:20:07Z INFO GET /products 200 14ms\n2026-03-02T10:20:09Z INFO GET /products/88 200 6ms",
+        "2026-03-02T10:31:55Z WARN retrying payment-gateway after connection refused (attempt 3/3)\n2026-03-02T10:31:58Z ERROR POST /orders 502 giving up on payment-gateway",
+        "2026-03-02T10:45:00Z INFO cache warmed: 1204 products",
+        "2026-03-02T10:50:12Z INFO GET /health 200 2ms\n2026-03-02T10:50:42Z INFO GET /health 200 2ms",
+        "2026-03-02T10:55:31Z INFO GET /orders/1182 200 9ms"
+      ],
+      "relevant": [1, 3]
+    },
+    {
+      "query": "rg -n retry src\nWhere is the retry delay for webhooks configured?",
+      "candidates": [
+        "src/http/client.rs:12:use crate::retry::Backoff;\nsrc/http/client.rs:88:        let retry = Backoff::default();",
+        "src/db/pool.rs:40:    // retry the connection once before failing\nsrc/db/pool.rs:41:    retry_once(|| connect(url))",
+        "src/webhooks/dispatch.rs:23:const RETRY_DELAY: Duration = Duration::from_secs(30);\nsrc/webhooks/dispatch.rs:57:        sleep(RETRY_DELAY * attempt).await;",
+        "src/jobs/queue.rs:101:        job.retry_count += 1;\nsrc/jobs/queue.rs:102:        if job.retry_count > MAX_RETRIES {",
+        "src/config.rs:77:    pub webhook_retry_delay_secs: u64,\nsrc/config.rs:140:            webhook_retry_delay_secs: 30,",
+        "tests/http.rs:9:fn retry_after_header_is_respected() {\ntests/http.rs:31:    assert_eq!(client.retries(), 3);"
+      ],
+      "relevant": [2, 4]
+    },
+    {
+      "query": "terraform plan\nMake sure the plan does not destroy the production database.",
+      "candidates": [
+        "  # aws_db_instance.production must be replaced\n-/+ resource \"aws_db_instance\" \"production\" {\n      ~ engine_version = \"15.4\" -> \"16.2\" # forces replacement",
+        "  # aws_s3_bucket.assets will be updated in-place\n  ~ resource \"aws_s3_bucket\" \"assets\" {\n      ~ tags = { \"team\" = \"web\" -> \"platform\" }",
+        "  # aws_cloudwatch_log_group.api will be created\n  + resource \"aws_cloudwatch_log_group\" \"api\" {\n      + retention_in_days = 14",
+        "  # aws_iam_role_policy.ci will be updated in-place\n  ~ policy = jsonencode(...)",
+        "Plan: 1 to add, 2 to change, 1 to destroy."
+      ],
+      "relevant": [0, 4]
+    },
+    {
+      "query": "cargo clippy --workspace -- -D warnings\nFix the clippy errors in the billing crate.",
+      "candidates": [
+        "    Checking serde v1.0.203\n    Checking tokio v1.38.0\n    Checking billing v0.9.0 (/work/billing)",
+        "error: called `unwrap` on `rate` after checking its variant with `is_some`\n  --> billing/src/tax.rs:31:13\n   |\n31 |         let value = rate.unwrap();",
+        "error: this `if` has identical blocks\n  --> reports/src/summary.rs:44:5",
+        "warning: unused import: `std::fmt`\n  --> web/src/main.rs:3:5",
+        "error: redundant clone\n   --> billing/src/invoice.rs:120:27\n    |\n120 |     let lines = items.clone();",
+        "    Checking reports v0.9.0 (/work/reports)\n    Checking web v0.9.0 (/work/web)"
+      ],
+      "relevant": [1, 4]
+    },
+    {
+      "query": "docker compose up --build\nThe worker container keeps restarting, find out why.",
+      "candidates": [
+        "[+] Building 12.3s (18/18) FINISHED\n => [api internal] load build definition from Dockerfile",
+        "api-1     | listening on :8080\nweb-1     | ready in 840 ms",
+        "worker-1  | Error: REDIS_URL is not set\nworker-1  |     at loadConfig (/app/src/config.js:14:11)\nworker-1 exited with code 1",
+        "db-1      | database system is ready to accept connections",
+        "worker-1  | Error: REDIS_URL is not set\nworker-1 exited with code 1\nworker-1  | restarting (attempt 4)",
+        "web-1     | GET / 200 3ms\napi-1     | GET /health 200 1ms"
+      ],
+      "relevant": [2, 4]
+    },
+    {
+      "query": "cargo build --release\nUpdate the README badge to point at the new CI workflow.",
+      "candidates": [
+        "   Compiling libc v0.2.155\n   Compiling proc-macro2 v1.0.86\n   Compiling unicode-ident v1.0.12",
+        "   Compiling serde_derive v1.0.203\n   Compiling tokio-macros v2.3.0",
+        "   Compiling app v1.4.0 (/work/app)\n    Finished `release` profile [optimized] target(s) in 1m 12s"
+      ],
+      "relevant": []
+    }
+  ]
+}

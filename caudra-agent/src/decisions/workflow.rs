@@ -74,7 +74,7 @@ impl Decisions {
             request
                 .timeout_ms
                 .unwrap_or(self.config().timeout_ms)
-                .min(self.config().timeout_ms),
+                .min(DecisionFeature::Workflow.timeout_ms(self.config())),
         ))
     }
 }
@@ -181,6 +181,8 @@ mod tests {
     const MODEL: &str = "workflow-model";
     const OTHER_MODEL: &str = "other-workflow-model";
     const TIMEOUT_MS: u64 = 5_000;
+    const SHORT_RERANK_TIMEOUT_MS: u64 = TIMEOUT_MS / 4;
+    const LONG_RERANK_TIMEOUT_MS: u64 = TIMEOUT_MS * 3;
     const INPUT_TOKENS: u64 = 11;
     const OUTPUT_TOKENS: u64 = 3;
     const WORKFLOW_NAME: &str = "deployment";
@@ -321,12 +323,22 @@ mod tests {
         });
     }
 
-    #[test_case(None, TIMEOUT_MS; "configured_timeout")]
-    #[test_case(Some(TIMEOUT_MS * 2), TIMEOUT_MS; "larger_override_is_capped")]
-    #[test_case(Some(TIMEOUT_MS / 2), TIMEOUT_MS / 2; "smaller_override_is_honored")]
-    fn workflow_timeout_and_default_model_are_projected(timeout: Option<u64>, expected: u64) {
+    #[test_case(None, SHORT_RERANK_TIMEOUT_MS, TIMEOUT_MS; "configured_timeout")]
+    #[test_case(Some(TIMEOUT_MS * 2), SHORT_RERANK_TIMEOUT_MS, TIMEOUT_MS; "larger_override_is_capped")]
+    #[test_case(Some(TIMEOUT_MS / 2), SHORT_RERANK_TIMEOUT_MS, TIMEOUT_MS / 2; "smaller_override_is_honored")]
+    #[test_case(None, LONG_RERANK_TIMEOUT_MS, TIMEOUT_MS; "default_stays_the_decision_timeout")]
+    #[test_case(Some(TIMEOUT_MS * 2), LONG_RERANK_TIMEOUT_MS, TIMEOUT_MS * 2; "rerank_budget_raises_the_ceiling")]
+    #[test_case(Some(LONG_RERANK_TIMEOUT_MS * 2), LONG_RERANK_TIMEOUT_MS, LONG_RERANK_TIMEOUT_MS; "ceiling_is_the_larger_budget")]
+    fn workflow_timeout_and_default_model_are_projected(
+        timeout: Option<u64>,
+        rerank_timeout_ms: u64,
+        expected: u64,
+    ) {
         let root = tempfile::tempdir().unwrap();
-        let config = config(false);
+        let config = DecisionsConfig {
+            rerank_timeout_ms,
+            ..config(false)
+        };
         let model = config.model.clone();
         let service = Decisions::with_engine(
             config,
@@ -368,6 +380,36 @@ mod tests {
                     .unwrap_err(),
                 DecisionError::Timeout
             );
+        });
+    }
+
+    #[test]
+    fn workflow_requests_may_use_the_rerank_budget() {
+        smol::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let service = Decisions::with_engine(
+                DecisionsConfig {
+                    rerank_timeout_ms: LONG_RERANK_TIMEOUT_MS,
+                    ..config(false)
+                },
+                &StateDir::from_path(root.path().into()),
+                FakeEngine {
+                    calls: calls.clone(),
+                    pending: false,
+                },
+            )
+            .unwrap();
+            let mut request = request();
+            request.timeout_ms = Some(LONG_RERANK_TIMEOUT_MS);
+            service
+                .workflow(&request, &DecisionContext::default())
+                .await
+                .result
+                .unwrap();
+            let budget = calls.lock().unwrap()[0].1;
+            assert!(budget > Duration::from_millis(TIMEOUT_MS));
+            assert!(budget <= Duration::from_millis(LONG_RERANK_TIMEOUT_MS));
         });
     }
 

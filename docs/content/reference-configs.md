@@ -975,9 +975,17 @@ version = 1
 # allow_http = false
 
 # Positive decision-request deadline in milliseconds, separate from shell
-# execution timeouts.
+# execution timeouts. Tool search and every reranking feature except memory
+# recall use `rerank_timeout_ms` instead.
 # Type: integer.
 # timeout_ms = 800
+
+# Positive deadline in milliseconds for tool search and the reranking features,
+# which judge at most 16 candidates per request and send their requests
+# concurrently. Memory recall keeps `timeout_ms` because it delays the start of
+# a turn. A workflow `decide()` may ask for up to the larger of the two.
+# Type: integer.
+# rerank_timeout_ms = 2000
 
 # Retain bounded decision records in the local `caudra.db`.
 # Type: boolean.
@@ -1052,9 +1060,53 @@ version = 1
 # Type: string.
 # question_tool_nudge = "off"
 
+# Rerank the memory tool's keyword matches against the agent's query and omit
+# those judged unrelated, saying how many were omitted. Sends the query and
+# each candidate note's name, heading, and a redacted body excerpt. Modes: off,
+# shadow, enforce.
+# Type: string.
+# memory_search = "off"
+
+# In main sessions, remind the agent of at most three saved notes likely
+# relevant to a new user message, without loading them. Sends a redacted
+# message excerpt and each keyword-matched note's name, heading, and redacted
+# excerpt. Modes: off, shadow, advise.
+# Type: string.
+# memory_recall = "off"
+
+# When a new memory note is written, name existing notes that may cover the
+# same topic in the write receipt. The write itself is never blocked or
+# changed. Sends redacted excerpts of the new note and of keyword-matched
+# notes. Modes: off, shadow, advise.
+# Type: string.
+# memory_duplicates = "off"
+
+# During compaction, keep the tool results most relevant to the active goal,
+# open todos, and latest request instead of only the newest, and keep the most
+# relevant part of a long result. Sends redacted goal, todo, and request
+# excerpts, and each recent result's tool name with redacted input and output
+# excerpts. Modes: off, shadow, enforce.
+# Type: string.
+# compaction_retention = "off"
+
+# When a saved tool output was truncated, point the agent to at most two
+# omitted line ranges likely to matter. Nothing extra is removed. Sends
+# redacted excerpts of the in-progress todos, latest request, tool input, and
+# omitted lines. Modes: off, shadow, advise.
+# Type: string.
+# output_pointers = "off"
+
+# In local sessions, reorder the first code-context rows by relevance to the
+# task, without pruning. Sends the task and each row's symbol name, kind, path,
+# line span, and reference counts, never source text. Modes: off, shadow,
+# enforce.
+# Type: string.
+# code_context = "off"
+
 [decisions.thresholds]
-# Probabilities between 0 and 1. Flags trigger at or above their threshold, and
-# goal prescreening skips at or below its own.
+# Probabilities between 0 and 1. Flags trigger at or above their threshold,
+# goal prescreening skips at or below its own, and enforcing rerank features
+# prune or demote candidates below the relevance floor.
 
 # Probability for a permission warning.
 # Type: float.
@@ -1080,10 +1132,11 @@ version = 1
 # Type: float.
 # shell_duration = 0.9
 
-# Confidence required for tool search and skill suggestions. Tool-search choice
-# probability must also meet it. Subagent routing picks the Fast model when
-# this much difficulty probability is at or below routine work, and the Best
-# model when this much is on open-ended work.
+# Confidence required for skill suggestions. Subagent routing picks the Fast
+# model when this much difficulty probability is at or below routine work, and
+# the Best model when this much is on open-ended work. Memory recall, memory
+# duplicates, and output pointers name a candidate only at or above this
+# relevance probability.
 # Type: float.
 # routing_confidence = 0.9
 
@@ -1102,6 +1155,14 @@ version = 1
 # the turn.
 # Type: float.
 # question_tool_nudge = 0.85
+
+# Relevance probability below which an enforcing rerank feature prunes or
+# demotes a candidate. Memory search omits it, compaction retention keeps a
+# newer result in its place, and tool search ranks it after the candidates
+# judged relevant, in keyword order. A list the engine could not judge is never
+# emptied.
+# Type: float.
+# relevance_floor = 0.1
 
 [automations]
 # Limits for automations, which need `automations = true` under [experimental].

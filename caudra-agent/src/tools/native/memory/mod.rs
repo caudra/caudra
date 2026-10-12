@@ -22,10 +22,12 @@ use caudra_storage::memory_journal::{
     EntryKind, EntryMeta, EntryOrigin, MemoryJournalError, body_hash,
 };
 use caudra_workspace::RecordScope;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::memory::search::terms;
+use crate::decisions::DecisionFeature;
+use crate::memory::relevance::{self, Judge};
+use crate::memory::search::{Hit, MAX_HITS, terms};
 use crate::memory::snapshot::EntryStatus;
 use crate::memory::store::{MemoryError, MemoryStore, Source, leaf_kind, local_dir, note_name};
 use crate::memory::tree::{self, Part};
@@ -101,6 +103,14 @@ const ENTRY_CURRENT: &str = "current";
 const REWRITTEN_BY: &str = "rewritten by entry";
 const DELETED_BY: &str = "deleted by entry";
 const ENTRY_FORGOTTEN: &str = "its text was purged";
+const DECISION_TOOL_KEY: &str = "tool";
+/// Most notes a search's omission notice names before it only counts them.
+const OMITTED_NAMED: usize = 10;
+const OMITTED_ONE: &str = "keyword match the decision engine judged unrelated was left out";
+const OMITTED_MANY: &str = "keyword matches the decision engine judged unrelated were left out";
+const OMITTED_HINT: &str = "`read` opens any of them by name.";
+const DUPLICATE_ADVICE: &str =
+    "may cover the same topic: rewrite it under its name instead of keeping a near-duplicate.";
 
 static COMMAND_PARAM: ParamSchema = ParamSchema::Enum {
     variants: COMMANDS,
@@ -378,12 +388,15 @@ impl MemoryCall {
     }
 
     /// Reconciles first, so the call sees notes edited outside the tool. A
-    /// failed reconcile only means those edits arrive later.
-    fn answer(
+    /// failed reconcile only means those edits arrive later. `judge` ranks a
+    /// search and checks a new note for near-duplicates while those features
+    /// are on.
+    async fn answer(
         &self,
         store: &MemoryStore,
         request: Request<'_>,
         origin: &EntryOrigin,
+        judge: Option<&Judge>,
     ) -> Result<Answer, ToolError> {
         if let Err(error) = store.reconcile() {
             warn!(
@@ -396,9 +409,9 @@ impl MemoryCall {
         match request {
             Request::View => view(store).map(Answer::Found),
             Request::Zoom { id, n } => zoom(store, id, n).map(Answer::Found),
-            Request::Search(query) => search(store, query).map(Answer::Found),
+            Request::Search(query) => search(store, query, judge).await.map(Answer::Found),
             Request::Read(path) => read(store, path).map(Answer::Found),
-            Request::Write { path, content } => write(store, path, content, origin),
+            Request::Write { path, content } => write(store, path, content, origin, judge).await,
             Request::Delete(path) => delete(store, path, origin),
         }
     }
@@ -537,13 +550,31 @@ impl ToolInvocation for MemoryCall {
 
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
         Box::pin(async move {
-            let answer = self.request().and_then(|request| {
-                let store = self.store(ctx)?;
-                self.answer(&store, request, &entry_origin(ctx))
-            });
+            let answer = match self
+                .request()
+                .and_then(|request| Ok((request, self.store(ctx)?)))
+            {
+                Ok((request, store)) => {
+                    let judge = judge(ctx);
+                    self.answer(&store, request, &entry_origin(ctx), judge.as_ref())
+                        .await
+                }
+                Err(error) => Err(error),
+            };
             self.reply(answer)
         })
     }
+}
+
+fn judge(ctx: &ToolContext) -> Option<Judge> {
+    Some(Judge {
+        decisions: ctx.permissions.decisions()?,
+        context: ctx
+            .permissions
+            .decision_context(json!({DECISION_TOOL_KEY: crate::tools::MEMORY_TOOL_NAME})),
+        permissions: Some(Arc::clone(&ctx.permissions)),
+        cancel: ctx.cancel.clone(),
+    })
 }
 
 fn scoped_store(ctx: &ToolContext) -> Result<&Arc<LocalDocumentStore>, ToolError> {
@@ -666,9 +697,19 @@ fn status_notice(meta: &EntryMeta, status: EntryStatus) -> String {
     )
 }
 
-fn search(store: &MemoryStore, query: &str) -> Result<MemoryOutput, ToolError> {
-    let hits: Vec<MemoryHit> = store
-        .search(query)?
+/// The keyword matches, or with search ranking on, those the decision
+/// engine judged relevant, best first, naming the ones it left out.
+async fn search(
+    store: &MemoryStore,
+    query: &str,
+    judge: Option<&Judge>,
+) -> Result<MemoryOutput, ToolError> {
+    let (found, omitted) = match judge.filter(|judge| judge.enabled(&DecisionFeature::MemorySearch))
+    {
+        Some(judge) => ranked_search(store, query, judge).await?,
+        None => (store.search(query)?, Vec::new()),
+    };
+    let hits: Vec<MemoryHit> = found
         .into_iter()
         .map(|hit| MemoryHit {
             seq: hit.seq,
@@ -678,15 +719,68 @@ fn search(store: &MemoryStore, query: &str) -> Result<MemoryOutput, ToolError> {
             line: hit.line,
         })
         .collect();
-    let notices = match hits.is_empty() {
-        true => Vec::from([NO_HITS.to_owned()]),
-        false => Vec::new(),
+    let notices = match (omitted.is_empty(), hits.is_empty()) {
+        (false, _) => Vec::from([omitted_notice(&omitted)]),
+        (true, true) => Vec::from([NO_HITS.to_owned()]),
+        (true, false) => Vec::new(),
     };
     Ok(MemoryOutput::Hits {
         query: query.to_owned(),
         hits,
         notices,
     })
+}
+
+/// The hits to show and the names of the keyword matches judged unrelated.
+/// Without an answer, the keyword order's first hits and no omissions.
+async fn ranked_search(
+    store: &MemoryStore,
+    query: &str,
+    judge: &Judge,
+) -> Result<(Vec<Hit>, Vec<String>), ToolError> {
+    let pool = store.search_pool(query)?;
+    let Some(ranking) = relevance::rank_search(judge, query, &pool).await else {
+        return Ok((
+            pool.into_iter()
+                .take(MAX_HITS)
+                .map(|candidate| candidate.hit)
+                .collect(),
+            Vec::new(),
+        ));
+    };
+    Ok((
+        ranking
+            .kept
+            .iter()
+            .take(MAX_HITS)
+            .map(|index| pool[*index].hit.clone())
+            .collect(),
+        ranking
+            .omitted
+            .iter()
+            .map(|index| pool[*index].hit.name.clone())
+            .collect(),
+    ))
+}
+
+/// `3 keyword matches … were left out: a.md, b.md, c.md.`, naming at most
+/// [`OMITTED_NAMED`] of them.
+fn omitted_notice(names: &[String]) -> String {
+    let phrase = match names.len() {
+        1 => OMITTED_ONE,
+        _ => OMITTED_MANY,
+    };
+    let listed = names
+        .iter()
+        .take(OMITTED_NAMED)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = match names.len().saturating_sub(OMITTED_NAMED) {
+        0 => String::new(),
+        more => format!(" and {more} more"),
+    };
+    format!("{} {phrase}: {listed}{more}. {OMITTED_HINT}", names.len())
 }
 
 fn read(store: &MemoryStore, path: &str) -> Result<MemoryOutput, ToolError> {
@@ -703,24 +797,50 @@ fn read(store: &MemoryStore, path: &str) -> Result<MemoryOutput, ToolError> {
     })
 }
 
-fn write(
+/// Writes the note. A note under a new name, with duplicate advice on, has
+/// the existing notes the decision engine judged to cover its topic named
+/// after the receipt; the write itself never waits on or changes for that.
+async fn write(
     store: &MemoryStore,
     path: &str,
     content: &str,
     origin: &EntryOrigin,
+    judge: Option<&Judge>,
 ) -> Result<Answer, ToolError> {
     if let Some(error) = notes::write_size_error(content) {
         return Err(invalid(error));
     }
     let name = note_name(path)?;
-    let receipt = match store.write(&name, content, origin)? {
+    let judge = judge.filter(|judge| {
+        judge.enabled(&DecisionFeature::MemoryDuplicates)
+            && matches!(store.journal().live(store.scope(), &name), Ok(None))
+    });
+    let mut receipt = match store.write(&name, content, origin)? {
         Some(seq) => format!("wrote {name} (entry {seq})"),
         None => format!("{name} {UNCHANGED}"),
     };
+    if let Some(judge) = judge {
+        receipt.push_str(&duplicates(store, judge, &name, content).await);
+    }
     Ok(Answer::Changed {
         receipt,
         file: local_file(store, &name),
     })
+}
+
+/// One line per existing note the engine judged to cover the same topic.
+async fn duplicates(store: &MemoryStore, judge: &Judge, name: &str, content: &str) -> String {
+    let notes = relevance::duplicate_pool(store, name, content);
+    let Some(advice) = relevance::duplicate_advice(judge, name, content, &notes).await else {
+        return String::new();
+    };
+    let advised = advice
+        .advised
+        .iter()
+        .map(|index| format!("\n`{}` {DUPLICATE_ADVICE}", notes[*index].hit.name))
+        .collect();
+    advice.record();
+    advised
 }
 
 fn delete(store: &MemoryStore, path: &str, origin: &EntryOrigin) -> Result<Answer, ToolError> {
@@ -841,10 +961,13 @@ impl From<MemoryError> for ToolError {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::atomic::Ordering;
 
+    use caudra_config::decisions::FeatureMode;
     use caudra_config::{
         DefaultEffect, Effect, FeatureFlags, PermissionRule, PermissionsConfig, ToolKey,
     };
+    use caudra_storage::decision_log::DecisionEffect;
     use caudra_storage::id::SessionRef;
     use serde_json::json;
     use tempfile::TempDir;
@@ -853,6 +976,9 @@ mod tests {
     use super::*;
     use crate::AgentMode;
     use crate::agent::tool_dispatch::{self, Emit};
+    use crate::memory::relevance::tests::{
+        NoteEngine, RELATED, RELEVANT, assert_effects, note_judge,
+    };
     use crate::memory::store::{NAME_NOT_MARKDOWN, NAME_TRAVERSAL};
     use crate::memory::tree::{NODE, PENDING, VIEW, ZoomError};
     use crate::permissions::{
@@ -880,6 +1006,17 @@ mod tests {
     const BODY_MSG: &str = "the reader sees the note, the model sees the receipt";
     const CHANGED_NOTE_MSG: &str = "a local change names its note, and nothing else names one";
     const INCOHERENT_MSG: &str = "a call missing what its command needs must not run";
+    const RECEIPT_MSG: &str = "a write answers with its receipt";
+    const FLAKY_TESTS: &str = "flaky-tests.md";
+    const CI: &str = "ci.md";
+    const RELEASE: &str = "release.md";
+    const FLAKY_QUERY: &str = "flaky";
+    const TAGS: &str = "tags.md";
+    const FONTS: &str = "fonts.md";
+    const RELEASE_NOTE: &str = "# Release\nTags are signed with the release key.";
+    const FONTS_NOTE: &str = "# Fonts\nThe release key signs two fonts.";
+    const TAGS_NOTE: &str = "# Tags\nRelease tags are signed with the key.";
+    const TAGS_REWRITE: &str = "# Tags\nRelease tags are signed before publishing.";
 
     struct Fixture {
         _state: TempDir,
@@ -907,9 +1044,13 @@ mod tests {
 
     impl Fixture {
         fn answer(&self, input: Value) -> Result<Answer, ToolError> {
+            self.judged(input, None)
+        }
+
+        fn judged(&self, input: Value, judge: Option<&Judge>) -> Result<Answer, ToolError> {
             let call = call(input);
-            call.request()
-                .and_then(|request| call.answer(&self.store, request, &session()))
+            let request = call.request()?;
+            smol::block_on(call.answer(&self.store, request, &session(), judge))
         }
 
         /// What the model reads: a reading command's one rendering, or a
@@ -931,10 +1072,9 @@ mod tests {
 
         fn execute(&self, input: Value) -> ToolExecResult {
             let call = call(input);
-            call.reply(
-                call.request()
-                    .and_then(|request| call.answer(&self.store, request, &session())),
-            )
+            call.reply(call.request().and_then(|request| {
+                smol::block_on(call.answer(&self.store, request, &session(), None))
+            }))
         }
 
         fn write(&self, name: &str, content: &str) {
@@ -1308,6 +1448,131 @@ mod tests {
 
         assert!(output.is_empty());
         assert_eq!(output.as_display_text(), NO_HITS);
+    }
+
+    fn flaky_notes() -> Fixture {
+        let notes = fixture();
+        notes.write(FLAKY_TESTS, "# Flaky tests\nRetry the suite once.");
+        notes.write(CI, "# CI\nThe flaky suite runs nightly.");
+        notes.write(RELEASE, "# Release\nA flaky upload retries.");
+        notes
+    }
+
+    fn judged_hits(notes: &Fixture, judge: &Judge) -> (Vec<String>, Vec<String>) {
+        let input = json!({ "command": "search", "query": FLAKY_QUERY });
+        let Ok(Answer::Found(MemoryOutput::Hits { hits, notices, .. })) =
+            notes.judged(input, Some(judge))
+        else {
+            panic!("{FOUND_MSG}");
+        };
+        (hits.into_iter().map(|hit| hit.name).collect(), notices)
+    }
+
+    #[test]
+    fn a_ranked_search_shows_the_relevant_matches_and_names_the_rest() {
+        let notes = flaky_notes();
+        let state = tempdir();
+        let judge = note_judge(
+            state.path(),
+            |features| features.memory_search = FeatureMode::Enforce,
+            NoteEngine::scoring(&[(CI, RELEVANT), (RELEASE, RELATED)]),
+        );
+
+        let (hits, notices) = judged_hits(&notes, &judge);
+
+        assert_eq!(hits, [CI, RELEASE]);
+        assert_eq!(
+            notices,
+            [format!("1 {OMITTED_ONE}: {FLAKY_TESTS}. {OMITTED_HINT}")]
+        );
+        smol::block_on(assert_effects(state.path(), &[DecisionEffect::Rerouted]));
+    }
+
+    #[test_case(FeatureMode::Off, false ; "off")]
+    #[test_case(FeatureMode::Shadow, false ; "shadow")]
+    #[test_case(FeatureMode::Enforce, true ; "engine_failed")]
+    fn a_search_without_an_answer_keeps_the_keyword_order(mode: FeatureMode, fail: bool) {
+        let notes = flaky_notes();
+        let state = tempdir();
+        let judge = note_judge(
+            state.path(),
+            |features| features.memory_search = mode,
+            NoteEngine {
+                fail,
+                ..NoteEngine::scoring(&[(CI, RELEVANT)])
+            },
+        );
+
+        let (hits, notices) = judged_hits(&notes, &judge);
+
+        assert_eq!(hits, [FLAKY_TESTS, RELEASE, CI]);
+        assert!(notices.is_empty());
+    }
+
+    #[test]
+    fn an_omission_notice_counts_what_it_does_not_name() {
+        let names: Vec<String> = (0..OMITTED_NAMED + 2)
+            .map(|index| format!("{index}.md"))
+            .collect();
+        let listed = names[..OMITTED_NAMED].join(", ");
+
+        assert_eq!(
+            omitted_notice(&names),
+            format!(
+                "{} {OMITTED_MANY}: {listed} and 2 more. {OMITTED_HINT}",
+                names.len()
+            )
+        );
+    }
+
+    #[test]
+    fn a_new_note_names_the_notes_it_may_repeat() {
+        let notes = fixture();
+        notes.write(RELEASE, RELEASE_NOTE);
+        notes.write(FONTS, FONTS_NOTE);
+        let state = tempdir();
+        let judge = note_judge(
+            state.path(),
+            |features| features.memory_duplicates = FeatureMode::Advise,
+            NoteEngine::scoring(&[(RELEASE, RELEVANT)]),
+        );
+
+        let Ok(Answer::Changed { receipt, .. }) =
+            notes.judged(write_input(TAGS, TAGS_NOTE), Some(&judge))
+        else {
+            panic!("{RECEIPT_MSG}");
+        };
+
+        assert_eq!(
+            receipt,
+            format!("wrote {TAGS} (entry 2)\n`{RELEASE}` {DUPLICATE_ADVICE}")
+        );
+        assert_eq!(fs::read_to_string(notes.dir.join(TAGS)).unwrap(), TAGS_NOTE);
+        smol::block_on(assert_effects(state.path(), &[DecisionEffect::Advised]));
+    }
+
+    #[test]
+    fn a_rewrite_is_not_checked_for_duplicates() {
+        let notes = fixture();
+        notes.write(RELEASE, RELEASE_NOTE);
+        notes.write(TAGS, TAGS_NOTE);
+        let state = tempdir();
+        let engine = NoteEngine::scoring(&[(RELEASE, RELEVANT)]);
+        let calls = Arc::clone(&engine.calls);
+        let judge = note_judge(
+            state.path(),
+            |features| features.memory_duplicates = FeatureMode::Advise,
+            engine,
+        );
+
+        let Ok(Answer::Changed { receipt, .. }) =
+            notes.judged(write_input(TAGS, TAGS_REWRITE), Some(&judge))
+        else {
+            panic!("{RECEIPT_MSG}");
+        };
+
+        assert_eq!(receipt, format!("wrote {TAGS} (entry 2)"));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
     /// A reading call has one answer, so both sides read it: the reader gets

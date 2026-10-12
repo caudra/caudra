@@ -590,6 +590,7 @@ impl AgentLoop {
             &self.model_policy,
         )
         .await;
+        let retention = agent::Retention::new(&self.permissions, &self.goal, &self.history);
         let spend = agent::compact_with_session(
             &*provider,
             &model,
@@ -602,6 +603,7 @@ impl AgentLoop {
                 jobs: None,
                 workflow: self.workflow.as_ref(),
             },
+            retention,
         )
         .await?;
         let cost = model.billed_cost(&spend.usage, false);
@@ -814,6 +816,7 @@ impl AgentLoop {
                 tools: self.tools.clone(),
                 deferred: self.deferred.clone(),
                 tools_fixed: true,
+                memory_store: self.memory.store().cloned(),
             },
         )
         .with_peer_checkpoint()

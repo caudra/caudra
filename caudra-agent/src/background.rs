@@ -2721,6 +2721,7 @@ mod tests {
                     jobs: None,
                     workflow: None,
                 },
+                None,
             );
             let complete = async {
                 summary_starts.recv_async().await.unwrap();

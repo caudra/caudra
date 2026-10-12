@@ -845,6 +845,8 @@ Shell duration advice applies only to eligible local native shell calls. Measure
 
 The optional [question-tool nudge](/docs/configuration/#question-tool-nudge) can remind the main-session assistant to use `question` when its attempted final reply asks you for a choice, clarification, or approval. It is separate from permission checks and defaults to `off`.
 
+The [reranking features](/docs/configuration/#reranking) order or annotate memory notes, retained tool output, truncated output, and code-context rows by their relevance to the current work. They never grant permission, load a tool, or run anything. Each defaults to `off`.
+
 Set `log = true` to retain bounded, redacted decision states and answers in decision-log tables in `caudra.db`. A state over the bound is never sent. Its row records a `rejected` error and the state's size in place of the state. Redaction is best effort both before transmission and before storage. It is not a guarantee that sensitive text has been removed. Human permission answers can supply training labels, but approval is not proof that a predicted effect occurred. Effect fields are a partial action record. A value of `none` does not prove that no advice or routing was applied. Tool-search records do not have actual-use labels, and shell-effect records do not have observed-filesystem labels.
 
 `/decisions` opens a read-only inspector with four tabs. Overview shows the engine and protocol, its cached health, the session's permission mode and taint, logging, and thresholds. Features lists each feature with its mode, allowed modes, and thresholds. Activity counts logged decisions per feature, and Recent lists the newest logged decisions with their state, questions, answers, and label. Press `g` to switch Activity and Recent between this session, this project, and every logged row. Both tabs read the decision log in `caudra.db`. Recording new rows requires `log = true`. The inspector reads the log when it opens and on `Ctrl+R`. It does not contact the endpoint. When the status bar shows `[decisions offline]`, click it to open the inspector.
@@ -859,7 +861,7 @@ An explicit `/yolo` choice is stored with the root conversation. A user-created 
 
 YOLO approves each call once and stores no rule, so turning it off brings back the prompts your rules do not cover. In plan mode it also skips the prompts for commands plan mode cannot prove read-only, for `send_message` and `publish_message`, and for `execution_environment`. Plan mode still refuses what it always refuses, such as file writes outside the plan.
 
-YOLO bypasses decision-engine permission advice, Auto screening, and permission-related shell-effect checks, including in plan mode. Shell duration, content screening, tool search, skill selection, goal prescreening, subagent routing, and the question-tool nudge still follow their feature settings. An unreachable engine can still show `[decisions offline]`. Deterministic denies and hard capability restrictions still apply.
+YOLO bypasses decision-engine permission advice, Auto screening, and permission-related shell-effect checks, including in plan mode. Shell duration, content screening, tool search, skill selection, goal prescreening, subagent routing, the question-tool nudge, and the [reranking features](/docs/configuration/#reranking) still follow their feature settings. An unreachable engine can still show `[decisions offline]`. Deterministic denies and hard capability restrictions still apply.
 
 ## Autopilot
 

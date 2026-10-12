@@ -41,7 +41,8 @@ const DECISION_FEATURES_ABOUT: &str = "`off` turns a feature off, `shadow` colle
      without applying them, `advise` adds caution or suggestions, and `enforce` applies the \
      feature's own behavior. Each feature lists the modes it takes.";
 const THRESHOLDS_ABOUT: &str = "Probabilities between 0 and 1. Flags trigger at or above their \
-     threshold, and goal prescreening skips at or below its own.";
+     threshold, goal prescreening skips at or below its own, and enforcing rerank features \
+     prune or demote candidates below the relevance floor.";
 const AUTOMATIONS_ABOUT: &str = "Limits for automations, which need `automations = true` under \
      [experimental]. Only the global caudra.toml may hold this table.";
 const AUTOPILOT_ABOUT: &str = "Limits for autopilot, which needs `autopilot = true` under \

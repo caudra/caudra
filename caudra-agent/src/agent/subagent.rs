@@ -638,6 +638,7 @@ impl Subagent {
                 tools: self.tools.clone(),
                 deferred: self.deferred.clone(),
                 tools_fixed: false,
+                memory_store: None,
             },
         )
         .with_user_response_rx(Arc::clone(&self.answer_rx))

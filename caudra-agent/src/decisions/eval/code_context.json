@@ -1,0 +1,92 @@
+{
+  "k": 5,
+  "baseline": {"ndcg_at_k": 1.0, "recall_at_k": 1.0, "p50_ms": 877, "p95_ms": 923},
+  "baseline_note": "Synthetic, hand-labelled cases. Measured 2026-10-12 with protocol openai, endpoint http://127.0.0.1:8080/v1 (local ninfer), model systemone-decision-v7. The Workcell order that the feature falls back to scored nDCG@k 0.207 and recall@k 0.319 on the same cases.",
+  "cases": [
+    {
+      "query": "where do we invalidate the cache after a write",
+      "candidates": [
+        {"name": "cache_hit_ratio", "kind": "function", "path": "src/metrics/cache.rs", "line_start": 14, "line_end": 31, "callers": 4, "calls": 2},
+        {"name": "CacheConfig", "kind": "struct", "path": "src/config/cache.rs", "line_start": 8, "line_end": 22, "callers": 9, "calls": 0},
+        {"name": "write_banner", "kind": "function", "path": "src/cli/banner.rs", "line_start": 40, "line_end": 66, "callers": 1, "calls": 3},
+        {"name": "invalidate_after_write", "kind": "function", "path": "src/store/cache.rs", "line_start": 88, "line_end": 120, "callers": 3, "calls": 4},
+        {"name": "CacheKey", "kind": "struct", "path": "src/store/key.rs", "line_start": 5, "line_end": 19, "callers": 12, "calls": 0},
+        {"name": "evict_stale_entries", "kind": "function", "path": "src/store/cache.rs", "line_start": 122, "line_end": 160, "callers": 2, "calls": 3},
+        {"name": "write_entry", "kind": "function", "path": "src/store/write.rs", "line_start": 20, "line_end": 74, "callers": 6, "calls": 5},
+        {"name": "render_cache_table", "kind": "function", "path": "src/ui/table.rs", "line_start": 101, "line_end": 140, "callers": 1, "calls": 6}
+      ],
+      "relevant": [3, 5, 6]
+    },
+    {
+      "query": "add a retry with backoff to the webhook sender",
+      "candidates": [
+        {"name": "retry_count_label", "kind": "function", "path": "src/ui/labels.rs", "line_start": 12, "line_end": 20, "callers": 2, "calls": 1},
+        {"name": "WebhookPayload", "kind": "struct", "path": "src/hooks/payload.rs", "line_start": 6, "line_end": 40, "callers": 7, "calls": 0},
+        {"name": "RetryPolicy", "kind": "struct", "path": "src/http/retry.rs", "line_start": 10, "line_end": 28, "callers": 5, "calls": 0},
+        {"name": "sender_name", "kind": "function", "path": "src/mail/header.rs", "line_start": 33, "line_end": 41, "callers": 3, "calls": 1},
+        {"name": "send_webhook", "kind": "function", "path": "src/hooks/sender.rs", "line_start": 45, "line_end": 98, "callers": 4, "calls": 6},
+        {"name": "parse_backoff_env", "kind": "function", "path": "src/config/env.rs", "line_start": 60, "line_end": 82, "callers": 1, "calls": 2},
+        {"name": "backoff_delay", "kind": "function", "path": "src/http/retry.rs", "line_start": 30, "line_end": 52, "callers": 3, "calls": 1},
+        {"name": "webhook_retries_are_spaced_out", "kind": "function", "path": "tests/hooks.rs", "line_start": 15, "line_end": 60, "callers": 0, "calls": 4}
+      ],
+      "relevant": [2, 4, 6, 7]
+    },
+    {
+      "query": "rename the user session token field",
+      "candidates": [
+        {"name": "token_count", "kind": "function", "path": "src/llm/tokens.rs", "line_start": 18, "line_end": 44, "callers": 8, "calls": 2},
+        {"name": "user_avatar_url", "kind": "function", "path": "src/profile/avatar.rs", "line_start": 9, "line_end": 25, "callers": 2, "calls": 1},
+        {"name": "SessionToken", "kind": "struct", "path": "src/auth/token.rs", "line_start": 4, "line_end": 30, "callers": 11, "calls": 0},
+        {"name": "field_label", "kind": "function", "path": "src/forms/field.rs", "line_start": 50, "line_end": 61, "callers": 6, "calls": 1},
+        {"name": "rename_file", "kind": "function", "path": "src/fs/ops.rs", "line_start": 72, "line_end": 99, "callers": 3, "calls": 2},
+        {"name": "UserSession", "kind": "struct", "path": "src/auth/session.rs", "line_start": 12, "line_end": 48, "callers": 14, "calls": 0},
+        {"name": "tokenize_query", "kind": "function", "path": "src/search/lexer.rs", "line_start": 20, "line_end": 88, "callers": 5, "calls": 4},
+        {"name": "session_from_cookie", "kind": "function", "path": "src/auth/session.rs", "line_start": 50, "line_end": 91, "callers": 4, "calls": 5},
+        {"name": "serialize_session", "kind": "function", "path": "src/auth/session_codec.rs", "line_start": 8, "line_end": 40, "callers": 2, "calls": 3}
+      ],
+      "relevant": [2, 5, 7, 8]
+    },
+    {
+      "query": "fix the off-by-one in pagination of the orders list",
+      "candidates": [
+        {"name": "off_by_one_lint", "kind": "function", "path": "tools/lint/rules.rs", "line_start": 210, "line_end": 260, "callers": 1, "calls": 4},
+        {"name": "list_files", "kind": "function", "path": "src/fs/list.rs", "line_start": 15, "line_end": 58, "callers": 7, "calls": 3},
+        {"name": "page_size_option", "kind": "function", "path": "src/cli/args.rs", "line_start": 90, "line_end": 104, "callers": 2, "calls": 1},
+        {"name": "OrderList", "kind": "struct", "path": "src/orders/list.rs", "line_start": 10, "line_end": 36, "callers": 6, "calls": 0},
+        {"name": "order_total", "kind": "function", "path": "src/orders/total.rs", "line_start": 5, "line_end": 30, "callers": 5, "calls": 2},
+        {"name": "paginate", "kind": "function", "path": "src/orders/pagination.rs", "line_start": 22, "line_end": 70, "callers": 3, "calls": 4},
+        {"name": "PageCursor", "kind": "struct", "path": "src/orders/pagination.rs", "line_start": 5, "line_end": 20, "callers": 4, "calls": 0},
+        {"name": "last_page_of_orders_is_complete", "kind": "function", "path": "tests/orders_pagination.rs", "line_start": 30, "line_end": 72, "callers": 0, "calls": 5}
+      ],
+      "relevant": [3, 5, 6, 7]
+    },
+    {
+      "query": "parse the timeout from the config file",
+      "candidates": [
+        {"name": "TimeoutError", "kind": "enum", "path": "src/net/error.rs", "line_start": 8, "line_end": 26, "callers": 9, "calls": 0},
+        {"name": "parse_args", "kind": "function", "path": "src/cli/args.rs", "line_start": 20, "line_end": 110, "callers": 1, "calls": 9},
+        {"name": "config_path_display", "kind": "function", "path": "src/ui/status.rs", "line_start": 44, "line_end": 58, "callers": 2, "calls": 1},
+        {"name": "file_size_limit", "kind": "function", "path": "src/fs/limits.rs", "line_start": 12, "line_end": 24, "callers": 3, "calls": 0},
+        {"name": "parse_duration", "kind": "function", "path": "src/config/duration.rs", "line_start": 10, "line_end": 52, "callers": 5, "calls": 2},
+        {"name": "load_config_file", "kind": "function", "path": "src/config/load.rs", "line_start": 30, "line_end": 95, "callers": 4, "calls": 6},
+        {"name": "RawConfig", "kind": "struct", "path": "src/config/raw.rs", "line_start": 14, "line_end": 80, "callers": 8, "calls": 0},
+        {"name": "timeout_ms_default", "kind": "function", "path": "src/config/defaults.rs", "line_start": 40, "line_end": 46, "callers": 2, "calls": 0}
+      ],
+      "relevant": [4, 5, 6, 7]
+    },
+    {
+      "query": "why does the image thumbnail come out rotated",
+      "candidates": [
+        {"name": "rotate_log_files", "kind": "function", "path": "src/logging/rotate.rs", "line_start": 18, "line_end": 64, "callers": 2, "calls": 4},
+        {"name": "image_mime_type", "kind": "function", "path": "src/media/mime.rs", "line_start": 7, "line_end": 35, "callers": 6, "calls": 1},
+        {"name": "out_dir", "kind": "function", "path": "build.rs", "line_start": 3, "line_end": 12, "callers": 1, "calls": 0},
+        {"name": "ImageCache", "kind": "struct", "path": "src/media/cache.rs", "line_start": 9, "line_end": 40, "callers": 5, "calls": 0},
+        {"name": "Thumbnail", "kind": "struct", "path": "src/media/thumbnail.rs", "line_start": 6, "line_end": 24, "callers": 4, "calls": 0},
+        {"name": "rotation_matrix", "kind": "function", "path": "src/geometry/matrix.rs", "line_start": 50, "line_end": 77, "callers": 3, "calls": 2},
+        {"name": "make_thumbnail", "kind": "function", "path": "src/media/thumbnail.rs", "line_start": 26, "line_end": 90, "callers": 3, "calls": 5},
+        {"name": "apply_exif_orientation", "kind": "function", "path": "src/media/exif.rs", "line_start": 15, "line_end": 60, "callers": 2, "calls": 3}
+      ],
+      "relevant": [4, 6, 7]
+    }
+  ]
+}

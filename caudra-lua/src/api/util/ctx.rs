@@ -269,6 +269,7 @@ impl From<&ToolContext> for AgentContext {
         // parent's failure nor replace its observation by expanding a batch.
         c.steering_observations = None;
         c.steering_order.clear();
+        c.decision_focus = None;
         Self {
             tool: c,
             caller: None,

@@ -510,6 +510,7 @@ impl SpeculativeRuns {
             .clone()
             .or_else(|| Some(batch_id.to_owned()));
         ctx.steering_order = vec![top.ordinal, index];
+        ctx.decision_focus = None;
         if self
             .lock()
             .iter()

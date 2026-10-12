@@ -1559,6 +1559,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
             .with_actor_policy(Arc::clone(&profile_tool_policy))
     });
     let tool_names = advertised_tool_names(&tools, &deferred, mcp.as_ref(), false);
+    let memory_store = memory.store().cloned();
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
 
@@ -1699,6 +1700,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                     tools,
                     deferred,
                     tools_fixed: false,
+                    memory_store,
                 },
             )
             .with_loaded_instructions(instructions.loaded)
@@ -4323,6 +4325,7 @@ async fn spawn_prepared_session(
                         tools: definitions.declared,
                         deferred: definitions.deferred,
                         tools_fixed: true,
+                        memory_store: memory.store().cloned(),
                     },
                 )
                 .with_loaded_instructions(baseline.loaded().clone())

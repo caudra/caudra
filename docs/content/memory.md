@@ -113,6 +113,18 @@ The model can zoom into a row with `n` = 1 to read the entry whole. At the next 
 
 Subagents get the `memory` tool without the view.
 
+## Relevance from the decision engine
+
+Three experimental [decision features](/docs/configuration/#reranking) can judge which notes matter. Each is off by default and needs a configured decision engine. They send note names, headings, and redacted excerpts of up to 400 bytes to that engine.
+
+| Feature | Mode | Effect |
+|---------|------|--------|
+| `memory_search` | `enforce` | `search` takes up to 32 word matches and shows the ones the engine scores at or above `relevance_floor`, most relevant first, up to 10. A notice names the matches it left out, and `read` still opens any of them |
+| `memory_recall` | `advise` | At each new user message in the main session, a reminder names up to 3 notes that the engine scores at or above `routing_confidence` for that message. A note is named once per conversation, and the agent reads it before relying on it |
+| `memory_duplicates` | `advise` | After `write` creates a note under a new name, the receipt names existing notes that may cover the same topic and suggests rewriting one of them instead |
+
+Recall weighs the 16 notes that share the most significant words with the message and uses the shorter `timeout_ms` deadline, because it runs before the turn starts. It runs at the same time as skill suggestions. A write is never blocked or changed by duplicate advice. When the engine fails, times out, or refuses, search shows its word matches as before and the other two add nothing.
+
 ## Summaries and spend
 
 The summaries come from the Memory model job. Unbound, it uses the same model as compaction, the one running the session, because a summary line stands in for its notes for months. A stronger model costs several times more per line than a Fast one. To spend less, bind Memory to Fast or to an exact model in `/model`, as [Model jobs](/docs/providers/#model-jobs) describes. The model is chosen again each time you switch the Chat model or change a binding in `/model`, and the next line uses it, while a line being written finishes on the model it started with. Other Caudra processes that are already running see a binding change only after they restart. When a Memory binding cannot be resolved or its model cannot be loaded, summaries pause until the next switch or the next session.

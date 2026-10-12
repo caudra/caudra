@@ -39,7 +39,7 @@ const DEFAULT_READ_LIMIT: usize = 200;
 const DEFAULT_GREP_OFFSET: usize = 1;
 const DEFAULT_GREP_LIMIT: usize = 100;
 const DEFAULT_CONTEXT: usize = 0;
-const MAX_READ_LIMIT: usize = 2000;
+pub(crate) const MAX_READ_LIMIT: usize = 2000;
 const MAX_GREP_LIMIT: usize = 200;
 const MAX_CONTEXT: usize = 5;
 

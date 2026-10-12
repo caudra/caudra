@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use std::{env, mem};
 
 use crate::tools::json_repair::RepairState;
+use futures_lite::future;
 use serde_json::{Map, Value, json};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
@@ -30,7 +31,7 @@ use super::goal::{
 };
 use super::history::{
     CANCEL_MARKER, History, sanitize_cancelled_history, sanitize_failed_history,
-    settle_failed_attempt,
+    settle_failed_attempt, user_request,
 };
 use super::instructions::LoadedInstructions;
 use super::mention_preamble;
@@ -55,12 +56,16 @@ use crate::context::{
     BuiltinToolsInput, ContextCapture, ContextInventory, ContextPublisher, ContextReadiness,
     ContextSnapshot, estimate_context_usage,
 };
+use crate::decisions::output_pointers::output_focus;
 use crate::decisions::questions as decision_questions;
 use crate::decisions::{
     DecisionContext, DecisionFeature, DecisionOutcome, DecisionReceipt, Decisions, push_fitting,
     question_tool_nudge, redact_decision_text, redacted_excerpt,
 };
 use crate::mcp::{McpRequestSnapshot, McpSession};
+use crate::memory::relevance::{Judge, Recall};
+use crate::memory::search::significant_words;
+use crate::memory::store::MemoryStore;
 use crate::nudge::Nudge;
 use crate::peers::{PeerClaim, PeerSession};
 use crate::permissions::PermissionManager;
@@ -69,7 +74,7 @@ use crate::tools::ToolFilter;
 use crate::tools::native::peers::WORK_NAME;
 use crate::tools::native::plan::{self, PlanTarget};
 use crate::tools::native::skill::{self, SkillInventoryEntry};
-use crate::tools::{BATCH_TOOL_NAME, QUESTION_TOOL_NAME, SKILL_TOOL_NAME};
+use crate::tools::{BATCH_TOOL_NAME, MEMORY_TOOL_NAME, QUESTION_TOOL_NAME, SKILL_TOOL_NAME};
 use crate::tools::{BuiltinDeferral, DeferralSession, DeferredTool};
 use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolContext};
 use crate::types::{AutopilotEvent, TodoItem};
@@ -103,16 +108,6 @@ const SKILL_NONE_CRITERION: &str = "No listed skill covers the request";
 const SKILL_REQUEST_EXCERPT_BYTES: usize = 1_200;
 const SKILL_DESCRIPTION_EXCERPT_BYTES: usize = 320;
 const MAX_SKILL_CANDIDATES: usize = 8;
-/// Words too common to say which skill a task wants, including the "use"
-/// that skill descriptions open with by convention.
-const SKILL_STOPWORDS: &[&str] = &[
-    "about", "an", "and", "any", "are", "as", "at", "be", "but", "by", "can", "could", "do",
-    "does", "for", "from", "get", "has", "have", "help", "how", "if", "in", "into", "is", "it",
-    "its", "like", "make", "me", "my", "need", "not", "of", "on", "or", "our", "please", "should",
-    "so", "some", "that", "the", "their", "them", "then", "there", "these", "this", "those", "to",
-    "up", "us", "use", "using", "want", "was", "we", "what", "when", "where", "which", "while",
-    "who", "why", "will", "with", "would", "you", "your",
-];
 const MAX_GOAL_PRESCREEN_SKIPS: u32 = 2;
 pub(crate) const GOAL_MET_QUESTION: &str = "goal_met";
 const GOAL_PRESCREEN_CONTINUATION: &str =
@@ -407,6 +402,9 @@ pub struct AgentRunParams<'h> {
     /// configured when it was fixed. They are then sent as given, and a call
     /// to a tool that is no longer available fails at dispatch.
     pub tools_fixed: bool,
+    /// The project's notes, which a main session's turn may recall from.
+    /// `None` for a subagent.
+    pub memory_store: Option<Arc<MemoryStore>>,
 }
 
 pub struct Agent<'h> {
@@ -515,6 +513,7 @@ pub struct Agent<'h> {
     autopilot_observed: Option<(u64, usize)>,
     /// The group work item this run last reminded autopilot's agent to report.
     work_reminded: Option<String>,
+    memory_store: Option<Arc<MemoryStore>>,
 }
 
 impl<'h> Agent<'h> {
@@ -682,6 +681,7 @@ impl<'h> Agent<'h> {
             autopilot: None,
             autopilot_observed: None,
             work_reminded: None,
+            memory_store: run.memory_store,
         }
     }
 
@@ -906,7 +906,18 @@ impl<'h> Agent<'h> {
         if !self.tools_fixed {
             self.configure_profile_tools();
         }
-        let skill_suggestion = self.suggest_skill(&message).await;
+        let recall = self.memory_recall(&message, peer_wake);
+        let (skill_suggestion, recalled) = future::zip(self.suggest_skill(&message), async {
+            match recall {
+                Some(recall) => recall.run(&message).await,
+                None => None,
+            }
+        })
+        .await;
+        if let Some(recalled) = recalled {
+            recalled.record();
+            self.push_injected(Message::synthetic(recalled.reminder));
+        }
 
         info!(
             model = %self.model.id,
@@ -2940,6 +2951,30 @@ impl<'h> Agent<'h> {
         }
     }
 
+    /// The recall a main session's turn runs next to the skill suggestion,
+    /// built from what it owns so the two can ask the engine at once.
+    fn memory_recall(&self, request: &str, peer_wake: bool) -> Option<Recall> {
+        if peer_wake
+            || request.trim().is_empty()
+            || !self.is_main_session()
+            || !self.tool_filter.matches(MEMORY_TOOL_NAME)
+        {
+            return None;
+        }
+        let store = Arc::clone(self.memory_store.as_ref()?);
+        let decisions = self
+            .permissions
+            .decisions()
+            .filter(|decisions| decisions.enabled(&DecisionFeature::MemoryRecall))?;
+        let judge = Judge {
+            decisions,
+            context: self.decision_context(),
+            permissions: Some(Arc::clone(&self.permissions)),
+            cancel: self.cancel.clone(),
+        };
+        Some(Recall::new(judge, store, self.history.as_slice()))
+    }
+
     async fn suggest_skill(&mut self, task: &str) -> Option<SkillSuggestion> {
         if task.trim().is_empty() {
             return None;
@@ -3362,7 +3397,18 @@ impl<'h> Agent<'h> {
             jobs: self.jobs.clone(),
             shell_live: None,
             speculative: None,
+            decision_focus: self.decision_focus(),
         }
+    }
+
+    fn decision_focus(&self) -> Option<Value> {
+        self.permissions
+            .decisions()
+            .filter(|decisions| decisions.enabled(&DecisionFeature::OutputPointers))?;
+        output_focus(
+            self.history.todos().unwrap_or_default(),
+            self.history.latest_user_request(),
+        )
     }
 
     /// How full the window is: the provider's own count for the last request it
@@ -3470,6 +3516,7 @@ impl<'h> Agent<'h> {
         } else {
             None
         };
+        let retention = compaction::Retention::new(&self.permissions, &self.goal, self.history);
         let compacted = compaction::compact_history(
             &*compact_provider,
             &compact_model,
@@ -3480,6 +3527,7 @@ impl<'h> Agent<'h> {
                 retry_now: &self.retry_now,
                 config: &self.config,
                 extractor: extractor.as_ref(),
+                retention,
                 session: (main_session || self.child_jobs().is_some()).then_some(
                     BackgroundReminderContext {
                         background: self.background.as_ref().filter(|_| main_session),
@@ -3609,17 +3657,15 @@ fn question_nudge_request(history: &History) -> Option<&str> {
     for item in history.transcript().rev() {
         if let HistoryItemKind::User {
             text,
-            origin,
-            display_text,
+            origin: UserOrigin::Synthetic,
             ..
         } = &item.kind
+            && text == question_tool_nudge::REMINDER
         {
-            if *origin == UserOrigin::Synthetic && text == question_tool_nudge::REMINDER {
-                return None;
-            }
-            if *origin == UserOrigin::Turn {
-                return Some(display_text.as_deref().unwrap_or(text));
-            }
+            return None;
+        }
+        if let Some(request) = user_request(&item.kind) {
+            return Some(request);
         }
     }
     None
@@ -3682,7 +3728,7 @@ pub(crate) fn skill_shortlist(
     {
         return Vec::new();
     }
-    let words = skill_words(task);
+    let words = significant_words(task);
     let mut ranked: Vec<_> = inventory
         .into_iter()
         .filter(|skill| {
@@ -3691,7 +3737,7 @@ pub(crate) fn skill_shortlist(
                 && redact_decision_text(&skill.name) == skill.name
         })
         .map(|skill| {
-            let score = skill_words(&format!("{} {}", skill.name, skill.description))
+            let score = significant_words(&format!("{} {}", skill.name, skill.description))
                 .intersection(&words)
                 .count();
             (score, skill)
@@ -3707,14 +3753,6 @@ pub(crate) fn skill_shortlist(
         .into_iter()
         .map(|(_, skill)| skill)
         .take(MAX_SKILL_CANDIDATES)
-        .collect()
-}
-
-fn skill_words(text: &str) -> BTreeSet<String> {
-    text.split(|character: char| !character.is_alphanumeric())
-        .filter(|word| word.chars().nth(1).is_some())
-        .map(str::to_lowercase)
-        .filter(|word| !SKILL_STOPWORDS.contains(&word.as_str()))
         .collect()
 }
 
@@ -4236,9 +4274,14 @@ mod tests {
     use crate::context::{ContextKey, ContextStore};
     use crate::decisions::DecisionState;
     use crate::mcp::tool_names;
+    use crate::memory::relevance::RECALL_OPEN;
+    use crate::memory::relevance::tests::{
+        NoteEngine, RELEVANT, assert_effects, note_decisions, note_store,
+    };
     use crate::permissions::{PermissionManager, PermissionMode};
     use crate::remote_project_context::{RemoteAssetIdentity, RemoteSkill};
     use crate::tools::native::batch::BatchTool;
+    use crate::tools::native::tests::tempdir;
     use crate::tools::native::todo_write::TodoWrite;
     use crate::tools::registry::ToolSource;
     use crate::tools::{TODOWRITE_TOOL_NAME, ToolEffect, audited_local_tool, local_tool};
@@ -4272,6 +4315,10 @@ mod tests {
     const AUTOMATION_FIRE_ID: &str = "opaque-firing";
     const AUTOMATION_SEQ: u32 = 1;
     const AUTOPILOT_SEQ: u32 = 1;
+    const RECALL_REQUEST: &str = "Sign the release tags before publishing";
+    const RECALL_NOTE: &str = "release.md";
+    const RECALL_CONTENT: &str = "# Release tags\nSign them before publishing.";
+    const RECALL_ROOT: &str = "call-recall";
 
     #[test]
     fn peer_wake_without_a_claim_does_not_request_the_model() {
@@ -4699,6 +4746,124 @@ mod tests {
                 json!({"skill": SKILL_NONE}),
             )
             .await;
+        });
+    }
+
+    /// An agent whose memory holds one note the engine judges relevant to
+    /// [`RECALL_REQUEST`], with recall in `mode`.
+    fn recalling_agent<'h>(
+        history: &'h mut History,
+        state: &Path,
+        mode: FeatureMode,
+        engine: NoteEngine,
+        provider: MockProvider,
+    ) -> (Agent<'h>, flume::Receiver<Envelope>) {
+        let (mut agent, events) = make_agent(provider, history);
+        agent.memory_store = Some(note_store(state, &[(RECALL_NOTE, RECALL_CONTENT)]));
+        agent.permissions.set_decisions(Some(note_decisions(
+            state,
+            |features| features.memory_recall = mode,
+            engine,
+        )));
+        (agent, events)
+    }
+
+    fn recall_input() -> AgentInput {
+        AgentInput {
+            message: RECALL_REQUEST.into(),
+            ..default_input()
+        }
+    }
+
+    fn recall_reminders(request: &[Message]) -> usize {
+        request
+            .iter()
+            .filter_map(Message::first_text_content)
+            .filter(|text| text.starts_with(RECALL_OPEN))
+            .count()
+    }
+
+    #[test_case(|_| {}, true ; "main_session")]
+    #[test_case(|agent| agent.root_tool_use_id = Some(RECALL_ROOT.into()), false ; "subagent_run")]
+    #[test_case(|agent| agent.audience = ToolAudience::GENERAL_SUB, false ; "not_the_main_audience")]
+    #[test_case(|agent| agent.tool_filter = ToolFilter::All.excluding(&[MEMORY_TOOL_NAME]), false ; "memory_tool_filtered_out")]
+    #[test_case(|agent| agent.memory_store = None, false ; "no_memory")]
+    #[test_case(|agent| agent.permissions.set_decisions(None), false ; "no_engine")]
+    fn memory_recall_reaches_only_a_main_session_that_can_read_memory(
+        adjust: fn(&mut Agent<'_>),
+        recalled: bool,
+    ) {
+        smol::block_on(async {
+            let state = tempdir();
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let captured = Arc::clone(&provider.captured_messages);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _events) = recalling_agent(
+                &mut history,
+                state.path(),
+                FeatureMode::Advise,
+                NoteEngine::scoring(&[(RECALL_NOTE, RELEVANT)]),
+                provider,
+            );
+            adjust(&mut agent);
+
+            agent.run(recall_input()).await.unwrap();
+
+            let requests = captured.lock().unwrap();
+            assert_eq!(recall_reminders(&requests[0]), usize::from(recalled));
+        });
+    }
+
+    #[test_case(FeatureMode::Advise, 1, 1 ; "advise_reminds")]
+    #[test_case(FeatureMode::Shadow, 0, 1 ; "shadow_only_asks")]
+    #[test_case(FeatureMode::Off, 0, 0 ; "off_never_asks")]
+    fn memory_recall_reminds_only_when_advising(mode: FeatureMode, reminders: usize, asked: usize) {
+        smol::block_on(async {
+            let state = tempdir();
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let captured = Arc::clone(&provider.captured_messages);
+            let engine = NoteEngine::scoring(&[(RECALL_NOTE, RELEVANT)]);
+            let calls = Arc::clone(&engine.calls);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _events) =
+                recalling_agent(&mut history, state.path(), mode, engine, provider);
+
+            agent.run(recall_input()).await.unwrap();
+
+            assert_eq!(recall_reminders(&captured.lock().unwrap()[0]), reminders);
+            assert_eq!(calls.load(Ordering::Relaxed), asked);
+        });
+    }
+
+    #[test]
+    fn memory_recall_names_a_note_once_per_conversation() {
+        smol::block_on(async {
+            let state = tempdir();
+            let provider = MockProvider::new(vec![
+                text_response(StopReason::EndTurn),
+                text_response(StopReason::EndTurn),
+            ]);
+            let captured = Arc::clone(&provider.captured_messages);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _events) = recalling_agent(
+                &mut history,
+                state.path(),
+                FeatureMode::Advise,
+                NoteEngine::scoring(&[(RECALL_NOTE, RELEVANT)]),
+                provider,
+            );
+
+            agent.run(recall_input()).await.unwrap();
+            agent.run(recall_input()).await.unwrap();
+
+            let reminders: Vec<usize> = captured
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| recall_reminders(request))
+                .collect();
+            assert_eq!(reminders, [1, 1]);
+            assert_effects(state.path(), &[DecisionEffect::Advised]).await;
         });
     }
 
@@ -6122,6 +6287,7 @@ mod tests {
                 tools: serde_json::json!([]),
                 deferred: Vec::new(),
                 tools_fixed: false,
+                memory_store: None,
             },
         );
         // The pause is real time, and a stall case would otherwise wait it out

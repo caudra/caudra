@@ -1,0 +1,85 @@
+{
+  "k": 3,
+  "baseline": {"ndcg_at_k": 0.961, "recall_at_k": 0.903, "p50_ms": 714, "p95_ms": 762},
+  "baseline_note": "Synthetic, hand-labelled cases. Measured 2026-10-12 with protocol openai, endpoint http://127.0.0.1:8080/v1 (local ninfer), model systemone-decision-v7. The recency order (the newest three) that the feature falls back to scored nDCG@k 0.422 and recall@k 0.347 on the same cases.",
+  "cases": [
+    {
+      "query": "fix the failing date parsing test in the invoice module",
+      "candidates": [
+        {"tool": "shell", "input": {"command": "git status"}, "content": "On branch main\nChanges not staged for commit:\n  modified: src/invoice/date.rs"},
+        {"tool": "file_read", "input": {"path": "README.md"}, "content": "# Billing service\nRun `make dev` to start the local server."},
+        {"tool": "shell", "input": {"command": "ls docs"}, "content": "architecture.md\ncontributing.md\nrelease.md"},
+        {"tool": "shell", "input": {"command": "cargo test invoice::date"}, "content": "test invoice::date::parses_iso_dates ... FAILED\nassertion failed: left == right\n  left: 2024-02-30\n  right: error: day out of range"},
+        {"tool": "file_read", "input": {"path": "src/invoice/date.rs"}, "content": "pub fn parse_due_date(text: &str) -> Result<NaiveDate, DateError> {\n    NaiveDate::parse_from_str(text, \"%Y-%m-%d\").map_err(DateError::from)\n}"},
+        {"tool": "grep", "input": {"pattern": "parse_due_date"}, "content": "src/invoice/date.rs:12: pub fn parse_due_date\nsrc/invoice/mod.rs:40: let due = parse_due_date(&raw)?;"},
+        {"tool": "file_read", "input": {"path": "Cargo.toml"}, "content": "[package]\nname = \"billing\"\nversion = \"0.3.1\""}
+      ],
+      "relevant": [3, 4, 5]
+    },
+    {
+      "query": "make the CSV export include the currency column",
+      "candidates": [
+        {"tool": "file_read", "input": {"path": "src/export/csv.rs"}, "content": "fn header() -> Vec<&'static str> {\n    vec![\"id\", \"amount\", \"date\"]\n}"},
+        {"tool": "shell", "input": {"command": "npm run lint"}, "content": "No lint errors found."},
+        {"tool": "file_read", "input": {"path": "src/ui/theme.css"}, "content": ".header { color: #333; }"},
+        {"tool": "grep", "input": {"pattern": "currency"}, "content": "src/model/invoice.rs:8: pub currency: Currency,\nsrc/export/json.rs:22: \"currency\": invoice.currency.code(),"},
+        {"tool": "shell", "input": {"command": "git log -3 --oneline"}, "content": "a1b2c3d bump version\nd4e5f6a fix typo in docs\n0a9b8c7 add dark theme"},
+        {"tool": "shell", "input": {"command": "cargo test export"}, "content": "test export::csv::writes_header ... ok\ntest export::csv::writes_rows ... ok"},
+        {"tool": "file_read", "input": {"path": "LICENSE"}, "content": "MIT License\nCopyright (c) 2024"}
+      ],
+      "relevant": [0, 3, 5]
+    },
+    {
+      "query": "why does the webhook retry loop never stop",
+      "candidates": [
+        {"tool": "shell", "input": {"command": "df -h"}, "content": "Filesystem Size Used Avail\n/dev/sda1 50G 21G 29G"},
+        {"tool": "file_read", "input": {"path": "src/hooks/retry.rs"}, "content": "loop {\n    match send(&payload).await {\n        Ok(_) => break,\n        Err(_) => sleep(backoff.next()).await,\n    }\n}"},
+        {"tool": "shell", "input": {"command": "date"}, "content": "Tue Mar 4 10:12:00 UTC 2025"},
+        {"tool": "shell", "input": {"command": "tail -n 3 logs/hooks.log"}, "content": "retrying webhook 7f3a attempt 211\nretrying webhook 7f3a attempt 212\nretrying webhook 7f3a attempt 213"},
+        {"tool": "file_read", "input": {"path": "src/hooks/backoff.rs"}, "content": "pub struct Backoff { attempt: u32, max_attempts: Option<u32> }\nimpl Backoff {\n    pub fn next(&mut self) -> Duration { self.attempt += 1; self.delay() }\n}"},
+        {"tool": "file_read", "input": {"path": "src/ui/labels.rs"}, "content": "pub const RETRY_LABEL: &str = \"Retry\";"},
+        {"tool": "shell", "input": {"command": "cargo build"}, "content": "Finished dev profile in 4.2s"}
+      ],
+      "relevant": [1, 3, 4]
+    },
+    {
+      "query": "add a migration that makes users.email unique",
+      "candidates": [
+        {"tool": "shell", "input": {"command": "ls migrations"}, "content": "0001_create_users.sql\n0002_add_orders.sql\n0003_add_index_orders_date.sql"},
+        {"tool": "file_read", "input": {"path": "migrations/0001_create_users.sql"}, "content": "CREATE TABLE users (\n  id SERIAL PRIMARY KEY,\n  email TEXT NOT NULL\n);"},
+        {"tool": "shell", "input": {"command": "psql -c 'select email, count(*) from users group by email having count(*) > 1'"}, "content": "email | count\nann@example.com | 2"},
+        {"tool": "file_read", "input": {"path": "src/mail/templates/welcome.html"}, "content": "<p>Welcome! Confirm your email.</p>"},
+        {"tool": "shell", "input": {"command": "git stash list"}, "content": "stash@{0}: WIP on main: tweak footer"},
+        {"tool": "grep", "input": {"pattern": "unique"}, "content": "src/ui/list.tsx:14: key={unique(item.id)}"},
+        {"tool": "file_read", "input": {"path": "docs/migrations.md"}, "content": "Name new migrations NNNN_description.sql and run `make migrate`."}
+      ],
+      "relevant": [0, 1, 2, 6]
+    },
+    {
+      "query": "the login page shows a blank screen after the React upgrade",
+      "candidates": [
+        {"tool": "shell", "input": {"command": "npm ls react"}, "content": "app@1.0.0\n└── react@19.0.0"},
+        {"tool": "file_read", "input": {"path": "package.json"}, "content": "\"dependencies\": { \"react\": \"^19.0.0\", \"react-router\": \"^5.3.4\" }"},
+        {"tool": "shell", "input": {"command": "npm run build"}, "content": "Compiled successfully."},
+        {"tool": "shell", "input": {"command": "curl -s localhost:3000/api/health"}, "content": "{\"status\":\"ok\"}"},
+        {"tool": "file_read", "input": {"path": "src/pages/Login.tsx"}, "content": "import { withRouter } from 'react-router';\nexport default withRouter(LoginPage);"},
+        {"tool": "shell", "input": {"command": "git diff --stat"}, "content": "src/styles/footer.css | 4 ++--"},
+        {"tool": "file_read", "input": {"path": "CHANGELOG.md"}, "content": "## 2.1.0\n- Upgrade React to 19"}
+      ],
+      "relevant": [0, 1, 4]
+    },
+    {
+      "query": "speed up the slow integration test suite",
+      "candidates": [
+        {"tool": "file_read", "input": {"path": ".editorconfig"}, "content": "root = true\nindent_style = space"},
+        {"tool": "shell", "input": {"command": "git branch"}, "content": "* main\n  feature/dark-mode"},
+        {"tool": "file_read", "input": {"path": "src/theme/colors.ts"}, "content": "export const primary = '#0055ff';"},
+        {"tool": "shell", "input": {"command": "cargo nextest run --profile integration"}, "content": "Summary [412.3s] 58 tests run: 58 passed\nSLOW [180.2s] integration::db::full_migration_replay"},
+        {"tool": "file_read", "input": {"path": "tests/integration/db.rs"}, "content": "#[test]\nfn full_migration_replay() {\n    for migration in all_migrations() { db.reset(); db.apply_all_until(migration); }\n}"},
+        {"tool": "file_read", "input": {"path": ".config/nextest.toml"}, "content": "[profile.integration]\ntest-threads = 1"},
+        {"tool": "shell", "input": {"command": "whoami"}, "content": "dev"}
+      ],
+      "relevant": [3, 4, 5]
+    }
+  ]
+}

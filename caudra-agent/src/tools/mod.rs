@@ -590,6 +590,10 @@ pub struct ToolContext {
     /// could start children of its own would keep the store alive through the
     /// context it inherited.
     pub speculative: Option<Arc<crate::agent::speculative::SpeculativeRuns>>,
+    /// The open todos and latest request that output pointers judge a cut
+    /// result's omitted lines against, redacted and bounded. Set only while
+    /// that feature is on, and cleared for batch children and nested dispatch.
+    pub decision_focus: Option<Value>,
 }
 
 impl ToolContext {
@@ -833,6 +837,7 @@ pub fn interpreter_ctx(
         steering_observations: None,
         steering_order: Vec::new(),
         speculative: None,
+        decision_focus: None,
         model: Arc::clone(&MODEL),
         chat_provider: Arc::clone(&PROVIDER),
         chat_model: Arc::clone(&MODEL),

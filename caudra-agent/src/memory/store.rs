@@ -7,7 +7,7 @@
 //! outside the memory tool into the journal, and on a scope's first use it is
 //! the import of the notes already there.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -15,7 +15,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
 use caudra_storage::local_documents::{LocalDocumentError, LocalDocumentStore, MemoryFileStat};
 use caudra_storage::memory_journal::{
-    EntryKind, EntryMeta, EntryOrigin, ForgetReport, JournalChange, MAX_ENTRY_BODY_BYTES,
+    Entry, EntryKind, EntryMeta, EntryOrigin, ForgetReport, JournalChange, MAX_ENTRY_BODY_BYTES,
     MemoryJournal, MemoryJournalError, StoredNode, body_hash,
 };
 use caudra_storage::projects::project_subdir;
@@ -24,7 +24,7 @@ use jiff::Timestamp;
 use thiserror::Error;
 use tracing::{info, warn};
 
-use super::search::{self, Document, Hit};
+use super::search::{self, Candidate, Document, Hit};
 use super::tree::{self, Block, Leaf, LeafKind, Part, Tree, VIEW};
 
 const MEMORIES_DIR: &str = "memories";
@@ -338,13 +338,36 @@ impl MemoryStore {
     /// The live notes that best match `query`, best first.
     pub fn search(&self, query: &str) -> Result<Vec<Hit>, MemoryError> {
         let current = self.journal().current(&self.scope)?;
-        let documents = current.iter().map(|entry| Document {
-            seq: entry.meta.seq,
-            name: &entry.meta.name,
-            heading: &entry.meta.heading,
-            body: &entry.body,
-        });
-        Ok(search::search(&search::terms(query), documents))
+        Ok(search::search(
+            &search::terms(query),
+            current.iter().map(document),
+        ))
+    }
+
+    /// [`Self::search`] widened for the decision engine to rank, each note
+    /// with an excerpt of its body.
+    pub fn search_pool(&self, query: &str) -> Result<Vec<Candidate>, MemoryError> {
+        let current = self.journal().current(&self.scope)?;
+        Ok(search::pool(
+            &search::terms(query),
+            current.iter().map(document),
+        ))
+    }
+
+    /// The live notes sharing the most of `words`, at most `limit`, leaving
+    /// out those `skip` names.
+    pub fn related(
+        &self,
+        words: &BTreeSet<String>,
+        limit: usize,
+        skip: impl Fn(&str) -> bool,
+    ) -> Result<Vec<Candidate>, MemoryError> {
+        let current = self.journal().current(&self.scope)?;
+        let documents = current
+            .iter()
+            .filter(|entry| !skip(&entry.meta.name))
+            .map(document);
+        Ok(search::related(words, documents, limit))
     }
 
     fn changed_body(
@@ -542,6 +565,15 @@ fn leaf(meta: &EntryMeta, body: Option<String>) -> Leaf {
         name: meta.name.clone(),
         heading: meta.heading.clone(),
         body,
+    }
+}
+
+fn document(entry: &Entry) -> Document<'_> {
+    Document {
+        seq: entry.meta.seq,
+        name: &entry.meta.name,
+        heading: &entry.meta.heading,
+        body: &entry.body,
     }
 }
 

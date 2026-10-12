@@ -129,6 +129,12 @@ impl History {
         self.archived.iter().chain(self.active_items())
     }
 
+    pub fn latest_user_request(&self) -> Option<&str> {
+        self.transcript()
+            .rev()
+            .find_map(|item| user_request(&item.kind))
+    }
+
     /// Bumped by `replace` and `truncate` but not by `extend`, so a caller can
     /// tell a wholesale swap of the conversation from an append. Compaction and
     /// conversation revert are the swaps, and both cool the message cache.
@@ -356,6 +362,18 @@ fn stand_for_originals(
     });
     for item in &mut items[..unplaced] {
         item.stands_for = Some(lead.unwrap_or(item.id));
+    }
+}
+
+pub(super) fn user_request(kind: &HistoryItemKind) -> Option<&str> {
+    match kind {
+        HistoryItemKind::User {
+            text,
+            origin: UserOrigin::Turn,
+            display_text,
+            ..
+        } => Some(display_text.as_deref().unwrap_or(text)),
+        _ => None,
     }
 }
 
@@ -993,6 +1011,23 @@ mod tests {
             &transcript[0].kind,
             HistoryItemKind::User { text, .. } if text == FIRST
         ));
+    }
+
+    #[test_case(vec![Message::user(FIRST.into()), assistant_text(GO), Message::user(SECOND.into()), Message::synthetic(GO.into())], Some(SECOND); "a_reminder_is_skipped")]
+    #[test_case(vec![Message::synthetic(GO.into())], None; "only_synthetic_turns")]
+    fn the_latest_user_request_is_the_newest_typed_turn(
+        messages: Vec<Message>,
+        expected: Option<&str>,
+    ) {
+        assert_eq!(History::new(messages).latest_user_request(), expected);
+    }
+
+    #[test]
+    fn the_latest_user_request_reaches_across_a_seam() {
+        let archived = History::new(vec![Message::user(FIRST.into())]).into_items();
+        let history = History::new(vec![Message::synthetic(GO.into())]).with_archived(archived);
+
+        assert_eq!(history.latest_user_request(), Some(FIRST));
     }
 
     #[track_caller]

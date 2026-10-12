@@ -81,6 +81,7 @@ fn status(decisions: &DecisionsConfig) -> Value {
         "protocol": decisions.protocol.as_str(),
         "model": decisions.model,
         "timeout_ms": decisions.timeout_ms,
+        "rerank_timeout_ms": decisions.rerank_timeout_ms,
         "logging": decisions.log,
         "retention_days": decisions.log_retention_days,
         "features": decisions.features,
@@ -110,6 +111,8 @@ mod tests {
         let result = status(&config);
 
         assert_eq!(result["protocol"], expected);
+        assert_eq!(result["timeout_ms"], config.timeout_ms);
+        assert_eq!(result["rerank_timeout_ms"], config.rerank_timeout_ms);
         assert_eq!(result["configured"], false);
         assert!(result["endpoint_origin"].is_null());
         assert_eq!(result["reachability"], NOT_PROBED);

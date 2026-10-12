@@ -705,9 +705,13 @@ fn write_decisions_section(out: &mut String) {
          evaluation without applying partial answers.\n\n\
          Caudra retries HTTP 408, 429, and 5xx responses at most twice. Each retry waits for the \
          delay the server requests in `retry-after-ms` or `Retry-After`, or else for an exponential \
-         backoff that starts near half a second. No retry waits past `timeout_ms`, so under the \
-         default {timeout_ms} ms deadline most retries need a short server-requested delay. Connection \
-         failures, 401, 422, and other client errors fail at once.\n\n\
+         backoff that starts near half a second. No retry waits past the request deadline, so under \
+         the default {timeout_ms} ms `timeout_ms` most retries need a short server-requested delay. \
+         Connection failures, 401, 422, and other client errors fail at once.\n\n\
+         Tool search and the [reranking features](#reranking) judge up to 16 candidates in one \
+         request and use `rerank_timeout_ms` (default {rerank_timeout_ms} ms) instead. Memory recall \
+         keeps `timeout_ms` because it delays the start of a turn. A workflow `decide()` or \
+         `rerank()` call may ask for up to the larger of the two.\n\n\
          Requests ignore ambient proxies and do not follow redirects. `localhost` is a DNS name, \
          not numeric loopback for this policy. Private and CGNAT addresses receive no automatic HTTP exemption. \
          These settings do not change Workcell transport policy.\n\n\
@@ -720,11 +724,13 @@ fn write_decisions_section(out: &mut String) {
          listed below, never permission grants or relaxed executor restrictions. \
          Unsupported modes are configuration errors. YOLO bypasses permission advice, Auto screening, \
          and permission-related shell-effect checks. Shell duration, content screening, tool search, \
-         skill selection, goal prescreening, subagent routing, and the question-tool nudge still follow \
-         their feature settings in YOLO. Deterministic denies and hard restrictions still apply.\n\n\
+         skill selection, goal prescreening, subagent routing, the question-tool nudge, and the \
+         reranking features still follow their feature settings in YOLO. Deterministic denies and \
+         hard restrictions still apply.\n\n\
          | Feature | Default | Supported modes | Behavior beyond shadow |\n\
          |---------|---------|-----------------|------------------------|\n",
         timeout_ms = DecisionsConfig::default().timeout_ms,
+        rerank_timeout_ms = DecisionsConfig::default().rerank_timeout_ms,
     )
     .unwrap();
     for feature in DecisionFeatures::ALL {
@@ -805,6 +811,31 @@ fn write_decisions_section(out: &mut String) {
          request within the 1,500-byte serialized state limit. Long replies retain an opening and \
          a larger tail, so questions in the omitted middle can be missed. Errors, timeouts, invalid \
          answers, and scores below the threshold leave the reply unchanged.\n\n\
+         #### Reranking\n\n\
+         Tool search, `memory_search`, `memory_recall`, `memory_duplicates`, `compaction_retention`, \
+         `output_pointers`, and `code_context` use the engine as a reranker. A cheap first pass, such \
+         as keyword matching, picks the candidates. The engine then answers one true or false \
+         relevance question per candidate, and Caudra orders, prunes, or names candidates by the \
+         probability it returns. The feature table above lists what each one sends.\n\n\
+         One request holds up to 16 candidates, each with an opaque ID such as `c00`. Larger lists \
+         go out as concurrent requests under one deadline. Candidate text is redacted and cut to a \
+         fixed size before it is sent, and every question tells the engine to treat the candidate as \
+         data rather than instructions. The request state, such as the query, task, or goal, stays \
+         within the 1,500-byte state limit.\n\n\
+         Enforcing features compare each probability with `thresholds.relevance_floor` (default \
+         `0.1`). Tool search and `code_context` only reorder, putting candidates at or above the \
+         floor first. `memory_search` omits matches below the floor and names them. \
+         `compaction_retention` keeps the same number of tool results as without the engine, \
+         choosing them by relevance, and never drops a result it could not otherwise drop. Advisory \
+         features name a candidate only at or above `thresholds.routing_confidence` (default \
+         `0.9`).\n\n\
+         When any request fails, is refused, times out, or is cancelled, or the decision service \
+         changes while it runs, the feature behaves as if it were `off`. In `shadow`, requests are \
+         sent and logged without effect. With `log = true`, an enforcing feature records \
+         `rerouted` when the order it used differs from the first pass, and an advisory feature \
+         records `advised` when it named a candidate. Workflows can rerank their own candidates \
+         with [`rerank()`](/docs/workflows/#reranking-candidates). See also \
+         [memory relevance](/docs/memory/#relevance-from-the-decision-engine).\n\n\
          #### Question overrides\n\n\
          Only the permission question set currently supports a user-global file override: \
          `~/.config/caudra/decisions/permission.json`. It must be a regular JSON file no larger \

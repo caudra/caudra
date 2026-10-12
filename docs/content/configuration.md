@@ -717,7 +717,8 @@ Connection settings and thresholds are global-only. Projects may set individual 
 | `api_key_env` | string | `TYPESAFE_API_KEY` for typesafe; `OPENAI_API_KEY` for openai | Environment variable containing the optional credential, never the credential itself. Project environment values are excluded. |
 | `allow_remote` | boolean | `false` | Explicit global consent to send decision context to a non-loopback endpoint. |
 | `allow_http` | boolean | `false` | Global-only opt-in for non-loopback HTTP. Also requires `allow_remote = true`. Use only with transport protection you control, such as a trusted encrypted tunnel. |
-| `timeout_ms` | integer | `800` | Positive decision-request deadline in milliseconds, separate from shell execution timeouts. |
+| `timeout_ms` | integer | `800` | Positive decision-request deadline in milliseconds, separate from shell execution timeouts. Tool search and every reranking feature except memory recall use `rerank_timeout_ms` instead. |
+| `rerank_timeout_ms` | integer | `2000` | Positive deadline in milliseconds for tool search and the reranking features, which judge at most 16 candidates per request and send their requests concurrently. Memory recall keeps `timeout_ms` because it delays the start of a turn. A workflow `decide()` may ask for up to the larger of the two. |
 | `log` | boolean | `false` | Retain bounded decision records in the local `caudra.db`. |
 | `log_retention_days` | integer | `90` | Positive retention period for decision records. |
 | `features` | table | `{}` | Per-feature modes below. |
@@ -753,7 +754,9 @@ model = "systemone-decision-v7"
 
 Both protocols send text only. OpenAI maps native boolean questions to predicates, retaining the true and false criteria in the instruction text. Answers normalize to the same typed results, including workflow `noul` probabilities. A refusal fails the whole evaluation without applying partial answers.
 
-Caudra retries HTTP 408, 429, and 5xx responses at most twice. Each retry waits for the delay the server requests in `retry-after-ms` or `Retry-After`, or else for an exponential backoff that starts near half a second. No retry waits past `timeout_ms`, so under the default 800 ms deadline most retries need a short server-requested delay. Connection failures, 401, 422, and other client errors fail at once.
+Caudra retries HTTP 408, 429, and 5xx responses at most twice. Each retry waits for the delay the server requests in `retry-after-ms` or `Retry-After`, or else for an exponential backoff that starts near half a second. No retry waits past the request deadline, so under the default 800 ms `timeout_ms` most retries need a short server-requested delay. Connection failures, 401, 422, and other client errors fail at once.
+
+Tool search and the [reranking features](#reranking) judge up to 16 candidates in one request and use `rerank_timeout_ms` (default 2000 ms) instead. Memory recall keeps `timeout_ms` because it delays the start of a turn. A workflow `decide()` or `rerank()` call may ask for up to the larger of the two.
 
 Requests ignore ambient proxies and do not follow redirects. `localhost` is a DNS name, not numeric loopback for this policy. Private and CGNAT addresses receive no automatic HTTP exemption. These settings do not change Workcell transport policy.
 
@@ -761,7 +764,7 @@ Redaction is best effort. Decision context can include commands, task text, tool
 
 #### `decisions.features`
 
-`off` disables the feature. `shadow` collects predictions without applying them. `advise` adds caution or suggestions. `enforce` applies only the feature-specific behavior listed below, never permission grants or relaxed executor restrictions. Unsupported modes are configuration errors. YOLO bypasses permission advice, Auto screening, and permission-related shell-effect checks. Shell duration, content screening, tool search, skill selection, goal prescreening, subagent routing, and the question-tool nudge still follow their feature settings in YOLO. Deterministic denies and hard restrictions still apply.
+`off` disables the feature. `shadow` collects predictions without applying them. `advise` adds caution or suggestions. `enforce` applies only the feature-specific behavior listed below, never permission grants or relaxed executor restrictions. Unsupported modes are configuration errors. YOLO bypasses permission advice, Auto screening, and permission-related shell-effect checks. Shell duration, content screening, tool search, skill selection, goal prescreening, subagent routing, the question-tool nudge, and the reranking features still follow their feature settings in YOLO. Deterministic denies and hard restrictions still apply.
 
 | Feature | Default | Supported modes | Behavior beyond shadow |
 |---------|---------|-----------------|------------------------|
@@ -775,6 +778,12 @@ Redaction is best effort. Decision context can include commands, task text, tool
 | `goal_prescreen` | `off` | `off`, `shadow`, `enforce` | Skip an unlikely-to-pass goal evaluation within the continuation budget and continue work. Only the normal evaluator can certify completion. |
 | `subagent_routing` | `off` | `off`, `shadow`, `enforce` | Choose a model job for a new unpinned subagent from its task label, mode, profile, and a redacted prompt excerpt. Explicit jobs, profile pins, and continuations keep their routing. |
 | `question_tool_nudge` | `off` | `off`, `shadow`, `advise` | At a main-session handoff with a usable question tool, advise adds one visible reminder per user-input episode to ask a live user question through that tool. Shadow only evaluates. Uses a redacted, bounded request and reply excerpt; uncertainty and failures leave the reply unchanged. |
+| `memory_search` | `off` | `off`, `shadow`, `enforce` | Rerank the memory tool's keyword matches against the agent's query and omit those judged unrelated, saying how many were omitted. Sends the query and each candidate note's name, heading, and a redacted body excerpt. |
+| `memory_recall` | `off` | `off`, `shadow`, `advise` | In main sessions, remind the agent of at most three saved notes likely relevant to a new user message, without loading them. Sends a redacted message excerpt and each keyword-matched note's name, heading, and redacted excerpt. |
+| `memory_duplicates` | `off` | `off`, `shadow`, `advise` | When a new memory note is written, name existing notes that may cover the same topic in the write receipt. The write itself is never blocked or changed. Sends redacted excerpts of the new note and of keyword-matched notes. |
+| `compaction_retention` | `off` | `off`, `shadow`, `enforce` | During compaction, keep the tool results most relevant to the active goal, open todos, and latest request instead of only the newest, and keep the most relevant part of a long result. Sends redacted goal, todo, and request excerpts, and each recent result's tool name with redacted input and output excerpts. |
+| `output_pointers` | `off` | `off`, `shadow`, `advise` | When a saved tool output was truncated, point the agent to at most two omitted line ranges likely to matter. Nothing extra is removed. Sends redacted excerpts of the in-progress todos, latest request, tool input, and omitted lines. |
+| `code_context` | `off` | `off`, `shadow`, `enforce` | In local sessions, reorder the first code-context rows by relevance to the task, without pruning. Sends the task and each row's symbol name, kind, path, line span, and reference counts, never source text. |
 
 #### `decisions.thresholds`
 
@@ -788,10 +797,11 @@ Flag thresholds trigger at or above the configured value. Goal prescreening uses
 | `content_addressed_to_agent` | float | `0.9` | Probability that sampled content addresses the agent. |
 | `shell_endless` | float | `0.9` | Probability that a shell command runs until stopped. |
 | `shell_duration` | float | `0.9` | Probability mass a duration bound needs before an engine estimate is used. |
-| `routing_confidence` | float | `0.9` | Confidence required for tool search and skill suggestions. Tool-search choice probability must also meet it. Subagent routing picks the Fast model when this much difficulty probability is at or below routine work, and the Best model when this much is on open-ended work. |
+| `routing_confidence` | float | `0.9` | Confidence required for skill suggestions. Subagent routing picks the Fast model when this much difficulty probability is at or below routine work, and the Best model when this much is on open-ended work. Memory recall, memory duplicates, and output pointers name a candidate only at or above this relevance probability. |
 | `goal_skip_below` | float | `0.05` | Skip an evaluator at or below this completion probability, within the continuation budget. |
 | `shell_writes` | float | unset | Optional project-write warning threshold. Omission leaves the warning disabled. No built-in enforcement threshold. |
 | `question_tool_nudge` | float | `0.85` | Minimum noul score for a question-tool reminder. Provisional, not a calibrated probability; advise only, and errors or uncertainty never reopen the turn. |
+| `relevance_floor` | float | `0.1` | Relevance probability below which an enforcing rerank feature prunes or demotes a candidate. Memory search omits it, compaction retention keeps a newer result in its place, and tool search ranks it after the candidates judged relevant, in keyword order. A list the engine could not judge is never emptied. |
 
 #### Shell duration
 
@@ -812,6 +822,16 @@ With `agent.shell_execution = "auto"`, Enforce estimates can select synchronous 
 In `shadow`, the prediction leaves the reply unchanged. In `advise`, a score at or above `decisions.thresholds.question_tool_nudge` (default `0.85`) adds a normal system reminder asking the assistant to use `question` for the outstanding answer. The original reply stays in history. The reminder follows the `show_reminders` display preference and can occur at most once per genuine user-input episode. Synthetic reminders, retries, and resume do not renew that allowance. It never fabricates a tool call, an answer, or approval. While [autopilot](/docs/autopilot/#questions) is engaged, its delegate answers the form that the reminder leads to.
 
 The request contains redacted excerpts of the current visible reply and relevant user request within the 1,500-byte serialized state limit. Long replies retain an opening and a larger tail, so questions in the omitted middle can be missed. Errors, timeouts, invalid answers, and scores below the threshold leave the reply unchanged.
+
+#### Reranking
+
+Tool search, `memory_search`, `memory_recall`, `memory_duplicates`, `compaction_retention`, `output_pointers`, and `code_context` use the engine as a reranker. A cheap first pass, such as keyword matching, picks the candidates. The engine then answers one true or false relevance question per candidate, and Caudra orders, prunes, or names candidates by the probability it returns. The feature table above lists what each one sends.
+
+One request holds up to 16 candidates, each with an opaque ID such as `c00`. Larger lists go out as concurrent requests under one deadline. Candidate text is redacted and cut to a fixed size before it is sent, and every question tells the engine to treat the candidate as data rather than instructions. The request state, such as the query, task, or goal, stays within the 1,500-byte state limit.
+
+Enforcing features compare each probability with `thresholds.relevance_floor` (default `0.1`). Tool search and `code_context` only reorder, putting candidates at or above the floor first. `memory_search` omits matches below the floor and names them. `compaction_retention` keeps the same number of tool results as without the engine, choosing them by relevance, and never drops a result it could not otherwise drop. Advisory features name a candidate only at or above `thresholds.routing_confidence` (default `0.9`).
+
+When any request fails, is refused, times out, or is cancelled, or the decision service changes while it runs, the feature behaves as if it were `off`. In `shadow`, requests are sent and logged without effect. With `log = true`, an enforcing feature records `rerouted` when the order it used differs from the first pass, and an advisory feature records `advised` when it named a candidate. Workflows can rerank their own candidates with [`rerank()`](/docs/workflows/#reranking-candidates). See also [memory relevance](/docs/memory/#relevance-from-the-decision-engine).
 
 #### Question overrides
 

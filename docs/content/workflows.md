@@ -165,6 +165,7 @@ Everything after the metadata is ordinary Rhai with these host functions:
 | `complete()`, `complete(value)` | Ends the run with `value` as its result |
 | `write_scratch_file(name, content)` | Writes an artifact and returns its path |
 | `decide(state, questions)`, `decide(state, questions, opts)` | Calls the configured decision endpoint. Needs `experimental.decision_engine`. Returns `#{ answers, model }` |
+| `rerank(query, candidates)`, `rerank(query, candidates, opts)` | Orders candidates by relevance to `query` through the decision endpoint. Needs `experimental.decision_engine`. Returns `[#{ index, score }]`, best first |
 | `json_encode(value)` | Serializes a value to JSON text |
 | `budget()` | Returns `#{ issued, limit, remaining }` for the run's agent budget |
 | `args` | The launch arguments, or `()` when none were given |
@@ -214,7 +215,7 @@ Questions are keyed by ID. Supported types are `noul`, `choice`, and `score`. A 
 
 The OpenAI protocol maps `noul` questions to predicates and normalizes their answers back to the same `noul` probability. The script-facing result stays `#{ answers, model }`, so switching protocols does not change the example above. Native boolean questions retain their true and false criteria in the predicate instruction text. OpenAI choices require at least two options.
 
-The optional third argument accepts `model` and `timeout_ms`. A positive timeout is capped at the configured decision deadline. States are redacted and bounded to 1,500 serialized bytes, with depth and node limits. Oversized states are rejected rather than silently shortened. Dynamic question descriptions are also redacted. A question is rejected if redaction would change an option name, a score level, or a question ID. Redaction is best effort, so keep credentials and sensitive material out of both states and questions.
+The optional third argument accepts `model` and `timeout_ms`. Without a timeout, a call uses `timeout_ms` from the [decisions configuration](/docs/configuration/#decisions). A positive timeout is capped at the larger of `timeout_ms` and `rerank_timeout_ms`. States are redacted and bounded to 1,500 serialized bytes, with depth and node limits. Oversized states are rejected rather than silently shortened. Dynamic question descriptions are also redacted. A question is rejected if redaction would change an option name, a score level, or a question ID. Redaction is best effort, so keep credentials and sensitive material out of both states and questions.
 
 Endpoint errors, refusals, and timeouts are catchable Rhai errors. A refused answer fails the whole evaluation without returning partial answers. A successful result is saved before the script continues and replayed on resume without another endpoint call. Calls that failed or were interrupted before their result was committed can run again. The workflow journal omits the decision request body. The separate opt-in decision log stores the redacted state that was sent, questions, and answers. Workflow effects remain `none` there, even if the script acts on an answer.
 
@@ -223,6 +224,36 @@ While the engine switch is off, a new `decide()` call raises a catchable error b
 Decision calls count against the host-call limit, not the agent budget. Their answers are data for the script. They do not grant permissions or change an agent's execution mode.
 
 Explicit `decide()` state is separate from passive subagent routing. The passive router sees the task label, mode, and profile, plus a redacted excerpt of the prompt rather than the full prompt. An explicit `model_job` or profile model pin takes precedence over passive routing.
+
+### Reranking candidates
+
+`rerank()` asks the decision endpoint how relevant each candidate is to a query and returns the candidates best first. It needs the same switches and endpoint as `decide()`.
+
+```rhai
+let files = ["src/parser.rs", "src/lexer.rs", "docs/parser.md", "src/config.rs"];
+let picked = [];
+for entry in rerank(args.objective, files, #{ threshold: 0.5, top_k: 2 }) {
+    picked.push(files[entry.index]);
+}
+complete(picked);
+```
+
+`query` is a non-empty string. `candidates` is an array of strings or maps. A map is sent as candidate data, so one candidate can carry a path and an excerpt together. Each candidate becomes one `noul` question that asks whether it is relevant to the query and frames the candidate as untrusted data to judge rather than instructions to follow. The state of every call is `#{ query }`.
+
+The result holds one `#{ index, score }` for each kept candidate. `index` is the position in `candidates`, and `score` is the `noul` probability. Entries are sorted by score, highest first, and equal scores keep their input order. An empty `candidates` array returns `[]` without calling the endpoint.
+
+Candidates go out in batches of 16. Each batch is one decision call with its own journal entry, and the batches run one after another. A resumed run replays the batches that were already committed and asks only for the rest. Each batch counts as one host call.
+
+| Option | Meaning |
+|--------|---------|
+| `model` | The decision model, as for `decide()` |
+| `timeout_ms` | A positive deadline for each batch, capped as for `decide()`. Long candidate lists may need `rerank_timeout_ms` |
+| `threshold` | Drops candidates that score below this number, from 0 to 1 |
+| `top_k` | Keeps at most this many candidates after the threshold |
+
+`threshold` and `top_k` apply after the answers arrive, so changing them does not change the recorded requests. An unknown or invalid option, a query that is not a string, or a candidate that is neither a string nor a map raises a catchable error before any call is made.
+
+Each candidate is redacted and bounded like a state, to 1,500 serialized bytes together with the fixed relevance question. An oversized candidate fails its batch with a catchable error rather than being shortened. Endpoint errors, refusals, and timeouts are catchable as for `decide()`, and one refused batch fails the whole `rerank()` call. Like `decide()` answers, scores are data for the script and do not grant permissions.
 
 ### Spending the budget
 

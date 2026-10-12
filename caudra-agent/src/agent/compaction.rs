@@ -1,3 +1,5 @@
+pub(super) mod retention;
+
 use std::borrow::Cow;
 use std::env;
 use std::slice;
@@ -15,6 +17,8 @@ use caudra_providers::{
 use caudra_storage::usage_ledger::LedgerPurpose;
 use tracing::{info, warn};
 
+pub use self::retention::Retention;
+use self::retention::{RetentionPlan, rank_tool_results};
 use super::history::{History, is_user_turn, remove_orphaned_tool_results, repair_tool_pairs};
 use super::requirements::{
     self, REQUIREMENTS_MARKER, REQUIREMENTS_OUTPUT_TOKENS, RequirementsInput,
@@ -120,6 +124,7 @@ pub(super) struct CompactionContext<'a> {
     pub retry_now: &'a Nudge,
     pub config: &'a AgentConfig,
     pub extractor: Option<&'a SideModel>,
+    pub retention: Option<Retention>,
     pub session: Option<BackgroundReminderContext<'a>>,
 }
 
@@ -135,6 +140,7 @@ pub(super) async fn compact_history(
         retry_now,
         config,
         extractor,
+        retention,
         session,
     } = context;
     let had_background = session
@@ -152,7 +158,11 @@ pub(super) async fn compact_history(
         .iter_mut()
         .for_each(Message::detach_documents);
     strip_thinking(&mut compaction_history);
-    strip_old_tool_results(&mut compaction_history);
+    let plan = match &retention {
+        Some(retention) => rank_tool_results(&compaction_history, retention, cancel).await,
+        None => None,
+    };
+    strip_old_tool_results(&mut compaction_history, plan.as_ref());
     compaction_history.push(Message::user(summary_prompt(&compaction_history, config)));
     // Read before the summary runs and across every seam: the requirements
     // are what the user said, not what the last summary kept of it.
@@ -463,10 +473,12 @@ pub async fn compact(
         config,
         extractor,
         BackgroundReminderContext::default(),
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn compact_with_session(
     provider: &dyn Provider,
     model: &Model,
@@ -475,6 +487,7 @@ pub async fn compact_with_session(
     config: &AgentConfig,
     extractor: Option<&SideModel>,
     session: BackgroundReminderContext<'_>,
+    retention: Option<Retention>,
 ) -> Result<CompactionSpend, AgentError> {
     event_tx.send(AgentEvent::Compacting)?;
     let cancel = CancelToken::none();
@@ -488,6 +501,7 @@ pub async fn compact_with_session(
             retry_now: &Nudge::default(),
             config,
             extractor,
+            retention,
             session: Some(session),
         },
     )
@@ -592,7 +606,7 @@ fn strip_invalidated_thinking(tail: &mut Vec<Message>) {
     });
 }
 
-fn strip_old_tool_results(messages: &mut [Message]) {
+fn strip_old_tool_results(messages: &mut [Message], plan: Option<&RetentionPlan>) {
     let mut seen = 0;
     for message in messages.iter_mut().rev() {
         for block in message.content.iter_mut().rev() {
@@ -602,7 +616,9 @@ fn strip_old_tool_results(messages: &mut [Message]) {
                 ..
             } = block
             {
-                if seen < KEEP_LAST_TOOL_RESULTS {
+                if let Some(excerpt) = plan.and_then(|plan| plan.excerpt(seen)) {
+                    excerpt.clone_into(content);
+                } else if plan.map_or(seen < KEEP_LAST_TOOL_RESULTS, |plan| plan.keeps(seen)) {
                     bound_retained_tool_result(content, output_ref.as_ref());
                 } else {
                     *content = output_ref.as_ref().map_or_else(
@@ -1508,6 +1524,7 @@ mod tests {
                     retry_now: &Nudge::default(),
                     config: &AgentConfig::default(),
                     extractor: None,
+                    retention: None,
                     session: None,
                 },
             )
@@ -1711,7 +1728,7 @@ mod tests {
             ],
             ..Default::default()
         }];
-        strip_old_tool_results(&mut messages);
+        strip_old_tool_results(&mut messages, None);
         assert_eq!(messages[0].content.len(), 6);
         assert!(
             matches!(&messages[0].content[0], ContentBlock::ToolResult { content, tool_use_id, .. } if content == TOOL_RESULT_PLACEHOLDER && tool_use_id == "t1")
@@ -1753,7 +1770,7 @@ mod tests {
             ..Default::default()
         }];
 
-        strip_old_tool_results(&mut messages);
+        strip_old_tool_results(&mut messages, None);
 
         assert!(matches!(
             &messages[0].content[0],
@@ -1784,7 +1801,7 @@ mod tests {
             ..Default::default()
         }];
 
-        strip_old_tool_results(&mut messages);
+        strip_old_tool_results(&mut messages, None);
 
         let ContentBlock::ToolResult { content, .. } = &messages[0].content[0] else {
             unreachable!();
@@ -1813,7 +1830,7 @@ mod tests {
             ..Default::default()
         }];
 
-        strip_old_tool_results(&mut messages);
+        strip_old_tool_results(&mut messages, None);
 
         assert!(matches!(
             &messages[0].content[0],
@@ -1961,6 +1978,7 @@ mod tests {
                     retry_now: &Nudge::default(),
                     config: &AgentConfig::default(),
                     extractor: None,
+                    retention: None,
                     session: None,
                 },
             )
@@ -2010,6 +2028,7 @@ mod tests {
                     retry_now: &Nudge::default(),
                     config: &AgentConfig::default(),
                     extractor: None,
+                    retention: None,
                     session: None,
                 },
             )

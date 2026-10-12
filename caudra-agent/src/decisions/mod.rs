@@ -1,9 +1,12 @@
+mod code_context;
 mod content;
 #[cfg(test)]
 mod eval;
+pub(crate) mod output_pointers;
 mod permission;
 pub(crate) mod question_tool_nudge;
 pub(crate) mod questions;
+mod rerank;
 pub(crate) mod shell_duration;
 mod shell_effect;
 mod state;
@@ -37,9 +40,14 @@ use url::{Host, Url};
 
 use shell_duration::ShellDurationCache;
 
+pub use code_context::{CodeSymbol, reordered_note, rerank_code_context};
 pub use permission::{PermissionAction, PermissionDecision, PermissionFlag, PermissionPurpose};
+pub use rerank::{
+    CANDIDATE_KEY, CANDIDATE_TEXT_OMITTED, MAX_CANDIDATE_INPUT_BYTES, MAX_RERANK_BATCH, Relevance,
+    Rerank, Reranked, candidate_text, changed_from,
+};
 pub use state::{DecisionState, DecisionStateError};
-pub(crate) use state::{push_fitting, redact_decision_text, redacted_excerpt};
+pub(crate) use state::{push_fitting, redact_decision_text, redacted_excerpt, redacted_leaves};
 
 const CACHE_ENTRIES: usize = 128;
 const STATE_REJECTED: &str = "state exceeds the bounded redacted context";
@@ -61,11 +69,17 @@ pub enum DecisionFeature {
     GoalPrescreen,
     SubagentRouting,
     QuestionToolNudge,
+    MemorySearch,
+    MemoryRecall,
+    MemoryDuplicates,
+    CompactionRetention,
+    OutputPointers,
+    CodeContext,
 }
 
 impl DecisionFeature {
     /// Configured features in `[decisions.features]` order, then workflow.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 17] = [
         Self::PermissionAdvice,
         Self::AutoScreening,
         Self::ShellEffect,
@@ -76,6 +90,12 @@ impl DecisionFeature {
         Self::GoalPrescreen,
         Self::SubagentRouting,
         Self::QuestionToolNudge,
+        Self::MemorySearch,
+        Self::MemoryRecall,
+        Self::MemoryDuplicates,
+        Self::CompactionRetention,
+        Self::OutputPointers,
+        Self::CodeContext,
         Self::Workflow,
     ];
 
@@ -94,6 +114,12 @@ impl DecisionFeature {
             Self::GoalPrescreen => "goal",
             Self::SubagentRouting => "subagent_routing",
             Self::QuestionToolNudge => "question_tool_nudge",
+            Self::MemorySearch => "memory_search",
+            Self::MemoryRecall => "memory_recall",
+            Self::MemoryDuplicates => "memory_duplicates",
+            Self::CompactionRetention => "compaction_retention",
+            Self::OutputPointers => "output_pointers",
+            Self::CodeContext => "code_context",
         }
     }
 
@@ -112,6 +138,12 @@ impl DecisionFeature {
             Self::GoalPrescreen => Some("goal_prescreen"),
             Self::SubagentRouting => Some("subagent_routing"),
             Self::QuestionToolNudge => Some("question_tool_nudge"),
+            Self::MemorySearch => Some("memory_search"),
+            Self::MemoryRecall => Some("memory_recall"),
+            Self::MemoryDuplicates => Some("memory_duplicates"),
+            Self::CompactionRetention => Some("compaction_retention"),
+            Self::OutputPointers => Some("output_pointers"),
+            Self::CodeContext => Some("code_context"),
         }
     }
 
@@ -136,6 +168,62 @@ impl DecisionFeature {
             Self::GoalPrescreen => &features.goal_prescreen,
             Self::SubagentRouting => &features.subagent_routing,
             Self::QuestionToolNudge => &features.question_tool_nudge,
+            Self::MemorySearch => &features.memory_search,
+            Self::MemoryRecall => &features.memory_recall,
+            Self::MemoryDuplicates => &features.memory_duplicates,
+            Self::CompactionRetention => &features.compaction_retention,
+            Self::OutputPointers => &features.output_pointers,
+            Self::CodeContext => &features.code_context,
+        }
+    }
+
+    /// The deadline ceiling for one request. Memory recall keeps the general
+    /// deadline because it delays the start of a turn; a workflow may ask for
+    /// either budget.
+    pub fn timeout_ms(&self, config: &DecisionsConfig) -> u64 {
+        match self {
+            Self::Workflow => config.timeout_ms.max(config.rerank_timeout_ms),
+            Self::ToolSearch
+            | Self::MemorySearch
+            | Self::MemoryDuplicates
+            | Self::CompactionRetention
+            | Self::OutputPointers
+            | Self::CodeContext => config.rerank_timeout_ms,
+            Self::PermissionAdvice
+            | Self::AutoScreening
+            | Self::ShellEffect
+            | Self::ContentScreening
+            | Self::ShellDuration
+            | Self::SkillSuggestions
+            | Self::GoalPrescreen
+            | Self::SubagentRouting
+            | Self::QuestionToolNudge
+            | Self::MemoryRecall => config.timeout_ms,
+        }
+    }
+
+    /// The relevance probability a reranked candidate needs before the
+    /// feature acts on it: the floor for enforcing surfaces, the routing
+    /// confidence for advice.
+    pub fn rerank_threshold(&self, thresholds: &DecisionThresholds) -> Option<f64> {
+        match self {
+            Self::ToolSearch
+            | Self::MemorySearch
+            | Self::CompactionRetention
+            | Self::CodeContext => Some(thresholds.relevance_floor),
+            Self::MemoryRecall | Self::MemoryDuplicates | Self::OutputPointers => {
+                Some(thresholds.routing_confidence)
+            }
+            Self::Workflow
+            | Self::PermissionAdvice
+            | Self::AutoScreening
+            | Self::ShellEffect
+            | Self::ContentScreening
+            | Self::ShellDuration
+            | Self::SkillSuggestions
+            | Self::GoalPrescreen
+            | Self::SubagentRouting
+            | Self::QuestionToolNudge => None,
         }
     }
 }
@@ -178,6 +266,12 @@ pub fn stats_thresholds(config: &DecisionThresholds, feature: &str) -> StatsThre
         && let Some(threshold) = config.shell_writes
     {
         overrides.insert(shell_effect::WRITES.into(), threshold);
+    } else if let Some(threshold) = DecisionFeature::ALL
+        .iter()
+        .find(|candidate| candidate.name() == feature)
+        .and_then(|candidate| candidate.rerank_threshold(config))
+    {
+        thresholds.default_noul = threshold;
     }
     thresholds
 }
@@ -395,15 +489,10 @@ impl Decisions {
             state: bounded.value().clone(),
             questions: questions.questions().clone(),
         };
+        let timeout_ms = feature.timeout_ms(self.config());
         Some(
-            self.run(
-                feature,
-                questions,
-                request,
-                context,
-                self.config().timeout_ms,
-            )
-            .await,
+            self.run(feature, questions, request, context, timeout_ms)
+                .await,
         )
     }
 
@@ -451,6 +540,7 @@ impl Decisions {
         timeout_ms: u64,
     ) -> DecisionOutcome {
         let started = Instant::now();
+        let timeout_ms = timeout_ms.min(feature.timeout_ms(self.config()));
         let result = self.call(&request, started, timeout_ms).await;
         let latency_ms = elapsed_ms(started);
         {
@@ -490,9 +580,7 @@ impl Decisions {
         timeout_ms: u64,
     ) -> Result<DecisionResponse, DecisionError> {
         let deadline = started
-            .checked_add(Duration::from_millis(
-                timeout_ms.min(self.config().timeout_ms),
-            ))
+            .checked_add(Duration::from_millis(timeout_ms))
             .ok_or(DecisionError::Rejected(DEADLINE_REJECTED))?;
         request.validate()?;
         if Instant::now() >= deadline {
@@ -759,6 +847,7 @@ mod tests {
     use async_trait::async_trait;
     use caudra_config::decisions::{
         DecisionFeatures, DecisionProtocol, DecisionThresholds, DecisionsConfig, FeatureMode,
+        RawDecisionsConfig,
     };
     use caudra_decision::wire::MAX_REQUEST_BYTES;
     use caudra_decision::{
@@ -798,6 +887,9 @@ mod tests {
     const REFUSED_ERROR: &str = "refused";
     const HTTP_TEST_CREDENTIAL_ENV: &str = "CAUDRA_DECISION_TEST_NO_CREDENTIAL";
     const HTTP_TEST_TIMEOUT_MESSAGE: &str = "decision HTTP integration test timed out";
+    const FEATURES_KEY: &str = "features";
+    const RELEVANCE_FLOOR: f64 = 0.2;
+    const ROUTING_CONFIDENCE: f64 = 0.8;
     static CHOICE_SET: LazyLock<Option<QuestionSet>> = LazyLock::new(|| {
         Some(QuestionSet::new("routing", serde_json::from_value(json!({
             "tool": {"type": "choice", "instructions": {"question": "Which tool fits?"}, "criteria": {"candidate_0": "Reads files", "none": "No match"}},
@@ -1483,6 +1575,81 @@ mod tests {
                 escalates
             );
         });
+    }
+
+    #[test_case(DecisionFeature::AutoScreening, false; "auto_screening")]
+    #[test_case(DecisionFeature::QuestionToolNudge, false; "question_tool_nudge")]
+    #[test_case(DecisionFeature::MemoryRecall, false; "memory_recall_delays_the_turn")]
+    #[test_case(DecisionFeature::ToolSearch, true; "tool_search")]
+    #[test_case(DecisionFeature::MemorySearch, true; "memory_search")]
+    #[test_case(DecisionFeature::MemoryDuplicates, true; "memory_duplicates")]
+    #[test_case(DecisionFeature::CompactionRetention, true; "compaction_retention")]
+    #[test_case(DecisionFeature::OutputPointers, true; "output_pointers")]
+    #[test_case(DecisionFeature::CodeContext, true; "code_context")]
+    fn pending_engine_cannot_escape_the_feature_budget(feature: DecisionFeature, rerank: bool) {
+        smol::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (timeout_ms, rerank_timeout_ms) = match rerank {
+                true => (TEST_NORMAL_TIMEOUT_MS, TEST_TIMEOUT_MS),
+                false => (TEST_TIMEOUT_MS, TEST_NORMAL_TIMEOUT_MS),
+            };
+            let features: RawDecisionsConfig = serde_json::from_value(json!({
+                FEATURES_KEY: {feature.config_key().unwrap(): FeatureMode::Shadow.as_str()},
+            }))
+            .unwrap();
+            let config = DecisionsConfig {
+                timeout_ms,
+                rerank_timeout_ms,
+                features: features.resolve(None).unwrap().features,
+                ..config(false)
+            };
+            assert_eq!(feature.timeout_ms(&config), TEST_TIMEOUT_MS);
+            assert_eq!(
+                DecisionFeature::Workflow.timeout_ms(&config),
+                TEST_NORMAL_TIMEOUT_MS
+            );
+            let service = Decisions::with_engine(
+                config,
+                &StateDir::from_path(root.path().into()),
+                FakeEngine {
+                    requests: Arc::default(),
+                    behavior: Behavior::Pending,
+                },
+            )
+            .unwrap();
+            let outcome = service
+                .evaluate(
+                    feature,
+                    &json!({"command": "pwd"}),
+                    &Decisions::permission_questions().unwrap(),
+                    &DecisionContext::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome.result.unwrap_err(), DecisionError::Timeout);
+            assert!(outcome.latency_ms < TEST_NORMAL_TIMEOUT_MS);
+        });
+    }
+
+    #[test_case(DecisionFeature::MemorySearch, Some(RELEVANCE_FLOOR); "enforcing_rerank_uses_the_floor")]
+    #[test_case(DecisionFeature::CodeContext, Some(RELEVANCE_FLOOR); "code_context_uses_the_floor")]
+    #[test_case(DecisionFeature::ToolSearch, Some(RELEVANCE_FLOOR); "tool_search_uses_the_floor")]
+    #[test_case(DecisionFeature::OutputPointers, Some(ROUTING_CONFIDENCE); "advice_uses_routing_confidence")]
+    #[test_case(DecisionFeature::SkillSuggestions, None; "choice_features_keep_the_default")]
+    fn rerank_stats_score_candidates_at_the_acting_threshold(
+        feature: DecisionFeature,
+        threshold: Option<f64>,
+    ) {
+        let config = DecisionThresholds {
+            relevance_floor: RELEVANCE_FLOOR,
+            routing_confidence: ROUTING_CONFIDENCE,
+            ..Default::default()
+        };
+        assert_eq!(feature.rerank_threshold(&config), threshold);
+        assert_eq!(
+            stats_thresholds(&config, feature.name()).default_noul,
+            threshold.unwrap_or(StatsThresholds::default().default_noul)
+        );
     }
 
     #[test_case(Behavior::Answer(0.0), false; "approval_is_not_an_allow")]

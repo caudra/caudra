@@ -1,3 +1,4 @@
+use std::ops::{Range, RangeInclusive};
 use std::sync::{Arc, LazyLock};
 use std::thread;
 
@@ -78,6 +79,14 @@ fn reclaim_orphans(store: &ToolOutputStore, state_dir: &StateDir) {
     }
 }
 
+/// The text a saved result's preview was cut from, numbered as the stored copy
+/// is, and the 1-indexed lines the preview left out. A line the preview shows
+/// only part of counts as left out.
+pub(crate) struct Omitted {
+    pub(crate) text: String,
+    pub(crate) lines: RangeInclusive<usize>,
+}
+
 pub(crate) fn default_store() -> Option<Arc<ToolOutputStore>> {
     DEFAULT_STORE.clone()
 }
@@ -108,11 +117,14 @@ pub(crate) fn shell_output_label(command: &str) -> String {
     }
 }
 
+/// Bounds `done` to its limits, saving the full text when it is cut or large.
+/// Returns what was left out when the preview cut a freshly saved text and
+/// its lines are known exactly.
 pub(crate) async fn limit_named(
     done: &mut ToolDoneEvent,
     ctx: &ToolContext,
     producer: Option<&str>,
-) {
+) -> Option<Omitted> {
     let limits = effective_limits(done.output_limits, &ctx.config);
     let pre_persisted = done.model_output_from_ref;
     let pre_persisted_load = if pre_persisted {
@@ -127,7 +139,7 @@ pub(crate) async fn limit_named(
     if !oversized
         && (pre_persisted || done.is_error || full_model_output.len() <= PERSIST_THRESHOLD_BYTES)
     {
-        return;
+        return None;
     }
 
     let producer = producer.unwrap_or(&done.tool);
@@ -150,7 +162,7 @@ pub(crate) async fn limit_named(
         output_ref
     };
     if !oversized {
-        return;
+        return None;
     }
 
     let marker = marker(
@@ -170,7 +182,7 @@ pub(crate) async fn limit_named(
         source.truncate(source.trim_end_matches(['\r', '\n']).len());
     }
     let trailer = suffix.map_or_else(String::new, |suffix| format!("\n\n{suffix}"));
-    let body = preview_body(
+    let (body, omitted) = preview_body(
         &source,
         &marker,
         &trailer,
@@ -178,7 +190,8 @@ pub(crate) async fn limit_named(
         limits.max_bytes,
     );
     let composed = format!("{body}{trailer}");
-    done.model_output = Some(if fits(&composed, limits.max_lines, limits.max_bytes) {
+    let previewed = fits(&composed, limits.max_lines, limits.max_bytes);
+    done.model_output = Some(if previewed {
         body
     } else {
         done.model_suffix = None;
@@ -191,6 +204,13 @@ pub(crate) async fn limit_named(
         limits.max_bytes,
         matches!(pre_persisted_load, PrePersistedLoad::Preview),
     );
+    let lines = omitted
+        .filter(|_| previewed && !pre_persisted && output_ref.is_some())
+        .and_then(|bytes| omitted_lines(&source, bytes))?;
+    Some(Omitted {
+        text: source,
+        lines,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -348,18 +368,18 @@ fn bound_presentation(
 
     match output {
         ToolOutput::Index(IndexOutput::File { skeleton, .. }) => {
-            *skeleton = preview_body(&rendered, marker, "", max_lines, max_bytes);
+            *skeleton = preview_body(&rendered, marker, "", max_lines, max_bytes).0;
         }
         ToolOutput::Index(IndexOutput::Directory { listing, .. }) => {
-            *listing = preview_body(&rendered, marker, "", max_lines, max_bytes);
+            *listing = preview_body(&rendered, marker, "", max_lines, max_bytes).0;
         }
         ToolOutput::Batch { text, .. } => {
-            *text = preview_body(&rendered, marker, "", max_lines, max_bytes);
+            *text = preview_body(&rendered, marker, "", max_lines, max_bytes).0;
         }
         // Cut from the pretty form, so what survives still breaks into lines a
         // card can colour one at a time.
         ToolOutput::Mcp(output) => {
-            let text = preview_body(&output.display_text(), marker, "", max_lines, max_bytes);
+            let text = preview_body(&output.display_text(), marker, "", max_lines, max_bytes).0;
             output.blocks = vec![McpBlock::Excerpt { text }];
         }
         ToolOutput::Plain(text) | ToolOutput::Markdown(text) | ToolOutput::ReadDir(text) => {
@@ -367,9 +387,9 @@ fn bound_presentation(
             let trailer = rendered.strip_prefix(&source).unwrap_or_default();
             let ending = format!("{marker}{trailer}");
             if fits(&ending, max_lines, max_bytes) {
-                text.text = preview_body(&source, marker, trailer, max_lines, max_bytes);
+                text.text = preview_body(&source, marker, trailer, max_lines, max_bytes).0;
             } else {
-                text.text = preview_body(&rendered, marker, "", max_lines, max_bytes);
+                text.text = preview_body(&rendered, marker, "", max_lines, max_bytes).0;
                 text.instructions = None;
             }
         }
@@ -386,23 +406,26 @@ fn text_output_mut(output: &mut ToolOutput) -> Option<&mut TextOutput> {
     }
 }
 
+/// The preview of `source`, and the bytes of `source` it leaves out between
+/// its head and tail. `None` when the preview is only the marker.
 fn preview_body(
     source: &str,
     marker: &str,
     trailer: &str,
     max_lines: usize,
     max_bytes: usize,
-) -> String {
+) -> (String, Option<Range<usize>>) {
     let ending = format!("{marker}{trailer}");
     if !fits(&ending, max_lines, max_bytes) {
-        return hard_bound(marker, max_lines, max_bytes);
+        return (hard_bound(marker, max_lines, max_bytes), None);
     }
 
+    let leading = source.len() - source.trim_start_matches(['\r', '\n']).len();
     let source = source.trim_matches(['\r', '\n']);
     let source_line_budget = max_lines.saturating_sub(line_count(&ending).saturating_add(2));
     let source_byte_budget = max_bytes.saturating_sub(ending.len().saturating_add(7));
     if source.is_empty() || source_line_budget < 2 || source_byte_budget < 2 {
-        return marker.to_owned();
+        return (marker.to_owned(), None);
     }
 
     let head_line_budget = source_line_budget.div_ceil(2);
@@ -412,15 +435,40 @@ fn preview_body(
     let head = head(source, head_line_budget, head_byte_budget);
     let tail = tail(source, tail_line_budget, tail_byte_budget);
     if head.is_empty() || tail.is_empty() {
-        return marker.to_owned();
+        return (marker.to_owned(), None);
     }
 
     let preview = format!("{head}\n...\n{tail}\n\n{marker}");
     if fits(&(preview.clone() + trailer), max_lines, max_bytes) {
-        preview
+        let omitted = leading + head.len()..leading + source.len() - tail.len();
+        (preview, Some(omitted))
     } else {
-        marker.to_owned()
+        (marker.to_owned(), None)
     }
+}
+
+/// The lines of `text` that `bytes` touches, leaving out the line the head
+/// ends on when only its line break was cut and the line the tail starts at
+/// when it starts whole.
+fn omitted_lines(text: &str, bytes: Range<usize>) -> Option<RangeInclusive<usize>> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let before = newlines(&text[..bytes.start]);
+    let head_line_whole = text[bytes.start..]
+        .trim_start_matches('\r')
+        .starts_with('\n');
+    let first = before + 1 + usize::from(head_line_whole);
+    let through = before + newlines(&text[bytes.clone()]);
+    let last = match text[..bytes.end].ends_with('\n') {
+        true => through,
+        false => through + 1,
+    };
+    (first <= last).then_some(first..=last)
+}
+
+fn newlines(text: &str) -> usize {
+    text.bytes().filter(|byte| *byte == b'\n').count()
 }
 
 fn head(source: &str, max_lines: usize, max_bytes: usize) -> &str {
@@ -500,6 +548,14 @@ mod tests {
     const LARGE_BYTE_LIMIT: usize = 100_000;
     const ROSTER_LOST: &str = "an oversized batch must keep the roster its card is drawn from";
     const SHAPE_LOST: &str = "an oversized result must keep the variant its card is drawn from";
+    const PREVIEW_GAP: &str = "\n...\n";
+    const MARKER_GAP: &str = "\n\n";
+    const LINE_BREAKS: [char; 2] = ['\r', '\n'];
+    const NUMBERED_LINES: usize = 30;
+    const TIGHT_LINES: usize = 7;
+    const WIDE_LINES: usize = 1_000;
+    const LONG_LINE_FILL: usize = 40;
+    const SUFFIX: &str = "model-only guidance";
 
     #[test_case("cargo test private_test_name --token=private", "cargo-test"; "ignores_arguments")]
     #[test_case("git status --short", "git-status"; "known_subcommand")]
@@ -1331,5 +1387,154 @@ mod tests {
         assert!(done.is_error);
         assert!(done.output_ref.is_none());
         assert!(done.model_output.is_none());
+    }
+
+    fn numbered(lines: usize, fill: usize, separator: &str) -> String {
+        (0..lines)
+            .map(|line| format!("line-{line}-{}", "x".repeat(fill)))
+            .collect::<Vec<_>>()
+            .join(separator)
+    }
+
+    /// Every line outside `omitted` is shown whole, and the preview's head and
+    /// tail reach no further into the text than the range's edge lines.
+    fn assert_only_omitted_lines_are_hidden(
+        text: &str,
+        preview: &str,
+        omitted: &RangeInclusive<usize>,
+    ) {
+        let lines: Vec<&str> = text.split('\n').collect();
+        let (head, rest) = preview.split_once(PREVIEW_GAP).unwrap();
+        let (tail, _) = rest.rsplit_once(MARKER_GAP).unwrap();
+        let shown_before = lines[..omitted.start() - 1].join("\n");
+        let through_first = lines[..*omitted.start()].join("\n");
+        assert!(head.starts_with(shown_before.trim_matches(LINE_BREAKS)));
+        assert!(through_first.trim_matches(LINE_BREAKS).starts_with(head));
+        let shown_after = lines[*omitted.end()..].join("\n");
+        let from_last = lines[omitted.end() - 1..].join("\n");
+        assert!(tail.ends_with(shown_after.trim_matches(LINE_BREAKS)));
+        assert!(from_last.trim_matches(LINE_BREAKS).ends_with(tail));
+    }
+
+    fn limited(
+        text: String,
+        suffix: Option<&str>,
+        max_lines: usize,
+        max_bytes: usize,
+    ) -> (ToolDoneEvent, Option<Omitted>, String) {
+        let temp = TempDir::new().unwrap();
+        let (ctx, store, session) = stored_context(&temp, max_lines, max_bytes);
+        let mut event = done(text, false).with_model_suffix(suffix.map(str::to_owned));
+        let omitted = smol::block_on(limit_named(&mut event, &ctx, None));
+        let stored = event
+            .output_ref
+            .as_ref()
+            .map_or_else(String::new, |output_ref| {
+                store
+                    .load_text(session.id(), output_ref.id.clone())
+                    .unwrap()
+            });
+        (event, omitted, stored)
+    }
+
+    #[test_case("", "\n", 3..=28; "lf")]
+    #[test_case("", "\r\n", 3..=28; "crlf")]
+    #[test_case("\n\n", "\n", 5..=30; "leading_blank_lines")]
+    #[test_case("\r\n\r\n", "\r\n", 5..=30; "leading_blank_crlf_lines")]
+    fn line_cuts_report_the_omitted_stored_lines(
+        leading: &str,
+        separator: &str,
+        expected: RangeInclusive<usize>,
+    ) {
+        let text = format!("{leading}{}", numbered(NUMBERED_LINES, 0, separator));
+        let (event, omitted, stored) = limited(text.clone(), None, TIGHT_LINES, LARGE_BYTE_LIMIT);
+        let omitted = omitted.unwrap();
+        assert_eq!(omitted.lines, expected);
+        assert_eq!(omitted.text, text);
+        assert_eq!(stored, text);
+        assert_only_omitted_lines_are_hidden(
+            &text,
+            event.model_output.as_deref().unwrap(),
+            &omitted.lines,
+        );
+    }
+
+    #[test_case(numbered(NUMBERED_LINES, LONG_LINE_FILL, "\n"), 360; "lines_cut_mid_line")]
+    #[test_case(numbered(NUMBERED_LINES, LONG_LINE_FILL, "\r\n"), 361; "crlf_lines_cut_mid_line")]
+    #[test_case(format!("\n\n{}", numbered(NUMBERED_LINES, LONG_LINE_FILL, "\n")), 362; "leading_blank_lines_cut_mid_line")]
+    #[test_case(format!("start-{}\n{}\n-end", "蟹".repeat(400), "蟹\n".repeat(20)), 241; "utf8")]
+    #[test_case(format!("HEAD{}TAIL", "x".repeat(1_000)), 240; "one_line")]
+    fn byte_cuts_count_partly_shown_edge_lines_as_omitted(text: String, max_bytes: usize) {
+        let (event, omitted, _) = limited(text.clone(), None, WIDE_LINES, max_bytes);
+        let omitted = omitted.unwrap();
+        let preview = event.model_output.as_deref().unwrap();
+        assert!(preview.len() <= max_bytes);
+        assert_only_omitted_lines_are_hidden(&text, preview, &omitted.lines);
+    }
+
+    #[test]
+    fn a_suffix_keeps_lines_numbered_from_the_start_of_the_stored_text() {
+        let text = numbered(NUMBERED_LINES, 0, "\n");
+        let (event, omitted, stored) = limited(
+            format!("{text}\n"),
+            Some(SUFFIX),
+            TIGHT_LINES + 2,
+            LARGE_BYTE_LIMIT,
+        );
+        let omitted = omitted.unwrap();
+        assert_eq!(omitted.text, text);
+        assert_eq!(stored, format!("{text}{MARKER_GAP}{SUFFIX}"));
+        assert_only_omitted_lines_are_hidden(
+            &text,
+            event.model_output.as_deref().unwrap(),
+            &omitted.lines,
+        );
+    }
+
+    #[test_case("x\n".repeat(5_000), None, WIDE_LINES * 10, LARGE_BYTE_LIMIT; "saved_but_not_cut")]
+    #[test_case("line\n".repeat(200), Some("guidance ".repeat(100)), 9, 420; "hard_bound")]
+    #[test_case("x".repeat(2_000), None, 4, 360; "marker_only")]
+    fn no_exact_preview_reports_no_lines(
+        text: String,
+        suffix: Option<String>,
+        max_lines: usize,
+        max_bytes: usize,
+    ) {
+        let (event, omitted, _) = limited(text, suffix.as_deref(), max_lines, max_bytes);
+        assert!(event.output_ref.is_some());
+        assert!(omitted.is_none());
+    }
+
+    #[test]
+    fn an_unsaved_output_reports_no_lines() {
+        let mut event = done(numbered(NUMBERED_LINES, 0, "\n"), false);
+        let ctx = context(TIGHT_LINES, LARGE_BYTE_LIMIT);
+        assert!(smol::block_on(limit_named(&mut event, &ctx, None)).is_none());
+        assert!(event.model_output.unwrap().contains(PREVIEW_GAP));
+    }
+
+    #[test]
+    fn a_pre_persisted_output_reports_no_lines() {
+        let temp = TempDir::new().unwrap();
+        let (ctx, store, session) = stored_context(&temp, TIGHT_LINES, LARGE_BYTE_LIMIT);
+        let text = numbered(NUMBERED_LINES, 0, "\n");
+        let mut event = done(String::new(), false);
+        event.output_ref = Some(store.put(session.id(), &text).unwrap());
+        event.model_output_from_ref = true;
+        assert!(smol::block_on(limit_named(&mut event, &ctx, None)).is_none());
+    }
+
+    #[test_case("ab\ncd", 1..4, Some(1..=2); "both_edges_partial")]
+    #[test_case("ab\ncd\nef", 2..6, Some(2..=2); "whole_edge_lines")]
+    #[test_case("ab\r\ncd\r\nef", 2..8, Some(2..=2); "whole_crlf_edge_lines")]
+    #[test_case("ab\r\ncd", 2..4, None; "only_a_line_break")]
+    #[test_case("ab\rcd\nef", 2..5, Some(1..=1); "carriage_return_inside_a_line")]
+    #[test_case("abcdef", 3..3, None; "empty")]
+    fn omitted_bytes_map_to_lines(
+        text: &str,
+        bytes: Range<usize>,
+        expected: Option<RangeInclusive<usize>>,
+    ) {
+        assert_eq!(omitted_lines(text, bytes), expected);
     }
 }

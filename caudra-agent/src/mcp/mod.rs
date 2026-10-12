@@ -440,7 +440,7 @@ pub struct PreparedMcpSearch<'a> {
     session: &'a McpSession,
     query: &'a str,
     declaring: McpRequestSnapshot,
-    ranking: Option<ToolSearchRanking<'a>>,
+    ranking: Option<ToolSearchRanking>,
 }
 
 impl PreparedMcpSearch<'_> {
@@ -636,7 +636,7 @@ impl McpSession {
     pub async fn prepare_search_tools_with_decisions<'a>(
         &'a self,
         query: &'a str,
-        decisions: Option<&'a Decisions>,
+        decisions: Option<&Decisions>,
         context: &DecisionContext,
     ) -> Result<PreparedMcpSearch<'a>, String> {
         let declaring = self.request_snapshot();
@@ -719,7 +719,7 @@ impl McpSession {
         &self,
         query: &str,
         mut matches: Vec<(bool, usize, &ToolDescriptor)>,
-        ranking: Option<ToolSearchRanking<'_>>,
+        ranking: Option<ToolSearchRanking>,
     ) -> SearchOutcome {
         let mut guard = self.lock_loaded();
         let baseline: Vec<Arc<str>> = matches
@@ -729,7 +729,7 @@ impl McpSession {
             .map(|(_, _, tool)| Arc::from(tool.wire_name()))
             .collect();
         if let Some(ranking) = &ranking {
-            matches[..=ranking.index()].rotate_right(1);
+            ranking.reorder(&mut matches, |(_, _, tool)| tool.wire_name());
         }
         let mut hits: Vec<&str> = Vec::new();
         let mut overflow: Vec<&str> = Vec::new();
@@ -2219,7 +2219,7 @@ mod tests {
     use crate::tools::ToolAudience;
     use crate::tools::deferral::{
         TOOL_SEARCH_TOOL_NAME,
-        tests::{PENDING_CHOICE, SearchDecisions},
+        tests::{NO_CANDIDATE, PENDING_REPLY, RELEVANT, SearchDecisions},
     };
     use async_lock::Mutex as AsyncMutex;
     use caudra_config::decisions::FeatureMode;
@@ -2247,7 +2247,9 @@ mod tests {
     const REPLACEMENT_TOOL_NAME: &str = "srv.replacement";
     const TEST_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-6";
     const SEARCH_QUERY: &str = "inspect";
-    const LAST_SEARCH_CHOICE: &str = "candidate_5";
+    const FIRST_SEARCH_CANDIDATE: &str = "c00";
+    const SECOND_SEARCH_CANDIDATE: &str = "c01";
+    const LAST_SEARCH_CANDIDATE: &str = "c05";
     const RELOAD_SERVER: &str = "srv";
     const OTHER_SERVER: &str = "other";
     const FAKE_TOOL: &str = "tool";
@@ -3259,7 +3261,7 @@ mod tests {
 
     #[test]
     fn discarded_preparation_keeps_mcp_catalog_unloaded() {
-        let fixture = SearchDecisions::new(FeatureMode::Enforce, LAST_SEARCH_CHOICE, 1.0, 1.0);
+        let fixture = SearchDecisions::new(FeatureMode::Enforce, LAST_SEARCH_CANDIDATE, RELEVANT);
         let (_, session) = decision_search_session();
         let prepared = smol::block_on(session.prepare_search_tools_with_decisions(
             SEARCH_QUERY,
@@ -3283,7 +3285,7 @@ mod tests {
     #[test]
     fn cancelled_preparation_keeps_mcp_catalog_unloaded() {
         smol::block_on(async {
-            let fixture = SearchDecisions::new(FeatureMode::Enforce, PENDING_CHOICE, 1.0, 1.0);
+            let fixture = SearchDecisions::new(FeatureMode::Enforce, PENDING_REPLY, RELEVANT);
             let (_, session) = decision_search_session();
             let context = DecisionContext::default();
             let mut pending = Box::pin(session.prepare_search_tools_with_decisions(
@@ -3298,13 +3300,13 @@ mod tests {
         });
     }
 
-    #[test_case("candidate_0", false, false; "lexical_choice")]
-    #[test_case("candidate_1", false, false; "same_batch")]
-    #[test_case(LAST_SEARCH_CHOICE, false, true; "different_batch")]
-    #[test_case(LAST_SEARCH_CHOICE, true, false; "already_loaded_at_commit")]
-    #[test_case("none", false, false; "none_falls_back")]
-    fn mcp_commit_accounts_only_changed_new_loads(choice: &str, preload: bool, rerouted: bool) {
-        let fixture = SearchDecisions::new(FeatureMode::Enforce, choice, 1.0, 1.0);
+    #[test_case(FIRST_SEARCH_CANDIDATE, false, false; "lexical_choice")]
+    #[test_case(SECOND_SEARCH_CANDIDATE, false, false; "same_batch")]
+    #[test_case(LAST_SEARCH_CANDIDATE, false, true; "different_batch")]
+    #[test_case(LAST_SEARCH_CANDIDATE, true, false; "already_loaded_at_commit")]
+    #[test_case(NO_CANDIDATE, false, false; "nothing_relevant_falls_back")]
+    fn mcp_commit_accounts_only_changed_new_loads(favoured: &str, preload: bool, rerouted: bool) {
+        let fixture = SearchDecisions::new(FeatureMode::Enforce, favoured, RELEVANT);
         let (_, session) = decision_search_session();
         let lexical = session.fresh();
         let prepared = smol::block_on(session.prepare_search_tools_with_decisions(
@@ -3331,7 +3333,7 @@ mod tests {
 
     #[test]
     fn catalog_republication_after_preparation_commits_lexical_fallback() {
-        let fixture = SearchDecisions::new(FeatureMode::Enforce, LAST_SEARCH_CHOICE, 1.0, 1.0);
+        let fixture = SearchDecisions::new(FeatureMode::Enforce, LAST_SEARCH_CANDIDATE, RELEVANT);
         let (mut inner, session) = decision_search_session();
         let prepared = smol::block_on(session.prepare_search_tools_with_decisions(
             SEARCH_QUERY,
@@ -3353,7 +3355,7 @@ mod tests {
     #[test_case(FeatureMode::Shadow, false; "shadow_keeps_predicted_tool_unloaded")]
     #[test_case(FeatureMode::Off, false; "off_preserves_lexical")]
     fn decision_search_only_reorders_catalog_loads(mode: FeatureMode, ranked: bool) {
-        let fixture = SearchDecisions::new(mode, LAST_SEARCH_CHOICE, 1.0, 1.0);
+        let fixture = SearchDecisions::new(mode, LAST_SEARCH_CANDIDATE, RELEVANT);
         let (_, session) = decision_search_session();
         let outcome = smol::block_on(session.prepare_search_tools_with_decisions(
             SEARCH_QUERY,
@@ -3378,7 +3380,7 @@ mod tests {
     #[test_case(" SRV__TOOL_5 "; "wire")]
     #[test_case(" SRV.TOOL_5 "; "qualified")]
     fn exact_mcp_names_bypass_decisions(query: &str) {
-        let fixture = SearchDecisions::new(FeatureMode::Enforce, "candidate_0", 1.0, 1.0);
+        let fixture = SearchDecisions::new(FeatureMode::Enforce, FIRST_SEARCH_CANDIDATE, RELEVANT);
         let (_, session) = decision_search_session();
         assert!(session.has_exact_match(query));
         let outcome = smol::block_on(session.prepare_search_tools_with_decisions(
@@ -3395,7 +3397,7 @@ mod tests {
     #[test_case("srv.tool_5"; "individual")]
     #[test_case("srv.*"; "server")]
     fn disabled_mcp_tools_never_enter_decision_shortlist(disabled: &str) {
-        let fixture = SearchDecisions::new(FeatureMode::Enforce, "candidate_0", 1.0, 1.0);
+        let fixture = SearchDecisions::new(FeatureMode::Enforce, FIRST_SEARCH_CANDIDATE, RELEVANT);
         let (_, session) = decision_search_session();
         let session = session.with_disabled_tools(&[disabled.into()]);
         assert!(!session.has_exact_match("tool_5"));
@@ -3435,9 +3437,8 @@ mod tests {
         let index = session.handle.index.clone();
         let fixture = SearchDecisions::with_hook(
             FeatureMode::Enforce,
-            LAST_SEARCH_CHOICE,
-            1.0,
-            1.0,
+            LAST_SEARCH_CANDIDATE,
+            RELEVANT,
             Some(Box::new(move || {
                 index.store(replacement_index.load_full());
             })),

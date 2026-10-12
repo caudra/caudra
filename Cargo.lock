@@ -1444,6 +1444,7 @@ dependencies = [
  "caudra-agent",
  "caudra-automation",
  "caudra-config",
+ "caudra-decision",
  "caudra-storage",
  "caudra-terminal-host",
  "caudra-workbench",

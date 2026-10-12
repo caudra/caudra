@@ -1111,6 +1111,13 @@ complete(results);
     const DECISION_SECRET: &str = "workflow-test-secret";
     const DECISION_BASE_URL: &str = "http://127.0.0.1:8000";
     const DECISION_TIMEOUT_MS: u64 = 60_000;
+    const DECISION_NOUL: f64 = 0.9;
+    const RERANKING: &str = "reranking";
+    const RERANKING_BODY: &str = r#"
+complete(rerank("where parse errors are reported", ["parser.rs reports parse errors", #{ path: "lexer.rs", note: "TOKEN=workflow-test-secret" }]));
+"#;
+    const RERANK_CANDIDATE_FIELD: &str = "candidate";
+    const RERANK_IDS: [&str; 2] = ["c00", "c01"];
     const CONTROL_TEST_TIMEOUT: Duration = Duration::from_secs(5);
     const CONTROL_TIMEOUT_ERROR: &str = "workflow control waited for the decision deadline";
     const CAUGHT: &str = "caught";
@@ -1178,9 +1185,14 @@ complete(result);
             if let Some(error) = &self.error {
                 return Err(error.clone());
             }
+            let answers = request
+                .questions
+                .keys()
+                .map(|id| (id.clone(), json!({ "type": "noul", "noul": DECISION_NOUL })))
+                .collect();
             Ok(serde_json::from_value(json!({
                 "model": request.model,
-                "answers": { "ready": { "type": "noul", "noul": 0.9 } },
+                "answers": Value::Object(answers),
                 "usage": { "input_tokens": 1, "output_tokens": 1 },
             }))
             .unwrap())
@@ -1241,7 +1253,7 @@ complete(result);
             assert!(!call.request.contains(DECISION_SECRET));
             let result: Value = serde_json::from_str(call.result.as_deref().unwrap()).unwrap();
             assert_eq!(result["model"], DECISION_MODEL);
-            assert_eq!(result["answers"]["ready"]["noul"], 0.9);
+            assert_eq!(result["answers"]["ready"]["noul"], DECISION_NOUL);
             assert_eq!(engine.requests.lock().unwrap()[0].model, DECISION_MODEL);
             assert!(
                 !engine.requests.lock().unwrap()[0]
@@ -1343,6 +1355,50 @@ complete(result);
                 record.project,
                 Some(canonicalize_clean(&fixture.project).display().to_string())
             );
+        });
+    }
+
+    #[test]
+    fn workflow_rerank_asks_one_redacted_noul_question_per_candidate() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(RERANKING, RERANKING_BODY);
+            let (decisions, engine, _, _) = decision_service(&fixture, None, false);
+            let runtime = fixture.spawn_with_decisions(Some(decisions)).await;
+            let started = start(&runtime.handle(), RERANKING, Some(0)).await;
+            let completed = fixture
+                .wait_for(&started.run_id, RunStatus::Completed)
+                .await;
+            assert_eq!(
+                completed.result,
+                Some(json!([
+                    { "index": 0, "score": DECISION_NOUL },
+                    { "index": 1, "score": DECISION_NOUL },
+                ]))
+            );
+            let call = runtime
+                .store
+                .load_call(started.run_id, FIRST_KEY)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(call.kind, WorkflowCallKind::Decision);
+            assert!(!call.request.contains(DECISION_SECRET));
+            {
+                let requests = engine.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].questions.keys().collect::<Vec<_>>(), RERANK_IDS);
+                let candidate =
+                    |id: &str| &requests[0].questions[id].instructions[RERANK_CANDIDATE_FIELD];
+                assert_eq!(candidate(RERANK_IDS[0]), "parser.rs reports parse errors");
+                assert_eq!(candidate(RERANK_IDS[1])["path"], "lexer.rs");
+                assert!(
+                    !serde_json::to_string(&requests[0])
+                        .unwrap()
+                        .contains(DECISION_SECRET)
+                );
+            }
+            runtime.shutdown().await;
         });
     }
 

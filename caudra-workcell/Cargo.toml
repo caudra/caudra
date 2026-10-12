@@ -36,6 +36,7 @@ workcell-tool-contract = { workspace = true }
 workcell = { workspace = true, features = ["files-index", "web", "shell", "code-bundled", "code-graph-git", "environment", "host-contract", "snapshots"] }
 
 [dev-dependencies]
+caudra-decision = { workspace = true }
 caudra-workbench = { workspace = true }
 image = { workspace = true }
 ratatui = { workspace = true }

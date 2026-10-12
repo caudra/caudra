@@ -152,16 +152,44 @@ pub(crate) fn redacted_excerpt(text: &str, limit: usize) -> String {
     excerpt
 }
 
+/// `value` with each string cut to `limit` bytes and redacted on its own, and
+/// each secret field's value replaced, so JSON quoting around a string cannot
+/// hide a secret from the word-based redaction of its serialized form.
+pub(crate) fn redacted_leaves(value: &Value, limit: usize) -> Value {
+    match value {
+        Value::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| {
+                let key = redact_decision_text(key);
+                let value = if secret_key(&key) {
+                    Value::String(REDACTED.into())
+                } else {
+                    redacted_leaves(value, limit)
+                };
+                (key, value)
+            })
+            .collect(),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| redacted_leaves(value, limit))
+            .collect(),
+        Value::String(text) => Value::String(redact_decision_text(
+            &text[..text.floor_char_boundary(limit)],
+        )),
+        _ => value.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::iter;
 
-    use serde_json::json;
+    use serde_json::{Value, json};
     use test_case::test_case;
 
     use super::{
         DecisionState, DecisionStateError, MAX_STATE_BYTES, REDACTED, push_fitting,
-        redacted_excerpt,
+        redacted_excerpt, redacted_leaves,
     };
 
     const SECRET: &str = "do-not-send-this-value";
@@ -224,6 +252,13 @@ mod tests {
     fn strings_use_permission_review_redaction(command: &str) {
         let state = DecisionState::new(&json!({"command": command})).unwrap();
         assert!(!state.value().to_string().contains(SECRET));
+    }
+
+    #[test_case(json!({"command": format!("make TOKEN={SECRET}")}); "assignment_in_a_quoted_string")]
+    #[test_case(json!({"nested": [{"api_key": SECRET}]}); "secret_field")]
+    fn serialized_leaves_never_carry_a_secret(input: Value) {
+        const LIMIT: usize = 256;
+        assert!(!redacted_leaves(&input, LIMIT).to_string().contains(SECRET));
     }
 
     #[test_case("postgresql"; "postgres")]

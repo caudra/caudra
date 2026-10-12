@@ -101,6 +101,11 @@ pub(super) fn overview(ctx: &DecisionsModalContext, theme: &Theme) -> Vec<Line<'
         theme,
     ));
     lines.push(field("Timeout", format!("{} ms", config.timeout_ms), theme));
+    lines.push(field(
+        "Rerank timeout",
+        format!("{} ms", config.rerank_timeout_ms),
+        theme,
+    ));
     lines.push(field("allow_remote", yes_no(config.allow_remote), theme));
     lines.push(field("allow_http", yes_no(config.allow_http), theme));
     lines.push(field(
@@ -190,7 +195,7 @@ pub(super) fn overview(ctx: &DecisionsModalContext, theme: &Theme) -> Vec<Line<'
 
 /// Every threshold, in `[decisions.thresholds]` order. An unset `shell_writes`
 /// is `None`, which is what keeps shell-effect warnings off.
-pub(super) fn threshold_rows(thresholds: &DecisionThresholds) -> [(&'static str, Option<f64>); 10] {
+pub(super) fn threshold_rows(thresholds: &DecisionThresholds) -> [(&'static str, Option<f64>); 11] {
     [
         ("permission_flag", Some(thresholds.permission_flag)),
         ("auto_flag", Some(thresholds.auto_flag)),
@@ -205,6 +210,7 @@ pub(super) fn threshold_rows(thresholds: &DecisionThresholds) -> [(&'static str,
         ("goal_skip_below", Some(thresholds.goal_skip_below)),
         ("shell_writes", thresholds.shell_writes),
         ("question_tool_nudge", Some(thresholds.question_tool_nudge)),
+        ("relevance_floor", Some(thresholds.relevance_floor)),
     ]
 }
 
