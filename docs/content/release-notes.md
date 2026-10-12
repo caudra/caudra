@@ -11,7 +11,11 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.7 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.7)
 
-Preview 7 sizes context windows to the limits providers enforce and lets you set them for built-in providers, keeps the reasoning of GPT models on Copilot in one piece, makes copying from Caudra in WSL reach the Windows clipboard, leaves approving a saved plan to the plan menu, and saves a session again after another Caudra carried it on.
+Preview 7 sizes context windows to the limits providers enforce and lets you set them for built-in providers, reads secrets from files in global config files, keeps the reasoning of GPT models on Copilot in one piece, makes copying from Caudra in WSL reach the Windows clipboard, leaves approving a saved plan to the plan menu, and saves a session again after another Caudra carried it on.
+
+> **Important**
+>
+> **After you update, keep `{file:PATH}` out of your config files until every Caudra process that reads them runs Preview 7.** Older versions read it as literal text.
 
 ### Providers
 
@@ -19,6 +23,10 @@ Preview 7 sizes context windows to the limits providers enforce and lets you set
 - **Copilot models compact before Copilot's prompt limit.** Copilot lists two limits for each model: the total window, which also holds the reply, and a smaller prompt limit that it enforces on its own. Caudra used the total, so `copilot-enterprise/gpt-6.1-sol` ran at 400k while Copilot refused any prompt over 272k with "prompt token count of … exceeds the limit of 272000". Caudra now uses the prompt limit as the window, and sessions compact before they reach it.
 - **OpenCode models keep their whole prompt budget.** models.dev lists a separate input limit for some models, such as the GPT-5 models on OpenCode. Once the model list loaded, Caudra counted that limit as a total, so it compacted at 80% of it instead of 90%. With background work running, it also refused a prompt past the limit minus the reply allowance, 144k of a 272k budget. These models now run at their full input limit.
 - **Set a built-in model's window in `providers.toml`.** A `[[SLUG.models]]` entry or a `[SLUG.model_defaults]` table now sets `context_window` and `max_output_tokens` for a built-in provider such as `anthropic`, ahead of what the provider lists and the built-in model table. Built-in providers ignored both before, although the docs said the Claude window could be set this way. Other model keys on a built-in provider are still ignored, and Caudra now warns about them in `model_defaults` too. See [Model limits on a built-in provider](/docs/providers/#model-limits-on-a-built-in-provider).
+
+### Configuration
+
+- **Values from files.** Beside `{env:NAME}`, a string value in the global `caudra.toml`, `permissions.toml`, `mcp.toml`, `providers.toml`, or `workcell.toml` can now hold `{file:PATH}`. Caudra puts the file's text there, trimmed at both ends, so a secret that a password manager or a deployment tool keeps in a file stays out of the config. A relative path starts at the config file's directory, `~/` is your home directory, and a path can hold `{env:NAME}`, such as `{file:{env:CREDENTIALS_DIRECTORY}/token}`. The file must be a UTF-8 regular file of at most 1 MiB. A missing or unreadable file is an error that names the config file, the line, and the path, never the contents. Project files under `.caudra/` cannot use references, and Caudra reads the file again when it reloads the config file that names it. See [Values from files](/docs/configuration/#values-from-files).
 
 ### Terminal
 

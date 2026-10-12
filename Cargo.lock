@@ -846,7 +846,7 @@ dependencies = [
 
 [[package]]
 name = "caudra"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "async-trait",
  "caudra-acp",
@@ -890,7 +890,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-acp"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "agent-client-protocol-schema",
  "caudra-agent",
@@ -911,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-agent"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "arc-swap",
  "async-io",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-automation"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "caudra-script",
  "humantime",
@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-config"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "caudra-config-macro",
  "caudra-storage",
@@ -1011,7 +1011,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-config-macro"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1020,7 +1020,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-decision"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "async-io",
  "async-trait",
@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-diff"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "serde",
  "similar",
@@ -1047,7 +1047,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-docgen"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "caudra-agent",
  "caudra-automation",
@@ -1065,7 +1065,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-docs"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "memchr",
  "semver",
@@ -1079,7 +1079,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-grab"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "ratatui",
  "test-case",
@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-highlight"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "serde_json",
  "syntect",
@@ -1098,7 +1098,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-interpreter"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "monty",
  "monty-types 1.0.0 (git+https://github.com/pydantic/monty.git?tag=v1.0.0)",
@@ -1110,7 +1110,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-lua"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -1187,7 +1187,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-lua-macro"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1196,7 +1196,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-markdown"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "caudra-highlight",
  "fastrand",
@@ -1207,7 +1207,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-otel"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "caudra-config",
  "fastrand",
@@ -1226,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-providers"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "async-lock",
  "base64 0.23.1",
@@ -1261,7 +1261,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-sandbox"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "caudra-config",
  "caudra-storage",
@@ -1285,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-script"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "rhai",
  "serde_json",
@@ -1296,7 +1296,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-storage"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "bs58",
  "caudra-workspace",
@@ -1327,7 +1327,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-terminal-host"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "base64 0.23.1",
  "flume",
@@ -1343,7 +1343,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-ui"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "arboard",
  "arc-swap",
@@ -1405,7 +1405,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-workbench"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "async-trait",
  "caudra-diff",
@@ -1438,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-workcell"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "async-trait",
  "caudra-agent",
@@ -1473,7 +1473,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-workflow"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "caudra-script",
  "rhai",
@@ -1485,7 +1485,7 @@ dependencies = [
 
 [[package]]
 name = "caudra-workspace"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "async-trait",
  "futures-lite",
@@ -10297,7 +10297,7 @@ dependencies = [
 
 [[package]]
 name = "workcell"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "workcell-environment",
  "workcell-host-contract",
@@ -10316,7 +10316,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-code-graph"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "gix",
  "lru",
@@ -10330,7 +10330,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-environment"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "rmcp",
  "rustix 0.38.44",
@@ -10345,7 +10345,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-host-contract"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -10355,7 +10355,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-mcp"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "async-trait",
  "axum",
@@ -10392,7 +10392,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-mcp-code"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "monty-pool",
  "monty-types 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -10409,7 +10409,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-mcp-code-graph"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "async-trait",
  "rmcp",
@@ -10427,7 +10427,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-mcp-files"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "dunce",
  "file-format",
@@ -10455,7 +10455,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-mcp-shell"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "async-trait",
  "dunce",
@@ -10480,7 +10480,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-mcp-web"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -10511,7 +10511,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-monty-worker"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "flate2",
  "libc",
@@ -10523,7 +10523,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-net"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "async-trait",
  "bytes",
@@ -10542,7 +10542,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-output-filter"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "regex",
  "serde",
@@ -10551,7 +10551,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-snapshot-store"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "gix",
  "serde",
@@ -10563,7 +10563,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-source-icons"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -10584,7 +10584,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-source-languages"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "test-case",
  "tree-sitter",
@@ -10628,7 +10628,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-tool-contract"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -10639,7 +10639,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-workspace-scm"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "gix",
  "rustix 0.38.44",
@@ -10657,7 +10657,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-workspace-snapshot"
-version = "0.2.0-preview.6"
+version = "0.2.0-preview.7"
 dependencies = [
  "rustix 0.38.44",
  "serde",
