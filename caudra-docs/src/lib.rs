@@ -24,7 +24,8 @@ pub use search::{Correction, Hit, Search};
 
 pub const NAME: &str = "caudra-docs";
 pub const SKILL_DESCRIPTION: &str = "Caudra's own user documentation for this build: caudra.toml \
-configuration, permissions, tools, commands, keybindings, providers, sessions, MCP, skills, plugins, workflows. \
+configuration, permissions, tools, commands, keybindings, providers, sessions, MCP, skills, plugins, workflows, \
+release notes. \
 Load it before answering questions about using or configuring Caudra.";
 pub const SITE_DOCS_URL: &str = "https://caudra.ai/docs/";
 

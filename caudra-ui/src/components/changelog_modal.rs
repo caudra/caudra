@@ -30,7 +30,6 @@ const CURRENT_TITLE: &str = " What's new in ";
 const ALL_TITLE: &str = " Release notes - all ";
 const TITLE_END: &str = " ";
 const RELEASE_HEADING: &str = "## ";
-const GITHUB_LINK: &str = " on GitHub";
 const NO_NOTES: &str = "This build ships without release notes.";
 const H_PAD: u16 = 1;
 const FOOTER_ROWS: u16 = 1;
@@ -295,8 +294,9 @@ impl ChangelogModal {
             let start = text.len();
             let _ = write!(
                 text,
-                "{RELEASE_HEADING}{}\n\n[{}{GITHUB_LINK}]({})\n\n{}",
-                release.title, release.tag, release.url, release.display
+                "{RELEASE_HEADING}{}\n\n{}",
+                release.title,
+                release.body()
             );
             line += text[start..].matches('\n').count();
         }

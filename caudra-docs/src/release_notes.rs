@@ -9,8 +9,10 @@ use semver::Version;
 
 use crate::SourceError;
 use crate::markdown::{Fences, atx_heading};
+use crate::slug::slugify;
 
 pub const RELEASES_URL: &str = "https://github.com/caudra/caudra/releases/tag/";
+const GITHUB_LINK: &str = " on GitHub";
 const NOTES_EXTENSION: &str = ".md";
 const TAG_PREFIX: &str = "v";
 const TITLE_PREFIX: &str = "Caudra ";
@@ -57,8 +59,8 @@ pub struct Release {
 
 impl ReleaseNotes {
     /// Validates `<version>.md` sources against the authoring rules in CONTRIBUTING.md.
-    pub fn parse(
-        files: impl IntoIterator<Item = (&'static str, &'static str)>,
+    pub fn parse<'a>(
+        files: impl IntoIterator<Item = (&'a str, &'a str)>,
     ) -> Result<Self, SourceError> {
         let mut releases = files
             .into_iter()
@@ -137,6 +139,21 @@ impl Release {
             version,
         })
     }
+
+    /// The release as Caudra shows it under its heading, in `/changelog` and on the Release notes docs page: a
+    /// link to its GitHub page, then the notes.
+    pub fn body(&self) -> String {
+        format!(
+            "[{}{GITHUB_LINK}]({})\n\n{}",
+            self.tag, self.url, self.display
+        )
+    }
+
+    /// The id of the release's heading on the docs page, from the version, because titles hold dots that the
+    /// site and the TUI slug differently.
+    pub fn anchor(&self) -> String {
+        slugify(&self.tag)
+    }
 }
 
 /// The GitHub release title, as the release pipeline writes it.
@@ -192,7 +209,8 @@ fn display(path: &str, text: &str) -> Result<String, SourceError> {
                         format!("unknown alert `[!{kind}]`; use NOTE, TIP, IMPORTANT, WARNING or CAUTION"),
                     )
                 })?;
-            display.push_str(&format!("{QUOTE} **{label}**"));
+            // A paragraph of its own, or the label runs into the first sentence wherever the quote reflows.
+            display.push_str(&format!("{QUOTE} **{label}**\n{QUOTE}"));
         } else {
             display.push_str(line);
         }
@@ -372,12 +390,16 @@ mod tests {
         let release = &notes.releases()[0];
         assert_eq!(
             release.display,
-            "A summary.\n\n> **Important**\n> **Restart.** Now.\n\n```md\n> [!TIP]\n```\n"
+            "A summary.\n\n> **Important**\n>\n> **Restart.** Now.\n\n```md\n> [!TIP]\n```\n"
         );
         assert_eq!(release.tag, "v0.2.0-preview.4");
         assert_eq!(
             release.url,
             "https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.4"
         );
+        assert!(release.body().starts_with(
+            "[v0.2.0-preview.4 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.4)\n\nA summary."
+        ));
+        assert_eq!(release.anchor(), "v0-2-0-preview-4");
     }
 }

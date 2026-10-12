@@ -424,7 +424,8 @@ fn write_update_check_section(out: &mut String) {
          A new install shows no notes. Caudra reads this setting at startup.\n\n\
          `/changelog` opens the same notes at any time, and `/changelog all` \
          opens every release. Press `g` in the modal to switch between the two, \
-         and `o` to open the release you are reading on GitHub.\n"
+         and `o` to open the release you are reading on GitHub. The same notes \
+         are on the [Release notes](/docs/release-notes/) page.\n"
     )
     .unwrap();
 }

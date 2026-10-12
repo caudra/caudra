@@ -6,6 +6,7 @@ mod gen_plugins;
 mod gen_providers;
 mod gen_reference_configs;
 mod gen_regions;
+mod gen_release_notes;
 mod gen_tools;
 
 use std::collections::BTreeMap;
@@ -24,7 +25,7 @@ type Page = (&'static str, fn() -> String);
 /// One entry per generated page. Every generator is a slow, self-contained
 /// string build (it boots a Lua host, walks the tool registry, and so on), so
 /// they each get a thread.
-const PAGES: [Page; 8] = [
+const PAGES: [Page; 9] = [
     ("tools", gen_tools::generate),
     ("plugins", gen_plugins::generate),
     ("providers", gen_providers::generate),
@@ -33,6 +34,7 @@ const PAGES: [Page; 8] = [
     ("lua-api", gen_lua_api::generate),
     ("keybindings", gen_keybindings::generate),
     ("commands", gen_commands::generate),
+    (gen_release_notes::SLUG, gen_release_notes::generate),
 ];
 
 fn page_path(section: &str) -> PathBuf {

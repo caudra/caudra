@@ -394,7 +394,7 @@ Run `caudra update --channel auto`, `caudra update --channel stable`, or `caudra
 
 Enabled by default. The first interactive start after an update opens the release notes for every release since the one that ran before. It opens once per update, even with several Caudra processes running. A start that runs a prompt from the command line, exits when it is done, or opens on a login or trust dialog leaves the notes to the next start. A new install shows no notes. Caudra reads this setting at startup.
 
-`/changelog` opens the same notes at any time, and `/changelog all` opens every release. Press `g` in the modal to switch between the two, and `o` to open the release you are reading on GitHub.
+`/changelog` opens the same notes at any time, and `/changelog all` opens every release. Press `g` in the modal to switch between the two, and `o` to open the release you are reading on GitHub. The same notes are on the [Release notes](/docs/release-notes/) page.
 
 ### `ui.tool_output_lines`
 

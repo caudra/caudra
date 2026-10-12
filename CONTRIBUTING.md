@@ -158,7 +158,7 @@ The first public release is `0.2.0-preview.1`, tagged `v0.2.0-preview.1`. Each p
 
 A release tag must match the workspace version exactly. Pushing it to the canonical repository authorizes CI to verify the exact commit, build all supported targets, stage a draft with installers and checksums, and publish automatically after every required check passes. Prereleases carry GitHub's pre-release flag and cannot become Latest. A failed job leaves publication incomplete rather than exposing a partial release. Ordinary pushes to `main` do not publish binaries.
 
-Write reviewed release notes in `release-notes/<version>.md` before tagging. The same file is the GitHub release body and what Caudra shows after an update and in `/changelog`, so it holds only what changed:
+Write reviewed release notes in `release-notes/<version>.md` before tagging. The same file is the GitHub release body, what Caudra shows after an update and in `/changelog`, and a section of the generated [Release notes](https://caudra.ai/docs/release-notes/) docs page, so it holds only what changed. Run `make gen-docs` after editing it, because CI fails while that page is out of date:
 
 1. Start with one paragraph that summarizes the release.
 2. Put anything a user must do in a `> [!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`, `[!NOTE]` or `[!TIP]` alert, and say when it applies, such as "Before you update" or "After you update, restart".

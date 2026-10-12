@@ -1053,6 +1053,7 @@ dependencies = [
  "caudra-agent",
  "caudra-automation",
  "caudra-config",
+ "caudra-docs",
  "caudra-lua",
  "caudra-providers",
  "caudra-ui",

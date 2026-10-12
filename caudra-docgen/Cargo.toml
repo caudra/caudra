@@ -16,6 +16,7 @@ path = "src/main.rs"
 caudra-agent = { workspace = true }
 caudra-automation = { workspace = true }
 caudra-config = { workspace = true }
+caudra-docs = { workspace = true }
 caudra-lua = { workspace = true }
 caudra-providers = { workspace = true }
 caudra-ui = { workspace = true }

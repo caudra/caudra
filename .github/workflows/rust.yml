@@ -68,6 +68,7 @@ jobs:
               - "docs/content/**"
               - "docs/navigation.json"
               - "docs/examples/**"
+              - "release-notes/**"
               - "THIRD_PARTY_LICENSES/**"
               - "Makefile"
               - "scripts/test-make.py"

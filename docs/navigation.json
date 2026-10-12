@@ -52,7 +52,8 @@
         "cli",
         "reference-configs",
         "logging",
-        "telemetry"
+        "telemetry",
+        "release-notes"
       ]
     }
   ]
