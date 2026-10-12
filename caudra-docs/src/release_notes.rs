@@ -271,6 +271,8 @@ mod tests {
     const NAME_ERROR: &str = "<version>.md";
     const DUPLICATE_ERROR: &str = "duplicate notes";
     const NOTES_DIR: &str = "../release-notes";
+    const WORKSPACE_VERSION: &str = env!("CARGO_PKG_VERSION");
+    const DRAFTS_AHEAD: usize = 1;
 
     fn notes(versions: &[&str]) -> ReleaseNotes {
         ReleaseNotes::parse(versions.iter().map(|version| {
@@ -362,9 +364,8 @@ mod tests {
         title(&Version::parse(version).unwrap())
     }
 
-    /// Every file in `release-notes/`, read from disk, follows the rules the pipeline checks.
-    #[test]
-    fn checked_in_notes_follow_the_authoring_rules() {
+    /// Every file in `release-notes/`, read from disk.
+    fn checked_in_notes() -> ReleaseNotes {
         let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join(NOTES_DIR);
         let files = fs::read_dir(&directory)
             .unwrap()
@@ -377,7 +378,25 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(!files.is_empty(), "{}", directory.display());
-        ReleaseNotes::parse(files).unwrap();
+        ReleaseNotes::parse(files).unwrap()
+    }
+
+    #[test]
+    fn checked_in_notes_follow_the_authoring_rules() {
+        checked_in_notes();
+    }
+
+    /// Changes land in the next release's draft, so a second file ahead of the workspace version is a draft
+    /// started in the wrong file.
+    #[test]
+    fn checked_in_notes_draft_only_the_next_release() {
+        let notes = checked_in_notes();
+        let ahead = notes.releases().len() - notes.up_to(WORKSPACE_VERSION).len();
+        assert!(
+            ahead <= DRAFTS_AHEAD,
+            "release-notes/ drafts {:?} ahead of {WORKSPACE_VERSION}: merge them into the next release's file",
+            versions(&notes.releases()[..ahead])
+        );
     }
 
     #[test]

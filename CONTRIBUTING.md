@@ -158,15 +158,7 @@ The first public release is `0.2.0-preview.1`, tagged `v0.2.0-preview.1`. Each p
 
 A release tag must match the workspace version exactly. Pushing it to the canonical repository authorizes CI to verify the exact commit, build all supported targets, stage a draft with installers and checksums, and publish automatically after every required check passes. Prereleases carry GitHub's pre-release flag and cannot become Latest. A failed job leaves publication incomplete rather than exposing a partial release. Ordinary pushes to `main` do not publish binaries.
 
-Write reviewed release notes in `release-notes/<version>.md` before tagging. The same file is the GitHub release body, what Caudra shows after an update and in `/changelog`, and a section of the generated [Release notes](https://caudra.ai/docs/release-notes/) docs page, so it holds only what changed. Run `make gen-docs` after editing it, because CI fails while that page is out of date:
-
-1. Start with one paragraph that summarizes the release.
-2. Put anything a user must do in a `> [!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`, `[!NOTE]` or `[!TIP]` alert, and say when it applies, such as "Before you update" or "After you update, restart".
-3. Group changes under `###` headings, never `#` or `##`.
-4. Start each bullet with a bold lead-in that names the change.
-5. Leave out install and update steps. The pipeline adds a "New to Caudra?" section with the [Quick Start](https://caudra.ai/docs/quick-start/), and an "Updating from" section that names the previous release and the update command for its channel.
-
-The pipeline reads this file from the tagged commit and adds a status line. GitHub shows the title, tag and commit beside the notes, so the notes do not repeat them. Missing notes, unresolved placeholders, and notes that break these rules stop validation, and the Rust tests check every file in `release-notes/` the same way. The same content is used for draft creation and publication, so manual draft edits are not the authoring workflow.
+A tag needs reviewed notes in `release-notes/<version>.md`, written as described in [Release notes](#release-notes).
 
 Set the GitHub Actions repository variable `CAUDRA_RUNNER_PROFILE` to select a reviewed runner mapping. An unset value defaults to `github`, using standard GitHub-hosted runners. `blacksmith` selects accelerated runners where supported. `ubicloud-blacksmith` selects Ubicloud for Linux and Blacksmith for Apple Silicon macOS and Windows. Intel macOS and lightweight control jobs remain on GitHub. The mappings live in `scripts/ci-runners.py`. Unknown profiles stop validation.
 
@@ -181,6 +173,29 @@ The website deploys separately. Verified development commits propose a `docs-sou
 After the complete release workflow succeeds, the source automation dispatches the published release identity to the website repository. The website independently verifies the release, successful source run, and exact tag commit before building production inputs. Production uses that release commit, not a newer development pin. Drafts, failed releases, moved tags, and stale automatic release requests cannot promote a preview to production. Self-updates use the installer attached to the selected GitHub Release.
 
 Configure `WEBSITE_APP_ID` and `WEBSITE_APP_PRIVATE_KEY` in the application repository. Install the App only on the website repository with Contents and Pull requests write permissions and Actions read permission. The latter lets the bot verify private website CI before merging. Deploy the website workflow changes before enabling the source automation changes so development pin updates cannot reach the old production-on-main path.
+
+### Release notes
+
+Each release's notes live in `release-notes/<version>.md`. The same file is the GitHub release body, what Caudra shows after an update and in `/changelog`, and a section of the generated [Release notes](https://caudra.ai/docs/release-notes/) docs page, so it holds only what changed.
+
+Notes are written as changes land, not at release time. The draft is the newest file in `release-notes/` whose version has no tag yet. After a release, the first user-visible change starts the next file, such as `0.2.0-preview.7.md` after `v0.2.0-preview.6`. The workspace version is bumped only when the release is prepared, so the draft is usually ahead of it, and builds leave it out of `/changelog` until then. The Rust tests allow at most one file ahead of the workspace version.
+
+When you draft:
+
+- Update the draft in the same commit as the change. Leave out refactors, tests, CI and internal tooling.
+- Write for someone updating: what they will notice and what they must do, not how it was built.
+- Fold a follow-up into the bullet it refines, and remove the bullet of a reverted change.
+- Rewrite the lead paragraph as the release grows, so it still sums up the whole release.
+
+Every file follows the same format. Run `make gen-docs` after editing one, because CI fails while the docs page is out of date:
+
+1. Start with one paragraph that summarizes the release.
+2. Put anything a user must do in a `> [!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`, `[!NOTE]` or `[!TIP]` alert, and say when it applies, such as "Before you update" or "After you update, restart". A release that upgrades the session database says so in an alert like the one in `0.2.0-preview.6.md`.
+3. Group changes under `###` headings, never `#` or `##`.
+4. Start each bullet with a bold lead-in that names the change.
+5. Leave out install and update steps. The pipeline adds a "New to Caudra?" section with the [Quick Start](https://caudra.ai/docs/quick-start/), and an "Updating from" section that names the previous release and the update command for its channel.
+
+The pipeline reads the file from the tagged commit and adds a status line. GitHub shows the title, tag and commit beside the notes, so the notes do not repeat them. Missing notes, unresolved placeholders, and notes that break these rules stop validation, and the Rust tests check every file in `release-notes/` the same way. The same content is used for draft creation and publication, so manual draft edits are not the authoring workflow.
 
 ## Commits and pull requests
 
