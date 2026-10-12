@@ -966,7 +966,6 @@ dependencies = [
  "toml_edit",
  "tracing",
  "url",
- "wait-timeout",
 ]
 
 [[package]]
@@ -1400,7 +1399,6 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "url",
- "wait-timeout",
  "windows-sys 0.61.2",
  "workcell-tool-contract",
 ]
