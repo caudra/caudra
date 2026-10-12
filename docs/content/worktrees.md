@@ -111,12 +111,14 @@ Caudra detects Herdr from the environment Herdr gives every process it starts in
 - the title of the focused session, the model and the context usage, shown in the Herdr sidebar,
 - the command that resumes the focused session, `caudra --session <id>`.
 
+Caudra also names the pane's tab after the focused session while the tab still shows its number, as [Tab names](/docs/sessions/#tab-names) describes.
+
 After a Herdr restart, Herdr runs that command in the restored pane, so the focused tab comes back. Other tabs stay available in `/sessions`. A fork opens in a new Herdr tab with a Caudra of its own, as [Forks in Herdr and Orca](/docs/sessions/#forks-in-herdr-and-orca) describes. See [CLI](/docs/cli/) for how reporting works and [Notifications](/docs/notifications/#herdr) for how notifications change inside Herdr.
 
 Native Herdr reporting takes precedence over [OSC 7501 pane status](/docs/notifications/#persistent-pane-status), so Caudra does not probe for or send OSC 7501 while the native reporter is active.
 
 ## Orca integration
 
-Caudra detects [Orca](https://github.com/stablyai/orca) from the variables Orca sets in each terminal, `ORCA_PANE_KEY` or `ORCA_TERMINAL_HANDLE`. Herdr running inside Orca counts as Herdr. Besides worktrees, Caudra reports the agent state, the model and the label of the blocking prompt. See [Notifications](/docs/notifications/#orca) for what the report contains and how notifications change inside Orca.
+Caudra detects [Orca](https://github.com/stablyai/orca) from the variables Orca sets in each terminal, `ORCA_PANE_KEY` or `ORCA_TERMINAL_HANDLE`. Herdr running inside Orca counts as Herdr. Besides worktrees, Caudra reports the agent state, the model and the label of the blocking prompt. See [Notifications](/docs/notifications/#orca) for what the report contains and how notifications change inside Orca. The window title carries the session title, which Orca shows on the terminal's tab until you rename it. See [Tab names](/docs/sessions/#tab-names).
 
 Orca cannot restore a Caudra terminal after a restart. Your sessions stay available in `/sessions` and through `caudra --session <id>`. A fork opens in a new terminal in the current worktree, as [Forks in Herdr and Orca](/docs/sessions/#forks-in-herdr-and-orca) describes.

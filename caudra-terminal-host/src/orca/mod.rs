@@ -101,6 +101,12 @@ impl TerminalHost for OrcaHost {
     fn raises_notifications(&self) -> bool {
         true
     }
+
+    /// Orca labels a terminal's tab with its window title until the user
+    /// renames it.
+    fn names_tabs(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

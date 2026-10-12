@@ -160,6 +160,12 @@ A title you set yourself is never overwritten. Renaming through the session pick
 
 Choose its assignment from the Title row in `/model`, described in [Providers](/docs/providers/#model-jobs). Set `agent.generate_titles = false` to keep the trimmed prompt and skip the request.
 
+### Tab names
+
+Caudra sets the terminal window title to the title of the focused session. It updates the window title when the session gets a new title or you switch to another session. Most terminals, and [Orca](/docs/worktrees/#orca-integration), show the window title on the tab until you name the tab yourself. A session without a title yet leaves the previous window title in place. On exit, a terminal with a title stack gets back the title it had before Caudra started. Once a plugin sets the window title with `caudra.ui.set_window_title`, Caudra stops setting it for the rest of the run.
+
+[Herdr](/docs/worktrees/#herdr-integration) labels a tab with its number rather than with the window title of the program in it, so Caudra leaves the window title alone there. Inside a Herdr pane, Caudra renames the tab to the session title while the tab still shows its number. When the session title changes, Caudra renames the tab again if it still shows the title Caudra gave it. A name you gave the tab stays. Herdr cannot give a tab its number back, so the tab keeps the last title after Caudra exits. A later Caudra in that tab treats a tab named after its own session as its own, as after Herdr restores the pane.
+
 ## Message actions
 
 Click `⋮` in the gutter beside a message to open Message Actions. Right-clicking the message also works when the terminal forwards it. Clicks in the message body still select text, expand reasoning, and interact with tool output.

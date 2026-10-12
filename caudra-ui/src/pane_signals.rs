@@ -1,6 +1,7 @@
 //! What this pane tells the terminal around it: one persistent status for
-//! whichever host receives it, and one-off alerts. The routing itself lives
-//! in `caudra-terminal-host`; this is where the UI feeds it.
+//! whichever host receives it, one-off alerts, and the window title most
+//! terminals and Orca label the tab with. The routing itself lives in
+//! `caudra-terminal-host`; this is where the UI feeds it.
 
 use std::io;
 use std::time::Duration;
@@ -15,6 +16,8 @@ use caudra_terminal_host::status::{PaneMetadata, PaneStatus};
 use caudra_terminal_host::terminal_detect::detect_osc9_support;
 use tracing::warn;
 
+use crate::terminal;
+
 pub(crate) struct PaneSignals {
     /// The host's reporter, or the one this owns for OSC 7501.
     reporter: Option<ReporterHandle>,
@@ -23,6 +26,30 @@ pub(crate) struct PaneSignals {
     turn_alerts: Option<Notifier>,
     /// An automation's `notify()`.
     notice_alerts: Option<Notifier>,
+    window_title: WindowTitle,
+}
+
+/// Whether the window title follows the focused session. The terminal guard
+/// saves the title the shell left and restores it on exit.
+#[derive(Debug, PartialEq, Eq)]
+enum WindowTitle {
+    /// The host names the tab itself, a plugin set the title, or writing it
+    /// failed.
+    Elsewhere,
+    /// The session title last written, if one was since the terminal was
+    /// last handed back.
+    Session(Option<String>),
+}
+
+impl WindowTitle {
+    fn due<'a>(&self, title: &'a str) -> Option<&'a str> {
+        match self {
+            Self::Session(shown) if !title.trim().is_empty() && shown.as_deref() != Some(title) => {
+                Some(title)
+            }
+            _ => None,
+        }
+    }
 }
 
 fn preference(method: NotificationMethod) -> AlertPreference {
@@ -66,11 +93,17 @@ impl PaneSignals {
             StatusRoute::Osc7501 => osc7501.as_ref().map(Reporter::handle),
             StatusRoute::None => None,
         };
+        let window_title = if reporter.as_ref().is_some_and(ReporterHandle::names_tabs) {
+            WindowTitle::Elsewhere
+        } else {
+            WindowTitle::Session(None)
+        };
         Self {
             reporter,
             _osc7501: osc7501,
             turn_alerts: routing.turn_alerts.map(Notifier::new),
             notice_alerts: routing.notice_alerts.map(Notifier::new),
+            window_title,
         }
     }
 
@@ -105,11 +138,34 @@ impl PaneSignals {
         }
     }
 
+    /// Titles the window after the focused session, so the tab carries its
+    /// name. An empty title keeps the last one.
+    pub(crate) fn show_session_title(&mut self, title: &str) {
+        let Some(title) = self.window_title.due(title) else {
+            return;
+        };
+        self.window_title = match terminal::set_window_title(title) {
+            Ok(()) => WindowTitle::Session(Some(title.to_owned())),
+            Err(error) => {
+                warn!(%error, "window title disabled after write failure");
+                WindowTitle::Elsewhere
+            }
+        };
+    }
+
+    /// A plugin set the window title, so the session no longer does.
+    pub(crate) fn yield_window_title(&mut self) {
+        self.window_title = WindowTitle::Elsewhere;
+    }
+
     /// The terminal was handed to another program, which may have changed
     /// what it shows.
-    pub(crate) fn invalidate(&self) {
+    pub(crate) fn invalidate(&mut self) {
         if let Some(reporter) = &self.reporter {
             reporter.invalidate();
+        }
+        if let WindowTitle::Session(shown) = &mut self.window_title {
+            *shown = None;
         }
     }
 
@@ -128,5 +184,27 @@ impl PaneSignals {
             warn!(sink = ?notifier.sink(), %error, "terminal alerts disabled after write failure");
             *sink = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_case::test_case;
+
+    const TITLE: &str = "Fix the parser";
+    const EARLIER: &str = "Refactor auth";
+
+    #[test_case(WindowTitle::Session(None), TITLE, Some(TITLE) ; "first_title")]
+    #[test_case(WindowTitle::Session(Some(EARLIER.into())), TITLE, Some(TITLE) ; "renamed_session")]
+    #[test_case(WindowTitle::Session(Some(TITLE.into())), TITLE, None ; "unchanged")]
+    #[test_case(WindowTitle::Session(Some(EARLIER.into())), " ", None ; "untitled_session_keeps_the_last")]
+    #[test_case(WindowTitle::Elsewhere, TITLE, None ; "titled_elsewhere")]
+    fn only_a_new_session_title_is_written(
+        window: WindowTitle,
+        title: &str,
+        expected: Option<&str>,
+    ) {
+        assert_eq!(window.due(title), expected);
     }
 }

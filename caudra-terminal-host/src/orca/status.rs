@@ -1,6 +1,7 @@
 //! Orca's agent status, which it reads out of the terminal's own output as
 //! `OSC 9999 ; <json> BEL`. Orca shows the state, the model and what blocks
-//! the agent; it is never told a session title or anything the model said.
+//! the agent. The status never carries the session title, which Orca sees
+//! only as the window title, or anything the model said.
 
 use serde::Serialize;
 

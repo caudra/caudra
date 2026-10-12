@@ -4732,7 +4732,8 @@ clear it.
 The title passes through tmux, GNU screen, and zellij untouched, and
 control characters are stripped, so model text cannot inject escape
 sequences into the terminal. On exit caudra hands the title back to the
-shell, on terminals that support the title stack.
+shell, on terminals that support the title stack. After the first call,
+caudra stops setting the window title to the session title.
 
 **Parameters:**
 

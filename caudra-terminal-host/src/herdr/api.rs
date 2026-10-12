@@ -81,9 +81,65 @@ impl HerdrPane {
         self.run(args)
     }
 
+    /// The tab this pane is in, found again on every call because the user
+    /// can move the pane to another tab.
+    pub fn tab(&self) -> Result<PaneTab, HostError> {
+        let PaneLocation { pane } = self
+            .cli
+            .call(&pane_get_args(&self.pane_id), REPORT_TIMEOUT)?;
+        let TabListing { tabs } = self
+            .cli
+            .call(&tab_list_args(&pane.workspace_id), REPORT_TIMEOUT)?;
+        tabs.into_iter()
+            .enumerate()
+            .find(|(_, tab)| tab.tab_id == pane.tab_id)
+            .map(|(index, tab)| PaneTab {
+                numbered: tab.label == (index + 1).to_string(),
+                tab_id: tab.tab_id,
+                label: tab.label,
+            })
+            .ok_or_else(|| HostError::missing_field(HOST, "tabs"))
+    }
+
+    pub fn rename_tab(&self, tab_id: &str, label: &str) -> Result<(), HostError> {
+        self.run(rename_args("tab", tab_id, label))
+    }
+
     fn run(&self, args: Vec<OsString>) -> Result<(), HostError> {
         self.cli.run(&args, REPORT_TIMEOUT).map(drop)
     }
+}
+
+/// A tab as Herdr's tab bar shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaneTab {
+    pub tab_id: String,
+    pub label: String,
+    /// The label is the tab's position, which is what Herdr shows for a tab
+    /// no one named. Herdr reports nothing else that tells the two apart.
+    pub numbered: bool,
+}
+
+#[derive(Deserialize)]
+struct PaneLocation {
+    pane: PanePlace,
+}
+
+#[derive(Deserialize)]
+struct PanePlace {
+    tab_id: String,
+    workspace_id: String,
+}
+
+#[derive(Deserialize)]
+struct TabListing {
+    tabs: Vec<ListedTab>,
+}
+
+#[derive(Deserialize)]
+struct ListedTab {
+    tab_id: String,
+    label: String,
 }
 
 /// A checkout as Herdr lists it.
@@ -400,6 +456,19 @@ fn tab_create_args(workspace_id: Option<&str>, cwd: &Path) -> Vec<OsString> {
     }
     args.extend(["--cwd".into(), cwd.into(), "--focus".into()]);
     args
+}
+
+fn pane_get_args(pane_id: &str) -> Vec<OsString> {
+    argv(["pane".as_ref(), "get".as_ref(), pane_id.as_ref()])
+}
+
+fn tab_list_args(workspace_id: &str) -> Vec<OsString> {
+    argv([
+        "tab".as_ref(),
+        "list".as_ref(),
+        "--workspace".as_ref(),
+        workspace_id.as_ref(),
+    ])
 }
 
 fn pane_list_args(workspace_id: &str) -> Vec<OsString> {

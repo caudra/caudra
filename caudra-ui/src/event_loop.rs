@@ -2810,6 +2810,7 @@ impl<'t> EventLoop<'t> {
                 self.focused_app().flash(msg);
             }
             UiAction::SetWindowTitle(title) => {
+                self.pane_signals.yield_window_title();
                 if let Err(error) = terminal::set_window_title(&title) {
                     warn!(%error, "failed to set window title");
                 }
@@ -2954,10 +2955,12 @@ impl<'t> EventLoop<'t> {
         pane::aggregate(self.sessions.iter().map(SessionRuntime::pane_status))
     }
 
-    /// Reports the pane's status to whichever host receives it, then raises
-    /// the alerts that are due. Both are written here, between frames, so no
-    /// sequence lands inside one the UI is drawing.
+    /// Titles the window, reports the pane's status to whichever host
+    /// receives it, then raises the alerts that are due. All are written here,
+    /// between frames, so no sequence lands inside one the UI is drawing.
     fn emit_pane_signals(&mut self) {
+        self.pane_signals
+            .show_session_title(&self.sessions[self.focused].app.state.session.title);
         if self.pane_signals.reports_status() {
             let status = PaneStatus {
                 resume: self.pane_resume(),

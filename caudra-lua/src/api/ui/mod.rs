@@ -258,7 +258,8 @@ fn flash(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, msg: String) -> LuaResu
 /// The title passes through tmux, GNU screen, and zellij untouched, and
 /// control characters are stripped, so model text cannot inject escape
 /// sequences into the terminal. On exit caudra hands the title back to the
-/// shell, on terminals that support the title stack.
+/// shell, on terminals that support the title stack. After the first call,
+/// caudra stops setting the window title to the session title.
 ///
 /// @param title string New window title, e.g. `"● 3/5 tests"`.
 /// @return

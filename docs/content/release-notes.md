@@ -11,7 +11,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.8 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.8)
 
-Preview 8 lets the experimental decision engine rerank memory notes, tool search, retained tool output, and code context, gives workflows a `rerank()` function, opens forks in a new Herdr or Orca tab, makes the wheel scroll lists instead of moving their selection, and stops pending reverts in a destination directory from blocking session moves.
+Preview 8 lets the experimental decision engine rerank memory notes, tool search, retained tool output, and code context, gives workflows a `rerank()` function, opens forks in a new Herdr or Orca tab, names tabs after the session, makes the wheel scroll lists instead of moving their selection, and stops pending reverts in a destination directory from blocking session moves.
 
 > **Note**
 >
@@ -29,6 +29,7 @@ Preview 8 lets the experimental decision engine rerank memory notes, tool search
 
 ### Sessions
 
+- **Tabs are named after the session.** Caudra sets the terminal window title to the title of the focused session, so most terminals and Orca label the tab with it until you name the tab yourself. Inside Herdr, Caudra renames the tab while it still shows its number, and again when the session title changes, as long as the tab still shows the title Caudra gave it. A tab you named keeps its name. On exit, a terminal with a title stack gets its earlier window title back. Herdr cannot clear a tab name, so the tab keeps the last session title. A plugin that sets the window title keeps it from then on. See [Tab names](/docs/sessions/#tab-names).
 - **Forks open in a new Herdr or Orca tab.** Inside a Herdr pane or an Orca terminal, **Fork here** saves the new session and resumes it in a new tab of that host, with a Caudra of its own. The tab takes focus and the session you forked from stays open where it was. Remote, sandbox, and ephemeral sessions still fork into a tab of the current Caudra, and so does a fork the host cannot open. See [Forks in Herdr and Orca](/docs/sessions/#forks-in-herdr-and-orca).
 - **Moving into a directory ignores its pending reverts.** A move was refused with "Destination session … has a pending restore; resolve it before moving sessions" when any session already in the destination had a pending revert, even an old conversation revert. `/move-session` and `/migrate-sessions` stopped there. `/worktree remove` and other moves that brought this Caudra back to such a directory committed the move and then failed to start, with "UI startup failed; reopen the committed sessions at the destination". Sessions already in the destination no longer affect a move, just as they never stopped a new session from starting there. The rules for the directory a session leaves are unchanged.
 

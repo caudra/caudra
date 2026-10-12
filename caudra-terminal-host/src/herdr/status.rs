@@ -4,6 +4,7 @@ use tracing::{info, warn};
 
 use super::api::{AgentReport, AgentState, HerdrPane};
 use super::env::HerdrEnv;
+use super::tab_name::TabName;
 use crate::error::HostError;
 use crate::host::BlockingStatusSink;
 use crate::resume::{RESUME_COMMAND, command_on_path};
@@ -18,6 +19,7 @@ pub(super) struct HerdrStatusSink {
     resume: bool,
     /// Herdr takes pane metadata.
     metadata: bool,
+    tab_name: TabName,
 }
 
 impl HerdrStatusSink {
@@ -34,6 +36,7 @@ impl HerdrStatusSink {
             sequence: sequence_seed(),
             resume,
             metadata: true,
+            tab_name: TabName::default(),
         }
     }
 
@@ -79,18 +82,18 @@ impl BlockingStatusSink for HerdrStatusSink {
     }
 
     fn describe(&mut self, metadata: &PaneMetadata<'_>) {
-        if !self.metadata {
-            return;
-        }
-        let seq = self.next_seq();
-        match self.pane.report_metadata(metadata, seq) {
-            Ok(()) => {}
-            Err(HostError::Unsupported(_, detail)) => {
-                warn!(%detail, "Herdr rejected pane metadata; the sidebar keeps its defaults");
-                self.metadata = false;
+        if self.metadata {
+            let seq = self.next_seq();
+            match self.pane.report_metadata(metadata, seq) {
+                Ok(()) => {}
+                Err(HostError::Unsupported(_, detail)) => {
+                    warn!(%detail, "Herdr rejected pane metadata; the sidebar keeps its defaults");
+                    self.metadata = false;
+                }
+                Err(error) => warn!(%error, "Herdr metadata report failed"),
             }
-            Err(error) => warn!(%error, "Herdr metadata report failed"),
         }
+        self.tab_name.follow(&self.pane, &metadata.title);
     }
 
     fn release(&mut self) {
@@ -157,6 +160,7 @@ mod tests {
             sequence: 0,
             resume: true,
             metadata: true,
+            tab_name: TabName::default(),
         }
     }
 

@@ -7,6 +7,7 @@ mod api;
 mod cli;
 mod env;
 mod status;
+mod tab_name;
 mod workspaces;
 
 use std::ffi::OsString;
@@ -77,6 +78,11 @@ impl TerminalHost for HerdrHost {
 
     /// Herdr raises its own toast when an agent it tracks blocks or finishes.
     fn raises_notifications(&self) -> bool {
+        true
+    }
+
+    /// Herdr numbers its tabs and shows no window title of a pane.
+    fn names_tabs(&self) -> bool {
         true
     }
 }

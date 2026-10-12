@@ -41,6 +41,10 @@ impl TerminalHost for Osc7501Host {
     fn raises_notifications(&self) -> bool {
         true
     }
+
+    fn names_tabs(&self) -> bool {
+        false
+    }
 }
 
 struct Osc7501Encoder;

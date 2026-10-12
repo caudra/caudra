@@ -16,6 +16,9 @@ pub trait TerminalHost: Debug + Send + Sync {
     /// The host raises its own notices for finished turns and waiting
     /// prompts, so Caudra does not alert for them as well.
     fn raises_notifications(&self) -> bool;
+    /// The host names the pane's tab after the session from the metadata its
+    /// status channel receives, so Caudra leaves the window title alone.
+    fn names_tabs(&self) -> bool;
 }
 
 pub enum StatusChannel {

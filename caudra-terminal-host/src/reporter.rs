@@ -189,6 +189,7 @@ enum Delivery {
 pub struct ReporterHandle {
     delivery: Arc<Delivery>,
     raises_notifications: bool,
+    names_tabs: bool,
 }
 
 impl ReporterHandle {
@@ -230,6 +231,10 @@ impl ReporterHandle {
         self.raises_notifications
     }
 
+    pub fn names_tabs(&self) -> bool {
+        self.names_tabs
+    }
+
     fn close(&self, farewell: Farewell) {
         match &*self.delivery {
             Delivery::Blocking(shared) => shared.close(farewell),
@@ -247,7 +252,13 @@ impl Reporter {
     /// Starts reporting to `host`, writing in-band sequences to the terminal.
     pub fn for_host(host: &dyn TerminalHost) -> Option<Self> {
         let channel = host.status_channel()?;
-        Self::start(channel, host.raises_notifications(), terminal_writer()).map_or_else(
+        Self::start(
+            channel,
+            host.raises_notifications(),
+            host.names_tabs(),
+            terminal_writer(),
+        )
+        .map_or_else(
             |error| {
                 warn!(%error, host = host.name(), "failed to start the pane status reporter");
                 None
@@ -259,6 +270,7 @@ impl Reporter {
     pub fn start(
         channel: StatusChannel,
         raises_notifications: bool,
+        names_tabs: bool,
         writer: Writer,
     ) -> io::Result<Self> {
         let (delivery, worker) = match channel {
@@ -297,6 +309,7 @@ impl Reporter {
             handle: ReporterHandle {
                 delivery,
                 raises_notifications,
+                names_tabs,
             },
             worker,
         })
@@ -490,8 +503,13 @@ mod tests {
             lock(&sink).push(sequence.to_owned());
             Ok(())
         });
-        let reporter =
-            Reporter::start(StatusChannel::InBand(Box::new(Encoder)), true, writer).unwrap();
+        let reporter = Reporter::start(
+            StatusChannel::InBand(Box::new(Encoder)),
+            true,
+            false,
+            writer,
+        )
+        .unwrap();
         (reporter, written)
     }
 

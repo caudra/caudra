@@ -153,8 +153,10 @@ applies.
 Each report carries the state, the model, and the label of the prompt that
 blocks the agent, such as `Permission requested: shell`. It never carries the
 session title, prompt or response text, tool arguments, or error details. Orca
-has no field for context usage. Starting idle and exiting on purpose report a
-session boundary, so Orca does not announce a finished task.
+still sees the session title as the window title, which it shows on the tab, as
+[Tab names](/docs/sessions/#tab-names) describes. Orca has no field for context
+usage. Starting idle and exiting on purpose report a session boundary, so Orca
+does not announce a finished task.
 
 Caudra wraps OSC 9999 for tmux and GNU screen. Inside tmux, set
 `allow-passthrough on` or `all`. Zellij drops the sequence, so Caudra sends no
