@@ -1,4 +1,6 @@
 use std::collections::{HashSet, VecDeque};
+#[cfg(test)]
+use std::time::Duration;
 
 use caudra_agent::permissions::{
     AutopilotNote, PermissionAnswer, PermissionLifetime, PermissionRequest, PermissionRowGrant,
@@ -8,6 +10,7 @@ use caudra_workbench::text_field::{FieldKind, TextField};
 use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 
+use crate::components::key_freshness::KeyFreshness;
 use crate::components::permission_scope::view::{ScopeControl, ScopeView};
 use crate::components::scrollbar::Scrollbar;
 use crate::components::tooltip::TipArea;
@@ -29,7 +32,6 @@ use choices::Choice;
 use customize::{Customize, Effect};
 use decision::Pending;
 pub(crate) use details::{likely_secret_key, sensitive_text};
-use input::InputFreshness;
 pub(crate) use inspector::pattern_widened;
 use inspector::{InspectorControl, PatternInspector};
 pub(crate) use notes::{origin_word, tilde};
@@ -151,7 +153,7 @@ pub struct PermissionPrompt {
     reveal: bool,
     area: Rect,
     awaiting_review: bool,
-    input_freshness: InputFreshness,
+    input_freshness: KeyFreshness,
 }
 
 impl Overlay for PermissionPrompt {
@@ -199,7 +201,7 @@ impl PermissionPrompt {
             reveal: false,
             area: Rect::default(),
             awaiting_review: false,
-            input_freshness: InputFreshness::default(),
+            input_freshness: KeyFreshness::default(),
         }
     }
 
@@ -262,6 +264,12 @@ impl PermissionPrompt {
             )),
             subagent_id,
         );
+    }
+
+    /// Lets a test wait out the quiet gap for keys whose key-up never arrives.
+    #[cfg(test)]
+    pub(crate) fn age_last_press(&mut self, by: Duration) {
+        self.input_freshness.age(by);
     }
 
     pub(crate) fn tool(&self) -> Option<&ToolKey> {

@@ -17,6 +17,7 @@ use crate::components::file_walk::UNREADABLE_DIR_MSG;
 use crate::components::goal_modal::GoalTarget;
 use crate::components::help_modal::HelpTarget;
 use crate::components::input::ChordHint;
+use crate::components::key_freshness::QUIET_GAP;
 use crate::components::keybindings::{Bind, KeybindContext, key as kb, leader as chord};
 use crate::components::messages::{ASSISTANT_LABEL, ReviewTarget};
 use crate::components::peer_manager::SubscriptionChange;
@@ -20999,6 +21000,30 @@ fn associated_enter_release_rearms_initial_permission(release_before: bool) {
         app.update(associated_key(release, None));
     }
     rendered(&mut app);
+    app.update(associated_key(enter, None));
+    assert!(!app.permission_prompt.is_open());
+    assert!(app.input_box.is_empty());
+}
+
+#[test]
+fn without_key_ups_a_quiet_enter_answers_the_permission() {
+    let mut app = test_app();
+    app.input_box
+        .buffer
+        .insert_text(REPORTED_PERMISSION_COMMAND);
+    let enter = key(KeyCode::Enter);
+    assert!(matches!(
+        app.update(associated_key(enter, None)).as_slice(),
+        [Action::SendMessage(_)]
+    ));
+    app.update(agent_msg(permission_event(
+        REPORTED_PERMISSION_FIRST,
+        REPORTED_PERMISSION_COMMAND,
+    )));
+    rendered(&mut app);
+    app.update(associated_key(enter, None));
+    assert!(app.permission_prompt.is_open());
+    app.permission_prompt.age_last_press(QUIET_GAP);
     app.update(associated_key(enter, None));
     assert!(!app.permission_prompt.is_open());
     assert!(app.input_box.is_empty());

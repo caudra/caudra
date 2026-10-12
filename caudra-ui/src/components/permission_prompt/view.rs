@@ -36,6 +36,7 @@ use crate::components::command_text::{
     code_spans_in, command_lines, command_spans, ellipsize_spans, marked_spans, overlay, pad_spans,
     scope_spans,
 };
+use crate::components::key_freshness::Rearm;
 use crate::components::permission_scope::model::ScopeModel;
 use crate::components::permission_scope::pattern::PatternPanel;
 use crate::components::permission_scope::view::ScopeView;
@@ -73,7 +74,8 @@ const COLUMN_GAP: &str = "  ";
 const BADGE_SEPARATOR: &str = " · ";
 const TITLE_SEPARATOR: &str = " · ";
 const RESIZE_MESSAGE: &str = "Make the terminal larger to answer. Esc says no.";
-pub(super) const REARM_MESSAGE: &str = "Press Tab, then press the key again.";
+pub(super) const RELEASE_MESSAGE: &str = "Let go of the key, then press it again.";
+pub(super) const WAIT_MESSAGE: &str = "Wait a moment, then press the key again.";
 pub(super) const GUIDANCE_PLACEHOLDER: &str = "what to do instead (optional)";
 const PATTERN_PLACEHOLDER: &str = "a pattern ending in ` *` or `/*`, such as cargo test *";
 pub(super) const PRESS_AGAIN: &str = "Press Enter again to allow, or Esc to go back.";
@@ -1496,10 +1498,14 @@ impl PermissionPrompt {
 
     /// Every key's description when they all fit, else only the last one's.
     fn draw_footer(&mut self, frame: &mut Frame, area: Rect, t: &Theme) {
-        if self.decision_needs_rearm() {
+        if let Some(rearm) = self.decision_rearm() {
+            let message = match rearm {
+                Rearm::Release => RELEASE_MESSAGE,
+                Rearm::Wait => WAIT_MESSAGE,
+            };
             frame.render_widget(
                 Paragraph::new(Line::styled(
-                    format!("{}{REARM_MESSAGE}", " ".repeat(usize::from(MARGIN))),
+                    format!("{}{message}", " ".repeat(usize::from(MARGIN))),
                     t.status_notice,
                 )),
                 area,

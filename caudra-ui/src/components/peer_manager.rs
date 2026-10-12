@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::mem;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use caudra_agent::peers::topics::{MAX_PATTERNS, add_patterns, pattern_matches, remove_patterns};
 use caudra_agent::peers::{
@@ -27,6 +27,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::components::document_view::{DocumentMouse, DocumentView, MAX_ROWS, Painted};
+use crate::components::key_freshness::KeyFreshness;
 use crate::components::keybindings::key;
 use crate::components::modal::{FooterHits, FooterLine, Modal};
 use crate::components::{Overlay, field_styles, hover_style, input_text_style};
@@ -594,45 +595,6 @@ enum Confirmation {
     },
 }
 
-#[derive(Default)]
-struct FreshInput {
-    last: Option<KeyCode>,
-    blocked: Option<KeyCode>,
-}
-
-impl FreshInput {
-    fn barrier(&mut self) {
-        self.blocked = self.blocked.or(self.last);
-    }
-
-    fn accept(&mut self, key: KeyEvent) -> bool {
-        match key.kind {
-            KeyEventKind::Release => {
-                if self.last == Some(key.code) {
-                    self.last = None;
-                }
-                if self.blocked == Some(key.code) {
-                    self.blocked = None;
-                }
-                false
-            }
-            KeyEventKind::Repeat => {
-                self.last = Some(key.code);
-                self.barrier();
-                false
-            }
-            KeyEventKind::Press => {
-                self.last = Some(key.code);
-                if self.blocked == Some(key.code) {
-                    return false;
-                }
-                self.blocked = None;
-                true
-            }
-        }
-    }
-}
-
 pub struct PeerManager {
     open: bool,
     generation: u64,
@@ -660,7 +622,7 @@ pub struct PeerManager {
     confirmation: Option<Confirmation>,
     review_rendered: bool,
     confirmation_rendered: bool,
-    freshness: FreshInput,
+    freshness: KeyFreshness,
     feedback: Option<String>,
     popup: Rect,
     list_area: Rect,
@@ -702,7 +664,7 @@ impl PeerManager {
             confirmation: None,
             review_rendered: false,
             confirmation_rendered: false,
-            freshness: FreshInput::default(),
+            freshness: KeyFreshness::default(),
             feedback: None,
             popup: Rect::default(),
             list_area: Rect::default(),
@@ -1595,7 +1557,7 @@ impl PeerManager {
         if matches!(event.code, KeyCode::Modifier(_)) {
             return PeerManagerAction::Consumed;
         }
-        let fresh = event.code != KeyCode::Null && self.freshness.accept(event);
+        let fresh = event.code != KeyCode::Null && self.freshness.accept(event, Instant::now());
         if !self.open || event.kind == KeyEventKind::Release {
             return PeerManagerAction::Consumed;
         }
@@ -3289,9 +3251,9 @@ mod tests {
     use super::{
         ALIAS_SCOPE, AUDIENCE_LABEL, BINDINGS, BROADCASTS_LABEL, BROADCASTS_ON_LABEL,
         BROADCASTS_TITLE, Command, Confirmation, DIRECT_LABEL, EXACT_TARGET_LABEL, FLOOR_BLOCKED,
-        FreshInput, GROUPS_HINT, GROUPS_LABEL, HISTORY_FAILED, HISTORY_POLL, HISTORY_STATUS,
-        LEFT_OUT_HINT, LIST_SEPARATOR, LOADING_HISTORY, LoadedPage, MAX_LITERAL_COLS, MAX_ROWS,
-        NAME_IN_USE, NAME_LABEL, NO_LONGER_HELD, NO_MATCHES, NO_NAME, NO_PEERS, NO_REPLY_TARGET,
+        GROUPS_HINT, GROUPS_LABEL, HISTORY_FAILED, HISTORY_POLL, HISTORY_STATUS, LEFT_OUT_HINT,
+        LIST_SEPARATOR, LOADING_HISTORY, LoadedPage, MAX_LITERAL_COLS, MAX_ROWS, NAME_IN_USE,
+        NAME_LABEL, NO_LONGER_HELD, NO_MATCHES, NO_NAME, NO_PEERS, NO_REPLY_TARGET,
         NO_TOPIC_HISTORY, NO_TOPICS, NOT_LOADED, NOT_RECEIVING, OLDER_HINT, ON, POLICY_SAVED, Pane,
         PanelFocus, PeerManager, PeerManagerAction, PeerView, QUEUED, RECEIVING, REJECTED,
         RETRY_HINT, Reader, ReviewPanel, SEPARATOR, STALE_REVIEW, START_HINT, SUBSCRIBE_LABEL,
@@ -3808,28 +3770,6 @@ mod tests {
             manager.handle_key(press(KeyCode::Enter)),
             PeerManagerAction::Consumed
         ));
-    }
-
-    #[test_case(KeyCode::Char('y'))]
-    #[test_case(KeyCode::Char('n'))]
-    #[test_case(KeyCode::Enter)]
-    fn decision_barrier_rejects_repeat_and_unreleased_repeated_press(code: KeyCode) {
-        let mut input = FreshInput::default();
-        assert!(input.accept(press(code)));
-        input.barrier();
-        assert!(!input.accept(press(code)));
-        assert!(!input.accept(KeyEvent {
-            kind: KeyEventKind::Repeat,
-            ..press(code)
-        }));
-        assert!(!input.accept(KeyEvent {
-            kind: KeyEventKind::Release,
-            ..press(code)
-        }));
-        assert!(input.accept(press(code)));
-        input.barrier();
-        assert!(input.accept(press(KeyCode::Tab)));
-        assert!(input.accept(press(code)));
     }
 
     #[test_case(WIDE, HEIGHT, true ; "wide")]
@@ -4998,6 +4938,7 @@ mod tests {
             fs::{self, Permissions},
             os::unix::fs::PermissionsExt,
             sync::{Arc, atomic::AtomicUsize},
+            time::Instant,
         };
 
         use caudra_agent::{
@@ -5016,6 +4957,7 @@ mod tests {
             BODY, CHANNELS_WANTED, Command, HEIGHT, NARROW, PAGE_WANTED, PeerManager,
             PeerManagerAction, PeerView, SHORT, TITLE, WIDE, draw, mouse, press,
         };
+        use crate::components::key_freshness::QUIET_GAP;
 
         const PRIVATE_MODE: u32 = 0o700;
         const REQUEST: &str = "peer-manager-review-test";
@@ -5105,6 +5047,26 @@ mod tests {
             ));
         }
 
+        #[test]
+        fn without_key_ups_a_quiet_press_approves() {
+            let (_directory, _host, _receiver, mut manager) = reviewing();
+            let approve = press(KeyCode::Char('y'));
+            manager.freshness.accept(approve, Instant::now());
+            manager.freshness.barrier();
+            assert!(matches!(
+                manager.handle_key(approve),
+                PeerManagerAction::Consumed
+            ));
+            manager.freshness.age(QUIET_GAP);
+            assert!(matches!(
+                manager.handle_key(approve),
+                PeerManagerAction::Decide {
+                    decision: PeerDecision::Approve,
+                    ..
+                }
+            ));
+        }
+
         #[test_case(KeyCode::Char('y'), KeyModifiers::NONE, None, false; "no_text")]
         #[test_case(KeyCode::Char('y'), KeyModifiers::NONE, Some(""), false; "empty_text")]
         #[test_case(KeyCode::Char('y'), KeyModifiers::NONE, Some("yes"), false; "multiple_scalars")]
@@ -5127,8 +5089,8 @@ mod tests {
                     panic!("expected an exact peer decision");
                 };
                 assert_eq!(decision, PeerDecision::Approve);
-                assert_eq!(manager.freshness.blocked, Some(code));
-                assert_eq!(manager.freshness.last, Some(code));
+                assert_eq!(manager.freshness.blocked_key(), Some(code));
+                assert_eq!(manager.freshness.last_press(), Some(code));
                 manager.handle_keyboard(
                     KeyEvent {
                         kind: KeyEventKind::Release,
@@ -5136,8 +5098,8 @@ mod tests {
                     },
                     Some(None),
                 );
-                assert_eq!(manager.freshness.blocked, None);
-                assert_eq!(manager.freshness.last, None);
+                assert_eq!(manager.freshness.blocked_key(), None);
+                assert_eq!(manager.freshness.last_press(), None);
                 manager.finish_decision(receiver.decide_held(&token, decision));
                 assert!(receiver.has_pending());
             } else {

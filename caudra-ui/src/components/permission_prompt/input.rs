@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use caudra_agent::permissions::PermissionAnswer;
 use caudra_workbench::text_field::{
     FieldKind, TextCommand, TextKey, command_key, decode, keyboard_text,
@@ -11,43 +13,10 @@ use super::choices::Choice;
 use super::customize::ScopeItem;
 use super::step_through::{REVIEW_CHOICES, ReviewChoice};
 use super::{Panel, PermissionDecision, PermissionPrompt, PromptMouse, PromptState, PromptTarget};
+use crate::components::key_freshness::Rearm;
 use crate::components::permission_scope::view::ScopeView;
 use crate::components::scrollbar::ScrollbarMouse;
 use crate::components::{Overlay, is_ctrl};
-
-/// Holds back a key that was already down when what it would answer last
-/// changed, until it is let go or another key is pressed, so a held or
-/// repeated key cannot answer something the user has not seen.
-#[derive(Default)]
-pub(super) struct InputFreshness {
-    last_press: Option<KeyCode>,
-    blocked_key: Option<KeyCode>,
-}
-
-impl InputFreshness {
-    pub(super) fn barrier(&mut self) {
-        self.blocked_key = self.blocked_key.or(self.last_press);
-    }
-
-    fn press(&mut self, key: KeyEvent) -> bool {
-        self.last_press = Some(key.code);
-        if self.blocked_key == Some(key.code) {
-            false
-        } else {
-            self.blocked_key = None;
-            true
-        }
-    }
-
-    fn release(&mut self, key: KeyEvent) {
-        if self.blocked_key == Some(key.code) {
-            self.blocked_key = None;
-        }
-        if self.last_press == Some(key.code) {
-            self.last_press = None;
-        }
-    }
-}
 
 fn backwards(key: &KeyEvent) -> bool {
     key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT)
@@ -68,12 +37,14 @@ fn review_index(choice: ReviewChoice) -> usize {
 }
 
 impl PermissionPrompt {
-    /// Whether the key being held back would answer, so the footer says how
-    /// to get it through.
-    pub(super) fn decision_needs_rearm(&self) -> bool {
-        let Some(key) = self.input_freshness.blocked_key else {
-            return false;
-        };
+    /// How the key being held back gets through, when it would answer, so the
+    /// footer says so.
+    pub(super) fn decision_rearm(&self) -> Option<Rearm> {
+        let (key, rearm) = self.input_freshness.held_back()?;
+        self.key_would_answer(key).then_some(rearm)
+    }
+
+    fn key_would_answer(&self, key: KeyCode) -> bool {
         if self.inspector.is_some() && self.panel != Panel::Details {
             return false;
         }
@@ -128,14 +99,10 @@ impl PermissionPrompt {
             self.insert_keyboard_text(key, text);
             return None;
         }
+        let fresh = self.input_freshness.accept(key, Instant::now());
         match key.kind {
-            KeyEventKind::Release => {
-                self.input_freshness.release(key);
-                return None;
-            }
+            KeyEventKind::Release => return None,
             KeyEventKind::Repeat => {
-                self.input_freshness.last_press = Some(key.code);
-                self.input_freshness.barrier();
                 if self.insert_keyboard_text(key, text) {
                     return None;
                 }
@@ -147,7 +114,6 @@ impl PermissionPrompt {
             }
             KeyEventKind::Press => {}
         }
-        let fresh = self.input_freshness.press(key);
         if !self.is_open() {
             return None;
         }
@@ -164,11 +130,11 @@ impl PermissionPrompt {
             && (matches!(key.code, KeyCode::Enter | KeyCode::Char('y' | 's' | 'a'))
                 || digit(key.code).is_some());
         let decision = self.handle_press(key);
-        if decision.is_some() || unseen_activation {
-            self.input_freshness.barrier();
-        }
         if decision.is_some() {
+            self.input_freshness.barrier();
             self.invalidate_controls();
+        } else if unseen_activation {
+            self.input_freshness.refuse();
         }
         decision
     }
@@ -731,7 +697,7 @@ impl PermissionPrompt {
                 return false;
             }
             self.field.paste(text);
-            self.input_freshness = InputFreshness::default();
+            self.input_freshness.clear();
             self.refresh_inspector(None);
             return true;
         }
@@ -739,7 +705,7 @@ impl PermissionPrompt {
             return false;
         }
         self.field.paste(text);
-        self.input_freshness = InputFreshness::default();
+        self.input_freshness.clear();
         true
     }
 
@@ -843,12 +809,13 @@ mod tests {
         batch_request, cover, fetch_request, file_request, heredoc_request, key, planning,
         prompt_for, prose, render, shell_prompt,
     };
-    use super::super::view::{PRESS_AGAIN, REARM_MESSAGE};
+    use super::super::view::{PRESS_AGAIN, RELEASE_MESSAGE, WAIT_MESSAGE};
     use super::super::{
         Panel, PermissionPrompt, PromptMouse, PromptState, PromptTarget, RowChoice,
     };
     use super::ScopeItem;
     use crate::components::command_text::tests::coloured;
+    use crate::components::key_freshness::QUIET_GAP;
 
     const FIRST: &str = "first";
     const NEXT: &str = "next";
@@ -1342,7 +1309,7 @@ mod tests {
         for _ in 0..REPEAT_COUNT {
             assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
         }
-        assert!(draw(&mut prompt).contains(REARM_MESSAGE));
+        assert!(draw(&mut prompt).contains(WAIT_MESSAGE));
         for kind in [
             KeyEventKind::Press,
             KeyEventKind::Repeat,
@@ -1403,7 +1370,7 @@ mod tests {
                 .handle_key(with_kind(held, KeyEventKind::Repeat))
                 .is_none()
         );
-        assert_eq!(draw(&mut prompt).contains(REARM_MESSAGE), named);
+        assert_eq!(draw(&mut prompt).contains(RELEASE_MESSAGE), named);
         assert!(prompt.handle_key(key(held)).is_none());
         assert_eq!(prompt.pending.as_ref().unwrap().answer, frozen);
     }
@@ -1472,7 +1439,7 @@ mod tests {
         prompt.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), area));
         assert!(prompt.resolve(FIRST));
         assert!(prompt.handle_key(key(KeyCode::Char(shortcut))).is_none());
-        assert!(draw(&mut prompt).contains(REARM_MESSAGE));
+        assert!(draw(&mut prompt).contains(WAIT_MESSAGE));
         assert!(
             decided(prompt.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), area)))
                 .is_none()
@@ -1502,14 +1469,14 @@ mod tests {
         draw(&mut prompt);
         assert_eq!(prompt.handle_key(event).unwrap().request_id, FIRST);
         assert!(prompt.resolve(FIRST));
-        assert!(draw(&mut prompt).contains(REARM_MESSAGE));
+        assert!(!draw(&mut prompt).contains(WAIT_MESSAGE));
         for _ in 0..REPEAT_COUNT {
             assert!(prompt.handle_key(event).is_none());
-            assert!(draw(&mut prompt).contains(REARM_MESSAGE));
+            assert!(draw(&mut prompt).contains(WAIT_MESSAGE));
             assert_eq!(prompt.request_id(), Some(NEXT));
         }
         assert!(prompt.handle_key(key(KeyCode::Down)).is_none());
-        assert!(!draw(&mut prompt).contains(REARM_MESSAGE));
+        assert!(!draw(&mut prompt).contains(WAIT_MESSAGE));
         assert_eq!(prompt.handle_key(event).unwrap().request_id, NEXT);
     }
 
@@ -1579,6 +1546,39 @@ mod tests {
         );
     }
 
+    #[test_case(None; "legacy")]
+    #[test_case(Some(None); "enhanced")]
+    fn without_key_ups_a_quiet_enter_accepts_the_highlighted_choice(text: Option<Option<&str>>) {
+        let mut prompt = PermissionPrompt::new();
+        prompt.handle_keyboard(key(KeyCode::Enter), text);
+        prompt.enqueue(Box::new(native_shell_request(SINGLE_COMMAND)), None);
+        assert!(!draw(&mut prompt).contains(WAIT_MESSAGE));
+        assert!(prompt.handle_keyboard(key(KeyCode::Enter), text).is_none());
+        assert!(draw(&mut prompt).contains(WAIT_MESSAGE));
+        prompt.input_freshness.age(QUIET_GAP);
+        assert_eq!(
+            prompt
+                .handle_keyboard(key(KeyCode::Enter), text)
+                .unwrap()
+                .answer,
+            prompt.choice_answer(Choice::Once).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_reported_key_up_keeps_waiting_for_the_release() {
+        let mut prompt = PermissionPrompt::new();
+        prompt.handle_key(key(KeyCode::Enter));
+        prompt.handle_key(with_kind(KeyCode::Enter, KeyEventKind::Release));
+        prompt.handle_key(key(KeyCode::Enter));
+        prompt.enqueue(Box::new(native_shell_request(SINGLE_COMMAND)), None);
+        assert!(draw(&mut prompt).contains(RELEASE_MESSAGE));
+        prompt.input_freshness.age(QUIET_GAP);
+        assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
+        prompt.handle_key(with_kind(KeyCode::Enter, KeyEventKind::Release));
+        assert!(prompt.handle_key(key(KeyCode::Enter)).is_some());
+    }
+
     #[test_case(KeyCode::Char('y'), KeyModifiers::NONE, None, false; "no_text")]
     #[test_case(KeyCode::Char('y'), KeyModifiers::NONE, Some(""), false; "empty_text")]
     #[test_case(KeyCode::Char('y'), KeyModifiers::NONE, Some(KEYBOARD_TEXT), false; "multiple_scalars")]
@@ -1608,7 +1608,7 @@ mod tests {
         let physical = KeyEvent::new(KeyCode::Char('/'), KeyModifiers::SHIFT);
         assert!(prompt.handle_keyboard(physical, Some(Some("?"))).is_none());
         assert_eq!(prompt.panel, Panel::Details);
-        assert_eq!(prompt.input_freshness.last_press, Some(physical.code));
+        assert_eq!(prompt.input_freshness.last_press(), Some(physical.code));
         prompt.input_freshness.barrier();
         prompt.handle_keyboard(
             KeyEvent {
@@ -1617,8 +1617,8 @@ mod tests {
             },
             Some(None),
         );
-        assert_eq!(prompt.input_freshness.last_press, None);
-        assert_eq!(prompt.input_freshness.blocked_key, None);
+        assert_eq!(prompt.input_freshness.last_press(), None);
+        assert_eq!(prompt.input_freshness.blocked_key(), None);
         prompt.handle_keyboard(physical, Some(Some("?")));
         assert_eq!(prompt.panel, Panel::Main);
     }
@@ -1634,7 +1634,10 @@ mod tests {
             Some(text),
         );
         assert_eq!(prompt.highlight, expected);
-        assert_eq!(prompt.input_freshness.blocked_key, Some(KeyCode::Char('k')));
+        assert_eq!(
+            prompt.input_freshness.blocked_key(),
+            Some(KeyCode::Char('k'))
+        );
     }
 
     #[test_case(KeyEventKind::Press; "press")]
@@ -1644,17 +1647,17 @@ mod tests {
     ) {
         let mut prompt = broad_pending(PermissionLifetime::Project);
         prompt.state = PromptState::Guidance;
-        let blocked = prompt.input_freshness.blocked_key;
+        let blocked = prompt.input_freshness.blocked_key();
         assert!(blocked.is_some());
         prompt.handle_keyboard(with_kind(KeyCode::Null, kind), Some(Some(KEYBOARD_TEXT)));
         assert_eq!(prompt.field.text(), KEYBOARD_TEXT);
-        assert_eq!(prompt.input_freshness.blocked_key, blocked);
+        assert_eq!(prompt.input_freshness.blocked_key(), blocked);
         prompt.handle_keyboard(
             with_kind(KeyCode::Null, KeyEventKind::Release),
             Some(Some(KEYBOARD_TEXT)),
         );
         assert_eq!(prompt.field.text(), KEYBOARD_TEXT);
-        assert_eq!(prompt.input_freshness.blocked_key, blocked);
+        assert_eq!(prompt.input_freshness.blocked_key(), blocked);
     }
 
     #[test]
@@ -1664,9 +1667,9 @@ mod tests {
         let physical = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SHIFT);
         prompt.handle_keyboard(physical, Some(Some(KEYBOARD_TEXT)));
         assert_eq!(prompt.field.text(), KEYBOARD_TEXT);
-        assert_eq!(prompt.input_freshness.last_press, Some(physical.code));
+        assert_eq!(prompt.input_freshness.last_press(), Some(physical.code));
         prompt.handle_keyboard(with_kind(physical.code, KeyEventKind::Release), Some(None));
-        assert_eq!(prompt.input_freshness.last_press, None);
+        assert_eq!(prompt.input_freshness.last_press(), None);
         prompt.handle_keyboard(key(KeyCode::Char('\'')), Some(None));
         assert_eq!(prompt.field.text(), KEYBOARD_TEXT);
     }
@@ -1807,7 +1810,7 @@ mod tests {
             prompt.row_grant(1),
             Some(PermissionRowGrant::Offered(exact))
         );
-        assert_eq!(prompt.input_freshness.blocked_key, Some(KeyCode::Right));
+        assert_eq!(prompt.input_freshness.blocked_key(), Some(KeyCode::Right));
 
         let Some(PermissionRowGrant::Offered(id)) = chosen else {
             panic!("row 0 was not moved to an offered rung: {chosen:?}");
@@ -1827,7 +1830,7 @@ mod tests {
         prompt.handle_key(key(KeyCode::Down));
         let update = if caution { advised(request) } else { request };
         assert!(prompt.update(Box::new(update)));
-        assert_eq!(prompt.input_freshness.blocked_key.is_some(), caution);
+        assert_eq!(prompt.input_freshness.blocked_key().is_some(), caution);
         assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
         draw(&mut prompt);
         assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());

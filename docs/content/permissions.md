@@ -121,7 +121,7 @@ The `No` answer opens a one-line field for guidance. `Enter` sends the guidance 
 | `Esc` | Deny from the answers or Details. Elsewhere, go back without answering |
 | `Ctrl-C` | Deny |
 
-Answers and footer keys also take mouse clicks. A click counts when the press and the release land on the same answer. An answer needs a key press made after the prompt was drawn, so a held or repeated key cannot answer a prompt you have not seen. Terminals that report key releases rearm on release. On older terminals, a key that would carry over into the next decision makes the footer read `Press Tab, then press the key again.`
+Answers and footer keys also take mouse clicks. A click counts when the press and the release land on the same answer. An answer needs a key press made after the prompt was drawn, so a held or repeated key cannot answer a prompt you have not seen. Terminals that report key releases rearm on release, and the footer reads `Let go of the key, then press it again.` while you hold it. Some terminals never report releases. There a key rearms once it has been quiet for a second, and a held key keeps repeating, so it stays blocked. After a press too soon, the footer reads `Wait a moment, then press the key again.` Pressing a different key rearms at once on any terminal.
 
 Rest the mouse on part of a prompt for half a second and a [tooltip](/docs/quick-start/) explains it. Answers show their letter keys and what they remember. Command rows show their status and the full command when its column cut it. Badges, tabs, Customize fields, inspector controls, and the parts of the Advanced view work the same way. A footer key shows its description when the footer had to drop it. Set `tooltips = false` under `[ui]` to turn tooltips off.
 

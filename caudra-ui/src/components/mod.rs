@@ -21,6 +21,7 @@ pub(crate) mod help_modal;
 pub mod input;
 pub(crate) mod json_text;
 pub(crate) mod json_tree;
+pub(crate) mod key_freshness;
 pub mod keybindings;
 pub(crate) mod list_picker;
 pub(crate) mod login_picker;
