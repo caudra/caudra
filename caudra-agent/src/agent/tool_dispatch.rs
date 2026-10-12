@@ -13,6 +13,7 @@ use super::change_recording;
 use super::relative_paths::{MAX_SUGGESTIONS, PathBase, PathSuggestion};
 use crate::background::ShellJobMetadata;
 use crate::decisions::{DecisionFeature, shell_duration::ShellDurationPlan};
+use crate::mcp::output::MCP_SUMMARY_PREFIX;
 use crate::mcp::{McpSession, UNKNOWN_MCP};
 use crate::permissions::{
     PermissionAuthorityProfile, PermissionError, RemotePermissionIdentity, canonical_json,
@@ -1301,7 +1302,7 @@ async fn run_inner(
             &id,
             &tool_id,
             ToolEffect::Unknown,
-            format!("mcp: {mcp_lookup}"),
+            format!("{MCP_SUMMARY_PREFIX}{mcp_lookup}"),
             input,
         );
         execute_mcp_tool(ctx, &id, tool_id, mcp_lookup, input)
@@ -1787,10 +1788,10 @@ async fn execute_mcp_tool(
     tool_name: &str,
     input: &Value,
 ) -> ToolDoneEvent {
-    let done = |output: String| ToolDoneEvent {
+    let done = |output: ToolOutput| ToolDoneEvent {
         id: id.to_owned(),
         tool: Arc::clone(&tool_id),
-        output: ToolOutput::Plain(output.into()),
+        output,
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1804,32 +1805,33 @@ async fn execute_mcp_tool(
         documents: Vec::new(),
         accounting: ToolAccounting::default(),
     };
+    let fail = |message: String| done(ToolOutput::Plain(message.into()));
 
     if ctx.policy().is_read_only() {
-        return done(format!("{READ_ONLY_TOOL_RESTRICTED}: {tool_name}"))
+        return fail(format!("{READ_ONLY_TOOL_RESTRICTED}: {tool_name}"))
             .with_failure(ToolFailure::Denied);
     }
 
     if ctx.mode.is_planning() {
-        return done(MCP_BLOCKED_IN_PLAN.into()).with_failure(ToolFailure::Denied);
+        return fail(MCP_BLOCKED_IN_PLAN.into()).with_failure(ToolFailure::Denied);
     }
 
     let perm_tool = match ToolKey::parse(tool_name) {
         Ok(k) => k,
         Err(e) => {
-            return done(format!("invalid MCP tool key '{tool_name}': {e}"))
+            return fail(format!("invalid MCP tool key '{tool_name}': {e}"))
                 .with_failure(ToolFailure::Other);
         }
     };
     let perm_scope = canonical_json(input);
     let perm_scopes = crate::tools::PermissionScopes::single(perm_scope);
     let Some(mcp) = &ctx.mcp else {
-        return done(format!("MCP manager not available for {tool_name}"))
+        return fail(format!("MCP manager not available for {tool_name}"))
             .with_failure(ToolFailure::Other);
     };
     let binding = match mcp.bind_tool(tool_name) {
         Ok(binding) => binding,
-        Err(error) => return done(error.to_string()).with_failure(error.failure()),
+        Err(error) => return fail(error.to_string()).with_failure(error.failure()),
     };
 
     if let Err(e) = ctx
@@ -1852,7 +1854,7 @@ async fn execute_mcp_tool(
         .await
     {
         let refusal = permission_refusal(ctx, &e);
-        return done(refusal.message).with_failure(refusal.failure);
+        return fail(refusal.message).with_failure(refusal.failure);
     }
 
     // A permitted call to a deferred tool counts as loading it, so its full
@@ -1866,12 +1868,12 @@ async fn execute_mcp_tool(
     .await
     {
         Ok(recording) => recording,
-        Err(message) => return done(message).with_failure(ToolFailure::Other),
+        Err(message) => return fail(message).with_failure(ToolFailure::Other),
     };
     let called = recording.around(ctx, binding.call(input)).await;
     match called {
-        Ok(text) => done(text),
-        Err(e) => done(e.to_string()).with_failure(e.failure()),
+        Ok(output) => done(ToolOutput::Mcp(output)),
+        Err(e) => fail(e.to_string()).with_failure(e.failure()),
     }
 }
 

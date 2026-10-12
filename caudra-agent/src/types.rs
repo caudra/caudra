@@ -31,6 +31,7 @@ use strum::Display;
 
 use crate::agent::{GoalResult, GoalVerdict};
 use crate::autopilot::{AutopilotDecision, DecisionKind};
+use crate::mcp::output::McpOutput;
 use crate::peers::{
     AssignedWork, PeerHistoryPage, PeerSummary, PublishReceipt, STATUS_HELD, STATUS_QUEUED,
     STATUS_RATE_LIMITED, STATUS_REFUSED, STATUS_UNAVAILABLE, SendReceipt, TopicActivity,
@@ -60,7 +61,7 @@ pub const CARD_LOG_LINES: usize = 3;
 const CARD_REPORT_FIELD: &str = "report";
 const CARD_PREVIEW_MARKER: &str = "…";
 const CARD_PHASE_SEPARATOR: &str = " › ";
-const CARD_ANNOTATION_SEPARATOR: &str = " · ";
+pub(crate) const CARD_ANNOTATION_SEPARATOR: &str = " · ";
 
 /// Labels for the two command rows an environment result ends with. The card
 /// and the model text use the same words, so a reader and the model are looking
@@ -88,7 +89,7 @@ const MEMORY_PENDING_LABEL: &str = "pending";
 const MEMORY_HITS_HEADING: &str = "Notes matching";
 const MEMORY_HIT_BULLET: &str = "- ";
 const MEMORY_HIT_INDENT: &str = "  ";
-const LINE_NOUN: &str = "line";
+pub(crate) const LINE_NOUN: &str = "line";
 const TOOL_OUTPUT_LOADED: &str = "loaded";
 const PEER_SESSION_NOUN: &str = "session";
 const PEER_SESSIONS_EMPTY: &str = "No other live local sessions.";
@@ -1424,7 +1425,7 @@ fn numbered(content: &str) -> String {
 
 /// `1 note`, `3 notes`. Small enough to inline everywhere it is needed, and
 /// wrong often enough when it is.
-fn counted(count: usize, noun: &str) -> String {
+pub(crate) fn counted(count: usize, noun: &str) -> String {
     match count {
         1 => format!("{count} {noun}"),
         _ => format!("{count} {noun}s"),
@@ -1865,6 +1866,8 @@ pub enum ToolOutput {
     WorkflowRun(Box<WorkflowRunCard>),
     Tasks(TaskOutput),
     Peers(PeerOutput),
+    /// An MCP tool's answer, block by block.
+    Mcp(McpOutput),
 }
 
 /// How far a search reached before a bound stopped it. Both counts are lower
@@ -2004,6 +2007,7 @@ impl ToolOutput {
             Self::WorkflowRun(card) => Some(card.headline()),
             Self::Tasks(cards) => Some(counted(cards.len(), "task")),
             Self::Environment { headline, .. } => Some(headline.clone()),
+            Self::Mcp(output) => output.annotation(),
             _ => None,
         }
     }
@@ -2099,6 +2103,7 @@ impl ToolOutput {
             | Self::Answers(_)
             | Self::Environment { .. }
             | Self::WorkflowRun(_)
+            | Self::Mcp(_)
             | Self::Tasks(_) => Some(self.as_display_text()),
             _ => None,
         }
@@ -2118,6 +2123,7 @@ impl ToolOutput {
                 page.messages.is_empty() && page.withheld == 0
             }
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.text.is_empty(),
+            Self::Mcp(output) => output.is_empty(),
             _ => false,
         }
     }
@@ -2132,6 +2138,7 @@ impl ToolOutput {
             Self::Shell(output) => output.model_text.clone(),
             Self::Skill(skill) => skill.model_text(),
             Self::Peers(output) => output.model_text(),
+            Self::Mcp(output) => output.model_text(),
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => {
                 let mut out = t.text.clone();
                 if let Some(blocks) = &t.instructions {
@@ -2161,6 +2168,7 @@ impl ToolOutput {
     pub fn as_display_text(&self) -> String {
         match self {
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.text.clone(),
+            Self::Mcp(output) => output.display_text(),
             Self::CodeGraph {
                 headline,
                 rows,

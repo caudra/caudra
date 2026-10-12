@@ -9,6 +9,7 @@ use tracing::info;
 use std::collections::HashMap;
 
 use super::error::McpError;
+use super::output::McpOutput;
 use super::protocol::{
     CallToolResult, GetPromptResult, PromptInfo, PromptsListResult, ToolInfo, ToolsListResult,
     initialize_params,
@@ -103,7 +104,7 @@ pub async fn call_tool(
     transport: &dyn McpTransport,
     tool_name: &str,
     args: &Value,
-) -> Result<String, McpError> {
+) -> Result<McpOutput, McpError> {
     let server = &**transport.server_name();
     let start = Instant::now();
     let params = serde_json::json!({
@@ -114,13 +115,11 @@ pub async fn call_tool(
     let call_result: CallToolResult =
         serde_json::from_value(result).map_err(|e| invalid_response(transport.server_name(), e))?;
 
-    let text = call_result.joined_text();
-
     if call_result.is_error {
         return Err(McpError::RpcError {
             server: (**transport.server_name()).into(),
             code: -1,
-            message: text,
+            message: call_result.joined_text(),
         });
     }
 
@@ -130,7 +129,7 @@ pub async fn call_tool(
         duration_ms = start.elapsed().as_millis() as u64,
         "MCP tools/call response"
     );
-    Ok(text)
+    Ok(McpOutput::from_result(call_result))
 }
 
 #[cfg(test)]

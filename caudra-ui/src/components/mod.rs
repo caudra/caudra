@@ -26,6 +26,7 @@ pub(crate) mod login_picker;
 pub(crate) mod logs_modal;
 pub(crate) mod lua_float;
 pub(crate) mod markdown_reader;
+pub(crate) mod mcp_card;
 pub(crate) mod mcp_picker;
 pub(crate) mod memory_card;
 pub(crate) mod memory_inspector;

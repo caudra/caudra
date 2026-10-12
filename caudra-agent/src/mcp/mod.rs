@@ -19,6 +19,7 @@ pub mod config;
 pub mod error;
 pub mod http;
 pub mod oauth;
+pub mod output;
 pub mod protocol;
 pub mod stdio;
 pub mod transport;
@@ -48,6 +49,7 @@ use self::config::{
 };
 use self::error::McpError;
 use self::http::HttpTransport;
+use self::output::McpOutput;
 use self::stdio::StdioTransport;
 use self::transport::McpTransport;
 use crate::decisions::{DecisionContext, Decisions};
@@ -278,7 +280,7 @@ impl McpToolBinding {
         self.tool.generation
     }
 
-    pub async fn call(&self, args: &Value) -> Result<String, McpError> {
+    pub async fn call(&self, args: &Value) -> Result<McpOutput, McpError> {
         transport::call_tool(self.tool.transport.as_ref(), &self.tool.raw_name, args).await
     }
 }
@@ -1007,7 +1009,11 @@ impl McpHandle {
         Ok(McpToolBinding { tool })
     }
 
-    pub async fn call_tool(&self, qualified_name: &str, args: &Value) -> Result<String, McpError> {
+    pub async fn call_tool(
+        &self,
+        qualified_name: &str,
+        args: &Value,
+    ) -> Result<McpOutput, McpError> {
         self.bind_tool(qualified_name)?.call(args).await
     }
 

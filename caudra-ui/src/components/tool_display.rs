@@ -2,6 +2,7 @@ use super::{DisplayMessage, ToolProgress, ToolStatus, escape_terminal_controls, 
 
 use super::code_view;
 use super::command_text::{command_spans, overlay};
+use super::mcp_card::OUTPUT_DIVIDER as CODE_OUTPUT_DIVIDER;
 use super::status_bar::collapse_home;
 use crate::animation::{live_elapsed, spinner_frame, spinner_str};
 use crate::chat::batch_child_id;
@@ -11,7 +12,7 @@ use caudra_storage::background::JobKind;
 use code_view::{
     BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, BatchViews, BodySource,
     CardPolicy, CodeRole, Disclosure, HighlightRegion, RenderLimits, RowTarget, ScrollSpan,
-    ScrollWindow, SourceTrace, UNCONSTRAINED_WIDTH, WrappedRows,
+    ScrollWindow, SourceTrace, ToolContent, UNCONSTRAINED_WIDTH, WrappedRows,
 };
 
 use std::borrow::Cow;
@@ -39,9 +40,9 @@ use caudra_agent::tools::native::peers::{
 use caudra_agent::tools::native::plan;
 use caudra_agent::{
     ActivityChild, BatchToolStatus, BufferSnapshot, CallStage, IndexOutput, InstructionBlock,
-    NO_FILES_FOUND, PeerOutput, ShellOutput, SnapshotSpan, SpanStyle, SubagentActivity,
-    SubagentProgress, TaskCard, ToolInput, ToolOutput, format_live_duration,
-    format_settled_duration,
+    MCP_SUMMARY_PREFIX, McpOutput, NO_FILES_FOUND, PeerOutput, ShellOutput, SnapshotSpan,
+    SpanStyle, SubagentActivity, SubagentProgress, TaskCard, ToolInput, ToolOutput,
+    format_live_duration, format_settled_duration, mcp_tool_parts, pretty_json,
     tools::{
         FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, IMAGE_GENERATE_TOOL_NAME, MEMORY_TOOL_NAME,
         PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME,
@@ -276,7 +277,8 @@ pub(crate) const AUTOPILOT_PREFIX: &str = "autopilot \u{203a} ";
 pub(crate) const SPINNER_STYLE_NAME: &str = "spinner";
 pub(crate) const SPINNER_STYLE_PREFIX: &str = "spinner:";
 
-const CODE_OUTPUT_DIVIDER: &str = "────────────";
+/// Between an MCP server's name and its tool's, in a card's label.
+const MCP_LABEL_SEPARATOR: &str = " \u{203a} ";
 /// What separates the parts of a row that reports several things at once: a
 /// header's tally from its spend, each part of its annotation from the next,
 /// and a compact row's header from its activity.
@@ -839,7 +841,13 @@ fn capitalized(label: &str) -> String {
 /// The header with its leading verb put in `tense`, borrowed unchanged for
 /// every tool that does not open with one. Only a whole leading word is
 /// replaced, so a note called `write-ups.md` keeps its name.
+///
+/// A header that only repeats the tool's name says nothing the label does not,
+/// so it is dropped.
 pub(super) fn inflected_header<'a>(tool: &str, header: &'a str, tense: Tense) -> Cow<'a, str> {
+    if repeats_tool(tool, header) {
+        return Cow::Borrowed("");
+    }
     if !names_tool(MEMORY_TOOL_NAME, tool) {
         return Cow::Borrowed(header);
     }
@@ -856,6 +864,40 @@ pub(super) fn inflected_header<'a>(tool: &str, header: &'a str, tense: Tense) ->
         true => Cow::Borrowed(conjugated),
         false => Cow::Owned(format!("{conjugated} {rest}")),
     }
+}
+
+/// Whether `header` is the name of a tool the table has never heard of,
+/// bare as a restored call resolves it or as the summary an MCP call starts
+/// with. Such a tool has nothing to say about a call but its name.
+pub(super) fn repeats_tool(tool: &str, header: &str) -> bool {
+    compact_tool(tool).is_none()
+        && header.strip_prefix(MCP_SUMMARY_PREFIX).unwrap_or(header) == tool
+}
+
+/// Whether a card is an MCP call's: it answered as one, or it started as one.
+fn is_mcp_call(tool: &str, header: &str, output: Option<&ToolOutput>) -> bool {
+    matches!(output, Some(ToolOutput::Mcp(_)))
+        || header.strip_prefix(MCP_SUMMARY_PREFIX) == Some(tool)
+}
+
+/// A title's label, followed by `gap`. A tool the table has never heard of is
+/// labelled with its own name, and an MCP one's names its server apart from
+/// its tool, dimmed, so `executor › execute` reads as the tool it is.
+pub(super) fn label_spans(tool: &str, label: &str, gap: &str, style: Style) -> Vec<Span<'static>> {
+    match mcp_tool_parts(tool).filter(|_| label == tool && compact_tool(tool).is_none()) {
+        Some((server, name)) => vec![
+            Span::styled(
+                format!("{server}{MCP_LABEL_SEPARATOR}"),
+                theme::current().tool_dim,
+            ),
+            Span::styled(format!("{name}{gap}"), style),
+        ],
+        None => vec![Span::styled(format!("{label}{gap}"), style)],
+    }
+}
+
+fn spans_text(spans: &[Span<'_>]) -> String {
+    spans.iter().map(|span| span.content.as_ref()).collect()
 }
 
 pub(super) fn report_header<'a>(
@@ -1650,6 +1692,29 @@ struct ResolvedOutput<'a> {
     /// the rows it withheld itself.
     dropped: usize,
     limit: RowLimit,
+    /// The text is a JSON document re-indented, to be painted as one.
+    json: bool,
+}
+
+impl ResolvedOutput<'_> {
+    /// A card whose header only repeats its tool's name has nothing to say
+    /// but its answer, and a plain answer that is a JSON document reads as
+    /// one: indented and coloured. A restored MCP call from before results
+    /// were kept block by block is the case this exists for. The pretty text
+    /// replaces the abridged body whole, so the limit cuts it by its own rows.
+    fn prefer_json(&mut self) {
+        let Some(pretty) = self.full_text.as_deref().and_then(pretty_json) else {
+            return;
+        };
+        let pretty: Cow<'_, str> = Cow::Owned(pretty);
+        self.text = Some(match self.limit {
+            RowLimit::Budget { .. } => capped_lines(pretty.clone()),
+            RowLimit::Scroll(_) => pretty.clone(),
+        });
+        self.full_text = Some(pretty);
+        self.dropped = 0;
+        self.json = true;
+    }
 }
 
 fn resolve_output<'a>(
@@ -1732,6 +1797,7 @@ fn resolve_output<'a>(
         full_text,
         dropped,
         limit,
+        json: false,
     }
 }
 
@@ -1828,10 +1894,8 @@ impl ToolLineBuilder {
         // An omitted header leaves the label against the annotation, so the
         // separator goes with the text it separates.
         let gap = if header.is_empty() { "" } else { " " };
-        let mut spans = vec![Span::styled(
-            format!("{label}{gap}"),
-            theme::current().tool_prefix,
-        )];
+        let mut spans = label_spans(tool_name, label, gap, theme::current().tool_prefix);
+        let mut copy = format!("{}{header}", spans_text(&spans));
         if let Some(snapshot) = render_header {
             if let Some(first_line) = snapshot.lines.first() {
                 let line_idx = self.lines.len();
@@ -1855,7 +1919,6 @@ impl ToolLineBuilder {
             };
             spans.extend(header_spans(tool_name, header, style, raw_input));
         }
-        let mut copy = format!("{label}{gap}{header}");
         push_annotation(&mut spans, &mut copy, annotation);
         self.lines.push(Line::from(spans));
         self.search_text = copy;
@@ -1876,11 +1939,9 @@ impl ToolLineBuilder {
         let header = &*inflected_header(tool_name, header, tense);
         self.sigil = sigil;
 
-        let mut copy = format!("{label} {header}");
-        let mut spans = vec![Span::styled(
-            format!("{label} "),
-            theme::current().tool_prefix,
-        )];
+        let gap = if header.is_empty() { "" } else { " " };
+        let mut spans = label_spans(tool_name, label, gap, theme::current().tool_prefix);
+        let mut copy = format!("{}{header}", spans_text(&spans));
         spans.extend(header_spans(
             tool_name,
             header,
@@ -2097,6 +2158,22 @@ impl ToolLineBuilder {
 
     fn push_rendered_code(&mut self, input: Option<&ToolInput>, output: Option<&ToolOutput>) {
         let content = code_view::render_tool_content(input, output, false, self.limits.clone());
+        self.push_content(content);
+    }
+
+    /// An MCP call's body, with `arguments` above what came back when given.
+    fn push_mcp_card(&mut self, arguments: Option<&Value>, output: Option<&McpOutput>) {
+        self.push_content(code_view::render_mcp_content(
+            arguments,
+            output,
+            &self.limits,
+        ));
+        if let Some(output) = output {
+            self.push_search_text(&output.display_text());
+        }
+    }
+
+    fn push_content(&mut self, content: ToolContent) {
         self.truncation |= content.truncation;
         let start = self.lines.len();
         match content.source {
@@ -2220,7 +2297,10 @@ impl ToolLineBuilder {
                 // Broken to the body's own width, so a row too long for the
                 // card keeps the indent that says whose body it is instead of
                 // restarting at column zero when the terminal breaks it.
-                let (body, source) = code_view::plain_body(text, self.body_width());
+                let (body, source) = match resolved.json {
+                    true => code_view::json_body(text, self.body_width()),
+                    false => code_view::plain_body(text, self.body_width()),
+                };
                 let (body, scrolled) = resolved.limit.apply(body);
                 // The rows behind the lines the limit kept, so a copy reads
                 // back what was drawn rather than the whole body it came from.
@@ -2844,9 +2924,21 @@ pub fn build_tool_lines(
         b.push_resolved_output(&resolved);
         return b.finish(None, None);
     }
+    let mcp_call = is_mcp_call(tool_name, header, msg.tool_output.as_deref());
     match live {
         Some(live) if draws_live_script(tool_name) => b.push_live_script(live),
         Some(live) => b.push_live_body(live, draws_live_markdown(tool_name, header)),
+        // At rest the card spends its budget on the answer; the arguments are
+        // there for a reader who opened it whole, or while there is no answer.
+        None if mcp_call => b.push_mcp_card(
+            msg.tool_raw_input
+                .as_deref()
+                .filter(|_| expanded.full || b.is_in_progress()),
+            match msg.tool_output.as_deref() {
+                Some(ToolOutput::Mcp(output)) => Some(output),
+                _ => None,
+            },
+        ),
         None => b.push_code_content(
             msg.tool_input.as_deref(),
             match msg.render_snapshot.is_some() {
@@ -2905,6 +2997,9 @@ pub fn build_tool_lines(
             output_limits,
             expanded.shell_raw,
         );
+        if repeats_tool(tool_name, header) {
+            resolved.prefer_json();
+        }
         if window.is_some() {
             resolved.limit = RowLimit::WHOLE;
             resolved.dropped = 0;
@@ -3197,7 +3292,7 @@ mod tests {
         SKILL_TOOL_NAME, TASK_TOOL_NAME, ToolEffect,
     };
     use caudra_agent::{
-        BatchToolEntry, BatchToolStatus, GrepFileEntry, GrepMatchGroup, ShellFilterInfo,
+        BatchToolEntry, BatchToolStatus, GrepFileEntry, GrepMatchGroup, McpBlock, ShellFilterInfo,
         SkillOutput, SnapshotLine, SnapshotSpan, SubagentActivity, TextOutput, ToolInput,
         ToolOutput,
     };
@@ -8392,6 +8487,165 @@ mod tests {
             finished_style(Indicator::Warning),
             finished_style(Indicator::Success),
             "{EMPTY_ANSWER_MSG}"
+        );
+    }
+
+    const MCP_TOOL: &str = "executor.execute";
+    const MCP_LABEL: &str = "executor \u{203a} execute";
+    const MCP_JSON: &str = "{\"status\":\"completed\",\"items\":[1]}";
+    const MCP_PRETTY_ROW: &str = "\"status\": \"completed\",";
+    const MCP_ARGUMENT_ROW: &str = "\"limit\": 3";
+
+    fn mcp_msg(text: &str, status: ToolStatus, output: Option<ToolOutput>) -> DisplayMessage {
+        let mut msg = bash_msg(text, status, None, output);
+        if let DisplayRole::Tool(tool) = &mut msg.role {
+            tool.name = MCP_TOOL.into();
+        }
+        msg.tool_raw_input = Some(Arc::new(serde_json::json!({"limit": 3})));
+        msg
+    }
+
+    fn mcp_output() -> ToolOutput {
+        ToolOutput::Mcp(McpOutput {
+            blocks: vec![McpBlock::Text {
+                text: MCP_JSON.into(),
+            }],
+        })
+    }
+
+    fn trimmed_rows(tl: &ToolLines) -> Vec<String> {
+        tl.lines
+            .iter()
+            .map(|line| line_text(line).trim().to_owned())
+            .collect()
+    }
+
+    #[test_case(&format!("{MCP_SUMMARY_PREFIX}{MCP_TOOL}") ; "live")]
+    #[test_case(MCP_TOOL ; "restored")]
+    fn an_mcp_header_names_its_server_and_tool_once(header: &str) {
+        let tl = build_tool_lines(
+            &mcp_msg(header, ToolStatus::Success, Some(mcp_output())),
+            ToolStatus::Success,
+            &test_rctx(80),
+            Some(Disclosure::default()),
+        );
+
+        let title = line_text(&tl.lines[0]);
+        assert!(title.contains(MCP_LABEL), "{title}");
+        assert!(!title.contains(MCP_TOOL), "{title}");
+        assert!(!title.contains(MCP_SUMMARY_PREFIX), "{title}");
+        assert!(has_styled_span(
+            &tl.lines[0].spans,
+            "executor",
+            theme::current().tool_dim
+        ));
+    }
+
+    #[test]
+    fn a_compact_mcp_row_keeps_its_arguments() {
+        let rctx = RenderCtx {
+            compact: true,
+            ..test_rctx(80)
+        };
+        let tl = build_tool_lines(
+            &mcp_msg(
+                &format!("{MCP_SUMMARY_PREFIX}{MCP_TOOL}"),
+                ToolStatus::Success,
+                Some(mcp_output()),
+            ),
+            ToolStatus::Success,
+            &rctx,
+            None,
+        );
+
+        let title = line_text(&tl.lines[0]);
+        assert!(title.contains(&format!("{MCP_LABEL} [limit=3]")), "{title}");
+    }
+
+    #[test]
+    fn an_mcp_json_answer_is_drawn_indented() {
+        let tl = build_tool_lines(
+            &mcp_msg(MCP_TOOL, ToolStatus::Success, Some(mcp_output())),
+            ToolStatus::Success,
+            &test_rctx(80),
+            Some(Disclosure::default()),
+        );
+
+        let rows = trimmed_rows(&tl);
+        assert!(rows.iter().any(|row| row == MCP_PRETTY_ROW), "{rows:?}");
+        assert!(tl.search_text.contains(MCP_PRETTY_ROW));
+    }
+
+    #[test_case(ToolStatus::Success,    false, false ; "at_rest")]
+    #[test_case(ToolStatus::Success,    true,  true  ; "opened_whole")]
+    #[test_case(ToolStatus::InProgress, false, true  ; "running")]
+    fn mcp_arguments_show_when_opened_whole_or_running(
+        status: ToolStatus,
+        full: bool,
+        shown: bool,
+    ) {
+        let output = matches!(status, ToolStatus::Success).then(mcp_output);
+        let tl = build_tool_lines(
+            &mcp_msg(&format!("{MCP_SUMMARY_PREFIX}{MCP_TOOL}"), status, output),
+            status,
+            &test_rctx(80),
+            Some(Disclosure {
+                full,
+                ..Disclosure::default()
+            }),
+        );
+
+        let rows = trimmed_rows(&tl);
+        assert_eq!(
+            rows.iter().any(|row| row == MCP_ARGUMENT_ROW),
+            shown,
+            "{rows:?}"
+        );
+    }
+
+    #[test_case(MCP_TOOL, true ; "header_repeats_the_name")]
+    #[test_case("a summary of its own", false ; "header_says_something")]
+    fn a_plain_json_answer_is_pretty_only_under_a_redundant_header(header: &str, pretty: bool) {
+        let msg = mcp_msg(
+            &format!("{header}\n{MCP_JSON}"),
+            ToolStatus::Success,
+            Some(ToolOutput::Plain(MCP_JSON.into())),
+        );
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            Some(Disclosure::default()),
+        );
+
+        let rows = trimmed_rows(&tl);
+        assert_eq!(
+            rows.iter().any(|row| row == MCP_PRETTY_ROW),
+            pretty,
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_batch_child_draws_its_mcp_answer_under_its_label() {
+        let child = BatchToolEntry {
+            tool: MCP_TOOL.into(),
+            summary: format!("{MCP_SUMMARY_PREFIX}{MCP_TOOL}"),
+            output: Some(mcp_output()),
+            ..code_child()
+        };
+
+        let tl = batch_of(vec![child], &BatchStartedMap::default());
+
+        let rows = trimmed_rows(&tl);
+        assert!(rows.iter().any(|row| row.contains(MCP_LABEL)), "{rows:?}");
+        assert!(
+            rows.iter().any(|row| row.ends_with(MCP_PRETTY_ROW)),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().all(|row| !row.contains(MCP_SUMMARY_PREFIX)),
+            "{rows:?}"
         );
     }
 }

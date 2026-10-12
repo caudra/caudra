@@ -8,6 +8,7 @@ use tracing::warn;
 
 use caudra_config::{MIN_PER_TOOL_OUTPUT_BYTES, MIN_PER_TOOL_OUTPUT_LINES};
 
+use crate::mcp::output::McpBlock;
 use crate::tools::ToolContext;
 use crate::{IndexOutput, TextOutput, ToolDoneEvent, ToolOutput, ToolOutputLimits};
 
@@ -355,6 +356,12 @@ fn bound_presentation(
         ToolOutput::Batch { text, .. } => {
             *text = preview_body(&rendered, marker, "", max_lines, max_bytes);
         }
+        // Cut from the pretty form, so what survives still breaks into lines a
+        // card can colour one at a time.
+        ToolOutput::Mcp(output) => {
+            let text = preview_body(&output.display_text(), marker, "", max_lines, max_bytes);
+            output.blocks = vec![McpBlock::Excerpt { text }];
+        }
         ToolOutput::Plain(text) | ToolOutput::Markdown(text) | ToolOutput::ReadDir(text) => {
             let source = text.text.clone();
             let trailer = rendered.strip_prefix(&source).unwrap_or_default();
@@ -485,7 +492,8 @@ mod tests {
     use crate::InstructionBlock;
     use crate::tools::ToolEffect;
     use crate::{
-        BatchToolEntry, BatchToolStatus, GrepFileEntry, GrepLine, GrepMatchGroup, PatchedFile,
+        BatchToolEntry, BatchToolStatus, GrepFileEntry, GrepLine, GrepMatchGroup, McpOutput,
+        PatchedFile,
     };
     use std::mem::discriminant;
 
@@ -1022,6 +1030,35 @@ mod tests {
             ctx.config.max_output_lines,
             ctx.config.max_output_bytes
         ));
+        assert!(text.contains("Tool output truncated"));
+    }
+
+    #[test]
+    fn oversized_mcp_output_becomes_a_pretty_excerpt_and_the_model_text_is_unchanged() {
+        let compact = serde_json::to_string(
+            &(0..200)
+                .map(|index| serde_json::json!({ "index": index }))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let ctx = context(8, 360);
+        let mut plain = done(compact.clone(), false);
+        smol::block_on(limit(&mut plain, &ctx));
+        let mut mcp = done(String::new(), false);
+        mcp.output = ToolOutput::Mcp(McpOutput {
+            blocks: vec![McpBlock::Text { text: compact }],
+        });
+
+        smol::block_on(limit(&mut mcp, &ctx));
+
+        assert_eq!(mcp.model_output, plain.model_output);
+        let ToolOutput::Mcp(output) = mcp.output else {
+            panic!("an MCP output must stay one");
+        };
+        let [McpBlock::Excerpt { text }] = output.blocks.as_slice() else {
+            panic!("an oversized MCP output must become one excerpt");
+        };
+        assert!(text.starts_with("[\n  {\n    \"index\": 0"), "{text}");
         assert!(text.contains("Tool output truncated"));
     }
 

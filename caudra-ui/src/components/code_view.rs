@@ -17,12 +17,12 @@ use crate::theme;
 use super::tool_display::{
     ACTIVITY_BODY_PAD, ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, annotation_spans,
     append_annotation, batch_sigil_style, compact_args_for, header_spans, header_timeout,
-    header_workdir, inflected_header, names_tool, progress_lines, report_header, report_markdown,
-    report_message, scroll_footer_text, title,
+    header_workdir, inflected_header, label_spans, names_tool, progress_lines, repeats_tool,
+    report_header, report_markdown, report_message, scroll_footer_text, title,
 };
 use super::{
-    ToolProgress, environment_card, is_collapsible, memory_card, peer_card, task_card,
-    workflow_card,
+    ToolProgress, environment_card, is_collapsible, json_text, mcp_card, memory_card, peer_card,
+    task_card, workflow_card,
 };
 use caudra_agent::tools::{
     PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, timeout_annotation,
@@ -32,8 +32,8 @@ use caudra_agent::types::{TodoItem, TodoStatus};
 use caudra_agent::{
     BatchToolEntry, BatchToolStatus, CodeGraphRow, CodeGraphSource, GrepFileEntry, INDEX_TRUNCATED,
     IndexDirectoryEntryKind, IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange,
-    InstructionBlock, PatchedFile, SearchCap, SkillOutput, SubagentProgress, ToolInput, ToolOutput,
-    format_live_duration, format_settled_duration,
+    InstructionBlock, McpOutput, PatchedFile, SearchCap, SkillOutput, SubagentProgress, ToolInput,
+    ToolOutput, format_live_duration, format_settled_duration, pretty_json,
 };
 use caudra_config::ToolOutputLines;
 use caudra_diff::{DiffHunk, DiffLine, DiffSpan, compute_hunks};
@@ -41,6 +41,7 @@ use caudra_markdown::Source;
 use caudra_markdown::render::SpanSource;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use serde_json::Value;
 use syntect::parsing::SyntaxReference;
 use syntect::util::LinesWithEndings;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -1127,8 +1128,8 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
                 format!("{sigil} "),
                 batch_sigil_style(entry.status, entry.output.as_ref()),
             ),
-            Span::styled(format!("{label}{gap}"), t.tool_prefix),
         ];
+        spans.extend(label_spans(&entry.tool, label, gap, t.tool_prefix));
         if !summary.is_empty() {
             spans.extend(header_spans(
                 &entry.tool,
@@ -1440,6 +1441,15 @@ fn child_body(
         Some(plain_body(tail, limits.width))
     } else {
         match output {
+            // A tool whose summary only repeats its name has nothing but its
+            // answer to say, and an answer that is a JSON document reads as one.
+            Some(ToolOutput::Plain(text))
+                if let Some(pretty) = repeats_tool(&entry.tool, &entry.summary)
+                    .then(|| pretty_json(&text.text))
+                    .flatten() =>
+            {
+                Some(json_body(&pretty, limits.width))
+            }
             Some(ToolOutput::Plain(text) | ToolOutput::ReadDir(text)) => {
                 Some(plain_body(&text.text, limits.width))
             }
@@ -1822,6 +1832,24 @@ pub(super) fn highlighted_body(text: &str, language: &str, width: u16) -> Vec<Li
             ))
         })
         .collect()
+}
+
+/// [`plain_body`]'s rows coloured as JSON by the theme alone, broken at the
+/// same places so a copy reads back the text the rows were painted from. No
+/// grammar runs, so a document of any size paints in one linear pass.
+pub(super) fn json_body(text: &str, width: u16) -> (Vec<Line<'static>>, BodySource) {
+    let lines = text
+        .lines()
+        .flat_map(|line| {
+            wrapped_lines(wrap_styled(
+                json_text::themed_line(line).spans,
+                0,
+                "",
+                width,
+            ))
+        })
+        .collect();
+    (lines, plain_body(text, width).1)
 }
 
 /// One piece of a styled row, on the display row the break put it on.
@@ -3586,6 +3614,11 @@ pub fn render_tool_content(
             output_links = card.links;
             (card.lines, false)
         }
+        Some(ToolOutput::Mcp(output)) => {
+            let card = mcp_card::render(None, Some(output), limits.budget, limits.width);
+            output_links = card.links;
+            (card.lines, card.truncated)
+        }
         Some(ToolOutput::ReadDir(_)) => (Vec::new(), false),
         _ => (Vec::new(), false),
     };
@@ -3652,6 +3685,28 @@ pub fn render_tool_content(
             truncation,
             scroll_spans,
             source,
+        },
+        limits.width,
+    )
+}
+
+/// An MCP call's body: its arguments when `arguments` is given, then what
+/// came back.
+pub fn render_mcp_content(
+    arguments: Option<&Value>,
+    output: Option<&McpOutput>,
+    limits: &RenderLimits,
+) -> ToolContent {
+    let card = mcp_card::render(arguments, output, limits.budget, limits.width);
+    wrapped_content(
+        ToolContent {
+            highlights: Vec::new(),
+            rows: vec![None; card.lines.len()],
+            links: card.links,
+            lines: card.lines,
+            truncation: card.truncated,
+            scroll_spans: Vec::new(),
+            source: None,
         },
         limits.width,
     )
@@ -6259,7 +6314,7 @@ mod tests {
     const SHELL_WIRE_CHILD: &str = "mcp_Shell";
     const SHELL_CHILD_ROW: &str = "$ Ran";
     const UNTABLED_CHILD: &str = "srv.custom";
-    const UNTABLED_CHILD_ROW: &str = "⚙ srv.custom";
+    const UNTABLED_CHILD_ROW: &str = "⚙ srv \u{203a} custom";
     const CHILD_LABEL_MSG: &str = "a child names its tool the way a standalone compact row does";
 
     /// A child row printed the string the model called, so a batch run under

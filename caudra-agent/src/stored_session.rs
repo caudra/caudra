@@ -221,6 +221,7 @@ pub(crate) mod tests {
         IndexDirectoryEntry, IndexDirectoryEntryKind, IndexLine, IndexLineSemantic, IndexOutput,
         IndexSourceRange, ShellFilterInfo, ShellOutput,
     };
+    use crate::{McpBlock, McpOutput};
     use caudra_storage::sessions::SessionDatabase;
 
     const CWD: &str = "/repo";
@@ -696,6 +697,37 @@ pub(crate) mod tests {
 
         assert_eq!(serde_json::to_value(actual.as_ref()).unwrap(), expected);
         assert!(matches!(actual.as_ref(), ToolOutput::Index(_)));
+    }
+
+    #[test]
+    fn mcp_output_survives_persisted_session_roundtrip() {
+        let output = ToolOutput::Mcp(McpOutput {
+            blocks: vec![
+                McpBlock::Text {
+                    text: "{\"a\":1}".into(),
+                },
+                McpBlock::Image {
+                    mime_type: Some("image/png".into()),
+                    bytes: 12,
+                },
+                McpBlock::Structured {
+                    value: serde_json::json!({"k": [1, 2]}),
+                },
+            ],
+        });
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let expected = serde_json::to_value(&output).unwrap();
+        let mut session = StoredSession::new(MODEL, CWD);
+        let id = session.id;
+        session.insert_tool_output("mcp-call".into(), output);
+        session.save(&storage).unwrap();
+
+        let loaded = load_stored_session(id, &storage).unwrap();
+        let actual = loaded.tool_outputs().get("mcp-call").unwrap();
+
+        assert_eq!(serde_json::to_value(actual.as_ref()).unwrap(), expected);
+        assert!(matches!(actual.as_ref(), ToolOutput::Mcp(_)));
     }
 
     #[test]

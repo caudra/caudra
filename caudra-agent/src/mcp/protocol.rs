@@ -79,10 +79,37 @@ pub struct ToolsListResult {
     pub tools: Vec<ToolInfo>,
 }
 
-#[derive(Deserialize)]
+/// One content block of a `tools/call` result. Every field is optional so a
+/// block of a kind this client has never heard of still parses, and still
+/// contributes its `text` the way it always did.
+#[derive(Deserialize, Default)]
 pub struct CallToolContent {
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
     #[serde(default)]
     pub text: String,
+    #[serde(default)]
+    pub data: Option<String>,
+    #[serde(default, rename = "mimeType")]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub resource: Option<EmbeddedResource>,
+    #[serde(default)]
+    pub uri: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct EmbeddedResource {
+    #[serde(default)]
+    pub uri: String,
+    #[serde(default, rename = "mimeType")]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub blob: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -90,6 +117,8 @@ pub struct CallToolResult {
     pub content: Vec<CallToolContent>,
     #[serde(default, rename = "isError")]
     pub is_error: bool,
+    #[serde(default, rename = "structuredContent")]
+    pub structured_content: Option<Value>,
 }
 
 impl CallToolResult {
@@ -180,6 +209,31 @@ mod tests {
         let result: CallToolResult = serde_json::from_value(raw).unwrap();
         assert!(result.is_error);
         assert_eq!(result.joined_text(), "hello");
+    }
+
+    #[test]
+    fn call_tool_result_parses_every_block_kind_and_joins_only_text() {
+        let raw = json!({
+            "content": [
+                {"type": "text", "text": "first"},
+                {"type": "image", "data": "aGk=", "mimeType": "image/png"},
+                {"type": "audio", "data": "aGk=", "mimeType": "audio/wav"},
+                {"type": "resource", "resource": {"uri": "file:///a", "text": "body"}},
+                {"type": "resource_link", "uri": "file:///b", "name": "b"},
+                {"text": "untyped"}
+            ],
+            "structuredContent": {"k": 1}
+        });
+        let result: CallToolResult = serde_json::from_value(raw).unwrap();
+        assert_eq!(result.content.len(), 6);
+        assert_eq!(result.content[1].mime_type.as_deref(), Some("image/png"));
+        assert_eq!(
+            result.content[3].resource.as_ref().unwrap().text.as_deref(),
+            Some("body")
+        );
+        assert_eq!(result.content[4].name.as_deref(), Some("b"));
+        assert_eq!(result.structured_content, Some(json!({"k": 1})));
+        assert_eq!(result.joined_text(), "first\n\n\n\n\nuntyped");
     }
 
     #[test]

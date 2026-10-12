@@ -140,6 +140,12 @@ Tool-call approval binds to the configured server authority, the discovered tool
 
 Generic MCP approvals are exact-input by default. The permission review shows the complete validated JSON rather than a truncated preview.
 
+## Results in the transcript
+
+An MCP call's card is labelled `server › tool`, with short arguments beside the label. Opening the card shows every argument. A multi-line string argument, such as a script, is shown as plain text under its name.
+
+Each block of the result is drawn by its type. A text block that is a whole JSON object or array is indented and coloured. Other text is rendered as markdown. Images, audio, and resources become labelled rows with their type and size. The model receives the same text whatever the card shows, and it never receives image or audio data.
+
 ## Project server trust
 
 Caudra separates server startup trust from tool-call permissions.
