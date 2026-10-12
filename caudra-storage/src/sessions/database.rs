@@ -3074,7 +3074,9 @@ impl SessionDatabase {
     pub fn has_sessions(&self) -> Result<bool, SessionError> {
         Ok(self
             .connection
-            .query_row("SELECT EXISTS(SELECT 1 FROM sessions)", [], |row| row.get(0))?)
+            .query_row("SELECT EXISTS(SELECT 1 FROM sessions)", [], |row| {
+                row.get(0)
+            })?)
     }
 
     pub fn latest_id(&self, cwd: &str) -> Result<Option<CaudraId>, SessionError> {

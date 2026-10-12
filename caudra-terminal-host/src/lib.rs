@@ -29,11 +29,9 @@ pub use host::TerminalHost;
 /// Every variable a host exports to the processes in its pane. Shell commands
 /// receive them too, so a host's CLI sees the pane the way any process in it
 /// would.
-pub const PANE_ENVIRONMENT: &[&str] =
-    &concat::<{ herdr::PANE_ENVIRONMENT.len() + orca::PANE_ENVIRONMENT.len() }>(
-        herdr::PANE_ENVIRONMENT,
-        orca::PANE_ENVIRONMENT,
-    );
+pub const PANE_ENVIRONMENT: &[&str] = &concat::<
+    { herdr::PANE_ENVIRONMENT.len() + orca::PANE_ENVIRONMENT.len() },
+>(herdr::PANE_ENVIRONMENT, orca::PANE_ENVIRONMENT);
 
 /// The host this process runs in, from its own environment.
 pub fn detect() -> Option<Arc<dyn TerminalHost>> {
@@ -48,7 +46,10 @@ pub fn detect_from(get: impl Fn(&str) -> Option<OsString>) -> Option<Arc<dyn Ter
     orca::OrcaHost::detect(&get).map(|orca| Arc::new(orca) as Arc<dyn TerminalHost>)
 }
 
-const fn concat<const N: usize>(first: &[&'static str], second: &[&'static str]) -> [&'static str; N] {
+const fn concat<const N: usize>(
+    first: &[&'static str],
+    second: &[&'static str],
+) -> [&'static str; N] {
     let mut joined = [""; N];
     let mut index = 0;
     while index < first.len() {
