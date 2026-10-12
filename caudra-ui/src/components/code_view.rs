@@ -3427,6 +3427,41 @@ impl ScrollSpan {
     }
 }
 
+/// A card's script, numbered, from the top of the card. Drawn plain when
+/// `highlight` is off, with the region a highlight job repaints it through.
+///
+/// A card that draws its script at all draws the whole of it. The script is
+/// the record of what ran, it cannot be reconstructed from the output, and it
+/// is bounded by what the model wrote. The budget belongs to the output, which
+/// the tool can make arbitrarily long.
+fn push_script(
+    language: &str,
+    code: &str,
+    highlight: bool,
+    limits: &RenderLimits,
+    lines: &mut Vec<Line<'static>>,
+    highlights: &mut Vec<HighlightRegion>,
+    trace: &mut SourceTrace,
+) {
+    let code_lines: Vec<String> = code
+        .trim_end_matches('\n')
+        .lines()
+        .map(String::from)
+        .collect();
+    let total = code_lines.len();
+    let hl = highlight.then(|| caudra_highlight::Highlighter::for_token(language));
+    let script = render_code(hl, 1, &code_lines, total, total, limits.width);
+    trace.record(lines.len(), script.source.named(language));
+    lines.extend(script.lines);
+    if !highlight && !lines.is_empty() {
+        highlights.push(HighlightRegion::new(
+            0..lines.len(),
+            CodeRole::Input,
+            limits,
+        ));
+    }
+}
+
 pub fn render_tool_content(
     input: Option<&ToolInput>,
     output: Option<&ToolOutput>,
@@ -3448,27 +3483,15 @@ pub fn render_tool_content(
         }
     });
     if let Some((language, code)) = drawn_script {
-        let code_lines: Vec<String> = code
-            .trim_end_matches('\n')
-            .lines()
-            .map(String::from)
-            .collect();
-        let total = code_lines.len();
-        let hl = highlight.then(|| caudra_highlight::Highlighter::for_token(language));
-        // A card that draws its script at all draws the whole of it. The
-        // script is the record of what ran, it cannot be reconstructed from
-        // the output, and it is bounded by what the model wrote. The budget
-        // belongs to the output, which the tool can make arbitrarily long.
-        let script = render_code(hl, 1, &code_lines, total, total, limits.width);
-        trace.record(lines.len(), script.source.named(language));
-        lines.extend(script.lines);
-        if !highlight && !lines.is_empty() {
-            highlights.push(HighlightRegion::new(
-                0..lines.len(),
-                CodeRole::Input,
-                &limits,
-            ));
-        }
+        push_script(
+            language,
+            code,
+            highlight,
+            &limits,
+            &mut lines,
+            &mut highlights,
+            &mut trace,
+        );
     }
     let (output_lines, output_trunc) = match output {
         Some(ToolOutput::ReadCode {
@@ -3615,7 +3638,8 @@ pub fn render_tool_content(
             (card.lines, false)
         }
         Some(ToolOutput::Mcp(output)) => {
-            let card = mcp_card::render(None, Some(output), limits.budget, limits.width);
+            let card =
+                mcp_card::render(None, None, false, Some(output), limits.budget, limits.width);
             output_links = card.links;
             (card.lines, card.truncated)
         }
@@ -3690,23 +3714,57 @@ pub fn render_tool_content(
     )
 }
 
-/// An MCP call's body: its arguments when `arguments` is given, then what
-/// came back.
+/// An MCP call's body: the script it ran, the rest of its arguments when
+/// `arguments` is given, then what came back. The script leads so its region
+/// sits where a highlight job, rendering the script alone, draws it.
 pub fn render_mcp_content(
+    script: Option<&ToolInput>,
     arguments: Option<&Value>,
+    script_key: Option<&str>,
     output: Option<&McpOutput>,
     limits: &RenderLimits,
 ) -> ToolContent {
-    let card = mcp_card::render(arguments, output, limits.budget, limits.width);
+    let mut lines = Vec::new();
+    let mut highlights = Vec::new();
+    let mut trace = SourceTrace::default();
+    if let Some(ToolInput::Code { language, code } | ToolInput::Script { language, code }) = script
+    {
+        push_script(
+            language,
+            code,
+            false,
+            limits,
+            &mut lines,
+            &mut highlights,
+            &mut trace,
+        );
+    }
+    let card = mcp_card::render(
+        arguments,
+        script_key,
+        !lines.is_empty(),
+        output,
+        limits.budget,
+        limits.width,
+    );
+    // The card's rows name no source, and copying them as nothing is worse
+    // than scraping them back.
+    if !card.lines.is_empty() {
+        trace.abandon();
+    }
+    let mut links = LinkMap::none_for(&lines);
+    links.rows.extend(card.links.rows);
+    lines.extend(card.lines);
+    let source = trace.finish(&lines);
     wrapped_content(
         ToolContent {
-            highlights: Vec::new(),
-            rows: vec![None; card.lines.len()],
-            links: card.links,
-            lines: card.lines,
+            highlights,
+            rows: vec![None; lines.len()],
+            links,
+            lines,
             truncation: card.truncated,
             scroll_spans: Vec::new(),
-            source: None,
+            source,
         },
         limits.width,
     )

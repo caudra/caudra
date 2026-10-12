@@ -36,7 +36,8 @@ Preview 6 adds autopilot, an experimental mode that answers permission prompts, 
 ### MCP tool cards
 
 - **Readable results.** An MCP result that is a JSON document is drawn indented and coloured, and other text is drawn as markdown. Images, audio, and resources become labelled rows. The model receives the same text as before.
-- **Cleaner header.** A card reads `server › tool` with the call's arguments beside it, and opening the card shows them in full.
+- **Cleaner header.** A card reads `server › tool` with the call's arguments beside it and an estimate of the tokens the result costs. Opening the card shows every argument.
+- **Code it ran.** When a call runs code, such as a `code` or `sql` argument, the card shows it numbered and highlighted above the result.
 
 ## Caudra 0.2 Preview 5 {#v0-2-0-preview-5}
 

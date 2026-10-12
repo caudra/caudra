@@ -142,7 +142,9 @@ Generic MCP approvals are exact-input by default. The permission review shows th
 
 ## Results in the transcript
 
-An MCP call's card is labelled `server › tool`, with short arguments beside the label. Opening the card shows every argument. A multi-line string argument, such as a script, is shown as plain text under its name.
+An MCP call's card is labelled `server › tool`, with short arguments beside the label. The header also shows the size of the result and an estimate of the tokens the model reads from it, such as `JSON · 128 lines · ~3.2k tokens`.
+
+When a call runs code, the card shows that code above the result, numbered and highlighted like a `python_execution` card. Caudra takes the string under `code`, `script`, `source`, `program`, `sql`, `command`, or `cmd`, or else the longest multi-line string. The key or the text decides the language. Opening the card whole also shows the remaining arguments. A multi-line string among them is shown as plain text under its name.
 
 Each block of the result is drawn by its type. A text block that is a whole JSON object or array is indented and coloured. Other text is rendered as markdown. Images, audio, and resources become labelled rows with their type and size. The model receives the same text whatever the card shows, and it never receives image or audio data.
 

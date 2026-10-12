@@ -62,7 +62,7 @@ use crate::tools::report::{REASON_CONFIG, REASON_PROFILE_LOADED};
 use crate::tools::schema::sanitize_tool_input_schema;
 
 const SEPARATOR: &str = ".";
-const WIRE_SEPARATOR: &str = "__";
+pub(super) const WIRE_SEPARATOR: &str = "__";
 pub const UNKNOWN_MCP: &str = "unknown_mcp";
 /// Loads per search are capped so one broad query can't flood the context.
 const MAX_SEARCH_LOADS: usize = 5;

@@ -5,8 +5,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::SEPARATOR;
+use caudra_providers::{estimate_tokens_cached, token_label};
+
 use super::protocol::{CallToolContent, CallToolResult};
+use super::{SEPARATOR, WIRE_SEPARATOR};
 use crate::types::{CARD_ANNOTATION_SEPARATOR, LINE_NOUN, counted};
 
 /// How an MCP call's start summary opens, ahead of its qualified name.
@@ -122,6 +124,10 @@ impl McpOutput {
                 parts.push(JSON_LABEL.to_owned());
             }
             parts.push(counted(lines, LINE_NOUN));
+        }
+        let model_text = self.model_text();
+        if !model_text.is_empty() {
+            parts.push(token_label(estimate_tokens_cached(&model_text)));
         }
         for (noun, count) in [
             (
@@ -268,11 +274,16 @@ pub fn pretty_json(text: &str) -> Option<String> {
     serde_json::to_string_pretty(&value).ok()
 }
 
-/// `("server", "tool")` for a qualified MCP tool name.
-pub fn mcp_tool_parts(qualified: &str) -> Option<(&str, &str)> {
-    qualified
-        .split_once(SEPARATOR)
-        .filter(|(server, tool)| !server.is_empty() && !tool.is_empty())
+/// `("server", "tool")` for an MCP tool name, qualified (`server.tool`) or
+/// in the wire form history keeps (`server__tool`). A server name holds
+/// neither separator, so whichever comes first is the boundary.
+pub fn mcp_tool_parts(name: &str) -> Option<(&str, &str)> {
+    let boundary = [SEPARATOR, WIRE_SEPARATOR]
+        .into_iter()
+        .filter_map(|separator| name.find(separator).map(|at| (at, separator.len())))
+        .min()?;
+    let (server, tool) = (&name[..boundary.0], &name[boundary.0 + boundary.1..]);
+    (!server.is_empty() && !tool.is_empty()).then_some((server, tool))
 }
 
 #[cfg(test)]
@@ -344,16 +355,18 @@ mod tests {
         );
     }
 
-    #[test_case(json!({"content": [{"type": "text", "text": "{\"a\":1,\"b\":[true]}"}]}), Some("JSON · 6 lines") ; "json")]
-    #[test_case(json!({"content": [{"type": "text", "text": "one\ntwo"}]}), Some("2 lines") ; "text")]
-    #[test_case(json!({"content": [{"type": "text", "text": "{}"}, {"type": "text", "text": "prose"}]}), Some("2 lines") ; "mixed")]
-    #[test_case(json!({"content": [{"type": "text", "text": "x"}, {"type": "image", "data": ""}, {"type": "resource_link", "uri": "u"}]}), Some("1 line · 1 image · 1 link") ; "media")]
+    #[test_case(json!({"content": [{"type": "text", "text": "{\"a\":1,\"b\":[true]}"}]}), Some("JSON · 6 lines · {tokens}") ; "json")]
+    #[test_case(json!({"content": [{"type": "text", "text": "one\ntwo"}]}), Some("2 lines · {tokens}") ; "text")]
+    #[test_case(json!({"content": [{"type": "text", "text": "{}"}, {"type": "text", "text": "prose"}]}), Some("2 lines · {tokens}") ; "mixed")]
+    #[test_case(json!({"content": [{"type": "text", "text": "x"}, {"type": "image", "data": ""}, {"type": "resource_link", "uri": "u"}]}), Some("1 line · {tokens} · 1 image · 1 link") ; "media")]
     #[test_case(json!({"content": [], "structuredContent": {"k": 1}}), Some("JSON · 3 lines") ; "structured")]
     #[test_case(json!({"content": []}), None ; "empty")]
-    fn annotation_names_the_kind_and_size(raw: Value, expected: Option<&str>) {
+    fn annotation_names_the_kind_size_and_tokens(raw: Value, expected: Option<&str>) {
+        let output = McpOutput::from_result(result(raw));
+        let tokens = token_label(estimate_tokens_cached(&output.model_text()));
         assert_eq!(
-            McpOutput::from_result(result(raw)).annotation().as_deref(),
-            expected
+            output.annotation(),
+            expected.map(|expected| expected.replace("{tokens}", &tokens))
         );
     }
 
@@ -370,7 +383,10 @@ mod tests {
     #[test_case("srv.a.b", Some(("srv", "a.b")) ; "dotted_tool")]
     #[test_case("shell", None ; "builtin")]
     #[test_case(".tool", None ; "no_server")]
-    fn mcp_tool_parts_splits_at_the_first_separator(name: &str, expected: Option<(&str, &str)>) {
+    #[test_case("srv__tool", Some(("srv", "tool")) ; "wire")]
+    #[test_case("srv.my__tool", Some(("srv", "my__tool")) ; "qualified_tool_with_wire_separator")]
+    #[test_case("srv__a.b", Some(("srv", "a.b")) ; "wire_tool_with_dot")]
+    fn mcp_tool_parts_splits_at_the_first_boundary(name: &str, expected: Option<(&str, &str)>) {
         assert_eq!(mcp_tool_parts(name), expected);
     }
 }

@@ -2,7 +2,7 @@ use super::{DisplayMessage, ToolProgress, ToolStatus, escape_terminal_controls, 
 
 use super::code_view;
 use super::command_text::{command_spans, overlay};
-use super::mcp_card::OUTPUT_DIVIDER as CODE_OUTPUT_DIVIDER;
+use super::mcp_card::{OUTPUT_DIVIDER as CODE_OUTPUT_DIVIDER, script_argument};
 use super::status_bar::collapse_home;
 use crate::animation::{live_elapsed, spinner_frame, spinner_str};
 use crate::chat::batch_child_id;
@@ -894,6 +894,22 @@ pub(super) fn label_spans(tool: &str, label: &str, gap: &str, style: Style) -> V
         ],
         None => vec![Span::styled(format!("{label}{gap}"), style)],
     }
+}
+
+/// The short arguments an open MCP card names beside its label. The script
+/// is left out: the body draws it whole.
+fn mcp_header_args(
+    tool: &str,
+    header: &str,
+    raw_input: Option<&Value>,
+    output: Option<&ToolOutput>,
+) -> Option<String> {
+    if !is_mcp_call(tool, header, output) {
+        return None;
+    }
+    let script_key = raw_input.and_then(script_argument).map(|script| script.key);
+    let folded: Vec<&str> = script_key.iter().map(String::as_str).collect();
+    compact_args(raw_input, "", None, &folded, output)
 }
 
 fn spans_text(spans: &[Span<'_>]) -> String {
@@ -1889,6 +1905,7 @@ impl ToolLineBuilder {
         raw_input: Option<&serde_json::Value>,
     ) {
         let (sigil, label, tense) = title(tool_name, self.indicator.into(), self.stage);
+        let mcp_args = mcp_header_args(tool_name, header, raw_input, output);
         let header = &*inflected_header(tool_name, header, tense);
         self.sigil = sigil;
         // An omitted header leaves the label against the annotation, so the
@@ -1918,6 +1935,10 @@ impl ToolLineBuilder {
                 theme::current().tool
             };
             spans.extend(header_spans(tool_name, header, style, raw_input));
+        }
+        if let Some(args) = mcp_args {
+            copy.push_str(&args);
+            spans.push(Span::styled(args, theme::current().tool_dim));
         }
         push_annotation(&mut spans, &mut copy, annotation);
         self.lines.push(Line::from(spans));
@@ -2161,10 +2182,19 @@ impl ToolLineBuilder {
         self.push_content(content);
     }
 
-    /// An MCP call's body, with `arguments` above what came back when given.
-    fn push_mcp_card(&mut self, arguments: Option<&Value>, output: Option<&McpOutput>) {
+    /// An MCP call's body: its script, then `arguments` when given, then
+    /// what came back.
+    fn push_mcp_card(
+        &mut self,
+        script: Option<&ToolInput>,
+        arguments: Option<&Value>,
+        script_key: Option<&str>,
+        output: Option<&McpOutput>,
+    ) {
         self.push_content(code_view::render_mcp_content(
+            script,
             arguments,
+            script_key,
             output,
             &self.limits,
         ));
@@ -2925,15 +2955,24 @@ pub fn build_tool_lines(
         return b.finish(None, None);
     }
     let mcp_call = is_mcp_call(tool_name, header, msg.tool_output.as_deref());
+    let script = msg
+        .tool_raw_input
+        .as_deref()
+        .filter(|_| mcp_call)
+        .and_then(script_argument);
+    let script_input = script.as_ref().map(|script| Arc::new(script.input.clone()));
     match live {
         Some(live) if draws_live_script(tool_name) => b.push_live_script(live),
         Some(live) => b.push_live_body(live, draws_live_markdown(tool_name, header)),
-        // At rest the card spends its budget on the answer; the arguments are
-        // there for a reader who opened it whole, or while there is no answer.
+        // The script is what ran, so it always leads. At rest the rest of the
+        // budget goes to the answer; the other arguments are there for a
+        // reader who opened the card whole, or while there is no answer.
         None if mcp_call => b.push_mcp_card(
+            script_input.as_deref(),
             msg.tool_raw_input
                 .as_deref()
                 .filter(|_| expanded.full || b.is_in_progress()),
+            script.as_ref().map(|script| script.key.as_str()),
             match msg.tool_output.as_deref() {
                 Some(ToolOutput::Mcp(output)) => Some(output),
                 _ => None,
@@ -3012,7 +3051,10 @@ pub fn build_tool_lines(
     if let Some((progress, first, window)) = progress_body {
         b.push_progress_body(progress, first, window);
     }
-    b.finish(msg.tool_input.clone(), msg.tool_output.clone())
+    b.finish(
+        script_input.or_else(|| msg.tool_input.clone()),
+        msg.tool_output.clone(),
+    )
 }
 
 fn project_task_output(
@@ -8646,6 +8688,109 @@ mod tests {
         assert!(
             rows.iter().all(|row| !row.contains(MCP_SUMMARY_PREFIX)),
             "{rows:?}"
+        );
+    }
+
+    const MCP_WIRE_TOOL: &str = "executor__execute";
+    const MCP_SCRIPT: &str = "let p = await tools.search({limit: 10}); return p;";
+
+    fn scripted_mcp_msg(status: ToolStatus) -> DisplayMessage {
+        let mut msg = mcp_msg(
+            &format!("{MCP_SUMMARY_PREFIX}{MCP_TOOL}"),
+            status,
+            matches!(status, ToolStatus::Success).then(mcp_output),
+        );
+        msg.tool_raw_input = Some(Arc::new(
+            serde_json::json!({"code": MCP_SCRIPT, "limit": 3}),
+        ));
+        msg
+    }
+
+    fn scripted_card(status: ToolStatus, full: bool, compact: bool) -> ToolLines {
+        let rctx = RenderCtx {
+            compact,
+            ..test_rctx(120)
+        };
+        build_tool_lines(
+            &scripted_mcp_msg(status),
+            status,
+            &rctx,
+            (!compact).then_some(Disclosure {
+                full,
+                ..Disclosure::default()
+            }),
+        )
+    }
+
+    #[test]
+    fn a_restored_wire_name_labels_as_server_and_tool() {
+        let mut msg = mcp_msg(MCP_WIRE_TOOL, ToolStatus::Success, Some(mcp_output()));
+        if let DisplayRole::Tool(tool) = &mut msg.role {
+            tool.name = MCP_WIRE_TOOL.into();
+        }
+
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            Some(Disclosure::default()),
+        );
+
+        let title = line_text(&tl.lines[0]);
+        assert!(title.contains(MCP_LABEL), "{title}");
+        assert!(!title.contains(MCP_WIRE_TOOL), "{title}");
+    }
+
+    #[test_case(false, false ; "at_rest")]
+    #[test_case(true,  true  ; "opened_whole")]
+    fn the_script_always_leads_and_other_arguments_wait_to_be_opened(full: bool, arguments: bool) {
+        let tl = scripted_card(ToolStatus::Success, full, false);
+
+        let rows = trimmed_rows(&tl);
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with('1') && row.ends_with(MCP_SCRIPT)),
+            "{rows:?}"
+        );
+        assert_eq!(
+            rows.iter().any(|row| row == MCP_ARGUMENT_ROW),
+            arguments,
+            "{rows:?}"
+        );
+        assert!(rows.iter().any(|row| row == MCP_PRETTY_ROW), "{rows:?}");
+    }
+
+    #[test_case(false, false ; "open_card_folds_the_script")]
+    #[test_case(true,  true  ; "compact_row_keeps_it")]
+    fn the_header_names_the_script_only_where_no_body_shows_it(compact: bool, names_script: bool) {
+        let tl = scripted_card(ToolStatus::Success, false, compact);
+
+        let title = line_text(&tl.lines[0]);
+        assert!(title.contains("limit=3"), "{title}");
+        assert_eq!(title.contains("code="), names_script, "{title}");
+    }
+
+    #[test]
+    fn the_script_is_highlighted_from_the_derived_input() {
+        let tl = scripted_card(ToolStatus::Success, false, false);
+
+        let request = tl
+            .highlight
+            .iter()
+            .find(|request| request.region.role == CodeRole::Input)
+            .expect("the script asks to be highlighted");
+        let (input, output) = request.sources();
+        let Some(ToolInput::Code { language, code }) = input else {
+            panic!("the script highlights from the code it was given");
+        };
+        assert_eq!((language.as_str(), code.as_str()), ("js", MCP_SCRIPT));
+        let painted = request.region.render(input, output);
+        assert_eq!(
+            painted.lines.iter().map(line_text).collect::<Vec<_>>(),
+            tl.lines[request.region.range.clone()]
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
         );
     }
 }

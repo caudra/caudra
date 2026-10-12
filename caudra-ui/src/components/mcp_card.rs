@@ -1,9 +1,10 @@
-//! The transcript card of an MCP tool call: the arguments it was given, when
-//! the reader asked for them, then each block of the answer drawn as what it
-//! is. JSON is indented and coloured, prose is markdown, and media the model
-//! never read is a labelled row rather than a wall of base64.
+//! The transcript card of an MCP tool call: the script it ran, the rest of the
+//! arguments it was given when the reader asked for them, then each block of
+//! the answer drawn as what it is. JSON is indented and coloured, prose is
+//! markdown, and media the model never read is a labelled row rather than a
+//! wall of base64.
 
-use caudra_agent::{McpBlock, McpOutput, pretty_json};
+use caudra_agent::{McpBlock, McpOutput, ToolInput, pretty_json};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 
@@ -23,6 +24,86 @@ const IMAGE_LABEL: &str = "image";
 const AUDIO_LABEL: &str = "audio";
 const RESOURCE_LABEL: &str = "resource";
 const LINK_LABEL: &str = "link";
+/// Argument keys whose string is code the tool runs, in the order a script is
+/// looked for.
+const SCRIPT_KEYS: &[&str] = &[
+    "code", "script", "source", "program", "sql", "command", "cmd",
+];
+const SQL_LANGUAGE: &str = "sql";
+const SHELL_LANGUAGE: &str = "bash";
+const PYTHON_LANGUAGE: &str = "python";
+const JAVASCRIPT_LANGUAGE: &str = "js";
+const PLAIN_LANGUAGE: &str = "text";
+/// Keys that name their language outright.
+const KEY_LANGUAGES: &[(&str, &str)] = &[
+    ("sql", SQL_LANGUAGE),
+    ("command", SHELL_LANGUAGE),
+    ("cmd", SHELL_LANGUAGE),
+];
+const SQL_LEADS: &[&str] = &["select", "with", "insert", "update", "delete"];
+const PYTHON_MARKERS: &[&str] = &["def ", "print(", "elif ", "self."];
+const JAVASCRIPT_MARKERS: &[&str] = &["=>", "await ", "const ", "let ", "function", "console."];
+
+/// The argument an MCP call ran, and the key it came under, so the rest of
+/// the arguments can leave it out.
+pub(crate) struct ScriptArgument {
+    pub(crate) key: String,
+    pub(crate) input: ToolInput,
+}
+
+/// The string the call was asked to run: the first under a key that names
+/// code, or failing that the longest one spanning several lines.
+pub(crate) fn script_argument(arguments: &Value) -> Option<ScriptArgument> {
+    let fields = arguments.as_object()?;
+    let strings = || {
+        fields
+            .iter()
+            .filter_map(|(key, value)| Some((key, value.as_str()?)))
+            .filter(|(_, text)| !text.trim().is_empty())
+    };
+    let (key, code) = SCRIPT_KEYS
+        .iter()
+        .find_map(|wanted| strings().find(|(key, _)| key.eq_ignore_ascii_case(wanted)))
+        .or_else(|| {
+            strings()
+                .filter(|(_, text)| text.contains(LINE_BREAK))
+                .max_by_key(|(_, text)| text.len())
+        })?;
+    Some(ScriptArgument {
+        key: key.clone(),
+        input: ToolInput::Code {
+            language: script_language(key, code).to_owned(),
+            code: code.to_owned(),
+        },
+    })
+}
+
+/// The language a key names, or else the one the text reads as.
+fn script_language(key: &str, code: &str) -> &'static str {
+    if let Some((_, language)) = KEY_LANGUAGES
+        .iter()
+        .find(|(named, _)| key.eq_ignore_ascii_case(named))
+    {
+        return language;
+    }
+    let lead = code
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if SQL_LEADS.contains(&lead.as_str()) {
+        SQL_LANGUAGE
+    } else if PYTHON_MARKERS.iter().any(|marker| code.contains(marker)) {
+        PYTHON_LANGUAGE
+    } else if JAVASCRIPT_MARKERS
+        .iter()
+        .any(|marker| code.contains(marker))
+    {
+        JAVASCRIPT_LANGUAGE
+    } else {
+        PLAIN_LANGUAGE
+    }
+}
 
 /// The card's lines, the links each of them carries, and whether the budget
 /// left any of the answer out.
@@ -61,16 +142,24 @@ impl Rows {
 }
 
 /// `budget` holds back only the answer: arguments are drawn when the reader
-/// opened the card whole or while the call has nothing else to show.
+/// opened the card whole or while the call has nothing else to show. The
+/// argument under `script_key` is left out, because the script above the card
+/// already shows it, and `after_script` says that script is there.
 pub(crate) fn render(
     arguments: Option<&Value>,
+    script_key: Option<&str>,
+    after_script: bool,
     output: Option<&McpOutput>,
     budget: usize,
     width: u16,
 ) -> McpCard {
     let mut card = Rows::default();
+    let arguments = arguments.map(|arguments| without(arguments, script_key));
     if let Some(arguments) = arguments.filter(|arguments| !is_empty(arguments)) {
-        push_arguments(&mut card, arguments, width);
+        if after_script {
+            card.push(vec![Line::default()]);
+        }
+        push_arguments(&mut card, &arguments, width);
     }
     let mut answer = Rows::default();
     for block in output.map_or(&[][..], |output| output.blocks.as_slice()) {
@@ -83,7 +172,7 @@ pub(crate) fn render(
         }
         answer.append(drawn);
     }
-    if !card.lines.is_empty() && !answer.lines.is_empty() {
+    if (after_script || !card.lines.is_empty()) && !answer.lines.is_empty() {
         card.push(vec![Line::from(Span::styled(
             OUTPUT_DIVIDER,
             theme::current().tool_dim,
@@ -99,6 +188,17 @@ pub(crate) fn render(
         lines: card.lines,
         links: card.links,
         truncated: hidden > 0,
+    }
+}
+
+fn without(arguments: &Value, key: Option<&str>) -> Value {
+    match (arguments, key) {
+        (Value::Object(fields), Some(key)) => {
+            let mut rest = fields.clone();
+            rest.shift_remove(key);
+            Value::Object(rest)
+        }
+        _ => arguments.clone(),
     }
 }
 
@@ -255,7 +355,14 @@ mod tests {
 
     #[test]
     fn a_json_block_is_drawn_indented_with_coloured_keys() {
-        let card = render(None, Some(&output(vec![text(JSON_TEXT)])), UNBOUNDED, WIDTH);
+        let card = render(
+            None,
+            None,
+            false,
+            Some(&output(vec![text(JSON_TEXT)])),
+            UNBOUNDED,
+            WIDTH,
+        );
 
         assert_eq!(rendered(&card)[..2], ["{", "  \"name\": \"value\","]);
         let key = card.lines[1]
@@ -271,6 +378,8 @@ mod tests {
     fn a_prose_block_is_drawn_as_markdown() {
         let card = render(
             None,
+            None,
+            false,
             Some(&output(vec![text("# Heading\n\nbody **bold**")])),
             UNBOUNDED,
             WIDTH,
@@ -289,7 +398,14 @@ mod tests {
     #[test_case(McpBlock::ResourceLink { uri: "file:///a".into(), name: Some("a".into()), mime_type: None }, "link · a · file:///a" ; "link")]
     #[test_case(McpBlock::Resource { uri: "file:///b".into(), mime_type: None, text: None, bytes: Some(1) }, "resource · file:///b · 1 B" ; "blob")]
     fn media_is_a_labelled_row(block: McpBlock, label: &str) {
-        let card = render(None, Some(&output(vec![block])), UNBOUNDED, WIDTH);
+        let card = render(
+            None,
+            None,
+            false,
+            Some(&output(vec![block])),
+            UNBOUNDED,
+            WIDTH,
+        );
 
         assert_eq!(rendered(&card), [label]);
     }
@@ -298,6 +414,8 @@ mod tests {
     fn blocks_are_separated_by_one_blank_row() {
         let card = render(
             None,
+            None,
+            false,
             Some(&output(vec![text("[1]"), text(""), text("[2]")])),
             UNBOUNDED,
             WIDTH,
@@ -312,7 +430,14 @@ mod tests {
             "[{}]",
             (0..50).map(|n| n.to_string()).collect::<Vec<_>>().join(",")
         );
-        let card = render(None, Some(&output(vec![text(&long)])), 5, WIDTH);
+        let card = render(
+            None,
+            None,
+            false,
+            Some(&output(vec![text(&long)])),
+            5,
+            WIDTH,
+        );
 
         assert!(card.truncated);
         assert_eq!(card.lines.len(), 5);
@@ -324,6 +449,8 @@ mod tests {
         let arguments = serde_json::json!({"limit": 3, "code": "let a = 1;\nlet b = \"x\";"});
         let card = render(
             Some(&arguments),
+            None,
+            false,
             Some(&output(vec![text("done")])),
             UNBOUNDED,
             WIDTH,
@@ -349,6 +476,8 @@ mod tests {
     fn empty_arguments_draw_nothing(arguments: Value) {
         let card = render(
             Some(&arguments),
+            None,
+            false,
             Some(&output(vec![text("done")])),
             UNBOUNDED,
             WIDTH,
@@ -362,6 +491,8 @@ mod tests {
         let excerpt = "[\n  {\n    \"a\": \"unterminated\n\n[Tool output truncated.]";
         let card = render(
             None,
+            None,
+            false,
             Some(&output(vec![McpBlock::Excerpt {
                 text: excerpt.into(),
             }])),
@@ -370,5 +501,74 @@ mod tests {
         );
 
         assert_eq!(rendered(&card).join("\n"), excerpt);
+    }
+
+    const JS_CODE: &str = "let p = await tools.search({limit: 10}); return p;";
+
+    fn script(arguments: Value) -> Option<(String, String, String)> {
+        script_argument(&arguments).map(|script| {
+            let ToolInput::Code { language, code } = script.input else {
+                unreachable!("a script argument is code");
+            };
+            (script.key, language, code)
+        })
+    }
+
+    #[test_case(serde_json::json!({"limit": 3, "code": JS_CODE}), Some("code") ; "code_key")]
+    #[test_case(serde_json::json!({"note": "a\nb", "script": "x"}), Some("script") ; "known_key_beats_multiline")]
+    #[test_case(serde_json::json!({"sql": "select 1"}), Some("sql") ; "sql_key")]
+    #[test_case(serde_json::json!({"command": "ls"}), Some("command") ; "command_key")]
+    #[test_case(serde_json::json!({"a": "x\ny", "b": "longer\ntext\nhere"}), Some("b") ; "longest_multiline")]
+    #[test_case(serde_json::json!({"query": "find docs"}), None ; "short_query")]
+    #[test_case(serde_json::json!({"code": "  "}), None ; "blank_code")]
+    #[test_case(serde_json::json!(["code"]), None ; "not_an_object")]
+    fn the_script_is_code_under_its_key_or_the_longest_multiline_string(
+        arguments: Value,
+        key: Option<&str>,
+    ) {
+        assert_eq!(script(arguments).map(|(key, _, _)| key).as_deref(), key);
+    }
+
+    #[test_case("code", JS_CODE, JAVASCRIPT_LANGUAGE ; "javascript")]
+    #[test_case("code", "def f():\n    return 1", PYTHON_LANGUAGE ; "python")]
+    #[test_case("code", "SELECT * FROM t", SQL_LANGUAGE ; "sql_by_text")]
+    #[test_case("sql", "x", SQL_LANGUAGE ; "sql_by_key")]
+    #[test_case("cmd", "ls -la", SHELL_LANGUAGE ; "shell_by_key")]
+    #[test_case("code", "plain words", PLAIN_LANGUAGE ; "plain")]
+    fn the_script_language_comes_from_its_key_or_its_text(key: &str, code: &str, language: &str) {
+        assert_eq!(script_language(key, code), language);
+    }
+
+    #[test]
+    fn the_script_key_is_left_out_of_the_other_arguments() {
+        let arguments = serde_json::json!({"code": JS_CODE, "limit": 3});
+        let card = render(
+            Some(&arguments),
+            Some("code"),
+            true,
+            Some(&output(vec![text("done")])),
+            UNBOUNDED,
+            WIDTH,
+        );
+
+        assert_eq!(
+            rendered(&card),
+            ["", "{", "  \"limit\": 3", "}", OUTPUT_DIVIDER, "done"]
+        );
+    }
+
+    #[test]
+    fn a_script_alone_still_divides_it_from_the_answer() {
+        let arguments = serde_json::json!({"code": JS_CODE});
+        let card = render(
+            Some(&arguments),
+            Some("code"),
+            true,
+            Some(&output(vec![text("done")])),
+            UNBOUNDED,
+            WIDTH,
+        );
+
+        assert_eq!(rendered(&card), [OUTPUT_DIVIDER, "done"]);
     }
 }
