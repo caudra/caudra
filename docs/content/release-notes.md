@@ -11,7 +11,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.8 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.8)
 
-Preview 8 lets the experimental decision engine rerank memory notes, tool search, retained tool output, and code context, gives workflows a `rerank()` function, and makes the wheel scroll lists instead of moving their selection.
+Preview 8 lets the experimental decision engine rerank memory notes, tool search, retained tool output, and code context, gives workflows a `rerank()` function, makes the wheel scroll lists instead of moving their selection, and stops pending reverts in a destination directory from blocking session moves.
 
 > **Note**
 >
@@ -26,6 +26,10 @@ Preview 8 lets the experimental decision engine rerank memory notes, tool search
 ### Interface fixes
 
 - **The wheel scrolls lists.** In `/decisions`, `/automations`, `/workflow`, `/peers` and `/messages`, the wheel over the list now scrolls it instead of moving the selection and loading every row it passes. Click a row or use the arrow keys to select one.
+
+### Sessions
+
+- **Moving into a directory ignores its pending reverts.** A move was refused with "Destination session … has a pending restore; resolve it before moving sessions" when any session already in the destination had a pending revert, even an old conversation revert. `/move-session` and `/migrate-sessions` stopped there. `/worktree remove` and other moves that brought this Caudra back to such a directory committed the move and then failed to start, with "UI startup failed; reopen the committed sessions at the destination". Sessions already in the destination no longer affect a move, just as they never stopped a new session from starting there. The rules for the directory a session leaves are unchanged.
 
 ## Caudra 0.2 Preview 7 {#v0-2-0-preview-7}
 

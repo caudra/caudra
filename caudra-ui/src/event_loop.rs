@@ -828,33 +828,6 @@ fn reconcile_relocation_live_version(
     Ok(())
 }
 
-fn check_relocation_destination(storage: &StateDir, destination: &Path) -> Result<(), String> {
-    let database = SessionDatabase::open_state(storage).map_err(|error| error.to_string())?;
-    let ids: HashSet<_> = database
-        .local_session_locations()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .filter(|entry| {
-            Path::new(&entry.cwd)
-                .canonicalize()
-                .is_ok_and(|cwd| cwd == destination)
-        })
-        .map(|entry| entry.id)
-        .collect();
-    for facts in database
-        .session_facts(None)
-        .map_err(|error| error.to_string())?
-    {
-        if ids.contains(&facts.id) && facts.pending_revert {
-            return Err(format!(
-                "Destination session {} has a pending restore; resolve it before moving sessions",
-                facts.id
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn refuse_resumable_workflows(database: &SessionDatabase, id: CaudraId) -> Result<(), String> {
     let resumable = database
         .load_workflow_runs(id)
@@ -1068,7 +1041,7 @@ fn prepare_session_for_runtime(
     validate_session_cwd(&session, &process_cwd)?;
     if !allow_workspace_recovery && session.meta.pending_revert.is_some() {
         return Err(format!(
-            "Session {} has a pending restore; resolve it before moving sessions",
+            "Session {} has a pending revert; resolve it before moving sessions",
             session.id
         ));
     }
@@ -1891,11 +1864,6 @@ impl<'t> EventLoop<'t> {
 
         let provider_ms = lap();
 
-        if !ctx.allow_workspace_recovery {
-            check_relocation_destination(&ctx.storage, &cwd).map_err(|error| eyre!(error))?;
-        }
-        let recover_sessions_ms = lap();
-
         let armings = launch_armings(sessions.len(), focused, launch_automations);
         let mut runtimes: Vec<SessionRuntime> = sessions
             .into_iter()
@@ -1907,7 +1875,6 @@ impl<'t> EventLoop<'t> {
         info!(
             mcp_ms,
             provider_ms,
-            recover_sessions_ms,
             spawn_runtimes_ms = lap(),
             total_ms = started.elapsed().as_millis() as u64,
             "event loop startup phases"
@@ -3930,7 +3897,6 @@ impl<'t> EventLoop<'t> {
             return Err(RELOCATION_CHANGED_ERR.into());
         }
         fs::read_dir(&destination).map_err(|error| error.to_string())?;
-        check_relocation_destination(&self.ctx.storage, &destination)?;
         let inventory = self.relocation_inventory()?;
         for expected in &mut request.sessions {
             if let Some(index) = self.position(expected.id) {
@@ -5456,7 +5422,6 @@ mod tests {
     const RELOCATION_DRAFT: &str = "draft before moving";
     const RELOCATION_EXTERNAL_TITLE: &str = "external writer";
     const RELOCATION_VERSION: i64 = 7;
-    const RELOCATION_PENDING_ERR: &str = "has a pending restore; resolve it before moving sessions";
     const RELOCATION_INPUT_HISTORY: usize = 100;
     const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
     const LAUNCH_AUTOMATION: &str = "nightly";
@@ -5728,44 +5693,6 @@ mod tests {
             Err(RELOCATION_CHANGED_ERR.into())
         );
         assert_eq!(expected, unchanged);
-    }
-
-    #[test_case(false; "clean_destination_allowed")]
-    #[test_case(true; "destination_donor_pending_revert_refused")]
-    fn relocation_startup_rechecks_destination_without_mutation(pending: bool) {
-        let temp = TempDir::new().unwrap();
-        let storage = StateDir::from_path(temp.path().to_path_buf());
-        let workspace = TempDir::new().unwrap();
-        let cwd = workspace.path().canonicalize().unwrap();
-        let mut donor = AppSession::new(RELOCATION_MODEL, cwd.to_str().unwrap());
-        if pending {
-            donor.meta.pending_revert = Some(PendingConversationRevert {
-                original_head: None,
-                target_head: None,
-                file_status: None,
-            });
-        }
-        donor.save(&storage).unwrap();
-        let session_before =
-            serde_json::to_value(load_app_session(donor.id, &storage).unwrap()).unwrap();
-
-        let result = check_relocation_destination(&storage, &cwd);
-
-        if pending {
-            assert_eq!(
-                result,
-                Err(format!(
-                    "Destination session {} {RELOCATION_PENDING_ERR}",
-                    donor.id
-                ))
-            );
-        } else {
-            result.unwrap();
-        }
-        assert_eq!(
-            serde_json::to_value(load_app_session(donor.id, &storage).unwrap()).unwrap(),
-            session_before
-        );
     }
 
     /// Another session's reverted files would block the move, so a new

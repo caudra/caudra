@@ -9531,6 +9531,28 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         }
     }
 
+    /// A session already at the destination keeps its revert to itself, as it
+    /// would if a new session started there.
+    #[test_case(CONVERSATION_REVERT; "conversation_revert")]
+    #[test_case(FILE_REVERT; "file_revert")]
+    fn relocation_ignores_pending_reverts_at_its_destination(pending: &str) {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let moving = TestSession::new(MODEL, CWD);
+        database.save(&moving, None).unwrap();
+        let resident = TestSession::new(MODEL, RELOCATION_DESTINATION);
+        database.save(&resident, None).unwrap();
+        database.connection.execute("UPDATE sessions SET metadata = json_set(metadata, '$.pending_revert', json(?1)) WHERE id = ?2", params![pending, resident.id.as_bytes().as_slice()]).unwrap();
+        let request = relocation_request(&database, CWD, false);
+
+        database.relocate_sessions(&request).unwrap();
+
+        assert_eq!(
+            root_on(&database.connection, moving.id).unwrap().cwd,
+            RELOCATION_DESTINATION
+        );
+    }
+
     #[test_case(WorkflowRunStatus::Active, true, false; "active")]
     #[test_case(WorkflowRunStatus::Paused, true, false; "paused")]
     #[test_case(WorkflowRunStatus::BudgetLimited, true, false; "budget_limited")]
