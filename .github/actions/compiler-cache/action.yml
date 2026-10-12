@@ -7,12 +7,13 @@ runs:
     - uses: mozilla-actions/sccache-action@v0.0.11
       with:
         version: v0.18.0
-    # Pull requests only read: they still reuse what main wrote, without spending the repository's
-    # cache quota on entries no other ref can see. RUSTC_WRAPPER covers direct Cargo, Make, and the
+    # Only main writes. Every other ref, pull requests and release tags alike, can read main's
+    # entries but keeps its own invisible to all later refs, so writing there only spends the
+    # repository's cache quota and evicts main's. RUSTC_WRAPPER covers direct Cargo, Make, and the
     # worker build, and cc-rs follows it for C and C++.
     - shell: bash
       env:
-        RW_MODE: ${{ github.event_name == 'pull_request' && 'READ_ONLY' || 'READ_WRITE' }}
+        RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
       run: |
         {
           echo "RUSTC_WRAPPER=sccache"

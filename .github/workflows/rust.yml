@@ -127,7 +127,8 @@ jobs:
         with:
           python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
-      - uses: ./.github/actions/compiler-cache
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/code-worker
       - run: make code-worker
       - run: cargo clippy --locked --all --tests -- -D warnings
@@ -148,6 +149,8 @@ jobs:
         with:
           python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/compiler-cache
       - uses: ./.github/actions/code-worker
       - uses: taiki-e/install-action@v2
@@ -191,6 +194,8 @@ jobs:
         with:
           python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/compiler-cache
       - uses: ./.github/actions/code-worker
       - run: python3 scripts/build-code-worker.py
@@ -212,6 +217,8 @@ jobs:
         with:
           python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/compiler-cache
       - uses: ./.github/actions/code-worker
       - run: make check build workcell-build ARGS=--locked
@@ -245,6 +252,8 @@ jobs:
           grep -Eq '^Ran [1-9][0-9]* tests? in ' "$RUNNER_TEMP/installer-tests.log"
           ! grep -q 'skipped=' "$RUNNER_TEMP/installer-tests.log"
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/code-worker
       - run: make check ARGS=--locked
       - name: Workcell macOS native filesystem checks
@@ -283,6 +292,8 @@ jobs:
         with:
           python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install GNU Make and select Git Bash
         shell: pwsh
         run: |
