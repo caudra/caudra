@@ -191,3 +191,8 @@ no part of the artwork maps back to a slice of the source. Emphasis, headings,
 and inline code copy at character precision.
 
 The role prefix is part of the interface and never reaches the clipboard.
+
+In WSL, every copy also asks the terminal to take the text with OSC 52, so it
+reaches the Windows clipboard even when WSLg does not pass it on. Orca needs
+Allow TUI Clipboard Writes (OSC 52) for this. Current Orca releases turn it on
+by default, and older ones leave it off.
