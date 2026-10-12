@@ -505,6 +505,9 @@ pub struct Agent<'h> {
     goal_blocks: u32,
     goal_prescreen_skips: u32,
     todos_reminded: bool,
+    /// Whether this run saved the plan in plan mode. Approving it is then the
+    /// host's plan handoff, which a `question` answer cannot stand in for.
+    plan_saved: bool,
     wait_for_background: bool,
     /// The session's autopilot. Only the main session acts for it.
     autopilot: Option<AutopilotHandle>,
@@ -674,6 +677,7 @@ impl<'h> Agent<'h> {
             goal_blocks: 0,
             goal_prescreen_skips: 0,
             todos_reminded: false,
+            plan_saved: false,
             wait_for_background: false,
             autopilot: None,
             autopilot_observed: None,
@@ -873,6 +877,7 @@ impl<'h> Agent<'h> {
             .map_err(|message| AgentError::Config { message })?;
         self.goal_prescreen_skips = 0;
         self.todos_reminded = false;
+        self.plan_saved = false;
         self.work_reminded = None;
         self.history.take_plan_written();
         self.response_text = None;
@@ -1815,12 +1820,18 @@ impl<'h> Agent<'h> {
 
     /// The handoff steps that may settle the turn before it goes back to the
     /// user, in order: the plan review, the question-tool nudge, and the reply
-    /// review. The first that settles it wins.
+    /// review. The first that settles it wins. Once this run saved the plan,
+    /// the nudge stands aside: a `question` answer cannot leave plan mode.
     async fn review_turn_end(&mut self) -> Result<Option<TurnOutcome>, AgentError> {
-        if let Some(outcome) = self.review_plan().await? {
-            return Ok(Some(outcome));
+        if self.mode.is_planning() && self.history.take_plan_written() {
+            self.plan_saved = true;
+            if let Some(outcome) = self.review_plan().await? {
+                return Ok(Some(outcome));
+            }
         }
-        if let Some(outcome) = self.remind_question_tool().await? {
+        if !self.plan_saved
+            && let Some(outcome) = self.remind_question_tool().await?
+        {
             return Ok(Some(outcome));
         }
         self.review_reply().await
@@ -1932,9 +1943,6 @@ impl<'h> Agent<'h> {
     /// verdict and leaves the plan to the human. Implementing ends the run,
     /// and the frontend starts the implement run.
     async fn review_plan(&mut self) -> Result<Option<TurnOutcome>, AgentError> {
-        if !self.mode.is_planning() || !self.history.take_plan_written() {
-            return Ok(None);
-        }
         let Some(autopilot) = self.reviewing_autopilot() else {
             return Ok(None);
         };

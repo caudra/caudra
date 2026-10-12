@@ -1,6 +1,5 @@
 mod autopilot_tests {
     use std::iter;
-    use std::path::Path;
     use std::sync::atomic::AtomicBool;
 
     use caudra_config::AutopilotConfig;
@@ -21,7 +20,6 @@ mod autopilot_tests {
     use crate::peers::held_work;
     #[cfg(unix)]
     use crate::tools::native::peers::WorkAssignment;
-    use crate::tools::native::plan::{self, PlanTool};
     use crate::tools::native::tests::tempdir;
     use crate::types::AutopilotEvent;
 
@@ -73,9 +71,6 @@ mod autopilot_tests {
     const REVISE_VERDICT: &str =
         r#"{"action":"revise","reason":"tests are missing","feedback":"Add the tests."}"#;
     const REVISION: &str = "Add the tests.";
-    const PLAN_FILE: &str = "plan.md";
-    const PLAN_TEXT: &str = "# Plan: retry uploads\nWrap the upload in a retry loop.";
-    const PLAN_READY: &str = "The plan is written. Shall I implement it?";
     const PLAN_REVISED: &str = "The plan now covers the tests.";
     /// The plan write, the reply after it, then the delegate.
     const PLAN_DELEGATE_CALL: usize = 2;
@@ -936,41 +931,7 @@ mod autopilot_tests {
 
     /// The plan write, the reply asking to implement it, then `verdict`.
     fn plan_written_then(verdict: &str) -> Vec<StreamResponse> {
-        vec![
-            tool_use_response(plan::NAME, json!({"action": "write", "content": PLAN_TEXT})),
-            answer(PLAN_READY),
-            answer(verdict),
-        ]
-    }
-
-    /// A main agent that may write the plan of [`planning_input`] under `root`.
-    fn planning_agent<'h>(
-        root: &Path,
-        provider: impl Provider + 'static,
-        history: &'h mut History,
-    ) -> (Agent<'h>, flume::Receiver<Envelope>) {
-        let (mut agent, events) = make_agent(provider, history);
-        agent.host_cwd = Some(root.to_owned());
-        agent
-            .registry
-            .register_audited(
-                Arc::new(PlanTool),
-                ToolSource::Native {
-                    owner: crate::tools::native::OWNER.into(),
-                    contract: plan::permission_contract().into(),
-                    trusted: true,
-                },
-                ToolEffect::Mutating,
-            )
-            .unwrap();
-        (agent, events)
-    }
-
-    fn planning_input(root: &Path) -> AgentInput {
-        AgentInput {
-            mode: AgentMode::Plan(root.join(PLAN_FILE)),
-            ..default_input()
-        }
+        vec![qn_plan_write(), answer(QN_PLAN_READY), answer(verdict)]
     }
 
     #[test]
@@ -980,7 +941,7 @@ mod autopilot_tests {
             let plans = tempdir();
             let root = plans.path();
             let mut history = History::default();
-            let (mut agent, events) = planning_agent(
+            let (mut agent, events) = qn_planning_agent(
                 root,
                 MockProvider::new(plan_written_then(ESCALATE_VERDICT)),
                 &mut history,
@@ -991,7 +952,7 @@ mod autopilot_tests {
             let mut agent = agent.with_autopilot(engaged(false));
 
             assert_eq!(
-                agent.run(planning_input(root)).await.unwrap(),
+                agent.run(qn_planning_input(root)).await.unwrap(),
                 DoneReason::EndTurn
             );
             assert_eq!(qn_reminders(agent.history), 0, "{PLAN_FIRST}");
@@ -1021,11 +982,11 @@ mod autopilot_tests {
             let provider = MockProvider::new(responses);
             let requests = Arc::clone(&provider.captured_messages);
             let mut history = History::default();
-            let (agent, events) = planning_agent(root, provider, &mut history);
+            let (agent, events) = qn_planning_agent(root, provider, &mut history);
             let mut agent = agent.with_autopilot(handle.clone());
 
             assert_eq!(
-                agent.run(planning_input(root)).await.unwrap(),
+                agent.run(qn_planning_input(root)).await.unwrap(),
                 DoneReason::EndTurn
             );
             assert!(agent.mode.is_planning(), "{PLAN_SETTLED}");
@@ -1059,7 +1020,7 @@ mod autopilot_tests {
                 requests[PLAN_DELEGATE_CALL]
                     .iter()
                     .filter_map(Message::first_text_content)
-                    .any(|prompt| PLAN_TEXT.lines().all(|line| prompt.contains(line))),
+                    .any(|prompt| QN_PLAN_TEXT.lines().all(|line| prompt.contains(line))),
                 "{PLAN_SETTLED}"
             );
         });
@@ -1078,11 +1039,11 @@ mod autopilot_tests {
                 assert!(claimer.claim_plan());
             });
             let mut history = History::default();
-            let (agent, _events) = planning_agent(root, provider, &mut history);
+            let (agent, _events) = qn_planning_agent(root, provider, &mut history);
             let mut agent = agent.with_autopilot(handle.clone());
 
             assert_eq!(
-                agent.run(planning_input(root)).await.unwrap(),
+                agent.run(qn_planning_input(root)).await.unwrap(),
                 DoneReason::EndTurn
             );
             drop(agent);

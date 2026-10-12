@@ -11,7 +11,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.7 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.7)
 
-Preview 7 keeps the reasoning of GPT models on Copilot in one piece, and makes copying from Caudra in WSL reach the Windows clipboard.
+Preview 7 keeps the reasoning of GPT models on Copilot in one piece, makes copying from Caudra in WSL reach the Windows clipboard, and leaves approving a saved plan to the plan menu.
 
 ### Providers
 
@@ -20,6 +20,10 @@ Preview 7 keeps the reasoning of GPT models on Copilot in one piece, and makes c
 ### Terminal
 
 - **Copying works in WSL.** In WSL, Caudra showed "Copied" while the text often stayed in the WSLg clipboard and never reached Windows. Every copy now also asks the terminal to take the text with OSC 52, which Windows Terminal and Orca pass to the Windows clipboard. In Orca, this needs Allow TUI Clipboard Writes (OSC 52), which older Orca releases leave off.
+
+### Plan mode
+
+- **A saved plan goes to the plan menu.** With the question-tool nudge on, a plan-mode reply that offered to implement the saved plan was turned into a question about implementing it. Choosing to implement there could not leave plan mode, so the model refused. Once the plan is saved, the nudge now stays off until your next message, and the plan-mode instructions ask the model to end with a summary instead of asking. Approve the plan from the plan menu as before.
 
 ## Caudra 0.2 Preview 6 {#v0-2-0-preview-6}
 

@@ -789,7 +789,10 @@ fn write_decisions_section(out: &mut String) {
          It checks an attempted final prose reply for a live request for the user to clarify, choose, \
          supply information, or approve a next step. It needs a configured engine and a usable \
          `question` tool with an answer channel in the main session. Subagents and frontends without \
-         that channel are excluded. YOLO does not disable it.\n\n\
+         that channel are excluded. YOLO does not disable it. Once the plan is saved in plan mode, \
+         the nudge stays off until the next user message. A `question` answer cannot leave plan \
+         mode, so the plan is approved through the plan menu, autopilot, or the client's mode \
+         switch.\n\n\
          In `shadow`, the prediction leaves the reply unchanged. In `advise`, a score at or above \
          `decisions.thresholds.question_tool_nudge` (default `0.85`) adds a normal system reminder \
          asking the assistant to use `question` for the outstanding answer. The original reply stays \

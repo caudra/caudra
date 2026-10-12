@@ -1,4 +1,6 @@
+use crate::tools::native::plan::PlanTool as QnPlanTool;
 use crate::tools::native::question::QuestionTool as QnQuestionTool;
+use crate::tools::native::tests::tempdir as qn_plan_dir;
 use caudra_storage::id::CaudraId as QnSessionId;
 use tempfile::TempDir as QnTempDir;
 
@@ -18,6 +20,12 @@ const QN_CALL_COUNT: &str = "only eligible handoffs may reach the decision engin
 const QN_NO_REMINDER: &str = "an ineligible or stale handoff must not inject a reminder";
 const QN_ONE_REMINDER: &str = "a genuine user-input episode allows one corrective reminder";
 const QN_VISIBLE_REMINDER: &str = "the correction must be a visible injected event";
+const QN_PLAN_FILE: &str = "plan.md";
+const QN_PLAN_TEXT: &str = "# Plan: retry uploads\nWrap the upload in a retry loop.";
+const QN_PLAN_READY: &str =
+    "The plan is saved. Leave plan mode when you're ready and I'll implement it.";
+const QN_PLAN_HANDOFF: &str = "a saved plan is approved through the plan handoff, not the nudge";
+const QN_PLAN_MODE_ASKS: &str = "a question in plan mode without a saved plan must still be nudged";
 
 fn qn_config(mode: FeatureMode) -> DecisionsConfig {
     let mut config = DecisionsConfig {
@@ -98,6 +106,43 @@ fn qn_reminders(history: &History) -> usize {
             )
         })
         .count()
+}
+
+fn qn_plan_write() -> StreamResponse {
+    tool_use_response(
+        plan::NAME,
+        json!({"action": "write", "content": QN_PLAN_TEXT}),
+    )
+}
+
+/// A main agent that may write the plan of [`qn_planning_input`] under `root`.
+fn qn_planning_agent<'h>(
+    root: &Path,
+    provider: impl Provider + 'static,
+    history: &'h mut History,
+) -> (Agent<'h>, flume::Receiver<Envelope>) {
+    let (mut agent, events) = make_agent(provider, history);
+    agent.host_cwd = Some(root.to_owned());
+    agent
+        .registry
+        .register_audited(
+            Arc::new(QnPlanTool),
+            ToolSource::Native {
+                owner: crate::tools::native::OWNER.into(),
+                contract: plan::permission_contract().into(),
+                trusted: true,
+            },
+            ToolEffect::Mutating,
+        )
+        .unwrap();
+    (agent, events)
+}
+
+fn qn_planning_input(root: &Path) -> AgentInput {
+    AgentInput {
+        mode: AgentMode::Plan(root.join(QN_PLAN_FILE)),
+        ..default_input()
+    }
 }
 
 fn qn_question_input() -> Value {
@@ -406,6 +451,86 @@ fn question_nudge_requires_an_unrestricted_end_turn(
         assert_eq!(requests.lock().unwrap().len(), 1);
         assert_eq!(qn_reminders(agent.history), 0, "{QN_NO_REMINDER}");
         assert!(events.try_iter().all(|event| !matches!(&event.event, AgentEvent::Injected { text, .. } if text == question_tool_nudge::REMINDER)));
+    });
+}
+
+#[test_case(false; "saved_plan")]
+#[test_case(true; "saved_plan_then_todo_reminder")]
+fn question_nudge_leaves_a_saved_plan_to_the_plan_handoff(open_todos: bool) {
+    smol::block_on(async {
+        let directory = QnTempDir::new().unwrap();
+        let plans = qn_plan_dir();
+        let root = plans.path();
+        let mut responses = vec![qn_plan_write(), answer(QN_PLAN_READY)];
+        if open_todos {
+            responses.push(answer(QN_REPEAT));
+        }
+        let provider = MockProvider::new(responses);
+        let requests = Arc::clone(&provider.captured_messages);
+        let mut history = History::default().with_todos(open_todos.then(mixed_todos));
+        let (mut agent, events) = qn_planning_agent(root, provider, &mut history);
+        install_todo_tool(&agent);
+        qn_install_native(&agent);
+        let _answers = qn_transport(&mut agent);
+        let calls = qn_enable(&agent, &directory, FeatureMode::Advise, QN_POSITIVE, false);
+
+        assert_eq!(
+            agent.run(qn_planning_input(root)).await.unwrap(),
+            DoneReason::EndTurn
+        );
+        let last = if open_todos { QN_REPEAT } else { QN_PLAN_READY };
+        assert_eq!(agent.response_text(), Some(last));
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "{QN_PLAN_HANDOFF}");
+        assert_eq!(qn_reminders(agent.history), 0, "{QN_PLAN_HANDOFF}");
+        assert_eq!(todo_reminders(agent.history), usize::from(open_todos));
+        drop(agent);
+
+        assert_eq!(requests.lock().unwrap().len(), 2 + usize::from(open_todos));
+        assert_eq!(
+            drain_events(&events)
+                .iter()
+                .filter(|event| matches!(event.event, AgentEvent::Done { .. }))
+                .count(),
+            1
+        );
+        assert_decision_effects(&directory, &[], Value::Null).await;
+    });
+}
+
+#[test_case(false; "before_any_save")]
+#[test_case(true; "after_an_earlier_run_saved_it")]
+fn question_nudge_still_asks_in_plan_mode_without_a_saved_plan(earlier_save: bool) {
+    smol::block_on(async {
+        let directory = QnTempDir::new().unwrap();
+        let plans = qn_plan_dir();
+        let root = plans.path();
+        let mut responses = Vec::new();
+        if earlier_save {
+            responses.extend([qn_plan_write(), answer(QN_PLAN_READY)]);
+        }
+        responses.extend([answer(QN_REPLY), answer(QN_FINAL)]);
+        let mut history = History::default();
+        let (mut agent, _events) =
+            qn_planning_agent(root, MockProvider::new(responses), &mut history);
+        qn_install_native(&agent);
+        let _answers = qn_transport(&mut agent);
+        let calls = qn_enable(&agent, &directory, FeatureMode::Advise, QN_POSITIVE, false);
+        if earlier_save {
+            assert_eq!(
+                agent.run(qn_planning_input(root)).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 0, "{QN_PLAN_HANDOFF}");
+        }
+
+        let input = AgentInput {
+            message: QN_REQUEST.into(),
+            ..qn_planning_input(root)
+        };
+        assert_eq!(agent.run(input).await.unwrap(), DoneReason::EndTurn);
+        assert_eq!(agent.response_text(), Some(QN_FINAL));
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "{QN_PLAN_MODE_ASKS}");
+        assert_eq!(qn_reminders(agent.history), 1, "{QN_PLAN_MODE_ASKS}");
     });
 }
 
