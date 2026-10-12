@@ -310,7 +310,7 @@ class MakeTests(unittest.TestCase):
 
     def test_sccache_selection_and_settings_can_be_overridden(self):
         self.env["PATH"] = self.path_with_sccache
-        custom = "/opt/cache tools/sccache"
+        custom = "cache tools/sccache"
         for arguments, environment, expected in (
             (["SCCACHE="], {}, UNCACHED),
             ([], {"SCCACHE": ""}, UNCACHED),
