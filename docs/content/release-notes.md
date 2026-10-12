@@ -7,6 +7,16 @@ Each release lists what changed, newest first. After an update, the first intera
 
 To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run [`caudra update`](/docs/cli/#caudra-update-caudra-rollback). Each release links to its GitHub page, which holds the downloads.
 
+## Caudra 0.2 Preview 7 {#v0-2-0-preview-7}
+
+[v0.2.0-preview.7 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.7)
+
+Preview 7 keeps the reasoning of GPT models on Copilot in one piece.
+
+### Providers
+
+- **Copilot reasoning stays whole.** With GPT models on Copilot and Copilot Enterprise, a finished turn split its reasoning into a separate block for each streamed word. Caudra then sent that reasoning back to the model as plain reply text, once in fragments and once in full, and dropped the encrypted reasoning the model needs on later turns. Each reasoning summary is now one block, and later turns send the encrypted reasoning back as they do with OpenAI. Turns saved before the update keep their split blocks.
+
 ## Caudra 0.2 Preview 6 {#v0-2-0-preview-6}
 
 [v0.2.0-preview.6 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.6)
