@@ -11,7 +11,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.7 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.7)
 
-Preview 7 keeps the reasoning of GPT models on Copilot in one piece, makes copying from Caudra in WSL reach the Windows clipboard, and leaves approving a saved plan to the plan menu.
+Preview 7 keeps the reasoning of GPT models on Copilot in one piece, makes copying from Caudra in WSL reach the Windows clipboard, leaves approving a saved plan to the plan menu, and saves a session again after another Caudra carried it on.
 
 ### Providers
 
@@ -24,6 +24,10 @@ Preview 7 keeps the reasoning of GPT models on Copilot in one piece, makes copyi
 ### Plan mode
 
 - **A saved plan goes to the plan menu.** With the question-tool nudge on, a plan-mode reply that offered to implement the saved plan was turned into a question about implementing it. Choosing to implement there could not leave plan mode, so the model refused. Once the plan is saved, the nudge now stays off until your next message, and the plan-mode instructions ask the model to end with a summary instead of asking. Approve the plan from the plan menu as before.
+
+### Sessions
+
+- **Reopening a session another Caudra carried on saves again.** If you left a session with `Ctrl+X n` or `/new`, carried it on in another Caudra, such as an Orca pane, and then reopened it in the first one, every save failed with "session … was modified concurrently: expected write version …, found …". Nothing written after reopening it was saved, and no other Caudra could open the session until you quit the first one. The session on disk was not damaged. Deleting such a session from the session picker failed the same way. Both now work.
 
 ## Caudra 0.2 Preview 6 {#v0-2-0-preview-6}
 

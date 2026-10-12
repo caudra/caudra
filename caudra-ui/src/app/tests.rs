@@ -23470,6 +23470,33 @@ fn load_session_persists_the_new_session_and_leaks_no_history_into_it() {
     ));
 }
 
+const ELSEWHERE_TITLE: &str = "carried on in an Orca pane";
+const RESUMED_TITLE: &str = "saved after resuming here";
+
+/// `ctrl-x n` releases a session another Caudra may then carry on. Resuming it
+/// here, as the picker does, must save on top of that instead of failing every
+/// write with "modified concurrently".
+#[test]
+fn resuming_after_new_session_saves_what_another_process_advanced() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
+    app.checkpoint();
+    let id = app.state.session.id;
+    assert!(!app.reset_session().is_empty());
+    let mut elsewhere = AppSession::load(id, &dir).unwrap();
+    elsewhere.set_title(ELSEWHERE_TITLE.into());
+    elsewhere.save(&dir).unwrap();
+
+    let (resumed, cursor) = crate::open_app_session_with_cursor(id, &dir).unwrap();
+    writer.adopt_cursor(cursor);
+    let model = app.state.model.clone();
+    app.apply_loaded_session(resumed, &model).unwrap();
+    app.state.session_mut().set_title(RESUMED_TITLE.into());
+
+    writer.save_sync(Arc::clone(&app.state.session)).unwrap();
+    assert_eq!(AppSession::load(id, &dir).unwrap().title, RESUMED_TITLE);
+}
+
 #[test]
 fn idle_checkpoint_changes_nothing() {
     let mut app = test_app();

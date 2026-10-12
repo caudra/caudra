@@ -797,31 +797,46 @@ impl Writer {
         Ok(())
     }
 
-    /// Takes the cursor a load handed over when this writer has none of its
-    /// own. Without it the first save of a resumed session finds no cursor and
-    /// falls back to rewriting every payload the session holds.
-    fn adopt_seeded_cursor(&mut self, id: CaudraId) {
-        if self.cursors.contains_key(&id) {
+    /// Takes the cursor a load handed over for this snapshot's lineage, unless
+    /// this writer already saved that lineage itself. Without it the first save
+    /// of a resumed session finds no cursor and falls back to rewriting every
+    /// payload the session holds. A cursor kept from an earlier lineage gives
+    /// way: another process may have saved the session after this one let go.
+    fn adopt_seeded_cursor(&mut self, session: &AppSession) {
+        if self
+            .cursors
+            .get(&session.id)
+            .is_some_and(|cursor| cursor.shares_lineage(session))
+        {
             return;
         }
-        let seeded = self
+        let mut seeded = self
             .seeded_cursors
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&id);
-        if let Some(cursor) = seeded {
-            self.cursors.insert(id, cursor);
+            .unwrap_or_else(|error| error.into_inner());
+        if seeded
+            .get(&session.id)
+            .is_some_and(|cursor| cursor.shares_lineage(session))
+            && let Some(cursor) = seeded.remove(&session.id)
+        {
+            self.cursors.insert(session.id, cursor);
         }
     }
 
     fn write(&mut self, session: &AppSession) -> Result<(), SessionError> {
-        self.adopt_seeded_cursor(session.id);
+        self.adopt_seeded_cursor(session);
         if self.database.is_none() {
             self.database = Some(SessionDatabase::open(&self.dir)?);
         }
         let database = self.database.as_mut().expect("database initialized");
-        if let Some(cursor) = self.cursors.get(&session.id)
-            && cursor.shares_lineage(session)
+        // A cursor only describes what its own lineage saved. One left from a
+        // lineage this process released says nothing about a later load, so
+        // that snapshot is checked against its own base instead.
+        let cursor = self
+            .cursors
+            .get(&session.id)
+            .filter(|cursor| cursor.shares_lineage(session));
+        if let Some(cursor) = cursor
             && session
                 .persisted_write_version()
                 .is_none_or(|base| base < cursor.write_version())
@@ -836,7 +851,7 @@ impl Writer {
         } else {
             // Borrow rather than remove: a retryable failure must retain the
             // latest committed cursor instead of falling back to a stale full write.
-            database.save(session, self.cursors.get(&session.id))?
+            database.save(session, cursor)?
         };
         if session.meta.peer_controls.is_some()
             && let Some(peer) = PeerSession::lookup(session.id)
@@ -860,13 +875,18 @@ impl Writer {
             }
         }
         let database = self.database.as_mut().expect("database initialized");
-        let expected = match self.cursors.get(&id).map(SessionCursor::write_version) {
-            Some(version) => Some(version),
-            None => match database.write_version(id) {
-                Ok(version) => version,
-                Err(error) => return (Err(error), None),
-            },
+        let stored = match database.write_version(id) {
+            Ok(version) => version,
+            Err(error) => return (Err(error), None),
         };
+        // Deletes run under the session's lease, so a stored version past this
+        // writer's cursor was committed by a process that has since let go. A
+        // cursor past the stored version still conflicts: storage went back.
+        let expected = self
+            .cursors
+            .get(&id)
+            .map(SessionCursor::write_version)
+            .max(stored);
         match AppSession::delete_for_recreation(id, &self.dir, expected) {
             Ok(version) => (Ok(()), Some(version)),
             Err(SessionError::Storage(StorageError::NotFound(_))) => (Ok(()), None),
@@ -1044,6 +1064,8 @@ mod tests {
         "each turn must reach the sum; the ledger is money, not a snapshot";
     const SPEND_OUTLIVES: &str = "forgetting a session must not erase what it cost";
     const TITLE: &str = "renamed after reload";
+    const ELSEWHERE_TITLE: &str = "carried on in another Caudra";
+    const REOPENED_TITLE: &str = "saved after reopening";
     const GENERATION_LAGS: &str =
         "a change that has already reported back must be visible in the generation that follows it";
     const GENERATION_RAN_AHEAD: &str =
@@ -2473,6 +2495,56 @@ mod tests {
             AppSession::load(stored.id, &dir).unwrap().title,
             unrelated.title
         );
+    }
+
+    /// Writes a session, then advances its stored version from outside this
+    /// writer, as another Caudra does once this one has released the session.
+    fn released_and_advanced_elsewhere(writer: &mut Writer, dir: &StateDir) -> CaudraId {
+        let released = AppSession::new(MODEL, CWD);
+        writer.write(&released).unwrap();
+        let mut elsewhere = AppSession::load(released.id, dir).unwrap();
+        elsewhere.set_title(ELSEWHERE_TITLE.into());
+        elsewhere.save(dir).unwrap();
+        released.id
+    }
+
+    /// Releasing a session keeps this writer's cursor for it. Reopening the
+    /// session after another Caudra saved it must save on top of that, not
+    /// fail every write against the cursor left from before.
+    #[test_case(true; "seeded_by_resume")]
+    #[test_case(false; "loaded_without_cursor")]
+    fn reopened_session_saves_after_another_process_advanced_it(seeded: bool) {
+        let (_tmp, dir) = state_dir();
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let mut writer = bare_writer(&dir, warn_tx);
+        let id = released_and_advanced_elsewhere(&mut writer, &dir);
+        let (mut reopened, cursor) = crate::open_app_session_with_cursor(id, &dir).unwrap();
+        let loaded_version = cursor.write_version();
+        if seeded {
+            writer.seeded_cursors.lock().unwrap().insert(id, cursor);
+        }
+        reopened.set_title(REOPENED_TITLE.into());
+
+        writer.write(&reopened).unwrap();
+
+        assert_eq!(AppSession::load(id, &dir).unwrap().title, REOPENED_TITLE);
+        assert_eq!(writer.cursors[&id].write_version(), loaded_version + 1);
+        assert!(writer.cursors[&id].shares_lineage(&reopened));
+        assert!(writer.seeded_cursors.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_a_released_session_another_process_advanced_succeeds() {
+        let (_tmp, dir) = state_dir();
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let mut writer = bare_writer(&dir, warn_tx);
+        let id = released_and_advanced_elsewhere(&mut writer, &dir);
+
+        let (result, recreation) = writer.delete(id);
+
+        result.unwrap();
+        assert!(recreation.is_some());
+        assert!(AppSession::load(id, &dir).is_err());
     }
 
     /// `journal_size_limit` leaves the file at the retention limit, so a latch
