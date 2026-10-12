@@ -3764,20 +3764,35 @@ mod tests {
 
     use super::*;
     use serde_json::json;
-    use std::collections::{BTreeMap, BTreeSet};
-    use workcell_host_contract::{EnvPattern, EnvironmentEntryState, ToolName};
+    #[cfg(unix)]
+    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
+    #[cfg(unix)]
+    use workcell_host_contract::EnvironmentEntryState;
+    use workcell_host_contract::{EnvPattern, ToolName};
 
     const PRINTENV: &str = "printenv";
+    #[cfg(unix)]
     const SHELL_ENVIRONMENT_CHILD_ENV: &str = "WORKCELL_TEST_SHELL_ENVIRONMENT_CHILD";
+    #[cfg(unix)]
     const SHELL_ENVIRONMENT_CHILD_TEST: &str = "server::tests::shell_environment_child";
+    #[cfg(unix)]
     const SHELL_ENVIRONMENT_CHILD_PASSED: &str = "shell environment child passed";
+    #[cfg(unix)]
     const FORWARDED_CANARY: &str = "FORWARDED_CANARY";
+    #[cfg(unix)]
     const OVERRIDDEN_SETTING: &str = "OVERRIDDEN_SETTING";
+    #[cfg(unix)]
     const OPERATOR_FILE_SETTING: &str = "OPERATOR_FILE_SETTING";
+    #[cfg(unix)]
     const OPERATOR_CONSULTED_SETTING: &str = "OPERATOR_CONSULTED_SETTING";
+    #[cfg(unix)]
     const HTTP_TOKEN_ENV: &str = "WORKCELL_MCP_HTTP_TOKEN";
+    #[cfg(unix)]
     const GUEST_VALUE: &str = "guest-value";
+    #[cfg(unix)]
     const LITERAL_VALUE: &str = "literal-value";
+    #[cfg(unix)]
     const SERVER_SECRET: &str = "server-secret-canary";
 
     const PATH_OUTSIDE_ROOT_CODE: &str = "path_outside_root";
@@ -5216,6 +5231,7 @@ mod tests {
             .await
     }
 
+    #[cfg(unix)]
     async fn run_prepared_stdout(server: &WorkcellServer, preparation_id: Identifier) -> String {
         let remote = server.remote_host.as_ref().unwrap();
         let request = workcell_host_contract::ExecuteRequest {

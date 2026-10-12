@@ -8839,8 +8839,10 @@ complete(#{ report: first.output });
     const PLAN_FILE: &str = "plan.md";
     const PLAN_TEXT: &str = "# Plan: retry uploads\nWrap the upload in a retry loop.";
     const OTHER_PLAN_TEXT: &str = "# Plan: a subagent's notes";
+    #[cfg(unix)]
     const PLAN_READY: &str = "The plan is written. Shall I implement it?";
     const PLAN_WRITE_CALL: &str = "plan-write";
+    #[cfg(unix)]
     const IMPLEMENT_VERDICT: &str = r#"{"action":"implement","reason":"the plan covers it"}"#;
     const IMPLEMENT_SEQ: u32 = 3;
     #[cfg(unix)]
@@ -8850,8 +8852,10 @@ complete(#{ report: first.output });
     const NO_AUTOPILOT: &str = "the session must attach an autopilot while the experiment is on";
     const ANNOUNCED_ONCE: &str = "an engagement must be announced once, and its end once";
     const INTERRUPT_ENDS: &str = "an interrupt must end autopilot as the interrupt's stop";
+    #[cfg(unix)]
     const IMPLEMENTED: &str =
         "the plan autopilot chose must run in build mode, opened by autopilot's implement message";
+    #[cfg(unix)]
     const COUNTED_ONCE: &str = "a run autopilot starts must count one continuation";
     const RESUMED_ENGAGED: &str = "a resumed engagement must stay engaged with the budget it used";
     const RESUMED_CHECKIN: &str = "a resumed engagement must owe its goal one check-in";
@@ -8869,12 +8873,14 @@ complete(#{ report: first.output });
         }
     }
 
+    #[cfg(unix)]
     fn answer_text(text: &str) -> StreamResponse {
         let mut response = text_answer();
         response.message.content = vec![ContentBlock::Text { text: text.into() }];
         response
     }
 
+    #[cfg(unix)]
     fn plan_write_response() -> StreamResponse {
         StreamResponse {
             message: Message {

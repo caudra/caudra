@@ -659,6 +659,7 @@ mod tests {
     use test_case::test_case;
 
     const BUILTIN_NAME: &str = "caudra-plugin-dev";
+    #[cfg(unix)]
     const HOST_SKILL_BODY: &str = "# Host\n\nRun host pane list.";
     const BUILTIN_BODY: &str = "how to write plugins";
     const BUILTIN_DESC: &str = "author plugins";

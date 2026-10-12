@@ -90,7 +90,9 @@ mod autopilot_tests {
     const REPLY_CONTINUES: &str = "an autopilot reply must continue the run with its text";
     const PLAN_SETTLED: &str = "a plan verdict must settle the turn as its action says";
     const CLAIM_DROPS: &str = "a plan the user claimed must drop the delegate's verdict";
+    #[cfg(unix)]
     const WORK_REMINDED: &str = "held work must be reminded once per item while it can be reported";
+    #[cfg(unix)]
     const WORK_AFTER_TODOS: &str = "the unreported-work reminder must follow the todo reminder";
     const CONTINUE_VERDICT: &str = r#"{"action":"continue","reason":"the work is close","guidance":"Run the failing test alone."}"#;
     const AGREE_VERDICT: &str = r#"{"action":"agree","reason":"the endpoint is gone"}"#;
