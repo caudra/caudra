@@ -805,7 +805,7 @@ impl ProviderDef {
             min: None,
             max: None,
             env: None,
-            description: "An API key, stored as plain text unless you write `{env:NAME}` to read it from your environment. Caudra tries the environment variable and saved credentials first",
+            description: "An API key, stored as plain text unless you write `{env:NAME}` or `{file:PATH}` to read it from your environment or a file. Caudra tries the environment variable and saved credentials first",
         },
         ConfigField {
             name: "default_model",
@@ -1700,7 +1700,7 @@ best = "gpt-4.1"
     fn saving_keeps_references_as_written() {
         const REFERENCED: &str = "proxy";
         const ADDED: &str = "added";
-        const API_KEY: &str = "{env:PROXY_API_KEY}";
+        const API_KEY: &str = "{file:~/.secrets/proxy}";
         const BASE_URL: &str = "https://{env:PROXY_HOST}/v1";
         let mut file = ProvidersFile::parse(&format!(
             "[{REFERENCED}]\nprotocol = \"openai\"\napi_key = \"{API_KEY}\"\nbase_url = \"{BASE_URL}\"\n"
@@ -1714,6 +1714,24 @@ best = "gpt-4.1"
         assert_eq!(referenced.api_key.as_deref(), Some(API_KEY));
         assert_eq!(referenced.base_url.as_deref(), Some(BASE_URL));
         assert!(reparsed.get(ADDED).is_some());
+    }
+
+    #[test]
+    fn api_keys_can_come_from_a_file_beside_the_config() {
+        const KEY_FILE: &str = "proxy-key";
+        const KEY: &str = "sk-from-file";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PROVIDERS_FILE);
+        fs::write(dir.path().join(KEY_FILE), format!("{KEY}\n")).unwrap();
+        fs::write(
+            &path,
+            format!("[{KEPT_SLUG}]\nprotocol = \"openai\"\napi_key = \"{{file:{KEY_FILE}}}\"\n"),
+        )
+        .unwrap();
+
+        let config = ProvidersConfig::parse_file(&path).unwrap();
+
+        assert_eq!(config.get(KEPT_SLUG).unwrap().api_key.as_deref(), Some(KEY));
     }
 
     const KEPT_SLUG: &str = "kept";

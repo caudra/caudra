@@ -440,8 +440,8 @@ version = 1
 # Type: string[].
 # pass = []
 
-# Values set for local shell commands; {env:NAME} reads Caudra's environment.
-# Wins over pass.
+# Values set for local shell commands; {env:NAME} reads Caudra's environment
+# and {file:PATH} a file. Wins over pass.
 # Type: table.
 # set = {}
 

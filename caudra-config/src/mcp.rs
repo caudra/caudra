@@ -74,7 +74,7 @@ pub const STDIO_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
-        description: "Stdio servers: environment variables for the server process, such as `{ GITHUB_TOKEN = \"{env:GITHUB_TOKEN}\" }`. In the global file, `{env:NAME}` reads a value from your environment. Other values are stored as plain text",
+        description: "Stdio servers: environment variables for the server process, such as `{ GITHUB_TOKEN = \"{env:GITHUB_TOKEN}\" }`. In the global file, `{env:NAME}` reads a value from your environment and `{file:PATH}` reads a file. Other values are stored as plain text",
     },
 ];
 
@@ -95,7 +95,7 @@ pub const HTTP_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
-        description: "HTTP servers: headers sent with every request, such as `{ Authorization = \"Bearer {env:GITHUB_TOKEN}\" }`. In the global file, `{env:NAME}` reads a value from your environment. Other values are stored as plain text",
+        description: "HTTP servers: headers sent with every request, such as `{ Authorization = \"Bearer {env:GITHUB_TOKEN}\" }`. In the global file, `{env:NAME}` reads a value from your environment and `{file:PATH}` reads a file. Other values are stored as plain text",
     },
     ConfigField {
         name: "oauth",
@@ -125,7 +125,7 @@ pub const OAUTH_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
-        description: "The client secret, for a confidential client. It is stored as plain text unless the global file reads it from your environment with `{env:NAME}`",
+        description: "The client secret, for a confidential client. It is stored as plain text unless the global file reads it with `{env:NAME}` from your environment or with `{file:PATH}` from a file",
     },
     ConfigField {
         name: "callback_port",

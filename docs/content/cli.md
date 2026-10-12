@@ -259,7 +259,7 @@ set = { AWS_PROFILE = "readonly", AGENT_TOKEN = "{env:CAUDRA_AGENT_TOKEN}" }
 ```
 
 - `pass` forwards host variables by exact name or by a `NAME_*` prefix. A name that is unset is skipped. A bare `*` is refused, because the host environment holds your provider keys.
-- `set` gives a command a value of its own, so the agent can use a different Docker host or AWS profile from your terminal. `{env:NAME}` reads a value from Caudra's environment or the global `.env`, which keeps a secret out of the file.
+- `set` gives a command a value of its own, so the agent can use a different Docker host or AWS profile from your terminal. `{env:NAME}` reads a value from Caudra's environment or the global `.env`, and `{file:PATH}` reads one from a file. Both keep a secret out of `caudra.toml`. See [Values from files](/docs/configuration/#values-from-files).
 - `set` wins over `pass`, and both win over the variables listed above. `NO_COLOR` and `CLICOLOR` are always set last.
 - Names that decide how Bash starts, such as `BASH_ENV`, `ENV`, `IFS`, `PS4`, and `PWD`, are refused, and so is a prefix that would match one.
 - Values for `pass` come from the environment Caudra started with and the global `.env`. A project `.env` never supplies one, so a repository cannot choose the value of a variable you forward. Tools in the repository can still read its `.env` file themselves.

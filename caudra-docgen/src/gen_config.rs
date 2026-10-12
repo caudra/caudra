@@ -882,6 +882,26 @@ headers = { authorization = "Bearer {env:OTEL_TOKEN}" }
 
 "#;
 
+const FILES_SECTION: &str = r#"## Values from files
+
+A string value in a global config file can also hold the contents of a file. Write `{file:PATH}` where the value goes, and Caudra puts the file's text there, with spaces and line breaks trimmed from both ends. This suits a secret that a password manager or a deployment tool keeps in a file:
+
+```toml
+[telemetry]
+headers = { authorization = "Bearer {file:~/.secrets/otel-token}" }
+```
+
+- The same files accept it, and the rules for [environment variables](#environment-variables) apply to it too. Only string values expand, a project file under `.caudra/` cannot hold one, `${file:PATH}` stays as written, and Caudra writes the reference back rather than the contents.
+- A relative path starts at the directory of the config file that holds it. `~` followed by `/` stands for your home directory, and so does `~\` on Windows.
+- Caudra removes `.` and `..` from the path as written before it reads the file. After a symlinked directory, `..` goes back to the directory that holds the link, as on Windows, rather than to the parent of its target. A symlinked file is followed.
+- A path can hold `{env:NAME}`, such as `{file:{env:CREDENTIALS_DIRECTORY}/otel-token}`. Caudra uses the variable's value as written, so a `~` in it is a plain name.
+- On Windows, write a path with backslashes in a single-quoted TOML string, such as `'{file:C:\Users\me\otel-token}'`, or use forward slashes. A double-quoted string needs every backslash doubled. A path such as `\secrets\otel-token` starts at the root of the config file's drive, and UNC paths such as `\\server\share\otel-token` work.
+- The file must be a regular file in UTF-8, at most 1 MiB. A path cannot contain `}`, or start or end with a space.
+- A missing or unreadable file is an error that names the config file, the line, and the path Caudra tried, never the contents. The config file then fails to load, with the same effect as an unset variable.
+- Caudra does not watch the file. It reads it again when it reloads the config file that names it, such as after you edit that file or run `/reload`.
+
+"#;
+
 const HOT_RELOAD_SECTION: &str = r#"## Hot reload
 
 While the terminal UI runs, Caudra watches its config files, skill and command directories, and [system prompt profiles](/docs/system-prompts/). It applies an edit shortly after you save it. One line in the footer then says what reloaded, what still needs `/reload` or a restart, and which file failed to load. For `caudra.toml` it names the tables whose values changed. It names files and keys and never shows a value from them. A save that changed nothing says nothing, and so do Caudra's own writes, such as turning a server off in `/mcp`. Headless runs and ACP read configuration once, at startup.
@@ -899,6 +919,7 @@ While the terminal UI runs, Caudra watches its config files, skill and command d
 | `workcell.toml` and `sandboxes.toml` | After `/reload`. |
 | `init.lua` | After `/reload`, which runs it again. A changed script never runs by itself. |
 | Global `.env` | `{env:NAME}` references follow it at once. Shell commands and keys read from the environment keep their startup values until a restart. |
+| Files that `{file:PATH}` reads | When the config file that names them reloads. Caudra does not watch them. |
 | Project `.env` | After a restart. |
 
 A [remote workspace](/docs/remote-workspaces/) session keeps the permissions and commands of its workspace. Its project files apply after `/reload`.
@@ -1174,6 +1195,7 @@ For every setting in one file, with its type, default, and description, see [Ref
     )
     .unwrap();
     out.push_str(ENVIRONMENT_SECTION);
+    out.push_str(FILES_SECTION);
     out.push_str(&hot_reload_section());
     write_experimental_section(&mut out);
     write_migration_section(&mut out);
@@ -1318,7 +1340,7 @@ Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/pro
 #[cfg(test)]
 mod tests {
     use caudra_config::config_file::GlobalConfigFile;
-    use caudra_config::interpolation::Lookup;
+    use caudra_config::interpolation::{ENV_OPEN, FILE_OPEN, Lookup};
     use caudra_config::{
         AgentConfig, ConfigValue, DecisionsConfig, Feature, SteeringConfig,
         decisions::RawDecisionsConfig,
@@ -1336,10 +1358,9 @@ mod tests {
     const RULE_COUNT: usize = 9;
     const TOML_FENCE: &str = "```toml\n";
     const FENCE_END: &str = "```";
-    /// A reference needs a real environment, and caudra-config tests those.
-    /// The examples only have to be valid settings once it is gone.
-    const ENV_REFERENCE: &str = "{env:";
-    const ENV_PLACEHOLDER: &str = "{";
+    /// A reference needs a real environment or file, and caudra-config tests
+    /// those. The examples only have to be valid settings once it is gone.
+    const REFERENCE_PLACEHOLDER: &str = "{";
 
     #[test]
     fn experimental_reference_lists_every_switch_off() {
@@ -1364,7 +1385,9 @@ mod tests {
             .collect();
         assert!(!examples.is_empty());
         for example in examples {
-            let shape = example.replace(ENV_REFERENCE, ENV_PLACEHOLDER);
+            let shape = example
+                .replace(ENV_OPEN, REFERENCE_PLACEHOLDER)
+                .replace(FILE_OPEN, REFERENCE_PLACEHOLDER);
             if let Err(error) = GlobalConfigFile::parse(&shape, Lookup::Refused) {
                 panic!("{error}\n{example}");
             }

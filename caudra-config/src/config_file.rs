@@ -36,7 +36,7 @@ pub enum ConfigFileError {
         source: Box<TomlError>,
     },
     #[error("invalid {}: {source}", path.display())]
-    Environment {
+    Reference {
         path: PathBuf,
         #[source]
         source: InterpolationError,
@@ -128,7 +128,7 @@ fn invalid(path: &Path, error: ConfigTextError) -> ConfigFileError {
             path,
             source: Box::new(source),
         },
-        ConfigTextError::Environment(source) => ConfigFileError::Environment { path, source },
+        ConfigTextError::Reference(source) => ConfigFileError::Reference { path, source },
     }
 }
 
@@ -164,11 +164,13 @@ mod tests {
         CONFIG_FILE, ConfigFileError, load_global_config, load_project_config, project_config_path,
     };
     use crate::experimental::{Feature, FeatureFlags};
+    use crate::interpolation::{ENV_OPEN, FILE_OPEN};
     use crate::{ENV_FILE, InboundPolicy};
     use test_case::test_case;
 
     const ENDPOINT_HOST: &str = "CAUDRA_TEST_CONFIG_FILE_ENDPOINT_HOST";
-    const UNSET_THEME: &str = "CAUDRA_TEST_CONFIG_FILE_UNSET_THEME";
+    /// Neither a variable nor a file has this name.
+    const MISSING_THEME: &str = "CAUDRA_TEST_CONFIG_FILE_MISSING_THEME";
     const GLOBAL_SCOPE: &str = "global";
     const PROJECT_SCOPE: &str = "project";
     const EVERY_FLAG: &str = "[experimental]\nworkflows = true\nsandboxes = true\nremote_workcell = true\nlua_plugins = true\ndecision_engine = true\ncross_session_messaging = true\nautomations = true\nautopilot = true\n";
@@ -306,15 +308,17 @@ mod tests {
         );
     }
 
-    #[test_case(GLOBAL_SCOPE; "global_unset")]
-    #[test_case(PROJECT_SCOPE; "project_refused")]
-    fn environment_errors_name_the_file_and_line(scope: &str) {
+    #[test_case(GLOBAL_SCOPE, ENV_OPEN; "global_unset")]
+    #[test_case(PROJECT_SCOPE, ENV_OPEN; "project_refused")]
+    #[test_case(GLOBAL_SCOPE, FILE_OPEN; "global_missing_file")]
+    #[test_case(PROJECT_SCOPE, FILE_OPEN; "project_file_refused")]
+    fn reference_errors_name_the_file_and_line(scope: &str, open: &str) {
         let dir = tempfile::tempdir().unwrap();
         let path = project_config_path(dir.path());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
-            format!("version = 1\n[ui]\ntheme = \"{{env:{UNSET_THEME}}}\"\n"),
+            format!("version = 1\n[ui]\ntheme = \"{open}{MISSING_THEME}}}\"\n"),
         )
         .unwrap();
         let error = if scope == GLOBAL_SCOPE {
@@ -323,13 +327,13 @@ mod tests {
             load_project_config(&path).unwrap_err()
         };
         assert!(
-            matches!(error, ConfigFileError::Environment { .. }),
+            matches!(error, ConfigFileError::Reference { .. }),
             "{error}"
         );
         let message = error.to_string();
         assert!(message.contains(&path.display().to_string()), "{message}");
         assert!(message.contains("line 3"), "{message}");
-        assert!(message.contains(UNSET_THEME), "{message}");
+        assert!(message.contains(MISSING_THEME), "{message}");
     }
 
     #[test]

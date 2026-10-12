@@ -90,7 +90,7 @@ impl ShellEnvConfig {
             min: None,
             max: None,
             env: None,
-            description: "Values set for local shell commands; {env:NAME} reads Caudra's environment. Wins over pass",
+            description: "Values set for local shell commands; {env:NAME} reads Caudra's environment and {file:PATH} a file. Wins over pass",
         },
     ];
 
@@ -185,8 +185,8 @@ pub enum ShellEnvEdit {
     RemoveValue(String),
 }
 
-/// `[agent.shell_env]` of the global `caudra.toml` as written, `{env:NAME}` references
-/// unexpanded, with the revision an edit commits against.
+/// `[agent.shell_env]` of the global `caudra.toml` as written, `{env:NAME}` and `{file:PATH}`
+/// references unexpanded, with the revision an edit commits against.
 #[derive(Debug, Clone)]
 pub struct GlobalShellEnvFile {
     path: PathBuf,

@@ -8,6 +8,7 @@ mod sandbox;
 
 use std::mem;
 
+use caudra_config::interpolation::holds_reference;
 use caudra_config::shell_env::{GlobalShellEnvFile, ShellEnvEdit, ShellEnvError};
 use caudra_grab::grab_scope;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
@@ -29,7 +30,7 @@ use crate::theme;
 use form::{EnvForm, FormKey, FormKind};
 pub(crate) use local::LocalEnvironment;
 use local::local_rows;
-use rows::{ENV_REFERENCE, EnvRow, FORWARDED_SECTION, RowAction, Unforward};
+use rows::{EnvRow, FORWARDED_SECTION, RowAction, Unforward};
 pub(crate) use sandbox::GuestListing;
 use sandbox::sandbox_rows;
 
@@ -79,7 +80,7 @@ const UNSUPPORTED: &str =
 const TRUNCATED: &str = "the guest listed only part of its environment";
 const CONFIRM_SUFFIX: &str = "Enter/y confirms, Esc cancels.";
 const LITERAL_WARNING_BYTES: usize = 24;
-const LOCAL_VALUE_HINT: &str = "A literal, or {env:NAME} to read Caudra's own environment. Tab switches fields, Enter saves, Esc cancels.";
+const LOCAL_VALUE_HINT: &str = "A literal, {env:NAME} to read Caudra's own environment, or {file:PATH} to read a file. Tab switches fields, Enter saves, Esc cancels.";
 const SANDBOX_VALUE_HINT: &str = "A non-secret literal the guest receives as written. Tab switches fields, Enter saves, Esc cancels.";
 const LOCAL_PATTERN_HINT: &str =
     "An exact NAME or a NAME_* prefix of variables Caudra can see. Enter adds it, Esc cancels.";
@@ -566,7 +567,7 @@ impl EnvModal {
         if is_shell_startup_variable(name) {
             return Err(EnvPatternError::Reserved(name.to_owned()).to_string());
         }
-        let literal = !value.contains(ENV_REFERENCE);
+        let literal = !holds_reference(value);
         Ok(
             (literal && (looks_secret(name) || value.len() >= LITERAL_WARNING_BYTES))
                 .then(|| literal_warning(name)),
@@ -1058,6 +1059,15 @@ mod tests {
             EnvAction::Request(EnvRequest::EditLocal { edit, .. }) => edit,
             _ => panic!("expected a local edit"),
         }
+    }
+
+    #[test_case(SECRET_VALUE, true; "literal")]
+    #[test_case("{env:CAUDRA_DEPLOY_TOKEN}", false; "variable_reference")]
+    #[test_case("{file:~/.secrets/deploy-token}", false; "file_reference")]
+    fn only_a_literal_credential_earns_the_plain_text_warning(value: &str, warned: bool) {
+        let fixture = local_fixture("", &[]);
+        let warning = fixture.modal.check_value(SECRET_NAME, value).unwrap();
+        assert_eq!(warning.is_some(), warned, "{warning:?}");
     }
 
     #[test]

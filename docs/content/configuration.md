@@ -93,6 +93,24 @@ headers = { authorization = "Bearer {env:OTEL_TOKEN}" }
 - `${env:NAME}`, the PowerShell form, stays as written, so shell commands and permission patterns can use it.
 - When Caudra writes a file, such as `/mcp` turning a server off or `caudra auth login` adding a provider, the reference stays in the file rather than its value.
 
+## Values from files
+
+A string value in a global config file can also hold the contents of a file. Write `{file:PATH}` where the value goes, and Caudra puts the file's text there, with spaces and line breaks trimmed from both ends. This suits a secret that a password manager or a deployment tool keeps in a file:
+
+```toml
+[telemetry]
+headers = { authorization = "Bearer {file:~/.secrets/otel-token}" }
+```
+
+- The same files accept it, and the rules for [environment variables](#environment-variables) apply to it too. Only string values expand, a project file under `.caudra/` cannot hold one, `${file:PATH}` stays as written, and Caudra writes the reference back rather than the contents.
+- A relative path starts at the directory of the config file that holds it. `~` followed by `/` stands for your home directory, and so does `~\` on Windows.
+- Caudra removes `.` and `..` from the path as written before it reads the file. After a symlinked directory, `..` goes back to the directory that holds the link, as on Windows, rather than to the parent of its target. A symlinked file is followed.
+- A path can hold `{env:NAME}`, such as `{file:{env:CREDENTIALS_DIRECTORY}/otel-token}`. Caudra uses the variable's value as written, so a `~` in it is a plain name.
+- On Windows, write a path with backslashes in a single-quoted TOML string, such as `'{file:C:\Users\me\otel-token}'`, or use forward slashes. A double-quoted string needs every backslash doubled. A path such as `\secrets\otel-token` starts at the root of the config file's drive, and UNC paths such as `\\server\share\otel-token` work.
+- The file must be a regular file in UTF-8, at most 1 MiB. A path cannot contain `}`, or start or end with a space.
+- A missing or unreadable file is an error that names the config file, the line, and the path Caudra tried, never the contents. The config file then fails to load, with the same effect as an unset variable.
+- Caudra does not watch the file. It reads it again when it reloads the config file that names it, such as after you edit that file or run `/reload`.
+
 ## Hot reload
 
 While the terminal UI runs, Caudra watches its config files, skill and command directories, and [system prompt profiles](/docs/system-prompts/). It applies an edit shortly after you save it. One line in the footer then says what reloaded, what still needs `/reload` or a restart, and which file failed to load. For `caudra.toml` it names the tables whose values changed. It names files and keys and never shows a value from them. A save that changed nothing says nothing, and so do Caudra's own writes, such as turning a server off in `/mcp`. Headless runs and ACP read configuration once, at startup.
@@ -110,6 +128,7 @@ While the terminal UI runs, Caudra watches its config files, skill and command d
 | `workcell.toml` and `sandboxes.toml` | After `/reload`. |
 | `init.lua` | After `/reload`, which runs it again. A changed script never runs by itself. |
 | Global `.env` | `{env:NAME}` references follow it at once. Shell commands and keys read from the environment keep their startup values until a restart. |
+| Files that `{file:PATH}` reads | When the config file that names them reloads. Caudra does not watch them. |
 | Project `.env` | After a restart. |
 
 A [remote workspace](/docs/remote-workspaces/) session keeps the permissions and commands of its workspace. Its project files apply after `/reload`.
@@ -460,7 +479,7 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `pass` | string[] | `[]` | Host variables forwarded to local shell commands: exact names or NAME_* prefixes, never a bare *. Values come from Caudra's environment and the global .env, never a project .env |
-| `set` | table | `{}` | Values set for local shell commands; {env:NAME} reads Caudra's environment. Wins over pass |
+| `set` | table | `{}` | Values set for local shell commands; {env:NAME} reads Caudra's environment and {file:PATH} a file. Wins over pass |
 
 These choose which host variables reach local [shell commands](/docs/cli/#forwarding-more-variables), and `/env` edits them. Only the global `caudra.toml` may hold this table. Caudra rejects a project `.caudra/caudra.toml` that contains it, even an empty one, so a repository cannot forward your credentials to the commands it asks for. A [sandbox](/docs/sandboxes/#shell-environment) forwards its guest's variables instead, set per profile.
 

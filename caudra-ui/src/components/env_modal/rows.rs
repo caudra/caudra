@@ -12,7 +12,6 @@ pub(super) const PASS_STATE: &str = "pass";
 pub(super) const INVALID_STATE: &str = "invalid";
 pub(super) const BUILT_IN_NOTE: &str =
     "Every shell command receives this from the fixed allowlist.";
-pub(super) const ENV_REFERENCE: &str = "{env:";
 pub(super) const MASK: &str = "****";
 pub(super) const EMPTY_VALUE: &str = "(empty)";
 const ELLIPSIS: char = '…';

@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use caudra_config::interpolation::holds_reference;
 use caudra_config::shell_env::GlobalShellEnvFile;
 use caudra_config::{EnvSource, env_source, shell_visible_environment};
 use caudra_providers::catalog_providers_if_available;
@@ -14,8 +15,8 @@ use workcell_tool_contract::shell_env::{
 use crate::components::escape_terminal_controls;
 
 use super::rows::{
-    BUILT_IN_NOTE, BUILT_IN_STATE, ENV_REFERENCE, EnvRow, FORWARDED_SECTION, INVALID_STATE,
-    PASS_STATE, PATTERN_SECTION, RowAction, Unforward, names_state, via, via_note,
+    BUILT_IN_NOTE, BUILT_IN_STATE, EnvRow, FORWARDED_SECTION, INVALID_STATE, PASS_STATE,
+    PATTERN_SECTION, RowAction, Unforward, names_state, via, via_note,
 };
 
 pub(super) const SET_SECTION: &str = "Set by config";
@@ -190,9 +191,10 @@ pub(super) fn local_rows(environment: &LocalEnvironment) -> Vec<EnvRow> {
     rows
 }
 
-/// A `{env:NAME}` reference names where the value comes from, so it is shown as written.
+/// A `{env:NAME}` or `{file:PATH}` reference names where the value comes from, so it is shown
+/// as written.
 fn set_row(name: &str, value: &str) -> EnvRow {
-    let row = match value.contains(ENV_REFERENCE) {
+    let row = match holds_reference(value) {
         true => EnvRow::entry(SET_SECTION, name, escape_terminal_controls(value)),
         false => EnvRow::variable(SET_SECTION, name, value),
     };

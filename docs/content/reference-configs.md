@@ -452,8 +452,8 @@ version = 1
 # Type: string[].
 # pass = []
 
-# Values set for local shell commands; {env:NAME} reads Caudra's environment.
-# Wins over pass.
+# Values set for local shell commands; {env:NAME} reads Caudra's environment
+# and {file:PATH} a file. Wins over pass.
 # Type: table.
 # set = {}
 
@@ -1326,7 +1326,8 @@ version = 1
 
 # Stdio servers: environment variables for the server process, such as
 # `{ GITHUB_TOKEN = "{env:GITHUB_TOKEN}" }`. In the global file, `{env:NAME}`
-# reads a value from your environment. Other values are stored as plain text.
+# reads a value from your environment and `{file:PATH}` reads a file. Other
+# values are stored as plain text.
 # Type: table.
 # environment = {}
 
@@ -1340,8 +1341,8 @@ version = 1
 
 # HTTP servers: headers sent with every request, such as
 # `{ Authorization = "Bearer {env:GITHUB_TOKEN}" }`. In the global file,
-# `{env:NAME}` reads a value from your environment. Other values are stored as
-# plain text.
+# `{env:NAME}` reads a value from your environment and `{file:PATH}` reads a
+# file. Other values are stored as plain text.
 # Type: table.
 # headers = {}
 
@@ -1355,7 +1356,8 @@ version = 1
 # client_id = "analytics-client"
 
 # The client secret, for a confidential client. It is stored as plain text
-# unless the global file reads it from your environment with `{env:NAME}`.
+# unless the global file reads it with `{env:NAME}` from your environment or
+# with `{file:PATH}` from a file.
 # Type: string. Default: unset.
 # client_secret = <string>
 
@@ -1428,9 +1430,9 @@ version = 1
 # Type: string. Default: `<SLUG>_API_KEY`.
 # api_key_env = <string>
 
-# An API key, stored as plain text unless you write `{env:NAME}` to read it
-# from your environment. Caudra tries the environment variable and saved
-# credentials first.
+# An API key, stored as plain text unless you write `{env:NAME}` or
+# `{file:PATH}` to read it from your environment or a file. Caudra tries the
+# environment variable and saved credentials first.
 # Type: string. Default: unset.
 # api_key = <string>
 

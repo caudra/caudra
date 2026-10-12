@@ -311,7 +311,7 @@ pub enum WorkcellProfileError {
     #[error("local Workcell profile file is not valid strict v1 TOML")]
     Parse,
     #[error("local Workcell profile file: {0}")]
-    Environment(#[source] InterpolationError),
+    Reference(#[source] InterpolationError),
     #[error("unsupported local Workcell profile version {0}; expected version 1")]
     Version(u32),
     #[error(transparent)]
@@ -469,7 +469,7 @@ fn parse_profile_file(
     let raw: WorkcellProfileFile =
         interpolation::from_str(content, lookup).map_err(|error| match error {
             ConfigTextError::Toml(_) => WorkcellProfileError::Parse,
-            ConfigTextError::Environment(error) => WorkcellProfileError::Environment(error),
+            ConfigTextError::Reference(error) => WorkcellProfileError::Reference(error),
         })?;
     WorkcellProfiles::try_from(raw)
 }
@@ -770,7 +770,7 @@ expected_workspace_id = "workspace-1"
 
         assert!(matches!(
             error,
-            WorkcellProfileError::Environment(InterpolationError::Unset { line: 8, ref name })
+            WorkcellProfileError::Reference(InterpolationError::Unset { line: 8, ref name })
                 if name == ENDPOINT_VARIABLE
         ));
     }

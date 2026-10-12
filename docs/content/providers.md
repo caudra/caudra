@@ -449,7 +449,7 @@ The file can start with `version = 1`, and a file without it counts as version 1
 | `base_url` | string | the plan URL, or the built-in URL | `<SLUG>_BASE_URL` | The API origin. Caudra appends the protocol paths |
 | `plan` | string | unset | - | A built-in plan key, which sets the base URL and the default model |
 | `api_key_env` | string | `<SLUG>_API_KEY` | - | The environment variable that holds the API key |
-| `api_key` | string | unset | - | An API key, stored as plain text unless you write `{env:NAME}` to read it from your environment. Caudra tries the environment variable and saved credentials first |
+| `api_key` | string | unset | - | An API key, stored as plain text unless you write `{env:NAME}` or `{file:PATH}` to read it from your environment or a file. Caudra tries the environment variable and saved credentials first |
 | `default_model` | string | unset | - | The model to use after login when none is saved yet, such as `my-provider/my-model` |
 | `discover_models` | bool | `false` | - | Also list the models the provider's model endpoint reports |
 | `enable_free_models` | bool | unset | - | Opencode only. Show the free models of its catalog. Unset counts as `false` |
