@@ -159,8 +159,8 @@ pub fn warn_ignored_provider_fields() {
             slug,
             fields = %ignored.join(", "),
             "providers.toml entry for built-in provider ignores these fields \
-             (base_url/plan/api_key still apply), use a custom slug to set \
-             protocol or models"
+             (base_url/plan/api_key and a model's context_window/max_output_tokens \
+             still apply), use a custom slug to set the rest"
         );
     }
 }

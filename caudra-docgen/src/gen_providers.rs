@@ -2,7 +2,7 @@ use std::fmt::Write;
 
 use caudra_config::example;
 use caudra_config::files;
-use caudra_config::providers::BUILTIN_IGNORED_FIELDS;
+use caudra_config::providers::{BUILTIN_IGNORED_FIELDS, BUILTIN_MODEL_FIELDS};
 use caudra_providers::copilot_auth::ENTERPRISE_HOST_ENV;
 use caudra_providers::manifest::{ManifestRegistry, ProviderManifest};
 use caudra_providers::model::ModelEntry;
@@ -85,11 +85,11 @@ You can also set `base_url` for a built-in provider in `~/.config/caudra/provide
 base_url = "http://xxxx:1234/v1"
 ```
 
-The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those.
+The built-in provider still owns the slug, so `protocol`, `api_key_env` and `discover_models` are ignored with a warning. Its `model_defaults` and `models` entries only set a model's `context_window` and `max_output_tokens`, see [Model limits on a built-in provider](#model-limits-on-a-built-in-provider). Use a custom slug if you need the rest.
 
 Ollama reads `OLLAMA_HOST` and llama.cpp reads `LLAMA_CPP_HOST`. Neither reads `<SLUG>_BASE_URL`. A `base_url` in `providers.toml` wins over the host variable, and Caudra appends `/v1` to either, so leave it off. Aperture reads `APERTURE_HOST`, which wins over the file. Copilot asks GitHub for the API endpoint of your account, Copilot Enterprise derives it from the host you signed in with, and both ignore these settings."#;
 
-const LONG_CONTEXT_NOTE: &str = r#"Recent Claude models accept up to 1M tokens. Caudra runs them at a 372k working window, which keeps cost and latency bounded. That window is an input budget: the model's output allowance sits on top of it rather than inside it, so Caudra holds back less of it before compaction. Add `-1m` to a model id, like `claude-sonnet-4-6-1m`, to open the full 1M window instead. Set `context_window` in `providers.toml` to pick any other size."#;
+const LONG_CONTEXT_NOTE: &str = r#"Recent Claude models accept up to 1M tokens. Caudra runs them at a 372k working window, which keeps cost and latency bounded. That window is an input budget: the model's output allowance sits on top of it rather than inside it, so Caudra holds back less of it before compaction. Add `-1m` to a model id, like `claude-sonnet-4-6-1m`, to open the full 1M window instead. Set `context_window` in `providers.toml` to pick any other size, see [Model limits on a built-in provider](#model-limits-on-a-built-in-provider)."#;
 
 const ANTHROPIC_OAUTH_NOTE: &str = r#"Run `caudra auth login anthropic` to sign in to a Claude subscription through browser OAuth. Caudra stores the tokens in its state directory, refreshes them automatically, and shows subscription limits through `/usage`. Subscription requests always go to `api.anthropic.com`, even when `ANTHROPIC_BASE_URL` is set.
 
@@ -118,7 +118,9 @@ If `~/.grok/auth.json` already exists, login offers to reuse it without writing 
 
 const COPILOT_OAUTH_NOTE: &str = r#"Run `caudra auth login copilot` to sign in with GitHub. Caudra prints a URL and a one-time code, opens the browser when it can, and waits until you approve the code on GitHub. The login uses the same public GitHub OAuth app as OpenCode and asks only for the `read:user` scope. GitHub issues a token that does not expire, so there is no refresh. When GitHub revokes it, run the login again.
 
-To reuse a token from the gh CLI, the Copilot editor plugin, or the system keyring instead, add `--method import`. Caudra stores the token in its state directory and labels it `token` in `caudra auth status`. `GH_COPILOT_TOKEN` or `COPILOT_GITHUB_TOKEN` wins over the saved token."#;
+To reuse a token from the gh CLI, the Copilot editor plugin, or the system keyring instead, add `--method import`. Caudra stores the token in its state directory and labels it `token` in `caudra auth status`. `GH_COPILOT_TOKEN` or `COPILOT_GITHUB_TOKEN` wins over the saved token.
+
+Copilot lists a prompt limit for each model beside its total window, and refuses a longer prompt even when the total has room. Caudra uses that prompt limit as the model's window, with the output allowance on top of it, so a session compacts before Copilot refuses it."#;
 
 const COPILOT_ENTERPRISE_NOTE: &str = r#"Copilot Enterprise is a separate provider, so a GitHub Enterprise account and a personal account can stay signed in together. Run `caudra auth login copilot-enterprise --hostname company.ghe.com`, or leave out `--hostname` and Caudra asks for it. The login runs against that host and saves the token together with the host. `--method import` reads gh CLI and Copilot plugin tokens for that host only.
 
@@ -220,6 +222,7 @@ Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this fil
     let model_fields = keys_table(&document, &[example::providers::MODELS]);
     let override_fields = keys_table(&document, &[example::providers::UPSTREAM]);
     let builtin_ignored = join_and(&BUILTIN_IGNORED_FIELDS.map(|name| format!("`{name}`")));
+    let builtin_model = join_and(&BUILTIN_MODEL_FIELDS.map(|name| format!("`{name}`")));
     let reference = footer(&files::PROVIDERS);
 
     format!(
@@ -270,7 +273,7 @@ The file can start with `version = 1`, and a file without it counts as version 1
 ### Provider fields
 
 {provider_fields}
-A built-in slug keeps its compiled protocol, model catalog, and auth setup, so it ignores {builtin_ignored}. Opencode still reads `enable_free_models`.
+A built-in slug keeps its compiled protocol, model catalog, and auth setup, so it ignores {builtin_ignored}. Opencode still reads `enable_free_models`. From `model_defaults` and `models`, a built-in reads only {builtin_model}, see [Model limits on a built-in provider](#model-limits-on-a-built-in-provider).
 
 A `[SLUG.purposes]` table takes these keys:
 
@@ -304,6 +307,20 @@ A `models` entry whose `id` matches no live model is logged once: every setting 
 Custom slugs must not reuse a built-in provider name. A bad TOML parse exits with code 2 at startup so a typo cannot silently empty the registry. A bad edit while Caudra runs keeps the last valid file and shows the error, see [Hot reload](/docs/configuration/#hot-reload).
 
 You can also create a custom provider interactively with `caudra auth login` and choosing the custom option. That writes a starter entry to this file.
+
+### Model limits on a built-in provider
+
+A built-in provider reads two model keys from this file: `context_window` and `max_output_tokens`. Set them in a `[[SLUG.models]]` entry for one model, or in `[SLUG.model_defaults]` for every model of the provider:
+
+```toml
+[[anthropic.models]]
+id = "claude-sonnet-4-6"
+context_window = 200000
+```
+
+A `models` entry wins over `model_defaults`, and both win over the limits the provider lists, the built-in model table, and models.dev, in that order. A declared window is the total the prompt and the reply share, as on a custom provider, so compaction leaves room in it for the reply. The OpenAI Coding Plan still caps a declared window at the plan's own. On `aperture`, a declared window also wins over [Aperture overrides](#aperture-overrides).
+
+An entry adds no model to the model list, and its `id` has to match the id in the model spec exactly. Every other model key on a built-in slug, such as `supports_vision` or a price, is ignored with a warning. Caudra reads an edit the next time it resolves the model, such as in a new session or after you pick the model again, see [Hot reload](/docs/configuration/#hot-reload).
 
 ### Aperture overrides
 

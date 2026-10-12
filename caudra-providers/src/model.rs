@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use caudra_config::ModelPolicy;
 pub use caudra_config::providers::ModelPurpose;
-use caudra_config::providers::UnknownPurpose;
+use caudra_config::providers::{ModelFields, UnknownPurpose};
 use caudra_storage::sessions::{StoredTokenUsage, cache_hit_rate};
 use caudra_storage::thinking::{ReasoningOption, ReasoningOptions};
 use jiff::Timestamp;
@@ -121,6 +121,10 @@ pub struct ModelPricing {
 pub struct ModelInfo {
     pub id: String,
     pub context_window: Option<u32>,
+    /// `context_window` is a prompt budget and `max_output_tokens` is granted
+    /// on top of it, rather than the total the two share. Only the source that
+    /// reported the window knows which it is.
+    pub window_excludes_output: bool,
     pub max_output_tokens: Option<u32>,
     pub pricing: Option<ModelPricing>,
     pub supports_thinking: Option<bool>,
@@ -137,6 +141,7 @@ impl ModelInfo {
         Self {
             id,
             context_window: None,
+            window_excludes_output: false,
             max_output_tokens: None,
             pricing: None,
             supports_thinking: None,
@@ -549,8 +554,10 @@ impl Model {
         // instead would flag any window that happened to equal one caudra caps
         // itself at, and miss one that a provider reported for itself.
         let (context_window, window_excludes_output) = discovered
-            .and_then(|info| info.context_window)
-            .map(|window| (window, false))
+            .and_then(|info| {
+                info.context_window
+                    .map(|window| (window, info.window_excludes_output))
+            })
             .or_else(|| anthropic::shared::long_context_window(model_id).map(|w| (w, false)))
             .or_else(|| {
                 static_entry.map(|entry| {
@@ -575,7 +582,7 @@ impl Model {
             })
             .or_else(|| catalog_reasoning_options(catalog))
             .unwrap_or_default();
-        Self {
+        let mut model = Self {
             id: model_id.to_string(),
             provider: Arc::from(slug),
             family,
@@ -592,7 +599,27 @@ impl Model {
             thinking_fields: None,
             reasoning_options,
             billing: Billing::default(),
+        };
+        model.apply_declared_limits();
+        model
+    }
+
+    /// Lay the limits `providers.toml` declares for this model over every other
+    /// source. A provider adjustment that sets a window calls this again, so
+    /// the declaration still wins.
+    pub(crate) fn apply_declared_limits(&mut self) {
+        let declared = custom::declared_limits(&self.provider, &self.id);
+        self.apply_declared(&declared);
+    }
+
+    /// A declared window is a total the reply shares until its author says
+    /// otherwise, the same as on a custom provider.
+    fn apply_declared(&mut self, declared: &ModelFields) {
+        if let Some(window) = declared.context_window {
+            self.context_window = window;
+            self.window_excludes_output = false;
         }
+        self.max_output_tokens = declared.max_output_tokens.or(self.max_output_tokens);
     }
 
     /// Build a `Model` from a models.dev catalogue sub-provider (nvidia,
@@ -1181,6 +1208,7 @@ impl AddAssign for TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::copilot;
     use caudra_storage::StateDir;
     use test_case::test_case;
 
@@ -2032,6 +2060,76 @@ mod tests {
         let vision = |id| Model::from_spec(id).unwrap().supports_vision();
         assert!(vision("synthetic/syn:test-vision"));
         assert!(!vision("synthetic/syn:test-blind"));
+    }
+
+    const DISCOVERED_BUDGET_STAYS_A_BUDGET: &str = "a window discovery reports as a prompt budget \
+         stays one, so the reply allowance is not carved out of it";
+
+    #[test]
+    fn a_discovered_prompt_budget_flows_into_from_base() {
+        let model_id = "test-discovered-prompt-budget";
+        let window = 272_000;
+        model_registry::set_known_models(
+            copilot::ENTERPRISE_SLUG,
+            vec![ModelInfo {
+                context_window: Some(window),
+                window_excludes_output: true,
+                ..ModelInfo::id_only(model_id.to_string())
+            }],
+        );
+
+        let model = Model::from_spec(&format!("{}/{model_id}", copilot::ENTERPRISE_SLUG)).unwrap();
+
+        assert_eq!(
+            model.context_window, window,
+            "{DISCOVERED_BUDGET_STAYS_A_BUDGET}"
+        );
+        assert!(
+            model.window_excludes_output,
+            "{DISCOVERED_BUDGET_STAYS_A_BUDGET}"
+        );
+    }
+
+    const DECLARED_LIMITS_WIN: &str = "a declared limit replaces whatever the model had, and a \
+         declared window is a total the reply shares";
+    const BASE_WINDOW: u32 = 372_000;
+    const BASE_OUTPUT: u32 = 128_000;
+    const DECLARED_WINDOW: u32 = 200_000;
+    const DECLARED_OUTPUT: u32 = 32_000;
+
+    #[test_case(
+        ModelFields { context_window: Some(DECLARED_WINDOW), ..Default::default() },
+        DECLARED_WINDOW, BASE_OUTPUT, false
+        ; "a_declared_window_is_a_total"
+    )]
+    #[test_case(
+        ModelFields { max_output_tokens: Some(DECLARED_OUTPUT), ..Default::default() },
+        BASE_WINDOW, DECLARED_OUTPUT, true
+        ; "a_declared_output_keeps_the_budget"
+    )]
+    #[test_case(ModelFields::default(), BASE_WINDOW, BASE_OUTPUT, true ; "nothing_declared_changes_nothing")]
+    fn declared_limits_lay_over_the_model(
+        declared: ModelFields,
+        window: u32,
+        output: u32,
+        excludes_output: bool,
+    ) {
+        let mut model = Model::from_spec(OPENAI_CHAT_SPEC).unwrap();
+        model.context_window = BASE_WINDOW;
+        model.max_output_tokens = Some(BASE_OUTPUT);
+        model.window_excludes_output = true;
+
+        model.apply_declared(&declared);
+
+        assert_eq!(
+            (
+                model.context_window,
+                model.max_output_tokens,
+                model.window_excludes_output
+            ),
+            (window, Some(output), excludes_output),
+            "{DECLARED_LIMITS_WIN}"
+        );
     }
 
     #[test]

@@ -405,6 +405,7 @@ fn parse_models(body: &Value, overrides: &Overrides) -> Vec<ModelInfo> {
                     format!("{provider_id}/{id}")
                 },
                 context_window: ov.context_window,
+                window_excludes_output: false,
                 max_output_tokens: ov.max_output_tokens,
                 pricing: m["pricing"].as_object().map(|p| ModelPricing {
                     input: price_per_m(p.get("input")),
@@ -459,6 +460,7 @@ fn apply_adjustments(model: &mut Model, overrides: &Overrides) {
         model.thinking_override = ThinkingSupport::from_flags(Some(thinking), false);
     }
     model.supports_vision_override = ov.supports_vision.or(model.supports_vision_override);
+    model.apply_declared_limits();
 }
 
 pub(crate) fn adjust_model_for_inspection(model: &mut Model) {

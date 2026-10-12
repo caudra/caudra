@@ -5,8 +5,8 @@ use flume::Sender;
 use serde_json::Value;
 
 use caudra_config::providers::{
-    ModelPurpose, Protocol, ProviderDef, ProvidersConfig, resolve_api_key_env, resolve_base_url,
-    resolve_protocol,
+    ModelFields, ModelPurpose, Protocol, ProviderDef, ProvidersConfig, resolve_api_key_env,
+    resolve_base_url, resolve_protocol,
 };
 
 use super::ResolvedAuth;
@@ -105,6 +105,15 @@ pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
     let def = config.get(slug)?;
     let kind = protocol_kind(def.protocol?);
     Some(model_from_def(def, kind, slug, model_id))
+}
+
+/// What `providers.toml` declares for one model of `slug`, which for a
+/// built-in only ever moves its limits, see `Model::apply_declared`.
+pub(crate) fn declared_limits(slug: &str, model_id: &str) -> ModelFields {
+    ProvidersConfig::load()
+        .get(slug)
+        .map(|def| def.model_settings(model_id))
+        .unwrap_or_default()
 }
 
 /// Model ids this provider declares for `purpose` in `providers.toml`, the one

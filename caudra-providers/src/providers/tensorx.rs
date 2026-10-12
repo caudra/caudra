@@ -229,6 +229,7 @@ impl Provider for TensorX {
                             Some(ModelInfo {
                                 id: id.to_string(),
                                 context_window,
+                                window_excludes_output: false,
                                 max_output_tokens,
                                 pricing,
                                 supports_thinking,

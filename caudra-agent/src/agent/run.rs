@@ -3412,13 +3412,10 @@ impl<'h> Agent<'h> {
             self.do_compact().await?;
             input = self.request_context_size();
         }
-        let input_ceiling = if self.model.window_excludes_output {
-            self.model.context_window
-        } else {
-            self.model
-                .context_window
-                .saturating_sub(self.model.max_output_tokens.unwrap_or_default())
-        };
+        let input_ceiling = self
+            .model
+            .context_window
+            .saturating_sub(compaction::output_allowance(&self.model));
         if input >= input_ceiling {
             return Err(AgentError::Config {
                 message: format!(

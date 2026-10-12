@@ -351,6 +351,10 @@ pub trait Provider: Send + Sync {
         Box::pin(async { Ok(false) })
     }
 
+    /// An adjustment that replaces the window or the output cap ends with
+    /// `Model::apply_declared_limits`, so what `providers.toml` declares
+    /// still wins. One that only narrows the window, like the OpenAI Coding
+    /// Plan cap, may leave it as is.
     fn adjust_model(&self, _model: &mut Model) {}
 
     fn reasoning_transport(&self, _model: &Model) -> ReasoningTransport {

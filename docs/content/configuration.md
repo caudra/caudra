@@ -440,7 +440,7 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 | `system_prompt_profile` | String | `builtin` | - | Default user system prompt profile from the system-prompts config directory |
 | `max_output_bytes` | usize | `51200` | 1024 | Host-enforced default max tool-result size (bytes) |
 | `max_output_lines` | usize | `2000` | 10 | Host-enforced default max tool-result lines |
-| `compaction_buffer` | u32 \| string | 20%, or 10% when the model's window excludes output | - | Context reserved for compaction: token count or percent of the context window (e.g. "20%") |
+| `compaction_buffer` | u32 \| string | 20%, or 10% when the model's window excludes output. On a window that includes output, at least the model's output allowance, up to half the window | - | Context reserved for compaction: token count or percent of the context window (e.g. "20%") |
 | `compaction_instructions` | String | unset | - | Extra instructions appended to the compaction summary prompt |
 | `post_compaction_instructions` | String | unset | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
 | `compaction_requirements` | bool | `true` | - | Append a `# User requirements` section to every compaction summary: what the user asked for, constrained, and decided, read from their own messages and answered questions across every earlier compaction, and extracted by the Extract model so the conversation model never sees the request |

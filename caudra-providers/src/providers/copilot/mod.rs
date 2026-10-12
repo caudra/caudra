@@ -953,11 +953,18 @@ impl CopilotModel {
                 .is_none_or(|policy| policy.state == "enabled")
     }
 
+    /// Copilot refuses a prompt over `max_prompt_tokens`, while
+    /// `max_context_window_tokens` also counts the reply, so the prompt limit
+    /// is the window a conversation has to fit.
     fn model_info(&self) -> ModelInfo {
+        let limits = &self.capabilities.limits;
         ModelInfo {
             id: self.id.clone(),
-            context_window: self.capabilities.limits.max_context_window_tokens,
-            max_output_tokens: self.capabilities.limits.max_output_tokens,
+            context_window: limits
+                .max_prompt_tokens
+                .or(limits.max_context_window_tokens),
+            window_excludes_output: limits.max_prompt_tokens.is_some(),
+            max_output_tokens: limits.max_output_tokens,
             pricing: self.pricing(),
             supports_thinking: Some(self.supports_thinking()),
             supports_vision: Some(self.capabilities.supports.vision),
@@ -1059,6 +1066,7 @@ struct CopilotModelCapabilities {
 #[derive(Clone, Default, Deserialize)]
 struct CopilotModelLimits {
     max_context_window_tokens: Option<u32>,
+    max_prompt_tokens: Option<u32>,
     max_output_tokens: Option<u32>,
 }
 
@@ -1538,6 +1546,40 @@ mod tests {
         let options = info.reasoning_options.unwrap();
         assert_eq!(options.efforts(), ["none", "low", "medium", "high"]);
         assert_eq!(options.budget_bounds(), Some((Some(1_024), Some(64_000))));
+    }
+
+    const PROMPT_LIMIT_IS_THE_WINDOW: &str = "Copilot refuses a prompt over max_prompt_tokens, so \
+         that limit is the window, with the output allowance on top of it";
+
+    #[test_case(
+        json!({"max_context_window_tokens": 400_000, "max_prompt_tokens": 272_000, "max_output_tokens": 128_000}),
+        Some(272_000), true
+        ; "a_prompt_limit_is_the_window"
+    )]
+    #[test_case(
+        json!({"max_context_window_tokens": 400_000, "max_output_tokens": 128_000}),
+        Some(400_000), false
+        ; "a_total_alone_is_shared_with_the_reply"
+    )]
+    #[test_case(json!({}), None, false ; "no_limits_leave_the_window_unknown")]
+    fn discovered_window_is_the_prompt_limit(
+        limits: Value,
+        window: Option<u32>,
+        excludes_output: bool,
+    ) {
+        let model: CopilotModel = serde_json::from_value(json!({
+            "id": "gpt-6.1-sol",
+            "model_picker_enabled": true,
+            "capabilities": { "type": "chat", "limits": limits }
+        }))
+        .unwrap();
+
+        let info = model.model_info();
+        assert_eq!(info.context_window, window, "{PROMPT_LIMIT_IS_THE_WINDOW}");
+        assert_eq!(
+            info.window_excludes_output, excludes_output,
+            "{PROMPT_LIMIT_IS_THE_WINDOW}"
+        );
     }
 
     #[test]

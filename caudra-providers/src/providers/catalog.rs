@@ -290,6 +290,7 @@ impl CatalogMeta {
         ModelInfo {
             id: model_id.to_string(),
             context_window: Some(self.context),
+            window_excludes_output: self.context_excludes_output,
             max_output_tokens: Some(self.output),
             pricing: Some(self.pricing()),
             supports_thinking: Some(self.supports_thinking),
@@ -1632,8 +1633,13 @@ mod tests {
     #[test_case(r#"{}"#, false ; "an unpublished window is a total")]
     fn catalog_meta_says_whether_its_window_excludes_output(json: &str, expected: bool) {
         let model: super::schema::CatalogModel = serde_json::from_str(json).unwrap();
+        let meta = CatalogMeta::from_model(&model);
         assert_eq!(
-            CatalogMeta::from_model(&model).context_excludes_output,
+            meta.context_excludes_output, expected,
+            "{OUTPUT_CARVED_FROM_A_BUDGET}"
+        );
+        assert_eq!(
+            meta.model_info("listed").window_excludes_output,
             expected,
             "{OUTPUT_CARVED_FROM_A_BUDGET}"
         );

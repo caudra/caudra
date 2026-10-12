@@ -735,6 +735,8 @@ impl Provider for OpenAi {
         })
     }
 
+    /// The baseline already holds any window `providers.toml` declares, so the
+    /// plan cap narrows a declared window just as it does the table's.
     fn adjust_model(&self, model: &mut Model) {
         model.billing = Billing::from_oauth(self.is_oauth());
         let baseline_context_window = *self

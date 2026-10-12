@@ -289,7 +289,8 @@ version = 1
 # Context reserved for compaction: token count or percent of the context window
 # (e.g. "20%").
 # Type: u32 | string. Default: 20%, or 10% when the model's window excludes
-# output.
+# output. On a window that includes output, at least the model's output
+# allowance, up to half the window.
 # compaction_buffer = <u32 | string>
 
 # Extra instructions appended to the compaction summary prompt.
@@ -1405,9 +1406,11 @@ version = 1
 # Each top-level table is one provider, named by its slug. A new slug, such as
 # my-provider here, adds a custom provider whose models are
 # `my-provider/MODEL`. A built-in slug, such as [anthropic], changes that
-# provider and ignores `protocol`, `api_key_env`, `discover_models`, `models`,
-# `enable_free_models`, except that opencode reads `enable_free_models`. In an
-# environment variable name, `<SLUG>` is the slug in capitals with `_` for `-`.
+# provider and ignores `protocol`, `api_key_env`, `discover_models`,
+# `enable_free_models`, except that opencode reads `enable_free_models`. From
+# [anthropic.model_defaults] and [[anthropic.models]], a built-in reads only
+# these model keys: `context_window`, `max_output_tokens`. In an environment
+# variable name, `<SLUG>` is the slug in capitals with `_` for `-`.
 
 # The name pickers and auth status show.
 # Type: string. Default: the built-in name, or the slug.

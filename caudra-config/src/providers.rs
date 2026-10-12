@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -26,13 +26,15 @@ const BAD_CONFIG_EXIT_CODE: i32 = 2;
 const OPENCODE_SLUG: &str = "opencode";
 /// Keys a built-in slug ignores, because built-ins keep their compiled
 /// protocol, model catalog and auth wiring. Opencode reads the last one.
-pub const BUILTIN_IGNORED_FIELDS: [&str; 5] = [
+pub const BUILTIN_IGNORED_FIELDS: [&str; 4] = [
     "protocol",
     "api_key_env",
     "discover_models",
-    "models",
     "enable_free_models",
 ];
+/// The model keys a built-in slug reads from `model_defaults` and `models`.
+/// The rest describe what the built-in already knows about its models.
+pub const BUILTIN_MODEL_FIELDS: [&str; 2] = ["context_window", "max_output_tokens"];
 const DISCOVERED_OR_PROTOCOL: &str = "discovered, or the protocol default";
 const OFF_UNLESS_DECLARED: &str = "false";
 const UNPRICED: &str = "0";
@@ -492,6 +494,18 @@ impl ModelFields {
 
     pub fn has_fast_pricing(&self) -> bool {
         self.pricing_fast_input.is_some() || self.pricing_fast_output.is_some()
+    }
+
+    /// The keys set here, which are exactly the ones that serialize.
+    fn declared_keys(&self) -> Vec<String> {
+        toml::Value::try_from(self)
+            .ok()
+            .and_then(|value| {
+                value
+                    .as_table()
+                    .map(|table| table.keys().cloned().collect())
+            })
+            .unwrap_or_default()
     }
 
     /// Field-by-field override: whatever `self` declares wins, and `base` fills
@@ -1114,29 +1128,33 @@ pub fn resolve_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String>
 
 /// Fields a `providers.toml` entry sets that a built-in slug ignores, because
 /// built-ins keep their compiled protocol, model catalog and auth wiring.
+/// Model keys count when `model_defaults` or any `models` entry sets them.
 /// Callers decide what counts as built-in (the inventory misses the `opencode`
 /// slugs) and when to report it.
 pub fn ignored_builtin_fields(slug: &str, def: &ProviderDef) -> Vec<&'static str> {
-    let [
-        protocol,
-        api_key_env,
-        discover_models,
-        models,
-        enable_free_models,
-    ] = BUILTIN_IGNORED_FIELDS;
-    [
+    let [protocol, api_key_env, discover_models, enable_free_models] = BUILTIN_IGNORED_FIELDS;
+    let provider_fields = [
         (protocol, def.protocol.is_some()),
         (api_key_env, def.api_key_env.is_some()),
         (discover_models, def.discover_models),
-        (models, !def.models.is_empty()),
         (
             enable_free_models,
             def.enable_free_models.is_some() && slug != OPENCODE_SLUG,
         ),
     ]
     .into_iter()
-    .filter_map(|(field, set)| set.then_some(field))
-    .collect()
+    .filter_map(|(field, set)| set.then_some(field));
+    let declared: HashSet<String> = def
+        .model_defaults
+        .iter()
+        .chain(def.models.iter().map(|model| &model.fields))
+        .flat_map(ModelFields::declared_keys)
+        .collect();
+    let model_fields = ModelFields::FIELDS
+        .iter()
+        .map(|field| field.name)
+        .filter(|name| !BUILTIN_MODEL_FIELDS.contains(name) && declared.contains(*name));
+    provider_fields.chain(model_fields).collect()
 }
 
 pub fn resolve_protocol(slug: &str, def: Option<&ProviderDef>) -> Option<Protocol> {
@@ -1636,6 +1654,51 @@ best = "gpt-4.1"
         assert_eq!(
             ignored_builtin_fields("openrouter", &def),
             ["enable_free_models"]
+        );
+    }
+
+    const BUILTIN_READS_LIMITS: &str = "a built-in reads the window and output cap its models \
+         declare, and only the other model keys are ignored";
+
+    fn limit_fields() -> ModelFields {
+        ModelFields {
+            context_window: Some(200_000),
+            max_output_tokens: Some(32_000),
+            ..Default::default()
+        }
+    }
+
+    fn vision_fields() -> ModelFields {
+        ModelFields {
+            supports_vision: Some(true),
+            ..limit_fields()
+        }
+    }
+
+    #[test_case(Some(limit_fields()), None, &[] ; "limits_in_model_defaults")]
+    #[test_case(None, Some(limit_fields()), &[] ; "limits_in_a_models_entry")]
+    #[test_case(Some(vision_fields()), None, &["supports_vision"] ; "vision_in_model_defaults")]
+    #[test_case(None, Some(vision_fields()), &["supports_vision"] ; "vision_in_a_models_entry")]
+    fn ignored_builtin_fields_reports_model_keys_beyond_the_limits(
+        model_defaults: Option<ModelFields>,
+        entry: Option<ModelFields>,
+        expected: &[&str],
+    ) {
+        let def = ProviderDef {
+            model_defaults,
+            models: entry
+                .map(|fields| ModelDef {
+                    id: "claude-sonnet-4-6".into(),
+                    fields,
+                })
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            ignored_builtin_fields("anthropic", &def),
+            expected,
+            "{BUILTIN_READS_LIMITS}"
         );
     }
 

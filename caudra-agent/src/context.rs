@@ -1113,6 +1113,8 @@ mod tests {
     const DEFERRED_MCP: &str = "search__query";
     const DISABLED_MCP: &str = "admin__delete";
     const TEST_WINDOW: u32 = 200_000;
+    /// Below every reserve the cases expect, so they measure the percentage.
+    const SMALL_REPLY_ALLOWANCE: u32 = 8_192;
     const LONG_METADATA_REPETITIONS: usize = 2_048;
     const LARGE_IMAGE_PAYLOAD_BYTES: usize = 256 * 1_024;
     const PDF_CALL: &str = "fetch-call";
@@ -1135,6 +1137,7 @@ mod tests {
         let mut model = Model::from_spec(MODEL_SPEC).unwrap();
         model.context_window = context_window;
         model.window_excludes_output = window_excludes_output;
+        model.max_output_tokens = Some(SMALL_REPLY_ALLOWANCE);
         model
     }
 
@@ -2209,6 +2212,8 @@ mod tests {
     #[test_case(true, true, None, 200_000, ContextReserve::Enabled(20_000) ; "default_input_budget")]
     #[test_case(true, true, Some(CompactionBuffer::Tokens(12_345)), 200_000, ContextReserve::Enabled(12_345) ; "explicit_tokens")]
     #[test_case(true, false, Some(CompactionBuffer::Percent(25)), 200_000, ContextReserve::Enabled(50_000) ; "explicit_percent")]
+    #[test_case(true, false, Some(CompactionBuffer::Tokens(4_000)), 200_000, ContextReserve::Enabled(SMALL_REPLY_ALLOWANCE) ; "explicit_tokens_below_the_reply_allowance")]
+    #[test_case(true, true, Some(CompactionBuffer::Tokens(4_000)), 200_000, ContextReserve::Enabled(4_000) ; "input_budget_ignores_the_reply_allowance")]
     #[test_case(true, false, None, 0, ContextReserve::Enabled(0) ; "zero_window")]
     fn reserve_matches_compaction_policy(
         auto_compact: bool,

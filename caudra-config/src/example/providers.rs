@@ -1,7 +1,7 @@
 use crate::files;
 use crate::providers::{
-    BUILTIN_IGNORED_FIELDS, ModelDef, ModelFields, OverrideFields, PROVIDERS_VERSION,
-    PURPOSE_FIELDS, ProviderDef, ProviderOverride,
+    BUILTIN_IGNORED_FIELDS, BUILTIN_MODEL_FIELDS, ModelDef, ModelFields, OverrideFields,
+    PROVIDERS_VERSION, PURPOSE_FIELDS, ProviderDef, ProviderOverride,
 };
 
 use super::{Document, Header, RECORDS_USAGE, Table, code_list, global_location, preamble};
@@ -64,9 +64,11 @@ fn provider_about() -> String {
         "Each top-level table is one provider, named by its slug. A new slug, such as my-provider \
          here, adds a custom provider whose models are `my-provider/MODEL`. A built-in slug, such \
          as [anthropic], changes that provider and ignores {}, except that opencode reads \
-         `enable_free_models`. In an environment variable name, `<SLUG>` is the slug in capitals \
-         with `_` for `-`.",
-        code_list(&BUILTIN_IGNORED_FIELDS)
+         `enable_free_models`. From [anthropic.model_defaults] and [[anthropic.models]], a \
+         built-in reads only these model keys: {}. In an environment variable name, `<SLUG>` is \
+         the slug in capitals with `_` for `-`.",
+        code_list(&BUILTIN_IGNORED_FIELDS),
+        code_list(&BUILTIN_MODEL_FIELDS)
     )
 }
 

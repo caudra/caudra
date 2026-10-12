@@ -21,9 +21,11 @@ version = 1
 # Each top-level table is one provider, named by its slug. A new slug, such as
 # my-provider here, adds a custom provider whose models are
 # `my-provider/MODEL`. A built-in slug, such as [anthropic], changes that
-# provider and ignores `protocol`, `api_key_env`, `discover_models`, `models`,
-# `enable_free_models`, except that opencode reads `enable_free_models`. In an
-# environment variable name, `<SLUG>` is the slug in capitals with `_` for `-`.
+# provider and ignores `protocol`, `api_key_env`, `discover_models`,
+# `enable_free_models`, except that opencode reads `enable_free_models`. From
+# [anthropic.model_defaults] and [[anthropic.models]], a built-in reads only
+# these model keys: `context_window`, `max_output_tokens`. In an environment
+# variable name, `<SLUG>` is the slug in capitals with `_` for `-`.
 
 # The name pickers and auth status show.
 # Type: string. Default: the built-in name, or the slug.

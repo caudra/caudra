@@ -188,6 +188,7 @@ fn parse_model(m: &Value) -> Option<ModelInfo> {
     Some(ModelInfo {
         id: id.to_string(),
         context_window,
+        window_excludes_output: false,
         max_output_tokens: None,
         pricing,
         supports_thinking: Some(supports_thinking),

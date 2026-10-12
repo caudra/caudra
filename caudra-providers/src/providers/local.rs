@@ -345,6 +345,7 @@ impl LocalEndpoint {
                 Some(crate::model::ModelInfo {
                     id: m.id,
                     context_window: Some(context_window),
+                    window_excludes_output: false,
                     max_output_tokens: None,
                     pricing: Some(crate::model::ModelPricing::ZERO),
                     supports_thinking: None,
@@ -464,6 +465,7 @@ impl LocalEndpoint {
             .map(|(m, (context_window, info))| crate::model::ModelInfo {
                 id: m.id,
                 context_window,
+                window_excludes_output: false,
                 max_output_tokens: None,
                 pricing: Some(crate::model::ModelPricing::ZERO),
                 supports_thinking: None,

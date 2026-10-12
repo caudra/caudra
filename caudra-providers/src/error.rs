@@ -169,6 +169,7 @@ impl AgentError {
     /// - DeepSeek:   400 "maximum context length is X tokens"  <https://api-docs.deepseek.com/quick_start/pricing>
     /// - Mistral:    400 "too large for model with X maximum context length"  <https://docs.mistral.ai/resources/known-limitations>
     /// - OpenRouter: 400 "endpoint's maximum context length is X tokens"  <https://openrouter.ai/docs/api/reference/errors-and-debugging.mdx>
+    /// - Copilot:    400 "prompt token count of N exceeds the limit of M", where M is `max_prompt_tokens` from `/models`
     /// - Synthetic:  400 pass-through from upstream models (OpenAI-compatible)  <https://synthetic.new>
     pub fn is_context_overflow(&self) -> bool {
         match self {
@@ -845,6 +846,8 @@ mod tests {
     #[test_case(400, "Prompt contains 321774 tokens and 0 draft tokens, too large for model with 262144 maximum context length", true ; "mistral")]
     // OpenRouter: https://openrouter.ai/docs/api/reference/errors-and-debugging.mdx
     #[test_case(400, "This endpoint's maximum context length is 200000 tokens. However, you requested about 5028244 tokens", true ; "openrouter")]
+    // Copilot: the limit is `max_prompt_tokens` from its `/models` listing
+    #[test_case(400, "prompt token count of 285012 exceeds the limit of 272000", true                     ; "copilot")]
     // Bedrock: https://repost.aws/knowledge-center/bedrock-validation-exception-errors
     #[test_case(400, "Input is too long for requested model.", true                                                          ; "bedrock")]
     #[test_case(400, "Input is too long for the model", true                                              ; "too_long_input")]

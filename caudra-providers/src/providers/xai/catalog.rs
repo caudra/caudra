@@ -64,6 +64,7 @@ impl CachedModel {
         } else {
             ThinkingSupport::No
         });
+        model.apply_declared_limits();
     }
 }
 
@@ -80,6 +81,7 @@ impl From<CachedModel> for ModelInfo {
         ModelInfo {
             id: model.id,
             context_window: Some(model.context_window),
+            window_excludes_output: false,
             max_output_tokens: Some(model.max_tokens),
             pricing: Some(ModelPricing {
                 input: model.pricing.input,

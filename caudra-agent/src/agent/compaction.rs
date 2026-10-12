@@ -42,6 +42,11 @@ const PRESERVE_RECENT_MIN_TOKENS: u32 = 2_000;
 const PRESERVE_RECENT_MAX_TOKENS: u32 = 15_000;
 /// The share of the usable window the preserved tail may claim.
 const PRESERVE_RECENT_FRACTION: u32 = 4;
+/// The window divided by this caps what the reply allowance adds to the
+/// compaction reserve. An allowance past half the window is a provider
+/// fallback that does not fit the model, such as a 16k output cap on an 8k
+/// local model, and reserving all of it would compact after every turn.
+const MAX_OUTPUT_RESERVE_DIVISOR: u32 = 2;
 /// Newlines that separate the summary from the requirements section appended
 /// below it, so the two never run together as one paragraph.
 const BLANK_LINE_NEWLINES: usize = 2;
@@ -514,7 +519,11 @@ pub async fn compact_with_session(
 
 /// A window that excludes output only needs the reserve to absorb estimation
 /// drift, so it holds back less than one that has to fit a response as well.
+/// On a window the reply shares, the reserve never drops below the reply's
+/// allowance: a prompt that leaves no room for it is refused, by the provider
+/// or by the request preflight, so compaction has to fire before that point.
 pub(crate) fn compaction_reserve(model: &Model, configured: Option<CompactionBuffer>) -> u32 {
+    let reply_room = output_allowance(model).min(model.context_window / MAX_OUTPUT_RESERVE_DIVISOR);
     configured
         .unwrap_or(if model.window_excludes_output {
             DEFAULT_INPUT_BUDGET_COMPACTION_BUFFER
@@ -522,6 +531,16 @@ pub(crate) fn compaction_reserve(model: &Model, configured: Option<CompactionBuf
             DEFAULT_COMPACTION_BUFFER
         })
         .resolve(model.context_window)
+        .max(reply_room)
+}
+
+/// The part of the window a reply may claim, which a prompt cannot use.
+pub(crate) fn output_allowance(model: &Model) -> u32 {
+    if model.window_excludes_output {
+        0
+    } else {
+        model.max_output_tokens.unwrap_or_default()
+    }
 }
 
 pub(super) fn is_overflow(
@@ -750,9 +769,14 @@ mod tests {
         Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()
     }
 
+    const SMALL_REPLY_ALLOWANCE: u32 = 8_192;
+
+    /// The reply allowance stays below the percentage reserves the overflow
+    /// cases expect, so they measure the percentage alone.
     fn small_context_model(context_window: u32) -> Model {
         let mut model = default_model();
         model.context_window = context_window;
+        model.max_output_tokens = Some(SMALL_REPLY_ALLOWANCE);
         model
     }
 
@@ -1567,6 +1591,32 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(is_overflow(&usage, &model, Some(buffer)), expected);
+    }
+
+    const REPLY_ROOM_HELD_BACK: &str = "on a window the reply shares, compaction fires before the \
+         prompt leaves less room than the reply may take, up to half the window";
+
+    #[test_case(200_000, 64_000, false, None, 64_000 ; "an_allowance_above_the_default_raises_it")]
+    #[test_case(200_000, SMALL_REPLY_ALLOWANCE, false, None, 40_000 ; "an_allowance_below_the_default_leaves_it")]
+    #[test_case(200_000, 64_000, true, None, 20_000 ; "an_input_budget_ignores_the_allowance")]
+    #[test_case(200_000, 64_000, false, Some(CompactionBuffer::Tokens(10_000)), 64_000 ; "an_explicit_buffer_below_the_allowance_is_raised")]
+    #[test_case(200_000, 64_000, false, Some(CompactionBuffer::Percent(50)), 100_000 ; "an_explicit_buffer_above_the_allowance_stays")]
+    #[test_case(8_192, 16_384, false, None, 4_096 ; "an_allowance_past_half_the_window_is_capped")]
+    fn reserve_holds_back_the_reply_allowance(
+        context_window: u32,
+        max_output_tokens: u32,
+        window_excludes_output: bool,
+        buffer: Option<CompactionBuffer>,
+        expected: u32,
+    ) {
+        let mut model = small_context_model(context_window);
+        model.max_output_tokens = Some(max_output_tokens);
+        model.window_excludes_output = window_excludes_output;
+        assert_eq!(
+            compaction_reserve(&model, buffer),
+            expected,
+            "{REPLY_ROOM_HELD_BACK}"
+        );
     }
 
     /// An explicit buffer is the user's number, so it wins over the reserve the

@@ -2651,7 +2651,7 @@ pub struct AgentConfig {
     #[config(
         default = "None",
         ty = "u32 | string",
-        default_varies = "20%, or 10% when the model's window excludes output",
+        default_varies = "20%, or 10% when the model's window excludes output. On a window that includes output, at least the model's output allowance, up to half the window",
         desc = "Context reserved for compaction: token count or percent of the context window (e.g. \"20%\")"
     )]
     pub compaction_buffer: Option<CompactionBuffer>,

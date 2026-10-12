@@ -277,7 +277,8 @@ version = 1
 # Context reserved for compaction: token count or percent of the context window
 # (e.g. "20%").
 # Type: u32 | string. Default: 20%, or 10% when the model's window excludes
-# output.
+# output. On a window that includes output, at least the model's output
+# allowance, up to half the window.
 # compaction_buffer = <u32 | string>
 
 # Extra instructions appended to the compaction summary prompt.
