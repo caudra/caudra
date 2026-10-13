@@ -757,7 +757,13 @@ impl App {
         features: FeatureFlags,
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
-        let state = SessionState::from_session(session, model, &storage, &model_policy);
+        let state = SessionState::from_session(
+            session,
+            model,
+            &storage,
+            &model_policy,
+            ui_config.default_mode.into(),
+        );
         let view = caudra_storage::view::read(&storage).unwrap_or_default();
         let typewriter = ui_config.typewriter_ms_per_char;
         let flash = ui_config.flash_duration();

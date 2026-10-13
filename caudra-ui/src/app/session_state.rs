@@ -63,6 +63,7 @@ impl SessionState {
         fallback_model: &Model,
         storage: &StateDir,
         model_policy: &ModelPolicy,
+        default_mode: Mode,
     ) -> Self {
         let mut model = model_policy
             .allows(&session.model)
@@ -81,12 +82,10 @@ impl SessionState {
             tracing::warn!(model = %model.id, error = %e, "failed to adjust resumed model");
         }
 
-        // Plan is where a session that never chose starts, so the agent has to
-        // be asked before it may touch the workspace.
-        let mode = match session.meta.mode {
-            Some(StoredMode::Build) => Mode::Build,
-            _ => Mode::Plan,
-        };
+        // A session that never chose opens in `ui.default_mode`. Plan unless
+        // configured otherwise, so the agent has to be asked before it may
+        // touch the workspace.
+        let mode = session.meta.mode.map_or(default_mode, Into::into);
         let applied_mode = session.meta.execution_mode.map_or(mode, Into::into);
 
         let mut warnings = Vec::new();
@@ -268,7 +267,8 @@ mod tests {
     const IMAGE_DATA: &str = "iVBORw0KGgo=";
     const ITEMS_PER_TURN: &str = "the fixture must spread each exchange over several items";
     const TURNS_NOT_ITEMS: &str = "an exchange is one turn however many items it expands to";
-    const MODE_DEFAULT: &str = "plan is where a session opens unless it stored a choice";
+    const MODE_DEFAULT: &str = "a session opens in the default mode unless it stored a choice";
+    const PLAN_PATH_FOLLOWS_MODE: &str = "only a session opening in plan needs a plan file";
     const LEVEL_LOST: &str = "the level last chosen must survive into a session that has none";
     const STORED_LEVEL_LOST: &str = "a level the session stored outranks the remembered one";
     const LEVEL_KEPT: &str = "a model that cannot reason must not be sent a level";
@@ -280,7 +280,13 @@ mod tests {
     fn resumed(session: AppSession, model: &Model) -> SessionState {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
-        SessionState::from_session(session, model, &storage, &ModelPolicy::default())
+        SessionState::from_session(
+            session,
+            model,
+            &storage,
+            &ModelPolicy::default(),
+            Mode::Plan,
+        )
     }
 
     /// An old session: counters, no per-model breakdown.
@@ -385,8 +391,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let session = make_plan_session(Some(StoredMode::Plan), None);
-        let state =
-            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        let state = SessionState::from_session(
+            session,
+            &test_model(),
+            &storage,
+            &ModelPolicy::default(),
+            Mode::Plan,
+        );
         assert_eq!(state.mode, Mode::Plan);
         assert!(state.plan.path().is_some(), "plan path should be allocated");
     }
@@ -397,8 +408,13 @@ mod tests {
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let session =
             make_plan_session(Some(StoredMode::Plan), Some("/nonexistent/plan.md".into()));
-        let state =
-            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        let state = SessionState::from_session(
+            session,
+            &test_model(),
+            &storage,
+            &ModelPolicy::default(),
+            Mode::Plan,
+        );
         assert_eq!(state.mode, Mode::Plan);
         let path = state.plan.path().expect("plan path should be allocated");
         assert_ne!(path, Path::new("/nonexistent/plan.md"));
@@ -416,8 +432,13 @@ mod tests {
             Some(StoredMode::Plan),
             Some(plan_file.to_string_lossy().into_owned()),
         );
-        let state =
-            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        let state = SessionState::from_session(
+            session,
+            &test_model(),
+            &storage,
+            &ModelPolicy::default(),
+            Mode::Plan,
+        );
         assert_eq!(state.mode, Mode::Plan);
         assert_eq!(state.plan.path(), Some(plan_file.as_path()));
     }
@@ -435,7 +456,7 @@ mod tests {
         .unwrap();
         let policy = raw.into_config(false).unwrap().provider.model_policy;
 
-        let state = SessionState::from_session(session, &fallback, &storage, &policy);
+        let state = SessionState::from_session(session, &fallback, &storage, &policy, Mode::Plan);
 
         assert_eq!(state.model.spec(), fallback.spec());
         assert_eq!(state.session.model, fallback.spec());
@@ -471,8 +492,13 @@ mod tests {
             (true, true) => PlanState::RemoteReady(reference),
         };
 
-        let state =
-            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        let state = SessionState::from_session(
+            session,
+            &test_model(),
+            &storage,
+            &ModelPolicy::default(),
+            Mode::Plan,
+        );
 
         assert_eq!(state.mode, Mode::Build);
         assert_eq!(state.plan, expected);
@@ -484,20 +510,28 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let session = make_plan_session(Some(StoredMode::Build), None);
-        let state =
-            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        let state = SessionState::from_session(
+            session,
+            &test_model(),
+            &storage,
+            &ModelPolicy::default(),
+            Mode::Plan,
+        );
         assert_eq!(state.mode, Mode::Build);
         assert!(state.plan.path().is_none());
     }
 
-    /// A session that never chose opens in plan, so the agent has to be asked
-    /// before it may touch the workspace. One that did chose keeps its choice,
-    /// which is what makes resuming mid-implementation land back in build.
-    #[test_case(None, Mode::Plan ; "unchosen_opens_in_plan")]
-    #[test_case(Some(StoredMode::Plan), Mode::Plan ; "stored_plan_survives")]
-    #[test_case(Some(StoredMode::Build), Mode::Build ; "stored_build_survives")]
-    fn a_session_opens_in_plan_unless_it_chose_otherwise(
+    /// A session that never chose opens in the configured default, so plan
+    /// keeps the agent from touching the workspace until asked. One that did
+    /// choose keeps its choice whatever the default, which is what makes
+    /// resuming mid-implementation land back in build.
+    #[test_case(None, Mode::Plan, Mode::Plan ; "unchosen_opens_in_plan")]
+    #[test_case(None, Mode::Build, Mode::Build ; "unchosen_opens_in_build")]
+    #[test_case(Some(StoredMode::Plan), Mode::Build, Mode::Plan ; "stored_plan_beats_build_default")]
+    #[test_case(Some(StoredMode::Build), Mode::Plan, Mode::Build ; "stored_build_beats_plan_default")]
+    fn a_session_opens_in_the_default_mode_unless_it_chose_otherwise(
         stored: Option<StoredMode>,
+        default_mode: Mode,
         expected: Mode,
     ) {
         let tmp = tempfile::tempdir().unwrap();
@@ -507,8 +541,14 @@ mod tests {
             &test_model(),
             &storage,
             &ModelPolicy::default(),
+            default_mode,
         );
         assert_eq!(state.mode, expected, "{MODE_DEFAULT}");
+        assert_eq!(
+            state.plan.path().is_some(),
+            expected == Mode::Plan,
+            "{PLAN_PATH_FOLLOWS_MODE}"
+        );
     }
 
     /// `/thinking` has to outlive the session it was typed in, so a session
@@ -528,6 +568,7 @@ mod tests {
             &test_model(),
             &storage,
             &ModelPolicy::default(),
+            Mode::Plan,
         );
 
         assert_eq!(state.thinking, ThinkingConfig::Adaptive, "{LEVEL_LOST}");
@@ -547,8 +588,13 @@ mod tests {
         let mut session = AppSession::new("test-model", "/tmp");
         session.meta.thinking = Some(StoredThinking::Off);
 
-        let state =
-            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        let state = SessionState::from_session(
+            session,
+            &test_model(),
+            &storage,
+            &ModelPolicy::default(),
+            Mode::Plan,
+        );
 
         assert_eq!(state.thinking, ThinkingConfig::Off, "{STORED_LEVEL_LOST}");
     }
@@ -575,6 +621,7 @@ mod tests {
             &model,
             &storage,
             &ModelPolicy::default(),
+            Mode::Plan,
         );
 
         assert_eq!(state.thinking, ThinkingConfig::default(), "{LEVEL_KEPT}");
@@ -588,8 +635,13 @@ mod tests {
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let mut session = AppSession::new("aperture/zai/glm-5.2", "/tmp");
         session.meta.thinking = Some(StoredThinking::Adaptive);
-        let state =
-            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        let state = SessionState::from_session(
+            session,
+            &test_model(),
+            &storage,
+            &ModelPolicy::default(),
+            Mode::Plan,
+        );
         assert!(
             state.model.supports_thinking(),
             "resumed aperture/zai/glm-5.2 should inherit thinking support from adjust_model",

@@ -347,6 +347,7 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
     } else {
         initial_prompt
     };
+    let default_mode = params.ui_config.default_mode;
     let report = {
         // Nothing between the last `caudra` startup phase and the first frame is
         // logged otherwise, so a slow open has nowhere left to hide.
@@ -411,14 +412,15 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
             let summary = report
                 .tabs
                 .get(report.focused)
-                .filter(|tab| app::session_has_content(&tab.session))
+                .filter(|tab| app::session_has_content(&tab.session, default_mode))
                 .map(|tab| {
                     let others = report
                         .tabs
                         .iter()
                         .enumerate()
                         .filter(|&(index, other)| {
-                            index != report.focused && app::session_has_content(&other.session)
+                            index != report.focused
+                                && app::session_has_content(&other.session, default_mode)
                         })
                         .count();
                     ExitSummary::new(&tab.session, report.run_time, others)

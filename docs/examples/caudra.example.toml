@@ -215,6 +215,13 @@ version = 1
 # Type: bool.
 # changelog_on_update = true
 
+# Mode a new terminal UI session opens in: `plan`, where the agent writes only
+# the plan file until you switch, or `build`. A resumed session reopens in the
+# mode it was left in, and `/new` in an idle tab keeps that tab's mode.
+# `--print` and ACP always start in build.
+# Type: string.
+# default_mode = "plan"
+
 # Name of the color theme to load at startup, overriding the theme you last
 # picked with `/theme`. Unset keeps your last pick.
 # Type: string. Default: unset.

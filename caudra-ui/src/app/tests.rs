@@ -11781,14 +11781,14 @@ fn submit_exit_quits() {
 #[test]
 fn session_has_content_covers_each_branch() {
     let mut session = AppSession::new("test-model", "/tmp/test");
-    assert!(!session_has_content(&session));
+    assert!(!session_has_content(&session, StoredMode::Plan));
 
     session.meta.input_draft = Some("draft".into());
-    assert!(session_has_content(&session));
+    assert!(session_has_content(&session, StoredMode::Plan));
     session.meta.input_draft = None;
 
     session.meta.queued_messages = vec![stored_queued_prompt("queued")];
-    assert!(session_has_content(&session));
+    assert!(session_has_content(&session, StoredMode::Plan));
     session.meta.queued_messages.clear();
 
     session.meta.unsent_subagent_messages.insert(
@@ -11798,30 +11798,42 @@ fn session_has_content_covers_each_branch() {
             paste_ranges: Vec::new(),
         }],
     );
-    assert!(session_has_content(&session));
+    assert!(session_has_content(&session, StoredMode::Plan));
     session.meta.unsent_subagent_messages.clear();
 
     session.meta.system_prompt_profile = Some("review".into());
-    assert!(session_has_content(&session));
+    assert!(session_has_content(&session, StoredMode::Plan));
     session.meta.system_prompt_profile = Some("builtin".into());
-    assert!(!session_has_content(&session));
-
-    session.meta.mode = Some(StoredMode::Build);
-    assert!(session_has_content(&session));
-    session.meta.mode = Some(StoredMode::Plan);
-    assert!(!session_has_content(&session));
+    assert!(!session_has_content(&session, StoredMode::Plan));
 
     session.meta.automations = Some(StoredAutomationControls::default());
-    assert!(!session_has_content(&session));
+    assert!(!session_has_content(&session, StoredMode::Plan));
     session.meta.automations = Some(StoredAutomationControls {
         armed: vec!["nightly".into()],
         ..StoredAutomationControls::default()
     });
-    assert!(session_has_content(&session));
+    assert!(session_has_content(&session, StoredMode::Plan));
     session.meta.automations = None;
 
     crate::push_history_message(&mut session, Message::user("hello".into()));
-    assert!(session_has_content(&session));
+    assert!(session_has_content(&session, StoredMode::Plan));
+}
+
+/// A new session opens in `ui.default_mode`, so only leaving it is a choice
+/// worth keeping an otherwise empty session for.
+#[test_case(None, StoredMode::Plan => false ; "unchosen_under_plan")]
+#[test_case(None, StoredMode::Build => false ; "unchosen_under_build")]
+#[test_case(Some(StoredMode::Plan), StoredMode::Plan => false ; "plan_under_plan")]
+#[test_case(Some(StoredMode::Build), StoredMode::Build => false ; "build_under_build")]
+#[test_case(Some(StoredMode::Build), StoredMode::Plan => true ; "build_under_plan")]
+#[test_case(Some(StoredMode::Plan), StoredMode::Build => true ; "plan_under_build")]
+fn only_leaving_the_default_mode_keeps_an_empty_session(
+    stored: Option<StoredMode>,
+    default_mode: StoredMode,
+) -> bool {
+    let mut session = AppSession::new("test-model", "/tmp/test");
+    session.meta.mode = stored;
+    session_has_content(&session, default_mode)
 }
 
 #[test]
@@ -11868,7 +11880,7 @@ fn checkpoint_and_restore_preserve_separate_unsent_task_messages() {
 fn checkpoint_syncs_ephemeral_content_into_meta() {
     let mut app = test_app();
     app.checkpoint();
-    assert!(!session_has_content(&app.state.session));
+    assert!(!app.has_content());
     assert_eq!(
         app.state.session.meta.system_prompt_profile.as_deref(),
         Some("builtin")
@@ -11876,24 +11888,24 @@ fn checkpoint_syncs_ephemeral_content_into_meta() {
 
     app.state.system_prompt_profile_name = "review".into();
     app.checkpoint();
-    assert!(session_has_content(&app.state.session));
+    assert!(app.has_content());
     app.state.system_prompt_profile_name = "builtin".into();
     app.checkpoint();
-    assert!(!session_has_content(&app.state.session));
+    assert!(!app.has_content());
 
     app.update(Msg::Key(key(KeyCode::Char('x'))));
     app.checkpoint();
-    assert!(session_has_content(&app.state.session));
+    assert!(app.has_content());
 
     app.update(Msg::Key(key(KeyCode::Backspace)));
     app.checkpoint();
     assert!(app.state.session.meta.input_draft.is_none());
-    assert!(!session_has_content(&app.state.session));
+    assert!(!app.has_content());
 
     app.update(Msg::Key(key(KeyCode::Tab)));
     app.checkpoint();
     assert_eq!(app.state.session.meta.mode, Some(StoredMode::Build));
-    assert!(session_has_content(&app.state.session));
+    assert!(app.has_content());
 
     let mut queued = app_with_queued_message();
     queued.checkpoint();
@@ -11905,7 +11917,7 @@ fn checkpoint_syncs_ephemeral_content_into_meta() {
         session.meta.queued_messages,
         [stored_queued_prompt("queued")]
     );
-    assert!(session_has_content(session));
+    assert!(queued.has_content());
 }
 
 #[test]
@@ -12139,6 +12151,7 @@ fn automatic_wake_suppression_survives_reload(reason: DoneReason, startup: bool,
             &test_model(),
             &restored.storage,
             &restored.model_policy,
+            Mode::Plan,
         );
         restored.restore_resumed_session();
     } else {
@@ -12515,7 +12528,10 @@ fn a_session_holding_only_permission_grants_still_restores() {
     drain_writer(app, writer);
 
     let stored = AppSession::load(id, &dir).unwrap();
-    assert!(crate::app::session::session_has_content(&stored));
+    assert!(crate::app::session::session_has_content(
+        &stored,
+        StoredMode::Plan
+    ));
 }
 
 /// A tab the way the event loop spawns a fresh one: durable, but owed no row
@@ -13205,6 +13221,7 @@ fn active_goal_round_trips_through_session_metadata() {
         &model,
         &app.storage,
         &app.model_policy,
+        Mode::Plan,
     );
     assert_eq!(
         state.goal.snapshot().unwrap().condition.as_ref(),
@@ -13240,6 +13257,7 @@ fn a_resumed_active_goal_keeps_its_spend_evaluations_and_clock() {
         &model,
         &resumed.storage,
         &resumed.model_policy,
+        Mode::Plan,
     );
 
     let snapshot = resumed.state.goal.snapshot().expect(GOAL_PROGRESS_SURVIVES);
@@ -13313,8 +13331,13 @@ fn resuming_an_active_goal_starts_no_work_on_its_own() {
     let session = Arc::unwrap_or_clone(app.state.session.clone());
     let model = app.state.model.clone();
     let mut resumed = test_app();
-    resumed.state =
-        SessionState::from_session(session, &model, &resumed.storage, &resumed.model_policy);
+    resumed.state = SessionState::from_session(
+        session,
+        &model,
+        &resumed.storage,
+        &resumed.model_policy,
+        Mode::Plan,
+    );
     resumed.restore_resumed_session();
 
     assert!(resumed.state.goal.snapshot().is_some());
@@ -13367,6 +13390,7 @@ fn completed_goal_round_trips_through_session_metadata() {
         &model,
         &app.storage,
         &app.model_policy,
+        Mode::Plan,
     );
     let Some(GoalStatus::Finished(result)) = state.goal.status() else {
         panic!("completed goal was not restored");
@@ -20390,6 +20414,7 @@ fn openai_setup_selects_model_and_restores_thinking(
             &app.state.model,
             &dir,
             &ModelPolicy::default(),
+            Mode::Plan,
         );
     }
     app.checkpoint();
@@ -20412,6 +20437,7 @@ fn openai_setup_selects_model_and_restores_thinking(
         &model,
         &dir,
         &ModelPolicy::default(),
+        Mode::Plan,
     );
     assert_eq!(restored.thinking, expected);
     assert_eq!(
@@ -20614,6 +20640,7 @@ fn thinking_restored_from_session_meta() {
         &test_model(),
         &storage,
         &caudra_config::ModelPolicy::default(),
+        Mode::Plan,
     );
     assert_eq!(state.thinking, ThinkingConfig::Budget(4096));
 }
@@ -20855,6 +20882,7 @@ fn fast_restored_from_session_meta() {
         &test_model(),
         &storage,
         &caudra_config::ModelPolicy::default(),
+        Mode::Plan,
     );
     assert!(state.fast);
 }
@@ -20873,6 +20901,7 @@ fn fast_normalized_off_when_restored_onto_ineligible_model() {
         &test_model(),
         &storage,
         &caudra_config::ModelPolicy::default(),
+        Mode::Plan,
     );
     assert!(!state.fast);
 }

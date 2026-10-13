@@ -11,6 +11,7 @@ use std::time::Duration;
 use caudra_config_macro::ConfigSection;
 use caudra_storage::paths;
 use caudra_storage::retention::{GroupBy, KeepPolicy};
+use caudra_storage::sessions::StoredMode;
 use caudra_storage::thinking::{StoredThinking, ThinkingParseError};
 use caudra_storage::version::UpdateChannel;
 use caudra_terminal_host::PANE_ENVIRONMENT;
@@ -1125,6 +1126,7 @@ pub struct UiFileConfig {
     pub update_check: Option<bool>,
     pub update_channel: Option<UpdateChannel>,
     pub changelog_on_update: Option<bool>,
+    pub default_mode: Option<StoredMode>,
 }
 
 impl UiFileConfig {
@@ -1155,7 +1157,8 @@ impl UiFileConfig {
             max_input_lines,
             update_check,
             update_channel,
-            changelog_on_update
+            changelog_on_update,
+            default_mode
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -2334,6 +2337,14 @@ pub struct UiConfig {
     pub changelog_on_update: bool,
 
     #[config(
+        default = StoredMode::Plan,
+        ty = "string",
+        default_doc = "plan",
+        desc = "Mode a new terminal UI session opens in: `plan`, where the agent writes only the plan file until you switch, or `build`. A resumed session reopens in the mode it was left in, and `/new` in an idle tab keeps that tab's mode. `--print` and ACP always start in build"
+    )]
+    pub default_mode: StoredMode,
+
+    #[config(
         ty = "string",
         default = "None",
         desc = "Name of the color theme to load at startup, overriding the theme you last picked with `/theme`. Unset keeps your last pick"
@@ -2391,6 +2402,7 @@ impl UiConfig {
             update_check: f.update_check.unwrap_or(true),
             update_channel: f.update_channel.unwrap_or_default(),
             changelog_on_update: f.changelog_on_update.unwrap_or(true),
+            default_mode: f.default_mode.unwrap_or(StoredMode::Plan),
             theme: f.theme,
             theme_light: f.theme_light,
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
@@ -7266,6 +7278,29 @@ mod tests {
         let config = base.into_config(false).unwrap();
         assert_eq!(config.ui.update_channel, expected);
         assert!(!config.ui.update_check);
+    }
+
+    #[test_case("" => StoredMode::Plan; "missing_defaults_to_plan")]
+    #[test_case("[ui]\ndefault_mode = 'plan'\n" => StoredMode::Plan; "plan")]
+    #[test_case("[ui]\ndefault_mode = 'build'\n" => StoredMode::Build; "build")]
+    fn default_mode_deserializes(toml: &str) -> StoredMode {
+        let raw: RawConfig = toml::from_str(toml).unwrap();
+        raw.into_config(false).unwrap().ui.default_mode
+    }
+
+    #[test_case("'auto'"; "unknown")]
+    #[test_case("'Build'"; "capitalized")]
+    #[test_case("true"; "boolean")]
+    fn default_mode_rejects_invalid(mode: &str) {
+        assert!(toml::from_str::<RawConfig>(&format!("[ui]\ndefault_mode = {mode}\n")).is_err());
+    }
+
+    #[test_case("" => StoredMode::Build; "missing_preserves_base")]
+    #[test_case("default_mode = 'plan'" => StoredMode::Plan; "project_overrides")]
+    fn default_mode_overlay_wins(field: &str) -> StoredMode {
+        let mut base: RawConfig = toml::from_str("[ui]\ndefault_mode = 'build'\n").unwrap();
+        base.merge(toml::from_str(&format!("[ui]\n{field}\n")).unwrap());
+        base.into_config(false).unwrap().ui.default_mode
     }
 
     #[test]

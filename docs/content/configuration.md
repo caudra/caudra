@@ -359,6 +359,7 @@ To keep using `init.lua`, set `lua_plugins = true` under `[experimental]`. Its `
 | `update_check` | bool | `true` | `CAUDRA_ENABLE_UPDATE_CHECK` | - | Check GitHub releases in the background at interactive startup and show a banner above the prompt when a newer version is available. Uses a shared 24-hour cache and never installs automatically. Set false to disable |
 | `update_channel` | string | `auto` | - | - | Release channel: `auto` follows stable from a stable build and preview from a prerelease, including graduation to stable. `stable` excludes prereleases. `preview` includes prereleases and stable releases |
 | `changelog_on_update` | bool | `true` | - | - | After an update, show what is new in the releases since the one you last ran, once, the next time the terminal UI starts with nothing else to show. `/changelog` shows the notes at any time. Set false to keep them to `/changelog` |
+| `default_mode` | string | `plan` | - | - | Mode a new terminal UI session opens in: `plan`, where the agent writes only the plan file until you switch, or `build`. A resumed session reopens in the mode it was left in, and `/new` in an idle tab keeps that tab's mode. `--print` and ACP always start in build |
 | `theme` | string | unset | - | - | Name of the color theme to load at startup, overriding the theme you last picked with `/theme`. Unset keeps your last pick |
 | `theme_light` | string | unset | - | - | Light theme to pair with `theme`, in place of the one from the pairing table or for a theme that has no pair. `theme` becomes the dark half |
 

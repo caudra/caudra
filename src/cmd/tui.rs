@@ -32,7 +32,6 @@ use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::sweep::{SweepPolicy, sweep_if_due};
 use caudra_storage::sessions::{
     SessionDatabase, SessionLease, SessionLocation, SessionRelocation, SessionRelocationResult,
-    StoredMode,
 };
 use caudra_storage::state::{WorkspaceTabs, read_workspace_tabs};
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
@@ -685,13 +684,13 @@ fn build_stack(
 
     let commands = discover_commands(cli.no_commands || remote);
 
-    // A fresh session opens in plan; a resumed one overrides this with the model
-    // it stored.
+    // A fresh session opens in `ui.default_mode`; a resumed one overrides this
+    // with the model it stored.
     let model_result = setup::resolve_model(
         cli.model.as_deref(),
         &config.provider,
         storage,
-        StoredMode::Plan,
+        config.ui.default_mode,
     );
     let (model, needs_login) = match (model_result, fallback_model) {
         (Ok(m), _) => (m, false),

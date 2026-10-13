@@ -166,7 +166,7 @@ fn appended_len(merged: &HistorySnapshot, snapshot: &HistorySnapshot) -> Option<
 /// The one content check: `App::checkpoint` saves a session only when this
 /// holds, and the shutdown report reuses it to say which tabs were saved, so
 /// the report and the disk can never disagree.
-pub(crate) fn session_has_content(session: &AppSession) -> bool {
+pub(crate) fn session_has_content(session: &AppSession, default_mode: StoredMode) -> bool {
     !session.messages().is_empty()
         || session.meta.input_draft.is_some()
         || !session.meta.input_draft_images.is_empty()
@@ -181,9 +181,9 @@ pub(crate) fn session_has_content(session: &AppSession) -> bool {
             .system_prompt_profile
             .as_deref()
             .is_some_and(|profile| profile != caudra_agent::prompt::profile::BUILTIN_PROFILE_NAME)
-        // Plan is the mode a session opens in, so only leaving it is a choice
-        // worth keeping an otherwise empty session for.
-        || session.meta.mode == Some(caudra_storage::sessions::StoredMode::Build)
+        // A new session opens in `default_mode`, so only leaving it is a
+        // choice worth keeping an otherwise empty session for.
+        || session.meta.mode.is_some_and(|mode| mode != default_mode)
         // A name, a subscription, or a group membership is how peers and scripts
         // reach the session, so it is worth keeping before the first message. An
         // inbound policy is not.
@@ -203,7 +203,7 @@ pub(crate) fn session_has_content(session: &AppSession) -> bool {
 
 impl App {
     pub(crate) fn has_content(&self) -> bool {
-        session_has_content(&self.state.session)
+        session_has_content(&self.state.session, self.ui_config.default_mode)
     }
 
     /// The event loop runs this once per frame per session. It syncs whatever
@@ -1556,7 +1556,9 @@ impl App {
         // A loaded session that holds nothing owns no row worth publishing
         // against, so it waits for its first run like a fresh one.
         let conversation_permissions = match self.conversation_permissions.deferred() {
-            ConversationPermissions::Pending if session_has_content(&session) => {
+            ConversationPermissions::Pending
+                if session_has_content(&session, self.ui_config.default_mode) =>
+            {
                 ConversationPermissions::Published(attach_session_permissions(
                     &self.storage,
                     &self.storage_writer,
@@ -1580,8 +1582,13 @@ impl App {
         self.conversation_permissions = conversation_permissions;
         self.apply_stored_permission_mode(&session.meta);
         let autopilot_limits = self.state.autopilot.limits();
-        self.state =
-            SessionState::from_session(session, fallback_model, &self.storage, &self.model_policy);
+        self.state = SessionState::from_session(
+            session,
+            fallback_model,
+            &self.storage,
+            &self.model_policy,
+            self.ui_config.default_mode.into(),
+        );
         self.restore_autopilot(autopilot_limits);
         let coverage = self.state.session.meta.record_coverage.clone();
         let first = self.bind_change_recorder();

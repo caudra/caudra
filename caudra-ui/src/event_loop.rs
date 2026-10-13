@@ -1275,7 +1275,8 @@ impl SpawnCtx {
         let archived_history = crate::archived_session_history(&session);
         let todos = crate::session_todos(&session, &archived_history, &initial_history);
         let archived_history_ms = lap();
-        let restore_session = !initial_history.is_empty() || session_has_content(&session);
+        let restore_session = !initial_history.is_empty()
+            || session_has_content(&session, self.ui_config.default_mode);
         let (system_prompt_profile_name, system_prompt_profile) =
             self.resolve_prompt_profile(&session)?;
         let permissions = Arc::new(self.permissions.fork_session(session.id));
@@ -5620,7 +5621,7 @@ mod tests {
             app.checkpoint_now();
             writer.delete_sync(app.state.session.id).unwrap();
         }
-        assert!(!session_has_content(&app.state.session));
+        assert!(!app.has_content());
         let database = SessionDatabase::open_state(&storage).unwrap();
         assert!(database.local_session_locations().unwrap().is_empty());
         let inventory = relocation_inventory(&storage, [app.state.session.as_ref()]).unwrap();
@@ -5644,7 +5645,8 @@ mod tests {
         )
         .unwrap();
         assert!(!session_has_content(
-            &load_app_session(app.state.session.id, &storage).unwrap()
+            &load_app_session(app.state.session.id, &storage).unwrap(),
+            app.ui_config.default_mode,
         ));
         drop(app);
         Arc::try_unwrap(writer)
@@ -5803,7 +5805,7 @@ mod tests {
             },
         );
 
-        assert!(session_has_content(&session));
+        assert!(session_has_content(&session, StoredMode::Plan));
         assert_eq!(session.meta.input_draft.as_deref(), Some("edit me"));
         assert_eq!(session.meta.input_draft_images.len(), 1);
         assert_eq!(session.meta.input_draft_images[0].media_type, "image/png");
