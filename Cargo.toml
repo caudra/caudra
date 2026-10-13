@@ -5,7 +5,7 @@ edition = "2024"
 authors = [
   "Thorsten Born <tensorninja@caudra.ai>",
 ]
-description = "Terminal coding agent that turns context into effective action."
+description = "The complete coding agent for your terminal."
 license.workspace = true
 repository = "https://github.com/caudra/caudra"
 homepage = "https://caudra.ai"

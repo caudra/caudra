@@ -48,11 +48,14 @@ Fine when genuine: anaphora in scannable checklists ("No prompt text / No model 
 
 ## Product identity
 
-- Lead with what Caudra does: effective action from coordinated models, tools, and subagents, adapted to each outcome and kept under user control. Prefer concrete actions and outcomes over claims about intelligence. Never imply the agent always knows the right answer.
+- The brand line "The complete coding agent" serves titles and metadata. The README headline is "Stop assembling your coding agent." Never show the two side by side.
+- Own the word "complete". Lead with what arrives in one native binary, designed, tested, and released together: steerable subagents, built-in token savings, a workbench, and a history you can revert, kept under user control. Prove completeness with built-in capabilities and the way they connect, rather than adjectives. Prefer concrete actions and outcomes over claims about intelligence. Never imply the agent always knows the right answer.
+- "Complete" describes what ships in the binary. It never claims correctness or an advantage over a named product. Do not use "batteries included", "just works", "ever need", or "ultimate", and never call Caudra or a part of it "the best". Never claim that Caudra has no plugins, because Lua extensions, MCP servers, and skills exist. Say there are no plugins to assemble, or that a capability is built in.
+- Brain references belong only in the name story (README "Why the name"), which cites its sources. The analogy is limited: never imply consciousness, biological equivalence, or goals of its own.
 - State that Caudra is an independent fork when project provenance is relevant.
 - Use `Caudra` for the product and `caudra` for commands, paths, packages, APIs, and the lowercase wordmark.
 - Use only `https://caudra.ai` for the site, docs, and installer origin. An unrelated apparel business owns `caudra.com`, so never imply any connection to it.
-- Use `github.com/caudra/caudra` for source and `github.com/caudra/config` for the example config. Workcell source lives at `https://github.com/caudra/caudra/tree/main/workcell`.
+- Use `github.com/caudra/caudra` for source. Link configuration examples to `https://caudra.ai/docs/reference-configs/`. Workcell source lives at `https://github.com/caudra/caudra/tree/main/workcell`.
 - Telemetry names use the `caudra.*` namespace.
 - Mark every experimental capability as experimental. Never present one as a default.
 - Wherever Claude subscription sign-in appears, show that it is experimental and that Anthropic's terms limit Pro and Max subscriptions to official clients. Present ChatGPT, Copilot, and xAI sign-in plainly.

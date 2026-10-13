@@ -1,5 +1,5 @@
 {
-  description = "Caudra - terminal coding agent that turns context into effective action";
+  description = "Caudra - the complete coding agent for your terminal";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

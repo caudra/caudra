@@ -602,7 +602,7 @@ mod tests {
     #[test]
     fn canonical_overview_is_searchable() {
         let library = site::library();
-        let search = library.search("effective action", SEARCH_LIMIT);
+        let search = library.search("complete coding agent", SEARCH_LIMIT);
         assert!(
             search
                 .hits

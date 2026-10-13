@@ -8,7 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use std::time::{Duration, Instant};
 
 const LOGO: &str = "caudra";
-const TAGLINE: &str = "turns context into effective action";
+const TAGLINE: &str = "the complete coding agent";
 const HELP_SEGMENTS: &[(&str, bool)] = &[
     (key::HELP.label, true),
     (" help", false),

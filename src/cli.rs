@@ -87,7 +87,7 @@ impl From<LogLevel> for caudra_storage::log::record::Level {
 #[command(
     name = "caudra",
     version,
-    about = "Terminal coding agent that turns context into effective action"
+    about = "The complete coding agent for your terminal"
 )]
 pub struct Cli {
     #[command(subcommand)]
