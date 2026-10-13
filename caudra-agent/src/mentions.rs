@@ -7,6 +7,9 @@
 //! Parsing alone cannot tell a mention from a decorator, an email address, or a
 //! git revision, so every entry point pairs [`scan`] with an existence
 //! predicate. A candidate that does not resolve on disk is left as prose.
+//!
+//! `@server:uri` names a resource of a running MCP server instead. It counts
+//! only when that server lists the URI or one of its templates spells it.
 
 use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
@@ -18,6 +21,7 @@ use crate::sigil::{MAX_CANDIDATES, TRAILING_PUNCTUATION, opens_after};
 
 const SIGIL: char = '@';
 const RANGE_SEPARATOR: char = ':';
+const SERVER_SEPARATOR: char = ':';
 const LINE_PREFIXES: [char; 2] = ['L', 'l'];
 const RANGE_SPAN: char = '-';
 const QUOTE: char = '"';
@@ -38,6 +42,14 @@ pub struct Mention {
 pub enum MentionTarget {
     Local(PathBuf),
     Remote(WorkspacePath),
+    Resource(ResourceMention),
+}
+
+/// A resource an MCP server offers, by the server's configured name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceMention {
+    pub server: String,
+    pub uri: String,
 }
 
 impl Mention {
@@ -61,17 +73,35 @@ impl Mention {
         }
     }
 
+    pub fn resource(server: &str, uri: &str) -> Self {
+        Self {
+            raw: format_text(&format!("{server}{SERVER_SEPARATOR}{uri}"), None),
+            target: MentionTarget::Resource(ResourceMention {
+                server: server.to_owned(),
+                uri: uri.to_owned(),
+            }),
+            lines: None,
+        }
+    }
+
     pub fn local_path(&self) -> Option<&Path> {
         match &self.target {
             MentionTarget::Local(path) => Some(path),
-            MentionTarget::Remote(_) => None,
+            MentionTarget::Remote(_) | MentionTarget::Resource(_) => None,
         }
     }
 
     pub fn remote_path(&self) -> Option<&WorkspacePath> {
         match &self.target {
             MentionTarget::Remote(path) => Some(path),
-            MentionTarget::Local(_) => None,
+            MentionTarget::Local(_) | MentionTarget::Resource(_) => None,
+        }
+    }
+
+    pub fn resource_target(&self) -> Option<&ResourceMention> {
+        match &self.target {
+            MentionTarget::Resource(resource) => Some(resource),
+            MentionTarget::Local(_) | MentionTarget::Remote(_) => None,
         }
     }
 
@@ -79,6 +109,7 @@ impl Mention {
         match &self.target {
             MentionTarget::Local(path) => path.to_str().unwrap_or("<non-UTF-8 path>"),
             MentionTarget::Remote(path) => path.as_str(),
+            MentionTarget::Resource(resource) => &resource.uri,
         }
     }
 
@@ -142,29 +173,57 @@ fn format_text(display: &str, lines: Option<&RangeInclusive<usize>>) -> String {
     out
 }
 
-/// Finds every mention in `text` that names a path under `cwd`, which is what a
-/// caller holding a working directory wants instead of its own predicate.
-pub fn scan_in(text: &str, cwd: &Path) -> Vec<(Range<usize>, Mention)> {
+/// Finds every mention in `text` that names a path under `cwd`, or a resource
+/// `offered` accepts, which is what a caller holding a working directory wants
+/// instead of its own predicate.
+pub fn scan_in(
+    text: &str,
+    cwd: &Path,
+    offered: impl FnMut(&str, &str) -> bool,
+) -> Vec<(Range<usize>, Mention)> {
     let mut candidates = 0;
-    scan(text, |path| {
-        candidates += 1;
-        candidates <= MAX_CANDIDATES && cwd.join(path).exists()
-    })
+    scan_with(
+        text,
+        |path| {
+            candidates += 1;
+            candidates <= MAX_CANDIDATES && cwd.join(path).exists()
+        },
+        offered,
+    )
 }
 
 /// Finds every mention in `text` whose path satisfies `exists`.
 ///
 /// Ranges are char offsets, matching the composer's span model. Mentions never
 /// overlap: a match consumes its own text before scanning resumes.
-pub fn scan(text: &str, mut exists: impl FnMut(&Path) -> bool) -> Vec<(Range<usize>, Mention)> {
+pub fn scan(text: &str, exists: impl FnMut(&Path) -> bool) -> Vec<(Range<usize>, Mention)> {
+    scan_with(text, exists, |_, _| false)
+}
+
+/// [`scan`] that also reads `@server:uri` as a resource wherever `offered`
+/// says that server offers that URI. A resource wins over a file of the same
+/// spelling, which only a path with a colon in its first segment could be.
+pub fn scan_with(
+    text: &str,
+    mut exists: impl FnMut(&Path) -> bool,
+    mut offered: impl FnMut(&str, &str) -> bool,
+) -> Vec<(Range<usize>, Mention)> {
     let mut found = Vec::new();
     let mut boundary = true;
     let mut cursor = text.char_indices().enumerate();
     while let Some((char_index, (byte_index, character))) = cursor.next() {
         if character == SIGIL
             && boundary
-            && let Some((end, mention)) = parse_from(text, byte_index)
-            && mention.local_path().is_some_and(&mut exists)
+            && let Some((end, mention)) = parse_resource(text, byte_index)
+                .filter(|(_, mention)| {
+                    mention
+                        .resource_target()
+                        .is_some_and(|resource| offered(&resource.server, &resource.uri))
+                })
+                .or_else(|| {
+                    parse_from(text, byte_index)
+                        .filter(|(_, mention)| mention.local_path().is_some_and(&mut exists))
+                })
         {
             let width = text[byte_index..end].chars().count();
             found.push((char_index..char_index + width, mention));
@@ -220,6 +279,35 @@ fn parse_from(text: &str, at: usize) -> Option<(usize, Mention)> {
             raw: text[at..end].to_owned(),
             target: MentionTarget::Local(PathBuf::from(path)),
             lines,
+        },
+    ))
+}
+
+/// Parses `@server:uri` starting at `at`, quoted or not. The whole run is the
+/// URI: a `:L12` tail belongs to it, since resources have no line ranges.
+fn parse_resource(text: &str, at: usize) -> Option<(usize, Mention)> {
+    let body = text.get(at..)?.strip_prefix(SIGIL)?;
+    let (run, consumed) = match body.strip_prefix(QUOTE) {
+        Some(quoted) => {
+            let close = quoted.find(QUOTE)?;
+            (&quoted[..close], QUOTE.len_utf8() * 2 + close)
+        }
+        None => {
+            let end = body.find(char::is_whitespace).unwrap_or(body.len());
+            let run = body[..end].trim_end_matches(TRAILING_PUNCTUATION);
+            (run, run.len())
+        }
+    };
+    let (server, uri) = run.split_once(SERVER_SEPARATOR)?;
+    if server.is_empty() || uri.is_empty() {
+        return None;
+    }
+    let end = at + SIGIL.len_utf8() + consumed;
+    Some((
+        end,
+        Mention {
+            raw: text[at..end].to_owned(),
+            ..Mention::resource(server, uri)
         },
     ))
 }
@@ -299,9 +387,44 @@ mod tests {
 
     const WHOLE: &str = "src/main.rs";
     const SPACED: &str = "my notes.md";
+    const SERVER: &str = "docs";
+    const GUIDE: &str = "file:///guide.md";
 
     fn anything(_: &Path) -> bool {
         true
+    }
+
+    fn offers_guide(server: &str, uri: &str) -> bool {
+        server == SERVER && uri == GUIDE
+    }
+
+    #[test_case("@docs:file:///guide.md", Some(GUIDE) ; "listed")]
+    #[test_case("read @docs:file:///guide.md.", Some(GUIDE) ; "trailing_period")]
+    #[test_case("@\"docs:file:///guide.md\"", Some(GUIDE) ; "quoted")]
+    #[test_case("@docs:file:///other.md", None ; "unlisted_uri")]
+    #[test_case("@wiki:file:///guide.md", None ; "other_server")]
+    #[test_case("@docs:", None ; "no_uri")]
+    fn scan_with_reads_an_offered_resource(text: &str, uri: Option<&str>) {
+        let found = scan_with(text, |_| false, offers_guide);
+        let resource = found.first().and_then(|(_, m)| m.resource_target());
+        assert_eq!(resource.map(|r| r.uri.as_str()), uri, "{text}");
+        assert!(resource.is_none_or(|r| r.server == SERVER));
+    }
+
+    #[test]
+    fn a_resource_wins_over_a_file_of_the_same_spelling() {
+        const TEXT: &str = "@docs:file:///guide.md and @src/main.rs";
+        let found = scan_with(TEXT, anything, offers_guide);
+        assert_eq!(found.len(), 2);
+        assert!(found[0].1.resource_target().is_some());
+        assert_eq!(found[1].1.local_path(), Some(Path::new(WHOLE)));
+        assert_eq!(found[0].1.raw, Mention::resource(SERVER, GUIDE).raw);
+    }
+
+    #[test]
+    fn plain_scan_never_reads_a_resource() {
+        let found = scan("@docs:file:///guide.md", anything);
+        assert!(found[0].1.resource_target().is_none());
     }
 
     fn only(expected: &'static str) -> impl FnMut(&Path) -> bool {

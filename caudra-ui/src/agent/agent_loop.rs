@@ -13,15 +13,18 @@ use caudra_agent::context::{
     BuiltinToolsInput, ContextCapture, ContextInventory, ContextMcpInventory, ContextPublisher,
     ContextReadiness, ContextSnapshot,
 };
+use caudra_agent::mcp::call::CallScope;
 use caudra_agent::mcp::config::McpServerStatus;
+use caudra_agent::mcp::elicitor::QuestionForms;
+use caudra_agent::mcp::resources::prompt_message;
 use caudra_agent::mcp::{McpHandle, McpRequestSnapshot, McpSession};
 use caudra_agent::memory::baseline::MemoryBaseline;
 use caudra_agent::memory::compactor::Pump;
 use caudra_agent::permissions::PermissionManager;
-use caudra_agent::prompt::ResolvedSlots;
 use caudra_agent::prompt::profile::{
     BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile, TaskProfileBindings,
 };
+use caudra_agent::prompt::{ResolvedSlots, running_mcp_instructions};
 use caudra_agent::template;
 use caudra_agent::template::Vars;
 use caudra_agent::tools::execution::{configure_tools, execution_slots};
@@ -36,7 +39,7 @@ use caudra_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
     BackgroundReminderContext, CancelMap, CancelToken, CancelTrigger, DoneReason, Envelope,
     EventSender, GoalHandle, History, InstructionBaseline, Instructions, McpCommand, Nudge,
-    PromptRole, SessionMailbox, SharedHistory, SubagentHistoryStore, ToolOutputLines,
+    SessionMailbox, SharedHistory, SubagentHistoryStore, ToolOutputLines,
 };
 use caudra_config::{ModelPolicy, ProfileToolPolicy};
 use caudra_lua::EventHandle;
@@ -312,6 +315,7 @@ impl AgentLoop {
         let mcp = mcp_handle.map(|h| {
             McpSession::new(h, initial_messages)
                 .with_disabled_tools(&config.disabled_tools)
+                .with_elicitors(Some(Arc::new(QuestionForms)))
                 .with_profile_policy(
                     Arc::new(
                         system_prompt_profile
@@ -764,24 +768,22 @@ impl AgentLoop {
                 });
             };
             let messages = mcp
-                .get_prompt(&prompt_ref.qualified_name, &prompt_ref.arguments)
+                .get_prompt(
+                    &prompt_ref.qualified_name,
+                    &prompt_ref.arguments,
+                    &CallScope::none(),
+                )
                 .await
                 .map_err(|e| AgentError::Tool {
                     tool: "mcp_prompt".into(),
                     message: e.to_string(),
                 })?;
-            for pm in messages {
-                let text = pm.content.text.unwrap_or_default();
-                let msg = match pm.role {
-                    PromptRole::Assistant => Message {
-                        role: caudra_providers::Role::Assistant,
-                        content: vec![caudra_providers::ContentBlock::Text { text }],
-                        ..Default::default()
-                    },
-                    PromptRole::User => Message::user(text),
-                };
-                input.preamble.push(msg);
-            }
+            let vision = effective_slot.model.supports_vision();
+            input.preamble.extend(
+                messages
+                    .into_iter()
+                    .map(|message| prompt_message(message, vision)),
+            );
         }
 
         let opts = RequestOptions {
@@ -1057,7 +1059,10 @@ impl AgentLoop {
         };
         prompt_profiles.refresh(&mut self.system_prompt_profile);
         if self.mcp.is_none() {
-            self.mcp = mcp.map(|handle| McpSession::new(handle, self.history.as_slice()));
+            self.mcp = mcp.map(|handle| {
+                McpSession::new(handle, self.history.as_slice())
+                    .with_elicitors(Some(Arc::new(QuestionForms)))
+            });
         }
         self.mcp = self
             .mcp
@@ -1201,8 +1206,12 @@ impl AgentLoop {
         prompt_slots: &caudra_agent::prompt::ResolvedSlots,
         tool_filter: &ToolFilter,
     ) -> String {
+        let mcp_instructions = self
+            .mcp
+            .as_ref()
+            .and_then(|mcp| running_mcp_instructions(&mcp.reader().load()));
         let prompt_slots = execution_slots(
-            prompt_slots,
+            &prompt_slots.with_mcp_instructions(mcp_instructions),
             &self.config,
             self.background.is_some(),
             self.background.is_some(),

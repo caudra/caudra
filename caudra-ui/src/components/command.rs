@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use caudra_agent::command::CustomCommand;
+use caudra_agent::mcp::CompletionTarget;
 use caudra_agent::{McpPromptInfo, McpSnapshotReader};
 use caudra_config::{Feature, FeatureFlags};
 use caudra_grab::grab_scope;
@@ -16,6 +19,8 @@ use ratatui::widgets::{Clear, Paragraph};
 
 use crate::components::list_picker::{DISABLED_DIM, PickerItem};
 use crate::components::match_spans;
+use crate::components::mcp_completion::{CompletionAsk, McpCompleter};
+use crate::repaint::Dirty;
 use crate::theme;
 
 const TICK_TIMEOUT_MS: u64 = 10;
@@ -26,6 +31,7 @@ pub(crate) const SECTION_BUILTIN: &str = "Built-in";
 const SECTION_CUSTOM: &str = "Project & User";
 const SECTION_MCP: &str = "MCP Prompts";
 const SECTION_PLUGIN: &str = "Plugins";
+const VALUE_PAD: usize = 1;
 
 /// Which chat a command can act on. [`ChatScope::MainOnly`] reaches the main
 /// session's turn or history, which a focused task has no equivalent of, so
@@ -623,6 +629,22 @@ pub struct CommandPalette {
     /// Set by [`CommandPalette::sync`] so it cannot go stale behind the rows
     /// it styles.
     task_focused: bool,
+    completer: McpCompleter,
+    /// The MCP prompt argument the input is in the middle of.
+    argument: Option<PromptArgument>,
+    /// What the prompt's server suggested for it. While there are any, they
+    /// are the rows.
+    values: Vec<String>,
+    value_selected: usize,
+}
+
+/// The prompt argument at the end of the input, and where its value starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromptArgument {
+    ask: CompletionAsk,
+    start: usize,
+    /// The last argument takes the rest of the input, spaces and all.
+    last: bool,
 }
 
 impl CommandPalette {
@@ -661,6 +683,10 @@ impl CommandPalette {
             row_hits: Vec::new(),
             mouse_down: None,
             task_focused: false,
+            completer: McpCompleter::default(),
+            argument: None,
+            values: Vec::new(),
+            value_selected: 0,
         }
     }
 
@@ -754,6 +780,9 @@ impl CommandPalette {
     pub fn handle_key(&mut self, key: KeyEvent, input: &str) -> CommandAction {
         if !self.is_active() {
             return CommandAction::Passthrough;
+        }
+        if let Some(action) = self.handle_value_key(key, input) {
+            return action;
         }
         match key.code {
             KeyCode::Up => {
@@ -850,7 +879,115 @@ impl CommandPalette {
     }
 
     pub fn is_active(&self) -> bool {
-        !self.filtered.is_empty()
+        !self.filtered.is_empty() || !self.values.is_empty()
+    }
+
+    /// Up and Down walk the suggested values and Tab takes one; Enter still
+    /// runs the command as typed.
+    fn handle_value_key(&mut self, key: KeyEvent, input: &str) -> Option<CommandAction> {
+        if self.values.is_empty() {
+            return None;
+        }
+        let count = self.values.len();
+        match key.code {
+            KeyCode::Up => self.value_selected = (self.value_selected + count - 1) % count,
+            KeyCode::Down => self.value_selected = (self.value_selected + 1) % count,
+            KeyCode::Esc => self.clear_argument(),
+            KeyCode::Tab => {
+                let argument = self.argument.as_ref()?;
+                let value = self.values.get(self.value_selected)?;
+                let separator = if argument.last { "" } else { " " };
+                let head = input.get(..argument.start)?;
+                return Some(CommandAction::Complete(format!("{head}{value}{separator}")));
+            }
+            _ => return None,
+        }
+        Some(CommandAction::Consumed)
+    }
+
+    /// The argument `input` is typing, when it calls an MCP prompt whose
+    /// server completes. Arguments are positional, split on whitespace, and
+    /// the last one takes the rest, as running the prompt reads them.
+    fn prompt_argument(&self, input: &str) -> Option<PromptArgument> {
+        let (command, mut rest) = input.strip_prefix('/')?.split_once(char::is_whitespace)?;
+        let prompt = self
+            .mcp_prompts
+            .iter()
+            .find(|prompt| prompt.completions && prompt.display_name == command)?;
+        let last = prompt.arguments.len().checked_sub(1)?;
+        let mut context = BTreeMap::new();
+        for (index, argument) in prompt.arguments.iter().enumerate() {
+            rest = rest.trim_start();
+            let start = input.len() - rest.len();
+            let value = match rest.split_once(char::is_whitespace) {
+                Some((word, tail)) if index < last => {
+                    context.insert(argument.name.clone(), word.to_owned());
+                    rest = tail;
+                    continue;
+                }
+                _ => rest,
+            };
+            return Some(PromptArgument {
+                ask: CompletionAsk {
+                    target: CompletionTarget::Prompt {
+                        qualified_name: prompt.qualified_name.clone(),
+                    },
+                    argument: argument.name.clone(),
+                    value: value.to_owned(),
+                    context,
+                },
+                start,
+                last: index == last,
+            });
+        }
+        None
+    }
+
+    /// Follows the argument being typed. Values the server already gave stay
+    /// while they still fit what is typed, so a keystroke does not blank the
+    /// list while the next answer is on its way.
+    fn track_argument(&mut self, input: &str, now: Instant) {
+        let Some(argument) = self.prompt_argument(input) else {
+            self.clear_argument();
+            return;
+        };
+        if self.argument.as_ref() == Some(&argument) {
+            return;
+        }
+        let typed = &argument.ask.value;
+        self.values
+            .retain(|value| value.starts_with(typed.as_str()));
+        self.value_selected = 0;
+        self.completer.ask(argument.ask.clone(), now);
+        self.argument = Some(argument);
+    }
+
+    fn clear_argument(&mut self) {
+        self.completer.clear();
+        self.argument = None;
+        self.values.clear();
+        self.value_selected = 0;
+    }
+
+    /// Takes the server's answer for the argument still being typed.
+    pub(crate) fn poll_completion(&mut self) -> Dirty {
+        self.poll_completion_at(Instant::now())
+    }
+
+    fn poll_completion_at(&mut self, now: Instant) -> Dirty {
+        let Some((ask, values)) = self.completer.poll(&self.mcp_reader, now) else {
+            return Dirty::NO;
+        };
+        if self
+            .argument
+            .as_ref()
+            .is_none_or(|argument| argument.ask != ask)
+        {
+            return Dirty::NO;
+        }
+        self.values = values;
+        self.value_selected = 0;
+        Dirty::YES
     }
 
     /// Pulls MCP prompts and Lua commands forward when either side has
@@ -944,6 +1081,7 @@ impl CommandPalette {
         let Some(stripped) = input.strip_prefix('/') else {
             self.filtered.clear();
             self.current_arg_count = 0;
+            self.clear_argument();
             return;
         };
 
@@ -967,6 +1105,7 @@ impl CommandPalette {
 
         self.tick();
         self.hold_abbreviation(cmd_word);
+        self.track_argument(input, Instant::now());
     }
 
     fn hold_abbreviation(&mut self, typed: &str) {
@@ -1040,6 +1179,7 @@ impl CommandPalette {
         self.filtered.clear();
         self.current_arg_count = 0;
         self.scroll_offset = 0;
+        self.clear_argument();
         self.invalidate_mouse_geometry();
     }
 
@@ -1190,6 +1330,9 @@ impl CommandPalette {
     }
 
     pub fn view(&mut self, frame: &mut Frame, input_area: Rect) -> Option<Rect> {
+        if !self.values.is_empty() {
+            return self.view_values(frame, input_area);
+        }
         let filtered = &self.filtered;
         if filtered.is_empty() {
             self.invalidate_mouse_geometry();
@@ -1288,6 +1431,49 @@ impl CommandPalette {
 
         Some(popup)
     }
+
+    /// The suggested values for the argument being typed, the selected one
+    /// highlighted. The selection is kept in view by drawing from it.
+    fn view_values(&mut self, frame: &mut Frame, input_area: Rect) -> Option<Rect> {
+        self.invalidate_mouse_geometry();
+        let height = (self.values.len() as u16).min(input_area.y);
+        if height == 0 {
+            return None;
+        }
+        let width = self
+            .values
+            .iter()
+            .map(|value| value.chars().count() + VALUE_PAD * 2)
+            .max()
+            .unwrap_or_default() as u16;
+        let popup = Rect {
+            x: input_area.x,
+            y: input_area.y.saturating_sub(height),
+            width: width.min(input_area.width),
+            height,
+        };
+        grab_scope!("command", popup);
+        let t = theme::current();
+        let first = (self.value_selected + 1).saturating_sub(height as usize);
+        let pad = " ".repeat(VALUE_PAD);
+        let lines: Vec<Line> = self
+            .values
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(height as usize)
+            .map(|(index, value)| {
+                let style = match index == self.value_selected {
+                    true => t.item_selected,
+                    false => t.item,
+                };
+                Line::from(Span::styled(format!("{pad}{value}{pad}"), style))
+            })
+            .collect();
+        frame.render_widget(Clear, popup);
+        frame.render_widget(Paragraph::new(lines).style(t.surface_style()), popup);
+        Some(popup)
+    }
 }
 
 #[cfg(test)]
@@ -1295,6 +1481,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::components::mcp_completion::COMPLETION_DEBOUNCE;
+    use caudra_agent::mcp::completing_stub_session;
+    use caudra_agent::mcp::resources::ResourceLists;
     use caudra_agent::{McpPromptArg, McpSnapshot};
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use test_case::test_case;
@@ -1788,6 +1977,7 @@ mod tests {
                     display_name: "myserver:code-review".into(),
                     qualified_name: "myserver/code-review".into(),
                     description: "Review code changes".into(),
+                    completions: false,
                     arguments: vec![McpPromptArg {
                         name: "diff".into(),
                         description: "The diff".into(),
@@ -1798,9 +1988,11 @@ mod tests {
                     display_name: "myserver:summarize".into(),
                     qualified_name: "myserver/summarize".into(),
                     description: "Summarize text".into(),
+                    completions: false,
                     arguments: vec![],
                 },
             ],
+            resources: Vec::new(),
             pids: vec![],
             generation: 0,
         })
@@ -1891,8 +2083,10 @@ mod tests {
                 display_name: "myserver:new-prompt".into(),
                 qualified_name: "myserver/new-prompt".into(),
                 description: "A new prompt".into(),
+                completions: false,
                 arguments: vec![],
             }],
+            resources: Vec::new(),
             pids: vec![],
             generation: 1,
         });
@@ -2214,5 +2408,95 @@ mod tests {
         let popup = palette.popup_area.expect("the palette drew");
         assert!(palette.contains(Position::new(popup.x, popup.y)));
         assert!(!palette.contains(Position::new(popup.x, popup.bottom())));
+    }
+
+    const COMPLETING_PROMPT: &str = "review";
+    const BRANCH: &str = "branch";
+    const PATH: &str = "path";
+    const SUGGESTED: [&str; 2] = ["main", "maint"];
+    const NOT_TRACKED: &str = "the palette lost the argument being typed";
+
+    fn completing_palette() -> CommandPalette {
+        let session = completing_stub_session(
+            ResourceLists::default(),
+            COMPLETING_PROMPT,
+            &[BRANCH, PATH],
+            &SUGGESTED,
+        );
+        CommandPalette::new(
+            Arc::from([]),
+            session.reader(),
+            LuaCommandReader::empty(),
+            FeatureFlags::all(),
+        )
+    }
+
+    /// Spins until the server's answer lands, past the pause it waits out.
+    fn answered(palette: &mut CommandPalette) {
+        let due = Instant::now() + COMPLETION_DEBOUNCE;
+        while palette.completer.busy() {
+            let _ = palette.poll_completion_at(due);
+        }
+    }
+
+    #[test_case("/stub:review ma", BRANCH, "ma", &[] ; "the_first_argument")]
+    #[test_case("/stub:review ", BRANCH, "", &[] ; "an_argument_not_started")]
+    #[test_case("/stub:review main pa", PATH, "pa", &[(BRANCH, "main")] ; "a_later_argument_carries_the_earlier")]
+    #[test_case("/stub:review main docs/my file", PATH, "docs/my file", &[(BRANCH, "main")] ; "the_last_argument_takes_the_rest")]
+    fn the_argument_being_typed_is_asked_with_the_ones_before(
+        input: &str,
+        argument: &str,
+        value: &str,
+        context: &[(&str, &str)],
+    ) {
+        let mut palette = completing_palette();
+        palette.sync(input, false);
+        let asked = &palette.argument.as_ref().expect(NOT_TRACKED).ask;
+        let context: BTreeMap<String, String> = context
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        assert_eq!(
+            (
+                asked.argument.as_str(),
+                asked.value.as_str(),
+                &asked.context
+            ),
+            (argument, value, &context)
+        );
+    }
+
+    #[test]
+    fn a_suggested_value_completes_the_argument() {
+        let mut palette = completing_palette();
+        let input = "/stub:review ma";
+        palette.sync(input, false);
+        answered(&mut palette);
+        assert_eq!(palette.values, SUGGESTED);
+        palette.handle_key(KeyEvent::from(KeyCode::Down), input);
+        let CommandAction::Complete(text) = palette.handle_key(KeyEvent::from(KeyCode::Tab), input)
+        else {
+            panic!("Tab did not take the suggestion");
+        };
+        assert_eq!(text, format!("/stub:review {} ", SUGGESTED[1]));
+    }
+
+    /// Typing on keeps the suggestions that still fit, while the next answer
+    /// is on its way.
+    #[test]
+    fn typing_on_keeps_only_the_values_that_still_fit() {
+        let mut palette = completing_palette();
+        palette.sync("/stub:review ma", false);
+        answered(&mut palette);
+        palette.sync("/stub:review mai", false);
+        palette.sync("/stub:review main", false);
+        palette.sync("/stub:review maint", false);
+        assert_eq!(palette.values, [SUGGESTED[1]]);
+    }
+
+    #[test]
+    fn a_server_without_completions_is_never_asked() {
+        let palette = synced_with_prompts("/myserver:code-review ma");
+        assert!(palette.argument.is_none());
     }
 }

@@ -16,6 +16,7 @@ use caudra_agent::agent::task_runner::{
 use caudra_agent::background::BackgroundTasks;
 use caudra_agent::context::ContextPublisher;
 use caudra_agent::mcp::McpSession;
+use caudra_agent::mcp::elicitor::QuestionForms;
 use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::tools::{FileReadTracker, PathLocks, ToolAudience, ToolFilter, ToolRegistry};
@@ -200,7 +201,9 @@ impl WorkflowSession {
         // map the agent loop's cancel sweep clears.
         let subagent_cancels = Arc::new(CancelMap::new());
         let mcp = spawn.mcp_handle.map(|handle| {
-            McpSession::new(handle.clone(), &[]).with_disabled_tools(&spawn.config.disabled_tools)
+            McpSession::new(handle.clone(), &[])
+                .with_disabled_tools(&spawn.config.disabled_tools)
+                .with_elicitors(Some(Arc::new(QuestionForms)))
         });
         let started = Instant::now();
         let loaded_instructions = spawn.remote_project_context.as_ref().map_or_else(

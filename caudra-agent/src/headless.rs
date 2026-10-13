@@ -80,6 +80,7 @@ use crate::autopilot::{AutopilotDecision, AutopilotHandle};
 use crate::background::{BackgroundTasks, BackgroundTransition, SessionWork};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::commits;
+use crate::mcp::elicitor::ElicitorFactory;
 use crate::memory::baseline::{MemoryBaseline, open_store as open_memory_store};
 use crate::memory::compactor::{Ledger, Pump};
 use crate::mentions;
@@ -1550,8 +1551,12 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
         false,
         false,
     );
+    let mcp_instructions = params
+        .mcp_handle
+        .as_ref()
+        .and_then(|handle| crate::prompt::running_mcp_instructions(&handle.reader().load()));
     params.prompt_slots = crate::tools::execution::execution_slots(
-        &params.prompt_slots,
+        &params.prompt_slots.with_mcp_instructions(mcp_instructions),
         &params.config,
         false,
         false,
@@ -1826,6 +1831,9 @@ pub struct InteractiveParams {
     /// Host-side overrides that shadow a registered tool's execution while
     /// keeping its advertised schema (e.g. ACP answers `question` via elicitation).
     pub local_tools: LocalTools,
+    /// How the front end asks the user what an MCP server wants to know.
+    /// `None` declines every such request, for a front end that cannot ask.
+    pub mcp_elicitors: Option<Arc<dyn ElicitorFactory>>,
     /// `Some` attaches a workflow runtime to the session, whose agents are
     /// capped by the mode this returns as each of them starts. `None` leaves
     /// the `workflow` tool reporting unavailable.
@@ -3113,6 +3121,7 @@ async fn spawn_prepared_session(
     let mcp = params.mcp_handle.clone().map(|h| {
         McpSession::new(h, initial_messages)
             .with_disabled_tools(&params.config.disabled_tools)
+            .with_elicitors(params.mcp_elicitors.clone())
             .with_actor_policy(Arc::new(
                 params
                     .system_prompt_profile
@@ -4241,8 +4250,11 @@ async fn spawn_prepared_session(
                     background.is_some(),
                 );
                 let live_tool_filter = definitions.available_filter().for_mode(&input.mode);
+                let mcp_instructions = mcp
+                    .as_ref()
+                    .and_then(|mcp| crate::prompt::running_mcp_instructions(&mcp.reader().load()));
                 let execution_slots = crate::tools::execution::execution_slots(
-                    &params.prompt_slots,
+                    &params.prompt_slots.with_mcp_instructions(mcp_instructions),
                     &params.config,
                     background.is_some(),
                     background.is_some(),
@@ -6427,6 +6439,7 @@ complete(#{ report: first.output });
                 model_policy: Arc::new(ModelPolicy::default()),
                 plugin_rules: Arc::default(),
                 local_tools: LocalTools::default(),
+                mcp_elicitors: None,
                 workflow_mode: workflows.then(|| Arc::new(|| AgentMode::Build) as ModeResolver),
                 workspace_binding: binding,
                 remote_environment: workspace.as_ref().map(|_| RemoteEnvironment {

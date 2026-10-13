@@ -10,9 +10,9 @@ use crate::input_document::{
 };
 use crate::theme;
 
-use caudra_agent::PromptAdmission;
 use caudra_agent::commits::{self, CommitRef};
 use caudra_agent::mentions::{self, Mention};
+use caudra_agent::{McpSnapshotReader, PromptAdmission};
 use caudra_grab::grab_scope;
 use caudra_storage::input_history::InputHistory;
 use caudra_workbench::buffer::Cursor;
@@ -235,6 +235,9 @@ pub struct InputBox {
     /// the session's log, which is what keeps `#` prose in a project that has
     /// no repository.
     commit_index: CommitIndex,
+    /// Resolves the `@server:uri` resources a mention names: only what a
+    /// running server offers is one.
+    mcp: McpSnapshotReader,
 }
 
 impl InputBox {
@@ -362,7 +365,12 @@ impl InputBox {
             cwd: PathBuf::new(),
             remote_workspace: false,
             commit_index: CommitIndex::default(),
+            mcp: McpSnapshotReader::empty(),
         }
+    }
+
+    pub(crate) fn set_mcp_reader(&mut self, reader: McpSnapshotReader) {
+        self.mcp = reader;
     }
 
     pub(crate) fn set_cwd(&mut self, cwd: impl Into<PathBuf>) {
@@ -387,7 +395,10 @@ impl InputBox {
         if self.remote_workspace {
             mentions::scan_remote(&self.buffer.display_text())
         } else {
-            mentions::scan_in(&self.buffer.display_text(), &self.cwd)
+            let snapshot = self.mcp.load();
+            mentions::scan_in(&self.buffer.display_text(), &self.cwd, |server, uri| {
+                snapshot.offers_resource(server, uri)
+            })
         }
     }
 

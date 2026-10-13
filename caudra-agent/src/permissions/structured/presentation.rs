@@ -3,6 +3,7 @@ use super::{
     PermissionResourcePresentation, PermissionRisk, ResourceCoverage, RuleOrigin, ShellOpacity,
     strict_http_url,
 };
+use crate::mcp::kind::McpCallFacts;
 use caudra_config::ToolKey;
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +12,9 @@ pub(super) const SUMMARY_MAX_CHARS: usize = 240;
 pub(super) const LISTED_COMMANDS_MAX: usize = 3;
 
 const PERCENT: f64 = 100.0;
+const MCP_LABEL: &str = "MCP";
+/// How a call the server itself calls read-only is summed up.
+pub(super) const READ_ONLY_MCP_SUMMARY: &str = "Read-only lookup, as the server describes it";
 
 /// A caution the decision engine can raise about a call. The wire carries the
 /// snake_case name, so every client reads the same fixed set.
@@ -166,11 +170,13 @@ pub(super) fn presentation_for(
     tool: &ToolKey,
     risk: &PermissionRisk,
     resources: &[PermissionResource],
+    mcp: Option<&McpCallFacts>,
 ) -> PermissionPresentation {
     let action = match tool {
         ToolKey::McpTool { server, tool } => {
             format!(
-                "Call MCP tool {} from {}",
+                "Call {} tool {} from {}",
+                mcp.map_or(MCP_LABEL, |facts| facts.kind.label()),
                 safe_summary(tool),
                 safe_summary(server)
             )
@@ -182,6 +188,7 @@ pub(super) fn presentation_for(
         ToolKey::Wildcard => "Run an unknown legacy tool".into(),
     };
     let risk_summary = match risk {
+        PermissionRisk::Low if mcp.is_some_and(|facts| facts.read_only) => READ_ONLY_MCP_SUMMARY,
         PermissionRisk::Low => "Limited read or lookup operation",
         PermissionRisk::Medium => "External read or network operation",
         PermissionRisk::High => "May modify data, execute code, or invoke an external authority",
@@ -352,7 +359,7 @@ mod tests {
     #[test_case(Some("/reviewed/project"); "project_round_trip")]
     fn presentation_project_is_optional_display_context(project: Option<&str>) {
         let mut presentation =
-            presentation_for(&ToolKey::native("bash"), &PermissionRisk::High, &[]);
+            presentation_for(&ToolKey::native("bash"), &PermissionRisk::High, &[], None);
         assert!(presentation.project.is_none());
         presentation.project = project.map(PathBuf::from);
         let serialized = serde_json::to_value(&presentation).unwrap();
@@ -375,7 +382,7 @@ mod tests {
     )]
     fn presentation_autopilot_note_round_trips(note: Option<AutopilotNote>, wire: Option<Value>) {
         let mut presentation =
-            presentation_for(&ToolKey::native("bash"), &PermissionRisk::High, &[]);
+            presentation_for(&ToolKey::native("bash"), &PermissionRisk::High, &[], None);
         presentation.autopilot = note;
 
         let serialized = serde_json::to_value(&presentation).unwrap();

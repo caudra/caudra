@@ -136,7 +136,7 @@ pub(super) struct Segment {
     pub spinner_lines: Vec<(usize, usize)>,
     snapshot_base: Option<usize>,
     snapshot_skip: usize,
-    pub shell_toggle_line: Option<usize>,
+    pub raw_toggle_line: Option<usize>,
     pub scroll_footer_line: Option<usize>,
     pub scroll_spans: Vec<ScrollSpan>,
     /// What each line belongs to, parallel to `lines`. Spliced alongside them
@@ -484,7 +484,7 @@ impl Segment {
         self.spinner_lines = tl.spinner_lines;
         self.snapshot_base = tl.snapshot_base;
         self.snapshot_skip = tl.snapshot_skip;
-        self.shell_toggle_line = tl.shell_toggle_line;
+        self.raw_toggle_line = tl.raw_toggle_line;
         self.scroll_footer_line = tl.scroll_footer_line;
         self.scroll_spans = tl.scroll_spans;
         self.content_indent = tl.content_indent;
@@ -1162,7 +1162,7 @@ mod tests {
             spinner_lines: Vec::new(),
             snapshot_base: None,
             snapshot_skip: 0,
-            shell_toggle_line: None,
+            raw_toggle_line: None,
             scroll_footer_line: None,
             scroll_spans: Vec::new(),
             content_indent: "",

@@ -415,7 +415,7 @@ Viewing, zooming, searching, and reading notes with the [`memory` tool](/docs/me
 
 ## Read-only agents
 
-A read-only agent is a subagent that may not change anything: research tasks, `task` calls in plan mode, and every agent a workflow starts in `read-only` capability mode. Only audited host tools with safe call effects are eligible. Ordinary MCP and plugin tools are excluded. When an audited `shell` is available, Caudra judges each command line rather than the tool as a whole.
+A read-only agent is a subagent that may not change anything: research tasks, `task` calls in plan mode, and every agent a workflow starts in `read-only` capability mode. Only audited host tools with safe call effects are eligible, and the read-only tools of a [recognised MCP server](/docs/mcp/#recognised-servers). Other MCP and plugin tools are excluded. When an audited `shell` is available, Caudra judges each command line rather than the tool as a whole.
 
 A line is admitted when the classifier rules every command in it read-only and every path it touches resolves inside the project. `git diff`, `git log`, `rg`, and `wc -l` pass. Git options that only shape what is printed pass in their `=` form, such as `--format='%h %ci'`, `--date=short`, and `--since=2.weeks`. A format holding `%G` does not, because signature placeholders run gpg. Anything that writes, anything the parser could not read, and anything reaching outside the project is refused with a message naming the call and the reason, and the agent can retry with a narrower line. The same classifier answers here and in plan mode, so a command plan mode would refuse is refused here too.
 
@@ -681,6 +681,14 @@ Caudra binds approval to one immutable MCP transport, server configuration diges
 Generic field names such as `path` or `command` do not create reusable resource authority. External servers control their schemas, so Caudra treats these values as display information unless the host has a trusted typed profile.
 
 In [Customize](#customize), the TUI can allow a whole MCP tool with any arguments for the current conversation. It needs a [second `Enter`](#confirming-broad-grants) and cannot be stored for a project or globally. ACP and SDK clients remain exact-only.
+
+A [recognised server](/docs/mcp/#recognised-servers) gets more care, and its read-only tools get the treatment of Caudra's own read tools:
+
+- **Read-only tools.** A tool the server marks read-only is low risk, works in [plan mode](#plan-mode) and in [read-only agents](#read-only-agents), and still asks in Ask mode. Its prompt offers `<tool> with any arguments`, which you can keep for the conversation, the project, or all projects without a second `Enter`. The prompt marks the tool `read-only, as the server describes it`.
+- **Home Assistant devices.** A call whose `domain` names `lock`, `alarm_control_panel`, `cover`, or `valve` always asks, at critical risk. No rule covers it, Auto leaves it to you, and autopilot never allows it. The prompt says which devices, such as `Home Assistant lock devices always ask`.
+- **Executor approvals.** An Executor `resume` call that accepts a paused run always asks in the same way. The prompt shows what the run is waiting for, such as `Executor run waiting for: Deploy to prod? · deploy.run({"env":"prod"})`. A run Caudra did not see pause shows as `Executor run <id>: not a run Caudra saw pause`. Caudra remembers the last 64 paused runs of each server.
+
+[YOLO mode](#yolo-mode) runs these calls without asking, as it runs every forced prompt. Recognition uses the name a server reports. A server that reports one of these names gains only its read-only tools in plan mode, and they still ask. Any other server's tools stay blocked in plan mode and in read-only agents, whatever annotations they carry.
 
 ## Shell parsing
 

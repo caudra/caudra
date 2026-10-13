@@ -344,6 +344,7 @@ pub const FILE_WRITE_TOOL_NAME: &str = "file_write";
 pub const IMAGE_GENERATE_TOOL_NAME: &str = "image_generate";
 /// The only backend `image_generate` can reach today.
 const OPENAI_PROVIDER_SLUG: &str = "openai";
+pub const MCP_RESOURCE_TOOL_NAME: &str = "mcp_resource";
 pub const MEMORY_TOOL_NAME: &str = "memory";
 pub const QUESTION_TOOL_NAME: &str = "question";
 pub const SHELL_TOOL_NAME: &str = "shell";

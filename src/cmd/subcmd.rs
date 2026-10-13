@@ -40,10 +40,11 @@ use caudra_providers::{
 use caudra_providers::{anthropic_auth, copilot_auth, dynamic, openai_auth, xai_auth};
 use caudra_storage::StateDir;
 use caudra_storage::auth::{
-    MAX_WORKCELL_BEARER_TOKEN_BYTES, ProviderAuth, ProviderCredentials, WorkcellCredential,
-    WorkcellCredentialName, delete_provider_credentials, delete_workcell_credential,
-    list_workcell_credentials, load_provider_credentials, save_provider_credentials,
-    save_workcell_credential, try_load_provider_auth,
+    MAX_WORKCELL_BEARER_TOKEN_BYTES, McpAuthData, ProviderAuth, ProviderCredentials,
+    WorkcellCredential, WorkcellCredentialName, delete_provider_credentials,
+    delete_workcell_credential, list_workcell_credentials, load_mcp_auth,
+    load_provider_credentials, save_mcp_auth, save_provider_credentials, save_workcell_credential,
+    try_load_provider_auth,
 };
 use caudra_storage::model::persist_model_for_every_mode;
 use caudra_storage::sessions::StoredMode;
@@ -1046,16 +1047,43 @@ pub fn mcp_auth(server: &str, storage: &StateDir, global_only: bool) -> Result<(
         };
         let resolved_addresses = mcp_config::resolve_url_addresses(&url)
             .map_err(|error| color_eyre::eyre::eyre!("cannot resolve MCP URL: {error}"))?;
-        mcp_oauth::authenticate(
-            server,
-            &url,
-            None,
-            storage,
-            mcp_oauth::Interaction::Cli,
-            oauth,
-            Some(&resolved_addresses),
-        )
-        .await?;
+        let authenticate = || {
+            mcp_oauth::authenticate(
+                server,
+                &url,
+                None,
+                storage,
+                mcp_oauth::Interaction::Cli,
+                oauth.clone(),
+                Some(&resolved_addresses),
+            )
+        };
+        let refused = async |data: &McpAuthData| match &data.tokens {
+            Some(tokens) => {
+                mcp_oauth::token_refused(&url, &tokens.access, Some(&resolved_addresses)).await
+            }
+            None => false,
+        };
+        let held_tokens =
+            load_mcp_auth(storage, server, &url).is_some_and(|data| data.tokens.is_some());
+        let data = authenticate().await?;
+        if refused(&data).await {
+            if !held_tokens {
+                bail!("MCP server '{server}': {}", mcp_oauth::REFUSED_ACCESS);
+            }
+            eprintln!("MCP server '{server}' refused the stored sign-in; signing in again");
+            save_mcp_auth(
+                storage,
+                server,
+                &McpAuthData {
+                    tokens: None,
+                    ..data
+                },
+            )?;
+            if refused(&authenticate().await?).await {
+                bail!("MCP server '{server}': {}", mcp_oauth::REFUSED_ACCESS);
+            }
+        }
         eprintln!("Successfully authenticated with MCP server '{server}'");
         Ok(())
     })

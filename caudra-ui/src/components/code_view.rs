@@ -14,6 +14,7 @@ use crate::provenance::LineProvenance;
 use crate::selection::wrap_breaks;
 use crate::theme;
 
+use super::mcp_card::McpCall;
 use super::tool_display::{
     ACTIVITY_BODY_PAD, ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, annotation_spans,
     append_annotation, batch_sigil_style, compact_args_for, header_spans, header_timeout,
@@ -41,7 +42,6 @@ use caudra_markdown::Source;
 use caudra_markdown::render::SpanSource;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use serde_json::Value;
 use syntect::parsing::SyntaxReference;
 use syntect::util::LinesWithEndings;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -1129,7 +1129,13 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
                 batch_sigil_style(entry.status, entry.output.as_ref()),
             ),
         ];
-        spans.extend(label_spans(&entry.tool, label, gap, t.tool_prefix));
+        spans.extend(label_spans(
+            &entry.tool,
+            label,
+            gap,
+            t.tool_prefix,
+            entry.output.as_ref(),
+        ));
         if !summary.is_empty() {
             spans.extend(header_spans(
                 &entry.tool,
@@ -2868,8 +2874,10 @@ pub(crate) fn render_instructions(
 pub struct Disclosure {
     /// The whole body rather than the tool's row budget.
     pub full: bool,
-    /// Shell only: the raw capture instead of the filtered text.
-    pub shell_raw: bool,
+    /// The body as it came rather than as Caudra draws it: a shell's capture
+    /// instead of its filtered text, an MCP answer as its data instead of
+    /// its card.
+    pub raw_view: bool,
 }
 
 /// The batch children the reader has asked to see whole, by their index in the
@@ -3638,8 +3646,13 @@ pub fn render_tool_content(
             (card.lines, false)
         }
         Some(ToolOutput::Mcp(output)) => {
-            let card =
-                mcp_card::render(None, None, false, Some(output), limits.budget, limits.width);
+            let card = mcp_card::render(
+                &McpCall::default(),
+                false,
+                Some(output),
+                limits.budget,
+                limits.width,
+            );
             output_links = card.links;
             (card.lines, card.truncated)
         }
@@ -3714,16 +3727,16 @@ pub fn render_tool_content(
     )
 }
 
-/// An MCP call's body: the script it ran, the rest of its arguments when
-/// `arguments` is given, then what came back. The script leads so its region
-/// sits where a highlight job, rendering the script alone, draws it.
-pub fn render_mcp_content(
+/// An MCP call's body: the script it ran, the rest of its arguments when the
+/// call says to show them, then what came back. The script leads so its
+/// region sits where a highlight job, rendering the script alone, draws it.
+/// The flag says whether the answer has a raw view to switch to.
+pub(crate) fn render_mcp_content(
     script: Option<&ToolInput>,
-    arguments: Option<&Value>,
-    script_key: Option<&str>,
+    call: &McpCall<'_>,
     output: Option<&McpOutput>,
     limits: &RenderLimits,
-) -> ToolContent {
+) -> (ToolContent, bool) {
     let mut lines = Vec::new();
     let mut highlights = Vec::new();
     let mut trace = SourceTrace::default();
@@ -3739,14 +3752,7 @@ pub fn render_mcp_content(
             &mut trace,
         );
     }
-    let card = mcp_card::render(
-        arguments,
-        script_key,
-        !lines.is_empty(),
-        output,
-        limits.budget,
-        limits.width,
-    );
+    let card = mcp_card::render(call, !lines.is_empty(), output, limits.budget, limits.width);
     // The card's rows name no source, and copying them as nothing is worse
     // than scraping them back.
     if !card.lines.is_empty() {
@@ -3756,7 +3762,7 @@ pub fn render_mcp_content(
     links.rows.extend(card.links.rows);
     lines.extend(card.lines);
     let source = trace.finish(&lines);
-    wrapped_content(
+    let content = wrapped_content(
         ToolContent {
             highlights,
             rows: vec![None; lines.len()],
@@ -3767,7 +3773,8 @@ pub fn render_mcp_content(
             source,
         },
         limits.width,
-    )
+    );
+    (content, card.has_raw_view)
 }
 
 /// The card, broken to the width it will be drawn at.

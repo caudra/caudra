@@ -149,7 +149,10 @@ use caudra_agent::permissions::{AutopilotNote, PermissionManager, PermissionPoli
 use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::tools::ToolAudience;
 use caudra_agent::tools::native::plan::{self, PlanTarget};
-use caudra_agent::types::{BACKGROUND_EVENT_RUN_ID, WorkflowProvenance};
+use caudra_agent::types::{
+    BACKGROUND_EVENT_RUN_ID, QUESTION_ACCEPTED_REPLY, QUESTION_DECLINED_REPLY,
+    QUESTION_DISMISSED_REPLY, QuestionEvent, WorkflowProvenance,
+};
 use caudra_agent::{
     AgentEvent, AgentInput, AgentMode, CommitRef, Envelope, GoalVerdict, HistorySnapshot,
     ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader, Mention, PromptAdmission,
@@ -260,8 +263,6 @@ const QUESTION_BLOCKER: &str = "Question requested";
 const AUTOPILOT_BLOCKER: &str = "Autopilot needs you";
 const AUTOPILOT_ENDED_NOTICE: &str = "Autopilot ended";
 const AUTOMATION_NOTICE_PREFIX: &str = "automation";
-/// Never valid JSON, so the tool reads it as the dismissal it is.
-const QUESTION_DISMISSED: &str = "dismissed";
 const LOGIN_BLOCKER: &str = "Provider login required";
 const MCP_TRUST_BLOCKER: &str = "MCP trust required";
 const PROJECT_PERMISSION_CONFIG_TRUST_BLOCKER: &str = "Project permission config trust required";
@@ -761,10 +762,13 @@ impl App {
         let typewriter = ui_config.typewriter_ms_per_char;
         let flash = ui_config.flash_duration();
         let status_bar = StatusBar::new(flash, &state.session.cwd, workspace_session.is_some());
-        let input_box = InputBox::new(
+        let mut input_box = InputBox::new(
             InputHistory::load(&storage, input_history_size),
             ui_config.max_input_lines,
         );
+        input_box.set_mcp_reader(mcp_reader.clone());
+        let mut mention_popup = MentionPopup::new();
+        mention_popup.set_mcp_reader(mcp_reader.clone());
         let subagent_input_box = InputBox::new(InputHistory::default(), ui_config.max_input_lines);
         let mut app = Self {
             chats: vec![Chat::new(
@@ -828,7 +832,7 @@ impl App {
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
-            mention_popup: MentionPopup::new(),
+            mention_popup,
             commit_popup: CommitPopup::new(),
             commit_reload: CommitReload::Idle,
             paste_editor: PasteEditor::new(),
@@ -1808,6 +1812,8 @@ impl App {
         let answered = matches!(
             action,
             QuestionFormAction::Submit(_)
+                | QuestionFormAction::Accept
+                | QuestionFormAction::Decline
                 | QuestionFormAction::Dismiss
                 | QuestionFormAction::Cancel
         );
@@ -1849,15 +1855,32 @@ impl App {
                     None => self.handle_cancel(),
                 };
             }
-            QuestionFormAction::Dismiss => QUESTION_DISMISSED.to_owned(),
-            QuestionFormAction::Submit(answers) => {
-                serde_json::to_string(&answers).unwrap_or_else(|_| QUESTION_DISMISSED.to_owned())
-            }
+            QuestionFormAction::Dismiss => QUESTION_DISMISSED_REPLY.to_owned(),
+            QuestionFormAction::Decline => QUESTION_DECLINED_REPLY.to_owned(),
+            QuestionFormAction::Accept => QUESTION_ACCEPTED_REPLY.to_owned(),
+            QuestionFormAction::Submit(answers) => serde_json::to_string(&answers)
+                .unwrap_or_else(|_| QUESTION_DISMISSED_REPLY.to_owned()),
         };
         self.question_form.close();
         let subagent = self.question_subagent.take();
         self.send_to_agent(subagent.as_deref(), reply);
         Vec::new()
+    }
+
+    /// Closes the form an agent withdrew, and only if it is the one on screen:
+    /// a later question from someone else must stay up for its own answer.
+    /// Nothing is sent back, since nothing waits for this form any more.
+    fn close_withdrawn_question(&mut self, envelope: &Envelope) {
+        let subagent = envelope.subagent.as_ref().map(|s| s.task_id.as_str());
+        let same_asker = self.question_subagent.as_deref() == subagent
+            && self.task_interactions.question.as_deref() == envelope.task.as_deref();
+        if !self.question_form.is_open() || !same_asker {
+            return;
+        }
+        self.discard_question_btw();
+        self.question_form.close();
+        self.question_subagent = None;
+        self.task_interactions.question = None;
     }
 
     fn send_answer(&self, answer: String) {
@@ -4669,6 +4692,10 @@ impl App {
         } else if matches!(envelope.event, AgentEvent::Question(_)) {
             self.task_interactions.question = None;
         }
+        if matches!(envelope.event, AgentEvent::QuestionClosed) {
+            self.close_withdrawn_question(&envelope);
+            return Vec::new();
+        }
         // Sent under their own run id, ahead of the stale-run filter: a run
         // outlives the turn that launched it and reports through every one
         // after it.
@@ -5427,7 +5454,8 @@ impl App {
         // answer channel, so the form remembers which chat asked.
         if let ChatEventResult::Question(event) = result {
             self.discard_question_btw();
-            self.question_form.open(event.questions);
+            let QuestionEvent { questions, source } = *event;
+            self.question_form.open(questions, source);
             self.question_subagent = subagent_id;
             return vec![];
         }
@@ -6180,9 +6208,12 @@ impl App {
         self.mcp_picker.set_config_errors(errors);
     }
 
-    /// Points the MCP picker and the palette's prompts at a restarted manager.
+    /// Points the MCP picker, the palette's prompts, and the composer's
+    /// resource mentions at a restarted manager.
     pub(crate) fn adopt_mcp_reader(&mut self, reader: McpSnapshotReader) {
         self.mcp_picker.set_reader(reader.clone());
+        self.input_box.set_mcp_reader(reader.clone());
+        self.mention_popup.set_mcp_reader(reader.clone());
         self.command_palette.set_mcp_reader(reader);
     }
 
@@ -6640,6 +6671,7 @@ impl App {
             | self.update_banner.poll(self.update_notice.latest())
             | self.tick_file_picker()
             | self.mention_popup.tick()
+            | self.command_palette.poll_completion()
             | self.commit_popup.tick()
             | self.refresh_session_picker()
             | self.poll_workflow_replies()

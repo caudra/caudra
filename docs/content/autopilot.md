@@ -85,6 +85,8 @@ With no one to answer, as in `-p`, the delegate still decides, and a prompt it l
 
 The delegate answers the `question` tool form, with one answer for each question. An answer may pick listed options or give its own text. The answer reaches the model marked as autopilot's, and it never counts as your requirement.
 
+The delegate also answers a form an MCP server shows during the main agent's tool call (see [Server questions](/docs/mcp/#server-questions)). It never answers a request to open a link, a form from Executor, a form with no fields, a form with a field that looks like a credential, or a form from a subagent's call. Those wait for you. The card lists each answer as autopilot's.
+
 When the assistant asks in prose instead, two steps run in order at the end of the turn:
 
 1. The [question-tool nudge](/docs/configuration/#question-tool-nudge) runs first, unchanged. When it fires, the assistant asks again through `question`, and the delegate answers the form.

@@ -442,10 +442,10 @@ pub(super) fn format_size(bytes: u64) -> String {
 }
 
 #[cfg(test)]
-pub(super) mod test_support {
+pub(crate) mod test_support {
     use super::{DynamicImage, ImageFormat, encode};
 
-    pub(in crate::tools) fn png(width: u32, height: u32) -> Vec<u8> {
+    pub(crate) fn png(width: u32, height: u32) -> Vec<u8> {
         encode(&DynamicImage::new_rgb8(width, height), ImageFormat::Png).unwrap()
     }
 

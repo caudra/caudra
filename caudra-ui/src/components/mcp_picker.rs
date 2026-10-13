@@ -3,8 +3,9 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
 use caudra_agent::mcp::config::McpConfigSource;
+use caudra_agent::mcp::oauth::REFUSED_ACCESS;
 use caudra_agent::{
-    McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader,
+    McpConfigErrors, McpServerInfo, McpServerKind, McpServerStatus, McpSnapshot, McpSnapshotReader,
 };
 use caudra_grab::grab_scope;
 
@@ -15,23 +16,51 @@ use crate::components::{Hint, Overlay, escape_terminal_controls};
 use crate::repaint::{Cadence, Dirty, Watch};
 
 const TITLE: &str = " MCP Servers ";
+const DETAIL_SEPARATOR: &str = " \u{00b7} ";
+const PROTOCOL_PREFIX: &str = "MCP ";
+const USES_PREFIX: &str = "Uses: ";
+const USES_SEPARATOR: &str = ", ";
+const USES_RESOURCES: &str = "resources";
+const USES_COMPLETIONS: &str = "completions";
+const USES_LIST_CHANGES: &str = "list changes";
+const INSTRUCTIONS_PREFIX: &str = "Instructions: ";
+/// Lines of a server's instructions the picker shows under it.
+const INSTRUCTIONS_PREVIEW_LINES: usize = 3;
+const NATIVE_ELICITATION_QUERY: &str = "elicitation_mode=native";
+const REFUSED_DETAIL: &str = "refused access \u{00b7} details below";
+const REFUSED_HEADING: &str = "Refused: ";
+const SWITCH_ACCOUNT_PREFIX: &str = "Run 'caudra mcp auth ";
+const SWITCH_ACCOUNT_SUFFIX: &str = "' to sign in with another account.";
+const EXECUTOR_NATIVE_HINT: &str = "Executor asks the model to approve its runs. Add ?elicitation_mode=native to the URL so Caudra asks you.";
 
 fn build_entries(infos: &[McpServerInfo]) -> (Vec<McpEntry>, Vec<bool>, Vec<bool>) {
     let entries = infos
         .iter()
         .map(|info| {
-            let trust_review =
-                (info.status == McpServerStatus::AwaitingTrust).then(|| review_text(info));
+            let info_text = match info.status {
+                McpServerStatus::AwaitingTrust => Some(review_text(info)),
+                McpServerStatus::Running => running_text(info),
+                McpServerStatus::Refused => Some(format!(
+                    "{REFUSED_HEADING}{REFUSED_ACCESS}.\n{SWITCH_ACCOUNT_PREFIX}{}{SWITCH_ACCOUNT_SUFFIX}",
+                    info.name
+                )),
+                _ => None,
+            };
             McpEntry {
                 name: info.name.clone(),
                 status: info.status.clone(),
-                review_text: trust_review,
+                info_text,
                 detail_text: match &info.status {
                     McpServerStatus::Connecting => {
                         format!("{} \u{00b7} connecting\u{2026}", info.transport_kind)
                     }
                     McpServerStatus::Running => {
-                        let mut parts = vec![info.transport_kind.to_string()];
+                        let mut parts: Vec<String> = info
+                            .kind
+                            .map(|kind| kind.label().to_owned())
+                            .into_iter()
+                            .collect();
+                        parts.push(info.transport_kind.to_string());
                         if info.tool_count > 0 {
                             parts.push(format!("{} tools", info.tool_count));
                         }
@@ -61,6 +90,9 @@ fn build_entries(infos: &[McpServerInfo]) -> (Vec<McpEntry>, Vec<bool>, Vec<bool
                             info.transport_kind, info.name
                         )
                     }
+                    McpServerStatus::Refused => {
+                        format!("{}{DETAIL_SEPARATOR}{REFUSED_DETAIL}", info.transport_kind)
+                    }
                 },
             }
         })
@@ -87,7 +119,7 @@ struct McpEntry {
     name: String,
     status: McpServerStatus,
     detail_text: String,
-    review_text: Option<String>,
+    info_text: Option<String>,
 }
 
 enum PendingConfirmation {
@@ -102,6 +134,10 @@ impl PickerItem for McpEntry {
 
     fn detail(&self) -> Option<&str> {
         Some(&self.detail_text)
+    }
+
+    fn info(&self) -> Option<&str> {
+        self.info_text.as_deref()
     }
 }
 
@@ -313,7 +349,7 @@ impl McpPicker {
         let review = self
             .picker
             .selected_item()
-            .and_then(|entry| entry.review_text.clone());
+            .and_then(|entry| entry.info_text.clone());
         self.picker.set_info_text(review);
     }
 
@@ -362,6 +398,66 @@ fn review_text(info: &McpServerInfo) -> String {
     format!(
         "Awaiting trust: no connection has been attempted.\nTarget {target}\nConfig: {source} · {config_path}\n{environment}\n{headers}"
     )
+}
+
+/// What a running server said about itself: who it is, the protocol, the
+/// features it offers, the start of its instructions, and for Executor in
+/// model mode, how to have it ask the user instead.
+fn running_text(info: &McpServerInfo) -> Option<String> {
+    let discovery = info.discovery.as_ref()?;
+    let server = &discovery.server_info;
+    let name = server.title.as_deref().unwrap_or(&server.name);
+    let mut identity: Vec<&str> = [name, server.version.as_str()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect();
+    let protocol = format!("{PROTOCOL_PREFIX}{}", discovery.protocol_version);
+    if !discovery.protocol_version.is_empty() {
+        identity.push(&protocol);
+    }
+    let mut lines = vec![escape_terminal_controls(&identity.join(DETAIL_SEPARATOR))];
+
+    let capabilities = &discovery.capabilities;
+    let lists_change = [
+        &capabilities.tools,
+        &capabilities.prompts,
+        &capabilities.resources,
+    ]
+    .into_iter()
+    .any(|list| list.as_ref().is_some_and(|list| list.list_changed));
+    let uses: Vec<&str> = [
+        (capabilities.resources.is_some(), USES_RESOURCES),
+        (capabilities.completions, USES_COMPLETIONS),
+        (lists_change, USES_LIST_CHANGES),
+    ]
+    .into_iter()
+    .filter_map(|(offered, feature)| offered.then_some(feature))
+    .collect();
+    if !uses.is_empty() {
+        lines.push(format!("{USES_PREFIX}{}", uses.join(USES_SEPARATOR)));
+    }
+
+    if let Some(instructions) = discovery.instructions.as_deref() {
+        let preview: Vec<String> = instructions
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .take(INSTRUCTIONS_PREVIEW_LINES)
+            .map(escape_terminal_controls)
+            .collect();
+        if !preview.is_empty() {
+            lines.push(format!("{INSTRUCTIONS_PREFIX}{}", preview.join("\n")));
+        }
+    }
+
+    let model_mode = info
+        .url
+        .as_deref()
+        .is_some_and(|url| !url.contains(NATIVE_ELICITATION_QUERY));
+    if info.kind == Some(McpServerKind::Executor) && model_mode {
+        lines.push(EXECUTOR_NATIVE_HINT.into());
+    }
+    Some(lines.join("\n"))
 }
 
 fn source_name(source: McpConfigSource) -> &'static str {
@@ -481,6 +577,9 @@ mod tests {
     use crate::components::key;
     use crate::components::keybindings::key as kb;
     use caudra_agent::mcp::config::{McpReviewSummary, load_config};
+    use caudra_agent::mcp::protocol::{
+        ListCapability, ServerCapabilities, ServerDiscovery, ServerInfo,
+    };
     use caudra_agent::{McpServerInfo, McpSnapshot};
     use caudra_config::PROJECT_DIR;
     use caudra_config::mcp::MCP_FILE;
@@ -511,6 +610,8 @@ mod tests {
                         environment_names: vec![],
                         header_names: vec![],
                     },
+                    kind: None,
+                    discovery: None,
                 },
                 McpServerInfo {
                     name: "github".into(),
@@ -529,9 +630,12 @@ mod tests {
                         environment_names: vec![],
                         header_names: vec![],
                     },
+                    kind: None,
+                    discovery: None,
                 },
             ],
             prompts: vec![],
+            resources: Vec::new(),
             pids: vec![],
             generation: 0,
         })
@@ -592,8 +696,11 @@ mod tests {
                     environment_names: vec!["GITHUB_TOKEN".into()],
                     header_names: vec!["Authorization".into()],
                 },
+                kind: None,
+                discovery: None,
             }],
             prompts: vec![],
+            resources: Vec::new(),
             pids: vec![],
             generation: 0,
         })
@@ -669,7 +776,7 @@ mod tests {
     fn awaiting_trust_review_is_safe_and_complete() {
         let snapshot = awaiting_trust_snapshot();
         let (entries, _, _) = build_entries(&snapshot.load().infos);
-        let detail = entries[0].review_text.as_deref().unwrap();
+        let detail = entries[0].info_text.as_deref().unwrap();
         assert!(detail.contains("command:"));
         assert!(detail.contains("Config: project · /project/.caudra/config.toml"));
         assert!(detail.contains("env: GITHUB_TOKEN"));
@@ -741,5 +848,151 @@ mod tests {
 
         assert_eq!(picker.refresh(), Dirty::YES);
         assert!(picker.has_awaiting_trust());
+    }
+
+    const SERVER_NAME: &str = "exec";
+    const EXECUTOR_URL: &str = "https://mcp.executor.sh/mcp";
+    const EXECUTOR_NATIVE_URL: &str = "https://mcp.executor.sh/mcp?elicitation_mode=native";
+    const SERVER_TITLE: &str = "Executor";
+    const SERVER_VERSION: &str = "1.4.2";
+    const PROTOCOL_VERSION: &str = "2025-11-25";
+    const INSTRUCTIONS: &str = "Search first.\n\nThen execute.\nThen resume.\nNever more.";
+
+    fn running(kind: Option<McpServerKind>, url: &str) -> McpServerInfo {
+        McpServerInfo {
+            name: SERVER_NAME.into(),
+            transport_kind: "http",
+            tool_count: 4,
+            prompt_count: 0,
+            status: McpServerStatus::Running,
+            config_path: PathBuf::from("/home/.config/caudra/mcp.toml"),
+            url: Some(url.into()),
+            oauth: None,
+            resolved_addresses: Vec::new(),
+            review: McpReviewSummary {
+                command: None,
+                url: Some(url.into()),
+                config_source: McpConfigSource::Global,
+                environment_names: vec![],
+                header_names: vec![],
+            },
+            kind,
+            discovery: Some(ServerDiscovery {
+                protocol_version: PROTOCOL_VERSION.into(),
+                server_info: ServerInfo {
+                    name: "executor".into(),
+                    title: Some(SERVER_TITLE.into()),
+                    version: SERVER_VERSION.into(),
+                },
+                capabilities: ServerCapabilities {
+                    tools: Some(ListCapability { list_changed: true }),
+                    completions: true,
+                    ..ServerCapabilities::default()
+                },
+                instructions: Some(INSTRUCTIONS.into()),
+                ..ServerDiscovery::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn a_running_server_shows_what_it_said_about_itself() {
+        let (entries, _, _) =
+            build_entries(&[running(Some(McpServerKind::Executor), EXECUTOR_URL)]);
+
+        assert!(
+            entries[0]
+                .detail_text
+                .starts_with(McpServerKind::Executor.label())
+        );
+        let info = entries[0].info_text.as_deref().unwrap();
+        let identity = format!(
+            "{SERVER_TITLE}{DETAIL_SEPARATOR}{SERVER_VERSION}{DETAIL_SEPARATOR}{PROTOCOL_PREFIX}{PROTOCOL_VERSION}"
+        );
+        assert!(info.starts_with(&identity), "{info}");
+        assert!(info.contains(&format!(
+            "{USES_PREFIX}{USES_COMPLETIONS}{USES_SEPARATOR}{USES_LIST_CHANGES}"
+        )));
+        assert!(
+            info.contains("Search first.\nThen execute.\nThen resume."),
+            "{info}"
+        );
+        assert!(!info.contains("Never more."));
+    }
+
+    #[test_case(Some(McpServerKind::Executor), EXECUTOR_URL, true ; "executor_in_model_mode")]
+    #[test_case(Some(McpServerKind::Executor), EXECUTOR_NATIVE_URL, false ; "executor_in_native_mode")]
+    #[test_case(None, EXECUTOR_URL, false ; "unrecognised_server")]
+    fn executor_in_model_mode_is_told_how_to_ask_the_user(
+        kind: Option<McpServerKind>,
+        url: &str,
+        hinted: bool,
+    ) {
+        let (entries, _, _) = build_entries(&[running(kind, url)]);
+
+        let info = entries[0].info_text.as_deref().unwrap();
+        assert_eq!(info.contains(EXECUTOR_NATIVE_HINT), hinted);
+    }
+
+    const STEADY_PICKER_MSG: &str =
+        "moving the selection must keep the popup and its rows where they were";
+    const QUIET_SERVER: &str = "quiet";
+
+    fn drawn(
+        picker: &mut McpPicker,
+        terminal: &mut Terminal<TestBackend>,
+    ) -> (Rect, Option<usize>) {
+        let mut popup = Rect::default();
+        terminal
+            .draw(|frame| popup = picker.view(frame, frame.area()))
+            .unwrap();
+        let row = buffer_text(terminal.backend().buffer())
+            .lines()
+            .position(|line| line.contains(QUIET_SERVER));
+        (popup, row)
+    }
+
+    #[test]
+    fn moving_between_servers_with_unequal_info_keeps_the_picker_still() {
+        let quiet = McpServerInfo {
+            name: QUIET_SERVER.into(),
+            status: McpServerStatus::Disabled,
+            discovery: None,
+            ..running(None, EXECUTOR_URL)
+        };
+        let reader = McpSnapshotReader::from_snapshot(McpSnapshot {
+            infos: vec![running(Some(McpServerKind::Executor), EXECUTOR_URL), quiet],
+            ..McpSnapshot::default()
+        });
+        let mut picker = McpPicker::new(reader, no_errors());
+        picker.open();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let first = drawn(&mut picker, &mut terminal);
+
+        picker.handle_key(key(KeyCode::Down));
+        let second = drawn(&mut picker, &mut terminal);
+
+        assert!(first.1.is_some(), "{STEADY_PICKER_MSG}");
+        assert_eq!(first, second, "{STEADY_PICKER_MSG}");
+        assert_eq!(picker.picker.selected_item().unwrap().name, QUIET_SERVER);
+    }
+
+    #[test]
+    fn a_refused_server_says_why_and_how_to_switch_accounts() {
+        let refused = McpServerInfo {
+            status: McpServerStatus::Refused,
+            discovery: None,
+            ..running(Some(McpServerKind::HomeAssistant), EXECUTOR_URL)
+        };
+
+        let (entries, enabled, toggleable) = build_entries(&[refused]);
+
+        assert!(entries[0].detail_text.ends_with(REFUSED_DETAIL));
+        let info = entries[0].info_text.as_deref().unwrap();
+        assert!(info.starts_with(&format!("{REFUSED_HEADING}{REFUSED_ACCESS}")));
+        assert!(info.contains(&format!(
+            "{SWITCH_ACCOUNT_PREFIX}{SERVER_NAME}{SWITCH_ACCOUNT_SUFFIX}"
+        )));
+        assert_eq!((enabled[0], toggleable[0]), (false, true));
     }
 }

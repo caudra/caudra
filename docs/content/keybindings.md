@@ -126,6 +126,7 @@ These keys work the same in every text field: the composer, a picker's filter, f
 |-----|--------|
 | `↑` / `↓` | Navigate options |
 | `F2` | Ask /btw about a pending main-agent question without answering it |
+| `F3` | Decline an MCP server's request |
 | `Enter` | Select option |
 | `Esc` | Close |
 

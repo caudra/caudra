@@ -12,7 +12,8 @@ use thiserror::Error;
 
 use super::CONFINED_READ_ATTRIBUTE;
 use super::command_pattern::{PatternFault, grade_command_pattern};
-use crate::tools::PermissionIntent;
+use crate::mcp::kind::McpCallFacts;
+use crate::tools::{PermissionIntent, PermissionScopes};
 
 pub use caudra_storage::permission_state::{
     PermissionArgumentConstraint, PermissionCapabilityFamily, PermissionExecutorKind,
@@ -59,7 +60,8 @@ pub(super) use options::BROAD_SHELL_PHRASE;
 use options::rule_options;
 pub use options::{
     COMMAND_EXACT_PREFIX, COMMAND_GROUP_PREFIX, COMMAND_PATTERN_PREFIX, COMMAND_TEMPLATE_PREFIX,
-    COMPOSABLE_SHELL_OPTIONS,
+    COMPOSABLE_SHELL_OPTIONS, MCP_SERVER_READS_OPTION, MCP_SERVER_RESOURCE,
+    READ_ONLY_MCP_TOOL_OPTION,
 };
 #[cfg(test)]
 use options::{
@@ -75,7 +77,7 @@ pub use resources::filesystem_permission_resource;
 use resources::filesystem_resource_flags;
 use resources::{
     GIT_METADATA_DIR, attribute_kind, exact_resource_constraints, legacy_authority_profile,
-    pinned_digest, remote_resource_identity, resource_constraint, resources_for,
+    mcp_tool_resource, pinned_digest, remote_resource_identity, resource_constraint, resources_for,
     reusable_remote_resource_constraint, risk_for, subject_and_executor,
 };
 
@@ -380,6 +382,8 @@ pub struct PermissionRequest {
     pub lifetime: PermissionLifetime,
     pub options: Vec<PermissionRuleOption>,
     pub presentation: PermissionPresentation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpCallFacts>,
 }
 /// What a rule set says about a request or one of its resources.
 ///
@@ -450,7 +454,7 @@ impl PermissionRequest {
         let resources = resources_for(&tool, &scopes, &input, cwd, force_prompt);
         let authority = legacy_authority_profile(&tool);
         Self::from_parts(
-            id, tool, scopes, input, cwd, subject, executor, risk, resources, &authority,
+            id, tool, scopes, input, cwd, subject, executor, risk, resources, &authority, None,
         )
     }
     pub fn from_intent(
@@ -484,6 +488,7 @@ impl PermissionRequest {
             intent.risk.clone(),
             intent.resources.clone(),
             &intent.authority,
+            intent.mcp.clone(),
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -498,6 +503,7 @@ impl PermissionRequest {
         risk: PermissionRisk,
         resources: Vec<PermissionResource>,
         authority: &PermissionAuthorityProfile,
+        mcp: Option<McpCallFacts>,
     ) -> Self {
         let input_digest = canonical_json_sha256(&input);
         let options = rule_options(
@@ -509,8 +515,9 @@ impl PermissionRequest {
             &input_digest,
             cwd,
             authority,
+            mcp.as_ref().is_some_and(|facts| facts.read_only),
         );
-        let presentation = presentation_for(&tool, &risk, &resources);
+        let presentation = presentation_for(&tool, &risk, &resources, mcp.as_ref());
         Self {
             id,
             tool,
@@ -524,7 +531,34 @@ impl PermissionRequest {
             lifetime: PermissionLifetime::Once,
             options,
             presentation,
+            mcp,
         }
+    }
+}
+/// The intent of a call to an MCP tool with `input`, whose one resource is
+/// the tool. A call its server says always asks is forced and Critical, a
+/// recognised server's read-only tool Low, and any other High.
+pub fn mcp_permission_intent(
+    tool: &ToolKey,
+    input: &Value,
+    facts: Option<McpCallFacts>,
+) -> PermissionIntent {
+    let scope = canonical_json(input);
+    let scopes = if facts.as_ref().is_some_and(McpCallFacts::always_asks) {
+        PermissionScopes::force_prompt(scope)
+    } else {
+        PermissionScopes::single(scope)
+    };
+    let risk = match &facts {
+        Some(facts) if facts.read_only && !scopes.force_prompt => PermissionRisk::Low,
+        _ => risk_for(tool, scopes.force_prompt),
+    };
+    PermissionIntent {
+        scopes,
+        resources: vec![mcp_tool_resource(tool)],
+        risk,
+        authority: legacy_authority_profile(tool),
+        mcp: facts,
     }
 }
 pub fn prepared_command_binding(resource_value: &str, input: &Value) -> String {

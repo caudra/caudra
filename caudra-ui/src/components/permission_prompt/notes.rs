@@ -18,6 +18,7 @@ const OUTSIDE_REPOSITORY: &str = "Outside this repository";
 const OUTSIDE_HOME: &str = "Outside your home directory";
 const OUTSIDE_PROJECT: &str = "Outside this project";
 const REMOTE_NOTE: &str = "Runs on a remote workspace";
+pub(super) const READ_ONLY_BADGE: &str = "read-only, as the server describes it";
 const WORKDIR_PREFIX: &str = "in ";
 const HOME_PREFIX: &str = "~";
 const READ_ONLY: &str = "read-only";
@@ -173,6 +174,15 @@ pub(super) fn is_shell(request: &PermissionRequest) -> bool {
         .any(|resource| resource.kind == PermissionResourceKind::Command)
 }
 
+/// Why a recognised MCP server's call always asks, as the server put it.
+pub(super) fn mcp_note(request: &PermissionRequest) -> Option<String> {
+    request
+        .mcp
+        .as_ref()
+        .and_then(|facts| facts.note.as_deref())
+        .map(review_text)
+}
+
 /// The literal request a prompt asks about: the command line with its own
 /// line breaks, the URL, the paths, or the tool and its arguments. A remote
 /// plan's reference means nothing to a person, so it is named by what it is.
@@ -218,6 +228,9 @@ impl PermissionPrompt {
         };
         let project = request.presentation.project.as_deref();
         let mut context = Vec::new();
+        if request.mcp.as_ref().is_some_and(|facts| facts.read_only) {
+            context.push(Note::muted(READ_ONLY_BADGE));
+        }
         let workdirs: BTreeSet<&str> = request
             .resources
             .iter()
@@ -252,6 +265,9 @@ impl PermissionPrompt {
             return Vec::new();
         };
         let mut notes = Vec::new();
+        if let Some(note) = mcp_note(request) {
+            notes.push(Note::warning(note));
+        }
         if let Some(opacity) = self.opacity() {
             notes.push(Note::warning(opacity.caution()));
         } else if request.resources.iter().any(|resource| resource.protected) {

@@ -47,6 +47,15 @@ pub(super) const URL_ORIGIN_OPTION_ID: &str = "allow_url_origin";
 
 pub(super) const EXACT_CALL_OPTION: &str = "allow_exact";
 
+pub const READ_ONLY_MCP_TOOL_OPTION: &str = "allow_read_only_mcp_tool";
+
+pub const MCP_SERVER_READS_OPTION: &str = "allow_mcp_server_reads";
+
+/// The custom resource kind naming an MCP server whose resources a call reads.
+pub const MCP_SERVER_RESOURCE: &str = "mcp_server";
+
+const MCP_SERVER_READS_PREFIX: &str = "reads from ";
+
 /// How many path prefixes a URL ladder offers below its origin. The rungs share
 /// one row, so this bounds the request a deep path serializes to rather than
 /// anything the prompt draws. Real paths stay well under it.
@@ -95,6 +104,8 @@ const ANY_PAGE_LABEL: &str = "any public web page";
 const EXACT_QUERY_LABEL: &str = "this exact search";
 const ANY_QUERY_LABEL: &str = "any search";
 const ANY_ARGUMENTS_LABEL: &str = "any arguments";
+const ANY_ARGUMENTS_SUFFIX: &str = " with any arguments";
+const ALWAYS_ALLOW_PREFIX: &str = "Always allow ";
 const EXACT_SEARCH_LABEL: &str = "this search";
 const EXACT_FILE_LABEL: &str = "this file";
 const EXACT_FOLDER_LABEL: &str = "this folder";
@@ -401,6 +412,7 @@ pub(super) fn rule_options(
     input_digest: &str,
     cwd: &Path,
     authority: &PermissionAuthorityProfile,
+    mcp_read_only: bool,
 ) -> Vec<PermissionRuleOption> {
     let exact_arguments = PermissionArgumentConstraint::Exact {
         digest: input_digest.into(),
@@ -799,7 +811,51 @@ pub(super) fn rule_options(
         &reusable,
         authority,
     );
-    if tool.is_mcp() {
+    // Reading the resources of the servers a call names earns the same: any
+    // URI from those servers, remembered as long as the user likes.
+    if !resources.is_empty()
+        && resources.iter().all(|resource| {
+            matches!(&resource.kind, PermissionResourceKind::Custom { name } if name == MCP_SERVER_RESOURCE)
+        })
+    {
+        let servers: Vec<String> = resources
+            .iter()
+            .map(|resource| safe_summary(&resource.value))
+            .collect();
+        let label = format!("{MCP_SERVER_READS_PREFIX}{}", servers.join(", "));
+        options.push(option(
+            MCP_SERVER_READS_OPTION,
+            &label,
+            &format!("{ALWAYS_ALLOW_PREFIX}{label}."),
+            StructuredPermissionEffect::Allow,
+            resource_constraints.clone(),
+            PermissionArgumentConstraint::Unconstrained,
+            reusable.clone(),
+            false,
+            false,
+            None,
+        ));
+    }
+    // A tool its recognised server calls read-only earns what a read does:
+    // any arguments, remembered as long as the user likes, without a typed
+    // confirmation.
+    if let ToolKey::McpTool { tool: name, .. } = tool
+        && mcp_read_only
+    {
+        let any_arguments = format!("{}{ANY_ARGUMENTS_SUFFIX}", safe_summary(name));
+        options.push(option(
+            READ_ONLY_MCP_TOOL_OPTION,
+            &any_arguments,
+            &format!("{ALWAYS_ALLOW_PREFIX}{any_arguments}."),
+            StructuredPermissionEffect::Allow,
+            resource_constraints,
+            PermissionArgumentConstraint::Unconstrained,
+            reusable.clone(),
+            false,
+            false,
+            None,
+        ));
+    } else if tool.is_mcp() {
         options.push(option(
             "allow_whole_mcp_tool_conversation",
             ANY_ARGUMENTS_LABEL,
@@ -1979,6 +2035,7 @@ mod browse_tests {
             &PermissionAuthorityProfile::Filesystem {
                 input_pointers: Vec::new(),
             },
+            false,
         );
         request
     }

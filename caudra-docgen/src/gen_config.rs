@@ -861,7 +861,8 @@ fn write_tool_output_section(out: &mut String) {
          whole. It is also a floor rather than a bound for anything drawn as a diff, since \
          a diff is already only the part that changed: an edit, a patch, and an overwrite \
          are drawn whole until they run long, and raising `write` past that point is what \
-         makes this number matter to them.\n"
+         makes this number matter to them. No entry reaches an MCP call's card, which \
+         opens with its arguments and its whole answer.\n"
     )
     .unwrap();
     writeln!(out, "| Field | Default | Tools |").unwrap();

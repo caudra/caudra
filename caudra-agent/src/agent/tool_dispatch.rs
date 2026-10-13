@@ -15,10 +15,12 @@ use crate::background::ShellJobMetadata;
 use crate::decisions::output_pointers::{self, OmittedOutput};
 use crate::decisions::shell_duration::{ShellCall, ShellDurationPlan};
 use crate::decisions::{DecisionFeature, NoteAnchor, NoteDraft, NoteOutcome, NoteSink, Screening};
+use crate::mcp::call::CallScope;
 use crate::mcp::output::MCP_SUMMARY_PREFIX;
 use crate::mcp::{McpSession, UNKNOWN_MCP};
 use crate::permissions::{
     PermissionAuthorityProfile, PermissionError, RemotePermissionIdentity, canonical_json,
+    mcp_permission_intent,
 };
 use crate::task_set::TaskSet;
 use crate::tools::json_repair::RepairError;
@@ -503,7 +505,8 @@ pub async fn run(
             || mcp.is_some_and(|mcp| mcp.has_tool(&mcp_name) && !mcp.is_disabled(&mcp_name)))
         && (!ctx.policy().is_read_only()
             || entry.is_some()
-            || local.is_some_and(|local| local.effect.is_safe_in_read_only()));
+            || local.is_some_and(|local| local.effect.is_safe_in_read_only())
+            || mcp.is_some_and(|mcp| mcp.is_read_only(&mcp_name)));
     let invalid = ctx.json_repair.invalid_input(&id);
     let repair = if eligible && invalid.is_some() {
         let schema = repair_schema(registry, mcp, canonical, ctx);
@@ -844,7 +847,9 @@ async fn run_inner(
             (None, Some(_)) => true,
             (None, None) => {
                 name == TOOL_SEARCH_TOOL_NAME && searchable(mcp, ctx)
-                    || !mcp.is_some_and(|mcp| mcp.has_tool(mcp_lookup))
+                    || !mcp.is_some_and(|mcp| {
+                        mcp.has_tool(mcp_lookup) && !mcp.is_read_only(mcp_lookup)
+                    })
             }
         };
         if !allowed {
@@ -1891,12 +1896,14 @@ async fn execute_mcp_tool(
     };
     let fail = |message: String| done(ToolOutput::Plain(message.into()));
 
-    if ctx.policy().is_read_only() {
+    let binding = ctx.mcp.as_ref().map(|mcp| mcp.bind_tool(tool_name));
+    let read_only = matches!(&binding, Some(Ok(binding)) if binding.read_only());
+    if ctx.policy().is_read_only() && !read_only {
         return fail(format!("{READ_ONLY_TOOL_RESTRICTED}: {tool_name}"))
             .with_failure(ToolFailure::Denied);
     }
 
-    if ctx.mode.is_planning() {
+    if ctx.mode.is_planning() && !read_only {
         return fail(MCP_BLOCKED_IN_PLAN.into()).with_failure(ToolFailure::Denied);
     }
 
@@ -1907,22 +1914,21 @@ async fn execute_mcp_tool(
                 .with_failure(ToolFailure::Other);
         }
     };
-    let perm_scope = canonical_json(input);
-    let perm_scopes = crate::tools::PermissionScopes::single(perm_scope);
-    let Some(mcp) = &ctx.mcp else {
+    let (Some(mcp), Some(binding)) = (&ctx.mcp, binding) else {
         return fail(format!("MCP manager not available for {tool_name}"))
             .with_failure(ToolFailure::Other);
     };
-    let binding = match mcp.bind_tool(tool_name) {
+    let binding = match binding {
         Ok(binding) => binding,
         Err(error) => return fail(error.to_string()).with_failure(error.failure()),
     };
+    let intent = mcp_permission_intent(&perm_tool, input, binding.call_facts(input));
 
     if let Err(e) = ctx
         .permissions
-        .enforce_with_identity(
+        .enforce_with_intent(
             &perm_tool,
-            &perm_scopes,
+            &intent,
             input,
             &ctx.event_tx,
             ctx.user_response_rx.as_deref(),
@@ -1954,11 +1960,39 @@ async fn execute_mcp_tool(
         Ok(recording) => recording,
         Err(message) => return fail(message).with_failure(ToolFailure::Other),
     };
-    let called = recording.around(ctx, binding.call(input)).await;
+    let scope = mcp_call_scope(ctx);
+    let called = recording.around(ctx, binding.call(input, &scope)).await;
     match called {
+        Ok(output) if output.is_error => {
+            let error = binding.reported_error(&output);
+            ToolDoneEvent {
+                model_output: Some(error.to_string()),
+                ..done(ToolOutput::Mcp(output))
+            }
+            .with_failure(error.failure())
+        }
         Ok(output) => done(ToolOutput::Mcp(output)),
-        Err(e) => fail(e.to_string()).with_failure(e.failure()),
+        Err(error) => {
+            let interactions = scope.take_interactions();
+            if !interactions.is_empty() {
+                warn!(
+                    tool = tool_name,
+                    %error,
+                    ?interactions,
+                    "MCP call failed after asking the user"
+                );
+            }
+            fail(error.to_string()).with_failure(error.failure())
+        }
     }
+}
+
+/// What an MCP tool call runs under: its progress reaches the call's card,
+/// the turn's cancel stops it, and a server's questions go to whoever the
+/// front end has answer them. Where nobody can, each one is declined.
+pub(crate) fn mcp_call_scope(ctx: &ToolContext) -> CallScope {
+    let elicitor = ctx.mcp.as_ref().and_then(|mcp| mcp.elicitor_for(ctx));
+    CallScope::new(elicitor, ctx.live_sink.clone(), ctx.cancel.clone())
 }
 
 /// Deduplicates doom-loop repeats, then runs remaining calls in parallel.
@@ -2290,6 +2324,12 @@ mod tests {
     const READ_TOOL: &str = "file_read";
     const PATCH_TOOL: &str = "file_apply_patch";
     const FETCH_ISSUE: &str = "fetch_issue";
+    const HOME_ASSISTANT_SERVER: &str = "home-assistant";
+    const LOOKALIKE_SERVER: &str = "home-assistant-ish";
+    const LOOKUP_MCP_TOOL: &str = "ha.lookup";
+    const LOOKUP_MCP_WIRE: &str = "ha__lookup";
+    const LOOKUP_RESULT: &str = "the kitchen light is on";
+    const MCP_PLAN_FILE: &str = "/tmp/caudra-plan.md";
     const REPEAT_GUIDANCE: &str = "Inspect the previous result before choosing another tool.";
     const MODEL_REPEAT_GUIDANCE: &str = "Use a different query for this model.";
     const REPEAT_TWO_PREFIX: &str =
@@ -2357,6 +2397,9 @@ mod tests {
     const RECORDED_LOCAL: &str = "recorded_local";
     const RECORDED_MCP: &str = "srv.fetch_issue";
     const RECORDED_MCP_CALL: &str = "srv__fetch_issue";
+    const MCP_ERROR_TEXT: &str = "issue tracker is down";
+    /// What the model read when an `isError` result failed the call.
+    const LEGACY_MCP_ERROR: &str = "server stub returned error -1: issue tracker is down";
     const DENIED_OPENS_NOTHING: &str = "a denied call must not open a record";
     const POINTER_REQUEST: &str = "fix the failed deploy";
     const POINTER_MARKER: &str = "deploy failed: missing signing key";
@@ -5398,6 +5441,71 @@ mod tests {
         });
     }
 
+    #[derive(Debug, PartialEq)]
+    enum McpVerdict {
+        Ran,
+        Asked,
+        Hidden,
+    }
+
+    /// A tool a recognised server annotates read-only stays callable in plan
+    /// mode and under a read-only policy, and still answers to the permission
+    /// mode there. Any other MCP tool stays out of reach, even in Yolo.
+    #[test_case(AgentMode::Plan(PathBuf::from(MCP_PLAN_FILE)), PermissionMode::Yolo, HOME_ASSISTANT_SERVER, true, McpVerdict::Ran ; "plan_runs_a_read_only_tool")]
+    #[test_case(AgentMode::ReadOnly, PermissionMode::Yolo, HOME_ASSISTANT_SERVER, true, McpVerdict::Ran ; "read_only_policy_runs_a_read_only_tool")]
+    #[test_case(AgentMode::Build, PermissionMode::Yolo, HOME_ASSISTANT_SERVER, true, McpVerdict::Ran ; "build_runs_a_read_only_tool")]
+    #[test_case(AgentMode::Plan(PathBuf::from(MCP_PLAN_FILE)), PermissionMode::Ask, HOME_ASSISTANT_SERVER, true, McpVerdict::Asked ; "ask_still_asks_in_plan_mode")]
+    #[test_case(AgentMode::ReadOnly, PermissionMode::Ask, HOME_ASSISTANT_SERVER, true, McpVerdict::Asked ; "ask_still_asks_under_a_read_only_policy")]
+    #[test_case(AgentMode::Plan(PathBuf::from(MCP_PLAN_FILE)), PermissionMode::Yolo, LOOKALIKE_SERVER, true, McpVerdict::Hidden ; "plan_hides_a_stranger_claiming_read_only")]
+    #[test_case(AgentMode::ReadOnly, PermissionMode::Yolo, LOOKALIKE_SERVER, true, McpVerdict::Hidden ; "read_only_policy_hides_a_stranger_claiming_read_only")]
+    #[test_case(AgentMode::Plan(PathBuf::from(MCP_PLAN_FILE)), PermissionMode::Yolo, HOME_ASSISTANT_SERVER, false, McpVerdict::Hidden ; "plan_hides_a_recognised_tool_that_writes")]
+    #[test_case(AgentMode::ReadOnly, PermissionMode::Yolo, HOME_ASSISTANT_SERVER, false, McpVerdict::Hidden ; "read_only_policy_hides_a_recognised_tool_that_writes")]
+    fn read_only_mcp_tools_reach_plan_and_read_only_modes(
+        mode: AgentMode,
+        permission_mode: PermissionMode,
+        server: &str,
+        annotated: bool,
+        expected: McpVerdict,
+    ) {
+        smol::block_on(async {
+            let mcp = crate::mcp::recognised_stub_session(
+                server,
+                &[(LOOKUP_MCP_TOOL, annotated)],
+                json!({"content": [{"type": "text", "text": LOOKUP_RESULT}]}),
+            );
+            let dir = TempDir::new().unwrap();
+            let permissions = Arc::new(PermissionManager::new_nonpersistent(
+                PermissionsConfig::default(),
+                dir.path().to_path_buf(),
+                Arc::default(),
+            ));
+            permissions.set_session_mode(Some(permission_mode));
+            let mut ctx = crate::tools::test_support::stub_ctx_with_permissions(&mode, permissions);
+            ctx.mcp = Some(mcp.clone());
+            let done = run(
+                ToolRegistry::global(),
+                Some(&mcp),
+                "t1".into(),
+                LOOKUP_MCP_WIRE,
+                &json!({}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            let text = done.output.as_text();
+            let verdict = if !done.is_error && text.contains(LOOKUP_RESULT) {
+                McpVerdict::Ran
+            } else if text.starts_with(PERMISSION_DENIED_PREFIX) {
+                McpVerdict::Asked
+            } else if text.contains(TOOL_DISABLED_SUFFIX) {
+                McpVerdict::Hidden
+            } else {
+                panic!("{text}");
+            };
+            assert_eq!(verdict, expected, "{text}");
+        });
+    }
+
     #[test]
     fn local_tool_named_tool_search_shadows_mcp_search() {
         smol::block_on(async {
@@ -6792,6 +6900,35 @@ mod tests {
                 changes.steps(),
                 [Step::Begin(RecordScope::Workspace), Step::Finish]
             );
+        });
+    }
+
+    #[test]
+    fn an_mcp_result_flagged_is_error_fails_the_call_but_keeps_its_output() {
+        smol::block_on(async {
+            let reply = json!({
+                "content": [{"type": "text", "text": MCP_ERROR_TEXT}],
+                "isError": true,
+            });
+            let mcp = crate::mcp::stub_session_replying(&[(RECORDED_MCP, "")], Some(reply));
+            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            ctx.mcp = Some(mcp.clone());
+
+            let done = run(
+                ToolRegistry::global(),
+                Some(&mcp),
+                RECORDED_MCP_CALL.into(),
+                RECORDED_MCP_CALL,
+                &json!({}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+
+            assert!(done.is_error);
+            assert_eq!(done.accounting.outcome, Some(ToolFailure::Other.into()));
+            assert!(matches!(&done.output, ToolOutput::Mcp(output) if output.is_error));
+            assert_eq!(done.composed_model_output(), LEGACY_MCP_ERROR);
         });
     }
 

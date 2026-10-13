@@ -18,12 +18,17 @@ use caudra_providers::{ImageMediaType, Message};
 use caudra_workspace::{ReadTextRequest, ResourceKind, ResourceSelector, TextRange, WorkspacePath};
 use serde_json::json;
 
-use crate::mentions::{Mention, MentionTarget};
+use super::tool_dispatch::mcp_call_scope;
+use crate::mcp::resources::ResourceContents;
+use crate::mentions::{Mention, MentionTarget, ResourceMention};
 use crate::remote_project_context::RemoteProjectContext;
 use crate::tools::image_bytes;
 use crate::tools::{ToolContext, ToolRegistry};
 
 const READ_TOOL: &str = "file_read";
+const RESOURCE_CLOSE: &str = "</resource>";
+const RESOURCE_TRUNCATED: &str = "\n[resource truncated: this turn's mention budget ran out]";
+const NO_MCP_ERROR: &str = "not inlined: MCP is not running in this session";
 /// Total inlined bytes one turn may spend across every kind of attachment. One
 /// ceiling rather than one per kind, so a prompt that mixes files and commits
 /// cannot quietly spend twice what either alone is allowed.
@@ -68,8 +73,12 @@ pub async fn build(
 }
 
 async fn resolve(mention: &Mention, resolution: &Resolution<'_>, budget: &mut usize) -> Message {
-    if matches!(mention.target, MentionTarget::Remote(_)) {
-        return resolve_remote(mention, resolution, budget).await;
+    match &mention.target {
+        MentionTarget::Remote(_) => return resolve_remote(mention, resolution, budget).await,
+        MentionTarget::Resource(resource) => {
+            return resolve_resource(mention, resource, resolution, budget).await;
+        }
+        MentionTarget::Local(_) => {}
     }
     let Some(path) = mention.local_path() else {
         return note(mention, "not inlined: invalid client-local attachment");
@@ -234,6 +243,79 @@ async fn resolve_remote(
     ))
 }
 
+/// Reads the resource through the session's MCP, so a server that asks the
+/// user something first is answered the way a tool call's would be.
+async fn resolve_resource(
+    mention: &Mention,
+    resource: &ResourceMention,
+    resolution: &Resolution<'_>,
+    budget: &mut usize,
+) -> Message {
+    if *budget == 0 {
+        return note(mention, BUDGET_ERROR);
+    }
+    let context = resolution.whole_file;
+    let Some(mcp) = context.mcp.as_ref() else {
+        return note(mention, NO_MCP_ERROR);
+    };
+    match mcp
+        .read_resource(&resource.server, &resource.uri, &mcp_call_scope(context))
+        .await
+    {
+        Ok(contents) => attach_resource(mention, &contents, resolution.vision, budget),
+        Err(error) => note(mention, &format!("not inlined: {error}")),
+    }
+}
+
+/// Text inline, cut to what is left of the budget. An image becomes an image
+/// block when the model can see one, outside the budget as file images are.
+/// Any other blob is named by its type and size.
+fn attach_resource(
+    mention: &Mention,
+    contents: &[ResourceContents],
+    vision: bool,
+    budget: &mut usize,
+) -> Message {
+    let mut body = Vec::with_capacity(contents.len());
+    let mut images = Vec::new();
+    for content in contents {
+        if let Some(text) = &content.text {
+            let kept = text.floor_char_boundary(*budget);
+            *budget -= kept;
+            body.push(match kept < text.len() {
+                true => format!("{}{RESOURCE_TRUNCATED}", &text[..kept]),
+                false => text.clone(),
+            });
+            continue;
+        }
+        let Some(label) = content.blob_label() else {
+            continue;
+        };
+        if !content.is_image() {
+            body.push(label);
+        } else if !vision {
+            body.push(format!("{label} {NO_VISION_ERROR}"));
+        } else {
+            match content.image() {
+                Ok(source) => {
+                    images.push(source);
+                    body.push(label);
+                }
+                Err(error) => body.push(format!("{label} not inlined: {error}")),
+            }
+        }
+    }
+    let text = format!(
+        "{}\n{}\n{RESOURCE_CLOSE}",
+        open_tag(mention),
+        body.join("\n")
+    );
+    match images.is_empty() {
+        true => Message::mention(text),
+        false => Message::user_display_with_images(text, String::new(), images),
+    }
+}
+
 async fn remote_image(
     mention: &Mention,
     resolution: &Resolution<'_>,
@@ -281,6 +363,12 @@ fn image(mention: &Mention, root: &Path, vision: bool) -> Message {
 }
 
 fn open_tag(mention: &Mention) -> String {
+    if let Some(resource) = mention.resource_target() {
+        return format!(
+            "<resource server=\"{}\" uri=\"{}\">",
+            resource.server, resource.uri
+        );
+    }
     let path = mention.display_path();
     match &mention.lines {
         Some(lines) => format!(
@@ -327,9 +415,25 @@ fn is_image_name(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AgentMode;
+    use crate::mcp::resources::ResourceLists;
+    use crate::mcp::{McpSession, resource_stub_session};
+    use crate::tools::image_bytes::test_support::png;
+    use crate::tools::test_support::stub_ctx;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
     use caudra_providers::ContentBlock;
     use std::path::PathBuf;
     use test_case::test_case;
+
+    const SERVER: &str = "stub";
+    const GUIDE_URI: &str = "mem://guide";
+    const GUIDE_TEXT: &str = "how to begin";
+    const GUIDE_TAG: &str = "<resource server=\"stub\" uri=\"mem://guide\">";
+    const PNG_MIME: &str = "image/png";
+    const PDF_MIME: &str = "application/pdf";
+    const PDF_LABEL: &str = "[blob: application/pdf, 4 bytes]";
+    const CUT_AT: usize = 3;
 
     /// Whether a resolved message carries an image the provider will be sent.
     fn has_image(message: &Message) -> bool {
@@ -383,6 +487,123 @@ mod tests {
         let message = image(&Mention::new("shot.png", None), Path::new("."), false);
         assert!(text_of(&message).contains(NO_VISION_ERROR));
         assert!(!has_image(&message));
+    }
+
+    fn guide() -> Mention {
+        Mention::resource(SERVER, GUIDE_URI)
+    }
+
+    fn text_contents() -> ResourceContents {
+        ResourceContents {
+            uri: GUIDE_URI.into(),
+            text: Some(GUIDE_TEXT.into()),
+            ..Default::default()
+        }
+    }
+
+    fn blob_contents(mime_type: &str, bytes: &[u8]) -> ResourceContents {
+        ResourceContents {
+            uri: GUIDE_URI.into(),
+            mime_type: Some(mime_type.into()),
+            blob: Some(BASE64.encode(bytes)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_resource_text_is_inlined_under_its_tag() {
+        let mut budget = MAX_TOTAL_BYTES;
+        let message = attach_resource(&guide(), &[text_contents()], false, &mut budget);
+        assert_eq!(
+            text_of(&message),
+            format!("{GUIDE_TAG}\n{GUIDE_TEXT}\n{RESOURCE_CLOSE}")
+        );
+        assert_eq!(budget, MAX_TOTAL_BYTES - GUIDE_TEXT.len());
+    }
+
+    #[test]
+    fn a_resource_text_is_cut_where_the_budget_runs_out() {
+        let mut budget = CUT_AT;
+        let message = attach_resource(&guide(), &[text_contents()], false, &mut budget);
+        assert!(
+            text_of(&message).contains(&format!("{}{RESOURCE_TRUNCATED}", &GUIDE_TEXT[..CUT_AT])),
+            "{}",
+            text_of(&message)
+        );
+        assert_eq!(budget, 0);
+    }
+
+    #[test_case(true ; "vision")]
+    #[test_case(false ; "no_vision")]
+    fn an_image_resource_is_an_image_block_only_for_a_vision_model(vision: bool) {
+        let mut budget = MAX_TOTAL_BYTES;
+        let message = attach_resource(
+            &guide(),
+            &[blob_contents(PNG_MIME, &png(4, 3))],
+            vision,
+            &mut budget,
+        );
+        assert_eq!(has_image(&message), vision);
+        assert_eq!(text_of(&message).contains(NO_VISION_ERROR), !vision);
+        assert_eq!(budget, MAX_TOTAL_BYTES);
+    }
+
+    #[test]
+    fn another_blob_is_named_by_its_type_and_size() {
+        let mut budget = MAX_TOTAL_BYTES;
+        let message = attach_resource(
+            &guide(),
+            &[blob_contents(PDF_MIME, b"%PDF")],
+            true,
+            &mut budget,
+        );
+        assert!(
+            text_of(&message).contains(PDF_LABEL),
+            "{}",
+            text_of(&message)
+        );
+        assert!(!has_image(&message));
+    }
+
+    fn resolve_guide(mcp: Option<McpSession>, mut budget: usize) -> String {
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.mcp = mcp;
+        let messages = smol::block_on(build(
+            &[guide()],
+            Resolution {
+                root: Path::new("."),
+                registry: &ctx.registry,
+                whole_file: &ctx,
+                slice: &ctx,
+                vision: false,
+                remote_context: None,
+            },
+            &mut budget,
+        ));
+        text_of(&messages[0])
+    }
+
+    fn guide_server() -> McpSession {
+        resource_stub_session(
+            ResourceLists::default(),
+            json!({"contents": [{"uri": GUIDE_URI, "text": GUIDE_TEXT}]}),
+        )
+    }
+
+    #[test]
+    fn a_resource_mention_is_read_from_its_server() {
+        assert_eq!(
+            resolve_guide(Some(guide_server()), MAX_TOTAL_BYTES),
+            format!("{GUIDE_TAG}\n{GUIDE_TEXT}\n{RESOURCE_CLOSE}")
+        );
+    }
+
+    #[test_case(Some(guide_server()), 0, BUDGET_ERROR ; "budget_spent")]
+    #[test_case(None, MAX_TOTAL_BYTES, NO_MCP_ERROR ; "no_mcp")]
+    fn an_unread_resource_mention_says_why(mcp: Option<McpSession>, budget: usize, error: &str) {
+        let text = resolve_guide(mcp, budget);
+        assert!(text.starts_with(GUIDE_TAG.trim_end_matches('>')), "{text}");
+        assert!(text.contains(error), "{text}");
     }
 
     #[test]

@@ -2,7 +2,7 @@ use super::{DisplayMessage, ToolProgress, ToolStatus, escape_terminal_controls, 
 
 use super::code_view;
 use super::command_text::{command_spans, overlay};
-use super::mcp_card::{OUTPUT_DIVIDER as CODE_OUTPUT_DIVIDER, script_argument};
+use super::mcp_card::{McpCall, OUTPUT_DIVIDER as CODE_OUTPUT_DIVIDER, script_argument};
 use super::status_bar::collapse_home;
 use crate::animation::{live_elapsed, spinner_frame, spinner_str};
 use crate::chat::batch_child_id;
@@ -306,9 +306,11 @@ const ACTIVITY_BODY_INDENT: &str = "  │ ";
 pub(crate) const FOLLOWING: &str = "following";
 pub(crate) const PAUSED: &str = "paused";
 const RESUME_HINT: &str = " · click to follow";
-const SCROLL_FOOTER_SEPARATOR: &str = " · ";
+const FOOTER_SEPARATOR: &str = " · ";
 pub const RAW_AFFORDANCE: &str = "click for raw";
 pub const FILTERED_AFFORDANCE: &str = "click for filtered";
+pub const CARD_AFFORDANCE: &str = "click for the card";
+const RAW_VIEW_LABEL: &str = "raw";
 const COMPACT_LOAD_PREFIX: &str = "↳ Loaded ";
 const COMPACT_FALLBACK_SIGIL: char = '⚙';
 const COMPACT_ARG_LIMIT: usize = 3;
@@ -650,10 +652,7 @@ pub(crate) fn scroll_footer_text(above: usize, below: usize, tail: ScrollTail) -
         (ScrollTail::Resumable, _) => parts.push(format!("{PAUSED}{RESUME_HINT}")),
         (ScrollTail::Live, _) => parts.push(PAUSED.to_owned()),
     }
-    Some(format!(
-        "{NOTICE_PREFIX}{}",
-        parts.join(SCROLL_FOOTER_SEPARATOR)
-    ))
+    Some(format!("{NOTICE_PREFIX}{}", parts.join(FOOTER_SEPARATOR)))
 }
 
 fn compact_tool(name: &str) -> Option<&'static CompactTool> {
@@ -887,16 +886,32 @@ fn is_mcp_call(tool: &str, header: &str, output: Option<&ToolOutput>) -> bool {
 
 /// A title's label, followed by `gap`. A tool the table has never heard of is
 /// labelled with its own name, and an MCP one's names its server apart from
-/// its tool, dimmed, so `executor › execute` reads as the tool it is.
-pub(super) fn label_spans(tool: &str, label: &str, gap: &str, style: Style) -> Vec<Span<'static>> {
+/// its tool, dimmed, so `executor › execute` reads as the tool it is. The
+/// title the server gave the tool, when its answer carries one, stands in for
+/// the tool's name.
+pub(super) fn label_spans(
+    tool: &str,
+    label: &str,
+    gap: &str,
+    style: Style,
+    output: Option<&ToolOutput>,
+) -> Vec<Span<'static>> {
     match mcp_tool_parts(tool).filter(|_| label == tool && compact_tool(tool).is_none()) {
-        Some((server, name)) => vec![
-            Span::styled(
-                format!("{server}{MCP_LABEL_SEPARATOR}"),
-                theme::current().tool_dim,
-            ),
-            Span::styled(format!("{name}{gap}"), style),
-        ],
+        Some((server, name)) => {
+            let name = match output {
+                Some(ToolOutput::Mcp(McpOutput {
+                    title: Some(title), ..
+                })) if !title.trim().is_empty() => escape_terminal_controls(&one_line(title)),
+                _ => name.to_owned(),
+            };
+            vec![
+                Span::styled(
+                    format!("{server}{MCP_LABEL_SEPARATOR}"),
+                    theme::current().tool_dim,
+                ),
+                Span::styled(format!("{name}{gap}"), style),
+            ]
+        }
         None => vec![Span::styled(format!("{label}{gap}"), style)],
     }
 }
@@ -1344,7 +1359,7 @@ pub struct ToolLines {
     /// Snapshot lines the card's window left above its first drawn row, so a
     /// click still names the buffer line it landed on.
     pub snapshot_skip: usize,
-    pub shell_toggle_line: Option<usize>,
+    pub raw_toggle_line: Option<usize>,
     /// The scroll card's footer, which re-pins the window to the tail.
     pub scroll_footer_line: Option<usize>,
     /// Every window drawn in these lines, the card's own and each scrolling
@@ -1641,6 +1656,7 @@ impl Indicator {
                     _ => Self::Warning,
                 }
             }
+            (Self::Success, Some(ToolOutput::Mcp(output))) if output.is_error => Self::Error,
             (Self::Success, Some(output)) if found_nothing(output) => Self::Warning,
             (indicator, _) => indicator,
         }
@@ -1767,7 +1783,7 @@ fn resolve_output<'a>(
     live_output: Option<&'a str>,
     pre_truncated: usize,
     limits: RenderLimits,
-    shell_raw: bool,
+    raw_view: bool,
 ) -> ResolvedOutput<'a> {
     let full_text: Option<Cow<'a, str>> = match output {
         Some(ToolOutput::Plain(t) | ToolOutput::Markdown(t) | ToolOutput::ReadDir(t)) => {
@@ -1778,7 +1794,7 @@ fn resolve_output<'a>(
         Some(ToolOutput::Batch { entries, text }) if entries.is_empty() => {
             Some(Cow::Borrowed(text.as_str()))
         }
-        Some(ToolOutput::Shell(output)) => Some(if output.filter.is_some() && !shell_raw {
+        Some(ToolOutput::Shell(output)) => Some(if output.filter.is_some() && !raw_view {
             Cow::Borrowed(output.model_text.as_str())
         } else {
             match live_output {
@@ -1862,7 +1878,7 @@ struct ToolLineBuilder {
     spinner_lines: Vec<(usize, usize)>,
     snapshot_base: Option<usize>,
     snapshot_skip: usize,
-    shell_toggle_line: Option<usize>,
+    raw_toggle_line: Option<usize>,
     scroll_footer_line: Option<usize>,
     scroll_spans: Vec<ScrollSpan>,
     highlights: Vec<HighlightRegion>,
@@ -1900,7 +1916,7 @@ impl ToolLineBuilder {
             spinner_lines: Vec::new(),
             snapshot_base: None,
             snapshot_skip: 0,
-            shell_toggle_line: None,
+            raw_toggle_line: None,
             scroll_footer_line: None,
             scroll_spans: Vec::new(),
             highlights: Vec::new(),
@@ -1939,7 +1955,7 @@ impl ToolLineBuilder {
         // An omitted header leaves the label against the annotation, so the
         // separator goes with the text it separates.
         let gap = if header.is_empty() { "" } else { " " };
-        let mut spans = label_spans(tool_name, label, gap, theme::current().tool_prefix);
+        let mut spans = label_spans(tool_name, label, gap, theme::current().tool_prefix, output);
         let mut copy = format!("{}{header}", spans_text(&spans));
         if let Some(snapshot) = render_header {
             if let Some(first_line) = snapshot.lines.first() {
@@ -1989,7 +2005,7 @@ impl ToolLineBuilder {
         self.sigil = sigil;
 
         let gap = if header.is_empty() { "" } else { " " };
-        let mut spans = label_spans(tool_name, label, gap, theme::current().tool_prefix);
+        let mut spans = label_spans(tool_name, label, gap, theme::current().tool_prefix, output);
         let mut copy = format!("{}{header}", spans_text(&spans));
         spans.extend(header_spans(
             tool_name,
@@ -2157,10 +2173,10 @@ impl ToolLineBuilder {
         };
         self.link_rows.retain_mut(|(line, _)| keep_row(line));
         self.spinner_lines.retain_mut(|(line, _)| keep_row(line));
-        self.shell_toggle_line = self
-            .shell_toggle_line
+        self.raw_toggle_line = self
+            .raw_toggle_line
             .filter(|line| (start..end).contains(line));
-        self.shell_toggle_line = self.shell_toggle_line.map(|line| line - above);
+        self.raw_toggle_line = self.raw_toggle_line.map(|line| line - above);
         if let Some(base) = self.snapshot_base {
             self.snapshot_skip += start.saturating_sub(base);
             self.snapshot_base =
@@ -2210,25 +2226,37 @@ impl ToolLineBuilder {
         self.push_content(content);
     }
 
-    /// An MCP call's body: its script, then `arguments` when given, then
-    /// what came back.
+    /// An MCP call's body: its script, then its arguments when the call says
+    /// to show them, then what came back.
     fn push_mcp_card(
         &mut self,
         script: Option<&ToolInput>,
-        arguments: Option<&Value>,
-        script_key: Option<&str>,
+        call: &McpCall<'_>,
         output: Option<&McpOutput>,
     ) {
-        self.push_content(code_view::render_mcp_content(
-            script,
-            arguments,
-            script_key,
-            output,
-            &self.limits,
-        ));
+        let (content, has_raw_view) =
+            code_view::render_mcp_content(script, call, output, &self.limits);
+        self.push_content(content);
+        if has_raw_view {
+            self.push_mcp_raw_toggle(call.raw);
+        }
         if let Some(output) = output {
             self.push_search_text(&output.display_text());
         }
+    }
+
+    /// The switch between an MCP answer's card and its data, on a row of its
+    /// own that the hit test finds by its affordance.
+    fn push_mcp_raw_toggle(&mut self, raw: bool) {
+        let label = match raw {
+            true => format!("{RAW_VIEW_LABEL}{FOOTER_SEPARATOR}{CARD_AFFORDANCE}"),
+            false => RAW_AFFORDANCE.to_owned(),
+        };
+        self.raw_toggle_line = Some(self.lines.len());
+        self.lines.push(Line::from(Span::styled(
+            format!("{}{label}", self.body_indent),
+            theme::current().tool_dim,
+        )));
     }
 
     fn push_content(&mut self, content: ToolContent) {
@@ -2417,11 +2445,11 @@ impl ToolLineBuilder {
     /// redraw frames rendering absorbed. Rendering is decoding rather than
     /// filtering, so a command can collapse redraws without being filtered at
     /// all, and then there is nothing to toggle to.
-    fn push_shell_footer(&mut self, output: &ShellOutput, shell_raw: bool) {
+    fn push_shell_footer(&mut self, output: &ShellOutput, raw_view: bool) {
         let redraws = output.redraws_collapsed();
         let mut parts: Vec<String> = Vec::new();
         if let Some(filter) = &output.filter {
-            if shell_raw {
+            if raw_view {
                 parts.push("raw output".into());
             } else {
                 let saved = filter
@@ -2444,16 +2472,16 @@ impl ToolLineBuilder {
         // Only a filtered result has a second view, and the hit test finds the
         // row by its affordance, so a line without one must not claim it.
         if output.filter.is_some() {
-            let affordance = if shell_raw {
+            let affordance = if raw_view {
                 FILTERED_AFFORDANCE
             } else {
                 RAW_AFFORDANCE
             };
             parts.push(affordance.to_owned());
-            self.shell_toggle_line = Some(self.lines.len());
+            self.raw_toggle_line = Some(self.lines.len());
         }
         self.lines.push(Line::from(Span::styled(
-            format!("{}{}", self.body_indent, parts.join(" · ")),
+            format!("{}{}", self.body_indent, parts.join(FOOTER_SEPARATOR)),
             theme::current().tool_dim,
         )));
     }
@@ -2585,7 +2613,7 @@ impl ToolLineBuilder {
                 .collect(),
             snapshot_base: self.snapshot_base.map(|line| wrapped.row_of(line)),
             snapshot_skip: self.snapshot_skip,
-            shell_toggle_line: self.shell_toggle_line.map(|line| wrapped.row_of(line)),
+            raw_toggle_line: self.raw_toggle_line.map(|line| wrapped.row_of(line)),
             scroll_footer_line: self.scroll_footer_line.map(|line| wrapped.row_of(line)),
             scroll_spans: self
                 .scroll_spans
@@ -2997,10 +3025,13 @@ pub fn build_tool_lines(
         // reader who opened the card whole, or while there is no answer.
         None if mcp_call => b.push_mcp_card(
             script_input.as_deref(),
-            msg.tool_raw_input
-                .as_deref()
-                .filter(|_| expanded.full || b.is_in_progress()),
-            script.as_ref().map(|script| script.key.as_str()),
+            &McpCall {
+                tool: tool_name,
+                arguments: msg.tool_raw_input.as_deref(),
+                show_arguments: expanded.full || b.is_in_progress(),
+                script_key: script.as_ref().map(|script| script.key.as_str()),
+                raw: expanded.raw_view,
+            },
             match msg.tool_output.as_deref() {
                 Some(ToolOutput::Mcp(output)) => Some(output),
                 _ => None,
@@ -3062,7 +3093,7 @@ pub fn build_tool_lines(
             msg.live_output.as_deref(),
             msg.truncated_lines,
             output_limits,
-            expanded.shell_raw,
+            expanded.raw_view,
         );
         if repeats_tool(tool_name, header) {
             resolved.prefer_json();
@@ -3074,7 +3105,7 @@ pub fn build_tool_lines(
         b.push_resolved_output(&resolved);
     }
     if let Some(ToolOutput::Shell(output)) = msg.tool_output.as_deref() {
-        b.push_shell_footer(output, expanded.shell_raw);
+        b.push_shell_footer(output, expanded.raw_view);
     }
     if let Some((progress, first, window)) = progress_body {
         b.push_progress_body(progress, first, window);
@@ -3332,7 +3363,7 @@ fn compact_instruction_lines(blocks: &[InstructionBlock]) -> ToolLines {
         spinner_lines: Vec::new(),
         snapshot_base: None,
         snapshot_skip: 0,
-        shell_toggle_line: None,
+        raw_toggle_line: None,
         scroll_footer_line: None,
         scroll_spans: Vec::new(),
         content_indent: TOOL_BODY_INDENT,
@@ -3362,9 +3393,9 @@ mod tests {
         SKILL_TOOL_NAME, TASK_TOOL_NAME, ToolEffect,
     };
     use caudra_agent::{
-        BatchToolEntry, BatchToolStatus, GrepFileEntry, GrepMatchGroup, McpBlock, ShellFilterInfo,
-        SkillOutput, SnapshotLine, SnapshotSpan, SubagentActivity, TextOutput, ToolInput,
-        ToolOutput,
+        BatchToolEntry, BatchToolStatus, GrepFileEntry, GrepMatchGroup, McpBlock, McpServerKind,
+        ShellFilterInfo, SkillOutput, SnapshotLine, SnapshotSpan, SubagentActivity, TextOutput,
+        ToolInput, ToolOutput,
     };
     use std::time::Duration;
     use test_case::test_case;
@@ -3440,7 +3471,7 @@ mod tests {
     fn exp(full: bool) -> Disclosure {
         Disclosure {
             full,
-            shell_raw: false,
+            raw_view: false,
         }
     }
 
@@ -4678,7 +4709,7 @@ mod tests {
             ToolStatus::Success,
             &test_rctx(80),
             Some(Disclosure {
-                shell_raw: true,
+                raw_view: true,
                 ..Disclosure::default()
             }),
         );
@@ -4688,7 +4719,7 @@ mod tests {
             &test_rctx(80),
             Some(Disclosure {
                 full: true,
-                shell_raw: true,
+                raw_view: true,
             }),
         );
         let collapsed_text = lines_text(&collapsed);
@@ -4700,7 +4731,7 @@ mod tests {
             collapsed_text.contains("filtered · cargo, progress · 80% smaller · click for raw")
         );
         assert!(collapsed.truncation);
-        assert!(collapsed.shell_toggle_line.is_some());
+        assert!(collapsed.raw_toggle_line.is_some());
         assert!(lines_text(&filtered_expanded).contains("model_1"));
         assert!(lines_text(&raw_collapsed).contains("raw_8"));
         assert!(!lines_text(&raw_collapsed).contains("raw_1"));
@@ -4728,7 +4759,7 @@ mod tests {
         assert!(text.contains("raw_8"));
         assert!(!text.contains("click for"));
         assert!(!text.contains("model_8"));
-        assert!(lines.shell_toggle_line.is_none());
+        assert!(lines.raw_toggle_line.is_none());
     }
 
     #[test]
@@ -4752,7 +4783,7 @@ mod tests {
 
         assert!(text.contains("190 redraws collapsed"), "{text}");
         assert!(!text.contains("click for"), "{text}");
-        assert!(lines.shell_toggle_line.is_none());
+        assert!(lines.raw_toggle_line.is_none());
     }
 
     #[test]
@@ -4777,7 +4808,7 @@ mod tests {
             ),
             "{text}"
         );
-        assert!(lines.shell_toggle_line.is_some());
+        assert!(lines.raw_toggle_line.is_some());
     }
 
     #[test_case(ToolStatus::InProgress, None           ; "live_streaming_shows_body")]
@@ -8580,6 +8611,7 @@ mod tests {
             blocks: vec![McpBlock::Text {
                 text: MCP_JSON.into(),
             }],
+            ..McpOutput::default()
         })
     }
 
@@ -8820,5 +8852,71 @@ mod tests {
                 .map(line_text)
                 .collect::<Vec<_>>()
         );
+    }
+
+    const MCP_TITLE: &str = "Run code";
+    const MCP_RESULT: &str = "42 issues";
+    const MCP_COMPLETED: &str = "completed";
+
+    fn executor_output(is_error: bool) -> ToolOutput {
+        ToolOutput::Mcp(McpOutput {
+            blocks: vec![McpBlock::Text {
+                text: MCP_RESULT.into(),
+            }],
+            structured: Some(serde_json::json!({
+                "status": MCP_COMPLETED, "result": MCP_RESULT, "logs": [],
+            })),
+            kind: Some(McpServerKind::Executor),
+            title: Some(MCP_TITLE.into()),
+            is_error,
+            ..McpOutput::default()
+        })
+    }
+
+    #[test_case(Some(executor_output(false)), &format!("executor \u{203a} {MCP_TITLE}") ; "titled")]
+    #[test_case(Some(mcp_output()), MCP_LABEL ; "untitled")]
+    fn an_mcp_title_stands_in_for_the_tool_name(output: Option<ToolOutput>, label: &str) {
+        let tl = build_tool_lines(
+            &mcp_msg(MCP_TOOL, ToolStatus::Success, output),
+            ToolStatus::Success,
+            &test_rctx(80),
+            Some(Disclosure::default()),
+        );
+
+        let title = line_text(&tl.lines[0]);
+        assert!(title.contains(label), "{title}");
+    }
+
+    #[test_case(true, true ; "is_error")]
+    #[test_case(false, false ; "answered")]
+    fn an_mcp_error_answer_paints_the_header_as_a_failure(is_error: bool, failed: bool) {
+        let indicator = Indicator::resolve(ToolStatus::Success, Some(&executor_output(is_error)));
+
+        assert_eq!(matches!(indicator, Indicator::Error), failed);
+    }
+
+    #[test]
+    fn a_recognised_card_keeps_the_script_above_the_divider() {
+        let mut msg = scripted_mcp_msg(ToolStatus::Success);
+        msg.tool_output = Some(Arc::new(executor_output(false)));
+
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(120),
+            Some(Disclosure::default()),
+        );
+
+        let rows = trimmed_rows(&tl);
+        let divider = rows
+            .iter()
+            .position(|row| row == CODE_OUTPUT_DIVIDER)
+            .expect("the answer is divided from the script");
+        assert!(rows[..divider].iter().any(|row| row.ends_with(MCP_SCRIPT)));
+        assert_eq!(
+            rows[divider + 1..],
+            [MCP_COMPLETED, MCP_RESULT, RAW_AFFORDANCE]
+        );
+        assert_eq!(tl.raw_toggle_line, Some(rows.len() - 1));
     }
 }

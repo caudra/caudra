@@ -355,6 +355,7 @@ impl Chat {
             AgentEvent::QueueDrained
             | AgentEvent::SessionTitle { .. }
             | AgentEvent::MemoryChanged
+            | AgentEvent::QuestionClosed
             | AgentEvent::Autopilot(_) => {}
             AgentEvent::Decision(note) => {
                 if self.show_decisions {
@@ -1070,6 +1071,11 @@ impl Chat {
     #[cfg(test)]
     pub fn streaming_thinking_is_empty(&self) -> bool {
         self.messages_panel.streaming_thinking_is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn settle_splash(&mut self) {
+        self.messages_panel.settle_splash();
     }
 
     #[cfg(test)]

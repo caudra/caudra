@@ -22,7 +22,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const NO_MATCHES: &str = "No matches";
@@ -80,6 +80,12 @@ pub trait PickerItem {
     /// row stays selectable so whoever owns the action can explain the refusal.
     fn is_disabled(&self) -> bool {
         false
+    }
+    /// What the owner shows above the list while this item is selected. The
+    /// picker keeps that area as tall as the tallest item's, so moving the
+    /// selection never resizes the popup or shifts the rows under the pointer.
+    fn info(&self) -> Option<&str> {
+        None
     }
 }
 
@@ -871,11 +877,15 @@ fn render_ready<T: PickerItem>(
     let footer_rows = if footer.is_some() { 1u16 } else { 0 };
     let error_rows = error_text.is_some() as u16;
     let modal_inner_width = Modal::inner_width(area.width, options.width_percent);
-    let requested_info_rows = info_text.map_or(0, |text| {
-        Paragraph::new(text.clone())
-            .wrap(ratatui::widgets::Wrap { trim: false })
-            .line_count(modal_inner_width.max(1)) as u16
-    });
+    let info_width = modal_inner_width.max(1);
+    let requested_info_rows = s
+        .items
+        .iter()
+        .filter_map(PickerItem::info)
+        .map(|info| wrapped_rows(Text::from(info), info_width))
+        .chain(info_text.map(|text| wrapped_rows(text.clone(), info_width)))
+        .max()
+        .unwrap_or(0);
     let (max_height_percent, requested_rows) = if options.docked {
         (
             DOCKED_HEIGHT_PERCENT,
@@ -920,9 +930,7 @@ fn render_ready<T: PickerItem>(
     }
 
     let mut constraints: Vec<Constraint> = Vec::with_capacity(
-        3 + footer.is_some() as usize
-            + error_text.is_some() as usize
-            + info_text.is_some() as usize,
+        3 + footer.is_some() as usize + error_text.is_some() as usize + (info_rows > 0) as usize,
     );
     if error_text.is_some() {
         constraints.push(Constraint::Length(1)); // error line
@@ -948,15 +956,15 @@ fn render_ready<T: PickerItem>(
         area_idx += 1;
     }
 
-    if let Some(info) = info_text
-        && info_rows > 0
-    {
-        frame.render_widget(
-            Paragraph::new(info.clone())
-                .style(theme::current().item_desc)
-                .wrap(ratatui::widgets::Wrap { trim: false }),
-            areas[area_idx],
-        );
+    if info_rows > 0 {
+        if let Some(info) = info_text {
+            frame.render_widget(
+                Paragraph::new(info.clone())
+                    .style(theme::current().item_desc)
+                    .wrap(Wrap { trim: false }),
+                areas[area_idx],
+            );
+        }
         area_idx += 1;
     }
 
@@ -992,6 +1000,12 @@ fn render_ready<T: PickerItem>(
 
     s.popup_area = popup;
     popup
+}
+
+fn wrapped_rows(text: Text<'_>, width: u16) -> u16 {
+    Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .line_count(width) as u16
 }
 
 /// Orders matches by relevance while keeping each section contiguous, which

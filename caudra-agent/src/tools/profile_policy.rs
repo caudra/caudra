@@ -253,6 +253,8 @@ pub fn tool_available(
                 && effective_task_execution(&ctx.config, ctx.background.is_some()).is_none())
             || (name == super::SHELL_TOOL_NAME
                 && effective_shell_execution(&ctx.config, ctx.job_scope().is_some()).is_none())
+            || (name == super::MCP_RESOURCE_TOOL_NAME
+                && !mcp.is_some_and(|mcp| mcp.offers_resources()))
         {
             return false;
         }
@@ -273,8 +275,8 @@ pub fn tool_available(
     mcp.is_some_and(|mcp| {
         mcp.has_tool(&canonical)
             && !mcp.is_disabled(&canonical)
-            && !ctx.policy().is_read_only()
-            && !ctx.mode.is_planning()
+            && (mcp.is_read_only(&canonical)
+                || !(ctx.policy().is_read_only() || ctx.mode.is_planning()))
             && ctx
                 .profile_tool_policy
                 .exposure(&canonical, ProfileToolSource::Mcp)

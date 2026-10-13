@@ -467,6 +467,7 @@ pub fn run(
             | AgentEvent::TaskAdmitted(_)
             | AgentEvent::BatchProgress(_)
             | AgentEvent::Question(_)
+            | AgentEvent::QuestionClosed
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueBatchConsumed { .. }
             | AgentEvent::QueueDrained

@@ -1,16 +1,22 @@
 //! Maps the `question` tool onto ACP form elicitation (`elicitation/create`).
 //! The tool keeps its Lua-advertised schema; only execution is rerouted here,
 //! so Zed and friends render native forms instead of a spinner nobody can answer.
+//! An MCP server's own elicitation is forwarded the same way, in its mode.
 
 use std::collections::BTreeMap;
 
 use agent_client_protocol_schema::v1::{
-    ClientCapabilities, CreateElicitationRequest, ElicitationContentValue, ElicitationFormMode,
-    ElicitationPropertySchema, ElicitationSchema, ElicitationSessionScope, EnumOption,
+    ClientCapabilities, CreateElicitationRequest, CreateElicitationResponse, ElicitationAction,
+    ElicitationContentValue, ElicitationFormMode, ElicitationId, ElicitationPropertySchema,
+    ElicitationSchema, ElicitationSessionScope, ElicitationUrlMode, EnumOption,
     MultiSelectPropertySchema, PermissionOption, PermissionOptionId, PermissionOptionKind,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, SessionId,
     StringPropertySchema, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
 };
+use caudra_agent::ElicitAction;
+use caudra_agent::mcp::call::{ElicitMode, ElicitRequest, ElicitResponse};
+use caudra_agent::mcp::elicitation::ElicitForm;
+use caudra_agent::types::Answerer;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -46,6 +52,61 @@ struct QuestionOption {
 
 pub fn supports_form(caps: &ClientCapabilities) -> bool {
     caps.elicitation.as_ref().is_some_and(|e| e.form.is_some())
+}
+
+pub fn supports_url(caps: &ClientCapabilities) -> bool {
+    caps.elicitation.as_ref().is_some_and(|e| e.url.is_some())
+}
+
+/// An MCP server's request, scoped to the tool call that raised it. A form's
+/// requested schema is already the shape ACP asks with; one that does not
+/// read as such is an error, and the request goes unasked.
+pub fn mcp_request(
+    session_id: &str,
+    tool_call_id: Option<String>,
+    elicitation_id: String,
+    request: &ElicitRequest,
+) -> Result<CreateElicitationRequest, String> {
+    let scope = ElicitationSessionScope::new(SessionId::from(session_id.to_owned()))
+        .tool_call_id(tool_call_id.map(ToolCallId::from));
+    let message = request.message.clone();
+    Ok(match &request.mode {
+        ElicitMode::Form { schema } => {
+            let schema: ElicitationSchema =
+                serde_json::from_value(schema.clone()).map_err(|error| error.to_string())?;
+            CreateElicitationRequest::new(ElicitationFormMode::new(scope, schema), message)
+        }
+        ElicitMode::Url { url } => CreateElicitationRequest::new(
+            ElicitationUrlMode::new(scope, ElicitationId::new(elicitation_id), url.clone()),
+            message,
+        ),
+    })
+}
+
+/// The client's `elicitation/create` result as the server reads it. Anything
+/// but an accept or a decline, an error response included, is a cancel. The
+/// answers shown on the call's card come from `form`, with credentials masked.
+pub fn mcp_response(result: Value, form: Option<&ElicitForm>) -> ElicitResponse {
+    match serde_json::from_value::<CreateElicitationResponse>(result).map(|r| r.action) {
+        Ok(ElicitationAction::Accept(accepted)) => {
+            let content = match serde_json::to_value(accepted.content) {
+                Ok(Value::Object(content)) => Some(content),
+                _ => None,
+            };
+            ElicitResponse {
+                action: ElicitAction::Accept,
+                answers: content
+                    .as_ref()
+                    .zip(form)
+                    .map(|(content, form)| form.summary(content))
+                    .unwrap_or_default(),
+                content,
+                by: Answerer::User,
+            }
+        }
+        Ok(ElicitationAction::Decline) => ElicitResponse::unanswered(ElicitAction::Decline),
+        _ => ElicitResponse::unanswered(ElicitAction::Cancel),
+    }
 }
 
 fn parse_questions(input: &Value) -> Result<Vec<Question>, String> {
@@ -259,6 +320,16 @@ mod tests {
 
     use super::*;
 
+    const SESSION: &str = "sess_1";
+    const TOOL_CALL: &str = "toolu_mcp";
+    const ELICITATION_ID: &str = "1042";
+    const SERVER_MESSAGE: &str = "Where should the release go?";
+    const URL: &str = "https://example.com/authorize";
+    const BRANCH: &str = "branch";
+    const MAIN: &str = "main";
+    const PASSWORD: &str = "password";
+    const SECRET: &str = "hunter2";
+
     fn questions_input() -> Value {
         serde_json::json!({
             "questions": [
@@ -434,5 +505,108 @@ mod tests {
         }))
         .unwrap();
         assert!(!supports_form(&url_only));
+    }
+
+    fn mcp_schema() -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                BRANCH: {"type": "string", "title": "Branch", "minLength": 1},
+                "count": {"type": "integer", "minimum": 1, "maximum": 9},
+                "ratio": {"type": "number"},
+                "confirm": {"type": "boolean", "default": true},
+                "env": {"type": "string", "oneOf": [{"const": "prod", "title": "Production"}]},
+                "tags": {"type": "array", "items": {"type": "string", "enum": ["a", "b"]}},
+                PASSWORD: {"type": "string"},
+            },
+            "required": [BRANCH],
+        })
+    }
+
+    fn mcp_request_json(mode: ElicitMode) -> Value {
+        let request = ElicitRequest {
+            mode,
+            message: SERVER_MESSAGE.into(),
+            kind: None,
+        };
+        let created = mcp_request(
+            SESSION,
+            Some(TOOL_CALL.into()),
+            ELICITATION_ID.into(),
+            &request,
+        )
+        .unwrap();
+        serde_json::to_value(created).unwrap()
+    }
+
+    #[test]
+    fn an_mcp_form_is_forwarded_with_its_schema_scoped_to_the_call() {
+        let json = mcp_request_json(ElicitMode::Form {
+            schema: mcp_schema(),
+        });
+
+        assert_eq!(json["mode"], "form");
+        assert_eq!(json["message"], SERVER_MESSAGE);
+        assert_eq!(json["sessionId"], SESSION);
+        assert_eq!(json["toolCallId"], TOOL_CALL);
+        assert_eq!(json["requestedSchema"], mcp_schema());
+    }
+
+    #[test]
+    fn an_mcp_url_is_forwarded_with_an_id_scoped_to_the_call() {
+        let json = mcp_request_json(ElicitMode::Url { url: URL.into() });
+
+        assert_eq!(json["mode"], "url");
+        assert_eq!(json["url"], URL);
+        assert_eq!(json["elicitationId"], ELICITATION_ID);
+        assert_eq!(json["sessionId"], SESSION);
+        assert_eq!(json["toolCallId"], TOOL_CALL);
+    }
+
+    #[test]
+    fn an_mcp_form_acp_cannot_carry_is_refused() {
+        let request = ElicitRequest {
+            mode: ElicitMode::Form {
+                schema: serde_json::json!({"type": "object", "properties": {BRANCH: "text"}}),
+            },
+            message: SERVER_MESSAGE.into(),
+            kind: None,
+        };
+        assert!(mcp_request(SESSION, None, ELICITATION_ID.into(), &request).is_err());
+    }
+
+    #[test]
+    fn an_accepted_mcp_form_returns_its_content_with_credentials_masked() {
+        let form = ElicitForm::parse(&mcp_schema()).unwrap();
+        let content = serde_json::json!({BRANCH: MAIN, "count": 3, PASSWORD: SECRET});
+        let result = serde_json::json!({"action": "accept", "content": content});
+
+        let response = mcp_response(result, Some(&form));
+
+        assert_eq!(response.action, ElicitAction::Accept);
+        assert_eq!(response.content.map(Value::Object), Some(content));
+        assert_eq!(response.by, Answerer::User);
+        assert!(response.answers.contains(&("Branch".into(), MAIN.into())));
+        assert!(!response.answers.iter().any(|(_, shown)| shown == SECRET));
+    }
+
+    #[test_case(serde_json::json!({"action": "accept"}), ElicitAction::Accept ; "accepted_url")]
+    #[test_case(serde_json::json!({"action": "decline"}), ElicitAction::Decline ; "declined")]
+    #[test_case(serde_json::json!({"action": "cancel"}), ElicitAction::Cancel ; "cancelled")]
+    #[test_case(serde_json::json!({"action": "later"}), ElicitAction::Cancel ; "an_unknown_action")]
+    #[test_case(Value::Null, ElicitAction::Cancel ; "an_error_response")]
+    fn an_mcp_result_without_content_maps_to_its_action(result: Value, action: ElicitAction) {
+        assert_eq!(
+            mcp_response(result, None),
+            ElicitResponse::unanswered(action)
+        );
+    }
+
+    #[test_case(serde_json::json!({}), false ; "no_elicitation")]
+    #[test_case(serde_json::json!({"elicitation": {"form": {}}}), false ; "form_only")]
+    #[test_case(serde_json::json!({"elicitation": {"url": {}}}), true ; "url")]
+    fn supports_url_requires_url_capability(caps: Value, expected: bool) {
+        let caps: ClientCapabilities = serde_json::from_value(caps).unwrap();
+        assert_eq!(supports_url(&caps), expected);
     }
 }

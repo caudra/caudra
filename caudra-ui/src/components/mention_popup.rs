@@ -5,11 +5,19 @@
 //! back over the query that opened it. A remote session lists the workspace
 //! through the workbench backend instead of walking a local directory.
 //!
+//! Running MCP servers' resources join the list as `server:uri`, and their
+//! templates as `server:template`. Choosing a template types its fixed start
+//! and stays open, and the server's completions for the variable being typed
+//! join the list as they arrive.
+//!
 //! Everything about being a list — matching, selection, scrolling, hit testing
 //! and painting — lives in [`crate::components::completion`]. What is here is
 //! what makes the list one of paths: where the rows come from, and the fact
 //! that a directory drills in rather than finishing the mention.
 
+use caudra_agent::McpSnapshotReader;
+use caudra_agent::mcp::resources::UriTemplate;
+use caudra_agent::mcp::{CompletionTarget, McpServerResources, McpSnapshot};
 use caudra_workbench::{
     BackendDriver, BackendEvent, ResourceEntry, WorkbenchBackend, WorkbenchPath,
 };
@@ -20,19 +28,25 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 use crate::components::completion::{self, Completion, MouseOutcome, PAD};
 use crate::components::file_walk::{self, Walk};
+use crate::components::mcp_completion::{CompletionAsk, McpCompleter};
 use crate::repaint::Dirty;
 use crate::theme;
 
 const SIGIL: char = '@';
 const SEPARATOR: char = std::path::MAIN_SEPARATOR;
 const SCOPE: &str = "mention_popup";
+const SERVER_SEPARATOR: char = ':';
+const DETAIL_GAP: &str = "  ";
+const TEMPLATE_OPEN: char = '{';
 
 pub(crate) enum MentionAction {
     Consumed,
@@ -52,6 +66,15 @@ struct Session {
     done_rx: Option<flume::Receiver<Walk>>,
     backend: Option<BackendDriver>,
     remote_resources: HashMap<String, ResourceEntry>,
+    /// Every `server:uri` row, by the text it was listed under.
+    mcp_rows: HashMap<String, McpRow>,
+}
+
+/// What a row naming an MCP resource says beside itself, and whether a
+/// variable is still to be typed before it names one.
+struct McpRow {
+    detail: String,
+    partial: bool,
 }
 
 impl Drop for Session {
@@ -68,14 +91,118 @@ impl Session {
         if reset {
             self.completion.clear_items();
             added = self.remote_resources.keys().cloned().collect();
+            added.extend(self.mcp_rows.keys().cloned());
         }
+        self.push(added);
+    }
+
+    fn push(&self, rows: impl IntoIterator<Item = String>) {
         let injector = self.completion.injector();
-        for path in added {
+        for row in rows {
             injector.push((), |_, columns| {
-                columns[0] = Utf32String::from(path.as_str())
+                columns[0] = Utf32String::from(row.as_str())
             });
         }
     }
+
+    /// Lists what each running server offers to be read.
+    fn add_resources(&mut self, snapshot: &McpSnapshot) {
+        let rows: Vec<(String, McpRow)> = snapshot.resources.iter().flat_map(offered).collect();
+        self.add_mcp_rows(rows);
+    }
+
+    /// Adds the rows not listed yet, and returns whether there were any.
+    fn add_mcp_rows(&mut self, rows: Vec<(String, McpRow)>) -> bool {
+        let mut added = Vec::new();
+        for (text, row) in rows {
+            if let Entry::Vacant(slot) = self.mcp_rows.entry(text) {
+                added.push(slot.key().clone());
+                slot.insert(row);
+            }
+        }
+        let any = !added.is_empty();
+        self.push(added);
+        any
+    }
+}
+
+/// A server's resources, then its templates, as rows.
+fn offered(offer: &McpServerResources) -> Vec<(String, McpRow)> {
+    let row = |uri: &str, label: &str, partial| {
+        (
+            format!("{}{SERVER_SEPARATOR}{uri}", offer.server),
+            McpRow {
+                detail: label.to_owned(),
+                partial,
+            },
+        )
+    };
+    let resources = offer
+        .lists
+        .resources
+        .iter()
+        .map(|resource| row(&resource.uri, resource.label(), false));
+    let templates = offer
+        .lists
+        .templates
+        .iter()
+        .map(|template| row(&template.uri_template, template.label(), true));
+    resources.chain(templates).collect()
+}
+
+/// The completion to ask for while `query` is in the middle of a variable of
+/// one of `server`'s templates, when that server completes them.
+fn template_ask(snapshot: &McpSnapshot, query: &str) -> Option<CompletionAsk> {
+    let (server, typed) = query.split_once(SERVER_SEPARATOR)?;
+    let offer = snapshot
+        .resources_of(server)
+        .filter(|offer| offer.completions)?;
+    offer.lists.templates.iter().find_map(|template| {
+        let progress = UriTemplate::parse(&template.uri_template).progress(typed)?;
+        let (argument, value) = progress.current?;
+        Some(CompletionAsk {
+            target: CompletionTarget::Template {
+                server: server.to_owned(),
+                uri_template: template.uri_template.clone(),
+            },
+            argument,
+            value,
+            context: progress.settled,
+        })
+    })
+}
+
+/// The rows a template's completed `values` make of what was typed: each
+/// value in place of the partial one, and the literal after it.
+fn completed_rows(query: &str, ask: &CompletionAsk, values: Vec<String>) -> Vec<(String, McpRow)> {
+    let CompletionTarget::Template {
+        server,
+        uri_template,
+    } = &ask.target
+    else {
+        return Vec::new();
+    };
+    let Some((_, typed)) = query.split_once(SERVER_SEPARATOR) else {
+        return Vec::new();
+    };
+    let Some(progress) = UriTemplate::parse(uri_template).progress(typed) else {
+        return Vec::new();
+    };
+    values
+        .into_iter()
+        .map(|value| {
+            (
+                format!(
+                    "{server}{SERVER_SEPARATOR}{}{value}{}",
+                    progress.prefix, progress.follows
+                ),
+                McpRow {
+                    detail: ask.argument.clone(),
+                    partial: progress.more,
+                },
+            )
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -84,11 +211,18 @@ pub(crate) struct MentionPopup {
     /// Char range of the `@query` the popup is completing, into the composer's
     /// display text.
     trigger: Option<Range<usize>>,
+    mcp: McpSnapshotReader,
+    completer: McpCompleter,
 }
 
 impl MentionPopup {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn set_mcp_reader(&mut self, reader: McpSnapshotReader) {
+        self.mcp = reader;
+        self.completer.clear();
     }
 
     pub fn is_open(&self) -> bool {
@@ -100,6 +234,7 @@ impl MentionPopup {
     pub fn close(&mut self) {
         self.session = None;
         self.trigger = None;
+        self.completer.clear();
     }
 
     /// Where the rows are, so the host can hand the popup the wheel it drew
@@ -130,6 +265,10 @@ impl MentionPopup {
             return;
         };
         self.trigger = Some(range);
+        match template_ask(&self.mcp.load(), &query) {
+            Some(ask) => self.completer.ask(ask, Instant::now()),
+            None => self.completer.clear(),
+        }
         match &mut self.session {
             Some(session) if session.completion.query() == query => {}
             Some(session) => session.completion.set_query(query),
@@ -156,6 +295,7 @@ impl MentionPopup {
             done_rx: Some(done_rx),
             backend: None,
             remote_resources: HashMap::new(),
+            mcp_rows: HashMap::new(),
         });
     }
 
@@ -172,12 +312,14 @@ impl MentionPopup {
             done_rx: None,
             backend: Some(backend),
             remote_resources: HashMap::new(),
+            mcp_rows: HashMap::new(),
         });
     }
 
     /// Runs the query the session was built with before the popup adopts it, so
     /// the first frame shows matches rather than the whole project.
     fn open(&mut self, mut session: Session) {
+        session.add_resources(&self.mcp.load());
         let query = session.completion.query().to_owned();
         session.completion.set_query(query);
         self.session = Some(session);
@@ -186,6 +328,10 @@ impl MentionPopup {
     /// Collects whatever the walk has produced so far. The popup is fed by a
     /// background thread, so it grows over the first few frames after opening.
     pub fn tick(&mut self) -> Dirty {
+        self.tick_at(Instant::now())
+    }
+
+    fn tick_at(&mut self, now: Instant) -> Dirty {
         let Some(session) = &mut self.session else {
             return Dirty::NO;
         };
@@ -193,6 +339,12 @@ impl MentionPopup {
             let _ = done_rx.try_recv();
         }
         let mut changed = Dirty::NO;
+        if let Some((ask, values)) = self.completer.poll(&self.mcp, now) {
+            let rows = completed_rows(session.completion.query(), &ask, values);
+            if session.add_mcp_rows(rows) {
+                changed = Dirty::YES;
+            }
+        }
         if let Some(events) = session.backend.as_mut().map(BackendDriver::drain) {
             for event in events {
                 if let BackendEvent::Listed {
@@ -273,11 +425,31 @@ impl MentionPopup {
         let Some(chosen) = session.completion.selected().map(str::to_owned) else {
             return MentionAction::Passthrough;
         };
-        if session.backend.is_some() && !session.remote_resources.contains_key(&chosen) {
+        let mcp_row = session.mcp_rows.get(&chosen);
+        if session.backend.is_some()
+            && mcp_row.is_none()
+            && !session.remote_resources.contains_key(&chosen)
+        {
             return MentionAction::Consumed;
         }
+        // A template is chosen for the start every URI it names shares; the
+        // variables are typed, or completed, from there.
+        let chosen = match mcp_row {
+            Some(McpRow { partial: true, .. }) if chosen.contains(TEMPLATE_OPEN) => {
+                let (server, template) = chosen.split_once(SERVER_SEPARATOR).unwrap_or_default();
+                format!(
+                    "{server}{SERVER_SEPARATOR}{}",
+                    UriTemplate::parse(template).stem()
+                )
+            }
+            _ => chosen,
+        };
         let path = format!("{SIGIL}{chosen}");
-        match drill && chosen.ends_with(SEPARATOR) {
+        let stays_open = match mcp_row {
+            Some(row) => row.partial,
+            None => drill && chosen.ends_with(SEPARATOR),
+        };
+        match stays_open {
             true => {
                 session.completion.set_query(chosen);
                 self.trigger = Some(range.start..range.start + path.chars().count());
@@ -290,17 +462,36 @@ impl MentionPopup {
     pub fn view(&mut self, frame: &mut Frame, input_area: Rect) -> Option<Rect> {
         let session = self.session.as_mut()?;
         let theme = theme::current();
+        let rows = &session.mcp_rows;
+        let detail = |path: &str| {
+            rows.get(path)
+                .map(|row| row.detail.as_str())
+                .filter(|detail| !detail.is_empty())
+        };
         session.completion.view(
             frame,
             input_area,
             SCOPE,
-            |path| path.chars().count() as u16 + PAD * 2,
+            |path| {
+                let detail = detail(path).map_or(0, |detail| {
+                    DETAIL_GAP.chars().count() + detail.chars().count()
+                });
+                (path.chars().count() + detail) as u16 + PAD * 2
+            },
             move |path, selected| {
                 let style = match selected {
                     true => theme.item_selected,
                     false => theme.item,
                 };
-                Line::from(Span::styled(format!(" {path} "), style))
+                let mut spans = vec![Span::styled(format!(" {path}"), style)];
+                if let Some(detail) = detail(path) {
+                    spans.push(Span::styled(
+                        format!("{DETAIL_GAP}{detail}"),
+                        theme.item_desc,
+                    ));
+                }
+                spans.push(Span::styled(" ", style));
+                Line::from(spans)
             },
         )
     }
@@ -309,6 +500,9 @@ impl MentionPopup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::mcp_completion::COMPLETION_DEBOUNCE;
+    use caudra_agent::mcp::completing_stub_session;
+    use caudra_agent::mcp::resources::{Resource, ResourceLists, ResourceTemplate};
     use caudra_workspace::ResourceKind;
     use crossterm::event::{MouseButton, MouseEventKind};
     use test_case::test_case;
@@ -340,8 +534,10 @@ mod tests {
                 done_rx: Some(done_rx),
                 backend: None,
                 remote_resources: HashMap::new(),
+                mcp_rows: HashMap::new(),
             }),
             trigger: Some(0..1),
+            ..MentionPopup::default()
         }
     }
 
@@ -548,5 +744,112 @@ mod tests {
         if let Some((range, _)) = found {
             assert_eq!(range.end, cursor);
         }
+    }
+
+    const SERVER: &str = "stub";
+    const README: &str = "docs://readme";
+    const README_ROW: &str = "stub:docs://readme";
+    const README_TITLE: &str = "Read me";
+    const TEMPLATE: &str = "docs://pages/{page}";
+    const TEMPLATE_ROW: &str = "stub:docs://pages/{page}";
+    const TEMPLATE_NAME: &str = "Page";
+    const TEMPLATE_STEM_MENTION: &str = "@stub:docs://pages/";
+    const TYPED_PAGE: &str = "stub:docs://pages/ma";
+    const VARIABLE: &str = "page";
+    const PAGES: [&str; 2] = ["main", "maint"];
+    const COMPLETED_ROW: &str = "stub:docs://pages/main";
+    const NO_ASK: &str = "typing into a template variable asked nothing";
+
+    fn completing_reader() -> McpSnapshotReader {
+        let lists = ResourceLists {
+            resources: vec![Resource {
+                uri: README.into(),
+                title: Some(README_TITLE.into()),
+                ..Resource::default()
+            }],
+            templates: vec![ResourceTemplate {
+                uri_template: TEMPLATE.into(),
+                name: TEMPLATE_NAME.into(),
+                ..ResourceTemplate::default()
+            }],
+        };
+        completing_stub_session(lists, "review", &[], &PAGES).reader()
+    }
+
+    #[test]
+    fn running_servers_list_their_resources_and_templates() {
+        let snapshot = completing_reader().load_full();
+        let rows: Vec<(String, String, bool)> = offered(&snapshot.resources[0])
+            .into_iter()
+            .map(|(text, row)| (text, row.detail, row.partial))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (README_ROW.to_owned(), README_TITLE.to_owned(), false),
+                (TEMPLATE_ROW.to_owned(), TEMPLATE_NAME.to_owned(), true),
+            ]
+        );
+    }
+
+    #[test_case(TYPED_PAGE, Some("ma") ; "inside_the_variable")]
+    #[test_case("stub:docs://pages/", Some("") ; "at_the_variable")]
+    #[test_case(README_ROW, None ; "a_listed_resource")]
+    #[test_case("other:docs://pages/ma", None ; "another_server")]
+    #[test_case("src/main.rs", None ; "a_path")]
+    fn typing_into_a_template_variable_asks_its_server(query: &str, expected: Option<&str>) {
+        let ask = template_ask(&completing_reader().load(), query);
+        assert_eq!(ask.as_ref().map(|ask| ask.value.as_str()), expected);
+        if let Some(ask) = ask {
+            assert_eq!(
+                (ask.target, ask.argument.as_str()),
+                (
+                    CompletionTarget::Template {
+                        server: SERVER.into(),
+                        uri_template: TEMPLATE.into(),
+                    },
+                    VARIABLE
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn choosing_a_template_types_its_start_and_stays_open() {
+        let mut popup = popup(&[TEMPLATE_ROW], AREA);
+        popup.session.as_mut().expect(NO_SESSION).mcp_rows.insert(
+            TEMPLATE_ROW.into(),
+            McpRow {
+                detail: TEMPLATE_NAME.into(),
+                partial: true,
+            },
+        );
+        let action = popup.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(inserted(action).as_deref(), Some(TEMPLATE_STEM_MENTION));
+        assert!(popup.session.is_some());
+    }
+
+    /// The server's values for the variable join the list once typing
+    /// pauses, each as the whole URI it completes.
+    #[test]
+    fn completed_values_join_the_list() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut popup = MentionPopup::new();
+        popup.set_mcp_reader(completing_reader());
+        let text = format!("{SIGIL}{TYPED_PAGE}");
+        popup.sync_workspace(
+            &text,
+            text.chars().count(),
+            cwd.path().to_str().unwrap(),
+            None,
+        );
+        assert!(popup.completer.busy(), "{NO_ASK}");
+        let due = Instant::now() + COMPLETION_DEBOUNCE;
+        while popup.completer.busy() {
+            let _ = popup.tick_at(due);
+        }
+        let session = popup.session.as_ref().expect(NO_SESSION);
+        assert!(session.mcp_rows.contains_key(COMPLETED_ROW));
+        assert!(!session.mcp_rows[COMPLETED_ROW].partial);
     }
 }

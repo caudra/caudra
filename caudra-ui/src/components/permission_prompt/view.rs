@@ -83,6 +83,7 @@ const DETAILS_TITLE: &str = "Details";
 const CUSTOMIZE_TITLE: &str = "Customize";
 const PLAN_READ_QUESTION: &str = "Allow reading the plan?";
 const PLAN_WRITE_QUESTION: &str = "Allow changing the plan?";
+const MCP_LABEL: &str = "MCP";
 const OVERFLOW_HINT: &str = "? shows all";
 const REMEMBER_FOR: &str = "Remember for ";
 const EFFECT_LABEL: &str = "Effect";
@@ -695,8 +696,12 @@ impl PermissionPrompt {
             .into();
         }
         if let ToolKey::McpTool { server, tool } = &request.tool {
+            let label = request
+                .mcp
+                .as_ref()
+                .map_or(MCP_LABEL, |facts| facts.kind.label());
             return format!(
-                "Allow MCP tool {}?",
+                "Allow {label} tool {}?",
                 review_text(&format!("{server}/{tool}"))
             );
         }
@@ -1572,11 +1577,12 @@ pub(super) mod tests {
         PermissionAuthorityProfile, PermissionExecutorKind, PermissionLifetime, PermissionRequest,
         PermissionResource, PermissionResourceAccess, PermissionResourceKind, PermissionRisk,
         PermissionSubject, PromptReason, ResourceCoverage, RuleOrigin, ScriptLanguage,
-        ShellOpacity, StructuredPermissionEffect,
+        ShellOpacity, StructuredPermissionEffect, mcp_permission_intent,
     };
     use caudra_agent::tools::native;
     use caudra_agent::tools::native::plan::{self, PlanAccess};
     use caudra_agent::tools::{PermissionIntent, PermissionScopes};
+    use caudra_agent::{McpCallFacts, McpServerKind};
     use caudra_config::ToolKey;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
@@ -1593,8 +1599,9 @@ pub(super) mod tests {
         PROJECT, command_resource, commands_request, native_shell_request, shell_request,
     };
     use super::super::inspector::tests::learned_request;
+    use super::super::notes::READ_ONLY_BADGE;
     use super::super::{Panel, PermissionPrompt};
-    use super::{PLAN_READ_QUESTION, PLAN_WRITE_QUESTION};
+    use super::{PLAN_READ_QUESTION, PLAN_WRITE_QUESTION, WARNING_MARK};
     use crate::components::buffer_text;
     use crate::components::command_text::tests::{
         COLOUR_THEME, NOT_COLOURED, NOT_TOLD_APART, PYTHON_SYNTAX, SHELL_SYNTAX, assert_drawn_in,
@@ -1651,6 +1658,13 @@ pub(super) mod tests {
         "Learned from 4 similar commands. <value> is caudra-agent or caudra-ui.";
     const LEARNED_WORDS: &str = "Learned from";
     const OTHER_COMMAND: &str = "ls src";
+    const MCP_SERVER: &str = "home-assistant";
+    const MCP_TOOL: &str = "HassTurnOn";
+    const MCP_DOMAIN: &str = "lock";
+    const MCP_REQUEST_ID: &str = "mcp";
+    const MCP_CONTRACT: &str = "mcp-contract";
+    pub(crate) const MCP_NOTE: &str = "Home Assistant lock devices always ask";
+    const MCP_QUESTION: &str = "Allow Home Assistant tool home-assistant/HassTurnOn?";
     pub(crate) const INTERNAL_TERMS: [&str; 12] = [
         "SHA-256",
         "sha256",
@@ -1823,6 +1837,37 @@ pub(super) mod tests {
                 contract: READ_CONTRACT.into(),
             },
             PermissionExecutorKind::Native,
+        );
+        request.presentation.project = Some(PROJECT.into());
+        request
+    }
+
+    /// A call to Home Assistant's `HassTurnOn` the way dispatch raises it.
+    pub(crate) fn mcp_request(read_only: bool, note: Option<&str>) -> PermissionRequest {
+        let tool = ToolKey::parse(&format!("{MCP_SERVER}.{MCP_TOOL}")).unwrap();
+        let input = json!({"domain": MCP_DOMAIN});
+        let intent = mcp_permission_intent(
+            &tool,
+            &input,
+            Some(McpCallFacts {
+                kind: McpServerKind::HomeAssistant,
+                read_only,
+                note: note.map(str::to_owned),
+            }),
+        );
+        let mut request = PermissionRequest::from_intent_with_identity(
+            MCP_REQUEST_ID.into(),
+            tool,
+            &intent,
+            input,
+            Path::new(PROJECT),
+            PermissionSubject::Mcp {
+                server: MCP_SERVER.into(),
+                authority: MCP_SERVER.into(),
+                tool: MCP_TOOL.into(),
+                contract: MCP_CONTRACT.into(),
+            },
+            PermissionExecutorKind::Mcp,
         );
         request.presentation.project = Some(PROJECT.into());
         request
@@ -2190,6 +2235,30 @@ pub(super) mod tests {
         let mut prompt = prompt_for(request);
         let text = render(&mut prompt, FIT_WIDTH, FIT_HEIGHT);
         assert_eq!(text.contains("Auto asked"), auto.is_some(), "{text}");
+    }
+
+    /// A recognised server's call names the server, says when it is a
+    /// read-only lookup, and leads with why it always asks, in the main view
+    /// and in Details.
+    #[test_case(true, None; "a_read_only_lookup")]
+    #[test_case(false, Some(MCP_NOTE); "a_guarded_call")]
+    fn a_recognised_mcp_prompt_names_its_server_and_why(read_only: bool, note: Option<&str>) {
+        let mut prompt = prompt_for(mcp_request(read_only, note));
+        let main = prose(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
+        prompt.toggle_details();
+        let details = prose(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
+        assert!(main.contains(MCP_QUESTION), "{main}");
+        for text in [&main, &details] {
+            assert_eq!(text.contains(READ_ONLY_BADGE), read_only, "{text}");
+            assert_eq!(
+                note.is_some_and(|note| text.contains(note)),
+                note.is_some(),
+                "{text}"
+            );
+        }
+        if let Some(note) = note {
+            assert!(main.contains(&format!("{WARNING_MARK}{note}")), "{main}");
+        }
     }
 
     #[test]

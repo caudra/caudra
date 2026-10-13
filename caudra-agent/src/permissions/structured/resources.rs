@@ -17,6 +17,7 @@ use std::path::Path;
 
 pub(super) const GIT_METADATA_DIR: &str = ".git";
 const MAX_POSSIBLE_WORKDIRS: usize = 32;
+const MCP_TOOL_RESOURCE: &str = "mcp_tool";
 pub(super) const INERT_GIT_METADATA: &[&str] = &[
     "COMMIT_EDITMSG",
     "FETCH_HEAD",
@@ -295,16 +296,7 @@ pub(super) fn resources_for(
                 }
             })
             .collect(),
-        ToolKey::McpTool { .. } | ToolKey::McpServer { .. } => vec![PermissionResource {
-            kind: PermissionResourceKind::Custom {
-                name: "mcp_tool".into(),
-            },
-            value: tool.to_string(),
-            access: Some(PermissionResourceAccess::Execute),
-            protected: false,
-            requires_prompt: false,
-            attributes: BTreeMap::new(),
-        }],
+        ToolKey::McpTool { .. } | ToolKey::McpServer { .. } => vec![mcp_tool_resource(tool)],
         _ => scopes
             .iter()
             .map(|scope| PermissionResource {
@@ -318,6 +310,20 @@ pub(super) fn resources_for(
                 attributes: BTreeMap::new(),
             })
             .collect(),
+    }
+}
+
+/// An MCP call's one resource: the tool itself, whatever its arguments.
+pub(super) fn mcp_tool_resource(tool: &ToolKey) -> PermissionResource {
+    PermissionResource {
+        kind: PermissionResourceKind::Custom {
+            name: MCP_TOOL_RESOURCE.into(),
+        },
+        value: tool.to_string(),
+        access: Some(PermissionResourceAccess::Execute),
+        protected: false,
+        requires_prompt: false,
+        attributes: BTreeMap::new(),
     }
 }
 

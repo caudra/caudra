@@ -950,10 +950,10 @@ pub struct MessagesPanel {
     /// What the reader asked of a card, keyed by tool id. Absent leaves the
     /// disclosure to the view mode.
     disclosure: HashMap<String, CardState>,
-    /// Which shell cards the reader put into raw view. Kept apart from
+    /// Which shell and MCP cards the reader put into raw view. Kept apart from
     /// `disclosure` because it is a choice about the body rather than an
     /// expansion of it, so closing the card must not forget it.
-    shell_raw: HashSet<String>,
+    raw_views: HashSet<String>,
     /// Which batch children the reader opened, by parent tool id. Empty for
     /// every card nobody has clicked, which is nearly all of them.
     batch_views: BatchViewMap,
@@ -1106,7 +1106,7 @@ impl MessagesPanel {
             idle_splash: Splash::new(ui_config.splash_animation),
             accent: ColorTransition::new(theme::current().mode_build),
             disclosure: HashMap::new(),
-            shell_raw: HashSet::new(),
+            raw_views: HashSet::new(),
             batch_views: BatchViewMap::new(),
             batch_child_progress: BatchProgressMap::new(),
             task_cards: HashMap::new(),
@@ -1244,7 +1244,8 @@ impl MessagesPanel {
     ///
     /// Elsewhere the older rule holds: a call whose body is the only record of
     /// what it did stays open, and an always-collapsed tool is the other
-    /// extreme that no mode opens.
+    /// extreme that no mode opens. An MCP card stays open too, read-only or
+    /// not, since it [rests whole](Self::rests_whole).
     fn opens_by_default(&self, role: &ToolRole, msg_index: usize) -> bool {
         if self.view == ViewMode::Compact {
             return &*role.name == BATCH_TOOL_NAME;
@@ -1255,7 +1256,19 @@ impl MessagesPanel {
         if self.stays_collapsed(&role.name) {
             return false;
         }
-        self.view == ViewMode::Expanded || self.is_latest(msg_index)
+        self.view == ViewMode::Expanded || self.is_latest(msg_index) || self.rests_whole(msg_index)
+    }
+
+    /// An MCP card opens whole rather than at a row budget: the arguments it
+    /// was given and what the server answered are the whole record of a call
+    /// to a server Caudra knows nothing else about, and three rows of either
+    /// say next to nothing. A session restored from before the server's
+    /// blocks were kept has only text, and keeps resting at the budget.
+    fn rests_whole(&self, msg_index: usize) -> bool {
+        matches!(
+            self.messages[msg_index].tool_output.as_deref(),
+            Some(ToolOutput::Mcp(_))
+        )
     }
 
     /// Resolved from the message rather than tracked alongside it, so a
@@ -1296,8 +1309,9 @@ impl MessagesPanel {
     }
 
     /// `None` means header-only. A card the reader has not spoken about rests
-    /// within the tool's row budget; the budget is never what a click opens to,
-    /// so an asked-for card is always whole.
+    /// within the tool's row budget, or whole where it
+    /// [rests whole](Self::rests_whole); the budget is never what a click opens
+    /// to, so an asked-for card is always whole.
     ///
     /// A scroll card is the exception: its window is the whole of what it
     /// shows, so it is never `full` and a click that would have opened one
@@ -1306,12 +1320,14 @@ impl MessagesPanel {
         let full = match self.disclosure.get(tool_id) {
             Some(CardState::Closed) => return None,
             Some(CardState::Full) => !self.card_scrolls(tool_id),
-            None if open_by_default => false,
+            None if open_by_default => self
+                .tool_card(tool_id)
+                .is_some_and(|(index, _)| self.rests_whole(index)),
             None => return None,
         };
         Some(Disclosure {
             full,
-            shell_raw: self.shell_raw.contains(tool_id),
+            raw_view: self.raw_views.contains(tool_id),
         })
     }
 
@@ -1758,7 +1774,7 @@ impl MessagesPanel {
         self.held_anchor = None;
         self.card_floor.clear();
         self.disclosure.clear();
-        self.shell_raw.clear();
+        self.raw_views.clear();
         self.batch_views.clear();
         self.batch_child_progress.clear();
         self.task_cards.clear();
@@ -3016,6 +3032,11 @@ impl MessagesPanel {
     }
 
     #[cfg(test)]
+    pub fn settle_splash(&mut self) {
+        self.idle_splash = Splash::settled();
+    }
+
+    #[cfg(test)]
     pub fn tool_turn_usage(&self, tool_id: &str) -> Option<&str> {
         self.messages.iter().rev().find_map(|msg| match &msg.role {
             DisplayRole::Tool(tool) if tool.id == tool_id => msg.turn_usage.as_deref(),
@@ -3384,7 +3405,7 @@ impl MessagesPanel {
         let mentions = if remote {
             mentions::scan_remote(&source)
         } else {
-            mentions::scan_in(&source, cwd)
+            mentions::scan_in(&source, cwd, |_, _| false)
         };
         mentions
             .into_iter()
@@ -3476,15 +3497,15 @@ impl MessagesPanel {
         // is served locally and the row has to advertise itself.
         let native_toggle = (!self.has_snapshot(tool_id) || self.card_closed(tool_id))
             && self.tool_click_acts(tool_id, segment.truncation);
-        let shell_toggle = segment
-            .shell_toggle_line
+        let raw_toggle = segment
+            .raw_toggle_line
             .is_some_and(|line| segment.source_line_at(rel, width) == Some(line));
         let batch_row = segment.control_line_at(rel, width);
-        if !native_toggle && !shell_toggle && batch_row.is_none() && !known_task_target {
+        if !native_toggle && !raw_toggle && batch_row.is_none() && !known_task_target {
             return None;
         }
-        let feedback = if shell_toggle {
-            HoverFeedback::ShellToggle
+        let feedback = if raw_toggle {
+            HoverFeedback::RawToggle
         } else if let Some(line) = batch_row {
             HoverFeedback::Row(line)
         } else if native_toggle
@@ -3820,13 +3841,13 @@ impl MessagesPanel {
             self.follow_card(&tool_id);
             return true;
         }
-        let shell_toggle = seg
-            .shell_toggle_line
+        let raw_toggle = seg
+            .raw_toggle_line
             .is_some_and(|line| source_line == Some(line));
-        if shell_toggle {
+        if raw_toggle {
             let tool_id = tool_id.to_owned();
-            if !self.shell_raw.remove(&tool_id) {
-                self.shell_raw.insert(tool_id.clone());
+            if !self.raw_views.remove(&tool_id) {
+                self.raw_views.insert(tool_id.clone());
             }
             self.rebuild_expanded_tool(&tool_id);
             return true;

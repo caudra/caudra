@@ -8,6 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::Mutex as SyncMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -21,12 +22,19 @@ use smol::channel;
 use tempfile::{Builder, TempDir};
 use tracing::{debug, info, warn};
 
+use super::call::{CallScope, CancelOnDrop, lock, with_progress_token};
 use super::error::McpError;
-use super::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
+use super::inbound::Inbound;
+use super::listen;
+use super::message::{self, Message, RequestId, Response};
+use super::protocol::{
+    JsonRpcNotification, JsonRpcRequest, LISTEN_METHOD, ServerCapabilities,
+};
 use super::transport::{BoxFuture, McpTransport};
 use crate::ChildGuard;
 
 type PendingMap = HashMap<u64, channel::Sender<Result<Value, McpError>>>;
+type Stdin = Arc<Mutex<async_process::ChildStdin>>;
 
 const LINE_DELIMITER: u8 = b'\n';
 const REMOTE_TRUST_REQUIRED: &str = "client-local MCP processes require explicit trust; launch isolation is not a filesystem sandbox";
@@ -36,16 +44,29 @@ const LOCAL_TEMP_ROOT: &str = "/tmp";
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 
 pub struct StdioTransport {
-    name: Arc<str>,
-    stdin: Mutex<async_process::ChildStdin>,
-    pending: Arc<Mutex<PendingMap>>,
-    next_id: AtomicU64,
-    timeout: Duration,
-    alive: Arc<AtomicBool>,
+    core: Arc<Core>,
+    /// A modern server's subscription, open once it declared a list that can
+    /// change. Dropping the task cancels it.
+    listener: SyncMutex<Option<smol::Task<()>>>,
     _reader_task: smol::Task<()>,
+    _writer_task: smol::Task<()>,
     _stderr_task: smol::Task<()>,
     _child: ChildGuard,
     _local_cwd: Option<TempDir>,
+}
+
+/// What sending a request takes, shared with the subscription's task.
+struct Core {
+    name: Arc<str>,
+    stdin: Stdin,
+    /// Lines written without a caller waiting on the write: replies to the
+    /// server's requests, and cancellations sent from a drop.
+    outbox: flume::Sender<Vec<u8>>,
+    pending: Arc<Mutex<PendingMap>>,
+    inbound: Arc<Inbound>,
+    next_id: AtomicU64,
+    timeout: Duration,
+    alive: Arc<AtomicBool>,
 }
 
 impl StdioTransport {
@@ -105,13 +126,38 @@ impl StdioTransport {
         let name: Arc<str> = Arc::from(name);
         let alive = Arc::new(AtomicBool::new(true));
         let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let inbound = Arc::new(Inbound::new(Arc::clone(&name)));
+        let stdin: Stdin = Arc::new(Mutex::new(stdin));
+        let (outbox, outbox_rx) = flume::unbounded::<Vec<u8>>();
+
+        let writer_task = {
+            let name = Arc::clone(&name);
+            let stdin = Arc::clone(&stdin);
+            smol::spawn(async move {
+                while let Ok(line) = outbox_rx.recv_async().await {
+                    if let Err(error) = write_to(&stdin, &line).await {
+                        debug!(server = &*name, %error, "MCP stdio writer stopped");
+                        return;
+                    }
+                }
+            })
+        };
 
         let reader_task = {
             let name = Arc::clone(&name);
             let alive = Arc::clone(&alive);
             let pending = Arc::clone(&pending);
+            let inbound = Arc::clone(&inbound);
+            let outbox = outbox.clone();
             smol::spawn(async move {
-                let result = Self::reader_loop(&name, &mut BufReader::new(stdout), &pending).await;
+                let result = Self::reader_loop(
+                    &name,
+                    &mut BufReader::new(stdout),
+                    &pending,
+                    &inbound,
+                    &outbox,
+                )
+                .await;
                 if let Err(e) = &result {
                     warn!(server = &*name, error = %e, "MCP reader loop ended");
                 }
@@ -147,23 +193,34 @@ impl StdioTransport {
         };
 
         Ok(Self {
-            name,
-            stdin: Mutex::new(stdin),
-            pending,
-            next_id: AtomicU64::new(1),
-            timeout,
-            alive,
+            core: Arc::new(Core {
+                name,
+                stdin,
+                outbox,
+                pending,
+                inbound,
+                next_id: AtomicU64::new(1),
+                timeout,
+                alive,
+            }),
+            listener: SyncMutex::default(),
             _reader_task: reader_task,
+            _writer_task: writer_task,
             _stderr_task: stderr_task,
             _child: ChildGuard::new(child),
             _local_cwd: local_cwd,
         })
     }
 
+    /// A response settles the call waiting on its id. A request from the
+    /// server is answered on its own task, against the newest call that can
+    /// ask someone, since stdio ties it to no call.
     async fn reader_loop(
         name: &Arc<str>,
         reader: &mut (impl AsyncBufReadExt + Unpin),
         pending: &Mutex<PendingMap>,
+        inbound: &Arc<Inbound>,
+        outbox: &flume::Sender<Vec<u8>>,
     ) -> Result<(), McpError> {
         let mut line = String::new();
         loop {
@@ -186,51 +243,44 @@ impl StdioTransport {
                 continue;
             }
 
-            match serde_json::from_str::<JsonRpcResponse>(trimmed) {
-                Ok(resp) => {
-                    if let Some(id) = resp.id {
-                        if let Some(sender) = pending.lock().await.remove(&id) {
-                            let result = if let Some(err) = resp.error {
-                                Err(McpError::RpcError {
-                                    server: (**name).into(),
-                                    code: err.code,
-                                    message: err.message,
-                                })
-                            } else {
-                                Ok(resp.result.unwrap_or(Value::Null))
-                            };
-                            let _ = sender.send(result).await;
-                        } else {
-                            debug!(server = &**name, id, "response for unknown request id");
+            match message::parse(trimmed) {
+                Some(Message::Response(response)) => resolve(name, pending, response).await,
+                Some(Message::Request(request)) => {
+                    let route = inbound.routed();
+                    let inbound = Arc::clone(inbound);
+                    let outbox = outbox.clone();
+                    smol::spawn(async move {
+                        if let Some(reply) = inbound.answer(request, route).await {
+                            let _ = outbox.send(line_of(&reply));
                         }
-                    } else {
-                        debug!(server = &**name, "received notification (no id)");
-                    }
+                    })
+                    .detach();
                 }
-                Err(e) => {
-                    debug!(server = &**name, error = %e, line = trimmed, "non-JSON-RPC line from server");
+                Some(Message::Notification(notification)) => inbound.notify(notification),
+                None => {
+                    debug!(
+                        server = &**name,
+                        line = trimmed,
+                        "non-JSON-RPC line from server"
+                    );
                 }
             }
         }
     }
+}
 
+impl Core {
     fn server(&self) -> String {
         (*self.name).into()
     }
 
     async fn write_line(&self, line: &[u8]) -> Result<(), McpError> {
-        let mut stdin = self.stdin.lock().await;
-        stdin
-            .write_all(line)
+        write_to(&self.stdin, line)
             .await
             .map_err(|e| McpError::WriteFailed {
                 server: self.server(),
                 reason: e.to_string(),
-            })?;
-        stdin.flush().await.map_err(|e| McpError::WriteFailed {
-            server: self.server(),
-            reason: e.to_string(),
-        })
+            })
     }
 
     fn server_died(&self) -> McpError {
@@ -247,6 +297,46 @@ impl StdioTransport {
         buf.push(LINE_DELIMITER);
         Ok(buf)
     }
+
+    async fn request(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        scope: &CallScope,
+    ) -> Result<Value, McpError> {
+        if !self.alive.load(Ordering::Acquire) {
+            return Err(self.server_died());
+        }
+
+        let start = Instant::now();
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let params = self.inbound.era().with_meta(params, scope);
+        let req = JsonRpcRequest::new(id, method, with_progress_token(method, params, id));
+
+        let (tx, rx) = smol::channel::bounded(1);
+        self.pending.lock().await.insert(id, tx);
+        let _tracked = self.inbound.track(id, scope);
+
+        if let Err(e) = self.write_line(&self.serialize(&req)?).await {
+            self.pending.lock().await.remove(&id);
+            return Err(e);
+        }
+
+        let mut cancel = CancelOnDrop::new(method, id, |notification| {
+            let _ = self.outbox.send(line_of(&notification));
+        });
+        let result = scope
+            .wait(&self.name, self.timeout, async {
+                rx.recv().await.unwrap_or(Err(self.server_died()))
+            })
+            .await;
+        cancel.settle(&result);
+        self.pending.lock().await.remove(&id);
+        if result.is_ok() {
+            info!(server = %self.server(), method, id, duration_ms = start.elapsed().as_millis() as u64, "MCP stdio response");
+        }
+        result
+    }
 }
 
 impl McpTransport for StdioTransport {
@@ -254,44 +344,9 @@ impl McpTransport for StdioTransport {
         &'a self,
         method: &'a str,
         params: Option<Value>,
+        scope: &'a CallScope,
     ) -> BoxFuture<'a, Result<Value, McpError>> {
-        Box::pin(async move {
-            if !self.alive.load(Ordering::Acquire) {
-                return Err(self.server_died());
-            }
-
-            let start = Instant::now();
-            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            let req = JsonRpcRequest::new(id, method, params);
-
-            let (tx, rx) = smol::channel::bounded(1);
-            self.pending.lock().await.insert(id, tx);
-
-            if let Err(e) = self.write_line(&self.serialize(&req)?).await {
-                self.pending.lock().await.remove(&id);
-                return Err(e);
-            }
-
-            let result = futures_lite::future::race(
-                async { rx.recv().await.unwrap_or(Err(self.server_died())) },
-                async {
-                    async_io::Timer::after(self.timeout).await;
-                    Err(McpError::Timeout {
-                        server: self.server(),
-                        timeout_ms: self.timeout.as_millis() as u64,
-                    })
-                },
-            )
-            .await;
-
-            if result.is_err() {
-                self.pending.lock().await.remove(&id);
-            } else {
-                info!(server = %self.server(), method, id, duration_ms = start.elapsed().as_millis() as u64, "MCP stdio response");
-            }
-
-            result
-        })
+        Box::pin(self.core.request(method, params, scope))
     }
 
     fn send_notification<'a>(
@@ -301,22 +356,23 @@ impl McpTransport for StdioTransport {
     ) -> BoxFuture<'a, Result<(), McpError>> {
         Box::pin(async move {
             let notif = JsonRpcNotification::new(method, params);
-            self.write_line(&self.serialize(&notif)?).await
+            self.core.write_line(&self.core.serialize(&notif)?).await
         })
     }
 
     fn shutdown<'a>(&'a self) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            lock(&self.listener).take();
             // Flip `alive` so any in-flight reader or writer gives up with a clean error.
             // We deliberately do not signal the child here: the transport lives behind an
             // Arc, and once the last clone goes away `ChildGuard::drop` takes care of
             // killing the whole process group. Doing it twice just raced with itself.
-            self.alive.store(false, Ordering::Release);
+            self.core.alive.store(false, Ordering::Release);
         })
     }
 
     fn server_name(&self) -> &Arc<str> {
-        &self.name
+        &self.core.name
     }
 
     fn transport_kind(&self) -> &'static str {
@@ -325,6 +381,54 @@ impl McpTransport for StdioTransport {
 
     fn child_pids(&self) -> Vec<u32> {
         vec![self._child.id()]
+    }
+
+    fn inbound(&self) -> Option<&Inbound> {
+        Some(&self.core.inbound)
+    }
+
+    fn listen(&self, capabilities: &ServerCapabilities) {
+        let mut listener = lock(&self.listener);
+        if listener.is_some() || self.core.inbound.era().modern().is_none() {
+            return;
+        }
+        let core = Arc::clone(&self.core);
+        *listener = Some(smol::spawn(listen::subscribe(
+            Arc::clone(&core.name),
+            capabilities.listen_filter(),
+            move |params| {
+                let core = Arc::clone(&core);
+                Box::pin(async move {
+                    let scope = CallScope::standing();
+                    core.request(LISTEN_METHOD, Some(params), &scope).await
+                })
+            },
+        )));
+    }
+}
+
+async fn write_to(stdin: &Stdin, line: &[u8]) -> io::Result<()> {
+    let mut stdin = stdin.lock().await;
+    stdin.write_all(line).await?;
+    stdin.flush().await
+}
+
+fn line_of(message: &Value) -> Vec<u8> {
+    let mut line = message.to_string().into_bytes();
+    line.push(LINE_DELIMITER);
+    line
+}
+
+async fn resolve(name: &str, pending: &Mutex<PendingMap>, response: Response) {
+    let Some(id) = response.id.as_ref().and_then(RequestId::as_u64) else {
+        debug!(server = name, "MCP response names no request of ours");
+        return;
+    };
+    match pending.lock().await.remove(&id) {
+        Some(sender) => {
+            let _ = sender.send(response.into_result(name)).await;
+        }
+        None => debug!(server = name, id, "response for unknown request id"),
     }
 }
 
@@ -349,8 +453,40 @@ fn configure_launch(
 mod tests {
     use super::*;
     use futures_lite::io::Cursor;
+    use serde_json::json;
     use test_case::test_case;
 
+    use crate::cancel::CancelToken;
+    use crate::mcp::McpToolMeta;
+    use crate::mcp::call::{ElicitMode, ElicitRequest, ElicitResponse, Elicitor};
+    use crate::mcp::elicitation::ElicitAction;
+    use crate::mcp::protocol::{CANCELLED_NOTIFICATION, METHOD_NOT_FOUND, TOOLS_CALL_METHOD};
+    use crate::mcp::transport;
+    use crate::types::Answerer;
+
+    const SERVER_REQUEST_ENV: &str = "SERVER_REQUEST";
+    const SERVER_REQUEST_ID: &str = "srv-1";
+    const PROBE_METHOD: &str = "probe";
+    const ELICIT_MESSAGE: &str = "Which branch?";
+    const FIELD: &str = "branch";
+    const ANSWER: &str = "main";
+    /// Sends `$SERVER_REQUEST` while the first call is open, then answers
+    /// the call with whatever Caudra replied to it.
+    const ECHO_REPLY_SCRIPT: &str = r#"read -r call
+printf '%s\n' "$SERVER_REQUEST"
+read -r reply
+printf '{"jsonrpc":"2.0","id":1,"result":{"reply":%s}}\n' "$reply"
+cat >/dev/null
+"#;
+    /// Never answers the first call; answers the second with the line that
+    /// cancelled the first, whichever order the two arrived in.
+    const ECHO_CANCEL_SCRIPT: &str = r#"read -r call
+read -r first
+read -r second
+case "$first" in *notifications/cancelled*) cancelled="$first" ;; *) cancelled="$second" ;; esac
+printf '{"jsonrpc":"2.0","id":2,"result":{"cancelled":%s}}\n' "$cancelled"
+cat >/dev/null
+"#;
     const CANARY_ENV: &str = "CAUDRA_MCP_ENV_CANARY";
     const CANARY_VALUE: &str = "launch-secret";
     const CONFIGURED_ENV: &str = "CAUDRA_MCP_CONFIGURED";
@@ -392,7 +528,10 @@ cat >/dev/null
                     true,
                 )
                 .unwrap();
-                let response = transport.send_request("probe", None).await.unwrap();
+                let response = transport
+                    .send_request("probe", None, &CallScope::none())
+                    .await
+                    .unwrap();
                 let embedded = policy == LocalExecutionPolicy::Embedded;
                 assert_eq!(response["configured"], CONFIGURED_VALUE);
                 assert_eq!(response["canary"], if embedded { CANARY_VALUE } else { "" });
@@ -467,12 +606,20 @@ cat >/dev/null
     async fn read_single_response(input: &str) -> Result<Value, McpError> {
         let pending: Mutex<PendingMap> = Mutex::new(HashMap::new());
         let name: Arc<str> = Arc::from("test");
+        let inbound = Arc::new(Inbound::new(Arc::clone(&name)));
 
         let (tx, rx) = channel::bounded(1);
         pending.lock().await.insert(1, tx);
 
         let mut reader = BufReader::new(Cursor::new(input.as_bytes().to_vec()));
-        let _ = StdioTransport::reader_loop(&name, &mut reader, &pending).await;
+        let _ = StdioTransport::reader_loop(
+            &name,
+            &mut reader,
+            &pending,
+            &inbound,
+            &flume::unbounded().0,
+        )
+        .await;
 
         rx.try_recv().unwrap_or(Err(McpError::ServerDied {
             server: "no response received".into(),
@@ -499,6 +646,173 @@ cat >/dev/null
                 read_single_response(input).await,
                 Err(McpError::RpcError { code: -32600, .. })
             ));
+        });
+    }
+
+    fn scripted(script: &str, environment: HashMap<String, String>) -> StdioTransport {
+        StdioTransport::spawn(
+            "scripted",
+            "/bin/sh",
+            &["-c".into(), script.into()],
+            &environment,
+            Duration::from_secs(5),
+            LocalExecutionPolicy::Embedded,
+            true,
+        )
+        .unwrap()
+    }
+
+    /// What Caudra replied to `request`, sent by the server mid-call.
+    fn reply_to(request: Value, scope: &CallScope) -> Value {
+        let transport = scripted(
+            ECHO_REPLY_SCRIPT,
+            HashMap::from([(SERVER_REQUEST_ENV.into(), request.to_string())]),
+        );
+        smol::block_on(async {
+            let result = transport
+                .send_request(TOOLS_CALL_METHOD, None, scope)
+                .await
+                .unwrap();
+            transport.shutdown().await;
+            result["reply"].clone()
+        })
+    }
+
+    fn elicitation() -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": SERVER_REQUEST_ID,
+            "method": "elicitation/create",
+            "params": {
+                "message": ELICIT_MESSAGE,
+                "requestedSchema": {"type": "object", "properties": {FIELD: {"type": "string"}}},
+            },
+        })
+    }
+
+    #[test]
+    fn a_server_request_reusing_a_pending_id_is_answered_not_taken_as_the_response() {
+        let reply = reply_to(
+            json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
+            &CallScope::none(),
+        );
+        assert_eq!(reply, json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
+    }
+
+    #[test_case("roots/list" ; "roots")]
+    #[test_case("sampling/createMessage" ; "sampling")]
+    #[test_case("vendor/unknown" ; "unknown")]
+    fn unsupported_server_requests_are_refused(method: &str) {
+        let reply = reply_to(
+            json!({"jsonrpc": "2.0", "id": SERVER_REQUEST_ID, "method": method}),
+            &CallScope::none(),
+        );
+        assert_eq!(reply["id"], SERVER_REQUEST_ID);
+        assert_eq!(reply["error"]["code"], METHOD_NOT_FOUND);
+    }
+
+    #[test]
+    fn an_elicitation_nobody_can_answer_is_declined() {
+        let reply = reply_to(elicitation(), &CallScope::none());
+        assert_eq!(reply["result"], json!({"action": "decline"}));
+    }
+
+    struct Accepting;
+
+    impl Elicitor for Accepting {
+        fn elicit<'a>(
+            &'a self,
+            _server: &'a str,
+            request: ElicitRequest,
+        ) -> BoxFuture<'a, ElicitResponse> {
+            Box::pin(async move {
+                assert!(matches!(request.mode, ElicitMode::Form { .. }));
+                ElicitResponse {
+                    action: ElicitAction::Accept,
+                    content: json!({FIELD: ANSWER}).as_object().cloned(),
+                    by: Answerer::User,
+                    answers: vec![(FIELD.into(), ANSWER.into())],
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn an_elicitation_reaches_the_calls_elicitor_and_is_recorded() {
+        let scope = CallScope::new(Some(Arc::new(Accepting)), None, CancelToken::none());
+        let reply = reply_to(elicitation(), &scope);
+        assert_eq!(
+            reply["result"],
+            json!({"action": "accept", "content": {FIELD: ANSWER}})
+        );
+        let interactions = scope.take_interactions();
+        assert_eq!(interactions.len(), 1);
+        assert_eq!(interactions[0].message, ELICIT_MESSAGE);
+        assert_eq!(interactions[0].action, ElicitAction::Accept);
+        assert_eq!(
+            interactions[0].answers,
+            [(FIELD.to_owned(), ANSWER.to_owned())]
+        );
+    }
+
+    const STATE_ENV: &str = "STATE";
+    /// As written on the wire: raw UTF-8, escaped quotes and backslashes,
+    /// and a run that looks like the header sentinel.
+    const WIRE_STATE: &str = r#"état \"opaque\" \\ =?base64?x?="#;
+    const TOOL: &str = "t";
+    /// Asks for nothing but another try with `$STATE`, then answers the
+    /// retry with both calls and whether the state came back byte for byte.
+    const STATE_ONLY_SCRIPT: &str = r#"id_of() { printf '%s' "$1" | sed -n 's/^{"jsonrpc":"2.0","id":\([0-9]*\),.*/\1/p'; }
+read -r first
+printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"input_required","requestState":"%s"}}\n' "$(id_of "$first")" "$STATE"
+read -r second
+case "$second" in *"\"requestState\":\"$STATE\""*) exact=true ;; *) exact=false ;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[],"structuredContent":{"first":%s,"second":%s,"exact":%s}}}\n' "$(id_of "$second")" "$first" "$second" "$exact"
+cat >/dev/null
+"#;
+
+    #[test]
+    fn a_retried_round_is_a_new_request_echoing_the_state_byte_for_byte() {
+        let transport = scripted(
+            STATE_ONLY_SCRIPT,
+            HashMap::from([(STATE_ENV.into(), WIRE_STATE.into())]),
+        );
+        let output = smol::block_on(transport::call_tool(
+            &transport,
+            TOOL,
+            &McpToolMeta::default(),
+            None,
+            &json!({}),
+            &CallScope::none(),
+        ))
+        .unwrap();
+        let echoed = output.structured_content().unwrap();
+        assert_eq!(echoed["exact"], true, "{echoed}");
+        assert_ne!(echoed["first"]["id"], echoed["second"]["id"]);
+        let retry = &echoed["second"]["params"];
+        assert_eq!(retry["name"], TOOL);
+        assert!(retry.get("inputResponses").is_none(), "{retry}");
+        smol::block_on(transport.shutdown());
+    }
+
+    #[test]
+    fn a_cancelled_call_tells_the_server() {
+        let transport = scripted(ECHO_CANCEL_SCRIPT, HashMap::new());
+        let (trigger, cancel) = CancelToken::new();
+        let scope = CallScope::new(None, None, cancel);
+        trigger.cancel();
+        smol::block_on(async {
+            let call = transport
+                .send_request(TOOLS_CALL_METHOD, None, &scope)
+                .await;
+            assert!(matches!(call, Err(McpError::Cancelled { .. })), "{call:?}");
+            let probe = transport
+                .send_request(PROBE_METHOD, None, &CallScope::none())
+                .await
+                .unwrap();
+            assert_eq!(probe["cancelled"]["method"], CANCELLED_NOTIFICATION);
+            assert_eq!(probe["cancelled"]["params"]["requestId"], 1);
+            transport.shutdown().await;
         });
     }
 }

@@ -13,6 +13,8 @@ use toml_edit::DocumentMut;
 use url::{Host, Url};
 
 use super::error::McpError;
+use super::kind::McpServerKind;
+use super::protocol::ServerDiscovery;
 use crate::tools::is_builtin_tool;
 use caudra_config::config_version::ConfigVersion;
 use caudra_config::interpolation::{self, ConfigTextError, Lookup};
@@ -112,7 +114,12 @@ pub enum McpServerStatus {
     AwaitingTrust,
     Disabled,
     Failed(String),
-    NeedsAuth { url: Option<String> },
+    NeedsAuth {
+        url: Option<String>,
+    },
+    /// Signed in, and the server still answered 401 to a fresh token: a new
+    /// sign-in with the same account would be refused too.
+    Refused,
 }
 
 impl McpServerStatus {
@@ -150,6 +157,10 @@ pub struct McpServerInfo {
     pub oauth: Option<OauthClientConfig>,
     pub resolved_addresses: Vec<IpAddr>,
     pub review: McpReviewSummary,
+    pub kind: Option<McpServerKind>,
+    /// The running server's `serverInfo`, negotiated protocol version,
+    /// capabilities and instructions.
+    pub discovery: Option<ServerDiscovery>,
 }
 
 #[derive(Deserialize, Default)]
@@ -307,6 +318,8 @@ impl McpConfig {
                     },
                     resolved_addresses: Vec::new(),
                     review: review_summary(&raw.transport, source),
+                    kind: None,
+                    discovery: None,
                 }
             })
             .collect()

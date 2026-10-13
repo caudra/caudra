@@ -216,6 +216,7 @@ pub(crate) mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::mcp::kind::McpServerKind;
     use crate::types::{Answer, Answerer, QuestionOption};
     use crate::{
         IndexDirectoryEntry, IndexDirectoryEntryKind, IndexLine, IndexLineSemantic, IndexOutput,
@@ -714,6 +715,9 @@ pub(crate) mod tests {
                     value: serde_json::json!({"k": [1, 2]}),
                 },
             ],
+            kind: Some(McpServerKind::Executor),
+            is_error: true,
+            ..McpOutput::default()
         });
         let temp = TempDir::new().unwrap();
         let storage = StateDir::from_path(temp.path().to_path_buf());

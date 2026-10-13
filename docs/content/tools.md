@@ -3,7 +3,7 @@ title: "Tools"
 description: "Every built-in tool and its parameters."
 ---
 
-Caudra ships with 35 built-in tools in this reference (35 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Caudra ships with 36 built-in tools in this reference (36 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 First-party file, web, shell, index, Python, and environment tools run through protocol-neutral Workcell contracts. Workcell owns schemas, validation, execution bounds, atomic file changes, network policy, subprocess cleanup, cancellation, and the bundled worker lifecycle. Caudra owns registration, authorization, retained session output, and model or UI presentation. Release builds pin an exact Workcell revision.
 
@@ -434,6 +434,19 @@ Load a skill that provides instructions and workflows for specific tasks.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `name` | string | yes | Name of the skill to load |
+
+### `mcp_resource` {#mcp_resource}
+
+List or read the resources that running MCP servers offer: documents, records, files and other context a server exposes to be read rather than called.
+
+Offered only while a running [MCP server](/docs/mcp/#resources) declares resources. Each call asks first, and the prompt can allow every read from that server for the conversation, the project, or everywhere.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `action` | string | yes | `list` to see what can be read, `read` to read one resource |
+| `server` | string | no | The MCP server's configured name. Required to read; narrows a listing |
+| `uri` | string | no | The resource URI to read, as listed or as a template spells it |
+| `cursor` | string | no | The cursor a previous listing returned, to list the next page |
 
 ## Media
 

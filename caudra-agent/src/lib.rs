@@ -15,7 +15,11 @@ pub mod mcp;
 pub mod memory;
 pub mod peers;
 pub use mcp::config::{McpConfigError, McpConfigErrors, McpServerInfo, McpServerStatus};
-pub use mcp::output::{MCP_SUMMARY_PREFIX, McpBlock, McpOutput, mcp_tool_parts, pretty_json};
+pub use mcp::elicitation::ElicitAction;
+pub use mcp::kind::{McpCallFacts, McpServerKind};
+pub use mcp::output::{
+    MCP_SUMMARY_PREFIX, McpBlock, McpInteraction, McpOutput, mcp_tool_parts, pretty_json,
+};
 pub use mcp::protocol::PromptRole;
 pub use mcp::{
     McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSession, McpSnapshot, McpSnapshotReader,

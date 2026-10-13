@@ -381,6 +381,7 @@ fn bound_presentation(
         ToolOutput::Mcp(output) => {
             let text = preview_body(&output.display_text(), marker, "", max_lines, max_bytes).0;
             output.blocks = vec![McpBlock::Excerpt { text }];
+            output.structured = None;
         }
         ToolOutput::Plain(text) | ToolOutput::Markdown(text) | ToolOutput::ReadDir(text) => {
             let source = text.text.clone();
@@ -1103,6 +1104,8 @@ mod tests {
         let mut mcp = done(String::new(), false);
         mcp.output = ToolOutput::Mcp(McpOutput {
             blocks: vec![McpBlock::Text { text: compact }],
+            structured: Some(serde_json::json!({ "kept": true })),
+            ..McpOutput::default()
         });
 
         smol::block_on(limit(&mut mcp, &ctx));
@@ -1114,6 +1117,7 @@ mod tests {
         let [McpBlock::Excerpt { text }] = output.blocks.as_slice() else {
             panic!("an oversized MCP output must become one excerpt");
         };
+        assert_eq!(output.structured, None);
         assert!(text.starts_with("[\n  {\n    \"index\": 0"), "{text}");
         assert!(text.contains("Tool output truncated"));
     }

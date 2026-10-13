@@ -15,6 +15,7 @@ use tracing::debug;
 
 use crate::autopilot::question::QuestionDelegate;
 use crate::autopilot::{DelegateAction, DelegateOutcome, DelegateOutput};
+use crate::cancel::CancelToken;
 use crate::tools::registry::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolFailure,
     ToolInvocation,
@@ -158,6 +159,7 @@ fn parse_question(raw: &Value) -> AskedQuestion {
             .get(MULTI_SELECT_FIELD)
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        ..AskedQuestion::default()
     }
 }
 
@@ -181,10 +183,11 @@ struct QuestionCall {
     questions: Vec<AskedQuestion>,
 }
 
-/// What ended the wait for an answer.
-enum Reply {
+/// What ended the wait for an answer: the human's raw reply, or the
+/// delegate's answer as the form took it.
+pub(crate) enum Reply<T> {
     Human(String),
-    Autopilot(Vec<Answer>),
+    Autopilot(T),
 }
 
 enum Woken {
@@ -221,8 +224,13 @@ impl ToolInvocation for QuestionCall {
                 .event_tx
                 .send(AgentEvent::Question(Box::new(QuestionEvent {
                     questions: self.questions.clone(),
+                    source: None,
                 })));
-            let reply = ctx.cancel.race(self.wait(ctx, &guard, delegate)).await;
+            let fit = |picked: &[Vec<String>]| {
+                delegated_answers(&self.questions, picked).ok_or_else(|| UNFIT_ANSWER.to_owned())
+            };
+            let wait = wait_for_answer(&guard, delegate, &ctx.event_tx, &ctx.cancel, fit);
+            let reply = ctx.cancel.race(wait).await;
             drop(guard);
 
             match reply {
@@ -237,7 +245,7 @@ impl ToolInvocation for QuestionCall {
 }
 
 /// Autopilot answers only the main agent, the one the user is watching.
-fn asked_by_main_agent(ctx: &ToolContext) -> bool {
+pub(crate) fn asked_by_main_agent(ctx: &ToolContext) -> bool {
     ctx.audience.contains(ToolAudience::MAIN) && ctx.root_tool_use_id.is_none()
 }
 
@@ -245,75 +253,73 @@ fn asked_by_main_agent(ctx: &ToolContext) -> bool {
 /// and this form is not shown yet. A reply already waiting answered an earlier
 /// form, one autopilot answered while the human was still on it, and must not
 /// answer this one.
-fn drop_stale_replies(replies: &Receiver<String>) {
+pub(crate) fn drop_stale_replies(replies: &Receiver<String>) {
     let stale = replies.drain().count();
     if stale > 0 {
         debug!(stale, "dropped replies to an earlier question");
     }
 }
 
-impl QuestionCall {
-    /// Waits for the human, racing the delegate when autopilot may answer.
-    /// The human always wins: an answer of theirs ends the delegate's call,
-    /// and one that lands with the delegate's is taken over it. `None` when
-    /// the channel closed or the run was cancelled.
-    async fn wait(
-        &self,
-        ctx: &ToolContext,
-        replies: &Receiver<String>,
-        delegate: Option<QuestionDelegate>,
-    ) -> Option<Reply> {
-        if let Some(delegate) = delegate {
-            delegate.announce(&ctx.event_tx);
-            let woken = future::or(
-                async { Woken::Human(replies.recv_async().await.ok()) },
-                async { Woken::Delegate(delegate.decide(&ctx.event_tx, &ctx.cancel).await) },
-            )
-            .await;
-            match woken {
-                Woken::Human(reply) => return reply.map(Reply::Human),
-                Woken::Delegate(None) => return None,
-                Woken::Delegate(Some(outcome)) => {
-                    if let Some(answers) = self.conclude(&delegate, outcome, &ctx.event_tx) {
-                        return Some(
-                            replies
-                                .try_recv()
-                                .map_or(Reply::Autopilot(answers), Reply::Human),
-                        );
-                    }
+/// Waits for the human, racing the delegate when autopilot may answer.
+/// The human always wins: an answer of theirs ends the delegate's call,
+/// and one that lands with the delegate's is taken over it. `fit` turns the
+/// delegate's picks into what the form accepts, or says why it does not.
+/// `None` when the channel closed or `cancel` fired.
+pub(crate) async fn wait_for_answer<T>(
+    replies: &Receiver<String>,
+    delegate: Option<QuestionDelegate>,
+    event_tx: &EventSender,
+    cancel: &CancelToken,
+    fit: impl FnOnce(&[Vec<String>]) -> Result<T, String>,
+) -> Option<Reply<T>> {
+    if let Some(delegate) = delegate {
+        delegate.announce(event_tx);
+        let woken = future::or(
+            async { Woken::Human(replies.recv_async().await.ok()) },
+            async { Woken::Delegate(delegate.decide(event_tx, cancel).await) },
+        )
+        .await;
+        match woken {
+            Woken::Human(reply) => return reply.map(Reply::Human),
+            Woken::Delegate(None) => return None,
+            Woken::Delegate(Some(outcome)) => {
+                if let Some(answer) = conclude(&delegate, outcome, event_tx, fit) {
+                    return Some(
+                        replies
+                            .try_recv()
+                            .map_or(Reply::Autopilot(answer), Reply::Human),
+                    );
                 }
             }
         }
-        replies.recv_async().await.ok().map(Reply::Human)
     }
+    replies.recv_async().await.ok().map(Reply::Human)
+}
 
-    /// Takes the delegate's answers when the form accepts them and the human
-    /// has not taken the form first, and records the decision either way. An
-    /// answer the form does not accept is recorded as an escalation.
-    fn conclude(
-        &self,
-        delegate: &QuestionDelegate,
-        mut outcome: DelegateOutcome,
-        event_tx: &EventSender,
-    ) -> Option<Vec<Answer>> {
-        let answers = match &outcome.answer {
-            Ok(DelegateOutput {
-                action: DelegateAction::Answer { answers },
-                ..
-            }) => {
-                let fitting = delegated_answers(&self.questions, answers);
-                if fitting.is_none() {
-                    outcome.answer = Err(UNFIT_ANSWER.into());
-                }
-                fitting
-            }
-            _ => None,
-        };
-        let taken = answers.filter(|_| delegate.claim());
-        delegate.record(&outcome, event_tx);
-        taken
-    }
+/// Takes the delegate's answer when the form accepts it and the human has not
+/// taken the form first, and records the decision either way. An answer the
+/// form does not accept is recorded as an escalation.
+fn conclude<T>(
+    delegate: &QuestionDelegate,
+    mut outcome: DelegateOutcome,
+    event_tx: &EventSender,
+    fit: impl FnOnce(&[Vec<String>]) -> Result<T, String>,
+) -> Option<T> {
+    let answer = match &outcome.answer {
+        Ok(DelegateOutput {
+            action: DelegateAction::Answer { answers },
+            ..
+        }) => fit(answers)
+            .inspect_err(|unfit| outcome.answer = Err(unfit.clone()))
+            .ok(),
+        _ => None,
+    };
+    let taken = answer.filter(|_| delegate.claim());
+    delegate.record(&outcome, event_tx);
+    taken
+}
 
+impl QuestionCall {
     /// The front end answers with one label list per question, in order. A
     /// reply that does not parse is a dismissal: the form is gone and there is
     /// nothing left to ask.
@@ -782,6 +788,7 @@ mod tests {
                 },
             ],
             multiple,
+            ..AskedQuestion::default()
         }
     }
 

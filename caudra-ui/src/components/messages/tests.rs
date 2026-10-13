@@ -24,9 +24,10 @@ use caudra_agent::tools::{
     ToolEffect, VIEW_IMAGE_TOOL_NAME,
 };
 use caudra_agent::{
-    ActivityChild, CodeGraphRow, GrepFileEntry, GrepMatchGroup, NO_FILES_FOUND, SearchCap,
-    ShellFilterInfo, ShellOutput, SkillOutput, SnapshotLine, SnapshotSpan, SpanStyle,
-    SubagentActivity, SubagentProgress, ToolAccounting, ToolInput, ToolOutput,
+    ActivityChild, CodeGraphRow, GrepFileEntry, GrepMatchGroup, McpBlock, McpOutput,
+    NO_FILES_FOUND, SearchCap, ShellFilterInfo, ShellOutput, SkillOutput, SnapshotLine,
+    SnapshotSpan, SpanStyle, SubagentActivity, SubagentProgress, ToolAccounting, ToolInput,
+    ToolOutput,
 };
 use caudra_providers::{PeerAudience, PeerMessageOrigin};
 use caudra_storage::background::ShellJobMetadata;
@@ -3799,7 +3800,7 @@ fn completed_shell_output_toggles_between_filtered_and_raw_views() {
         .iter()
         .find(|segment| segment.tool_id.as_deref() == Some("t1"))
         .unwrap();
-    let toggle_line = segment.shell_toggle_line.unwrap() as u16;
+    let toggle_line = segment.raw_toggle_line.unwrap() as u16;
     let toggle_row = segment.chrome(80).content_start() + toggle_line;
 
     assert!(seg_text(&panel, "t1").contains("model_8"));
@@ -3845,14 +3846,14 @@ fn body_done(tool: &str, id: &str, lines: usize) -> ToolDoneEvent {
     }
 }
 
-fn shell_toggle_row(panel: &MessagesPanel) -> u16 {
+fn raw_toggle_row(panel: &MessagesPanel) -> u16 {
     let segment = panel
         .cache
         .segments()
         .iter()
         .find(|segment| segment.tool_id.as_deref() == Some("t1"))
         .unwrap();
-    segment.chrome(80).content_start() + segment.shell_toggle_line.unwrap() as u16
+    segment.chrome(80).content_start() + segment.raw_toggle_line.unwrap() as u16
 }
 
 /// The raw/filtered switch is a choice about the body rather than about how
@@ -3867,7 +3868,7 @@ fn changing_mode_keeps_a_shell_card_on_its_raw_or_filtered_view(raw: bool) {
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
     if raw {
-        assert!(panel.toggle_expansion_at(shell_toggle_row(&panel), area));
+        assert!(panel.toggle_expansion_at(raw_toggle_row(&panel), area));
         render(&mut panel, 80, 24);
     }
     let chosen = seg_text(&panel, "t1").contains("raw_8");
@@ -3891,7 +3892,7 @@ fn hovering_the_raw_switch_reverses_it_instead_of_the_card_header() {
     panel.tool_done(shell_done("t1", true));
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
-    let row = shell_toggle_row(&panel);
+    let row = raw_toggle_row(&panel);
 
     panel.update_hover(row, area.x, area, false, Path::new(NO_PROJECT));
 
@@ -3904,7 +3905,7 @@ fn hovering_the_raw_switch_reverses_it_instead_of_the_card_header() {
                 .find(|s| s.tool_id.as_deref() == Some("t1"))
                 .unwrap()
         ),
-        Some(HoverFeedback::ShellToggle),
+        Some(HoverFeedback::RawToggle),
         "{SHELL_HOVER_MSG}"
     );
 }
@@ -7754,6 +7755,125 @@ fn the_mode_decides_which_cards_open(view: ViewMode, tool: &'static str, open: b
     assert_eq!(!panel.card_closed("t1"), open, "{MODE_EFFECT_MSG}");
 }
 
+const LATER_TOOL_ID: &str = "t2";
+const MCP_READ_TOOL: &str = "home__GetLiveContext";
+const MCP_ARGUMENT_ROW: &str = "\"area\": \"kitchen\"";
+const MCP_ANSWER_ROWS: usize = 8;
+const MCP_LAST_ANSWER_ROW: &str = "\"k8\": 8";
+const MCP_WHOLE_MSG: &str = "an MCP card rests whole, its arguments and all of its answer, even \
+    read-only and after a newer call replaced it; only compact folds it";
+const MCP_CLOSES_MSG: &str = "a click on a whole MCP card takes it back to its header";
+const MCP_REOPENS_MSG: &str = "the next click opens the MCP card whole again";
+
+const MCP_STRUCTURED_ROW: &str = "structuredContent:";
+const MCP_RAW_SWITCH_MSG: &str = "the switch row trades an MCP card for its data and back";
+const MCP_RAW_STICKY_MSG: &str =
+    "a mode change must leave an MCP card on the view it was switched to";
+const MCP_NO_SWITCH_MSG: &str = "an answer the card already shows whole has no raw view to offer";
+
+/// A read-only MCP call given one argument, whose answer runs well past the
+/// row budget a card of an unknown tool rests at, with `structured` kept
+/// beside its text.
+fn mcp_call(panel: &mut MessagesPanel, id: &str, structured: Option<serde_json::Value>) {
+    panel.tool_start(ToolStartEvent {
+        effect: ToolEffect::ReadOnly,
+        raw_input: Some(serde_json::json!({"area": "kitchen"})),
+        ..start(id, MCP_READ_TOOL)
+    });
+    let answer: serde_json::Map<_, _> = (1..=MCP_ANSWER_ROWS)
+        .map(|n| (format!("k{n}"), n.into()))
+        .collect();
+    panel.tool_done(ToolDoneEvent {
+        tool: MCP_READ_TOOL.into(),
+        output: ToolOutput::Mcp(McpOutput {
+            blocks: vec![McpBlock::Text {
+                text: serde_json::Value::Object(answer).to_string(),
+            }],
+            structured,
+            ..McpOutput::default()
+        }),
+        ..done(id)
+    });
+}
+
+#[test]
+fn the_raw_switch_trades_an_mcp_card_for_its_data_and_back() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    mcp_call(&mut panel, TOOL_ID, Some(serde_json::json!({"id": 7})));
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    let shows_data = |panel: &MessagesPanel| seg_text(panel, TOOL_ID).contains(MCP_STRUCTURED_ROW);
+    assert!(!shows_data(&panel), "{MCP_RAW_SWITCH_MSG}");
+
+    assert!(panel.toggle_expansion_at(raw_toggle_row(&panel), area));
+    render(&mut panel, 80, 24);
+    assert!(shows_data(&panel), "{MCP_RAW_SWITCH_MSG}");
+    panel.set_view(ViewMode::Compact);
+    render(&mut panel, 80, 24);
+    panel.set_view(ViewMode::Auto);
+    render(&mut panel, 80, 24);
+    assert!(shows_data(&panel), "{MCP_RAW_STICKY_MSG}");
+
+    assert!(panel.toggle_expansion_at(raw_toggle_row(&panel), area));
+    render(&mut panel, 80, 24);
+    assert!(!shows_data(&panel), "{MCP_RAW_SWITCH_MSG}");
+}
+
+#[test]
+fn an_mcp_answer_its_card_shows_whole_has_no_raw_switch() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    mcp_call(&mut panel, TOOL_ID, None);
+    render(&mut panel, 80, 24);
+
+    let segment = panel
+        .cache
+        .segments()
+        .iter()
+        .find(|segment| segment.tool_id.as_deref() == Some(TOOL_ID))
+        .unwrap();
+    assert_eq!(segment.raw_toggle_line, None, "{MCP_NO_SWITCH_MSG}");
+}
+
+#[test_case(ViewMode::Auto, true ; "auto")]
+#[test_case(ViewMode::Expanded, true ; "expanded")]
+#[test_case(ViewMode::Compact, false ; "compact")]
+fn an_mcp_card_rests_whole(view: ViewMode, whole: bool) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(view);
+    mcp_call(&mut panel, TOOL_ID, None);
+    panel.tool_start(start(LATER_TOOL_ID, CODE_MAP_TOOL_NAME));
+    panel.tool_done(done(LATER_TOOL_ID));
+    rebuild(&mut panel);
+
+    let text = seg_text(&panel, TOOL_ID);
+    assert_eq!(
+        text.contains(MCP_ARGUMENT_ROW) && text.contains(MCP_LAST_ANSWER_ROW),
+        whole,
+        "{MCP_WHOLE_MSG}: {text:?}"
+    );
+}
+
+#[test]
+fn a_click_closes_a_whole_mcp_card_and_the_next_opens_it_whole() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(ViewMode::Auto);
+    mcp_call(&mut panel, TOOL_ID, None);
+    rebuild(&mut panel);
+    let area = Rect::new(0, 0, 80, 24);
+
+    assert!(panel.handle_click(0, area), "{MCP_CLOSES_MSG}");
+    rebuild(&mut panel);
+    assert!(panel.card_closed(TOOL_ID), "{MCP_CLOSES_MSG}");
+
+    assert!(panel.handle_click(0, area), "{MCP_REOPENS_MSG}");
+    rebuild(&mut panel);
+    let text = seg_text(&panel, TOOL_ID);
+    assert!(
+        text.contains(MCP_ARGUMENT_ROW) && text.contains(MCP_LAST_ANSWER_ROW),
+        "{MCP_REOPENS_MSG}: {text:?}"
+    );
+}
+
 const COMPACT_FOLDS_MSG: &str = "compact answers for every tool, whatever the call did, so its row \
     is all there is until the reader asks for more";
 const COMPACT_KEEPS_BATCH_MSG: &str = "a folded batch says nothing at all, so it is the one call \
@@ -8283,7 +8403,7 @@ fn loading_a_session_forgets_the_raw_view() {
     panel.tool_done(shell_done("t1", true));
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
-    assert!(panel.toggle_expansion_at(shell_toggle_row(&panel), area));
+    assert!(panel.toggle_expansion_at(raw_toggle_row(&panel), area));
     render(&mut panel, 80, 24);
     assert!(seg_text(&panel, "t1").contains("raw_8"));
 

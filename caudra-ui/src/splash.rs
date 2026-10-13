@@ -5,7 +5,7 @@ use crate::update;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const LOGO: &str = "caudra";
 const TAGLINE: &str = "turns context into effective action";
@@ -288,7 +288,7 @@ impl ColorTransition {
         Self {
             from: rgb,
             to: rgb,
-            start: Instant::now() - std::time::Duration::from_secs_f32(COLOR_TRANSITION_SECS),
+            start: Instant::now() - Duration::from_secs_f32(COLOR_TRANSITION_SECS),
         }
     }
 
@@ -347,6 +347,15 @@ impl Splash {
             animate,
             tip_idx: (seed >> u32::BITS) as usize % TIPS.len(),
         }
+    }
+
+    /// Still and past its entry fade, so every frame paints the same colours
+    /// however long the test took to reach it.
+    #[cfg(test)]
+    pub fn settled() -> Self {
+        let mut splash = Self::new(false);
+        splash.start -= Duration::from_secs_f32(FADE_DURATION);
+        splash
     }
 
     /// Routes keep being selected for as long as the splash is up. With the

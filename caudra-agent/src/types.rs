@@ -26,12 +26,13 @@ use caudra_workspace::LocalDocumentRef;
 use flume::Sender;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Number, Value, json};
 use strum::Display;
 
 use crate::agent::{GoalResult, GoalVerdict};
 use crate::autopilot::{AutopilotDecision, DecisionKind};
 use crate::decisions::DecisionNote;
+use crate::mcp::kind::McpServerKind;
 use crate::mcp::output::McpOutput;
 use crate::peers::{
     AssignedWork, PeerHistoryPage, PeerSummary, PublishReceipt, STATUS_HELD, STATUS_QUEUED,
@@ -57,6 +58,15 @@ pub const MEMORY_EVENT_RUN_ID: u64 = u64::MAX - 3;
 pub const AUTOPILOT_EVENT_RUN_ID: u64 = u64::MAX - 4;
 /// How much of a run's report or result a transcript card quotes.
 pub const MAX_CARD_PREVIEW_BYTES: usize = 2048;
+/// What a front end sends down the answer channel for a form the user closed
+/// without answering. The `question` tool reads it as a dismissal, an MCP
+/// server is told `cancel`.
+pub const QUESTION_DISMISSED_REPLY: &str = "dismissed";
+/// The user turned down an MCP server's request outright: `decline`.
+pub const QUESTION_DECLINED_REPLY: &str = "declined";
+/// The user consented to an MCP request that asks for no answers: opening the
+/// address a URL request carries, or a form with no fields. Either is `accept`.
+pub const QUESTION_ACCEPTED_REPLY: &str = "accepted";
 /// Log lines a card keeps under its roster while the run works.
 pub const CARD_LOG_LINES: usize = 3;
 const CARD_REPORT_FIELD: &str = "report";
@@ -262,14 +272,102 @@ pub enum ToolInput {
     },
 }
 
-/// A question put to the user, as the model asked it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A question put to the user, as the model or an MCP server asked it. The
+/// `question` tool leaves `answer`, `optional` and `default` at their
+/// defaults, which serde skips, so its questions keep the shape every earlier
+/// session stored them in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskedQuestion {
     pub question: String,
     pub header: String,
     pub options: Vec<QuestionOption>,
     #[serde(default)]
     pub multiple: bool,
+    #[serde(default, skip_serializing_if = "AnswerKind::is_choice")]
+    pub answer: AnswerKind,
+    /// May be left unanswered on a server's form, which otherwise needs every
+    /// answer. The `question` tool's questions can all be skipped regardless.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
+    /// What the form starts out answering: the labels picked, or the text in
+    /// the box.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default: Vec<String>,
+}
+
+/// What a question takes for an answer. A `Choice` is the `question` tool's:
+/// offered labels, or the user's own words.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AnswerKind {
+    #[default]
+    Choice,
+    Text {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<TextFormat>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_length: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_length: Option<usize>,
+    },
+    Number {
+        #[serde(default)]
+        integer: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        minimum: Option<Number>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        maximum: Option<Number>,
+    },
+    Boolean,
+}
+
+impl AnswerKind {
+    pub fn is_choice(&self) -> bool {
+        *self == Self::Choice
+    }
+
+    /// Typed into a box rather than picked from a list.
+    pub fn is_typed(&self) -> bool {
+        matches!(self, Self::Text { .. } | Self::Number { .. })
+    }
+}
+
+/// The string formats an MCP form may ask for, spelled as the schema spells
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TextFormat {
+    Email,
+    Uri,
+    Date,
+    DateTime,
+}
+
+/// Who put a question, when it was not the agent's own `question` tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum QuestionSource {
+    /// An MCP server's elicitation. One with a `url` asks the user to open
+    /// that address rather than to answer anything, so it comes with no
+    /// questions.
+    Mcp {
+        server: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<McpServerKind>,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+}
+
+impl QuestionSource {
+    /// The name the user knows the asker by: a recognised server's own label,
+    /// or the name it was configured under.
+    pub fn asker(&self) -> &str {
+        match self {
+            Self::Mcp { server, kind, .. } => kind.map_or(server.as_str(), |kind| kind.label()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -320,9 +418,12 @@ pub struct Answer {
 /// The run has parked on a question. The front end that shows the form answers
 /// through the user-response channel, which the asking tool holds locked for
 /// the duration, so no id is needed to route the reply back.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionEvent {
     pub questions: Vec<AskedQuestion>,
+    /// `None` for the agent's own `question` tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<QuestionSource>,
 }
 
 /// One child of a batch, as the reader sees it. `output` is the child's own
@@ -2696,6 +2797,9 @@ pub enum AgentEvent {
     ToolDone(Box<ToolDoneEvent>),
     BatchProgress(Box<BatchProgressEvent>),
     Question(Box<QuestionEvent>),
+    /// The form this agent opened will never be answered: the server withdrew
+    /// it, or the call that asked ended. A front end closes it.
+    QuestionClosed,
     GoalEvaluating {
         evaluation: u32,
     },
@@ -5972,5 +6076,102 @@ mod tests {
         let json = serde_json::to_value(&event).unwrap();
 
         assert_eq!(json.get("by").and_then(Value::as_str), expected);
+    }
+
+    const ASKED: &str = "Which store?";
+    const ASKED_HEADER: &str = "Store";
+    const ASKED_LABEL: &str = "SQLite";
+    const MCP_SERVER: &str = "home-assistant";
+    const MCP_MESSAGE: &str = "Confirm the lock";
+    const HOME_ASSISTANT_LABEL: &str = "Home Assistant";
+    const OLD_QUESTION_SHAPE: &str =
+        "a question stored before typed answers must load, and store, as it always did";
+
+    fn old_question() -> Value {
+        json!({
+            "question": ASKED,
+            "header": ASKED_HEADER,
+            "options": [{ "label": ASKED_LABEL, "description": "" }],
+            "multiple": false,
+        })
+    }
+
+    #[test]
+    fn a_question_stored_before_typed_answers_still_loads_and_keeps_its_shape() {
+        let restored: AskedQuestion = serde_json::from_value(old_question()).unwrap();
+
+        assert_eq!(restored.answer, AnswerKind::Choice, "{OLD_QUESTION_SHAPE}");
+        assert!(!restored.optional, "{OLD_QUESTION_SHAPE}");
+        assert!(restored.default.is_empty(), "{OLD_QUESTION_SHAPE}");
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap(),
+            old_question(),
+            "{OLD_QUESTION_SHAPE}"
+        );
+    }
+
+    #[test]
+    fn a_question_event_without_a_source_loads_as_the_agents_own() {
+        let event: QuestionEvent =
+            serde_json::from_value(json!({ "questions": [old_question()] })).unwrap();
+
+        assert_eq!(event.source, None, "{OLD_QUESTION_SHAPE}");
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            json!({ "questions": [old_question()] }),
+            "{OLD_QUESTION_SHAPE}"
+        );
+    }
+
+    #[test_case(AnswerKind::Boolean ; "boolean")]
+    #[test_case(AnswerKind::Text { format: Some(TextFormat::DateTime), min_length: Some(1), max_length: None } ; "text")]
+    #[test_case(AnswerKind::Number { integer: true, minimum: Some(Number::from(1)), maximum: Some(Number::from(9)) } ; "number")]
+    fn a_typed_question_round_trips(answer: AnswerKind) {
+        let asked = AskedQuestion {
+            question: ASKED.into(),
+            answer,
+            optional: true,
+            default: vec![ASKED_LABEL.into()],
+            ..AskedQuestion::default()
+        };
+
+        let stored = serde_json::to_value(&asked).unwrap();
+
+        assert_eq!(
+            serde_json::from_value::<AskedQuestion>(stored).unwrap(),
+            asked
+        );
+    }
+
+    #[test_case(None, MCP_SERVER ; "by_its_configured_name")]
+    #[test_case(Some(McpServerKind::HomeAssistant), HOME_ASSISTANT_LABEL ; "by_its_recognised_label")]
+    fn an_mcp_source_round_trips_and_names_its_asker(kind: Option<McpServerKind>, asker: &str) {
+        let source = QuestionSource::Mcp {
+            server: MCP_SERVER.into(),
+            kind,
+            message: MCP_MESSAGE.into(),
+            url: None,
+        };
+        let event = QuestionEvent {
+            questions: Vec::new(),
+            source: Some(source.clone()),
+        };
+
+        let restored: QuestionEvent =
+            serde_json::from_value(serde_json::to_value(&event).unwrap()).unwrap();
+
+        assert_eq!(restored.source, Some(source));
+        assert_eq!(restored.source.unwrap().asker(), asker);
+    }
+
+    #[test]
+    fn the_reply_sentinels_never_read_as_answers() {
+        for reply in [
+            QUESTION_DISMISSED_REPLY,
+            QUESTION_DECLINED_REPLY,
+            QUESTION_ACCEPTED_REPLY,
+        ] {
+            assert!(serde_json::from_str::<Vec<Vec<String>>>(reply).is_err());
+        }
     }
 }

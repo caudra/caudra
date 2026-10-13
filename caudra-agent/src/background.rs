@@ -1066,6 +1066,7 @@ impl BackgroundTasks {
             !matches!(
                 envelope.event,
                 AgentEvent::Question(_)
+                    | AgentEvent::QuestionClosed
                     | AgentEvent::PermissionRequest(_)
                     | AgentEvent::PermissionRequestUpdated(_)
                     | AgentEvent::AuthRequired

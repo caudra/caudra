@@ -18,7 +18,11 @@ use agent_client_protocol_schema::v1::{
 #[cfg(test)]
 use caudra_agent::ToolOutput;
 use caudra_agent::headless::{self, InteractiveHandle, InteractiveParams};
+use caudra_agent::mcp::call::{ElicitMode, ElicitRequest, ElicitResponse, Elicitor};
 use caudra_agent::mcp::config::{McpServerStatus, RawHttpFields, RawStdioFields, RawTransport};
+use caudra_agent::mcp::elicitation::ElicitForm;
+use caudra_agent::mcp::elicitor::ElicitorFactory;
+use caudra_agent::mcp::transport::BoxFuture;
 use caudra_agent::mcp::{self, McpHandle};
 use caudra_agent::permissions::{
     EngineFlag, PermissionAdvisory, PermissionAnswer, PermissionRequest as CaudraPermissionRequest,
@@ -26,12 +30,13 @@ use caudra_agent::permissions::{
 use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, SystemPromptProfile};
 use caudra_agent::tools::native::plan::PlanTarget;
 use caudra_agent::tools::{
-    LocalToolFn, LocalTools, QUESTION_TOOL_NAME, ToolEffect, ToolError, ToolFailure, ToolRegistry,
-    typed_local_tool,
+    LocalToolFn, LocalTools, QUESTION_TOOL_NAME, ToolContext, ToolEffect, ToolError, ToolFailure,
+    ToolRegistry, typed_local_tool,
 };
 use caudra_agent::types::AgentEvent;
 use caudra_agent::{
-    AgentInput, AgentMode, Envelope, History, ImageMediaType, ImageSource, open_stored_session,
+    AgentInput, AgentMode, ElicitAction, Envelope, History, ImageMediaType, ImageSource,
+    open_stored_session,
 };
 use caudra_config::{MAX_SERVER_NAME_LEN, ModelPolicy};
 use caudra_providers::model::Model;
@@ -89,6 +94,9 @@ enum AskKind {
     },
     ResolvedPermission,
     Elicitation,
+    /// An MCP server's elicitation, answered on its own channel so a late
+    /// result for one the server withdrew reaches nobody.
+    McpElicitation(Sender<Value>),
 }
 
 type PendingState = Arc<Mutex<Pending>>;
@@ -141,6 +149,7 @@ struct Server {
     model_policy: Arc<ModelPolicy>,
     thinking: caudra_providers::ThinkingConfig,
     client_elicits_form: bool,
+    client_elicits_url: bool,
     client_asks_via_permission: bool,
     session: Option<SessionState>,
     failed_runtime: Option<AcpRuntime>,
@@ -177,6 +186,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         model_policy: Arc::clone(&params.model_policy),
         thinking: params.thinking.clone(),
         client_elicits_form: false,
+        client_elicits_url: false,
         client_asks_via_permission: false,
         session: None,
         failed_runtime: None,
@@ -306,6 +316,7 @@ async fn handle_request(
         "initialize" => {
             if let Ok(req) = parse_params::<InitializeRequest>(raw) {
                 srv.client_elicits_form = elicitation::supports_form(&req.client_capabilities);
+                srv.client_elicits_url = elicitation::supports_url(&req.client_capabilities);
                 srv.client_asks_via_permission = req
                     .client_info
                     .is_some_and(|info| info.name == PERMISSION_QUESTION_CLIENT);
@@ -624,6 +635,7 @@ async fn prepare_session(
         model_policy: Arc::clone(&params.model_policy),
         plugin_rules: Arc::clone(&runtime.plugin_rules),
         local_tools,
+        mcp_elicitors: mcp_elicitors(srv, &pending),
         // ACP has no wire shape for workflow runs, so a session under it
         // gets no runtime and the `workflow` tool reports unavailable.
         workflow_mode: None,
@@ -743,6 +755,116 @@ fn question_tool(
 /// Questions this client cannot render are the model's to rephrase.
 fn unaskable(message: String) -> ToolError {
     ToolError::new(ToolFailure::InvalidInput, message)
+}
+
+/// `None` for a client that renders no elicitation, so every MCP server's
+/// question is declined at once.
+fn mcp_elicitors(srv: &Server, pending: &PendingState) -> Option<Arc<dyn ElicitorFactory>> {
+    let elicitors = McpElicitors {
+        out_tx: srv.out_tx.clone(),
+        pending: Arc::clone(pending),
+        form: srv.client_elicits_form,
+        url: srv.client_elicits_url,
+    };
+    (elicitors.form || elicitors.url).then(|| Arc::new(elicitors) as Arc<dyn ElicitorFactory>)
+}
+
+/// Forwards MCP servers' elicitations to the client, in the modes it
+/// declared it renders.
+#[derive(Clone)]
+struct McpElicitors {
+    out_tx: Sender<Value>,
+    pending: PendingState,
+    form: bool,
+    url: bool,
+}
+
+struct McpElicitor {
+    client: McpElicitors,
+    session_id: String,
+    tool_call_id: Option<String>,
+}
+
+/// Forgets an ask whose wait was dropped, so its late result is discarded.
+struct ForgetAsk<'a> {
+    pending: &'a PendingState,
+    id: i64,
+}
+
+impl Drop for ForgetAsk<'_> {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().asks.remove(&self.id);
+    }
+}
+
+impl ElicitorFactory for McpElicitors {
+    /// A call without the answer channel is declined, as in the terminal. A
+    /// subagent's call is scoped to the parent's tool call, the only one of
+    /// its calls the client has seen.
+    fn for_call(&self, ctx: &ToolContext) -> Option<Arc<dyn Elicitor>> {
+        ctx.user_response_rx.as_ref()?;
+        Some(Arc::new(McpElicitor {
+            client: self.clone(),
+            session_id: ctx.session_id.as_ref()?.to_string(),
+            tool_call_id: shown_tool_call(ctx),
+        }))
+    }
+}
+
+/// The client never sees a subagent's own calls, nor a batch child, which
+/// dispatches with an empty id.
+fn shown_tool_call(ctx: &ToolContext) -> Option<String> {
+    ctx.root_tool_use_id
+        .as_ref()
+        .or(ctx.tool_use_id.as_ref())
+        .filter(|id| !id.is_empty())
+        .cloned()
+}
+
+impl Elicitor for McpElicitor {
+    fn elicit<'a>(
+        &'a self,
+        server: &'a str,
+        request: ElicitRequest,
+    ) -> BoxFuture<'a, ElicitResponse> {
+        Box::pin(async move {
+            let (rendered, form) = match &request.mode {
+                ElicitMode::Form { schema } => (self.client.form, ElicitForm::parse(schema).ok()),
+                ElicitMode::Url { .. } => (self.client.url, None),
+            };
+            if !rendered {
+                return ElicitResponse::unanswered(ElicitAction::Decline);
+            }
+            let elicitation_id = NEXT_OUTGOING_REQUEST_ID
+                .fetch_add(1, Ordering::Relaxed)
+                .to_string();
+            let create = match elicitation::mcp_request(
+                &self.session_id,
+                self.tool_call_id.clone(),
+                elicitation_id,
+                &request,
+            ) {
+                Ok(create) => create,
+                Err(error) => {
+                    warn!(server, %error, "declined an MCP form the client cannot be sent");
+                    return ElicitResponse::unanswered(ElicitAction::Decline);
+                }
+            };
+            let (answer_tx, answer) = flume::bounded(1);
+            let id = ask_client(
+                &self.client.out_tx,
+                &self.client.pending,
+                AskKind::McpElicitation(answer_tx),
+                AgentRequest::CreateElicitationRequest(create),
+            );
+            let _forget = ForgetAsk {
+                pending: &self.client.pending,
+                id,
+            };
+            let result = answer.recv_async().await.unwrap_or(Value::Null);
+            elicitation::mcp_response(result, form.as_ref())
+        })
+    }
 }
 
 /// Servers the client injects on `session/new` and `session/load`. A transport we
@@ -1178,6 +1300,9 @@ fn handle_incoming_response(srv: &Server, raw: &Value) {
                 .to_string();
             let _ = session.handle.answer_tx.send(answer);
         }
+        AskKind::McpElicitation(answer) => {
+            let _ = answer.send(raw.get("result").cloned().unwrap_or(Value::Null));
+        }
     }
 }
 
@@ -1223,7 +1348,13 @@ fn request_permission(
 }
 
 fn permission_content(request: &CaudraPermissionRequest) -> Vec<ToolCallContent> {
-    let mut text = permission_scope_summary(&request.scopes);
+    let mut text = request
+        .mcp
+        .as_ref()
+        .and_then(|facts| facts.note.as_deref())
+        .map(|note| format!("{note}\n\n"))
+        .unwrap_or_default();
+    text.push_str(&permission_scope_summary(&request.scopes));
     let mut has_advisories = false;
     for flag in EngineFlag::ALL {
         if let Some(caution) = request
@@ -1489,11 +1620,12 @@ fn json_str(e: &(impl std::fmt::Display + ?Sized)) -> Value {
 #[cfg(test)]
 mod tests {
     use crate::AcpRuntimeGuard;
-    use caudra_agent::SubagentInfo;
     use caudra_agent::permissions::{
         PermissionAdvisory, PermissionLifetime, PermissionManager, PermissionRequest,
     };
     use caudra_agent::tools::PermissionScopes;
+    use caudra_agent::tools::test_support::stub_ctx;
+    use caudra_agent::{McpCallFacts, McpServerKind, SubagentInfo};
     use caudra_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use caudra_storage::StateDir;
     use caudra_storage::sessions::Session;
@@ -1518,9 +1650,21 @@ mod tests {
     const ADVISORY_PROBABILITY: f64 = 0.875;
     const DELETE_CAUTION: &str = "Decision engine caution: May delete files (88%).";
     const UPLOAD_CAUTION: &str = "Decision engine caution: May upload or send data (88%).";
+    const MCP_NOTE: &str = "Home Assistant lock devices always ask";
     const PLAN_FILE: &str = "plan.md";
     const PLAN_CONTENT: &str = "# Plan\nShip it.";
     const REMOTE_PLAN_REF: &str = "plan-test";
+    const MCP_SERVER: &str = "deploys";
+    const MCP_MESSAGE: &str = "Where should the release go?";
+    const MCP_TOOL_CALL: &str = "toolu_mcp";
+    const MCP_TASK_CALL: &str = "toolu_task";
+    const BATCH_CHILD_CALL: &str = "";
+    const MCP_FIELD: &str = "branch";
+    const MCP_ANSWER: &str = "main";
+    const MCP_URL: &str = "https://example.com/authorize";
+    const ELICITATION_METHOD: &str = "elicitation/create";
+    const ANSWER_CHANNEL_CLEAR: &str =
+        "an MCP answer must never reach the session's answer channel";
 
     fn stored_local_plan(path: &Path) -> StoredPlanTarget {
         StoredPlanTarget::LocalPath {
@@ -1625,6 +1769,25 @@ mod tests {
         } else {
             assert_eq!(text, permission_scope_summary(&request.scopes));
         }
+    }
+
+    #[test]
+    fn mcp_note_leads_the_permission_text() {
+        let mut request = advisory_request(EngineFlag::Deletes, f64::NAN);
+        request.mcp = Some(McpCallFacts {
+            kind: McpServerKind::HomeAssistant,
+            read_only: false,
+            note: Some(MCP_NOTE.into()),
+        });
+        let content = serde_json::to_value(permission_content(&request)).unwrap();
+        let text = content[0]["content"]["text"].as_str().unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "{MCP_NOTE}\n\n{}",
+                permission_scope_summary(&request.scopes)
+            )
+        );
     }
 
     #[test]
@@ -1831,6 +1994,7 @@ mod tests {
             model_policy: Arc::new(ModelPolicy::default()),
             thinking: Default::default(),
             client_elicits_form: false,
+            client_elicits_url: false,
             client_asks_via_permission: false,
             failed_runtime: None,
             session: Some(SessionState {
@@ -2063,6 +2227,126 @@ mod tests {
             serde_json::from_str::<Value>(&forwarded).unwrap(),
             raw["result"]
         );
+    }
+
+    fn mcp_elicitor(srv: &Server, form: bool, url: bool) -> McpElicitor {
+        let session = srv.session.as_ref().unwrap();
+        McpElicitor {
+            client: McpElicitors {
+                out_tx: srv.out_tx.clone(),
+                pending: Arc::clone(&session.pending),
+                form,
+                url,
+            },
+            session_id: session.handle.session_id.as_str().to_owned(),
+            tool_call_id: Some(MCP_TOOL_CALL.into()),
+        }
+    }
+
+    fn mcp_form() -> ElicitRequest {
+        ElicitRequest {
+            mode: ElicitMode::Form {
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {MCP_FIELD: {"type": "string"}},
+                }),
+            },
+            message: MCP_MESSAGE.into(),
+            kind: None,
+        }
+    }
+
+    #[test]
+    fn an_mcp_elicitation_round_trips_through_the_client() {
+        let (srv, answer_rx, out_rx) = server_with_asks(permission_manager(), HashMap::new());
+        let elicitor = mcp_elicitor(&srv, true, false);
+
+        let (response, ()) = smol::block_on(smol::future::zip(
+            elicitor.elicit(MCP_SERVER, mcp_form()),
+            async {
+                let sent = out_rx.recv_async().await.unwrap();
+                assert_eq!(sent["method"], ELICITATION_METHOD);
+                assert_eq!(sent["params"]["message"], MCP_MESSAGE);
+                assert_eq!(sent["params"]["toolCallId"], MCP_TOOL_CALL);
+                assert_eq!(
+                    sent["params"]["requestedSchema"]["properties"][MCP_FIELD]["type"],
+                    "string"
+                );
+                let result =
+                    serde_json::json!({"action": "accept", "content": {MCP_FIELD: MCP_ANSWER}});
+                handle_incoming_response(
+                    &srv,
+                    &serde_json::json!({"id": sent["id"], "result": result}),
+                );
+            },
+        ));
+
+        assert_eq!(response.action, ElicitAction::Accept);
+        assert_eq!(
+            response.content,
+            serde_json::json!({MCP_FIELD: MCP_ANSWER})
+                .as_object()
+                .cloned()
+        );
+        assert_eq!(response.answers, [(MCP_FIELD.into(), MCP_ANSWER.into())]);
+        assert!(answer_rx.is_empty(), "{ANSWER_CHANNEL_CLEAR}");
+    }
+
+    #[test]
+    fn an_mcp_elicitation_in_a_mode_the_client_lacks_is_declined_unsent() {
+        let (srv, _, out_rx) = server_with_asks(permission_manager(), HashMap::new());
+        let request = ElicitRequest {
+            mode: ElicitMode::Url {
+                url: MCP_URL.into(),
+            },
+            ..mcp_form()
+        };
+
+        let response = smol::block_on(mcp_elicitor(&srv, true, false).elicit(MCP_SERVER, request));
+
+        assert_eq!(response, ElicitResponse::unanswered(ElicitAction::Decline));
+        assert!(out_rx.is_empty());
+    }
+
+    #[test_case(None, Some(MCP_TOOL_CALL) => Some(MCP_TOOL_CALL.to_owned()) ; "the_main_agents_own")]
+    #[test_case(Some(MCP_TASK_CALL), Some(MCP_TOOL_CALL) => Some(MCP_TASK_CALL.to_owned()) ; "a_subagents_task")]
+    #[test_case(None, Some(BATCH_CHILD_CALL) => None ; "none_for_a_batch_child")]
+    fn an_mcp_elicitation_is_scoped_to_a_call_the_client_saw(
+        root: Option<&str>,
+        call: Option<&str>,
+    ) -> Option<String> {
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.root_tool_use_id = root.map(str::to_owned);
+        ctx.tool_use_id = call.map(str::to_owned);
+        shown_tool_call(&ctx)
+    }
+
+    #[test_case(false, false => false ; "neither_mode")]
+    #[test_case(true, false => true ; "form")]
+    #[test_case(false, true => true ; "url")]
+    fn only_a_client_that_renders_elicitation_is_asked(form: bool, url: bool) -> bool {
+        let (mut srv, ..) = server_with_asks(permission_manager(), HashMap::new());
+        srv.client_elicits_form = form;
+        srv.client_elicits_url = url;
+        mcp_elicitors(&srv, &PendingState::default()).is_some()
+    }
+
+    #[test]
+    fn a_withdrawn_mcp_elicitation_forgets_its_ask() {
+        let (srv, _, out_rx) = server_with_asks(permission_manager(), HashMap::new());
+        let elicitor = mcp_elicitor(&srv, true, false);
+
+        smol::block_on(smol::future::or(
+            async {
+                elicitor.elicit(MCP_SERVER, mcp_form()).await;
+            },
+            async {
+                out_rx.recv_async().await.unwrap();
+            },
+        ));
+
+        let session = srv.session.as_ref().unwrap();
+        assert!(session.pending.lock().unwrap().asks.is_empty());
     }
 
     #[test]

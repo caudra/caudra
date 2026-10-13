@@ -66,7 +66,8 @@ use caudra_agent::tools::{
     VIEW_IMAGE_TOOL_NAME, native,
 };
 use caudra_agent::types::{
-    AskedQuestion, QuestionEvent, QuestionOption, TodoItem, TodoPriority, TodoStatus,
+    AnswerKind, AskedQuestion, QuestionEvent, QuestionOption, QuestionSource, TodoItem,
+    TodoPriority, TodoStatus,
 };
 use caudra_agent::{
     BatchProgressEvent, BatchToolEntry, BatchToolStatus, CallStage, CancelToken, DoneReason,
@@ -5919,18 +5920,22 @@ fn a_permission_prompt_suppresses_peer_manager_without_discarding_it() {
 fn peer_manager_captures_wheel_above_a_question_that_arrives_later() {
     let mut app = test_app();
     app.open_peer_manager(PeerView::Sessions);
-    app.question_form.open(vec![AskedQuestion {
-        question: (0..PEER_MANAGER_QUESTION_LINES)
-            .map(|index| format!("{index}: {QUESTION_TEXT}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        header: QUESTION_HEADER.into(),
-        options: vec![QuestionOption {
-            label: QUESTION_OPTION.into(),
-            description: String::new(),
+    app.question_form.open(
+        vec![AskedQuestion {
+            question: (0..PEER_MANAGER_QUESTION_LINES)
+                .map(|index| format!("{index}: {QUESTION_TEXT}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            header: QUESTION_HEADER.into(),
+            options: vec![QuestionOption {
+                label: QUESTION_OPTION.into(),
+                description: String::new(),
+            }],
+            multiple: false,
+            ..Default::default()
         }],
-        multiple: false,
-    }]);
+        None,
+    );
     rendered(&mut app);
     let (_, bottom, ..) = app.layout_geometry(TEST_AREA);
     let position = (bottom.y..bottom.bottom())
@@ -6713,8 +6718,8 @@ const QUESTION_ANSWER_HEAD: char = '>';
 const EXPECT_RUN_LEFT_ALONE: &str = "only a cancel may stop the run that asked";
 
 fn open_question(app: &mut App) {
-    app.question_form
-        .open(vec![caudra_agent::types::AskedQuestion {
+    app.question_form.open(
+        vec![caudra_agent::types::AskedQuestion {
             question: QUESTION_TEXT.into(),
             header: QUESTION_HEADER.into(),
             options: vec![caudra_agent::types::QuestionOption {
@@ -6722,7 +6727,46 @@ fn open_question(app: &mut App) {
                 description: String::new(),
             }],
             multiple: false,
-        }]);
+            ..Default::default()
+        }],
+        None,
+    );
+}
+
+const ELICITING_SERVER: &str = "tracker";
+const ELICITING_MESSAGE: &str = "Sign in to continue";
+const LOOKALIKE_ADDRESS: &str = "https://xn--pple-43d.com/login";
+
+fn mcp_source(url: Option<&str>) -> QuestionSource {
+    QuestionSource::Mcp {
+        server: ELICITING_SERVER.into(),
+        kind: None,
+        message: ELICITING_MESSAGE.into(),
+        url: url.map(str::to_owned),
+    }
+}
+
+/// A server's form with a number to type, left empty and submitted so its
+/// problem shows under the box.
+fn open_server_form(app: &mut App) {
+    let count = AskedQuestion {
+        question: QUESTION_TEXT.into(),
+        header: QUESTION_HEADER.into(),
+        answer: AnswerKind::Number {
+            integer: true,
+            minimum: None,
+            maximum: None,
+        },
+        ..Default::default()
+    };
+    app.question_form.open(vec![count], Some(mcp_source(None)));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+}
+
+/// A server asking for an address to be opened that only looks familiar.
+fn open_server_address(app: &mut App) {
+    app.question_form
+        .open(Vec::new(), Some(mcp_source(Some(LOOKALIKE_ADDRESS))));
 }
 
 /// A full transcript with the question form waiting under it.
@@ -6841,6 +6885,78 @@ fn ctrl_c_on_a_subagent_question_cancels_only_that_subagent() {
     assert_eq!(app.run_id, run_id, "{EXPECT_RUN_LEFT_ALONE}");
     assert!(app.chats[1].is_finished());
     assert!(!app.question_form.is_open());
+}
+
+const EXPECT_NO_REPLY: &str = "a withdrawn form has nobody waiting for its answer";
+
+fn server_question(url: Option<&str>) -> AgentEvent {
+    AgentEvent::Question(Box::new(QuestionEvent {
+        questions: Vec::new(),
+        source: Some(mcp_source(url)),
+    }))
+}
+
+/// The main agent's run, waiting on a server's request for consent.
+fn server_request_app() -> (App, flume::Receiver<String>) {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let (answer_tx, answers) = flume::unbounded();
+    app.answer_tx = Some(answer_tx);
+    app.update(agent_msg(server_question(Some(LOOKALIKE_ADDRESS))));
+    assert!(app.question_form.is_open());
+    (app, answers)
+}
+
+#[test_case(key(KeyCode::Enter), QUESTION_ACCEPTED_REPLY ; "accept")]
+#[test_case(kb::QUESTION_DECLINE.to_key_event(), QUESTION_DECLINED_REPLY ; "decline")]
+#[test_case(key(KeyCode::Esc), QUESTION_DISMISSED_REPLY ; "dismiss")]
+fn a_server_request_is_answered_with_its_reply(press: KeyEvent, reply: &str) {
+    let (mut app, answers) = server_request_app();
+
+    let actions = app.update(Msg::Key(press));
+
+    assert!(actions.is_empty(), "{EXPECT_RUN_LEFT_ALONE}");
+    assert!(!app.question_form.is_open());
+    assert_eq!(answers.try_recv().unwrap(), reply);
+}
+
+#[test]
+fn a_withdrawn_request_closes_its_form_without_a_reply() {
+    let (mut app, answers) = server_request_app();
+
+    app.update(agent_msg(AgentEvent::QuestionClosed));
+
+    assert!(!app.question_form.is_open());
+    assert_eq!(
+        answers.try_recv(),
+        Err(TryRecvError::Empty),
+        "{EXPECT_NO_REPLY}"
+    );
+}
+
+#[test]
+fn a_subagent_cannot_withdraw_the_main_agents_form() {
+    let (mut app, answers) = server_request_app();
+
+    app.update(subagent_msg(AgentEvent::QuestionClosed, TASK_ID, None));
+
+    assert!(app.question_form.is_open());
+    assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[test]
+fn a_subagent_withdraws_only_its_own_form() {
+    let mut app = app_with_subagent();
+    app.update(subagent_msg(server_question(None), TASK_ID, None));
+    assert_eq!(app.question_subagent.as_deref(), Some(TASK_ID));
+
+    app.update(agent_msg(AgentEvent::QuestionClosed));
+    assert!(app.question_form.is_open(), "the main agent asked nothing");
+
+    app.update(subagent_msg(AgentEvent::QuestionClosed, TASK_ID, None));
+    assert!(!app.question_form.is_open());
+    assert_eq!(app.question_subagent, None);
 }
 
 /// Where the pointer is decides whose wheel event it is.
@@ -7246,8 +7362,10 @@ fn an_mcp_prompt_is_bound_to_the_message_the_agent_records() {
                 display_name: MCP_PROMPT_SERVER_NAME.into(),
                 qualified_name: MCP_PROMPT_QUALIFIED_NAME.into(),
                 description: MCP_PROMPT_DESCRIPTION.into(),
+                completions: false,
                 arguments: Vec::new(),
             }],
+            resources: Vec::new(),
             pids: Vec::new(),
             generation: 0,
         }),
@@ -16487,8 +16605,11 @@ fn mcp_toggle_dispatches_action() {
                     environment_names: vec![],
                     header_names: vec![],
                 },
+                kind: None,
+                discovery: None,
             }],
             prompts: vec![],
+            resources: Vec::new(),
             pids: vec![],
             generation: 0,
         }),
@@ -16562,8 +16683,11 @@ fn awaiting_mcp_picker() -> McpPicker {
                     environment_names: vec!["PROJECT_TOKEN".into()],
                     header_names: vec![],
                 },
+                kind: None,
+                discovery: None,
             }],
             prompts: vec![],
+            resources: Vec::new(),
             pids: vec![],
             generation: 0,
         }),
@@ -17832,7 +17956,7 @@ fn question_btw_is_discarded_when_the_form_finishes(code: KeyCode) {
         }
         KeyCode::Esc => {
             assert!(actions.is_empty());
-            assert_eq!(answers.try_recv().unwrap(), QUESTION_DISMISSED);
+            assert_eq!(answers.try_recv().unwrap(), QUESTION_DISMISSED_REPLY);
         }
         _ => assert!(matches!(
             actions.as_slice(),
@@ -17861,7 +17985,9 @@ fn question_btw_is_discarded_when_an_agent_replaces_the_form(hidden: bool) {
                     description: String::new(),
                 }],
                 multiple: false,
+                ..Default::default()
             }],
+            source: None,
         }))))
         .is_empty()
     );
@@ -17927,18 +18053,22 @@ fn question_btw_missing_initialization_preserves_the_form() {
 #[test]
 fn question_btw_owns_overlapping_wheel_and_mouse_and_outside_click_returns_to_the_form() {
     let (mut app, answers) = question_btw_app();
-    app.question_form.open(vec![AskedQuestion {
-        question: (0..PEER_MANAGER_QUESTION_LINES)
-            .map(|index| format!("{index}: {QUESTION_TEXT}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        header: QUESTION_HEADER.into(),
-        options: vec![QuestionOption {
-            label: QUESTION_OPTION.into(),
-            description: String::new(),
+    app.question_form.open(
+        vec![AskedQuestion {
+            question: (0..PEER_MANAGER_QUESTION_LINES)
+                .map(|index| format!("{index}: {QUESTION_TEXT}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            header: QUESTION_HEADER.into(),
+            options: vec![QuestionOption {
+                label: QUESTION_OPTION.into(),
+                description: String::new(),
+            }],
+            multiple: false,
+            ..Default::default()
         }],
-        multiple: false,
-    }]);
+        None,
+    );
     app.update(Msg::Key(key(KeyCode::Down)));
     app.update(Msg::Key(key(KeyCode::Enter)));
     app.update(Msg::Paste(QUESTION_ANSWER.into()));
@@ -21263,8 +21393,10 @@ fn associated_shift_tab_navigates_questions_backward(code: KeyCode) {
                     description: String::new(),
                 }],
                 multiple: false,
+                ..Default::default()
             })
             .collect(),
+        None,
     );
     let first = rendered_question(&mut app);
     app.update(associated_key(key(KeyCode::Tab), None));
@@ -22781,15 +22913,19 @@ fn pane_status_permission_outranks_auth_and_streaming(tool: ToolKey) {
 fn pane_status_question_form_requires_a_decision(status: Status) {
     let mut app = test_app();
     app.status = status;
-    app.question_form.open(vec![AskedQuestion {
-        question: QUESTION_TEXT.into(),
-        header: QUESTION_HEADER.into(),
-        options: vec![QuestionOption {
-            label: QUESTION_OPTION.into(),
-            description: String::new(),
+    app.question_form.open(
+        vec![AskedQuestion {
+            question: QUESTION_TEXT.into(),
+            header: QUESTION_HEADER.into(),
+            options: vec![QuestionOption {
+                label: QUESTION_OPTION.into(),
+                description: String::new(),
+            }],
+            multiple: false,
+            ..Default::default()
         }],
-        multiple: false,
-    }]);
+        None,
+    );
     assert_eq!(
         app.pane_status().state,
         PaneState::Blocked(Some(BlockKind::Question)),
@@ -26605,10 +26741,12 @@ mod theme_colours {
         open_goal_modal, open_help_modal, open_logs_modal, open_model_picker,
         open_permission_test_editor, open_permission_test_leader, open_projection_modal,
         open_question, open_queue_menu, open_relocation_picker, open_repeat_test_session_picker,
-        open_search, open_skills_modal, open_storage_modal, open_system_prompt_modal,
-        open_tools_modal, open_usage_modal, press_chord, queued_msg, test_app,
+        open_search, open_server_address, open_server_form, open_skills_modal, open_storage_modal,
+        open_system_prompt_modal, open_tools_modal, open_usage_modal, press_chord, queued_msg,
+        test_app,
     };
     use crate::components::messages::ASSISTANT_LABEL;
+    use crate::components::permission_prompt::{MCP_NOTE, mcp_request};
     use crate::components::sandbox_manager::SandboxView;
     use crate::components::worktree_picker::{WorktreeOverview, WorktreeView};
     use crate::components::{Overlay, key};
@@ -26713,6 +26851,14 @@ mod theme_colours {
             shown: |app| app.workbench.is_open() && app.permission_prompt.is_open(),
         },
         Surface {
+            name: "recognised_mcp_permission_prompt",
+            open: |app, _| {
+                app.permission_prompt
+                    .enqueue(Box::new(mcp_request(true, Some(MCP_NOTE))), None);
+            },
+            shown: |app| app.permission_prompt.is_open(),
+        },
+        Surface {
             name: "question_form",
             open: |app, _| open_question(app),
             shown: |app| app.question_form.is_open(),
@@ -26724,6 +26870,16 @@ mod theme_colours {
                 open_question(app);
             },
             shown: |app| app.workbench.is_open() && app.question_form.is_open(),
+        },
+        Surface {
+            name: "server_form",
+            open: |app, _| open_server_form(app),
+            shown: |app| app.question_form.is_open(),
+        },
+        Surface {
+            name: "server_address",
+            open: |app, _| open_server_address(app),
+            shown: |app| app.question_form.is_open(),
         },
         Surface {
             name: "logs_modal",
@@ -27147,6 +27303,12 @@ mod theme_colours {
             let mut held = Held::new();
             (surface.open)(&mut app, &mut held);
             assert!((surface.shown)(&app), "{}: {NOT_SHOWN}", surface.name);
+            // A splash mid-fade or mid-route draws greys that land on the
+            // other theme's foreground at whatever moment the clock and its
+            // random seed happen to pick.
+            for chat in &mut app.chats {
+                chat.settle_splash();
+            }
 
             let before = draw(&mut app);
             let reset = cells(&before, in_terminal_colours);

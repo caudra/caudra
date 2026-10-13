@@ -7,16 +7,18 @@ use serde_json::Value;
 
 use caudra_providers::{estimate_tokens_cached, token_label};
 
+use super::elicitation::ElicitAction;
+use super::kind::McpServerKind;
 use super::protocol::{CallToolContent, CallToolResult};
 use super::{SEPARATOR, WIRE_SEPARATOR};
-use crate::types::{CARD_ANNOTATION_SEPARATOR, LINE_NOUN, counted};
+use crate::types::{Answerer, CARD_ANNOTATION_SEPARATOR, LINE_NOUN, counted};
 
 /// How an MCP call's start summary opens, ahead of its qualified name.
 pub const MCP_SUMMARY_PREFIX: &str = "mcp: ";
 const JSON_LABEL: &str = "JSON";
-const IMAGE_KIND: &str = "image";
+pub(super) const IMAGE_KIND: &str = "image";
 const AUDIO_KIND: &str = "audio";
-const RESOURCE_KIND: &str = "resource";
+pub(super) const RESOURCE_KIND: &str = "resource";
 const RESOURCE_LINK_KIND: &str = "resource_link";
 const LINK_NOUN: &str = "link";
 const MODEL_SEPARATOR: &str = "\n";
@@ -26,6 +28,39 @@ const BASE64_PADDING: char = '=';
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct McpOutput {
     pub blocks: Vec<McpBlock>,
+    /// `structuredContent` when a text block mirrors it, so the generic card
+    /// draws the text once while a server's own card can still read the value.
+    /// Without text it is the [`McpBlock::Structured`] block instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<McpServerKind>,
+    /// The tool's display title, when the server gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The server answered with `isError`: a failure the model reads as one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_error: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interactions: Vec<McpInteraction>,
+    /// Why `structuredContent` did not match the tool's `outputSchema`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_mismatch: Option<String>,
+}
+
+/// One thing the server asked the user during the call, and what came of it.
+/// Values of fields that look like credentials are never kept.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpInteraction {
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    pub action: ElicitAction,
+    #[serde(default, skip_serializing_if = "Answerer::is_user")]
+    pub by: Answerer,
+    /// `(label, value)` for each answered field, in form order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answers: Vec<(String, String)>,
 }
 
 /// One block of a result. Media and blobs keep only their size: the card
@@ -80,13 +115,28 @@ impl McpOutput {
             .into_iter()
             .map(McpBlock::from_content)
             .collect();
-        if let Some(value) = result
-            .structured_content
-            .filter(|_| !blocks.iter().any(McpBlock::has_text))
+        let mut structured = result.structured_content;
+        if !blocks.iter().any(McpBlock::has_text)
+            && let Some(value) = structured.take()
         {
             blocks.push(McpBlock::Structured { value });
         }
-        Self { blocks }
+        Self {
+            blocks,
+            structured,
+            is_error: result.is_error,
+            ..Self::default()
+        }
+    }
+
+    /// The call's `structuredContent`, wherever it was kept.
+    pub fn structured_content(&self) -> Option<&Value> {
+        self.structured.as_ref().or_else(|| {
+            self.blocks.iter().find_map(|block| match block {
+                McpBlock::Structured { value } => Some(value),
+                _ => None,
+            })
+        })
     }
 
     /// Exactly what the joined `text` of every content block was, which is
@@ -251,7 +301,7 @@ impl McpBlock {
     }
 }
 
-fn media_label(kind: &str, mime_type: &Option<String>, bytes: usize) -> String {
+pub(crate) fn media_label(kind: &str, mime_type: &Option<String>, bytes: usize) -> String {
     match mime_type {
         Some(mime_type) => format!("[{kind}: {mime_type}, {bytes} bytes]"),
         None => format!("[{kind}: {bytes} bytes]"),
@@ -259,7 +309,7 @@ fn media_label(kind: &str, mime_type: &Option<String>, bytes: usize) -> String {
 }
 
 /// Bytes a base64 payload decodes to, without decoding it.
-fn decoded_len(data: &str) -> usize {
+pub(crate) fn decoded_len(data: &str) -> usize {
     data.trim_end_matches(BASE64_PADDING).len() * 3 / 4
 }
 

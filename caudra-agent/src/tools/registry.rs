@@ -23,6 +23,7 @@ use caudra_workspace::{RecordScope, TransportErrorKind, WorkspaceError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::mcp::kind::McpCallFacts;
 use crate::permissions::{
     PermissionAuthorityProfile, PermissionExecutorKind, PermissionResource, PermissionRisk,
     PermissionSubject, RemotePermissionIdentity,
@@ -558,6 +559,8 @@ pub struct PermissionIntent {
     pub resources: Vec<PermissionResource>,
     pub risk: PermissionRisk,
     pub authority: PermissionAuthorityProfile,
+    /// What the prompt knows about a call to a recognised MCP server.
+    pub mcp: Option<McpCallFacts>,
 }
 
 impl PermissionIntent {
@@ -571,6 +574,7 @@ impl PermissionIntent {
             resources,
             risk,
             authority: PermissionAuthorityProfile::default(),
+            mcp: None,
         }
     }
 

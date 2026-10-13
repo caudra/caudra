@@ -1,9 +1,14 @@
-//! The form behind the `question` tool: one tab per question, an option list,
-//! and a free-text answer the user can type instead.
+//! The form behind the `question` tool and MCP elicitations: one tab per
+//! question, an option list, and a free-text answer the user can type instead.
+//! A server's text or number field opens the answer box directly and checks
+//! what is typed before moving on, and a server's request to open an address
+//! asks only for consent.
 //!
 //! The form holds only what the user has picked. Everything on screen is
 //! derived from that plus the questions, so a resize or a theme switch can
 //! never disagree with what will be submitted.
+
+use std::ops::Range;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -11,9 +16,11 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
+use url::Url;
 
+use caudra_agent::mcp::elicitation::{REQUIRED, describe_answer, validate_answer};
 use caudra_agent::permissions::AutopilotNote;
-use caudra_agent::types::AskedQuestion;
+use caudra_agent::types::{AskedQuestion, QuestionSource};
 use caudra_grab::grab_scope;
 use caudra_workbench::buffer::Cursor;
 use caudra_workbench::render::Row;
@@ -28,9 +35,24 @@ use crate::repaint::Cadence;
 use crate::theme;
 
 const TITLE: &str = " Question ";
+const ASKS: &str = "asks";
 const CUSTOM_OPTION: &str = "Type your own answer";
-const MULTI_HINT: &str = "  (multiple answers)";
-const SINGLE_HINT: &str = "  (single answer)";
+const MULTIPLE_ANSWERS: &str = "multiple answers";
+const SINGLE_ANSWER: &str = "single answer";
+const OPTIONAL_NOTE: &str = ", optional";
+const KIND_INDENT: &str = "  ";
+const ERROR_MARK: &str = " ✗ ";
+const WARNING_MARK: &str = " ⚠ ";
+const LOOKALIKE_WARNING: &str = "This address uses lookalike characters";
+const LOOKALIKE_HOST: &str = ", it really goes to ";
+const PUNYCODE_PREFIX: &str = "xn--";
+const SCHEME_SEPARATOR: &str = "://";
+const OPEN_IN_BROWSER: &str = "Open in browser";
+const ACCEPT: &str = "Accept";
+const DECLINE: &str = "Decline";
+/// The consent rows: accepting, then declining.
+const ACCEPT_ROW: usize = 0;
+const DECLINE_ROW: usize = 1;
 const NO_ANSWER: &str = "(no answer)";
 const REVIEW_HEADING: &str = " Review your answers:";
 /// A description sits under its label, past the pointer and the mark.
@@ -46,8 +68,10 @@ const LINE_BREAK: &str = "\n";
 const ASK_HINT: Hint = Hint::bind(key::QUESTION_ASK_BTW, "Ask /btw");
 const COMPACT_ASK_HINT: Hint = Hint::bind(key::QUESTION_ASK_BTW, "Ask");
 const ASK_HINT_INDEX: usize = 0;
-/// Autopilot's note and the blank row under it.
-const NOTE_LINES: u16 = 2;
+const DECLINE_HINT: Hint = Hint::bind(key::QUESTION_DECLINE, "decline");
+/// Every bar ends on dismiss and cancel, and a server's form adds decline
+/// right before them.
+const CLOSING_HINTS: usize = 2;
 
 const SHIFT_ENTER: Bind = Bind {
     code: KeyCode::Enter,
@@ -60,6 +84,15 @@ const EDITING_HINTS: [Hint; 5] = [
     Hint::bind(key::ENTER, "submit"),
     Hint::bind(SHIFT_ENTER, "newline"),
     Hint::bind(key::ESC, "back"),
+    Hint::bind(key::QUIT, "cancel"),
+];
+/// A server's text or number field has no list to go back to, so `Esc`
+/// dismisses it like every other question.
+const TYPED_HINTS: [Hint; 5] = [
+    ASK_HINT,
+    Hint::bind(key::ENTER, "next"),
+    Hint::bind(key::SHIFT_TAB, "back"),
+    Hint::bind(key::ESC, "dismiss"),
     Hint::bind(key::QUIT, "cancel"),
 ];
 const CONFIRMING_HINTS: [Hint; 5] = [
@@ -83,6 +116,11 @@ const SINGLE_SELECT_HINTS: [Hint; 5] = [
     Hint::bind(key::ESC, "dismiss"),
     Hint::bind(key::QUIT, "cancel"),
 ];
+const CONSENT_HINTS: [Hint; 3] = [
+    Hint::bind(key::ENTER, "select"),
+    Hint::bind(key::ESC, "dismiss"),
+    Hint::bind(key::QUIT, "cancel"),
+];
 
 pub enum QuestionFormAction {
     Consumed,
@@ -90,6 +128,11 @@ pub enum QuestionFormAction {
     /// One label list per question, in question order. An empty list is a
     /// question the user skipped.
     Submit(Vec<Vec<String>>),
+    /// Consent to a server's request that asks for no answers: opening the
+    /// address it gave, or a form with no fields.
+    Accept,
+    /// Turn a server's request down outright.
+    Decline,
     /// Answer nothing and let the asking agent carry on.
     Dismiss,
     /// Stop the agent that asked, so only a new message moves it again.
@@ -107,6 +150,10 @@ enum Mode {
 
 pub struct QuestionForm {
     questions: Vec<AskedQuestion>,
+    /// `None` for the agent's own `question` tool.
+    source: Option<QuestionSource>,
+    /// Why the answer on screen cannot be sent yet, until it changes.
+    error: Option<String>,
     mode: Mode,
     tab: usize,
     cursor: usize,
@@ -195,6 +242,8 @@ impl QuestionForm {
     pub fn new() -> Self {
         Self {
             questions: Vec::new(),
+            source: None,
+            error: None,
             mode: Mode::Selecting,
             tab: 0,
             cursor: 0,
@@ -210,23 +259,28 @@ impl QuestionForm {
         }
     }
 
-    pub fn open(&mut self, questions: Vec<AskedQuestion>) {
+    /// Opens on the first question, with every default already picked. A
+    /// server's request with no questions asks for consent alone.
+    pub fn open(&mut self, questions: Vec<AskedQuestion>, source: Option<QuestionSource>) {
         self.autopilot_note = None;
-        self.answers = vec![Vec::new(); questions.len()];
+        self.answers = questions
+            .iter()
+            .map(|question| question.default.clone())
+            .collect();
         self.questions = questions;
+        self.source = source;
         self.mode = Mode::Selecting;
-        self.tab = 0;
-        self.cursor = 0;
         self.custom.clear();
         self.scroll = 0;
         self.follow_cursor = true;
         self.row_hits.clear();
         self.mouse_down = None;
         self.hover = None;
+        self.enter(0);
     }
 
     pub fn is_open(&self) -> bool {
-        !self.questions.is_empty()
+        !self.questions.is_empty() || self.source.is_some()
     }
 
     pub(crate) fn text_input_active(&self) -> bool {
@@ -257,11 +311,7 @@ impl QuestionForm {
                     self.questions.len(),
                     tab_label(index, question),
                     question.question,
-                    if question.multiple {
-                        MULTI_HINT.trim()
-                    } else {
-                        SINGLE_HINT.trim()
-                    },
+                    kind_hint(question).trim(),
                     options,
                 )
             })
@@ -280,6 +330,8 @@ impl QuestionForm {
     pub fn close(&mut self) {
         self.autopilot_note = None;
         self.questions.clear();
+        self.source = None;
+        self.error = None;
         self.answers.clear();
         self.row_hits.clear();
         self.mouse_down = None;
@@ -291,12 +343,18 @@ impl QuestionForm {
         if !self.is_open() {
             return QuestionFormAction::Consumed;
         }
-        if key::QUESTION_ASK_BTW.matches(key) {
+        if key::QUESTION_ASK_BTW.matches(key) && !self.is_consent() {
             self.hover = None;
             self.mouse_down = None;
             return QuestionFormAction::AskBtw;
         }
+        if key::QUESTION_DECLINE.matches(key) && self.source.is_some() {
+            return QuestionFormAction::Decline;
+        }
         self.follow_cursor = true;
+        if self.is_consent() {
+            return self.key_consent(key);
+        }
         match self.mode {
             Mode::Selecting => self.key_selecting(key),
             Mode::EditingCustom => self.key_editing(key),
@@ -315,6 +373,7 @@ impl QuestionForm {
         if !paste {
             self.follow_cursor = true;
         }
+        self.error = None;
         self.custom.handle_text(text, paste);
         true
     }
@@ -361,9 +420,13 @@ impl QuestionForm {
         }
         self.scroll = self.scroll.min(rows.total.saturating_sub(visible));
         let t = theme::current();
+        let title = match &self.source {
+            Some(source) => format!(" {} {ASKS} ", source.asker()),
+            None => TITLE.to_owned(),
+        };
         let hint = render_form(
             &t,
-            TITLE,
+            &title,
             frame,
             area,
             body.lines,
@@ -431,11 +494,7 @@ impl QuestionForm {
     /// in step with the spans themselves. A bar wide enough to wrap is left
     /// alone: past the fold a column no longer maps to the span under it.
     fn push_tab_hits(&mut self, rows: &VisualRows, form: Rect, visible: u16) {
-        let line = if self.autopilot_note.is_some() {
-            NOTE_LINES
-        } else {
-            0
-        };
+        let line = self.noted_body().lines.len() as u16;
         if !self.has_review() || rows.height_of(line) != 1 {
             return;
         }
@@ -538,13 +597,11 @@ impl QuestionForm {
                 self.activate_cursor()
             }
             FormTarget::Tab(index) | FormTarget::ReviewRow(index) => {
-                self.tab = index;
-                self.cursor = 0;
-                self.mode = Mode::Selecting;
+                self.go_to(index);
                 QuestionFormAction::Consumed
             }
             FormTarget::Review => {
-                self.mode = Mode::Confirming;
+                self.review();
                 QuestionFormAction::Consumed
             }
             // The press already placed the cursor; a release must not move it
@@ -566,13 +623,32 @@ impl QuestionForm {
     /// What `Enter` does on the focused row, shared with the click path so the
     /// two can never drift.
     fn activate_cursor(&mut self) -> QuestionFormAction {
-        if self.cursor == self.custom_row() {
-            self.start_editing();
-            return QuestionFormAction::Consumed;
+        if self.is_consent() {
+            return match self.cursor {
+                ACCEPT_ROW => QuestionFormAction::Accept,
+                _ => QuestionFormAction::Decline,
+            };
         }
-        let label = self.question().options[self.cursor].label.clone();
+        self.error = None;
+        let Some(label) = self
+            .question()
+            .options
+            .get(self.cursor)
+            .map(|option| option.label.clone())
+        else {
+            if self.offers_custom() {
+                self.start_editing();
+            }
+            return QuestionFormAction::Consumed;
+        };
         if self.is_multi() {
             self.toggle(label);
+            return QuestionFormAction::Consumed;
+        }
+        // An optional answer picked again is taken back, which is how a
+        // default the user does not want is left unanswered.
+        if self.question().optional && self.picked() == [label.as_str()] {
+            self.answers[self.tab].clear();
             return QuestionFormAction::Consumed;
         }
         self.answers[self.tab] = vec![label];
@@ -583,20 +659,108 @@ impl QuestionForm {
         &self.questions[self.tab]
     }
 
+    /// A server's request with no questions, which only asks for consent:
+    /// to open the address it gave, or to accept a form with no fields.
+    fn is_consent(&self) -> bool {
+        self.questions.is_empty() && self.source.is_some()
+    }
+
+    fn url(&self) -> Option<&str> {
+        match &self.source {
+            Some(QuestionSource::Mcp { url, .. }) => url.as_deref(),
+            None => None,
+        }
+    }
+
+    /// Only the agent's own questions take words of the user's choosing: a
+    /// server checks every answer against the choices it listed.
+    fn offers_custom(&self) -> bool {
+        self.source.is_none()
+    }
+
     /// The custom-answer row always sits one past the offered options, so a
     /// question with no options still has something to pick.
     fn custom_row(&self) -> usize {
         self.question().options.len()
     }
 
+    fn last_row(&self) -> usize {
+        match self.offers_custom() {
+            true => self.custom_row(),
+            false => self.custom_row().saturating_sub(1),
+        }
+    }
+
     fn is_multi(&self) -> bool {
-        self.question().multiple
+        self.questions
+            .get(self.tab)
+            .is_some_and(|question| question.multiple)
+    }
+
+    fn is_typed(&self) -> bool {
+        self.questions
+            .get(self.tab)
+            .is_some_and(|question| question.answer.is_typed())
     }
 
     /// A single question with one answer submits the moment it is picked;
-    /// anything else needs a review step so the user can go back.
+    /// anything else needs a review step so the user can go back. A server's
+    /// form is always reviewed before it is sent.
     fn has_review(&self) -> bool {
-        self.questions.len() > 1 || self.questions.first().is_some_and(|q| q.multiple)
+        (self.source.is_some() && !self.questions.is_empty())
+            || self.questions.len() > 1
+            || self.questions.first().is_some_and(|q| q.multiple)
+    }
+
+    /// Opens question `tab`. A typed one goes straight to its answer box,
+    /// filled with the answer so far.
+    fn enter(&mut self, tab: usize) {
+        self.tab = tab;
+        self.cursor = 0;
+        self.error = None;
+        if !self.is_typed() {
+            self.mode = Mode::Selecting;
+            return;
+        }
+        let answer = self.answers[tab].first().cloned().unwrap_or_default();
+        self.custom.set_text(&answer);
+        self.mode = Mode::EditingCustom;
+    }
+
+    /// Moves to question `tab`, keeping what was typed on the one left.
+    fn go_to(&mut self, tab: usize) {
+        self.keep_draft();
+        self.enter(tab);
+    }
+
+    fn review(&mut self) {
+        self.keep_draft();
+        self.error = None;
+        self.mode = Mode::Confirming;
+    }
+
+    /// A typed answer is kept as it stands when the user moves off it, checked
+    /// or not: the review checks every answer again before anything is sent.
+    fn keep_draft(&mut self) {
+        if self.mode != Mode::EditingCustom || !self.is_typed() {
+            return;
+        }
+        let text = self.custom.text().trim().to_owned();
+        self.answers[self.tab] = match text.is_empty() {
+            true => Vec::new(),
+            false => vec![text],
+        };
+    }
+
+    /// Why question `index` cannot be sent as answered. Only a server's form
+    /// needs an answer to every question it did not mark optional.
+    fn problem(&self, index: usize) -> Option<String> {
+        let question = &self.questions[index];
+        match self.answers[index].first() {
+            None if self.source.is_some() && !question.optional => Some(REQUIRED.to_owned()),
+            None => None,
+            Some(answer) => validate_answer(&question.answer, answer).err(),
+        }
     }
 
     fn picked(&self) -> &[String] {
@@ -615,25 +779,28 @@ impl QuestionForm {
             .find(|pick| !options.iter().any(|o| &&o.label == pick))
     }
 
+    fn key_consent(&mut self, key: KeyEvent) -> QuestionFormAction {
+        match key.code {
+            KeyCode::Up => self.cursor = ACCEPT_ROW,
+            KeyCode::Down => self.cursor = DECLINE_ROW,
+            KeyCode::Enter => return self.activate_cursor(),
+            KeyCode::Esc => return QuestionFormAction::Dismiss,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return QuestionFormAction::Cancel;
+            }
+            _ => {}
+        }
+        QuestionFormAction::Consumed
+    }
+
     fn key_selecting(&mut self, key: KeyEvent) -> QuestionFormAction {
-        let last = self.custom_row();
         match key.code {
             KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Down => self.cursor = (self.cursor + 1).min(last),
-            KeyCode::Enter if self.cursor == last => self.start_editing(),
-            KeyCode::Enter => {
-                let label = self.question().options[self.cursor].label.clone();
-                if self.is_multi() {
-                    self.toggle(label);
-                } else {
-                    self.answers[self.tab] = vec![label];
-                    return self.advance();
-                }
-            }
+            KeyCode::Down => self.cursor = (self.cursor + 1).min(self.last_row()),
+            KeyCode::Enter => return self.activate_cursor(),
             KeyCode::Tab | KeyCode::Right if self.has_review() => return self.next_tab(),
             KeyCode::BackTab | KeyCode::Left if self.has_review() && self.tab > 0 => {
-                self.tab -= 1;
-                self.cursor = 0;
+                self.go_to(self.tab - 1);
             }
             KeyCode::Esc => return QuestionFormAction::Dismiss,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -658,7 +825,16 @@ impl QuestionForm {
     /// and only cancels when there is nothing to copy.
     fn key_editing(&mut self, key: KeyEvent) -> QuestionFormAction {
         let submit = key.code == KeyCode::Enter && !is_newline_key(key);
+        let typed = self.is_typed();
         match key.code {
+            KeyCode::Enter if submit && typed => return self.commit_typed(),
+            KeyCode::Esc if typed => return QuestionFormAction::Dismiss,
+            KeyCode::Tab if typed => return self.next_tab(),
+            KeyCode::BackTab if typed => {
+                if self.tab > 0 {
+                    self.go_to(self.tab - 1);
+                }
+            }
             // A trailing backslash is the plain-terminal way to ask for a
             // newline where the modifier combination never arrives. The break
             // is typed over the backslash, so one undo brings it back.
@@ -671,13 +847,34 @@ impl QuestionForm {
             }
             KeyCode::Enter if submit => return self.commit_custom(),
             KeyCode::Esc => self.mode = Mode::Selecting,
-            _ => match self.custom.handle_key(key) {
-                TextKey::Copy(text) | TextKey::Cut(text) => return QuestionFormAction::Copy(text),
-                TextKey::Ignored if key::QUIT.matches(key) => return QuestionFormAction::Cancel,
-                _ => {}
-            },
+            _ => {
+                let outcome = self.custom.handle_key(key);
+                if outcome.changed() {
+                    self.error = None;
+                }
+                match outcome {
+                    TextKey::Copy(text) | TextKey::Cut(text) => {
+                        return QuestionFormAction::Copy(text);
+                    }
+                    TextKey::Ignored if key::QUIT.matches(key) => {
+                        return QuestionFormAction::Cancel;
+                    }
+                    _ => {}
+                }
+            }
         }
         QuestionFormAction::Consumed
+    }
+
+    /// A typed answer moves on only once it is one the server takes; until
+    /// then the reason sits under the box and the box keeps the text.
+    fn commit_typed(&mut self) -> QuestionFormAction {
+        self.keep_draft();
+        self.error = self.problem(self.tab);
+        if self.error.is_some() {
+            return QuestionFormAction::Consumed;
+        }
+        self.advance()
     }
 
     fn commit_custom(&mut self) -> QuestionFormAction {
@@ -707,11 +904,9 @@ impl QuestionForm {
 
     fn key_confirming(&mut self, key: KeyEvent) -> QuestionFormAction {
         match key.code {
-            KeyCode::Enter => QuestionFormAction::Submit(std::mem::take(&mut self.answers)),
+            KeyCode::Enter => self.submit(),
             KeyCode::BackTab | KeyCode::Left => {
-                self.tab = self.questions.len() - 1;
-                self.cursor = 0;
-                self.mode = Mode::Selecting;
+                self.go_to(self.questions.len() - 1);
                 QuestionFormAction::Consumed
             }
             KeyCode::Esc => QuestionFormAction::Dismiss,
@@ -736,35 +931,53 @@ impl QuestionForm {
         if self.has_review() {
             return self.next_tab();
         }
-        QuestionFormAction::Submit(std::mem::take(&mut self.answers))
+        self.submit()
     }
 
     fn next_tab(&mut self) -> QuestionFormAction {
         if self.tab + 1 < self.questions.len() {
-            self.tab += 1;
-            self.cursor = 0;
-            self.mode = Mode::Selecting;
+            self.go_to(self.tab + 1);
         } else {
-            self.mode = Mode::Confirming;
+            self.review();
         }
         QuestionFormAction::Consumed
     }
 
+    /// Sends the answers, unless one of them cannot go: then the form opens
+    /// on the first such question with the reason under it.
+    fn submit(&mut self) -> QuestionFormAction {
+        let blocked =
+            (0..self.questions.len()).find_map(|index| Some((index, self.problem(index)?)));
+        if let Some((index, problem)) = blocked {
+            self.enter(index);
+            self.error = Some(problem);
+            return QuestionFormAction::Consumed;
+        }
+        QuestionFormAction::Submit(std::mem::take(&mut self.answers))
+    }
+
     /// The hint bar's contents, which a click on one of them turns back into
     /// the key it names.
-    fn hint_pairs(&self) -> &'static [Hint] {
-        match self.mode {
+    fn hint_pairs(&self) -> Vec<Hint> {
+        let pairs: &[Hint] = match self.mode {
+            _ if self.is_consent() => &CONSENT_HINTS,
+            Mode::EditingCustom if self.is_typed() => &TYPED_HINTS,
             Mode::EditingCustom => &EDITING_HINTS,
             Mode::Confirming => &CONFIRMING_HINTS,
             Mode::Selecting if self.is_multi() => &MULTI_SELECT_HINTS,
             Mode::Selecting => &SINGLE_SELECT_HINTS,
+        };
+        let mut hints = pairs.to_vec();
+        if self.source.is_some() {
+            hints.insert(hints.len() - CLOSING_HINTS, DECLINE_HINT);
         }
+        hints
     }
 
     fn visible_hints(&self, width: u16) -> Vec<Hint> {
-        let mut hints = self.hint_pairs().to_vec();
+        let mut hints = self.hint_pairs();
         let area = Rect::new(0, 0, width, 1);
-        if super::hint_hits(&hints[..1], area).is_empty() {
+        if !self.is_consent() && super::hint_hits(&hints[..1], area).is_empty() {
             hints[ASK_HINT_INDEX] = COMPACT_ASK_HINT;
         }
         hints.truncate(super::hint_hits(&hints, area).len());
@@ -781,6 +994,7 @@ impl QuestionForm {
 
     fn body(&self, width: u16, focused: bool) -> Body {
         match self.mode {
+            _ if self.is_consent() => self.consent_body(),
             Mode::Confirming => self.review_body(width),
             _ => self.selecting_body(width, focused),
         }
@@ -827,7 +1041,8 @@ impl QuestionForm {
         )
     }
 
-    /// A body that opens with autopilot's note, when the form carries one.
+    /// A body that opens with autopilot's note and the server's message, when
+    /// the form carries them. Everything below starts on the line after.
     fn noted_body(&self) -> Body {
         let mut body = Body::default();
         if let Some(note) = &self.autopilot_note {
@@ -835,6 +1050,13 @@ impl QuestionForm {
                 Line::styled(format!(" {}", card_note(note)), theme::current().tool_dim),
                 Line::default(),
             ]);
+        }
+        if let Some(QuestionSource::Mcp { message, .. }) = &self.source
+            && !message.is_empty()
+        {
+            body.lines
+                .extend(message.lines().map(|line| Line::raw(format!(" {line}"))));
+            body.lines.push(Line::default());
         }
         body
     }
@@ -850,14 +1072,8 @@ impl QuestionForm {
         for line in question.question.lines() {
             body.lines.push(Line::from(Span::raw(format!(" {line}"))));
         }
-        body.lines.push(Line::styled(
-            if question.multiple {
-                MULTI_HINT
-            } else {
-                SINGLE_HINT
-            },
-            t.tool_dim,
-        ));
+        body.lines
+            .push(Line::styled(kind_hint(question), t.tool_dim));
         body.lines.push(Line::default());
         for index in 0..question.options.len() {
             body.push(FormTarget::Option(index), self.option_lines(index, width));
@@ -866,9 +1082,37 @@ impl QuestionForm {
             for (index, line) in self.custom_editor_lines(focused).into_iter().enumerate() {
                 body.push(FormTarget::Editor(index), vec![line]);
             }
-        } else {
+        } else if self.offers_custom() {
             let custom = self.custom_row();
             body.push(FormTarget::Option(custom), self.option_lines(custom, width));
+        }
+        if let Some(error) = &self.error {
+            body.lines.push(marked_line(ERROR_MARK, error, t.error));
+        }
+        body
+    }
+
+    /// A request that asks only for consent: the server's message, the
+    /// address it wants opened if any, and the two answers.
+    fn consent_body(&self) -> Body {
+        let t = theme::current();
+        let mut body = self.noted_body();
+        let accept = match self.url() {
+            Some(url) => {
+                body.lines.push(url_line(url, t.accent));
+                if let Some(host) = lookalike_host(url) {
+                    let warning = format!("{LOOKALIKE_WARNING}{LOOKALIKE_HOST}{host}");
+                    body.lines
+                        .push(marked_line(WARNING_MARK, &warning, t.tool_warning));
+                }
+                body.lines.push(Line::default());
+                OPEN_IN_BROWSER
+            }
+            None => ACCEPT,
+        };
+        for (row, label) in [(ACCEPT_ROW, accept), (DECLINE_ROW, DECLINE)] {
+            let line = self.option_line(row == self.cursor, false, label);
+            body.push(FormTarget::Option(row), vec![line]);
         }
         body
     }
@@ -991,6 +1235,9 @@ impl QuestionForm {
                 Span::styled(text, super::hover_style(t.todo_completed, on)),
                 width,
             ));
+            if let Some(problem) = self.problem(index) {
+                lines.push(marked_line(ERROR_MARK, &problem, t.error));
+            }
             body.push(FormTarget::ReviewRow(index), lines);
         }
         body
@@ -1037,6 +1284,71 @@ fn tab_label(index: usize, question: &AskedQuestion) -> String {
     }
 }
 
+/// What a question takes, under it: how many choices, or what to type and
+/// within which limits, and whether it may be left empty.
+fn kind_hint(question: &AskedQuestion) -> String {
+    let kind = describe_answer(&question.answer).unwrap_or_else(|| {
+        match question.multiple {
+            true => MULTIPLE_ANSWERS,
+            false => SINGLE_ANSWER,
+        }
+        .to_owned()
+    });
+    let optional = if question.optional { OPTIONAL_NOTE } else { "" };
+    format!("{KIND_INDENT}({kind}{optional})")
+}
+
+fn marked_line(mark: &'static str, text: &str, style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(mark, style),
+        Span::styled(text.to_owned(), style),
+    ])
+}
+
+/// The whole address, with the host picked out so the reader sees where it
+/// really goes rather than whatever the path claims.
+fn url_line(url: &str, host_style: Style) -> Line<'static> {
+    let Some(host) = host_range(url) else {
+        return Line::raw(format!(" {url}"));
+    };
+    Line::from(vec![
+        Span::raw(format!(" {}", &url[..host.start])),
+        Span::styled(url[host.clone()].to_owned(), host_style),
+        Span::raw(url[host.end..].to_owned()),
+    ])
+}
+
+/// Where the host sits in `url` as written: past the scheme and any user
+/// name, before the port and the path.
+fn host_range(url: &str) -> Option<Range<usize>> {
+    let start = url.find(SCHEME_SEPARATOR)? + SCHEME_SEPARATOR.len();
+    let end = url[start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |offset| start + offset);
+    let host_start = url[start..end]
+        .rfind('@')
+        .map_or(start, |at| start + at + 1);
+    let authority = &url[host_start..end];
+    let host_end = match authority.rfind(':') {
+        Some(colon) if !authority[colon..].contains(']') => host_start + colon,
+        _ => end,
+    };
+    (host_start < host_end).then_some(host_start..host_end)
+}
+
+/// The host `url` really reaches, when what is written could pass for some
+/// other one: letters outside ASCII, or a label already in punycode.
+fn lookalike_host(url: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    let written = host_range(url).map_or(host, |range| &url[range]);
+    let lookalike = !written.is_ascii()
+        || host
+            .split('.')
+            .any(|label| label.starts_with(PUNYCODE_PREFIX));
+    lookalike.then(|| host.to_owned())
+}
+
 impl Overlay for QuestionForm {
     fn is_open(&self) -> bool {
         self.is_open()
@@ -1062,7 +1374,10 @@ impl Overlay for QuestionForm {
 mod tests {
     use super::*;
     use crate::components::key as key_event;
-    use caudra_agent::types::QuestionOption;
+    use caudra_agent::mcp::elicitation::{
+        ABOVE_MAXIMUM, ElicitForm, NO_LABEL, NOT_A_WHOLE_NUMBER, YES_LABEL,
+    };
+    use caudra_agent::types::{AnswerKind, QuestionOption};
 
     const PICK: &str = "Pick one";
     const HEADER: &str = "Choice";
@@ -1087,12 +1402,13 @@ mod tests {
                 },
             ],
             multiple,
+            ..AskedQuestion::default()
         }
     }
 
     fn opened(questions: Vec<AskedQuestion>) -> QuestionForm {
         let mut form = QuestionForm::new();
-        form.open(questions);
+        form.open(questions, None);
         form
     }
 
@@ -1404,6 +1720,7 @@ mod tests {
                 description: [YES_DESC; 20].join(" "),
             }],
             multiple: false,
+            ..AskedQuestion::default()
         }
     }
 
@@ -1481,6 +1798,7 @@ mod tests {
                 description: String::new(),
             }],
             multiple: false,
+            ..AskedQuestion::default()
         }]);
         render(&mut form);
         assert!(
@@ -1509,6 +1827,7 @@ mod tests {
             header: HEADER.into(),
             options,
             multiple: false,
+            ..AskedQuestion::default()
         }]);
         for _ in 0..count {
             press(&mut form, KeyCode::Down);
@@ -1815,6 +2134,7 @@ mod tests {
             header: HEADER.into(),
             options: Vec::new(),
             multiple: false,
+            ..AskedQuestion::default()
         }]);
         assert_eq!(form.custom_row(), 0);
         press(&mut form, KeyCode::Enter);
@@ -2053,6 +2373,7 @@ mod tests {
                 })
                 .collect(),
             multiple: false,
+            ..AskedQuestion::default()
         }
     }
     const EXPECT_MARKED: &str = "the control under the pointer has to be marked";
@@ -2148,6 +2469,7 @@ mod tests {
                 header: HEADER.into(),
                 options: Vec::new(),
                 multiple: false,
+                ..AskedQuestion::default()
             },
             question(SECOND, false),
         ]);
@@ -2340,13 +2662,11 @@ mod tests {
         assert!(!context.contains(TYPED));
         assert!(!context.contains(UNCOMMITTED));
         let active = format!(
-            "About: 2/2 · {SECOND}\n{FULL_QUESTION}\n{}\n- {YES}\n  {FULL_DESCRIPTION}\n- {NO}\n  {NO_DESC}",
-            MULTI_HINT.trim(),
+            "About: 2/2 · {SECOND}\n{FULL_QUESTION}\n({MULTIPLE_ANSWERS})\n- {YES}\n  {FULL_DESCRIPTION}\n- {NO}\n  {NO_DESC}",
         );
         let expected = if mode == Mode::Confirming {
             format!(
-                "About: 1/2 · {HEADER}\n{PICK}\n{}\n- {YES}\n  {YES_DESC}\n- {NO}\n  {NO_DESC}\n\n{active}",
-                SINGLE_HINT.trim(),
+                "About: 1/2 · {HEADER}\n{PICK}\n({SINGLE_ANSWER})\n- {YES}\n  {YES_DESC}\n- {NO}\n  {NO_DESC}\n\n{active}",
             )
         } else {
             active
@@ -2470,8 +2790,312 @@ mod tests {
         let mut form = opened(two_questions());
         form.set_autopilot_note(Some(AutopilotNote::Deciding));
 
-        form.open(two_questions());
+        form.open(two_questions(), None);
 
         assert_eq!(form.autopilot_note(), None);
+    }
+
+    const SERVER: &str = "tracker";
+    const MESSAGE: &str = "Fill in the ticket";
+    const COUNT: &str = "Count";
+    const NOTE: &str = "Note";
+    const MAXIMUM: i64 = 10;
+    const IN_RANGE: &str = "7";
+    const OUT_OF_RANGE: &str = "42";
+    const NOT_WHOLE: &str = "seven";
+    const DRAFT: &str = "3";
+    const SAFE_URL: &str = "https://example.com/login";
+    const SAFE_HOST: &str = "example.com";
+    const PUNYCODE_URL: &str = "https://xn--pple-43d.com/login";
+    const PUNYCODE_HOST: &str = "xn--pple-43d.com";
+    const CYRILLIC_URL: &str = "https://\u{430}pple.com/login";
+    const FULLWIDTH_URL: &str = "https://\u{ff45}xample.com/login";
+    const CONFIRM_FIELD: &str = "confirm";
+
+    fn mcp(url: Option<&str>) -> QuestionSource {
+        QuestionSource::Mcp {
+            server: SERVER.into(),
+            kind: None,
+            message: MESSAGE.into(),
+            url: url.map(str::to_owned),
+        }
+    }
+
+    fn asked_by_server(questions: Vec<AskedQuestion>) -> QuestionForm {
+        let mut form = QuestionForm::new();
+        form.open(questions, Some(mcp(None)));
+        form
+    }
+
+    fn count_question() -> AskedQuestion {
+        AskedQuestion {
+            question: PICK.into(),
+            header: COUNT.into(),
+            answer: AnswerKind::Number {
+                integer: true,
+                minimum: Some(1.into()),
+                maximum: Some(MAXIMUM.into()),
+            },
+            ..AskedQuestion::default()
+        }
+    }
+
+    fn note_question() -> AskedQuestion {
+        AskedQuestion {
+            question: PICK.into(),
+            header: NOTE.into(),
+            answer: AnswerKind::Text {
+                format: None,
+                min_length: None,
+                max_length: None,
+            },
+            optional: true,
+            ..AskedQuestion::default()
+        }
+    }
+
+    fn offers(form: &QuestionForm, bind: Bind) -> Option<usize> {
+        form.hint_pairs()
+            .iter()
+            .position(|hint| hint.label() == bind.label)
+    }
+
+    #[test]
+    fn only_a_server_form_can_be_declined() {
+        let mut own = opened(vec![question(HEADER, false)]);
+        assert_eq!(offers(&own, key::QUESTION_DECLINE), None);
+        assert!(matches!(
+            own.handle_key(key::QUESTION_DECLINE.to_key_event()),
+            QuestionFormAction::Consumed
+        ));
+
+        let mut asked = asked_by_server(vec![question(HEADER, false)]);
+        let index = offers(&asked, key::QUESTION_DECLINE).expect("a server's form offers decline");
+        assert_eq!(index, asked.hint_pairs().len() - CLOSING_HINTS - 1);
+        assert!(matches!(
+            asked.handle_key(key::QUESTION_DECLINE.to_key_event()),
+            QuestionFormAction::Decline
+        ));
+        render(&mut asked);
+        assert!(matches!(
+            click_target(&mut asked, FormTarget::Hint(index)),
+            QuestionFormAction::Decline
+        ));
+    }
+
+    #[test]
+    fn a_server_form_takes_only_the_offered_choices() {
+        let mut form = asked_by_server(vec![question(HEADER, false)]);
+        for _ in 0..=form.custom_row() {
+            press(&mut form, KeyCode::Down);
+        }
+        assert_eq!(form.cursor, form.custom_row() - 1);
+        let screen = painted(&mut form).join(LINE_BREAK);
+        assert!(!screen.contains(CUSTOM_OPTION), "{screen}");
+        assert!(screen.contains(MESSAGE), "{screen}");
+        assert!(screen.contains(&format!(" {SERVER} {ASKS} ")), "{screen}");
+    }
+
+    #[test_case(NOT_WHOLE, NOT_A_WHOLE_NUMBER ; "not_a_number")]
+    #[test_case(OUT_OF_RANGE, ABOVE_MAXIMUM ; "out_of_range")]
+    #[test_case("", REQUIRED ; "empty")]
+    fn a_typed_answer_that_does_not_fit_stays_put(text: &str, problem: &str) {
+        let mut form = asked_by_server(vec![count_question()]);
+        assert_eq!(form.mode, Mode::EditingCustom);
+        type_text(&mut form, text);
+
+        assert!(matches!(
+            press(&mut form, KeyCode::Enter),
+            QuestionFormAction::Consumed
+        ));
+
+        assert_eq!(form.mode, Mode::EditingCustom);
+        assert_eq!(form.custom.text(), text);
+        let error = form.error.clone().expect("the problem is shown");
+        assert!(error.starts_with(problem), "{error}");
+        assert!(painted(&mut form).join(LINE_BREAK).contains(&error));
+        press(&mut form, KeyCode::Backspace);
+        type_text(&mut form, IN_RANGE);
+        assert_eq!(form.error, None, "editing the answer clears the problem");
+    }
+
+    #[test]
+    fn a_fitting_typed_answer_goes_through_the_review() {
+        let mut form = asked_by_server(vec![count_question()]);
+        type_text(&mut form, IN_RANGE);
+        press(&mut form, KeyCode::Enter);
+        assert_eq!(form.mode, Mode::Confirming);
+        assert!(matches!(
+            press(&mut form, KeyCode::Enter),
+            QuestionFormAction::Submit(answers) if answers == vec![vec![IN_RANGE.to_owned()]]
+        ));
+    }
+
+    #[test]
+    fn escape_in_a_typed_answer_dismisses() {
+        let mut form = asked_by_server(vec![count_question()]);
+        assert!(matches!(
+            press(&mut form, KeyCode::Esc),
+            QuestionFormAction::Dismiss
+        ));
+    }
+
+    #[test]
+    fn an_optional_typed_answer_may_be_left_empty() {
+        let mut form = asked_by_server(vec![note_question()]);
+        assert!(painted(&mut form).join(LINE_BREAK).contains(OPTIONAL_NOTE));
+        press(&mut form, KeyCode::Enter);
+        assert_eq!(form.mode, Mode::Confirming);
+        assert!(matches!(
+            press(&mut form, KeyCode::Enter),
+            QuestionFormAction::Submit(answers) if answers == vec![Vec::<String>::new()]
+        ));
+    }
+
+    #[test]
+    fn moving_between_typed_answers_keeps_each_draft() {
+        let mut form = asked_by_server(vec![count_question(), note_question()]);
+        type_text(&mut form, DRAFT);
+        press(&mut form, KeyCode::Tab);
+        assert_eq!((form.tab, form.mode), (1, Mode::EditingCustom));
+        assert!(form.custom.text().is_empty());
+        type_text(&mut form, TYPED);
+        press(&mut form, KeyCode::BackTab);
+        assert_eq!((form.tab, form.custom.text()), (0, DRAFT.to_owned()));
+        press(&mut form, KeyCode::Tab);
+        assert_eq!(form.custom.text(), TYPED);
+    }
+
+    #[test]
+    fn the_review_will_not_send_a_missing_required_answer() {
+        let mut form = asked_by_server(vec![question(HEADER, false), count_question()]);
+        press(&mut form, KeyCode::Tab);
+        type_text(&mut form, IN_RANGE);
+        press(&mut form, KeyCode::Tab);
+        assert_eq!(form.mode, Mode::Confirming);
+        assert!(painted(&mut form).join(LINE_BREAK).contains(REQUIRED));
+
+        assert!(matches!(
+            press(&mut form, KeyCode::Enter),
+            QuestionFormAction::Consumed
+        ));
+
+        assert_eq!((form.tab, form.mode), (0, Mode::Selecting));
+        assert_eq!(form.error.as_deref(), Some(REQUIRED));
+        assert_eq!(form.answers[1], vec![IN_RANGE.to_owned()]);
+    }
+
+    #[test]
+    fn a_default_starts_picked_and_an_optional_one_can_be_taken_back() {
+        let mut asked = question(HEADER, false);
+        asked.default = vec![NO.into()];
+        asked.optional = true;
+        let mut form = asked_by_server(vec![asked]);
+        assert_eq!(form.answers, vec![vec![NO.to_owned()]]);
+        form.cursor = 1;
+
+        press(&mut form, KeyCode::Enter);
+
+        assert_eq!(form.answers, vec![Vec::<String>::new()]);
+        assert_eq!(form.mode, Mode::Selecting);
+    }
+
+    #[test]
+    fn a_yes_or_no_field_is_picked_and_sent_as_a_boolean() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { CONFIRM_FIELD: { "type": "boolean" } },
+            "required": [CONFIRM_FIELD],
+        });
+        let elicit = ElicitForm::parse(&schema).unwrap();
+        let mut form = asked_by_server(elicit.questions());
+        let screen = painted(&mut form).join(LINE_BREAK);
+        let kind = describe_answer(&AnswerKind::Boolean).unwrap();
+        for expected in [YES_LABEL, NO_LABEL, kind.as_str()] {
+            assert!(screen.contains(expected), "{expected:?} in\n{screen}");
+        }
+        press(&mut form, KeyCode::Enter);
+        let QuestionFormAction::Submit(answers) = press(&mut form, KeyCode::Enter) else {
+            panic!("the review submits");
+        };
+        let content = elicit.content(&answers).unwrap();
+        assert_eq!(content[CONFIRM_FIELD], serde_json::Value::Bool(true));
+    }
+
+    #[test_case(None, ACCEPT ; "form_without_fields")]
+    #[test_case(Some(SAFE_URL), OPEN_IN_BROWSER ; "address")]
+    fn consent_is_accepted_declined_or_dismissed(url: Option<&str>, accept: &str) {
+        let mut form = QuestionForm::new();
+        form.open(Vec::new(), Some(mcp(url)));
+        assert!(form.is_open());
+        let screen = painted(&mut form).join(LINE_BREAK);
+        for expected in [MESSAGE, accept, DECLINE] {
+            assert!(screen.contains(expected), "{expected:?} in\n{screen}");
+        }
+        assert!(offers(&form, key::QUESTION_DECLINE).is_some());
+        assert!(matches!(
+            form.handle_key(key::QUESTION_ASK_BTW.to_key_event()),
+            QuestionFormAction::Consumed
+        ));
+        assert!(matches!(
+            click_target(&mut form, FormTarget::Option(ACCEPT_ROW)),
+            QuestionFormAction::Accept
+        ));
+        assert!(matches!(
+            press(&mut form, KeyCode::Enter),
+            QuestionFormAction::Accept
+        ));
+        press(&mut form, KeyCode::Down);
+        assert!(matches!(
+            press(&mut form, KeyCode::Enter),
+            QuestionFormAction::Decline
+        ));
+        assert!(matches!(
+            press(&mut form, KeyCode::Esc),
+            QuestionFormAction::Dismiss
+        ));
+    }
+
+    #[test]
+    fn an_address_is_shown_whole_with_its_host_picked_out() {
+        let mut form = QuestionForm::new();
+        form.open(Vec::new(), Some(mcp(Some(SAFE_URL))));
+        let screen = painted(&mut form).join(LINE_BREAK);
+        assert!(screen.contains(SAFE_URL), "{screen}");
+        assert!(!screen.contains(LOOKALIKE_WARNING), "{screen}");
+        let accent = theme::current().accent;
+        let line = url_line(SAFE_URL, accent);
+        let host = line
+            .spans
+            .iter()
+            .find(|span| span.style == accent)
+            .expect("the host is styled apart");
+        assert_eq!(host.content, SAFE_HOST);
+    }
+
+    #[test]
+    fn a_punycode_address_warns_where_it_really_goes() {
+        let mut form = QuestionForm::new();
+        form.open(Vec::new(), Some(mcp(Some(PUNYCODE_URL))));
+        let screen = painted(&mut form).join(LINE_BREAK);
+        assert!(screen.contains(LOOKALIKE_WARNING), "{screen}");
+        assert!(screen.contains(PUNYCODE_HOST), "{screen}");
+    }
+
+    #[test_case(SAFE_URL, None ; "plain")]
+    #[test_case(PUNYCODE_URL, Some(PUNYCODE_HOST) ; "punycode")]
+    #[test_case(CYRILLIC_URL, Some(PUNYCODE_HOST) ; "cyrillic")]
+    #[test_case(FULLWIDTH_URL, Some(SAFE_HOST) ; "fullwidth")]
+    fn a_lookalike_host_is_flagged_with_where_it_goes(url: &str, host: Option<&str>) {
+        assert_eq!(lookalike_host(url).as_deref(), host);
+    }
+
+    #[test_case(SAFE_URL, Some(SAFE_HOST) ; "path")]
+    #[test_case("https://user:pw@example.com:8443/x?y#z", Some(SAFE_HOST) ; "userinfo_and_port")]
+    #[test_case("https://example.com@evil.test/", Some("evil.test") ; "deceptive_userinfo")]
+    #[test_case("http://[::1]:8080/", Some("[::1]") ; "ipv6")]
+    #[test_case("mailto:someone", None ; "no_authority")]
+    fn the_host_is_found_where_it_is_written(url: &str, host: Option<&str>) {
+        assert_eq!(host_range(url).map(|range| &url[range]), host);
     }
 }

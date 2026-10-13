@@ -182,6 +182,12 @@ pub mod key {
         modifiers: KeyModifiers::NONE,
         label: "F2",
     };
+    /// A function key, since an MCP form may have its answer box open.
+    pub const QUESTION_DECLINE: Bind = Bind {
+        code: KeyCode::F(3),
+        modifiers: KeyModifiers::NONE,
+        label: "F3",
+    };
     pub const COMMAND_PALETTE: Bind = ctrl_bind!('p');
     pub const SCROLL_HALF_UP: Bind = ctrl_bind!('u');
     /// Text fields take plain, Ctrl, Super and Shift arrows, and Alt cannot be
@@ -1054,6 +1060,11 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::QUESTION_ASK_BTW.label),
         description: "Ask /btw about a pending main-agent question without answering it",
+        context: KeybindContext::FormInput,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::QUESTION_DECLINE.label),
+        description: "Decline an MCP server's request",
         context: KeybindContext::FormInput,
     },
     Keybind {

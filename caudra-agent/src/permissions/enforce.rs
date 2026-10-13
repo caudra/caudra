@@ -1580,6 +1580,7 @@ pub(super) mod tests {
         DelegateOutput, GatedProvider, ScriptedProvider, Step, WireError, engaged_handle,
     };
     use crate::decisions::Decisions;
+    use crate::mcp::kind::{McpCallFacts, McpServerKind, PausedRuns};
     use crate::permissions::tests::{
         CONTROLLED_REQUEST, FIRST_COMMAND, SECOND_COMMAND, controlled_enforcement,
         opaque_line_intent, remember_command,
@@ -1587,7 +1588,8 @@ pub(super) mod tests {
     use crate::permissions::{
         AutopilotNote, DECISION_SOURCE_AUTOPILOT_DENY, DECISION_SOURCE_AUTOPILOT_ONCE,
         DECISION_SOURCE_RULE, DECISION_SOURCE_USER_ABORT, DECISION_SOURCE_USER_ONCE,
-        DECISION_SOURCE_YOLO, EngineFlag, PermissionAdvisory, PermissionError,
+        DECISION_SOURCE_YOLO, EngineFlag, PermissionAdvisory, PermissionArgumentConstraint,
+        PermissionError, READ_ONLY_MCP_TOOL_OPTION, mcp_permission_intent,
     };
     use crate::types::Answerer;
     use crate::types::{AutopilotEvent, TaskProvenance, WorkflowProvenance};
@@ -5060,5 +5062,376 @@ pub(super) mod tests {
                 commands.len() - 1
             )
         );
+    }
+
+    const HOME_ASSISTANT_SERVER: &str = "home-assistant";
+    const EXECUTOR_SERVER: &str = "executor";
+    const TURN_ON_TOOL: &str = "HassTurnOn";
+    const LOOKUP_TOOL: &str = "GetLiveContext";
+    const RESUME_TOOL: &str = "resume";
+    const MCP_TEST_CONTRACT: &str = "mcp-test-contract";
+    const MCP_REQUEST: &str = "mcp-call";
+    const MCP_FACTS_FIELD: &str = "mcp";
+    const PAUSED_RUN: &str = "exec_1";
+    const UNSEEN_RUN: &str = "exec_2";
+    const WAITING_STATUS: &str = "waiting_for_interaction";
+    const PAUSED_MESSAGE: &str = "Deploy to prod?";
+    const PAUSED_ADDRESS: &str = "deploy.run";
+    const LOCK_NOTE: &str = "Home Assistant lock devices always ask";
+    const WAITING_NOTE: &str =
+        "Executor run waiting for: Deploy to prod? · deploy.run({\"env\":\"prod\"})";
+    const UNSEEN_RUN_NOTE: &str = "Executor run exec_2: not a run Caudra saw pause";
+    const MCP_PROMPT_MISSING: &str = "the MCP call ran without a prompt";
+    const READ_ONLY_OPTION_MISSING: &str = "a read-only tool offers any arguments";
+
+    fn mcp_key(server: &str, tool: &str) -> ToolKey {
+        ToolKey::parse(&format!("{server}.{tool}")).unwrap()
+    }
+
+    /// The intent dispatch raises for `server`'s `tool`, a recognised server
+    /// having seen [`PAUSED_RUN`] pause.
+    fn mcp_intent(server: &str, tool: &str, input: &Value, read_only: bool) -> PermissionIntent {
+        let paused = PausedRuns::default();
+        paused.record(&json!({
+            "status": WAITING_STATUS,
+            "executionId": PAUSED_RUN,
+            "interaction": {"message": PAUSED_MESSAGE, "address": PAUSED_ADDRESS, "args": {"env": "prod"}},
+        }));
+        let facts = McpServerKind::from_server_name(server).map(|kind| McpCallFacts {
+            kind,
+            read_only,
+            note: kind.always_asks(tool, input, &paused),
+        });
+        mcp_permission_intent(&mcp_key(server, tool), input, facts)
+    }
+
+    async fn enforce_mcp(
+        manager: &PermissionManager,
+        (server, tool): (&str, &str),
+        input: &Value,
+        read_only: bool,
+        event_tx: &EventSender,
+        answers: Option<&async_lock::Mutex<flume::Receiver<String>>>,
+    ) -> Result<(), PermissionError> {
+        let subject = PermissionSubject::Mcp {
+            server: server.into(),
+            authority: server.into(),
+            tool: tool.into(),
+            contract: MCP_TEST_CONTRACT.into(),
+        };
+        manager
+            .enforce_with_intent(
+                &mcp_key(server, tool),
+                &mcp_intent(server, tool, input, read_only),
+                input,
+                event_tx,
+                answers,
+                MCP_REQUEST,
+                &CancelToken::none(),
+                None,
+                Some((subject, PermissionExecutorKind::Mcp)),
+                false,
+            )
+            .await
+    }
+
+    /// The prompt a call raises, refused once seen, or `None` when it ran.
+    async fn mcp_prompt(
+        manager: &PermissionManager,
+        call: (&str, &str),
+        input: &Value,
+        read_only: bool,
+    ) -> Option<Box<PermissionRequest>> {
+        let (event_tx, events) = flume::unbounded();
+        let event_tx = EventSender::new(event_tx, 0);
+        let (_answer_tx, answers) = flume::unbounded();
+        let answers = async_lock::Mutex::new(answers);
+        let mut enforcement = Box::pin(enforce_mcp(
+            manager,
+            call,
+            input,
+            read_only,
+            &event_tx,
+            Some(&answers),
+        ));
+        let prompt = future::race(
+            async {
+                enforcement.as_mut().await.unwrap();
+                None
+            },
+            async {
+                loop {
+                    if let AgentEvent::PermissionRequest(request) =
+                        events.recv_async().await.unwrap().event
+                    {
+                        return Some(request);
+                    }
+                }
+            },
+        )
+        .await;
+        if prompt.is_some() {
+            assert!(manager.answer(MCP_REQUEST, PermissionAnswer::Deny));
+            assert!(enforcement.await.is_err());
+        }
+        prompt
+    }
+
+    fn mcp_manager((server, tool): (&str, &str), rule: Option<Effect>) -> PermissionManager {
+        let rules = rule
+            .map(|effect| PermissionRule {
+                tool: mcp_key(server, tool),
+                scope: None,
+                effect,
+            })
+            .into_iter()
+            .collect();
+        mgr_with(make_config(rules), PathBuf::from(SHELL_WORKDIR))
+    }
+
+    /// A call its recognised server guards asks whatever the rules or the
+    /// mode say, and says why.
+    #[test_case((HOME_ASSISTANT_SERVER, TURN_ON_TOOL), json!({"domain": "lock"}), None, PermissionMode::Ask, LOCK_NOTE, None; "a_string_domain")]
+    #[test_case((HOME_ASSISTANT_SERVER, TURN_ON_TOOL), json!({"domain": ["light", "lock"]}), None, PermissionMode::Ask, LOCK_NOTE, None; "an_array_domain")]
+    #[test_case((HOME_ASSISTANT_SERVER, TURN_ON_TOOL), json!({"domain": ["LoCk"]}), None, PermissionMode::Ask, LOCK_NOTE, None; "a_mixed_case_domain")]
+    #[test_case((HOME_ASSISTANT_SERVER, TURN_ON_TOOL), json!({"domain": "lock"}), Some(Effect::Allow), PermissionMode::Ask, LOCK_NOTE, None; "despite_an_allow_rule")]
+    #[test_case((HOME_ASSISTANT_SERVER, TURN_ON_TOOL), json!({"domain": "lock"}), None, PermissionMode::Auto, LOCK_NOTE, Some(AutoNote::Forced); "in_auto")]
+    #[test_case((EXECUTOR_SERVER, RESUME_TOOL), json!({"executionId": PAUSED_RUN, "action": "Accept"}), Some(Effect::Allow), PermissionMode::Ask, WAITING_NOTE, None; "an_executor_accept")]
+    #[test_case((EXECUTOR_SERVER, RESUME_TOOL), json!({"executionId": UNSEEN_RUN, "action": "accept"}), Some(Effect::Allow), PermissionMode::Ask, UNSEEN_RUN_NOTE, None; "an_accept_of_an_unseen_run")]
+    fn a_guarded_mcp_call_always_asks(
+        call: (&str, &str),
+        input: Value,
+        rule: Option<Effect>,
+        mode: PermissionMode,
+        note: &str,
+        auto: Option<AutoNote>,
+    ) {
+        smol::block_on(async {
+            let manager = mcp_manager(call, rule);
+            manager.set_session_mode(Some(mode));
+            let prompt = mcp_prompt(&manager, call, &input, false)
+                .await
+                .expect(MCP_PROMPT_MISSING);
+            assert_eq!(
+                prompt.mcp.as_ref().and_then(|facts| facts.note.as_deref()),
+                Some(note)
+            );
+            assert_eq!(
+                (
+                    &prompt.risk,
+                    &prompt.presentation.reason,
+                    prompt.presentation.auto
+                ),
+                (&PermissionRisk::Critical, &PromptReason::Forced, auto)
+            );
+        });
+    }
+
+    /// Without a guarded argument the same tools follow the rules and the
+    /// mode, and Yolo runs even a guarded one.
+    #[test_case((HOME_ASSISTANT_SERVER, TURN_ON_TOOL), json!({"name": "Front door"}), Some(Effect::Allow), PermissionMode::Ask; "no_domain_with_an_allow_rule")]
+    #[test_case((HOME_ASSISTANT_SERVER, TURN_ON_TOOL), json!({"domain": "light"}), None, PermissionMode::Auto; "a_harmless_domain_in_auto")]
+    #[test_case((HOME_ASSISTANT_SERVER, TURN_ON_TOOL), json!({"domain": "lock"}), None, PermissionMode::Yolo; "yolo_runs_a_sensitive_domain")]
+    #[test_case((EXECUTOR_SERVER, RESUME_TOOL), json!({"executionId": PAUSED_RUN, "action": "decline"}), Some(Effect::Allow), PermissionMode::Ask; "an_executor_decline")]
+    #[test_case((EXECUTOR_SERVER, RESUME_TOOL), json!({"executionId": PAUSED_RUN, "action": "cancel"}), Some(Effect::Allow), PermissionMode::Ask; "an_executor_cancel")]
+    fn an_unguarded_mcp_call_follows_policy(
+        call: (&str, &str),
+        input: Value,
+        rule: Option<Effect>,
+        mode: PermissionMode,
+    ) {
+        smol::block_on(async {
+            let manager = mcp_manager(call, rule);
+            manager.set_session_mode(Some(mode));
+            assert_eq!(mcp_prompt(&manager, call, &input, false).await, None);
+        });
+    }
+
+    /// Autopilot reads a guarded call as forced, so it may not allow it.
+    #[test]
+    fn autopilot_cannot_allow_a_guarded_mcp_call() {
+        let provider = ScriptedProvider::new(vec![Step::Answer(DELEGATE_ALLOW)]);
+        let manager = default_mgr();
+        manager.set_autopilot(Some(engaged_handle(provider.clone())));
+        let (event_tx, events) = flume::unbounded();
+        let event_tx = EventSender::new(event_tx, 0);
+
+        let result = smol::block_on(enforce_mcp(
+            &manager,
+            (HOME_ASSISTANT_SERVER, TURN_ON_TOOL),
+            &json!({"domain": "lock"}),
+            false,
+            &event_tx,
+            None,
+        ));
+
+        let [prompt] = provider.prompts().try_into().unwrap();
+        assert!(
+            prompt.contains(&format!(
+                "{ITEM_RESERVED_LABEL} {}",
+                AutoNote::Forced.name()
+            )),
+            "{prompt}"
+        );
+        let guidance = result.unwrap_err().guidance.unwrap();
+        assert_eq!(
+            (guidance.text.as_str(), guidance.by),
+            (UNATTENDED_ESCALATION, Answerer::Autopilot)
+        );
+        let events = events_of(&events);
+        let decisions = decided(&events);
+        let [decision] = decisions.as_slice() else {
+            panic!("{decisions:?}");
+        };
+        assert_eq!(decision.action, ActionName::Escalate);
+    }
+
+    /// A read-only tool asks like any other in Ask, at Low risk, and offers
+    /// to remember it with any arguments for as long as the user likes.
+    #[test_case(true; "read_only")]
+    #[test_case(false; "writes")]
+    fn a_read_only_mcp_tool_offers_any_arguments(read_only: bool) {
+        smol::block_on(async {
+            let prompt = mcp_prompt(
+                &default_mgr(),
+                (HOME_ASSISTANT_SERVER, LOOKUP_TOOL),
+                &json!({}),
+                read_only,
+            )
+            .await
+            .expect(MCP_PROMPT_MISSING);
+            let option = prompt
+                .options
+                .iter()
+                .find(|option| option.id == READ_ONLY_MCP_TOOL_OPTION);
+            if !read_only {
+                assert_eq!(prompt.risk, PermissionRisk::High);
+                assert!(option.is_none());
+                return;
+            }
+            let option = option.expect(READ_ONLY_OPTION_MISSING);
+            assert_eq!(prompt.risk, PermissionRisk::Low);
+            assert_eq!(
+                (
+                    option.allowed_lifetimes.as_slice(),
+                    &option.rule.arguments,
+                    option.broad,
+                    option.is_default,
+                    option.confirmation.as_deref(),
+                ),
+                (
+                    [
+                        PermissionLifetime::Conversation,
+                        PermissionLifetime::Project,
+                        PermissionLifetime::Global,
+                    ]
+                    .as_slice(),
+                    &PermissionArgumentConstraint::Unconstrained,
+                    false,
+                    false,
+                    None,
+                )
+            );
+        });
+    }
+
+    /// The grant outlives the session and covers the tool's next call
+    /// whatever its arguments, and no other tool.
+    #[test_case(PermissionLifetime::Project; "project")]
+    #[test_case(PermissionLifetime::Global; "global")]
+    fn a_read_only_mcp_grant_persists_for_any_arguments(lifetime: PermissionLifetime) {
+        smol::block_on(async {
+            let temp = tempdir().unwrap();
+            let project = temp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let state_dir = StateDir::from_path(temp.path().join("state"));
+            let manager = persistent_manager(state_dir.clone(), &project);
+            let (event_tx, events) = flume::unbounded();
+            let event_tx = EventSender::new(event_tx, 0);
+            let (_answer_tx, answers) = flume::unbounded();
+            let answers = async_lock::Mutex::new(answers);
+            let lookup = (HOME_ASSISTANT_SERVER, LOOKUP_TOOL);
+            let first_input = json!({"area": "kitchen"});
+
+            let call = enforce_mcp(
+                &manager,
+                lookup,
+                &first_input,
+                true,
+                &event_tx,
+                Some(&answers),
+            );
+            let answer = async {
+                wait_for(&events, &mut Vec::new(), |event| {
+                    matches!(event, AgentEvent::PermissionRequest(_))
+                })
+                .await;
+                assert!(manager.answer(
+                    MCP_REQUEST,
+                    PermissionAnswer::AllowOption {
+                        option_id: READ_ONLY_MCP_TOOL_OPTION.into(),
+                        lifetime,
+                    },
+                ));
+            };
+            let (granted, ()) = future::zip(call, answer).await;
+            granted.unwrap();
+            drop(manager);
+
+            let restarted = persistent_manager(state_dir, &project);
+            let (event_tx, _events) = flume::unbounded();
+            let event_tx = EventSender::new(event_tx, 0);
+            enforce_mcp(
+                &restarted,
+                lookup,
+                &json!({"area": "garage"}),
+                true,
+                &event_tx,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(
+                enforce_mcp(
+                    &restarted,
+                    (HOME_ASSISTANT_SERVER, TURN_ON_TOOL),
+                    &json!({}),
+                    false,
+                    &event_tx,
+                    None,
+                )
+                .await
+                .is_err()
+            );
+        });
+    }
+
+    /// A request saved before calls carried MCP facts still decodes, and
+    /// one that carries them round-trips.
+    #[test]
+    fn a_request_without_mcp_facts_decodes() {
+        smol::block_on(async {
+            let prompt = mcp_prompt(
+                &default_mgr(),
+                (HOME_ASSISTANT_SERVER, LOOKUP_TOOL),
+                &json!({}),
+                true,
+            )
+            .await
+            .expect(MCP_PROMPT_MISSING);
+            let wire = serde_json::to_value(&prompt).unwrap();
+            assert_eq!(
+                serde_json::from_value::<PermissionRequest>(wire.clone()).unwrap(),
+                *prompt
+            );
+            let mut older = wire;
+            older.as_object_mut().unwrap().remove(MCP_FACTS_FIELD);
+            let decoded: PermissionRequest = serde_json::from_value(older).unwrap();
+            assert_eq!(decoded.mcp, None);
+            assert_eq!(
+                serde_json::to_value(&decoded).unwrap().get(MCP_FACTS_FIELD),
+                None
+            );
+        });
     }
 }

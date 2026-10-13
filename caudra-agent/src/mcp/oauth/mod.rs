@@ -15,7 +15,7 @@ use caudra_storage::auth::{McpAuthData, load_mcp_auth, save_mcp_auth};
 use futures_lite::future;
 use isahc::HttpClient;
 use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
-use isahc::http::header::{ACCEPT, CONTENT_TYPE, WWW_AUTHENTICATE};
+use isahc::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE};
 use isahc::http::{Request, StatusCode};
 use isahc::net::dns::ResolveMap;
 use tracing::{debug, info, warn};
@@ -25,8 +25,8 @@ use self::callback::{CallbackResult, CallbackServer};
 use self::discovery::{issuer_matches, parse_www_authenticate};
 use super::config::{OauthClientConfig, resolve_url_addresses, risky_ip};
 use super::error::McpError;
-use super::http::{ACCEPT_VALUE, CT_JSON, INITIALIZE_METHOD};
-use super::protocol::{JsonRpcRequest, initialize_params};
+use super::http::{ACCEPT_VALUE, CT_JSON};
+use super::protocol::{INITIALIZE_METHOD, JsonRpcRequest, initialize_params};
 
 /// Caudra's OAuth Client ID Metadata Document. Authorization servers that
 /// advertise `client_id_metadata_document_supported` fetch it to learn the
@@ -35,6 +35,10 @@ const CLIENT_METADATA_URL: &str = "https://caudra.ai/oauth/client-metadata.json"
 const OAUTH_DOCS_URL: &str = "https://caudra.ai/docs/mcp/#oauth";
 const PKCE_METHOD: &str = "S256";
 const PROBE_REQUEST_ID: u64 = 0;
+const BEARER_PREFIX: &str = "Bearer ";
+/// Why a server that still answers 401 to a fresh token is not asked to sign
+/// in again: the account signed in, and the server turned it away.
+pub const REFUSED_ACCESS: &str = "the account signed in, but the server refused it. On Home Assistant, /api/mcp may need an administrator account, and /api/mcp/assist does not";
 const AUTH_TIMEOUT: Duration = Duration::from_secs(600);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// In-band refresh blocks requests waiting on the transport's auth lock, so it
@@ -423,6 +427,35 @@ fn check_response_issuer(
 /// names its resource metadata and the scope to request. Any other outcome
 /// leaves discovery to the well-known URLs.
 async fn probe_challenge(server_url: &str, server_addresses: Option<&[IpAddr]>) -> Option<String> {
+    probe(server_url, None, server_addresses).await?.challenge
+}
+
+/// Whether the server still answers 401 to a request carrying `access_token`,
+/// as Home Assistant's `/api/mcp` does for a user who is not an administrator.
+/// A probe that gets no answer counts as accepted, so the call that follows
+/// reports the real failure.
+pub async fn token_refused(
+    server_url: &str,
+    access_token: &str,
+    server_addresses: Option<&[IpAddr]>,
+) -> bool {
+    probe(server_url, Some(access_token), server_addresses)
+        .await
+        .is_some()
+}
+
+/// A 401 the server answered a probe with.
+struct Unauthorized {
+    challenge: Option<String>,
+}
+
+/// Sends `initialize` as the server's first request, with `bearer` when one is
+/// given. `None` unless the server answered 401.
+async fn probe(
+    server_url: &str,
+    bearer: Option<&str>,
+    server_addresses: Option<&[IpAddr]>,
+) -> Option<Unauthorized> {
     let client = build_http_client(server_url, server_url, server_addresses, HTTP_TIMEOUT).ok()?;
     let body = serde_json::to_vec(&JsonRpcRequest::new(
         PROBE_REQUEST_ID,
@@ -430,24 +463,27 @@ async fn probe_challenge(server_url: &str, server_addresses: Option<&[IpAddr]>) 
         Some(initialize_params()),
     ))
     .ok()?;
-    let request = Request::post(server_url)
+    let mut request = Request::post(server_url)
         .header(CONTENT_TYPE, CT_JSON)
-        .header(ACCEPT, ACCEPT_VALUE)
-        .body(body)
-        .ok()?;
+        .header(ACCEPT, ACCEPT_VALUE);
+    if let Some(token) = bearer {
+        request = request.header(AUTHORIZATION, format!("{BEARER_PREFIX}{token}"));
+    }
+    let request = request.body(body).ok()?;
     let response = smol::unblock(move || client.send(request))
         .await
-        .inspect_err(|error| debug!(%error, "OAuth challenge probe failed"))
+        .inspect_err(|error| debug!(%error, "OAuth probe failed"))
         .ok()?;
     if response.status() != StatusCode::UNAUTHORIZED {
-        debug!(status = %response.status(), "OAuth challenge probe got no 401");
+        debug!(status = %response.status(), "OAuth probe got no 401");
         return None;
     }
-    response
+    let challenge = response
         .headers()
         .get(WWW_AUTHENTICATE)
         .and_then(|value| value.to_str().ok())
-        .map(String::from)
+        .map(String::from);
+    Some(Unauthorized { challenge })
 }
 
 async fn auth_timeout() -> Result<CallbackResult, String> {
@@ -558,7 +594,9 @@ fn build_authorization_url(
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{IpAddr, Ipv4Addr, TcpListener};
+    use std::thread;
     use std::time::Duration;
 
     use caudra_storage::auth::McpAuthData;
@@ -568,7 +606,7 @@ mod tests {
     use super::discovery::AuthServerMetadata;
     use super::{
         CLIENT_METADATA_URL, ClientChoice, OAuthError, build_authorization_url, build_http_client,
-        check_response_issuer, choose_client, require_pkce,
+        check_response_issuer, choose_client, require_pkce, token_refused,
     };
     use crate::mcp::config::OauthClientConfig;
 
@@ -584,6 +622,10 @@ mod tests {
     const STATIC_ID: &str = "static-client";
     const STORED_ID: &str = "stored-client";
     const REGISTER: &str = "register";
+    const REFUSED_TOKEN: &str = "refused";
+    const ACCEPTED_TOKEN: &str = "accepted";
+    const UNAUTHORIZED_STATUS: &str = "401 Unauthorized";
+    const OK_STATUS: &str = "200 OK";
 
     fn auth_server(metadata_documents: bool, registration: bool) -> AuthServerMetadata {
         AuthServerMetadata {
@@ -769,6 +811,47 @@ mod tests {
                 Duration::from_secs(1),
             )
             .is_ok()
+        );
+    }
+
+    /// A server that answers one request: 401 when it carries `refused` as
+    /// its bearer token, 200 otherwise.
+    fn serve_once() -> String {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut refused = false;
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 0 && line != "\r\n" {
+                refused |= line.to_ascii_lowercase()
+                    == format!("authorization: bearer {REFUSED_TOKEN}\r\n");
+                line.clear();
+            }
+            let status = if refused {
+                UNAUTHORIZED_STATUS
+            } else {
+                OK_STATUS
+            };
+            write!(
+                &stream,
+                "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        url
+    }
+
+    #[test_case(REFUSED_TOKEN, true ; "still_401")]
+    #[test_case(ACCEPTED_TOKEN, false ; "accepted")]
+    fn a_token_the_server_turns_away_is_refused(token: &str, refused: bool) {
+        let url = serve_once();
+        let addresses = [IpAddr::V4(Ipv4Addr::LOCALHOST)];
+
+        assert_eq!(
+            smol::block_on(token_refused(&url, token, Some(&addresses))),
+            refused
         );
     }
 }

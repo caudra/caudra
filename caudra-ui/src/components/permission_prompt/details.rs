@@ -8,7 +8,10 @@ use super::PermissionPrompt;
 use super::choices::{grant_label, grant_names_commands};
 use super::decision::grant_option;
 use super::inspector::pattern_summary;
-use super::notes::{action_lines, coverage_phrase, is_shell, reason_sentence, row_coverage, tilde};
+use super::notes::{
+    READ_ONLY_BADGE, action_lines, coverage_phrase, is_shell, mcp_note, reason_sentence,
+    row_coverage, tilde,
+};
 use super::scope::{SHELL_REACH, option_summary, tool_text};
 use crate::components::escape_terminal_controls;
 
@@ -34,6 +37,7 @@ const REMOTE_PLACE: &str = "A remote workspace";
 const ASKS_EVERY_TIME: &str = "asks every time";
 const WORKDIR_ATTRIBUTE: &str = "workdir";
 const WRITTEN_SCOPE: &str = "Commands that match this pattern, started in the same folder.";
+const KIND_SEPARATOR: &str = " · ";
 
 pub(super) fn mask_secrets(value: &Value) -> Value {
     let mut nodes = MAX_REVIEW_NODES;
@@ -477,6 +481,7 @@ impl PermissionPrompt {
             Section::new("Where", places(request)),
         ];
         let mut why = vec![reason_sentence(&request.presentation.reason)];
+        why.extend(mcp_note(request));
         if let Some(auto) = request.presentation.auto {
             why.push(auto.phrase().into());
         }
@@ -509,7 +514,15 @@ impl PermissionPrompt {
         if !cautions.is_empty() {
             sections.push(Section::new("Decision engine", cautions));
         }
-        sections.push(Section::new("Tool", vec![tool_text(request)]));
+        let mut tool = vec![tool_text(request)];
+        if let Some(facts) = &request.mcp {
+            tool.push(if facts.read_only {
+                format!("{}{KIND_SEPARATOR}{READ_ONLY_BADGE}", facts.kind.label())
+            } else {
+                facts.kind.label().into()
+            });
+        }
+        sections.push(Section::new("Tool", tool));
         sections.push(Section::new("Input", input_lines(request)));
         sections
     }

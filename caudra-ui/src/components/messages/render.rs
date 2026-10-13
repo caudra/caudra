@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use crate::components::hover_style;
-use crate::components::tool_display::{FILTERED_AFFORDANCE, RAW_AFFORDANCE};
+use crate::components::tool_display::{CARD_AFFORDANCE, FILTERED_AFFORDANCE, RAW_AFFORDANCE};
 use crate::markdown::{LinkMap, TerminalLink};
 use crate::theme;
 
@@ -18,9 +18,9 @@ pub(super) const MESSAGE_ACTION_GLYPH: &str = "⋮";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HoverFeedback {
     Affordance,
-    /// Only the raw/filtered switch, so hovering it does not also light up an
-    /// expand affordance elsewhere on the same card.
-    ShellToggle,
+    /// Only the switch to a body's raw view and back, so hovering it does not
+    /// also light up an expand affordance elsewhere on the same card.
+    RawToggle,
     /// The row that names a control nested inside a card, by its line index. A
     /// batch child is a control in its own right, so it marks itself rather
     /// than the card around it, the same way a card marks its own header.
@@ -32,7 +32,7 @@ impl HoverFeedback {
     fn needles(self) -> &'static [&'static str] {
         match self {
             Self::Affordance => &[EXPAND_AFFORDANCE],
-            Self::ShellToggle => &[RAW_AFFORDANCE, FILTERED_AFFORDANCE],
+            Self::RawToggle => &[RAW_AFFORDANCE, FILTERED_AFFORDANCE, CARD_AFFORDANCE],
             Self::Row(_) | Self::Chrome => &[],
         }
     }
@@ -242,7 +242,7 @@ fn hover_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = lines.to_vec();
     match hover {
-        Some((feedback @ (HoverFeedback::Affordance | HoverFeedback::ShellToggle), _)) => {
+        Some((feedback @ (HoverFeedback::Affordance | HoverFeedback::RawToggle), _)) => {
             for line in &mut lines {
                 let mut spans = Vec::with_capacity(line.spans.len());
                 for span in line.spans.drain(..) {

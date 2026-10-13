@@ -15,23 +15,32 @@
 //! `McpSnapshotReader` is a read-only handle. Outside code physically cannot publish a
 //! snapshot, so the "only `run` publishes" invariant is enforced by the type system.
 
+pub mod call;
 pub mod config;
+pub mod elicitation;
+pub mod elicitor;
+pub mod era;
 pub mod error;
 pub mod http;
+pub mod inbound;
+pub mod kind;
+pub mod listen;
+pub mod message;
 pub mod oauth;
 pub mod output;
 pub mod protocol;
+pub mod resources;
 pub mod stdio;
 pub mod transport;
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::tools::ToolFilter;
+use crate::tools::{ToolContext, ToolFilter};
 use arc_swap::{ArcSwap, Guard};
 use caudra_config::mcp::DEFAULT_DEFER_TOOLS;
 use caudra_config::{ProfileToolExposure, ProfileToolPolicy, ProfileToolSource};
@@ -39,17 +48,26 @@ use caudra_providers::{ContentBlock, Message};
 use caudra_storage::StateDir;
 use caudra_storage::mcp_trust::{is_project_trusted, revoke_project_trust, trust_project};
 use serde_json::{Value, json};
+use smol::Timer;
 use tracing::{info, warn};
 
+use self::call::{CallScope, Elicitor};
 use self::config::{
     LocalExecutionPolicy, McpConfig, McpConfigErrors, McpConfigSource, McpReviewSummary,
     McpServerInfo, McpServerStatus, OauthClientConfig, RawServerConfig, RawTransport, ServerConfig,
     Transport, load_config, load_global_config, parse_server, requires_project_trust,
     resolve_http_addresses, review_summary, risky_ip, security_digest, transport_kind,
 };
+use self::elicitor::ElicitorFactory;
 use self::error::McpError;
 use self::http::HttpTransport;
+use self::inbound::ListKind;
+use self::kind::{McpCallFacts, McpServerKind, PausedRuns};
 use self::output::McpOutput;
+use self::protocol::{PromptInfo, ServerDiscovery, ToolAnnotations, ToolInfo};
+use self::resources::{
+    COMPLETIONS_FEATURE, CompletionRef, RESOURCES_FEATURE, ResourceContents, ResourceLists,
+};
 use self::stdio::StdioTransport;
 use self::transport::McpTransport;
 use crate::decisions::{DecisionContext, Decisions, NoteDraft};
@@ -73,6 +91,11 @@ const MAX_OVERFLOW_NAMES: usize = 20;
 const SEARCH_NO_MATCH: &str = "No deferred MCP tools matched";
 const SEARCH_OVERFLOW_PREFIX: &str = "Also matched but not loaded: ";
 const STARTUP_EPOCH: u64 = 0;
+/// How long a server's list changes settle before it is listed again, so a
+/// burst of them costs one listing.
+pub const LIST_CHANGE_DEBOUNCE: Duration = Duration::from_millis(500);
+const SCHEMA_REF_KEY: &str = "$ref";
+const LOCAL_REF_PREFIX: char = '#';
 pub(crate) use crate::tools::deferral::SEARCH_EMPTY_QUERY;
 
 /// Convert internal qualified name (`server.tool`) to wire format (`server__tool`)
@@ -97,6 +120,86 @@ struct McpToolDef {
     raw_name: String,
     description: String,
     input_schema: Value,
+    meta: Arc<McpToolMeta>,
+}
+
+/// What a server said about a tool besides its name, description and input.
+/// None of it reaches the model or the tool's permission contract.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct McpToolMeta {
+    pub title: Option<String>,
+    pub annotations: ToolAnnotations,
+    pub output_schema: Option<Value>,
+}
+
+impl McpToolMeta {
+    fn from_info(info: &mut ToolInfo) -> Self {
+        Self {
+            title: info.title.take(),
+            annotations: std::mem::take(&mut info.annotations),
+            output_schema: info.output_schema.take(),
+        }
+    }
+
+    /// The tool's display title: its own, else the one its annotations give.
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref().or(self.annotations.title.as_deref())
+    }
+}
+
+/// The first `$ref` in `schema` that points outside it. Fetching one is
+/// never safe, and a schema that needs it cannot be checked without it.
+fn external_ref(schema: &Value) -> Option<&str> {
+    match schema {
+        Value::Object(fields) => fields.iter().find_map(|(key, value)| match value {
+            Value::String(target)
+                if key == SCHEMA_REF_KEY && !target.starts_with(LOCAL_REF_PREFIX) =>
+            {
+                Some(target.as_str())
+            }
+            _ => external_ref(value),
+        }),
+        Value::Array(items) => items.iter().find_map(external_ref),
+        _ => None,
+    }
+}
+
+/// The tools of `server` a model can be offered. A name that is invalid or
+/// too long on the wire, or an input schema with an external `$ref`, drops
+/// the tool with a warning.
+fn tool_defs(server: &str, infos: Vec<ToolInfo>) -> Vec<McpToolDef> {
+    infos
+        .into_iter()
+        .filter(|info| {
+            if !config::is_valid_tool_name(&info.name) {
+                warn!(tool = %info.name, server, "skipping tool with invalid name");
+                return false;
+            }
+            // Wire format is server__tool — check total length fits LLM API limits
+            let wire_len = server.len() + 2 + info.name.len();
+            if wire_len > 64 {
+                warn!(
+                    tool = %info.name,
+                    server,
+                    wire_len,
+                    "skipping tool — wire name exceeds 64 char LLM API limit"
+                );
+                return false;
+            }
+            if let Some(target) = external_ref(&info.input_schema) {
+                warn!(tool = %info.name, server, target, "skipping tool whose input schema references an external $ref");
+                return false;
+            }
+            true
+        })
+        .map(|mut info| McpToolDef {
+            qualified_name: intern(format!("{server}{SEPARATOR}{}", info.name)),
+            meta: Arc::new(McpToolMeta::from_info(&mut info)),
+            raw_name: info.name,
+            description: info.description,
+            input_schema: info.input_schema,
+        })
+        .collect()
 }
 
 struct McpPromptDef {
@@ -116,8 +219,9 @@ impl McpPromptDef {
         }
     }
 
-    fn to_info(&self, server_name: &str) -> McpPromptInfo {
+    fn to_info(&self, server_name: &str, completions: bool) -> McpPromptInfo {
         McpPromptInfo {
+            completions,
             display_name: format!("{server_name}:{}", self.raw_name),
             qualified_name: self.qualified_name.clone(),
             description: self.description.clone(),
@@ -147,8 +251,16 @@ struct ServerEntry {
     trust_rejected: bool,
     status: McpServerStatus,
     transport: Option<Arc<dyn McpTransport>>,
+    /// What the running server said about itself when it connected.
+    discovery: Option<ServerDiscovery>,
+    /// Lists the running server again when it says a list changed. Dropped
+    /// with the connection.
+    list_watch: Option<smol::Task<()>>,
+    /// Executor runs this connection reported paused. Replaced with it.
+    paused_runs: Arc<PausedRuns>,
     tools: Vec<McpToolDef>,
     prompts: Vec<McpPromptDef>,
+    resources: ResourceLists,
     /// `STARTUP_EPOCH`, or the generation of the reload that built this entry.
     /// A connect lands only on the entry it was started for, never on a successor.
     epoch: u64,
@@ -168,50 +280,163 @@ impl ServerEntry {
             kill_process_groups(&old.child_pids());
             old.shutdown().await;
         }
+        self.list_watch = None;
+        self.discovery = None;
+        self.paused_runs = Arc::default();
         self.tools.clear();
         self.prompts.clear();
+        self.resources = ResourceLists::default();
     }
 
     fn populate(&mut self, result: StartResult) {
         let StartResult {
             transport,
+            discovery,
             tool_infos,
             prompt_infos,
+            resources,
         } = result;
-        self.tools = tool_infos
-            .into_iter()
-            .filter(|info| {
-                if !config::is_valid_tool_name(&info.name) {
-                    warn!(tool = %info.name, server = %self.name, "skipping tool with invalid name");
-                    return false;
-                }
-                // Wire format is server__tool — check total length fits LLM API limits
-                let wire_len = self.name.len() + 2 + info.name.len();
-                if wire_len > 64 {
-                    warn!(
-                        tool = %info.name,
-                        server = %self.name,
-                        wire_len,
-                        "skipping tool — wire name exceeds 64 char LLM API limit"
-                    );
-                    return false;
-                }
-                true
-            })
-            .map(|info| McpToolDef {
-                qualified_name: intern(format!("{}{SEPARATOR}{}", self.name, info.name)),
-                raw_name: info.name,
-                description: info.description,
-                input_schema: info.input_schema,
-            })
-            .collect();
-        self.prompts = prompt_infos
-            .into_iter()
-            .map(|info| McpPromptDef::from_info(&self.name, info))
-            .collect();
+        self.tools = tool_defs(&self.name, tool_infos);
+        self.prompts = prompt_defs(&self.name, prompt_infos);
+        self.resources = resources;
         self.transport = Some(transport);
+        self.discovery = Some(discovery);
+        self.list_watch = None;
+        self.paused_runs = Arc::default();
         self.status = McpServerStatus::Running;
     }
+
+    fn kind(&self) -> Option<McpServerKind> {
+        self.discovery.as_ref().and_then(ServerDiscovery::kind)
+    }
+
+    /// Lists the running server again, after [`LIST_CHANGE_DEBOUNCE`], each
+    /// time it says its tools, prompts or resources changed.
+    fn watch_lists(&mut self, relisted: &flume::Sender<Relisted>) {
+        if self.list_watch.is_some() {
+            return;
+        }
+        let Some(connection) = self.transport.clone() else {
+            return;
+        };
+        let Some(changes) = connection.inbound().map(|inbound| inbound.list_changes()) else {
+            return;
+        };
+        let server = self.name.clone();
+        let relisted = relisted.clone();
+        let offers_resources = self
+            .discovery
+            .as_ref()
+            .is_some_and(|discovery| discovery.capabilities.resources.is_some());
+        self.list_watch = Some(smol::spawn(async move {
+            while let Ok(first) = changes.recv_async().await {
+                Timer::after(LIST_CHANGE_DEBOUNCE).await;
+                let changed: HashSet<ListKind> = changes.drain().chain([first]).collect();
+                let tools = if changed.contains(&ListKind::Tools) {
+                    Some(transport::list_tools(connection.as_ref()).await)
+                } else {
+                    None
+                };
+                let prompts = if changed.contains(&ListKind::Prompts) {
+                    Some(transport::list_prompts(connection.as_ref()).await)
+                } else {
+                    None
+                };
+                let resources = if offers_resources && changed.contains(&ListKind::Resources) {
+                    Some(resources::list_all(connection.as_ref()).await)
+                } else {
+                    None
+                };
+                if tools.is_none() && prompts.is_none() && resources.is_none() {
+                    continue;
+                }
+                let update = Relisted {
+                    server: server.clone(),
+                    connection: Arc::clone(&connection),
+                    tools,
+                    prompts,
+                    resources,
+                };
+                if relisted.send_async(update).await.is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+}
+
+fn prompt_defs(server: &str, infos: Vec<PromptInfo>) -> Vec<McpPromptDef> {
+    infos
+        .into_iter()
+        .map(|info| McpPromptDef::from_info(server, info))
+        .collect()
+}
+
+/// A running server's lists, fetched again after it said they changed.
+/// `None` for a list it did not say changed.
+struct Relisted {
+    server: String,
+    connection: Arc<dyn McpTransport>,
+    tools: Option<Result<Vec<ToolInfo>, McpError>>,
+    prompts: Option<Result<Vec<PromptInfo>, McpError>>,
+    resources: Option<Result<ResourceLists, McpError>>,
+}
+
+/// Lands a relisting on the connection it was fetched over, and nowhere
+/// else. A list that failed keeps the one before it. Whether anything
+/// landed, and so needs publishing.
+fn apply_relisted(inner: &mut McpManagerInner, relisted: Relisted) -> bool {
+    let Some(entry) = inner.entries.iter_mut().find(|entry| {
+        entry.name == relisted.server
+            && entry
+                .transport
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &relisted.connection))
+    }) else {
+        return false;
+    };
+    let mut landed = false;
+    match relisted.tools {
+        Some(Ok(tools)) => {
+            entry.tools = tool_defs(&entry.name, tools);
+            landed = true;
+        }
+        Some(Err(error)) => {
+            warn!(server = %entry.name, %error, "MCP tools/list after a list change failed")
+        }
+        None => {}
+    }
+    match relisted.prompts {
+        Some(Ok(prompts)) => {
+            entry.prompts = prompt_defs(&entry.name, prompts);
+            landed = true;
+        }
+        Some(Err(error)) => {
+            warn!(server = %entry.name, %error, "MCP prompts/list after a list change failed")
+        }
+        None => {}
+    }
+    match relisted.resources {
+        Some(Ok(resources)) => {
+            entry.resources = resources;
+            landed = true;
+        }
+        Some(Err(error)) => {
+            warn!(server = %entry.name, %error, "MCP resources/list after a list change failed")
+        }
+        None => {}
+    }
+    if landed {
+        info!(
+            server = %entry.name,
+            tools = entry.tools.len(),
+            prompts = entry.prompts.len(),
+            resources = entry.resources.resources.len(),
+            templates = entry.resources.templates.len(),
+            "MCP server lists changed"
+        );
+    }
+    landed
 }
 
 struct McpManagerInner {
@@ -226,7 +451,23 @@ struct McpManagerInner {
 struct ToolIndex {
     tools: HashMap<Arc<str>, ToolRef>,
     prompts: HashMap<String, PromptRef>,
+    servers: HashMap<String, ServerRef>,
     descriptors: Arc<[ToolDescriptor]>,
+}
+
+/// A running server, for what it offers beyond tools and prompts.
+struct ServerRef {
+    transport: Arc<dyn McpTransport>,
+    resources: bool,
+    completions: bool,
+}
+
+impl ToolIndex {
+    fn read_only(&self, qualified_name: &str) -> bool {
+        self.tools
+            .get(qualified_name)
+            .is_some_and(ToolRef::read_only)
+    }
 }
 
 /// One published MCP tool. Wire name and search text are derived from
@@ -260,6 +501,17 @@ struct ToolRef {
     subject: PermissionSubject,
     generation: u64,
     transport: Arc<dyn McpTransport>,
+    meta: Arc<McpToolMeta>,
+    kind: Option<McpServerKind>,
+    paused_runs: Arc<PausedRuns>,
+}
+
+impl ToolRef {
+    /// A recognised server annotated the tool `readOnlyHint`, so it may run
+    /// where Caudra's own read tools do. A stranger's annotation earns nothing.
+    fn read_only(&self) -> bool {
+        self.kind.is_some() && self.meta.annotations.read_only()
+    }
 }
 
 #[derive(Clone)]
@@ -280,22 +532,74 @@ impl McpToolBinding {
         self.tool.generation
     }
 
-    pub async fn call(&self, args: &Value) -> Result<McpOutput, McpError> {
-        transport::call_tool(self.tool.transport.as_ref(), &self.tool.raw_name, args).await
+    /// The server this tool belongs to, when Caudra knows it by name.
+    pub fn kind(&self) -> Option<McpServerKind> {
+        self.tool.kind
+    }
+
+    pub fn annotations(&self) -> &ToolAnnotations {
+        &self.tool.meta.annotations
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.tool.meta.title()
+    }
+
+    pub fn read_only(&self) -> bool {
+        self.tool.read_only()
+    }
+
+    /// What a permission prompt for a call with `args` should know, for a
+    /// tool of a recognised server.
+    pub fn call_facts(&self, args: &Value) -> Option<McpCallFacts> {
+        let kind = self.tool.kind?;
+        Some(McpCallFacts {
+            kind,
+            read_only: self.read_only(),
+            note: kind.always_asks(&self.tool.raw_name, args, &self.tool.paused_runs),
+        })
+    }
+
+    /// Calls the tool. An Executor run the result says is paused is
+    /// remembered, so a later `resume` prompt can say what it approves.
+    pub async fn call(&self, args: &Value, scope: &CallScope) -> Result<McpOutput, McpError> {
+        let output = transport::call_tool(
+            self.tool.transport.as_ref(),
+            &self.tool.raw_name,
+            &self.tool.meta,
+            self.tool.kind,
+            args,
+            scope,
+        )
+        .await?;
+        if self.tool.kind == Some(McpServerKind::Executor)
+            && let Some(structured) = output.structured_content()
+        {
+            self.tool.paused_runs.record(structured);
+        }
+        Ok(output)
+    }
+
+    /// What `output`, flagged `isError`, reads as to the model.
+    pub fn reported_error(&self, output: &McpOutput) -> McpError {
+        transport::reported_error(self.tool.transport.server_name(), output)
     }
 }
 
 struct PromptRef {
     raw_name: String,
     transport: Arc<dyn McpTransport>,
+    completions: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct McpPromptInfo {
     pub display_name: String,
     pub qualified_name: String,
     pub description: String,
     pub arguments: Vec<McpPromptArg>,
+    /// Whether its server completes argument values.
+    pub completions: bool,
 }
 
 #[derive(Clone)]
@@ -309,8 +613,45 @@ pub struct McpPromptArg {
 pub struct McpSnapshot {
     pub infos: Vec<McpServerInfo>,
     pub prompts: Vec<McpPromptInfo>,
+    /// Every running server that declared resources, in server order.
+    pub resources: Vec<McpServerResources>,
     pub pids: Vec<u32>,
     pub generation: u64,
+}
+
+/// A running server's resources and templates, and whether it completes
+/// their variables.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct McpServerResources {
+    pub server: String,
+    pub lists: ResourceLists,
+    pub completions: bool,
+}
+
+impl McpSnapshot {
+    pub fn resources_of(&self, server: &str) -> Option<&McpServerResources> {
+        self.resources.iter().find(|offer| offer.server == server)
+    }
+
+    /// Whether `uri` is something the running `server` listed, or spells the
+    /// way one of its templates names a resource.
+    pub fn offers_resource(&self, server: &str, uri: &str) -> bool {
+        self.resources_of(server)
+            .is_some_and(|offer| offer.lists.offers(uri))
+    }
+}
+
+/// What a completion is asked for: a prompt's argument, or a variable of one
+/// of a server's resource templates.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CompletionTarget {
+    Prompt {
+        qualified_name: String,
+    },
+    Template {
+        server: String,
+        uri_template: String,
+    },
 }
 
 /// How one MCP tool would reach the model on the next request.
@@ -327,7 +668,10 @@ pub struct McpToolStatus {
 /// Read-only view of the latest published `McpSnapshot`. Handing this out instead of the
 /// raw `ArcSwap` keeps outside code from publishing snapshots of its own.
 #[derive(Clone)]
-pub struct McpSnapshotReader(Arc<ArcSwap<McpSnapshot>>);
+pub struct McpSnapshotReader {
+    snapshot: Arc<ArcSwap<McpSnapshot>>,
+    index: Arc<ArcSwap<ToolIndex>>,
+}
 
 impl McpSnapshotReader {
     pub fn empty() -> Self {
@@ -335,15 +679,81 @@ impl McpSnapshotReader {
     }
 
     pub fn from_snapshot(snapshot: McpSnapshot) -> Self {
-        Self(Arc::new(ArcSwap::from_pointee(snapshot)))
+        Self {
+            snapshot: Arc::new(ArcSwap::from_pointee(snapshot)),
+            index: Arc::default(),
+        }
     }
 
     pub fn load(&self) -> Guard<Arc<McpSnapshot>> {
-        self.0.load()
+        self.snapshot.load()
     }
 
     pub fn load_full(&self) -> Arc<McpSnapshot> {
-        self.0.load_full()
+        self.snapshot.load_full()
+    }
+
+    /// Asks the server behind `target` for values of `argument`, typed so far
+    /// as `value`. A completion changes nothing, so a view may ask for one; a
+    /// server that never declared `completions` is not asked at all.
+    pub async fn complete(
+        &self,
+        target: &CompletionTarget,
+        argument: &str,
+        value: &str,
+        context: &BTreeMap<String, String>,
+    ) -> Result<resources::Completion, McpError> {
+        let (transport, reference) = {
+            let index = self.index.load();
+            match target {
+                CompletionTarget::Prompt { qualified_name } => {
+                    let prompt = index.prompts.get(qualified_name).ok_or_else(|| {
+                        McpError::UnknownPrompt {
+                            name: qualified_name.clone(),
+                        }
+                    })?;
+                    if !prompt.completions {
+                        return Err(McpError::Unsupported {
+                            server: prompt.transport.server_name().to_string(),
+                            feature: COMPLETIONS_FEATURE,
+                        });
+                    }
+                    (
+                        Arc::clone(&prompt.transport),
+                        CompletionRef::Prompt(prompt.raw_name.clone()),
+                    )
+                }
+                CompletionTarget::Template {
+                    server,
+                    uri_template,
+                } => {
+                    let running =
+                        index
+                            .servers
+                            .get(server)
+                            .ok_or_else(|| McpError::ServerDied {
+                                server: server.clone(),
+                            })?;
+                    if !running.completions {
+                        return Err(McpError::Unsupported {
+                            server: server.clone(),
+                            feature: COMPLETIONS_FEATURE,
+                        });
+                    }
+                    (
+                        Arc::clone(&running.transport),
+                        CompletionRef::Resource(uri_template.clone()),
+                    )
+                }
+            }
+        };
+        resources::complete(transport.as_ref(), &reference, argument, value, context).await
+    }
+}
+
+impl Default for McpSnapshotReader {
+    fn default() -> Self {
+        Self::empty()
     }
 }
 
@@ -409,6 +819,9 @@ pub struct McpSession {
     /// tool array is fixed. Calls always bind against the live index, so a
     /// tool that left since fails rather than reaching a stale server.
     pinned: Option<PinnedMcpTools>,
+    /// How the front end asks the user what a server wants to know; `None`
+    /// declines every such request.
+    elicitors: Option<Arc<dyn ElicitorFactory>>,
 }
 
 /// The MCP tools a conversation's fixed tool array was built from, with the
@@ -491,7 +904,18 @@ impl McpSession {
             ceiling: ToolFilter::All,
             inherited_profiles: Vec::new(),
             pinned: None,
+            elicitors: None,
         }
+    }
+
+    pub fn with_elicitors(mut self, elicitors: Option<Arc<dyn ElicitorFactory>>) -> Self {
+        self.elicitors = elicitors;
+        self
+    }
+
+    /// Who answers the servers during a call made under `ctx`, if anyone can.
+    pub fn elicitor_for(&self, ctx: &ToolContext) -> Option<Arc<dyn Elicitor>> {
+        self.elicitors.as_ref()?.for_call(ctx)
     }
 
     /// Fixes what requests declare to `pinned`.
@@ -548,11 +972,16 @@ impl McpSession {
     }
 
     pub fn is_disabled(&self, qualified_name: &str) -> bool {
-        policy_disabled(&self.disabled, &self.profile, &self.ceiling, qualified_name)
-            || self.inherited_profiles.iter().any(|profile| {
-                profile.exposure(qualified_name, ProfileToolSource::Mcp)
-                    == Some(ProfileToolExposure::Disabled)
-            })
+        policy_disabled(
+            &self.disabled,
+            &self.profile,
+            &self.ceiling,
+            qualified_name,
+            self.handle.is_read_only(qualified_name),
+        ) || self.inherited_profiles.iter().any(|profile| {
+            profile.exposure(qualified_name, ProfileToolSource::Mcp)
+                == Some(ProfileToolExposure::Disabled)
+        })
     }
 
     pub fn with_profile_policy(
@@ -612,6 +1041,7 @@ impl McpSession {
             ceiling: self.ceiling.clone(),
             inherited_profiles: self.inherited_profiles.clone(),
             pinned: None,
+            elicitors: self.elicitors.clone(),
         }
     }
 
@@ -813,11 +1243,16 @@ impl McpSession {
 
 impl McpRequestSnapshot {
     fn is_disabled(&self, qualified_name: &str) -> bool {
-        policy_disabled(&self.disabled, &self.profile, &self.ceiling, qualified_name)
-            || self.inherited_profiles.iter().any(|profile| {
-                profile.exposure(qualified_name, ProfileToolSource::Mcp)
-                    == Some(ProfileToolExposure::Disabled)
-            })
+        policy_disabled(
+            &self.disabled,
+            &self.profile,
+            &self.ceiling,
+            qualified_name,
+            self.index.read_only(qualified_name),
+        ) || self.inherited_profiles.iter().any(|profile| {
+            profile.exposure(qualified_name, ProfileToolSource::Mcp)
+                == Some(ProfileToolExposure::Disabled)
+        })
     }
 
     fn deferring(&self) -> bool {
@@ -843,7 +1278,9 @@ impl McpRequestSnapshot {
                 let reason = if disabled {
                     Some(if is_disabled(&self.disabled, &descriptor.qualified_name) {
                         REASON_CONFIG
-                    } else if self.ceiling.is_read_only() {
+                    } else if self.ceiling.is_read_only()
+                        && !self.index.read_only(&descriptor.qualified_name)
+                    {
                         MODE_DISABLED
                     } else if !self.ceiling.matches(&descriptor.qualified_name) {
                         CEILING_DISABLED
@@ -942,14 +1379,17 @@ fn profile_lazy(
     }
 }
 
+/// A read-only ceiling keeps only tools a recognised server annotated
+/// read-only (`read_only`).
 fn policy_disabled(
     patterns: &[String],
     profile: &ProfileToolPolicy,
     ceiling: &ToolFilter,
     name: &str,
+    read_only: bool,
 ) -> bool {
     is_disabled(patterns, name)
-        || ceiling.is_read_only()
+        || (ceiling.is_read_only() && !read_only)
         || !ceiling.matches(name)
         || profile.exposure(name, ProfileToolSource::Mcp) == Some(ProfileToolExposure::Disabled)
 }
@@ -981,7 +1421,10 @@ impl McpHandle {
     }
 
     pub fn reader(&self) -> McpSnapshotReader {
-        McpSnapshotReader(Arc::clone(&self.snapshot))
+        McpSnapshotReader {
+            snapshot: Arc::clone(&self.snapshot),
+            index: Arc::clone(&self.index),
+        }
     }
 
     /// Moves the running servers onto `config`, loaded by `config::try_load_config`,
@@ -999,6 +1442,24 @@ impl McpHandle {
 
     pub fn has_tool(&self, name: &str) -> bool {
         self.index.load().tools.contains_key(name)
+    }
+
+    /// Whether some running server lists a resource or a template, which is
+    /// what offers the `mcp_resource` tool. Declaring the capability is not
+    /// enough: Executor declares it for an MCP-Apps shell and lists nothing,
+    /// and the tool's definition would ride along on every request for it.
+    pub fn offers_resources(&self) -> bool {
+        self.snapshot
+            .load()
+            .resources
+            .iter()
+            .any(|offer| !offer.lists.is_empty())
+    }
+
+    /// Whether `name` is a recognised server's tool annotated read-only,
+    /// which plan mode and read-only policies keep.
+    pub fn is_read_only(&self, name: &str) -> bool {
+        self.index.load().read_only(name)
     }
 
     pub fn interned_name(&self, name: &str) -> Arc<str> {
@@ -1027,14 +1488,16 @@ impl McpHandle {
         &self,
         qualified_name: &str,
         args: &Value,
+        scope: &CallScope,
     ) -> Result<McpOutput, McpError> {
-        self.bind_tool(qualified_name)?.call(args).await
+        self.bind_tool(qualified_name)?.call(args, scope).await
     }
 
     pub async fn get_prompt(
         &self,
         qualified_name: &str,
         arguments: &HashMap<String, String>,
+        scope: &CallScope,
     ) -> Result<Vec<protocol::PromptMessage>, McpError> {
         let (raw_name, transport) = {
             let idx = self.index.load();
@@ -1045,7 +1508,34 @@ impl McpHandle {
             };
             (p.raw_name.clone(), Arc::clone(&p.transport))
         };
-        transport::get_prompt(transport.as_ref(), &raw_name, arguments).await
+        transport::get_prompt(transport.as_ref(), &raw_name, arguments, scope).await
+    }
+
+    /// Reads `uri` from the running `server`, which must have declared
+    /// resources.
+    pub async fn read_resource(
+        &self,
+        server: &str,
+        uri: &str,
+        scope: &CallScope,
+    ) -> Result<Vec<ResourceContents>, McpError> {
+        let transport = {
+            let index = self.index.load();
+            let running = index
+                .servers
+                .get(server)
+                .ok_or_else(|| McpError::ServerDied {
+                    server: server.to_string(),
+                })?;
+            if !running.resources {
+                return Err(McpError::Unsupported {
+                    server: server.to_string(),
+                    feature: RESOURCES_FEATURE,
+                });
+            }
+            Arc::clone(&running.transport)
+        };
+        resources::read_resource(transport.as_ref(), uri, scope).await
     }
 
     pub async fn shutdown(&self) {
@@ -1189,6 +1679,7 @@ fn start_with_config_and_state(
 /// mid-connect never waits for a slow `initialize`.
 enum Step {
     Connected(Connect),
+    Relisted(Relisted),
     Command(McpCommand),
     /// Every handle is gone.
     Closed,
@@ -1214,12 +1705,16 @@ async fn run(
     ready_tx: flume::Sender<Infallible>,
 ) {
     let (connected_tx, connected_rx) = flume::unbounded();
+    let (relisted_tx, relisted_rx) = flume::unbounded();
     let mut connects = spawn_connects(&inner, STARTUP_EPOCH, &connected_tx);
     let mut ready = Some(ready_tx);
 
     let mut ack: Option<flume::Sender<()>> = None;
     loop {
         release_ready(&inner, &mut ready);
+        for entry in &mut inner.entries {
+            entry.watch_lists(&relisted_tx);
+        }
         let step = futures_lite::future::or(
             async {
                 match connected_rx.recv_async().await {
@@ -1228,12 +1723,21 @@ async fn run(
                     Err(_) => futures_lite::future::pending().await,
                 }
             },
-            async {
-                match cmd_rx.recv_async().await {
-                    Ok(cmd) => Step::Command(cmd),
-                    Err(_) => Step::Closed,
-                }
-            },
+            futures_lite::future::or(
+                async {
+                    match relisted_rx.recv_async().await {
+                        Ok(relisted) => Step::Relisted(relisted),
+                        // `run` keeps a sender for new watches, so this never closes.
+                        Err(_) => futures_lite::future::pending().await,
+                    }
+                },
+                async {
+                    match cmd_rx.recv_async().await {
+                        Ok(cmd) => Step::Command(cmd),
+                        Err(_) => Step::Closed,
+                    }
+                },
+            ),
         )
         .await;
 
@@ -1248,6 +1752,11 @@ async fn run(
                         && entry.status == McpServerStatus::Connecting
                 }) {
                     let _ = apply_start_result(entry, connect.result, "start");
+                }
+            }
+            Step::Relisted(relisted) => {
+                if !apply_relisted(&mut inner, relisted) {
+                    continue;
                 }
             }
             Step::Command(McpCommand::Reload { config }) => {
@@ -1684,24 +2193,25 @@ fn stored_project_trust(
 }
 
 fn status_from_err(e: &McpError) -> McpServerStatus {
-    if let McpError::HttpError {
-        status: 401,
-        reason,
-        ..
-    } = e
-    {
-        McpServerStatus::NeedsAuth {
+    match e {
+        McpError::HttpError {
+            status: 401,
+            reason,
+            ..
+        } => McpServerStatus::NeedsAuth {
             url: Some(reason.clone()),
-        }
-    } else {
-        McpServerStatus::Failed(e.to_string())
+        },
+        McpError::Refused { .. } => McpServerStatus::Refused,
+        _ => McpServerStatus::Failed(e.to_string()),
     }
 }
 
 struct StartResult {
     transport: Arc<dyn McpTransport>,
-    tool_infos: Vec<protocol::ToolInfo>,
-    prompt_infos: Vec<protocol::PromptInfo>,
+    discovery: ServerDiscovery,
+    tool_infos: Vec<ToolInfo>,
+    prompt_infos: Vec<PromptInfo>,
+    resources: ResourceLists,
 }
 
 async fn start_server(config: &ServerConfig, trusted: bool) -> Result<StartResult, McpError> {
@@ -1733,34 +2243,55 @@ async fn start_server(config: &ServerConfig, trusted: bool) -> Result<StartResul
             caudra_storage::StateDir::resolve().ok(),
         )?),
     };
-    let capabilities = transport::initialize(transport.as_ref()).await?;
+    let discovery = era::connect(transport.as_ref(), config.timeout).await?;
+    let capabilities = &discovery.capabilities;
     // Asymmetric on purpose: sloppy servers omit `capabilities` yet serve
     // tools/list fine, so always ask (fatal only when tools were declared).
     // Prompts only when declared: undeclared endpoints may answer junk,
     // and junk must not take down the server's tools.
     let tool_infos = match transport::list_tools(transport.as_ref()).await {
         Ok(tools) => tools,
-        Err(e) if !capabilities.tools => {
+        Err(e) if capabilities.tools.is_none() => {
             warn!(server = config.name, error = %e, "tools/list failed; server declared no tools");
             Vec::new()
         }
         Err(e) => return Err(e),
     };
-    let prompt_infos = if capabilities.prompts {
+    let prompt_infos = if capabilities.prompts.is_some() {
         transport::list_prompts(transport.as_ref()).await?
     } else {
         Vec::new()
     };
+    // Resources are an extra: a broken listing costs the server its
+    // resources, never its tools.
+    let resources = if capabilities.resources.is_some() {
+        resources::list_all(transport.as_ref())
+            .await
+            .unwrap_or_else(|error| {
+                warn!(server = config.name, %error, "MCP resources/list failed");
+                ResourceLists::default()
+            })
+    } else {
+        ResourceLists::default()
+    };
     info!(
         server = config.name,
+        server_name = discovery.server_info.name,
+        server_version = discovery.server_info.version,
+        protocol_version = discovery.protocol_version,
+        kind = ?discovery.kind(),
         tool_count = tool_infos.len(),
         prompt_count = prompt_infos.len(),
+        resource_count = resources.resources.len(),
+        template_count = resources.templates.len(),
         "MCP server initialized"
     );
     Ok(StartResult {
         transport,
+        discovery,
         tool_infos,
         prompt_infos,
+        resources,
     })
 }
 
@@ -1861,8 +2392,12 @@ fn parse_entries(config: McpConfig, state_dir: Option<StateDir>) -> McpManagerIn
             trust_rejected: false,
             status,
             transport: None,
+            discovery: None,
+            list_watch: None,
+            paused_runs: Arc::default(),
             tools: Vec::new(),
             prompts: Vec::new(),
+            resources: ResourceLists::default(),
             epoch: STARTUP_EPOCH,
         });
     }
@@ -1933,6 +2468,8 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
     let mut descriptors: Vec<ToolDescriptor> = Vec::new();
     let mut server_infos = Vec::with_capacity(inner.entries.len());
     let mut prompt_infos = Vec::new();
+    let mut servers = HashMap::new();
+    let mut resource_offers = Vec::new();
     let mut pids = Vec::new();
 
     for entry in &inner.entries {
@@ -1953,6 +2490,7 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
                     Transport::Stdio { .. } => Vec::new(),
                 });
 
+        let kind = entry.kind();
         if let Some(ref transport) = entry.transport
             && entry.status != McpServerStatus::Disabled
         {
@@ -1976,6 +2514,9 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
                         },
                         generation: inner.generation,
                         transport: Arc::clone(transport),
+                        meta: Arc::clone(&t.meta),
+                        kind,
+                        paused_runs: Arc::clone(&entry.paused_runs),
                     },
                 );
                 let sanitized_schema = sanitize_tool_input_schema(t.input_schema.clone());
@@ -1989,15 +2530,37 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
                     }),
                 });
             }
+            let capabilities = entry
+                .discovery
+                .as_ref()
+                .map(|discovery| &discovery.capabilities);
+            let completions = capabilities.is_some_and(|c| c.completions);
+            let offers_resources = capabilities.is_some_and(|c| c.resources.is_some());
             for p in &entry.prompts {
                 prompts.insert(
                     p.qualified_name.clone(),
                     PromptRef {
                         raw_name: p.raw_name.clone(),
                         transport: Arc::clone(transport),
+                        completions,
                     },
                 );
-                prompt_infos.push(p.to_info(&entry.name));
+                prompt_infos.push(p.to_info(&entry.name, completions));
+            }
+            servers.insert(
+                entry.name.clone(),
+                ServerRef {
+                    transport: Arc::clone(transport),
+                    resources: offers_resources,
+                    completions,
+                },
+            );
+            if offers_resources {
+                resource_offers.push(McpServerResources {
+                    server: entry.name.clone(),
+                    lists: entry.resources.clone(),
+                    completions,
+                });
             }
             pids.extend(transport.child_pids());
         }
@@ -2013,17 +2576,21 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
             oauth,
             resolved_addresses,
             review: entry.review.clone(),
+            kind,
+            discovery: entry.discovery.clone(),
         });
     }
 
     index.store(Arc::new(ToolIndex {
         tools,
         prompts,
+        servers,
         descriptors: descriptors.into(),
     }));
     snapshot.store(Arc::new(McpSnapshot {
         infos: server_infos,
         prompts: prompt_infos,
+        resources: resource_offers,
         pids,
         generation: inner.generation,
     }));
@@ -2033,6 +2600,134 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
 /// real `publish` path so it can't drift from production index construction.
 #[cfg(any(test, feature = "test-support"))]
 pub fn stub_session(tools: &[(&str, &str)]) -> McpSession {
+    stub_session_replying(tools, None)
+}
+
+/// [`stub_session`] whose server answers every `tools/call` with `reply`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn stub_session_replying(tools: &[(&str, &str)], reply: Option<Value>) -> McpSession {
+    let tools = tools
+        .iter()
+        .map(|(qualified, description)| stub_tool(qualified, description, McpToolMeta::default()))
+        .collect();
+    stub_session_from(None, tools, reply, None, Vec::new())
+}
+
+/// A stub session over a server named `stub` that declared resources, lists
+/// `lists`, and answers every `resources/read` with `read`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn resource_stub_session(lists: ResourceLists, read: Value) -> McpSession {
+    let discovery = ServerDiscovery {
+        capabilities: protocol::ServerCapabilities {
+            resources: Some(protocol::ListCapability::default()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    stub_session_from(
+        Some(discovery),
+        Vec::new(),
+        None,
+        Some((lists, read)),
+        Vec::new(),
+    )
+}
+
+/// A stub session over a server named `stub` that declared resources and
+/// completions: it lists `lists`, offers `prompt` taking `arguments`, and
+/// completes anything with `values`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn completing_stub_session(
+    lists: ResourceLists,
+    prompt: &str,
+    arguments: &[&str],
+    values: &[&str],
+) -> McpSession {
+    let discovery = ServerDiscovery {
+        capabilities: protocol::ServerCapabilities {
+            resources: Some(protocol::ListCapability::default()),
+            prompts: Some(protocol::ListCapability::default()),
+            completions: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let info = protocol::PromptInfo {
+        name: prompt.into(),
+        description: None,
+        arguments: arguments
+            .iter()
+            .map(|name| protocol::PromptArgument {
+                name: (*name).into(),
+                description: None,
+                required: true,
+            })
+            .collect(),
+    };
+    stub_session_from(
+        Some(discovery),
+        Vec::new(),
+        Some(json!({ "completion": { "values": values } })),
+        Some((lists, Value::Null)),
+        vec![McpPromptDef::from_info("stub", info)],
+    )
+}
+
+/// A stub session over a server that calls itself `server_name`, whose
+/// tools are `(qualified name, annotated read-only)` and whose every
+/// `tools/call` answers `result`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn recognised_stub_session(
+    server_name: &str,
+    tools: &[(&str, bool)],
+    result: Value,
+) -> McpSession {
+    let discovery = ServerDiscovery {
+        server_info: protocol::ServerInfo {
+            name: server_name.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let tools = tools
+        .iter()
+        .map(|(qualified, read_only)| {
+            let meta = McpToolMeta {
+                annotations: ToolAnnotations {
+                    read_only_hint: Some(*read_only),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            stub_tool(qualified, "", meta)
+        })
+        .collect();
+    stub_session_from(Some(discovery), tools, Some(result), None, Vec::new())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn stub_tool(qualified: &str, description: &str, meta: McpToolMeta) -> McpToolDef {
+    McpToolDef {
+        qualified_name: Arc::from(qualified),
+        raw_name: qualified
+            .split_once(SEPARATOR)
+            .map_or(qualified, |(_, raw)| raw)
+            .into(),
+        description: description.into(),
+        input_schema: json!({}),
+        meta: Arc::new(meta),
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn stub_session_from(
+    discovery: Option<ServerDiscovery>,
+    tools: Vec<McpToolDef>,
+    result: Option<Value>,
+    resources: Option<(ResourceLists, Value)>,
+    prompts: Vec<McpPromptDef>,
+) -> McpSession {
+    let (resources, read) = resources.unzip();
     let entry = ServerEntry {
         name: "stub".into(),
         config: None,
@@ -2051,20 +2746,17 @@ pub fn stub_session(tools: &[(&str, &str)]) -> McpSession {
         trusted_once: false,
         trust_rejected: false,
         status: McpServerStatus::Running,
-        transport: Some(Arc::new(StubTransport(Arc::from("stub")))),
-        tools: tools
-            .iter()
-            .map(|(qualified, description)| McpToolDef {
-                qualified_name: Arc::from(*qualified),
-                raw_name: qualified
-                    .split_once(SEPARATOR)
-                    .map_or(*qualified, |(_, r)| r)
-                    .into(),
-                description: (*description).into(),
-                input_schema: json!({}),
-            })
-            .collect(),
-        prompts: Vec::new(),
+        transport: Some(Arc::new(StubTransport {
+            name: Arc::from("stub"),
+            result,
+            read,
+        })),
+        discovery,
+        list_watch: None,
+        paused_runs: Arc::default(),
+        tools,
+        prompts,
+        resources: resources.unwrap_or_default(),
         epoch: STARTUP_EPOCH,
     };
     let inner = McpManagerInner {
@@ -2098,8 +2790,14 @@ pub(crate) fn tool_names(tools: &Value) -> Vec<&str> {
         .collect()
 }
 
+/// Answers every `tools/call` and `completion/complete` with `result` and
+/// every `resources/read` with `read`, and refuses everything else.
 #[cfg(any(test, feature = "test-support"))]
-struct StubTransport(Arc<str>);
+struct StubTransport {
+    name: Arc<str>,
+    result: Option<Value>,
+    read: Option<Value>,
+}
 
 #[cfg(any(test, feature = "test-support"))]
 impl McpTransport for StubTransport {
@@ -2107,11 +2805,20 @@ impl McpTransport for StubTransport {
         &'a self,
         method: &'a str,
         _params: Option<Value>,
+        _scope: &'a CallScope,
     ) -> transport::BoxFuture<'a, Result<Value, McpError>> {
         Box::pin(async move {
-            Err(McpError::UnknownTool {
-                name: method.into(),
-            })
+            let reply = match method {
+                protocol::TOOLS_CALL_METHOD | protocol::COMPLETION_COMPLETE_METHOD => &self.result,
+                protocol::RESOURCES_READ_METHOD => &self.read,
+                _ => &None,
+            };
+            match reply {
+                Some(reply) => Ok(reply.clone()),
+                None => Err(McpError::UnknownTool {
+                    name: method.into(),
+                }),
+            }
         })
     }
     fn send_notification<'a>(
@@ -2125,7 +2832,7 @@ impl McpTransport for StubTransport {
         Box::pin(async {})
     }
     fn server_name(&self) -> &Arc<str> {
-        &self.0
+        &self.name
     }
     fn transport_kind(&self) -> &'static str {
         "stub"
@@ -2252,6 +2959,9 @@ mod tests {
     use crate::context::{
         ContextCapture, ContextInventory, ContextMcpInventory, ContextReadiness, ContextSnapshot,
     };
+    use crate::mcp::inbound::Inbound;
+    use crate::mcp::message::Notification;
+    use crate::mcp::protocol::ServerInfo;
 
     const DEFAULT_TIMEOUT_MS: u64 = 30_000;
     const MISSING_PROGRAM: &str = "/nonexistent/definitely-not-here";
@@ -2274,6 +2984,14 @@ mod tests {
     const CHANGED_ARGUMENT: &str = "--changed";
     const CHANGED_TIMEOUT_MS: u64 = 5_000;
     const ENV_FILE: &str = ".env";
+    const ADDED_TOOL: &str = "added";
+    const TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
+    const LIST_CHANGE_BURST: usize = 3;
+    const TOOL_TITLE: &str = "Run a script";
+    const ANNOTATION_TITLE: &str = "Script runner";
+    const EXECUTOR_SERVER_NAME: &str = "executor";
+    const NEGOTIATED_PROTOCOL: &str = "2025-06-18";
+    const INSTRUCTIONS: &str = "Search before you execute.";
 
     fn stdio_raw(cmd: &[&str]) -> RawServerConfig {
         RawServerConfig {
@@ -2368,6 +3086,7 @@ mod tests {
             &'a self,
             method: &'a str,
             _params: Option<Value>,
+            _scope: &'a CallScope,
         ) -> transport::BoxFuture<'a, Result<Value, McpError>> {
             Box::pin(async move {
                 if method == "tools/call" {
@@ -2419,13 +3138,18 @@ mod tests {
             trust_rejected: false,
             status: McpServerStatus::Running,
             transport: Some(transport),
+            discovery: None,
+            list_watch: None,
+            paused_runs: Arc::default(),
             tools: vec![McpToolDef {
                 qualified_name: qualified,
                 raw_name: "tool".into(),
                 description: String::new(),
                 input_schema: json!({}),
+                meta: Arc::default(),
             }],
             prompts: Vec::new(),
+            resources: ResourceLists::default(),
             epoch: STARTUP_EPOCH,
         }
     }
@@ -3098,6 +3822,7 @@ mod tests {
                 raw_name: format!("tool-{i}"),
                 description: String::new(),
                 input_schema: json!({}),
+                meta: Arc::default(),
             })
             .collect();
         let (_inner, handle) = setup(vec![entry]);
@@ -3130,6 +3855,7 @@ mod tests {
             raw_name: raw.into(),
             description: description.into(),
             input_schema: schema,
+            meta: Arc::default(),
         }
     }
 
@@ -3866,7 +4592,12 @@ mod tests {
             let entered = t.call_entered_rx.clone();
             let call_handle = {
                 let handle = handle.clone();
-                smol::spawn(async move { handle.call_tool(TOOL_NAME, &json!({})).await.unwrap() })
+                smol::spawn(async move {
+                    handle
+                        .call_tool(TOOL_NAME, &json!({}), &CallScope::none())
+                        .await
+                        .unwrap()
+                })
             };
 
             entered.recv_async().await.unwrap();
@@ -3948,12 +4679,15 @@ mod tests {
             .unwrap()
             .populate(StartResult {
                 transport: transport.clone(),
+                discovery: ServerDiscovery::default(),
                 tool_infos: vec![protocol::ToolInfo {
                     name: FAKE_TOOL.into(),
                     description: String::new(),
                     input_schema: json!({}),
+                    ..protocol::ToolInfo::default()
                 }],
                 prompt_infos: Vec::new(),
+                resources: ResourceLists::default(),
             });
         transport
     }
@@ -4333,5 +5067,339 @@ mod tests {
         assert!(!is_valid_tool_name("tool!"));
         assert!(!is_valid_tool_name("*"));
         assert!(!is_valid_tool_name(&"a".repeat(65)));
+    }
+
+    /// Serves `tools/list` from `tools`, which a test swaps to stand for the
+    /// server changing its list, and reads what the server sends unasked.
+    struct ListingTransport {
+        name: Arc<str>,
+        inbound: Inbound,
+        tools: Mutex<Vec<&'static str>>,
+    }
+
+    impl ListingTransport {
+        fn new(tools: &[&'static str]) -> Arc<Self> {
+            let name: Arc<str> = Arc::from(RELOAD_SERVER);
+            Arc::new(Self {
+                inbound: Inbound::new(Arc::clone(&name)),
+                name,
+                tools: Mutex::new(tools.to_vec()),
+            })
+        }
+    }
+
+    impl McpTransport for ListingTransport {
+        fn send_request<'a>(
+            &'a self,
+            _method: &'a str,
+            _params: Option<Value>,
+            _scope: &'a CallScope,
+        ) -> transport::BoxFuture<'a, Result<Value, McpError>> {
+            let tools: Vec<Value> = self
+                .tools
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|name| json!({"name": name}))
+                .collect();
+            Box::pin(async move { Ok(json!({ "tools": tools })) })
+        }
+        fn send_notification<'a>(
+            &'a self,
+            _method: &'a str,
+            _params: Option<Value>,
+        ) -> transport::BoxFuture<'a, Result<(), McpError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn shutdown<'a>(&'a self) -> transport::BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+        fn server_name(&self) -> &Arc<str> {
+            &self.name
+        }
+        fn transport_kind(&self) -> &'static str {
+            RELOAD_SERVER
+        }
+        fn inbound(&self) -> Option<&Inbound> {
+            Some(&self.inbound)
+        }
+    }
+
+    fn qualified(tool: &str) -> String {
+        format!("{RELOAD_SERVER}{SEPARATOR}{tool}")
+    }
+
+    #[test]
+    fn a_tool_list_change_is_relisted_and_republished() {
+        smol::block_on(async {
+            let transport = ListingTransport::new(&[FAKE_TOOL]);
+            let (mut inner, handle) =
+                setup(vec![fake_entry(RELOAD_SERVER, Arc::clone(&transport) as _)]);
+            let (relisted_tx, relisted_rx) = flume::unbounded();
+            inner.entries[0].watch_lists(&relisted_tx);
+
+            *transport.tools.lock().unwrap() = vec![FAKE_TOOL, ADDED_TOOL];
+            for _ in 0..LIST_CHANGE_BURST {
+                transport.inbound.notify(Notification {
+                    method: TOOLS_LIST_CHANGED.into(),
+                    params: Value::Null,
+                });
+            }
+            let relisted = relisted_rx.recv_async().await.unwrap();
+            assert!(relisted_rx.is_empty(), "a burst must cost one listing");
+            assert!(apply_relisted(&mut inner, relisted));
+            inner.generation += 1;
+            publish(&inner, &handle.index, &handle.snapshot);
+
+            assert!(handle.has_tool(&qualified(ADDED_TOOL)));
+            assert_eq!(handle.snapshot.load().infos[0].tool_count, 2);
+            assert_eq!(handle.snapshot.load().generation, 1);
+        });
+    }
+
+    #[test]
+    fn a_relisting_from_a_replaced_connection_is_dropped() {
+        let (mut inner, _handle) = setup(vec![fake_entry(RELOAD_SERVER, FakeTransport::new())]);
+        let stale = Relisted {
+            server: RELOAD_SERVER.into(),
+            connection: ListingTransport::new(&[]),
+            tools: Some(Ok(Vec::new())),
+            resources: None,
+            prompts: None,
+        };
+        assert!(!apply_relisted(&mut inner, stale));
+        assert_eq!(inner.entries[0].tools.len(), 1);
+    }
+
+    #[test_case(json!({"$ref": "https://example.com/schema.json"}), false ; "remote_ref_excluded")]
+    #[test_case(json!({"properties": {"a": {"anyOf": [{"$ref": "other.json#/a"}]}}}), false ; "nested_relative_ref_excluded")]
+    #[test_case(json!({"properties": {"a": {"$ref": "#/$defs/a"}}, "$defs": {"a": {"type": "string"}}}), true ; "local_ref_kept")]
+    #[test_case(json!({"properties": {"$ref": {"type": "string"}}}), true ; "property_named_ref_kept")]
+    fn a_tool_whose_schema_needs_an_external_ref_is_excluded(schema: Value, kept: bool) {
+        let tools = tool_defs(
+            RELOAD_SERVER,
+            vec![ToolInfo {
+                name: FAKE_TOOL.into(),
+                input_schema: schema,
+                ..ToolInfo::default()
+            }],
+        );
+        assert_eq!(tools.len(), usize::from(kept));
+    }
+
+    #[test_case(Some(TOOL_TITLE), None, Some(TOOL_TITLE) ; "own_title")]
+    #[test_case(Some(TOOL_TITLE), Some(ANNOTATION_TITLE), Some(TOOL_TITLE) ; "own_title_wins")]
+    #[test_case(None, Some(ANNOTATION_TITLE), Some(ANNOTATION_TITLE) ; "annotation_title")]
+    #[test_case(None, None, None ; "untitled")]
+    fn a_tool_title_falls_back_to_its_annotation(
+        title: Option<&str>,
+        annotation: Option<&str>,
+        expected: Option<&str>,
+    ) {
+        let meta = McpToolMeta {
+            title: title.map(str::to_owned),
+            annotations: ToolAnnotations {
+                title: annotation.map(str::to_owned),
+                ..ToolAnnotations::default()
+            },
+            output_schema: None,
+        };
+        assert_eq!(meta.title(), expected);
+    }
+
+    #[test]
+    fn a_bound_tool_and_its_server_info_carry_what_the_server_said() {
+        let (mut inner, _handle) = setup(vec![fake_entry(RELOAD_SERVER, FakeTransport::new())]);
+        let discovery = ServerDiscovery {
+            protocol_version: NEGOTIATED_PROTOCOL.into(),
+            server_info: ServerInfo {
+                name: EXECUTOR_SERVER_NAME.into(),
+                ..ServerInfo::default()
+            },
+            instructions: Some(INSTRUCTIONS.into()),
+            ..ServerDiscovery::default()
+        };
+        inner.entries[0].populate(StartResult {
+            transport: FakeTransport::new(),
+            discovery: discovery.clone(),
+            tool_infos: vec![ToolInfo {
+                name: FAKE_TOOL.into(),
+                title: Some(TOOL_TITLE.into()),
+                annotations: ToolAnnotations {
+                    read_only_hint: Some(true),
+                    ..ToolAnnotations::default()
+                },
+                ..ToolInfo::default()
+            }],
+            prompt_infos: Vec::new(),
+            resources: ResourceLists::default(),
+        });
+        let handle = published(&inner, 0);
+
+        let binding = handle.bind_tool(&qualified(FAKE_TOOL)).unwrap();
+        assert_eq!(binding.kind(), Some(McpServerKind::Executor));
+        assert_eq!(binding.title(), Some(TOOL_TITLE));
+        assert!(binding.annotations().read_only());
+        let info = &handle.snapshot.load().infos[0];
+        assert_eq!(info.kind, Some(McpServerKind::Executor));
+        assert_eq!(info.discovery.as_ref(), Some(&discovery));
+    }
+
+    const HOME_ASSISTANT_SERVER_NAME: &str = "home-assistant";
+    const LOOKALIKE_SERVER_NAME: &str = "home-assistant-ish";
+    const LOOKUP_RAW: &str = "lookup";
+    const LOOKUP_TOOL: &str = "ha.lookup";
+    const EXECUTE_RAW: &str = "execute";
+    const RESUME_RAW: &str = "resume";
+    const PAUSED_RUN: &str = "exec_1";
+    const WAITING_STATUS: &str = "waiting_for_interaction";
+    const PAUSED_MESSAGE: &str = "Deploy to prod?";
+    const PAUSED_ADDRESS: &str = "deploy.run";
+    const PAUSED_NOTE: &str =
+        "Executor run waiting for: Deploy to prod? · deploy.run({\"env\":\"prod\"})";
+    const UNSEEN_NOTE: &str = "Executor run exec_1: not a run Caudra saw pause";
+
+    fn paused_run() -> Value {
+        json!({
+            "status": WAITING_STATUS,
+            "executionId": PAUSED_RUN,
+            "interaction": {"message": PAUSED_MESSAGE, "address": PAUSED_ADDRESS, "args": {"env": "prod"}},
+        })
+    }
+
+    fn accept_paused_run() -> Value {
+        json!({"executionId": PAUSED_RUN, "action": "accept"})
+    }
+
+    fn executor_tool(raw: &str) -> String {
+        format!("{EXECUTOR_SERVER_NAME}{SEPARATOR}{raw}")
+    }
+
+    fn read_only_ceiling() -> ToolFilter {
+        ToolFilter::ReadOnly(Box::new(ToolFilter::All))
+    }
+
+    /// Only a server Caudra recognises earns trust in its `readOnlyHint`, and
+    /// a read-only ceiling keeps exactly those tools, declared and searchable.
+    #[test_case(HOME_ASSISTANT_SERVER_NAME, true, true ; "a_recognised_read_only_tool")]
+    #[test_case(HOME_ASSISTANT_SERVER_NAME, false, false ; "a_recognised_tool_that_writes")]
+    #[test_case(LOOKALIKE_SERVER_NAME, true, false ; "a_stranger_claiming_read_only")]
+    fn a_read_only_ceiling_keeps_recognised_read_only_tools(
+        server: &str,
+        annotated: bool,
+        read_only: bool,
+    ) {
+        let session = recognised_stub_session(server, &[(LOOKUP_TOOL, annotated)], json!({}));
+        assert_eq!(
+            session.bind_tool(LOOKUP_TOOL).unwrap().read_only(),
+            read_only
+        );
+        assert_eq!(session.is_read_only(LOOKUP_TOOL), read_only);
+
+        let narrowed = session.narrowed(&read_only_ceiling());
+        assert_eq!(narrowed.is_disabled(LOOKUP_TOOL), !read_only);
+        let [status] = narrowed
+            .request_snapshot()
+            .tool_inventory()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            (status.disabled, status.reason),
+            (!read_only, (!read_only).then_some(MODE_DISABLED))
+        );
+    }
+
+    /// Recognition and annotations add to a prompt, never to the contract a
+    /// grant was filed against, so grants made before them still match.
+    #[test]
+    fn recognition_leaves_the_contract_digest_alone() {
+        let contract = |session: McpSession| match session.bind_tool(LOOKUP_TOOL).unwrap().subject()
+        {
+            PermissionSubject::Mcp { contract, .. } => contract.clone(),
+            subject => panic!("{subject:?}"),
+        };
+        let expected = canonical_json_sha256(&json!({
+            "name": LOOKUP_RAW,
+            "description": "",
+            "input_schema": {},
+        }));
+        assert_eq!(contract(stub_session(&[(LOOKUP_TOOL, "")])), expected);
+        assert_eq!(
+            contract(recognised_stub_session(
+                HOME_ASSISTANT_SERVER_NAME,
+                &[(LOOKUP_TOOL, true)],
+                json!({}),
+            )),
+            expected
+        );
+    }
+
+    /// A run an Executor result reports paused is what accepting it later
+    /// says it approves.
+    #[test]
+    fn an_executor_pause_is_remembered_for_its_resume() {
+        smol::block_on(async {
+            let session = recognised_stub_session(
+                EXECUTOR_SERVER_NAME,
+                &[
+                    (&executor_tool(EXECUTE_RAW), false),
+                    (&executor_tool(RESUME_RAW), false),
+                ],
+                json!({"content": [], "structuredContent": paused_run()}),
+            );
+            let resume = session.bind_tool(&executor_tool(RESUME_RAW)).unwrap();
+            let note = || resume.call_facts(&accept_paused_run()).unwrap().note;
+            let unseen = note();
+            session
+                .bind_tool(&executor_tool(EXECUTE_RAW))
+                .unwrap()
+                .call(&json!({}), &CallScope::none())
+                .await
+                .unwrap();
+            assert_eq!(
+                (unseen.as_deref(), note().as_deref()),
+                (Some(UNSEEN_NOTE), Some(PAUSED_NOTE))
+            );
+        });
+    }
+
+    /// A paused run belongs to the connection that reported it.
+    #[test]
+    fn a_reconnect_forgets_paused_runs() {
+        let (mut inner, _handle) = setup(vec![fake_entry(RELOAD_SERVER, FakeTransport::new())]);
+        let connect = |inner: &mut McpManagerInner| {
+            inner.entries[0].populate(StartResult {
+                transport: FakeTransport::new(),
+                discovery: ServerDiscovery {
+                    server_info: ServerInfo {
+                        name: EXECUTOR_SERVER_NAME.into(),
+                        ..ServerInfo::default()
+                    },
+                    ..ServerDiscovery::default()
+                },
+                tool_infos: vec![ToolInfo {
+                    name: RESUME_RAW.into(),
+                    ..ToolInfo::default()
+                }],
+                prompt_infos: Vec::new(),
+                resources: ResourceLists::default(),
+            });
+        };
+        let note = |inner: &McpManagerInner| {
+            published(inner, 0)
+                .bind_tool(&qualified(RESUME_RAW))
+                .unwrap()
+                .call_facts(&accept_paused_run())
+                .unwrap()
+                .note
+        };
+        connect(&mut inner);
+        inner.entries[0].paused_runs.record(&paused_run());
+        let remembered = note(&inner);
+        connect(&mut inner);
+        assert_eq!(
+            (remembered.as_deref(), note(&inner).as_deref()),
+            (Some(PAUSED_NOTE), Some(UNSEEN_NOTE))
+        );
     }
 }

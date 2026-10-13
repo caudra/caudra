@@ -1373,6 +1373,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                         caudra_agent::McpServerStatus::Disabled => "disabled",
                         caudra_agent::McpServerStatus::Failed(_) => "failed",
                         caudra_agent::McpServerStatus::NeedsAuth { .. } => "needs-auth",
+                        caudra_agent::McpServerStatus::Refused => "refused",
                     };
                     serde_json::json!({"name": info.name, "status": status})
                 })
@@ -1434,6 +1435,9 @@ pub fn run(params: SdkParams) -> Result<()> {
         model_policy: Arc::clone(&model_policy),
         plugin_rules,
         local_tools: Default::default(),
+        // The SDK protocol carries no question events, so a server's
+        // questions are declined rather than left waiting on nobody.
+        mcp_elicitors: None,
         automations: config
             .features
             .enabled(Feature::Automations)
@@ -3345,6 +3349,7 @@ impl EventPump {
             | AgentEvent::ToolDone(_)
             | AgentEvent::BatchProgress(_)
             | AgentEvent::Question(_)
+            | AgentEvent::QuestionClosed
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueBatchConsumed { .. }
             | AgentEvent::QueueDrained

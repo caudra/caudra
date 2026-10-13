@@ -41,7 +41,7 @@ pub(crate) use scope::{rule_names_commands, rule_phrase, rule_summary, tool_word
 use step_through::StepThrough;
 pub(crate) use step_through::lifetime_phrase;
 #[cfg(test)]
-pub(crate) use view::tests::{THEMES, WIDTHS, assert_plain, buffer_rows};
+pub(crate) use view::tests::{MCP_NOTE, THEMES, WIDTHS, assert_plain, buffer_rows, mcp_request};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Panel {
