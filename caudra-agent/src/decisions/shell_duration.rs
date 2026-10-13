@@ -11,7 +11,12 @@ use caudra_storage::{
     },
 };
 use serde_json::{Value, json};
-use std::{collections::VecDeque, sync::Arc, thread, time::Instant};
+use std::{
+    collections::VecDeque,
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use super::{
     DecisionFeature, DecisionReceipt, Decisions, NoteAnchor, NoteDraft, NoteOutcome, push_fitting,
@@ -20,7 +25,7 @@ use super::{
 use crate::{
     ToolDoneEvent, ToolOutput,
     permissions::{PassiveDecisionRevision, canonical_json_sha256, command_pattern},
-    tools::{ToolContext, ToolExecResult},
+    tools::{ToolContext, ToolExecResult, humanize_duration},
 };
 
 pub(super) const DURATION_QUESTION: &str = "duration";
@@ -47,6 +52,8 @@ const SECONDS_P50_MS: u64 = 10 * MILLIS_PER_SECOND;
 const MINUTES_P50_MS: u64 = 5 * 60 * MILLIS_PER_SECOND;
 const MINUTES_P90_MS: u64 = 10 * 60 * MILLIS_PER_SECOND;
 const ENGINE_PRIOR: &str = "engine prior";
+const ETA_LABEL: &str = "ETA ";
+const ETA_RANGE: &str = "–";
 /// The estimate each measurable level stands for, by level.
 const LEVELS: [Estimate; 3] = [
     Estimate::prior(INSTANT_MS, INSTANT_MS, false),
@@ -89,6 +96,29 @@ impl Estimate {
             samples: 0,
             source: ENGINE_PRIOR,
             extend_timeout,
+        }
+    }
+
+    /// The wait the estimate predicts, in the units of a timeout. A command
+    /// expected to exit at once has no wait to show.
+    fn eta(&self) -> Option<String> {
+        if self.p90_ms <= INSTANT_MS {
+            return None;
+        }
+        let [p50, p90] = [self.p50_ms, self.p90_ms]
+            .map(|ms| humanize_duration(Duration::from_secs(ms.div_ceil(MILLIS_PER_SECOND))));
+        Some(if p50 == p90 {
+            format!("{ETA_LABEL}{p90}")
+        } else {
+            format!("{ETA_LABEL}{p50}{ETA_RANGE}{p90}")
+        })
+    }
+
+    /// Where the estimate came from, with a sample count only for history.
+    fn provenance(&self) -> String {
+        match self.samples {
+            0 => self.source.to_owned(),
+            samples => format!("{}, {samples} samples", self.source),
         }
     }
 }
@@ -464,11 +494,11 @@ impl ShellDurationPlan {
                 estimate.p90_ms.div_ceil(MILLIS_PER_SECOND),
             );
             summary.push_str(&format!(
-                " from an estimate of p90 {p90} s ({}; {} samples)",
-                estimate.source, estimate.samples
+                " from an estimate of p90 {p90} s ({})",
+                estimate.provenance()
             ));
             details.push(format!("p50 {p50} s, p90 {p90} s"));
-            details.push(format!("{}, {} samples", estimate.source, estimate.samples));
+            details.push(estimate.provenance());
         }
         if self.endless {
             details.push(UNTIL_STOPPED_DETAIL.into());
@@ -510,15 +540,7 @@ impl ShellDurationPlan {
         if !self.visible() {
             return None;
         }
-        self.estimate.as_ref().map(|estimate| {
-            format!(
-                "ETA {}–{}s ({}; {} samples)",
-                estimate.p50_ms.div_ceil(MILLIS_PER_SECOND),
-                estimate.p90_ms.div_ceil(MILLIS_PER_SECOND),
-                estimate.source,
-                estimate.samples
-            )
-        })
+        self.estimate.as_ref().and_then(Estimate::eta)
     }
 
     pub(crate) fn advise(&self, done: &mut ToolDoneEvent, ctx: &ToolContext) {
@@ -540,10 +562,9 @@ impl ShellDurationPlan {
             && let Some(timeout) = self.injected_timeout
         {
             notes.push(format!(
-                "Omitted timeout set to {timeout}s from p90 {}s ({}; {} samples).",
+                "Omitted timeout set to {timeout}s from p90 {}s ({}).",
                 estimate.p90_ms.div_ceil(MILLIS_PER_SECOND),
-                estimate.source,
-                estimate.samples
+                estimate.provenance()
             ));
         }
         if !notes.is_empty() {
@@ -670,11 +691,11 @@ fn completed_level(elapsed_ms: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        AT_ONCE, DURATION_FALLBACK, DURATION_QUESTION, EARLIER_RUNS, ENDLESS_QUESTION, Estimate,
-        HISTORY_CACHE_ENTRIES, INSTANT_MS, MAX_EARLIER_RUNS, MINUTES, MINUTES_MS, SECONDS,
-        SET_VERB, STOPPED, ShellCall, ShellDurationCache, ShellDurationPlan, TOOK, UNTIL_STOPPED,
-        WARNED_VERB, WORKDIR_FIELD, duration_label, duration_state, earlier_run, history_key,
-        prior,
+        AT_ONCE, DURATION_FALLBACK, DURATION_QUESTION, EARLIER_RUNS, ENDLESS_QUESTION,
+        ENGINE_PRIOR, Estimate, HISTORY_CACHE_ENTRIES, INSTANT_MS, LEVELS, MAX_EARLIER_RUNS,
+        MINUTES, MINUTES_MS, SECONDS, SET_VERB, STOPPED, ShellCall, ShellDurationCache,
+        ShellDurationPlan, TOOK, UNTIL_STOPPED, WARNED_VERB, WORKDIR_FIELD, duration_label,
+        duration_state, earlier_run, history_key, prior,
     };
     use crate::{
         AgentEvent, AgentMode, CancelToken, EventSender,
@@ -715,6 +736,23 @@ mod tests {
     const LONG_P90_MS: u64 = 200_001;
     const SHORT_TIMEOUT_SECS: u64 = 5;
     const ONE_NOTE: &str = "expected exactly one decision note";
+    const EXACT_HISTORY: &str = "exact history";
+    const HISTORY_SAMPLES: u64 = 3;
+    const EXACT_PROVENANCE: &str = "exact history, 3 samples";
+    const SECONDS_ETA: &str = "ETA 10s–2m";
+    const MINUTES_ETA: &str = "ETA 5m–10m";
+    const EQUAL_ENDS_ETA: &str = "ETA 8s";
+    const SUB_SECOND_P50_ETA: &str = "ETA 1s–2s";
+
+    fn history(p50_ms: u64, p90_ms: u64) -> Estimate {
+        Estimate {
+            p50_ms,
+            p90_ms,
+            samples: HISTORY_SAMPLES,
+            source: EXACT_HISTORY,
+            extend_timeout: true,
+        }
+    }
 
     struct FailedEngine(DecisionError);
 
@@ -746,13 +784,7 @@ mod tests {
             .passive_decision_revision()
             .unwrap(),
             key: history_key(WORKSPACE, ".", COMMAND),
-            estimate: Some(Estimate {
-                p50_ms: p90_ms,
-                p90_ms,
-                samples: 3,
-                source: "exact history",
-                extend_timeout: true,
-            }),
+            estimate: Some(history(p90_ms, p90_ms)),
             endless: false,
             receipt: None,
             requested_timeout: None,
@@ -888,6 +920,22 @@ mod tests {
         if outcome == NoteOutcome::FellBack {
             assert!(note.summary.ends_with(DURATION_FALLBACK));
         }
+    }
+
+    #[test_case(LEVELS[AT_ONCE].clone(), None; "at_once_prior")]
+    #[test_case(history(300, 900), None; "measured_sub_second")]
+    #[test_case(LEVELS[SECONDS].clone(), Some(SECONDS_ETA); "seconds_prior")]
+    #[test_case(LEVELS[MINUTES].clone(), Some(MINUTES_ETA); "minutes_prior")]
+    #[test_case(history(7_200, 7_900), Some(EQUAL_ENDS_ETA); "equal_ends_collapse")]
+    #[test_case(history(300, 1_500), Some(SUB_SECOND_P50_ETA); "sub_second_p50")]
+    fn eta_shows_only_a_wait(estimate: Estimate, expected: Option<&str>) {
+        assert_eq!(estimate.eta().as_deref(), expected);
+    }
+
+    #[test_case(LEVELS[SECONDS].clone(), ENGINE_PRIOR; "an_engine_prior")]
+    #[test_case(history(MINUTES_MS, MINUTES_MS), EXACT_PROVENANCE; "measured_history")]
+    fn provenance_counts_only_measured_samples(estimate: Estimate, expected: &str) {
+        assert_eq!(estimate.provenance(), expected);
     }
 
     #[test_case(DurationOutcome::Ok, INSTANT_MS, Some(AT_ONCE); "completed_at_once")]
