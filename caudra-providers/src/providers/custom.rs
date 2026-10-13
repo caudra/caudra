@@ -200,10 +200,16 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         .or_else(|| discovered.and_then(|d| d.context_window))
         .unwrap_or_else(|| kind.fallback_context_window());
     let supports_tool_examples_override = declared.supports_tool_examples;
+    let reasoning_options = declared.reasoning_options.clone().unwrap_or_default();
+    // An OpenAI-shaped endpoint is sent a level only when the model declares
+    // its ladder (see `apply_declared_effort`), so without one it offers no
+    // setting and reports none, rather than claiming a level it never sends.
+    let manifest_thinking = match kind {
+        ProviderKind::OpenAi => Some(!reasoning_options.is_empty()),
+        _ => ManifestRegistry::get(&kind.to_string()).map(|m| m.supports_thinking),
+    };
     let thinking_override = ThinkingSupport::from_flags(
-        declared
-            .supports_thinking
-            .or_else(|| ManifestRegistry::get(&kind.to_string()).map(|m| m.supports_thinking)),
+        declared.supports_thinking.or(manifest_thinking),
         declared.requires_thinking.unwrap_or(false),
     );
     let supports_vision_override = declared.supports_vision;
@@ -247,7 +253,7 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         max_output_tokens,
         context_window,
         window_excludes_output: false,
-        reasoning_options: declared.reasoning_options.unwrap_or_default(),
+        reasoning_options,
         thinking_fields: None,
         billing: Billing::default(),
     }
@@ -574,7 +580,7 @@ mod tests {
     #[test_case::test_case("openai-responses" ; "responses")]
     fn an_openai_shaped_protocol_never_implies_gpt_weights(protocol: &str) {
         let def: ProviderDef = serde_json::from_str(&format!(
-            r#"{{"protocol":"{protocol}","models":[{{"id":"qwen3.8-27b-cyberstrike"}}]}}"#
+            r#"{{"protocol":"{protocol}","models":[{{"id":"qwen3.8-27b-distill"}}]}}"#
         ))
         .unwrap();
 
@@ -582,7 +588,7 @@ mod tests {
             &def,
             ProviderKind::OpenAi,
             "local-openai-shaped-test",
-            "qwen3.8-27b-cyberstrike",
+            "qwen3.8-27b-distill",
         );
 
         assert_eq!(model.family, ModelFamily::Generic, "{protocol}");
@@ -714,6 +720,34 @@ mod tests {
         assert!(body.get("thinking").is_none(), "{ANTHROPIC_KEY_LEAKED}");
         body.get("reasoning_effort")
             .map(|level| level.as_str().unwrap().to_string())
+    }
+
+    /// What an OpenAI-shaped endpoint is never sent, the model must not offer
+    /// or report: without a declared ladder it takes no thinking setting, so a
+    /// request carries no level and a task reports none.
+    #[test_case::test_case("openai", "", false ; "chat_without_levels")]
+    #[test_case::test_case("openai-responses", "", false ; "responses_without_levels")]
+    #[test_case::test_case("openai", r#","reasoning_options":[{"type":"effort","values":["low","high"]}]"#, true ; "declared_levels")]
+    #[test_case::test_case("openai", r#","supports_thinking":true"#, true ; "explicit_support_is_kept")]
+    #[test_case::test_case("anthropic", "", true ; "anthropic_shape_keeps_its_default")]
+    fn an_openai_shaped_model_takes_thinking_only_with_declared_levels(
+        protocol: &str,
+        declared: &str,
+        expected: bool,
+    ) {
+        let def: ProviderDef = serde_json::from_str(&format!(
+            r#"{{"protocol":"{protocol}","models":[{{"id":"m"{declared}}}]}}"#
+        ))
+        .unwrap();
+        let kind = protocol_kind(def.protocol.unwrap());
+        let model = model_from_def(&def, kind, "thinking-support-test", "m");
+        let requested = RequestOptions {
+            thinking: ThinkingConfig::Effort("max".into()),
+            fast: false,
+        };
+
+        assert_eq!(model.supports_thinking(), expected, "{protocol}");
+        assert_eq!(requested.clamped(&model).thinking.is_enabled(), expected);
     }
 
     #[test]

@@ -157,7 +157,9 @@ impl ReasoningOptions {
     }
 
     /// The declared level nearest `level`: the exact match, else the highest
-    /// declared level below it, else the lowest declared level. `None` when the
+    /// declared depth below it, else the lowest declared depth. A declared
+    /// `none` is off rather than a depth, so a level that asks for reasoning
+    /// lands on it only when the model declares nothing else. `None` when the
     /// model declares no levels, or when `level` is a spelling this model does
     /// not declare and the catalog has never seen, leaving nothing to order it
     /// against.
@@ -167,13 +169,15 @@ impl ReasoningOptions {
             return Some(exact);
         }
         let rank = effort_rank(level)?;
-        values
-            .iter()
+        let depths = || values.iter().filter(|declared| *declared != EFFORT_NONE);
+        depths()
             .filter_map(|declared| Some((effort_rank(declared)?, declared)))
             .filter(|(declared_rank, _)| *declared_rank < rank)
             .max_by_key(|(declared_rank, _)| *declared_rank)
-            .map(|(_, declared)| declared.as_str())
-            .or_else(|| values.first().map(String::as_str))
+            .map(|(_, declared)| declared)
+            .or_else(|| depths().next())
+            .or_else(|| values.first())
+            .map(String::as_str)
     }
 
     /// Depths to offer in the UI. A budget model gets the two steps its bounds
@@ -447,6 +451,24 @@ mod tests {
     #[test_case("turbo", None ; "unrankable_level_has_no_neighbour")]
     fn snap_clamps_to_a_declared_level(level: &str, expected: Option<&str>) {
         assert_eq!(efforts(&["low", "medium", "high"]).snap(level), expected);
+    }
+
+    /// The local and OpenAI shape: `none` is how the model spells off, so a
+    /// level that asks for some reasoning must never be snapped onto it.
+    #[test_case("minimal", Some("low") ; "below_the_lowest_depth_rises_past_none")]
+    #[test_case("high", Some("medium") ; "between_depths_falls_to_the_one_below")]
+    #[test_case("max", Some("xhigh") ; "above_the_top_falls_to_the_top")]
+    #[test_case("none", Some("none") ; "asking_for_none_keeps_it")]
+    fn snap_never_turns_a_depth_into_off(level: &str, expected: Option<&str>) {
+        assert_eq!(
+            efforts(&["none", "low", "medium", "xhigh"]).snap(level),
+            expected
+        );
+    }
+
+    #[test]
+    fn snap_lands_on_none_when_the_model_declares_nothing_else() {
+        assert_eq!(efforts(&["none"]).snap("high"), Some("none"));
     }
 
     #[test]

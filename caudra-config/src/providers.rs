@@ -381,7 +381,7 @@ impl ModelFields {
             min: None,
             max: None,
             env: None,
-            description: "The model accepts extended thinking",
+            description: "The model accepts extended thinking. On `openai` and `openai-responses`, the default is on only when `reasoning_options` declares levels",
         },
         ConfigField {
             name: "requires_thinking",

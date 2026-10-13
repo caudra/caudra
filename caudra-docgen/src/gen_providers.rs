@@ -300,7 +300,7 @@ max_output_tokens = 64000
 
 It takes the same fields as a `models` entry apart from `id`, and applies to every model of the provider including discovered ones. A matching `models` entry wins field by field, so `smart-v1` above keeps the 229376-token window and raises only its output cap. Anything a model neither declares nor inherits falls back to discovery, then to the protocol default.
 
-`reasoning_options = []` is a declaration, not an omission: it says the endpoint takes no reasoning controls, so Caudra sends no `reasoning_effort`. Leaving it unset instead lets a thinking level chosen for another model reach an endpoint that rejects it.
+On an `openai` or `openai-responses` provider, a model gets a thinking level only from its declared `reasoning_options`. A model that declares no levels takes no thinking setting: Caudra sends no `reasoning_effort`, and the footer and task results show no level for it, because the endpoint would reject one it does not know. Declare the levels to offer them. On `anthropic` and `google`, `reasoning_options = []` is a declaration, not an omission: it says the endpoint takes no reasoning controls. Leaving it unset there lets a thinking level chosen for another model reach an endpoint that may reject it.
 
 A `models` entry whose `id` matches no live model is logged once: every setting on it is ignored, which otherwise looks like Caudra disregarding the config.
 

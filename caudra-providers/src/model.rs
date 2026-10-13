@@ -572,14 +572,20 @@ impl Model {
         // The static entry wins over the catalog on purpose: it is where caudra
         // records what a *request* accepts, which is not always what the model
         // is capable of. Discovery still wins over both, since the provider
-        // just told us.
+        // just told us, except where the entry says the model always reasons.
+        // There a listing that offers a way off is wrong about the request,
+        // since the `none` it offers is rejected, and an empty one would drop
+        // the levels the entry knows.
+        let static_options = static_entry
+            .and_then(|entry| entry.reasoning_options)
+            .map(reasoning_options_from_static);
+        let always_reasons = static_options
+            .as_ref()
+            .is_some_and(|known| !known.can_disable());
         let reasoning_options = discovered
             .and_then(|info| info.reasoning_options.clone())
-            .or_else(|| {
-                static_entry
-                    .and_then(|entry| entry.reasoning_options)
-                    .map(reasoning_options_from_static)
-            })
+            .filter(|listed| !(always_reasons && listed.can_disable()))
+            .or(static_options)
             .or_else(|| catalog_reasoning_options(catalog))
             .unwrap_or_default();
         let mut model = Self {
@@ -1395,7 +1401,7 @@ mod tests {
     #[test_case("openrouter/gpt-oss-120b", false ; "open weights were not trained on it")]
     #[test_case("anthropic/claude-opus-4-8", false ; "claude uses string replacement")]
     #[test_case("zai/glm-4.6", false ; "glm uses string replacement")]
-    #[test_case("llama-cpp/qwen3.8-27b-cyberstrike", false ; "an openai shaped local server is not gpt")]
+    #[test_case("llama-cpp/qwen3.8-27b-distill", false ; "an openai shaped local server is not gpt")]
     fn prefers_apply_patch_follows_the_model_id(spec: &str, expected: bool) {
         let model = Model::from_spec(spec).unwrap();
 

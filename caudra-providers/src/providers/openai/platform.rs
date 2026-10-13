@@ -1024,7 +1024,7 @@ mod tests {
     }
 
     #[test_case("gpt-5.3-codex", ThinkingConfig::Adaptive, None ; "adaptive_lets_the_api_decide")]
-    #[test_case("gpt-5.3-codex", effort("minimal"), Some("none") ; "minimal_snaps_down_to_the_declared_floor")]
+    #[test_case("gpt-5.3-codex", effort("minimal"), Some("low") ; "minimal_rises_to_the_shallowest_depth_not_off")]
     #[test_case("gpt-5.3-codex", effort("low"), Some("low") ; "low")]
     #[test_case("gpt-5.3-codex", effort("medium"), Some("medium") ; "medium")]
     #[test_case("gpt-5.3-codex", effort("high"), Some("high") ; "high")]

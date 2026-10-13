@@ -1715,6 +1715,40 @@ mod tests {
         assert!(model.model_info().pricing.is_none());
     }
 
+    const SOL: &str = "gpt-6.1-sol";
+    const SOL_SHALLOWEST: &str = "low";
+    const NO_NONE_FOR_SOL: &str = "gpt-6.1-sol reasons unconditionally and OpenAI rejects `none` \
+         for it, whatever Copilot's /models listing says";
+
+    #[test_case(json!(["none", "low", "medium", "high", "xhigh", "max"]), ThinkingConfig::Off ; "a_listed_none_the_table_rules_out")]
+    #[test_case(json!([]), ThinkingConfig::Off ; "an_empty_listing_keeps_the_table_for_off")]
+    #[test_case(json!([]), ThinkingConfig::Effort("none".into()) ; "an_empty_listing_keeps_the_table_for_none")]
+    fn discovery_never_sends_none_to_a_model_that_always_reasons(
+        listed_efforts: Value,
+        thinking: ThinkingConfig,
+    ) {
+        let listed: CopilotModel = serde_json::from_value(json!({
+            "id": SOL,
+            "model_picker_enabled": true,
+            "supported_endpoints": [RESPONSES_PATH],
+            "capabilities": {
+                "type": "chat",
+                "supports": {"reasoning_effort": listed_efforts, "adaptive_thinking": true}
+            }
+        }))
+        .unwrap();
+        crate::model_registry::set_known_models(ENTERPRISE_SLUG, vec![listed.model_info()]);
+        let model = Model::from_spec(&format!("{ENTERPRISE_SLUG}/{SOL}")).unwrap();
+
+        let mut body = json!({});
+        responses::apply_responses_reasoning(&mut body, &thinking, &model);
+
+        assert_eq!(
+            body["reasoning"]["effort"], SOL_SHALLOWEST,
+            "{NO_NONE_FOR_SOL}"
+        );
+    }
+
     #[test_case(ThinkingConfig::Off, "none" ; "off is the declared none")]
     #[test_case(ThinkingConfig::Effort("medium".into()), "medium" ; "declared level passes through")]
     #[test_case(ThinkingConfig::Effort("max".into()), "xhigh" ; "undeclared level snaps down")]

@@ -479,7 +479,7 @@ Each `[[SLUG.models]]` entry declares one model:
 | `context_window` | integer | discovered, or the protocol default | Tokens of context |
 | `max_output_tokens` | integer | discovered, or the protocol default | The most tokens one response may hold |
 | `supports_tool_examples` | bool | false | Send tool examples as a structured field. It is off unless declared, because the protocol says nothing about the model behind it |
-| `supports_thinking` | bool | discovered, or the protocol default | The model accepts extended thinking |
+| `supports_thinking` | bool | discovered, or the protocol default | The model accepts extended thinking. On `openai` and `openai-responses`, the default is on only when `reasoning_options` declares levels |
 | `requires_thinking` | bool | false | For an API that rejects requests with thinking off. It implies `supports_thinking` and raises thinking to minimal effort when it is off, compaction included |
 | `supports_vision` | bool | false | The model accepts images. When false, image input and `view_image` are off |
 | `supports_pdf` | bool | false | `anthropic` and `openai-responses` only. The model reads a PDF that `webfetch` attaches inside its tool result. When it is off, `webfetch` returns the text of the PDF instead |
@@ -509,7 +509,7 @@ max_output_tokens = 64000
 
 It takes the same fields as a `models` entry apart from `id`, and applies to every model of the provider including discovered ones. A matching `models` entry wins field by field, so `smart-v1` above keeps the 229376-token window and raises only its output cap. Anything a model neither declares nor inherits falls back to discovery, then to the protocol default.
 
-`reasoning_options = []` is a declaration, not an omission: it says the endpoint takes no reasoning controls, so Caudra sends no `reasoning_effort`. Leaving it unset instead lets a thinking level chosen for another model reach an endpoint that rejects it.
+On an `openai` or `openai-responses` provider, a model gets a thinking level only from its declared `reasoning_options`. A model that declares no levels takes no thinking setting: Caudra sends no `reasoning_effort`, and the footer and task results show no level for it, because the endpoint would reject one it does not know. Declare the levels to offer them. On `anthropic` and `google`, `reasoning_options = []` is a declaration, not an omission: it says the endpoint takes no reasoning controls. Leaving it unset there lets a thinking level chosen for another model reach an endpoint that may reject it.
 
 A `models` entry whose `id` matches no live model is logged once: every setting on it is ignored, which otherwise looks like Caudra disregarding the config.
 

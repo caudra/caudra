@@ -1250,6 +1250,9 @@ impl ThinkingConfig {
             }
             Self::Off => ResolvedThinking::Off,
             Self::Adaptive => ResolvedThinking::On,
+            // `none` is how a ladder spells off, never a depth, so it goes out
+            // only where the model declares it, exactly as off does.
+            Self::Effort(level) if level.as_ref() == EFFORT_NONE => Self::Off.resolve(model),
             Self::Effort(level) => match options.snap(level) {
                 Some(declared) => ResolvedThinking::Effort(declared.to_string()),
                 None if options.budget_bounds().is_some() => {
@@ -2217,7 +2220,7 @@ mod tests {
     #[test_case(LEVELS_WITH_NONE, ThinkingConfig::Off,       Some("none")  ; "declared_none_is_how_off_is_spelled")]
     #[test_case(LEVELS_WITH_NONE, ThinkingConfig::Adaptive,  None          ; "adaptive_leaves_the_choice_to_the_model")]
     #[test_case(LEVELS_WITH_NONE, effort("low"),             Some("low")   ; "declared_level_passes_through")]
-    #[test_case(LEVELS_WITH_NONE, effort("minimal"),         Some("none")  ; "undeclared_below_floor_snaps_to_floor")]
+    #[test_case(LEVELS_WITH_NONE, effort("minimal"),         Some("low")   ; "undeclared_below_floor_rises_to_the_shallowest_depth")]
     #[test_case(LEVELS_WITH_NONE, effort("max"),             Some("high")  ; "undeclared_above_top_snaps_to_top")]
     #[test_case(LEVELS_WITHOUT_NONE, ThinkingConfig::Off,    Some("low")   ; "no_declared_none_means_off_becomes_the_shallowest_level")]
     #[test_case(LEVELS_WITHOUT_NONE, effort("max"),          Some("xhigh") ; "max_snaps_to_declared_xhigh")]
@@ -2249,6 +2252,19 @@ mod tests {
     ) {
         let model = budget_model(Some(1024), Some(4096));
         assert_eq!(config.resolve(&model), expected);
+    }
+
+    #[test_case(ReasoningOptions::default() ; "nothing_declared")]
+    #[test_case(ReasoningOptions::new(vec![ReasoningOption::Toggle]) ; "a_toggle")]
+    #[test_case(ReasoningOptions::new(vec![ReasoningOption::Effort { values: vec!["none".into(), "high".into()] }]) ; "a_declared_none")]
+    #[test_case(ReasoningOptions::new(vec![ReasoningOption::Effort { values: vec!["low".into(), "high".into()] }]) ; "no_way_to_turn_it_off")]
+    fn none_is_off_rather_than_a_level(reasoning_options: ReasoningOptions) {
+        let mut model = thinking_model("none-model");
+        model.reasoning_options = reasoning_options;
+        assert_eq!(
+            effort(EFFORT_NONE).resolve(&model),
+            ThinkingConfig::Off.resolve(&model)
+        );
     }
 
     #[test_case(ThinkingConfig::Off, ReasoningOptions::default(), ResolvedThinking::Off ; "off_without_options")]

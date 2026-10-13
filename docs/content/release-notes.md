@@ -34,6 +34,9 @@ Preview 8 lets the experimental decision engine rerank memory notes, tool search
 ### Interface fixes
 
 - **The wheel scrolls lists.** In `/decisions`, `/automations`, `/workflow`, `/peers` and `/messages`, the wheel over the list now scrolls it instead of moving the selection and loading every row it passes. Click a row or use the arrow keys to select one.
+- **`minimal` no longer turns reasoning off.** On a model whose lowest level is `none`, such as several OpenAI models and local servers that declare `none`, asking for `minimal` thinking sent `none` and the model did not reason at all. It now sends the shallowest level the model has, usually `low`. Asking for `off` still sends `none`.
+- **Copilot no longer sends `none` to a model that always reasons.** On Copilot and Copilot Enterprise, thinking `off` on a model that cannot turn reasoning off, such as `gpt-6.1-sol`, could send `none`, and the request failed with `Unsupported value: 'none' is not supported`. Copilot's model list replaced Caudra's own levels for the model, so a list that offered `none`, or offered no levels at all, decided what was sent. Caudra now keeps its own levels when the list offers none, and never sends `none` to a model its table says always reasons. Such a model runs at its lowest level instead. A `none` thinking setting now means the same as `off` on every model.
+- **Custom OpenAI-compatible models without declared levels take no thinking setting.** On an `openai` or `openai-responses` provider in `providers.toml`, a model that declares no `reasoning_options` was offered thinking levels it was never sent, so the footer and task results named a level that did not apply, and an `openai-responses` endpoint was sent the level as typed. Such a model now takes no thinking setting and shows none. Declare its levels with `reasoning_options` to offer them. See [Model defaults](/docs/providers/#model-defaults).
 
 ### Sessions
 

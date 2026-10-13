@@ -1559,7 +1559,8 @@ version = 1
 # Type: bool. Default: false.
 # supports_tool_examples = <bool>
 
-# The model accepts extended thinking.
+# The model accepts extended thinking. On `openai` and `openai-responses`, the
+# default is on only when `reasoning_options` declares levels.
 # Type: bool. Default: discovered, or the protocol default.
 # supports_thinking = <bool>
 
@@ -1637,7 +1638,8 @@ version = 1
 # Type: bool. Default: false.
 # supports_tool_examples = <bool>
 
-# The model accepts extended thinking.
+# The model accepts extended thinking. On `openai` and `openai-responses`, the
+# default is on only when `reasoning_options` declares levels.
 # Type: bool. Default: discovered, or the protocol default.
 # supports_thinking = <bool>
 
