@@ -28,7 +28,7 @@ const MAX_VISIBLE: u16 = 15;
 const WIDTH_PERCENT: u16 = 95;
 const EMPTY_TEXT: &str = "No sessions yet. Press Ctrl+N to start one.";
 const CURRENT_LABEL: &str = "current";
-const DELETE_FOCUSED_HINT: &str = "Cannot delete the current session";
+const REPLACES_CURRENT: &str = " and start a new one";
 const RENAME_TITLE: &str = " Rename session ";
 const UNTITLED: &str = "(untitled)";
 const DETACHED_LABEL: &str = "detached";
@@ -397,17 +397,13 @@ impl SessionPicker {
         let Some(item) = self.picker.selected_item() else {
             return SessionPickerAction::Consumed;
         };
-        if item.focused {
-            self.picker.set_info_text(Some(DELETE_FOCUSED_HINT.into()));
-            return SessionPickerAction::Consumed;
-        }
-        let id = item.id;
+        let (id, focused) = (item.id, item.focused);
         if self.pending_delete == Some(id) {
             self.clear_pending();
             return SessionPickerAction::Delete(id);
         }
         self.pending_delete = Some(id);
-        self.picker.set_info_text(Some(confirm_hint()));
+        self.picker.set_info_text(Some(confirm_hint(focused)));
         SessionPickerAction::Consumed
     }
 
@@ -482,8 +478,12 @@ fn rename_footer() -> Vec<Hint> {
     ]
 }
 
-fn confirm_hint() -> String {
-    format!("Press {} again to delete this session.", key::DELETE.label)
+fn confirm_hint(focused: bool) -> String {
+    let outcome = if focused { REPLACES_CURRENT } else { "" };
+    format!(
+        "Press {} again to delete this session{outcome}.",
+        key::DELETE.label
+    )
 }
 
 /// Names another checkout by its branch and where it lives.
@@ -720,19 +720,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_current_session_cannot_be_deleted() {
-        let mut current = row(FIRST, TITLE_A, 10, Some(SessionActivity::Idle));
-        current.focused = true;
-        let mut picker = opened(vec![current]);
+    #[test_case(true; "current")]
+    #[test_case(false; "other")]
+    fn confirming_deletes_and_says_when_a_new_session_follows(focused: bool) {
+        let mut target = row(FIRST, TITLE_A, 10, Some(SessionActivity::Idle));
+        target.focused = focused;
+        let mut picker = opened(vec![target]);
         picker.handle_key(key::DELETE.to_key_event());
-        assert!(
-            matches!(
-                picker.handle_key(key::DELETE.to_key_event()),
-                SessionPickerAction::Consumed
-            ),
-            "no amount of pressing deletes the session you are in"
-        );
+        let hint = picker.picker.info_text().expect("a confirmation hint");
+        assert_eq!(hint.contains(REPLACES_CURRENT), focused);
+        assert!(matches!(
+            picker.handle_key(key::DELETE.to_key_event()),
+            SessionPickerAction::Delete(got) if got == id(FIRST)
+        ));
     }
 
     #[test]

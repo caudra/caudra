@@ -3100,6 +3100,17 @@ fn reset_session_clears_exit_request_source() {
     assert!(app.last_exit.is_none());
 }
 
+#[test]
+fn a_refused_reset_keeps_the_session_and_reports_why() {
+    let mut app = test_app();
+    app.cancelling_run = Some(app.run_id);
+    let id = app.state.session.id;
+
+    assert_eq!(app.try_reset_session().err().as_deref(), Some(REVERT_BUSY_MSG));
+    assert_eq!(app.state.session.id, id);
+    assert_eq!(app.status_bar.flash_text(), None);
+}
+
 const TURNS_UNCOUNTED: &str = "a finished exchange must move the session's turn counter";
 const TURNS_UNSAVED: &str =
     "the exit summary reads the counter off the session, so it must be saved";

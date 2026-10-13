@@ -3319,6 +3319,30 @@ impl<'t> EventLoop<'t> {
         Ok(lease)
     }
 
+    /// Clears the way for deleting the focused session: a fresh session takes
+    /// its place first, so the retiring one's automations and workflows stop
+    /// before its rows go. The returned lease keeps it claimed meanwhile.
+    fn replace_focused_for_delete(&mut self) -> Result<Arc<SessionLease>, String> {
+        let focused = &self.sessions[self.focused];
+        if !focused.quiescent() {
+            return Err(DELETE_BUSY_ERR.into());
+        }
+        let lease = Arc::clone(&focused.lease);
+        self.reset_in_place(self.focused)?;
+        Ok(lease)
+    }
+
+    /// Erases on the storage writer thread after any queued flushes, so the
+    /// loop never blocks on disk and a queued save cannot resurrect the rows.
+    fn erase_session(&self, id: CaudraId, lease: Arc<SessionLease>) {
+        self.ctx.storage_writer.delete(id, move |res| {
+            let _lease = lease;
+            if let Err(error) = res {
+                tracing::error!(%error, %id, "failed to delete session");
+            }
+        });
+    }
+
     /// A live session is retitled in memory and saved on its own schedule; a
     /// stored one is loaded, retitled, and written back under a lease.
     fn set_session_title(&mut self, id: CaudraId, title: &str) -> Result<(), String> {
@@ -3748,14 +3772,30 @@ impl<'t> EventLoop<'t> {
             );
             return true;
         }
-        self.sessions[idx].close_peer();
-        let actions = self.sessions[idx].app.reset_session();
-        if actions.is_empty() {
-            self.sessions[idx].install_peer(&self.ctx);
-            return false;
+        match self.reset_in_place(idx) {
+            Ok(()) => true,
+            Err(error) => {
+                self.sessions[idx].app.flash(error);
+                false
+            }
         }
-        self.dispatch(idx, actions);
-        true
+    }
+
+    /// Swaps a fresh session into the runtime at `idx`, the way an idle
+    /// `/new` does. The retiring session is saved and its runtime work torn
+    /// down before this returns.
+    fn reset_in_place(&mut self, idx: usize) -> Result<(), String> {
+        self.sessions[idx].close_peer();
+        match self.sessions[idx].app.try_reset_session() {
+            Ok(actions) => {
+                self.dispatch(idx, actions);
+                Ok(())
+            }
+            Err(error) => {
+                self.sessions[idx].install_peer(&self.ctx);
+                Err(error)
+            }
+        }
     }
 
     fn clear_and_implement(&mut self, idx: usize, handoff: PlanHandoff) {
@@ -4286,15 +4326,17 @@ impl<'t> EventLoop<'t> {
                 }
             }
             Action::OpenSessionElsewhere { id, cwd } => self.open_session_elsewhere(idx, id, &cwd),
-            Action::DeleteSession(id) => match self.release_for_delete(id) {
-                Ok(lease) => self.ctx.storage_writer.delete(id, move |res| {
-                    let _lease = lease;
-                    if let Err(error) = res {
-                        tracing::error!(%error, %id, "failed to delete session");
-                    }
-                }),
-                Err(error) => self.sessions[idx].app.flash(error),
-            },
+            Action::DeleteSession(id) => {
+                let released = if self.position(id) == Some(self.focused) {
+                    self.replace_focused_for_delete()
+                } else {
+                    self.release_for_delete(id)
+                };
+                match released {
+                    Ok(lease) => self.erase_session(id, lease),
+                    Err(error) => self.sessions[idx].app.flash(error),
+                }
+            }
             Action::SetSessionTitle { id, title } => {
                 if let Err(error) = self.set_session_title(id, &title) {
                     self.sessions[idx].app.flash(error);

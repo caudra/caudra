@@ -957,17 +957,17 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn reset_session(&mut self) -> Vec<Action> {
-        let result = self
-            .prepare_session_reset()
-            .and_then(|prepared| self.commit_session_reset(prepared, self.state.mode));
-        match result {
-            Ok(actions) => actions,
-            Err(error) => {
-                self.flash(error);
-                Vec::new()
-            }
-        }
+        self.try_reset_session().unwrap_or_else(|error| {
+            self.flash(error);
+            Vec::new()
+        })
+    }
+
+    pub(crate) fn try_reset_session(&mut self) -> Result<Vec<Action>, String> {
+        self.prepare_session_reset()
+            .and_then(|prepared| self.commit_session_reset(prepared, self.state.mode))
     }
 
     /// The plan goes with the work, so the session left behind is saved

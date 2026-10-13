@@ -503,6 +503,11 @@ impl<T: PickerItem> ListPicker<T> {
         self.info_text = text.map(Text::from);
     }
 
+    #[cfg(test)]
+    pub(crate) fn info_text(&self) -> Option<String> {
+        self.info_text.as_ref().map(ToString::to_string)
+    }
+
     pub(crate) fn set_info_lines(&mut self, lines: Option<Vec<Line<'static>>>) {
         self.info_text = lines.map(Text::from);
     }
