@@ -17,7 +17,6 @@ mod config_problems;
 mod exit_summary;
 pub use exit_summary::ExitSummary;
 mod highlight;
-pub use highlight::highlight_ansi;
 pub mod image;
 mod input_document;
 mod markdown;

@@ -569,10 +569,12 @@ pub fn dispatch(mut cli: Cli, startup: Result<Startup, ConfigFileError>) -> Resu
         }
         Some(Command::Update {
             channel,
+            show_script,
             yes,
-            no_color,
+            ..
         }) => {
-            update::update(channel, yes, no_color).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+            update::update(channel, show_script, yes)
+                .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         }
         Some(Command::Rollback) => {
             update::rollback().map_err(|e| color_eyre::eyre::eyre!("{e}"))?;

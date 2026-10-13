@@ -838,8 +838,8 @@ fn windows_update_command(path: &Path, tag: &str) -> String {
 
 pub fn update(
     channel: Option<UpdateChannel>,
+    show_script: bool,
     skip_confirm: bool,
-    no_color: bool,
 ) -> Result<(), UpdateError> {
     let exe_path = current_exe_resolved()?;
     if let Some(manager) = package_manager(&exe_path) {
@@ -856,9 +856,12 @@ pub fn update(
         return Ok(());
     }
 
-    println!("Current version: v{}", version::CURRENT);
-    println!("Selected release: {}", release.tag);
-    println!();
+    let action = if cfg!(windows) {
+        "Preparing the update"
+    } else {
+        "Updating Caudra"
+    };
+    println!("{action} from v{} to {}", version::CURRENT, release.tag);
 
     let install_dir = match std::env::var_os(INSTALL_DIR_ENV).filter(|d| !d.is_empty()) {
         Some(dir) => PathBuf::from(dir),
@@ -875,16 +878,12 @@ pub fn update(
 
     let script = fetch_script(&release)?;
 
-    if no_color {
+    if show_script {
         println!("{script}");
-    } else {
-        let language = if cfg!(windows) { "powershell" } else { "bash" };
-        println!("{}", caudra_ui::highlight_ansi(language, &script));
-    }
-
-    if !skip_confirm && !prompt_yes(&install_dir) {
-        println!("Aborted.");
-        return Ok(());
+        if !skip_confirm && !prompt_yes(&install_dir) {
+            println!("Aborted.");
+            return Ok(());
+        }
     }
 
     let backup_path = backup_binary(&exe_path, &storage)?;
@@ -898,10 +897,11 @@ pub fn update(
     #[cfg(not(windows))]
     {
         execute_script(&script, &install_dir, &release.tag, &backup_path)?;
-        println!();
-        println!("Updated successfully.");
-        println!("Previous version saved to: {}", backup_path.display());
-        println!("To restore: caudra rollback");
+        println!(
+            "Updated to {}. Run `caudra rollback` to return to v{}.",
+            release.tag,
+            version::CURRENT
+        );
     }
 
     Ok(())

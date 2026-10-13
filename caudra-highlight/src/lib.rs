@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fmt::Write;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use syntect::dumps::from_uncompressed_data;
@@ -306,25 +305,6 @@ pub fn highlight_lines_independent(lang: &str, code: &str) -> Vec<Vec<StyledSegm
         .collect()
 }
 
-pub fn highlight_ansi(lang: &str, code: &str, bg: (u8, u8, u8)) -> String {
-    let bg_code = format!("\x1b[48;2;{};{};{}m", bg.0, bg.1, bg.2);
-    let mut hl = Highlighter::for_token(lang);
-    let mut out = String::new();
-    for line in LinesWithEndings::from(code) {
-        out.push_str(&bg_code);
-        for seg in hl.highlight_line(line) {
-            let bold = if seg.bold { "1;" } else { "" };
-            let _ = write!(
-                out,
-                "\x1b[{bold}38;2;{};{};{}m{}",
-                seg.fg.0, seg.fg.1, seg.fg.2, seg.text
-            );
-        }
-        out.push_str("\x1b[K\x1b[0m\n");
-    }
-    out
-}
-
 pub struct CodeHighlighter {
     checkpoint: HighlighterState,
     completed_lines: usize,
@@ -545,15 +525,6 @@ mod tests {
         warmup();
         let plain = syntax_set().find_syntax_plain_text();
         assert_eq!(syntax_for_path("file.totally_unknown_xyz").name, plain.name);
-    }
-
-    #[test]
-    fn highlight_ansi_formatting() {
-        warmup();
-        let out = highlight_ansi("rust", "let x = 1;\nlet y = 2;\n", (30, 30, 30));
-        let bg_count = out.matches("\x1b[48;2;30;30;30m").count();
-        assert_eq!(bg_count, 2, "each line should get its own bg escape");
-        assert!(out.ends_with("\x1b[K\x1b[0m\n"));
     }
 
     #[test]

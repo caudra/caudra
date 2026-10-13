@@ -11,7 +11,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.8 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.8)
 
-Preview 8 adds Claude Haiku 5.5 as the Anthropic Fast model, lets the experimental decision engine rerank memory notes, tool search, retained tool output, and code context, shows in the transcript what each decision feature changed, gives workflows a `rerank()` function, runs a task on the model you name, opens forks in a new Herdr or Orca tab, names tabs after the session, lets new sessions open in build mode, makes the wheel scroll lists instead of moving their selection, and stops pending reverts in a destination directory from blocking session moves.
+Preview 8 adds Claude Haiku 5.5 as the Anthropic Fast model, lets the experimental decision engine rerank memory notes, tool search, retained tool output, and code context, shows in the transcript what each decision feature changed, gives workflows a `rerank()` function, runs a task on the model you name, opens forks in a new Herdr or Orca tab, names tabs after the session, lets new sessions open in build mode, makes the wheel scroll lists instead of moving their selection, stops pending reverts in a destination directory from blocking session moves, and has `caudra update` install without printing its installer first.
 
 > **Important**
 >
@@ -75,6 +75,10 @@ Preview 8 adds Claude Haiku 5.5 as the Anthropic Fast model, lets the experiment
 - **Forks open in a new Herdr or Orca tab.** Inside a Herdr pane or an Orca terminal, **Fork here** saves the new session and resumes it in a new tab of that host, with a Caudra of its own. The tab takes focus and the session you forked from stays open where it was. Remote, sandbox, and ephemeral sessions still fork into a tab of the current Caudra, and so does a fork the host cannot open. See [Forks in Herdr and Orca](/docs/sessions/#forks-in-herdr-and-orca).
 - **Memory writes wait out a busy database.** The `memory` tool failed with `memory journal database operation failed: database is locked` when another Caudra process held the database's write lock for more than 5 seconds, such as while saving a large session. Memory writes, and the background work that builds memory summaries, now keep retrying for up to 30 seconds, like session saves do. A write that times out changes nothing, so it is safe to retry.
 - **Moving into a directory ignores its pending reverts.** A move was refused with "Destination session … has a pending restore; resolve it before moving sessions" when any session already in the destination had a pending revert, even an old conversation revert. `/move-session` and `/migrate-sessions` stopped there. `/worktree remove` and other moves that brought this Caudra back to such a directory committed the move and then failed to start, with "UI startup failed; reopen the committed sessions at the destination". Sessions already in the destination no longer affect a move, just as they never stopped a new session from starting there. The rules for the directory a session leaves are unchanged.
+
+### Command line
+
+- **`caudra update` no longer prints its installer.** It names the release it moves to, installs it without asking, and ends with the `caudra rollback` command that returns to your current version. `caudra update --show-script` prints the checksum-verified installer and asks before running it, as before. `-y` now answers only that question, and `--no-color` is still accepted, so existing scripts keep working. See [`caudra update`](/docs/cli/#caudra-update-caudra-rollback).
 
 ## Caudra 0.2 Preview 7 {#v0-2-0-preview-7}
 

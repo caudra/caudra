@@ -587,12 +587,14 @@ pub enum Command {
     Update {
         #[arg(long, help = "Release channel: auto, stable, or preview")]
         channel: Option<UpdateChannel>,
-        /// Skip confirmation prompt
-        #[arg(short = 'y', long)]
-        yes: bool,
-        /// Disable syntax highlighting
+        /// Print the checksum-verified installer and ask before running it
         #[arg(long)]
-        no_color: bool,
+        show_script: bool,
+        /// Skip the --show-script confirmation
+        #[arg(short = 'y', long, hide = true)]
+        yes: bool,
+        #[arg(long = "no-color", hide = true)]
+        _no_color: bool,
     },
     /// Rollback to the previous version
     Rollback,
@@ -1906,6 +1908,20 @@ mod tests {
     #[test_case(""; "empty_channel")]
     fn update_rejects_unknown_channel(value: &str) {
         assert!(Cli::try_parse_from(["caudra", "update", "--channel", value]).is_err());
+    }
+
+    #[test_case(&["caudra", "update"], false, false; "plain")]
+    #[test_case(&["caudra", "update", "--show-script", "-y"], true, true; "show_script_confirmed")]
+    #[test_case(&["caudra", "update", "-y", "--no-color"], false, true; "legacy_flags")]
+    fn update_parses_review_flags(args: &[&str], expected_show_script: bool, expected_yes: bool) {
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Some(Command::Update {
+            show_script, yes, ..
+        }) = cli.command
+        else {
+            panic!("{UPDATE_NOT_PARSED}");
+        };
+        assert_eq!((show_script, yes), (expected_show_script, expected_yes));
     }
 
     #[test_case(&[], files::CAUDRA.name ; "caudra_toml_by_default")]

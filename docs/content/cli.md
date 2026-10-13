@@ -489,8 +489,7 @@ Server names come from your [MCP config](/docs/mcp/). On a machine without a bro
 caudra update
 caudra update --channel stable
 caudra update --channel preview
-caudra update -y
-caudra update --no-color
+caudra update --show-script
 caudra rollback
 ```
 
@@ -498,9 +497,9 @@ caudra rollback
 
 `auto` follows stable releases from a stable build and both previews and stable releases from a preview build. After installing a final release, `auto` follows stable releases. Choose `preview` explicitly to keep receiving previews of future versions. `stable` never selects a prerelease. Ordinary updates never downgrade.
 
-On Unix, `update` shows the selected release and its checksum-verified installer before asking for confirmation. `-y` skips that prompt. The installer receives the exact selected tag and verifies the archive checksum before extraction. The previous binary and its license bundle are saved together for `rollback`. Rollback restores files, not migrations to session data or configuration.
+On Unix, `update` names the release it moves to and installs it without asking. When the installation directory is not writable, the installer runs through `sudo`, which may ask for your password. `--show-script` prints the checksum-verified installer first and asks before running it, and `-y` answers that question with yes. The installer receives the exact selected tag and verifies the archive checksum before extraction. The previous binary and its license bundle are saved together for `rollback`. Rollback restores files, not migrations to session data or configuration.
 
-On Windows, `update` saves the verified PowerShell installer and prints an exact command. Close all Caudra processes before running it. Preparing that command does not install the update. In-process `rollback` is unsupported on Windows. Close Caudra and run the installer with the previous release tag instead. Recognized Nix, Homebrew, and Cargo installations must be updated or rolled back through their package manager.
+On Windows, `update` saves the verified PowerShell installer without asking and prints an exact command. With `--show-script`, it prints the installer and asks before saving it. Close all Caudra processes before running the command. Preparing that command does not install the update. In-process `rollback` is unsupported on Windows. Close Caudra and run the installer with the previous release tag instead. Recognized Nix, Homebrew, and Cargo installations must be updated or rolled back through their package manager.
 
 Set `CAUDRA_INSTALL_DIR` to override the destination. Release checksums detect corruption relative to the published manifest. They do not protect against a compromised release publisher.
 

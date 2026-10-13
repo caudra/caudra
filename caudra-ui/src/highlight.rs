@@ -49,16 +49,6 @@ pub fn fallback_span(text: &str) -> Span<'static> {
     )
 }
 
-pub fn highlight_ansi(lang: &str, code: &str) -> String {
-    let theme = theme::current();
-    caudra_highlight::set_theme(theme.syntax.clone());
-    let bg = match theme.background {
-        Color::Rgb(r, g, b) => (r, g, b),
-        _ => (0, 0, 0),
-    };
-    caudra_highlight::highlight_ansi(lang, code, bg)
-}
-
 fn convert_segment(seg: &StyledSegment) -> Style {
     let mut style = Style::new().fg(Color::Rgb(seg.fg.0, seg.fg.1, seg.fg.2));
     if seg.bold {
