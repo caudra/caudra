@@ -234,6 +234,8 @@ const HISTORY_UNREADABLE: &str = "Failed to read session history: ";
 const UNRECORDED_MSG: &str = "A call ran without file revert";
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode needs a model that sells a fast tier (API only)";
 const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
+const FAVORITE_SAVE_ERR: &str = "Could not save favorite models";
+const MODEL_SWITCH_PREFIX: &str = "Model: ";
 const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_OFF_MSG: &str = "Fast mode: off";
 const YOLO_ON_MSG: &str = "YOLO mode enabled";
@@ -990,12 +992,10 @@ impl App {
             pending_delegations: HashSet::new(),
             view,
         };
-        app.model_picker.set_recents(
-            caudra_storage::model::read_recents(&app.storage)
-                .into_iter()
-                .filter(|spec| model_policy.allows(spec))
-                .collect(),
-        );
+        let recents = app.allowed_models(caudra_storage::model::read_recents(&app.storage));
+        app.model_picker.set_recents(recents);
+        let favorites = app.allowed_models(caudra_storage::model::read_favorites(&app.storage));
+        app.model_picker.set_favorites(favorites);
         app.chats[0].context_window = app.state.model.context_window;
         app.sync_composer_cwd();
         app.workbench.set_markdown_painter(paint_markdown);
@@ -1618,11 +1618,42 @@ impl App {
     }
 
     pub(crate) fn record_recent_model(&mut self, spec: &str) {
-        let recents = caudra_storage::model::push_recent(&self.storage, spec)
+        let recents = self.allowed_models(caudra_storage::model::push_recent(&self.storage, spec));
+        self.model_picker.set_recents(recents);
+    }
+
+    fn allowed_models(&self, specs: Vec<String>) -> Vec<String> {
+        specs
             .into_iter()
             .filter(|spec| self.model_policy.allows(spec))
-            .collect();
-        self.model_picker.set_recents(recents);
+            .collect()
+    }
+
+    fn toggle_favorite_model(&mut self, spec: &str) {
+        match caudra_storage::model::toggle_favorite(&self.storage, spec) {
+            Ok(favorites) => {
+                let favorites = self.allowed_models(favorites);
+                self.model_picker.set_favorites(favorites);
+            }
+            Err(error) => self.flash(format!("{FAVORITE_SAVE_ERR}: {error}")),
+        }
+    }
+
+    /// The favorite after the running model, wrapping, or the first when the
+    /// running model is not one.
+    fn cycle_favorite_model(&mut self) -> Vec<Action> {
+        let favorites = self.model_picker.favorites();
+        let current = self.state.model.spec();
+        let next = favorites
+            .iter()
+            .position(|spec| *spec == current)
+            .map_or(0, |index| (index + 1) % favorites.len());
+        let Some(spec) = favorites.get(next).cloned() else {
+            self.flash(no_favorites_msg());
+            return vec![];
+        };
+        self.flash(format!("{MODEL_SWITCH_PREFIX}{spec}"));
+        vec![Action::ChangeModel(spec)]
     }
 
     pub(crate) fn flash(&mut self, msg: String) {
@@ -2875,6 +2906,10 @@ impl App {
             ModelPickerAction::Select(spec) => vec![Action::ChangeModel(spec)],
             ModelPickerAction::Bind(purpose, binding) => vec![Action::Bind(purpose, binding)],
             ModelPickerAction::Unbind(purpose) => vec![Action::Unbind(purpose)],
+            ModelPickerAction::ToggleFavorite(spec) => {
+                self.toggle_favorite_model(&spec);
+                vec![]
+            }
             ModelPickerAction::Copy(text) => {
                 self.copy_to_clipboard(&text);
                 vec![]
@@ -3834,6 +3869,9 @@ impl App {
 
         if leader::TASKS.matches(key) {
             return self.tasks_browse();
+        }
+        if leader::CYCLE_FAVORITE.matches(key) {
+            return self.cycle_favorite_model();
         }
         if leader::WORKFLOWS.matches(key) {
             return self.execute_workflow("");
@@ -5883,6 +5921,7 @@ impl App {
                     .open(&self.state.model, &self.model_policy);
                 vec![Action::RefreshModels]
             }
+            "/favorite-next" => self.cycle_favorite_model(),
             "/system-prompt" => {
                 self.execute_system_prompt();
                 vec![]
@@ -7388,6 +7427,13 @@ impl App {
 /// common case still reads as the model alone.
 fn session_usage_model(provider: &str, model: &str) -> String {
     format!("{provider}/{model}")
+}
+
+pub(crate) fn no_favorites_msg() -> String {
+    format!(
+        "No favorite models yet: press {} on a model in /model",
+        key::TOGGLE_FAVORITE.label
+    )
 }
 
 fn is_goal_clear(args: &str) -> bool {

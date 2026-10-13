@@ -44,6 +44,7 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `Ctrl+X s` | Stash the current prompt |
 | `Ctrl+X p` | Restore the newest stashed prompt |
 | `Ctrl+X m` | Model picker |
+| `Ctrl+X c` | Next favorite model |
 | `Shift+Left` / `Shift+Right` | Pan a modal too wide for the screen left / right |
 | `Ctrl+X w` | Open the workbench |
 
@@ -233,6 +234,7 @@ Some pickers add extra bindings on top of the defaults:
 | Queue | `.` | Open item actions |
 | Queue | `r` | Replace current run |
 | Commands | `Tab` | Complete command |
+| Model Picker | `Ctrl+F` | Toggle favorite model |
 | Model Picker | `R` | Clear job binding |
 | Session Picker | `Ctrl+N` | New session |
 | Session Picker | `F2` | Move current session |

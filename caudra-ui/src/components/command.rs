@@ -342,6 +342,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         features: &[],
     },
     BuiltinCommand {
+        name: "/favorite-next",
+        description: "Switch to the next favorite model",
+        max_args: 0,
+        scope: ChatScope::MainOnly,
+        features: &[],
+    },
+    BuiltinCommand {
         name: "/system-prompt",
         description: "Inspect the system prompt and switch profile",
         max_args: 0,

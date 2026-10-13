@@ -270,6 +270,9 @@ pub mod key {
     };
     pub const POP_QUEUE: Bind = ctrl_bind!('q');
     pub const SEARCH: Bind = ctrl_bind!('f');
+    /// Inside the model picker, where nothing searches the transcript. The
+    /// key opencode spends on the same toggle.
+    pub const TOGGLE_FAVORITE: Bind = ctrl_bind!('f');
     pub const FILE_PICKER: Bind = ctrl_bind!('s');
     pub const OPEN_EDITOR: Bind = ctrl_bind!('o');
     /// Cycles the reasoning ladder. `t` for thinking, and the same key
@@ -333,6 +336,7 @@ pub mod leader {
     pub const TASKS: Bind = leader_bind!('a');
     /// `Ctrl+B` is the tmux prefix and never reaches a session inside tmux.
     pub const SCROLL_BOTTOM: Bind = leader_bind!('b');
+    pub const CYCLE_FAVORITE: Bind = leader_bind!('c');
     pub const EDIT_INPUT: Bind = leader_bind!('e');
     pub const FILE_PICKER: Bind = leader_bind!('f');
     pub const STEER_PROMPT: Bind = leader_bind!('g');
@@ -358,6 +362,7 @@ pub mod leader {
         TASKS,
         WORKFLOWS,
         SCROLL_BOTTOM,
+        CYCLE_FAVORITE,
         EDIT_INPUT,
         FILE_PICKER,
         STEER_PROMPT,
@@ -840,6 +845,11 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(leader::MODEL_PICKER.label),
         description: "Model picker",
+        context: KeybindContext::General,
+    },
+    Keybind {
+        label: KeyLabel::Single(leader::CYCLE_FAVORITE.label),
+        description: "Next favorite model",
         context: KeybindContext::General,
     },
     Keybind {
@@ -1370,6 +1380,11 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single("Tab"),
         description: "Complete command",
         context: KeybindContext::CommandPalette,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::TOGGLE_FAVORITE.label),
+        description: "Toggle favorite model",
+        context: KeybindContext::ModelPicker,
     },
     Keybind {
         label: KeyLabel::Single("R"),

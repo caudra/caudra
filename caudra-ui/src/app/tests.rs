@@ -3225,6 +3225,94 @@ fn the_model_chord_opens_the_model_picker() {
     assert!(matches!(&actions[..], [Action::RefreshModels]));
 }
 
+const FIRST_FAVORITE: &str = "zai/glm-5";
+const SECOND_FAVORITE: &str = "anthropic/claude-opus-4-6-20260101";
+
+fn app_with_favorites(favorites: &[&str]) -> App {
+    let mut app = test_app();
+    app.model_picker
+        .set_favorites(favorites.iter().map(|spec| spec.to_string()).collect());
+    app
+}
+
+#[test]
+fn a_toggled_favorite_is_saved_and_reaches_the_picker() {
+    let (_tmp, dir, _writer, mut app) = tempdir_app();
+
+    let actions =
+        app.handle_model_picker_action(ModelPickerAction::ToggleFavorite(FIRST_FAVORITE.into()));
+
+    assert!(actions.is_empty());
+    assert_eq!(app.model_picker.favorites(), [FIRST_FAVORITE]);
+    assert_eq!(
+        caudra_storage::model::read_favorites(&dir),
+        [FIRST_FAVORITE]
+    );
+
+    app.handle_model_picker_action(ModelPickerAction::ToggleFavorite(FIRST_FAVORITE.into()));
+    assert!(app.model_picker.favorites().is_empty());
+    assert!(caudra_storage::model::read_favorites(&dir).is_empty());
+}
+
+#[test]
+fn a_favorite_the_policy_excludes_is_saved_but_never_offered() {
+    let (_tmp, dir, _writer, mut app) = tempdir_app();
+    app.model_policy = Arc::new(ModelPolicy::new(&[], &[FIRST_FAVORITE.to_string()]).unwrap());
+
+    for spec in [FIRST_FAVORITE, SECOND_FAVORITE] {
+        app.handle_model_picker_action(ModelPickerAction::ToggleFavorite(spec.into()));
+    }
+
+    assert_eq!(
+        caudra_storage::model::read_favorites(&dir),
+        [SECOND_FAVORITE, FIRST_FAVORITE]
+    );
+    assert_eq!(app.model_picker.favorites(), [SECOND_FAVORITE]);
+    assert_eq!(
+        asked_for(&app.execute_command(cmd("/favorite-next"), 0)),
+        Some(SECOND_FAVORITE)
+    );
+}
+
+#[test]
+fn cycling_without_favorites_says_how_to_add_one() {
+    let mut app = test_app();
+
+    let actions = app.execute_command(cmd("/favorite-next"), 0);
+
+    assert!(actions.is_empty());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(super::no_favorites_msg().as_str())
+    );
+}
+
+#[test]
+fn cycling_starts_at_the_first_favorite_and_wraps() {
+    let mut app = app_with_favorites(&[FIRST_FAVORITE, SECOND_FAVORITE]);
+
+    assert_eq!(
+        asked_for(&press_chord(&mut app, chord::CYCLE_FAVORITE)),
+        Some(FIRST_FAVORITE)
+    );
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(format!("{MODEL_SWITCH_PREFIX}{FIRST_FAVORITE}").as_str())
+    );
+
+    app.state.model = Model::from_spec(FIRST_FAVORITE).unwrap();
+    assert_eq!(
+        asked_for(&app.execute_command(cmd("/favorite-next"), 0)),
+        Some(SECOND_FAVORITE)
+    );
+
+    app.state.model = Model::from_spec(SECOND_FAVORITE).unwrap();
+    assert_eq!(
+        asked_for(&press_chord(&mut app, chord::CYCLE_FAVORITE)),
+        Some(FIRST_FAVORITE)
+    );
+}
+
 #[test]
 fn the_model_chord_reaches_through_a_visible_plan_form() {
     let mut app = test_app();

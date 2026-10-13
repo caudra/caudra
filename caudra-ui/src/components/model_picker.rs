@@ -27,6 +27,9 @@ const SAME_PREFIX: &str = "Same as ";
 const SAME_DETAIL: &str = "follow this job";
 const SAVED_DETAIL: &str = "saved exact model";
 const RECENT_SECTION: &str = "Recent";
+const FAVORITES_SECTION: &str = "Favorites";
+const FAVORITE_MARK: &str = "★";
+const RECENT_MARK: &str = "↺";
 const FREE_LABEL: &str = "Free";
 const DETAIL_SEPARATOR: &str = " · ";
 const LOADING_MODELS: &str = "Loading models...";
@@ -41,6 +44,7 @@ const UNBIND_LABEL: &str = "R";
 fn home_footer_line() -> Vec<Hint> {
     vec![
         Hint::bind(key::ENTER, "select/open"),
+        Hint::bind(key::TOGGLE_FAVORITE, "favorite"),
         Hint::bind(key::ESC, "close"),
     ]
 }
@@ -48,6 +52,7 @@ fn home_footer_line() -> Vec<Hint> {
 fn assignment_footer_line() -> Vec<Hint> {
     vec![
         Hint::bind(key::ENTER, "assign"),
+        Hint::bind(key::TOGGLE_FAVORITE, "favorite"),
         Hint::char(UNBIND_LABEL, "unbind"),
         Hint::bind(key::ESC, "back"),
     ]
@@ -66,6 +71,7 @@ pub enum ModelPickerAction {
     Select(String),
     Bind(ModelPurpose, Binding),
     Unbind(ModelPurpose),
+    ToggleFavorite(String),
     Close,
     Copy(String),
 }
@@ -82,6 +88,7 @@ struct ModelEntry {
     job: Option<ModelPurpose>,
     selected: bool,
     free: bool,
+    mark: Option<&'static str>,
 }
 
 impl ModelEntry {
@@ -106,7 +113,10 @@ impl ModelEntry {
             return RowIdentity::Job(purpose);
         }
         if self.suffix.is_some() {
-            return RowIdentity::RecentModel(self.spec.clone());
+            return RowIdentity::Shortlisted {
+                section: self.provider_display.clone(),
+                spec: self.spec.clone(),
+            };
         }
         match &self.binds {
             Some(Binding::Same(target)) => RowIdentity::Binding(Some(*target)),
@@ -140,6 +150,10 @@ impl PickerItem for ModelEntry {
     fn is_highlighted(&self) -> bool {
         !self.claimed_by.is_empty() || self.selected
     }
+
+    fn mark(&self) -> Option<&str> {
+        self.mark
+    }
 }
 
 fn title_for(purpose: ModelPurpose) -> String {
@@ -156,8 +170,22 @@ enum PickerPage {
 enum RowIdentity {
     Job(ModelPurpose),
     Binding(Option<ModelPurpose>),
-    RecentModel(String),
+    /// A row in Favorites or Recent, told apart by section because a model can
+    /// sit in either.
+    Shortlisted {
+        section: String,
+        spec: String,
+    },
     ExactModel(String),
+}
+
+impl RowIdentity {
+    fn model_spec(&self) -> Option<&str> {
+        match self {
+            Self::Shortlisted { spec, .. } | Self::ExactModel(spec) => Some(spec),
+            Self::Job(_) | Self::Binding(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +199,7 @@ pub struct ModelPicker {
     models: Arc<ArcSwapOption<Vec<String>>>,
     available: Watch<Vec<String>>,
     recents: Vec<String>,
+    favorites: Vec<String>,
     current_model: Option<Model>,
     model_policy: Option<ModelPolicy>,
     page: PickerPage,
@@ -185,10 +214,12 @@ impl ModelPicker {
             picker: ListPicker::new()
                 .with_relevance_order()
                 .with_width_percent(PICKER_WIDTH_PERCENT)
-                .with_footer_builder(home_footer_line),
+                .with_footer_builder(home_footer_line)
+                .with_marks(),
             models,
             available: Watch::default(),
             recents: Vec::new(),
+            favorites: Vec::new(),
             current_model: None,
             model_policy: None,
             page: PickerPage::Home,
@@ -201,6 +232,19 @@ impl ModelPicker {
     pub fn set_recents(&mut self, recents: Vec<String>) {
         self.recents = recents;
         self.needs_rebuild = true;
+    }
+
+    /// Rebuilds at once rather than on the next tick, because the user just
+    /// toggled one and is looking at the row.
+    pub fn set_favorites(&mut self, favorites: Vec<String>) {
+        self.favorites = favorites;
+        if self.picker.is_open() {
+            self.rebuild();
+        }
+    }
+
+    pub fn favorites(&self) -> &[String] {
+        &self.favorites
     }
 
     pub fn open(&mut self, current_model: &Model, model_policy: &ModelPolicy) {
@@ -276,6 +320,11 @@ impl ModelPicker {
         if arrived == Dirty::NO && !self.needs_rebuild {
             return Dirty::NO;
         }
+        self.rebuild();
+        Dirty::YES
+    }
+
+    fn rebuild(&mut self) {
         self.needs_rebuild = false;
         if let PickerPage::Job(purpose) = self.page {
             self.binding = model_registry::binding(purpose);
@@ -287,7 +336,6 @@ impl ModelPicker {
             self.preselect_page();
         }
         self.capture_anchor();
-        Dirty::YES
     }
 
     fn sync_empty_text(&mut self) {
@@ -314,16 +362,20 @@ impl ModelPicker {
             self.mark_selection(entry, &current_spec);
         }
 
-        let mut recents = Vec::new();
-        for spec in &self.recents {
-            if let Some(mut e) = parse_model_entry(spec) {
-                self.mark_selection(&mut e, &current_spec);
-                e.suffix = Some(std::mem::take(&mut e.provider_display));
-                e.provider_display = RECENT_SECTION.to_string();
-                e.rebuild_search_text();
-                recents.push(e);
-            }
-        }
+        let favorites = self.shortlist(&self.favorites, FAVORITES_SECTION, &current_spec);
+        let recents = self.shortlist(
+            self.recents
+                .iter()
+                .filter(|spec| !self.favorites.contains(spec)),
+            RECENT_SECTION,
+            &current_spec,
+        );
+        let shortlisted = |spec: &str| {
+            favorites
+                .iter()
+                .chain(&recents)
+                .any(|entry| entry.spec == spec)
+        };
         let mut full: Vec<ModelEntry> = specs
             .map(|s| {
                 s.iter()
@@ -336,7 +388,7 @@ impl ModelPicker {
             })
             .unwrap_or_default();
         if !current_spec.is_empty()
-            && !recents.iter().any(|entry| entry.spec == current_spec)
+            && !shortlisted(&current_spec)
             && !full.iter().any(|entry| entry.spec == current_spec)
             && let Some(mut current) = parse_model_entry(&current_spec)
         {
@@ -346,14 +398,52 @@ impl ModelPicker {
         sort_models(&mut full);
         if matches!(self.page, PickerPage::Job(_))
             && let Some(spec) = self.bound_spec()
-            && !recents.iter().any(|entry| entry.spec == spec)
+            && !shortlisted(spec)
             && !full.iter().any(|entry| entry.spec == spec)
         {
             entries.push(saved_binding_entry(spec));
         }
+        entries.extend(favorites);
         entries.extend(recents);
         entries.extend(full);
+        for entry in &mut entries {
+            if entry.job.is_none() && matches!(entry.binds, Some(Binding::Exact(_))) {
+                entry.mark = self.mark_for(&entry.spec);
+            }
+        }
         entries
+    }
+
+    /// Rows for a section of hand-picked models: each names its provider as a
+    /// suffix, since the section header no longer does.
+    fn shortlist<'a>(
+        &self,
+        specs: impl IntoIterator<Item = &'a String>,
+        section: &str,
+        current_spec: &str,
+    ) -> Vec<ModelEntry> {
+        specs
+            .into_iter()
+            .filter_map(|spec| {
+                let mut entry = parse_model_entry(spec)?;
+                self.mark_selection(&mut entry, current_spec);
+                entry.suffix = Some(std::mem::take(&mut entry.provider_display));
+                entry.provider_display = section.to_string();
+                entry.rebuild_search_text();
+                Some(entry)
+            })
+            .collect()
+    }
+
+    fn mark_for(&self, spec: &str) -> Option<&'static str> {
+        let listed = |specs: &[String]| specs.iter().any(|listed| listed == spec);
+        if listed(&self.favorites) {
+            Some(FAVORITE_MARK)
+        } else if listed(&self.recents) {
+            Some(RECENT_MARK)
+        } else {
+            None
+        }
     }
 
     fn job_entries(&self) -> Vec<ModelEntry> {
@@ -445,8 +535,19 @@ impl ModelPicker {
         else {
             return false;
         };
-        self.picker
+        if self
+            .picker
             .select_item_by(|entry| entry.identity() == anchor.row)
+        {
+            return true;
+        }
+        // A toggle moves a model between Favorites and Recent, and the
+        // selection follows it to its first row that is still listed.
+        let Some(spec) = anchor.row.model_spec() else {
+            return false;
+        };
+        self.picker
+            .select_item_by(|entry| entry.job.is_none() && entry.spec == spec)
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
@@ -490,6 +591,16 @@ impl ModelPicker {
             self.preselect_page();
             self.needs_rebuild = true;
             return ModelPickerAction::Unbind(purpose);
+        }
+        if key::TOGGLE_FAVORITE.matches(key) {
+            return match self.picker.selected_item() {
+                Some(ModelEntry {
+                    job: None,
+                    binds: Some(Binding::Exact(spec)),
+                    ..
+                }) => ModelPickerAction::ToggleFavorite(spec.clone()),
+                _ => ModelPickerAction::Consumed,
+            };
         }
         let action = self.picker.handle_key(key);
         self.map_picker_action(action)
@@ -581,6 +692,7 @@ fn job_entry_with_binding(
         job: Some(purpose),
         selected: false,
         free: false,
+        mark: None,
     }
     .with_search_text()
 }
@@ -618,6 +730,7 @@ fn binding_row(id: &str, detail: &str, binds: Option<Binding>) -> ModelEntry {
         job: None,
         selected: false,
         free: false,
+        mark: None,
     }
     .with_search_text()
 }
@@ -641,6 +754,7 @@ fn saved_binding_entry(spec: &str) -> ModelEntry {
         job: None,
         selected: true,
         free: false,
+        mark: None,
     }
     .with_search_text()
 }
@@ -728,6 +842,7 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
             job: None,
             selected: false,
             free,
+            mark: None,
         }
         .with_search_text(),
     )
@@ -1462,6 +1577,115 @@ mod tests {
         let entry = p.picker.selected_item().expect("selection after refresh");
         assert_eq!(entry.spec, SWAPPED_SPEC);
         assert_eq!(entry.section(), Some(RECENT_SECTION));
+    }
+
+    fn shortlisted_specs(p: &ModelPicker, section: &str) -> Vec<String> {
+        p.load_entries()
+            .into_iter()
+            .filter(|entry| entry.section() == Some(section))
+            .map(|entry| entry.spec)
+            .collect()
+    }
+
+    fn selected_row(p: &ModelPicker) -> (String, Option<String>) {
+        let entry = p.picker.selected_item().expect("a selected row");
+        (entry.spec.clone(), entry.section().map(str::to_owned))
+    }
+
+    #[test]
+    fn favorites_lead_and_leave_recent_without_leaving_their_providers() {
+        let mut p = ModelPicker::new(test_models());
+        p.set_recents(vec![SWAPPED_SPEC.into(), SONNET_SPEC.into()]);
+        p.set_favorites(vec![OPUS_SPEC.into(), SONNET_SPEC.into()]);
+        open_picker(&mut p, SONNET_SPEC);
+
+        assert_eq!(
+            shortlisted_specs(&p, FAVORITES_SECTION),
+            [OPUS_SPEC, SONNET_SPEC]
+        );
+        assert_eq!(shortlisted_specs(&p, RECENT_SECTION), [SWAPPED_SPEC]);
+        assert_eq!(shortlisted_specs(&p, "Anthropic"), [OPUS_SPEC, SONNET_SPEC]);
+
+        let sections: Vec<_> = p
+            .load_entries()
+            .into_iter()
+            .filter(|entry| entry.job.is_none())
+            .filter_map(|entry| entry.section().map(str::to_owned))
+            .collect();
+        let first = |section: &str| sections.iter().position(|s| s == section).unwrap();
+        assert!(first(FAVORITES_SECTION) < first(RECENT_SECTION));
+        assert!(first(RECENT_SECTION) < first("Anthropic"));
+    }
+
+    #[test_case(OPUS_SPEC, Some(FAVORITE_MARK); "favorite")]
+    #[test_case(SONNET_SPEC, Some(FAVORITE_MARK); "favorite_and_recent")]
+    #[test_case(SWAPPED_SPEC, Some(RECENT_MARK); "recent_only")]
+    #[test_case(UNCLASSIFIED_SPEC, None; "unlisted")]
+    fn every_row_of_a_model_carries_its_mark(spec: &str, expected: Option<&str>) {
+        let mut p = ModelPicker::new(test_models());
+        p.set_recents(vec![SONNET_SPEC.into(), SWAPPED_SPEC.into()]);
+        p.set_favorites(vec![OPUS_SPEC.into(), SONNET_SPEC.into()]);
+        open_picker(&mut p, UNCLASSIFIED_SPEC);
+
+        let marks: Vec<_> = p
+            .load_entries()
+            .into_iter()
+            .filter(|entry| entry.job.is_none() && entry.spec == spec)
+            .map(|entry| entry.mark)
+            .collect();
+        assert!(!marks.is_empty());
+        assert!(marks.iter().all(|mark| *mark == expected), "{marks:?}");
+    }
+
+    #[test]
+    fn toggle_favorite_names_the_model_row_and_ignores_job_rows() {
+        let mut p = ModelPicker::new(test_models());
+        open_picker(&mut p, SONNET_SPEC);
+        assert!(matches!(
+            p.handle_key(kb::TOGGLE_FAVORITE.to_key_event()),
+            ModelPickerAction::Consumed
+        ));
+
+        navigate_to_model(&mut p, OPUS_SPEC, "Anthropic");
+        assert!(matches!(
+            p.handle_key(kb::TOGGLE_FAVORITE.to_key_event()),
+            ModelPickerAction::ToggleFavorite(spec) if spec == OPUS_SPEC
+        ));
+        assert!(p.is_open());
+    }
+
+    #[test]
+    fn the_selection_follows_a_model_between_recent_and_favorites() {
+        let mut p = ModelPicker::new(test_models());
+        p.set_recents(vec![SWAPPED_SPEC.into(), SONNET_SPEC.into()]);
+        open_picker(&mut p, SONNET_SPEC);
+        navigate_to_model(&mut p, SWAPPED_SPEC, RECENT_SECTION);
+
+        p.set_favorites(vec![SWAPPED_SPEC.into()]);
+        assert_eq!(
+            selected_row(&p),
+            (SWAPPED_SPEC.into(), Some(FAVORITES_SECTION.into()))
+        );
+
+        p.set_favorites(Vec::new());
+        assert_eq!(
+            selected_row(&p),
+            (SWAPPED_SPEC.into(), Some(RECENT_SECTION.into()))
+        );
+    }
+
+    #[test]
+    fn a_job_page_lists_favorites_and_toggles_them() {
+        let mut p = ModelPicker::new(test_models());
+        p.set_favorites(vec![OPUS_SPEC.into()]);
+        open_job_picker(&mut p, SONNET_SPEC, ModelPurpose::Goal);
+
+        assert_eq!(shortlisted_specs(&p, FAVORITES_SECTION), [OPUS_SPEC]);
+        navigate_to_model(&mut p, OPUS_SPEC, FAVORITES_SECTION);
+        assert!(matches!(
+            p.handle_key(kb::TOGGLE_FAVORITE.to_key_event()),
+            ModelPickerAction::ToggleFavorite(spec) if spec == OPUS_SPEC
+        ));
     }
 
     fn discovered(id: &str, pricing: ModelPricing) -> ModelInfo {

@@ -11,7 +11,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.8 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.8)
 
-Preview 8 adds Claude Haiku 5.5 as the Anthropic Fast model, lets the experimental decision engine rerank memory notes, tool search, retained tool output, and code context, shows in the transcript what each decision feature changed, gives workflows a `rerank()` function, runs a task on the model you name, opens forks in a new Herdr or Orca tab, names tabs after the session, lets new sessions open in build mode, makes the wheel scroll lists instead of moving their selection, stops pending reverts in a destination directory from blocking session moves, rings the bell in Orca when a turn ends in a tab you are not looking at, and has `caudra update` install without printing its installer first.
+Preview 8 adds Claude Haiku 5.5 as the Anthropic Fast model, lets the experimental decision engine rerank memory notes, tool search, retained tool output, and code context, shows in the transcript what each decision feature changed, gives workflows a `rerank()` function, runs a task on the model you name, adds favorite models to `/model` and keeps 10 recent ones, opens forks in a new Herdr or Orca tab, names tabs after the session, lets new sessions open in build mode, makes the wheel scroll lists instead of moving their selection, stops pending reverts in a destination directory from blocking session moves, rings the bell in Orca when a turn ends in a tab you are not looking at, and has `caudra update` install without printing its installer first.
 
 > **Important**
 >
@@ -28,6 +28,12 @@ Preview 8 adds Claude Haiku 5.5 as the Anthropic Fast model, lets the experiment
 - **Claude Haiku 5.5.** `anthropic/claude-haiku-5-5` costs $0.10 per million input tokens and $0.50 per million output tokens, with cache reads at $0.01. Once a prompt passes 100k tokens, cached tokens included, Anthropic bills the whole request at five times those rates, and Caudra counts its cost the same way. Caudra runs it at the 372k working window of other recent Claude models, and `claude-haiku-5-5-1m` opens the full 1M window. Thinking takes effort levels from `low` to `max`, and thinking `off` turns its reasoning off. Copilot and Copilot Enterprise list it as `claude-haiku-5.5`. There, as with Copilot's other Claude models, `off` runs at the lowest level. See [Anthropic](/docs/providers/#anthropic).
 - **Haiku 5.5 is the Anthropic Fast model.** It replaces `claude-haiku-4-5` as the curated Fast model, so on an Anthropic session, session titles, completion-goal checks, and other Fast work run on it unless you bound those jobs to a model. Bind Fast to `anthropic/claude-haiku-4-5` in `/model` to keep the older model. See [Model jobs](/docs/providers/#model-jobs).
 - **Sonnet 5.5 cache reads cost less.** Anthropic halved the cache read price of Claude Sonnet 5.5 to $0.10 per million tokens, and Copilot bills the same. Caudra now counts `claude-sonnet-5-5` and `copilot/claude-sonnet-5.5` at the new price.
+
+### Model picker
+
+- **Favorite models.** In `/model`, press `Ctrl+F` on a model to mark it as a favorite, and again to unmark it. Favorites are listed first, above Recent, and are kept across sessions. `/favorite-next` or `Ctrl+X c` switches to your next favorite. See [Model jobs](/docs/providers/#model-jobs).
+- **Recent keeps 10 models.** The Recent section now lists the last 10 models you switched to instead of 4, and leaves out your favorites.
+- **Marks on every model row.** A model keeps its row in its provider's section, where a `★` marks a favorite and a `↺` a recent model, so you can see either one while you search.
 
 ### Decision engine
 

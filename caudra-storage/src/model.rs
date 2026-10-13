@@ -6,7 +6,7 @@ use tracing::warn;
 
 use crate::sessions::StoredMode;
 use crate::state::{self, SCOPE_GLOBAL, StateKey};
-use crate::{StateClass, StateDir};
+use crate::{StateClass, StateDir, StorageError};
 
 /// The model last chosen in each mode, so planning and building can run on
 /// different ones. Keyed by mode because the two are chosen for different work:
@@ -28,7 +28,13 @@ const RECENT: StateKey = StateKey {
     name: "model.recent",
     class: StateClass::Persistent,
 };
-const MAX_RECENTS: usize = 4;
+/// Models the user marked by hand, newest first. Never capped: unlike recents,
+/// nothing adds to it behind the user's back.
+const FAVORITES: StateKey = StateKey {
+    name: "model.favorites",
+    class: StateClass::Persistent,
+};
+const MAX_RECENTS: usize = 10;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ModeModels {
@@ -119,6 +125,35 @@ pub fn read_recents(dir: &StateDir) -> Vec<String> {
     state::get::<Vec<String>>(dir, SCOPE_GLOBAL, RECENT)
         .unwrap_or_else(|error| {
             warn!(%error, "failed to read recent models");
+            None
+        })
+        .unwrap_or_default()
+}
+
+/// Marks `spec` as a favorite, or unmarks it when it already is one, and
+/// answers the list as stored. The error reaches the caller because the user
+/// asked for this change and has to hear when it did not stick.
+pub fn toggle_favorite(dir: &StateDir, spec: &str) -> Result<Vec<String>, StorageError> {
+    state::update(
+        dir,
+        SCOPE_GLOBAL,
+        FAVORITES,
+        |favorites: &mut Vec<String>| {
+            match favorites.iter().position(|favorite| favorite == spec) {
+                Some(index) => {
+                    favorites.remove(index);
+                }
+                None => favorites.insert(0, spec.to_owned()),
+            }
+            favorites.clone()
+        },
+    )
+}
+
+pub fn read_favorites(dir: &StateDir) -> Vec<String> {
+    state::get::<Vec<String>>(dir, SCOPE_GLOBAL, FAVORITES)
+        .unwrap_or_else(|error| {
+            warn!(%error, "failed to read favorite models");
             None
         })
         .unwrap_or_default()
@@ -280,5 +315,26 @@ mod tests {
         let (_tmp, dir) = state_dir();
 
         assert!(read_recents(&dir).is_empty());
+    }
+
+    #[test]
+    fn toggle_favorite_adds_newest_first_and_removes_on_repeat() {
+        let (_tmp, dir) = state_dir();
+
+        toggle_favorite(&dir, PLAN_MODEL).unwrap();
+        let favorites = toggle_favorite(&dir, BUILD_MODEL).unwrap();
+        assert_eq!(favorites, [BUILD_MODEL, PLAN_MODEL]);
+        assert_eq!(read_favorites(&dir), favorites);
+
+        let favorites = toggle_favorite(&dir, PLAN_MODEL).unwrap();
+        assert_eq!(favorites, [BUILD_MODEL]);
+        assert_eq!(read_favorites(&dir), favorites);
+    }
+
+    #[test]
+    fn read_favorites_handles_missing_state() {
+        let (_tmp, dir) = state_dir();
+
+        assert!(read_favorites(&dir).is_empty());
     }
 }

@@ -41,6 +41,8 @@ const BADGE_DETAIL_GAP: &str = "  ";
 const LABEL_MIN_COLS: usize = 20;
 const DETAIL_DIM: f32 = 0.4;
 pub(crate) const DISABLED_DIM: f32 = 0.45;
+/// The columns a marked picker keeps at each row's right edge for its mark.
+const MARK_COLS: usize = 1;
 
 pub trait PickerItem {
     fn label(&self) -> &str;
@@ -54,6 +56,11 @@ pub trait PickerItem {
         None
     }
     fn badge(&self) -> Option<&str> {
+        None
+    }
+    /// A one-column sigil drawn at the row's right edge, in a column every row
+    /// of a [`ListPicker::with_marks`] picker keeps whether it has one or not.
+    fn mark(&self) -> Option<&str> {
         None
     }
     /// How many leading characters of the label draw in their own style, as a
@@ -122,6 +129,7 @@ pub struct ListPicker<T> {
     width_percent: u16,
     docked: bool,
     relevance_order: bool,
+    marks: bool,
 }
 
 struct State<T> {
@@ -159,6 +167,7 @@ struct RenderOptions<'a> {
     max_visible: Option<u16>,
     width_percent: u16,
     docked: bool,
+    marks: bool,
     empty_text: &'a str,
 }
 
@@ -377,7 +386,15 @@ impl<T: PickerItem> ListPicker<T> {
             width_percent: MIN_WIDTH_PERCENT,
             docked: false,
             relevance_order: false,
+            marks: false,
         }
+    }
+
+    /// Keeps a column at every row's right edge for [`PickerItem::mark`], so
+    /// the marks line up and a row without one keeps its detail in place.
+    pub fn with_marks(mut self) -> Self {
+        self.marks = true;
+        self
     }
 
     pub fn with_max_visible(mut self, max: u16) -> Self {
@@ -831,6 +848,7 @@ impl<T: PickerItem> ListPicker<T> {
                     max_visible: self.max_visible,
                     width_percent: self.width_percent,
                     docked: self.docked,
+                    marks: self.marks,
                     empty_text: self.empty_text,
                 },
                 RenderContent {
@@ -986,6 +1004,7 @@ fn render_ready<T: PickerItem>(
         s.enabled.as_deref(),
         &mut s.row_hits,
         options.empty_text,
+        options.marks,
     );
     render_search(frame, search_area, &s.search);
 
@@ -1223,8 +1242,15 @@ fn render_list<T: PickerItem>(
     enabled: Option<&[bool]>,
     row_hits: &mut Vec<PickerRowHit>,
     empty_text: &str,
+    marks: bool,
 ) {
     grab_scope!("list_picker_list", area);
+    let mark_cols = if marks {
+        MARK_COLS + usize::from(DETAIL_RIGHT_PAD)
+    } else {
+        0
+    };
+    let content_width = usize::from(area.width).saturating_sub(mark_cols);
     if filtered.is_empty() {
         let line = Line::from(Span::styled(
             format!("  {empty_text}"),
@@ -1315,8 +1341,10 @@ fn render_list<T: PickerItem>(
         let suffix_w = suffix.map(|s| s.width()).unwrap_or(0);
         let trailing_gap = suffix_w + if suffix_w > 0 { suffix_gap } else { 0 };
         let checkbox_cols = u16::try_from(checkbox.as_ref().map_or(0, Span::width)).unwrap_or(0);
-        let row_width = area.width.saturating_sub(checkbox_cols);
-        let (line, clipped) = match detail {
+        let row_width = u16::try_from(content_width)
+            .unwrap_or(u16::MAX)
+            .saturating_sub(checkbox_cols);
+        let (mut line, clipped) = match detail {
             Some(detail) => {
                 let row = if item.badge().is_some() {
                     badge_row(&label, detail, trailing_gap, row_width)
@@ -1342,7 +1370,7 @@ fn render_list<T: PickerItem>(
             // Nothing cuts a label without a detail, so the row's own edge does.
             None => {
                 let checkbox_width = checkbox.as_ref().map_or(0, Span::width);
-                let clipped = checkbox_width + label.width() > usize::from(area.width);
+                let clipped = checkbox_width + label.width() > content_width;
                 let mut spans: Vec<Span> = Vec::with_capacity(4);
                 if let Some(cb) = checkbox {
                     spans.push(cb);
@@ -1355,6 +1383,16 @@ fn render_list<T: PickerItem>(
                 (Line::from(spans), clipped)
             }
         };
+        if marks {
+            let mark = truncate_label(item.mark().unwrap_or_default(), MARK_COLS);
+            let fill = content_width.saturating_sub(line.width());
+            let mark_fill = MARK_COLS.saturating_sub(mark.width());
+            line.spans.extend([
+                Span::styled(" ".repeat(fill), style),
+                Span::styled(mark, detail_style),
+                Span::styled(" ".repeat(mark_fill + usize::from(DETAIL_RIGHT_PAD)), style),
+            ]);
+        }
         row_hits.push(PickerRowHit {
             area: row_area,
             filtered_index: i,
@@ -1461,6 +1499,7 @@ mod tests {
         label: String,
         detail: Option<String>,
         spinning: bool,
+        mark: Option<&'static str>,
     }
 
     impl Entry {
@@ -1469,6 +1508,7 @@ mod tests {
                 label: label.into(),
                 detail: None,
                 spinning: false,
+                mark: None,
             }
         }
     }
@@ -1479,6 +1519,9 @@ mod tests {
         }
         fn detail(&self) -> Option<&str> {
             self.detail.as_deref()
+        }
+        fn mark(&self) -> Option<&str> {
+            self.mark
         }
         fn is_spinning(&self) -> bool {
             self.spinning
@@ -1801,6 +1844,47 @@ mod tests {
         };
         let (tip, _) = hovered_tip(entry, |row| row);
         assert_eq!(tip.map(|tip| tip.text), expected, "{TIP_ONLY_WHEN_CUT}");
+    }
+
+    /// Marks line up whether a row has a detail or not, and a row without a
+    /// mark keeps its detail where a marked row puts it.
+    #[test]
+    fn marks_share_one_column_and_leave_details_aligned() {
+        const MARK: &str = "*";
+        let detailed = |label: &str, mark| Entry {
+            detail: Some(SHORT_DETAIL.to_owned()),
+            mark,
+            ..Entry::new(label)
+        };
+        let mut picker = ListPicker::new().with_marks();
+        picker.open(
+            vec![
+                detailed("marked", Some(MARK)),
+                detailed("plain", None),
+                Entry {
+                    mark: Some(MARK),
+                    ..Entry::new("bare")
+                },
+            ],
+            " Test ",
+        );
+        let buffer = render(&mut picker);
+        let rows: Vec<String> = ready_state(&picker)
+            .row_hits
+            .iter()
+            .map(|hit| {
+                (hit.area.left()..hit.area.right())
+                    .map(|x| buffer[(x, hit.area.y)].symbol())
+                    .collect()
+            })
+            .collect();
+        let mark_at = |row: &str| row.chars().rev().nth(usize::from(DETAIL_RIGHT_PAD));
+        let detail_end = |row: &str| row.rfind(SHORT_DETAIL).map(|at| at + SHORT_DETAIL.len());
+
+        assert_eq!(mark_at(&rows[0]), MARK.chars().next());
+        assert_eq!(mark_at(&rows[1]), Some(' '));
+        assert_eq!(mark_at(&rows[2]), MARK.chars().next());
+        assert_eq!(detail_end(&rows[0]), detail_end(&rows[1]));
     }
 
     #[test]

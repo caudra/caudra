@@ -46,6 +46,7 @@ A command with an Experiment entry exists only while that switch is on under `[e
 | `/sessions` | Browse and switch sessions |  |  |
 | `/rename` | Rename the current session |  |  |
 | `/model` | Switch chat model or assign job models | Main only |  |
+| `/favorite-next` | Switch to the next favorite model | Main only |  |
 | `/system-prompt` | Inspect the system prompt and switch profile | Main only |  |
 | `/projection` | Inspect the conversation as the provider receives it | Main only |  |
 | `/review` | Review the last reply passage by passage |  |  |
