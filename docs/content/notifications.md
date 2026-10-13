@@ -23,7 +23,7 @@ notifications = "auto"
 
 | Value | Behavior |
 | --- | --- |
-| `auto` | Prefer native Herdr or Orca reporting, then OSC 7501 status when supported. Otherwise use OSC 9 in a supported terminal or BEL. |
+| `auto` | Prefer native Herdr or Orca reporting, then OSC 7501 status when supported. Otherwise use OSC 9 in a supported terminal or BEL. Orca also gets BEL, as [Orca](#orca) describes. |
 | `osc9` | Always send an OSC 9 notification. |
 | `bell` | Always send the terminal bell. |
 | `off` | Do not send notifications. |
@@ -146,9 +146,16 @@ for what else Caudra reports through the native integration.
 Inside an [Orca](https://github.com/stablyai/orca) terminal, Caudra reports its
 status to Orca as OSC 9999, the sequence Orca reads from agent output. Orca shows
 the agent state and raises its own notice when the agent finishes or waits for
-you. `auto` then sends no separate notices for turns and prompts,
-and it does not probe for OSC 7501. An explicit `osc9` or `bell` setting still
-applies.
+you. `auto` does not probe for OSC 7501 there.
+
+In a remote workspace, Orca stops reading the status of a hidden tab after a
+while, so the tab keeps its old state, such as `working`. With `auto`, Caudra
+therefore also rings the bell when a turn ends or a prompt waits while its
+terminal does not have focus. Orca then marks the tab unread. For a desktop
+notice as well, turn on **Terminal Bell** in Orca's notification settings. When
+the terminal gets focus again, Caudra sends its status again, so the tab shows
+the current state. An explicit `osc9` or `bell` setting still applies, and `off`
+stops the bell.
 
 Each report carries the state, the model, and the label of the prompt that
 blocks the agent, such as `Permission requested: shell`. It never carries the

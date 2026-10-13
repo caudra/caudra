@@ -219,8 +219,9 @@ impl ReporterHandle {
         }
     }
 
-    /// The terminal was handed to another program, which may have changed
-    /// what it shows, so the next status is written again.
+    /// The terminal may not show what was last written: another program had
+    /// it, or it was out of sight, as a hidden Orca tab is. The next status is
+    /// written again.
     pub fn invalidate(&self) {
         if let Delivery::InBand(in_band) = &*self.delivery {
             lock(in_band).written = None;

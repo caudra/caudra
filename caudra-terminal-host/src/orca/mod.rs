@@ -97,9 +97,11 @@ impl TerminalHost for OrcaHost {
         })
     }
 
-    /// Orca notifies when an agent's status turns done or blocked.
+    /// Orca stops reading the status of a remote tab once it parks the hidden
+    /// tab (stablyai/orca#15442), so its own notice never comes. A bell still
+    /// reaches it and marks the tab unread.
     fn raises_notifications(&self) -> bool {
-        true
+        false
     }
 
     /// Orca labels a terminal's tab with its window title until the user

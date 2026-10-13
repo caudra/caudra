@@ -3590,6 +3590,7 @@ impl<'t> EventLoop<'t> {
             }
             if focused {
                 self.wake_appearance();
+                self.pane_signals.invalidate();
             }
             return (None, None);
         }

@@ -158,8 +158,8 @@ impl PaneSignals {
         self.window_title = WindowTitle::Elsewhere;
     }
 
-    /// The terminal was handed to another program, which may have changed
-    /// what it shows.
+    /// The terminal may not show what was last written: another program had
+    /// it, or it was out of sight, as a hidden Orca tab is.
     pub(crate) fn invalidate(&mut self) {
         if let Some(reporter) = &self.reporter {
             reporter.invalidate();
