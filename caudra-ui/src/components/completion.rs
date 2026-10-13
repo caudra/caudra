@@ -14,7 +14,6 @@ use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Injector, Nucleo};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::Modifier;
 use ratatui::text::Line;
 use ratatui::widgets::{Clear, Paragraph, Widget};
 use std::sync::Arc;
@@ -269,9 +268,10 @@ impl Completion {
             .map(|(index, item)| row(item, index == self.selected))
             .collect();
 
+        let t = theme::current();
         Clear.render(area, frame.buffer_mut());
         frame.render_widget(
-            Paragraph::new(lines).style(theme::current().item.add_modifier(Modifier::empty())),
+            Paragraph::new(lines).style(t.surface_style().patch(t.item)),
             area,
         );
         Some(area)

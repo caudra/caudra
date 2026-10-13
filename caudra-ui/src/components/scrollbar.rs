@@ -10,16 +10,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crossterm::event::MouseEvent;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
 
 use caudra_grab::grab_leaf;
 use caudra_workbench::scroll;
 
-pub use caudra_workbench::scroll::{ScrollHint, ScrollbarMouse};
+use crate::theme;
 
-/// A `ListPicker` renders highlighted rows over the bar's column, so the thumb
-/// resets both channels rather than inheriting the row's background.
-const THUMB: Style = Style::new().fg(Color::Reset).bg(Color::Reset);
+pub use caudra_workbench::scroll::{ScrollHint, ScrollbarMouse};
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
 
@@ -72,7 +69,10 @@ impl Scrollbar {
             "scrollbar",
             self.0.track().map_or(Rect::ZERO, scroll::ScrollTrack::area)
         );
-        self.0.render(frame.buffer_mut(), THUMB);
+        // Both channels, so a highlighted `ListPicker` row drawn over the bar's
+        // column lends the thumb neither of its colours.
+        self.0
+            .render(frame.buffer_mut(), theme::current().surface_style());
     }
 
     /// Only drawn while a drag is live, and only worth setting on a surface

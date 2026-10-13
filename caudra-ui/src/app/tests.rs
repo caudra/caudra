@@ -26570,3 +26570,619 @@ mod engine_decisions {
         );
     }
 }
+
+/// Every surface drawn in the theme it shows, then again after the theme
+/// switches the way an appearance change switches it. A cell left at
+/// `Color::Reset` is painted in the terminal's own colours, so a dark theme on a
+/// light terminal shows a light patch there. A cell still in the old theme's
+/// colours never switched.
+mod theme_colours {
+    use std::any::Any;
+    use std::collections::BTreeSet;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use caudra_automation::snapshot::AutomationState;
+    use caudra_config::ToolKey;
+    use caudra_providers::Message;
+    use caudra_storage::id::CaudraId;
+    use caudra_storage::prompt_stash::StashEntry;
+    use crossterm::event::KeyCode;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::{Buffer, Cell, CellDiffOption};
+    use ratatui::layout::Position;
+    use ratatui::style::Color;
+    use ratatui::text::Line;
+    use test_case::test_case;
+    use unicode_width::UnicodeWidthStr;
+
+    use super::{
+        App, BuiltinAction, DisplaySource, Mode, Msg, PeerView, ReviewTarget, Status,
+        StatusBarHitTarget, StreamEvent, StreamFooter, TRANSCRIPT_LINES, chord, click_status, cmd,
+        commit_popup_at, fill_transcript, mention_popup_at, open_changelog_modal,
+        open_command_modal, open_context_modal, open_decisions_modal, open_docs_modal,
+        open_goal_modal, open_help_modal, open_logs_modal, open_model_picker,
+        open_permission_test_editor, open_permission_test_leader, open_projection_modal,
+        open_question, open_queue_menu, open_relocation_picker, open_repeat_test_session_picker,
+        open_search, open_skills_modal, open_storage_modal, open_system_prompt_modal,
+        open_tools_modal, open_usage_modal, press_chord, queued_msg, test_app,
+    };
+    use crate::components::messages::ASSISTANT_LABEL;
+    use crate::components::sandbox_manager::SandboxView;
+    use crate::components::worktree_picker::{WorktreeOverview, WorktreeView};
+    use crate::components::{Overlay, key};
+    use crate::theme::{self, Theme};
+
+    const WIDTH: u16 = 160;
+    const HEIGHT: u16 = 40;
+    const DARK: &str = "caudra-dark";
+    const LIGHT: &str = "caudra-light";
+    const TERMINAL_COLOURS: &str =
+        "drew cells in the terminal's own colours instead of the theme's";
+    const STALE_THEME: &str = "kept the previous theme's colours after the theme changed";
+    const NOT_SHOWN: &str = "the opener did not bring the surface up";
+    const UNCOVERED: &str = "every overlay needs a surface here, or its colours go unchecked";
+    const REPORTED_CELLS: usize = 4;
+    const PERMISSION_ID: &str = "theme-colours";
+    const PERMISSION_TOOL: &str = "bash";
+    const PERMISSION_COMMAND: &str = "cargo test -p caudra-ui";
+    const MENTION_QUERY: &str = "@";
+    const COMMIT_SIGIL: &str = "#";
+    const COMMIT_QUERY: &str = "#a1b2";
+    const STREAM_TITLE: &str = " /btw ";
+    const STREAM_QUESTION: &str = "why sqlite?";
+    const STREAM_ANSWER: &str = "Because it is one file.";
+    const REVIEW_TEXT: &str = "A sentence to review.";
+    const STASHED: &str = "a stashed draft";
+    const STASH_ID: &str = "stash-1";
+    const REWIND_PROMPT: &str = "hello";
+    const QUEUED: &str = "queued";
+    const PROFILE_KEY: char = 'p';
+    const FLOAT_CHANNEL: usize = 8;
+
+    /// What an opener must keep alive for its surface to stay up, such as the
+    /// sender a float closes on losing.
+    type Held = Vec<Box<dyn Any>>;
+
+    struct Surface {
+        name: &'static str,
+        open: fn(&mut App, &mut Held),
+        shown: fn(&App) -> bool,
+    }
+
+    const SURFACES: &[Surface] = &[
+        Surface {
+            name: "idle",
+            open: |_, _| {},
+            shown: |_| true,
+        },
+        Surface {
+            name: "transcript",
+            open: |app, _| fill_transcript(app),
+            shown: |app| app.chats[0].message_count() >= TRANSCRIPT_LINES,
+        },
+        Surface {
+            name: "plan_form",
+            open: |app, _| {
+                app.state.mode = Mode::Plan;
+                app.plan_form.on_plan_ready();
+            },
+            shown: |app| app.plan_form.is_visible(),
+        },
+        Surface {
+            name: "which_key",
+            open: |app, _| open_permission_test_leader(app),
+            shown: |app| app.which_key.is_armed(),
+        },
+        Surface {
+            name: "mention_popup",
+            open: |app, _| {
+                mention_popup_at(app, Path::new(env!("CARGO_MANIFEST_DIR")), MENTION_QUERY);
+            },
+            shown: |app| app.mention_popup.is_open(),
+        },
+        Surface {
+            name: "commit_loading",
+            open: |app, _| {
+                app.update(Msg::Paste(COMMIT_SIGIL.into()));
+            },
+            shown: |app| app.commit_popup.is_loading(),
+        },
+        Surface {
+            name: "commit_popup",
+            open: |app, _| commit_popup_at(app, COMMIT_QUERY),
+            shown: |app| app.commit_popup.is_open(),
+        },
+        Surface {
+            name: "workbench",
+            open: |app, _| open_workbench(app),
+            shown: |app| app.workbench.is_open(),
+        },
+        Surface {
+            name: "permission_prompt",
+            open: |app, _| open_permission(app),
+            shown: |app| app.permission_prompt.is_open(),
+        },
+        Surface {
+            name: "permission_prompt_over_workbench",
+            open: |app, _| {
+                open_workbench(app);
+                open_permission(app);
+            },
+            shown: |app| app.workbench.is_open() && app.permission_prompt.is_open(),
+        },
+        Surface {
+            name: "question_form",
+            open: |app, _| open_question(app),
+            shown: |app| app.question_form.is_open(),
+        },
+        Surface {
+            name: "question_form_over_workbench",
+            open: |app, _| {
+                open_workbench(app);
+                open_question(app);
+            },
+            shown: |app| app.workbench.is_open() && app.question_form.is_open(),
+        },
+        Surface {
+            name: "logs_modal",
+            open: |app, _| open_logs_modal(app),
+            shown: |app| app.logs_modal.is_open(),
+        },
+        Surface {
+            name: "docs_modal",
+            open: |app, _| open_docs_modal(app),
+            shown: |app| app.docs_modal.is_open(),
+        },
+        Surface {
+            name: "changelog_modal",
+            open: |app, _| open_changelog_modal(app),
+            shown: |app| app.changelog_modal.is_open(),
+        },
+        Surface {
+            name: "help_modal",
+            open: |app, _| open_help_modal(app),
+            shown: |app| app.help_modal.is_open(),
+        },
+        Surface {
+            name: "usage_modal",
+            open: |app, _| open_usage_modal(app),
+            shown: |app| app.usage_modal.is_open(),
+        },
+        Surface {
+            name: "context_modal",
+            open: |app, _| open_context_modal(app),
+            shown: |app| app.context_modal.is_open(),
+        },
+        Surface {
+            name: "tools_modal",
+            open: |app, _| open_tools_modal(app),
+            shown: |app| app.tools_modal.is_open(),
+        },
+        Surface {
+            name: "decisions_modal",
+            open: |app, _| open_decisions_modal(app),
+            shown: |app| app.decisions_modal.is_open(),
+        },
+        Surface {
+            name: "skills_modal",
+            open: |app, _| open_skills_modal(app),
+            shown: |app| app.skills_modal.is_open(),
+        },
+        Surface {
+            name: "storage_modal",
+            open: |app, _| open_storage_modal(app),
+            shown: |app| app.storage_modal.is_open(),
+        },
+        Surface {
+            name: "system_prompt_modal",
+            open: |app, _| open_system_prompt_modal(app),
+            shown: |app| app.system_prompt_modal.is_open(),
+        },
+        Surface {
+            name: "projection_modal",
+            open: |app, _| open_projection_modal(app),
+            shown: |app| app.projection_modal.is_open(),
+        },
+        Surface {
+            name: "goal_modal",
+            open: |app, _| open_goal_modal(app),
+            shown: |app| app.goal_modal.is_open(),
+        },
+        Surface {
+            name: "autopilot_panel",
+            open: |app, _| app.autopilot_panel.open(),
+            shown: |app| app.autopilot_panel.is_open(),
+        },
+        Surface {
+            name: "stream_modal",
+            open: |app, _| open_stream(app),
+            shown: |app| app.stream_modal.is_open(),
+        },
+        Surface {
+            name: "float",
+            open: open_float,
+            shown: |app| app.float_mgr.is_open(),
+        },
+        Surface {
+            name: "search_modal",
+            open: |app, _| open_search(app),
+            shown: |app| app.search_modal.is_open(),
+        },
+        Surface {
+            name: "file_picker",
+            open: |app, _| {
+                app.run_builtin(BuiltinAction::FilePicker);
+            },
+            shown: |app| app.file_picker.is_open(),
+        },
+        Surface {
+            name: "paste_editor",
+            open: |app, _| open_permission_test_editor(app),
+            shown: |app| app.paste_editor.is_open(),
+        },
+        Surface {
+            name: "rewind_picker",
+            open: |app, _| {
+                crate::push_history_message(
+                    app.state.session_mut(),
+                    Message::user(REWIND_PROMPT.into()),
+                );
+                app.open_rewind_picker();
+            },
+            shown: |app| app.rewind_picker.is_open(),
+        },
+        Surface {
+            name: "message_actions",
+            open: |app, _| {
+                app.message_actions.open(
+                    DisplaySource::AssistantText(CaudraId::generate()),
+                    false,
+                    None,
+                );
+            },
+            shown: |app| app.message_actions.is_open(),
+        },
+        Surface {
+            name: "queue_actions",
+            open: |app, _| {
+                app.status = Status::Streaming;
+                app.run_id = 1;
+                app.queue_and_notify(queued_msg(QUEUED));
+                open_queue_menu(app);
+            },
+            shown: |app| app.queue_actions.is_open(),
+        },
+        Surface {
+            name: "mode_submission",
+            open: |app, _| app.mode_submission.open(),
+            shown: |app| app.mode_submission.is_open(),
+        },
+        Surface {
+            name: "review",
+            open: |app, _| {
+                app.review.open(
+                    DisplaySource::AssistantText(CaudraId::generate()),
+                    ReviewTarget {
+                        lines: vec![Line::raw(REVIEW_TEXT)],
+                        provenance: None,
+                        label: ASSISTANT_LABEL,
+                    },
+                );
+            },
+            shown: |app| app.review.is_open(),
+        },
+        Surface {
+            name: "command_modal",
+            open: |app, _| open_command_modal(app),
+            shown: |app| app.command_modal.is_open(),
+        },
+        Surface {
+            name: "theme_picker",
+            open: |app, _| app.theme_picker.open(),
+            shown: |app| app.theme_picker.is_open(),
+        },
+        Surface {
+            name: "thinking_picker",
+            open: |app, _| {
+                click_status(app, StatusBarHitTarget::Thinking);
+            },
+            shown: |app| app.thinking_picker.is_open(),
+        },
+        Surface {
+            name: "prompt_profile_picker",
+            open: |app, _| {
+                open_system_prompt_modal(app);
+                app.update(Msg::Key(key(KeyCode::Char(PROFILE_KEY))));
+            },
+            shown: |app| app.prompt_profile_picker.is_open(),
+        },
+        Surface {
+            name: "model_picker",
+            open: |app, _| open_model_picker(app),
+            shown: |app| app.model_picker.is_open(),
+        },
+        Surface {
+            name: "login_picker",
+            open: |app, _| {
+                app.execute_command(cmd("/login"), 0);
+            },
+            shown: |app| app.login_picker.is_open(),
+        },
+        Surface {
+            name: "mcp_picker",
+            open: |app, _| {
+                app.execute_command(cmd("/mcp"), 0);
+            },
+            shown: |app| app.mcp_picker.is_open(),
+        },
+        Surface {
+            name: "env_modal",
+            open: |app, _| {
+                app.execute_command(cmd("/env"), 0);
+            },
+            shown: |app| app.env_modal.is_open(),
+        },
+        Surface {
+            name: "permissions_picker",
+            open: |app, _| {
+                app.execute_command(cmd("/permissions"), 0);
+                app.finish_permission_jobs();
+            },
+            shown: |app| app.permissions_picker.is_open(),
+        },
+        Surface {
+            name: "sandbox_manager",
+            open: |app, _| {
+                let session = app.state.session.id;
+                let _ = app.sandbox_manager.open(session, SandboxView::Profiles);
+            },
+            shown: |app| app.sandbox_manager.is_open(),
+        },
+        Surface {
+            name: "stash_picker",
+            open: |app, _| {
+                app.stash_picker.open(
+                    vec![StashEntry {
+                        id: STASH_ID.into(),
+                        text: STASHED.into(),
+                        paste_ranges: Vec::new(),
+                        images: Vec::new(),
+                        cwd: String::new(),
+                        created_at: 0,
+                    }],
+                    0,
+                );
+            },
+            shown: |app| app.stash_picker.is_open(),
+        },
+        Surface {
+            name: "memory_inspector",
+            open: |app, _| {
+                app.execute_command(cmd("/memory"), 0);
+            },
+            shown: |app| app.memory_inspector.is_open(),
+        },
+        Surface {
+            name: "task_picker",
+            open: |app, _| {
+                app.tasks_browse();
+            },
+            shown: |app| app.task_picker.is_open(),
+        },
+        Surface {
+            name: "shell_modal",
+            open: |app, _| {
+                app.shells_browse();
+            },
+            shown: |app| app.shell_modal.is_open(),
+        },
+        Surface {
+            name: "peer_manager",
+            open: |app, _| app.open_peer_manager(PeerView::Sessions),
+            shown: |app| app.peer_manager.is_open(),
+        },
+        Surface {
+            name: "workflow_inspector",
+            open: |app, _| {
+                let _ = app.workflow_inspector.open(Vec::new(), None);
+            },
+            shown: |app| app.workflow_inspector.is_open(),
+        },
+        Surface {
+            name: "workflow_catalog_picker",
+            open: |app, _| app.workflow_catalog_picker.open(),
+            shown: |app| app.workflow_catalog_picker.is_open(),
+        },
+        Surface {
+            name: "automation_inspector",
+            open: |app, _| {
+                let _ = app
+                    .automation_inspector
+                    .open(Arc::new(AutomationState::default()), None);
+            },
+            shown: |app| app.automation_inspector.is_open(),
+        },
+        Surface {
+            name: "session_picker",
+            open: |app, _| open_repeat_test_session_picker(app),
+            shown: |app| app.session_picker.is_open(),
+        },
+        Surface {
+            name: "session_relocation_picker",
+            open: |app, _| open_relocation_picker(app),
+            shown: |app| app.session_relocation_picker.is_open(),
+        },
+        Surface {
+            name: "worktree_picker",
+            open: |app, _| {
+                let cwd = Path::new(&app.state.session.cwd).to_path_buf();
+                let overview = WorktreeOverview {
+                    session: app.state.session.id,
+                    cwd: cwd.clone(),
+                    current: cwd.clone(),
+                    main_root: cwd,
+                    checkouts: Vec::new(),
+                    dirty: false,
+                    host: None,
+                };
+                app.open_worktrees(overview, WorktreeView::List);
+            },
+            shown: |app| app.worktree_picker.is_open(),
+        },
+    ];
+
+    fn open_workbench(app: &mut App) {
+        press_chord(app, chord::WORKBENCH);
+    }
+
+    fn open_permission(app: &mut App) {
+        app.permission_prompt.open(
+            PERMISSION_ID.into(),
+            ToolKey::native(PERMISSION_TOOL),
+            vec![PERMISSION_COMMAND.into()],
+            None,
+        );
+    }
+
+    fn open_stream(app: &mut App) {
+        let (tx, rx) = flume::unbounded();
+        let (trigger, _cancel) = caudra_agent::CancelToken::new();
+        app.stream_modal.open(
+            STREAM_TITLE,
+            STREAM_QUESTION.into(),
+            StreamFooter::FollowUp,
+            rx,
+            trigger,
+        );
+        tx.send(StreamEvent::TextDelta(STREAM_ANSWER.into()))
+            .unwrap();
+    }
+
+    fn open_float(app: &mut App, held: &mut Held) {
+        let (event_tx, _event_rx) = flume::bounded::<caudra_lua::WinEvent>(FLOAT_CHANNEL);
+        let (cmd_tx, cmd_rx) = flume::bounded::<caudra_lua::WinCommand>(FLOAT_CHANNEL);
+        app.float_mgr.open(
+            Arc::new(caudra_agent::SharedBuf::new()),
+            caudra_lua::FloatConfig::default(),
+            true,
+            event_tx,
+            cmd_rx,
+        );
+        held.push(Box::new(cmd_tx));
+    }
+
+    fn draw(app: &mut App) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        terminal.draw(|frame| app.view(frame)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// Cells the terminal will draw that `offends`. The cells a wide glyph
+    /// covers are never drawn, so whatever they hold does not count.
+    fn cells(buffer: &Buffer, offends: impl Fn(&Cell) -> bool) -> Vec<Position> {
+        let mut found = Vec::new();
+        for y in 0..buffer.area.height {
+            let mut covered = 0;
+            for x in 0..buffer.area.width {
+                let cell = &buffer[(x, y)];
+                if covered > 0 {
+                    covered -= 1;
+                    continue;
+                }
+                covered = cell.symbol().width().saturating_sub(1);
+                if cell.diff_option != CellDiffOption::Skip && offends(cell) {
+                    found.push(Position::new(x, y));
+                }
+            }
+        }
+        found
+    }
+
+    fn in_terminal_colours(cell: &Cell) -> bool {
+        cell.fg == Color::Reset || cell.bg == Color::Reset
+    }
+
+    /// The previous theme's surfaces and text, which no cell should still wear.
+    fn previous_colours(previous: &Theme) -> (Vec<Color>, Color) {
+        let backgrounds = [
+            previous.surface_style(),
+            previous.panel_style(),
+            previous.element_style(),
+            previous.user_message_style(),
+        ]
+        .iter()
+        .filter_map(|style| style.bg)
+        .collect();
+        (backgrounds, previous.foreground)
+    }
+
+    fn report(
+        failures: &mut Vec<String>,
+        surface: &str,
+        theme: &str,
+        problem: &str,
+        at: &[Position],
+    ) {
+        if let Some(first) = at.first() {
+            let shown: Vec<_> = at.iter().take(REPORTED_CELLS).collect();
+            failures.push(format!(
+                "{surface} in {theme} {problem}: {} cells, first {shown:?} (row {})",
+                at.len(),
+                first.y
+            ));
+        }
+    }
+
+    #[test_case(DARK, LIGHT; "dark_to_light")]
+    #[test_case(LIGHT, DARK; "light_to_dark")]
+    fn every_surface_draws_in_the_theme_it_shows(from: &str, to: &str) {
+        let (old_backgrounds, old_foreground) =
+            previous_colours(&theme::load_by_name(from).unwrap());
+        let mut failures = Vec::new();
+        for surface in SURFACES {
+            theme::set(theme::load_by_name(from).unwrap());
+            let mut app = test_app();
+            let mut held = Held::new();
+            (surface.open)(&mut app, &mut held);
+            assert!((surface.shown)(&app), "{}: {NOT_SHOWN}", surface.name);
+
+            let before = draw(&mut app);
+            let reset = cells(&before, in_terminal_colours);
+            report(&mut failures, surface.name, from, TERMINAL_COLOURS, &reset);
+
+            theme::set(theme::load_by_name(to).unwrap());
+            let _ = app.tick();
+            let after = draw(&mut app);
+            let reset = cells(&after, in_terminal_colours);
+            report(&mut failures, surface.name, to, TERMINAL_COLOURS, &reset);
+            let stale = cells(&after, |cell| {
+                old_backgrounds.contains(&cell.bg) || cell.fg == old_foreground
+            });
+            report(&mut failures, surface.name, to, STALE_THEME, &stale);
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn every_overlay_has_a_surface() {
+        let overlays = test_app().overlays().len();
+        let mut covered = BTreeSet::new();
+        for surface in SURFACES {
+            let mut app = test_app();
+            (surface.open)(&mut app, &mut Held::new());
+            covered.extend(
+                app.overlays()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, overlay)| overlay.is_open())
+                    .map(|(index, _)| index),
+            );
+        }
+        let missing: Vec<_> = (0..overlays)
+            .filter(|index| !covered.contains(index))
+            .collect();
+        assert!(missing.is_empty(), "{UNCOVERED}: overlays {missing:?}");
+    }
+}

@@ -167,6 +167,10 @@ impl App {
             ..body
         };
         frame.render_widget(Clear, area);
+        frame.render_widget(
+            Block::default().style(theme::current().surface_style()),
+            area,
+        );
         if self.permission_prompt.is_open() {
             self.permission_prompt.view(frame, area);
         } else {

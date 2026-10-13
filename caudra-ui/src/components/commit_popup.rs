@@ -410,9 +410,10 @@ fn loading_view(frame: &mut Frame, input_area: Rect) -> Option<Rect> {
         height: 1,
     };
     grab_scope!(SCOPE, area);
+    let t = theme::current();
     Clear.render(area, frame.buffer_mut());
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(line, theme::current().spinner))),
+        Paragraph::new(Line::from(Span::styled(line, t.spinner))).style(t.surface_style()),
         area,
     );
     Some(area)

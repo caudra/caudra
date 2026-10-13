@@ -79,7 +79,8 @@ impl Manager {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" Sandboxes · {state} "))
-            .border_style(theme.tool_dim);
+            .border_style(theme.tool_dim)
+            .style(theme.surface_style());
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let hint_rows = self.footer();

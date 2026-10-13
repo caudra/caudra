@@ -535,6 +535,7 @@ impl PermissionPrompt {
         let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         self.scroll.update_dimensions(total, body_area.height);
         let mut buffer = Buffer::empty(Rect::new(0, 0, body_area.width, total));
+        buffer.set_style(buffer.area, t.surface_style());
         for (y, line) in lines.iter().enumerate() {
             buffer.set_line(0, y as u16, line, body_area.width);
         }
@@ -671,6 +672,7 @@ impl PermissionPrompt {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(t.panel_border)
+            .style(t.surface_style())
             .title_top(Line::styled(format!(" {} ", self.title()), t.panel_title));
         let place = self.place();
         if !place.is_empty() {
