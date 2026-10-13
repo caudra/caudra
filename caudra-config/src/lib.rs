@@ -1459,6 +1459,7 @@ pub struct AgentFileConfig {
     pub todo_reminder: Option<bool>,
     pub work_nudge_compactions: Option<u32>,
     pub task_execution: Option<ExecutionMode>,
+    pub task_model_choice: Option<bool>,
     pub shell_execution: Option<ExecutionMode>,
     pub shell_async_threshold_secs: Option<u64>,
     pub generate_titles: Option<bool>,
@@ -1501,6 +1502,7 @@ impl AgentFileConfig {
             todo_reminder,
             work_nudge_compactions,
             task_execution,
+            task_model_choice,
             shell_execution,
             shell_async_threshold_secs,
             generate_titles,
@@ -2706,6 +2708,12 @@ pub struct AgentConfig {
     #[config(default = ExecutionMode::Auto, ty = "string", default_doc = "auto", desc = "Task delivery: sync waits for the completed result, auto lets the model choose, async returns an admission receipt")]
     pub task_execution: ExecutionMode,
 
+    #[config(
+        default = true,
+        desc = "Let the main agent choose a model and reasoning level for each `task` call, such as when you ask it to run work on a named model. When off, `task` has no `model` or `thinking` argument and tasks run on the Subagent model or a profile's pin"
+    )]
+    pub task_model_choice: bool,
+
     #[config(default = ExecutionMode::Auto, ty = "string", default_doc = "auto", desc = "Shell delivery: sync waits for termination, auto routes by requested timeout, async returns an admission receipt")]
     pub shell_execution: ExecutionMode,
 
@@ -2836,6 +2844,7 @@ impl AgentConfig {
             post_compaction_instructions: file.post_compaction_instructions,
             compaction_requirements: file.compaction_requirements.unwrap_or(true),
             task_execution: file.task_execution.unwrap_or_default(),
+            task_model_choice: file.task_model_choice.unwrap_or(true),
             shell_execution: file.shell_execution.unwrap_or_default(),
             shell_async_threshold_secs: file
                 .shell_async_threshold_secs
@@ -4458,6 +4467,7 @@ mod tests {
     const CUSTOM_BACKGROUND_REMINDER_TURNS: u32 = 13;
     const UNSIGNED_REMINDER_ERROR: &str = "expected u32";
     const TODO_REMINDER_FIELD: &str = "todo_reminder";
+    const TASK_MODEL_CHOICE_FIELD: &str = "task_model_choice";
     const WORK_NUDGE_FIELD: &str = "work_nudge_compactions";
     const BOOLEAN_EXPECTED_ERROR: &str = "expected a boolean";
     const SHELL_THRESHOLD_FIELD: &str = "shell_async_threshold_secs";
@@ -5902,6 +5912,36 @@ mod tests {
         raw.merge(layer(overlay));
         assert_eq!(
             raw.into_config(false).unwrap().agent.todo_reminder,
+            expected
+        );
+    }
+
+    #[test_case("", true ; "enabled_by_default")]
+    #[test_case("task_model_choice = false", false ; "disabled")]
+    fn task_model_choice_config(source: &str, expected: bool) {
+        let raw: RawConfig = toml::from_str(&format!("[agent]\n{source}")).unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert_eq!(config.agent.task_model_choice, expected);
+        assert_eq!(
+            serde_json::to_value(&config.agent).unwrap()[TASK_MODEL_CHOICE_FIELD],
+            expected
+        );
+    }
+
+    #[test_case(Some(false), None, false ; "omitted_overlay_keeps_disabled")]
+    #[test_case(None, Some(false), false ; "overlay_disables")]
+    fn task_model_choice_config_merge(base: Option<bool>, overlay: Option<bool>, expected: bool) {
+        let layer = |task_model_choice| RawConfig {
+            agent: AgentFileConfig {
+                task_model_choice,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut raw = layer(base);
+        raw.merge(layer(overlay));
+        assert_eq!(
+            raw.into_config(false).unwrap().agent.task_model_choice,
             expected
         );
     }

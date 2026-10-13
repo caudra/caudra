@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_lock::Mutex as AsyncMutex;
 use caudra_config::ProfileToolPolicy;
@@ -18,7 +18,8 @@ use serde_json::{Value as JsonValue, json};
 use tracing::info;
 
 use caudra_providers::model::{Model, ModelPurpose};
-use caudra_providers::model_registry::Binding;
+use caudra_providers::model_lookup::{ModelLookupError, find_model};
+use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider;
 use caudra_providers::{
     CacheKey, HistoryItem, Message, ThinkingConfig, TokenUsage, add_cost, expand_message,
@@ -28,6 +29,7 @@ use caudra_storage::{
     decision_log::DecisionEffect,
     id::CaudraId,
     sessions::{RuntimeRetry, SessionDatabase},
+    thinking::StoredThinking,
     tool_outputs::ToolOutputStore,
 };
 
@@ -85,6 +87,8 @@ const ROUTED: &str = "routed to";
 const ROUTING_FALLBACK: &str = "kept the default subagent model";
 const BASELINE_LABEL: &str = "baseline";
 const CHOSEN_LABEL: &str = "chosen";
+const MODEL_SPEC_SEPARATOR: char = '/';
+const LIVE_MODEL_LISTING_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Forwards subagent events to the parent, stamped with the subagent identity.
 /// Usage takes two paths: live on the tool header while the run goes on (last
@@ -521,6 +525,19 @@ impl Subagent {
         self.closed
     }
 
+    pub fn model_spec(&self) -> String {
+        self.params.model.spec()
+    }
+
+    /// The level this session's requests carry, snapped to its model. `None`
+    /// when the model cannot reason at all.
+    pub fn effective_thinking(&self) -> Option<String> {
+        self.params
+            .model
+            .supports_thinking()
+            .then(|| self.thinking.resolve(&self.params.model).to_string())
+    }
+
     /// Tokens every prompt of this session has consumed so far.
     pub fn usage(&self) -> TokenUsage {
         self.usage
@@ -620,12 +637,8 @@ impl Subagent {
                 task_id: self.task_id.clone(),
                 name: self.name.clone(),
                 prompt: message.clone(),
-                model: Some(self.params.model.spec()),
-                thinking: self
-                    .params
-                    .model
-                    .supports_thinking()
-                    .then(|| self.thinking.resolve(&self.params.model).to_string()),
+                model: Some(self.model_spec()),
+                thinking: self.effective_thinking(),
                 fast: self.fast,
                 answer_tx: self.answer_tx.take(),
                 steer_tx: self.steer_tx.take(),
@@ -782,6 +795,23 @@ impl TaskIdentity {
     }
 }
 
+/// What the caller asked to run a task on. A chosen model or level outranks a
+/// profile's pin, which in turn outranks a job.
+#[derive(Debug, Clone, Default)]
+pub struct TaskModel {
+    /// Which model job runs this one task, when the caller knows what kind of
+    /// work it is, as a workflow script does. A profile that pins
+    /// `subagent_model` still wins, because the user configured that and the
+    /// caller only asked for a job. Not persisted with the task, so a
+    /// continuation resolves the model the ordinary way.
+    pub job: Option<ModelPurpose>,
+    /// A model as someone named it: an exact `provider/model` spec or a short
+    /// name such as `sonnet`. Stored with the task once resolved.
+    pub name: Option<String>,
+    /// Stored with the task as asked, and snapped to the model per request.
+    pub thinking: Option<StoredThinking>,
+}
+
 /// A `task` call: the profile may override the Subagent model and thinking;
 /// prompt, tools, and mode otherwise come from task policy.
 pub struct TaskOptions {
@@ -789,11 +819,7 @@ pub struct TaskOptions {
     pub task_id: TaskIdentity,
     pub profile: Option<String>,
     pub mode: Option<SubagentTaskMode>,
-    /// Which model job runs this one task, when the caller knows what kind of
-    /// work it is. A profile that pins `subagent_model` still wins, because the
-    /// user configured that and the caller only asked for a job. Not persisted
-    /// with the task, so a continuation resolves the model the ordinary way.
-    pub model_job: Option<ModelPurpose>,
+    pub model: TaskModel,
     /// The prompt the task will be sent, read only by subagent routing, which
     /// sees a redacted excerpt of it.
     pub routing_prompt: Option<String>,
@@ -826,48 +852,43 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         mode: inherited_mode(&ctx.mode),
         ..SubagentTaskSpec::default()
     };
+    let chosen_model = match opts.model.name.as_deref() {
+        Some(name) => Some(resolve_task_model(ctx, name).await?),
+        None => None,
+    };
+    let candidate = SubagentTaskSpecCandidate {
+        profile_name: opts.profile,
+        mode: opts.mode,
+        model: chosen_model,
+        thinking: opts.model.thinking,
+    };
     let (task_id, history_lease) = match opts.task_id {
         TaskIdentity::Continue(_) => (
             ids.task_id.clone(),
             ctx.subagent_history
-                .continue_task_with_defaults(
-                    &ids.task_id,
-                    SubagentTaskSpecCandidate {
-                        profile_name: opts.profile,
-                        mode: opts.mode,
-                    },
-                    default_spec,
-                )
+                .continue_task_with_defaults(&ids.task_id, candidate, default_spec)
                 .map_err(|error| error.to_string())?,
         ),
         TaskIdentity::Exact(_) | TaskIdentity::Fresh(_) => {
-            let spec = SubagentTaskSpec {
-                profile_name: opts.profile.unwrap_or(default_spec.profile_name),
-                mode: opts.mode.unwrap_or(default_spec.mode),
-                ..SubagentTaskSpec::default()
-            };
             let lease = ctx
                 .subagent_history
-                .reserve_with_spec(ids.task_id.clone(), spec)
+                .reserve_with_spec(ids.task_id.clone(), candidate.or_defaults(default_spec))
                 .map_err(|error| error.to_string())?;
             (ids.task_id.clone(), lease)
         }
         TaskIdentity::Reserved(lease) => {
-            let spec = lease.spec().cloned().unwrap_or_else(|| SubagentTaskSpec {
-                profile_name: opts.profile.unwrap_or(default_spec.profile_name),
-                mode: opts.mode.unwrap_or(default_spec.mode),
-                ..SubagentTaskSpec::default()
-            });
+            let spec = lease
+                .spec()
+                .cloned()
+                .unwrap_or_else(|| candidate.or_defaults(default_spec));
             (lease.task_id().to_owned(), lease.with_spec(spec))
         }
         TaskIdentity::Derive => {
-            let spec = SubagentTaskSpec {
-                profile_name: opts.profile.unwrap_or(default_spec.profile_name),
-                mode: opts.mode.unwrap_or(default_spec.mode),
-                ..SubagentTaskSpec::default()
-            };
             let lease = reserve_task_identity_async(ctx, &opts.name).await?;
-            (lease.task_id().to_owned(), lease.with_spec(spec))
+            (
+                lease.task_id().to_owned(),
+                lease.with_spec(candidate.or_defaults(default_spec)),
+            )
         }
     };
     let spec = history_lease
@@ -885,12 +906,20 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         &ctx.model_policy,
         ctx.timeouts,
     );
-    ctx.prompt_profiles
+    let catalog_profile = ctx
+        .prompt_profiles
         .resolve(Some(&spec.profile_name))
         .map_err(|error| error.to_string())?;
-    let profile = bindings
-        .resolve(&spec.profile_name)
-        .map_err(|error| error.to_string())?;
+    // A task that chose its own model or level never runs the profile on the
+    // Subagent model, so that model cannot make the profile unavailable.
+    let chosen = spec.model.is_some() || spec.thinking.is_some();
+    let profile = if chosen {
+        catalog_profile
+    } else {
+        bindings
+            .resolve(&spec.profile_name)
+            .map_err(|error| error.to_string())?
+    };
 
     let vars = ctx.task_environment.clone().set(
         "{task_system_prompt_profiles}",
@@ -905,25 +934,33 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
             smol::unblock(move || crate::agent::load_instruction_text(&cwd)).await
         }
     };
-    let mut routed = route_subagent(
-        ctx,
-        continuation,
-        profile.as_deref(),
-        opts.model_job,
-        RoutingTask {
-            label: &opts.name,
-            prompt: opts.routing_prompt.as_deref(),
-            mode: spec.mode,
-            profile: (*spec.profile_name != *ctx.default_task_prompt_profile_name)
-                .then_some(spec.profile_name.as_str()),
-        },
-    )
-    .await;
+    let mut routed = match spec.model {
+        Some(_) => None,
+        None => {
+            route_subagent(
+                ctx,
+                continuation,
+                profile.as_deref(),
+                opts.model.job,
+                RoutingTask {
+                    label: &opts.name,
+                    prompt: opts.routing_prompt.as_deref(),
+                    mode: spec.mode,
+                    profile: (*spec.profile_name != *ctx.default_task_prompt_profile_name)
+                        .then_some(spec.profile_name.as_str()),
+                },
+            )
+            .await
+        }
+    };
+    let chosen_binding = spec.model.clone().map(Binding::Exact);
     let asked = opts
-        .model_job
+        .model
+        .job
         .or_else(|| routed.as_ref().map(|route| route.purpose))
         .map(Binding::Same);
-    let model_binding = subagent_model_binding(profile.as_deref(), asked.as_ref());
+    let model_binding =
+        subagent_model_binding(chosen_binding.as_ref(), profile.as_deref(), asked.as_ref());
     let baseline = routed
         .as_ref()
         .and_then(|_| inspected_subagent_model(ctx, None));
@@ -941,14 +978,21 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
     };
     announce_model(ctx, &model);
 
-    let thinking = profile
-        .as_deref()
-        .and_then(|profile| profile.subagent_thinking().cloned())
+    let thinking = spec
+        .thinking
+        .clone()
+        .or_else(|| {
+            profile
+                .as_deref()
+                .and_then(|profile| profile.subagent_thinking().cloned())
+        })
         .map(ThinkingConfig::from)
         .unwrap_or_else(|| ctx.opts.thinking.clone());
-    if profile.as_ref().is_some_and(|profile| {
-        profile.subagent_model().is_some() || profile.subagent_thinking().is_some()
-    }) && let Err(error) = thinking.resolve_exact(&model)
+    if !chosen
+        && profile.as_ref().is_some_and(|profile| {
+            profile.subagent_model().is_some() || profile.subagent_thinking().is_some()
+        })
+        && let Err(error) = thinking.resolve_exact(&model)
     {
         return Err(format!(
             "system prompt profile {:?} is unavailable for subagents: thinking {thinking} is incompatible with model {:?}: {error}",
@@ -1495,15 +1539,67 @@ pub(crate) fn subagent_job(response: &DecisionResponse, threshold: f64) -> Optio
     }
 }
 
-/// A profile pin wins over the job the caller named: the user chose the model,
-/// the caller only said what kind of work this is.
+/// A model chosen for this one task wins over a profile pin, which wins over
+/// the job the caller named: the pin is a default the user configured, the
+/// choice is what was asked for now, and a job only says what kind of work
+/// this is.
 fn subagent_model_binding<'a>(
+    chosen: Option<&'a Binding>,
     profile: Option<&'a SystemPromptProfile>,
     asked: Option<&'a Binding>,
 ) -> Option<&'a Binding> {
-    profile
-        .and_then(SystemPromptProfile::subagent_model)
+    chosen
+        .or_else(|| profile.and_then(SystemPromptProfile::subagent_model))
         .or(asked)
+}
+
+/// The exact spec a task's `model` names among the models this session may
+/// use, preferring the providers it already runs on. The models the session
+/// runs and binds always count. A miss among the models known offline asks
+/// the providers for their live lists, which is where a server's own models,
+/// such as a local `qwen3.8-27b`, come from. A qualified spec nothing lists is
+/// taken as written when it resolves, so an unlisted model id stays reachable.
+async fn resolve_task_model(ctx: &ToolContext, name: &str) -> Result<String, String> {
+    let policy = Arc::clone(&ctx.model_policy);
+    let in_use: Vec<String> = [ctx.model.spec(), ctx.chat_model.spec()]
+        .into_iter()
+        .chain(ModelPurpose::ALL.into_iter().filter_map(|purpose| {
+            match model_registry::binding(purpose)? {
+                Binding::Exact(spec) => Some(spec),
+                Binding::Same(_) => None,
+            }
+        }))
+        .filter(|spec| policy.allows(spec))
+        .collect();
+    let preferred: Vec<&str> = in_use
+        .iter()
+        .filter_map(|spec| Some(spec.split_once(MODEL_SPEC_SEPARATOR)?.0))
+        .collect();
+    let name = name.trim().to_owned();
+    let mut candidates = {
+        let policy = Arc::clone(&policy);
+        smol::unblock(move || provider::delegable_model_specs(&policy)).await
+    };
+    candidates.extend(in_use.iter().cloned());
+    candidates.sort_unstable();
+    candidates.dedup();
+    match find_model(&name, &candidates, &preferred) {
+        Err(ModelLookupError::NotFound { .. }) => {}
+        result => return result.map_err(|error| error.to_string()),
+    }
+    candidates.extend(provider::listed_model_specs(&policy, LIVE_MODEL_LISTING_DEADLINE).await);
+    candidates.sort_unstable();
+    candidates.dedup();
+    let result = find_model(&name, &candidates, &preferred);
+    if matches!(result, Err(ModelLookupError::NotFound { .. }))
+        && name.contains(MODEL_SPEC_SEPARATOR)
+    {
+        let written = name.clone();
+        if smol::unblock(move || Model::from_spec_with_policy(&written, &policy).is_ok()).await {
+            return Ok(name);
+        }
+    }
+    result.map_err(|error| error.to_string())
 }
 
 async fn resolve_provider(
@@ -1727,7 +1823,6 @@ mod tests {
     use caudra_storage::decision_log::{DecisionLabel, DecisionLog};
     use caudra_storage::now_epoch;
     use serde_json::json;
-    use std::time::Duration;
 
     use super::*;
     use crate::agent::LoadedInstructions;
@@ -1761,9 +1856,11 @@ mod tests {
     const ROUTING_TASK: &str = "Rename a variable";
     const ROUTING_BASELINE: &str = "anthropic/claude-sonnet-4-6";
     const ROUTING_FAST: &str = "anthropic/claude-haiku-4-5";
+    const ROUTING_BASELINE_NAME: &str = "sonnet 4.6";
     const ROUTING_PROFILE: &str = "security";
     const ROUTING_SECRET: &str = "do-not-send-this-value";
     const FAST_LEVELS: [f64; 4] = [0.6, 0.35, 0.05, 0.0];
+    const CHOSEN_THINKING: &str = "high";
     const ROUTING_ROUNDS: usize = 2;
     const LONG_LABEL_WORDS: usize = 140;
     const LONG_PROMPT_WORDS: usize = 400;
@@ -2054,13 +2151,7 @@ mod tests {
                     }]);
                 options.task_id = TaskIdentity::Reserved(
                     ctx.subagent_history
-                        .continue_task_with(
-                            PARENT_ID,
-                            SubagentTaskSpecCandidate {
-                                profile_name: None,
-                                mode: None,
-                            },
-                        )
+                        .continue_task_with(PARENT_ID, SubagentTaskSpecCandidate::default())
                         .unwrap(),
                 );
             }
@@ -2109,6 +2200,55 @@ mod tests {
                 }
                 futures_lite::future::yield_now().await;
             }
+        });
+    }
+
+    /// Routing would move this task to the Fast model; a model the caller
+    /// chose is never second-guessed, so the engine is not even asked. The
+    /// session's own model counts as usable even with no provider signed in.
+    #[test_case(ROUTING_BASELINE ; "exact_spec")]
+    #[test_case(ROUTING_BASELINE_NAME ; "short_name")]
+    fn a_chosen_model_and_thinking_run_the_task_unrouted(name: &str) {
+        smol::block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let mut ctx = routing_context();
+            ctx.model = Arc::new(Model::from_spec(ROUTING_BASELINE).unwrap());
+            ctx.chat_model = Arc::new(Model::from_spec(ROUTING_FAST).unwrap());
+            let calls = Arc::new(AtomicUsize::new(0));
+            ctx.permissions.set_decisions(Some(routing_decisions(
+                &directory,
+                FeatureMode::Enforce,
+                RoutingEngine {
+                    levels: FAST_LEVELS,
+                    fail: false,
+                    calls: Arc::clone(&calls),
+                },
+            )));
+            let thinking = StoredThinking::Effort {
+                level: CHOSEN_THINKING.into(),
+            };
+            let mut options = task_options(None);
+            options.name = ROUTING_TASK.into();
+            options.model = TaskModel {
+                name: Some(name.into()),
+                thinking: Some(thinking.clone()),
+                ..TaskModel::default()
+            };
+
+            let mut subagent = open_task(&ctx, options).await.unwrap();
+
+            assert_eq!(subagent.model_spec(), ROUTING_BASELINE);
+            assert_eq!(subagent.thinking, ThinkingConfig::from(thinking.clone()));
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            let spec = subagent
+                .history_lease
+                .as_ref()
+                .and_then(SubagentHistoryLease::spec)
+                .cloned()
+                .expect("an opened task carries its specification");
+            assert_eq!(spec.model.as_deref(), Some(ROUTING_BASELINE));
+            assert_eq!(spec.thinking, Some(thinking));
+            subagent.close();
         });
     }
 
@@ -2244,7 +2384,7 @@ mod tests {
             task_id: TaskIdentity::Derive,
             profile: Some(crate::prompt::profile::BUILTIN_PROFILE_NAME.into()),
             mode,
-            model_job: None,
+            model: Default::default(),
             routing_prompt: None,
             local_definitions: Vec::new(),
             local_tools: LocalTools::default(),
@@ -2446,7 +2586,7 @@ mod tests {
                     task_id: TaskIdentity::Derive,
                     profile: Some(crate::prompt::profile::BUILTIN_PROFILE_NAME.into()),
                     mode: Some(mode),
-                    model_job: None,
+                    model: Default::default(),
                     routing_prompt: None,
                     local_definitions: Vec::new(),
                     local_tools: LocalTools::default(),
@@ -2490,8 +2630,24 @@ mod tests {
         let asked = model_job.map(Binding::Same);
 
         assert_eq!(
-            subagent_model_binding(Some(&profile), asked.as_ref()),
+            subagent_model_binding(None, Some(&profile), asked.as_ref()),
             Some(&Binding::Exact(PINNED_MODEL_SPEC.into()))
+        );
+    }
+
+    /// The pin is a default and the job a hint; a model chosen for this one
+    /// task is what was asked for now.
+    #[test_case(true, None ; "over_a_pin")]
+    #[test_case(true, Some(ModelPurpose::Fast) ; "over_a_pin_and_a_job")]
+    #[test_case(false, Some(ModelPurpose::Best) ; "over_a_job")]
+    fn a_chosen_model_outranks_the_pin_and_the_job(pinned: bool, model_job: Option<ModelPurpose>) {
+        let profile = pinned.then(|| profile_pinning(Some(PINNED_MODEL_SPEC)));
+        let asked = model_job.map(Binding::Same);
+        let chosen = Binding::Exact(PLAN_MODEL_SPEC.into());
+
+        assert_eq!(
+            subagent_model_binding(Some(&chosen), profile.as_deref(), asked.as_ref()),
+            Some(&chosen)
         );
     }
 
@@ -2502,7 +2658,7 @@ mod tests {
         let asked = Some(Binding::Same(ModelPurpose::Fast));
 
         assert_eq!(
-            subagent_model_binding(profile.as_deref(), asked.as_ref()),
+            subagent_model_binding(None, profile.as_deref(), asked.as_ref()),
             Some(&Binding::Same(ModelPurpose::Fast))
         );
     }
@@ -2829,7 +2985,7 @@ mod tests {
                     task_id: TaskIdentity::Derive,
                     profile: Some(crate::prompt::profile::BUILTIN_PROFILE_NAME.into()),
                     mode: Some(SubagentTaskMode::Plan),
-                    model_job: None,
+                    model: Default::default(),
                     routing_prompt: None,
                     local_definitions: Vec::new(),
                     local_tools: LocalTools::default(),

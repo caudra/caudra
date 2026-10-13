@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -575,6 +576,34 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
         }
     }
     specs.retain(|spec| policy.allows(spec));
+    specs
+}
+
+/// What a task may be delegated to: [`available_model_specs`] plus every model
+/// a live listing registered this session, within `policy`.
+pub fn delegable_model_specs(policy: &ModelPolicy) -> Vec<String> {
+    let mut specs = available_model_specs(policy);
+    let mut seen: HashSet<String> = specs.iter().cloned().collect();
+    specs.extend(
+        crate::model_registry::known_specs()
+            .into_iter()
+            .filter(|spec| policy.allows(spec) && seen.insert(spec.clone())),
+    );
+    specs
+}
+
+/// Every model the configured providers list within `deadline`, asked live
+/// as `caudra models` does. A provider still answering at the deadline is
+/// left out, so a slow server cannot hold its caller.
+pub async fn listed_model_specs(policy: &ModelPolicy, deadline: Duration) -> Vec<String> {
+    let mut specs = Vec::new();
+    smol::future::or(
+        fetch_all_models(policy, |batch| specs.extend(batch.models), None),
+        async {
+            smol::Timer::after(deadline).await;
+        },
+    )
+    .await;
     specs
 }
 

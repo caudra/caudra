@@ -31,7 +31,7 @@ use tracing::{info, warn};
 use super::manager::CALL_LABEL_FIELD;
 use super::state::{Published, now_secs, publish, snapshot_from_row, stored_status};
 use super::store::WorkflowStore;
-use crate::agent::subagent::TaskIdentity;
+use crate::agent::subagent::{TaskIdentity, TaskModel};
 use crate::agent::task_runner::{ModeResolver, TaskOutcome, TaskRequest, TaskRunner};
 use crate::cancel::{CancelToken, CancelTrigger};
 use crate::decisions::{DecisionContext, Decisions};
@@ -699,7 +699,10 @@ impl Driver {
                 CapabilityMode::Build => SubagentTaskMode::Build,
             }),
             profile: request.profile.clone(),
-            model_job: request.model_job.and_then(model_purpose),
+            model: TaskModel {
+                job: request.model_job.and_then(model_purpose),
+                ..TaskModel::default()
+            },
             output_schema: request.output_schema.clone(),
             call_id: format!("{}{CALL_ID_SEPARATOR}{}", self.snapshot.run_id, key.0),
             provenance: Some(provenance.clone()),

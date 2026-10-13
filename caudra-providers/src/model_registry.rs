@@ -171,6 +171,19 @@ pub fn smallest_known(provider: &str) -> Option<String> {
     read().smallest_known(provider)
 }
 
+/// `provider/model` specs of every model a provider listing registered.
+pub fn known_specs() -> Vec<String> {
+    read()
+        .known_models
+        .iter()
+        .flat_map(|(provider, models)| {
+            models
+                .iter()
+                .map(move |model| format!("{provider}/{}", model.id))
+        })
+        .collect()
+}
+
 pub fn set_known_models(provider: &str, models: Vec<ModelInfo>) {
     write().set_known_models(provider, models);
 }

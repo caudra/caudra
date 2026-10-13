@@ -11390,6 +11390,48 @@ fn resolve_or_create_chat_sets_model_id_and_annotation() {
     );
 }
 
+/// An admitted job opens its chat before the subagent has resolved a model,
+/// so the model it later reports must still reach the footer and the card.
+#[test_case(false ; "foreground_task")]
+#[test_case(true ; "admitted_job")]
+fn a_task_chat_takes_the_model_its_subagent_reports(admitted: bool) {
+    const MODEL: &str = "openai/gpt-6.1-sol";
+    const THINKING: &str = "low";
+    const LABEL: &str = "research";
+
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    if admitted {
+        let card = serde_json::from_value(serde_json::json!({
+            "task_id": TASK_ID, "invocation_id": "invocation", "call_id": TASK_ID,
+            "root_call_id": TASK_ID, "label": LABEL, "state": "queued",
+            "background": true, "mode": "plan", "generation": 1,
+            "created_at": 1, "updated_at": 1
+        }))
+        .unwrap();
+        app.update(agent_msg(AgentEvent::TaskAdmitted(card)));
+    }
+    let mut info = subagent_info(TASK_ID, LABEL);
+    info.model = Some(MODEL.into());
+    info.thinking = Some(THINKING.into());
+    for text in ["4", "2"] {
+        app.update(subagent_msg_with_info(
+            AgentEvent::TextDelta { text: text.into() },
+            info.clone(),
+        ));
+    }
+
+    assert_eq!(app.chats.len(), 2);
+    assert_eq!(app.chats[1].model_id.as_deref(), Some(MODEL));
+    assert_eq!(app.chats[1].thinking.as_deref(), Some(THINKING));
+    assert_eq!(
+        app.chats[0].message_at(0).unwrap().annotation.as_deref(),
+        Some(MODEL)
+    );
+}
+
 #[test]
 fn help_toggles_modal() {
     let mut app = test_app();

@@ -11,7 +11,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.8 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.8)
 
-Preview 8 lets the experimental decision engine rerank memory notes, tool search, retained tool output, and code context, shows in the transcript what each decision feature changed, gives workflows a `rerank()` function, opens forks in a new Herdr or Orca tab, names tabs after the session, makes the wheel scroll lists instead of moving their selection, and stops pending reverts in a destination directory from blocking session moves.
+Preview 8 lets the experimental decision engine rerank memory notes, tool search, retained tool output, and code context, shows in the transcript what each decision feature changed, gives workflows a `rerank()` function, runs a task on the model you name, opens forks in a new Herdr or Orca tab, names tabs after the session, makes the wheel scroll lists instead of moving their selection, and stops pending reverts in a destination directory from blocking session moves.
 
 > **Important**
 >
@@ -31,12 +31,17 @@ Preview 8 lets the experimental decision engine rerank memory notes, tool search
 - **Decision rows in the transcript.** When a decision feature changes what happens, the transcript shows one row that names the feature and what it did, such as `code_context · moved 3 of 12 rows up`, placed after the tool call or at the turn it affected. A row also appears when the engine fails and the default applies, once per feature until the engine answers again, and a dim `shadow` row shows what a feature in shadow mode would have done. Click a row to see the candidates and scores behind it. The rows are saved with the session and return in place when you reopen it. The model never sees them, and `[ui] show_decisions = false` hides them. See [Decision rows](/docs/permissions/#decision-rows-in-the-transcript).
 - **Workflow decisions are labelled.** In `/workflow`, a `decide()` call now reads like `decide: ready, route` and a `rerank()` batch like `rerank: 17 candidates · batch 2 of 2`, instead of a bare call number. Labels hold only question IDs and counts, never the state or candidates.
 
+### Tasks
+
+- **Run a task on a model you name.** Ask for a model, as in "ask opus and sol to review this change", and the main agent starts the task on it, with one task per model when you name several. The `task` tool takes a `model`, either an exact `provider/model` name or a short name such as `opus` or `gpt-6.1-sol` that resolves to the newest match you can use, so `opus` picks `claude-opus-5-5`, and a `thinking` level from `off` to `max`. Both win over a profile's `subagent_model` and `subagent_thinking`, and every result reports the model and level the task ran on. A name that fits several models fails and lists them. `[agent] task_model_choice = false` turns this off. See [Models and reasoning](/docs/commands/#models-and-reasoning).
+
 ### Interface fixes
 
 - **The wheel scrolls lists.** In `/decisions`, `/automations`, `/workflow`, `/peers` and `/messages`, the wheel over the list now scrolls it instead of moving the selection and loading every row it passes. Click a row or use the arrow keys to select one.
 - **`minimal` no longer turns reasoning off.** On a model whose lowest level is `none`, such as several OpenAI models and local servers that declare `none`, asking for `minimal` thinking sent `none` and the model did not reason at all. It now sends the shallowest level the model has, usually `low`. Asking for `off` still sends `none`.
 - **Copilot no longer sends `none` to a model that always reasons.** On Copilot and Copilot Enterprise, thinking `off` on a model that cannot turn reasoning off, such as `gpt-6.1-sol`, could send `none`, and the request failed with `Unsupported value: 'none' is not supported`. Copilot's model list replaced Caudra's own levels for the model, so a list that offered `none`, or offered no levels at all, decided what was sent. Caudra now keeps its own levels when the list offers none, and never sends `none` to a model its table says always reasons. Such a model runs at its lowest level instead. A `none` thinking setting now means the same as `off` on every model.
 - **Custom OpenAI-compatible models without declared levels take no thinking setting.** On an `openai` or `openai-responses` provider in `providers.toml`, a model that declares no `reasoning_options` was offered thinking levels it was never sent, so the footer and task results named a level that did not apply, and an `openai-responses` endpoint was sent the level as typed. Such a model now takes no thinking setting and shows none. Declare its levels with `reasoning_options` to offer them. See [Model defaults](/docs/providers/#model-defaults).
+- **A task's footer names the model it runs on.** The footer of a task's chat could show the main session's model instead of the task's, and the task's card in the transcript then named no model. The footer now shows the model and thinking level the task actually runs on, and the card names that model, including one picked by a profile pin or subagent routing.
 
 ### Sessions
 

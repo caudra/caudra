@@ -34,7 +34,7 @@ use tracing::info;
 use crate::agent::LoadedInstructions;
 use crate::agent::change_recording::ChangeRecorder;
 use crate::agent::run::AgentParams;
-use crate::agent::subagent::{self, STRUCTURED_OUTPUT_TOOL, Subagent, TaskIdentity};
+use crate::agent::subagent::{self, STRUCTURED_OUTPUT_TOOL, Subagent, TaskIdentity, TaskModel};
 use crate::background::JobScope;
 use crate::cancel::{CancelMap, CancelToken};
 use crate::context::ContextPublisher;
@@ -98,10 +98,9 @@ pub struct TaskRequest {
     /// `None` is the parent's default profile for a new task and the stored
     /// profile for a continuation.
     pub profile: Option<String>,
-    /// Which model job runs this task. Reachable from a workflow script, which
-    /// names a job rather than a model, and never from the `task` tool, whose
-    /// API deliberately no longer takes a model.
-    pub model_job: Option<ModelPurpose>,
+    /// What runs this task. A workflow script names a job, never a model, so
+    /// it stays portable; the `task` tool names a model and a level.
+    pub model: TaskModel,
     /// JSON Schema (object) the result must match. When set, `output` is the
     /// validated value the subagent reported through `structured_output`.
     pub output_schema: Option<Value>,
@@ -119,6 +118,13 @@ pub struct TaskOutcome {
     /// What the task ran as once the caller's request was defaulted and capped.
     /// `None` when no session opened.
     pub mode: Option<SubagentTaskMode>,
+    /// The model spec that answered. `None` when no session opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The reasoning level its requests carried, snapped to that model. `None`
+    /// when no session opened or the model cannot reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
     pub success: bool,
     pub cancelled: bool,
     /// The validated structured value under an `output_schema`, else the
@@ -215,7 +221,7 @@ pub async fn run_task(ctx: &ToolContext, request: TaskRequest) -> TaskOutcome {
     let started = Instant::now();
     match PreparedTask::prepare(ctx, request, None).await {
         Ok(task) => task.run(&ctx.cancel).await,
-        Err(message) => finish(started, None, None, 0, Err(message.into())),
+        Err(message) => finish(started, None, 0, Err(message.into())),
     }
 }
 
@@ -274,7 +280,7 @@ impl PreparedTask {
                 task_id: request.task,
                 profile: request.profile,
                 mode,
-                model_job: request.model_job,
+                model: request.model,
                 routing_prompt: request.prompt.clone(),
                 local_definitions,
                 local_tools,
@@ -321,21 +327,14 @@ impl PreparedTask {
     ) -> TaskOutcome {
         let started = self.started;
         let session = &mut self.session;
-        let task_id = session.0.id().to_owned();
-        let effective_mode = session.0.task_mode();
+        let ran_as = RanAs::of(&session.0);
         let permit = cancel.race(permits.acquire_arc()).await;
         let mut verdict = if let Ok(_permit) = permit {
             if let Some(reporter) = &self.reporter
                 && let Err(error) = reporter.running().await
             {
                 session.0.close();
-                return finish(
-                    started,
-                    Some(task_id),
-                    Some(effective_mode),
-                    0,
-                    Err(error.into()),
-                );
+                return finish(started, Some(ran_as), 0, Err(error.into()));
             }
             converse(
                 &mut session.0,
@@ -354,45 +353,62 @@ impl PreparedTask {
             verdict = Err(error.into());
         }
         session.0.close();
-        finish(
-            started,
-            Some(task_id),
-            Some(effective_mode),
-            tokens_used,
-            verdict,
-        )
+        finish(started, Some(ran_as), tokens_used, verdict)
+    }
+}
+
+/// What an opened session ran as once the request was defaulted, capped and
+/// resolved, reported with every outcome so the caller knows which model
+/// answered.
+struct RanAs {
+    task_id: String,
+    mode: SubagentTaskMode,
+    model: String,
+    thinking: Option<String>,
+}
+
+impl RanAs {
+    fn of(session: &Subagent) -> Self {
+        Self {
+            task_id: session.id().to_owned(),
+            mode: session.task_mode(),
+            model: session.model_spec(),
+            thinking: session.effective_thinking(),
+        }
     }
 }
 
 fn finish(
     started: Instant,
-    task_id: Option<String>,
-    mode: Option<SubagentTaskMode>,
+    ran_as: Option<RanAs>,
     tokens_used: u64,
     verdict: Result<Value, Failure>,
 ) -> TaskOutcome {
     let duration_ms = started.elapsed().as_millis() as u64;
-    match verdict {
-        Ok(output) => TaskOutcome {
-            task_id,
-            mode,
-            success: true,
-            cancelled: false,
-            output,
-            error: None,
-            tokens_used,
-            duration_ms,
-        },
-        Err(failure) => TaskOutcome {
-            task_id,
-            mode,
-            success: false,
-            cancelled: failure.cancelled,
-            output: Value::Null,
-            error: Some(failure.message),
-            tokens_used,
-            duration_ms,
-        },
+    let (task_id, mode, model, thinking) = match ran_as {
+        Some(ran_as) => (
+            Some(ran_as.task_id),
+            Some(ran_as.mode),
+            Some(ran_as.model),
+            ran_as.thinking,
+        ),
+        None => (None, None, None, None),
+    };
+    let (success, cancelled, output, error) = match verdict {
+        Ok(output) => (true, false, output, None),
+        Err(failure) => (false, failure.cancelled, Value::Null, Some(failure.message)),
+    };
+    TaskOutcome {
+        task_id,
+        mode,
+        model,
+        thinking,
+        success,
+        cancelled,
+        output,
+        error,
+        tokens_used,
+        duration_ms,
     }
 }
 
@@ -913,7 +929,7 @@ impl TaskRunner for SubagentTaskRunner {
                 .await
             {
                 Ok(ctx) => ctx,
-                Err(message) => return finish(started, None, None, 0, Err(message.into())),
+                Err(message) => return finish(started, None, 0, Err(message.into())),
             };
             run_task(&ctx, request).await
         })
@@ -1967,7 +1983,7 @@ mod tests {
             task,
             mode,
             profile: None,
-            model_job: None,
+            model: Default::default(),
             output_schema: None,
             call_id: CALL_ID.into(),
             provenance: None,
@@ -2581,7 +2597,7 @@ mod tests {
                         task_id: TaskIdentity::Derive,
                         profile: None,
                         mode: None,
-                        model_job: None,
+                        model: Default::default(),
                         routing_prompt: None,
                         local_definitions: Vec::new(),
                         local_tools: LocalTools::default(),
@@ -2657,7 +2673,7 @@ mod tests {
                         task_id: TaskIdentity::Derive,
                         profile: None,
                         mode: None,
-                        model_job: None,
+                        model: Default::default(),
                         routing_prompt: None,
                         local_definitions: Vec::new(),
                         local_tools: LocalTools::default(),
@@ -3006,7 +3022,7 @@ mod tests {
                         task_id: TaskIdentity::Derive,
                         profile: None,
                         mode: None,
-                        model_job: None,
+                        model: Default::default(),
                         routing_prompt: None,
                         local_definitions: Vec::new(),
                         local_tools: LocalTools::default(),
@@ -3067,7 +3083,7 @@ mod tests {
                         task_id: TaskIdentity::Derive,
                         profile: None,
                         mode: None,
-                        model_job: None,
+                        model: Default::default(),
                         routing_prompt: None,
                         local_definitions: Vec::new(),
                         local_tools: LocalTools::default(),

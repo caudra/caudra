@@ -159,7 +159,15 @@ An input box appears while the focused task is running. Press Enter to queue gui
 
 That input box is a full composer. Typing `/` opens the palette, `Ctrl+S` inserts a file path, `Ctrl+X e` edits the draft in the [workbench](/docs/workbench/#plans-memory-notes-and-prompt-drafts), and `Ctrl+V` attaches an image to the guidance. A custom `/project:` or `/user:` command expands its template and steers the focused task rather than the main session.
 
-Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/continue`, `/model`, `/system-prompt`, `/projection`, `/btw`, `/extract`, the `/goal` family, the workflow commands, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/skills`, `/queue`, `/review`, and the stash commands already follow the focused transcript."#;
+Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/continue`, `/model`, `/system-prompt`, `/projection`, `/btw`, `/extract`, the `/goal` family, the workflow commands, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/skills`, `/queue`, `/review`, and the stash commands already follow the focused transcript.
+
+### Models and reasoning
+
+Ask for a model by name and the main agent sets the `model` of its `task` call. For example, "ask opus and sol to review this change" starts one task per model in the same turn, so several models can take one request side by side without a workflow. "Review this with fable at high thinking" sets `thinking` as well.
+
+`model` takes an exact `provider/model` name or a short name such as `opus`, `sonnet 5.5`, or `gpt-6.1-sol`. A short name resolves to the newest matching model you can use, so `opus` picks `claude-opus-5-5` and `opus 4` picks `claude-opus-4-8`. A numbered word answers to its family name too, so `qwen` finds `qwen3.8-27b` rather than one of its fine-tuned variants, which answer to their own names. Caudra first searches the models it knows without a network call, including the ones the session runs on, and asks your providers for their live model lists only when that finds nothing, for up to 15 seconds. When two providers serve a match, a provider the session already uses wins, and otherwise the call fails and names both. A name that fits several different models equally well, such as `claude` for both `claude-opus-5-5` and `claude-sonnet-5-5`, fails and lists them. A name that matches nothing fails and suggests close models. `allowed_models` and `excluded_models` limit the choice as they limit `/model`. `thinking` takes `off` or an effort level from `minimal` to `max`, and snaps to the nearest level the model supports.
+
+A model or level set on the call wins over the profile's `subagent_model` and `subagent_thinking`, and passive subagent routing never moves a task whose model was chosen. Every result reports the model and thinking level the task ran on. A continuation keeps both, and passing a different value fails. The main agent sets them only when you ask. Set `agent.task_model_choice = false` to remove both arguments, so tasks run on the Subagent model or a profile's pin."#;
 
 const SHELLS: &str = r#"## Shell commands
 

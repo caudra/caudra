@@ -777,6 +777,13 @@ pub struct StoredSubagentTaskSpec {
     pub profile_name: String,
     #[serde(default)]
     pub mode: StoredMode,
+    /// The exact model the caller chose for this task. `None` follows the
+    /// session's Subagent model or the profile's pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The reasoning level the caller chose, as asked rather than as snapped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<StoredThinking>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -800,6 +807,8 @@ impl Default for StoredSubagentTaskSpec {
             kind: StoredSubagentKind::Task,
             profile_name: default_subagent_profile_name(),
             mode: StoredMode::default(),
+            model: None,
+            thinking: None,
         }
     }
 }
@@ -1964,6 +1973,29 @@ mod tests {
         snapshot.save(&dir).unwrap();
 
         assert!(session.is_persisted());
+    }
+
+    #[test]
+    fn a_chosen_task_model_and_thinking_round_trip() {
+        const CHOSEN_MODEL: &str = "anthropic/claude-sonnet-5-5";
+        const CHOSEN_LEVEL: &str = "high";
+        let spec = StoredSubagentTaskSpec {
+            model: Some(CHOSEN_MODEL.into()),
+            thinking: Some(StoredThinking::Effort {
+                level: CHOSEN_LEVEL.into(),
+            }),
+            ..subagent_spec()
+        };
+        let restored: StoredSubagentTaskSpec =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(restored, spec);
+    }
+
+    #[test]
+    fn an_unchosen_task_model_stays_out_of_the_stored_spec() {
+        let stored = serde_json::to_value(subagent_spec()).unwrap();
+        assert!(stored.get("model").is_none());
+        assert!(stored.get("thinking").is_none());
     }
 
     #[test]

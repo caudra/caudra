@@ -11,9 +11,10 @@ use caudra_config::{
     AgentConfig, ExecutionMode, effective_shell_execution, effective_task_execution,
     resolve_task_background,
 };
+use caudra_storage::thinking::StoredThinking;
 use serde_json::{Value, json};
 
-use crate::agent::subagent::{self, TaskIdentity};
+use crate::agent::subagent::{self, TaskIdentity, TaskModel};
 pub use crate::agent::task_runner::set_max_concurrent;
 use crate::agent::task_runner::{TaskOutcome, TaskRequest, run_task};
 use crate::prompt::task_execution_guidance;
@@ -42,22 +43,38 @@ Notes:
 1. Use direct tools for small lookups; delegate meaningful bounded work. Use workflows for staged repeatable orchestration.
 2. The agent's result is not visible to the user. Summarize it in your response.
 3. A fresh call gives the subagent no context beyond your prompt. Include the objective, relevant context, allowed scope/files, constraints, verification expectations, and what to report back. It does not automatically receive later user instructions. Write self-contained prose: compress by omitting, never by running words together.
-4. Every admitted task has a task_id. Pass it back after settlement to continue that subagent with its previous messages and tool outputs, sending only the new work. Omit mode and profile when continuing; they stay locked to the original run. Omit prompt too to resume an interrupted subagent that needs no new instruction.
+4. Every admitted task has a task_id. Pass it back after settlement to continue that subagent with its previous messages and tool outputs, sending only the new work. Omit mode, profile, model, and thinking when continuing; they stay locked to the original run. Omit prompt too to resume an interrupted subagent that needs no new instruction.
 5. Tell it to return concise summaries with file:line refs, not full file contents.
 ";
 
+/// Published with `model` and `thinking`, and withdrawn with them when
+/// `agent.task_model_choice` is off.
+const MODEL_CHOICE_GUIDANCE: &str = "Models:
+- Set `model` or `thinking` only when the user names a model or a reasoning level, or asks to compare models. Otherwise omit both, and the task runs on the session's subagent model.
+- Names the user asks to do something, as in \"ask terra and sol\" or \"have opus review this\", are models unless written as @name or called sessions. Start one task per name with `model` set to the name as written. Caudra resolves it, and a name that matches no model fails and lists the models it knows.
+- To send one request to several models, start one task per model in a single `batch` call, each with the same self-contained prompt.
+- Every result reports the model and thinking level that actually ran. Attribute each result to that model.";
+
 const RECEIPT_GUIDANCE: &str = "Reports and the final outcome will arrive automatically, including after you end this turn. Continue independent work, or tell the user what is pending and return control. Do not poll or repeat the delegated work. Admission is not task completion.";
 
-const TASK_METADATA_FORMAT: &str = "<task_metadata>\ntask_id: {task_id}\n{mode}</task_metadata>";
+const TASK_METADATA_FORMAT: &str = "<task_metadata>\ntask_id: {task_id}\n{details}</task_metadata>";
 const TASK_ID_PLACEHOLDER: &str = "{task_id}";
-const MODE_PLACEHOLDER: &str = "{mode}";
+const DETAILS_PLACEHOLDER: &str = "{details}";
 const MODE_METADATA_LINE: &str = "mode: ";
+const MODEL_METADATA_LINE: &str = "model: ";
+const THINKING_METADATA_LINE: &str = "thinking: ";
 const JSON_FENCE_OPEN: &str = "```json\n";
 const JSON_FENCE_CLOSE: &str = "\n```";
 const DESCRIPTION_REQUIRED_ERROR: &str = "description is required";
 const PROMPT_REQUIRED_ERROR: &str = "prompt is required unless task_id is set";
+const MODEL_CHOICE_DISABLED_ERROR: &str = "choosing a task's model or thinking level is turned off (agent.task_model_choice = false); omit model and thinking";
+const MODEL_PROPERTY: &str = "model";
+const THINKING_PROPERTY: &str = "thinking";
 
 const MODES: &[&str] = &["plan", "build"];
+/// `off`, then every effort level `StoredThinking` ranks except the wire
+/// spelling `none`, which `off` already covers.
+const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 static DESCRIPTION_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::String,
@@ -69,7 +86,7 @@ static PROMPT_PARAM: ParamSchema = ParamSchema::Primitive {
 };
 static TASK_ID_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::String,
-    description: "Resume a settled task, not an active one. Continues its existing history with locked mode/profile. Unknown task IDs fail.",
+    description: "Resume a settled task, not an active one. Continues its existing history with locked mode, profile, model, and thinking. Unknown task IDs fail.",
 };
 static MODE_PARAM: ParamSchema = ParamSchema::Enum {
     variants: MODES,
@@ -78,6 +95,14 @@ static MODE_PARAM: ParamSchema = ParamSchema::Enum {
 static PROFILE_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::String,
     description: "System prompt profile. Defaults to the parent profile for a new task; use \"builtin\" explicitly for Caudra's built-in prompt. Omitted continuations retain their stored profile.",
+};
+static MODEL_PARAM: ParamSchema = ParamSchema::Primitive {
+    kind: ParamKind::String,
+    description: "Model for a new task: `provider/model`, or a short name such as `opus`, `sonnet 5.5`, or `gpt-6.1-sol`, resolved to the newest matching model this session can use. Omit it to use the session's subagent model. Omitted continuations keep the stored model.",
+};
+static THINKING_PARAM: ParamSchema = ParamSchema::Enum {
+    variants: THINKING_LEVELS,
+    description: "Reasoning level for a new task, snapped to the nearest level its model supports. Omit it to inherit. Omitted continuations keep the stored level.",
 };
 static OUTPUT_SCHEMA_PARAM: ParamSchema = ParamSchema::Any {
     description: "JSON Schema (object) for the successful final payload. The successful result is returned as validated JSON.",
@@ -92,6 +117,8 @@ static PROPERTIES: &[Property] = &[
     ("task_id", &TASK_ID_PARAM, false, &[]),
     ("mode", &MODE_PARAM, false, &[]),
     ("profile", &PROFILE_PARAM, false, &[]),
+    (MODEL_PROPERTY, &MODEL_PARAM, false, &[]),
+    (THINKING_PROPERTY, &THINKING_PARAM, false, &[]),
     ("output_schema", &OUTPUT_SCHEMA_PARAM, false, &[]),
     ("background", &BACKGROUND_PARAM, false, &[]),
 ];
@@ -138,17 +165,22 @@ pub fn configure_execution(
             continue;
         };
         if let Some(Value::String(description)) = definition.get_mut("description") {
-            for previous in [
+            let model_guidance = format!("\n\n{MODEL_CHOICE_GUIDANCE}");
+            let execution_guidance = [
                 ExecutionMode::Sync,
                 ExecutionMode::Auto,
                 ExecutionMode::Async,
-            ] {
-                let guidance = format!("\n\n{}", task_execution_guidance(&previous));
-                if let Some(offset) = description.find(&guidance) {
+            ]
+            .map(|previous| format!("\n\n{}", task_execution_guidance(&previous)));
+            for guidance in execution_guidance.iter().chain([&model_guidance]) {
+                if let Some(offset) = description.find(guidance.as_str()) {
                     description.replace_range(offset..offset + guidance.len(), "");
                 }
             }
             *description = description.trim_end().into();
+            if config.task_model_choice {
+                description.push_str(&model_guidance);
+            }
             description.push_str("\n\n");
             description.push_str(&task_execution_guidance(mode));
         }
@@ -157,6 +189,15 @@ pub fn configure_execution(
             .and_then(|schema| schema.get_mut("properties"))
             .and_then(Value::as_object_mut)
         {
+            for (name, param) in [
+                (MODEL_PROPERTY, &MODEL_PARAM),
+                (THINKING_PROPERTY, &THINKING_PARAM),
+            ] {
+                match config.task_model_choice {
+                    true => properties.insert(name.into(), to_json_schema(param)),
+                    false => properties.remove(name),
+                };
+            }
             match mode {
                 ExecutionMode::Sync => {
                     properties.remove("background");
@@ -187,7 +228,7 @@ impl Tool for TaskTool {
 
     fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
         Cow::Owned(format!(
-            "{DESCRIPTION}\n\n{}",
+            "{DESCRIPTION}\n{MODEL_CHOICE_GUIDANCE}\n\n{}",
             task_execution_guidance(&ExecutionMode::Auto)
         ))
     }
@@ -224,10 +265,21 @@ impl Tool for TaskTool {
             task_id,
             profile: field("profile"),
             mode: field("mode").map(|mode| parse_mode(&mode)).transpose()?,
+            model: TaskModel {
+                name: field(MODEL_PROPERTY),
+                thinking: field(THINKING_PROPERTY)
+                    .map(|level| parse_thinking(&level))
+                    .transpose()?,
+                ..TaskModel::default()
+            },
             output_schema: input.get("output_schema").cloned(),
             background: input.get("background").and_then(Value::as_bool),
         }))
     }
+}
+
+fn parse_thinking(raw: &str) -> Result<StoredThinking, ParseError> {
+    StoredThinking::parse_setting(raw).map_err(|error| ParseError::custom(error.to_string()))
 }
 
 fn parse_mode(raw: &str) -> Result<SubagentTaskMode, ParseError> {
@@ -246,6 +298,7 @@ struct TaskCall {
     task_id: Option<String>,
     profile: Option<String>,
     mode: Option<SubagentTaskMode>,
+    model: TaskModel,
     output_schema: Option<Value>,
 }
 
@@ -268,13 +321,17 @@ impl ToolInvocation for TaskCall {
                     return error(failure, message.into());
                 }
             };
+            let chooses_model = self.model.name.is_some() || self.model.thinking.is_some();
+            if chooses_model && !ctx.config.task_model_choice {
+                return error(ToolFailure::Denied, MODEL_CHOICE_DISABLED_ERROR.into());
+            }
             let request = TaskRequest {
                 prompt: self.prompt,
                 label: self.description,
                 task: TaskIdentity::continue_or_derive(self.task_id),
                 mode: self.mode,
                 profile: self.profile,
-                model_job: None,
+                model: self.model,
                 output_schema: self.output_schema,
                 call_id: ctx
                     .tool_use_id
@@ -285,7 +342,7 @@ impl ToolInvocation for TaskCall {
             if let Some(tasks) = &ctx.background {
                 match tasks.execute(ctx, request, background).await {
                     Ok(crate::background::TaskDelivery::Foreground(outcome, reports)) => {
-                        let mut result = render(outcome);
+                        let mut result = render(*outcome);
                         if !reports.is_empty() {
                             result
                                 .model_suffix
@@ -308,10 +365,10 @@ impl ToolInvocation for TaskCall {
 }
 
 /// The task ID is what makes a continuation possible, so it rides along with
-/// failures too: an interrupted subagent is still resumable. The mode rides
-/// with it because the caller's request is defaulted and capped on the way in,
-/// and a caller that wanted a command run has no other way to learn it was
-/// handed a read-only agent.
+/// failures too: an interrupted subagent is still resumable. The mode, model,
+/// and thinking level ride with it because the caller's request is defaulted,
+/// capped, resolved, and snapped on the way in, and a caller that wanted a
+/// command run, or a named model, has no other way to learn what it got.
 fn render(outcome: TaskOutcome) -> ToolExecResult {
     let failure = match outcome.cancelled {
         true => ToolFailure::Cancelled,
@@ -322,18 +379,26 @@ fn render(outcome: TaskOutcome) -> ToolExecResult {
         (None, Value::String(text)) => markdown(text),
         (None, structured) => structured_json(structured),
     };
-    match outcome.task_id {
-        Some(task_id) => with_metadata(&task_id, outcome.mode, result),
+    let ran_as = RanAs {
+        mode: outcome.mode,
+        model: outcome.model.as_deref(),
+        thinking: outcome.thinking.as_deref(),
+    };
+    match &outcome.task_id {
+        Some(task_id) => with_metadata(task_id, ran_as, result),
         None => result,
     }
 }
 
 pub(crate) fn receipt(status: TaskCard) -> ToolExecResult {
     let task_id = status.task_id.clone();
-    let mode = parse_mode(&status.mode).ok();
+    let ran_as = RanAs {
+        mode: parse_mode(&status.mode).ok(),
+        ..RanAs::default()
+    };
     let mut result = with_metadata(
         &task_id,
-        mode,
+        ran_as,
         ToolExecResult::from(Ok(ToolOutput::Tasks(vec![status]))),
     );
     let suffix = result.model_suffix.get_or_insert_default();
@@ -342,16 +407,28 @@ pub(crate) fn receipt(status: TaskCard) -> ToolExecResult {
     result
 }
 
-fn with_metadata(
-    task_id: &str,
+/// What a task actually ran as, after the caller's request was defaulted,
+/// capped, resolved, and snapped on the way in.
+#[derive(Default)]
+struct RanAs<'a> {
     mode: Option<SubagentTaskMode>,
-    mut result: ToolExecResult,
-) -> ToolExecResult {
-    let mode = mode.map_or_else(String::new, |mode| format!("{MODE_METADATA_LINE}{mode}\n"));
+    model: Option<&'a str>,
+    thinking: Option<&'a str>,
+}
+
+fn with_metadata(task_id: &str, ran_as: RanAs<'_>, mut result: ToolExecResult) -> ToolExecResult {
+    let details: String = [
+        (MODE_METADATA_LINE, ran_as.mode.map(|mode| mode.to_string())),
+        (MODEL_METADATA_LINE, ran_as.model.map(str::to_owned)),
+        (THINKING_METADATA_LINE, ran_as.thinking.map(str::to_owned)),
+    ]
+    .into_iter()
+    .filter_map(|(label, value)| value.map(|value| format!("{label}{value}\n")))
+    .collect();
     result.model_suffix = Some(
         TASK_METADATA_FORMAT
             .replace(TASK_ID_PLACEHOLDER, task_id)
-            .replace(MODE_PLACEHOLDER, &mode),
+            .replace(DETAILS_PLACEHOLDER, &details),
     );
     result
 }
@@ -386,6 +463,9 @@ mod tests {
     const SUMMARY: &str = "found the middleware in src/auth.rs:12";
     const REQUIRED_FIELD: &str = "answer";
     const BOOM: &str = "boom";
+    const MODEL_NAME: &str = "sonnet";
+    const MODEL_SPEC: &str = "anthropic/claude-sonnet-4-6";
+    const THINKING_LEVEL: &str = "high";
 
     #[test_case(false; "synchronous_frontend")]
     #[test_case(true; "session_background_frontend")]
@@ -609,6 +689,17 @@ mod tests {
         json!({ "description": "find auth", "prompt": "search the codebase" })
     }
 
+    fn choosing(model: Option<&str>, thinking: Option<&str>) -> Value {
+        let mut input = minimal();
+        if let Some(model) = model {
+            input[MODEL_PROPERTY] = json!(model);
+        }
+        if let Some(thinking) = thinking {
+            input[THINKING_PROPERTY] = json!(thinking);
+        }
+        input
+    }
+
     fn text_of(result: &ToolExecResult) -> String {
         match result.output.as_ref().expect("tool produced output") {
             ToolOutput::Plain(text) | ToolOutput::Markdown(text) => text.text.clone(),
@@ -620,6 +711,8 @@ mod tests {
         TaskOutcome {
             task_id: task_id.map(str::to_owned),
             mode: task_id.map(|_| SubagentTaskMode::Plan),
+            model: None,
+            thinking: None,
             success: verdict.is_ok(),
             cancelled: false,
             output: verdict.clone().unwrap_or(Value::Null),
@@ -666,6 +759,94 @@ mod tests {
             panic!("a new task without a prompt was accepted");
         };
         assert!(error.to_string().contains(PROMPT_REQUIRED_ERROR));
+    }
+
+    #[test_case(Some(MODEL_NAME), None; "model_only")]
+    #[test_case(None, Some(THINKING_LEVEL); "thinking_only")]
+    #[test_case(Some(MODEL_NAME), Some(THINKING_LEVEL); "both")]
+    fn a_chosen_model_and_thinking_parse(model: Option<&str>, thinking: Option<&str>) {
+        assert!(parse(choosing(model, thinking)).is_ok());
+    }
+
+    #[test_case("adaptive"; "adaptive")]
+    #[test_case("none"; "wire_spelling")]
+    #[test_case("4096"; "budget")]
+    #[test_case("turbo"; "unknown")]
+    fn a_thinking_level_outside_the_ladder_is_rejected(level: &str) {
+        assert!(parse(choosing(None, Some(level))).is_err());
+    }
+
+    #[test]
+    fn every_published_thinking_level_parses() {
+        for level in THINKING_LEVELS {
+            assert_eq!(
+                parse_thinking(level).expect("published level").to_string(),
+                *level
+            );
+        }
+    }
+
+    #[test_case(Some(MODEL_NAME), None; "model")]
+    #[test_case(None, Some(THINKING_LEVEL); "thinking")]
+    fn a_disabled_model_choice_refuses_the_call(model: Option<&str>, thinking: Option<&str>) {
+        smol::block_on(async {
+            let mut ctx = crate::tools::test_support::stub_ctx(&crate::AgentMode::Build);
+            ctx.config.task_model_choice = false;
+            let result = parse(choosing(model, thinking))
+                .unwrap()
+                .execute(&ctx)
+                .await;
+            assert_eq!(result.failure, Some(ToolFailure::Denied));
+            assert_eq!(text_of(&result), MODEL_CHOICE_DISABLED_ERROR);
+            assert!(ctx.subagent_history.snapshot().records().is_empty());
+        });
+    }
+
+    #[test_case(true; "enabled")]
+    #[test_case(false; "disabled")]
+    fn model_choice_is_published_only_when_enabled(enabled: bool) {
+        let mut tools = json!([{
+            "name": "task",
+            "description": TaskTool.description(&DescriptionContext {
+                filter: &crate::tools::ToolFilter::All,
+                audience: ToolAudience::MAIN,
+                workflows_available: false,
+            }),
+            "input_schema": TaskTool.schema(),
+        }]);
+        let config = AgentConfig {
+            task_model_choice: enabled,
+            ..AgentConfig::default()
+        };
+        configure_execution(&mut tools, &config, true, true);
+        let once = tools.clone();
+        configure_execution(&mut tools, &config, true, true);
+        assert_eq!(tools, once);
+        let properties = &tools[0]["input_schema"]["properties"];
+        for name in [MODEL_PROPERTY, THINKING_PROPERTY] {
+            assert_eq!(properties.get(name).is_some(), enabled, "{name}");
+        }
+        let description = tools[0]["description"].as_str().unwrap();
+        assert_eq!(description.contains(MODEL_CHOICE_GUIDANCE), enabled);
+        assert!(description.contains("background: false"));
+    }
+
+    #[test]
+    fn a_task_reports_the_model_and_thinking_it_ran_on() {
+        let result = render(TaskOutcome {
+            model: Some(MODEL_SPEC.into()),
+            thinking: Some(THINKING_LEVEL.into()),
+            ..outcome(Some(TASK_ID), Ok(Value::String(SUMMARY.into())))
+        });
+        assert_eq!(
+            result.model_suffix.as_deref(),
+            Some(
+                format!(
+                    "<task_metadata>\ntask_id: {TASK_ID}\nmode: {PLAN_MODE}\nmodel: {MODEL_SPEC}\nthinking: {THINKING_LEVEL}\n</task_metadata>"
+                )
+                .as_str()
+            )
+        );
     }
 
     #[test]

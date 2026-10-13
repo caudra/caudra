@@ -162,7 +162,7 @@ mod owned_jobs_tests {
                 task: TaskIdentity::Fresh(fixture.task_id.clone()),
                 mode: None,
                 profile: None,
-                model_job: None,
+                model: Default::default(),
                 output_schema: None,
                 call_id: OWNER.into(),
                 provenance: None,

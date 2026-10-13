@@ -8,9 +8,12 @@ use caudra_storage::DescriptiveIdCandidates;
 pub use caudra_storage::sessions::{
     StoredMode as SubagentTaskMode, StoredSubagentTaskSpec as SubagentTaskSpec,
 };
+use caudra_storage::thinking::StoredThinking;
 use thiserror::Error;
 
 const TASK_ID_EXHAUSTED: &str = "task identity allocation exhausted after 4096 candidates; use a different description or start a new session";
+const INHERITED_MODEL: &str = "the session's Subagent model";
+const INHERITED_THINKING: &str = "the inherited level";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SubagentHistoryError {
@@ -39,6 +42,22 @@ pub enum SubagentHistoryError {
         requested: SubagentTaskMode,
     },
     #[error(
+        "subagent task `{task_id}` runs on {stored}, not requested model `{requested}`; omit model to keep it"
+    )]
+    ModelMismatch {
+        task_id: String,
+        stored: String,
+        requested: String,
+    },
+    #[error(
+        "subagent task `{task_id}` reasons at {stored}, not requested level `{requested}`; omit thinking to keep it"
+    )]
+    ThinkingMismatch {
+        task_id: String,
+        stored: String,
+        requested: String,
+    },
+    #[error(
         "subagent task `{task_id}` has a locked task profile and mode; continue it with task = true"
     )]
     TaskSpecRequired { task_id: String },
@@ -50,21 +69,31 @@ pub enum SubagentHistoryError {
 pub struct SubagentTaskSpecCandidate {
     pub profile_name: Option<String>,
     pub mode: Option<SubagentTaskMode>,
+    /// An exact `provider/model` spec, already resolved from what was asked.
+    pub model: Option<String>,
+    pub thinking: Option<StoredThinking>,
 }
 
 impl SubagentTaskSpecCandidate {
+    /// The spec a task with no stored one starts from: what was asked,
+    /// `defaults` for the rest.
+    pub(crate) fn or_defaults(self, defaults: SubagentTaskSpec) -> SubagentTaskSpec {
+        SubagentTaskSpec {
+            profile_name: self.profile_name.unwrap_or(defaults.profile_name),
+            mode: self.mode.unwrap_or(defaults.mode),
+            model: self.model,
+            thinking: self.thinking,
+            ..SubagentTaskSpec::default()
+        }
+    }
+
     fn resolve(
         self,
         task_id: &str,
         stored: Option<&SubagentTaskSpec>,
     ) -> Result<SubagentTaskSpec, SubagentHistoryError> {
         let Some(stored) = stored else {
-            let defaults = SubagentTaskSpec::default();
-            return Ok(SubagentTaskSpec {
-                profile_name: self.profile_name.unwrap_or(defaults.profile_name),
-                mode: self.mode.unwrap_or(defaults.mode),
-                ..SubagentTaskSpec::default()
-            });
+            return Ok(self.or_defaults(SubagentTaskSpec::default()));
         };
         if let Some(requested) = self.profile_name
             && requested != stored.profile_name
@@ -82,6 +111,30 @@ impl SubagentTaskSpecCandidate {
                 task_id: task_id.to_owned(),
                 stored: stored.mode,
                 requested,
+            });
+        }
+        if let Some(requested) = self.model
+            && stored.model.as_ref() != Some(&requested)
+        {
+            return Err(SubagentHistoryError::ModelMismatch {
+                task_id: task_id.to_owned(),
+                stored: stored
+                    .model
+                    .as_ref()
+                    .map_or_else(|| INHERITED_MODEL.to_owned(), |model| format!("`{model}`")),
+                requested,
+            });
+        }
+        if let Some(requested) = self.thinking
+            && stored.thinking.as_ref() != Some(&requested)
+        {
+            return Err(SubagentHistoryError::ThinkingMismatch {
+                task_id: task_id.to_owned(),
+                stored: stored.thinking.as_ref().map_or_else(
+                    || INHERITED_THINKING.to_owned(),
+                    |thinking| format!("`{thinking}`"),
+                ),
+                requested: requested.to_string(),
             });
         }
         Ok(stored.clone())
@@ -337,11 +390,7 @@ impl SubagentHistoryStore {
                 });
             }
             Some(stored) => candidate.resolve(task_id, Some(stored))?,
-            None => SubagentTaskSpec {
-                profile_name: candidate.profile_name.unwrap_or(defaults.profile_name),
-                mode: candidate.mode.unwrap_or(defaults.mode),
-                ..SubagentTaskSpec::default()
-            },
+            None => candidate.or_defaults(defaults),
         };
         state.active.insert(task_id.to_owned());
         drop(state);
@@ -716,6 +765,10 @@ mod tests {
     const SECOND_PROMPT: &str = "second prompt";
     const PROFILE: &str = "review";
     const OTHER_PROFILE: &str = "custom";
+    const CHOSEN_MODEL: &str = "anthropic/claude-sonnet-5-5";
+    const OTHER_MODEL: &str = "openai/gpt-5.6-terra";
+    const CHOSEN_LEVEL: &str = "high";
+    const OTHER_LEVEL: &str = "low";
     const PHRASE: &str = "happy-cute-tick";
     const LAUNCH: &str = "launch-call";
     const CONTINUATION: &str = "continuation-call";
@@ -1143,13 +1196,119 @@ mod tests {
             .continue_task_with(
                 TASK_ID,
                 SubagentTaskSpecCandidate {
-                    profile_name: None,
                     mode: Some(SubagentTaskMode::Plan),
+                    ..SubagentTaskSpecCandidate::default()
                 },
             )
             .unwrap();
 
         assert_eq!(lease.spec(), Some(&task_spec));
+    }
+
+    fn chosen_spec() -> SubagentTaskSpec {
+        SubagentTaskSpec {
+            model: Some(CHOSEN_MODEL.into()),
+            thinking: Some(effort(CHOSEN_LEVEL)),
+            ..spec(PROFILE, SubagentTaskMode::Plan)
+        }
+    }
+
+    fn effort(level: &str) -> StoredThinking {
+        StoredThinking::Effort {
+            level: level.into(),
+        }
+    }
+
+    #[test_case(None, None ; "both_omitted")]
+    #[test_case(Some(CHOSEN_MODEL), Some(CHOSEN_LEVEL) ; "both_repeated")]
+    fn continuation_keeps_the_chosen_model_and_thinking(model: Option<&str>, level: Option<&str>) {
+        let store = SubagentHistoryStore::default();
+        store
+            .reserve_with_spec(TASK_ID, chosen_spec())
+            .unwrap()
+            .complete(history(FIRST_PROMPT));
+
+        let lease = store
+            .continue_task_with(
+                TASK_ID,
+                SubagentTaskSpecCandidate {
+                    model: model.map(str::to_owned),
+                    thinking: level.map(effort),
+                    ..SubagentTaskSpecCandidate::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(lease.spec(), Some(&chosen_spec()));
+    }
+
+    #[test]
+    fn continuation_rejects_another_model_or_thinking() {
+        let store = SubagentHistoryStore::default();
+        store
+            .reserve_with_spec(TASK_ID, chosen_spec())
+            .unwrap()
+            .complete(history(FIRST_PROMPT));
+
+        assert_eq!(
+            store
+                .continue_task_with(
+                    TASK_ID,
+                    SubagentTaskSpecCandidate {
+                        model: Some(OTHER_MODEL.into()),
+                        ..SubagentTaskSpecCandidate::default()
+                    },
+                )
+                .unwrap_err(),
+            SubagentHistoryError::ModelMismatch {
+                task_id: TASK_ID.into(),
+                stored: format!("`{CHOSEN_MODEL}`"),
+                requested: OTHER_MODEL.into(),
+            }
+        );
+        assert_eq!(
+            store
+                .continue_task_with(
+                    TASK_ID,
+                    SubagentTaskSpecCandidate {
+                        thinking: Some(effort(OTHER_LEVEL)),
+                        ..SubagentTaskSpecCandidate::default()
+                    },
+                )
+                .unwrap_err(),
+            SubagentHistoryError::ThinkingMismatch {
+                task_id: TASK_ID.into(),
+                stored: format!("`{CHOSEN_LEVEL}`"),
+                requested: OTHER_LEVEL.into(),
+            }
+        );
+        assert!(!store.is_active(TASK_ID));
+    }
+
+    #[test]
+    fn continuation_cannot_choose_a_model_the_task_never_had() {
+        let store = SubagentHistoryStore::default();
+        store
+            .reserve_with_spec(TASK_ID, spec(PROFILE, SubagentTaskMode::Plan))
+            .unwrap()
+            .complete(history(FIRST_PROMPT));
+
+        assert_eq!(
+            store
+                .continue_task_with(
+                    TASK_ID,
+                    SubagentTaskSpecCandidate {
+                        model: Some(OTHER_MODEL.into()),
+                        ..SubagentTaskSpecCandidate::default()
+                    },
+                )
+                .unwrap_err(),
+            SubagentHistoryError::ModelMismatch {
+                task_id: TASK_ID.into(),
+                stored: INHERITED_MODEL.into(),
+                requested: OTHER_MODEL.into(),
+            }
+        );
     }
 
     #[test]
@@ -1166,7 +1325,7 @@ mod tests {
                     TASK_ID,
                     SubagentTaskSpecCandidate {
                         profile_name: Some(OTHER_PROFILE.into()),
-                        mode: None,
+                        ..SubagentTaskSpecCandidate::default()
                     },
                 )
                 .unwrap_err(),
@@ -1183,8 +1342,8 @@ mod tests {
                 .continue_task_with(
                     TASK_ID,
                     SubagentTaskSpecCandidate {
-                        profile_name: None,
                         mode: Some(SubagentTaskMode::Build),
+                        ..SubagentTaskSpecCandidate::default()
                     },
                 )
                 .unwrap_err(),
@@ -1204,6 +1363,7 @@ mod tests {
         let candidate = SubagentTaskSpecCandidate {
             profile_name: Some(PROFILE.into()),
             mode: Some(SubagentTaskMode::Plan),
+            ..SubagentTaskSpecCandidate::default()
         };
 
         let lease = store

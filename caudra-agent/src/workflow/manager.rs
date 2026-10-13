@@ -1691,6 +1691,8 @@ complete(result);
                         return TaskOutcome {
                             task_id,
                             mode: None,
+                            model: None,
+                            thinking: None,
                             success: false,
                             cancelled: true,
                             output: Value::Null,
@@ -1705,6 +1707,8 @@ complete(result);
                         return TaskOutcome {
                             task_id: None,
                             mode: None,
+                            model: None,
+                            thinking: None,
                             success: false,
                             cancelled: false,
                             output: Value::Null,
@@ -1716,6 +1720,8 @@ complete(result);
                     TaskOutcome {
                         task_id,
                         mode: None,
+                        model: None,
+                        thinking: None,
                         success: true,
                         cancelled: false,
                         output: json!({ "echo": request.prompt }),

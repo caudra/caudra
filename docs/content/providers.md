@@ -27,7 +27,7 @@ Bindings are saved globally in the `model.purposes` row of Caudra's SQLite state
 | Fast | Provider `fast` config, curated preferred small model, cheapest priced model, fewest-parameter model, then the anchor |
 | Best | Provider `best` config, curated flagship, then the anchor |
 
-The anchor is the selected Chat model when a main turn starts. A Plan binding can select a distinct model, which Caudra uses for main turns sent in Plan mode. An explicit global Subagent binding overrides parent inheritance. A prompt profile's `subagent_model` overrides the global Subagent binding for tasks using that profile. See [System Prompt Profiles](/docs/system-prompts/#configure-subagents).
+The anchor is the selected Chat model when a main turn starts. A Plan binding can select a distinct model, which Caudra uses for main turns sent in Plan mode. An explicit global Subagent binding overrides parent inheritance. A prompt profile's `subagent_model` overrides the global Subagent binding for tasks using that profile. See [System Prompt Profiles](/docs/system-prompts/#configure-subagents). A `model` set on one `task` call overrides both. See [Models and reasoning](/docs/commands/#models-and-reasoning).
 
 See [Sessions](/docs/sessions/#titles) for Title, [Completion goals](/docs/commands/#completion-goals) for Goal, [Requirements](/docs/commands/#requirements) for Extract, [Memory](/docs/memory/#summaries-and-spend) for Memory, and [Autopilot](/docs/autopilot/#the-model-and-its-cost) for Autopilot.
 

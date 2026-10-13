@@ -193,7 +193,7 @@ A profile can select a model and thinking setting for subagents:
 ---
 description: Deep security analysis
 layout: overlay
-subagent_model: anthropic/claude-opus-4-6
+subagent_model: anthropic/claude-opus-5-5
 subagent_thinking: high
 ---
 
@@ -204,17 +204,19 @@ Prioritize exploitable findings and concrete fixes.
 
 `subagent_thinking` accepts `off`, `adaptive`, an effort level, or a positive token budget. It inherits the parent's thinking setting when omitted. These fields do not change the main agent. See [Model jobs](/docs/providers/#model-jobs) for routing rules.
 
-Caudra validates each profile against the effective subagent model. An explicit thinking setting must be supported exactly. Caudra does not snap effort levels, clamp budgets, or translate between effort and budget modes for a profile. An incompatible profile remains available to the main agent, but Caudra warns and removes it from the task profile list.
+A `model` or `thinking` set on the `task` call wins over these fields for that task. The main agent sets one when you ask for a model or a reasoning level. See [Models and reasoning](/docs/commands/#models-and-reasoning).
 
-The `task` tool accepts `profile` and `mode`. A new task inherits the parent profile when `profile` is omitted. Set `profile` to `builtin` to use Caudra's built-in task prompt.
+Caudra validates each profile against the effective subagent model. An explicit thinking setting must be supported exactly. Caudra does not snap effort levels, clamp budgets, or translate between effort and budget modes for a profile. An incompatible profile remains available to the main agent, but Caudra warns and removes it from the task profile list. A task that sets its own `model` or `thinking` skips this check and snaps the level to its model.
+
+The `task` tool accepts `profile`, `mode`, `model`, and `thinking`. A new task inherits the parent profile when `profile` is omitted. Set `profile` to `builtin` to use Caudra's built-in task prompt.
 
 `mode` defaults to the caller's own mode and can never exceed it, so a task launched from build mode can build, and one launched from plan mode stays read-only. `plan` has a host-enforced read-only tool set with no file writes. Eligible shell calls must pass the host's confined read-only checks. A task that needs mutating commands requires `build`. A `build` request from a plan-mode caller runs as `plan` instead. Every result reports the mode the task ran as. A task in either mode can read the session plan but cannot replace it. See [Read-only agents](/docs/permissions/#read-only-agents).
 
 Task profiles support overlay and custom layouts. For a custom task prompt, directives resolve to the matching research or general task component. `{{caudra.default}}` expands to the complete built-in task prompt. Caudra appends the system-reminder contract after the rendered profile, so custom layouts cannot remove it.
 
-The effective profile and mode are stored with task history. A continuation uses the stored values when they are omitted and rejects conflicting values. Legacy task histories bind both values on their first successful continuation.
+The effective profile and mode, and any `model` or `thinking` the call set, are stored with task history. A continuation uses the stored values when they are omitted and rejects conflicting values. Legacy task histories bind profile and mode on their first successful continuation.
 
-The task API no longer accepts `subagent_type`, `model`, or `model_tier`. Replace `subagent_type = "research"` with `mode = "plan"` and `subagent_type = "general"` with `mode = "build"`. Move model selection into profile frontmatter and remove `plugins.task.allow_model` from your `caudra.toml` or `init.lua`.
+The task API no longer accepts `subagent_type` or `model_tier`. Replace `subagent_type = "research"` with `mode = "plan"` and `subagent_type = "general"` with `mode = "build"`. Put a standing model choice in profile frontmatter and remove `plugins.task.allow_model` from your `caudra.toml` or `init.lua`.
 
 ## Select a profile
 

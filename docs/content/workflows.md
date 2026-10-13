@@ -192,7 +192,7 @@ A `read-only` agent reads, searches, and fetches, and it may also run a shell co
 
 Use `fast` for bulk work over a fixed packet, such as a shard of findings to rule on. Use `best` for the one call whose output the user reads. Leave it off, or pass `subagent`, for everything else, and the call runs on whatever the session uses for subagents.
 
-Precedence runs from most specific configuration to least. A `subagent_model` pin on the profile the call names wins over the call's `model_job`, because a user who pinned a model for a profile meant it. Without a pin, `model_job` applies. Without either, the session's subagent binding applies. See [System Prompt Profiles](/docs/system-prompts/#configure-subagents).
+Precedence runs from most specific configuration to least. A `subagent_model` pin on the profile the call names wins over the call's `model_job`, because a user who pinned a model for a profile meant it. Without a pin, `model_job` applies. Without either, the session's subagent binding applies. See [System Prompt Profiles](/docs/system-prompts/#configure-subagents). The main agent's `task` tool can name a model for one call, but `agent()` keeps to jobs so scripts stay portable. See [Models and reasoning](/docs/commands/#models-and-reasoning).
 
 ### Typed decisions
 

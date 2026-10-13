@@ -5618,6 +5618,17 @@ impl App {
             {
                 self.chats[idx].push_user_message(prompt);
             }
+            // An admitted job opens its chat before the subagent resolves its
+            // model, so the first report of it is adopted here.
+            let chat = &mut self.chats[idx];
+            if let Some(model) = &subagent.model {
+                chat.thinking.clone_from(&subagent.thinking);
+                chat.fast = subagent.fast;
+                if chat.model_id.as_ref() != Some(model) {
+                    chat.model_id = Some(model.clone());
+                    self.chats[0].update_tool_model(parent_tool_use_id, model);
+                }
+            }
             return idx;
         }
         let idx = if let Some(idx) = self

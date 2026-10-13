@@ -212,7 +212,7 @@ features! {
     goal_prescreen: [Enforce],
         "Skip an unlikely-to-pass goal evaluation within the continuation budget and continue work. Only the normal evaluator can certify completion.";
     subagent_routing: [Enforce],
-        "Choose a model job for a new unpinned subagent from its task label, mode, profile, and a redacted prompt excerpt. Explicit jobs, profile pins, and continuations keep their routing.";
+        "Choose a model job for a new unpinned subagent from its task label, mode, profile, and a redacted prompt excerpt. Explicit jobs, models chosen on the `task` call, profile pins, and continuations keep their routing.";
     question_tool_nudge: [Advise],
         "At a main-session handoff with a usable question tool, advise adds one visible reminder per user-input episode to ask a live user question through that tool. Shadow only evaluates. Uses a redacted, bounded request and reply excerpt; uncertainty and failures leave the reply unchanged.";
     memory_search: [Enforce],

@@ -1456,7 +1456,7 @@ mod tests {
                         task_id: TaskIdentity::Derive,
                         profile: None,
                         mode: None,
-                        model_job: None,
+                        model: Default::default(),
                         routing_prompt: None,
                         local_definitions: Vec::new(),
                         local_tools: LocalTools::default(),

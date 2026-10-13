@@ -2,6 +2,7 @@ pub(crate) mod error;
 pub mod history;
 pub mod manifest;
 pub mod model;
+pub mod model_lookup;
 pub mod model_registry;
 pub mod pricing;
 pub mod provider;

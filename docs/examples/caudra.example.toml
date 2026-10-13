@@ -330,6 +330,13 @@ version = 1
 # Type: string.
 # task_execution = "auto"
 
+# Let the main agent choose a model and reasoning level for each `task` call,
+# such as when you ask it to run work on a named model. When off, `task` has no
+# `model` or `thinking` argument and tasks run on the Subagent model or a
+# profile's pin.
+# Type: bool.
+# task_model_choice = true
+
 # Shell delivery: sync waits for termination, auto routes by requested timeout,
 # async returns an admission receipt.
 # Type: string.
@@ -1044,8 +1051,9 @@ version = 1
 # goal_prescreen = "off"
 
 # Choose a model job for a new unpinned subagent from its task label, mode,
-# profile, and a redacted prompt excerpt. Explicit jobs, profile pins, and
-# continuations keep their routing. Modes: off, shadow, enforce.
+# profile, and a redacted prompt excerpt. Explicit jobs, models chosen on the
+# `task` call, profile pins, and continuations keep their routing. Modes: off,
+# shadow, enforce.
 # Type: string.
 # subagent_routing = "off"
 
