@@ -6179,12 +6179,23 @@ fn custom_command_falls_back_to_main_when_the_task_cannot_be_steered() {
 #[test]
 fn file_picker_inserts_into_the_focused_task_composer() {
     const PATH: &str = "src/main.rs";
+    const MENTION: &str = "@src/main.rs";
     let (mut app, _steer_tx) = focused_task_composer();
 
     app.handle_file_picker_action(FilePickerModalAction::Select(PATH.into()));
 
-    assert!(app.subagent_input_box.buffer.value().contains(PATH));
+    assert!(app.subagent_input_box.buffer.value().contains(MENTION));
     assert!(app.input_box.is_empty(), "the main draft must be untouched");
+}
+
+#[test_case("src/main.rs", "@src/main.rs"; "plain_path")]
+#[test_case("docs/my notes.md", "@\"docs/my notes.md\""; "path_with_spaces")]
+fn file_picker_inserts_a_mention(path: &str, expected: &str) {
+    let mut app = test_app();
+
+    app.handle_file_picker_action(FilePickerModalAction::Select(path.into()));
+
+    assert_eq!(app.input_box.buffer.value(), expected);
 }
 
 #[test]

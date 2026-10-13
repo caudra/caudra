@@ -3044,8 +3044,9 @@ impl App {
             FilePickerModalAction::Consumed => {}
             FilePickerModalAction::Select(path) => {
                 self.file_picker.close();
+                let mention = mentions::format(Path::new(&path), None);
                 if let InputAction::PaletteSync(val) =
-                    self.active_input_box_mut().handle_paste_with_spaces(&path)
+                    self.active_input_box_mut().handle_paste_with_spaces(&mention)
                 {
                     self.sync_dropdowns(&val);
                 }

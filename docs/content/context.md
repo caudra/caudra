@@ -50,7 +50,7 @@ The `/context` views report what currently contributes without loading deferred 
 
 ## Mention a file with @
 
-Typing `@` in the composer opens a path completion popup drawn from the same project walk as the file picker, so it honours your ignore rules and skips `.git`. Arrow keys move, Enter picks, Tab drills into a directory, Esc dismisses. You can also type the path yourself. The pointer works the same way: moving over a row marks it, the wheel walks the list, and a click takes the row under it, drilling into a directory the way `Tab` does.
+Typing `@` in the composer opens a path completion popup drawn from the same project walk as the file picker, so it honours your ignore rules and skips `.git`. Arrow keys move, Enter picks, Tab drills into a directory, Esc dismisses. You can also type the path yourself. The pointer works the same way: moving over a row marks it, the wheel walks the list, and a click takes the row under it, drilling into a directory the way `Tab` does. A file chosen in the file picker (`Ctrl+S`) is inserted as a mention too.
 
 A mention names a file, and optionally a line range:
 
