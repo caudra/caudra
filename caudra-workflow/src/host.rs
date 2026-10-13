@@ -288,7 +288,15 @@ pub enum HostError {
 pub trait WorkflowHost: Send + Sync {
     fn agent(&self, key: CallKey, request: &AgentRequest) -> Result<AgentResult, HostError>;
 
-    fn decide(&self, key: CallKey, request: &DecisionRequest) -> Result<DecisionResult, HostError>;
+    /// `label` names the call for the run inspector. The engine builds it from question ids and
+    /// candidate counts only, and it is neither hashed nor journaled, so a relabelled call still
+    /// replays.
+    fn decide(
+        &self,
+        key: CallKey,
+        request: &DecisionRequest,
+        label: &str,
+    ) -> Result<DecisionResult, HostError>;
 
     /// Runs `requests` concurrently under keys `first_key..first_key + requests.len()` and returns
     /// results in request order.

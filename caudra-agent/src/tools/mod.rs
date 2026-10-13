@@ -54,6 +54,7 @@ use crate::agent::change_recording::ChangeRecorder;
 use crate::background::{JobScope, ShellLive};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::context::ContextPublisher;
+use crate::decisions::{NoteAnchor, NoteDraft, NoteSink};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::template::Vars;
@@ -646,6 +647,21 @@ impl ToolContext {
             ToolPolicy::Standard
         }
     }
+
+    /// Reports what a decision feature did inside this call, for a row after
+    /// its card. A context outside any call has no card to anchor it to.
+    pub fn emit_decision(&self, draft: NoteDraft) {
+        if let Some(sink) = self.note_sink() {
+            sink.emit(draft);
+        }
+    }
+
+    /// Where a decision surface inside this call places its rows: after the
+    /// call's card. A context outside any call has none.
+    pub fn note_sink(&self) -> Option<NoteSink> {
+        let id = self.tool_use_id.clone()?;
+        Some(NoteSink::new(self.event_tx.clone(), NoteAnchor::Tool(id)))
+    }
 }
 
 /// Live progress of a dispatched child tool, streamed while it runs.
@@ -1107,8 +1123,13 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::AgentEvent;
+    use crate::decisions::{DecisionFeature, NoteOutcome};
+    use caudra_config::decisions::FeatureMode;
 
     const LINE_LIMIT: usize = 500;
+    const DECISION_SUMMARY: &str = "moved 3 of 12 rows up";
+    const DECISION_TOOL_USE_ID: &str = "toolu_decision";
 
     #[test_case(true  ; "vision_model_keeps_view_image")]
     #[test_case(false ; "text_only_model_loses_view_image")]
@@ -1605,5 +1626,32 @@ mod tests {
         for name in &names {
             assert!(seen.insert(name), "duplicate builtin tool name: {name}");
         }
+    }
+
+    #[test_case(Some(DECISION_TOOL_USE_ID); "a_call_anchors_the_note_to_its_card")]
+    #[test_case(None; "no_call_sends_nothing")]
+    fn emit_decision_anchors_the_note_to_the_call(tool_use_id: Option<&str>) {
+        let (tx, rx) = flume::unbounded();
+        let event_tx = EventSender::new(tx, 0);
+        let ctx = test_support::stub_ctx_with(&AgentMode::Build, Some(&event_tx), tool_use_id);
+        ctx.emit_decision(NoteDraft {
+            feature: DecisionFeature::CodeContext,
+            mode: FeatureMode::Enforce,
+            outcome: NoteOutcome::Acted,
+            summary: DECISION_SUMMARY.into(),
+            details: Vec::new(),
+        });
+        let anchors: Vec<NoteAnchor> = rx
+            .try_iter()
+            .filter_map(|envelope| match envelope.event {
+                AgentEvent::Decision(note) => Some(note.anchor),
+                _ => None,
+            })
+            .collect();
+        let expected: Vec<NoteAnchor> = tool_use_id
+            .map(|id| NoteAnchor::Tool(id.into()))
+            .into_iter()
+            .collect();
+        assert_eq!(anchors, expected);
     }
 }

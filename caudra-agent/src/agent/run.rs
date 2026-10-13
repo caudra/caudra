@@ -59,8 +59,9 @@ use crate::context::{
 use crate::decisions::output_pointers::output_focus;
 use crate::decisions::questions as decision_questions;
 use crate::decisions::{
-    DecisionContext, DecisionFeature, DecisionOutcome, DecisionReceipt, Decisions, push_fitting,
-    question_tool_nudge, redact_decision_text, redacted_excerpt,
+    DecisionContext, DecisionFeature, DecisionOutcome, DecisionReceipt, Decisions, NoteAnchor,
+    NoteDraft, NoteOutcome, push_fitting, question_tool_nudge, redact_decision_text,
+    redacted_excerpt,
 };
 use crate::mcp::{McpRequestSnapshot, McpSession};
 use crate::memory::relevance::{Judge, Recall};
@@ -87,7 +88,7 @@ use crate::{
 use caudra_automation::request::AutomationError;
 use caudra_config::decisions::FeatureMode;
 use caudra_config::{Feature, ModelPolicy, ProfileToolPolicy, ToolOutputLines};
-use caudra_decision::{Answer, Question, QuestionSet, QuestionType};
+use caudra_decision::{Answer, ChoiceAnswer, Question, QuestionSet, QuestionType};
 use caudra_storage::autopilot::AutopilotEnd;
 use caudra_storage::background::JobOwner;
 use caudra_storage::decision_log::{DecisionEffect, DecisionLabel};
@@ -108,6 +109,13 @@ const SKILL_NONE_CRITERION: &str = "No listed skill covers the request";
 const SKILL_REQUEST_EXCERPT_BYTES: usize = 1_200;
 const SKILL_DESCRIPTION_EXCERPT_BYTES: usize = 320;
 const MAX_SKILL_CANDIDATES: usize = 8;
+const SKILL_SUGGESTED: &str = "suggested skill";
+const SKILL_FALLBACK: &str = "suggested no skill";
+const QUESTION_NUDGED: &str = "asked the agent to use the question tool";
+const QUESTION_NUDGE_FALLBACK: &str = "left the reply without a question-tool reminder";
+const GOAL_SKIPPED: &str = "skipped the goal check";
+const GOAL_PRESCREEN_FALLBACK: &str = "ran the goal check";
+const THRESHOLD_LABEL: &str = "threshold";
 const MAX_GOAL_PRESCREEN_SKIPS: u32 = 2;
 pub(crate) const GOAL_MET_QUESTION: &str = "goal_met";
 const GOAL_PRESCREEN_CONTINUATION: &str =
@@ -916,7 +924,12 @@ impl<'h> Agent<'h> {
         .await;
         if let Some(recalled) = recalled {
             recalled.record();
-            self.push_injected(Message::synthetic(recalled.reminder));
+            if let Some(note) = recalled.note {
+                self.emit_decision(note);
+            }
+            if let Some(reminder) = recalled.reminder {
+                self.push_injected(Message::synthetic(reminder));
+            }
         }
 
         info!(
@@ -1715,15 +1728,37 @@ impl<'h> Agent<'h> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        if !self.can_nudge_question()
-            || !question_tool_nudge::should_nudge(
-                decisions.mode(&DecisionFeature::QuestionToolNudge),
-                &outcome,
-                decisions.config().thresholds.question_tool_nudge,
-            )
-        {
+        if !self.can_nudge_question() {
             return Ok(None);
         }
+        let threshold = decisions.config().thresholds.question_tool_nudge;
+        let probability = match (
+            decisions.mode(&DecisionFeature::QuestionToolNudge),
+            question_tool_nudge::nudge_probability(&outcome, threshold),
+        ) {
+            (FeatureMode::Advise, Some(probability)) => probability,
+            (FeatureMode::Shadow, Some(probability)) => {
+                self.emit_decision(question_nudge_note(
+                    &decisions,
+                    NoteOutcome::Shadow,
+                    probability,
+                    threshold,
+                ));
+                return Ok(None);
+            }
+            (FeatureMode::Advise, None) => {
+                if let Some(failure) = outcome.fresh_failure() {
+                    self.emit_decision(NoteDraft::fell_back(
+                        &decisions,
+                        DecisionFeature::QuestionToolNudge,
+                        &failure,
+                        QUESTION_NUDGE_FALLBACK,
+                    ));
+                }
+                return Ok(None);
+            }
+            _ => return Ok(None),
+        };
         if let Some(outcome) = self.take_arrivals().await? {
             return Ok(Some(outcome));
         }
@@ -1738,6 +1773,12 @@ impl<'h> Agent<'h> {
         }
         self.response_text = None;
         self.count_continuation();
+        self.emit_decision(question_nudge_note(
+            &decisions,
+            NoteOutcome::Acted,
+            probability,
+            threshold,
+        ));
         self.push_injected(Message::synthetic(question_tool_nudge::REMINDER.into()));
         if let Some(receipt) = &outcome.receipt {
             decisions.record_effect_detached(receipt, DecisionEffect::Advised);
@@ -2715,32 +2756,61 @@ impl<'h> Agent<'h> {
         if !self.goal_completion_ready() {
             return self.defer_goal(done_reason);
         }
-        if prescreen.as_ref().is_some_and(|(decisions, outcome)| {
-            should_skip_goal(
-                decisions.mode(&DecisionFeature::GoalPrescreen),
+        if let Some((decisions, outcome)) = &prescreen {
+            let threshold = decisions.config().thresholds.goal_skip_below;
+            let skip = should_skip_goal(
+                &FeatureMode::Enforce,
                 outcome,
-                decisions.config().thresholds.goal_skip_below,
+                threshold,
                 self.goal_prescreen_skips,
                 self.goal_blocks,
                 self.goal.continuation_limit(),
             )
-        }) {
-            if !self.goal.is_generation_active(goal.generation) {
-                return Ok(TurnOutcome::Done(done_reason));
+            .then(|| goal_pass_probability(outcome))
+            .flatten();
+            match (decisions.mode(&DecisionFeature::GoalPrescreen), skip) {
+                (FeatureMode::Enforce, Some(probability)) => {
+                    if !self.goal.is_generation_active(goal.generation) {
+                        return Ok(TurnOutcome::Done(done_reason));
+                    }
+                    self.emit_decision(goal_skip_note(
+                        decisions,
+                        NoteOutcome::Acted,
+                        probability,
+                        threshold,
+                    ));
+                    self.goal_blocks += 1;
+                    self.goal_prescreen_skips += 1;
+                    self.count_continuation();
+                    self.push_injected(Message::synthetic(continuation_message(
+                        &goal.condition,
+                        GOAL_PRESCREEN_CONTINUATION,
+                    )));
+                    if let Some(receipt) = &outcome.receipt {
+                        decisions.record_effect_detached(receipt, DecisionEffect::Skipped);
+                    }
+                    return Ok(TurnOutcome::Continue);
+                }
+                (FeatureMode::Shadow, Some(probability)) => {
+                    self.emit_decision(goal_skip_note(
+                        decisions,
+                        NoteOutcome::Shadow,
+                        probability,
+                        threshold,
+                    ));
+                }
+                (FeatureMode::Enforce, None) => {
+                    if let Some(failure) = outcome.fresh_failure() {
+                        self.emit_decision(NoteDraft::fell_back(
+                            decisions,
+                            DecisionFeature::GoalPrescreen,
+                            &failure,
+                            GOAL_PRESCREEN_FALLBACK,
+                        ));
+                    }
+                }
+                _ => {}
             }
-            self.goal_blocks += 1;
-            self.goal_prescreen_skips += 1;
-            self.count_continuation();
-            self.push_injected(Message::synthetic(continuation_message(
-                &goal.condition,
-                GOAL_PRESCREEN_CONTINUATION,
-            )));
-            if let Some((decisions, outcome)) = prescreen
-                && let Some(receipt) = outcome.receipt
-            {
-                decisions.record_effect_detached(&receipt, DecisionEffect::Skipped);
-            }
-            return Ok(TurnOutcome::Continue);
         }
         self.goal_prescreen_skips = 0;
         let evaluation = goal.evaluations.saturating_add(1);
@@ -2999,17 +3069,47 @@ impl<'h> Agent<'h> {
             .ok()
             .flatten()
             .flatten()?;
-        if decisions.mode(&DecisionFeature::SkillSuggestions) == &FeatureMode::Advise
-            && let Some(name) = suggested_skill(
-                &outcome,
-                &candidates,
-                decisions.config().thresholds.routing_confidence,
-            )
-        {
-            self.push_injected(Message::synthetic(skill_reminder(name)));
-            if let Some(receipt) = &outcome.receipt {
-                decisions.record_effect_detached(receipt, DecisionEffect::Advised);
+        let suggestion = suggested_skill(
+            &outcome,
+            &candidates,
+            decisions.config().thresholds.routing_confidence,
+        )
+        .zip(skill_answer(&outcome));
+        match (
+            decisions.mode(&DecisionFeature::SkillSuggestions),
+            suggestion,
+        ) {
+            (FeatureMode::Advise, Some(suggestion @ (name, _))) => {
+                self.emit_decision(skill_note(
+                    &decisions,
+                    NoteOutcome::Acted,
+                    suggestion,
+                    &candidates,
+                ));
+                self.push_injected(Message::synthetic(skill_reminder(name)));
+                if let Some(receipt) = &outcome.receipt {
+                    decisions.record_effect_detached(receipt, DecisionEffect::Advised);
+                }
             }
+            (FeatureMode::Shadow, Some(suggestion)) => {
+                self.emit_decision(skill_note(
+                    &decisions,
+                    NoteOutcome::Shadow,
+                    suggestion,
+                    &candidates,
+                ));
+            }
+            (FeatureMode::Advise, None) => {
+                if let Some(failure) = outcome.fresh_failure() {
+                    self.emit_decision(NoteDraft::fell_back(
+                        &decisions,
+                        DecisionFeature::SkillSuggestions,
+                        &failure,
+                        SKILL_FALLBACK,
+                    ));
+                }
+            }
+            _ => {}
         }
         Some(SkillSuggestion {
             decisions,
@@ -3023,6 +3123,14 @@ impl<'h> Agent<'h> {
     fn decision_context(&self) -> DecisionContext {
         self.permissions
             .decision_context(json!({"turn": self.turn_id}))
+    }
+
+    /// Reports what a decision feature did this turn, for a row placed before
+    /// the next transcript item: emit it before pushing what the decision
+    /// added, so the row sits above it.
+    pub(crate) fn emit_decision(&self, draft: NoteDraft) {
+        let anchor = NoteAnchor::History(self.history.transcript().count());
+        self.event_tx.try_send(draft.anchored(anchor));
     }
 
     async fn prescreen_goal(&self, condition: &str) -> Option<(Decisions, DecisionOutcome)> {
@@ -3653,6 +3761,25 @@ impl SkillSuggestion {
     }
 }
 
+/// The nudge with the probability that crossed the threshold, then both.
+fn question_nudge_note(
+    decisions: &Decisions,
+    outcome: NoteOutcome,
+    probability: f64,
+    threshold: f64,
+) -> NoteDraft {
+    NoteDraft::new(
+        decisions,
+        DecisionFeature::QuestionToolNudge,
+        outcome,
+        &format!("{QUESTION_NUDGED} ({probability:.2})"),
+        vec![
+            format!("{probability:.2}  {}", question_tool_nudge::QUESTION),
+            format!("{threshold:.2}  {THRESHOLD_LABEL}"),
+        ],
+    )
+}
+
 fn question_nudge_request(history: &History) -> Option<&str> {
     for item in history.transcript().rev() {
         if let HistoryItemKind::User {
@@ -3793,14 +3920,19 @@ pub(crate) fn skill_questions(candidates: &[SkillInventoryEntry]) -> Option<Ques
     .ok()
 }
 
+fn skill_answer(outcome: &DecisionOutcome) -> Option<&ChoiceAnswer> {
+    match outcome.result.as_ref().ok()?.answers.get(SKILL_QUESTION)? {
+        Answer::Choice(answer) => Some(answer),
+        Answer::Noul(_) | Answer::Score(_) => None,
+    }
+}
+
 pub(crate) fn suggested_skill<'a>(
     outcome: &DecisionOutcome,
     candidates: &'a [SkillInventoryEntry],
     threshold: f64,
 ) -> Option<&'a str> {
-    let Answer::Choice(answer) = outcome.result.as_ref().ok()?.answers.get(SKILL_QUESTION)? else {
-        return None;
-    };
+    let answer = skill_answer(outcome)?;
     if answer.confidence < threshold {
         return None;
     }
@@ -3808,6 +3940,34 @@ pub(crate) fn suggested_skill<'a>(
         .iter()
         .find(|skill| skill.name == answer.choice)
         .map(|skill| skill.name.as_str())
+}
+
+/// The suggestion with the answer's confidence, then each offered option
+/// with its probability, most likely first.
+fn skill_note(
+    decisions: &Decisions,
+    outcome: NoteOutcome,
+    (name, answer): (&str, &ChoiceAnswer),
+    candidates: &[SkillInventoryEntry],
+) -> NoteDraft {
+    let mut options: Vec<(&str, f64)> = candidates
+        .iter()
+        .map(|skill| skill.name.as_str())
+        .chain([SKILL_NONE])
+        .filter_map(|option| Some((option, *answer.probabilities.get(option)?)))
+        .collect();
+    options.sort_by(|(_, left), (_, right)| right.total_cmp(left));
+    let details = options
+        .into_iter()
+        .map(|(option, probability)| format!("{probability:.2}  {option}"))
+        .collect();
+    NoteDraft::new(
+        decisions,
+        DecisionFeature::SkillSuggestions,
+        outcome,
+        &format!("{SKILL_SUGGESTED} {name} ({:.2})", answer.confidence),
+        details,
+    )
 }
 
 fn skill_reminder(name: &str) -> String {
@@ -3887,14 +4047,38 @@ pub(crate) fn should_skip_goal(
     mode == &FeatureMode::Enforce
         && consecutive < MAX_GOAL_PRESCREEN_SKIPS
         && continuations.saturating_add(1) < limit
-        && outcome
-            .result
-            .as_ref()
-            .ok()
-            .and_then(|response| response.answers.get(GOAL_MET_QUESTION))
-            .is_some_and(
-                |answer| matches!(answer, Answer::Noul(answer) if answer.noul <= threshold),
-            )
+        && goal_pass_probability(outcome).is_some_and(|probability| probability <= threshold)
+}
+
+fn goal_pass_probability(outcome: &DecisionOutcome) -> Option<f64> {
+    match outcome
+        .result
+        .as_ref()
+        .ok()?
+        .answers
+        .get(GOAL_MET_QUESTION)?
+    {
+        Answer::Noul(answer) => Some(answer.noul),
+        Answer::Choice(_) | Answer::Score(_) => None,
+    }
+}
+
+fn goal_skip_note(
+    decisions: &Decisions,
+    outcome: NoteOutcome,
+    probability: f64,
+    threshold: f64,
+) -> NoteDraft {
+    NoteDraft::new(
+        decisions,
+        DecisionFeature::GoalPrescreen,
+        outcome,
+        &format!("{GOAL_SKIPPED} (pass probability {probability:.2} ≤ {threshold:.2})"),
+        vec![
+            format!("{probability:.2}  {GOAL_MET_QUESTION}"),
+            format!("{threshold:.2}  {THRESHOLD_LABEL}"),
+        ],
+    )
 }
 
 fn queued_message(display: &str) -> String {
@@ -4272,7 +4456,7 @@ mod tests {
     use crate::background_reminder::{RuntimeHealth, RuntimeSnapshot, render};
     use crate::cancel::CancelTrigger;
     use crate::context::{ContextKey, ContextStore};
-    use crate::decisions::DecisionState;
+    use crate::decisions::{DecisionNote, DecisionState};
     use crate::mcp::tool_names;
     use crate::memory::relevance::RECALL_OPEN;
     use crate::memory::relevance::tests::{
@@ -4294,6 +4478,11 @@ mod tests {
     const DECISION_VERDICT: &str = "not yet verified";
     const DECISION_SKILL: &str = "test-helper";
     const DECISION_SKILL_TASK: &str = "effect-suggestion-regression";
+    const DECISION_NOTE_SUMMARY: &str = "named 1 note";
+    const DECISION_NOTE_ROUNDS: usize = 2;
+    const DECISION_GOAL_CONTINUATIONS: u32 = 8;
+    const CERTAIN_PROBABILITY: &str = "1.00";
+    const NO_PROBABILITY: &str = "0.00";
     const SKILL_TASK: &str = "testing ";
     const LONG_TASK_REPEATS: usize = 400;
     const RANKING_TASK: &str = "testing fixtures";
@@ -4645,42 +4834,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let mut history = History::new(Vec::new());
             let (mut agent, _events) = make_agent(MockProvider::new(Vec::new()), &mut history);
-            let authority = AuthorityIdentity::new(
-                SourceTrustAnchor::new(DECISION_SKILL).unwrap(),
-                DECISION_SKILL,
-                DECISION_SKILL,
-                DECISION_SKILL,
-                DECISION_SKILL,
-            )
-            .unwrap();
-            let remote = RemoteSkill {
-                source: RemoteAssetIdentity {
-                    principal: AuthenticatedPrincipalId::new(authority.clone(), DECISION_SKILL)
-                        .unwrap(),
-                    project: ProjectIdentity::new(
-                        authority.clone(),
-                        ProjectKey::new(DECISION_SKILL).unwrap(),
-                    ),
-                    authority,
-                    path: WorkspacePath::new(DECISION_SKILL).unwrap(),
-                    resource_id: ResourceId::new(DECISION_SKILL).unwrap(),
-                    revision: ResourceRevision::new(DECISION_SKILL).unwrap(),
-                },
-                name: DECISION_SKILL.into(),
-                description: DECISION_SKILL_TASK.into(),
-                content: DECISION_SKILL_TASK.into(),
-            };
-            agent
-                .registry
-                .register(
-                    Arc::new(skill::SkillTool::remote(&[remote])),
-                    ToolSource::Native {
-                        owner: DECISION_SKILL.into(),
-                        contract: DECISION_SKILL.into(),
-                        trusted: true,
-                    },
-                )
-                .unwrap();
+            register_decision_skill(&agent);
             agent.permissions.set_decisions(Some(feature_decisions(
                 &directory,
                 mode,
@@ -4749,6 +4903,199 @@ mod tests {
         });
     }
 
+    fn register_decision_skill(agent: &Agent<'_>) {
+        let authority = AuthorityIdentity::new(
+            SourceTrustAnchor::new(DECISION_SKILL).unwrap(),
+            DECISION_SKILL,
+            DECISION_SKILL,
+            DECISION_SKILL,
+            DECISION_SKILL,
+        )
+        .unwrap();
+        let remote = RemoteSkill {
+            source: RemoteAssetIdentity {
+                principal: AuthenticatedPrincipalId::new(authority.clone(), DECISION_SKILL)
+                    .unwrap(),
+                project: ProjectIdentity::new(
+                    authority.clone(),
+                    ProjectKey::new(DECISION_SKILL).unwrap(),
+                ),
+                authority,
+                path: WorkspacePath::new(DECISION_SKILL).unwrap(),
+                resource_id: ResourceId::new(DECISION_SKILL).unwrap(),
+                revision: ResourceRevision::new(DECISION_SKILL).unwrap(),
+            },
+            name: DECISION_SKILL.into(),
+            description: DECISION_SKILL_TASK.into(),
+            content: DECISION_SKILL_TASK.into(),
+        };
+        agent
+            .registry
+            .register(
+                Arc::new(skill::SkillTool::remote(&[remote])),
+                ToolSource::Native {
+                    owner: DECISION_SKILL.into(),
+                    contract: DECISION_SKILL.into(),
+                    trusted: true,
+                },
+            )
+            .unwrap();
+    }
+
+    fn decision_notes(events: &flume::Receiver<Envelope>) -> Vec<DecisionNote> {
+        events
+            .try_iter()
+            .filter_map(|envelope| match envelope.event {
+                AgentEvent::Decision(note) => Some(*note),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn cancelled_token() -> CancelToken {
+        let (trigger, token) = CancelToken::new();
+        trigger.cancel();
+        token
+    }
+
+    #[test_case(FeatureMode::Advise, 1.0, false, false, &[NoteOutcome::Acted, NoteOutcome::Acted], SKILL_SUGGESTED; "advise_suggests")]
+    #[test_case(FeatureMode::Shadow, 1.0, false, false, &[NoteOutcome::Shadow, NoteOutcome::Shadow], SKILL_SUGGESTED; "shadow_would_suggest")]
+    #[test_case(FeatureMode::Advise, 0.1, false, false, &[], SKILL_SUGGESTED; "uncertain_says_nothing")]
+    #[test_case(FeatureMode::Advise, 1.0, true, false, &[NoteOutcome::FellBack], SKILL_FALLBACK; "failure_is_noted_once")]
+    #[test_case(FeatureMode::Advise, 1.0, false, true, &[], SKILL_SUGGESTED; "cancelled_says_nothing")]
+    fn decision_skill_notes(
+        mode: FeatureMode,
+        confidence: f64,
+        fail: bool,
+        cancelled: bool,
+        expected: &[NoteOutcome],
+        phrase: &str,
+    ) {
+        smol::block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let mut history = History::new(Vec::new());
+            let (mut agent, events) = make_agent(MockProvider::new(Vec::new()), &mut history);
+            register_decision_skill(&agent);
+            agent.permissions.set_decisions(Some(feature_decisions(
+                &directory,
+                mode.clone(),
+                0.0,
+                confidence,
+                fail,
+                Arc::new(AtomicUsize::new(0)),
+            )));
+            if cancelled {
+                agent.cancel = cancelled_token();
+            }
+            for _ in 0..DECISION_NOTE_ROUNDS {
+                agent.suggest_skill(DECISION_SKILL_TASK).await;
+            }
+            let notes = decision_notes(&events);
+            assert_eq!(
+                notes.iter().map(|note| note.outcome).collect::<Vec<_>>(),
+                expected
+            );
+            let acted = notes
+                .iter()
+                .filter(|note| note.outcome == NoteOutcome::Acted)
+                .count();
+            assert_eq!(agent.history.as_slice().len(), acted);
+            for (round, note) in notes.iter().enumerate() {
+                assert_eq!(note.feature, DecisionFeature::SkillSuggestions);
+                assert_eq!(note.mode, mode);
+                let before = if note.outcome == NoteOutcome::Acted {
+                    round
+                } else {
+                    0
+                };
+                assert_eq!(note.anchor, NoteAnchor::History(before));
+                match note.outcome {
+                    NoteOutcome::FellBack => assert!(note.summary.ends_with(phrase)),
+                    NoteOutcome::Acted | NoteOutcome::Shadow => {
+                        assert_eq!(
+                            note.summary,
+                            format!(
+                                "{}{phrase} {DECISION_SKILL} ({confidence:.2})",
+                                note.outcome.lead()
+                            )
+                        );
+                        assert_eq!(
+                            note.details,
+                            [
+                                format!("{CERTAIN_PROBABILITY}  {DECISION_SKILL}"),
+                                format!("{NO_PROBABILITY}  {SKILL_NONE}")
+                            ]
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test_case(FeatureMode::Enforce, 0.0, false, false, &[NoteOutcome::Acted, NoteOutcome::Acted], GOAL_SKIPPED; "enforce_skips")]
+    #[test_case(FeatureMode::Shadow, 0.0, false, false, &[NoteOutcome::Shadow, NoteOutcome::Shadow], GOAL_SKIPPED; "shadow_would_skip")]
+    #[test_case(FeatureMode::Enforce, 0.5, false, false, &[], GOAL_SKIPPED; "uncertain_says_nothing")]
+    #[test_case(FeatureMode::Enforce, 0.0, true, false, &[NoteOutcome::FellBack], GOAL_PRESCREEN_FALLBACK; "failure_is_noted_once")]
+    #[test_case(FeatureMode::Enforce, 0.0, false, true, &[], GOAL_SKIPPED; "cancelled_says_nothing")]
+    fn decision_goal_notes(
+        mode: FeatureMode,
+        probability: f64,
+        fail: bool,
+        cancelled: bool,
+        expected: &[NoteOutcome],
+        phrase: &str,
+    ) {
+        smol::block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let mut history = History::new(Vec::new());
+            let verdicts = (0..DECISION_NOTE_ROUNDS)
+                .map(|_| goal_response(false, false, DECISION_VERDICT))
+                .collect();
+            let (mut agent, events) = make_agent(MockProvider::new(verdicts), &mut history);
+            agent.goal.set(DECISION_GOAL).unwrap();
+            agent
+                .goal
+                .set_continuation_limit(DECISION_GOAL_CONTINUATIONS);
+            agent.permissions.set_decisions(Some(feature_decisions(
+                &directory,
+                mode.clone(),
+                probability,
+                1.0,
+                fail,
+                Arc::new(AtomicUsize::new(0)),
+            )));
+            if cancelled {
+                agent.cancel = cancelled_token();
+            }
+            for _ in 0..DECISION_NOTE_ROUNDS {
+                let _ = agent.goal_completion(DoneReason::EndTurn).await;
+            }
+            let notes = decision_notes(&events);
+            assert_eq!(
+                notes.iter().map(|note| note.outcome).collect::<Vec<_>>(),
+                expected
+            );
+            for note in &notes {
+                assert_eq!(note.feature, DecisionFeature::GoalPrescreen);
+                assert_eq!(note.mode, mode);
+                match note.outcome {
+                    NoteOutcome::FellBack => assert!(note.summary.ends_with(phrase)),
+                    NoteOutcome::Acted | NoteOutcome::Shadow => {
+                        let decisions = agent.permissions.decisions().unwrap();
+                        let threshold = decisions.config().thresholds.goal_skip_below;
+                        assert_eq!(
+                            note.summary,
+                            format!(
+                                "{}{phrase} (pass probability {probability:.2} ≤ {threshold:.2})",
+                                note.outcome.lead()
+                            )
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     /// An agent whose memory holds one note the engine judges relevant to
     /// [`RECALL_REQUEST`], with recall in `mode`.
     fn recalling_agent<'h>(
@@ -4814,10 +5161,15 @@ mod tests {
         });
     }
 
-    #[test_case(FeatureMode::Advise, 1, 1 ; "advise_reminds")]
-    #[test_case(FeatureMode::Shadow, 0, 1 ; "shadow_only_asks")]
-    #[test_case(FeatureMode::Off, 0, 0 ; "off_never_asks")]
-    fn memory_recall_reminds_only_when_advising(mode: FeatureMode, reminders: usize, asked: usize) {
+    #[test_case(FeatureMode::Advise, 1, 1, Some(NoteOutcome::Acted) ; "advise_reminds")]
+    #[test_case(FeatureMode::Shadow, 0, 1, Some(NoteOutcome::Shadow) ; "shadow_only_asks")]
+    #[test_case(FeatureMode::Off, 0, 0, None ; "off_never_asks")]
+    fn memory_recall_reminds_only_when_advising(
+        mode: FeatureMode,
+        reminders: usize,
+        asked: usize,
+        outcome: Option<NoteOutcome>,
+    ) {
         smol::block_on(async {
             let state = tempdir();
             let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
@@ -4825,13 +5177,26 @@ mod tests {
             let engine = NoteEngine::scoring(&[(RECALL_NOTE, RELEVANT)]);
             let calls = Arc::clone(&engine.calls);
             let mut history = History::new(Vec::new());
-            let (mut agent, _events) =
+            let (mut agent, events) =
                 recalling_agent(&mut history, state.path(), mode, engine, provider);
 
             agent.run(recall_input()).await.unwrap();
 
             assert_eq!(recall_reminders(&captured.lock().unwrap()[0]), reminders);
             assert_eq!(calls.load(Ordering::Relaxed), asked);
+            let rows: Vec<NoteOutcome> = events
+                .try_iter()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::Decision(note)
+                        if note.feature == DecisionFeature::MemoryRecall
+                            && matches!(note.anchor, NoteAnchor::History(_)) =>
+                    {
+                        Some(note.outcome)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(rows, Vec::from_iter(outcome));
         });
     }
 
@@ -5043,6 +5408,34 @@ mod tests {
         let loaded = loaded_skills(&history.transcript_items());
         assert_eq!(loaded.len(), expected);
         assert_eq!(loaded.contains(DECISION_SKILL), !is_error);
+    }
+
+    #[test]
+    fn a_turn_note_is_anchored_at_the_transcript_length_across_a_seam() {
+        let archived = History::new(vec![
+            Message::user(DECISION_GOAL.into()),
+            Message::synthetic(DECISION_VERDICT.into()),
+        ])
+        .into_items();
+        let mut history = History::new(vec![Message::user(GO.into())]).with_archived(archived);
+        let items = history.transcript().count();
+        assert_ne!(items, history.len());
+        let (agent, events) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        agent.emit_decision(NoteDraft {
+            feature: DecisionFeature::MemoryRecall,
+            mode: FeatureMode::Advise,
+            outcome: NoteOutcome::Acted,
+            summary: DECISION_NOTE_SUMMARY.into(),
+            details: Vec::new(),
+        });
+        let anchors: Vec<NoteAnchor> = events
+            .try_iter()
+            .filter_map(|envelope| match envelope.event {
+                AgentEvent::Decision(note) => Some(note.anchor),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(anchors, [NoteAnchor::History(items)]);
     }
     const MAX_AFTER_TOOLS: u32 = 3;
     const MAX_IDLE_NUDGES: u32 = 2;

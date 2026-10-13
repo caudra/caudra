@@ -13,12 +13,12 @@ use std::time::Instant;
 use async_lock::Mutex as AsyncMutex;
 use caudra_config::ProfileToolPolicy;
 use caudra_config::decisions::FeatureMode;
-use caudra_decision::{Answer, DecisionResponse};
+use caudra_decision::{Answer, DecisionResponse, ScoreAnswer};
 use serde_json::{Value as JsonValue, json};
 use tracing::info;
 
 use caudra_providers::model::{Model, ModelPurpose};
-use caudra_providers::model_registry::{self, Binding};
+use caudra_providers::model_registry::Binding;
 use caudra_providers::provider;
 use caudra_providers::{
     CacheKey, HistoryItem, Message, ThinkingConfig, TokenUsage, add_cost, expand_message,
@@ -32,12 +32,13 @@ use caudra_storage::{
 };
 
 use super::steering::{SharedSteering, Steering};
-use super::{ModelRoute, resolve_model_for_purpose};
+use super::{ModelRoute, resolve_model_for_purpose, resolve_purpose_model_for_inspection};
 use crate::background::JobScope;
 use crate::cancel::{CancelMap, CancelSlot};
 use crate::decisions::questions as decision_questions;
 use crate::decisions::{
-    DecisionFeature, DecisionReceipt, DecisionState, Decisions, redacted_excerpt,
+    DecisionFeature, DecisionReceipt, DecisionState, Decisions, NoteDraft, NoteOutcome,
+    redacted_excerpt,
 };
 use crate::permissions::PassiveDecisionRevision;
 use crate::prompt::PromptId;
@@ -76,6 +77,14 @@ const ROUTINE_LEVEL: usize = 1;
 const OPEN_ENDED_LEVEL: usize = 3;
 const SUBAGENT_PROMPT_EXCERPT_BYTES: usize = 900;
 const ROUTING_INPUT_SCOPE: &str = "task_label_and_prompt_excerpt";
+/// Each difficulty level by index, in the words of its criterion.
+const DIFFICULTY_LEVELS: [&str; 4] = ["lookup", "routine", "judgment", "open-ended"];
+const ROUTINE_BAND: &str = "routine or less";
+const OPEN_ENDED_BAND: &str = "open-ended";
+const ROUTED: &str = "routed to";
+const ROUTING_FALLBACK: &str = "kept the default subagent model";
+const BASELINE_LABEL: &str = "baseline";
+const CHOSEN_LABEL: &str = "chosen";
 
 /// Forwards subagent events to the parent, stamped with the subagent identity.
 /// Usage takes two paths: live on the tool header while the run goes on (last
@@ -915,20 +924,9 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         .or_else(|| routed.as_ref().map(|route| route.purpose))
         .map(Binding::Same);
     let model_binding = subagent_model_binding(profile.as_deref(), asked.as_ref());
-    let baseline = routed.as_ref().and_then(|_| {
-        let binding = model_registry::binding(ModelPurpose::Subagent);
-        Model::resolve_binding_if_available(
-            ModelPurpose::Subagent,
-            binding.as_ref(),
-            if binding.is_some() {
-                &ctx.chat_model
-            } else {
-                &ctx.model
-            },
-            &ctx.model_policy,
-        )
-        .ok()
-    });
+    let baseline = routed
+        .as_ref()
+        .and_then(|_| inspected_subagent_model(ctx, None));
     let resolved = resolve_provider(ctx, model_binding).await;
     let (model, provider) = match resolved {
         result
@@ -1082,13 +1080,22 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         opts.name,
     )?;
     if let Some(route) = routed
-        && let Some(receipt) = route.receipt
         && let Some(baseline) = baseline
         && baseline.spec() != subagent.params.model.spec()
     {
-        route
-            .decisions
-            .record_effect_detached(&receipt, DecisionEffect::Rerouted);
+        ctx.emit_decision(routing_note(
+            &route.decisions,
+            NoteOutcome::Acted,
+            route.purpose,
+            &route.difficulty,
+            &baseline,
+            &subagent.params.model,
+        ));
+        if let Some(receipt) = route.receipt {
+            route
+                .decisions
+                .record_effect_detached(&receipt, DecisionEffect::Rerouted);
+        }
     }
     Ok(subagent)
 }
@@ -1309,6 +1316,7 @@ struct SubagentRoute {
     revision: PassiveDecisionRevision,
     decisions: Decisions,
     receipt: Option<DecisionReceipt>,
+    difficulty: ScoreAnswer,
 }
 
 /// What the router reads about a task. `profile` is set only when the caller
@@ -1355,21 +1363,97 @@ async fn route_subagent(
         .ok()
         .flatten()
         .flatten()?;
-    if !ctx.permissions.passive_decision_is_current(revision)
-        || decisions.mode(&DecisionFeature::SubagentRouting) != &FeatureMode::Enforce
-    {
+    if !ctx.permissions.passive_decision_is_current(revision) {
         return None;
     }
-    let purpose = subagent_job(
-        &outcome.result.ok()?,
-        decisions.config().thresholds.routing_confidence,
-    )?;
-    Some(SubagentRoute {
-        purpose,
-        revision,
+    let mode = decisions.mode(&DecisionFeature::SubagentRouting).clone();
+    let Ok(response) = &outcome.result else {
+        if mode == FeatureMode::Enforce
+            && let Some(failure) = outcome.fresh_failure()
+        {
+            ctx.emit_decision(NoteDraft::fell_back(
+                &decisions,
+                DecisionFeature::SubagentRouting,
+                &failure,
+                ROUTING_FALLBACK,
+            ));
+        }
+        return None;
+    };
+    let purpose = subagent_job(response, decisions.config().thresholds.routing_confidence)?;
+    let difficulty = difficulty(response)?.clone();
+    match mode {
+        FeatureMode::Enforce => Some(SubagentRoute {
+            purpose,
+            revision,
+            decisions,
+            receipt: outcome.receipt,
+            difficulty,
+        }),
+        FeatureMode::Shadow => {
+            if let Some(baseline) = inspected_subagent_model(ctx, None)
+                && let Some(chosen) = inspected_subagent_model(ctx, Some(&Binding::Same(purpose)))
+                && baseline.spec() != chosen.spec()
+            {
+                ctx.emit_decision(routing_note(
+                    &decisions,
+                    NoteOutcome::Shadow,
+                    purpose,
+                    &difficulty,
+                    &baseline,
+                    &chosen,
+                ));
+            }
+            None
+        }
+        FeatureMode::Off | FeatureMode::Advise => None,
+    }
+}
+
+/// The Subagent model a binding resolves to, without warming the catalog.
+fn inspected_subagent_model(ctx: &ToolContext, binding: Option<&Binding>) -> Option<Model> {
+    resolve_purpose_model_for_inspection(
+        ModelPurpose::Subagent,
+        binding,
+        &ctx.model,
+        &ctx.chat_model,
+        &ctx.model_policy,
+    )
+    .ok()
+}
+
+/// The model change and the band that chose it, then each level's
+/// probability and both models.
+fn routing_note(
+    decisions: &Decisions,
+    outcome: NoteOutcome,
+    purpose: ModelPurpose,
+    difficulty: &ScoreAnswer,
+    baseline: &Model,
+    chosen: &Model,
+) -> NoteDraft {
+    let (band, probability) = match purpose {
+        ModelPurpose::Fast => (ROUTINE_BAND, difficulty.at_most(ROUTINE_LEVEL)),
+        _ => (OPEN_ENDED_BAND, difficulty.at_least(OPEN_ENDED_LEVEL)),
+    };
+    let (chosen, baseline) = (chosen.spec(), baseline.spec());
+    let mut details: Vec<String> = DIFFICULTY_LEVELS
+        .iter()
+        .enumerate()
+        .filter_map(|(level, name)| {
+            let probability = difficulty.probabilities.get(&level.to_string())?;
+            Some(format!("{probability:.2}  {name}"))
+        })
+        .collect();
+    details.push(format!("{BASELINE_LABEL} {baseline}"));
+    details.push(format!("{CHOSEN_LABEL} {chosen}"));
+    NoteDraft::new(
         decisions,
-        receipt: outcome.receipt,
-    })
+        DecisionFeature::SubagentRouting,
+        outcome,
+        &format!("{ROUTED} {chosen} instead of {baseline} (difficulty {band}, {probability:.2})"),
+        details,
+    )
 }
 
 /// The label, a redacted excerpt of the prompt, the mode and any chosen
@@ -1391,12 +1475,17 @@ pub(crate) fn routing_state(task: &RoutingTask) -> JsonValue {
     }
 }
 
+fn difficulty(response: &DecisionResponse) -> Option<&ScoreAnswer> {
+    match response.answers.get(DIFFICULTY_QUESTION)? {
+        Answer::Score(difficulty) => Some(difficulty),
+        Answer::Noul(_) | Answer::Choice(_) => None,
+    }
+}
+
 /// Routine work or less runs on the Fast model and open-ended work on the
 /// Best one; anything between keeps the Subagent model.
 pub(crate) fn subagent_job(response: &DecisionResponse, threshold: f64) -> Option<ModelPurpose> {
-    let Answer::Score(difficulty) = response.answers.get(DIFFICULTY_QUESTION)? else {
-        return None;
-    };
+    let difficulty = difficulty(response)?;
     if difficulty.at_most(ROUTINE_LEVEL) >= threshold {
         Some(ModelPurpose::Fast)
     } else if difficulty.at_least(OPEN_ENDED_LEVEL) >= threshold {
@@ -1649,6 +1738,7 @@ mod tests {
         ContextInventory, ContextKey, ContextReadiness, ContextSnapshot, ContextStore,
         ContextUsage, ContextWindow,
     };
+    use crate::decisions::NoteAnchor;
     use crate::permissions::{PermissionManager, PermissionMode, PermissionRequest};
     use crate::prompt::EFFICIENT_TOOLS_LABEL;
     use crate::tools::BATCH_TOOL_NAME;
@@ -1658,7 +1748,7 @@ mod tests {
     use crate::tools::test_support::NamedMock;
     use crate::tools::{FILE_GREP_TOOL_NAME, TASK_TOOL_NAME};
     use crate::tools::{ToolEffect, audited_local_tool};
-    use crate::{CancelToken, ToolDoneEvent, TurnCompleteEvent};
+    use crate::{AgentEvent, CancelToken, EventSender, ToolDoneEvent, TurnCompleteEvent};
     use caudra_config::{PermissionsConfig, ToolKey};
     use caudra_providers::{Billing, ContentBlock, Message, Role};
     use caudra_storage::id::SessionRef;
@@ -1674,6 +1764,7 @@ mod tests {
     const ROUTING_PROFILE: &str = "security";
     const ROUTING_SECRET: &str = "do-not-send-this-value";
     const FAST_LEVELS: [f64; 4] = [0.6, 0.35, 0.05, 0.0];
+    const ROUTING_ROUNDS: usize = 2;
     const LONG_LABEL_WORDS: usize = 140;
     const LONG_PROMPT_WORDS: usize = 400;
     const EFFECT_TEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2017,6 +2108,77 @@ mod tests {
                     break;
                 }
                 futures_lite::future::yield_now().await;
+            }
+        });
+    }
+
+    #[test_case(FeatureMode::Enforce, false, false, &[NoteOutcome::Acted, NoteOutcome::Acted], ROUTED; "enforce_routes")]
+    #[test_case(FeatureMode::Shadow, false, false, &[NoteOutcome::Shadow, NoteOutcome::Shadow], ROUTED; "shadow_would_route")]
+    #[test_case(FeatureMode::Enforce, true, false, &[], ROUTED; "same_model_says_nothing")]
+    #[test_case(FeatureMode::Enforce, false, true, &[NoteOutcome::FellBack], ROUTING_FALLBACK; "failure_is_noted_once")]
+    fn decision_subagent_routing_notes(
+        mode: FeatureMode,
+        same_model: bool,
+        fail: bool,
+        expected: &[NoteOutcome],
+        phrase: &str,
+    ) {
+        smol::block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let decisions = routing_decisions(
+                &directory,
+                mode.clone(),
+                RoutingEngine {
+                    levels: FAST_LEVELS,
+                    fail,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                },
+            );
+            let (sender, events) = flume::unbounded();
+            for _ in 0..ROUTING_ROUNDS {
+                let mut ctx = routing_context();
+                ctx.model = Arc::new(
+                    Model::from_spec(if same_model {
+                        ROUTING_FAST
+                    } else {
+                        ROUTING_BASELINE
+                    })
+                    .unwrap(),
+                );
+                ctx.chat_model = Arc::new(Model::from_spec(ROUTING_FAST).unwrap());
+                ctx.event_tx = EventSender::new(sender.clone(), RUN_ID);
+                ctx.tool_use_id = Some(TOOL_ID.into());
+                ctx.permissions.set_decisions(Some(decisions.clone()));
+                let mut options = task_options(None);
+                options.name = ROUTING_TASK.into();
+                open_task(&ctx, options).await.unwrap().close();
+            }
+            let notes: Vec<_> = events
+                .try_iter()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::Decision(note) => Some(note),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                notes.iter().map(|note| note.outcome).collect::<Vec<_>>(),
+                expected
+            );
+            for note in &notes {
+                assert_eq!(note.feature, DecisionFeature::SubagentRouting);
+                assert_eq!(note.mode, mode);
+                assert_eq!(note.anchor, NoteAnchor::Tool(TOOL_ID.into()));
+                match note.outcome {
+                    NoteOutcome::FellBack => assert!(note.summary.ends_with(phrase)),
+                    NoteOutcome::Acted | NoteOutcome::Shadow => assert_eq!(
+                        note.summary,
+                        format!(
+                            "{}{phrase} {ROUTING_FAST} instead of {ROUTING_BASELINE} (difficulty {ROUTINE_BAND}, {:.2})",
+                            note.outcome.lead(),
+                            FAST_LEVELS[0] + FAST_LEVELS[1]
+                        )
+                    ),
+                }
             }
         });
     }

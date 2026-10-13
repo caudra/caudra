@@ -25,7 +25,7 @@ use caudra_workspace::RecordScope;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::decisions::DecisionFeature;
+use crate::decisions::{DecisionFeature, NoteDraft, NoteSink, counted};
 use crate::memory::relevance::{self, Judge};
 use crate::memory::search::{Hit, MAX_HITS, terms};
 use crate::memory::snapshot::EntryStatus;
@@ -104,6 +104,8 @@ const REWRITTEN_BY: &str = "rewritten by entry";
 const DELETED_BY: &str = "deleted by entry";
 const ENTRY_FORGOTTEN: &str = "its text was purged";
 const DECISION_TOOL_KEY: &str = "tool";
+const EXISTING_NOTE: &str = "existing note";
+const EXISTING_NOTES: &str = "existing notes";
 /// Most notes a search's omission notice names before it only counts them.
 const OMITTED_NAMED: usize = 10;
 const OMITTED_ONE: &str = "keyword match the decision engine judged unrelated was left out";
@@ -397,6 +399,7 @@ impl MemoryCall {
         request: Request<'_>,
         origin: &EntryOrigin,
         judge: Option<&Judge>,
+        rows: Option<&NoteSink>,
     ) -> Result<Answer, ToolError> {
         if let Err(error) = store.reconcile() {
             warn!(
@@ -409,9 +412,11 @@ impl MemoryCall {
         match request {
             Request::View => view(store).map(Answer::Found),
             Request::Zoom { id, n } => zoom(store, id, n).map(Answer::Found),
-            Request::Search(query) => search(store, query, judge).await.map(Answer::Found),
+            Request::Search(query) => search(store, query, judge, rows).await.map(Answer::Found),
             Request::Read(path) => read(store, path).map(Answer::Found),
-            Request::Write { path, content } => write(store, path, content, origin, judge).await,
+            Request::Write { path, content } => {
+                write(store, path, content, origin, judge, rows).await
+            }
             Request::Delete(path) => delete(store, path, origin),
         }
     }
@@ -556,8 +561,15 @@ impl ToolInvocation for MemoryCall {
             {
                 Ok((request, store)) => {
                     let judge = judge(ctx);
-                    self.answer(&store, request, &entry_origin(ctx), judge.as_ref())
-                        .await
+                    let rows = ctx.note_sink();
+                    self.answer(
+                        &store,
+                        request,
+                        &entry_origin(ctx),
+                        judge.as_ref(),
+                        rows.as_ref(),
+                    )
+                    .await
                 }
                 Err(error) => Err(error),
             };
@@ -703,10 +715,11 @@ async fn search(
     store: &MemoryStore,
     query: &str,
     judge: Option<&Judge>,
+    rows: Option<&NoteSink>,
 ) -> Result<MemoryOutput, ToolError> {
     let (found, omitted) = match judge.filter(|judge| judge.enabled(&DecisionFeature::MemorySearch))
     {
-        Some(judge) => ranked_search(store, query, judge).await?,
+        Some(judge) => ranked_search(store, query, judge, rows).await?,
         None => (store.search(query)?, Vec::new()),
     };
     let hits: Vec<MemoryHit> = found
@@ -737,9 +750,12 @@ async fn ranked_search(
     store: &MemoryStore,
     query: &str,
     judge: &Judge,
+    rows: Option<&NoteSink>,
 ) -> Result<(Vec<Hit>, Vec<String>), ToolError> {
     let pool = store.search_pool(query)?;
-    let Some(ranking) = relevance::rank_search(judge, query, &pool).await else {
+    let (ranking, note) = relevance::rank_search(judge, query, &pool).await;
+    emit(rows, note);
+    let Some(ranking) = ranking else {
         return Ok((
             pool.into_iter()
                 .take(MAX_HITS)
@@ -806,6 +822,7 @@ async fn write(
     content: &str,
     origin: &EntryOrigin,
     judge: Option<&Judge>,
+    rows: Option<&NoteSink>,
 ) -> Result<Answer, ToolError> {
     if let Some(error) = notes::write_size_error(content) {
         return Err(invalid(error));
@@ -820,7 +837,7 @@ async fn write(
         None => format!("{name} {UNCHANGED}"),
     };
     if let Some(judge) = judge {
-        receipt.push_str(&duplicates(store, judge, &name, content).await);
+        receipt.push_str(&duplicates(store, judge, &name, content, rows).await);
     }
     Ok(Answer::Changed {
         receipt,
@@ -828,12 +845,37 @@ async fn write(
     })
 }
 
-/// One line per existing note the engine judged to cover the same topic.
-async fn duplicates(store: &MemoryStore, judge: &Judge, name: &str, content: &str) -> String {
+/// One line per existing note the engine judged to cover the same topic,
+/// and a row naming them.
+async fn duplicates(
+    store: &MemoryStore,
+    judge: &Judge,
+    name: &str,
+    content: &str,
+    rows: Option<&NoteSink>,
+) -> String {
     let notes = relevance::duplicate_pool(store, name, content);
-    let Some(advice) = relevance::duplicate_advice(judge, name, content, &notes).await else {
-        return String::new();
+    let advice = match relevance::duplicate_advice(judge, name, content, &notes).await {
+        Ok(advice) => advice,
+        Err(note) => {
+            emit(rows, note);
+            return String::new();
+        }
     };
+    if advice.advised.is_empty() {
+        return String::new();
+    }
+    let acted = format!(
+        "named {} on the same topic",
+        counted(advice.advised.len(), EXISTING_NOTE, EXISTING_NOTES)
+    );
+    emit(
+        rows,
+        Some(advice.note(DecisionFeature::MemoryDuplicates, &acted, &notes)),
+    );
+    if !advice.applied() {
+        return String::new();
+    }
     let advised = advice
         .advised
         .iter()
@@ -841,6 +883,12 @@ async fn duplicates(store: &MemoryStore, judge: &Judge, name: &str, content: &st
         .collect();
     advice.record();
     advised
+}
+
+fn emit(rows: Option<&NoteSink>, note: Option<NoteDraft>) {
+    if let (Some(rows), Some(note)) = (rows, note) {
+        rows.emit(note);
+    }
 }
 
 fn delete(store: &MemoryStore, path: &str, origin: &EntryOrigin) -> Result<Answer, ToolError> {
@@ -974,8 +1022,8 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::AgentMode;
     use crate::agent::tool_dispatch::{self, Emit};
+    use crate::decisions::{DecisionNote, ENGINE_UNREACHABLE, NoteAnchor, NoteOutcome};
     use crate::memory::relevance::tests::{
         NoteEngine, RELATED, RELEVANT, assert_effects, note_judge,
     };
@@ -989,6 +1037,7 @@ mod tests {
     use crate::tools::test_support::stub_ctx;
     use crate::tools::{MEMORY_TOOL_NAME, PLAN_WRITE_RESTRICTED};
     use crate::types::MEMORY_DIRECTORY_LABEL;
+    use crate::{AgentEvent, AgentMode, CancelToken, EventSender};
 
     const REGISTERED_EFFECT: ToolEffect = ToolEffect::Mutating;
     const SCOPE: &str = "projects/test";
@@ -1017,6 +1066,12 @@ mod tests {
     const FONTS_NOTE: &str = "# Fonts\nThe release key signs two fonts.";
     const TAGS_NOTE: &str = "# Tags\nRelease tags are signed with the key.";
     const TAGS_REWRITE: &str = "# Tags\nRelease tags are signed before publishing.";
+    const CALL_ID: &str = "toolu_memory";
+    const SECRET: &str = "do-not-send-this-value";
+    const SEARCH_ROW: &str = "ranked 3 keyword matches; left out 1 judged unrelated";
+    const DUPLICATE_ROW: &str = "named 1 existing note on the same topic";
+    const SHADOW_DUPLICATE_ROW: &str = "would have named 1 existing note on the same topic";
+    const DUPLICATE_LINE: &str = "0.95  0+1 release.md  named";
 
     struct Fixture {
         _state: TempDir,
@@ -1048,9 +1103,29 @@ mod tests {
         }
 
         fn judged(&self, input: Value, judge: Option<&Judge>) -> Result<Answer, ToolError> {
+            self.noted(input, judge).0
+        }
+
+        /// The answer, and the rows placed after the call's card.
+        fn noted(
+            &self,
+            input: Value,
+            judge: Option<&Judge>,
+        ) -> (Result<Answer, ToolError>, Vec<DecisionNote>) {
+            let (tx, rx) = flume::unbounded();
+            let rows = NoteSink::new(EventSender::new(tx, 0), NoteAnchor::Tool(CALL_ID.into()));
             let call = call(input);
-            let request = call.request()?;
-            smol::block_on(call.answer(&self.store, request, &session(), judge))
+            let answer = call.request().and_then(|request| {
+                smol::block_on(call.answer(&self.store, request, &session(), judge, Some(&rows)))
+            });
+            let notes = rx
+                .try_iter()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::Decision(note) => Some(*note),
+                    _ => None,
+                })
+                .collect();
+            (answer, notes)
         }
 
         /// What the model reads: a reading command's one rendering, or a
@@ -1073,7 +1148,7 @@ mod tests {
         fn execute(&self, input: Value) -> ToolExecResult {
             let call = call(input);
             call.reply(call.request().and_then(|request| {
-                smol::block_on(call.answer(&self.store, request, &session(), None))
+                smol::block_on(call.answer(&self.store, request, &session(), None, None))
             }))
         }
 
@@ -1458,14 +1533,21 @@ mod tests {
         notes
     }
 
-    fn judged_hits(notes: &Fixture, judge: &Judge) -> (Vec<String>, Vec<String>) {
+    fn judged_hits(
+        notes: &Fixture,
+        judge: &Judge,
+    ) -> (Vec<String>, Vec<String>, Vec<DecisionNote>) {
         let input = json!({ "command": "search", "query": FLAKY_QUERY });
-        let Ok(Answer::Found(MemoryOutput::Hits { hits, notices, .. })) =
-            notes.judged(input, Some(judge))
+        let (Ok(Answer::Found(MemoryOutput::Hits { hits, notices, .. })), rows) =
+            notes.noted(input, Some(judge))
         else {
             panic!("{FOUND_MSG}");
         };
-        (hits.into_iter().map(|hit| hit.name).collect(), notices)
+        (
+            hits.into_iter().map(|hit| hit.name).collect(),
+            notices,
+            rows,
+        )
     }
 
     #[test]
@@ -1478,20 +1560,30 @@ mod tests {
             NoteEngine::scoring(&[(CI, RELEVANT), (RELEASE, RELATED)]),
         );
 
-        let (hits, notices) = judged_hits(&notes, &judge);
+        let (hits, notices, rows) = judged_hits(&notes, &judge);
 
         assert_eq!(hits, [CI, RELEASE]);
         assert_eq!(
             notices,
             [format!("1 {OMITTED_ONE}: {FLAKY_TESTS}. {OMITTED_HINT}")]
         );
+        let [row] = rows.as_slice() else {
+            panic!("one row for one ranked search, got {rows:?}");
+        };
+        assert_eq!(row.outcome, NoteOutcome::Acted);
+        assert_eq!(row.summary, SEARCH_ROW);
+        assert_eq!(row.anchor, NoteAnchor::Tool(CALL_ID.into()));
         smol::block_on(assert_effects(state.path(), &[DecisionEffect::Rerouted]));
     }
 
-    #[test_case(FeatureMode::Off, false ; "off")]
-    #[test_case(FeatureMode::Shadow, false ; "shadow")]
-    #[test_case(FeatureMode::Enforce, true ; "engine_failed")]
-    fn a_search_without_an_answer_keeps_the_keyword_order(mode: FeatureMode, fail: bool) {
+    #[test_case(FeatureMode::Off, false, None ; "off")]
+    #[test_case(FeatureMode::Shadow, false, Some(NoteOutcome::Shadow) ; "shadow")]
+    #[test_case(FeatureMode::Enforce, true, Some(NoteOutcome::FellBack) ; "engine_failed")]
+    fn a_search_without_an_answer_keeps_the_keyword_order(
+        mode: FeatureMode,
+        fail: bool,
+        outcome: Option<NoteOutcome>,
+    ) {
         let notes = flaky_notes();
         let state = tempdir();
         let judge = note_judge(
@@ -1503,10 +1595,12 @@ mod tests {
             },
         );
 
-        let (hits, notices) = judged_hits(&notes, &judge);
+        let (hits, notices, rows) = judged_hits(&notes, &judge);
 
         assert_eq!(hits, [FLAKY_TESTS, RELEASE, CI]);
         assert!(notices.is_empty());
+        let outcomes: Vec<NoteOutcome> = rows.iter().map(|row| row.outcome).collect();
+        assert_eq!(outcomes, Vec::from_iter(outcome));
     }
 
     #[test]
@@ -1537,8 +1631,8 @@ mod tests {
             NoteEngine::scoring(&[(RELEASE, RELEVANT)]),
         );
 
-        let Ok(Answer::Changed { receipt, .. }) =
-            notes.judged(write_input(TAGS, TAGS_NOTE), Some(&judge))
+        let (Ok(Answer::Changed { receipt, .. }), rows) =
+            notes.noted(write_input(TAGS, TAGS_NOTE), Some(&judge))
         else {
             panic!("{RECEIPT_MSG}");
         };
@@ -1548,7 +1642,116 @@ mod tests {
             format!("wrote {TAGS} (entry 2)\n`{RELEASE}` {DUPLICATE_ADVICE}")
         );
         assert_eq!(fs::read_to_string(notes.dir.join(TAGS)).unwrap(), TAGS_NOTE);
+        let [row] = rows.as_slice() else {
+            panic!("one row for one duplicate check, got {rows:?}");
+        };
+        assert_eq!(row.outcome, NoteOutcome::Acted);
+        assert_eq!(row.summary, DUPLICATE_ROW);
+        assert_eq!(row.details, [DUPLICATE_LINE]);
         smol::block_on(assert_effects(state.path(), &[DecisionEffect::Advised]));
+    }
+
+    fn duplicate_rows(
+        mode: FeatureMode,
+        engine: NoteEngine,
+        cancelled: bool,
+        writes: &[(&str, &str)],
+    ) -> Vec<(String, Vec<DecisionNote>)> {
+        let notes = fixture();
+        notes.write(RELEASE, RELEASE_NOTE);
+        let state = tempdir();
+        let mut judge = note_judge(
+            state.path(),
+            |features| features.memory_duplicates = mode,
+            engine,
+        );
+        if cancelled {
+            let (trigger, cancel) = CancelToken::new();
+            trigger.cancel();
+            judge.cancel = cancel;
+        }
+        writes
+            .iter()
+            .map(|(name, content)| {
+                let (Ok(Answer::Changed { receipt, .. }), rows) =
+                    notes.noted(write_input(name, content), Some(&judge))
+                else {
+                    panic!("{RECEIPT_MSG}");
+                };
+                (receipt, rows)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_shadow_duplicate_check_leaves_the_receipt_alone() {
+        let written = duplicate_rows(
+            FeatureMode::Shadow,
+            NoteEngine::scoring(&[(RELEASE, RELEVANT)]),
+            false,
+            &[(TAGS, TAGS_NOTE)],
+        );
+
+        let [(receipt, rows)] = written.as_slice() else {
+            panic!("{RECEIPT_MSG}");
+        };
+        assert_eq!(receipt, &format!("wrote {TAGS} (entry 1)"));
+        let summaries: Vec<&str> = rows.iter().map(|row| row.summary.as_str()).collect();
+        assert_eq!(summaries, [SHADOW_DUPLICATE_ROW]);
+    }
+
+    #[test]
+    fn a_failing_duplicate_check_falls_back_once_until_it_answers() {
+        let written = duplicate_rows(
+            FeatureMode::Advise,
+            NoteEngine {
+                fail: true,
+                ..NoteEngine::scoring(&[(RELEASE, RELEVANT)])
+            },
+            false,
+            &[(TAGS, TAGS_NOTE), (FONTS, FONTS_NOTE)],
+        );
+
+        let summaries: Vec<Vec<String>> = written
+            .into_iter()
+            .map(|(_, rows)| rows.into_iter().map(|row| row.summary).collect())
+            .collect();
+        assert_eq!(
+            summaries,
+            [
+                vec![format!("{ENGINE_UNREACHABLE}; named no existing notes")],
+                Vec::new()
+            ]
+        );
+    }
+
+    #[test_case(NoteEngine::scoring(&[(RELEASE, RELATED)]), false ; "nothing_confident")]
+    #[test_case(NoteEngine::scoring(&[(RELEASE, RELEVANT)]), true ; "cancelled")]
+    fn a_duplicate_check_that_names_nothing_has_no_row(engine: NoteEngine, cancelled: bool) {
+        let written = duplicate_rows(FeatureMode::Advise, engine, cancelled, &[(TAGS, TAGS_NOTE)]);
+
+        assert_eq!(written, [(format!("wrote {TAGS} (entry 1)"), Vec::new())]);
+    }
+
+    #[test]
+    fn a_duplicate_row_never_carries_the_new_note_or_a_secret() {
+        let leaked = format!("{TAGS_NOTE}\nTOKEN={SECRET}");
+        let written = duplicate_rows(
+            FeatureMode::Advise,
+            NoteEngine::scoring(&[(RELEASE, RELEVANT)]),
+            false,
+            &[(TAGS, &leaked)],
+        );
+
+        let [(_, rows)] = written.as_slice() else {
+            panic!("{RECEIPT_MSG}");
+        };
+        let [row] = rows.as_slice() else {
+            panic!("one row for one duplicate check, got {rows:?}");
+        };
+        let text = format!("{}\n{}", row.summary, row.details.join("\n"));
+        assert!(!text.contains(SECRET));
+        assert!(!text.contains(TAGS));
     }
 
     #[test]

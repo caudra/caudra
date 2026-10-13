@@ -4,8 +4,8 @@ use caudra_storage::{decision_log::DecisionLabel, now_epoch};
 use serde_json::{Value, json};
 
 use super::{
-    DecisionContext, DecisionFeature, Decisions, PermissionAction, PermissionDecision,
-    PermissionFlag, questions,
+    DecisionContext, DecisionFeature, DecisionOutcome, Decisions, PermissionAction,
+    PermissionDecision, PermissionFlag, questions,
 };
 
 pub(super) const WRITES: &str = "writes_project_files";
@@ -48,23 +48,24 @@ impl Decisions {
                 )
                 .await;
         }
-        let action = if plan && *mode == FeatureMode::Advise {
-            self.config().thresholds.shell_writes.and_then(|threshold| {
-                let response = evaluation.result.as_ref().ok()?;
-                let Answer::Noul(answer) = response.answers.get(WRITES)? else {
-                    return None;
-                };
-                (answer.noul >= threshold).then(|| {
-                    PermissionAction::Advice(vec![PermissionFlag {
-                        flag: WRITES.into(),
-                        probability: answer.noul,
-                    }])
-                })
-            })
-        } else {
-            None
-        };
+        let action = (plan && *mode == FeatureMode::Advise)
+            .then(|| self.writes_flag(&evaluation))
+            .flatten()
+            .map(|flag| PermissionAction::Advice(vec![flag]));
         Some(PermissionDecision { action, evaluation })
+    }
+
+    /// The write warning an answer raises against `shell_writes`, whatever
+    /// the mode: what advise shows during plan review and shadow reports.
+    pub(crate) fn writes_flag(&self, evaluation: &DecisionOutcome) -> Option<PermissionFlag> {
+        let threshold = self.config().thresholds.shell_writes?;
+        let Answer::Noul(answer) = evaluation.result.as_ref().ok()?.answers.get(WRITES)? else {
+            return None;
+        };
+        (answer.noul >= threshold).then(|| PermissionFlag {
+            flag: WRITES.into(),
+            probability: answer.noul,
+        })
     }
 }
 

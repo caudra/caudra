@@ -43,6 +43,7 @@ impl Decisions {
                     result: Err(error),
                     latency_ms: 0,
                     receipt: None,
+                    newly_failing: false,
                 }
             }
         }

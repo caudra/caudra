@@ -870,6 +870,16 @@ impl SegmentCache {
         self.segments.insert(pos, seg);
     }
 
+    /// Drops the segments of every message from `msg_index` on, so the next
+    /// rebuild draws them under the indices they have now.
+    pub fn truncate_messages(&mut self, msg_index: usize) {
+        let kept = self
+            .segments
+            .partition_point(|seg| seg.msg_index.is_some_and(|index| index < msg_index));
+        self.segments.truncate(kept);
+        self.msg_count = self.msg_count.min(msg_index);
+    }
+
     pub fn needs_rebuild(&self, msg_len: usize) -> bool {
         self.msg_count != msg_len
     }

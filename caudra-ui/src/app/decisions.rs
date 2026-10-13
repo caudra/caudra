@@ -1,14 +1,19 @@
 //! `/decisions`: the engine as the permission manager holds it, beside the
 //! decision log in `caudra.db`, which a blocking thread reads for every
-//! scope at once.
+//! scope at once. Also the session's decision transcript rows, kept as they
+//! are drawn and read back on restore.
 
 use std::sync::{Arc, LazyLock};
 
-use caudra_agent::decisions::{Decisions, stats_thresholds};
+use caudra_agent::automation::clock::{Clock, SystemClock};
+use caudra_agent::decisions::{DecisionNote, Decisions, stats_thresholds};
 use caudra_config::ClockFormat;
 use caudra_config::decisions::{DecisionThresholds, DecisionsConfig};
 use caudra_storage::StateDir;
 use caudra_storage::decision_log::{DecisionFilter, DecisionLog, DecisionLogError};
+use caudra_storage::engine_decisions::StoredEngineDecision;
+use caudra_storage::id::CaudraId;
+use caudra_storage::sessions::SessionDatabase;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use tracing::warn;
@@ -91,6 +96,38 @@ impl App {
         };
         self.decisions_modal.view(frame, area, &ctx)
     }
+
+    /// Keeps the row a note drew for `agent`, `None` being the main agent,
+    /// whatever `show_decisions` says. The session's row goes to the writer
+    /// first, so the decision has one to reference.
+    pub(super) fn record_engine_decision(&mut self, note: &DecisionNote, agent: Option<String>) {
+        self.checkpoint_now();
+        let at_ms = u64::try_from(SystemClock::new().now_ms()).unwrap_or_default();
+        self.storage_writer
+            .record_engine_decision(self.state.session.id, note.stored(at_ms, agent));
+    }
+
+    /// The session's rows a restore draws, none while `show_decisions` is off.
+    pub(super) fn stored_engine_decisions(&self) -> Vec<StoredEngineDecision> {
+        if !self.ui_config.show_decisions {
+            return Vec::new();
+        }
+        load_engine_decisions(&self.storage, self.state.session.id)
+    }
+}
+
+/// A session's decision rows, or none when they cannot be read: they are for
+/// display alone, so a restore goes on without them.
+pub(super) fn load_engine_decisions(
+    storage: &StateDir,
+    session_id: CaudraId,
+) -> Vec<StoredEngineDecision> {
+    SessionDatabase::open(storage)
+        .and_then(|database| database.load_engine_decisions(session_id))
+        .unwrap_or_else(|error| {
+            warn!(%error, %session_id, "decision rows unreadable; restoring without them");
+            Vec::new()
+        })
 }
 
 /// Every scope's stats and newest rows, or why there are none.

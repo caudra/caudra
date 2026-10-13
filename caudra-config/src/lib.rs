@@ -1115,6 +1115,7 @@ pub struct UiFileConfig {
     pub show_thinking: Option<bool>,
     pub thinking_lines: Option<u32>,
     pub show_reminders: Option<bool>,
+    pub show_decisions: Option<bool>,
     pub theme: Option<String>,
     pub theme_light: Option<String>,
     pub clock_format: Option<ClockFormat>,
@@ -1146,6 +1147,7 @@ impl UiFileConfig {
             show_thinking,
             thinking_lines,
             show_reminders,
+            show_decisions,
             theme,
             theme_light,
             clock_format,
@@ -2303,6 +2305,12 @@ pub struct UiConfig {
     )]
     pub show_reminders: bool,
 
+    #[config(
+        default = true,
+        desc = "Show what the experimental decision engine changed: one row where it reordered, pruned or pointed out results, suggested a skill or model, skipped a goal check, or flagged a call, and one where it failed and the default applied. A dim `shadow` row shows what a feature in shadow mode would have done. Each row expands on click to the candidates and scores behind it. The model never sees these rows"
+    )]
+    pub show_decisions: bool,
+
     #[config(default = ClockFormat::System, ty = "String", default_doc = "system", desc = "Clock format for timestamps: \"12h\", \"24h\", or \"system\" (follow the OS preference, 24h when unknown)")]
     pub clock_format: ClockFormat,
 
@@ -2375,6 +2383,7 @@ impl UiConfig {
             show_thinking: f.show_thinking.unwrap_or(true),
             thinking_lines: f.thinking_lines.unwrap_or(DEFAULT_THINKING_LINES),
             show_reminders: f.show_reminders.unwrap_or(true),
+            show_decisions: f.show_decisions.unwrap_or(true),
             clock_format: f.clock_format.unwrap_or_default(),
             update_check: f.update_check.unwrap_or(true),
             update_channel: f.update_channel.unwrap_or_default(),

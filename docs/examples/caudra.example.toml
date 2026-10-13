@@ -182,6 +182,15 @@ version = 1
 # Type: bool.
 # show_reminders = true
 
+# Show what the experimental decision engine changed: one row where it
+# reordered, pruned or pointed out results, suggested a skill or model, skipped
+# a goal check, or flagged a call, and one where it failed and the default
+# applied. A dim `shadow` row shows what a feature in shadow mode would have
+# done. Each row expands on click to the candidates and scores behind it. The
+# model never sees these rows.
+# Type: bool.
+# show_decisions = true
+
 # Clock format for timestamps: "12h", "24h", or "system" (follow the OS
 # preference, 24h when unknown).
 # Type: String.

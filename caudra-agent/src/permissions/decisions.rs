@@ -6,8 +6,9 @@ use super::{
     PermissionResourceKind,
 };
 use crate::decisions::{
-    DecisionContext, DecisionFeature, DecisionReceipt, Decisions, PermissionAction,
-    PermissionDecision, PermissionPurpose,
+    DecisionContext, DecisionFeature, DecisionNote, DecisionReceipt, Decisions, NoteAnchor,
+    NoteDraft, NoteOutcome, PermissionAction, PermissionDecision, PermissionFlag,
+    PermissionPurpose,
 };
 use crate::types::Answerer;
 use crate::{AgentEvent, CancelToken};
@@ -26,6 +27,11 @@ use tracing::warn;
 const SCREEN_CANCELLED: &str = "permission screening cancelled";
 const LABEL_SOURCE: &str = "user";
 const EFFECT_UPDATE_TIMEOUT: Duration = Duration::from_secs(5);
+const SCREEN_ASKED: &str = "asked you instead of running";
+const FLAGGED: &str = "flagged";
+const WRITE_WARNED: &str = "warned the command may write to the project";
+const WRITE_FALLBACK: &str = "asked without a write warning";
+const THRESHOLD_LABEL: &str = "threshold";
 
 pub(super) type AdvisoryTask = Task<(Decisions, Option<PermissionDecision>)>;
 pub(super) type ShellAdvisoryTask = AdvisoryTask;
@@ -38,6 +44,58 @@ pub(super) struct AutoScreening {
     pub(super) note: Option<AutoNote>,
     pub(super) decision: Option<(Decisions, PermissionDecision)>,
     pub(super) escalation: Option<EscalationReceipt>,
+}
+
+impl AutoScreening {
+    /// What screening did to the call `request_id` gates, for a row after its
+    /// card: nothing once cancelled or stale, or when it changed nothing.
+    pub(super) fn decision_note(
+        &self,
+        request_id: &str,
+        cancel: &CancelToken,
+    ) -> Option<DecisionNote> {
+        let (service, decision) = self.decision.as_ref().filter(|_| !cancel.is_cancelled())?;
+        let feature = DecisionFeature::AutoScreening;
+        let flags = || service.screening_flags(&decision.evaluation);
+        let draft = match (service.mode(&feature), self.note) {
+            (FeatureMode::Enforce, Some(AutoNote::EngineFlagged)) => {
+                flagged(service, NoteOutcome::Acted, flags())?
+            }
+            (FeatureMode::Enforce, Some(AutoNote::EngineUnavailable)) => {
+                let phrase = decision.evaluation.fresh_failure()?;
+                NoteDraft::fell_back(service, feature, &phrase, SCREEN_ASKED)
+            }
+            (FeatureMode::Shadow, _) => flagged(service, NoteOutcome::Shadow, flags())?,
+            _ => return None,
+        };
+        Some(draft.anchored(NoteAnchor::Tool(request_id.to_owned())))
+    }
+}
+
+/// The likeliest flag leads the summary; every flag follows in the details,
+/// likeliest first.
+fn flagged(
+    service: &Decisions,
+    outcome: NoteOutcome,
+    mut flags: Vec<PermissionFlag>,
+) -> Option<NoteDraft> {
+    flags.sort_by(|left, right| right.probability.total_cmp(&left.probability));
+    let top = flags.first()?;
+    let summary = format!(
+        "{SCREEN_ASKED}: {FLAGGED} {} ({:.2})",
+        top.flag, top.probability
+    );
+    let details = flags
+        .iter()
+        .map(|flag| format!("{:.2}  {}", flag.probability, flag.flag))
+        .collect();
+    Some(NoteDraft::new(
+        service,
+        DecisionFeature::AutoScreening,
+        outcome,
+        &summary,
+        details,
+    ))
 }
 
 pub(super) struct EscalationReceipt {
@@ -351,6 +409,64 @@ impl PendingRegistration<'_> {
         revision: u64,
         service: &Decisions,
     ) -> Option<Task<()>> {
+        self.present(request, decision, revision)?;
+        advised(service, decision)
+    }
+
+    /// Presents the shell effect warning like any advisory, and says after
+    /// the call's card what it did, or would have done during plan review.
+    pub(super) fn annotate_shell_effect(
+        &self,
+        request: &mut PermissionRequest,
+        decision: &PermissionDecision,
+        revision: u64,
+        service: &Decisions,
+        plan: bool,
+    ) -> Option<Task<()>> {
+        let presented = self.present(request, decision, revision).is_some();
+        let feature = DecisionFeature::ShellEffect;
+        let warned = |outcome, probability: f64| {
+            let threshold = service.config().thresholds.shell_writes;
+            NoteDraft::new(
+                service,
+                DecisionFeature::ShellEffect,
+                outcome,
+                &format!("{WRITE_WARNED} ({probability:.2})"),
+                threshold
+                    .map(|threshold| format!("{THRESHOLD_LABEL} {threshold:.2}"))
+                    .into_iter()
+                    .collect(),
+            )
+        };
+        let note = match (
+            service.mode(&feature),
+            service.writes_flag(&decision.evaluation),
+        ) {
+            (FeatureMode::Advise, Some(flag)) if presented => {
+                Some(warned(NoteOutcome::Acted, flag.probability))
+            }
+            (FeatureMode::Advise, None) if plan => decision
+                .evaluation
+                .fresh_failure()
+                .map(|phrase| NoteDraft::fell_back(service, feature, &phrase, WRITE_FALLBACK)),
+            (FeatureMode::Shadow, Some(flag)) if plan => {
+                Some(warned(NoteOutcome::Shadow, flag.probability))
+            }
+            _ => None,
+        };
+        if let Some(note) = note {
+            self.event_tx
+                .try_send(note.anchored(NoteAnchor::Tool(self.request_id.to_owned())));
+        }
+        presented.then(|| advised(service, decision)).flatten()
+    }
+
+    fn present(
+        &self,
+        request: &mut PermissionRequest,
+        decision: &PermissionDecision,
+        revision: u64,
+    ) -> Option<()> {
         let _mutation = self
             .manager
             .broker
@@ -391,13 +507,16 @@ impl PendingRegistration<'_> {
             .send(AgentEvent::PermissionRequestUpdated(Box::new(
                 request.clone(),
             )))
-            .ok()?;
-        decision
-            .evaluation
-            .receipt
-            .as_ref()
-            .map(|receipt| record_effect(service, receipt, DecisionEffect::Advised))
+            .ok()
     }
+}
+
+fn advised(service: &Decisions, decision: &PermissionDecision) -> Option<Task<()>> {
+    decision
+        .evaluation
+        .receipt
+        .as_ref()
+        .map(|receipt| record_effect(service, receipt, DecisionEffect::Advised))
 }
 
 /// Labels the engine's verdicts with what the user chose. Autopilot's answers
@@ -435,10 +554,13 @@ pub(super) fn label_answer(
 
 #[cfg(test)]
 mod tests {
-    use super::{advisories, label_answer, state};
+    use super::{
+        FLAGGED, SCREEN_ASKED, WRITE_FALLBACK, WRITE_WARNED, advisories, label_answer, state,
+    };
     use crate::decisions::{
-        DecisionContext, DecisionOutcome, DecisionReceipt, Decisions, PermissionAction,
-        PermissionDecision, PermissionFlag, PermissionPurpose,
+        DecisionContext, DecisionFeature, DecisionNote, DecisionOutcome, DecisionReceipt,
+        Decisions, NoteAnchor, NoteOutcome, PermissionAction, PermissionDecision, PermissionFlag,
+        PermissionPurpose,
     };
     use crate::permissions::enforce::EvaluationContext;
     use crate::permissions::tests::{
@@ -490,6 +612,12 @@ mod tests {
     const INLINE_PYTHON: ShellOpacity = ShellOpacity::InlineScript {
         language: ScriptLanguage::Python,
     };
+    const SECRET_VALUE: &str = "sk-live-4f9a0c7e1b2d3a5f";
+    const SECRET_COMMAND: &str = "TOKEN=sk-live-4f9a0c7e1b2d3a5f cargo build";
+    const WRITE_THRESHOLD: f64 = 0.8;
+    const NOTE_ROUNDS: usize = 2;
+    const CERTAIN: &str = "1.00";
+    const SECRET_IN_NOTE: &str = "a decision note must never carry the command's secret";
 
     #[derive(Clone)]
     enum Behavior {
@@ -1018,6 +1146,7 @@ mod tests {
                 result: Err(DecisionError::Unreachable),
                 latency_ms: 0,
                 receipt: None,
+                newly_failing: false,
             },
         };
         let warnings = advisories(&decision);
@@ -1623,6 +1752,247 @@ mod tests {
             );
 
             assert!(label.is_none(), "{AUTOPILOT_IS_NOT_THE_USER}");
+        });
+    }
+
+    fn decision_notes(events: impl IntoIterator<Item = AgentEvent>) -> Vec<DecisionNote> {
+        events
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Decision(note) => Some(*note),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_no_secret(note: &DecisionNote) {
+        for text in std::iter::once(&note.summary).chain(&note.details) {
+            assert!(!text.contains(SECRET_VALUE), "{SECRET_IN_NOTE}");
+        }
+    }
+
+    /// Runs a bash call whose command carries a secret, denying any prompt,
+    /// and returns the notes it emitted.
+    async fn screened_call_notes(manager: &PermissionManager) -> Vec<DecisionNote> {
+        let (sender, events) = flume::unbounded();
+        let sender = EventSender::new(sender, 0);
+        let (_legacy_tx, legacy_rx) = flume::unbounded();
+        let legacy_rx = async_lock::Mutex::new(legacy_rx);
+        let scopes = PermissionScopes::single(FIRST_COMMAND.into());
+        let input = json!({"command": SECRET_COMMAND});
+        let cancel = CancelToken::none();
+        let tool = ToolKey::native("bash");
+        let mut call = Box::pin(manager.enforce(
+            &tool,
+            &scopes,
+            &input,
+            &sender,
+            Some(&legacy_rx),
+            CONTROLLED_REQUEST,
+            &cancel,
+            None,
+        ));
+        let mut seen = Vec::new();
+        let prompted = future::race(
+            async {
+                let _ = call.as_mut().await;
+                false
+            },
+            async {
+                loop {
+                    let event = events.recv_async().await.unwrap().event;
+                    let prompt = matches!(event, AgentEvent::PermissionRequest(_));
+                    seen.push(event);
+                    if prompt {
+                        break true;
+                    }
+                }
+            },
+        )
+        .await;
+        if prompted {
+            assert!(manager.answer(CONTROLLED_REQUEST, PermissionAnswer::Deny));
+            assert!(call.await.is_err());
+        }
+        seen.extend(events.try_iter().map(|envelope| envelope.event));
+        decision_notes(seen)
+    }
+
+    #[test_case(Behavior::Probability(1.0), FeatureMode::Enforce, &[NoteOutcome::Acted, NoteOutcome::Acted], SCREEN_ASKED; "flagged_asks")]
+    #[test_case(Behavior::Probability(1.0), FeatureMode::Shadow, &[NoteOutcome::Shadow, NoteOutcome::Shadow], SCREEN_ASKED; "shadow_would_ask")]
+    #[test_case(Behavior::Probability(0.0), FeatureMode::Enforce, &[], SCREEN_ASKED; "clear_approval_says_nothing")]
+    #[test_case(Behavior::Error, FeatureMode::Enforce, &[NoteOutcome::FellBack], SCREEN_ASKED; "failure_is_noted_once")]
+    #[test_case(Behavior::Error, FeatureMode::Shadow, &[], SCREEN_ASKED; "shadow_failure_says_nothing")]
+    fn auto_screening_notes_what_it_did(
+        behavior: Behavior,
+        screening: FeatureMode,
+        expected: &[NoteOutcome],
+        lead: &str,
+    ) {
+        smol::block_on(async {
+            let service = service(behavior, screening.clone(), FeatureMode::Off, false);
+            let manager = default_mgr();
+            manager.set_session_mode(Some(PermissionMode::Auto));
+            manager.set_decisions(Some(service.decisions));
+            let mut notes = Vec::new();
+            for _ in 0..NOTE_ROUNDS {
+                notes.extend(screened_call_notes(&manager).await);
+            }
+            assert_eq!(
+                notes.iter().map(|note| note.outcome).collect::<Vec<_>>(),
+                expected
+            );
+            for note in &notes {
+                assert_eq!(note.feature, DecisionFeature::AutoScreening);
+                assert_eq!(note.mode, screening);
+                assert_eq!(note.anchor, NoteAnchor::Tool(CONTROLLED_REQUEST.into()));
+                assert_no_secret(note);
+                match note.outcome {
+                    NoteOutcome::FellBack => assert!(note.summary.ends_with(lead)),
+                    NoteOutcome::Acted | NoteOutcome::Shadow => {
+                        assert_eq!(
+                            note.summary,
+                            format!(
+                                "{}{lead}: {FLAGGED} {} ({CERTAIN})",
+                                note.outcome.lead(),
+                                EngineFlag::Deletes.name()
+                            )
+                        );
+                        assert_eq!(
+                            note.details.len(),
+                            EngineFlag::ALL
+                                .iter()
+                                .filter(|flag| **flag != EngineFlag::WritesProjectFiles)
+                                .count()
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn a_cancelled_screening_notes_nothing() {
+        smol::block_on(async {
+            let service = service(
+                Behavior::Probability(1.0),
+                FeatureMode::Enforce,
+                FeatureMode::Off,
+                false,
+            );
+            let manager = default_mgr();
+            manager.set_session_mode(Some(PermissionMode::Auto));
+            manager.set_decisions(Some(service.decisions));
+            let request = shell_request(&[FIRST_COMMAND], workcell_shell_subject());
+            let context = EvaluationContext {
+                revision: *manager.context_revision.read().unwrap(),
+                plan_scoped: false,
+                builtin_allows: true,
+                force_prompt: false,
+                forced: false,
+                exact_plan: None,
+            };
+            let screened = manager
+                .screen_auto_candidate(&request, &context, &CancelToken::none())
+                .await
+                .unwrap();
+            assert!(
+                screened
+                    .decision_note(CONTROLLED_REQUEST, &CancelToken::none())
+                    .is_some()
+            );
+            let (trigger, cancel) = CancelToken::new();
+            trigger.cancel();
+            assert!(
+                screened
+                    .decision_note(CONTROLLED_REQUEST, &cancel)
+                    .is_none()
+            );
+        });
+    }
+
+    #[test_case(FeatureMode::Advise, Behavior::Probability(1.0), true, &[NoteOutcome::Acted, NoteOutcome::Acted], WRITE_WARNED; "plan_warning")]
+    #[test_case(FeatureMode::Shadow, Behavior::Probability(1.0), true, &[NoteOutcome::Shadow, NoteOutcome::Shadow], WRITE_WARNED; "shadow_would_warn")]
+    #[test_case(FeatureMode::Advise, Behavior::Probability(0.0), true, &[], WRITE_WARNED; "unlikely_write_says_nothing")]
+    #[test_case(FeatureMode::Advise, Behavior::Probability(1.0), false, &[], WRITE_WARNED; "build_prompt_says_nothing")]
+    #[test_case(FeatureMode::Shadow, Behavior::Probability(1.0), false, &[], WRITE_WARNED; "shadow_build_prompt_says_nothing")]
+    #[test_case(FeatureMode::Advise, Behavior::Error, true, &[NoteOutcome::FellBack], WRITE_FALLBACK; "failure_is_noted_once")]
+    fn shell_effect_notes_the_warning_it_presented(
+        mode: FeatureMode,
+        behavior: Behavior,
+        plan: bool,
+        expected: &[NoteOutcome],
+        phrase: &str,
+    ) {
+        smol::block_on(async {
+            let mut config = DecisionsConfig {
+                base_url: Some(BASE_URL.parse().unwrap()),
+                timeout_ms: TIMEOUT_MS,
+                ..Default::default()
+            };
+            config.features.shell_effect = mode.clone();
+            config.thresholds.shell_writes = Some(WRITE_THRESHOLD);
+            let service = configured_service(behavior, config, false);
+            let manager = default_mgr();
+            let scopes = PermissionScopes::single(FIRST_COMMAND.into());
+            let (sender, events) = flume::unbounded();
+            let sender = EventSender::new(sender, 0);
+            let cancel = CancelToken::none();
+            let mut enforcement =
+                Box::pin(controlled_enforcement(&manager, &scopes, &sender, &cancel));
+            assert!(future::poll_once(&mut enforcement).await.is_none());
+            let AgentEvent::PermissionRequest(mut request) = events.try_recv().unwrap().event
+            else {
+                panic!("{PROMPT_MISSING}");
+            };
+            let registration = PendingRegistration {
+                manager: &manager,
+                request_id: CONTROLLED_REQUEST,
+                sender: manager.pending()[&manager.id][CONTROLLED_REQUEST]
+                    .sender
+                    .clone(),
+                event_tx: &sender,
+            };
+            let revision = manager.broker.revision.load(Ordering::Acquire);
+            for _ in 0..NOTE_ROUNDS {
+                let decision = service
+                    .decisions
+                    .shell_effect(SECRET_COMMAND, false, plan, &DecisionContext::default())
+                    .await
+                    .unwrap();
+                request.presentation.advisories.clear();
+                if let Some(effect) = registration.annotate_shell_effect(
+                    &mut request,
+                    &decision,
+                    revision,
+                    &service.decisions,
+                    plan,
+                ) {
+                    effect.detach();
+                }
+            }
+            assert!(manager.answer(CONTROLLED_REQUEST, PermissionAnswer::Deny));
+            assert!(enforcement.await.is_err());
+            let notes = decision_notes(events.try_iter().map(|envelope| envelope.event));
+            assert_eq!(
+                notes.iter().map(|note| note.outcome).collect::<Vec<_>>(),
+                expected
+            );
+            for note in &notes {
+                assert_eq!(note.feature, DecisionFeature::ShellEffect);
+                assert_eq!(note.mode, mode);
+                assert_eq!(note.anchor, NoteAnchor::Tool(CONTROLLED_REQUEST.into()));
+                assert_no_secret(note);
+                match note.outcome {
+                    NoteOutcome::FellBack => assert!(note.summary.ends_with(phrase)),
+                    NoteOutcome::Acted | NoteOutcome::Shadow => {
+                        assert_eq!(
+                            note.summary,
+                            format!("{}{phrase} ({CERTAIN})", note.outcome.lead())
+                        )
+                    }
+                }
+            }
         });
     }
 }

@@ -26381,3 +26381,150 @@ mod autopilot {
         linked.stop();
     }
 }
+
+mod engine_decisions {
+    use caudra_agent::AgentEvent;
+    use caudra_agent::decisions::{DecisionFeature, DecisionNote, NoteAnchor, NoteOutcome};
+    use caudra_agent::tools::SHELL_TOOL_NAME;
+    use caudra_config::decisions::FeatureMode;
+    use caudra_providers::{ContentBlock, Message, Role};
+    use caudra_storage::sessions::{SessionDatabase, StoredSubagent, StoredSubagentOutcome};
+    use std::sync::Arc;
+    use test_case::test_case;
+
+    use super::{
+        App, DONE_TEXT, agent_msg, build_app, drain_writer, subagent_msg, tempdir_app, test_model,
+        test_writer,
+    };
+    use crate::AppSession;
+    use crate::chat::Chat;
+    use crate::components::{DECISION_SEPARATOR, DisplayRole};
+
+    const CALL: &str = "decision-call";
+    const TASK: &str = "decision-task";
+    const TASK_NAME: &str = "ranker";
+    const USER_TEXT: &str = "find the release notes";
+    const TASK_PROMPT: &str = "rank the notes";
+    const CALL_RESULT: &str = "release-notes.md";
+    const MAIN_SUMMARY: &str = "ranked for the main agent";
+    const TASK_SUMMARY: &str = "ranked for the task";
+    const ROWS_KEPT: &str = "every row the transcript drew must be kept, shown or not";
+
+    fn note(summary: &str, anchor: NoteAnchor) -> AgentEvent {
+        DecisionNote::new(
+            DecisionFeature::MemorySearch,
+            FeatureMode::Advise,
+            NoteOutcome::Acted,
+            summary,
+            Vec::new(),
+            anchor,
+        )
+        .into()
+    }
+
+    /// A card by its call, a decision row by its summary, anything else by
+    /// its text.
+    fn placement(chat: &Chat) -> Vec<&str> {
+        (0..chat.message_count())
+            .filter_map(|index| chat.message_at(index))
+            .map(|message| match &message.role {
+                DisplayRole::Tool(tool) => tool.id.as_str(),
+                DisplayRole::Decision(_) => message
+                    .text
+                    .rsplit(DECISION_SEPARATOR)
+                    .next()
+                    .unwrap_or_default(),
+                _ => message.text.as_str(),
+            })
+            .collect()
+    }
+
+    fn seed_transcript(app: &mut App) {
+        let main = [
+            Message::user(USER_TEXT.into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    CALL,
+                    SHELL_TOOL_NAME,
+                    serde_json::json!({}),
+                )],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: CALL.into(),
+                    content: CALL_RESULT.into(),
+                    is_error: false,
+                    output_ref: None,
+                }],
+                ..Default::default()
+            },
+        ];
+        let session = app.state.session_mut();
+        session.replace_messages(crate::history_items(&main));
+        session.set_subagent_messages(
+            TASK.into(),
+            crate::history_items(&[Message::user(TASK_PROMPT.into())]),
+        );
+        session.set_subagents(vec![StoredSubagent {
+            tool_use_id: TASK.into(),
+            parent_tool_use_id: None,
+            root_tool_use_id: None,
+            name: TASK_NAME.into(),
+            model: None,
+            thinking: None,
+            fast: false,
+            outcome: StoredSubagentOutcome::Done,
+        }]);
+    }
+
+    /// The App keeps each row through the storage writer, and a reopened
+    /// session draws the main agent's under its call and the task's in the
+    /// task's own transcript, unless decisions are hidden.
+    #[test_case(true ; "shown")]
+    #[test_case(false ; "hidden")]
+    fn decision_rows_survive_a_reload(shown: bool) {
+        let (_tmp, dir, writer, mut app) = tempdir_app();
+        app.run_id = 1;
+        seed_transcript(&mut app);
+        app.update(agent_msg(note(MAIN_SUMMARY, NoteAnchor::Tool(CALL.into()))));
+        app.update(subagent_msg(
+            note(TASK_SUMMARY, NoteAnchor::History(1)),
+            TASK,
+            Some(TASK_NAME),
+        ));
+        let id = app.state.session.id;
+        drain_writer(app, writer);
+        let kept = SessionDatabase::open(&dir)
+            .unwrap()
+            .load_engine_decisions(id)
+            .unwrap();
+        assert_eq!(
+            kept.iter()
+                .map(|row| (row.summary.as_str(), row.agent.as_deref()))
+                .collect::<Vec<_>>(),
+            [(MAIN_SUMMARY, None), (TASK_SUMMARY, Some(TASK))],
+            "{ROWS_KEPT}"
+        );
+
+        let mut restored = build_app(dir.clone(), Arc::new(test_writer(dir.clone())));
+        restored.ui_config.show_decisions = shown;
+        restored
+            .apply_loaded_session(AppSession::load(id, &dir).unwrap(), &test_model())
+            .unwrap();
+
+        let main_rows: &[&str] = if shown { &[MAIN_SUMMARY] } else { &[] };
+        let task_rows: &[&str] = if shown { &[TASK_SUMMARY] } else { &[] };
+        assert_eq!(
+            placement(&restored.chats[0]),
+            [&[USER_TEXT, CALL][..], main_rows].concat()
+        );
+        let task = restored.chat_index[TASK];
+        assert_eq!(
+            placement(&restored.chats[task]),
+            [&[TASK_PROMPT][..], task_rows, &[DONE_TEXT]].concat()
+        );
+    }
+}

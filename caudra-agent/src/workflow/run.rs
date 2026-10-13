@@ -28,6 +28,7 @@ use futures_lite::future;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
+use super::manager::CALL_LABEL_FIELD;
 use super::state::{Published, now_secs, publish, snapshot_from_row, stored_status};
 use super::store::WorkflowStore;
 use crate::agent::subagent::TaskIdentity;
@@ -51,6 +52,7 @@ const DECISION_FAILED: &str = "workflow decision engine failed";
 const DECISION_INVALID: &str = "workflow decision response was invalid";
 const DECISION_REJECTED: &str = "workflow decision request was rejected";
 const DECISION_REFUSED: &str = "workflow decision was refused by the engine";
+const REDACTED_FIELD: &str = "redacted";
 
 /// What every attempt shares with the runtime that launched it.
 #[derive(Clone)]
@@ -108,6 +110,7 @@ enum HostCommand {
     Decision {
         key: CallKey,
         request: DecisionRequest,
+        label: String,
         reply: Sender<Result<DecisionResult, HostError>>,
     },
     Agent {
@@ -156,10 +159,16 @@ impl HostAdapter {
 }
 
 impl WorkflowHost for HostAdapter {
-    fn decide(&self, key: CallKey, request: &DecisionRequest) -> Result<DecisionResult, HostError> {
+    fn decide(
+        &self,
+        key: CallKey,
+        request: &DecisionRequest,
+        label: &str,
+    ) -> Result<DecisionResult, HostError> {
         self.ask(|reply| HostCommand::Decision {
             key,
             request: request.clone(),
+            label: label.to_owned(),
             reply,
         })?
     }
@@ -411,8 +420,9 @@ impl Driver {
             HostCommand::Decision {
                 key,
                 request,
+                label,
                 reply,
-            } => match self.admit_decision(key, request).await {
+            } => match self.admit_decision(key, request, &label).await {
                 Ok(()) => self.pending = Some(Pending::Decision { reply }),
                 Err(error) => drop(reply.send(Err(error))),
             },
@@ -458,10 +468,12 @@ impl Driver {
         }
     }
 
+    /// Stores the engine's label and the request hash, never the state or the questions.
     async fn admit_decision(
         &mut self,
         key: CallKey,
         request: DecisionRequest,
+        label: &str,
     ) -> Result<(), HostError> {
         if self.preempted || self.cancel.is_cancelled() {
             return Err(HostError::Cancelled);
@@ -484,7 +496,7 @@ impl Driver {
                 call_key: key.0,
                 kind: WorkflowCallKind::Decision,
                 request_hash: hash_request(CallKind::Decision, &value).to_string(),
-                request: json!({ "redacted": true }).to_string(),
+                request: json!({ REDACTED_FIELD: true, CALL_LABEL_FIELD: label }).to_string(),
                 task_id: None,
             })
             .await

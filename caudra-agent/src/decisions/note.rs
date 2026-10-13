@@ -1,0 +1,474 @@
+use caudra_config::decisions::FeatureMode;
+use caudra_storage::engine_decisions::{
+    StoredDecisionAnchor, StoredDecisionOutcome, StoredEngineDecision,
+};
+use serde::{Serialize, Serializer};
+
+use super::{DecisionFeature, Decisions, candidate_text};
+use crate::EventSender;
+
+const MAX_SUMMARY_BYTES: usize = 200;
+const MAX_DETAIL_BYTES: usize = 200;
+const MAX_DETAIL_LINES: usize = 20;
+const MAX_NOTE_BYTES: usize = 4_096;
+const ELLIPSIS: &str = "…";
+const CONTROL_REPLACEMENT: char = ' ';
+const MORE_PREFIX: &str = "+";
+const MORE_SUFFIX: &str = " more";
+const MAX_COUNT_DIGITS: usize = usize::MAX.ilog10() as usize + 1;
+const MORE_LINE_BYTES: usize = MORE_PREFIX.len() + MAX_COUNT_DIGITS + MORE_SUFFIX.len();
+/// The store numbers rows as it inserts them.
+const UNASSIGNED_SEQ: u64 = 0;
+const MAX_LABEL_BYTES: usize = 120;
+const SHADOW_PREFIX: &str = "would have ";
+const NO_LEAD: &str = "";
+const FALLBACK_SEPARATOR: &str = "; ";
+const COLUMN_SEPARATOR: &str = "  ";
+const ORDINAL_SUFFIXES: [&str; 4] = ["th", "st", "nd", "rd"];
+const KEPT_VERB: &str = "kept";
+const MOVED_VERB: &str = "moved";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteOutcome {
+    /// The engine's answer changed what happened.
+    Acted,
+    /// Shadow mode: what the answer would have changed.
+    Shadow,
+    /// The engine failed, so the default applied.
+    FellBack,
+}
+
+impl NoteOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Acted => "acted",
+            Self::Shadow => "shadow",
+            Self::FellBack => "fell_back",
+        }
+    }
+
+    /// What a summary opens with before what the surface did: a shadow row
+    /// tells what it would have done.
+    pub(crate) const fn lead(self) -> &'static str {
+        match self {
+            Self::Shadow => SHADOW_PREFIX,
+            Self::Acted | Self::FellBack => NO_LEAD,
+        }
+    }
+}
+
+/// Where a note sits among the turns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteAnchor {
+    /// Before the transcript item at this index, counted across compaction
+    /// seams.
+    History(usize),
+    /// After the card of the call with this tool use id.
+    Tool(String),
+}
+
+/// What a decision feature did, for a display-only transcript row.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DecisionNote {
+    /// Serialized as the name the decision log records.
+    #[serde(serialize_with = "feature_name")]
+    pub feature: DecisionFeature,
+    pub mode: FeatureMode,
+    pub outcome: NoteOutcome,
+    /// What happened. The row's title names the feature, so this does not.
+    pub summary: String,
+    /// One candidate or value per line.
+    pub details: Vec<String>,
+    pub anchor: NoteAnchor,
+}
+
+impl DecisionNote {
+    /// Every line is single, free of control characters and cut on a
+    /// character boundary. At most [`MAX_DETAIL_LINES`] details are kept, the
+    /// last counting any left out, and the text stays within
+    /// [`MAX_NOTE_BYTES`].
+    pub fn new(
+        feature: DecisionFeature,
+        mode: FeatureMode,
+        outcome: NoteOutcome,
+        summary: &str,
+        details: Vec<String>,
+        anchor: NoteAnchor,
+    ) -> Self {
+        let summary = single_line(summary, MAX_SUMMARY_BYTES);
+        let details = bounded_details(details, MAX_NOTE_BYTES - summary.len());
+        Self {
+            feature,
+            mode,
+            outcome,
+            summary,
+            details,
+            anchor,
+        }
+    }
+
+    /// The row a session keeps for this note, made at `at_ms` for `agent`,
+    /// `None` being the main agent.
+    pub fn stored(&self, at_ms: u64, agent: Option<String>) -> StoredEngineDecision {
+        StoredEngineDecision {
+            seq: UNASSIGNED_SEQ,
+            at_ms,
+            feature: self.feature.name().to_owned(),
+            mode: self.mode.as_str().to_owned(),
+            outcome: self.outcome.into(),
+            summary: self.summary.clone(),
+            details: self.details.clone(),
+            agent,
+            anchor: match &self.anchor {
+                NoteAnchor::History(len) => StoredDecisionAnchor::History(*len),
+                NoteAnchor::Tool(id) => StoredDecisionAnchor::Tool(id.clone()),
+            },
+        }
+    }
+}
+
+impl From<NoteOutcome> for StoredDecisionOutcome {
+    fn from(outcome: NoteOutcome) -> Self {
+        match outcome {
+            NoteOutcome::Acted => Self::Acted,
+            NoteOutcome::Shadow => Self::Shadow,
+            NoteOutcome::FellBack => Self::FellBack,
+        }
+    }
+}
+
+impl From<StoredDecisionOutcome> for NoteOutcome {
+    fn from(outcome: StoredDecisionOutcome) -> Self {
+        match outcome {
+            StoredDecisionOutcome::Acted => Self::Acted,
+            StoredDecisionOutcome::Shadow => Self::Shadow,
+            StoredDecisionOutcome::FellBack => Self::FellBack,
+        }
+    }
+}
+
+/// A row before it is placed: the surface that knows what happened is not
+/// always the one that knows where the row sits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NoteDraft {
+    pub feature: DecisionFeature,
+    pub mode: FeatureMode,
+    pub outcome: NoteOutcome,
+    pub summary: String,
+    pub details: Vec<String>,
+}
+
+impl NoteDraft {
+    /// `acted` says what the surface did, in the past tense; a shadow row
+    /// reads it as what the surface would have done.
+    pub fn new(
+        decisions: &Decisions,
+        feature: DecisionFeature,
+        outcome: NoteOutcome,
+        acted: &str,
+        details: Vec<String>,
+    ) -> Self {
+        Self {
+            mode: decisions.mode(&feature).clone(),
+            feature,
+            outcome,
+            summary: format!("{}{acted}", outcome.lead()),
+            details,
+        }
+    }
+
+    /// The engine's `failure`, then the `default` the surface kept instead.
+    pub fn fell_back(
+        decisions: &Decisions,
+        feature: DecisionFeature,
+        failure: &str,
+        default: &str,
+    ) -> Self {
+        let summary = format!("{failure}{FALLBACK_SEPARATOR}{default}");
+        Self::new(
+            decisions,
+            feature,
+            NoteOutcome::FellBack,
+            &summary,
+            Vec::new(),
+        )
+    }
+
+    pub fn anchored(self, anchor: NoteAnchor) -> DecisionNote {
+        DecisionNote::new(
+            self.feature,
+            self.mode,
+            self.outcome,
+            &self.summary,
+            self.details,
+            anchor,
+        )
+    }
+}
+
+/// Places a surface's drafts at one anchor.
+#[derive(Clone)]
+pub struct NoteSink {
+    event_tx: EventSender,
+    anchor: NoteAnchor,
+}
+
+impl NoteSink {
+    pub fn new(event_tx: EventSender, anchor: NoteAnchor) -> Self {
+        Self { event_tx, anchor }
+    }
+
+    pub fn emit(&self, draft: NoteDraft) {
+        self.event_tx.try_send(draft.anchored(self.anchor.clone()));
+    }
+}
+
+/// `0.97  42+1 release-preview-7  kept 1st`: a candidate's score, the label
+/// the transcript already shows it by, redacted and bounded, and what became
+/// of it.
+pub fn score_line(score: f64, label: &str, action: &str) -> String {
+    let label = candidate_text(label, MAX_LABEL_BYTES);
+    format!("{score:.2}{COLUMN_SEPARATOR}{label}{COLUMN_SEPARATOR}{action}")
+}
+
+/// `1st`, `2nd`, `11th`, for the position at 0-based `index`.
+fn ordinal(index: usize) -> String {
+    let position = index + 1;
+    let suffix = match (position % 10, position % 100) {
+        (_, 11..=13) => ORDINAL_SUFFIXES[0],
+        (last @ 1..=3, _) => ORDINAL_SUFFIXES[last],
+        _ => ORDINAL_SUFFIXES[0],
+    };
+    format!("{position}{suffix}")
+}
+
+/// `kept 1st` or `moved 3rd to 1st`, for a candidate that went from 0-based
+/// `from` to `to`.
+pub fn placement(from: usize, to: usize) -> String {
+    match from == to {
+        true => format!("{KEPT_VERB} {}", ordinal(to)),
+        false => format!("{MOVED_VERB} {} to {}", ordinal(from), ordinal(to)),
+    }
+}
+
+/// `1 note` or `3 notes`.
+pub fn counted(count: usize, one: &str, many: &str) -> String {
+    match count {
+        1 => format!("{count} {one}"),
+        _ => format!("{count} {many}"),
+    }
+}
+
+fn feature_name<S: Serializer>(
+    feature: &DecisionFeature,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(feature.name())
+}
+
+/// Each line that fits in `budget` bytes while leaving room to count the
+/// rest, and the count once one does not.
+fn bounded_details(details: Vec<String>, mut budget: usize) -> Vec<String> {
+    let total = details.len();
+    let mut kept = Vec::with_capacity(total.min(MAX_DETAIL_LINES));
+    for (index, detail) in details.into_iter().enumerate() {
+        let remaining = total - index;
+        let last = remaining == 1;
+        let reserve = if last { 0 } else { MORE_LINE_BYTES };
+        let line = (last || kept.len() + 1 < MAX_DETAIL_LINES)
+            .then(|| single_line(&detail, MAX_DETAIL_BYTES))
+            .filter(|line| line.len() + reserve <= budget);
+        let Some(line) = line else {
+            kept.push(format!("{MORE_PREFIX}{remaining}{MORE_SUFFIX}"));
+            break;
+        };
+        budget -= line.len();
+        kept.push(line);
+    }
+    kept
+}
+
+/// `text` on one line with its control characters blanked, cut to `limit`
+/// bytes on a character boundary and marked when cut.
+fn single_line(text: &str, limit: usize) -> String {
+    let text = text.trim();
+    let end = match text.len() > limit {
+        true => text.floor_char_boundary(limit - ELLIPSIS.len()),
+        false => text.len(),
+    };
+    let mut line: String = text[..end]
+        .chars()
+        .map(|character| match character.is_control() {
+            true => CONTROL_REPLACEMENT,
+            false => character,
+        })
+        .collect();
+    if end < text.len() {
+        line.push_str(ELLIPSIS);
+    }
+    line
+}
+
+#[cfg(test)]
+mod tests {
+    use caudra_config::decisions::FeatureMode;
+    use caudra_storage::engine_decisions::{
+        StoredDecisionAnchor, StoredDecisionOutcome, StoredEngineDecision,
+    };
+    use serde_json::json;
+    use test_case::test_case;
+
+    use super::{
+        DecisionNote, ELLIPSIS, MAX_DETAIL_BYTES, MAX_DETAIL_LINES, MAX_NOTE_BYTES,
+        MAX_SUMMARY_BYTES, NoteAnchor, NoteOutcome, UNASSIGNED_SEQ, placement,
+    };
+    use crate::AgentEvent;
+    use crate::decisions::DecisionFeature;
+
+    const SUMMARY: &str = "moved 3 of 12 rows up";
+    const DETAIL: &str = "0.97  42+1 release-preview-7  kept 1st";
+    const CONTROLLED: &str = "\n kept\u{1b}[31m 1st\r\n\tof\u{7}12 \n";
+    const CONTROL_FREE: &str = "kept [31m 1st   of 12";
+    const WIDE: &str = "é";
+    const NARROW: &str = "x";
+    const ONE_MORE: &str = "+1 more";
+    const HISTORY_LEN: usize = 38;
+    const TOOL_USE_ID: &str = "toolu_01";
+    const AT_MS: u64 = 1_767_225_600_000;
+    const AGENT: &str = "task-1";
+
+    fn note(summary: &str, details: Vec<String>) -> DecisionNote {
+        DecisionNote::new(
+            DecisionFeature::CodeContext,
+            FeatureMode::Enforce,
+            NoteOutcome::Acted,
+            summary,
+            details,
+            NoteAnchor::Tool(TOOL_USE_ID.into()),
+        )
+    }
+
+    fn details(count: usize, text: &str) -> Vec<String> {
+        vec![text.to_owned(); count]
+    }
+
+    fn text_bytes(note: &DecisionNote) -> usize {
+        note.summary.len() + note.details.iter().map(String::len).sum::<usize>()
+    }
+
+    #[test]
+    fn a_long_line_is_cut_on_a_char_boundary() {
+        let long = WIDE.repeat(MAX_SUMMARY_BYTES.max(MAX_DETAIL_BYTES));
+        let note = note(&long, details(1, &long));
+        for (line, limit) in [
+            (&note.summary, MAX_SUMMARY_BYTES),
+            (&note.details[0], MAX_DETAIL_BYTES),
+        ] {
+            assert!(line.len() <= limit);
+            let kept = line.strip_suffix(ELLIPSIS).unwrap();
+            assert!(!kept.is_empty());
+            assert!(long.starts_with(kept));
+        }
+    }
+
+    #[test]
+    fn control_characters_never_reach_a_line() {
+        let note = note(CONTROLLED, details(1, CONTROLLED));
+        assert_eq!(note.summary, CONTROL_FREE);
+        assert_eq!(note.details, [CONTROL_FREE]);
+    }
+
+    #[test_case(MAX_DETAIL_LINES, MAX_DETAIL_LINES, None; "a_full_list_is_kept")]
+    #[test_case(MAX_DETAIL_LINES + 1, MAX_DETAIL_LINES, Some("+2 more"); "one_over_counts_two")]
+    #[test_case(MAX_DETAIL_LINES * 3, MAX_DETAIL_LINES, Some("+41 more"); "many_over")]
+    fn details_are_capped_with_a_count_of_the_rest(count: usize, lines: usize, more: Option<&str>) {
+        let note = note(SUMMARY, details(count, DETAIL));
+        assert_eq!(note.details.len(), lines);
+        assert_eq!(
+            note.details.last().unwrap().as_str(),
+            more.unwrap_or(DETAIL)
+        );
+    }
+
+    #[test]
+    fn the_whole_note_stays_within_its_byte_cap() {
+        let long = NARROW.repeat(MAX_DETAIL_BYTES * 2);
+        let note = note(&long, details(MAX_DETAIL_LINES, &long));
+        assert!(text_bytes(&note) <= MAX_NOTE_BYTES);
+        assert_eq!(note.details.len(), MAX_DETAIL_LINES);
+        assert_eq!(note.details.last().unwrap().as_str(), ONE_MORE);
+    }
+
+    #[test_case(0, 0, "kept 1st"; "kept")]
+    #[test_case(2, 0, "moved 3rd to 1st"; "moved_up")]
+    #[test_case(10, 21, "moved 11th to 22nd"; "teens_take_th")]
+    fn placement_names_both_positions(from: usize, to: usize, expected: &str) {
+        assert_eq!(placement(from, to), expected);
+    }
+
+    #[test_case(NoteAnchor::History(HISTORY_LEN), StoredDecisionAnchor::History(HISTORY_LEN), None ; "history_main")]
+    #[test_case(NoteAnchor::Tool(TOOL_USE_ID.into()), StoredDecisionAnchor::Tool(TOOL_USE_ID.into()), Some(AGENT) ; "tool_subagent")]
+    fn the_stored_row_keeps_the_logged_names_and_the_anchor(
+        anchor: NoteAnchor,
+        expected_anchor: StoredDecisionAnchor,
+        agent: Option<&str>,
+    ) {
+        let note = DecisionNote::new(
+            DecisionFeature::CodeContext,
+            FeatureMode::Shadow,
+            NoteOutcome::Shadow,
+            SUMMARY,
+            details(1, DETAIL),
+            anchor,
+        );
+
+        let stored = note.stored(AT_MS, agent.map(str::to_owned));
+
+        assert_eq!(
+            stored,
+            StoredEngineDecision {
+                seq: UNASSIGNED_SEQ,
+                at_ms: AT_MS,
+                feature: DecisionFeature::CodeContext.name().into(),
+                mode: FeatureMode::Shadow.as_str().into(),
+                outcome: StoredDecisionOutcome::Shadow,
+                summary: SUMMARY.into(),
+                details: vec![DETAIL.into()],
+                agent: agent.map(str::to_owned),
+                anchor: expected_anchor,
+            }
+        );
+        assert_eq!(NoteOutcome::from(stored.outcome), note.outcome);
+    }
+
+    #[test_case(NoteAnchor::History(HISTORY_LEN), json!({"history": HISTORY_LEN}); "history")]
+    #[test_case(NoteAnchor::Tool(TOOL_USE_ID.into()), json!({"tool": TOOL_USE_ID}); "tool")]
+    fn the_event_names_the_logged_feature_and_snake_case_outcome(
+        anchor: NoteAnchor,
+        expected_anchor: serde_json::Value,
+    ) {
+        let note = DecisionNote::new(
+            DecisionFeature::GoalPrescreen,
+            FeatureMode::Advise,
+            NoteOutcome::FellBack,
+            SUMMARY,
+            details(1, DETAIL),
+            anchor,
+        );
+        let event = serde_json::to_value(AgentEvent::from(note)).unwrap();
+        assert_eq!(
+            event,
+            json!({
+                "type": "decision",
+                "feature": DecisionFeature::GoalPrescreen.name(),
+                "mode": FeatureMode::Advise.as_str(),
+                "outcome": NoteOutcome::FellBack.as_str(),
+                "summary": SUMMARY,
+                "details": [DETAIL],
+                "anchor": expected_anchor,
+            })
+        );
+    }
+}

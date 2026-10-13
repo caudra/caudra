@@ -5325,6 +5325,9 @@ impl App {
             event => event,
         };
 
+        if let AgentEvent::Decision(note) = &event {
+            self.record_engine_decision(note, subagent_id.clone());
+        }
         let plan_path = if active_plan {
             self.state.plan.path()
         } else {

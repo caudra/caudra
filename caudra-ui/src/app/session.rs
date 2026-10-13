@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use crate::app::tasks::TaskOutcome;
 use crate::chat::{
-    CANCELLED_TEXT, Chat, DONE_TEXT, ERROR_TEXT, history_to_display, interleaved_history_to_display,
+    CANCELLED_TEXT, Chat, DONE_TEXT, ERROR_TEXT, decision_inserts, history_to_display,
+    interleaved_history_to_display,
 };
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::session_picker::{OtherCheckout, SessionPickerAction, SessionRow};
@@ -28,6 +29,7 @@ use caudra_providers::{
     HistoryItem, HistoryItemKind, HistoryProjectionError, ImageSource, Model, TokenUsage,
     active_history_items, merge_history_items, project_messages, validate_history_items,
 };
+use caudra_storage::engine_decisions::StoredEngineDecision;
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::{
     PendingConversationRevert, SessionDatabase, SessionLease, SessionLocation, SessionMeta,
@@ -683,12 +685,18 @@ impl App {
                 Vec::new()
             }
         };
+        let decisions = self.stored_engine_decisions();
+        let mut inserts = self.autopilot_decision_rows();
+        inserts.extend(decision_inserts(
+            &active_history,
+            decisions.iter().filter(|row| row.agent.is_none()),
+        ));
         let (display_msgs, restore_items) = interleaved_history_to_display(
             &active_history,
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
             self.ui_config.show_reminders,
-            self.autopilot_decision_rows(),
+            inserts,
         );
         let mut reachable_subagents = reachable_subagent_ids(
             &active_history,
@@ -853,6 +861,7 @@ impl App {
             .collect();
         let rendered = render_subagent_displays(
             &restorable,
+            &decisions,
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
             self.ui_config.show_reminders,
@@ -1636,32 +1645,35 @@ pub(super) fn source_target_id(source: DisplaySource) -> CaudraId {
 /// Renders each restored subagent's transcript on its own core. The work is
 /// per-chat, independent, and reads nothing but shared state, and a long-lived
 /// session carries enough subagents that doing it serially is the largest
-/// remaining cost of a resume.
+/// remaining cost of a resume. Each gets the decision rows made for it.
 fn render_subagent_displays(
     restorable: &[(StoredSubagent, Arc<Vec<HistoryItem>>)],
+    decisions: &[StoredEngineDecision],
     tool_outputs: &HashMap<String, Arc<caudra_agent::ToolOutput>>,
     tool_output_lines: &caudra_config::ToolOutputLines,
     show_reminders: bool,
 ) -> Vec<(Vec<DisplayMessage>, Vec<caudra_lua::RestoreItem>)> {
-    let render = |messages: &Arc<Vec<HistoryItem>>| {
-        history_to_display(messages, tool_outputs, tool_output_lines, show_reminders)
+    let render = |(subagent, messages): &(StoredSubagent, Arc<Vec<HistoryItem>>)| {
+        let rows = decisions
+            .iter()
+            .filter(|row| row.agent.as_deref() == Some(subagent.tool_use_id.as_str()));
+        interleaved_history_to_display(
+            messages,
+            tool_outputs,
+            tool_output_lines,
+            show_reminders,
+            decision_inserts(messages, rows),
+        )
     };
     let workers = restore_workers(restorable.len());
     if workers == 1 {
-        return restorable.iter().map(|(_, items)| render(items)).collect();
+        return restorable.iter().map(render).collect();
     }
     let chunk = restorable.len().div_ceil(workers);
     std::thread::scope(|scope| {
         let handles: Vec<_> = restorable
             .chunks(chunk)
-            .map(|chunk| {
-                scope.spawn(move || {
-                    chunk
-                        .iter()
-                        .map(|(_, items)| render(items))
-                        .collect::<Vec<_>>()
-                })
-            })
+            .map(|chunk| scope.spawn(move || chunk.iter().map(render).collect::<Vec<_>>()))
             .collect();
         handles
             .into_iter()

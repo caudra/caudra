@@ -1,12 +1,15 @@
+use caudra_config::decisions::FeatureMode;
 use serde_json::{Value, json};
 
 use super::{
-    DecisionContext, DecisionFeature, Decisions, MAX_RERANK_BATCH, Relevance, Rerank,
-    candidate_text, redacted_excerpt,
+    DecisionContext, DecisionFeature, Decisions, MAX_RERANK_BATCH, NoteDraft, NoteOutcome,
+    Relevance, Rerank, candidate_text, placement, redacted_excerpt, score_line,
 };
 use crate::CancelToken;
 use crate::permissions::PermissionManager;
 
+const KEPT_WORKCELL_ORDER: &str = "kept Workcell's order";
+const OUT_OF_DEADLINE: &str = "ran out of the call's deadline";
 const MIN_RERANKED_ROWS: usize = 2;
 const MAX_TASK_BYTES: usize = 700;
 const MAX_NAME_BYTES: usize = 128;
@@ -40,7 +43,8 @@ pub struct CodeSymbol<'a> {
 /// Reorders the first [`MAX_RERANK_BATCH`] rows by relevance to `task`: the
 /// rows at or above the relevance floor first, most relevant first, then the
 /// rest of that head in its original order. Nothing is dropped and later rows
-/// never move. Returns the note for the model when the order changed.
+/// never move. Returns the note for the model when the order changed, and the
+/// transcript row for a move, a shadow move or a fresh failure.
 pub async fn rerank_code_context<T>(
     rows: &mut Vec<T>,
     describe: impl Fn(&T) -> CodeSymbol<'_>,
@@ -49,21 +53,23 @@ pub async fn rerank_code_context<T>(
     context: &DecisionContext,
     permissions: Option<&PermissionManager>,
     cancel: &CancelToken,
-) -> Option<String> {
+) -> (Option<String>, Option<NoteDraft>) {
     let head = rows.len().min(MAX_RERANK_BATCH);
-    if head < MIN_RERANKED_ROWS {
-        return None;
-    }
     let feature = DecisionFeature::CodeContext;
-    let floor = feature.rerank_threshold(&decisions.config().thresholds)?;
+    let Some(floor) = feature
+        .rerank_threshold(&decisions.config().thresholds)
+        .filter(|_| head >= MIN_RERANKED_ROWS)
+    else {
+        return (None, None);
+    };
     let candidates: Vec<Value> = rows[..head]
         .iter()
         .map(|row| candidate(&describe(row)))
         .collect();
-    let reranked = decisions
+    let reranking = decisions
         .rerank(
             Rerank {
-                feature,
+                feature: feature.clone(),
                 relevance: &RELEVANCE,
                 query: &json!({TASK_KEY: redacted_excerpt(task, MAX_TASK_BYTES)}),
                 candidates: &candidates,
@@ -72,18 +78,57 @@ pub async fn rerank_code_context<T>(
             permissions,
             cancel,
         )
-        .await?;
+        .await;
+    let (reranked, outcome) = match reranking.scored() {
+        Ok(scored) => scored,
+        Err(failure) => {
+            let note = failure.map(|failure| {
+                NoteDraft::fell_back(decisions, feature, &failure, KEPT_WORKCELL_ORDER)
+            });
+            return (None, note);
+        }
+    };
     let (mut order, below) = reranked.split_at_floor(floor);
     order.extend(below);
     if !reranked.record_rerouted(&order, head) {
-        return None;
+        return (None, None);
+    }
+    let moved: Vec<String> = order
+        .iter()
+        .enumerate()
+        .filter(|(to, from)| to < from)
+        .map(|(to, from)| {
+            let symbol = describe(&rows[*from]);
+            score_line(
+                reranked.scores()[*from],
+                &format!("{}:{} {}", symbol.path, symbol.line_start, symbol.name),
+                &placement(*from, to),
+            )
+        })
+        .collect();
+    let summary = format!("moved {} of {head} rows up", moved.len());
+    let note = Some(NoteDraft::new(decisions, feature, outcome, &summary, moved));
+    if outcome != NoteOutcome::Acted {
+        return (None, note);
     }
     let mut original: Vec<Option<T>> = rows.drain(..head).map(Some).collect();
     rows.splice(
         0..0,
         order.iter().filter_map(|index| original[*index].take()),
     );
-    Some(reordered_note(head))
+    (Some(reordered_note(head)), note)
+}
+
+/// The row for a rerank the call's own deadline cut short, reported like an
+/// engine failure: once, until the feature answers again.
+pub fn code_context_out_of_deadline(decisions: &Decisions) -> Option<NoteDraft> {
+    let feature = DecisionFeature::CodeContext;
+    let applied = matches!(
+        decisions.mode(&feature),
+        FeatureMode::Advise | FeatureMode::Enforce
+    );
+    (applied && decisions.mark_failing(&feature))
+        .then(|| NoteDraft::fell_back(decisions, feature, OUT_OF_DEADLINE, KEPT_WORKCELL_ORDER))
 }
 
 pub fn reordered_note(rows: usize) -> String {
@@ -120,17 +165,23 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        CALLEES_KEY, CALLERS_KEY, CodeSymbol, KIND_KEY, LINES_KEY, MAX_RERANK_BATCH, PATH_KEY,
-        SYMBOL_KEY, TASK_KEY, reordered_note, rerank_code_context,
+        CALLEES_KEY, CALLERS_KEY, CodeSymbol, KEPT_WORKCELL_ORDER, KIND_KEY, LINES_KEY,
+        MAX_RERANK_BATCH, OUT_OF_DEADLINE, PATH_KEY, SYMBOL_KEY, TASK_KEY,
+        code_context_out_of_deadline, reordered_note, rerank_code_context,
     };
     use crate::CancelToken;
     use crate::decisions::rerank::CANDIDATE_KEY;
-    use crate::decisions::{DecisionContext, Decisions};
+    use crate::decisions::{
+        DecisionContext, Decisions, ENGINE_UNREACHABLE, NoteDraft, NoteOutcome,
+    };
 
     const BASE_URL: &str = "http://127.0.0.1:1";
     const FLOOR: f64 = 0.1;
     const TASK: &str = "where do we invalidate the cache after a write";
     const SECRET: &str = "do-not-send-this-value";
+    const MOVED_ONE: &str = "moved 1 of 5 rows up";
+    const SHADOW_MOVED_ONE: &str = "would have moved 1 of 5 rows up";
+    const MOVED_ROW: &str = "0.90  src/store/cache.rs:12 symbol_03  moved 4th to 1st";
     const KIND: &str = "function";
     const PATH: &str = "src/store/cache.rs";
     const LINE_START: usize = 12;
@@ -216,7 +267,7 @@ mod tests {
             rows: &mut Vec<String>,
             task: &str,
             cancel: &CancelToken,
-        ) -> Option<String> {
+        ) -> (Option<String>, Option<NoteDraft>) {
             smol::block_on(rerank_code_context(
                 rows,
                 |name| CodeSymbol {
@@ -253,7 +304,7 @@ mod tests {
     fn relevant_head_rows_move_first(scores: &[(usize, f64)], count: usize, lead: &[usize]) {
         let fixture = Fixture::new(FeatureMode::Enforce, scores, false);
         let mut reranked = rows(count);
-        let note = fixture.rerank(&mut reranked, TASK, &CancelToken::none());
+        let (note, row) = fixture.rerank(&mut reranked, TASK, &CancelToken::none());
         let head = count.min(MAX_RERANK_BATCH);
         let original = rows(count);
         let expected: Vec<String> = lead
@@ -264,32 +315,69 @@ mod tests {
             .collect();
         assert_eq!(reranked, expected);
         assert_eq!(note, Some(reordered_note(head)));
+        assert_eq!(row.map(|row| row.outcome), Some(NoteOutcome::Acted));
         let requests = fixture.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].questions.len(), head);
     }
 
-    #[test_case(FeatureMode::Enforce, &[(1, 0.05)], SHORT, false, 1; "everything_below_the_floor")]
-    #[test_case(FeatureMode::Enforce, &[(0, 0.9), (1, 0.5)], SHORT, false, 1; "already_in_workcell_order")]
-    #[test_case(FeatureMode::Enforce, &[(0, 0.9)], 1, false, 0; "a_single_row")]
-    #[test_case(FeatureMode::Enforce, &[(3, 0.9)], SHORT, true, 1; "engine_failure")]
-    #[test_case(FeatureMode::Off, &[(3, 0.9)], SHORT, false, 0; "off")]
-    #[test_case(FeatureMode::Shadow, &[(3, 0.9)], SHORT, false, 1; "shadow")]
+    #[test]
+    fn a_move_names_each_row_that_moved_up() {
+        let fixture = Fixture::new(FeatureMode::Enforce, &[(3, 0.9)], false);
+        let (_, row) = fixture.rerank(&mut rows(SHORT), TASK, &CancelToken::none());
+        let row = row.unwrap();
+        assert_eq!(row.summary, MOVED_ONE);
+        assert_eq!(row.details, [MOVED_ROW]);
+    }
+
+    #[test_case(FeatureMode::Enforce, &[(1, 0.05)], SHORT, false, 1, None; "everything_below_the_floor")]
+    #[test_case(FeatureMode::Enforce, &[(0, 0.9), (1, 0.5)], SHORT, false, 1, None; "already_in_workcell_order")]
+    #[test_case(FeatureMode::Enforce, &[(0, 0.9)], 1, false, 0, None; "a_single_row")]
+    #[test_case(FeatureMode::Enforce, &[(3, 0.9)], SHORT, true, 1, Some(NoteOutcome::FellBack); "engine_failure")]
+    #[test_case(FeatureMode::Off, &[(3, 0.9)], SHORT, false, 0, None; "off")]
+    #[test_case(FeatureMode::Shadow, &[(3, 0.9)], SHORT, false, 1, Some(NoteOutcome::Shadow); "shadow")]
     fn workcell_order_is_kept_without_a_change(
         mode: FeatureMode,
         scores: &[(usize, f64)],
         count: usize,
         fail: bool,
         requests: usize,
+        outcome: Option<NoteOutcome>,
     ) {
         let fixture = Fixture::new(mode, scores, fail);
         let mut reranked = rows(count);
-        assert_eq!(
-            fixture.rerank(&mut reranked, TASK, &CancelToken::none()),
-            None
-        );
+        let (note, row) = fixture.rerank(&mut reranked, TASK, &CancelToken::none());
+        assert_eq!(note, None);
+        assert_eq!(row.map(|row| row.outcome), outcome);
         assert_eq!(reranked, rows(count));
         assert_eq!(fixture.requests().len(), requests);
+    }
+
+    #[test]
+    fn a_shadow_row_says_what_would_have_moved() {
+        let fixture = Fixture::new(FeatureMode::Shadow, &[(3, 0.9)], false);
+        let (_, row) = fixture.rerank(&mut rows(SHORT), TASK, &CancelToken::none());
+        let row = row.unwrap();
+        assert_eq!(row.summary, SHADOW_MOVED_ONE);
+        assert_eq!(row.details, [MOVED_ROW]);
+    }
+
+    #[test]
+    fn a_failing_engine_falls_back_once_until_it_answers() {
+        let fixture = Fixture::new(FeatureMode::Enforce, &[(3, 0.9)], true);
+        let summaries: Vec<Option<String>> = (0..2)
+            .map(|_| {
+                let (_, row) = fixture.rerank(&mut rows(SHORT), TASK, &CancelToken::none());
+                row.map(|row| row.summary)
+            })
+            .collect();
+        assert_eq!(
+            summaries,
+            [
+                Some(format!("{ENGINE_UNREACHABLE}; {KEPT_WORKCELL_ORDER}")),
+                None
+            ]
+        );
     }
 
     #[test]
@@ -298,9 +386,48 @@ mod tests {
         let (trigger, cancel) = CancelToken::new();
         trigger.cancel();
         let mut reranked = rows(SHORT);
-        assert_eq!(fixture.rerank(&mut reranked, TASK, &cancel), None);
+        assert_eq!(fixture.rerank(&mut reranked, TASK, &cancel), (None, None));
         assert_eq!(reranked, rows(SHORT));
         assert!(fixture.requests().is_empty());
+    }
+
+    #[test_case(FeatureMode::Enforce, &[Some(NoteOutcome::FellBack), None, Some(NoteOutcome::FellBack)]; "enforce_reports_once_per_outage")]
+    #[test_case(FeatureMode::Shadow, &[None, None, None]; "shadow_never_falls_back")]
+    fn a_deadline_cut_rerank_falls_back_once_until_it_answers(
+        mode: FeatureMode,
+        expected: &[Option<NoteOutcome>],
+    ) {
+        let fixture = Fixture::new(mode, &[(3, 0.9)], false);
+        let first = code_context_out_of_deadline(&fixture.decisions);
+        let second = code_context_out_of_deadline(&fixture.decisions);
+        fixture.rerank(&mut rows(SHORT), TASK, &CancelToken::none());
+        let after_an_answer = code_context_out_of_deadline(&fixture.decisions);
+        let outcomes: Vec<Option<NoteOutcome>> = [&first, &second, &after_an_answer]
+            .map(|row| row.as_ref().map(|row| row.outcome))
+            .into();
+        assert_eq!(outcomes, expected);
+        if let Some(row) = first {
+            assert_eq!(
+                row.summary,
+                format!("{OUT_OF_DEADLINE}; {KEPT_WORKCELL_ORDER}")
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_never_carries_the_task_or_a_secret_in_a_label() {
+        let fixture = Fixture::new(FeatureMode::Enforce, &[(3, 0.9)], false);
+        let mut reranked = rows(SHORT);
+        reranked[3] = format!("TOKEN={SECRET}");
+        let (_, row) = fixture.rerank(
+            &mut reranked,
+            &format!("{TASK} TOKEN={SECRET}"),
+            &CancelToken::none(),
+        );
+        let row = row.unwrap();
+        let text = format!("{} {}", row.summary, row.details.join("\n"));
+        assert!(!text.contains(SECRET));
+        assert!(!text.contains(TASK));
     }
 
     #[test]

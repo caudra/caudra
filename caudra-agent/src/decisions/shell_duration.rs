@@ -1,4 +1,5 @@
 use caudra_config::decisions::FeatureMode;
+use caudra_config::resolve_shell_background;
 use caudra_decision::{Answer, DecisionResponse};
 use caudra_storage::{
     decision_log::DecisionLabel,
@@ -12,7 +13,10 @@ use caudra_storage::{
 use serde_json::{Value, json};
 use std::{collections::VecDeque, sync::Arc, thread, time::Instant};
 
-use super::{DecisionFeature, DecisionReceipt, Decisions, push_fitting, questions};
+use super::{
+    DecisionFeature, DecisionReceipt, Decisions, NoteAnchor, NoteDraft, NoteOutcome, push_fitting,
+    questions,
+};
 use crate::{
     ToolDoneEvent, ToolOutput,
     permissions::{PassiveDecisionRevision, canonical_json_sha256, command_pattern},
@@ -59,6 +63,14 @@ const TOOK: [&str; 3] = [
 const STOPPED: &str = "did not finish before it was stopped";
 const ENDLESS_WARNING: &str =
     "Duration estimate: this command may run until stopped; its execution deadline still applies.";
+const DURATION_FALLBACK: &str = "ran the call without an estimate";
+const BACKGROUND: &str = "background";
+const FOREGROUND: &str = "foreground";
+const UNTIL_STOPPED_DETAIL: &str = "level: until stopped";
+/// Each verb reads the same after "would have", for a shadow row.
+const SET_VERB: &str = "set";
+const MOVED_VERB: &str = "moved";
+const WARNED_VERB: &str = "warned";
 
 #[derive(Clone, Debug)]
 struct Estimate {
@@ -124,6 +136,19 @@ pub(crate) struct ShellDurationPlan {
     receipt: Option<DecisionReceipt>,
     requested_timeout: Option<u64>,
     injected_timeout: Option<u64>,
+    /// What went wrong when the engine newly failed to estimate this call.
+    failure: Option<String>,
+}
+
+/// What a shell call's row is built from, once its delivery is decided.
+pub(crate) struct ShellCall<'a> {
+    /// The tool use id whose card the row follows.
+    pub(crate) id: &'a str,
+    /// The input the call runs with.
+    pub(crate) input: &'a Value,
+    pub(crate) schema: &'a Value,
+    pub(crate) timeout_secs: u64,
+    pub(crate) background_supported: bool,
 }
 
 impl Decisions {
@@ -162,6 +187,7 @@ impl Decisions {
             receipt: None,
             requested_timeout: input.get(TIMEOUT_FIELD).and_then(Value::as_u64),
             injected_timeout: None,
+            failure: None,
         };
         if plan.estimate.is_some() {
             return Some(plan);
@@ -211,6 +237,7 @@ impl Decisions {
                 .evaluate(DecisionFeature::ShellDuration, &state, questions, &context)
                 .await
             {
+                plan.failure = outcome.fresh_failure();
                 plan.receipt = outcome.receipt;
                 if let Ok(response) = outcome.result {
                     let thresholds = &self.config().thresholds;
@@ -226,6 +253,14 @@ impl Decisions {
         }
         Some(plan)
     }
+}
+
+/// The default and the cap a shell schema gives its timeout, when the cap
+/// leaves room for the default.
+fn timeout_bounds(schema: &Value) -> Option<(u64, u64)> {
+    let default = schema.pointer("/properties/timeoutSec/default")?.as_u64()?;
+    let cap = schema.pointer("/properties/timeoutSec/maximum")?.as_u64()?;
+    (default <= cap).then_some((default, cap))
 }
 
 pub(crate) fn history_key(workspace: &str, workdir: &str, command: &str) -> ShellDurationKey {
@@ -316,26 +351,10 @@ impl ShellDurationPlan {
     }
 
     pub(crate) fn inject_timeout(&mut self, input: &Value, schema: &Value) -> Option<Value> {
-        if *self.decisions.mode(&DecisionFeature::ShellDuration) != FeatureMode::Enforce
-            || input.get(TIMEOUT_FIELD).is_some()
-            || self.endless
-        {
+        if *self.decisions.mode(&DecisionFeature::ShellDuration) != FeatureMode::Enforce {
             return None;
         }
-        let estimate = self
-            .estimate
-            .as_ref()
-            .filter(|estimate| estimate.extend_timeout)?;
-        let default = schema.pointer("/properties/timeoutSec/default")?.as_u64()?;
-        let cap = schema.pointer("/properties/timeoutSec/maximum")?.as_u64()?;
-        if cap < default {
-            return None;
-        }
-        let seconds = estimate
-            .p90_ms
-            .saturating_mul(3)
-            .div_ceil(2 * MILLIS_PER_SECOND)
-            .clamp(default, cap);
+        let seconds = self.estimated_timeout(input, schema)?;
         let mut effective = input.clone();
         effective
             .as_object_mut()?
@@ -344,14 +363,147 @@ impl ShellDurationPlan {
         Some(effective)
     }
 
+    /// The timeout the estimate fills in for a call that names none.
+    fn estimated_timeout(&self, input: &Value, schema: &Value) -> Option<u64> {
+        if input.get(TIMEOUT_FIELD).is_some() || self.endless {
+            return None;
+        }
+        let estimate = self
+            .estimate
+            .as_ref()
+            .filter(|estimate| estimate.extend_timeout)?;
+        let (default, cap) = timeout_bounds(schema)?;
+        Some(
+            estimate
+                .p90_ms
+                .saturating_mul(3)
+                .div_ceil(2 * MILLIS_PER_SECOND)
+                .clamp(default, cap),
+        )
+    }
+
     pub(crate) fn expected_secs(&self) -> Option<u64> {
         (*self.decisions.mode(&DecisionFeature::ShellDuration) == FeatureMode::Enforce)
-            .then(|| {
-                self.estimate
-                    .as_ref()
-                    .map(|estimate| estimate.p90_ms.div_ceil(MILLIS_PER_SECOND))
-            })
+            .then(|| self.estimated_secs())
             .flatten()
+    }
+
+    fn estimated_secs(&self) -> Option<u64> {
+        self.estimate
+            .as_ref()
+            .map(|estimate| estimate.p90_ms.div_ceil(MILLIS_PER_SECOND))
+    }
+
+    /// The call's own timeout, when it is below the estimated p90.
+    fn short_timeout(&self) -> Option<(u64, &Estimate)> {
+        let estimate = self.estimate.as_ref()?;
+        self.requested_timeout
+            .filter(|timeout| timeout.saturating_mul(MILLIS_PER_SECOND) < estimate.p90_ms)
+            .map(|timeout| (timeout, estimate))
+    }
+
+    /// Reports what the estimate changed about `call`: the timeout it filled
+    /// in, a delivery that differs from the one the call alone gets, and the
+    /// short-timeout warning advice adds. Shadow reports what enforce would
+    /// have done. A first engine failure in advise or enforce reports that
+    /// instead.
+    pub(crate) fn report(&self, ctx: &ToolContext, call: &ShellCall) {
+        if ctx.cancel.is_cancelled() {
+            return;
+        }
+        let feature = DecisionFeature::ShellDuration;
+        let mode = self.decisions.mode(&feature);
+        let emit = |draft: NoteDraft| {
+            ctx.event_tx
+                .try_send(draft.anchored(NoteAnchor::Tool(call.id.to_owned())));
+        };
+        let outcome = match mode {
+            FeatureMode::Advise | FeatureMode::Enforce => NoteOutcome::Acted,
+            FeatureMode::Shadow => NoteOutcome::Shadow,
+            FeatureMode::Off => return,
+        };
+        if let Some(failure) = &self.failure {
+            if outcome == NoteOutcome::Acted {
+                emit(NoteDraft::fell_back(
+                    &self.decisions,
+                    feature,
+                    failure,
+                    DURATION_FALLBACK,
+                ));
+            }
+            return;
+        }
+        let timeout = match mode {
+            FeatureMode::Enforce => self.injected_timeout,
+            FeatureMode::Shadow => self.estimated_timeout(call.input, call.schema),
+            FeatureMode::Advise | FeatureMode::Off => None,
+        };
+        let mut effects = Vec::new();
+        if let Some(timeout) = timeout {
+            effects.push(format!("{SET_VERB} the timeout to {timeout} s"));
+        }
+        if *mode != FeatureMode::Advise
+            && let Some(background) = self.moved_delivery(ctx, call, timeout)
+        {
+            let place = if background { BACKGROUND } else { FOREGROUND };
+            effects.push(format!("{MOVED_VERB} it to the {place}"));
+        }
+        if let Some((requested, _)) = self.short_timeout() {
+            effects.push(format!(
+                "{WARNED_VERB} that its {requested} s timeout is too short"
+            ));
+        }
+        if effects.is_empty() {
+            return;
+        }
+        let mut summary = effects.join("; ");
+        let mut details = Vec::new();
+        if let Some(estimate) = &self.estimate {
+            let (p50, p90) = (
+                estimate.p50_ms.div_ceil(MILLIS_PER_SECOND),
+                estimate.p90_ms.div_ceil(MILLIS_PER_SECOND),
+            );
+            summary.push_str(&format!(
+                " from an estimate of p90 {p90} s ({}; {} samples)",
+                estimate.source, estimate.samples
+            ));
+            details.push(format!("p50 {p50} s, p90 {p90} s"));
+            details.push(format!("{}, {} samples", estimate.source, estimate.samples));
+        }
+        if self.endless {
+            details.push(UNTIL_STOPPED_DETAIL.into());
+        }
+        if let Some(requested) = self.requested_timeout {
+            details.push(format!("requested timeout {requested} s"));
+        }
+        emit(NoteDraft::new(
+            &self.decisions,
+            feature,
+            outcome,
+            &summary,
+            details,
+        ));
+    }
+
+    /// The delivery the estimate chooses, when it differs from the one the
+    /// call gets from its own timeout. `timeout` is the one the estimate
+    /// filled in, if any.
+    fn moved_delivery(
+        &self,
+        ctx: &ToolContext,
+        call: &ShellCall,
+        timeout: Option<u64>,
+    ) -> Option<bool> {
+        let own_timeout = match timeout {
+            Some(_) => timeout_bounds(call.schema)?.0,
+            None => call.timeout_secs,
+        };
+        let deliver = |timeout, expected| {
+            resolve_shell_background(&ctx.config, call.background_supported, timeout, expected).ok()
+        };
+        let own = deliver(own_timeout, None)?;
+        let estimated = deliver(timeout.unwrap_or(own_timeout), self.estimated_secs())?;
+        (own != estimated).then_some(estimated)
     }
 
     pub(crate) fn annotation(&self) -> Option<String> {
@@ -377,25 +529,22 @@ impl ShellDurationPlan {
         if self.endless {
             notes.push(ENDLESS_WARNING.to_owned());
         }
-        if let Some(estimate) = &self.estimate {
-            if self
-                .requested_timeout
-                .is_some_and(|timeout| timeout.saturating_mul(MILLIS_PER_SECOND) < estimate.p90_ms)
-            {
-                notes.push(format!(
-                    "The explicit timeout is below estimated p90 {}s ({}); it was not changed.",
-                    estimate.p90_ms.div_ceil(MILLIS_PER_SECOND),
-                    estimate.source
-                ));
-            }
-            if let Some(timeout) = self.injected_timeout {
-                notes.push(format!(
-                    "Omitted timeout set to {timeout}s from p90 {}s ({}; {} samples).",
-                    estimate.p90_ms.div_ceil(MILLIS_PER_SECOND),
-                    estimate.source,
-                    estimate.samples
-                ));
-            }
+        if let Some((_, estimate)) = self.short_timeout() {
+            notes.push(format!(
+                "The explicit timeout is below estimated p90 {}s ({}); it was not changed.",
+                estimate.p90_ms.div_ceil(MILLIS_PER_SECOND),
+                estimate.source
+            ));
+        }
+        if let Some(estimate) = &self.estimate
+            && let Some(timeout) = self.injected_timeout
+        {
+            notes.push(format!(
+                "Omitted timeout set to {timeout}s from p90 {}s ({}; {} samples).",
+                estimate.p90_ms.div_ceil(MILLIS_PER_SECOND),
+                estimate.source,
+                estimate.samples
+            ));
         }
         if !notes.is_empty() {
             if let Some(suffix) = done.model_suffix.take() {
@@ -521,16 +670,20 @@ fn completed_level(elapsed_ms: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        AT_ONCE, DURATION_QUESTION, EARLIER_RUNS, ENDLESS_QUESTION, Estimate,
-        HISTORY_CACHE_ENTRIES, INSTANT_MS, MAX_EARLIER_RUNS, MINUTES, MINUTES_MS, SECONDS, STOPPED,
-        ShellDurationCache, ShellDurationPlan, TOOK, UNTIL_STOPPED, WORKDIR_FIELD, duration_label,
-        duration_state, earlier_run, history_key, prior,
+        AT_ONCE, DURATION_FALLBACK, DURATION_QUESTION, EARLIER_RUNS, ENDLESS_QUESTION, Estimate,
+        HISTORY_CACHE_ENTRIES, INSTANT_MS, MAX_EARLIER_RUNS, MINUTES, MINUTES_MS, SECONDS,
+        SET_VERB, STOPPED, ShellCall, ShellDurationCache, ShellDurationPlan, TOOK, UNTIL_STOPPED,
+        WARNED_VERB, WORKDIR_FIELD, duration_label, duration_state, earlier_run, history_key,
+        prior,
     };
     use crate::{
-        AgentMode,
-        decisions::{DecisionState, Decisions},
+        AgentEvent, AgentMode, CancelToken, EventSender,
+        decisions::{DecisionFeature, DecisionState, Decisions, NoteAnchor, NoteOutcome},
         permissions::PermissionManager,
-        tools::{ToolExecResult, test_support::stub_ctx_with_permissions},
+        tools::{
+            ToolExecResult,
+            test_support::{stub_ctx_with, stub_ctx_with_permissions},
+        },
     };
     use async_trait::async_trait;
     use caudra_config::{
@@ -557,6 +710,11 @@ mod tests {
     const EXECUTION_ERROR: &str = "execution unavailable";
     const BASE_URL: &str = "http://127.0.0.1:1";
     const MODEL: &str = "jev-latest";
+    const CALL_ID: &str = "call-duration";
+    const ENGINE_FAILURE: &str = "the decision engine timed out";
+    const LONG_P90_MS: u64 = 200_001;
+    const SHORT_TIMEOUT_SECS: u64 = 5;
+    const ONE_NOTE: &str = "expected exactly one decision note";
 
     struct FailedEngine(DecisionError);
 
@@ -599,6 +757,7 @@ mod tests {
             receipt: None,
             requested_timeout: None,
             injected_timeout: None,
+            failure: None,
         }
     }
 
@@ -661,6 +820,74 @@ mod tests {
         }
         plan.endless = true;
         assert!(plan.inject_timeout(&input, &schema).is_none());
+    }
+
+    #[test_case(FeatureMode::Enforce, None, None, false, Some((NoteOutcome::Acted, SET_VERB)); "enforce_sets_the_timeout")]
+    #[test_case(FeatureMode::Shadow, None, None, false, Some((NoteOutcome::Shadow, SET_VERB)); "shadow_would_set_the_timeout")]
+    #[test_case(FeatureMode::Advise, Some(SHORT_TIMEOUT_SECS), None, false, Some((NoteOutcome::Acted, WARNED_VERB)); "advise_warns_of_a_short_timeout")]
+    #[test_case(FeatureMode::Advise, None, None, false, None; "an_eta_alone_says_nothing")]
+    #[test_case(FeatureMode::Enforce, None, Some(ENGINE_FAILURE), false, Some((NoteOutcome::FellBack, ENGINE_FAILURE)); "fresh_failure_falls_back")]
+    #[test_case(FeatureMode::Shadow, None, Some(ENGINE_FAILURE), false, None; "shadow_failure_says_nothing")]
+    #[test_case(FeatureMode::Enforce, None, None, true, None; "cancelled_says_nothing")]
+    fn shell_duration_notes_only_what_it_changed(
+        mode: FeatureMode,
+        requested: Option<u64>,
+        failure: Option<&str>,
+        cancelled: bool,
+        expected: Option<(NoteOutcome, &str)>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = StateDir::from_path(temp.path().join("state"));
+        let mut plan = plan(&dir, mode.clone(), LONG_P90_MS);
+        plan.requested_timeout = requested;
+        plan.failure = failure.map(String::from);
+        let schema =
+            json!({"properties":{"timeoutSec":{"default":DEFAULT_SECS,"maximum":CAP_SECS}}});
+        let input = json!({"command": COMMAND});
+        let effective = plan.inject_timeout(&input, &schema);
+        let (sender, events) = flume::unbounded();
+        let event_tx = EventSender::new(sender, 0);
+        let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
+        if cancelled {
+            let (trigger, token) = CancelToken::new();
+            trigger.cancel();
+            ctx.cancel = token;
+        }
+        plan.report(
+            &ctx,
+            &ShellCall {
+                id: CALL_ID,
+                input: effective.as_ref().unwrap_or(&input),
+                schema: &schema,
+                timeout_secs: requested.unwrap_or(DEFAULT_SECS),
+                background_supported: false,
+            },
+        );
+        let notes: Vec<_> = events
+            .try_iter()
+            .filter_map(|envelope| match envelope.event {
+                AgentEvent::Decision(note) => Some(note),
+                _ => None,
+            })
+            .collect();
+        let Some((outcome, lead)) = expected else {
+            assert!(notes.is_empty());
+            return;
+        };
+        let [note] = notes.as_slice() else {
+            panic!("{ONE_NOTE}");
+        };
+        assert_eq!(note.feature, DecisionFeature::ShellDuration);
+        assert_eq!(note.mode, mode);
+        assert_eq!(note.outcome, outcome);
+        assert_eq!(note.anchor, NoteAnchor::Tool(CALL_ID.into()));
+        assert!(
+            note.summary
+                .starts_with(&format!("{}{lead}", outcome.lead()))
+        );
+        if outcome == NoteOutcome::FellBack {
+            assert!(note.summary.ends_with(DURATION_FALLBACK));
+        }
     }
 
     #[test_case(DurationOutcome::Ok, INSTANT_MS, Some(AT_ONCE); "completed_at_once")]

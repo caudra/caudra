@@ -809,18 +809,24 @@ impl PermissionManager {
         }
         let mut receipts = Vec::new();
         let mut escalation = None;
+        let mut screening_note = None;
         if let Some(AutoEligibility::Direct | AutoEligibility::NeedsEngine) = current.auto {
             let screened = self
                 .screen_auto_candidate(&request, &context, cancel)
                 .await
                 .map_err(|error| deny(DECISION_SOURCE_RULE, Some(error.to_string())))?;
+            let note = screened.decision_note(request_id, cancel);
             current = screened.policy;
             if current.automatic {
                 return allowed(observed, current.source);
             }
             if screened.approved {
+                if let Some(note) = note {
+                    event_tx.try_send(note);
+                }
                 return allowed(observed, DECISION_SOURCE_AUTO);
             }
+            screening_note = note;
             request.presentation.auto = screened.note;
             escalation = screened.escalation;
             if let Some((service, decision)) = screened.decision {
@@ -855,6 +861,9 @@ impl PermissionManager {
             );
             if let Some(effect) = self.record_escalation(escalation, &context) {
                 effect.detach();
+            }
+            if let Some(note) = screening_note {
+                event_tx.try_send(note);
             }
             let Some(delegate) = delegate else {
                 return Err(deny(DECISION_SOURCE_USER_ABORT, None));
@@ -930,6 +939,9 @@ impl PermissionManager {
         }
         if let Some(effect) = self.record_escalation(escalation, &context) {
             effect.detach();
+        }
+        if let Some(note) = screening_note {
+            event_tx.try_send(note);
         }
         if let Some(delegate) = &delegate {
             delegate.announce(event_tx);
@@ -1058,12 +1070,23 @@ impl PermissionManager {
                     )
                     .await;
                     if let Some(decision) = decision {
-                        if let Some(effect) = registration.annotate(
-                            &mut request,
-                            &decision,
-                            advice_revision,
-                            &service,
-                        ) {
+                        let effect = if label_user {
+                            registration.annotate(
+                                &mut request,
+                                &decision,
+                                advice_revision,
+                                &service,
+                            )
+                        } else {
+                            registration.annotate_shell_effect(
+                                &mut request,
+                                &decision,
+                                advice_revision,
+                                &service,
+                                context.plan_scoped,
+                            )
+                        };
+                        if let Some(effect) = effect {
                             effect.detach();
                         }
                         if label_user && let Some(receipt) = decision.evaluation.receipt {

@@ -86,7 +86,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.db";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.db.lock";
 
-const SCHEMA_VERSION: i64 = 24;
+const SCHEMA_VERSION: i64 = 25;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -730,6 +730,11 @@ const MIGRATIONS: &[Migration] = &[
         to: 24,
         sql: crate::autopilot::TABLE,
     },
+    Migration {
+        from: 24,
+        to: 25,
+        sql: crate::engine_decisions::TABLE,
+    },
 ];
 
 /// Which automation sent a message for its session, a stamp ordering every
@@ -1008,7 +1013,7 @@ CREATE TABLE pending_archives (
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
     format!(
-        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}",
+        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}",
         crate::background::TABLES,
         crate::shell_durations::TABLES,
         crate::shell_history::TABLES,
@@ -1018,7 +1023,8 @@ fn full_schema() -> String {
         crate::messages::GROUP_SCHEMA,
         crate::automation::TABLES,
         crate::memory_journal::TABLES,
-        crate::autopilot::TABLE
+        crate::autopilot::TABLE,
+        crate::engine_decisions::TABLE
     )
 }
 
@@ -6668,18 +6674,20 @@ mod tests {
     const CHILD_TASK: &str = "child-task";
     const OTHER_CHILD_TASK: &str = "other-child-task";
     const BACKGROUND_ARCHIVE_DOWNGRADE: &str = "DROP INDEX background_history; DROP INDEX background_task_version; DROP INDEX background_call_owner; DROP INDEX background_sequence; DROP INDEX background_generation; DROP INDEX background_task_history; DROP INDEX background_owner_history; ALTER TABLE background_tasks DROP COLUMN archived; ALTER TABLE background_tasks DROP COLUMN last_sequence;";
-    const AUTOPILOT_DECISIONS_DOWNGRADE: &str = "DROP TABLE autopilot_decisions;";
+    const ENGINE_DECISIONS_DOWNGRADE: &str = "DROP TABLE engine_decisions;";
+    const ENGINE_DECISIONS_PREVIOUS_SCHEMA: i64 = 24;
+    const AUTOPILOT_DECISIONS_DOWNGRADE: &str =
+        "DROP TABLE engine_decisions; DROP TABLE autopilot_decisions;";
     const AUTOPILOT_DECISIONS_PREVIOUS_SCHEMA: i64 = 23;
-    const MEMORY_JOURNAL_DOWNGRADE: &str =
-        "DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes;";
+    const MEMORY_JOURNAL_DOWNGRADE: &str = "DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes;";
     const MEMORY_JOURNAL_PREVIOUS_SCHEMA: i64 = 22;
-    const AUTOMATION_MESSAGING_DOWNGRADE: &str = "DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; ALTER TABLE automation_firings DROP COLUMN delivery;";
+    const AUTOMATION_MESSAGING_DOWNGRADE: &str = "DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; ALTER TABLE automation_firings DROP COLUMN delivery;";
     const AUTOMATION_MESSAGING_PREVIOUS_SCHEMA: i64 = 21;
-    const AUTOMATIONS_DOWNGRADE: &str = "DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings;";
+    const AUTOMATIONS_DOWNGRADE: &str = "DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings;";
     const AUTOMATIONS_PREVIOUS_SCHEMA: i64 = 20;
-    const CONSUMER_GROUPS_DOWNGRADE: &str = "DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation;";
+    const CONSUMER_GROUPS_DOWNGRADE: &str = "DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation;";
     const CONSUMER_GROUPS_PREVIOUS_SCHEMA: i64 = 19;
-    const SHARED_REPOSITORIES_DOWNGRADE: &str = "DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP TABLE deliveries; DROP TABLE cursors; DROP TABLE messages; DROP TABLE message_history_revision; DROP TABLE decisions;";
+    const SHARED_REPOSITORIES_DOWNGRADE: &str = "DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP TABLE deliveries; DROP TABLE cursors; DROP TABLE messages; DROP TABLE message_history_revision; DROP TABLE decisions;";
     const SHARED_REPOSITORIES_PREVIOUS_SCHEMA: i64 = 18;
     const OWNER_CHECKPOINT_PREVIOUS_SCHEMA: i64 = 13;
     const WORKFLOW_DECISION_PREVIOUS_SCHEMA: i64 = 14;
@@ -11571,6 +11579,42 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         );
     }
 
+    #[test]
+    fn engine_decisions_migrate_from_schema_twenty_four_keeping_sessions() {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open_state(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        database
+            .connection
+            .execute_batch(ENGINE_DECISIONS_DOWNGRADE)
+            .unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", ENGINE_DECISIONS_PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(database);
+
+        let migrated = SessionDatabase::open_state(&state).unwrap();
+
+        assert_eq!(migrated.stats().unwrap().schema_version, SCHEMA_VERSION);
+        let kept: TestSession = migrated.load(session.id).unwrap();
+        assert_eq!(kept.id, session.id);
+        assert!(
+            migrated
+                .load_engine_decisions(session.id)
+                .unwrap()
+                .is_empty()
+        );
+        let (_fresh_temp, fresh_state) = state_dir();
+        let fresh = SessionDatabase::open_state(&fresh_state).unwrap();
+        assert_eq!(
+            schema_objects(&migrated),
+            schema_objects(&fresh),
+            "{MIGRATED_MATCHES_FRESH}"
+        );
+    }
+
     #[test_case(false; "missing_root")]
     #[test_case(true; "existing_empty_root")]
     fn existing_state_open_never_initializes_missing_storage(existing_root: bool) {
@@ -12314,6 +12358,7 @@ CREATE TABLE subagent_history_items (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(crate::engine_decisions::TABLE, "")
                     .replace(crate::autopilot::TABLE, "")
                     .replace(crate::memory_journal::TABLES, "")
                     .replace(AUTOMATION_MESSAGING_SCHEMA, "")
@@ -12418,6 +12463,7 @@ CREATE TABLE subagents (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(crate::engine_decisions::TABLE, "")
                     .replace(crate::autopilot::TABLE, "")
                     .replace(crate::memory_journal::TABLES, "")
                     .replace(AUTOMATION_MESSAGING_SCHEMA, "")

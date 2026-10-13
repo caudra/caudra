@@ -19,6 +19,7 @@ use caudra_agent::automation::clock::SystemClock;
 use caudra_agent::automation::handle::AutomationHandle;
 use caudra_agent::autopilot::{AutopilotDecision, AutopilotHandle, DecisionKind};
 use caudra_agent::background::BackgroundTasks;
+use caudra_agent::decisions::DecisionNote;
 use caudra_agent::headless::{
     self, AutomationParams, AutopilotParams, InteractiveHandle, InteractiveParams, InteractiveRun,
 };
@@ -120,6 +121,7 @@ const GOAL_ACTIVE: &str = "active";
 const GOAL_FINISHED: &str = "finished";
 const NO_GOAL: &str = "none";
 pub(crate) const AUTOPILOT_SYSTEM_SUBTYPE: &str = "autopilot";
+const DECISION_SYSTEM_SUBTYPE: &str = "decision";
 const AUTOPILOT_START: &str = "autopilot_start";
 const AUTOPILOT_STOP: &str = "autopilot_stop";
 const AUTOPILOT_STATUS: &str = "autopilot_status";
@@ -360,6 +362,16 @@ struct RetryPayload<'a> {
     attempt: u32,
     retry_delay_ms: u64,
     error: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_tool_use_id: Option<&'a str>,
+}
+
+/// The `system` / `decision` body: what a decision feature did, for a client
+/// that shows it as the TUI does. `parent_tool_use_id` names the subagent it
+/// acted for.
+#[derive(Serialize)]
+struct DecisionSystemPayload<'a> {
+    decision: &'a DecisionNote,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_tool_use_id: Option<&'a str>,
 }
@@ -3352,6 +3364,13 @@ impl EventPump {
             | AgentEvent::Unrecorded { .. }
             | AgentEvent::PromptProgress { .. } => {}
             AgentEvent::Autopilot(event) => self.emit_autopilot(event)?,
+            AgentEvent::Decision(note) => self.writer.emit_system(
+                DECISION_SYSTEM_SUBTYPE,
+                serde_json::to_value(DecisionSystemPayload {
+                    decision: note,
+                    parent_tool_use_id: parent_tool_use_id.as_deref(),
+                })?,
+            )?,
             // The claims a run starts with are on record already and come back
             // here as its preamble lands; a guide item joins the run mid-way.
             AgentEvent::Injected {
@@ -3650,9 +3669,11 @@ mod tests {
     use caudra_agent::automation::testing::{AutomationFixture, FakeWorkflows};
     use caudra_agent::automation::workflows::Workflows;
     use caudra_agent::autopilot::ActionName;
+    use caudra_agent::decisions::{DecisionFeature, NoteAnchor, NoteOutcome};
     use caudra_agent::permissions::PermissionRequest;
     use caudra_agent::tools::PermissionScopes;
     use caudra_agent::types::{Answerer, WORKFLOW_EVENT_RUN_ID};
+    use caudra_config::decisions::FeatureMode;
     use caudra_storage::autopilot::AutopilotBudget;
     use std::time::Duration;
 
@@ -3688,6 +3709,8 @@ mod tests {
     const RETRY_ERROR: &str = "overloaded";
     const RETRY_DELAY_MS: u64 = 1_000;
     const PARENT_KEY: &str = "parent_tool_use_id";
+    const DECISION_SUMMARY: &str = "engine timed out after 2003 ms; kept going";
+    const DECISION_HISTORY_LEN: usize = 38;
     const WORKSPACE_REBIND_REQUIRED: &str =
         "session workspace identity changed; fork or explicitly rebind the session";
     const FORK_HISTORY: &str = "history retained without source authority";
@@ -5952,6 +5975,52 @@ mod tests {
         let message = next_message(&out_rx);
         assert_eq!(message["subtype"], "api_retry");
         assert_eq!(message["error"], RETRY_ERROR);
+        message
+            .get(PARENT_KEY)
+            .map(|id| id.as_str().expect("serialized as a string").to_owned())
+    }
+
+    #[test_case(None => None ; "main_decision_omits_the_key")]
+    #[test_case(Some(RETRY_PARENT) => Some(RETRY_PARENT.to_owned()) ; "subagent_decision_names_its_parent")]
+    fn a_decision_note_is_a_system_decision_message(parent: Option<&str>) -> Option<String> {
+        let (mut pump, out_rx, _) =
+            permission_event_pump(permission_manager(), PermissionMode::Default);
+        let note = DecisionNote::new(
+            DecisionFeature::GoalPrescreen,
+            FeatureMode::Advise,
+            NoteOutcome::FellBack,
+            DECISION_SUMMARY,
+            Vec::new(),
+            NoteAnchor::History(DECISION_HISTORY_LEN),
+        );
+
+        pump.handle(Envelope {
+            event: note.into(),
+            subagent: parent.map(|id| SubagentInfo {
+                parent_tool_use_id: id.into(),
+                task_id: id.into(),
+                name: id.into(),
+                prompt: None,
+                model: None,
+                thinking: None,
+                fast: false,
+                answer_tx: None,
+                steer_tx: None,
+            }),
+            run_id: 1,
+            task: None,
+            workflow: None,
+        })
+        .unwrap();
+
+        let message = next_message(&out_rx);
+        assert_eq!(message["type"], "system");
+        assert_eq!(message["subtype"], DECISION_SYSTEM_SUBTYPE);
+        let decision = &message["decision"];
+        assert_eq!(decision["feature"], DecisionFeature::GoalPrescreen.name());
+        assert_eq!(decision["outcome"], NoteOutcome::FellBack.as_str());
+        assert_eq!(decision["summary"], DECISION_SUMMARY);
+        assert!(out_rx.is_empty());
         message
             .get(PARENT_KEY)
             .map(|id| id.as_str().expect("serialized as a string").to_owned())

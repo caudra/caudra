@@ -712,7 +712,7 @@ fn question_tool_nudge_eval() {
 }
 
 fn question_tool_verdict(outcome: &DecisionOutcome, threshold: f64, needed: bool) -> Verdict {
-    let chosen = question_tool_nudge::should_nudge(&FeatureMode::Advise, outcome, threshold);
+    let chosen = question_tool_nudge::nudge_probability(outcome, threshold).is_some();
     matched(
         question_tool_nudge::probability(outcome).is_some(),
         chosen.then_some(true),
@@ -793,6 +793,7 @@ fn question_tool_quiz_miss_is_not_scored_as_success() {
         .unwrap()),
         latency_ms: 0,
         receipt: None,
+        newly_failing: false,
     };
     assert_eq!(
         question_tool_verdict(&outcome, DECIDED, true),
@@ -1050,6 +1051,7 @@ async fn tool_search_case(decisions: &Decisions, case: ToolCase) -> Scored {
     .await;
     let latency_ms = latency_since(started);
     let chosen = ranking
+        .ok()
         .and_then(|ranking| ranking.top())
         .map(|index| case.candidates[index].name.as_str());
     let verdict = matched(true, chosen, expected_choice(&case.expect));
@@ -1064,7 +1066,7 @@ async fn tool_search_case(decisions: &Decisions, case: ToolCase) -> Scored {
 async fn memory_search_case(judge: &Judge, case: RankCase) -> Ranking {
     let notes = memory_notes(&case.candidates).expect(RANK_FIXTURE_INVALID);
     let started = Instant::now();
-    let ranking = relevance::rank_search(judge, &case.query, &notes).await;
+    let (ranking, _) = relevance::rank_search(judge, &case.query, &notes).await;
     Ranking {
         order: ranking.map_or_else(|| lexical(&notes), |ranking| ranking.kept),
         advised: Vec::new(),
@@ -1076,7 +1078,7 @@ async fn memory_recall_case(judge: &Judge, case: RankCase) -> Ranking {
     let notes = memory_notes(&case.candidates).expect(RANK_FIXTURE_INVALID);
     let started = Instant::now();
     let advice = relevance::recall_advice(judge, &case.query, &notes).await;
-    advised(advice, &notes, started)
+    advised(advice.ok(), &notes, started)
 }
 
 async fn memory_duplicates_case(judge: &Judge, case: RankCase) -> Ranking {
@@ -1084,7 +1086,7 @@ async fn memory_duplicates_case(judge: &Judge, case: RankCase) -> Ranking {
     let (name, content) = new_note(&case.query).expect(RANK_FIXTURE_INVALID);
     let started = Instant::now();
     let advice = relevance::duplicate_advice(judge, name, content, &notes).await;
-    advised(advice, &notes, started)
+    advised(advice.ok(), &notes, started)
 }
 
 /// The notes a memory case offers, in its order, as the store would.
@@ -1186,6 +1188,7 @@ async fn compaction_retention_case(decisions: &Decisions, case: RankCase) -> Ran
     let started = Instant::now();
     let kept = select_tool_results(&retention, &views, &CancelToken::none())
         .await
+        .map(|selection| selection.kept)
         .unwrap_or_default();
     Ranking {
         order: kept
@@ -1224,12 +1227,12 @@ async fn output_pointers_case(decisions: &Decisions, case: RankCase) -> Ranking 
     .await;
     let latency_ms = latency_since(started);
     match advice {
-        Some(advice) => Ranking {
+        Ok(advice) => Ranking {
             order: advice.order(),
             advised: advice.advised,
             latency_ms,
         },
-        None => Ranking {
+        Err(_) => Ranking {
             order: (0..windows.len()).collect(),
             advised: Vec::new(),
             latency_ms,

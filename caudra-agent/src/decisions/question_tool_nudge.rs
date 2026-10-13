@@ -1,4 +1,3 @@
-use caudra_config::decisions::FeatureMode;
 use caudra_decision::Answer;
 use serde_json::json;
 
@@ -33,11 +32,13 @@ pub(crate) fn state(user_request: &str, assistant_reply: &str) -> Option<Decisio
     .ok()
 }
 
-pub(crate) fn should_nudge(mode: &FeatureMode, outcome: &DecisionOutcome, threshold: f64) -> bool {
-    *mode == FeatureMode::Advise
-        && threshold.is_finite()
-        && (0.0..=1.0).contains(&threshold)
-        && probability(outcome).is_some_and(|probability| probability >= threshold)
+/// The probability, when it reaches a usable `threshold`: what advise acts on
+/// and shadow reports.
+pub(crate) fn nudge_probability(outcome: &DecisionOutcome, threshold: f64) -> Option<f64> {
+    (threshold.is_finite() && (0.0..=1.0).contains(&threshold))
+        .then(|| probability(outcome))
+        .flatten()
+        .filter(|probability| *probability >= threshold)
 }
 
 pub(super) fn probability(outcome: &DecisionOutcome) -> Option<f64> {
@@ -88,7 +89,7 @@ fn json_bytes(character: char) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use caudra_config::decisions::{DecisionThresholds, FeatureMode};
+    use caudra_config::decisions::DecisionThresholds;
     use caudra_decision::{
         Answer, DecisionError, DecisionResponse, NoulAnswer, ScoreAnswer, Usage,
     };
@@ -96,8 +97,8 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        ASSISTANT_REPLY_BYTES, OMISSION, QUESTION, REMINDER, USER_REQUEST_BYTES, probability,
-        should_nudge, state,
+        ASSISTANT_REPLY_BYTES, OMISSION, QUESTION, REMINDER, USER_REQUEST_BYTES, nudge_probability,
+        probability, state,
     };
     use crate::decisions::state::MAX_STATE_BYTES;
     use crate::decisions::{DecisionFeature, DecisionOutcome, stats_thresholds};
@@ -121,15 +122,8 @@ mod tests {
             }),
             latency_ms: 0,
             receipt: None,
+            newly_failing: false,
         }
-    }
-
-    #[test_case(FeatureMode::Off, false; "off")]
-    #[test_case(FeatureMode::Shadow, false; "shadow")]
-    #[test_case(FeatureMode::Advise, true; "advise")]
-    #[test_case(FeatureMode::Enforce, false; "unsupported_enforce")]
-    fn only_advise_acts(mode: FeatureMode, expected: bool) {
-        assert_eq!(should_nudge(&mode, &outcome(1.0), THRESHOLD), expected);
     }
 
     #[test_case(0.0, false; "negative")]
@@ -144,7 +138,7 @@ mod tests {
     #[test_case(f64::NEG_INFINITY, false; "negative_infinity")]
     fn scores_fail_open(answer: f64, expected: bool) {
         assert_eq!(
-            should_nudge(&FeatureMode::Advise, &outcome(answer), THRESHOLD),
+            nudge_probability(&outcome(answer), THRESHOLD).is_some(),
             expected
         );
     }
@@ -154,11 +148,7 @@ mod tests {
     #[test_case(f64::NAN; "nan")]
     #[test_case(f64::INFINITY; "infinity")]
     fn invalid_thresholds_fail_open(threshold: f64) {
-        assert!(!should_nudge(
-            &FeatureMode::Advise,
-            &outcome(1.0),
-            threshold
-        ));
+        assert_eq!(nudge_probability(&outcome(1.0), threshold), None);
     }
 
     #[test_case(DecisionError::Timeout; "timeout")]
@@ -171,7 +161,7 @@ mod tests {
         let mut outcome = outcome(1.0);
         outcome.result = Err(error);
         assert_eq!(probability(&outcome), None);
-        assert!(!should_nudge(&FeatureMode::Advise, &outcome, THRESHOLD));
+        assert_eq!(nudge_probability(&outcome, THRESHOLD), None);
     }
 
     #[test_case("missing"; "missing")]
@@ -203,7 +193,7 @@ mod tests {
             }
         }
         assert_eq!(probability(&outcome), None);
-        assert!(!should_nudge(&FeatureMode::Advise, &outcome, THRESHOLD));
+        assert_eq!(nudge_probability(&outcome, THRESHOLD), None);
     }
 
     #[test_case("", REPLY; "no_request")]

@@ -52,7 +52,7 @@ use self::http::HttpTransport;
 use self::output::McpOutput;
 use self::stdio::StdioTransport;
 use self::transport::McpTransport;
-use crate::decisions::{DecisionContext, Decisions};
+use crate::decisions::{DecisionContext, Decisions, NoteDraft};
 use crate::permissions::{PermissionSubject, canonical_json_sha256};
 use crate::tools::deferral::{SearchOutcome, ToolSearchRanking, rank_tool_search};
 use crate::tools::profile_policy::{
@@ -440,7 +440,7 @@ pub struct PreparedMcpSearch<'a> {
     session: &'a McpSession,
     query: &'a str,
     declaring: McpRequestSnapshot,
-    ranking: Option<ToolSearchRanking>,
+    ranking: Result<ToolSearchRanking, Option<NoteDraft>>,
 }
 
 impl PreparedMcpSearch<'_> {
@@ -449,9 +449,15 @@ impl PreparedMcpSearch<'_> {
         if !Arc::ptr_eq(&self.declaring.index, &self.session.declared_index()) {
             return self.session.search_tools(self.query);
         }
-        Ok(self
-            .session
-            .load_search_matches(self.query, matches, self.ranking))
+        Ok(match self.ranking {
+            Ok(ranking) => self
+                .session
+                .load_search_matches(self.query, matches, Some(ranking)),
+            Err(note) => SearchOutcome {
+                note,
+                ..self.session.load_search_matches(self.query, matches, None)
+            },
+        })
     }
 }
 
@@ -645,7 +651,7 @@ impl McpSession {
             self.findable(&declaring, &tool.qualified_name) && tool.matches_exactly(query.trim())
         });
         let ranking = if exact {
-            None
+            Err(None)
         } else {
             rank_tool_search(
                 query,
@@ -722,13 +728,20 @@ impl McpSession {
         ranking: Option<ToolSearchRanking>,
     ) -> SearchOutcome {
         let mut guard = self.lock_loaded();
-        let baseline: Vec<Arc<str>> = matches
-            .iter()
-            .take(MAX_SEARCH_LOADS)
-            .filter(|(_, _, tool)| ranking.is_some() && !guard.contains(&tool.qualified_name))
-            .map(|(_, _, tool)| Arc::from(tool.wire_name()))
-            .collect();
-        if let Some(ranking) = &ranking {
+        let unloaded_head = |matches: &[(bool, usize, &ToolDescriptor)]| -> Vec<Arc<str>> {
+            matches
+                .iter()
+                .take(MAX_SEARCH_LOADS)
+                .filter(|(_, _, tool)| !guard.contains(&tool.qualified_name))
+                .map(|(_, _, tool)| Arc::from(tool.wire_name()))
+                .collect()
+        };
+        let compared = ranking.as_ref().map(|ranking| {
+            let mut ranked = matches.clone();
+            ranking.reorder(&mut ranked, |(_, _, tool)| tool.wire_name());
+            (unloaded_head(&ranked), unloaded_head(&matches))
+        });
+        if let Some(ranking) = ranking.as_ref().filter(|ranking| ranking.applied()) {
             ranking.reorder(&mut matches, |(_, _, tool)| tool.wire_name());
         }
         let mut hits: Vec<&str> = Vec::new();
@@ -756,6 +769,7 @@ impl McpSession {
                 message: format!(
                     "{SEARCH_NO_MATCH} '{query}'. Try other keywords or an exact name from the catalog."
                 ),
+                note: None,
             };
         }
         let plural = if hits.len() == 1 { "tool" } else { "tools" };
@@ -775,14 +789,14 @@ impl McpSession {
             }
             out.push_str(". Search an exact tool name to load it.");
         }
-        let outcome = SearchOutcome {
+        let note = ranking
+            .zip(compared)
+            .and_then(|(ranking, (ranked, lexical))| ranking.settle(&ranked, &lexical));
+        SearchOutcome {
             loaded,
             message: out,
-        };
-        if let Some(ranking) = ranking {
-            ranking.record_effect(&outcome, &baseline);
+            note,
         }
-        outcome
     }
 
     /// Invoked on every MCP dispatch: a deferred tool the model calls by
@@ -3269,7 +3283,7 @@ mod tests {
             &DecisionContext::default(),
         ))
         .unwrap();
-        assert!(prepared.ranking.is_some());
+        assert!(prepared.ranking.is_ok());
         assert!(session.lock_loaded().is_empty());
         drop(prepared);
         assert!(session.lock_loaded().is_empty());

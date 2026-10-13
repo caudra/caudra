@@ -50,7 +50,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use caudra_agent::decisions::{CodeSymbol, rerank_code_context};
+use caudra_agent::decisions::{CodeSymbol, code_context_out_of_deadline, rerank_code_context};
 use caudra_agent::patch;
 use caudra_agent::permissions::pattern_recognition::ObservationProvenance;
 use caudra_agent::permissions::{
@@ -4439,7 +4439,7 @@ fn code_graph_result(
 /// Moves the rows the decision engine judges relevant to the task to the top
 /// before `fit` keeps a prefix, within the call's own deadline. Workcell's
 /// headline and confidence still describe its own ranking; the returned note
-/// tells the model which rows moved.
+/// tells the model which rows moved, and a row after the card tells the user.
 async fn rerank_context_rows(ctx: &ToolContext, output: &mut CodeContextOutput) -> Option<String> {
     let decisions = ctx.permissions.decisions()?;
     let remaining = ctx.deadline.remaining().ok()?;
@@ -4463,16 +4463,20 @@ async fn rerank_context_rows(ctx: &ToolContext, output: &mut CodeContextOutput) 
         Some(ctx.permissions.as_ref()),
         &ctx.cancel,
     );
-    match remaining {
+    let (reordered, note) = match remaining {
         Some(remaining) => {
             future::or(rerank, async {
                 Timer::after(remaining).await;
-                None
+                (None, code_context_out_of_deadline(&decisions))
             })
             .await
         }
         None => rerank.await,
+    };
+    if let Some((note, sink)) = note.zip(ctx.note_sink()) {
+        sink.emit(note);
     }
+    reordered
 }
 
 /// A refused selector is a successful call: the did-you-mean list is the useful

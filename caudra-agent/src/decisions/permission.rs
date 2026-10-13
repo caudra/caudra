@@ -83,20 +83,40 @@ impl Decisions {
         feature: &DecisionFeature,
         result: &Result<DecisionResponse, DecisionError>,
     ) -> Option<PermissionAction> {
-        let (escalate, threshold) = match (feature, self.mode(feature)) {
-            (DecisionFeature::PermissionAdvice, FeatureMode::Advise) => {
-                (false, self.config().thresholds.permission_flag)
-            }
-            (DecisionFeature::AutoScreening, FeatureMode::Enforce) => {
-                (true, self.config().thresholds.auto_flag)
-            }
+        let escalate = match (feature, self.mode(feature)) {
+            (DecisionFeature::PermissionAdvice, FeatureMode::Advise) => false,
+            (DecisionFeature::AutoScreening, FeatureMode::Enforce) => true,
             _ => return None,
         };
         let response = match result {
             Ok(response) => response,
             Err(_) => return escalate.then(|| PermissionAction::Escalate(Vec::new())),
         };
-        let flags: Vec<_> = FLAGS
+        let flags = self.flags(response, escalate);
+        if flags.is_empty() {
+            None
+        } else if escalate {
+            Some(PermissionAction::Escalate(flags))
+        } else {
+            Some(PermissionAction::Advice(flags))
+        }
+    }
+
+    /// The flags enforcing auto screening escalates on, whatever the mode:
+    /// what shadow screening reports.
+    pub(crate) fn screening_flags(&self, evaluation: &DecisionOutcome) -> Vec<PermissionFlag> {
+        evaluation
+            .result
+            .as_ref()
+            .map_or_else(|_| Vec::new(), |response| self.flags(response, true))
+    }
+
+    fn flags(&self, response: &DecisionResponse, escalate: bool) -> Vec<PermissionFlag> {
+        let threshold = match escalate {
+            true => self.config().thresholds.auto_flag,
+            false => self.config().thresholds.permission_flag,
+        };
+        FLAGS
             .iter()
             .filter_map(|flag| {
                 let Answer::Noul(answer) = response.answers.get(*flag)? else {
@@ -115,14 +135,7 @@ impl Decisions {
                     probability: answer.noul,
                 })
             })
-            .collect();
-        if flags.is_empty() {
-            None
-        } else if escalate {
-            Some(PermissionAction::Escalate(flags))
-        } else {
-            Some(PermissionAction::Advice(flags))
-        }
+            .collect()
     }
 }
 

@@ -488,6 +488,7 @@ pub fn run(
             | AgentEvent::Nudge { .. }
             | AgentEvent::ToolsLoaded { .. }
             | AgentEvent::Unrecorded { .. }
+            | AgentEvent::Decision(_)
             | AgentEvent::PromptProgress { .. } => {}
             AgentEvent::Autopilot(event) => {
                 note_autopilot(event, &mut tally, verbose_out.as_mut(), &session_id)?;

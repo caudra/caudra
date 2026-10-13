@@ -206,6 +206,8 @@ Each one appears in the transcript as a dim row folded to its heading. Click the
 
 Set `ui.show_reminders = false` to keep the transcript to the conversation alone. The messages still reach the model.
 
+Rows about what the decision engine changed are a separate kind. The model never sees them, and `ui.show_decisions` controls them. See [Decision rows in the transcript](/docs/permissions/#decision-rows-in-the-transcript).
+
 ### Background-work awareness
 
 Caudra keeps the main agent aware of delegated work with a compact snapshot of background tasks, its own asynchronous shell jobs, and active workflows. It includes readable IDs, short assignments, current states, and counts for entries that do not fit. Child agents receive owner-scoped command state. Their shell jobs are not repeated as independent main-agent assignments. Snapshots read runtime state without polling tools or consuming result notifications.

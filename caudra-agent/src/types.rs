@@ -31,6 +31,7 @@ use strum::Display;
 
 use crate::agent::{GoalResult, GoalVerdict};
 use crate::autopilot::{AutopilotDecision, DecisionKind};
+use crate::decisions::DecisionNote;
 use crate::mcp::output::McpOutput;
 use crate::peers::{
     AssignedWork, PeerHistoryPage, PeerSummary, PublishReceipt, STATUS_HELD, STATUS_QUEUED,
@@ -2741,6 +2742,8 @@ pub enum AgentEvent {
         autopilot_owned: bool,
     },
     Autopilot(AutopilotEvent),
+    /// What a decision feature did, for a transcript row the model never sees.
+    Decision(Box<DecisionNote>),
     TurnComplete(Box<TurnCompleteEvent>),
     ModelUsage {
         usage: TokenUsage,
@@ -2891,6 +2894,12 @@ pub enum AgentEvent {
 impl From<AutopilotEvent> for AgentEvent {
     fn from(event: AutopilotEvent) -> Self {
         Self::Autopilot(event)
+    }
+}
+
+impl From<DecisionNote> for AgentEvent {
+    fn from(note: DecisionNote) -> Self {
+        Self::Decision(Box::new(note))
     }
 }
 

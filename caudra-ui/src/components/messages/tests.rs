@@ -891,6 +891,13 @@ const INJECTED_BODY: &str =
 const INJECTED_HEADING: &str = "Environment";
 const INJECTED_DETAIL: &str = "2026-09-10";
 const REASONING_BODY: &str = "weighing the options";
+const DECISION_FEATURE: &str = "memory_search";
+const DECISION_SUMMARY: &str = "3 notes ranked";
+const DECISION_DETAIL: &str = "0.97  release-notes  kept 1st";
+const DECISION_TITLED: &str = "a decision row must show its title";
+const DECISION_FOLDED: &str = "a decision row's details must stay folded";
+const DECISION_OPENED: &str = "a click must open a decision row's details";
+const DECISION_STYLES_APART: &str = "each outcome must draw its row its own way";
 const EAGER_SUMMARY: &str = "executed arguments";
 const EAGER_BODY: &str = "execution output";
 const EAGER_ANNOTATION: &str = "ranking 12 files";
@@ -5235,6 +5242,91 @@ fn an_injected_heading_responds_to_hover() {
     panel.update_hover(area.y, area.x, area, false, Path::new(NO_PROJECT));
 
     assert!(matches!(panel.hover, Some(HoverTarget::CachedThinking(0))));
+}
+
+fn decision_row(outcome: NoteOutcome, details: &[String]) -> DisplayMessage {
+    DisplayMessage::decision(DECISION_FEATURE, outcome, DECISION_SUMMARY, details)
+}
+
+/// The details are the feature's working, so the row reads as one line until
+/// someone asks for them, and the same click puts them away again.
+#[test]
+fn a_decision_row_shows_its_title_until_clicked_open() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(decision_row(NoteOutcome::Acted, &[DECISION_DETAIL.into()]));
+    let area = Rect::new(0, 0, 80, 24);
+
+    let folded = buffer_text(&render(&mut panel, area.width, area.height));
+    let folded_height = panel.segment_heights()[0];
+    assert!(
+        folded.contains(DECISION_SUMMARY),
+        "{DECISION_TITLED}: {folded}"
+    );
+    assert!(
+        !folded.contains(DECISION_DETAIL),
+        "{DECISION_FOLDED}: {folded}"
+    );
+
+    assert!(panel.handle_click(0, area));
+    let opened = buffer_text(&render(&mut panel, area.width, area.height));
+    assert!(
+        opened.contains(DECISION_DETAIL),
+        "{DECISION_OPENED}: {opened}"
+    );
+
+    assert!(panel.handle_click(0, area));
+    assert_eq!(panel.segment_heights()[0], folded_height);
+}
+
+#[test]
+fn a_decision_row_without_details_has_nothing_to_open() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(decision_row(NoteOutcome::Acted, &[]));
+    let area = Rect::new(0, 0, 80, 24);
+    render(&mut panel, area.width, area.height);
+
+    assert!(!panel.handle_click(0, area));
+}
+
+/// A row that only says what it would have done, and one whose engine failed,
+/// must not read as a row that acted, nor as each other.
+#[test]
+fn decision_outcomes_are_drawn_apart() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let outcomes = [
+        NoteOutcome::Acted,
+        NoteOutcome::Shadow,
+        NoteOutcome::FellBack,
+    ];
+    let styles: Vec<Style> = outcomes
+        .into_iter()
+        .map(|outcome| {
+            panel.load_messages(vec![decision_row(outcome, &[])]);
+            style_of(&render(&mut panel, 80, 24), DECISION_SUMMARY)
+        })
+        .collect();
+
+    for (index, style) in styles.iter().enumerate() {
+        for other in &styles[index + 1..] {
+            assert_ne!(style, other, "{DECISION_STYLES_APART}");
+        }
+    }
+}
+
+/// A row reporting on a call goes under the call's card, so it must not take
+/// the card's place as the transcript's newest message.
+#[test]
+fn a_decision_row_never_takes_the_newest_card_place() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start(TOOL_ID, SHELL_TOOL_NAME));
+    let card = panel.message_count() - 1;
+
+    let after_card = panel.row_after_card(TOOL_ID).unwrap();
+    panel.insert(after_card, decision_row(NoteOutcome::Acted, &[]));
+
+    assert_eq!(after_card, card + 1);
+    assert!(panel.is_latest(card));
+    assert!(!panel.is_latest(after_card));
 }
 
 #[test]

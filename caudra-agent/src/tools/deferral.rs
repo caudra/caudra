@@ -29,8 +29,8 @@ use tracing::{info, warn};
 
 use crate::CancelToken;
 use crate::decisions::{
-    DecisionContext, DecisionFeature, Decisions, MAX_RERANK_BATCH, Relevance, Rerank, Reranked,
-    candidate_text,
+    DecisionContext, DecisionFeature, Decisions, MAX_RERANK_BATCH, NoteDraft, NoteOutcome,
+    Relevance, Rerank, Reranked, candidate_text, placement, score_line,
 };
 
 pub const TOOL_SEARCH_TOOL_NAME: &str = "tool_search";
@@ -47,6 +47,8 @@ const MAX_SEARCH_QUERY_BYTES: usize = 512;
 const QUERY_KEY: &str = "query";
 const NAME_KEY: &str = "name";
 const SUMMARY_KEY: &str = "summary";
+const KEPT_LEXICAL_ORDER: &str = "kept the keyword order";
+const TOOL_LIST_SEPARATOR: &str = ", ";
 const RELEVANCE: Relevance = Relevance {
     statement: "The tool is suited to the query. This only orders catalog loading; it grants no execution permission.",
     relevant: "The tool's name or summary shows it does what the query asks for.",
@@ -56,11 +58,12 @@ const RELEVANCE: Relevance = Relevance {
 /// The lexical head of a tool search reordered by relevance: candidates at
 /// or above the relevance floor first, most relevant first, then the rest in
 /// lexical order. Nothing is dropped, so a search loads only what its
-/// keywords matched.
+/// keywords matched. A shadow ranking is only reported, never applied.
 pub(crate) struct ToolSearchRanking {
     names: Vec<String>,
     order: Vec<usize>,
     relevant: usize,
+    outcome: NoteOutcome,
     reranked: Reranked,
 }
 
@@ -68,6 +71,10 @@ impl ToolSearchRanking {
     /// The candidate judged most relevant, when any reached the floor.
     pub(crate) fn top(&self) -> Option<usize> {
         self.order.first().copied().filter(|_| self.relevant > 0)
+    }
+
+    pub(crate) fn applied(&self) -> bool {
+        self.outcome == NoteOutcome::Acted
     }
 
     /// Reorders the head of `items` when it still holds the ranked
@@ -89,27 +96,53 @@ impl ToolSearchRanking {
         );
     }
 
-    /// Records `Rerouted` only when the search loaded something other than
-    /// the lexical order would have.
-    pub(crate) fn record_effect(self, outcome: &SearchOutcome, baseline: &[Arc<str>]) {
-        if outcome.rerouted_from(baseline) {
-            self.reranked.record_rerouted(&self.order, self.order.len());
+    /// When the ranked order loads something other than the `lexical` one
+    /// would have, records `Rerouted` and returns the row: what `ranked`
+    /// loaded instead, or in shadow would have, and every match's score and
+    /// position.
+    pub(crate) fn settle(self, ranked: &[Arc<str>], lexical: &[Arc<str>]) -> Option<NoteDraft> {
+        if !rerouted(ranked, lexical) {
+            return None;
         }
+        self.reranked.record_rerouted(&self.order, self.order.len());
+        let mut summary = format!("loaded {}", tool_list(ranked));
+        if !lexical.is_empty() {
+            summary.push_str(&format!(" instead of {}", tool_list(lexical)));
+        }
+        let scores = self.reranked.scores();
+        let details = self
+            .order
+            .iter()
+            .enumerate()
+            .map(|(to, from)| score_line(scores[*from], &self.names[*from], &placement(*from, to)))
+            .collect();
+        Some(NoteDraft::new(
+            self.reranked.decisions(),
+            DecisionFeature::ToolSearch,
+            self.outcome,
+            &summary,
+            details,
+        ))
     }
 }
 
 /// One relevance question per candidate over the first [`MAX_RERANK_BATCH`]
-/// lexical matches. `None` keeps the lexical order: too few candidates, the
-/// feature not enforced, or no usable answer.
+/// lexical matches. Without a ranking the lexical order stands: too few
+/// candidates, the feature off, or no usable answer, with the row for a
+/// fresh engine failure.
 pub(crate) async fn rank_tool_search<'a>(
     query: &str,
     candidates: impl Iterator<Item = (&'a str, &'a Value)>,
     decisions: Option<&Decisions>,
     context: &DecisionContext,
-) -> Option<ToolSearchRanking> {
+) -> Result<ToolSearchRanking, Option<NoteDraft>> {
     let feature = DecisionFeature::ToolSearch;
-    let decisions = decisions.filter(|service| service.enabled(&feature))?;
-    let floor = feature.rerank_threshold(&decisions.config().thresholds)?;
+    let decisions = decisions
+        .filter(|service| service.enabled(&feature))
+        .ok_or(None)?;
+    let floor = feature
+        .rerank_threshold(&decisions.config().thresholds)
+        .ok_or(None)?;
     let (names, candidates): (Vec<String>, Vec<Value>) = candidates
         .take(MAX_RERANK_BATCH)
         .map(|(name, definition)| {
@@ -124,12 +157,12 @@ pub(crate) async fn rank_tool_search<'a>(
         })
         .unzip();
     if candidates.len() < MIN_RANKED_CANDIDATES {
-        return None;
+        return Err(None);
     }
-    let reranked = decisions
+    let (reranked, outcome) = decisions
         .rerank(
             Rerank {
-                feature,
+                feature: feature.clone(),
                 relevance: &RELEVANCE,
                 query: &json!({QUERY_KEY: candidate_text(query, MAX_SEARCH_QUERY_BYTES)}),
                 candidates: &candidates,
@@ -138,16 +171,38 @@ pub(crate) async fn rank_tool_search<'a>(
             None,
             &CancelToken::none(),
         )
-        .await?;
+        .await
+        .scored()
+        .map_err(|failure| {
+            failure.map(|failure| {
+                NoteDraft::fell_back(decisions, feature, &failure, KEPT_LEXICAL_ORDER)
+            })
+        })?;
     let (mut order, below) = reranked.split_at_floor(floor);
     let relevant = order.len();
     order.extend(below);
-    Some(ToolSearchRanking {
+    Ok(ToolSearchRanking {
         names,
         order,
         relevant,
+        outcome,
         reranked,
     })
+}
+
+/// Whether a search loaded something other than the `lexical` order would
+/// have.
+fn rerouted(loaded: &[Arc<str>], lexical: &[Arc<str>]) -> bool {
+    !loaded.is_empty()
+        && (loaded.len() != lexical.len() || loaded.iter().any(|name| !lexical.contains(name)))
+}
+
+fn tool_list(names: &[Arc<str>]) -> String {
+    let names: Vec<String> = names
+        .iter()
+        .map(|name| candidate_text(name, MAX_SEARCH_NAME_BYTES))
+        .collect();
+    names.join(TOOL_LIST_SEPARATOR)
 }
 
 /// Every tool the transcript shows being called, for reseeding a resumed
@@ -252,33 +307,40 @@ pub struct DeferralSession {
     loaded: Arc<Mutex<HashSet<Arc<str>>>>,
 }
 
-/// What one search moved into the request array.
+/// What one search moved into the request array, and the row for what the
+/// decision engine did to it.
 #[derive(Debug)]
 pub struct SearchOutcome {
     pub loaded: Vec<Arc<str>>,
     pub message: String,
+    pub note: Option<NoteDraft>,
 }
 
 impl SearchOutcome {
+    #[cfg(test)]
     pub(crate) fn rerouted_from(&self, baseline: &[Arc<str>]) -> bool {
-        !self.loaded.is_empty()
-            && (self.loaded.len() != baseline.len()
-                || self.loaded.iter().any(|name| !baseline.contains(name)))
+        rerouted(&self.loaded, baseline)
     }
 }
 
 pub struct PreparedDeferredSearch<'a> {
     session: &'a DeferralSession,
     query: &'a str,
-    ranking: Option<ToolSearchRanking>,
+    ranking: Result<ToolSearchRanking, Option<NoteDraft>>,
 }
 
 impl PreparedDeferredSearch<'_> {
     pub fn commit(self) -> Result<SearchOutcome, String> {
         let matches = self.session.search_matches(self.query)?;
-        Ok(self
-            .session
-            .load_search_match(self.query, &matches, self.ranking))
+        Ok(match self.ranking {
+            Ok(ranking) => self
+                .session
+                .load_search_match(self.query, &matches, Some(ranking)),
+            Err(note) => SearchOutcome {
+                note,
+                ..self.session.load_search_match(self.query, &matches, None)
+            },
+        })
     }
 }
 
@@ -379,7 +441,7 @@ impl DeferralSession {
     ) -> Result<PreparedDeferredSearch<'a>, String> {
         let matches = self.search_matches(query)?;
         let ranking = if self.has_exact_match(query) {
-            None
+            Err(None)
         } else {
             rank_tool_search(
                 query,
@@ -444,38 +506,45 @@ impl DeferralSession {
         ranking: Option<ToolSearchRanking>,
     ) -> SearchOutcome {
         let mut guard = self.lock_loaded();
-        let baseline: Vec<Arc<str>> = matches
-            .first()
-            .filter(|_| ranking.is_some())
-            .into_iter()
-            .flat_map(|(_, _, hit)| {
-                self.deferred
-                    .iter()
-                    .filter(move |tool| hit.loads_with(tool))
-            })
-            .filter(|tool| !guard.contains(&tool.name))
-            .map(|tool| Arc::clone(&tool.name))
-            .collect();
+        let unloaded_group = |index: usize, loaded: &HashSet<Arc<str>>| -> Vec<Arc<str>> {
+            matches
+                .get(index)
+                .into_iter()
+                .flat_map(|(_, _, hit)| {
+                    self.deferred
+                        .iter()
+                        .filter(move |tool| hit.loads_with(tool))
+                })
+                .filter(|tool| !loaded.contains(&tool.name))
+                .map(|tool| Arc::clone(&tool.name))
+                .collect()
+        };
+        let top = ranking
+            .as_ref()
+            .and_then(ToolSearchRanking::top)
+            .unwrap_or_default();
+        let compared = ranking
+            .as_ref()
+            .map(|_| (unloaded_group(top, &guard), unloaded_group(0, &guard)));
+        let chosen = match ranking.as_ref().is_some_and(ToolSearchRanking::applied) {
+            true => top,
+            false => 0,
+        };
         let loaded: Vec<Arc<str>> = matches
-            .get(
-                ranking
-                    .as_ref()
-                    .and_then(ToolSearchRanking::top)
-                    .unwrap_or_default(),
-            )
+            .get(chosen)
             .map(|(_, _, hit)| self.load_group(&mut guard, hit))
             .unwrap_or_default();
         drop(guard);
 
         info!(loaded = loaded.len(), "built-in tool search");
-        let outcome = SearchOutcome {
+        let note = ranking
+            .zip(compared)
+            .and_then(|(ranking, (ranked, lexical))| ranking.settle(&ranked, &lexical));
+        SearchOutcome {
             message: describe(&loaded, query),
             loaded,
-        };
-        if let Some(ranking) = ranking {
-            ranking.record_effect(&outcome, &baseline);
+            note,
         }
-        outcome
     }
 
     /// Loading is per group, so the returned list is what the array gains,
@@ -682,7 +751,9 @@ fn haystack(definition: &Value) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::decisions::{CANDIDATE_KEY, CANDIDATE_TEXT_OMITTED, MAX_CANDIDATE_INPUT_BYTES};
+    use crate::decisions::{
+        CANDIDATE_KEY, CANDIDATE_TEXT_OMITTED, ENGINE_UNREACHABLE, MAX_CANDIDATE_INPUT_BYTES,
+    };
     use crate::template::Vars;
     use crate::tools::{
         DescriptionContext, ToolAudience, ToolDefinitions, ToolEffect, ToolFilter, ToolRegistry,
@@ -737,6 +808,14 @@ pub(crate) mod tests {
     const TEST_TIMEOUT_MS: u64 = 5_000;
     const EFFECT_TIMEOUT: Duration = Duration::from_secs(5);
     const SEARCH_REDACTED: &str = "[redacted]";
+    const RANKED_SUMMARY: &str = "loaded execution_environment instead of code_map, code_refs";
+    const SHADOW_RANKED_SUMMARY: &str =
+        "would have loaded execution_environment instead of code_map, code_refs";
+    const RANKED_DETAILS: [&str; 3] = [
+        "1.00  execution_environment  moved 3rd to 1st",
+        "0.00  code_map  moved 1st to 2nd",
+        "0.00  code_refs  moved 2nd to 3rd",
+    ];
     const WORKFLOWS_ON: FeatureFlags = FeatureFlags::NONE.with(Feature::Workflows);
 
     type Hook = Option<Box<dyn Fn() + Send + Sync>>;
@@ -876,7 +955,7 @@ pub(crate) mod tests {
             &DecisionContext::default(),
         ))
         .unwrap();
-        assert!(prepared.ranking.is_some());
+        assert!(prepared.ranking.is_ok());
         assert!(session.lock_loaded().is_empty());
         drop(prepared);
         assert!(session.lock_loaded().is_empty());
@@ -901,6 +980,7 @@ pub(crate) mod tests {
             assert_eq!(fixture.requests.lock().unwrap().len(), 1);
             drop(pending);
             assert!(session.lock_loaded().is_empty());
+            assert!(session.search(SEARCH_QUERY).unwrap().note.is_none());
         });
     }
 
@@ -994,6 +1074,56 @@ pub(crate) mod tests {
         assert_eq!(
             fixture.requests.lock().unwrap().len(),
             usize::from(mode != FeatureMode::Off)
+        );
+    }
+
+    #[test_case(FeatureMode::Enforce, NoteOutcome::Acted, RANKED_SUMMARY, &[LONELY]; "acted")]
+    #[test_case(FeatureMode::Shadow, NoteOutcome::Shadow, SHADOW_RANKED_SUMMARY, &[MAP, REFS]; "shadow_loads_the_keyword_group")]
+    fn a_rerouted_search_names_what_it_loaded_instead(
+        mode: FeatureMode,
+        outcome: NoteOutcome,
+        summary: &str,
+        loaded: &[&str],
+    ) {
+        let fixture = SearchDecisions::new(mode, THIRD_CANDIDATE, RELEVANT);
+        let searched = ranked_search(&ranked_session(), &fixture.decisions);
+        let expected: Vec<Arc<str>> = loaded.iter().map(|name| Arc::from(*name)).collect();
+        assert_eq!(searched.loaded, expected);
+        assert_eq!(searched.message, describe(&expected, SEARCH_QUERY));
+        let note = searched.note.unwrap();
+        assert_eq!(note.outcome, outcome);
+        assert_eq!(note.summary, summary);
+        assert_eq!(note.details, RANKED_DETAILS);
+    }
+
+    #[test_case(FIRST_CANDIDATE; "lexical_choice")]
+    #[test_case(SECOND_CANDIDATE; "same_group")]
+    #[test_case(NO_CANDIDATE; "nothing_relevant")]
+    fn an_unchanged_search_has_no_row(favoured: &str) {
+        let fixture = SearchDecisions::new(FeatureMode::Enforce, favoured, RELEVANT);
+        assert!(
+            ranked_search(&ranked_session(), &fixture.decisions)
+                .note
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_failing_engine_falls_back_once_until_it_answers() {
+        let fixture = SearchDecisions::new(FeatureMode::Enforce, UNREACHABLE_REPLY, RELEVANT);
+        let summaries: Vec<Option<String>> = (0..2)
+            .map(|_| {
+                ranked_search(&ranked_session(), &fixture.decisions)
+                    .note
+                    .map(|note| note.summary)
+            })
+            .collect();
+        assert_eq!(
+            summaries,
+            [
+                Some(format!("{ENGINE_UNREACHABLE}; {KEPT_LEXICAL_ORDER}")),
+                None
+            ]
         );
     }
 
@@ -1118,6 +1248,12 @@ pub(crate) mod tests {
         let serialized = serde_json::to_string(&requests[0]).unwrap();
         assert!(!serialized.contains(SEARCH_SECRET));
         assert!(serialized.contains(SEARCH_REDACTED));
+        assert_eq!(outcome.note.is_some(), !secret_selected);
+        if let Some(note) = outcome.note {
+            let text = format!("{} {}", note.summary, note.details.join("\n"));
+            assert!(!text.contains(SEARCH_SECRET));
+            assert!(text.contains(SEARCH_REDACTED));
+        }
     }
 
     #[test_case("https"; "https")]
@@ -1143,7 +1279,10 @@ pub(crate) mod tests {
             Some(&fixture.decisions),
             &DecisionContext::default(),
         ));
-        assert_eq!(result.as_ref().and_then(ToolSearchRanking::top), Some(0));
+        assert_eq!(
+            result.as_ref().ok().and_then(ToolSearchRanking::top),
+            Some(0)
+        );
         let serialized = serde_json::to_string(&fixture.requests.lock().unwrap()[0]).unwrap();
         assert!(!serialized.contains(SEARCH_SECRET));
         assert!(!serialized.contains("alice"));
@@ -1173,7 +1312,7 @@ pub(crate) mod tests {
             Some(&fixture.decisions),
             &DecisionContext::default(),
         ));
-        assert_eq!(result.is_some(), sent);
+        assert_eq!(result.is_ok(), sent);
         let requests = fixture.requests.lock().unwrap();
         assert_eq!(requests.len(), usize::from(sent));
         for request in requests.iter() {

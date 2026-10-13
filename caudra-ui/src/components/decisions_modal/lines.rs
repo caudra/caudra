@@ -243,17 +243,11 @@ fn feature_summary(config: &DecisionsConfig, theme: &Theme) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The name a reader configures the feature by. Workflow has no key, so it
-/// goes by the name it is logged under.
-pub(super) fn feature_label(feature: &DecisionFeature) -> &'static str {
-    feature.config_key().unwrap_or(feature.name())
-}
-
-/// The widest [`feature_label`], so a column of them lines up.
+/// The widest [`DecisionFeature::label`], so a column of them lines up.
 pub(super) fn feature_cols() -> usize {
     DecisionFeature::ALL
         .iter()
-        .map(|feature| feature_label(feature).width())
+        .map(|feature| feature.label().width())
         .max()
         .unwrap_or_default()
 }
@@ -287,7 +281,7 @@ pub(super) fn feature_row(
     let cols = feature_cols();
     vec![
         Span::styled(
-            format!("{:<cols$}{COLUMN_GAP}", feature_label(feature)),
+            format!("{:<cols$}{COLUMN_GAP}", feature.label()),
             theme.item,
         ),
         Span::styled(mode.as_str(), mode_style(mode, theme)),
@@ -305,7 +299,7 @@ pub(super) fn feature_detail(
     let mode = feature_mode(feature, config);
     let setting = feature.setting();
     let mut lines = vec![
-        Line::styled(feature_label(feature), theme.bold),
+        Line::styled(feature.label(), theme.bold),
         Line::styled(
             setting.map_or(WORKFLOW_DETAIL, |setting| setting.description),
             theme.item_desc,
@@ -457,7 +451,7 @@ pub(super) fn activity(
             .find(|stats| stats.feature == feature.name());
         if *mode != FeatureMode::Off || stats.is_some() {
             rows.push(stats_cells(
-                feature_label(feature).to_owned(),
+                feature.label().to_owned(),
                 Some(mode),
                 stats,
                 now,
@@ -750,13 +744,10 @@ fn json_lines(value: &Value) -> Vec<Line<'static>> {
 /// A logged feature by the name it is configured under, or verbatim when no
 /// feature of this build logs under it.
 fn logged_label(name: &str) -> String {
-    DecisionFeature::ALL
-        .iter()
-        .find(|feature| feature.name() == name)
-        .map_or_else(
-            || escape_terminal_controls(name),
-            |feature| feature_label(feature).to_owned(),
-        )
+    DecisionFeature::from_name(name).map_or_else(
+        || escape_terminal_controls(name),
+        |feature| feature.label().to_owned(),
+    )
 }
 
 fn logged_feature(name: &str) -> String {

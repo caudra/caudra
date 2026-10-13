@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::decisions::Decisions;
+use crate::decisions::{DecisionNote, Decisions};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_lock::Mutex;
 use caudra_automation::event::{GoalView, SessionStatus, SessionView, StartedBy, WorkView};
@@ -469,6 +469,22 @@ impl SessionStore {
         }
     }
 
+    /// Kept for display alone, so a row that cannot be written is reported and the session
+    /// carries on.
+    fn record_engine_decision(&mut self, note: &DecisionNote, agent: Option<String>) {
+        let session_id = self.session.id;
+        let at_ms = u64::try_from(SystemClock::new().now_ms()).unwrap_or_default();
+        let row = note.stored(at_ms, agent);
+        if let Err(error) = self.database().and_then(|database| {
+            database
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert_engine_decisions(session_id, &[row])
+        }) {
+            warn!(%error, %session_id, feature = note.feature.name(), "decision row not recorded");
+        }
+    }
+
     fn set_system_prompt_profile(&mut self, name: Option<&str>) {
         if let Some(name) = name {
             self.session.meta.system_prompt_profile = Some(name.to_owned());
@@ -710,6 +726,11 @@ impl SessionStore {
             }
             AgentEvent::Autopilot(AutopilotEvent::Decided(decision)) => {
                 self.record_autopilot_decision(decision);
+                return Ok(());
+            }
+            AgentEvent::Decision(note) => {
+                let agent = envelope.subagent.as_ref().map(|info| info.task_id.clone());
+                self.record_engine_decision(note, agent);
                 return Ok(());
             }
             AgentEvent::Autopilot(AutopilotEvent::Engaged | AutopilotEvent::Ended { .. })
@@ -4671,6 +4692,7 @@ mod tests {
     use caudra_automation::limits::ROLLING_WINDOW_MS;
     use caudra_automation::request::{AutomationRequest, AutomationResponse, GoalClaim};
     use caudra_automation::snapshot::{ArmOrigin, FiringStatus, FiringSummary, WaitReason};
+    use caudra_config::decisions::FeatureMode;
     use caudra_providers::{
         AgentError, ProviderEvent, RequestOptions, StandingReminderKind, StopReason,
         StreamResponse, TaskEventOrigin,
@@ -4678,6 +4700,7 @@ mod tests {
     use caudra_storage::autopilot::{AutopilotBudget, StoredAutopilot};
     use caudra_storage::background::TaskRecord;
     use caudra_storage::decision_log::DecisionLog;
+    use caudra_storage::engine_decisions::StoredDecisionAnchor;
     use caudra_storage::permission_state::PermissionRuleRecord;
     use caudra_storage::permission_state::mutation::{
         PermissionMutation, PermissionRecordIdentity, prepare_mutation,
@@ -4696,6 +4719,7 @@ mod tests {
     use crate::automation::manager::{GOAL_ACTIVE, GOAL_OWNED_BY_AUTOPILOT, PAUSED_BY_SDK};
     use crate::automation::testing::AutomationFixture;
     use crate::background::TaskDelivery;
+    use crate::decisions::{DecisionFeature, NoteAnchor, NoteOutcome};
     use crate::permissions::{
         PermissionAnswer, PermissionError, PermissionLifetime, PermissionRequest, RevokedRuleScope,
     };
@@ -5856,6 +5880,71 @@ mod tests {
         let loaded = load(&tmp);
         assert_eq!(outcome(&loaded, RESOLVED), StoredSubagentOutcome::Done);
         assert_eq!(outcome(&loaded, RUNNING), StoredSubagentOutcome::Killed);
+    }
+
+    #[test]
+    fn decision_notes_are_kept_for_the_agent_that_made_them() {
+        const SUMMARY: &str = "3 notes ranked";
+        const DETAIL: &str = "0.97  release-notes  kept 1st";
+        const CALL_ID: &str = "toolu_decision";
+        const HISTORY_LEN: usize = 4;
+
+        let tmp = TempDir::new().unwrap();
+        let mut store = store_in(&tmp);
+        store.save().unwrap();
+        let notes = [
+            (NoteAnchor::History(HISTORY_LEN), None),
+            (NoteAnchor::Tool(CALL_ID.into()), Some(child())),
+        ];
+        for (anchor, subagent) in notes {
+            let note = DecisionNote::new(
+                DecisionFeature::MemorySearch,
+                FeatureMode::Advise,
+                NoteOutcome::Acted,
+                SUMMARY,
+                vec![DETAIL.into()],
+                anchor,
+            );
+            store
+                .record_event(&Envelope {
+                    event: note.into(),
+                    subagent,
+                    run_id: 0,
+                    task: None,
+                    workflow: None,
+                })
+                .unwrap();
+        }
+
+        let session_id = store.session.id;
+        let rows = store
+            .database()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .load_engine_decisions(session_id)
+            .unwrap();
+        let placed: Vec<_> = rows
+            .into_iter()
+            .map(|row| (row.anchor, row.agent, row.summary, row.details))
+            .collect();
+        assert_eq!(
+            placed,
+            [
+                (
+                    StoredDecisionAnchor::History(HISTORY_LEN),
+                    None,
+                    SUMMARY.to_owned(),
+                    vec![DETAIL.to_owned()],
+                ),
+                (
+                    StoredDecisionAnchor::Tool(CALL_ID.into()),
+                    Some(CHILD_TASK.to_owned()),
+                    SUMMARY.to_owned(),
+                    vec![DETAIL.to_owned()],
+                ),
+            ]
+        );
     }
 
     #[test]

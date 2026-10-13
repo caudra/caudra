@@ -10,11 +10,12 @@ use caudra_storage::{
     id::CaudraId,
 };
 
-use crate::chat::{Chat, history_to_display};
+use crate::chat::{Chat, decision_inserts, interleaved_history_to_display};
 use crate::components::DisplayMessage;
 use crate::repaint::Dirty;
 
 use super::App;
+use super::decisions::load_engine_decisions;
 use super::tasks::{MAIN_TASK_ID, TaskOutcome};
 
 type HistoryLoad<T> = smol::Task<Result<T, String>>;
@@ -105,6 +106,11 @@ impl App {
         let outputs = self.state.session.tool_outputs().clone();
         let lines = self.ui_config.tool_output_lines;
         let reminders = self.ui_config.show_reminders;
+        let decisions = self
+            .ui_config
+            .show_decisions
+            .then(|| (self.storage.clone(), self.state.session.id));
+        let task_id = id.to_owned();
         let invocation = card.invocation_id.clone();
         self.task_history.transcript = Some((
             id.to_owned(),
@@ -117,11 +123,17 @@ impl App {
                     } else {
                         serde_json::from_value(record.history).map_err(|error| error.to_string())?
                     };
-                    let (messages, restore) = history_to_display(
-                        &crate::history_items(&history),
-                        &outputs,
-                        &lines,
-                        reminders,
+                    let items = crate::history_items(&history);
+                    let rows = decisions
+                        .map(|(storage, session_id)| load_engine_decisions(&storage, session_id))
+                        .unwrap_or_default();
+                    let inserts = decision_inserts(
+                        &items,
+                        rows.iter()
+                            .filter(|row| row.agent.as_deref() == Some(task_id.as_str())),
+                    );
+                    let (messages, restore) = interleaved_history_to_display(
+                        &items, &outputs, &lines, reminders, inserts,
                     );
                     Ok(ArchivedChat {
                         card,

@@ -999,7 +999,7 @@ mod tests {
 
     use super::lines::{
         ACTIVITY_FOOTNOTE, ENGINE_CONFIGURED, ERROR_MARK, JSON_SECTIONS, LABEL_MARK, LOGGING_HINT,
-        NO_DECISIONS, NO_SESSION_DECISIONS, READING, feature_label, recent_row,
+        NO_DECISIONS, NO_SESSION_DECISIONS, READING, recent_row,
     };
     use super::*;
     use crate::components::{buffer_text, escape_terminal_controls, key as press};
@@ -1249,7 +1249,7 @@ mod tests {
         let fixture = Fixture::new(true);
         let mut modal = opened(snapshot());
         let _ = type_char(&mut modal, '3');
-        let tool_search = feature_label(&DecisionFeature::ToolSearch);
+        let tool_search = DecisionFeature::ToolSearch.label();
         let session = draw(&mut modal, &fixture, WIDE, TALL);
 
         assert_eq!(type_char(&mut modal, 'g'), DecisionsAction::Consumed);
@@ -1263,7 +1263,7 @@ mod tests {
         assert_eq!(modal.scope(), DecisionsScope::Session);
     }
 
-    #[test_case(Tab::Activity, feature_label(&DecisionFeature::PermissionAdvice); "activity")]
+    #[test_case(Tab::Activity, DecisionFeature::PermissionAdvice.label(); "activity")]
     #[test_case(Tab::Recent, STATE_MARKER; "recent")]
     fn with_logging_off_the_log_tabs_say_how_to_turn_it_on(tab: Tab, kept_row: &str) {
         let fixture = Fixture::new(false);
@@ -1439,7 +1439,7 @@ mod tests {
             .setting()
             .unwrap()
             .description[..DESCRIPTION_PREFIX];
-        let other = feature_label(&DecisionFeature::AutoScreening);
+        let other = DecisionFeature::AutoScreening.label();
 
         let list = draw(&mut modal, &fixture, NARROW, TALL);
         let _ = modal.handle_key(press(KeyCode::Right));

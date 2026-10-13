@@ -79,6 +79,7 @@ impl WorkflowHost for SmokeHost {
         &self,
         _key: CallKey,
         request: &DecisionRequest,
+        _label: &str,
     ) -> Result<DecisionResult, HostError> {
         request.validate()?;
         self.calls.fetch_add(1, Ordering::Relaxed);

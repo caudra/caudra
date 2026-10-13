@@ -450,6 +450,21 @@ The `interrupt` control ends autopilot as stopped by `interrupt`, in addition to
 
 Delegate spend counts in the engagement's `cost_usd` and in the run's `result`. Like the rest of a stream-json session's model jobs, it stays out of the lifetime ledger in `/usage`.
 
+### Decision rows
+
+When a [decision feature](/docs/permissions/#decision-rows-in-the-transcript) changes what happens, would have changed it in `shadow` mode, or falls back because the engine failed, a stream-json session sends a `system` message with subtype `decision`. It carries the same row the transcript shows:
+
+```json
+{"type":"system","subtype":"decision",
+ "decision":{"feature":"code_context","mode":"enforce","outcome":"acted",
+  "summary":"moved 3 of 12 rows up",
+  "details":["0.97  src/parser.rs:88 report_error  moved 7th to 1st"],
+  "anchor":{"tool":"toolu_01"}},
+ "parent_tool_use_id":"toolu_00"}
+```
+
+`feature` is the name the decision log uses, and `outcome` is `acted`, `shadow`, or `fell_back`. `anchor` is `{"tool": ID}` for a row about a tool call, or `{"history": N}` for a row about a turn, placed before the session's Nth transcript item. `parent_tool_use_id` names the task call of the subagent the row came from, and is absent for the main agent. The model never sees these rows, and the session saves them with the rest of its state.
+
 ### Workflows
 
 Workflows are [experimental](/docs/configuration/#experimental-features) and need `experimental.workflows`. With it on, a stream-json session runs a workflow runtime beside the agent. Scripts under `.caudra/workflows/<name>.rhai` in the project can be started, watched, paused, and resumed from the wire, and the model can reach the same runtime through the [`workflow` tool](/docs/tools/#workflow). Runs outlive individual turns and keep a journal. Pause a run before closing the session if you intend to resume it later.

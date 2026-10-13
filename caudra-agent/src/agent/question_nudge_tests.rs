@@ -219,6 +219,57 @@ fn question_nudge_modes_and_effects(
     });
 }
 
+#[test_case(FeatureMode::Advise, QN_POSITIVE, false, 1, &[NoteOutcome::Acted], QUESTION_NUDGED; "advise_nudges")]
+#[test_case(FeatureMode::Shadow, QN_POSITIVE, false, 1, &[NoteOutcome::Shadow], QUESTION_NUDGED; "shadow_would_nudge")]
+#[test_case(FeatureMode::Advise, QN_BELOW_THRESHOLD, false, 1, &[], QUESTION_NUDGED; "below_threshold_says_nothing")]
+#[test_case(FeatureMode::Advise, QN_POSITIVE, true, 2, &[NoteOutcome::FellBack], QUESTION_NUDGE_FALLBACK; "failure_is_noted_once")]
+fn question_nudge_notes_what_it_did(
+    mode: FeatureMode,
+    probability: f64,
+    fail: bool,
+    rounds: usize,
+    expected: &[NoteOutcome],
+    phrase: &str,
+) {
+    smol::block_on(async {
+        let directory = QnTempDir::new().unwrap();
+        let mut history = History::new(vec![Message::user(QN_REQUEST.into())]);
+        let (mut agent, events) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        qn_install_native(&agent);
+        let _answers = qn_transport(&mut agent);
+        let calls = qn_enable(&agent, &directory, mode.clone(), probability, fail);
+        for _ in 0..rounds {
+            agent.response_text = Some(QN_REPLY.into());
+            agent.remind_question_tool().await.unwrap();
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), rounds, "{QN_CALL_COUNT}");
+        let notes = decision_notes(&events);
+        assert_eq!(
+            notes.iter().map(|note| note.outcome).collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            qn_reminders(agent.history),
+            usize::from(expected == [NoteOutcome::Acted])
+        );
+        let request_items = agent.history.transcript().count() - qn_reminders(agent.history);
+        for note in &notes {
+            assert_eq!(note.feature, DecisionFeature::QuestionToolNudge);
+            assert_eq!(note.mode, mode);
+            assert_eq!(note.anchor, NoteAnchor::History(request_items));
+            match note.outcome {
+                NoteOutcome::FellBack => assert!(note.summary.ends_with(phrase)),
+                NoteOutcome::Acted | NoteOutcome::Shadow => {
+                    assert_eq!(
+                        note.summary,
+                        format!("{}{phrase} ({probability:.2})", note.outcome.lead())
+                    )
+                }
+            }
+        }
+    });
+}
+
 enum QnGate {
     NoTool,
     NoTransport,
@@ -304,11 +355,10 @@ fn question_nudge_ineligible_handoffs_make_no_decision_call(gate: QnGate) {
         assert!(agent.remind_question_tool().await.unwrap().is_none());
         assert_eq!(calls.load(Ordering::Relaxed), 0, "{QN_CALL_COUNT}");
         assert_eq!(qn_reminders(agent.history), 0, "{QN_NO_REMINDER}");
-        assert!(
-            events
-                .try_iter()
-                .all(|event| !matches!(event.event, AgentEvent::Injected { .. }))
-        );
+        assert!(events.try_iter().all(|event| !matches!(
+            event.event,
+            AgentEvent::Injected { .. } | AgentEvent::Decision(_)
+        )));
         assert_decision_effects(&directory, &[], Value::Null).await;
     });
 }
@@ -943,7 +993,15 @@ fn question_nudge_revalidates_after_inference(race: QnRace) {
             usize::from(nudged),
             "{QN_NO_REMINDER}"
         );
-        assert_eq!(events.try_iter().filter(|event| matches!(&event.event, AgentEvent::Injected { text, .. } if text == question_tool_nudge::REMINDER)).count(), usize::from(nudged));
+        let events: Vec<Envelope> = events.try_iter().collect();
+        assert_eq!(events.iter().filter(|event| matches!(&event.event, AgentEvent::Injected { text, .. } if text == question_tool_nudge::REMINDER)).count(), usize::from(nudged));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, AgentEvent::Decision(_)))
+                .count(),
+            usize::from(nudged)
+        );
         if nudged {
             assert_eq!(agent.response_text(), None);
             assert_decision_effects(

@@ -58,7 +58,7 @@ const RUN_ALREADY_DRIVEN: &str = "workflow run already has a driver";
 const DRIVER_MISSING: &str = "active workflow run has no driver";
 const PHASE_LIST_SEPARATOR: &str = ", ";
 const DEFAULT_HISTORY_RUNS: usize = 20;
-const CALL_LABEL_FIELD: &str = "label";
+pub(super) const CALL_LABEL_FIELD: &str = "label";
 const CALL_PROMPT_FIELD: &str = "prompt";
 const CALL_NAME_FIELD: &str = "name";
 const INVALID_BACKGROUND_BINDING: &str =
@@ -809,7 +809,8 @@ impl Drop for Manager {
 }
 
 /// A journal row as the inspector shows it. The label is what the script
-/// gave the agent, else the start of its prompt, else the scratch file name.
+/// gave the agent or the engine gave a decision, else the start of its
+/// prompt, else the scratch file name.
 /// A string result is quoted bare, so a scratch call previews its path.
 fn run_call(call: &WorkflowCallRow) -> RunCall {
     let request: Value = serde_json::from_str(&call.request).unwrap_or(Value::Null);
@@ -1118,6 +1119,11 @@ complete(rerank("where parse errors are reported", ["parser.rs reports parse err
 "#;
     const RERANK_CANDIDATE_FIELD: &str = "candidate";
     const RERANK_IDS: [&str; 2] = ["c00", "c01"];
+    const DECIDE_LABEL: &str = "decide: ready";
+    const RERANK_LABEL: &str = "rerank: 2 candidates";
+    const STORED_DECISION_IS_ITS_LABEL: &str =
+        "a decision row must store its label and nothing the script sent";
+    const INSPECTOR_SHOWS_THE_LABEL: &str = "the inspector must name a decision call by its label";
     const CONTROL_TEST_TIMEOUT: Duration = Duration::from_secs(5);
     const CONTROL_TIMEOUT_ERROR: &str = "workflow control waited for the decision deadline";
     const CAUGHT: &str = "caught";
@@ -1250,6 +1256,11 @@ complete(result);
                 .unwrap();
             assert_eq!(call.kind, WorkflowCallKind::Decision);
             assert_eq!(call.state, WorkflowCallState::Completed);
+            assert_eq!(
+                serde_json::from_str::<Value>(&call.request).unwrap(),
+                stored_decision(DECIDE_LABEL),
+                "{STORED_DECISION_IS_ITS_LABEL}"
+            );
             assert!(!call.request.contains(DECISION_SECRET));
             let result: Value = serde_json::from_str(call.result.as_deref().unwrap()).unwrap();
             assert_eq!(result["model"], DECISION_MODEL);
@@ -1289,6 +1300,13 @@ complete(result);
                 engine.requests.lock().unwrap().len(),
                 1,
                 "{JOURNAL_REPLAYS}"
+            );
+            assert_eq!(
+                inspect(&handle, &started.run_id).await.calls[0]
+                    .label
+                    .as_deref(),
+                Some(DECIDE_LABEL),
+                "{INSPECTOR_SHOWS_THE_LABEL}"
             );
             runtime.shutdown().await;
         });
@@ -1378,12 +1396,24 @@ complete(result);
             );
             let call = runtime
                 .store
-                .load_call(started.run_id, FIRST_KEY)
+                .load_call(started.run_id.clone(), FIRST_KEY)
                 .await
                 .unwrap()
                 .unwrap();
             assert_eq!(call.kind, WorkflowCallKind::Decision);
+            assert_eq!(
+                serde_json::from_str::<Value>(&call.request).unwrap(),
+                stored_decision(RERANK_LABEL),
+                "{STORED_DECISION_IS_ITS_LABEL}"
+            );
             assert!(!call.request.contains(DECISION_SECRET));
+            assert_eq!(
+                inspect(&runtime.handle(), &started.run_id).await.calls[0]
+                    .label
+                    .as_deref(),
+                Some(RERANK_LABEL),
+                "{INSPECTOR_SHOWS_THE_LABEL}"
+            );
             {
                 let requests = engine.requests.lock().unwrap();
                 assert_eq!(requests.len(), 1);
@@ -1940,6 +1970,22 @@ complete(result);
             Ok(WorkflowResponse::Started(run)) => *run,
             other => panic!("expected a started run, got {other:?}"),
         }
+    }
+
+    async fn inspect(handle: &WorkflowHandle, run_id: &str) -> RunDetail {
+        match handle
+            .request(WorkflowRequest::Inspect {
+                run_id: run_id.into(),
+            })
+            .await
+        {
+            Ok(WorkflowResponse::Detail(detail)) => *detail,
+            other => panic!("expected a run detail, got {other:?}"),
+        }
+    }
+
+    fn stored_decision(label: &str) -> Value {
+        json!({ "redacted": true, CALL_LABEL_FIELD: label })
     }
 
     async fn run(handle: &WorkflowHandle, request: WorkflowRequest) -> RunSnapshot {

@@ -95,6 +95,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use caudra_agent::AgentInput;
+use caudra_agent::decisions::NoteOutcome;
 use caudra_agent::peers::{PeerDecision, PeerReviewToken};
 use caudra_agent::tools::native::plan::PlanTarget;
 use caudra_agent::tools::{SHELL_TOOL_NAME, ToolEffect};
@@ -134,6 +135,11 @@ pub(crate) const HISTORY_HINTS: [Hint; 2] = [
     Hint::bind(key::RECENT_HISTORY, "recent"),
     Hint::bind(key::OLDER_HISTORY, "older"),
 ];
+/// Between a decision row's feature and what it did.
+pub(crate) const DECISION_SEPARATOR: &str = " · ";
+/// Leads a decision row's title when the feature only reports what it would
+/// have done.
+pub(crate) const SHADOW_MARKER: &str = "shadow · ";
 const DIGIT_GROUP: usize = 3;
 /// Columns a modal pans per key press. Roughly one column of a token table, so
 /// a reader walks the table a field at a time rather than a glyph at a time.
@@ -1362,6 +1368,26 @@ impl DisplayMessage {
         Self::new(DisplayRole::Autopilot, text)
     }
 
+    /// The title names `feature`, as its config key reads, and what it did;
+    /// each detail is a line of the body the title opens.
+    pub(crate) fn decision(
+        feature: &str,
+        outcome: NoteOutcome,
+        summary: &str,
+        details: &[String],
+    ) -> Self {
+        let marker = match outcome {
+            NoteOutcome::Shadow => SHADOW_MARKER,
+            NoteOutcome::Acted | NoteOutcome::FellBack => "",
+        };
+        let mut text = format!("{marker}{feature}{DECISION_SEPARATOR}{summary}");
+        for detail in details {
+            text.push('\n');
+            text.push_str(detail);
+        }
+        Self::new(DisplayRole::Decision(outcome), text)
+    }
+
     pub fn new(role: DisplayRole, text: String) -> Self {
         Self {
             role,
@@ -1490,6 +1516,10 @@ pub enum DisplayRole {
     /// What autopilot did for the user: a decision, a retry, an engagement
     /// starting or ending, or a message it wrote on their behalf.
     Autopilot,
+    /// What a decision-engine feature changed, would have changed in shadow,
+    /// or left to the default when the engine failed. Display only: the model
+    /// never sees it. It folds to its title like an injected message.
+    Decision(NoteOutcome),
 }
 
 impl DisplayRole {

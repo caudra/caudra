@@ -72,6 +72,17 @@ const RERANK_IRRELEVANT: &str = "The candidate is not relevant to the query.";
 const RANK_INDEX: &str = "index";
 const RANK_SCORE: &str = "score";
 
+const DECIDE_LABEL: &str = "decide";
+const LABEL_QUESTION_IDS: usize = 3;
+const LABEL_ID_SEPARATOR: &str = ", ";
+/// A label names an id only when it is this short and made of word characters, so a script
+/// cannot put free text into the inspector through its question ids.
+const MAX_LABEL_ID_CHARS: usize = 24;
+const LABEL_ID_PUNCTUATION: [char; 3] = ['_', '-', '.'];
+const ELIDED_LABEL_ID: &str = "…";
+const CANDIDATE_NOUN: &str = "candidate";
+const CANDIDATES_NOUN: &str = "candidates";
+
 const BUDGET_ISSUED: &str = "issued";
 const BUDGET_LIMIT: &str = "limit";
 const BUDGET_REMAINING: &str = "remaining";
@@ -410,6 +421,12 @@ impl Session {
     }
 
     fn decide(&self, request: DecisionRequest) -> ScriptResult<Value> {
+        let label = decide_label(&request.questions);
+        self.decision(request, label)
+    }
+
+    /// Replay matches on the request alone, so `label` can change without forking a run.
+    fn decision(&self, request: DecisionRequest, label: String) -> ScriptResult<Value> {
         request
             .validate()
             .map_err(|error| runtime_error(error.to_string()))?;
@@ -417,7 +434,8 @@ impl Session {
         match self.replayed(key, CallKind::Decision, &decision_request_value(&request))? {
             Some(result) => Ok(result),
             None => Ok(json_value(&host_result(
-                self.host.call(move |host| host.decide(key, &request)),
+                self.host
+                    .call(move |host| host.decide(key, &request, &label)),
             )?)),
         }
     }
@@ -433,18 +451,22 @@ impl Session {
         } = request;
         let state = json!({ QUERY_FIELD: query });
         let mut scores = Vec::with_capacity(candidates.len());
-        for batch in candidates.chunks(MAX_RERANK_BATCH) {
+        let batches = candidates.len().div_ceil(MAX_RERANK_BATCH);
+        for (index, batch) in candidates.chunks(MAX_RERANK_BATCH).enumerate() {
             let questions = batch
                 .iter()
                 .enumerate()
                 .map(|(offset, candidate)| (candidate_id(offset), rerank_question(candidate)))
                 .collect();
-            let result = self.decide(DecisionRequest {
-                state: state.clone(),
-                questions: Value::Object(questions),
-                model: model.clone(),
-                timeout_ms,
-            })?;
+            let result = self.decision(
+                DecisionRequest {
+                    state: state.clone(),
+                    questions: Value::Object(questions),
+                    model: model.clone(),
+                    timeout_ms,
+                },
+                rerank_label(candidates.len(), index + 1, batches),
+            )?;
             for offset in 0..batch.len() {
                 let score = noul_score(&result, &candidate_id(offset)).ok_or_else(|| {
                     runtime_error(format!("{RERANK_ANSWER_MISSING} {}", scores.len()))
@@ -727,6 +749,45 @@ fn rerank_request(
 
 fn candidate_id(offset: usize) -> String {
     format!("{CANDIDATE_ID_PREFIX}{offset:02}")
+}
+
+/// `decide: ready, route +2 more`: the first question ids, never what the questions ask.
+fn decide_label(questions: &Value) -> String {
+    let mut ids = questions
+        .as_object()
+        .into_iter()
+        .flat_map(|questions| questions.keys());
+    let shown = ids
+        .by_ref()
+        .take(LABEL_QUESTION_IDS)
+        .map(|id| label_id(id))
+        .collect::<Vec<_>>()
+        .join(LABEL_ID_SEPARATOR);
+    match ids.count() {
+        0 => format!("{DECIDE_LABEL}: {shown}"),
+        more => format!("{DECIDE_LABEL}: {shown} +{more} more"),
+    }
+}
+
+fn label_id(id: &str) -> &str {
+    let plain = id.chars().count() <= MAX_LABEL_ID_CHARS
+        && id.chars().all(|character| {
+            character.is_alphanumeric() || LABEL_ID_PUNCTUATION.contains(&character)
+        });
+    if plain { id } else { ELIDED_LABEL_ID }
+}
+
+/// `rerank: 17 candidates · batch 2 of 2`, without the batch when one call holds them all.
+fn rerank_label(candidates: usize, batch: usize, batches: usize) -> String {
+    let noun = if candidates == 1 {
+        CANDIDATE_NOUN
+    } else {
+        CANDIDATES_NOUN
+    };
+    match batches {
+        1 => format!("{RERANK_FUNCTION}: {candidates} {noun}"),
+        _ => format!("{RERANK_FUNCTION}: {candidates} {noun} · batch {batch} of {batches}"),
+    }
 }
 
 fn rerank_question(candidate: &Value) -> Value {
@@ -1043,6 +1104,10 @@ mod tests {
     const OUT_OF_RANGE: &str = "1.5";
     const CANDIDATE_PATH: &str = "src/parser.rs";
     const CANDIDATE_LINE: i64 = 42;
+    const DECISION_ARGS_BODY: &str = "complete(decide(args.state, args.questions));";
+    const LONG_QUESTION_ID: &str = "an_identifier_of_25_chars";
+    const SECRET_QUESTION_ID: &str = "token=workflow-test-secret";
+    const LABELS_DIFFER: &str = "the replayed call must carry another label for the test to hold";
 
     type Responder =
         Box<dyn Fn(CallKey, &AgentRequest) -> Result<AgentResult, HostError> + Send + Sync>;
@@ -1052,6 +1117,7 @@ mod tests {
         committed: Mutex<Vec<(CallKey, JournalEntry)>>,
         requests: Mutex<Vec<(CallKey, AgentRequest)>>,
         decisions: Mutex<Vec<(CallKey, DecisionRequest)>>,
+        labels: Mutex<Vec<String>>,
         decision_error: Option<HostError>,
         emissions: Mutex<Vec<String>>,
         scratch: Mutex<Vec<(String, String)>>,
@@ -1076,6 +1142,7 @@ mod tests {
                 committed: Mutex::default(),
                 requests: Mutex::default(),
                 decisions: Mutex::default(),
+                labels: Mutex::default(),
                 decision_error: None,
                 emissions: Mutex::default(),
                 scratch: Mutex::default(),
@@ -1138,6 +1205,10 @@ mod tests {
         fn scratch(&self) -> Vec<(String, String)> {
             self.scratch.lock().unwrap().clone()
         }
+
+        fn labels(&self) -> Vec<String> {
+            self.labels.lock().unwrap().clone()
+        }
     }
 
     impl WorkflowHost for FakeHost {
@@ -1145,8 +1216,10 @@ mod tests {
             &self,
             key: CallKey,
             request: &DecisionRequest,
+            label: &str,
         ) -> Result<DecisionResult, HostError> {
             self.decisions.lock().unwrap().push((key, request.clone()));
+            self.labels.lock().unwrap().push(label.to_owned());
             if let Some(error) = &self.decision_error {
                 return Err(error.clone());
             }
@@ -1417,6 +1490,72 @@ mod tests {
         assert!(replay_host.decisions.lock().unwrap().is_empty());
     }
 
+    #[test_case(&["ready"] => "decide: ready"; "one_id")]
+    #[test_case(&["ready", "risk", "route"] => "decide: ready, risk, route"; "three_ids")]
+    #[test_case(&["a1", "b2", "c3", "d4", "e5"] => "decide: a1, b2, c3 +2 more"; "five_ids")]
+    #[test_case(&[LONG_QUESTION_ID, "ready", SECRET_QUESTION_ID] => "decide: …, ready, …"; "free_text_ids_are_elided")]
+    fn decide_labels_name_the_first_question_ids(ids: &[&str]) -> String {
+        let host = FakeHost::echo();
+        let questions = Value::Object(
+            ids.iter()
+                .map(|id| {
+                    (
+                        id.to_string(),
+                        json!({ "type": "noul", "instructions": "Ready?" }),
+                    )
+                })
+                .collect(),
+        );
+        let outcome = run_with(
+            DECISION_ARGS_BODY,
+            &json!({ "state": "state", "questions": questions }),
+            &Journal::new(),
+            &host,
+            &EngineLimits::default(),
+        );
+        assert!(
+            matches!(outcome, WorkflowOutcome::Completed(_)),
+            "{outcome:?}"
+        );
+        let [label] = host.labels().try_into().expect("one decision call");
+        label
+    }
+
+    #[test]
+    fn a_label_only_difference_still_replays() {
+        let host = FakeHost::echo();
+        assert_eq!(
+            run_rerank(RERANK_BODY, &[BEST], &Journal::new(), &host),
+            WorkflowOutcome::Completed(json!([{ "index": 0, "score": 0.9 }]))
+        );
+        let args = json!({
+            "state": { QUERY_FIELD: RERANK_QUERY },
+            "questions": { candidate_id(0): rerank_question(&json!(BEST)) },
+        });
+        assert_ne!(
+            host.labels(),
+            [decide_label(&args["questions"])],
+            "{LABELS_DIFFER}"
+        );
+        let replay_host = FakeHost {
+            decision_error: Some(HostError::Failed(MUST_NOT_CALL.into())),
+            ..FakeHost::echo()
+        };
+        assert_eq!(
+            run_with(
+                DECISION_ARGS_BODY,
+                &args,
+                &host.journal(),
+                &replay_host,
+                &EngineLimits::default(),
+            ),
+            WorkflowOutcome::Completed(json!({
+                "answers": { "c00": { "type": "noul", "noul": 0.9 } }, "model": DECISION_MODEL,
+            }))
+        );
+        assert!(replay_host.decisions.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn decisions_share_keys_and_host_budget_but_not_agent_budget() {
         let host = FakeHost::echo();
@@ -1551,6 +1690,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
         );
+    }
+
+    #[test_case(1 => vec!["rerank: 1 candidate"]; "one_candidate")]
+    #[test_case(5 => vec!["rerank: 5 candidates"]; "one_batch")]
+    #[test_case(MAX_RERANK_BATCH + 1 => vec![
+        "rerank: 17 candidates · batch 1 of 2",
+        "rerank: 17 candidates · batch 2 of 2",
+    ]; "two_batches")]
+    fn rerank_labels_count_candidates_and_batches(count: usize) -> Vec<String> {
+        let host = FakeHost::echo();
+        assert_eq!(
+            run_rerank(
+                RERANK_INDICES_BODY,
+                &spilled_candidates(count),
+                &Journal::new(),
+                &host
+            ),
+            WorkflowOutcome::Completed(json!(spilled_ranking(count)))
+        );
+        host.labels()
     }
 
     #[test_case("#{}", &[1, 3, 2, 0]; "no_filters")]

@@ -12,10 +12,10 @@ use self::thinking::ThinkingWindow;
 use layout::{SegmentChrome, SegmentKind};
 
 use super::tool_display::{
-    RenderCtx, ScrollTail, ToolLines, append_annotation, append_right_info, assistant_style,
-    autopilot_style, build_instructions_lines, build_tool_lines, done_style, draws_live_script,
-    error_style, format_timestamp_now, names_tool, notice_style, shell_clock_ticks, thinking_style,
-    truncate_to_header, user_style,
+    DECISION_BODY_INDENT, RenderCtx, ScrollTail, ToolLines, append_annotation, append_right_info,
+    assistant_style, autopilot_style, build_instructions_lines, build_tool_lines, decision_style,
+    done_style, draws_live_script, error_style, format_timestamp_now, names_tool, notice_style,
+    shell_clock_ticks, thinking_style, truncate_to_header, user_style,
 };
 use super::{
     DisplayMessage, DisplayRole, DisplaySource, ToolProgress, ToolRole, ToolStatus,
@@ -63,6 +63,7 @@ use super::streaming_content::StreamingContent;
 use super::tooltip::{Anchor, Tip, TipKey};
 use caudra_agent::background::BackgroundTasks;
 use caudra_agent::commits::{self, CommitRef};
+use caudra_agent::decisions::NoteOutcome;
 use caudra_agent::mentions::{self, Mention};
 use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME, ToolEffect};
 use caudra_agent::{
@@ -891,7 +892,7 @@ impl CardScroll {
 #[derive(Clone)]
 struct ReadingAnchor {
     /// The message behind the row. Safe to hold across a rebuild because
-    /// every path that renumbers `messages` drops the whole cache with it.
+    /// every path that renumbers `messages` drops it or moves it along.
     msg_index: Option<usize>,
     /// The call the row was drawn for, which is what tells a card apart from
     /// the instruction segment that shares its message.
@@ -1215,11 +1216,18 @@ impl MessagesPanel {
 
     /// The card at the end of the transcript is the one being written. Live
     /// reasoning and text draw after every settled card, so while either is
-    /// running nothing settled is last.
+    /// running nothing settled is last. A decision row reports on the card
+    /// above it, so it never takes the end from that card.
     fn is_latest(&self, msg_index: usize) -> bool {
         self.streaming_thinking.is_empty()
             && self.streaming_text.is_empty()
-            && msg_index + 1 == self.messages.len()
+            && self.last_beside_decisions() == Some(msg_index)
+    }
+
+    fn last_beside_decisions(&self) -> Option<usize> {
+        self.messages
+            .iter()
+            .rposition(|msg| !matches!(msg.role, DisplayRole::Decision(_)))
     }
 
     /// Whether the mode alone draws this call's body.
@@ -1614,7 +1622,7 @@ impl MessagesPanel {
     /// does not move when the transcript grows past it. Reasoning is absent
     /// because no mode closes it.
     fn auto_governed_tail(&self) -> Option<usize> {
-        let idx = self.messages.len().checked_sub(1)?;
+        let idx = self.last_beside_decisions()?;
         if !self.is_latest(idx) {
             return None;
         }
@@ -1689,6 +1697,41 @@ impl MessagesPanel {
         self.forget_thinking_windows(
             |block| matches!(block, ThinkingWindow::Settled(msg_index) if msg_index >= index),
         );
+    }
+
+    /// Puts `msg` before the message at `index`. Only the segments from there
+    /// on are rebuilt. An index naming a later message follows it, except a
+    /// reasoning window's or a diagram's, which are let go as
+    /// [`Self::remove`] lets them go.
+    pub fn insert(&mut self, index: usize, msg: DisplayMessage) {
+        if index >= self.messages.len() {
+            self.push(msg);
+            return;
+        }
+        self.clear_hover();
+        self.messages.insert(index, msg);
+        self.cache.truncate_messages(index);
+        let follow = |at: usize| if at >= index { at + 1 } else { at };
+        self.auto_open = self.auto_open.map(follow);
+        if let Some(anchor) = &mut self.held_anchor {
+            anchor.msg_index = anchor.msg_index.map(follow);
+        }
+        self.diagram_pans.retain(|key, _| key.msg_index < index);
+        self.forget_thinking_windows(
+            |block| matches!(block, ThinkingWindow::Settled(msg_index) if msg_index >= index),
+        );
+    }
+
+    /// Where a row reporting on the call `tool_id` names goes: right after
+    /// its card, past any rows already reporting on it. `None` when no card
+    /// holds the call. A batch child's card is its batch's.
+    pub fn row_after_card(&self, tool_id: &str) -> Option<usize> {
+        let (card, _) = self.tool_card(self.root_tool_id(tool_id)?)?;
+        let reports = self.messages[card + 1..]
+            .iter()
+            .take_while(|msg| matches!(msg.role, DisplayRole::Decision(_)))
+            .count();
+        Some(card + 1 + reports)
     }
 
     /// Drops the newest harness notice reading `text`. Found by content rather
@@ -3925,7 +3968,7 @@ impl MessagesPanel {
     ///
     /// An injected message is the other way round. It is reference material
     /// rather than part of the conversation, so it stays folded to its heading
-    /// until someone asks for it.
+    /// until someone asks for it. So does a decision row's list of candidates.
     fn body_open(&self, msg: &DisplayMessage) -> bool {
         msg.body_open.unwrap_or(match msg.role {
             DisplayRole::Thinking => self.show_thinking,
@@ -3933,8 +3976,14 @@ impl MessagesPanel {
         })
     }
 
+    /// A decision row without details is all title, so it has nothing to
+    /// open.
     fn has_foldable_body(msg: &DisplayMessage) -> bool {
-        matches!(msg.role, DisplayRole::Thinking | DisplayRole::Injected)
+        match msg.role {
+            DisplayRole::Thinking | DisplayRole::Injected => true,
+            DisplayRole::Decision(_) => msg.text.contains('\n'),
+            _ => false,
+        }
     }
 
     fn streaming_thinking_collapsed(&self) -> bool {
@@ -5239,6 +5288,7 @@ impl MessagesPanel {
                 injected_line(&msg.text),
                 format!("{INJECTED_SEARCH_PREFIX}{}", msg.text),
             ),
+            DisplayRole::Decision(outcome) => built_decision(msg, outcome, false),
             _ => BuiltMessage::bare(
                 self.build_cached_thinking_indicator(&msg.text, msg.thinking_duration),
                 format!("{THINKING_SEARCH_PREFIX}{}", msg.text),
@@ -5774,7 +5824,7 @@ fn display_key(message: &DisplayMessage) -> Option<DisplayKey<'_>> {
             mem::discriminant(&message.role),
             message.text.len(),
         )),
-        DisplayRole::Error | DisplayRole::Done => None,
+        DisplayRole::Error | DisplayRole::Done | DisplayRole::Decision(_) => None,
     }
 }
 
@@ -5921,6 +5971,26 @@ fn injected_line(text: &str) -> Vec<Line<'static>> {
     ])]
 }
 
+/// A decision row's title behind its prefix, and once `open`, each detail
+/// under it. Plain text: a label such as a note name is drawn as written.
+fn built_decision(msg: &DisplayMessage, outcome: NoteOutcome, open: bool) -> BuiltMessage {
+    let style = decision_style(outcome);
+    let mut text = msg.text.lines();
+    let mut lines = vec![Line::from(vec![
+        Span::styled(style.prefix, style.prefix_style),
+        Span::styled(text.next().unwrap_or_default().to_owned(), style.text_style),
+    ])];
+    if open {
+        lines.extend(text.map(|detail| {
+            Line::from(vec![
+                Span::raw(DECISION_BODY_INDENT),
+                Span::styled(detail.to_owned(), style.text_style),
+            ])
+        }));
+    }
+    BuiltMessage::bare(lines, format!("{}{}", style.prefix, msg.text))
+}
+
 fn thought_line(title: Option<&str>, duration: Option<Duration>, done: bool) -> Vec<Line<'static>> {
     let theme = theme::current();
     let label = if done { THOUGHT_PREFIX } else { "Thinking" };
@@ -5963,9 +6033,10 @@ fn segment_kind(role: &DisplayRole) -> SegmentKind {
         DisplayRole::Thinking => SegmentKind::Thinking,
         DisplayRole::Error => SegmentKind::Error,
         DisplayRole::Done => SegmentKind::Done,
-        DisplayRole::Notice | DisplayRole::Injected | DisplayRole::Autopilot => {
-            SegmentKind::Assistant
-        }
+        DisplayRole::Notice
+        | DisplayRole::Injected
+        | DisplayRole::Autopilot
+        | DisplayRole::Decision(_) => SegmentKind::Assistant,
         DisplayRole::TaskDelivery(_) => SegmentKind::TaskDelivery,
         DisplayRole::AutomationDelivery(_) => SegmentKind::AutomationDelivery,
         DisplayRole::PeerMessage(_) => SegmentKind::PeerMessage,
@@ -6040,6 +6111,9 @@ fn build_message_lines(
             ..BuiltMessage::bare(lines, search_text)
         };
     }
+    if let DisplayRole::Decision(outcome) = msg.role {
+        return built_decision(msg, outcome, true);
+    }
     let style = match &msg.role {
         DisplayRole::User => user_style(),
         DisplayRole::Assistant => assistant_style(),
@@ -6051,7 +6125,8 @@ fn build_message_lines(
         DisplayRole::Tool(_)
         | DisplayRole::TaskDelivery(_)
         | DisplayRole::AutomationDelivery(_)
-        | DisplayRole::PeerMessage(_) => {
+        | DisplayRole::PeerMessage(_)
+        | DisplayRole::Decision(_) => {
             unreachable!()
         }
     };

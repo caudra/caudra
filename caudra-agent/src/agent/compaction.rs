@@ -27,6 +27,7 @@ use super::run::{estimate_message_tokens, push_injected, stranded_reminders};
 use super::side_model::{self, SideModel};
 use super::streaming::{StreamError, StreamRetry, stream_with_retry};
 use crate::cancel::CancelToken;
+use crate::decisions::NoteAnchor;
 use crate::nudge::Nudge;
 use crate::{
     AgentError, AgentEvent, BackgroundReminderContext, DoneReason, EventSender, TurnCompleteEvent,
@@ -158,9 +159,9 @@ pub(super) async fn compact_history(
         .iter_mut()
         .for_each(Message::detach_documents);
     strip_thinking(&mut compaction_history);
-    let plan = match &retention {
+    let (plan, note) = match &retention {
         Some(retention) => rank_tool_results(&compaction_history, retention, cancel).await,
-        None => None,
+        None => (None, None),
     };
     strip_old_tool_results(&mut compaction_history, plan.as_ref());
     compaction_history.push(Message::user(summary_prompt(&compaction_history, config)));
@@ -268,6 +269,9 @@ pub(super) async fn compact_history(
     let stranded = stranded_reminders(history.as_slice(), head_end);
     let result = finish_compact(response, history, head_end, event_tx, compact_start, model);
     if result.is_ok() {
+        if let Some(note) = note {
+            event_tx.try_send(note.anchored(NoteAnchor::History(history.transcript().count())));
+        }
         for reminder in stranded {
             push_injected(history, event_tx, reminder);
         }
@@ -741,13 +745,13 @@ mod tests {
     const ACTIVE_PLAN: &str = "current-plan";
     const PREVIOUS_PLAN: &str = "previous-plan";
 
-    struct MockProvider {
+    pub(super) struct MockProvider {
         responses: Mutex<Vec<Result<StreamResponse, AgentError>>>,
         requests: Mutex<Vec<Vec<Message>>>,
     }
 
     impl MockProvider {
-        fn new(responses: Vec<Result<StreamResponse, AgentError>>) -> Self {
+        pub(super) fn new(responses: Vec<Result<StreamResponse, AgentError>>) -> Self {
             Self {
                 responses: Mutex::new(responses),
                 requests: Mutex::new(Vec::new()),
@@ -781,7 +785,7 @@ mod tests {
         }
     }
 
-    fn default_model() -> Model {
+    pub(super) fn default_model() -> Model {
         Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()
     }
 
@@ -832,7 +836,7 @@ mod tests {
         }
     }
 
-    fn text_response(stop_reason: StopReason) -> StreamResponse {
+    pub(super) fn text_response(stop_reason: StopReason) -> StreamResponse {
         StreamResponse {
             message: assistant_text("response"),
             usage: TokenUsage::default(),

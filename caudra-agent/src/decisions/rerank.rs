@@ -7,7 +7,7 @@ use caudra_storage::decision_log::DecisionEffect;
 use serde_json::{Value, json};
 
 use super::{
-    DecisionContext, DecisionFeature, DecisionReceipt, DecisionState, Decisions,
+    DecisionContext, DecisionFeature, DecisionReceipt, DecisionState, Decisions, NoteOutcome,
     redact_decision_text,
 };
 use crate::CancelToken;
@@ -33,9 +33,9 @@ pub struct Relevance {
     pub unrelated: &'static str,
 }
 
-/// Candidates arrive in the caller's own order, which is what it keeps when
-/// reranking returns `None`. Each is a small object built from
-/// [`candidate_text`]; it is redacted and bounded again before it is sent.
+/// Candidates arrive in the caller's own order, which is what it keeps unless
+/// reranking answers. Each is a small object built from [`candidate_text`];
+/// it is redacted and bounded again before it is sent.
 pub struct Rerank<'a> {
     pub feature: DecisionFeature,
     pub relevance: &'a Relevance,
@@ -50,6 +50,43 @@ pub struct Reranked {
     receipts: Vec<DecisionReceipt>,
 }
 
+/// How a rerank ended, so a surface can say what it did or why it did not.
+pub enum Reranking {
+    /// Advise or enforce, and every batch answered: apply it.
+    Answered(Reranked),
+    /// Shadow, and every batch answered: show it, never apply it. Its effects
+    /// record nothing.
+    Shadow(Reranked),
+    /// Advise or enforce, and a batch failed while the feature was answering:
+    /// what went wrong. A failure that repeats is [`Reranking::Quiet`].
+    Failed(String),
+    /// Off, nothing to rank, cancelled, stale, a repeated failure, or any
+    /// failure in shadow: nothing to say.
+    Quiet,
+}
+
+impl Reranking {
+    /// The scores to apply, for a surface that only acts on an answer.
+    pub fn answered(self) -> Option<Reranked> {
+        match self {
+            Self::Answered(reranked) => Some(reranked),
+            Self::Shadow(_) | Self::Failed(_) | Self::Quiet => None,
+        }
+    }
+
+    /// The scores and how a row reports them: `Acted` when the surface
+    /// applies them, `Shadow` when it only shows them. Otherwise the failure
+    /// a row reports, if this one is fresh.
+    pub fn scored(self) -> Result<(Reranked, NoteOutcome), Option<String>> {
+        match self {
+            Self::Answered(reranked) => Ok((reranked, NoteOutcome::Acted)),
+            Self::Shadow(reranked) => Ok((reranked, NoteOutcome::Shadow)),
+            Self::Failed(failure) => Err(Some(failure)),
+            Self::Quiet => Err(None),
+        }
+    }
+}
+
 struct Batch {
     ids: Vec<String>,
     questions: QuestionSet,
@@ -57,16 +94,15 @@ struct Batch {
 
 impl Decisions {
     /// One `noul` question per candidate, in concurrent batches of at most
-    /// [`MAX_RERANK_BATCH`], each gated like any other passive decision. Any
-    /// batch that fails, is refused, goes stale or is cancelled yields `None`,
-    /// and so does a feature that is off or only shadowed.
+    /// [`MAX_RERANK_BATCH`], each gated like any other passive decision. The
+    /// first batch without an answer ends the rerank for all of them.
     pub async fn rerank(
         &self,
         request: Rerank<'_>,
         context: &DecisionContext,
         permissions: Option<&PermissionManager>,
         cancel: &CancelToken,
-    ) -> Option<Reranked> {
+    ) -> Reranking {
         let Rerank {
             feature,
             relevance,
@@ -74,19 +110,29 @@ impl Decisions {
             candidates,
         } = request;
         if candidates.is_empty() || !self.enabled(&feature) {
-            return None;
+            return Reranking::Quiet;
         }
-        let batches = batches(&feature, relevance, candidates)?;
+        let Some(batches) = batches(&feature, relevance, candidates) else {
+            return Reranking::Quiet;
+        };
+        let applied = matches!(
+            self.mode(&feature),
+            FeatureMode::Advise | FeatureMode::Enforce
+        );
         let answered = join_answered(batches.iter().map(|batch| {
             let feature = feature.clone();
             async move {
-                let outcome = admit(
+                let Some(Some(outcome)) = admit(
                     permissions,
                     cancel,
                     self.evaluate(feature, query, &batch.questions, context),
                 )
-                .await??;
-                let response = outcome.result.ok()?;
+                .await
+                else {
+                    return Err(None);
+                };
+                let failure = outcome.fresh_failure();
+                let response = outcome.result.map_err(|_| failure)?;
                 let scores = batch
                     .ids
                     .iter()
@@ -94,34 +140,43 @@ impl Decisions {
                         Answer::Noul(answer) => Some(answer.noul),
                         Answer::Choice(_) | Answer::Score(_) => None,
                     })
-                    .collect::<Option<Vec<_>>>()?;
-                Some((scores, outcome.receipt))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or(None)?;
+                Ok((scores, outcome.receipt))
             }
         }))
-        .await?;
-        if !matches!(
-            self.mode(&feature),
-            FeatureMode::Advise | FeatureMode::Enforce
-        ) {
-            return None;
-        }
+        .await;
+        let answered = match answered {
+            Ok(answered) => answered,
+            Err(Some(failure)) if applied => return Reranking::Failed(failure),
+            Err(_) => return Reranking::Quiet,
+        };
         let mut scores = Vec::with_capacity(candidates.len());
         let mut receipts = Vec::with_capacity(answered.len());
         for (batch_scores, receipt) in answered {
             scores.extend(batch_scores);
-            receipts.extend(receipt);
+            receipts.extend(receipt.filter(|_| applied));
         }
-        Some(Reranked {
+        let reranked = Reranked {
             decisions: self.clone(),
             scores,
             receipts,
-        })
+        };
+        match applied {
+            true => Reranking::Answered(reranked),
+            false => Reranking::Shadow(reranked),
+        }
     }
 }
 
 impl Reranked {
     pub fn scores(&self) -> &[f64] {
         &self.scores
+    }
+
+    /// The service that answered, for a row that names its mode.
+    pub fn decisions(&self) -> &Decisions {
+        &self.decisions
     }
 
     /// Candidate indices, most relevant first; ties keep input order.
@@ -243,9 +298,9 @@ async fn admit<T>(
 }
 
 /// Polls every batch together and stops at the first one without an answer.
-async fn join_answered<T>(
-    batches: impl IntoIterator<Item = impl Future<Output = Option<T>>>,
-) -> Option<Vec<T>> {
+async fn join_answered<T, E>(
+    batches: impl IntoIterator<Item = impl Future<Output = Result<T, E>>>,
+) -> Result<Vec<T>, E> {
     let mut pending: Vec<_> = batches
         .into_iter()
         .map(|batch| Some(Box::pin(batch)))
@@ -258,22 +313,22 @@ async fn join_answered<T>(
                 continue;
             };
             match batch.as_mut().poll(context) {
-                Poll::Ready(Some(value)) => {
+                Poll::Ready(Ok(value)) => {
                     *answer = Some(value);
                     *slot = None;
                 }
-                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Pending => waiting = true,
             }
         }
         if waiting {
             Poll::Pending
         } else {
-            Poll::Ready(Some(()))
+            Poll::Ready(Ok(()))
         }
     })
     .await?;
-    answered.into_iter().collect()
+    Ok(answered.into_iter().flatten().collect())
 }
 
 #[cfg(test)]
@@ -300,11 +355,13 @@ mod tests {
 
     use super::{
         CANDIDATE_KEY, CANDIDATE_TEXT_OMITTED, MAX_CANDIDATE_INPUT_BYTES, MAX_RERANK_BATCH,
-        RELEVANT_KEY, Relevance, Rerank, Reranked, STATEMENT_KEY, UNRELATED_KEY,
+        RELEVANT_KEY, Relevance, Rerank, Reranked, Reranking, STATEMENT_KEY, UNRELATED_KEY,
         UNTRUSTED_CANDIDATE, candidate_text, changed_from,
     };
     use crate::CancelToken;
-    use crate::decisions::{DecisionContext, DecisionFeature, Decisions};
+    use crate::decisions::{
+        DecisionContext, DecisionFeature, Decisions, ENGINE_REFUSED, ENGINE_UNREACHABLE,
+    };
     use crate::permissions::PermissionManager;
 
     const BASE_URL: &str = "http://127.0.0.1:1";
@@ -328,6 +385,9 @@ mod tests {
     const FIRST_ID: &str = "c00";
     const TENTH_ID: &str = "c09";
     const ELEVENTH_ID: &str = "c10";
+    const ANSWERED: &str = "answered";
+    const SHADOW: &str = "shadow";
+    const QUIET: &str = "quiet";
     const RELEVANCE: Relevance = Relevance {
         statement: "The note helps answer the query.",
         relevant: "The note answers or directly informs the query.",
@@ -420,7 +480,7 @@ mod tests {
             candidates: &[Value],
             permissions: Option<&PermissionManager>,
             cancel: &CancelToken,
-        ) -> Option<Reranked> {
+        ) -> Reranking {
             self.decisions
                 .rerank(
                     Rerank {
@@ -453,8 +513,19 @@ mod tests {
             Fixture::new(FeatureMode::Enforce, false, None)
                 .rerank(&scored(scores), None, &CancelToken::none())
                 .await
+                .answered()
                 .unwrap()
         })
+    }
+
+    /// The variant, or the failure it reports.
+    fn reported(reranking: Reranking) -> String {
+        match reranking {
+            Reranking::Answered(_) => ANSWERED.into(),
+            Reranking::Shadow(_) => SHADOW.into(),
+            Reranking::Failed(failure) => failure,
+            Reranking::Quiet => QUIET.into(),
+        }
     }
 
     #[test]
@@ -467,6 +538,7 @@ mod tests {
             fixture
                 .rerank(&candidates, None, &CancelToken::none())
                 .await
+                .answered()
                 .unwrap();
             let requests = fixture.requests();
             assert_eq!(requests.len(), 1);
@@ -512,6 +584,7 @@ mod tests {
             fixture
                 .rerank(&candidates, None, &CancelToken::none())
                 .await
+                .answered()
                 .unwrap();
             let sent = serde_json::to_string(&fixture.requests()[0].0).unwrap();
             assert!(!sent.contains(SECRET));
@@ -528,6 +601,7 @@ mod tests {
             let reranked = fixture
                 .rerank(&scored(&scores), None, &CancelToken::none())
                 .await
+                .answered()
                 .unwrap();
             assert_eq!(reranked.scores(), scores);
             let requests = fixture.requests();
@@ -545,34 +619,73 @@ mod tests {
         });
     }
 
-    #[test_case(FAIL; "failed_batch")]
-    #[test_case(REFUSE; "refused_batch")]
-    fn one_unanswered_batch_keeps_the_original_order(reply: &str) {
+    #[test_case(FAIL, ENGINE_UNREACHABLE; "failed_batch")]
+    #[test_case(REFUSE, ENGINE_REFUSED; "refused_batch")]
+    fn one_unanswered_batch_keeps_the_original_order(reply: &str, failure: &str) {
         smol::block_on(async {
             let fixture = Fixture::new(FeatureMode::Enforce, false, None);
             let mut candidates = scored(&[0.5; SPLIT]);
             candidates[SPLIT - 1][REPLY] = json!(reply);
-            assert!(
-                fixture
-                    .rerank(&candidates, None, &CancelToken::none())
-                    .await
-                    .is_none()
-            );
+            let reranking = fixture
+                .rerank(&candidates, None, &CancelToken::none())
+                .await;
+            assert_eq!(reported(reranking), failure);
         });
     }
 
-    #[test_case(FeatureMode::Off, 0; "off_never_asks")]
-    #[test_case(FeatureMode::Shadow, 1; "shadow_only_evaluates")]
-    fn inactive_features_keep_the_original_order(mode: FeatureMode, requests: usize) {
+    #[test_case(FeatureMode::Off, 0, QUIET; "off_never_asks")]
+    #[test_case(FeatureMode::Shadow, 1, SHADOW; "shadow_only_evaluates")]
+    fn inactive_features_keep_the_original_order(
+        mode: FeatureMode,
+        requests: usize,
+        expected: &str,
+    ) {
         smol::block_on(async {
             let fixture = Fixture::new(mode, false, None);
-            assert!(
-                fixture
-                    .rerank(&scored(&[0.9, 0.1]), None, &CancelToken::none())
-                    .await
-                    .is_none()
-            );
+            let reranking = fixture
+                .rerank(&scored(&[0.9, 0.1]), None, &CancelToken::none())
+                .await;
+            assert_eq!(reported(reranking), expected);
             assert_eq!(fixture.requests().len(), requests);
+        });
+    }
+
+    #[test_case(FeatureMode::Enforce, &[ENGINE_UNREACHABLE, QUIET, ANSWERED, ENGINE_UNREACHABLE]; "enforce_reports_each_new_failure_once")]
+    #[test_case(FeatureMode::Shadow, &[QUIET, QUIET, SHADOW, QUIET]; "shadow_never_reports_a_failure")]
+    fn a_failing_engine_is_reported_once_until_it_answers(mode: FeatureMode, expected: &[&str]) {
+        smol::block_on(async {
+            let fixture = Fixture::new(mode, false, None);
+            let answering = scored(&[0.5; SINGLE_BATCH]);
+            let mut failing = answering.clone();
+            failing[0][REPLY] = json!(FAIL);
+            let mut reports = Vec::new();
+            for candidates in [&failing, &failing, &answering, &failing] {
+                let reranking = fixture.rerank(candidates, None, &CancelToken::none()).await;
+                reports.push(reported(reranking));
+            }
+            assert_eq!(reports, expected);
+        });
+    }
+
+    #[test]
+    fn a_shadow_rerank_scores_without_recording_an_effect() {
+        smol::block_on(async {
+            let fixture = Fixture::new(FeatureMode::Shadow, true, None);
+            let reranking = fixture
+                .rerank(&scored(&[0.1, 0.9]), None, &CancelToken::none())
+                .await;
+            let Reranking::Shadow(reranked) = reranking else {
+                panic!("expected a shadow rerank, got {}", reported(reranking));
+            };
+            assert_eq!(reranked.order(), [1, 0]);
+            assert!(reranked.record_rerouted(&[1, 0], 2));
+            assert!(reranked.record_advised(&[1]));
+            let log = DecisionLog::open_read_only(&StateDir::from_path(fixture.root.path().into()))
+                .unwrap()
+                .unwrap();
+            let records = log.recent(&DecisionFilter::default(), SPLIT).unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].record.effect, DecisionEffect::None);
         });
     }
 
@@ -597,7 +710,7 @@ mod tests {
             } else {
                 manager.set_decisions(None);
             }
-            assert!(pending.await.is_none());
+            assert_eq!(reported(pending.await), QUIET);
         });
     }
 
@@ -647,6 +760,7 @@ mod tests {
             let reranked = fixture
                 .rerank(&scored(&[0.5; SPLIT]), None, &CancelToken::none())
                 .await
+                .answered()
                 .unwrap();
             assert!(act(&reranked));
             let log = DecisionLog::open_read_only(&StateDir::from_path(fixture.root.path().into()))

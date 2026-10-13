@@ -13,23 +13,40 @@ const MAX_SCAN_BYTES: usize = 64 * 1024;
 pub(super) const INJECTION: &str = "injection";
 pub(super) const ADDRESSED_TO_AGENT: &str = "addressed_to_agent";
 
+/// How screening a result ended.
+pub enum Screening {
+    /// Advise, and a chunk was flagged: mark the result. Each flag is one
+    /// detail line.
+    Flagged {
+        receipts: Vec<DecisionReceipt>,
+        flags: Vec<String>,
+    },
+    /// Shadow, and a chunk would have been flagged.
+    Shadow(Vec<String>),
+    /// Advise, nothing was flagged, and a chunk failed while the feature was
+    /// answering: what went wrong.
+    Failed(String),
+    /// Off, nothing flagged, or a repeated failure.
+    Quiet,
+}
+
 impl Decisions {
-    pub async fn screen_content(
-        &self,
-        text: &str,
-        context: &DecisionContext,
-    ) -> Option<Vec<DecisionReceipt>> {
+    pub async fn screen_content(&self, text: &str, context: &DecisionContext) -> Screening {
         if !self.enabled(&DecisionFeature::ContentScreening) {
-            return None;
+            return Screening::Quiet;
         }
-        let questions = questions::CONTENT.as_ref()?;
-        let mut flagged = false;
+        let Some(questions) = questions::CONTENT.as_ref() else {
+            return Screening::Quiet;
+        };
+        let chunks = chunks(text);
+        let mut flags = Vec::new();
         let mut receipts = Vec::new();
-        for chunk in chunks(text) {
+        let mut failure = None;
+        for (index, chunk) in chunks.iter().enumerate() {
             let Some(outcome) = self
                 .evaluate(
                     DecisionFeature::ContentScreening,
-                    &chunk_state(&chunk),
+                    &chunk_state(chunk),
                     questions,
                     context,
                 )
@@ -37,6 +54,7 @@ impl Decisions {
             else {
                 break;
             };
+            failure = failure.or_else(|| outcome.fresh_failure());
             if let Ok(response) = outcome.result
                 && content_flagged(
                     &response,
@@ -44,13 +62,34 @@ impl Decisions {
                     self.config().thresholds.content_addressed_to_agent,
                 )
             {
-                flagged = true;
+                flags.push(flag_detail(&response, index, chunks.len()));
                 receipts.extend(outcome.receipt);
             }
         }
-        (flagged && *self.mode(&DecisionFeature::ContentScreening) == FeatureMode::Advise)
-            .then_some(receipts)
+        let mode = self.mode(&DecisionFeature::ContentScreening);
+        match (mode, flags.is_empty(), failure) {
+            (FeatureMode::Advise, false, _) => Screening::Flagged { receipts, flags },
+            (FeatureMode::Advise, true, Some(failure)) => Screening::Failed(failure),
+            (FeatureMode::Shadow, false, _) => Screening::Shadow(flags),
+            _ => Screening::Quiet,
+        }
     }
+}
+
+/// Both probabilities that flagged a chunk, and which chunk it was.
+fn flag_detail(response: &DecisionResponse, index: usize, chunks: usize) -> String {
+    let probabilities: Vec<String> = [INJECTION, ADDRESSED_TO_AGENT]
+        .into_iter()
+        .filter_map(|question| match response.answers.get(question)? {
+            Answer::Noul(answer) => Some(format!("{:.2}  {question}", answer.noul)),
+            Answer::Choice(_) | Answer::Score(_) => None,
+        })
+        .collect();
+    format!(
+        "{}  in chunk {} of {chunks}",
+        probabilities.join(", "),
+        index + 1
+    )
 }
 
 pub(super) fn chunk_state(chunk: &str) -> Value {

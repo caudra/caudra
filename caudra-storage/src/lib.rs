@@ -12,6 +12,8 @@ pub mod changelog;
 pub mod checkout;
 pub mod decision_log;
 pub mod digest_trust;
+#[path = "sessions/engine_decisions.rs"]
+pub mod engine_decisions;
 pub mod id;
 pub mod input_history;
 pub mod local_documents;

@@ -5,8 +5,9 @@ use std::ops::RangeInclusive;
 use serde_json::{Value, json};
 
 use super::{
-    DecisionContext, DecisionFeature, DecisionState, Decisions, MAX_RERANK_BATCH, Relevance,
-    Rerank, Reranked, candidate_text, redacted_excerpt, redacted_leaves,
+    DecisionContext, DecisionFeature, DecisionState, Decisions, MAX_RERANK_BATCH, NoteDraft,
+    NoteOutcome, Relevance, Rerank, Reranked, candidate_text, counted, redacted_excerpt,
+    redacted_leaves, score_line,
 };
 use crate::CancelToken;
 use crate::memory::search::significant_words;
@@ -32,6 +33,11 @@ const TOOL_KEY: &str = "tool";
 const INPUT_KEY: &str = "input";
 const EXCERPT_KEY: &str = "excerpt";
 const LINE_BREAK: &str = "\n";
+const POINTED_NOWHERE: &str = "pointed to no omitted lines";
+const RANGE_ONE: &str = "omitted line range";
+const RANGE_MANY: &str = "omitted line ranges";
+const POINTED: &str = "pointed";
+const NOT_POINTED: &str = "not pointed";
 const RELEVANCE: Relevance = Relevance {
     statement: "The excerpt comes from lines a long tool result left out of its preview, and reading those lines would help the work the query describes.",
     relevant: "It shows errors, failures, values, paths or code that the request, the open todos or the tool call are looking for.",
@@ -50,10 +56,11 @@ pub struct OmittedOutput<'a> {
 
 /// The windows the omitted lines were split into, and the ones worth naming:
 /// at most [`MAX_POINTERS`], each scored at least the routing confidence,
-/// most relevant first.
+/// most relevant first. Only `Acted` advice reaches the model.
 pub struct PointerAdvice {
     pub windows: Vec<RangeInclusive<usize>>,
     pub advised: Vec<usize>,
+    pub outcome: NoteOutcome,
     reranked: Reranked,
 }
 
@@ -98,22 +105,24 @@ pub(crate) fn output_focus(todos: &[TodoItem], request: Option<&str>) -> Option<
         .then_some(focus)
 }
 
-/// Names the omitted windows most worth reading, or `None` when the feature
-/// is off or only shadowed, nothing could be judged, or the engine gave no
-/// answer.
+/// Names the omitted windows most worth reading. Without an answer, the
+/// failure a row reports if it is fresh, and nothing when the feature is off,
+/// nothing could be judged or the call was cut short.
 pub async fn advise_pointers(
     output: OmittedOutput<'_>,
     decisions: &Decisions,
     context: &DecisionContext,
     permissions: Option<&PermissionManager>,
     cancel: &CancelToken,
-) -> Option<PointerAdvice> {
+) -> Result<PointerAdvice, Option<String>> {
     let feature = DecisionFeature::OutputPointers;
     if !decisions.enabled(&feature) {
-        return None;
+        return Err(None);
     }
-    let threshold = feature.rerank_threshold(&decisions.config().thresholds)?;
-    let query = query(output.focus, output.tool, output.input)?;
+    let threshold = feature
+        .rerank_threshold(&decisions.config().thresholds)
+        .ok_or(None)?;
+    let query = query(output.focus, output.tool, output.input).ok_or(None)?;
     let mut query_words = words(output.focus);
     query_words.extend(words(output.input));
     let windows = windows(output.text, &output.lines, &query_words);
@@ -121,7 +130,7 @@ pub async fn advise_pointers(
         .iter()
         .map(|window| candidate(&window.excerpt))
         .collect();
-    let reranked = decisions
+    let (reranked, outcome) = decisions
         .rerank(
             Rerank {
                 feature,
@@ -133,7 +142,8 @@ pub async fn advise_pointers(
             permissions,
             cancel,
         )
-        .await?;
+        .await
+        .scored()?;
     let scores = reranked.scores();
     let advised = reranked
         .order()
@@ -141,15 +151,18 @@ pub async fn advise_pointers(
         .take_while(|index| scores[*index] >= threshold)
         .take(MAX_POINTERS)
         .collect();
-    Some(PointerAdvice {
+    Ok(PointerAdvice {
         windows: windows.into_iter().map(|window| window.lines).collect(),
         advised,
+        outcome,
         reranked,
     })
 }
 
 /// One pointer line per advised window, most relevant first, and `Advised`
-/// recorded; `None` when no window cleared the bar.
+/// recorded; `None` when no window cleared the bar or the advice is only a
+/// shadow's. The row says what was or would have been pointed to, or that
+/// the engine newly failed.
 pub async fn pointer_lines(
     output: OmittedOutput<'_>,
     output_id: &str,
@@ -157,17 +170,62 @@ pub async fn pointer_lines(
     context: &DecisionContext,
     permissions: Option<&PermissionManager>,
     cancel: &CancelToken,
-) -> Option<String> {
-    let advice = advise_pointers(output, decisions, context, permissions, cancel).await?;
+) -> (Option<String>, Option<NoteDraft>) {
+    let feature = DecisionFeature::OutputPointers;
+    let advice = match advise_pointers(output, decisions, context, permissions, cancel).await {
+        Ok(advice) => advice,
+        Err(failure) => {
+            let note = failure
+                .map(|failure| NoteDraft::fell_back(decisions, feature, &failure, POINTED_NOWHERE));
+            return (None, note);
+        }
+    };
     if !advice.reranked.record_advised(&advice.advised) {
-        return None;
+        return (None, None);
     }
-    let lines: Vec<String> = advice
-        .advised
-        .iter()
-        .map(|index| pointer(output_id, &advice.windows[*index]))
-        .collect();
-    Some(lines.join(LINE_BREAK))
+    let summary = format!(
+        "pointed to {}",
+        counted(advice.advised.len(), RANGE_ONE, RANGE_MANY)
+    );
+    let note = NoteDraft::new(
+        decisions,
+        feature,
+        advice.outcome,
+        &summary,
+        window_lines(&advice),
+    );
+    let lines = (advice.outcome == NoteOutcome::Acted).then(|| {
+        let lines: Vec<String> = advice
+            .advised
+            .iter()
+            .map(|index| pointer(output_id, &advice.windows[*index]))
+            .collect();
+        lines.join(LINE_BREAK)
+    });
+    (lines, Some(note))
+}
+
+/// Every window, most relevant first: its score, its lines and whether it
+/// was pointed to.
+fn window_lines(advice: &PointerAdvice) -> Vec<String> {
+    let scores = advice.reranked.scores();
+    advice
+        .reranked
+        .order()
+        .into_iter()
+        .map(|index| {
+            let lines = &advice.windows[index];
+            let action = match advice.advised.contains(&index) {
+                true => POINTED,
+                false => NOT_POINTED,
+            };
+            score_line(
+                scores[index],
+                &format!("lines {}-{}", lines.start(), lines.end()),
+                action,
+            )
+        })
+        .collect()
 }
 
 fn pointer(output_id: &str, lines: &RangeInclusive<usize>) -> String {
@@ -332,10 +390,13 @@ mod tests {
 
     use super::{
         EXCERPT_KEY, LINE_BREAK, MAX_POINTERS, MIN_WINDOW_LINES, OPEN_TODOS_KEY, OmittedOutput,
-        REQUEST_KEY, output_focus, pointer, pointer_lines, windows, words,
+        POINTED_NOWHERE, REQUEST_KEY, output_focus, pointer, pointer_lines, windows, words,
     };
     use crate::CancelToken;
-    use crate::decisions::{CANDIDATE_KEY, DecisionContext, Decisions, MAX_RERANK_BATCH};
+    use crate::decisions::{
+        CANDIDATE_KEY, DecisionContext, Decisions, ENGINE_UNREACHABLE, MAX_RERANK_BATCH, NoteDraft,
+        NoteOutcome,
+    };
     use crate::memory::relevance::tests::assert_effects;
     use crate::tools::native::tests::tempdir;
     use crate::types::{TodoItem, TodoPriority, TodoStatus};
@@ -362,6 +423,15 @@ mod tests {
     const BETA_LINE: usize = 700;
     const GAMMA_LINE: usize = 900;
     const ADVISED_POINTERS: &str = "[Likely relevant omitted lines 621-820: tool_output(output_id=\"output-1\", offset=621, limit=200)]\n[Likely relevant omitted lines 221-420: tool_output(output_id=\"output-1\", offset=221, limit=200)]";
+    const POINTED_TWO: &str = "pointed to 2 omitted line ranges";
+    const SHADOW_POINTED_ONE: &str = "would have pointed to 1 omitted line range";
+    const ADVISED_WINDOWS: [&str; 5] = [
+        "0.99  lines 621-820  pointed",
+        "0.95  lines 221-420  pointed",
+        "0.92  lines 821-980  not pointed",
+        "0.02  lines 21-220  not pointed",
+        "0.02  lines 421-620  not pointed",
+    ];
     const HUGE_OMISSION: usize = 100_000;
     const FIRST_TODO: &str = "reproduce the failure";
     const DONE_TODO: &str = "read the deploy script";
@@ -452,7 +522,7 @@ mod tests {
             text: &str,
             input: &Value,
             cancel: &CancelToken,
-        ) -> Option<String> {
+        ) -> (Option<String>, Option<NoteDraft>) {
             let focus = output_focus(&[], Some(REQUEST)).unwrap();
             pointer_lines(
                 OmittedOutput {
@@ -514,37 +584,85 @@ mod tests {
             );
             let text = output_text(&[(ALPHA_LINE, ALPHA), (BETA_LINE, BETA), (GAMMA_LINE, GAMMA)]);
 
-            let pointers = fixture
+            let (pointers, row) = fixture
                 .pointers(&text, &command(), &CancelToken::none())
-                .await
-                .unwrap();
+                .await;
 
+            let pointers = pointers.unwrap();
             assert_eq!(pointers, ADVISED_POINTERS);
             assert_eq!(pointers.lines().count(), MAX_POINTERS);
+            let row = row.unwrap();
+            assert_eq!(row.outcome, NoteOutcome::Acted);
+            assert_eq!(row.summary, POINTED_TWO);
+            assert_eq!(row.details, ADVISED_WINDOWS);
             assert_effects(fixture.root.path(), &[DecisionEffect::Advised]).await;
         });
     }
 
-    #[test_case(FeatureMode::Advise, RELATED, false, 1; "nothing_confident")]
-    #[test_case(FeatureMode::Advise, CONFIDENT, true, 1; "engine_failed")]
-    #[test_case(FeatureMode::Shadow, CONFIDENT, false, 1; "shadow_only_evaluates")]
-    #[test_case(FeatureMode::Off, CONFIDENT, false, 0; "off_never_asks")]
+    #[test_case(FeatureMode::Advise, RELATED, false, 1, None; "nothing_confident")]
+    #[test_case(FeatureMode::Advise, CONFIDENT, true, 1, Some(NoteOutcome::FellBack); "engine_failed")]
+    #[test_case(FeatureMode::Shadow, CONFIDENT, false, 1, Some(NoteOutcome::Shadow); "shadow_only_evaluates")]
+    #[test_case(FeatureMode::Off, CONFIDENT, false, 0, None; "off_never_asks")]
     fn pointers_without_a_confident_answer_name_nothing(
         mode: FeatureMode,
         score: f64,
         fail: bool,
         requests: usize,
+        outcome: Option<NoteOutcome>,
     ) {
         smol::block_on(async {
             let fixture = Fixture::new(mode, &[(BETA, score)], fail);
             let text = output_text(&[(BETA_LINE, BETA)]);
 
-            let pointers = fixture
+            let (pointers, row) = fixture
                 .pointers(&text, &command(), &CancelToken::none())
                 .await;
 
             assert_eq!(pointers, None);
+            assert_eq!(row.map(|row| row.outcome), outcome);
             assert_eq!(fixture.requests().len(), requests);
+        });
+    }
+
+    #[test]
+    fn a_shadow_row_says_what_would_have_been_pointed_to() {
+        smol::block_on(async {
+            let fixture = Fixture::new(FeatureMode::Shadow, &[(BETA, CONFIDENT)], false);
+
+            let (pointers, row) = fixture
+                .pointers(
+                    &output_text(&[(BETA_LINE, BETA)]),
+                    &command(),
+                    &CancelToken::none(),
+                )
+                .await;
+
+            assert_eq!(pointers, None);
+            assert_eq!(row.unwrap().summary, SHADOW_POINTED_ONE);
+            assert_effects(fixture.root.path(), &[]).await;
+        });
+    }
+
+    #[test]
+    fn a_failing_engine_falls_back_once_until_it_answers() {
+        smol::block_on(async {
+            let fixture = Fixture::new(FeatureMode::Advise, &[(BETA, CONFIDENT)], true);
+            let text = output_text(&[(BETA_LINE, BETA)]);
+            let mut summaries = Vec::new();
+            for _ in 0..2 {
+                let (_, row) = fixture
+                    .pointers(&text, &command(), &CancelToken::none())
+                    .await;
+                summaries.push(row.map(|row| row.summary));
+            }
+
+            assert_eq!(
+                summaries,
+                [
+                    Some(format!("{ENGINE_UNREACHABLE}; {POINTED_NOWHERE}")),
+                    None
+                ]
+            );
         });
     }
 
@@ -555,11 +673,33 @@ mod tests {
             let (trigger, cancel) = CancelToken::new();
             trigger.cancel();
 
-            let pointers = fixture
+            let pointed = fixture
                 .pointers(&output_text(&[(BETA_LINE, BETA)]), &command(), &cancel)
                 .await;
 
-            assert_eq!(pointers, None);
+            assert_eq!(pointed, (None, None));
+        });
+    }
+
+    #[test]
+    fn a_row_never_carries_the_output_or_a_secret() {
+        smol::block_on(async {
+            let fixture = Fixture::new(FeatureMode::Advise, &[(BETA, CONFIDENT)], false);
+            let leaked = format!("{BETA} TOKEN={SECRET}");
+            let input = json!({COMMAND_KEY: format!("{COMMAND} TOKEN={SECRET}")});
+
+            let (_, row) = fixture
+                .pointers(
+                    &output_text(&[(BETA_LINE, &leaked)]),
+                    &input,
+                    &CancelToken::none(),
+                )
+                .await;
+
+            let row = row.unwrap();
+            let text = format!("{} {}", row.summary, row.details.join(LINE_BREAK));
+            assert!(!text.contains(SECRET));
+            assert!(!text.contains(BETA));
         });
     }
 
@@ -570,15 +710,15 @@ mod tests {
             let leaked = format!("{BETA} TOKEN={SECRET}");
             let input = json!({COMMAND_KEY: format!("{COMMAND} TOKEN={SECRET}")});
 
-            fixture
+            let (pointers, _) = fixture
                 .pointers(
                     &output_text(&[(BETA_LINE, &leaked)]),
                     &input,
                     &CancelToken::none(),
                 )
-                .await
-                .unwrap();
+                .await;
 
+            assert!(pointers.is_some());
             let requests = fixture.requests();
             assert!(!requests.is_empty());
             assert!(requests.iter().all(|request| !request.contains(SECRET)));

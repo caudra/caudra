@@ -32,6 +32,7 @@ use jiff::tz::TimeZone;
 use caudra_markdown::render::truncate_long_lines;
 
 use crate::markdown::{LinkMap, expand_notice, should_truncate, text_to_painted};
+use caudra_agent::decisions::NoteOutcome;
 use caudra_agent::tools::native::peers::{
     LIST_NAME as LIST_SESSIONS_TOOL_NAME, PUBLISH_NAME as PUBLISH_MESSAGE_TOOL_NAME,
     READ_NAME as READ_TOPIC_TOOL_NAME, SEND_NAME as SEND_MESSAGE_TOOL_NAME,
@@ -274,6 +275,10 @@ const INDICATOR_PAD: &str = "  ";
 const TOOL_BODY_INDENT_WIDTH: u16 = TOOL_BODY_INDENT.len() as u16;
 pub(crate) const NOTICE_PREFIX: &str = "· ";
 pub(crate) const AUTOPILOT_PREFIX: &str = "autopilot \u{203a} ";
+pub(crate) const DECISION_PREFIX: &str = "\u{25c6} ";
+/// As wide as [`DECISION_PREFIX`], so a decision's details line up under its
+/// title.
+pub(crate) const DECISION_BODY_INDENT: &str = "  ";
 pub(crate) const SPINNER_STYLE_NAME: &str = "spinner";
 pub(crate) const SPINNER_STYLE_PREFIX: &str = "spinner:";
 
@@ -1288,6 +1293,29 @@ pub fn autopilot_style() -> RoleStyle {
         text_style: theme::current().status_dim,
         prefix_style: theme::current().status_notice,
         use_markdown: true,
+        max_line_bytes: None,
+    }
+}
+
+/// A reminder's weight whatever the outcome: quiet text behind an accent
+/// prefix where the feature acted, the whole row dimmed where it only says
+/// what it would have done, and a warning where the engine failed and the
+/// default applied.
+pub fn decision_style(outcome: NoteOutcome) -> RoleStyle {
+    let theme = theme::current();
+    let (prefix_style, text_style) = match outcome {
+        NoteOutcome::Acted => (theme.accent, theme.status_dim),
+        NoteOutcome::Shadow => {
+            let dimmed = theme.status_dim.add_modifier(Modifier::DIM);
+            (dimmed, dimmed)
+        }
+        NoteOutcome::FellBack => (theme.tool_warning, theme.tool_warning),
+    };
+    RoleStyle {
+        prefix: DECISION_PREFIX,
+        text_style,
+        prefix_style,
+        use_markdown: false,
         max_line_bytes: None,
     }
 }

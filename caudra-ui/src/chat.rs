@@ -23,6 +23,7 @@ use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
 use caudra_agent::background::BackgroundTasks;
+use caudra_agent::decisions::{DecisionFeature, DecisionNote, NoteAnchor};
 use caudra_agent::permissions::PermissionRequest;
 use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
 use caudra_agent::tools::native::question::asked_questions;
@@ -42,6 +43,7 @@ use caudra_providers::{
     AutomationEventOrigin, AutopilotMessageKind, CaudraId, HistoryItem, HistoryItemKind,
     SteeringKind, SteeringOrigin, UserOrigin,
 };
+use caudra_storage::engine_decisions::{StoredDecisionAnchor, StoredEngineDecision};
 use caudra_storage::usage_ledger::LedgerPurpose;
 use caudra_storage::view::ViewMode;
 use caudra_workflow::RunSnapshot;
@@ -120,6 +122,9 @@ pub struct Chat {
     /// folded, so this is the switch for readers who want the transcript to
     /// hold nothing but the conversation.
     show_reminders: bool,
+    /// Whether what the decision engine did gets a row. The rows are stored
+    /// either way, so turning this back on shows them again on restore.
+    show_decisions: bool,
     /// The row the current stall is reporting on, and whether the injection
     /// about to arrive belongs to it. A stall answers itself several times
     /// over; the transcript should still read as one event.
@@ -147,6 +152,7 @@ impl Chat {
             fast: false,
             pending_turn_usage: None,
             show_reminders: ui_config.show_reminders,
+            show_decisions: ui_config.show_decisions,
             stall_row: None,
             stall_pending: false,
             messages_panel: MessagesPanel::new(ui_config, lua_event_handle),
@@ -350,6 +356,11 @@ impl Chat {
             | AgentEvent::SessionTitle { .. }
             | AgentEvent::MemoryChanged
             | AgentEvent::Autopilot(_) => {}
+            AgentEvent::Decision(note) => {
+                if self.show_decisions {
+                    self.place_decision(&note);
+                }
+            }
             AgentEvent::StreamReset
             | AgentEvent::TaskAdmitted(_)
             | AgentEvent::Retry { .. }
@@ -510,6 +521,34 @@ impl Chat {
     pub(crate) fn plan_written(&mut self, id: &str, plan: &PlanWriteResult) {
         self.messages_panel.close_tool_card(id);
         self.messages_panel.push(plan_message(plan));
+    }
+
+    /// A call's row goes right under the call's card, which parallel calls
+    /// may already have drawn others after. Anything else, including a call
+    /// whose card this chat does not hold, follows the transcript.
+    fn place_decision(&mut self, note: &DecisionNote) {
+        let row = DisplayMessage::decision(
+            note.feature.label(),
+            note.outcome,
+            &note.summary,
+            &note.details,
+        );
+        let after_card = match &note.anchor {
+            NoteAnchor::Tool(id) => self.messages_panel.row_after_card(id),
+            NoteAnchor::History(_) => None,
+        };
+        let Some(index) = after_card else {
+            self.messages_panel.flush();
+            self.messages_panel.push(row);
+            return;
+        };
+        self.messages_panel.insert(index, row);
+        let finish = self.finish.as_mut().map(|(_, bubble)| bubble);
+        for row in [self.stall_row.as_mut(), finish].into_iter().flatten() {
+            if *row >= index {
+                *row += 1;
+            }
+        }
     }
 
     /// Offers the wheel to an armed scroll card under the pointer first,
@@ -1091,6 +1130,50 @@ pub fn history_to_display(
     )
 }
 
+/// Each stored decision row with the position
+/// [`interleaved_history_to_display`] places it at: a turn's row before the
+/// item it was made at, a call's right after the item that made the call. A
+/// call that appears twice, kept across a compaction, keeps its row under the
+/// first. A row whose call `items` no longer holds is dropped, and a feature
+/// this build does not know is titled by its stored name.
+pub(crate) fn decision_inserts<'a>(
+    items: &[HistoryItem],
+    rows: impl IntoIterator<Item = &'a StoredEngineDecision>,
+) -> Vec<(usize, DisplayMessage)> {
+    let mut after_calls: HashMap<&str, usize> = HashMap::new();
+    for (index, item) in items.iter().enumerate() {
+        if let HistoryItemKind::ToolCall { call_id, .. } = &item.kind {
+            after_calls.entry(call_id.as_str()).or_insert(index + 1);
+        }
+    }
+    rows.into_iter()
+        .filter_map(|row| {
+            let position = match &row.anchor {
+                StoredDecisionAnchor::History(len) => *len,
+                StoredDecisionAnchor::Tool(id) => after_call(&after_calls, id)?,
+            };
+            Some((position, stored_decision_row(row)))
+        })
+        .collect()
+}
+
+/// A batch child's call is drawn on its batch's card, so it falls back to the
+/// position after the batch.
+fn after_call(after_calls: &HashMap<&str, usize>, mut call_id: &str) -> Option<usize> {
+    loop {
+        if let Some(position) = after_calls.get(call_id) {
+            return Some(*position);
+        }
+        call_id = batch_child_id(call_id)?.0;
+    }
+}
+
+fn stored_decision_row(row: &StoredEngineDecision) -> DisplayMessage {
+    let feature = DecisionFeature::from_name(&row.feature)
+        .map_or(row.feature.as_str(), |feature| feature.label());
+    DisplayMessage::decision(feature, row.outcome.into(), &row.summary, &row.details)
+}
+
 /// [`history_to_display`] with rows kept outside the history, each placed
 /// after the first `n` items where `n` is the position it comes with. Rows
 /// sharing a position keep their order, and a position past the end lands
@@ -1542,6 +1625,7 @@ fn build_tool_results_map(items: &[HistoryItem]) -> HashMap<&str, ToolResultRef<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_agent::decisions::NoteOutcome;
     use caudra_agent::peers::{
         AssignedWork, PeerSummary, PublishReceipt, QueuedWork, RecipientReceipt, SendReceipt,
     };
@@ -1553,15 +1637,19 @@ mod tests {
         IndexLineSemantic, IndexOutput, IndexSourceRange, PeerOutput, SharedBuf, TextOutput,
         ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
     };
+    use caudra_config::decisions::FeatureMode;
     use caudra_config::{InboundPolicy, UiConfig};
     use caudra_providers::{
         AutopilotOrigin, Billing, ContentBlock, Message, PeerAudience, PeerMessageOrigin, Role,
         StandingReminderKind, TaskEventOrigin, estimate_tokens_cached, project_messages,
         token_label,
     };
+    use caudra_storage::engine_decisions::StoredDecisionOutcome;
     use caudra_workspace::PlanRef;
     use ratatui::{Terminal, backend::TestBackend};
     use test_case::test_case;
+
+    use crate::components::{DECISION_SEPARATOR, SHADOW_MARKER};
 
     fn tool_start(id: &str, tool: &str) -> AgentEvent {
         AgentEvent::ToolStart(Box::new(ToolStartEvent {
@@ -3745,6 +3833,272 @@ mod tests {
         assert_eq!(
             (&last.role, last.text.as_str()),
             (&DisplayRole::Autopilot, AUTOPILOT_TEXT)
+        );
+    }
+
+    const DECISION_SUMMARY: &str = "3 notes ranked";
+    const DECISION_DETAIL: &str = "0.97  release-notes  kept 1st";
+    const FIRST_CALL: &str = "t1";
+    const SECOND_CALL: &str = "t2";
+    const SECOND_CALL_CHILD: &str = "t2:0";
+    const UNKNOWN_CALL: &str = "t9";
+    const RETIRED_FEATURE: &str = "retired_feature";
+    const TURN_ROW: &str = "ranked before the turn";
+    const FIRST_CALL_ROW: &str = "ranked in the first call";
+    const SECOND_CALL_ROW: &str = "ranked in the second call";
+    const CHILD_ROW: &str = "ranked in a batch child";
+    const UNKNOWN_CALL_ROW: &str = "ranked in a call that is gone";
+    const COMPACTION_SUMMARY: &str = "## Objective";
+
+    fn decision(outcome: NoteOutcome, anchor: NoteAnchor) -> AgentEvent {
+        DecisionNote::new(
+            DecisionFeature::MemorySearch,
+            FeatureMode::Advise,
+            outcome,
+            DECISION_SUMMARY,
+            vec![DECISION_DETAIL.into()],
+            anchor,
+        )
+        .into()
+    }
+
+    /// Each message as a reader tells it apart: a card by its call, a
+    /// decision row by its outcome, anything else by its text.
+    fn live_placement(chat: &Chat) -> Vec<&str> {
+        (0..chat.message_count())
+            .filter_map(|index| chat.message_at(index))
+            .map(|message| match &message.role {
+                DisplayRole::Tool(tool) => tool.id.as_str(),
+                DisplayRole::Decision(outcome) => outcome.as_str(),
+                _ => message.text.as_str(),
+            })
+            .collect()
+    }
+
+    /// Two calls run side by side, so a later card is already drawn when the
+    /// first call's rows arrive. Each still lands under its own card, the
+    /// second row on a card after the first.
+    #[test]
+    fn a_calls_row_lands_under_its_card_beside_a_parallel_call() {
+        let mut chat = chat();
+        chat.handle_event(tool_start(FIRST_CALL, SHELL_TOOL_NAME), None);
+        chat.handle_event(tool_start(SECOND_CALL, SHELL_TOOL_NAME), None);
+
+        for (outcome, call) in [
+            (NoteOutcome::Shadow, SECOND_CALL),
+            (NoteOutcome::Acted, FIRST_CALL),
+            (NoteOutcome::FellBack, FIRST_CALL),
+        ] {
+            chat.handle_event(decision(outcome, NoteAnchor::Tool(call.into())), None);
+        }
+
+        assert_eq!(
+            live_placement(&chat),
+            [
+                FIRST_CALL,
+                NoteOutcome::Acted.as_str(),
+                NoteOutcome::FellBack.as_str(),
+                SECOND_CALL,
+                NoteOutcome::Shadow.as_str(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_batch_childs_row_lands_under_its_batch() {
+        let mut chat = chat();
+        chat.handle_event(batch_start(SECOND_CALL, 1), None);
+        chat.handle_event(tool_start(FIRST_CALL, SHELL_TOOL_NAME), None);
+
+        chat.handle_event(
+            decision(
+                NoteOutcome::Acted,
+                NoteAnchor::Tool(SECOND_CALL_CHILD.into()),
+            ),
+            None,
+        );
+
+        assert_eq!(
+            live_placement(&chat),
+            [SECOND_CALL, NoteOutcome::Acted.as_str(), FIRST_CALL]
+        );
+    }
+
+    #[test_case(NoteAnchor::History(0) ; "a_turns_row")]
+    #[test_case(NoteAnchor::Tool(UNKNOWN_CALL.into()) ; "a_row_for_a_card_this_chat_lacks")]
+    fn a_row_without_a_card_follows_the_transcript(anchor: NoteAnchor) {
+        let mut chat = chat();
+        chat.handle_event(tool_start(FIRST_CALL, SHELL_TOOL_NAME), None);
+        chat.handle_event(tool_start(SECOND_CALL, SHELL_TOOL_NAME), None);
+
+        chat.handle_event(decision(NoteOutcome::Acted, anchor), None);
+
+        assert_eq!(
+            live_placement(&chat),
+            [FIRST_CALL, SECOND_CALL, NoteOutcome::Acted.as_str()]
+        );
+    }
+
+    #[test]
+    fn a_live_row_titles_the_feature_and_lists_its_details() {
+        let mut chat = chat();
+
+        chat.handle_event(decision(NoteOutcome::Shadow, NoteAnchor::History(0)), None);
+
+        let row = chat.message_at(0).unwrap();
+        let title = format!(
+            "{SHADOW_MARKER}{}{DECISION_SEPARATOR}{DECISION_SUMMARY}",
+            DecisionFeature::MemorySearch.label()
+        );
+        assert_eq!(row.text, format!("{title}\n{DECISION_DETAIL}"));
+    }
+
+    #[test]
+    fn hidden_decisions_draw_no_row() {
+        let mut chat = Chat::new(
+            MAIN_NAME.into(),
+            Path::new(SESSION_CWD),
+            UiConfig {
+                show_decisions: false,
+                ..UiConfig::default()
+            },
+            caudra_lua::EventHandle::disconnected_for_test(),
+        );
+        chat.handle_event(tool_start(FIRST_CALL, SHELL_TOOL_NAME), None);
+
+        for anchor in [NoteAnchor::History(0), NoteAnchor::Tool(FIRST_CALL.into())] {
+            chat.handle_event(decision(NoteOutcome::Acted, anchor), None);
+        }
+
+        assert_eq!(live_placement(&chat), [FIRST_CALL]);
+    }
+
+    fn stored(feature: &str, summary: &str, anchor: StoredDecisionAnchor) -> StoredEngineDecision {
+        StoredEngineDecision {
+            seq: 0,
+            at_ms: 0,
+            feature: feature.into(),
+            mode: FeatureMode::Advise.as_str().into(),
+            outcome: StoredDecisionOutcome::Acted,
+            summary: summary.into(),
+            details: Vec::new(),
+            agent: None,
+            anchor,
+        }
+    }
+
+    fn call(id: &str) -> [Message; 2] {
+        [
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    id,
+                    SHELL_TOOL_NAME,
+                    serde_json::json!({}),
+                )],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: id.into(),
+                    content: REPLY_TEXT.into(),
+                    is_error: false,
+                    output_ref: None,
+                }],
+                ..Default::default()
+            },
+        ]
+    }
+
+    /// A compaction keeps the first call's pair after its summary, so the
+    /// transcript holds that call twice and its row stays under the first.
+    /// A turn's row counts items across the seam, a batch child's row falls
+    /// back to its batch, and a row whose call is gone is dropped.
+    #[test]
+    fn stored_rows_restore_among_the_history_across_a_compaction() {
+        let mut summary = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: COMPACTION_SUMMARY.into(),
+            }],
+            ..Default::default()
+        };
+        summary.is_compaction_summary = true;
+        let mut msgs = vec![Message::user(USER_TEXT.into())];
+        msgs.extend(call(FIRST_CALL));
+        let seam = msgs.len();
+        msgs.push(Message::synthetic(COMPACTION_ANCHOR.into()));
+        msgs.push(summary);
+        msgs.extend(call(FIRST_CALL));
+        msgs.extend(call(SECOND_CALL));
+        let items = crate::history_items(&msgs);
+        let feature = DecisionFeature::MemorySearch.name();
+        let rows = [
+            stored(feature, TURN_ROW, StoredDecisionAnchor::History(seam)),
+            stored(
+                feature,
+                UNKNOWN_CALL_ROW,
+                StoredDecisionAnchor::Tool(UNKNOWN_CALL.into()),
+            ),
+            stored(
+                feature,
+                SECOND_CALL_ROW,
+                StoredDecisionAnchor::Tool(SECOND_CALL.into()),
+            ),
+            stored(
+                feature,
+                CHILD_ROW,
+                StoredDecisionAnchor::Tool(SECOND_CALL_CHILD.into()),
+            ),
+            stored(
+                feature,
+                FIRST_CALL_ROW,
+                StoredDecisionAnchor::Tool(FIRST_CALL.into()),
+            ),
+        ];
+
+        let (display, _) = interleaved_history_to_display(
+            &items,
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+            false,
+            decision_inserts(&items, &rows),
+        );
+
+        let shown: Vec<&str> = display
+            .iter()
+            .map(|message| match &message.role {
+                DisplayRole::Tool(tool) => tool.id.as_str(),
+                DisplayRole::Decision(_) => message.text.rsplit(DECISION_SEPARATOR).next().unwrap(),
+                _ => message.text.as_str(),
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                USER_TEXT,
+                FIRST_CALL,
+                FIRST_CALL_ROW,
+                TURN_ROW,
+                COMPACTION_BORDER_TEXT,
+                COMPACTION_SUMMARY,
+                FIRST_CALL,
+                SECOND_CALL,
+                SECOND_CALL_ROW,
+                CHILD_ROW,
+            ]
+        );
+    }
+
+    #[test_case(DecisionFeature::MemorySearch.name(), DecisionFeature::MemorySearch.label() ; "a_known_feature_by_its_label")]
+    #[test_case(RETIRED_FEATURE, RETIRED_FEATURE ; "an_unknown_feature_by_its_stored_name")]
+    fn a_stored_row_is_titled_by_its_feature(feature: &str, title: &str) {
+        let row = stored(feature, DECISION_SUMMARY, StoredDecisionAnchor::History(0));
+
+        assert_eq!(
+            stored_decision_row(&row).text,
+            format!("{title}{DECISION_SEPARATOR}{DECISION_SUMMARY}")
         );
     }
 }
