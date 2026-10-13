@@ -91,7 +91,8 @@ Ollama reads `OLLAMA_HOST` and llama.cpp reads `LLAMA_CPP_HOST`. Neither reads `
 
 | Marker | Models | Pricing (in/out per 1M tokens) | Context |
 |---------|--------|-------------------------------|---------|
-| Fast | **claude-haiku-4-5** (default) | $1.00 / $5.00 | 200K ctx / 64K out |
+| Fast | **claude-haiku-5-5** (default) | $0.10 / $0.50 | 372K ctx / 128K out |
+| Small | claude-haiku-4-5 | $1.00 / $5.00 | 200K ctx / 64K out |
 |  | claude-sonnet-4-5 | $3.00 / $15.00 | 200K ctx / 64K out |
 |  | claude-sonnet-4-6 | $3.00 / $15.00 | 372K ctx / 64K out |
 |  | claude-sonnet-5-5 | $2.00 / $10.00 | 372K ctx / 128K out |
@@ -107,13 +108,13 @@ Ollama reads `OLLAMA_HOST` and llama.cpp reads `LLAMA_CPP_HOST`. Neither reads `
 |  | claude-fable-5 | $10.00 / $50.00 | 372K ctx / 128K out |
 |  | claude-opus-4-0, claude-opus-4-1 | $15.00 / $75.00 | 200K ctx / 32K out |
 
-Routing defaults: claude-haiku-4-5 (Fast), claude-opus-5-5 (Best)
+Routing defaults: claude-haiku-5-5 (Fast), claude-opus-5-5 (Best)
 
 Run `caudra auth login anthropic` to sign in to a Claude subscription through browser OAuth. Caudra stores the tokens in its state directory, refreshes them automatically, and shows subscription limits through `/usage`. Subscription requests always go to `api.anthropic.com`, even when `ANTHROPIC_BASE_URL` is set.
 
 This experimental flow uses Claude Code's public client registration. Anthropic limits Pro and Max subscription tokens to official clients in its terms. The flow may stop working when Anthropic changes its OAuth or request protocol.
 
-Recent Claude models accept up to 1M tokens. Caudra runs them at a 372k working window, which keeps cost and latency bounded. That window is an input budget: the model's output allowance sits on top of it rather than inside it, so Caudra holds back less of it before compaction. Add `-1m` to a model id, like `claude-sonnet-4-6-1m`, to open the full 1M window instead. Set `context_window` in `providers.toml` to pick any other size, see [Model limits on a built-in provider](#model-limits-on-a-built-in-provider).
+Recent Claude models accept up to 1M tokens. Caudra runs them at a 372k working window, which keeps cost and latency bounded. That window is an input budget: the model's output allowance sits on top of it rather than inside it, so Caudra holds back less of it before compaction. Add `-1m` to a model id, like `claude-sonnet-4-6-1m`, to open the full 1M window instead. Set `context_window` in `providers.toml` to pick any other size, see [Model limits on a built-in provider](#model-limits-on-a-built-in-provider). `claude-haiku-5-5` bills a whole request at five times its listed rates once the prompt passes 100k tokens, cached tokens included, and Caudra counts its cost the same way.
 
 #### Amazon Bedrock
 
@@ -190,6 +191,7 @@ Routing defaults: gemini-2.0-flash-lite (Fast), gemini-2.5-pro (Best)
 | Small | gpt-5.4-mini | $0.75 / $4.50 | 200K ctx / 100K out |
 | Small | gpt-5.4-nano | $0.20 / $1.25 | 200K ctx / 100K out |
 | Small | claude-haiku-4.5 | $1.00 / $5.00 | 200K ctx / 64K out |
+| Small | claude-haiku-5.5 | $0.10 / $0.50 | 200K ctx / 100K out |
 | Small | gemini-3.5-flash | $1.50 / $9.00 | 200K ctx / 65K out |
 | Small | mai-code-1-flash-picker | $0.75 / $4.50 | 200K ctx / 100K out |
 | Small | gpt-6-luna | $0.10 / $0.50 | 200K ctx / 100K out |

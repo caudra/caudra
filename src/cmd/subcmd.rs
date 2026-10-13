@@ -1902,11 +1902,11 @@ mod auth_tests {
         assert!(read_workcell_bearer(input.as_bytes()).is_err());
     }
 
-    const FAST_SPEC: &str = "anthropic/claude-haiku-4-5";
+    const FAST_SPEC: &str = "anthropic/claude-haiku-5-5";
     const SMALL_SPEC: &str = "openai/gpt-5.4-nano";
     const BEST_SPEC: &str = "openai/gpt-5.6-sol";
     const UNCURATED_SPEC: &str = "ollama/llama3";
-    const AGGREGATED_SPEC: &str = "openrouter/anthropic/claude-haiku-4-5";
+    const AGGREGATED_SPEC: &str = "openrouter/anthropic/claude-haiku-5-5";
     const UNAVAILABLE_RESOLUTION: &str = "error: unavailable";
     const INSPECTION_TODO: &str = "todo_write";
     const INSPECTION_TASK: &str = "task";

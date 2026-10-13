@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -78,7 +79,9 @@ const AIC_TO_USD_PER_MILLION: f64 = 10_000.0;
 /// for offline runs). The API wins via discovered metadata; these mirror
 /// GitHub's published rates (usage-based billing since June 2026,
 /// docs.github.com/copilot/reference/copilot-billing/models-and-pricing), at
-/// the default context tier.
+/// the default context tier. A long-prompt tier is stated only where it starts
+/// inside Copilot's window, as Haiku 5.5's does; `/models` reports base rates
+/// alone, so the tier comes from here even once discovery has landed.
 /// Levels these models declare, matching the models.dev catalog. Copilot's
 /// `/models` response overrides these the moment it lands; the table only has
 /// to survive a cold start.
@@ -204,6 +207,24 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: Some(CLAUDE_BUDGET),
         },
         ModelEntry {
+            prefixes: &["claude-haiku-5.5"],
+            small: true,
+            family: ModelFamily::Generic,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 0.10,
+                output: 0.50,
+                cache_write: 0.125,
+                cache_read: 0.01,
+                fast: None,
+                tiers: Cow::Borrowed(&[shared::HAIKU_5_5_LONG_PROMPT]),
+            },
+            max_output_tokens: Some(100_000),
+            context_window: 200_000,
+            reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
+        },
+        ModelEntry {
             prefixes: &["gemini-3.5-flash"],
             small: true,
             family: ModelFamily::Generic,
@@ -303,7 +324,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 input: 2.00,
                 output: 10.00,
                 cache_write: 2.50,
-                cache_read: 0.20,
+                cache_read: 0.10,
                 fast: None,
                 tiers: ModelPricing::UNTIERED,
             },

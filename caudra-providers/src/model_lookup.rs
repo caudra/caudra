@@ -504,6 +504,7 @@ mod tests {
         "ninfer-4090/qwen3.8-27b-random",
         "ninfer-4090/qwen3.8-27b-zero",
         "ninfer-4090/systemone-decision-v7",
+        "anthropic/claude-haiku-5-5",
         "anthropic/claude-haiku-4-5",
         "anthropic/claude-sonnet-4-5",
         "anthropic/claude-sonnet-4-6",
@@ -524,6 +525,7 @@ mod tests {
         "copilot/gpt-5.4-mini",
         "copilot/gpt-5.4-nano",
         "copilot/claude-haiku-4.5",
+        "copilot/claude-haiku-5.5",
         "copilot/gemini-3.5-flash",
         "copilot/gemini-3.6-flash",
         "copilot/gemini-3.7-flash",
@@ -560,7 +562,9 @@ mod tests {
     #[test_case("opus 4.6", &[], "anthropic/claude-opus-4-6" ; "opus_4_6_only_anthropic_serves")]
     #[test_case("opus 4", &[ANTHROPIC], "anthropic/claude-opus-4-8" ; "opus_4_newest_point_release")]
     #[test_case("opus 5", &[ANTHROPIC], "anthropic/claude-opus-5-5" ; "opus_5_covers_5_5")]
-    #[test_case("haiku", &[ANTHROPIC], "anthropic/claude-haiku-4-5" ; "haiku")]
+    #[test_case("haiku", &[ANTHROPIC], "anthropic/claude-haiku-5-5" ; "haiku")]
+    #[test_case("haiku 4", &[ANTHROPIC], "anthropic/claude-haiku-4-5" ; "haiku_4")]
+    #[test_case("haiku", &[COPILOT], "copilot/claude-haiku-5.5" ; "copilot_haiku")]
     #[test_case("fable", &[ANTHROPIC], "anthropic/claude-fable-5-1" ; "fable")]
     #[test_case("anthropic/opus", &[OPENAI], "anthropic/claude-opus-5-5" ; "provider_beats_preference")]
     #[test_case("gpt", &[OPENAI], "openai/gpt-6.1-sol" ; "gpt_newest_release")]
@@ -597,7 +601,7 @@ mod tests {
     }
 
     #[test_case("gpt-5.6", &[OPENAI], &["openai/gpt-5.6-luna", "openai/gpt-5.6-sol", "openai/gpt-5.6-terra"] ; "three_5_6_models")]
-    #[test_case("claude", &[ANTHROPIC], &["anthropic/claude-opus-5-5", "anthropic/claude-sonnet-5-5"] ; "claude_names_a_vendor")]
+    #[test_case("claude", &[ANTHROPIC], &["anthropic/claude-haiku-5-5", "anthropic/claude-opus-5-5", "anthropic/claude-sonnet-5-5"] ; "claude_names_a_vendor")]
     #[test_case("sonnet", &[OPENAI, LOCAL], &["anthropic/claude-sonnet-5-5", "copilot/claude-sonnet-5.5"] ; "two_providers_serve_sonnet")]
     #[test_case("sonnet 4.6", &[], &["anthropic/claude-sonnet-4-6", "copilot/claude-sonnet-4.6"] ; "spellings_differ_by_provider")]
     fn an_ambiguous_listed_name_lists_its_candidates(

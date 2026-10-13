@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
 use std::sync::{Arc, LazyLock};
@@ -10,7 +11,7 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::model::{
-    ANTHROPIC_SLUG, FastPricing, Model, ModelEntry, ModelFamily, ModelPricing,
+    ANTHROPIC_SLUG, FastPricing, Model, ModelEntry, ModelFamily, ModelPricing, PricingTier,
     StaticReasoningOption,
 };
 use crate::{
@@ -56,6 +57,17 @@ pub(crate) const LONG_CONTEXT_WINDOW: u32 = 1_000_000;
 /// 200k entries, it is an *input* budget: `max_output_tokens` is granted on top
 /// of it rather than carved out of it.
 pub(crate) const WIDE_CONTEXT_WINDOW: u32 = 372_000;
+
+/// Haiku 5.5 bills a prompt past 100k tokens at five times its base rates,
+/// and Copilot passes the same list price through.
+pub(crate) const HAIKU_5_5_LONG_PROMPT: PricingTier = PricingTier {
+    above: 100_000,
+    input: 0.50,
+    output: 2.50,
+    cache_write: 0.625,
+    cache_read: 0.05,
+    fast: None,
+};
 
 const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 const BILLING_PREFIX: &str = "59cf53e54c78";
@@ -925,11 +937,29 @@ const BUDGET_ONLY: &[StaticReasoningOption] = &[StaticReasoningOption::BudgetTok
 pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
         ModelEntry {
-            prefixes: &["claude-haiku-4-5"],
+            prefixes: &["claude-haiku-5-5"],
             small: true,
             family: ModelFamily::Claude,
             vision: true,
             default: true,
+            pricing: ModelPricing {
+                input: 0.10,
+                output: 0.50,
+                cache_write: 0.125,
+                cache_read: 0.01,
+                fast: None,
+                tiers: Cow::Borrowed(&[HAIKU_5_5_LONG_PROMPT]),
+            },
+            max_output_tokens: Some(128000),
+            context_window: WIDE_CONTEXT_WINDOW,
+            reasoning_options: Some(TOGGLE_WITH_EFFORT_TO_MAX),
+        },
+        ModelEntry {
+            prefixes: &["claude-haiku-4-5"],
+            small: true,
+            family: ModelFamily::Claude,
+            vision: true,
+            default: false,
             pricing: ModelPricing {
                 input: 1.00,
                 output: 5.00,
@@ -988,7 +1018,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 input: 2.00,
                 output: 10.00,
                 cache_write: 2.50,
-                cache_read: 0.20,
+                cache_read: 0.10,
                 fast: None,
                 tiers: ModelPricing::UNTIERED,
             },
@@ -1432,6 +1462,7 @@ mod tests {
 
     #[test_case("anthropic/claude-sonnet-5", &["low", "medium", "high", "xhigh", "max"] ; "sonnet_5_has_no_minimal")]
     #[test_case("anthropic/claude-sonnet-5-5", &["low", "medium", "high", "xhigh", "max"] ; "sonnet_5_5_has_no_minimal")]
+    #[test_case("anthropic/claude-haiku-5-5", &["low", "medium", "high", "xhigh", "max"] ; "haiku_5_5_has_no_minimal")]
     #[test_case("anthropic/claude-opus-5",   &["low", "medium", "high", "xhigh", "max"] ; "opus_5_has_no_minimal")]
     #[test_case("anthropic/claude-opus-4-5", &["low", "medium", "high"]                 ; "opus_4_5_stops_at_high")]
     #[test_case("anthropic/claude-sonnet-4-5", &["high", "max"]                         ; "budget_only_model_gets_two_steps")]
@@ -1455,6 +1486,7 @@ mod tests {
     /// snapping it to a level, and the version decides how it is said.
     #[test_case("anthropic/claude-sonnet-5", json!({"type": "disabled"}) ; "sonnet_5_says_disabled")]
     #[test_case("anthropic/claude-sonnet-5-5", json!({"type": "between_tools"}) ; "sonnet_5_5_says_between_tools")]
+    #[test_case("anthropic/claude-haiku-5-5", json!({"type": "disabled"}) ; "haiku_5_5_says_disabled")]
     fn thinking_off_reaches_the_wire_as_the_model_spells_it(spec: &str, expected: Value) {
         let model = Model::from_spec(spec).unwrap();
         let body = super::request_body(&model, &[], None, "", &json!([]), &ThinkingConfig::Off);
@@ -1514,7 +1546,9 @@ mod tests {
     #[test_case("anthropic/claude-opus-4-5", NARROW_CONTEXT_WINDOW,   false ; "opus_4_5_stays_narrow")]
     #[test_case("anthropic/claude-sonnet-4-5", NARROW_CONTEXT_WINDOW, false ; "sonnet_4_5_stays_narrow")]
     #[test_case("anthropic/claude-haiku-4-5", NARROW_CONTEXT_WINDOW,  false ; "haiku_4_5_stays_narrow")]
+    #[test_case("anthropic/claude-haiku-5-5", WIDE_CONTEXT_WINDOW,    true  ; "haiku_5_5_is_wide")]
     #[test_case("anthropic/claude-opus-5-1m", LONG_CONTEXT_WINDOW,    false ; "suffix_still_opts_into_the_ceiling")]
+    #[test_case("anthropic/claude-haiku-5-5-1m", LONG_CONTEXT_WINDOW, false ; "haiku_5_5_suffix_opts_into_the_ceiling")]
     // Only this table declares input budgets. An OpenAI entry at the same number
     // is an API total, and a rule that read the resolved window rather than its
     // source would have reserved the wrong share of it.

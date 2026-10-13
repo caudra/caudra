@@ -2151,12 +2151,14 @@ data: {\"type\":\"content_block_stop\"}\n";
         assert!(body.get("speed").is_none());
     }
 
-    /// `between_tools` and budgets reject a binding, and a binding without its
-    /// beta header is a 400.
+    /// `between_tools`, `disabled` and budgets take no binding, and a binding
+    /// without its beta header is a 400.
     #[test_case(resolve_auth_from_key(CREDENTIAL, None), AuthMode::ApiKey, "anthropic/claude-sonnet-5-5", ThinkingConfig::Adaptive, true ; "adaptive_sonnet_5_5_binds")]
     #[test_case(oauth_auth(), AuthMode::ClaudeOauth, "anthropic/claude-opus-5-5", ThinkingConfig::Adaptive, true ; "adaptive_opus_5_5_binds_on_a_subscription")]
     #[test_case(resolve_auth_from_key(CREDENTIAL, None), AuthMode::ApiKey, "anthropic/claude-sonnet-5-5", ThinkingConfig::Off, false ; "between_tools_takes_no_binding")]
     #[test_case(resolve_auth_from_key(CREDENTIAL, None), AuthMode::ApiKey, "anthropic/claude-sonnet-4-5", ThinkingConfig::Budget(THINKING_BUDGET), false ; "a_budget_takes_no_binding")]
+    #[test_case(resolve_auth_from_key(CREDENTIAL, None), AuthMode::ApiKey, "anthropic/claude-haiku-5-5", ThinkingConfig::Adaptive, true ; "adaptive_haiku_5_5_binds")]
+    #[test_case(resolve_auth_from_key(CREDENTIAL, None), AuthMode::ApiKey, "anthropic/claude-haiku-5-5", ThinkingConfig::Off, false ; "disabled_takes_no_binding")]
     fn only_adaptive_thinking_binds_its_blocks(
         resolved: ResolvedAuth,
         mode: AuthMode,

@@ -1067,10 +1067,12 @@ pub const THINKING_USAGE: &str = "Usage: /thinking [off|adaptive|<effort level>|
 /// uses it from 4.7 onward.
 const ADAPTIVE_SINCE: (u32, u32) = (4, 7);
 const EARLY_ADAPTIVE_VERSION: (u32, u32) = (4, 6);
-/// From Sonnet 5 a request without a `thinking` field reasons, so off has to
-/// be said. Sonnet 5.5 rejects `disabled` and names `between_tools`, which
-/// keeps up-front thinking off, as its lowest setting.
+/// From Sonnet 5 and Haiku 5.5 a request without a `thinking` field reasons,
+/// so off has to be said. Sonnet 5.5 rejects `disabled` and names
+/// `between_tools`, which keeps up-front thinking off, as its lowest setting;
+/// Haiku 5.5 takes `disabled`.
 const SONNET_REASONS_UNASKED_SINCE: (u32, u32) = (5, 0);
+const HAIKU_REASONS_UNASKED_SINCE: (u32, u32) = (5, 5);
 const BETWEEN_TOOLS_SINCE: (u32, u32) = (5, 5);
 /// Read back by the Anthropic provider, which binds only adaptive thinking.
 pub(crate) const THINKING_ADAPTIVE: &str = "adaptive";
@@ -1078,6 +1080,7 @@ const THINKING_DISABLED: &str = "disabled";
 const THINKING_BETWEEN_TOOLS: &str = "between_tools";
 const OPUS: &str = "opus";
 const SONNET: &str = "sonnet";
+const HAIKU: &str = "haiku";
 
 /// `claude-opus-4.7` -> `("opus", (4, 7))`, `claude-opus-5-1m` -> `("opus", (5, 0))`.
 /// Copilot writes the version with a dot, hence the two separators. Legacy ids
@@ -1386,13 +1389,14 @@ impl ThinkingConfig {
         claude_version(model_id).is_some_and(|(_, version)| version >= ADAPTIVE_SINCE)
     }
 
-    /// Off for a model that reasons when the field is absent. Only Sonnet
-    /// offers off at all: Opus and Fable declare no toggle, so their off
+    /// Off for a model that reasons when the field is absent. Only Sonnet and
+    /// Haiku offer off at all: Opus and Fable declare no toggle, so their off
     /// resolves to the shallowest effort instead.
     fn explicit_off(model_id: &str) -> Option<&'static str> {
         match claude_version(model_id)? {
             (SONNET, version) if version >= BETWEEN_TOOLS_SINCE => Some(THINKING_BETWEEN_TOOLS),
             (SONNET, version) if version >= SONNET_REASONS_UNASKED_SINCE => Some(THINKING_DISABLED),
+            (HAIKU, version) if version >= HAIKU_REASONS_UNASKED_SINCE => Some(THINKING_DISABLED),
             _ => None,
         }
     }
@@ -2162,6 +2166,11 @@ mod tests {
     #[test_case(ThinkingConfig::Off, "claude-sonnet-5-5", json!({"thinking": {"type": "between_tools"}}) ; "sonnet_5_5_says_between_tools")]
     #[test_case(ThinkingConfig::Off, "claude-sonnet-5.5", json!({"thinking": {"type": "between_tools"}}) ; "sonnet_5_5_copilot_dotted_id_says_between_tools")]
     #[test_case(effort("high"), "claude-sonnet-5-5", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "sonnet_5_5_effort_stays_adaptive")]
+    #[test_case(ThinkingConfig::Off, "claude-haiku-4-5", json!({}) ; "haiku_4_5_is_off_without_the_field")]
+    #[test_case(ThinkingConfig::Off, "claude-haiku-5-5", json!({"thinking": {"type": "disabled"}}) ; "haiku_5_5_says_disabled")]
+    #[test_case(ThinkingConfig::Off, "claude-haiku-5.5", json!({"thinking": {"type": "disabled"}}) ; "haiku_5_5_copilot_dotted_id_says_disabled")]
+    #[test_case(ThinkingConfig::Off, "claude-haiku-5-5-1m", json!({"thinking": {"type": "disabled"}}) ; "haiku_5_5_long_context_says_disabled")]
+    #[test_case(effort("high"), "claude-haiku-5-5", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "haiku_5_5_effort_stays_adaptive")]
     fn thinking_apply_to_body(config: ThinkingConfig, model_id: &str, expected: Value) {
         let mut body = json!({});
         config.apply_to_body(&mut body, &thinking_model(model_id));

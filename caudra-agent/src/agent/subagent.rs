@@ -1855,7 +1855,7 @@ mod tests {
     const ROUTING_BASE_URL: &str = "http://127.0.0.1:1";
     const ROUTING_TASK: &str = "Rename a variable";
     const ROUTING_BASELINE: &str = "anthropic/claude-sonnet-4-6";
-    const ROUTING_FAST: &str = "anthropic/claude-haiku-4-5";
+    const ROUTING_FAST: &str = "anthropic/claude-haiku-5-5";
     const ROUTING_BASELINE_NAME: &str = "sonnet 4.6";
     const ROUTING_PROFILE: &str = "security";
     const ROUTING_SECRET: &str = "do-not-send-this-value";

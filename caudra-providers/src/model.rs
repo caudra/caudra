@@ -1258,7 +1258,8 @@ mod tests {
     }
 
     #[test_case("zai", "glm-4.5-air", Some(ModelMarker::Small) ; "small_non_default")]
-    #[test_case("anthropic", "claude-haiku-4-5", Some(ModelMarker::Fast) ; "small_default")]
+    #[test_case("anthropic", "claude-haiku-5-5", Some(ModelMarker::Fast) ; "small_default")]
+    #[test_case("anthropic", "claude-haiku-4-5", Some(ModelMarker::Small) ; "superseded_small_default")]
     #[test_case("anthropic", "claude-opus-5-5", Some(ModelMarker::Best) ; "non_small_default")]
     #[test_case("anthropic", "claude-sonnet-4-6", None ; "non_small_non_default")]
     #[test_case(UNCLASSIFIABLE, "llama3", None ; "unknown_facts")]
@@ -1495,7 +1496,7 @@ mod tests {
     #[test_case("openai/gpt-5.6-terra", ModelPurpose::Fast, "openai/gpt-5.6-luna" ; "gpt_5_6_keeps_fast_in_line")]
     #[test_case("openai/gpt-5.6-terra", ModelPurpose::Best, "openai/gpt-5.6-sol" ; "gpt_5_6_keeps_best_in_line")]
     #[test_case("openai/gpt-4.1", ModelPurpose::Best, "openai/gpt-6-astra" ; "an_unlined_anchor_takes_the_provider_default")]
-    #[test_case("anthropic/claude-opus-5-5", ModelPurpose::Fast, "anthropic/claude-haiku-4-5" ; "an_unlined_provider_answers_across_lines")]
+    #[test_case("anthropic/claude-opus-5-5", ModelPurpose::Fast, "anthropic/claude-haiku-5-5" ; "an_unlined_provider_answers_across_lines")]
     fn a_lane_answers_inside_the_anchors_line(
         anchor_spec: &str,
         purpose: ModelPurpose,
@@ -1563,7 +1564,7 @@ mod tests {
     /// No anchor to read a line from, so these are the provider-wide answers:
     /// the first default in table order, which is why the tables are ordered
     /// newest line first.
-    #[test_case("anthropic", ModelPurpose::Fast, "claude-haiku-4-5" ; "anthropic_small")]
+    #[test_case("anthropic", ModelPurpose::Fast, "claude-haiku-5-5" ; "anthropic_small")]
     #[test_case("anthropic", ModelPurpose::Best, "claude-opus-5-5" ; "anthropic_flagship")]
     #[test_case("openai", ModelPurpose::Fast, "gpt-6-luna" ; "openai_small")]
     #[test_case("openai", ModelPurpose::Best, "gpt-6-astra" ; "openai_flagship")]
@@ -1751,6 +1752,33 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(usage.cost(&FAST_RISES, false), usage.cost_at(BASE_RATES));
+    }
+
+    const HAIKU_5_5_LONG_PROMPT: u32 = 100_000;
+    const HAIKU_5_5_BASE_RATES: Rates = (0.10, 0.50, 0.125, 0.01);
+    const HAIKU_5_5_LONG_RATES: Rates = (0.50, 2.50, 0.625, 0.05);
+
+    /// Haiku 5.5 bills a prompt past 100K at five times its base rates, on the
+    /// Anthropic API and through Copilot alike, and a prompt read from cache
+    /// crosses the line as surely as a fresh one.
+    #[test_case("anthropic/claude-haiku-5-5", HAIKU_5_5_LONG_PROMPT, HAIKU_5_5_BASE_RATES     ; "anthropic_at_the_threshold")]
+    #[test_case("anthropic/claude-haiku-5-5", HAIKU_5_5_LONG_PROMPT + 1, HAIKU_5_5_LONG_RATES ; "anthropic_past_the_threshold")]
+    #[test_case("anthropic/claude-haiku-5-5-1m", HAIKU_5_5_LONG_PROMPT + 1, HAIKU_5_5_LONG_RATES ; "anthropic_long_context_past_the_threshold")]
+    #[test_case("copilot/claude-haiku-5.5", HAIKU_5_5_LONG_PROMPT, HAIKU_5_5_BASE_RATES       ; "copilot_at_the_threshold")]
+    #[test_case("copilot/claude-haiku-5.5", HAIKU_5_5_LONG_PROMPT + 1, HAIKU_5_5_LONG_RATES   ; "copilot_past_the_threshold")]
+    fn haiku_5_5_bills_long_prompts_from_the_table(
+        spec: &str,
+        prompt_tokens: u32,
+        expected: Rates,
+    ) {
+        let model = Model::from_spec(spec).unwrap();
+        let usage = TokenUsage {
+            input: 1,
+            output: 1_000,
+            cache_creation: 0,
+            cache_read: prompt_tokens - 1,
+        };
+        assert_eq!(usage.cost(&model.pricing, false), usage.cost_at(expected));
     }
 
     const GPT_6_SOL_SPEC: &str = "openai/gpt-6-sol";
@@ -1980,6 +2008,7 @@ mod tests {
     #[test_case("claude-opus-4-7",  false ; "fast_withdrawn_from_the_table")]
     #[test_case("claude-sonnet-5",  false ; "entry_without_fast_pricing")]
     #[test_case("claude-sonnet-5-5", false ; "sonnet_5_5_sells_no_fast_mode")]
+    #[test_case("claude-haiku-5-5", false ; "haiku_5_5_sells_no_fast_mode")]
     #[test_case("claude-opus-99",   false ; "no_entry_at_all")]
     fn supports_fast_follows_anthropic_table(model_id: &str, expected: bool) {
         let model = Model::from_base(
@@ -1997,6 +2026,9 @@ mod tests {
     #[test_case("claude-opus-5",    (5.00, 25.00, 6.25, 0.50)   ; "opus_5_keeps_its_own")]
     #[test_case("claude-fable-5-1", (10.00, 50.00, 12.50, 0.25) ; "fable_5_1_does_not_inherit_fable_5")]
     #[test_case("claude-fable-5",   (10.00, 50.00, 12.50, 1.00) ; "fable_5_keeps_its_own")]
+    #[test_case("claude-haiku-5-5", (0.10, 0.50, 0.125, 0.01)   ; "haiku_5_5_keeps_its_own")]
+    #[test_case("claude-haiku-5-5-1m", (0.10, 0.50, 0.125, 0.01) ; "haiku_5_5_long_context_keeps_its_base_rates")]
+    #[test_case("claude-sonnet-5-5", (2.00, 10.00, 2.50, 0.10)  ; "sonnet_5_5_reads_cache_at_a_twentieth")]
     fn anthropic_rates_come_from_the_most_specific_prefix(
         model_id: &str,
         expected: (f64, f64, f64, f64),
