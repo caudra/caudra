@@ -16,7 +16,7 @@ use rusqlite::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::sessions::{SessionDatabase, SessionError};
+use crate::sessions::{RuntimeRetry, SessionDatabase, SessionError};
 use crate::{StateClass, StateDir};
 
 pub const MAX_ENTRY_BODY_BYTES: usize = 1024 * 1024;
@@ -45,6 +45,13 @@ const LIVE: &str = "kind = 'note' AND forgotten = 0 AND seq = (SELECT max(newer.
     FROM memory_entries newer WHERE newer.scope = memory_entries.scope \
     AND newer.name = memory_entries.name)";
 const NEXT_SEQ: &str = "SELECT coalesce(max(seq) + 1, 0) FROM memory_entries WHERE scope = ?1";
+const APPEND_OPERATION: &str = "memory journal append";
+const RECONCILE_OPERATION: &str = "memory journal reconcile";
+const FORGET_OPERATION: &str = "memory journal forget";
+const PURGE_OPERATION: &str = "memory journal purge";
+const CLAIM_OPERATION: &str = "memory node claim";
+const STORE_NODE_OPERATION: &str = "memory node store";
+const RELEASE_OPERATION: &str = "memory node release";
 
 /// The body comes last so every other column of a row sits ahead of its
 /// overflow pages.
@@ -385,7 +392,7 @@ impl MemoryJournal {
         effect: impl FnOnce() -> io::Result<()>,
     ) -> Result<Option<u64>, MemoryJournalError> {
         change.validate()?;
-        let transaction = self.begin_write()?;
+        let transaction = self.begin_write(APPEND_OPERATION)?;
         effect()?;
         let seq = record(&transaction, scope, &change, &origin.storage_name())?;
         transaction.commit()?;
@@ -403,7 +410,7 @@ impl MemoryJournal {
     ) -> Result<Vec<u64>, MemoryJournalError> {
         changes.iter().try_for_each(JournalChange::validate)?;
         let origin = origin.storage_name();
-        let transaction = self.begin_write()?;
+        let transaction = self.begin_write(RECONCILE_OPERATION)?;
         let mut appended = Vec::new();
         for change in changes {
             appended.extend(record(&transaction, scope, change, &origin)?);
@@ -424,7 +431,8 @@ impl MemoryJournal {
         now_ms: i64,
         lease_ms: i64,
     ) -> Result<bool, MemoryJournalError> {
-        let claimed = self.connection().execute(
+        let claimed = self.write_one(
+            CLAIM_OPERATION,
             "INSERT INTO memory_nodes (scope, level, idx, created_ms, lease_owner, lease_expires_ms) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
              ON CONFLICT(scope, level, idx) DO UPDATE SET created_ms = excluded.created_ms, \
@@ -464,7 +472,8 @@ impl MemoryJournal {
                 bytes: text.len(),
             });
         }
-        let stored = self.connection().execute(
+        let stored = self.write_one(
+            STORE_NODE_OPERATION,
             "UPDATE memory_nodes SET text = ?5, model = ?6, created_ms = ?7, lease_owner = NULL, \
              lease_expires_ms = NULL \
              WHERE scope = ?1 AND level = ?2 AND idx = ?3 AND text IS NULL AND lease_owner = ?4",
@@ -489,7 +498,8 @@ impl MemoryJournal {
         index: u64,
         owner: &str,
     ) -> Result<(), MemoryJournalError> {
-        self.connection().execute(
+        self.write_one(
+            RELEASE_OPERATION,
             "DELETE FROM memory_nodes \
              WHERE scope = ?1 AND level = ?2 AND idx = ?3 AND text IS NULL AND lease_owner = ?4",
             params![scope, level, sql_integer(index, INDEX_FIELD)?, owner],
@@ -509,7 +519,7 @@ impl MemoryJournal {
         name: &str,
         effect: impl FnOnce() -> io::Result<()>,
     ) -> Result<ForgetReport, MemoryJournalError> {
-        let transaction = self.begin_write()?;
+        let transaction = self.begin_write(FORGET_OPERATION)?;
         effect()?;
         let nodes = transaction.execute(
             "DELETE FROM memory_nodes WHERE scope = ?1 AND idx >= \
@@ -528,7 +538,7 @@ impl MemoryJournal {
     /// Deletes the scope's whole journal and tree. Returns how many entries
     /// went.
     pub fn purge(&self, scope: &str) -> Result<u64, MemoryJournalError> {
-        let transaction = self.begin_write()?;
+        let transaction = self.begin_write(PURGE_OPERATION)?;
         let entries =
             transaction.execute("DELETE FROM memory_entries WHERE scope = ?1", [scope])?;
         transaction.execute("DELETE FROM memory_nodes WHERE scope = ?1", [scope])?;
@@ -540,11 +550,29 @@ impl MemoryJournal {
         self.database.connection()
     }
 
-    fn begin_write(&self) -> Result<Transaction<'_>, MemoryJournalError> {
-        Ok(Transaction::new_unchecked(
-            self.connection(),
-            TransactionBehavior::Immediate,
-        )?)
+    /// Takes the write lock, waiting out other writers for the runtime
+    /// contention budget rather than a single busy timeout. Only taking the
+    /// lock is retried, so an effect run inside the transaction runs once.
+    fn begin_write(&self, operation: &'static str) -> Result<Transaction<'_>, MemoryJournalError> {
+        let retry = RuntimeRetry::new(None, &|| false);
+        Ok(retry.run(operation, || {
+            Ok(Transaction::new_unchecked(
+                self.connection(),
+                TransactionBehavior::Immediate,
+            )?)
+        })?)
+    }
+
+    fn write_one(
+        &self,
+        operation: &'static str,
+        sql: &str,
+        params: impl Params,
+    ) -> Result<usize, MemoryJournalError> {
+        let transaction = self.begin_write(operation)?;
+        let changed = transaction.execute(sql, params)?;
+        transaction.commit()?;
+        Ok(changed)
     }
 
     fn query_rows<T, C: FromIterator<T>>(
@@ -655,15 +683,18 @@ fn row_u64(row: &Row<'_>, column: usize, field: &'static str) -> Result<u64, Mem
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashMap;
     use std::io;
+    use std::sync::Mutex;
+    use std::sync::mpsc::{Sender, channel};
     use std::thread;
 
     use tempfile::{TempDir, tempdir};
     use test_case::test_case;
 
     use super::{
-        Entry, EntryKind, EntryMeta, EntryOrigin, ForgetReport, JournalChange,
+        APPEND_OPERATION, Entry, EntryKind, EntryMeta, EntryOrigin, ForgetReport, JournalChange,
         MAX_ENTRY_BODY_BYTES, MAX_HEADING_BYTES, MAX_NODE_TEXT_BYTES, MemoryJournal,
         MemoryJournalError, StoredNode, body_hash, heading,
     };
@@ -692,6 +723,7 @@ mod tests {
     const MISSING_SEQ: u64 = 99;
     const WRITERS: u64 = 4;
     const NOTES_PER_WRITER: u64 = 8;
+    static RELEASE_HOLDER: Mutex<Option<Sender<()>>> = Mutex::new(None);
 
     fn fixture() -> (TempDir, StateDir, MemoryJournal) {
         let root = tempdir().unwrap();
@@ -1137,6 +1169,47 @@ mod tests {
         assert!(journal.nodes(SCOPE).unwrap().is_empty());
         assert_eq!(journal.len(OTHER_SCOPE).unwrap(), 1);
         assert_eq!(node_keys(&journal, OTHER_SCOPE), [(0, 0)]);
+    }
+
+    /// Gives up on the lock at once, as an expired busy timeout would, and
+    /// lets the other writer finish.
+    fn release_holder_and_give_up(_attempts: i32) -> bool {
+        if let Some(release) = RELEASE_HOLDER.lock().unwrap().take() {
+            release.send(()).unwrap();
+        }
+        false
+    }
+
+    #[test]
+    fn a_write_outlasts_a_busy_timeout_and_runs_its_effect_once() {
+        let (_root, state, journal) = fixture();
+        let (release, released) = channel();
+        let (locked, holding) = channel();
+        *RELEASE_HOLDER.lock().unwrap() = Some(release);
+        let holder = thread::spawn(move || {
+            let holder = MemoryJournal::open(&state).unwrap();
+            let transaction = holder.begin_write(APPEND_OPERATION).unwrap();
+            locked.send(()).unwrap();
+            released.recv().unwrap();
+            transaction.commit().unwrap();
+        });
+        holding.recv().unwrap();
+        journal
+            .connection()
+            .busy_handler(Some(release_holder_and_give_up))
+            .unwrap();
+        let effects = Cell::new(0);
+
+        let seq = journal
+            .append(SCOPE, note(NAME, BODY), &origin(), || {
+                effects.set(effects.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+
+        holder.join().unwrap();
+        assert_eq!(seq, Some(0));
+        assert_eq!(effects.get(), 1);
     }
 
     #[test_case("# Build\n\nRun make.", "Build"; "markdown_heading")]
