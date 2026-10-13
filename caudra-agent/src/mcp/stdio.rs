@@ -27,9 +27,7 @@ use super::error::McpError;
 use super::inbound::Inbound;
 use super::listen;
 use super::message::{self, Message, RequestId, Response};
-use super::protocol::{
-    JsonRpcNotification, JsonRpcRequest, LISTEN_METHOD, ServerCapabilities,
-};
+use super::protocol::{JsonRpcNotification, JsonRpcRequest, LISTEN_METHOD, ServerCapabilities};
 use super::transport::{BoxFuture, McpTransport};
 use crate::ChildGuard;
 

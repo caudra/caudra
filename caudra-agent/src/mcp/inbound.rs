@@ -571,8 +571,16 @@ mod tests {
             SUBSCRIPTION_ID,
             json!({NOTIFICATIONS_KEY: {TOOLS_LIST_CHANGED_FILTER: true, PROMPTS_LIST_CHANGED_FILTER: false}}),
         ));
-        inbound.notify(on_subscription(PROMPTS_CHANGED, SUBSCRIPTION_ID + 1, json!({})));
-        inbound.notify(on_subscription(PROMPTS_CHANGED, SUBSCRIPTION_ID + 2, json!({})));
+        inbound.notify(on_subscription(
+            PROMPTS_CHANGED,
+            SUBSCRIPTION_ID + 1,
+            json!({}),
+        ));
+        inbound.notify(on_subscription(
+            PROMPTS_CHANGED,
+            SUBSCRIPTION_ID + 2,
+            json!({}),
+        ));
         inbound.notify(on_subscription(TOOLS_CHANGED, SUBSCRIPTION_ID, json!({})));
         assert_eq!(inbound.granted(), HashSet::from([ListKind::Tools]));
         assert_eq!(changes.try_iter().collect::<Vec<_>>(), [ListKind::Tools]);
