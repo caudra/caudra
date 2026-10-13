@@ -24444,6 +24444,75 @@ fn alt_gr_is_text_not_the_leader() {
     assert!(!app.which_key.is_armed());
 }
 
+/// Wide enough that the panel lays its chords out in columns and none of the
+/// ones these tests click is cut off.
+const CHORD_PANEL_WIDTH: u16 = 200;
+const CHORD_NOT_CLICKED: &str = "a click on a listed chord must run it as its key would";
+const CHORD_NOT_LISTED: &str = "the panel must list the chord the test clicks";
+
+fn arm_visible_leader(app: &mut App) {
+    app.which_key = crate::components::which_key::WhichKey::new(Duration::ZERO);
+    assert!(app.update(Msg::Key(kb::LEADER.to_key_event())).is_empty());
+    rendered_wide(app, CHORD_PANEL_WIDTH);
+}
+
+fn click(app: &mut App, at: Rect) -> Vec<Action> {
+    let mut actions = app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        at.x,
+        at.y,
+    ));
+    actions.extend(app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        at.x,
+        at.y,
+    )));
+    actions
+}
+
+#[test]
+fn clicking_a_listed_chord_runs_it() {
+    let mut app = test_app();
+    arm_visible_leader(&mut app);
+    let hit = app.which_key.hit(chord::MODEL_PICKER.to_key_event());
+    assert_ne!(hit, Rect::default(), "{CHORD_NOT_LISTED}");
+
+    click(&mut app, hit);
+
+    assert!(app.model_picker.is_open(), "{CHORD_NOT_CLICKED}");
+    assert!(!app.which_key.is_armed(), "{LEADER_STAYS_ARMED}");
+    assert_eq!(app.input_box.buffer.value(), "", "{CHORD_LEAKED}");
+}
+
+#[test]
+fn a_press_outside_the_panel_cancels_the_chord_silently() {
+    let mut app = test_app();
+    arm_visible_leader(&mut app);
+
+    let actions = click(&mut app, Rect::default());
+
+    assert!(actions.is_empty());
+    assert!(!app.which_key.is_armed(), "{LEADER_STAYS_ARMED}");
+    assert!(!app.any_overlay_open());
+    assert_eq!(app.input_box.buffer.value(), "", "{CHORD_LEAKED}");
+    assert_eq!(app.status_bar.flash_text(), None);
+}
+
+/// The workbench answers the pointer before every overlay but the leader, so
+/// the click proves the panel is asked first.
+#[test]
+fn clicking_a_chord_over_the_workbench_runs_it() {
+    let mut app = open_workbench();
+    arm_visible_leader(&mut app);
+    let hit = app.which_key.hit(chord::WORKBENCH.to_key_event());
+    assert_ne!(hit, Rect::default(), "{CHORD_NOT_LISTED}");
+
+    click(&mut app, hit);
+
+    assert!(!app.workbench.is_open(), "{CHORD_NOT_CLICKED}");
+    assert!(!app.which_key.is_armed(), "{LEADER_STAYS_ARMED}");
+}
+
 const PAN_CHART: &str = "```mermaid\nflowchart LR\n  A[Ingest events] --> B[Normalise schema] --> C[Enrich metadata] --> D[Write store]\n```";
 const CURSOR_PROBE: &str = "abc";
 

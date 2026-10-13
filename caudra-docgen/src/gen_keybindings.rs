@@ -101,7 +101,8 @@ fn write_leader(out: &mut String) {
         "`{}` is the leader. It acts as a prefix: press it, then press the \
          chord's second key. Nothing happens until that second key arrives, \
          and `Esc` cancels. Hold the leader for a moment and a panel lists \
-         every chord available where you are.\n\n",
+         every chord available where you are. Click a chord in the panel to \
+         run it, or click anywhere else to cancel, as `Esc` does.\n\n",
         LEADER_PREFIX
     ));
     out.push_str(

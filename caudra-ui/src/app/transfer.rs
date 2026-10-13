@@ -24,7 +24,7 @@ use caudra_workbench::{
 };
 use caudra_workcell::TransferReport;
 use caudra_workspace::{OperationId, TransferDigest, WorkspacePath};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseEvent};
 
 use super::{Action, App, Msg, sandbox::attached_sandbox_instance};
 use crate::components::{
@@ -488,7 +488,7 @@ impl App {
                 self.transfer_keyboard(event, Some(text.as_deref()))
             }
             Msg::Key(event) => self.transfer_keyboard(event, None),
-            Msg::Mouse(event) => self.workbench.handle_mouse(event),
+            Msg::Mouse(event) => self.transfer_mouse(event),
             Msg::Paste(text) => {
                 self.workbench.paste(&text);
                 WorkbenchAction::Consumed
@@ -538,6 +538,17 @@ impl App {
             return WorkbenchAction::Consumed;
         };
         self.workbench.handle_key(event)
+    }
+
+    fn transfer_mouse(&mut self, event: MouseEvent) -> WorkbenchAction {
+        if !self.which_key.is_armed() {
+            return self.workbench.handle_mouse(event);
+        }
+        self.which_key
+            .handle_mouse(event)
+            .map_or(WorkbenchAction::Consumed, |chord| {
+                self.workbench_leader(chord)
+            })
     }
 }
 
@@ -871,7 +882,9 @@ mod tests {
     use caudra_workspace::{
         ResourceId, ResourceRevision, TransferContent, TransferMode, WorkspacePath,
     };
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use serde_json::json;
     use std::{env, fs, path::PathBuf, sync::Arc, time::Duration};
     use test_case::test_case;
@@ -975,6 +988,22 @@ mod tests {
                 generation: app.workbench.transfer_generation(),
             })
         );
+    }
+
+    #[test]
+    fn a_press_off_the_panel_cancels_a_transfer_chord() {
+        let mut app = attached();
+        assert!(app.workbench.open_transfer());
+        app.which_key.arm();
+        let action = app.transfer_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(action, WorkbenchAction::Consumed);
+        assert!(!app.which_key.is_armed());
+        assert!(app.workbench.transfer_input_active());
     }
 
     #[test]

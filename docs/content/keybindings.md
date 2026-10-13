@@ -3,7 +3,7 @@ title: "Keybindings"
 description: "Defaults, precedence, rebinding from Lua."
 ---
 
-`Ctrl+X` is the leader. It acts as a prefix: press it, then press the chord's second key. Nothing happens until that second key arrives, and `Esc` cancels. Hold the leader for a moment and a panel lists every chord available where you are.
+`Ctrl+X` is the leader. It acts as a prefix: press it, then press the chord's second key. Nothing happens until that second key arrives, and `Esc` cancels. Hold the leader for a moment and a panel lists every chord available where you are. Click a chord in the panel to run it, or click anywhere else to cancel, as `Esc` does.
 
 Leader chords are written as two keys below, and every one of them is reachable on any terminal: Caudra ships no `Alt` defaults, because macOS routes Option through the input method and never reports it as Alt.
 

@@ -47,6 +47,9 @@ impl App {
     /// What the pointer rests on, asked of the topmost surface alone: a box
     /// for something an overlay covers would explain what cannot be clicked.
     fn tooltip_candidate(&self) -> Option<Tip> {
+        if self.leader_holds_pointer() {
+            return None;
+        }
         let open = self
             .overlays()
             .into_iter()

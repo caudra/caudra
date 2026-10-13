@@ -352,9 +352,11 @@ pub mod leader {
     pub const COPY_MESSAGE: Bind = leader_bind!('y');
     pub const HELP: Bind = leader_bind!('?');
 
-    /// Every global chord, in the order the which-key panel lists them.
+    /// Every global chord, which is what a click on a which-key cell can
+    /// press. The panel itself lists them in `KEYBINDS` order.
     pub const ALL: &[Bind] = &[
         TASKS,
+        WORKFLOWS,
         SCROLL_BOTTOM,
         EDIT_INPUT,
         FILE_PICKER,
@@ -545,10 +547,12 @@ impl KeyLabel {
 /// How every leader chord label starts.
 pub const LEADER_PREFIX: &str = mod_key!("X");
 
-/// One row of the which-key panel: the key still to press, and what it does.
+/// One row of the which-key panel: the key still to press, what it does, and
+/// the key event a click on the row stands in for.
 pub struct LeaderChord {
     pub key: &'static str,
     pub description: &'static str,
+    pub press: KeyEvent,
 }
 
 fn leader_suffix(label: &'static str) -> Option<&'static str> {
@@ -556,6 +560,17 @@ fn leader_suffix(label: &'static str) -> Option<&'static str> {
         .strip_prefix(LEADER_PREFIX)?
         .strip_prefix(' ')
         .filter(|suffix| !suffix.is_empty())
+}
+
+/// The second key a chord label spells, looked up by the label itself so a
+/// click presses exactly the bind the label was written from.
+fn leader_press(label: &str) -> Option<KeyEvent> {
+    leader::ALL
+        .iter()
+        .copied()
+        .chain(wb::LEADER_BINDS.iter().copied().map(Bind::from_workbench))
+        .find(|bind| bind.label == label)
+        .map(Bind::to_key_event)
 }
 
 /// Every chord the leader still reaches from `contexts`, read back out of
@@ -566,10 +581,14 @@ pub fn leader_chords(contexts: &[KeybindContext], features: FeatureFlags) -> Vec
         .iter()
         .filter(|kb| kb.is_visible(features) && contexts.contains(&kb.context))
         .filter_map(|kb| {
-            let key = kb.label.parts().find_map(leader_suffix)?;
+            let label = kb
+                .label
+                .parts()
+                .find(|part| leader_suffix(part).is_some())?;
             Some(LeaderChord {
-                key,
+                key: leader_suffix(label)?,
                 description: kb.description,
+                press: leader_press(label)?,
             })
         })
         .collect()
@@ -2064,6 +2083,8 @@ mod tests {
         "tmux keeps this chord for its prefix, so inside tmux it never arrives";
     const CHORD_COLLISION: &str = "two leader chords in one context answer the same second key";
     const LEADER_DRIFT: &str = "the workbench and the host must spend the same key on the prefix";
+    const UNPRESSABLE_CHORD: &str =
+        "a listed chord must name a bind a click can press, or the panel drops it";
     const SANDBOX_KEY_SHADOWS_EDIT: &str =
         "a sandbox form key runs before the focused field and would shadow this edit";
 
@@ -2189,6 +2210,19 @@ mod tests {
             "{LEADER_DRIFT}"
         );
         assert_eq!(wb::LEADER_LABEL, LEADER_PREFIX, "{LEADER_DRIFT}");
+    }
+
+    #[test]
+    fn every_chord_the_panel_lists_can_be_pressed() {
+        for kb in KEYBINDS {
+            for part in kb
+                .label
+                .parts()
+                .filter(|part| leader_suffix(part).is_some())
+            {
+                assert!(leader_press(part).is_some(), "{UNPRESSABLE_CHORD}: {part}");
+            }
+        }
     }
 
     #[test]

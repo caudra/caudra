@@ -90,6 +90,15 @@ impl App {
         if let Some(actions) = self.handle_grab_mouse(event) {
             return actions;
         }
+        // Where the keyboard checks the leader too: a pending chord owns the
+        // pointer as it owns the next key, over the workbench and every picker.
+        if self.leader_holds_pointer() {
+            self.clear_control_hovers();
+            return match self.which_key.handle_mouse(event) {
+                Some(chord) => self.resolve_leader(chord),
+                None => Vec::new(),
+            };
+        }
         if self.permissions_picker.is_open() && self.permissions_picker.editor_mut().is_some() {
             self.clear_control_hovers();
             if self.permission_mutation_pending() {
@@ -1509,6 +1518,12 @@ impl App {
             &self.selection_state,
             Some(SelectionState::Dragging { sel, .. }) if !sel.is_empty()
         )
+    }
+
+    /// A pending chord takes the pointer unless a permission prompt holds
+    /// input, the same order the keyboard asks them in.
+    pub(super) fn leader_holds_pointer(&self) -> bool {
+        self.which_key.is_armed() && !self.permission_prompt_holds_input()
     }
 
     pub(super) fn clear_control_hovers(&mut self) {
