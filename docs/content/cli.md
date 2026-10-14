@@ -493,7 +493,7 @@ caudra update --show-script
 caudra rollback
 ```
 
-`update` checks GitHub directly, bypassing the background cache and its opt-out. It reads `ui.update_channel` from your global config unless `--channel` overrides it. Missing or broken config falls back to `auto`, so configuration errors do not prevent recovery. Project settings are not loaded by this command. The UI notice includes an explicit channel when offering an update.
+`update` checks GitHub directly, bypassing the background cache and its opt-out. It reads `ui.update_channel` from your global config unless `--channel` overrides it. Missing or broken config falls back to `auto`, so configuration errors do not prevent recovery. Project settings are not loaded by this command. The UI notice includes an explicit channel when offering an update. Both checks send `GITHUB_TOKEN`, or `GH_TOKEN` when that is unset or empty, to the GitHub API, the same as the installer, so a network that shares one public IP is not held to GitHub's unauthenticated rate limit.
 
 `auto` follows stable releases from a stable build and both previews and stable releases from a preview build. After installing a final release, `auto` follows stable releases. Choose `preview` explicitly to keep receiving previews of future versions. `stable` never selects a prerelease. Ordinary updates never downgrade.
 

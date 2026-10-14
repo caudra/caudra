@@ -109,6 +109,8 @@ def main():
         log.write(json.dumps(args) + "\n")
     status, content = response(uri, scenario)
     if status >= 400 or status == 0:
+        if "-w" in args:
+            print(f"{status:03d}", end="")
         sys.exit(22 if status else 28)
     Path(args[args.index("-o") + 1]).write_bytes(content)
     if "-w" in args:

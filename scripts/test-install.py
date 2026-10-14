@@ -17,6 +17,7 @@ from pathlib import Path
 INSTALLER = Path(__file__).resolve().parents[1] / "install.sh"
 HTTP_HELPER = Path(__file__).with_name("test-install-http.py")
 POWERSHELL = shutil.which("pwsh") or shutil.which("powershell")
+TOKEN_HINT = "Set GITHUB_TOKEN or GH_TOKEN and retry"
 OLD_BINARY = b"previous executable"
 NEW_BINARY = b"replacement executable"
 OLD_MANIFEST = b'{"schema_version":1,"previous":true}\n'
@@ -169,6 +170,22 @@ class ReleaseCases(unittest.TestCase):
                 result = self.install([])
                 self.assertNotEqual(result.returncode, 0)
                 self.assert_previous_installation()
+
+    def test_rate_limit_suggests_a_token_only_when_anonymous(self):
+        for status, token, hinted in [
+            (403, None, True),
+            (429, None, True),
+            (403, "fixture-token", False),
+            (404, None, False),
+        ]:
+            with self.subTest(status=status, token=token):
+                self.env.pop("GITHUB_TOKEN", None)
+                if token:
+                    self.env["GITHUB_TOKEN"] = token
+                self.scenario["pages"] = [{"http_status": status}]
+                result = self.install([])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(TOKEN_HINT in result.stderr, hinted, result.stderr)
 
     def test_explicit_tag_lookup_never_substitutes_another_release(self):
         self.seed_installation()

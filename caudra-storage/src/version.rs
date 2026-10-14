@@ -1,16 +1,22 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
-use std::env::consts::{ARCH, OS};
+use std::env::{
+    self,
+    consts::{ARCH, OS},
+};
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use isahc::Request;
 use isahc::config::{Configurable, VersionNegotiation};
+use isahc::http::header::AUTHORIZATION;
+use isahc::http::{HeaderValue, StatusCode};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +41,8 @@ const CHECKSUM_ASSET: &str = "sha256sums.txt";
 const UNIX_INSTALLER: &str = "install.sh";
 const WINDOWS_INSTALLER: &str = "install.ps1";
 const UPLOADED: &str = "uploaded";
+const TOKEN_VARIABLES: [&str; 2] = ["GITHUB_TOKEN", "GH_TOKEN"];
+const CURL_HEADERS_FROM_STDIN: &str = "@-";
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -120,6 +128,12 @@ pub enum VersionError {
     Io(#[from] io::Error),
     #[error("server returned HTTP {0}")]
     Status(u16),
+    #[error(
+        "GitHub refused the release check with HTTP {0}; its unauthenticated API quota may be used up. Set GITHUB_TOKEN or GH_TOKEN and retry"
+    )]
+    RateLimited(u16),
+    #[error("{0} is not usable as a GitHub token")]
+    InvalidToken(&'static str),
     #[error("invalid response: {0}")]
     InvalidResponse(&'static str),
     #[error("JSON parse error: {0}")]
@@ -312,19 +326,52 @@ fn read_bounded(reader: impl Read, limit: usize) -> Result<Vec<u8>, VersionError
     Ok(bytes)
 }
 
+/// The first of `GITHUB_TOKEN` and `GH_TOKEN` that is set and not empty, the
+/// order the installers use. A token that cannot be sent fails the check
+/// rather than silently going unauthenticated.
+fn github_authorization(
+    variable: impl Fn(&str) -> Option<OsString>,
+) -> Result<Option<HeaderValue>, VersionError> {
+    let Some((name, token)) = TOKEN_VARIABLES.into_iter().find_map(|name| {
+        variable(name)
+            .filter(|token| !token.is_empty())
+            .map(|token| (name, token))
+    }) else {
+        return Ok(None);
+    };
+    let mut header = token
+        .to_str()
+        .and_then(|token| HeaderValue::from_str(&format!("Bearer {token}")).ok())
+        .ok_or(VersionError::InvalidToken(name))?;
+    header.set_sensitive(true);
+    Ok(Some(header))
+}
+
+fn status_error(status: StatusCode, authorized: bool) -> VersionError {
+    match status {
+        StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS if !authorized => {
+            VersionError::RateLimited(status.as_u16())
+        }
+        _ => VersionError::Status(status.as_u16()),
+    }
+}
+
 fn fetch_page(
     client: &isahc::HttpClient,
     url: &str,
     timeout: Duration,
+    authorization: Option<&HeaderValue>,
 ) -> Result<Vec<u8>, VersionError> {
-    let request = Request::get(url)
+    let mut request = Request::get(url)
         .header("Accept", "application/vnd.github+json")
         .header("User-Agent", "caudra")
-        .timeout(timeout.min(REQUEST_TIMEOUT))
-        .body(())?;
-    let response = client.send(request)?;
+        .timeout(timeout.min(REQUEST_TIMEOUT));
+    if let Some(authorization) = authorization {
+        request = request.header(AUTHORIZATION, authorization);
+    }
+    let response = client.send(request.body(())?)?;
     if !response.status().is_success() {
-        return Err(VersionError::Status(response.status().as_u16()));
+        return Err(status_error(response.status(), authorization.is_some()));
     }
     read_bounded(response.into_body(), MAX_RESPONSE_BYTES)
 }
@@ -332,6 +379,7 @@ fn fetch_page(
 pub fn fetch_release(channel: UpdateChannel) -> Result<Release, VersionError> {
     let channel = channel.resolve()?;
     let target = current_target()?;
+    let authorization = github_authorization(|name| env::var_os(name))?;
     let started = Instant::now();
     let client = isahc::HttpClient::builder()
         .connect_timeout(CONNECT_TIMEOUT)
@@ -340,11 +388,17 @@ pub fn fetch_release(channel: UpdateChannel) -> Result<Release, VersionError> {
         .build()?;
     let release = discover(channel, target, |page| {
         let url = format!("{RELEASES_URL}?per_page={PAGE_SIZE}&page={page}");
-        fetch_page(&client, &url, remaining(started)?).or_else(|error| {
+        let authorization = authorization.as_ref();
+        fetch_page(&client, &url, remaining(started)?, authorization).or_else(|error| {
             if !matches!(error, VersionError::Http(_)) {
                 return Err(error);
             }
-            curl_fetch_bounded(&url, remaining(started)?.min(REQUEST_TIMEOUT)).map_err(|_| error)
+            curl_fetch_bounded(
+                &url,
+                remaining(started)?.min(REQUEST_TIMEOUT),
+                authorization,
+            )
+            .map_err(|_| error)
         })
     })?;
     remaining(started)?;
@@ -352,11 +406,14 @@ pub fn fetch_release(channel: UpdateChannel) -> Result<Release, VersionError> {
 }
 
 pub fn curl_fetch(url: &str) -> io::Result<Vec<u8>> {
-    curl_fetch_bounded(url, REQUEST_TIMEOUT)
+    curl_fetch_bounded(url, REQUEST_TIMEOUT, None)
 }
 
-fn curl_fetch_bounded(url: &str, timeout: Duration) -> io::Result<Vec<u8>> {
-    let mut child = Command::new("curl")
+/// An authorized command reads its header from stdin, so the token never
+/// appears in the process list.
+fn curl_command(url: &str, timeout: Duration, authorized: bool) -> Command {
+    let mut command = Command::new("curl");
+    command
         .args([
             "--disable",
             "-fsSL",
@@ -376,12 +433,36 @@ fn curl_fetch_bounded(url: &str, timeout: Duration) -> io::Result<Vec<u8>> {
         .arg("--url")
         .arg(url)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let result = match child.stdout.take() {
-        Some(stdout) => read_bounded(stdout, MAX_RESPONSE_BYTES).map_err(io::Error::other),
-        None => Err(io::Error::other("curl stdout is unavailable")),
-    };
+        .stderr(Stdio::null());
+    if authorized {
+        command
+            .args(["-H", CURL_HEADERS_FROM_STDIN])
+            .stdin(Stdio::piped());
+    }
+    command
+}
+
+fn send_authorization(stdin: Option<ChildStdin>, authorization: &HeaderValue) -> io::Result<()> {
+    let mut stdin = stdin.ok_or_else(|| io::Error::other("curl stdin is unavailable"))?;
+    stdin.write_all(format!("{AUTHORIZATION}: ").as_bytes())?;
+    stdin.write_all(authorization.as_bytes())?;
+    stdin.write_all(b"\n")
+}
+
+fn curl_fetch_bounded(
+    url: &str,
+    timeout: Duration,
+    authorization: Option<&HeaderValue>,
+) -> io::Result<Vec<u8>> {
+    let mut child = curl_command(url, timeout, authorization.is_some()).spawn()?;
+    let result = authorization
+        .map_or(Ok(()), |authorization| {
+            send_authorization(child.stdin.take(), authorization)
+        })
+        .and_then(|()| match child.stdout.take() {
+            Some(stdout) => read_bounded(stdout, MAX_RESPONSE_BYTES).map_err(io::Error::other),
+            None => Err(io::Error::other("curl stdout is unavailable")),
+        });
     if result.is_err() {
         let _ = child.kill();
     }
@@ -506,20 +587,28 @@ fn cached_at(
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::ffi::OsString;
     use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::path::Path;
+    use std::thread;
     use std::time::Instant;
 
+    use isahc::HttpClient;
+    use isahc::config::Configurable;
+    use isahc::http::HeaderValue;
     use serde_json::{Value, json};
     use tempfile::tempdir;
     use test_case::test_case;
 
     use super::{
-        CACHE_SCHEMA, CACHE_TTL, CHECKSUM_ASSET, CacheEntry, DISCOVERY_TIMEOUT, DOWNLOAD_URL,
-        FAILURE_COOLDOWN, LOCK_MODE, Lookup, MAX_CACHE_BYTES, MAX_PAGES, MAX_RESPONSE_BYTES,
-        PAGE_SIZE, Release, UNIX_INSTALLER, UPLOADED, UpdateChannel, VersionError,
-        WINDOWS_INSTALLER, cached_at, discover, is_newer, read_bounded, remaining, tag_version,
-        target_for,
+        CACHE_SCHEMA, CACHE_TTL, CHECKSUM_ASSET, CURL_HEADERS_FROM_STDIN, CacheEntry,
+        DISCOVERY_TIMEOUT, DOWNLOAD_URL, FAILURE_COOLDOWN, LOCK_MODE, Lookup, MAX_CACHE_BYTES,
+        MAX_PAGES, MAX_RESPONSE_BYTES, PAGE_SIZE, RELEASES_URL, REQUEST_TIMEOUT, Release,
+        UNIX_INSTALLER, UPLOADED, UpdateChannel, VersionError, WINDOWS_INSTALLER, cached_at,
+        curl_command, discover, fetch_page, github_authorization, is_newer, read_bounded,
+        remaining, tag_version, target_for,
     };
     use crate::try_exclusive_state_lock;
 
@@ -536,6 +625,62 @@ mod tests {
     const NOW: u64 = 1_800_000_000;
     const PUBLISHED: &str = "2026-01-01T00:00:00Z";
     const UNAVAILABLE: u16 = 503;
+    const TOKEN: &str = "github-token";
+    const FALLBACK_TOKEN: &str = "gh-token";
+    const UNSENDABLE_TOKEN: &str = "github\ntoken";
+    const FORBIDDEN: u16 = 403;
+    const TOO_MANY_REQUESTS: u16 = 429;
+    const OK: u16 = 200;
+    const EMPTY_PAGE: &[u8] = b"[]";
+    const REQUEST_END: &[u8] = b"\r\n\r\n";
+    const AUTHORIZATION_HEADER: &str = "\r\nauthorization:";
+
+    fn environment(variables: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+        let variables: Vec<(String, OsString)> = variables
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), OsString::from(value)))
+            .collect();
+        move |name| {
+            variables
+                .iter()
+                .find(|(variable, _)| variable == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    fn bearer(token: &str) -> HeaderValue {
+        HeaderValue::from_str(&format!("Bearer {token}")).unwrap()
+    }
+
+    /// Serves one request with `status` and an empty release list, returning
+    /// the lowercased request head it received.
+    fn serve_once(
+        status: u16,
+        authorization: Option<&HeaderValue>,
+    ) -> (Result<Vec<u8>, VersionError>, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/releases", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0; 1];
+            while !head.ends_with(REQUEST_END) && stream.read(&mut byte).unwrap() == 1 {
+                head.push(byte[0]);
+            }
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status} X\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            String::from_utf8(head).unwrap().to_lowercase()
+        });
+        let client = HttpClient::builder().proxy(None).build().unwrap();
+        let result = fetch_page(&client, &url, REQUEST_TIMEOUT, authorization);
+        (result, server.join().unwrap())
+    }
 
     fn release() -> Release {
         Release {
@@ -1254,5 +1399,64 @@ mod tests {
         .unwrap();
         assert_eq!(cached, Some(release()), "{FRESH_FAILURE_CLOBBERED}");
         assert_eq!(calls.get(), 0, "{FRESH_FAILURE_CLOBBERED}");
+    }
+
+    #[test_case(&[("GITHUB_TOKEN", TOKEN), ("GH_TOKEN", FALLBACK_TOKEN)], Some(TOKEN); "github_token_wins")]
+    #[test_case(&[("GITHUB_TOKEN", ""), ("GH_TOKEN", FALLBACK_TOKEN)], Some(FALLBACK_TOKEN); "empty_github_token_falls_back")]
+    #[test_case(&[("GH_TOKEN", FALLBACK_TOKEN)], Some(FALLBACK_TOKEN); "gh_token_alone")]
+    #[test_case(&[("GITHUB_TOKEN", ""), ("GH_TOKEN", "")], None; "empty_is_unset")]
+    #[test_case(&[], None; "unset")]
+    fn token_lookup(variables: &[(&str, &str)], expected: Option<&str>) {
+        let header = github_authorization(environment(variables)).unwrap();
+        assert!(header.as_ref().is_none_or(HeaderValue::is_sensitive));
+        assert_eq!(header, expected.map(bearer));
+    }
+
+    #[test_case(&[("GITHUB_TOKEN", UNSENDABLE_TOKEN), ("GH_TOKEN", FALLBACK_TOKEN)], "GITHUB_TOKEN"; "github_token")]
+    #[test_case(&[("GH_TOKEN", UNSENDABLE_TOKEN)], "GH_TOKEN"; "gh_token")]
+    fn unsendable_token_fails_instead_of_going_anonymous(
+        variables: &[(&str, &str)],
+        variable: &str,
+    ) {
+        assert!(matches!(
+            github_authorization(environment(variables)),
+            Err(VersionError::InvalidToken(name)) if name == variable
+        ));
+    }
+
+    #[test_case(Some(TOKEN); "authorized")]
+    #[test_case(None; "anonymous")]
+    fn page_request_sends_the_token_only_when_set(token: Option<&str>) {
+        let authorization = token.map(bearer);
+        let (result, head) = serve_once(OK, authorization.as_ref());
+        assert_eq!(result.unwrap(), EMPTY_PAGE);
+        assert_eq!(head.contains(AUTHORIZATION_HEADER), token.is_some());
+        if let Some(token) = token {
+            assert!(head.contains(&format!("{AUTHORIZATION_HEADER} bearer {token}\r\n")));
+        }
+    }
+
+    #[test_case(FORBIDDEN, false => matches Err(VersionError::RateLimited(FORBIDDEN)); "forbidden_anonymous")]
+    #[test_case(TOO_MANY_REQUESTS, false => matches Err(VersionError::RateLimited(TOO_MANY_REQUESTS)); "too_many_anonymous")]
+    #[test_case(FORBIDDEN, true => matches Err(VersionError::Status(FORBIDDEN)); "forbidden_authorized")]
+    #[test_case(UNAVAILABLE, false => matches Err(VersionError::Status(UNAVAILABLE)); "unavailable_anonymous")]
+    fn refusals_suggest_a_token_only_when_anonymous(
+        status: u16,
+        authorized: bool,
+    ) -> Result<Vec<u8>, VersionError> {
+        let authorization = authorized.then(|| bearer(TOKEN));
+        serve_once(status, authorization.as_ref()).0
+    }
+
+    #[test_case(true; "authorized")]
+    #[test_case(false; "anonymous")]
+    fn curl_reads_headers_from_stdin_only_when_authorized(authorized: bool) {
+        let command = curl_command(RELEASES_URL, REQUEST_TIMEOUT, authorized);
+        let reads_stdin = command
+            .get_args()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|pair| pair == ["-H", CURL_HEADERS_FROM_STDIN]);
+        assert_eq!(reads_stdin, authorized);
     }
 }

@@ -11,11 +11,12 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.9 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.9)
 
-Preview 9 fixes updates on macOS that sat for minutes on the download line and shows download progress while Caudra updates.
+Preview 9 fixes updates on macOS that sat for minutes on the download line, lets update checks use your GitHub token, and shows download progress while Caudra updates.
 
 ### Command line
 
 - **Updates on macOS no longer stall.** Updating a Mac that still had the large license bundle from Preview 1 stayed on `downloading caudra …` for about four minutes. The installer checks the previous bundle before replacing it, and its JSON reader grew slower with every character of that bundle's 2 MB manifest under the `awk` that ships with macOS. It now reads the manifest in under a second, and a fresh install reads the GitHub release list faster too.
+- **Updates use your GitHub token.** `caudra update` and the update notice now send `GITHUB_TOKEN`, or `GH_TOKEN`, when they ask GitHub for releases, the same as the installer. Behind a shared IP that had used up GitHub's unauthenticated quota, they failed with `server returned HTTP 403`. Without a token, that refusal now says to set one, in `caudra update` and in both installers.
 - **Download progress.** The shell installer shows curl's progress bar for the release archive when it runs in a terminal, so updating to Preview 9 shows it already. From Preview 9 on, `caudra update` downloads the archive itself and shows a bar with size, speed, and time left. It checks the archive against the release checksums before it saves your current version, and if the download fails, the installer downloads the archive instead.
 
 ## Caudra 0.2 Preview 8 {#v0-2-0-preview-8}

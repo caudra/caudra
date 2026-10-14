@@ -26,6 +26,16 @@ github_api() {
     fi
 }
 
+github_api_failed() {
+    case "$2" in
+        403|429)
+            [ -n "${GITHUB_TOKEN:-${GH_TOKEN:-}}" ] ||
+                err "$1 returned HTTP $2; GitHub's unauthenticated API quota may be used up. Set GITHUB_TOKEN or GH_TOKEN and retry"
+            ;;
+    esac
+    err "$1 failed"
+}
+
 download() {
     progress=-s
     if [ "${4:-}" = progress ] && [ -t 2 ]; then progress=--progress-bar; fi
@@ -246,7 +256,7 @@ resolve_tag() {
     : > "${tmp}/candidates"
     if [ -n "${tag}" ]; then
         awk -v mode=tag -v tag="${tag}" -f "${tmp}/releases.awk" || err "expected a v-prefixed SemVer tag"
-        status="$(github_api "https://api.github.com/repos/${REPO}/releases/tags/${tag}" -o "${tmp}/page")" || err "release lookup failed"
+        status="$(github_api "https://api.github.com/repos/${REPO}/releases/tags/${tag}" -o "${tmp}/page")" || github_api_failed "release lookup" "${status:-}"
         [ "${status}" = 200 ] || err "release lookup returned HTTP ${status}"
         [ "$(wc -c < "${tmp}/page")" -le 4194304 ] || err "release response too large"
         awk -v mode=single -v tag="${tag}" -v target="${target}" -v extension="${archive_ext}" \
@@ -255,7 +265,7 @@ resolve_tag() {
         page=1
         while :; do
             [ "${page}" -le 10 ] || err "release discovery exceeded 10 pages; refusing incomplete selection"
-            status="$(github_api "https://api.github.com/repos/${REPO}/releases?per_page=100&page=${page}" -o "${tmp}/page")" || err "release discovery failed"
+            status="$(github_api "https://api.github.com/repos/${REPO}/releases?per_page=100&page=${page}" -o "${tmp}/page")" || github_api_failed "release discovery" "${status:-}"
             [ "${status}" = 200 ] || err "release discovery returned HTTP ${status}"
             [ "$(wc -c < "${tmp}/page")" -le 4194304 ] || err "release response too large"
             awk -v target="${target}" -v extension="${archive_ext}" -v installer=install.sh \

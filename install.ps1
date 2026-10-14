@@ -217,6 +217,12 @@ function Open-ReleaseResponse([string]$Uri, [hashtable]$Headers, [int]$TimeoutMi
     return $request.GetResponse()
 }
 
+function Assert-ApiAuthorized([int]$Status, [hashtable]$Headers) {
+    if ($Status -in @(403, 429) -and -not $Headers.ContainsKey('Authorization')) {
+        throw "GitHub refused the release request with HTTP $Status; its unauthenticated API quota may be used up. Set GITHUB_TOKEN or GH_TOKEN and retry"
+    }
+}
+
 function Receive-ReleaseData([string]$Uri, [IO.Stream]$Output, [long]$MaxBytes, [bool]$Api) {
     $headers = @{}
     $timeout = $AssetTimeoutMilliseconds
@@ -236,8 +242,17 @@ function Receive-ReleaseData([string]$Uri, [IO.Stream]$Output, [long]$MaxBytes, 
         }
         $remaining = $timeout - $clock.ElapsedMilliseconds
         if ($remaining -le 0) { throw 'release request timed out' }
-        $response = Open-ReleaseResponse $Uri $headers $remaining
+        try { $response = Open-ReleaseResponse $Uri $headers $remaining }
+        catch {
+            $failure = $_.Exception
+            while ($failure -and $failure -isnot [Net.WebException]) { $failure = $failure.InnerException }
+            if ($Api -and $failure -and $failure.Response) {
+                Assert-ApiAuthorized ([int]$failure.Response.StatusCode) $headers
+            }
+            throw
+        }
         try {
+            if ($Api) { Assert-ApiAuthorized ([int]$response.StatusCode) $headers }
             if ([int]$response.StatusCode -in @(301, 302, 303, 307, 308)) {
                 if ($redirect -eq $redirectLimit) { throw 'release redirect limit exceeded' }
                 if (-not $response.Headers['Location']) { throw 'release redirect missing Location' }
