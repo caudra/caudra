@@ -58,6 +58,7 @@ use explorer::{Explorer, ExplorerSection};
 use fs::ops;
 use fs::tree::Tree;
 use fs::watch::{HostWatch, Watch};
+use keys::ListEnd;
 use menu::{Action as MenuAction, Menu, Target};
 use quick_open::QuickOpen;
 use scm::backend::{
@@ -3443,8 +3444,12 @@ impl Workbench {
             KeyCode::Down => self.palette.move_selection(1),
             KeyCode::PageUp => self.palette.move_selection(-page),
             KeyCode::PageDown => self.palette.move_selection(page),
-            _ if keys::LIST_FIRST.matches(key) => self.palette.select_first(),
-            _ if keys::LIST_LAST.matches(key) => self.palette.select_last(),
+            _ if let Some(end) = keys::list_end(key, self.palette.query().is_empty()) => {
+                match end {
+                    ListEnd::First => self.palette.select_first(),
+                    ListEnd::Last => self.palette.select_last(),
+                }
+            }
             _ => {
                 return self
                     .field_key(FocusedField::Palette, key)
@@ -3770,8 +3775,14 @@ impl Workbench {
             KeyCode::PageUp => self.search.move_selection(-page),
             KeyCode::PageDown => self.search.move_selection(page),
             KeyCode::Enter => self.run_or_open_search(),
-            _ if keys::LIST_FIRST.matches(key) => self.search.select_first(),
-            _ if keys::LIST_LAST.matches(key) => self.search.select_last(),
+            _ if let Some(end) =
+                keys::list_end(key, self.search.input(self.search.field()).is_empty()) =>
+            {
+                match end {
+                    ListEnd::First => self.search.select_first(),
+                    ListEnd::Last => self.search.select_last(),
+                }
+            }
             _ => {
                 return self
                     .field_key(FocusedField::Search, key)
@@ -4927,8 +4938,9 @@ mod tests {
         "a selection in a field must reach the host's clipboard and the workbench's";
     const COPY_TRAPPED: &str = "Ctrl+C over a field with nothing selected must reach the host";
     const SAVE_TRAPPED: &str = "a chord the find bar does not take must still reach the workbench";
-    const LIST_KEY_MISSED: &str =
-        "the palette list takes the text-start chords and leaves Home and End to its field";
+    const LIST_KEY_MISSED: &str = "the palette list takes the text-start chords, and Home and End \
+         only while its field is empty";
+    const PALETTE_TOO_SHORT: &str = "the palette needs two rows to tell its ends apart";
     const NOT_DIGITS: &str = "go-to-line must keep the digits of what it is given and nothing else";
     const GOTO_MISSED: &str = "go-to-line must land on the line its digits name";
     const NO_FIELD: &str = "a field must have the focus";
@@ -6509,6 +6521,22 @@ mod tests {
             format!("{PALETTE_PREFIX}{PALETTE_QUERY}"),
             "{LIST_KEY_MISSED}"
         );
+    }
+
+    #[test]
+    fn the_palette_list_takes_home_and_end_while_its_field_is_empty() {
+        let (_dir, mut workbench) = project();
+        open_palette(&mut workbench);
+        assert!(workbench.palette.len() > 1, "{PALETTE_TOO_SHORT}");
+
+        workbench.handle_key(key(KeyCode::End));
+        assert_eq!(
+            workbench.palette.selected_index() + 1,
+            workbench.palette.len(),
+            "{LIST_KEY_MISSED}"
+        );
+        workbench.handle_key(key(KeyCode::Home));
+        assert_eq!(workbench.palette.selected_index(), 0, "{LIST_KEY_MISSED}");
     }
 
     #[test_case(Focus::Sidebar, None ; "the sidebar sends the selected path")]

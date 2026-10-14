@@ -5,7 +5,7 @@ use crate::components::tooltip::Tip;
 use crate::repaint::Cadence;
 
 use caudra_grab::grab_scope;
-use caudra_workbench::keys::{LIST_FIRST, LIST_LAST};
+use caudra_workbench::keys::list_end;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 #[cfg(test)]
@@ -102,8 +102,7 @@ impl ModeSubmission {
                 | KeyCode::Esc
         ) && !key::QUIT.matches(event)
             && !key::SCROLL_HALF_UP.matches(event)
-            && !LIST_FIRST.matches(event)
-            && !LIST_LAST.matches(event)
+            && list_end(event, self.picker.filter_is_empty()).is_none()
         {
             return ModeSubmissionAction::Consumed;
         }
@@ -218,6 +217,8 @@ mod tests {
     #[test_case(&[KeyCode::Down], ModeSubmissionChoice::Queue; "select_queue")]
     #[test_case(&[KeyCode::Down, KeyCode::Down], ModeSubmissionChoice::Stop; "select_stop")]
     #[test_case(&[KeyCode::Up], ModeSubmissionChoice::Stop; "navigate_backwards")]
+    #[test_case(&[KeyCode::End], ModeSubmissionChoice::Stop; "end_selects_the_last_row")]
+    #[test_case(&[KeyCode::End, KeyCode::Home], ModeSubmissionChoice::KeepEditing; "home_selects_the_first_row")]
     fn keyboard_selection(navigation: &[KeyCode], expected: ModeSubmissionChoice) {
         let mut submission = ModeSubmission::new();
         submission.open();

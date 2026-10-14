@@ -1327,6 +1327,14 @@ pub const KEYBINDS: &[Keybind] = &[
         context: KeybindContext::Picker,
     },
     Keybind {
+        label: KeyLabel::Alt(
+            wb::LIST_FIRST_UNFILTERED.label,
+            wb::LIST_LAST_UNFILTERED.label,
+        ),
+        description: "First / last item while the filter is empty",
+        context: KeybindContext::Picker,
+    },
+    Keybind {
         label: KeyLabel::Single(key::SCROLL_HALF_UP.label),
         description: "Scroll page up",
         context: KeybindContext::Picker,

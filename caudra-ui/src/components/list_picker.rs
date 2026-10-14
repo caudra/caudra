@@ -15,7 +15,7 @@ use crate::repaint::Cadence;
 use crate::theme;
 
 use caudra_grab::grab_scope;
-use caudra_workbench::keys::{LIST_FIRST, LIST_LAST};
+use caudra_workbench::keys::{ListEnd, list_end};
 use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -520,6 +520,12 @@ impl<T: PickerItem> ListPicker<T> {
         self.set_search_text("");
     }
 
+    pub fn filter_is_empty(&self) -> bool {
+        self.state
+            .as_ref()
+            .is_none_or(|state| state.search.is_empty())
+    }
+
     pub fn search_text(&self) -> String {
         self.state
             .as_ref()
@@ -698,12 +704,11 @@ impl<T: PickerItem> ListPicker<T> {
             s.page_up();
             return PickerAction::Consumed;
         }
-        if LIST_FIRST.matches(key) {
-            s.select_first();
-            return PickerAction::Consumed;
-        }
-        if LIST_LAST.matches(key) {
-            s.select_last();
+        if let Some(end) = list_end(key, s.search.is_empty()) {
+            match end {
+                ListEnd::First => s.select_first(),
+                ListEnd::Last => s.select_last(),
+            }
             return PickerAction::Consumed;
         }
         match key.code {
@@ -1425,7 +1430,7 @@ mod tests {
     use super::*;
     use crate::components::key;
     use crate::components::keybindings::key as kb;
-    use caudra_workbench::keys::Bind;
+    use caudra_workbench::keys::{Bind, LIST_FIRST, LIST_LAST};
     use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::buffer::Buffer;
     use ratatui::style::Color;
@@ -1663,7 +1668,23 @@ mod tests {
         assert_eq!(ready_state(&p).selected, 0);
     }
 
-    /// Bare `Home` and `End` belong to the search line's caret.
+    /// With nothing typed there is no caret to move, so bare `Home` and `End`
+    /// take the list to its ends.
+    #[test_case(KeyCode::Home, 0  ; "home_selects_first")]
+    #[test_case(KeyCode::End,  49 ; "end_selects_last")]
+    fn home_and_end_reach_the_list_ends_while_the_search_is_empty(code: KeyCode, expected: usize) {
+        let items: Vec<Entry> = (0..50).map(|i| Entry::new(&format!("Item {i}"))).collect();
+        let mut p = ListPicker::new();
+        p.open(items, " Test ");
+        ready_state_mut(&mut p).selected = 25;
+
+        p.handle_key(key(code));
+
+        assert_eq!(ready_state(&p).selected, expected);
+    }
+
+    /// Once something is typed, bare `Home` and `End` belong to the search
+    /// line's caret.
     #[test_case(KeyCode::Home, 0                 ; "home_reaches_the_query_start")]
     #[test_case(KeyCode::End,  FIRST_WORD.len()  ; "end_reaches_the_query_end")]
     fn home_and_end_move_the_search_caret(code: KeyCode, expected: usize) {

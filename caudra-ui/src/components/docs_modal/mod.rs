@@ -14,7 +14,7 @@ use std::borrow::Cow;
 
 use caudra_docs::{DocsLibrary, Library, Target};
 use caudra_grab::grab_scope;
-use caudra_workbench::keys::{LIST_FIRST, LIST_LAST};
+use caudra_workbench::keys::{ListEnd, list_end};
 use caudra_workbench::text_field::{TextField, TextKey};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -725,9 +725,16 @@ fn page_source(library: &Library, shown: Shown) -> (Cow<'_, str>, Vec<usize>) {
 /// Where a list's selection goes for a movement key, or `None` for a key that
 /// moves nothing. `page` is how far the paging keys move. A selection left past
 /// the end of a list that lost rows moves from its last row. Every list here
-/// sits under a field, which keeps the editing keys: `Home` and `End` among
-/// them, so the list's ends are a `Ctrl` away.
-fn list_move(key: KeyEvent, selected: usize, count: usize, page: usize) -> Option<usize> {
+/// sits under a field, which keeps the editing keys once it holds text, so
+/// bare `Home` and `End` reach the list's ends only while `filter_empty`; the
+/// `Ctrl` chords always do.
+fn list_move(
+    key: KeyEvent,
+    selected: usize,
+    count: usize,
+    page: usize,
+    filter_empty: bool,
+) -> Option<usize> {
     let last = count.saturating_sub(1);
     let selected = selected.min(last);
     let page = page.max(1);
@@ -738,9 +745,11 @@ fn list_move(key: KeyEvent, selected: usize, count: usize, page: usize) -> Optio
         KeyCode::Down => down(1),
         _ if key::PAGE_UP.matches(key) || key::SCROLL_HALF_UP.matches(key) => up(page),
         _ if key::PAGE_DOWN.matches(key) => down(page),
-        _ if LIST_FIRST.matches(key) || key::SCROLL_TOP.matches(key) => 0,
-        _ if LIST_LAST.matches(key) => last,
-        _ => return None,
+        _ if key::SCROLL_TOP.matches(key) => 0,
+        _ => match list_end(key, filter_empty)? {
+            ListEnd::First => 0,
+            ListEnd::Last => last,
+        },
     })
 }
 
@@ -853,6 +862,7 @@ mod tests {
     use super::*;
     use crate::components::keybindings::leader;
     use crate::components::{buffer_text, key as press};
+    use caudra_workbench::keys::{LIST_FIRST, LIST_LAST};
 
     const WIDE: u16 = 140;
     const NARROW: u16 = 80;
@@ -1463,18 +1473,27 @@ mod tests {
     #[test_case(KeyCode::Down, SHRUNK_TO - 1 ; "down")]
     fn a_selection_past_a_shrunken_list_moves_from_its_last_row(code: KeyCode, expected: usize) {
         assert_eq!(
-            list_move(press(code), STALE_SELECTION, SHRUNK_TO, LIST_PAGE),
+            list_move(press(code), STALE_SELECTION, SHRUNK_TO, LIST_PAGE, false),
             Some(expected)
         );
     }
 
-    #[test_case(LIST_FIRST.to_key_event(), Some(0) ; "ctrl_home_selects_the_first_row")]
-    #[test_case(LIST_LAST.to_key_event(), Some(SHRUNK_TO - 1) ; "ctrl_end_selects_the_last_row")]
-    #[test_case(press(KeyCode::Home), None ; "home_is_left_to_the_field")]
-    #[test_case(press(KeyCode::End), None ; "end_is_left_to_the_field")]
-    #[test_case(leader::SCROLL_BOTTOM.to_key_event(), None ; "the_bare_leader_key_is_left_to_the_field")]
-    fn only_ctrl_takes_a_list_to_its_ends(event: KeyEvent, expected: Option<usize>) {
-        assert_eq!(list_move(event, MIDDLE_ROW, SHRUNK_TO, LIST_PAGE), expected);
+    #[test_case(LIST_FIRST.to_key_event(), false, Some(0) ; "ctrl_home_selects_the_first_row")]
+    #[test_case(LIST_LAST.to_key_event(), false, Some(SHRUNK_TO - 1) ; "ctrl_end_selects_the_last_row")]
+    #[test_case(press(KeyCode::Home), true, Some(0) ; "home_selects_the_first_row_while_the_field_is_empty")]
+    #[test_case(press(KeyCode::End), true, Some(SHRUNK_TO - 1) ; "end_selects_the_last_row_while_the_field_is_empty")]
+    #[test_case(press(KeyCode::Home), false, None ; "home_is_left_to_a_field_with_text")]
+    #[test_case(press(KeyCode::End), false, None ; "end_is_left_to_a_field_with_text")]
+    #[test_case(leader::SCROLL_BOTTOM.to_key_event(), true, None ; "the_bare_leader_key_is_left_to_the_field")]
+    fn the_list_ends_follow_the_field(
+        event: KeyEvent,
+        filter_empty: bool,
+        expected: Option<usize>,
+    ) {
+        assert_eq!(
+            list_move(event, MIDDLE_ROW, SHRUNK_TO, LIST_PAGE, filter_empty),
+            expected
+        );
     }
 
     #[test]

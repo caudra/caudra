@@ -15,7 +15,7 @@ use ratatui::widgets::Paragraph;
 use tracing::warn;
 
 use caudra_grab::grab_scope;
-use caudra_workbench::keys::{LIST_FIRST, LIST_LAST};
+use caudra_workbench::keys::{ListEnd, list_end};
 use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 use caudra_workbench::{
     BackendDriver, BackendError, BackendEvent, ResourceEntry, WorkbenchBackend, WorkbenchPath,
@@ -273,8 +273,16 @@ impl FilePickerModal {
             }
             // A whole list's worth of steps lands on the end it was aimed at,
             // because `move_selection` clamps.
-            _ if LIST_FIRST.matches(key) => move_selection(s, -(s.matches.len() as isize)),
-            _ if LIST_LAST.matches(key) => move_selection(s, s.matches.len() as isize),
+            _ if let Some(end) = list_end(key, s.search.is_empty()) => {
+                let len = s.matches.len() as isize;
+                move_selection(
+                    s,
+                    match end {
+                        ListEnd::First => -len,
+                        ListEnd::Last => len,
+                    },
+                );
+            }
             // Everything the list itself does not claim edits the search
             // line, which owns the whole editing keymap.
             _ => {
@@ -689,6 +697,7 @@ mod tests {
     use crate::components::file_walk::NOTHING_TO_PICK_MSG;
     use crate::components::keybindings::key as kb;
     use crate::repaint::expect::{OWED, QUIET};
+    use caudra_workbench::keys::{LIST_FIRST, LIST_LAST};
     use caudra_workspace::ResourceKind;
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
     use std::time::Duration;
@@ -1086,6 +1095,8 @@ mod tests {
 
     #[test_case(LIST_FIRST.to_key_event(), 25, 0  ; "ctrl_home_selects_first")]
     #[test_case(LIST_LAST.to_key_event(),  25, 49 ; "ctrl_end_selects_last")]
+    #[test_case(key(KeyCode::Home),        25, 0  ; "home_selects_first_while_the_search_is_empty")]
+    #[test_case(key(KeyCode::End),         25, 49 ; "end_selects_last_while_the_search_is_empty")]
     #[test_case(key(KeyCode::PageUp),      25, 20 ; "page_up_retreats_a_half_page")]
     #[test_case(key(KeyCode::PageDown),    25, 30 ; "page_down_advances_a_half_page")]
     fn navigation_keys_move_the_match_list(event: KeyEvent, start: usize, expected: usize) {
@@ -1101,7 +1112,8 @@ mod tests {
         assert!(s.search.is_empty(), "{QUERY_UNTOUCHED}");
     }
 
-    /// Home and End move the caret, and the selection stays where it was.
+    /// Once something is typed, Home and End move the caret, and the selection
+    /// stays where it was.
     #[test_case(KeyCode::Home, 0            ; "home")]
     #[test_case(KeyCode::End,  QUERY.len() ; "end")]
     fn home_and_end_move_the_search_caret(code: KeyCode, caret: usize) {

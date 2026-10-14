@@ -15769,7 +15769,8 @@ fn deleting_a_stored_session_drops_it_from_the_open_picker() {
 }
 
 /// The transcript binds hand every key to the open overlay, so this walks the
-/// whole chain, not just the list. Bare `Home` and `End` are the filter's.
+/// whole chain, not just the list. With nothing typed in the filter, bare
+/// `Home` and `End` are the list's too.
 #[test_case(KeyEventKind::Press; "press")]
 #[test_case(KeyEventKind::Repeat; "repeat")]
 fn the_list_end_keys_reach_an_open_picker_list(kind: KeyEventKind) {
@@ -15782,10 +15783,13 @@ fn the_list_end_keys_reach_an_open_picker_list(kind: KeyEventKind) {
     let last = app.session_picker.ids().len() - 1;
     assert!(last > 0, "{PICKER_NEEDS_ROWS}");
 
-    dispatch_reported_key(&mut app, workbench_keys::LIST_LAST.to_key_event(), kind);
+    dispatch_reported_key(&mut app, key(KeyCode::End), kind);
     assert_eq!(app.session_picker.selected_index(), Some(last));
 
     dispatch_reported_key(&mut app, key(KeyCode::Home), kind);
+    assert_eq!(app.session_picker.selected_index(), Some(0));
+
+    dispatch_reported_key(&mut app, workbench_keys::LIST_LAST.to_key_event(), kind);
     assert_eq!(app.session_picker.selected_index(), Some(last));
 
     dispatch_reported_key(&mut app, workbench_keys::LIST_FIRST.to_key_event(), kind);

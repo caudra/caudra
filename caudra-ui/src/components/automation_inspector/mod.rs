@@ -919,6 +919,11 @@ impl AutomationInspector {
         if self.filter_focused {
             return self.handle_filter_key(key);
         }
+        if self.pane == Pane::List
+            && let Some(delta) = self.list_scroll.list_jump(key)
+        {
+            return self.step_selection(delta);
+        }
         match (key.code, plain_char(&key)) {
             (KeyCode::Esc, _) => return self.back(),
             (KeyCode::Tab, _) => self.step_tab(1),
@@ -1242,7 +1247,9 @@ impl AutomationInspector {
             .iter()
             .position(|selection| *selection == self.selection)
             .map_or(0, |at| {
-                (at as isize + delta).clamp(0, selections.len() as isize - 1) as usize
+                (at as isize)
+                    .saturating_add(delta)
+                    .clamp(0, selections.len() as isize - 1) as usize
             });
         match selections.into_iter().nth(at) {
             Some(selection) => self.select(selection),
@@ -4098,6 +4105,43 @@ mod tests {
 
         assert_eq!(walked, listed);
         assert!(walked.contains(&peer_selection()), "{ITEM_LISTED}");
+    }
+
+    /// The list holds the focus until `Right` hands it to the detail, so the
+    /// page and end keys move its selection rather than the detail.
+    #[test]
+    fn the_page_and_end_keys_move_the_list_while_it_has_the_focus() {
+        let mut terminal = terminal();
+        let mut inspector = opened(long_catalog(), None);
+        draw(&mut inspector, &mut terminal);
+        let listed: Vec<Selection> = list::entries(&inspector.state, &inspector.sessions, "")
+            .iter()
+            .map(Entry::selection)
+            .collect();
+        let (first, last) = (
+            listed.first().expect(ROW_DRAWN),
+            listed.last().expect(ROW_DRAWN),
+        );
+
+        let _ = press(&mut inspector, KeyCode::End);
+        assert_eq!(&inspector.selection, last);
+        let _ = press(&mut inspector, KeyCode::Home);
+        assert_eq!(&inspector.selection, first);
+        let _ = press(&mut inspector, KeyCode::PageDown);
+        assert_ne!(&inspector.selection, first);
+        let _ = press(&mut inspector, KeyCode::PageUp);
+        assert_eq!(&inspector.selection, first);
+    }
+
+    #[test]
+    fn the_end_key_leaves_the_list_alone_once_the_detail_has_the_focus() {
+        let mut inspector = opened(long_catalog(), None);
+        let selected = inspector.selection.clone();
+
+        let _ = press(&mut inspector, KeyCode::Right);
+        let _ = press(&mut inspector, KeyCode::End);
+
+        assert_eq!(inspector.selection, selected);
     }
 
     #[test]

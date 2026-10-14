@@ -112,6 +112,7 @@ use caudra_providers::{
     AutomationEventOrigin, CaudraId, HistoryItem, ModelPurpose, PeerMessageOrigin, TaskEventOrigin,
 };
 use caudra_storage::sessions::SessionRelocation;
+use caudra_workbench::keys::{ListEnd, list_end};
 use caudra_workbench::text_field::FieldStyles;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::Frame;
@@ -965,6 +966,24 @@ impl ModalScroll {
 
     fn half_page(&self) -> i32 {
         (self.viewport_h / 2).max(1) as i32
+    }
+
+    /// How far a list with no filter, scrolled by this, moves its selection
+    /// for a paging key or an end key. An end is as far as a step can go, so
+    /// the step has to saturate and clamp to land on it.
+    pub(crate) fn list_jump(&self, key_event: KeyEvent) -> Option<isize> {
+        use keybindings::key;
+        let page = self.half_page() as isize;
+        if key::PAGE_UP.matches(key_event) || key::SCROLL_HALF_UP.matches(key_event) {
+            return Some(-page);
+        }
+        if key::PAGE_DOWN.matches(key_event) {
+            return Some(page);
+        }
+        list_end(key_event, true).map(|end| match end {
+            ListEnd::First => isize::MIN,
+            ListEnd::Last => isize::MAX,
+        })
     }
 
     fn clamp(&mut self) {

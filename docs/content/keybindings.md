@@ -141,6 +141,7 @@ These keys work the same in every text field: the composer, a picker's filter, f
 | `Type` | Filter |
 | `PageUp` / `PageDown` | Scroll page up / down |
 | `Ctrl+Home` / `Ctrl+End` | First / last item |
+| `Home` / `End` | First / last item while the filter is empty |
 | `Ctrl+U` | Scroll page up |
 
 ## Docs

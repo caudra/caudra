@@ -5,7 +5,7 @@ use caudra_agent::worktree::{Changes, CreateRequest, RemoveRequest, Request, lab
 use caudra_grab::grab_scope;
 use caudra_storage::id::CaudraId;
 use caudra_storage::worktrees::CheckoutSessions;
-use caudra_workbench::keys::{LIST_FIRST, LIST_LAST};
+use caudra_workbench::keys::list_end;
 use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
@@ -337,8 +337,7 @@ impl WorktreePicker {
                         | KeyCode::Down
                         | KeyCode::PageUp
                         | KeyCode::PageDown
-                ) || LIST_FIRST.matches(event)
-                    || LIST_LAST.matches(event)
+                ) || list_end(event, self.picker.filter_is_empty()).is_some()
                     || key::QUIT.matches(event);
                 if !for_list {
                     return WorktreeAction::Consumed;
@@ -950,6 +949,24 @@ mod tests {
         assert_eq!(request.carry, carried);
         assert_eq!(request.branch, None);
         assert_eq!(request.base, HEAD);
+    }
+
+    #[test]
+    fn home_and_end_reach_the_ends_of_a_list_with_nothing_to_search() {
+        let (mut picker, _) = opened(true);
+        picker.show_create(None);
+        picker.handle_key(press(KeyCode::Enter));
+        picker.handle_key(press(KeyCode::Home));
+        let first = picker.picker.selected_index();
+
+        picker.handle_key(press(KeyCode::End));
+
+        assert_ne!(picker.picker.selected_index(), first);
+        let action = picker.handle_key(press(KeyCode::Enter));
+        assert!(
+            matches!(action, WorktreeAction::Run(Request::Create(_))),
+            "{EXPECTED_CREATE}, got {action:?}"
+        );
     }
 
     #[test_case(false, Changes::None ; "clean")]

@@ -93,7 +93,13 @@ impl SearchView {
 
     pub(super) fn handle_key(&mut self, key: KeyEvent, library: &Library) -> Pick {
         let page = usize::from(self.results.height / HIT_ROWS / 2);
-        if let Some(selected) = list_move(key, self.selected, self.found.hits.len(), page) {
+        if let Some(selected) = list_move(
+            key,
+            self.selected,
+            self.found.hits.len(),
+            page,
+            self.query.is_empty(),
+        ) {
             self.selected = selected;
             self.scroll.reveal_and_hold(first_row(selected), HIT_ROWS);
             return Pick::Stay;

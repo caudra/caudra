@@ -693,6 +693,11 @@ impl WorkflowInspector {
         if self.filter_focused {
             return self.handle_filter_key(key);
         }
+        if self.pane == Pane::Runs
+            && let Some(delta) = self.list_scroll.list_jump(key)
+        {
+            return self.step_selection(delta);
+        }
         let plain = key.modifiers.is_empty();
         match key.code {
             KeyCode::Esc => return InspectorAction::Close,
@@ -933,7 +938,9 @@ impl WorkflowInspector {
             .as_ref()
             .and_then(|selected| ids.iter().position(|id| id == selected))
             .map_or(0, |at| {
-                (at as isize + delta).clamp(0, ids.len() as isize - 1) as usize
+                (at as isize)
+                    .saturating_add(delta)
+                    .clamp(0, ids.len() as isize - 1) as usize
             });
         self.select(Some(ids[at].clone()))
     }
@@ -3706,6 +3713,43 @@ mod tests {
             (inspector.list_area.y..inspector.list_area.bottom()).contains(&row),
             "{SELECTION_REVEALED}"
         );
+    }
+
+    /// The run list holds the focus until `Right` hands it to the detail, so
+    /// the page and end keys move its selection rather than the detail.
+    #[test]
+    fn the_page_and_end_keys_move_the_run_list_while_it_has_the_focus() {
+        let mut terminal = terminal();
+        let mut inspector = open_with(
+            (0..MANY_RUNS)
+                .map(|index| {
+                    run(
+                        &format!("{RUN_ID}-{index}"),
+                        RunStatus::Completed,
+                        Vec::new(),
+                    )
+                })
+                .collect(),
+        );
+        draw(&mut inspector, &mut terminal);
+        let ids: Vec<String> = inspector
+            .entries()
+            .iter()
+            .map(|entry| entry.run.run_id.clone())
+            .collect();
+        let (first, last) = (
+            ids.first().expect(NO_SUCH_ROW),
+            ids.last().expect(NO_SUCH_ROW),
+        );
+
+        let _ = inspector.handle_key(key_event(KeyCode::End));
+        assert_eq!(inspector.selected(), Some(last.as_str()));
+        let _ = inspector.handle_key(key_event(KeyCode::Home));
+        assert_eq!(inspector.selected(), Some(first.as_str()));
+        let _ = inspector.handle_key(key_event(KeyCode::PageDown));
+        assert_ne!(inspector.selected(), Some(first.as_str()));
+        let _ = inspector.handle_key(key_event(KeyCode::PageUp));
+        assert_eq!(inspector.selected(), Some(first.as_str()));
     }
 
     /// The section follows its tail, so the cursor is a place in the list

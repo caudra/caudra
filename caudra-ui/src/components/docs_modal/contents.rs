@@ -127,7 +127,13 @@ impl Contents {
     ) -> Pick {
         let rows = self.rows(library, current.page);
         let page = usize::from(self.list.height / 2);
-        if let Some(selected) = list_move(key, self.selected, selectable(&rows).count(), page) {
+        if let Some(selected) = list_move(
+            key,
+            self.selected,
+            selectable(&rows).count(),
+            page,
+            self.filter.is_empty(),
+        ) {
             self.selected = selected;
             self.reveal = true;
             return Pick::Stay;

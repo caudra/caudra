@@ -131,10 +131,33 @@ pub const SUPER_END: Bind = bind!(KeyCode::Right, SUPER, "Super+→");
 pub const TEXT_START: Bind = bind!(KeyCode::Home, CTRL, "Ctrl+Home");
 pub const TEXT_END: Bind = bind!(KeyCode::End, CTRL, "Ctrl+End");
 /// A list under a one-line field takes the text-start chords for its own
-/// ends, and leaves bare `Home` and `End` to the field's caret. On one line
-/// the two chords would only repeat `Home` and `End` anyway.
+/// ends, which on one line would only repeat `Home` and `End` anyway. Bare
+/// `Home` and `End` reach the list too while the field is empty, since there
+/// is no caret to move; see [`list_end`].
 pub const LIST_FIRST: Bind = TEXT_START;
 pub const LIST_LAST: Bind = TEXT_END;
+pub const LIST_FIRST_UNFILTERED: Bind = bind!(KeyCode::Home, NONE, "Home");
+pub const LIST_LAST_UNFILTERED: Bind = bind!(KeyCode::End, NONE, "End");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListEnd {
+    First,
+    Last,
+}
+
+/// The end of a list a key sends it to. `filter_empty` says the field over
+/// the list holds no text, so bare `Home` and `End` have no caret to move and
+/// belong to the list; once something is typed they are the field's again.
+pub fn list_end(key: KeyEvent, filter_empty: bool) -> Option<ListEnd> {
+    let bare = |bind: Bind| filter_empty && bind.matches(key);
+    if LIST_FIRST.matches(key) || bare(LIST_FIRST_UNFILTERED) {
+        Some(ListEnd::First)
+    } else if LIST_LAST.matches(key) || bare(LIST_LAST_UNFILTERED) {
+        Some(ListEnd::Last)
+    } else {
+        None
+    }
+}
 
 pub const STAGE_TOGGLE: Bind = bind!(KeyCode::Char(' '), NONE, "Space");
 pub const OPEN_DIFF: Bind = bind!(KeyCode::Char('d'), NONE, "D");
@@ -309,8 +332,10 @@ pub const LEADER_BINDS: &[Bind] = &[
 mod tests {
     use super::{
         Bind, EXPLORER_BINDS, GLOBAL_BINDS, KeyCode, KeyEvent, KeyModifiers, LEADER_BINDS,
-        LEADER_LABEL, NONE, SOURCE_CONTROL_BINDS, STAGE_TOGGLE, TEXT_BINDS, TRANSFER_BINDS,
+        LEADER_LABEL, LIST_FIRST, LIST_LAST, ListEnd, NONE, SOURCE_CONTROL_BINDS, STAGE_TOGGLE,
+        TEXT_BINDS, TRANSFER_BINDS, list_end,
     };
+    use test_case::test_case;
 
     const DUPLICATE: &str = "two workbench binds must not answer to the same chord";
     const LABEL_EMPTY: &str = "every bind must carry a label for the help modal";
@@ -407,6 +432,18 @@ mod tests {
             STAGE_TOGGLE.matches(KeyEvent::new(KeyCode::Char(' '), NONE)),
             "the bare chord must still match"
         );
+    }
+
+    #[test_case(KeyEvent::new(KeyCode::Home, NONE), true => Some(ListEnd::First) ; "home_with_an_empty_filter")]
+    #[test_case(KeyEvent::new(KeyCode::End, NONE), true => Some(ListEnd::Last) ; "end_with_an_empty_filter")]
+    #[test_case(KeyEvent::new(KeyCode::Home, NONE), false => None ; "home_with_text_is_the_fields")]
+    #[test_case(KeyEvent::new(KeyCode::End, NONE), false => None ; "end_with_text_is_the_fields")]
+    #[test_case(LIST_FIRST.to_key_event(), false => Some(ListEnd::First) ; "ctrl_home_always_reaches_the_first_row")]
+    #[test_case(LIST_LAST.to_key_event(), false => Some(ListEnd::Last) ; "ctrl_end_always_reaches_the_last_row")]
+    #[test_case(KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT), true => None ; "shift_home_still_selects_in_the_field")]
+    #[test_case(KeyEvent::new(KeyCode::Up, NONE), true => None ; "other_keys_reach_no_end")]
+    fn list_end_reads_the_filter(key: KeyEvent, filter_empty: bool) -> Option<ListEnd> {
+        list_end(key, filter_empty)
     }
 
     #[test]

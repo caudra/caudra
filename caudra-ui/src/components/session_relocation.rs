@@ -7,7 +7,7 @@ use caudra_grab::grab_scope;
 use caudra_storage::id::CaudraId;
 use caudra_storage::paths;
 use caudra_storage::sessions::{SessionLocation, SessionRelocation};
-use caudra_workbench::keys::{LIST_FIRST, LIST_LAST};
+use caudra_workbench::keys::list_end;
 use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
@@ -253,8 +253,7 @@ impl SessionRelocationPicker {
                         | KeyCode::Down
                         | KeyCode::PageUp
                         | KeyCode::PageDown
-                ) || LIST_FIRST.matches(event)
-                    || LIST_LAST.matches(event)
+                ) || list_end(event, self.picker.filter_is_empty()).is_some()
                     || key::QUIT.matches(event);
                 if !for_list {
                     return SessionRelocationAction::Consumed;
@@ -1082,6 +1081,27 @@ mod tests {
             Some(path_string(&root.path().join(SOURCE)))
         );
         assert!(!picker.is_open());
+    }
+
+    #[test]
+    fn home_and_end_reach_the_ends_of_a_list_with_nothing_to_search() {
+        let root = workspace();
+        let mut picker = opened(
+            root.path(),
+            true,
+            Some(path_string(&root.path().join(TARGET))),
+        );
+        picker.handle_key(press(KeyCode::Enter));
+        picker.handle_key(press(KeyCode::Home));
+        let first = picker.picker.selected_index();
+
+        picker.handle_key(press(KeyCode::End));
+
+        assert_ne!(picker.picker.selected_index(), first);
+        assert!(matches!(
+            picker.handle_key(press(KeyCode::Enter)),
+            SessionRelocationAction::Confirm(..)
+        ));
     }
 
     #[test_case(1; "up")]
