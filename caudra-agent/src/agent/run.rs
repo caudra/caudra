@@ -6436,7 +6436,7 @@ mod tests {
     }
 
     fn default_model() -> Model {
-        Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()
+        Model::from_spec("anthropic/claude-sonnet-4-6").unwrap()
     }
 
     #[derive(Clone, Copy)]
@@ -6458,9 +6458,9 @@ mod tests {
 
     #[test_case(TestBinding::None, TestBinding::None, PLAN_MODEL_SPEC ; "unbound_inherits_effective_plan")]
     #[test_case(TestBinding::Exact(PROFILE_MODEL_SPEC), TestBinding::None, PROFILE_MODEL_SPEC ; "global_exact_override")]
-    #[test_case(TestBinding::Chat, TestBinding::None, "anthropic/claude-sonnet-4-20250514" ; "global_same_chat_override")]
+    #[test_case(TestBinding::Chat, TestBinding::None, "anthropic/claude-sonnet-4-6" ; "global_same_chat_override")]
     #[test_case(TestBinding::Exact(PLAN_MODEL_SPEC), TestBinding::Exact(PROFILE_MODEL_SPEC), PROFILE_MODEL_SPEC ; "profile_exact_override")]
-    #[test_case(TestBinding::Exact(PLAN_MODEL_SPEC), TestBinding::Chat, "anthropic/claude-sonnet-4-20250514" ; "profile_same_chat_override")]
+    #[test_case(TestBinding::Exact(PLAN_MODEL_SPEC), TestBinding::Chat, "anthropic/claude-sonnet-4-6" ; "profile_same_chat_override")]
     fn subagent_binding_uses_effective_default_and_selected_chat_anchor(
         global: TestBinding,
         profile: TestBinding,
