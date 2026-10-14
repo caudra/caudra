@@ -17,6 +17,7 @@ use crate::model::{ModelEntry, ModelPricing, PricingTier, lookup_entry};
 use crate::providers::anthropic::shared::{WIDE_CONTEXT_WINDOW, declares_input_budget};
 use crate::providers::catalog::{self, CatalogMeta, schema::CatalogModel};
 use crate::providers::openai;
+use crate::providers::xai::GROK_MAX_OUTPUT_TOKENS;
 
 /// Catalog slugs whose new models belong in a table. Aggregators relist every
 /// vendor's models, so their additions are someone else's release.
@@ -167,6 +168,12 @@ pub const CAPS: &[Cap] = &[
         field: Field::MaxOutput,
         ours: COPILOT_FALLBACK_OUTPUT,
         reason: "A cold-start fallback: Copilot's `/models` reports each model's output limit, which replaces it.",
+    },
+    Cap {
+        provider: "xai",
+        field: Field::MaxOutput,
+        ours: GROK_MAX_OUTPUT_TOKENS,
+        reason: "xAI documents no text output limit for Grok 4.5 and later (docs.x.ai/developers/grok-4-7), so the table asks for at most this many.",
     },
 ];
 

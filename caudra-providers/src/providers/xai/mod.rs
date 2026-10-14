@@ -10,7 +10,7 @@ use crate::model::{ModelEntry, ModelFamily, ModelPricing, PricingTier, StaticRea
 
 const GROK_CONTEXT_WINDOW: u32 = 500_000;
 const GROK_4_3_CONTEXT_WINDOW: u32 = 1_000_000;
-const GROK_MAX_OUTPUT_TOKENS: u32 = 131_072;
+pub(crate) const GROK_MAX_OUTPUT_TOKENS: u32 = 131_072;
 /// Once a prompt reaches this many tokens, xAI bills every token of the
 /// request at the long-context rate. A tier's `above` is exclusive, so the
 /// tiers sit one token below it.
@@ -22,7 +22,7 @@ inventory::submit!(caudra_config::providers::BuiltInProvider {
     protocol: caudra_config::providers::Protocol::Openai,
     default_base_url: "https://api.x.ai/v1",
     default_api_key_env: auth::API_KEY_ENV,
-    default_model: "xai/grok-4.6",
+    default_model: "xai/grok-4.7",
     plans: None,
     login_url: Some("https://console.x.ai"),
     needs_url: false,
@@ -42,11 +42,36 @@ const EFFORT_WITH_NONE: &[StaticReasoningOption] = &[StaticReasoningOption::Effo
 pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
         ModelEntry {
-            prefixes: &["grok-4.6"],
+            prefixes: &["grok-4.7"],
             small: false,
             family: ModelFamily::Generic,
             vision: true,
             default: true,
+            pricing: ModelPricing {
+                input: 2.00,
+                output: 6.00,
+                cache_write: 0.00,
+                cache_read: 0.50,
+                fast: None,
+                tiers: Cow::Borrowed(&[PricingTier {
+                    above: LONG_CONTEXT_FROM - 1,
+                    input: 4.00,
+                    output: 12.00,
+                    cache_write: 0.00,
+                    cache_read: 1.00,
+                    fast: None,
+                }]),
+            },
+            max_output_tokens: Some(GROK_MAX_OUTPUT_TOKENS),
+            context_window: GROK_CONTEXT_WINDOW,
+            reasoning_options: Some(EFFORT_TO_XHIGH),
+        },
+        ModelEntry {
+            prefixes: &["grok-4.6"],
+            small: false,
+            family: ModelFamily::Generic,
+            vision: true,
+            default: false,
             pricing: ModelPricing {
                 input: 2.00,
                 output: 6.00,
@@ -199,6 +224,7 @@ mod tests {
         );
     }
 
+    #[test_case("grok-4.7", 2.0, 6.0, 0.5, GROK_CONTEXT_WINDOW)]
     #[test_case("grok-4.6", 2.0, 6.0, 0.5, GROK_CONTEXT_WINDOW)]
     #[test_case("grok-4.5", 2.0, 6.0, 0.3, GROK_CONTEXT_WINDOW)]
     #[test_case("grok-4.3", 1.25, 2.5, 0.2, GROK_4_3_CONTEXT_WINDOW)]

@@ -358,11 +358,12 @@ The default is `false`.
 
 | Marker | Models | Pricing (in/out per 1M tokens) | Context |
 |---------|--------|-------------------------------|---------|
-| Best | **grok-4.6** (default) | $2.00 / $6.00 | 500K ctx / 131K out |
+| Best | **grok-4.7** (default) | $2.00 / $6.00 | 500K ctx / 131K out |
+|  | grok-4.6 | $2.00 / $6.00 | 500K ctx / 131K out |
 |  | grok-4.5 | $2.00 / $6.00 | 500K ctx / 131K out |
 |  | grok-4.3 | $1.25 / $2.50 | 1000K ctx / 131K out |
 
-Routing defaults: grok-4.6 (Best)
+Routing defaults: grok-4.7 (Best)
 
 OAuth uses the same first-party xAI client as the official Grok CLI (`caudra auth login xai`). Browser login (PKCE) is the desktop default; device code is recommended over SSH or in a container. Tokens refresh automatically. After login, Caudra fetches your account catalog from `GET /v1/models-v2` on the Grok CLI proxy and caches it for 15 minutes. `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth proxy.
 

@@ -26,6 +26,7 @@ Preview 9 adds Gemini 4 Argon as the Google default, along with Gemini 3.8 Flash
 - **Claude Sonnet 4.6 answers at full length.** Caudra now lets `anthropic/claude-sonnet-4-6` write up to 128,000 output tokens, the limit Anthropic documents, instead of 64,000.
 - **Retired Claude models leave the model table.** Anthropic retired Claude Sonnet 4 and Claude Opus 4 on June 15, 2026, and Claude Opus 4.1 on August 5, 2026, so Caudra drops `claude-sonnet-4`, `claude-opus-4-0`, and `claude-opus-4-1` from its model table. Use `claude-sonnet-5-5` or `claude-opus-4-8` instead, as Anthropic recommends.
 - **Retired Codex models leave the model table.** OpenAI shut down `gpt-5.1-codex`, `gpt-5.1-codex-max`, `gpt-5.1-codex-mini`, and `gpt-5.2-codex` on July 23, 2026, so Caudra drops them too. Use `openai/gpt-5.6-sol`, or `gpt-5.6-terra` in place of `gpt-5.1-codex-mini`.
+- **Grok 4.7.** `xai/grok-4.7` is the xAI default, in place of `grok-4.6`, and the model Caudra picks when you use xAI without choosing one. It costs $2 per million input tokens and $6 per million output tokens, with cache reads at $0.50, and from a 200,000-token prompt every rate doubles. Thinking takes `low` to `xhigh`.
 - **No Google sign-in.** A Google AI Pro or Ultra plan covers AI Studio in the browser, and Google bills API use separately. Google's terms forbid third-party tools from using the sign-in of Gemini CLI or Antigravity, so Caudra uses an API key for Google. The providers page now says so.
 
 ### Pickers and lists
