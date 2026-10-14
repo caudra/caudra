@@ -872,7 +872,7 @@ mod tests {
 
     const SAME_SIZED_LIST: &str = "a republished list of the same length is still a new list";
     const SWAPPED_SPEC: &str = "zai/glm-5";
-    const SONNET_SPEC: &str = "anthropic/claude-sonnet-4-6";
+    const SONNET_SPEC: &str = "anthropic/claude-sonnet-4-5";
     const OPUS_SPEC: &str = "anthropic/claude-opus-4-6-20260101";
     const MISSING_SPEC: &str = "catalog-provider/vendor/model";
     const UNCLASSIFIED_SPEC: &str = "anthropic/claude-nothing-curated";
@@ -1276,7 +1276,7 @@ mod tests {
 
         let selected = p.picker.selected_item().unwrap();
         assert_eq!(selected.spec, SONNET_SPEC);
-        assert_eq!(selected.label(), "claude-sonnet-4-6");
+        assert_eq!(selected.label(), "claude-sonnet-4-5");
     }
 
     #[test]
@@ -1382,7 +1382,7 @@ mod tests {
     #[test]
     fn parse_model_entry_valid() {
         let entry = parse_model_entry(SONNET_SPEC).unwrap();
-        assert_eq!(entry.id, "claude-sonnet-4-6");
+        assert_eq!(entry.id, "claude-sonnet-4-5");
         assert_eq!(entry.provider_display, "Anthropic");
         assert_eq!(entry.binds, Some(Binding::Exact(SONNET_SPEC.into())));
     }
