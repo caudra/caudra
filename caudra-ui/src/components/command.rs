@@ -476,7 +476,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/autopilot",
-        description: "Keep the session moving: answer prompts, questions, and plans for you (off, model)",
+        description: "Keep the session moving: answer prompts, questions, and plans for you (off, model, log)",
         max_args: usize::MAX,
         scope: ChatScope::MainOnly,
         features: &[Feature::Autopilot],

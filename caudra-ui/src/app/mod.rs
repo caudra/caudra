@@ -139,7 +139,7 @@ use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use crate::{AppSession, PatternDiscoveryMode, PatternDiscoveryOutcome, PatternSuggestionLoader};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use caudra_agent::agent::task_runner::WorkflowHostContext;
-use caudra_agent::autopilot::DecisionKind;
+use caudra_agent::autopilot::{ActionName, DecisionKind};
 use caudra_agent::background::{BackgroundTasks, ShellSnapshot};
 use caudra_agent::commits::repo;
 use caudra_agent::context::{ContextKey, ContextSnapshot, ContextStore};
@@ -641,6 +641,9 @@ pub struct App {
     /// Decisions autopilot announced and has not made yet, by seq. A
     /// permission card carries its own state, so none is kept here.
     autopilot_deciding: Vec<(u32, DecisionKind)>,
+    /// The plan decision autopilot left to the user, settled by how they
+    /// answer the card and forgotten when it closes otherwise.
+    autopilot_plan_escalation: Option<u32>,
     /// The end of an engagement, for the terminal to announce.
     autopilot_notice: Option<Notification>,
     pub(super) zones: ZoneRegistry,
@@ -935,6 +938,7 @@ impl App {
             autopilot_checkin_due: false,
             autopilot_implement: None,
             autopilot_deciding: Vec::new(),
+            autopilot_plan_escalation: None,
             autopilot_notice: None,
             zones: ZoneRegistry::new(),
             #[cfg(debug_assertions)]
@@ -2058,7 +2062,7 @@ impl App {
             return None;
         }
         if self.autopilot_panel.is_open() {
-            self.autopilot_panel.scroll(delta);
+            self.autopilot_panel.scroll_at(pos, delta);
             return None;
         }
         if self.float_mgr.is_open() && self.float_mgr.contains(pos) {
@@ -6711,6 +6715,7 @@ impl App {
             | self.usage_modal.poll(&self.usage_slot)
             | self.storage_modal.poll(&self.storage_slot)
             | self.decisions_modal.poll(&self.decisions_slot)
+            | self.autopilot_panel.poll()
             | self.poll_context_snapshot()
             | self.poll_tools_snapshot()
             | self.logs_modal.poll()
@@ -6995,7 +7000,7 @@ impl App {
         let key = session_usage_model(provider, model);
         self.state
             .session_mut()
-            .add_model_usage(&key, usage.billed(cost, billing));
+            .add_model_usage(&key, purpose, usage.billed(cost, billing));
         self.storage_writer.record_usage(TurnUsage {
             provider: provider.to_owned(),
             model: model.to_owned(),
@@ -7355,12 +7360,14 @@ impl App {
                 self.flash(error);
                 return vec![];
             }
+            self.answer_plan_escalation(ActionName::Implement);
             return vec![Action::ClearAndImplement(Box::new(handoff))];
         }
         if let Err(error) = self.admit_run() {
             self.flash(error);
             return vec![];
         }
+        self.answer_plan_escalation(ActionName::Implement);
         self.finish_plan_handoff(handoff)
     }
 
@@ -7387,6 +7394,7 @@ impl App {
     /// a return to Plan revises the same document.
     fn leave_plan(&mut self) {
         self.plan_form.reset();
+        self.autopilot_plan_escalation = None;
         self.state.plan.mark_drafting();
         self.state.mode = Mode::Build;
     }

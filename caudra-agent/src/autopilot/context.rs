@@ -14,6 +14,7 @@ use caudra_providers::{
 use caudra_storage::sessions::PermissionMode;
 use serde_json::Value;
 
+use super::DecisionOutcome;
 use super::wire::{AutopilotDecision, DecisionKind, output_schema};
 use crate::agent::estimate_message_tokens;
 use crate::agent::judging::{
@@ -24,6 +25,9 @@ use crate::agent::requirements::{RequirementsInput, Said};
 pub const RECENT_DECISIONS: usize = 20;
 pub const MAX_CONTEXT_BYTES: usize = 256 * 1024;
 pub const TOOL_RESULT_PREVIEW_BYTES: usize = 2 * 1024;
+/// What a decision's row keeps of the item the delegate read.
+const MAX_LOGGED_ITEM_BYTES: usize = 2 * 1024;
+const LOGGED_ITEM_CUT: &str = " [cut for the log]";
 const TOOL_INPUT_PREVIEW_BYTES: usize = 2 * 1024;
 const MAX_USER_SAID_BYTES: usize = 32 * 1024;
 const GOAL_TAG: &str = "goal";
@@ -39,6 +43,9 @@ const AUTOPILOT_LABEL: &str = "[autopilot]";
 const ANSWERS_LABEL: &str = "[answers]";
 const SUBJECT_LABEL: &str = "subject:";
 const REASON_LABEL: &str = "reason:";
+const THEN_LABEL: &str = "then:";
+const ANSWERED_FIRST_LABEL: &str = "the user answered first:";
+const ANSWERED_LABEL: &str = "the user answered:";
 const MODE_LABEL: &str = "permission_mode:";
 const ITEM_LABEL: &str = "item:";
 const SCHEMA_LABEL: &str = "schema:";
@@ -198,6 +205,9 @@ fn user_said(input: &RequirementsInput) -> String {
     lines.join("\n")
 }
 
+/// One line per decision. Where the human changed the course, it says what
+/// they answered, so the delegate learns from it. What autopilot said and
+/// what it was shown stay out.
 fn recent_decisions(decisions: &[AutopilotDecision]) -> String {
     let recent = &decisions[decisions.len().saturating_sub(RECENT_DECISIONS)..];
     if recent.is_empty() {
@@ -206,16 +216,37 @@ fn recent_decisions(decisions: &[AutopilotDecision]) -> String {
     recent
         .iter()
         .map(|decision| {
-            format!(
+            let mut line = format!(
                 "{} {} {SUBJECT_LABEL} {} {REASON_LABEL} {}",
                 decision.kind.name(),
                 decision.action.name(),
                 tag_safe_literal(&decision.subject),
                 tag_safe_literal(&decision.reason),
-            )
+            );
+            let human = match &decision.outcome {
+                Some(DecisionOutcome::HumanFirst { answer }) => {
+                    Some((ANSWERED_FIRST_LABEL, answer))
+                }
+                Some(DecisionOutcome::Answered { answer }) => Some((ANSWERED_LABEL, answer)),
+                _ => None,
+            };
+            if let Some((label, answer)) = human {
+                let _ = write!(line, " {THEN_LABEL} {label} {}", tag_safe_literal(answer));
+            }
+            line
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// What a decision's row keeps of `item`: its first [`MAX_LOGGED_ITEM_BYTES`],
+/// marked when the rest is cut.
+pub(super) fn logged_item(item: &str) -> String {
+    let cut = item.floor_char_boundary(MAX_LOGGED_ITEM_BYTES);
+    if cut == item.len() {
+        return item.to_owned();
+    }
+    format!("{}{LOGGED_ITEM_CUT}", &item[..cut])
 }
 
 /// The newest of the conversation that fits both `max_tokens` and
@@ -429,6 +460,7 @@ pub(super) mod tests {
     use super::*;
     use crate::agent::History;
     use crate::agent::judging::{INITIAL_TRANSCRIPT_PERCENT, TOOL_RESULT_LINE};
+    use crate::autopilot::DecisionPayload;
     use crate::autopilot::wire::ActionName;
     use crate::tools::native::question::AUTOPILOT_ANSWERED;
     use crate::tools::{NullProvider, QUESTION_TOOL_NAME};
@@ -488,6 +520,13 @@ pub(super) mod tests {
         "the user's words must be the ones the requirements extractor reads";
     const ONLY_RECENT: &str = "only the most recent decisions must be listed";
     const NOT_THE_USERS: &str = "autopilot's answer must never pass for the user's words";
+    const HUMAN_ANSWER: &str = "deny_guidance: stay in the parser crate";
+    const LOGGED_ITEM: &str = "tool: shell, input: rm -rf target";
+    const PAYLOAD: &str = "run only the parser tests";
+    const HUMAN_SHOWN: &str =
+        "a listed decision must end with what the human answered, if anything";
+    const OWN_WORDS_OUT: &str = "what autopilot said and was shown must stay out of the list";
+    const ITEM_CUT: &str = "a logged item must keep its bound and cut no more than one char";
 
     fn assistant(content: Vec<ContentBlock>) -> Message {
         Message {
@@ -571,6 +610,10 @@ pub(super) mod tests {
             model: None,
             usage: None,
             cost: None,
+            engagement: None,
+            item: None,
+            payload: None,
+            outcome: None,
         }
     }
 
@@ -943,5 +986,54 @@ pub(super) mod tests {
             "{ONLY_RECENT}"
         );
         assert!(!listed.contains(&newest_dropped), "{ONLY_RECENT}");
+    }
+
+    #[test_case(Some(DecisionOutcome::HumanFirst { answer: HUMAN_ANSWER.into() }), Some(ANSWERED_FIRST_LABEL) ; "an_answer_the_human_gave_first")]
+    #[test_case(Some(DecisionOutcome::Answered { answer: HUMAN_ANSWER.into() }), Some(ANSWERED_LABEL) ; "the_human_s_answer_to_an_escalation")]
+    #[test_case(Some(DecisionOutcome::Applied), None ; "an_applied_answer")]
+    #[test_case(None, None ; "an_open_decision")]
+    fn a_listed_decision_says_what_the_human_answered(
+        outcome: Option<DecisionOutcome>,
+        label: Option<&str>,
+    ) {
+        let listed = recent_decisions(&[AutopilotDecision {
+            item: Some(LOGGED_ITEM.into()),
+            payload: Some(DecisionPayload::Guidance(PAYLOAD.into())),
+            outcome,
+            ..decision(0, SUBJECT.into(), REASON)
+        }]);
+
+        let ending = match label {
+            Some(label) => format!(" {THEN_LABEL} {label} {}", tag_safe_literal(HUMAN_ANSWER)),
+            None => tag_safe_literal(REASON),
+        };
+        assert!(listed.ends_with(&ending), "{HUMAN_SHOWN}: {listed}");
+        assert!(
+            !listed.contains(LOGGED_ITEM) && !listed.contains(PAYLOAD),
+            "{OWN_WORDS_OUT}"
+        );
+    }
+
+    /// A single-byte lead puts the bound inside the last multibyte char.
+    #[test_case(0, false ; "an_item_that_fits")]
+    #[test_case(1, true ; "an_item_past_the_bound")]
+    fn a_logged_item_is_cut_on_a_char_boundary(lead: usize, cut: bool) {
+        let chars = MAX_LOGGED_ITEM_BYTES / MULTIBYTE.len_utf8();
+        let item = format!(
+            "{}{}",
+            FILLER.repeat(lead),
+            MULTIBYTE.to_string().repeat(chars)
+        );
+
+        let logged = logged_item(&item);
+
+        assert_eq!(logged.ends_with(LOGGED_ITEM_CUT), cut, "{ITEM_CUT}");
+        let kept = logged.strip_suffix(LOGGED_ITEM_CUT).unwrap_or(&logged);
+        assert!(item.starts_with(kept), "{ITEM_CUT}");
+        assert!(
+            (MAX_LOGGED_ITEM_BYTES + 1 - MULTIBYTE.len_utf8()..=MAX_LOGGED_ITEM_BYTES)
+                .contains(&kept.len()),
+            "{ITEM_CUT}"
+        );
     }
 }

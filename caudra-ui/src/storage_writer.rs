@@ -18,7 +18,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use caudra_agent::peers::PeerSession;
-use caudra_storage::autopilot::StoredAutopilotDecision;
+use caudra_storage::autopilot::{
+    DecisionOutcome, StoredAutopilotDecision, StoredAutopilotEngagement,
+};
 use caudra_storage::engine_decisions::StoredEngineDecision;
 use caudra_storage::id::CaudraId;
 use caudra_storage::permission_state::mutation::{
@@ -73,8 +75,8 @@ type PendingUsage = Arc<Mutex<Vec<QueuedUsage>>>;
 /// The same, for the ledger that sums what tools did.
 type PendingToolCalls = Arc<Mutex<Vec<QueuedToolCall>>>;
 /// Written after the snapshots queued with them, so the session row a
-/// decision references is on disk first.
-type PendingDecisions<D> = Arc<Mutex<Vec<QueuedDecision<D>>>>;
+/// row references is on disk first.
+type PendingRows<R> = Arc<Mutex<Vec<QueuedRow<R>>>>;
 
 type DeleteCallback = Box<dyn FnOnce(Result<(), SessionError>) + Send>;
 type SaveCallback = flume::Sender<Result<(), SessionError>>;
@@ -144,9 +146,20 @@ struct QueuedToolCall {
     enqueued_at: u64,
 }
 
-struct QueuedDecision<D> {
+#[derive(Clone)]
+struct QueuedRow<R> {
     session_id: CaudraId,
-    decision: D,
+    row: R,
+}
+
+/// One change to a session's autopilot log. They are written in the order
+/// they were queued, so a settle never overtakes the decision it updates.
+#[derive(Clone)]
+pub enum AutopilotWrite {
+    Decision(Box<StoredAutopilotDecision>),
+    Settle { seq: u64, outcome: DecisionOutcome },
+    Engaged(StoredAutopilotEngagement),
+    Ended(StoredAutopilotEngagement),
 }
 
 pub struct StorageWriter {
@@ -156,8 +169,8 @@ pub struct StorageWriter {
     workspace_tabs: PendingWorkspaceTabs,
     usage: PendingUsage,
     tool_calls: PendingToolCalls,
-    autopilot_decisions: PendingDecisions<StoredAutopilotDecision>,
-    engine_decisions: PendingDecisions<StoredEngineDecision>,
+    autopilot_writes: PendingRows<AutopilotWrite>,
+    engine_decisions: PendingRows<StoredEngineDecision>,
     done_rx: flume::Receiver<Result<(), SessionError>>,
     thread: JoinHandle<()>,
     generation: Arc<AtomicU64>,
@@ -176,9 +189,9 @@ impl StorageWriter {
         let writer_usage = Arc::clone(&usage);
         let tool_calls: PendingToolCalls = Arc::default();
         let writer_tool_calls = Arc::clone(&tool_calls);
-        let autopilot_decisions: PendingDecisions<StoredAutopilotDecision> = Arc::default();
-        let writer_autopilot_decisions = Arc::clone(&autopilot_decisions);
-        let engine_decisions: PendingDecisions<StoredEngineDecision> = Arc::default();
+        let autopilot_writes: PendingRows<AutopilotWrite> = Arc::default();
+        let writer_autopilot_writes = Arc::clone(&autopilot_writes);
+        let engine_decisions: PendingRows<StoredEngineDecision> = Arc::default();
         let writer_engine_decisions = Arc::clone(&engine_decisions);
         let (wake, wake_rx) = flume::bounded::<()>(1);
         let wake = Arc::new(wake);
@@ -199,7 +212,7 @@ impl StorageWriter {
                     tool_ledger: None,
                     cursors: HashMap::new(),
                     seeded_cursors: writer_seeded_cursors,
-                    autopilot_decisions: writer_autopilot_decisions,
+                    autopilot_writes: writer_autopilot_writes,
                     engine_decisions: writer_engine_decisions,
                     deleted_sessions: HashMap::new(),
                     failing: HashSet::new(),
@@ -238,7 +251,7 @@ impl StorageWriter {
             workspace_tabs,
             usage,
             tool_calls,
-            autopilot_decisions,
+            autopilot_writes,
             engine_decisions,
             done_rx,
             thread,
@@ -293,26 +306,36 @@ impl StorageWriter {
         }
     }
 
-    /// Logs a decision autopilot made in `session_id`, whose row must already
-    /// exist or be queued. Never coalesced: the log keeps every decision.
-    pub fn record_autopilot_decision(
-        &self,
-        session_id: CaudraId,
-        decision: StoredAutopilotDecision,
-    ) {
-        self.autopilot_decisions
+    /// Changes the autopilot log of `session_id`, whose row must already exist
+    /// or be queued. Never coalesced: the log keeps every decision and what
+    /// became of it.
+    pub fn record_autopilot(&self, session_id: CaudraId, write: AutopilotWrite) {
+        self.autopilot_writes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(QueuedDecision {
+            .push(QueuedRow {
                 session_id,
-                decision,
+                row: write,
             });
         match self.wake.try_send(()) {
             Ok(()) | Err(flume::TrySendError::Full(())) => {}
             Err(flume::TrySendError::Disconnected(())) => {
-                warn!(%session_id, "storage writer unavailable; an autopilot decision may not be recorded");
+                warn!(%session_id, "storage writer unavailable; an autopilot log entry may not be recorded");
             }
         }
+    }
+
+    /// The changes to `session_id`'s autopilot log not yet written, oldest
+    /// first. A change leaves the queue only once written, so a read of the
+    /// log that starts after this call holds every change it does not list.
+    pub fn unwritten_autopilot(&self, session_id: CaudraId) -> Vec<AutopilotWrite> {
+        self.autopilot_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|queued| queued.session_id == session_id)
+            .map(|queued| queued.row.clone())
+            .collect()
     }
 
     /// Keeps a decision-engine transcript row for `session_id`, whose row must
@@ -322,9 +345,9 @@ impl StorageWriter {
         self.engine_decisions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(QueuedDecision {
+            .push(QueuedRow {
                 session_id,
-                decision,
+                row: decision,
             });
         match self.wake.try_send(()) {
             Ok(()) | Err(flume::TrySendError::Full(())) => {}
@@ -451,7 +474,7 @@ fn lock(pending: &Pending) -> std::sync::MutexGuard<'_, HashMap<CaudraId, Entry>
     pending.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn claim<D>(pending: &PendingDecisions<D>) -> Vec<QueuedDecision<D>> {
+fn claim<R>(pending: &PendingRows<R>) -> Vec<QueuedRow<R>> {
     mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
@@ -495,8 +518,8 @@ struct Writer {
     tool_ledger: Option<ToolLedger>,
     cursors: HashMap<CaudraId, SessionCursor>,
     seeded_cursors: SeededCursors,
-    autopilot_decisions: PendingDecisions<StoredAutopilotDecision>,
-    engine_decisions: PendingDecisions<StoredEngineDecision>,
+    autopilot_writes: PendingRows<AutopilotWrite>,
+    engine_decisions: PendingRows<StoredEngineDecision>,
     /// Explicit recreation capability retained only by the writer that
     /// completed an ordered delete; ordinary stale saves cannot cross tombstones.
     deleted_sessions: HashMap<CaudraId, SessionRecreation>,
@@ -697,36 +720,62 @@ impl Writer {
         self.database.as_ref()
     }
 
-    /// A decision that fails to write is dropped with a warning: the log
+    /// An entry that fails to write is dropped with a warning: the log
     /// mirrors what the transcript already showed, and a session that is gone
     /// would refuse it on every retry.
-    fn write_autopilot_decisions(
-        &mut self,
-        decisions: Vec<QueuedDecision<StoredAutopilotDecision>>,
-    ) {
-        let Some(database) = self.decisions_database(decisions.len()) else {
+    fn write_autopilot(&mut self, writes: &[QueuedRow<AutopilotWrite>]) {
+        let Some(database) = self.decisions_database(writes.len()) else {
             return;
         };
-        for QueuedDecision {
-            session_id,
-            decision,
-        } in decisions
-        {
-            if let Err(error) = database.insert_autopilot_decision(session_id, &decision) {
-                warn!(%error, %session_id, seq = decision.seq, "autopilot decision write failed");
+        for QueuedRow { session_id, row } in writes {
+            let session_id = *session_id;
+            match row {
+                AutopilotWrite::Decision(decision) => {
+                    if let Err(error) = database.insert_autopilot_decision(session_id, decision) {
+                        warn!(%error, %session_id, seq = decision.seq, "autopilot decision write failed");
+                    }
+                }
+                AutopilotWrite::Settle { seq, outcome } => {
+                    match database.settle_autopilot_decision(session_id, *seq, outcome) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            warn!(%session_id, seq, "settled an autopilot decision the log lacks");
+                        }
+                        Err(error) => {
+                            warn!(%error, %session_id, seq, "autopilot decision outcome write failed");
+                        }
+                    }
+                }
+                AutopilotWrite::Engaged(engagement) => {
+                    if let Err(error) = database.begin_autopilot_engagement(session_id, engagement)
+                    {
+                        warn!(%error, %session_id, engagement = engagement.engagement, "autopilot engagement write failed");
+                    }
+                }
+                AutopilotWrite::Ended(engagement) => {
+                    match database.end_autopilot_engagement(session_id, engagement) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            warn!(%session_id, engagement = engagement.engagement, "ended an autopilot engagement the log lacks");
+                        }
+                        Err(error) => {
+                            warn!(%error, %session_id, engagement = engagement.engagement, "autopilot engagement end write failed");
+                        }
+                    }
+                }
             }
         }
     }
 
     /// Dropped with a warning on failure, for the reason autopilot's
-    /// decisions are.
-    fn write_engine_decisions(&mut self, decisions: Vec<QueuedDecision<StoredEngineDecision>>) {
+    /// entries are.
+    fn write_engine_decisions(&mut self, decisions: Vec<QueuedRow<StoredEngineDecision>>) {
         let Some(database) = self.decisions_database(decisions.len()) else {
             return;
         };
-        for QueuedDecision {
+        for QueuedRow {
             session_id,
-            decision,
+            row: decision,
         } in decisions
         {
             if let Err(error) = database.insert_engine_decisions(session_id, &[decision]) {
@@ -743,6 +792,8 @@ impl Writer {
     /// second request to correct it. Decisions are claimed first too: the
     /// save of the session row each one references was queued ahead of it, so
     /// that save is among the snapshots this pass writes before them.
+    /// Autopilot's changes leave their queue only once written, for
+    /// [`StorageWriter::unwritten_autopilot`].
     fn drain(
         &mut self,
         pending: &Pending,
@@ -751,10 +802,18 @@ impl Writer {
         tool_calls: &PendingToolCalls,
     ) {
         let request = tabs.lock().unwrap_or_else(|e| e.into_inner()).take();
-        let autopilot_decisions = claim(&self.autopilot_decisions);
+        let autopilot_writes = self
+            .autopilot_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let engine_decisions = claim(&self.engine_decisions);
         self.flush(pending);
-        self.write_autopilot_decisions(autopilot_decisions);
+        self.write_autopilot(&autopilot_writes);
+        self.autopilot_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..autopilot_writes.len());
         self.write_engine_decisions(engine_decisions);
         self.flush_permissions();
         if let Some(request) = request {
@@ -1085,6 +1144,7 @@ fn retryable(error: &SessionError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_storage::autopilot::AutopilotEnd;
     use caudra_storage::engine_decisions::{StoredDecisionAnchor, StoredDecisionOutcome};
     use caudra_storage::permission_state::mutation::{
         PermissionMutation, PermissionRecordIdentity, prepare_mutation,
@@ -1140,6 +1200,16 @@ mod tests {
     const DECISION_ACTION: &str = "allow";
     const DECISION_SUBJECT: &str = "bash";
     const DECISION_REASON: &str = "read-only listing";
+    const ENGAGEMENT: u32 = 1;
+    const ENGAGED_AT_MS: u64 = 1_000;
+    const ENDED_AT_MS: u64 = 2_000;
+    const ENGAGED_HISTORY_LEN: usize = 2;
+    const ENDED_HISTORY_LEN: usize = 6;
+    const CONTINUATIONS: u32 = 3;
+    const HUMAN_ANSWER: &str = "allow once";
+    const SETTLED_BEHIND_INSERT: &str =
+        "a settle queued behind its decision must find the decision written";
+    const ENGAGEMENT_LOGGED: &str = "an engagement's start and end must reach the log";
     const ENGINE_FEATURE: &str = "memory_search";
     const ENGINE_MODE: &str = "advise";
     const ENGINE_SUMMARY: &str = "3 notes ranked";
@@ -1469,7 +1539,7 @@ mod tests {
             tool_ledger: None,
             cursors: HashMap::new(),
             seeded_cursors: Arc::default(),
-            autopilot_decisions: Arc::default(),
+            autopilot_writes: Arc::default(),
             engine_decisions: Arc::default(),
             deleted_sessions: HashMap::new(),
             failing: HashSet::new(),
@@ -1814,7 +1884,7 @@ mod tests {
             seq,
             at_ms: seq,
             kind: DECISION_KIND.into(),
-            action: DECISION_ACTION.into(),
+            action: Some(DECISION_ACTION.into()),
             subject: DECISION_SUBJECT.into(),
             reason: DECISION_REASON.into(),
             agent: None,
@@ -1823,6 +1893,28 @@ mod tests {
             model: None,
             usage: None,
             cost: None,
+            engagement: None,
+            item: None,
+            payload: None,
+            outcome: None,
+        }
+    }
+
+    fn engagement(ended: bool) -> StoredAutopilotEngagement {
+        StoredAutopilotEngagement {
+            engagement: ENGAGEMENT,
+            engaged_at_ms: ENGAGED_AT_MS,
+            engaged_history_len: ENGAGED_HISTORY_LEN,
+            goal: None,
+            owns_goal: false,
+            ended_at_ms: ended.then_some(ENDED_AT_MS),
+            ended_history_len: ended.then_some(ENDED_HISTORY_LEN),
+            end: ended.then_some(AutopilotEnd::GoalMet),
+            continuations: if ended { CONTINUATIONS } else { 0 },
+            cost_usd: 0.0,
+            subscription_cost_usd: 0.0,
+            elapsed_ms: 0,
+            retries: 0,
         }
     }
 
@@ -1838,7 +1930,7 @@ mod tests {
         }
         let logged = [decision(0), decision(1)];
         for decision in &logged {
-            writer.record_autopilot_decision(id, decision.clone());
+            writer.record_autopilot(id, AutopilotWrite::Decision(Box::new(decision.clone())));
         }
         writer.shutdown(DRAIN_TIMEOUT);
 
@@ -1848,6 +1940,45 @@ mod tests {
             .unwrap();
         let expected: &[StoredAutopilotDecision] = if saved { &logged } else { &[] };
         assert_eq!(stored, expected);
+    }
+
+    /// One drain takes the whole queue, so the order the App queued in is
+    /// the only thing keeping a settle or an end behind the row it updates.
+    #[test]
+    fn the_autopilot_log_is_written_in_the_order_it_was_queued() {
+        let (_tmp, dir) = state_dir();
+        let (writer, _warn_rx) = writer(&dir);
+        let session = AppSession::new(MODEL, CWD);
+        let id = session.id;
+        let answered = DecisionOutcome::Answered {
+            answer: HUMAN_ANSWER.into(),
+        };
+        writer.send(Arc::new(session));
+        for write in [
+            AutopilotWrite::Engaged(engagement(false)),
+            AutopilotWrite::Decision(Box::new(decision(0))),
+            AutopilotWrite::Settle {
+                seq: 0,
+                outcome: answered.clone(),
+            },
+            AutopilotWrite::Ended(engagement(true)),
+        ] {
+            writer.record_autopilot(id, write);
+        }
+        writer.shutdown(DRAIN_TIMEOUT);
+
+        let database = SessionDatabase::open(&dir).unwrap();
+        let [decision] = database
+            .load_autopilot_decisions(id)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(decision.outcome, Some(answered), "{SETTLED_BEHIND_INSERT}");
+        assert_eq!(
+            database.load_autopilot_engagements(id).unwrap(),
+            [engagement(true)],
+            "{ENGAGEMENT_LOGGED}"
+        );
     }
 
     fn engine_decision(seq: u64, anchor: StoredDecisionAnchor) -> StoredEngineDecision {

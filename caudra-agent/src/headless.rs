@@ -31,7 +31,9 @@ use caudra_providers::{
 };
 #[cfg(test)]
 use caudra_providers::{ContentBlock, Role};
-use caudra_storage::autopilot::{AutopilotEnd, AutopilotStopper, StoredAutopilotDecision};
+use caudra_storage::autopilot::{
+    AutopilotEnd, AutopilotStopper, StoredAutopilotDecision, StoredAutopilotEngagement,
+};
 use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::permission_state::PermissionRuleRecord;
@@ -76,7 +78,7 @@ use crate::automation::http::HttpClient;
 use crate::automation::manager::{AutomationRuntime, RuntimeDeps as AutomationDeps};
 use crate::automation::outbox::claim_message;
 use crate::automation::workflows::Workflows;
-use crate::autopilot::{AutopilotDecision, AutopilotHandle};
+use crate::autopilot::{AutopilotHandle, DecisionOutcome, EngagementSpend};
 use crate::background::{BackgroundTasks, BackgroundTransition, SessionWork};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::commits;
@@ -458,16 +460,119 @@ impl SessionStore {
 
     /// The decision log is a record of what autopilot did, so a decision that cannot be
     /// written is reported and the session carries on.
-    fn record_autopilot_decision(&mut self, decision: &AutopilotDecision) {
+    fn record_autopilot_decision(&mut self, decision: StoredAutopilotDecision) {
         let session_id = self.session.id;
-        if let Err(error) = self.database().and_then(|database| {
-            database
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .insert_autopilot_decision(session_id, &decision.clone().into())
-        }) {
+        if let Err(error) =
+            self.with_database(|database| database.insert_autopilot_decision(session_id, &decision))
+        {
             warn!(%error, %session_id, seq = decision.seq, "autopilot decision not recorded");
         }
+    }
+
+    fn settle_autopilot_decision(&mut self, seq: u32, outcome: &DecisionOutcome) {
+        let session_id = self.session.id;
+        match self.with_database(|database| {
+            database.settle_autopilot_decision(session_id, u64::from(seq), outcome)
+        }) {
+            Ok(true) => {}
+            Ok(false) => warn!(%session_id, seq, "settled an autopilot decision the log lacks"),
+            Err(error) => {
+                warn!(%error, %session_id, seq, "autopilot decision outcome not recorded");
+            }
+        }
+    }
+
+    fn begin_autopilot_engagement(&mut self, engagement: u32, goal: Option<String>) {
+        let Some(autopilot) = &self.autopilot else {
+            return;
+        };
+        let stored = autopilot.stored();
+        let row = StoredAutopilotEngagement {
+            engagement,
+            engaged_at_ms: stored
+                .as_ref()
+                .and_then(|stored| stored.engaged_at_ms)
+                .unwrap_or_else(|| autopilot.now_ms()),
+            engaged_history_len: self.autopilot_history_len(),
+            goal,
+            owns_goal: stored.is_some_and(|stored| stored.owns_goal),
+            ended_at_ms: None,
+            ended_history_len: None,
+            end: None,
+            continuations: 0,
+            cost_usd: 0.0,
+            subscription_cost_usd: 0.0,
+            elapsed_ms: 0,
+            retries: 0,
+        };
+        let session_id = self.session.id;
+        if let Err(error) =
+            self.with_database(|database| database.begin_autopilot_engagement(session_id, &row))
+        {
+            warn!(%error, %session_id, engagement, "autopilot engagement not recorded");
+        }
+    }
+
+    fn end_autopilot_engagement(
+        &mut self,
+        engagement: u32,
+        end: &AutopilotEnd,
+        spend: &EngagementSpend,
+    ) {
+        let Some(autopilot) = &self.autopilot else {
+            return;
+        };
+        let ended_at_ms = autopilot.now_ms();
+        let row = StoredAutopilotEngagement {
+            engagement,
+            engaged_at_ms: ended_at_ms,
+            engaged_history_len: 0,
+            goal: None,
+            owns_goal: false,
+            ended_at_ms: Some(ended_at_ms),
+            ended_history_len: Some(self.autopilot_history_len()),
+            end: Some(end.clone()),
+            continuations: spend.continuations,
+            cost_usd: spend.cost_usd,
+            subscription_cost_usd: spend.subscription_cost_usd,
+            elapsed_ms: spend.elapsed_ms,
+            retries: spend.retries,
+        };
+        let session_id = self.session.id;
+        match self.with_database(|database| database.end_autopilot_engagement(session_id, &row)) {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(%session_id, engagement, "ended an autopilot engagement the log lacks")
+            }
+            Err(error) => {
+                warn!(%error, %session_id, engagement, "autopilot engagement end not recorded")
+            }
+        }
+    }
+
+    /// History items the session holds, counted as a decision's row counts them. The
+    /// snapshot autopilot last saw is newer during a run, and the stored transcript is
+    /// newer between engagements, so the larger of the two is the nearer.
+    fn autopilot_history_len(&self) -> usize {
+        let messages = self.session.messages();
+        let head = resolve_history_head(
+            messages,
+            self.session.meta.history_head,
+            self.session.meta.pending_revert.is_some(),
+        );
+        let stored = transcript_history_items(messages, head).map_or(0, |items| items.len());
+        self.autopilot
+            .as_ref()
+            .and_then(AutopilotHandle::snapshot)
+            .map_or(stored, |snapshot| snapshot.history_len.max(stored))
+    }
+
+    fn with_database<T>(
+        &mut self,
+        write: impl FnOnce(&SessionDatabase) -> Result<T, SessionError>,
+    ) -> Result<T, SessionError> {
+        let database = self.database()?;
+        write(&database.lock().unwrap_or_else(|error| error.into_inner()))
     }
 
     /// Kept for display alone, so a row that cannot be written is reported and the session
@@ -726,7 +831,15 @@ impl SessionStore {
                 self.session.set_subagents(subagents);
             }
             AgentEvent::Autopilot(AutopilotEvent::Decided(decision)) => {
-                self.record_autopilot_decision(decision);
+                self.record_autopilot_decision((**decision).clone().into());
+                return Ok(());
+            }
+            AgentEvent::Autopilot(AutopilotEvent::StoodDown(stood_down)) => {
+                self.record_autopilot_decision((**stood_down).clone().into());
+                return Ok(());
+            }
+            AgentEvent::Autopilot(AutopilotEvent::Settled { seq, outcome }) => {
+                self.settle_autopilot_decision(*seq, outcome);
                 return Ok(());
             }
             AgentEvent::Decision(note) => {
@@ -734,8 +847,18 @@ impl SessionStore {
                 self.record_engine_decision(note, agent);
                 return Ok(());
             }
-            AgentEvent::Autopilot(AutopilotEvent::Engaged | AutopilotEvent::Ended { .. })
-                if self.autopilot.is_some() => {}
+            AgentEvent::Autopilot(AutopilotEvent::Engaged { engagement, goal })
+                if self.autopilot.is_some() =>
+            {
+                self.begin_autopilot_engagement(*engagement, goal.clone());
+            }
+            AgentEvent::Autopilot(AutopilotEvent::Ended {
+                reason,
+                engagement,
+                spend,
+            }) if self.autopilot.is_some() => {
+                self.end_autopilot_engagement(*engagement, reason, spend);
+            }
             _ => return Ok(()),
         }
         self.save()
@@ -1888,6 +2011,8 @@ pub struct InteractiveHandle {
     pub model_route: Option<InteractiveModelRoute>,
     pub session_id: SessionRef,
     pub session_lease: Arc<SessionLease>,
+    /// Where the session's database lives, for the host's own reads of it.
+    pub state_dir: StateDir,
     pub permissions: Arc<PermissionManager>,
     /// The session's workflow runtime, when `workflow_mode` asked for one.
     pub workflow: Option<WorkflowHandle>,
@@ -2672,6 +2797,7 @@ impl InteractiveModelRoute {
 impl InteractiveHandle {
     #[cfg(any(test, feature = "test-support"))]
     pub fn for_test(
+        state_dir: StateDir,
         session_lease: Arc<SessionLease>,
         permissions: Arc<PermissionManager>,
         answer_tx: flume::Sender<String>,
@@ -2688,6 +2814,7 @@ impl InteractiveHandle {
             model_route: None,
             session_id: SessionRef::from(session_lease.id()),
             session_lease,
+            state_dir,
             permissions,
             workflow: None,
             goal: GoalHandle::default(),
@@ -2762,10 +2889,11 @@ impl InteractiveHandle {
     /// Engages the session's autopilot, owning the active goal when the caller set it.
     /// Already engaged, it only takes such a goal on, and announces nothing.
     pub fn engage_autopilot(&self, owns_goal: bool) {
+        let goal = self.goal.snapshot().map(|goal| goal.condition.to_string());
         if let Some(engaged) = self
             .autopilot
             .as_ref()
-            .and_then(|autopilot| autopilot.engage(owns_goal))
+            .and_then(|autopilot| autopilot.engage(owns_goal, goal))
         {
             announce_autopilot(&self.autopilot_events, engaged);
         }
@@ -4492,6 +4620,7 @@ async fn spawn_prepared_session(
         model_route,
         session_id: session_ref,
         session_lease,
+        state_dir,
         permissions,
         workflow,
         goal,
@@ -4730,6 +4859,7 @@ mod tests {
     use crate::automation::clock::FakeClock;
     use crate::automation::manager::{GOAL_ACTIVE, GOAL_OWNED_BY_AUTOPILOT, PAUSED_BY_SDK};
     use crate::automation::testing::AutomationFixture;
+    use crate::autopilot::{ActionName, AutopilotDecision, DecisionKind, StoodDown};
     use crate::background::TaskDelivery;
     use crate::decisions::{DecisionFeature, NoteAnchor, NoteOutcome};
     use crate::permissions::{
@@ -8793,7 +8923,7 @@ complete(#{ report: first.output });
         smol::block_on(async {
             let fixture = AutomationFixture::default();
             let autopilot = AutopilotHandle::default();
-            autopilot.engage(true);
+            autopilot.engage(true, None);
             let (runtime, automations, host, _) =
                 served_beside(&fixture, fixture_store(&fixture), Some(autopilot)).await;
             let goal = GoalHandle::default();
@@ -8966,6 +9096,17 @@ complete(#{ report: first.output });
     const RESUMED_CHECKIN: &str = "a resumed engagement must owe its goal one check-in";
     const MAIN_PLAN_ONLY: &str = "only the main agent's plan and choice may be implemented";
     const SPEND_COUNTED: &str = "a subagent's spend must reach the autopilot cost limit";
+    const FIRST_ENGAGEMENT: u32 = 1;
+    const AUTOPILOT_START_MS: i64 = 1_790_000_000_000;
+    const DECIDED_SEQ: u32 = 0;
+    const STOOD_DOWN_SEQ: u32 = 1;
+    const LOGGED_SUBJECT: &str = "shell: cargo test";
+    const LOGGED_REASON: &str = "the user should decide";
+    const HUMAN_ANSWER: &str = "allow";
+    const ENGAGEMENT_LOGGED: &str =
+        "an engagement's start and end must reach the session's engagement log";
+    const AUTOPILOT_LOGGED: &str =
+        "every decision row must reach the session's log, with what became of it";
 
     fn autopilot_params() -> AutopilotParams {
         AutopilotParams {
@@ -9058,16 +9199,19 @@ complete(#{ report: first.output });
             handle.interrupt().await.unwrap();
 
             assert_eq!(
-                [
+                next_autopilot_event(&handle.event_rx).await,
+                AutopilotEvent::Engaged {
+                    engagement: FIRST_ENGAGEMENT,
+                    goal: None,
+                },
+                "{ANNOUNCED_ONCE}"
+            );
+            assert!(
+                matches!(
                     next_autopilot_event(&handle.event_rx).await,
-                    next_autopilot_event(&handle.event_rx).await,
-                ],
-                [
-                    AutopilotEvent::Engaged,
-                    AutopilotEvent::Ended {
-                        reason: interrupted.clone(),
-                    },
-                ],
+                    AutopilotEvent::Ended { reason, engagement: FIRST_ENGAGEMENT, .. }
+                        if reason == interrupted
+                ),
                 "{ANNOUNCED_ONCE}"
             );
             assert!(!autopilot.is_engaged(), "{INTERRUPT_ENDS}");
@@ -9083,8 +9227,19 @@ complete(#{ report: first.output });
                 .expect(INTERRUPT_ENDS);
             assert_eq!(
                 (stored.engaged, stored.last_end),
-                (false, Some(interrupted)),
+                (false, Some(interrupted.clone())),
                 "{INTERRUPT_ENDS}"
+            );
+            let [row] = SessionDatabase::open(&session.state_dir)
+                .unwrap()
+                .load_autopilot_engagements(session_id())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            assert_eq!(
+                (row.engagement, row.end, row.ended_at_ms.is_some()),
+                (FIRST_ENGAGEMENT, Some(interrupted), true),
+                "{ENGAGEMENT_LOGGED}"
             );
         });
     }
@@ -9182,12 +9337,14 @@ complete(#{ report: first.output });
             stored.goal.set(GOAL).unwrap();
             stored.session.meta.autopilot = Some(Box::new(StoredAutopilot {
                 engaged: true,
+                engagement: 1,
                 owns_goal: true,
                 engaged_at_ms: None,
                 continuations: RESUMED_CONTINUATIONS,
                 cost_usd: 0.0,
                 subscription_cost_usd: 0.0,
                 elapsed_ms: 0,
+                retries: 0,
                 last_end: None,
             }));
             stored.save().unwrap();
@@ -9283,7 +9440,7 @@ complete(#{ report: first.output });
             max_cost: Some(TURN_COST),
             ..AutopilotConfig::default()
         });
-        autopilot.engage(false);
+        autopilot.engage(false, None);
         let (events_tx, events) = flume::unbounded();
         let AgentEvent::TurnComplete(mut turn) = answered(TURN_COST) else {
             unreachable!("answered is a completed turn");
@@ -9309,10 +9466,125 @@ complete(#{ report: first.output });
                     reason: AutopilotEnd::Budget {
                         kind: AutopilotBudget::Cost,
                     },
+                    ..
                 })
             )
         });
         assert_eq!(ended, !autopilot.is_engaged(), "{SPEND_COUNTED}");
         ended
+    }
+
+    fn autopilot_row(seq: u32, autopilot: &AutopilotHandle) -> AutopilotDecision {
+        AutopilotDecision {
+            seq,
+            at_ms: autopilot.now_ms(),
+            kind: DecisionKind::Permission,
+            action: ActionName::Escalate,
+            subject: LOGGED_SUBJECT.into(),
+            reason: LOGGED_REASON.into(),
+            agent: None,
+            tool_use_id: None,
+            history_len: 0,
+            model: None,
+            usage: None,
+            cost: None,
+            engagement: autopilot.engagement(),
+            item: Some(LOGGED_SUBJECT.into()),
+            payload: None,
+            outcome: None,
+        }
+    }
+
+    /// Every row an engagement writes reaches the session's log: its start and end, a
+    /// decision and how it settled, and a decision it stood down from.
+    #[test]
+    fn the_autopilot_log_keeps_what_an_engagement_writes() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = store_in(&tmp);
+        let autopilot = AutopilotHandle::new(FakeClock::new(AUTOPILOT_START_MS));
+        store.autopilot = Some(autopilot.clone());
+        let stopped = AutopilotEnd::Stopped {
+            by: AutopilotStopper::Sdk,
+        };
+        let answered = DecisionOutcome::Answered {
+            answer: HUMAN_ANSWER.into(),
+        };
+        let engaged = autopilot.engage(false, Some(GOAL.into())).unwrap();
+        let decided = autopilot.record(autopilot_row(DECIDED_SEQ, &autopilot));
+        let stood_down = StoodDown {
+            seq: STOOD_DOWN_SEQ,
+            at_ms: autopilot.now_ms(),
+            kind: DecisionKind::Question,
+            subject: LOGGED_SUBJECT.into(),
+            item: None,
+            agent: None,
+            tool_use_id: None,
+            history_len: 0,
+            engagement: autopilot.engagement(),
+            outcome: DecisionOutcome::TakenOver,
+        };
+        let settled = autopilot.settle(DECIDED_SEQ, answered.clone());
+        let ended = autopilot.end(stopped.clone()).unwrap();
+
+        for event in [
+            engaged,
+            decided,
+            AutopilotEvent::StoodDown(Box::new(stood_down)),
+            settled,
+            ended,
+        ] {
+            store
+                .record_event(&Envelope {
+                    event: AgentEvent::Autopilot(event),
+                    subagent: None,
+                    run_id: AUTOPILOT_EVENT_RUN_ID,
+                    task: None,
+                    workflow: None,
+                })
+                .unwrap();
+        }
+
+        let database = SessionDatabase::open(&store.dir).unwrap();
+        let rows: Vec<_> = database
+            .load_autopilot_decisions(session_id())
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.seq, row.action, row.engagement, row.outcome))
+            .collect();
+        let escalated = Some(ActionName::Escalate.name().to_owned());
+        assert_eq!(
+            rows,
+            [
+                (
+                    u64::from(DECIDED_SEQ),
+                    escalated,
+                    Some(FIRST_ENGAGEMENT),
+                    Some(answered)
+                ),
+                (
+                    u64::from(STOOD_DOWN_SEQ),
+                    None,
+                    Some(FIRST_ENGAGEMENT),
+                    Some(DecisionOutcome::TakenOver)
+                ),
+            ],
+            "{AUTOPILOT_LOGGED}"
+        );
+        let [row] = database
+            .load_autopilot_engagements(session_id())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            (row.engagement, row.goal.as_deref(), row.end),
+            (FIRST_ENGAGEMENT, Some(GOAL), Some(stopped)),
+            "{ENGAGEMENT_LOGGED}"
+        );
+        let started = u64::try_from(AUTOPILOT_START_MS).unwrap();
+        assert_eq!(
+            (row.engaged_at_ms, row.ended_at_ms),
+            (started, Some(started)),
+            "{ENGAGEMENT_LOGGED}"
+        );
     }
 }

@@ -32,6 +32,7 @@ Only you engage autopilot. Scripts, profiles, and the model cannot.
 | `/autopilot <goal>` | Sets the goal as `/goal <goal>` does, and engages with autopilot owning it. On an engaged session it replaces the goal. |
 | `/autopilot off` or `/autopilot stop` | Disengages. |
 | `/autopilot model` | Picks the model for the Autopilot job. |
+| `/autopilot log` | Opens the [log](#the-log) of what autopilot did in this session, engaged or not. |
 | `--autopilot` | Engages the session Caudra starts with, in the terminal UI, `-p`, and the SDK. |
 | `autopilot_start` | Engages from an SDK client. See [Headless Mode](/docs/headless/#autopilot). |
 
@@ -143,12 +144,35 @@ Most autopilot continuations stay inside the current run. So `[agent]` settings,
 
 ## See what it does
 
-- **Transcript.** Every decision is a row with its reason. Delegate replies are marked as autopilot's, during the session and after a resume.
+- **Transcript.** Every decision is a row with its reason, and so are the start and end of each engagement. Click a decision row to open what autopilot said, what happened next, which agent it was for, and what it cost. Delegate replies are marked as autopilot's, during the session and after a resume.
 - **Cards.** A prompt, question, or plan card that the delegate is deciding says so, and does not take focus. When the delegate leaves it to you, the card says why, takes focus, and notifies you.
-- **Footer.** A chip, `[autopilot · 12/100]` or `[ap]` in a narrow terminal, shows the continuations used against the limit. It turns amber while an item waits for you. Click it, or run `/autopilot` on an engaged session, to open the status panel with the goal and who owns it, budget use, the model, waiting items, and recent decisions. In the panel, `s` stops autopilot, `m` picks its model, and Esc closes it. See [Keybindings](/docs/keybindings/#context-specific).
+- **Footer.** A chip, `[autopilot · 12/100]` or `[ap]` in a narrow terminal, shows the continuations used against the limit. It turns amber while an item waits for you. Click it, or run `/autopilot` on an engaged session, to open the status panel. Its Status tab shows the goal and who owns it, budget use, the model, and waiting items. Its Log tab is [the log](#the-log). In the panel, `s` stops autopilot, `m` picks its model, and Esc closes it. See [Keybindings](/docs/keybindings/#context-specific).
 - **Pane status.** While the delegate decides, the [pane status](/docs/notifications/#persistent-pane-status) reads as working. An item left to you reads as blocked.
 - **Notifications.** An item left to you is an urgent notification, and the end of autopilot is a notice. Both follow [`ui.notifications`](/docs/notifications/#configuration).
-- **Decision log.** Caudra keeps the last 2,000 decisions of each session in its database, with the model, the reason, and the cost. A fork starts without them.
+
+### The log
+
+The Log tab of the status panel lists what autopilot did in this session, newest first, under a header for each engagement. A header says when the engagement ran, how it ended, how many decisions it made, and what it cost. `/autopilot log` opens it at any time, so you can read an engagement after it ended.
+
+Each entry records:
+
+- what was decided, when, and in which engagement,
+- what the delegate was asked, such as the permission request with its command, up to 2 KiB,
+- what autopilot said, such as the guidance of a denial, the text of a reply, or the answers it picked,
+- its reason,
+- what happened next: the action applied, you answered first, you took the card, a reload or a rule settled it, the run stopped, or you answered after autopilot left it to you,
+- the agent it was for, the model, the tokens, and the cost.
+
+| Key | What it does |
+|-----|--------------|
+| `f` | Cycles the filter: all entries, the ones left to you or answered by you, then each kind of decision. |
+| `y` | Copies the selected entry. |
+| Enter | Jumps to the entry's row in the transcript. |
+| Tab | Switches between Status and Log. |
+
+Caudra keeps the last 2,000 decisions and 200 engagements of each session in its database, with the session. They go when the session is deleted, and a fork starts without them. Decisions made before preview 9 keep only their one-line record, and the panel shows them under Earlier decisions. Notifications never carry what the log holds. SDK clients read the same log with [`autopilot_log`](/docs/headless/#autopilot).
+
+The delegate reads its recent decisions in the engagement, and sees where you answered instead of it, so it can follow your lead.
 
 ## Stop it or take over
 

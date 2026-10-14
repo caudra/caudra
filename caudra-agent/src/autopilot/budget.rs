@@ -10,6 +10,8 @@ use caudra_config::AutopilotConfig;
 use caudra_providers::Billing;
 use caudra_storage::autopilot::{AutopilotBudget, StoredAutopilot};
 
+use super::EngagementSpend;
+
 /// Consecutive `continue` reviews allowed with no human input between them.
 pub const MAX_REVIEW_STREAK: u32 = 3;
 const FIRST_RETRY_DELAY: Duration = Duration::from_secs(60);
@@ -30,6 +32,8 @@ pub struct Budget {
     elapsed_before: Duration,
     /// When this process took the engagement over, `None` once it ended.
     resumed_at: Option<Duration>,
+    /// Main-agent runs retried after an error. Counted, never capped here.
+    retries: u32,
 }
 
 impl Budget {
@@ -40,6 +44,7 @@ impl Budget {
             subscription_cost_usd: 0.0,
             elapsed_before: Duration::ZERO,
             resumed_at: Some(now),
+            retries: 0,
         }
     }
 
@@ -52,6 +57,7 @@ impl Budget {
             subscription_cost_usd: stored.subscription_cost_usd,
             elapsed_before: Duration::from_millis(stored.elapsed_ms),
             resumed_at: stored.engaged.then_some(now),
+            retries: stored.retries,
         }
     }
 
@@ -66,7 +72,23 @@ impl Budget {
         stored.continuations = self.continuations;
         stored.cost_usd = self.cost_usd;
         stored.subscription_cost_usd = self.subscription_cost_usd;
-        stored.elapsed_ms = u64::try_from(self.elapsed(now).as_millis()).unwrap_or(u64::MAX);
+        stored.elapsed_ms = elapsed_ms(self.elapsed(now));
+        stored.retries = self.retries;
+    }
+
+    /// The use as an engagement's end reports it.
+    pub fn spend(&self, now: Duration) -> EngagementSpend {
+        EngagementSpend {
+            continuations: self.continuations,
+            cost_usd: self.cost_usd,
+            subscription_cost_usd: self.subscription_cost_usd,
+            elapsed_ms: elapsed_ms(self.elapsed(now)),
+            retries: self.retries,
+        }
+    }
+
+    pub fn count_retry(&mut self) {
+        self.retries = self.retries.saturating_add(1);
     }
 
     pub fn elapsed(&self, now: Duration) -> Duration {
@@ -179,6 +201,10 @@ pub fn retry_delay(attempt: u32, error_retries: u32) -> Option<Duration> {
     Some(delay.min(MAX_RETRY_DELAY))
 }
 
+fn elapsed_ms(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use test_case::test_case;
@@ -227,12 +253,14 @@ mod tests {
     fn engagement() -> StoredAutopilot {
         StoredAutopilot {
             engaged: true,
+            engagement: 1,
             owns_goal: false,
             engaged_at_ms: None,
             continuations: 0,
             cost_usd: 0.0,
             subscription_cost_usd: 0.0,
             elapsed_ms: 0,
+            retries: 0,
             last_end: None,
         }
     }
@@ -362,6 +390,7 @@ mod tests {
         budget.try_continue(&limits(), clock.monotonic()).unwrap();
         budget.add_spend(Some(HALF_COST), Billing::Api);
         budget.add_spend(Some(HALF_COST), Billing::Subscription);
+        budget.count_retry();
         clock.advance(RAN_BEFORE_RESTART);
         let mut stored = engagement();
         budget.store(&mut stored, clock.monotonic());
@@ -386,6 +415,10 @@ mod tests {
         assert_eq!(
             resumed.subscription_cost_usd(),
             budget.subscription_cost_usd()
+        );
+        assert_eq!(
+            resumed.spend(reopened.monotonic()).retries,
+            budget.spend(clock.monotonic()).retries
         );
         assert_eq!(
             resumed.overspent(&limits(), reopened.monotonic()),

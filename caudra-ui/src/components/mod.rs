@@ -1388,6 +1388,12 @@ impl DisplayMessage {
         Self::new(DisplayRole::Autopilot, text)
     }
 
+    /// The first line of `text` is the title, and each line after it a
+    /// detail the title opens.
+    pub(crate) fn autopilot_decision(seq: u64, text: String) -> Self {
+        Self::new(DisplayRole::AutopilotDecision(seq), text)
+    }
+
     /// The title names `feature`, as its config key reads, and what it did;
     /// each detail is a line of the body the title opens.
     pub(crate) fn decision(
@@ -1533,9 +1539,13 @@ pub enum DisplayRole {
     /// has a body worth reading, so it collapses to its heading and opens on a
     /// click.
     Injected,
-    /// What autopilot did for the user: a decision, a retry, an engagement
-    /// starting or ending, or a message it wrote on their behalf.
+    /// What autopilot did for the user: a retry, an engagement starting or
+    /// ending, or a message it wrote on their behalf.
     Autopilot,
+    /// A decision autopilot made or stood down from, under its seq so it can
+    /// be found again. Drawn as an autopilot row, it folds to its title like
+    /// a decision-engine row.
+    AutopilotDecision(u64),
     /// What a decision-engine feature changed, would have changed in shadow,
     /// or left to the default when the engine failed. Display only: the model
     /// never sees it. It folds to its title like an injected message.

@@ -22,6 +22,7 @@ use crate::id::CaudraId;
 use crate::permission_state::PermissionRuleRecord;
 use crate::thinking::StoredThinking;
 use crate::tool_ledger::{Latency, ToolOutcome};
+use crate::usage_ledger::LedgerPurpose;
 use crate::workspace_binding::StoredWorkspaceBinding;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -620,6 +621,10 @@ pub struct Session<M, U, T> {
     subagents: Vec<StoredSubagent>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     usage_by_model: HashMap<String, StoredTokenUsage>,
+    /// The same spend keyed by [`LedgerPurpose::storage_name`], so `/usage`
+    /// can say what the session spent on chat and what on everything else.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    usage_by_purpose: HashMap<String, StoredTokenUsage>,
     /// A list rather than a map because the key is a triple, and because this
     /// is rewritten whole on every save anyway.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -681,6 +686,7 @@ impl<M: Clone, U: Clone, T: Clone> Clone for Session<M, U, T> {
             subagent_task_specs: self.subagent_task_specs.clone(),
             subagents: self.subagents.clone(),
             usage_by_model: self.usage_by_model.clone(),
+            usage_by_purpose: self.usage_by_purpose.clone(),
             tool_usage: self.tool_usage.clone(),
             meta: self.meta.clone(),
             created_at: self.created_at,
@@ -955,6 +961,8 @@ enum LogRecord<M, U, T> {
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         usage_by_model: HashMap<String, StoredTokenUsage>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        usage_by_purpose: HashMap<String, StoredTokenUsage>,
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         subagent_task_specs: HashMap<String, StoredSubagentTaskSpec>,
         #[serde(flatten)]
         meta: Box<SessionMeta>,
@@ -1047,6 +1055,7 @@ where
             workspace_binding: session.workspace_binding.clone(),
             subagents: session.subagents.clone(),
             usage_by_model: session.usage_by_model.clone(),
+            usage_by_purpose: session.usage_by_purpose.clone(),
             subagent_task_specs: session.subagent_task_specs.clone(),
             meta: Box::new(session.meta.clone()),
         },
@@ -1142,6 +1151,7 @@ where
             subagent_task_specs: HashMap::new(),
             subagents: Vec::new(),
             usage_by_model: HashMap::new(),
+            usage_by_purpose: HashMap::new(),
             tool_usage: Vec::new(),
             meta: SessionMeta::default(),
             created_at: now,
@@ -1522,8 +1532,21 @@ where
         self.rewrite();
     }
 
-    pub fn add_model_usage(&mut self, model: &str, usage: StoredTokenUsage) {
+    pub fn usage_by_purpose(&self) -> &HashMap<String, StoredTokenUsage> {
+        &self.usage_by_purpose
+    }
+
+    pub fn add_model_usage(
+        &mut self,
+        model: &str,
+        purpose: LedgerPurpose,
+        usage: StoredTokenUsage,
+    ) {
         *self.usage_by_model.entry(model.to_owned()).or_default() += usage;
+        *self
+            .usage_by_purpose
+            .entry(purpose.storage_name().to_owned())
+            .or_default() += usage;
         self.touch();
     }
 
@@ -1689,6 +1712,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::LedgerPurpose;
     use super::StoredThinking;
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, DEFAULT_TITLE, LOG_FORMAT_VERSION,
@@ -2253,6 +2277,7 @@ mod tests {
         let mut session: TestSession = Session::new("anthropic/claude-sonnet-4", "/project");
         session.add_model_usage(
             "claude-sonnet-4",
+            LedgerPurpose::Chat,
             StoredTokenUsage {
                 input: 100,
                 output: 20,
@@ -2264,6 +2289,7 @@ mod tests {
         );
         session.add_model_usage(
             "claude-haiku-4",
+            LedgerPurpose::Goal,
             StoredTokenUsage {
                 input: 30,
                 output: 10,
@@ -2284,6 +2310,14 @@ mod tests {
         assert_eq!(
             loaded.usage_by_model()["claude-haiku-4"].cost,
             Some(HAIKU_COST)
+        );
+        assert_eq!(
+            loaded.usage_by_purpose()[LedgerPurpose::Chat.storage_name()],
+            loaded.usage_by_model()["claude-sonnet-4"]
+        );
+        assert_eq!(
+            loaded.usage_by_purpose()[LedgerPurpose::Goal.storage_name()],
+            loaded.usage_by_model()["claude-haiku-4"]
         );
     }
 
@@ -2339,7 +2373,7 @@ mod tests {
     fn unpriced_usage_entry_stays_unpriced_across_a_reload() {
         let (_temp, state_dir) = state_dir();
         let mut session: TestSession = Session::new("m", "/project");
-        session.add_model_usage("m", usage(7, None));
+        session.add_model_usage("m", LedgerPurpose::Chat, usage(7, None));
         session.save(&state_dir).unwrap();
 
         let entry = TestSession::load(session.id, &state_dir)
@@ -2357,13 +2391,21 @@ mod tests {
     fn recorded_costs_survive_a_reload_and_keep_adding_up() {
         let (_temp, state_dir) = state_dir();
         let mut session: TestSession = Session::new("anthropic/claude-sonnet-4", "/project");
-        session.add_model_usage("claude-sonnet-4", usage(100, Some(SONNET_COST)));
-        session.add_model_usage("claude-haiku-4", usage(30, None));
+        session.add_model_usage(
+            "claude-sonnet-4",
+            LedgerPurpose::Chat,
+            usage(100, Some(SONNET_COST)),
+        );
+        session.add_model_usage("claude-haiku-4", LedgerPurpose::Chat, usage(30, None));
         session.save(&state_dir).unwrap();
 
         let mut loaded = TestSession::load(session.id, &state_dir).unwrap();
-        loaded.add_model_usage("claude-sonnet-4", usage(50, None));
-        loaded.add_model_usage("claude-haiku-4", usage(10, Some(HAIKU_COST)));
+        loaded.add_model_usage("claude-sonnet-4", LedgerPurpose::Chat, usage(50, None));
+        loaded.add_model_usage(
+            "claude-haiku-4",
+            LedgerPurpose::Chat,
+            usage(10, Some(HAIKU_COST)),
+        );
 
         let sonnet = loaded.usage_by_model()["claude-sonnet-4"];
         assert_eq!((sonnet.input, sonnet.cost), (150, Some(SONNET_COST)));
@@ -2387,7 +2429,7 @@ mod tests {
             fast: false,
             outcome: StoredSubagentOutcome::Done,
         }]);
-        session.add_model_usage("m", usage(7, None));
+        session.add_model_usage("m", LedgerPurpose::Chat, usage(7, None));
         session.meta.fast = true;
 
         let record: Value = serde_json::from_slice(&meta_record(&session).unwrap()).unwrap();
@@ -2395,6 +2437,10 @@ mod tests {
         assert_eq!(record["t"], META_RECORD);
         assert_eq!(record["subagents"][0]["name"], "child");
         assert_eq!(record["usage_by_model"]["m"]["input"], 7);
+        assert_eq!(
+            record["usage_by_purpose"][LedgerPurpose::Chat.storage_name()]["input"],
+            7
+        );
         assert_eq!(record["fast"], true);
     }
 
@@ -3240,7 +3286,7 @@ mod tests {
     /// An owner re-merges its history only when `messages_revision` moves, so
     /// a tool output or a usage record landing must leave it where it was.
     #[test_case(|s| s.insert_tool_output("t1".into(), Value::Null), false ; "a_tool_output")]
-    #[test_case(|s| s.add_model_usage("m", StoredTokenUsage::default()), false ; "a_usage_record")]
+    #[test_case(|s| s.add_model_usage("m", LedgerPurpose::Chat, StoredTokenUsage::default()), false ; "a_usage_record")]
     #[test_case(|s| s.set_meta(SessionMeta { input_draft: Some(PENDING_DRAFT.into()), ..s.meta.clone() }), false ; "a_meta_change")]
     #[test_case(|s| s.push_message(user_message("b")), true ; "a_pushed_message")]
     #[test_case(append_reply, true ; "an_appended_history")]

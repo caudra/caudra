@@ -7,15 +7,14 @@
 
 use caudra_providers::{AutopilotMessageKind, AutopilotOrigin, Message, tag_safe_literal};
 
-use super::AutopilotHandle;
 use super::context::{DecisionRequest, clip};
-use super::delegate::DecisionOrigin;
+use super::delegate::{DecisionOrigin, DecisionSlot};
 use super::wire::{DecisionKind, DelegateAction, DelegateOutput};
+use super::{AutopilotHandle, DecisionOutcome};
 use crate::EventSender;
 use crate::agent::GoalSnapshot;
 use crate::cancel::CancelToken;
 use crate::prompt::{AUTOPILOT_UNREPORTED_WORK_PROMPT, WORK_SLOT};
-use crate::types::AutopilotEvent;
 
 const MAX_ITEM_BYTES: usize = 32 * 1024;
 const MAX_SUBJECT_BYTES: usize = 160;
@@ -144,25 +143,24 @@ impl TurnEnd {
 
     /// Announces the decision, asks the delegate and records the decision's
     /// row. `None` when `cancel` fired first. A review the delegate continues
-    /// once the streak is full is recorded as left to a human.
+    /// once the streak is full is recorded as left to a human. An answer
+    /// autopilot gave is recorded as applied, and an escalation is left for
+    /// whoever answers it to settle.
     pub async fn decide(
         self,
         handle: &AutopilotHandle,
         event_tx: &EventSender,
         cancel: &CancelToken,
     ) -> Option<Verdict> {
-        let seq = handle.next_seq();
-        event_tx.try_send(AutopilotEvent::Deciding {
-            seq,
-            kind: self.kind,
-            subject: self.subject.clone(),
-        });
+        let origin = DecisionOrigin::new(handle, self.subject, &self.item);
+        let slot = DecisionSlot::new(handle.clone(), self.kind, origin, event_tx);
+        slot.announce();
         let request = DecisionRequest {
             kind: self.kind,
             reserved: false,
             item: &self.item,
         };
-        let mut outcome = Box::pin(handle.decide(&request, event_tx, cancel)).await?;
+        let mut outcome = slot.decide(&request, cancel).await?;
         if self.kind == DecisionKind::Review
             && matches!(
                 outcome.answer,
@@ -175,17 +173,16 @@ impl TurnEnd {
         {
             outcome.answer = Err(STREAK_REASON.into());
         }
-        let origin = DecisionOrigin {
-            subject: self.subject,
-            agent: None,
-            tool_use_id: None,
-            history_len: handle.snapshot().map_or(0, |snapshot| snapshot.history_len),
-        };
-        event_tx.try_send(handle.record(outcome.decision(seq, handle.now_ms(), origin)));
+        let applied = matches!(&outcome.answer, Ok(output)
+            if !matches!(output.action, DelegateAction::Escalate));
+        slot.record(&outcome, applied.then_some(DecisionOutcome::Applied));
         let action = outcome
             .answer
             .map_or(DelegateAction::Escalate, |output| output.action);
-        Some(Verdict { seq, action })
+        Some(Verdict {
+            seq: slot.seq(),
+            action,
+        })
     }
 }
 

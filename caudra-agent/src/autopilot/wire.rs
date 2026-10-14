@@ -4,7 +4,7 @@
 //! delegate meant by it.
 
 use caudra_providers::tag_safe_literal;
-use caudra_storage::autopilot::StoredAutopilotDecision;
+use caudra_storage::autopilot::{DecisionOutcome, DecisionPayload, StoredAutopilotDecision};
 use caudra_storage::sessions::StoredTokenUsage;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -203,6 +203,19 @@ impl DelegateAction {
             Self::Revise { .. } => ActionName::Revise,
             Self::Continue { .. } => ActionName::Continue,
             Self::Agree => ActionName::Agree,
+        }
+    }
+
+    /// What the action carries beside its reason, as the log keeps it.
+    pub fn payload(&self) -> Option<DecisionPayload> {
+        match self {
+            Self::Deny { guidance } | Self::Continue { guidance } => {
+                Some(DecisionPayload::Guidance(guidance.clone()))
+            }
+            Self::Reply { text } => Some(DecisionPayload::Text(text.clone())),
+            Self::Revise { feedback } => Some(DecisionPayload::Feedback(feedback.clone())),
+            Self::Answer { answers } => Some(DecisionPayload::Answers(answers.clone())),
+            Self::Allow | Self::Escalate | Self::Done | Self::Implement | Self::Agree => None,
         }
     }
 }
@@ -465,6 +478,35 @@ pub struct AutopilotDecision {
     pub usage: Option<StoredTokenUsage>,
     /// What the delegate cost, wherever pricing is known.
     pub cost: Option<f64>,
+    /// The engagement it was made in.
+    pub engagement: Option<u32>,
+    /// What the delegate was shown, without the schema.
+    pub item: Option<String>,
+    /// What the action carried beside its reason.
+    pub payload: Option<DecisionPayload>,
+    /// What became of it, where that is known yet.
+    pub outcome: Option<DecisionOutcome>,
+}
+
+/// A decision autopilot started but never answered: the human took it over,
+/// something settled it first, or the run stopped.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StoodDown {
+    pub seq: u32,
+    /// Unix milliseconds.
+    pub at_ms: u64,
+    pub kind: DecisionKind,
+    /// What was to be decided, such as the tool a prompt names.
+    pub subject: String,
+    /// What the delegate was shown, without the schema.
+    pub item: Option<String>,
+    /// The subagent it was for, `None` for the main agent.
+    pub agent: Option<String>,
+    pub tool_use_id: Option<String>,
+    /// History items the session held when it was asked for.
+    pub history_len: usize,
+    pub engagement: Option<u32>,
+    pub outcome: DecisionOutcome,
 }
 
 /// A stored decision this build cannot read back.
@@ -476,6 +518,9 @@ pub enum StoredDecisionError {
     Action(String),
     #[error("autopilot decision seq {0} is out of range")]
     Seq(u64),
+    /// A [`StoodDown`] row, which has no action to read.
+    #[error("autopilot decision seq {0} stood down without an action")]
+    NoAction(u64),
 }
 
 impl From<AutopilotDecision> for StoredAutopilotDecision {
@@ -484,7 +529,7 @@ impl From<AutopilotDecision> for StoredAutopilotDecision {
             seq: u64::from(decision.seq),
             at_ms: decision.at_ms,
             kind: decision.kind.name().to_owned(),
-            action: decision.action.name().to_owned(),
+            action: Some(decision.action.name().to_owned()),
             subject: decision.subject,
             reason: decision.reason,
             agent: decision.agent,
@@ -493,6 +538,33 @@ impl From<AutopilotDecision> for StoredAutopilotDecision {
             model: decision.model,
             usage: decision.usage,
             cost: decision.cost,
+            engagement: decision.engagement,
+            item: decision.item,
+            payload: decision.payload,
+            outcome: decision.outcome,
+        }
+    }
+}
+
+impl From<StoodDown> for StoredAutopilotDecision {
+    fn from(stood_down: StoodDown) -> Self {
+        Self {
+            seq: u64::from(stood_down.seq),
+            at_ms: stood_down.at_ms,
+            kind: stood_down.kind.name().to_owned(),
+            action: None,
+            subject: stood_down.subject,
+            reason: String::new(),
+            agent: stood_down.agent,
+            tool_use_id: stood_down.tool_use_id,
+            history_len: stood_down.history_len,
+            model: None,
+            usage: None,
+            cost: None,
+            engagement: stood_down.engagement,
+            item: stood_down.item,
+            payload: None,
+            outcome: Some(stood_down.outcome),
         }
     }
 }
@@ -501,13 +573,15 @@ impl TryFrom<StoredAutopilotDecision> for AutopilotDecision {
     type Error = StoredDecisionError;
 
     fn try_from(stored: StoredAutopilotDecision) -> Result<Self, Self::Error> {
+        let action = stored
+            .action
+            .ok_or(StoredDecisionError::NoAction(stored.seq))?;
         Ok(Self {
             seq: u32::try_from(stored.seq).map_err(|_| StoredDecisionError::Seq(stored.seq))?,
             at_ms: stored.at_ms,
             kind: DecisionKind::from_name(&stored.kind)
                 .ok_or(StoredDecisionError::Kind(stored.kind))?,
-            action: ActionName::from_name(&stored.action)
-                .ok_or(StoredDecisionError::Action(stored.action))?,
+            action: ActionName::from_name(&action).ok_or(StoredDecisionError::Action(action))?,
             subject: stored.subject,
             reason: stored.reason,
             agent: stored.agent,
@@ -516,6 +590,10 @@ impl TryFrom<StoredAutopilotDecision> for AutopilotDecision {
             model: stored.model,
             usage: stored.usage,
             cost: stored.cost,
+            engagement: stored.engagement,
+            item: stored.item,
+            payload: stored.payload,
+            outcome: stored.outcome,
         })
     }
 }
@@ -581,6 +659,9 @@ mod tests {
     const REPLY_TEXT: &str = "Yes, go ahead.";
     const REVISE_FEEDBACK: &str = "add the tests";
     const CONTINUE_GUIDANCE: &str = "finish the parser";
+    const ITEM: &str = "shell: cargo test --workspace";
+    const ENGAGEMENT: u32 = 2;
+    const STOOD_DOWN_UNREAD: &str = "a stood-down row has no action, so it is no decision";
 
     fn answers() -> Vec<Vec<String>> {
         ANSWER_LABELS
@@ -616,6 +697,25 @@ mod tests {
                 ..StoredTokenUsage::default()
             }),
             cost: Some(COST),
+            engagement: Some(ENGAGEMENT),
+            item: Some(ITEM.into()),
+            payload: Some(DecisionPayload::Guidance(DENY_GUIDANCE.into())),
+            outcome: Some(DecisionOutcome::Applied),
+        }
+    }
+
+    fn stood_down() -> StoodDown {
+        StoodDown {
+            seq: SEQ,
+            at_ms: AT_MS,
+            kind: DecisionKind::Permission,
+            subject: SUBJECT.into(),
+            item: Some(ITEM.into()),
+            agent: None,
+            tool_use_id: None,
+            history_len: HISTORY_LEN,
+            engagement: Some(ENGAGEMENT),
+            outcome: DecisionOutcome::TakenOver,
         }
     }
 
@@ -873,12 +973,49 @@ mod tests {
         let stored = StoredAutopilotDecision::from(decision());
 
         assert_eq!(stored.kind, PERMISSION_KIND);
-        assert_eq!(stored.action, DENY_ACTION);
+        assert_eq!(stored.action.as_deref(), Some(DENY_ACTION));
         assert_eq!(AutopilotDecision::try_from(stored), Ok(decision()));
     }
 
+    #[test]
+    fn a_stood_down_decision_is_stored_without_an_action() {
+        let stored = StoredAutopilotDecision::from(stood_down());
+
+        assert_eq!(
+            (
+                stored.action.clone(),
+                stored.payload.clone(),
+                stored.outcome.clone()
+            ),
+            (None, None, Some(DecisionOutcome::TakenOver))
+        );
+        assert_eq!(
+            (stored.item.as_deref(), stored.engagement),
+            (Some(ITEM), Some(ENGAGEMENT))
+        );
+        assert_eq!(
+            AutopilotDecision::try_from(stored),
+            Err(StoredDecisionError::NoAction(u64::from(SEQ))),
+            "{STOOD_DOWN_UNREAD}"
+        );
+    }
+
+    #[test_case(DelegateAction::Allow, None ; "allow")]
+    #[test_case(DelegateAction::Deny { guidance: DENY_GUIDANCE.into() }, Some(DecisionPayload::Guidance(DENY_GUIDANCE.into())) ; "deny")]
+    #[test_case(DelegateAction::Escalate, None ; "escalate")]
+    #[test_case(DelegateAction::Answer { answers: answers() }, Some(DecisionPayload::Answers(answers())) ; "answer")]
+    #[test_case(DelegateAction::Reply { text: REPLY_TEXT.into() }, Some(DecisionPayload::Text(REPLY_TEXT.into())) ; "reply")]
+    #[test_case(DelegateAction::Done, None ; "done")]
+    #[test_case(DelegateAction::Implement, None ; "implement")]
+    #[test_case(DelegateAction::Revise { feedback: REVISE_FEEDBACK.into() }, Some(DecisionPayload::Feedback(REVISE_FEEDBACK.into())) ; "revise")]
+    #[test_case(DelegateAction::Continue { guidance: CONTINUE_GUIDANCE.into() }, Some(DecisionPayload::Guidance(CONTINUE_GUIDANCE.into())) ; "continue_with_guidance")]
+    #[test_case(DelegateAction::Agree, None ; "agree")]
+    fn an_action_carries_its_payload(action: DelegateAction, expected: Option<DecisionPayload>) {
+        assert_eq!(action.payload(), expected);
+    }
+
     #[test_case(|stored| stored.kind = UNKNOWN_NAME.into(), StoredDecisionError::Kind(UNKNOWN_NAME.into()) ; "unknown_kind")]
-    #[test_case(|stored| stored.action = UNKNOWN_NAME.into(), StoredDecisionError::Action(UNKNOWN_NAME.into()) ; "unknown_action")]
+    #[test_case(|stored| stored.action = Some(UNKNOWN_NAME.into()), StoredDecisionError::Action(UNKNOWN_NAME.into()) ; "unknown_action")]
     #[test_case(|stored| stored.seq = u64::MAX, StoredDecisionError::Seq(u64::MAX) ; "seq_out_of_range")]
     fn a_stored_decision_this_build_cannot_read_is_refused(
         corrupt: fn(&mut StoredAutopilotDecision),

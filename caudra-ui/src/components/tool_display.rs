@@ -275,6 +275,9 @@ const INDICATOR_PAD: &str = "  ";
 const TOOL_BODY_INDENT_WIDTH: u16 = TOOL_BODY_INDENT.len() as u16;
 pub(crate) const NOTICE_PREFIX: &str = "· ";
 pub(crate) const AUTOPILOT_PREFIX: &str = "autopilot \u{203a} ";
+/// As wide as [`AUTOPILOT_PREFIX`], so an autopilot decision's details line
+/// up under its title.
+pub(crate) const AUTOPILOT_BODY_INDENT: &str = "            ";
 pub(crate) const DECISION_PREFIX: &str = "\u{25c6} ";
 /// As wide as [`DECISION_PREFIX`], so a decision's details line up under its
 /// title.

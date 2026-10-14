@@ -1,13 +1,16 @@
 //! The App's half of autopilot: the session's handle, `/autopilot`, the spend
 //! it counts, the implement handoff, the resume check-in and the stops.
 
+use std::iter;
 use std::mem;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use caudra_agent::AgentMode;
 use caudra_agent::automation::clock::SystemClock;
-use caudra_agent::autopilot::{ActionName, AutopilotDecision, AutopilotHandle, DecisionKind};
+use caudra_agent::autopilot::{
+    ActionName, AutopilotDecision, AutopilotHandle, DecisionKind, EngagementSpend, StoodDown,
+};
 use caudra_agent::permissions::AutopilotNote;
 use caudra_agent::types::AutopilotEvent;
 use caudra_automation::event::StartedBy;
@@ -16,40 +19,48 @@ use caudra_providers::model_registry;
 use caudra_providers::{
     AutopilotMessageKind, AutopilotOrigin, Billing, Message, ModelPurpose, TokenUsage,
 };
+use caudra_storage::StateDir;
 use caudra_storage::autopilot::{
-    AutopilotEnd, AutopilotStopper, StoredAutopilot, StoredAutopilotDecision,
+    AutopilotEnd, AutopilotStopper, DecisionOutcome, StoredAutopilot, StoredAutopilotDecision,
+    StoredAutopilotEngagement,
 };
-use caudra_storage::sessions::SessionDatabase;
+use caudra_storage::id::CaudraId;
+use caudra_storage::sessions::{SessionDatabase, SessionError};
 use caudra_storage::usage_ledger::LedgerPurpose;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use tracing::warn;
 
+use super::tasks::MAIN_TASK_ID;
 use super::{
     App, CONFIRMATION_DURATION, FLASH_CANCEL, IMPLEMENT_CAPTURE_FAILED, MODEL_ARG, Notification,
     Status, is_goal_clear,
 };
 use crate::components::autopilot_panel::{
-    PanelAction, PanelContent, budget_left, decision_text, end_notice, end_reason, goal_line,
-    state_label,
+    AutopilotLog, COPIED_ENTRY, NO_ENTRIES, PanelAction, PanelContent, PanelTab, REASON_SEPARATOR,
+    budget_left, decision_details, decision_title, end_notice, end_reason, goal_line,
+    spend_summary, state_label,
 };
 use crate::components::messages::markdown_code_span;
 use crate::components::status_bar::AutopilotChip;
 use crate::components::{Action, DisplayMessage, Overlay, format_elapsed};
+use crate::storage_writer::AutopilotWrite;
 
 const GOAL_COMMAND: &str = "/goal";
 const AUTOPILOT_COMMAND: &str = "/autopilot";
 const STOP_ARGS: [&str; 2] = ["off", "stop"];
+const LOG_ARG: &str = "log";
 const MS_PER_MINUTE: u64 = 60_000;
 /// How far the stored engagement clock may trail the live one, so time
 /// passing alone does not rewrite an engaged session every frame.
 const ELAPSED_SAVE_STEP_MS: u64 = MS_PER_MINUTE;
 pub(crate) const NOT_ENGAGED_MSG: &str = "Autopilot is not engaged";
+pub(crate) const ROW_NOT_LOADED: &str = "That entry's row is not in the loaded transcript";
 pub(crate) const PLAN_LEFT_TO_YOU: &str = "Autopilot left the plan to you: queued input goes first";
 pub(crate) const ENGAGED_ROW: &str = "engaged";
 pub(crate) const ENDED_ROW: &str = "ended";
 const RETRYING_ROW: &str = "retrying";
-const SUMMARY_LINE_BREAK: &str = "\n";
+const LINE_BREAK: &str = "\n";
 /// Autopilot retries the main agent's runs alone.
 const MAIN_CHAT: usize = 0;
 
@@ -59,6 +70,16 @@ pub(super) enum AutopilotCommand<'a> {
     Goal(&'a str),
     Stop,
     Model,
+    Log,
+}
+
+/// Where a restored log row goes among others at the same history length:
+/// an engagement's start ahead of its decisions, and its end after them.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum LogRow {
+    Engaged,
+    Decision,
+    Ended,
 }
 
 pub(super) fn parse_autopilot_command(args: &str) -> AutopilotCommand<'_> {
@@ -67,6 +88,8 @@ pub(super) fn parse_autopilot_command(args: &str) -> AutopilotCommand<'_> {
         AutopilotCommand::Engage
     } else if args.eq_ignore_ascii_case(MODEL_ARG) {
         AutopilotCommand::Model
+    } else if args.eq_ignore_ascii_case(LOG_ARG) {
+        AutopilotCommand::Log
     } else if STOP_ARGS.iter().any(|stop| args.eq_ignore_ascii_case(stop)) {
         AutopilotCommand::Stop
     } else {
@@ -83,7 +106,10 @@ pub(crate) fn launch_prompt(prompt: String) -> String {
         .filter(|args| args.starts_with(char::is_whitespace))
         .map(str::trim)
         .filter(|condition| {
-            !condition.eq_ignore_ascii_case(MODEL_ARG) && !is_goal_clear(condition)
+            ![MODEL_ARG, LOG_ARG]
+                .iter()
+                .any(|arg| condition.eq_ignore_ascii_case(arg))
+                && !is_goal_clear(condition)
         });
     match condition {
         Some(condition) if !condition.is_empty() => format!("{AUTOPILOT_COMMAND} {condition}"),
@@ -91,20 +117,49 @@ pub(crate) fn launch_prompt(prompt: String) -> String {
     }
 }
 
-/// A decision's transcript row, its subject quoted so the markdown row
-/// draws it as written.
-pub(crate) fn decision_row(kind: &str, action: &str, subject: &str, reason: &str) -> String {
-    let subject = if subject.is_empty() {
+/// A decision's transcript row, found again by its seq.
+fn decision_message(decision: &StoredAutopilotDecision) -> DisplayMessage {
+    DisplayMessage::autopilot_decision(decision.seq, decision_body(decision))
+}
+
+/// A decision row's title, its subject quoted so the markdown title draws it
+/// as written, then the details it folds open to, one per line.
+pub(super) fn decision_body(decision: &StoredAutopilotDecision) -> String {
+    let subject = if decision.subject.is_empty() {
         String::new()
     } else {
-        markdown_code_span(subject)
+        markdown_code_span(&decision.subject)
     };
-    decision_text(kind, action, &subject, reason)
+    iter::once(decision_title(decision, &subject))
+        .chain(decision_details(decision))
+        .collect::<Vec<_>>()
+        .join(LINE_BREAK)
+}
+
+/// The row an engagement's end draws: why it ended and what it spent.
+pub(super) fn ended_row(end: &AutopilotEnd, engagement: &StoredAutopilotEngagement) -> String {
+    format!(
+        "{ENDED_ROW}: {}{REASON_SEPARATOR}{}",
+        end_reason(end),
+        spend_summary(engagement)
+    )
 }
 
 fn retrying_row(attempt: u32, limit: u32, delay_ms: u64, error: &str) -> String {
     let delay = format_elapsed(Duration::from_millis(delay_ms).as_secs());
     format!("{RETRYING_ROW} {attempt}/{limit} in {delay}: {error}")
+}
+
+/// The session's whole log, for the panel's Log tab.
+fn load_autopilot_log(storage: &StateDir, session_id: CaudraId) -> Result<AutopilotLog, String> {
+    let database = SessionDatabase::open(storage).map_err(|error| error.to_string())?;
+    let decisions = database
+        .load_autopilot_decisions(session_id)
+        .map_err(|error| error.to_string())?;
+    let engagements = database
+        .load_autopilot_engagements(session_id)
+        .map_err(|error| error.to_string())?;
+    Ok(AutopilotLog::new(decisions, engagements))
 }
 
 /// What a card's note says autopilot left to the user, if anything.
@@ -145,33 +200,66 @@ impl App {
             self.state.autopilot.is_engaged() && self.state.goal.snapshot().is_some();
     }
 
-    /// The stored decisions' transcript rows, each with the history length it
-    /// was made at, so a restore places it among the turns. None while the
-    /// experiment is off.
-    pub(super) fn autopilot_decision_rows(&self) -> Vec<(usize, DisplayMessage)> {
+    /// The stored log's transcript rows, every decision and each engagement's
+    /// start and end, with the history length each was made at, so a restore
+    /// places it among the turns. None while the experiment is off.
+    pub(super) fn autopilot_log_rows(&self) -> Vec<(usize, DisplayMessage)> {
         if !self.features.enabled(Feature::Autopilot) {
             return Vec::new();
         }
-        self.stored_autopilot_decisions()
+        let decisions = self
+            .stored_autopilot_decisions()
             .into_iter()
             .map(|decision| {
-                let row = decision_row(
-                    &decision.kind,
-                    &decision.action,
-                    &decision.subject,
-                    &decision.reason,
+                let order = (
+                    decision.history_len,
+                    decision.engagement.unwrap_or_default(),
+                    LogRow::Decision,
                 );
-                (decision.history_len, DisplayMessage::autopilot(row))
-            })
+                (order, decision_message(&decision))
+            });
+        let engagements = self
+            .read_autopilot_log(SessionDatabase::load_autopilot_engagements)
+            .into_iter()
+            .flat_map(|engagement| {
+                let number = engagement.engagement;
+                let engaged = (
+                    (engagement.engaged_history_len, number, LogRow::Engaged),
+                    DisplayMessage::autopilot(ENGAGED_ROW.to_owned()),
+                );
+                let ended = engagement
+                    .ended_history_len
+                    .zip(engagement.end.as_ref())
+                    .map(|(history_len, end)| {
+                        (
+                            (history_len, number, LogRow::Ended),
+                            DisplayMessage::autopilot(ended_row(end, &engagement)),
+                        )
+                    });
+                iter::once(engaged).chain(ended)
+            });
+        let mut rows: Vec<_> = decisions.chain(engagements).collect();
+        rows.sort_by(|(left, _), (right, _)| left.cmp(right));
+        rows.into_iter()
+            .map(|((history_len, ..), row)| (history_len, row))
             .collect()
     }
 
     fn stored_autopilot_decisions(&self) -> Vec<StoredAutopilotDecision> {
+        self.read_autopilot_log(SessionDatabase::load_autopilot_decisions)
+    }
+
+    /// The log is a record, so a session whose log cannot be read resumes
+    /// without it.
+    fn read_autopilot_log<T>(
+        &self,
+        read: impl FnOnce(&SessionDatabase, CaudraId) -> Result<Vec<T>, SessionError>,
+    ) -> Vec<T> {
         let session_id = self.state.session.id;
         SessionDatabase::open(&self.storage)
-            .and_then(|database| database.load_autopilot_decisions(session_id))
+            .and_then(|database| read(&database, session_id))
             .unwrap_or_else(|error| {
-                warn!(%error, %session_id, "autopilot decisions unreadable; resuming without them");
+                warn!(%error, %session_id, "autopilot log unreadable; resuming without it");
                 Vec::new()
             })
     }
@@ -195,8 +283,11 @@ impl App {
     pub(super) fn execute_autopilot(&mut self, args: &str) -> Vec<Action> {
         match parse_autopilot_command(args) {
             AutopilotCommand::Engage if self.state.autopilot.is_engaged() => {
-                self.clear_control_hovers();
-                self.autopilot_panel.open();
+                self.open_autopilot_panel(PanelTab::Status);
+                Vec::new()
+            }
+            AutopilotCommand::Log => {
+                self.open_autopilot_log();
                 Vec::new()
             }
             AutopilotCommand::Engage => {
@@ -234,24 +325,70 @@ impl App {
         vec![Action::RefreshModels]
     }
 
-    /// The panel closes before acting, so the picker it opens is not drawn
-    /// under it.
-    pub(super) fn on_autopilot_panel(&mut self, action: PanelAction) -> Vec<Action> {
-        self.autopilot_panel.close();
-        match action {
-            PanelAction::Stop => {
-                self.stop_autopilot_by_command();
-                Vec::new()
-            }
-            PanelAction::Model => self.open_autopilot_model_picker(),
+    /// Opens the panel on `tab`, reading the session's log off the UI thread.
+    /// What the writer has yet to write is taken first, so the read misses
+    /// nothing the transcript already shows.
+    pub(super) fn open_autopilot_panel(&mut self, tab: PanelTab) {
+        self.clear_control_hovers();
+        let storage = self.storage.clone();
+        let session_id = self.state.session.id;
+        let unwritten = self.storage_writer.unwritten_autopilot(session_id);
+        self.autopilot_panel.open(
+            tab,
+            smol::unblock(move || load_autopilot_log(&storage, session_id)),
+            unwritten,
+            self.ui_config.clock_format,
+        );
+    }
+
+    /// The Log, engaged or not. A session autopilot never ran in has nothing
+    /// logged, which needs no read to tell.
+    fn open_autopilot_log(&mut self) {
+        if self.state.autopilot.stored().is_none() {
+            self.flash(NO_ENTRIES.into());
+            return;
         }
+        self.open_autopilot_panel(PanelTab::Log);
+    }
+
+    /// The panel closes before it stops, picks the model or jumps, so what
+    /// that opens or scrolls is not drawn under it.
+    pub(super) fn on_autopilot_panel(&mut self, action: PanelAction) -> Vec<Action> {
+        match action {
+            PanelAction::Copy(text) => self.copy_labelled(&text, COPIED_ENTRY),
+            PanelAction::Flash(message) => self.flash(message.into()),
+            PanelAction::Jump(seq) => self.jump_to_autopilot_decision(seq),
+            PanelAction::Stop => {
+                self.autopilot_panel.close();
+                self.stop_autopilot_by_command();
+            }
+            PanelAction::Model => {
+                self.autopilot_panel.close();
+                return self.open_autopilot_model_picker();
+            }
+        }
+        Vec::new()
+    }
+
+    /// Scrolls the main transcript to decision `seq`'s row. A row the
+    /// transcript does not hold leaves the panel up, saying so.
+    fn jump_to_autopilot_decision(&mut self, seq: u64) {
+        let Some(row) = self.chats[MAIN_CHAT].autopilot_decision_row(seq) else {
+            self.flash(ROW_NOT_LOADED.into());
+            return;
+        };
+        self.autopilot_panel.close();
+        if !self.is_main_chat()
+            && let Err(error) = self.focus_task(MAIN_TASK_ID)
+        {
+            self.flash(error);
+            return;
+        }
+        self.main_chat().scroll_to_message(row);
     }
 
     pub(super) fn draw_autopilot_panel(&mut self, frame: &mut Frame, area: Rect) -> Rect {
-        let Some(stored) = self.state.autopilot.stored() else {
-            self.autopilot_panel.close();
-            return Rect::default();
-        };
+        let stored = self.state.autopilot.stored();
         let limits = self.state.autopilot.limits();
         let goal = self.state.goal.active_condition();
         let model = model_registry::binding(ModelPurpose::Autopilot);
@@ -259,15 +396,13 @@ impl App {
             .autopilot_escalations()
             .map(|(kind, reason)| format!("{}: {reason}", kind.name()))
             .collect();
-        let decisions = self.state.autopilot.recent_decisions();
         let content = PanelContent {
-            stored: &stored,
+            stored: stored.as_ref(),
             limits: &limits,
             goal: goal.as_deref(),
             model: model.as_ref(),
             deciding: self.autopilot_is_deciding(),
             escalations: &escalations,
-            decisions: &decisions,
         };
         self.autopilot_panel.view(frame, area, &content)
     }
@@ -293,7 +428,7 @@ impl App {
             ),
             budget_left(&stored, &limits),
         ]
-        .join(SUMMARY_LINE_BREAK);
+        .join(LINE_BREAK);
         Some(AutopilotChip {
             used: stored.continuations,
             limit: limits.max_continuations,
@@ -403,7 +538,12 @@ impl App {
     /// Engages with a fresh budget, owning the active goal when autopilot set
     /// it. Already engaged, it only takes ownership of such a goal.
     pub(crate) fn engage_autopilot(&mut self, owns_goal: bool) {
-        if let Some(engaged) = self.state.autopilot.engage(owns_goal) {
+        let goal = self
+            .state
+            .goal
+            .snapshot()
+            .map(|goal| goal.condition.to_string());
+        if let Some(engaged) = self.state.autopilot.engage(owns_goal, goal) {
             self.note_autopilot_event(engaged);
         }
     }
@@ -466,14 +606,17 @@ impl App {
     /// from the App itself.
     fn note_autopilot_event(&mut self, event: AutopilotEvent) {
         match event {
-            AutopilotEvent::Engaged => self.push_autopilot_row(ENGAGED_ROW.to_owned()),
-            AutopilotEvent::Decided(decision) => self.log_autopilot_decision(*decision),
-            AutopilotEvent::Ended { reason } => {
-                self.push_autopilot_row(format!("{ENDED_ROW}: {}", end_reason(&reason)));
-                self.autopilot_notice = Some(Notification::AutopilotEnded {
-                    reason: end_notice(&reason),
-                });
+            AutopilotEvent::Engaged { engagement, goal } => {
+                self.autopilot_engaged(engagement, goal);
             }
+            AutopilotEvent::Decided(decision) => self.log_autopilot_decision(*decision),
+            AutopilotEvent::StoodDown(stood_down) => self.autopilot_stood_down(*stood_down),
+            AutopilotEvent::Settled { seq, outcome } => self.autopilot_settled(seq, outcome),
+            AutopilotEvent::Ended {
+                reason,
+                engagement,
+                spend,
+            } => self.autopilot_ended(reason, engagement, &spend),
             AutopilotEvent::Retrying {
                 attempt,
                 limit,
@@ -523,7 +666,52 @@ impl App {
                 self.task_interactions.question = None;
             }
             DecisionKind::Question => self.question_form.set_autopilot_note(left_to_you),
-            DecisionKind::Plan => self.plan_form.set_autopilot_note(left_to_you),
+            DecisionKind::Plan => {
+                self.autopilot_plan_escalation = left_to_you.is_some().then_some(decision.seq);
+                self.plan_form.set_autopilot_note(left_to_you);
+            }
+            DecisionKind::Permission
+            | DecisionKind::Reply
+            | DecisionKind::Review
+            | DecisionKind::SecondOpinion => {}
+        }
+    }
+
+    /// The user answered the plan card autopilot left to them, by `action`.
+    /// A card autopilot never left to them has nothing to settle.
+    pub(super) fn answer_plan_escalation(&mut self, action: ActionName) {
+        let Some(seq) = self.autopilot_plan_escalation.take() else {
+            return;
+        };
+        let answer = action.name().to_owned();
+        let settled = self
+            .state
+            .autopilot
+            .settle(seq, DecisionOutcome::Answered { answer });
+        self.note_autopilot_event(settled);
+    }
+
+    /// A decision autopilot gave up before it answered: its card stays with
+    /// whoever holds it, and the log says who.
+    fn autopilot_stood_down(&mut self, stood_down: StoodDown) {
+        self.release_deciding_card(stood_down.seq);
+        let decision = StoredAutopilotDecision::from(stood_down);
+        self.main_chat().push(decision_message(&decision));
+        self.record_autopilot(|_| AutopilotWrite::Decision(Box::new(decision)));
+    }
+
+    /// The card stops saying autopilot is deciding it.
+    fn release_deciding_card(&mut self, seq: u32) {
+        let Some(index) = self
+            .autopilot_deciding
+            .iter()
+            .position(|(deciding, _)| *deciding == seq)
+        else {
+            return;
+        };
+        match self.autopilot_deciding.remove(index).1 {
+            DecisionKind::Question => self.question_form.set_autopilot_note(None),
+            DecisionKind::Plan => self.plan_form.set_autopilot_note(None),
             DecisionKind::Permission
             | DecisionKind::Reply
             | DecisionKind::Review
@@ -535,19 +723,115 @@ impl App {
         self.main_chat().push(DisplayMessage::autopilot(text));
     }
 
-    /// The session's row goes to the writer first, so the decision has one
-    /// to reference.
     fn log_autopilot_decision(&mut self, decision: AutopilotDecision) {
         self.settle_autopilot_card(&decision);
-        self.push_autopilot_row(decision_row(
-            decision.kind.name(),
-            decision.action.name(),
-            &decision.subject,
-            &decision.reason,
-        ));
+        let decision = StoredAutopilotDecision::from(decision);
+        self.main_chat().push(decision_message(&decision));
+        self.record_autopilot(|_| AutopilotWrite::Decision(Box::new(decision)));
+    }
+
+    /// What became of a logged decision. Its row is retitled while the
+    /// handle still holds the decision, and the log learns it either way.
+    fn autopilot_settled(&mut self, seq: u32, outcome: DecisionOutcome) {
+        let settled = self
+            .state
+            .autopilot
+            .recent_decisions()
+            .into_iter()
+            .find(|decision| decision.seq == seq);
+        if let Some(decision) = settled {
+            let decision = StoredAutopilotDecision {
+                outcome: Some(outcome.clone()),
+                ..decision.into()
+            };
+            self.main_chat()
+                .rewrite_autopilot_decision(decision.seq, decision_body(&decision));
+        }
+        self.record_autopilot(|_| AutopilotWrite::Settle {
+            seq: u64::from(seq),
+            outcome,
+        });
+    }
+
+    fn autopilot_engaged(&mut self, engagement: u32, goal: Option<String>) {
+        self.push_autopilot_row(ENGAGED_ROW.to_owned());
+        let stored = self.state.autopilot.stored();
+        let engaged_at_ms = stored
+            .as_ref()
+            .and_then(|stored| stored.engaged_at_ms)
+            .unwrap_or_else(|| self.state.autopilot.now_ms());
+        let owns_goal = stored.is_some_and(|stored| stored.owns_goal);
+        self.record_autopilot(|app| {
+            AutopilotWrite::Engaged(StoredAutopilotEngagement {
+                engagement,
+                engaged_at_ms,
+                engaged_history_len: app.autopilot_history_len(),
+                goal,
+                owns_goal,
+                ended_at_ms: None,
+                ended_history_len: None,
+                end: None,
+                continuations: 0,
+                cost_usd: 0.0,
+                subscription_cost_usd: 0.0,
+                elapsed_ms: 0,
+                retries: 0,
+            })
+        });
+    }
+
+    /// The row says why the engagement ended and what it spent. The notice
+    /// says only why, as a notification carries fixed text alone.
+    fn autopilot_ended(&mut self, end: AutopilotEnd, engagement: u32, spend: &EngagementSpend) {
+        let ended_at_ms = self.state.autopilot.now_ms();
+        let ended = StoredAutopilotEngagement {
+            engagement,
+            engaged_at_ms: ended_at_ms,
+            engaged_history_len: 0,
+            goal: None,
+            owns_goal: false,
+            ended_at_ms: Some(ended_at_ms),
+            ended_history_len: None,
+            end: Some(end.clone()),
+            continuations: spend.continuations,
+            cost_usd: spend.cost_usd,
+            subscription_cost_usd: spend.subscription_cost_usd,
+            elapsed_ms: spend.elapsed_ms,
+            retries: spend.retries,
+        };
+        self.push_autopilot_row(ended_row(&end, &ended));
+        self.autopilot_notice = Some(Notification::AutopilotEnded {
+            reason: end_notice(&end),
+        });
+        self.record_autopilot(|app| {
+            AutopilotWrite::Ended(StoredAutopilotEngagement {
+                ended_history_len: Some(app.autopilot_history_len()),
+                ..ended
+            })
+        });
+    }
+
+    /// The session's row goes to the writer first, so the log has one to
+    /// reference, and `write` is built after it, so a history length it
+    /// measures counts what that merged. An open panel's Log takes it too.
+    fn record_autopilot(&mut self, write: impl FnOnce(&Self) -> AutopilotWrite) {
         self.checkpoint_now();
+        let write = write(self);
+        self.autopilot_panel.note(&write);
         self.storage_writer
-            .record_autopilot_decision(self.state.session.id, decision.into());
+            .record_autopilot(self.state.session.id, write);
+    }
+
+    /// History items the session holds, counted as a decision's row counts
+    /// them. The snapshot autopilot last saw is newer during a run, and the
+    /// merged transcript between runs, so the larger of the two is the nearer.
+    fn autopilot_history_len(&self) -> usize {
+        let transcript =
+            crate::transcript_session_history(&self.state.session).map_or(0, |items| items.len());
+        self.state
+            .autopilot
+            .snapshot()
+            .map_or(transcript, |snapshot| snapshot.history_len.max(transcript))
     }
 
     /// Starts the plan's implementation as `implement_plan` does, once the run
@@ -616,6 +900,7 @@ mod tests {
     #[test_case("off", AutopilotCommand::Stop; "off")]
     #[test_case("STOP", AutopilotCommand::Stop; "stop_any_case")]
     #[test_case("model", AutopilotCommand::Model; "model")]
+    #[test_case("Log", AutopilotCommand::Log; "log_any_case")]
     #[test_case(" the tests pass ", AutopilotCommand::Goal(CONDITION); "goal_trimmed")]
     fn the_command_parses_its_argument(args: &str, expected: AutopilotCommand<'static>) {
         assert_eq!(parse_autopilot_command(args), expected);
@@ -624,6 +909,7 @@ mod tests {
     #[test_case("/goal the tests pass", "/autopilot the tests pass"; "a_goal_becomes_owned")]
     #[test_case("  /goal   the tests pass ", "/autopilot the tests pass"; "padded_goal")]
     #[test_case("/goal model", "/goal model"; "the_model_picker_stays")]
+    #[test_case("/goal log", "/goal log"; "the_log_stays")]
     #[test_case("/goal clear", "/goal clear"; "a_clear_stays")]
     #[test_case("/goal", "/goal"; "no_condition")]
     #[test_case("/goals are fun", "/goals are fun"; "another_word")]
@@ -635,12 +921,28 @@ mod tests {
     #[test_case(SUBJECT, markdown_code_span(SUBJECT) ; "a_subject_is_quoted")]
     #[test_case("", String::new() ; "no_subject_stays_empty")]
     fn a_decision_row_quotes_its_subject(subject: &str, quoted: String) {
-        let kind = DecisionKind::Permission.name();
-        let action = ActionName::Allow.name();
+        let decision = StoredAutopilotDecision {
+            seq: 0,
+            at_ms: 0,
+            kind: DecisionKind::Permission.name().to_owned(),
+            action: Some(ActionName::Allow.name().to_owned()),
+            subject: subject.to_owned(),
+            reason: REASON.to_owned(),
+            agent: None,
+            tool_use_id: None,
+            history_len: 0,
+            model: None,
+            usage: None,
+            cost: None,
+            engagement: None,
+            item: None,
+            payload: None,
+            outcome: None,
+        };
 
         assert_eq!(
-            decision_row(kind, action, subject, REASON),
-            decision_text(kind, action, &quoted, REASON)
+            decision_body(&decision).lines().next(),
+            Some(decision_title(&decision, &quoted).as_str())
         );
     }
 

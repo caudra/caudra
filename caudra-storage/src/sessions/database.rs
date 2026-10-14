@@ -86,7 +86,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.db";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.db.lock";
 
-const SCHEMA_VERSION: i64 = 25;
+const SCHEMA_VERSION: i64 = 27;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -386,6 +386,53 @@ CREATE TABLE tool_ledger (
     PRIMARY KEY(bucket_start, tool, source, cwd, outcome)
 ) STRICT, WITHOUT ROWID;
 "#;
+
+/// A session's spend by why the model was called, beside `model_usage`'s by
+/// which model answered. It dies with its session, like `model_usage`; the
+/// usage ledger keeps the lifetime figure.
+const SESSION_PURPOSE_USAGE_TABLE: &str = r#"
+CREATE TABLE session_purpose_usage (
+    session_id        BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    purpose           TEXT NOT NULL,
+    input_tokens      INTEGER NOT NULL,
+    output_tokens     INTEGER NOT NULL,
+    cache_creation    INTEGER NOT NULL,
+    cache_read        INTEGER NOT NULL,
+    cost              REAL,
+    subscription_cost REAL,
+    PRIMARY KEY(session_id, purpose)
+) STRICT, WITHOUT ROWID;
+"#;
+
+/// A per-session usage table, keyed by the column that names its rows, with
+/// the field names a corrupt counter is reported under.
+struct UsageTable {
+    name: &'static str,
+    key: &'static str,
+    fields: [&'static str; 4],
+}
+
+const MODEL_USAGE: UsageTable = UsageTable {
+    name: "model_usage",
+    key: "model",
+    fields: [
+        "model_usage.input_tokens",
+        "model_usage.output_tokens",
+        "model_usage.cache_creation",
+        "model_usage.cache_read",
+    ],
+};
+
+const PURPOSE_USAGE: UsageTable = UsageTable {
+    name: "session_purpose_usage",
+    key: "purpose",
+    fields: [
+        "session_purpose_usage.input_tokens",
+        "session_purpose_usage.output_tokens",
+        "session_purpose_usage.cache_creation",
+        "session_purpose_usage.cache_read",
+    ],
+};
 
 /// Shared so the reader and the project move cannot drift into different column
 /// orders behind the same row mapper.
@@ -728,12 +775,22 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         from: 23,
         to: 24,
-        sql: crate::autopilot::TABLE,
+        sql: crate::autopilot::DECISIONS_TABLE_V24,
     },
     Migration {
         from: 24,
         to: 25,
         sql: crate::engine_decisions::TABLE,
+    },
+    Migration {
+        from: 25,
+        to: 26,
+        sql: SESSION_PURPOSE_USAGE_TABLE,
+    },
+    Migration {
+        from: 26,
+        to: 27,
+        sql: crate::autopilot::AUDIT_MIGRATION,
     },
 ];
 
@@ -1013,7 +1070,7 @@ CREATE TABLE pending_archives (
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
     format!(
-        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}",
+        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}{SESSION_PURPOSE_USAGE_TABLE}",
         crate::background::TABLES,
         crate::shell_durations::TABLES,
         crate::shell_history::TABLES,
@@ -1023,7 +1080,7 @@ fn full_schema() -> String {
         crate::messages::GROUP_SCHEMA,
         crate::automation::TABLES,
         crate::memory_journal::TABLES,
-        crate::autopilot::TABLE,
+        crate::autopilot::TABLES,
         crate::engine_decisions::TABLE
     )
 }
@@ -4228,7 +4285,8 @@ where
         })
         .collect();
     let subagents = query_subagents(connection, id)?;
-    let usage_by_model = query_model_usage(connection, id)?;
+    let usage_by_model = query_usage(connection, &MODEL_USAGE, id)?;
+    let usage_by_purpose = query_usage(connection, &PURPOSE_USAGE, id)?;
     let tool_usage = query_tool_usage(connection, id)?;
     let subagent_item_count = subagent_messages.values().map(|items| items.len()).sum();
     for (field, actual, expected) in [
@@ -4292,6 +4350,7 @@ where
         subagent_task_specs,
         subagents,
         usage_by_model,
+        usage_by_purpose,
         tool_usage,
         meta,
         created_at: root.created_at,
@@ -5447,6 +5506,7 @@ fn validate_scalars<M, U, T>(session: &Session<M, U, T>) -> Result<(), SessionEr
         .chain(session.subagent_messages.keys())
         .chain(session.subagent_task_specs.keys())
         .chain(session.usage_by_model.keys())
+        .chain(session.usage_by_purpose.keys())
         .chain(session.meta.unsent_subagent_messages.keys())
     {
         validate_identifier("session identifier", id)?;
@@ -5927,7 +5987,8 @@ fn clear_children(transaction: &Transaction<'_>, id: CaudraId) -> Result<(), Ses
         "tool_outputs",
         "subagent_streams",
         "subagents",
-        "model_usage",
+        MODEL_USAGE.name,
+        PURPOSE_USAGE.name,
     ] {
         transaction.execute(
             &format!("DELETE FROM {table} WHERE session_id = ?1"),
@@ -6132,30 +6193,18 @@ fn replace_auxiliary<M, U, T>(
             ],
         )?;
     }
-    transaction.execute(
-        "DELETE FROM model_usage WHERE session_id = ?1",
-        params![session.id.as_bytes().as_slice()],
+    replace_usage(
+        transaction,
+        &MODEL_USAGE,
+        session.id,
+        &session.usage_by_model,
     )?;
-    // Usage is storage-owned and queryable across sessions. Nullable cost keeps
-    // unpriced history distinct from a priced zero-dollar value.
-    for (model, usage) in &session.usage_by_model {
-        transaction.execute(
-            "INSERT INTO model_usage (\
-                 session_id, model, input_tokens, output_tokens, cache_creation, cache_read, \
-                 cost, subscription_cost\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                session.id.as_bytes().as_slice(),
-                model,
-                i64::from(usage.input),
-                i64::from(usage.output),
-                i64::from(usage.cache_creation),
-                i64::from(usage.cache_read),
-                usage.cost,
-                usage.subscription_cost,
-            ],
-        )?;
-    }
+    replace_usage(
+        transaction,
+        &PURPOSE_USAGE,
+        session.id,
+        &session.usage_by_purpose,
+    )?;
     transaction.execute(
         "DELETE FROM session_tool_usage WHERE session_id = ?1",
         params![session.id.as_bytes().as_slice()],
@@ -6276,25 +6325,65 @@ fn query_subagents(
     Ok(values)
 }
 
-fn query_model_usage(
+/// Usage is storage-owned and queryable across sessions. Nullable cost keeps
+/// unpriced history distinct from a priced zero-dollar value.
+fn replace_usage(
+    transaction: &Transaction<'_>,
+    table: &UsageTable,
+    id: CaudraId,
+    usage: &HashMap<String, StoredTokenUsage>,
+) -> Result<(), SessionError> {
+    let UsageTable { name, key, .. } = table;
+    transaction.execute(
+        &format!("DELETE FROM {name} WHERE session_id = ?1"),
+        params![id.as_bytes().as_slice()],
+    )?;
+    let insert = format!(
+        "INSERT INTO {name} (\
+             session_id, {key}, input_tokens, output_tokens, cache_creation, cache_read, \
+             cost, subscription_cost\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+    );
+    for (label, usage) in usage {
+        transaction.execute(
+            &insert,
+            params![
+                id.as_bytes().as_slice(),
+                label,
+                i64::from(usage.input),
+                i64::from(usage.output),
+                i64::from(usage.cache_creation),
+                i64::from(usage.cache_read),
+                usage.cost,
+                usage.subscription_cost,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn query_usage(
     connection: &Connection,
+    table: &UsageTable,
     id: CaudraId,
 ) -> Result<HashMap<String, StoredTokenUsage>, SessionError> {
-    let mut statement = connection.prepare(
-        "SELECT model, input_tokens, output_tokens, cache_creation, cache_read, cost, \
+    let UsageTable { name, key, fields } = table;
+    let [input, output, cache_creation, cache_read] = fields;
+    let mut statement = connection.prepare(&format!(
+        "SELECT {key}, input_tokens, output_tokens, cache_creation, cache_read, cost, \
                 subscription_cost \
-         FROM model_usage WHERE session_id = ?1",
-    )?;
+         FROM {name} WHERE session_id = ?1"
+    ))?;
     let mut rows = statement.query(params![id.as_bytes().as_slice()])?;
     let mut values = HashMap::new();
     while let Some(row) = rows.next()? {
         values.insert(
             row.get(0)?,
             StoredTokenUsage {
-                input: from_i64_u32(row.get(1)?, "model_usage.input_tokens")?,
-                output: from_i64_u32(row.get(2)?, "model_usage.output_tokens")?,
-                cache_creation: from_i64_u32(row.get(3)?, "model_usage.cache_creation")?,
-                cache_read: from_i64_u32(row.get(4)?, "model_usage.cache_read")?,
+                input: from_i64_u32(row.get(1)?, input)?,
+                output: from_i64_u32(row.get(2)?, output)?,
+                cache_creation: from_i64_u32(row.get(3)?, cache_creation)?,
+                cache_read: from_i64_u32(row.get(4)?, cache_read)?,
                 cost: row.get(5)?,
                 subscription_cost: row.get(6)?,
             },
@@ -6538,6 +6627,7 @@ mod tests {
         AutomationArming, AutomationFiringStatus, AutomationOrigin, AutomationScope,
         AutomationTrigger, INTERRUPTED_BY_RELOCATION, NewAutomationFiring,
     };
+    use crate::autopilot::{DECISIONS_TABLE_V24, StoredAutopilotDecision};
     use crate::background::{JobPayload, ShellJobMetadata, TaskEvent, TaskRecord};
     use crate::permission_state::StructuredPermissionEffect;
     use crate::sessions::change_stores::fake::{FakeStore, FakeStores, REFUSED};
@@ -6674,20 +6764,47 @@ mod tests {
     const CHILD_TASK: &str = "child-task";
     const OTHER_CHILD_TASK: &str = "other-child-task";
     const BACKGROUND_ARCHIVE_DOWNGRADE: &str = "DROP INDEX background_history; DROP INDEX background_task_version; DROP INDEX background_call_owner; DROP INDEX background_sequence; DROP INDEX background_generation; DROP INDEX background_task_history; DROP INDEX background_owner_history; ALTER TABLE background_tasks DROP COLUMN archived; ALTER TABLE background_tasks DROP COLUMN last_sequence;";
-    const ENGINE_DECISIONS_DOWNGRADE: &str = "DROP TABLE engine_decisions;";
+    const PURPOSE_USAGE_DOWNGRADE: &str = "DROP TABLE session_purpose_usage;";
+    const PURPOSE_USAGE_PREVIOUS_SCHEMA: i64 = 25;
+    const PURPOSE_TURN: StoredTokenUsage = StoredTokenUsage {
+        input: 120,
+        output: 30,
+        cache_creation: 0,
+        cache_read: 400,
+        cost: Some(0.25),
+        subscription_cost: None,
+    };
+    const ENGINE_DECISIONS_DOWNGRADE: &str =
+        "DROP TABLE session_purpose_usage; DROP TABLE engine_decisions;";
     const ENGINE_DECISIONS_PREVIOUS_SCHEMA: i64 = 24;
-    const AUTOPILOT_DECISIONS_DOWNGRADE: &str =
-        "DROP TABLE engine_decisions; DROP TABLE autopilot_decisions;";
+    /// Followed by [`crate::autopilot::DECISIONS_TABLE_V24`] in
+    /// [`downgrade_autopilot_audit`], which every downgrade to schema 24, 25
+    /// or 26 runs first.
+    const AUTOPILOT_AUDIT_DOWNGRADE: &str =
+        "DROP TABLE autopilot_engagements; DROP TABLE autopilot_decisions;";
+    const AUTOPILOT_AUDIT_PREVIOUS_SCHEMA: i64 = 26;
+    const AUDIT_SEQ: u64 = 7;
+    const AUDIT_KIND: &str = "permission";
+    const AUDIT_ACTION: &str = "allow";
+    const AUDIT_SUBJECT: &str = "shell: cargo test";
+    const AUDIT_REASON: &str = "reads the repo only";
+    const AUDIT_AGENT: &str = "review";
+    const AUDIT_TOOL_USE_ID: &str = "toolu_1";
+    const AUDIT_HISTORY_LEN: usize = 12;
+    const AUDIT_COST: f64 = 0.0125;
+    const MIGRATION_KEEPS_DECISIONS: &str =
+        "rebuilding the decision log must keep every row, with nothing new recorded on it";
+    const AUTOPILOT_DECISIONS_DOWNGRADE: &str = "DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions;";
     const AUTOPILOT_DECISIONS_PREVIOUS_SCHEMA: i64 = 23;
-    const MEMORY_JOURNAL_DOWNGRADE: &str = "DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes;";
+    const MEMORY_JOURNAL_DOWNGRADE: &str = "DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes;";
     const MEMORY_JOURNAL_PREVIOUS_SCHEMA: i64 = 22;
-    const AUTOMATION_MESSAGING_DOWNGRADE: &str = "DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; ALTER TABLE automation_firings DROP COLUMN delivery;";
+    const AUTOMATION_MESSAGING_DOWNGRADE: &str = "DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; ALTER TABLE automation_firings DROP COLUMN delivery;";
     const AUTOMATION_MESSAGING_PREVIOUS_SCHEMA: i64 = 21;
-    const AUTOMATIONS_DOWNGRADE: &str = "DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings;";
+    const AUTOMATIONS_DOWNGRADE: &str = "DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings;";
     const AUTOMATIONS_PREVIOUS_SCHEMA: i64 = 20;
-    const CONSUMER_GROUPS_DOWNGRADE: &str = "DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation;";
+    const CONSUMER_GROUPS_DOWNGRADE: &str = "DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation;";
     const CONSUMER_GROUPS_PREVIOUS_SCHEMA: i64 = 19;
-    const SHARED_REPOSITORIES_DOWNGRADE: &str = "DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP TABLE deliveries; DROP TABLE cursors; DROP TABLE messages; DROP TABLE message_history_revision; DROP TABLE decisions;";
+    const SHARED_REPOSITORIES_DOWNGRADE: &str = "DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP TABLE deliveries; DROP TABLE cursors; DROP TABLE messages; DROP TABLE message_history_revision; DROP TABLE decisions;";
     const SHARED_REPOSITORIES_PREVIOUS_SCHEMA: i64 = 18;
     const OWNER_CHECKPOINT_PREVIOUS_SCHEMA: i64 = 13;
     const WORKFLOW_DECISION_PREVIOUS_SCHEMA: i64 = 14;
@@ -11296,6 +11413,21 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         }
     }
 
+    /// Every save writes the purpose table, so a save with today's code into a
+    /// database downgraded below it needs the table for the write and must
+    /// drop it again, or the upgrade under test finds it already there.
+    fn save_below_purpose_usage(database: &mut SessionDatabase, session: &TestSession) {
+        database
+            .connection
+            .execute_batch(SESSION_PURPOSE_USAGE_TABLE)
+            .unwrap();
+        database.save(session, None).unwrap();
+        database
+            .connection
+            .execute_batch(PURPOSE_USAGE_DOWNGRADE)
+            .unwrap();
+    }
+
     fn seed_schema_eighteen_wal(state: &StateDir) -> CaudraId {
         let (_source_temp, source) = state_dir();
         let mut database = SessionDatabase::open_state(&source).unwrap();
@@ -11310,7 +11442,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         database.checkpoint(true).unwrap();
         let mut session = TestSession::new(MODEL, CWD);
         session.push_message(TestMessage(ARTIFACT_NAME.into()));
-        database.save(&session, None).unwrap();
+        save_below_purpose_usage(&mut database, &session);
         for suffix in ["", WAL_SUFFIX, SHM_SUFFIX] {
             fs::copy(
                 database_sidecar(&database.path(), suffix),
@@ -11585,6 +11717,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let mut database = SessionDatabase::open_state(&state).unwrap();
         let session = TestSession::new(MODEL, CWD);
         database.save(&session, None).unwrap();
+        downgrade_autopilot_audit(&database.connection);
         database
             .connection
             .execute_batch(ENGINE_DECISIONS_DOWNGRADE)
@@ -11603,6 +11736,130 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         assert!(
             migrated
                 .load_engine_decisions(session.id)
+                .unwrap()
+                .is_empty()
+        );
+        let (_fresh_temp, fresh_state) = state_dir();
+        let fresh = SessionDatabase::open_state(&fresh_state).unwrap();
+        assert_eq!(
+            schema_objects(&migrated),
+            schema_objects(&fresh),
+            "{MIGRATED_MATCHES_FRESH}"
+        );
+    }
+
+    #[test]
+    fn purpose_usage_migrates_from_schema_twenty_five_keeping_sessions() {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open_state(&state).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        session.add_model_usage(MODEL, LedgerPurpose::Chat, PURPOSE_TURN);
+        database.save(&session, None).unwrap();
+        downgrade_autopilot_audit(&database.connection);
+        database
+            .connection
+            .execute_batch(PURPOSE_USAGE_DOWNGRADE)
+            .unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", PURPOSE_USAGE_PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(database);
+
+        let mut migrated = SessionDatabase::open_state(&state).unwrap();
+
+        assert_eq!(migrated.stats().unwrap().schema_version, SCHEMA_VERSION);
+        let mut kept: TestSession = migrated.load(session.id).unwrap();
+        assert_eq!(kept.usage_by_model()[MODEL], PURPOSE_TURN);
+        assert!(kept.usage_by_purpose().is_empty());
+        kept.add_model_usage(MODEL, LedgerPurpose::Goal, PURPOSE_TURN);
+        migrated.save(&kept, None).unwrap();
+        let reloaded: TestSession = migrated.load(session.id).unwrap();
+        assert_eq!(
+            reloaded.usage_by_purpose()[LedgerPurpose::Goal.storage_name()],
+            PURPOSE_TURN
+        );
+        let (_fresh_temp, fresh_state) = state_dir();
+        let fresh = SessionDatabase::open_state(&fresh_state).unwrap();
+        assert_eq!(
+            schema_objects(&migrated),
+            schema_objects(&fresh),
+            "{MIGRATED_MATCHES_FRESH}"
+        );
+    }
+
+    /// Puts autopilot's log back as schema 26 left it: decisions without what
+    /// they said or came to, and no engagements.
+    fn downgrade_autopilot_audit(connection: &Connection) {
+        connection.execute_batch(AUTOPILOT_AUDIT_DOWNGRADE).unwrap();
+        connection.execute_batch(DECISIONS_TABLE_V24).unwrap();
+    }
+
+    #[test]
+    fn autopilot_audit_migrates_from_schema_twenty_six_keeping_decisions() {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open_state(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        let decision = StoredAutopilotDecision {
+            seq: AUDIT_SEQ,
+            at_ms: HISTORY_TIME_MS,
+            kind: AUDIT_KIND.into(),
+            action: Some(AUDIT_ACTION.into()),
+            subject: AUDIT_SUBJECT.into(),
+            reason: AUDIT_REASON.into(),
+            agent: Some(AUDIT_AGENT.into()),
+            tool_use_id: Some(AUDIT_TOOL_USE_ID.into()),
+            history_len: AUDIT_HISTORY_LEN,
+            model: Some(MODEL.into()),
+            usage: Some(PURPOSE_TURN),
+            cost: Some(AUDIT_COST),
+            engagement: None,
+            item: None,
+            payload: None,
+            outcome: None,
+        };
+        downgrade_autopilot_audit(&database.connection);
+        database
+            .connection
+            .execute(
+                "INSERT INTO autopilot_decisions (session_id, seq, at, kind, action, subject, \
+                     reason, agent, tool_use_id, history_len, model, usage, cost) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    session.id.as_bytes().as_slice(),
+                    to_i64(decision.seq, "seq").unwrap(),
+                    to_i64(decision.at_ms, "at").unwrap(),
+                    decision.kind,
+                    decision.action,
+                    decision.subject,
+                    decision.reason,
+                    decision.agent,
+                    decision.tool_use_id,
+                    to_i64(decision.history_len, "history_len").unwrap(),
+                    decision.model,
+                    serde_json::to_string(&PURPOSE_TURN).unwrap(),
+                    decision.cost,
+                ],
+            )
+            .unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", AUTOPILOT_AUDIT_PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(database);
+
+        let migrated = SessionDatabase::open_state(&state).unwrap();
+
+        assert_eq!(migrated.stats().unwrap().schema_version, SCHEMA_VERSION);
+        assert_eq!(
+            migrated.load_autopilot_decisions(session.id).unwrap(),
+            vec![decision],
+            "{MIGRATION_KEEPS_DECISIONS}"
+        );
+        assert!(
+            migrated
+                .load_autopilot_engagements(session.id)
                 .unwrap()
                 .is_empty()
         );
@@ -11828,7 +12085,11 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
                 .unwrap();
         }
         let session = TestSession::new(MODEL, CWD);
-        database.save(&session, None).unwrap();
+        if migrate {
+            save_below_purpose_usage(&mut database, &session);
+        } else {
+            database.save(&session, None).unwrap();
+        }
         let run = relocation_workflow(&database, session.id, WorkflowRunStatus::Completed);
         for (call_key, kind) in [
             (2, WorkflowCallKind::Parallel),
@@ -12358,8 +12619,9 @@ CREATE TABLE subagent_history_items (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(SESSION_PURPOSE_USAGE_TABLE, "")
                     .replace(crate::engine_decisions::TABLE, "")
-                    .replace(crate::autopilot::TABLE, "")
+                    .replace(crate::autopilot::TABLES, "")
                     .replace(crate::memory_journal::TABLES, "")
                     .replace(AUTOMATION_MESSAGING_SCHEMA, "")
                     .replace(crate::automation::TABLES, "")
@@ -12463,8 +12725,9 @@ CREATE TABLE subagents (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(SESSION_PURPOSE_USAGE_TABLE, "")
                     .replace(crate::engine_decisions::TABLE, "")
-                    .replace(crate::autopilot::TABLE, "")
+                    .replace(crate::autopilot::TABLES, "")
                     .replace(crate::memory_journal::TABLES, "")
                     .replace(AUTOMATION_MESSAGING_SCHEMA, "")
                     .replace(crate::automation::TABLES, "")

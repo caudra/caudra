@@ -6,6 +6,7 @@ use crate::app::sandbox::attached_sandbox_instance;
 use crate::app::tasks::{MAIN_TASK_ID, TaskStatus};
 use crate::app::tooltip::ChordTopic;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
+use crate::components::autopilot_panel::PanelTab;
 use crate::components::changelog_modal::fixture as changelog_fixture;
 use crate::components::command::{BUILTIN_COMMANDS, CommandPalette, ParsedCommand};
 use crate::components::context_modal::{
@@ -5051,6 +5052,7 @@ fn resumed_session_keeps_adding_to_the_restored_bill() {
     stored.token_usage = RESTORED_TOKENS;
     stored.add_model_usage(
         RESTORED_MODEL,
+        LedgerPurpose::Chat,
         RESTORED_TOKENS.billed(Some(RESTORED_COST), Billing::Api),
     );
 
@@ -17707,6 +17709,11 @@ fn btw_usage_settles_into_the_session_ledger() {
     assert_eq!(billed.input, 100);
     assert_eq!(billed.cost, Some(BTW_COST));
     assert_eq!(
+        app.state.session.usage_by_purpose()[LedgerPurpose::Btw.storage_name()],
+        *billed,
+        "the session files the side request under its purpose for /usage"
+    );
+    assert_eq!(
         app.state.goal.snapshot().unwrap().usage.input,
         100,
         "btw spends inside the goal window, so the goal is charged"
@@ -18645,6 +18652,10 @@ fn open_goal_modal(app: &mut App) {
     app.goal_modal.open();
 }
 
+fn open_autopilot_log(app: &mut App) {
+    app.open_autopilot_panel(PanelTab::Log);
+}
+
 fn open_peer_manager(app: &mut App) {
     app.open_peer_manager(PeerView::Sessions);
 }
@@ -18677,6 +18688,7 @@ fn open_argument_prompt(app: &mut App) {
 #[test_case(open_system_prompt_modal ; "system_prompt_modal")]
 #[test_case(open_projection_modal ; "projection_modal")]
 #[test_case(open_goal_modal    ; "goal_modal")]
+#[test_case(open_autopilot_log ; "autopilot_panel")]
 #[test_case(open_model_picker  ; "model_picker")]
 #[test_case(open_command_modal ; "command_modal")]
 #[test_case(open_relocation_picker ; "relocation_picker")]
@@ -18711,6 +18723,7 @@ fn a_press_outside_a_modal_dismisses_it(open: fn(&mut App)) {
 #[test_case(open_system_prompt_modal ; "system_prompt_modal")]
 #[test_case(open_projection_modal ; "projection_modal")]
 #[test_case(open_goal_modal    ; "goal_modal")]
+#[test_case(open_autopilot_log ; "autopilot_panel")]
 #[test_case(open_model_picker  ; "model_picker")]
 #[test_case(open_command_modal ; "command_modal")]
 #[test_case(open_peer_manager ; "peer_manager")]
@@ -23496,7 +23509,7 @@ const MERGE_USAGE_MODEL: &str = "usage-model";
 /// neither changes what the merge reads. Keyed on the content revision, each
 /// one used to walk the whole transcript again.
 #[test_case(|session| session.insert_tool_output("t1".into(), ToolOutput::Plain(tool_text("t1").into())), false ; "a_tool_output")]
-#[test_case(|session| session.add_model_usage(MERGE_USAGE_MODEL, StoredTokenUsage::default()), false ; "a_usage_record")]
+#[test_case(|session| session.add_model_usage(MERGE_USAGE_MODEL, LedgerPurpose::Chat, StoredTokenUsage::default()), false ; "a_usage_record")]
 #[test_case(|session| session.truncate_messages(1), true ; "a_truncation")]
 fn only_the_sessions_messages_bring_the_merge_back(mutate: fn(&mut AppSession), moves: bool) {
     let (_tmp, _dir, _writer, mut app) = tempdir_app();
@@ -24749,6 +24762,7 @@ fn app_with_wide_spend() -> App {
     let mut app = test_app();
     app.state.session_mut().add_model_usage(
         LONG_SPEND_MODEL,
+        LedgerPurpose::Chat,
         StoredTokenUsage {
             input: 1_000_000,
             cost: Some(0.75),
@@ -25850,17 +25864,24 @@ pub(crate) mod automation_runtime {
 /// The App's side of autopilot, with the experiment on.
 mod autopilot {
     use std::path::{Path, PathBuf};
+    use std::slice;
     use std::sync::Arc;
 
-    use caudra_agent::autopilot::{ActionName, AutopilotDecision, DecisionKind};
+    use caudra_agent::autopilot::{
+        ActionName, AutopilotDecision, DecisionKind, DecisionOutcome, EngagementSpend, StoodDown,
+    };
     use caudra_agent::permissions::{AutopilotNote, PermissionRequest};
     use caudra_agent::types::{Answerer, AutopilotEvent};
     use caudra_agent::{AgentEvent, AgentMode, DoneReason};
     use caudra_automation::event::{AutopilotView, InputKind, SessionStatus};
     use caudra_automation::snapshot::PauseSource;
     use caudra_config::{AutopilotConfig, Feature, FeatureFlags, ToolKey};
-    use caudra_providers::{AutopilotMessageKind, AutopilotOrigin, Billing, TokenUsage};
-    use caudra_storage::autopilot::{AutopilotBudget, AutopilotEnd, AutopilotStopper};
+    use caudra_providers::{AutopilotMessageKind, AutopilotOrigin, Billing, Message, TokenUsage};
+    use caudra_storage::autopilot::{
+        AutopilotBudget, AutopilotEnd, AutopilotStopper, StoredAutopilotDecision,
+        StoredAutopilotEngagement,
+    };
+    use caudra_storage::sessions::SessionDatabase;
     use caudra_storage::usage_ledger::LedgerPurpose;
     use crossterm::event::{KeyCode, KeyEvent};
     use test_case::test_case;
@@ -25870,25 +25891,36 @@ mod autopilot {
         press_esc_twice_during_a_run, start_a_run,
     };
     use super::{
-        App, BlockKind, Msg, Notification, PaneState, PaneStatus, PlanState, agent_msg,
+        App, BlockKind, Msg, Notification, PaneState, PaneStatus, PlanState, Status, agent_msg,
         btw_ready_app, build_app, cancel_app, click_status, done_event, drain_writer, key,
-        open_question, plan_app, queued_msg, rendered, sent_input, subagent_msg, tempdir_app,
-        test_app, test_model, test_writer,
+        open_question, plan_app, queued_msg, rendered, rendered_wide, sent_input, subagent_msg,
+        tempdir_app, test_app, test_model, test_writer,
     };
     use crate::AppSession;
     use crate::app::Mode;
     use crate::app::automation::InputWait;
     use crate::app::autopilot::{
-        ENDED_ROW, ENGAGED_ROW, NOT_ENGAGED_MSG, PLAN_LEFT_TO_YOU, decision_row,
+        ENDED_ROW, ENGAGED_ROW, NOT_ENGAGED_MSG, PLAN_LEFT_TO_YOU, ROW_NOT_LOADED, decision_body,
+        ended_row,
     };
     use crate::components::autopilot_panel::{
-        ENGAGED_STATE, ERROR_END, MODEL_KEY, STOP_KEY, STOPPED, WAITING_STATE, end_reason,
+        ANSWERED_TAG, CANCELLED_TAG, DENIED_UNATTENDED_TAG, ENGAGED_STATE, ENGAGEMENT_HEADER,
+        ERROR_END, HUMAN_FIRST_TAG, MODEL_KEY, NO_ENTRIES, PanelTab, REASON_SEPARATOR, STOP_KEY,
+        STOPPED, SUPERSEDED_TAG, TAKEN_OVER_TAG, WAITING_STATE, end_reason,
     };
     use crate::components::keybindings::key as kb;
     use crate::components::status_bar::StatusBarHitTarget;
-    use crate::components::{Action, DisplayRole, Overlay};
+    use crate::components::{Action, DisplayMessage, DisplayRole, Overlay};
+    use crate::storage_writer::AutopilotWrite;
 
     const AUTOPILOT: &str = "/autopilot";
+    const AUTOPILOT_LOG: &str = "/autopilot log";
+    /// Wide enough that the Log shows its list and detail side by side.
+    const LOG_WIDTH: u16 = 160;
+    const LIVE_SUBJECT: &str = "cargo clippy";
+    const UNSHOWN_SUBJECT: &str = "a row the transcript never drew";
+    /// Enough rows after a decision to scroll it out of a frame.
+    const TRANSCRIPT_ROWS: usize = 60;
     const AUTOPILOT_OFF: &str = "/autopilot off";
     const AUTOPILOT_GOAL: &str = "/autopilot the tests pass";
     const GOAL: &str = "the tests pass";
@@ -25901,6 +25933,7 @@ mod autopilot {
     const SPEND: f64 = 0.25;
     const COST_LIMIT: f64 = 0.1;
     const SEQ: u32 = 0;
+    const AUTOPILOT_ENGAGEMENT: u32 = 1;
     /// The run `agent_msg` sends under.
     const RUN_ID: u64 = 1;
     const DECISION_SUBJECT: &str = "bash";
@@ -25921,6 +25954,8 @@ mod autopilot {
     const PARTIAL_THINKING: &str = "partial reasoning";
     const ANY_KEY: char = 'y';
     const CLAIMED: &str = "the first touch takes the card from autopilot";
+    const STOOD_DOWN: &str =
+        "a decision autopilot stood down from must leave its card to the human";
     const NOT_ANSWERED: &str = "the touch that took the card answers nothing";
     const KEEPS_ITS_EFFECT: &str = "a key that takes a form still does what it does there";
     const NO_NOTICE_WHILE_DECIDING: &str = "a card autopilot is deciding asks nothing of the user";
@@ -25931,6 +25966,27 @@ mod autopilot {
     const NOT_HUMAN_INPUT: &str =
         "what autopilot does in the user's place must leave the automation pause latch alone";
     const TURN_STARTED: &str = "autopilot's turn must start";
+    const NOTHING_DONE: &str = "0 continuations";
+    const SPENT_CONTINUATIONS: u32 = 12;
+    const SPENT_COST: f64 = 0.42;
+    const SPENT_MS: u64 = 18 * 60_000;
+    const SPENT_RETRIES: u32 = 2;
+    const SPEND_SUMMARY: &str = "12 continuations · $0.42 · 18 min · 2 retries";
+    const HUMAN_ANSWER: &str = "allow once";
+    const PLAN_FEEDBACK: &str = "split the second step";
+    const FIRST_PROMPT: &str = "fix the flaky test";
+    const SECOND_PROMPT: &str = "now the docs";
+    const LATER_SEQ: u32 = 1;
+    const STOOD_DOWN_SEQ: u32 = 2;
+    const SECOND_ENGAGEMENT: u32 = 2;
+    const RETITLED_ONCE: &str = "a settled decision keeps its one row, retitled";
+    const LOGGED_WITHOUT_ACTION: &str = "a decision autopilot stood down from is logged as such";
+    const SETTLED_BY_THE_USER: &str = "the user's answer to an escalated plan settles it";
+    const LOG_PLACEMENT: &str =
+        "restored log rows sit at their history length, an engagement's start first";
+    const EMPTY_SESSION_KEPT: &str =
+        "an empty session is kept only while autopilot is engaged in it";
+    const ENGAGEMENT_LOGGED: &str = "a kept session's engagement must reach the log";
 
     fn autopilot_features(enabled: bool) -> FeatureFlags {
         if enabled {
@@ -25986,6 +26042,10 @@ mod autopilot {
             model: None,
             usage: None,
             cost: None,
+            engagement: None,
+            item: None,
+            payload: None,
+            outcome: None,
         }
     }
 
@@ -26040,6 +26100,29 @@ mod autopilot {
         chat.message_at(chat.message_count().checked_sub(1)?)
             .filter(|message| message.role == DisplayRole::Autopilot)
             .map(|message| message.text.clone())
+    }
+
+    /// The main transcript's rows for decision `seq`, by text.
+    fn decision_rows(app: &App, seq: u32) -> Vec<String> {
+        let chat = &app.chats[0];
+        (0..chat.message_count())
+            .filter_map(|index| chat.message_at(index))
+            .filter(|message| message.role == DisplayRole::AutopilotDecision(u64::from(seq)))
+            .map(|message| message.text.clone())
+            .collect()
+    }
+
+    /// Records the decision on the session's handle, as the agent does, and
+    /// hands the App the event.
+    fn log_decision(app: &mut App, kind: DecisionKind, action: ActionName) {
+        let decided = AutopilotDecision {
+            kind,
+            action,
+            reason: ESCALATION_REASON.into(),
+            ..decision(app)
+        };
+        let event = app.state.autopilot.record(decided);
+        autopilot_event(app, event);
     }
 
     #[test]
@@ -26157,13 +26240,8 @@ mod autopilot {
         app.update(agent_msg(AgentEvent::Autopilot(AutopilotEvent::Decided(
             Box::new(decision.clone()),
         ))));
-        let row = decision_row(
-            decision.kind.name(),
-            decision.action.name(),
-            &decision.subject,
-            &decision.reason,
-        );
-        assert_eq!(last_autopilot_row(&app), Some(row.clone()));
+        let row = decision_body(&decision.clone().into());
+        assert_eq!(decision_rows(&app, SEQ), slice::from_ref(&row));
         app.checkpoint_now();
         let id = app.state.session.id;
         drain_writer(app, writer);
@@ -26183,7 +26261,9 @@ mod autopilot {
 
         assert_eq!(restored.state.autopilot.is_engaged(), enabled);
         assert_eq!(restored.goal_checkin_due(), enabled);
-        assert_eq!(has_autopilot_row(&restored, &row), enabled);
+        assert_eq!(has_autopilot_row(&restored, ENGAGED_ROW), enabled);
+        let restored_rows = if enabled { vec![row] } else { Vec::new() };
+        assert_eq!(decision_rows(&restored, SEQ), restored_rows);
         if !enabled {
             restored.checkpoint_now();
             assert_eq!(restored.state.session.meta.autopilot, stored);
@@ -26194,6 +26274,44 @@ mod autopilot {
         assert!(!restored.start_goal_checkin().is_empty());
         assert_eq!(restored.state.autopilot.stored().unwrap().continuations, 1);
         assert!(!restored.goal_checkin_due());
+    }
+
+    fn engage_and_stop(app: &mut App) {
+        command(app, AUTOPILOT);
+        command(app, AUTOPILOT_OFF);
+    }
+
+    /// Engaging keeps an otherwise empty session, so the engagement's log
+    /// entry has the session's row to land on. An ended one keeps nothing.
+    #[test_case(|_| {}, false ; "untouched")]
+    #[test_case(|app| command(app, AUTOPILOT), true ; "bare_autopilot")]
+    #[test_case(engage_and_stop, false ; "engaged_then_stopped")]
+    fn only_a_running_engagement_keeps_an_empty_session(setup: fn(&mut App), kept: bool) {
+        let (_tmp, dir, writer, mut app) = tempdir_app();
+        enable(&mut app);
+
+        setup(&mut app);
+        app.checkpoint_now();
+        let id = app.state.session.id;
+        drain_writer(app, writer);
+
+        assert_eq!(
+            AppSession::load(id, &dir).is_ok(),
+            kept,
+            "{EMPTY_SESSION_KEPT}"
+        );
+        let logged: Vec<u32> = SessionDatabase::open(&dir)
+            .unwrap()
+            .load_autopilot_engagements(id)
+            .unwrap()
+            .iter()
+            .map(|row| row.engagement)
+            .collect();
+        assert_eq!(
+            logged,
+            Vec::from_iter(kept.then_some(AUTOPILOT_ENGAGEMENT)),
+            "{ENGAGEMENT_LOGGED}"
+        );
     }
 
     #[test]
@@ -26396,6 +26514,7 @@ mod autopilot {
 
         assert!(click_status(&mut app, StatusBarHitTarget::Autopilot).is_empty());
         assert!(app.autopilot_panel.is_open());
+        assert_eq!(app.autopilot_panel.tab(), PanelTab::Status);
         app.update(Msg::Key(key(KeyCode::Char(MODEL_KEY))));
         assert!(!app.autopilot_panel.is_open());
         assert!(app.model_picker.is_open());
@@ -26406,15 +26525,107 @@ mod autopilot {
 
         assert!(!app.autopilot_panel.is_open());
         assert_eq!(last_end(&app), stopped(AutopilotStopper::Command));
-        assert_eq!(
-            last_autopilot_row(&app),
-            Some(format!(
-                "{ENDED_ROW}: {}",
+        assert!(last_autopilot_row(&app).is_some_and(|row| {
+            row.starts_with(&format!(
+                "{ENDED_ROW}: {}{REASON_SEPARATOR}",
                 end_reason(&AutopilotEnd::Stopped {
                     by: AutopilotStopper::Command
                 })
             ))
+        }));
+    }
+
+    /// The Log, read from the session's log and drawn wide.
+    fn open_log(app: &mut App) -> String {
+        command(app, AUTOPILOT_LOG);
+        app.autopilot_panel.finish_loading();
+        rendered_wide(app, LOG_WIDTH)
+    }
+
+    #[test]
+    fn autopilot_log_in_a_session_never_engaged_says_there_is_none() {
+        let mut app = autopilot_app();
+
+        command(&mut app, AUTOPILOT_LOG);
+
+        assert!(!app.autopilot_panel.is_open());
+        assert_eq!(app.status_bar.flash_text(), Some(NO_ENTRIES));
+    }
+
+    #[test]
+    fn autopilot_log_reads_the_log_after_autopilot_stopped() {
+        let mut app = running_app();
+        log_decision(&mut app, DecisionKind::Permission, ActionName::Allow);
+        command(&mut app, AUTOPILOT_OFF);
+
+        let shown = open_log(&mut app);
+
+        assert_eq!(app.autopilot_panel.tab(), PanelTab::Log);
+        assert!(app.autopilot_panel.is_loaded());
+        for part in [
+            format!("{ENGAGEMENT_HEADER} {AUTOPILOT_ENGAGEMENT}"),
+            DECISION_SUBJECT.to_owned(),
+        ] {
+            assert!(shown.contains(&part), "{part}\n{shown}");
+        }
+    }
+
+    #[test]
+    fn the_log_takes_decisions_made_while_it_is_open() {
+        let mut app = running_app();
+        let before = open_log(&mut app);
+        assert!(!before.contains(LIVE_SUBJECT), "{before}");
+
+        let decided = AutopilotDecision {
+            seq: LATER_SEQ,
+            subject: LIVE_SUBJECT.into(),
+            ..decision(&app)
+        };
+        let event = app.state.autopilot.record(decided);
+        autopilot_event(&mut app, event);
+        let shown = rendered_wide(&mut app, LOG_WIDTH);
+
+        assert!(shown.contains(LIVE_SUBJECT), "{shown}");
+    }
+
+    #[test]
+    fn enter_closes_the_log_on_the_decisions_row() {
+        let mut app = running_app();
+        log_decision(&mut app, DecisionKind::Permission, ActionName::Allow);
+        for line in 0..TRANSCRIPT_ROWS {
+            app.main_chat()
+                .push(DisplayMessage::new(DisplayRole::User, line.to_string()));
+        }
+        let before = rendered_wide(&mut app, LOG_WIDTH);
+        assert!(!before.contains(DECISION_SUBJECT), "{before}");
+        open_log(&mut app);
+
+        app.update(Msg::Key(key(KeyCode::Enter)));
+        let after = rendered_wide(&mut app, LOG_WIDTH);
+
+        assert!(!app.autopilot_panel.is_open());
+        assert!(!app.chats[0].auto_scroll());
+        assert!(after.contains(DECISION_SUBJECT), "{after}");
+    }
+
+    #[test]
+    fn enter_on_a_row_the_transcript_lacks_keeps_the_log_up() {
+        let mut app = engaged_app();
+        let unshown = StoredAutopilotDecision {
+            subject: UNSHOWN_SUBJECT.into(),
+            ..decision(&app).into()
+        };
+        app.storage_writer.record_autopilot(
+            app.state.session.id,
+            AutopilotWrite::Decision(Box::new(unshown)),
         );
+        let shown = open_log(&mut app);
+        assert!(shown.contains(UNSHOWN_SUBJECT), "{shown}");
+
+        app.update(Msg::Key(key(KeyCode::Enter)));
+
+        assert!(app.autopilot_panel.is_open());
+        assert_eq!(app.status_bar.flash_text(), Some(ROW_NOT_LOADED));
     }
 
     /// The engagement's end is announced, for a user who looked away.
@@ -26442,14 +26653,60 @@ mod autopilot {
             message: RETRY_ERROR.into(),
         };
 
-        autopilot_event(&mut app, AutopilotEvent::Ended { reason: end });
+        autopilot_event(
+            &mut app,
+            AutopilotEvent::Ended {
+                reason: end,
+                engagement: AUTOPILOT_ENGAGEMENT,
+                spend: EngagementSpend::default(),
+            },
+        );
 
         let notice = app.take_autopilot_notice().unwrap();
         assert_eq!(notice, Notification::AutopilotEnded { reason: ERROR_END });
         assert!(!notice.message().contains(RETRY_ERROR));
         assert_eq!(
             last_autopilot_row(&app),
-            Some(format!("{ENDED_ROW}: {RETRY_ERROR}"))
+            Some(format!(
+                "{ENDED_ROW}: {RETRY_ERROR}{REASON_SEPARATOR}{NOTHING_DONE}"
+            ))
+        );
+    }
+
+    /// The row carries what the engagement spent, and the notice still says
+    /// only why it ended.
+    #[test]
+    fn an_end_row_says_what_the_engagement_spent() {
+        let mut app = engaged_app();
+        app.run_id = RUN_ID;
+
+        autopilot_event(
+            &mut app,
+            AutopilotEvent::Ended {
+                reason: AutopilotEnd::GoalMet,
+                engagement: AUTOPILOT_ENGAGEMENT,
+                spend: EngagementSpend {
+                    continuations: SPENT_CONTINUATIONS,
+                    cost_usd: SPENT_COST,
+                    subscription_cost_usd: 0.0,
+                    elapsed_ms: SPENT_MS,
+                    retries: SPENT_RETRIES,
+                },
+            },
+        );
+
+        assert_eq!(
+            last_autopilot_row(&app),
+            Some(format!(
+                "{ENDED_ROW}: {}{REASON_SEPARATOR}{SPEND_SUMMARY}",
+                end_reason(&AutopilotEnd::GoalMet)
+            ))
+        );
+        assert!(
+            !app.take_autopilot_notice()
+                .unwrap()
+                .message()
+                .contains(SPEND_SUMMARY)
         );
     }
 
@@ -26599,6 +26856,266 @@ mod autopilot {
         decide(&mut app, DecisionKind::Question, ActionName::Answer);
 
         assert!(!app.question_form.is_open());
+    }
+
+    /// A decision autopilot stood down from stops saying it is deciding, and
+    /// the form stays with the human who holds it.
+    #[test]
+    fn a_stood_down_decision_leaves_the_question_form_to_the_human() {
+        let mut app = running_app();
+        deciding_question(&mut app);
+
+        autopilot_event(
+            &mut app,
+            AutopilotEvent::StoodDown(Box::new(taken_over(DecisionKind::Question))),
+        );
+
+        assert_eq!(app.question_form.autopilot_note(), None, "{STOOD_DOWN}");
+        assert!(app.question_form.is_open(), "{STOOD_DOWN}");
+        assert!(app.autopilot_deciding.is_empty(), "{STOOD_DOWN}");
+    }
+
+    fn taken_over(kind: DecisionKind) -> StoodDown {
+        StoodDown {
+            seq: SEQ,
+            at_ms: 0,
+            kind,
+            subject: DECISION_SUBJECT.into(),
+            item: None,
+            agent: None,
+            tool_use_id: None,
+            history_len: 0,
+            engagement: Some(AUTOPILOT_ENGAGEMENT),
+            outcome: DecisionOutcome::TakenOver,
+        }
+    }
+
+    #[test]
+    fn a_stood_down_decision_gets_a_row_and_an_action_less_log_entry() {
+        let (_tmp, dir, writer, mut app) = tempdir_app();
+        enable(&mut app);
+        app.state.goal.set(GOAL).unwrap();
+        app.engage_autopilot(false);
+        app.run_id = RUN_ID;
+        let stood_down = taken_over(DecisionKind::Permission);
+
+        autopilot_event(
+            &mut app,
+            AutopilotEvent::StoodDown(Box::new(stood_down.clone())),
+        );
+
+        let rows = decision_rows(&app, SEQ);
+        assert!(
+            rows.iter().any(|row| row
+                .lines()
+                .next()
+                .is_some_and(|title| title.ends_with(TAKEN_OVER_TAG))),
+            "{LOGGED_WITHOUT_ACTION}: {rows:?}"
+        );
+        let id = app.state.session.id;
+        drain_writer(app, writer);
+        let logged = SessionDatabase::open(&dir)
+            .unwrap()
+            .load_autopilot_decisions(id)
+            .unwrap();
+        assert_eq!(
+            logged,
+            [StoredAutopilotDecision::from(stood_down)],
+            "{LOGGED_WITHOUT_ACTION}"
+        );
+    }
+
+    fn answered(answer: &str) -> DecisionOutcome {
+        DecisionOutcome::Answered {
+            answer: answer.into(),
+        }
+    }
+
+    #[test_case(DecisionOutcome::HumanFirst { answer: HUMAN_ANSWER.into() }, HUMAN_FIRST_TAG.into() ; "human_first")]
+    #[test_case(DecisionOutcome::TakenOver, TAKEN_OVER_TAG.into() ; "taken_over")]
+    #[test_case(DecisionOutcome::Superseded, SUPERSEDED_TAG.into() ; "superseded")]
+    #[test_case(DecisionOutcome::Cancelled, CANCELLED_TAG.into() ; "cancelled")]
+    #[test_case(answered(HUMAN_ANSWER), format!("{ANSWERED_TAG}: {HUMAN_ANSWER}") ; "answered_after_escalation")]
+    #[test_case(DecisionOutcome::DeniedUnattended, DENIED_UNATTENDED_TAG.into() ; "denied_unattended")]
+    fn a_settled_decision_retitles_its_row(outcome: DecisionOutcome, tag: String) {
+        let mut app = running_app();
+        log_decision(&mut app, DecisionKind::Permission, ActionName::Escalate);
+
+        let settled = app.state.autopilot.settle(SEQ, outcome);
+        autopilot_event(&mut app, settled);
+
+        let rows = decision_rows(&app, SEQ);
+        let [row] = rows.as_slice() else {
+            panic!("{RETITLED_ONCE}: {rows:?}");
+        };
+        assert!(
+            row.lines()
+                .next()
+                .is_some_and(|title| title.ends_with(&format!("{REASON_SEPARATOR}{tag}"))),
+            "{RETITLED_ONCE}: {row}"
+        );
+    }
+
+    fn implement_it(app: &mut App) {
+        assert!(!app.implement_plan(false).is_empty(), "{TURN_STARTED}");
+    }
+
+    fn revise_it(app: &mut App) {
+        app.status = Status::Idle;
+        let actions = app.submit_or_queue(queued_msg(PLAN_FEEDBACK));
+        assert!(!actions.is_empty(), "{TURN_STARTED}");
+    }
+
+    #[test_case(implement_it, ActionName::Implement ; "implemented")]
+    #[test_case(revise_it, ActionName::Revise ; "revised")]
+    fn the_users_answer_to_an_escalated_plan_settles_it(answer: fn(&mut App), action: ActionName) {
+        let mut app = plan_app();
+        enable(&mut app);
+        app.engage_autopilot(false);
+        deciding(&mut app, DecisionKind::Plan);
+        log_decision(&mut app, DecisionKind::Plan, ActionName::Escalate);
+
+        answer(&mut app);
+
+        let outcome = answered(action.name());
+        let recent = app.state.autopilot.recent_decisions();
+        assert_eq!(
+            recent.last().and_then(|decision| decision.outcome.clone()),
+            Some(outcome.clone()),
+            "{SETTLED_BY_THE_USER}"
+        );
+        let tag = format!("{ANSWERED_TAG}: {}", action.name());
+        assert!(
+            decision_rows(&app, SEQ).iter().any(|row| row
+                .lines()
+                .next()
+                .is_some_and(|title| title.ends_with(&tag))),
+            "{SETTLED_BY_THE_USER}"
+        );
+        assert_eq!(app.autopilot_plan_escalation, None);
+    }
+
+    fn stored_decision(seq: u32, engagement: u32, history_len: usize) -> StoredAutopilotDecision {
+        AutopilotDecision {
+            seq,
+            at_ms: 0,
+            kind: DecisionKind::Permission,
+            action: ActionName::Allow,
+            subject: DECISION_SUBJECT.into(),
+            reason: DECISION_REASON.into(),
+            agent: None,
+            tool_use_id: None,
+            history_len,
+            model: None,
+            usage: None,
+            cost: None,
+            engagement: Some(engagement),
+            item: None,
+            payload: None,
+            outcome: None,
+        }
+        .into()
+    }
+
+    fn stored_engagement(
+        engagement: u32,
+        engaged_history_len: usize,
+        end: Option<(usize, AutopilotEnd)>,
+    ) -> StoredAutopilotEngagement {
+        let (ended_history_len, end) = end.unzip();
+        StoredAutopilotEngagement {
+            engagement,
+            engaged_at_ms: 0,
+            engaged_history_len,
+            goal: None,
+            owns_goal: false,
+            ended_at_ms: end.as_ref().map(|_| 0),
+            ended_history_len,
+            end,
+            continuations: SPENT_CONTINUATIONS,
+            cost_usd: SPENT_COST,
+            subscription_cost_usd: 0.0,
+            elapsed_ms: SPENT_MS,
+            retries: SPENT_RETRIES,
+        }
+    }
+
+    /// A row by its text, a decision row by its title.
+    fn transcript(app: &App) -> Vec<String> {
+        let chat = &app.chats[0];
+        (0..chat.message_count())
+            .filter_map(|index| chat.message_at(index))
+            .map(|message| message.text.lines().next().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    /// Engagement 1 runs over the first prompt and ends where engagement 2
+    /// starts, which then runs over the second prompt, so rows share a
+    /// history length with others from both engagements.
+    #[test_case(true ; "experiment_on")]
+    #[test_case(false ; "experiment_off")]
+    fn the_log_is_restored_in_history_order(enabled: bool) {
+        let (_tmp, dir, writer, mut app) = tempdir_app();
+        app.state
+            .session_mut()
+            .replace_messages(crate::history_items(&[
+                Message::user(FIRST_PROMPT.into()),
+                Message::user(SECOND_PROMPT.into()),
+            ]));
+        app.checkpoint_now();
+        let id = app.state.session.id;
+        drain_writer(app, writer);
+        let stopped = AutopilotEnd::Stopped {
+            by: AutopilotStopper::Command,
+        };
+        let first = stored_engagement(AUTOPILOT_ENGAGEMENT, 0, Some((1, stopped.clone())));
+        let second = stored_engagement(SECOND_ENGAGEMENT, 1, None);
+        let made_in_first = stored_decision(SEQ, AUTOPILOT_ENGAGEMENT, 1);
+        let made_in_second = stored_decision(LATER_SEQ, SECOND_ENGAGEMENT, 1);
+        let stood_down = StoredAutopilotDecision::from(StoodDown {
+            seq: STOOD_DOWN_SEQ,
+            history_len: 2,
+            engagement: Some(SECOND_ENGAGEMENT),
+            ..taken_over(DecisionKind::Question)
+        });
+        let database = SessionDatabase::open(&dir).unwrap();
+        for engagement in [&first, &second] {
+            database.begin_autopilot_engagement(id, engagement).unwrap();
+        }
+        database.end_autopilot_engagement(id, &first).unwrap();
+        for decision in [&made_in_first, &made_in_second, &stood_down] {
+            database.insert_autopilot_decision(id, decision).unwrap();
+        }
+        drop(database);
+
+        let mut restored = build_app(dir.clone(), Arc::new(test_writer(dir.clone())));
+        restored.features = autopilot_features(enabled);
+        restored
+            .apply_loaded_session(AppSession::load(id, &dir).unwrap(), &test_model())
+            .unwrap();
+
+        let title = |decision: &StoredAutopilotDecision| {
+            decision_body(decision)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let expected = if enabled {
+            vec![
+                ENGAGED_ROW.to_owned(),
+                FIRST_PROMPT.to_owned(),
+                title(&made_in_first),
+                ended_row(&stopped, &first),
+                ENGAGED_ROW.to_owned(),
+                title(&made_in_second),
+                SECOND_PROMPT.to_owned(),
+                title(&stood_down),
+            ]
+        } else {
+            vec![FIRST_PROMPT.to_owned(), SECOND_PROMPT.to_owned()]
+        };
+        assert_eq!(transcript(&restored), expected, "{LOG_PLACEMENT}");
     }
 
     #[test]
@@ -26962,9 +27479,9 @@ mod theme_colours {
     use super::{
         App, BuiltinAction, DisplaySource, Mode, Msg, PeerView, ReviewTarget, Status,
         StatusBarHitTarget, StreamEvent, StreamFooter, TRANSCRIPT_LINES, chord, click_status, cmd,
-        commit_popup_at, fill_transcript, mention_popup_at, open_changelog_modal,
-        open_command_modal, open_context_modal, open_decisions_modal, open_docs_modal,
-        open_goal_modal, open_help_modal, open_logs_modal, open_model_picker,
+        commit_popup_at, fill_transcript, mention_popup_at, open_autopilot_log,
+        open_changelog_modal, open_command_modal, open_context_modal, open_decisions_modal,
+        open_docs_modal, open_goal_modal, open_help_modal, open_logs_modal, open_model_picker,
         open_permission_test_editor, open_permission_test_leader, open_projection_modal,
         open_question, open_queue_menu, open_relocation_picker, open_repeat_test_session_picker,
         open_search, open_server_address, open_server_form, open_skills_modal, open_storage_modal,
@@ -27174,7 +27691,7 @@ mod theme_colours {
         },
         Surface {
             name: "autopilot_panel",
-            open: |app, _| app.autopilot_panel.open(),
+            open: |app, _| open_autopilot_log(app),
             shown: |app| app.autopilot_panel.is_open(),
         },
         Surface {

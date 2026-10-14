@@ -141,7 +141,7 @@ impl AutopilotTally {
                     self.escalations += 1;
                 }
             }
-            AutopilotEvent::Ended { reason } => self.ended = Some(reason.clone()),
+            AutopilotEvent::Ended { reason, .. } => self.ended = Some(reason.clone()),
             _ => {}
         }
     }
@@ -189,7 +189,8 @@ fn launch_autopilot(
 ) -> (AutopilotHandle, Option<AutopilotEvent>) {
     let autopilot = AutopilotHandle::default();
     autopilot.set_limits(limits);
-    let engaged = autopilot.engage(goal.snapshot().is_some());
+    let condition = goal.snapshot().map(|goal| goal.condition.to_string());
+    let engaged = autopilot.engage(condition.is_some(), condition);
     (autopilot, engaged)
 }
 
@@ -754,9 +755,9 @@ fn print_goal(prompt: String) -> Result<(String, GoalHandle)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use caudra_agent::autopilot::{AutopilotDecision, DecisionKind};
+    use caudra_agent::autopilot::{AutopilotDecision, DecisionKind, EngagementSpend};
     use caudra_providers::TokenUsage;
-    use caudra_storage::autopilot::AutopilotStopper;
+    use caudra_storage::autopilot::{AutopilotStopper, DecisionOutcome};
     use test_case::test_case;
 
     const RETRY_PARENT_ID: &str = "toolu_task_1";
@@ -878,6 +879,7 @@ mod tests {
     const PLAIN_PROMPT: &str = "fix the tests";
     const AUTOPILOT_FAILURE: &str = "the delegate kept failing";
     const AUTOPILOT_SEQ: u32 = 4;
+    const AUTOPILOT_ENGAGEMENT: u32 = 1;
     const AUTOPILOT_SUBJECT: &str = "cargo test";
     const MAX_COST: f64 = 0.5;
     const SPEND: f64 = 0.75;
@@ -900,6 +902,10 @@ mod tests {
             model: None,
             usage: None,
             cost: None,
+            engagement: None,
+            item: None,
+            payload: None,
+            outcome: None,
         }))
     }
 
@@ -913,7 +919,11 @@ mod tests {
     }
 
     fn ended(reason: AutopilotEnd) -> AutopilotEvent {
-        AutopilotEvent::Ended { reason }
+        AutopilotEvent::Ended {
+            reason,
+            engagement: AUTOPILOT_ENGAGEMENT,
+            spend: EngagementSpend::default(),
+        }
     }
 
     fn budget(kind: AutopilotBudget) -> AutopilotEnd {
@@ -997,8 +1007,14 @@ mod tests {
         let (_, goal) = print_goal(prompt).unwrap();
         let (autopilot, engaged) = launch_autopilot(AutopilotConfig::default(), &goal);
 
-        assert_eq!(engaged, Some(AutopilotEvent::Engaged));
-        assert_eq!(autopilot.engage(false), None);
+        assert_eq!(
+            engaged,
+            Some(AutopilotEvent::Engaged {
+                engagement: AUTOPILOT_ENGAGEMENT,
+                goal: goal.active_condition(),
+            })
+        );
+        assert_eq!(autopilot.engage(false, None), None);
         (goal.active_condition(), autopilot.owns_goal())
     }
 
@@ -1016,10 +1032,8 @@ mod tests {
         let ended = subagent_spend(Some(&autopilot), Some(SPEND), Billing::Api, purpose);
 
         assert_eq!(ended.is_some(), !autopilot.is_engaged());
-        ended
-            == Some(AutopilotEvent::Ended {
-                reason: budget(AutopilotBudget::Cost),
-            })
+        matches!(ended, Some(AutopilotEvent::Ended { reason, .. })
+            if reason == budget(AutopilotBudget::Cost))
     }
 
     #[test]
@@ -1029,9 +1043,16 @@ mod tests {
         let mut tally = AutopilotTally::default();
 
         for event in [
-            AutopilotEvent::Engaged,
+            AutopilotEvent::Engaged {
+                engagement: AUTOPILOT_ENGAGEMENT,
+                goal: None,
+            },
             AutopilotEvent::ImplementPlan { seq: AUTOPILOT_SEQ },
             decided(ActionName::Escalate),
+            AutopilotEvent::Settled {
+                seq: AUTOPILOT_SEQ,
+                outcome: DecisionOutcome::DeniedUnattended,
+            },
         ] {
             note_autopilot(&event, &mut tally, Some(&mut out), &session_id).unwrap();
         }
@@ -1064,6 +1085,12 @@ mod tests {
                     json!(AUTOPILOT_SYSTEM_SUBTYPE),
                     json!("decided"),
                     json!(ActionName::Escalate.name()),
+                ),
+                (
+                    json!(SYSTEM_EVENT),
+                    json!(AUTOPILOT_SYSTEM_SUBTYPE),
+                    json!("settled"),
+                    Value::Null,
                 ),
             ]
         );

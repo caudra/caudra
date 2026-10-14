@@ -1475,6 +1475,7 @@ impl<'h> Agent<'h> {
             status = error.status(),
             "provider error outlasted the transport retries, autopilot retries the run"
         );
+        autopilot.count_retry();
         self.event_tx.try_send(AutopilotEvent::Retrying {
             attempt,
             limit,

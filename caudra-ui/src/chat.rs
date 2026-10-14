@@ -620,6 +620,10 @@ impl Chat {
         self.messages_panel.scroll_to_segment(segment_index);
     }
 
+    pub fn scroll_to_message(&mut self, msg_index: usize) {
+        self.messages_panel.scroll_to_message(msg_index);
+    }
+
     pub fn restore_scroll(&mut self, scroll_top: u32, auto_scroll: bool) {
         self.messages_panel.restore_scroll(scroll_top, auto_scroll);
     }
@@ -850,6 +854,16 @@ impl Chat {
 
     pub fn remove_notice(&mut self, text: &str) {
         self.messages_panel.remove_notice(text);
+    }
+
+    /// The row autopilot's decision `seq` drew, for a caller that scrolls to
+    /// it.
+    pub fn autopilot_decision_row(&self, seq: u64) -> Option<usize> {
+        self.messages_panel.autopilot_decision_row(seq)
+    }
+
+    pub fn rewrite_autopilot_decision(&mut self, seq: u64, text: String) {
+        self.messages_panel.rewrite_autopilot_decision(seq, text);
     }
 
     /// Ends the transcript with the bubble [`TaskOutcome::role`] picks. A chat

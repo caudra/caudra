@@ -612,7 +612,7 @@ mod tests {
         let handle = engaged.map(|engaged| {
             let handle = AutopilotHandle::default();
             if engaged {
-                handle.engage(true);
+                handle.engage(true, None);
             }
             handle
         });

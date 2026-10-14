@@ -30,7 +30,9 @@ use serde_json::{Number, Value, json};
 use strum::Display;
 
 use crate::agent::{GoalResult, GoalVerdict};
-use crate::autopilot::{AutopilotDecision, DecisionKind};
+use crate::autopilot::{
+    AutopilotDecision, DecisionKind, DecisionOutcome, EngagementSpend, StoodDown,
+};
 use crate::decisions::DecisionNote;
 use crate::mcp::kind::McpServerKind;
 use crate::mcp::output::McpOutput;
@@ -2712,13 +2714,27 @@ impl From<Option<StopReason>> for DoneReason {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AutopilotEvent {
-    Engaged,
+    Engaged {
+        engagement: u32,
+        /// The goal active when it engaged.
+        goal: Option<String>,
+    },
+    /// Every decision announced is followed by one [`Self::Decided`] or one
+    /// [`Self::StoodDown`].
     Deciding {
         seq: u32,
         kind: DecisionKind,
         subject: String,
     },
     Decided(Box<AutopilotDecision>),
+    /// A decision that started and never produced an answer.
+    StoodDown(Box<StoodDown>),
+    /// What became of a decision after it was recorded, such as the human's
+    /// answer to an escalation.
+    Settled {
+        seq: u32,
+        outcome: DecisionOutcome,
+    },
     /// A retryable provider error ended a run, and it starts again after
     /// `delay_ms`.
     Retrying {
@@ -2732,6 +2748,8 @@ pub enum AutopilotEvent {
     },
     Ended {
         reason: AutopilotEnd,
+        engagement: u32,
+        spend: EngagementSpend,
     },
 }
 

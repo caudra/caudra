@@ -1740,6 +1740,41 @@ pub const KEYBINDS: &[Keybind] = &[
         context: KeybindContext::Decisions,
     },
     Keybind {
+        label: KeyLabel::Alt("Tab", SHIFT_TAB_LABEL),
+        description: "Switch between Status and Log",
+        context: KeybindContext::AutopilotPanel,
+    },
+    Keybind {
+        label: KeyLabel::Single("1-2"),
+        description: "Jump to Status or Log",
+        context: KeybindContext::AutopilotPanel,
+    },
+    Keybind {
+        label: KeyLabel::Alt(autopilot_panel::DOWN_LABEL, autopilot_panel::UP_LABEL),
+        description: "Next or previous log entry, skipping engagement headers",
+        context: KeybindContext::AutopilotPanel,
+    },
+    Keybind {
+        label: KeyLabel::Alt("Left", "Right"),
+        description: "Focus the log list or the entry's detail",
+        context: KeybindContext::AutopilotPanel,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::ENTER.label),
+        description: "Jump to the entry's row in the transcript. A narrow panel opens its detail first",
+        context: KeybindContext::AutopilotPanel,
+    },
+    Keybind {
+        label: KeyLabel::Single(autopilot_panel::FILTER_LABEL),
+        description: "Cycle the log filter: all, left to you, then each decision kind",
+        context: KeybindContext::AutopilotPanel,
+    },
+    Keybind {
+        label: KeyLabel::Single(autopilot_panel::COPY_LABEL),
+        description: "Copy the selected log entry as text",
+        context: KeybindContext::AutopilotPanel,
+    },
+    Keybind {
         label: KeyLabel::Single(autopilot_panel::STOP_LABEL),
         description: "Stop autopilot",
         context: KeybindContext::AutopilotPanel,

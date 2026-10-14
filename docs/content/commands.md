@@ -65,7 +65,7 @@ A command with an Experiment entry exists only while that switch is on under `[e
 | `/goal` | Work until a completion condition is met | Main only |  |
 | `/goal-clear` | Stop the active completion goal | Main only |  |
 | `/goal-model` | Assign the completion goal model | Main only |  |
-| `/autopilot` | Keep the session moving: answer prompts, questions, and plans for you (off, model) | Main only | `autopilot` |
+| `/autopilot` | Keep the session moving: answer prompts, questions, and plans for you (off, model, log) | Main only | `autopilot` |
 | `/auto` | Toggle Auto permissions (skip unmatched prompts, keep safeguards) |  | `decision_engine` |
 | `/decisions` | Inspect decision engine status, features, activity, and recent decisions |  | `decision_engine` |
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |  |  |
@@ -215,7 +215,7 @@ The summary shows the active model and window, estimated tokens by category, the
 
 Token counts are estimates. Deferred MCP definitions and memory or skill bodies stay on demand, and opening either report does not load them. The compact MCP catalog, the [memory view](/docs/memory/#the-view), and the skill name and description list count when present. Full definitions and bodies count after the agent loads them.
 
-`/usage` is the cumulative view. It totals provider-reported tokens and priced spend for completed calls across the session, and its global view shows lifetime spend. Both scopes break the work down per model, and per provider once more than one served it, with a `hit` column for [cache hit rate](/docs/token-economy/#cache-hit-rate). See [Context](/docs/context/) for how requests are assembled and [Token Economy](/docs/token-economy/#lifetime-spend) for the spending ledger.
+`/usage` is the cumulative view. It totals provider-reported tokens and priced spend for completed calls across the session, and its global view shows lifetime spend. Both scopes break the work down per model, per purpose, and per provider once more than one served it, with a `hit` column for [cache hit rate](/docs/token-economy/#cache-hit-rate). A purpose says why Caudra called the model: `chat` is the conversation, and the rest, such as `title`, `goal`, `compaction`, or `memory`, is work Caudra did on your behalf. The session view counts purposes for turns. See [Context](/docs/context/) for how requests are assembled and [Token Economy](/docs/token-economy/#lifetime-spend) for the spending ledger.
 
 Subscription quota comes from the provider's usage endpoint, which every client on the account shares and which rate-limits far sooner than chat. `/usage` marks the figures with the time they were fetched. If a refresh is refused, it keeps the last figures and counts down the provider's retry window. Until the window ends, opening `/usage` or pressing `Ctrl+R` makes no request. Click the time to refresh anyway.
 

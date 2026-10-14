@@ -154,8 +154,7 @@ impl FormElicitor {
         for _ in 0..MAX_FORM_ATTEMPTS {
             let shown = self.show(asked, questions.clone(), message, None);
             let fit = |picked: &[Vec<String>]| form.content(picked);
-            let wait =
-                wait_for_answer(&replies, delegate.take(), &self.event_tx, &self.cancel, fit);
+            let wait = wait_for_answer(&replies, delegate.take(), &self.cancel, fit);
             let raw = match wait.await {
                 Some(Reply::Human(raw)) => raw,
                 Some(Reply::Autopilot(content)) => {
@@ -219,6 +218,7 @@ impl FormElicitor {
             &asked.message,
             questions,
             self.tool_use_id.clone(),
+            &self.event_tx,
         ))
     }
 

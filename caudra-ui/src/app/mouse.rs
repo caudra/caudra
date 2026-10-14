@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crate::agent::AgentCommand;
+use crate::components::autopilot_panel::PanelTab;
 use crate::components::command::ChatScope;
 use crate::components::help_modal::HelpMouse;
 use crate::components::input::{ChordHint, InputHit};
@@ -1250,8 +1251,7 @@ impl App {
                 Vec::new()
             }
             StatusBarHitTarget::Autopilot => {
-                self.clear_control_hovers();
-                self.autopilot_panel.open();
+                self.open_autopilot_panel(PanelTab::Status);
                 Vec::new()
             }
             StatusBarHitTarget::Tasks => {

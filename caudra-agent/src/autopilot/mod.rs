@@ -18,6 +18,7 @@ use caudra_config::AutopilotConfig;
 use caudra_providers::{Billing, Message};
 use caudra_storage::autopilot::{AutopilotEnd, StoredAutopilot, StoredAutopilotDecision};
 use caudra_storage::sessions::SessionMeta;
+use serde::Serialize;
 use tracing::warn;
 
 use crate::agent::{ResolvedEvaluator, last_announced, standing_notice as restated_notice};
@@ -27,20 +28,35 @@ use crate::types::AutopilotEvent;
 use budget::{Budget, ReviewStreak};
 
 pub use budget::{MAX_REVIEW_STREAK, retry_delay};
+pub use caudra_storage::autopilot::{DecisionOutcome, DecisionPayload};
 #[cfg(test)]
 pub(crate) use context::MAX_CONTEXT_BYTES;
 pub(crate) use context::mode_label;
 pub use context::{AutopilotSnapshot, ChatSession, DecisionRequest, RECENT_DECISIONS};
+pub(crate) use delegate::DecisionSlot;
 #[cfg(test)]
 pub(crate) use delegate::tests::{GatedProvider, ScriptedProvider, Step, engaged_handle};
 pub use delegate::{DecisionOrigin, Delegate, DelegateOutcome};
 pub use wire::{
-    ActionName, AutopilotDecision, DecisionKind, DelegateAction, DelegateOutput,
+    ActionName, AutopilotDecision, DecisionKind, DelegateAction, DelegateOutput, StoodDown,
     StoredDecisionError, WireError,
 };
 
 /// Delegate calls one session may have in flight.
 pub const MAX_CONCURRENT_DECISIONS: usize = 4;
+
+/// What one engagement used, as its end reports it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct EngagementSpend {
+    pub continuations: u32,
+    /// API-billed spend, the part the cost limit caps.
+    pub cost_usd: f64,
+    /// Spend a subscription covered: shown, never capped.
+    pub subscription_cost_usd: f64,
+    pub elapsed_ms: u64,
+    /// Main-agent runs retried after an error.
+    pub retries: u32,
+}
 
 /// One session's autopilot. Clones share it, so the App keeps it across
 /// respawns and hands it to every root permission manager it builds. It holds
@@ -54,6 +70,8 @@ pub struct AutopilotHandle {
 
 struct State {
     engaged: bool,
+    /// The latest engagement's number, `0` before the first.
+    engagement: u32,
     owns_goal: bool,
     /// Unix milliseconds.
     engaged_at_ms: Option<u64>,
@@ -85,6 +103,7 @@ impl AutopilotHandle {
     pub fn new(clock: Arc<dyn Clock>) -> Self {
         let state = State {
             engaged: false,
+            engagement: 0,
             owns_goal: false,
             engaged_at_ms: None,
             budget: Budget::new(clock.monotonic()),
@@ -109,7 +128,8 @@ impl AutopilotHandle {
     /// Reopens the engagement a session stored, still engaged if it was, with
     /// the budget it had used. `decisions` are the session's, oldest first:
     /// numbering continues after them, and the ones this engagement made are
-    /// the recent ones again.
+    /// the recent ones again. A decision stored before decisions carried their
+    /// engagement counts as this one's when it was made since it engaged.
     pub fn from_meta(
         meta: &SessionMeta,
         decisions: Vec<StoredAutopilotDecision>,
@@ -120,6 +140,7 @@ impl AutopilotHandle {
         let mut state = handle.lock();
         if let Some(stored) = meta.autopilot.as_deref() {
             state.engaged = stored.engaged;
+            state.engagement = stored.engagement;
             state.owns_goal = stored.owns_goal;
             state.engaged_at_ms = stored.engaged_at_ms;
             state.budget = Budget::restored(stored, now);
@@ -130,10 +151,16 @@ impl AutopilotHandle {
             .map(|decision| decision.seq.saturating_add(1))
             .max()
             .map_or(0, |next| u32::try_from(next).unwrap_or(u32::MAX));
+        let current = state.engagement;
         let since = state.engaged_at_ms.unwrap_or_default();
         state.recent = decisions
             .into_iter()
-            .filter(|decision| decision.at_ms >= since)
+            .filter(|decision| {
+                decision.action.is_some()
+                    && decision
+                        .engagement
+                        .map_or(decision.at_ms >= since, |engagement| engagement == current)
+            })
             .filter_map(|decision| {
                 AutopilotDecision::try_from(decision)
                     .inspect_err(|error| warn!(%error, "skipping an unreadable autopilot decision"))
@@ -155,21 +182,24 @@ impl AutopilotHandle {
         }
         let mut stored = StoredAutopilot {
             engaged: state.engaged,
+            engagement: state.engagement,
             owns_goal: state.owns_goal,
             engaged_at_ms: state.engaged_at_ms,
             continuations: 0,
             cost_usd: 0.0,
             subscription_cost_usd: 0.0,
             elapsed_ms: 0,
+            retries: 0,
             last_end: state.last_end.clone(),
         };
         state.budget.store(&mut stored, now);
         Some(stored)
     }
 
-    /// Starts an engagement with a fresh budget. Already engaged, it only
-    /// takes ownership of a goal it set, and announces nothing.
-    pub fn engage(&self, owns_goal: bool) -> Option<AutopilotEvent> {
+    /// Starts the next engagement with a fresh budget, under `goal` when one
+    /// is active. Already engaged, it only takes ownership of a goal it set,
+    /// and announces nothing.
+    pub fn engage(&self, owns_goal: bool, goal: Option<String>) -> Option<AutopilotEvent> {
         let now = self.clock.monotonic();
         let engaged_at_ms = u64::try_from(self.clock.now_ms()).ok();
         let mut state = self.lock();
@@ -178,6 +208,7 @@ impl AutopilotHandle {
             return None;
         }
         state.engaged = true;
+        state.engagement = state.engagement.saturating_add(1);
         state.owns_goal = owns_goal;
         state.engaged_at_ms = engaged_at_ms;
         state.budget = Budget::new(now);
@@ -186,7 +217,15 @@ impl AutopilotHandle {
         state.question_claimed = false;
         state.plan_claimed = false;
         state.review_streak.reset();
-        Some(AutopilotEvent::Engaged)
+        Some(AutopilotEvent::Engaged {
+            engagement: state.engagement,
+            goal,
+        })
+    }
+
+    /// The engagement now running or last run, `None` before the first.
+    pub fn engagement(&self) -> Option<u32> {
+        Some(self.lock().engagement).filter(|engagement| *engagement > 0)
     }
 
     /// Ends the engagement for `reason`. Not engaged, it does nothing.
@@ -246,6 +285,11 @@ impl AutopilotHandle {
             AutopilotEnd::Budget { kind },
             now,
         ))
+    }
+
+    /// Counts a main-agent run retried after an error.
+    pub fn count_retry(&self) {
+        self.lock().budget.count_retry();
     }
 
     /// The user spoke. It breaks the review streak and nothing else: an
@@ -329,6 +373,20 @@ impl AutopilotHandle {
         AutopilotEvent::Decided(Box::new(decision))
     }
 
+    /// Records what became of decision `seq` once it was recorded, such as
+    /// the human's answer to an escalation.
+    pub fn settle(&self, seq: u32, outcome: DecisionOutcome) -> AutopilotEvent {
+        if let Some(decision) = self
+            .lock()
+            .recent
+            .iter_mut()
+            .find(|decision| decision.seq == seq)
+        {
+            decision.outcome = Some(outcome.clone());
+        }
+        AutopilotEvent::Settled { seq, outcome }
+    }
+
     /// This engagement's newest decisions, oldest first.
     pub fn recent_decisions(&self) -> Vec<AutopilotDecision> {
         self.lock().recent.iter().cloned().collect()
@@ -353,7 +411,11 @@ fn end_engagement(state: &mut State, reason: AutopilotEnd, now: Duration) -> Aut
     state.owns_goal = false;
     state.budget.pause(now);
     state.last_end = Some(reason.clone());
-    AutopilotEvent::Ended { reason }
+    AutopilotEvent::Ended {
+        reason,
+        engagement: state.engagement,
+        spend: state.budget.spend(now),
+    }
 }
 
 fn trim_recent(recent: &mut VecDeque<AutopilotDecision>) {
@@ -402,9 +464,16 @@ mod tests {
     const STOPPED: AutopilotEnd = AutopilotEnd::Stopped {
         by: AutopilotStopper::Command,
     };
-    const ENDED_JSON: &str =
-        r#"{"type":"autopilot","event":"ended","reason":{"reason":"budget","kind":"cost"}}"#;
-    const ENGAGED_JSON: &str = r#"{"type":"autopilot","event":"engaged"}"#;
+    const ENDED_JSON: &str = r#"{"type":"autopilot","event":"ended","reason":{"reason":"budget","kind":"cost"},"engagement":1,"spend":{"continuations":0,"cost_usd":0.0,"subscription_cost_usd":0.0,"elapsed_ms":0,"retries":0}}"#;
+    const ENGAGED_JSON: &str =
+        r#"{"type":"autopilot","event":"engaged","engagement":1,"goal":null}"#;
+    const SETTLED_JSON: &str =
+        r#"{"type":"autopilot","event":"settled","seq":3,"outcome":{"status":"taken_over"}}"#;
+    const FIRST_ENGAGEMENT: u32 = 1;
+    const NUMBERED: &str = "every engagement must take the next number";
+    const SPEND_REPORTED: &str = "an end must report the engagement's spend, retries included";
+    const SETTLED: &str = "a settled decision must carry its outcome among the recent";
+    const RESTORED_BY_ENGAGEMENT: &str = "a restore must keep only the engagement's own answered decisions, by number or, unnumbered, by time";
     const DECIDING_JSON: &str = r#"{"type":"autopilot","event":"deciding","seq":3,"kind":"permission","subject":"shell: cargo test"}"#;
     const DECIDED_EVENT: &str = "decided";
     const ANNOUNCED_ONCE: &str = "an engagement must be announced once";
@@ -445,13 +514,31 @@ mod tests {
             model: None,
             usage: None,
             cost: None,
+            engagement: None,
+            item: None,
+            payload: None,
+            outcome: None,
         }
     }
 
-    fn budget_end(kind: AutopilotBudget) -> AutopilotEvent {
-        AutopilotEvent::Ended {
-            reason: AutopilotEnd::Budget { kind },
+    fn budget_end(kind: AutopilotBudget) -> Option<AutopilotEnd> {
+        Some(AutopilotEnd::Budget { kind })
+    }
+
+    fn ended_by(event: Option<AutopilotEvent>) -> Option<AutopilotEnd> {
+        match event? {
+            AutopilotEvent::Ended { reason, .. } => Some(reason),
+            _ => None,
         }
+    }
+
+    fn in_engagement(seq: u32, engagement: Option<u32>, at_ms: i64) -> StoredAutopilotDecision {
+        AutopilotDecision {
+            engagement,
+            at_ms: u64::try_from(at_ms).unwrap(),
+            ..decision(seq)
+        }
+        .into()
     }
 
     fn engaged_notice() -> Message {
@@ -476,12 +563,22 @@ mod tests {
     fn an_engagement_is_announced_and_ended_once() {
         let (_, handle) = handle();
 
-        assert_eq!(handle.engage(false), Some(AutopilotEvent::Engaged));
-        assert_eq!(handle.engage(false), None);
+        assert_eq!(
+            handle.engage(false, Some(PROMPT.into())),
+            Some(AutopilotEvent::Engaged {
+                engagement: FIRST_ENGAGEMENT,
+                goal: Some(PROMPT.into()),
+            })
+        );
+        assert_eq!(handle.engage(false, None), None);
         assert!(handle.is_engaged());
         assert_eq!(
             handle.end(STOPPED),
-            Some(AutopilotEvent::Ended { reason: STOPPED })
+            Some(AutopilotEvent::Ended {
+                reason: STOPPED,
+                engagement: FIRST_ENGAGEMENT,
+                spend: EngagementSpend::default(),
+            })
         );
         assert_eq!(handle.end(STOPPED), None);
 
@@ -490,12 +587,125 @@ mod tests {
     }
 
     #[test]
+    fn every_engagement_takes_the_next_number() {
+        let (_, handle) = handle();
+        assert_eq!(handle.engagement(), None);
+
+        handle.engage(false, None);
+        handle.end(STOPPED);
+        assert_eq!(handle.engagement(), Some(FIRST_ENGAGEMENT), "{NUMBERED}");
+        let engaged = handle.engage(false, None);
+
+        assert!(
+            matches!(engaged, Some(AutopilotEvent::Engaged { engagement, .. })
+                if engagement == FIRST_ENGAGEMENT + 1),
+            "{NUMBERED}"
+        );
+        assert_eq!(
+            handle.engagement(),
+            Some(FIRST_ENGAGEMENT + 1),
+            "{NUMBERED}"
+        );
+    }
+
+    #[test]
+    fn an_end_reports_what_the_engagement_spent() {
+        let (clock, handle) = handle();
+        handle.engage(false, None);
+        handle.try_continue(&limits()).unwrap();
+        handle.record_spend(Some(SPEND), Billing::Api, &limits());
+        handle.record_spend(Some(SPEND), Billing::Subscription, &limits());
+        handle.count_retry();
+        clock.advance(RAN);
+
+        let Some(AutopilotEvent::Ended { spend, .. }) = handle.end(STOPPED) else {
+            panic!("an engaged autopilot must end");
+        };
+
+        assert_eq!(
+            spend,
+            EngagementSpend {
+                continuations: 1,
+                cost_usd: SPEND,
+                subscription_cost_usd: SPEND,
+                elapsed_ms: u64::try_from(RAN.as_millis()).unwrap(),
+                retries: 1,
+            },
+            "{SPEND_REPORTED}"
+        );
+        handle.engage(false, None);
+        assert_eq!(handle.stored().unwrap().retries, 0, "{SPEND_REPORTED}");
+    }
+
+    #[test]
+    fn a_settled_decision_keeps_its_outcome_among_the_recent() {
+        let (_, handle) = handle();
+        handle.engage(false, None);
+        let seq = handle.next_seq();
+        handle.record(decision(seq));
+        let answered = DecisionOutcome::Answered {
+            answer: REASON.into(),
+        };
+
+        let event = handle.settle(seq, answered.clone());
+
+        assert_eq!(
+            event,
+            AutopilotEvent::Settled {
+                seq,
+                outcome: answered.clone(),
+            }
+        );
+        let outcomes: Vec<_> = handle
+            .recent_decisions()
+            .into_iter()
+            .map(|decision| decision.outcome)
+            .collect();
+        assert_eq!(outcomes, [Some(answered)], "{SETTLED}");
+    }
+
+    #[test]
+    fn a_restore_keeps_only_the_engagements_own_decisions() {
+        let (clock, handle) = handle();
+        handle.engage(false, None);
+        handle.end(STOPPED);
+        clock.advance(RAN);
+        handle.engage(false, None);
+        let current = handle.engagement();
+        let engaged_at = START_MS + i64::try_from(RAN.as_millis()).unwrap();
+        let meta = SessionMeta {
+            autopilot: handle.stored().map(Box::new),
+            ..SessionMeta::default()
+        };
+        let stood_down = StoredAutopilotDecision {
+            action: None,
+            ..in_engagement(4, current, engaged_at)
+        };
+        let decisions = vec![
+            in_engagement(0, Some(FIRST_ENGAGEMENT), engaged_at),
+            in_engagement(1, None, START_MS),
+            in_engagement(2, None, engaged_at),
+            in_engagement(3, current, START_MS),
+            stood_down,
+        ];
+
+        let restored = AutopilotHandle::from_meta(&meta, decisions, clock);
+
+        let kept: Vec<_> = restored
+            .recent_decisions()
+            .iter()
+            .map(|decision| decision.seq)
+            .collect();
+        assert_eq!(kept, [2, 3], "{RESTORED_BY_ENGAGEMENT}");
+    }
+
+    #[test]
     fn engaging_again_with_a_goal_only_takes_ownership() {
         let (_, handle) = handle();
-        handle.engage(false);
+        handle.engage(false, None);
         handle.try_continue(&limits()).unwrap();
 
-        assert_eq!(handle.engage(true), None);
+        assert_eq!(handle.engage(true, None), None);
 
         assert!(handle.owns_goal());
         assert_eq!(handle.stored().unwrap().continuations, 1);
@@ -504,12 +714,12 @@ mod tests {
     #[test]
     fn ownership_drops_by_hand_and_with_the_engagement() {
         let (_, handle) = handle();
-        handle.engage(true);
+        handle.engage(true, None);
         handle.drop_goal_ownership();
         assert!(!handle.owns_goal());
         assert!(handle.is_engaged());
 
-        handle.engage(true);
+        handle.engage(true, None);
         handle.end(STOPPED);
 
         assert!(!handle.owns_goal(), "{OWNERSHIP_ENDS}");
@@ -520,7 +730,7 @@ mod tests {
     fn human_input_breaks_the_review_streak_and_nothing_else(engaged: bool) {
         let (_, handle) = handle();
         if engaged {
-            handle.engage(false);
+            handle.engage(false, None);
         }
         for _ in 0..MAX_REVIEW_STREAK {
             assert!(handle.review_continue());
@@ -536,14 +746,14 @@ mod tests {
     #[test]
     fn continuations_run_out_through_the_handle() {
         let (_, handle) = handle();
-        handle.engage(false);
+        handle.engage(false, None);
         for _ in 0..MAX_CONTINUATIONS {
             assert_eq!(handle.try_continue(&limits()), Ok(()));
         }
 
         assert_eq!(
-            handle.try_continue(&limits()),
-            Err(budget_end(AutopilotBudget::Continuations))
+            ended_by(handle.try_continue(&limits()).err()),
+            budget_end(AutopilotBudget::Continuations)
         );
         assert!(!handle.is_engaged(), "{BUDGET_ENDS}");
     }
@@ -551,15 +761,15 @@ mod tests {
     #[test]
     fn cost_runs_out_through_the_handle() {
         let (_, handle) = handle();
-        handle.engage(false);
+        handle.engage(false, None);
 
         assert_eq!(
             handle.record_spend(Some(SPEND), Billing::Api, &limits()),
             None
         );
         assert_eq!(
-            handle.record_spend(Some(MAX_COST), Billing::Api, &limits()),
-            Some(budget_end(AutopilotBudget::Cost))
+            ended_by(handle.record_spend(Some(MAX_COST), Billing::Api, &limits())),
+            budget_end(AutopilotBudget::Cost)
         );
         assert!(!handle.is_engaged(), "{BUDGET_ENDS}");
     }
@@ -568,7 +778,7 @@ mod tests {
     #[test_case(false ; "at_the_next_spend")]
     fn time_runs_out_through_the_handle(continuing: bool) {
         let (clock, handle) = handle();
-        handle.engage(false);
+        handle.engage(false, None);
         clock.advance(MINUTE * MAX_MINUTES);
 
         let ended = if continuing {
@@ -577,7 +787,7 @@ mod tests {
             handle.record_spend(None, Billing::Api, &limits())
         };
 
-        assert_eq!(ended, Some(budget_end(AutopilotBudget::Time)));
+        assert_eq!(ended_by(ended), budget_end(AutopilotBudget::Time));
         assert!(!handle.is_engaged(), "{BUDGET_ENDS}");
     }
 
@@ -598,7 +808,7 @@ mod tests {
     #[test]
     fn a_restored_engagement_keeps_its_budget_and_numbering() {
         let (clock, handle) = handle();
-        handle.engage(true);
+        handle.engage(true, None);
         handle.try_continue(&limits()).unwrap();
         handle.record_spend(Some(SPEND), Billing::Api, &limits());
         clock.advance(RAN);
@@ -634,7 +844,7 @@ mod tests {
     #[test_case(Some(STOPPED) ; "ended")]
     fn an_engagement_round_trips_through_storage(end: Option<AutopilotEnd>) {
         let (clock, handle) = handle();
-        handle.engage(false);
+        handle.engage(false, None);
         handle.record_spend(Some(SPEND), Billing::Subscription, &limits());
         clock.advance(RAN);
         if let Some(end) = end {
@@ -656,7 +866,7 @@ mod tests {
     #[test]
     fn an_ended_engagement_stops_its_clock() {
         let (clock, handle) = handle();
-        handle.engage(false);
+        handle.engage(false, None);
         clock.advance(RAN);
         handle.end(STOPPED);
         clock.advance(RAN);
@@ -670,14 +880,14 @@ mod tests {
     #[test]
     fn engaging_resets_the_budget_and_the_claims() {
         let (_, handle) = handle();
-        handle.engage(false);
+        handle.engage(false, None);
         handle.try_continue(&limits()).unwrap();
         handle.record(decision(handle.next_seq()));
         assert!(handle.claim_question());
         assert!(handle.claim_plan());
         handle.end(STOPPED);
 
-        handle.engage(false);
+        handle.engage(false, None);
 
         let stored = handle.stored().unwrap();
         assert_eq!((stored.continuations, stored.last_end), (0, None));
@@ -716,7 +926,7 @@ mod tests {
     #[test]
     fn only_the_recent_decisions_are_kept() {
         let (_, handle) = handle();
-        handle.engage(false);
+        handle.engage(false, None);
 
         for _ in 0..=RECENT_DECISIONS {
             let event = handle.record(decision(handle.next_seq()));
@@ -746,9 +956,10 @@ mod tests {
         assert!(Arc::ptr_eq(&handle.snapshot().unwrap().messages, &messages));
     }
 
-    #[test_case(AutopilotEvent::Engaged, ENGAGED_JSON ; "engaged")]
+    #[test_case(AutopilotEvent::Engaged { engagement: FIRST_ENGAGEMENT, goal: None }, ENGAGED_JSON ; "engaged")]
     #[test_case(AutopilotEvent::Deciding { seq: 3, kind: DecisionKind::Permission, subject: SUBJECT.into() }, DECIDING_JSON ; "deciding")]
-    #[test_case(budget_end(AutopilotBudget::Cost), ENDED_JSON ; "ended")]
+    #[test_case(AutopilotEvent::Ended { reason: AutopilotEnd::Budget { kind: AutopilotBudget::Cost }, engagement: FIRST_ENGAGEMENT, spend: EngagementSpend::default() }, ENDED_JSON ; "ended")]
+    #[test_case(AutopilotEvent::Settled { seq: 3, outcome: DecisionOutcome::TakenOver }, SETTLED_JSON ; "settled")]
     fn an_event_serializes_under_the_agent_event_tag(event: AutopilotEvent, expected: &str) {
         let value = serde_json::to_value(AgentEvent::Autopilot(event)).unwrap();
 

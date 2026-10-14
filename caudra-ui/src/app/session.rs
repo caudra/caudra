@@ -199,6 +199,13 @@ pub(crate) fn session_has_content(session: &AppSession, default_mode: StoredMode
             .automations
             .as_ref()
             .is_some_and(|controls| !controls.armed.is_empty())
+        // Engaging autopilot is a choice, and its log needs the session's row.
+        // An engagement that ended keeps nothing on its own.
+        || session
+            .meta
+            .autopilot
+            .as_ref()
+            .is_some_and(|stored| stored.engaged)
 }
 
 impl App {
@@ -667,6 +674,7 @@ impl App {
         self.last_exit = None;
         self.restoring = Arc::new(AtomicBool::new(false));
         self.plan_form.reset();
+        self.autopilot_plan_escalation = None;
     }
 
     pub(crate) fn restore_display(&mut self) {
@@ -686,7 +694,7 @@ impl App {
             }
         };
         let decisions = self.stored_engine_decisions();
-        let mut inserts = self.autopilot_decision_rows();
+        let mut inserts = self.autopilot_log_rows();
         inserts.extend(decision_inserts(
             &active_history,
             decisions.iter().filter(|row| row.agent.is_none()),

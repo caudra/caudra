@@ -1629,6 +1629,7 @@ mod tests {
     use caudra_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use caudra_storage::StateDir;
     use caudra_storage::sessions::Session;
+    use caudra_storage::usage_ledger::LedgerPurpose;
     use caudra_workspace::PlanRef;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -1980,14 +1981,9 @@ mod tests {
         let session_id = SessionRef::from(CaudraId::generate());
         static LEASE_DIR: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
         let lease_dir = LEASE_DIR.get_or_init(|| TempDir::new().unwrap());
-        let session_lease = Arc::new(
-            SessionLease::acquire(
-                &StateDir::from_path(lease_dir.path().to_path_buf()),
-                session_id.id(),
-            )
-            .unwrap(),
-        );
-        let handle = InteractiveHandle::for_test(session_lease, permissions, answer_tx);
+        let state_dir = StateDir::from_path(lease_dir.path().to_path_buf());
+        let session_lease = Arc::new(SessionLease::acquire(&state_dir, session_id.id()).unwrap());
+        let handle = InteractiveHandle::for_test(state_dir, session_lease, permissions, answer_tx);
         let server = Server {
             out_tx,
             model_specs: Vec::new(),
@@ -2577,6 +2573,7 @@ mod tests {
         };
         session.add_model_usage(
             RETIRED_MODEL_ID,
+            LedgerPurpose::Chat,
             StoredTokenUsage {
                 input: 1_000_000,
                 output: 200_000,
