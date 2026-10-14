@@ -35,8 +35,8 @@ Each clip is a short excerpt of a real session, played at its original speed. Cl
 Open a running subagent's chat and type. It reads your guidance at its next turn while the main agent keeps working.<br>
 <sub>Model: <code>openai/gpt-6.1-sol</code> · <a href="https://caudra.ai/docs/queue/">Queue and steering</a> · <a href="https://caudra.ai/gallery/#steer">Full session</a></sub></p>
 <a href="https://caudra.ai/gallery/#steer"><picture>
-  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/steer-still.webp?v=1">
-  <img src="https://caudra.ai/readme/steer.webp?v=1" alt="Excerpt of Guide a running subagent. The main agent delegates a regression test to a background task. Then the subagent's chat opens, and you type guidance into it while it reads the source files." width="100%">
+  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/steer-still.webp?v=2">
+  <img src="https://caudra.ai/readme/steer.webp?v=2" alt="Excerpt of Guide a running subagent. In the chat of a background task, you ask the subagent to call the new test an empty listing has no next cursor while it reads the source files and patches src/pagination.test.ts. The guidance waits in the task queue under Guide." width="100%">
 </picture></a>
 </td></tr>
 <tr><td>
@@ -44,8 +44,8 @@ Open a running subagent's chat and type. It reads your guidance at its next turn
 Command-aware filters shrink shell output before the model reads it, with rules that mostly come from <a href="https://www.rtk-ai.app/docs/">RTK</a>. One click shows the raw output.<br>
 <sub>Model: <code>openai/gpt-6.1-sol</code> · <a href="https://caudra.ai/docs/tools/#shell">Shell</a> · <a href="https://caudra.ai/gallery/#filter">Full session</a></sub></p>
 <a href="https://caudra.ai/gallery/#filter"><picture>
-  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/filter-still.webp?v=1">
-  <img src="https://caudra.ai/readme/filter.webp?v=1" alt="Excerpt of Filter shell output. make check fails, and its card shows the filtered output with the note filtered, make, progress, 36% smaller, click for raw. The reply then lists the failing tests." width="100%">
+  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/filter-still.webp?v=2">
+  <img src="https://caudra.ai/readme/filter.webp?v=2" alt="Excerpt of Filter shell output. make check exits with code 2, and its card shows the filtered output, 4 pass and 3 fail, with the note filtered, make, progress, 36% smaller, click for raw. The reply then lists the failing tests." width="100%">
 </picture></a>
 </td></tr>
 <tr><td>
@@ -53,8 +53,8 @@ Command-aware filters shrink shell output before the model reads it, with rules 
 Revert files first counts what it would create, replace, or delete. Choosing it again applies the revert, and Unrevert puts the files back.<br>
 <sub>Model: <code>openai/gpt-6.1-sol</code> · <a href="https://caudra.ai/docs/sessions/#file-revert">File revert</a> · <a href="https://caudra.ai/gallery/#revert">Full session</a></sub></p>
 <a href="https://caudra.ai/gallery/#revert"><picture>
-  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/revert-still.webp?v=1">
-  <img src="https://caudra.ai/readme/revert.webp?v=1" alt="Excerpt of Revert files from a message. The message menu opens beside the first reply, and Revert files reports 0 created, 2 replaced, 0 deleted, repeat to confirm." width="100%">
+  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/revert-still.webp?v=2">
+  <img src="https://caudra.ai/readme/revert.webp?v=2" alt="Excerpt of Revert files from a message. The message menu opens beside the first tool batch of the reply, and Revert files reports 0 created, 2 replaced, 0 deleted. Repeat to confirm. Then the menu opens again." width="100%">
 </picture></a>
 </td></tr>
 <tr><td>
@@ -62,8 +62,8 @@ Revert files first counts what it would create, replace, or delete. Choosing it 
 <code>Ctrl+X w</code> opens source control, an editor, and project search while the session keeps running.<br>
 <sub>Model: <code>openai/gpt-6.1-sol</code> · <a href="https://caudra.ai/docs/workbench/">Workbench</a> · <a href="https://caudra.ai/gallery/#workbench">Full session</a></sub></p>
 <a href="https://caudra.ai/gallery/#workbench"><picture>
-  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/workbench-still.webp?v=1">
-  <img src="https://caudra.ai/readme/workbench.webp?v=1" alt="Excerpt of The workbench beside a session. After the reply, the workbench opens with the changed files in source control on the left and the diff of src/pagination.ts on the right." width="100%">
+  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/workbench-still.webp?v=2">
+  <img src="https://caudra.ai/readme/workbench.webp?v=2" alt="Excerpt of The workbench beside a session. While the session runs make check again, the workbench opens with the two changed files in source control on the left. Then the diff of src/pagination.ts opens on the right, with the change at line 29." width="100%">
 </picture></a>
 </td></tr>
 <tr><td>
@@ -71,8 +71,8 @@ Revert files first counts what it would create, replace, or delete. Choosing it 
 <code>/goal</code> keeps the session working until a separate evaluator finds your condition met.<br>
 <sub>Model: <code>openai/gpt-6.1-sol</code> · <a href="https://caudra.ai/docs/commands/#completion-goals">Completion goals</a> · <a href="https://caudra.ai/gallery/#goal">Full session</a></sub></p>
 <a href="https://caudra.ai/gallery/#goal"><picture>
-  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/goal-still.webp?v=1">
-  <img src="https://caudra.ai/readme/goal.webp?v=1" alt="Excerpt of Work toward a goal. The footer shows the active goal, and the transcript ends with Goal achieved: make check exited 0 with all 7 tests passing." width="100%">
+  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/goal-still.webp?v=2">
+  <img src="https://caudra.ai/readme/goal.webp?v=2" alt="Excerpt of Work toward a goal. The agent reports that make check exited 0 with 7 tests passed. The footer shows the active goal and then Evaluating goal, and the transcript ends with Goal achieved: make check exited 0 with all 7 tests passing." width="100%">
 </picture></a>
 </td></tr>
 <tr><td>
@@ -80,8 +80,8 @@ Revert files first counts what it would create, replace, or delete. Choosing it 
 Qwen3.8-27B on <a href="https://github.com/tensorninja/ninfer-4090">ninfer-4090</a> uses the same tools and permission rules as a hosted model.<br>
 <sub>Model: <code>ninfer-4090/qwen3.8-27b</code> · <a href="https://caudra.ai/docs/providers/#providers-toml">Custom providers</a> · <a href="https://caudra.ai/gallery/#local">Full session</a></sub></p>
 <a href="https://caudra.ai/gallery/#local"><picture>
-  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/local-still.webp?v=1">
-  <img src="https://caudra.ai/readme/local.webp?v=1" alt="Excerpt of A local model fixes the bug. Qwen3.8-27B on ninfer-4090 reads the source files, edits them, and runs make check, which passes with 8 tests and 0 failures." width="100%">
+  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/local-still.webp?v=2">
+  <img src="https://caudra.ai/readme/local.webp?v=2" alt="Excerpt of A local model fixes the bug. The prompt goes to Qwen3.8-27B on ninfer-4090, and a bar above the input shows the prefill rate, between 1.9k and 3.6k tok/s. Then the model reads src/pagination.ts and src/pagination.test.ts." width="100%">
 </picture></a>
 </td></tr>
 </table>
@@ -174,7 +174,7 @@ Every session keeps its full history, subagent transcripts included, in compact 
 - **Memory that outlasts the session.** The agent keeps notes on project gotchas and decisions outside your repository. Older notes fold into one-line summaries, so the view in each request stays within 32 KiB. The model opens a summary or searches the notes when it needs more, and `/memory` shows what it reads.
 - **Fork and branch out.** Fork from a message to try another approach. `/worktree new` moves a session into a fresh Git worktree with its conversation and plan.
 
-File revert cannot undo external side effects such as running processes, databases, network calls, or Git branch state. Worktrees and agent status integrate with [Herdr](https://herdr.dev) and [Orca](https://github.com/stablyai/orca).
+File revert cannot undo external side effects such as running processes, databases, network calls, or Git branch state.
 
 [Sessions and revert](https://caudra.ai/docs/sessions/) · Watch: [Revert files from a message](https://caudra.ai/gallery/#revert)
 
@@ -202,11 +202,26 @@ Passage review was inspired by [Plannotator](https://plannotator.ai/).
 - **Goals that check evidence.** After each work turn, a separate model call with no tools reads the transcript. An unmet goal starts another turn. A met goal clears itself.
 - **Background work wakes the agent.** Tasks and shell jobs can keep running in the background. Their reports start the next step at a safe boundary, with no polling.
 - **Permissions that read the command.** Shell chains and pipelines split into separate commands for approval. Approve once, for the conversation, the project, or every project, and accept patterns Caudra suggests from repeated approvals.
-- **Plan first, then hear back.** Caudra opens in Plan mode, where the agent edits only its plan and asks before commands it cannot prove read-only. Notifications tell you when a turn finishes or a prompt needs your answer.
+- **Plan first, then hear back.** By default, new sessions open in Plan mode, where the agent edits only its plan and asks before commands it cannot prove read-only. Notifications tell you when a turn finishes or a prompt needs your answer.
 
 Unattended work needs a running session, for example in tmux or [Herdr](https://herdr.dev). Closing it cancels background work. Experimental [autopilot](https://caudra.ai/docs/autopilot/) can answer permission prompts, questions, and ready plans while you are away, within budgets you set. A goal allows 16 automatic continuations by default, and work pauses when it needs your answer. `/goal` looks for evidence in the transcript. It does not prove the work is correct.
 
 [Completion goals](https://caudra.ai/docs/commands/#completion-goals) · Watch: [Work toward a goal](https://caudra.ai/gallery/#goal)
+
+## Give every session its own tab.
+
+*When you run several sessions*
+
+Run Caudra inside [Herdr](https://herdr.dev) or [Orca](https://github.com/stablyai/orca), and the host knows what each session is doing. Caudra reports its state, names the tab after the session, and opens forks and worktrees in tabs of their own.
+
+- **Status where you look.** The Herdr sidebar shows the state of each session with its title, model, and context usage. Orca shows the state on the tab. Both raise their own notice when a turn ends or a prompt waits, and name the prompt, such as `Permission requested: shell`.
+- **Tabs named after the session.** Caudra renames a Herdr tab to the session title while the tab still shows its number, and a tab you named keeps its name. Orca shows the session title on the terminal tab.
+- **Forks open in a new tab.** **Fork here**, in the message menu, starts the new session in a new Herdr or Orca tab with a Caudra of its own. The session you forked from stays open where it was.
+- **Worktrees in the host.** `/worktree new` asks Herdr or Orca to create the worktree, and the session continues there. After a Herdr restart, the focused session comes back in its pane.
+
+Caudra detects each host from the variables the host sets in the terminal. Inside either one, the `herdr` or `orca` skill gives the agent the instructions of the installed release, and its commands still pass through your permission rules. Integrates with [Herdr](https://herdr.dev) and [Orca](https://github.com/stablyai/orca).
+
+[Herdr and Orca integration](https://caudra.ai/docs/worktrees/#herdr-integration) · Watch: [Caudra inside Herdr](https://caudra.ai/gallery/#herdr)
 
 ## Keep any model on task.
 
@@ -283,12 +298,12 @@ Caudra reads the instruction files and skills you already have and connects to y
 
 - **[Instruction files](https://caudra.ai/docs/context/#instruction-files).** At session start, Caudra loads `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `GEMINI.md`, or one of six other instruction file names.
 - **[Skills](https://caudra.ai/docs/skills/#where-skills-live).** Caudra reads skills from `.claude/skills` and `.agents/skills` folders.
-- **[MCP servers](https://caudra.ai/docs/mcp/#configuration).** Add stdio or HTTP MCP servers in `mcp.toml`, with OAuth sign-in.
+- **[MCP servers](https://caudra.ai/docs/mcp/#configuration).** Add stdio or HTTP MCP servers in `mcp.toml`, with OAuth sign-in. Caudra speaks the current MCP protocol and the older one, so servers built on either work.
 - **[Scripts](https://caudra.ai/docs/headless/#claude-code-compatibility).** `--print` writes the same JSON fields as Claude Code, so scripts that parse its output keep working.
 
 ### A model for each job
 
-Eleven jobs decide which model serves each kind of work. Pin a job to a model in `/model`, or let it follow Chat, Plan, Fast, or Best. A local endpoint can name its own Fast and Best models in `providers.toml`.
+Eleven jobs decide which model serves each kind of work. Pin a job to a model in `/model`, or let it follow Chat, Plan, Fast, or Best. A local endpoint can name its own Fast and Best models in `providers.toml`. For a single task, name the model in your prompt, as in “ask opus and sol to review this change”, and each gets a task of its own.
 
 | Job | What it serves |
 | --- | --- |
@@ -307,14 +322,14 @@ Eleven jobs decide which model serves each kind of work. Pin a job to a model in
 See [Model jobs](https://caudra.ai/docs/providers/#model-jobs).
 
 <!-- BEGIN caudra.ai capabilities: generated by `bun run readme:snippet` in caudra/website. Edit there. -->
-## 68 capabilities, designed together.
+## 73 capabilities, designed together.
 
 *Everything in the box*
 
 Each one links to its documentation. Experimental items are marked and stay off until you switch them on.
 
 <details>
-<summary><b>Agents</b> (11)</summary>
+<summary><b>Agents</b> (13)</summary>
 
 - [Steerable subagents](https://caudra.ai/docs/commands/#tasks)
 - [Background tasks and shell jobs](https://caudra.ai/docs/sessions/#background-tasks)
@@ -323,6 +338,8 @@ Each one links to its documentation. Experimental items are marked and stay off 
 - [Autopilot toward a goal](https://caudra.ai/docs/autopilot/) (experimental)
 - [Side questions with `/btw`](https://caudra.ai/docs/commands/#modes-and-toggles)
 - [A model for each job](https://caudra.ai/docs/providers/#model-jobs)
+- [Tasks on the model you name](https://caudra.ai/docs/commands/#models-and-reasoning)
+- [Favorite models in `/model`](https://caudra.ai/docs/providers/#model-jobs)
 - [Automatic steering, tuned per model](https://caudra.ai/docs/configuration/#agent-steering)
 - [Requirements tracking with `/extract`](https://caudra.ai/docs/commands/#requirements)
 - [Resume a stopped turn with `/continue`](https://caudra.ai/docs/commands/#resuming-after-an-interruption)
@@ -361,11 +378,13 @@ Each one links to its documentation. Experimental items are marked and stay off 
 
 </details>
 <details>
-<summary><b>Sessions</b> (8)</summary>
+<summary><b>Sessions</b> (10)</summary>
 
 - [Revert conversation, files, or both](https://caudra.ai/docs/sessions/#message-actions)
 - [File changes recorded per call](https://caudra.ai/docs/sessions/#recording)
 - [Forks from any message](https://caudra.ai/docs/sessions/#fork-boundaries)
+- [Forks in a new Herdr or Orca tab](https://caudra.ai/docs/sessions/#forks-in-herdr-and-orca)
+- [Tabs named after the session](https://caudra.ai/docs/sessions/#tab-names)
 - [Git worktrees](https://caudra.ai/docs/worktrees/)
 - [Retention policies and `/storage`](https://caudra.ai/docs/sessions/#retention)
 - [Move sessions between directories](https://caudra.ai/docs/sessions/#moving-sessions-to-another-directory)
@@ -399,11 +418,12 @@ Each one links to its documentation. Experimental items are marked and stay off 
 
 </details>
 <details>
-<summary><b>Integrations</b> (13)</summary>
+<summary><b>Integrations</b> (14)</summary>
 
 - [MCP servers with tool search](https://caudra.ai/docs/mcp/#tool-search)
 - [MCP OAuth with client ID metadata documents](https://caudra.ai/docs/mcp/#oauth)
 - [MCP results drawn by type, with token estimates](https://caudra.ai/docs/mcp/#results-in-the-transcript)
+- [MCP server questions and `@` resources](https://caudra.ai/docs/mcp/#server-questions)
 - [ACP for Zed](https://caudra.ai/docs/acp/)
 - [Headless runs for scripts and CI](https://caudra.ai/docs/headless/)
 - [Claude Code compatible output](https://caudra.ai/docs/headless/#claude-code-compatibility)
@@ -432,7 +452,7 @@ workflows = true
 - **[Managed sandboxes](https://caudra.ai/docs/sandboxes/)** (`sandboxes`). Move execution into a VM. Managed sandboxes run workspace tools in a separate VM. Model connections, provider credentials, and the conversation stay on your machine, so a compromised VM cannot read credentials it never received. Network policy allows listed domains and IP ranges, with TLS hostname checks or an inspecting proxy. File transfers between your machine and the VM go through a review. They require e2b-libvirt infrastructure that you or your operator run. Transferred files can still carry secrets. The separation reduces exposure and is no guarantee against compromise.
 - **[Autopilot](https://caudra.ai/docs/autopilot/)** (`autopilot`). `/autopilot <goal>` hands permission prompts, questions, ready plans, and stalls to a separate delegate model until the goal is met, a budget runs out, or you stop it. The delegate approves a prompt once and adds no rule. It never approves prompts that plan mode raises, tools that always ask, or protected files and commands. It also runs headless with `caudra -p --autopilot`.
 - **[Durable workflows](https://caudra.ai/docs/workflows/)** (`workflows`). Scripts launch subagents in phases, keep a journal, and can pause and resume. Each agent call can name a model job, such as Fast for a wide pass and Best for the answer you read. Built-in workflows cover deep research, change review, and root-cause analysis. They are heavily inspired by [Grok Build workflows](https://x.ai/news/workflows) and mostly compatible with them.
-- **[JEV decision engine](https://caudra.ai/docs/configuration/#decisions)** (`decision_engine`). Typed decisions from an endpoint you configure: permission advice, Auto mode screening, shell effect and duration predictions, sampled web and MCP content screening, tool search ranking, skill suggestions, goal prescreening, and subagent routing to the Fast or Best model. Predictions add to deterministic permission rules and can miss risks.
+- **[JEV decision engine](https://caudra.ai/docs/configuration/#decisions)** (`decision_engine`). Typed decisions from an endpoint you configure: permission advice, Auto mode screening, shell effect and duration predictions, sampled web and MCP content screening, tool search ranking, skill suggestions, goal prescreening, and subagent routing to the Fast or Best model. As a reranker, it can put the most relevant memory notes, code context rows, and omitted tool output first, and the transcript shows what each feature changed. Predictions add to deterministic permission rules and can miss risks.
 - **[Cross-session messaging](https://caudra.ai/docs/messaging/)** (`cross_session_messaging`). Live sessions on one machine exchange messages, publish to topics, and share work through consumer groups.
 - **[Lua extensions](https://caudra.ai/docs/plugins/)** (`lua_plugins`). Add your own commands, tools, and interface behavior in Lua when the built-in workflow needs something specific.
 - **[Remote Workcell](https://caudra.ai/docs/remote-workspaces/)** (`remote_workcell`). Run workspace tools on a Workcell server while the conversation stays on your machine.
