@@ -96,10 +96,9 @@ Ollama reads `OLLAMA_HOST` and llama.cpp reads `LLAMA_CPP_HOST`. Neither reads `
 | Fast | **claude-haiku-5-5** (default) | $0.10 / $0.50 | 372K ctx / 128K out |
 | Small | claude-haiku-4-5 | $1.00 / $5.00 | 200K ctx / 64K out |
 |  | claude-sonnet-4-5 | $3.00 / $15.00 | 200K ctx / 64K out |
-|  | claude-sonnet-4-6 | $3.00 / $15.00 | 372K ctx / 64K out |
+|  | claude-sonnet-4-6 | $3.00 / $15.00 | 372K ctx / 128K out |
 |  | claude-sonnet-5-5 | $2.00 / $10.00 | 372K ctx / 128K out |
 |  | claude-sonnet-5 | $2.00 / $10.00 | 372K ctx / 128K out |
-|  | claude-sonnet-4 | $3.00 / $15.00 | 200K ctx / 64K out |
 |  | claude-opus-4-5 | $5.00 / $25.00 | 200K ctx / 64K out |
 |  | claude-opus-4-6 | $5.00 / $25.00 | 372K ctx / 128K out |
 |  | claude-opus-4-7 | $5.00 / $25.00 | 372K ctx / 128K out |
@@ -108,7 +107,6 @@ Ollama reads `OLLAMA_HOST` and llama.cpp reads `LLAMA_CPP_HOST`. Neither reads `
 |  | claude-opus-5 | $5.00 / $25.00 | 372K ctx / 128K out |
 |  | claude-fable-5-1 | $10.00 / $50.00 | 372K ctx / 128K out |
 |  | claude-fable-5 | $10.00 / $50.00 | 372K ctx / 128K out |
-|  | claude-opus-4-0, claude-opus-4-1 | $15.00 / $75.00 | 200K ctx / 32K out |
 
 Routing defaults: claude-haiku-5-5 (Fast), claude-opus-5-5 (Best)
 

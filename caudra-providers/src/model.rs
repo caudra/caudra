@@ -1,5 +1,5 @@
 //! Model registry with prefix-based lookup and token accounting.
-//! Lookup is prefix-based: `claude-sonnet-4-20250514` matches the `claude-sonnet-4` entry,
+//! Lookup is prefix-based: `claude-sonnet-4-5-20250929` matches the `claude-sonnet-4-5` entry,
 //! so dated snapshots resolve without registry churn. `context_tokens()` sums input + output
 //! + cache reads/writes because the context window limit applies to all of them combined.
 
