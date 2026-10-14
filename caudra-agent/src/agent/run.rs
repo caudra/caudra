@@ -25,6 +25,7 @@ use caudra_providers::{
 
 use super::commit_preamble;
 use super::compaction;
+use super::favorites;
 use super::goal::{
     Evaluator, GOAL_EVALUATOR_ROLE, GoalApply, GoalHandle, GoalSnapshot, GoalStatus, GoalVerdict,
     ResolvedEvaluator, continuation_message, is_unrecoverable, resolve_evaluator,
@@ -75,7 +76,9 @@ use crate::tools::ToolFilter;
 use crate::tools::native::peers::WORK_NAME;
 use crate::tools::native::plan::{self, PlanTarget};
 use crate::tools::native::skill::{self, SkillInventoryEntry};
-use crate::tools::{BATCH_TOOL_NAME, MEMORY_TOOL_NAME, QUESTION_TOOL_NAME, SKILL_TOOL_NAME};
+use crate::tools::{
+    BATCH_TOOL_NAME, MEMORY_TOOL_NAME, QUESTION_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME,
+};
 use crate::tools::{BuiltinDeferral, DeferralSession, DeferredTool};
 use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolContext};
 use crate::types::{AutopilotEvent, TodoItem};
@@ -1159,6 +1162,13 @@ impl<'h> Agent<'h> {
         self.mode = latest.mode.clone();
         self.plan = latest.plan.clone();
         let tool_context = self.tool_context();
+        let favorites = if self.chooses_task_models(&tool_context) {
+            let policy = Arc::clone(&self.model_policy);
+            smol::unblock(move || favorites::list(&policy)).await
+        } else {
+            None
+        };
+        standing.extend(favorites::notice(self.history.as_slice(), favorites));
         standing.extend(mode_switch_notice_with_tools(
             self.history.as_slice(),
             &latest.mode,
@@ -1559,6 +1569,14 @@ impl<'h> Agent<'h> {
     /// The conversation with a person, as opposed to a task's own run.
     fn is_main_session(&self) -> bool {
         self.audience.contains(ToolAudience::MAIN) && self.root_tool_use_id.is_none()
+    }
+
+    /// Whether this agent can pick a task's model, which is what makes the
+    /// user's favorites worth telling it about.
+    fn chooses_task_models(&self, tool_context: &ToolContext) -> bool {
+        self.is_main_session()
+            && self.config.task_model_choice
+            && tool_context.tool_available(TASK_TOOL_NAME)
     }
 
     fn main_autopilot(&self) -> Option<&AutopilotHandle> {
@@ -4468,6 +4486,7 @@ mod tests {
     use crate::tools::native::tests::tempdir;
     use crate::tools::native::todo_write::TodoWrite;
     use crate::tools::registry::ToolSource;
+    use crate::tools::test_support::NamedMock;
     use crate::tools::{TODOWRITE_TOOL_NAME, ToolEffect, audited_local_tool, local_tool};
     use crate::types::{TodoPriority, TodoStatus};
     use crate::{Envelope, QueueItemId};
@@ -5533,6 +5552,8 @@ mod tests {
         "<system-reminder>\n# Instructions changed\n\n+ be brief\n</system-reminder>";
     const MEMORY_UPDATED: &str =
         "<system-reminder>\n# Memory updated\n\n- 7+1 note cache.md: Cache\n</system-reminder>";
+    const FAVORITE_SPEC: &str = "anthropic/claude-opus-5-5";
+    const FAVORITES_LISTED: &str = "<system-reminder>\n# Model favorites\n\n- `anthropic/claude-opus-5-5`: lane Best\n</system-reminder>";
     const MENTION_BODY: &str = "<file path=\"a.rs\">fn main() {}</file>";
     /// Standing, not per turn: the block stays in the transcript and the
     /// contract says the most recent one is the one in force.
@@ -7943,7 +7964,9 @@ mod tests {
     #[test_case(vec![turn(), environment_announcement(ENVIRONMENT), plan_announcement(), reply(), turn(), environment_announcement(ENVIRONMENT), plan_announcement(), reply()], 4, &[] ; "blocks_the_tail_states_stay_put")]
     #[test_case(vec![turn(), plan_announcement(), reply(), turn(), build_announcement(), reply()], 3, &[] ; "a_later_mode_in_the_tail_supersedes")]
     #[test_case(vec![turn(), environment_announcement(ENVIRONMENT), reply(), turn(), environment_announcement(ENVIRONMENT_NEXT_DAY), reply(), turn(), reply()], 6, &[4] ; "only_the_last_block_of_a_kind")]
-    #[test_case(vec![turn(), plan_announcement(), Message::observation(crate::prompt::TASK_PLAN_CONTRACT.into()), Message::observation(INSTRUCTIONS_CHANGED.into()), environment_announcement(ENVIRONMENT), Message::observation(MEMORY_UPDATED.into()), reply()], 7, &[4, 3, 5, 2, 1] ; "everything_summarized_in_announcement_order")]
+    #[test_case(vec![turn(), plan_announcement(), Message::observation(FAVORITES_LISTED.into()), Message::observation(crate::prompt::TASK_PLAN_CONTRACT.into()), Message::observation(INSTRUCTIONS_CHANGED.into()), environment_announcement(ENVIRONMENT), Message::observation(MEMORY_UPDATED.into()), reply()], 8, &[5, 4, 6, 3, 2, 1] ; "everything_summarized_in_announcement_order")]
+    #[test_case(vec![turn(), Message::observation(FAVORITES_LISTED.into()), reply(), turn(), reply()], 3, &[1] ; "a_favorites_list_is_restated")]
+    #[test_case(vec![turn(), Message::observation(FAVORITES_LISTED.into()), reply(), turn(), Message::observation(crate::prompt::MODEL_FAVORITES_WITHDRAWN_PROMPT.into()), reply()], 3, &[] ; "a_withdrawal_in_the_tail_supersedes")]
     #[test_case(vec![turn(), Message::observation(MEMORY_UPDATED.into()), reply(), turn(), reply()], 3, &[1] ; "a_memory_update_is_restated")]
     #[test_case(vec![turn(), Message::observation(crate::prompt::AUTOPILOT_ENGAGED_PROMPT.into()), reply(), turn(), reply()], 3, &[1] ; "an_autopilot_notice_is_restated")]
     #[test_case(vec![turn(), Message::observation(crate::prompt::AUTOPILOT_ENGAGED_PROMPT.into()), reply(), turn(), Message::observation(crate::prompt::AUTOPILOT_ENDED_PROMPT.into()), reply()], 3, &[] ; "an_ended_autopilot_in_the_tail_supersedes")]
@@ -8008,6 +8031,53 @@ mod tests {
             let left = announced(crate::prompt::BUILD_MODE_MARKER).expect(EXPECTED_BUILD_NOTICE);
             assert!(restated < left, "{PLAN_RESTATED}");
         });
+    }
+
+    /// Two turns, so a list the first one stated has to stay unrepeated in
+    /// the second, and a closed gate has two chances to leak one.
+    #[test_case(true, true => 1 ; "announced_once_while_tasks_choose_models")]
+    #[test_case(false, true => 0 ; "silent_when_task_model_choice_is_off")]
+    #[test_case(true, false => 0 ; "silent_without_the_task_tool")]
+    fn favorites_reach_the_main_agent_while_it_chooses_task_models(
+        task_model_choice: bool,
+        task_tool: bool,
+    ) -> usize {
+        smol::block_on(async {
+            let temp = tempdir();
+            let dir = StateDir::from_path(temp.path().to_path_buf());
+            model_registry::toggle_favorite_and_persist(FAVORITE_SPEC, &dir).unwrap();
+            let mut history = History::new(Vec::new());
+            let (mut agent, events) = make_agent_configured(
+                MockProvider::new(vec![
+                    text_response(StopReason::EndTurn),
+                    text_response(StopReason::EndTurn),
+                ]),
+                &mut history,
+                |params| params.config.task_model_choice = task_model_choice,
+            );
+            agent.config.generate_titles = false;
+            if task_tool {
+                agent
+                    .registry
+                    .register(
+                        Arc::new(NamedMock::new(TASK_TOOL_NAME, ToolAudience::MAIN)),
+                        NamedMock::source(),
+                    )
+                    .unwrap();
+            }
+
+            agent.run(default_input()).await.unwrap();
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            drain_events(&events)
+                .into_iter()
+                .filter(|envelope| {
+                    matches!(&envelope.event, AgentEvent::Injected { text, .. }
+                        if text.contains(crate::prompt::MODEL_FAVORITES_MARKER) && text.contains(FAVORITE_SPEC))
+                })
+                .count()
+        })
     }
 
     fn environment_announcement(environment: &str) -> Message {

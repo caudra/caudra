@@ -207,6 +207,15 @@ pub const CONFIGURATION_CHANGED_PROMPT: &str = include_str!("prompts/configurati
 /// again. Shares the heading, and so the kind, with the notice it supersedes.
 pub const CONFIGURATION_RESTORED_PROMPT: &str = include_str!("prompts/configuration_restored.md");
 pub const CONFIGURATION_CHANGED_MARKER: &str = "# Configuration changed";
+/// The models the user starred, for the main agent to read a task's model
+/// name against, since the name resolves to a matching favorite first.
+pub const MODEL_FAVORITES_PROMPT: &str = include_str!("prompts/model_favorites.md");
+/// Withdraws the list once no favorite applies or tasks can no longer choose a
+/// model. Shares the heading, and so the kind, with the list it supersedes.
+pub const MODEL_FAVORITES_WITHDRAWN_PROMPT: &str =
+    include_str!("prompts/model_favorites_withdrawn.md");
+pub const MODEL_FAVORITES_MARKER: &str = "# Model favorites";
+pub const FAVORITES_SLOT: &str = "{favorites}";
 pub const AUTOPILOT_PROMPT: &str = include_str!("prompts/autopilot.md");
 /// Standing while autopilot is engaged, and withdrawn by the ended text, which
 /// shares its heading and so its kind.
@@ -260,6 +269,7 @@ pub(crate) const STANDING_KINDS: &[&[&str]] = &[
     &[CONFIGURATION_CHANGED_MARKER],
     &[AUTOPILOT_MARKER],
     &[TASK_MODE_MARKER],
+    &[MODEL_FAVORITES_MARKER],
     MODE_MARKERS,
 ];
 

@@ -3241,6 +3241,8 @@ fn the_model_chord_opens_the_model_picker() {
 
 const FIRST_FAVORITE: &str = "zai/glm-5";
 const SECOND_FAVORITE: &str = "anthropic/claude-opus-4-6-20260101";
+const FAVORITE_REACHES_AGENT: &str =
+    "a toggled favorite must reach the list the agent reads on its next turn";
 
 fn app_with_favorites(favorites: &[&str]) -> App {
     let mut app = test_app();
@@ -3262,10 +3264,19 @@ fn a_toggled_favorite_is_saved_and_reaches_the_picker() {
         caudra_storage::model::read_favorites(&dir),
         [FIRST_FAVORITE]
     );
+    assert_eq!(
+        model_registry::favorites(),
+        [FIRST_FAVORITE],
+        "{FAVORITE_REACHES_AGENT}"
+    );
 
     app.handle_model_picker_action(ModelPickerAction::ToggleFavorite(FIRST_FAVORITE.into()));
     assert!(app.model_picker.favorites().is_empty());
     assert!(caudra_storage::model::read_favorites(&dir).is_empty());
+    assert!(
+        model_registry::favorites().is_empty(),
+        "{FAVORITE_REACHES_AGENT}"
+    );
 }
 
 #[test]

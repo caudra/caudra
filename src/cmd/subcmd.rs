@@ -777,14 +777,6 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-fn model_marker_label(marker: ModelMarker) -> &'static str {
-    match marker {
-        ModelMarker::Small => "Small",
-        ModelMarker::Fast => "Fast",
-        ModelMarker::Best => "Best",
-    }
-}
-
 /// Specs stay first, and a batch with no supply markers stays unpadded, so
 /// piping `caudra models` into another command keeps working unchanged.
 ///
@@ -809,10 +801,7 @@ fn model_lines(specs: &[String]) -> Vec<String> {
         .zip(markers)
         .map(|(spec, marker)| match (marker, width) {
             (Some(marker), Some(width)) => {
-                format!(
-                    "{spec:<width$}{MODEL_COLUMN_GAP}{}",
-                    model_marker_label(marker)
-                )
+                format!("{spec:<width$}{MODEL_COLUMN_GAP}{}", marker.label())
             }
             _ => spec.clone(),
         })
@@ -1948,10 +1937,7 @@ mod auth_tests {
         let lines = model_lines(&[spec.into()]);
         assert_eq!(
             lines,
-            vec![format!(
-                "{spec}{MODEL_COLUMN_GAP}{}",
-                model_marker_label(marker)
-            )]
+            vec![format!("{spec}{MODEL_COLUMN_GAP}{}", marker.label())]
         );
     }
 
@@ -1960,10 +1946,7 @@ mod auth_tests {
     #[test]
     fn an_aggregated_model_borrows_the_upstream_marker() {
         let lines = model_lines(&[AGGREGATED_SPEC.into()]);
-        assert!(
-            lines[0].ends_with(model_marker_label(ModelMarker::Fast)),
-            "{lines:?}"
-        );
+        assert!(lines[0].ends_with(ModelMarker::Fast.label()), "{lines:?}");
     }
 
     /// A batch with no markers must pipe exactly as it did before the column

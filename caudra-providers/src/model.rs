@@ -259,6 +259,17 @@ pub enum ModelMarker {
     Best,
 }
 
+impl ModelMarker {
+    /// The name `caudra models`, the providers page, and the agent all show.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Small => "Small",
+            Self::Fast => "Fast",
+            Self::Best => "Best",
+        }
+    }
+}
+
 impl ModelFacts {
     pub const fn class(&self) -> ModelPurpose {
         if self.small {

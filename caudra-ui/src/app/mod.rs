@@ -1630,7 +1630,7 @@ impl App {
     }
 
     fn toggle_favorite_model(&mut self, spec: &str) {
-        match caudra_storage::model::toggle_favorite(&self.storage, spec) {
+        match model_registry::toggle_favorite_and_persist(spec, &self.storage) {
             Ok(favorites) => {
                 let favorites = self.allowed_models(favorites);
                 self.model_picker.set_favorites(favorites);

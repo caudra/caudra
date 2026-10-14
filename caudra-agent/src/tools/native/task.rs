@@ -98,7 +98,7 @@ static PROFILE_PARAM: ParamSchema = ParamSchema::Primitive {
 };
 static MODEL_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::String,
-    description: "Model for a new task: `provider/model`, or a short name such as `opus`, `sonnet 5.5`, or `gpt-6.1-sol`, resolved to the newest matching model this session can use. Omit it to use the session's subagent model. Omitted continuations keep the stored model.",
+    description: "Model for a new task: `provider/model`, or a short name such as `opus`, `sonnet 5.5`, or `gpt-6.1-sol`, resolved to the user's favorite model that matches it, else the newest matching model this session can use. Omit it to use the session's subagent model. Omitted continuations keep the stored model.",
 };
 static THINKING_PARAM: ParamSchema = ParamSchema::Enum {
     variants: THINKING_LEVELS,

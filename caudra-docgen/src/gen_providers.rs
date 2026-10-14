@@ -19,7 +19,7 @@ Caudra routes work through eleven jobs: **Chat**, **Plan**, **Subagent**, **Comp
 
 `/model` opens a Jobs overview and the model list. Selecting a model on this page changes Chat. Selecting the Chat row jumps to its current model. Select another job to open its assignment page, press `Esc` to return to the overview, and use uppercase `R` to clear the open job's binding. `/goal-model` opens Goal directly. Jobs are opened from the overview rather than cycled with `Tab`.
 
-Press `Ctrl+F` on a model to mark it as a favorite, and again to unmark it. The list shows your favorites first, newest first, then the last 10 models you switched to under Recent. With favorites, `/model` opens on the current model's favorite row, or on the first favorite, instead of on the Chat job. Each model also stays in its provider's section, where a `★` marks a favorite and a `↺` a recent model. `/favorite-next` or `Ctrl+X c` switches Chat to the favorite after the current model, and to the first favorite when the current model is not one. Favorites are saved globally, like bindings, and a favorite that `allowed_models` or `excluded_models` rules out is not shown.
+Press `Ctrl+F` on a model to mark it as a favorite, and again to unmark it. The list shows your favorites first, newest first, then the last 10 models you switched to under Recent. With favorites, `/model` opens on the current model's favorite row, or on the first favorite, instead of on the Chat job. Each model also stays in its provider's section, where a `★` marks a favorite and a `↺` a recent model. `/favorite-next` or `Ctrl+X c` switches Chat to the favorite after the current model, and to the first favorite when the current model is not one. Favorites are saved globally, like bindings, and a favorite that `allowed_models` or `excluded_models` rules out is not shown. A task model name such as `sonnet` runs on the favorite it matches, and the main agent is told your favorites. See [Models and reasoning](/docs/commands/#models-and-reasoning).
 
 Bindings are saved globally in the `model.purposes` row of Caudra's SQLite state database and apply across sessions. Unbound jobs use these rules:
 
@@ -449,14 +449,6 @@ fn format_context(entry: &ModelEntry) -> String {
     }
 }
 
-fn marker_label(marker: ModelMarker) -> &'static str {
-    match marker {
-        ModelMarker::Small => "Small",
-        ModelMarker::Fast => "Fast",
-        ModelMarker::Best => "Best",
-    }
-}
-
 struct ProviderSection {
     kind: ProviderKind,
     name: &'static str,
@@ -593,7 +585,7 @@ fn write_model_table(out: &mut String, manifest: &ProviderManifest) {
     let label = |entry: &ModelEntry| {
         let prefix = entry.prefixes.first()?;
         let marker = entry.facts().marker()?;
-        Some(format!("{prefix} ({})", marker_label(marker)))
+        Some(format!("{prefix} ({})", marker.label()))
     };
 
     let _ = writeln!(
@@ -610,7 +602,11 @@ fn write_model_table(out: &mut String, manifest: &ProviderManifest) {
         let _ = writeln!(
             out,
             "| {} | {} | {} | {} |",
-            entry.facts().marker().map(marker_label).unwrap_or_default(),
+            entry
+                .facts()
+                .marker()
+                .map(ModelMarker::label)
+                .unwrap_or_default(),
             match (entry.default, line_of(entry)) {
                 (false, _) => names,
                 (true, None) => format!("**{names}** (default)"),

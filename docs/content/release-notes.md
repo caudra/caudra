@@ -11,7 +11,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.9 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.9)
 
-Preview 9 adds Gemini 4 Argon as the Google default, along with Gemini 3.8 Flash, 3.6 Flash, and 3.5 Flash-Lite, brings Argon and 3.8 Flash to Copilot, bills announced Gemini price changes from their dates, fixes Google requests, which all failed on Caudra's tool definitions, fixes updates on macOS that sat for minutes on the download line, lets update checks use your GitHub token, shows download progress while Caudra updates, and opens `/model` on your favorite models.
+Preview 9 adds Gemini 4 Argon as the Google default, along with Gemini 3.8 Flash, 3.6 Flash, and 3.5 Flash-Lite, brings Argon and 3.8 Flash to Copilot, bills announced Gemini price changes from their dates, fixes Google requests, which all failed on Caudra's tool definitions, fixes updates on macOS that sat for minutes on the download line, lets update checks use your GitHub token, shows download progress while Caudra updates, opens `/model` on your favorite models, and runs a task on the favorite model you name.
 
 ### Models
 
@@ -28,6 +28,10 @@ Preview 9 adds Gemini 4 Argon as the Google default, along with Gemini 3.8 Flash
 ### Model picker
 
 - **`/model` opens on your favorites.** With favorite models, `/model` and `Ctrl+X m` put the cursor on the current model's favorite row, or on the first favorite, instead of on the Chat job, so you no longer move past every job row first. Without favorites, the picker opens on Chat as before. See [Model jobs](/docs/providers/#model-jobs).
+
+### Tasks
+
+- **Tasks run on the favorite you name.** When you ask for a model by a short name, as in "ask sonnet to review this", the task now runs on your favorite model that matches the name, even when a newer model or another provider matches too. While the main agent can choose a task's model, it is also told your favorites with their lane, the jobs you bound to them, and the thinking levels they take, and hears again when you star or unstar one. See [Models and reasoning](/docs/commands/#models-and-reasoning).
 
 ### Command line
 

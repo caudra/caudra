@@ -1,8 +1,11 @@
-//! Persisted bindings from a workload purpose to the model that serves it.
+//! Persisted bindings from a workload purpose to the model that serves it, and
+//! the models the user marked as favorites.
 //!
 //! A binding is an assignment the user made. Nothing here infers what a model
 //! is; a purpose the user never bound stays absent, and the caller applies its
-//! own default rule (see [`crate::model::Model::resolve`]).
+//! own default rule (see [`crate::model::Model::resolve`]). Favorites are kept
+//! beside them because the agent reads both on every turn: they say which
+//! models the user means when naming one.
 //!
 //! Discovered metadata (context windows, pricing) from `/models` endpoints is
 //! stored in `known_models` and consulted by [`crate::model::Model::from_base`].
@@ -192,6 +195,20 @@ pub fn load_from_storage(dir: &StateDir) -> Result<(), BindingError> {
     write().load_from_storage(dir)
 }
 
+/// The favorite models as last loaded or toggled in this process, newest first.
+pub fn favorites() -> Vec<String> {
+    read().favorites.clone()
+}
+
+/// Marks `spec` as a favorite, or unmarks it, and answers the list as stored.
+/// Memory follows only once storage took the change.
+pub fn toggle_favorite_and_persist(
+    spec: &str,
+    dir: &StateDir,
+) -> Result<Vec<String>, StorageError> {
+    write().toggle_favorite_and_persist(spec, dir)
+}
+
 pub fn set_binding_and_persist(
     purpose: ModelPurpose,
     binding: Binding,
@@ -283,13 +300,26 @@ struct ModelRegistry {
     /// Ordered model info per provider, populated from `list_models()`.
     /// Not persisted, rebuilt every session. Discovered metadata lookup only.
     known_models: HashMap<String, Vec<ModelInfo>>,
+    /// Newest first, as stored. Persisted by `caudra_storage::model`.
+    favorites: Vec<String>,
 }
 
 impl ModelRegistry {
     fn load_from_storage(&mut self, dir: &StateDir) -> Result<(), BindingError> {
         let bindings = read_bindings(dir)?;
         self.bindings = bindings;
+        self.favorites = caudra_storage::model::read_favorites(dir);
         Ok(())
+    }
+
+    fn toggle_favorite_and_persist(
+        &mut self,
+        spec: &str,
+        dir: &StateDir,
+    ) -> Result<Vec<String>, StorageError> {
+        let favorites = caudra_storage::model::toggle_favorite(dir, spec)?;
+        self.favorites.clone_from(&favorites);
+        Ok(favorites)
     }
 
     fn update_and_persist(
@@ -657,5 +687,55 @@ mod tests {
             Err(BindingError::Storage(_))
         ));
         assert_eq!(reg.bindings, original, "{MEMORY_CHANGED}");
+    }
+
+    const OLD_FAVORITE: &str = "provider/old";
+    const NEW_FAVORITE: &str = "provider/new";
+    const FAVORITES_DIVERGED: &str = "the favorites in memory must match the stored ones";
+
+    #[test]
+    fn loading_reads_the_stored_favorites() {
+        let (_temp, dir) = state_dir();
+        caudra_storage::model::toggle_favorite(&dir, OLD_FAVORITE).unwrap();
+        caudra_storage::model::toggle_favorite(&dir, NEW_FAVORITE).unwrap();
+        let mut reg = ModelRegistry::default();
+
+        reg.load_from_storage(&dir).unwrap();
+
+        assert_eq!(reg.favorites, [NEW_FAVORITE, OLD_FAVORITE]);
+    }
+
+    #[test]
+    fn a_toggle_changes_storage_and_memory_alike() {
+        let (_temp, dir) = state_dir();
+        let mut reg = ModelRegistry::default();
+
+        reg.toggle_favorite_and_persist(OLD_FAVORITE, &dir).unwrap();
+        reg.toggle_favorite_and_persist(NEW_FAVORITE, &dir).unwrap();
+        reg.toggle_favorite_and_persist(OLD_FAVORITE, &dir).unwrap();
+
+        assert_eq!(reg.favorites, [NEW_FAVORITE]);
+        assert_eq!(
+            caudra_storage::model::read_favorites(&dir),
+            reg.favorites,
+            "{FAVORITES_DIVERGED}"
+        );
+    }
+
+    #[test]
+    fn a_failed_toggle_leaves_the_favorites_in_memory() {
+        let temp = TempDir::new().unwrap();
+        let blocked = temp.path().join("not-a-directory");
+        fs::write(&blocked, "blocked").unwrap();
+        let mut reg = ModelRegistry {
+            favorites: vec![OLD_FAVORITE.into()],
+            ..Default::default()
+        };
+
+        assert!(
+            reg.toggle_favorite_and_persist(NEW_FAVORITE, &StateDir::from_path(blocked))
+                .is_err()
+        );
+        assert_eq!(reg.favorites, [OLD_FAVORITE], "{MEMORY_CHANGED}");
     }
 }

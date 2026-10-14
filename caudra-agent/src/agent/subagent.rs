@@ -33,6 +33,7 @@ use caudra_storage::{
     tool_outputs::ToolOutputStore,
 };
 
+use super::favorites;
 use super::steering::{SharedSteering, Steering};
 use super::{ModelRoute, resolve_model_for_purpose, resolve_purpose_model_for_inspection};
 use crate::background::JobScope;
@@ -1554,7 +1555,9 @@ fn subagent_model_binding<'a>(
 }
 
 /// The exact spec a task's `model` names among the models this session may
-/// use, preferring the providers it already runs on. The models the session
+/// use, preferring the providers it already runs on. A name the user's
+/// favorites alone resolve picks that favorite, ahead of a newer model or
+/// another provider, because it is the one the user means. The models the session
 /// runs and binds always count. A miss among the models known offline asks
 /// the providers for their live lists, which is where a server's own models,
 /// such as a local `qwen3.8-27b`, come from. A qualified spec nothing lists is
@@ -1576,6 +1579,9 @@ async fn resolve_task_model(ctx: &ToolContext, name: &str) -> Result<String, Str
         .filter_map(|spec| Some(spec.split_once(MODEL_SPEC_SEPARATOR)?.0))
         .collect();
     let name = name.trim().to_owned();
+    if let Ok(favorite) = find_model(&name, &favorites::allowed(&policy), &preferred) {
+        return Ok(favorite);
+    }
     let mut candidates = {
         let policy = Arc::clone(&policy);
         smol::unblock(move || provider::delegable_model_specs(&policy)).await
@@ -1844,7 +1850,7 @@ mod tests {
     use crate::tools::{FILE_GREP_TOOL_NAME, TASK_TOOL_NAME};
     use crate::tools::{ToolEffect, audited_local_tool};
     use crate::{AgentEvent, CancelToken, EventSender, ToolDoneEvent, TurnCompleteEvent};
-    use caudra_config::{PermissionsConfig, ToolKey};
+    use caudra_config::{ModelPolicy, PermissionsConfig, ToolKey};
     use caudra_providers::{Billing, ContentBlock, Message, Role};
     use caudra_storage::id::SessionRef;
     use caudra_storage::usage_ledger::LedgerPurpose;
@@ -1869,6 +1875,10 @@ mod tests {
     const SUBAGENT_ROOT: &str = "/work/project";
     const LOCAL_READER: &str = "local_reader";
     const LOCAL_RESULT: &str = "local result";
+    const SONNET_NAME: &str = "sonnet";
+    const NEWEST_SONNET: &str = "anthropic/claude-sonnet-5-5";
+    const FAVORITE_SONNET: &str = "anthropic/claude-sonnet-4-5";
+    const OTHER_PROVIDER_SONNET: &str = "copilot/claude-sonnet-4.6";
 
     struct RevisionChangingProvider {
         permissions: Arc<PermissionManager>,
@@ -2250,6 +2260,29 @@ mod tests {
             assert_eq!(spec.thinking, Some(thinking));
             subagent.close();
         });
+    }
+
+    /// The session runs the newest Sonnet, which a bare `sonnet` names unless
+    /// the user starred another one.
+    #[test_case(&[], &[] => NEWEST_SONNET ; "without_favorites_the_newest_wins")]
+    #[test_case(&[FAVORITE_SONNET], &[] => FAVORITE_SONNET ; "a_favorite_beats_a_newer_model")]
+    #[test_case(&[OTHER_PROVIDER_SONNET, FAVORITE_SONNET], &[] => FAVORITE_SONNET ; "the_session_provider_breaks_a_tie_between_favorites")]
+    #[test_case(&[FAVORITE_SONNET], &[FAVORITE_SONNET] => NEWEST_SONNET ; "an_excluded_favorite_falls_through")]
+    fn a_task_model_name_prefers_a_favorite(favorites: &[&str], excluded: &[&str]) -> String {
+        smol::block_on(async {
+            let directory = TempDir::new().unwrap();
+            let dir = StateDir::from_path(directory.path().to_path_buf());
+            for spec in favorites.iter().rev() {
+                model_registry::toggle_favorite_and_persist(spec, &dir).unwrap();
+            }
+            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            ctx.model = Arc::new(Model::from_spec(NEWEST_SONNET).unwrap());
+            ctx.chat_model = Arc::clone(&ctx.model);
+            let excluded: Vec<String> = excluded.iter().map(|spec| spec.to_string()).collect();
+            ctx.model_policy = Arc::new(ModelPolicy::new(&[], &excluded).unwrap());
+
+            resolve_task_model(&ctx, SONNET_NAME).await.unwrap()
+        })
     }
 
     #[test_case(FeatureMode::Enforce, false, false, &[NoteOutcome::Acted, NoteOutcome::Acted], ROUTED; "enforce_routes")]
