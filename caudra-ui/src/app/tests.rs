@@ -5051,6 +5051,7 @@ fn resumed_session_keeps_adding_to_the_restored_bill() {
     stored.token_usage = RESTORED_TOKENS;
     stored.add_model_usage(
         RESTORED_MODEL,
+        LedgerPurpose::Chat,
         RESTORED_TOKENS.billed(Some(RESTORED_COST), Billing::Api),
     );
 
@@ -17707,6 +17708,11 @@ fn btw_usage_settles_into_the_session_ledger() {
     assert_eq!(billed.input, 100);
     assert_eq!(billed.cost, Some(BTW_COST));
     assert_eq!(
+        app.state.session.usage_by_purpose()[LedgerPurpose::Btw.storage_name()],
+        *billed,
+        "the session files the side request under its purpose for /usage"
+    );
+    assert_eq!(
         app.state.goal.snapshot().unwrap().usage.input,
         100,
         "btw spends inside the goal window, so the goal is charged"
@@ -23496,7 +23502,7 @@ const MERGE_USAGE_MODEL: &str = "usage-model";
 /// neither changes what the merge reads. Keyed on the content revision, each
 /// one used to walk the whole transcript again.
 #[test_case(|session| session.insert_tool_output("t1".into(), ToolOutput::Plain(tool_text("t1").into())), false ; "a_tool_output")]
-#[test_case(|session| session.add_model_usage(MERGE_USAGE_MODEL, StoredTokenUsage::default()), false ; "a_usage_record")]
+#[test_case(|session| session.add_model_usage(MERGE_USAGE_MODEL, LedgerPurpose::Chat, StoredTokenUsage::default()), false ; "a_usage_record")]
 #[test_case(|session| session.truncate_messages(1), true ; "a_truncation")]
 fn only_the_sessions_messages_bring_the_merge_back(mutate: fn(&mut AppSession), moves: bool) {
     let (_tmp, _dir, _writer, mut app) = tempdir_app();
@@ -24749,6 +24755,7 @@ fn app_with_wide_spend() -> App {
     let mut app = test_app();
     app.state.session_mut().add_model_usage(
         LONG_SPEND_MODEL,
+        LedgerPurpose::Chat,
         StoredTokenUsage {
             input: 1_000_000,
             cost: Some(0.75),

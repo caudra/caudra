@@ -601,6 +601,7 @@ impl App {
                 total_cost: self.state.cost,
                 subscription_cost: self.state.subscription_cost,
                 by_model: self.state.session.usage_by_model(),
+                by_purpose: self.state.session.usage_by_purpose(),
                 model: &self.state.model,
                 fast: self.state.fast,
                 clock_format: self.ui_config.clock_format,

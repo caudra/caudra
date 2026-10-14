@@ -1629,6 +1629,7 @@ mod tests {
     use caudra_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use caudra_storage::StateDir;
     use caudra_storage::sessions::Session;
+    use caudra_storage::usage_ledger::LedgerPurpose;
     use caudra_workspace::PlanRef;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -2577,6 +2578,7 @@ mod tests {
         };
         session.add_model_usage(
             RETIRED_MODEL_ID,
+            LedgerPurpose::Chat,
             StoredTokenUsage {
                 input: 1_000_000,
                 output: 200_000,

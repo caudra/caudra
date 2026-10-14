@@ -6995,7 +6995,7 @@ impl App {
         let key = session_usage_model(provider, model);
         self.state
             .session_mut()
-            .add_model_usage(&key, usage.billed(cost, billing));
+            .add_model_usage(&key, purpose, usage.billed(cost, billing));
         self.storage_writer.record_usage(TurnUsage {
             provider: provider.to_owned(),
             model: model.to_owned(),

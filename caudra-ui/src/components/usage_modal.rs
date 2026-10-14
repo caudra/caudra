@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use arc_swap::ArcSwapOption;
 
@@ -11,7 +11,7 @@ use caudra_providers::{
 };
 use caudra_storage::sessions::StoredTokenUsage;
 use caudra_storage::usage_ledger::{LifetimeUsage, UsageSlice};
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use ratatui::Frame;
@@ -30,6 +30,19 @@ use crate::theme;
 const TITLE: &str = " Token usage ";
 const LIFETIME_TITLE: &str = " Token usage - lifetime ";
 const SLICE_LIMIT: usize = 8;
+/// A cap hides rows only when it hides at least two: the line saying one row
+/// is hidden takes the room the row would have.
+const COLLAPSE_ABOVE: usize = SLICE_LIMIT + 1;
+const SHOW_LESS: &str = "show less";
+const PROVIDER_COLUMN: &str = "provider";
+const MODEL_COLUMN: &str = "model";
+const PURPOSE_COLUMN: &str = "purpose";
+/// Expands every capped lifetime breakdown, or collapses them again.
+pub(crate) const EXPAND_KEY: Bind = Bind {
+    code: KeyCode::Char('e'),
+    modifiers: KeyModifiers::NONE,
+    label: "e",
+};
 const NO_LEDGER: &str = "no spend recorded yet";
 const LEDGER_UNAVAILABLE: &str = "lifetime spend unavailable";
 /// Switches the modal between this session and everything ever recorded.
@@ -149,6 +162,9 @@ pub struct UsageModalContext<'a> {
     /// than folded into `total_cost`.
     pub subscription_cost: Option<f64>,
     pub by_model: &'a HashMap<String, StoredTokenUsage>,
+    /// The same spend keyed by purpose, empty for turns recorded before the
+    /// session kept it.
+    pub by_purpose: &'a HashMap<String, StoredTokenUsage>,
     pub model: &'a Model,
     pub fast: bool,
     pub clock_format: ClockFormat,
@@ -169,7 +185,23 @@ pub struct UsageModal {
     quota: Watch<UsageFetchState>,
     /// The quota's age, which a click turns into a refresh.
     refresh: FooterHits,
+    /// Lifetime breakdowns showing every row rather than the first few.
+    expanded: HashSet<LifetimeSection>,
+    /// The `... and N more` and `show less` lines, which a click flips.
+    toggles: FooterHits,
+    /// Which section each of `toggles` flips, in the same order.
+    toggle_sections: Vec<LifetimeSection>,
     popup: Rect,
+}
+
+/// A lifetime breakdown long enough to be capped. Purposes are a short fixed
+/// list and always show whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum LifetimeSection {
+    Provider,
+    Model,
+    Project,
+    Month,
 }
 
 /// What the pointer asked of the host. `Ignored` hands the event back.
@@ -190,6 +222,9 @@ impl UsageModal {
             pan_bar: Scrollbar::horizontal(),
             quota: Watch::default(),
             refresh: FooterHits::default(),
+            expanded: HashSet::new(),
+            toggles: FooterHits::default(),
+            toggle_sections: Vec::new(),
             popup: Rect::default(),
         }
     }
@@ -214,8 +249,30 @@ impl UsageModal {
 
     pub fn toggle(&mut self) {
         self.open = !self.open;
+        self.reset_view();
+    }
+
+    fn reset_view(&mut self) {
         self.scroll.reset();
         self.refresh.reset();
+        self.toggles.reset();
+        self.expanded.clear();
+    }
+
+    fn flip_section(&mut self, section: LifetimeSection) {
+        if !self.expanded.remove(&section) {
+            self.expanded.insert(section);
+        }
+    }
+
+    /// Opens every capped breakdown at once, or closes them all once any is
+    /// open, so one key always undoes the last press.
+    fn flip_all_sections(&mut self) {
+        if self.expanded.is_empty() {
+            self.expanded.extend(self.toggle_sections.iter().copied());
+        } else {
+            self.expanded.clear();
+        }
     }
 
     pub fn scope(&self) -> UsageScope {
@@ -234,8 +291,7 @@ impl UsageModal {
     /// lands it beats a blank panel.
     pub fn close(&mut self) {
         self.open = false;
-        self.scroll.reset();
-        self.refresh.reset();
+        self.reset_view();
     }
 
     /// The quota's age is asked first, the way a footer control is: a press on
@@ -248,7 +304,14 @@ impl UsageModal {
         if self.refresh.handle_mouse(*event).is_some() {
             return UsageMouse::Refresh;
         }
-        if event.kind == MouseEventKind::Down(MouseButton::Left) && self.refresh.hovered().is_some()
+        if let Some(index) = self.toggles.handle_mouse(*event) {
+            if let Some(&section) = self.toggle_sections.get(index) {
+                self.flip_section(section);
+            }
+            return UsageMouse::Consumed;
+        }
+        if event.kind == MouseEventKind::Down(MouseButton::Left)
+            && (self.refresh.hovered().is_some() || self.toggles.hovered().is_some())
         {
             return UsageMouse::Consumed;
         }
@@ -289,6 +352,10 @@ impl UsageModal {
             self.toggle_scope();
             return;
         }
+        if self.scope == UsageScope::Lifetime && EXPAND_KEY.matches(key_event) {
+            self.flip_all_sections();
+            return;
+        }
         self.scroll.handle_key(key_event);
     }
 
@@ -299,9 +366,15 @@ impl UsageModal {
         grab_scope!("usage_modal", area);
 
         let theme = theme::current();
-        let (mut lines, refresh_row) = match self.scope {
-            UsageScope::Session => build_lines(ctx, self.quota.get(), &theme),
-            UsageScope::Lifetime => (build_lifetime_lines(ctx.lifetime, &theme), None),
+        let (mut lines, refresh_row, toggle_rows) = match self.scope {
+            UsageScope::Session => {
+                let (lines, refresh_row) = build_lines(ctx, self.quota.get(), &theme);
+                (lines, refresh_row, Vec::new())
+            }
+            UsageScope::Lifetime => {
+                let (lines, toggles) = build_lifetime_lines(ctx.lifetime, &self.expanded, &theme);
+                (lines, None, toggles)
+            }
         };
 
         let total = lines.len() as u16;
@@ -325,19 +398,34 @@ impl UsageModal {
         let scroll = self.scroll.offset();
         let pan = self.scroll.pan();
 
-        let refresh_line = refresh_row.and_then(|row| Some((row, lines.get(row)?)));
-        self.refresh.set(
-            refresh_line
-                .and_then(|(row, line)| refresh_hit(line, row, inner, scroll, pan))
-                .into_iter()
+        let hit = |row: usize| {
+            lines
+                .get(row)
+                .and_then(|line| last_span_hit(line, row, inner, scroll, pan))
+        };
+        self.refresh
+            .set(refresh_row.and_then(hit).into_iter().collect());
+        // An off-screen toggle keeps an empty rect so the indices still line up
+        // with `toggle_sections`.
+        let (toggle_rows, sections): (Vec<usize>, Vec<LifetimeSection>) =
+            toggle_rows.into_iter().unzip();
+        self.toggles.set(
+            toggle_rows
+                .iter()
+                .map(|&row| hit(row).unwrap_or_default())
                 .collect(),
         );
-        if self.refresh.hovered().is_some()
-            && let Some(age) = refresh_row
-                .and_then(|row| lines.get_mut(row))
-                .and_then(|line| line.spans.last_mut())
-        {
-            age.style = hover_style(age.style, true);
+        self.toggle_sections = sections;
+        let hovered = [
+            self.refresh.hovered().and(refresh_row),
+            self.toggles
+                .hovered()
+                .and_then(|index| toggle_rows.get(index).copied()),
+        ];
+        for row in hovered.into_iter().flatten() {
+            if let Some(target) = lines.get_mut(row).and_then(|line| line.spans.last_mut()) {
+                target.style = hover_style(target.style, true);
+            }
         }
 
         frame.render_widget(Paragraph::new(lines).scroll((scroll, pan)), inner);
@@ -350,7 +438,7 @@ impl UsageModal {
         // because a track is only built for content that overflows.
         self.pan_bar.draw(frame, bar_area(inner), content_w, pan);
 
-        let hint = Line::from(vec![
+        let mut hint = Line::from(vec![
             Span::raw(" "),
             Span::styled("Ctrl+R", theme.keybind_key),
             Span::styled(" reload ", theme.tool_dim),
@@ -363,6 +451,17 @@ impl UsageModal {
                 theme.tool_dim,
             ),
         ]);
+        if !self.toggle_sections.is_empty() {
+            hint.push_span(Span::styled(EXPAND_KEY.label, theme.keybind_key));
+            hint.push_span(Span::styled(
+                if self.expanded.is_empty() {
+                    " more "
+                } else {
+                    " less "
+                },
+                theme.tool_dim,
+            ));
+        }
         let hint_w = hint.width() as u16;
         // Beside the title rather than under the table: the bottom border row
         // belongs to the pan bar, and a hint sharing it would be overpainted
@@ -423,12 +522,25 @@ fn build_lines(
     // One provider row would only restate the session total, which already
     // carries its own rate. The fold earns its lines once there are two.
     if providers.len() > 1 {
-        lines.extend(breakdown_table("Per provider", &providers, theme));
+        lines.extend(breakdown_table(
+            "Per provider",
+            PROVIDER_COLUMN,
+            &providers,
+            theme,
+        ));
     }
     for row in &mut models {
         row.trim_provider(&ctx.model.provider);
     }
-    lines.extend(breakdown_table("Per model", &models, theme));
+    lines.extend(breakdown_table("Per model", MODEL_COLUMN, &models, theme));
+    if !ctx.by_purpose.is_empty() {
+        lines.extend(breakdown_table(
+            "Per purpose",
+            PURPOSE_COLUMN,
+            &purpose_rows(ctx.by_purpose),
+            theme,
+        ));
+    }
 
     (lines, refresh_row)
 }
@@ -436,7 +548,7 @@ fn build_lines(
 /// Where the last span of `line`, drawn at `row` of an unwrapped paragraph
 /// scrolled to `scroll` and panned to `pan`, landed inside `area`, clipped to
 /// what is visible.
-fn refresh_hit(line: &Line, row: usize, area: Rect, scroll: u16, pan: u16) -> Option<Rect> {
+fn last_span_hit(line: &Line, row: usize, area: Rect, scroll: u16, pan: u16) -> Option<Rect> {
     let target = line.spans.last()?;
     let row = u16::try_from(row).ok()?.checked_sub(scroll)?;
     if row >= area.height {
@@ -515,8 +627,42 @@ fn provider_rows(models: &[BreakdownRow], fallback: &str) -> Vec<BreakdownRow> {
     folded
 }
 
+/// The session's spend by why each model was called, dearest in tokens first,
+/// ties by name so the order holds still between frames.
+fn purpose_rows(by_purpose: &HashMap<String, StoredTokenUsage>) -> Vec<BreakdownRow> {
+    let mut rows: Vec<BreakdownRow> = by_purpose
+        .iter()
+        .map(|(purpose, usage)| BreakdownRow {
+            label: purpose.clone(),
+            usage: *usage,
+            spend: recorded_spend(usage),
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.usage
+            .total()
+            .cmp(&a.usage.total())
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    rows
+}
+
+/// What a purpose's turns recorded paying. No model names a purpose, so an
+/// unpriced row stays unpriced rather than being estimated, and both payers
+/// add up the way a provider fold does: any invoice makes the figure a bill.
+fn recorded_spend(usage: &StoredTokenUsage) -> ModelSpend {
+    let mut usd = usage.cost;
+    add_cost(&mut usd, usage.subscription_cost);
+    let billing = match (usage.cost, usage.subscription_cost) {
+        (None, Some(_)) => Billing::Subscription,
+        _ => Billing::Api,
+    };
+    ModelSpend { usd, billing }
+}
+
 fn breakdown_table(
     heading: &str,
+    column: &str,
     rows: &[BreakdownRow],
     theme: &crate::theme::Theme,
 ) -> Vec<Line<'static>> {
@@ -546,7 +692,7 @@ fn breakdown_table(
             format!("{PREFIX}{heading}"),
             theme.keybind_section,
         )),
-        Line::from(header_row(label_w, &widths, theme)),
+        Line::from(header_row(column, label_w, &widths, theme)),
     ];
     lines.extend(rows.iter().zip(&cells).map(|(row, cells)| {
         Line::from(model_row(
@@ -561,22 +707,30 @@ fn breakdown_table(
     lines
 }
 
+/// The lines, and the rows that expand or collapse a capped section.
 fn build_lifetime_lines(
     lifetime: Option<&LifetimeUsage>,
+    expanded: &HashSet<LifetimeSection>,
     theme: &crate::theme::Theme,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<(usize, LifetimeSection)>) {
     let fg = Style::new().fg(theme.foreground);
     let Some(lifetime) = lifetime else {
-        return vec![Line::from(Span::styled(
-            format!("{PREFIX}{LEDGER_UNAVAILABLE}"),
-            theme.status_dim,
-        ))];
+        return (
+            vec![Line::from(Span::styled(
+                format!("{PREFIX}{LEDGER_UNAVAILABLE}"),
+                theme.status_dim,
+            ))],
+            Vec::new(),
+        );
     };
     if lifetime.is_empty() {
-        return vec![Line::from(Span::styled(
-            format!("{PREFIX}{NO_LEDGER}"),
-            theme.status_dim,
-        ))];
+        return (
+            vec![Line::from(Span::styled(
+                format!("{PREFIX}{NO_LEDGER}"),
+                theme.status_dim,
+            ))],
+            Vec::new(),
+        );
     }
 
     let mut lines = vec![
@@ -631,12 +785,34 @@ fn build_lifetime_lines(
 
     // A lone provider row only restates the all-time line above it, rate and
     // all, so that fold alone has to earn its heading with a second row.
-    for (heading, slices, min_rows) in [
-        ("Per provider", &lifetime.by_provider, 2),
-        ("Per model", &lifetime.by_model, 1),
-        ("Per project", &lifetime.by_project, 1),
-        ("Per purpose", &lifetime.by_purpose, 1),
-        ("Per month", &lifetime.by_month, 1),
+    // Purposes have no section: there are few enough to always show whole.
+    let mut toggles = Vec::new();
+    for (heading, slices, min_rows, section) in [
+        (
+            "Per provider",
+            &lifetime.by_provider,
+            2,
+            Some(LifetimeSection::Provider),
+        ),
+        (
+            "Per model",
+            &lifetime.by_model,
+            1,
+            Some(LifetimeSection::Model),
+        ),
+        (
+            "Per project",
+            &lifetime.by_project,
+            1,
+            Some(LifetimeSection::Project),
+        ),
+        ("Per purpose", &lifetime.by_purpose, 1, None),
+        (
+            "Per month",
+            &lifetime.by_month,
+            1,
+            Some(LifetimeSection::Month),
+        ),
     ] {
         if slices.len() < min_rows {
             continue;
@@ -646,20 +822,35 @@ fn build_lifetime_lines(
             format!("{PREFIX}{heading}"),
             theme.keybind_section,
         )));
-        lines.extend(slice_rows(slices, fg, theme.status_dim));
+        let section = section.filter(|_| slices.len() > COLLAPSE_ABOVE);
+        let shown = match section {
+            Some(section) if !expanded.contains(&section) => SLICE_LIMIT,
+            _ => slices.len(),
+        };
+        lines.extend(slice_rows(&slices[..shown], fg, theme.status_dim));
+        if let Some(section) = section {
+            toggles.push((lines.len(), section));
+            let label = match slices.len() - shown {
+                0 => SHOW_LESS.to_owned(),
+                hidden => format!("... and {hidden} more"),
+            };
+            lines.push(Line::from(vec![
+                Span::raw(PREFIX),
+                Span::styled(label, theme.status_dim),
+            ]));
+        }
     }
-    lines
+    (lines, toggles)
 }
 
 fn slice_rows(slices: &[UsageSlice], fg: Style, dim: Style) -> Vec<Line<'static>> {
-    let shown = slices.len().min(SLICE_LIMIT);
-    let label_w = slices[..shown]
+    let label_w = slices
         .iter()
         .map(|slice| slice.label.chars().count())
         .max()
         .unwrap_or(0)
         .max(MODEL_COL_MIN);
-    let cells: Vec<_> = slices[..shown]
+    let cells: Vec<_> = slices
         .iter()
         .map(|slice| {
             [
@@ -673,7 +864,7 @@ fn slice_rows(slices: &[UsageSlice], fg: Style, dim: Style) -> Vec<Line<'static>
         })
         .collect();
     let [token_w, turns_w, cost_w] = column_widths(&cells, [NUM_COL, TURNS_COL, LIFETIME_COST_COL]);
-    let mut lines: Vec<Line> = slices[..shown]
+    slices
         .iter()
         .zip(&cells)
         .map(|(slice, [tokens, turns, cost])| {
@@ -702,14 +893,7 @@ fn slice_rows(slices: &[UsageSlice], fg: Style, dim: Style) -> Vec<Line<'static>
                 ),
             ])
         })
-        .collect();
-    if slices.len() > shown {
-        lines.push(Line::from(Span::styled(
-            format!("{PREFIX}... and {} more", slices.len() - shown),
-            dim,
-        )));
-    }
-    lines
+        .collect()
 }
 
 /// Its own line rather than a share of the total: the headline number is money
@@ -792,7 +976,8 @@ fn breakdown_cells(row: &BreakdownRow) -> [String; 6] {
 }
 
 fn header_row(
-    model_w: usize,
+    column: &str,
+    label_w: usize,
     widths: &[usize; 6],
     theme: &crate::theme::Theme,
 ) -> Vec<Span<'static>> {
@@ -801,10 +986,7 @@ fn header_row(
     let gap = || Span::raw(" ".repeat(COL_GAP));
     vec![
         Span::raw(PREFIX),
-        Span::styled(
-            format!("{:width$}", "model", width = model_w),
-            theme.status_dim,
-        ),
+        Span::styled(format!("{column:label_w$}"), theme.status_dim),
         gap(),
         h("base in", input_w),
         gap(),
@@ -1108,6 +1290,17 @@ mod tests {
     const WIDE_TERMINAL: u16 = 180;
     /// A small screen: the modal fills its floor and the table still runs past it.
     const NARROW_TERMINAL: u16 = 80;
+    const TERMINAL_HEIGHT: u16 = 30;
+    const PURPOSE_HEADING: &str = "Per purpose";
+    const GOAL_PURPOSE: &str = "goal";
+    const CHAT_PURPOSE: &str = "chat";
+    const HIDDEN_ROWS: usize = 2;
+    const NONE_HIDDEN: &str = "a cap that would hide one row shows it instead";
+    const PURPOSES_WHOLE: &str = "purposes are a short fixed list and always show whole";
+    const TOGGLE_UNREACHABLE: &str = "the more line must be where a pointer reaches it";
+    const EXPANDED_WHOLE: &str = "an expanded section shows every row and offers to collapse";
+    const COLLAPSED_AGAIN: &str = "a second click puts the cap back";
+    const PURPOSE_ORDER: &str = "the purpose that used the most tokens comes first";
     const LONG_MODEL: &str = "a-model-with-a-deliberately-long-identifier";
     const PANS_TO_THE_END: usize = 8;
     /// A tap covers half a viewport, so a couple reach the end of any table this
@@ -1175,7 +1368,7 @@ mod tests {
         if providers {
             rows = provider_rows(&rows, FOREIGN_PROVIDER);
         }
-        let lines = breakdown_table(PROVIDER_HEADING, &rows, &theme);
+        let lines = breakdown_table(PROVIDER_HEADING, PROVIDER_COLUMN, &rows, &theme);
         let header = &lines[TABLE_HEADER];
         for line in &lines[TABLE_BODY..] {
             assert_eq!(line.width(), header.width(), "{DECIMAL_ALIGNMENT}");
@@ -1265,24 +1458,34 @@ mod tests {
     #[test_case(false ; "billed")]
     #[test_case(true ; "mixed_payers")]
     fn lifetime_widths_ignore_hidden_rows(mixed: bool) {
+        let theme = crate::theme::current();
         let mut slices = vec![slice(LIFETIME_MODEL, RECORDED_COST); SLICE_LIMIT];
         if mixed {
             slices[0].subscription_cost = SUBSCRIPTION_COST;
         }
-        let fg = Style::default();
-        let visible = slice_rows(&slices, fg, fg);
-        slices.push(UsageSlice {
+        let visible = slice_rows(&slices, Style::new().fg(theme.foreground), theme.status_dim);
+        let wide = UsageSlice {
             label: LONG_MODEL.to_owned(),
             tokens: u64::MAX,
             turns: u64::MAX,
             cost: 1_000_000.0,
             ..UsageSlice::default()
-        });
-        let capped = slice_rows(&slices, fg, fg);
-        assert_eq!(&capped[..SLICE_LIMIT], visible);
+        };
+        slices.extend(vec![wide; HIDDEN_ROWS]);
+        let usage = LifetimeUsage {
+            by_model: slices,
+            ..lifetime()
+        };
+
+        let (lines, toggles) = build_lifetime_lines(Some(&usage), &HashSet::new(), &theme);
+
+        let [(toggle, LifetimeSection::Model)] = toggles[..] else {
+            panic!("only the model breakdown is long enough to cap: {toggles:?}");
+        };
+        assert_eq!(&lines[toggle - SLICE_LIMIT..toggle], visible);
         assert_eq!(
-            line_texts(&capped[SLICE_LIMIT..]),
-            [format!("{PREFIX}... and 1 more")]
+            line_texts(&lines[toggle..=toggle]),
+            [format!("{PREFIX}... and {HIDDEN_ROWS} more")]
         );
         if mixed {
             assert_eq!(visible[0].spans[9].content.trim(), "4.690");
@@ -1324,7 +1527,7 @@ mod tests {
     }
 
     fn lifetime_texts(lifetime: Option<&LifetimeUsage>) -> Vec<String> {
-        line_texts(&build_lifetime_lines(lifetime, &crate::theme::current()))
+        line_texts(&build_lifetime_lines(lifetime, &HashSet::new(), &crate::theme::current()).0)
     }
 
     fn line_texts(lines: &[Line<'static>]) -> Vec<String> {
@@ -1469,6 +1672,192 @@ mod tests {
         };
         let texts = lifetime_texts(Some(&usage)).join("\n");
         assert!(texts.contains("and 2 more"), "{texts}");
+    }
+
+    fn numbered(prefix: &str, count: usize) -> Vec<UsageSlice> {
+        (0..count)
+            .map(|index| slice(&format!("{prefix}-{index}"), index as f64))
+            .collect()
+    }
+
+    #[test]
+    fn a_cap_never_hides_a_single_row() {
+        let usage = LifetimeUsage {
+            by_model: numbered(LIFETIME_MODEL, COLLAPSE_ABOVE),
+            ..lifetime()
+        };
+        let (lines, toggles) =
+            build_lifetime_lines(Some(&usage), &HashSet::new(), &crate::theme::current());
+        let texts = line_texts(&lines).join("\n");
+        assert!(toggles.is_empty(), "{NONE_HIDDEN}: {texts}");
+        for index in 0..COLLAPSE_ABOVE {
+            assert!(
+                texts.contains(&format!("{LIFETIME_MODEL}-{index}")),
+                "{NONE_HIDDEN}: {texts}"
+            );
+        }
+    }
+
+    #[test]
+    fn purposes_always_show_whole() {
+        let purposes = SLICE_LIMIT + HIDDEN_ROWS;
+        let usage = LifetimeUsage {
+            by_purpose: numbered(GOAL_PURPOSE, purposes),
+            ..lifetime()
+        };
+        let (lines, toggles) =
+            build_lifetime_lines(Some(&usage), &HashSet::new(), &crate::theme::current());
+        let texts = line_texts(&lines).join("\n");
+        assert!(toggles.is_empty(), "{PURPOSES_WHOLE}: {texts}");
+        assert!(texts.contains(PURPOSE_HEADING), "{texts}");
+        for index in 0..purposes {
+            assert!(
+                texts.contains(&format!("{GOAL_PURPOSE}-{index}")),
+                "{PURPOSES_WHOLE}: {texts}"
+            );
+        }
+    }
+
+    fn long_lifetime() -> LifetimeUsage {
+        LifetimeUsage {
+            by_model: numbered(LIFETIME_MODEL, SLICE_LIMIT + HIDDEN_ROWS),
+            ..lifetime()
+        }
+    }
+
+    fn shown_models(modal: &mut UsageModal, usage: &LifetimeUsage) -> (String, usize) {
+        let rendered = buffer_text(&draw_with(
+            modal,
+            WIDE_TERMINAL,
+            &HashMap::new(),
+            Some(usage),
+        ));
+        let shown = (0..SLICE_LIMIT + HIDDEN_ROWS)
+            .filter(|index| rendered.contains(&format!("{LIFETIME_MODEL}-{index} ")))
+            .count();
+        (rendered, shown)
+    }
+
+    #[test]
+    fn a_click_on_the_more_line_expands_and_collapses_its_section() {
+        let usage = long_lifetime();
+        let mut modal = UsageModal::new();
+        modal.toggle();
+        modal.handle_key(SCOPE_KEY.to_key_event());
+        let (rendered, shown) = shown_models(&mut modal, &usage);
+        assert_eq!(shown, SLICE_LIMIT, "{rendered}");
+        let hit = modal.toggles.hit(0);
+        assert!(!hit.is_empty(), "{TOGGLE_UNREACHABLE}");
+
+        let press = modal.handle_mouse(&pointer(MouseEventKind::Down(MouseButton::Left), hit));
+        assert_eq!(press, UsageMouse::Consumed);
+        let release = modal.handle_mouse(&pointer(MouseEventKind::Up(MouseButton::Left), hit));
+        assert_eq!(release, UsageMouse::Consumed);
+        let (rendered, shown) = shown_models(&mut modal, &usage);
+        assert_eq!(
+            shown,
+            SLICE_LIMIT + HIDDEN_ROWS,
+            "{EXPANDED_WHOLE}: {rendered}"
+        );
+        assert!(rendered.contains(SHOW_LESS), "{EXPANDED_WHOLE}: {rendered}");
+
+        let hit = modal.toggles.hit(0);
+        modal.handle_mouse(&pointer(MouseEventKind::Down(MouseButton::Left), hit));
+        modal.handle_mouse(&pointer(MouseEventKind::Up(MouseButton::Left), hit));
+        let (rendered, shown) = shown_models(&mut modal, &usage);
+        assert_eq!(shown, SLICE_LIMIT, "{COLLAPSED_AGAIN}: {rendered}");
+    }
+
+    #[test]
+    fn the_expand_key_opens_and_closes_every_capped_section() {
+        let usage = LifetimeUsage {
+            by_project: numbered(LIFETIME_PROJECT, SLICE_LIMIT + HIDDEN_ROWS),
+            ..long_lifetime()
+        };
+        let mut modal = UsageModal::new();
+        modal.toggle();
+        modal.handle_key(SCOPE_KEY.to_key_event());
+        let theme = crate::theme::current();
+        shown_models(&mut modal, &usage);
+
+        modal.handle_key(EXPAND_KEY.to_key_event());
+        let (lines, toggles) = build_lifetime_lines(Some(&usage), &modal.expanded, &theme);
+        assert_eq!(toggles.len(), 2);
+        assert!(
+            toggles
+                .iter()
+                .all(|&(row, _)| line_texts(&lines[row..=row])[0].ends_with(SHOW_LESS)),
+            "{EXPANDED_WHOLE}"
+        );
+
+        modal.handle_key(EXPAND_KEY.to_key_event());
+        assert!(modal.expanded.is_empty(), "{COLLAPSED_AGAIN}");
+    }
+
+    #[test]
+    fn the_session_view_breaks_spend_down_by_purpose() {
+        let model = test_model();
+        let by_model = HashMap::from([(model.spec(), stored(Some(RECORDED_COST)))]);
+        let by_purpose = HashMap::from([
+            (CHAT_PURPOSE.to_owned(), stored(Some(RECORDED_COST))),
+            (
+                GOAL_PURPOSE.to_owned(),
+                StoredTokenUsage {
+                    input: ONE_MILLION / 2,
+                    subscription_cost: Some(SUBSCRIPTION_COST),
+                    ..StoredTokenUsage::default()
+                },
+            ),
+        ]);
+        let ctx = UsageModalContext {
+            total: &TokenUsage::default(),
+            total_cost: None,
+            subscription_cost: None,
+            by_model: &by_model,
+            by_purpose: &by_purpose,
+            model: &model,
+            fast: false,
+            clock_format: ClockFormat::Hour24,
+            lifetime: None,
+        };
+        let rows = line_texts(&build_lines(&ctx, None, &crate::theme::current()).0);
+
+        let heading = rows
+            .iter()
+            .position(|row| row.ends_with(PURPOSE_HEADING))
+            .unwrap_or_else(|| panic!("no purpose table: {rows:?}"));
+        assert!(rows[heading + 1].trim_start().starts_with(PURPOSE_COLUMN));
+        assert!(
+            rows[heading + 2].trim_start().starts_with(CHAT_PURPOSE),
+            "{PURPOSE_ORDER}: {rows:?}"
+        );
+        assert!(rows[heading + 2].ends_with(RECORDED_TEXT), "{rows:?}");
+        assert!(
+            rows[heading + 3].trim_start().starts_with(GOAL_PURPOSE),
+            "{PURPOSE_ORDER}: {rows:?}"
+        );
+        assert!(
+            rows[heading + 3].ends_with(&format!("{NOT_BILLED_MARK}{SUBSCRIPTION_TEXT}")),
+            "{rows:?}"
+        );
+    }
+
+    #[test_case(Some(RECORDED_COST), None, Some(RECORDED_COST), Billing::Api ; "billed")]
+    #[test_case(None, Some(SUBSCRIPTION_COST), Some(SUBSCRIPTION_COST), Billing::Subscription ; "covered")]
+    #[test_case(Some(RECORDED_COST), Some(SUBSCRIPTION_COST), Some(RECORDED_COST + SUBSCRIPTION_COST), Billing::Api ; "mixed_is_a_bill")]
+    #[test_case(None, None, None, Billing::Api ; "unpriced_stays_unpriced")]
+    fn recorded_spend_adds_both_payers(
+        cost: Option<f64>,
+        subscription_cost: Option<f64>,
+        usd: Option<f64>,
+        billing: Billing,
+    ) {
+        let spend = recorded_spend(&StoredTokenUsage {
+            cost,
+            subscription_cost,
+            ..StoredTokenUsage::default()
+        });
+        assert_eq!((spend.usd, spend.billing), (usd, billing));
     }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
@@ -1737,6 +2126,7 @@ mod tests {
             total_cost,
             subscription_cost,
             by_model,
+            by_purpose: &HashMap::new(),
             model,
             fast: false,
             clock_format: ClockFormat::Hour24,
@@ -1767,12 +2157,14 @@ mod tests {
         }
 
         let rows = modal_rows(&TokenUsage::default(), None, &by_model, &model);
-        let header = format!("{PREFIX}{:<MODEL_COL_MIN$}  {BUCKET_HEADERS}", "model");
+        let header = |column: &str| format!("{PREFIX}{column:<MODEL_COL_MIN$}  {BUCKET_HEADERS}");
         let own_model = format!("{PREFIX}{:<MODEL_COL_MIN$}  {BUCKET_VALUES}", model.id);
         assert!(rows.contains(&own_model), "{rows:?}");
+        assert!(rows.contains(&header(MODEL_COLUMN)), "{rows:?}");
         assert_eq!(
-            rows.iter().filter(|row| **row == header).count(),
-            if include_foreign { 2 } else { 1 },
+            rows.contains(&header(PROVIDER_COLUMN)),
+            include_foreign,
+            "{rows:?}"
         );
         assert_eq!(
             rows.iter().any(|row| row.contains(PROVIDER_HEADING)),
@@ -2045,7 +2437,16 @@ mod tests {
         width: u16,
         by_model: &HashMap<String, StoredTokenUsage>,
     ) -> Buffer {
-        let backend = ratatui::backend::TestBackend::new(width, 30);
+        draw_with(modal, width, by_model, None)
+    }
+
+    fn draw_with(
+        modal: &mut UsageModal,
+        width: u16,
+        by_model: &HashMap<String, StoredTokenUsage>,
+        lifetime: Option<&LifetimeUsage>,
+    ) -> Buffer {
+        let backend = ratatui::backend::TestBackend::new(width, TERMINAL_HEIGHT);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let model = test_model();
         let ctx = UsageModalContext {
@@ -2053,10 +2454,11 @@ mod tests {
             total_cost: None,
             subscription_cost: None,
             by_model,
+            by_purpose: &HashMap::new(),
             model: &model,
             fast: false,
             clock_format: ClockFormat::Hour24,
-            lifetime: None,
+            lifetime,
         };
         terminal
             .draw(|f| {
@@ -2389,7 +2791,7 @@ mod tests {
         expected: Option<Rect>,
     ) {
         let line = aged_note(AGE_LEAD.into(), AGE_PHRASE.into(), Style::new());
-        assert_eq!(refresh_hit(&line, row, area, scroll, pan), expected);
+        assert_eq!(last_span_hit(&line, row, area, scroll, pan), expected);
     }
 
     #[test]

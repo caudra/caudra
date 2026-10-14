@@ -246,6 +246,7 @@ mod tests {
         Role, ThinkingSupport,
     };
     use caudra_storage::thinking::StoredThinking;
+    use caudra_storage::usage_ledger::LedgerPurpose;
     use caudra_workspace::PlanRef;
     use std::collections::HashMap;
     use test_case::test_case;
@@ -333,6 +334,7 @@ mod tests {
         let mut session = session_with_counters();
         session.add_model_usage(
             UNRESOLVABLE_MODEL,
+            LedgerPurpose::Chat,
             session
                 .token_usage
                 .billed(Some(RECORDED_COST), Billing::Api),
