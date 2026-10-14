@@ -455,7 +455,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/goal",
-        description: "Work until a completion condition is met",
+        description: "Work until a completion condition is met (model, log)",
         max_args: usize::MAX,
         scope: ChatScope::MainOnly,
         features: &[],

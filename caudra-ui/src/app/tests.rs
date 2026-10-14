@@ -6,7 +6,7 @@ use crate::app::sandbox::attached_sandbox_instance;
 use crate::app::tasks::{MAIN_TASK_ID, TaskStatus};
 use crate::app::tooltip::ChordTopic;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
-use crate::components::autopilot_panel::PanelTab;
+use crate::components::audit_log::PanelTab;
 use crate::components::changelog_modal::fixture as changelog_fixture;
 use crate::components::command::{BUILTIN_COMMANDS, CommandPalette, ParsedCommand};
 use crate::components::context_modal::{
@@ -15,7 +15,7 @@ use crate::components::context_modal::{
 use crate::components::docs_modal::fixture as docs_fixture;
 use crate::components::env_modal::PATTERN_KEY as ENV_PATTERN_KEY;
 use crate::components::file_walk::UNREADABLE_DIR_MSG;
-use crate::components::goal_modal::GoalTarget;
+use crate::components::goal_panel::{FooterCommand, GOAL_CLEAR, GOAL_MODEL, PanelCommand};
 use crate::components::help_modal::HelpTarget;
 use crate::components::input::ChordHint;
 use crate::components::key_freshness::QUIET_GAP;
@@ -95,6 +95,7 @@ use caudra_providers::{
 };
 use caudra_storage::StateClass;
 use caudra_storage::changelog;
+use caudra_storage::goal_log::GoalEvaluationOutcome;
 use caudra_storage::id::CaudraId;
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::permission_patterns::{
@@ -9945,13 +9946,13 @@ fn clicking_the_spend_figure_in_a_task_opens_usage() {
 }
 
 #[test]
-fn clicking_the_goal_chip_opens_the_goal_modal() {
+fn clicking_the_goal_chip_opens_the_goal_panel() {
     let mut app = test_app();
     app.state.goal.set(GOAL_CONDITION).unwrap();
 
     assert!(click_status(&mut app, StatusBarHitTarget::Goal).is_empty());
 
-    assert!(app.goal_modal.is_open());
+    assert!(app.goal_panel.is_open());
 }
 
 #[test_case(false, false; "main")]
@@ -10010,10 +10011,10 @@ fn activity_task_hits_clear_on_resize_and_completion_but_composer_hint_remains()
 }
 
 #[test]
-fn goal_modal_adjusts_the_session_continuation_limit() {
+fn goal_panel_adjusts_the_session_continuation_limit() {
     let mut app = test_app();
     let initial = app.state.goal.continuation_limit();
-    app.goal_modal.open();
+    open_goal_panel(&mut app);
 
     app.update(Msg::Key(key(KeyCode::Right)));
 
@@ -10021,7 +10022,7 @@ fn goal_modal_adjusts_the_session_continuation_limit() {
 }
 
 #[test]
-fn opening_the_goal_modal_clears_footer_hover() {
+fn opening_the_goal_panel_clears_footer_hover() {
     let mut app = test_app();
     app.state.goal.set(GOAL_CONDITION).unwrap();
     let hit = status_hit(&mut app, StatusBarHitTarget::Goal);
@@ -10030,7 +10031,7 @@ fn opening_the_goal_modal_clears_footer_hover() {
 
     click_status(&mut app, StatusBarHitTarget::Goal);
 
-    assert!(app.goal_modal.is_open());
+    assert!(app.goal_panel.is_open());
     assert_eq!(app.status_hover, None);
 }
 
@@ -12992,9 +12993,9 @@ fn goal_clear_registered_command_stops_active_goal() {
 #[test]
 fn goal_without_arguments_opens_status_modal() {
     let mut app = test_app();
-    assert!(!app.goal_modal.is_open());
+    assert!(!app.goal_panel.is_open());
     assert!(app.run_cmdline("/goal", 0).unwrap().is_empty());
-    assert!(app.goal_modal.is_open());
+    assert!(app.goal_panel.is_open());
 }
 
 #[test]
@@ -13042,10 +13043,15 @@ fn goal_evaluation_is_billed_to_its_own_provider_and_purpose() {
     app.run_id = 1;
 
     app.update(agent_msg(AgentEvent::GoalEvaluation {
+        seq: 1,
+        goal: 1,
+        started_at_ms: 0,
+        at_ms: 0,
         verdict: GoalVerdict::NotMet,
         reason: GOAL_REASON.into(),
         evaluation: 1,
         applied: true,
+        outcome: GoalEvaluationOutcome::Applied,
         usage: TokenUsage {
             input: GOAL_INPUT,
             output: GOAL_OUTPUT,
@@ -13363,6 +13369,8 @@ fn active_goal_round_trips_through_session_metadata() {
 fn a_resumed_active_goal_keeps_its_spend_evaluations_and_clock() {
     let mut app = test_app();
     app.state.session_mut().meta.active_goal = Some(Box::new(StoredActiveGoal {
+        goal: 1,
+        set_at_ms: 0,
         condition: GOAL_CONDITION.into(),
         evaluations: GOAL_EVALUATIONS,
         elapsed_ms: GOAL_ELAPSED_MS,
@@ -13494,6 +13502,8 @@ fn new_session_clears_goal_and_restores_the_default_continuation_limit() {
 fn completed_goal_round_trips_through_session_metadata() {
     let mut app = test_app();
     app.state.goal.restore_finished(GoalResult {
+        goal: 1,
+        set_at_ms: 0,
         condition: Arc::from("persist result"),
         verdict: GoalVerdict::Met,
         reason: Arc::from("verified"),
@@ -14094,12 +14104,11 @@ fn context_footer_click_switches_views() {
     );
 }
 
-const GOAL_MODEL_COMMAND: &str = "/goal-model";
-const GOAL_CLEAR_COMMAND: &str = "/goal-clear";
-
 fn click_goal_footer(app: &mut App, command: &'static str) -> Vec<Action> {
     let _ = rendered(app);
-    let hit = app.goal_modal.footer_hit(GoalTarget::Command(command));
+    let hit = app
+        .goal_panel
+        .footer_hit(FooterCommand::Panel(PanelCommand::Run(command)));
     assert!(!hit.is_empty(), "command={command}");
     app.update(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
@@ -14120,12 +14129,12 @@ fn click_goal_footer(app: &mut App, command: &'static str) -> Vec<Action> {
 fn goal_footer_click_opens_the_model_picker() {
     let mut app = test_app();
     app.state.goal.set(GOAL_CONDITION).unwrap();
-    app.goal_modal.open();
+    open_goal_panel(&mut app);
 
-    let actions = click_goal_footer(&mut app, GOAL_MODEL_COMMAND);
+    let actions = click_goal_footer(&mut app, GOAL_MODEL);
 
     assert!(app.model_picker.is_open());
-    assert!(!app.goal_modal.is_open());
+    assert!(!app.goal_panel.is_open());
     assert!(matches!(&actions[..], [Action::RefreshModels]));
 }
 
@@ -14133,13 +14142,13 @@ fn goal_footer_click_opens_the_model_picker() {
 fn goal_footer_click_clears_the_goal() {
     let mut app = test_app();
     app.state.goal.set(GOAL_CONDITION).unwrap();
-    app.goal_modal.open();
+    open_goal_panel(&mut app);
 
-    let actions = click_goal_footer(&mut app, GOAL_CLEAR_COMMAND);
+    let actions = click_goal_footer(&mut app, GOAL_CLEAR);
 
     assert!(actions.is_empty());
     assert!(app.state.goal.snapshot().is_none());
-    assert!(!app.goal_modal.is_open());
+    assert!(!app.goal_panel.is_open());
     assert_eq!(
         app.status_bar.flash_text(),
         Some(format!("Goal cleared: {GOAL_CONDITION}").as_str())
@@ -14150,17 +14159,17 @@ fn goal_footer_click_clears_the_goal() {
 #[test]
 fn a_finished_goal_footer_has_no_clear() {
     let mut app = test_app();
-    app.goal_modal.open();
+    open_goal_panel(&mut app);
     let _ = rendered(&mut app);
 
     assert!(
-        app.goal_modal
-            .footer_hit(GoalTarget::Command(GOAL_CLEAR_COMMAND))
+        app.goal_panel
+            .footer_hit(FooterCommand::Panel(PanelCommand::Run(GOAL_CLEAR)))
             .is_empty()
     );
     assert!(
-        !app.goal_modal
-            .footer_hit(GoalTarget::Command(GOAL_MODEL_COMMAND))
+        !app.goal_panel
+            .footer_hit(FooterCommand::Panel(PanelCommand::Run(GOAL_MODEL)))
             .is_empty()
     );
 }
@@ -15852,6 +15861,8 @@ fn fork_copies_execution_settings_but_resets_conversation_state() {
     app.state.session_mut().meta.input_draft = Some("old draft".into());
     app.state.session_mut().meta.queued_messages = vec![stored_queued_prompt("queued")];
     app.state.session_mut().meta.active_goal = Some(Box::new(StoredActiveGoal {
+        goal: 1,
+        set_at_ms: 0,
         condition: GOAL_CONDITION.into(),
         evaluations: 0,
         elapsed_ms: 0,
@@ -18648,8 +18659,8 @@ fn open_projection_modal(app: &mut App) {
     app.execute_command(cmd("/projection"), 0);
 }
 
-fn open_goal_modal(app: &mut App) {
-    app.goal_modal.open();
+fn open_goal_panel(app: &mut App) {
+    app.open_goal_panel(PanelTab::Status);
 }
 
 fn open_autopilot_log(app: &mut App) {
@@ -18687,7 +18698,7 @@ fn open_argument_prompt(app: &mut App) {
 #[test_case(open_storage_modal ; "storage_modal")]
 #[test_case(open_system_prompt_modal ; "system_prompt_modal")]
 #[test_case(open_projection_modal ; "projection_modal")]
-#[test_case(open_goal_modal    ; "goal_modal")]
+#[test_case(open_goal_panel    ; "goal_panel")]
 #[test_case(open_autopilot_log ; "autopilot_panel")]
 #[test_case(open_model_picker  ; "model_picker")]
 #[test_case(open_command_modal ; "command_modal")]
@@ -18722,7 +18733,7 @@ fn a_press_outside_a_modal_dismisses_it(open: fn(&mut App)) {
 #[test_case(open_storage_modal ; "storage_modal")]
 #[test_case(open_system_prompt_modal ; "system_prompt_modal")]
 #[test_case(open_projection_modal ; "projection_modal")]
-#[test_case(open_goal_modal    ; "goal_modal")]
+#[test_case(open_goal_panel    ; "goal_panel")]
 #[test_case(open_autopilot_log ; "autopilot_panel")]
 #[test_case(open_model_picker  ; "model_picker")]
 #[test_case(open_command_modal ; "command_modal")]
@@ -21451,7 +21462,7 @@ fn associated_text_edits_the_paste_editor_not_the_composer() {
 }
 
 #[test_case(open_help_modal; "help")]
-#[test_case(open_goal_modal; "goal")]
+#[test_case(open_goal_panel; "goal")]
 #[test_case(open_context_modal; "context")]
 #[test_case(open_model_picker; "model_filter")]
 #[test_case(open_command_modal; "command_filter")]
@@ -21524,7 +21535,7 @@ fn associated_altgr_characters_do_not_run_selection_shortcuts() {
     assert!(app.question_form.is_open());
     assert!(app.input_box.is_empty());
     app.question_form.close();
-    open_goal_modal(&mut app);
+    open_goal_panel(&mut app);
     app.update(associated_key(
         KeyEvent::new(
             KeyCode::Char('q'),
@@ -21532,7 +21543,7 @@ fn associated_altgr_characters_do_not_run_selection_shortcuts() {
         ),
         Some("@"),
     ));
-    assert!(app.goal_modal.is_open());
+    assert!(app.goal_panel.is_open());
     assert!(app.input_box.is_empty());
 }
 
@@ -21688,7 +21699,7 @@ fn open_permission_test_leader(app: &mut App) {
 #[test_case(open_storage_modal; "storage")]
 #[test_case(open_system_prompt_modal; "system_prompt")]
 #[test_case(open_projection_modal; "projection")]
-#[test_case(open_goal_modal; "goal")]
+#[test_case(open_goal_panel; "goal")]
 #[test_case(open_model_picker; "model_picker")]
 #[test_case(open_command_modal; "command_modal")]
 #[test_case(open_relocation_picker; "relocation_picker")]
@@ -25872,7 +25883,7 @@ mod autopilot {
     };
     use caudra_agent::permissions::{AutopilotNote, PermissionRequest};
     use caudra_agent::types::{Answerer, AutopilotEvent};
-    use caudra_agent::{AgentEvent, AgentMode, DoneReason};
+    use caudra_agent::{AgentEvent, AgentMode, DoneReason, GoalVerdict};
     use caudra_automation::event::{AutopilotView, InputKind, SessionStatus};
     use caudra_automation::snapshot::PauseSource;
     use caudra_config::{AutopilotConfig, Feature, FeatureFlags, ToolKey};
@@ -25881,6 +25892,7 @@ mod autopilot {
         AutopilotBudget, AutopilotEnd, AutopilotStopper, StoredAutopilotDecision,
         StoredAutopilotEngagement,
     };
+    use caudra_storage::goal_log::GoalEvaluationOutcome;
     use caudra_storage::sessions::SessionDatabase;
     use caudra_storage::usage_ledger::LedgerPurpose;
     use crossterm::event::{KeyCode, KeyEvent};
@@ -25890,6 +25902,7 @@ mod autopilot {
         LinkedAutomations, cancel_the_question, press_ctrl_c_during_a_run,
         press_esc_twice_during_a_run, start_a_run,
     };
+    use super::goal_log::{EVALUATION as GOAL_EVALUATION, check as goal_check};
     use super::{
         App, BlockKind, Msg, Notification, PaneState, PaneStatus, PlanState, Status, agent_msg,
         btw_ready_app, build_app, cancel_app, click_status, done_event, drain_writer, key,
@@ -25900,14 +25913,15 @@ mod autopilot {
     use crate::app::Mode;
     use crate::app::automation::InputWait;
     use crate::app::autopilot::{
-        ENDED_ROW, ENGAGED_ROW, NOT_ENGAGED_MSG, PLAN_LEFT_TO_YOU, ROW_NOT_LOADED, decision_body,
-        ended_row,
+        ENDED_ROW, ENGAGED_ROW, NOT_ENGAGED_MSG, PLAN_LEFT_TO_YOU, decision_body, ended_row,
     };
+    use crate::components::audit_log::{PanelTab, ROW_NOT_LOADED};
     use crate::components::autopilot_panel::{
         ANSWERED_TAG, CANCELLED_TAG, DENIED_UNATTENDED_TAG, ENGAGED_STATE, ENGAGEMENT_HEADER,
-        ERROR_END, HUMAN_FIRST_TAG, MODEL_KEY, NO_ENTRIES, PanelTab, REASON_SEPARATOR, STOP_KEY,
-        STOPPED, SUPERSEDED_TAG, TAKEN_OVER_TAG, WAITING_STATE, end_reason,
+        ERROR_END, HUMAN_FIRST_TAG, MODEL_KEY, NO_ENTRIES, REASON_SEPARATOR, STOP_KEY, STOPPED,
+        SUPERSEDED_TAG, TAKEN_OVER_TAG, WAITING_STATE, end_reason,
     };
+    use crate::components::goal_panel::not_met_row;
     use crate::components::keybindings::key as kb;
     use crate::components::status_bar::StatusBarHitTarget;
     use crate::components::{Action, DisplayMessage, DisplayRole, Overlay};
@@ -25979,6 +25993,7 @@ mod autopilot {
     const LATER_SEQ: u32 = 1;
     const STOOD_DOWN_SEQ: u32 = 2;
     const SECOND_ENGAGEMENT: u32 = 2;
+    const GOAL_CHECK_SEQ: u64 = 1;
     const RETITLED_ONCE: &str = "a settled decision keeps its one row, retitled";
     const LOGGED_WITHOUT_ACTION: &str = "a decision autopilot stood down from is logged as such";
     const SETTLED_BY_THE_USER: &str = "the user's answer to an escalated plan settles it";
@@ -27041,7 +27056,7 @@ mod autopilot {
     }
 
     /// A row by its text, a decision row by its title.
-    fn transcript(app: &App) -> Vec<String> {
+    pub(super) fn transcript(app: &App) -> Vec<String> {
         let chat = &app.chats[0];
         (0..chat.message_count())
             .filter_map(|index| chat.message_at(index))
@@ -27116,6 +27131,56 @@ mod autopilot {
             vec![FIRST_PROMPT.to_owned(), SECOND_PROMPT.to_owned()]
         };
         assert_eq!(transcript(&restored), expected, "{LOG_PLACEMENT}");
+    }
+
+    /// A goal check made after a decision at the same history length draws
+    /// after it.
+    #[test]
+    fn goal_rows_restore_among_the_autopilot_rows() {
+        let (_tmp, dir, writer, mut app) = tempdir_app();
+        app.state
+            .session_mut()
+            .replace_messages(crate::history_items(&[
+                Message::user(FIRST_PROMPT.into()),
+                Message::user(SECOND_PROMPT.into()),
+            ]));
+        app.checkpoint_now();
+        let id = app.state.session.id;
+        drain_writer(app, writer);
+        let decision = stored_decision(SEQ, AUTOPILOT_ENGAGEMENT, 1);
+        let checked = goal_check(
+            GOAL_CHECK_SEQ,
+            Some(GoalVerdict::NotMet),
+            GoalEvaluationOutcome::Applied,
+            1,
+            decision.at_ms + 1,
+        );
+        let database = SessionDatabase::open(&dir).unwrap();
+        database.insert_autopilot_decision(id, &decision).unwrap();
+        database.insert_goal_evaluation(id, &checked).unwrap();
+        drop(database);
+
+        let mut restored = build_app(dir.clone(), Arc::new(test_writer(dir.clone())));
+        restored.features = autopilot_features(true);
+        restored
+            .apply_loaded_session(AppSession::load(id, &dir).unwrap(), &test_model())
+            .unwrap();
+
+        let title = decision_body(&decision)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        assert_eq!(
+            transcript(&restored),
+            [
+                FIRST_PROMPT.to_owned(),
+                title,
+                not_met_row(GOAL_EVALUATION, &checked.reason),
+                SECOND_PROMPT.to_owned(),
+            ],
+            "{LOG_PLACEMENT}"
+        );
     }
 
     #[test]
@@ -27303,6 +27368,353 @@ mod autopilot {
     }
 }
 
+mod goal_log {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use caudra_agent::{AgentEvent, GoalResult, GoalVerdict};
+    use caudra_providers::{Billing, Message, TokenUsage};
+    use caudra_storage::goal_log::{
+        GoalEnd, GoalEvaluationOutcome, GoalLogWrite, StoredGoalEvaluation, StoredGoalRecord,
+    };
+    use caudra_storage::sessions::{SessionDatabase, StoredTokenUsage};
+    use crossterm::event::KeyCode;
+
+    use super::autopilot::transcript;
+    use super::{
+        App, GOAL_CONDITION, GOAL_REASON, Msg, Status, agent_msg, build_app, drain_writer, key,
+        rendered_wide, tempdir_app, test_app, test_model, test_writer,
+    };
+    use crate::AppSession;
+    use crate::components::audit_log::{PanelTab, ROW_NOT_LOADED};
+    use crate::components::goal_panel::{
+        NO_GOAL_LOG, cleared_after_error_row, finished_row, not_met_row,
+    };
+    use crate::components::{DisplayMessage, DisplayRole, GoalTone, Overlay};
+    use crate::repaint::Dirty;
+
+    const GOAL_LOG: &str = "/goal log";
+    const OTHER_CONDITION: &str = "the docs build cleanly";
+    const EVALUATOR: &str = "test/evaluator";
+    const CLEAR_ERROR: &str = "provider unavailable";
+    const FIRST_PROMPT: &str = "fix the flaky test";
+    const SECOND_PROMPT: &str = "now the docs";
+    const GOAL: u32 = 1;
+    const OTHER_GOAL: u32 = 2;
+    pub(super) const EVALUATION: u32 = 1;
+    const CHECK_SEQ: u64 = 1;
+    const STALE_SEQ: u64 = 2;
+    const MET_SEQ: u64 = 3;
+    const EARLIER_MS: u64 = 1_000;
+    const LATER_MS: u64 = 2_000;
+    /// The run `agent_msg` sends under.
+    const RUN_ID: u64 = 1;
+    /// Wide enough that the Log shows its list and detail side by side.
+    const LOG_WIDTH: u16 = 160;
+    /// Enough rows after a check to scroll it out of a frame.
+    const TRANSCRIPT_ROWS: usize = 60;
+    const NOT_A_CONDITION: &str = "`/goal log` must never be taken as a condition";
+    const DRAINED: &str = "opening the log drains the goal's journal first";
+    const ROW_PLACEMENT: &str = "restored goal rows sit where the session drew them";
+
+    pub(super) fn check(
+        seq: u64,
+        verdict: Option<GoalVerdict>,
+        outcome: GoalEvaluationOutcome,
+        history_len: usize,
+        at_ms: u64,
+    ) -> StoredGoalEvaluation {
+        StoredGoalEvaluation {
+            seq,
+            goal: GOAL,
+            evaluation: EVALUATION,
+            started_at_ms: at_ms,
+            at_ms,
+            history_len,
+            verdict: verdict.map(|verdict| verdict.to_string()),
+            reason: GOAL_REASON.into(),
+            outcome,
+            model: Some(EVALUATOR.into()),
+            usage: None,
+            cost: None,
+        }
+    }
+
+    fn cleared_after_error(goal: u32, ended_history_len: usize) -> StoredGoalRecord {
+        StoredGoalRecord {
+            goal,
+            condition: GOAL_CONDITION.into(),
+            set_at_ms: EARLIER_MS,
+            set_history_len: 0,
+            ended_at_ms: Some(LATER_MS),
+            ended_history_len: Some(ended_history_len),
+            end: Some(GoalEnd::Error {
+                message: CLEAR_ERROR.into(),
+            }),
+            evaluations: EVALUATION,
+            elapsed_ms: 0,
+            usage: StoredTokenUsage::default(),
+            cost_usd: 0.0,
+            subscription_cost_usd: 0.0,
+        }
+    }
+
+    fn verdict(seq: u64, verdict: GoalVerdict) -> Msg {
+        agent_msg(AgentEvent::GoalEvaluation {
+            seq,
+            goal: GOAL,
+            started_at_ms: 0,
+            at_ms: 0,
+            verdict,
+            reason: GOAL_REASON.into(),
+            evaluation: EVALUATION,
+            applied: true,
+            outcome: GoalEvaluationOutcome::Applied,
+            usage: TokenUsage::default(),
+            cost: None,
+            billing: Billing::Api,
+            model: EVALUATOR.into(),
+        })
+    }
+
+    fn met() -> GoalResult {
+        GoalResult {
+            goal: GOAL,
+            set_at_ms: 0,
+            condition: Arc::from(GOAL_CONDITION),
+            verdict: GoalVerdict::Met,
+            reason: Arc::from(GOAL_REASON),
+            evaluations: EVALUATION,
+            duration: Duration::ZERO,
+            usage: TokenUsage::default(),
+            cost: None,
+            subscription_cost: None,
+        }
+    }
+
+    fn running_goal() -> App {
+        let mut app = test_app();
+        app.state.goal.set(GOAL_CONDITION).unwrap();
+        app.status = Status::Streaming;
+        app.run_id = RUN_ID;
+        app
+    }
+
+    /// The Log, read from the session's log and drawn wide.
+    fn open_log(app: &mut App) -> String {
+        app.run_cmdline(GOAL_LOG, 0).unwrap();
+        app.goal_panel.finish_loading();
+        rendered_wide(app, LOG_WIDTH)
+    }
+
+    fn last_role(app: &App) -> Option<DisplayRole> {
+        let chat = &app.chats[0];
+        chat.message_at(chat.message_count().checked_sub(1)?)
+            .map(|message| message.role.clone())
+    }
+
+    fn record(app: &App, evaluation: StoredGoalEvaluation) {
+        app.storage_writer.record_goal_log(
+            app.state.session.id,
+            GoalLogWrite::Evaluated(Box::new(evaluation)),
+        );
+    }
+
+    #[test]
+    fn goal_log_before_any_goal_says_there_is_none() {
+        let mut app = test_app();
+
+        app.run_cmdline(GOAL_LOG, 0).unwrap();
+
+        assert!(!app.goal_panel.is_open());
+        assert!(app.state.goal.snapshot().is_none(), "{NOT_A_CONDITION}");
+        assert_eq!(app.status_bar.flash_text(), Some(NO_GOAL_LOG));
+    }
+
+    #[test]
+    fn goal_log_opens_on_the_log_with_the_goal_listed() {
+        let mut app = test_app();
+        app.state.goal.set(GOAL_CONDITION).unwrap();
+
+        let shown = open_log(&mut app);
+
+        assert_eq!(app.goal_panel.tab(), PanelTab::Log);
+        assert!(!app.state.goal.has_unlogged(), "{DRAINED}");
+        assert!(shown.contains(GOAL_CONDITION), "{shown}");
+        assert_eq!(
+            app.state.goal.active_condition().as_deref(),
+            Some(GOAL_CONDITION),
+            "{NOT_A_CONDITION}"
+        );
+    }
+
+    #[test]
+    fn a_goal_set_while_the_log_is_open_lands_in_it() {
+        let mut app = test_app();
+        app.state.goal.set(GOAL_CONDITION).unwrap();
+        let before = open_log(&mut app);
+        assert!(!before.contains(OTHER_CONDITION), "{before}");
+
+        app.state.goal.set(OTHER_CONDITION).unwrap();
+        assert_eq!(app.poll_goal_log(), Dirty::YES);
+        let shown = rendered_wide(&mut app, LOG_WIDTH);
+
+        assert!(shown.contains(OTHER_CONDITION), "{shown}");
+    }
+
+    #[test]
+    fn a_not_met_verdict_draws_a_row_under_its_check() {
+        let mut app = running_goal();
+
+        app.update(verdict(CHECK_SEQ, GoalVerdict::NotMet));
+
+        assert_eq!(
+            last_role(&app),
+            Some(DisplayRole::GoalEvaluation(CHECK_SEQ, GoalTone::Notice))
+        );
+        assert_eq!(
+            app.main_chat().last_message_text(),
+            not_met_row(EVALUATION, GOAL_REASON)
+        );
+    }
+
+    #[test]
+    fn a_goals_end_by_verdict_draws_its_row_under_the_deciding_check() {
+        let mut app = running_goal();
+        let (tone, text) = finished_row(GoalVerdict::Met, GOAL_REASON);
+
+        app.update(verdict(MET_SEQ, GoalVerdict::Met));
+        app.update(agent_msg(AgentEvent::GoalFinished {
+            result: met(),
+            autopilot_owned: false,
+        }));
+
+        assert_eq!(
+            last_role(&app),
+            Some(DisplayRole::GoalEvaluation(MET_SEQ, tone))
+        );
+        assert_eq!(app.main_chat().last_message_text(), text);
+    }
+
+    #[test]
+    fn enter_closes_the_log_on_the_checks_row() {
+        let mut app = running_goal();
+        app.update(verdict(CHECK_SEQ, GoalVerdict::NotMet));
+        record(
+            &app,
+            check(
+                CHECK_SEQ,
+                Some(GoalVerdict::NotMet),
+                GoalEvaluationOutcome::Applied,
+                0,
+                EARLIER_MS,
+            ),
+        );
+        for line in 0..TRANSCRIPT_ROWS {
+            app.main_chat()
+                .push(DisplayMessage::new(DisplayRole::User, line.to_string()));
+        }
+        app.status = Status::Idle;
+        open_log(&mut app);
+
+        app.update(Msg::Key(key(KeyCode::Enter)));
+
+        assert!(!app.goal_panel.is_open());
+        assert!(!app.chats[0].auto_scroll());
+    }
+
+    #[test]
+    fn enter_on_a_check_that_drew_no_row_keeps_the_log_up() {
+        let mut app = test_app();
+        app.state.goal.set(GOAL_CONDITION).unwrap();
+        record(
+            &app,
+            check(
+                STALE_SEQ,
+                Some(GoalVerdict::Met),
+                GoalEvaluationOutcome::Stale,
+                0,
+                EARLIER_MS,
+            ),
+        );
+        open_log(&mut app);
+
+        app.update(Msg::Key(key(KeyCode::Enter)));
+
+        assert!(app.goal_panel.is_open());
+        assert_eq!(app.status_bar.flash_text(), Some(ROW_NOT_LOADED));
+    }
+
+    /// Goal 1 is checked over the first prompt and cleared by an error, and
+    /// goal 2 is checked over the second, once too late and once met.
+    #[test]
+    fn the_goal_rows_are_restored_where_they_were_drawn() {
+        let (_tmp, dir, writer, mut app) = tempdir_app();
+        app.state
+            .session_mut()
+            .replace_messages(crate::history_items(&[
+                Message::user(FIRST_PROMPT.into()),
+                Message::user(SECOND_PROMPT.into()),
+            ]));
+        app.checkpoint_now();
+        let id = app.state.session.id;
+        drain_writer(app, writer);
+        let database = SessionDatabase::open(&dir).unwrap();
+        database
+            .begin_goal(id, &cleared_after_error(GOAL, 1))
+            .unwrap();
+        let later_goal = |seq, verdict, outcome, at_ms| StoredGoalEvaluation {
+            goal: OTHER_GOAL,
+            ..check(seq, verdict, outcome, 2, at_ms)
+        };
+        for evaluation in [
+            check(
+                CHECK_SEQ,
+                Some(GoalVerdict::NotMet),
+                GoalEvaluationOutcome::Applied,
+                1,
+                EARLIER_MS,
+            ),
+            later_goal(
+                STALE_SEQ,
+                Some(GoalVerdict::Met),
+                GoalEvaluationOutcome::Stale,
+                EARLIER_MS,
+            ),
+            later_goal(
+                MET_SEQ,
+                Some(GoalVerdict::Met),
+                GoalEvaluationOutcome::Applied,
+                LATER_MS,
+            ),
+        ] {
+            database.insert_goal_evaluation(id, &evaluation).unwrap();
+        }
+        drop(database);
+
+        let mut restored = build_app(dir.clone(), Arc::new(test_writer(dir.clone())));
+        restored
+            .apply_loaded_session(AppSession::load(id, &dir).unwrap(), &test_model())
+            .unwrap();
+
+        assert_eq!(
+            transcript(&restored),
+            [
+                FIRST_PROMPT.to_owned(),
+                not_met_row(EVALUATION, GOAL_REASON),
+                cleared_after_error_row(GOAL_CONDITION, CLEAR_ERROR),
+                SECOND_PROMPT.to_owned(),
+                finished_row(GoalVerdict::Met, GOAL_REASON).1,
+            ],
+            "{ROW_PLACEMENT}"
+        );
+        assert!(
+            restored.chats[0].goal_evaluation_row(CHECK_SEQ).is_some(),
+            "{ROW_PLACEMENT}"
+        );
+    }
+}
+
 mod engine_decisions {
     use caudra_agent::AgentEvent;
     use caudra_agent::decisions::{DecisionFeature, DecisionNote, NoteAnchor, NoteOutcome};
@@ -27481,7 +27893,7 @@ mod theme_colours {
         StatusBarHitTarget, StreamEvent, StreamFooter, TRANSCRIPT_LINES, chord, click_status, cmd,
         commit_popup_at, fill_transcript, mention_popup_at, open_autopilot_log,
         open_changelog_modal, open_command_modal, open_context_modal, open_decisions_modal,
-        open_docs_modal, open_goal_modal, open_help_modal, open_logs_modal, open_model_picker,
+        open_docs_modal, open_goal_panel, open_help_modal, open_logs_modal, open_model_picker,
         open_permission_test_editor, open_permission_test_leader, open_projection_modal,
         open_question, open_queue_menu, open_relocation_picker, open_repeat_test_session_picker,
         open_search, open_server_address, open_server_form, open_skills_modal, open_storage_modal,
@@ -27685,9 +28097,9 @@ mod theme_colours {
             shown: |app| app.projection_modal.is_open(),
         },
         Surface {
-            name: "goal_modal",
-            open: |app, _| open_goal_modal(app),
-            shown: |app| app.goal_modal.is_open(),
+            name: "goal_panel",
+            open: |app, _| open_goal_panel(app),
+            shown: |app| app.goal_panel.is_open(),
         },
         Surface {
             name: "autopilot_panel",

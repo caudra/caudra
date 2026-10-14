@@ -11,17 +11,19 @@ use caudra_config::ClockFormat;
 use caudra_storage::autopilot::{
     DecisionOutcome, StoredAutopilotDecision, StoredAutopilotEngagement,
 };
-use jiff::Timestamp;
-use jiff::tz::TimeZone;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use super::text::{
     AGENT_LABEL, DELEGATE_LABEL, LEFT_TO_YOU_TAG, OUTCOME_LABEL, REASON_SEPARATOR, agent_name,
-    counted, decision_title, delegate_spend, end_reason, is_escalation, kind_words,
-    outcome_sentence, outcome_tag, payload_lines,
+    decision_title, delegate_spend, end_reason, is_escalation, kind_words, outcome_sentence,
+    outcome_tag, payload_lines,
 };
 use crate::clock::{hm, hms};
+use crate::components::audit_log::{
+    AuditLog, DATE_FORMAT, EntryFilter, LogRow, counted, field, hint, local_time, section,
+    text_lines,
+};
 use crate::components::escape_terminal_controls;
 use crate::storage_writer::AutopilotWrite;
 use crate::theme::Theme;
@@ -47,12 +49,13 @@ const TIME_LABEL: &str = "Time";
 const ENGAGEMENT_LABEL: &str = "Engagement";
 const SUBJECT_LABEL: &str = "Subject";
 const TRANSCRIPT_LABEL: &str = "Transcript";
-const DATE_FORMAT: &str = "%Y-%m-%d ";
-const INDENT: &str = "  ";
-const LABEL_COLS: usize = 12;
 const WORD_GAP: &str = " ";
 const ALL_FILTER: &str = "All";
 const LEFT_TO_YOU_FILTER: &str = "Left to you";
+const TITLE: &str = " Autopilot ";
+const SCOPE: &str = "autopilot_panel";
+pub(crate) const READING_LOG: &str = "Reading the autopilot log\u{2026}";
+pub(crate) const NO_ENTRIES: &str = "No autopilot log for this session yet";
 
 /// A session's log as read when the panel opened, kept up to date with what
 /// the session writes to it while the panel stays open.
@@ -62,22 +65,10 @@ pub(crate) struct AutopilotLog {
     engagements: Vec<StoredAutopilotEngagement>,
 }
 
-/// One row of the list: a group's header, or a decision by its place in the
-/// log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum LogRow {
-    /// `decisions` counts the whole group, whatever the filter lists.
-    Header {
-        group: Group,
-        decisions: usize,
-    },
-    Entry(usize),
-}
-
 /// Ordered so the newest engagement sorts last, and the rows stored before
 /// decisions named their engagement first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum Group {
+pub(crate) enum Group {
     Earlier,
     Engagement(u32),
 }
@@ -92,9 +83,9 @@ pub(crate) enum LogFilter {
     Kind(DecisionKind),
 }
 
-impl LogFilter {
+impl EntryFilter for LogFilter {
     /// All, Left to you, then each kind in [`DecisionKind::ALL`] order.
-    pub(super) fn next(self) -> Self {
+    fn next(self) -> Self {
         let kinds = DecisionKind::ALL;
         match self {
             Self::All => Self::LeftToYou,
@@ -107,7 +98,7 @@ impl LogFilter {
         }
     }
 
-    pub(super) fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             Self::All => ALL_FILTER,
             Self::LeftToYou => LEFT_TO_YOU_FILTER,
@@ -119,7 +110,9 @@ impl LogFilter {
             Self::Kind(DecisionKind::SecondOpinion) => "Second opinion",
         }
     }
+}
 
+impl LogFilter {
     fn admits(self, decision: &StoredAutopilotDecision) -> bool {
         match self {
             Self::All => true,
@@ -151,10 +144,26 @@ impl AutopilotLog {
         }
     }
 
-    /// Takes in what the session wrote, as the database does: a decision
-    /// replaces the one with its seq, and an end lands only on an engagement
-    /// the log holds.
-    pub(super) fn apply(&mut self, write: &AutopilotWrite) {
+    fn engagement_mut(&mut self, number: u32) -> Option<&mut StoredAutopilotEngagement> {
+        self.engagements
+            .iter_mut()
+            .find(|kept| kept.engagement == number)
+    }
+}
+
+impl AuditLog for AutopilotLog {
+    type Write = AutopilotWrite;
+    type Entry = StoredAutopilotDecision;
+    type Filter = LogFilter;
+    type Group = Group;
+    const TITLE: &'static str = TITLE;
+    const SCOPE: &'static str = SCOPE;
+    const READING: &'static str = READING_LOG;
+    const EMPTY: &'static str = NO_ENTRIES;
+
+    /// A decision replaces the one with its seq, and an end lands only on an
+    /// engagement the log holds.
+    fn apply(&mut self, write: &AutopilotWrite) {
         match write {
             AutopilotWrite::Decision(decision) => {
                 match self
@@ -193,25 +202,23 @@ impl AutopilotLog {
         }
     }
 
-    fn engagement_mut(&mut self, number: u32) -> Option<&mut StoredAutopilotEngagement> {
-        self.engagements
-            .iter_mut()
-            .find(|kept| kept.engagement == number)
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.decisions.is_empty() && self.engagements.is_empty()
     }
 
-    pub(super) fn decision(&self, index: usize) -> Option<&StoredAutopilotDecision> {
+    fn entry(&self, index: usize) -> Option<&StoredAutopilotDecision> {
         self.decisions.get(index)
+    }
+
+    fn seq(decision: &StoredAutopilotDecision) -> u64 {
+        decision.seq
     }
 
     /// The list under `filter`: newest engagement first and its newest
     /// decision first, with the decisions stored before engagements were
     /// numbered last. Unfiltered, an engagement that decided nothing still
     /// has its header; filtered, a group with nothing to list has none.
-    pub(super) fn rows(&self, filter: LogFilter) -> Vec<LogRow> {
+    fn rows(&self, filter: LogFilter) -> Vec<LogRow<Group>> {
         let mut groups: BTreeMap<Group, (usize, Vec<usize>)> = BTreeMap::new();
         if filter == LogFilter::All {
             for engagement in &self.engagements {
@@ -234,9 +241,9 @@ impl AutopilotLog {
             .into_iter()
             .rev()
             .filter(|(_, (_, listed))| filter == LogFilter::All || !listed.is_empty())
-            .flat_map(|(group, (decisions, mut listed))| {
+            .flat_map(|(group, (entries, mut listed))| {
                 listed.sort_by_key(|index| Reverse(self.decisions[*index].seq));
-                iter::once(LogRow::Header { group, decisions })
+                iter::once(LogRow::Header { group, entries })
                     .chain(listed.into_iter().map(LogRow::Entry))
             })
             .collect()
@@ -245,7 +252,7 @@ impl AutopilotLog {
     /// A group's header, such as `Engagement 3 · 14:02 to 14:41 · goal met ·
     /// 23 decisions · $0.42`. The one still running reads `engaged since
     /// 14:02`.
-    pub(super) fn header(&self, group: Group, decisions: usize, clock: ClockFormat) -> String {
+    fn header(&self, group: Group, decisions: usize, clock: ClockFormat) -> String {
         let Group::Engagement(number) = group else {
             return EARLIER_DECISIONS.to_owned();
         };
@@ -279,6 +286,149 @@ impl AutopilotLog {
         );
         parts.join(REASON_SEPARATOR)
     }
+
+    /// A list row: `time kind action subject`, then its tag. An escalation reads
+    /// in the colour of what waits on the user.
+    fn entry_spans(
+        decision: &StoredAutopilotDecision,
+        clock: ClockFormat,
+        theme: &Theme,
+    ) -> Vec<Span<'static>> {
+        let style = escalation_style(decision, theme);
+        let mut words = vec![kind_words(&decision.kind)];
+        words.extend(decision.action.clone());
+        if !decision.subject.is_empty() {
+            words.push(escape_terminal_controls(&decision.subject));
+        }
+        let mut spans = vec![
+            Span::styled(
+                format!("{}{WORD_GAP}", local_time(decision.at_ms, hms(clock))),
+                theme.tool_dim,
+            ),
+            Span::styled(words.join(WORD_GAP), style),
+        ];
+        spans.extend(entry_tag(decision).map(|tag| {
+            Span::styled(
+                format!("{REASON_SEPARATOR}{}", escape_terminal_controls(&tag)),
+                theme.tool_dim,
+            )
+        }));
+        spans
+    }
+
+    /// Everything the log keeps about a decision, under its title. A field an
+    /// older row never stored reads [`NOT_RECORDED`].
+    fn entry_detail(
+        &self,
+        decision: &StoredAutopilotDecision,
+        clock: ClockFormat,
+        theme: &Theme,
+    ) -> Vec<Line<'static>> {
+        let old = decision.engagement.is_none();
+        let mut lines = vec![
+            Line::styled(
+                escape_terminal_controls(&decision_title(decision, &decision.subject)),
+                escalation_style(decision, theme).patch(theme.bold),
+            ),
+            Line::default(),
+            field(KIND_LABEL, kind_words(&decision.kind), theme),
+            field(
+                ACTION_LABEL,
+                decision
+                    .action
+                    .clone()
+                    .unwrap_or_else(|| STOOD_DOWN_ACTION.to_owned()),
+                theme,
+            ),
+            field(
+                TIME_LABEL,
+                local_time(decision.at_ms, &format!("{DATE_FORMAT}{}", hms(clock))),
+                theme,
+            ),
+            field(
+                ENGAGEMENT_LABEL,
+                decision
+                    .engagement
+                    .map_or_else(|| NOT_RECORDED.to_owned(), |number| number.to_string()),
+                theme,
+            ),
+            field(
+                SUBJECT_LABEL,
+                match decision.subject.as_str() {
+                    "" => NONE.to_owned(),
+                    subject => escape_terminal_controls(subject),
+                },
+                theme,
+            ),
+        ];
+        section(
+            &mut lines,
+            ASKED_HEADING,
+            decision.item.as_deref().map_or_else(
+                || vec![hint(NOT_RECORDED, theme)],
+                |item| text_lines(item, theme.inline_code),
+            ),
+            theme,
+        );
+        let said = match &decision.payload {
+            Some(payload) => Some(
+                payload_lines(payload)
+                    .iter()
+                    .flat_map(|line| text_lines(line, Style::default()))
+                    .collect(),
+            ),
+            None if old => Some(vec![hint(NOT_RECORDED, theme)]),
+            None => None,
+        };
+        if let Some(said) = said {
+            section(&mut lines, SAID_HEADING, said, theme);
+        }
+        section(
+            &mut lines,
+            REASON_HEADING,
+            match decision.reason.as_str() {
+                "" => vec![hint(NONE, theme)],
+                reason => text_lines(reason, Style::default()),
+            },
+            theme,
+        );
+        section(
+            &mut lines,
+            OUTCOME_LABEL,
+            outcome_sentence(decision).map_or_else(
+                || vec![hint(NOT_RECORDED, theme)],
+                |outcome| text_lines(&outcome, Style::default()),
+            ),
+            theme,
+        );
+        lines.push(Line::default());
+        lines.push(field(
+            AGENT_LABEL,
+            escape_terminal_controls(agent_name(decision)),
+            theme,
+        ));
+        lines.push(field(
+            DELEGATE_LABEL,
+            delegate_spend(decision).map_or_else(
+                || NOT_RECORDED.to_owned(),
+                |spend| escape_terminal_controls(&spend),
+            ),
+            theme,
+        ));
+        lines.push(field(
+            TRANSCRIPT_LABEL,
+            format!(
+                "{TRANSCRIPT_PREFIX} {}",
+                counted(
+                    u64::try_from(decision.history_len).unwrap_or(u64::MAX),
+                    HISTORY_ITEM_WORD,
+                    HISTORY_ITEMS_WORD,
+                )
+            ),
+            theme,
+        ));
+        lines
+    }
 }
 
 /// What a decision was tagged with in the list: what became of it, or that
@@ -291,200 +441,12 @@ pub(super) fn entry_tag(decision: &StoredAutopilotDecision) -> Option<String> {
     }
 }
 
-/// A list row: `time kind action subject`, then its tag. An escalation reads
-/// in the colour of what waits on the user.
-pub(super) fn entry_spans(
-    decision: &StoredAutopilotDecision,
-    clock: ClockFormat,
-    theme: &Theme,
-) -> Vec<Span<'static>> {
-    let style = escalation_style(decision, theme);
-    let mut words = vec![kind_words(&decision.kind)];
-    words.extend(decision.action.clone());
-    if !decision.subject.is_empty() {
-        words.push(escape_terminal_controls(&decision.subject));
-    }
-    let mut spans = vec![
-        Span::styled(
-            format!("{}{WORD_GAP}", local_time(decision.at_ms, hms(clock))),
-            theme.tool_dim,
-        ),
-        Span::styled(words.join(WORD_GAP), style),
-    ];
-    spans.extend(entry_tag(decision).map(|tag| {
-        Span::styled(
-            format!("{REASON_SEPARATOR}{}", escape_terminal_controls(&tag)),
-            theme.tool_dim,
-        )
-    }));
-    spans
-}
-
-/// Everything the log keeps about a decision, under its title. A field an
-/// older row never stored reads [`NOT_RECORDED`].
-pub(super) fn entry_detail(
-    decision: &StoredAutopilotDecision,
-    clock: ClockFormat,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
-    let old = decision.engagement.is_none();
-    let mut lines = vec![
-        Line::styled(
-            escape_terminal_controls(&decision_title(decision, &decision.subject)),
-            escalation_style(decision, theme).patch(theme.bold),
-        ),
-        Line::default(),
-        field(KIND_LABEL, kind_words(&decision.kind), theme),
-        field(
-            ACTION_LABEL,
-            decision
-                .action
-                .clone()
-                .unwrap_or_else(|| STOOD_DOWN_ACTION.to_owned()),
-            theme,
-        ),
-        field(
-            TIME_LABEL,
-            local_time(decision.at_ms, &format!("{DATE_FORMAT}{}", hms(clock))),
-            theme,
-        ),
-        field(
-            ENGAGEMENT_LABEL,
-            decision
-                .engagement
-                .map_or_else(|| NOT_RECORDED.to_owned(), |number| number.to_string()),
-            theme,
-        ),
-        field(
-            SUBJECT_LABEL,
-            match decision.subject.as_str() {
-                "" => NONE.to_owned(),
-                subject => escape_terminal_controls(subject),
-            },
-            theme,
-        ),
-    ];
-    section(
-        &mut lines,
-        ASKED_HEADING,
-        decision.item.as_deref().map_or_else(
-            || vec![hint(NOT_RECORDED, theme)],
-            |item| text_lines(item, theme.inline_code),
-        ),
-        theme,
-    );
-    let said = match &decision.payload {
-        Some(payload) => Some(
-            payload_lines(payload)
-                .iter()
-                .flat_map(|line| text_lines(line, Style::default()))
-                .collect(),
-        ),
-        None if old => Some(vec![hint(NOT_RECORDED, theme)]),
-        None => None,
-    };
-    if let Some(said) = said {
-        section(&mut lines, SAID_HEADING, said, theme);
-    }
-    section(
-        &mut lines,
-        REASON_HEADING,
-        match decision.reason.as_str() {
-            "" => vec![hint(NONE, theme)],
-            reason => text_lines(reason, Style::default()),
-        },
-        theme,
-    );
-    section(
-        &mut lines,
-        OUTCOME_LABEL,
-        outcome_sentence(decision).map_or_else(
-            || vec![hint(NOT_RECORDED, theme)],
-            |outcome| text_lines(&outcome, Style::default()),
-        ),
-        theme,
-    );
-    lines.push(Line::default());
-    lines.push(field(
-        AGENT_LABEL,
-        escape_terminal_controls(agent_name(decision)),
-        theme,
-    ));
-    lines.push(field(
-        DELEGATE_LABEL,
-        delegate_spend(decision).map_or_else(
-            || NOT_RECORDED.to_owned(),
-            |spend| escape_terminal_controls(&spend),
-        ),
-        theme,
-    ));
-    lines.push(field(
-        TRANSCRIPT_LABEL,
-        format!(
-            "{TRANSCRIPT_PREFIX} {}",
-            counted(
-                u64::try_from(decision.history_len).unwrap_or(u64::MAX),
-                HISTORY_ITEM_WORD,
-                HISTORY_ITEMS_WORD,
-            )
-        ),
-        theme,
-    ));
-    lines
-}
-
-pub(super) fn hint(text: &str, theme: &Theme) -> Line<'static> {
-    Line::from(vec![
-        Span::raw(INDENT),
-        Span::styled(text.to_owned(), theme.tool_dim),
-    ])
-}
-
 fn escalation_style(decision: &StoredAutopilotDecision, theme: &Theme) -> Style {
     if is_escalation(decision) {
         theme.todo_in_progress
     } else {
         Style::default()
     }
-}
-
-fn section(
-    lines: &mut Vec<Line<'static>>,
-    heading: &'static str,
-    body: Vec<Line<'static>>,
-    theme: &Theme,
-) {
-    lines.push(Line::default());
-    lines.push(Line::styled(heading, theme.keybind_section));
-    lines.extend(body);
-}
-
-/// Text that may run over several lines, each indented and escaped.
-fn text_lines(text: &str, style: Style) -> Vec<Line<'static>> {
-    text.lines()
-        .map(|line| {
-            Line::from(vec![
-                Span::raw(INDENT),
-                Span::styled(escape_terminal_controls(line), style),
-            ])
-        })
-        .collect()
-}
-
-fn field(label: &str, value: String, theme: &Theme) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("{INDENT}{label:<LABEL_COLS$}"), theme.tool_dim),
-        Span::raw(value),
-    ])
-}
-
-/// Unix milliseconds in the local zone, by `format`.
-fn local_time(at_ms: u64, format: &str) -> String {
-    i64::try_from(at_ms)
-        .ok()
-        .and_then(|millis| Timestamp::from_millisecond(millis).ok())
-        .map(|at| at.to_zoned(TimeZone::system()).strftime(format).to_string())
-        .unwrap_or_else(|| at_ms.to_string())
 }
 
 #[cfg(test)]
@@ -586,7 +548,7 @@ mod tests {
         log.rows(filter)
             .into_iter()
             .filter_map(|row| match row {
-                LogRow::Entry(index) => log.decision(index).map(|decision| decision.seq),
+                LogRow::Entry(index) => log.entry(index).map(|decision| decision.seq),
                 LogRow::Header { .. } => None,
             })
             .collect()
@@ -603,19 +565,19 @@ mod tests {
             [
                 LogRow::Header {
                     group: Group::Engagement(SECOND),
-                    decisions: 2
+                    entries: 2
                 },
                 LogRow::Entry(4),
                 LogRow::Entry(3),
                 LogRow::Header {
                     group: Group::Engagement(FIRST),
-                    decisions: 2
+                    entries: 2
                 },
                 LogRow::Entry(2),
                 LogRow::Entry(1),
                 LogRow::Header {
                     group: Group::Earlier,
-                    decisions: 1
+                    entries: 1
                 },
                 LogRow::Entry(0),
             ],
@@ -651,7 +613,7 @@ mod tests {
             [
                 LogRow::Header {
                     group: Group::Engagement(SECOND),
-                    decisions: 2
+                    entries: 2
                 },
                 LogRow::Entry(3),
             ]
@@ -702,7 +664,8 @@ mod tests {
     }
 
     fn detail_text(decision: &StoredAutopilotDecision) -> String {
-        entry_detail(decision, ClockFormat::default(), &theme::current())
+        AutopilotLog::default()
+            .entry_detail(decision, ClockFormat::default(), &theme::current())
             .iter()
             .map(Line::to_string)
             .collect::<Vec<_>>()
@@ -815,8 +778,7 @@ mod tests {
 
         assert_eq!(entries(&log, LogFilter::All), [5, 4, 3, 2, 1, 0]);
         assert_eq!(
-            log.decision(5)
-                .and_then(|decision| decision.outcome.clone()),
+            log.entry(5).and_then(|decision| decision.outcome.clone()),
             Some(DecisionOutcome::Answered {
                 answer: ANSWER.into()
             })

@@ -1,3 +1,4 @@
+pub(crate) mod audit_log;
 pub(crate) mod automation_inspector;
 pub(crate) mod autopilot_panel;
 pub(crate) mod changelog_modal;
@@ -16,7 +17,7 @@ pub(crate) mod environment_card;
 pub(crate) mod file_picker;
 pub(crate) mod file_walk;
 pub(crate) mod form;
-pub(crate) mod goal_modal;
+pub(crate) mod goal_panel;
 pub(crate) mod help_modal;
 pub mod input;
 pub(crate) mod json_text;
@@ -1394,6 +1395,10 @@ impl DisplayMessage {
         Self::new(DisplayRole::AutopilotDecision(seq), text)
     }
 
+    pub(crate) fn goal_evaluation(seq: u64, tone: GoalTone, text: String) -> Self {
+        Self::new(DisplayRole::GoalEvaluation(seq, tone), text)
+    }
+
     /// The title names `feature`, as its config key reads, and what it did;
     /// each detail is a line of the body the title opens.
     pub(crate) fn decision(
@@ -1546,10 +1551,21 @@ pub enum DisplayRole {
     /// be found again. Drawn as an autopilot row, it folds to its title like
     /// a decision-engine row.
     AutopilotDecision(u64),
+    /// A goal row an evaluation drew, under the evaluation's seq so the goal
+    /// log can find it again. It draws as the plain row its tone names.
+    GoalEvaluation(u64, GoalTone),
     /// What a decision-engine feature changed, would have changed in shadow,
     /// or left to the default when the engine failed. Display only: the model
     /// never sees it. It folds to its title like an injected message.
     Decision(NoteOutcome),
+}
+
+/// The plain row a [`DisplayRole::GoalEvaluation`] draws as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalTone {
+    Notice,
+    Error,
+    Done,
 }
 
 impl DisplayRole {

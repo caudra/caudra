@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::sync::atomic::Ordering;
 
 use crate::components::Overlay;
+use crate::components::goal_panel::StatusContent;
 use crate::components::input::{self, Placeholder};
 use crate::components::keybindings;
 #[cfg(test)]
@@ -681,17 +682,16 @@ impl App {
                 overlay_rect = r;
             }
         }
-        if self.goal_modal.is_open() {
+        if self.goal_panel.is_open() {
             let status = self.state.goal.status();
             let evaluator =
                 caudra_providers::model_registry::binding(caudra_providers::ModelPurpose::Goal);
-            let r = self.goal_modal.view(
-                frame,
-                full,
-                status.as_ref(),
-                evaluator.as_ref(),
-                self.state.goal.continuation_limit(),
-            );
+            let content = StatusContent {
+                status: status.as_ref(),
+                evaluator: evaluator.as_ref(),
+                continuation_limit: self.state.goal.continuation_limit(),
+            };
+            let r = self.goal_panel.view(frame, full, &content);
             if r.width > 0 {
                 overlay_rect = r;
             }

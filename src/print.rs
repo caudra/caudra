@@ -518,7 +518,7 @@ pub fn run(
             // One-shot print spawns no workflow runtime (`workflow: None`), so
             // nothing can launch a run here and the event has no consumer.
             AgentEvent::Workflow(_) => {}
-            AgentEvent::GoalEvaluating { .. } => {}
+            AgentEvent::GoalEvaluating { .. } | AgentEvent::GoalSkipped { .. } => {}
             AgentEvent::GoalEvaluation {
                 cost: goal_cost,
                 billing,

@@ -11,6 +11,8 @@ use caudra_storage::autopilot::{
     StoredAutopilotDecision, StoredAutopilotEngagement,
 };
 
+use crate::components::audit_log::counted;
+
 const DECIDING_NOTE: &str = "Autopilot is deciding. Press any key to answer yourself.";
 const LEFT_TO_YOU_NOTE: &str = "Autopilot left this to you";
 const SENTENCE_END: char = '.';
@@ -252,12 +254,6 @@ pub(crate) fn spend_summary(engagement: &StoredAutopilotEngagement) -> String {
         parts.push(counted(engagement.retries, RETRY_WORD, RETRIES_WORD));
     }
     parts.join(BUDGET_SEPARATOR)
-}
-
-/// `count` and the word for it, `one` when it is 1.
-pub(super) fn counted(count: impl Into<u64>, one: &str, many: &str) -> String {
-    let count = count.into();
-    format!("{count} {}", if count == 1 { one } else { many })
 }
 
 /// The line a card carries while autopilot decides it or once autopilot

@@ -14,6 +14,7 @@ use caudra_providers::{
 };
 use caudra_storage::autopilot::AutopilotEnd;
 use caudra_storage::background::{JobKind, JobOwner, ShellJobMetadata};
+use caudra_storage::goal_log::GoalEvaluationOutcome;
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::UnrecordedCall;
 use caudra_storage::tool_ledger::ToolOutcome;
@@ -2822,10 +2823,19 @@ pub enum AgentEvent {
         evaluation: u32,
     },
     GoalEvaluation {
+        /// The evaluation's number in the session's goal log.
+        seq: u64,
+        /// The goal it judged, numbered as the goal log numbers them.
+        goal: u32,
+        /// Unix milliseconds.
+        started_at_ms: u64,
+        /// Unix milliseconds.
+        at_ms: u64,
         verdict: GoalVerdict,
         reason: String,
         evaluation: u32,
         applied: bool,
+        outcome: GoalEvaluationOutcome,
         usage: TokenUsage,
         cost: Option<f64>,
         billing: Billing,
@@ -2848,7 +2858,22 @@ pub enum AgentEvent {
     GoalTurnLimit {
         evaluations: u32,
     },
+    /// The prescreen judged the goal unlikely met, so the evaluator never ran.
+    GoalSkipped {
+        seq: u64,
+        goal: u32,
+        evaluation: u32,
+        probability: f64,
+        /// Unix milliseconds.
+        at_ms: u64,
+    },
     GoalEvaluationFailed {
+        seq: u64,
+        goal: u32,
+        /// Unix milliseconds.
+        started_at_ms: u64,
+        /// Unix milliseconds.
+        at_ms: u64,
         evaluation: u32,
         message: String,
         applied: bool,

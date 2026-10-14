@@ -315,6 +315,15 @@ Some pickers add extra bindings on top of the defaults:
 | Autopilot Panel | `s` | Stop autopilot |
 | Autopilot Panel | `m` | Pick the model for the Autopilot job |
 | Autopilot Panel | `q` | Close, as Esc does |
+| Goal Panel | `Tab` / `Shift+Tab` | Switch between Status and Log |
+| Goal Panel | `1-2` | Jump to Status or Log |
+| Goal Panel | `-` / `+` | On Status, lower or raise this session's automatic continuation limit |
+| Goal Panel | `j` / `k` | Next or previous log entry, skipping goal headers |
+| Goal Panel | `Left` / `Right` | On Log, focus the log list or the entry's detail. On Status, lower or raise the continuation limit |
+| Goal Panel | `Enter` | Jump to the entry's row in the transcript. A narrow panel opens its detail first |
+| Goal Panel | `f` | Cycle the log filter: all, verdicts, failures, then skipped and discarded |
+| Goal Panel | `y` | Copy the selected log entry as text |
+| Goal Panel | `q` | Close, as Esc does |
 | Workbench Explorer | `Ctrl+X h` | Show hidden files |
 | Workbench Explorer | `C` | Fold the section the cursor is in back to its top level |
 | Workbench Explorer | `Ctrl+X ↑` / `Ctrl+X ↓` | Shrink / grow the section the cursor is in |
@@ -374,7 +383,7 @@ Some of these contexts belong to an [experimental feature](/docs/configuration/#
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Environment, Session Picker, Session Relocation, Worktree Picker, Peer Manager, Workflow Inspector, Workflow Catalog, Automation Inspector, Decisions, Autopilot Panel
+- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Environment, Session Picker, Session Relocation, Worktree Picker, Peer Manager, Workflow Inspector, Workflow Catalog, Automation Inspector, Decisions, Autopilot Panel, Goal Panel
 - **Workbench** is the base for: Workbench Explorer, Workbench Editor, Workbench Source Control, Workbench Search, Workbench Transfer
 
 ## Overriding Keybindings

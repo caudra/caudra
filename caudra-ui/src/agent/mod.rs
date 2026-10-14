@@ -496,15 +496,7 @@ impl AgentHandles {
         app.effective_model_slot = Some(Arc::clone(&self.effective_model_slot));
         app.queue.set_shared(self.queue.clone());
         if self.goal.status().is_none() {
-            match app.state.goal.status() {
-                Some(caudra_agent::GoalStatus::Active(goal)) => {
-                    let _ = self.goal.set(&goal.condition);
-                }
-                Some(caudra_agent::GoalStatus::Finished(result)) => {
-                    self.goal.restore_finished(result);
-                }
-                None => {}
-            }
+            self.goal.adopt(&app.state.goal);
         }
         app.state.goal = self.goal.clone();
         app.workflow.set_handle(self.workflow_handle());

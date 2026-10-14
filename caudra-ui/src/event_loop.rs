@@ -1294,10 +1294,7 @@ impl SpawnCtx {
             ConversationPermissions::Pending
         };
         permissions.set_session_mode(session.meta.permission_mode.clone());
-        let goal = caudra_agent::GoalHandle::restored(session.meta.active_goal.as_deref());
-        if let Some(limit) = session.meta.goal_continuation_limit {
-            goal.set_continuation_limit(limit);
-        }
+        let goal = caudra_agent::GoalHandle::from_meta(&session.meta);
         let permissions_ms = lap();
         let subagent_history = crate::agent::stored_subagent_history(&session);
         let subagent_history_ms = lap();

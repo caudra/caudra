@@ -13,6 +13,7 @@ mod delegation;
 mod env;
 mod extract;
 pub(crate) mod file_revert;
+mod goal;
 #[cfg(debug_assertions)]
 mod grab;
 mod image_paste;
@@ -57,6 +58,7 @@ use crate::app::workbench::{MountScope, StoredDocument};
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT, format_with_images};
 use crate::clipboard::{ClipboardState, CopyResult};
+use crate::components::audit_log::PanelTab;
 use crate::components::automation_inspector::{AutomationAction, AutomationInspector};
 use crate::components::autopilot_panel::AutopilotPanel;
 use crate::components::changelog_modal::{
@@ -70,7 +72,9 @@ use crate::components::decisions_modal::{DecisionsFetchState, DecisionsModal};
 use crate::components::docs_modal::{DocsAction, DocsModal};
 use crate::components::env_modal::EnvModal;
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
-use crate::components::goal_modal::GoalModal;
+use crate::components::goal_panel::{
+    GoalPanel, cleared_after_error_row, evaluation_failed_row, finished_row, not_met_row,
+};
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{
     AdmissionHit, ChordHint, ChordHintHit, InputAction, InputBox, InputState, Submission,
@@ -127,8 +131,8 @@ use crate::components::workflow_catalog_picker::WorkflowCatalogPicker;
 use crate::components::workflow_inspector::WorkflowInspector;
 use crate::components::worktree_picker::{WorktreePicker, WorktreeView};
 use crate::components::{
-    Action, DisplayMessage, DisplayRole, DisplaySource, ExitRequest, Overlay, PlanHandoff,
-    RetryInfo, Status, is_ctrl,
+    Action, DisplayMessage, DisplayRole, DisplaySource, ExitRequest, GoalTone, Overlay,
+    PlanHandoff, RetryInfo, Status, is_ctrl,
 };
 use crate::config_problems::ConfigProblems;
 use crate::image;
@@ -257,6 +261,7 @@ const IMPLEMENT_CAPTURE_FAILED: &str = "Cannot implement plan";
 const GOAL_CLEAR_ARGS: [&str; 6] = ["clear", "stop", "off", "reset", "none", "cancel"];
 /// The argument `/goal` and `/autopilot` take to bind their model.
 const MODEL_ARG: &str = "model";
+const LOG_ARG: &str = "log";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 const PERMISSION_BLOCKER: &str = "Permission requested";
 const AUTH_BLOCKER: &str = "Authentication required";
@@ -509,7 +514,7 @@ pub struct App {
     /// Recorded tool activity for the scope `/tools` is showing. `None` means
     /// not loaded yet or unreadable; the modal tells those apart by scope.
     pub(super) tool_stats: Option<ToolStats>,
-    pub(super) goal_modal: GoalModal,
+    pub(super) goal_panel: GoalPanel,
     pub(super) autopilot_panel: AutopilotPanel,
     pub(super) stream_modal: StreamModal,
     pub(super) float_mgr: FloatManager,
@@ -641,6 +646,9 @@ pub struct App {
     /// Decisions autopilot announced and has not made yet, by seq. A
     /// permission card carries its own state, so none is kept here.
     autopilot_deciding: Vec<(u32, DecisionKind)>,
+    /// The seq of the goal check last reported, so the row a goal's end
+    /// draws carries the verdict that ended it.
+    goal_verdict_seq: Option<u64>,
     /// The plan decision autopilot left to the user, settled by how they
     /// answer the card and forgotten when it closes otherwise.
     autopilot_plan_escalation: Option<u32>,
@@ -837,7 +845,7 @@ impl App {
             tools_preview_source: None,
             lifetime_usage: None,
             tool_stats: None,
-            goal_modal: GoalModal::default(),
+            goal_panel: GoalPanel::default(),
             autopilot_panel: AutopilotPanel::default(),
             stream_modal: StreamModal::new(typewriter),
             float_mgr: FloatManager::new(),
@@ -938,6 +946,7 @@ impl App {
             autopilot_checkin_due: false,
             autopilot_implement: None,
             autopilot_deciding: Vec::new(),
+            goal_verdict_seq: None,
             autopilot_plan_escalation: None,
             autopilot_notice: None,
             zones: ZoneRegistry::new(),
@@ -2057,8 +2066,8 @@ impl App {
             self.projection_modal.scroll(delta);
             return None;
         }
-        if self.goal_modal.is_open() {
-            self.goal_modal.scroll(delta);
+        if self.goal_panel.is_open() {
+            self.goal_panel.scroll_at(pos, delta);
             return None;
         }
         if self.autopilot_panel.is_open() {
@@ -2482,15 +2491,14 @@ impl App {
             return Some(vec![]);
         }
 
-        if self.goal_modal.is_open() {
+        if self.goal_panel.is_open() {
             guard_repeat!(false);
-            if let Some(limit) = self
-                .goal_modal
-                .handle_key(key, self.state.goal.continuation_limit())
-            {
-                self.state.goal.set_continuation_limit(limit);
-            }
-            return Some(vec![]);
+            return Some(
+                self.goal_panel
+                    .handle_key(key, self.state.goal.continuation_limit())
+                    .map(|action| self.on_goal_panel(action))
+                    .unwrap_or_default(),
+            );
         }
 
         if self.autopilot_panel.is_open() {
@@ -4471,6 +4479,7 @@ impl App {
 
     fn quit_with(&mut self, req: ExitRequest) -> Vec<Action> {
         self.save_input_history();
+        self.flush_goal_log();
         self.exit_request = req;
         vec![Action::ManualExit]
     }
@@ -5293,7 +5302,12 @@ impl App {
                 self.flash(format!("Evaluating goal (#{evaluation})..."));
                 return vec![];
             }
+            AgentEvent::GoalSkipped { .. } => {
+                self.flush_goal_log();
+                return vec![];
+            }
             AgentEvent::GoalEvaluation {
+                seq,
                 verdict,
                 reason,
                 evaluation,
@@ -5302,17 +5316,24 @@ impl App {
                 cost,
                 billing,
                 model,
+                ..
             } => {
                 self.state.token_usage += usage;
                 self.add_session_spend(cost, billing);
                 add_chat_spend(&mut self.chats[chat_idx], cost, billing);
                 self.record_goal_usage(&model, usage, cost, billing);
-                if applied && verdict == GoalVerdict::NotMet {
-                    self.main_chat().push(DisplayMessage::new(
-                        DisplayRole::Notice,
-                        format!("Goal not yet met (#{evaluation}): {reason}"),
-                    ));
+                match verdict {
+                    _ if !applied => {}
+                    GoalVerdict::NotMet => self.main_chat().push(DisplayMessage::goal_evaluation(
+                        seq,
+                        GoalTone::Notice,
+                        not_met_row(evaluation, &reason),
+                    )),
+                    GoalVerdict::Met | GoalVerdict::Impossible => {
+                        self.goal_verdict_seq = Some(seq);
+                    }
                 }
+                self.flush_goal_log();
                 return vec![];
             }
             AgentEvent::GoalFinished {
@@ -5320,16 +5341,11 @@ impl App {
                 autopilot_owned,
             } => {
                 self.automation_goal_finished(&result, autopilot_owned);
-                let (role, label) = match result.verdict {
-                    GoalVerdict::Met => (DisplayRole::Done, "Goal achieved"),
-                    GoalVerdict::Impossible | GoalVerdict::NotMet => {
-                        (DisplayRole::Error, "Goal could not be achieved")
-                    }
-                };
-                self.main_chat().push(DisplayMessage::new(
-                    role,
-                    format!("{label}: {}", result.reason),
-                ));
+                let (tone, text) = finished_row(result.verdict, &result.reason);
+                let seq = self.goal_verdict_seq.take().unwrap_or_default();
+                self.main_chat()
+                    .push(DisplayMessage::goal_evaluation(seq, tone, text));
+                self.flush_goal_log();
                 return vec![];
             }
             AgentEvent::GoalDeferred {
@@ -5365,6 +5381,7 @@ impl App {
                 return vec![];
             }
             AgentEvent::GoalEvaluationFailed {
+                seq,
                 evaluation,
                 message,
                 applied,
@@ -5372,19 +5389,20 @@ impl App {
                 cost,
                 billing,
                 model,
+                ..
             } => {
                 self.state.token_usage += usage;
                 self.add_session_spend(cost, billing);
                 add_chat_spend(&mut self.chats[chat_idx], cost, billing);
                 self.record_goal_usage(&model, usage, cost, billing);
                 if applied {
-                    self.main_chat().push(DisplayMessage::new(
-                        DisplayRole::Error,
-                        format!(
-                            "Goal evaluation #{evaluation} failed; the goal remains active: {message}"
-                        ),
+                    self.main_chat().push(DisplayMessage::goal_evaluation(
+                        seq,
+                        GoalTone::Error,
+                        evaluation_failed_row(evaluation, &message),
                     ));
                 }
+                self.flush_goal_log();
                 return vec![];
             }
             AgentEvent::GoalClearedAfterError {
@@ -5395,8 +5413,9 @@ impl App {
                 self.automation_goal_cleared(&condition, &message, autopilot_owned);
                 self.main_chat().push(DisplayMessage::new(
                     DisplayRole::Error,
-                    format!("Goal cleared after an unrecoverable error: {condition} ({message})"),
+                    cleared_after_error_row(&condition, &message),
                 ));
+                self.flush_goal_log();
                 return vec![];
             }
             event => event,
@@ -6043,11 +6062,15 @@ impl App {
     fn execute_goal(&mut self, args: &str) -> Vec<Action> {
         let condition = args.trim();
         if condition.is_empty() {
-            self.goal_modal.open();
+            self.open_goal_panel(PanelTab::Status);
             return vec![];
         }
         if condition.eq_ignore_ascii_case(MODEL_ARG) {
             return self.open_goal_model_picker();
+        }
+        if condition.eq_ignore_ascii_case(LOG_ARG) {
+            self.open_goal_log();
+            return vec![];
         }
         if is_goal_clear(condition) {
             return self.clear_goal();
@@ -6056,7 +6079,7 @@ impl App {
         self.submit_goal(condition)
     }
 
-    fn open_goal_model_picker(&mut self) -> Vec<Action> {
+    pub(super) fn open_goal_model_picker(&mut self) -> Vec<Action> {
         self.model_picker.open_purpose(
             &self.state.model,
             &self.model_policy,
@@ -6071,6 +6094,7 @@ impl App {
             || "No goal set".to_string(),
             |goal| format!("Goal cleared: {}", goal.condition),
         );
+        self.flush_goal_log();
         self.flash(message);
         vec![]
     }
@@ -6368,7 +6392,7 @@ impl App {
             &self.storage_modal,
             &self.system_prompt_modal,
             &self.projection_modal,
-            &self.goal_modal,
+            &self.goal_panel,
             &self.autopilot_panel,
             &self.stream_modal,
             &self.float_mgr,
@@ -6421,7 +6445,7 @@ impl App {
             &mut self.storage_modal,
             &mut self.system_prompt_modal,
             &mut self.projection_modal,
-            &mut self.goal_modal,
+            &mut self.goal_panel,
             &mut self.autopilot_panel,
             &mut self.stream_modal,
             &mut self.float_mgr,
@@ -6716,6 +6740,8 @@ impl App {
             | self.storage_modal.poll(&self.storage_slot)
             | self.decisions_modal.poll(&self.decisions_slot)
             | self.autopilot_panel.poll()
+            | self.goal_panel.poll()
+            | self.poll_goal_log()
             | self.poll_context_snapshot()
             | self.poll_tools_snapshot()
             | self.logs_modal.poll()

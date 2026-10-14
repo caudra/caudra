@@ -22,6 +22,7 @@ use caudra_storage::autopilot::{
     DecisionOutcome, StoredAutopilotDecision, StoredAutopilotEngagement,
 };
 use caudra_storage::engine_decisions::StoredEngineDecision;
+use caudra_storage::goal_log::GoalLogWrite;
 use caudra_storage::id::CaudraId;
 use caudra_storage::permission_state::mutation::{
     PermissionCommitReceipt, PermissionMutationError, PermissionOwner, PreparedPermissionMutation,
@@ -63,6 +64,8 @@ const USAGE_DRAIN_FAILED: &str = "storage writer stopped with unsaved usage cont
 const TOOL_DRAIN_FAILED: &str = "storage writer stopped with unsaved tool activity";
 const PERMISSION_QUEUE_CAPACITY: usize = 16;
 const PERMISSION_QUEUE_FULL: &str = "permission mutation queue is full; nothing was enqueued";
+const AUTOPILOT_LOG: &str = "autopilot";
+const GOAL_LOG: &str = "goal";
 
 type Pending = Arc<Mutex<HashMap<CaudraId, Entry>>>;
 /// Cursors handed to the writer outside the coalescing queue, which keeps one
@@ -170,6 +173,7 @@ pub struct StorageWriter {
     usage: PendingUsage,
     tool_calls: PendingToolCalls,
     autopilot_writes: PendingRows<AutopilotWrite>,
+    goal_writes: PendingRows<GoalLogWrite>,
     engine_decisions: PendingRows<StoredEngineDecision>,
     done_rx: flume::Receiver<Result<(), SessionError>>,
     thread: JoinHandle<()>,
@@ -191,6 +195,8 @@ impl StorageWriter {
         let writer_tool_calls = Arc::clone(&tool_calls);
         let autopilot_writes: PendingRows<AutopilotWrite> = Arc::default();
         let writer_autopilot_writes = Arc::clone(&autopilot_writes);
+        let goal_writes: PendingRows<GoalLogWrite> = Arc::default();
+        let writer_goal_writes = Arc::clone(&goal_writes);
         let engine_decisions: PendingRows<StoredEngineDecision> = Arc::default();
         let writer_engine_decisions = Arc::clone(&engine_decisions);
         let (wake, wake_rx) = flume::bounded::<()>(1);
@@ -213,6 +219,7 @@ impl StorageWriter {
                     cursors: HashMap::new(),
                     seeded_cursors: writer_seeded_cursors,
                     autopilot_writes: writer_autopilot_writes,
+                    goal_writes: writer_goal_writes,
                     engine_decisions: writer_engine_decisions,
                     deleted_sessions: HashMap::new(),
                     failing: HashSet::new(),
@@ -252,6 +259,7 @@ impl StorageWriter {
             usage,
             tool_calls,
             autopilot_writes,
+            goal_writes,
             engine_decisions,
             done_rx,
             thread,
@@ -310,32 +318,46 @@ impl StorageWriter {
     /// or be queued. Never coalesced: the log keeps every decision and what
     /// became of it.
     pub fn record_autopilot(&self, session_id: CaudraId, write: AutopilotWrite) {
-        self.autopilot_writes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(QueuedRow {
-                session_id,
-                row: write,
-            });
-        match self.wake.try_send(()) {
-            Ok(()) | Err(flume::TrySendError::Full(())) => {}
-            Err(flume::TrySendError::Disconnected(())) => {
-                warn!(%session_id, "storage writer unavailable; an autopilot log entry may not be recorded");
-            }
-        }
+        self.queue_log_write(&self.autopilot_writes, session_id, write, AUTOPILOT_LOG);
     }
 
     /// The changes to `session_id`'s autopilot log not yet written, oldest
     /// first. A change leaves the queue only once written, so a read of the
     /// log that starts after this call holds every change it does not list.
     pub fn unwritten_autopilot(&self, session_id: CaudraId) -> Vec<AutopilotWrite> {
-        self.autopilot_writes
+        unwritten(&self.autopilot_writes, session_id)
+    }
+
+    /// Changes the goal log of `session_id`, as [`Self::record_autopilot`]
+    /// changes the autopilot log.
+    pub fn record_goal_log(&self, session_id: CaudraId, write: GoalLogWrite) {
+        self.queue_log_write(&self.goal_writes, session_id, write, GOAL_LOG);
+    }
+
+    /// The changes to `session_id`'s goal log not yet written, as
+    /// [`Self::unwritten_autopilot`] lists the autopilot log's.
+    pub fn unwritten_goal_log(&self, session_id: CaudraId) -> Vec<GoalLogWrite> {
+        unwritten(&self.goal_writes, session_id)
+    }
+
+    /// Never coalesced: a log keeps every change made to it.
+    fn queue_log_write<R>(
+        &self,
+        pending: &PendingRows<R>,
+        session_id: CaudraId,
+        row: R,
+        log: &'static str,
+    ) {
+        pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|queued| queued.session_id == session_id)
-            .map(|queued| queued.row.clone())
-            .collect()
+            .push(QueuedRow { session_id, row });
+        match self.wake.try_send(()) {
+            Ok(()) | Err(flume::TrySendError::Full(())) => {}
+            Err(flume::TrySendError::Disconnected(())) => {
+                warn!(%session_id, log, "storage writer unavailable; a log entry may not be recorded");
+            }
+        }
     }
 
     /// Keeps a decision-engine transcript row for `session_id`, whose row must
@@ -478,6 +500,29 @@ fn claim<R>(pending: &PendingRows<R>) -> Vec<QueuedRow<R>> {
     mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
+fn unwritten<R: Clone>(pending: &PendingRows<R>, session_id: CaudraId) -> Vec<R> {
+    pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|queued| queued.session_id == session_id)
+        .map(|queued| queued.row.clone())
+        .collect()
+}
+
+/// A copy of the queue, which keeps it until [`drain_written`] drops what was
+/// written, so a reader between the two still finds it unwritten.
+fn snapshot<R: Clone>(pending: &PendingRows<R>) -> Vec<QueuedRow<R>> {
+    pending.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn drain_written<R>(pending: &PendingRows<R>, written: usize) {
+    pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain(..written);
+}
+
 fn writer_gone() -> SessionError {
     StorageError::Io(io::Error::other(WRITER_UNAVAILABLE)).into()
 }
@@ -519,6 +564,7 @@ struct Writer {
     cursors: HashMap<CaudraId, SessionCursor>,
     seeded_cursors: SeededCursors,
     autopilot_writes: PendingRows<AutopilotWrite>,
+    goal_writes: PendingRows<GoalLogWrite>,
     engine_decisions: PendingRows<StoredEngineDecision>,
     /// Explicit recreation capability retained only by the writer that
     /// completed an ordered delete; ordinary stale saves cannot cross tombstones.
@@ -769,6 +815,38 @@ impl Writer {
 
     /// Dropped with a warning on failure, for the reason autopilot's
     /// entries are.
+    fn write_goal_log(&mut self, writes: &[QueuedRow<GoalLogWrite>]) {
+        let Some(database) = self.decisions_database(writes.len()) else {
+            return;
+        };
+        for QueuedRow { session_id, row } in writes {
+            let session_id = *session_id;
+            match row {
+                GoalLogWrite::Begun(goal) => {
+                    if let Err(error) = database.begin_goal(session_id, goal) {
+                        warn!(%error, %session_id, goal = goal.goal, "goal write failed");
+                    }
+                }
+                GoalLogWrite::Evaluated(evaluation) => {
+                    if let Err(error) = database.insert_goal_evaluation(session_id, evaluation) {
+                        warn!(%error, %session_id, seq = evaluation.seq, "goal evaluation write failed");
+                    }
+                }
+                GoalLogWrite::Ended(goal) => match database.end_goal(session_id, goal) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        warn!(%session_id, goal = goal.goal, "ended a goal the log lacks");
+                    }
+                    Err(error) => {
+                        warn!(%error, %session_id, goal = goal.goal, "goal end write failed");
+                    }
+                },
+            }
+        }
+    }
+
+    /// Dropped with a warning on failure, for the reason autopilot's
+    /// entries are.
     fn write_engine_decisions(&mut self, decisions: Vec<QueuedRow<StoredEngineDecision>>) {
         let Some(database) = self.decisions_database(decisions.len()) else {
             return;
@@ -792,8 +870,9 @@ impl Writer {
     /// second request to correct it. Decisions are claimed first too: the
     /// save of the session row each one references was queued ahead of it, so
     /// that save is among the snapshots this pass writes before them.
-    /// Autopilot's changes leave their queue only once written, for
-    /// [`StorageWriter::unwritten_autopilot`].
+    /// Autopilot's and the goal log's changes leave their queues only once
+    /// written, for [`StorageWriter::unwritten_autopilot`] and
+    /// [`StorageWriter::unwritten_goal_log`].
     fn drain(
         &mut self,
         pending: &Pending,
@@ -802,18 +881,14 @@ impl Writer {
         tool_calls: &PendingToolCalls,
     ) {
         let request = tabs.lock().unwrap_or_else(|e| e.into_inner()).take();
-        let autopilot_writes = self
-            .autopilot_writes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let autopilot_writes = snapshot(&self.autopilot_writes);
+        let goal_writes = snapshot(&self.goal_writes);
         let engine_decisions = claim(&self.engine_decisions);
         self.flush(pending);
         self.write_autopilot(&autopilot_writes);
-        self.autopilot_writes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain(..autopilot_writes.len());
+        drain_written(&self.autopilot_writes, autopilot_writes.len());
+        self.write_goal_log(&goal_writes);
+        drain_written(&self.goal_writes, goal_writes.len());
         self.write_engine_decisions(engine_decisions);
         self.flush_permissions();
         if let Some(request) = request {
@@ -1146,6 +1221,9 @@ mod tests {
     use super::*;
     use caudra_storage::autopilot::AutopilotEnd;
     use caudra_storage::engine_decisions::{StoredDecisionAnchor, StoredDecisionOutcome};
+    use caudra_storage::goal_log::{
+        GoalEnd, GoalEvaluationOutcome, StoredGoalEvaluation, StoredGoalRecord,
+    };
     use caudra_storage::permission_state::mutation::{
         PermissionMutation, PermissionRecordIdentity, prepare_mutation,
     };
@@ -1154,7 +1232,7 @@ mod tests {
         PermissionRuleRecord, PermissionSubject, StructuredPermissionEffect,
         StructuredPermissionRule,
     };
-    use caudra_storage::sessions::SessionRelocation;
+    use caudra_storage::sessions::{SessionRelocation, StoredTokenUsage};
     use caudra_storage::usage_ledger::{BUCKET_SECONDS, LedgerPurpose, bucket_for};
     use jiff::civil::DateTime;
     use jiff::tz::TimeZone;
@@ -1210,6 +1288,11 @@ mod tests {
     const SETTLED_BEHIND_INSERT: &str =
         "a settle queued behind its decision must find the decision written";
     const ENGAGEMENT_LOGGED: &str = "an engagement's start and end must reach the log";
+    const GOAL: u32 = 1;
+    const GOAL_CONDITION: &str = "the suite is green";
+    const GOAL_VERDICT: &str = "met";
+    const GOAL_ENDED_BEHIND_START: &str =
+        "a goal's end queued behind its start must find it written";
     const ENGINE_FEATURE: &str = "memory_search";
     const ENGINE_MODE: &str = "advise";
     const ENGINE_SUMMARY: &str = "3 notes ranked";
@@ -1540,6 +1623,7 @@ mod tests {
             cursors: HashMap::new(),
             seeded_cursors: Arc::default(),
             autopilot_writes: Arc::default(),
+            goal_writes: Arc::default(),
             engine_decisions: Arc::default(),
             deleted_sessions: HashMap::new(),
             failing: HashSet::new(),
@@ -1978,6 +2062,70 @@ mod tests {
             database.load_autopilot_engagements(id).unwrap(),
             [engagement(true)],
             "{ENGAGEMENT_LOGGED}"
+        );
+    }
+
+    fn goal_record(ended: bool) -> StoredGoalRecord {
+        StoredGoalRecord {
+            goal: GOAL,
+            condition: GOAL_CONDITION.into(),
+            set_at_ms: ENGAGED_AT_MS,
+            set_history_len: ENGAGED_HISTORY_LEN,
+            ended_at_ms: ended.then_some(ENDED_AT_MS),
+            ended_history_len: ended.then_some(ENDED_HISTORY_LEN),
+            end: ended.then_some(GoalEnd::Met),
+            evaluations: u32::from(ended),
+            elapsed_ms: 0,
+            usage: StoredTokenUsage::default(),
+            cost_usd: 0.0,
+            subscription_cost_usd: 0.0,
+        }
+    }
+
+    fn goal_evaluation(seq: u64) -> StoredGoalEvaluation {
+        StoredGoalEvaluation {
+            seq,
+            goal: GOAL,
+            evaluation: 1,
+            started_at_ms: ENGAGED_AT_MS,
+            at_ms: ENDED_AT_MS,
+            history_len: ENDED_HISTORY_LEN,
+            verdict: Some(GOAL_VERDICT.into()),
+            reason: DECISION_REASON.into(),
+            outcome: GoalEvaluationOutcome::Applied,
+            model: None,
+            usage: None,
+            cost: None,
+        }
+    }
+
+    /// The goal's end is an update, so it lands only behind the start queued
+    /// ahead of it.
+    #[test]
+    fn the_goal_log_is_written_in_the_order_it_was_queued() {
+        let (_tmp, dir) = state_dir();
+        let (writer, _warn_rx) = writer(&dir);
+        let session = AppSession::new(MODEL, CWD);
+        let id = session.id;
+        writer.send(Arc::new(session));
+        for write in [
+            GoalLogWrite::Begun(goal_record(false)),
+            GoalLogWrite::Evaluated(Box::new(goal_evaluation(1))),
+            GoalLogWrite::Ended(goal_record(true)),
+        ] {
+            writer.record_goal_log(id, write);
+        }
+        writer.shutdown(DRAIN_TIMEOUT);
+
+        let database = SessionDatabase::open(&dir).unwrap();
+        assert_eq!(
+            database.load_goals(id).unwrap(),
+            [goal_record(true)],
+            "{GOAL_ENDED_BEHIND_START}"
+        );
+        assert_eq!(
+            database.load_goal_evaluations(id).unwrap(),
+            [goal_evaluation(1)]
         );
     }
 

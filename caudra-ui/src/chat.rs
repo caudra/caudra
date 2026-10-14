@@ -316,6 +316,7 @@ impl Chat {
             }
             AgentEvent::ModelUsage { .. } => {}
             AgentEvent::GoalEvaluating { .. }
+            | AgentEvent::GoalSkipped { .. }
             | AgentEvent::GoalEvaluation { .. }
             | AgentEvent::GoalFinished { .. }
             | AgentEvent::GoalDeferred { .. }
@@ -860,6 +861,11 @@ impl Chat {
     /// it.
     pub fn autopilot_decision_row(&self, seq: u64) -> Option<usize> {
         self.messages_panel.autopilot_decision_row(seq)
+    }
+
+    /// The row goal evaluation `seq` drew, for a caller that scrolls to it.
+    pub fn goal_evaluation_row(&self, seq: u64) -> Option<usize> {
+        self.messages_panel.goal_evaluation_row(seq)
     }
 
     pub fn rewrite_autopilot_decision(&mut self, seq: u64, text: String) {

@@ -6,7 +6,8 @@ use strum::EnumIter;
 use unicode_width::UnicodeWidthStr;
 
 use crate::components::{
-    automation_inspector, autopilot_panel, decisions_modal, env_modal, workflow_inspector,
+    audit_log, automation_inspector, autopilot_panel, decisions_modal, env_modal, goal_panel,
+    workflow_inspector,
 };
 
 /// Spelled once because three tables quote it.
@@ -416,6 +417,7 @@ pub enum KeybindContext {
     AutomationInspector,
     Decisions,
     AutopilotPanel,
+    GoalPanel,
     SandboxManager,
     Workbench,
     WorkbenchExplorer,
@@ -459,6 +461,7 @@ impl KeybindContext {
             Self::AutomationInspector => "Automation Inspector",
             Self::Decisions => "Decisions",
             Self::AutopilotPanel => "Autopilot Panel",
+            Self::GoalPanel => "Goal Panel",
             Self::SandboxManager => "Sandbox Manager",
             Self::Workbench => "Workbench",
             Self::WorkbenchExplorer => "Workbench Explorer",
@@ -502,7 +505,8 @@ impl KeybindContext {
             | Self::WorkflowCatalogPicker
             | Self::AutomationInspector
             | Self::Decisions
-            | Self::AutopilotPanel => Some(Self::Picker),
+            | Self::AutopilotPanel
+            | Self::GoalPanel => Some(Self::Picker),
             Self::WorkbenchExplorer
             | Self::WorkbenchEditor
             | Self::WorkbenchSourceControl
@@ -1750,7 +1754,7 @@ pub const KEYBINDS: &[Keybind] = &[
         context: KeybindContext::AutopilotPanel,
     },
     Keybind {
-        label: KeyLabel::Alt(autopilot_panel::DOWN_LABEL, autopilot_panel::UP_LABEL),
+        label: KeyLabel::Alt(audit_log::DOWN_LABEL, audit_log::UP_LABEL),
         description: "Next or previous log entry, skipping engagement headers",
         context: KeybindContext::AutopilotPanel,
     },
@@ -1765,12 +1769,12 @@ pub const KEYBINDS: &[Keybind] = &[
         context: KeybindContext::AutopilotPanel,
     },
     Keybind {
-        label: KeyLabel::Single(autopilot_panel::FILTER_LABEL),
+        label: KeyLabel::Single(audit_log::FILTER_LABEL),
         description: "Cycle the log filter: all, left to you, then each decision kind",
         context: KeybindContext::AutopilotPanel,
     },
     Keybind {
-        label: KeyLabel::Single(autopilot_panel::COPY_LABEL),
+        label: KeyLabel::Single(audit_log::COPY_LABEL),
         description: "Copy the selected log entry as text",
         context: KeybindContext::AutopilotPanel,
     },
@@ -1785,9 +1789,54 @@ pub const KEYBINDS: &[Keybind] = &[
         context: KeybindContext::AutopilotPanel,
     },
     Keybind {
-        label: KeyLabel::Single(autopilot_panel::CLOSE_LABEL),
+        label: KeyLabel::Single(audit_log::CLOSE_LABEL),
         description: "Close, as Esc does",
         context: KeybindContext::AutopilotPanel,
+    },
+    Keybind {
+        label: KeyLabel::Alt("Tab", SHIFT_TAB_LABEL),
+        description: "Switch between Status and Log",
+        context: KeybindContext::GoalPanel,
+    },
+    Keybind {
+        label: KeyLabel::Single("1-2"),
+        description: "Jump to Status or Log",
+        context: KeybindContext::GoalPanel,
+    },
+    Keybind {
+        label: KeyLabel::Alt(goal_panel::LOWER_LABEL, goal_panel::RAISE_LABEL),
+        description: "On Status, lower or raise this session's automatic continuation limit",
+        context: KeybindContext::GoalPanel,
+    },
+    Keybind {
+        label: KeyLabel::Alt(audit_log::DOWN_LABEL, audit_log::UP_LABEL),
+        description: "Next or previous log entry, skipping goal headers",
+        context: KeybindContext::GoalPanel,
+    },
+    Keybind {
+        label: KeyLabel::Alt("Left", "Right"),
+        description: "On Log, focus the log list or the entry's detail. On Status, lower or raise the continuation limit",
+        context: KeybindContext::GoalPanel,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::ENTER.label),
+        description: "Jump to the entry's row in the transcript. A narrow panel opens its detail first",
+        context: KeybindContext::GoalPanel,
+    },
+    Keybind {
+        label: KeyLabel::Single(audit_log::FILTER_LABEL),
+        description: "Cycle the log filter: all, verdicts, failures, then skipped and discarded",
+        context: KeybindContext::GoalPanel,
+    },
+    Keybind {
+        label: KeyLabel::Single(audit_log::COPY_LABEL),
+        description: "Copy the selected log entry as text",
+        context: KeybindContext::GoalPanel,
+    },
+    Keybind {
+        label: KeyLabel::Single(audit_log::CLOSE_LABEL),
+        description: "Close, as Esc does",
+        context: KeybindContext::GoalPanel,
     },
     Keybind {
         label: KeyLabel::Single(leader::WORKBENCH.label),

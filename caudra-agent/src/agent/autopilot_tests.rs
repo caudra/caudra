@@ -1727,6 +1727,12 @@ mod autopilot_tests {
                 }),
                 "{SECOND_OPINION}"
             );
+            let logged = if continues {
+                GoalEvaluationOutcome::Reconsidered
+            } else {
+                GoalEvaluationOutcome::Applied
+            };
+            assert_eq!(logged_outcomes(&goal), [(1, logged)], "{SECOND_OPINION}");
             assert_eq!(
                 ends(&events),
                 ended.iter().cloned().collect::<Vec<_>>(),

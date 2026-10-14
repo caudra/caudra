@@ -546,6 +546,7 @@ impl App {
             active_goal: goal.active,
             goal_result: goal.result,
             goal_continuation_limit: goal.continuation_limit,
+            goal_log: goal.log,
             autopilot: self.stored_autopilot(),
             automatic_wakes_suppressed: self.automatic_wakes_suppressed
                 || peer.as_ref().is_some_and(PeerSession::wakes_suppressed),
@@ -694,7 +695,13 @@ impl App {
             }
         };
         let decisions = self.stored_engine_decisions();
-        let mut inserts = self.autopilot_log_rows();
+        let mut log_rows = self.autopilot_log_rows();
+        log_rows.extend(self.goal_log_rows());
+        log_rows.sort_by_key(|(place, _)| *place);
+        let mut inserts: Vec<_> = log_rows
+            .into_iter()
+            .map(|((history_len, _), row)| (history_len, row))
+            .collect();
         inserts.extend(decision_inserts(
             &active_history,
             decisions.iter().filter(|row| row.agent.is_none()),
@@ -1618,6 +1625,7 @@ impl App {
     fn retire_current_session(&mut self) -> Result<(), caudra_storage::sessions::SessionError> {
         self.release_revert_confirmation();
         self.close_stream_modal();
+        self.flush_goal_log();
         self.checkpoint_now();
         if self.has_content() {
             self.storage_writer

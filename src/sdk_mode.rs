@@ -59,6 +59,9 @@ use caudra_storage::autopilot::{
     AutopilotEnd, AutopilotStopper, DecisionOutcome, DecisionPayload, StoredAutopilot,
     StoredAutopilotDecision, StoredAutopilotEngagement,
 };
+use caudra_storage::goal_log::{
+    GoalEnd, GoalEvaluationOutcome, StoredGoalEvaluation, StoredGoalRecord,
+};
 use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::permission_state::PermissionRuleRecord;
@@ -119,9 +122,12 @@ const GOAL_SYSTEM_SUBTYPE: &str = "goal";
 const GOAL_SET: &str = "goal_set";
 const GOAL_CLEAR: &str = "goal_clear";
 const GOAL_STATUS: &str = "goal_status";
+const GOAL_LOG: &str = "goal_log";
 /// Every `control_request` subtype the session goal answers, as the init
 /// message advertises them.
-const GOAL_CONTROLS: &[&str] = &[GOAL_SET, GOAL_CLEAR, GOAL_STATUS];
+const GOAL_CONTROLS: &[&str] = &[GOAL_SET, GOAL_CLEAR, GOAL_STATUS, GOAL_LOG];
+const GOAL_LOG_DEFAULT_LIMIT: usize = 100;
+const GOAL_LOG_MAX_LIMIT: usize = 500;
 const GOAL_ACTIVE: &str = "active";
 const GOAL_FINISHED: &str = "finished";
 const NO_GOAL: &str = "none";
@@ -429,16 +435,25 @@ enum GoalSystemPayload<'a> {
         evaluation: u32,
     },
     Evaluation {
+        seq: u64,
+        goal: u32,
+        started_at_ms: u64,
+        at_ms: u64,
         verdict: GoalVerdict,
         reason: &'a str,
         evaluation: u32,
         applied: bool,
+        outcome: &'a GoalEvaluationOutcome,
         usage: TokenUsage,
         cost: Option<f64>,
         billing: Billing,
         model: &'a str,
     },
     EvaluationFailed {
+        seq: u64,
+        goal: u32,
+        started_at_ms: u64,
+        at_ms: u64,
         evaluation: u32,
         message: &'a str,
         applied: bool,
@@ -446,6 +461,14 @@ enum GoalSystemPayload<'a> {
         cost: Option<f64>,
         billing: Billing,
         model: &'a str,
+    },
+    /// The prescreen judged the goal unlikely met, so the evaluator never ran.
+    Skipped {
+        seq: u64,
+        goal: u32,
+        evaluation: u32,
+        probability: f64,
+        at_ms: u64,
     },
     Deferred {
         active_background_tasks: usize,
@@ -473,25 +496,39 @@ impl<'a> GoalSystemPayload<'a> {
                 evaluation: *evaluation,
             },
             AgentEvent::GoalEvaluation {
+                seq,
+                goal,
+                started_at_ms,
+                at_ms,
                 verdict,
                 reason,
                 evaluation,
                 applied,
+                outcome,
                 usage,
                 cost,
                 billing,
                 model,
             } => Self::Evaluation {
+                seq: *seq,
+                goal: *goal,
+                started_at_ms: *started_at_ms,
+                at_ms: *at_ms,
                 verdict: *verdict,
                 reason,
                 evaluation: *evaluation,
                 applied: *applied,
+                outcome,
                 usage: *usage,
                 cost: *cost,
                 billing: *billing,
                 model,
             },
             AgentEvent::GoalEvaluationFailed {
+                seq,
+                goal,
+                started_at_ms,
+                at_ms,
                 evaluation,
                 message,
                 applied,
@@ -500,6 +537,10 @@ impl<'a> GoalSystemPayload<'a> {
                 billing,
                 model,
             } => Self::EvaluationFailed {
+                seq: *seq,
+                goal: *goal,
+                started_at_ms: *started_at_ms,
+                at_ms: *at_ms,
                 evaluation: *evaluation,
                 message,
                 applied: *applied,
@@ -507,6 +548,19 @@ impl<'a> GoalSystemPayload<'a> {
                 cost: *cost,
                 billing: *billing,
                 model,
+            },
+            AgentEvent::GoalSkipped {
+                seq,
+                goal,
+                evaluation,
+                probability,
+                at_ms,
+            } => Self::Skipped {
+                seq: *seq,
+                goal: *goal,
+                evaluation: *evaluation,
+                probability: *probability,
+                at_ms: *at_ms,
             },
             AgentEvent::GoalDeferred {
                 active_background_tasks,
@@ -538,6 +592,11 @@ impl<'a> GoalSystemPayload<'a> {
 /// finished, or how far one still active has come.
 #[derive(Serialize)]
 struct GoalReport<'a> {
+    /// The goal's number in the session's goal log, `0` for one finished
+    /// before goals were numbered.
+    goal: u32,
+    /// Unix milliseconds, `0` when not known.
+    set_at_ms: u64,
     condition: &'a str,
     verdict: Option<GoalVerdict>,
     reason: Option<&'a str>,
@@ -551,6 +610,8 @@ struct GoalReport<'a> {
 impl<'a> From<&'a GoalResult> for GoalReport<'a> {
     fn from(result: &'a GoalResult) -> Self {
         Self {
+            goal: result.goal,
+            set_at_ms: result.set_at_ms,
             condition: &result.condition,
             verdict: Some(result.verdict),
             reason: Some(&result.reason),
@@ -566,6 +627,8 @@ impl<'a> From<&'a GoalResult> for GoalReport<'a> {
 impl<'a> From<&'a GoalSnapshot> for GoalReport<'a> {
     fn from(goal: &'a GoalSnapshot) -> Self {
         Self {
+            goal: goal.goal,
+            set_at_ms: goal.set_at_ms,
             condition: &goal.condition,
             verdict: goal.last_verdict,
             reason: goal.last_reason.as_deref(),
@@ -601,6 +664,108 @@ struct GoalSetRequest {
     condition: String,
     continuation_limit: Option<u32>,
     kickoff: Option<bool>,
+}
+
+/// A client's page of the goal log: the evaluations of `goal` and before seq
+/// `before`, when given. `limit` defaults to [`GOAL_LOG_DEFAULT_LIMIT`] and is
+/// clamped to `1..=`[`GOAL_LOG_MAX_LIMIT`].
+#[derive(Deserialize)]
+struct GoalLogRequest {
+    goal: Option<u32>,
+    before: Option<u64>,
+    limit: Option<usize>,
+}
+
+impl GoalLogRequest {
+    fn page_size(&self) -> usize {
+        self.limit
+            .unwrap_or(GOAL_LOG_DEFAULT_LIMIT)
+            .clamp(1, GOAL_LOG_MAX_LIMIT)
+    }
+}
+
+/// What `goal_log` answers. Both lists run newest first, and `next_before`
+/// is the `before` that asks for the next page, `null` on the last one.
+#[derive(Serialize)]
+struct GoalLogReply<'a> {
+    goals: Vec<LoggedGoal<'a>>,
+    evaluations: Vec<LoggedGoalEvaluation<'a>>,
+    next_before: Option<u64>,
+}
+
+/// One goal as the session keeps it. `ended_at_ms`, `ended_history_len` and
+/// `end` are `null` while it is active.
+#[derive(Serialize)]
+struct LoggedGoal<'a> {
+    goal: u32,
+    condition: &'a str,
+    set_at_ms: u64,
+    set_history_len: usize,
+    ended_at_ms: Option<u64>,
+    ended_history_len: Option<usize>,
+    end: Option<&'a GoalEnd>,
+    evaluations: u32,
+    elapsed_ms: u64,
+    usage: &'a StoredTokenUsage,
+    cost_usd: f64,
+    subscription_cost_usd: f64,
+}
+
+impl<'a> From<&'a StoredGoalRecord> for LoggedGoal<'a> {
+    fn from(goal: &'a StoredGoalRecord) -> Self {
+        Self {
+            goal: goal.goal,
+            condition: &goal.condition,
+            set_at_ms: goal.set_at_ms,
+            set_history_len: goal.set_history_len,
+            ended_at_ms: goal.ended_at_ms,
+            ended_history_len: goal.ended_history_len,
+            end: goal.end.as_ref(),
+            evaluations: goal.evaluations,
+            elapsed_ms: goal.elapsed_ms,
+            usage: &goal.usage,
+            cost_usd: goal.cost_usd,
+            subscription_cost_usd: goal.subscription_cost_usd,
+        }
+    }
+}
+
+/// One check of a goal as the session keeps it. `verdict` is the evaluator's
+/// own, `null` when none came, and `model`, `usage` and `cost` are `null`
+/// when no evaluator ran.
+#[derive(Serialize)]
+struct LoggedGoalEvaluation<'a> {
+    seq: u64,
+    goal: u32,
+    evaluation: u32,
+    started_at_ms: u64,
+    at_ms: u64,
+    history_len: usize,
+    verdict: Option<&'a str>,
+    reason: &'a str,
+    outcome: &'a GoalEvaluationOutcome,
+    model: Option<&'a str>,
+    usage: Option<&'a StoredTokenUsage>,
+    cost: Option<f64>,
+}
+
+impl<'a> From<&'a StoredGoalEvaluation> for LoggedGoalEvaluation<'a> {
+    fn from(evaluation: &'a StoredGoalEvaluation) -> Self {
+        Self {
+            seq: evaluation.seq,
+            goal: evaluation.goal,
+            evaluation: evaluation.evaluation,
+            started_at_ms: evaluation.started_at_ms,
+            at_ms: evaluation.at_ms,
+            history_len: evaluation.history_len,
+            verdict: evaluation.verdict.as_deref(),
+            reason: &evaluation.reason,
+            outcome: &evaluation.outcome,
+            model: evaluation.model.as_deref(),
+            usage: evaluation.usage.as_ref(),
+            cost: evaluation.cost,
+        }
+    }
 }
 
 /// The `system` / `autopilot` body: one autopilot event, named by `kind`. A
@@ -2562,25 +2727,29 @@ fn handle_control_request(
                 ),
             }
         }
-        GOAL_SET => writer.emit_answer(
-            &cr.request_id,
-            goal_set(
+        GOAL_SET => {
+            let answer = goal_set(
                 &cr.request.extra,
                 &handle.goal,
                 handle.autopilot.as_ref(),
                 prompts,
                 &handle.input_tx,
-            ),
-        ),
-        GOAL_CLEAR => writer.emit_answer(
-            &cr.request_id,
-            goal_clear(&handle.goal, handle.autopilot.as_ref()),
-        ),
+            );
+            handle.write_goal_log();
+            writer.emit_answer(&cr.request_id, answer)
+        }
+        GOAL_CLEAR => {
+            let answer = goal_clear(&handle.goal, handle.autopilot.as_ref());
+            handle.write_goal_log();
+            writer.emit_answer(&cr.request_id, answer)
+        }
         GOAL_STATUS => writer.emit_answer(&cr.request_id, goal_status(&handle.goal)),
-        AUTOPILOT_START => writer.emit_answer(
-            &cr.request_id,
-            autopilot_start(&cr.request.extra, handle, prompts),
-        ),
+        GOAL_LOG => answer_goal_log(writer, &cr.request_id, &cr.request.extra, handle),
+        AUTOPILOT_START => {
+            let answer = autopilot_start(&cr.request.extra, handle, prompts);
+            handle.write_goal_log();
+            writer.emit_answer(&cr.request_id, answer)
+        }
         AUTOPILOT_STOP => writer.emit_answer(&cr.request_id, autopilot_stop(handle)),
         AUTOPILOT_STATUS => writer.emit_answer(
             &cr.request_id,
@@ -2869,6 +3038,61 @@ fn goal_status(goal: &GoalHandle) -> Result<Value, String> {
         continuation_limit: goal.continuation_limit(),
     })
     .map_err(|error| error.to_string())
+}
+
+/// `goal_log` for a client, whether a goal is active or not. The log is read
+/// off the control thread, so a busy database never holds up the session's
+/// input.
+fn answer_goal_log(
+    writer: &SdkWriter,
+    request_id: &str,
+    extra: &Value,
+    handle: &InteractiveHandle,
+) -> Result<()> {
+    let request = match GoalLogRequest::deserialize(extra) {
+        Ok(request) => request,
+        Err(error) => {
+            return writer.emit_control_response(
+                request_id,
+                None,
+                Some(format!("{GOAL_LOG}: {error}")),
+            );
+        }
+    };
+    let state_dir = handle.state_dir.clone();
+    let session_id = handle.session_id.id();
+    forward_control(
+        writer,
+        request_id,
+        smol::unblock(move || {
+            goal_log(&state_dir, session_id, &request)
+                .map_err(|error| format!("{GOAL_LOG}: {error}"))
+        }),
+        control_reply,
+    );
+    Ok(())
+}
+
+/// One page of the session's goal evaluations, newest first, beside the goals
+/// the request covers.
+fn goal_log(state_dir: &StateDir, session_id: CaudraId, request: &GoalLogRequest) -> Result<Value> {
+    let limit = request.page_size();
+    let database = SessionDatabase::open_read_only(state_dir)?;
+    let mut evaluations =
+        database.page_goal_evaluations(session_id, request.goal, request.before, limit + 1)?;
+    let next_before = if evaluations.len() > limit {
+        evaluations.truncate(limit);
+        evaluations.last().map(|evaluation| evaluation.seq)
+    } else {
+        None
+    };
+    let mut goals = database.load_goals(session_id)?;
+    goals.retain(|stored| request.goal.is_none_or(|goal| goal == stored.goal));
+    Ok(serde_json::to_value(GoalLogReply {
+        goals: goals.iter().rev().map(LoggedGoal::from).collect(),
+        evaluations: evaluations.iter().map(LoggedGoalEvaluation::from).collect(),
+        next_before,
+    })?)
 }
 
 /// The init message with what the session can do beyond the Claude Code
@@ -3658,6 +3882,7 @@ impl EventPump {
                 }
             }
             AgentEvent::GoalEvaluating { .. }
+            | AgentEvent::GoalSkipped { .. }
             | AgentEvent::GoalFinished { .. }
             | AgentEvent::GoalDeferred { .. }
             | AgentEvent::GoalLoopCap { .. }
@@ -6377,7 +6602,7 @@ mod tests {
         assert_eq!(payload["cwd"], "/tmp");
         assert_eq!(
             payload["goal_controls"],
-            serde_json::json!([GOAL_SET, GOAL_CLEAR, GOAL_STATUS])
+            serde_json::json!([GOAL_SET, GOAL_CLEAR, GOAL_STATUS, GOAL_LOG])
         );
         (
             payload["workflows"].as_bool().unwrap(),
@@ -6397,10 +6622,20 @@ mod tests {
     const GOAL_DURATION_MS: u64 = 1_500;
     const GOAL_TASKS: usize = 2;
     const GOAL_CWD: &str = "/project";
+    const GOAL_SEQ: u64 = 9;
+    const GOAL_NUMBER: u32 = 3;
+    const OTHER_GOAL_NUMBER: u32 = 4;
+    const GOAL_STARTED_AT_MS: u64 = 1_790_000_000_000;
+    const GOAL_AT_MS: u64 = 1_790_000_004_000;
+    const GOAL_PASS_PROBABILITY: f64 = 0.25;
+    const PAGED_EVALUATIONS: u64 = 5;
+    const GOAL_PAGE_LIMIT: usize = 2;
     static GOAL_THINKING: ThinkingConfig = ThinkingConfig::Off;
 
     fn goal_result() -> GoalResult {
         GoalResult {
+            goal: GOAL_NUMBER,
+            set_at_ms: GOAL_STARTED_AT_MS,
             condition: Arc::from(GOAL_CONDITION),
             verdict: GoalVerdict::Met,
             reason: Arc::from(GOAL_REASON),
@@ -6425,20 +6660,30 @@ mod tests {
             ),
             "evaluation" => (
                 AgentEvent::GoalEvaluation {
-                    verdict: GoalVerdict::NotMet,
+                    seq: GOAL_SEQ,
+                    goal: GOAL_NUMBER,
+                    started_at_ms: GOAL_STARTED_AT_MS,
+                    at_ms: GOAL_AT_MS,
+                    verdict: GoalVerdict::Impossible,
                     reason: GOAL_REASON.into(),
                     evaluation: GOAL_EVALUATION,
                     applied: true,
+                    outcome: GoalEvaluationOutcome::Reconsidered,
                     usage: TokenUsage::default(),
                     cost: Some(GOAL_COST),
                     billing: Billing::Api,
                     model: GOAL_MODEL.into(),
                 },
                 serde_json::json!({
-                    "verdict": "not_met",
+                    "seq": GOAL_SEQ,
+                    "goal": GOAL_NUMBER,
+                    "started_at_ms": GOAL_STARTED_AT_MS,
+                    "at_ms": GOAL_AT_MS,
+                    "verdict": "impossible",
                     "reason": GOAL_REASON,
                     "evaluation": GOAL_EVALUATION,
                     "applied": true,
+                    "outcome": {"status": "reconsidered"},
                     "cost": GOAL_COST,
                     "model": GOAL_MODEL,
                 }),
@@ -6446,6 +6691,10 @@ mod tests {
             ),
             "evaluation_failed" => (
                 AgentEvent::GoalEvaluationFailed {
+                    seq: GOAL_SEQ,
+                    goal: GOAL_NUMBER,
+                    started_at_ms: GOAL_STARTED_AT_MS,
+                    at_ms: GOAL_AT_MS,
                     evaluation: GOAL_EVALUATION,
                     message: GOAL_FAILURE.into(),
                     applied: false,
@@ -6455,6 +6704,10 @@ mod tests {
                     model: GOAL_MODEL.into(),
                 },
                 serde_json::json!({
+                    "seq": GOAL_SEQ,
+                    "goal": GOAL_NUMBER,
+                    "started_at_ms": GOAL_STARTED_AT_MS,
+                    "at_ms": GOAL_AT_MS,
                     "evaluation": GOAL_EVALUATION,
                     "message": GOAL_FAILURE,
                     "applied": false,
@@ -6462,6 +6715,23 @@ mod tests {
                     "model": GOAL_MODEL,
                 }),
                 Some(GOAL_COST),
+            ),
+            "skipped" => (
+                AgentEvent::GoalSkipped {
+                    seq: GOAL_SEQ,
+                    goal: GOAL_NUMBER,
+                    evaluation: GOAL_EVALUATION,
+                    probability: GOAL_PASS_PROBABILITY,
+                    at_ms: GOAL_AT_MS,
+                },
+                serde_json::json!({
+                    "seq": GOAL_SEQ,
+                    "goal": GOAL_NUMBER,
+                    "evaluation": GOAL_EVALUATION,
+                    "probability": GOAL_PASS_PROBABILITY,
+                    "at_ms": GOAL_AT_MS,
+                }),
+                None,
             ),
             "deferred" => (
                 AgentEvent::GoalDeferred {
@@ -6476,6 +6746,8 @@ mod tests {
                     autopilot_owned: false,
                 },
                 serde_json::json!({
+                    "goal": GOAL_NUMBER,
+                    "set_at_ms": GOAL_STARTED_AT_MS,
                     "condition": GOAL_CONDITION,
                     "verdict": "met",
                     "reason": GOAL_REASON,
@@ -6521,6 +6793,7 @@ mod tests {
     #[test_case("evaluating"; "evaluating")]
     #[test_case("evaluation"; "evaluation")]
     #[test_case("evaluation_failed"; "evaluation_failed")]
+    #[test_case("skipped"; "skipped")]
     #[test_case("deferred"; "deferred")]
     #[test_case("finished"; "finished")]
     #[test_case("loop_cap"; "loop_cap")]
@@ -7909,10 +8182,11 @@ mod tests {
         session
     }
 
-    /// What `autopilot_log` answers `request` with, once the log is read.
-    fn autopilot_log_reply(session: &InteractiveHandle, request: Value) -> Value {
+    /// What the log control `subtype` answers `request` with, once the log is
+    /// read.
+    fn log_reply(session: &InteractiveHandle, subtype: &str, request: Value) -> Value {
         let (writer, out_rx) = sdk_writer();
-        send_control(&writer, session, AUTOPILOT_LOG, request);
+        send_control(&writer, session, subtype, request);
         drop(writer);
         let reply: Value = serde_json::from_str(&out_rx.recv().unwrap()).unwrap();
         assert_eq!(reply["response"]["subtype"], "success", "{reply}");
@@ -8053,7 +8327,7 @@ mod tests {
         let session = logged_session(&state, &[], &[]);
 
         assert_eq!(
-            autopilot_log_reply(&session, serde_json::json!({})),
+            log_reply(&session, AUTOPILOT_LOG, serde_json::json!({})),
             serde_json::json!({"engagements": [], "decisions": [], "next_before": null})
         );
     }
@@ -8070,8 +8344,9 @@ mod tests {
             .collect();
         let session = logged_session(&state, &[], &decisions);
 
-        let log = autopilot_log_reply(
+        let log = log_reply(
             &session,
+            AUTOPILOT_LOG,
             serde_json::json!({"limit": PAGE_LIMIT, "before": before}),
         );
 
@@ -8101,7 +8376,11 @@ mod tests {
             ],
         );
 
-        let log = autopilot_log_reply(&session, serde_json::json!({"engagement": engagement}));
+        let log = log_reply(
+            &session,
+            AUTOPILOT_LOG,
+            serde_json::json!({"engagement": engagement}),
+        );
 
         let engagements = log["engagements"]
             .as_array()
@@ -8138,7 +8417,7 @@ mod tests {
             &[decided.clone().into(), stood_down.into()],
         );
 
-        let log = autopilot_log_reply(&session, serde_json::json!({}));
+        let log = log_reply(&session, AUTOPILOT_LOG, serde_json::json!({}));
 
         assert_eq!(
             log["engagements"],
@@ -8168,6 +8447,200 @@ mod tests {
             serde_json::json!({"status": "taken_over"})
         );
         assert_eq!(decided_entry, &serde_json::to_value(&decided).unwrap());
+    }
+
+    fn logged_goal(goal: u32) -> StoredGoalRecord {
+        StoredGoalRecord {
+            goal,
+            condition: GOAL_CONDITION.into(),
+            set_at_ms: GOAL_STARTED_AT_MS,
+            set_history_len: 0,
+            ended_at_ms: None,
+            ended_history_len: None,
+            end: None,
+            evaluations: 0,
+            elapsed_ms: 0,
+            usage: StoredTokenUsage::default(),
+            cost_usd: 0.0,
+            subscription_cost_usd: 0.0,
+        }
+    }
+
+    fn logged_evaluation(seq: u64, goal: u32) -> StoredGoalEvaluation {
+        StoredGoalEvaluation {
+            seq,
+            goal,
+            evaluation: GOAL_EVALUATION,
+            started_at_ms: GOAL_STARTED_AT_MS,
+            at_ms: GOAL_AT_MS,
+            history_len: 0,
+            verdict: Some(GoalVerdict::NotMet.to_string()),
+            reason: GOAL_REASON.into(),
+            outcome: GoalEvaluationOutcome::Applied,
+            model: None,
+            usage: None,
+            cost: None,
+        }
+    }
+
+    /// A session whose goal log holds `goals` and `evaluations`.
+    fn goal_logged_session(
+        state: &TempDir,
+        goals: &[StoredGoalRecord],
+        evaluations: &[StoredGoalEvaluation],
+    ) -> InteractiveHandle {
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let mut stored = StoredSession::new("provider/model", "/repo");
+        stored.save(&storage).unwrap();
+        let database = SessionDatabase::open(&storage).unwrap();
+        for goal in goals {
+            database.begin_goal(stored.id, goal).unwrap();
+        }
+        for evaluation in evaluations {
+            database
+                .insert_goal_evaluation(stored.id, evaluation)
+                .unwrap();
+        }
+        control_session(&storage, stored.id, None)
+    }
+
+    fn logged_evaluation_seqs(log: &Value) -> Vec<u64> {
+        log["evaluations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|evaluation| evaluation["seq"].as_u64().unwrap())
+            .collect()
+    }
+
+    #[test_case(None => GOAL_LOG_DEFAULT_LIMIT; "the_default")]
+    #[test_case(Some(GOAL_PAGE_LIMIT) => GOAL_PAGE_LIMIT; "a_limit_under_the_cap")]
+    #[test_case(Some(GOAL_LOG_MAX_LIMIT + 1) => GOAL_LOG_MAX_LIMIT; "a_limit_past_the_cap")]
+    #[test_case(Some(0) => 1; "a_zero_limit")]
+    fn a_goal_log_page_holds_its_limit_up_to_the_cap(limit: Option<usize>) -> usize {
+        GoalLogRequest {
+            goal: None,
+            before: None,
+            limit,
+        }
+        .page_size()
+    }
+
+    #[test]
+    fn goal_log_reads_an_empty_log_for_a_session_that_never_set_a_goal() {
+        let state = TempDir::new().unwrap();
+        let session = goal_logged_session(&state, &[], &[]);
+
+        assert_eq!(
+            log_reply(&session, GOAL_LOG, serde_json::json!({})),
+            serde_json::json!({"goals": [], "evaluations": [], "next_before": null})
+        );
+    }
+
+    #[test_case(None => (vec![5, 4], Some(4)); "the_newest_page")]
+    #[test_case(Some(4) => (vec![3, 2], Some(2)); "the_page_before_it")]
+    #[test_case(Some(2) => (vec![1], None); "the_last_page")]
+    fn goal_log_pages_back_through_next_before(before: Option<u64>) -> (Vec<u64>, Option<u64>) {
+        let state = TempDir::new().unwrap();
+        let evaluations: Vec<_> = (1..=PAGED_EVALUATIONS)
+            .map(|seq| logged_evaluation(seq, GOAL_NUMBER))
+            .collect();
+        let session = goal_logged_session(&state, &[logged_goal(GOAL_NUMBER)], &evaluations);
+
+        let log = log_reply(
+            &session,
+            GOAL_LOG,
+            serde_json::json!({"limit": GOAL_PAGE_LIMIT, "before": before}),
+        );
+
+        (logged_evaluation_seqs(&log), log["next_before"].as_u64())
+    }
+
+    /// Seqs 1 and 2 checked the first goal, 3 the second.
+    #[test_case(None => (vec![OTHER_GOAL_NUMBER, GOAL_NUMBER], vec![3, 2, 1]); "every_goal")]
+    #[test_case(Some(GOAL_NUMBER) => (vec![GOAL_NUMBER], vec![2, 1]); "the_first")]
+    #[test_case(Some(OTHER_GOAL_NUMBER) => (vec![OTHER_GOAL_NUMBER], vec![3]); "the_second")]
+    fn goal_log_lists_only_the_goal_asked_for(goal: Option<u32>) -> (Vec<u32>, Vec<u64>) {
+        let state = TempDir::new().unwrap();
+        let session = goal_logged_session(
+            &state,
+            &[logged_goal(GOAL_NUMBER), logged_goal(OTHER_GOAL_NUMBER)],
+            &[
+                logged_evaluation(1, GOAL_NUMBER),
+                logged_evaluation(2, GOAL_NUMBER),
+                logged_evaluation(3, OTHER_GOAL_NUMBER),
+            ],
+        );
+
+        let log = log_reply(&session, GOAL_LOG, serde_json::json!({"goal": goal}));
+
+        let goals = log["goals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|goal| u32::try_from(goal["goal"].as_u64().unwrap()).unwrap())
+            .collect();
+        (goals, logged_evaluation_seqs(&log))
+    }
+
+    #[test]
+    fn goal_log_reads_each_entry_as_the_session_keeps_it() {
+        let state = TempDir::new().unwrap();
+        let session = goal_logged_session(
+            &state,
+            &[StoredGoalRecord {
+                ended_at_ms: Some(GOAL_AT_MS),
+                ended_history_len: Some(GOAL_TASKS),
+                end: Some(GoalEnd::Met),
+                evaluations: GOAL_EVALUATION,
+                elapsed_ms: GOAL_DURATION_MS,
+                cost_usd: GOAL_COST,
+                ..logged_goal(GOAL_NUMBER)
+            }],
+            &[StoredGoalEvaluation {
+                verdict: None,
+                reason: String::new(),
+                outcome: GoalEvaluationOutcome::Skipped {
+                    pass_probability: GOAL_PASS_PROBABILITY,
+                },
+                ..logged_evaluation(GOAL_SEQ, GOAL_NUMBER)
+            }],
+        );
+
+        assert_eq!(
+            log_reply(&session, GOAL_LOG, serde_json::json!({})),
+            serde_json::json!({
+                "goals": [{
+                    "goal": GOAL_NUMBER,
+                    "condition": GOAL_CONDITION,
+                    "set_at_ms": GOAL_STARTED_AT_MS,
+                    "set_history_len": 0,
+                    "ended_at_ms": GOAL_AT_MS,
+                    "ended_history_len": GOAL_TASKS,
+                    "end": {"end": "met"},
+                    "evaluations": GOAL_EVALUATION,
+                    "elapsed_ms": GOAL_DURATION_MS,
+                    "usage": {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0},
+                    "cost_usd": GOAL_COST,
+                    "subscription_cost_usd": 0.0,
+                }],
+                "evaluations": [{
+                    "seq": GOAL_SEQ,
+                    "goal": GOAL_NUMBER,
+                    "evaluation": GOAL_EVALUATION,
+                    "started_at_ms": GOAL_STARTED_AT_MS,
+                    "at_ms": GOAL_AT_MS,
+                    "history_len": 0,
+                    "verdict": null,
+                    "reason": "",
+                    "outcome": {"status": "skipped", "pass_probability": GOAL_PASS_PROBABILITY},
+                    "model": null,
+                    "usage": null,
+                    "cost": null,
+                }],
+                "next_before": null,
+            })
+        );
     }
 
     #[test_case(true; "a_replaced_goal")]

@@ -18,6 +18,7 @@ use rusqlite::Error as SqliteError;
 use tracing::warn;
 
 use crate::autopilot::StoredAutopilot;
+use crate::goal_log::StoredGoalCursor;
 use crate::id::CaudraId;
 use crate::permission_state::PermissionRuleRecord;
 use crate::thinking::StoredThinking;
@@ -294,6 +295,13 @@ pub enum StoredGoalVerdict {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredGoalResult {
+    /// The goal's number in the session's goal log, `0` on a meta written
+    /// before goals were numbered.
+    #[serde(default)]
+    pub goal: u32,
+    /// Unix milliseconds, `0` on a meta written before it was kept.
+    #[serde(default)]
+    pub set_at_ms: u64,
     pub condition: String,
     pub verdict: StoredGoalVerdict,
     pub reason: String,
@@ -312,6 +320,13 @@ pub struct StoredGoalResult {
 /// closed would be a lie in the other direction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredActiveGoal {
+    /// The goal's number in the session's goal log, `0` on a meta written
+    /// before goals were numbered.
+    #[serde(default)]
+    pub goal: u32,
+    /// Unix milliseconds, `0` on a meta written before it was kept.
+    #[serde(default)]
+    pub set_at_ms: u64,
     pub condition: String,
     #[serde(default)]
     pub evaluations: u32,
@@ -502,6 +517,10 @@ pub struct SessionMeta {
     pub goal_result: Option<Box<StoredGoalResult>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_continuation_limit: Option<u32>,
+    /// Where goal and evaluation numbering stands, `None` before the first
+    /// goal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_log: Option<StoredGoalCursor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autopilot: Option<Box<StoredAutopilot>>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

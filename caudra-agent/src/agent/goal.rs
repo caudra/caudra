@@ -1,5 +1,7 @@
+use std::collections::VecDeque;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::mem;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use caudra_config::ModelPolicy;
@@ -9,12 +11,17 @@ use caudra_providers::{
     AgentError, Billing, ContentBlock, Message, Model, ModelPurpose, RequestOptions, Timeouts,
     TokenUsage,
 };
+use caudra_storage::goal_log::{
+    GoalEnd, GoalEvaluationOutcome, GoalLogWrite, StoredGoalCursor, StoredGoalEvaluation,
+    StoredGoalRecord,
+};
 use caudra_storage::sessions::{
-    SessionMeta, StoredActiveGoal, StoredGoalResult, StoredGoalVerdict,
+    SessionMeta, StoredActiveGoal, StoredGoalResult, StoredGoalVerdict, StoredTokenUsage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use strum::Display;
+use tracing::warn;
 
 use super::judging::{
     self, INITIAL_TRANSCRIPT_PERCENT, ONE_JSON_OBJECT_ERROR, RETRY_TRANSCRIPT_PERCENT,
@@ -23,12 +30,16 @@ use super::judging::{
 };
 use super::run::estimate_message_tokens;
 use super::streaming::stream_silent_with_retry;
+use crate::automation::clock::{Clock, SystemClock};
 use crate::cancel::CancelToken;
 use crate::{AgentEvent, EventSender};
 
 pub const MAX_GOAL_CHARS: usize = 4_000;
 pub const DEFAULT_GOAL_CONTINUATION_LIMIT: u32 = 16;
 pub const MAX_GOAL_CONTINUATION_LIMIT: u32 = 100;
+/// Goal log writes a handle holds for its frontend. Past it the oldest is
+/// dropped, so a handle nobody drains stays bounded.
+const MAX_UNLOGGED_GOAL_WRITES: usize = 512;
 const EVALUATOR_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(30);
 const EVALUATOR_OUTPUT_TOKENS: u32 = 4_096;
 const MAX_EVALUATOR_OUTPUT_BYTES: usize = 64 * 1024;
@@ -60,6 +71,10 @@ pub enum GoalVerdict {
 
 #[derive(Debug, Clone)]
 pub struct GoalSnapshot {
+    /// The goal's number in the session's goal log, counted from 1.
+    pub goal: u32,
+    /// Unix milliseconds.
+    pub set_at_ms: u64,
     pub condition: Arc<str>,
     pub evaluations: u32,
     pub last_verdict: Option<GoalVerdict>,
@@ -102,6 +117,11 @@ impl From<StoredGoalVerdict> for GoalVerdict {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GoalResult {
+    /// The goal's number in the session's goal log, `0` for one finished
+    /// before goals were numbered.
+    pub goal: u32,
+    /// Unix milliseconds, `0` when not known.
+    pub set_at_ms: u64,
     pub condition: Arc<str>,
     pub verdict: GoalVerdict,
     pub reason: Arc<str>,
@@ -119,12 +139,36 @@ pub enum GoalStatus {
 }
 
 /// A goal as `SessionMeta` keeps it: the active goal, the last finished one,
-/// and the session's continuation limit.
+/// the session's continuation limit, and where goal log numbering stands.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredGoal {
     pub active: Option<Box<StoredActiveGoal>>,
     pub result: Option<Box<StoredGoalResult>>,
     pub continuation_limit: Option<u32>,
+    pub log: Option<StoredGoalCursor>,
+}
+
+/// One check of a goal, as [`GoalHandle::log_evaluation`] files it.
+pub(crate) struct EvaluationDraft {
+    pub evaluation: u32,
+    /// Unix milliseconds.
+    pub started_at_ms: u64,
+    pub history_len: usize,
+    /// The evaluator's own verdict, `None` when none came.
+    pub verdict: Option<GoalVerdict>,
+    pub reason: String,
+    pub outcome: GoalEvaluationOutcome,
+    pub model: Option<String>,
+    pub usage: Option<StoredTokenUsage>,
+    pub cost: Option<f64>,
+}
+
+/// Where a logged evaluation landed: its number and when it was filed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoggedEvaluation {
+    pub seq: u64,
+    /// Unix milliseconds.
+    pub at_ms: u64,
 }
 
 struct GoalState {
@@ -132,6 +176,12 @@ struct GoalState {
     active: Option<GoalSnapshot>,
     finished: Option<GoalResult>,
     continuation_limit: u32,
+    /// The newest goal's number, `0` before the first.
+    last_goal: u32,
+    /// The newest evaluation's number, `0` before the first.
+    last_seq: u64,
+    /// Goal log writes the frontend has yet to take, oldest first.
+    unlogged: VecDeque<GoalLogWrite>,
 }
 
 impl Default for GoalState {
@@ -141,13 +191,47 @@ impl Default for GoalState {
             active: None,
             finished: None,
             continuation_limit: DEFAULT_GOAL_CONTINUATION_LIMIT,
+            last_goal: 0,
+            last_seq: 0,
+            unlogged: VecDeque::new(),
         }
     }
 }
 
-#[derive(Clone, Default)]
+impl GoalState {
+    fn journal(&mut self, write: GoalLogWrite) {
+        if self.unlogged.len() >= MAX_UNLOGGED_GOAL_WRITES {
+            self.unlogged.pop_front();
+            warn!(
+                cap = MAX_UNLOGGED_GOAL_WRITES,
+                "goal log backlog full, dropping its oldest write"
+            );
+        }
+        self.unlogged.push_back(write);
+    }
+
+    /// Takes the active goal, journaling how it ended.
+    fn end_active(&mut self, end: GoalEnd, at_ms: u64) -> Option<GoalSnapshot> {
+        let active = self.active.take()?;
+        self.generation = self.generation.wrapping_add(1);
+        self.journal(GoalLogWrite::Ended(ended_record(&active, end, at_ms)));
+        Some(active)
+    }
+}
+
+/// One session's goal. Clones share it. Every transition it makes is
+/// journaled for the frontend to drain into the session's goal log, so no
+/// caller that sets or clears a goal has to report it.
+#[derive(Clone)]
 pub struct GoalHandle {
     inner: Arc<Mutex<GoalState>>,
+    clock: Arc<dyn Clock>,
+}
+
+impl Default for GoalHandle {
+    fn default() -> Self {
+        Self::new(Arc::new(SystemClock::new()))
+    }
 }
 
 pub(crate) enum GoalApply {
@@ -157,18 +241,54 @@ pub(crate) enum GoalApply {
 }
 
 impl GoalHandle {
-    /// Reopens a goal a previous run left active, with the spend, evaluation
-    /// count and clock it had then. A condition that no longer validates is
-    /// dropped rather than resumed: the panel would have nothing to show and
-    /// the evaluator nothing to check.
-    pub fn restored(stored: Option<&StoredActiveGoal>) -> Self {
-        let handle = Self::default();
-        if let Some(stored) = stored
+    pub fn new(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            inner: Arc::default(),
+            clock,
+        }
+    }
+
+    /// Reopens everything a session stored of its goal: the active goal, the
+    /// result of the last finished one, the continuation limit, and the goal
+    /// log's numbering.
+    pub fn from_meta(meta: &SessionMeta) -> Self {
+        Self::from_meta_with_clock(meta, Arc::new(SystemClock::new()))
+    }
+
+    /// [`Self::from_meta`] on `clock`. An active goal resumes with the spend,
+    /// evaluation count and clock it had. One stored before goals were
+    /// numbered takes the next number and journals its start, dated back by
+    /// the time it had run. A condition that no longer validates is dropped
+    /// rather than resumed: the panel would have nothing to show and the
+    /// evaluator nothing to check.
+    pub fn from_meta_with_clock(meta: &SessionMeta, clock: Arc<dyn Clock>) -> Self {
+        let handle = Self::new(clock);
+        let now_ms = handle.now_ms();
+        let mut state = handle.lock();
+        if let Some(cursor) = &meta.goal_log {
+            state.last_goal = cursor.last_goal;
+            state.last_seq = cursor.last_seq;
+        }
+        if let Some(limit) = meta.goal_continuation_limit {
+            state.continuation_limit = limit.min(MAX_GOAL_CONTINUATION_LIMIT);
+        }
+        if let Some(stored) = meta.active_goal.as_deref()
             && let Ok(condition) = Goal::validate(&stored.condition)
         {
-            let mut state = handle.lock();
+            let legacy = stored.goal == 0;
+            state.last_goal = if legacy {
+                state.last_goal.saturating_add(1)
+            } else {
+                state.last_goal.max(stored.goal)
+            };
             state.generation = state.generation.wrapping_add(1);
-            state.active = Some(GoalSnapshot {
+            let snapshot = GoalSnapshot {
+                goal: if legacy { state.last_goal } else { stored.goal },
+                set_at_ms: if stored.set_at_ms == 0 {
+                    now_ms.saturating_sub(stored.elapsed_ms)
+                } else {
+                    stored.set_at_ms
+                },
                 condition,
                 evaluations: stored.evaluations,
                 last_verdict: stored.last_verdict.map(Into::into),
@@ -179,20 +299,18 @@ impl GoalHandle {
                 cost: stored.usage.cost,
                 subscription_cost: stored.usage.subscription_cost,
                 generation: state.generation,
-            });
+            };
+            if legacy {
+                state.journal(GoalLogWrite::Begun(begun_record(&snapshot)));
+            }
+            state.active = Some(snapshot);
         }
-        handle
-    }
-
-    /// Reopens everything a session stored of its goal: the active goal, the
-    /// result of the last finished one, and the continuation limit.
-    pub fn from_meta(meta: &SessionMeta) -> Self {
-        let handle = Self::restored(meta.active_goal.as_deref());
-        if let Some(limit) = meta.goal_continuation_limit {
-            handle.set_continuation_limit(limit);
-        }
-        if let Some(stored) = meta.goal_result.as_deref() {
-            handle.restore_finished(GoalResult {
+        if let Some(stored) = meta.goal_result.as_deref()
+            && state.active.is_none()
+        {
+            state.finished = Some(GoalResult {
+                goal: stored.goal,
+                set_at_ms: stored.set_at_ms,
                 condition: Arc::from(stored.condition.as_str()),
                 verdict: stored.verdict.into(),
                 reason: Arc::from(stored.reason.as_str()),
@@ -203,6 +321,7 @@ impl GoalHandle {
                 subscription_cost: stored.usage.subscription_cost,
             });
         }
+        drop(state);
         handle
     }
 
@@ -213,6 +332,8 @@ impl GoalHandle {
         StoredGoal {
             active: state.active.as_ref().map(|goal| {
                 Box::new(StoredActiveGoal {
+                    goal: goal.goal,
+                    set_at_ms: goal.set_at_ms,
                     condition: goal.condition.to_string(),
                     evaluations: goal.evaluations,
                     elapsed_ms: saturating_millis(goal.elapsed()),
@@ -227,6 +348,8 @@ impl GoalHandle {
                 .filter(|_| state.active.is_none())
                 .map(|goal| {
                     Box::new(StoredGoalResult {
+                        goal: goal.goal,
+                        set_at_ms: goal.set_at_ms,
                         condition: goal.condition.to_string(),
                         verdict: goal.verdict.into(),
                         reason: goal.reason.to_string(),
@@ -236,6 +359,10 @@ impl GoalHandle {
                     })
                 }),
             continuation_limit: Some(state.continuation_limit),
+            log: (state.last_goal > 0 || state.last_seq > 0).then(|| StoredGoalCursor {
+                last_goal: state.last_goal,
+                last_seq: state.last_seq,
+            }),
         }
     }
 
@@ -244,10 +371,16 @@ impl GoalHandle {
         Ok(self.set_validated(condition))
     }
 
+    /// Starts the next goal, ending an active one as replaced.
     fn set_validated(&self, condition: Arc<str>) -> GoalSnapshot {
+        let now_ms = self.now_ms();
         let mut state = self.lock();
+        state.end_active(GoalEnd::Replaced, now_ms);
         state.generation = state.generation.wrapping_add(1);
+        state.last_goal = state.last_goal.saturating_add(1);
         let snapshot = GoalSnapshot {
+            goal: state.last_goal,
+            set_at_ms: now_ms,
             condition,
             evaluations: 0,
             last_verdict: None,
@@ -259,24 +392,33 @@ impl GoalHandle {
             subscription_cost: None,
             generation: state.generation,
         };
+        state.journal(GoalLogWrite::Begun(begun_record(&snapshot)));
         state.finished = None;
         state.active = Some(snapshot.clone());
         snapshot
     }
 
     pub fn clear(&self) -> Option<GoalSnapshot> {
-        let mut state = self.lock();
-        let active = state.active.take();
-        if active.is_some() {
-            state.generation = state.generation.wrapping_add(1);
-        }
-        active
+        let now_ms = self.now_ms();
+        self.lock().end_active(GoalEnd::Cleared, now_ms)
+    }
+
+    /// Clears the active goal because the run failed with `message`.
+    pub fn clear_after_error(&self, message: &str) -> Option<GoalSnapshot> {
+        let now_ms = self.now_ms();
+        self.lock().end_active(
+            GoalEnd::Error {
+                message: message.to_owned(),
+            },
+            now_ms,
+        )
     }
 
     pub fn reset(&self) {
+        let now_ms = self.now_ms();
         let mut state = self.lock();
+        state.end_active(GoalEnd::Cleared, now_ms);
         state.generation = state.generation.wrapping_add(1);
-        state.active = None;
         state.finished = None;
     }
 
@@ -284,6 +426,39 @@ impl GoalHandle {
         let mut state = self.lock();
         if state.active.is_none() {
             state.finished = Some(result);
+        }
+    }
+
+    /// Takes over `other`'s goal, its number and its log numbering without
+    /// journaling anything: the goal moves between handles, it does not
+    /// start or end. Writes `other` had yet to hand over move with it.
+    pub fn adopt(&self, other: &GoalHandle) {
+        if Arc::ptr_eq(&self.inner, &other.inner) {
+            return;
+        }
+        let (generation, active, finished, last_goal, last_seq, mut unlogged) = {
+            let mut other = other.lock();
+            (
+                other.generation,
+                other.active.clone(),
+                other.finished.clone(),
+                other.last_goal,
+                other.last_seq,
+                mem::take(&mut other.unlogged),
+            )
+        };
+        let mut state = self.lock();
+        state.generation = state.generation.max(generation).wrapping_add(1);
+        let current = state.generation;
+        state.active = active.map(|goal| GoalSnapshot {
+            generation: current,
+            ..goal
+        });
+        state.finished = finished;
+        state.last_goal = state.last_goal.max(last_goal);
+        state.last_seq = state.last_seq.max(last_seq);
+        for write in unlogged.drain(..) {
+            state.journal(write);
         }
     }
 
@@ -313,6 +488,44 @@ impl GoalHandle {
 
     pub fn set_continuation_limit(&self, limit: u32) {
         self.lock().continuation_limit = limit.min(MAX_GOAL_CONTINUATION_LIMIT);
+    }
+
+    /// Unix milliseconds, as goal log rows are stamped.
+    pub fn now_ms(&self) -> u64 {
+        u64::try_from(self.clock.now_ms()).unwrap_or_default()
+    }
+
+    /// Files one check of goal `goal`, the number its check started under, so
+    /// a check that outlived its goal still lands under the goal it judged.
+    pub(crate) fn log_evaluation(&self, goal: u32, draft: EvaluationDraft) -> LoggedEvaluation {
+        let at_ms = self.now_ms();
+        let mut state = self.lock();
+        state.last_seq = state.last_seq.saturating_add(1);
+        let seq = state.last_seq;
+        state.journal(GoalLogWrite::Evaluated(Box::new(StoredGoalEvaluation {
+            seq,
+            goal,
+            evaluation: draft.evaluation,
+            started_at_ms: draft.started_at_ms,
+            at_ms,
+            history_len: draft.history_len,
+            verdict: draft.verdict.map(|verdict| verdict.to_string()),
+            reason: draft.reason,
+            outcome: draft.outcome,
+            model: draft.model,
+            usage: draft.usage,
+            cost: draft.cost,
+        })));
+        LoggedEvaluation { seq, at_ms }
+    }
+
+    /// The goal log writes journaled since the last take, oldest first.
+    pub fn take_log(&self) -> Vec<GoalLogWrite> {
+        self.lock().unlogged.drain(..).collect()
+    }
+
+    pub fn has_unlogged(&self) -> bool {
+        !self.lock().unlogged.is_empty()
     }
 
     pub fn record_external_usage(&self, usage: TokenUsage, cost: Option<f64>, billing: Billing) {
@@ -355,6 +568,7 @@ impl GoalHandle {
         verdict: GoalVerdict,
         reason: Arc<str>,
     ) -> GoalApply {
+        let now_ms = self.now_ms();
         let mut state = self.lock();
         let Some(active) = state
             .active
@@ -371,14 +585,22 @@ impl GoalHandle {
             return GoalApply::Continue { evaluation };
         }
 
-        let active = state.active.take().expect("active goal checked above");
-        let duration = active.elapsed();
+        let end = if verdict == GoalVerdict::Met {
+            GoalEnd::Met
+        } else {
+            GoalEnd::Impossible
+        };
+        let active = state
+            .end_active(end, now_ms)
+            .expect("active goal checked above");
         state.finished = Some(GoalResult {
+            goal: active.goal,
+            set_at_ms: active.set_at_ms,
+            duration: active.elapsed(),
             condition: active.condition,
             verdict,
             reason,
             evaluations: active.evaluations,
-            duration,
             usage: active.usage,
             cost: active.cost,
             subscription_cost: active.subscription_cost,
@@ -386,8 +608,35 @@ impl GoalHandle {
         GoalApply::Terminal
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, GoalState> {
+    fn lock(&self) -> MutexGuard<'_, GoalState> {
         self.inner.lock().unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+/// A goal as its log row records it, with no end and its history placement
+/// left for the frontend to stamp.
+fn begun_record(goal: &GoalSnapshot) -> StoredGoalRecord {
+    StoredGoalRecord {
+        goal: goal.goal,
+        condition: goal.condition.to_string(),
+        set_at_ms: goal.set_at_ms,
+        set_history_len: 0,
+        ended_at_ms: None,
+        ended_history_len: None,
+        end: None,
+        evaluations: goal.evaluations,
+        elapsed_ms: saturating_millis(goal.elapsed()),
+        usage: goal.usage.spent(goal.cost, goal.subscription_cost),
+        cost_usd: goal.cost.unwrap_or_default(),
+        subscription_cost_usd: goal.subscription_cost.unwrap_or_default(),
+    }
+}
+
+fn ended_record(goal: &GoalSnapshot, end: GoalEnd, at_ms: u64) -> StoredGoalRecord {
+    StoredGoalRecord {
+        ended_at_ms: Some(at_ms),
+        end: Some(end),
+        ..begun_record(goal)
     }
 }
 
@@ -856,6 +1105,7 @@ pub(crate) fn is_unrecoverable(error: &AgentError) -> bool {
 mod tests {
     use super::*;
     use crate::agent::judging::{TOOL_ERROR_LINE, TOOL_RESULT_LINE, UNNAMED_TOOL};
+    use crate::automation::clock::FakeClock;
     use caudra_providers::provider::BoxFuture;
     use caudra_providers::{
         CacheKey, ImageMediaType, ImageSource, ModelInfo, ProviderEvent, Role, StreamResponse,
@@ -879,6 +1129,24 @@ mod tests {
     const ELAPSED_BEFORE_RESUME_MS: u64 = 90_000;
     const COUNTS_TIME_BEFORE_RESUME: &str =
         "a resumed goal's duration must include the time it ran before the resume";
+    const OTHER_PROMPT: &str = "ship it again";
+    const RUN_ERROR: &str = "credit balance too low";
+    const START_MS: i64 = 1_767_225_600_000;
+    const START_MS_U64: u64 = START_MS as u64;
+    const RAN: Duration = Duration::from_secs(90);
+    const RAN_MS: u64 = 90_000;
+    const GOAL_COST: f64 = 0.25;
+    const NUMBERED_GOAL: u32 = 4;
+    const LAST_SEQ: u64 = 40;
+    const EXTRA_WRITES: usize = 3;
+    const JOURNALS_IN_ORDER: &str = "each transition must journal its goal log writes in order";
+    const JOURNALS_TIMES: &str = "a finished goal must journal when it ran and what it spent";
+    const STALE_KEEPS_GOAL: &str = "a stale check must land under the goal it judged";
+    const RESUMES_NUMBERING: &str = "numbering must continue from the stored cursor";
+    const RESTORED_NUMBERED: &str =
+        "a restored goal must keep its number, or take and journal the next one";
+    const CAP_DROPS_OLDEST: &str = "a full backlog must drop its oldest write";
+    const ADOPT_LOGS_NOTHING: &str = "adopting a goal must journal nothing of its own";
 
     struct NullProvider;
 
@@ -1023,14 +1291,10 @@ mod tests {
 
     #[test]
     fn a_resumed_goal_finishes_with_the_time_it_ran_before_the_resume() {
-        let handle = GoalHandle::restored(Some(&StoredActiveGoal {
-            condition: PROMPT.to_owned(),
-            evaluations: 0,
-            elapsed_ms: ELAPSED_BEFORE_RESUME_MS,
-            usage: Default::default(),
-            last_verdict: None,
-            last_reason: None,
-        }));
+        let handle = GoalHandle::from_meta(&SessionMeta {
+            active_goal: Some(Box::new(stored_active(NUMBERED_GOAL))),
+            ..SessionMeta::default()
+        });
         let goal = handle.snapshot().expect("the stored goal must resume");
         assert!(matches!(
             handle.apply_evaluation(goal.generation, GoalVerdict::Met, Arc::from(VERIFIED)),
@@ -1042,6 +1306,287 @@ mod tests {
         assert!(
             result.duration >= Duration::from_millis(ELAPSED_BEFORE_RESUME_MS),
             "{COUNTS_TIME_BEFORE_RESUME}"
+        );
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Journaled {
+        Begun(u32),
+        Ended(u32, GoalEnd),
+        Evaluated { seq: u64, goal: u32 },
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Transition {
+        Set,
+        Replace,
+        Clear,
+        ClearAfterError,
+        Met,
+        Impossible,
+        Reset,
+    }
+
+    fn clocked() -> (Arc<FakeClock>, GoalHandle) {
+        let clock = FakeClock::new(START_MS);
+        (Arc::clone(&clock), GoalHandle::new(clock))
+    }
+
+    fn journaled(handle: &GoalHandle) -> Vec<Journaled> {
+        handle
+            .take_log()
+            .into_iter()
+            .map(|write| match write {
+                GoalLogWrite::Begun(record) => Journaled::Begun(record.goal),
+                GoalLogWrite::Ended(record) => {
+                    Journaled::Ended(record.goal, record.end.expect("an end must say how"))
+                }
+                GoalLogWrite::Evaluated(evaluation) => Journaled::Evaluated {
+                    seq: evaluation.seq,
+                    goal: evaluation.goal,
+                },
+            })
+            .collect()
+    }
+
+    fn draft() -> EvaluationDraft {
+        EvaluationDraft {
+            evaluation: 1,
+            started_at_ms: START_MS_U64,
+            history_len: 0,
+            verdict: Some(GoalVerdict::NotMet),
+            reason: VERIFIED.into(),
+            outcome: GoalEvaluationOutcome::Applied,
+            model: None,
+            usage: None,
+            cost: None,
+        }
+    }
+
+    fn stored_active(goal: u32) -> StoredActiveGoal {
+        StoredActiveGoal {
+            goal,
+            set_at_ms: 0,
+            condition: PROMPT.to_owned(),
+            evaluations: 0,
+            elapsed_ms: ELAPSED_BEFORE_RESUME_MS,
+            usage: Default::default(),
+            last_verdict: None,
+            last_reason: None,
+        }
+    }
+
+    #[test_case(Transition::Set, vec![Journaled::Begun(1)] ; "set_begins")]
+    #[test_case(Transition::Replace, vec![Journaled::Begun(1), Journaled::Ended(1, GoalEnd::Replaced), Journaled::Begun(2)] ; "replace_ends_then_begins")]
+    #[test_case(Transition::Clear, vec![Journaled::Begun(1), Journaled::Ended(1, GoalEnd::Cleared)] ; "clear_ends_cleared")]
+    #[test_case(Transition::ClearAfterError, vec![Journaled::Begun(1), Journaled::Ended(1, GoalEnd::Error { message: RUN_ERROR.into() })] ; "error_ends_with_its_message")]
+    #[test_case(Transition::Met, vec![Journaled::Begun(1), Journaled::Ended(1, GoalEnd::Met)] ; "met_ends_met")]
+    #[test_case(Transition::Impossible, vec![Journaled::Begun(1), Journaled::Ended(1, GoalEnd::Impossible)] ; "impossible_ends_impossible")]
+    #[test_case(Transition::Reset, vec![Journaled::Begun(1), Journaled::Ended(1, GoalEnd::Cleared)] ; "reset_ends_cleared")]
+    fn each_transition_journals_its_writes_in_order(
+        transition: Transition,
+        expected: Vec<Journaled>,
+    ) {
+        let (_clock, handle) = clocked();
+        let goal = handle.set(PROMPT).unwrap();
+
+        match transition {
+            Transition::Set => {}
+            Transition::Replace => {
+                handle.set(OTHER_PROMPT).unwrap();
+            }
+            Transition::Clear => {
+                handle.clear();
+            }
+            Transition::ClearAfterError => {
+                handle.clear_after_error(RUN_ERROR);
+            }
+            Transition::Met | Transition::Impossible => {
+                let verdict = if matches!(transition, Transition::Met) {
+                    GoalVerdict::Met
+                } else {
+                    GoalVerdict::Impossible
+                };
+                handle.apply_evaluation(goal.generation, verdict, Arc::from(VERIFIED));
+            }
+            Transition::Reset => handle.reset(),
+        }
+
+        assert_eq!(journaled(&handle), expected, "{JOURNALS_IN_ORDER}");
+    }
+
+    #[test]
+    fn a_finished_goal_journals_its_times_and_spend() {
+        let (clock, handle) = clocked();
+        let goal = handle.set(PROMPT).unwrap();
+        handle.record_usage_for(
+            goal.generation,
+            TokenUsage::default(),
+            Some(GOAL_COST),
+            Billing::Api,
+        );
+        clock.advance(RAN);
+
+        handle.apply_evaluation(goal.generation, GoalVerdict::Met, Arc::from(VERIFIED));
+
+        let writes = handle.take_log();
+        let [GoalLogWrite::Begun(begun), GoalLogWrite::Ended(ended)] = writes.as_slice() else {
+            panic!("a goal set then met must journal its start and end: {writes:?}");
+        };
+        assert_eq!(
+            (begun.set_at_ms, ended.set_at_ms, ended.ended_at_ms),
+            (START_MS_U64, START_MS_U64, Some(START_MS_U64 + RAN_MS)),
+            "{JOURNALS_TIMES}"
+        );
+        assert_eq!(
+            (ended.evaluations, ended.cost_usd, ended.usage.cost),
+            (1, GOAL_COST, Some(GOAL_COST)),
+            "{JOURNALS_TIMES}"
+        );
+    }
+
+    #[test]
+    fn a_stale_evaluation_keeps_the_number_of_the_goal_it_judged() {
+        let (_clock, handle) = clocked();
+        let old = handle.set(PROMPT).unwrap();
+        handle.set(OTHER_PROMPT).unwrap();
+        handle.take_log();
+
+        let logged = handle.log_evaluation(old.goal, draft());
+
+        assert_eq!(
+            (logged.seq, journaled(&handle)),
+            (
+                1,
+                vec![Journaled::Evaluated {
+                    seq: 1,
+                    goal: old.goal
+                }]
+            ),
+            "{STALE_KEEPS_GOAL}"
+        );
+    }
+
+    #[test]
+    fn numbering_resumes_from_the_cursor() {
+        let handle = GoalHandle::from_meta_with_clock(
+            &SessionMeta {
+                goal_log: Some(StoredGoalCursor {
+                    last_goal: NUMBERED_GOAL,
+                    last_seq: LAST_SEQ,
+                }),
+                ..SessionMeta::default()
+            },
+            FakeClock::new(START_MS),
+        );
+
+        let goal = handle.set(PROMPT).unwrap();
+        let logged = handle.log_evaluation(goal.goal, draft());
+
+        assert_eq!(
+            (goal.goal, logged.seq, handle.stored().log),
+            (
+                NUMBERED_GOAL + 1,
+                LAST_SEQ + 1,
+                Some(StoredGoalCursor {
+                    last_goal: NUMBERED_GOAL + 1,
+                    last_seq: LAST_SEQ + 1,
+                })
+            ),
+            "{RESUMES_NUMBERING}"
+        );
+    }
+
+    #[test_case(0, NUMBERED_GOAL + 1, true ; "legacy_goal_takes_the_next_number")]
+    #[test_case(NUMBERED_GOAL, NUMBERED_GOAL, false ; "numbered_goal_keeps_its_number")]
+    fn a_restored_goal_is_numbered(stored_goal: u32, expected_goal: u32, begins: bool) {
+        let handle = GoalHandle::from_meta_with_clock(
+            &SessionMeta {
+                active_goal: Some(Box::new(stored_active(stored_goal))),
+                goal_log: Some(StoredGoalCursor {
+                    last_goal: NUMBERED_GOAL,
+                    last_seq: LAST_SEQ,
+                }),
+                ..SessionMeta::default()
+            },
+            FakeClock::new(START_MS),
+        );
+
+        let writes = handle.take_log();
+        let snapshot = handle.snapshot().expect("the stored goal must resume");
+        assert_eq!(snapshot.goal, expected_goal, "{RESTORED_NUMBERED}");
+        let expected = begins.then_some((expected_goal, START_MS_U64 - ELAPSED_BEFORE_RESUME_MS));
+        let begun = match writes.as_slice() {
+            [GoalLogWrite::Begun(record)] => Some((record.goal, record.set_at_ms)),
+            [] => None,
+            other => panic!("a restore journals at most its start: {other:?}"),
+        };
+        assert_eq!(begun, expected, "{RESTORED_NUMBERED}");
+    }
+
+    #[test]
+    fn a_full_backlog_drops_its_oldest_write() {
+        let (_clock, handle) = clocked();
+        for _ in 0..MAX_UNLOGGED_GOAL_WRITES + EXTRA_WRITES {
+            handle.log_evaluation(NUMBERED_GOAL, draft());
+        }
+
+        let writes = journaled(&handle);
+
+        assert_eq!(
+            (writes.len(), writes.first()),
+            (
+                MAX_UNLOGGED_GOAL_WRITES,
+                Some(&Journaled::Evaluated {
+                    seq: EXTRA_WRITES as u64 + 1,
+                    goal: NUMBERED_GOAL
+                })
+            ),
+            "{CAP_DROPS_OLDEST}"
+        );
+    }
+
+    #[test_case(true ; "drained_source")]
+    #[test_case(false ; "undrained_source")]
+    fn adopting_a_goal_journals_nothing_new(drained: bool) {
+        let (_clock, source) = clocked();
+        let goal = source.set(PROMPT).unwrap();
+        source.log_evaluation(goal.goal, draft());
+        if drained {
+            source.take_log();
+        }
+        let (_other_clock, handle) = clocked();
+
+        handle.adopt(&source);
+
+        let expected = if drained {
+            Vec::new()
+        } else {
+            vec![
+                Journaled::Begun(goal.goal),
+                Journaled::Evaluated {
+                    seq: 1,
+                    goal: goal.goal,
+                },
+            ]
+        };
+        assert_eq!(journaled(&handle), expected, "{ADOPT_LOGS_NOTHING}");
+        assert!(!source.has_unlogged(), "{ADOPT_LOGS_NOTHING}");
+        let adopted = handle.snapshot().expect("the adopted goal must be active");
+        assert_eq!(
+            (adopted.goal, handle.stored().log),
+            (
+                goal.goal,
+                Some(StoredGoalCursor {
+                    last_goal: goal.goal,
+                    last_seq: 1,
+                })
+            ),
+            "{ADOPT_LOGS_NOTHING}"
+        );
+        assert!(
+            handle.is_generation_active(adopted.generation),
+            "{ADOPT_LOGS_NOTHING}"
         );
     }
 

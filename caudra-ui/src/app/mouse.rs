@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crate::agent::AgentCommand;
-use crate::components::autopilot_panel::PanelTab;
+use crate::components::audit_log::PanelTab;
 use crate::components::command::ChatScope;
 use crate::components::help_modal::HelpMouse;
 use crate::components::input::{ChordHint, InputHit};
@@ -257,16 +257,13 @@ impl App {
             self.handle_projection_action(action);
             return Vec::new();
         }
-        // The goal footer names session commands rather than modal state, and
-        // `/goal-model` opens a picker this modal is drawn over, so the click
-        // closes the modal before the command runs.
-        if self.goal_modal.is_open() && !self.permission_prompt_holds_input() {
+        if self.goal_panel.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
-            let Some(cmdline) = self.goal_modal.handle_mouse(event) else {
-                return Vec::new();
-            };
-            self.goal_modal.close();
-            return self.run_footer_command(cmdline);
+            return self
+                .goal_panel
+                .handle_mouse(event)
+                .map(|action| self.on_goal_panel(action))
+                .unwrap_or_default();
         }
         if self.autopilot_panel.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
@@ -905,7 +902,7 @@ impl App {
 
     /// A footer that names a session command runs it as typing it would, and
     /// says why when the command is refused.
-    fn run_footer_command(&mut self, cmdline: &str) -> Vec<Action> {
+    pub(super) fn run_footer_command(&mut self, cmdline: &str) -> Vec<Action> {
         match self.run_cmdline(cmdline, 0) {
             Ok(actions) => actions,
             Err(error) => {
@@ -1246,8 +1243,7 @@ impl App {
                 Vec::new()
             }
             StatusBarHitTarget::Goal => {
-                self.clear_control_hovers();
-                self.goal_modal.open();
+                self.open_goal_panel(PanelTab::Status);
                 Vec::new()
             }
             StatusBarHitTarget::Autopilot => {
@@ -1425,7 +1421,7 @@ impl App {
         dismiss!(self.storage_modal);
         dismiss!(self.system_prompt_modal);
         dismiss!(self.projection_modal);
-        dismiss!(self.goal_modal);
+        dismiss!(self.goal_panel);
         dismiss!(self.autopilot_panel);
 
         dismiss!(self.command_modal);

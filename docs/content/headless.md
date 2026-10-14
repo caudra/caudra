@@ -153,7 +153,7 @@ The `interrupt` control stops the parent and all session tasks, shell jobs, and 
 A stream-json session can pursue a [completion goal](/docs/commands/#completion-goals), checked by the same evaluator as `/goal` in the TUI. A `/goal` user message reaches the model as plain text, so the client sets and watches the goal through controls. Every stream-json session answers them, and `init` lists them:
 
 ```json
-{"type":"system","subtype":"init","goal_controls":["goal_set","goal_clear","goal_status"],...}
+{"type":"system","subtype":"init","goal_controls":["goal_set","goal_clear","goal_status","goal_log"],...}
 ```
 
 #### Goal controls
@@ -170,8 +170,9 @@ Goal controls use the same `control_request` envelope as task and workflow contr
 | `goal_set` | `condition`, `continuation_limit` (optional), `kickoff` (optional, default `true`) | Set the goal, replacing the active goal and the last finished one. Unless `kickoff` is `false`, queue the condition as a prompt | The new goal's status |
 | `goal_clear` | None | Clear the active goal. A finished goal stays on record | `cleared`: the condition it cleared, or `null` |
 | `goal_status` | None | Read the active goal, or the last finished one when none is active | `status`: `active`, `finished`, or `none` |
+| `goal_log` | `goal` (optional), `before` (optional), `limit` (optional, default `100`, at most `500`) | Read the session's [log](#goal-log), with goals or without | The log |
 
-A successful `control_response` carries the reply in `response.response`. Failures use `response.error`. A status reply always carries the session's `continuation_limit`. Unless `status` is `none`, it also carries the goal under the field names of the [`finished` event](#goal-events). For an active goal, `verdict` and `reason` come from the latest evaluation and are `null` before the first.
+A successful `control_response` carries the reply in `response.response`. Failures use `response.error`. A status reply always carries the session's `continuation_limit`. Unless `status` is `none`, it also carries the goal under the field names of the [`finished` event](#goal-events). `goal` numbers the session's goals from 1, and `set_at_ms` is when the goal was set. For an active goal, `verdict` and `reason` come from the latest evaluation and are `null` before the first.
 
 The queued prompt is the condition with the kickoff instructions `/goal` adds. It runs like a prompt the client sent, with its own `turn_start` and `result`. With `kickoff: false`, nothing starts, and the goal is evaluated when the next run ends.
 
@@ -185,22 +186,37 @@ Every goal event arrives as a `system` message with subtype `goal`, before the `
 
 ```json
 {"type":"system","subtype":"goal","kind":"evaluation","verdict":"not_met",
- "reason":"two tests still fail","evaluation":2,"applied":true,"cost":0.0054,
- "billing":"api","model":"anthropic/claude-haiku-4-5",...}
+ "reason":"two tests still fail","seq":7,"goal":2,"evaluation":2,"applied":true,
+ "started_at_ms":1790000000000,"at_ms":1790000004200,"outcome":{"status":"applied"},
+ "cost":0.0054,"billing":"api","model":"anthropic/claude-haiku-4-5",...}
 ```
 
 | `kind` | Fields | When |
 |--------|--------|------|
 | `evaluating` | `evaluation` | An evaluation starts. `evaluation` numbers it within the goal |
-| `evaluation` | `verdict` (`met`, `not_met`, or `impossible`), `reason`, `evaluation`, `applied`, `usage`, `cost`, `billing`, `model` | The evaluator answered |
-| `evaluation_failed` | `evaluation`, `message`, `applied`, `usage`, `cost`, `billing`, `model` | The evaluator call failed. The goal stays active |
+| `evaluation` | `verdict` (`met`, `not_met`, or `impossible`), `reason`, `seq`, `goal`, `evaluation`, `started_at_ms`, `at_ms`, `applied`, `outcome`, `usage`, `cost`, `billing`, `model` | The evaluator answered |
+| `evaluation_failed` | `seq`, `goal`, `evaluation`, `started_at_ms`, `at_ms`, `message`, `applied`, `usage`, `cost`, `billing`, `model` | The evaluator call failed. The goal stays active |
+| `skipped` | `seq`, `goal`, `evaluation`, `probability`, `at_ms` | The decision engine's [goal prescreen](/docs/configuration/#decisions) skipped an evaluation it judged unlikely to pass. `probability` is the estimated chance of a pass |
 | `deferred` | `active_background_tasks` | The run ended before session work settled, so evaluation waits. See [Check-ins and resume](#check-ins-and-resume) |
-| `finished` | `condition`, `verdict`, `reason`, `evaluations`, `duration_ms`, `usage`, `cost`, `subscription_cost` | The goal was met or judged impossible, and cleared itself |
+| `finished` | `goal`, `condition`, `set_at_ms`, `verdict`, `reason`, `evaluations`, `duration_ms`, `usage`, `cost`, `subscription_cost` | The goal was met or judged impossible, and cleared itself |
 | `loop_cap` | `evaluations`, `continuations`, `limit` | The run used all its automatic continuations. The goal stays active |
 | `turn_limit` | `evaluations` | The run reached its turn limit. The goal stays active |
 | `cleared_after_error` | `condition`, `message` | An unrecoverable error ended the run and cleared the goal |
 
 `applied` is `false` when the outcome no longer counts, for example because the goal was replaced while the evaluator ran. `billing` says who pays `cost`: `api` or `subscription`. The `usage`, `cost`, and `subscription_cost` of `finished` total the goal's whole spend, evaluator calls included. As in the `result`, `cost` is money owed and `subscription_cost` the list price a subscription covered.
+
+`seq` numbers every check in the session, across goals, and `goal` numbers the session's goals from 1. When the bound evaluator fails and the check falls back to the chat model, the [log](#goal-log) records the failed attempt with `applied: false`. That attempt sends an event only when it spent tokens, so the `seq` of events can skip numbers the log holds.
+
+`outcome` says what became of the check. Its `status` is one of these:
+
+| `status` | Meaning |
+|----------|---------|
+| `applied` | The verdict took effect |
+| `reconsidered` | The evaluator said `impossible` and a second opinion disagreed, so the goal continued as not met |
+| `deferred` | Work or input arrived during the check, so the goal waits for a [check-in](#check-ins-and-resume) |
+| `stale` | The goal was cleared or replaced during the check |
+| `skipped` | The goal prescreen skipped the check. `pass_probability` holds its estimate |
+| `failed` | The evaluator call failed. `message` says why, and `applied` says whether the goal it checked was still active |
 
 Evaluator spend also counts in the run's `result`. Unlike one-shot `--print`, an impossible goal, a failed evaluation, or the continuation cap leaves that `result` a success, so read these outcomes from the goal events.
 
@@ -210,7 +226,40 @@ A `deferred` goal waits for session tasks, shell jobs, and workflows to settle, 
 
 A prompt that arrives first takes the check-in's place. An `interrupt`, a `set_permission_mode` request, or a run that stops short of a normal end of turn calls the check-in off. That covers an error, a cancellation, and the turn or output-token limit. In each case the goal stays active and is evaluated when the next run ends.
 
-The goal belongs to the session, which saves it after every run and when stdin closes. `--resume <ID>` restores the active goal with its evaluation count, spend, elapsed time, and latest verdict and reason, along with the last finished goal and the continuation limit. `goal_status` reports what came back. A resumed goal waits for the next prompt and is evaluated at the end of that run.
+The goal belongs to the session, which saves it after every run and when stdin closes. `--resume <ID>` restores the active goal with its evaluation count, spend, elapsed time, and latest verdict and reason, along with the last finished goal and the continuation limit. `goal_status` reports what came back. A resumed goal waits for the next prompt and is evaluated at the end of that run. The [goal log](#goal-log) lives in the session's database, so it survives `--resume` too.
+
+#### Goal log
+
+`goal_log` reads the session's goals and their checks from its database. A session that never had a goal replies with empty lists:
+
+```json
+{"goals":[{"goal":2,"condition":"tests pass and cargo clippy is clean",
+   "set_at_ms":1790000000000,"set_history_len":14,"ended_at_ms":1790000900000,
+   "ended_history_len":88,"end":{"end":"met"},"evaluations":3,"elapsed_ms":900000,
+   "usage":{...},"cost_usd":0.62,"subscription_cost_usd":0.0}],
+ "evaluations":[{"seq":7,"goal":2,"evaluation":3,"started_at_ms":1790000895000,
+   "at_ms":1790000899000,"history_len":88,"verdict":"met",
+   "reason":"all tests pass and clippy reports no warnings",
+   "outcome":{"status":"applied"},"model":"anthropic/claude-haiku-4-5",
+   "usage":{...},"cost":0.0049}],
+ "next_before":7}
+```
+
+Both lists run newest first. `goals` holds the session's goals, and `evaluations` its newest `limit` checks older than `before`. With `goal`, both hold that goal's alone. `set_history_len` and `ended_history_len` give the transcript length when the goal was set and when it ended. `cost_usd` and `subscription_cost_usd` total the goal's spend, evaluator calls included. An evaluation's `cost` is what its call came to at list price, whoever pays it, and its `usage` holds the tokens with that price under `cost` when billed to the API key or under `subscription_cost` when a subscription covered it.
+
+`end` is `null` while the goal is active. Otherwise its `end` field says how the goal ended:
+
+| `end` | Meaning |
+|-------|---------|
+| `met` | The evaluator judged the goal met |
+| `impossible` | The evaluator judged the goal impossible |
+| `cleared` | The goal was cleared, for example by `goal_clear` |
+| `replaced` | A new goal took its place |
+| `error` | An unrecoverable error cleared it. `message` says what failed |
+
+An evaluation's `verdict` is the evaluator's raw answer, `met`, `not_met`, or `impossible`, and is `null` when it gave none. `reason` is empty when there is none. `outcome` has the fields of the [event's `outcome`](#goal-events). While more checks remain, `next_before` is the `seq` to pass as `before` for the next page, and otherwise it is `null`.
+
+A session keeps its last 200 goals and 2,000 evaluations. The log is deleted with the session, and a fork starts without one.
 
 ### Automations
 

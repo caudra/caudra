@@ -19,7 +19,7 @@ use super::tool_display::{
     truncate_to_header, user_style,
 };
 use super::{
-    DisplayMessage, DisplayRole, DisplaySource, ToolProgress, ToolRole, ToolStatus,
+    DisplayMessage, DisplayRole, DisplaySource, GoalTone, ToolProgress, ToolRole, ToolStatus,
     apply_scroll_rows, automation_inspector,
     code_view::{
         BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, CardPolicy, Disclosure,
@@ -1770,6 +1770,14 @@ impl MessagesPanel {
         self.messages
             .iter()
             .rposition(|msg| matches!(msg.role, DisplayRole::AutopilotDecision(row) if row == seq))
+    }
+
+    /// The row goal evaluation `seq` drew, `None` when the transcript holds
+    /// none.
+    pub fn goal_evaluation_row(&self, seq: u64) -> Option<usize> {
+        self.messages
+            .iter()
+            .rposition(|msg| matches!(msg.role, DisplayRole::GoalEvaluation(row, _) if row == seq))
     }
 
     /// Rewrites the row decision `seq` drew, left folded or open as the
@@ -5890,7 +5898,8 @@ fn display_key(message: &DisplayMessage) -> Option<DisplayKey<'_>> {
         DisplayRole::Error
         | DisplayRole::Done
         | DisplayRole::Decision(_)
-        | DisplayRole::AutopilotDecision(_) => None,
+        | DisplayRole::AutopilotDecision(_)
+        | DisplayRole::GoalEvaluation(..) => None,
     }
 }
 
@@ -6124,9 +6133,10 @@ fn segment_kind(role: &DisplayRole) -> SegmentKind {
         DisplayRole::User => SegmentKind::User,
         DisplayRole::Assistant => SegmentKind::Assistant,
         DisplayRole::Thinking => SegmentKind::Thinking,
-        DisplayRole::Error => SegmentKind::Error,
-        DisplayRole::Done => SegmentKind::Done,
+        DisplayRole::Error | DisplayRole::GoalEvaluation(_, GoalTone::Error) => SegmentKind::Error,
+        DisplayRole::Done | DisplayRole::GoalEvaluation(_, GoalTone::Done) => SegmentKind::Done,
         DisplayRole::Notice
+        | DisplayRole::GoalEvaluation(_, GoalTone::Notice)
         | DisplayRole::Injected
         | DisplayRole::Autopilot
         | DisplayRole::AutopilotDecision(_)
@@ -6215,9 +6225,11 @@ fn build_message_lines(
         DisplayRole::User => user_style(),
         DisplayRole::Assistant => assistant_style(),
         DisplayRole::Thinking => thinking_style(),
-        DisplayRole::Error => error_style(),
-        DisplayRole::Done => done_style(),
-        DisplayRole::Notice | DisplayRole::Injected => notice_style(),
+        DisplayRole::Error | DisplayRole::GoalEvaluation(_, GoalTone::Error) => error_style(),
+        DisplayRole::Done | DisplayRole::GoalEvaluation(_, GoalTone::Done) => done_style(),
+        DisplayRole::Notice
+        | DisplayRole::GoalEvaluation(_, GoalTone::Notice)
+        | DisplayRole::Injected => notice_style(),
         DisplayRole::Autopilot => autopilot_style(),
         DisplayRole::Tool(_)
         | DisplayRole::TaskDelivery(_)

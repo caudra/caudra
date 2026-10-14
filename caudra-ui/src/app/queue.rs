@@ -1078,6 +1078,7 @@ impl App {
                 return SubmitOutcome::Rejected(GOAL_SUBMISSION_ERR);
             }
             self.state.autopilot.drop_goal_ownership();
+            self.flush_goal_log();
             self.flash(GOAL_SET.into());
         }
         if submission.input.mode.is_planning() && self.state.plan.is_ready() {

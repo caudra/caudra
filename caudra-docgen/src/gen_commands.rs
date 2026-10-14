@@ -101,7 +101,29 @@ At the end of each natural work turn, a separate model call evaluates the condit
 
 Run `/goal-model` to open the Goal assignment page directly. `/goal model` is also accepted as an alias. Left unbound, Goal follows Fast. See [Model jobs](#model-jobs) for other assignments and failure behavior.
 
-Run `/goal` without arguments to open the status panel. It shows the condition, evaluator, elapsed time, evaluation count, spend, latest reason, and automatic-continuation limit. Use Left and Right or `-` and `+` to adjust the limit for the current session. The footer shows a compact indicator while a goal is active, and clicking that indicator opens the panel.
+Run `/goal` without arguments to open the status panel. Its Status tab shows the condition, evaluator, elapsed time, evaluation count, spend, latest reason, and automatic-continuation limit. Use Left and Right or `-` and `+` to adjust the limit for the current session. The footer shows a compact indicator while a goal is active, and clicking that indicator opens the panel.
+
+### The goal log
+
+`/goal log` opens the panel's Log tab, which lists every goal the session set and every check of it, newest first. Each goal heads its own group with its condition, when it was set, how it ended (`active`, `met`, `impossible`, `cleared`, `replaced` by a new goal, or `error`), its evaluation count, elapsed time, and spend. Each check shows when it ran, its number, its status, how long it took, the evaluator model, its cost, and the start of its reason. The status is `met`, `not met`, or `impossible` for a verdict that took effect, and otherwise one of these:
+
+| Status | Meaning |
+|---|---|
+| `reconsidered` | The evaluator called the goal impossible, a second opinion disagreed, and work continued |
+| `failed` | The evaluator call failed. A failed call to the bound evaluator before Caudra falls back to the chat model is logged too |
+| `skipped` | The [goal prescreen](/docs/configuration/#decisions) judged the goal unlikely to pass and skipped the check |
+| `deferred` | Work or queued input arrived during the check, so its verdict waits for a check-in |
+| `stale` | The goal was cleared or replaced while the check ran |
+
+| Key | Action |
+|---|---|
+| `f` | Cycle the filter: all, verdicts, failures, then skipped and discarded |
+| `y` | Copy the selected entry as text |
+| Enter | Jump to the entry's row in the transcript. A narrow panel opens its detail first |
+| Left / Right | Focus the list or the entry's detail |
+| Tab / `1`-`2` | Switch between Status and Log |
+
+The detail shows the check's start and end times, the evaluator's own verdict, what became of it, the full reason or error, and its tokens and cost. The transcript rows for checks that were not met, failed checks, and a goal's end come back when you resume. A session keeps its last 200 goals and 2,000 checks. The log goes when the session is deleted, and a fork starts without one.
 
 Use `/goal-clear` to stop early. `/goal clear` remains an alias, and `stop`, `off`, `reset`, `none`, and `cancel` are also accepted after `/goal`, without regard to case.
 

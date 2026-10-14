@@ -4,7 +4,7 @@ use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use crate::decisions::{DecisionNote, Decisions};
@@ -34,6 +34,7 @@ use caudra_providers::{ContentBlock, Role};
 use caudra_storage::autopilot::{
     AutopilotEnd, AutopilotStopper, StoredAutopilotDecision, StoredAutopilotEngagement,
 };
+use caudra_storage::goal_log::GoalLogWrite;
 use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::permission_state::PermissionRuleRecord;
@@ -381,6 +382,7 @@ impl SessionStore {
         meta.active_goal = goal.active;
         meta.goal_result = goal.result;
         meta.goal_continuation_limit = goal.continuation_limit;
+        meta.goal_log = goal.log;
         if let Some(automations) = &self.automations {
             meta.automations = Some(saved_controls(automations));
         }
@@ -398,12 +400,43 @@ impl SessionStore {
                 Ok(())
             })
             .map_err(|error| StorageError::Io(io::Error::other(error)))?;
-        match database.save(&self.session, self.cursor.as_ref()) {
-            Ok(cursor) => {
-                self.cursor = Some(cursor);
-                Ok(())
+        self.cursor = Some(database.save(&self.session, self.cursor.as_ref())?);
+        drop(database);
+        self.write_goal_log();
+        Ok(())
+    }
+
+    /// Writes what the goal journaled since the last write, in order, so a goal's end never
+    /// lands before its start.
+    /// Nothing is written before the session's own record exists, which the next save
+    /// writes. The log is a record, so a row that cannot be written is reported and the
+    /// session carries on.
+    fn write_goal_log(&mut self) {
+        if self.cursor.is_none() || !self.goal.has_unlogged() {
+            return;
+        }
+        let session_id = self.session.id;
+        let mut writes = self.goal.take_log();
+        GoalLogWrite::stamp_batch(&mut writes, self.autopilot_history_len());
+        for write in writes {
+            let (goal, seq) = match &write {
+                GoalLogWrite::Begun(record) | GoalLogWrite::Ended(record) => (record.goal, None),
+                GoalLogWrite::Evaluated(evaluation) => (evaluation.goal, Some(evaluation.seq)),
+            };
+            let written = self.with_database(|database| match &write {
+                GoalLogWrite::Begun(record) => {
+                    database.begin_goal(session_id, record).map(|()| true)
+                }
+                GoalLogWrite::Evaluated(evaluation) => database
+                    .insert_goal_evaluation(session_id, evaluation)
+                    .map(|()| true),
+                GoalLogWrite::Ended(record) => database.end_goal(session_id, record),
+            });
+            match written {
+                Ok(true) => {}
+                Ok(false) => warn!(%session_id, goal, "ended a goal the log lacks"),
+                Err(error) => warn!(%error, %session_id, goal, ?seq, "goal log row not recorded"),
             }
-            Err(error) => Err(error),
         }
     }
 
@@ -550,9 +583,9 @@ impl SessionStore {
         }
     }
 
-    /// History items the session holds, counted as a decision's row counts them. The
-    /// snapshot autopilot last saw is newer during a run, and the stored transcript is
-    /// newer between engagements, so the larger of the two is the nearer.
+    /// History items the session holds, counted as a decision's or a goal check's row counts
+    /// them. The snapshot autopilot last saw is newer during a run, and the stored transcript
+    /// is newer between engagements, so the larger of the two is the nearer.
     fn autopilot_history_len(&self) -> usize {
         let messages = self.session.messages();
         let head = resolve_history_head(
@@ -732,6 +765,7 @@ impl SessionStore {
         &mut self,
         envelope: &Envelope,
     ) -> Result<(), caudra_storage::sessions::SessionError> {
+        self.write_goal_log();
         match &envelope.event {
             AgentEvent::SessionTitle {
                 title: Some(title), ..
@@ -2027,6 +2061,9 @@ pub struct InteractiveHandle {
     pub autopilot: Option<AutopilotHandle>,
     /// Where an engagement change the host makes is announced; see [`announce_autopilot`].
     autopilot_events: flume::WeakSender<Envelope>,
+    /// The session's record, which a goal the host changes reaches through
+    /// [`Self::write_goal_log`]. Weak, so the session's task alone keeps it.
+    store: Weak<Mutex<Option<SessionStore>>>,
     mode_route: Arc<InteractiveModeRoute>,
     workspace_change_tx: flume::Sender<WorkspaceChangeRequest>,
     remote_workspace: Option<Arc<StdMutex<RemoteWorkspaceState>>>,
@@ -2822,6 +2859,7 @@ impl InteractiveHandle {
             automation_events: flume::unbounded().1,
             autopilot: None,
             autopilot_events: flume::unbounded().0.downgrade(),
+            store: Weak::new(),
             mode_route: Arc::default(),
             workspace_change_tx: flume::unbounded().0,
             remote_workspace: None,
@@ -2896,6 +2934,19 @@ impl InteractiveHandle {
             .and_then(|autopilot| autopilot.engage(owns_goal, goal))
         {
             announce_autopilot(&self.autopilot_events, engaged);
+        }
+    }
+
+    /// Writes the goal log rows a goal the host set or cleared owes, so they land without
+    /// waiting for the session's next event or save.
+    pub fn write_goal_log(&self) {
+        if !self.goal.has_unlogged() {
+            return;
+        }
+        if let Some(store) = self.store.upgrade()
+            && let Some(store) = &mut *store.lock_blocking()
+        {
+            store.write_goal_log();
         }
     }
 
@@ -3405,6 +3456,7 @@ async fn spawn_prepared_session(
             )
         });
     let store = Arc::new(Mutex::new(Some(store)));
+    let host_store = Arc::downgrade(&store);
 
     let answer_rx = Arc::new(Mutex::new(answer_rx));
     let active_prompt_profile_name: Arc<str> = Arc::from(
@@ -4101,6 +4153,9 @@ async fn spawn_prepared_session(
                 };
                 if let (Some(automations), Some(claim)) = (&automations, &claim) {
                     automations.set_goal(&goal, claim);
+                    if let Some(store) = &mut *store.lock().await {
+                        store.write_goal_log();
+                    }
                     input.preamble.push(claim_message(claim));
                 }
                 if automatic
@@ -4628,6 +4683,7 @@ async fn spawn_prepared_session(
         automation_events,
         autopilot,
         autopilot_events,
+        store: host_store,
         mode_route,
         workspace_change_tx,
         remote_workspace,
@@ -4842,6 +4898,7 @@ mod tests {
     use caudra_storage::background::TaskRecord;
     use caudra_storage::decision_log::DecisionLog;
     use caudra_storage::engine_decisions::StoredDecisionAnchor;
+    use caudra_storage::goal_log::{GoalEnd, GoalEvaluationOutcome};
     use caudra_storage::permission_state::PermissionRuleRecord;
     use caudra_storage::permission_state::mutation::{
         PermissionMutation, PermissionRecordIdentity, prepare_mutation,
@@ -6961,6 +7018,11 @@ complete(#{ report: first.output });
     const PROMPT_FIRST: &str = "a prompt sent during a goal run must start before the goal goes on";
     const EVALUATED_AFTER_PROMPT: &str =
         "the goal must be evaluated at the end of the prompt's run";
+    const FIRST_GOAL: u32 = 1;
+    const FIRST_EVALUATION_SEQ: u64 = 1;
+    const GOAL_SET_LOGGED: &str =
+        "a goal's start and end must reach the goal log without waiting for a save";
+    const GOAL_CHECK_LOGGED: &str = "a run's goal check must reach the goal log under its goal";
 
     fn text_answer() -> StreamResponse {
         StreamResponse {
@@ -7045,6 +7107,82 @@ complete(#{ report: first.output });
             assert_eq!(meta.active_goal.unwrap().condition, OTHER_GOAL);
             assert!(meta.goal_result.is_none());
             assert_eq!(meta.goal_continuation_limit, Some(GOAL_LIMIT));
+        });
+    }
+
+    fn logged_goals(state_dir: &StateDir) -> Vec<(u32, String, Option<GoalEnd>)> {
+        SessionDatabase::open(state_dir)
+            .unwrap()
+            .load_goals(session_id())
+            .unwrap()
+            .into_iter()
+            .map(|goal| (goal.goal, goal.condition, goal.end))
+            .collect()
+    }
+
+    /// What a goal run journals reaches the session's goal log as it happens: a goal the
+    /// host sets or clears outside any run, and a run's check and the end it led to.
+    #[test]
+    fn the_goal_log_keeps_what_a_goal_run_writes() {
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let (responses, rx) = flume::unbounded();
+            *session.provider.responses.lock().unwrap() = Some(rx);
+            let handle = session.spawn(false).await;
+
+            handle.goal.set(GOAL).unwrap();
+            handle.write_goal_log();
+            assert_eq!(
+                logged_goals(&session.state_dir),
+                [(FIRST_GOAL, GOAL.to_owned(), None)],
+                "{GOAL_SET_LOGGED}"
+            );
+
+            responses.send(text_answer()).unwrap();
+            responses.send(goal_met()).unwrap();
+            handle.input_tx.send(prompt(PROMPT)).unwrap();
+            turn_events(&handle.event_rx).await;
+            handle.goal.set(OTHER_GOAL).unwrap();
+            handle.write_goal_log();
+            handle.goal.clear();
+            handle.write_goal_log();
+
+            assert_eq!(
+                logged_goals(&session.state_dir),
+                [
+                    (FIRST_GOAL, GOAL.to_owned(), Some(GoalEnd::Met)),
+                    (
+                        FIRST_GOAL + 1,
+                        OTHER_GOAL.to_owned(),
+                        Some(GoalEnd::Cleared)
+                    ),
+                ],
+                "{GOAL_SET_LOGGED}"
+            );
+            let [evaluation] = SessionDatabase::open(&session.state_dir)
+                .unwrap()
+                .load_goal_evaluations(session_id())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            assert_eq!(
+                (
+                    evaluation.seq,
+                    evaluation.goal,
+                    evaluation.verdict.as_deref(),
+                    evaluation.reason.as_str(),
+                    evaluation.outcome,
+                ),
+                (
+                    FIRST_EVALUATION_SEQ,
+                    FIRST_GOAL,
+                    Some(GoalVerdict::Met.to_string().as_str()),
+                    GOAL_REASON,
+                    GoalEvaluationOutcome::Applied,
+                ),
+                "{GOAL_CHECK_LOGGED}"
+            );
+            shutdown_interactive(handle).await;
         });
     }
 
@@ -8859,6 +8997,8 @@ complete(#{ report: first.output });
     fn met_goal(autopilot_owned: bool) -> AgentEvent {
         AgentEvent::GoalFinished {
             result: GoalResult {
+                goal: 1,
+                set_at_ms: 0,
                 condition: GOAL.into(),
                 verdict: GoalVerdict::Met,
                 reason: GOAL_REASON.into(),

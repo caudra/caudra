@@ -31,13 +31,15 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use tracing::warn;
 
+use super::goal::LogPlace;
 use super::tasks::MAIN_TASK_ID;
 use super::{
-    App, CONFIRMATION_DURATION, FLASH_CANCEL, IMPLEMENT_CAPTURE_FAILED, MODEL_ARG, Notification,
-    Status, is_goal_clear,
+    App, CONFIRMATION_DURATION, FLASH_CANCEL, IMPLEMENT_CAPTURE_FAILED, LOG_ARG, MODEL_ARG,
+    Notification, Status, is_goal_clear,
 };
+use crate::components::audit_log::{COPIED_ENTRY, PanelTab, ROW_NOT_LOADED};
 use crate::components::autopilot_panel::{
-    AutopilotLog, COPIED_ENTRY, NO_ENTRIES, PanelAction, PanelContent, PanelTab, REASON_SEPARATOR,
+    AutopilotLog, NO_ENTRIES, PanelAction, PanelCommand, PanelContent, REASON_SEPARATOR,
     budget_left, decision_details, decision_title, end_notice, end_reason, goal_line,
     spend_summary, state_label,
 };
@@ -49,18 +51,17 @@ use crate::storage_writer::AutopilotWrite;
 const GOAL_COMMAND: &str = "/goal";
 const AUTOPILOT_COMMAND: &str = "/autopilot";
 const STOP_ARGS: [&str; 2] = ["off", "stop"];
-const LOG_ARG: &str = "log";
 const MS_PER_MINUTE: u64 = 60_000;
 /// How far the stored engagement clock may trail the live one, so time
 /// passing alone does not rewrite an engaged session every frame.
 const ELAPSED_SAVE_STEP_MS: u64 = MS_PER_MINUTE;
 pub(crate) const NOT_ENGAGED_MSG: &str = "Autopilot is not engaged";
-pub(crate) const ROW_NOT_LOADED: &str = "That entry's row is not in the loaded transcript";
 pub(crate) const PLAN_LEFT_TO_YOU: &str = "Autopilot left the plan to you: queued input goes first";
 pub(crate) const ENGAGED_ROW: &str = "engaged";
 pub(crate) const ENDED_ROW: &str = "ended";
 const RETRYING_ROW: &str = "retrying";
 const LINE_BREAK: &str = "\n";
+const AUTOPILOT_LOG: &str = "autopilot";
 /// Autopilot retries the main agent's runs alone.
 const MAIN_CHAT: usize = 0;
 
@@ -201,9 +202,9 @@ impl App {
     }
 
     /// The stored log's transcript rows, every decision and each engagement's
-    /// start and end, with the history length each was made at, so a restore
-    /// places it among the turns. None while the experiment is off.
-    pub(super) fn autopilot_log_rows(&self) -> Vec<(usize, DisplayMessage)> {
+    /// start and end, with the history length and time each was made at, so a
+    /// restore places it among the turns. None while the experiment is off.
+    pub(super) fn autopilot_log_rows(&self) -> Vec<(LogPlace, DisplayMessage)> {
         if !self.features.enabled(Feature::Autopilot) {
             return Vec::new();
         }
@@ -216,15 +217,16 @@ impl App {
                     decision.engagement.unwrap_or_default(),
                     LogRow::Decision,
                 );
-                (order, decision_message(&decision))
+                (order, decision.at_ms, decision_message(&decision))
             });
         let engagements = self
-            .read_autopilot_log(SessionDatabase::load_autopilot_engagements)
+            .read_session_log(AUTOPILOT_LOG, SessionDatabase::load_autopilot_engagements)
             .into_iter()
             .flat_map(|engagement| {
                 let number = engagement.engagement;
                 let engaged = (
                     (engagement.engaged_history_len, number, LogRow::Engaged),
+                    engagement.engaged_at_ms,
                     DisplayMessage::autopilot(ENGAGED_ROW.to_owned()),
                 );
                 let ended = engagement
@@ -233,33 +235,35 @@ impl App {
                     .map(|(history_len, end)| {
                         (
                             (history_len, number, LogRow::Ended),
+                            engagement.ended_at_ms.unwrap_or(engagement.engaged_at_ms),
                             DisplayMessage::autopilot(ended_row(end, &engagement)),
                         )
                     });
                 iter::once(engaged).chain(ended)
             });
         let mut rows: Vec<_> = decisions.chain(engagements).collect();
-        rows.sort_by(|(left, _), (right, _)| left.cmp(right));
+        rows.sort_by(|(left, ..), (right, ..)| left.cmp(right));
         rows.into_iter()
-            .map(|((history_len, ..), row)| (history_len, row))
+            .map(|((history_len, ..), at_ms, row)| ((history_len, at_ms), row))
             .collect()
     }
 
     fn stored_autopilot_decisions(&self) -> Vec<StoredAutopilotDecision> {
-        self.read_autopilot_log(SessionDatabase::load_autopilot_decisions)
+        self.read_session_log(AUTOPILOT_LOG, SessionDatabase::load_autopilot_decisions)
     }
 
-    /// The log is a record, so a session whose log cannot be read resumes
+    /// A log is a record, so a session whose `log` cannot be read resumes
     /// without it.
-    fn read_autopilot_log<T>(
+    pub(super) fn read_session_log<T>(
         &self,
+        log: &'static str,
         read: impl FnOnce(&SessionDatabase, CaudraId) -> Result<Vec<T>, SessionError>,
     ) -> Vec<T> {
         let session_id = self.state.session.id;
         SessionDatabase::open(&self.storage)
             .and_then(|database| read(&database, session_id))
             .unwrap_or_else(|error| {
-                warn!(%error, %session_id, "autopilot log unreadable; resuming without it");
+                warn!(%error, %session_id, log, "log unreadable; resuming without it");
                 Vec::new()
             })
     }
@@ -358,11 +362,11 @@ impl App {
             PanelAction::Copy(text) => self.copy_labelled(&text, COPIED_ENTRY),
             PanelAction::Flash(message) => self.flash(message.into()),
             PanelAction::Jump(seq) => self.jump_to_autopilot_decision(seq),
-            PanelAction::Stop => {
+            PanelAction::Command(PanelCommand::Stop) => {
                 self.autopilot_panel.close();
                 self.stop_autopilot_by_command();
             }
-            PanelAction::Model => {
+            PanelAction::Command(PanelCommand::Model) => {
                 self.autopilot_panel.close();
                 return self.open_autopilot_model_picker();
             }
@@ -378,6 +382,11 @@ impl App {
             return;
         };
         self.autopilot_panel.close();
+        self.scroll_main_to(row);
+    }
+
+    /// Scrolls the main transcript to row `row`, focusing it first.
+    pub(super) fn scroll_main_to(&mut self, row: usize) {
         if !self.is_main_chat()
             && let Err(error) = self.focus_task(MAIN_TASK_ID)
         {
@@ -825,7 +834,7 @@ impl App {
     /// History items the session holds, counted as a decision's row counts
     /// them. The snapshot autopilot last saw is newer during a run, and the
     /// merged transcript between runs, so the larger of the two is the nearer.
-    fn autopilot_history_len(&self) -> usize {
+    pub(super) fn autopilot_history_len(&self) -> usize {
         let transcript =
             crate::transcript_session_history(&self.state.session).map_or(0, |items| items.len());
         self.state

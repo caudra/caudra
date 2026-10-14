@@ -27,8 +27,9 @@ use super::commit_preamble;
 use super::compaction;
 use super::favorites;
 use super::goal::{
-    Evaluator, GOAL_EVALUATOR_ROLE, GoalApply, GoalHandle, GoalSnapshot, GoalStatus, GoalVerdict,
-    ResolvedEvaluator, continuation_message, is_unrecoverable, resolve_evaluator,
+    EvaluationDraft, Evaluator, GOAL_EVALUATOR_ROLE, GoalApply, GoalHandle, GoalSnapshot,
+    GoalStatus, GoalVerdict, ResolvedEvaluator, continuation_message, is_unrecoverable,
+    resolve_evaluator,
 };
 use super::history::{
     CANCEL_MARKER, History, sanitize_cancelled_history, sanitize_failed_history,
@@ -95,6 +96,7 @@ use caudra_decision::{Answer, ChoiceAnswer, Question, QuestionSet, QuestionType}
 use caudra_storage::autopilot::AutopilotEnd;
 use caudra_storage::background::JobOwner;
 use caudra_storage::decision_log::{DecisionEffect, DecisionLabel};
+use caudra_storage::goal_log::GoalEvaluationOutcome;
 use caudra_storage::id::SessionRef;
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::now_epoch;
@@ -1002,7 +1004,7 @@ impl<'h> Agent<'h> {
                     self.end_autopilot(AutopilotEnd::Error {
                         message: e.to_string(),
                     });
-                    if let Some(goal) = self.goal.clear() {
+                    if let Some(goal) = self.goal.clear_after_error(&e.to_string()) {
                         self.event_tx.send(AgentEvent::GoalClearedAfterError {
                             condition: goal.condition.to_string(),
                             message: e.to_string(),
@@ -2771,6 +2773,7 @@ impl<'h> Agent<'h> {
             return self.defer_goal(done_reason);
         }
 
+        let evaluation = goal.evaluations.saturating_add(1);
         let prescreen = self.prescreen_goal(&goal.condition).await;
         if !self.goal_completion_ready() {
             return self.defer_goal(done_reason);
@@ -2798,6 +2801,24 @@ impl<'h> Agent<'h> {
                         probability,
                         threshold,
                     ));
+                    let now_ms = self.goal.now_ms();
+                    let logged = self.goal.log_evaluation(
+                        goal.goal,
+                        self.goal_evaluation_draft(
+                            evaluation,
+                            now_ms,
+                            GoalEvaluationOutcome::Skipped {
+                                pass_probability: probability,
+                            },
+                        ),
+                    );
+                    self.event_tx.send(AgentEvent::GoalSkipped {
+                        seq: logged.seq,
+                        goal: goal.goal,
+                        evaluation,
+                        probability,
+                        at_ms: logged.at_ms,
+                    })?;
                     self.goal_blocks += 1;
                     self.goal_prescreen_skips += 1;
                     self.count_continuation();
@@ -2832,7 +2853,7 @@ impl<'h> Agent<'h> {
             }
         }
         self.goal_prescreen_skips = 0;
-        let evaluation = goal.evaluations.saturating_add(1);
+        let started_at_ms = self.goal.now_ms();
         self.event_tx
             .send(AgentEvent::GoalEvaluating { evaluation })?;
         let binding = caudra_providers::model_registry::binding(ModelPurpose::Goal);
@@ -2857,10 +2878,30 @@ impl<'h> Agent<'h> {
             }
             Err(error) => {
                 let cancelled = matches!(error, AgentError::Cancelled);
+                let message = error.to_string();
+                let applied = self.goal.is_generation_active(goal.generation);
+                let logged = self.goal.log_evaluation(
+                    goal.goal,
+                    EvaluationDraft {
+                        model: Some(binding_label.clone()),
+                        ..self.goal_evaluation_draft(
+                            evaluation,
+                            started_at_ms,
+                            GoalEvaluationOutcome::Failed {
+                                message: message.clone(),
+                                applied,
+                            },
+                        )
+                    },
+                );
                 self.event_tx.send(AgentEvent::GoalEvaluationFailed {
+                    seq: logged.seq,
+                    goal: goal.goal,
+                    started_at_ms,
+                    at_ms: logged.at_ms,
                     evaluation,
-                    message: error.to_string(),
-                    applied: self.goal.is_generation_active(goal.generation),
+                    message,
+                    applied,
                     usage: TokenUsage::default(),
                     cost: None,
                     billing: Billing::default(),
@@ -2905,14 +2946,15 @@ impl<'h> Agent<'h> {
                     error_kind = failure.error.kind(),
                     "goal evaluator model unavailable, falling back to chat model"
                 );
-                if failure.usage != TokenUsage::default() || failure.cost.is_some() {
-                    self.record_goal_evaluation_failure(
-                        goal.generation,
-                        evaluation,
-                        failure,
-                        false,
-                    )?;
-                }
+                let announce = failure.usage != TokenUsage::default() || failure.cost.is_some();
+                self.record_goal_evaluation_failure(
+                    &goal,
+                    evaluation,
+                    started_at_ms,
+                    failure,
+                    false,
+                    announce,
+                )?;
                 evaluator = fallback;
                 Evaluator {
                     provider: &*evaluator.provider,
@@ -2933,7 +2975,14 @@ impl<'h> Agent<'h> {
             Err(failure) => {
                 let cancelled = matches!(failure.error, AgentError::Cancelled);
                 let applied = self.goal.is_generation_active(goal.generation);
-                self.record_goal_evaluation_failure(goal.generation, evaluation, failure, applied)?;
+                self.record_goal_evaluation_failure(
+                    &goal,
+                    evaluation,
+                    started_at_ms,
+                    failure,
+                    applied,
+                    true,
+                )?;
                 if cancelled {
                     return Err(AgentError::Cancelled);
                 }
@@ -2978,11 +3027,36 @@ impl<'h> Agent<'h> {
             self.goal
                 .apply_evaluation(goal.generation, verdict, Arc::clone(&reason))
         };
+        let outcome = if deferred {
+            GoalEvaluationOutcome::Deferred
+        } else if matches!(apply, GoalApply::Stale) {
+            GoalEvaluationOutcome::Stale
+        } else if guidance.is_some() {
+            GoalEvaluationOutcome::Reconsidered
+        } else {
+            GoalEvaluationOutcome::Applied
+        };
+        let logged = self.goal.log_evaluation(
+            goal.goal,
+            EvaluationDraft {
+                verdict: Some(result.verdict),
+                reason: result.reason.clone(),
+                model: Some(result.model.clone()),
+                usage: Some(result.usage.billed(result.cost, result.billing)),
+                cost: result.cost,
+                ..self.goal_evaluation_draft(evaluation, started_at_ms, outcome.clone())
+            },
+        );
         self.event_tx.send(AgentEvent::GoalEvaluation {
+            seq: logged.seq,
+            goal: goal.goal,
+            started_at_ms,
+            at_ms: logged.at_ms,
             verdict,
             reason: result.reason.clone(),
             evaluation,
             applied: !matches!(apply, GoalApply::Stale),
+            outcome,
             usage: result.usage,
             cost: result.cost,
             billing: result.billing,
@@ -3179,20 +3253,73 @@ impl<'h> Agent<'h> {
         Some((decisions, outcome))
     }
 
+    /// A check of `evaluation` with nothing but its outcome, placed after the
+    /// history it judged.
+    fn goal_evaluation_draft(
+        &self,
+        evaluation: u32,
+        started_at_ms: u64,
+        outcome: GoalEvaluationOutcome,
+    ) -> EvaluationDraft {
+        EvaluationDraft {
+            evaluation,
+            started_at_ms,
+            history_len: self.history.transcript().count(),
+            verdict: None,
+            reason: String::new(),
+            outcome,
+            model: None,
+            usage: None,
+            cost: None,
+        }
+    }
+
+    /// Bills and logs a failed check, and reports it when `announce`.
+    #[allow(clippy::too_many_arguments)]
     fn record_goal_evaluation_failure(
         &mut self,
-        generation: u64,
+        goal: &GoalSnapshot,
         evaluation: u32,
+        started_at_ms: u64,
         failure: super::goal::EvaluationError,
         applied: bool,
+        announce: bool,
     ) -> Result<(), AgentError> {
         self.total_usage += failure.usage;
-        self.goal
-            .record_usage_for(generation, failure.usage, failure.cost, failure.billing);
+        self.goal.record_usage_for(
+            goal.generation,
+            failure.usage,
+            failure.cost,
+            failure.billing,
+        );
         self.record_autopilot_spend(failure.cost, failure.billing);
+        let message = failure.error.to_string();
+        let logged = self.goal.log_evaluation(
+            goal.goal,
+            EvaluationDraft {
+                model: Some(failure.model.clone()),
+                usage: Some(failure.usage.billed(failure.cost, failure.billing)),
+                cost: failure.cost,
+                ..self.goal_evaluation_draft(
+                    evaluation,
+                    started_at_ms,
+                    GoalEvaluationOutcome::Failed {
+                        message: message.clone(),
+                        applied,
+                    },
+                )
+            },
+        );
+        if !announce {
+            return Ok(());
+        }
         self.event_tx.send(AgentEvent::GoalEvaluationFailed {
+            seq: logged.seq,
+            goal: goal.goal,
+            started_at_ms,
+            at_ms: logged.at_ms,
             evaluation,
-            message: failure.error.to_string(),
+            message,
             applied,
             usage: failure.usage,
             cost: failure.cost,
@@ -4463,6 +4590,7 @@ mod tests {
     };
     use caudra_storage::StateDir;
     use caudra_storage::decision_log::{DecisionFilter, DecisionLog, StatsThresholds};
+    use caudra_storage::goal_log::GoalLogWrite;
     use caudra_workspace::{
         AuthenticatedPrincipalId, AuthorityIdentity, PlanRef, ProjectIdentity, ProjectKey,
         ResourceId, ResourceRevision, SourceTrustAnchor, WorkspacePath,
@@ -4495,6 +4623,7 @@ mod tests {
     const AUTH_ERROR_STATUS: u16 = 401;
     const DECISION_BASE_URL: &str = "http://127.0.0.1:1";
     const DECISION_GOAL: &str = "tests pass";
+    const LOGS_EVERY_CHECK: &str = "each goal check must log one evaluation and report its fields";
     const DECISION_VERDICT: &str = "not yet verified";
     const DECISION_SKILL: &str = "test-helper";
     const DECISION_SKILL_TASK: &str = "effect-suggestion-regression";
@@ -4722,7 +4851,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let calls = Arc::new(AtomicUsize::new(0));
             let mut history = History::new(Vec::new());
-            let (mut agent, _events) = make_agent(
+            let (mut agent, events) = make_agent(
                 MockProvider::new(vec![goal_response(false, false, DECISION_VERDICT)]),
                 &mut history,
             );
@@ -4748,6 +4877,33 @@ mod tests {
             );
             assert_eq!(agent.goal_blocks, 1);
             assert_eq!(calls.load(Ordering::Relaxed), expected_calls);
+            let outcome = if skipped {
+                GoalEvaluationOutcome::Skipped {
+                    pass_probability: probability,
+                }
+            } else {
+                GoalEvaluationOutcome::Applied
+            };
+            assert_eq!(
+                logged_outcomes(&agent.goal),
+                [(1, outcome)],
+                "{LOGS_EVERY_CHECK}"
+            );
+            let skip_events = events
+                .try_iter()
+                .filter(|envelope| {
+                    matches!(
+                        envelope.event,
+                        AgentEvent::GoalSkipped {
+                            seq: 1,
+                            goal: 1,
+                            evaluation: 1,
+                            ..
+                        }
+                    )
+                })
+                .count();
+            assert_eq!(skip_events, usize::from(skipped), "{LOGS_EVERY_CHECK}");
             let expected = if skipped {
                 DecisionEffect::Skipped
             } else {
@@ -6567,6 +6723,17 @@ mod tests {
         }
     }
 
+    /// The checks a goal handle logged, by the goal each judged.
+    fn logged_outcomes(goal: &GoalHandle) -> Vec<(u32, GoalEvaluationOutcome)> {
+        goal.take_log()
+            .into_iter()
+            .filter_map(|write| match write {
+                GoalLogWrite::Evaluated(evaluation) => Some((evaluation.goal, evaluation.outcome)),
+                GoalLogWrite::Begun(_) | GoalLogWrite::Ended(_) => None,
+            })
+            .collect()
+    }
+
     fn goal_response(ok: bool, impossible: bool, reason: &str) -> StreamResponse {
         assistant_response(vec![ContentBlock::Text {
             text: serde_json::json!({
@@ -7233,6 +7400,23 @@ mod tests {
                 event,
                 AgentEvent::GoalFinished { result, autopilot_owned: false } if result.verdict == super::super::goal::GoalVerdict::Met
             )));
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::GoalEvaluation {
+                        seq: 1,
+                        goal: 1,
+                        outcome: GoalEvaluationOutcome::Applied,
+                        ..
+                    }
+                )),
+                "{LOGS_EVERY_CHECK}"
+            );
+            assert_eq!(
+                logged_outcomes(&goal),
+                [(1, GoalEvaluationOutcome::Applied)],
+                "{LOGS_EVERY_CHECK}"
+            );
             assert!(matches!(goal.status(), Some(GoalStatus::Finished(_))));
             assert_eq!(
                 captured_tools.lock().unwrap().as_slice(),
@@ -7320,8 +7504,18 @@ mod tests {
             assert_eq!(replacement.evaluations, 0);
             assert!(event_rx.try_iter().any(|envelope| matches!(
                 envelope.event,
-                AgentEvent::GoalEvaluation { applied: false, .. }
+                AgentEvent::GoalEvaluation {
+                    applied: false,
+                    goal: 1,
+                    outcome: GoalEvaluationOutcome::Stale,
+                    ..
+                }
             )));
+            assert_eq!(
+                logged_outcomes(&goal),
+                [(1, GoalEvaluationOutcome::Stale)],
+                "{LOGS_EVERY_CHECK}"
+            );
         });
     }
 
@@ -7403,11 +7597,18 @@ mod tests {
                     .iter()
                     .any(|event| matches!(event, AgentEvent::GoalDeferred { .. }))
             );
-            assert!(
-                events.iter().any(|event| matches!(
-                    event,
-                    AgentEvent::GoalEvaluation { applied: false, .. }
-                ))
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentEvent::GoalEvaluation {
+                    applied: false,
+                    outcome: GoalEvaluationOutcome::Deferred,
+                    ..
+                }
+            )));
+            assert_eq!(
+                logged_outcomes(&goal),
+                [(1, GoalEvaluationOutcome::Deferred)],
+                "{LOGS_EVERY_CHECK}"
             );
         });
     }
@@ -7434,10 +7635,19 @@ mod tests {
             assert!(event_rx.try_iter().any(|envelope| matches!(
                 envelope.event,
                 AgentEvent::GoalEvaluationFailed {
+                    seq: 1,
+                    goal: 1,
                     usage: TokenUsage { output: 21, .. },
                     ..
                 }
             )));
+            assert!(
+                matches!(
+                    logged_outcomes(&goal).as_slice(),
+                    [(1, GoalEvaluationOutcome::Failed { applied: true, .. })]
+                ),
+                "{LOGS_EVERY_CHECK}"
+            );
         });
     }
 
@@ -7524,12 +7734,23 @@ mod tests {
             assert!(events.iter().any(|event| matches!(
                 event,
                 AgentEvent::GoalEvaluation {
+                    seq: 2,
                     evaluation: 1,
                     applied: true,
                     model,
                     ..
                 } if model == &current_model.spec()
             )));
+            assert!(
+                matches!(
+                    logged_outcomes(&goal).as_slice(),
+                    [
+                        (1, GoalEvaluationOutcome::Failed { applied: false, .. }),
+                        (1, GoalEvaluationOutcome::Applied)
+                    ]
+                ),
+                "{LOGS_EVERY_CHECK}"
+            );
             assert!(!events.iter().any(|event| matches!(
                 event,
                 AgentEvent::GoalEvaluationFailed { applied: true, .. }
