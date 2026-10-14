@@ -51,8 +51,6 @@ const LINE_BREAK: &str = "\n";
 const KEY_GAP: &str = " ";
 const INDENT: &str = "  ";
 const LABEL_COLS: usize = 12;
-const LIST_SCOPE: &str = "audit_log_list";
-const BODY_SCOPE: &str = "audit_log_body";
 pub(crate) const DATE_FORMAT: &str = "%Y-%m-%d ";
 pub(crate) const FILTER_PREFIX: &str = "Filter: ";
 pub(crate) const CLOSE_LABEL: &str = "q";
@@ -93,6 +91,8 @@ pub(crate) trait AuditLog: Sized + Send + 'static {
     /// What a header heads.
     type Group: Copy;
     const TITLE: &'static str;
+    /// The grab scope the panel draws under, which only debug builds record.
+    #[cfg(debug_assertions)]
     const SCOPE: &'static str;
     const READING: &'static str;
     const EMPTY: &'static str;
@@ -732,7 +732,7 @@ impl<L: AuditLog, C: Copy> AuditPanel<L, C> {
         cursor: Option<usize>,
         theme: &Theme,
     ) {
-        grab_scope!(LIST_SCOPE, area);
+        grab_scope!("audit_log_list", area);
         let total = u16::try_from(rows.len().max(1)).unwrap_or(u16::MAX);
         self.list_scroll.update_dimensions(total, area.height);
         if self.reveal_cursor {
@@ -828,7 +828,7 @@ impl<L: AuditLog, C: Copy> AuditPanel<L, C> {
     }
 
     fn render_body(&mut self, frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
-        grab_scope!(BODY_SCOPE, area);
+        grab_scope!("audit_log_body", area);
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
         let total = u16::try_from(paragraph.line_count(area.width.max(1))).unwrap_or(u16::MAX);
         self.body_scroll.update_dimensions(total, area.height);

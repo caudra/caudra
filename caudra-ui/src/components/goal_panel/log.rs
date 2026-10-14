@@ -36,7 +36,6 @@ pub(crate) const OUTCOME_HEADING: &str = "Outcome";
 pub(crate) const SEPARATOR: &str = " \u{b7} ";
 pub(crate) const SET_PREFIX: &str = "set";
 const TITLE: &str = " Goal ";
-const SCOPE: &str = "goal_panel";
 const GOAL_MARK: &str = "#";
 const EVALUATION_WORD: &str = "evaluation";
 const EVALUATIONS_WORD: &str = "evaluations";
@@ -140,7 +139,8 @@ impl AuditLog for GoalLog {
     type Filter = LogFilter;
     type Group = u32;
     const TITLE: &'static str = TITLE;
-    const SCOPE: &'static str = SCOPE;
+    #[cfg(debug_assertions)]
+    const SCOPE: &'static str = "goal_panel";
     const READING: &'static str = READING_LOG;
     const EMPTY: &'static str = NO_GOAL_LOG;
 

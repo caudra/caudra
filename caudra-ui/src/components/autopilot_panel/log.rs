@@ -53,7 +53,6 @@ const WORD_GAP: &str = " ";
 const ALL_FILTER: &str = "All";
 const LEFT_TO_YOU_FILTER: &str = "Left to you";
 const TITLE: &str = " Autopilot ";
-const SCOPE: &str = "autopilot_panel";
 pub(crate) const READING_LOG: &str = "Reading the autopilot log\u{2026}";
 pub(crate) const NO_ENTRIES: &str = "No autopilot log for this session yet";
 
@@ -157,7 +156,8 @@ impl AuditLog for AutopilotLog {
     type Filter = LogFilter;
     type Group = Group;
     const TITLE: &'static str = TITLE;
-    const SCOPE: &'static str = SCOPE;
+    #[cfg(debug_assertions)]
+    const SCOPE: &'static str = "autopilot_panel";
     const READING: &'static str = READING_LOG;
     const EMPTY: &'static str = NO_ENTRIES;
 
