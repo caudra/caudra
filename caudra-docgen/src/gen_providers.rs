@@ -5,7 +5,7 @@ use caudra_config::files;
 use caudra_config::providers::{BUILTIN_IGNORED_FIELDS, BUILTIN_MODEL_FIELDS};
 use caudra_providers::copilot_auth::ENTERPRISE_HOST_ENV;
 use caudra_providers::manifest::{ManifestRegistry, ProviderManifest};
-use caudra_providers::model::ModelEntry;
+use caudra_providers::model::{ModelEntry, ModelPricing};
 use caudra_providers::provider::ProviderKind;
 use caudra_providers::{EFFORT_LEVELS, ModelMarker};
 use strum::IntoEnumIterator;
@@ -92,6 +92,10 @@ The built-in provider still owns the slug, so `protocol`, `api_key_env` and `dis
 Ollama reads `OLLAMA_HOST` and llama.cpp reads `LLAMA_CPP_HOST`. Neither reads `<SLUG>_BASE_URL`. A `base_url` in `providers.toml` wins over the host variable, and Caudra appends `/v1` to either, so leave it off. Aperture reads `APERTURE_HOST`, which wins over the file. Copilot asks GitHub for the API endpoint of your account, Copilot Enterprise derives it from the host you signed in with, and both ignore these settings."#;
 
 const LONG_CONTEXT_NOTE: &str = r#"Recent Claude models accept up to 1M tokens. Caudra runs them at a 372k working window, which keeps cost and latency bounded. That window is an input budget: the model's output allowance sits on top of it rather than inside it, so Caudra holds back less of it before compaction. Add `-1m` to a model id, like `claude-sonnet-4-6-1m`, to open the full 1M window instead. Set `context_window` in `providers.toml` to pick any other size, see [Model limits on a built-in provider](#model-limits-on-a-built-in-provider). `claude-haiku-5-5` bills a whole request at five times its listed rates once the prompt passes 100k tokens, cached tokens included, and Caudra counts its cost the same way."#;
+
+const GOOGLE_NOTE: &str = r#"Create a `GEMINI_API_KEY` in [Google AI Studio](https://aistudio.google.com/apikey). `gemini-4-argon` needs a key on a project with billing enabled, because the free tier does not serve it. On the free tier, pick `google/gemini-3.8-flash` instead. Where a price above names a date, Caudra bills the first price until that day and the second from 00:00 UTC on it, so an introductory price ends on time without an update. Gemini 4 and Gemini 3 models always think, so thinking `off` runs at the lowest level the model accepts.
+
+A Google AI Pro or Ultra plan covers AI Studio in the browser. Google bills API calls separately, so the plan does not pay for Caudra's requests. Caudra offers no Google sign-in, because Google's terms forbid third-party tools from using the sign-in of Gemini CLI or Antigravity, and Google may suspend accounts that do. On Copilot Pro+, Max, Business or Enterprise, `copilot/gemini-4-argon` runs Argon on your Copilot plan."#;
 
 const ANTHROPIC_OAUTH_NOTE: &str = r#"Run `caudra auth login anthropic` to sign in to a Claude subscription through browser OAuth. Caudra stores the tokens in its state directory, refreshes them automatically, and shows subscription limits through `/usage`. Subscription requests always go to `api.anthropic.com`, even when `ANTHROPIC_BASE_URL` is set.
 
@@ -422,8 +426,19 @@ Dynamic provider models are namespaced as `{{slug}}/{{model_id}}` (e.g. `myproxy
     )
 }
 
-fn format_pricing(entry: &ModelEntry) -> String {
-    format!("${:.2} / ${:.2}", entry.pricing.input, entry.pricing.output)
+/// Today's rates, then any announced change with its date. Reads no clock, so
+/// the page renders the same whenever it is generated.
+fn format_pricing(entry: &ModelEntry, manifest: &ProviderManifest) -> String {
+    let rates = |pricing: &ModelPricing| format!("${:.2} / ${:.2}", pricing.input, pricing.output);
+    match manifest.price_change(entry) {
+        Some(change) => format!(
+            "{}, then {} from {}",
+            rates(&entry.pricing),
+            rates(&change.pricing),
+            change.from
+        ),
+        None => rates(&entry.pricing),
+    }
 }
 
 fn format_context(entry: &ModelEntry) -> String {
@@ -601,7 +616,7 @@ fn write_model_table(out: &mut String, manifest: &ProviderManifest) {
                 (true, None) => format!("**{names}** (default)"),
                 (true, Some(line)) => format!("**{names}** ({line} default)"),
             },
-            format_pricing(entry),
+            format_pricing(entry, manifest),
             format_context(entry),
         );
     }
@@ -727,6 +742,10 @@ fn write_section(out: &mut String, section: &ProviderSection) {
         let _ = writeln!(out, "\n{COPILOT_OAUTH_NOTE}");
     }
 
+    if section.kind == ProviderKind::Google {
+        let _ = writeln!(out, "\n{GOOGLE_NOTE}");
+    }
+
     if section.name == "Anthropic" {
         let _ = writeln!(out, "\n{ANTHROPIC_OAUTH_NOTE}");
         let _ = writeln!(out, "\n{LONG_CONTEXT_NOTE}");
@@ -776,9 +795,24 @@ pub fn generate() -> String {
 #[cfg(test)]
 mod tests {
     use caudra_config::files;
+    use caudra_providers::manifest::ManifestRegistry;
+    use caudra_providers::model::ModelEntry;
+    use test_case::test_case;
 
-    use super::providers_toml_section;
+    use super::{format_pricing, providers_toml_section};
     use crate::gen_regions::reference;
+
+    #[test_case("gemini-4-argon", "$2.00 / $10.00, then $4.00 / $20.00 from 2026-12-01" ; "an_announced_change_follows_todays_price")]
+    #[test_case("gemini-3.5-flash-lite", "$0.30 / $2.50"                               ; "a_steady_price_stands_alone")]
+    fn pricing_shows_an_announced_change_with_its_date(prefix: &str, expected: &str) {
+        let google = ManifestRegistry::get("google").unwrap();
+        let entry: &ModelEntry = google
+            .models
+            .iter()
+            .find(|entry| entry.prefixes.contains(&prefix))
+            .unwrap();
+        assert_eq!(format_pricing(entry, google), expected);
+    }
 
     #[test]
     fn the_providers_section_lists_every_key_of_the_reference() {

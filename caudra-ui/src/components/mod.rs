@@ -1583,6 +1583,7 @@ pub(crate) fn test_model() -> caudra_providers::Model {
         supports_cache_breakpoints_override: None,
         supports_pdf: false,
         pricing: test_pricing(),
+        price_change: None,
         discovered_free: false,
         max_output_tokens: Some(8192),
         context_window: TEST_CONTEXT_WINDOW,

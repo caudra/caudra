@@ -5,7 +5,7 @@ use caudra_storage::thinking::ReasoningOptions;
 use crate::model::{
     ModelEntry, ModelFacts, ModelFamily, ModelGeneration, ModelPricing, ModelPurpose,
 };
-use crate::pricing::PricingSchedule;
+use crate::pricing::{PriceChange, PricingSchedule};
 use crate::providers::catalog::CatalogMetaView;
 use crate::providers::{
     anthropic, aperture, copilot, custom, deepseek, dynamic, google, llama_cpp, mistral, ollama,
@@ -34,6 +34,9 @@ pub struct ProviderManifest {
     /// Set by the providers whose rates move with the wall clock, so the hours
     /// sit next to the prices they scale. Everyone else bills flat.
     pub pricing_schedule: Option<&'static PricingSchedule>,
+    /// Prices this provider has announced for later dates, at most one per
+    /// model prefix. Empty for everyone whose list price is not about to move.
+    pub price_changes: &'static [PriceChange],
     /// This provider's id in the models.dev catalog, where it differs from the
     /// caudra slug. `None` for providers the catalog has no entry for: local
     /// runtimes and gateways that route somewhere else.
@@ -48,6 +51,13 @@ impl ProviderManifest {
     /// them for the same model.
     pub fn catalog_meta(&self, model_id: &str) -> Option<CatalogMetaView> {
         crate::providers::catalog::model_meta_if_available(self.catalog_slug?, model_id)
+    }
+
+    /// The announced change to `entry`'s rates, whether or not it applies yet.
+    pub fn price_change(&self, entry: &ModelEntry) -> Option<&'static PriceChange> {
+        self.price_changes
+            .iter()
+            .find(|change| entry.prefixes.contains(&change.prefix))
     }
 }
 
@@ -84,6 +94,7 @@ const ANTHROPIC: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: true,
     pricing_schedule: None,
+    price_changes: &[],
     catalog_slug: Some("anthropic"),
 };
 
@@ -99,6 +110,7 @@ const OPENAI: ProviderManifest = ProviderManifest {
     generations: openai::generations(),
     serves_fast_mode: true,
     pricing_schedule: None,
+    price_changes: &[],
     catalog_slug: Some("openai"),
 };
 
@@ -114,6 +126,7 @@ const GOOGLE: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
+    price_changes: google::PRICE_CHANGES,
     catalog_slug: Some("google"),
 };
 
@@ -129,6 +142,7 @@ const COPILOT: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
+    price_changes: &[],
     catalog_slug: Some("github-copilot"),
 };
 
@@ -152,6 +166,7 @@ const OLLAMA: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
+    price_changes: &[],
     catalog_slug: None,
 };
 
@@ -167,6 +182,7 @@ const LLAMA_CPP: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
+    price_changes: &[],
     catalog_slug: None,
 };
 
@@ -182,6 +198,7 @@ const MISTRAL: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
+    price_changes: &[],
     catalog_slug: Some("mistral"),
 };
 
@@ -197,6 +214,7 @@ const ZAI: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
+    price_changes: &[],
     catalog_slug: Some("zai"),
 };
 
@@ -212,6 +230,7 @@ const DEEPSEEK: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: Some(&deepseek::PEAK_HOURS),
+    price_changes: &[],
     catalog_slug: Some("deepseek"),
 };
 
@@ -227,6 +246,7 @@ const OPENROUTER: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
+    price_changes: &[],
     catalog_slug: Some("openrouter"),
 };
 
@@ -242,6 +262,7 @@ const SYNTHETIC: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
+    price_changes: &[],
     catalog_slug: Some("synthetic"),
 };
 
@@ -257,6 +278,7 @@ const TENSORX: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
+    price_changes: &[],
     catalog_slug: Some("tensorx"),
 };
 
@@ -272,6 +294,7 @@ const OPENCODE: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
+    price_changes: &[],
     catalog_slug: Some("opencode"),
 };
 
@@ -287,6 +310,7 @@ const XAI: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
+    price_changes: &[],
     catalog_slug: Some("xai"),
 };
 
@@ -302,6 +326,7 @@ const OPENCODE_GO: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
+    price_changes: &[],
     catalog_slug: Some("opencode-go"),
 };
 
@@ -317,6 +342,7 @@ const APERTURE: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
+    price_changes: &[],
     catalog_slug: None,
 };
 

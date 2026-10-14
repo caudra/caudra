@@ -1051,7 +1051,9 @@ impl StopReason {
     pub fn from_google(s: &str) -> Self {
         match s {
             "STOP" => Self::EndTurn,
-            "MAX_TOKENS" => Self::MaxTokens,
+            // Long decode stopped at the per-request cap and the answer is not
+            // finished, which is a cut-off reply as far as the turn goes.
+            "MAX_TOKENS" | "CONTINUATION" => Self::MaxTokens,
             "SAFETY" | "RECITATION" => {
                 warn!("Gemini stop reason: {s}, treating as end_turn");
                 Self::EndTurn
@@ -2495,6 +2497,7 @@ mod tests {
             supports_cache_breakpoints_override: None,
             supports_pdf: false,
             pricing: crate::model::ModelPricing::default(),
+            price_change: None,
             discovered_free: false,
             max_output_tokens: Some(8192),
             context_window: 200_000,

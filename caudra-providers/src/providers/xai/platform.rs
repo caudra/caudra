@@ -433,6 +433,7 @@ mod tests {
             supports_cache_breakpoints_override: None,
             supports_pdf: false,
             pricing: ModelPricing::ZERO,
+            price_change: None,
             discovered_free: false,
             max_output_tokens: Some(131_072),
             context_window: 500_000,

@@ -104,6 +104,7 @@ impl ScriptModel {
             supports_cache_breakpoints_override: None,
             supports_pdf: false,
             pricing: self.pricing.clone().unwrap_or_default(),
+            price_change: None,
             discovered_free: false,
             max_output_tokens: Some(self.max_output_tokens),
             context_window: self.context_window,

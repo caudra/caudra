@@ -20,6 +20,7 @@ use crate::manifest::{
     ManifestRegistry, ProviderManifest, catalog_pricing, catalog_reasoning_options,
 };
 use crate::model_registry::{self, Binding};
+use crate::pricing::{PriceChange, rates_in_force};
 use crate::providers::{anthropic, custom, dynamic};
 use crate::types::{DOCUMENT_TOKENS_PER_PAGE, ThinkingFields};
 
@@ -78,8 +79,8 @@ pub enum ModelError {
 type Rates = (f64, f64, f64, f64);
 
 /// Rates that replace the base ones once a prompt crosses `above` tokens.
-/// OpenAI, Gemini 2.5 Pro and Grok all bill long prompts this way, and a
-/// single flat rate cannot express any of them.
+/// OpenAI, Anthropic and Grok all bill long prompts this way, and a single
+/// flat rate cannot express any of them.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PricingTier {
     /// Prompt tokens above which these rates apply.
@@ -451,6 +452,9 @@ pub struct Model {
     /// Caudra can encode documents in.
     pub supports_pdf: bool,
     pub pricing: ModelPricing,
+    /// A change to `pricing` that is still ahead, carried only while the rates
+    /// came from the static table. Turns billed from its date on pay its rates.
+    pub price_change: Option<&'static PriceChange>,
     /// Discovery reported an explicit all-zero price. Distinct from a zero
     /// `pricing`, which also covers "no price is known".
     pub discovered_free: bool,
@@ -519,6 +523,13 @@ impl Model {
         let catalog = catalog.as_ref();
         let discovered_pricing = discovered.and_then(|info| info.pricing.as_ref());
         let catalog_pricing = catalog_pricing(catalog);
+        let static_rates = static_entry.map(|entry| {
+            rates_in_force(
+                &entry.pricing,
+                manifest.price_change(entry),
+                Timestamp::now(),
+            )
+        });
         // Base rates come from the first source that has any: what the provider
         // just reported, then the static table, then the catalog. Tiers resolve
         // on their own, from the first source that states any, because a
@@ -526,9 +537,14 @@ impl Model {
         // a long prompt costs.
         let sources = [
             discovered_pricing,
-            static_entry.map(|entry| &entry.pricing),
+            static_rates.map(|(pricing, _)| pricing),
             catalog_pricing.as_ref(),
         ];
+        // An announced change belongs to the table's rates, so it only rides
+        // along while those are the ones billed.
+        let price_change = static_rates
+            .filter(|_| discovered_pricing.is_none())
+            .and_then(|(_, pending)| pending);
         let tiers = sources
             .into_iter()
             .flatten()
@@ -598,6 +614,7 @@ impl Model {
             supports_cache_breakpoints_override: None,
             supports_pdf: false,
             pricing,
+            price_change,
             discovered_free: discovered_pricing.is_some_and(ModelPricing::is_zero),
             max_output_tokens,
             context_window,
@@ -655,6 +672,7 @@ impl Model {
                 fast: None,
                 tiers: Cow::Owned(meta.pricing_tiers),
             },
+            price_change: None,
             discovered_free: false,
             max_output_tokens: Some(meta.output),
             context_window: meta.context,
@@ -772,15 +790,28 @@ impl Model {
 
     /// What the provider charges right now, so it is only ever correct for a
     /// turn that just finished: under a
-    /// [`PricingSchedule`](crate::pricing::PricingSchedule) the answer moves
-    /// with the clock. Anything historical wants [`Self::list_cost`].
+    /// [`PricingSchedule`](crate::pricing::PricingSchedule) or a pending
+    /// [`PriceChange`] the answer moves with the clock. Anything historical
+    /// wants [`Self::list_cost`].
     ///
     /// `None` on an unpriced model (oauth, local), so callers can hide the cost
     /// instead of showing a misleading "$0.000".
     pub fn billed_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
-        let cost = (!self.pricing.is_zero()).then(|| usage.cost(&self.pricing, fast))?;
+        self.billed_cost_at(usage, fast, Timestamp::now())
+    }
+
+    /// [`Self::billed_cost`] for a turn that finished at `at`, under the
+    /// announced price change once its date has come.
+    pub(crate) fn billed_cost_at(
+        &self,
+        usage: &TokenUsage,
+        fast: bool,
+        at: Timestamp,
+    ) -> Option<f64> {
+        let (pricing, _) = rates_in_force(&self.pricing, self.price_change, at);
+        let cost = (!pricing.is_zero()).then(|| usage.cost(pricing, fast))?;
         let schedule = ManifestRegistry::for_slug(&self.provider).and_then(|m| m.pricing_schedule);
-        Some(schedule.map_or(cost, |s| cost * s.multiplier_at(Timestamp::now())))
+        Some(schedule.map_or(cost, |s| cost * s.multiplier_at(at)))
     }
 
     /// The quoted rates, with no wall-clock surcharge. Deterministic, which is
@@ -1216,6 +1247,7 @@ mod tests {
     use super::*;
     use crate::providers::copilot;
     use caudra_storage::StateDir;
+    use jiff::civil;
     use test_case::test_case;
 
     fn policy(allowed: &[&str], excluded: &[&str]) -> ModelPolicy {
@@ -1262,6 +1294,9 @@ mod tests {
     #[test_case("anthropic", "claude-haiku-4-5", Some(ModelMarker::Small) ; "superseded_small_default")]
     #[test_case("anthropic", "claude-opus-5-5", Some(ModelMarker::Best) ; "non_small_default")]
     #[test_case("anthropic", "claude-sonnet-4-6", None ; "non_small_non_default")]
+    #[test_case("google", "gemini-4-argon", Some(ModelMarker::Best) ; "google_flagship")]
+    #[test_case("google", "gemini-3.5-flash-lite", Some(ModelMarker::Fast) ; "google_small_default")]
+    #[test_case("google", "gemini-3.8-flash", None ; "google_non_small_non_default")]
     #[test_case(UNCLASSIFIABLE, "llama3", None ; "unknown_facts")]
     fn marker_of_preserves_size_and_default_status(
         provider: &str,
@@ -1568,6 +1603,8 @@ mod tests {
     #[test_case("anthropic", ModelPurpose::Best, "claude-opus-5-5" ; "anthropic_flagship")]
     #[test_case("openai", ModelPurpose::Fast, "gpt-6-luna" ; "openai_small")]
     #[test_case("openai", ModelPurpose::Best, "gpt-6-astra" ; "openai_flagship")]
+    #[test_case("google", ModelPurpose::Fast, "gemini-3.5-flash-lite" ; "google_small")]
+    #[test_case("google", ModelPurpose::Best, "gemini-4-argon" ; "google_flagship")]
     fn curated_defaults_select_by_size_lane(provider: &str, purpose: ModelPurpose, expected: &str) {
         assert_eq!(
             Model::curated_default(provider, purpose).unwrap().id,
@@ -1990,7 +2027,7 @@ mod tests {
     #[test_case("anthropic/claude-opus-4-8",       true  ; "claude")]
     #[test_case("openai/gpt-5.4",                   true  ; "gpt")]
     #[test_case("xai/grok-4.6",                     true  ; "grok")]
-    #[test_case("google/gemini-2.5-pro",            true  ; "gemini")]
+    #[test_case("google/gemini-4-argon",            true  ; "gemini")]
     #[test_case("copilot/claude-opus-4.7",          true  ; "copilot_entry_beats_generic_family")]
     #[test_case("zai/glm-5-code",                   false ; "glm_code_text_only")]
     #[test_case("deepseek/deepseek-v4-pro",         false ; "deepseek_text_only")]
@@ -2074,7 +2111,7 @@ mod tests {
         let mut model = Model::from_base(
             ManifestRegistry::get("google").unwrap(),
             "google",
-            "gemini-2.5-pro",
+            "gemini-4-argon",
         );
         model.pricing.fast = Some(FastPricing::derived(30.0, 150.0));
         assert!(!model.supports_fast());
@@ -2246,6 +2283,128 @@ mod tests {
 
         let model = Model::from_base(ManifestRegistry::get("ollama").unwrap(), "ollama", model_id);
         assert_eq!(model.is_free(), expected, "{FREE_MEANS_A_KNOWN_ZERO}");
+    }
+
+    const PRICE_CHANGE_MODEL: &str = "test-price-change-model";
+    const TABLE_INPUT_RATE: f64 = 1.0;
+    const CHANGED_INPUT_RATE: f64 = 2.0;
+    const DISCOVERED_INPUT_RATE: f64 = 5.0;
+    const fn input_only(input: f64) -> ModelPricing {
+        ModelPricing {
+            input,
+            output: 0.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
+            fast: None,
+            tiers: ModelPricing::UNTIERED,
+        }
+    }
+    const PRICE_CHANGE_ENTRIES: &[ModelEntry] = &[ModelEntry {
+        prefixes: &[PRICE_CHANGE_MODEL],
+        small: false,
+        family: ModelFamily::Generic,
+        vision: false,
+        default: true,
+        pricing: input_only(TABLE_INPUT_RATE),
+        max_output_tokens: None,
+        context_window: 1_000,
+        reasoning_options: None,
+    }];
+    /// One date the suite never reaches and one long gone, so the real clock
+    /// that `from_base` reads cannot move the answer.
+    const AHEAD: &[PriceChange] = &[PriceChange {
+        prefix: PRICE_CHANGE_MODEL,
+        from: civil::date(9999, 1, 1),
+        pricing: input_only(CHANGED_INPUT_RATE),
+    }];
+    const PASSED: &[PriceChange] = &[PriceChange {
+        prefix: PRICE_CHANGE_MODEL,
+        from: civil::date(2000, 1, 1),
+        pricing: input_only(CHANGED_INPUT_RATE),
+    }];
+    const CHANGE_RIDES_ON_THE_TABLE: &str =
+        "an announced price belongs to the table's rates and to nothing a provider reported";
+
+    /// A change still ahead travels with the table's rates, one that has come
+    /// replaces them, and rates a provider reported owe the table nothing.
+    #[test_case("test-price-change-ahead", AHEAD, None, TABLE_INPUT_RATE, true       ; "ahead_rides_along")]
+    #[test_case("test-price-change-passed", PASSED, None, CHANGED_INPUT_RATE, false  ; "passed_replaces_the_table")]
+    #[test_case("test-price-change-listed", AHEAD, Some(DISCOVERED_INPUT_RATE), DISCOVERED_INPUT_RATE, false ; "discovery_drops_it")]
+    fn a_price_change_follows_the_table_rates(
+        slug: &'static str,
+        changes: &'static [PriceChange],
+        discovered_rate: Option<f64>,
+        expected_rate: f64,
+        expected_pending: bool,
+    ) {
+        model_registry::set_known_models(
+            slug,
+            vec![ModelInfo {
+                pricing: discovered_rate.map(input_only),
+                ..ModelInfo::id_only(PRICE_CHANGE_MODEL.to_string())
+            }],
+        );
+        let manifest = ProviderManifest {
+            slug,
+            models: PRICE_CHANGE_ENTRIES,
+            price_changes: changes,
+            pricing_schedule: None,
+            catalog_slug: None,
+            ..*ManifestRegistry::get("google").unwrap()
+        };
+
+        let model = Model::from_base(&manifest, slug, PRICE_CHANGE_MODEL);
+
+        assert_eq!(
+            model.pricing.input, expected_rate,
+            "{CHANGE_RIDES_ON_THE_TABLE}"
+        );
+        assert_eq!(
+            model.price_change.is_some(),
+            expected_pending,
+            "{CHANGE_RIDES_ON_THE_TABLE}"
+        );
+    }
+
+    /// A change in the wrong table, on the wrong prefix, or one that repeats
+    /// the rates it replaces bills nothing different and only looks handled.
+    #[test]
+    fn every_price_change_names_one_entry_and_moves_its_rates() {
+        let rates = |p: &ModelPricing| (p.input, p.output, p.cache_write, p.cache_read);
+        for manifest in ManifestRegistry::builtins() {
+            for change in manifest.price_changes {
+                let named: Vec<&ModelEntry> = manifest
+                    .models
+                    .iter()
+                    .filter(|entry| entry.prefixes.contains(&change.prefix))
+                    .collect();
+                let [entry] = named[..] else {
+                    panic!(
+                        "{} names {} entries for {}",
+                        manifest.slug,
+                        named.len(),
+                        change.prefix
+                    );
+                };
+                let repeats = manifest
+                    .price_changes
+                    .iter()
+                    .filter(|other| other.prefix == change.prefix)
+                    .count();
+                assert_eq!(
+                    repeats, 1,
+                    "{} changes {} twice",
+                    manifest.slug, change.prefix
+                );
+                assert_ne!(
+                    rates(&entry.pricing),
+                    rates(&change.pricing),
+                    "{}/{} changes to the rates it has",
+                    manifest.slug,
+                    change.prefix
+                );
+            }
+        }
     }
 
     /// A schedule hung on the wrong manifest silently doubles every turn of a

@@ -175,11 +175,16 @@ A lane answers inside the release line you are on. On gpt-6 that is gpt-6-luna (
 
 | Marker | Models | Pricing (in/out per 1M tokens) | Context |
 |---------|--------|-------------------------------|---------|
-| Fast | **gemini-2.0-flash-lite** (default) | $0.07 / $0.30 | 1048K ctx / 65K out |
-| Best | **gemini-2.5-pro** (default) | $1.25 / $10.00 | 1048K ctx / 65K out |
-|  | gemini-2.5-flash | $0.30 / $2.50 | 1048K ctx / 65K out |
+| Fast | **gemini-3.5-flash-lite** (default) | $0.30 / $2.50 | 1048K ctx / 65K out |
+| Best | **gemini-4-argon** (default) | $2.00 / $10.00, then $4.00 / $20.00 from 2026-12-01 | 1048K ctx / 65K out |
+|  | gemini-3.8-flash | $0.75 / $3.75, then $1.50 / $7.50 from 2027-01-01 | 1048K ctx / 65K out |
+|  | gemini-3.6-flash | $0.75 / $3.75, then $1.50 / $7.50 from 2027-01-01 | 1048K ctx / 65K out |
 
-Routing defaults: gemini-2.0-flash-lite (Fast), gemini-2.5-pro (Best)
+Routing defaults: gemini-3.5-flash-lite (Fast), gemini-4-argon (Best)
+
+Create a `GEMINI_API_KEY` in [Google AI Studio](https://aistudio.google.com/apikey). `gemini-4-argon` needs a key on a project with billing enabled, because the free tier does not serve it. On the free tier, pick `google/gemini-3.8-flash` instead. Where a price above names a date, Caudra bills the first price until that day and the second from 00:00 UTC on it, so an introductory price ends on time without an update. Gemini 4 and Gemini 3 models always think, so thinking `off` runs at the lowest level the model accepts.
+
+A Google AI Pro or Ultra plan covers AI Studio in the browser. Google bills API calls separately, so the plan does not pay for Caudra's requests. Caudra offers no Google sign-in, because Google's terms forbid third-party tools from using the sign-in of Gemini CLI or Antigravity, and Google may suspend accounts that do. On Copilot Pro+, Max, Business or Enterprise, `copilot/gemini-4-argon` runs Argon on your Copilot plan.
 
 ### Copilot
 
@@ -194,19 +199,18 @@ Routing defaults: gemini-2.0-flash-lite (Fast), gemini-2.5-pro (Best)
 | Small | gpt-5.4-nano | $0.20 / $1.25 | 200K ctx / 100K out |
 | Small | claude-haiku-4.5 | $1.00 / $5.00 | 200K ctx / 64K out |
 | Small | claude-haiku-5.5 | $0.10 / $0.50 | 200K ctx / 100K out |
-| Small | gemini-3.5-flash | $1.50 / $9.00 | 200K ctx / 65K out |
 | Small | mai-code-1-flash-picker | $0.75 / $4.50 | 200K ctx / 100K out |
 | Small | gpt-6-luna | $0.10 / $0.50 | 200K ctx / 100K out |
 | Fast | **gpt-5.6-luna** (default) | $0.20 / $1.20 | 200K ctx / 100K out |
-|  | gemini-3.6-flash | $0.75 / $3.75 | 200K ctx / 65K out |
 |  | gemini-3.7-flash | $0.75 / $3.75 | 200K ctx / 65K out |
+|  | gemini-3.8-flash | $0.75 / $3.75 | 200K ctx / 65K out |
 |  | claude-sonnet-4.5, claude-sonnet-4.6 | $3.00 / $15.00 | 200K ctx / 64K out |
 |  | claude-sonnet-5.5 | $2.00 / $10.00 | 200K ctx / 100K out |
 |  | claude-sonnet-5 | $2.00 / $10.00 | 200K ctx / 100K out |
 |  | gpt-5.5 | $5.00 / $30.00 | 200K ctx / 100K out |
 |  | kimi-k2.7-code | $0.95 / $4.00 | 200K ctx / 100K out |
 |  | kimi-k3 | $3.00 / $15.00 | 200K ctx / 100K out |
-|  | gemini-3.1-pro-preview | $2.00 / $12.00 | 200K ctx / 65K out |
+|  | gemini-4-argon | $2.00 / $10.00 | 200K ctx / 65K out |
 |  | gpt-6.1-sol | $2.00 / $10.00 | 200K ctx / 100K out |
 |  | gpt-6-sol | $2.00 / $10.00 | 200K ctx / 100K out |
 |  | gpt-5.4 | $2.50 / $15.00 | 200K ctx / 100K out |

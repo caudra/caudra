@@ -249,6 +249,7 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         supports_cache_breakpoints_override,
         supports_pdf,
         pricing,
+        price_change: None,
         discovered_free: false,
         max_output_tokens,
         context_window,

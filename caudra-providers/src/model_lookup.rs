@@ -526,9 +526,8 @@ mod tests {
         "copilot/gpt-5.4-nano",
         "copilot/claude-haiku-4.5",
         "copilot/claude-haiku-5.5",
-        "copilot/gemini-3.5-flash",
-        "copilot/gemini-3.6-flash",
         "copilot/gemini-3.7-flash",
+        "copilot/gemini-3.8-flash",
         "copilot/mai-code-1-flash-picker",
         "copilot/claude-sonnet-4.5",
         "copilot/claude-sonnet-4.6",
@@ -537,7 +536,7 @@ mod tests {
         "copilot/gpt-5.5",
         "copilot/kimi-k2.7-code",
         "copilot/kimi-k3",
-        "copilot/gemini-3.1-pro-preview",
+        "copilot/gemini-4-argon",
         "copilot/gpt-6-luna",
         "copilot/gpt-6.1-sol",
         "copilot/gpt-6-sol",
@@ -593,8 +592,9 @@ mod tests {
     #[test_case("opus", &[COPILOT], "copilot/claude-opus-5.5" ; "copilot_opus")]
     #[test_case("opus fast", &[], "copilot/claude-opus-4.8-fast" ; "copilot_fast_variant")]
     #[test_case("kimi", &[], "copilot/kimi-k3" ; "kimi_numbered_versions")]
-    #[test_case("gemini", &[ANTHROPIC], "copilot/gemini-3.7-flash" ; "gemini_newest")]
-    #[test_case("gemini pro", &[], "copilot/gemini-3.1-pro-preview" ; "gemini_pro")]
+    #[test_case("gemini", &[ANTHROPIC], "copilot/gemini-4-argon" ; "gemini_newest")]
+    #[test_case("gemini flash", &[], "copilot/gemini-3.8-flash" ; "gemini_flash_newest")]
+    #[test_case("argon", &[], "copilot/gemini-4-argon" ; "argon")]
     #[test_case("grok", &[], "copilot/grok-4.6" ; "grok")]
     fn a_listed_model_resolves(query: &str, preferred: &[&str], expected: &str) {
         assert_eq!(find_model(query, &listed(), preferred).unwrap(), expected);
@@ -675,7 +675,8 @@ mod tests {
     #[test_case("copilot", "opus")]
     #[test_case("copilot", "kimi")]
     #[test_case("copilot", "gemini")]
-    #[test_case("google", "gemini pro")]
+    #[test_case("google", "gemini flash")]
+    #[test_case("google", "argon")]
     #[test_case("xai", "grok")]
     #[test_case("deepseek", "deepseek pro")]
     fn a_builtin_family_resolves_on_the_preferred_provider(provider: &str, family: &str) {

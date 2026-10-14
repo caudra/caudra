@@ -11,8 +11,10 @@ use std::fmt;
 
 use caudra_storage::sessions::StoredTokenUsage;
 use jiff::Timestamp;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
 
-use crate::model::{Billing, Model, TokenUsage};
+use crate::model::{Billing, Model, ModelPricing, TokenUsage};
 
 const HOURS_PER_DAY: u8 = 24;
 const SECONDS_PER_HOUR: i64 = 3_600;
@@ -104,6 +106,39 @@ impl fmt::Display for PricingSchedule {
             write!(f, "{window}")?;
         }
         f.write_str(" UTC")
+    }
+}
+
+/// A price the provider has announced for a later date, such as the end of an
+/// introductory rate. The model table quotes today's price. From `from` at
+/// 00:00 UTC every turn bills at `pricing`, tiers included, so a build shipped
+/// during a promotion stays right after it ends. Providers name a day without
+/// a timezone, so a turn near midnight may land a day off.
+#[derive(Debug)]
+pub struct PriceChange {
+    /// The `ModelEntry` prefix whose rates change.
+    pub prefix: &'static str,
+    pub from: Date,
+    pub pricing: ModelPricing,
+}
+
+impl PriceChange {
+    pub(crate) fn applies_at(&self, at: Timestamp) -> bool {
+        at.to_zoned(TimeZone::UTC).date() >= self.from
+    }
+}
+
+/// The rates in force at `at`: `base` until `change` applies, then the
+/// change's. Also returns the change while it is still ahead, so whoever
+/// holds the rates can switch over later.
+pub(crate) fn rates_in_force<'a>(
+    base: &'a ModelPricing,
+    change: Option<&'static PriceChange>,
+    at: Timestamp,
+) -> (&'a ModelPricing, Option<&'static PriceChange>) {
+    match change {
+        Some(change) if change.applies_at(at) => (&change.pricing, None),
+        pending => (base, pending),
     }
 }
 
@@ -231,7 +266,8 @@ mod tests {
     use super::*;
     use crate::ReasoningOptions;
     use crate::manifest::ManifestRegistry;
-    use crate::model::{FastPricing, ModelFamily, ModelPricing, PricingTier};
+    use crate::model::{FastPricing, ModelFamily, PricingTier};
+    use jiff::civil;
     use std::borrow::Cow;
     use std::sync::Arc;
     use test_case::test_case;
@@ -296,6 +332,7 @@ mod tests {
                 input: input_rate,
                 ..ModelPricing::ZERO
             },
+            price_change: None,
             discovered_free: false,
             max_output_tokens: None,
             context_window: 0,
@@ -354,6 +391,75 @@ mod tests {
                 "day {day}"
             );
         }
+    }
+
+    const CHANGED_INPUT_RATE: f64 = 6.0;
+    /// [`ONE_MILLION`] input tokens at [`CHANGED_INPUT_RATE`].
+    const CHANGED_LIST_PRICE: f64 = 6.0;
+    const LAST_SECOND_BEFORE: &str = "2026-11-30T23:59:59Z";
+    const FIRST_SECOND_OF: &str = "2026-12-01T00:00:00Z";
+    /// 04:30 UTC on the first, still the evening before in New York.
+    const EVENING_BEFORE_IN_NEW_YORK: &str = "2026-11-30T23:30:00-05:00";
+    const LONG_AFTER: &str = "2027-06-01T12:00:00Z";
+    static CHANGE: PriceChange = PriceChange {
+        prefix: CURRENT,
+        from: civil::date(2026, 12, 1),
+        pricing: ModelPricing {
+            input: CHANGED_INPUT_RATE,
+            output: 0.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
+            fast: None,
+            tiers: ModelPricing::UNTIERED,
+        },
+    };
+
+    fn instant(text: &str) -> Timestamp {
+        text.parse().expect("an RFC 3339 instant")
+    }
+
+    #[test_case(LAST_SECOND_BEFORE, false        ; "last_second_before_the_day")]
+    #[test_case(FIRST_SECOND_OF, true            ; "first_second_of_the_day")]
+    #[test_case(EVENING_BEFORE_IN_NEW_YORK, true ; "the_day_is_read_in_utc")]
+    #[test_case(LONG_AFTER, true                 ; "long_after")]
+    fn a_change_applies_from_midnight_utc(at: &str, expected: bool) {
+        assert_eq!(CHANGE.applies_at(instant(at)), expected);
+    }
+
+    /// A model built before the date keeps the old rates on it, so the switch
+    /// has to happen when a turn is billed.
+    #[test_case(LAST_SECOND_BEFORE, Some(LIST_PRICE)      ; "before_bills_the_table")]
+    #[test_case(FIRST_SECOND_OF, Some(CHANGED_LIST_PRICE) ; "from_the_day_bills_the_change")]
+    fn a_turn_bills_the_rates_in_force_when_it_ends(at: &str, expected: Option<f64>) {
+        let mut current = model(CURRENT, INPUT_RATE);
+        current.price_change = Some(&CHANGE);
+        let usage = TokenUsage {
+            input: ONE_MILLION,
+            ..Default::default()
+        };
+
+        assert_eq!(current.billed_cost_at(&usage, false, instant(at)), expected);
+        assert_eq!(
+            current.list_cost(&usage, false),
+            Some(LIST_PRICE),
+            "re-pricing history must not depend on the clock"
+        );
+    }
+
+    #[test]
+    fn rates_in_force_hand_over_once() {
+        let base = ModelPricing {
+            input: INPUT_RATE,
+            ..ModelPricing::ZERO
+        };
+
+        let (before, pending) = rates_in_force(&base, Some(&CHANGE), instant(LAST_SECOND_BEFORE));
+        assert_eq!(before.input, INPUT_RATE);
+        assert!(pending.is_some());
+
+        let (after, pending) = rates_in_force(&base, Some(&CHANGE), instant(FIRST_SECOND_OF));
+        assert_eq!(after.input, CHANGED_INPUT_RATE);
+        assert!(pending.is_none());
     }
 
     #[test]

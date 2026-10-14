@@ -110,27 +110,15 @@ const CLAUDE_BUDGET: &[StaticReasoningOption] = &[StaticReasoningOption::BudgetT
     min: Some(1_024),
     max: Some(32_000),
 }];
-const GEMINI_FLASH_24K: &[StaticReasoningOption] = &[
-    StaticReasoningOption::Effort(&["minimal", "low", "medium", "high"]),
-    StaticReasoningOption::BudgetTokens {
-        min: Some(256),
-        max: Some(24_000),
-    },
-];
-const GEMINI_FLASH_32K: &[StaticReasoningOption] = &[
-    StaticReasoningOption::Effort(&["minimal", "low", "medium", "high"]),
-    StaticReasoningOption::BudgetTokens {
-        min: Some(256),
-        max: Some(32_000),
-    },
-];
-const GEMINI_PRO_32K: &[StaticReasoningOption] = &[
-    StaticReasoningOption::Effort(&["low", "medium", "high"]),
-    StaticReasoningOption::BudgetTokens {
-        min: Some(256),
-        max: Some(32_000),
-    },
-];
+const GEMINI_MAX_OUTPUT: u32 = 65_536;
+const GEMINI_FLASH_PROMO: ModelPricing = ModelPricing {
+    input: 0.75,
+    output: 3.75,
+    cache_write: 0.00,
+    cache_read: 0.075,
+    fast: None,
+    tiers: ModelPricing::UNTIERED,
+};
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
@@ -225,56 +213,28 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
         },
         ModelEntry {
-            prefixes: &["gemini-3.5-flash"],
-            small: true,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.50,
-                output: 9.00,
-                cache_write: 0.00,
-                cache_read: 0.15,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(65_536),
-            context_window: 200_000,
-            reasoning_options: Some(GEMINI_FLASH_24K),
-        },
-        ModelEntry {
-            prefixes: &["gemini-3.6-flash"],
-            small: false,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.75,
-                output: 3.75,
-                cache_write: 0.00,
-                cache_read: 0.075,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(65_536),
-            context_window: 200_000,
-            reasoning_options: Some(GEMINI_FLASH_32K),
-        },
-        ModelEntry {
             prefixes: &["gemini-3.7-flash"],
             small: false,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
-            pricing: ModelPricing {
-                input: 0.75,
-                output: 3.75,
-                cache_write: 0.00,
-                cache_read: 0.075,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(65_536),
+            // GitHub's promotional rate through 2026-12-31. `/models` reports
+            // the live rate.
+            pricing: GEMINI_FLASH_PROMO,
+            max_output_tokens: Some(GEMINI_MAX_OUTPUT),
+            context_window: 200_000,
+            reasoning_options: Some(EFFORT_TO_HIGH_NO_NONE),
+        },
+        ModelEntry {
+            prefixes: &["gemini-3.8-flash"],
+            small: false,
+            family: ModelFamily::Generic,
+            vision: true,
+            default: false,
+            // GitHub's promotional rate through 2026-12-31. `/models` reports
+            // the live rate.
+            pricing: GEMINI_FLASH_PROMO,
+            max_output_tokens: Some(GEMINI_MAX_OUTPUT),
             context_window: 200_000,
             reasoning_options: Some(EFFORT_TO_HIGH_NO_NONE),
         },
@@ -405,22 +365,24 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: Some(KIMI_EFFORT),
         },
         ModelEntry {
-            prefixes: &["gemini-3.1-pro-preview"],
+            prefixes: &["gemini-4-argon"],
             small: false,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
+            // GitHub's promotional rate until 2026-12-01. `/models` reports
+            // the live rate.
             pricing: ModelPricing {
                 input: 2.00,
-                output: 12.00,
+                output: 10.00,
                 cache_write: 0.00,
-                cache_read: 0.20,
+                cache_read: 0.10,
                 fast: None,
                 tiers: ModelPricing::UNTIERED,
             },
-            max_output_tokens: Some(65_536),
+            max_output_tokens: Some(GEMINI_MAX_OUTPUT),
             context_window: 200_000,
-            reasoning_options: Some(GEMINI_PRO_32K),
+            reasoning_options: Some(EFFORT_TO_HIGH_NO_NONE),
         },
         ModelEntry {
             prefixes: &["gpt-6-luna"],
@@ -1460,7 +1422,7 @@ mod tests {
     #[test_case("gpt-6.1-sol", Endpoint::Responses ; "gpt_6_point_release_takes_responses")]
     #[test_case("gpt-5.6-sol", Endpoint::Responses ; "gpt_5_takes_responses")]
     #[test_case("gpt-5.3-codex", Endpoint::Responses ; "codex_takes_responses")]
-    #[test_case("gemini-3.1-pro-preview", Endpoint::ChatCompletions ; "everything_else_takes_chat")]
+    #[test_case("gemini-4-argon", Endpoint::ChatCompletions ; "everything_else_takes_chat")]
     fn guess_endpoint_covers_every_openai_family(model_id: &str, expected: Endpoint) {
         assert_eq!(guess_endpoint(model_id), expected);
     }
@@ -1526,7 +1488,7 @@ mod tests {
     /// cannot fetch, so it guesses from the model's family instead.
     #[test_case("copilot/claude-opus-5.5", MESSAGES_PATH ; "claude_guesses_messages")]
     #[test_case("copilot/gpt-6-sol", RESPONSES_PATH ; "gpt_guesses_responses")]
-    #[test_case("copilot/gemini-3.1-pro-preview", CHAT_COMPLETIONS_PATH ; "others_guess_chat_completions")]
+    #[test_case("copilot/gemini-4-argon", CHAT_COMPLETIONS_PATH ; "others_guess_chat_completions")]
     fn a_warm_cache_missing_the_model_guesses_its_endpoint(spec: &str, path: &str) {
         let provider = provider_with_token();
         cache_model(&provider, OTHER_MODEL_ID, CHAT_COMPLETIONS_PATH);

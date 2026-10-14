@@ -1,4 +1,5 @@
-use std::borrow::Cow;
+mod json_schema;
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -6,13 +7,13 @@ use caudra_storage::id::CaudraId;
 use flume::Sender;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
+use jiff::civil;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::model::{
-    Model, ModelEntry, ModelFamily, ModelPricing, PricingTier, StaticReasoningOption,
-};
+use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, StaticReasoningOption};
+use crate::pricing::PriceChange;
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::{
     AgentError, CacheKey, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
@@ -23,9 +24,81 @@ use super::{KeyPool, ResolvedAuth, http_client, next_sse_line};
 
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const ENV_VAR: &str = "GEMINI_API_KEY";
-/// Gemini 2.5 Pro bills a request whose prompt runs past this many tokens at
-/// its long-context rates, output and cache reads included.
-const LONG_CONTEXT_ABOVE: u32 = 200_000;
+const ONE_MILLION_WINDOW: u32 = 1_048_576;
+/// The output limit of every Gemini model in the table. On Gemini 4 it is the
+/// most one streaming request returns. Asking for more starts long decode,
+/// which stops with `CONTINUATION` and expects the client to resume.
+const MAX_OUTPUT_TOKENS: u32 = 65_536;
+const ARGON: &str = "gemini-4-argon";
+const FLASH_3_8: &str = "gemini-3.8-flash";
+const FLASH_3_6: &str = "gemini-3.6-flash";
+/// Gemini 4 and 3 take a `thinkingLevel` and cannot turn thinking off, so
+/// `off` runs at the lowest level. Argon and 3.8 Flash reject `minimal`.
+const LEVELS_LOW_TO_HIGH: &[StaticReasoningOption] =
+    &[StaticReasoningOption::Effort(&["low", "medium", "high"])];
+const LEVELS_MINIMAL_TO_HIGH: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
+    "minimal", "low", "medium", "high",
+])];
+/// What Google's FAQ says to send in place of a thought signature on a
+/// function call the model did not produce, such as one carried over from
+/// another model's turn. Gemini 3 and later reject such a call otherwise.
+const SKIP_SIGNATURE_VALIDATOR: &str = "skip_thought_signature_validator";
+/// The first Gemini major version that validates thought signatures.
+const VALIDATES_SIGNATURES_SINCE: u32 = 3;
+const GEMINI_ID_PREFIX: &str = "gemini-";
+/// Ids without a major version that still name a Gemini 2.5 model.
+const UNVERSIONED_GEMINI_2: [&str; 1] = ["robotics-er-1.5"];
+const TOO_MANY_REQUESTS: u16 = 429;
+/// Google refuses a model the key's tier does not serve, such as Argon on the
+/// free tier, with a 429 that lists every quota it hit as `limit: 0`.
+const QUOTA_LIMIT_LABEL: &str = "limit: ";
+const ZERO_QUOTA_LIMIT: &str = "0";
+/// Reported as a billing refusal, which neither the retry loop nor a goal
+/// retries: no wait raises a limit of 0.
+const PAYMENT_REQUIRED: u16 = 402;
+const FLASH_PROMO_PRICE: ModelPricing = ModelPricing {
+    input: 0.75,
+    output: 3.75,
+    cache_write: 0.00,
+    cache_read: 0.075,
+    fast: None,
+    tiers: ModelPricing::UNTIERED,
+};
+const FLASH_LIST_PRICE: ModelPricing = ModelPricing {
+    input: 1.50,
+    output: 7.50,
+    cache_write: 0.00,
+    cache_read: 0.15,
+    fast: None,
+    tiers: ModelPricing::UNTIERED,
+};
+
+/// Introductory rates Google ends on a set day, from
+/// <https://ai.google.dev/gemini-api/docs/pricing>.
+pub(crate) const PRICE_CHANGES: &[PriceChange] = &[
+    PriceChange {
+        prefix: ARGON,
+        from: civil::date(2026, 12, 1),
+        pricing: ModelPricing {
+            input: 4.00,
+            output: 20.00,
+            cache_write: 0.00,
+            cache_read: 0.20,
+            fast: None,
+            tiers: ModelPricing::UNTIERED,
+        },
+    },
+    PriceChange {
+        prefix: FLASH_3_8,
+        from: civil::date(2027, 1, 1),
+        pricing: FLASH_LIST_PRICE,
+    },
+    PriceChange {
+        prefix: FLASH_3_6,
+        from: civil::date(2027, 1, 1),
+        pricing: FLASH_LIST_PRICE,
+    },
+];
 
 inventory::submit!(caudra_config::providers::BuiltInProvider {
     slug: "google",
@@ -33,7 +106,7 @@ inventory::submit!(caudra_config::providers::BuiltInProvider {
     protocol: caudra_config::providers::Protocol::Google,
     default_base_url: BASE_URL,
     default_api_key_env: ENV_VAR,
-    default_model: "google/gemini-2.5-pro",
+    default_model: "google/gemini-4-argon",
     plans: None,
     login_url: Some("https://aistudio.google.com/apikey"),
     needs_url: false,
@@ -42,39 +115,54 @@ inventory::submit!(caudra_config::providers::BuiltInProvider {
 pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
         ModelEntry {
-            prefixes: &["gemini-2.5-pro"],
+            prefixes: &[ARGON],
             small: false,
             family: ModelFamily::Gemini,
             vision: true,
             default: true,
+            // Introductory through 2026-11-30, see `PRICE_CHANGES`.
             pricing: ModelPricing {
-                input: 1.25,
+                input: 2.00,
                 output: 10.00,
                 cache_write: 0.00,
-                cache_read: 0.125,
+                cache_read: 0.10,
                 fast: None,
-                tiers: Cow::Borrowed(&[PricingTier {
-                    above: LONG_CONTEXT_ABOVE,
-                    input: 2.50,
-                    output: 15.00,
-                    cache_write: 0.00,
-                    cache_read: 0.25,
-                    fast: None,
-                }]),
+                tiers: ModelPricing::UNTIERED,
             },
-            max_output_tokens: Some(65_536),
-            context_window: 1_048_576,
-            reasoning_options: Some(&[StaticReasoningOption::BudgetTokens {
-                min: Some(128),
-                max: Some(32_768),
-            }]),
+            max_output_tokens: Some(MAX_OUTPUT_TOKENS),
+            context_window: ONE_MILLION_WINDOW,
+            reasoning_options: Some(LEVELS_LOW_TO_HIGH),
         },
         ModelEntry {
-            prefixes: &["gemini-2.5-flash"],
+            prefixes: &[FLASH_3_8],
             small: false,
             family: ModelFamily::Gemini,
             vision: true,
             default: false,
+            // Introductory through 2026-12-31, see `PRICE_CHANGES`.
+            pricing: FLASH_PROMO_PRICE,
+            max_output_tokens: Some(MAX_OUTPUT_TOKENS),
+            context_window: ONE_MILLION_WINDOW,
+            reasoning_options: Some(LEVELS_LOW_TO_HIGH),
+        },
+        ModelEntry {
+            prefixes: &[FLASH_3_6],
+            small: false,
+            family: ModelFamily::Gemini,
+            vision: true,
+            default: false,
+            // Introductory through 2026-12-31, see `PRICE_CHANGES`.
+            pricing: FLASH_PROMO_PRICE,
+            max_output_tokens: Some(MAX_OUTPUT_TOKENS),
+            context_window: ONE_MILLION_WINDOW,
+            reasoning_options: Some(LEVELS_MINIMAL_TO_HIGH),
+        },
+        ModelEntry {
+            prefixes: &["gemini-3.5-flash-lite"],
+            small: true,
+            family: ModelFamily::Gemini,
+            vision: true,
+            default: true,
             pricing: ModelPricing {
                 input: 0.30,
                 output: 2.50,
@@ -83,33 +171,9 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 fast: None,
                 tiers: ModelPricing::UNTIERED,
             },
-            max_output_tokens: Some(65_536),
-            context_window: 1_048_576,
-            reasoning_options: Some(&[
-                StaticReasoningOption::Toggle,
-                StaticReasoningOption::BudgetTokens {
-                    min: Some(0),
-                    max: Some(24_576),
-                },
-            ]),
-        },
-        ModelEntry {
-            prefixes: &["gemini-2.0-flash-lite"],
-            small: true,
-            family: ModelFamily::Gemini,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.075,
-                output: 0.30,
-                cache_write: 0.00,
-                cache_read: 0.01,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(65_536),
-            context_window: 1_048_576,
-            reasoning_options: None,
+            max_output_tokens: Some(MAX_OUTPUT_TOKENS),
+            context_window: ONE_MILLION_WINDOW,
+            reasoning_options: Some(LEVELS_MINIMAL_TO_HIGH),
         },
     ];
     MODELS
@@ -223,8 +287,12 @@ impl Google {
         tools: &Value,
         thinking: &ThinkingConfig,
     ) -> Value {
+        let mut contents = convert_messages(messages);
+        if validates_thought_signatures(&model.id) {
+            sign_unsigned_calls(&mut contents);
+        }
         let mut body = json!({
-            "contents": convert_messages(messages),
+            "contents": contents,
         });
 
         if !system.is_empty() {
@@ -273,9 +341,39 @@ impl Google {
         if status == 200 {
             parse_sse(response, event_tx, self.stream_timeout).await
         } else {
-            Err(AgentError::from_response(response).await)
+            let error = AgentError::from_response(response).await;
+            Err(refuse_zero_quota(error, &model.id))
         }
     }
+}
+
+fn refuse_zero_quota(error: AgentError, model_id: &str) -> AgentError {
+    match &error {
+        AgentError::Api {
+            status: TOO_MANY_REQUESTS,
+            message,
+            ..
+        } if every_quota_limit_is_zero(message) => AgentError::api(
+            PAYMENT_REQUIRED,
+            format!(
+                "Google gives this API key no quota for {model_id}, so retrying cannot help. Enable billing on the key's Google Cloud project, or pick a model its tier serves"
+            ),
+        ),
+        _ => error,
+    }
+}
+
+fn every_quota_limit_is_zero(body: &str) -> bool {
+    let mut limits = body
+        .split(QUOTA_LIMIT_LABEL)
+        .skip(1)
+        .map(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()
+                .unwrap_or_default()
+        })
+        .peekable();
+    limits.peek().is_some() && limits.all(|limit| limit == ZERO_QUOTA_LIMIT)
 }
 
 impl Provider for Google {
@@ -366,6 +464,45 @@ impl Provider for Google {
 
     fn reasoning_transport(&self, _model: &Model) -> crate::ReasoningTransport {
         crate::ReasoningTransport::GeminiGenerateContent
+    }
+}
+
+/// Gemini 3 and later, read from the major version in the id. An alias with no
+/// version, such as `gemini-flash-latest`, points at a current model, so it is
+/// treated as one. Custom models and Gemini 2.5 accept a call without a
+/// signature.
+fn validates_thought_signatures(model_id: &str) -> bool {
+    let Some(rest) = model_id.strip_prefix(GEMINI_ID_PREFIX) else {
+        return false;
+    };
+    match rest
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+    {
+        Some(major) => major >= VALIDATES_SIGNATURES_SINCE,
+        None => !UNVERSIONED_GEMINI_2.iter().any(|id| rest.starts_with(id)),
+    }
+}
+
+/// Each model turn's first function call must carry a signature. One that has
+/// none came from another model or lost it on the way, so it gets
+/// [`SKIP_SIGNATURE_VALIDATOR`]. A signature Gemini issued is never replaced.
+fn sign_unsigned_calls(contents: &mut [Value]) {
+    for content in contents
+        .iter_mut()
+        .filter(|content| content["role"] == "model")
+    {
+        let Some(parts) = content["parts"].as_array_mut() else {
+            continue;
+        };
+        if let Some(first_call) = parts
+            .iter_mut()
+            .find(|part| part.get("functionCall").is_some())
+            && first_call.get("thoughtSignature").is_none()
+        {
+            first_call["thoughtSignature"] = json!(SKIP_SIGNATURE_VALIDATOR);
+        }
     }
 }
 
@@ -484,6 +621,10 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
     out
 }
 
+/// Tool schemas go out as `parametersJsonSchema`, which takes standard JSON
+/// Schema. The older `parameters` field takes an OpenAPI subset and refuses the
+/// whole request over `$schema`, `$ref`, `const` and other keywords that
+/// Workcell and MCP tools declare.
 fn convert_tools(tools: &Value) -> Vec<Value> {
     let Some(arr) = tools.as_array() else {
         return Vec::new();
@@ -493,32 +634,17 @@ fn convert_tools(tools: &Value) -> Vec<Value> {
         .filter_map(|t| {
             let name = t.get("name")?.as_str()?;
             let description = t.get("description")?.as_str().unwrap_or("");
-            let parameters = t
-                .get("input_schema")
-                .cloned()
-                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+            let schema = match t.get("input_schema") {
+                Some(Value::Object(schema)) => json_schema::normalize(schema.clone()),
+                _ => json!({"type": "object", "properties": {}}),
+            };
             Some(json!({
                 "name": name,
                 "description": description,
-                "parameters": strip_additional_properties(parameters),
+                "parametersJsonSchema": schema,
             }))
         })
         .collect()
-}
-
-fn strip_additional_properties(value: Value) -> Value {
-    match value {
-        Value::Object(mut map) => {
-            map.remove("additionalProperties");
-            map.values_mut()
-                .for_each(|v| *v = strip_additional_properties(std::mem::take(v)));
-            Value::Object(map)
-        }
-        Value::Array(items) => {
-            Value::Array(items.into_iter().map(strip_additional_properties).collect())
-        }
-        other => other,
-    }
 }
 
 fn tool_defs_empty(tool_decls: &[Value]) -> bool {
@@ -849,6 +975,7 @@ mod tests {
             supports_tool_examples_override: None,
             thinking_override: None,
             pricing: ModelPricing::default(),
+            price_change: None,
             discovered_free: false,
             max_output_tokens: Some(8192),
             context_window: 1_048_576,
@@ -931,11 +1058,113 @@ mod tests {
 
     #[test_case("STOP", StopReason::EndTurn ; "stop")]
     #[test_case("MAX_TOKENS", StopReason::MaxTokens ; "max_tokens")]
+    #[test_case("CONTINUATION", StopReason::MaxTokens ; "long_decode_stopped_mid_answer")]
     #[test_case("SAFETY", StopReason::EndTurn ; "safety")]
     #[test_case("RECITATION", StopReason::EndTurn ; "recitation")]
     #[test_case("unknown", StopReason::EndTurn ; "unknown")]
     fn stop_reason_from_google(input: &str, expected: StopReason) {
         assert_eq!(StopReason::from_google(input), expected);
+    }
+
+    const ARGON_SPEC: &str = "google/gemini-4-argon";
+    const FLASH_3_6_SPEC: &str = "google/gemini-3.6-flash";
+    const FLASH_LITE_SPEC: &str = "google/gemini-3.5-flash-lite";
+    const FLASH_2_5_SPEC: &str = "google/gemini-2.5-flash";
+    const ISSUED_SIGNATURE: &str = "sig-from-gemini";
+    const ONLY_THE_FIRST_CALL: &str = "Gemini validates only the first call of a step";
+
+    fn effort(level: &str) -> ThinkingConfig {
+        ThinkingConfig::Effort(level.into())
+    }
+
+    fn table_body(spec: &str, messages: &[Message], thinking: ThinkingConfig) -> Value {
+        let model = Model::from_spec(spec).unwrap();
+        Google::with_auth(test_auth(), test_timeouts())
+            .wire_request(
+                &model,
+                messages,
+                "",
+                &json!([]),
+                &RequestOptions {
+                    thinking,
+                    ..RequestOptions::default()
+                },
+                None,
+            )
+            .unwrap()
+            .body
+    }
+
+    /// Gemini 4 and 3 cannot stop thinking, so `off` asks for the shallowest
+    /// level each model accepts, and a level it would reject snaps into range.
+    #[test_case(ARGON_SPEC, ThinkingConfig::Adaptive, json!({"includeThoughts": true})                         ; "argon_adaptive_leaves_the_level_to_gemini")]
+    #[test_case(ARGON_SPEC, ThinkingConfig::Off, json!({"includeThoughts": true, "thinkingLevel": "low"})      ; "argon_off_runs_at_low")]
+    #[test_case(ARGON_SPEC, effort("minimal"), json!({"includeThoughts": true, "thinkingLevel": "low"})        ; "argon_rejects_minimal")]
+    #[test_case(ARGON_SPEC, effort("max"), json!({"includeThoughts": true, "thinkingLevel": "high"})           ; "argon_tops_out_at_high")]
+    #[test_case(FLASH_LITE_SPEC, ThinkingConfig::Off, json!({"includeThoughts": true, "thinkingLevel": "minimal"}) ; "flash_lite_off_runs_at_minimal")]
+    #[test_case(FLASH_3_6_SPEC, effort("minimal"), json!({"includeThoughts": true, "thinkingLevel": "minimal"}) ; "flash_3_6_keeps_minimal")]
+    fn gemini_thinking_levels_reach_the_wire(
+        spec: &str,
+        thinking: ThinkingConfig,
+        expected: Value,
+    ) {
+        let body = table_body(spec, &[Message::user("hi".into())], thinking);
+        assert_eq!(body["generationConfig"]["thinkingConfig"], expected);
+    }
+
+    #[test]
+    fn argon_asks_for_no_more_than_one_streaming_request_returns() {
+        let body = table_body(ARGON_SPEC, &[], ThinkingConfig::Adaptive);
+        assert_eq!(
+            body["generationConfig"]["maxOutputTokens"],
+            MAX_OUTPUT_TOKENS
+        );
+    }
+
+    fn parallel_calls(first_signature: Option<&str>) -> Vec<Message> {
+        let call = |id: &str, thought_signature: Option<&str>| ContentBlock::ToolUse {
+            id: id.into(),
+            name: TOOL_NAME.into(),
+            input: json!({}),
+            thought_signature: thought_signature.map(Into::into),
+        };
+        vec![
+            Message::user("read both".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![call("call_1", first_signature), call("call_2", None)],
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[test_case(ARGON_SPEC, None, Some(SKIP_SIGNATURE_VALIDATOR)            ; "argon_signs_a_call_from_another_model")]
+    #[test_case(FLASH_3_6_SPEC, None, Some(SKIP_SIGNATURE_VALIDATOR)        ; "gemini_3_signs_a_call_from_another_model")]
+    #[test_case(ARGON_SPEC, Some(ISSUED_SIGNATURE), Some(ISSUED_SIGNATURE)  ; "an_issued_signature_is_kept")]
+    #[test_case(FLASH_2_5_SPEC, None, None                                   ; "gemini_2_5_takes_unsigned_calls")]
+    fn the_first_call_of_a_model_turn_carries_a_signature(
+        spec: &str,
+        signature: Option<&str>,
+        expected: Option<&str>,
+    ) {
+        let body = table_body(spec, &parallel_calls(signature), ThinkingConfig::Adaptive);
+        let parts = &body["contents"][1]["parts"];
+        assert_eq!(parts[0]["thoughtSignature"].as_str(), expected);
+        assert!(
+            parts[1].get("thoughtSignature").is_none(),
+            "{ONLY_THE_FIRST_CALL}"
+        );
+    }
+
+    #[test_case("gemini-4-argon", true         ; "gemini_4")]
+    #[test_case("gemini-3.5-flash-lite", true  ; "gemini_3")]
+    #[test_case("gemini-10-pro", true          ; "two_digit_major")]
+    #[test_case("gemini-2.5-pro", false        ; "gemini_2_5")]
+    #[test_case("gemini-flash-latest", true    ; "an_alias_follows_the_current_model")]
+    #[test_case("gemini-robotics-er-1.5-preview", false ; "an_unversioned_gemini_2_5")]
+    #[test_case("gemma-3-27b-it", false        ; "not_gemini")]
+    fn signatures_are_validated_from_gemini_3(model_id: &str, expected: bool) {
+        assert_eq!(validates_thought_signatures(model_id), expected);
     }
 
     #[test]
@@ -1134,80 +1363,18 @@ mod tests {
         assert_eq!(parts[1]["inlineData"]["mimeType"], "image/webp");
     }
 
-    #[test]
-    fn convert_tools_basic() {
-        let tools = json!([{
-            "name": "bash",
-            "description": "run a command",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "cmd": {"type": "string", "additionalProperties": false},
-                    "opts": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "properties": {"verbose": {"type": "boolean"}}
-                    }
-                },
-                "additionalProperties": false
-            }
-        }]);
-        let result = convert_tools(&tools);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["name"], "bash");
-        assert_eq!(result[0]["description"], "run a command");
-        assert!(result[0]["parameters"]["properties"]["cmd"].is_object());
-        assert!(
-            result[0]["parameters"]
-                .get("additionalProperties")
-                .is_none()
-        );
-        assert!(
-            result[0]["parameters"]["properties"]["cmd"]
-                .get("additionalProperties")
-                .is_none()
-        );
-        assert!(
-            result[0]["parameters"]["properties"]["opts"]
-                .get("additionalProperties")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn strip_additional_properties_recursive() {
-        let schema = json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "inner": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {"x": {"type": "number", "additionalProperties": false}}
-                },
-                "list": {
-                    "type": "array",
-                    "items": {"type": "string", "additionalProperties": false}
-                }
-            }
-        });
-        let cleaned = strip_additional_properties(schema);
-        assert!(cleaned.get("additionalProperties").is_none());
-        assert!(
-            cleaned["properties"]["inner"]
-                .get("additionalProperties")
-                .is_none()
-        );
-        assert!(
-            cleaned["properties"]["inner"]["properties"]["x"]
-                .get("additionalProperties")
-                .is_none()
-        );
-        assert!(
-            cleaned["properties"]["list"]["items"]
-                .get("additionalProperties")
-                .is_none()
-        );
+    #[test_case(
+        json!({"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd", "ghost"], "additionalProperties": false}),
+        json!({"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"], "additionalProperties": false})
+        ; "a_declared_schema_is_normalized"
+    )]
+    #[test_case(Value::Null, json!({"type": "object", "properties": {}}) ; "a_missing_schema_takes_no_arguments")]
+    fn tools_declare_standard_json_schema(input_schema: Value, expected: Value) {
+        let tools =
+            json!([{"name": TOOL_NAME, "description": TOOL_NAME, "input_schema": input_schema}]);
+        let declarations = convert_tools(&tools);
+        assert_eq!(declarations[0]["parametersJsonSchema"], expected);
+        assert!(declarations[0].get("parameters").is_none());
     }
 
     #[test]
@@ -1367,11 +1534,11 @@ mod tests {
 
     const CACHED_ONCE: &str = "promptTokenCount already includes the cached tokens";
     const THINKING_IS_OUTPUT: &str = "Gemini bills thinking tokens as output";
-    const LONG_CONTEXT_RULE: &str =
-        "Gemini 2.5 Pro bills a prompt past 200K at its long-context rate";
-    const GEMINI_2_5_PRO_SPEC: &str = "google/gemini-2.5-pro";
-    const PER_MILLION: f64 = 1_000_000.0;
-    const RATE_TOLERANCE: f64 = 1e-9;
+    const ZERO_QUOTA_BODY: &str = r#"{"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details.\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 0, model: gemini-4-argon\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_input_token_count, limit: 0, model: gemini-4-argon\nPlease retry in 13h3m20s.","status":"RESOURCE_EXHAUSTED"}}"#;
+    const SPENT_QUOTA_BODY: &str = r#"{"error":{"code":429,"message":"You exceeded your current quota.\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 15, model: gemini-3.8-flash\nPlease retry in 40s.","status":"RESOURCE_EXHAUSTED"}}"#;
+    const ONE_LIVE_QUOTA_BODY: &str = r#"{"error":{"code":429,"message":"* Quota exceeded for metric: a, limit: 0, model: gemini-4-argon\n* Quota exceeded for metric: b, limit: 250000, model: gemini-4-argon","status":"RESOURCE_EXHAUSTED"}}"#;
+    const UNNAMED_QUOTA_BODY: &str = r#"{"error":{"code":429,"message":"Resource has been exhausted","status":"RESOURCE_EXHAUSTED"}}"#;
+    const ZERO_NEVER_REFILLS: &str = "a quota of 0 never refills, so waiting cannot help";
 
     #[test]
     fn parse_sse_cached_tokens() {
@@ -1395,19 +1562,19 @@ mod tests {
         assert_eq!(result.usage.input, 100);
     }
 
-    #[test_case(LONG_CONTEXT_ABOVE, 1.25     ; "a_prompt_at_the_threshold_bills_the_base_rate")]
-    #[test_case(LONG_CONTEXT_ABOVE + 1, 2.50 ; "a_longer_prompt_bills_the_tier")]
-    fn gemini_2_5_pro_bills_its_200k_tier(prompt_tokens: u32, input_rate: f64) {
-        let model = Model::from_spec(GEMINI_2_5_PRO_SPEC).unwrap();
-        let usage = TokenUsage {
-            input: prompt_tokens,
-            ..Default::default()
-        };
-        let cost = model.billed_cost(&usage, false).unwrap();
-        let expected = f64::from(prompt_tokens) * input_rate / PER_MILLION;
-        assert!(
-            (cost - expected).abs() < RATE_TOLERANCE,
-            "{cost} is not {expected}: {LONG_CONTEXT_RULE}"
-        );
+    #[test_case(ZERO_QUOTA_BODY, false     ; "every_limit_at_zero_is_a_billing_refusal")]
+    #[test_case(SPENT_QUOTA_BODY, true     ; "a_spent_limit_refills")]
+    #[test_case(ONE_LIVE_QUOTA_BODY, true  ; "one_live_limit_is_worth_the_wait")]
+    #[test_case(UNNAMED_QUOTA_BODY, true   ; "no_limit_named")]
+    fn only_a_quota_of_zero_stops_retrying(body: &str, retryable: bool) {
+        let error = refuse_zero_quota(AgentError::api(TOO_MANY_REQUESTS, body), ARGON);
+        assert_eq!(error.is_retryable(), retryable, "{ZERO_NEVER_REFILLS}");
+    }
+
+    #[test]
+    fn a_zero_quota_names_the_model() {
+        let error = refuse_zero_quota(AgentError::api(TOO_MANY_REQUESTS, ZERO_QUOTA_BODY), ARGON);
+        assert_eq!(error.status(), Some(PAYMENT_REQUIRED));
+        assert!(error.user_message().contains(ARGON));
     }
 }
