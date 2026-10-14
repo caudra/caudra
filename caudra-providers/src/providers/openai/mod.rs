@@ -47,9 +47,6 @@ const EFFORT_WITH_MAX: &[StaticReasoningOption] = &[StaticReasoningOption::Effor
 const EFFORT_TO_XHIGH: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
     "none", "low", "medium", "high", "xhigh",
 ])];
-const EFFORT_TO_HIGH: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
-    "none", "low", "medium", "high",
-])];
 /// The o-series predates the explicit opt-out, so it always reasons.
 const EFFORT_TO_HIGH_NO_NONE: &[StaticReasoningOption] =
     &[StaticReasoningOption::Effort(&["low", "medium", "high"])];
@@ -520,24 +517,6 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: Some(EFFORT_TO_XHIGH),
         },
         ModelEntry {
-            prefixes: &["gpt-5.2-codex"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.75,
-                output: 14.00,
-                cache_write: 0.00,
-                cache_read: 0.175,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(128_000),
-            context_window: 400_000,
-            reasoning_options: Some(EFFORT_TO_XHIGH),
-        },
-        ModelEntry {
             prefixes: &["gpt-5.2"],
             small: false,
             family: ModelFamily::Gpt,
@@ -554,60 +533,6 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             max_output_tokens: Some(128_000),
             context_window: 400_000,
             reasoning_options: Some(EFFORT_TO_XHIGH),
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.1-codex-mini"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.25,
-                output: 2.00,
-                cache_write: 0.00,
-                cache_read: 0.025,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(128_000),
-            context_window: 400_000,
-            reasoning_options: Some(EFFORT_TO_HIGH),
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.1-codex-max"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.25,
-                output: 10.00,
-                cache_write: 0.00,
-                cache_read: 0.125,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(128_000),
-            context_window: 400_000,
-            reasoning_options: Some(EFFORT_TO_XHIGH),
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.1-codex"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.25,
-                output: 10.00,
-                cache_write: 0.00,
-                cache_read: 0.125,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(128_000),
-            context_window: 400_000,
-            reasoning_options: Some(EFFORT_TO_HIGH),
         },
     ];
     MODELS

@@ -155,11 +155,7 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 |  | gpt-5.4 | $2.50 / $15.00 | 1050K ctx / 128K out |
 |  | o3 | $2.00 / $8.00 | 200K ctx / 100K out |
 |  | gpt-5.3-codex | $1.75 / $14.00 | 400K ctx / 128K out |
-|  | gpt-5.2-codex | $1.75 / $14.00 | 400K ctx / 128K out |
 |  | gpt-5.2 | $1.75 / $14.00 | 400K ctx / 128K out |
-|  | gpt-5.1-codex-mini | $0.25 / $2.00 | 400K ctx / 128K out |
-|  | gpt-5.1-codex-max | $1.25 / $10.00 | 400K ctx / 128K out |
-|  | gpt-5.1-codex | $1.25 / $10.00 | 400K ctx / 128K out |
 
 Routing defaults: gpt-6-luna (Fast), gpt-6-astra (Best)
 

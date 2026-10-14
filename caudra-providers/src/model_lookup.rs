@@ -473,11 +473,7 @@ mod tests {
     /// Anthropic and a local server signed in, plus the built-in GitHub
     /// Copilot catalog.
     const LISTED: &[&str] = &[
-        "openai/gpt-5.1-codex",
-        "openai/gpt-5.1-codex-max",
-        "openai/gpt-5.1-codex-mini",
         "openai/gpt-5.2",
-        "openai/gpt-5.2-codex",
         "openai/gpt-5.3-codex",
         "openai/gpt-5.4",
         "openai/gpt-5.4-mini",
@@ -570,7 +566,6 @@ mod tests {
     #[test_case("sol", &[OPENAI], "openai/gpt-6.1-sol" ; "sol_point_release")]
     #[test_case("astra", &[ANTHROPIC], "openai/gpt-6-astra" ; "astra_only_openai_serves")]
     #[test_case("codex", &[OPENAI], "openai/gpt-5.3-codex" ; "codex")]
-    #[test_case("codex max", &[OPENAI], "openai/gpt-5.1-codex-max" ; "codex_max")]
     #[test_case("mini", &[OPENAI], "openai/gpt-5.4-mini" ; "mini_newest")]
     #[test_case("o3", &[], "openai/o3" ; "o3")]
     #[test_case("o4 mini", &[], "openai/o4-mini" ; "o4_mini")]
