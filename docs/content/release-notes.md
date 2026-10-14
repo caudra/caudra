@@ -11,7 +11,11 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.9 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.9)
 
-Preview 9 fixes updates on macOS that sat for minutes on the download line, lets update checks use your GitHub token, and shows download progress while Caudra updates.
+Preview 9 fixes updates on macOS that sat for minutes on the download line, lets update checks use your GitHub token, shows download progress while Caudra updates, and opens `/model` on your favorite models.
+
+### Model picker
+
+- **`/model` opens on your favorites.** With favorite models, `/model` and `Ctrl+X m` put the cursor on the current model's favorite row, or on the first favorite, instead of on the Chat job, so you no longer move past every job row first. Without favorites, the picker opens on Chat as before. See [Model jobs](/docs/providers/#model-jobs).
 
 ### Command line
 

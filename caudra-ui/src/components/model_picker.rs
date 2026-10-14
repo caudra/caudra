@@ -474,9 +474,20 @@ impl ModelPicker {
 
     fn preselect_page(&mut self) {
         match self.page {
+            // Favorites are what the picker is opened for most of the time, so
+            // the cursor starts there rather than above every job row.
             PickerPage::Home => {
-                self.picker
-                    .select_item_by(|entry| entry.job == Some(ModelPurpose::Chat));
+                let current = self.current_model.as_ref().map(Model::spec);
+                let favorite = |entry: &ModelEntry| entry.section() == Some(FAVORITES_SECTION);
+                let current_favorite = |entry: &ModelEntry| {
+                    favorite(entry) && current.as_deref() == Some(entry.spec.as_str())
+                };
+                if !self.picker.select_item_by(current_favorite)
+                    && !self.picker.select_item_by(favorite)
+                {
+                    self.picker
+                        .select_item_by(|entry| entry.job == Some(ModelPurpose::Chat));
+                }
             }
             PickerPage::Job(_) => {
                 if let Some(spec) = self.bound_spec().map(str::to_owned) {
@@ -1615,6 +1626,24 @@ mod tests {
         let first = |section: &str| sections.iter().position(|s| s == section).unwrap();
         assert!(first(FAVORITES_SECTION) < first(RECENT_SECTION));
         assert!(first(RECENT_SECTION) < first("Anthropic"));
+    }
+
+    #[test_case(&[], SONNET_SPEC, None; "no_favorites_keeps_the_chat_job")]
+    #[test_case(&[OPUS_SPEC, SWAPPED_SPEC], SWAPPED_SPEC, Some(SWAPPED_SPEC); "current_favorite")]
+    #[test_case(&[OPUS_SPEC, SWAPPED_SPEC], SONNET_SPEC, Some(OPUS_SPEC); "first_favorite")]
+    fn opening_starts_on_the_favorites(favorites: &[&str], current: &str, expected: Option<&str>) {
+        let mut p = ModelPicker::new(test_models());
+        p.set_favorites(favorites.iter().map(|spec| spec.to_string()).collect());
+        open_picker(&mut p, current);
+
+        let selected = p.picker.selected_item().expect("a selected row");
+        match expected {
+            Some(spec) => assert_eq!(
+                selected_row(&p),
+                (spec.into(), Some(FAVORITES_SECTION.into()))
+            ),
+            None => assert_eq!(selected.job, Some(ModelPurpose::Chat)),
+        }
     }
 
     #[test_case(OPUS_SPEC, Some(FAVORITE_MARK); "favorite")]
