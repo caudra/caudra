@@ -130,6 +130,20 @@ Tests resolve every docs link and section anchor, so update the links when you r
 
 The website is maintained separately and consumes these canonical sources. Its design, recordings, publishing, and JavaScript tooling belong to that repository. Native builds and offline docs read the checked-in sources directly.
 
+## Keeping the model list current
+
+The built-in model tables in `caudra-providers/src/providers/` hold each provider's ids, prices, limits, and defaults. `make model-watch` compares them with the [models.dev](https://models.dev) catalog and prints a Markdown report: models released in the last 90 days that no table names, deprecations, changed prices and limits, table models the catalog does not list, and stale acceptances. Pass `ARGS='-- --since 2026-07-01'` to choose the start date, or `--catalog FILE` to read a saved copy of `api.json`.
+
+models.dev is a lead, not a source. Confirm every change on the provider's own model, pricing, or deprecation page. A divergence that is deliberate goes into `ACCEPTED` in `caudra-providers/src/model_watch.rs`, and a limit a table caps on purpose goes into `CAPS`, each with its reason. The `model-updates` skill in `.caudra/skills/` lists the sources, the rules for applying a change, and what each table needs.
+
+The `model-watch` automation in `.caudra/automations/` runs that routine once a day. It merges `main` into its own branch, surveys, applies confirmed changes with the skill, validates, and then fast-forwards your local `main`. It waits while the main checkout is busy, and it never pushes. To set it up:
+
+1. In your global `caudra.toml`, set `[experimental] autopilot = true` and `[autopilot] max_continuations = 0`.
+2. Create its worktree: `git worktree add ../caudra-model-watch -b model-watch main`.
+3. In that worktree, start `caudra --autopilot` in Build mode, trust the project's automations in `/automations`, and arm it with the path of your main checkout: `/automations arm model-watch {"main_worktree": "/path/to/caudra"}`.
+
+Each run writes its report to `target/model-watch/<date>.md` in the worktree and notifies you when it lands, or when something needs a person.
+
 ## Working on Workcell
 
 The file, shell, web, Python, and code-graph tools come from [Workcell](https://github.com/caudra/caudra/tree/main/workcell). Its crates live under `workcell/` as local members of this Rust workspace and share the root `Cargo.lock`.

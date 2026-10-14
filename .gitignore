@@ -8,6 +8,8 @@ runs.csv
 /.playwright-mcp/
 /result
 .maki/
-.caudra/
+**/.caudra/*
+!/.caudra/automations/
+!/.caudra/skills/
 external_repos/
 AGENTS.local.md
