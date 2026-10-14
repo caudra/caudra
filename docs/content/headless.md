@@ -408,7 +408,7 @@ All three reply with the engagement in `response.response`:
  "limits":{"max_continuations":100,"max_cost":null,"max_minutes":null}}
 ```
 
-`status` is `engaged`, `ended`, or `none`. A session that never engaged replies with `status` and `limits` alone. After an end, `last_end` holds the [end](#autopilot-events). `limits` are the [`[autopilot]`](/docs/configuration/#autopilot) values, which a stream-json session reads once at startup. While the switch is off, each control fails with an error that names it.
+`status` is `engaged`, `ended`, or `none`. A session that never engaged replies with `status` and `limits` alone. After an end, `last_end` holds the [end](#autopilot-events). `limits` are the [`[autopilot]`](/docs/configuration/#autopilot) values, which a stream-json session reads once at startup. A limit that is not set is `null`, and so is `max_continuations` when it is `0`. While the switch is off, each control fails with an error that names it.
 
 `goal_set` and `goal_clear` leave autopilot engaged, and the goal they set or clear is no longer autopilot's.
 

@@ -566,7 +566,7 @@ mod autopilot_tests {
                 handle.try_continue(&handle.limits()).unwrap();
             }
             handle.set_limits(AutopilotConfig {
-                max_continuations: LOWERED_LIMIT,
+                max_continuations: Some(LOWERED_LIMIT),
                 ..AutopilotConfig::default()
             });
             let mut history = History::default();
@@ -2174,7 +2174,7 @@ mod autopilot_tests {
         smol::block_on(async {
             let (clock, handle) = clocked(RETRY_LIMIT);
             handle.set_limits(AutopilotConfig {
-                max_continuations: LOWERED_LIMIT,
+                max_continuations: Some(LOWERED_LIMIT),
                 ..handle.limits()
             });
             handle.try_continue(&handle.limits()).unwrap();

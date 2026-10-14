@@ -124,7 +124,7 @@ Each engagement has its own budget, set in the global [`[autopilot]`](/docs/conf
 
 | Key | Default | Counts |
 |-----|---------|--------|
-| `max_continuations` | `100` | Turns that start without you while autopilot is engaged |
+| `max_continuations` | `100` | Turns that start without you while autopilot is engaged. `0` removes the limit |
 | `max_cost` | unset | API-billed spend since engaging, in USD |
 | `max_minutes` | unset | Minutes since engaging while the session is open |
 | `error_retries` | `5` | Retries of one provider error |
@@ -134,6 +134,8 @@ A continuation is any turn that starts without you: goal continuations, delegate
 Spend covers the session's own turns, its subagents, the goal evaluator, and the delegate, wherever the price is known. Subscription spend is shown in the status panel and is never capped.
 
 When a budget runs out, autopilot ends and the goal stays active.
+
+With `max_continuations = 0`, an engagement can run for days, for example in a session that an [automation](/docs/automations/) gives a goal every morning. The footer chip then counts continuations without a limit. `max_cost`, `max_minutes`, and `error_retries` still end it. Each goal's own continuation limit still stops its loop, and autopilot reviews that stall as usual. Only your input breaks the [review streak](#stalls), so over a long engagement the fourth review in a row that would continue is left to you.
 
 The limits are live in the terminal UI. An edit applies from the next turn, to engagements that are already running too. Lowering a limit below what an engagement has used ends it at its next check. Headless runs and `-p` read the limits once, at startup.
 

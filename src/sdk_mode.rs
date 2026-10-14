@@ -665,10 +665,11 @@ struct AutopilotStatusReply {
     limits: AutopilotLimits,
 }
 
-/// The `[autopilot]` limits a client can measure an engagement against.
+/// The `[autopilot]` limits a client can measure an engagement against, each
+/// `null` when it does not cap the engagement.
 #[derive(Serialize)]
 struct AutopilotLimits {
-    max_continuations: u32,
+    max_continuations: Option<u32>,
     max_cost: Option<f64>,
     max_minutes: Option<u32>,
 }
@@ -7576,12 +7577,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn autopilot_status_names_the_limits_an_engagement_runs_under() {
+    #[test_case(Some(AUTOPILOT_LIMIT); "capped")]
+    #[test_case(None; "uncapped_continuations_read_as_null")]
+    fn autopilot_status_names_the_limits_an_engagement_runs_under(continuations: Option<u32>) {
         let state = TempDir::new().unwrap();
         let autopilot = AutopilotHandle::default();
         autopilot.set_limits(AutopilotConfig {
-            max_continuations: AUTOPILOT_LIMIT,
+            max_continuations: continuations,
             max_cost: Some(AUTOPILOT_MAX_COST),
             max_minutes: Some(AUTOPILOT_MAX_MINUTES),
             ..AutopilotConfig::default()
@@ -7596,7 +7598,7 @@ mod tests {
             serde_json::json!({
                 "status": NO_AUTOPILOT,
                 "limits": {
-                    "max_continuations": AUTOPILOT_LIMIT,
+                    "max_continuations": continuations,
                     "max_cost": AUTOPILOT_MAX_COST,
                     "max_minutes": AUTOPILOT_MAX_MINUTES,
                 },

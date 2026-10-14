@@ -11,7 +11,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.9 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.9)
 
-Preview 9 adds Gemini 4 Argon as the Google default, along with Gemini 3.8 Flash, 3.6 Flash, and 3.5 Flash-Lite, brings Argon and 3.8 Flash to Copilot, bills announced Gemini price changes from their dates, fixes Google requests, which all failed on Caudra's tool definitions, fixes updates on macOS that sat for minutes on the download line, lets update checks use your GitHub token, shows download progress while Caudra updates, opens `/model` on your favorite models, lets `Home` and `End` jump to the ends of a picker's list, and runs a task on the favorite model you name.
+Preview 9 adds Gemini 4 Argon as the Google default, along with Gemini 3.8 Flash, 3.6 Flash, and 3.5 Flash-Lite, brings Argon and 3.8 Flash to Copilot, bills announced Gemini price changes from their dates, fixes Google requests, which all failed on Caudra's tool definitions, fixes updates on macOS that sat for minutes on the download line, lets update checks use your GitHub token, shows download progress while Caudra updates, opens `/model` on your favorite models, lets `Home` and `End` jump to the ends of a picker's list, runs a task on the favorite model you name, and lets autopilot run without a continuation limit.
 
 ### Models
 
@@ -33,6 +33,10 @@ Preview 9 adds Gemini 4 Argon as the Google default, along with Gemini 3.8 Flash
 ### Tasks
 
 - **Tasks run on the favorite you name.** When you ask for a model by a short name, as in "ask sonnet to review this", the task now runs on your favorite model that matches the name, even when a newer model or another provider matches too. While the main agent can choose a task's model, it is also told your favorites with their lane, the jobs you bound to them, and the thinking levels they take, and hears again when you star or unstar one. See [Models and reasoning](/docs/commands/#models-and-reasoning).
+
+### Autopilot
+
+- **No continuation limit.** `max_continuations = 0` under `[autopilot]` lets an engagement run until its goal ends, its cost or time limit runs out, or you stop it, so a session that an automation keeps busy every day can stay on autopilot. The footer chip then shows the count without a limit, and SDK clients read `max_continuations` as `null`. See [Budgets](/docs/autopilot/#budgets).
 
 ### Command line
 

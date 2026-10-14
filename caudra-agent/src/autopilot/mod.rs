@@ -424,7 +424,7 @@ mod tests {
 
     fn limits() -> AutopilotConfig {
         AutopilotConfig {
-            max_continuations: MAX_CONTINUATIONS,
+            max_continuations: Some(MAX_CONTINUATIONS),
             max_cost: Some(MAX_COST),
             max_minutes: Some(MAX_MINUTES),
             error_retries: ERROR_RETRIES,

@@ -854,7 +854,7 @@ Only the permission question set currently supports a user-global file override:
 
 | Field | Type | Default | Min | Max | Description |
 |-------|------|---------|-----|-----|-------------|
-| `max_continuations` | u32 | `100` | 1 | 10000 | Most continuations autopilot may send per engagement before it ends |
+| `max_continuations` | u32 | `100` | 0 | 10000 | Most continuations autopilot may send per engagement before it ends. `0` removes the limit |
 | `max_cost` | f64 | unset | - | - | Most spending in USD per autopilot engagement, counting API-billed spend only. Must be positive, and unset means no cap |
 | `max_minutes` | u32 | unset | 1 | 525600 | Most wall-clock minutes per autopilot engagement while the session is open. Unset means no cap |
 | `error_retries` | u32 | `5` | 0 | 20 | Retries for transient provider errors during an autopilot engagement |

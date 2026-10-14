@@ -321,14 +321,16 @@ pub(crate) fn state_label(stored: &StoredAutopilot, deciding: bool, escalated: b
 }
 
 /// What the engagement may still spend, limit by limit, such as
-/// `88 continuations left · $1.50 left · 25 min left`.
+/// `88 continuations left · $1.50 left · 25 min left`. A limit that is not set
+/// has nothing to count down.
 pub(crate) fn budget_left(stored: &StoredAutopilot, limits: &AutopilotConfig) -> String {
-    let mut left = vec![format!(
-        "{} {CONTINUATIONS_WORD} {LEFT_SUFFIX}",
-        limits
-            .max_continuations
-            .saturating_sub(stored.continuations)
-    )];
+    let mut left = Vec::new();
+    if let Some(max) = limits.max_continuations {
+        left.push(format!(
+            "{} {CONTINUATIONS_WORD} {LEFT_SUFFIX}",
+            max.saturating_sub(stored.continuations)
+        ));
+    }
     if let Some(max) = limits.max_cost {
         left.push(format!(
             "${:.2} {LEFT_SUFFIX}",
@@ -389,10 +391,10 @@ fn content_lines(content: &PanelContent<'_>) -> Vec<Line<'static>> {
         Line::from(Span::styled(BUDGET_HEADING, theme.panel_title)),
         labelled(
             CONTINUATIONS_LABEL,
-            format!(
-                "{}/{}",
-                stored.continuations, content.limits.max_continuations
-            ),
+            match content.limits.max_continuations {
+                Some(max) => format!("{}/{max}", stored.continuations),
+                None => format!("{} ({NO_LIMIT})", stored.continuations),
+            },
         ),
         labelled(
             API_COST_LABEL,
@@ -491,6 +493,7 @@ mod tests {
     const ELAPSED_MS: u64 = 5 * MS_PER_MINUTE;
     const MAX_MINUTES: u32 = 30;
     const MISSING: &str = "the panel must show every part of the engagement";
+    const NOTHING_TO_COUNT_DOWN: &str = "an uncapped engagement has no continuations to count down";
 
     fn stored(engaged: bool, last_end: Option<AutopilotEnd>) -> StoredAutopilot {
         StoredAutopilot {
@@ -507,7 +510,7 @@ mod tests {
 
     fn limits() -> AutopilotConfig {
         AutopilotConfig {
-            max_continuations: MAX_CONTINUATIONS,
+            max_continuations: Some(MAX_CONTINUATIONS),
             max_cost: Some(MAX_COST),
             max_minutes: Some(MAX_MINUTES),
             ..AutopilotConfig::default()
@@ -540,9 +543,8 @@ mod tests {
         }
     }
 
-    fn drawn(panel: &mut AutopilotPanel) -> String {
+    fn drawn(panel: &mut AutopilotPanel, limits: AutopilotConfig) -> String {
         let stored = stored(true, None);
-        let limits = limits();
         let model = Binding::Exact(BOUND_MODEL.into());
         let decisions = [decision()];
         let escalations = [ESCALATION.to_owned()];
@@ -577,7 +579,7 @@ mod tests {
         let mut panel = AutopilotPanel::default();
         panel.open();
 
-        let screen = drawn(&mut panel);
+        let screen = drawn(&mut panel, limits());
 
         for part in [
             WAITING_STATE.to_owned(),
@@ -616,7 +618,7 @@ mod tests {
     fn a_footer_click_asks_for_its_action(target: PanelTarget, action: Option<PanelAction>) {
         let mut panel = AutopilotPanel::default();
         panel.open();
-        drawn(&mut panel);
+        drawn(&mut panel, limits());
         let hit = panel.footer_hit(target);
         assert!(!hit.is_empty(), "{target:?}");
 
@@ -683,6 +685,25 @@ mod tests {
                 ),
             ]
             .join(BUDGET_SEPARATOR)
+        );
+    }
+
+    #[test]
+    fn an_uncapped_engagement_counts_continuations_without_a_limit() {
+        let uncapped = AutopilotConfig {
+            max_continuations: None,
+            ..limits()
+        };
+        let mut panel = AutopilotPanel::default();
+        panel.open();
+
+        let screen = drawn(&mut panel, uncapped.clone());
+
+        let count = format!("{CONTINUATIONS} ({NO_LIMIT})");
+        assert!(screen.contains(&count), "{MISSING}: {count}\n{screen}");
+        assert!(
+            !budget_left(&stored(true, None), &uncapped).contains(CONTINUATIONS_WORD),
+            "{NOTHING_TO_COUNT_DOWN}"
         );
     }
 

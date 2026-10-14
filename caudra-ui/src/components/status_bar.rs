@@ -178,12 +178,12 @@ pub struct AutomationChip {
 }
 
 /// What the bar says about an engaged autopilot: the continuations it used
-/// against its limit, and whether an escalation waits on the user. `summary`
-/// is the tooltip's body, already worded by the App.
+/// against its limit, `None` when uncapped, and whether an escalation waits on
+/// the user. `summary` is the tooltip's body, already worded by the App.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AutopilotChip {
     pub used: u32,
-    pub limit: u32,
+    pub limit: Option<u32>,
     pub escalated: bool,
     pub summary: String,
 }
@@ -1529,8 +1529,8 @@ fn push_goal(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>) {
     }
 }
 
-/// `[autopilot · 12/100]`, `[ap]` on a narrow bar, amber while an
-/// escalation waits on the user.
+/// `[autopilot · 12/100]`, or `[autopilot · 12]` without a limit, `[ap]` on a
+/// narrow bar, amber while an escalation waits on the user.
 fn push_autopilot(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>, width: u16) {
     let Some(chip) = ctx.autopilot else {
         return;
@@ -1538,7 +1538,10 @@ fn push_autopilot(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>, width: u16)
     let label = if width < AUTOPILOT_SHORT_BELOW_WIDTH {
         AUTOPILOT_SHORT_LABEL.to_owned()
     } else {
-        format!("[{AUTOPILOT_CHIP_LABEL} · {}/{}]", chip.used, chip.limit)
+        match chip.limit {
+            Some(limit) => format!("[{AUTOPILOT_CHIP_LABEL} · {}/{limit}]", chip.used),
+            None => format!("[{AUTOPILOT_CHIP_LABEL} · {}]", chip.used),
+        }
     };
     let style = if chip.escalated {
         theme::current().todo_in_progress
@@ -4071,27 +4074,29 @@ mod tests {
     const NARROW_BAR_WIDTH: u16 = AUTOPILOT_SHORT_BELOW_WIDTH - 1;
     const NO_AUTOPILOT_CHIP_MSG: &str = "a disengaged autopilot draws no chip";
 
-    fn autopilot_chip(escalated: bool) -> AutopilotChip {
+    fn autopilot_chip(escalated: bool, limit: Option<u32>) -> AutopilotChip {
         AutopilotChip {
             used: AUTOPILOT_USED,
-            limit: AUTOPILOT_LIMIT,
+            limit,
             escalated,
             summary: AUTOPILOT_SUMMARY.into(),
         }
     }
 
-    #[test_case(BAR_WIDTH, false; "wide")]
-    #[test_case(NARROW_BAR_WIDTH, false; "narrow")]
-    #[test_case(BAR_WIDTH, true; "an_escalation_turns_it_amber")]
+    #[test_case(BAR_WIDTH, false, Some(AUTOPILOT_LIMIT); "wide")]
+    #[test_case(NARROW_BAR_WIDTH, false, Some(AUTOPILOT_LIMIT); "narrow")]
+    #[test_case(BAR_WIDTH, true, Some(AUTOPILOT_LIMIT); "an_escalation_turns_it_amber")]
+    #[test_case(BAR_WIDTH, false, None; "uncapped_counts_without_a_limit")]
     fn autopilot_chip_counts_continuations_and_turns_amber_on_escalation(
         width: u16,
         escalated: bool,
+        limit: Option<u32>,
     ) {
-        let chip = autopilot_chip(escalated);
-        let label = if width < AUTOPILOT_SHORT_BELOW_WIDTH {
-            AUTOPILOT_SHORT_LABEL.to_owned()
-        } else {
-            format!("[{AUTOPILOT_CHIP_LABEL} · {AUTOPILOT_USED}/{AUTOPILOT_LIMIT}]")
+        let chip = autopilot_chip(escalated, limit);
+        let label = match limit {
+            _ if width < AUTOPILOT_SHORT_BELOW_WIDTH => AUTOPILOT_SHORT_LABEL.to_owned(),
+            Some(limit) => format!("[{AUTOPILOT_CHIP_LABEL} · {AUTOPILOT_USED}/{limit}]"),
+            None => format!("[{AUTOPILOT_CHIP_LABEL} · {AUTOPILOT_USED}]"),
         };
         let colour = if escalated {
             theme::current().todo_in_progress.fg
@@ -4131,7 +4136,7 @@ mod tests {
     #[test_case(true; "on_main")]
     #[test_case(false; "on_a_task")]
     fn the_autopilot_tip_reads_its_summary(main_chat: bool) {
-        let chip = autopilot_chip(false);
+        let chip = autopilot_chip(false, Some(AUTOPILOT_LIMIT));
         let tip = tip_for(
             StatusBarHitTarget::Autopilot,
             Fixture {
@@ -5285,7 +5290,7 @@ mod tests {
     #[test]
     fn a_task_bar_offers_only_the_controls_a_task_owns() {
         let goal = active_goal();
-        let autopilot = autopilot_chip(false);
+        let autopilot = autopilot_chip(false, Some(AUTOPILOT_LIMIT));
         let retry = RetryInfo {
             attempt: RETRY_ATTEMPT,
             message: RETRY_MESSAGE.into(),

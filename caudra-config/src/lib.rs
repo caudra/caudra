@@ -202,7 +202,8 @@ const MAX_COST_FIELD: &str = "max_cost";
 const MAX_MINUTES_FIELD: &str = "max_minutes";
 const ERROR_RETRIES_FIELD: &str = "error_retries";
 pub const DEFAULT_AUTOPILOT_MAX_CONTINUATIONS: u32 = 100;
-pub const MIN_AUTOPILOT_MAX_CONTINUATIONS: u32 = 1;
+pub const UNCAPPED_AUTOPILOT_CONTINUATIONS: u32 = 0;
+pub const MIN_AUTOPILOT_MAX_CONTINUATIONS: u32 = UNCAPPED_AUTOPILOT_CONTINUATIONS;
 pub const MAX_AUTOPILOT_MAX_CONTINUATIONS: u32 = 10_000;
 pub const DEFAULT_AUTOPILOT_ERROR_RETRIES: u32 = 5;
 pub const MIN_AUTOPILOT_ERROR_RETRIES: u32 = 0;
@@ -3627,7 +3628,10 @@ impl AutopilotFileConfig {
 /// repository cannot change them or start continuous runs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AutopilotConfig {
-    pub max_continuations: u32,
+    /// `None` when the configured limit is
+    /// [`UNCAPPED_AUTOPILOT_CONTINUATIONS`], so only the other limits end an
+    /// engagement.
+    pub max_continuations: Option<u32>,
     pub max_cost: Option<f64>,
     pub max_minutes: Option<u32>,
     pub error_retries: u32,
@@ -3642,7 +3646,7 @@ impl AutopilotConfig {
             min: Some(MIN_AUTOPILOT_MAX_CONTINUATIONS as u64),
             max: Some(MAX_AUTOPILOT_MAX_CONTINUATIONS as u64),
             env: None,
-            description: "Most continuations autopilot may send per engagement before it ends",
+            description: "Most continuations autopilot may send per engagement before it ends. `0` removes the limit",
         },
         ConfigField {
             name: MAX_COST_FIELD,
@@ -3674,13 +3678,15 @@ impl AutopilotConfig {
     ];
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        check_range(
-            AUTOPILOT_SECTION,
-            MAX_CONTINUATIONS_FIELD,
-            self.max_continuations,
-            MIN_AUTOPILOT_MAX_CONTINUATIONS,
-            MAX_AUTOPILOT_MAX_CONTINUATIONS,
-        )?;
+        if let Some(continuations) = self.max_continuations {
+            check_range(
+                AUTOPILOT_SECTION,
+                MAX_CONTINUATIONS_FIELD,
+                continuations,
+                MIN_AUTOPILOT_MAX_CONTINUATIONS,
+                MAX_AUTOPILOT_MAX_CONTINUATIONS,
+            )?;
+        }
         check_range(
             AUTOPILOT_SECTION,
             ERROR_RETRIES_FIELD,
@@ -3711,9 +3717,10 @@ impl AutopilotConfig {
 
     fn from_file(f: AutopilotFileConfig) -> Self {
         Self {
-            max_continuations: f
-                .max_continuations
-                .unwrap_or(DEFAULT_AUTOPILOT_MAX_CONTINUATIONS),
+            max_continuations: match f.max_continuations {
+                Some(UNCAPPED_AUTOPILOT_CONTINUATIONS) => None,
+                configured => Some(configured.unwrap_or(DEFAULT_AUTOPILOT_MAX_CONTINUATIONS)),
+            },
             max_cost: f.max_cost,
             max_minutes: f.max_minutes,
             error_retries: f.error_retries.unwrap_or(DEFAULT_AUTOPILOT_ERROR_RETRIES),
@@ -4867,7 +4874,7 @@ mod tests {
         assert_eq!(
             raw.into_config(false).unwrap().autopilot,
             AutopilotConfig {
-                max_continuations: DEFAULT_AUTOPILOT_MAX_CONTINUATIONS,
+                max_continuations: Some(DEFAULT_AUTOPILOT_MAX_CONTINUATIONS),
                 max_cost: None,
                 max_minutes: None,
                 error_retries: DEFAULT_AUTOPILOT_ERROR_RETRIES,
@@ -4875,7 +4882,7 @@ mod tests {
         );
     }
 
-    #[test_case(MAX_CONTINUATIONS_FIELD, MIN_AUTOPILOT_MAX_CONTINUATIONS; "continuations_minimum")]
+    #[test_case(MAX_CONTINUATIONS_FIELD, MIN_AUTOPILOT_MAX_CONTINUATIONS + 1; "continuations_minimum")]
     #[test_case(MAX_CONTINUATIONS_FIELD, MAX_AUTOPILOT_MAX_CONTINUATIONS; "continuations_maximum")]
     #[test_case(MAX_MINUTES_FIELD, MIN_AUTOPILOT_MAX_MINUTES; "minutes_minimum")]
     #[test_case(MAX_MINUTES_FIELD, MAX_AUTOPILOT_MAX_MINUTES; "minutes_maximum")]
@@ -4887,14 +4894,13 @@ mod tests {
             .unwrap()
             .autopilot;
         let resolved = match field {
-            MAX_CONTINUATIONS_FIELD => Some(autopilot.max_continuations),
+            MAX_CONTINUATIONS_FIELD => autopilot.max_continuations,
             MAX_MINUTES_FIELD => autopilot.max_minutes,
             _ => Some(autopilot.error_retries),
         };
         assert_eq!(resolved, Some(value));
     }
 
-    #[test_case(MAX_CONTINUATIONS_FIELD, MIN_AUTOPILOT_MAX_CONTINUATIONS - 1; "continuations_below_minimum")]
     #[test_case(MAX_CONTINUATIONS_FIELD, MAX_AUTOPILOT_MAX_CONTINUATIONS + 1; "continuations_above_maximum")]
     #[test_case(MAX_MINUTES_FIELD, MIN_AUTOPILOT_MAX_MINUTES - 1; "minutes_below_minimum")]
     #[test_case(MAX_MINUTES_FIELD, MAX_AUTOPILOT_MAX_MINUTES + 1; "minutes_above_maximum")]
@@ -4912,6 +4918,17 @@ mod tests {
             ),
             "{error}"
         );
+    }
+
+    #[test]
+    fn zero_continuations_remove_the_cap() {
+        let autopilot = autopilot_layer(&format!(
+            "{MAX_CONTINUATIONS_FIELD} = {UNCAPPED_AUTOPILOT_CONTINUATIONS}"
+        ))
+        .into_config(false)
+        .unwrap()
+        .autopilot;
+        assert_eq!(autopilot.max_continuations, None);
     }
 
     #[test_case(0.0; "zero")]
@@ -4967,7 +4984,7 @@ mod tests {
         assert_eq!(
             raw.into_config(false).unwrap().autopilot,
             AutopilotConfig {
-                max_continuations: CUSTOM_AUTOPILOT_CONTINUATIONS,
+                max_continuations: Some(CUSTOM_AUTOPILOT_CONTINUATIONS),
                 max_cost: Some(CUSTOM_AUTOPILOT_COST),
                 max_minutes: None,
                 error_retries: DEFAULT_AUTOPILOT_ERROR_RETRIES,

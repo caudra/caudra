@@ -8970,7 +8970,7 @@ complete(#{ report: first.output });
     fn autopilot_params() -> AutopilotParams {
         AutopilotParams {
             limits: AutopilotConfig {
-                max_continuations: AUTOPILOT_CONTINUATIONS,
+                max_continuations: Some(AUTOPILOT_CONTINUATIONS),
                 ..AutopilotConfig::default()
             },
             mode: Arc::new(|| AgentMode::Build) as ModeResolver,

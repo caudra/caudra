@@ -109,7 +109,10 @@ impl Budget {
         limits: &AutopilotConfig,
         now: Duration,
     ) -> Result<(), AutopilotBudget> {
-        if self.continuations >= limits.max_continuations {
+        if limits
+            .max_continuations
+            .is_some_and(|max| self.continuations >= max)
+        {
             return Err(AutopilotBudget::Continuations);
         }
         if let Some(budget) = self.overspent(limits, now) {
@@ -205,7 +208,7 @@ mod tests {
 
     fn limits() -> AutopilotConfig {
         AutopilotConfig {
-            max_continuations: MAX_CONTINUATIONS,
+            max_continuations: Some(MAX_CONTINUATIONS),
             max_cost: Some(MAX_COST),
             max_minutes: Some(MAX_MINUTES),
             error_retries: ERROR_RETRIES,
@@ -214,7 +217,7 @@ mod tests {
 
     fn unlimited() -> AutopilotConfig {
         AutopilotConfig {
-            max_continuations: u32::MAX,
+            max_continuations: None,
             max_cost: None,
             max_minutes: None,
             ..limits()
@@ -252,6 +255,26 @@ mod tests {
             budget.continuations(),
             MAX_CONTINUATIONS,
             "{REFUSED_NOT_COUNTED}"
+        );
+    }
+
+    #[test]
+    fn an_uncapped_engagement_ends_only_on_its_other_limits() {
+        let clock = FakeClock::new(START_MS);
+        let mut budget = Budget::new(clock.monotonic());
+        let uncapped = AutopilotConfig {
+            max_continuations: None,
+            ..limits()
+        };
+
+        for _ in 0..=MAX_CONTINUATIONS * 10 {
+            assert_eq!(budget.try_continue(&uncapped, clock.monotonic()), Ok(()));
+        }
+        clock.advance(MINUTE * MAX_MINUTES);
+
+        assert_eq!(
+            budget.try_continue(&uncapped, clock.monotonic()),
+            Err(AutopilotBudget::Time)
         );
     }
 
@@ -306,7 +329,7 @@ mod tests {
         );
     }
 
-    #[test_case(|limits| limits.max_continuations = 1, AutopilotBudget::Continuations ; "continuations")]
+    #[test_case(|limits| limits.max_continuations = Some(1), AutopilotBudget::Continuations ; "continuations")]
     #[test_case(|limits| limits.max_cost = Some(HALF_COST), AutopilotBudget::Cost ; "cost")]
     #[test_case(|limits| limits.max_minutes = Some(1), AutopilotBudget::Time ; "time")]
     fn a_limit_lowered_below_use_ends_at_the_next_check(

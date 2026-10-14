@@ -1200,8 +1200,9 @@ version = 1
 # Limits for autopilot, which needs `autopilot = true` under [experimental].
 # Only the global caudra.toml may hold this table.
 
-# Most continuations autopilot may send per engagement before it ends.
-# Type: u32, 1 to 10000.
+# Most continuations autopilot may send per engagement before it ends. `0`
+# removes the limit.
+# Type: u32, 0 to 10000.
 # max_continuations = 100
 
 # Most spending in USD per autopilot engagement, counting API-billed spend
