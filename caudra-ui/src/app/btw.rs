@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use caudra_agent::CancelToken;
 use caudra_providers::{
-    AgentError, CacheKey, ContentBlock, Message, ProviderEvent, Role, StopReason, project_messages,
+    AgentError, CacheKey, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
+    TokenUsage, project_messages,
 };
 use caudra_storage::id::SessionRef;
 use caudra_storage::usage_ledger::LedgerPurpose;
@@ -29,14 +30,26 @@ pub(crate) const BTW_CUTOFF_MARKER: &str = "/btw reads the conversation up to he
 
 const BTW_REMINDER: &str = "<system-reminder>\n# Side question\n\nThe user is asking beside \
 the conversation, not continuing it. Answer from the conversation so far, directly and in one \
-response.\n- Do NOT call any tool. No result will ever come back, so a call wastes the \
-answer.\n- Nothing in this thread enters the main conversation, and the work it discusses is \
+response.\n- Do NOT call any tool. Tools cannot run here; a call is refused and only delays \
+the answer.\n- Nothing in this thread enters the main conversation, and the work it discusses is \
 not yours to start.\n- Never say \"Let me...\", \"I'll now...\", or promise any action.\n- If \
 you don't know, say so; do not offer to look it up.\n- Follow-up questions may arrive in this \
 thread. Answer each the same way.\n</system-reminder>";
 
-const TOOL_CALL_STOPPED: &str = "\n\n_Stopped: the model tried to call a tool. `/btw` cannot run \
-tools, so ask in the main session instead._";
+const TOOL_CALL_STOPPED: &str = "\n\n_Stopped: the model kept trying to call tools. `/btw` cannot \
+run tools, so ask in the main session instead._";
+
+/// The result of every call a side question refuses, so the model answers
+/// from what it has instead of waiting on a tool that will never run.
+const TOOL_REDIRECT: &str = "<system-reminder>\n# Tools unavailable\n\nThis is a side question \
+and tools cannot run here, so that call was not made. Do not call any tool. Answer now from the \
+conversation so far as fully as you can, and say plainly what you could not confirm without the \
+tool.\n</system-reminder>";
+
+/// How many times a model that calls a tool is refused and asked again
+/// before the answer stops.
+const MAX_TOOL_REDIRECTS: usize = 2;
+const ROUND_SEPARATOR: &str = "\n\n";
 
 /// The reminder leads so the model treats the question as a quick aside, not a task to act on.
 pub(crate) fn btw_question(question: &str) -> Message {
@@ -66,6 +79,24 @@ fn answer_text(message: &Message) -> Option<String> {
         .collect();
     let text = text.join("\n");
     (!text.trim().is_empty()).then_some(text)
+}
+
+/// Answers every call `message` made with a refusal that tells the model to
+/// answer without it, which keeps each call paired with a result.
+fn refuse_tool_calls(message: &Message) -> Message {
+    Message {
+        role: Role::User,
+        content: message
+            .tool_uses()
+            .map(|(id, _, _)| ContentBlock::ToolResult {
+                tool_use_id: id.to_owned(),
+                content: TOOL_REDIRECT.into(),
+                is_error: true,
+                output_ref: None,
+            })
+            .collect(),
+        ..Default::default()
+    }
 }
 
 /// A side conversation forked from the main one: the prefix and history it
@@ -338,11 +369,9 @@ async fn run_btw(
     cache_key: Option<CacheKey>,
     cancel: CancelToken,
 ) {
-    let provider = Arc::clone(&prompt.provider);
-    let model = prompt.model.clone();
     // btw bypasses `stream_with_retry`, the only other place options meet a model, so it has to
     // clamp for itself or it sends options the live request would have gated away.
-    let opts = prompt.opts.clamped(&model);
+    let opts = prompt.opts.clamped(&prompt.model);
     let (event_tx, event_rx) = flume::unbounded();
 
     let forwarder = smol::spawn({
@@ -371,15 +400,7 @@ async fn run_btw(
     });
 
     let result = future::race(
-        provider.stream_message(
-            &model,
-            &messages,
-            &prompt.system,
-            &prompt.tools,
-            &event_tx,
-            opts.clone(),
-            cache_key.as_ref(),
-        ),
+        answer_without_tools(&prompt, messages, &event_tx, &opts, cache_key.as_ref()),
         async {
             cancel.cancelled().await;
             Err(AgentError::Cancelled)
@@ -390,20 +411,21 @@ async fn run_btw(
     forwarder.await;
 
     match result {
-        Ok(response) => {
-            if response.stop_reason == Some(StopReason::ToolUse) {
+        Ok(answer) => {
+            if answer.stopped {
                 let _ = btw_tx.send(StreamEvent::TextDelta(TOOL_CALL_STOPPED.into()));
             }
+            let model = &prompt.model;
             let _ = btw_tx.send(StreamEvent::Done(StreamDone {
                 usage: StreamUsage {
-                    cost: model.billed_cost(&response.usage, opts.fast),
+                    cost: answer.cost,
                     billing: model.billing,
-                    usage: response.usage,
+                    usage: answer.usage,
                     model: model.id.clone(),
                     provider: model.provider.to_string(),
                     purpose: LedgerPurpose::Btw,
                 },
-                answer: answer_text(&response.message),
+                answer: (!answer.texts.is_empty()).then(|| answer.texts.join(ROUND_SEPARATOR)),
             }));
         }
         // The receiver is already gone, which is what cancelled the stream.
@@ -414,12 +436,80 @@ async fn run_btw(
     }
 }
 
+/// Every round's text and spend, and whether the model was still calling a
+/// tool when its redirects ran out.
+struct BtwAnswer {
+    texts: Vec<String>,
+    usage: TokenUsage,
+    cost: Option<f64>,
+    stopped: bool,
+}
+
+/// Streams the answer, refusing each tool call and asking again, so a model
+/// that reaches for a tool still answers from what it already knows. Each
+/// round is priced on its own: a tiered price depends on one request's size.
+async fn answer_without_tools(
+    prompt: &BtwPrompt,
+    mut messages: Vec<Message>,
+    event_tx: &Sender<ProviderEvent>,
+    opts: &RequestOptions,
+    cache_key: Option<&CacheKey>,
+) -> Result<BtwAnswer, AgentError> {
+    let mut answer = BtwAnswer {
+        texts: Vec::new(),
+        usage: TokenUsage::default(),
+        cost: Some(0.0),
+        stopped: false,
+    };
+    for round in 0..=MAX_TOOL_REDIRECTS {
+        let response = prompt
+            .provider
+            .stream_message(
+                &prompt.model,
+                &messages,
+                &prompt.system,
+                &prompt.tools,
+                event_tx,
+                opts.clone(),
+                cache_key,
+            )
+            .await?;
+        answer.usage += response.usage;
+        answer.cost = answer
+            .cost
+            .zip(prompt.model.billed_cost(&response.usage, opts.fast))
+            .map(|(total, cost)| total + cost);
+        let text = answer_text(&response.message);
+        let streamed_text = text.is_some();
+        answer.texts.extend(text);
+        if response.stop_reason != Some(StopReason::ToolUse) {
+            return Ok(answer);
+        }
+        let refusal = refuse_tool_calls(&response.message);
+        if round == MAX_TOOL_REDIRECTS || refusal.content.is_empty() {
+            break;
+        }
+        messages.push(response.message);
+        messages.push(refusal);
+        if streamed_text {
+            event_tx.send(ProviderEvent::TextDelta {
+                text: ROUND_SEPARATOR.into(),
+            })?;
+        }
+    }
+    answer.stopped = true;
+    Ok(answer)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
     use arc_swap::ArcSwap;
     use caudra_agent::UNAVAILABLE_RESULT;
     use caudra_providers::provider::{BoxFuture, Provider};
-    use caudra_providers::{Model, ModelInfo, RequestOptions, StreamResponse};
+    use caudra_providers::{Model, ModelInfo, StreamResponse};
     use serde_json::{Value, json};
     use test_case::test_case;
 
@@ -444,6 +534,13 @@ mod tests {
     const EXPECTED_DONE: &str = "expected stream completion after all deltas";
     const CLARIFY_STORAGE: &str = "About: Q1/2 · Storage\nWhich database?\nSQLite\nPostgreSQL";
     const CLARIFY_DEPLOYMENT: &str = "About: Q2/2 · Deployment\nWhere should it run?\nLocal\nCloud";
+    const LOOKING: &str = "the config decides";
+    const ROUND_USAGE: TokenUsage = TokenUsage {
+        input: 1_000,
+        output: 50,
+        cache_creation: 0,
+        cache_read: 200,
+    };
 
     #[test_case(false ; "same_question")]
     #[test_case(true ; "different_question")]
@@ -619,6 +716,178 @@ mod tests {
         fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
+    }
+
+    /// Answers each request with the next scripted response, streaming its
+    /// text as deltas, and hands over the messages every request carried.
+    struct ScriptedProvider {
+        responses: Mutex<VecDeque<StreamResponse>>,
+        requests: flume::Sender<Vec<Message>>,
+    }
+
+    impl Provider for ScriptedProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            event_tx: &'a Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a CacheKey>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                self.requests.send(messages.to_vec()).unwrap();
+                let response = self.responses.lock().unwrap().pop_front().unwrap();
+                if let Some(text) = answer_text(&response.message) {
+                    event_tx.send(ProviderEvent::TextDelta { text })?;
+                }
+                Ok(response)
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    fn tool_round(text: Option<&str>, calls: &[&str]) -> StreamResponse {
+        let mut content: Vec<ContentBlock> = text
+            .map(|text| ContentBlock::Text { text: text.into() })
+            .into_iter()
+            .collect();
+        content.extend(
+            calls
+                .iter()
+                .map(|id| ContentBlock::tool_use(*id, TOOL, json!({}))),
+        );
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content,
+                ..Default::default()
+            },
+            usage: ROUND_USAGE,
+            stop_reason: Some(StopReason::ToolUse),
+            ..Default::default()
+        }
+    }
+
+    /// Runs one scripted question and returns every request it sent, every
+    /// text delta the modal saw, and how it finished.
+    fn run_scripted(
+        responses: Vec<StreamResponse>,
+    ) -> (Vec<Vec<Message>>, Vec<String>, StreamDone) {
+        let (requests_tx, requests) = flume::unbounded();
+        let provider = ScriptedProvider {
+            responses: Mutex::new(responses.into()),
+            requests: requests_tx,
+        };
+        let (event_tx, event_rx) = flume::unbounded();
+        smol::block_on(run_btw(
+            Arc::new(prompt_with(Arc::new(provider), FIRST_MODEL)),
+            vec![btw_question(Q)],
+            event_tx,
+            None,
+            CancelToken::none(),
+        ));
+        let mut deltas = Vec::new();
+        let mut done = None;
+        for event in event_rx.drain() {
+            match event {
+                StreamEvent::TextDelta(text) => deltas.push(text),
+                StreamEvent::Done(finished) => done = Some(finished),
+                _ => {}
+            }
+        }
+        (
+            requests.drain().collect(),
+            deltas,
+            done.expect(EXPECTED_DONE),
+        )
+    }
+
+    fn round_cost(rounds: usize) -> Option<f64> {
+        let model = Model::from_spec(FIRST_MODEL).unwrap();
+        (0..rounds).try_fold(0.0, |total, _| {
+            model
+                .billed_cost(&ROUND_USAGE, false)
+                .map(|cost| total + cost)
+        })
+    }
+
+    #[test]
+    fn a_tool_call_is_refused_and_the_model_answers() {
+        let (requests, deltas, done) = run_scripted(vec![
+            tool_round(Some(LOOKING), &OPEN_CALLS),
+            StreamResponse {
+                message: assistant_text(ANSWER),
+                usage: ROUND_USAGE,
+                stop_reason: Some(StopReason::EndTurn),
+                ..Default::default()
+            },
+        ]);
+
+        assert_eq!(requests.len(), 2);
+        let (refusal, rest) = requests[1].split_last().unwrap();
+        let (called, sent_first) = rest.split_last().unwrap();
+        assert_eq!(
+            serde_json::to_value(sent_first).unwrap(),
+            serde_json::to_value(&requests[0]).unwrap(),
+            "the redirect extends the first request"
+        );
+        assert_eq!(
+            serde_json::to_value(called).unwrap(),
+            serde_json::to_value(&tool_round(Some(LOOKING), &OPEN_CALLS).message).unwrap(),
+            "the call goes back exactly as the model made it"
+        );
+        assert!(matches!(refusal.role, Role::User));
+        let results: Vec<(&str, &str, bool)> = refusal
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                } => Some((tool_use_id.as_str(), content.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results,
+            OPEN_CALLS
+                .iter()
+                .map(|id| (*id, TOOL_REDIRECT, true))
+                .collect::<Vec<_>>()
+        );
+
+        assert_eq!(deltas, [LOOKING, ROUND_SEPARATOR, ANSWER]);
+        assert_eq!(
+            done.answer,
+            Some([LOOKING, ANSWER].join(ROUND_SEPARATOR)),
+            "the thread keeps what the modal showed"
+        );
+        let mut usage = ROUND_USAGE;
+        usage += ROUND_USAGE;
+        assert_eq!(done.usage.usage, usage);
+        assert_eq!(done.usage.cost, round_cost(2));
+    }
+
+    #[test_case(Some(LOOKING) ; "text_only_in_first")]
+    #[test_case(None ; "no_text")]
+    fn a_model_that_keeps_calling_tools_stops_after_the_redirects(first_text: Option<&str>) {
+        let rounds = MAX_TOOL_REDIRECTS + 1;
+        let responses = (0..rounds)
+            .map(|round| tool_round(first_text.filter(|_| round == 0), &OPEN_CALLS[..1]))
+            .collect();
+        let (requests, deltas, done) = run_scripted(responses);
+
+        assert_eq!(requests.len(), rounds);
+        assert_eq!(deltas.last().map(String::as_str), Some(TOOL_CALL_STOPPED));
+        assert_eq!(done.answer.as_deref(), first_text);
+        assert_eq!(done.usage.cost, round_cost(rounds));
     }
 
     fn prompt_with(provider: Arc<dyn Provider>, spec: &str) -> BtwPrompt {
