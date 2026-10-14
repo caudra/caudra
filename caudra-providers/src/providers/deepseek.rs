@@ -17,7 +17,7 @@ use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
 
 const PAD: &str = "";
-const V4_MARKER: &str = "deepseek-v4";
+const THINKING_PAD_MARKERS: &[&str] = &["deepseek-v4", "deepseek-flash"];
 const BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
@@ -35,7 +35,7 @@ inventory::submit!(caudra_config::providers::BuiltInProvider {
     protocol: caudra_config::providers::Protocol::Openai,
     default_base_url: "https://api.deepseek.com",
     default_api_key_env: "DEEPSEEK_API_KEY",
-    default_model: "deepseek/deepseek-v4-flash",
+    default_model: "deepseek/deepseek-flash",
     plans: None,
     login_url: Some("https://platform.deepseek.com/api_keys"),
     needs_url: false,
@@ -51,16 +51,16 @@ const PEAK_MULTIPLIER: f64 = 2.0;
 pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
         ModelEntry {
-            prefixes: &["deepseek-v4-flash"],
+            prefixes: &["deepseek-flash", "deepseek-v4-flash"],
             small: false,
             family: ModelFamily::Generic,
-            vision: false,
+            vision: true,
             default: false,
             pricing: ModelPricing {
-                input: 0.22,
-                output: 0.66,
+                input: 0.15,
+                output: 0.60,
                 cache_write: 0.00,
-                cache_read: 0.007,
+                cache_read: 0.003,
                 fast: None,
                 tiers: ModelPricing::UNTIERED,
             },
@@ -253,15 +253,19 @@ impl Provider for DeepSeek {
     }
 }
 
-/// DeepSeek's two reasoning models disagree about `reasoning_content`: V4 in
-/// thinking mode wants it on every assistant turn (missing = 400), R1 refuses
-/// it as input. So we gate on the V4 substring, same trick Vercel's AI SDK
-/// uses, and back-fill the turns that have none (plain replies, tool-only
-/// turns). The API only checks the field exists, so `""` is enough.
+/// DeepSeek's reasoning models disagree about `reasoning_content`: V4 and
+/// V4.1 Flash (`deepseek-flash`) in thinking mode want it on every assistant
+/// turn (missing = 400), R1 refuses it as input. So we gate on their names,
+/// the same trick Vercel's AI SDK uses, and back-fill the turns that have none
+/// (plain replies, tool-only turns). The API only checks the field exists, so
+/// `""` is enough.
 ///
 /// Ref: <https://api-docs.deepseek.com/guides/thinking_mode>
 fn pad_reasoning_content(model_id: &str, body: &mut Value) {
-    if !model_id.contains(V4_MARKER) {
+    if !THINKING_PAD_MARKERS
+        .iter()
+        .any(|marker| model_id.contains(marker))
+    {
         return;
     }
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
@@ -291,6 +295,7 @@ mod tests {
     use crate::{ContentBlock, Role};
 
     const V4: &str = "deepseek/deepseek-v4-pro";
+    const FLASH: &str = "deepseek/deepseek-flash";
     const R1: &str = "deepseek/deepseek-reasoner";
     const API_KEY: &str = "sk-deepseek";
     const SYSTEM_PROMPT: &str = "sys";
@@ -349,6 +354,7 @@ mod tests {
     }
 
     #[test_case(V4, ThinkingConfig::Adaptive, Some(PAD) ; "v4_thinking_pads_the_turn_without_reasoning")]
+    #[test_case(FLASH, ThinkingConfig::Adaptive, Some(PAD) ; "v4_1_flash_thinking_pads_the_turn_without_reasoning")]
     #[test_case(V4, ThinkingConfig::Off, None ; "v4_without_thinking_is_not_padded")]
     #[test_case(R1, ThinkingConfig::Adaptive, None ; "r1_is_not_padded")]
     fn only_v4_thinking_pads_assistant_turns(
