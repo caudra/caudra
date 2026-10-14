@@ -1,9 +1,11 @@
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
+use jiff::civil;
 use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ThinkingSupport};
+use crate::pricing::PriceChange;
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
@@ -11,6 +13,24 @@ use crate::{
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
+
+const LARGE_4: &str = "mistral-large-4";
+
+/// Mistral Large 4 launched on 2026-10-06 at half price "for 2 weeks"
+/// (docs.mistral.ai/getting-started/changelog), so list price from 2026-10-20,
+/// as <https://docs.mistral.ai/models/mistral-large-4-0> quotes it.
+pub(crate) const PRICE_CHANGES: &[PriceChange] = &[PriceChange {
+    prefix: LARGE_4,
+    from: civil::date(2026, 10, 20),
+    pricing: ModelPricing {
+        input: 1.36,
+        output: 4.18,
+        cache_write: 0.00,
+        cache_read: 0.14,
+        fast: None,
+        tiers: ModelPricing::UNTIERED,
+    },
+}];
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "mistral",
@@ -75,6 +95,42 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: None,
             context_window: 262_144,
+            reasoning_options: None,
+        },
+        ModelEntry {
+            prefixes: &[LARGE_4],
+            small: false,
+            family: ModelFamily::Generic,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 0.68,
+                output: 2.09,
+                cache_write: 0.00,
+                cache_read: 0.07,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: None,
+            context_window: 1_000_000,
+            reasoning_options: None,
+        },
+        ModelEntry {
+            prefixes: &["glm-5-3", "zai-glm-5-3"],
+            small: false,
+            family: ModelFamily::Glm,
+            vision: false,
+            default: false,
+            pricing: ModelPricing {
+                input: 1.40,
+                output: 4.40,
+                cache_write: 0.00,
+                cache_read: 0.14,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: None,
+            context_window: 1_000_000,
             reasoning_options: None,
         },
         ModelEntry {

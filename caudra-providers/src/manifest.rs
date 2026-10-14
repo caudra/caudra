@@ -198,7 +198,7 @@ const MISTRAL: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
-    price_changes: &[],
+    price_changes: mistral::PRICE_CHANGES,
     catalog_slug: Some("mistral"),
 };
 
