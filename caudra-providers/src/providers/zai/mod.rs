@@ -26,6 +26,9 @@ static CONFIG_STANDARD: OpenAiCompatConfig = OpenAiCompatConfig {
 };
 
 const QUOTA_LIMIT_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
+/// The models that take `reasoning_effort`, from
+/// <https://docs.z.ai/guides/overview/migrate-to-glm-new>.
+const THINKING_MODELS: &[&str] = &["glm-5.2", "glm-5.3"];
 
 #[derive(Deserialize)]
 struct QuotaResponse {
@@ -84,14 +87,14 @@ inventory::submit!(BuiltInProvider {
     protocol: Protocol::Openai,
     default_base_url: "https://api.z.ai/api/paas/v4",
     default_api_key_env: "ZHIPU_API_KEY",
-    default_model: "zai/glm-5.1",
+    default_model: "zai/glm-5.3",
     plans: Some(&[
         (
             "standard",
             ProviderPlan {
                 display_name: "Pay-as-you-go",
                 base_url: "https://api.z.ai/api/paas/v4",
-                default_model: Some("zai/glm-5.1"),
+                default_model: Some("zai/glm-5.3"),
                 login_url: None,
             }
         ),
@@ -112,11 +115,29 @@ inventory::submit!(BuiltInProvider {
 pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
         ModelEntry {
-            prefixes: &["glm-5-code"],
+            prefixes: &["glm-5.3"],
             small: false,
             family: ModelFamily::Glm,
             vision: false,
             default: true,
+            pricing: ModelPricing {
+                input: 1.40,
+                output: 4.40,
+                cache_write: 0.00,
+                cache_read: 0.26,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: Some(131072),
+            context_window: 1_000_000,
+            reasoning_options: None,
+        },
+        ModelEntry {
+            prefixes: &["glm-5-code"],
+            small: false,
+            family: ModelFamily::Glm,
+            vision: false,
+            default: false,
             pricing: ModelPricing {
                 input: 1.20,
                 output: 5.00,
@@ -136,10 +157,10 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             vision: false,
             default: false,
             pricing: ModelPricing {
-                input: 1.00,
-                output: 3.20,
+                input: 1.40,
+                output: 4.40,
                 cache_write: 0.00,
-                cache_read: 0.20,
+                cache_read: 0.26,
                 fast: None,
                 tiers: ModelPricing::UNTIERED,
             },
@@ -148,7 +169,25 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: None,
         },
         ModelEntry {
-            prefixes: &["glm-5.1", "glm-5"],
+            prefixes: &["glm-5.1"],
+            small: false,
+            family: ModelFamily::Glm,
+            vision: false,
+            default: false,
+            pricing: ModelPricing {
+                input: 1.40,
+                output: 4.40,
+                cache_write: 0.00,
+                cache_read: 0.26,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: Some(131072),
+            context_window: 200_000,
+            reasoning_options: None,
+        },
+        ModelEntry {
+            prefixes: &["glm-5"],
             small: false,
             family: ModelFamily::Glm,
             vision: false,
@@ -163,6 +202,42 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(131072),
             context_window: 200_000,
+            reasoning_options: None,
+        },
+        ModelEntry {
+            prefixes: &["glm-5.3-flashx"],
+            small: true,
+            family: ModelFamily::Glm,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 0.37,
+                output: 1.25,
+                cache_write: 0.00,
+                cache_read: 0.075,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: Some(131072),
+            context_window: 1_000_000,
+            reasoning_options: None,
+        },
+        ModelEntry {
+            prefixes: &["glm-5.3-flash"],
+            small: true,
+            family: ModelFamily::Glm,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 0.15,
+                output: 0.50,
+                cache_write: 0.00,
+                cache_read: 0.03,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: Some(131072),
+            context_window: 1_000_000,
             reasoning_options: None,
         },
         ModelEntry {
@@ -394,7 +469,7 @@ impl Provider for Zai {
 }
 
 pub(crate) fn adjust_model(model: &mut Model) {
-    if model.id.starts_with("glm-5.2") {
+    if THINKING_MODELS.contains(&model.id.as_str()) {
         model.thinking_override = Some(ThinkingSupport::Yes);
     }
 }
@@ -410,6 +485,7 @@ mod tests {
         {"type":"TIME_LIMIT","unit":5,"percentage":0,"nextResetTime":1780336384978}
     ],"level":"lite"}}"#;
 
+    #[test_case("zai/glm-5.3", true ; "glm_5_3_supports_thinking")]
     #[test_case("zai/glm-5.2", true ; "glm_5_2_supports_thinking")]
     #[test_case("zai/glm-5.1", false ; "glm_5_1_no_thinking")]
     #[test_case("zai/glm-4.7", false ; "glm_4_7_no_thinking")]

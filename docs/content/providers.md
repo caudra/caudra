@@ -277,16 +277,20 @@ Routing defaults: ministral-14b-latest (Fast), mistral-medium-latest (Best)
 
 | Marker | Models | Pricing (in/out per 1M tokens) | Context |
 |---------|--------|-------------------------------|---------|
+| Small | glm-5.3-flashx | $0.37 / $1.25 | 1000K ctx / 131K out |
+| Small | glm-5.3-flash | $0.15 / $0.50 | 1000K ctx / 131K out |
 | Fast | **glm-4.7-flash** (default) | $0.00 / $0.00 | 200K ctx / 131K out |
 | Small | glm-4.5-flash | $0.00 / $0.00 | 131K ctx / 98K out |
 | Small | glm-4.5-air | $0.20 / $1.10 | 131K ctx / 98K out |
-| Best | **glm-5-code** (default) | $1.20 / $5.00 | 200K ctx / 131K out |
-|  | glm-5.2 | $1.00 / $3.20 | 1000K ctx / 131K out |
-|  | glm-5.1, glm-5 | $1.00 / $3.20 | 200K ctx / 131K out |
+| Best | **glm-5.3** (default) | $1.40 / $4.40 | 1000K ctx / 131K out |
+|  | glm-5-code | $1.20 / $5.00 | 200K ctx / 131K out |
+|  | glm-5.2 | $1.40 / $4.40 | 1000K ctx / 131K out |
+|  | glm-5.1 | $1.40 / $4.40 | 200K ctx / 131K out |
+|  | glm-5 | $1.00 / $3.20 | 200K ctx / 131K out |
 |  | glm-4.7, glm-4.6 | $0.60 / $2.20 | 200K ctx / 131K out |
 |  | glm-4.5 | $0.60 / $2.20 | 131K ctx / 98K out |
 
-Routing defaults: glm-4.7-flash (Fast), glm-5-code (Best)
+Routing defaults: glm-4.7-flash (Fast), glm-5.3 (Best)
 
 ### DeepSeek
 
@@ -582,7 +586,7 @@ Current plans:
 |----------|------|--------------|
 | Mistral | `standard` | Standard at `https://api.mistral.ai/v1`, default `mistral/mistral-medium-latest` |
 | Mistral | `coding` | Vibe / Coding at `https://api.mistral.ai/v1`, default `mistral/mistral-vibe-cli-latest` |
-| Z.AI | `standard` | Pay-as-you-go at `https://api.z.ai/api/paas/v4`, default `zai/glm-5.1` |
+| Z.AI | `standard` | Pay-as-you-go at `https://api.z.ai/api/paas/v4`, default `zai/glm-5.3` |
 | Z.AI | `coding` | Coding plan at `https://api.z.ai/api/coding/paas/v4`, default `zai/glm-5-code` |
 
 Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this file.
