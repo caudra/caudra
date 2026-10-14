@@ -70,6 +70,9 @@ pub const QUESTION_DECLINED_REPLY: &str = "declined";
 /// The user consented to an MCP request that asks for no answers: opening the
 /// address a URL request carries, or a form with no fields. Either is `accept`.
 pub const QUESTION_ACCEPTED_REPLY: &str = "accepted";
+/// The user put a waiting `question` off to answer later: the agent gets a
+/// receipt and carries on, and the form joins the deferred questions.
+pub const QUESTION_DEFERRED_REPLY: &str = "deferred";
 /// Log lines a card keeps under its roster while the run works.
 pub const CARD_LOG_LINES: usize = 3;
 const CARD_REPORT_FIELD: &str = "report";
@@ -420,13 +423,42 @@ pub struct Answer {
 
 /// The run has parked on a question. The front end that shows the form answers
 /// through the user-response channel, which the asking tool holds locked for
-/// the duration, so no id is needed to route the reply back.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// the duration, so no id is needed to route the reply back. A deferred
+/// question is the exception: nothing is parked, and its answer goes to the
+/// background job named in [`QuestionDelivery::Deferred`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QuestionEvent {
     pub questions: Vec<AskedQuestion>,
     /// `None` for the agent's own `question` tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<QuestionSource>,
+    /// The `question` call that asked, which keys autopilot's claim on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "QuestionDelivery::is_blocking")]
+    pub delivery: QuestionDelivery,
+}
+
+/// Whether the asking agent waits for this form.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum QuestionDelivery {
+    /// The agent waits for the answer.
+    #[default]
+    Blocking,
+    /// The agent waits, and the user may put the question off with
+    /// [`QUESTION_DEFERRED_REPLY`], which turns it into a deferred one.
+    Deferrable,
+    /// The agent keeps working. The answer goes to the background job
+    /// `task_id` through `BackgroundTasks::answer_question`. `docked` is
+    /// whether the form goes up at once or waits until the user opens it.
+    Deferred { task_id: String, docked: bool },
+}
+
+impl QuestionDelivery {
+    pub fn is_blocking(&self) -> bool {
+        *self == Self::Blocking
+    }
 }
 
 /// One child of a batch, as the reader sees it. `output` is the child's own
@@ -6196,8 +6228,8 @@ mod tests {
             url: None,
         };
         let event = QuestionEvent {
-            questions: Vec::new(),
             source: Some(source.clone()),
+            ..QuestionEvent::default()
         };
 
         let restored: QuestionEvent =
@@ -6213,8 +6245,24 @@ mod tests {
             QUESTION_DISMISSED_REPLY,
             QUESTION_DECLINED_REPLY,
             QUESTION_ACCEPTED_REPLY,
+            QUESTION_DEFERRED_REPLY,
         ] {
             assert!(serde_json::from_str::<Vec<Vec<String>>>(reply).is_err());
         }
+    }
+
+    #[test_case(QuestionDelivery::Deferrable ; "deferrable")]
+    #[test_case(QuestionDelivery::Deferred { task_id: ASKED_HEADER.into(), docked: true } ; "deferred")]
+    fn a_question_delivery_round_trips(delivery: QuestionDelivery) {
+        let event = QuestionEvent {
+            questions: vec![serde_json::from_value(old_question()).unwrap()],
+            delivery: delivery.clone(),
+            ..QuestionEvent::default()
+        };
+
+        let restored: QuestionEvent =
+            serde_json::from_value(serde_json::to_value(&event).unwrap()).unwrap();
+
+        assert_eq!(restored.delivery, delivery);
     }
 }

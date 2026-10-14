@@ -452,7 +452,7 @@ impl RunNotificationState {
 
 impl SessionStatus {
     fn of(app: &App) -> Self {
-        if app.awaiting_input() {
+        if app.needs_input() {
             Self::NeedsInput
         } else if app.status == Status::Streaming || app.waiting_for_background() {
             Self::Working

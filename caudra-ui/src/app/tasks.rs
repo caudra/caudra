@@ -801,7 +801,12 @@ impl App {
         let runtime = self.runtime_tasks();
         let mut tasks = self.chat_tasks(&runtime);
         let mut seen = HashSet::new();
-        for card in runtime.iter().filter(|card| card.kind == JobKind::Agent) {
+        let listed = |card: &&TaskCard| match card.kind {
+            JobKind::Agent => true,
+            JobKind::Question => card.active(),
+            JobKind::Shell => false,
+        };
+        for card in runtime.iter().filter(listed) {
             if !tasks.iter().any(|task| task.id.as_ref() == card.task_id) {
                 tasks.push(TaskInfo {
                     id: Arc::from(card.task_id.as_str()),
@@ -985,7 +990,7 @@ impl App {
         };
         let mut changed = false;
         for task in runtime.list() {
-            if task.kind == JobKind::Shell {
+            if task.kind != JobKind::Agent {
                 if let Some(index) = self.job_owner_chat(&task) {
                     changed |= self.chats[index].task_card_update(task);
                 }
@@ -1056,6 +1061,9 @@ impl App {
             TaskPickerAction::History { older } => self.load_task_history(older),
             TaskPickerAction::Consumed => {}
             TaskPickerAction::Copy(text) => self.copy_to_clipboard(&text),
+            TaskPickerAction::Opened(id) if self.is_question_job(&id) => {
+                self.reopen_question(Some(&id));
+            }
             TaskPickerAction::Opened(id) => self.preview_task(&id),
             TaskPickerAction::Control { task, promote } => {
                 self.start_task_control(*task, promote, ControlModal::Tasks);
@@ -1098,7 +1106,18 @@ impl App {
         Some(format!("{count} {noun}"))
     }
 
+    /// A deferred question has a form, never a transcript to preview.
+    fn is_question_job(&self, id: &str) -> bool {
+        self.background
+            .as_ref()
+            .and_then(|runtime| runtime.resident_status(id))
+            .is_some_and(|card| card.kind == JobKind::Question)
+    }
+
     pub(super) fn preview_task(&mut self, id: &str) {
+        if self.is_question_job(id) {
+            return;
+        }
         self.task_history.cancel_transcript();
         if !self
             .chats

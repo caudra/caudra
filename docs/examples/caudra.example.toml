@@ -345,6 +345,13 @@ version = 1
 # Type: bool.
 # task_model_choice = true
 
+# Let the main agent ask a `question` without waiting for the answer, so it
+# keeps working while the form waits for you. The answer reaches it later, and
+# you can also put a waiting question off with F4. When off, every question
+# waits for its answer.
+# Type: bool.
+# deferred_questions = true
+
 # Shell delivery: sync waits for termination, auto routes by requested timeout,
 # async returns an admission receipt.
 # Type: string.

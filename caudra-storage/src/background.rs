@@ -85,6 +85,7 @@ pub enum JobKind {
     #[default]
     Agent,
     Shell,
+    Question,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -107,12 +108,22 @@ pub struct ShellJobMetadata {
     pub mode: String,
 }
 
+/// A `question` the main agent asked without waiting for the answer.
+/// `label` names it in lists and reminders, built from the question headers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionJobMetadata {
+    pub call_id: String,
+    pub root_call_id: String,
+    pub label: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "metadata", rename_all = "snake_case")]
 pub enum JobPayload {
     #[default]
     Agent,
     Shell(ShellJobMetadata),
+    Question(QuestionJobMetadata),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +170,7 @@ impl TaskRecord {
         match self.payload {
             JobPayload::Agent => JobKind::Agent,
             JobPayload::Shell(_) => JobKind::Shell,
+            JobPayload::Question(_) => JobKind::Question,
         }
     }
 

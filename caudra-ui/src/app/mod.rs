@@ -21,6 +21,7 @@ mod memory;
 pub(crate) mod mode;
 mod mouse;
 pub(crate) mod permission_editor;
+pub(crate) mod questions;
 mod queue;
 mod sandbox;
 mod session;
@@ -154,8 +155,8 @@ use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::tools::ToolAudience;
 use caudra_agent::tools::native::plan::{self, PlanTarget};
 use caudra_agent::types::{
-    BACKGROUND_EVENT_RUN_ID, QUESTION_ACCEPTED_REPLY, QUESTION_DECLINED_REPLY,
-    QUESTION_DISMISSED_REPLY, QuestionEvent, WorkflowProvenance,
+    AutopilotEvent, BACKGROUND_EVENT_RUN_ID, QUESTION_ACCEPTED_REPLY, QUESTION_DECLINED_REPLY,
+    QUESTION_DISMISSED_REPLY, QuestionDelivery, WorkflowProvenance,
 };
 use caudra_agent::{
     AgentEvent, AgentInput, AgentMode, CommitRef, Envelope, GoalVerdict, HistorySnapshot,
@@ -551,7 +552,10 @@ pub struct App {
     pub(crate) workflow: workflow::WorkflowUi,
     pub(crate) automation: automation::AutomationLink,
     pub(super) automation_inspector: AutomationInspector,
+    /// The docked question form, whichever kind of ask it is.
     pub(super) question_form: QuestionForm,
+    /// Deferred questions off the dock, and an ask held behind one.
+    questions: questions::QuestionQueue,
     pub(super) session_picker: SessionPicker,
     pub(super) session_relocation_picker: SessionRelocationPicker,
     pub(super) worktree_picker: WorktreePicker,
@@ -877,6 +881,7 @@ impl App {
             automation: automation::AutomationLink::default(),
             automation_inspector: AutomationInspector::new(),
             question_form: QuestionForm::new(),
+            questions: questions::QuestionQueue::default(),
             session_picker: SessionPicker::new(),
             session_relocation_picker: SessionRelocationPicker::new(),
             worktree_picker: WorktreePicker::new(),
@@ -1859,6 +1864,9 @@ impl App {
     /// is parked on. A dismissal is an unparseable reply by design: the tool
     /// reads anything it cannot make answers of as "the user declined".
     fn handle_question_form_action(&mut self, action: QuestionFormAction) -> Vec<Action> {
+        if self.question_form.deferred_task().is_some() {
+            return self.handle_deferred_question_action(action);
+        }
         let answered = matches!(
             action,
             QuestionFormAction::Submit(_)
@@ -1877,9 +1885,7 @@ impl App {
                 .as_ref()
                 .is_some_and(|origin| !self.task_response_current(origin))
         {
-            self.question_form.close();
-            self.question_subagent = None;
-            self.task_interactions.question = None;
+            self.close_blocking_question();
             return Vec::new();
         }
         if answered {
@@ -1895,24 +1901,31 @@ impl App {
                 self.copy_to_clipboard(&text);
                 return Vec::new();
             }
+            QuestionFormAction::Later => {
+                self.defer_question();
+                return Vec::new();
+            }
             // Nothing is sent back: the parked tool ends on its own cancel
             // path, and the run only moves again when the user says so.
             QuestionFormAction::Cancel => {
-                self.question_form.close();
                 self.user_stopped(AutopilotStopper::QuestionCancel);
-                return match self.question_subagent.take() {
+                let subagent = self.question_subagent.take();
+                self.close_blocking_question();
+                return match subagent {
                     Some(task_id) => self.cancel_subagent(task_id),
                     None => self.handle_cancel(),
                 };
             }
-            QuestionFormAction::Dismiss => QUESTION_DISMISSED_REPLY.to_owned(),
+            QuestionFormAction::Dismiss | QuestionFormAction::PutAside => {
+                QUESTION_DISMISSED_REPLY.to_owned()
+            }
             QuestionFormAction::Decline => QUESTION_DECLINED_REPLY.to_owned(),
             QuestionFormAction::Accept => QUESTION_ACCEPTED_REPLY.to_owned(),
             QuestionFormAction::Submit(answers) => serde_json::to_string(&answers)
                 .unwrap_or_else(|_| QUESTION_DISMISSED_REPLY.to_owned()),
         };
-        self.question_form.close();
         let subagent = self.question_subagent.take();
+        self.close_blocking_question();
         self.send_to_agent(subagent.as_deref(), reply);
         Vec::new()
     }
@@ -1924,13 +1937,10 @@ impl App {
         let subagent = envelope.subagent.as_ref().map(|s| s.task_id.as_str());
         let same_asker = self.question_subagent.as_deref() == subagent
             && self.task_interactions.question.as_deref() == envelope.task.as_deref();
-        if !self.question_form.is_open() || !same_asker {
+        if !self.has_blocking_question() || !same_asker {
             return;
         }
-        self.discard_question_btw();
-        self.question_form.close();
-        self.question_subagent = None;
-        self.task_interactions.question = None;
+        self.close_blocking_question();
     }
 
     fn send_answer(&self, answer: String) {
@@ -3900,6 +3910,10 @@ impl App {
             self.toggle_plan_or_todo();
             return vec![];
         }
+        if leader::UNANSWERED_QUESTION.matches(key) {
+            self.reopen_question(None);
+            return vec![];
+        }
         if leader::SCROLL_BOTTOM.matches(key) {
             self.active_chat().enable_auto_scroll();
             return vec![];
@@ -4660,8 +4674,7 @@ impl App {
         self.preserve_unconsumed_steers(&task_id);
         // The tool the form was parked on is gone, so the form goes with it.
         if self.question_subagent.as_deref() == Some(task_id.as_str()) {
-            self.question_subagent = None;
-            self.question_form.close();
+            self.close_blocking_question();
         }
 
         vec![Action::CancelSubagent {
@@ -4728,6 +4741,23 @@ impl App {
                     _ => {}
                 }
             }
+            return Vec::new();
+        }
+        // A deferred question's job asks under its own provenance, and
+        // nothing is parked on it, so it never becomes the task's question.
+        match envelope.event {
+            AgentEvent::Question(event)
+                if matches!(event.delivery, QuestionDelivery::Deferred { .. }) =>
+            {
+                self.receive_deferred_question(*event);
+                return Vec::new();
+            }
+            other => envelope.event = other,
+        }
+        if let AgentEvent::QuestionClosed = envelope.event
+            && let Some(origin) = &envelope.task
+            && self.close_deferred_question(&origin.task_id)
+        {
             return Vec::new();
         }
         if let Some(origin) = &envelope.task {
@@ -4807,6 +4837,15 @@ impl App {
         // Hoisted like the workflow events above: a workflow agent's prompt is
         // decided under the workflow's run id.
         if let AgentEvent::Autopilot(event) = envelope.event {
+            if let AutopilotEvent::Deciding {
+                seq,
+                kind: DecisionKind::Question,
+                ..
+            } = &event
+                && let Some(origin) = &envelope.task
+            {
+                self.note_question_decision(*seq, &origin.task_id);
+            }
             if session_owned || envelope.workflow.is_some() || envelope.run_id == self.run_id {
                 self.on_autopilot_event(event, envelope.run_id);
             }
@@ -4883,7 +4922,7 @@ impl App {
             if !session_owned && envelope.run_id != self.run_id {
                 return Vec::new();
             }
-            if card.kind == JobKind::Shell {
+            if card.kind != JobKind::Agent {
                 if let Some(index) = self.job_owner_chat(card) {
                     self.chats[index].task_card_update(card.clone());
                 }
@@ -5522,10 +5561,7 @@ impl App {
         // A subagent's question routes back through that subagent's own
         // answer channel, so the form remembers which chat asked.
         if let ChatEventResult::Question(event) = result {
-            self.discard_question_btw();
-            let QuestionEvent { questions, source } = *event;
-            self.question_form.open(questions, source);
-            self.question_subagent = subagent_id;
+            self.receive_question(*event, subagent_id);
             return vec![];
         }
 
@@ -5571,6 +5607,7 @@ impl App {
                         self.retain_session_task_routes();
                     }
                     self.status = Status::Idle;
+                    self.escalate_questions();
                     self.fire_session_autocmd("TurnEnd", serde_json::json!({}));
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Success;
@@ -5588,6 +5625,7 @@ impl App {
                     };
                     self.status = Status::error(message.clone());
                     self.status_bar.clear_flash();
+                    self.escalate_questions();
                     self.automatic_wakes_suppressed = true;
                     self.terminalize_turn(&message);
                     self.retain_session_task_routes();
@@ -6488,19 +6526,14 @@ impl App {
     }
 
     /// True when the agent is parked on user input. Drives the `needs_input`
-    /// session status.
+    /// session status. A deferred question parks nothing: its answer has to
+    /// be able to wake the agent.
     pub(crate) fn awaiting_input(&self) -> bool {
         (self.permission_prompt.is_open()
             && self.permission_prompt.autopilot_note() != Some(&AutopilotNote::Deciding))
             || self.pending_input != PendingInput::None
             || self.float_mgr.needs_input()
-            || self.question_form_waits()
-    }
-
-    /// The question form waits on the user unless autopilot is deciding it.
-    fn question_form_waits(&self) -> bool {
-        self.question_form.is_open()
-            && self.question_form.autopilot_note() != Some(&AutopilotNote::Deciding)
+            || self.blocking_question_waits()
     }
 
     /// What keeps this session from closing or changing, read the way its
@@ -6698,6 +6731,7 @@ impl App {
     }
 
     pub fn close_all_overlays(&mut self) {
+        self.shelve_deferred_question();
         self.pending_plan_submission = None;
         self.suspend_permission_editor();
         self.close_stream_modal();

@@ -288,6 +288,7 @@ impl BackgroundDelivery {
 
 impl App {
     pub(crate) fn stop_background_work(&mut self) {
+        self.drop_questions();
         self.suppress_background_wakes();
         let key = DeliveryKey {
             session: self.state.session.id,

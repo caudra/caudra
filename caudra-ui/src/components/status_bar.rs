@@ -4,6 +4,7 @@ use std::path::{MAIN_SEPARATOR, Path};
 use std::time::{Duration, Instant};
 
 use super::command::ChatScope;
+use super::keybindings::leader;
 use super::tooltip::{Anchor, Tip, TipKey};
 use super::{RetryInfo, Status, escape_terminal_controls, format_elapsed, hover_style};
 
@@ -61,6 +62,8 @@ const YOLO_SHORT_LABEL: &str = " [!]";
 const AUTO_LABEL: &str = " [auto]";
 const AUTO_SHORT_LABEL: &str = " [a]";
 const DECISIONS_OFFLINE_LABEL: &str = "[decisions offline]";
+/// `[? 2]`: deferred questions waiting off the dock.
+const QUESTIONS_MARK: &str = "?";
 /// `[permissions.toml invalid]` names the one file; past one, the count.
 const CONFIG_INVALID_LABEL: &str = "invalid";
 const CONFIG_FILES_INVALID_LABEL: &str = "config files invalid";
@@ -128,6 +131,7 @@ const TIP_SANDBOX: &str = "Attached sandbox: ";
 const TIP_DECISIONS: &str = "The decision engine is unreachable";
 const TIP_CONFIG_PROBLEMS: &str = "Config failed to load";
 const TIP_TRUST_REVIEW: &str = "Project config is waiting for your trust";
+const TIP_QUESTIONS: &str = "unanswered questions";
 const TIP_AUTOMATIONS_ARMED: &str = "armed";
 const TIP_AUTOMATIONS_FAILED: &str = "failed since you last looked";
 const CLICK_MODE: &str = "Click to switch between plan and build";
@@ -146,6 +150,7 @@ const CLICK_DETAILS: &str = "Click for details";
 const CLICK_TRUST_REVIEW: &str = "Click to review it";
 const CLICK_AUTOMATIONS: &str = "Click to open automations";
 const CLICK_AUTOPILOT: &str = "Click to open autopilot";
+const CLICK_QUESTIONS: &str = "Click to answer the oldest";
 /// Cells in the context gauge. Each fills in eighths, so the gauge resolves
 /// the window to one part in eighty.
 const GAUGE_CELLS: u8 = 10;
@@ -307,6 +312,7 @@ pub enum StatusBarHitTarget {
     TrustReview,
     Automations,
     Autopilot,
+    Questions,
 }
 
 impl StatusBarHitTarget {
@@ -341,7 +347,8 @@ impl StatusBarHitTarget {
             | Self::Sandbox
             | Self::Decisions
             | Self::ConfigProblems
-            | Self::TrustReview => ChatScope::Any,
+            | Self::TrustReview
+            | Self::Questions => ChatScope::Any,
             Self::Mode
             | Self::Model
             | Self::Thinking
@@ -426,6 +433,8 @@ pub struct StatusBarContext<'a> {
     pub workflows: Option<WorkflowChip>,
     pub permission_mode: PermissionMode,
     pub decisions_offline: bool,
+    /// Deferred questions waiting off the dock.
+    pub waiting_questions: usize,
     /// Config files the session runs without because they failed to load.
     pub config_problems: &'a [ConfigProblem],
     pub pending_trust: PendingTrust,
@@ -1186,6 +1195,7 @@ impl StatusBar {
             ));
         }
         push_retry(&mut left, ctx, Instant::now());
+        push_questions(&mut left, ctx);
         push_decisions_status(&mut left, ctx);
         push_config_problems(&mut left, ctx);
         push_trust_review(&mut left, ctx);
@@ -1266,6 +1276,7 @@ impl StatusBar {
         if let Some(flash) = self.flash_span() {
             messages.push(flash);
         }
+        push_questions(&mut messages, ctx);
         push_decisions_status(&mut messages, ctx);
         push_config_problems(&mut messages, ctx);
         push_trust_review(&mut messages, ctx);
@@ -1963,6 +1974,11 @@ fn chip_tip(
             ),
         },
         StatusBarHitTarget::Autopilot => ctx.autopilot?.summary.clone(),
+        StatusBarHitTarget::Questions => format!(
+            "{} {TIP_QUESTIONS} ({})",
+            ctx.waiting_questions,
+            leader::UNANSWERED_QUESTION.label
+        ),
     };
     Some(match click_tip(target).filter(|_| clickable(ctx, target)) {
         Some(click) => format!("{body}\n{click}"),
@@ -1988,6 +2004,7 @@ fn click_tip(target: StatusBarHitTarget) -> Option<&'static str> {
         StatusBarHitTarget::TrustReview => CLICK_TRUST_REVIEW,
         StatusBarHitTarget::Automations => CLICK_AUTOMATIONS,
         StatusBarHitTarget::Autopilot => CLICK_AUTOPILOT,
+        StatusBarHitTarget::Questions => CLICK_QUESTIONS,
         StatusBarHitTarget::BackToMain
         | StatusBarHitTarget::ChatName
         | StatusBarHitTarget::Cwd
@@ -2034,6 +2051,20 @@ fn push_decisions_status(strip: &mut Strip, ctx: &StatusBarContext<'_>) {
             StatusBarHitTarget::Decisions,
             [Span::styled(
                 DECISIONS_OFFLINE_LABEL,
+                theme::current().tool_warning,
+            )],
+        );
+    }
+}
+
+/// A control rather than a label: the click docks the oldest question.
+fn push_questions(strip: &mut Strip, ctx: &StatusBarContext<'_>) {
+    if ctx.waiting_questions > 0 {
+        strip.chip(
+            ctx,
+            StatusBarHitTarget::Questions,
+            [Span::styled(
+                format!("[{QUESTIONS_MARK} {}]", ctx.waiting_questions),
                 theme::current().tool_warning,
             )],
         );
@@ -2589,6 +2620,7 @@ mod tests {
         show_global: bool,
         permission_mode: PermissionMode,
         decisions_offline: bool,
+        waiting_questions: usize,
         config_problems: &'a [ConfigProblem],
         pending_trust: PendingTrust,
         fast: bool,
@@ -2622,6 +2654,7 @@ mod tests {
                 show_global: false,
                 permission_mode: PermissionMode::Ask,
                 decisions_offline: false,
+                waiting_questions: 0,
                 config_problems: &[],
                 pending_trust: PendingTrust::default(),
                 fast: false,
@@ -2675,6 +2708,7 @@ mod tests {
                 workflows: self.workflows,
                 permission_mode: self.permission_mode,
                 decisions_offline: self.decisions_offline,
+                waiting_questions: self.waiting_questions,
                 config_problems: self.config_problems,
                 pending_trust: self.pending_trust,
                 restoring: false,
@@ -2838,6 +2872,7 @@ mod tests {
             workflows: ladder_workflows(),
             permission_mode: PermissionMode::Yolo,
             decisions_offline: false,
+            waiting_questions: 0,
             config_problems: &[],
             pending_trust: PendingTrust::default(),
             restoring: false,

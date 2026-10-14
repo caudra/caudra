@@ -3,7 +3,10 @@ use serde_json::Value;
 
 use crate::prompt::{ResolvedSlots, execution_guidance, shell_execution_guidance};
 
-use super::{DeferredTool, SHELL_TOOL_NAME, TASK_TOOL_NAME, native::task};
+use super::{
+    DeferredTool, SHELL_TOOL_NAME, TASK_TOOL_NAME,
+    native::{question, task},
+};
 
 const SHELL_EXECUTION_HEADING: &str = "\n\nExecution:\n";
 
@@ -14,6 +17,7 @@ pub fn configure_declared(
     shell_supported: bool,
 ) {
     task::configure_execution(tools, config, tasks_supported, shell_supported);
+    question::configure_deferral(tools, config.deferred_questions && tasks_supported);
     let Some(mode) = effective_shell_execution(config, shell_supported) else {
         return;
     };

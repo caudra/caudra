@@ -36,6 +36,7 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `Ctrl+S` / `Ctrl+X f` | File picker |
 | `Ctrl+O` / `Ctrl+X o` | Open the plan in the workbench |
 | `Ctrl+X t` | Toggle plan / todo panel |
+| `Ctrl+X u` | Open the oldest unanswered question |
 | `Ctrl+X a` | Open tasks |
 | `Ctrl+X k` | Open the workflow inspector (needs `experimental.workflows`) |
 | `Ctrl+X l` | Browse sessions |
@@ -128,6 +129,7 @@ These keys work the same in every text field: the composer, a picker's filter, f
 | `↑` / `↓` | Navigate options |
 | `F2` | Ask /btw about a pending main-agent question without answering it |
 | `F3` | Decline an MCP server's request |
+| `F4` | Answer the question later, or show the next waiting question |
 | `Enter` | Select option |
 | `Esc` | Close |
 

@@ -100,7 +100,7 @@ impl PickerItem for TaskItem {
     fn detail(&self) -> Option<&str> {
         self.runtime
             .as_ref()
-            .map(|task| task.state.as_str())
+            .map(task_card::shown_state)
             .or(self.suffix)
     }
 
@@ -294,7 +294,7 @@ impl TaskPicker {
                     format!(
                         "{} · {} · {}\n{}\n{} · {}s elapsed",
                         task.task_id,
-                        task.state,
+                        task_card::shown_state(task),
                         task.mode,
                         task.label,
                         if task.background {
@@ -462,7 +462,11 @@ fn build_items(tasks: Vec<TaskInfo>) -> Vec<TaskItem> {
                 .as_ref()
                 .map_or(suffix, |workflow| Some(workflow.state)),
             section: None,
-            running: status == Some(TaskStatus::Working),
+            running: status == Some(TaskStatus::Working)
+                && task
+                    .runtime
+                    .as_ref()
+                    .is_none_or(|runtime| runtime.kind != JobKind::Question),
             runtime: task.runtime,
             workflow: task.workflow.map(|workflow| workflow.run_id),
         });

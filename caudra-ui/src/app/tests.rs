@@ -1382,6 +1382,73 @@ mod background_runtime {
         )
     }
 
+    /// An app on a live agent runtime whose provider is the test, answering
+    /// each request it receives.
+    fn live_app(
+        show_reminders: bool,
+    ) -> (
+        Box<App>,
+        AgentHandles,
+        SubagentHistoryStore,
+        flume::Receiver<Request>,
+    ) {
+        crate::components::register_native_tools();
+        let mut app = Box::new(test_app());
+        app.ui_config.show_reminders = show_reminders;
+        app.chats[0] = Chat::new(
+            app.chats[0].name.clone(),
+            Path::new(&app.state.session.cwd),
+            app.ui_config.clone(),
+            EventHandle::disconnected_for_test(),
+        );
+        app.state.mode = super::Mode::Build;
+        app.permissions.set_session_mode(Some(PermissionMode::Yolo));
+        app.storage_writer
+            .save_sync(Arc::clone(&app.state.session))
+            .unwrap();
+        let (requests, received) = flume::unbounded();
+        let slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
+            model: app.state.model.clone(),
+            provider: Arc::new(ControlledProvider(requests)),
+        }));
+        let history = SubagentHistoryStore::default();
+        let handles = AgentHandles::spawn(
+            &slot,
+            Vec::new(),
+            Vec::new(),
+            None,
+            AgentConfig {
+                generate_titles: false,
+                summarize_memory: false,
+                compaction_requirements: false,
+                features: FeatureFlags::NONE.with(Feature::Workflows),
+                ..Default::default()
+            },
+            app.ui_config.tool_output_lines,
+            &app.permissions,
+            Some(SessionRef::from(app.state.session.id)),
+            None,
+            Timeouts::default(),
+            EventHandle::disconnected_for_test(),
+            None,
+            McpConfigErrors::new(Default::default()),
+            Arc::new(ModelPolicy::default()),
+            app.state.goal.clone(),
+            history.clone(),
+            None,
+            Arc::new(PromptProfileCatalog::default()),
+            Some(app.storage.clone()),
+            Arc::clone(&app.change_recorder),
+            None,
+            None,
+            None,
+            None,
+            true,
+        );
+        handles.apply_to_app(&mut app);
+        (app, handles, history, received)
+    }
+
     struct Fixture {
         app: Box<App>,
         handles: AgentHandles,
@@ -1400,60 +1467,7 @@ mod background_runtime {
         }
 
         async fn after_final_with_options(show_reminders: bool, rearm: bool) -> Self {
-            crate::components::register_native_tools();
-            let mut app = Box::new(test_app());
-            app.ui_config.show_reminders = show_reminders;
-            app.chats[0] = Chat::new(
-                app.chats[0].name.clone(),
-                Path::new(&app.state.session.cwd),
-                app.ui_config.clone(),
-                EventHandle::disconnected_for_test(),
-            );
-            app.state.mode = super::Mode::Build;
-            app.permissions.set_session_mode(Some(PermissionMode::Yolo));
-            app.storage_writer
-                .save_sync(Arc::clone(&app.state.session))
-                .unwrap();
-            let (requests, received) = flume::unbounded();
-            let slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
-                model: app.state.model.clone(),
-                provider: Arc::new(ControlledProvider(requests)),
-            }));
-            let history = SubagentHistoryStore::default();
-            let handles = AgentHandles::spawn(
-                &slot,
-                Vec::new(),
-                Vec::new(),
-                None,
-                AgentConfig {
-                    generate_titles: false,
-                    summarize_memory: false,
-                    compaction_requirements: false,
-                    features: FeatureFlags::NONE.with(Feature::Workflows),
-                    ..Default::default()
-                },
-                app.ui_config.tool_output_lines,
-                &app.permissions,
-                Some(SessionRef::from(app.state.session.id)),
-                None,
-                Timeouts::default(),
-                EventHandle::disconnected_for_test(),
-                None,
-                McpConfigErrors::new(Default::default()),
-                Arc::new(ModelPolicy::default()),
-                app.state.goal.clone(),
-                history.clone(),
-                None,
-                Arc::new(PromptProfileCatalog::default()),
-                Some(app.storage.clone()),
-                Arc::clone(&app.change_recorder),
-                None,
-                None,
-                None,
-                None,
-                true,
-            );
-            handles.apply_to_app(&mut app);
+            let (mut app, handles, history, received) = live_app(show_reminders);
             if rearm {
                 let background = handles.background.as_ref().unwrap();
                 background.stop().await.unwrap();
@@ -1649,6 +1663,112 @@ mod background_runtime {
             panic!("background TUI test did not reach its event barrier");
         })
         .await;
+    }
+
+    const QUESTION_CALL: &str = "deferred-question";
+    const QUESTION_TEXT: &str = "Which backend should the cache use?";
+    const QUESTION_HEADER: &str = "Backend";
+    const QUESTION_PICK: &str = "SQLite";
+    const RECEIPT_REACHES_MODEL: &str = "the agent must get a receipt rather than wait";
+    const ANSWER_REACHES_MODEL: &str = "the user's answer must reach the agent it woke";
+
+    /// Feeds the main agent's events to the app until its queue runs dry.
+    async fn drain_main(app: &mut App, handles: &AgentHandles) {
+        loop {
+            let envelope = handles.agent_rx.recv_async().await.unwrap();
+            if envelope.run_id == app.run_id && matches!(envelope.event, AgentEvent::QueueDrained) {
+                break;
+            }
+            app.update(Msg::Agent(Box::new(envelope)));
+        }
+    }
+
+    #[test]
+    fn a_deferred_question_docks_and_its_answer_wakes_the_idle_agent() {
+        smol::block_on(bounded(async {
+            let (mut app, handles, _history, requests) = live_app(true);
+            let background = handles.background.as_ref().unwrap().clone();
+            let SubmitOutcome::Started(actions) = app.submit_prompt(QueuedMessage {
+                text: PARENT.into(),
+                images: Vec::new(),
+                mentions: Vec::new(),
+                commits: Vec::new(),
+                paste_ranges: Vec::new(),
+            }) else {
+                panic!("parent prompt was not admitted");
+            };
+            enqueue(&app, &handles, actions);
+            requests
+                .recv_async()
+                .await
+                .unwrap()
+                .reply
+                .send(response(
+                    ContentBlock::ToolUse {
+                        id: QUESTION_CALL.into(),
+                        name: "question".into(),
+                        input: json!({
+                            "background": true,
+                            "questions": [{
+                                "question": QUESTION_TEXT,
+                                "header": QUESTION_HEADER,
+                                "options": [{"label": QUESTION_PICK, "description": ""}],
+                            }],
+                        }),
+                        thought_signature: None,
+                    },
+                    StopReason::ToolUse,
+                ))
+                .unwrap();
+            let request = requests.recv_async().await.unwrap();
+            let receipt = request
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .find_map(|block| match block {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                        ..
+                    } if tool_use_id == QUESTION_CALL => Some((*is_error, content.clone())),
+                    _ => None,
+                });
+            assert!(
+                matches!(&receipt, Some((false, _))),
+                "{RECEIPT_REACHES_MODEL}: {receipt:?}"
+            );
+            request.reply.send(final_response()).unwrap();
+            drain_main(&mut app, &handles).await;
+            while app.question_form.deferred_task().is_none() {
+                let envelope = handles.agent_rx.recv_async().await.unwrap();
+                app.update(Msg::Agent(Box::new(envelope)));
+            }
+            assert_eq!(app.status, Status::Idle);
+            assert!(app.needs_input());
+
+            app.update(Msg::Key(key(KeyCode::Enter)));
+
+            assert!(!app.question_form.is_open());
+            background.notified().await;
+            let messages = background.claim_messages().unwrap();
+            let actions = app.start_mailbox_run(messages, StartedBy::Background);
+            enqueue(&app, &handles, actions);
+            let request = requests.recv_async().await.unwrap();
+            assert!(
+                request.messages.iter().any(|message| {
+                    message.task_event.is_some()
+                        && message
+                            .first_text_content()
+                            .is_some_and(|text| text.contains(QUESTION_PICK))
+                }),
+                "{ANSWER_REACHES_MODEL}"
+            );
+            request.reply.send(final_response()).unwrap();
+            drain_main(&mut app, &handles).await;
+            background.shutdown().await.unwrap();
+            handles.cancel();
+        }));
     }
 
     #[test_case(false, false, false; "admission_reply_first")]
@@ -7020,6 +7140,7 @@ fn server_question(url: Option<&str>) -> AgentEvent {
     AgentEvent::Question(Box::new(QuestionEvent {
         questions: Vec::new(),
         source: Some(mcp_source(url)),
+        ..QuestionEvent::default()
     }))
 }
 
@@ -18157,7 +18278,7 @@ fn question_btw_is_discarded_when_an_agent_replaces_the_form(hidden: bool) {
                 multiple: false,
                 ..Default::default()
             }],
-            source: None,
+            ..QuestionEvent::default()
         }))))
         .is_empty()
     );
@@ -26857,7 +26978,7 @@ mod autopilot {
         app.update(Msg::Key(pressed));
         decide(&mut app, DecisionKind::Question, ActionName::Answer);
 
-        assert!(app.state.autopilot.question_claimed(), "{CLAIMED}");
+        assert!(app.state.autopilot.question_claimed(""), "{CLAIMED}");
         assert_eq!(app.question_form.autopilot_note(), None, "{CLAIMED}");
         assert!(app.question_form.is_open(), "{CLAIMED}");
         assert_eq!(app.stream_modal.is_open(), asks_btw, "{KEEPS_ITS_EFFECT}");
@@ -28501,5 +28622,284 @@ mod theme_colours {
             .filter(|index| !covered.contains(index))
             .collect();
         assert!(missing.is_empty(), "{UNCOVERED}: overlays {missing:?}");
+    }
+}
+
+/// Questions the main agent asked without waiting, sharing the one docked
+/// form with the questions an agent waits on.
+mod deferred_questions {
+    use caudra_agent::AgentEvent;
+    use caudra_agent::types::{
+        AskedQuestion, QUESTION_DEFERRED_REPLY, QuestionDelivery, QuestionEvent, QuestionOption,
+    };
+    use crossterm::event::KeyCode;
+    use test_case::test_case;
+
+    use super::{
+        App, Msg, Status, agent_msg, click_status, end_turn, press_chord, rendered, test_app,
+    };
+    use crate::app::questions::{NO_WAITING_QUESTION_MSG, QUESTION_CLOSED_MSG};
+    use crate::components::keybindings::{key as kb, leader};
+    use crate::components::status_bar::StatusBarHitTarget;
+    use crate::components::{Action, key};
+
+    const FIRST: &str = "question-first";
+    const SECOND: &str = "question-second";
+    const THIRD: &str = "question-third";
+    const BLOCKING_CALL: &str = "toolu_blocking";
+    const HEADER: &str = "Pick";
+    const OPTION: &str = "First";
+    const FIRST_OF_TWO: &str = "Deferred question 1 of 2";
+    const TWO_WAITING: &str = "[? 2]";
+    const RUN_LEFT_ALONE: &str = "putting a deferred question aside must not stop the run";
+    const HELD: &str = "a blocking ask must not take the place of a form the user started";
+    const GIVEN_BACK: &str = "a deferred form must dock again once the blocking ask is answered";
+    const DOCKS_AT_ONCE: &str = "a deferred question docks at once when the dock is free";
+
+    fn asked(call: &str, delivery: QuestionDelivery) -> QuestionEvent {
+        QuestionEvent {
+            questions: vec![AskedQuestion {
+                question: HEADER.into(),
+                header: HEADER.into(),
+                options: vec![QuestionOption {
+                    label: OPTION.into(),
+                    description: String::new(),
+                }],
+                ..Default::default()
+            }],
+            call_id: Some(call.into()),
+            delivery,
+            ..QuestionEvent::default()
+        }
+    }
+
+    fn deferred(task_id: &str, docked: bool) -> QuestionDelivery {
+        QuestionDelivery::Deferred {
+            task_id: task_id.into(),
+            docked,
+        }
+    }
+
+    fn defer(app: &mut App, task_id: &str) {
+        app.receive_deferred_question(asked(task_id, deferred(task_id, true)));
+    }
+
+    /// The main agent's run, with its answers on the returned channel.
+    fn streaming() -> (App, flume::Receiver<String>) {
+        let mut app = test_app();
+        app.status = Status::Streaming;
+        app.run_id = 1;
+        let (answer_tx, answers) = flume::unbounded();
+        app.answer_tx = Some(answer_tx);
+        (app, answers)
+    }
+
+    fn docked(app: &App) -> Option<&str> {
+        app.question_form
+            .deferred_task()
+            .filter(|_| app.question_form.is_open())
+    }
+
+    fn ask_blocking(app: &mut App, delivery: QuestionDelivery) {
+        app.update(agent_msg(AgentEvent::Question(Box::new(asked(
+            BLOCKING_CALL,
+            delivery,
+        )))));
+    }
+
+    #[test]
+    fn a_deferred_question_docks_at_once_and_the_next_queues_behind_it() {
+        let (mut app, _answers) = streaming();
+
+        defer(&mut app, FIRST);
+        defer(&mut app, SECOND);
+
+        assert_eq!(docked(&app), Some(FIRST), "{DOCKS_AT_ONCE}");
+        assert_eq!(app.open_question_count(), 2);
+        assert_eq!(
+            app.waiting_question_count(),
+            0,
+            "the docked form counts them"
+        );
+        assert!(rendered(&mut app).contains(FIRST_OF_TWO));
+    }
+
+    #[test]
+    fn escape_puts_every_deferred_question_aside_without_stopping_the_run() {
+        let (mut app, answers) = streaming();
+        defer(&mut app, FIRST);
+        defer(&mut app, SECOND);
+
+        let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+
+        assert!(actions.is_empty(), "{RUN_LEFT_ALONE}");
+        assert_eq!(app.status, Status::Streaming, "{RUN_LEFT_ALONE}");
+        assert!(answers.is_empty(), "nothing waits on a deferred form");
+        assert!(!app.question_form.is_open());
+        assert_eq!(app.waiting_question_count(), 2);
+        assert!(rendered(&mut app).contains(TWO_WAITING));
+    }
+
+    #[test]
+    fn a_question_arriving_after_the_rest_were_put_aside_still_docks() {
+        let (mut app, _answers) = streaming();
+        defer(&mut app, FIRST);
+        app.update(Msg::Key(key(KeyCode::Esc)));
+
+        defer(&mut app, SECOND);
+
+        assert_eq!(docked(&app), Some(SECOND), "{DOCKS_AT_ONCE}");
+    }
+
+    #[test_case(true ; "by_the_leader_chord")]
+    #[test_case(false ; "by_the_status_chip")]
+    fn a_put_aside_question_reopens_oldest_first(chord: bool) {
+        let (mut app, _answers) = streaming();
+        defer(&mut app, FIRST);
+        defer(&mut app, SECOND);
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        let _ = rendered(&mut app);
+
+        match chord {
+            true => press_chord(&mut app, leader::UNANSWERED_QUESTION),
+            false => click_status(&mut app, StatusBarHitTarget::Questions),
+        };
+
+        assert_eq!(docked(&app), Some(FIRST));
+        assert_eq!(app.waiting_question_count(), 0);
+    }
+
+    #[test]
+    fn reopening_with_nothing_waiting_says_so() {
+        let (mut app, _answers) = streaming();
+
+        press_chord(&mut app, leader::UNANSWERED_QUESTION);
+
+        assert_eq!(app.status_bar.flash_text(), Some(NO_WAITING_QUESTION_MSG));
+    }
+
+    #[test]
+    fn f4_rotates_through_the_deferred_questions() {
+        let (mut app, _answers) = streaming();
+        defer(&mut app, FIRST);
+        defer(&mut app, SECOND);
+
+        app.update(Msg::Key(kb::QUESTION_LATER.to_key_event()));
+        assert_eq!(docked(&app), Some(SECOND));
+
+        app.update(Msg::Key(kb::QUESTION_LATER.to_key_event()));
+        assert_eq!(docked(&app), Some(FIRST));
+    }
+
+    #[test]
+    fn a_blocking_ask_borrows_the_dock_from_an_untouched_deferred_form() {
+        let (mut app, answers) = streaming();
+        defer(&mut app, FIRST);
+
+        ask_blocking(&mut app, QuestionDelivery::Blocking);
+        assert_eq!(app.question_form.call_id(), Some(BLOCKING_CALL));
+        assert!(app.awaiting_input());
+
+        app.update(Msg::Key(key(KeyCode::Enter)));
+
+        assert!(answers.try_recv().is_ok());
+        assert_eq!(docked(&app), Some(FIRST), "{GIVEN_BACK}");
+    }
+
+    #[test]
+    fn a_blocking_ask_waits_behind_a_deferred_form_the_user_started() {
+        let (mut app, _answers) = streaming();
+        defer(&mut app, FIRST);
+        app.update(Msg::Key(key(KeyCode::Down)));
+
+        ask_blocking(&mut app, QuestionDelivery::Blocking);
+
+        assert_eq!(docked(&app), Some(FIRST), "{HELD}");
+        assert!(app.awaiting_input(), "the held ask still waits on the user");
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert_eq!(app.question_form.call_id(), Some(BLOCKING_CALL));
+        assert_eq!(app.waiting_question_count(), 1);
+    }
+
+    #[test]
+    fn f4_on_an_ask_the_agent_waits_on_answers_later_and_keeps_the_form() {
+        let (mut app, answers) = streaming();
+        ask_blocking(&mut app, QuestionDelivery::Deferrable);
+
+        app.update(Msg::Key(kb::QUESTION_LATER.to_key_event()));
+
+        assert_eq!(answers.try_recv().as_deref(), Ok(QUESTION_DEFERRED_REPLY));
+        assert!(!app.question_form.is_open());
+        app.receive_deferred_question(asked(BLOCKING_CALL, deferred(FIRST, false)));
+        assert!(
+            !app.question_form.is_open(),
+            "the user put it off, so it waits off the dock"
+        );
+        assert_eq!(app.waiting_question_count(), 1);
+        assert!(app.reopen_question(Some(FIRST)));
+        assert_eq!(app.question_form.call_id(), Some(BLOCKING_CALL));
+    }
+
+    #[test]
+    fn ctrl_c_on_a_deferred_form_cancels_the_run() {
+        let (mut app, _answers) = streaming();
+        defer(&mut app, FIRST);
+
+        let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::CancelAgent { run_id: 1 }]
+        ));
+    }
+
+    #[test]
+    fn going_idle_docks_the_oldest_put_aside_question() {
+        let (mut app, _answers) = streaming();
+        defer(&mut app, FIRST);
+        defer(&mut app, SECOND);
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert!(!app.needs_input(), "the agent is still working without it");
+
+        end_turn(&mut app);
+
+        assert_eq!(app.status, Status::Idle);
+        assert_eq!(docked(&app), Some(FIRST));
+        assert!(app.needs_input(), "the idle agent may be waiting on it");
+        assert!(
+            !app.awaiting_input(),
+            "no agent is parked on a deferred form"
+        );
+    }
+
+    #[test]
+    fn a_question_closed_without_the_user_leaves_the_rest() {
+        let (mut app, _answers) = streaming();
+        defer(&mut app, FIRST);
+        defer(&mut app, SECOND);
+        defer(&mut app, THIRD);
+
+        assert!(app.close_deferred_question(SECOND));
+        assert!(app.close_deferred_question(FIRST));
+
+        assert_eq!(docked(&app), Some(THIRD));
+        assert_eq!(app.open_question_count(), 1);
+        assert!(!app.close_deferred_question(FIRST), "it is already closed");
+    }
+
+    #[test]
+    fn an_answer_whose_question_closed_says_so_and_docks_the_next() {
+        let (mut app, answers) = streaming();
+        defer(&mut app, FIRST);
+        defer(&mut app, SECOND);
+
+        app.update(Msg::Key(key(KeyCode::Enter)));
+
+        assert_eq!(app.status_bar.flash_text(), Some(QUESTION_CLOSED_MSG));
+        assert!(
+            answers.is_empty(),
+            "a deferred answer never goes to the run"
+        );
+        assert_eq!(docked(&app), Some(SECOND));
     }
 }

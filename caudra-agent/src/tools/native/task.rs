@@ -391,6 +391,11 @@ fn render(outcome: TaskOutcome) -> ToolExecResult {
 }
 
 pub(crate) fn receipt(status: TaskCard) -> ToolExecResult {
+    receipt_with(status, RECEIPT_GUIDANCE)
+}
+
+/// A receipt whose closing words fit the kind of job it admits.
+pub(crate) fn receipt_with(status: TaskCard, guidance: &str) -> ToolExecResult {
     let task_id = status.task_id.clone();
     let ran_as = RanAs {
         mode: parse_mode(&status.mode).ok(),
@@ -403,7 +408,7 @@ pub(crate) fn receipt(status: TaskCard) -> ToolExecResult {
     );
     let suffix = result.model_suffix.get_or_insert_default();
     suffix.push('\n');
-    suffix.push_str(RECEIPT_GUIDANCE);
+    suffix.push_str(guidance);
     result
 }
 

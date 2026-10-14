@@ -1465,6 +1465,7 @@ pub struct AgentFileConfig {
     pub work_nudge_compactions: Option<u32>,
     pub task_execution: Option<ExecutionMode>,
     pub task_model_choice: Option<bool>,
+    pub deferred_questions: Option<bool>,
     pub shell_execution: Option<ExecutionMode>,
     pub shell_async_threshold_secs: Option<u64>,
     pub generate_titles: Option<bool>,
@@ -1508,6 +1509,7 @@ impl AgentFileConfig {
             work_nudge_compactions,
             task_execution,
             task_model_choice,
+            deferred_questions,
             shell_execution,
             shell_async_threshold_secs,
             generate_titles,
@@ -2729,6 +2731,12 @@ pub struct AgentConfig {
     )]
     pub task_model_choice: bool,
 
+    #[config(
+        default = true,
+        desc = "Let the main agent ask a `question` without waiting for the answer, so it keeps working while the form waits for you. The answer reaches it later, and you can also put a waiting question off with F4. When off, every question waits for its answer"
+    )]
+    pub deferred_questions: bool,
+
     #[config(default = ExecutionMode::Auto, ty = "string", default_doc = "auto", desc = "Shell delivery: sync waits for termination, auto routes by requested timeout, async returns an admission receipt")]
     pub shell_execution: ExecutionMode,
 
@@ -2860,6 +2868,7 @@ impl AgentConfig {
             compaction_requirements: file.compaction_requirements.unwrap_or(true),
             task_execution: file.task_execution.unwrap_or_default(),
             task_model_choice: file.task_model_choice.unwrap_or(true),
+            deferred_questions: file.deferred_questions.unwrap_or(true),
             shell_execution: file.shell_execution.unwrap_or_default(),
             shell_async_threshold_secs: file
                 .shell_async_threshold_secs
@@ -4489,6 +4498,7 @@ mod tests {
     const UNSIGNED_REMINDER_ERROR: &str = "expected u32";
     const TODO_REMINDER_FIELD: &str = "todo_reminder";
     const TASK_MODEL_CHOICE_FIELD: &str = "task_model_choice";
+    const DEFERRED_QUESTIONS_FIELD: &str = "deferred_questions";
     const WORK_NUDGE_FIELD: &str = "work_nudge_compactions";
     const BOOLEAN_EXPECTED_ERROR: &str = "expected a boolean";
     const SHELL_THRESHOLD_FIELD: &str = "shell_async_threshold_secs";
@@ -5973,6 +5983,18 @@ mod tests {
         raw.merge(layer(overlay));
         assert_eq!(
             raw.into_config(false).unwrap().agent.task_model_choice,
+            expected
+        );
+    }
+
+    #[test_case("", true ; "enabled_by_default")]
+    #[test_case("deferred_questions = false", false ; "disabled")]
+    fn deferred_questions_config(source: &str, expected: bool) {
+        let raw: RawConfig = toml::from_str(&format!("[agent]\n{source}")).unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert_eq!(config.agent.deferred_questions, expected);
+        assert_eq!(
+            serde_json::to_value(&config.agent).unwrap()[DEFERRED_QUESTIONS_FIELD],
             expected
         );
     }

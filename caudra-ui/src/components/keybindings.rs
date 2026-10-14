@@ -189,6 +189,12 @@ pub mod key {
         modifiers: KeyModifiers::NONE,
         label: "F3",
     };
+    /// A function key, since the answer box may be open.
+    pub const QUESTION_LATER: Bind = Bind {
+        code: KeyCode::F(4),
+        modifiers: KeyModifiers::NONE,
+        label: "F4",
+    };
     pub const COMMAND_PALETTE: Bind = ctrl_bind!('p');
     pub const SCROLL_HALF_UP: Bind = ctrl_bind!('u');
     /// Text fields take plain, Ctrl, Super and Shift arrows, and Alt cannot be
@@ -350,6 +356,7 @@ pub mod leader {
     pub const REVIEW: Bind = leader_bind!('r');
     pub const STASH_PUSH: Bind = leader_bind!('s');
     pub const PLAN_TOGGLE: Bind = leader_bind!('t');
+    pub const UNANSWERED_QUESTION: Bind = leader_bind!('u');
     pub const VIEW_TOGGLE: Bind = leader_bind!('v');
     pub const WORKBENCH: Bind = leader_bind!('w');
     pub const WORKFLOWS: Bind = leader_bind!('k');
@@ -376,6 +383,7 @@ pub mod leader {
         REVIEW,
         STASH_PUSH,
         PLAN_TOGGLE,
+        UNANSWERED_QUESTION,
         VIEW_TOGGLE,
         WORKBENCH,
         INTERRUPT_PROMPT,
@@ -812,6 +820,11 @@ pub const KEYBINDS: &[Keybind] = &[
         context: KeybindContext::General,
     },
     Keybind {
+        label: KeyLabel::Single(leader::UNANSWERED_QUESTION.label),
+        description: "Open the oldest unanswered question",
+        context: KeybindContext::General,
+    },
+    Keybind {
         label: KeyLabel::Single(leader::TASKS.label),
         description: "Open tasks",
         context: KeybindContext::General,
@@ -1098,6 +1111,11 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::QUESTION_DECLINE.label),
         description: "Decline an MCP server's request",
+        context: KeybindContext::FormInput,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::QUESTION_LATER.label),
+        description: "Answer the question later, or show the next waiting question",
         context: KeybindContext::FormInput,
     },
     Keybind {

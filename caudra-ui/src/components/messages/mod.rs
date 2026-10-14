@@ -2215,8 +2215,7 @@ impl MessagesPanel {
         if let Some(message) = segment.msg_index.and_then(|index| self.messages.get(index))
             && let DisplayRole::TaskDelivery(origin) = &message.role
         {
-            return (!task_card::is_shell_delivery(origin, &message.text))
-                .then(|| origin.task_id.clone());
+            return task_card::opens_chat(origin, &message.text).then(|| origin.task_id.clone());
         }
         let agent_target =
             |task: &TaskCard| (task.kind == JobKind::Agent).then(|| task.task_id.clone());

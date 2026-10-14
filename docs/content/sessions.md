@@ -88,6 +88,16 @@ Settled tasks and background shell jobs are archived with the session once deliv
 
 Shell results retain Workcell's output bounds and filtering. A truncated result can include a `tool_output` reference for the retained output, which is not an unlimited process log. Saved references remain usable after history reloads and forks.
 
+### Deferred questions
+
+In the TUI, the main agent can ask a [`question`](/docs/tools/#question) with `background: true` when it does not need the answer for its next steps. The call returns a question ID at once and the agent keeps working. The form docks right away. Your answer reaches the agent the same way a background task result does: between tool rounds, or by starting a new run once the agent has ended its turn. When the agent cannot continue without an answer, it ends its turn and says which answer it is waiting for. The oldest open question then docks again, and the pane shows the session as blocked on a question.
+
+A deferred form reads `Deferred question 1 of N`. On it, `Esc` hides every deferred form and keeps your drafts. The footer then shows `[? N]`, the number of unanswered questions. Click the chip or press `Ctrl+X u`, for unanswered, to open the oldest one again. `F4` shows the next open question, and `Ctrl+C` stops the run, which withdraws every deferred question.
+
+A question the agent waits on shows `F4 later` while deferral is available. Press it to answer later and let the agent continue. The agent then gets a question ID instead of an answer, and the form joins the deferred questions with your draft kept. Questions the agent waits on, permission prompts, and sign-in requests go ahead of deferred questions, but never replace a deferred form you have started to answer.
+
+At most 3 deferred questions can be open at a time. `/tasks` lists open questions as `waiting for your answer`, and Enter opens that form. The model can withdraw one with `task_control` `cancel`. Stopping the run withdraws them all, and a question that was open when the session closed is delivered as interrupted. Set `agent.deferred_questions = false` to make every question wait for its answer. Only the main agent can defer a question, and one-shot `--print`, the SDK, and ACP keep their existing question handling.
+
 ### Shell history
 
 Foreground `shell` calls are saved with the session, including calls from subagents and workflow agents. Caudra records each command before it starts and again when it settles. If that first record cannot be written, the call fails without running the command. Each session keeps its 200 most recent finished commands, with up to 64 KiB of output each. Longer output keeps the end of each stream. Background shell jobs keep their records with the session's background tasks.

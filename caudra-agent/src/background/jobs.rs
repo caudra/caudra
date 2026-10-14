@@ -9,8 +9,8 @@ use caudra_providers::Message;
 use caudra_storage::{
     StateDir,
     background::{
-        BackgroundCursor, JobOwner, JobPayload, MAX_INVOCATIONS, ShellJobMetadata, TaskEvent,
-        TaskRecord,
+        BackgroundCursor, JobKind, JobOwner, JobPayload, MAX_INVOCATIONS, QuestionJobMetadata,
+        ShellJobMetadata, TaskEvent, TaskRecord,
     },
     id::CaudraId,
     now_epoch,
@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 
 use super::{
     Admission, BackgroundTasks, CLOSED, DriverGuard, MAX_ACTIVE, MAX_ID_BYTES, MAX_REQUEST_BYTES,
-    MAX_RESULT_BYTES, STALE_INVOCATION, TRANSITION, TaskHistoryPage, bounded, deliverable,
+    MAX_RESULT_BYTES, STALE_INVOCATION, State, TRANSITION, TaskHistoryPage, bounded, deliverable,
     shells::ShellExecutions,
 };
 use crate::{
@@ -32,11 +32,32 @@ use crate::{
 };
 
 const MAX_OWNER_ACTIVE: usize = 16;
-const CAPACITY: &str = "session or owner shell admission capacity exhausted";
-const RETRY_MISMATCH: &str = "shell retry differs from the admitted request";
+/// Deferred questions the main agent may have open at once.
+pub const MAX_DEFERRED_QUESTIONS: usize = 3;
+const CAPACITY: &str = "session or owner job admission capacity exhausted";
+const QUESTION_CAPACITY: &str = "deferred question capacity exhausted";
+const QUESTION_CLOSED: &str = "the question is no longer open";
+const QUESTION_IDENTITY: &str = "question";
+const QUESTION_MODE: &str = "question";
+const QUESTION_OUTPUT_LABEL: &str = "output-question";
+const QUESTION_OUTCOME_FIELD: &str = "answers";
+const SHELL_OUTCOME_FIELD: &str = "shell";
+const RETRY_MISMATCH: &str = "job retry differs from the admitted request";
 const FOREIGN_JOB: &str = "job does not belong to this invocation";
-const SHELL_PANIC: &str =
-    "owned shell execution panicked; execution effects may require reconciliation";
+const JOB_PANIC: &str =
+    "owned job execution panicked; execution effects may require reconciliation";
+
+/// What one admission writes on its record, whatever kind of job it is.
+struct JobSpec {
+    payload: JobPayload,
+    call_id: String,
+    root_call_id: String,
+    /// Names the generated task id.
+    identity: String,
+    /// What lists and reminders show for the job.
+    label: String,
+    mode: String,
+}
 
 #[derive(Clone)]
 pub struct JobScope {
@@ -340,26 +361,97 @@ impl JobScope {
         F: FnOnce(CancelToken, TaskProvenance) -> Fut + Send + 'static,
         Fut: Future<Output = ToolDoneEvent> + Send + 'static,
     {
-        if [&metadata.call_id, &metadata.root_call_id]
-            .iter()
-            .any(|id| id.is_empty() || id.len() > MAX_ID_BYTES)
-            || matches!(&self.owner, JobOwner::Child { invocation_id } if invocation_id.is_empty() || invocation_id.len() > MAX_ID_BYTES)
-            || metadata.command.is_empty()
-            || metadata.timeout_ms == 0
-        {
+        if metadata.command.is_empty() || metadata.timeout_ms == 0 {
             return Err(
                 "shell admission requires bounded identities, a command and a positive timeout"
                     .into(),
             );
         }
-        let mut request = json!({"call_id": metadata.call_id, "label": metadata.command});
-        if serde_json::to_vec(&metadata)
+        let label = shell_output_label(&metadata.command);
+        let spec = JobSpec {
+            call_id: metadata.call_id.clone(),
+            root_call_id: metadata.root_call_id.clone(),
+            label: metadata.command.clone(),
+            identity: if label == "shell" {
+                label
+            } else {
+                format!("shell-{label}")
+            },
+            mode: metadata.mode.clone(),
+            payload: JobPayload::Shell(metadata),
+        };
+        self.admit_job(spec, history, cancel, deadline, execute)
+            .await
+    }
+
+    /// Admits a `question` the main agent asked without waiting. `execute`
+    /// gets the receiver the user's answer arrives on, open for exactly as
+    /// long as the question is.
+    pub async fn admit_question<F, Fut>(
+        &self,
+        metadata: QuestionJobMetadata,
+        history: &SubagentHistoryStore,
+        cancel: &CancelToken,
+        deadline: Deadline,
+        execute: F,
+    ) -> Result<TaskCard, String>
+    where
+        F: FnOnce(CancelToken, TaskProvenance, flume::Receiver<String>) -> Fut + Send + 'static,
+        Fut: Future<Output = ToolDoneEvent> + Send + 'static,
+    {
+        let tasks = self.tasks.clone();
+        let spec = JobSpec {
+            call_id: metadata.call_id.clone(),
+            root_call_id: metadata.root_call_id.clone(),
+            label: metadata.label.clone(),
+            identity: QUESTION_IDENTITY.into(),
+            mode: QUESTION_MODE.into(),
+            payload: JobPayload::Question(metadata),
+        };
+        self.admit_job(
+            spec,
+            history,
+            cancel,
+            deadline,
+            move |cancel, provenance| {
+                let (desk, answers) = tasks.open_desk(&provenance.task_id);
+                async move {
+                    let _desk = desk;
+                    execute(cancel, provenance, answers).await
+                }
+            },
+        )
+        .await
+    }
+
+    async fn admit_job<F, Fut>(
+        &self,
+        spec: JobSpec,
+        history: &SubagentHistoryStore,
+        cancel: &CancelToken,
+        deadline: Deadline,
+        execute: F,
+    ) -> Result<TaskCard, String>
+    where
+        F: FnOnce(CancelToken, TaskProvenance) -> Fut + Send + 'static,
+        Fut: Future<Output = ToolDoneEvent> + Send + 'static,
+    {
+        if [&spec.call_id, &spec.root_call_id]
+            .iter()
+            .any(|id| id.is_empty() || id.len() > MAX_ID_BYTES)
+            || matches!(&self.owner, JobOwner::Child { invocation_id } if invocation_id.is_empty() || invocation_id.len() > MAX_ID_BYTES)
+        {
+            return Err("job admission requires bounded identities".into());
+        }
+        let mut request = json!({"call_id": spec.call_id, "label": spec.label});
+        if serde_json::to_vec(&spec.payload)
             .map_err(|error| error.to_string())?
             .len()
             > MAX_REQUEST_BYTES
         {
-            return Err("shell metadata exceeds admission byte limit".into());
+            return Err("job metadata exceeds admission byte limit".into());
         }
+        let questions = matches!(spec.payload, JobPayload::Question(_));
         let admission = Admission {
             scope: self.clone(),
             cancel: cancel.clone(),
@@ -370,10 +462,10 @@ impl JobScope {
         admission.check()?;
         if let Some(record) = self
             .tasks
-            .retry_record(&self.owner, &metadata.call_id, &admission)
+            .retry_record(&self.owner, &spec.call_id, &admission)
             .await?
         {
-            return if record.payload == JobPayload::Shell(metadata) {
+            return if record.payload == spec.payload {
                 Ok(TaskCard::from(&record))
             } else {
                 Err(RETRY_MISMATCH.into())
@@ -410,27 +502,27 @@ impl JobScope {
                     "{CAPACITY}: active {active}/{MAX_ACTIVE}, owner {owned}/{MAX_OWNER_ACTIVE}"
                 ));
             }
+            if questions && open_questions(&state, &self.owner) >= MAX_DEFERRED_QUESTIONS {
+                return Err(format!(
+                    "{QUESTION_CAPACITY}: {MAX_DEFERRED_QUESTIONS} / {MAX_DEFERRED_QUESTIONS}"
+                ));
+            }
         }
         let dir = self.tasks.0.dir.clone();
         let session = self.tasks.session_id();
         let history = history.clone();
-        let label = shell_output_label(&metadata.command);
-        let label = if label == "shell" {
-            label
-        } else {
-            format!("shell-{label}")
-        };
+        let identity = spec.identity;
         let reservation = admission.clone();
         let lease = smol::unblock(move || {
             reservation.check()?;
             let cancelled = || reservation.is_cancelled();
             let retry = RuntimeRetry::new(reservation.runtime_deadline(), &cancelled);
             let database = SessionDatabase::open_runtime(&dir, &retry)
-                .map_err(|error| format!("shell identity connection setup: {error}"))?;
-            let lease = history.reserve_generated(&label, |id| {
+                .map_err(|error| format!("job identity connection setup: {error}"))?;
+            let lease = history.reserve_generated(&identity, |id| {
                 database
                     .task_identity_exists_runtime(session, id, &retry)
-                    .map_err(|error| format!("shell identity lookup: {error}"))
+                    .map_err(|error| format!("job identity lookup: {error}"))
             })?;
             reservation.check()?;
             Ok::<_, String>(lease)
@@ -452,19 +544,19 @@ impl JobScope {
         }
         let invocation_id = CaudraId::generate().to_string();
         let record = TaskRecord {
-            payload: JobPayload::Shell(metadata.clone()),
+            payload: spec.payload,
             owner: self.owner.clone(),
             created_at: now_epoch(),
             updated_at: now_epoch(),
             sequence: self.tasks.next_sequence(),
             task_id: task_id.clone(),
             invocation_id: invocation_id.clone(),
-            root_call_id: metadata.root_call_id,
+            root_call_id: spec.root_call_id,
             generation: self.generation,
             state: "queued".into(),
             background: true,
             receipt_accepted: false,
-            mode: metadata.mode,
+            mode: spec.mode,
             request,
             outcome: None,
             output_ref: None,
@@ -503,7 +595,7 @@ impl JobScope {
                 if let Err(error) = admitted {
                     scope.tasks.lock().cancels.remove(&driver_id);
                     drop(gate);
-                    let error = match execute_shell(execute, cancel, provenance).await {
+                    let error = match execute_job(execute, cancel, provenance).await {
                         Ok(_) => error,
                         Err(cleanup) => {
                             scope.tasks.lock().failure = Some(cleanup.clone());
@@ -524,9 +616,7 @@ impl JobScope {
                 if current.is_ok() {
                     let _ = admitted_tx.send(Ok(card));
                 }
-                let result = scope
-                    .run_shell(&driver_id, cancel, provenance, execute)
-                    .await;
+                let result = scope.run_job(&driver_id, cancel, provenance, execute).await;
                 if let Err(error) = result {
                     let mut state = scope.tasks.lock();
                     state.failure = Some(error.clone());
@@ -547,10 +637,10 @@ impl JobScope {
         admitted_rx
             .recv_async()
             .await
-            .map_err(|_| "shell admission ended before settlement".to_owned())?
+            .map_err(|_| "job admission ended before settlement".to_owned())?
     }
 
-    async fn run_shell<F, Fut>(
+    async fn run_job<F, Fut>(
         &self,
         invocation: &str,
         cancel: CancelToken,
@@ -573,10 +663,10 @@ impl JobScope {
         .await;
         if let Err(error) = started {
             self.tasks.lock().cancels.remove(invocation);
-            execute_shell(execute, cancel, provenance).await?;
+            execute_job(execute, cancel, provenance).await?;
             return Err(error);
         }
-        let done = execute_shell(execute, cancel.clone(), provenance).await?;
+        let done = execute_job(execute, cancel.clone(), provenance).await?;
         let _gate = self.tasks.0.gate.lock().await;
         let mut record = self.tasks.record(invocation)?;
         record.state = shell_job_state(cancel.is_cancelled(), &done).into();
@@ -591,6 +681,7 @@ impl JobScope {
                     JobPayload::Shell(metadata) => {
                         format!("output-{}", shell_output_label(&metadata.command))
                     }
+                    JobPayload::Question(_) => QUESTION_OUTPUT_LABEL.into(),
                     JobPayload::Agent => "output-shell".into(),
                 };
                 smol::unblock(move || {
@@ -602,9 +693,13 @@ impl JobScope {
             }
         };
         record.output_ref = Some(reference);
-        record.outcome = Some(
-            json!({"output": bounded(&terminal, MAX_RESULT_BYTES), "shell": done.output, "is_error": done.is_error, "duration_ms": done.accounting.duration_ms, "outcome": done.accounting.outcome}),
-        );
+        let output_field = match record.kind() {
+            JobKind::Question => QUESTION_OUTCOME_FIELD,
+            JobKind::Agent | JobKind::Shell => SHELL_OUTCOME_FIELD,
+        };
+        let mut outcome = json!({"output": bounded(&terminal, MAX_RESULT_BYTES), "is_error": done.is_error, "duration_ms": done.accounting.duration_ms, "outcome": done.accounting.outcome});
+        outcome[output_field] = json!(done.output);
+        record.outcome = Some(outcome);
         let suppressed = self.current().is_err();
         record.events.push(TaskEvent {
             sequence: self.tasks.next_sequence(),
@@ -718,7 +813,7 @@ fn shell_job_state(cancelled: bool, done: &ToolDoneEvent) -> &'static str {
     }
 }
 
-async fn execute_shell<F, Fut>(
+async fn execute_job<F, Fut>(
     execute: F,
     cancel: CancelToken,
     provenance: TaskProvenance,
@@ -730,7 +825,62 @@ where
     AssertUnwindSafe(async move { execute(cancel, provenance).await })
         .catch_unwind()
         .await
-        .map_err(|_| SHELL_PANIC.into())
+        .map_err(|_| JOB_PANIC.into())
+}
+
+fn open_questions(state: &State, owner: &JobOwner) -> usize {
+    state
+        .records
+        .values()
+        .filter(|record| {
+            record.owner == *owner
+                && record.generation == state.generation
+                && record.kind() == JobKind::Question
+                && record.active()
+        })
+        .count()
+}
+
+/// The open end of one deferred question's answer channel. Dropped when the
+/// question settles, so a late answer is refused rather than lost.
+struct AnswerDesk {
+    tasks: BackgroundTasks,
+    task_id: String,
+}
+
+impl Drop for AnswerDesk {
+    fn drop(&mut self) {
+        self.tasks.lock().answers.remove(&self.task_id);
+    }
+}
+
+impl BackgroundTasks {
+    fn open_desk(&self, task_id: &str) -> (AnswerDesk, flume::Receiver<String>) {
+        let (sender, answers) = flume::bounded(1);
+        self.lock().answers.insert(task_id.to_owned(), sender);
+        let desk = AnswerDesk {
+            tasks: self.clone(),
+            task_id: task_id.to_owned(),
+        };
+        (desk, answers)
+    }
+
+    /// Hands the user's reply to the deferred question `task_id` is waiting
+    /// on, in the shape the question form sends. Refused once it is no longer
+    /// open: answered, withdrawn, or stopped.
+    pub fn answer_question(&self, task_id: &str, reply: String) -> Result<(), String> {
+        self.lock()
+            .answers
+            .get(task_id)
+            .ok_or(QUESTION_CLOSED)?
+            .try_send(reply)
+            .map_err(|_| QUESTION_CLOSED.to_owned())
+    }
+
+    /// Deferred questions the main agent is still waiting on.
+    pub fn open_questions(&self) -> usize {
+        open_questions(&self.lock(), &JobOwner::Main)
+    }
 }
 
 #[cfg(test)]
@@ -753,11 +903,12 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        BackgroundTasks, CLOSED, FOREIGN_JOB, RETRY_MISMATCH, STALE_INVOCATION, ShellJobMetadata,
+        BackgroundTasks, CLOSED, FOREIGN_JOB, MAX_DEFERRED_QUESTIONS, QUESTION_CAPACITY,
+        QUESTION_CLOSED, QuestionJobMetadata, RETRY_MISMATCH, STALE_INVOCATION, ShellJobMetadata,
     };
     use crate::{
         AgentEvent, AgentMode, Envelope, History, StoredSession, SubagentHistoryStore,
-        SubagentInfo, TaskProvenance, ToolDoneEvent,
+        SubagentInfo, TaskCard, TaskProvenance, ToolDoneEvent,
         agent::{
             subagent::{
                 RESERVATION_SESSION_MISMATCH, TaskIdentity, TaskOptions, open_task,
@@ -767,14 +918,16 @@ mod tests {
         },
         background::{
             ADMISSION_CANCELLED, MAX_BATCH_BYTES, MAX_HISTORY_PAGE, MAX_INVOCATIONS,
-            MAX_RESULT_BYTES, MAX_SHELL_COMMAND_BYTES,
+            MAX_RESULT_BYTES, MAX_SHELL_COMMAND_BYTES, QUESTION_INTERRUPTED,
             tests::{
                 ARCHIVE_LIFECYCLE_COUNT, assert_archive_count, hold_writer, seed_archived_tasks,
             },
         },
         background_reminder::render,
         cancel::{CancelMap, CancelToken},
-        tools::{DEADLINE_EXCEEDED, Deadline, LocalTools, test_support::stub_ctx},
+        tools::{
+            DEADLINE_EXCEEDED, Deadline, LocalTools, native::question, test_support::stub_ctx,
+        },
         types::BACKGROUND_EVENT_RUN_ID,
     };
 
@@ -807,6 +960,13 @@ mod tests {
     const CANCELLED: &str = "cancelled";
     const PREMATURE_ACK: &str =
         "task event must be durably saved in parent history before acknowledgment";
+    const QUESTION_LABEL: &str = "Cache backend";
+    const ANSWER: &str = "Cache backend: SQLite";
+    const WITHDRAWN_TEXT: &str = "withdrawn before an answer";
+    const QUESTION_KIND: &str = "question";
+    const AWAITING_ANSWER: &str = "awaiting answer";
+    const LATE_ANSWER: &str = "an answer to a settled question must be refused";
+    const GOAL_WAITS: &str = "an open question must count as pending session work";
 
     struct Fixture {
         _temp: TempDir,
@@ -2054,11 +2214,11 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 fixture.tasks.join_jobs().await.unwrap_err(),
-                super::SHELL_PANIC
+                super::JOB_PANIC
             );
             assert_eq!(
                 fixture.tasks.status(&card.task_id).unwrap().result,
-                Some(json!({"error": super::SHELL_PANIC}))
+                Some(json!({"error": super::JOB_PANIC}))
             );
             assert_eq!(fixture.tasks.active_count(), 0);
         });
@@ -2210,6 +2370,213 @@ mod tests {
                     .unwrap();
                 fixture.tasks.shutdown().await.unwrap();
             }
+        });
+    }
+
+    fn question(call: &str) -> QuestionJobMetadata {
+        QuestionJobMetadata {
+            call_id: call.into(),
+            root_call_id: call.into(),
+            label: QUESTION_LABEL.into(),
+        }
+    }
+
+    fn question_receipt(call: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: call.into(),
+                content: "deferred".into(),
+                is_error: false,
+                output_ref: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Admits a question whose job settles with the reply it is handed, or
+    /// as withdrawn when cancelled. `opened` fires once its answer desk is
+    /// open.
+    async fn ask(
+        fixture: &Fixture,
+        call: &str,
+        opened: flume::Sender<()>,
+    ) -> Result<TaskCard, String> {
+        let call_id = call.to_owned();
+        fixture
+            .tasks
+            .main_scope()
+            .admit_question(
+                question(call),
+                &fixture.history,
+                &CancelToken::none(),
+                Deadline::None,
+                move |cancel, _, answers| async move {
+                    let _ = opened.send(());
+                    let mut done = match cancel.race(answers.recv_async()).await {
+                        Ok(Ok(reply)) => ToolDoneEvent::error(call_id, reply),
+                        _ => ToolDoneEvent::error(call_id, WITHDRAWN_TEXT),
+                    };
+                    done.is_error = cancel.is_cancelled();
+                    done
+                },
+            )
+            .await
+    }
+
+    fn delivered(tasks: &BackgroundTasks) -> String {
+        tasks
+            .claim_messages()
+            .unwrap()
+            .iter()
+            .find(|message| message.task_event.is_some())
+            .and_then(Message::first_text_content)
+            .map(str::to_owned)
+            .expect("the question settled with a delivery")
+    }
+
+    #[test]
+    fn a_deferred_question_takes_its_answer_from_its_desk() {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let (opened, open) = flume::unbounded();
+            let card = ask(&fixture, CALL, opened).await.unwrap();
+            assert_eq!(
+                (card.kind, card.label.as_str()),
+                (JobKind::Question, QUESTION_LABEL)
+            );
+            open.recv_async().await.unwrap();
+            assert_eq!(fixture.tasks.open_questions(), 1);
+
+            fixture
+                .tasks
+                .answer_question(&card.task_id, ANSWER.into())
+                .unwrap();
+            fixture.tasks.join_jobs().await.unwrap();
+            fixture
+                .tasks
+                .main_scope()
+                .settle_launches(&[question_receipt(CALL)])
+                .await
+                .unwrap();
+
+            assert_eq!(fixture.tasks.open_questions(), 0);
+            assert_eq!(
+                fixture
+                    .tasks
+                    .answer_question(&card.task_id, ANSWER.into())
+                    .unwrap_err(),
+                QUESTION_CLOSED,
+                "{LATE_ANSWER}"
+            );
+            assert_eq!(
+                delivered(&fixture.tasks),
+                question::delivery_text(&card.task_id, question::ANSWERED_KIND, ANSWER)
+            );
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn a_withdrawn_question_is_delivered_as_withdrawn() {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let (opened, open) = flume::unbounded();
+            let card = ask(&fixture, CALL, opened).await.unwrap();
+            open.recv_async().await.unwrap();
+
+            fixture
+                .tasks
+                .main_scope()
+                .cancel(&card.task_id)
+                .await
+                .unwrap();
+            fixture.tasks.join_jobs().await.unwrap();
+            fixture
+                .tasks
+                .main_scope()
+                .settle_launches(&[question_receipt(CALL)])
+                .await
+                .unwrap();
+
+            assert_eq!(
+                delivered(&fixture.tasks),
+                question::delivery_text(&card.task_id, question::WITHDRAWN_KIND, WITHDRAWN_TEXT)
+            );
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn a_question_past_the_cap_is_refused() {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let (opened, _open) = flume::unbounded();
+            for index in 0..MAX_DEFERRED_QUESTIONS {
+                ask(&fixture, &format!("{CALL}-{index}"), opened.clone())
+                    .await
+                    .unwrap();
+            }
+
+            let error = ask(&fixture, CALL, opened).await.unwrap_err();
+
+            assert!(error.starts_with(QUESTION_CAPACITY), "{error}");
+            assert_eq!(fixture.tasks.open_questions(), MAX_DEFERRED_QUESTIONS);
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn an_open_question_lists_as_waiting_on_the_user() {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let (opened, open) = flume::unbounded();
+            ask(&fixture, CALL, opened).await.unwrap();
+            open.recv_async().await.unwrap();
+
+            let (reminder, ..) =
+                render(Some(&fixture.tasks.main_scope().reminder_snapshot()), None);
+
+            assert!(reminder.contains(QUESTION_KIND), "{reminder}");
+            assert!(reminder.contains(AWAITING_ANSWER), "{reminder}");
+            assert!(reminder.contains(QUESTION_LABEL), "{reminder}");
+            assert!(fixture.tasks.main_scope().pending(), "{GOAL_WAITS}");
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn a_question_open_at_a_crash_restores_as_interrupted() {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let (opened, open) = flume::unbounded();
+            let card = ask(&fixture, CALL, opened).await.unwrap();
+            open.recv_async().await.unwrap();
+            fixture
+                .tasks
+                .answer_question(&card.task_id, ANSWER.into())
+                .unwrap();
+            fixture.tasks.join_jobs().await.unwrap();
+            let mut record = fixture.tasks.record(&card.invocation_id).unwrap();
+            record.state = "running".into();
+            record.outcome = None;
+            record.events.clear();
+            fixture.tasks.persist(record).await.unwrap();
+
+            let restored = BackgroundTasks::spawn(fixture.dir.clone(), fixture.session.id)
+                .await
+                .unwrap();
+
+            let status = restored.status(&card.task_id).unwrap();
+            assert_eq!(status.state, "interrupted");
+            assert_eq!(
+                status
+                    .result
+                    .as_ref()
+                    .and_then(|result| result["error"].as_str()),
+                Some(QUESTION_INTERRUPTED)
+            );
+            restored.shutdown().await.unwrap();
         });
     }
 }

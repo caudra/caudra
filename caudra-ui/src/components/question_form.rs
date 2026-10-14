@@ -20,7 +20,7 @@ use url::Url;
 
 use caudra_agent::mcp::elicitation::{REQUIRED, describe_answer, validate_answer};
 use caudra_agent::permissions::AutopilotNote;
-use caudra_agent::types::{AskedQuestion, QuestionSource};
+use caudra_agent::types::{AskedQuestion, QuestionDelivery, QuestionEvent, QuestionSource};
 use caudra_grab::grab_scope;
 use caudra_workbench::buffer::Cursor;
 use caudra_workbench::render::Row;
@@ -69,6 +69,11 @@ const ASK_HINT: Hint = Hint::bind(key::QUESTION_ASK_BTW, "Ask /btw");
 const COMPACT_ASK_HINT: Hint = Hint::bind(key::QUESTION_ASK_BTW, "Ask");
 const ASK_HINT_INDEX: usize = 0;
 const DECLINE_HINT: Hint = Hint::bind(key::QUESTION_DECLINE, "decline");
+const DEFER_HINT: Hint = Hint::bind(key::QUESTION_LATER, "later");
+const NEXT_HINT: Hint = Hint::bind(key::QUESTION_LATER, "next");
+const PUT_ASIDE_HINT: Hint = Hint::bind(key::ESC, "later");
+const DISMISS_LABEL: &str = "dismiss";
+const DEFERRED_TITLE: &str = "Deferred question";
 /// Every bar ends on dismiss and cancel, and a server's form adds decline
 /// right before them.
 const CLOSING_HINTS: usize = 2;
@@ -137,6 +142,10 @@ pub enum QuestionFormAction {
     Dismiss,
     /// Stop the agent that asked, so only a new message moves it again.
     Cancel,
+    /// `F4`: answer a waiting question later, or show the next deferred one.
+    Later,
+    /// `Esc` on a deferred question: hide the form and keep its draft.
+    PutAside,
     /// Text the answer box copied or cut, for the clipboard.
     Copy(String),
 }
@@ -177,6 +186,13 @@ pub struct QuestionForm {
     hover: Option<FormTarget>,
     /// What autopilot is doing about the form, drawn muted above it.
     autopilot_note: Option<AutopilotNote>,
+    /// The tool call that asked, which keys its draft and autopilot's claim.
+    call_id: Option<String>,
+    delivery: QuestionDelivery,
+    /// Where a deferred form stands among the open ones, as `(n, of)`.
+    place: Option<(usize, usize)>,
+    /// The user acted on the form, so a new ask must not push it aside.
+    touched: bool,
 }
 
 /// Everything on the form a click can name. The form is rebuilt from scratch
@@ -256,13 +272,59 @@ impl QuestionForm {
             row_hits: Vec::new(),
             mouse_down: None,
             autopilot_note: None,
+            call_id: None,
+            delivery: QuestionDelivery::Blocking,
+            place: None,
+            touched: false,
         }
+    }
+
+    /// Opens on what an agent asked, carrying how the answer is waited for.
+    pub(crate) fn ask(&mut self, event: QuestionEvent) {
+        self.open(event.questions, event.source);
+        self.call_id = event.call_id;
+        self.delivery = event.delivery;
+    }
+
+    /// The same question asked again under a new delivery, as when the user
+    /// deferred it: the draft stays.
+    pub(crate) fn redeliver(&mut self, delivery: QuestionDelivery) {
+        self.delivery = delivery;
+        self.place = None;
+    }
+
+    pub(crate) fn call_id(&self) -> Option<&str> {
+        self.call_id.as_deref()
+    }
+
+    /// The job a deferred form answers, `None` for one an agent waits on.
+    pub(crate) fn deferred_task(&self) -> Option<&str> {
+        match &self.delivery {
+            QuestionDelivery::Deferred { task_id, .. } => Some(task_id),
+            QuestionDelivery::Blocking | QuestionDelivery::Deferrable => None,
+        }
+    }
+
+    pub(crate) fn set_place(&mut self, place: Option<(usize, usize)>) {
+        self.place = place;
+    }
+
+    pub(crate) fn touch(&mut self) {
+        self.touched = true;
+    }
+
+    pub(crate) fn touched(&self) -> bool {
+        self.touched
     }
 
     /// Opens on the first question, with every default already picked. A
     /// server's request with no questions asks for consent alone.
     pub fn open(&mut self, questions: Vec<AskedQuestion>, source: Option<QuestionSource>) {
         self.autopilot_note = None;
+        self.call_id = None;
+        self.delivery = QuestionDelivery::Blocking;
+        self.place = None;
+        self.touched = false;
         self.answers = questions
             .iter()
             .map(|question| question.default.clone())
@@ -329,6 +391,10 @@ impl QuestionForm {
 
     pub fn close(&mut self) {
         self.autopilot_note = None;
+        self.call_id = None;
+        self.delivery = QuestionDelivery::Blocking;
+        self.place = None;
+        self.touched = false;
         self.questions.clear();
         self.source = None;
         self.error = None;
@@ -350,6 +416,9 @@ impl QuestionForm {
         }
         if key::QUESTION_DECLINE.matches(key) && self.source.is_some() {
             return QuestionFormAction::Decline;
+        }
+        if key::QUESTION_LATER.matches(key) && self.delivery != QuestionDelivery::Blocking {
+            return QuestionFormAction::Later;
         }
         self.follow_cursor = true;
         if self.is_consent() {
@@ -420,9 +489,10 @@ impl QuestionForm {
         }
         self.scroll = self.scroll.min(rows.total.saturating_sub(visible));
         let t = theme::current();
-        let title = match &self.source {
-            Some(source) => format!(" {} {ASKS} ", source.asker()),
-            None => TITLE.to_owned(),
+        let title = match (&self.source, self.place) {
+            (Some(source), _) => format!(" {} {ASKS} ", source.asker()),
+            (None, Some((place, of))) => format!(" {DEFERRED_TITLE} {place} of {of} "),
+            (None, None) => TITLE.to_owned(),
         };
         let hint = render_form(
             &t,
@@ -784,13 +854,24 @@ impl QuestionForm {
             KeyCode::Up => self.cursor = ACCEPT_ROW,
             KeyCode::Down => self.cursor = DECLINE_ROW,
             KeyCode::Enter => return self.activate_cursor(),
-            KeyCode::Esc => return QuestionFormAction::Dismiss,
+            KeyCode::Esc => return self.dismiss(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return QuestionFormAction::Cancel;
             }
             _ => {}
         }
         QuestionFormAction::Consumed
+    }
+
+    /// `Esc` lets the asking agent carry on without an answer, except on a
+    /// deferred form: nothing waits for that one, so it is only put aside.
+    fn dismiss(&self) -> QuestionFormAction {
+        match self.delivery {
+            QuestionDelivery::Deferred { .. } => QuestionFormAction::PutAside,
+            QuestionDelivery::Blocking | QuestionDelivery::Deferrable => {
+                QuestionFormAction::Dismiss
+            }
+        }
     }
 
     fn key_selecting(&mut self, key: KeyEvent) -> QuestionFormAction {
@@ -802,7 +883,7 @@ impl QuestionForm {
             KeyCode::BackTab | KeyCode::Left if self.has_review() && self.tab > 0 => {
                 self.go_to(self.tab - 1);
             }
-            KeyCode::Esc => return QuestionFormAction::Dismiss,
+            KeyCode::Esc => return self.dismiss(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return QuestionFormAction::Cancel;
             }
@@ -828,7 +909,7 @@ impl QuestionForm {
         let typed = self.is_typed();
         match key.code {
             KeyCode::Enter if submit && typed => return self.commit_typed(),
-            KeyCode::Esc if typed => return QuestionFormAction::Dismiss,
+            KeyCode::Esc if typed => return self.dismiss(),
             KeyCode::Tab if typed => return self.next_tab(),
             KeyCode::BackTab if typed => {
                 if self.tab > 0 {
@@ -909,7 +990,7 @@ impl QuestionForm {
                 self.go_to(self.questions.len() - 1);
                 QuestionFormAction::Consumed
             }
-            KeyCode::Esc => QuestionFormAction::Dismiss,
+            KeyCode::Esc => self.dismiss(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 QuestionFormAction::Cancel
             }
@@ -970,6 +1051,20 @@ impl QuestionForm {
         let mut hints = pairs.to_vec();
         if self.source.is_some() {
             hints.insert(hints.len() - CLOSING_HINTS, DECLINE_HINT);
+        }
+        match self.delivery {
+            QuestionDelivery::Blocking => {}
+            QuestionDelivery::Deferrable => hints.insert(hints.len() - CLOSING_HINTS, DEFER_HINT),
+            QuestionDelivery::Deferred { .. } => {
+                for hint in &mut hints {
+                    if hint.description == DISMISS_LABEL {
+                        *hint = PUT_ASIDE_HINT;
+                    }
+                }
+                if self.place.is_some_and(|(_, of)| of > 1) {
+                    hints.insert(hints.len() - CLOSING_HINTS, NEXT_HINT);
+                }
+            }
         }
         hints
     }
@@ -2858,6 +2953,91 @@ mod tests {
         form.hint_pairs()
             .iter()
             .position(|hint| hint.label() == bind.label)
+    }
+
+    const DEFERRED_TASK: &str = "question-task";
+    const CALL: &str = "toolu_question";
+    const PLACED_TITLE: &str = "Deferred question 2 of 3";
+
+    fn delivered(delivery: QuestionDelivery) -> QuestionForm {
+        let mut form = QuestionForm::new();
+        form.ask(QuestionEvent {
+            questions: vec![question(HEADER, false)],
+            call_id: Some(CALL.into()),
+            delivery,
+            ..QuestionEvent::default()
+        });
+        form
+    }
+
+    fn deferred() -> QuestionDelivery {
+        QuestionDelivery::Deferred {
+            task_id: DEFERRED_TASK.into(),
+            docked: true,
+        }
+    }
+
+    #[test_case(QuestionDelivery::Blocking, false ; "an_ask_that_cannot_be_put_off")]
+    #[test_case(QuestionDelivery::Deferrable, true ; "an_ask_the_user_may_put_off")]
+    fn only_a_deferrable_ask_offers_later(delivery: QuestionDelivery, offered: bool) {
+        let mut form = delivered(delivery);
+
+        assert_eq!(offers(&form, key::QUESTION_LATER).is_some(), offered);
+        let action = form.handle_key(key::QUESTION_LATER.to_key_event());
+        assert_eq!(matches!(action, QuestionFormAction::Later), offered);
+        assert_eq!(form.call_id(), Some(CALL));
+    }
+
+    #[test]
+    fn escape_puts_a_deferred_form_aside_instead_of_dismissing_it() {
+        let mut form = delivered(deferred());
+
+        assert_eq!(form.deferred_task(), Some(DEFERRED_TASK));
+        assert!(matches!(
+            press(&mut form, KeyCode::Esc),
+            QuestionFormAction::PutAside
+        ));
+        let hints = form.hint_pairs();
+        assert!(hints.iter().all(|hint| hint.description != DISMISS_LABEL));
+        assert!(
+            hints.iter().any(|hint| hint.label() == key::ESC.label
+                && hint.description == PUT_ASIDE_HINT.description)
+        );
+        assert_eq!(
+            offers(&form, key::QUESTION_LATER),
+            None,
+            "one question has no next"
+        );
+    }
+
+    #[test]
+    fn a_placed_deferred_form_names_its_place_and_offers_the_next() {
+        let mut form = delivered(deferred());
+        form.set_place(Some((2, 3)));
+
+        assert!(offers(&form, key::QUESTION_LATER).is_some());
+        assert!(matches!(
+            form.handle_key(key::QUESTION_LATER.to_key_event()),
+            QuestionFormAction::Later
+        ));
+        assert!(
+            painted(&mut form)
+                .iter()
+                .any(|row| row.contains(PLACED_TITLE))
+        );
+    }
+
+    #[test]
+    fn a_redelivered_form_keeps_its_draft() {
+        let mut form = delivered(QuestionDelivery::Deferrable);
+        press(&mut form, KeyCode::Down);
+        form.touch();
+
+        form.redeliver(deferred());
+
+        assert_eq!(form.cursor, 1);
+        assert!(form.touched());
+        assert_eq!(form.deferred_task(), Some(DEFERRED_TASK));
     }
 
     #[test]

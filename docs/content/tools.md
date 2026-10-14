@@ -278,6 +278,7 @@ Use this tool when you need to ask the user questions during execution. This all
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `questions` | array | yes | Questions to ask |
+| `background` | boolean | no | Ask without waiting: return a question ID now, and the answer arrives automatically later, including after you end your turn. Default false waits for the answer. |
 
 ## Agent & Knowledge
 

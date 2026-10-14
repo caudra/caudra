@@ -1286,6 +1286,11 @@ impl App {
                 self.execute_decisions("");
                 Vec::new()
             }
+            StatusBarHitTarget::Questions => {
+                self.clear_control_hovers();
+                self.reopen_question(None);
+                Vec::new()
+            }
             StatusBarHitTarget::ConfigProblems => {
                 if let Some(details) = self.config_problems.details() {
                     self.flash(details);

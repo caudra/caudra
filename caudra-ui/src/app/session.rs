@@ -666,6 +666,7 @@ impl App {
         self.key_focus = super::KeyFocus::Composer;
         self.recoverable_queue.clear();
         self.recoverable_queue_together = false;
+        self.drop_questions();
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
         self.cancelling_run = None;

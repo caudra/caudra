@@ -8,7 +8,7 @@ pub(crate) mod question;
 pub(crate) mod review;
 mod wire;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::mem;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -81,7 +81,8 @@ struct State {
     /// This engagement's newest decisions, oldest first.
     recent: VecDeque<AutopilotDecision>,
     snapshot: Option<AutopilotSnapshot>,
-    question_claimed: bool,
+    /// The forms taken, by key, for whoever answered first.
+    claimed_questions: HashSet<String>,
     plan_claimed: bool,
     review_streak: ReviewStreak,
     /// The goal generation whose second opinion was asked for.
@@ -111,7 +112,7 @@ impl AutopilotHandle {
             next_seq: 0,
             recent: VecDeque::new(),
             snapshot: None,
-            question_claimed: false,
+            claimed_questions: HashSet::new(),
             plan_claimed: false,
             review_streak: ReviewStreak::default(),
             second_opinion_generation: None,
@@ -214,7 +215,7 @@ impl AutopilotHandle {
         state.budget = Budget::new(now);
         state.last_end = None;
         state.recent.clear();
-        state.question_claimed = false;
+        state.claimed_questions.clear();
         state.plan_claimed = false;
         state.review_streak.reset();
         Some(AutopilotEvent::Engaged {
@@ -326,18 +327,19 @@ impl AutopilotHandle {
         self.lock().snapshot.clone()
     }
 
-    /// Takes the waiting question for whoever answers first, `false` when it
-    /// was already taken.
-    pub fn claim_question(&self) -> bool {
-        !mem::replace(&mut self.lock().question_claimed, true)
+    /// Takes the waiting form `key` names for whoever answers first, `false`
+    /// when it was already taken. Each form is claimed on its own, so a form
+    /// the user is typing into never holds the delegate off another.
+    pub fn claim_question(&self, key: &str) -> bool {
+        self.lock().claimed_questions.insert(key.to_owned())
     }
 
-    pub fn question_claimed(&self) -> bool {
-        self.lock().question_claimed
+    pub fn question_claimed(&self, key: &str) -> bool {
+        self.lock().claimed_questions.contains(key)
     }
 
-    pub fn reset_question_claim(&self) {
-        self.lock().question_claimed = false;
+    pub fn reset_question_claim(&self, key: &str) {
+        self.lock().claimed_questions.remove(key);
     }
 
     /// Takes the waiting plan for whoever answers first, `false` when it was
@@ -485,6 +487,9 @@ mod tests {
     const SEQ_CONTINUES: &str = "numbering must continue after the stored decisions";
     const OWNERSHIP_ENDS: &str = "an ended engagement owns no goal";
     const BUDGET_ENDS: &str = "a budget that runs out must end the engagement";
+    const FORM: &str = "toolu_form";
+    const OTHER_FORM: &str = "toolu_other_form";
+    const FORMS_APART: &str = "a claim must neither block nor free another form";
 
     fn handle() -> (Arc<FakeClock>, AutopilotHandle) {
         let clock = FakeClock::new(START_MS);
@@ -883,7 +888,7 @@ mod tests {
         handle.engage(false, None);
         handle.try_continue(&limits()).unwrap();
         handle.record(decision(handle.next_seq()));
-        assert!(handle.claim_question());
+        assert!(handle.claim_question(FORM));
         assert!(handle.claim_plan());
         handle.end(STOPPED);
 
@@ -891,7 +896,7 @@ mod tests {
 
         let stored = handle.stored().unwrap();
         assert_eq!((stored.continuations, stored.last_end), (0, None));
-        assert!(!handle.question_claimed());
+        assert!(!handle.question_claimed(FORM));
         assert!(!handle.plan_claimed());
         assert!(handle.recent_decisions().is_empty());
         assert_eq!(handle.next_seq(), 1, "{SEQ_CONTINUES}");
@@ -901,17 +906,29 @@ mod tests {
     fn a_claim_goes_to_whoever_takes_it_first() {
         let (_, handle) = handle();
 
-        assert!(handle.claim_question());
-        assert!(!handle.claim_question());
-        assert!(handle.question_claimed());
+        assert!(handle.claim_question(FORM));
+        assert!(!handle.claim_question(FORM));
+        assert!(handle.question_claimed(FORM));
         assert!(!handle.plan_claimed());
-        handle.reset_question_claim();
+        handle.reset_question_claim(FORM);
 
-        assert!(!handle.question_claimed());
+        assert!(!handle.question_claimed(FORM));
         assert!(handle.claim_plan());
         assert!(!handle.claim_plan());
         handle.reset_plan_claim();
         assert!(!handle.plan_claimed());
+    }
+
+    #[test]
+    fn a_claim_on_one_form_leaves_another_alone() {
+        let (_, handle) = handle();
+        assert!(handle.claim_question(FORM));
+
+        assert!(handle.claim_question(OTHER_FORM), "{FORMS_APART}");
+        handle.reset_question_claim(OTHER_FORM);
+
+        assert!(handle.question_claimed(FORM), "{FORMS_APART}");
+        assert!(!handle.question_claimed(OTHER_FORM), "{FORMS_APART}");
     }
 
     #[test]

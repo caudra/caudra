@@ -206,7 +206,9 @@ impl App {
         if !self.question_form.is_open() {
             return;
         }
-        if self.question_subagent.is_some() || self.task_interactions.question.is_some() {
+        let task_question =
+            self.question_subagent.is_some() || self.task_interactions.question.is_some();
+        if self.question_form.deferred_task().is_none() && task_question {
             self.flash(CLARIFICATION_MAIN_ONLY.into());
             return;
         }

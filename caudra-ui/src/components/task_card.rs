@@ -36,9 +36,21 @@ const ESCAPED_LINE_BREAK: &str = "\\n";
 /// thread at about 4-5 µs a byte, so longer text is drawn plain rather than
 /// stalling the frame that first shows it.
 const MAX_HIGHLIGHTED_BYTES: usize = 8 * 1024;
+const SUCCEEDED_STATE: &str = "succeeded";
+const CANCELLED_STATE: &str = "cancelled";
+pub(crate) const QUESTION_WAITING: &str = "waiting for your answer";
+const QUESTION_ANSWERED: &str = "answered";
+const QUESTION_WITHDRAWN: &str = "withdrawn";
+const QUESTION_DELIVERY_LEAD: &str = "Question";
 
 pub(crate) fn is_shell_delivery(origin: &TaskEventOrigin, text: &str) -> bool {
     text.starts_with(&format!("Shell {}:", origin.task_id))
+}
+
+/// Whether a delivery comes from an agent task, whose chat it can open.
+pub(crate) fn opens_chat(origin: &TaskEventOrigin, text: &str) -> bool {
+    !is_shell_delivery(origin, text)
+        && !text.starts_with(&format!("{QUESTION_DELIVERY_LEAD} {}:", origin.task_id))
 }
 
 pub(crate) fn literal_body(text: &str, width: u16) -> (Vec<Line<'static>>, LinkMap) {
@@ -84,7 +96,18 @@ fn indented(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
 pub(crate) fn details(task: &TaskCard, width: u16) -> (Vec<Line<'static>>, LinkMap) {
     match task.kind {
         JobKind::Agent => markdown_body(&task_details(task), width),
-        JobKind::Shell => literal_body(&task_details(task), width),
+        JobKind::Shell | JobKind::Question => literal_body(&task_details(task), width),
+    }
+}
+
+/// A job's state as the user reads it: a deferred question is waiting on
+/// them, then answered or withdrawn, rather than running or done.
+pub(crate) fn shown_state(task: &TaskCard) -> &str {
+    match (&task.kind, task.state.as_str()) {
+        (JobKind::Question, _) if task.active() => QUESTION_WAITING,
+        (JobKind::Question, SUCCEEDED_STATE) => QUESTION_ANSWERED,
+        (JobKind::Question, CANCELLED_STATE) => QUESTION_WITHDRAWN,
+        (_, state) => state,
     }
 }
 
@@ -158,7 +181,7 @@ pub(crate) fn delivery(
             Span::styled(
                 state.to_owned(),
                 match state.trim_end_matches('.') {
-                    "success" => t.tool_success,
+                    "success" | QUESTION_ANSWERED => t.tool_success,
                     "failure" => t.tool_error,
                     "blocked" => t.tool_warning,
                     _ => t.tool_dim,
@@ -168,7 +191,7 @@ pub(crate) fn delivery(
         None => vec![Span::styled(heading, t.tool_prefix)],
     };
     let shell = is_shell_delivery(origin, text);
-    if !shell {
+    if opens_chat(origin, text) {
         spans.push(Span::styled(OPEN_CHAT, t.accent));
     }
     let mut lines = WrappedRows::new(vec![Line::from(spans)], 0, width).lines();
@@ -244,18 +267,19 @@ pub(crate) fn render(
             rows.push(None);
         }
         let title = match task.kind {
-            JobKind::Agent => &task.label,
+            JobKind::Agent | JobKind::Question => &task.label,
             JobKind::Shell => &task.task_id,
         };
         let mut heading = vec![
             Span::styled(escape_terminal_controls(title), t.tool_prefix),
             Span::styled(SEPARATOR, t.tool_dim),
             Span::styled(
-                escape_terminal_controls(&task.state),
+                escape_terminal_controls(shown_state(task)),
                 status_style(&task.state),
             ),
         ];
-        if task.background {
+        let question = task.kind == JobKind::Question;
+        if task.background && !question {
             heading.push(Span::styled(BACKGROUND_BADGE, t.accent));
         }
         let mut identity = WrappedRows::new(vec![Line::from(heading)], 0, width).lines();
@@ -264,7 +288,11 @@ pub(crate) fn render(
             task_line.spans.push(Span::styled(OPEN_CHAT, t.accent));
             identity.extend(WrappedRows::new(vec![task_line], 1, width).lines());
         }
-        identity.extend(WrappedRows::new(vec![fact("Mode", &task.mode, t.tool)], 1, width).lines());
+        let (label, value) = match question {
+            true => ("Question", &task.task_id),
+            false => ("Mode", &task.mode),
+        };
+        identity.extend(WrappedRows::new(vec![fact(label, value, t.tool)], 1, width).lines());
         let mut body = shell_facts(task, script);
         if let Some(result) = &task.result {
             if let Some(duration) = result.get("duration_ms").and_then(|value| value.as_u64()) {

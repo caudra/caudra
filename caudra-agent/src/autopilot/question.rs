@@ -32,6 +32,8 @@ const NO_ANSWER: &str = "(no answer)";
 /// before the form is settled, the decision ends as cancelled.
 pub struct QuestionDelegate {
     item: String,
+    /// The form's claim key: the call that put it up.
+    key: String,
     slot: DecisionSlot,
 }
 
@@ -75,7 +77,8 @@ impl QuestionDelegate {
         tool_use_id: Option<String>,
         event_tx: &EventSender,
     ) -> Self {
-        handle.reset_question_claim();
+        let key = tool_use_id.clone().unwrap_or_default();
+        handle.reset_question_claim(&key);
         let item = clip(item(label, questions), MAX_ITEM_BYTES);
         let origin = DecisionOrigin {
             tool_use_id,
@@ -83,6 +86,7 @@ impl QuestionDelegate {
         };
         Self {
             item,
+            key,
             slot: DecisionSlot::new(handle, DecisionKind::Question, origin, event_tx),
         }
     }
@@ -119,7 +123,7 @@ impl QuestionDelegate {
 
     /// Takes the form for autopilot, `false` when the human took it first.
     pub fn claim(&self) -> bool {
-        self.slot.handle().claim_question()
+        self.slot.handle().claim_question(&self.key)
     }
 }
 

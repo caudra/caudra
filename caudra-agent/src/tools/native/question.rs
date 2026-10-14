@@ -7,24 +7,38 @@
 //! own way.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
+use caudra_storage::background::{JobOwner, QuestionJobMetadata};
+use caudra_storage::tool_ledger::ToolOutcome;
 use flume::Receiver;
 use futures_lite::future;
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, warn};
 
-use crate::AgentEvent;
 use crate::autopilot::question::QuestionDelegate;
-use crate::autopilot::{DecisionOutcome, DelegateAction, DelegateOutcome, DelegateOutput};
+use crate::autopilot::{
+    AutopilotHandle, DecisionOutcome, DelegateAction, DelegateOutcome, DelegateOutput,
+};
+use crate::background::{JobScope, MAX_DEFERRED_QUESTIONS};
 use crate::cancel::CancelToken;
+use crate::subagent_history::metadata_task_id;
+use crate::tools::QUESTION_TOOL_NAME;
+use crate::tools::native::task;
 use crate::tools::registry::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolFailure,
     ToolInvocation,
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{DescriptionContext, ToolAudience, ToolContext};
-use crate::types::{Answer, Answerer, AskedQuestion, QuestionEvent, QuestionOption, ToolOutput};
+use crate::types::{
+    Answer, Answerer, AskedQuestion, QUESTION_DEFERRED_REPLY, QuestionDelivery, QuestionEvent,
+    QuestionOption, TaskCard, TaskProvenance, ToolDoneEvent, ToolOutput,
+};
+use crate::{AgentEvent, EventSender};
 
+/// The deferral section, from [`DEFERRAL_HEADING`] on, is withdrawn with the
+/// `background` parameter wherever a question cannot be deferred.
 pub const DESCRIPTION: &str = "Use this tool when you need to ask the user questions during execution. This allows you to:
 1. Gather user preferences or requirements
 2. Clarify ambiguous instructions
@@ -34,14 +48,50 @@ pub const DESCRIPTION: &str = "Use this tool when you need to ask the user quest
 Usage notes:
 - A \"Type your own answer\" option is added automatically; don't include \"Other\" or catch-all options
 - Answers are returned as arrays of labels; set `multiSelect: true` to allow selecting more than one
-- If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label";
+- If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label
 
+Deferred questions:
+- Set `background: true` only for questions whose answer you do not need for your next steps, such as a preference, a name, or a follow-up. The call returns a question ID at once, and the answer arrives automatically as a message, including after you end your turn.
+- Keep working on what does not depend on the answer. Never act on a guessed answer; if you must assume one, say so and revisit it when the answer arrives.
+- When you cannot continue without an answer, end your turn and tell the user which answer you are waiting for.
+- At most 3 deferred questions can be open. Group related questions in one call, and withdraw one you no longer need with `task_control` `cancel`.
+- The user may defer a question you asked without `background`; you then get a question ID instead of the answer.";
+
+const DEFERRAL_HEADING: &str = "\n\nDeferred questions:\n";
+const BACKGROUND_FIELD: &str = "background";
 const NO_QUESTIONS: &str = "error: at least one question is required";
 const DISMISSED: &str = "(question dismissed by user)";
 const NO_ANSWER: &str = "(no answer)";
 const NO_UI: &str = "no answer channel: the question tool needs an interactive front end";
 const CANCELLED: &str = "cancelled";
 const MULTI_SELECT_FIELD: &str = "multiSelect";
+const DEFERRAL_UNAVAILABLE: &str = "this question cannot be deferred here: deferred questions are \
+turned off (agent.deferred_questions = false) or only the main agent of an interactive session \
+can defer one. Ask again without background and wait for the answer";
+const DEFERRAL_FULL: &str = "deferred questions are already open. Group related questions in \
+one call, withdraw one you no longer need with task_control cancel, or end your turn and tell the \
+user which answer you are waiting for";
+const NO_CALL_ID: &str = "a deferred question needs the id of the call that asked it";
+/// How a delivered deferred question reads: `Question <id>: <kind>.`, then
+/// the body.
+const DELIVERY_LEAD: &str = "Question ";
+const DELIVERY_KIND_SEPARATOR: &str = ": ";
+const DELIVERY_KIND_END: &str = ".\n\n";
+/// The delivery kind of a question the user, or autopilot, answered.
+pub(crate) const ANSWERED_KIND: &str = "answered";
+/// The delivery kind of a question withdrawn before it was answered.
+pub(crate) const WITHDRAWN_KIND: &str = "withdrawn";
+const DEFERRED_CLOSING: &str =
+    "The answer to a deferred question: revisit any work you did on a different assumption.";
+const WITHDRAWN: &str = "The question was withdrawn before the user answered it.";
+const DEFERRED_BY_AGENT: &str = "The question is deferred and waits for the user.";
+const DEFERRED_BY_USER: &str =
+    "The user chose to answer later, so the question is deferred instead of answered.";
+const DEFERRED_GUIDANCE: &str = "The answer arrives automatically as a message, including after \
+you end this turn. Keep working on what does not depend on it. If you cannot continue without it, \
+end your turn and tell the user which answer you are waiting for. Do not ask it again.";
+const LABEL_SEPARATOR: &str = ", ";
+const MAX_LABEL_BYTES: usize = 160;
 /// Opens the result of a form autopilot answered, so the model never takes
 /// the picks for the user's own.
 pub const AUTOPILOT_ANSWERED: &str = "Autopilot answered on the user's behalf:";
@@ -96,7 +146,14 @@ static QUESTIONS_PARAM: ParamSchema = ParamSchema::Array {
     items: &QUESTION_SCHEMA,
     description: "Questions to ask",
 };
-static PROPERTIES: &[Property] = &[("questions", &QUESTIONS_PARAM, true, &[])];
+static BACKGROUND_PARAM: ParamSchema = ParamSchema::Primitive {
+    kind: ParamKind::Bool,
+    description: "Ask without waiting: return a question ID now, and the answer arrives automatically later, including after you end your turn. Default false waits for the answer.",
+};
+static PROPERTIES: &[Property] = &[
+    ("questions", &QUESTIONS_PARAM, true, &[]),
+    (BACKGROUND_FIELD, &BACKGROUND_PARAM, false, &[]),
+];
 static SCHEMA: ParamSchema = ParamSchema::Object {
     properties: PROPERTIES,
     description: "",
@@ -128,8 +185,74 @@ impl Tool for QuestionTool {
         if questions.is_empty() {
             return Err(ParseError::custom(NO_QUESTIONS));
         }
-        Ok(Box::new(QuestionCall { questions }))
+        let background = input
+            .get(BACKGROUND_FIELD)
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        Ok(Box::new(QuestionCall {
+            questions,
+            background,
+        }))
     }
+}
+
+/// Publishes the `background` parameter and the deferral section only where
+/// a question can be deferred: `agent.deferred_questions` is on and the
+/// session runs background jobs.
+pub fn configure_deferral(tools: &mut Value, available: bool) {
+    let Some(definitions) = tools.as_array_mut() else {
+        return;
+    };
+    for definition in definitions {
+        if definition.get("name").and_then(Value::as_str) != Some(QUESTION_TOOL_NAME) {
+            continue;
+        }
+        if let Some(Value::String(description)) = definition.get_mut("description") {
+            if let Some(offset) = description.find(DEFERRAL_HEADING) {
+                description.truncate(offset);
+            }
+            if available && let Some(offset) = DESCRIPTION.find(DEFERRAL_HEADING) {
+                description.push_str(&DESCRIPTION[offset..]);
+            }
+        }
+        if let Some(properties) = definition
+            .get_mut("input_schema")
+            .and_then(|schema| schema.get_mut("properties"))
+            .and_then(Value::as_object_mut)
+        {
+            match available {
+                true => {
+                    properties.insert(BACKGROUND_FIELD.into(), to_json_schema(&BACKGROUND_PARAM))
+                }
+                false => properties.remove(BACKGROUND_FIELD),
+            };
+        }
+    }
+}
+
+/// Where this call may be deferred: the main agent of a session that runs
+/// background jobs and answers through a front end, with deferral on.
+fn deferral(ctx: &ToolContext) -> Option<JobScope> {
+    if !ctx.config.deferred_questions
+        || !asked_by_main_agent(ctx)
+        || ctx.background.is_none()
+        || ctx.user_response_rx.is_none()
+    {
+        return None;
+    }
+    ctx.job_scope()
+        .filter(|scope| *scope.owner() == JobOwner::Main)
+}
+
+/// Whether one more deferred question fits under the cap.
+fn has_room(ctx: &ToolContext) -> bool {
+    ctx.background
+        .as_ref()
+        .is_some_and(|tasks| tasks.open_questions() < MAX_DEFERRED_QUESTIONS)
+}
+
+fn deferral_full() -> String {
+    format!("{MAX_DEFERRED_QUESTIONS} {DEFERRAL_FULL}")
 }
 
 /// The questions a call put to the user, read back out of its own input.
@@ -179,8 +302,33 @@ pub fn answered_by_autopilot(result: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('\n'))
 }
 
+/// What a delivered question observation carries when the user, or
+/// autopilot, answered it: the answer text, `None` for any other delivery.
+pub(crate) fn deferred_answer(observation: &str) -> Option<&str> {
+    let (head, body) = observation
+        .strip_prefix(DELIVERY_LEAD)?
+        .split_once(DELIVERY_KIND_END)?;
+    let (_, kind) = head.rsplit_once(DELIVERY_KIND_SEPARATOR)?;
+    let answers = body
+        .split_once(DEFERRED_CLOSING)
+        .map_or(body, |(answers, _)| answers);
+    (kind == ANSWERED_KIND).then_some(answers.trim_end())
+}
+
+/// How background delivery words a settled deferred question.
+pub(crate) fn delivery_text(task_id: &str, kind: &str, body: &str) -> String {
+    format!("{DELIVERY_LEAD}{task_id}{DELIVERY_KIND_SEPARATOR}{kind}{DELIVERY_KIND_END}{body}")
+}
+
+/// The question ID a `question` result hands back when it was deferred
+/// rather than answered.
+pub(crate) fn deferred_receipt(result: &str) -> Option<&str> {
+    metadata_task_id(result)
+}
+
 struct QuestionCall {
     questions: Vec<AskedQuestion>,
+    background: bool,
 }
 
 /// What ended the wait for an answer: the human's raw reply, or the
@@ -207,51 +355,277 @@ impl ToolInvocation for QuestionCall {
             let Some(rx) = ctx.user_response_rx.as_ref() else {
                 return error(ToolFailure::Other, NO_UI);
             };
-            // The channel is shared with re-authentication, so the lock is
-            // taken before the ask goes out: nothing else may consume the
-            // reply meant for this form.
-            let guard = rx.lock().await;
-            let autopilot = ctx.permissions.autopilot();
-            if autopilot.is_some() {
-                drop_stale_replies(&guard);
+            let deferral = deferral(ctx);
+            if self.background {
+                let Some(scope) = deferral else {
+                    return error(ToolFailure::InvalidInput, DEFERRAL_UNAVAILABLE);
+                };
+                if !has_room(ctx) {
+                    return ToolExecResult::failed(ToolFailure::InvalidInput, deferral_full());
+                }
+                return self
+                    .defer(ctx, scope, DeferredBy::Agent)
+                    .await
+                    .unwrap_or_else(|message| ToolExecResult::failed(ToolFailure::Other, message));
             }
-            let delegate = autopilot
-                .filter(|handle| asked_by_main_agent(ctx) && handle.is_engaged())
-                .map(|handle| {
-                    QuestionDelegate::new(
-                        handle,
-                        &self.questions,
-                        ctx.tool_use_id.clone(),
-                        &ctx.event_tx,
-                    )
-                });
-            let _ = ctx
-                .event_tx
-                .send(AgentEvent::Question(Box::new(QuestionEvent {
-                    questions: self.questions.clone(),
-                    source: None,
-                })));
-            let fit = |picked: &[Vec<String>]| {
-                delegated_answers(&self.questions, picked).ok_or_else(|| UNFIT_ANSWER.to_owned())
-            };
-            let wait = wait_for_answer(&guard, delegate, &ctx.cancel, fit);
-            let reply = ctx.cancel.race(wait).await;
-            drop(guard);
-
-            match reply {
-                Ok(Some(Reply::Human(raw))) => self.report(&raw),
-                Ok(Some(Reply::Autopilot(answers))) => self.answered(answers),
-                // A cancel and a dropped channel are both "no answer is
-                // coming"; the run is ending either way.
-                _ => error(ToolFailure::Cancelled, CANCELLED),
+            let mut deferral = deferral.filter(|_| has_room(ctx));
+            let mut delegated = true;
+            loop {
+                let delivery = match deferral {
+                    Some(_) => QuestionDelivery::Deferrable,
+                    None => QuestionDelivery::Blocking,
+                };
+                match self.ask(ctx, rx, delivery, delegated).await {
+                    Some(Reply::Human(raw)) if raw == QUESTION_DEFERRED_REPLY => {
+                        let Some(scope) = deferral.take() else {
+                            return self.report(&raw);
+                        };
+                        match self.defer(ctx, scope, DeferredBy::User).await {
+                            Ok(receipt) => return receipt,
+                            // The user is still on the form, so it stays up
+                            // for them, now without the way out that failed.
+                            Err(error) => {
+                                warn!(%error, "could not defer a question the user put off");
+                                delegated = false;
+                            }
+                        }
+                    }
+                    Some(Reply::Human(raw)) => return self.report(&raw),
+                    Some(Reply::Autopilot(answers)) => return self.answered(answers),
+                    // A cancel and a dropped channel are both "no answer is
+                    // coming"; the run is ending either way.
+                    None => return error(ToolFailure::Cancelled, CANCELLED),
+                }
             }
         })
     }
 }
 
-/// Autopilot answers only the main agent, the one the user is watching.
+/// Who put a question off: the agent asking with `background`, or the user
+/// from a form the agent waited on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeferredBy {
+    Agent,
+    User,
+}
+
+impl QuestionCall {
+    /// Puts the form up and waits for whoever answers it. The answer channel
+    /// is shared with re-authentication, so the lock is taken before the ask
+    /// goes out: nothing else may consume the reply meant for this form.
+    async fn ask(
+        &self,
+        ctx: &ToolContext,
+        replies: &async_lock::Mutex<Receiver<String>>,
+        delivery: QuestionDelivery,
+        delegated: bool,
+    ) -> Option<Reply<Vec<Answer>>> {
+        let guard = replies.lock().await;
+        let autopilot = ctx.permissions.autopilot();
+        if autopilot.is_some() {
+            drop_stale_replies(&guard);
+        }
+        let delegate = autopilot
+            .filter(|handle| delegated && asked_by_main_agent(ctx) && handle.is_engaged())
+            .map(|handle| {
+                QuestionDelegate::new(
+                    handle,
+                    &self.questions,
+                    ctx.tool_use_id.clone(),
+                    &ctx.event_tx,
+                )
+            });
+        let _ = ctx
+            .event_tx
+            .send(AgentEvent::Question(Box::new(QuestionEvent {
+                questions: self.questions.clone(),
+                source: None,
+                call_id: ctx.tool_use_id.clone(),
+                delivery,
+            })));
+        let fit = |picked: &[Vec<String>]| {
+            delegated_answers(&self.questions, picked).ok_or_else(|| UNFIT_ANSWER.to_owned())
+        };
+        let wait = wait_for_answer(&guard, delegate, &ctx.cancel, fit);
+        ctx.cancel.race(wait).await.ok().flatten()
+    }
+
+    /// Admits the question as a background job and returns its receipt. The
+    /// job puts the form up and waits on a channel of its own, so it never
+    /// holds the answer lock other forms wait on.
+    async fn defer(
+        &self,
+        ctx: &ToolContext,
+        scope: JobScope,
+        by: DeferredBy,
+    ) -> Result<ToolExecResult, String> {
+        let call_id = ctx.tool_use_id.clone().ok_or(NO_CALL_ID)?;
+        let metadata = QuestionJobMetadata {
+            call_id: call_id.clone(),
+            root_call_id: ctx
+                .local_root_tool_use_id
+                .clone()
+                .unwrap_or_else(|| call_id.clone()),
+            label: label(&self.questions),
+        };
+        // The user put the form off themselves, so it is theirs and not the
+        // delegate's to answer, and it waits until they open it again.
+        let pending = PendingQuestion {
+            questions: self.questions.clone(),
+            call_id,
+            event_tx: ctx.event_tx.clone(),
+            autopilot: ctx
+                .permissions
+                .autopilot()
+                .filter(|handle| by == DeferredBy::Agent && handle.is_engaged()),
+            docked: by == DeferredBy::Agent,
+        };
+        let card = scope
+            .admit_question(
+                metadata,
+                &ctx.subagent_history,
+                &ctx.cancel,
+                ctx.deadline,
+                move |cancel, provenance, answers| pending.wait(cancel, provenance, answers),
+            )
+            .await?;
+        ctx.event_tx
+            .try_send(AgentEvent::TaskAdmitted(card.clone()));
+        Ok(receipt(card, by))
+    }
+}
+
+/// A deferred question's job: the form, and the wait for its answer.
+struct PendingQuestion {
+    questions: Vec<AskedQuestion>,
+    call_id: String,
+    event_tx: EventSender,
+    autopilot: Option<AutopilotHandle>,
+    docked: bool,
+}
+
+impl PendingQuestion {
+    async fn wait(
+        self,
+        cancel: CancelToken,
+        provenance: TaskProvenance,
+        answers: Receiver<String>,
+    ) -> ToolDoneEvent {
+        let task_id = provenance.task_id.clone();
+        let event_tx = self.event_tx.clone().with_task(provenance);
+        // Admission can fail after the job was set up, and a form nobody
+        // will answer must never go up.
+        if cancel.is_cancelled() {
+            return self.settle(withdrawn());
+        }
+        let delegate = self.autopilot.clone().map(|handle| {
+            QuestionDelegate::new(
+                handle,
+                &self.questions,
+                Some(self.call_id.clone()),
+                &event_tx,
+            )
+        });
+        let _ = event_tx.send(AgentEvent::Question(Box::new(QuestionEvent {
+            questions: self.questions.clone(),
+            source: None,
+            call_id: Some(self.call_id.clone()),
+            delivery: QuestionDelivery::Deferred {
+                task_id,
+                docked: self.docked,
+            },
+        })));
+        let fit = |picked: &[Vec<String>]| {
+            delegated_answers(&self.questions, picked).ok_or_else(|| UNFIT_ANSWER.to_owned())
+        };
+        let wait = wait_for_answer(&answers, delegate, &cancel, fit);
+        let result = match cancel.race(wait).await.ok().flatten() {
+            Some(Reply::Human(raw)) => match parse_answers(&self.questions, &raw) {
+                Some(answers) => deferred_answers(&self.questions, answers),
+                None => ToolExecResult::from(Ok(ToolOutput::Plain(DISMISSED.into()))),
+            },
+            Some(Reply::Autopilot(answers)) => deferred_answers(&self.questions, answers),
+            None => {
+                let _ = event_tx.send(AgentEvent::QuestionClosed);
+                withdrawn()
+            }
+        };
+        self.settle(result)
+    }
+
+    fn settle(self, result: ToolExecResult) -> ToolDoneEvent {
+        let mut done = ToolDoneEvent::error(self.call_id, String::new());
+        done.tool = Arc::from(QUESTION_TOOL_NAME);
+        done.is_error = result.is_error;
+        done.output = result
+            .output
+            .unwrap_or_else(|message| ToolOutput::Plain(message.into()));
+        done.model_output = result.model_output;
+        done.accounting.outcome = result.failure.map(ToolOutcome::from);
+        done
+    }
+}
+
+fn withdrawn() -> ToolExecResult {
+    error(ToolFailure::Cancelled, WITHDRAWN)
+}
+
+/// The answers, with each question again: the call that asked may be far
+/// back by the time they arrive.
+fn deferred_answers(questions: &[AskedQuestion], answers: Vec<Answer>) -> ToolExecResult {
+    let lines = questions
+        .iter()
+        .enumerate()
+        .map(|(index, question)| {
+            let header = match question.header.is_empty() {
+                false => question.header.clone(),
+                true => format!("Q{}", index + 1),
+            };
+            let picked = answers
+                .get(index)
+                .map(|answer| answer.labels.join(LABEL_SEPARATOR))
+                .filter(|labels| !labels.is_empty())
+                .unwrap_or_else(|| NO_ANSWER.to_owned());
+            format!("{header} — {}: {picked}", question.question)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let lead = match answers.iter().all(|answer| answer.by.is_user()) {
+        true => String::new(),
+        false => format!("{AUTOPILOT_ANSWERED}\n"),
+    };
+    ToolExecResult {
+        model_output: Some(format!("{lead}{lines}\n\n{DEFERRED_CLOSING}")),
+        ..ToolExecResult::from(Ok(ToolOutput::Answers(answers)))
+    }
+}
+
+fn receipt(card: TaskCard, by: DeferredBy) -> ToolExecResult {
+    let lead = match by {
+        DeferredBy::Agent => DEFERRED_BY_AGENT,
+        DeferredBy::User => DEFERRED_BY_USER,
+    };
+    task::receipt_with(card, &format!("{lead} {DEFERRED_GUIDANCE}"))
+}
+
+/// What lists and reminders show for a deferred question: its headers.
+fn label(questions: &[AskedQuestion]) -> String {
+    let label = questions
+        .iter()
+        .map(|question| match question.header.trim() {
+            "" => question.question.trim(),
+            header => header,
+        })
+        .collect::<Vec<_>>()
+        .join(LABEL_SEPARATOR);
+    label[..label.floor_char_boundary(MAX_LABEL_BYTES)].to_owned()
+}
+
+/// Whether the main agent, the one the user is watching, made this call.
+/// Dispatch roots every call at its own id, or its batch's, unless an agent
+/// above spawned the agent that made it: then the root is that spawning call.
 pub(crate) fn asked_by_main_agent(ctx: &ToolContext) -> bool {
-    ctx.audience.contains(ToolAudience::MAIN) && ctx.root_tool_use_id.is_none()
+    ctx.audience.contains(ToolAudience::MAIN) && ctx.root_tool_use_id == ctx.local_root_tool_use_id
 }
 
 /// In a session with autopilot, a front end replies only to a form it shows,
@@ -423,8 +797,13 @@ mod tests {
     use std::sync::Arc;
 
     use caudra_config::PermissionsConfig;
-    use caudra_storage::autopilot::{AutopilotEnd, AutopilotStopper};
+    use caudra_storage::{
+        StateDir,
+        autopilot::{AutopilotEnd, AutopilotStopper},
+        background::JobKind,
+    };
     use serde_json::json;
+    use tempfile::TempDir;
     use test_case::test_case;
 
     use super::*;
@@ -432,10 +811,11 @@ mod tests {
         ActionName, AutopilotDecision, AutopilotHandle, DecisionKind, GatedProvider,
         ScriptedProvider, Step, engaged_handle,
     };
+    use crate::background::BackgroundTasks;
     use crate::permissions::PermissionManager;
     use crate::tools::test_support::{stub_ctx, stub_ctx_with_permissions};
     use crate::types::AutopilotEvent;
-    use crate::{AgentMode, Envelope, EventSender};
+    use crate::{AgentMode, Envelope, EventSender, StoredSession};
 
     const PICK: &str = "Pick one";
     const HEADER: &str = "Choice";
@@ -445,6 +825,7 @@ mod tests {
     const CWD: &str = "/tmp";
     const TOOL_USE_ID: &str = "toolu_question";
     const PARENT_CALL: &str = "toolu_task";
+    const BATCH_CALL: &str = "toolu_batch";
     const ANSWER_YES: &str =
         r#"{"action":"answer","reason":"the user asked for yes","answers":[["Yes"]]}"#;
     const ANSWER_EACH: &str =
@@ -467,6 +848,29 @@ mod tests {
     const OLD_SHAPE: &str = "a user's answer must keep the shape older sessions stored";
     const TAKEN_OVER: &str = "a human answering first must stand the delegate down";
     const SETTLED_BY_HUMAN: &str = "a recorded decision must settle with the human's answer";
+    const TASK_ID: &str = "question-task";
+    const MODEL: &str = "test-model";
+    const OFFERED: &str = "a form the agent waits on must let the user put it off";
+    const FULL: &str = "past the cap a form must not offer a way to put it off";
+    const NOT_DEFERRED: &str = "a refused deferral must open no question";
+    const CAP_IN_DESCRIPTION: &str = "the description must state the cap the tool enforces";
+
+    /// A session that runs background jobs, where a question can be deferred.
+    struct Jobs {
+        _temp: TempDir,
+        tasks: BackgroundTasks,
+    }
+
+    impl Jobs {
+        async fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let dir = StateDir::from_path(temp.path().to_owned());
+            let mut session = StoredSession::new(MODEL, temp.path().to_str().unwrap());
+            session.save(&dir).unwrap();
+            let tasks = BackgroundTasks::spawn(dir, session.id).await.unwrap();
+            Self { _temp: temp, tasks }
+        }
+    }
 
     /// A main-agent question context that answers on `replies` and reports on
     /// `events`, with `autopilot` on its session's permissions.
@@ -477,6 +881,22 @@ mod tests {
     }
 
     impl Asked {
+        fn deferring(jobs: &Jobs) -> Self {
+            let mut asked = Self::new(None);
+            asked.ctx.background = Some(jobs.tasks.clone());
+            asked
+        }
+
+        async fn delivery(&self) -> QuestionDelivery {
+            let AgentEvent::Question(event) = self
+                .next(|event| matches!(event, AgentEvent::Question(_)))
+                .await
+            else {
+                unreachable!("only a question is waited for");
+            };
+            event.delivery
+        }
+
         fn new(autopilot: Option<AutopilotHandle>) -> Self {
             let permissions = Arc::new(PermissionManager::new_nonpersistent(
                 PermissionsConfig::default(),
@@ -487,14 +907,23 @@ mod tests {
             let mut ctx = stub_ctx_with_permissions(&AgentMode::Build, permissions);
             let (raw_tx, events) = flume::unbounded();
             ctx.event_tx = EventSender::new(raw_tx, 0);
-            ctx.tool_use_id = Some(TOOL_USE_ID.into());
             let (replies, rx) = flume::unbounded();
             ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(rx)));
-            Self {
+            let mut asked = Self {
                 ctx,
                 events,
                 replies,
-            }
+            };
+            asked.call(TOOL_USE_ID);
+            asked
+        }
+
+        /// Makes the next ask call `id`, rooted the way dispatch roots a
+        /// main-agent call: at itself.
+        fn call(&mut self, id: &str) {
+            self.ctx.tool_use_id = Some(id.into());
+            self.ctx.root_tool_use_id = Some(id.into());
+            self.ctx.local_root_tool_use_id = Some(id.into());
         }
 
         fn ask(&self) -> ToolExecResult {
@@ -559,6 +988,7 @@ mod tests {
     fn call() -> Box<QuestionCall> {
         Box::new(QuestionCall {
             questions: vec![question(HEADER, false)],
+            background: false,
         })
     }
 
@@ -598,7 +1028,7 @@ mod tests {
         let answers = answers(result);
         assert_eq!(answers[0].labels, [YES], "{AUTOPILOT_WINS}");
         assert_eq!(answers[0].by, Answerer::Autopilot, "{AUTOPILOT_WINS}");
-        assert!(handle.question_claimed(), "{AUTOPILOT_WINS}");
+        assert!(handle.question_claimed(TOOL_USE_ID), "{AUTOPILOT_WINS}");
         let events = asked.autopilot_events();
         let [
             AutopilotEvent::Deciding {
@@ -657,7 +1087,10 @@ mod tests {
 
         let (result, ()) = asked.ask_with(async {
             let _running = started.recv_async().await.unwrap();
-            assert!(handle.claim_question(), "the human touched the form first");
+            assert!(
+                handle.claim_question(TOOL_USE_ID),
+                "the human touched the form first"
+            );
             release.send(ANSWER_YES).unwrap();
             assert_eq!(asked.decided().await.action, ActionName::Answer);
             asked.reply(&[NO]);
@@ -716,7 +1149,9 @@ mod tests {
             handle
         });
         let mut asked = Asked::new(handle);
-        asked.ctx.root_tool_use_id = parent.map(str::to_owned);
+        if let Some(parent) = parent {
+            asked.ctx.root_tool_use_id = Some(parent.to_owned());
+        }
 
         let (result, ()) = asked.ask_with(async {
             asked.asked().await;
@@ -947,6 +1382,7 @@ mod tests {
     fn a_dismissal_is_not_an_error_the_model_should_retry() {
         let call = QuestionCall {
             questions: vec![question(HEADER, false)],
+            background: false,
         };
         let result = call.report("not json");
         assert!(!result.is_error, "the user chose not to answer");
@@ -965,6 +1401,7 @@ mod tests {
         ctx.user_response_rx = interactive.then(|| Arc::new(async_lock::Mutex::new(response_rx)));
         let call = Box::new(QuestionCall {
             questions: vec![question(HEADER, false)],
+            background: false,
         });
         let result = smol::block_on(call.execute(&ctx));
         assert_eq!(result.failure, Some(expected));
@@ -974,6 +1411,7 @@ mod tests {
     fn answers_reach_the_model_as_text_and_the_reader_as_structure() {
         let call = QuestionCall {
             questions: vec![question(HEADER, false)],
+            background: false,
         };
         let result = call.report(&json!([[YES]]).to_string());
         assert_eq!(result.model_output.as_deref(), Some("Choice: Yes"));
@@ -1023,5 +1461,217 @@ mod tests {
     #[test]
     fn an_input_without_questions_reads_back_as_none() {
         assert!(asked_questions(&json!({})).is_empty());
+    }
+
+    fn deferred_call() -> Box<QuestionCall> {
+        Box::new(QuestionCall {
+            background: true,
+            ..*call()
+        })
+    }
+
+    fn text(result: ToolExecResult) -> String {
+        match result.output {
+            Ok(output) => output.as_text().to_string(),
+            Err(message) => message,
+        }
+    }
+
+    /// The question ID a deferral handed back, after checking it reads as one.
+    fn receipt_task(result: &ToolExecResult, lead: &str) -> String {
+        let Ok(ToolOutput::Tasks(cards)) = &result.output else {
+            panic!("a deferred question returns its receipt");
+        };
+        assert_eq!(cards[0].kind, JobKind::Question);
+        let guidance = result.model_suffix.as_deref().unwrap_or_default();
+        assert!(guidance.contains(lead), "{guidance}");
+        cards[0].task_id.clone()
+    }
+
+    #[test]
+    fn a_background_ask_returns_at_once_and_docks_its_form() {
+        smol::block_on(async {
+            let jobs = Jobs::new().await;
+            let asked = Asked::deferring(&jobs);
+
+            let result = deferred_call().execute(&asked.ctx).await;
+
+            let task_id = receipt_task(&result, DEFERRED_BY_AGENT);
+            assert_eq!(
+                asked.delivery().await,
+                QuestionDelivery::Deferred {
+                    task_id: task_id.clone(),
+                    docked: true
+                }
+            );
+            assert_eq!(jobs.tasks.open_questions(), 1);
+            jobs.tasks
+                .answer_question(&task_id, json!([[YES]]).to_string())
+                .unwrap();
+            jobs.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn a_form_the_user_puts_off_returns_a_receipt_and_waits_undocked() {
+        smol::block_on(async {
+            let jobs = Jobs::new().await;
+            let asked = Asked::deferring(&jobs);
+
+            let (result, deferred) = future::zip(call().execute(&asked.ctx), async {
+                assert_eq!(
+                    asked.delivery().await,
+                    QuestionDelivery::Deferrable,
+                    "{OFFERED}"
+                );
+                asked.replies.send(QUESTION_DEFERRED_REPLY.into()).unwrap();
+                asked.delivery().await
+            })
+            .await;
+
+            let task_id = receipt_task(&result, DEFERRED_BY_USER);
+            assert_eq!(
+                deferred,
+                QuestionDelivery::Deferred {
+                    task_id,
+                    docked: false
+                }
+            );
+            jobs.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn past_the_cap_a_question_can_neither_be_deferred_nor_put_off() {
+        smol::block_on(async {
+            let jobs = Jobs::new().await;
+            let mut asked = Asked::deferring(&jobs);
+            for index in 0..MAX_DEFERRED_QUESTIONS {
+                asked.call(&format!("{TOOL_USE_ID}-{index}"));
+                assert!(!deferred_call().execute(&asked.ctx).await.is_error);
+            }
+            asked.call(TOOL_USE_ID);
+
+            let refused = deferred_call().execute(&asked.ctx).await;
+            let (waited, ()) = future::zip(call().execute(&asked.ctx), async {
+                while asked.delivery().await != QuestionDelivery::Blocking {}
+                asked.reply(&[YES]);
+            })
+            .await;
+
+            assert_eq!(refused.failure, Some(ToolFailure::InvalidInput));
+            assert_eq!(text(refused), deferral_full());
+            assert_eq!(jobs.tasks.open_questions(), MAX_DEFERRED_QUESTIONS);
+            assert_eq!(answers(waited)[0].labels, [YES], "{FULL}");
+            jobs.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false, true, None ; "without_background_jobs")]
+    #[test_case(true, false, None ; "with_deferral_turned_off")]
+    #[test_case(true, true, Some(PARENT_CALL) ; "for_a_subagent")]
+    fn a_background_ask_where_none_can_be_deferred_is_refused(
+        with_jobs: bool,
+        enabled: bool,
+        parent: Option<&str>,
+    ) {
+        smol::block_on(async {
+            let jobs = Jobs::new().await;
+            let mut asked = Asked::new(None);
+            asked.ctx.background = with_jobs.then(|| jobs.tasks.clone());
+            asked.ctx.config.deferred_questions = enabled;
+            if let Some(parent) = parent {
+                asked.ctx.root_tool_use_id = Some(parent.to_owned());
+            }
+
+            let result = deferred_call().execute(&asked.ctx).await;
+
+            assert_eq!(result.failure, Some(ToolFailure::InvalidInput));
+            assert_eq!(text(result), DEFERRAL_UNAVAILABLE);
+            assert_eq!(jobs.tasks.open_questions(), 0, "{NOT_DEFERRED}");
+            jobs.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(TOOL_USE_ID, TOOL_USE_ID, true ; "a_main_agent_call_rooted_at_itself")]
+    #[test_case(BATCH_CALL, BATCH_CALL, true ; "a_main_agent_call_in_a_batch")]
+    #[test_case(PARENT_CALL, TOOL_USE_ID, false ; "a_subagent_call")]
+    #[test_case(PARENT_CALL, BATCH_CALL, false ; "a_subagent_call_in_a_batch")]
+    fn the_main_agent_is_told_apart_by_how_dispatch_roots_its_calls(
+        root: &str,
+        local_root: &str,
+        main: bool,
+    ) {
+        let mut asked = Asked::new(None);
+        asked.ctx.root_tool_use_id = Some(root.into());
+        asked.ctx.local_root_tool_use_id = Some(local_root.into());
+
+        assert_eq!(asked_by_main_agent(&asked.ctx), main);
+    }
+
+    #[test]
+    fn a_put_off_reply_to_a_form_that_offered_none_reads_as_a_dismissal() {
+        let asked = Asked::new(None);
+        asked.replies.send(QUESTION_DEFERRED_REPLY.into()).unwrap();
+
+        assert_eq!(text(asked.ask()), DISMISSED);
+    }
+
+    #[test_case(true ; "where_a_question_can_be_deferred")]
+    #[test_case(false ; "where_none_can")]
+    fn deferral_is_published_only_where_available(available: bool) {
+        let mut tools = json!([{
+            "name": QUESTION_TOOL_NAME,
+            "description": DESCRIPTION,
+            "input_schema": QuestionTool.schema(),
+        }]);
+
+        configure_deferral(&mut tools, !available);
+        configure_deferral(&mut tools, available);
+
+        let description = tools[0]["description"].as_str().unwrap();
+        assert_eq!(
+            description.matches(DEFERRAL_HEADING).count(),
+            usize::from(available)
+        );
+        assert_eq!(
+            tools[0]["input_schema"]["properties"]
+                .get(BACKGROUND_FIELD)
+                .is_some(),
+            available
+        );
+    }
+
+    #[test]
+    fn the_description_states_the_enforced_cap() {
+        assert!(
+            DESCRIPTION.contains(&format!("At most {MAX_DEFERRED_QUESTIONS} deferred")),
+            "{CAP_IN_DESCRIPTION}"
+        );
+    }
+
+    #[test]
+    fn a_delivered_answer_reads_back_without_its_closing() {
+        let questions = [question(HEADER, false)];
+        let answers = parse_answers(&questions, &json!([[YES]]).to_string()).unwrap();
+        let body = deferred_answers(&questions, answers).model_output.unwrap();
+
+        let answered = delivery_text(TASK_ID, ANSWERED_KIND, &body);
+        let withdrawn = delivery_text(TASK_ID, WITHDRAWN_KIND, WITHDRAWN);
+
+        assert_eq!(
+            deferred_answer(&answered),
+            Some(format!("{HEADER} — {PICK}: {YES}").as_str())
+        );
+        assert_eq!(deferred_answer(&withdrawn), None);
+    }
+
+    #[test]
+    fn a_label_names_each_question_and_stays_bounded() {
+        let named = label(&[question(HEADER, false), question("", false)]);
+        let long = label(&[question(&"é".repeat(MAX_LABEL_BYTES), false)]);
+
+        assert_eq!(named, format!("{HEADER}{LABEL_SEPARATOR}{PICK}"));
+        assert!(long.len() <= MAX_LABEL_BYTES);
     }
 }

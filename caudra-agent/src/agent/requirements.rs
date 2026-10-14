@@ -21,7 +21,9 @@ use tracing::warn;
 use super::compaction::COMPACTION_ANCHOR;
 use crate::cancel::CancelToken;
 use crate::tools::QUESTION_TOOL_NAME;
-use crate::tools::native::question::{answered_by_autopilot, asked_questions};
+use crate::tools::native::question::{
+    answered_by_autopilot, asked_questions, deferred_answer, deferred_receipt,
+};
 use crate::types::AskedQuestion;
 
 /// Long enough for a list over a long session, short enough that a stalled
@@ -103,9 +105,26 @@ impl RequirementsInput {
         let mut closing = None;
         let mut prior = None;
         let mut pending: HashMap<&str, Vec<AskedQuestion>> = HashMap::new();
+        let mut deferred: HashMap<&str, Vec<AskedQuestion>> = HashMap::new();
         let mut last_agent: Option<&str> = None;
         for item in items {
             match &item.kind {
+                HistoryItemKind::User {
+                    text,
+                    origin: UserOrigin::Observation,
+                    task_event: Some(origin),
+                    ..
+                } => {
+                    if let Some(answers) = deferred_answer(text)
+                        && !answered_by_autopilot(answers)
+                        && let Some(questions) = deferred.remove(origin.task_id.as_str())
+                    {
+                        entries.push(Entry::Answered {
+                            questions,
+                            answers: answers.trim().to_owned(),
+                        });
+                    }
+                }
                 HistoryItemKind::User {
                     text,
                     display_text,
@@ -149,9 +168,12 @@ impl RequirementsInput {
                     is_error: false,
                     ..
                 } => {
-                    if let Some(questions) = pending.remove(call_id.as_str())
-                        && !answered_by_autopilot(content)
-                    {
+                    let Some(questions) = pending.remove(call_id.as_str()) else {
+                        continue;
+                    };
+                    if let Some(task_id) = deferred_receipt(content) {
+                        deferred.insert(task_id, questions);
+                    } else if !answered_by_autopilot(content) {
                         entries.push(Entry::Answered {
                             questions,
                             answers: content.trim().to_owned(),
@@ -494,12 +516,15 @@ mod tests {
     use caudra_providers::provider::BoxFuture;
     use caudra_providers::{
         AssistantTextState, CacheKey, CaudraId, ContentBlock, ModelInfo, Role, StreamResponse,
+        TaskEventOrigin,
     };
     use serde_json::json;
     use test_case::test_case;
 
     use super::*;
-    use crate::tools::native::question::AUTOPILOT_ANSWERED;
+    use crate::tools::native::question::{
+        ANSWERED_KIND, AUTOPILOT_ANSWERED, WITHDRAWN_KIND, delivery_text,
+    };
 
     const FIRST: &str = "add a /extract command";
     const SECOND: &str = "default it to the fast model";
@@ -516,6 +541,13 @@ mod tests {
     const PREFILL_TOTAL: u32 = 4_000;
     const PREFILL_CACHE: u32 = 900;
     const NOT_THE_USERS: &str = "autopilot's answer must never pass for the user's words";
+    const DEFERRED_TASK: &str = "question-1";
+    const OTHER_TASK: &str = "question-2";
+    const DEFERRED_RECEIPT: &str =
+        "The question is deferred.\n<task_metadata>\ntask_id: question-1\n</task_metadata>";
+    const INVOCATION: &str = "invocation-1";
+    const EVENT: &str = "event-1";
+    const PAIRED_LATER: &str = "a deferred answer must pair with the question it answers";
 
     fn item(kind: HistoryItemKind) -> HistoryItem {
         HistoryItem {
@@ -888,6 +920,68 @@ mod tests {
             !input.transcript(&model_with_window(WIDE)).contains(ANSWER),
             "{NOT_THE_USERS}"
         );
+    }
+
+    /// A settled deferred question, as background delivery hands it over.
+    fn delivered(task_id: &str, kind: &str, body: &str) -> HistoryItem {
+        let mut delivered = user(
+            &delivery_text(task_id, kind, body),
+            None,
+            UserOrigin::Observation,
+        );
+        if let HistoryItemKind::User { task_event, .. } = &mut delivered.kind {
+            *task_event = Some(TaskEventOrigin {
+                task_id: task_id.to_owned(),
+                invocation_id: INVOCATION.to_owned(),
+                event_id: EVENT.to_owned(),
+            });
+        }
+        delivered
+    }
+
+    #[test]
+    fn a_deferred_answer_pairs_with_the_question_it_answers() {
+        let items = [
+            turn(FIRST),
+            question_call(CALL),
+            result(CALL, DEFERRED_RECEIPT, false),
+            turn(SECOND),
+            delivered(DEFERRED_TASK, ANSWERED_KIND, ANSWER),
+        ];
+
+        let input = RequirementsInput::from_items(&items);
+
+        assert_eq!(input.answers(), 1, "{PAIRED_LATER}");
+        let transcript = input.transcript(&model_with_window(WIDE));
+        assert!(
+            transcript.contains(&format!("[question]\n{HEADER}: {QUESTION}")),
+            "{transcript}"
+        );
+        assert!(
+            transcript.ends_with(&format!("[answer]\n{ANSWER}")),
+            "{transcript}"
+        );
+    }
+
+    #[test_case(DEFERRED_TASK, WITHDRAWN_KIND, ANSWER ; "a_withdrawn_question")]
+    #[test_case(OTHER_TASK, ANSWERED_KIND, ANSWER ; "an_answer_to_another_question")]
+    #[test_case(DEFERRED_TASK, ANSWERED_KIND, &format!("{AUTOPILOT_ANSWERED}\n{ANSWER}") ; "autopilots_answer")]
+    fn a_deferred_question_without_the_users_answer_is_not_one(
+        task_id: &str,
+        kind: &str,
+        body: &str,
+    ) {
+        let items = [
+            turn(FIRST),
+            question_call(CALL),
+            result(CALL, DEFERRED_RECEIPT, false),
+            delivered(task_id, kind, body),
+        ];
+
+        let input = RequirementsInput::from_items(&items);
+
+        assert_eq!(input.answers(), 0);
+        assert!(!input.transcript(&model_with_window(WIDE)).contains(ANSWER));
     }
 
     #[test]

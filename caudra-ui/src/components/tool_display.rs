@@ -94,7 +94,7 @@ pub(crate) fn task_details(task: &TaskCard) -> String {
         lines.push(format!("Full outcome: tool_output {}", reference.id));
     } else if task.result_truncated || task.reports_truncated {
         lines.push(
-            if task.kind == JobKind::Shell {
+            if task.kind != JobKind::Agent {
                 "Output preview is truncated."
             } else {
                 "Open task chat for complete output."

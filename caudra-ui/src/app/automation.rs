@@ -225,7 +225,7 @@ impl App {
 
     /// The status peers see: held messages count as needing input, a ready plan does not.
     fn automation_status(&self, held_messages: bool) -> SessionStatus {
-        if held_messages || self.awaiting_input() {
+        if held_messages || self.needs_input() {
             SessionStatus::NeedsInput
         } else if self.status == Status::Streaming || self.waiting_for_background() {
             SessionStatus::Working

@@ -238,6 +238,8 @@ impl FormElicitor {
                     message,
                     url,
                 }),
+                call_id: self.tool_use_id.clone(),
+                ..QuestionEvent::default()
             })));
         Shown(Some(&self.event_tx))
     }
@@ -310,6 +312,7 @@ mod tests {
     const URL: &str = "https://example.com/authorize";
     const CWD: &str = "/tmp";
     const PARENT_CALL: &str = "toolu_task";
+    const MCP_CALL: &str = "toolu_mcp";
     const UNREADABLE_REPLY: &str = "not a reply";
     const STRING_TYPE: &str = "string";
     const INTEGER_TYPE: &str = "integer";
@@ -369,6 +372,7 @@ cat >/dev/null
             let mut ctx = stub_ctx_with_permissions(&AgentMode::Build, permissions);
             let (raw_tx, events) = flume::unbounded();
             ctx.event_tx = EventSender::new(raw_tx, 0);
+            ctx.tool_use_id = Some(MCP_CALL.into());
             let (replies, rx) = flume::unbounded();
             ctx.user_response_rx = Some(Arc::new(Mutex::new(rx)));
             Self {
@@ -671,7 +675,7 @@ cat >/dev/null
         assert_eq!(response.action, ElicitAction::Accept);
         assert_eq!(response.by, Answerer::Autopilot);
         assert_eq!(response.content, content(BRANCH, json!(MAIN)));
-        assert!(handle.question_claimed());
+        assert!(handle.question_claimed(MCP_CALL));
         assert!(!session.closed(), "{CLOSED_TWICE}");
     }
 

@@ -38,7 +38,7 @@ use crate::{
         task_runner::{PreparedTask, TaskOutcome, TaskRequest},
     },
     background_reminder::{RuntimeHealth, RuntimeSnapshot},
-    tools::{Deadline, ToolContext},
+    tools::{Deadline, ToolContext, native::question},
     types::{BACKGROUND_EVENT_RUN_ID, task_output_access},
 };
 
@@ -65,6 +65,8 @@ const TASK_SETTLING: &str = "task failure is still settling; try again after set
 const EMPTY_CONTINUATION: &str = "a task continuation requires a non-empty follow-up";
 const RETRY_MISMATCH: &str = "task retry differs from the admitted request";
 const INTERRUPTED: &str = "Execution interrupted by session shutdown or crash; effects may require reconciliation before explicit resume.";
+const QUESTION_INTERRUPTED: &str =
+    "The session closed before the user answered; ask again if you still need the answer.";
 const TASK_SYNC: &str = "task_execution = sync requires completed task results";
 const TASK_ASYNC: &str = "task_execution = async requires task admission receipts";
 const TASK_PROMOTION: &str = "task promotion requires task_execution = auto and an agent task";
@@ -83,8 +85,8 @@ mod jobs;
 mod shells;
 mod work;
 
-pub use caudra_storage::background::ShellJobMetadata;
-pub use jobs::JobScope;
+pub use caudra_storage::background::{QuestionJobMetadata, ShellJobMetadata};
+pub use jobs::{JobScope, MAX_DEFERRED_QUESTIONS};
 pub use shells::{ShellExecutions, ShellLive, ShellOutputView, ShellSnapshot, ShellView};
 pub use work::SessionWork;
 
@@ -128,8 +130,8 @@ impl TaskCard {
             kind: record.kind(),
             owner: record.owner.clone(),
             shell: match &record.payload {
-                JobPayload::Agent => None,
                 JobPayload::Shell(metadata) => Some(Box::new(metadata.clone())),
+                JobPayload::Agent | JobPayload::Question(_) => None,
             },
             task_id: record.task_id.clone(),
             invocation_id: record.invocation_id.clone(),
@@ -190,6 +192,8 @@ struct State {
     cancels: BTreeMap<String, CancelTrigger>,
     claims: HashMap<String, u64>,
     next_claim: u64,
+    /// Where the user's answer to each open deferred question goes, by task id.
+    answers: HashMap<String, flume::Sender<String>>,
     generation: u64,
     open: bool,
     pending_stops: usize,
@@ -406,8 +410,12 @@ impl BackgroundTasks {
                 for record in &mut records {
                     let retry = RuntimeRetry::new(None, &|| false);
                     if record.active() {
+                        let error = match record.kind() {
+                            JobKind::Question => QUESTION_INTERRUPTED,
+                            JobKind::Agent | JobKind::Shell => INTERRUPTED,
+                        };
                         record.state = "interrupted".into();
-                        record.outcome = Some(json!({"error": INTERRUPTED}));
+                        record.outcome = Some(json!({"error": error}));
                         record.output_ref = None;
                     }
                     if record.output_ref.is_none()
@@ -471,6 +479,7 @@ impl BackgroundTasks {
                 cancels: BTreeMap::new(),
                 claims: HashMap::new(),
                 next_claim: 0,
+                answers: HashMap::new(),
                 generation,
                 open: true,
                 pending_stops: 0,
@@ -1107,7 +1116,7 @@ impl BackgroundTasks {
                     && record.request.get("call_id").and_then(Value::as_str)
                         == Some(child.parent_tool_use_id.as_str())
             }),
-            (JobPayload::Shell(_), JobOwner::Main, None) => true,
+            (JobPayload::Shell(_) | JobPayload::Question(_), JobOwner::Main, None) => true,
             (JobPayload::Shell(_), JobOwner::Child { invocation_id }, Some(child)) => {
                 record
                     .request
@@ -1193,10 +1202,11 @@ impl BackgroundTasks {
             .into_values()
             .filter(|record| record.background && record.active())
         {
-            let execution = match record.state.as_str() {
-                "queued" => "queued",
-                "running" => "running",
-                "cancelling" => "cancelling",
+            let execution = match (record.kind(), record.state.as_str()) {
+                (JobKind::Question, "queued" | "running") => "awaiting answer",
+                (_, "queued") => "queued",
+                (_, "running") => "running",
+                (_, "cancelling") => "cancelling",
                 _ => continue,
             };
             let label = record
@@ -1207,6 +1217,7 @@ impl BackgroundTasks {
             let kind = match record.kind() {
                 JobKind::Agent => "task",
                 JobKind::Shell => "shell",
+                JobKind::Question => "question",
             };
             snapshot.add(kind, &record.task_id, execution, label, None);
         }
@@ -1390,14 +1401,13 @@ impl BackgroundTasks {
             .collect::<Vec<_>>();
         events.sort_by_key(|(_, event)| event.sequence);
         for (record, event) in events {
-            let kind = if event.terminal {
-                match record.state.as_str() {
-                    "succeeded" => "success",
-                    "failed" => "failure",
-                    state => state,
-                }
-            } else {
-                "report"
+            let kind = match (event.terminal, record.kind(), record.state.as_str()) {
+                (false, ..) => "report",
+                (true, JobKind::Question, "succeeded") => question::ANSWERED_KIND,
+                (true, JobKind::Question, "cancelled") => question::WITHDRAWN_KIND,
+                (true, _, "succeeded") => "success",
+                (true, _, "failed") => "failure",
+                (true, _, state) => state,
             };
             let body = if event.terminal {
                 record.outcome.as_ref().map(outcome_text)
@@ -1427,6 +1437,7 @@ impl BackgroundTasks {
                         record.task_id
                     )
                 }
+                JobPayload::Question(_) => question::delivery_text(&record.task_id, kind, &body),
                 JobPayload::Agent => {
                     let ran_on = match event.terminal {
                         true => ran_on(record.outcome.as_ref()),
@@ -1910,9 +1921,10 @@ impl BackgroundTasks {
             TaskIdentity::Derive => return Err("task identity was not reserved".into()),
         };
         if let Some(prior) = self.prior_record(&task_id, None, &admission).await? {
-            if prior.kind() == JobKind::Shell {
+            if prior.kind() != JobKind::Agent {
                 return Err(
-                    "shell jobs cannot be resumed as agent tasks; issue a new shell call".into(),
+                    "shell jobs and questions cannot be resumed as agent tasks; issue a new call"
+                        .into(),
                 );
             }
             if !request.task.is_continuation() {

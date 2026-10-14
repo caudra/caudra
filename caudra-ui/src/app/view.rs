@@ -822,6 +822,7 @@ impl App {
             decisions_offline: self.permissions.decisions().is_some_and(|decisions| {
                 decisions.config().base_url.is_some() && decisions.status().reachable == Some(false)
             }),
+            waiting_questions: self.waiting_question_count(),
             config_problems: &config_problems,
             pending_trust,
             restoring: self.restoring.load(Ordering::Relaxed),

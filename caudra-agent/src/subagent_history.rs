@@ -551,7 +551,7 @@ fn task_output_history_versions(
     }
 }
 
-fn metadata_task_id(output: &str) -> Option<&str> {
+pub(crate) fn metadata_task_id(output: &str) -> Option<&str> {
     output
         .rsplit_once("<task_metadata>")?
         .1

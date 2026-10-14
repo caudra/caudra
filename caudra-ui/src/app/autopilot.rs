@@ -502,12 +502,15 @@ impl App {
     /// The first touch on a question form autopilot is deciding takes it,
     /// and keeps its own effect: the form does not change under it.
     pub(super) fn claim_question_form(&mut self) {
+        self.question_form.touch();
+        let key = self.question_form.call_id().unwrap_or_default();
         if self.question_form.autopilot_note() == Some(&AutopilotNote::Deciding)
-            && self.state.autopilot.claim_question()
+            && self.state.autopilot.claim_question(key)
         {
             self.question_form.set_autopilot_note(None);
+            let claimed = self.claimed_question_decisions();
             self.autopilot_deciding
-                .retain(|(_, kind)| *kind != DecisionKind::Question);
+                .retain(|(seq, _)| !claimed.contains(seq));
         }
     }
 
@@ -534,10 +537,18 @@ impl App {
 
     /// A decision the run's end cut off is never made, so its card stops
     /// saying autopilot is deciding it.
+    /// A deferred question's decision outlives the run, as its job does.
     pub(super) fn autopilot_run_ended(&mut self) {
-        for (_, kind) in mem::take(&mut self.autopilot_deciding) {
+        for (seq, kind) in mem::take(&mut self.autopilot_deciding) {
             match kind {
-                DecisionKind::Question => self.question_form.set_autopilot_note(None),
+                DecisionKind::Question if self.decides_deferred_question(seq) => {
+                    self.autopilot_deciding.push((seq, kind));
+                }
+                DecisionKind::Question => {
+                    if let Some(form) = self.decided_question(seq) {
+                        form.set_autopilot_note(None);
+                    }
+                }
                 DecisionKind::Plan => self.plan_form.set_autopilot_note(None),
                 _ => {}
             }
@@ -645,7 +656,11 @@ impl App {
         let deciding = Some(AutopilotNote::Deciding);
         match kind {
             DecisionKind::Permission => return,
-            DecisionKind::Question => self.question_form.set_autopilot_note(deciding),
+            DecisionKind::Question => {
+                if let Some(form) = self.decided_question(seq) {
+                    form.set_autopilot_note(deciding);
+                }
+            }
             DecisionKind::Plan => self.plan_form.set_autopilot_note(deciding),
             DecisionKind::Reply | DecisionKind::Review | DecisionKind::SecondOpinion => {}
         }
@@ -669,12 +684,14 @@ impl App {
             });
         match decision.kind {
             DecisionKind::Question if left_to_you.is_none() => {
-                self.discard_question_btw();
-                self.question_form.close();
-                self.question_subagent = None;
-                self.task_interactions.question = None;
+                self.close_decided_question(decision.seq);
             }
-            DecisionKind::Question => self.question_form.set_autopilot_note(left_to_you),
+            DecisionKind::Question => {
+                if let Some(form) = self.decided_question(decision.seq) {
+                    form.set_autopilot_note(left_to_you);
+                }
+                self.forget_question_decision(decision.seq);
+            }
             DecisionKind::Plan => {
                 self.autopilot_plan_escalation = left_to_you.is_some().then_some(decision.seq);
                 self.plan_form.set_autopilot_note(left_to_you);
@@ -719,7 +736,12 @@ impl App {
             return;
         };
         match self.autopilot_deciding.remove(index).1 {
-            DecisionKind::Question => self.question_form.set_autopilot_note(None),
+            DecisionKind::Question => {
+                if let Some(form) = self.decided_question(seq) {
+                    form.set_autopilot_note(None);
+                }
+                self.forget_question_decision(seq);
+            }
             DecisionKind::Plan => self.plan_form.set_autopilot_note(None),
             DecisionKind::Permission
             | DecisionKind::Reply
