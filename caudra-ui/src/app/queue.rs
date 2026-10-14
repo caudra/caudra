@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::mem;
 use std::ops::Range;
 
+use caudra_agent::autopilot::ActionName;
 use caudra_agent::{AgentInput, AgentMode};
 use caudra_agent::{PromptAdmission, QueueDelivery, QueueItemId, is_run_failure_marker};
 use caudra_automation::event::StartedBy;
@@ -1078,6 +1079,9 @@ impl App {
             }
             self.state.autopilot.drop_goal_ownership();
             self.flash(GOAL_SET.into());
+        }
+        if submission.input.mode.is_planning() && self.state.plan.is_ready() {
+            self.answer_plan_escalation(ActionName::Revise);
         }
         if deferred {
             if admission == PromptAdmission::Interrupt {

@@ -17,7 +17,9 @@ use std::time::Instant;
 
 use caudra_agent::automation::clock::SystemClock;
 use caudra_agent::automation::handle::AutomationHandle;
-use caudra_agent::autopilot::{AutopilotDecision, AutopilotHandle, DecisionKind};
+use caudra_agent::autopilot::{
+    AutopilotDecision, AutopilotHandle, DecisionKind, EngagementSpend, StoodDown,
+};
 use caudra_agent::background::BackgroundTasks;
 use caudra_agent::decisions::DecisionNote;
 use caudra_agent::headless::{
@@ -53,13 +55,16 @@ use caudra_providers::{
     ImageSource, Message, StopReason, ThinkingConfig, Timeouts, TokenUsage, WorkflowEventOrigin,
     add_cost,
 };
-use caudra_storage::autopilot::{AutopilotEnd, AutopilotStopper, StoredAutopilot};
-use caudra_storage::id::SessionRef;
+use caudra_storage::autopilot::{
+    AutopilotEnd, AutopilotStopper, DecisionOutcome, DecisionPayload, StoredAutopilot,
+    StoredAutopilotDecision, StoredAutopilotEngagement,
+};
+use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::permission_state::PermissionRuleRecord;
 use caudra_storage::sessions::{
-    PermissionMode as StoredPermissionMode, SessionError, SessionLease, StoredMode,
-    StoredPlanTarget, StoredSubagentTaskSpec,
+    PermissionMode as StoredPermissionMode, SessionDatabase, SessionError, SessionLease,
+    StoredMode, StoredPlanTarget, StoredSubagentTaskSpec, StoredTokenUsage,
 };
 use caudra_storage::tool_outputs::{ToolOutputRef, ToolOutputStore};
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
@@ -125,9 +130,17 @@ const DECISION_SYSTEM_SUBTYPE: &str = "decision";
 const AUTOPILOT_START: &str = "autopilot_start";
 const AUTOPILOT_STOP: &str = "autopilot_stop";
 const AUTOPILOT_STATUS: &str = "autopilot_status";
+const AUTOPILOT_LOG: &str = "autopilot_log";
 /// Every `control_request` subtype autopilot answers, as the init message
 /// advertises them while `experimental.autopilot` is on.
-const AUTOPILOT_CONTROLS: &[&str] = &[AUTOPILOT_START, AUTOPILOT_STOP, AUTOPILOT_STATUS];
+const AUTOPILOT_CONTROLS: &[&str] = &[
+    AUTOPILOT_START,
+    AUTOPILOT_STOP,
+    AUTOPILOT_STATUS,
+    AUTOPILOT_LOG,
+];
+const AUTOPILOT_LOG_DEFAULT_LIMIT: usize = 100;
+const AUTOPILOT_LOG_MAX_LIMIT: usize = 500;
 const AUTOPILOT_ENGAGED: &str = "engaged";
 const AUTOPILOT_ENDED: &str = "ended";
 const NO_AUTOPILOT: &str = "none";
@@ -596,13 +609,25 @@ struct GoalSetRequest {
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum AutopilotSystemPayload<'a> {
-    Engaged,
+    Engaged {
+        engagement: u32,
+        goal: Option<&'a str>,
+    },
     Deciding {
         decision: DecidingReport<'a>,
     },
     /// An escalation is a decision whose action is `escalate`.
     Decided {
         decision: &'a AutopilotDecision,
+    },
+    /// A decision that started and never produced an answer.
+    StoodDown {
+        decision: &'a StoodDown,
+    },
+    /// What became of a decision after it was recorded.
+    Settled {
+        seq: u32,
+        outcome: &'a DecisionOutcome,
     },
     Retrying {
         attempt: u32,
@@ -612,6 +637,9 @@ pub(crate) enum AutopilotSystemPayload<'a> {
     },
     Ended {
         end: &'a AutopilotEnd,
+        engagement: u32,
+        #[serde(flatten)]
+        spend: &'a EngagementSpend,
     },
 }
 
@@ -628,7 +656,10 @@ impl<'a> AutopilotSystemPayload<'a> {
     /// `None` for the implement handoff, which the session acts on itself.
     pub(crate) fn from_event(event: &'a AutopilotEvent) -> Option<Self> {
         Some(match event {
-            AutopilotEvent::Engaged => Self::Engaged,
+            AutopilotEvent::Engaged { engagement, goal } => Self::Engaged {
+                engagement: *engagement,
+                goal: goal.as_deref(),
+            },
             AutopilotEvent::Deciding { seq, kind, subject } => Self::Deciding {
                 decision: DecidingReport {
                     seq: *seq,
@@ -637,6 +668,8 @@ impl<'a> AutopilotSystemPayload<'a> {
                 },
             },
             AutopilotEvent::Decided(decision) => Self::Decided { decision },
+            AutopilotEvent::StoodDown(decision) => Self::StoodDown { decision },
+            AutopilotEvent::Settled { seq, outcome } => Self::Settled { seq: *seq, outcome },
             AutopilotEvent::Retrying {
                 attempt,
                 limit,
@@ -648,7 +681,15 @@ impl<'a> AutopilotSystemPayload<'a> {
                 delay_ms: *delay_ms,
                 error,
             },
-            AutopilotEvent::Ended { reason } => Self::Ended { end: reason },
+            AutopilotEvent::Ended {
+                reason,
+                engagement,
+                spend,
+            } => Self::Ended {
+                end: reason,
+                engagement: *engagement,
+                spend,
+            },
             AutopilotEvent::ImplementPlan { .. } => return None,
         })
     }
@@ -680,6 +721,120 @@ struct AutopilotLimits {
 struct AutopilotStartRequest {
     goal: Option<String>,
     kickoff: Option<bool>,
+}
+
+/// A client's page of the autopilot log: the decisions made in `engagement`
+/// and before seq `before`, when given. `limit` defaults to
+/// [`AUTOPILOT_LOG_DEFAULT_LIMIT`] and is clamped to
+/// `1..=`[`AUTOPILOT_LOG_MAX_LIMIT`].
+#[derive(Deserialize)]
+struct AutopilotLogRequest {
+    engagement: Option<u32>,
+    before: Option<u64>,
+    limit: Option<usize>,
+}
+
+impl AutopilotLogRequest {
+    fn page_size(&self) -> usize {
+        self.limit
+            .unwrap_or(AUTOPILOT_LOG_DEFAULT_LIMIT)
+            .clamp(1, AUTOPILOT_LOG_MAX_LIMIT)
+    }
+}
+
+/// What `autopilot_log` answers. Both lists run newest first, and
+/// `next_before` is the `before` that asks for the next page, `null` on the
+/// last one.
+#[derive(Serialize)]
+struct AutopilotLogReply<'a> {
+    engagements: Vec<LoggedEngagement<'a>>,
+    decisions: Vec<LoggedDecision<'a>>,
+    next_before: Option<u64>,
+}
+
+/// One decision as the session keeps it. `action` is `null` on one autopilot
+/// stood down from, and `engagement`, `item`, `payload` and `outcome` are
+/// `null` on one recorded before the log kept them.
+#[derive(Serialize)]
+struct LoggedDecision<'a> {
+    seq: u64,
+    at_ms: u64,
+    kind: &'a str,
+    action: Option<&'a str>,
+    subject: &'a str,
+    reason: &'a str,
+    agent: Option<&'a str>,
+    tool_use_id: Option<&'a str>,
+    history_len: usize,
+    model: Option<&'a str>,
+    usage: Option<&'a StoredTokenUsage>,
+    cost: Option<f64>,
+    engagement: Option<u32>,
+    item: Option<&'a str>,
+    payload: Option<&'a DecisionPayload>,
+    outcome: Option<&'a DecisionOutcome>,
+}
+
+impl<'a> From<&'a StoredAutopilotDecision> for LoggedDecision<'a> {
+    fn from(decision: &'a StoredAutopilotDecision) -> Self {
+        Self {
+            seq: decision.seq,
+            at_ms: decision.at_ms,
+            kind: &decision.kind,
+            action: decision.action.as_deref(),
+            subject: &decision.subject,
+            reason: &decision.reason,
+            agent: decision.agent.as_deref(),
+            tool_use_id: decision.tool_use_id.as_deref(),
+            history_len: decision.history_len,
+            model: decision.model.as_deref(),
+            usage: decision.usage.as_ref(),
+            cost: decision.cost,
+            engagement: decision.engagement,
+            item: decision.item.as_deref(),
+            payload: decision.payload.as_ref(),
+            outcome: decision.outcome.as_ref(),
+        }
+    }
+}
+
+/// One engagement as the session keeps it. `ended_at_ms`,
+/// `ended_history_len` and `end` are `null` while it runs.
+#[derive(Serialize)]
+struct LoggedEngagement<'a> {
+    engagement: u32,
+    engaged_at_ms: u64,
+    engaged_history_len: usize,
+    goal: Option<&'a str>,
+    owns_goal: bool,
+    ended_at_ms: Option<u64>,
+    ended_history_len: Option<usize>,
+    end: Option<&'a AutopilotEnd>,
+    continuations: u32,
+    cost_usd: f64,
+    subscription_cost_usd: f64,
+    elapsed_ms: u64,
+    retries: u32,
+}
+
+impl<'a> From<&'a StoredAutopilotEngagement> for LoggedEngagement<'a> {
+    fn from(engagement: &'a StoredAutopilotEngagement) -> Self {
+        Self {
+            engagement: engagement.engagement,
+            engaged_at_ms: engagement.engaged_at_ms,
+            engaged_history_len: engagement.engaged_history_len,
+            goal: engagement.goal.as_deref(),
+            owns_goal: engagement.owns_goal,
+            ended_at_ms: engagement.ended_at_ms,
+            ended_history_len: engagement.ended_history_len,
+            end: engagement.end.as_ref(),
+            continuations: engagement.continuations,
+            cost_usd: engagement.cost_usd,
+            subscription_cost_usd: engagement.subscription_cost_usd,
+            elapsed_ms: engagement.elapsed_ms,
+            retries: engagement.retries,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1059,10 +1214,8 @@ impl SdkWriter {
     }
 
     fn emit_answer(&self, request_id: &str, answer: Result<Value, String>) -> Result<()> {
-        match answer {
-            Ok(response) => self.emit_control_response(request_id, Some(response), None),
-            Err(error) => self.emit_control_response(request_id, None, Some(error)),
-        }
+        let (response, error) = control_reply(answer);
+        self.emit_control_response(request_id, response, error)
     }
 
     /// A firing goes out once it has ended, a notice as its script sent it.
@@ -1892,8 +2045,7 @@ fn resolve_session(
     }
 
     let summaries = if let Some(binding) = workspace_binding {
-        caudra_storage::sessions::SessionDatabase::open_state(&storage)?
-            .list_for_workspace_identity(binding)?
+        SessionDatabase::open_state(&storage)?.list_for_workspace_identity(binding)?
     } else {
         StoredSession::list(cwd, &storage)?
     };
@@ -2434,6 +2586,7 @@ fn handle_control_request(
             &cr.request_id,
             session_autopilot(handle).and_then(autopilot_status),
         ),
+        AUTOPILOT_LOG => answer_autopilot_log(writer, &cr.request_id, &cr.request.extra, handle),
         other => {
             if let Some(request) = automation_request(other, &cr.request.extra) {
                 return answer_automation_control(
@@ -2623,6 +2776,73 @@ fn autopilot_status(autopilot: &AutopilotHandle) -> Result<Value, String> {
     .map_err(|error| error.to_string())
 }
 
+/// `autopilot_log` for a client, engaged or not. The log is read off the
+/// control thread, so a busy database never holds up the session's input.
+fn answer_autopilot_log(
+    writer: &SdkWriter,
+    request_id: &str,
+    extra: &Value,
+    handle: &InteractiveHandle,
+) -> Result<()> {
+    let request = session_autopilot(handle).and_then(|_| {
+        AutopilotLogRequest::deserialize(extra).map_err(|error| format!("{AUTOPILOT_LOG}: {error}"))
+    });
+    let request = match request {
+        Ok(request) => request,
+        Err(error) => return writer.emit_control_response(request_id, None, Some(error)),
+    };
+    let state_dir = handle.state_dir.clone();
+    let session_id = handle.session_id.id();
+    forward_control(
+        writer,
+        request_id,
+        smol::unblock(move || {
+            autopilot_log(&state_dir, session_id, &request)
+                .map_err(|error| format!("{AUTOPILOT_LOG}: {error}"))
+        }),
+        control_reply,
+    );
+    Ok(())
+}
+
+/// One page of the session's decisions, newest first, beside the
+/// engagements the request covers.
+fn autopilot_log(
+    state_dir: &StateDir,
+    session_id: CaudraId,
+    request: &AutopilotLogRequest,
+) -> Result<Value> {
+    let limit = request.page_size();
+    let database = SessionDatabase::open_read_only(state_dir)?;
+    let mut decisions = database.page_autopilot_decisions(
+        session_id,
+        request.engagement,
+        request.before,
+        limit + 1,
+    )?;
+    let next_before = if decisions.len() > limit {
+        decisions.truncate(limit);
+        decisions.last().map(|decision| decision.seq)
+    } else {
+        None
+    };
+    let mut engagements = database.load_autopilot_engagements(session_id)?;
+    engagements.retain(|stored| {
+        request
+            .engagement
+            .is_none_or(|engagement| engagement == stored.engagement)
+    });
+    Ok(serde_json::to_value(AutopilotLogReply {
+        engagements: engagements
+            .iter()
+            .rev()
+            .map(LoggedEngagement::from)
+            .collect(),
+        decisions: decisions.iter().map(LoggedDecision::from).collect(),
+        next_before,
+    })?)
+}
+
 /// `/goal clear`: the active goal stops, and a finished one stays on record.
 /// An engaged autopilot stays, without a goal of its own.
 fn goal_clear(goal: &GoalHandle, autopilot: Option<&AutopilotHandle>) -> Result<Value, String> {
@@ -2763,6 +2983,14 @@ fn workflow_request(subtype: &str, extra: &Value) -> Option<Result<WorkflowReque
         _ => return None,
     };
     Some(request)
+}
+
+/// A control's answer as the response or the error its reply carries.
+fn control_reply(answer: Result<Value, String>) -> (Option<Value>, Option<String>) {
+    match answer {
+        Ok(response) => (Some(response), None),
+        Err(error) => (None, Some(error)),
+    }
 }
 
 /// Answers off the stdin thread: a workflow pause or stop waits for the run's
@@ -3695,9 +3923,8 @@ mod tests {
     use caudra_automation::snapshot::{ErrorView, FiringStatus, StateOutcome};
     use caudra_providers::{AutopilotOrigin, ContentBlock, Message, Role, TaskEventOrigin};
     use caudra_storage::background::{JobPayload, ShellJobMetadata, TaskRecord};
-    use caudra_storage::id::CaudraId;
     use caudra_storage::sessions::{
-        SessionDatabase, StoredAutomationControls, StoredDeliveryBackoff, StoredUnattendedTurns,
+        StoredAutomationControls, StoredDeliveryBackoff, StoredUnattendedTurns,
     };
     use caudra_storage::usage_ledger::LedgerPurpose;
     use caudra_workflow::{RunSnapshot, RunStatus, RunUsage, SourceKind};
@@ -6628,8 +6855,12 @@ mod tests {
         automations: Option<AutomationHandle>,
     ) -> InteractiveHandle {
         let lease = Arc::new(SessionLease::acquire(state_dir, session_id).unwrap());
-        let mut session =
-            InteractiveHandle::for_test(lease, permission_manager(), flume::unbounded().0);
+        let mut session = InteractiveHandle::for_test(
+            state_dir.clone(),
+            lease,
+            permission_manager(),
+            flume::unbounded().0,
+        );
         session.automations = automations;
         session
     }
@@ -7398,6 +7629,7 @@ mod tests {
     }
 
     const AUTOPILOT_SEQ: u32 = 7;
+    const AUTOPILOT_ENGAGEMENT: u32 = 1;
     const AUTOPILOT_SUBJECT: &str = "cargo test";
     const AUTOPILOT_REASON: &str = "the tests only read the tree";
     const AUTOPILOT_LIMIT: u32 = 12;
@@ -7408,6 +7640,19 @@ mod tests {
     const SDK_PERMISSION_ID: &str = "req_autopilot";
     const DECIDED: &str = "decided";
     const ESCALATE: &str = "escalate";
+    const DENY: &str = "deny";
+    const AUTOPILOT_ITEM: &str = "Run `cargo test` in /repo";
+    const AUTOPILOT_GUIDANCE: &str = "run only the parser tests";
+    const AUTOPILOT_ANSWER: &str = "allow once";
+    const AUTOPILOT_CONTINUATIONS: u32 = 3;
+    const AUTOPILOT_SPENT: f64 = 0.75;
+    const AUTOPILOT_SUBSCRIPTION_SPENT: f64 = 0.5;
+    const AUTOPILOT_ELAPSED_MS: u64 = 90_000;
+    const AUTOPILOT_ENDED_AT_MS: u64 = 120_000;
+    const AUTOPILOT_ENDED_HISTORY_LEN: usize = 12;
+    const OTHER_ENGAGEMENT: u32 = 2;
+    const PAGED_DECISIONS: u32 = 5;
+    const PAGE_LIMIT: usize = 2;
 
     fn autopilot_session(state: &TempDir, autopilot: Option<AutopilotHandle>) -> InteractiveHandle {
         let mut session = control_session(
@@ -7421,7 +7666,7 @@ mod tests {
 
     fn engaged_autopilot(owns_goal: bool) -> AutopilotHandle {
         let autopilot = AutopilotHandle::default();
-        autopilot.engage(owns_goal);
+        autopilot.engage(owns_goal, None);
         autopilot
     }
 
@@ -7439,6 +7684,46 @@ mod tests {
             model: None,
             usage: None,
             cost: None,
+            engagement: None,
+            item: None,
+            payload: None,
+            outcome: None,
+        }
+    }
+
+    /// A decision with everything the log keeps about one.
+    fn audited_decision() -> AutopilotDecision {
+        AutopilotDecision {
+            engagement: Some(AUTOPILOT_ENGAGEMENT),
+            item: Some(AUTOPILOT_ITEM.into()),
+            payload: Some(DecisionPayload::Guidance(AUTOPILOT_GUIDANCE.into())),
+            outcome: Some(DecisionOutcome::Applied),
+            ..autopilot_decision(ActionName::Deny)
+        }
+    }
+
+    fn stood_down() -> StoodDown {
+        StoodDown {
+            seq: AUTOPILOT_SEQ,
+            at_ms: 0,
+            kind: DecisionKind::Question,
+            subject: AUTOPILOT_SUBJECT.into(),
+            item: Some(AUTOPILOT_ITEM.into()),
+            agent: None,
+            tool_use_id: None,
+            history_len: 0,
+            engagement: Some(AUTOPILOT_ENGAGEMENT),
+            outcome: DecisionOutcome::TakenOver,
+        }
+    }
+
+    fn engagement_spend() -> EngagementSpend {
+        EngagementSpend {
+            continuations: AUTOPILOT_CONTINUATIONS,
+            cost_usd: AUTOPILOT_SPENT,
+            subscription_cost_usd: AUTOPILOT_SUBSCRIPTION_SPENT,
+            elapsed_ms: AUTOPILOT_ELAPSED_MS,
+            retries: RETRY_ATTEMPT,
         }
     }
 
@@ -7451,8 +7736,15 @@ mod tests {
         };
         match case {
             "engaged" => (
-                AutopilotEvent::Engaged,
-                serde_json::json!({"kind": AUTOPILOT_ENGAGED}),
+                AutopilotEvent::Engaged {
+                    engagement: AUTOPILOT_ENGAGEMENT,
+                    goal: Some(GOAL_CONDITION.into()),
+                },
+                serde_json::json!({
+                    "kind": AUTOPILOT_ENGAGED,
+                    "engagement": AUTOPILOT_ENGAGEMENT,
+                    "goal": GOAL_CONDITION,
+                }),
             ),
             "deciding" => (
                 AutopilotEvent::Deciding {
@@ -7471,6 +7763,61 @@ mod tests {
             ),
             "decided" => decided(ActionName::Allow),
             "escalated" => decided(ActionName::Escalate),
+            "audited" => (
+                AutopilotEvent::Decided(Box::new(audited_decision())),
+                serde_json::json!({
+                    "kind": DECIDED,
+                    "decision": {
+                        "seq": AUTOPILOT_SEQ,
+                        "at_ms": 0,
+                        "kind": DecisionKind::Permission.name(),
+                        "action": DENY,
+                        "subject": AUTOPILOT_SUBJECT,
+                        "reason": AUTOPILOT_REASON,
+                        "agent": null,
+                        "tool_use_id": null,
+                        "history_len": 0,
+                        "model": null,
+                        "usage": null,
+                        "cost": null,
+                        "engagement": AUTOPILOT_ENGAGEMENT,
+                        "item": AUTOPILOT_ITEM,
+                        "payload": {"kind": "guidance", "value": AUTOPILOT_GUIDANCE},
+                        "outcome": {"status": "applied"},
+                    },
+                }),
+            ),
+            "stood_down" => (
+                AutopilotEvent::StoodDown(Box::new(stood_down())),
+                serde_json::json!({
+                    "kind": "stood_down",
+                    "decision": {
+                        "seq": AUTOPILOT_SEQ,
+                        "at_ms": 0,
+                        "kind": DecisionKind::Question.name(),
+                        "subject": AUTOPILOT_SUBJECT,
+                        "item": AUTOPILOT_ITEM,
+                        "agent": null,
+                        "tool_use_id": null,
+                        "history_len": 0,
+                        "engagement": AUTOPILOT_ENGAGEMENT,
+                        "outcome": {"status": "taken_over"},
+                    },
+                }),
+            ),
+            "settled" => (
+                AutopilotEvent::Settled {
+                    seq: AUTOPILOT_SEQ,
+                    outcome: DecisionOutcome::Answered {
+                        answer: AUTOPILOT_ANSWER.into(),
+                    },
+                },
+                serde_json::json!({
+                    "kind": "settled",
+                    "seq": AUTOPILOT_SEQ,
+                    "outcome": {"status": "answered", "answer": AUTOPILOT_ANSWER},
+                }),
+            ),
             "retrying" => (
                 AutopilotEvent::Retrying {
                     attempt: RETRY_ATTEMPT,
@@ -7491,14 +7838,94 @@ mod tests {
                     reason: AutopilotEnd::Budget {
                         kind: AutopilotBudget::Continuations,
                     },
+                    engagement: AUTOPILOT_ENGAGEMENT,
+                    spend: engagement_spend(),
                 },
                 serde_json::json!({
                     "kind": AUTOPILOT_ENDED,
                     "end": {"reason": "budget", "kind": "continuations"},
+                    "engagement": AUTOPILOT_ENGAGEMENT,
+                    "continuations": AUTOPILOT_CONTINUATIONS,
+                    "cost_usd": AUTOPILOT_SPENT,
+                    "subscription_cost_usd": AUTOPILOT_SUBSCRIPTION_SPENT,
+                    "elapsed_ms": AUTOPILOT_ELAPSED_MS,
+                    "retries": RETRY_ATTEMPT,
                 }),
             ),
             other => unreachable!("no autopilot event is named {other}"),
         }
+    }
+
+    fn logged_engagement(engagement: u32) -> StoredAutopilotEngagement {
+        StoredAutopilotEngagement {
+            engagement,
+            engaged_at_ms: 0,
+            engaged_history_len: 0,
+            goal: None,
+            owns_goal: false,
+            ended_at_ms: None,
+            ended_history_len: None,
+            end: None,
+            continuations: 0,
+            cost_usd: 0.0,
+            subscription_cost_usd: 0.0,
+            elapsed_ms: 0,
+            retries: 0,
+        }
+    }
+
+    fn logged_decision(seq: u32, engagement: Option<u32>) -> StoredAutopilotDecision {
+        AutopilotDecision {
+            seq,
+            engagement,
+            ..autopilot_decision(ActionName::Allow)
+        }
+        .into()
+    }
+
+    /// A session with the experiment on, whose log holds `engagements` and
+    /// `decisions`.
+    fn logged_session(
+        state: &TempDir,
+        engagements: &[StoredAutopilotEngagement],
+        decisions: &[StoredAutopilotDecision],
+    ) -> InteractiveHandle {
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let mut stored = StoredSession::new("provider/model", "/repo");
+        stored.save(&storage).unwrap();
+        let database = SessionDatabase::open(&storage).unwrap();
+        for engagement in engagements {
+            database
+                .begin_autopilot_engagement(stored.id, engagement)
+                .unwrap();
+        }
+        for decision in decisions {
+            database
+                .insert_autopilot_decision(stored.id, decision)
+                .unwrap();
+        }
+        let mut session = control_session(&storage, stored.id, None);
+        session.autopilot = Some(AutopilotHandle::default());
+        session
+    }
+
+    /// What `autopilot_log` answers `request` with, once the log is read.
+    fn autopilot_log_reply(session: &InteractiveHandle, request: Value) -> Value {
+        let (writer, out_rx) = sdk_writer();
+        send_control(&writer, session, AUTOPILOT_LOG, request);
+        drop(writer);
+        let reply: Value = serde_json::from_str(&out_rx.recv().unwrap()).unwrap();
+        assert_eq!(reply["response"]["subtype"], "success", "{reply}");
+        reply["response"]["response"].clone()
+    }
+
+    fn logged_seqs(log: &Value) -> Vec<u64> {
+        log["decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|decision| decision["seq"].as_u64().unwrap())
+            .collect()
     }
 
     fn parent_envelope(event: AgentEvent) -> Envelope {
@@ -7514,6 +7941,7 @@ mod tests {
     #[test_case(AUTOPILOT_START; "start")]
     #[test_case(AUTOPILOT_STOP; "stop")]
     #[test_case(AUTOPILOT_STATUS; "status")]
+    #[test_case(AUTOPILOT_LOG; "log")]
     fn without_the_experiment_an_autopilot_control_is_refused(subtype: &str) {
         let state = TempDir::new().unwrap();
         let session = autopilot_session(&state, None);
@@ -7606,6 +8034,142 @@ mod tests {
         );
     }
 
+    #[test_case(None => AUTOPILOT_LOG_DEFAULT_LIMIT; "the_default")]
+    #[test_case(Some(PAGE_LIMIT) => PAGE_LIMIT; "a_limit_under_the_cap")]
+    #[test_case(Some(AUTOPILOT_LOG_MAX_LIMIT + 1) => AUTOPILOT_LOG_MAX_LIMIT; "a_limit_past_the_cap")]
+    #[test_case(Some(0) => 1; "a_zero_limit")]
+    fn an_autopilot_log_page_holds_its_limit_up_to_the_cap(limit: Option<usize>) -> usize {
+        AutopilotLogRequest {
+            engagement: None,
+            before: None,
+            limit,
+        }
+        .page_size()
+    }
+
+    #[test]
+    fn autopilot_log_reads_an_empty_log_with_autopilot_never_engaged() {
+        let state = TempDir::new().unwrap();
+        let session = logged_session(&state, &[], &[]);
+
+        assert_eq!(
+            autopilot_log_reply(&session, serde_json::json!({})),
+            serde_json::json!({"engagements": [], "decisions": [], "next_before": null})
+        );
+    }
+
+    #[test_case(None => (vec![5, 4], Some(4)); "the_newest_page")]
+    #[test_case(Some(4) => (vec![3, 2], Some(2)); "the_page_before_it")]
+    #[test_case(Some(2) => (vec![1], None); "the_last_page")]
+    fn autopilot_log_pages_back_through_next_before(
+        before: Option<u64>,
+    ) -> (Vec<u64>, Option<u64>) {
+        let state = TempDir::new().unwrap();
+        let decisions: Vec<_> = (1..=PAGED_DECISIONS)
+            .map(|seq| logged_decision(seq, Some(AUTOPILOT_ENGAGEMENT)))
+            .collect();
+        let session = logged_session(&state, &[], &decisions);
+
+        let log = autopilot_log_reply(
+            &session,
+            serde_json::json!({"limit": PAGE_LIMIT, "before": before}),
+        );
+
+        (logged_seqs(&log), log["next_before"].as_u64())
+    }
+
+    /// Seq 1 predates engagement numbers, 2 and 3 were made in the first
+    /// engagement and 4 in the second.
+    #[test_case(None => (vec![OTHER_ENGAGEMENT, AUTOPILOT_ENGAGEMENT], vec![4, 3, 2, 1]); "every_engagement")]
+    #[test_case(Some(AUTOPILOT_ENGAGEMENT) => (vec![AUTOPILOT_ENGAGEMENT], vec![3, 2]); "the_first")]
+    #[test_case(Some(OTHER_ENGAGEMENT) => (vec![OTHER_ENGAGEMENT], vec![4]); "the_second")]
+    fn autopilot_log_lists_only_the_engagement_asked_for(
+        engagement: Option<u32>,
+    ) -> (Vec<u32>, Vec<u64>) {
+        let state = TempDir::new().unwrap();
+        let session = logged_session(
+            &state,
+            &[
+                logged_engagement(AUTOPILOT_ENGAGEMENT),
+                logged_engagement(OTHER_ENGAGEMENT),
+            ],
+            &[
+                logged_decision(1, None),
+                logged_decision(2, Some(AUTOPILOT_ENGAGEMENT)),
+                logged_decision(3, Some(AUTOPILOT_ENGAGEMENT)),
+                logged_decision(4, Some(OTHER_ENGAGEMENT)),
+            ],
+        );
+
+        let log = autopilot_log_reply(&session, serde_json::json!({"engagement": engagement}));
+
+        let engagements = log["engagements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|engagement| u32::try_from(engagement["engagement"].as_u64().unwrap()).unwrap())
+            .collect();
+        (engagements, logged_seqs(&log))
+    }
+
+    #[test]
+    fn autopilot_log_reads_each_entry_as_the_session_keeps_it() {
+        let state = TempDir::new().unwrap();
+        let decided = audited_decision();
+        let stood_down = StoodDown {
+            seq: AUTOPILOT_SEQ + 1,
+            ..stood_down()
+        };
+        let session = logged_session(
+            &state,
+            &[StoredAutopilotEngagement {
+                goal: Some(GOAL_CONDITION.into()),
+                owns_goal: true,
+                ended_at_ms: Some(AUTOPILOT_ENDED_AT_MS),
+                ended_history_len: Some(AUTOPILOT_ENDED_HISTORY_LEN),
+                end: Some(AutopilotEnd::GoalMet),
+                continuations: AUTOPILOT_CONTINUATIONS,
+                cost_usd: AUTOPILOT_SPENT,
+                subscription_cost_usd: AUTOPILOT_SUBSCRIPTION_SPENT,
+                elapsed_ms: AUTOPILOT_ELAPSED_MS,
+                retries: RETRY_ATTEMPT,
+                ..logged_engagement(AUTOPILOT_ENGAGEMENT)
+            }],
+            &[decided.clone().into(), stood_down.into()],
+        );
+
+        let log = autopilot_log_reply(&session, serde_json::json!({}));
+
+        assert_eq!(
+            log["engagements"],
+            serde_json::json!([{
+                "engagement": AUTOPILOT_ENGAGEMENT,
+                "engaged_at_ms": 0,
+                "engaged_history_len": 0,
+                "goal": GOAL_CONDITION,
+                "owns_goal": true,
+                "ended_at_ms": AUTOPILOT_ENDED_AT_MS,
+                "ended_history_len": AUTOPILOT_ENDED_HISTORY_LEN,
+                "end": {"reason": "goal_met"},
+                "continuations": AUTOPILOT_CONTINUATIONS,
+                "cost_usd": AUTOPILOT_SPENT,
+                "subscription_cost_usd": AUTOPILOT_SUBSCRIPTION_SPENT,
+                "elapsed_ms": AUTOPILOT_ELAPSED_MS,
+                "retries": RETRY_ATTEMPT,
+            }])
+        );
+        let [stood_down_entry, decided_entry] = log["decisions"].as_array().unwrap().as_slice()
+        else {
+            panic!("two decisions: {log}");
+        };
+        assert_eq!(stood_down_entry["action"], Value::Null);
+        assert_eq!(
+            stood_down_entry["outcome"],
+            serde_json::json!({"status": "taken_over"})
+        );
+        assert_eq!(decided_entry, &serde_json::to_value(&decided).unwrap());
+    }
+
     #[test_case(true; "a_replaced_goal")]
     #[test_case(false; "a_cleared_goal")]
     fn a_goal_changed_by_hand_leaves_an_engaged_autopilot_without_a_goal_of_its_own(
@@ -7634,7 +8198,7 @@ mod tests {
         assert!(!autopilot.owns_goal());
     }
 
-    #[test_case(true => (serde_json::json!(AUTOPILOT_CONTROLS), serde_json::json!(AUTOPILOT_ENGAGED)); "while_the_experiment_is_on")]
+    #[test_case(true => (serde_json::json!([AUTOPILOT_START, AUTOPILOT_STOP, AUTOPILOT_STATUS, AUTOPILOT_LOG]), serde_json::json!(AUTOPILOT_ENGAGED)); "while_the_experiment_is_on")]
     #[test_case(false => (Value::Null, Value::Null); "while_it_is_off")]
     fn init_advertises_autopilot_only_while_the_experiment_is_on(on: bool) -> (Value, Value) {
         let autopilot = engaged_autopilot(false);
@@ -7657,6 +8221,9 @@ mod tests {
     #[test_case("deciding" => Value::Null; "deciding")]
     #[test_case("decided" => serde_json::json!(ActionName::Allow.name()); "decided")]
     #[test_case("escalated" => serde_json::json!(ESCALATE); "escalated")]
+    #[test_case("audited" => serde_json::json!(DENY); "decided_with_what_the_log_keeps")]
+    #[test_case("stood_down" => Value::Null; "stood_down")]
+    #[test_case("settled" => Value::Null; "settled")]
     #[test_case("retrying" => Value::Null; "retrying")]
     #[test_case("ended" => Value::Null; "ended")]
     fn an_autopilot_event_is_an_autopilot_system_message(case: &str) -> Value {

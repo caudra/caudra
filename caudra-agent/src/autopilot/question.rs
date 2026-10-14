@@ -4,14 +4,14 @@
 
 use std::fmt::Write;
 
-use super::AutopilotHandle;
 use super::context::{DecisionRequest, clip};
-use super::delegate::{DecisionOrigin, DelegateOutcome};
+use super::delegate::{DecisionOrigin, DecisionSlot, DelegateOutcome};
 use super::wire::DecisionKind;
+use super::{AutopilotHandle, DecisionOutcome};
 use crate::EventSender;
 use crate::cancel::CancelToken;
 use crate::mcp::elicitation::describe_answer;
-use crate::types::{AskedQuestion, AutopilotEvent};
+use crate::types::AskedQuestion;
 
 const MAX_ITEM_BYTES: usize = 32 * 1024;
 const MAX_SUBJECT_BYTES: usize = 160;
@@ -24,13 +24,15 @@ const MESSAGE_PREFIX: &str = "Its message: ";
 const ONE_LABEL: &str = "one label";
 const ANY_LABELS: &str = "one or more labels";
 const MAY_BE_EMPTY: &str = ", or none to leave it unanswered";
+const LABEL_SEPARATOR: &str = ", ";
+const QUESTION_SEPARATOR: &str = "; ";
+const NO_ANSWER: &str = "(no answer)";
 
-/// Autopilot's part in one `question` form, made for the main agent.
+/// Autopilot's part in one `question` form, made for the main agent. Dropped
+/// before the form is settled, the decision ends as cancelled.
 pub struct QuestionDelegate {
-    handle: AutopilotHandle,
-    seq: u32,
     item: String,
-    origin: DecisionOrigin,
+    slot: DecisionSlot,
 }
 
 impl QuestionDelegate {
@@ -40,8 +42,15 @@ impl QuestionDelegate {
         handle: AutopilotHandle,
         questions: &[AskedQuestion],
         tool_use_id: Option<String>,
+        event_tx: &EventSender,
     ) -> Self {
-        Self::framed(handle, FORM_LABEL.to_owned(), questions, tool_use_id)
+        Self::framed(
+            handle,
+            FORM_LABEL.to_owned(),
+            questions,
+            tool_use_id,
+            event_tx,
+        )
     }
 
     /// As [`Self::new`], for a form an MCP server put during a tool call,
@@ -52,10 +61,11 @@ impl QuestionDelegate {
         message: &str,
         questions: &[AskedQuestion],
         tool_use_id: Option<String>,
+        event_tx: &EventSender,
     ) -> Self {
         let label =
             format!("{SERVER_FORM_LABEL}\n{SERVER_PREFIX}{server}\n{MESSAGE_PREFIX}{message}");
-        Self::framed(handle, label, questions, tool_use_id)
+        Self::framed(handle, label, questions, tool_use_id, event_tx)
     }
 
     fn framed(
@@ -63,54 +73,70 @@ impl QuestionDelegate {
         label: String,
         questions: &[AskedQuestion],
         tool_use_id: Option<String>,
+        event_tx: &EventSender,
     ) -> Self {
         handle.reset_question_claim();
+        let item = clip(item(label, questions), MAX_ITEM_BYTES);
         let origin = DecisionOrigin {
-            subject: clip(subject(questions), MAX_SUBJECT_BYTES),
-            agent: None,
             tool_use_id,
-            history_len: handle.snapshot().map_or(0, |snapshot| snapshot.history_len),
+            ..DecisionOrigin::new(&handle, clip(subject(questions), MAX_SUBJECT_BYTES), &item)
         };
         Self {
-            seq: handle.next_seq(),
-            item: clip(item(label, questions), MAX_ITEM_BYTES),
-            handle,
-            origin,
+            item,
+            slot: DecisionSlot::new(handle, DecisionKind::Question, origin, event_tx),
         }
     }
 
-    pub fn announce(&self, event_tx: &EventSender) {
-        event_tx.try_send(AutopilotEvent::Deciding {
-            seq: self.seq,
-            kind: DecisionKind::Question,
-            subject: self.origin.subject.clone(),
-        });
+    pub fn announce(&self) {
+        self.slot.announce();
     }
 
-    /// `None` when `cancel` fired first. Boxed, because the call sits in the
-    /// tool's future and that one in the dispatch path.
-    pub async fn decide(
-        &self,
-        event_tx: &EventSender,
-        cancel: &CancelToken,
-    ) -> Option<DelegateOutcome> {
+    /// `None` when `cancel` fired first.
+    pub async fn decide(&self, cancel: &CancelToken) -> Option<DelegateOutcome> {
         let request = DecisionRequest {
             kind: DecisionKind::Question,
             reserved: false,
             item: &self.item,
         };
-        Box::pin(self.handle.decide(&request, event_tx, cancel)).await
+        self.slot.decide(&request, cancel).await
     }
 
-    pub fn record(&self, outcome: &DelegateOutcome, event_tx: &EventSender) {
-        let decision = outcome.decision(self.seq, self.handle.now_ms(), self.origin.clone());
-        event_tx.try_send(self.handle.record(decision));
+    /// Records the delegate's answer with what became of it.
+    pub fn record(&self, outcome: &DelegateOutcome, settled: DecisionOutcome) {
+        self.slot.record(outcome, Some(settled));
+    }
+
+    /// Records the delegate's answer while the form stays the human's, whose
+    /// reply settles it.
+    pub fn record_open(&self, outcome: &DelegateOutcome) {
+        self.slot.record_open(outcome);
+    }
+
+    /// The human replied with `raw`, whatever autopilot made of the form.
+    pub fn human_answered(&self, raw: &str) {
+        self.slot.human_answered(&human_answer(raw));
     }
 
     /// Takes the form for autopilot, `false` when the human took it first.
     pub fn claim(&self) -> bool {
-        self.handle.claim_question()
+        self.slot.handle().claim_question()
     }
+}
+
+/// A human's reply as the log words it: the labels picked for each question,
+/// or the reply itself when it picks none, such as a dismissal.
+fn human_answer(raw: &str) -> String {
+    let Ok(picked) = serde_json::from_str::<Vec<Vec<String>>>(raw) else {
+        return raw.to_owned();
+    };
+    picked
+        .iter()
+        .map(|labels| match labels.as_slice() {
+            [] => NO_ANSWER.to_owned(),
+            labels => labels.join(LABEL_SEPARATOR),
+        })
+        .collect::<Vec<_>>()
+        .join(QUESTION_SEPARATOR)
 }
 
 /// The first question's header, or the question itself when it has none.
@@ -155,7 +181,8 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::types::{AnswerKind, QuestionOption, TextFormat};
+    use crate::Envelope;
+    use crate::types::{AgentEvent, AnswerKind, AutopilotEvent, QuestionOption, TextFormat};
 
     const HEADER: &str = "Cache";
     const QUESTION: &str = "Which store backs the cache?";
@@ -168,6 +195,8 @@ mod tests {
     const NAMED: &str = "a form must be named by its first question";
     const SHOWN: &str = "the delegate must read every question, option and pick count";
     const BOUNDED: &str = "a form must fit the delegate's bound";
+    const DISMISSAL: &str = "(question dismissed)";
+    const LOGGED: &str = "a human's reply must be logged as the labels it picked";
 
     fn asked(header: &str, question: &str, multiple: bool) -> AskedQuestion {
         AskedQuestion {
@@ -234,14 +263,21 @@ mod tests {
         );
     }
 
+    fn event_sender() -> (EventSender, flume::Receiver<Envelope>) {
+        let (raw_tx, events) = flume::unbounded();
+        (EventSender::new(raw_tx, 0), events)
+    }
+
     #[test]
     fn a_servers_form_names_the_server_and_its_message() {
+        let (event_tx, _events) = event_sender();
         let delegate = QuestionDelegate::for_server(
             AutopilotHandle::default(),
             SERVER,
             SERVER_MESSAGE,
             &[asked(HEADER, QUESTION, false)],
             None,
+            &event_tx,
         );
 
         assert!(delegate.item.starts_with(SERVER_FORM_LABEL), "{SHOWN}");
@@ -257,14 +293,31 @@ mod tests {
     #[test]
     fn a_form_is_bounded() {
         let long = FILLER.repeat(MAX_ITEM_BYTES);
-        let handle = AutopilotHandle::default();
+        let (event_tx, events) = event_sender();
 
-        let delegate = QuestionDelegate::new(handle, &[asked(&long, &long, false)], None);
+        let delegate = QuestionDelegate::new(
+            AutopilotHandle::default(),
+            &[asked(&long, &long, false)],
+            None,
+            &event_tx,
+        );
+        delegate.announce();
 
         assert!(delegate.item.len() <= MAX_ITEM_BYTES, "{BOUNDED}");
-        assert!(
-            delegate.origin.subject.len() <= MAX_SUBJECT_BYTES,
-            "{BOUNDED}"
-        );
+        let Ok(Envelope {
+            event: AgentEvent::Autopilot(AutopilotEvent::Deciding { subject, .. }),
+            ..
+        }) = events.try_recv()
+        else {
+            panic!("an announced form must say it is deciding");
+        };
+        assert!(subject.len() <= MAX_SUBJECT_BYTES, "{BOUNDED}");
+    }
+
+    #[test_case(r#"[["SQLite"],["core","cli"]]"#, "SQLite; core, cli" ; "the_labels_of_each_question")]
+    #[test_case(r#"[["SQLite"],[]]"#, "SQLite; (no answer)" ; "a_question_left_unanswered")]
+    #[test_case(DISMISSAL, DISMISSAL ; "a_reply_that_picks_none")]
+    fn a_human_reply_is_logged_as_the_labels_it_picked(raw: &str, expected: &str) {
+        assert_eq!(human_answer(raw), expected, "{LOGGED}");
     }
 }

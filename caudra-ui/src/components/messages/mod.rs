@@ -12,10 +12,11 @@ use self::thinking::ThinkingWindow;
 use layout::{SegmentChrome, SegmentKind};
 
 use super::tool_display::{
-    DECISION_BODY_INDENT, RenderCtx, ScrollTail, ToolLines, append_annotation, append_right_info,
-    assistant_style, autopilot_style, build_instructions_lines, build_tool_lines, decision_style,
-    done_style, draws_live_script, error_style, format_timestamp_now, names_tool, notice_style,
-    shell_clock_ticks, thinking_style, truncate_to_header, user_style,
+    AUTOPILOT_BODY_INDENT, DECISION_BODY_INDENT, RenderCtx, ScrollTail, ToolLines,
+    append_annotation, append_right_info, assistant_style, autopilot_style,
+    build_instructions_lines, build_tool_lines, decision_style, done_style, draws_live_script,
+    error_style, format_timestamp_now, names_tool, notice_style, shell_clock_ticks, thinking_style,
+    truncate_to_header, user_style,
 };
 use super::{
     DisplayMessage, DisplayRole, DisplaySource, ToolProgress, ToolRole, ToolStatus,
@@ -1763,6 +1764,23 @@ impl MessagesPanel {
         }
     }
 
+    /// The row autopilot's decision `seq` drew, `None` when the transcript
+    /// holds none.
+    pub fn autopilot_decision_row(&self, seq: u64) -> Option<usize> {
+        self.messages
+            .iter()
+            .rposition(|msg| matches!(msg.role, DisplayRole::AutopilotDecision(row) if row == seq))
+    }
+
+    /// Rewrites the row decision `seq` drew, left folded or open as the
+    /// reader left it. A transcript without the row is left alone.
+    pub fn rewrite_autopilot_decision(&mut self, seq: u64, text: String) {
+        if let Some(index) = self.autopilot_decision_row(seq) {
+            self.messages[index].text = text;
+            self.cache.clear();
+        }
+    }
+
     pub fn load_messages(&mut self, mut msgs: Vec<DisplayMessage>) {
         for msg in &mut msgs {
             msg.body_open = None;
@@ -3117,6 +3135,29 @@ impl MessagesPanel {
         self.set_scroll_top(offset);
     }
 
+    /// Puts the first row message `msg_index` drew at the top. A message the
+    /// cache has not drawn yet is held as the reading anchor, which the next
+    /// frame resolves once it has.
+    pub fn scroll_to_message(&mut self, msg_index: usize) {
+        match self
+            .cache
+            .segments()
+            .iter()
+            .position(|segment| segment.msg_index == Some(msg_index))
+        {
+            Some(segment) => self.scroll_to_segment(segment),
+            None => {
+                self.clear_hover();
+                self.auto_scroll = false;
+                self.held_anchor = Some(ReadingAnchor {
+                    msg_index: Some(msg_index),
+                    tool_id: None,
+                    rel: 0,
+                });
+            }
+        }
+    }
+
     pub fn restore_scroll(&mut self, scroll_top: u32, auto_scroll: bool) {
         self.clear_hover();
         self.scroll_top = scroll_top;
@@ -4002,7 +4043,7 @@ impl MessagesPanel {
     fn has_foldable_body(msg: &DisplayMessage) -> bool {
         match msg.role {
             DisplayRole::Thinking | DisplayRole::Injected => true,
-            DisplayRole::Decision(_) => msg.text.contains('\n'),
+            DisplayRole::Decision(_) | DisplayRole::AutopilotDecision(_) => msg.text.contains('\n'),
             _ => false,
         }
     }
@@ -5303,13 +5344,14 @@ impl MessagesPanel {
     /// The one row a folded message draws, plus the text search still has to
     /// match against. Both fold paths read it so a rebuild cannot disagree with
     /// a reflow about what a closed block looks like.
-    fn folded_message(&self, msg: &DisplayMessage) -> BuiltMessage {
+    fn folded_message(&self, msg: &DisplayMessage, width: u16) -> BuiltMessage {
         match msg.role {
             DisplayRole::Injected => BuiltMessage::bare(
                 injected_line(&msg.text),
                 format!("{INJECTED_SEARCH_PREFIX}{}", msg.text),
             ),
             DisplayRole::Decision(outcome) => built_decision(msg, outcome, false),
+            DisplayRole::AutopilotDecision(_) => built_autopilot_decision(msg, width, false),
             _ => BuiltMessage::bare(
                 self.build_cached_thinking_indicator(&msg.text, msg.thinking_duration),
                 format!("{THINKING_SEARCH_PREFIX}{}", msg.text),
@@ -5323,7 +5365,7 @@ impl MessagesPanel {
     fn built_message(&self, msg_index: usize, width: u16) -> Option<BuiltMessage> {
         let msg = self.messages.get(msg_index)?;
         if Self::has_foldable_body(msg) && !self.body_open(msg) {
-            return Some(self.folded_message(msg));
+            return Some(self.folded_message(msg, width));
         }
         let window = matches!(msg.role, DisplayRole::Thinking)
             .then(|| self.thinking_window(ThinkingWindow::Settled(msg_index)))
@@ -5845,7 +5887,10 @@ fn display_key(message: &DisplayMessage) -> Option<DisplayKey<'_>> {
             mem::discriminant(&message.role),
             message.text.len(),
         )),
-        DisplayRole::Error | DisplayRole::Done | DisplayRole::Decision(_) => None,
+        DisplayRole::Error
+        | DisplayRole::Done
+        | DisplayRole::Decision(_)
+        | DisplayRole::AutopilotDecision(_) => None,
     }
 }
 
@@ -6012,6 +6057,33 @@ fn built_decision(msg: &DisplayMessage, outcome: NoteOutcome, open: bool) -> Bui
     BuiltMessage::bare(lines, format!("{}{}", style.prefix, msg.text))
 }
 
+/// An autopilot decision's title as an autopilot row draws it, its subject
+/// quoted, and once `open`, each detail under the title as written.
+fn built_autopilot_decision(msg: &DisplayMessage, width: u16, open: bool) -> BuiltMessage {
+    let width = SegmentChrome::for_kind(segment_kind(&msg.role), width, 0).content_width(width);
+    let style = autopilot_style();
+    let mut text = msg.text.lines();
+    let (title, _) = text_to_painted(
+        text.next().unwrap_or_default(),
+        style.prefix,
+        style.text_style,
+        style.prefix_style,
+        width,
+        style.max_line_bytes,
+        Vec::new(),
+    );
+    let mut lines = title.lines;
+    if open {
+        lines.extend(text.map(|detail| {
+            Line::from(vec![
+                Span::raw(AUTOPILOT_BODY_INDENT),
+                Span::styled(detail.to_owned(), style.text_style),
+            ])
+        }));
+    }
+    BuiltMessage::bare(lines, format!("{}{}", style.prefix, msg.text))
+}
+
 fn thought_line(title: Option<&str>, duration: Option<Duration>, done: bool) -> Vec<Line<'static>> {
     let theme = theme::current();
     let label = if done { THOUGHT_PREFIX } else { "Thinking" };
@@ -6057,6 +6129,7 @@ fn segment_kind(role: &DisplayRole) -> SegmentKind {
         DisplayRole::Notice
         | DisplayRole::Injected
         | DisplayRole::Autopilot
+        | DisplayRole::AutopilotDecision(_)
         | DisplayRole::Decision(_) => SegmentKind::Assistant,
         DisplayRole::TaskDelivery(_) => SegmentKind::TaskDelivery,
         DisplayRole::AutomationDelivery(_) => SegmentKind::AutomationDelivery,
@@ -6107,6 +6180,9 @@ fn build_message_lines(
     diagram_pans: Vec<u16>,
     window: Option<ScrollWindow>,
 ) -> BuiltMessage {
+    if matches!(msg.role, DisplayRole::AutopilotDecision(_)) {
+        return built_autopilot_decision(msg, width, true);
+    }
     let width = SegmentChrome::for_kind(segment_kind(&msg.role), width, 0).content_width(width);
     if matches!(msg.role, DisplayRole::Thinking) {
         return build_thinking_lines(msg, width, diagram_pans, window);
@@ -6147,7 +6223,8 @@ fn build_message_lines(
         | DisplayRole::TaskDelivery(_)
         | DisplayRole::AutomationDelivery(_)
         | DisplayRole::PeerMessage(_)
-        | DisplayRole::Decision(_) => {
+        | DisplayRole::Decision(_)
+        | DisplayRole::AutopilotDecision(_) => {
             unreachable!()
         }
     };

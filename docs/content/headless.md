@@ -386,7 +386,7 @@ Closing stdin never pauses automations. Once it closes, no automation run starts
 
 ```json
 {"type":"system","subtype":"init",
- "autopilot_controls":["autopilot_start","autopilot_stop","autopilot_status"],
+ "autopilot_controls":["autopilot_start","autopilot_stop","autopilot_status","autopilot_log"],
  "autopilot":{"status":"none","limits":{"max_continuations":100,"max_cost":null,"max_minutes":null}},...}
 ```
 
@@ -399,16 +399,18 @@ Both fields are absent while the switch is off.
 | `autopilot_start` | `goal` (optional), `kickoff` (optional, default `true`) | Engage with a fresh budget. An engaged session keeps its engagement and budget. With `goal`, set it as `goal_set` does, and autopilot owns it. Unless `kickoff` is `false`, queue the goal as a prompt |
 | `autopilot_stop` | None | Disengage. The end reads as stopped by `sdk` |
 | `autopilot_status` | None | Read the engagement |
+| `autopilot_log` | `engagement` (optional), `before` (optional), `limit` (optional, default `100`, at most `500`) | Read the session's [log](#autopilot-log), engaged or not |
 
-All three reply with the engagement in `response.response`:
+The first three reply with the engagement in `response.response`:
 
 ```json
-{"status":"engaged","engaged":true,"owns_goal":true,"engaged_at_ms":1790000000000,
- "continuations":12,"cost_usd":0.84,"subscription_cost_usd":0.0,"elapsed_ms":540000,
+{"status":"engaged","engaged":true,"engagement":3,"owns_goal":true,
+ "engaged_at_ms":1790000000000,"continuations":12,"cost_usd":0.84,
+ "subscription_cost_usd":0.0,"elapsed_ms":540000,"retries":0,
  "limits":{"max_continuations":100,"max_cost":null,"max_minutes":null}}
 ```
 
-`status` is `engaged`, `ended`, or `none`. A session that never engaged replies with `status` and `limits` alone. After an end, `last_end` holds the [end](#autopilot-events). `limits` are the [`[autopilot]`](/docs/configuration/#autopilot) values, which a stream-json session reads once at startup. A limit that is not set is `null`, and so is `max_continuations` when it is `0`. While the switch is off, each control fails with an error that names it.
+`status` is `engaged`, `ended`, or `none`. A session that never engaged replies with `status` and `limits` alone. `engagement` numbers the session's engagements from 1, and `retries` counts the provider errors the engagement retried. After an end, `last_end` holds the [end](#autopilot-events). `limits` are the [`[autopilot]`](/docs/configuration/#autopilot) values, which a stream-json session reads once at startup. A limit that is not set is `null`, and so is `max_continuations` when it is `0`. While the switch is off, each control fails with an error that names it.
 
 `goal_set` and `goal_clear` leave autopilot engaged, and the goal they set or clear is no longer autopilot's.
 
@@ -421,18 +423,43 @@ Every autopilot event arrives as a `system` message with subtype `autopilot`. `k
  "decision":{"seq":4,"at_ms":1790000000000,"kind":"permission","action":"allow",
   "subject":"shell: cargo test","reason":"the goal needs the tests run",
   "agent":null,"tool_use_id":"toolu_01","history_len":38,
-  "model":"anthropic/claude-opus-4-6","usage":{...},"cost":0.0031}}
+  "model":"anthropic/claude-opus-4-6","usage":{...},"cost":0.0031,
+  "engagement":3,"item":"shell wants to run `cargo test` ...","payload":null,
+  "outcome":{"status":"applied"}}}
 ```
 
 | `kind` | Fields | When |
 |--------|--------|------|
-| `engaged` | None | Autopilot engaged |
+| `engaged` | `engagement`, `goal` | Autopilot engaged. `goal` is `null` without one |
 | `deciding` | `decision` with `seq`, `kind`, and `subject` | The delegate started a decision |
 | `decided` | `decision` | The delegate decided. An escalation is a decision whose `action` is `escalate` |
+| `stood_down` | `decision` with `seq`, `at_ms`, `kind`, `subject`, `item`, `agent`, `tool_use_id`, `history_len`, `engagement`, and `outcome` | A decision ended before the delegate answered |
+| `settled` | `seq`, `outcome` | Something followed a decision, such as a human answer after an escalation |
 | `retrying` | `attempt`, `limit`, `delay_ms`, `error` | A provider error ended the run, and the run starts again after `delay_ms` |
-| `ended` | `end` | Autopilot ended |
+| `ended` | `end`, `engagement`, `continuations`, `cost_usd`, `subscription_cost_usd`, `elapsed_ms`, `retries` | Autopilot ended, with what the engagement spent |
 
-A decision's `kind` is `permission`, `question`, `reply`, `plan`, `review`, or `second_opinion`. `agent` names the subagent the decision was for, and is `null` for the main agent.
+A decision's `kind` is `permission`, `question`, `reply`, `plan`, `review`, or `second_opinion`. `agent` names the subagent the decision was for, and is `null` for the main agent. `item` is what the delegate was asked, cut at 2 KiB.
+
+`payload` is what the action carried beside its reason, and is `null` for `allow`, `escalate`, `done`, `implement`, and `agree`:
+
+| `payload.kind` | `payload.value` | Actions |
+|----------------|-----------------|---------|
+| `guidance` | Text | `deny`, `continue` |
+| `text` | Text | `reply` |
+| `feedback` | Text | `revise` |
+| `answers` | One list of labels per question | `answer` |
+
+`outcome` says what became of the decision, and is `null` while nothing has. Its `status` is one of these:
+
+| `status` | Meaning |
+|----------|---------|
+| `applied` | The action took effect |
+| `human_first` | A human answered first, so the decision went unused. `answer` says how |
+| `taken_over` | A human took the card while the delegate decided |
+| `superseded` | A reload or a rule settled the request first |
+| `cancelled` | The run stopped before anyone answered |
+| `answered` | The decision was left to a human, who then answered. `answer` says how |
+| `denied_unattended` | The decision was left to a human, and with no one present the request was denied |
 
 An end has a `reason`:
 
@@ -449,6 +476,21 @@ When the delegate allows or denies a permission request, Caudra withdraws it fro
 The `interrupt` control ends autopilot as stopped by `interrupt`, in addition to its other effects. The session saves the engagement and its decision log with the rest of its state. `--resume <ID>` restores both, engaged, with the budget it has used. When a goal is active, one check-in run starts and counts as a continuation.
 
 Delegate spend counts in the engagement's `cost_usd` and in the run's `result`. Like the rest of a stream-json session's model jobs, it stays out of the lifetime ledger in `/usage`.
+
+#### Autopilot log
+
+`autopilot_log` reads the session's [log](/docs/autopilot/#the-log) from its database, whether autopilot is engaged or not:
+
+```json
+{"engagements":[{"engagement":3,"engaged_at_ms":1790000000000,"engaged_history_len":12,
+   "goal":"The test suite passes","owns_goal":true,"ended_at_ms":1790002400000,
+   "ended_history_len":96,"end":{"reason":"goal_met"},"continuations":12,
+   "cost_usd":0.84,"subscription_cost_usd":0.0,"elapsed_ms":2400000,"retries":1}],
+ "decisions":[{"seq":41,"at_ms":1790002300000,"kind":"permission","action":"allow",...}],
+ "next_before":41}
+```
+
+Both lists run newest first. `engagements` holds the session's engagements, and `decisions` its newest `limit` decisions older than `before`. With `engagement`, both hold that engagement's alone. A decision has the fields of a `decided` event. On a decision that stood down, `action` is `null` and `reason` is empty. On one recorded before preview 9, `engagement`, `item`, `payload`, and `outcome` are `null`. While more decisions remain, `next_before` is the `seq` to pass as `before` for the next page, and otherwise it is `null`.
 
 ### Decision rows
 

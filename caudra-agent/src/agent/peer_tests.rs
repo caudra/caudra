@@ -977,7 +977,7 @@ mod peer_tests {
             let fixture = PeerFixture::new().await;
             let origin = fixture.queue(PEER_TEXT).await;
             let autopilot = AutopilotHandle::default();
-            autopilot.engage(false);
+            autopilot.engage(false, None);
             let mut history = History::new(vec![Message::user(PEER_FIRST_TURN.into())]);
             let (mut agent, _events) = make_agent(
                 MockProvider::new(vec![answer(PEER_REPLY_VERDICT)]),

@@ -11,7 +11,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.9 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.9)
 
-Preview 9 adds Gemini 4 Argon as the Google default, along with Gemini 3.8 Flash, 3.6 Flash, and 3.5 Flash-Lite, brings Argon and 3.8 Flash to Copilot, bills announced Gemini price changes from their dates, fixes Google requests, which all failed on Caudra's tool definitions, fixes updates on macOS that sat for minutes on the download line, lets update checks use your GitHub token, shows download progress while Caudra updates, opens `/model` on your favorite models, lets `Home` and `End` jump to the ends of a picker's list, runs a task on the favorite model you name, lets autopilot run without a continuation limit, and breaks `/usage` down by purpose for the session as well as for all time.
+Preview 9 adds Gemini 4 Argon as the Google default, along with Gemini 3.8 Flash, 3.6 Flash, and 3.5 Flash-Lite, brings Argon and 3.8 Flash to Copilot, bills announced Gemini price changes from their dates, fixes Google requests, which all failed on Caudra's tool definitions, fixes updates on macOS that sat for minutes on the download line, lets update checks use your GitHub token, shows download progress while Caudra updates, opens `/model` on your favorite models, lets `Home` and `End` jump to the ends of a picker's list, runs a task on the favorite model you name, lets autopilot run without a continuation limit, keeps a log of what autopilot did and what happened next, and breaks `/usage` down by purpose for the session as well as for all time.
 
 > **Important**
 >
@@ -49,6 +49,8 @@ Preview 9 adds Gemini 4 Argon as the Google default, along with Gemini 3.8 Flash
 ### Autopilot
 
 - **No continuation limit.** `max_continuations = 0` under `[autopilot]` lets an engagement run until its goal ends, its cost or time limit runs out, or you stop it, so a session that an automation keeps busy every day can stay on autopilot. The footer chip then shows the count without a limit, and SDK clients read `max_continuations` as `null`. See [Budgets](/docs/autopilot/#budgets).
+- **An audit log of what autopilot did.** The status panel gains a Log tab, which `/autopilot log` opens at any time, engaged or not. It lists every decision of the session under its engagement, with what the delegate was asked, such as the exact command of a permission request, what autopilot said, its reason, the model and cost, and what happened next: whether the action applied, you answered first, you took the card, or you answered after autopilot left it to you. Press `f` to filter, `y` to copy an entry, and Enter to jump to its row in the transcript. Click a decision row in the transcript to see what autopilot said and what happened next, and the start and end of each engagement come back when you resume. Before, the panel showed only the last 20 decisions of the running engagement in one line each, and a decision row kept only the action's name. Decisions made before Preview 9 keep their one-line record. SDK clients read the log with the new `autopilot_log` control, and `decided`, `engaged`, and `ended` events carry the new fields. See [The log](/docs/autopilot/#the-log).
+- **The delegate sees your overrides.** When you answered a decision differently from autopilot, the delegate's next decisions see your answer, so it can follow your lead.
 
 ### Command line
 

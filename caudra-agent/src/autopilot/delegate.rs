@@ -3,7 +3,8 @@
 //! the chat model when the one it resolved to is unavailable. Every call is
 //! reported as autopilot spend and counted against the engagement's budget.
 
-use std::sync::Arc;
+use std::mem;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use caudra_config::{AutopilotConfig, ModelPolicy};
 use caudra_providers::model_registry::{self, Binding};
@@ -14,16 +15,17 @@ use caudra_providers::{
 use caudra_storage::usage_ledger::LedgerPurpose;
 use tracing::warn;
 
-use super::AutopilotHandle;
-use super::context::{AutopilotSnapshot, DecisionRequest, user_message};
+use super::context::{AutopilotSnapshot, DecisionRequest, logged_item, user_message};
 use super::wire::{
-    ActionName, AfterInvalid, AutopilotDecision, DecisionKind, DelegateOutput, after_invalid,
-    parse_output,
+    ActionName, AfterInvalid, AutopilotDecision, DecisionKind, DelegateOutput, StoodDown,
+    after_invalid, parse_output,
 };
+use super::{AutopilotHandle, DecisionOutcome};
 use crate::agent::judging::{INITIAL_TRANSCRIPT_PERCENT, RETRY_TRANSCRIPT_PERCENT};
 use crate::agent::{JudgeRole, ResolvedEvaluator, evaluator_request, resolve_evaluator};
 use crate::cancel::CancelToken;
 use crate::prompt::AUTOPILOT_PROMPT;
+use crate::types::AutopilotEvent;
 use crate::{AgentEvent, EventSender};
 
 const DELEGATE_ROLE: JudgeRole = JudgeRole {
@@ -43,6 +45,175 @@ pub struct DecisionOrigin {
     pub tool_use_id: Option<String>,
     /// History items the session held when it was asked for.
     pub history_len: usize,
+    /// What the delegate was shown, without the schema.
+    pub item: Option<String>,
+    /// The engagement it was asked for in.
+    pub engagement: Option<u32>,
+}
+
+impl DecisionOrigin {
+    /// A decision about `item` in `handle`'s engagement, for the main agent
+    /// and no tool call until the caller names them.
+    pub fn new(handle: &AutopilotHandle, subject: String, item: &str) -> Self {
+        Self {
+            subject,
+            agent: None,
+            tool_use_id: None,
+            history_len: handle.snapshot().map_or(0, |snapshot| snapshot.history_len),
+            item: Some(logged_item(item)),
+            engagement: handle.engagement(),
+        }
+    }
+}
+
+/// One decision's place in the engagement, from its number to its last row.
+/// Dropped after its announcement and before its row is final, it stands
+/// down or settles as cancelled, so every announced decision ends in exactly
+/// one row, and none is left open.
+pub(crate) struct DecisionSlot {
+    handle: AutopilotHandle,
+    seq: u32,
+    kind: DecisionKind,
+    origin: DecisionOrigin,
+    event_tx: EventSender,
+    stage: Mutex<Stage>,
+}
+
+/// Where a decision's row stands.
+enum Stage {
+    Unannounced,
+    /// Announced, with no answer yet.
+    Deciding,
+    /// Recorded, with what follows to settle. `escalated` when it was left
+    /// to the human.
+    Open {
+        escalated: bool,
+    },
+    Closed,
+}
+
+impl DecisionSlot {
+    /// Takes the engagement's next decision number.
+    pub(crate) fn new(
+        handle: AutopilotHandle,
+        kind: DecisionKind,
+        origin: DecisionOrigin,
+        event_tx: &EventSender,
+    ) -> Self {
+        Self {
+            seq: handle.next_seq(),
+            handle,
+            kind,
+            origin,
+            event_tx: event_tx.clone(),
+            stage: Mutex::new(Stage::Unannounced),
+        }
+    }
+
+    pub(crate) fn handle(&self) -> &AutopilotHandle {
+        &self.handle
+    }
+
+    pub(crate) fn seq(&self) -> u32 {
+        self.seq
+    }
+
+    pub(crate) fn announce(&self) {
+        *self.stage() = Stage::Deciding;
+        self.event_tx.try_send(AutopilotEvent::Deciding {
+            seq: self.seq,
+            kind: self.kind,
+            subject: self.origin.subject.clone(),
+        });
+    }
+
+    /// Asks the delegate, as [`AutopilotHandle::decide`] does. Boxed, because
+    /// every caller sits deep in a dispatch or a permission check.
+    pub(crate) async fn decide(
+        &self,
+        request: &DecisionRequest<'_>,
+        cancel: &CancelToken,
+    ) -> Option<DelegateOutcome> {
+        Box::pin(self.handle.decide(request, &self.event_tx, cancel)).await
+    }
+
+    /// Records the delegate's answer and, where it is known, what became of
+    /// it. Nothing follows that this slot settles.
+    pub(crate) fn record(&self, outcome: &DelegateOutcome, settled: Option<DecisionOutcome>) {
+        *self.stage() = Stage::Closed;
+        self.send_decision(outcome.decision(
+            self.seq,
+            self.handle.now_ms(),
+            self.origin.clone(),
+            settled,
+        ));
+    }
+
+    /// Records the delegate's answer while the request is still open, for the
+    /// human's answer or whatever else ends it to settle.
+    pub(crate) fn record_open(&self, outcome: &DelegateOutcome) {
+        let decision = outcome.decision(self.seq, self.handle.now_ms(), self.origin.clone(), None);
+        *self.stage() = Stage::Open {
+            escalated: decision.action == ActionName::Escalate,
+        };
+        self.send_decision(decision);
+    }
+
+    /// The human answered with `answer`: a decision still deciding was taken
+    /// over, an escalation was answered, and an answer autopilot gave went
+    /// unused.
+    pub(crate) fn human_answered(&self, answer: &str) {
+        let answer = logged_item(answer);
+        let outcome = match &*self.stage() {
+            Stage::Deciding => DecisionOutcome::TakenOver,
+            Stage::Open { escalated: true } => DecisionOutcome::Answered { answer },
+            Stage::Open { escalated: false } => DecisionOutcome::HumanFirst { answer },
+            Stage::Unannounced | Stage::Closed => return,
+        };
+        self.end(outcome);
+    }
+
+    /// Ends the decision with `outcome`: one still deciding stands down, and
+    /// an open one settles. A closed one is left as it is.
+    pub(crate) fn end(&self, outcome: DecisionOutcome) {
+        let stage = mem::replace(&mut *self.stage(), Stage::Closed);
+        let event = match stage {
+            Stage::Deciding => AutopilotEvent::StoodDown(Box::new(self.stood_down(outcome))),
+            Stage::Open { .. } => self.handle.settle(self.seq, outcome),
+            Stage::Unannounced | Stage::Closed => return,
+        };
+        self.event_tx.try_send(event);
+    }
+
+    fn send_decision(&self, decision: AutopilotDecision) {
+        self.event_tx.try_send(self.handle.record(decision));
+    }
+
+    fn stood_down(&self, outcome: DecisionOutcome) -> StoodDown {
+        let origin = self.origin.clone();
+        StoodDown {
+            seq: self.seq,
+            at_ms: self.handle.now_ms(),
+            kind: self.kind,
+            subject: origin.subject,
+            item: origin.item,
+            agent: origin.agent,
+            tool_use_id: origin.tool_use_id,
+            history_len: origin.history_len,
+            engagement: origin.engagement,
+            outcome,
+        }
+    }
+
+    fn stage(&self) -> MutexGuard<'_, Stage> {
+        self.stage.lock().unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+impl Drop for DecisionSlot {
+    fn drop(&mut self) {
+        self.end(DecisionOutcome::Cancelled);
+    }
 }
 
 /// What one decision came to and what it cost.
@@ -70,12 +241,23 @@ impl DelegateOutcome {
         }
     }
 
-    /// The decision's row. An answer that never came is recorded as
-    /// [`ActionName::Escalate`], with the failure as its reason.
-    pub fn decision(&self, seq: u32, at_ms: u64, origin: DecisionOrigin) -> AutopilotDecision {
-        let (action, reason) = match &self.answer {
-            Ok(output) => (output.action.name(), output.reason.clone()),
-            Err(reason) => (ActionName::Escalate, reason.clone()),
+    /// The decision's row, with what became of it where that is known. An
+    /// answer that never came is recorded as [`ActionName::Escalate`], with
+    /// the failure as its reason.
+    pub fn decision(
+        &self,
+        seq: u32,
+        at_ms: u64,
+        origin: DecisionOrigin,
+        outcome: Option<DecisionOutcome>,
+    ) -> AutopilotDecision {
+        let (action, reason, payload) = match &self.answer {
+            Ok(output) => (
+                output.action.name(),
+                output.reason.clone(),
+                output.action.payload(),
+            ),
+            Err(reason) => (ActionName::Escalate, reason.clone(), None),
         };
         let (cost, subscription_cost) = match self.billing {
             Billing::Api => (self.cost, None),
@@ -97,6 +279,10 @@ impl DelegateOutcome {
                 .is_some()
                 .then(|| self.usage.spent(cost, subscription_cost)),
             cost: self.cost,
+            engagement: origin.engagement,
+            item: origin.item,
+            payload,
+            outcome,
         }
     }
 }
@@ -335,7 +521,7 @@ pub(crate) mod tests {
     use caudra_providers::{
         CacheKey, ModelInfo, ProviderEvent, RequestOptions, Role, StopReason, StreamResponse,
     };
-    use caudra_storage::autopilot::{AutopilotBudget, AutopilotEnd};
+    use caudra_storage::autopilot::{AutopilotBudget, AutopilotEnd, DecisionPayload};
     use caudra_storage::sessions::PermissionMode;
     use serde_json::{Value, json};
     use smol::LocalExecutor;
@@ -370,6 +556,9 @@ pub(crate) mod tests {
     const HISTORY_LEN: usize = 3;
     const AGENT: &str = "review";
     const TOOL_USE_ID: &str = "toolu_1";
+    const ENGAGEMENT: u32 = 2;
+    const DENY_REASON: &str = "the tests are not part of the task";
+    const DENY_GUIDANCE: &str = "stay in the parser crate";
     const NO_TOOLS: &str = "the delegate must be offered no tools";
     const OWN_PROMPT: &str = "the delegate must run on its own system prompt";
     const CORRECTED: &str = "a retry must carry the correction for the answer it replaces";
@@ -508,7 +697,7 @@ pub(crate) mod tests {
     /// `chat_provider`.
     pub(crate) fn engaged_handle(chat_provider: Arc<dyn Provider>) -> AutopilotHandle {
         let handle = AutopilotHandle::new(FakeClock::new(START_MS));
-        handle.engage(false);
+        handle.engage(false, None);
         let history = History::new(vec![Message::user(PROMPT.into())]);
         handle.observe(AutopilotSnapshot::new(
             history.as_slice(),
@@ -619,6 +808,15 @@ pub(crate) mod tests {
         })
     }
 
+    fn denied() -> Result<DelegateOutput, String> {
+        Ok(DelegateOutput {
+            action: DelegateAction::Deny {
+                guidance: DENY_GUIDANCE.into(),
+            },
+            reason: DENY_REASON.into(),
+        })
+    }
+
     fn invalid_prose() -> WireError {
         parse_output(PROSE, DecisionKind::Permission, false).unwrap_err()
     }
@@ -629,6 +827,8 @@ pub(crate) mod tests {
             agent: Some(AGENT.into()),
             tool_use_id: Some(TOOL_USE_ID.into()),
             history_len: HISTORY_LEN,
+            item: Some(ITEM.into()),
+            engagement: Some(ENGAGEMENT),
         }
     }
 
@@ -829,7 +1029,8 @@ pub(crate) mod tests {
             AgentEvent::Autopilot(AutopilotEvent::Ended {
                 reason: AutopilotEnd::Budget {
                     kind: AutopilotBudget::Cost
-                }
+                },
+                ..
             })
         )));
     }
@@ -934,12 +1135,14 @@ pub(crate) mod tests {
         }));
     }
 
-    #[test_case(allowed(), ActionName::Allow, ALLOW_REASON ; "an_answer")]
-    #[test_case(Err(NO_SNAPSHOT_REASON.into()), ActionName::Escalate, NO_SNAPSHOT_REASON ; "a_failure")]
+    #[test_case(allowed(), ActionName::Allow, ALLOW_REASON, None ; "an_answer")]
+    #[test_case(denied(), ActionName::Deny, DENY_REASON, Some(DecisionPayload::Guidance(DENY_GUIDANCE.into())) ; "an_answer_with_guidance")]
+    #[test_case(Err(NO_SNAPSHOT_REASON.into()), ActionName::Escalate, NO_SNAPSHOT_REASON, None ; "a_failure")]
     fn an_outcome_is_recorded_as_its_decision(
         answer: Result<DelegateOutput, String>,
         action: ActionName,
         reason: &str,
+        payload: Option<DecisionPayload>,
     ) {
         let (_, fixture) = scripted(Vec::new());
         let outcome = DelegateOutcome {
@@ -950,7 +1153,7 @@ pub(crate) mod tests {
             ..DelegateOutcome::escalated(DecisionKind::Permission, String::new())
         };
 
-        let decision = outcome.decision(SEQ, AT_MS, origin());
+        let decision = outcome.decision(SEQ, AT_MS, origin(), None);
         let event = fixture.handle.record(decision.clone());
 
         assert_eq!(
@@ -964,6 +1167,12 @@ pub(crate) mod tests {
         );
         assert_eq!(decision.agent.as_deref(), Some(AGENT));
         assert_eq!(decision.tool_use_id.as_deref(), Some(TOOL_USE_ID));
+        assert_eq!(
+            (decision.item.as_deref(), decision.engagement),
+            (Some(ITEM), Some(ENGAGEMENT))
+        );
+        assert_eq!(decision.payload, payload);
+        assert_eq!(decision.outcome, None);
         assert_eq!(decision.usage.and_then(|usage| usage.cost), outcome.cost);
         assert_eq!(event, AutopilotEvent::Decided(Box::new(decision.clone())));
         assert_eq!(fixture.handle.recent_decisions(), [decision]);

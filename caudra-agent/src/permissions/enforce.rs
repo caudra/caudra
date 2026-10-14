@@ -20,12 +20,12 @@ use super::{
 };
 use crate::CancelToken;
 use crate::autopilot::{
-    AutopilotHandle, DecisionKind, DecisionOrigin, DecisionRequest, DelegateAction,
-    DelegateOutcome, DelegateOutput, WireError, mode_label,
+    AutopilotHandle, DecisionKind, DecisionOrigin, DecisionOutcome, DecisionRequest, DecisionSlot,
+    DelegateAction, DelegateOutcome, DelegateOutput, WireError, mode_label,
 };
 use crate::tools::native::plan::{self, PlanAccess, PlanTarget};
 use crate::tools::{PermissionIntent, PermissionScopes, ToolContext};
-use crate::types::{Answerer, AutopilotEvent};
+use crate::types::Answerer;
 use crate::{AgentEvent, EventSender};
 use caudra_config::{DefaultEffect, FILE_WRITE_TOOLS, ToolKey};
 use serde_json::Value;
@@ -64,6 +64,7 @@ const ITEM_RESERVED_LABEL: &str = "reserved:";
 const ITEM_NOT_RESERVED: &str = "no";
 const ITEM_TRUNCATED: &str = " [truncated]";
 const ITEM_SEPARATOR: &str = ", ";
+const HUMAN_GUIDANCE_SEPARATOR: &str = ": ";
 const MAIN_AGENT: &str = "the main agent or one of its subagents";
 const WORKFLOW_AGENT: &str = "workflow run";
 const WORKFLOW_CALL: &str = "agent call";
@@ -261,43 +262,47 @@ enum Woken {
 /// Autopilot's part in one prompt: what the delegate is told about it, and
 /// the decision's place in the engagement.
 struct PromptDelegate {
-    handle: AutopilotHandle,
-    seq: u32,
     /// Why autopilot may not allow the request, `None` when it may.
     reservation: Option<&'static str>,
     item: String,
-    origin: DecisionOrigin,
+    slot: DecisionSlot,
 }
 
 impl PromptDelegate {
-    fn announce(&self, event_tx: &EventSender) {
-        let _ = event_tx.send(AutopilotEvent::Deciding {
-            seq: self.seq,
-            kind: DecisionKind::Permission,
-            subject: self.origin.subject.clone(),
-        });
-    }
-
-    /// `None` when `cancel` fired first. The call is boxed because every
-    /// permission check embeds this future, and nested dispatch stacks checks.
-    async fn decide(
-        &self,
-        event_tx: &EventSender,
-        cancel: &CancelToken,
-    ) -> Option<DelegateOutcome> {
+    /// `None` when `cancel` fired first.
+    async fn decide(&self, cancel: &CancelToken) -> Option<DelegateOutcome> {
         let reserved = self.reservation.is_some();
         let request = DecisionRequest {
             kind: DecisionKind::Permission,
             reserved,
             item: &self.item,
         };
-        let outcome = Box::pin(self.handle.decide(&request, event_tx, cancel)).await?;
+        let outcome = self.slot.decide(&request, cancel).await?;
         Some(screened(outcome, reserved))
     }
 
-    fn record(&self, outcome: &DelegateOutcome, event_tx: &EventSender) {
-        let decision = outcome.decision(self.seq, self.handle.now_ms(), self.origin.clone());
-        let _ = event_tx.send(self.handle.record(decision));
+    /// Ends the decision with what settled the prompt, `None` when the run
+    /// stopped first.
+    fn settle(&self, decision: Option<&PendingDecision>) {
+        match decision {
+            Some(PendingDecision::Explicit(answer, Answerer::User)) => {
+                self.slot.human_answered(&human_answer(answer));
+            }
+            Some(PendingDecision::MatchedRule | PendingDecision::PolicyDenied(_)) => {
+                self.slot.end(DecisionOutcome::Superseded);
+            }
+            Some(PendingDecision::Explicit(_, Answerer::Autopilot)) | None => {}
+        }
+    }
+}
+
+/// A human's answer to a prompt as the log words it: how it answered and,
+/// for a denial, what it said.
+fn human_answer(answer: &PermissionAnswer) -> String {
+    let (name, ..) = answer_log_fields(answer);
+    match answer.guidance() {
+        Some(guidance) => format!("{name}{HUMAN_GUIDANCE_SEPARATOR}{guidance}"),
+        None => name.to_owned(),
     }
 }
 
@@ -868,16 +873,20 @@ impl PermissionManager {
             let Some(delegate) = delegate else {
                 return Err(deny(DECISION_SOURCE_USER_ABORT, None));
             };
-            delegate.announce(event_tx);
-            let Some(outcome) = delegate.decide(event_tx, cancel).await else {
+            delegate.slot.announce();
+            let Some(outcome) = delegate.decide(cancel).await else {
                 return Err(deny(DECISION_SOURCE_USER_ABORT, None));
             };
-            delegate.record(&outcome, event_tx);
-            let answer = delegated_answer(&outcome).unwrap_or_else(|_| {
-                PermissionAnswer::DenyWithGuidance(UNATTENDED_ESCALATION.into())
-            });
+            let (answer, settled) = match delegated_answer(&outcome) {
+                Ok(answer) => (answer, DecisionOutcome::Applied),
+                Err(_) => (
+                    PermissionAnswer::DenyWithGuidance(UNATTENDED_ESCALATION.into()),
+                    DecisionOutcome::DeniedUnattended,
+                ),
+            };
             let source = answer.decision_source_by(Answerer::Autopilot);
             if !answer.is_allow() {
+                delegate.slot.record(&outcome, Some(settled));
                 return Err(deny_by(
                     source,
                     answer.guidance().map(String::from),
@@ -885,10 +894,18 @@ impl PermissionManager {
                 ));
             }
             if cancel.is_cancelled() {
+                delegate
+                    .slot
+                    .record(&outcome, Some(DecisionOutcome::Cancelled));
                 return Err(deny(DECISION_SOURCE_USER_ABORT, None));
             }
-            self.current_policy(&request, &context)
-                .map_err(|error| deny(DECISION_SOURCE_RULE, Some(error.to_string())))?;
+            if let Err(error) = self.current_policy(&request, &context) {
+                delegate
+                    .slot
+                    .record(&outcome, Some(DecisionOutcome::Superseded));
+                return Err(deny(DECISION_SOURCE_RULE, Some(error.to_string())));
+            }
+            delegate.slot.record(&outcome, Some(settled));
             return allowed(observed, source);
         };
 
@@ -944,7 +961,7 @@ impl PermissionManager {
             event_tx.try_send(note);
         }
         if let Some(delegate) = &delegate {
-            delegate.announce(event_tx);
+            delegate.slot.announce();
         }
         let forcing_reason = prompt_forcing_reason(
             &request,
@@ -980,7 +997,7 @@ impl PermissionManager {
             forcing_reason,
             opacity = opacity.map(display),
             auto_note = request.presentation.auto.map(AutoNote::name),
-            autopilot_seq = delegate.as_ref().map(|delegate| delegate.seq),
+            autopilot_seq = delegate.as_ref().map(|delegate| delegate.slot.seq()),
             autopilot_reservation = delegate.as_ref().and_then(|delegate| delegate.reservation),
             uncovered = %uncovered,
             offered_options = %request
@@ -1001,7 +1018,7 @@ impl PermissionManager {
             let mut delegate_call = delegate
                 .as_ref()
                 .zip(delegate_cancel.as_ref())
-                .map(|(delegate, stop)| Box::pin(delegate.decide(event_tx, stop)));
+                .map(|(delegate, stop)| Box::pin(delegate.decide(stop)));
             loop {
                 while let Ok(source) = changed_rx.try_recv() {
                     source_request_id = source;
@@ -1127,6 +1144,9 @@ impl PermissionManager {
             Ok(Err(error)) => Some(PendingDecision::PolicyDenied(error.to_string())),
             Err(_) => None,
         };
+        if let Some(delegate) = &delegate {
+            delegate.settle(decision.as_ref());
+        }
         if let Some(PendingDecision::Explicit(_, Answerer::Autopilot)) = &decision {
             let _ = event_tx.send(AgentEvent::PermissionRequestResolved {
                 request_id: request_id.to_owned(),
@@ -1285,17 +1305,14 @@ impl PermissionManager {
         let agent = requesting_agent(event_tx);
         let item = decision_item(request, &self.mode(), agent.as_deref(), reservation);
         let origin = DecisionOrigin {
-            subject: decision_subject(request),
             agent,
             tool_use_id: Some(request.id.clone()),
-            history_len: handle.snapshot().map_or(0, |snapshot| snapshot.history_len),
+            ..DecisionOrigin::new(&handle, decision_subject(request), &item)
         };
         Some(PromptDelegate {
-            seq: handle.next_seq(),
-            handle,
             reservation,
             item,
-            origin,
+            slot: DecisionSlot::new(handle, DecisionKind::Permission, origin, event_tx),
         })
     }
 
@@ -1311,23 +1328,28 @@ impl PermissionManager {
         context: &EvaluationContext,
     ) {
         let Some(outcome) = outcome else {
+            delegate.slot.end(DecisionOutcome::TakenOver);
             registration.note_autopilot(request, None);
             return;
         };
         let answer = delegated_answer(&outcome);
         if answer.is_err() && self.superseded(context) {
+            delegate.slot.end(DecisionOutcome::Superseded);
             return;
         }
-        delegate.record(&outcome, registration.event_tx);
         let note = match answer {
             Ok(answer) => {
                 if self.answer_as(registration.request_id, answer, Answerer::Autopilot) {
+                    delegate
+                        .slot
+                        .record(&outcome, Some(DecisionOutcome::Applied));
                     return;
                 }
                 None
             }
             Err(reason) => Some(AutopilotNote::Escalated { reason }),
         };
+        delegate.slot.record_open(&outcome);
         registration.note_autopilot(request, note);
     }
 
@@ -1576,8 +1598,9 @@ pub(super) mod tests {
     };
     use crate::Envelope;
     use crate::autopilot::{
-        ActionName, AutopilotDecision, DecisionKind, DelegateAction, DelegateOutcome,
-        DelegateOutput, GatedProvider, ScriptedProvider, Step, WireError, engaged_handle,
+        ActionName, AutopilotDecision, DecisionKind, DecisionOutcome, DelegateAction,
+        DelegateOutcome, DelegateOutput, GatedProvider, ScriptedProvider, Step, WireError,
+        engaged_handle,
     };
     use crate::decisions::Decisions;
     use crate::mcp::kind::{McpCallFacts, McpServerKind, PausedRuns};
@@ -1686,6 +1709,8 @@ pub(super) mod tests {
     const DELEGATE_ESCALATE: &str = r#"{"action":"escalate","reason":"the user must choose"}"#;
     const DELEGATE_REASON: &str = "the user asked for the build";
     const ESCALATION_REASON: &str = "the user must choose";
+    const HUMAN_ALLOW: &str = "allow";
+    const HUMAN_DENIAL: &str = "deny_guidance: run the narrower test instead";
     const TASK_ID: &str = "task-7";
     const INVOCATION_ID: &str = "invocation-7";
     const WORKFLOW_RUN_ID: &str = "run-3";
@@ -4435,6 +4460,43 @@ pub(super) mod tests {
             .collect()
     }
 
+    /// One row the audit log keeps of a decision.
+    #[derive(Debug, PartialEq)]
+    enum Row {
+        Decided(Option<DecisionOutcome>),
+        StoodDown(DecisionOutcome),
+        Settled(DecisionOutcome),
+    }
+
+    fn rows(events: &[AgentEvent]) -> Vec<Row> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Autopilot(AutopilotEvent::Decided(decision)) => {
+                    Some(Row::Decided(decision.outcome.clone()))
+                }
+                AgentEvent::Autopilot(AutopilotEvent::StoodDown(stood_down)) => {
+                    Some(Row::StoodDown(stood_down.outcome.clone()))
+                }
+                AgentEvent::Autopilot(AutopilotEvent::Settled { outcome, .. }) => {
+                    Some(Row::Settled(outcome.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn evaluation_context(manager: &PermissionManager) -> EvaluationContext {
+        EvaluationContext {
+            revision: *manager.context_revision.read().unwrap(),
+            plan_scoped: false,
+            builtin_allows: true,
+            force_prompt: false,
+            forced: false,
+            exact_plan: None,
+        }
+    }
+
     fn delegate_outcome(action: DelegateAction) -> DelegateOutcome {
         DelegateOutcome {
             kind: DecisionKind::Permission,
@@ -4547,13 +4609,14 @@ pub(super) mod tests {
 
     /// With no human to ask, autopilot's answer stands, and an escalation is a
     /// denial that says why.
-    #[test_case(DELEGATE_ALLOW, None, DECISION_SOURCE_AUTOPILOT_ONCE; "an_allow_runs_the_call")]
-    #[test_case(DELEGATE_DENY, Some(DENY_GUIDANCE), DECISION_SOURCE_AUTOPILOT_DENY; "a_denial_carries_its_guidance")]
-    #[test_case(DELEGATE_ESCALATE, Some(UNATTENDED_ESCALATION), DECISION_SOURCE_AUTOPILOT_DENY; "an_escalation_finds_no_human")]
+    #[test_case(DELEGATE_ALLOW, None, DECISION_SOURCE_AUTOPILOT_ONCE, DecisionOutcome::Applied; "an_allow_runs_the_call")]
+    #[test_case(DELEGATE_DENY, Some(DENY_GUIDANCE), DECISION_SOURCE_AUTOPILOT_DENY, DecisionOutcome::Applied; "a_denial_carries_its_guidance")]
+    #[test_case(DELEGATE_ESCALATE, Some(UNATTENDED_ESCALATION), DECISION_SOURCE_AUTOPILOT_DENY, DecisionOutcome::DeniedUnattended; "an_escalation_finds_no_human")]
     fn an_unattended_prompt_takes_the_autopilot_answer(
         answer: &'static str,
         guidance: Option<&str>,
         source: &str,
+        outcome: DecisionOutcome,
     ) {
         let manager = autopilot_manager(ScriptedProvider::new(vec![Step::Answer(answer)]));
         let (event_tx, events) = flume::unbounded();
@@ -4589,7 +4652,7 @@ pub(super) mod tests {
                 ..
             }))
         ));
-        assert_eq!(decided(&events).len(), 1);
+        assert_eq!(rows(&events), [Row::Decided(Some(outcome))]);
         assert!(
             !events
                 .iter()
@@ -4652,6 +4715,10 @@ pub(super) mod tests {
             (decision.action, decision.tool_use_id.as_deref()),
             (action, Some(CONTROLLED_REQUEST))
         );
+        assert_eq!(
+            rows(&events),
+            [Row::Decided(Some(DecisionOutcome::Applied))]
+        );
         assert_eq!(resolved_by(&events), [Some(Answerer::Autopilot)]);
     }
 
@@ -4699,6 +4766,15 @@ pub(super) mod tests {
             .map(|decision| (decision.action, decision.reason.as_str()))
             .collect();
         assert_eq!(decisions, [(ActionName::Escalate, ESCALATION_REASON)]);
+        assert_eq!(
+            rows(&seen),
+            [
+                Row::Decided(None),
+                Row::Settled(DecisionOutcome::Answered {
+                    answer: HUMAN_ALLOW.into()
+                })
+            ]
+        );
         assert!(resolved_by(&seen).is_empty());
     }
 
@@ -4740,7 +4816,7 @@ pub(super) mod tests {
 
         assert!(result.unwrap_err().guidance.is_none());
         seen.extend(events_of(&events));
-        assert!(decided(&seen).is_empty());
+        assert_eq!(rows(&seen), [Row::StoodDown(DecisionOutcome::TakenOver)]);
     }
 
     enum PromptEnd {
@@ -4749,12 +4825,18 @@ pub(super) mod tests {
         Reloaded,
     }
 
-    /// Whatever ends a waiting prompt ends autopilot's call for it, with no
-    /// row and no escalation, and the prompt never resolves as autopilot's.
-    #[test_case(PromptEnd::Settled, true, DECISION_SOURCE_YOLO; "a_matching_rule")]
-    #[test_case(PromptEnd::Cancelled, false, DECISION_SOURCE_USER_ABORT; "a_cancelled_run")]
-    #[test_case(PromptEnd::Reloaded, false, DECISION_SOURCE_RULE; "a_reload")]
-    fn the_delegate_stops_when_the_prompt_ends(end: PromptEnd, allowed: bool, source: &str) {
+    /// Whatever ends a waiting prompt ends autopilot's call for it, which
+    /// stands down with no escalation, and the prompt never resolves as
+    /// autopilot's.
+    #[test_case(PromptEnd::Settled, true, DECISION_SOURCE_YOLO, DecisionOutcome::Superseded; "a_matching_rule")]
+    #[test_case(PromptEnd::Cancelled, false, DECISION_SOURCE_USER_ABORT, DecisionOutcome::Cancelled; "a_cancelled_run")]
+    #[test_case(PromptEnd::Reloaded, false, DECISION_SOURCE_RULE, DecisionOutcome::Superseded; "a_reload")]
+    fn the_delegate_stops_when_the_prompt_ends(
+        end: PromptEnd,
+        allowed: bool,
+        source: &str,
+        outcome: DecisionOutcome,
+    ) {
         let (provider, started, _release) = held_provider();
         let manager = autopilot_manager(provider);
         let (event_tx, events) = flume::unbounded();
@@ -4791,7 +4873,7 @@ pub(super) mod tests {
             Err(flume::TryRecvError::Disconnected)
         ));
         let events = events_of(&events);
-        assert!(decided(&events).is_empty());
+        assert_eq!(rows(&events), [Row::StoodDown(outcome)]);
         assert!(!escalated(&events));
         assert_eq!(resolved_by(&events), [None]);
     }
@@ -4907,14 +4989,7 @@ pub(super) mod tests {
         let manager = autopilot_manager(ScriptedProvider::new(Vec::new()));
         let mut request = shell_request(&[FIRST_COMMAND], workcell_shell_subject());
         let request_id = request.id.clone();
-        let context = EvaluationContext {
-            revision: *manager.context_revision.read().unwrap(),
-            plan_scoped: false,
-            builtin_allows: true,
-            force_prompt: false,
-            forced: false,
-            exact_plan: None,
-        };
+        let context = evaluation_context(&manager);
         let (event_tx, events) = flume::unbounded();
         let event_tx = EventSender::new(event_tx, 0);
         let delegate = manager
@@ -4967,6 +5042,48 @@ pub(super) mod tests {
                 .map(|pending| pending.presentation.autopilot),
             Some(None)
         );
+    }
+
+    /// What ends a prompt ends autopilot's decision for it: one still deciding
+    /// stands down, and one already recorded settles, with the human's answer
+    /// as the log words it.
+    #[test_case(None, Some(PendingDecision::Explicit(PermissionAnswer::AllowOnce, Answerer::User)), Row::StoodDown(DecisionOutcome::TakenOver); "a_human_while_deciding")]
+    #[test_case(Some(DelegateAction::Allow), Some(PendingDecision::Explicit(PermissionAnswer::DenyWithGuidance(DENY_GUIDANCE.into()), Answerer::User)), Row::Settled(DecisionOutcome::HumanFirst { answer: HUMAN_DENIAL.into() }); "a_human_first")]
+    #[test_case(Some(DelegateAction::Escalate), Some(PendingDecision::Explicit(PermissionAnswer::AllowOnce, Answerer::User)), Row::Settled(DecisionOutcome::Answered { answer: HUMAN_ALLOW.into() }); "a_human_answering_an_escalation")]
+    #[test_case(None, Some(PendingDecision::MatchedRule), Row::StoodDown(DecisionOutcome::Superseded); "a_rule_while_deciding")]
+    #[test_case(Some(DelegateAction::Escalate), Some(PendingDecision::PolicyDenied(CURRENT_POLICY_DENIES_REQUEST.into())), Row::Settled(DecisionOutcome::Superseded); "a_policy_after_an_escalation")]
+    #[test_case(None, None, Row::StoodDown(DecisionOutcome::Cancelled); "a_stopped_run_while_deciding")]
+    #[test_case(Some(DelegateAction::Allow), None, Row::Settled(DecisionOutcome::Cancelled); "a_stopped_run_after_an_answer")]
+    fn what_ends_a_prompt_ends_its_decision(
+        recorded: Option<DelegateAction>,
+        decision: Option<PendingDecision>,
+        last: Row,
+    ) {
+        let manager = autopilot_manager(ScriptedProvider::new(Vec::new()));
+        let request = shell_request(&[FIRST_COMMAND], workcell_shell_subject());
+        let (event_tx, events) = flume::unbounded();
+        let delegate = manager
+            .prompt_delegate(
+                &request,
+                &evaluation_context(&manager),
+                &EventSender::new(event_tx, 0),
+            )
+            .unwrap();
+        delegate.slot.announce();
+        let expected: Vec<Row> = recorded
+            .as_ref()
+            .map(|_| Row::Decided(None))
+            .into_iter()
+            .chain([last])
+            .collect();
+        if let Some(action) = recorded {
+            delegate.slot.record_open(&delegate_outcome(action));
+        }
+
+        delegate.settle(decision.as_ref());
+        drop(delegate);
+
+        assert_eq!(rows(&events_of(&events)), expected);
     }
 
     /// The screen refuses an action the request does not accept, whatever let

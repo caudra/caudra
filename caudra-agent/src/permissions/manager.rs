@@ -1385,7 +1385,7 @@ mod tests {
     fn autopilot_reaches_agents_sharing_the_manager_but_never_a_fork() {
         let root = Arc::new(default_mgr());
         let autopilot = AutopilotHandle::default();
-        autopilot.engage(false);
+        autopilot.engage(false, None);
         root.set_autopilot(Some(autopilot));
         let agent = Arc::clone(&root);
 

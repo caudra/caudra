@@ -1981,14 +1981,9 @@ mod tests {
         let session_id = SessionRef::from(CaudraId::generate());
         static LEASE_DIR: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
         let lease_dir = LEASE_DIR.get_or_init(|| TempDir::new().unwrap());
-        let session_lease = Arc::new(
-            SessionLease::acquire(
-                &StateDir::from_path(lease_dir.path().to_path_buf()),
-                session_id.id(),
-            )
-            .unwrap(),
-        );
-        let handle = InteractiveHandle::for_test(session_lease, permissions, answer_tx);
+        let state_dir = StateDir::from_path(lease_dir.path().to_path_buf());
+        let session_lease = Arc::new(SessionLease::acquire(&state_dir, session_id.id()).unwrap());
+        let handle = InteractiveHandle::for_test(state_dir, session_lease, permissions, answer_tx);
         let server = Server {
             out_tx,
             model_specs: Vec::new(),

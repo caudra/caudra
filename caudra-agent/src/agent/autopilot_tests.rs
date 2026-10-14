@@ -194,7 +194,7 @@ mod autopilot_tests {
 
     fn engaged(owns_goal: bool) -> AutopilotHandle {
         let handle = AutopilotHandle::default();
-        handle.engage(owns_goal);
+        handle.engage(owns_goal, None);
         handle
     }
 
@@ -206,7 +206,7 @@ mod autopilot_tests {
         events
             .iter()
             .filter_map(|envelope| match &envelope.event {
-                AgentEvent::Autopilot(AutopilotEvent::Ended { reason }) => Some(reason.clone()),
+                AgentEvent::Autopilot(AutopilotEvent::Ended { reason, .. }) => Some(reason.clone()),
                 _ => None,
             })
             .collect()
@@ -348,7 +348,7 @@ mod autopilot_tests {
         smol::block_on(async {
             let handle = AutopilotHandle::default();
             if engage {
-                handle.engage(false);
+                handle.engage(false, None);
             }
             let mut history = History::new(Vec::new());
             let (mut agent, _events) = make_agent(
@@ -1470,7 +1470,7 @@ mod autopilot_tests {
         smol::block_on(async {
             let handle = AutopilotHandle::default();
             if verdict.is_some() {
-                handle.engage(false);
+                handle.engage(false, None);
             }
             let mut responses = vec![goal_response(false, false, DECISION_VERDICT)];
             responses.extend(verdict.map(answer));
@@ -1829,7 +1829,7 @@ mod autopilot_tests {
     fn clocked(error_retries: u32) -> (Arc<FakeClock>, AutopilotHandle) {
         let clock = FakeClock::new(START_MS);
         let handle = AutopilotHandle::new(Arc::clone(&clock) as Arc<dyn Clock>);
-        handle.engage(false);
+        handle.engage(false, None);
         handle.set_limits(AutopilotConfig {
             error_retries,
             ..AutopilotConfig::default()

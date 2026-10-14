@@ -899,6 +899,10 @@ const DECISION_TITLED: &str = "a decision row must show its title";
 const DECISION_FOLDED: &str = "a decision row's details must stay folded";
 const DECISION_OPENED: &str = "a click must open a decision row's details";
 const DECISION_STYLES_APART: &str = "each outcome must draw its row its own way";
+const AUTOPILOT_SEQ: u64 = 7;
+const AUTOPILOT_TITLE: &str = "permission allow: shell · the tests need running";
+const AUTOPILOT_DETAIL: &str = "Agent: main";
+const NOTHING_TO_FOLD: &str = "a row without details to hide must not fold";
 const EAGER_SUMMARY: &str = "executed arguments";
 const EAGER_BODY: &str = "execution output";
 const EAGER_ANNOTATION: &str = "ranking 12 files";
@@ -5328,6 +5332,61 @@ fn a_decision_row_never_takes_the_newest_card_place() {
     assert_eq!(after_card, card + 1);
     assert!(panel.is_latest(card));
     assert!(!panel.is_latest(after_card));
+}
+
+fn titled(details: &[&str]) -> String {
+    [&[AUTOPILOT_TITLE], details].concat().join("\n")
+}
+
+/// An autopilot decision reads as its title until clicked open, like a
+/// decision-engine row.
+#[test]
+fn an_autopilot_decision_row_shows_its_title_until_clicked_open() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::autopilot_decision(
+        AUTOPILOT_SEQ,
+        titled(&[AUTOPILOT_DETAIL]),
+    ));
+    let area = Rect::new(0, 0, 80, 24);
+
+    let folded = buffer_text(&render(&mut panel, area.width, area.height));
+    let folded_height = panel.segment_heights()[0];
+    assert!(
+        folded.contains(AUTOPILOT_TITLE),
+        "{DECISION_TITLED}: {folded}"
+    );
+    assert!(
+        !folded.contains(AUTOPILOT_DETAIL),
+        "{DECISION_FOLDED}: {folded}"
+    );
+
+    assert!(panel.handle_click(0, area));
+    let opened = buffer_text(&render(&mut panel, area.width, area.height));
+    assert!(
+        opened.contains(AUTOPILOT_DETAIL),
+        "{DECISION_OPENED}: {opened}"
+    );
+
+    assert!(panel.handle_click(0, area));
+    assert_eq!(panel.segment_heights()[0], folded_height);
+}
+
+/// A decision with no details has nothing to open, and an observation row
+/// autopilot wrote is read whole, so neither folds.
+#[test_case(DisplayMessage::autopilot_decision(AUTOPILOT_SEQ, titled(&[])), None ; "a_decision_without_details")]
+#[test_case(DisplayMessage::autopilot(titled(&[AUTOPILOT_DETAIL])), Some(AUTOPILOT_DETAIL) ; "an_observation")]
+fn an_autopilot_row_with_nothing_to_hide_never_folds(row: DisplayMessage, shown: Option<&str>) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(row);
+    let area = Rect::new(0, 0, 80, 24);
+
+    let drawn = buffer_text(&render(&mut panel, area.width, area.height));
+
+    assert!(!panel.handle_click(0, area), "{NOTHING_TO_FOLD}");
+    assert!(
+        shown.is_none_or(|line| drawn.contains(line)),
+        "{NOTHING_TO_FOLD}: {drawn}"
+    );
 }
 
 #[test]

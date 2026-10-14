@@ -305,6 +305,13 @@ Some pickers add extra bindings on top of the defaults:
 | Decisions | `g` | Cycle the scope: this session, this project, every session |
 | Decisions | `y` | Copy the selected decision as JSON, or the visible section |
 | Decisions | `Ctrl+R` | Read the decision log again |
+| Autopilot Panel | `Tab` / `Shift+Tab` | Switch between Status and Log |
+| Autopilot Panel | `1-2` | Jump to Status or Log |
+| Autopilot Panel | `j` / `k` | Next or previous log entry, skipping engagement headers |
+| Autopilot Panel | `Left` / `Right` | Focus the log list or the entry's detail |
+| Autopilot Panel | `Enter` | Jump to the entry's row in the transcript. A narrow panel opens its detail first |
+| Autopilot Panel | `f` | Cycle the log filter: all, left to you, then each decision kind |
+| Autopilot Panel | `y` | Copy the selected log entry as text |
 | Autopilot Panel | `s` | Stop autopilot |
 | Autopilot Panel | `m` | Pick the model for the Autopilot job |
 | Autopilot Panel | `q` | Close, as Esc does |

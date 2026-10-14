@@ -13,8 +13,9 @@ use futures_lite::future;
 use serde_json::Value;
 use tracing::debug;
 
+use crate::AgentEvent;
 use crate::autopilot::question::QuestionDelegate;
-use crate::autopilot::{DelegateAction, DelegateOutcome, DelegateOutput};
+use crate::autopilot::{DecisionOutcome, DelegateAction, DelegateOutcome, DelegateOutput};
 use crate::cancel::CancelToken;
 use crate::tools::registry::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolFailure,
@@ -23,7 +24,6 @@ use crate::tools::registry::{
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{DescriptionContext, ToolAudience, ToolContext};
 use crate::types::{Answer, Answerer, AskedQuestion, QuestionEvent, QuestionOption, ToolOutput};
-use crate::{AgentEvent, EventSender};
 
 pub const DESCRIPTION: &str = "Use this tool when you need to ask the user questions during execution. This allows you to:
 1. Gather user preferences or requirements
@@ -218,7 +218,12 @@ impl ToolInvocation for QuestionCall {
             let delegate = autopilot
                 .filter(|handle| asked_by_main_agent(ctx) && handle.is_engaged())
                 .map(|handle| {
-                    QuestionDelegate::new(handle, &self.questions, ctx.tool_use_id.clone())
+                    QuestionDelegate::new(
+                        handle,
+                        &self.questions,
+                        ctx.tool_use_id.clone(),
+                        &ctx.event_tx,
+                    )
                 });
             let _ = ctx
                 .event_tx
@@ -229,7 +234,7 @@ impl ToolInvocation for QuestionCall {
             let fit = |picked: &[Vec<String>]| {
                 delegated_answers(&self.questions, picked).ok_or_else(|| UNFIT_ANSWER.to_owned())
             };
-            let wait = wait_for_answer(&guard, delegate, &ctx.event_tx, &ctx.cancel, fit);
+            let wait = wait_for_answer(&guard, delegate, &ctx.cancel, fit);
             let reply = ctx.cancel.race(wait).await;
             drop(guard);
 
@@ -268,41 +273,42 @@ pub(crate) fn drop_stale_replies(replies: &Receiver<String>) {
 pub(crate) async fn wait_for_answer<T>(
     replies: &Receiver<String>,
     delegate: Option<QuestionDelegate>,
-    event_tx: &EventSender,
     cancel: &CancelToken,
     fit: impl FnOnce(&[Vec<String>]) -> Result<T, String>,
 ) -> Option<Reply<T>> {
-    if let Some(delegate) = delegate {
-        delegate.announce(event_tx);
-        let woken = future::or(
-            async { Woken::Human(replies.recv_async().await.ok()) },
-            async { Woken::Delegate(delegate.decide(event_tx, cancel).await) },
-        )
-        .await;
-        match woken {
-            Woken::Human(reply) => return reply.map(Reply::Human),
-            Woken::Delegate(None) => return None,
-            Woken::Delegate(Some(outcome)) => {
-                if let Some(answer) = conclude(&delegate, outcome, event_tx, fit) {
-                    return Some(
-                        replies
-                            .try_recv()
-                            .map_or(Reply::Autopilot(answer), Reply::Human),
-                    );
-                }
+    let Some(delegate) = delegate else {
+        return replies.recv_async().await.ok().map(Reply::Human);
+    };
+    delegate.announce();
+    let woken = future::or(
+        async { Woken::Human(replies.recv_async().await.ok()) },
+        async { Woken::Delegate(delegate.decide(cancel).await) },
+    )
+    .await;
+    let raw = match woken {
+        Woken::Human(reply) => reply?,
+        Woken::Delegate(None) => return None,
+        Woken::Delegate(Some(mut outcome)) => {
+            if let Some(answer) = claimed(&delegate, &mut outcome, fit)
+                && replies.is_empty()
+            {
+                delegate.record(&outcome, DecisionOutcome::Applied);
+                return Some(Reply::Autopilot(answer));
             }
+            delegate.record_open(&outcome);
+            replies.recv_async().await.ok()?
         }
-    }
-    replies.recv_async().await.ok().map(Reply::Human)
+    };
+    delegate.human_answered(&raw);
+    Some(Reply::Human(raw))
 }
 
-/// Takes the delegate's answer when the form accepts it and the human has not
-/// taken the form first, and records the decision either way. An answer the
-/// form does not accept is recorded as an escalation.
-fn conclude<T>(
+/// The delegate's answer as the form takes it, when the form accepts it and
+/// the human has not taken the form first. An answer the form does not accept
+/// becomes an escalation.
+fn claimed<T>(
     delegate: &QuestionDelegate,
-    mut outcome: DelegateOutcome,
-    event_tx: &EventSender,
+    outcome: &mut DelegateOutcome,
     fit: impl FnOnce(&[Vec<String>]) -> Result<T, String>,
 ) -> Option<T> {
     let answer = match &outcome.answer {
@@ -314,9 +320,7 @@ fn conclude<T>(
             .ok(),
         _ => None,
     };
-    let taken = answer.filter(|_| delegate.claim());
-    delegate.record(&outcome, event_tx);
-    taken
+    answer.filter(|_| delegate.claim())
 }
 
 impl QuestionCall {
@@ -431,7 +435,7 @@ mod tests {
     use crate::permissions::PermissionManager;
     use crate::tools::test_support::{stub_ctx, stub_ctx_with_permissions};
     use crate::types::AutopilotEvent;
-    use crate::{AgentMode, Envelope};
+    use crate::{AgentMode, Envelope, EventSender};
 
     const PICK: &str = "Pick one";
     const HEADER: &str = "Choice";
@@ -461,6 +465,8 @@ mod tests {
     const UNTOUCHED: &str = "without an engaged main autopilot the question must wait as before";
     const STALE: &str = "a late reply to an earlier form must never answer this one";
     const OLD_SHAPE: &str = "a user's answer must keep the shape older sessions stored";
+    const TAKEN_OVER: &str = "a human answering first must stand the delegate down";
+    const SETTLED_BY_HUMAN: &str = "a recorded decision must settle with the human's answer";
 
     /// A main-agent question context that answers on `replies` and reports on
     /// `events`, with `autopilot` on its session's permissions.
@@ -539,6 +545,17 @@ mod tests {
         }
     }
 
+    fn settled(asked: &Asked) -> Vec<DecisionOutcome> {
+        asked
+            .autopilot_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                AutopilotEvent::Settled { outcome, .. } => Some(outcome),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn call() -> Box<QuestionCall> {
         Box::new(QuestionCall {
             questions: vec![question(HEADER, false)],
@@ -601,6 +618,7 @@ mod tests {
         );
         assert_eq!(decision.tool_use_id.as_deref(), Some(TOOL_USE_ID));
         assert_eq!(decision.agent, None);
+        assert_eq!(decision.outcome, Some(DecisionOutcome::Applied));
     }
 
     #[test]
@@ -620,6 +638,15 @@ mod tests {
         assert_eq!(answers[0].by, Answerer::User, "{HUMAN_WINS}");
         assert!(running.recv().is_err(), "{CUT_OFF}");
         assert!(handle.recent_decisions().is_empty(), "{CUT_OFF}");
+        let events = asked.autopilot_events();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [AutopilotEvent::Deciding { .. }, AutopilotEvent::StoodDown(stood_down)]
+                    if stood_down.outcome == DecisionOutcome::TakenOver
+            ),
+            "{TAKEN_OVER}: {events:?}"
+        );
     }
 
     #[test]
@@ -640,6 +667,11 @@ mod tests {
         assert_eq!(answers[0].labels, [NO], "{HUMAN_WINS}");
         assert_eq!(answers[0].by, Answerer::User, "{HUMAN_WINS}");
         assert_eq!(handle.recent_decisions().len(), 1);
+        assert_eq!(
+            settled(&asked),
+            [DecisionOutcome::HumanFirst { answer: NO.into() }],
+            "{SETTLED_BY_HUMAN}"
+        );
     }
 
     #[test_case(ANSWER_EACH, UNFIT_ANSWER ; "an_answer_for_a_question_not_asked")]
@@ -664,6 +696,11 @@ mod tests {
             "{LEFT_TO_HUMAN}"
         );
         assert_eq!(answers(result)[0].by, Answerer::User, "{LEFT_TO_HUMAN}");
+        assert_eq!(
+            settled(&asked),
+            [DecisionOutcome::Answered { answer: NO.into() }],
+            "{SETTLED_BY_HUMAN}"
+        );
     }
 
     #[test_case(None, None ; "without_autopilot")]
