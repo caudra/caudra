@@ -12,12 +12,18 @@ use std::time::{Duration, Instant};
 use caudra_config::config_file;
 use caudra_storage::version::{self, Release, UpdateChannel, VersionError};
 use caudra_storage::{StateDir, StorageError};
-use isahc::Request;
 use isahc::config::{Configurable, RedirectPolicy};
 use isahc::http::Uri;
+use isahc::{Body, HttpClient, Request, Response};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tempfile::Builder;
+
+#[cfg(not(windows))]
+use archive::{ARCHIVE_ENV, Archive};
+
+#[cfg(not(windows))]
+mod archive;
 
 const RELEASE_DOWNLOAD_URL: &str = "https://github.com/caudra/caudra/releases/download";
 const CHECKSUM_FILE: &str = "sha256sums.txt";
@@ -25,9 +31,11 @@ const INSTALLER_BYTES: u64 = 1024 * 1024;
 const CHECKSUM_BYTES: u64 = 64 * 1024;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const LOW_SPEED_BYTES: u32 = 1024;
+const LOW_SPEED_WINDOW: Duration = Duration::from_secs(30);
 const REDIRECT_LIMIT: u32 = 5;
 const CHECKSUM_INVALID: &str = "invalid release checksum manifest";
-const CHECKSUM_MISSING: &str = "release checksum manifest must contain exactly one installer entry";
+const CHECKSUM_MISSING: &str = "release checksum manifest must list the asset exactly once";
 const CHECKSUM_MISMATCH: &str = "release installer checksum mismatch";
 const WINDOWS_ROLLBACK: &str = "in-process rollback is not supported on Windows; close all Caudra processes and run the versioned PowerShell installer for the previous release";
 const BACKUP_FILENAME: &str = "caudra_backup";
@@ -159,6 +167,10 @@ pub enum UpdateError {
     #[cfg(not(windows))]
     InstallFailed(Option<i32>),
 
+    #[error("could not download the release archive ({0})")]
+    #[cfg(not(windows))]
+    Download(io::Error),
+
     #[error("no backup found at {0}")]
     NoBackup(PathBuf),
 
@@ -176,59 +188,73 @@ pub enum UpdateError {
     VersionCheck(#[from] VersionError),
 }
 
-fn fetch_asset(url: &str, limit: u64) -> Result<Vec<u8>, UpdateError> {
-    let fetch = || -> io::Result<Vec<u8>> {
-        let client = isahc::HttpClient::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(FETCH_TIMEOUT)
-            .redirect_policy(RedirectPolicy::None)
-            .build()
-            .map_err(io::Error::other)?;
-        let started = Instant::now();
-        let mut next = url.to_owned();
-        for redirects in 0..=REDIRECT_LIMIT {
-            if !asset_url_allowed(&next) {
-                return Err(io::Error::other(
-                    "release asset redirect is not an allowed HTTPS origin",
-                ));
-            }
-            let timeout = FETCH_TIMEOUT
+fn asset_url(release: &Release, name: &str) -> String {
+    format!("{RELEASE_DOWNLOAD_URL}/{}/{name}", release.tag)
+}
+
+/// Follows redirects by hand so every hop stays on an allowed HTTPS origin.
+/// `deadline` bounds the whole transfer; without one, only a stall ends it.
+fn open_asset(url: &str, deadline: Option<Duration>) -> io::Result<Response<Body>> {
+    let client = HttpClient::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .low_speed_timeout(LOW_SPEED_BYTES, LOW_SPEED_WINDOW)
+        .redirect_policy(RedirectPolicy::None)
+        .build()
+        .map_err(io::Error::other)?;
+    let started = Instant::now();
+    let mut next = url.to_owned();
+    for _ in 0..=REDIRECT_LIMIT {
+        if !asset_url_allowed(&next) {
+            return Err(io::Error::other(
+                "release asset redirect is not an allowed HTTPS origin",
+            ));
+        }
+        let mut request = Request::get(&next);
+        if let Some(deadline) = deadline {
+            let timeout = deadline
                 .checked_sub(started.elapsed())
                 .filter(|duration| !duration.is_zero())
                 .ok_or_else(|| io::Error::other("release asset download timed out"))?;
-            let request = Request::get(&next)
-                .timeout(timeout)
-                .body(())
-                .map_err(io::Error::other)?;
-            let response = match client.send(request) {
-                Ok(response) => response,
-                Err(error) if redirects == 0 => {
-                    return version::curl_fetch(url).map_err(|_| io::Error::other(error));
-                }
-                Err(error) => return Err(io::Error::other(error)),
-            };
-            if response.status().is_redirection() {
-                next = response
-                    .headers()
-                    .get("Location")
-                    .and_then(|value| value.to_str().ok())
-                    .ok_or_else(|| {
-                        io::Error::other("release asset redirect has no valid location")
-                    })?
-                    .to_owned();
-                continue;
-            }
-            if !response.status().is_success() {
-                return Err(io::Error::other(format!("HTTP {}", response.status())));
-            }
-            let mut bytes = Vec::new();
-            response
-                .into_body()
-                .take(limit + 1)
-                .read_to_end(&mut bytes)?;
-            return Ok(bytes);
+            request = request.timeout(timeout);
         }
-        Err(io::Error::other("release asset redirect limit exceeded"))
+        let request = request.body(()).map_err(io::Error::other)?;
+        let response = client.send(request).map_err(io::Error::other)?;
+        if response.status().is_redirection() {
+            next = response
+                .headers()
+                .get("Location")
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| io::Error::other("release asset redirect has no valid location"))?
+                .to_owned();
+            continue;
+        }
+        if !response.status().is_success() {
+            return Err(io::Error::other(format!("HTTP {}", response.status())));
+        }
+        return Ok(response);
+    }
+    Err(io::Error::other("release asset redirect limit exceeded"))
+}
+
+fn fetch_asset(url: &str, limit: u64) -> Result<Vec<u8>, UpdateError> {
+    let fetch = || -> io::Result<Vec<u8>> {
+        let response = match open_asset(url, Some(FETCH_TIMEOUT)) {
+            Ok(response) => response,
+            Err(error)
+                if error
+                    .get_ref()
+                    .is_some_and(|inner| inner.is::<isahc::Error>()) =>
+            {
+                return version::curl_fetch(url).map_err(|_| error);
+            }
+            Err(error) => return Err(error),
+        };
+        let mut bytes = Vec::new();
+        response
+            .into_body()
+            .take(limit + 1)
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
     };
     let bytes = fetch().map_err(|source| UpdateError::Fetch {
         url: url.to_owned(),
@@ -257,7 +283,7 @@ fn asset_url_allowed(url: &str) -> bool {
     })
 }
 
-fn verify_checksum(manifest: &[u8], name: &str, bytes: &[u8]) -> Result<(), UpdateError> {
+fn expected_digest(manifest: &[u8], name: &str) -> Result<[u8; 32], UpdateError> {
     let text =
         std::str::from_utf8(manifest).map_err(|_| UpdateError::Integrity(CHECKSUM_INVALID))?;
     let mut expected = None;
@@ -286,28 +312,29 @@ fn verify_checksum(manifest: &[u8], name: &str, bytes: &[u8]) -> Result<(), Upda
         }
     }
     let expected = expected.ok_or(UpdateError::Integrity(CHECKSUM_MISSING))?;
-    if !Sha256::digest(bytes)
-        .iter()
-        .enumerate()
-        .all(|(index, byte)| {
-            u8::from_str_radix(&expected[index * 2..index * 2 + 2], 16) == Ok(*byte)
-        })
-    {
+    let mut digest = [0; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&expected[index * 2..index * 2 + 2], 16)
+            .map_err(|_| UpdateError::Integrity(CHECKSUM_INVALID))?;
+    }
+    Ok(digest)
+}
+
+fn verify_checksum(manifest: &[u8], name: &str, bytes: &[u8]) -> Result<(), UpdateError> {
+    if Sha256::digest(bytes).as_slice() != expected_digest(manifest, name)? {
         return Err(UpdateError::Integrity(CHECKSUM_MISMATCH));
     }
     Ok(())
 }
 
-fn fetch_script(release: &Release) -> Result<String, UpdateError> {
+fn fetch_script(release: &Release, checksums: &[u8]) -> Result<String, UpdateError> {
     let name = if cfg!(windows) {
         "install.ps1"
     } else {
         "install.sh"
     };
-    let base = format!("{RELEASE_DOWNLOAD_URL}/{}", release.tag);
-    let manifest = fetch_asset(&format!("{base}/{CHECKSUM_FILE}"), CHECKSUM_BYTES)?;
-    let bytes = fetch_asset(&format!("{base}/{name}"), INSTALLER_BYTES)?;
-    verify_checksum(&manifest, name, &bytes)?;
+    let bytes = fetch_asset(&asset_url(release, name), INSTALLER_BYTES)?;
+    verify_checksum(checksums, name, &bytes)?;
     String::from_utf8(bytes).map_err(|_| UpdateError::Integrity("release installer is not UTF-8"))
 }
 
@@ -573,16 +600,20 @@ fn execute_script(
     install_dir: &Path,
     tag: &str,
     backup: &Path,
+    archive: Option<&Archive>,
 ) -> Result<(), UpdateError> {
     let mut tmp = tempfile::NamedTempFile::new().map_err(UpdateError::WriteScript)?;
     tmp.write_all(script.as_bytes())
         .map_err(UpdateError::WriteScript)?;
     tmp.flush().map_err(UpdateError::WriteScript)?;
 
-    let status = installer_command(tmp.path(), install_dir, tag)
-        .env(SNAPSHOT_ENV, backup)
-        .status()
-        .map_err(UpdateError::ExecScript)?;
+    let mut command = installer_command(tmp.path(), install_dir, tag);
+    command.env(SNAPSHOT_ENV, backup);
+    match archive {
+        Some(archive) => command.env(ARCHIVE_ENV, archive.path()),
+        None => command.env_remove(ARCHIVE_ENV),
+    };
+    let status = command.status().map_err(UpdateError::ExecScript)?;
 
     if !status.success() {
         return Err(UpdateError::InstallFailed(status.code()));
@@ -876,7 +907,8 @@ pub fn update(
     };
     let storage = StateDir::resolve()?;
 
-    let script = fetch_script(&release)?;
+    let checksums = fetch_asset(&asset_url(&release, CHECKSUM_FILE), CHECKSUM_BYTES)?;
+    let script = fetch_script(&release, &checksums)?;
 
     if show_script {
         println!("{script}");
@@ -886,17 +918,24 @@ pub fn update(
         }
     }
 
-    let backup_path = backup_binary(&exe_path, &storage)?;
-
     #[cfg(windows)]
     {
+        let backup_path = backup_binary(&exe_path, &storage)?;
         prepare_windows_update(&script, &install_dir, &release.tag, &backup_path)?;
         println!("Previous version saved to: {}", backup_path.display());
     }
 
     #[cfg(not(windows))]
     {
-        execute_script(&script, &install_dir, &release.tag, &backup_path)?;
+        let archive = archive::download(&release, &checksums)?;
+        let backup_path = backup_binary(&exe_path, &storage)?;
+        execute_script(
+            &script,
+            &install_dir,
+            &release.tag,
+            &backup_path,
+            archive.as_ref(),
+        )?;
         println!(
             "Updated to {}. Run `caudra rollback` to return to v{}.",
             release.tag,

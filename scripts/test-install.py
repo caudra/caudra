@@ -25,6 +25,10 @@ RUN_NOW = "Run Caudra now (no PATH change needed):"
 CHILD_PATH_NOTICE = "cannot change PATH in your current terminal"
 NO_SHELL_EDITS = "No shell startup files were changed."
 ROOT_WARNING = "warning: running as root"
+INVALID_RESPONSE = "invalid release response"
+SUPPLIED_ARCHIVE = "caudra-v0.1.0-x86_64-unknown-linux-musl.tar.gz"
+EXPANDED_PACKAGES = 1800
+NESTING_DEPTH = 40
 BUNDLE_FILES = {
     "manifest.json": b'{"schema_version":1}\n',
     "ATTRIBUTION.txt": b"Dependency attribution\n",
@@ -1114,6 +1118,110 @@ class InstallTests(ReleaseCases):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("refusing symlink", result.stderr)
         self.assertEqual(list(outside.iterdir()), [])
+
+    def archive_requests(self):
+        log = self.root / "requests.jsonl"
+        return [
+            arg
+            for line in log.read_text().splitlines()
+            for arg in json.loads(line)
+            if arg.startswith("https://") and arg.endswith(".tar.gz")
+        ]
+
+    def test_large_expanded_previous_bundle_installs_within_timeout(self):
+        self.seed_installation()
+        packages = [
+            {
+                "name": f"crate-{index}",
+                "version": "1.0.0",
+                "license": "MIT OR Apache-2.0",
+                "files": [
+                    {
+                        "path": f"dependencies/crate-{index}/LICENSE-{file}",
+                        "sha256": "0" * 64,
+                        "size": 1024,
+                    }
+                    for file in range(5)
+                ],
+            }
+            for index in range(EXPANDED_PACKAGES)
+        ]
+        manifest = json.dumps({"schema_version": 1, "packages": packages}, indent=2)
+        (self.license_dir / "manifest.json").write_text(manifest)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_installed()
+
+    def test_malformed_release_json_fails_closed(self):
+        self.seed_installation()
+        valid = json.dumps(release("v0.1.0"))
+        deep = []
+        for _ in range(NESTING_DEPTH):
+            deep = [deep]
+        control = json.dumps(release("v0.1.0", body="a\x01b"))
+        for case, text in [
+            ("trailing", valid + " x"),
+            ("unterminated", valid[: valid.index('"v0.1.0"') + 4]),
+            ("control", control.replace("\\u0001", "\x01")),
+            ("leading_zero", valid.replace('"size": 100', '"size": 0100', 1)),
+            ("bare_minus", valid.replace('"size": 100', '"size": -', 1)),
+            ("empty_exponent", valid.replace('"size": 100', '"size": 1e', 1)),
+            ("literal_suffix", valid.replace('"draft": false', '"draft": falsex')),
+            ("nesting", json.dumps(release("v0.1.0", extra=deep))),
+        ]:
+            with self.subTest(case=case):
+                self.scenario["explicit"] = text
+                result = self.install()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(INVALID_RESPONSE, result.stderr)
+                self.assert_previous_installation()
+
+    def test_long_release_body_escapes_straddle_parser_windows(self):
+        # Each repetition serializes to the nine characters `\u00e9\"x`, so
+        # successive parser windows split both escapes.
+        self.scenario["explicit"] = release("v0.1.0", body='é"x' * 1200)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_installed()
+
+    def test_supplied_archive_replaces_the_download(self):
+        self.archive = self.root / SUPPLIED_ARCHIVE
+        self.env["TEST_ARCHIVE"] = str(self.archive)
+        self.env["CAUDRA_INSTALL_ARCHIVE"] = str(self.archive)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_installed()
+        self.assertEqual(self.archive_requests(), [])
+        self.assertNotIn("downloading", result.stdout)
+
+    def test_misnamed_supplied_archive_is_ignored(self):
+        self.env["CAUDRA_INSTALL_ARCHIVE"] = str(self.archive)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_installed()
+        self.assertIn("ignoring CAUDRA_INSTALL_ARCHIVE", result.stderr)
+        self.assertEqual(len(self.archive_requests()), 1)
+
+    def test_supplied_archive_is_verified_and_must_be_a_safe_path(self):
+        self.seed_installation()
+        supplied = self.root / "supplied" / SUPPLIED_ARCHIVE
+        supplied.parent.mkdir()
+        supplied.write_bytes(b"tampered archive")
+        linked = self.root / "linked"
+        linked.symlink_to(supplied.parent, target_is_directory=True)
+        for path, error in [
+            (str(supplied), "archive SHA-256 checksum mismatch"),
+            (f"supplied/{SUPPLIED_ARCHIVE}", "not an absolute path"),
+            (str(linked / SUPPLIED_ARCHIVE), "refusing symlink"),
+        ]:
+            with self.subTest(error=error):
+                self.env["CAUDRA_INSTALL_ARCHIVE"] = path
+                result = self.install()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(error, result.stderr)
+                self.assert_previous_installation()
+                self.assertFalse((self.root / "extracted").exists())
+        self.assertEqual(self.archive_requests(), [])
 
 
 @unittest.skipUnless(POWERSHELL, "PowerShell is not installed")

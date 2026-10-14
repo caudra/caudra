@@ -7,6 +7,17 @@ Each release lists what changed, newest first. After an update, the first intera
 
 To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run [`caudra update`](/docs/cli/#caudra-update-caudra-rollback). Each release links to its GitHub page, which holds the downloads.
 
+## Caudra 0.2 Preview 9 {#v0-2-0-preview-9}
+
+[v0.2.0-preview.9 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.9)
+
+Preview 9 fixes updates on macOS that sat for minutes on the download line and shows download progress while Caudra updates.
+
+### Command line
+
+- **Updates on macOS no longer stall.** Updating a Mac that still had the large license bundle from Preview 1 stayed on `downloading caudra …` for about four minutes. The installer checks the previous bundle before replacing it, and its JSON reader grew slower with every character of that bundle's 2 MB manifest under the `awk` that ships with macOS. It now reads the manifest in under a second, and a fresh install reads the GitHub release list faster too.
+- **Download progress.** The shell installer shows curl's progress bar for the release archive when it runs in a terminal, so updating to Preview 9 shows it already. From Preview 9 on, `caudra update` downloads the archive itself and shows a bar with size, speed, and time left. It checks the archive against the release checksums before it saves your current version, and if the download fails, the installer downloads the archive instead.
+
 ## Caudra 0.2 Preview 8 {#v0-2-0-preview-8}
 
 [v0.2.0-preview.8 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.8)

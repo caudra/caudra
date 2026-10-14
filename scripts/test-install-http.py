@@ -35,7 +35,13 @@ def response(uri, scenario):
             content += b"corruption"
         return 200, content
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    entry = f"{digest}  {marker.read_text()}\n"
+    tag = parsed.path.rsplit("/", 2)[1]
+    listed = (
+        marker.read_text()
+        if marker.exists()
+        else f"caudra-{tag}-x86_64-unknown-linux-musl.tar.gz"
+    )
+    entry = f"{digest}  {listed}\n"
     mode = scenario.get("checksum")
     if mode == "duplicate":
         entry += entry

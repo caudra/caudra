@@ -19,8 +19,8 @@ use crate::cli::Cli;
 /// Wide enough for `rewriting subagent_history_items`, the longest label, so the
 /// bar does not jump sideways when that phase starts.
 const BAR_TEMPLATE: &str = "  {msg:<32} [{bar:20}] {pos}/{len} {elapsed_precise}";
-const BAR_CHARS: &str = "=> ";
-const BAR_REFRESH: Duration = Duration::from_millis(100);
+pub(crate) const BAR_CHARS: &str = "=> ";
+pub(crate) const BAR_REFRESH: Duration = Duration::from_millis(100);
 const BACKUP_MESSAGE: &str = "backing up (pages)";
 const RECLAIM_MESSAGE: &str = "reclaiming (pages)";
 const SANDBOX_TEMPLATE: &str = "  {spinner} {msg} [{elapsed_precise}]";

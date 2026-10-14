@@ -27,7 +27,9 @@ github_api() {
 }
 
 download() {
-    curl -q -fsSL --proto '=https' --proto-redir '=https' --max-redirs 3 \
+    progress=-s
+    if [ "${4:-}" = progress ] && [ -t 2 ]; then progress=--progress-bar; fi
+    curl -q -fSL "${progress}" --proto '=https' --proto-redir '=https' --max-redirs 3 \
         --connect-timeout 10 --max-time 300 --max-filesize "${3:-2147483648}" "$1" -o "$2" || return 1
     [ "$(wc -c < "$2")" -le "${3:-2147483648}" ] || err "release response too large"
 }
@@ -87,59 +89,76 @@ function compare(a, b, ac, bc, ap, bp, an, bn, i, c) {
     }
     return an == bn ? 0 : (an > bn ? 1 : -1)
 }
-function ws() { while (substr(json, pos, 1) ~ /^[ \t\r\n]$/) pos++ }
-function string( s, c, e, h, n, i) {
-    if (substr(json, pos++, 1) != "\"") fail("invalid JSON string")
+# BWK awk (macOS) rescans a whole string on every substr() and length(), so the
+# parser reads its input through a window of at most CHUNK bytes.
+function fill() {
+    while (wi > wn) {
+        if (off <= srclen) { win = substr(src, off, CHUNK); wn = length(win); off += wn; wi = 1 }
+        else if ((getline src) > 0) { src = src "\n"; srclen = length(src); off = 1 }
+        else return 0
+    }
+    return 1
+}
+function peekc() { return fill() ? substr(win, wi, 1) : "" }
+function getc( c) { c = peekc(); if (c != "") wi++; return c }
+function ws() { while (peekc() ~ /^[ \t\r\n]$/) wi++ }
+function string( s, run, c, e, h, n, i) {
+    if (getc() != "\"") fail("invalid JSON string")
     s = ""
-    while (pos <= length(json)) {
-        c = substr(json, pos++, 1)
+    while (fill()) {
+        run = substr(win, wi)
+        if (match(run, /["\\]|[[:cntrl:]]/)) run = substr(run, 1, RSTART - 1)
+        s = s run; wi += length(run)
+        if (wi > wn) continue
+        c = getc()
         if (c == "\"") return s
-        if (c ~ /[[:cntrl:]]/) fail("control character in JSON")
-        if (c == "\\") {
-            e = substr(json, pos++, 1)
-            if (e == "u") {
-                h = substr(json, pos, 4); pos += 4
-                if (length(h) != 4 || h ~ /[^0-9a-fA-F]/) fail("invalid JSON escape")
-                n = 0
-                for (i = 1; i <= 4; i++) n = n * 16 + index("0123456789abcdef", tolower(substr(h, i, 1))) - 1
-                c = n >= 32 && n < 127 ? sprintf("%c", n) : "\001"
-            } else if (e == "\"" || e == "\\" || e == "/") c = e
-            else if (e ~ /^[bfnrt]$/) c = "\001"
-            else fail("invalid JSON escape")
-        }
+        if (c != "\\") fail("control character in JSON")
+        e = getc()
+        if (e == "u") {
+            h = ""
+            for (i = 1; i <= 4; i++) h = h getc()
+            if (length(h) != 4 || h ~ /[^0-9a-fA-F]/) fail("invalid JSON escape")
+            n = 0
+            for (i = 1; i <= 4; i++) n = n * 16 + index("0123456789abcdef", tolower(substr(h, i, 1))) - 1
+            c = n >= 32 && n < 127 ? sprintf("%c", n) : "\001"
+        } else if (e == "\"" || e == "\\" || e == "/") c = e
+        else if (e ~ /^[bfnrt]$/) c = "\001"
+        else fail("invalid JSON escape")
         s = s c
     }
     fail("unterminated JSON string")
 }
 function value(path, depth, c, key, child, n, text) {
     if (depth > 32) fail("JSON nesting limit exceeded")
-    ws(); c = substr(json, pos, 1)
+    ws(); c = peekc()
     if (c == "{" || c == "[") {
-        kinds[path] = c; pos++; ws(); n = 0
-        if (substr(json, pos, 1) != (c == "{" ? "}" : "]")) {
+        kinds[path] = c; wi++; ws(); n = 0
+        if (peekc() != (c == "{" ? "}" : "]")) {
             while (1) {
                 if (c == "{") {
                     key = string(); ws()
-                    if (substr(json, pos++, 1) != ":") fail("invalid JSON object")
+                    if (getc() != ":") fail("invalid JSON object")
                 } else key = n
                 child = path SUBSEP key
                 if (child in kinds) fail("duplicate JSON member")
                 value(child, depth + 1); n++; ws()
-                if (substr(json, pos, 1) != ",") break
-                pos++; ws()
+                if (peekc() != ",") break
+                wi++; ws()
             }
         }
-        if (substr(json, pos++, 1) != (c == "{" ? "}" : "]")) fail("invalid JSON container")
+        if (getc() != (c == "{" ? "}" : "]")) fail("invalid JSON container")
         sizes[path] = n
     } else if (c == "\"") { kinds[path] = "string"; values[path] = string() }
     else {
-        text = substr(json, pos)
-        if (match(text, /^(true|false|null)/)) {
-            text = substr(text, 1, RLENGTH); kinds[path] = text; values[path] = text
-        } else if (match(text, /^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/)) {
-            text = substr(text, 1, RLENGTH); kinds[path] = "number"; values[path] = text
-        } else fail("invalid JSON value")
-        pos += length(text)
+        text = ""
+        while (fill()) {
+            match(substr(win, wi), /^[-+.0-9A-Za-z]*/)
+            text = text substr(win, wi, RLENGTH); wi += RLENGTH
+            if (wi <= wn) break
+        }
+        if (text ~ /^(true|false|null)$/) { kinds[path] = text; values[path] = text }
+        else if (text ~ /^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$/) { kinds[path] = "number"; values[path] = text }
+        else fail("invalid JSON value")
     }
 }
 function release(path, tag, pre, asset, name, base, archive, i, required, found, usable) {
@@ -207,9 +226,9 @@ BEGIN {
         if (usable != "1") fail("selected release lacks required uploaded assets")
         print best; exit
     }
-    while ((getline line) > 0) json = json line "\n"
-    pos = 1; value("root", 0); ws()
-    if (pos <= length(json)) fail("trailing JSON data")
+    CHUNK = 1024; off = wi = 1
+    value("root", 0); ws()
+    if (peekc() != "") fail("trailing JSON data")
     if (mode == "bundle") { bundle(); exit }
     if (mode == "single") {
         if (values["root" SUBSEP "tag_name"] != tag) fail("release tag mismatch")
@@ -261,9 +280,9 @@ verify_archive() {
         END { if (count != 1) exit 1; print digest }
     ' "${tmp}/sha256sums.txt")" || err "invalid, duplicate, or missing archive checksum"
     case "${sha_tool}" in
-        sha256sum) actual="$(sha256sum "${tmp}/${archive_name}")" ;;
-        shasum) actual="$(shasum -a 256 "${tmp}/${archive_name}")" ;;
-        openssl) actual="$(openssl dgst -sha256 "${tmp}/${archive_name}")"; actual="${actual##* }" ;;
+        sha256sum) actual="$(sha256sum "${archive}")" ;;
+        shasum) actual="$(shasum -a 256 "${archive}")" ;;
+        openssl) actual="$(openssl dgst -sha256 "${archive}")"; actual="${actual##* }" ;;
     esac
     actual="${actual%% *}"
     [ "${actual}" = "${expected}" ] || err "archive SHA-256 checksum mismatch"
@@ -406,11 +425,11 @@ validate_tree() {
 
 validate_archive() {
     if [ "${archive_ext}" = zip ]; then
-        unzip -Z -1 "${tmp}/${archive_name}" > "${tmp}/entries" || err "cannot inspect archive"
-        unzip -Z -l "${tmp}/${archive_name}" > "${tmp}/types" || err "cannot inspect archive types"
+        unzip -Z -1 "${archive}" > "${tmp}/entries" || err "cannot inspect archive"
+        unzip -Z -l "${archive}" > "${tmp}/types" || err "cannot inspect archive types"
     else
-        tar tzf "${tmp}/${archive_name}" > "${tmp}/entries" || err "cannot inspect archive"
-        tar tvzf "${tmp}/${archive_name}" > "${tmp}/types" || err "cannot inspect archive types"
+        tar tzf "${archive}" > "${tmp}/entries" || err "cannot inspect archive"
+        tar tvzf "${archive}" > "${tmp}/types" || err "cannot inspect archive types"
     fi
     [ "$(wc -c < "${tmp}/entries")" -le 16777216 ] || err "archive inventory too large"
     awk -v binary="${bin_name}" -v extension="${archive_ext}" '
@@ -661,16 +680,28 @@ main() {
     label=""
     case "${tag%%+*}" in *-*) label=" (Preview)" ;; esac
 
-    echo "downloading ${BINARY} ${tag}${label} for ${target}..."
-    download "${url}/${archive_name}" "${tmp}/${archive_name}" || err "archive download failed"
+    archive="${CAUDRA_INSTALL_ARCHIVE:-}"
+    if [ -n "${archive}" ] && [ "${archive##*/}" != "${archive_name}" ]; then
+        printf 'note: ignoring CAUDRA_INSTALL_ARCHIVE=%s, which is not %s\n' "${archive}" "${archive_name}" >&2
+        archive=""
+    fi
+    if [ -n "${archive}" ]; then
+        case "${archive}" in /*) ;; *) err "CAUDRA_INSTALL_ARCHIVE is not an absolute path: ${archive}" ;; esac
+        validate_path "${archive}"
+        [ -f "${archive}" ] || err "CAUDRA_INSTALL_ARCHIVE is not a regular file: ${archive}"
+    else
+        archive="${tmp}/${archive_name}"
+        echo "downloading ${BINARY} ${tag}${label} for ${target}..."
+        download "${url}/${archive_name}" "${archive}" "" progress || err "archive download failed"
+    fi
     download "${url}/sha256sums.txt" "${tmp}/sha256sums.txt" 1048576 || err "checksum download failed"
     verify_archive
     validate_archive
     payload="$(mktemp -d "${tmp}/payload.XXXXXX")"
     if [ "${archive_ext}" = "zip" ]; then
-        unzip -qo "${tmp}/${archive_name}" -d "${payload}"
+        unzip -qo "${archive}" -d "${payload}"
     else
-        tar xzf "${tmp}/${archive_name}" -C "${payload}"
+        tar xzf "${archive}" -C "${payload}"
     fi
 
     [ -f "${payload}/${bin_name}" ] || err "archive did not contain ${bin_name}"
