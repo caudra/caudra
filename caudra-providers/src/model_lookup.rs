@@ -521,13 +521,10 @@ mod tests {
         "copilot/claude-haiku-5.5",
         "copilot/gemini-3.7-flash",
         "copilot/gemini-3.8-flash",
-        "copilot/mai-code-1-flash-picker",
-        "copilot/claude-sonnet-4.5",
         "copilot/claude-sonnet-4.6",
         "copilot/claude-sonnet-5.5",
         "copilot/claude-sonnet-5",
         "copilot/gpt-5.5",
-        "copilot/kimi-k2.7-code",
         "copilot/kimi-k3",
         "copilot/gemini-4-argon",
         "copilot/gpt-6-luna",
@@ -543,6 +540,7 @@ mod tests {
         "copilot/claude-fable-5",
         "copilot/grok-4.5",
         "copilot/grok-4.6",
+        "copilot/grok-4.7",
     ];
 
     fn listed() -> Vec<String> {
@@ -587,7 +585,7 @@ mod tests {
     #[test_case("gemini", &[ANTHROPIC], "copilot/gemini-4-argon" ; "gemini_newest")]
     #[test_case("gemini flash", &[], "copilot/gemini-3.8-flash" ; "gemini_flash_newest")]
     #[test_case("argon", &[], "copilot/gemini-4-argon" ; "argon")]
-    #[test_case("grok", &[], "copilot/grok-4.6" ; "grok")]
+    #[test_case("grok", &[], "copilot/grok-4.7" ; "grok")]
     fn a_listed_model_resolves(query: &str, preferred: &[&str], expected: &str) {
         assert_eq!(find_model(query, &listed(), preferred).unwrap(), expected);
     }

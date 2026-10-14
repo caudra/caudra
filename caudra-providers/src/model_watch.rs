@@ -122,13 +122,6 @@ pub const ACCEPTED: &[Accepted] = &[
         catalog: "above 200000: 2.5 / 5 / 0.4 / 0",
         reason: XAI_LONG_PROMPT,
     },
-    Accepted {
-        provider: "copilot",
-        model: "gemini-3.6-flash",
-        field: Field::Unlisted,
-        catalog: "2026-07-21",
-        reason: "GitHub's supported-models page (docs.github.com/en/copilot/reference/ai-models/supported-models) no longer offers it, so it left the Copilot table with Gemini 4 Argon's arrival.",
-    },
 ];
 
 /// A limit a table holds below what the model accepts, on purpose: a working
