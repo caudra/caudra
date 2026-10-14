@@ -227,7 +227,7 @@ pub struct CatalogMeta {
 }
 
 impl CatalogMeta {
-    fn from_model(model: &schema::CatalogModel) -> Self {
+    pub(crate) fn from_model(model: &schema::CatalogModel) -> Self {
         let cost = model.cost.as_ref();
         let limit = model.limit.as_ref();
         Self {
@@ -629,9 +629,31 @@ async fn save_cached_catalog_async(index: &schema::CatalogIndex) {
     .await;
 }
 
+fn catalog_http_client() -> Result<HttpClient, AgentError> {
+    isahc::HttpClient::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .low_speed_timeout(1, Duration::from_secs(30))
+        // curl carries http2 for OTLP.
+        .version_negotiation(VersionNegotiation::http11())
+        .build()
+        .map_err(|e| config_error(format!("failed to build the catalog HTTP client: {e}")))
+}
+
+/// The catalog as models.dev serves it right now, bypassing the cache, for
+/// tools that compare it with the static tables.
+pub(crate) fn fetch_catalog_text() -> Result<String, AgentError> {
+    smol::block_on(fetch_catalog_text_async(&catalog_http_client()?))
+}
+
 async fn fetch_remote_catalog_async(
     client: &HttpClient,
 ) -> Result<schema::CatalogIndex, AgentError> {
+    let text = fetch_catalog_text_async(client).await?;
+    serde_json::from_str(&text)
+        .map_err(|e| config_error(format!("failed to parse catalog JSON: {e}")))
+}
+
+async fn fetch_catalog_text_async(client: &HttpClient) -> Result<String, AgentError> {
     let request = Request::builder()
         .uri(CATALOG_URL)
         .header("user-agent", super::user_agent())
@@ -652,13 +674,9 @@ async fn fetch_remote_catalog_async(
         ));
     }
 
-    let text = resp
-        .text()
+    resp.text()
         .await
-        .map_err(|e| config_error(format!("failed to read catalog response body: {e}")))?;
-
-    serde_json::from_str(&text)
-        .map_err(|e| config_error(format!("failed to parse catalog JSON: {e}")))
+        .map_err(|e| config_error(format!("failed to read catalog response body: {e}")))
 }
 
 fn determine_catalog_format(npm: &str) -> EndpointType {
@@ -689,15 +707,9 @@ fn init_catalog_blocking(
         return make_catalog(index);
     }
 
-    let client = isahc::HttpClient::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .low_speed_timeout(1, Duration::from_secs(30))
-        // curl carries http2 for OTLP.
-        .version_negotiation(VersionNegotiation::http11())
-        .build()
-        .expect("failed to build catalog HTTP client");
-
-    match smol::block_on(fetch_remote_catalog_async(&client)) {
+    let fetched = catalog_http_client()
+        .and_then(|client| smol::block_on(fetch_remote_catalog_async(&client)));
+    match fetched {
         Ok(index) => {
             smol::block_on(save_cached_catalog_async(&index));
             make_catalog(index)

@@ -1057,6 +1057,8 @@ dependencies = [
  "caudra-providers",
  "caudra-ui",
  "caudra-workcell",
+ "color-eyre",
+ "jiff",
  "regex",
  "serde_json",
  "strum 0.28.0",

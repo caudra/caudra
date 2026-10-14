@@ -18,7 +18,7 @@ pub(crate) const SETUP_MODEL_SPEC: &str = "openai/gpt-6.1-sol";
 /// Deliberately below what the API accepts — gpt-6 advertises 1,050,000 —
 /// because the window is what caudra fills before compacting, and cost and
 /// latency scale with it.
-const WIDE_CONTEXT_WINDOW: u32 = 372_000;
+pub(crate) const WIDE_CONTEXT_WINDOW: u32 = 372_000;
 const WIDE_MAX_OUTPUT_TOKENS: u32 = 128_000;
 /// A request whose prompt runs past this many tokens bills in full at twice
 /// the input and cache rates and one and a half times the output rate. The

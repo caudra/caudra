@@ -4,6 +4,7 @@ pub mod manifest;
 pub mod model;
 pub mod model_lookup;
 pub mod model_registry;
+pub mod model_watch;
 pub mod pricing;
 pub mod provider;
 pub(crate) mod providers;

@@ -16,7 +16,7 @@ endif
 
 export WORKCELL_BUNDLED_MONTY_WORKER := $(CURDIR)/target/code-worker/bin/$(MONTY_WORKER_NAME)
 
-.PHONY: help code-worker install install-fast build check run test lint lint-fix fmt-check fmt pylint distribution-tests gen-docs gen-docs-check workcell-build workcell-run workcell-release workcell-check-native workcell-doc-test machete ci
+.PHONY: help code-worker install install-fast build check run test lint lint-fix fmt-check fmt pylint distribution-tests gen-docs gen-docs-check model-watch workcell-build workcell-run workcell-release workcell-check-native workcell-doc-test machete ci
 
 help:
 	@printf '%s\n' \
@@ -36,6 +36,7 @@ help:
 		'  make distribution-tests  Test build and distribution helpers' \
 		'  make gen-docs       Regenerate canonical documentation' \
 		'  make gen-docs-check Check generated documentation' \
+		'  make model-watch    Report model changes from models.dev (flags via ARGS="-- --since DATE")' \
 		'  make workcell-build Build the standalone Workcell server' \
 		'  make workcell-run   Run Workcell (server flags via ARGS)' \
 		'  make workcell-release  Build the release Workcell server' \
@@ -102,6 +103,9 @@ gen-docs: code-worker
 
 gen-docs-check: code-worker
 	$(CARGO) run -p caudra-docgen -- --check
+
+model-watch: code-worker
+	$(CARGO) run -q -p caudra-docgen --bin caudra-model-watch $(ARGS)
 
 workcell-build: code-worker
 	$(CARGO) build $(if $(filter --locked,$(ARGS)),,--locked) --package workcell-mcp $(ARGS)
