@@ -103,6 +103,13 @@ pub const ACCEPTED: &[Accepted] = &[
     },
     Accepted {
         provider: "xai",
+        model: "grok-4.7",
+        field: Field::Tiers,
+        catalog: "above 200000: 4 / 12 / 1 / 0",
+        reason: XAI_LONG_PROMPT,
+    },
+    Accepted {
+        provider: "xai",
         model: "grok-4.6",
         field: Field::Tiers,
         catalog: "above 200000: 4 / 12 / 1 / 0",
