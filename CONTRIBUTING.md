@@ -172,6 +172,8 @@ Development and release builds use the same Workcell source. There are no siblin
 
 ## Nix
 
+The flake supports x86_64 and aarch64 Linux, and Apple Silicon macOS. Intel macOS uses the native build because current nixpkgs no longer supports it.
+
 CI checks the flake when the Nix files, the Rust or Lua sources, or the docs change. If you edit `flake.nix`, run the same checks locally:
 
 ```sh

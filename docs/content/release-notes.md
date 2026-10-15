@@ -7,6 +7,20 @@ Each release lists what changed, newest first. After an update, the first intera
 
 To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run [`caudra update`](/docs/cli/#caudra-update-caudra-rollback). Each release links to its GitHub page, which holds the downloads.
 
+## Caudra 0.2 Preview 10 {#v0-2-0-preview-10}
+
+[v0.2.0-preview.10 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.10)
+
+Nix builds use updated dependencies and continue to support Linux and Apple Silicon macOS.
+
+> **Important**
+>
+> **Intel macOS users building with Nix must switch to the native build.** Current nixpkgs no longer supports Intel macOS, so the flake no longer provides `x86_64-darwin` outputs. Native Intel macOS builds and release binaries remain supported.
+
+### Builds
+
+- **Nix evaluation works without building the worker source first.** The pinned Python worker source is fetched and verified during evaluation, without import from derivation.
+
 ## Caudra 0.2 Preview 9 {#v0-2-0-preview-9}
 
 [v0.2.0-preview.9 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.9)

@@ -23,7 +23,6 @@
       systems = [
         "x86_64-linux"
         "aarch64-linux"
-        "x86_64-darwin"
         "aarch64-darwin"
       ];
       forEachSystem =
@@ -145,10 +144,12 @@
         let
           craneLib = mkCraneLib pkgs;
           workspaceSrc = mkWorkspaceSrc craneLib;
-          montySrc = pkgs.fetchgit {
-            url = "https://github.com/pydantic/monty.git";
+          montySrc = builtins.fetchTree {
+            type = "github";
+            owner = "pydantic";
+            repo = "monty";
             rev = "591527397445bf734873252d1ee20c1b6308fe7f";
-            hash = "sha256-FqJIkEVmKeDWQyb/yrJ0+/2tZ1kCNe2Xc4r9UPgQptU=";
+            narHash = "sha256-FqJIkEVmKeDWQyb/yrJ0+/2tZ1kCNe2Xc4r9UPgQptU=";
           };
           montyVendorDeps = craneLib.vendorCargoDeps { src = montySrc; };
           montyAttributionVendor = pkgs.runCommandLocal "monty-attribution-vendor" { } (
