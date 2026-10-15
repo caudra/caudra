@@ -124,6 +124,9 @@ repository = "https://github.com/caudra/caudra"
 rust-version = "1.99"
 
 [workspace.dependencies]
+syn = { version = "3.0.9", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
 caudra-agent = { path = "caudra-agent" }
 caudra-acp = { path = "caudra-acp" }
 caudra-config = { path = "caudra-config" }
