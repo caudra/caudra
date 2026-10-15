@@ -157,9 +157,9 @@ Every turn re-sends the conversation, so a noisy result costs tokens again on ev
 - **RTK-style output filtering.** Command-aware rules, most of them from RTK, trim build and test noise before the model reads the output, and a filtered result is always smaller than the raw one. A failure is never reported as a success, and a failing command keeps its first and last lines. Progress bars collapse to one row, and you can switch between filtered and raw views.
 - **Structure before content.** `file_index` returns a file outline with signatures and line numbers. The `code_*` tools rank symbols and show callers, impact, and the tests they can trace to a change. They parse the source on the fly, so there is no index to build or maintain and nothing to configure.
 - **Fewer, smaller turns.** Oversized results reach the model as a bounded head and tail, and `tool_output` searches the rest. `batch` runs independent calls in one turn, and subagents keep their exploration out of the main context.
-- **Requests shaped for caching.** Caudra sends a per-conversation cache key where providers accept one, and `/usage` scores the cache hit rate for every model.
+- **MCP servers through Python.** The model reaches your MCP servers by writing Python in one `mcp` tool. A snippet calls several tools at once and filters their results before the model reads anything, and a server that connects or changes its tools never changes the tool definitions, so the prompt cache holds.
 
-In the creator's daily use, about 97% of Anthropic and 94% of OpenAI prompt tokens came from cache. With credit to the ideas in [RTK](https://www.rtk-ai.app/docs/) and [ripwire](https://github.com/redhat-et/ripwire).
+Caudra sends a per-conversation cache key where providers accept one, and `/usage` scores the cache hit rate for every model. In the creator's daily use, about 97% of Anthropic and 94% of OpenAI prompt tokens came from cache. With credit to the ideas in [RTK](https://www.rtk-ai.app/docs/) and [ripwire](https://github.com/redhat-et/ripwire).
 
 [How Caudra saves tokens](https://caudra.ai/docs/token-economy/) · Watch: [Filter shell output](https://caudra.ai/gallery/#filter)
 
@@ -199,12 +199,12 @@ Passage review was inspired by [Plannotator](https://plannotator.ai/).
 
 `/goal` keeps a session working until a separate evaluator finds evidence that your condition is met, for example "tests pass and clippy is clean". Background work reports back without polling, and your permission rules decide what runs while you are away.
 
-- **Goals that check evidence.** After each work turn, a separate model call with no tools reads the transcript. An unmet goal starts another turn. A met goal clears itself.
+- **Goals that check evidence.** After each work turn, a separate model call with no tools reads the transcript. An unmet goal starts another turn. A met goal clears itself. `/goal log` lists every check with its model, cost, and reason.
 - **Background work wakes the agent.** Tasks and shell jobs can keep running in the background. Their reports start the next step at a safe boundary, with no polling.
 - **Permissions that read the command.** Shell chains and pipelines split into separate commands for approval. Approve once, for the conversation, the project, or every project, and accept patterns Caudra suggests from repeated approvals.
 - **Plan first, then hear back.** By default, new sessions open in Plan mode, where the agent edits only its plan and asks before commands it cannot prove read-only. Notifications tell you when a turn finishes or a prompt needs your answer.
 
-Unattended work needs a running session, for example in tmux or [Herdr](https://herdr.dev). Closing it cancels background work. Experimental [autopilot](https://caudra.ai/docs/autopilot/) can answer permission prompts, questions, and ready plans while you are away, within budgets you set. A goal allows 16 automatic continuations by default, and work pauses when it needs your answer. `/goal` looks for evidence in the transcript. It does not prove the work is correct.
+Unattended work needs a running session, for example in tmux or [Herdr](https://herdr.dev). Closing it cancels background work. Experimental [autopilot](https://caudra.ai/docs/autopilot/) can answer permission prompts, questions, and ready plans while you are away, within budgets you set. Its log lists every decision and what followed. A goal allows 16 automatic continuations by default, and work pauses when it needs your answer. `/goal` looks for evidence in the transcript. It does not prove the work is correct.
 
 [Completion goals](https://caudra.ai/docs/commands/#completion-goals) · Watch: [Work toward a goal](https://caudra.ai/gallery/#goal)
 
@@ -217,7 +217,7 @@ Run Caudra inside [Herdr](https://herdr.dev) or [Orca](https://github.com/stably
 - **Status where you look.** The Herdr sidebar shows the state of each session with its title, model, and context usage. Orca shows the state on the tab. Both raise their own notice when a turn ends or a prompt waits, and name the prompt, such as `Permission requested: shell`.
 - **Tabs named after the session.** Caudra renames a Herdr tab to the session title while the tab still shows its number, and a tab you named keeps its name. Orca shows the session title on the terminal tab.
 - **Forks open in a new tab.** **Fork here**, in the message menu, starts the new session in a new Herdr or Orca tab with a Caudra of its own. The session you forked from stays open where it was.
-- **Worktrees in the host.** `/worktree new` asks Herdr or Orca to create the worktree, and the session continues there. After a Herdr restart, the focused session comes back in its pane.
+- **Worktrees in the host.** `/worktree new` asks Herdr or Orca to create the worktree, and the session continues there. `/worktree close` brings its commits and changes back, and every open session returns in a tab of its own. After a Herdr restart, the focused session comes back in its pane.
 
 Caudra detects each host from the variables the host sets in the terminal. Inside either one, the `herdr` or `orca` skill gives the agent the instructions of the installed release, and its commands still pass through your permission rules. Integrates with [Herdr](https://herdr.dev) and [Orca](https://github.com/stablyai/orca).
 
@@ -298,7 +298,7 @@ Caudra reads the instruction files and skills you already have and connects to y
 
 - **[Instruction files](https://caudra.ai/docs/context/#instruction-files).** At session start, Caudra loads `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `GEMINI.md`, or one of six other instruction file names.
 - **[Skills](https://caudra.ai/docs/skills/#where-skills-live).** Caudra reads skills from `.claude/skills` and `.agents/skills` folders.
-- **[MCP servers](https://caudra.ai/docs/mcp/#configuration).** Add stdio or HTTP MCP servers in `mcp.toml`, with OAuth sign-in. Caudra speaks the current MCP protocol and the older one, so servers built on either work.
+- **[MCP servers](https://caudra.ai/docs/mcp/#configuration).** Add stdio or HTTP MCP servers in `mcp.toml`, with OAuth sign-in. The model calls them by writing Python in one `mcp` tool, and Caudra speaks the current MCP protocol and the older one.
 - **[Scripts](https://caudra.ai/docs/headless/#claude-code-compatibility).** `--print` writes the same JSON fields as Claude Code, so scripts that parse its output keep working.
 
 ### A model for each job
@@ -322,21 +322,22 @@ Eleven jobs decide which model serves each kind of work. Pin a job to a model in
 See [Model jobs](https://caudra.ai/docs/providers/#model-jobs).
 
 <!-- BEGIN caudra.ai capabilities: generated by `bun run readme:snippet` in caudra/website. Edit there. -->
-## 73 capabilities, designed together.
+## 74 capabilities, designed together.
 
 *Everything in the box*
 
 Each one links to its documentation. Experimental items are marked and stay off until you switch them on.
 
 <details>
-<summary><b>Agents</b> (13)</summary>
+<summary><b>Agents</b> (14)</summary>
 
 - [Steerable subagents](https://caudra.ai/docs/commands/#tasks)
 - [Background tasks and shell jobs](https://caudra.ai/docs/sessions/#background-tasks)
 - [Next, Guide, and Replace queue](https://caudra.ai/docs/queue/)
-- [Completion goals with `/goal`](https://caudra.ai/docs/commands/#completion-goals)
+- [Completion goals with a log of every check](https://caudra.ai/docs/commands/#completion-goals)
 - [Autopilot toward a goal](https://caudra.ai/docs/autopilot/) (experimental)
 - [Side questions with `/btw`](https://caudra.ai/docs/commands/#modes-and-toggles)
+- [Questions you can answer later](https://caudra.ai/docs/sessions/#deferred-questions)
 - [A model for each job](https://caudra.ai/docs/providers/#model-jobs)
 - [Tasks on the model you name](https://caudra.ai/docs/commands/#models-and-reasoning)
 - [Favorite models in `/model`](https://caudra.ai/docs/providers/#model-jobs)
@@ -385,10 +386,10 @@ Each one links to its documentation. Experimental items are marked and stay off 
 - [Forks from any message](https://caudra.ai/docs/sessions/#fork-boundaries)
 - [Forks in a new Herdr or Orca tab](https://caudra.ai/docs/sessions/#forks-in-herdr-and-orca)
 - [Tabs named after the session](https://caudra.ai/docs/sessions/#tab-names)
-- [Git worktrees](https://caudra.ai/docs/worktrees/)
+- [Git worktrees you open and close](https://caudra.ai/docs/worktrees/#closing-a-worktree)
 - [Retention policies and `/storage`](https://caudra.ai/docs/sessions/#retention)
 - [Move sessions between directories](https://caudra.ai/docs/sessions/#moving-sessions-to-another-directory)
-- [Spend and cache hit rate in `/usage`](https://caudra.ai/docs/token-economy/#cache-hit-rate)
+- [Spend by model and purpose in `/usage`](https://caudra.ai/docs/token-economy/#cache-hit-rate)
 - [Release notes after an update, with `/changelog`](https://caudra.ai/docs/release-notes/)
 
 </details>
@@ -450,7 +451,7 @@ workflows = true
 ```
 
 - **[Managed sandboxes](https://caudra.ai/docs/sandboxes/)** (`sandboxes`). Move execution into a VM. Managed sandboxes run workspace tools in a separate VM. Model connections, provider credentials, and the conversation stay on your machine, so a compromised VM cannot read credentials it never received. Network policy allows listed domains and IP ranges, with TLS hostname checks or an inspecting proxy. File transfers between your machine and the VM go through a review. They require e2b-libvirt infrastructure that you or your operator run. Transferred files can still carry secrets. The separation reduces exposure and is no guarantee against compromise.
-- **[Autopilot](https://caudra.ai/docs/autopilot/)** (`autopilot`). `/autopilot <goal>` hands permission prompts, questions, ready plans, and stalls to a separate delegate model until the goal is met, a budget runs out, or you stop it. The delegate approves a prompt once and adds no rule. It never approves prompts that plan mode raises, tools that always ask, or protected files and commands. It also runs headless with `caudra -p --autopilot`.
+- **[Autopilot](https://caudra.ai/docs/autopilot/)** (`autopilot`). `/autopilot <goal>` hands permission prompts, questions, ready plans, and stalls to a separate delegate model until the goal is met, a budget runs out, or you stop it. The delegate approves a prompt once and adds no rule. It never approves prompts that plan mode raises, tools that always ask, or protected files and commands. It also runs headless with `caudra -p --autopilot`. A log lists every decision, what the delegate was asked, and what followed.
 - **[Durable workflows](https://caudra.ai/docs/workflows/)** (`workflows`). Scripts launch subagents in phases, keep a journal, and can pause and resume. Each agent call can name a model job, such as Fast for a wide pass and Best for the answer you read. Built-in workflows cover deep research, change review, and root-cause analysis. They are heavily inspired by [Grok Build workflows](https://x.ai/news/workflows) and mostly compatible with them.
 - **[JEV decision engine](https://caudra.ai/docs/configuration/#decisions)** (`decision_engine`). Typed decisions from an endpoint you configure: permission advice, Auto mode screening, shell effect and duration predictions, sampled web and MCP content screening, tool search ranking, skill suggestions, goal prescreening, and subagent routing to the Fast or Best model. As a reranker, it can put the most relevant memory notes, code context rows, and omitted tool output first, and the transcript shows what each feature changed. Predictions add to deterministic permission rules and can miss risks.
 - **[Cross-session messaging](https://caudra.ai/docs/messaging/)** (`cross_session_messaging`). Live sessions on one machine exchange messages, publish to topics, and share work through consumer groups.
