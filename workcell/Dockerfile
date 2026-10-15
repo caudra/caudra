@@ -4,7 +4,13 @@
 # leaving a binary that only serves `monty subprocess`.
 #
 # Build from the repository root: docker build -f workcell/Dockerfile .
-FROM rust:1.99.0-bookworm AS worker
+FROM rust:1.99.0-bookworm AS toolchain
+
+RUN rustup toolchain install 1.99.1 --profile minimal \
+    && rustup default 1.99.1 \
+    && rustup toolchain uninstall 1.99.0
+
+FROM toolchain AS worker
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends python3 \
@@ -14,7 +20,7 @@ COPY Cargo.lock ./
 COPY scripts/build-code-worker.py scripts/build-code-worker.py
 RUN python3 scripts/build-code-worker.py --root /out --target-dir /build/target/code-worker-build
 
-FROM rust:1.99.0-bookworm AS builder
+FROM toolchain AS builder
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends cmake python3 \

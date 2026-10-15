@@ -40,7 +40,7 @@
       mkCraneLib =
         pkgs:
         let
-          rustToolchain = pkgs.rust-bin.stable."1.99.0".default.override {
+          rustToolchain = pkgs.rust-bin.stable."1.99.1".default.override {
             extensions = [
               "rust-src"
               "rust-analyzer"

@@ -281,7 +281,7 @@ jobs:
           python-version: "3.15.0"
 
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.99.0 --profile minimal --target ${{ matrix.target }}
+        run: rustup toolchain install 1.99.1 --profile minimal --target ${{ matrix.target }}
 
       - name: Provision macOS installer shells
         if: runner.os == 'macOS'

@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "rust_runtime": {
-    "release": "1.99.0",
-    "commit_hash": "b940084d7eb6a299eb4bfeb8e34901bc051e7ac4",
+    "release": "1.99.1",
+    "commit_hash": "58cf8f9c35b355199727627d07ae34a4e2846d67",
     "required_license_files": [
       "licenses/Apache-2.0.txt",
       "licenses/BSD-2-Clause.txt",

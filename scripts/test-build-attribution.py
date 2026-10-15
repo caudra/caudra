@@ -26,8 +26,8 @@ THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND.
 """
 MPL = "Mozilla Public License Version 2.0\n3.1. Distribution of Source Form\n10. Versions of the License\n"
 RUNTIME_REPORT = b'<html><title>Copyright notices for The Rust Standard Library</title><a href="licenses/MIT.txt">MIT</a></html>\n'
-RUNTIME_VERSION = "1.99.0"
-RUNTIME_COMMIT = "b940084d7eb6a299eb4bfeb8e34901bc051e7ac4"
+RUNTIME_VERSION = "1.99.1"
+RUNTIME_COMMIT = "58cf8f9c35b355199727627d07ae34a4e2846d67"
 RUNTIME_REQUIRED_LICENSES = (
     "licenses/Apache-2.0.txt",
     "licenses/BSD-2-Clause.txt",
