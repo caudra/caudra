@@ -56,7 +56,8 @@ RUN curl -fsSLo /tmp/node.tar.xz \
 # Node and Python tools the corpus targets, installed once at image build time.
 # Cases that deliberately exercise a resolver, such as `npm install` or
 # `pip install`, still reach the network when they run.
-RUN npm install --global --no-fund --no-audit typescript eslint jest vitest \
+RUN npm install --global npm@12.2.0 \
+    && npm install --global --no-fund --no-audit typescript eslint jest vitest \
     && npm cache clean --force
 # `tqdm` and `rich` are the progress libraries the reduction is measured
 # against. `tqdm` does not consult isatty, so it redraws into a pipe and is the
