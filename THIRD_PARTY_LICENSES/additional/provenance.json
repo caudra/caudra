@@ -392,6 +392,82 @@
       "status": "collected"
     },
     {
+      "name": "jsonschema-regex",
+      "version": "0.58.6",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "a968fffd387b2ab005bf00c1851f5d26e90df05b6f7ad609ed0d620033cca5e7",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/Stranger6667/jsonschema",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "55ac1664384793c5d3b20745d3f9c169dfe2c06f"
+        },
+        "path_in_vcs": "crates/jsonschema-regex"
+      },
+      "revision": "55ac1664384793c5d3b20745d3f9c169dfe2c06f",
+      "path_in_vcs": "crates/jsonschema-regex",
+      "manifest_git_blob_sha1": "ce71c219ab1e7a44240024b627963cac638ca79d",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Prepared core-migrations/Cargo.lock and exact crates.io sparse-index entry",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/additional/jsonschema-0.52.1/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "upstream_legal_blobs": {
+        "LICENSE": "20c070f6401feda6f47be1b158f4f5a4a9d14062"
+      },
+      "workspace_license_manifest_git_blob_sha1": "97e57b8a4663ec929a7cebcb80650d954033b6e6",
+      "notes": [
+        "The new exact archive and every extracted byte are verified. Cargo.toml.orig matches the pinned upstream blob, inherits MIT from the root workspace manifest, and has no package-local license file. The sole ancestor legal file is root LICENSE; it is byte-identical to the existing 0.52.1 evidence, which is reused without altering old entries."
+      ]
+    },
+    {
+      "name": "jsonschema-value",
+      "version": "0.58.6",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "39b7670345e5ce87371339d13705dbb9276b7e3e934bbe1efa2c6734a1f65a96",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/Stranger6667/jsonschema",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "55ac1664384793c5d3b20745d3f9c169dfe2c06f"
+        },
+        "path_in_vcs": "crates/jsonschema-value"
+      },
+      "revision": "55ac1664384793c5d3b20745d3f9c169dfe2c06f",
+      "path_in_vcs": "crates/jsonschema-value",
+      "manifest_git_blob_sha1": "fbb9babe98a620a8c012b836cdce46fc4db250a6",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Prepared core-migrations/Cargo.lock and exact crates.io sparse-index entry",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/additional/jsonschema-0.52.1/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "upstream_legal_blobs": {
+        "LICENSE": "20c070f6401feda6f47be1b158f4f5a4a9d14062"
+      },
+      "workspace_license_manifest_git_blob_sha1": "97e57b8a4663ec929a7cebcb80650d954033b6e6",
+      "notes": [
+        "The new exact archive and every extracted byte are verified. Cargo.toml.orig matches the pinned upstream blob, inherits MIT from the root workspace manifest, and has no package-local license file. The sole ancestor legal file is root LICENSE; it is byte-identical to the existing 0.52.1 evidence, which is reused without altering old entries."
+      ]
+    },
+    {
       "name": "mlua_derive",
       "version": "0.12.1",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
