@@ -28,7 +28,7 @@ A worktree may have notes and plans of its own from an older Caudra release. The
 | `Ctrl+D` | Remove the selected worktree |
 | `Ctrl+R` | Refresh the list |
 
-`/worktree new` starts creating a worktree as `Ctrl+N` does, and `/worktree new <branch>` names the branch up front. `/worktree remove` opens the removal of the checkout the session works in. The main checkout cannot be removed.
+`/worktree new` starts creating a worktree as `Ctrl+N` does, and `/worktree new <branch>` names the branch up front. `/worktree close` and `/worktree remove` both open the confirmation that closes or removes the checkout the session works in, as `Ctrl+D` does. The main checkout cannot be removed.
 
 Opening a checkout outside Herdr moves every open tab into it, as [`/cd`](/docs/commands/) does. Inside Herdr, Caudra asks Herdr to open the checkout in its workspace. Herdr focuses the workspace when it is already open. Inside Orca, Caudra switches to a terminal Orca has open in the checkout, or opens one there.
 
@@ -60,6 +60,20 @@ Inside Orca, Orca creates the worktree and lists it in its sidebar. Orca needs a
 
 The new pane runs the same Caudra executable. If an upgrade replaced it while Caudra was running, the pane runs the replacement at that path. If neither file remains, the pane runs `caudra` from `PATH`.
 
+## Closing a worktree
+
+Closing is the reverse of creating a worktree. The commits and uncommitted changes of the worktree come back to the main checkout, its sessions move there, and the worktree is removed. The confirmation for a removal lists **Bring the work back to**, followed by the main checkout's path, as its first choice and says what that brings back.
+
+The commits come back by a fast-forward of the main checkout's branch to the worktree's commit. Caudra never creates a merge commit or rebases. Uncommitted changes come back through `git stash`, as they do when a worktree is created, and only into a clean main checkout at the worktree's commit, because that is where they are sure to apply.
+
+Closing is not offered, and the confirmation says why, when:
+
+- the main checkout has commits the worktree does not have. Merge or rebase the branch first.
+- the worktree has uncommitted changes and the main checkout has changes of its own. Commit or stash the main checkout's changes first.
+- the main checkout has moved past the worktree's commit and the worktree has uncommitted changes. Commit them in the worktree first.
+
+Sessions move back as they do for a [removal](#removing-a-worktree), and the changes come back once they have moved. If the changes still do not apply, they stay in the worktree, the worktree is kept, and Caudra says why. The branch is kept, so `git branch -d <branch>` deletes it once you no longer need it. Orca deletes it itself, because a fast-forward leaves it fully merged.
+
 ## Removing a worktree
 
 Removal keeps the branch, except [inside Orca](#orca-integration). When the worktree has uncommitted changes, the confirmation offers two ways forward:
@@ -69,9 +83,11 @@ Removal keeps the branch, except [inside Orca](#orca-integration). When the work
 
 Sessions that work in the worktree move back before it goes. They go to the same subdirectory of the main checkout when it exists, and otherwise to the main checkout root. If they cannot move, the worktree is kept and Caudra says why.
 
-Inside Herdr, removing a worktree also closes its workspace. When the current pane is in that workspace, Caudra first opens a pane in the repository's workspace, or in a new workspace when the repository has none open. The focused session continues in that pane, and Caudra exits. The removal then runs in its own process, because Herdr closes the pane that started it.
+Caudra checks that every session working in the worktree can [move](/docs/sessions/#moving-sessions-to-another-directory) before it stashes, merges or removes anything, as it does when it creates a worktree.
 
-Inside Orca, Orca removes the worktree. When the current terminal is in that worktree, the focused session first continues in a new terminal in the repository's main worktree, and Caudra exits. Orca also deletes the worktree's branch when it is fully merged, so removal keeps only unmerged branches.
+Inside Herdr, closing or removing a worktree also closes its workspace. When the current pane is in that workspace, every session open in Caudra continues in a tab of its own in the repository's workspace, or in a new workspace when the repository has none open. Each tab is labelled with its session's title, and the focused session's tab opens last, so it keeps the focus. Caudra then exits, and the removal runs in its own process, because Herdr closes the pane that started it. If a session cannot start in its tab, the worktree is kept and Caudra shows the command that resumes it.
+
+Inside Orca, Orca removes the worktree. When the current terminal is in that worktree, every session open in Caudra first continues in a terminal of its own in the repository's main worktree, and Caudra exits. Orca also deletes the worktree's branch when it is fully merged, so removal keeps only unmerged branches.
 
 ## Moving back after a removal
 

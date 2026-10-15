@@ -59,7 +59,7 @@ A command with an Experiment entry exists only while that switch is on under `[e
 | `/cd` | Change working directory |  |  |
 | `/move-session` | Move the current session; retain its counters and lifetime project attribution (optional directory) | Main only |  |
 | `/migrate-sessions` | Migrate sessions with one exact stored cwd; historical project usage included by default (optional destination directory) | Main only |  |
-| `/worktree` | Open, create or remove git worktrees of this repository (new [branch] \| remove) | Main only |  |
+| `/worktree` | Open, create, close or remove git worktrees of this repository (new [branch] \| close \| remove) | Main only |  |
 | `/btw` | Ask a side question, with follow-ups (no tools, nothing enters history) | Main only |  |
 | `/extract` | List the requirements the session has gathered so far (Extract model, copyable, no history pollution) | Main only |  |
 | `/goal` | Work until a completion condition is met (model, log) | Main only |  |

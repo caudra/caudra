@@ -44,6 +44,11 @@ pub enum GitError {
     OptionLikeBranch(String),
     #[error("stash {0} is no longer in the stash list")]
     StashMissing(String),
+    #[error("git {command} printed {output:?} rather than a count")]
+    Count {
+        command: &'static str,
+        output: String,
+    },
 }
 
 /// Git, run in one directory.
@@ -169,6 +174,46 @@ impl<'a> Git<'a> {
             "stash drop",
             &["stash", "drop", &format!("stash@{{{index}}}")],
             QUERY_TIMEOUT,
+        )
+        .map(drop)
+    }
+
+    /// Whether the commit `ancestor` is `descendant` or one it was built on.
+    pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool, GitError> {
+        Ok(self
+            .probe(
+                "merge-base",
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    "--end-of-options",
+                    ancestor,
+                    descendant,
+                ],
+            )?
+            .is_some())
+    }
+
+    /// How many commits `to` has that `from` does not.
+    pub fn commits_between(&self, from: &str, to: &str) -> Result<usize, GitError> {
+        let output = self.output(
+            "rev-list",
+            &["rev-list", "--count", &format!("{from}..{to}")],
+            QUERY_TIMEOUT,
+        )?;
+        output.parse().map_err(|_| GitError::Count {
+            command: "rev-list",
+            output,
+        })
+    }
+
+    /// Moves the checked-out branch forward to `commit`, refusing anything
+    /// but a fast-forward.
+    pub fn fast_forward(&self, commit: &str) -> Result<(), GitError> {
+        self.output(
+            "merge",
+            &["merge", "--ff-only", "--quiet", commit],
+            TREE_TIMEOUT,
         )
         .map(drop)
     }
@@ -408,6 +453,43 @@ mod tests {
             repository.git().stash_drop(&stash),
             Err(GitError::StashMissing(_))
         ));
+    }
+
+    #[test]
+    fn a_branch_ahead_fast_forwards_and_a_diverged_one_does_not() {
+        let repository = Repository::new();
+        let base = repository.git().head().unwrap();
+        let path = repository.sibling("login");
+        repository.git().add_worktree(&path, BRANCH, &base).unwrap();
+        git(
+            &path,
+            &["commit", "--quiet", "--allow-empty", "--message", "ahead"],
+        );
+        let ahead = Git::new(&path).head().unwrap();
+
+        assert!(repository.git().is_ancestor(&base, &ahead).unwrap());
+        assert!(!repository.git().is_ancestor(&ahead, &base).unwrap());
+        assert_eq!(repository.git().commits_between(&base, &ahead).unwrap(), 1);
+        repository.git().fast_forward(&ahead).unwrap();
+        assert_eq!(repository.git().head().unwrap(), ahead);
+
+        git(
+            &repository.root,
+            &["commit", "--quiet", "--allow-empty", "--message", "main"],
+        );
+        git(
+            &path,
+            &["commit", "--quiet", "--allow-empty", "--message", "branch"],
+        );
+        let main = repository.git().head().unwrap();
+
+        assert!(matches!(
+            repository
+                .git()
+                .fast_forward(&Git::new(&path).head().unwrap()),
+            Err(GitError::Failed { .. })
+        ));
+        assert_eq!(repository.git().head().unwrap(), main);
     }
 
     #[test]

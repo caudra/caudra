@@ -45,7 +45,10 @@ use caudra_agent::prompt::profile::{
 use caudra_agent::tools::ToolRegistry;
 use caudra_agent::workflow::WorkflowTransition;
 use caudra_agent::worktree::git::Git;
-use caudra_agent::worktree::{Backend, Request as WorktreeRequest, counterpart, label};
+use caudra_agent::worktree::{
+    Backend, CloseRequest, RemoveRequest, Request as WorktreeRequest, counterpart, label,
+    plan_close,
+};
 use caudra_agent::{
     AgentConfig, AgentEvent, AgentMode, CancelToken, DoneReason, Envelope, McpCommand,
     McpConfigErrors, McpHandle, mcp,
@@ -886,15 +889,16 @@ fn refuse_resumable_workflows(database: &SessionDatabase, id: CaudraId) -> Resul
     Ok(())
 }
 
-/// The move storage would refuse for a pending revert, asked before a new
-/// worktree is created for a session that could not move into it.
+/// The move storage would refuse for a pending revert, asked before a
+/// worktree is created, closed or removed, which the sessions working in it
+/// could then not follow or leave.
 fn refuse_pending_source_revert(
     database: &SessionDatabase,
     cwd: &str,
-    moving: CaudraId,
+    moving: &[CaudraId],
 ) -> Result<(), String> {
     let Some(blocker) = database
-        .relocation_revert_blocker(cwd, &[moving])
+        .relocation_revert_blocker(cwd, moving)
         .map_err(|error| error.to_string())?
     else {
         return Ok(());
@@ -4185,7 +4189,14 @@ impl<'t> EventLoop<'t> {
             .relocation_available()
             .and_then(|()| self.worktree_overview(idx));
         match overview {
-            Ok(overview) => self.sessions[idx].app.open_worktrees(overview, view),
+            Ok(overview) => {
+                let current = overview.current.clone();
+                let removal = view == WorktreeView::Remove;
+                self.sessions[idx].app.open_worktrees(overview, view);
+                if removal {
+                    self.inspect_worktree_removal(idx, current);
+                }
+            }
             Err(error) => self.sessions[idx].app.flash(error),
         }
     }
@@ -4238,15 +4249,23 @@ impl<'t> EventLoop<'t> {
     }
 
     fn inspect_worktree_removal(&mut self, idx: usize, root: PathBuf) {
+        let close = checkout::discover(&root)
+            .ok_or_else(|| WORKTREE_REPOSITORY_ERR.to_owned())
+            .and_then(|checkout| {
+                plan_close(&checkout.main_root, &root).map_err(|error| error.to_string())
+            });
         match Git::new(&root).is_dirty() {
-            Ok(dirty) => self.sessions[idx].app.show_worktree_removal(root, dirty),
+            Ok(dirty) => self.sessions[idx]
+                .app
+                .show_worktree_removal(root, dirty, close),
             Err(error) => self.sessions[idx].app.flash(error.to_string()),
         }
     }
 
     /// Checks what `/cd` and relocation check, since the UI restarts around
     /// every worktree change, and reserves each session's workflows until
-    /// then. A new worktree's session moves, so it must be free to.
+    /// then. The sessions a change moves must be free to, which is asked
+    /// before anything is created, merged or stashed.
     fn prepare_worktree(&self, request: WorktreeRequest) -> Result<PendingRelocation, String> {
         self.relocation_available()?;
         if let Some(error) = cwd_change_blocker(self.sessions.iter().map(|runtime| {
@@ -4264,20 +4283,29 @@ impl<'t> EventLoop<'t> {
         {
             return Err(RELOCATION_WORKBENCH_ERR.into());
         }
-        if let WorktreeRequest::Create(create) = &request {
-            let database = SessionDatabase::open_state(&self.ctx.storage)
-                .map_err(|error| error.to_string())?;
-            refuse_resumable_workflows(&database, create.session)?;
-            if let Some(runtime) = self
+        let moving: Vec<_> = match &request {
+            WorktreeRequest::Create(create) => self
                 .sessions
                 .iter()
-                .find(|runtime| runtime.id() == create.session)
-            {
-                refuse_pending_source_revert(
-                    &database,
-                    &runtime.app.state.session.cwd,
-                    create.session,
-                )?;
+                .filter(|runtime| runtime.id() == create.session)
+                .collect(),
+            WorktreeRequest::Remove(RemoveRequest { root, .. })
+            | WorktreeRequest::Close(CloseRequest { root, .. }) => self
+                .sessions
+                .iter()
+                .filter(|runtime| {
+                    canonical_cwd(Path::new(&runtime.app.state.session.cwd))
+                        .is_ok_and(|cwd| cwd.starts_with(root))
+                })
+                .collect(),
+        };
+        if !moving.is_empty() {
+            let database = SessionDatabase::open_state(&self.ctx.storage)
+                .map_err(|error| error.to_string())?;
+            let ids: Vec<_> = moving.iter().map(|runtime| runtime.id()).collect();
+            for runtime in &moving {
+                refuse_resumable_workflows(&database, runtime.id())?;
+                refuse_pending_source_revert(&database, &runtime.app.state.session.cwd, &ids)?;
             }
         }
         let mut workflows = Vec::with_capacity(self.sessions.len());
@@ -5857,7 +5885,7 @@ mod tests {
         sibling.save(&storage).unwrap();
         let database = SessionDatabase::open_state(&storage).unwrap();
 
-        let result = refuse_pending_source_revert(&database, cwd, moving.id);
+        let result = refuse_pending_source_revert(&database, cwd, &[moving.id]);
 
         if refused {
             assert_eq!(

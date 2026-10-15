@@ -23,6 +23,8 @@ const BRANCH_REF: &str = "refs/heads/";
 const UNKNOWN_CODES: [&str; 2] = ["repo_not_found", "selector_not_found"];
 /// How Orca refuses to remove a repository's own checkout.
 const PROTECTED_WORKTREE: &str = "Refusing to delete protected worktree";
+const OPEN_TERMINAL_WORKTREE_UNKNOWN: &str =
+    "a terminal Caudra did not open does not say which worktree holds it";
 
 /// Worktrees as Orca manages them: each belongs to a repository the user
 /// added to Orca, and a command runs in one by opening a terminal there.
@@ -280,10 +282,22 @@ impl Workspaces for OrcaWorkspaces {
     /// command for it. Each terminal is a tab of its own.
     fn pane(&self, site: PaneSite<'_>) -> Result<HostPane, HostError> {
         match site {
-            PaneSite::Beside { location, cwd } => Ok(HostPane::Pending {
-                location: location.clone(),
-                cwd: cwd.to_path_buf(),
-            }),
+            PaneSite::Beside { location, cwd } | PaneSite::TabIn { location, cwd } => {
+                Ok(HostPane::Pending {
+                    location: location.clone(),
+                    cwd: cwd.to_path_buf(),
+                })
+            }
+            PaneSite::TabBeside { pane, cwd } => match pane {
+                HostPane::Pending { location, .. } => Ok(HostPane::Pending {
+                    location: location.clone(),
+                    cwd: cwd.to_path_buf(),
+                }),
+                HostPane::Open { .. } => Err(HostError::Unsupported(
+                    HOST,
+                    OPEN_TERMINAL_WORKTREE_UNKNOWN.into(),
+                )),
+            },
             PaneSite::NewTab(cwd) => match &self.worktree_id {
                 Some(worktree_id) => Ok(HostPane::Pending {
                     location: HostLocation(worktree_id.clone()),
@@ -614,6 +628,37 @@ mod tests {
                 fixture.id(&fixture.linked)
             )]
         );
+    }
+
+    #[test]
+    fn tabs_in_a_worktree_and_beside_one_open_terminals_there() {
+        let fixture = Fixture::new();
+        let orca = fixture.orca(&[(
+            "terminal create",
+            format!(r#"{{"ok":true,"result":{{"terminal":{{"handle":"{HANDLE}"}}}}}}"#),
+        )]);
+        let location = HostLocation(fixture.id(&fixture.main));
+        let first = orca
+            .pane(PaneSite::TabIn {
+                location: &location,
+                cwd: &fixture.main,
+            })
+            .unwrap();
+        let second = orca
+            .pane(PaneSite::TabBeside {
+                pane: &first,
+                cwd: &fixture.main,
+            })
+            .unwrap();
+
+        orca.run(&first, COMMAND, Some(LABEL)).unwrap();
+        orca.run(&second, COMMAND, Some(LABEL)).unwrap();
+
+        let call = format!(
+            "terminal create --worktree id:{} --command {COMMAND} --title {LABEL} --focus --json",
+            location.0
+        );
+        assert_eq!(fixture.calls(), [call.clone(), call]);
     }
 
     #[test]

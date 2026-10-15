@@ -24,6 +24,7 @@ use caudra_agent::HistorySnapshot;
 use caudra_agent::agent::estimate_message_tokens;
 use caudra_agent::peers::PeerSession;
 use caudra_agent::permissions::PermissionManager;
+use caudra_agent::worktree::ClosePlan;
 use caudra_config::Feature;
 use caudra_providers::{
     HistoryItem, HistoryItemKind, HistoryProjectionError, ImageSource, Model, TokenUsage,
@@ -2143,8 +2144,13 @@ impl App {
         self.worktree_picker.open(overview, view);
     }
 
-    pub(crate) fn show_worktree_removal(&mut self, root: PathBuf, dirty: bool) {
-        self.worktree_picker.show_removal(root, dirty);
+    pub(crate) fn show_worktree_removal(
+        &mut self,
+        root: PathBuf,
+        dirty: bool,
+        close: Result<ClosePlan, String>,
+    ) {
+        self.worktree_picker.show_removal(root, dirty, close);
     }
 
     pub(super) fn handle_worktree_action(&mut self, action: WorktreeAction) -> Vec<Action> {

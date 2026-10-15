@@ -1,7 +1,9 @@
 use std::mem;
 use std::path::{Path, PathBuf};
 
-use caudra_agent::worktree::{Changes, CreateRequest, RemoveRequest, Request, label};
+use caudra_agent::worktree::{
+    Changes, ClosePlan, CloseRequest, CreateRequest, RemoveRequest, Request, label,
+};
 use caudra_grab::grab_scope;
 use caudra_storage::id::CaudraId;
 use caudra_storage::worktrees::CheckoutSessions;
@@ -34,6 +36,7 @@ const BASE_LABEL: &str = "Start at";
 const CARRY_LABEL: &str = "Carry uncommitted changes";
 const CREATE: &str = "Create worktree";
 const REMOVE: &str = "Remove worktree";
+const CLOSE_UNAVAILABLE: &str = "Bringing the work back is not possible:";
 const STASH_AND_REMOVE: &str = "Stash uncommitted changes, then remove";
 const DISCARD_AND_REMOVE: &str = "Discard uncommitted changes and remove";
 const MAIN_NOT_REMOVABLE: &str = "The main checkout cannot be removed.";
@@ -46,16 +49,18 @@ const BRANCH_HINT: &str =
     "Leave it empty to have one named for you. An existing branch is checked out as it is.";
 const BASE_HINT: &str = "A branch, tag or commit of this checkout.";
 const BRANCH_KEPT: &str = "Its branch is kept.";
-pub(crate) const USAGE: &str = "Usage: /worktree [new [branch] | remove]";
+pub(crate) const USAGE: &str = "Usage: /worktree [new [branch] | close | remove]";
 const NEW_ARGUMENT: &str = "new";
 const REMOVE_ARGUMENT: &str = "remove";
+const CLOSE_ARGUMENT: &str = "close";
 
 /// Where `/worktree` opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorktreeView {
     List,
     Create(Option<String>),
-    /// The removal of the checkout the session works in.
+    /// The confirmation that closes or removes the checkout the session
+    /// works in.
     Remove,
 }
 
@@ -65,7 +70,7 @@ impl WorktreeView {
         let view = match words.next() {
             None => Self::List,
             Some(NEW_ARGUMENT) => Self::Create(words.next().map(str::to_owned)),
-            Some(REMOVE_ARGUMENT) => Self::Remove,
+            Some(REMOVE_ARGUMENT | CLOSE_ARGUMENT) => Self::Remove,
             Some(_) => return Err(USAGE),
         };
         match words.next() {
@@ -81,7 +86,8 @@ pub enum WorktreeAction {
     Closed,
     Refresh,
     Open(PathBuf),
-    /// The removal of this checkout needs to know whether it has changes.
+    /// The removal of this checkout needs to know whether it has changes,
+    /// and what closing it would bring back.
     InspectRemoval(PathBuf),
     Run(Request),
     Copy(String),
@@ -130,6 +136,7 @@ enum EntryKind {
     Field(Field),
     Carry,
     Create,
+    Close,
     Remove(Changes),
 }
 
@@ -169,18 +176,17 @@ impl WorktreePicker {
         }
     }
 
+    /// Opens on `view`, except that the removal of the current checkout
+    /// needs [`WorktreeAction::InspectRemoval`] answered first.
     pub fn open(&mut self, overview: WorktreeOverview, view: WorktreeView) {
         self.close();
-        let (current, dirty) = (overview.current.clone(), overview.dirty);
         self.flow = Some(Flow {
             overview,
             stage: Stage::List,
         });
         self.show_list();
-        match view {
-            WorktreeView::List => {}
-            WorktreeView::Create(branch) => self.show_create(branch),
-            WorktreeView::Remove => self.show_removal(current, dirty),
+        if let WorktreeView::Create(branch) = view {
+            self.show_create(branch);
         }
     }
 
@@ -201,7 +207,9 @@ impl WorktreePicker {
         }
     }
 
-    pub fn show_removal(&mut self, root: PathBuf, dirty: bool) {
+    /// Confirms the removal of the checkout at `root`, offering first to
+    /// bring its work back as `close` plans, or saying why it cannot.
+    pub fn show_removal(&mut self, root: PathBuf, dirty: bool, close: Result<ClosePlan, String>) {
         let Some(flow) = &mut self.flow else {
             return;
         };
@@ -218,20 +226,30 @@ impl WorktreePicker {
             return;
         }
         let branch = checkout.branch.clone();
-        let info = format!(
+        let main = collapse_home(&flow.overview.main_root.to_string_lossy());
+        let mut info = format!(
             "{} at {}\n{} {BRANCH_KEPT}",
             label(branch.as_deref(), &root),
             collapse_home(&root.to_string_lossy()),
             moving_back(checkout.sessions.len(), &flow.overview.main_root),
         );
-        let entries = if dirty {
-            vec![
+        let mut entries = Vec::with_capacity(3);
+        match close {
+            Ok(plan) => entries.push(Entry {
+                label: format!("Bring the work back to {main}, then remove"),
+                detail: Some(bringing_back(&plan)),
+                kind: EntryKind::Close,
+            }),
+            Err(reason) => info.push_str(&format!("\n{CLOSE_UNAVAILABLE} {reason}")),
+        }
+        if dirty {
+            entries.extend([
                 action(STASH_AND_REMOVE, EntryKind::Remove(Changes::Stash)),
                 action(DISCARD_AND_REMOVE, EntryKind::Remove(Changes::Discard)),
-            ]
+            ]);
         } else {
-            vec![action(REMOVE, EntryKind::Remove(Changes::None))]
-        };
+            entries.push(action(REMOVE, EntryKind::Remove(Changes::None)));
+        }
         flow.stage = Stage::Remove { root, branch };
         self.picker.set_error_text(None);
         self.picker.set_info_text(Some(info));
@@ -536,6 +554,7 @@ impl WorktreePicker {
                     WorktreeAction::Consumed
                 }
                 EntryKind::Create => self.confirm_create(),
+                EntryKind::Close => self.confirm_close(),
                 EntryKind::Remove(changes) => self.confirm_removal(changes),
             },
             PickerAction::Key(key) => self.handle_key(key),
@@ -575,6 +594,22 @@ impl WorktreePicker {
             branch: (!draft.branch.is_empty()).then_some(draft.branch),
             base: draft.base,
             carry: draft.carry && overview.dirty,
+        }))
+    }
+
+    fn confirm_close(&mut self) -> WorktreeAction {
+        let Some(Flow {
+            overview,
+            stage: Stage::Remove { root, branch },
+        }) = self.flow.take()
+        else {
+            return WorktreeAction::Consumed;
+        };
+        self.picker.close();
+        WorktreeAction::Run(Request::Close(CloseRequest {
+            root,
+            main_root: overview.main_root,
+            branch,
         }))
     }
 
@@ -637,6 +672,23 @@ fn session_count(count: usize) -> String {
     }
 }
 
+/// What closing brings back to the main checkout.
+fn bringing_back(plan: &ClosePlan) -> String {
+    let commits = format!(
+        "fast-forwards it by {}",
+        match plan.commits {
+            1 => "1 commit".into(),
+            count => format!("{count} commits"),
+        }
+    );
+    match (plan.commits > 0, plan.carries) {
+        (true, true) => format!("{commits} and brings the uncommitted changes along"),
+        (true, false) => commits,
+        (false, true) => "brings the uncommitted changes along".into(),
+        (false, false) => "it already has every commit".into(),
+    }
+}
+
 fn moving_back(count: usize, main_root: &Path) -> String {
     match count {
         0 => "No session works in it.".into(),
@@ -685,9 +737,11 @@ fn confirm_footer() -> Vec<Hint> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
-    use caudra_agent::worktree::{Changes, CreateRequest, RemoveRequest, Request};
+    use caudra_agent::worktree::{
+        Changes, ClosePlan, CloseRequest, CreateRequest, RemoveRequest, Request,
+    };
     use caudra_storage::id::CaudraId;
     use caudra_storage::worktrees::CheckoutSessions;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -707,6 +761,7 @@ mod tests {
     const EMPTY_BRANCH: &str = "";
     const WHITESPACE_BRANCH: &str = "   ";
     const EXPECTED_CREATE: &str = "expected a create request";
+    const CLOSE_REFUSED: &str = "the main checkout has commits this worktree does not";
 
     fn checkout(root: &str, branch: &str, linked: bool) -> CheckoutSessions {
         CheckoutSessions {
@@ -743,25 +798,57 @@ mod tests {
     #[test_case("new", Ok(WorktreeView::Create(None)) ; "new_unnamed")]
     #[test_case(" new  feature/login ", Ok(WorktreeView::Create(Some(BRANCH.into()))) ; "new_named")]
     #[test_case("remove", Ok(WorktreeView::Remove) ; "remove")]
+    #[test_case("close", Ok(WorktreeView::Remove) ; "close")]
     #[test_case("delete", Err(USAGE) ; "unknown_subcommand")]
     #[test_case("remove now", Err(USAGE) ; "extra_argument")]
     fn worktree_arguments_choose_the_view(args: &str, expected: Result<WorktreeView, &str>) {
         assert_eq!(WorktreeView::parse(args), expected);
     }
 
-    #[test]
-    fn remove_view_confirms_the_current_linked_checkout() {
-        let mut current = overview(false);
-        current.current = LINKED.into();
-        let mut picker = WorktreePicker::new();
+    fn close_plan() -> ClosePlan {
+        ClosePlan {
+            head: HEAD.into(),
+            commits: 2,
+            carries: true,
+        }
+    }
 
-        picker.open(current, WorktreeView::Remove);
+    #[test]
+    fn closing_is_offered_first_when_the_work_can_come_back() {
+        let (mut picker, _) = opened(false);
+
+        picker.show_removal(LINKED.into(), false, Ok(close_plan()));
         let action = picker.handle_key(press(KeyCode::Enter));
 
-        let WorktreeAction::Run(Request::Remove(request)) = action else {
-            panic!("expected a remove request, got {action:?}");
+        let WorktreeAction::Run(Request::Close(request)) = action else {
+            panic!("expected a close request, got {action:?}");
         };
-        assert_eq!(request.root, PathBuf::from(LINKED));
+        assert_eq!(
+            request,
+            CloseRequest {
+                root: LINKED.into(),
+                main_root: MAIN.into(),
+                branch: Some(BRANCH.into()),
+            }
+        );
+    }
+
+    #[test]
+    fn a_worktree_that_cannot_close_says_why() {
+        let (mut picker, _) = opened(false);
+
+        picker.show_removal(LINKED.into(), false, Err(CLOSE_REFUSED.into()));
+
+        assert!(
+            picker
+                .picker
+                .info_text()
+                .is_some_and(|info| info.contains(CLOSE_REFUSED))
+        );
+        assert!(matches!(
+            picker.handle_key(press(KeyCode::Enter)),
+            WorktreeAction::Run(Request::Remove(_))
+        ));
     }
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -979,7 +1066,7 @@ mod tests {
         let WorktreeAction::InspectRemoval(root) = inspect else {
             panic!("expected an inspection, got {inspect:?}");
         };
-        picker.show_removal(root, dirty);
+        picker.show_removal(root, dirty, Err(CLOSE_REFUSED.into()));
         let action = picker.handle_key(press(KeyCode::Enter));
 
         let WorktreeAction::Run(Request::Remove(request)) = action else {
@@ -1000,7 +1087,7 @@ mod tests {
     fn the_main_checkout_is_never_removed() {
         let (mut picker, _) = opened(false);
 
-        picker.show_removal(MAIN.into(), false);
+        picker.show_removal(MAIN.into(), false, Ok(close_plan()));
 
         assert_eq!(picker.picker.error_text(), Some(MAIN_NOT_REMOVABLE));
         assert!(matches!(

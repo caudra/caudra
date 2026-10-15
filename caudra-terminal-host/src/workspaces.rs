@@ -33,6 +33,14 @@ pub enum PaneSite<'a> {
     /// In a tab of its own beside the one Caudra runs in, starting in the
     /// directory given.
     NewTab(&'a Path),
+    /// In a tab of its own in `location`, starting in `cwd`.
+    TabIn {
+        location: &'a HostLocation,
+        cwd: &'a Path,
+    },
+    /// In a tab of its own beside the one holding `pane`, a pane this host
+    /// opened, starting in `cwd`.
+    TabBeside { pane: &'a HostPane, cwd: &'a Path },
 }
 
 /// A checkout the host opened or focused.

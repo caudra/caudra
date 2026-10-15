@@ -9,6 +9,8 @@ use super::env::HerdrEnv;
 use crate::error::HostError;
 use crate::workspaces::{HostLocation, HostPane, Located, Opened, PaneSite, Workspaces};
 
+const PANES_OPEN_FIRST: &str = "Herdr opens every pane before it runs a command";
+
 /// Worktrees as Herdr workspaces: each opens grouped with its repository's,
 /// and a pane takes commands by being typed into.
 #[derive(Debug)]
@@ -20,6 +22,10 @@ impl HerdrWorkspaces {
     pub(super) fn new(env: HerdrEnv) -> Self {
         Self { env }
     }
+}
+
+fn not_open() -> HostError {
+    HostError::Unsupported(HOST, PANES_OPEN_FIRST.into())
 }
 
 fn open_pane(workspace: OpenedWorkspace) -> HostPane {
@@ -76,20 +82,28 @@ impl Workspaces for HerdrWorkspaces {
 
     fn pane(&self, site: PaneSite<'_>) -> Result<HostPane, HostError> {
         let cli = self.env.cli();
-        match site {
-            PaneSite::Beside { location, cwd } => Ok(HostPane::Open {
-                pane: cli.split_workspace(&location.0, cwd)?,
-                tab: None,
-            }),
-            PaneSite::NewWorkspace(cwd) => cli.workspace_create(cwd).map(open_pane),
-            PaneSite::NewTab(cwd) => {
-                cli.tab_create(self.env.workspace_id.as_deref(), cwd)
-                    .map(|opened| HostPane::Open {
-                        pane: opened.pane_id,
-                        tab: Some(opened.tab_id),
-                    })
+        let (workspace, cwd) = match site {
+            PaneSite::Beside { location, cwd } => {
+                return Ok(HostPane::Open {
+                    pane: cli.split_workspace(&location.0, cwd)?,
+                    tab: None,
+                });
             }
-        }
+            PaneSite::NewWorkspace(cwd) => return cli.workspace_create(cwd).map(open_pane),
+            PaneSite::NewTab(cwd) => (self.env.workspace_id.clone(), cwd),
+            PaneSite::TabIn { location, cwd } => (Some(location.0.clone()), cwd),
+            PaneSite::TabBeside { pane, cwd } => {
+                let HostPane::Open { pane, .. } = pane else {
+                    return Err(not_open());
+                };
+                (Some(cli.pane_workspace(pane)?), cwd)
+            }
+        };
+        cli.tab_create(workspace.as_deref(), cwd)
+            .map(|opened| HostPane::Open {
+                pane: opened.pane_id,
+                tab: Some(opened.tab_id),
+            })
     }
 
     fn run(
@@ -99,10 +113,7 @@ impl Workspaces for HerdrWorkspaces {
         label: Option<&str>,
     ) -> Result<(), HostError> {
         let HostPane::Open { pane, tab } = pane else {
-            return Err(HostError::Unsupported(
-                HOST,
-                "Herdr opens every pane before it runs a command".into(),
-            ));
+            return Err(not_open());
         };
         let cli = self.env.cli();
         if let Some(label) = label {

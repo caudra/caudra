@@ -28,6 +28,8 @@ const SLUG_KEPT: [char; 3] = ['-', '_', '.'];
 const UNNAMED_REPOSITORY: &str = "repository";
 const CARRY_MESSAGE: &str = "caudra: carried to a new worktree";
 const REMOVAL_MESSAGE: &str = "caudra: left by removed worktree";
+const CLOSE_MESSAGE: &str = "caudra: carried back from a closed worktree";
+const CHANGES_STAYED: &str = "they stay in the checkout they came from";
 
 #[derive(Debug, Error)]
 pub enum WorktreeError {
@@ -47,6 +49,18 @@ pub enum WorktreeError {
     BranchName(String),
     #[error("uncommitted changes carry over only to a worktree that starts at HEAD")]
     CarryNeedsHead,
+    #[error(
+        "the main checkout has commits this worktree does not; merge or rebase its branch first"
+    )]
+    Diverged,
+    #[error(
+        "the main checkout has uncommitted changes of its own; commit or stash them first, so the worktree's can come back"
+    )]
+    MainDirty,
+    #[error(
+        "the main checkout has moved past this worktree's commit, so its uncommitted changes have no commit to come back onto; commit them first"
+    )]
+    MovedPast,
 }
 
 /// Who creates and removes worktrees: the terminal host when there is one
@@ -125,10 +139,84 @@ pub struct RemoveRequest {
     pub changes: Changes,
 }
 
+/// Brings a linked worktree's commits and uncommitted changes back to the
+/// main checkout, moves its sessions there, and removes it, keeping its
+/// branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloseRequest {
+    pub root: PathBuf,
+    pub main_root: PathBuf,
+    pub branch: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
     Create(CreateRequest),
     Remove(RemoveRequest),
+    Close(CloseRequest),
+}
+
+/// What closing a worktree brings back to the main checkout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClosePlan {
+    /// The worktree's commit.
+    pub head: String,
+    /// How many commits the main checkout fast-forwards by to reach `head`.
+    pub commits: usize,
+    /// Whether the worktree has uncommitted changes to carry back.
+    pub carries: bool,
+}
+
+/// What closing the worktree at `root` would bring back, refused when the
+/// main checkout cannot take it: only a fast-forward brings commits back,
+/// and uncommitted changes come back only onto the worktree's own commit in
+/// a clean main checkout, where they always apply. Changes nothing.
+pub fn plan_close(main_root: &Path, root: &Path) -> Result<ClosePlan, WorktreeError> {
+    let main = Git::new(main_root);
+    let worktree = Git::new(root);
+    let head = worktree.head()?;
+    let main_head = main.head()?;
+    let carries = worktree.is_dirty()?;
+    let commits = if main.is_ancestor(&main_head, &head)? {
+        main.commits_between(&main_head, &head)?
+    } else if !main.is_ancestor(&head, &main_head)? {
+        return Err(WorktreeError::Diverged);
+    } else if carries {
+        return Err(WorktreeError::MovedPast);
+    } else {
+        0
+    };
+    if carries && main.is_dirty()? {
+        return Err(WorktreeError::MainDirty);
+    }
+    Ok(ClosePlan {
+        head,
+        commits,
+        carries,
+    })
+}
+
+/// Fast-forwards the main checkout to the worktree's commit, when it is
+/// behind it.
+pub fn fast_forward_main(main_root: &Path, plan: &ClosePlan) -> Result<(), WorktreeError> {
+    if plan.commits > 0 {
+        Git::new(main_root).fast_forward(&plan.head)?;
+    }
+    Ok(())
+}
+
+/// Moves the uncommitted changes of the worktree at `root` into the main
+/// checkout, which [`plan_close`] and [`fast_forward_main`] left clean at the
+/// worktree's commit. `Ok` holds a note when they came back but stay stashed
+/// too; `Err` says why they stayed in the worktree, which therefore has to
+/// stay.
+pub fn carry_back(root: &Path, main_root: &Path) -> Result<Option<String>, String> {
+    let worktree = Git::new(root);
+    match worktree.stash_push(CLOSE_MESSAGE) {
+        Ok(Some(stash)) => carry(&worktree, main_root, &stash),
+        Ok(None) => Ok(None),
+        Err(error) => Err(format!("{CHANGES_STAYED}: {error}")),
+    }
 }
 
 /// A worktree [`create`] made.
@@ -175,7 +263,8 @@ pub fn create(backend: &Backend, request: &CreateRequest) -> Result<Created, Wor
             return Err(error);
         }
     };
-    created.carry_failed = stash.and_then(|stash| carry(&source, &created.root, &stash));
+    created.carry_failed =
+        stash.and_then(|stash| carry(&source, &created.root, &stash).unwrap_or_else(Some));
     Ok(created)
 }
 
@@ -247,20 +336,21 @@ fn add_with_git(
     })
 }
 
-/// Applies `stash` in `root` and drops it, or puts it back into the source
-/// when it will not apply, returning why it did not come along.
-fn carry(source: &Git<'_>, root: &Path, stash: &str) -> Option<String> {
+/// Applies `stash`, taken in `source`, in `root` and drops it, saying so when
+/// it could not be dropped. When it will not apply it goes back into the
+/// source, and the error says why the changes did not come along.
+fn carry(source: &Git<'_>, root: &Path, stash: &str) -> Result<Option<String>, String> {
     let error = match Git::new(root).stash_apply(stash) {
         Ok(()) => {
-            return source
+            return Ok(source
                 .stash_drop(stash)
                 .err()
-                .map(|error| format!("they also stay stashed as {stash}: {error}"));
+                .map(|error| format!("they also stay stashed as {stash}: {error}")));
         }
         Err(error) => error,
     };
-    Some(match restore(source, stash) {
-        Ok(()) => format!("they stay in the source checkout: {error}"),
+    Err(match restore(source, stash) {
+        Ok(()) => format!("{CHANGES_STAYED}: {error}"),
         Err(_) => format!("they stay stashed as {stash}: {error}"),
     })
 }
@@ -407,8 +497,8 @@ mod tests {
     use super::git::Git;
     use super::git::fixture::{EDITED, ORIGINAL, Repository, TRACKED, UNTRACKED, git, stashes};
     use super::{
-        Backend, Changes, CreateRequest, Removal, RemoveRequest, WorktreeError, checkout_path,
-        counterpart, create, label, slug,
+        Backend, Changes, CreateRequest, Removal, RemoveRequest, WorktreeError, carry_back,
+        checkout_path, counterpart, create, fast_forward_main, label, plan_close, slug,
     };
 
     const DIRECTORY: &str = "/data/worktrees";
@@ -559,6 +649,119 @@ mod tests {
 
         assert!(matches!(removal.run(&backend), Err(WorktreeError::Git(_))));
         assert!(Git::new(&created.root).is_dirty().unwrap());
+    }
+
+    fn commit(root: &Path, message: &str) {
+        git(
+            root,
+            &["commit", "--quiet", "--allow-empty", "--message", message],
+        );
+    }
+
+    fn linked(repository: &Repository) -> PathBuf {
+        create(
+            &git_backend(repository),
+            &create_request(repository, "HEAD", false),
+        )
+        .unwrap()
+        .root
+    }
+
+    #[test_case(false ; "clean")]
+    #[test_case(true ; "dirty")]
+    fn closing_brings_commits_and_changes_back(dirty: bool) {
+        let repository = Repository::new();
+        let root = linked(&repository);
+        commit(&root, "work");
+        if dirty {
+            repository.edit(&root);
+        }
+
+        let plan = plan_close(&repository.root, &root).unwrap();
+        fast_forward_main(&repository.root, &plan).unwrap();
+        let carried = carry_back(&root, &repository.root);
+
+        assert_eq!(plan.commits, 1);
+        assert_eq!(plan.carries, dirty);
+        assert_eq!(carried, Ok(None));
+        assert_eq!(repository.git().head().unwrap(), plan.head);
+        assert!(!Git::new(&root).is_dirty().unwrap());
+        assert_eq!(repository.git().is_dirty().unwrap(), dirty);
+        let expected = if dirty { EDITED } else { ORIGINAL };
+        assert_eq!(
+            fs::read_to_string(repository.root.join(TRACKED)).unwrap(),
+            expected
+        );
+        assert_eq!(stashes(&repository.root), 0);
+    }
+
+    #[test_case(true, true, false, false, WorktreeError::Diverged ; "diverged")]
+    #[test_case(false, false, true, true, WorktreeError::MainDirty ; "main_dirty")]
+    #[test_case(true, false, true, false, WorktreeError::MovedPast ; "moved_past_with_changes")]
+    fn closing_is_refused_without_touching_either_checkout(
+        main_commits: bool,
+        branch_commits: bool,
+        worktree_dirty: bool,
+        main_dirty: bool,
+        expected: WorktreeError,
+    ) {
+        let repository = Repository::new();
+        let root = linked(&repository);
+        if main_commits {
+            commit(&repository.root, "main");
+        }
+        if branch_commits {
+            commit(&root, "branch");
+        }
+        if worktree_dirty {
+            repository.edit(&root);
+        }
+        if main_dirty {
+            fs::write(repository.root.join(UNTRACKED), ORIGINAL).unwrap();
+        }
+        let main_head = repository.git().head().unwrap();
+
+        let error = plan_close(&repository.root, &root).unwrap_err();
+
+        assert_eq!(error.to_string(), expected.to_string());
+        assert_eq!(repository.git().head().unwrap(), main_head);
+        assert_eq!(Git::new(&root).is_dirty().unwrap(), worktree_dirty);
+    }
+
+    #[test]
+    fn a_clean_worktree_the_main_checkout_moved_past_closes_without_a_merge() {
+        let repository = Repository::new();
+        let root = linked(&repository);
+        commit(&repository.root, "main");
+        let main_head = repository.git().head().unwrap();
+
+        let plan = plan_close(&repository.root, &root).unwrap();
+        fast_forward_main(&repository.root, &plan).unwrap();
+
+        assert_eq!(plan.commits, 0);
+        assert_eq!(repository.git().head().unwrap(), main_head);
+    }
+
+    #[test]
+    fn changes_that_will_not_apply_stay_in_the_worktree() {
+        let repository = Repository::new();
+        let root = linked(&repository);
+        repository.edit(&root);
+        plan_close(&repository.root, &root).unwrap();
+        let lock = repository.root.join(".git").join("index.lock");
+        fs::write(&lock, "").unwrap();
+
+        let carried = carry_back(&root, &repository.root);
+        fs::remove_file(lock).unwrap();
+
+        assert!(carried.is_err(), "{carried:?}");
+        assert_eq!(fs::read_to_string(root.join(TRACKED)).unwrap(), EDITED);
+        assert_eq!(fs::read_to_string(root.join(UNTRACKED)).unwrap(), EDITED);
+        assert_eq!(
+            fs::read_to_string(repository.root.join(TRACKED)).unwrap(),
+            ORIGINAL
+        );
+        assert_eq!(stashes(&repository.root), 0);
     }
 
     #[test_case("feature/login", "feature-login" ; "nested_branch")]

@@ -13,19 +13,23 @@ use color_eyre::Result;
 use color_eyre::eyre::eyre;
 
 use caudra_agent::worktree::{
-    self, Backend, CreateRequest, Removal, RemoveRequest, Request, counterpart, label,
+    self, Backend, Changes, CloseRequest, CreateRequest, Removal, RemoveRequest, Request,
+    counterpart, label,
 };
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::{SessionDatabase, SessionRelocation};
+use caudra_terminal_host::HostError;
 use caudra_terminal_host::resume::resume_command_line;
-use caudra_terminal_host::workspaces::{HostLocation, Opened, PaneSite, Workspaces};
+use caudra_terminal_host::workspaces::{HostLocation, HostPane, Opened, PaneSite, Workspaces};
 use caudra_ui::{SessionRelocationHandoff, SessionTab};
 
 const CREATE_FAILED: &str = "Could not create the worktree";
 const CARRY_FAILED: &str = "Uncommitted changes did not carry over";
 const MOVE_FAILED: &str = "The session stayed where it was";
 const REMOVE_FAILED: &str = "Could not remove worktree";
+const CLOSE_FAILED: &str = "Could not close worktree";
+const CHANGES_KEPT: &str = "Uncommitted changes stayed in worktree";
 const REMOVAL_KEPT: &str =
     "The worktree was kept, because the sessions working in it could not move out";
 const PANE_FAILED: &str = "could not start the session in its new pane";
@@ -59,7 +63,7 @@ pub(super) enum Handled {
 /// What is left of a worktree change once its sessions have moved.
 pub(super) struct FollowUp {
     moved: String,
-    removal: Option<(Removal, String)>,
+    retiring: Option<Retiring>,
 }
 
 impl FollowUp {
@@ -75,14 +79,50 @@ impl FollowUp {
     ) -> Vec<String> {
         if !committed {
             let mut notes = relocation;
-            notes.extend(self.removal.map(|_| REMOVAL_KEPT.to_owned()));
+            notes.extend(self.retiring.map(|_| REMOVAL_KEPT.to_owned()));
             return notes;
         }
         let mut notes = vec![self.moved];
-        if let Some((removal, name)) = self.removal {
-            notes.extend(remove_checkout(&removal, &name, backend, storage));
+        if let Some(retiring) = self.retiring {
+            notes.extend(retiring.finish(backend, storage));
         }
         notes
+    }
+}
+
+/// A checkout that goes once its sessions moved out.
+struct Retiring {
+    removal: Removal,
+    name: String,
+    /// Its uncommitted changes come back to the main checkout first, and it
+    /// stays when they cannot.
+    carry_back: bool,
+}
+
+impl Retiring {
+    fn finish(&self, backend: &Backend, storage: &StateDir) -> Vec<String> {
+        let mut notes = match self.bring_back() {
+            Ok(notes) => notes,
+            Err(note) => return vec![note],
+        };
+        notes.extend(remove_checkout(&self.removal, &self.name, backend, storage));
+        notes
+    }
+
+    /// Carries the uncommitted changes back when asked to; `Err` says why
+    /// they and the checkout stay.
+    fn bring_back(&self) -> Result<Vec<String>, String> {
+        if !self.carry_back {
+            return Ok(Vec::new());
+        }
+        let name = &self.name;
+        match worktree::carry_back(&self.removal.root, &self.removal.main_root) {
+            Ok(stashed) => Ok([format!("Brought the uncommitted changes of {name} back")]
+                .into_iter()
+                .chain(stashed)
+                .collect()),
+            Err(reason) => Err(format!("{CHANGES_KEPT} {name}, which was kept: {reason}")),
+        }
     }
 }
 
@@ -105,6 +145,7 @@ pub(super) fn execute(
     match request {
         Request::Create(request) => create(&request, tabs, focused, storage, backend),
         Request::Remove(request) => remove(&request, tabs, focused, storage, backend),
+        Request::Close(request) => close(&request, tabs, focused, storage, backend),
     }
 }
 
@@ -163,7 +204,7 @@ fn create(
                 handoff: handoff(relocation),
                 follow_up: Box::new(FollowUp {
                     moved,
-                    removal: None,
+                    retiring: None,
                 }),
             },
             notes,
@@ -246,81 +287,155 @@ fn remove(
             "Stashed the uncommitted changes of {name}; `git stash apply {stash}` brings them back in any checkout"
         )
     }));
-    let working: Vec<_> = tabs
-        .iter()
-        .filter_map(|tab| {
-            let cwd = canonical(&tab.session.cwd);
-            cwd.starts_with(&removal.root)
-                .then_some((tab.session.id, cwd))
-        })
-        .collect();
-    let destination = working.first().map_or_else(
-        || {
-            tabs.get(focused).map_or_else(
-                || removal.main_root.clone(),
-                |tab| canonical(&tab.session.cwd),
-            )
-        },
-        |(_, cwd)| counterpart(cwd, &removal.root, &removal.main_root),
-    );
-    let ids: Vec<_> = working.iter().map(|(id, _)| *id).collect();
-    if let (Some(host), Some(location)) = (backend.host(), removal.location.as_ref())
-        && host.holds_this_pane(location)
-    {
-        let leaving = Leaving {
-            host,
-            removal: &removal,
-            location,
-            name: &name,
-            destination: &destination,
-        };
-        return leaving.run(tabs, focused, &ids, storage, notes);
-    }
-    if ids.is_empty() {
-        notes.extend(remove_checkout(&removal, &name, backend, storage));
-        return Executed::resumed(tabs, focused, notes);
-    }
-    let relocation = match relocation(storage, &ids, &destination) {
-        Ok(relocation) => relocation,
+    let retiring = Retiring {
+        removal,
+        name,
+        carry_back: false,
+    };
+    retiring.leave(tabs, focused, storage, backend, notes)
+}
+
+/// Fast-forwards the main checkout to the worktree's commit, then has the
+/// worktree go as a removal does, its uncommitted changes coming back once
+/// its sessions moved.
+fn close(
+    request: &CloseRequest,
+    tabs: Vec<SessionTab>,
+    focused: usize,
+    storage: &StateDir,
+    backend: &Backend,
+) -> Executed {
+    let name = label(request.branch.as_deref(), &request.root);
+    let mut notes = super::reconcile_worktrees(storage, &request.root);
+    let prepared = worktree::plan_close(&request.main_root, &request.root).and_then(|plan| {
+        worktree::fast_forward_main(&request.main_root, &plan)?;
+        let (removal, _) = Removal::prepare(
+            backend,
+            &RemoveRequest {
+                root: request.root.clone(),
+                main_root: request.main_root.clone(),
+                branch: request.branch.clone(),
+                changes: Changes::None,
+            },
+        )?;
+        Ok((plan, removal))
+    });
+    let (plan, removal) = match prepared {
+        Ok(prepared) => prepared,
         Err(error) => {
-            notes.push(format!("{REMOVE_FAILED} {name}: {error:#}"));
+            notes.push(format!("{CLOSE_FAILED} {name}: {error}"));
             return Executed::resumed(tabs, focused, notes);
         }
     };
-    let moved = format!(
-        "Moved {} back to {}",
-        session_count(ids.len()),
-        destination.display()
-    );
-    Executed {
-        handled: Handled::Relocate {
-            tabs,
-            focused,
-            handoff: handoff(relocation),
-            follow_up: Box::new(FollowUp {
-                moved,
-                removal: Some((removal, name)),
-            }),
-        },
-        notes,
+    if plan.commits > 0 {
+        notes.push(format!(
+            "Fast-forwarded the main checkout by {} from {name}",
+            count(plan.commits, "commit")
+        ));
+    }
+    let retiring = Retiring {
+        removal,
+        name,
+        carry_back: plan.carries,
+    };
+    retiring.leave(tabs, focused, storage, backend, notes)
+}
+
+impl Retiring {
+    /// Moves the sessions working in the checkout back to the main checkout,
+    /// then has it go.
+    fn leave(
+        self,
+        tabs: Vec<SessionTab>,
+        focused: usize,
+        storage: &StateDir,
+        backend: &Backend,
+        mut notes: Vec<String>,
+    ) -> Executed {
+        let root = &self.removal.root;
+        let working: Vec<_> = tabs
+            .iter()
+            .filter_map(|tab| {
+                let cwd = canonical(&tab.session.cwd);
+                cwd.starts_with(root).then_some((tab.session.id, cwd))
+            })
+            .collect();
+        let destination = working.first().map_or_else(
+            || {
+                tabs.get(focused).map_or_else(
+                    || self.removal.main_root.clone(),
+                    |tab| canonical(&tab.session.cwd),
+                )
+            },
+            |(_, cwd)| counterpart(cwd, root, &self.removal.main_root),
+        );
+        let ids: Vec<_> = working.iter().map(|(id, _)| *id).collect();
+        if let (Some(host), Some(location)) = (backend.host(), self.removal.location.as_ref())
+            && host.holds_this_pane(location)
+        {
+            let leaving = Leaving {
+                host,
+                retiring: &self,
+                location,
+                destination: &destination,
+            };
+            return leaving.run(tabs, focused, &ids, storage, notes);
+        }
+        if ids.is_empty() {
+            notes.extend(self.finish(backend, storage));
+            return Executed::resumed(tabs, focused, notes);
+        }
+        let relocation = match relocation(storage, &ids, &destination) {
+            Ok(relocation) => relocation,
+            Err(error) => {
+                notes.push(format!("{REMOVE_FAILED} {}: {error:#}", self.name));
+                return Executed::resumed(tabs, focused, notes);
+            }
+        };
+        let moved = format!(
+            "Moved {} back to {}",
+            count(ids.len(), "session"),
+            destination.display()
+        );
+        Executed {
+            handled: Handled::Relocate {
+                tabs,
+                focused,
+                handoff: handoff(relocation),
+                follow_up: Box::new(FollowUp {
+                    moved,
+                    retiring: Some(self),
+                }),
+            },
+            notes,
+        }
     }
 }
 
-/// Leaving the host's workspace of a checkout being removed, which the host
+/// Leaving the host's workspace of a checkout that goes, which the host
 /// closes along with this pane.
 struct Leaving<'a> {
     host: &'a dyn Workspaces,
-    removal: &'a Removal,
+    retiring: &'a Retiring,
     /// Where the host has the checkout open, which holds this pane.
     location: &'a HostLocation,
-    name: &'a str,
+    /// Where the sessions working in the checkout move to.
     destination: &'a Path,
 }
 
+/// A session to resume in a tab of its own.
+struct Resuming {
+    id: CaudraId,
+    title: String,
+    cwd: PathBuf,
+}
+
 impl Leaving<'_> {
-    /// Opens a pane in the repository's own workspace, or in a new one, moves
-    /// the sessions working in the checkout, resumes the focused session in
-    /// that pane, and leaves the removal to run once this process is gone.
+    /// Opens a tab in the repository's own workspace, or in a new one, moves
+    /// the sessions working in the checkout, brings its changes back when
+    /// asked to, and resumes every session here in a tab of its own, the
+    /// focused one last so it keeps the focus. The removal runs once this
+    /// process is gone, and only when every session runs elsewhere.
     fn run(
         self,
         tabs: Vec<SessionTab>,
@@ -329,54 +444,117 @@ impl Leaving<'_> {
         storage: &StateDir,
         mut notes: Vec<String>,
     ) -> Executed {
-        let site = match &self.removal.main_location {
-            Some(location) => PaneSite::Beside {
-                location,
-                cwd: self.destination,
-            },
-            None => PaneSite::NewWorkspace(self.destination),
-        };
-        let pane = match self.host.pane(site) {
-            Ok(pane) => pane,
-            Err(error) => {
-                notes.push(format!("{REMOVE_FAILED} {}: {error}", self.name));
-                return Executed::resumed(tabs, focused, notes);
+        let name = &self.retiring.name;
+        let resuming = self.resuming(&tabs, focused, working);
+        let first = match resuming.first() {
+            Some(session) => {
+                let site = match &self.retiring.removal.main_location {
+                    Some(location) => PaneSite::TabIn {
+                        location,
+                        cwd: &session.cwd,
+                    },
+                    None => PaneSite::NewWorkspace(&session.cwd),
+                };
+                match self.host.pane(site) {
+                    Ok(pane) => Some(pane),
+                    Err(error) => {
+                        notes.push(format!("{REMOVE_FAILED} {name}: {error}"));
+                        return Executed::resumed(tabs, focused, notes);
+                    }
+                }
             }
+            None => None,
         };
         if !working.is_empty()
             && let Err(error) = relocation(storage, working, self.destination)
                 .and_then(|relocation| relocate(storage, &relocation))
         {
-            notes.push(format!("{REMOVE_FAILED} {}: {error:#}", self.name));
+            notes.push(format!("{REMOVE_FAILED} {name}: {error:#}"));
             return Executed::resumed(tabs, focused, notes);
         }
-        let resumed = tabs.get(focused).map(|tab| tab.session.id);
         drop(tabs);
-        if let Some(id) = resumed {
-            let command = resume_command_line(&id.to_string());
-            if let Err(error) = self.host.run(&pane, &command, None) {
-                notes.push(format!(
-                    "{} {PANE_FAILED}: {error}. Resume it there with: {command}",
-                    self.host.host()
-                ));
-                notes.push(REMOVAL_KEPT.into());
-                return Executed {
-                    handled: Handled::Exit,
-                    notes,
+        let mut removing = match self.retiring.bring_back() {
+            Ok(brought) => {
+                notes.extend(brought);
+                true
+            }
+            Err(note) => {
+                notes.push(note);
+                false
+            }
+        };
+        let mut started = true;
+        if let Some(first) = &first {
+            for (index, session) in resuming.iter().enumerate() {
+                let pane = match index {
+                    0 => Ok(first.clone()),
+                    _ => self.host.pane(PaneSite::TabBeside {
+                        pane: first,
+                        cwd: &session.cwd,
+                    }),
                 };
+                if let Err(note) = self.resume(pane, session) {
+                    notes.push(note);
+                    started = false;
+                }
             }
         }
-        notes.push(self.start_removal());
+        if removing && !started {
+            notes.push(REMOVAL_KEPT.into());
+            removing = false;
+        }
+        if removing {
+            notes.push(self.start_removal());
+        }
         Executed {
             handled: Handled::Exit,
             notes,
         }
     }
 
+    /// The sessions of `tabs` in the order their tabs open, the focused one
+    /// last, each where it works once the move is done.
+    fn resuming(&self, tabs: &[SessionTab], focused: usize, working: &[CaudraId]) -> Vec<Resuming> {
+        let mut ordered: Vec<_> = tabs.iter().collect();
+        if focused < ordered.len() {
+            let tab = ordered.remove(focused);
+            ordered.push(tab);
+        }
+        ordered
+            .into_iter()
+            .map(|tab| Resuming {
+                id: tab.session.id,
+                title: tab.session.title.clone(),
+                cwd: if working.contains(&tab.session.id) {
+                    self.destination.to_path_buf()
+                } else {
+                    canonical(&tab.session.cwd)
+                },
+            })
+            .collect()
+    }
+
+    /// Resumes `session` in `pane`, labelled with its title; `Err` says how
+    /// to resume it by hand.
+    fn resume(&self, pane: Result<HostPane, HostError>, session: &Resuming) -> Result<(), String> {
+        let command = resume_command_line(&session.id.to_string());
+        let label = Some(session.title.as_str()).filter(|title| !title.is_empty());
+        pane.and_then(|pane| self.host.run(&pane, &command, label))
+            .map_err(|error| {
+                format!(
+                    "{} {PANE_FAILED}: {error}. Resume it there with: {command}",
+                    self.host.host()
+                )
+            })
+    }
+
     /// Starts the removal in a process group of its own, which outlives this
     /// pane when the host closes it.
     fn start_removal(&self) -> String {
-        let mut command = self.host.remove_command(self.location, self.removal.force);
+        let name = &self.retiring.name;
+        let mut command = self
+            .host
+            .remove_command(self.location, self.retiring.removal.force);
         command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -386,9 +564,9 @@ impl Leaving<'_> {
         match command.spawn() {
             Ok(child) => {
                 drop(child);
-                format!("Removing worktree {}; its branch is kept", self.name)
+                format!("Removing worktree {name}; its branch is kept")
             }
-            Err(error) => format!("{REMOVE_FAILED} {}: {error}", self.name),
+            Err(error) => format!("{REMOVE_FAILED} {name}: {error}"),
         }
     }
 }
@@ -454,10 +632,10 @@ fn canonical(cwd: &str) -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(cwd))
 }
 
-fn session_count(count: usize) -> String {
+fn count(count: usize, noun: &str) -> String {
     match count {
-        1 => "1 session".into(),
-        count => format!("{count} sessions"),
+        1 => format!("1 {noun}"),
+        count => format!("{count} {noun}s"),
     }
 }
 
@@ -471,7 +649,8 @@ mod tests {
     use std::sync::Arc;
 
     use caudra_agent::worktree::{
-        Backend, Changes, CreateRequest, RemoveRequest, Request, checkout_path,
+        Backend, Changes, CloseRequest, CreateRequest, Removal, RemoveRequest, Request,
+        checkout_path,
     };
     use caudra_storage::StateDir;
     use caudra_storage::id::CaudraId;
@@ -483,8 +662,8 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        CREATE_FAILED, Executed, HandOff, Handled, PANE_FAILED, REMOVAL_KEPT, execute, relocate,
-        relocation,
+        CHANGES_KEPT, CLOSE_FAILED, CREATE_FAILED, Executed, HandOff, Handled, Leaving,
+        PANE_FAILED, REMOVAL_KEPT, Retiring, execute, relocate, relocation,
     };
 
     const MODEL: &str = "test/model";
@@ -502,6 +681,17 @@ mod tests {
     const HERDR_FAILS: &str = "echo 'no such pane' >&2; exit 1";
     const MOVED: &str = "This session moved";
     const RELOCATION_NOTE: &str = "Session relocation was not committed";
+    const MAIN_WORKSPACE: &str = "w1";
+    const NEW_TAB: &str = "w1:t9";
+    const NEW_PANE: &str = "w1:p9";
+    const NOTES: &str = "notes.txt";
+    const EDITED: &str = "edited\n";
+    const TITLES: [&str; 2] = ["Working in the worktree", "Working in main"];
+    /// A Herdr that opens every tab as the same pane in the main workspace.
+    const HERDR_OPENS_TABS: &str = r#"case "$1 $2" in
+"tab create") echo '{"id":"cli","result":{"type":"tab_created","tab":{"tab_id":"w1:t9"},"root_pane":{"pane_id":"w1:p9"}}}' ;;
+"pane get") echo '{"id":"cli","result":{"type":"pane_info","pane":{"pane_id":"w1:p9","tab_id":"w1:t9","workspace_id":"w1"}}}' ;;
+esac"#;
 
     struct Repository {
         _temp: TempDir,
@@ -597,6 +787,31 @@ mod tests {
             )
         }
 
+        fn close(&self, tabs: Vec<SessionTab>, root: &Path) -> Executed {
+            let request = CloseRequest {
+                root: root.to_path_buf(),
+                main_root: self.root.clone(),
+                branch: Some(BRANCH.into()),
+            };
+            execute(
+                Request::Close(request),
+                tabs,
+                0,
+                &self.storage,
+                &self.backend,
+            )
+        }
+
+        fn head(&self, dir: &Path) -> String {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        }
+
         fn stored_cwd(&self, id: CaudraId) -> String {
             SessionDatabase::open_state(&self.storage)
                 .unwrap()
@@ -681,6 +896,13 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?}");
+    }
+
+    fn commit(dir: &Path, message: &str) {
+        git(
+            dir,
+            &["commit", "--quiet", "--allow-empty", "--message", message],
+        );
     }
 
     fn ids(tabs: &[SessionTab]) -> Vec<CaudraId> {
@@ -842,5 +1064,161 @@ mod tests {
         }
         assert_eq!(repository.stored_cwd(moved), worktree.to_string_lossy());
         assert!(repository.herdr_calls().iter().any(|call| call == "run"));
+    }
+
+    #[test_case(false ; "clean")]
+    #[test_case(true ; "dirty")]
+    fn closing_a_git_worktree_brings_its_work_back_before_it_goes(dirty: bool) {
+        let repository = Repository::new();
+        let worktree = repository.worktree();
+        commit(&worktree, "work");
+        if dirty {
+            fs::write(worktree.join(NOTES), EDITED).unwrap();
+        }
+        let tab = repository.tab(&worktree);
+        let id = tab.session.id;
+
+        let Executed { handled, .. } = repository.close(vec![tab], &worktree);
+        let Handled::Relocate {
+            handoff, follow_up, ..
+        } = handled
+        else {
+            panic!("the session working in the worktree moves out first");
+        };
+        assert_eq!(
+            repository.head(&repository.root),
+            repository.head(&worktree)
+        );
+        relocate(&repository.storage, &handoff.request).unwrap();
+        follow_up.finish(Vec::new(), true, &repository.backend, &repository.storage);
+
+        assert!(!worktree.exists());
+        assert_eq!(repository.stored_cwd(id), repository.root.to_string_lossy());
+        assert_eq!(repository.root.join(NOTES).exists(), dirty);
+    }
+
+    #[test]
+    fn a_worktree_that_cannot_fast_forward_main_is_left_alone() {
+        let repository = Repository::new();
+        let worktree = repository.worktree();
+        commit(&worktree, "branch");
+        commit(&repository.root, "main");
+        let main_head = repository.head(&repository.root);
+        let tab = repository.tab(&worktree);
+        let id = tab.session.id;
+
+        let Executed { handled, notes } = repository.close(vec![tab], &worktree);
+
+        assert!(matches!(handled, Handled::Continue { .. }));
+        assert!(
+            notes.iter().any(|note| note.starts_with(CLOSE_FAILED)),
+            "{notes:?}"
+        );
+        assert!(worktree.exists());
+        assert_eq!(repository.head(&repository.root), main_head);
+        assert_eq!(repository.stored_cwd(id), worktree.to_string_lossy());
+    }
+
+    #[test]
+    fn changes_that_cannot_come_back_keep_the_worktree() {
+        let repository = Repository::new();
+        let worktree = repository.worktree();
+        fs::write(worktree.join(NOTES), EDITED).unwrap();
+        let tab = repository.tab(&worktree);
+
+        let Executed { handled, .. } = repository.close(vec![tab], &worktree);
+        let Handled::Relocate {
+            handoff, follow_up, ..
+        } = handled
+        else {
+            panic!("the session working in the worktree moves out first");
+        };
+        relocate(&repository.storage, &handoff.request).unwrap();
+        let lock = repository.root.join(".git").join("index.lock");
+        fs::write(&lock, "").unwrap();
+        let notes = follow_up.finish(Vec::new(), true, &repository.backend, &repository.storage);
+        fs::remove_file(lock).unwrap();
+
+        assert!(
+            notes.iter().any(|note| note.starts_with(CHANGES_KEPT)),
+            "{notes:?}"
+        );
+        assert!(worktree.join(NOTES).exists());
+        assert!(!repository.root.join(NOTES).exists());
+    }
+
+    /// Every session resumes in a tab of its own in the repository's
+    /// workspace, the focused one last so it keeps the focus.
+    #[test]
+    fn leaving_a_herdr_workspace_resumes_every_session_in_a_tab_of_its_own() {
+        let repository = Repository::new();
+        let worktree = repository.worktree();
+        let mut tabs = vec![repository.tab(&worktree), repository.tab(&repository.root)];
+        for (tab, title) in tabs.iter_mut().zip(TITLES) {
+            tab.session.title = title.into();
+        }
+        let [working, staying] = [tabs[0].session.id, tabs[1].session.id];
+        let herdr = repository.herdr(HERDR_OPENS_TABS);
+        let location = HostLocation(WORKSPACE.into());
+        let retiring = Retiring {
+            removal: Removal {
+                root: worktree.clone(),
+                main_root: repository.root.clone(),
+                force: false,
+                location: Some(location.clone()),
+                main_location: Some(HostLocation(MAIN_WORKSPACE.into())),
+            },
+            name: LABEL.into(),
+            carry_back: false,
+        };
+        let leaving = Leaving {
+            host: herdr.as_ref(),
+            retiring: &retiring,
+            location: &location,
+            destination: &repository.root,
+        };
+
+        let Executed { handled, notes } =
+            leaving.run(tabs, 0, &[working], &repository.storage, Vec::new());
+
+        assert!(matches!(handled, Handled::Exit), "{notes:?}");
+        assert_eq!(
+            repository.stored_cwd(working),
+            repository.root.to_string_lossy()
+        );
+        let main = repository.root.to_string_lossy().into_owned();
+        let [focused_title, other_title] = TITLES;
+        let (focused_resume, other_resume) = (
+            resume_command_line(&working.to_string()),
+            resume_command_line(&staying.to_string()),
+        );
+        let tab_create = |workspace: &'static str| {
+            [
+                "tab",
+                "create",
+                "--workspace",
+                workspace,
+                "--cwd",
+                main.as_str(),
+                "--focus",
+            ]
+            .map(str::to_owned)
+        };
+        let resume = |title: &str, command: &str| {
+            [
+                "tab", "rename", NEW_TAB, title, "pane", "rename", NEW_PANE, title, "pane", "run",
+                NEW_PANE, command,
+            ]
+            .map(str::to_owned)
+        };
+        let expected: Vec<String> = tab_create(MAIN_WORKSPACE)
+            .into_iter()
+            .chain(resume(other_title, &other_resume))
+            .chain(["pane", "get", NEW_PANE].map(str::to_owned))
+            .chain(tab_create(MAIN_WORKSPACE))
+            .chain(resume(focused_title, &focused_resume))
+            .collect();
+        let calls = repository.herdr_calls();
+        assert_eq!(&calls[..expected.len().min(calls.len())], &expected[..]);
     }
 }

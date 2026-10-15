@@ -434,7 +434,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/worktree",
-        description: "Open, create or remove git worktrees of this repository (new [branch] | remove)",
+        description: "Open, create, close or remove git worktrees of this repository (new [branch] | close | remove)",
         max_args: 2,
         scope: ChatScope::MainOnly,
         features: &[],

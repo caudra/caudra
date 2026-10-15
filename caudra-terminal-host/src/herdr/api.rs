@@ -344,6 +344,12 @@ impl HerdrCli {
         })
     }
 
+    /// The workspace that holds `pane_id`.
+    pub fn pane_workspace(&self, pane_id: &str) -> Result<String, HostError> {
+        let PaneLocation { pane } = self.call(&pane_get_args(pane_id), LAYOUT_TIMEOUT)?;
+        Ok(pane.workspace_id)
+    }
+
     /// Opens a pane in `cwd` beside the focused one of `workspace_id`, and
     /// focuses it.
     pub fn split_workspace(&self, workspace_id: &str, cwd: &Path) -> Result<String, HostError> {
@@ -848,6 +854,35 @@ esac
             format!(
                 "pane\nsplit\n{ROOT_PANE}\n--direction\n{SPLIT_DIRECTION}\n--cwd\n{MAIN_ROOT}\n--focus\n"
             )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pane_names_the_workspace_that_holds_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let record = temp.path().join("argv");
+        let binary = temp.path().join("herdr");
+        fs::write(
+            &binary,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$@" > '{}'
+echo '{{"id":"cli","result":{{"type":"pane_info","pane":{{"pane_id":"{ROOT_PANE}","tab_id":"{TAB}","workspace_id":"{WORKSPACE}"}}}}}}'
+"#,
+                record.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let cli = HerdrCli::new(binary.into(), "/tmp/herdr.sock".into());
+
+        assert_eq!(cli.pane_workspace(ROOT_PANE).unwrap(), WORKSPACE);
+        assert_eq!(
+            fs::read_to_string(record).unwrap(),
+            format!("pane\nget\n{ROOT_PANE}\n")
         );
     }
 
