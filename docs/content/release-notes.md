@@ -21,6 +21,7 @@ This release fixes Lua plugin cleanup, improves shell-output filtering, and upda
 
 - **Lua job cleanup survives cancellation and deadlines.** Releasing an abandoned `jobwait` during garbage collection no longer aborts the process, including when the plugin host shuts down.
 - **Shell output keeps unrelated subcommands intact.** Updated bundled filters no longer match commands merely because their names start with a filtered subcommand.
+- **PHP indexing handles clone arguments and partial application.** File indexes and code graphs no longer report parse errors for these expressions.
 
 ### Builds
 

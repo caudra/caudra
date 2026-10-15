@@ -13,6 +13,7 @@ use std::{collections::BTreeMap, path::Path};
 
 use test_case::test_case;
 use tree_sitter::StreamingIterator as _;
+use tree_sitter::{InputEdit, Parser, Point};
 use workcell_source_languages::{ALL, CaptureRole, Language, LanguageFamily, ReferenceKind};
 
 #[derive(Default)]
@@ -116,6 +117,63 @@ fn every_language_extracts_definitions_from_its_fixture() {
         }
     }
     assert!(empty.is_empty(), "{}", empty.join("\n"));
+}
+
+#[test_case("<?php function run($object) { return clone($object, ['name' => value()]); }", "function:run", "call:value" ; "clone with arguments")]
+#[test_case("<?php function run() { return apply(?, value()); }", "function:run", "call:apply" ; "partial application")]
+#[test_case("<?php class Record { public function __construct(public private(set) string $name) { record($name); } }", "method:__construct", "call:record" ; "asymmetric constructor promotion")]
+fn php_modern_syntax_preserves_named_definitions_and_calls(
+    source: &str,
+    definition: &str,
+    reference: &str,
+) {
+    let mut parser = Parser::new();
+    parser.set_language(&Language::Php.grammar()).unwrap();
+    let tree = parser.parse(source, None).unwrap();
+    assert!(
+        !tree.root_node().has_error(),
+        "{}",
+        tree.root_node().to_sexp()
+    );
+    let captured = capture(Language::Php, source);
+    assert_eq!(captured.definitions.get(definition), Some(&1));
+    assert_eq!(captured.references.get(reference), Some(&1));
+    assert_eq!(captured.unnamed_definitions, 0);
+}
+
+#[test]
+fn php_heredoc_incremental_parsing_matches_a_fresh_parse() {
+    const BEFORE: &str = "before";
+    const AFTER: &str = "after!";
+    const SOURCE: &str = "<?php\nfunction run() {\n    $text = <<<TEXT\nbefore\nTEXT;\n    return render($text);\n}\n";
+    let mut parser = Parser::new();
+    parser.set_language(&Language::Php.grammar()).unwrap();
+    let mut tree = parser.parse(SOURCE, None).unwrap();
+    assert!(!tree.root_node().has_error());
+    let start_byte = SOURCE.find(BEFORE).unwrap();
+    let row = SOURCE[..start_byte]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    tree.edit(&InputEdit {
+        start_byte,
+        old_end_byte: start_byte + BEFORE.len(),
+        new_end_byte: start_byte + AFTER.len(),
+        start_position: Point::new(row, 0),
+        old_end_position: Point::new(row, BEFORE.len()),
+        new_end_position: Point::new(row, AFTER.len()),
+    });
+    let source = SOURCE.replace(BEFORE, AFTER);
+    let incremental = parser.parse(&source, Some(&tree)).unwrap();
+    let fresh = parser.parse(&source, None).unwrap();
+    assert!(!incremental.root_node().has_error());
+    assert_eq!(
+        incremental.root_node().to_sexp(),
+        fresh.root_node().to_sexp()
+    );
+    let captured = capture(Language::Php, &source);
+    assert_eq!(captured.definitions.get("function:run"), Some(&1));
+    assert_eq!(captured.references.get("call:render"), Some(&1));
 }
 
 #[test]
