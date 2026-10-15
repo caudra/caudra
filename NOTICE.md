@@ -24,7 +24,7 @@ The bundled Monty interpreter is copyright (c) Pydantic Services Inc., licensed 
 
 The file, shell, web, code, and Python tools are built on [Workcell](https://github.com/caudra/caudra/tree/main/workcell), copyright The Workcell MCP authors, licensed under the Apache License, Version 2.0. See `THIRD_PARTY_LICENSES/Workcell.txt`.
 
-The Workcell shell output filter includes declarative filter rules copied without modification from [RTK](https://github.com/rtk-ai/rtk) at revision `aa408534859949ebac1dcc82ec4d25b575a539fa`, copyright 2024 rtk-ai and rtk-ai Labs, licensed under the Apache License, Version 2.0. See `THIRD_PARTY_LICENSES/RTK.txt`.
+The Workcell shell output filter includes declarative filter rules copied without modification from [RTK](https://github.com/rtk-ai/rtk) at revision `4ef8730cf3a0dea11c8d64a9b90bc0616fe52100` (tag `v1.0.1`), copyright 2026 RTK AI Labs, licensed under the Apache License, Version 2.0. See `THIRD_PARTY_LICENSES/RTK.txt`.
 
 The patched Crossterm terminal library retains its MIT license in `THIRD_PARTY_LICENSES/Crossterm.txt` and `vendor/crossterm/LICENSE`.
 

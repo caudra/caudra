@@ -11,11 +11,15 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.10 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.10)
 
-Nix builds use updated dependencies and continue to support Linux and Apple Silicon macOS.
+This release improves shell-output filtering and Nix builds.
 
 > **Important**
 >
 > **Intel macOS users building with Nix must switch to the native build.** Current nixpkgs no longer supports Intel macOS, so the flake no longer provides `x86_64-darwin` outputs. Native Intel macOS builds and release binaries remain supported.
+
+### Fixes
+
+- **Shell output keeps unrelated subcommands intact.** Updated bundled filters no longer match commands merely because their names start with a filtered subcommand.
 
 ### Builds
 

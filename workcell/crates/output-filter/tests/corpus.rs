@@ -59,6 +59,95 @@ fn rules_match_normalized_scopes_rather_than_raw_command_strings() {
 }
 
 #[test]
+fn refreshed_matchers_require_complete_subcommands() {
+    let corpus = builtin();
+    let mut failures = Vec::new();
+
+    for (command, name) in [
+        ("pio run", "pio-run"),
+        ("quarto render", "quarto-render"),
+        ("shopify theme push", "shopify-theme"),
+        ("shopify theme pull", "shopify-theme"),
+        ("terraform plan", "terraform-plan"),
+        ("trunk build", "trunk-build"),
+    ] {
+        for suffix in ["", " --help", "\t--help"] {
+            let scope = format!("{command}{suffix}");
+            let rule = corpus.find(&scope).expect("complete subcommand has a rule");
+            assert_eq!(rule.name(), name, "{scope}");
+            for case in &corpus.tests()[name] {
+                assert_eq!(
+                    rule.apply(&case.input, "", Some(0))
+                        .text
+                        .trim_end_matches('\n'),
+                    case.expected.trim_end_matches('\n'),
+                    "{scope}: {}",
+                    case.name
+                );
+            }
+        }
+        for suffix in ["ner", "_custom", "-custom"] {
+            let scope = format!("{command}{suffix}");
+            if let Some(rule) = corpus.find(&scope) {
+                failures.push(format!("{scope} incorrectly matched {}", rule.name()));
+            }
+        }
+    }
+
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn gradle_removal_preserves_normalized_build_and_spring_boot_routing() {
+    let corpus = builtin();
+
+    for (source, normalized, expected) in [
+        ("gradle build", "gradle build", None),
+        ("gradlew build", "gradlew build", None),
+        ("./gradlew build", "gradlew build", None),
+        ("gradle test", "gradle test", None),
+        ("gradlew test", "gradlew test", None),
+        ("./gradlew test", "gradlew test", None),
+        ("gradle bootRun", "gradle bootRun", Some("spring-boot")),
+        (
+            "gradle --info bootRun",
+            "gradle --info bootRun",
+            Some("spring-boot"),
+        ),
+        ("gradlew bootRun", "gradlew bootRun", None),
+        ("./gradlew bootRun", "gradlew bootRun", None),
+        ("bootRun", "bootRun", None),
+        (
+            "mvn spring-boot:run",
+            "mvn spring-boot:run",
+            Some("spring-boot"),
+        ),
+        (
+            "java -jar spring-app.jar",
+            "java -jar spring-app.jar",
+            Some("spring-boot"),
+        ),
+        ("java -jar app.jar", "java -jar app.jar", None),
+        ("java -jar spring/app.jar", "java -jar spring/app.jar", None),
+    ] {
+        let rule = corpus.find(normalized);
+        assert_eq!(rule.map(Rule::name), expected, "{source} -> {normalized}");
+        if let Some(rule) = rule {
+            for case in &corpus.tests()[rule.name()] {
+                assert_eq!(
+                    rule.apply(&case.input, "", Some(0))
+                        .text
+                        .trim_end_matches('\n'),
+                    case.expected.trim_end_matches('\n'),
+                    "{source}: {}",
+                    case.name
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn nextest_run_is_filtered_and_its_listing_subcommands_are_not() {
     let corpus = builtin();
     // `cargo test` and `cargo nextest run` produce unrelated formats, so each
