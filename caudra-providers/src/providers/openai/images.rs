@@ -35,7 +35,7 @@ const RESPONSES_PATH: &str = "/responses";
 /// The subscription backend routes image generation through the chat model
 /// rather than exposing an image endpoint of its own. This is the mainline
 /// model that drives the turn; the image model rides on the hosted tool.
-const MAINLINE_MODEL: &str = "gpt-5.5";
+const MAINLINE_MODEL: &str = "gpt-6.1-sol";
 const OUTPUT_FORMAT: &str = "png";
 const OUTPUT_ITEM_DONE: &str = "response.output_item.done";
 const IMAGE_CALL_ITEM: &str = "image_generation_call";

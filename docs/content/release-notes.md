@@ -11,7 +11,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.10 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.10)
 
-Preview 10 lets MCP snippets ask the decision engine typed questions and rerank long results before the model reads them, and moves workflow `decide()` to the same question shape, the one OpenAI Decisions uses.
+Preview 10 lets MCP snippets ask the decision engine typed questions and rerank long results before the model reads them, moves workflow `decide()` to the same question shape, the one OpenAI Decisions uses, and fixes subscription image generation after GPT-5.5 retired from Codex.
 
 > **Warning**
 >
@@ -24,6 +24,10 @@ Preview 10 lets MCP snippets ask the decision engine typed questions and rerank 
 ### Workflows
 
 - **`decide()` takes OpenAI Decisions questions.** A choice option or a score level can carry a description, as a map with `value` or `label` and `description`, and each answer lists the probability of every option or level. Both decision protocols return the same shape. `rerank()` is unchanged.
+
+### Image generation
+
+- **ChatGPT subscription image generation uses a supported model.** Image requests now run through GPT-6.1 Sol instead of GPT-5.5, which OpenAI retired from Codex with ChatGPT sign-in on October 14. This fixes the unsupported-model error without changing your configured image model or switching to API billing.
 
 ## Caudra 0.2 Preview 9 {#v0-2-0-preview-9}
 
