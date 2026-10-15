@@ -5,7 +5,6 @@
 //! unstaging points it back at `HEAD`, and both drop the cached tree extension
 //! so the next reader rebuilds it rather than trusting a stale one.
 
-use std::convert::Infallible;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -228,7 +227,7 @@ impl Repo {
             .for_each_to_obtain_tree(&tree, |change| {
                 if files.len() >= COMMIT_DIFF_FILES {
                     truncated = true;
-                    return Ok::<Action, Infallible>(Action::Break(()));
+                    return Ok(Action::Break(()));
                 }
                 let relative = change.location().to_str_lossy().into_owned();
                 let mark = match change {
@@ -541,7 +540,7 @@ fn worktree_mark(item: &WorktreeItem) -> Option<GitMark> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GitMark, ID_LENGTH, Repo};
+    use super::{GitMark, ID_LENGTH, Repo, ScmError};
     use gix::bstr::BString;
     use std::fs;
     use std::path::Path;
@@ -615,6 +614,13 @@ mod tests {
     fn a_clean_repository_reports_nothing() {
         let (_tmp, repo) = repository();
         assert!(marks(&repo).is_empty(), "{NOT_LISTED}");
+    }
+
+    #[test]
+    fn a_corrupt_index_is_a_read_error_not_a_clean_status() {
+        let (tmp, repo) = repository();
+        fs::write(tmp.path().join(".git/index"), b"invalid index").unwrap();
+        assert!(matches!(repo.status(), Err(ScmError::Read(_))));
     }
 
     #[test]

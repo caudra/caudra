@@ -191,7 +191,10 @@ pub fn signals(root: &Path, limits: HistoryLimits) -> Signals {
 
 fn walk(root: &Path, limits: HistoryLimits) -> Result<History, Unavailable> {
     let repository = gix::discover(root).map_err(|_| Unavailable::NoRepository)?;
-    if repository.is_shallow() {
+    if repository
+        .is_shallow()
+        .map_err(|_| Unavailable::Unreadable)?
+    {
         return Err(Unavailable::ShallowClone);
     }
 
@@ -553,6 +556,33 @@ mod tests {
         let signals = signals(directory.path(), HistoryLimits::default());
         let history = signals.history().expect("history");
         assert_eq!(history.changed_in_head, vec!["b.rs".to_owned()]);
+    }
+
+    #[test]
+    fn a_missing_commit_tree_reports_unreadable_instead_of_empty_history() {
+        let directory = repository(&[&[("a.rs", "one")]]);
+        let repository = gix::open(directory.path()).unwrap();
+        let tree = repository
+            .head_commit()
+            .unwrap()
+            .tree_id()
+            .unwrap()
+            .to_string();
+        std::fs::remove_file(
+            directory
+                .path()
+                .join(".git/objects")
+                .join(&tree[..2])
+                .join(&tree[2..]),
+        )
+        .unwrap();
+
+        let signals = signals(directory.path(), HistoryLimits::default());
+        assert!(matches!(
+            signals,
+            Signals::Unavailable(Unavailable::Unreadable)
+        ));
+        assert_eq!(signals.churn("a.rs"), None);
     }
 
     #[test]
