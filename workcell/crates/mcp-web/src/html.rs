@@ -289,6 +289,112 @@ mod tests {
     const TRACKING_LINKS: &str = "[](https://t.example.test/p?id=1) [](https://t.example.test/p?id=2) [](https://t.example.test/p?id=3) [](https://t.example.test/p?id=4) [](https://t.example.test/p?id=5)";
     const INLINE_STATE: &str = r#"{"props":{"pageProps":{"items":[{"id":1,"name":"alpha"},{"id":2,"name":"beta"},{"id":3,"name":"gamma"}],"meta":{"total":3,"page":1}}},"page":"/catalog","query":{},"buildId":"a1b2c3","isFallback":false,"gssp":true,"locale":"en"}"#;
     const FRAMEWORK_STATE: &str = r#"window.__INITIAL_STATE__={"user":null}"#;
+    const ARTICLE_PROSE: &str = "Researchers compared the collected observations across several regions, checking every measurement against the original records, and published their findings for independent review. The report explains how local conditions affect the results and provides practical recommendations for future studies. Readers can examine the supporting evidence and repeat the analysis with their own observations.";
+    const ARTICLE_URL: &str = "https://example.test/research/page";
+    const IMAGE_MARKDOWN: &str = "![Field measurements](https://example.test/real.jpg)";
+    const SPANNED_CODE: &str = "<pre><code class=language-rust><span class=line><span>let first = 1;\n</span></span><span class=line>\n</span><span class=line>  let second = 2;\n</span></code></pre>";
+    const CODE_MARKDOWN: &str = "```rust\nlet first = 1;\n\n  let second = 2;\n```";
+    const READABILITY_CODE_MARKDOWN: &str = "```\nlet first = 1;\n\n  let second = 2;\n```";
+
+    #[test_case(false, false; "fallback_text")]
+    #[test_case(false, true; "fallback_markdown")]
+    #[test_case(true, false; "readability_text")]
+    #[test_case(true, true; "readability_markdown")]
+    fn extraction_paths_keep_prose_and_links_without_active_content(
+        readability: bool,
+        markdown: bool,
+    ) {
+        let prose = if readability {
+            ARTICLE_PROSE
+        } else {
+            "Brief observation."
+        };
+        let html = format!(
+            "<html><head><title>Field report</title></head><body><article><p>{prose}</p><p><a href='../source?x=1&amp;y=2'>source-link</a></p><script>script-canary</script><style>style-canary</style><iframe>frame-canary</iframe><object>object-canary</object><noscript>noscript-canary</noscript></article></body></html>"
+        );
+        let extracted = extract_html_for_prompt(&html, markdown, ARTICLE_URL);
+        assert_eq!(
+            extracted.method,
+            if readability {
+                "readability"
+            } else {
+                "fallback"
+            }
+        );
+        assert!(extracted.output.contains(prose), "{}", extracted.output);
+        assert!(!extracted.output.contains("canary"), "{}", extracted.output);
+        if markdown {
+            assert!(
+                extracted
+                    .output
+                    .contains("[source-link](https://example.test/source?x=1&y=2)"),
+                "{}",
+                extracted.output
+            );
+        } else {
+            assert!(
+                extracted.output.contains("source-link"),
+                "{}",
+                extracted.output
+            );
+        }
+    }
+
+    #[test_case("loading=lazy src=/real.jpg resource='./File:Wrong.jpg'"; "native_lazy_keeps_working_source")]
+    #[test_case("loading=lazy src='   ' data-src=/real.jpg"; "missing_source_uses_lazy_source")]
+    #[test_case("class=lazyload src=/placeholder.jpg data-src=/real.jpg"; "lazy_class_replaces_placeholder")]
+    #[test_case("src=/real.jpg data-src=/wrong.jpg"; "ordinary_source_ignores_lazy_metadata")]
+    fn readability_preserves_real_images_and_repairs_placeholders(attributes: &str) {
+        let html = format!(
+            "<article><p>{ARTICLE_PROSE}</p><img alt='Field measurements' {attributes}><p>{ARTICLE_PROSE}</p></article>"
+        );
+        let extracted = extract_html_for_prompt(&html, true, ARTICLE_URL);
+        assert_eq!(extracted.method, "readability");
+        assert!(
+            extracted.output.contains(IMAGE_MARKDOWN),
+            "{}",
+            extracted.output
+        );
+        assert!(!extracted.output.contains("Wrong.jpg"));
+        assert!(!extracted.output.contains("placeholder.jpg"));
+    }
+
+    #[test_case(true; "readability")]
+    #[test_case(false; "fallback")]
+    fn highlighted_code_preserves_line_boundaries(readability: bool) {
+        let html = if readability {
+            format!("<article><p>{ARTICLE_PROSE}</p>{SPANNED_CODE}<p>{ARTICLE_PROSE}</p></article>")
+        } else {
+            SPANNED_CODE.to_owned()
+        };
+        let extracted = extract_html_for_prompt(&html, true, ARTICLE_URL);
+        assert_eq!(
+            extracted.method,
+            if readability {
+                "readability"
+            } else {
+                "fallback"
+            }
+        );
+        let expected = if readability {
+            READABILITY_CODE_MARKDOWN
+        } else {
+            CODE_MARKDOWN
+        };
+        assert!(extracted.output.contains(expected), "{}", extracted.output);
+    }
+
+    #[test_case("First", "Later"; "first_candidate")]
+    #[test_case("Later", "First"; "reversed_candidates")]
+    fn tied_article_candidates_follow_document_order(first: &str, second: &str) {
+        let html = format!(
+            "<html><body><section><div class=article><p>{first} {ARTICLE_PROSE}</p><p>{ARTICLE_PROSE}</p></div><hr></section><section><div class=article><p>{second} {ARTICLE_PROSE}</p><p>{ARTICLE_PROSE}</p></div><hr></section></body></html>"
+        );
+        let extracted = extract_html_for_prompt(&html, false, ARTICLE_URL);
+        assert_eq!(extracted.method, "readability");
+        assert!(extracted.output.starts_with(first), "{}", extracted.output);
+        assert!(!extracted.output.contains(second), "{}", extracted.output);
+    }
 
     #[test_case(CYRILLIC_PARAGRAPH ; "a Cyrillic paragraph")]
     #[test_case(CHINESE_PARAGRAPH ; "a Chinese paragraph")]

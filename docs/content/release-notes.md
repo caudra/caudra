@@ -23,6 +23,7 @@ This release fixes Lua plugin cleanup, improves shell-output filtering, and upda
 - **Shell output keeps unrelated subcommands intact.** Updated bundled filters no longer match commands merely because their names start with a filtered subcommand.
 - **PHP indexing handles clone arguments and partial application.** File indexes and code graphs no longer report parse errors for these expressions.
 - **SVG source icons enforce pixel-buffer limits across nested effects.** Allocation checks now include linked masks and clips, retained filter results, and drop-shadow scratch buffers. Over-budget icons are skipped.
+- **HTML conversion preserves code layout and lazy-loaded images.** Code blocks retain blank lines and image placeholders resolve correctly. Equally scored article candidates now follow document order.
 
 ### Builds
 
