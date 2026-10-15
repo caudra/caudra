@@ -273,8 +273,10 @@ async fn stdio_rejects_modern_version_on_legacy_initialize_lifecycle() {
     assert!(server_task.await.unwrap().is_err());
 }
 
+#[test_case(false; "modern_request_lifecycle")]
+#[test_case(true; "legacy_initialization_after_discovery")]
 #[tokio::test]
-async fn stdio_discovery_rejects_missing_and_legacy_request_context() {
+async fn stdio_discovery_rejects_invalid_context_without_selecting_a_lifecycle(legacy: bool) {
     let (_root, server) = fixture_server().await;
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
@@ -291,18 +293,55 @@ async fn stdio_discovery_rejects_missing_and_legacy_request_context() {
 
     write_json(&mut write, &discover_request(1, json!({}))).await;
     assert!(read_json(&mut read).await["result"].is_object());
-    write_json(
-        &mut write,
-        &json!({"jsonrpc":"2.0","id":2,"method":"server/discover","params":{}}),
-    )
-    .await;
-    assert_eq!(read_json(&mut read).await["error"]["code"], -32_602);
-
-    let mut legacy = discover_request(3, json!({}));
-    legacy["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
+    let mut legacy_discovery = discover_request(3, json!({}));
+    legacy_discovery["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
         json!(LEGACY_PROTOCOL_VERSION);
-    write_json(&mut write, &legacy).await;
-    assert_eq!(read_json(&mut read).await["error"]["code"], -32_022);
+    let invalid_discoveries = [
+        (
+            json!({"jsonrpc":"2.0","id":2,"method":"server/discover","params":{}}),
+            -32_602,
+        ),
+        (legacy_discovery, -32_022),
+    ];
+    for (request, code) in &invalid_discoveries {
+        write_json(&mut write, request).await;
+        assert_eq!(read_json(&mut read).await["error"]["code"], *code);
+    }
+
+    if legacy {
+        write_json(
+            &mut write,
+            &legacy_initialize_request(4, LEGACY_PROTOCOL_VERSION),
+        )
+        .await;
+        assert_eq!(
+            read_json(&mut read).await["result"]["protocolVersion"],
+            LEGACY_PROTOCOL_VERSION
+        );
+        write_json(
+            &mut write,
+            &json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        )
+        .await;
+    }
+    let list = if legacy {
+        legacy_request(5, "tools/list", json!({}))
+    } else {
+        mcp_request(5, "tools/list", json!({}))
+    };
+    write_json(&mut write, &list).await;
+    let listed = read_json(&mut read).await;
+    assert_eq!(listed["id"], 5);
+    assert!(
+        listed["result"]["tools"]
+            .as_array()
+            .is_some_and(|tools| { tools.iter().any(|tool| tool["name"] == "file_read") })
+    );
+
+    for (request, code) in &invalid_discoveries {
+        write_json(&mut write, request).await;
+        assert_eq!(read_json(&mut read).await["error"]["code"], *code);
+    }
 
     drop(write);
     drop(read);

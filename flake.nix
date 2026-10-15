@@ -118,8 +118,6 @@
       gitDepHashes = {
         "git+https://github.com/pydantic/monty.git?tag=v1.1.0#591527397445bf734873252d1ee20c1b6308fe7f" =
           "sha256-FqJIkEVmKeDWQyb/yrJ0+/2tZ1kCNe2Xc4r9UPgQptU=";
-        "git+https://github.com/modelcontextprotocol/rust-sdk.git?rev=9334c97f0d6e177546fc33593148aa3f942cb1f8#9334c97f0d6e177546fc33593148aa3f942cb1f8" =
-          "sha256-X9WsE8CB5rBwXClvZibtKA6ajoYuAOIA3mj4ETN9gyQ=";
       };
 
       missingGitDepHashes = builtins.filter (s: !(builtins.hasAttr s gitDepHashes)) gitDepSources;
