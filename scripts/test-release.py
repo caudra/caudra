@@ -1228,6 +1228,23 @@ class ReleaseWorkflowTests(unittest.TestCase):
         ):
             self.assertIn(command, nix["build"])
 
+    def test_workcell_image_prefetches_both_locked_graphs_before_offline_attribution(
+        self,
+    ):
+        dockerfile = (
+            Path(__file__).resolve().parent.parent / "workcell/Dockerfile"
+        ).read_text()
+        commands = (
+            "RUN cargo fetch --locked \\\n",
+            'cargo fetch --locked --manifest-path "$(cat /out/source-manifest-path)"',
+            "cargo build --locked --release --package workcell-mcp",
+            "python3 scripts/build-attribution.py",
+        )
+        positions = [dockerfile.index(command) for command in commands]
+        self.assertEqual(positions, sorted(positions))
+        for command in re.findall(r"cargo fetch[^\n]+", dockerfile):
+            self.assertNotIn("--target", command)
+
     def test_release_prefetches_both_locked_graphs_before_caudra_build(self):
         _, jobs = self.workflow("release")
         commands = (

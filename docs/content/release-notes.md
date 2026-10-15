@@ -25,6 +25,7 @@ This release fixes Lua plugin cleanup, improves shell-output filtering, and upda
 ### Builds
 
 - **Nix evaluation works without building the worker source first.** The pinned Python worker source is fetched and verified during evaluation, without import from derivation.
+- **Workcell container builds include all attribution sources.** The Debian 13.7 image fetches both locked dependency graphs before generating its offline license bundle.
 
 ## Caudra 0.2 Preview 9 {#v0-2-0-preview-9}
 

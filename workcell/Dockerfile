@@ -4,7 +4,7 @@
 # leaving a binary that only serves `monty subprocess`.
 #
 # Build from the repository root: docker build -f workcell/Dockerfile .
-FROM rust:1.99.0-bookworm AS toolchain
+FROM rust:1.99.0-trixie AS toolchain
 
 RUN rustup toolchain install 1.99.1 --profile minimal \
     && rustup default 1.99.1 \
@@ -34,7 +34,9 @@ COPY --from=worker /out/source-manifest-path /out/source-manifest-path
 # Built as a single package rather than `--workspace`: the workspace build is only used for
 # verification, and the shipped server must not link anything the code group needs. Symbols are
 # kept in the build for the diagnostics stage and stripped from the copy the runtime ships.
-RUN CARGO_PROFILE_RELEASE_STRIP=none cargo build --locked --release --package workcell-mcp \
+RUN cargo fetch --locked \
+    && cargo fetch --locked --manifest-path "$(cat /out/source-manifest-path)" \
+    && CARGO_PROFILE_RELEASE_STRIP=none cargo build --locked --release --package workcell-mcp \
     && mkdir -p /out/bin \
     && strip -o /out/bin/workcell-mcp target/release/workcell-mcp \
     && python3 scripts/build-attribution.py \
@@ -52,7 +54,7 @@ COPY --from=builder /build/target/release/workcell-mcp /workcell-mcp
 COPY --from=worker /out/symbols/bin/monty /monty
 COPY --from=builder /out/licenses /licenses
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:13.7-slim AS runtime
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends bash ca-certificates libgcc-s1 tini \
