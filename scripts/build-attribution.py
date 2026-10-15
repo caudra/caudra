@@ -18,11 +18,10 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
-
-import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
 POLICY = Path(__file__).with_name("attribution-policy.json")

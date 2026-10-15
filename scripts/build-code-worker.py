@@ -5,9 +5,8 @@ import os
 import shutil
 import subprocess
 import tempfile
-from pathlib import Path
-
 import tomllib
+from pathlib import Path
 
 VERSION = "1.1.0"
 EXPECTED_VERSION = f"monty-runtime {VERSION}"

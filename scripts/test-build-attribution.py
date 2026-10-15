@@ -8,11 +8,10 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-
-import tomllib
 
 SPEC = importlib.util.spec_from_file_location(
     "build_attribution", Path(__file__).with_name("build-attribution.py")

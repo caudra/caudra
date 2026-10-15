@@ -866,7 +866,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "actions/upload-artifact": "v7",
             "actions/download-artifact": "v8",
             "actions/create-github-app-token": "v3",
-            "actions/setup-python": "v6",
+            "actions/setup-python": "v7",
         }
         for workflow in WORKFLOWS.glob("*.yml"):
             with self.subTest(workflow=workflow.name):
@@ -989,9 +989,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
     def test_native_jobs_select_supported_python_before_scripts_and_worker(self):
         setup = (
-            "uses: actions/setup-python@v6\n"
+            "uses: actions/setup-python@v7\n"
             "        with:\n"
-            '          python-version: "3.13"\n'
+            '          python-version: "3.15.0"\n'
         )
         worker = "uses: ./.github/actions/code-worker"
         for workflow in ("rust", "release"):
@@ -1004,6 +1004,32 @@ class ReleaseWorkflowTests(unittest.TestCase):
                     self.assertLess(body.index(setup), body.index(worker))
                     for invocation in re.finditer(r"\bpython3\s", body):
                         self.assertLess(body.index(setup), invocation.start())
+
+    def test_python_verification_versions_match_release_and_keep_compatibility_lane(
+        self,
+    ):
+        header, python = self.workflow("python")
+        _, release = self.workflow("release")
+        pins = r"(?m)^\s+(RUFF_VERSION|TY_VERSION): (\S+)$"
+        self.assertEqual(
+            dict(re.findall(pins, header)),
+            dict(re.findall(pins, release["verify-python"])),
+        )
+        self.assertIn('python: ["3.13", "3.15.0"]', python["distribution"])
+        self.assertIn("python-version: ${{ matrix.python }}", python["distribution"])
+        setup = (
+            "uses: actions/setup-python@v7\n"
+            "        with:\n"
+            '          python-version: "3.15.0"\n'
+        )
+        for job in (
+            python["website-docs"],
+            python["lint"],
+            python["typecheck"],
+            release["verify-python"],
+        ):
+            self.assertEqual(job.count(setup), 1)
+            self.assertLess(job.index(setup), job.index("run:"))
 
     def test_native_installer_gates_provision_shells_and_reject_skipped_coverage(self):
         provision = "name: Provision macOS installer shells"

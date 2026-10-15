@@ -71,13 +71,16 @@ jobs:
     needs: validate
     runs-on: ubuntu-24.04
     env:
-      RUFF_VERSION: 0.16.2
-      TY_VERSION: 0.0.70
+      RUFF_VERSION: 0.17.1
+      TY_VERSION: 0.0.88
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.15.0"
       - name: Install verification tools
         run: .github/scripts/retry.sh pip install "ruff==${RUFF_VERSION}" "ty==${TY_VERSION}"
       - run: ruff format --check scripts/
@@ -273,9 +276,9 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
-          python-version: "3.13"
+          python-version: "3.15.0"
 
       - name: Install Rust toolchain
         run: rustup toolchain install 1.99.0 --profile minimal --target ${{ matrix.target }}
