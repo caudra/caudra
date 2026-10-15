@@ -34,7 +34,7 @@ use super::store::WorkflowStore;
 use crate::agent::subagent::{TaskIdentity, TaskModel};
 use crate::agent::task_runner::{ModeResolver, TaskOutcome, TaskRequest, TaskRunner};
 use crate::cancel::{CancelToken, CancelTrigger};
-use crate::decisions::{DecisionContext, Decisions};
+use crate::decisions::{DecisionContext, DecisionFeature, Decisions};
 use crate::subagent_history::SubagentTaskMode;
 use crate::types::{AgentEvent, Envelope, EventSender, WORKFLOW_EVENT_RUN_ID, WorkflowProvenance};
 
@@ -514,7 +514,7 @@ impl Driver {
         self.in_flight += 1;
         smol::spawn(async move {
             let (result, duration_ms) = match cancel
-                .race(decisions.workflow(&request, &context))
+                .race(decisions.scripted(DecisionFeature::Workflow, &request, &context))
                 .await
             {
                 Ok(outcome) => {

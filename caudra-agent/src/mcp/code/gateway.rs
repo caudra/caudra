@@ -13,12 +13,14 @@ use std::time::{Duration, Instant};
 use async_lock::Mutex as AsyncMutex;
 use caudra_config::ToolKey;
 use caudra_storage::tool_ledger::ToolOutcome as LedgerOutcome;
+use caudra_workflow::decision::{RerankRequest, decide_label, rerank_label};
 use serde_json::{Map, Value, json};
 
 use super::catalog::unavailable;
+use super::decide::{self, DECIDE_PARAMS, Decide, RERANK_PARAMS, decide_request, rerank_request};
 use super::naming::{
-    CLASS_PREFIX, HELPERS, Names, READ_RESOURCE_HELPER, RESOURCES_HELPER, SEARCH_HELPER,
-    SERVERS_HELPER,
+    CLASS_PREFIX, DECIDE_HELPER, DECISION_HELPERS, HELPERS, Names, READ_RESOURCE_HELPER,
+    RERANK_HELPER, RESOURCES_HELPER, SEARCH_HELPER, SERVERS_HELPER,
 };
 use super::output::{
     CALL_SOURCE, McpCodeCall, McpCodeCallStatus, McpCodeOutcome, McpCodeOutput,
@@ -34,6 +36,7 @@ use super::view::ServerView;
 use crate::AgentEvent;
 use crate::agent::change_recording::{self, Recording};
 use crate::agent::tool_dispatch::error_type;
+use crate::decisions::Decisions;
 use crate::mcp::call::CallScope;
 use crate::mcp::output::{McpBlock, McpInteraction, McpOutput, decoded_len};
 use crate::mcp::resources::{ResourceContents, ResourceLists};
@@ -77,6 +80,8 @@ const UNFINISHED: &str = "did not finish: the run stopped first";
 /// What the type checker says after the stub class of a namespace whose tool it cannot find.
 const NO_ATTRIBUTE: &str = " has no attribute `";
 const QUOTE: char = '`';
+/// The server column of a `decide()` or `rerank()` row.
+pub const DECISIONS_ROW: &str = "decisions";
 const NO_RUNNER: &str = "MCP code mode is unavailable: no code runner is installed in this process";
 const GONE_NOTE: &str = "Variables from earlier `mcp` runs in this conversation are gone (Caudra restarted, or the conversation was resumed, rewound or forked); this run started empty. Fetch again what you need.";
 const RESTORE_FAILED_NOTE: &str =
@@ -260,12 +265,15 @@ struct Inner {
     calls: Mutex<Vec<McpCodeCall>>,
     /// The run's change record, `None` until a call that could change files is let through.
     record: AsyncMutex<Option<Recording>>,
+    /// The session's decision engine, which `decide()` and `rerank()` need.
+    decisions: Option<Decisions>,
 }
 
 impl Gateway {
     fn new(session: McpSession, ctx: ToolContext) -> Self {
         let servers = session.servers();
         let names = Names::new(&servers);
+        let decisions = ctx.permissions.decisions();
         Self(Arc::new(Inner {
             session,
             ctx,
@@ -273,6 +281,7 @@ impl Gateway {
             names,
             calls: Mutex::new(Vec::new()),
             record: AsyncMutex::new(None),
+            decisions,
         }))
     }
 
@@ -422,6 +431,12 @@ impl Gateway {
                     async move { gateway.read_resource(call).await },
                 ))
             }
+            DECIDE_HELPER | RERANK_HELPER if let Some(decisions) = self.0.decisions.clone() => {
+                let gateway = self.clone();
+                ScriptInvocation::Deferred(Box::pin(async move {
+                    gateway.decision(decisions, call).await
+                }))
+            }
             name => ScriptInvocation::Ready(Err(ScriptError::new(
                 ScriptErrorKind::Name,
                 format!("name '{name}' is not defined"),
@@ -529,6 +544,75 @@ impl Gateway {
                 Ending::failed(error.failure(), error.to_string())
                     .with_interactions(scope.take_interactions()),
             ),
+        }
+    }
+
+    /// A `decide()` or `rerank()` call, shown as a row like any server call. It asks no permission:
+    /// the engine is the user's own, and an answer is data that grants nothing.
+    async fn decision(self, decisions: Decisions, call: ScriptCall) -> ScriptReply {
+        let rerank = call.name == RERANK_HELPER;
+        let (helper, params) = match rerank {
+            true => (RERANK_HELPER, RERANK_PARAMS),
+            false => (DECIDE_HELPER, DECIDE_PARAMS),
+        };
+        let arguments = bind(helper, params, &call)?;
+        let pending = match rerank {
+            true => Pending::Rerank(rerank_request(&arguments)?),
+            false => Pending::Decide(decide_request(&arguments)?),
+        };
+        if let Pending::Rerank(request) = &pending
+            && request.candidates.is_empty()
+        {
+            return Ok(Value::Array(Vec::new()));
+        }
+        let called_as = match &pending {
+            Pending::Decide(decide) => decide_label(&decide.request.questions),
+            Pending::Rerank(request) => rerank_label(request.candidates.len(), 1, 1),
+        };
+        let index = self.begin(McpCodeCall {
+            server: DECISIONS_ROW.to_owned(),
+            tool: helper.to_owned(),
+            called_as,
+            input: Value::Object(arguments),
+            ..McpCodeCall::default()
+        });
+        let started = Instant::now();
+        let ctx = &self.0.ctx;
+        let context = ctx.permissions.decision_context(json!({
+            "tool_use_id": child_tool_use_id(ctx.tool_use_id.as_deref(), index),
+        }));
+        let answered = match &pending {
+            Pending::Decide(decide) => {
+                decide::ask(&decisions, &context, &decide.request, &ctx.cancel)
+                    .await
+                    .and_then(|result| {
+                        decide
+                            .questions
+                            .answers(&result)
+                            .map_err(|message| ScriptError::new(ScriptErrorKind::Runtime, message))
+                    })
+            }
+            Pending::Rerank(request) => {
+                decide::rerank(&decisions, &context, request, &ctx.cancel).await
+            }
+        };
+        match answered {
+            Ok(value) => {
+                let output = McpOutput {
+                    blocks: vec![McpBlock::Text {
+                        text: serde_json::to_string_pretty(&value).unwrap_or_default(),
+                    }],
+                    ..McpOutput::default()
+                };
+                self.succeeded(index, started, output, value)
+            }
+            Err(error) => {
+                let failure = match ctx.cancel.is_cancelled() {
+                    true => ToolFailure::Cancelled,
+                    false => ToolFailure::Other,
+                };
+                self.failed(index, started, Ending::failed(failure, error.message))
+            }
         }
     }
 
@@ -658,6 +742,12 @@ impl Gateway {
     }
 }
 
+/// A decision call whose arguments were read.
+enum Pending {
+    Decide(Decide),
+    Rerank(RerankRequest),
+}
+
 /// How a call ended, as its row keeps it.
 #[derive(Default)]
 struct Ending {
@@ -700,7 +790,9 @@ impl ScriptHost for Gateway {
             if names.server(name).is_some() {
                 return ScriptName::Namespace;
             }
-            if HELPERS.contains(&name) {
+            if HELPERS.contains(&name)
+                && (self.0.decisions.is_some() || !DECISION_HELPERS.contains(&name))
+            {
                 return ScriptName::Function;
             }
             return ScriptName::Undefined(names.suggest_namespace(name).map(|namespace| {
@@ -728,7 +820,7 @@ impl ScriptHost for Gateway {
     }
 
     fn stubs(&self) -> String {
-        stubs(&self.0.names, &self.0.servers)
+        stubs(&self.0.names, &self.0.servers, self.0.decisions.is_some())
     }
 }
 
@@ -1128,8 +1220,15 @@ fn excerpt(output: &mut McpOutput) {
 mod tests {
     use std::path::{Path, PathBuf};
 
+    use async_trait::async_trait;
+    use caudra_config::decisions::DecisionsConfig;
     use caudra_config::{Effect, PermissionRule, PermissionsConfig};
+    use caudra_decision::{
+        Answer, ChoiceAnswer, DecisionEngine, DecisionError, DecisionRequest as EngineRequest,
+        DecisionResponse, NoulAnswer, QuestionType, ScoreAnswer, Usage,
+    };
     use caudra_providers::{ContentBlock, Message, Role};
+    use caudra_storage::StateDir;
     use caudra_workspace::RecordScope;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -1514,6 +1613,261 @@ mod tests {
                 && !text.contains(SERVER_TOOL),
             "{text}"
         );
+    }
+
+    const DECISION_MODEL: &str = "mcp-decision-model";
+    const DECISION_BASE_URL: &str = "http://127.0.0.1:1";
+    const EXPLICIT_TIMEOUT_MS: u64 = 100;
+    const RELEVANT: &str = "parser";
+    const RELEVANT_SCORE: f64 = 0.9;
+    const UNRELATED_SCORE: f64 = 0.1;
+
+    /// Answers a predicate by whether its text names [`RELEVANT`], a choice with its first
+    /// option, and a score with its top level, or refuses everything.
+    #[derive(Default)]
+    struct TypedEngine {
+        refuse: bool,
+        budgets: Arc<Mutex<Vec<Duration>>>,
+    }
+
+    #[async_trait]
+    impl DecisionEngine for TypedEngine {
+        async fn decide(
+            &self,
+            request: &EngineRequest,
+            deadline: Instant,
+        ) -> Result<DecisionResponse, DecisionError> {
+            self.budgets
+                .lock()
+                .unwrap()
+                .push(deadline.saturating_duration_since(Instant::now()));
+            if self.refuse {
+                return Err(DecisionError::Refused);
+            }
+            let answers = request
+                .questions
+                .iter()
+                .map(|(id, question)| {
+                    let criteria = question.criteria.clone().unwrap_or_default();
+                    let answer = match question.kind {
+                        QuestionType::Noul => Answer::Noul(NoulAnswer {
+                            noul: match question.instructions.to_string().contains(RELEVANT) {
+                                true => RELEVANT_SCORE,
+                                false => UNRELATED_SCORE,
+                            },
+                        }),
+                        QuestionType::Choice => {
+                            let options: Vec<String> =
+                                criteria.as_object().unwrap().keys().cloned().collect();
+                            Answer::Choice(ChoiceAnswer {
+                                choice: options[0].clone(),
+                                probabilities: options
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, option)| {
+                                        (option.clone(), f64::from(u8::from(index == 0)))
+                                    })
+                                    .collect(),
+                                confidence: 1.0,
+                            })
+                        }
+                        QuestionType::Score => {
+                            let levels = criteria.as_array().unwrap().len();
+                            let top = levels - 1;
+                            Answer::Score(ScoreAnswer {
+                                score: top as f64,
+                                legend: (0..levels)
+                                    .map(|index| (index.to_string(), index.to_string()))
+                                    .collect(),
+                                probabilities: (0..levels)
+                                    .map(|index| {
+                                        (index.to_string(), f64::from(u8::from(index == top)))
+                                    })
+                                    .collect(),
+                                confidence: 1.0,
+                            })
+                        }
+                    };
+                    (id.clone(), answer)
+                })
+                .collect();
+            Ok(DecisionResponse {
+                model: DECISION_MODEL.to_owned(),
+                answers,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                cache_hit: false,
+            })
+        }
+    }
+
+    /// A gateway whose session has a decision engine when `engine` is given.
+    fn deciding_gateway(mode: AgentMode, engine: Option<TypedEngine>) -> (TempDir, Gateway) {
+        let config = PermissionsConfig {
+            decision_engine: true,
+            ..Default::default()
+        };
+        let (dir, permissions) = permissions(config, PermissionMode::Ask);
+        if let Some(engine) = engine {
+            let config = DecisionsConfig {
+                base_url: Some(DECISION_BASE_URL.parse().unwrap()),
+                ..Default::default()
+            };
+            let state = StateDir::from_path(dir.path().join("state"));
+            permissions.set_decisions(Some(
+                Decisions::with_engine(config, &state, engine).unwrap(),
+            ));
+        }
+        let session = stub_session_replying(&[(LOOKUP_TOOL, "")], None);
+        let gateway = Gateway::new(session, stub_ctx_with_permissions(&mode, permissions));
+        (dir, gateway)
+    }
+
+    async fn call_helper(gateway: &Gateway, name: &str, kwargs: Value) -> ScriptReply {
+        let Value::Object(kwargs) = kwargs else {
+            panic!("keyword arguments are an object");
+        };
+        let call = ScriptCall {
+            namespace: None,
+            name: name.to_owned(),
+            args: Vec::new(),
+            kwargs,
+        };
+        match gateway.call(call) {
+            ScriptInvocation::Ready(reply) => reply,
+            ScriptInvocation::Deferred(future) => future.await,
+        }
+    }
+
+    /// `decide()` asks no permission, so it answers while planning too, in the snippet's own
+    /// order and shape, and shows as a row.
+    #[test]
+    fn decide_answers_in_the_snippets_shape_even_while_planning() {
+        let (_dir, gateway) = deciding_gateway(
+            AgentMode::Plan(PathBuf::from(PLAN_FILE)),
+            Some(TypedEngine::default()),
+        );
+        let reply = smol::block_on(call_helper(
+            &gateway,
+            DECIDE_HELPER,
+            json!({
+                "input": "The parser crashes on empty files.",
+                "questions": [
+                    {"type": "score", "name": "severity", "instructions": "How bad?", "levels": ["low", "high"]},
+                    {"type": "predicate", "name": "parser_bug", "instructions": "A parser bug?"},
+                    {"type": "choice", "name": "team", "instructions": "Which team?", "choices": ["core", "docs"]},
+                ],
+            }),
+        ))
+        .unwrap();
+        let names: Vec<&str> = reply["answers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|answer| answer["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["severity", "parser_bug", "team"]);
+        assert_eq!(reply["model"], DECISION_MODEL);
+        assert_eq!(
+            reply["by_name"]["parser_bug"]["probability"],
+            RELEVANT_SCORE
+        );
+        assert_eq!(reply["by_name"]["team"]["choice"], "core");
+        assert_eq!(reply["by_name"]["severity"]["score"], 1.0);
+        let calls = gateway.finish();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].qualified_name(),
+            format!("{DECISIONS_ROW}{SEPARATOR}{DECIDE_HELPER}")
+        );
+        assert_eq!(calls[0].called_as, "decide: severity, parser_bug, team");
+        assert_eq!(calls[0].status, McpCodeCallStatus::Success);
+    }
+
+    #[test]
+    fn rerank_keeps_the_relevant_candidates_best_first() {
+        let (_dir, gateway) = deciding_gateway(AgentMode::Build, Some(TypedEngine::default()));
+        let reply = smol::block_on(call_helper(
+            &gateway,
+            RERANK_HELPER,
+            json!({
+                "query": "where parse errors are reported",
+                "candidates": ["lexer.rs", "parser.rs", {"path": "docs/parser.md"}, "config.rs"],
+                "threshold": 0.5,
+            }),
+        ))
+        .unwrap();
+        assert_eq!(
+            reply,
+            json!([{"index": 1, "score": RELEVANT_SCORE}, {"index": 2, "score": RELEVANT_SCORE}])
+        );
+        assert_eq!(gateway.finish()[0].called_as, "rerank: 4 candidates");
+    }
+
+    /// A batch of 16 outlasts one decision, so a rerank without a timeout gets the rerank
+    /// budget rather than the shorter decision deadline, and an explicit timeout still wins.
+    #[test_case(None, |budget| budget > Duration::from_millis(DecisionsConfig::default().timeout_ms) ; "rerank_budget_by_default")]
+    #[test_case(Some(EXPLICIT_TIMEOUT_MS), |budget| budget <= Duration::from_millis(EXPLICIT_TIMEOUT_MS) ; "explicit_timeout")]
+    fn rerank_waits_for_the_rerank_budget(timeout_ms: Option<u64>, fits: fn(Duration) -> bool) {
+        let engine = TypedEngine::default();
+        let budgets = Arc::clone(&engine.budgets);
+        let (_dir, gateway) = deciding_gateway(AgentMode::Build, Some(engine));
+        smol::block_on(call_helper(
+            &gateway,
+            RERANK_HELPER,
+            json!({"query": "parser", "candidates": ["parser.rs"], "timeout_ms": timeout_ms}),
+        ))
+        .unwrap();
+        let budget = budgets.lock().unwrap()[0];
+        assert!(fits(budget), "{budget:?}");
+    }
+
+    #[test]
+    fn an_empty_rerank_answers_without_a_call() {
+        let (_dir, gateway) = deciding_gateway(
+            AgentMode::Build,
+            Some(TypedEngine {
+                refuse: true,
+                ..Default::default()
+            }),
+        );
+        let reply = smol::block_on(call_helper(
+            &gateway,
+            RERANK_HELPER,
+            json!({"query": "parser", "candidates": []}),
+        ));
+        assert_eq!(reply.unwrap(), json!([]));
+        assert!(gateway.finish().is_empty());
+    }
+
+    #[test_case(DECIDE_HELPER, json!({"input": "x", "questions": [{"type": "predicate", "name": "a", "instructions": "x"}]}) ; "decide")]
+    #[test_case(RERANK_HELPER, json!({"query": "parser", "candidates": ["parser.rs"]}) ; "rerank")]
+    fn a_refused_decision_raises_and_marks_its_row(helper: &str, kwargs: Value) {
+        let (_dir, gateway) = deciding_gateway(
+            AgentMode::Build,
+            Some(TypedEngine {
+                refuse: true,
+                ..Default::default()
+            }),
+        );
+        let error = smol::block_on(call_helper(&gateway, helper, kwargs)).unwrap_err();
+        assert_eq!(error.kind, ScriptErrorKind::Runtime);
+        assert_eq!(gateway.finish()[0].status, McpCodeCallStatus::Error);
+    }
+
+    #[test_case(DECIDE_HELPER ; "decide")]
+    #[test_case(RERANK_HELPER ; "rerank")]
+    fn without_an_engine_the_decision_helpers_do_not_exist(helper: &str) {
+        let (_dir, gateway) = deciding_gateway(AgentMode::Build, None);
+        assert!(matches!(
+            gateway.lookup(None, helper),
+            ScriptName::Undefined(_)
+        ));
+        assert!(!gateway.stubs().contains(&format!("def {helper}(")));
+        let reply = smol::block_on(call_helper(&gateway, helper, json!({})));
+        assert_eq!(reply.unwrap_err().kind, ScriptErrorKind::Name);
     }
 
     #[test]

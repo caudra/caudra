@@ -147,7 +147,9 @@ fn experiment_scope(feature: Feature) -> &'static str {
         }
         Feature::DecisionEngine => {
             "The [decision engine](#decisions), [Auto mode](/docs/permissions/#auto-mode), \
-              `caudra decisions`, and workflow [`decide()` calls](/docs/workflows/#typed-decisions)."
+              `caudra decisions`, workflow [`decide()` calls](/docs/workflows/#typed-decisions), and \
+              the [`decide()` and `rerank()` helpers](/docs/mcp/#decisions-and-reranking) of MCP \
+              code mode."
         }
         Feature::CrossSessionMessaging => {
             "Local [cross-session messaging](/docs/messaging/): the `list_sessions`, `send_message`, `publish_message`, `read_topic`, and `work_assignment` tools, `/peers`, `/messages`, `/topics`, `/groups`, `caudra message`, live session inboxes, consumer groups, and the message history. Both processes must opt in."
@@ -662,7 +664,8 @@ fn write_decisions_section(out: &mut String) {
          this table and starts no engine. It then sends no decision requests, reads no engine \
          credentials, and leaves decision logs and shell duration history untouched. \
          No base URL, passive feature, or decision logging is enabled by default. \
-         Explicit workflow [`decide()` calls](/docs/workflows/#typed-decisions) need a base URL \
+         Explicit workflow [`decide()` calls](/docs/workflows/#typed-decisions) and the MCP \
+         [`decide()` and `rerank()` helpers](/docs/mcp/#decisions-and-reranking) need a base URL \
          but do not need a passive feature enabled. Shell duration history can work without a base URL.\n\n\
          Connection settings and thresholds are global-only. Projects may set individual features \
          to `\"off\"`, set `log = false`, or keep or shorten inherited log retention. \
@@ -710,7 +713,8 @@ fn write_decisions_section(out: &mut String) {
          environment, not project `.env` files. Neither protocol implies remote or HTTP consent.\n\n\
          Both protocols send text only. OpenAI maps native boolean questions to predicates, \
          retaining the true and false criteria in the instruction text. Answers normalize to the \
-         same typed results, including workflow `noul` probabilities. A refusal fails the whole \
+         same typed results, so workflows and MCP snippets read the same answers under either \
+         protocol. A refusal fails the whole \
          evaluation without applying partial answers.\n\n\
          Caudra retries HTTP 408, 429, and 5xx responses at most twice. Each retry waits for the \
          delay the server requests in `retry-after-ms` or `Retry-After`, or else for an exponential \
@@ -719,8 +723,8 @@ fn write_decisions_section(out: &mut String) {
          Connection failures, 401, 422, and other client errors fail at once.\n\n\
          Tool search and the [reranking features](#reranking) judge up to 16 candidates in one \
          request and use `rerank_timeout_ms` (default {rerank_timeout_ms} ms) instead. Memory recall \
-         keeps `timeout_ms` because it delays the start of a turn. A workflow `decide()` or \
-         `rerank()` call may ask for up to the larger of the two.\n\n\
+         keeps `timeout_ms` because it delays the start of a turn. A `decide()` or `rerank()` call \
+         from a workflow or an MCP snippet may ask for up to the larger of the two.\n\n\
          Requests ignore ambient proxies and do not follow redirects. `localhost` is a DNS name, \
          not numeric loopback for this policy. Private and CGNAT addresses receive no automatic HTTP exemption. \
          These settings do not change Workcell transport policy.\n\n\
@@ -842,8 +846,9 @@ fn write_decisions_section(out: &mut String) {
          changes while it runs, the feature behaves as if it were `off`. In `shadow`, requests are \
          sent and logged without effect. With `log = true`, an enforcing feature records \
          `rerouted` when the order it used differs from the first pass, and an advisory feature \
-         records `advised` when it named a candidate. Workflows can rerank their own candidates \
-         with [`rerank()`](/docs/workflows/#reranking-candidates). See also \
+         records `advised` when it named a candidate. Workflows and MCP snippets can rerank their \
+         own candidates with `rerank()`: see [workflows](/docs/workflows/#reranking-candidates) \
+         and [MCP](/docs/mcp/#decisions-and-reranking). See also \
          [memory relevance](/docs/memory/#relevance-from-the-decision-engine).\n\n\
          #### Question overrides\n\n\
          Only the permission question set currently supports a user-global file override: \

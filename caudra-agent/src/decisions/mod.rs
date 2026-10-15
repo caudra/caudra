@@ -50,6 +50,7 @@ pub use note::{
     DecisionNote, NoteAnchor, NoteDraft, NoteOutcome, NoteSink, counted, placement, score_line,
 };
 pub use permission::{PermissionAction, PermissionDecision, PermissionFlag, PermissionPurpose};
+pub(crate) use rerank::join_answered;
 pub use rerank::{
     CANDIDATE_KEY, CANDIDATE_TEXT_OMITTED, MAX_CANDIDATE_INPUT_BYTES, MAX_RERANK_BATCH, Relevance,
     Rerank, Reranked, Reranking, candidate_text, changed_from,
@@ -73,6 +74,7 @@ const ENGINE_REFUSED: &str = "engine refused";
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DecisionFeature {
     Workflow,
+    Mcp,
     PermissionAdvice,
     AutoScreening,
     ShellEffect,
@@ -92,8 +94,8 @@ pub enum DecisionFeature {
 }
 
 impl DecisionFeature {
-    /// Configured features in `[decisions.features]` order, then workflow.
-    pub const ALL: [Self; 17] = [
+    /// Configured features in `[decisions.features]` order, then the script callers.
+    pub const ALL: [Self; 18] = [
         Self::PermissionAdvice,
         Self::AutoScreening,
         Self::ShellEffect,
@@ -111,6 +113,7 @@ impl DecisionFeature {
         Self::OutputPointers,
         Self::CodeContext,
         Self::Workflow,
+        Self::Mcp,
     ];
 
     /// The name the log records, which differs from the configuration key
@@ -118,6 +121,7 @@ impl DecisionFeature {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Workflow => "workflow",
+            Self::Mcp => "mcp",
             Self::PermissionAdvice => "permission",
             Self::AutoScreening => "auto",
             Self::ShellEffect => "shell_effect",
@@ -137,11 +141,12 @@ impl DecisionFeature {
         }
     }
 
-    /// The `[decisions.features]` key. Workflow has none: a script's
-    /// `decide()` call is the request, so it runs whenever an engine is set.
+    /// The `[decisions.features]` key. Workflow and MCP code mode have none:
+    /// a script's `decide()` call is the request, so it runs whenever an
+    /// engine is set.
     pub fn config_key(&self) -> Option<&'static str> {
         match self {
-            Self::Workflow => None,
+            Self::Workflow | Self::Mcp => None,
             Self::PermissionAdvice => Some("permission_advice"),
             Self::AutoScreening => Some("auto_screening"),
             Self::ShellEffect => Some("shell_effect"),
@@ -161,8 +166,8 @@ impl DecisionFeature {
         }
     }
 
-    /// The name a reader configures the feature by. Workflow has no key, so
-    /// it goes by the name it is logged under.
+    /// The name a reader configures the feature by. The script callers have
+    /// no key, so they go by the name they are logged under.
     pub fn label(&self) -> &'static str {
         self.config_key().unwrap_or(self.name())
     }
@@ -182,7 +187,7 @@ impl DecisionFeature {
 
     pub fn mode<'a>(&self, features: &'a DecisionFeatures) -> &'a FeatureMode {
         match self {
-            Self::Workflow => &FeatureMode::Enforce,
+            Self::Workflow | Self::Mcp => &FeatureMode::Enforce,
             Self::PermissionAdvice => &features.permission_advice,
             Self::AutoScreening => &features.auto_screening,
             Self::ShellEffect => &features.shell_effect,
@@ -207,7 +212,7 @@ impl DecisionFeature {
     /// either budget.
     pub fn timeout_ms(&self, config: &DecisionsConfig) -> u64 {
         match self {
-            Self::Workflow => config.timeout_ms.max(config.rerank_timeout_ms),
+            Self::Workflow | Self::Mcp => config.timeout_ms.max(config.rerank_timeout_ms),
             Self::ToolSearch
             | Self::MemorySearch
             | Self::MemoryDuplicates
@@ -240,6 +245,7 @@ impl DecisionFeature {
                 Some(thresholds.routing_confidence)
             }
             Self::Workflow
+            | Self::Mcp
             | Self::PermissionAdvice
             | Self::AutoScreening
             | Self::ShellEffect

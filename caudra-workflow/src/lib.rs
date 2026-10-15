@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod catalog;
+pub mod decision;
 #[cfg(feature = "rhai")]
 pub mod engine;
 pub mod host;
@@ -30,6 +31,7 @@ pub const ROOT_CAUSE_SOURCE: &str = include_str!("../builtins/root-cause.rhai");
 pub const WORKFLOW_SKILL: &str = include_str!("../skill/SKILL.md");
 
 pub use catalog::{CatalogEntry, InvalidEntry, LaunchRequest, WorkflowCatalog};
+pub use decision::{RerankRequest, ScriptQuestions};
 #[cfg(feature = "rhai")]
 pub use engine::{EngineError, RhaiEngine, RunParams, WorkflowEngine};
 pub use host::{

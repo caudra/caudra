@@ -138,6 +138,30 @@ Code that is not valid Python never runs. The error says what kind of code a sni
 
 Calls that ran before a failure keep their effects. When a run fails, the model reads why, followed by every server call the run made and how each ended, so it can check before it repeats one. The list names each call as the snippet wrote it, such as `my_server.get_sum`. Stopping the turn cancels the run and the calls it has in flight.
 
+### Decisions and reranking
+
+With the [decision engine](/docs/configuration/#decisions) on and a base URL set, snippets get two more functions, `decide()` and `rerank()`. They let a snippet judge and sort what its servers returned before any of it reaches the model:
+
+```python
+issues = await github.list_issues(owner="caudra", repo="caudra", state="open")
+titles = [issue["title"] for issue in issues]
+ranked = await rerank("crashes when saving a file", titles, threshold=0.5, top_k=10)
+[issues[entry["index"]]["number"] for entry in ranked]
+```
+
+| Function | What it returns |
+|---|---|
+| `await decide(input, questions, model=None, timeout_ms=None)` | `{"model", "answers", "by_name"}`: typed answers about `input` |
+| `await rerank(query, candidates, threshold=None, top_k=None, model=None, timeout_ms=None)` | `[{"index", "score"}]`: the candidates relevant to `query`, best first |
+
+`decide()` takes the same questions as a workflow's [`decide()`](/docs/workflows/#typed-decisions): a list of `predicate`, `choice`, and `score` questions in the shape of OpenAI Decisions, each with a `name`. `input` is the state the questions are about, and it must stay within 1,500 bytes as JSON. Read an answer by its question's name, as in `result["by_name"]["urgent"]["probability"]`.
+
+`rerank()` judges up to 256 candidates, each a string or a small dict. `index` is a candidate's position in `candidates`, and `score` is the probability that it is relevant. `threshold` drops candidates below it, and `top_k` keeps at most that many. Candidates go out 16 to a request, with up to 4 requests at once. Each request waits up to [`rerank_timeout_ms`](/docs/configuration/#decisions), like Caudra's own reranking, unless the call passes a shorter `timeout_ms`. A `decide()` call waits up to `timeout_ms` from the configuration. An empty list returns `[]` without a request.
+
+The model learns about both functions from the `# MCP servers` reminder, which lists them only while the engine is on. Without the engine they do not exist, and a snippet that calls one raises `NameError`. The `mcp` tool still appears only while a server is enabled.
+
+A call needs no approval and works in plan mode, since it only reads. A malformed question or argument raises `TypeError` or `ValueError` before anything is sent. An unreachable engine, a timeout, a refusal, or an invalid answer raises `RuntimeError`, and one failed request fails the whole `rerank()`. The card shows each call as a row, and the opt-in [decision log](/docs/permissions/#decision-engine-advice) records it under the feature `mcp`. Answers are data for the snippet: they never grant a permission.
+
 ### Variables between runs
 
 Variables that a run defines are still there in the next run of the same agent. The main agent and each subagent keep their own. They live in memory, up to 16 MiB. Past that they are dropped and the next run starts empty. They do not survive a restart of Caudra, and a resumed, rewound, or forked conversation starts without them. The model can pass `reset: true` to start a run empty. When variables are lost, the result says so.

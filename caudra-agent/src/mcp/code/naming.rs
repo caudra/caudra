@@ -12,13 +12,20 @@ pub const SEARCH_HELPER: &str = "search";
 pub const SERVERS_HELPER: &str = "servers";
 pub const RESOURCES_HELPER: &str = "resources";
 pub const READ_RESOURCE_HELPER: &str = "read_resource";
-/// Functions the snippet's globals hold beside the server namespaces.
+pub const DECIDE_HELPER: &str = "decide";
+pub const RERANK_HELPER: &str = "rerank";
+/// Functions the snippet's globals may hold beside the server namespaces. The decision helpers
+/// exist only with a decision engine, but their names stay reserved so namespaces never shift.
 pub const HELPERS: &[&str] = &[
     SEARCH_HELPER,
     SERVERS_HELPER,
     RESOURCES_HELPER,
     READ_RESOURCE_HELPER,
+    DECIDE_HELPER,
+    RERANK_HELPER,
 ];
+/// The helpers a session without a decision engine lacks.
+pub const DECISION_HELPERS: &[&str] = &[DECIDE_HELPER, RERANK_HELPER];
 /// Prefix of the stub class that types a namespace, `_McpServer_<namespace>`.
 pub const CLASS_PREFIX: &str = "_McpServer_";
 
@@ -459,6 +466,7 @@ pub(super) mod tests {
     }
 
     #[test_case("search", "search_" ; "helper")]
+    #[test_case("decide", "decide_" ; "decision_helper")]
     #[test_case("print", "print_" ; "builtin")]
     #[test_case("Exception", "Exception_" ; "builtin_exception")]
     #[test_case("json", "json_" ; "module")]

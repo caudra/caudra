@@ -252,13 +252,13 @@ pub(super) fn feature_cols() -> usize {
         .unwrap_or_default()
 }
 
-/// Workflow runs whenever an engine is set, and with no engine it cannot run.
+/// Script callers run whenever an engine is set, and with no engine they cannot run.
 pub(super) fn feature_mode<'a>(
     feature: &DecisionFeature,
     config: &'a DecisionsConfig,
 ) -> &'a FeatureMode {
     match (feature, &config.base_url) {
-        (DecisionFeature::Workflow, None) => &FeatureMode::Off,
+        (DecisionFeature::Workflow | DecisionFeature::Mcp, None) => &FeatureMode::Off,
         _ => feature.mode(&config.features),
     }
 }

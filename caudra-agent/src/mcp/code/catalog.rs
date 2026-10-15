@@ -30,6 +30,10 @@ const RESOURCES: &str = "resources";
 const TOOL: &str = "tool";
 const TOOLS: &str = "tools";
 const MAX_FAILURE_CHARS: usize = 120;
+/// Appended when the session has a decision engine, which the helpers need.
+const DECISIONS_SECTION: &str = "\n\n## Decision helpers\n\
+- `await decide(input, questions)`: typed answers about `input`. `questions` is a list in the OpenAI Decisions shape. Every question has `type`, `name`, and `instructions`: a `predicate`, a `choice` that adds `choices`, or a `score` that adds `levels`. Read answers by name: `r[\"by_name\"][\"urgent\"][\"probability\"]`.\n\
+- `await rerank(query, candidates, threshold=None, top_k=None)`: `[{\"index\", \"score\"}]`, most relevant first, for up to 256 strings or small dicts. Filter and sort large results with it before returning them.";
 
 /// What keeps a server's tools out of reach, or `None` when it is connected.
 pub fn unavailable(state: &ServerState) -> Option<String> {
@@ -47,8 +51,13 @@ pub fn unavailable(state: &ServerState) -> Option<String> {
 
 /// The `# MCP servers` block a turn should carry, `None` when the transcript already states it.
 /// `session` is what the agent reaches through the `mcp` tool, `None` when it cannot reach the
-/// tool; with nothing to list, a list still in force is withdrawn.
-pub fn notice(history: &[Message], session: Option<&McpSession>) -> Option<Message> {
+/// tool; with nothing to list, a list still in force is withdrawn. `decisions` adds the decision
+/// helpers, which only a session with a decision engine has.
+pub fn notice(
+    history: &[Message],
+    session: Option<&McpSession>,
+    decisions: bool,
+) -> Option<Message> {
     let listed = session
         .filter(|session| session.has_enabled_server())
         .map(|session| {
@@ -56,7 +65,12 @@ pub fn notice(history: &[Message], session: Option<&McpSession>) -> Option<Messa
             render(&servers, &Names::new(&servers))
         })
         .filter(|catalog| !catalog.is_empty())
-        .map(|catalog| MCP_SERVERS_PROMPT.replace(CATALOG_SLOT, &catalog));
+        .map(|mut catalog| {
+            if decisions {
+                catalog.push_str(DECISIONS_SECTION);
+            }
+            MCP_SERVERS_PROMPT.replace(CATALOG_SLOT, &catalog)
+        });
     let withdrawn =
         || last_announced(history, &[MCP_SERVERS_MARKER]).map(|_| MCP_SERVERS_WITHDRAWN_PROMPT);
     standing_notice(
@@ -388,32 +402,44 @@ mod tests {
 
     #[test]
     fn nothing_is_said_without_a_server() {
-        assert!(notice(&[], None).is_none());
+        assert!(notice(&[], None, false).is_none());
     }
 
     #[test]
     fn a_list_is_stated_once_and_restated_when_it_changes() {
         let session = crate::mcp::stub_session(&[(STUB_TOOL, LONG_DESCRIPTION)]);
-        let listed = notice(&[], Some(&session)).expect(LISTED);
+        let listed = notice(&[], Some(&session), false).expect(LISTED);
         let text = listed.user_text().unwrap();
         assert!(text.contains(MCP_SERVERS_MARKER), "{text}");
         assert!(text.contains("- list_issues("), "{text}");
         let history = [listed];
-        assert!(notice(&history, Some(&session)).is_none(), "{REPEATED}");
+        assert!(
+            notice(&history, Some(&session), false).is_none(),
+            "{REPEATED}"
+        );
 
         let changed = crate::mcp::stub_session(&[(OTHER_STUB_TOOL, LONG_DESCRIPTION)]);
-        let restated = notice(&history, Some(&changed)).expect(LISTED);
+        let restated = notice(&history, Some(&changed), false).expect(LISTED);
         assert!(restated.user_text().unwrap().contains("- close_issue("));
+    }
+
+    #[test_case(true ; "with_an_engine")]
+    #[test_case(false ; "without_an_engine")]
+    fn decision_helpers_are_listed_only_with_an_engine(decisions: bool) {
+        let session = crate::mcp::stub_session(&[(STUB_TOOL, LONG_DESCRIPTION)]);
+        let listed = notice(&[], Some(&session), decisions).expect(LISTED);
+        let text = listed.user_text().unwrap();
+        assert_eq!(text.contains(DECISIONS_SECTION), decisions, "{text}");
     }
 
     #[test]
     fn an_announced_list_is_withdrawn_once() {
         let session = crate::mcp::stub_session(&[(STUB_TOOL, LONG_DESCRIPTION)]);
-        let history = [notice(&[], Some(&session)).expect(LISTED)];
-        let withdrawal = notice(&history, None).expect(WITHDRAWN);
+        let history = [notice(&[], Some(&session), false).expect(LISTED)];
+        let withdrawal = notice(&history, None, false).expect(WITHDRAWN);
         assert_eq!(withdrawal.user_text(), Some(MCP_SERVERS_WITHDRAWN_PROMPT));
 
         let history = [history[0].clone(), withdrawal];
-        assert!(notice(&history, None).is_none(), "{REPEATED}");
+        assert!(notice(&history, None, false).is_none(), "{REPEATED}");
     }
 }

@@ -216,19 +216,19 @@ mod tests {
     fn decisions_smoke_run_with_deterministic_typed_answers() {
         let source = format!(
             r#"{META}
-            let result = decide(args, #{{
-                ready: #{{ type: "noul", instructions: "Ready?" }},
-                route: #{{ type: "choice", instructions: "Route?", criteria: #{{ a: "first", b: "second" }} }},
-                level: #{{ type: "score", instructions: "Level?", criteria: ["low", "high"] }}
-            }});
-            complete([result.answers.ready, result.answers.route.choice, result.answers.level.score, result.model]);"#
+            let result = decide(args, [
+                #{{ type: "predicate", name: "ready", instructions: "Ready?" }},
+                #{{ type: "choice", name: "route", instructions: "Route?", choices: [#{{ value: "a", description: "first" }}, "b"] }},
+                #{{ type: "score", name: "level", instructions: "Level?", levels: ["low", "high"] }}
+            ]);
+            complete([result.by_name.ready, result.by_name.route.choice, result.answers[2].score, result.model]);"#
         );
         let report = validate(&source).unwrap();
         assert_eq!(report.smoke.host_calls, 1);
         assert_eq!(
             report.smoke.outcome,
             WorkflowOutcome::Completed(json!([
-                {"type": "noul", "noul": 0.0},
+                {"type": "predicate", "name": "ready", "probability": 0.0},
                 "a",
                 0.0,
                 SMOKE_DECISION_MODEL

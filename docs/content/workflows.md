@@ -164,7 +164,7 @@ Everything after the metadata is ordinary Rhai with these host functions:
 | `pause(kind, message)` | Suspends the run in a resumable state |
 | `complete()`, `complete(value)` | Ends the run with `value` as its result |
 | `write_scratch_file(name, content)` | Writes an artifact and returns its path |
-| `decide(state, questions)`, `decide(state, questions, opts)` | Calls the configured decision endpoint. Needs `experimental.decision_engine`. Returns `#{ answers, model }` |
+| `decide(state, questions)`, `decide(state, questions, opts)` | Calls the configured decision endpoint. Needs `experimental.decision_engine`. Returns `#{ model, answers, by_name }` |
 | `rerank(query, candidates)`, `rerank(query, candidates, opts)` | Orders candidates by relevance to `query` through the decision endpoint. Needs `experimental.decision_engine`. Returns `[#{ index, score }]`, best first |
 | `json_encode(value)` | Serializes a value to JSON text |
 | `budget()` | Returns `#{ issued, limit, remaining }` for the run's agent budget |
@@ -201,23 +201,32 @@ Precedence runs from most specific configuration to least. A `subagent_model` pi
 ```rhai
 let result = decide(
     #{ task: args.objective },
-    #{ deep_reasoning: #{
-        type: "noul",
+    [#{
+        type: "predicate",
+        name: "deep_reasoning",
         instructions: "Does this task require substantial reasoning?"
-    } }
+    }]
 );
-let job = if result.answers.deep_reasoning.noul >= 0.9 { "best" } else { "fast" };
+let job = if result.by_name.deep_reasoning.probability >= 0.9 { "best" } else { "fast" };
 let answer = agent(args.objective, #{ model_job: job });
 complete(answer.output);
 ```
 
-Questions are keyed by ID. Supported types are `noul`, `choice`, and `score`. A `noul` answer holds only a probability, in `noul`. A choice needs a map from each option name to its description, or to `()` for none. A score needs an ordered array of 2 to 10 levels. Choice and score answers also carry `confidence`. Calls allow at most 64 questions, 255 choices per question, and 512 options in total.
+Questions follow the shape of OpenAI Decisions: an array of maps, each with a `type`, a unique `name`, and `instructions`, which can be a string or a map. The same shape works in [MCP code mode](/docs/mcp/#decisions-and-reranking).
 
-The OpenAI protocol maps `noul` questions to predicates and normalizes their answers back to the same `noul` probability. The script-facing result stays `#{ answers, model }`, so switching protocols does not change the example above. Native boolean questions retain their true and false criteria in the predicate instruction text. OpenAI choices require at least two options.
+| Type | Extra field | Answer |
+|------|-------------|--------|
+| `predicate` | none | `probability`, from 0 to 1, that the statement holds |
+| `choice` | `choices`: 2 to 255 options | `choice`, `confidence`, and `probabilities` as `#{ value, probability }` for every option |
+| `score` | `levels`: 2 to 10 ordered levels | `score`, the probability-weighted average of the level positions counted from 0, `confidence`, and `probabilities` as `#{ value, label, probability }`, where `value` is the level's position |
 
-The optional third argument accepts `model` and `timeout_ms`. Without a timeout, a call uses `timeout_ms` from the [decisions configuration](/docs/configuration/#decisions). A positive timeout is capped at the larger of `timeout_ms` and `rerank_timeout_ms`. States are redacted and bounded to 1,500 serialized bytes, with depth and node limits. Oversized states are rejected rather than silently shortened. Dynamic question descriptions are also redacted. A question is rejected if redaction would change an option name, a score level, or a question ID. Redaction is best effort, so keep credentials and sensitive material out of both states and questions.
+An option is a string, or a map with a `value` and a `description`. A level is a string, or a map with a `label` and a `description`. Calls allow at most 64 questions, and a misspelt field or type raises a catchable error before anything is sent.
 
-Endpoint errors, refusals, and timeouts are catchable Rhai errors. A refused answer fails the whole evaluation without returning partial answers. A successful result is saved before the script continues and replayed on resume without another endpoint call. Calls that failed or were interrupted before their result was committed can run again. The workflow journal omits the decision request body. The inspector names the call by its first three question IDs, as in `decide: ready, route`, or by its candidates and batch, as in `rerank: 17 candidates · batch 2 of 2`. The separate opt-in decision log stores the redacted state that was sent, questions, and answers. Workflow effects remain `none` there, even if the script acts on an answer.
+The result is `#{ model, answers, by_name }`. `answers` lists one answer per question, in question order, and each answer repeats its question's `type` and `name`. `by_name` holds the same answers keyed by name. Both protocols return this shape, so switching protocols does not change the example above.
+
+The optional third argument accepts `model` and `timeout_ms`. Without a timeout, a call uses `timeout_ms` from the [decisions configuration](/docs/configuration/#decisions). A positive timeout is capped at the larger of `timeout_ms` and `rerank_timeout_ms`. States are redacted and bounded to 1,500 serialized bytes, with depth and node limits. Oversized states are rejected rather than silently shortened. Dynamic question descriptions are also redacted. A question is rejected if redaction would change an option, a level, or a question name. Redaction is best effort, so keep credentials and sensitive material out of both states and questions.
+
+Endpoint errors, refusals, and timeouts are catchable Rhai errors. A refused answer fails the whole evaluation without returning partial answers. A successful result is saved before the script continues and replayed on resume without another endpoint call. Calls that failed or were interrupted before their result was committed can run again. The workflow journal omits the decision request body. The inspector names the call by its first three question names, as in `decide: ready, route`, or by its candidates and batch, as in `rerank: 17 candidates · batch 2 of 2`. The separate opt-in decision log stores the redacted state that was sent, questions, and answers. Workflow effects remain `none` there, even if the script acts on an answer.
 
 While the engine switch is off, a new `decide()` call raises a catchable error before anything reaches the journal. A decision the run already recorded still replays as its saved value, so resuming an older run works.
 
@@ -238,9 +247,9 @@ for entry in rerank(args.objective, files, #{ threshold: 0.5, top_k: 2 }) {
 complete(picked);
 ```
 
-`query` is a non-empty string. `candidates` is an array of strings or maps. A map is sent as candidate data, so one candidate can carry a path and an excerpt together. Each candidate becomes one `noul` question that asks whether it is relevant to the query and frames the candidate as untrusted data to judge rather than instructions to follow. The state of every call is `#{ query }`.
+`query` is a non-empty string. `candidates` is an array of strings or maps. A map is sent as candidate data, so one candidate can carry a path and an excerpt together. Each candidate becomes one predicate that asks whether it is relevant to the query and frames the candidate as untrusted data to judge rather than instructions to follow. The state of every call is `#{ query }`.
 
-The result holds one `#{ index, score }` for each kept candidate. `index` is the position in `candidates`, and `score` is the `noul` probability. Entries are sorted by score, highest first, and equal scores keep their input order. An empty `candidates` array returns `[]` without calling the endpoint.
+The result holds one `#{ index, score }` for each kept candidate. `index` is the position in `candidates`, and `score` is the probability that it is relevant. Entries are sorted by score, highest first, and equal scores keep their input order. An empty `candidates` array returns `[]` without calling the endpoint.
 
 Candidates go out in batches of 16. Each batch is one decision call with its own journal entry, and the batches run one after another. A resumed run replays the batches that were already committed and asks only for the rest. Each batch counts as one host call.
 

@@ -1176,6 +1176,7 @@ impl<'h> Agent<'h> {
         standing.extend(catalog::notice(
             self.history.as_slice(),
             self.catalog_mcp(&tool_context).as_ref(),
+            self.permissions.decisions().is_some(),
         ));
         standing.extend(mode_switch_notice_with_tools(
             self.history.as_slice(),

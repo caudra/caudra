@@ -9,6 +9,7 @@
 //! lookups and calls, and the runner is whatever executes the snippet.
 
 pub mod catalog;
+pub mod decide;
 pub mod gateway;
 pub mod naming;
 pub mod output;

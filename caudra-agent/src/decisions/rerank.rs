@@ -298,7 +298,7 @@ async fn admit<T>(
 }
 
 /// Polls every batch together and stops at the first one without an answer.
-async fn join_answered<T, E>(
+pub(crate) async fn join_answered<T, E>(
     batches: impl IntoIterator<Item = impl Future<Output = Result<T, E>>>,
 ) -> Result<Vec<T>, E> {
     let mut pending: Vec<_> = batches

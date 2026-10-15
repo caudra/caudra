@@ -279,7 +279,7 @@ decision_engine = true
 | `sandboxes` | `false` | [Managed sandboxes](/docs/sandboxes/): `caudra sandbox`, `caudra auth sandbox`, `--sandbox`, `/sandbox`, and the workbench Transfer view. Sandboxes bring their own connection to Workcell and do not need `remote_workcell`. |
 | `remote_workcell` | `false` | Direct [remote Workcell](/docs/remote-workspaces/) connections: the `--workcell-*` flags and `caudra auth workcell`. |
 | `lua_plugins` | `false` | Every use of Lua: [plugins](/docs/plugins/), the [Lua API](/docs/lua-api/), global and project `init.lua`, and the `caudra-plugin-dev` skill. `--no-plugins` still turns Lua off for one run. |
-| `decision_engine` | `false` | The [decision engine](#decisions), [Auto mode](/docs/permissions/#auto-mode), `caudra decisions`, and workflow [`decide()` calls](/docs/workflows/#typed-decisions). |
+| `decision_engine` | `false` | The [decision engine](#decisions), [Auto mode](/docs/permissions/#auto-mode), `caudra decisions`, workflow [`decide()` calls](/docs/workflows/#typed-decisions), and the [`decide()` and `rerank()` helpers](/docs/mcp/#decisions-and-reranking) of MCP code mode. |
 | `cross_session_messaging` | `false` | Local [cross-session messaging](/docs/messaging/): the `list_sessions`, `send_message`, `publish_message`, `read_topic`, and `work_assignment` tools, `/peers`, `/messages`, `/topics`, `/groups`, `caudra message`, live session inboxes, consumer groups, and the message history. Both processes must opt in. |
 | `automations` | `false` | [Automations](/docs/automations/): scripts that act on session events when their conditions hold, within the limits in [`[automations]`](#automations), and the `caudra-automation-dev` skill. Messaging triggers and actions also need `cross_session_messaging`, and workflow triggers and actions also need `workflows`. |
 | `autopilot` | `false` | [Autopilot](/docs/autopilot/): keep a session moving toward its goal unattended, answering permission prompts and questions within the limits in [`[autopilot]`](#autopilot). |
@@ -709,7 +709,7 @@ Inside a Herdr pane, `auto` asks Herdr to create and remove worktrees, so each o
 
 ### `decisions`
 
-Configure the optional typed decision engine in the `[decisions]` table. The engine is experimental and needs `decision_engine = true` under [`[experimental]`](#experimental-features). Without that switch Caudra still validates this table and starts no engine. It then sends no decision requests, reads no engine credentials, and leaves decision logs and shell duration history untouched. No base URL, passive feature, or decision logging is enabled by default. Explicit workflow [`decide()` calls](/docs/workflows/#typed-decisions) need a base URL but do not need a passive feature enabled. Shell duration history can work without a base URL.
+Configure the optional typed decision engine in the `[decisions]` table. The engine is experimental and needs `decision_engine = true` under [`[experimental]`](#experimental-features). Without that switch Caudra still validates this table and starts no engine. It then sends no decision requests, reads no engine credentials, and leaves decision logs and shell duration history untouched. No base URL, passive feature, or decision logging is enabled by default. Explicit workflow [`decide()` calls](/docs/workflows/#typed-decisions) and the MCP [`decide()` and `rerank()` helpers](/docs/mcp/#decisions-and-reranking) need a base URL but do not need a passive feature enabled. Shell duration history can work without a base URL.
 
 Connection settings and thresholds are global-only. Projects may set individual features to `"off"`, set `log = false`, or keep or shorten inherited log retention. Other project overrides are errors, even when they repeat a global value. Disabling globally required Auto screening or its active content screening restores prompting for eligible Auto calls.
 
@@ -722,7 +722,7 @@ Connection settings and thresholds are global-only. Projects may set individual 
 | `allow_remote` | boolean | `false` | Explicit global consent to send decision context to a non-loopback endpoint. |
 | `allow_http` | boolean | `false` | Global-only opt-in for non-loopback HTTP. Also requires `allow_remote = true`. Use only with transport protection you control, such as a trusted encrypted tunnel. |
 | `timeout_ms` | integer | `800` | Positive decision-request deadline in milliseconds, separate from shell execution timeouts. Tool search and every reranking feature except memory recall use `rerank_timeout_ms` instead. |
-| `rerank_timeout_ms` | integer | `2000` | Positive deadline in milliseconds for tool search and the reranking features, which judge at most 16 candidates per request and send their requests concurrently. Memory recall keeps `timeout_ms` because it delays the start of a turn. A workflow `decide()` may ask for up to the larger of the two. |
+| `rerank_timeout_ms` | integer | `2000` | Positive deadline in milliseconds for tool search and the reranking features, which judge at most 16 candidates per request and send their requests concurrently. Memory recall keeps `timeout_ms` because it delays the start of a turn. A `decide()` or `rerank()` call from a workflow or an MCP snippet may ask for up to the larger of the two. |
 | `log` | boolean | `false` | Retain bounded decision records in the local `caudra.db`. |
 | `log_retention_days` | integer | `90` | Positive retention period for decision records. |
 | `features` | table | `{}` | Per-feature modes below. |
@@ -756,11 +756,11 @@ model = "systemone-decision-v7"
 
 `TYPESAFE_BASE_URL` for `typesafe`, or `OPENAI_BASE_URL` for `openai`, replaces the whole configured base URL, path prefix included, and passes the same URL and transport opt-in checks. Only the selected protocol's variable applies, and only when `base_url` is set. A variable alone never activates the engine. Overrides and API keys come from the global environment, not project `.env` files. Neither protocol implies remote or HTTP consent.
 
-Both protocols send text only. OpenAI maps native boolean questions to predicates, retaining the true and false criteria in the instruction text. Answers normalize to the same typed results, including workflow `noul` probabilities. A refusal fails the whole evaluation without applying partial answers.
+Both protocols send text only. OpenAI maps native boolean questions to predicates, retaining the true and false criteria in the instruction text. Answers normalize to the same typed results, so workflows and MCP snippets read the same answers under either protocol. A refusal fails the whole evaluation without applying partial answers.
 
 Caudra retries HTTP 408, 429, and 5xx responses at most twice. Each retry waits for the delay the server requests in `retry-after-ms` or `Retry-After`, or else for an exponential backoff that starts near half a second. No retry waits past the request deadline, so under the default 800 ms `timeout_ms` most retries need a short server-requested delay. Connection failures, 401, 422, and other client errors fail at once.
 
-Tool search and the [reranking features](#reranking) judge up to 16 candidates in one request and use `rerank_timeout_ms` (default 2000 ms) instead. Memory recall keeps `timeout_ms` because it delays the start of a turn. A workflow `decide()` or `rerank()` call may ask for up to the larger of the two.
+Tool search and the [reranking features](#reranking) judge up to 16 candidates in one request and use `rerank_timeout_ms` (default 2000 ms) instead. Memory recall keeps `timeout_ms` because it delays the start of a turn. A `decide()` or `rerank()` call from a workflow or an MCP snippet may ask for up to the larger of the two.
 
 Requests ignore ambient proxies and do not follow redirects. `localhost` is a DNS name, not numeric loopback for this policy. Private and CGNAT addresses receive no automatic HTTP exemption. These settings do not change Workcell transport policy.
 
@@ -835,7 +835,7 @@ One request holds up to 16 candidates, each with an opaque ID such as `c00`. Lar
 
 Enforcing features compare each probability with `thresholds.relevance_floor` (default `0.1`). Tool search and `code_context` only reorder, putting candidates at or above the floor first. `memory_search` omits matches below the floor and names them. `compaction_retention` keeps the same number of tool results as without the engine, choosing them by relevance, and never drops a result it could not otherwise drop. Advisory features name a candidate only at or above `thresholds.routing_confidence` (default `0.9`).
 
-When any request fails, is refused, times out, or is cancelled, or the decision service changes while it runs, the feature behaves as if it were `off`. In `shadow`, requests are sent and logged without effect. With `log = true`, an enforcing feature records `rerouted` when the order it used differs from the first pass, and an advisory feature records `advised` when it named a candidate. Workflows can rerank their own candidates with [`rerank()`](/docs/workflows/#reranking-candidates). See also [memory relevance](/docs/memory/#relevance-from-the-decision-engine).
+When any request fails, is refused, times out, or is cancelled, or the decision service changes while it runs, the feature behaves as if it were `off`. In `shadow`, requests are sent and logged without effect. With `log = true`, an enforcing feature records `rerouted` when the order it used differs from the first pass, and an advisory feature records `advised` when it named a candidate. Workflows and MCP snippets can rerank their own candidates with `rerank()`: see [workflows](/docs/workflows/#reranking-candidates) and [MCP](/docs/mcp/#decisions-and-reranking). See also [memory relevance](/docs/memory/#relevance-from-the-decision-engine).
 
 #### Question overrides
 

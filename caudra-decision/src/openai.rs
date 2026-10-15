@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::engine::DecisionError;
 use crate::question_set::{bounded_json, rendered_text};
@@ -14,6 +15,9 @@ const PREDICATE_CRITERIA: &str = "\n\nCriteria (false and true outcomes):\n";
 const INVALID_SCHEMA: &str = "response does not match the OpenAI Decisions JSON schema";
 const INVALID_NAMES: &str = "answer names do not match the requested questions";
 const DUPLICATE_VALUE: &str = "answer contains duplicate probability values";
+const LEVEL_LABEL: &str = "label";
+const LEVEL_DESCRIPTION: &str = "description";
+const LEVEL_FIELDS: [&str; 2] = [LEVEL_LABEL, LEVEL_DESCRIPTION];
 
 #[derive(Serialize)]
 struct Request<'a> {
@@ -48,6 +52,32 @@ struct Choice<'a> {
 #[derive(Serialize)]
 struct Level {
     label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+impl Level {
+    /// A `{label, description}` map keeps its two parts; any other level is its rendered text.
+    fn from_content(level: &Value) -> Result<Self, DecisionError> {
+        if let Some(fields) = level.as_object()
+            && let Some(Value::String(label)) = fields.get(LEVEL_LABEL)
+            && fields
+                .keys()
+                .all(|key| LEVEL_FIELDS.contains(&key.as_str()))
+        {
+            return Ok(Self {
+                label: label.clone(),
+                description: fields
+                    .get(LEVEL_DESCRIPTION)
+                    .map(rendered_text)
+                    .transpose()?,
+            });
+        }
+        Ok(Self {
+            label: rendered_text(level)?,
+            description: None,
+        })
+    }
 }
 
 pub(crate) fn encode(request: &DecisionRequest) -> Result<Vec<u8>, DecisionError> {
@@ -91,7 +121,7 @@ pub(crate) fn encode(request: &DecisionRequest) -> Result<Vec<u8>, DecisionError
                 levels: question
                     .score_levels()?
                     .iter()
-                    .map(|level| rendered_text(level).map(|label| Level { label }))
+                    .map(Level::from_content)
                     .collect::<Result<_, _>>()?,
             },
         };
@@ -223,7 +253,7 @@ pub(crate) fn decode(
                     let level = levels.get(probability.value).ok_or(DecisionError::Invalid(
                         "score index is outside the requested levels",
                     ))?;
-                    if probability.label != rendered_text(level)? {
+                    if probability.label != Level::from_content(level)?.label {
                         return Err(DecisionError::Invalid(
                             "score label does not match the requested level",
                         ));
@@ -384,6 +414,26 @@ pub(crate) mod tests {
         let bytes = encode(&request).unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), encoded());
         assert_eq!(bytes, encode(&request).unwrap());
+    }
+
+    #[test]
+    fn a_labelled_level_keeps_its_description_and_answers_by_its_label() {
+        let mut request = request();
+        request.questions.get_mut("urgency").unwrap().criteria = Some(json!([
+            "low",
+            {"label": "medium", "description": "Blocks one user."},
+            "high",
+        ]));
+        let encoded: Value = serde_json::from_slice(&encode(&request).unwrap()).unwrap();
+        assert_eq!(
+            encoded["questions"][2]["levels"],
+            json!([{"label": "low"}, {"label": "medium", "description": "Blocks one user."}, {"label": "high"}])
+        );
+        let mut answer = response();
+        answer["answers"][2]["probabilities"][1]["label"] = json!("medium");
+        answer["answers"][2]["probabilities"][2]["label"] = json!("high");
+        let decoded = decode(&serde_json::to_vec(&answer).unwrap(), &request).unwrap();
+        decoded.validate_for(&request).unwrap();
     }
 
     #[test_case(&["zeta-review", "alpha-build", "none"]; "ranked_skill_keys")]

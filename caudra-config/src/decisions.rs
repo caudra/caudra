@@ -668,7 +668,7 @@ impl DecisionsConfig {
             min: None,
             max: None,
             env: None,
-            description: "Positive deadline in milliseconds for tool search and the reranking features, which judge at most 16 candidates per request and send their requests concurrently. Memory recall keeps `timeout_ms` because it delays the start of a turn. A workflow `decide()` may ask for up to the larger of the two.",
+            description: "Positive deadline in milliseconds for tool search and the reranking features, which judge at most 16 candidates per request and send their requests concurrently. Memory recall keeps `timeout_ms` because it delays the start of a turn. A `decide()` or `rerank()` call from a workflow or an MCP snippet may ask for up to the larger of the two.",
         },
         ConfigField {
             name: "log",

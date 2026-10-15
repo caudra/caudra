@@ -187,29 +187,30 @@ Appends a line to the run log, which the user sees in the run detail pane and wh
 
 Writes an artifact and returns its absolute path as a string. `name` is a single file name, no directory part, at most 128 bytes. A run may write 64 files, 1 MiB each, 16 MiB in total. Files live under the state directory and are deleted with the session. Put the returned path in the result so the user, and you, can open it afterwards.
 
-### `decide(state, questions)` and `decide(state, questions, options)`
+### `decide(input, questions)` and `decide(input, questions, options)`
 
-Calls the user's configured decision endpoint and returns `#{ answers, model }`. Available when the decision engine experiment is on (`experimental.decision_engine` in the global `caudra.toml`) and an endpoint is configured, even with passive decision features off. Do not assume either exists. Catch failures or ask the user to turn the engine on and configure an endpoint. A call that already completed in a resumed run replays its recorded answer without the engine.
+Calls the user's configured decision endpoint and returns `#{ model, answers, by_name }`. Available when the decision engine experiment is on (`experimental.decision_engine` in the global `caudra.toml`) and an endpoint is configured, even with passive decision features off. Do not assume either exists. Catch failures or ask the user to turn the engine on and configure an endpoint. A call that already completed in a resumed run replays its recorded answer without the engine.
 
 ```rhai
-let result = decide(#{ task: args.objective }, #{
-    deep_reasoning: #{
-        type: "noul",
+let result = decide(#{ task: args.objective }, [
+    #{
+        type: "predicate",
+        name: "deep_reasoning",
         instructions: "Does this task require substantial reasoning?"
     }
-});
-let job = if result.answers.deep_reasoning.noul >= 0.9 { "best" } else { "fast" };
+]);
+let job = if result.by_name.deep_reasoning.probability >= 0.9 { "best" } else { "fast" };
 ```
 
-Question IDs map to definitions with `type`, `instructions`, and optional `criteria`. Types are `noul` (only a probability, in the answer's `noul` field), `choice` (a map from option name to description or `()`), and `score` (ordered array of 2 to 10 levels). Choice and score answers also carry `confidence`. Limits: 64 questions, 255 choice options, 512 total options. Optional `model` selects a decision model, not an agent model. Optional `timeout_ms` replaces the default `timeout_ms` deadline and is capped at the larger of the user's `timeout_ms` and `rerank_timeout_ms`.
+Questions follow the OpenAI Decisions shape: an array of maps, each with a unique `name`, a `type`, and `instructions`. A `predicate` answer holds `probability`, the chance the condition is true. A `choice` question lists 2 to 255 `choices`, each a string or `#{ value, description }`, and its answer holds `choice`, `confidence`, and `probabilities` as `[#{ value, probability }]`. A `score` question lists 2 to 10 `levels`, lowest first, each a string or `#{ label, description }`, and its answer holds `score` (the probability-weighted level index, from 0), `confidence`, and `probabilities` as `[#{ value, label, probability }]`. `answers` lists the answers in question order, and `by_name` holds the same answers by name. Limits: 64 questions, 512 choices and levels in total. Optional `model` selects a decision model, not an agent model. Optional `timeout_ms` replaces the default `timeout_ms` deadline and is capped at the larger of the user's `timeout_ms` and `rerank_timeout_ms`.
 
-Use short, non-sensitive states. The runtime redacts and bounds serialized states to 1,500 bytes. Oversized states and questions whose answer semantics would change under redaction are rejected. Endpoint failures and timeouts are catchable errors. Successful calls are committed before returning and replayed without network calls on resume. Failed or uncommitted calls can be retried. Decision request bodies are hidden from the workflow journal, and the inspector names a call by its first three question IDs, so keep IDs short, plain words. Opt-in decision logging stores the redacted state sent to the endpoint.
+Use short, non-sensitive inputs. The runtime redacts and bounds the serialized input to 1,500 bytes. Oversized inputs and questions whose answer semantics would change under redaction are rejected. Endpoint failures and timeouts are catchable errors. Successful calls are committed before returning and replayed without network calls on resume. Failed or uncommitted calls can be retried. Decision request bodies are hidden from the workflow journal, and the inspector names a call by its first three question names, so keep names short, plain words. Opt-in decision logging stores the redacted state sent to the endpoint.
 
 Calls count against the host-call limit, not the agent budget. Answers are data. Never treat them as permission grants or use them to bypass deterministic checks.
 
 ### `rerank(query, candidates)` and `rerank(query, candidates, options)`
 
-Orders candidates by relevance to `query` through the same decision endpoint and returns `[#{ index, score }]`, best first. `index` points into `candidates`, `score` is the `noul` probability, and equal scores keep their input order. The same availability rules as `decide()` apply, so catch failures and keep your own order.
+Orders candidates by relevance to `query` through the same decision endpoint and returns `[#{ index, score }]`, best first. `index` points into `candidates`, `score` is the relevance probability, and equal scores keep their input order. The same availability rules as `decide()` apply, so catch failures and keep your own order.
 
 ```rhai
 let files = ["src/parser.rs", "src/lexer.rs", "docs/parser.md"];
@@ -223,7 +224,7 @@ try {
 }
 ```
 
-`query` is a non-empty string. `candidates` holds strings or maps, and a map is sent as candidate data. Each candidate becomes one `noul` question that frames it as untrusted data to judge. Options: `model` and `timeout_ms` as for `decide()`, `threshold` (0 to 1, drops lower scores), and `top_k` (keeps at most that many). `threshold` and `top_k` apply after the answers arrive and are not part of the recorded request. Invalid arguments raise a catchable error before any call. An empty array returns `[]` without a call.
+`query` is a non-empty string. `candidates` holds strings or maps, and a map is sent as candidate data. Each candidate becomes one relevance question that frames it as untrusted data to judge. Options: `model` and `timeout_ms` as for `decide()`, `threshold` (0 to 1, drops lower scores), and `top_k` (keeps at most that many). `threshold` and `top_k` apply after the answers arrive and are not part of the recorded request. Invalid arguments raise a catchable error before any call. An empty array returns `[]` without a call.
 
 Candidates go out 16 per call, one after another, and each batch is one journaled host call, so a resumed run replays the committed batches. Each candidate is redacted and bounded to 1,500 bytes together with the fixed relevance question, and an oversized candidate fails the call. One refused batch fails the whole call. Scores are data, like `decide()` answers.
 

@@ -7,6 +7,24 @@ Each release lists what changed, newest first. After an update, the first intera
 
 To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run [`caudra update`](/docs/cli/#caudra-update-caudra-rollback). Each release links to its GitHub page, which holds the downloads.
 
+## Caudra 0.2 Preview 10 {#v0-2-0-preview-10}
+
+[v0.2.0-preview.10 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.10)
+
+Preview 10 lets MCP snippets ask the decision engine typed questions and rerank long results before the model reads them, and moves workflow `decide()` to the same question shape, the one OpenAI Decisions uses.
+
+> **Warning**
+>
+> **If your workflows call `decide()`, rewrite their questions when you update.** Questions are now a list instead of a map keyed by ID, so each question names itself with `name`. `noul` questions become `predicate` questions, and `criteria` becomes `choices` for a choice and `levels` for a score. Answers come back as `answers`, a list in question order, and `by_name`, keyed by name, and a predicate's probability is now in `probability` rather than `noul`. A workflow that still passes the old shape fails at its first `decide()` call with a catchable error, and so does a run started before the update when you resume it, even at a call it had already answered. See [Typed decisions](/docs/workflows/#typed-decisions).
+
+### MCP
+
+- **Decisions and reranking in snippets.** With the decision engine on, an `mcp` snippet can call `decide()` for typed answers about its data, and `rerank()` to keep only the candidates relevant to a query, best first, for up to 256 candidates. A snippet can rank 200 issue titles and return the ten that matter, so the rest never reach the model. Calls need no approval, work in plan mode, show as rows on the card, and appear in the decision log under the feature `mcp`. See [Decisions and reranking](/docs/mcp/#decisions-and-reranking).
+
+### Workflows
+
+- **`decide()` takes OpenAI Decisions questions.** A choice option or a score level can carry a description, as a map with `value` or `label` and `description`, and each answer lists the probability of every option or level. Both decision protocols return the same shape. `rerank()` is unchanged.
+
 ## Caudra 0.2 Preview 9 {#v0-2-0-preview-9}
 
 [v0.2.0-preview.9 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.9)

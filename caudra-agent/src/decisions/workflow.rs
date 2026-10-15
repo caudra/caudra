@@ -16,29 +16,32 @@ const UNSAFE_MODEL: &str =
     "workflow model must be a bounded identifier without credentials or control characters";
 
 impl Decisions {
-    pub async fn workflow(
+    /// A script's own request, from a workflow or an MCP code-mode run: `feature` names the
+    /// caller in the log and sets the deadline ceiling.
+    pub async fn scripted(
         &self,
+        feature: DecisionFeature,
         request: &WorkflowRequest,
         context: &DecisionContext,
     ) -> DecisionOutcome {
-        let prepared = if self.enabled(&DecisionFeature::Workflow) {
-            self.prepare_workflow(request)
+        let prepared = if self.enabled(&feature) {
+            self.prepare_scripted(&feature, request)
         } else {
             Err(DecisionError::Unreachable)
         };
         match prepared {
             Ok((request, questions, timeout_ms)) => {
-                self.run(
-                    DecisionFeature::Workflow,
-                    &questions,
-                    request,
-                    context,
-                    timeout_ms,
-                )
-                .await
+                self.run(feature, &questions, request, context, timeout_ms)
+                    .await
             }
             Err(error) => {
-                caudra_otel::emit::decision("workflow", "none", 0, "", Some(error_kind(&error)));
+                caudra_otel::emit::decision(
+                    feature.name(),
+                    "none",
+                    0,
+                    "",
+                    Some(error_kind(&error)),
+                );
                 DecisionOutcome {
                     result: Err(error),
                     latency_ms: 0,
@@ -49,8 +52,9 @@ impl Decisions {
         }
     }
 
-    fn prepare_workflow(
+    fn prepare_scripted(
         &self,
+        feature: &DecisionFeature,
         request: &WorkflowRequest,
     ) -> Result<(DecisionRequest, QuestionSet, u64), DecisionError> {
         if request.state.is_null() || request.timeout_ms == Some(0) {
@@ -75,7 +79,7 @@ impl Decisions {
             request
                 .timeout_ms
                 .unwrap_or(self.config().timeout_ms)
-                .min(DecisionFeature::Workflow.timeout_ms(self.config())),
+                .min(feature.timeout_ms(self.config())),
         ))
     }
 }
@@ -265,7 +269,9 @@ mod tests {
                 ..Default::default()
             };
             let mut request = request();
-            let first = service.workflow(&request, &context).await;
+            let first = service
+                .scripted(DecisionFeature::Workflow, &request, &context)
+                .await;
             assert!(!first.result.unwrap().cache_hit);
             service
                 .attach_label(
@@ -279,12 +285,16 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let cached = service.workflow(&request, &context).await.result.unwrap();
+            let cached = service
+                .scripted(DecisionFeature::Workflow, &request, &context)
+                .await
+                .result
+                .unwrap();
             assert!(cached.cache_hit);
             request.model = Some(OTHER_MODEL.into());
             assert!(
                 !service
-                    .workflow(&request, &context)
+                    .scripted(DecisionFeature::Workflow, &request, &context)
                     .await
                     .result
                     .unwrap()
@@ -353,7 +363,9 @@ mod tests {
         let mut request = request();
         request.model = None;
         request.timeout_ms = timeout;
-        let (wire, _, timeout_ms) = service.prepare_workflow(&request).unwrap();
+        let (wire, _, timeout_ms) = service
+            .prepare_scripted(&DecisionFeature::Workflow, &request)
+            .unwrap();
         assert_eq!(wire.model, model);
         assert_eq!(timeout_ms, expected);
     }
@@ -375,7 +387,11 @@ mod tests {
             request.timeout_ms = Some(1);
             assert_eq!(
                 service
-                    .workflow(&request, &DecisionContext::default())
+                    .scripted(
+                        DecisionFeature::Workflow,
+                        &request,
+                        &DecisionContext::default()
+                    )
                     .await
                     .result
                     .unwrap_err(),
@@ -404,7 +420,11 @@ mod tests {
             let mut request = request();
             request.timeout_ms = Some(LONG_RERANK_TIMEOUT_MS);
             service
-                .workflow(&request, &DecisionContext::default())
+                .scripted(
+                    DecisionFeature::Workflow,
+                    &request,
+                    &DecisionContext::default(),
+                )
                 .await
                 .result
                 .unwrap();
@@ -426,7 +446,11 @@ mod tests {
             .unwrap();
             assert_eq!(
                 service
-                    .workflow(&request(), &DecisionContext::default())
+                    .scripted(
+                        DecisionFeature::Workflow,
+                        &request(),
+                        &DecisionContext::default()
+                    )
                     .await
                     .result
                     .unwrap_err(),
@@ -453,7 +477,11 @@ mod tests {
             let mut request = request();
             request.model = Some(format!("TOKEN={SECRET}"));
             let error = service
-                .workflow(&request, &DecisionContext::default())
+                .scripted(
+                    DecisionFeature::Workflow,
+                    &request,
+                    &DecisionContext::default(),
+                )
                 .await
                 .result
                 .unwrap_err();

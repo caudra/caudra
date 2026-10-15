@@ -1128,32 +1128,32 @@ complete(rerank("where parse errors are reported", ["parser.rs reports parse err
     const CONTROL_TIMEOUT_ERROR: &str = "workflow control waited for the decision deadline";
     const CAUGHT: &str = "caught";
     const DECIDING_BODY: &str = r#"
-let result = decide(#{ command: "ls", api_key: "workflow-test-secret" }, #{ ready: #{ type: "noul", instructions: "Is it ready?" } }, #{ model: "workflow/model" });
+let result = decide(#{ command: "ls", api_key: "workflow-test-secret" }, [#{ type: "predicate", name: "ready", instructions: "Is it ready?" }], #{ model: "workflow/model" });
 agent("one", #{ label: "block-1" });
 complete(result);
 "#;
     const DECISION_FAILURE_BODY: &str = r#"
 let result = "not caught";
 try {
-    decide(#{ command: "ls" }, #{ ready: #{ type: "noul", instructions: "Is it ready?" } });
+    decide(#{ command: "ls" }, [#{ type: "predicate", name: "ready", instructions: "Is it ready?" }]);
 } catch (error) { result = "caught"; }
 complete(result);
 "#;
     const DECISION_ERROR_BODY: &str = r#"
 let result = "not caught";
 try {
-    decide(#{ command: "ls" }, #{ ready: #{ type: "noul", instructions: "Is it ready?" } });
+    decide(#{ command: "ls" }, [#{ type: "predicate", name: "ready", instructions: "Is it ready?" }]);
 } catch (error) { result = error; }
 complete(result);
 "#;
     const DECISION_ONLY_BODY: &str = r#"
-complete(decide(#{ command: "ls" }, #{ ready: #{ type: "noul", instructions: "Is it ready?" } }));
+complete(decide(#{ command: "ls" }, [#{ type: "predicate", name: "ready", instructions: "Is it ready?" }]));
 "#;
     const DECISION_ENGINE_KEY: &str = "experimental.decision_engine";
     const DECISION_DEADLINE_BODY: &str = r#"
 let result = "not caught";
 try {
-    decide(#{ command: "ls" }, #{ ready: #{ type: "noul", instructions: "Is it ready?" } }, #{ timeout_ms: 10 });
+    decide(#{ command: "ls" }, [#{ type: "predicate", name: "ready", instructions: "Is it ready?" }], #{ timeout_ms: 10 });
 } catch (error) { result = "caught"; }
 complete(result);
 "#;
@@ -1295,7 +1295,16 @@ complete(result);
             let completed = fixture
                 .wait_for(&started.run_id, RunStatus::Completed)
                 .await;
-            assert_eq!(completed.result, Some(result));
+            let ready =
+                json!({ "type": "predicate", "name": "ready", "probability": DECISION_NOUL });
+            assert_eq!(
+                completed.result,
+                Some(json!({
+                    "model": DECISION_MODEL,
+                    "answers": [ready],
+                    "by_name": { "ready": ready },
+                }))
+            );
             assert_eq!(
                 engine.requests.lock().unwrap().len(),
                 1,
