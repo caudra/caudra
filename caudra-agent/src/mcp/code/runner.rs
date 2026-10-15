@@ -116,8 +116,9 @@ impl ReplState {
 /// The variables one agent's `mcp` runs keep, held only in memory.
 pub struct ReplSlot {
     state: Option<ReplState>,
-    /// Earlier runs kept variables in a process that has since gone, which the next run says.
-    restarted: bool,
+    /// Earlier runs kept variables in an agent that has since gone: Caudra restarted, or the
+    /// conversation was resumed, rewound or forked. The next run says so.
+    forgotten: bool,
 }
 
 pub type SharedRepl = Arc<AsyncMutex<ReplSlot>>;
@@ -126,7 +127,7 @@ impl ReplSlot {
     pub fn shared(ran_before: bool) -> SharedRepl {
         Arc::new(AsyncMutex::new(Self {
             state: None,
-            restarted: ran_before,
+            forgotten: ran_before,
         }))
     }
 }
@@ -149,9 +150,9 @@ impl ReplLease {
         self.0.state = state;
     }
 
-    /// Whether earlier runs' variables died with an earlier process, said once.
-    pub(super) fn take_restarted(&mut self) -> bool {
-        std::mem::take(&mut self.0.restarted)
+    /// Whether earlier runs' variables died with an earlier agent, said once.
+    pub(super) fn take_forgotten(&mut self) -> bool {
+        std::mem::take(&mut self.0.forgotten)
     }
 }
 

@@ -15,7 +15,7 @@ const GET_SUM_KEY: &str = "everything.get-sum";
 const SUM: &str = "The sum of 2 and 3 is 5.";
 const TRUE: &str = "true";
 const PERMISSION_ERROR: &str = "PermissionError";
-const RESTARTED: &str = "were lost when Caudra restarted";
+const GONE: &str = "runs in this conversation are gone";
 const CALL_SUM: &str = "await everything.get_sum(a=2, b=3)";
 
 fn run(code: &str) -> String {
@@ -67,5 +67,5 @@ fn variables_last_between_turns_and_a_resumed_session_says_they_were_lost() {
     let mut resumed = home.start(YOLO, Some(&id));
     let after = resumed.turn(&run("1 + 1"), &[]);
     assert_eq!(resumed.finish(), id);
-    assert!(after.mentions(RESTARTED), "{after:?}");
+    assert!(after.mentions(GONE), "{after:?}");
 }

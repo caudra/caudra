@@ -78,8 +78,7 @@ const UNFINISHED: &str = "did not finish: the run stopped first";
 const NO_ATTRIBUTE: &str = " has no attribute `";
 const QUOTE: char = '`';
 const NO_RUNNER: &str = "MCP code mode is unavailable: no code runner is installed in this process";
-const RESTARTED_NOTE: &str =
-    "Variables from earlier `mcp` runs were lost when Caudra restarted; this run started empty.";
+const GONE_NOTE: &str = "Variables from earlier `mcp` runs in this conversation are gone (Caudra restarted, or the conversation was resumed, rewound or forked); this run started empty. Fetch again what you need.";
 const RESTORE_FAILED_NOTE: &str =
     "Variables from earlier runs could not be restored; this run started empty.";
 const RUN_DISCARDED_NOTE: &str =
@@ -102,7 +101,7 @@ pub async fn run(
         };
     }
     let mut lease = ReplLease::acquire(session.repl()).await;
-    let restarted = lease.take_restarted() && !reset;
+    let forgotten = lease.take_forgotten() && !reset;
     if reset {
         lease.keep(None);
     }
@@ -127,7 +126,7 @@ pub async fn run(
         .await;
     gateway.close_record().await;
     let notes: Vec<String> = [
-        restarted.then(|| RESTARTED_NOTE.to_owned()),
+        forgotten.then(|| GONE_NOTE.to_owned()),
         outcome.note.map(note_text),
     ]
     .into_iter()
@@ -1330,12 +1329,13 @@ mod tests {
         assert!(calls[0].output.is_some());
     }
 
-    /// Variables live only in memory, so a conversation that ran `mcp` in an earlier process says
-    /// once that they are gone, unless the run asked to start empty anyway.
-    #[test_case(true, false, Some(RESTARTED_NOTE) ; "a_resumed_conversation_says_its_variables_are_gone")]
+    /// Variables live only in memory, so a conversation that ran `mcp` under another agent, in an
+    /// earlier process or before a rewind or fork, says once that they are gone, unless the run
+    /// asked to start empty anyway.
+    #[test_case(true, false, Some(GONE_NOTE) ; "a_resumed_conversation_says_its_variables_are_gone")]
     #[test_case(true, true, None ; "a_reset_run_has_nothing_to_miss")]
     #[test_case(false, false, None ; "a_new_conversation_lost_nothing")]
-    fn only_the_first_run_after_a_restart_notes_the_lost_variables(
+    fn only_the_first_run_of_a_new_agent_notes_the_lost_variables(
         ran_before: bool,
         reset: bool,
         expected: Option<&str>,

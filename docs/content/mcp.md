@@ -140,7 +140,7 @@ Calls that ran before a failure keep their effects. When a run fails, the model 
 
 ### Variables between runs
 
-Variables that a run defines are still there in the next run of the same agent. The main agent and each subagent keep their own. They live in memory, up to 16 MiB. Past that they are dropped and the next run starts empty. They do not survive a restart of Caudra. The model can pass `reset: true` to start a run empty. When variables are lost, the result says so.
+Variables that a run defines are still there in the next run of the same agent. The main agent and each subagent keep their own. They live in memory, up to 16 MiB. Past that they are dropped and the next run starts empty. They do not survive a restart of Caudra, and a resumed, rewound, or forked conversation starts without them. The model can pass `reset: true` to start a run empty. When variables are lost, the result says so.
 
 ### Where snippets run
 
