@@ -240,7 +240,7 @@ futures-lite = "2"
 futures = "0.3"
 isahc = { version = "2.0", default-features = false, features = ["text-decoding", "static-curl", "rustls-tls", "http2"] }
 flate2 = "1"
-zstd = "0.13"
+zstd = "0.14.2"
 indicatif = "0.18"
 libc = "0.2"
 winapi-util = "0.1.11"
