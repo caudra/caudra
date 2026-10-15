@@ -61,6 +61,7 @@ GENERATED_ERROR = "generated section"
 PAGE_HEADING_ERROR = "### headings"
 WORKER_ACTION = WORKFLOWS.parent / "actions/code-worker/action.yml"
 MUSL_WORKER_ACTION = WORKFLOWS.parent / "actions/musl-worker/action.yml"
+CACHE_ACTION_VERSION = "v6.1.0"
 WORKER_CACHE_PATHS = (
     "target/code-worker/bin",
     "target/code-worker/symbols",
@@ -861,6 +862,8 @@ class ReleaseTests(unittest.TestCase):
 class ReleaseWorkflowTests(unittest.TestCase):
     def test_actions_use_node24_versions_and_ubuntu_is_pinned(self):
         versions = {
+            "actions/cache/restore": CACHE_ACTION_VERSION,
+            "actions/cache/save": CACHE_ACTION_VERSION,
             "actions/checkout": "v7",
             "dorny/paths-filter": "v4",
             "actions/upload-artifact": "v7",
@@ -869,7 +872,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "actions/setup-python": "v7",
             "nixbuild/nix-quick-install-action": "v35",
         }
-        for workflow in WORKFLOWS.glob("*.yml"):
+        for workflow in (
+            *WORKFLOWS.glob("*.yml"),
+            *WORKFLOWS.parent.glob("actions/**/action.yml"),
+        ):
             with self.subTest(workflow=workflow.name):
                 text = workflow.read_text()
                 self.assertNotRegex(
@@ -1288,10 +1294,12 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def test_native_worker_cache_is_shared_and_saved_before_workspace_cleanup(self):
         action = WORKER_ACTION.read_text()
         restore, validate_and_save = action.split("    - shell: bash\n", 1)
-        self.assertIn("uses: actions/cache/restore@v5", restore)
+        self.assertIn(f"uses: actions/cache/restore@{CACHE_ACTION_VERSION}", restore)
         self.assertNotIn("restore-keys:", restore)
         self.assertNotIn("if:", restore)
-        validate, save = validate_and_save.split("uses: actions/cache/save@v5", 1)
+        validate, save = validate_and_save.split(
+            f"uses: actions/cache/save@{CACHE_ACTION_VERSION}", 1
+        )
         self.assertIn("python3 scripts/build-code-worker.py", validate)
         self.assertIn("TIME_WORKER: ${{ inputs.timing }}", validate)
         self.assertIn(
@@ -1345,6 +1353,38 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("cache-on-failure: true", cache)
         self.assertNotIn("github.ref", cache)
 
+    def test_cache_pairs_preserve_save_conditions_and_release_permissions(self):
+        header, release = self.workflow("release")
+        self.assertIn("permissions:\n  contents: read\n", header)
+        self.assertIn('    tags:\n      - "v*"\n', header)
+        self.assertNotIn("pull_request", header)
+        self.assertIn(
+            "if: github.repository == 'caudra/caudra' && startsWith(github.ref, 'refs/tags/v')",
+            release["validate"],
+        )
+        for job in ("build-linux", "build-other"):
+            self.assertNotIn("permissions:", release[job])
+        for path in (WORKER_ACTION, MUSL_WORKER_ACTION, WORKFLOWS / "release.yml"):
+            with self.subTest(path=path):
+                text = path.read_text()
+                self.assertEqual(
+                    re.findall(r"uses: (actions/cache[^\s]*)", text),
+                    [
+                        f"actions/cache/restore@{CACHE_ACTION_VERSION}",
+                        f"actions/cache/save@{CACHE_ACTION_VERSION}",
+                    ],
+                )
+                save = text.split(
+                    f"uses: actions/cache/save@{CACHE_ACTION_VERSION}", 1
+                )[1]
+                condition = "steps.cache.outputs.cache-hit != 'true'"
+                if path == WORKFLOWS / "release.yml":
+                    condition = (
+                        "${{ !cancelled() && steps.cargo-cache.outputs.cache-primary-key != ''"
+                        " && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+                    )
+                self.assertEqual(save.splitlines()[1].strip(), f"if: {condition}")
+
     def test_release_layout_is_frozen_and_passed_to_all_artifacts(self):
         _, jobs = self.workflow("release")
         self.assertEqual(
@@ -1391,6 +1431,11 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('"$ALPINE_IMAGE" sh -c', body)
         self.assertIn("source-manifest-path", cache)
         self.assertIn("steps.identity.outputs.source", cache)
+        paths = re.findall(r"(?m)^        path: \|\n((?:          .+\n)+)", cache)
+        self.assertEqual(
+            [textwrap.dedent(block).splitlines() for block in paths],
+            [list(WORKER_CACHE_PATHS)] * 2,
+        )
         self.assertIn('worker["validate_version"](Path("Cargo.lock"))', cache)
         self.assertIn('python3 scripts/build-code-worker.py --target "$TARGET"', cache)
         self.assertNotIn("code-worker-build", cache)
@@ -1475,9 +1520,11 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def test_alpine_cache_contains_only_downloads_with_compatible_identity(self):
         _, release = self.workflow("release")
         linux = release["build-linux"]
-        restore = linux.split("uses: actions/cache/restore@v5", 1)[1]
+        restore = linux.split(f"uses: actions/cache/restore@{CACHE_ACTION_VERSION}", 1)[
+            1
+        ]
         restore = restore.split("\n      - ", 1)[0]
-        save = linux.split("uses: actions/cache/save@v5", 1)[1]
+        save = linux.split(f"uses: actions/cache/save@{CACHE_ACTION_VERSION}", 1)[1]
         save = save.split("\n      - ", 1)[0]
         for operation in (restore, save):
             self.assertEqual(
@@ -1504,7 +1551,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )
         self.assertLess(
             linux.index("Restore ownership after Alpine"),
-            linux.index("uses: actions/cache/save@v5"),
+            linux.index(f"uses: actions/cache/save@{CACHE_ACTION_VERSION}"),
         )
 
     @unittest.skipUnless(
