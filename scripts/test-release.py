@@ -867,6 +867,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "actions/download-artifact": "v8",
             "actions/create-github-app-token": "v3",
             "actions/setup-python": "v7",
+            "nixbuild/nix-quick-install-action": "v35",
         }
         for workflow in WORKFLOWS.glob("*.yml"):
             with self.subTest(workflow=workflow.name):
