@@ -3,7 +3,7 @@ use std::env;
 use std::io::{self, Read};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -52,7 +52,7 @@ struct JobMeta {
     on_error: Option<RegistryKey>,
     on_exit: Option<RegistryKey>,
     raw_chunks: bool,
-    event_rx: Option<flume::Receiver<JobEvent>>,
+    event_rx: Arc<Mutex<Option<flume::Receiver<JobEvent>>>>,
 }
 
 pub(crate) struct JobStore {
@@ -61,8 +61,7 @@ pub(crate) struct JobStore {
 }
 
 struct CheckedOutReceiver {
-    lua: Lua,
-    job_id: u32,
+    slot: Weak<Mutex<Option<flume::Receiver<JobEvent>>>>,
     raw_chunks: bool,
     receiver: Option<flume::Receiver<JobEvent>>,
 }
@@ -445,7 +444,7 @@ impl JobStore {
                 on_error,
                 on_exit,
                 raw_chunks,
-                event_rx: Some(event_rx),
+                event_rx: Arc::new(Mutex::new(Some(event_rx))),
             },
         );
 
@@ -466,32 +465,30 @@ impl JobStore {
         }
     }
 
-    pub fn take_receiver(
+    fn take_receiver(
         &mut self,
         job_id: u32,
         task_id: Option<u64>,
         plugin: &str,
-    ) -> Option<(flume::Receiver<JobEvent>, bool)> {
+    ) -> Option<CheckedOutReceiver> {
         let job = self.jobs.get_mut(&job_id)?;
         job.can_access(task_id, plugin).then(|| {
             job.event_rx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
                 .take()
-                .map(|receiver| (receiver, job.raw_chunks))
+                .map(|receiver| CheckedOutReceiver {
+                    slot: Arc::downgrade(&job.event_rx),
+                    raw_chunks: job.raw_chunks,
+                    receiver: Some(receiver),
+                })
         })?
-    }
-
-    pub fn restore_receiver(&mut self, job_id: u32, receiver: flume::Receiver<JobEvent>) {
-        if let Some(job) = self.jobs.get_mut(&job_id)
-            && job.event_rx.is_none()
-        {
-            job.event_rx = Some(receiver);
-        }
     }
 
     pub fn drain_events(&self, owner: &JobOwner, buf: &mut Vec<(u32, JobEvent)>) {
         buf.clear();
         for (&id, job) in self.jobs.iter().filter(|(_, job)| job.owner == *owner) {
-            if let Some(ref rx) = job.event_rx {
+            if let Some(ref rx) = *job.event_rx.lock().unwrap_or_else(|e| e.into_inner()) {
                 for _ in 0..JOB_EVENT_DRAIN_PER_JOB {
                     let Ok(event) = rx.try_recv() else {
                         break;
@@ -512,7 +509,7 @@ impl JobStore {
             .iter()
             .filter(|(_, job)| matches!(job.owner, JobOwner::Plugin(_)))
         {
-            if let Some(ref rx) = job.event_rx {
+            if let Some(ref rx) = *job.event_rx.lock().unwrap_or_else(|e| e.into_inner()) {
                 for _ in 0..JOB_EVENT_DRAIN_PER_JOB {
                     let Ok(event) = rx.try_recv() else {
                         break;
@@ -545,6 +542,8 @@ impl JobStore {
                 self.jobs
                     .get_mut(&id)?
                     .event_rx
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
                     .take()
                     .map(|receiver| (id, receiver))
             })
@@ -556,8 +555,13 @@ impl JobStore {
         self.jobs
             .values()
             .filter(|job| job.owner == *owner)
-            .filter_map(|job| job.event_rx.as_ref())
-            .map(flume::Receiver::len)
+            .map(|job| {
+                job.event_rx
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map_or(0, flume::Receiver::len)
+            })
             .sum()
     }
 
@@ -612,15 +616,6 @@ impl Drop for JobStore {
 }
 
 impl CheckedOutReceiver {
-    fn new(lua: &Lua, job_id: u32, receiver: flume::Receiver<JobEvent>, raw_chunks: bool) -> Self {
-        Self {
-            lua: lua.clone(),
-            job_id,
-            raw_chunks,
-            receiver: Some(receiver),
-        }
-    }
-
     fn get(&self) -> &flume::Receiver<JobEvent> {
         self.receiver.as_ref().expect("receiver is checked out")
     }
@@ -628,10 +623,11 @@ impl CheckedOutReceiver {
 
 impl Drop for CheckedOutReceiver {
     fn drop(&mut self) {
-        if let Some(receiver) = self.receiver.take() {
-            with_jobs(&self.lua, |store| {
-                store.restore_receiver(self.job_id, receiver);
-            });
+        if let Some(slot) = self.slot.upgrade() {
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.is_none() {
+                *slot = self.receiver.take();
+            }
         }
     }
 }
@@ -834,10 +830,8 @@ async fn jobwait(
     timeout_ms: Option<u64>,
 ) -> LuaResult<Value> {
     let task_id = active_task_id(&lua);
-    let (receiver, raw_chunks) =
-        with_jobs(&lua, |store| store.take_receiver(job_id, task_id, &plugin))
-            .ok_or_else(|| mlua::Error::runtime("unknown job id or already waited"))?;
-    let receiver = CheckedOutReceiver::new(&lua, job_id, receiver, raw_chunks);
+    let receiver = with_jobs(&lua, |store| store.take_receiver(job_id, task_id, &plugin))
+        .ok_or_else(|| mlua::Error::runtime("unknown job id or already waited"))?;
 
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
     let deadline = smol::Timer::after(timeout);
@@ -1042,6 +1036,55 @@ mod tests {
 
     const TEST_PLUGIN: &str = "test-plugin";
 
+    #[test_case::test_case(false ; "live_job")]
+    #[test_case::test_case(true ; "retired_job")]
+    fn abandoned_jobwait_receiver_is_released_during_gc(retire: bool) {
+        const JOB_ID: u32 = 1;
+        let lua = Lua::new();
+        let (tx, rx) = event_channel();
+        with_jobs(&lua, |store| {
+            store.jobs.insert(
+                JOB_ID,
+                JobMeta {
+                    owner: plugin_owner(),
+                    pid: u32::MAX,
+                    on_stdout: None,
+                    on_stderr: None,
+                    on_error: None,
+                    on_exit: None,
+                    raw_chunks: false,
+                    event_rx: Arc::new(Mutex::new(Some(rx))),
+                },
+            );
+        });
+        let wait = lua
+            .create_async_function(|lua, ()| jobwait(lua, Arc::from(TEST_PLUGIN), JOB_ID, None))
+            .unwrap();
+        let mut pending = lua
+            .create_thread(wait)
+            .unwrap()
+            .into_async::<Value>(())
+            .unwrap();
+        smol::block_on(async { assert!(futures::poll!(&mut pending).is_pending()) });
+        assert!(with_jobs(&lua, |store| store
+            .take_receiver(JOB_ID, None, TEST_PLUGIN)
+            .is_none()));
+        drop(pending);
+        if retire {
+            with_jobs(&lua, |store| store.finish(&lua, JOB_ID));
+        }
+        lua.gc_collect().unwrap();
+        lua.gc_collect().unwrap();
+        assert_eq!(tx.is_disconnected(), retire);
+        assert_eq!(
+            with_jobs(&lua, |store| store
+                .take_receiver(JOB_ID, None, TEST_PLUGIN)
+                .is_some()),
+            !retire,
+        );
+        with_jobs(&lua, |store| store.finish(&lua, JOB_ID));
+    }
+
     struct ScriptedReader {
         reads: VecDeque<io::Result<Vec<u8>>>,
     }
@@ -1234,7 +1277,7 @@ mod tests {
                     on_error: None,
                     on_exit: None,
                     raw_chunks: true,
-                    event_rx: Some(rx),
+                    event_rx: Arc::new(Mutex::new(Some(rx))),
                 },
             );
         }
@@ -1294,7 +1337,7 @@ mod tests {
                     on_error: None,
                     on_exit: None,
                     raw_chunks: true,
-                    event_rx: None,
+                    event_rx: Arc::default(),
                 },
             );
         });
@@ -1444,9 +1487,9 @@ mod tests {
 
         let id = start_echo(&mut store);
         assert!(!store.is_empty(&owner));
-        let (receiver, _) = store.take_receiver(id, Some(1), TEST_PLUGIN).unwrap();
+        let receiver = store.take_receiver(id, Some(1), TEST_PLUGIN).unwrap();
         while !matches!(
-            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            receiver.get().recv_timeout(Duration::from_secs(5)).unwrap(),
             JobEvent::Exit(_)
         ) {}
 
@@ -1472,11 +1515,13 @@ mod tests {
             store.take_receiver(id, Some(2), TEST_PLUGIN).is_none(),
             "another task must not access the job"
         );
-        assert!(store.take_receiver(id, Some(1), TEST_PLUGIN).is_some());
+        let receiver = store.take_receiver(id, Some(1), TEST_PLUGIN).unwrap();
         assert!(
             store.take_receiver(id, Some(1), TEST_PLUGIN).is_none(),
             "second take should fail (receiver already moved)"
         );
+        drop(receiver);
+        assert!(store.take_receiver(id, Some(1), TEST_PLUGIN).is_some());
     }
 
     #[test]
@@ -1595,12 +1640,12 @@ mod tests {
     fn take_receiver_delivers_events() {
         let mut store = make_store();
         let id = start_echo(&mut store);
-        let (rx, _) = store.take_receiver(id, Some(1), TEST_PLUGIN).unwrap();
+        let rx = store.take_receiver(id, Some(1), TEST_PLUGIN).unwrap();
 
         let mut got_exit = false;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            match rx.recv_timeout(Duration::from_millis(200)) {
+            match rx.get().recv_timeout(Duration::from_millis(200)) {
                 Ok(JobEvent::Exit(_)) => {
                     got_exit = true;
                     break;
@@ -1766,7 +1811,7 @@ mod tests {
                     on_error: None,
                     on_exit: Some(callback_key),
                     raw_chunks: false,
-                    event_rx: None,
+                    event_rx: Arc::default(),
                 },
             );
         });
@@ -1798,7 +1843,7 @@ mod tests {
                 on_error: None,
                 on_exit: None,
                 raw_chunks: false,
-                event_rx: None,
+                event_rx: Arc::default(),
             },
         );
         assert_eq!(Arc::strong_count(&capture), 2);

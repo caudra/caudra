@@ -1312,6 +1312,72 @@
       "inspected_ancestor_legal_paths": [
         "LICENSE.md"
       ]
+    },
+    {
+      "name": "mlua-sys",
+      "version": "0.13.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "1631cda17bd6486410ab751d91f5fd4484f441589278cdad879eb3afc721a285",
+      "declared_license": "MIT",
+      "repository": "https://github.com/mlua-rs/mlua",
+      "revision": "a186d461c7772aed4cb0a9fa1d1899121c6450e7",
+      "path_in_vcs": "mlua-sys",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "a186d461c7772aed4cb0a9fa1d1899121c6450e7"
+        },
+        "path_in_vcs": "mlua-sys"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "9324784115f0ea98e02a09d42127e8530a5134e7",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/mlua-sys-0.12.0/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "upstream_legal_blobs": {
+        "LICENSE": "66f2fa32dff88afeceb8d5f9e3093f6b9b604f98"
+      },
+      "notes": [
+        "Exact new archive and all extracted bytes match Cargo.lock; original manifest matches the recorded upstream Git blob. Ancestor legal files were fetched at the package revision and verified by Git blob SHA-1. Existing evidence is reused only when byte-identical to that exact revision."
+      ]
+    },
+    {
+      "name": "mlua_derive",
+      "version": "0.12.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "9c4070bd35dad9477c94311c4668145bae8991b8accacf7201a77b14cab8a9e3",
+      "declared_license": "MIT",
+      "repository": "https://github.com/mlua-rs/mlua",
+      "revision": "a186d461c7772aed4cb0a9fa1d1899121c6450e7",
+      "path_in_vcs": "mlua_derive",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "a186d461c7772aed4cb0a9fa1d1899121c6450e7"
+        },
+        "path_in_vcs": "mlua_derive"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "9c598b3e6918945992d2fad0cf761fb79e9edc17",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/mlua-sys-0.12.0/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "upstream_legal_blobs": {
+        "LICENSE": "66f2fa32dff88afeceb8d5f9e3093f6b9b604f98"
+      },
+      "notes": [
+        "Exact new archive and all extracted bytes match Cargo.lock; original manifest matches the recorded upstream Git blob. Ancestor legal files were fetched at the package revision and verified by Git blob SHA-1. Existing evidence is reused only when byte-identical to that exact revision."
+      ]
     }
   ]
 }

@@ -11,7 +11,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.10 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.10)
 
-This release improves shell-output filtering and Nix builds.
+This release fixes Lua plugin cleanup, improves shell-output filtering, and updates Nix builds.
 
 > **Important**
 >
@@ -19,6 +19,7 @@ This release improves shell-output filtering and Nix builds.
 
 ### Fixes
 
+- **Lua job cleanup survives cancellation and deadlines.** Releasing an abandoned `jobwait` during garbage collection no longer aborts the process, including when the plugin host shuts down.
 - **Shell output keeps unrelated subcommands intact.** Updated bundled filters no longer match commands merely because their names start with a filtered subcommand.
 
 ### Builds
