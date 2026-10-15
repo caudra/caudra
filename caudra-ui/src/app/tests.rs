@@ -16173,7 +16173,7 @@ fn fork_copies_execution_settings_but_resets_conversation_state() {
     assert!(child.meta.fast);
     assert_eq!(child.meta.system_prompt_profile.as_deref(), Some("review"));
     assert!(child.meta.structured_permission_rules.is_empty());
-    assert_eq!(child.meta.permission_mode, None);
+    assert_eq!(child.meta.permission_mode, Some(PermissionMode::Yolo));
     assert_eq!(child.token_usage, TokenUsage::default());
     assert!(child.usage_by_model().is_empty());
     assert!(child.meta.input_draft.is_none());
@@ -16182,6 +16182,72 @@ fn fork_copies_execution_settings_but_resets_conversation_state() {
     assert!(child.meta.active_goal.is_none());
     assert!(child.meta.goal_result.is_none());
     assert!(child.meta.pending_revert.is_none());
+}
+
+#[test_case(PermissionMode::Ask, Some(PermissionMode::Yolo), PermissionMode::Yolo, PermissionMode::Ask; "stored_yolo")]
+#[test_case(PermissionMode::Yolo, None, PermissionMode::Yolo, PermissionMode::Ask; "seed_yolo")]
+#[test_case(PermissionMode::Yolo, Some(PermissionMode::Ask), PermissionMode::Ask, PermissionMode::Yolo; "ask_overrides_yolo")]
+#[test_case(PermissionMode::Ask, None, PermissionMode::Ask, PermissionMode::Yolo; "seed_ask")]
+#[test_case(PermissionMode::Ask, Some(PermissionMode::Auto), PermissionMode::Auto, PermissionMode::Ask; "stored_auto")]
+#[test_case(PermissionMode::Auto, None, PermissionMode::Auto, PermissionMode::Ask; "seed_auto")]
+fn fork_permission_mode_survives_save_and_resume(
+    seed: PermissionMode,
+    stored: Option<PermissionMode>,
+    expected: PermissionMode,
+    destination_seed: PermissionMode,
+) {
+    let (_temp, dir, writer, mut app) = tempdir_app();
+    app.permissions.set_seed_mode(seed);
+    app.permissions.set_session_mode(stored.clone());
+    let record = conversation_permission_record();
+    app.permissions
+        .load_structured_conversation_rules(vec![record.clone()]);
+    let items = crate::history_items(&[
+        Message::user(RESUMED_PROMPT.into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: HANDOFF_PLAN_CONTENT.into(),
+            }],
+            ..Default::default()
+        },
+    ]);
+    let source = DisplaySource::AssistantText(items[1].id);
+    app.state.session_mut().replace_messages(items);
+    let parent_meta = serde_json::to_value(&app.state.session.meta).unwrap();
+
+    let forked = app.fork_at(source).unwrap();
+    assert_eq!(forked.session.meta.permission_mode, Some(expected.clone()));
+    assert!(forked.session.meta.structured_permission_rules.is_empty());
+    assert_eq!(app.permissions.mode(), expected);
+    assert_eq!(app.permissions.persisted_mode(), stored);
+    assert_eq!(
+        serde_json::to_value(&app.state.session.meta).unwrap(),
+        parent_meta
+    );
+    let rules = app.permissions.structured_conversation_rules_snapshot();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].id, record.id);
+    assert_eq!(rules[0].rule, record.rule);
+
+    let id = forked.session.id;
+    writer.save_sync(Arc::new(forked.session)).unwrap();
+    drain_writer(app, writer);
+    let saved = AppSession::load(id, &dir).unwrap();
+    assert_eq!(saved.meta.permission_mode, Some(expected.clone()));
+    let resumed_writer = Arc::new(test_writer(dir.clone()));
+    let mut resumed = build_app(dir, Arc::clone(&resumed_writer));
+    resumed.permissions.set_seed_mode(destination_seed);
+    resumed.state.session = Arc::new(saved);
+    resumed.restore_resumed_session();
+    assert_eq!(resumed.permissions.mode(), expected);
+    assert!(
+        resumed
+            .permissions
+            .structured_conversation_rules_snapshot()
+            .is_empty()
+    );
+    drain_writer(resumed, resumed_writer);
 }
 
 /// The text of the plan `target` names, read as `owner`, the session whose

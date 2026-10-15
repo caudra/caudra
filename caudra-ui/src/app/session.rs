@@ -1301,6 +1301,7 @@ impl App {
             mode: Some(self.state.mode.into()),
             thinking: Some(self.state.thinking.clone().into()),
             fast: self.state.fast,
+            permission_mode: Some(self.permissions.mode()),
             unrecorded: self.state.session.meta.unrecorded.clone(),
             record_coverage: self.state.session.meta.record_coverage.clone(),
             ..SessionMeta::default()

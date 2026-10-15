@@ -107,6 +107,7 @@ mod tests {
     use std::sync::Mutex;
 
     use caudra_storage::id::CaudraId;
+    use caudra_storage::sessions::PermissionMode;
     use caudra_terminal_host::workspaces::{HostLocation, HostPane, Located, Opened};
     use tempfile::TempDir;
     use test_case::test_case;
@@ -264,6 +265,7 @@ mod tests {
             let mut session = AppSession::new(MODEL, CWD);
             session.set_title(TITLE.into());
             session.meta.input_draft = Some(DRAFT.into());
+            session.meta.permission_mode = Some(PermissionMode::Yolo);
             let id = session.id;
             let lease = Arc::new(SessionLease::acquire(&self.storage, id).unwrap());
             let launch = open_in_host_tab(host, &self.writer, &self.storage, session, lease);
@@ -300,6 +302,7 @@ mod tests {
         let saved = load_app_session(id, &fixture.storage).unwrap();
         assert_eq!(saved.title, TITLE);
         assert_eq!(saved.meta.input_draft.as_deref(), Some(DRAFT));
+        assert_eq!(saved.meta.permission_mode, Some(PermissionMode::Yolo));
         assert!(!fixture.in_use(id), "the new tab's Caudra needs the lease");
     }
 
@@ -316,6 +319,7 @@ mod tests {
         };
         assert_eq!(tab.session.id, id);
         assert_eq!(tab.session.meta.input_draft.as_deref(), Some(DRAFT));
+        assert_eq!(tab.session.meta.permission_mode, Some(PermissionMode::Yolo));
         assert!(warning.contains(REFUSAL), "{warning}");
         assert!(fixture.in_use(id), "this process keeps the fork's lease");
         assert!(tab.lease.validate(&fixture.storage, id).is_ok());
