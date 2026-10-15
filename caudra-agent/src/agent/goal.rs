@@ -960,9 +960,24 @@ fn flatten_tool_blocks(messages: &mut [Message]) {
     });
 }
 
+/// Drops the agent's reasoning, and any turn that held nothing else. It is
+/// the agent's own working rather than evidence, and only the model that
+/// wrote it can replay it: an interrupted block carries no signature, and
+/// another model's or provider's block fails its check.
+fn strip_reasoning(messages: &mut Vec<Message>) {
+    messages.retain_mut(|message| {
+        let before = message.content.len();
+        message.content.retain(|block| !block.is_thinking());
+        message.content.len() == before
+            || message.is_empty_padding()
+            || !message.content.is_empty()
+    });
+}
+
 fn transcript_within_budget(history: &[Message], model: &Model, percent: u32) -> Vec<Message> {
     let mut messages = history.to_vec();
     // Before budgeting, so the estimate measures what is actually sent.
+    strip_reasoning(&mut messages);
     flatten_tool_blocks(&mut messages);
     let budget = model.context_window.saturating_mul(percent) / 100;
     let omitted = drop_oldest_rounds(&mut messages, |messages| {
@@ -1122,6 +1137,10 @@ mod tests {
     const RESULT_BODY: &str = "fn main() {}";
     const PROMPT: &str = "ship it";
     const THOUGHT: &str = "weighing the evidence";
+    const SIGNATURE: &str = "signed-by-the-chat-model";
+    const REDACTED_DATA: &str = "opaque";
+    const NO_REASONING: &str = "the evaluator must never receive the agent's reasoning";
+    const REASONING_ONLY_TURN_DROPPED: &str = "a turn that held only reasoning has nothing left";
     const IMAGE_DATA: &str = "aGk=";
     const ANSWER_JSON: &str = r#"{"ok":true,"reason":"tests pass","impossible":false}"#;
     const NO_TOOL_BLOCKS: &str = "flattening must leave no tool blocks behind";
@@ -1933,6 +1952,75 @@ mod tests {
                 .any(|message| block_text(message).contains(crate::UNAVAILABLE_RESULT)),
             "a dangling call has nothing left to close"
         );
+    }
+
+    fn has_reasoning(messages: &[Message]) -> bool {
+        messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(ContentBlock::is_thinking)
+    }
+
+    #[test_case(ContentBlock::Thinking {
+        thinking: THOUGHT.into(),
+        signature: None,
+        duration_ms: None,
+        interrupted: true,
+        responses: None,
+    } ; "unsigned_interrupted_thinking")]
+    #[test_case(ContentBlock::thinking(THOUGHT.into(), Some(SIGNATURE.into())) ; "signed_thinking")]
+    #[test_case(ContentBlock::RedactedThinking { data: REDACTED_DATA.into() } ; "redacted_thinking")]
+    fn reasoning_never_reaches_the_evaluator(reasoning: ContentBlock) {
+        let history = vec![
+            Message::user(PROMPT.into()),
+            assistant(vec![
+                reasoning.clone(),
+                ContentBlock::Text {
+                    text: VERIFIED.into(),
+                },
+            ]),
+            assistant(vec![reasoning]),
+            Message::user(OTHER_PROMPT.into()),
+        ];
+
+        let messages = transcript_within_budget(
+            &history,
+            &Model::from_spec(CHAT_SPEC).unwrap(),
+            INITIAL_TRANSCRIPT_PERCENT,
+        );
+
+        assert!(!has_reasoning(&messages), "{NO_REASONING}");
+        assert_eq!(
+            messages.len(),
+            history.len() - 1,
+            "{REASONING_ONLY_TURN_DROPPED}"
+        );
+        assert_eq!(block_text(&messages[1]), VERIFIED);
+    }
+
+    #[test]
+    fn padding_survives_losing_its_reasoning() {
+        let history = vec![
+            Message::user(PROMPT.into()),
+            Message {
+                padding: true,
+                ..assistant(vec![ContentBlock::thinking(
+                    THOUGHT.into(),
+                    Some(SIGNATURE.into()),
+                )])
+            },
+            Message::user(OTHER_PROMPT.into()),
+        ];
+
+        let messages = transcript_within_budget(
+            &history,
+            &Model::from_spec(CHAT_SPEC).unwrap(),
+            INITIAL_TRANSCRIPT_PERCENT,
+        );
+
+        assert!(!has_reasoning(&messages), "{NO_REASONING}");
+        assert_eq!(messages.len(), history.len());
+        assert!(messages[1].is_empty_padding());
     }
 
     #[test]
