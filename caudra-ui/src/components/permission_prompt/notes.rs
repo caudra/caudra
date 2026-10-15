@@ -19,6 +19,9 @@ const OUTSIDE_HOME: &str = "Outside your home directory";
 const OUTSIDE_PROJECT: &str = "Outside this project";
 const REMOTE_NOTE: &str = "Runs on a remote workspace";
 pub(super) const READ_ONLY_BADGE: &str = "read-only, as the server describes it";
+/// Every MCP tool is reached through code the `mcp` tool runs, so a request
+/// for one is a single call out of a snippet that may make many.
+pub(super) const FROM_MCP_SNIPPET: &str = "called from an mcp snippet";
 const WORKDIR_PREFIX: &str = "in ";
 const HOME_PREFIX: &str = "~";
 const READ_ONLY: &str = "read-only";
@@ -228,6 +231,9 @@ impl PermissionPrompt {
         };
         let project = request.presentation.project.as_deref();
         let mut context = Vec::new();
+        if request.tool.is_mcp() {
+            context.push(Note::muted(FROM_MCP_SNIPPET));
+        }
         if request.mcp.as_ref().is_some_and(|facts| facts.read_only) {
             context.push(Note::muted(READ_ONLY_BADGE));
         }
@@ -322,6 +328,27 @@ mod tests {
     const COMMAND: &str = "cargo test";
     const PROJECT: &str = "/project";
     const ESCALATION: &str = "the user must choose";
+    const MCP_TOOL: &str = "github.list_issues";
+
+    #[test_case(ToolKey::native(TOOL), false ; "a_built_in_tool")]
+    #[test_case(ToolKey::parse(MCP_TOOL).unwrap(), true ; "an_mcp_tool")]
+    fn an_mcp_call_says_it_came_from_a_snippet(tool: ToolKey, from_snippet: bool) {
+        let request = PermissionRequest::from_legacy(
+            REQUEST_ID.into(),
+            tool,
+            vec![COMMAND.into()],
+            serde_json::Value::Null,
+            Path::new(PROJECT),
+            true,
+        );
+        let mut prompt = PermissionPrompt::new();
+        prompt.enqueue(Box::new(request), None);
+
+        assert_eq!(
+            prompt.context().contains(&Note::muted(FROM_MCP_SNIPPET)),
+            from_snippet
+        );
+    }
 
     #[test_case(None ; "no_autopilot")]
     #[test_case(Some(AutopilotNote::Deciding) ; "deciding")]

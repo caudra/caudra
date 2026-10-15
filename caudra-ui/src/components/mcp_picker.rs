@@ -1,7 +1,13 @@
+use std::sync::Arc;
+
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
+use caudra_agent::context::{ContextMcpInventory, ContextMcpStatus, ContextSnapshot};
+use caudra_agent::mcp::code::naming::Names;
+use caudra_agent::mcp::code::runner as code_runner;
+use caudra_agent::mcp::code::view::{ServerState, ServerView};
 use caudra_agent::mcp::config::McpConfigSource;
 use caudra_agent::mcp::oauth::REFUSED_ACCESS;
 use caudra_agent::{
@@ -27,13 +33,23 @@ const INSTRUCTIONS_PREFIX: &str = "Instructions: ";
 /// Lines of a server's instructions the picker shows under it.
 const INSTRUCTIONS_PREVIEW_LINES: usize = 3;
 const NATIVE_ELICITATION_QUERY: &str = "elicitation_mode=native";
+const PASSTHROUGH_QUERY: &str = "mode=passthrough";
 const REFUSED_DETAIL: &str = "refused access \u{00b7} details below";
 const REFUSED_HEADING: &str = "Refused: ";
 const SWITCH_ACCOUNT_PREFIX: &str = "Run 'caudra mcp auth ";
 const SWITCH_ACCOUNT_SUFFIX: &str = "' to sign in with another account.";
 const EXECUTOR_NATIVE_HINT: &str = "Executor asks the model to approve its runs. Add ?elicitation_mode=native to the URL so Caudra asks you.";
+const EXECUTOR_PASSTHROUGH_HINT: &str = "Executor's own tool takes code, so the model writes Python that sends code to it. Add ?mode=passthrough to the URL for its plain tools.";
+/// Worded as `/tools` and `/context` word the same states.
+const VIA_MCP: &str = "via mcp";
+const SEARCH_ONLY: &str = "search-only";
+const NAMESPACE_INFIX: &str = " as ";
 
-fn build_entries(infos: &[McpServerInfo]) -> (Vec<McpEntry>, Vec<bool>, Vec<bool>) {
+fn build_entries(
+    infos: &[McpServerInfo],
+    tools: Option<&ContextMcpInventory>,
+) -> (Vec<McpEntry>, Vec<bool>, Vec<bool>) {
+    let names = namespaces(infos);
     let entries = infos
         .iter()
         .map(|info| {
@@ -62,7 +78,11 @@ fn build_entries(infos: &[McpServerInfo]) -> (Vec<McpEntry>, Vec<bool>, Vec<bool
                             .collect();
                         parts.push(info.transport_kind.to_string());
                         if info.tool_count > 0 {
-                            parts.push(format!("{} tools", info.tool_count));
+                            parts.push(tools_text(info, &names));
+                            let search_only = search_only_count(tools, &info.name);
+                            if search_only > 0 {
+                                parts.push(format!("{search_only} {SEARCH_ONLY}"));
+                            }
                         }
                         if info.prompt_count > 0 {
                             parts.push(format!("{} prompts", info.prompt_count));
@@ -105,6 +125,61 @@ fn build_entries(infos: &[McpServerInfo]) -> (Vec<McpEntry>, Vec<bool>, Vec<bool
     (entries, enabled, toggleable)
 }
 
+/// The namespaces an `mcp` snippet calls servers by. They follow only from which servers are
+/// enabled, so the picker names them as a session does without its tool lists.
+fn namespaces(infos: &[McpServerInfo]) -> Names {
+    let servers: Vec<ServerView> = infos
+        .iter()
+        .filter(|info| info.status != McpServerStatus::Disabled)
+        .map(|info| ServerView {
+            name: info.name.clone(),
+            title: None,
+            state: ServerState::Connected,
+            instructions: None,
+            tools: Vec::new(),
+            resources: false,
+        })
+        .collect();
+    Names::new(&servers)
+}
+
+/// How many tools the server has and that the model reaches them through the `mcp` tool, with
+/// the namespace to call when it is not the server's own name.
+fn tools_text(info: &McpServerInfo, names: &Names) -> String {
+    let mut text = format!("{} tools {VIA_MCP}", info.tool_count);
+    if let Some(namespace) = names
+        .namespace(&info.name)
+        .filter(|namespace| *namespace != info.name)
+    {
+        text.push_str(NAMESPACE_INFIX);
+        text.push_str(namespace);
+    }
+    text
+}
+
+/// The config errors, after the reason no `mcp` snippet can run when there is one, since that
+/// leaves every server unreachable.
+fn banner(code_unavailable: Option<String>, errors: &McpConfigErrors) -> Option<String> {
+    let parts: Vec<String> = [
+        code_unavailable,
+        (!errors.is_empty()).then(|| errors.to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(DETAIL_SEPARATOR))
+}
+
+fn search_only_count(tools: Option<&ContextMcpInventory>, server: &str) -> usize {
+    tools.map_or(0, |inventory| {
+        inventory
+            .tools
+            .iter()
+            .filter(|tool| tool.server == server && tool.status == ContextMcpStatus::SearchOnly)
+            .count()
+    })
+}
+
 pub enum McpPickerAction {
     Consumed,
     Toggle { server_name: String, enabled: bool },
@@ -145,6 +220,8 @@ pub struct McpPicker {
     picker: ListPicker<McpEntry>,
     reader: McpSnapshotReader,
     servers: Watch<McpSnapshot>,
+    /// The main agent's inventory, which says which server tools a profile makes search-only.
+    tools: Watch<ContextSnapshot>,
     config_errors: McpConfigErrors,
     pending_confirmation: Option<PendingConfirmation>,
 }
@@ -156,14 +233,16 @@ impl McpPicker {
             picker,
             reader,
             servers: Watch::default(),
+            tools: Watch::default(),
             config_errors,
             pending_confirmation: None,
         }
     }
 
-    pub fn open(&mut self) {
+    pub fn open(&mut self, tools: Option<Arc<ContextSnapshot>>) {
         self.pending_confirmation = None;
         let _ = self.servers.poll(self.reader.load_full());
+        let _ = self.tools.poll(tools);
         let (entries, enabled, toggleable) = self.entries();
         self.show_config_errors();
         self.picker
@@ -184,15 +263,15 @@ impl McpPicker {
     }
 
     fn show_config_errors(&mut self) {
-        let errors = (!self.config_errors.is_empty()).then(|| self.config_errors.to_string());
-        self.picker.set_error_text(errors);
+        self.picker
+            .set_error_text(banner(code_runner::unavailable(), &self.config_errors));
     }
 
-    pub fn refresh(&mut self) -> Dirty {
+    pub fn refresh(&mut self, tools: Option<Arc<ContextSnapshot>>) -> Dirty {
         if !self.picker.is_open() {
             return Dirty::NO;
         }
-        if self.servers.poll(self.reader.load_full()) == Dirty::NO {
+        if (self.servers.poll(self.reader.load_full()) | self.tools.poll(tools)) == Dirty::NO {
             return Dirty::NO;
         }
         let (entries, enabled, toggleable) = self.entries();
@@ -205,7 +284,12 @@ impl McpPicker {
     fn entries(&self) -> (Vec<McpEntry>, Vec<bool>, Vec<bool>) {
         self.servers
             .get()
-            .map(|s| build_entries(&s.infos))
+            .map(|s| {
+                build_entries(
+                    &s.infos,
+                    self.tools.get().map(|snapshot| &snapshot.inventory.mcp),
+                )
+            })
             .unwrap_or_default()
     }
 
@@ -401,8 +485,8 @@ fn review_text(info: &McpServerInfo) -> String {
 }
 
 /// What a running server said about itself: who it is, the protocol, the
-/// features it offers, the start of its instructions, and for Executor in
-/// model mode, how to have it ask the user instead.
+/// features it offers, the start of its instructions, and for Executor, the
+/// URL options that have it ask the user and offer its plain tools.
 fn running_text(info: &McpServerInfo) -> Option<String> {
     let discovery = info.discovery.as_ref()?;
     let server = &discovery.server_info;
@@ -450,12 +534,18 @@ fn running_text(info: &McpServerInfo) -> Option<String> {
         }
     }
 
-    let model_mode = info
-        .url
-        .as_deref()
-        .is_some_and(|url| !url.contains(NATIVE_ELICITATION_QUERY));
-    if info.kind == Some(McpServerKind::Executor) && model_mode {
-        lines.push(EXECUTOR_NATIVE_HINT.into());
+    if info.kind == Some(McpServerKind::Executor)
+        && let Some(url) = info.url.as_deref()
+    {
+        lines.extend(
+            [
+                (NATIVE_ELICITATION_QUERY, EXECUTOR_NATIVE_HINT),
+                (PASSTHROUGH_QUERY, EXECUTOR_PASSTHROUGH_HINT),
+            ]
+            .into_iter()
+            .filter(|(query, _)| !url.contains(query))
+            .map(|(_, hint)| hint.to_owned()),
+        );
     }
     Some(lines.join("\n"))
 }
@@ -576,10 +666,16 @@ mod tests {
     use crate::components::buffer_text;
     use crate::components::key;
     use crate::components::keybindings::key as kb;
+    use caudra_agent::AgentMode;
+    use caudra_agent::context::{
+        ContextInventory, ContextMcpTool, ContextModel, ContextReadiness, ContextReserve,
+        ContextUsage, ContextWindow,
+    };
     use caudra_agent::mcp::config::{McpReviewSummary, load_config};
     use caudra_agent::mcp::protocol::{
         ListCapability, ServerCapabilities, ServerDiscovery, ServerInfo,
     };
+    use caudra_agent::tools::ToolAudience;
     use caudra_agent::{McpServerInfo, McpSnapshot};
     use caudra_config::PROJECT_DIR;
     use caudra_config::mcp::MCP_FILE;
@@ -644,7 +740,7 @@ mod tests {
     #[test]
     fn toggle_returns_server_name_and_new_state() {
         let mut p = McpPicker::new(test_snapshot(), McpConfigErrors::new(PathBuf::new()));
-        p.open();
+        p.open(None);
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(matches!(
             action,
@@ -656,7 +752,7 @@ mod tests {
     #[test_case(kb::QUIT.to_key_event() ; "ctrl_c_closes")]
     fn close_keys(cancel_key: KeyEvent) {
         let mut p = McpPicker::new(test_snapshot(), McpConfigErrors::new(PathBuf::new()));
-        p.open();
+        p.open(None);
         let action = p.handle_key(cancel_key);
         assert!(matches!(action, McpPickerAction::Close));
         assert!(!p.is_open());
@@ -668,7 +764,7 @@ mod tests {
             McpSnapshotReader::empty(),
             McpConfigErrors::new(PathBuf::new()),
         );
-        p.open();
+        p.open(None);
         assert!(p.is_open());
     }
 
@@ -713,7 +809,7 @@ mod tests {
             McpConfigErrors::new(PathBuf::new()),
         );
         assert!(picker.has_awaiting_trust());
-        picker.open();
+        picker.open(None);
         assert!(matches!(
             picker.handle_key(key(KeyCode::Enter)),
             McpPickerAction::Consumed
@@ -726,7 +822,7 @@ mod tests {
             awaiting_trust_snapshot(),
             McpConfigErrors::new(PathBuf::new()),
         );
-        picker.open();
+        picker.open(None);
         assert!(picker.text_key(None));
         assert!(!picker.text_key(Some(key(KeyCode::Char('o')))));
         picker.handle_text("project", false);
@@ -743,7 +839,7 @@ mod tests {
             awaiting_trust_snapshot(),
             McpConfigErrors::new(PathBuf::new()),
         );
-        picker.open();
+        picker.open(None);
         assert!(matches!(
             picker.handle_key(key(KeyCode::Char(shortcut))),
             McpPickerAction::Consumed
@@ -765,7 +861,7 @@ mod tests {
             awaiting_trust_snapshot(),
             McpConfigErrors::new(PathBuf::new()),
         );
-        picker.open();
+        picker.open(None);
         assert!(matches!(
             picker.handle_key(key(KeyCode::Char('o'))),
             McpPickerAction::TrustOnce { server_name } if server_name == "project-server"
@@ -775,7 +871,7 @@ mod tests {
     #[test]
     fn awaiting_trust_review_is_safe_and_complete() {
         let snapshot = awaiting_trust_snapshot();
-        let (entries, _, _) = build_entries(&snapshot.load().infos);
+        let (entries, _, _) = build_entries(&snapshot.load().infos, None);
         let detail = entries[0].info_text.as_deref().unwrap();
         assert!(detail.contains("command:"));
         assert!(detail.contains("Config: project · /project/.caudra/config.toml"));
@@ -793,7 +889,7 @@ mod tests {
             awaiting_trust_snapshot(),
             McpConfigErrors::new(PathBuf::new()),
         );
-        picker.open();
+        picker.open(None);
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -830,7 +926,7 @@ mod tests {
         let errors = broken_config_errors();
         let expected = errors.to_string();
         let mut picker = McpPicker::new(McpSnapshotReader::empty(), no_errors());
-        picker.open();
+        picker.open(None);
 
         picker.set_config_errors(errors);
         assert_eq!(picker.picker.error_text(), Some(expected.as_str()));
@@ -839,20 +935,41 @@ mod tests {
         assert_eq!(picker.picker.error_text(), None);
     }
 
+    /// Without the code worker no server can be reached, so the banner says so first.
+    #[test]
+    fn the_banner_leads_with_a_missing_code_worker() {
+        const NO_WORKER: &str = "MCP code mode needs the code worker";
+        let broken = broken_config_errors();
+        assert_eq!(banner(None, &no_errors()), None);
+        assert_eq!(
+            banner(Some(NO_WORKER.to_owned()), &no_errors()).as_deref(),
+            Some(NO_WORKER)
+        );
+        assert_eq!(banner(None, &broken), Some(broken.to_string()));
+        let both = banner(Some(NO_WORKER.to_owned()), &broken).expect("banner");
+        assert!(
+            both.starts_with(NO_WORKER) && both.ends_with(&broken.to_string()),
+            "{both}"
+        );
+    }
+
     #[test]
     fn an_adopted_reader_reaches_an_open_picker_at_the_next_refresh() {
         let mut picker = McpPicker::new(McpSnapshotReader::empty(), no_errors());
-        picker.open();
+        picker.open(None);
 
         picker.set_reader(awaiting_trust_snapshot());
 
-        assert_eq!(picker.refresh(), Dirty::YES);
+        assert_eq!(picker.refresh(None), Dirty::YES);
         assert!(picker.has_awaiting_trust());
     }
 
     const SERVER_NAME: &str = "exec";
     const EXECUTOR_URL: &str = "https://mcp.executor.sh/mcp";
     const EXECUTOR_NATIVE_URL: &str = "https://mcp.executor.sh/mcp?elicitation_mode=native";
+    const EXECUTOR_PASSTHROUGH_URL: &str = "https://mcp.executor.sh/mcp?mode=passthrough";
+    const EXECUTOR_NATIVE_PASSTHROUGH_URL: &str =
+        "https://mcp.executor.sh/mcp?mode=passthrough&elicitation_mode=native";
     const SERVER_TITLE: &str = "Executor";
     const SERVER_VERSION: &str = "1.4.2";
     const PROTOCOL_VERSION: &str = "2025-11-25";
@@ -897,8 +1014,10 @@ mod tests {
 
     #[test]
     fn a_running_server_shows_what_it_said_about_itself() {
-        let (entries, _, _) =
-            build_entries(&[running(Some(McpServerKind::Executor), EXECUTOR_URL)]);
+        let (entries, _, _) = build_entries(
+            &[running(Some(McpServerKind::Executor), EXECUTOR_URL)],
+            None,
+        );
 
         assert!(
             entries[0]
@@ -920,18 +1039,177 @@ mod tests {
         assert!(!info.contains("Never more."));
     }
 
-    #[test_case(Some(McpServerKind::Executor), EXECUTOR_URL, true ; "executor_in_model_mode")]
-    #[test_case(Some(McpServerKind::Executor), EXECUTOR_NATIVE_URL, false ; "executor_in_native_mode")]
-    #[test_case(None, EXECUTOR_URL, false ; "unrecognised_server")]
-    fn executor_in_model_mode_is_told_how_to_ask_the_user(
+    #[test_case(Some(McpServerKind::Executor), EXECUTOR_URL, true, true ; "executor_by_default")]
+    #[test_case(Some(McpServerKind::Executor), EXECUTOR_NATIVE_URL, false, true ; "executor_in_native_mode")]
+    #[test_case(Some(McpServerKind::Executor), EXECUTOR_PASSTHROUGH_URL, true, false ; "executor_in_passthrough_mode")]
+    #[test_case(Some(McpServerKind::Executor), EXECUTOR_NATIVE_PASSTHROUGH_URL, false, false ; "executor_with_both_options")]
+    #[test_case(None, EXECUTOR_URL, false, false ; "unrecognised_server")]
+    fn executor_is_told_the_url_options_it_lacks(
         kind: Option<McpServerKind>,
         url: &str,
-        hinted: bool,
+        native_hinted: bool,
+        passthrough_hinted: bool,
     ) {
-        let (entries, _, _) = build_entries(&[running(kind, url)]);
+        let (entries, _, _) = build_entries(&[running(kind, url)], None);
 
         let info = entries[0].info_text.as_deref().unwrap();
-        assert_eq!(info.contains(EXECUTOR_NATIVE_HINT), hinted);
+        assert_eq!(info.contains(EXECUTOR_NATIVE_HINT), native_hinted);
+        assert_eq!(info.contains(EXECUTOR_PASSTHROUGH_HINT), passthrough_hinted);
+    }
+
+    const TOOL_COUNT: usize = 4;
+    const SEARCH_ONLY_COUNT: usize = 2;
+    const PLAIN_SERVER: &str = "linear";
+    const HYPHENATED_SERVER: &str = "git-hub";
+    const UNDERSCORED_SERVER: &str = "git_hub";
+    const SECOND_NAMESPACE: &str = "git_hub_2";
+    const RESERVED_SERVER: &str = "json";
+    const RESERVED_NAMESPACE: &str = "json_";
+    const OTHER_SERVER: &str = "other";
+
+    fn tools_part(namespace: Option<&str>) -> String {
+        let infix = namespace.map_or_else(String::new, |namespace| {
+            format!("{NAMESPACE_INFIX}{namespace}")
+        });
+        format!("{TOOL_COUNT} tools {VIA_MCP}{infix}")
+    }
+
+    fn search_only_part() -> String {
+        format!("{SEARCH_ONLY_COUNT} {SEARCH_ONLY}")
+    }
+
+    fn named(name: &str, status: McpServerStatus) -> McpServerInfo {
+        McpServerInfo {
+            name: name.into(),
+            tool_count: TOOL_COUNT,
+            status,
+            ..running(None, EXECUTOR_URL)
+        }
+    }
+
+    fn detail_parts(entry: &McpEntry) -> Vec<&str> {
+        entry.detail_text.split(DETAIL_SEPARATOR).collect()
+    }
+
+    #[test_case(PLAIN_SERVER, None ; "named_as_configured")]
+    #[test_case(HYPHENATED_SERVER, Some(UNDERSCORED_SERVER) ; "hyphen_becomes_underscore")]
+    #[test_case(RESERVED_SERVER, Some(RESERVED_NAMESPACE) ; "standard_module_gets_a_trailing_underscore")]
+    fn a_running_server_says_its_tools_are_called_through_mcp(name: &str, namespace: Option<&str>) {
+        let (entries, _, _) = build_entries(&[named(name, McpServerStatus::Running)], None);
+
+        assert!(
+            detail_parts(&entries[0]).contains(&tools_part(namespace).as_str()),
+            "{}",
+            entries[0].detail_text
+        );
+    }
+
+    #[test_case(McpServerStatus::Running, Some(SECOND_NAMESPACE) ; "both_enabled_take_turns")]
+    #[test_case(McpServerStatus::Disabled, None ; "a_disabled_server_takes_no_name")]
+    fn namespaces_follow_the_enabled_servers(hyphenated: McpServerStatus, namespace: Option<&str>) {
+        let (entries, _, _) = build_entries(
+            &[
+                named(HYPHENATED_SERVER, hyphenated),
+                named(UNDERSCORED_SERVER, McpServerStatus::Running),
+            ],
+            None,
+        );
+
+        assert!(
+            detail_parts(&entries[1]).contains(&tools_part(namespace).as_str()),
+            "{}",
+            entries[1].detail_text
+        );
+    }
+
+    fn mcp_tool(server: &str, status: ContextMcpStatus) -> ContextMcpTool {
+        ContextMcpTool {
+            qualified_name: format!("{server}.tool"),
+            server: server.into(),
+            status,
+            reason: None,
+        }
+    }
+
+    fn mcp_inventory() -> ContextMcpInventory {
+        ContextMcpInventory {
+            tools: vec![
+                mcp_tool(PLAIN_SERVER, ContextMcpStatus::Available),
+                mcp_tool(PLAIN_SERVER, ContextMcpStatus::SearchOnly),
+                mcp_tool(PLAIN_SERVER, ContextMcpStatus::SearchOnly),
+                mcp_tool(PLAIN_SERVER, ContextMcpStatus::Disabled),
+                mcp_tool(OTHER_SERVER, ContextMcpStatus::SearchOnly),
+            ],
+            request_tokens: 0,
+        }
+    }
+
+    #[test_case(Some(mcp_inventory()), true ; "counted_from_the_inventory")]
+    #[test_case(None, false ; "unmarked_without_an_inventory")]
+    fn search_only_tools_are_marked(inventory: Option<ContextMcpInventory>, marked: bool) {
+        let (entries, _, _) = build_entries(
+            &[named(PLAIN_SERVER, McpServerStatus::Running)],
+            inventory.as_ref(),
+        );
+
+        assert_eq!(
+            detail_parts(&entries[0]).contains(&search_only_part().as_str()),
+            marked,
+            "{}",
+            entries[0].detail_text
+        );
+    }
+
+    fn context_snapshot(mcp: ContextMcpInventory) -> Arc<ContextSnapshot> {
+        Arc::new(ContextSnapshot {
+            readiness: ContextReadiness::PreparedNextRequest,
+            mode: AgentMode::Build,
+            audience: ToolAudience::MAIN,
+            model: ContextModel {
+                spec: String::new(),
+                provider_display_name: String::new(),
+            },
+            window: ContextWindow {
+                tokens: 0,
+                reserve: ContextReserve::Disabled,
+            },
+            usage: ContextUsage::default(),
+            measured: None,
+            inventory: ContextInventory {
+                mcp,
+                ..ContextInventory::default()
+            },
+        })
+    }
+
+    #[test]
+    fn an_inventory_arriving_after_open_marks_search_only_tools_on_screen() {
+        let reader = McpSnapshotReader::from_snapshot(McpSnapshot {
+            infos: vec![named(PLAIN_SERVER, McpServerStatus::Running)],
+            ..McpSnapshot::default()
+        });
+        let mut picker = McpPicker::new(reader, no_errors());
+        picker.open(None);
+        let before = screen(&mut picker);
+        assert!(before.contains(&tools_part(None)), "{before}");
+        assert!(!before.contains(&search_only_part()), "{before}");
+
+        let snapshot = context_snapshot(mcp_inventory());
+        assert_eq!(picker.refresh(Some(Arc::clone(&snapshot))), Dirty::YES);
+        assert_eq!(picker.refresh(Some(snapshot)), Dirty::NO);
+
+        let after = screen(&mut picker);
+        assert!(after.contains(&search_only_part()), "{after}");
+    }
+
+    fn screen(picker: &mut McpPicker) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        buffer_text(terminal.backend().buffer())
     }
 
     const STEADY_PICKER_MSG: &str =
@@ -965,7 +1243,7 @@ mod tests {
             ..McpSnapshot::default()
         });
         let mut picker = McpPicker::new(reader, no_errors());
-        picker.open();
+        picker.open(None);
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         let first = drawn(&mut picker, &mut terminal);
 
@@ -985,7 +1263,7 @@ mod tests {
             ..running(Some(McpServerKind::HomeAssistant), EXECUTOR_URL)
         };
 
-        let (entries, enabled, toggleable) = build_entries(&[refused]);
+        let (entries, enabled, toggleable) = build_entries(&[refused], None);
 
         assert!(entries[0].detail_text.ends_with(REFUSED_DETAIL));
         let info = entries[0].info_text.as_deref().unwrap();

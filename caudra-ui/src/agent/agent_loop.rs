@@ -17,14 +17,14 @@ use caudra_agent::mcp::call::CallScope;
 use caudra_agent::mcp::config::McpServerStatus;
 use caudra_agent::mcp::elicitor::QuestionForms;
 use caudra_agent::mcp::resources::prompt_message;
-use caudra_agent::mcp::{McpHandle, McpRequestSnapshot, McpSession};
+use caudra_agent::mcp::{McpHandle, McpSession};
 use caudra_agent::memory::baseline::MemoryBaseline;
 use caudra_agent::memory::compactor::Pump;
 use caudra_agent::permissions::PermissionManager;
+use caudra_agent::prompt::ResolvedSlots;
 use caudra_agent::prompt::profile::{
     BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile, TaskProfileBindings,
 };
-use caudra_agent::prompt::{ResolvedSlots, running_mcp_instructions};
 use caudra_agent::template;
 use caudra_agent::template::Vars;
 use caudra_agent::tools::execution::{configure_tools, execution_slots};
@@ -146,14 +146,12 @@ impl ToolsPreviewSource {
                 Arc::clone(&self.profile),
                 ToolFilter::All.for_mcp_mode(mode),
             )
-            .request_snapshot()
         });
         let full_tools = request_tools_from(
             &self.registry,
             history,
             definitions.declared.clone(),
             definitions.deferred.clone(),
-            mcp.as_ref(),
         );
         let inventory = ContextInventory {
             builtins: BuiltinToolsInput {
@@ -323,7 +321,7 @@ impl AgentLoop {
                             .map(|profile| profile.tools().clone())
                             .unwrap_or_default(),
                     ),
-                    ToolFilter::All.for_mcp_mode(&mode.load()),
+                    ToolFilter::All,
                 )
         });
         let (history, history_restore_error) = match restored_history {
@@ -737,7 +735,6 @@ impl AgentLoop {
             effective_slot
                 .provider
                 .prompt_cache_ttl(&effective_slot.model),
-            self.mcp.as_ref().is_some_and(|mcp| mcp.connecting()),
             Instant::now(),
         );
         let instructions = current.and_then(|current| {
@@ -962,8 +959,8 @@ impl AgentLoop {
         ))
     }
 
-    /// Base tools only. MCP definitions are injected per request by
-    /// `Agent::request_tools`; baking them here would freeze the catalog.
+    /// Server tools never join the array: the `mcp` tool reaches them, and the
+    /// mode is judged per call, so the session keeps no mode ceiling.
     fn rebuild_tools(
         &mut self,
         model: &Model,
@@ -971,10 +968,7 @@ impl AgentLoop {
         thinking: &caudra_providers::ThinkingConfig,
     ) {
         self.mcp = self.mcp.take().map(|mcp| {
-            mcp.with_profile_policy(
-                Arc::new(self.profile_tool_policy()),
-                ToolFilter::All.for_mcp_mode(&self.mode.load()),
-            )
+            mcp.with_profile_policy(Arc::new(self.profile_tool_policy()), ToolFilter::All)
         });
         let definitions = self.build_tools(model, chat_model, thinking);
         self.tools = definitions.declared;
@@ -1073,9 +1067,9 @@ impl AgentLoop {
     }
 
     /// Fixes the prefix just built from the live configuration when `rebuild`,
-    /// and otherwise puts back the one already fixed. Leaves `tools`,
-    /// `deferred`, and MCP's pin on the prefix, and returns its system prompt,
-    /// the tools it retired, and the configuration notice the turn carries.
+    /// and otherwise puts back the one already fixed. Leaves `tools` and
+    /// `deferred` on the prefix, and returns its system prompt, the tools it
+    /// retired, and the configuration notice the turn carries.
     fn fix_surface(
         &mut self,
         system: String,
@@ -1086,7 +1080,6 @@ impl AgentLoop {
             system,
             std::mem::take(&mut self.tools),
             std::mem::take(&mut self.deferred),
-            self.mcp.as_ref(),
         );
         if rebuild {
             self.bound_profile.clone_from(&self.system_prompt_profile);
@@ -1100,8 +1093,6 @@ impl AgentLoop {
         );
         self.tools = settled.surface.tools.clone();
         self.deferred = settled.surface.deferred.clone();
-        let pinned = settled.surface.mcp.clone();
-        self.mcp = self.mcp.take().map(|mcp| mcp.pinned(pinned));
         (
             settled.surface.system.clone(),
             settled.retired,
@@ -1178,26 +1169,15 @@ impl AgentLoop {
     }
 
     /// The array a request actually carries. `self.tools` is the declared base, and a run
-    /// appends the deferred catalog and then MCP on top, so anything that has to match the live
-    /// array has to append them in that order. The loaded set comes from history, which is what
-    /// the agent seeds its own session from. A load that happens mid-turn is not reflected until
-    /// the next publish.
-    fn request_tools(&self, mcp: Option<&McpRequestSnapshot>) -> Value {
-        self.request_tools_from(self.tools.clone(), self.deferred.clone(), mcp)
-    }
-
-    fn request_tools_from(
-        &self,
-        tools: Value,
-        deferred: Vec<DeferredTool>,
-        mcp: Option<&McpRequestSnapshot>,
-    ) -> Value {
+    /// appends the deferred catalog on top, so anything that has to match the live array has to
+    /// append it too. The loaded set comes from history, which is what the agent seeds its own
+    /// session from. A load that happens mid-turn is not reflected until the next publish.
+    fn request_tools(&self) -> Value {
         request_tools_from(
             ToolRegistry::global(),
             self.history.as_slice(),
-            tools,
-            deferred,
-            mcp,
+            self.tools.clone(),
+            self.deferred.clone(),
         )
     }
 
@@ -1206,12 +1186,8 @@ impl AgentLoop {
         prompt_slots: &caudra_agent::prompt::ResolvedSlots,
         tool_filter: &ToolFilter,
     ) -> String {
-        let mcp_instructions = self
-            .mcp
-            .as_ref()
-            .and_then(|mcp| running_mcp_instructions(&mcp.reader().load()));
         let prompt_slots = execution_slots(
-            &prompt_slots.with_mcp_instructions(mcp_instructions),
+            prompt_slots,
             &self.config,
             self.background.is_some(),
             self.background.is_some(),
@@ -1232,20 +1208,18 @@ impl AgentLoop {
     /// run bound, so a `/btw` continues the same cached prefix and agrees with
     /// the environment reminder the transcript already carries for that model.
     fn publish_btw_prompt(&self, slot: &ModelSlot, system: &str, opts: RequestOptions) {
-        let mcp = self.mcp.as_ref().map(McpSession::request_snapshot);
         self.btw_prompt.store(Arc::new(BtwPrompt {
             provider: Arc::clone(&slot.provider),
             model: slot.model.clone(),
             system: system.to_owned(),
-            tools: self.request_tools(mcp.as_ref()),
+            tools: self.request_tools(),
             opts,
             profile: self.bound_profile.clone(),
         }));
     }
 
     fn publish_prepared_context(&self, slot: &ModelSlot) {
-        let mcp = self.mcp.as_ref().map(McpSession::request_snapshot);
-        let tools = self.request_tools(mcp.as_ref());
+        let tools = self.request_tools();
         let messages = agent::project_request(
             self.history.as_slice(),
             &tools,
@@ -1281,7 +1255,7 @@ impl AgentLoop {
                 deferral: BuiltinDeferral::resolve(&self.config, &slot.model),
                 deferred: &self.deferred,
             }),
-            mcp.as_ref(),
+            self.mcp.as_ref(),
         );
         self.context_publisher
             .publish(ContextSnapshot::capture(ContextCapture {
@@ -1328,17 +1302,13 @@ fn request_tools_from(
     history: &[Message],
     mut tools: Value,
     deferred: Vec<DeferredTool>,
-    mcp: Option<&McpRequestSnapshot>,
 ) -> Value {
-    let mut sections: Vec<String> =
+    let sections: Vec<String> =
         DeferralSession::new(deferred, deferral::loaded_tool_names(history))
             .request_snapshot()
             .extend_declared(&mut tools)
             .into_iter()
             .collect();
-    if let Some(mcp) = mcp {
-        sections.extend(mcp.extend_declared(&mut tools));
-    }
     deferral::push_unbound_catalog(
         &mut tools,
         &sections,
@@ -1428,7 +1398,7 @@ pub(super) mod tests {
     use caudra_agent::tools::profile_policy::{
         MODE_DISABLED, PLAN_REQUIRED, PROFILE_DISABLED, PROFILE_LOADING,
     };
-    use caudra_agent::tools::report::{REASON_CONFIG, REASON_PROFILE_LOADED};
+    use caudra_agent::tools::report::REASON_CONFIG;
     use caudra_agent::tools::{ToolEffect, ToolSource};
     use caudra_config::ProfileToolExposure;
     use caudra_providers::{ContentBlock, Role};
@@ -1585,26 +1555,20 @@ pub(super) mod tests {
         );
     }
 
-    #[test_case(AgentMode::Build, ProfileToolExposure::Eager, false, ContextMcpStatus::LoadedOrEager, PROFILE_LOADING; "eager_does_not_load_source")]
-    #[test_case(AgentMode::Build, ProfileToolExposure::Lazy, false, ContextMcpStatus::AvailableOnDemand, PROFILE_LOADING; "lazy_catalog")]
-    #[test_case(AgentMode::Build, ProfileToolExposure::Lazy, true, ContextMcpStatus::LoadedOrEager, REASON_PROFILE_LOADED; "loaded_lazy")]
-    #[test_case(AgentMode::Build, ProfileToolExposure::Disabled, true, ContextMcpStatus::Disabled, PROFILE_DISABLED; "profile_excludes_loaded")]
-    #[test_case(AgentMode::ReadOnly, ProfileToolExposure::Eager, true, ContextMcpStatus::Disabled, MODE_DISABLED; "read_only_excludes_eager")]
-    #[test_case(AgentMode::Plan(PLAN_PATH.into()), ProfileToolExposure::Lazy, true, ContextMcpStatus::Disabled, MODE_DISABLED; "local_plan_excludes_loaded")]
-    #[test_case(AgentMode::RemotePlan(PlanRef::new(PREVIEW_PLAN_REF).unwrap()), ProfileToolExposure::Eager, false, ContextMcpStatus::Disabled, MODE_DISABLED; "remote_plan_excludes_eager")]
-    fn tools_preview_narrows_mcp_without_changing_source_loads(
+    #[test_case(AgentMode::Build, ProfileToolExposure::Eager, ContextMcpStatus::Available, Some(PROFILE_LOADING); "eager")]
+    #[test_case(AgentMode::Build, ProfileToolExposure::Lazy, ContextMcpStatus::SearchOnly, Some(PROFILE_LOADING); "lazy_is_search_only")]
+    #[test_case(AgentMode::Build, ProfileToolExposure::Disabled, ContextMcpStatus::Disabled, Some(PROFILE_DISABLED); "profile_disables")]
+    #[test_case(AgentMode::ReadOnly, ProfileToolExposure::Eager, ContextMcpStatus::Disabled, Some(MODE_DISABLED); "read_only_disables_eager")]
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()), ProfileToolExposure::Lazy, ContextMcpStatus::Disabled, Some(MODE_DISABLED); "local_plan_disables_lazy")]
+    #[test_case(AgentMode::RemotePlan(PlanRef::new(PREVIEW_PLAN_REF).unwrap()), ProfileToolExposure::Eager, ContextMcpStatus::Disabled, Some(MODE_DISABLED); "remote_plan_disables_eager")]
+    fn tools_preview_reports_mcp_without_declaring_it(
         mode: AgentMode,
         exposure: ProfileToolExposure,
-        loaded: bool,
         expected: ContextMcpStatus,
-        reason: &'static str,
+        reason: Option<&'static str>,
     ) {
         let session = stub_session(&[(PREVIEW_MCP_TOOL, PREVIEW_MCP_DESCRIPTION)]);
-        if loaded {
-            assert!(session.mark_loaded(PREVIEW_MCP_TOOL));
-        }
-        let before = session.request_snapshot();
-        assert_eq!(before.tool_inventory()[0].deferred, !loaded);
+        let before = session.tool_inventory();
         let mut policy = ProfileToolPolicy::default();
         policy
             .overrides
@@ -1625,28 +1589,10 @@ pub(super) mod tests {
         assert_eq!(snapshot.inventory.mcp.tools.len(), 1);
         let tool = &snapshot.inventory.mcp.tools[0];
         assert_eq!(tool.qualified_name, PREVIEW_MCP_TOOL);
-        assert_eq!(tool.status, expected);
-        assert_eq!(tool.reason, Some(reason));
-        assert_eq!(
-            tool.request_tokens > 0,
-            expected == ContextMcpStatus::LoadedOrEager
-        );
-        assert_eq!(snapshot.usage.mcp_tools, tool.request_tokens);
-        assert_eq!(
-            snapshot.inventory.builtins.catalog_tokens > 0,
-            expected == ContextMcpStatus::AvailableOnDemand
-        );
-        assert_eq!(
-            snapshot.usage.system_tools,
-            snapshot.inventory.builtins.request_tokens()
-        );
-        let after = source.mcp.as_ref().unwrap().request_snapshot();
-        assert_eq!(after.tool_inventory(), before.tool_inventory());
-        let mut before_tools = json!([]);
-        let mut after_tools = json!([]);
-        before.extend_tools(&mut before_tools);
-        after.extend_tools(&mut after_tools);
-        assert_eq!(after_tools, before_tools);
+        assert_eq!((tool.status, tool.reason), (expected, reason));
+        assert_eq!(snapshot.usage.mcp_tools, 0);
+        assert_eq!(snapshot.inventory.builtins.catalog_tokens, 0);
+        assert_eq!(source.mcp.as_ref().unwrap().tool_inventory(), before);
     }
 
     #[test_case("", false, false, None, true, true; "peer_wake")]

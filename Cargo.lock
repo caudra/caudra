@@ -10404,8 +10404,11 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "test-case",
  "tokio",
  "tokio-util",
+ "tree-sitter",
+ "tree-sitter-python",
  "workcell-monty-worker",
  "workcell-tool-contract",
 ]

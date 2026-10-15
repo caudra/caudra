@@ -442,8 +442,8 @@ fn mcp_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>> {
     }
     for tool in &inventory.tools {
         let (glyph, state, style) = match tool.status {
-            ContextMcpStatus::LoadedOrEager => (DECLARED_GLYPH, "on", theme.tool_success),
-            ContextMcpStatus::AvailableOnDemand => (DEFERRED_GLYPH, "lazy", theme.tool_dim),
+            ContextMcpStatus::Available => (DECLARED_GLYPH, "via mcp", theme.tool_success),
+            ContextMcpStatus::SearchOnly => (DEFERRED_GLYPH, "search-only", theme.tool_dim),
             ContextMcpStatus::Disabled => (DISABLED_GLYPH, "off", theme.error),
         };
         let mut spans = vec![
@@ -452,8 +452,7 @@ fn mcp_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>> {
                 escape_terminal_controls(&tool.qualified_name),
                 theme.tool_path,
             ),
-            Span::styled(format!("  {state} \u{b7} "), style),
-            Span::raw(token_label(tool.request_tokens)),
+            Span::styled(format!("  {state}"), style),
             Span::styled(
                 format!(" \u{b7} {}", escape_terminal_controls(&tool.server)),
                 theme.status_dim,
@@ -747,7 +746,7 @@ mod tests {
                 },
                 mcp: ContextMcpInventory {
                     tools: mcp,
-                    unattributed_tokens: 0,
+                    request_tokens: 0,
                 },
                 ..ContextInventory::default()
             },
@@ -795,13 +794,11 @@ mod tests {
     fn an_mcp_tool_reports_its_server_and_state(reason: Option<&'static str>) {
         let out = rendered(Some(&snapshot(vec![ContextMcpTool {
             qualified_name: "issues.fetch".to_owned(),
-            wire_name: "mcp_issues_fetch".to_owned(),
             server: "issues".to_owned(),
-            status: ContextMcpStatus::AvailableOnDemand,
-            request_tokens: 0,
+            status: ContextMcpStatus::SearchOnly,
             reason,
         }])));
-        assert!(out.contains("issues.fetch  lazy · "), "{out}");
+        assert!(out.contains("issues.fetch  search-only · "), "{out}");
         assert!(out.contains("· issues"), "{out}");
         assert!(!out.contains(NO_MCP), "{out}");
         if let Some(reason) = reason {

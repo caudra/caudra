@@ -7,7 +7,8 @@
 //! has finished saying it.
 
 use crate::tools::{
-    IMAGE_GENERATE_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, relative_path,
+    IMAGE_GENERATE_TOOL_NAME, MCP_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME,
+    relative_path,
 };
 
 /// Wide enough for a path or a short command, short enough that a header row
@@ -87,6 +88,12 @@ const SCRIPT_TOOLS: &[ScriptTool] = &[
         names_row: true,
     },
     ScriptTool {
+        tool: MCP_TOOL_NAME,
+        language: "python",
+        key: "code",
+        names_row: true,
+    },
+    ScriptTool {
         tool: IMAGE_GENERATE_TOOL_NAME,
         language: "markdown",
         key: "prompt",
@@ -102,6 +109,7 @@ const SCRIPT_TOOLS: &[ScriptTool] = &[
 /// this scanner collapses into spaces.
 const NO_PREVIEW: &[&str] = &[
     "python_execution",
+    MCP_TOOL_NAME,
     "file_apply_patch",
     "batch",
     "todo_write",

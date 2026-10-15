@@ -43,6 +43,42 @@ pub(crate) fn render(object: &MontyObject) -> (Value, Option<String>) {
     (rendered.json, repr)
 }
 
+/// Converts a value crossing to the host, or `None` when expanding it would exceed the budget.
+pub(crate) fn to_json(object: &MontyObject) -> Option<Value> {
+    within_render_budget(object).then(|| render_inner(object.as_ref(), 0).json)
+}
+
+/// Converts a host value for the sandbox. Nesting past the render depth crosses as its JSON text,
+/// which the sandbox can still parse with `json.loads`.
+pub(crate) fn from_json(value: &Value) -> MontyObject {
+    from_json_at(value, 0)
+}
+
+fn from_json_at(value: &Value, depth: usize) -> MontyObject {
+    if depth >= MAX_RENDER_DEPTH && (value.is_array() || value.is_object()) {
+        return MontyObject::string(value.to_string());
+    }
+    match value {
+        Value::Null => MontyObject::none(),
+        Value::Bool(flag) => MontyObject::bool(*flag),
+        Value::Number(number) => number
+            .as_i64()
+            .map(MontyObject::int)
+            .or_else(|| number.as_f64().map(MontyObject::float))
+            .unwrap_or_else(|| MontyObject::string(number.to_string())),
+        Value::String(text) => MontyObject::string(text.clone()),
+        Value::Array(items) => {
+            MontyObject::list(items.iter().map(|item| from_json_at(item, depth + 1)))
+        }
+        Value::Object(map) => MontyObject::dict(map.iter().map(|(key, item)| {
+            (
+                MontyObject::string(key.clone()),
+                from_json_at(item, depth + 1),
+            )
+        })),
+    }
+}
+
 fn within_render_budget(object: &MontyObject) -> bool {
     let (graph, root) = graph_parts(object);
     let mut costs = Vec::<usize>::with_capacity(graph.len());
@@ -329,6 +365,30 @@ mod tests {
         let (json, repr) = render(&value);
         assert_eq!(json, serde_json::json!([[1, 1], [1, 1]]));
         assert_eq!(repr.as_deref(), Some("[(1, 1), (1, 1)]"));
+    }
+
+    #[test]
+    fn host_json_round_trips_through_the_sandbox_form() {
+        let value = serde_json::json!({"n": 1, "f": 1.5, "s": "x", "l": [true, null], "o": {}});
+        assert_eq!(to_json(&from_json(&value)), Some(value));
+    }
+
+    #[test]
+    fn host_json_past_the_depth_cap_crosses_as_text() {
+        let mut value = serde_json::json!(1);
+        for _ in 0..(MAX_RENDER_DEPTH + 2) {
+            value = serde_json::json!([value]);
+        }
+        let mut object = from_json(&value);
+        for _ in 0..MAX_RENDER_DEPTH {
+            object = object.as_ref().items().expect("list")[0].to_owned();
+        }
+        assert!(
+            object
+                .as_ref()
+                .as_str()
+                .is_some_and(|text| text.starts_with('['))
+        );
     }
 
     #[test]

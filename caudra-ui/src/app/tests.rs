@@ -4628,6 +4628,89 @@ fn delegation_msg(delegations: Vec<caudra_agent::Delegation>) -> Msg {
     })
 }
 
+/// Each server call a snippet made lands in `/tools` under its own name, beside
+/// the `mcp` run that made it, and costs the context window nothing.
+#[test]
+fn an_mcp_run_counts_each_server_call_it_made() {
+    use caudra_agent::mcp::code::output::{
+        CALL_SOURCE, McpCodeCall, McpCodeCallStatus, McpCodeOutput,
+    };
+    use caudra_agent::tools::{MCP_TOOL_NAME, ToolFailure};
+    use caudra_storage::tool_ledger::ToolOutcome;
+
+    const SERVER: &str = "github";
+    const LISTED: &str = "list_issues";
+    const CREATED: &str = "create_issue";
+    const RUN_SOURCE: &str = "native";
+    const LISTED_MS: u64 = 40;
+
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let call = |tool: &str, status, failure, duration_ms| McpCodeCall {
+        server: SERVER.into(),
+        tool: tool.into(),
+        status,
+        failure,
+        duration_ms,
+        ..McpCodeCall::default()
+    };
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        id: "t1".into(),
+        tool: MCP_TOOL_NAME.into(),
+        output: ToolOutput::McpCode(McpCodeOutput {
+            calls: vec![
+                call(LISTED, McpCodeCallStatus::Success, None, LISTED_MS),
+                call(
+                    CREATED,
+                    McpCodeCallStatus::Refused,
+                    Some(ToolFailure::Denied),
+                    0,
+                ),
+            ],
+            ..McpCodeOutput::default()
+        }),
+        accounting: ToolAccounting {
+            source: Some(RUN_SOURCE.into()),
+            outcome: Some(ToolOutcome::Ok),
+            ..ToolAccounting::default()
+        },
+        is_error: false,
+        ..ToolDoneEvent::error("t1".into(), String::new())
+    }))));
+
+    let rows: Vec<_> = app
+        .state
+        .session
+        .tool_usage()
+        .iter()
+        .map(|row| {
+            (
+                row.tool.as_str(),
+                row.source.as_str(),
+                row.outcome,
+                row.duration_ms,
+                row.tokens,
+            )
+        })
+        .collect();
+    assert!(
+        rows.iter()
+            .any(|(tool, source, ..)| *tool == MCP_TOOL_NAME && *source == RUN_SOURCE),
+        "{rows:?}"
+    );
+    let listed = format!("{SERVER}.{LISTED}");
+    let created = format!("{SERVER}.{CREATED}");
+    assert!(
+        rows.contains(&(listed.as_str(), CALL_SOURCE, ToolOutcome::Ok, LISTED_MS, 0)),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&(created.as_str(), CALL_SOURCE, ToolOutcome::Denied, 0, 0)),
+        "{rows:?}"
+    );
+}
+
 fn tool_done_msg(id: &str) -> Msg {
     agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: id.into(),
@@ -17054,7 +17137,7 @@ fn deferred_permission_config_trust_does_not_close_a_manual_mcp_picker() {
         McpSnapshotReader::empty(),
         McpConfigErrors::new(PathBuf::new()),
     );
-    app.mcp_picker.open();
+    app.mcp_picker.open(None);
 
     let _ = app.tick();
 
@@ -21826,7 +21909,7 @@ fn open_permission_test_leader(app: &mut App) {
 #[test_case(open_relocation_picker; "relocation_picker")]
 #[test_case(open_permission_test_editor; "paste_editor")]
 #[test_case(open_permission_test_leader; "leader")]
-#[test_case(|app| app.mcp_picker.open(); "mcp_picker")]
+#[test_case(|app| app.mcp_picker.open(None); "mcp_picker")]
 #[test_case(|app| { app.execute_command(cmd("/permissions"), 0); app.finish_permission_jobs(); }; "permissions_picker")]
 fn permission_ownership_survives_overlays_before_and_after_arrival(open: fn(&mut App)) {
     for workbench in [false, true] {

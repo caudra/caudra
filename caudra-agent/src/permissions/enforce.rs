@@ -131,8 +131,8 @@ pub(super) fn exact_local_plan_write(
 ///
 /// The tools in [`TRUSTED_UNSCOPED_TOOLS`] are the exception, because for them
 /// the empty list is the true answer rather than a missing one: `python_execution`
-/// runs isolated with no filesystem, network or subprocess, and `batch`, `task`
-/// and `workflow` reach the manager again for every inner call. Denying those
+/// runs isolated with no filesystem, network or subprocess, and `batch`, `task`,
+/// `mcp` and `workflow` reach the manager again for every inner call. Denying those
 /// leaves the tool unusable and teaches the model nothing, so the request goes
 /// on to be evaluated as the unscoped call it is. Evaluation still runs, so a
 /// deny rule aimed at one of these tools keeps blocking it.

@@ -70,7 +70,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "plan",
             "memory",
             "skill",
-            "mcp_resource",
+            "mcp",
         ],
     ),
     ("Media", &["image_generate"]),
@@ -153,7 +153,8 @@ fn write_on_demand_section(out: &mut String) {
          `tool_search` entry instead, and one call with a query loads the matching tools for the \
          rest of the session. Sessions that never need them never pay for their descriptions. \
          An explicit profile policy can make other native, local or remote Workcell, Lua/plugin, \
-         local callback, or MCP tools lazy too. \
+         or local callback tools lazy too. A lazy MCP tool stays out of the \
+         [server list](/docs/mcp/#code-mode) and is found with `search()` inside `mcp`. \
          A known-name direct call to an eligible lazy tool is valid and loads its schema. \
          `tool_search` disappears when no eligible pending tools remain."
     )
@@ -359,8 +360,9 @@ fn tool_notes(name: &str) -> &'static [&'static str] {
             "A directory search skips the `.git`, `.ssh`, and `.workcell` directories below it and these credential files, in any letter case: `.env` and `.env.*`, `.npmrc`, `.pypirc`, `.netrc`, files ending in `.key`, and the SSH private keys `id_rsa`, `id_dsa`, `id_ecdsa`, and `id_ed25519`. Naming one of these files by its path still reaches it, subject to [permissions](/docs/permissions/).",
         ],
         "view_image" => &["Only models that accept images are offered `view_image`."],
-        "mcp_resource" => &[
-            "Offered only while a running [MCP server](/docs/mcp/#resources) declares resources. Each call asks first, and the prompt can allow every read from that server for the conversation, the project, or everywhere.",
+        "mcp" => &[
+            "Offered while at least one [MCP server](/docs/mcp/#code-mode) is enabled, whether or not it has connected. The servers and their tools reach the model in a `# MCP servers` reminder, so a server connecting or changing its tools never changes the tool definitions.",
+            "Snippets run on this machine in the bundled Monty worker, even when the session uses a remote Workcell. Variables persist between runs of the same agent, in memory only. Each server call a snippet makes goes through [permissions](/docs/permissions/#mcp-tool-calls) on its own, and reading a resource asks first.",
         ],
         "shell" => &[
             "`agent.shell_execution` selects `sync`, `auto`, or `async` independently of task execution. In `auto`, a validated requested timeout above `agent.shell_async_threshold_secs` returns an admission receipt. The default threshold is 120 seconds. This is not elapsed-time promotion and never extends the hard execution deadline. Shell has no per-call `background` argument. See [execution policies](/docs/sessions/#execution-policies) for frontend support and child-owned command results.",

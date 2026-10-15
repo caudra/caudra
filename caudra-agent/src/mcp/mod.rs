@@ -16,6 +16,7 @@
 //! snapshot, so the "only `run` publishes" invariant is enforced by the type system.
 
 pub mod call;
+pub mod code;
 pub mod config;
 pub mod elicitation;
 pub mod elicitor;
@@ -42,7 +43,6 @@ use std::time::Duration;
 
 use crate::tools::{ToolContext, ToolFilter};
 use arc_swap::{ArcSwap, Guard};
-use caudra_config::mcp::DEFAULT_DEFER_TOOLS;
 use caudra_config::{ProfileToolExposure, ProfileToolPolicy, ProfileToolSource};
 use caudra_providers::{ContentBlock, Message};
 use caudra_storage::StateDir;
@@ -52,6 +52,8 @@ use smol::Timer;
 use tracing::{info, warn};
 
 use self::call::{CallScope, Elicitor};
+use self::code::runner::{ReplSlot, SharedRepl};
+use self::code::view::{ServerState, ServerView, ToolView, cut_instructions};
 use self::config::{
     LocalExecutionPolicy, McpConfig, McpConfigErrors, McpConfigSource, McpReviewSummary,
     McpServerInfo, McpServerStatus, OauthClientConfig, RawServerConfig, RawTransport, ServerConfig,
@@ -70,33 +72,22 @@ use self::resources::{
 };
 use self::stdio::StdioTransport;
 use self::transport::McpTransport;
-use crate::decisions::{DecisionContext, Decisions, NoteDraft};
 use crate::permissions::{PermissionSubject, canonical_json_sha256};
-use crate::tools::deferral::{SearchOutcome, ToolSearchRanking, rank_tool_search};
+use crate::tools::MCP_TOOL_NAME;
 use crate::tools::profile_policy::{
     CEILING_DISABLED, MODE_DISABLED, PROFILE_DISABLED, PROFILE_LOADING,
 };
-use crate::tools::report::{REASON_CONFIG, REASON_PROFILE_LOADED};
-use crate::tools::schema::sanitize_tool_input_schema;
+use crate::tools::report::REASON_CONFIG;
 
 const SEPARATOR: &str = ".";
 pub(super) const WIRE_SEPARATOR: &str = "__";
 pub const UNKNOWN_MCP: &str = "unknown_mcp";
-/// Loads per search are capped so one broad query can't flood the context.
-const MAX_SEARCH_LOADS: usize = 5;
-const NAME_HIT_SCORE: usize = 2;
-const DESCRIPTION_HIT_SCORE: usize = 1;
-/// Overflow names shown to the model so it can re-search by exact name.
-const MAX_OVERFLOW_NAMES: usize = 20;
-const SEARCH_NO_MATCH: &str = "No deferred MCP tools matched";
-const SEARCH_OVERFLOW_PREFIX: &str = "Also matched but not loaded: ";
 const STARTUP_EPOCH: u64 = 0;
 /// How long a server's list changes settle before it is listed again, so a
 /// burst of them costs one listing.
 pub const LIST_CHANGE_DEBOUNCE: Duration = Duration::from_millis(500);
 const SCHEMA_REF_KEY: &str = "$ref";
 const LOCAL_REF_PREFIX: char = '#';
-pub(crate) use crate::tools::deferral::SEARCH_EMPTY_QUERY;
 
 /// Convert internal qualified name (`server.tool`) to wire format (`server__tool`)
 /// for LLM provider APIs that reject dots in tool names.
@@ -470,28 +461,11 @@ impl ToolIndex {
     }
 }
 
-/// One published MCP tool. Wire name and search text are derived from
-/// `definition` on demand: searches are model-paced and rare, so nothing
-/// to cache.
+/// One published MCP tool, as code mode presents it.
 struct ToolDescriptor {
     qualified_name: Arc<str>,
-    always_load: bool,
-    definition: Value,
-}
-
-impl ToolDescriptor {
-    fn wire_name(&self) -> &str {
-        self.definition["name"].as_str().unwrap_or_default()
-    }
-
-    fn matches_exactly(&self, query: &str) -> bool {
-        self.wire_name().eq_ignore_ascii_case(query)
-            || self.qualified_name.eq_ignore_ascii_case(query)
-            || self
-                .qualified_name
-                .split_once(SEPARATOR)
-                .is_some_and(|(_, raw)| raw.eq_ignore_ascii_case(query))
-    }
+    server: String,
+    view: ToolView,
 }
 
 #[derive(Clone)]
@@ -654,14 +628,14 @@ pub enum CompletionTarget {
     },
 }
 
-/// How one MCP tool would reach the model on the next request.
+/// How one MCP tool reaches the model: listed in the `# MCP servers` reminder, found only
+/// through `search()`, or not at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpToolStatus {
     pub qualified_name: String,
-    pub wire_name: String,
     pub server: String,
     pub disabled: bool,
-    pub deferred: bool,
+    pub search_only: bool,
     pub reason: Option<&'static str>,
 }
 
@@ -790,88 +764,27 @@ pub struct McpHandle {
     cmd_tx: flume::Sender<McpCommand>,
     index: Arc<ArcSwap<ToolIndex>>,
     snapshot: Arc<ArcSwap<McpSnapshot>>,
-    /// Never changes after startup, so it lives here instead of being
-    /// copied into every republished `ToolIndex`.
-    defer_tools: usize,
     /// Nothing is ever sent on it. `run` drops the sender once the first
     /// connect pass has published, and that disconnect is the signal.
     ready_rx: flume::Receiver<Infallible>,
 }
 
-/// One session's view of MCP: the shared handle plus the deferred tools
-/// this session loaded. Loads are per session, so a subagent's searches
-/// never bloat the parent's context.
-///
-/// `McpRequestSnapshot::extend_tools` output must never be stored: recompute it every request
-/// or the `tool_search` catalog goes stale.
+/// One agent's view of MCP: the shared handle, the policy that decides which tools this agent
+/// may reach, and the variables its `mcp` runs keep, so a subagent's never mix with its parent's.
 #[derive(Clone)]
 pub struct McpSession {
     handle: McpHandle,
-    loaded: Arc<Mutex<HashSet<Arc<str>>>>,
     /// The MCP-qualified entries of config's `disabled_tools`. Held here rather
-    /// than in `ToolFilter` because MCP definitions are appended after the
-    /// registry filter has already run.
+    /// than in `ToolFilter` because MCP tools never pass through the registry.
     disabled: Arc<[String]>,
     profile: Arc<ProfileToolPolicy>,
     ceiling: ToolFilter,
     inherited_profiles: Vec<Arc<ProfileToolPolicy>>,
-    /// What requests declare and searches load from while the conversation's
-    /// tool array is fixed. Calls always bind against the live index, so a
-    /// tool that left since fails rather than reaching a stale server.
-    pinned: Option<PinnedMcpTools>,
     /// How the front end asks the user what a server wants to know; `None`
     /// declines every such request.
     elicitors: Option<Arc<dyn ElicitorFactory>>,
-}
-
-/// The MCP tools a conversation's fixed tool array was built from, with the
-/// policy that chose which of them it declares and which it defers, so a
-/// `disabled_tools` or profile edit changes no declaration until the array
-/// is rebuilt. The default pins none, for an array fixed before any manager
-/// ran.
-#[derive(Clone, Default)]
-pub struct PinnedMcpTools {
-    index: Arc<ToolIndex>,
-    disabled: Arc<[String]>,
-    profile: Arc<ProfileToolPolicy>,
-    ceiling: ToolFilter,
-    inherited_profiles: Vec<Arc<ProfileToolPolicy>>,
-}
-
-/// Immutable MCP state used to assemble and account for one model request.
-pub struct McpRequestSnapshot {
-    index: Arc<ToolIndex>,
-    loaded: HashSet<Arc<str>>,
-    disabled: Arc<[String]>,
-    profile: Arc<ProfileToolPolicy>,
-    ceiling: ToolFilter,
-    inherited_profiles: Vec<Arc<ProfileToolPolicy>>,
-    defer_tools: usize,
-}
-
-pub struct PreparedMcpSearch<'a> {
-    session: &'a McpSession,
-    query: &'a str,
-    declaring: McpRequestSnapshot,
-    ranking: Result<ToolSearchRanking, Option<NoteDraft>>,
-}
-
-impl PreparedMcpSearch<'_> {
-    pub fn commit(self) -> Result<SearchOutcome, String> {
-        let matches = self.session.search_matches(&self.declaring, self.query)?;
-        if !Arc::ptr_eq(&self.declaring.index, &self.session.declared_index()) {
-            return self.session.search_tools(self.query);
-        }
-        Ok(match self.ranking {
-            Ok(ranking) => self
-                .session
-                .load_search_matches(self.query, matches, Some(ranking)),
-            Err(note) => SearchOutcome {
-                note,
-                ..self.session.load_search_matches(self.query, matches, None)
-            },
-        })
-    }
+    /// Held for the whole of a run, so one agent's runs never interleave.
+    repl: SharedRepl,
 }
 
 impl std::ops::Deref for McpSession {
@@ -882,29 +795,17 @@ impl std::ops::Deref for McpSession {
 }
 
 impl McpSession {
-    /// `history` seeds the loaded set when resuming: tools the model was
-    /// already calling stay declared across restarts. A pure string scan,
-    /// so it is safe before servers connect, and unknown names are inert.
+    /// `history` says whether the conversation ran `mcp` before: if it did, the variables those
+    /// runs kept died with the process that ran them, and the next run says so.
     pub fn new(handle: McpHandle, history: &[Message]) -> Self {
-        let loaded = history
-            .iter()
-            .flat_map(|m| &m.content)
-            .filter_map(|block| match block {
-                ContentBlock::ToolUse { name, .. } if name.contains(WIRE_SEPARATOR) => {
-                    Some(internal_tool_name(name).into())
-                }
-                _ => None,
-            })
-            .collect();
         Self {
             handle,
-            loaded: Arc::new(Mutex::new(loaded)),
             disabled: Arc::from([]),
             profile: Arc::default(),
             ceiling: ToolFilter::All,
             inherited_profiles: Vec::new(),
-            pinned: None,
             elicitors: None,
+            repl: repl_for(history),
         }
     }
 
@@ -916,48 +817,6 @@ impl McpSession {
     /// Who answers the servers during a call made under `ctx`, if anyone can.
     pub fn elicitor_for(&self, ctx: &ToolContext) -> Option<Arc<dyn Elicitor>> {
         self.elicitors.as_ref()?.for_call(ctx)
-    }
-
-    /// Fixes what requests declare to `pinned`.
-    pub fn pinned(mut self, pinned: PinnedMcpTools) -> Self {
-        self.pinned = Some(pinned);
-        self
-    }
-
-    /// The live tools and the policy that declares them, to pin.
-    pub fn live_tools(&self) -> PinnedMcpTools {
-        PinnedMcpTools {
-            index: self.handle.index.load_full(),
-            disabled: Arc::clone(&self.disabled),
-            profile: Arc::clone(&self.profile),
-            ceiling: self.ceiling.clone(),
-            inherited_profiles: self.inherited_profiles.clone(),
-        }
-    }
-
-    /// Every live definition this session's policy lets a request declare,
-    /// loaded or not, keyed by the name the model calls it by.
-    pub fn live_definitions(&self) -> Vec<(String, Value)> {
-        self.handle
-            .index
-            .load()
-            .descriptors
-            .iter()
-            .filter(|descriptor| !self.is_disabled(&descriptor.qualified_name))
-            .map(|descriptor| {
-                (
-                    descriptor.wire_name().to_owned(),
-                    descriptor.definition.clone(),
-                )
-            })
-            .collect()
-    }
-
-    fn declared_index(&self) -> Arc<ToolIndex> {
-        self.pinned.as_ref().map_or_else(
-            || self.handle.index.load_full(),
-            |pinned| Arc::clone(&pinned.index),
-        )
     }
 
     /// Config's `disabled_tools`, keeping only what can name an MCP tool.
@@ -982,6 +841,13 @@ impl McpSession {
             profile.exposure(qualified_name, ProfileToolSource::Mcp)
                 == Some(ProfileToolExposure::Disabled)
         })
+    }
+
+    /// A tool the profile loads lazily is reachable through `search()` but never listed.
+    pub fn is_search_only(&self, qualified_name: &str) -> bool {
+        self.profile
+            .exposure(qualified_name, ProfileToolSource::Mcp)
+            == Some(ProfileToolExposure::Lazy)
     }
 
     pub fn with_profile_policy(
@@ -1011,372 +877,110 @@ impl McpSession {
         self
     }
 
-    /// Captures the published tool generation while the session's loaded set
-    /// is stable. A pinned session declares under the policy it pinned, while
-    /// calls, searches, and loads follow the live one.
-    pub fn request_snapshot(&self) -> McpRequestSnapshot {
-        let (declaring, loaded) = {
-            let loaded = self.lock_loaded();
-            let declaring = self.pinned.clone().unwrap_or_else(|| self.live_tools());
-            (declaring, loaded.clone())
-        };
-        McpRequestSnapshot {
-            index: declaring.index,
-            loaded,
-            disabled: declaring.disabled,
-            defer_tools: self.handle.defer_tools,
-            profile: declaring.profile,
-            ceiling: declaring.ceiling,
-            inherited_profiles: declaring.inherited_profiles,
-        }
-    }
-
-    /// A view over the same handle with no loads, for a new (sub)session.
-    pub fn fresh(&self) -> Self {
+    /// A view over the same handle and policy with variables of its own, for a subagent whose
+    /// conversation is `history`.
+    pub fn fresh(&self, history: &[Message]) -> Self {
         Self {
-            handle: self.handle.clone(),
-            loaded: Arc::new(Mutex::new(HashSet::new())),
-            disabled: Arc::clone(&self.disabled),
-            profile: Arc::clone(&self.profile),
-            ceiling: self.ceiling.clone(),
-            inherited_profiles: self.inherited_profiles.clone(),
-            pinned: None,
-            elicitors: self.elicitors.clone(),
+            repl: repl_for(history),
+            ..self.clone()
         }
     }
 
-    /// Rank deferred tools against `query` keywords (exact name first,
-    /// then name hits over description hits) and mark the top
-    /// `MAX_SEARCH_LOADS` loaded; their definitions join the next request.
-    pub fn search_tools(&self, query: &str) -> Result<SearchOutcome, String> {
-        let declaring = self.request_snapshot();
-        let matches = self.search_matches(&declaring, query)?;
-        Ok(self.load_search_matches(query, matches, None))
+    pub fn repl(&self) -> &SharedRepl {
+        &self.repl
     }
 
-    pub fn has_exact_match(&self, query: &str) -> bool {
-        let declaring = self.request_snapshot();
-        declaring.index.descriptors.iter().any(|tool| {
-            self.findable(&declaring, &tool.qualified_name) && tool.matches_exactly(query.trim())
-        })
-    }
-
-    /// Whether a search may offer a tool: the requests' catalog lists it, a
-    /// server still serves it, and the configuration has not disabled it since.
-    fn findable(&self, declaring: &McpRequestSnapshot, qualified_name: &str) -> bool {
-        !declaring.is_disabled(qualified_name)
-            && !self.is_disabled(qualified_name)
-            && self.handle.has_tool(qualified_name)
-    }
-
-    pub async fn prepare_search_tools_with_decisions<'a>(
-        &'a self,
-        query: &'a str,
-        decisions: Option<&Decisions>,
-        context: &DecisionContext,
-    ) -> Result<PreparedMcpSearch<'a>, String> {
-        let declaring = self.request_snapshot();
-        let matches = self.search_matches(&declaring, query)?;
-        let exact = declaring.index.descriptors.iter().any(|tool| {
-            self.findable(&declaring, &tool.qualified_name) && tool.matches_exactly(query.trim())
-        });
-        let ranking = if exact {
-            Err(None)
-        } else {
-            rank_tool_search(
-                query,
-                matches
-                    .iter()
-                    .map(|(_, _, tool)| (tool.wire_name(), &tool.definition)),
-                decisions,
-                context,
-            )
-            .await
-        };
-        Ok(PreparedMcpSearch {
-            session: self,
-            query,
-            declaring,
-            ranking,
-        })
-    }
-
-    fn search_matches<'a>(
-        &self,
-        declaring: &'a McpRequestSnapshot,
-        query: &str,
-    ) -> Result<Vec<(bool, usize, &'a ToolDescriptor)>, String> {
-        let q = query.trim().to_lowercase();
-        let tokens: Vec<&str> = q
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|t| !t.is_empty())
-            .collect();
-        if tokens.is_empty() {
-            return Err(SEARCH_EMPTY_QUERY.into());
-        }
-        let mut matches: Vec<(bool, usize, &ToolDescriptor)> = declaring
-            .index
-            .descriptors
+    /// Every enabled server and the tools this agent may call on it, as code mode presents
+    /// them, in configuration order.
+    pub fn servers(&self) -> Vec<ServerView> {
+        let index = self.handle.index.load();
+        let snapshot = self.handle.snapshot.load();
+        snapshot
+            .infos
             .iter()
-            .filter(|d| {
-                self.findable(declaring, &d.qualified_name)
-                    && profile_lazy(&declaring.profile, d, !d.always_load)
+            .filter_map(|info| {
+                let state = match &info.status {
+                    McpServerStatus::Disabled => return None,
+                    McpServerStatus::Running => ServerState::Connected,
+                    McpServerStatus::Connecting => ServerState::Connecting,
+                    McpServerStatus::AwaitingTrust => ServerState::AwaitingTrust,
+                    McpServerStatus::NeedsAuth { .. } | McpServerStatus::Refused => {
+                        ServerState::NeedsLogin
+                    }
+                    McpServerStatus::Failed(message) => ServerState::Failed(message.clone()),
+                };
+                let discovery = info.discovery.as_ref();
+                Some(ServerView {
+                    name: info.name.clone(),
+                    title: discovery
+                        .and_then(|discovery| discovery.server_info.title.clone())
+                        .filter(|title| *title != info.name),
+                    state,
+                    instructions: discovery
+                        .and_then(|discovery| discovery.instructions.as_deref())
+                        .map(cut_instructions),
+                    tools: index
+                        .descriptors
+                        .iter()
+                        .filter(|descriptor| {
+                            descriptor.server == info.name
+                                && !self.is_disabled(&descriptor.qualified_name)
+                        })
+                        .map(|descriptor| ToolView {
+                            search_only: self.is_search_only(&descriptor.qualified_name),
+                            ..descriptor.view.clone()
+                        })
+                        .collect(),
+                    resources: snapshot
+                        .resources_of(&info.name)
+                        .is_some_and(|offer| !offer.lists.is_empty()),
+                })
             })
-            .filter_map(|d| {
-                let name = d.wire_name().to_lowercase();
-                let haystack = build_haystack(&d.definition);
-                // The catalog shows bare tool names, so exact match must
-                // accept both `server__tool` and `tool`.
-                let exact = d.matches_exactly(&q);
-                let score: usize = tokens
-                    .iter()
-                    .map(|t| {
-                        if name.contains(t) {
-                            NAME_HIT_SCORE
-                        } else if haystack.contains(t) {
-                            DESCRIPTION_HIT_SCORE
-                        } else {
-                            0
-                        }
-                    })
-                    .sum();
-                (exact || score > 0).then_some((exact, score, d))
-            })
-            .collect();
-        matches.sort_by(|a, b| {
-            (b.0, b.1)
-                .cmp(&(a.0, a.1))
-                .then_with(|| a.2.wire_name().cmp(b.2.wire_name()))
-        });
-        Ok(matches)
+            .collect()
     }
 
-    fn load_search_matches(
-        &self,
-        query: &str,
-        mut matches: Vec<(bool, usize, &ToolDescriptor)>,
-        ranking: Option<ToolSearchRanking>,
-    ) -> SearchOutcome {
-        let mut guard = self.lock_loaded();
-        let unloaded_head = |matches: &[(bool, usize, &ToolDescriptor)]| -> Vec<Arc<str>> {
-            matches
-                .iter()
-                .take(MAX_SEARCH_LOADS)
-                .filter(|(_, _, tool)| !guard.contains(&tool.qualified_name))
-                .map(|(_, _, tool)| Arc::from(tool.wire_name()))
-                .collect()
-        };
-        let compared = ranking.as_ref().map(|ranking| {
-            let mut ranked = matches.clone();
-            ranking.reorder(&mut ranked, |(_, _, tool)| tool.wire_name());
-            (unloaded_head(&ranked), unloaded_head(&matches))
-        });
-        if let Some(ranking) = ranking.as_ref().filter(|ranking| ranking.applied()) {
-            ranking.reorder(&mut matches, |(_, _, tool)| tool.wire_name());
-        }
-        let mut hits: Vec<&str> = Vec::new();
-        let mut overflow: Vec<&str> = Vec::new();
-        let mut loaded: Vec<Arc<str>> = Vec::new();
-        for (_, _, d) in matches {
-            if hits.len() < MAX_SEARCH_LOADS {
-                if guard.insert(Arc::clone(&d.qualified_name)) {
-                    loaded.push(Arc::from(d.wire_name()));
-                }
-                hits.push(d.wire_name());
-            } else {
-                overflow.push(d.wire_name());
-            }
-        }
-        drop(guard);
-        info!(
-            loaded = hits.len(),
-            overflow = overflow.len(),
-            "MCP tool search"
-        );
-        if hits.is_empty() {
-            return SearchOutcome {
-                loaded,
-                message: format!(
-                    "{SEARCH_NO_MATCH} '{query}'. Try other keywords or an exact name from the catalog."
-                ),
-                note: None,
-            };
-        }
-        let plural = if hits.len() == 1 { "tool" } else { "tools" };
-        let mut out = format!(
-            "Loaded {} {plural}, callable from your next message:",
-            hits.len()
-        );
-        for hit in &hits {
-            out.push_str(&format!("\n- `{hit}`"));
-        }
-        if !overflow.is_empty() {
-            let shown = overflow.len().min(MAX_OVERFLOW_NAMES);
-            let names: Vec<String> = overflow[..shown].iter().map(|n| format!("`{n}`")).collect();
-            out.push_str(&format!("\n{SEARCH_OVERFLOW_PREFIX}{}", names.join(", ")));
-            if overflow.len() > shown {
-                out.push_str(&format!(" and {} more", overflow.len() - shown));
-            }
-            out.push_str(". Search an exact tool name to load it.");
-        }
-        let note = ranking
-            .zip(compared)
-            .and_then(|(ranking, (ranked, lexical))| ranking.settle(&ranked, &lexical));
-        SearchOutcome {
-            loaded,
-            message: out,
-            note,
-        }
-    }
-
-    /// Invoked on every MCP dispatch: a deferred tool the model calls by
-    /// catalog name gets its full definition on the next request. `true` when
-    /// that call is what declared it, so the change can be reported once.
-    pub fn mark_loaded(&self, qualified_name: &str) -> bool {
-        !self.is_disabled(qualified_name) && self.lock_loaded().insert(Arc::from(qualified_name))
-    }
-
-    fn lock_loaded(&self) -> std::sync::MutexGuard<'_, HashSet<Arc<str>>> {
-        self.loaded.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
-impl McpRequestSnapshot {
-    fn is_disabled(&self, qualified_name: &str) -> bool {
-        policy_disabled(
-            &self.disabled,
-            &self.profile,
-            &self.ceiling,
-            qualified_name,
-            self.index.read_only(qualified_name),
-        ) || self.inherited_profiles.iter().any(|profile| {
-            profile.exposure(qualified_name, ProfileToolSource::Mcp)
-                == Some(ProfileToolExposure::Disabled)
-        })
-    }
-
-    fn deferring(&self) -> bool {
-        self.index
-            .descriptors
-            .iter()
-            .filter(|descriptor| {
-                !descriptor.always_load && !self.is_disabled(&descriptor.qualified_name)
-            })
-            .count()
-            > self.defer_tools
-    }
-
-    /// Every MCP tool in this request snapshot and how it reaches the model.
+    /// Every published MCP tool and how it reaches this agent.
     pub fn tool_inventory(&self) -> Vec<McpToolStatus> {
-        let defer = self.deferring();
-        self.index
+        let index = self.handle.index.load();
+        index
             .descriptors
             .iter()
             .map(|descriptor| {
-                let disabled = self.is_disabled(&descriptor.qualified_name);
-                let loaded = self.loaded.contains(&descriptor.qualified_name);
+                let name = &descriptor.qualified_name;
+                let disabled = self.is_disabled(name);
                 let reason = if disabled {
-                    Some(if is_disabled(&self.disabled, &descriptor.qualified_name) {
+                    Some(if is_disabled(&self.disabled, name) {
                         REASON_CONFIG
-                    } else if self.ceiling.is_read_only()
-                        && !self.index.read_only(&descriptor.qualified_name)
-                    {
+                    } else if self.ceiling.is_read_only() && !index.read_only(name) {
                         MODE_DISABLED
-                    } else if !self.ceiling.matches(&descriptor.qualified_name) {
+                    } else if !self.ceiling.matches(name) {
                         CEILING_DISABLED
                     } else {
                         PROFILE_DISABLED
                     })
                 } else {
                     self.profile
-                        .exposure(&descriptor.qualified_name, ProfileToolSource::Mcp)
-                        .map(|exposure| {
-                            if exposure == ProfileToolExposure::Lazy && loaded {
-                                REASON_PROFILE_LOADED
-                            } else {
-                                PROFILE_LOADING
-                            }
-                        })
+                        .exposure(name, ProfileToolSource::Mcp)
+                        .map(|_| PROFILE_LOADING)
                 };
-                let (server, _) = descriptor
-                    .qualified_name
-                    .split_once(SEPARATOR)
-                    .unwrap_or((UNKNOWN_MCP, &descriptor.qualified_name));
                 McpToolStatus {
-                    server: server.to_owned(),
-                    wire_name: descriptor.wire_name().to_owned(),
-                    deferred: !disabled
-                        && profile_lazy(
-                            &self.profile,
-                            descriptor,
-                            defer && !descriptor.always_load,
-                        )
-                        && !loaded,
-                    qualified_name: descriptor.qualified_name.to_string(),
+                    qualified_name: name.to_string(),
+                    server: descriptor.server.clone(),
                     disabled,
+                    search_only: !disabled && self.is_search_only(name),
                     reason,
                 }
             })
             .collect()
     }
-
-    /// Append this request's MCP definitions: loaded and `always_load`
-    /// tools in full, the rest as names inside one `tool_search` catalog.
-    /// Names already in the array are skipped.
-    ///
-    /// The `defer_tools` threshold is measured against the full index, not
-    /// what's left deferred, so loading tools mid-session can never flip
-    /// the remainder into the context.
-    pub fn extend_tools(&self, tools: &mut Value) {
-        let section = self.extend_declared(tools);
-        crate::tools::deferral::push_catalog(tools, section.as_slice());
-    }
-
-    /// Appends this request's declared definitions and returns MCP's slice of
-    /// the shared `tool_search` entry. See [`DeferralSnapshot::extend_declared`]
-    /// for why the two halves are separate.
-    pub fn extend_declared(&self, tools: &mut Value) -> Option<String> {
-        let Some(arr) = tools.as_array_mut() else {
-            debug_assert!(false, "tools must be a JSON array");
-            return None;
-        };
-        let existing: HashSet<String> = arr
-            .iter()
-            .filter_map(|t| t["name"].as_str().map(String::from))
-            .collect();
-        let enabled = || {
-            self.index
-                .descriptors
-                .iter()
-                .filter(|descriptor| !self.is_disabled(&descriptor.qualified_name))
-        };
-        let defer = self.deferring();
-        let mut deferred: Vec<&ToolDescriptor> = Vec::new();
-        for descriptor in enabled() {
-            if existing.contains(descriptor.wire_name()) {
-                continue;
-            }
-            if !profile_lazy(&self.profile, descriptor, defer && !descriptor.always_load)
-                || self.loaded.contains(&descriptor.qualified_name)
-            {
-                arr.push(descriptor.definition.clone());
-            } else {
-                deferred.push(descriptor);
-            }
-        }
-        (!deferred.is_empty()).then(|| catalog_section(&deferred))
-    }
 }
 
-fn profile_lazy(
-    profile: &ProfileToolPolicy,
-    descriptor: &ToolDescriptor,
-    legacy_lazy: bool,
-) -> bool {
-    match profile.exposure(&descriptor.qualified_name, ProfileToolSource::Mcp) {
-        Some(exposure) => exposure == ProfileToolExposure::Lazy,
-        None => legacy_lazy,
-    }
+fn repl_for(history: &[Message]) -> SharedRepl {
+    let ran_before = history
+        .iter()
+        .flat_map(|message| &message.content)
+        .any(|block| matches!(block, ContentBlock::ToolUse { name, .. } if name == MCP_TOOL_NAME));
+    ReplSlot::shared(ran_before)
 }
 
 /// A read-only ceiling keeps only tools a recognised server annotated
@@ -1434,8 +1038,7 @@ impl McpHandle {
     /// and its tools leave the index; an added or changed one is rebuilt under
     /// the startup rules, so one whose reviewed definition changed parks as
     /// `AwaitingTrust` rather than starting. Runtime servers stay unless a file
-    /// now claims the name, and `defer_tools` keeps its startup value because it
-    /// shapes the tool array a conversation is pinned to.
+    /// now claims the name.
     pub fn reload(&self, config: McpConfig) {
         self.send(McpCommand::Reload { config });
     }
@@ -1444,16 +1047,14 @@ impl McpHandle {
         self.index.load().tools.contains_key(name)
     }
 
-    /// Whether some running server lists a resource or a template, which is
-    /// what offers the `mcp_resource` tool. Declaring the capability is not
-    /// enough: Executor declares it for an MCP-Apps shell and lists nothing,
-    /// and the tool's definition would ride along on every request for it.
-    pub fn offers_resources(&self) -> bool {
+    /// Whether configuration enables some server, which is what offers the `mcp` tool. Whether
+    /// it has connected does not matter, so a server coming up never changes the tool list.
+    pub fn has_enabled_server(&self) -> bool {
         self.snapshot
             .load()
-            .resources
+            .infos
             .iter()
-            .any(|offer| !offer.lists.is_empty())
+            .any(|info| !matches!(info.status, McpServerStatus::Disabled))
     }
 
     /// Whether `name` is a recognised server's tool annotated read-only,
@@ -1652,7 +1253,6 @@ fn start_with_config_and_state(
         return None;
     }
 
-    let defer_tools = config.defer_tools.unwrap_or(DEFAULT_DEFER_TOOLS);
     let inner = parse_entries(config, state_dir);
 
     let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
@@ -1665,7 +1265,6 @@ fn start_with_config_and_state(
         cmd_tx,
         index: Arc::clone(&index),
         snapshot: Arc::clone(&snapshot),
-        defer_tools,
         ready_rx,
     };
 
@@ -2083,12 +1682,7 @@ async fn handle_reload(
 /// leaves out is compared besides. Disabled-ness, not status, is the enabled
 /// flag, so the file `/mcp` just wrote reads back as unchanged.
 fn same_definition(running: &ServerEntry, fresh: &ServerEntry) -> bool {
-    let unreviewed = |entry: &ServerEntry| {
-        entry
-            .config
-            .as_ref()
-            .map(|config| (config.timeout, config.always_load))
-    };
+    let unreviewed = |entry: &ServerEntry| entry.config.as_ref().map(|config| config.timeout);
     running.authority_digest == fresh.authority_digest
         && unreviewed(running) == unreviewed(fresh)
         && (running.status == McpServerStatus::Disabled)
@@ -2494,7 +2088,6 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
         if let Some(ref transport) = entry.transport
             && entry.status != McpServerStatus::Disabled
         {
-            let always_load = entry.config.as_ref().is_some_and(|c| c.always_load);
             for t in &entry.tools {
                 let contract = canonical_json_sha256(&json!({
                     "name": t.raw_name,
@@ -2519,15 +2112,17 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
                         paused_runs: Arc::clone(&entry.paused_runs),
                     },
                 );
-                let sanitized_schema = sanitize_tool_input_schema(t.input_schema.clone());
                 descriptors.push(ToolDescriptor {
                     qualified_name: Arc::clone(&t.qualified_name),
-                    always_load,
-                    definition: json!({
-                        "name": wire_tool_name(&t.qualified_name),
-                        "description": t.description,
-                        "input_schema": sanitized_schema,
-                    }),
+                    server: entry.name.clone(),
+                    view: ToolView {
+                        name: t.raw_name.clone(),
+                        title: t.meta.title().map(str::to_owned),
+                        description: t.description.clone(),
+                        input_schema: t.input_schema.clone(),
+                        output_schema: t.meta.output_schema.clone(),
+                        search_only: false,
+                    },
                 });
             }
             let capabilities = entry
@@ -2773,7 +2368,6 @@ fn stub_session_from(
             cmd_tx: flume::unbounded().0,
             index,
             snapshot,
-            defer_tools: 0,
             ready_rx: flume::bounded(0).1,
         },
         &[],
@@ -2839,49 +2433,6 @@ impl McpTransport for StubTransport {
     }
 }
 
-fn build_haystack(definition: &Value) -> String {
-    let mut hay = definition["description"]
-        .as_str()
-        .unwrap_or_default()
-        .to_lowercase();
-    if let Some(props) = definition["input_schema"]["properties"].as_object() {
-        for key in props.keys() {
-            hay.push(' ');
-            hay.push_str(&key.to_lowercase());
-        }
-    }
-    hay
-}
-
-/// MCP's slice of the shared `tool_search` entry. Unlike the built-in
-/// catalog this stays bare names: a server index is unbounded, so a sentence
-/// each would cost more than the deferral saves.
-fn catalog_section(deferred: &[&ToolDescriptor]) -> String {
-    // Grouping by server drops the repeated `server__` prefix, a few
-    // tokens per tool. Descriptors arrive grouped because entries are
-    // sorted and published per server.
-    let mut catalog = String::new();
-    let mut current_server = "";
-    for d in deferred {
-        let (server, raw) = d
-            .qualified_name
-            .split_once(SEPARATOR)
-            .unwrap_or((UNKNOWN_MCP, &d.qualified_name));
-        if server == current_server {
-            catalog.push_str(", ");
-        } else {
-            if !catalog.is_empty() {
-                catalog.push('\n');
-            }
-            catalog.push_str(server);
-            catalog.push_str(": ");
-            current_server = server;
-        }
-        catalog.push_str(raw);
-    }
-    format!("From MCP servers:\n{catalog}")
-}
-
 fn transport_url(transport: &Transport) -> Option<String> {
     match transport {
         Transport::Http { url, .. } => Some(url.clone()),
@@ -2937,43 +2488,25 @@ fn intern(name: String) -> Arc<str> {
 mod tests {
     use super::*;
     use crate::AgentMode;
-    use crate::tools::ToolAudience;
-    use crate::tools::deferral::{
-        TOOL_SEARCH_TOOL_NAME,
-        tests::{NO_CANDIDATE, PENDING_REPLY, RELEVANT, SearchDecisions},
-    };
     use async_lock::Mutex as AsyncMutex;
-    use caudra_config::decisions::FeatureMode;
     use caudra_config::mcp::MCP_FILE;
-    use caudra_providers::{Model, Role};
     use caudra_storage::sessions::SessionDatabase;
     use caudra_storage::state::project_scope;
     use caudra_workspace::PlanRef;
     use config::{RawHttpFields, RawServerConfig, RawStdioFields, RawTransport};
-    use futures_lite::future;
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(unix)]
     use std::time::Instant;
     use test_case::test_case;
 
-    use crate::context::{
-        ContextCapture, ContextInventory, ContextMcpInventory, ContextReadiness, ContextSnapshot,
-    };
     use crate::mcp::inbound::Inbound;
     use crate::mcp::message::Notification;
     use crate::mcp::protocol::ServerInfo;
 
     const DEFAULT_TIMEOUT_MS: u64 = 30_000;
     const MISSING_PROGRAM: &str = "/nonexistent/definitely-not-here";
-    const ORIGINAL_DESCRIPTION: &str = "original contract";
-    const REPLACEMENT_CATALOG_ENTRY: &str = "srv: replacement";
     const REPLACEMENT_DESCRIPTION: &str = "replacement contract";
     const REPLACEMENT_TOOL_NAME: &str = "srv.replacement";
-    const TEST_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-6";
-    const SEARCH_QUERY: &str = "inspect";
-    const FIRST_SEARCH_CANDIDATE: &str = "c00";
-    const SECOND_SEARCH_CANDIDATE: &str = "c01";
-    const LAST_SEARCH_CANDIDATE: &str = "c05";
     const RELOAD_SERVER: &str = "srv";
     const OTHER_SERVER: &str = "other";
     const FAKE_TOOL: &str = "tool";
@@ -2997,7 +2530,6 @@ mod tests {
         RawServerConfig {
             enabled: true,
             timeout: DEFAULT_TIMEOUT_MS,
-            always_load: false,
             transport: RawTransport::Stdio(RawStdioFields {
                 command: cmd.iter().map(|s| s.to_string()).collect(),
                 environment: HashMap::new(),
@@ -3009,7 +2541,6 @@ mod tests {
         RawServerConfig {
             enabled: true,
             timeout: DEFAULT_TIMEOUT_MS,
-            always_load: false,
             transport: RawTransport::Http(RawHttpFields {
                 url: url.into(),
                 headers: HashMap::new(),
@@ -3046,10 +2577,6 @@ mod tests {
     }
 
     const TOOL_NAME: &str = "srv.tool";
-    const WIRE_TOOL_NAME: &str = "srv__tool";
-    const SERVER_WILDCARD: &str = "srv.*";
-    const BUILTIN_DEFERRED: &str = "code_map";
-    const BUILTIN_DESCRIPTION: &str = "Rank every symbol in a source tree.";
     const PLAN_PATH: &str = "/tmp/active-plan.md";
     const PLAN_REFERENCE: &str = "plan_0123456789abcdef0123456789abcdef";
 
@@ -3159,7 +2686,6 @@ mod tests {
             local_execution: LocalExecutionPolicy::Embedded,
             name: name.into(),
             timeout: Duration::from_secs(1),
-            always_load: false,
             transport: Transport::Stdio {
                 program: MISSING_PROGRAM.into(),
                 args: vec![],
@@ -3171,26 +2697,19 @@ mod tests {
     /// Build `inner`, publish it into fresh `ArcSwap`s, and return a live `McpSession` pointing
     /// at the same state so tests can hit both the mutation and the read path.
     fn setup(entries: Vec<ServerEntry>) -> (McpManagerInner, McpSession) {
-        setup_with_defer(entries, 0)
-    }
-
-    fn setup_with_defer(
-        entries: Vec<ServerEntry>,
-        defer_tools: usize,
-    ) -> (McpManagerInner, McpSession) {
         let inner = McpManagerInner {
             entries,
             state_dir: None,
             generation: 0,
             local_execution: LocalExecutionPolicy::Embedded,
         };
-        let handle = published(&inner, defer_tools);
+        let handle = published(&inner);
         (inner, McpSession::new(handle, &[]))
     }
 
     /// A handle over what `inner` publishes, so tests read the same index and
     /// snapshot the command loop would hand out.
-    fn published(inner: &McpManagerInner, defer_tools: usize) -> McpHandle {
+    fn published(inner: &McpManagerInner) -> McpHandle {
         let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
         let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
         publish(inner, &index, &snapshot);
@@ -3198,7 +2717,6 @@ mod tests {
             cmd_tx: flume::unbounded().0,
             index,
             snapshot,
-            defer_tools,
             ready_rx: flume::bounded(0).1,
         }
     }
@@ -3228,84 +2746,6 @@ mod tests {
         assert!(Arc::ptr_eq(&current.tool.transport, &replacement_transport));
         assert_ne!(reviewed_subject, *current.subject());
         assert_ne!(binding.generation(), current.generation());
-    }
-
-    #[test]
-    fn request_snapshot_survives_generation_replacement_with_attributable_definitions() {
-        let original = entry_with_tools(
-            "srv",
-            vec![tool_def("srv", "tool", ORIGINAL_DESCRIPTION, json!({}))],
-        );
-        let (mut inner, session) = setup(vec![original]);
-        session.mark_loaded(TOOL_NAME);
-        let request = session.request_snapshot();
-        assert!(session.loaded.try_lock().is_ok());
-
-        inner.entries[0] = entry_with_tools(
-            "srv",
-            vec![tool_def(
-                "srv",
-                "replacement",
-                REPLACEMENT_DESCRIPTION,
-                json!({}),
-            )],
-        );
-        inner.generation += 1;
-        publish(
-            &inner,
-            session.handle.index.as_ref(),
-            session.handle.snapshot.as_ref(),
-        );
-
-        let base_tools = json!([]);
-        let mut full_tools = base_tools.clone();
-        request.extend_tools(&mut full_tools);
-        assert_eq!(tool_names(&full_tools), [WIRE_TOOL_NAME]);
-        assert_eq!(full_tools[0]["description"], ORIGINAL_DESCRIPTION);
-        assert_eq!(request.index.tools[TOOL_NAME].generation, 0);
-
-        let model = Model::from_spec(TEST_MODEL_SPEC).unwrap();
-        let captured = ContextSnapshot::capture(ContextCapture {
-            readiness: ContextReadiness::CapturedCurrentRequest,
-            mode: &AgentMode::Build,
-            audience: ToolAudience::MAIN,
-            model: &model,
-            auto_compact: false,
-            compaction_buffer: None,
-            system: "",
-            base_tools: &base_tools,
-            full_tools: &full_tools,
-            projected_messages: &[],
-            measured: None,
-            inventory: ContextInventory {
-                mcp: ContextMcpInventory::from_statuses(request.tool_inventory()),
-                ..ContextInventory::default()
-            },
-        });
-        assert_eq!(captured.inventory.mcp.unattributed_tokens, 0);
-        assert_eq!(captured.inventory.mcp.tools[0].wire_name, WIRE_TOOL_NAME);
-        assert_eq!(
-            captured.inventory.mcp.tools[0].request_tokens,
-            captured.usage.mcp_tools
-        );
-
-        let current = session.request_snapshot();
-        let mut current_tools = json!([]);
-        current.extend_tools(&mut current_tools);
-        assert_eq!(tool_names(&current_tools), [TOOL_SEARCH_TOOL_NAME]);
-        assert_eq!(
-            current.tool_inventory()[0].qualified_name,
-            REPLACEMENT_TOOL_NAME
-        );
-        assert_eq!(
-            current.index.tools[REPLACEMENT_TOOL_NAME].generation,
-            inner.generation
-        );
-        assert!(
-            current_tools[0]["description"]
-                .as_str()
-                .is_some_and(|description| description.contains(REPLACEMENT_CATALOG_ENTRY))
-        );
     }
 
     #[test]
@@ -3612,241 +3052,33 @@ mod tests {
         });
     }
 
-    fn always_load_entry(name: &str, transport: Arc<dyn McpTransport>) -> ServerEntry {
-        let mut raw = stdio_raw(&["echo"]);
-        raw.always_load = true;
-        let mut entry = fake_entry(name, transport);
-        entry.config = Some(parse_server(name.into(), raw).unwrap());
-        entry
+    fn listed(session: &McpSession) -> Vec<String> {
+        session
+            .servers()
+            .into_iter()
+            .flat_map(|server| {
+                let name = server.name;
+                server
+                    .tools
+                    .into_iter()
+                    .map(move |tool| format!("{name}{SEPARATOR}{}", tool.name))
+            })
+            .collect()
     }
 
-    #[test]
-    fn extend_tools_skips_deferral_at_or_below_threshold() {
-        let (_inner, handle) = setup_with_defer(vec![fake_entry("srv", FakeTransport::new())], 1);
-        let mut tools = json!([]);
-        handle.request_snapshot().extend_tools(&mut tools);
-        assert_eq!(tool_names(&tools), vec![WIRE_TOOL_NAME]);
-    }
-
+    /// A disabled tool must not surface as a name code mode offers either: that is the whole
+    /// point of turning it off.
     #[test_case(&["srv.tool".to_owned()] ; "qualified_name")]
     #[test_case(&["srv.*".to_owned()] ; "server_wildcard")]
-    fn extend_tools_drops_disabled_tools(disabled: &[String]) {
-        let (_inner, session) = setup_with_defer(vec![fake_entry("srv", FakeTransport::new())], 1);
-        let mut tools = json!([]);
-        session
-            .with_disabled_tools(disabled)
-            .request_snapshot()
-            .extend_tools(&mut tools);
-        assert!(tool_names(&tools).is_empty());
-    }
-
-    /// A disabled tool must not surface as a name in the catalog either: that
-    /// is the whole point of turning it off.
-    #[test]
-    fn a_disabled_tool_stays_out_of_the_search_catalog() {
+    fn a_disabled_tool_stays_out_of_what_code_mode_offers(disabled: &[String]) {
         let (_inner, session) = setup(vec![
             fake_entry("srv", FakeTransport::new()),
-            fake_entry("other", FakeTransport::new()),
+            fake_entry(OTHER_SERVER, FakeTransport::new()),
         ]);
-        let session = session.with_disabled_tools(&["srv.*".to_owned()]);
-        let mut tools = json!([]);
-        session.request_snapshot().extend_tools(&mut tools);
-
-        assert_eq!(tool_names(&tools), vec![TOOL_SEARCH_TOOL_NAME]);
-        let catalog = tools[0]["description"].as_str().unwrap();
-        assert!(catalog.contains("other"), "{catalog}");
-        assert!(!catalog.contains("srv"), "{catalog}");
-        assert!(
-            session
-                .search_tools("tool")
-                .unwrap()
-                .message
-                .contains("other__tool"),
-            "search must not reach a disabled tool"
+        assert_eq!(
+            listed(&session.with_disabled_tools(disabled)),
+            [format!("{OTHER_SERVER}{SEPARATOR}tool")]
         );
-    }
-
-    #[test]
-    fn disabling_tools_can_bring_a_server_back_under_the_defer_threshold() {
-        let (_inner, session) = setup_with_defer(
-            vec![
-                fake_entry("srv", FakeTransport::new()),
-                fake_entry("other", FakeTransport::new()),
-            ],
-            1,
-        );
-        let mut tools = json!([]);
-        session
-            .with_disabled_tools(&["srv.*".to_owned()])
-            .request_snapshot()
-            .extend_tools(&mut tools);
-        assert_eq!(tool_names(&tools), vec!["other__tool"]);
-    }
-
-    fn pinned_under(session: McpSession, pinned: &[String], live: &[String]) -> McpSession {
-        let session = session.with_disabled_tools(pinned);
-        let pin = session.live_tools();
-        session.pinned(pin).with_disabled_tools(live)
-    }
-
-    /// Editing `disabled_tools` mid-session must leave the declared array as
-    /// it was, or the provider's cache of the conversation is lost.
-    #[test_case(&[], &[SERVER_WILDCARD.to_owned()], &[WIRE_TOOL_NAME] ; "disabled_since_stays_declared")]
-    #[test_case(&[SERVER_WILDCARD.to_owned()], &[], &[] ; "enabled_since_stays_undeclared")]
-    fn a_pinned_session_declares_under_the_policy_it_pinned(
-        pinned: &[String],
-        live: &[String],
-        declared: &[&str],
-    ) {
-        let (_inner, session) = setup_with_defer(vec![fake_entry("srv", FakeTransport::new())], 1);
-        let session = pinned_under(session, pinned, live);
-        let mut tools = json!([]);
-        session.request_snapshot().extend_tools(&mut tools);
-
-        assert_eq!(tool_names(&tools), declared);
-        assert_eq!(session.is_disabled(TOOL_NAME), !live.is_empty());
-    }
-
-    #[test_case(&[], &[SERVER_WILDCARD.to_owned()] ; "disabled_since")]
-    #[test_case(&[SERVER_WILDCARD.to_owned()], &[] ; "enabled_since")]
-    fn a_pinned_session_searches_only_what_both_policies_allow(pinned: &[String], live: &[String]) {
-        let (_inner, session) = setup(vec![fake_entry("srv", FakeTransport::new())]);
-        let session = pinned_under(session, pinned, live);
-
-        assert!(!session.has_exact_match(WIRE_TOOL_NAME));
-        let outcome = session.search_tools(WIRE_TOOL_NAME).unwrap();
-        assert!(outcome.loaded.is_empty());
-        assert!(
-            outcome.message.starts_with(SEARCH_NO_MATCH),
-            "{}",
-            outcome.message
-        );
-    }
-
-    /// A stopped server's tools stay in the pinned catalog until the next
-    /// rebuild, but loading one would cost the cached conversation for a call
-    /// that fails.
-    #[test]
-    fn a_pinned_session_never_offers_a_tool_no_server_serves() {
-        let (mut inner, session) = setup(vec![fake_entry("srv", FakeTransport::new())]);
-        let pin = session.live_tools();
-        let session = session.pinned(pin);
-        inner.entries.clear();
-        inner.generation += 1;
-        publish(
-            &inner,
-            session.handle.index.as_ref(),
-            session.handle.snapshot.as_ref(),
-        );
-
-        assert!(!session.has_exact_match(WIRE_TOOL_NAME));
-        let outcome = session.search_tools(WIRE_TOOL_NAME).unwrap();
-        assert!(outcome.loaded.is_empty());
-        assert!(
-            outcome.message.starts_with(SEARCH_NO_MATCH),
-            "{}",
-            outcome.message
-        );
-    }
-
-    #[test]
-    fn defer_threshold_ignores_always_load_tools() {
-        let (_inner, handle) = setup_with_defer(
-            vec![
-                always_load_entry("eager", FakeTransport::new()),
-                fake_entry("lazy", FakeTransport::new()),
-            ],
-            1,
-        );
-        let mut tools = json!([]);
-        handle.request_snapshot().extend_tools(&mut tools);
-        assert_eq!(tool_names(&tools), vec!["eager__tool", "lazy__tool"]);
-    }
-
-    #[test]
-    fn extend_tools_defers_behind_tool_search_by_default() {
-        let (_inner, handle) = setup(vec![fake_entry("srv", FakeTransport::new())]);
-        let mut tools = json!([]);
-        handle.request_snapshot().extend_tools(&mut tools);
-        assert_eq!(tool_names(&tools), vec![TOOL_SEARCH_TOOL_NAME]);
-        let catalog = tools[0]["description"].as_str().unwrap();
-        assert!(catalog.contains("srv: tool"), "catalog groups by server");
-        assert!(handle.has_tool(TOOL_NAME), "deferred tools stay callable");
-    }
-
-    #[test]
-    fn extend_tools_includes_always_load_server_upfront() {
-        let (_inner, handle) = setup(vec![
-            always_load_entry("eager", FakeTransport::new()),
-            fake_entry("lazy", FakeTransport::new()),
-        ]);
-        let mut tools = json!([]);
-        handle.request_snapshot().extend_tools(&mut tools);
-        let names = tool_names(&tools);
-        assert!(names.contains(&"eager__tool"));
-        assert!(names.contains(&TOOL_SEARCH_TOOL_NAME));
-        assert!(!names.contains(&"lazy__tool"));
-    }
-
-    #[test]
-    fn search_loads_tools_into_next_extend() {
-        let (_inner, handle) = setup(vec![fake_entry("srv", FakeTransport::new())]);
-        let result = handle.search_tools("TOOL").unwrap().message;
-        assert!(result.contains(WIRE_TOOL_NAME), "got: {result}");
-
-        let mut tools = json!([]);
-        handle.request_snapshot().extend_tools(&mut tools);
-        assert_eq!(tool_names(&tools), vec![WIRE_TOOL_NAME]);
-    }
-
-    #[test]
-    fn search_reports_no_match_without_loading() {
-        let (_inner, handle) = setup(vec![fake_entry("srv", FakeTransport::new())]);
-        let result = handle
-            .search_tools("nonexistent-capability")
-            .unwrap()
-            .message;
-        assert!(result.contains(SEARCH_NO_MATCH), "got: {result}");
-        let mut tools = json!([]);
-        handle.request_snapshot().extend_tools(&mut tools);
-        assert_eq!(tool_names(&tools), vec![TOOL_SEARCH_TOOL_NAME]);
-    }
-
-    #[test]
-    fn search_caps_loads_and_reports_overflow() {
-        let transport: Arc<dyn McpTransport> = FakeTransport::new();
-        let mut entry = fake_entry("srv", Arc::clone(&transport));
-        entry.tools = (0..MAX_SEARCH_LOADS + 2)
-            .map(|i| McpToolDef {
-                qualified_name: intern(format!("srv{SEPARATOR}tool-{i}")),
-                raw_name: format!("tool-{i}"),
-                description: String::new(),
-                input_schema: json!({}),
-                meta: Arc::default(),
-            })
-            .collect();
-        let (_inner, handle) = setup(vec![entry]);
-
-        let result = handle.search_tools("tool").unwrap().message;
-        let expected = format!(
-            "{SEARCH_OVERFLOW_PREFIX}`srv__tool-{}`, `srv__tool-{}`",
-            MAX_SEARCH_LOADS,
-            MAX_SEARCH_LOADS + 1
-        );
-        assert!(
-            result.contains(&expected),
-            "overflow must list names: {result}"
-        );
-        let mut tools = json!([]);
-        handle.request_snapshot().extend_tools(&mut tools);
-        // Loaded cap plus the search tool for the remaining deferred ones.
-        assert_eq!(tools.as_array().unwrap().len(), MAX_SEARCH_LOADS + 1);
-    }
-
-    fn entry_with_tools(name: &str, tools: Vec<McpToolDef>) -> ServerEntry {
-        let mut entry = fake_entry(name, FakeTransport::new());
-        entry.tools = tools;
-        entry
     }
 
     fn tool_def(server: &str, raw: &str, description: &str, schema: Value) -> McpToolDef {
@@ -3859,106 +3091,44 @@ mod tests {
         }
     }
 
-    fn decision_search_session() -> (McpManagerInner, McpSession) {
-        setup(vec![entry_with_tools(
-            "srv",
-            (0..=MAX_SEARCH_LOADS)
-                .map(|index| tool_def("srv", &format!("tool_{index}"), SEARCH_QUERY, json!({})))
-                .collect(),
-        )])
-    }
-
     #[test_case("eager", false; "explicit_eager")]
     #[test_case("lazy", true; "explicit_lazy")]
-    fn profile_exposure_overrides_mcp_threshold(exposure: &str, deferred: bool) {
-        let mut session = stub_session(&[(REPLACEMENT_TOOL_NAME, REPLACEMENT_DESCRIPTION)]);
-        session.handle.defer_tools = if deferred { usize::MAX } else { 0 };
+    fn a_lazy_profile_keeps_a_tool_searchable_but_unlisted(exposure: &str, search_only: bool) {
         let profile =
             Arc::new(serde_json::from_value(json!({"overrides":{"srv.*":exposure}})).unwrap());
+        let (_inner, session) = setup(vec![fake_entry("srv", FakeTransport::new())]);
         let session = session.with_actor_policy(profile);
-        let inventory = session.request_snapshot().tool_inventory();
-        assert_eq!(inventory[0].deferred, deferred);
-        assert!(!inventory[0].disabled);
-        assert_eq!(inventory[0].reason, Some(PROFILE_LOADING));
-        let mut tools = json!([]);
-        session.request_snapshot().extend_tools(&mut tools);
+        let [status] = session.tool_inventory().try_into().unwrap();
         assert_eq!(
-            tool_names(&tools).contains(&TOOL_SEARCH_TOOL_NAME),
-            deferred
+            (status.disabled, status.search_only, status.reason),
+            (false, search_only, Some(PROFILE_LOADING))
         );
+        assert_eq!(session.servers()[0].tools[0].search_only, search_only);
     }
 
     #[test_case(AgentMode::Build, false; "build")]
     #[test_case(AgentMode::ReadOnly, true; "read_only")]
     #[test_case(AgentMode::Plan(PLAN_PATH.into()), true; "local_plan")]
     #[test_case(AgentMode::RemotePlan(PlanRef::new(PLAN_REFERENCE).unwrap()), true; "remote_plan")]
-    fn prepared_mcp_mode_matches_live_schemas_and_inventory(mode: AgentMode, disabled: bool) {
-        for exposure in ["eager", "lazy"] {
-            for loaded in [false, true] {
-                let profile =
-                    Arc::new(serde_json::from_value(json!({"default": exposure})).unwrap());
-                let session = stub_session(&[(REPLACEMENT_TOOL_NAME, REPLACEMENT_DESCRIPTION)]);
-                if loaded {
-                    session.mark_loaded(REPLACEMENT_TOOL_NAME);
-                }
-                let prepared = session
-                    .clone()
-                    .with_profile_policy(Arc::clone(&profile), ToolFilter::All.for_mcp_mode(&mode));
-                let live = session
-                    .with_actor_policy(Arc::clone(&profile))
-                    .narrowed(&ToolFilter::All.for_mcp_mode(&mode));
-                let mut prepared_tools = json!([]);
-                let mut live_tools = json!([]);
-                prepared
-                    .request_snapshot()
-                    .extend_tools(&mut prepared_tools);
-                live.request_snapshot().extend_tools(&mut live_tools);
-                assert_eq!(prepared_tools, live_tools);
-                assert_eq!(tool_names(&prepared_tools).is_empty(), disabled);
-                assert_eq!(
-                    tool_names(&prepared_tools).contains(&TOOL_SEARCH_TOOL_NAME),
-                    !disabled && exposure == "lazy" && !loaded,
-                );
-                for candidate in [&prepared, &live] {
-                    let inventory = candidate.request_snapshot().tool_inventory();
-                    assert_eq!(inventory[0].disabled, disabled);
-                    if disabled {
-                        assert_eq!(inventory[0].reason, Some(MODE_DISABLED));
-                        assert!(!candidate.mark_loaded(REPLACEMENT_TOOL_NAME));
-                        assert!(
-                            candidate
-                                .search_tools("replacement")
-                                .unwrap()
-                                .loaded
-                                .is_empty()
-                        );
-                    }
-                }
-                let resumed = prepared
-                    .with_profile_policy(profile, ToolFilter::All.for_mcp_mode(&AgentMode::Build));
-                let mut resumed_tools = json!([]);
-                resumed.request_snapshot().extend_tools(&mut resumed_tools);
-                assert!(!tool_names(&resumed_tools).is_empty());
-            }
+    fn a_prepared_mode_ceiling_matches_the_live_one(mode: AgentMode, disabled: bool) {
+        let session = stub_session(&[(REPLACEMENT_TOOL_NAME, REPLACEMENT_DESCRIPTION)]);
+        let prepared = session
+            .clone()
+            .with_profile_policy(Arc::default(), ToolFilter::All.for_mcp_mode(&mode));
+        let live = session.narrowed(&ToolFilter::All.for_mcp_mode(&mode));
+        for candidate in [&prepared, &live] {
+            let [status] = candidate.tool_inventory().try_into().unwrap();
+            assert_eq!(
+                (status.disabled, status.reason),
+                (disabled, disabled.then_some(MODE_DISABLED))
+            );
+            assert_eq!(candidate.is_disabled(REPLACEMENT_TOOL_NAME), disabled);
         }
     }
 
     #[test]
-    fn profile_lazy_overrides_mcp_always_load() {
-        let (_, session) = setup(vec![always_load_entry("eager", FakeTransport::new())]);
-        let profile = Arc::new(serde_json::from_value(json!({"default":"lazy"})).unwrap());
-        let session = session.with_actor_policy(profile);
-        assert!(session.request_snapshot().tool_inventory()[0].deferred);
-        assert!(!session.search_tools("tool").unwrap().loaded.is_empty());
-        let inventory = session.request_snapshot().tool_inventory();
-        assert!(!inventory[0].deferred);
-        assert_eq!(inventory[0].reason, Some(REASON_PROFILE_LOADED));
-    }
-
-    #[test]
-    fn profile_policy_survives_late_mcp_publication_and_history_loads() {
-        let (mut inner, session) = decision_search_session();
-        session.mark_loaded(REPLACEMENT_TOOL_NAME);
+    fn a_profile_disables_tools_published_after_it() {
+        let (mut inner, session) = setup(vec![fake_entry("srv", FakeTransport::new())]);
         let profile =
             Arc::new(serde_json::from_value(json!({"overrides":{"srv.*":"disabled"}})).unwrap());
         let session = session.with_actor_policy(profile);
@@ -3969,21 +3139,11 @@ mod tests {
             json!({}),
         )];
         publish(&inner, &session.handle.index, &session.handle.snapshot);
-        let mut tools = json!([]);
-        session.request_snapshot().extend_tools(&mut tools);
-        assert!(tool_names(&tools).is_empty());
-        assert!(!session.mark_loaded(REPLACEMENT_TOOL_NAME));
-        assert!(
-            session
-                .search_tools("replacement")
-                .unwrap()
-                .loaded
-                .is_empty()
-        );
-        assert!(session.request_snapshot().tool_inventory()[0].disabled);
+        assert!(listed(&session).is_empty());
+        let [status] = session.tool_inventory().try_into().unwrap();
         assert_eq!(
-            session.request_snapshot().tool_inventory()[0].reason,
-            Some(PROFILE_DISABLED)
+            (status.disabled, status.reason),
+            (true, Some(PROFILE_DISABLED))
         );
     }
 
@@ -3993,495 +3153,10 @@ mod tests {
         let session = stub_session(&[(REPLACEMENT_TOOL_NAME, REPLACEMENT_DESCRIPTION)])
             .with_actor_policy(profile)
             .freeze_actor_ceiling()
-            .fresh()
+            .fresh(&[])
             .with_actor_policy(Arc::default());
         assert!(session.is_disabled(REPLACEMENT_TOOL_NAME));
-        assert!(session.request_snapshot().tool_inventory()[0].disabled);
-    }
-
-    #[test]
-    fn discarded_preparation_keeps_mcp_catalog_unloaded() {
-        let fixture = SearchDecisions::new(FeatureMode::Enforce, LAST_SEARCH_CANDIDATE, RELEVANT);
-        let (_, session) = decision_search_session();
-        let prepared = smol::block_on(session.prepare_search_tools_with_decisions(
-            SEARCH_QUERY,
-            Some(&fixture.decisions),
-            &DecisionContext::default(),
-        ))
-        .unwrap();
-        assert!(prepared.ranking.is_ok());
-        assert!(session.lock_loaded().is_empty());
-        drop(prepared);
-        assert!(session.lock_loaded().is_empty());
-        let outcome = session.search_tools(SEARCH_QUERY).unwrap();
-        assert!(
-            !outcome
-                .loaded
-                .iter()
-                .any(|name| name.as_ref() == "srv__tool_5")
-        );
-    }
-
-    #[test]
-    fn cancelled_preparation_keeps_mcp_catalog_unloaded() {
-        smol::block_on(async {
-            let fixture = SearchDecisions::new(FeatureMode::Enforce, PENDING_REPLY, RELEVANT);
-            let (_, session) = decision_search_session();
-            let context = DecisionContext::default();
-            let mut pending = Box::pin(session.prepare_search_tools_with_decisions(
-                SEARCH_QUERY,
-                Some(&fixture.decisions),
-                &context,
-            ));
-            assert!(future::poll_once(&mut pending).await.is_none());
-            assert_eq!(fixture.requests.lock().unwrap().len(), 1);
-            drop(pending);
-            assert!(session.lock_loaded().is_empty());
-        });
-    }
-
-    #[test_case(FIRST_SEARCH_CANDIDATE, false, false; "lexical_choice")]
-    #[test_case(SECOND_SEARCH_CANDIDATE, false, false; "same_batch")]
-    #[test_case(LAST_SEARCH_CANDIDATE, false, true; "different_batch")]
-    #[test_case(LAST_SEARCH_CANDIDATE, true, false; "already_loaded_at_commit")]
-    #[test_case(NO_CANDIDATE, false, false; "nothing_relevant_falls_back")]
-    fn mcp_commit_accounts_only_changed_new_loads(favoured: &str, preload: bool, rerouted: bool) {
-        let fixture = SearchDecisions::new(FeatureMode::Enforce, favoured, RELEVANT);
-        let (_, session) = decision_search_session();
-        let lexical = session.fresh();
-        let prepared = smol::block_on(session.prepare_search_tools_with_decisions(
-            SEARCH_QUERY,
-            Some(&fixture.decisions),
-            &DecisionContext::default(),
-        ))
-        .unwrap();
-        assert!(session.lock_loaded().is_empty());
-        if preload {
-            for index in 0..=MAX_SEARCH_LOADS {
-                let name = format!("srv.tool_{index}");
-                session.mark_loaded(&name);
-                lexical.mark_loaded(&name);
-            }
-        }
-        let baseline = lexical.search_tools(SEARCH_QUERY).unwrap();
-        let outcome = prepared.commit().unwrap();
-        assert_eq!(outcome.rerouted_from(&baseline.loaded), rerouted);
-        if preload {
-            assert!(outcome.loaded.is_empty());
-        }
-    }
-
-    #[test]
-    fn catalog_republication_after_preparation_commits_lexical_fallback() {
-        let fixture = SearchDecisions::new(FeatureMode::Enforce, LAST_SEARCH_CANDIDATE, RELEVANT);
-        let (mut inner, session) = decision_search_session();
-        let prepared = smol::block_on(session.prepare_search_tools_with_decisions(
-            SEARCH_QUERY,
-            Some(&fixture.decisions),
-            &DecisionContext::default(),
-        ))
-        .unwrap();
-        inner.entries[0].tools = vec![tool_def("srv", "replacement", SEARCH_QUERY, json!({}))];
-        publish(&inner, &session.handle.index, &session.handle.snapshot);
-        assert!(session.lock_loaded().is_empty());
-        let baseline = session.fresh().search_tools(SEARCH_QUERY).unwrap();
-        let outcome = prepared.commit().unwrap();
-        assert_eq!(outcome.loaded, vec![Arc::<str>::from("srv__replacement")]);
-        assert!(!outcome.rerouted_from(&baseline.loaded));
-        assert_eq!(session.lock_loaded().len(), 1);
-    }
-
-    #[test_case(FeatureMode::Enforce, true; "enforce_promotes_candidate")]
-    #[test_case(FeatureMode::Shadow, false; "shadow_keeps_predicted_tool_unloaded")]
-    #[test_case(FeatureMode::Off, false; "off_preserves_lexical")]
-    fn decision_search_only_reorders_catalog_loads(mode: FeatureMode, ranked: bool) {
-        let fixture = SearchDecisions::new(mode, LAST_SEARCH_CANDIDATE, RELEVANT);
-        let (_, session) = decision_search_session();
-        let outcome = smol::block_on(session.prepare_search_tools_with_decisions(
-            SEARCH_QUERY,
-            Some(&fixture.decisions),
-            &DecisionContext::default(),
-        ))
-        .and_then(|prepared| prepared.commit())
-        .unwrap();
-        let last = format!("srv__tool_{MAX_SEARCH_LOADS}");
-        assert_eq!(outcome.loaded.len(), MAX_SEARCH_LOADS);
-        assert_eq!(
-            outcome.loaded.iter().any(|name| name.as_ref() == last),
-            ranked
-        );
-        assert!(session.has_tool(&format!("srv.tool_{MAX_SEARCH_LOADS}")));
-        if ranked {
-            assert_eq!(outcome.loaded[0].as_ref(), last);
-        }
-    }
-
-    #[test_case(" TOOL_5 "; "bare")]
-    #[test_case(" SRV__TOOL_5 "; "wire")]
-    #[test_case(" SRV.TOOL_5 "; "qualified")]
-    fn exact_mcp_names_bypass_decisions(query: &str) {
-        let fixture = SearchDecisions::new(FeatureMode::Enforce, FIRST_SEARCH_CANDIDATE, RELEVANT);
-        let (_, session) = decision_search_session();
-        assert!(session.has_exact_match(query));
-        let outcome = smol::block_on(session.prepare_search_tools_with_decisions(
-            query,
-            Some(&fixture.decisions),
-            &DecisionContext::default(),
-        ))
-        .and_then(|prepared| prepared.commit())
-        .unwrap();
-        assert_eq!(outcome.loaded[0].as_ref(), "srv__tool_5");
-        assert!(fixture.requests.lock().unwrap().is_empty());
-    }
-
-    #[test_case("srv.tool_5"; "individual")]
-    #[test_case("srv.*"; "server")]
-    fn disabled_mcp_tools_never_enter_decision_shortlist(disabled: &str) {
-        let fixture = SearchDecisions::new(FeatureMode::Enforce, FIRST_SEARCH_CANDIDATE, RELEVANT);
-        let (_, session) = decision_search_session();
-        let session = session.with_disabled_tools(&[disabled.into()]);
-        assert!(!session.has_exact_match("tool_5"));
-        let outcome = smol::block_on(session.prepare_search_tools_with_decisions(
-            SEARCH_QUERY,
-            Some(&fixture.decisions),
-            &DecisionContext::default(),
-        ))
-        .and_then(|prepared| prepared.commit())
-        .unwrap();
-        assert!(
-            !outcome
-                .loaded
-                .iter()
-                .any(|name| name.as_ref() == "srv__tool_5")
-        );
-        let requests = fixture.requests.lock().unwrap();
-        for request in requests.iter() {
-            assert!(
-                !serde_json::to_string(request)
-                    .unwrap()
-                    .contains("srv__tool_5")
-            );
-        }
-        if disabled == "srv.*" {
-            assert!(requests.is_empty());
-        }
-    }
-
-    #[test]
-    fn catalog_republication_discards_in_flight_ranking() {
-        let (mut inner, session) = decision_search_session();
-        inner.entries[0].tools = vec![tool_def("srv", "replacement", SEARCH_QUERY, json!({}))];
-        let replacement_index = ArcSwap::from_pointee(ToolIndex::default());
-        let replacement_snapshot = ArcSwap::from_pointee(McpSnapshot::default());
-        publish(&inner, &replacement_index, &replacement_snapshot);
-        let index = session.handle.index.clone();
-        let fixture = SearchDecisions::with_hook(
-            FeatureMode::Enforce,
-            LAST_SEARCH_CANDIDATE,
-            RELEVANT,
-            Some(Box::new(move || {
-                index.store(replacement_index.load_full());
-            })),
-        );
-        let outcome = smol::block_on(session.prepare_search_tools_with_decisions(
-            SEARCH_QUERY,
-            Some(&fixture.decisions),
-            &DecisionContext::default(),
-        ))
-        .and_then(|prepared| prepared.commit())
-        .unwrap();
-        assert_eq!(outcome.loaded, vec![Arc::<str>::from("srv__replacement")]);
-        assert!(
-            !session
-                .lock_loaded()
-                .iter()
-                .any(|name| name.as_ref().starts_with("srv.tool_"))
-        );
-    }
-
-    #[test_case("srv__tool-" ; "wire_name")]
-    #[test_case("tool-" ; "bare_name_as_shown_in_catalog")]
-    fn search_exact_name_outranks_keyword_matches(prefix: &str) {
-        let tools = (0..MAX_SEARCH_LOADS + 1)
-            .map(|i| tool_def("srv", &format!("tool-{i}"), "", json!({})))
-            .collect();
-        let (_inner, handle) = setup(vec![entry_with_tools("srv", tools)]);
-        // Alphabetical tie-break alone would leave the last tool in overflow.
-        let last = format!("{prefix}{MAX_SEARCH_LOADS}");
-        let result = handle.search_tools(&last).unwrap().message;
-        let overflow = result
-            .lines()
-            .find(|l| l.starts_with(SEARCH_OVERFLOW_PREFIX))
-            .expect("one match past the cap must overflow");
-        assert!(
-            result.contains(&format!("srv__tool-{MAX_SEARCH_LOADS}"))
-                && !overflow.contains(&format!("tool-{MAX_SEARCH_LOADS}")),
-            "exact name must be loaded, not overflowed: {result}"
-        );
-    }
-
-    #[test]
-    fn search_ranks_name_hits_above_description_hits() {
-        let tools = vec![
-            tool_def("srv", "add_comment", "Comment on an issue", json!({})),
-            tool_def("srv", "create_issue", "Open a ticket", json!({})),
-        ];
-        let (_inner, handle) = setup(vec![entry_with_tools("srv", tools)]);
-        let result = handle.search_tools("issue").unwrap().message;
-        let pos = |name: &str| {
-            result
-                .find(name)
-                .unwrap_or_else(|| panic!("{name} must match: {result}"))
-        };
-        assert!(
-            pos("srv__create_issue") < pos("srv__add_comment"),
-            "name hit must rank above description hit: {result}"
-        );
-    }
-
-    #[test]
-    fn search_multi_word_query_matches_any_keyword() {
-        let tools = vec![tool_def(
-            "srv",
-            "create_pr",
-            "Open a pull request",
-            json!({}),
-        )];
-        let (_inner, handle) = setup(vec![entry_with_tools("srv", tools)]);
-        let result = handle.search_tools("pull request").unwrap().message;
-        assert!(result.contains("srv__create_pr"), "got: {result}");
-    }
-
-    #[test]
-    fn search_matches_schema_parameter_names() {
-        let schema = json!({"type": "object", "properties": {"labels": {"type": "array"}}});
-        let tools = vec![tool_def("srv", "update", "Update a thing", schema)];
-        let (_inner, handle) = setup(vec![entry_with_tools("srv", tools)]);
-        let result = handle.search_tools("labels").unwrap().message;
-        assert!(result.contains("srv__update"), "got: {result}");
-    }
-
-    #[test]
-    fn extend_tools_never_duplicates_existing_names() {
-        let (_inner, handle) = setup(vec![always_load_entry("eager", FakeTransport::new())]);
-        let mut tools = json!([]);
-        handle.request_snapshot().extend_tools(&mut tools);
-        handle.request_snapshot().extend_tools(&mut tools);
-        assert_eq!(tool_names(&tools), vec!["eager__tool"]);
-    }
-
-    #[test]
-    fn new_seeds_loads_only_from_wire_names_in_history() {
-        let (_inner, session) = setup(vec![fake_entry("srv", FakeTransport::new())]);
-        let tool_use = |name: &str| ContentBlock::tool_use("t", name, json!({}));
-        let history = vec![Message {
-            role: Role::Assistant,
-            content: vec![
-                tool_use(WIRE_TOOL_NAME),
-                tool_use("read"),
-                tool_use("gone__tool"),
-            ],
-            display_text: None,
-            ..Default::default()
-        }];
-        let restored = McpSession::new(session.handle.clone(), &history);
-        let mut tools = json!([]);
-        restored.request_snapshot().extend_tools(&mut tools);
-        assert_eq!(
-            tool_names(&tools),
-            vec![WIRE_TOOL_NAME],
-            "only wire names still in the index may load"
-        );
-    }
-
-    #[test]
-    fn mid_session_loads_never_flip_remainder_into_context() {
-        let defs = vec![
-            tool_def("srv", "alpha", "", json!({})),
-            tool_def("srv", "beta", "", json!({})),
-            tool_def("srv", "gamma", "", json!({})),
-        ];
-        let (_inner, handle) = setup_with_defer(vec![entry_with_tools("srv", defs)], 2);
-        handle.mark_loaded("srv.alpha");
-        handle.mark_loaded("srv.beta");
-        let mut tools = json!([]);
-        handle.request_snapshot().extend_tools(&mut tools);
-        let names = tool_names(&tools);
-        assert!(names.contains(&"srv__alpha") && names.contains(&"srv__beta"));
-        assert!(
-            !names.contains(&"srv__gamma"),
-            "threshold must compare the full index, not the remaining deferred count: {names:?}"
-        );
-        let catalog = tools
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|t| t["name"] == TOOL_SEARCH_TOOL_NAME)
-            .expect("tool_search must stay while any tool is deferred");
-        let description = catalog["description"].as_str().unwrap();
-        assert!(description.contains("srv: gamma"), "got: {description}");
-    }
-
-    /// Both sources share one `tool_search`, and the request builds it by
-    /// running built-in deferral first. Whichever ran first used to claim the
-    /// name and leave the other's tools uncatalogued.
-    #[test_case(true; "builtin_exhausted_first")]
-    #[test_case(false; "mcp_exhausted_first")]
-    fn a_builtin_catalog_does_not_hide_the_deferred_mcp_tools(builtin_first: bool) {
-        let defs = vec![
-            tool_def("srv", "alpha", "", json!({})),
-            tool_def("srv", "beta", "", json!({})),
-            tool_def("srv", "gamma", "", json!({})),
-        ];
-        let (_inner, handle) = setup_with_defer(vec![entry_with_tools("srv", defs)], 2);
-        let builtin = crate::tools::DeferralSession::new(
-            vec![crate::tools::DeferredTool::new(
-                BUILTIN_DEFERRED,
-                None,
-                json!({ "name": BUILTIN_DEFERRED, "description": BUILTIN_DESCRIPTION }),
-            )],
-            std::iter::empty(),
-        );
-
-        for (builtin_loaded, mcp_loaded, search_count) in [
-            (false, false, 1),
-            (builtin_first, !builtin_first, 1),
-            (true, true, 0),
-        ] {
-            if builtin_loaded {
-                builtin.mark_loaded(BUILTIN_DEFERRED);
-            }
-            if mcp_loaded {
-                for name in ["srv.alpha", "srv.beta", "srv.gamma"] {
-                    handle.mark_loaded(name);
-                }
-            }
-
-            let mut tools = json!([]);
-            let mut sections: Vec<String> = builtin
-                .request_snapshot()
-                .extend_declared(&mut tools)
-                .into_iter()
-                .collect();
-            sections.extend(handle.request_snapshot().extend_declared(&mut tools));
-            crate::tools::deferral::push_catalog(&mut tools, &sections);
-
-            let catalogs: Vec<_> = tools
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|tool| tool["name"] == TOOL_SEARCH_TOOL_NAME)
-                .collect();
-            assert_eq!(catalogs.len(), search_count);
-            for catalog in catalogs {
-                let description = catalog["description"].as_str().unwrap();
-                assert_eq!(
-                    description.contains(BUILTIN_DEFERRED),
-                    !builtin_loaded,
-                    "got: {description}"
-                );
-                assert_eq!(
-                    description.contains("srv:"),
-                    !mcp_loaded,
-                    "got: {description}"
-                );
-            }
-        }
-    }
-
-    /// A plugin or server owning the name is a real conflict, unlike the two
-    /// internal sources that share the entry by design.
-    #[test]
-    fn a_tool_the_caller_declared_as_tool_search_keeps_the_name() {
-        let (_inner, handle) = setup(vec![fake_entry("srv", FakeTransport::new())]);
-        let mut tools = json!([{ "name": TOOL_SEARCH_TOOL_NAME, "description": "mine" }]);
-
-        let sections: Vec<String> = handle
-            .request_snapshot()
-            .extend_declared(&mut tools)
-            .into_iter()
-            .collect();
-        crate::tools::deferral::push_catalog(&mut tools, &sections);
-
-        assert_eq!(tool_names(&tools), vec![TOOL_SEARCH_TOOL_NAME]);
-        assert_eq!(tools.as_array().unwrap()[0]["description"], "mine");
-    }
-
-    #[test]
-    fn mark_loaded_declares_tool_and_drops_empty_catalog() {
-        let (_inner, handle) = setup(vec![fake_entry("srv", FakeTransport::new())]);
-        handle.mark_loaded(TOOL_NAME);
-        let mut tools = json!([]);
-        handle.request_snapshot().extend_tools(&mut tools);
-        assert_eq!(
-            tool_names(&tools),
-            vec![WIRE_TOOL_NAME],
-            "loaded tool must be declared; an empty catalog must not be advertised"
-        );
-    }
-
-    #[test]
-    fn existing_wire_name_stays_out_of_catalog() {
-        let defs = vec![
-            tool_def("srv", "alpha", "", json!({})),
-            tool_def("srv", "beta", "", json!({})),
-        ];
-        let (_inner, handle) = setup(vec![entry_with_tools("srv", defs)]);
-        let mut tools = json!([{ "name": "srv__alpha" }]);
-        handle.request_snapshot().extend_tools(&mut tools);
-        assert_eq!(
-            tool_names(&tools),
-            vec!["srv__alpha", TOOL_SEARCH_TOOL_NAME],
-            "colliding name must be skipped, not deferred or re-added"
-        );
-        let catalog = tools[1]["description"].as_str().unwrap();
-        assert!(catalog.contains("srv: beta"), "got: {catalog}");
-        assert!(!catalog.contains("alpha"), "got: {catalog}");
-    }
-
-    #[test]
-    fn history_seeding_handles_tool_names_with_double_underscores() {
-        let defs = vec![tool_def("srv", "do__thing", "", json!({}))];
-        let (_inner, session) = setup(vec![entry_with_tools("srv", defs)]);
-        let history = vec![Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::tool_use("t", "srv__do__thing", json!({}))],
-            display_text: None,
-            ..Default::default()
-        }];
-        let restored = McpSession::new(session.handle.clone(), &history);
-        let mut tools = json!([]);
-        restored.request_snapshot().extend_tools(&mut tools);
-        assert_eq!(
-            tool_names(&tools),
-            vec!["srv__do__thing"],
-            "only the first __ is the server separator"
-        );
-    }
-
-    #[test]
-    fn search_ignores_always_load_tools() {
-        let (_inner, handle) = setup(vec![always_load_entry("eager", FakeTransport::new())]);
-        let result = handle.search_tools("tool").unwrap().message;
-        assert!(
-            result.contains(SEARCH_NO_MATCH),
-            "always_load tools are already declared: {result}"
-        );
-    }
-
-    #[test]
-    fn search_loads_stay_scoped_to_their_session() {
-        let (_inner, session_a) = setup(vec![fake_entry("srv", FakeTransport::new())]);
-        let session_b = session_a.fresh();
-        session_a.search_tools("tool").unwrap();
-
-        let mut tools_a = json!([]);
-        session_a.request_snapshot().extend_tools(&mut tools_a);
-        assert_eq!(tool_names(&tools_a), vec![WIRE_TOOL_NAME]);
-
-        let mut tools_b = json!([]);
-        session_b.request_snapshot().extend_tools(&mut tools_b);
-        assert_eq!(tool_names(&tools_b), vec![TOOL_SEARCH_TOOL_NAME]);
+        assert!(session.tool_inventory()[0].disabled);
     }
 
     /// `ready` carries the correctness of connecting in the background: a prompt
@@ -4559,9 +3234,7 @@ mod tests {
             let (mut inner, handle) = setup(vec![fake_entry("srv", Arc::clone(&t) as _)]);
 
             assert!(handle.has_tool(TOOL_NAME));
-            let mut tools = json!([]);
-            handle.request_snapshot().extend_tools(&mut tools);
-            assert_eq!(tools[0]["name"], TOOL_SEARCH_TOOL_NAME);
+            assert!(handle.has_enabled_server());
 
             handle_toggle(&mut inner, "srv", false).await;
             publish(&inner, &handle.index, &handle.snapshot);
@@ -4572,9 +3245,8 @@ mod tests {
             assert!(entry.transport.is_none());
             assert_eq!(entry.status, McpServerStatus::Disabled);
             assert!(!handle.has_tool(TOOL_NAME));
-            let mut tools = json!([]);
-            handle.request_snapshot().extend_tools(&mut tools);
-            assert!(tools.as_array().unwrap().is_empty());
+            assert!(!handle.has_enabled_server());
+            assert!(handle.servers().is_empty());
         });
     }
 
@@ -4664,10 +3336,6 @@ mod tests {
         raw.timeout = CHANGED_TIMEOUT_MS;
     }
 
-    fn load_always(raw: &mut RawServerConfig) {
-        raw.always_load = true;
-    }
-
     /// Stands in for a connect that succeeded, so a test can watch the
     /// connection survive or die without spawning a server.
     fn connect_fake(inner: &mut McpManagerInner, server: &str) -> Arc<FakeTransport> {
@@ -4727,7 +3395,7 @@ mod tests {
                 entry(&inner, RELOAD_SERVER).status,
                 McpServerStatus::Running
             );
-            assert!(published(&inner, 0).has_tool(TOOL_NAME));
+            assert!(published(&inner).has_tool(TOOL_NAME));
         });
     }
 
@@ -4750,7 +3418,7 @@ mod tests {
 
             let (connects, _rx) = reload(&mut inner, make_config(servers)).await;
 
-            let handle = published(&inner, 0);
+            let handle = published(&inner);
             let statuses: Vec<McpServerStatus> = handle
                 .reader()
                 .load()
@@ -4803,7 +3471,6 @@ mod tests {
 
     #[test_case(add_argument; "command")]
     #[test_case(change_timeout; "timeout")]
-    #[test_case(load_always; "always_load")]
     fn reload_restarts_a_changed_server(change: fn(&mut RawServerConfig)) {
         smol::block_on(async {
             let mut raw = stdio_raw(&[MISSING_PROGRAM]);
@@ -4814,7 +3481,7 @@ mod tests {
             let (connects, rx) = reload(&mut inner, make_config(vec![(RELOAD_SERVER, raw)])).await;
 
             assert_eq!(transport.shutdowns(), 1);
-            assert!(!published(&inner, 0).has_tool(TOOL_NAME));
+            assert!(!published(&inner).has_tool(TOOL_NAME));
             assert_eq!(
                 entry(&inner, RELOAD_SERVER).status,
                 McpServerStatus::Connecting
@@ -4856,7 +3523,7 @@ mod tests {
             )
             .await;
 
-            let handle = published(&inner, 0);
+            let handle = published(&inner);
             let infos = handle.reader().load_full().infos.clone();
             let rendered = format!("{infos:?}");
             assert_eq!(transport.shutdowns(), 1);
@@ -5004,7 +3671,7 @@ mod tests {
 
             assert!(connects.is_empty());
             assert_eq!(transport.shutdowns(), 0);
-            assert!(published(&inner, 0).has_tool(TOOL_NAME));
+            assert!(published(&inner).has_tool(TOOL_NAME));
         });
     }
 
@@ -5021,7 +3688,7 @@ mod tests {
             );
             let kept = connect_fake(&mut inner, RELOAD_SERVER);
             let removed = connect_fake(&mut inner, OTHER_SERVER);
-            let handle = published(&inner, 0);
+            let handle = published(&inner);
             let (cmd_tx, cmd_rx) = flume::unbounded();
             let handle = McpHandle { cmd_tx, ..handle };
             let loop_task = smol::spawn(run(
@@ -5234,7 +3901,7 @@ mod tests {
             prompt_infos: Vec::new(),
             resources: ResourceLists::default(),
         });
-        let handle = published(&inner, 0);
+        let handle = published(&inner);
 
         let binding = handle.bind_tool(&qualified(FAKE_TOOL)).unwrap();
         assert_eq!(binding.kind(), Some(McpServerKind::Executor));
@@ -5298,11 +3965,7 @@ mod tests {
 
         let narrowed = session.narrowed(&read_only_ceiling());
         assert_eq!(narrowed.is_disabled(LOOKUP_TOOL), !read_only);
-        let [status] = narrowed
-            .request_snapshot()
-            .tool_inventory()
-            .try_into()
-            .unwrap();
+        let [status] = narrowed.tool_inventory().try_into().unwrap();
         assert_eq!(
             (status.disabled, status.reason),
             (!read_only, (!read_only).then_some(MODE_DISABLED))
@@ -5386,7 +4049,7 @@ mod tests {
             });
         };
         let note = |inner: &McpManagerInner| {
-            published(inner, 0)
+            published(inner)
                 .bind_tool(&qualified(RESUME_RAW))
                 .unwrap()
                 .call_facts(&accept_paused_run())

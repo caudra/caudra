@@ -271,9 +271,8 @@ version = 1
 # web = 3
 
 # Rows for `automation`, `batch`, `execution_environment`, `list_sessions`,
-# `mcp_resource`, `publish_message`, `question`, `read_topic`, `send_message`,
-# `skill`, `todo_write`, `tool_output`, `view_image`, `work_assignment`,
-# `workflow`.
+# `mcp`, `publish_message`, `question`, `read_topic`, `send_message`, `skill`,
+# `todo_write`, `tool_output`, `view_image`, `work_assignment`, `workflow`.
 # Type: usize, at least 1.
 # other = 3
 

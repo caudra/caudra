@@ -253,8 +253,7 @@ pub fn tool_available(
                 && effective_task_execution(&ctx.config, ctx.background.is_some()).is_none())
             || (name == super::SHELL_TOOL_NAME
                 && effective_shell_execution(&ctx.config, ctx.job_scope().is_some()).is_none())
-            || (name == super::MCP_RESOURCE_TOOL_NAME
-                && !mcp.is_some_and(|mcp| mcp.offers_resources()))
+            || (name == super::MCP_TOOL_NAME && !mcp.is_some_and(|mcp| mcp.has_enabled_server()))
         {
             return false;
         }
@@ -271,17 +270,7 @@ pub fn tool_available(
         )
         .available();
     }
-    let canonical = crate::mcp::internal_tool_name(name);
-    mcp.is_some_and(|mcp| {
-        mcp.has_tool(&canonical)
-            && !mcp.is_disabled(&canonical)
-            && (mcp.is_read_only(&canonical)
-                || !(ctx.policy().is_read_only() || ctx.mode.is_planning()))
-            && ctx
-                .profile_tool_policy
-                .exposure(&canonical, ProfileToolSource::Mcp)
-                != Some(ProfileToolExposure::Disabled)
-    })
+    false
 }
 
 #[cfg(test)]
@@ -600,10 +589,6 @@ mod tests {
                 split.deferred,
                 [Arc::from(WRITE)].into_iter(),
             ));
-            ctx.mcp = Some(crate::mcp::stub_session(&[(
-                "srv.observe",
-                "Observe external data",
-            )]));
             let found = tool_dispatch::run(
                 &ctx.registry,
                 ctx.mcp.as_ref(),
@@ -626,40 +611,17 @@ mod tests {
             )
             .await;
             assert!(!read.is_error, "{}", read.output.as_text());
-            for name in [WRITE, "srv__observe"] {
-                let denied = tool_dispatch::run(
-                    &ctx.registry,
-                    ctx.mcp.as_ref(),
-                    CALL.into(),
-                    name,
-                    &json!({}),
-                    &ctx,
-                    Emit::Silent,
-                )
-                .await;
-                assert_eq!(denied.accounting.outcome, Some(ToolOutcome::Denied));
-            }
-        });
-    }
-
-    #[test_case("srv.observe"; "canonical")]
-    #[test_case("srv__observe"; "wire")]
-    fn disabled_mcp_dispatch_is_typed(name: &str) {
-        smol::block_on(async {
-            let mut ctx = stub_ctx(&AgentMode::Build);
-            ctx.profile_tool_policy = profile(json!({"overrides":{"srv.*":"disabled"}}));
-            let mcp = crate::mcp::stub_session(&[("srv.observe", "Observe external data")]);
-            let done = tool_dispatch::run(
+            let denied = tool_dispatch::run(
                 &ctx.registry,
-                Some(&mcp),
+                ctx.mcp.as_ref(),
                 CALL.into(),
-                name,
+                WRITE,
                 &json!({}),
                 &ctx,
                 Emit::Silent,
             )
             .await;
-            assert_eq!(done.accounting.outcome, Some(ToolOutcome::Denied));
+            assert_eq!(denied.accounting.outcome, Some(ToolOutcome::Denied));
         });
     }
 }

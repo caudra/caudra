@@ -467,6 +467,7 @@ pub fn run(
             | AgentEvent::ToolDone(_)
             | AgentEvent::TaskAdmitted(_)
             | AgentEvent::BatchProgress(_)
+            | AgentEvent::McpCodeProgress(_)
             | AgentEvent::Question(_)
             | AgentEvent::QuestionClosed
             | AgentEvent::QueueItemConsumed { .. }

@@ -600,8 +600,8 @@ mod tests {
         },
         cancel::CancelToken,
         tools::{
-            BATCH_TOOL_NAME, Deadline, DescriptionContext, TOOL_SEARCH_TOOL_NAME, ToolContext,
-            ToolEffect, ToolFilter, audited_local_tool,
+            BATCH_TOOL_NAME, Deadline, DescriptionContext, ToolContext, ToolEffect, ToolFilter,
+            audited_local_tool,
             native::batch::BatchTool,
             registry::{BoxFuture, ParseError, Tool, ToolInvocation, ToolSource},
             test_support::stub_ctx,
@@ -984,20 +984,14 @@ mod tests {
         });
     }
 
+    /// MCP tools are reached only from the `mcp` tool's code, so a name from before code mode has
+    /// no schema to repair a call against.
     #[test_case(MCP_TOOL; "qualified_name")]
     #[test_case(MCP_WIRE_TOOL; "wire_name")]
-    fn deferred_mcp_schema_lookup_does_not_load_live_session(name: &str) {
+    fn an_mcp_tool_name_has_no_schema_to_repair_against(name: &str) {
         let (ctx, _) = model_context(REPLY);
         let mcp = crate::mcp::stub_session(&[(MCP_TOOL, TOOL)]);
-        assert!(mcp.request_snapshot().tool_inventory()[0].deferred);
-        assert_eq!(
-            repair_schema(&ctx.registry, Some(&mcp), name, &ctx),
-            Some(json!({}))
-        );
-        assert!(mcp.request_snapshot().tool_inventory()[0].deferred);
-        let schema = repair_schema(&ctx.registry, Some(&mcp), TOOL_SEARCH_TOOL_NAME, &ctx).unwrap();
-        assert_eq!(schema["properties"]["query"]["type"], "string");
-        assert_eq!(schema["required"], json!(["query"]));
+        assert_eq!(repair_schema(&ctx.registry, Some(&mcp), name, &ctx), None);
     }
 
     #[test_case(false; "null_schema")]

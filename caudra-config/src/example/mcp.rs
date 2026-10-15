@@ -1,8 +1,6 @@
 use crate::MAX_SERVER_NAME_LEN;
 use crate::files;
-use crate::mcp::{
-    HTTP_FIELDS, MCP_VERSION, OAUTH_FIELDS, SERVER_FIELDS, STDIO_FIELDS, TOP_LEVEL_FIELDS,
-};
+use crate::mcp::{HTTP_FIELDS, MCP_VERSION, OAUTH_FIELDS, SERVER_FIELDS, STDIO_FIELDS};
 
 use super::{Document, Header, RECORDS_USAGE, Table, global_location, preamble};
 
@@ -15,7 +13,7 @@ const PROJECT_SCOPE: &str = "A project .caudra/mcp.toml adds servers, and a proj
 const SAVES: &str = "When /mcp turns a server on or off, Caudra sets `enabled` in the file that \
      defines the server and keeps your comments.";
 const HTTP_ABOUT: &str = "An HTTP server connects to `url` instead of running a command. \
-     `enabled`, `timeout`, and `always_load` work here too.";
+     `enabled` and `timeout` work here too.";
 const OAUTH_ABOUT: &str = "The static OAuth client of [mcp.analytics], for a server that has no \
      dynamic client registration. Without it, Caudra registers a client when the server asks for \
      a login.";
@@ -35,7 +33,6 @@ pub fn document() -> Document {
         ),
         version: MCP_VERSION,
         tables: vec![
-            Table::of(Header::Root, TOP_LEVEL_FIELDS),
             Table::of(
                 Header::Record(STDIO_SERVER.into()),
                 SERVER_FIELDS.iter().chain(STDIO_FIELDS),
@@ -51,6 +48,7 @@ fn server_about() -> String {
     format!(
         "Each [mcp.NAME] table is one server, and a stdio server like this one runs `command`. \
          NAME is 1 to {MAX_SERVER_NAME_LEN} ASCII letters, digits, and hyphens, and cannot be \
-         the name of a built-in tool. The tools of the server are named NAME__TOOL."
+         the name of a built-in tool. In the `mcp` tool the server is a Python namespace, and its \
+         tools are that namespace's async functions."
     )
 }

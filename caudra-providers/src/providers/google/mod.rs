@@ -1078,13 +1078,22 @@ mod tests {
     }
 
     fn table_body(spec: &str, messages: &[Message], thinking: ThinkingConfig) -> Value {
+        declaring_body(spec, messages, thinking, &json!([]))
+    }
+
+    fn declaring_body(
+        spec: &str,
+        messages: &[Message],
+        thinking: ThinkingConfig,
+        tools: &Value,
+    ) -> Value {
         let model = Model::from_spec(spec).unwrap();
         Google::with_auth(test_auth(), test_timeouts())
             .wire_request(
                 &model,
                 messages,
                 "",
-                &json!([]),
+                tools,
                 &RequestOptions {
                     thinking,
                     ..RequestOptions::default()
@@ -1153,6 +1162,71 @@ mod tests {
         assert!(
             parts[1].get("thoughtSignature").is_none(),
             "{ONLY_THE_FIRST_CALL}"
+        );
+    }
+
+    const LEGACY_MCP_CALL: &str = "everything__get-sum";
+    const CODE_MODE_TOOL: &str = "mcp";
+    const LEGACY_RESULT: &str = "The sum of 4 and 5 is 9.";
+
+    /// A session from before MCP code mode called each MCP tool directly. Resumed now, it
+    /// declares only `mcp`, and the old call still goes out under its own name, signed for the
+    /// models that check, with its response paired to it.
+    #[test_case(ARGON_SPEC     ; "gemini_4")]
+    #[test_case(FLASH_3_6_SPEC ; "gemini_3")]
+    #[test_case(FLASH_2_5_SPEC ; "gemini_2_5")]
+    fn a_direct_mcp_call_from_before_code_mode_is_replayed_as_it_was(spec: &str) {
+        let arguments = json!({"a": 4, "b": 5});
+        let history = [
+            Message::user("add 4 and 5".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    "call_1",
+                    LEGACY_MCP_CALL,
+                    arguments.clone(),
+                )],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: LEGACY_RESULT.into(),
+                    is_error: false,
+                    output_ref: None,
+                }],
+                ..Default::default()
+            },
+            Message::user("and again".into()),
+        ];
+        let tools = json!([{
+            "name": CODE_MODE_TOOL,
+            "description": "Run Python that calls MCP servers.",
+            "input_schema": {"type": "object", "properties": {"code": {"type": "string"}}},
+        }]);
+
+        let body = declaring_body(spec, &history, ThinkingConfig::Adaptive, &tools);
+
+        let call = &body["contents"][1]["parts"][0];
+        assert_eq!(call["functionCall"]["name"], LEGACY_MCP_CALL);
+        assert_eq!(call["functionCall"]["args"], arguments);
+        let signed = validates_thought_signatures(&Model::from_spec(spec).unwrap().id);
+        assert_eq!(
+            call["thoughtSignature"].as_str(),
+            signed.then_some(SKIP_SIGNATURE_VALIDATOR)
+        );
+        let response = &body["contents"][2]["parts"][0]["functionResponse"];
+        assert_eq!(response["name"], LEGACY_MCP_CALL);
+        assert_eq!(response["response"], json!({"result": LEGACY_RESULT}));
+        assert_eq!(
+            body["tools"][0]["functionDeclarations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|declaration| &declaration["name"])
+                .collect::<Vec<_>>(),
+            [CODE_MODE_TOOL]
         );
     }
 

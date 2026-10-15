@@ -12,7 +12,7 @@
 pub mod automation;
 pub mod batch;
 pub mod image_generate;
-mod mcp_resource;
+pub mod mcp;
 pub mod memory;
 pub mod peers;
 pub mod plan;
@@ -96,11 +96,7 @@ fn entries(
             ToolEffect::Mutating,
             image_generate::DESCRIPTION,
         ),
-        entry(
-            mcp_resource::McpResourceTool,
-            ToolEffect::ReadOnly,
-            mcp_resource::DESCRIPTION,
-        ),
+        entry(mcp::McpTool, ToolEffect::Orchestrator, mcp::DESCRIPTION),
         entry(
             memory::MemoryTool,
             ToolEffect::Mutating,

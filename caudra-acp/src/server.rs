@@ -74,6 +74,9 @@ const PERMISSION_QUESTION_CLIENT: &str = "openmausbot";
 /// ACP has no fast-mode toggle, so a restored total is priced at standard rates.
 const RESTORED_FAST: bool = false;
 const DECISION_ADVISORY_GUIDANCE: &str = "Decision engine estimates do not authorize this action.";
+/// Joins a call's id to a child's index: a `batch` or `mcp` child runs as
+/// `<parent>:<n>`, and its own children append another `:<n>`.
+const CHILD_CALL_SEPARATOR: char = ':';
 
 /// Ids come from here and are never reused, so a late answer for a closed
 /// session cannot match a request of the session that replaced it.
@@ -715,10 +718,7 @@ fn question_tool(
                 .as_ref()
                 .map(ToString::to_string)
                 .ok_or("no session")?;
-            // Batch/python_execution children dispatch with an empty id; a
-            // scope pointing at a tool call the client never saw would get
-            // the elicitation rejected or dropped.
-            let tool_call_id = ctx.tool_use_id.filter(|id| !id.is_empty());
+            let tool_call_id = shown_tool_call(&ctx);
             let request = if via_permission {
                 AgentRequest::RequestPermissionRequest(
                     elicitation::question_permission_request(&session_id, tool_call_id, &input)
@@ -811,8 +811,8 @@ impl ElicitorFactory for McpElicitors {
     }
 }
 
-/// The client never sees a subagent's own calls, nor a batch child, which
-/// dispatches with an empty id.
+/// The client never sees a subagent's own calls, nor a `batch` or `mcp`
+/// child's, so either is scoped to the root call the client was shown.
 fn shown_tool_call(ctx: &ToolContext) -> Option<String> {
     ctx.root_tool_use_id
         .as_ref()
@@ -1325,19 +1325,35 @@ fn permission_scope_summary(scopes: &[String]) -> String {
     )
 }
 
+/// The announced call a request belongs to. A `batch` or `mcp` child asks
+/// under `<parent>:<n>`, an id the client never saw, so it is attributed to
+/// the nearest ancestor that was announced; an id with none passes through.
+fn shown_call<'a>(announced: &HashSet<String>, id: &'a str) -> &'a str {
+    iter::successors(Some(id), |call| {
+        call.rsplit_once(CHILD_CALL_SEPARATOR)
+            .map(|(parent, _)| parent)
+    })
+    .find(|call| announced.contains(*call))
+    .unwrap_or(id)
+}
+
+/// The request keeps its own title, content, and input, so the user approves
+/// the inner call even when it is shown on its parent's card.
 fn request_permission(
     out_tx: &Sender<Value>,
     pending: &PendingState,
     sid: &SessionId,
+    announced: &HashSet<String>,
     request: CaudraPermissionRequest,
 ) {
     let fields = ToolCallUpdateFields::new()
         .title(request.presentation.action.clone())
         .content(permission_content(&request))
         .raw_input(request.input.clone());
+    let tool_call_id = ToolCallId::from(shown_call(announced, &request.id).to_owned());
     let client_request = AgentRequest::RequestPermissionRequest(RequestPermissionRequest::new(
         sid.clone(),
-        ToolCallUpdate::new(ToolCallId::from(request.id.clone()), fields),
+        ToolCallUpdate::new(tool_call_id, fields),
         permissions::permission_options(),
     ));
     let kind = AskKind::Permission {
@@ -1381,6 +1397,7 @@ fn update_presented_permission(
     out_tx: &Sender<Value>,
     pending: &PendingState,
     sid: &SessionId,
+    announced: &HashSet<String>,
     request: &CaudraPermissionRequest,
 ) {
     let active = pending.lock().unwrap().asks.values().any(
@@ -1391,7 +1408,7 @@ fn update_presented_permission(
             out_tx,
             sid,
             SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                ToolCallId::from(request.id.clone()),
+                ToolCallId::from(shown_call(announced, &request.id).to_owned()),
                 ToolCallUpdateFields::new().content(permission_content(request)),
             )),
         );
@@ -1540,11 +1557,11 @@ fn start_event_pump(
                 }
                 AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
                 AgentEvent::PermissionRequest(request) => {
-                    request_permission(&out_tx, &pending, &sid, *request);
+                    request_permission(&out_tx, &pending, &sid, &announced, *request);
                     continue;
                 }
                 AgentEvent::PermissionRequestUpdated(request) => {
-                    update_presented_permission(&out_tx, &pending, &sid, &request);
+                    update_presented_permission(&out_tx, &pending, &sid, &announced, &request);
                     continue;
                 }
                 AgentEvent::PermissionRequestResolved { request_id, .. } => {
@@ -1660,6 +1677,12 @@ mod tests {
     const MCP_TOOL_CALL: &str = "toolu_mcp";
     const MCP_TASK_CALL: &str = "toolu_task";
     const BATCH_CHILD_CALL: &str = "";
+    const MCP_CHILD_CALL: &str = "toolu_mcp:0";
+    const NESTED_CHILD_CALL: &str = "toolu_mcp:0:1";
+    const UNANNOUNCED_CHILD_CALL: &str = "toolu_unseen:0";
+    /// Some providers mint ids that already contain the separator.
+    const COLON_CALL: &str = "functions.batch:3";
+    const COLON_CALL_CHILD: &str = "functions.batch:3:0";
     const MCP_FIELD: &str = "branch";
     const MCP_ANSWER: &str = "main";
     const MCP_URL: &str = "https://example.com/authorize";
@@ -1796,8 +1819,9 @@ mod tests {
         let (out_tx, out_rx) = flume::unbounded();
         let pending = PendingState::default();
         let sid = SessionId::from(SessionRef::generate().to_string());
+        let announced = HashSet::new();
         let mut request = advisory_request(EngineFlag::Deletes, ADVISORY_PROBABILITY);
-        request_permission(&out_tx, &pending, &sid, request.clone());
+        request_permission(&out_tx, &pending, &sid, &announced, request.clone());
         let initial = out_rx.try_recv().unwrap();
         assert!(
             initial["params"]["toolCall"]["content"][0]["content"]["text"]
@@ -1807,7 +1831,7 @@ mod tests {
         );
         let pending_id = *pending.lock().unwrap().asks.keys().next().unwrap();
         request.presentation.advisories[0].flag = EngineFlag::Uploads;
-        update_presented_permission(&out_tx, &pending, &sid, &request);
+        update_presented_permission(&out_tx, &pending, &sid, &announced, &request);
         let updated = out_rx.try_recv().unwrap();
         assert_eq!(updated["method"], "session/update");
         assert_eq!(updated["params"]["update"]["toolCallId"], CAUDRA_REQUEST_ID);
@@ -1816,8 +1840,42 @@ mod tests {
         assert!(pending.lock().unwrap().asks.contains_key(&pending_id));
         resolve_presented_permission(&out_tx, &pending, CAUDRA_REQUEST_ID);
         assert_eq!(out_rx.try_recv().unwrap()["method"], "$/cancel_request");
-        update_presented_permission(&out_tx, &pending, &sid, &request);
+        update_presented_permission(&out_tx, &pending, &sid, &announced, &request);
         assert!(out_rx.is_empty());
+    }
+
+    /// The client approves on a card it has, but answers the broker's own
+    /// request, and reads what it approves from the inner call.
+    #[test_case(MCP_TOOL_CALL, MCP_TOOL_CALL ; "an_announced_call_keeps_its_id")]
+    #[test_case(MCP_CHILD_CALL, MCP_TOOL_CALL ; "a_child_is_shown_on_its_parent")]
+    #[test_case(NESTED_CHILD_CALL, MCP_TOOL_CALL ; "a_nested_child_is_shown_on_its_root")]
+    #[test_case(COLON_CALL, COLON_CALL ; "an_announced_id_with_a_separator_keeps_its_id")]
+    #[test_case(COLON_CALL_CHILD, COLON_CALL ; "a_child_of_an_id_with_a_separator")]
+    #[test_case(UNANNOUNCED_CHILD_CALL, UNANNOUNCED_CHILD_CALL ; "an_unannounced_id_passes_through")]
+    fn a_permission_request_is_shown_on_the_call_the_client_saw(request_id: &str, shown: &str) {
+        let (out_tx, out_rx) = flume::unbounded();
+        let pending = PendingState::default();
+        let sid = SessionId::from(SessionRef::generate().to_string());
+        let announced = HashSet::from([MCP_TOOL_CALL.to_owned(), COLON_CALL.to_owned()]);
+        let mut request = advisory_request(EngineFlag::Deletes, ADVISORY_PROBABILITY);
+        request.id = request_id.to_owned();
+
+        request_permission(&out_tx, &pending, &sid, &announced, request.clone());
+        let asked = out_rx.try_recv().unwrap();
+        assert_eq!(asked["params"]["toolCall"]["toolCallId"], shown);
+        assert_eq!(
+            asked["params"]["toolCall"]["title"],
+            request.presentation.action
+        );
+        assert_eq!(asked["params"]["toolCall"]["rawInput"], request.input);
+        assert!(matches!(
+            pending.lock().unwrap().asks.values().next(),
+            Some(AskKind::Permission { request_id: asked_for, .. }) if asked_for == request_id
+        ));
+
+        update_presented_permission(&out_tx, &pending, &sid, &announced, &request);
+        let updated = out_rx.try_recv().unwrap();
+        assert_eq!(updated["params"]["update"]["toolCallId"], shown);
     }
 
     #[test_case(false; "fresh_server_restores_sandbox_provenance")]
@@ -2307,6 +2365,7 @@ mod tests {
     #[test_case(None, Some(MCP_TOOL_CALL) => Some(MCP_TOOL_CALL.to_owned()) ; "the_main_agents_own")]
     #[test_case(Some(MCP_TASK_CALL), Some(MCP_TOOL_CALL) => Some(MCP_TASK_CALL.to_owned()) ; "a_subagents_task")]
     #[test_case(None, Some(BATCH_CHILD_CALL) => None ; "none_for_a_batch_child")]
+    #[test_case(Some(MCP_TOOL_CALL), Some(MCP_CHILD_CALL) => Some(MCP_TOOL_CALL.to_owned()) ; "an_mcp_childs_root")]
     fn an_mcp_elicitation_is_scoped_to_a_call_the_client_saw(
         root: Option<&str>,
         call: Option<&str>,

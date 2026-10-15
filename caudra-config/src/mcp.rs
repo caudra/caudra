@@ -7,22 +7,9 @@ pub const MCP_FILE: &str = "mcp.toml";
 pub const MCP_VERSION: u32 = 1;
 pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 pub const MAX_TIMEOUT_MS: u64 = 300_000;
-/// Below this many deferrable tools, a search round-trip plus its
-/// prompt-cache miss cost more than a handful of upfront definitions.
-pub const DEFAULT_DEFER_TOOLS: usize = 10;
 pub const DEFAULT_CALLBACK_PATH: &str = "/mcp/oauth/callback";
 pub const DEFAULT_CALLBACK_HOSTNAME: &str = "127.0.0.1";
 const MIN_TIMEOUT_MS: u64 = 1;
-
-pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[ConfigField {
-    name: "defer_tools",
-    ty: "integer",
-    default: ConfigValue::U64(DEFAULT_DEFER_TOOLS as u64),
-    min: None,
-    max: None,
-    env: None,
-    description: "Defer MCP tools behind `tool_search` only when the servers offer more than this many. `0` always defers. A project value replaces the global one",
-}];
 
 /// Keys every server takes, whatever its transport.
 pub const SERVER_FIELDS: &[ConfigField] = &[
@@ -43,15 +30,6 @@ pub const SERVER_FIELDS: &[ConfigField] = &[
         max: Some(MAX_TIMEOUT_MS),
         env: None,
         description: "Milliseconds to wait for each response from the server",
-    },
-    ConfigField {
-        name: "always_load",
-        ty: "bool",
-        default: ConfigValue::Bool(false),
-        min: None,
-        max: None,
-        env: None,
-        description: "Load every tool of the server up front instead of through `tool_search`",
     },
 ];
 

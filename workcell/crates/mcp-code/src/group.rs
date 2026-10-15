@@ -26,7 +26,9 @@ use workcell_monty_worker::WorkerLease;
 #[cfg(feature = "mcp")]
 use crate::catalog;
 use crate::{
-    diagnose::{diagnose, diagnose_type_errors, timeout_guidance},
+    diagnose::{
+        Surface, diagnose_for, diagnose_type_errors_for, hosted_timeout_guidance, timeout_guidance,
+    },
     render::{Capture, render},
     suspend::{Answer, answer},
     types::{
@@ -39,7 +41,7 @@ use crate::{
 #[cfg(feature = "mcp")]
 const TOOL_NAME: &str = "python_execution";
 /// Name shown in tracebacks the caller sees. It is not a real path and never touches a filesystem.
-const SCRIPT_NAME: &str = "snippet.py";
+pub(crate) const SCRIPT_NAME: &str = "snippet.py";
 
 /// Startup configuration. Everything here is operator-chosen and unreachable from tool input.
 #[derive(Clone, Copy, Debug)]
@@ -52,9 +54,10 @@ pub struct CodeConfiguration<'a> {
 
 pub struct CodeToolGroup {
     pool: Pool,
+    pub(crate) hosted: Pool,
     #[cfg(feature = "bundled-worker")]
     _worker_lease: Option<WorkerLease>,
-    type_check: bool,
+    pub(crate) type_check: bool,
 }
 
 impl std::fmt::Debug for CodeToolGroup {
@@ -73,6 +76,7 @@ impl CodeToolGroup {
         let built = build_pool(configuration.worker, Duration::from_millis(MAX_TIMEOUT_MS)).await?;
         Ok(Self {
             pool: built.pool,
+            hosted: built.hosted,
             #[cfg(feature = "bundled-worker")]
             _worker_lease: built.worker_lease,
             type_check: configuration.type_check,
@@ -89,6 +93,7 @@ impl CodeToolGroup {
     /// safe but leaves a SIGKILL in the operator's logs.
     pub async fn shutdown(&self) {
         self.pool.close().await;
+        self.hosted.close().await;
     }
 
     #[cfg(feature = "mcp")]
@@ -162,6 +167,8 @@ impl CodeToolGroup {
                     &e,
                     timeout_ms,
                     started.elapsed(),
+                    Surface::Isolated,
+                    captured_empty(),
                 ))));
             }
         };
@@ -189,7 +196,12 @@ impl CodeToolGroup {
             Err(DriveError::Pool(e)) => {
                 drop(session);
                 Ok(Some(execution(Self::failure(
-                    type_check, &e, timeout_ms, duration,
+                    type_check,
+                    &e,
+                    timeout_ms,
+                    duration,
+                    Surface::Isolated,
+                    captured_empty(),
                 ))))
             }
             Err(DriveError::SuspensionLimit(captured)) => {
@@ -215,7 +227,7 @@ impl CodeToolGroup {
             .await
     }
 
-    fn repl_config(type_check: bool, timeout_ms: u64) -> ReplConfig {
+    pub(crate) fn repl_config(type_check: bool, timeout_ms: u64) -> ReplConfig {
         let limits = ResourceLimits::default()
             .max_feed_duration(Duration::from_millis(timeout_ms))
             .max_turn_duration(Duration::from_millis(timeout_ms))
@@ -275,7 +287,7 @@ impl CodeToolGroup {
         Err(DriveError::SuspensionLimit(captured.take()))
     }
 
-    fn complete(
+    pub(crate) fn complete(
         type_check: bool,
         completion: Completion,
         timeout_ms: u64,
@@ -295,22 +307,24 @@ impl CodeToolGroup {
     }
 
     /// Converts a pool failure into the envelope, keeping worker internals out of the result.
-    fn failure(
+    pub(crate) fn failure(
         type_check: bool,
         error: &PoolError,
         timeout_ms: u64,
         duration: Duration,
+        surface: Surface,
+        captured: CapturedOutput,
     ) -> CodeOutput {
         let mut output = Self::envelope(
             type_check,
             Outcome::Unavailable,
             timeout_ms,
             duration,
-            captured_empty(),
+            captured,
         );
         match error {
             PoolError::Runtime(exception) => {
-                let diagnosis = diagnose(exception);
+                let diagnosis = diagnose_for(exception, surface);
                 output.outcome = diagnosis.outcome;
                 output.diagnostic = diagnosis.diagnostic;
                 output.memory_exceeded =
@@ -325,12 +339,15 @@ impl CodeToolGroup {
             // Type checking ran before execution, so nothing was executed and nothing printed.
             PoolError::Typing(diagnostics) => {
                 output.outcome = Outcome::Rejected;
-                output.diagnostic = Some(diagnose_type_errors(diagnostics));
+                output.diagnostic = Some(diagnose_type_errors_for(diagnostics, surface));
             }
             PoolError::Timeout { .. } => {
                 output.outcome = Outcome::Limited;
                 output.timed_out = true;
-                output.diagnostic = Some(timeout_guidance(""));
+                output.diagnostic = Some(match surface {
+                    Surface::Isolated => timeout_guidance(""),
+                    Surface::Hosted => hosted_timeout_guidance(""),
+                });
             }
             PoolError::Exhausted => {
                 output.diagnostic = Some(
@@ -358,7 +375,7 @@ impl CodeToolGroup {
         output
     }
 
-    fn envelope(
+    pub(crate) fn envelope(
         type_check: bool,
         outcome: Outcome,
         timeout_ms: u64,
@@ -378,9 +395,9 @@ impl CodeToolGroup {
     }
 }
 
-struct Completion {
-    value: monty_types::MontyObject,
-    captured: CapturedOutput,
+pub(crate) struct Completion {
+    pub(crate) value: monty_types::MontyObject,
+    pub(crate) captured: CapturedOutput,
 }
 
 enum DriveError {
@@ -390,17 +407,17 @@ enum DriveError {
 
 /// Shared print capture. The pool hands the sink a `&mut` closure per turn, so the buffers live
 /// outside the turn and are locked only for the duration of one chunk.
-struct Captured {
+pub(crate) struct Captured {
     stdout: Arc<Mutex<Capture>>,
     stderr: Arc<Mutex<Capture>>,
 }
 
-struct CapturedOutput {
+pub(crate) struct CapturedOutput {
     stdout: (String, bool, u64),
     stderr: (String, bool, u64),
 }
 
-fn captured_empty() -> CapturedOutput {
+pub(crate) fn captured_empty() -> CapturedOutput {
     CapturedOutput {
         stdout: (String::new(), false, 0),
         stderr: (String::new(), false, 0),
@@ -408,14 +425,16 @@ fn captured_empty() -> CapturedOutput {
 }
 
 impl Captured {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             stdout: Arc::new(Mutex::new(Capture::new(STREAM_CAPTURE_BYTES))),
             stderr: Arc::new(Mutex::new(Capture::new(STREAM_CAPTURE_BYTES))),
         }
     }
 
-    fn sink(&self) -> impl FnMut(PrintStream, &str) -> monty_pool::PrintFuture + Send + use<> {
+    pub(crate) fn sink(
+        &self,
+    ) -> impl FnMut(PrintStream, &str) -> monty_pool::PrintFuture + Send + use<> {
         let stdout = Arc::clone(&self.stdout);
         let stderr = Arc::clone(&self.stderr);
         on_print_sync(move |stream, text| {
@@ -429,7 +448,7 @@ impl Captured {
         })
     }
 
-    fn take(self) -> CapturedOutput {
+    pub(crate) fn take(self) -> CapturedOutput {
         CapturedOutput {
             stdout: into_parts(self.stdout),
             stderr: into_parts(self.stderr),
@@ -443,7 +462,7 @@ fn into_parts(capture: Arc<Mutex<Capture>>) -> (String, bool, u64) {
         .into_parts()
 }
 
-fn duration_ms(duration: Duration) -> u64 {
+pub(crate) fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
@@ -461,7 +480,7 @@ fn result_content(execution: CodeExecution) -> CallToolResult {
 }
 
 /// The text block restates the machine-readable envelope for clients that only render text.
-fn summary(output: &CodeOutput) -> String {
+pub(crate) fn summary(output: &CodeOutput) -> String {
     let mut lines = Vec::new();
     if !output.stdout.is_empty() {
         lines.push(format!("stdout:\n{}", output.stdout));
@@ -497,7 +516,7 @@ fn summary(output: &CodeOutput) -> String {
     lines.join("\n")
 }
 
-fn execution(output: CodeOutput) -> CodeExecution {
+pub(crate) fn execution(output: CodeOutput) -> CodeExecution {
     let model_text = summary(&output);
     CodeExecution { output, model_text }
 }
@@ -543,7 +562,14 @@ mod tests {
     /// paths cannot be provoked from Python on purpose — Monty preflights the allocations that would
     /// reach them — so the classification we own is asserted directly.
     fn failure_envelope(error: &PoolError) -> CodeOutput {
-        CodeToolGroup::failure(true, error, DEFAULT_TIMEOUT_MS, Duration::from_millis(1))
+        CodeToolGroup::failure(
+            true,
+            error,
+            DEFAULT_TIMEOUT_MS,
+            Duration::from_millis(1),
+            Surface::Isolated,
+            captured_empty(),
+        )
     }
 
     fn vanished() -> PoolError {

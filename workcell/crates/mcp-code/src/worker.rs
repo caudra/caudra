@@ -14,6 +14,9 @@ pub const WORKER_FILE_NAME: &str = if cfg!(windows) { "monty.exe" } else { "mont
 /// Two workers bound aggregate interpreter memory while still letting one call proceed while
 /// another is mid-flight. Raising this multiplies the worst-case resident footprint.
 pub(crate) const CODE_CONCURRENCY: usize = 2;
+/// Hosted snippets hold their worker while the host answers, which can mean a person approving a
+/// call, so they get workers of their own and never starve isolated execution.
+pub(crate) const HOSTED_CONCURRENCY: usize = 4;
 /// Waiting longer than this for a free worker is worse for the caller than a retryable error.
 const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Parent-side headroom over the per-call budget. The sandbox clock is polled, and some native
@@ -98,6 +101,8 @@ pub const fn bundled_worker_available() -> bool {
 
 pub(crate) struct PoolBuild {
     pub(crate) pool: Pool,
+    /// Starts empty: a worker is spawned the first time a hosted snippet runs.
+    pub(crate) hosted: Pool,
     #[cfg(feature = "bundled-worker")]
     pub(crate) worker_lease: Option<WorkerLease>,
 }
@@ -123,21 +128,41 @@ pub(crate) async fn build_pool(
     max_timeout: Duration,
 ) -> Result<PoolBuild, CodeBuildError> {
     let resolved = resolve_worker(source)?;
-    let mut config = PoolConfig::subprocess(resolved.path.clone());
     // One prewarmed worker makes the first call fast and catches spawn failures at startup.
-    config.min_processes = 1;
-    config.max_processes = CODE_CONCURRENCY;
-    config.checkout_timeout = Some(CHECKOUT_TIMEOUT);
-    config.request_timeout = Some(max_timeout + REQUEST_TIMEOUT_GRACE);
-    config.max_checkouts_per_worker = Some(MAX_CHECKOUTS_PER_WORKER);
-    let pool = Pool::new(config)
-        .await
-        .map_err(|_| CodeBuildError::PoolUnavailable)?;
+    let pool = Pool::new(pool_config(
+        &resolved.path,
+        1,
+        CODE_CONCURRENCY,
+        max_timeout,
+    ))
+    .await
+    .map_err(|_| CodeBuildError::PoolUnavailable)?;
+    let hosted = Pool::new(pool_config(
+        &resolved.path,
+        0,
+        HOSTED_CONCURRENCY,
+        max_timeout,
+    ))
+    .await
+    .map_err(|_| CodeBuildError::PoolUnavailable)?;
     Ok(PoolBuild {
         pool,
+        hosted,
         #[cfg(feature = "bundled-worker")]
         worker_lease: resolved.lease,
     })
+}
+
+/// `max_timeout` bounds one request to the worker. A hosted snippet waiting on its host has no
+/// request outstanding, so the wait is never charged against it.
+fn pool_config(path: &Path, min: usize, max: usize, max_timeout: Duration) -> PoolConfig {
+    let mut config = PoolConfig::subprocess(path.to_path_buf());
+    config.min_processes = min;
+    config.max_processes = max;
+    config.checkout_timeout = Some(CHECKOUT_TIMEOUT);
+    config.request_timeout = Some(max_timeout + REQUEST_TIMEOUT_GRACE);
+    config.max_checkouts_per_worker = Some(MAX_CHECKOUTS_PER_WORKER);
+    config
 }
 
 fn resolve_worker(source: WorkerSource<'_>) -> Result<ResolvedWorker, CodeBuildError> {

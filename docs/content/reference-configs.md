@@ -283,9 +283,8 @@ version = 1
 # web = 3
 
 # Rows for `automation`, `batch`, `execution_environment`, `list_sessions`,
-# `mcp_resource`, `publish_message`, `question`, `read_topic`, `send_message`,
-# `skill`, `todo_write`, `tool_output`, `view_image`, `work_assignment`,
-# `workflow`.
+# `mcp`, `publish_message`, `question`, `read_topic`, `send_message`, `skill`,
+# `todo_write`, `tool_output`, `view_image`, `work_assignment`, `workflow`.
 # Type: usize, at least 1.
 # other = 3
 
@@ -1343,7 +1342,7 @@ version = 1
 # [mcp.github]
 # Each [mcp.SERVER] table holds the rules for the tools of one MCP server, such
 # as [mcp.github] here. Name each tool as the server does, without the
-# `github__` prefix.
+# `github.` prefix.
 
 # Tools to allow without asking: a list of names, one name, `"*"` for every
 # tool, or `true` for every tool. MCP allows wait in /permissions for review.
@@ -1392,15 +1391,11 @@ version = 1
 
 version = 1
 
-# Defer MCP tools behind `tool_search` only when the servers offer more than
-# this many. `0` always defers. A project value replaces the global one.
-# Type: integer.
-# defer_tools = 10
-
 # [mcp.filesystem]
 # Each [mcp.NAME] table is one server, and a stdio server like this one runs
 # `command`. NAME is 1 to 64 ASCII letters, digits, and hyphens, and cannot be
-# the name of a built-in tool. The tools of the server are named NAME__TOOL.
+# the name of a built-in tool. In the `mcp` tool the server is a Python
+# namespace, and its tools are that namespace's async functions.
 
 # Start the server. `/mcp` sets this key when it turns a server on or off.
 # Type: bool.
@@ -1409,10 +1404,6 @@ version = 1
 # Milliseconds to wait for each response from the server.
 # Type: integer, 1 to 300000.
 # timeout = 30000
-
-# Load every tool of the server up front instead of through `tool_search`.
-# Type: bool.
-# always_load = false
 
 # Stdio servers: the program and its arguments. It must not be empty. When
 # `url` is also set, `command` wins.
@@ -1427,8 +1418,8 @@ version = 1
 # environment = {}
 
 # [mcp.analytics]
-# An HTTP server connects to `url` instead of running a command. `enabled`,
-# `timeout`, and `always_load` work here too.
+# An HTTP server connects to `url` instead of running a command. `enabled` and
+# `timeout` work here too.
 
 # HTTP servers: the server URL. It must start with `http://` or `https://`.
 # Type: string. Required.

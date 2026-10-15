@@ -10,9 +10,17 @@
 use monty_types::{ExcType, MontyException};
 
 use crate::subset::{
-    UNTYPED_BUILTINS, WITHHELD_BUILTINS, available_modules, oxford, withheld_builtins,
+    SUBSET_MODULES, UNTYPED_BUILTINS, WITHHELD_BUILTINS, available_modules, oxford,
+    withheld_builtins,
 };
 use crate::types::Outcome;
+
+pub(crate) const UNRESOLVED_REFERENCE_RULE: &str = "[unresolved-reference]";
+const UNRESOLVED_REFERENCE_NAME: &str = "[unresolved-reference] Name `";
+const UNRESOLVED_ATTRIBUTE_RULE: &str = "[unresolved-attribute]";
+/// How the interpreter's `NameError` starts, before the name.
+const NAME_ERROR_PREFIX: &str = "name '";
+const NAME_ERROR_QUOTE: char = '\'';
 
 /// Classification of a raised exception plus the guidance that accompanies it.
 pub(crate) struct Diagnosis {
@@ -20,9 +28,42 @@ pub(crate) struct Diagnosis {
     pub(crate) diagnostic: Option<String>,
 }
 
+/// Which execution a failure came from. A hosted snippet reaches its host on purpose, so the
+/// isolation advice an isolated snippet needs would send its caller the wrong way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Surface {
+    Isolated,
+    Hosted,
+}
+
 /// Maps a sandbox exception onto an outcome and, where the subset is the cause, an explanation.
-pub(crate) fn diagnose(exception: &MontyException) -> Diagnosis {
+pub(crate) fn diagnose_for(exception: &MontyException, surface: Surface) -> Diagnosis {
     let message = exception.message().unwrap_or_default();
+    match (exception.exc_type(), surface) {
+        (ExcType::NameError | ExcType::UnboundLocalError, Surface::Hosted) => {
+            return Diagnosis {
+                outcome: Outcome::Exception,
+                diagnostic: Some(unimported_module(message).map_or_else(
+                    || hosted_name_guidance(message),
+                    |module| unimported_module_guidance(module, message),
+                )),
+            };
+        }
+        // The host raised it to refuse a call and its message already says why.
+        (ExcType::PermissionError, Surface::Hosted) => {
+            return Diagnosis {
+                outcome: Outcome::Exception,
+                diagnostic: None,
+            };
+        }
+        (ExcType::TimeoutError, Surface::Hosted) => {
+            return Diagnosis {
+                outcome: Outcome::Limited,
+                diagnostic: Some(hosted_timeout_guidance(message)),
+            };
+        }
+        _ => {}
+    }
     match exception.exc_type() {
         // Monty rejects unsupported syntax during compilation, so nothing ran and nothing printed.
         ExcType::NotImplementedError if message.contains("syntax parser does not yet support") => {
@@ -39,7 +80,10 @@ pub(crate) fn diagnose(exception: &MontyException) -> Diagnosis {
         },
         ExcType::NameError | ExcType::UnboundLocalError => Diagnosis {
             outcome: Outcome::Exception,
-            diagnostic: Some(undefined_name_guidance(message)),
+            diagnostic: Some(unimported_module(message).map_or_else(
+                || undefined_name_guidance(message),
+                |module| unimported_module_guidance(module, message),
+            )),
         },
         // Without mounts every filesystem call is refused, which is the isolation working.
         ExcType::PermissionError => Diagnosis {
@@ -96,6 +140,26 @@ pub(crate) fn timeout_guidance(detail: &str) -> String {
     )
 }
 
+/// The hosted form of [`timeout_guidance`]: there is no timeout to raise, and waiting on the host
+/// is not what ran out.
+pub(crate) fn hosted_timeout_guidance(detail: &str) -> String {
+    let suffix = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(" ({detail})")
+    };
+    format!(
+        "Computation exceeded its time budget and was stopped. Time spent waiting for calls to return does not count against it; loops in the snippet do. Reduce the work, and note that enumerate, zip, reversed, and generator expressions are eager.{suffix}"
+    )
+}
+
+fn hosted_name_guidance(detail: &str) -> String {
+    format!(
+        "Undefined name. Use only the names the catalog lists, or find one with search(). Note that {} are not implemented. ({detail})",
+        withheld_builtins!()
+    )
+}
+
 /// Guidance for an import the subset does not provide.
 ///
 /// The list must stay exactly the set the worker resolves. Naming a module Monty does not implement
@@ -105,6 +169,21 @@ fn module_guidance(detail: &str) -> String {
         "Only these standard library modules exist: {}. Third-party packages cannot be installed or imported. Do not retry this import; compute the result with the available modules, or use a different tool. ({detail})",
         available_modules!()
     )
+}
+
+/// Guidance for one of the subset's modules, used without importing it.
+fn unimported_module_guidance(module: &str, detail: &str) -> String {
+    format!(
+        "`{module}` is a standard library module the interpreter provides, but it must be imported first: add `import {module}`. ({detail})"
+    )
+}
+
+/// The module a `NameError` names, when it is one of the subset's.
+fn unimported_module(message: &str) -> Option<&str> {
+    let (name, _) = message
+        .strip_prefix(NAME_ERROR_PREFIX)?
+        .split_once(NAME_ERROR_QUOTE)?;
+    SUBSET_MODULES.contains(&name).then_some(name)
 }
 
 /// Guidance for a name the subset does not provide.
@@ -144,8 +223,31 @@ fn isolation_guidance(detail: &str) -> String {
 /// first. It reports a withheld capability as an ordinary unresolved name or import, which reads as
 /// a typo and invites either a pointless retry or a request to disable type checking. Recognising
 /// those two rules lets the caller receive the same redirection it would have received at runtime.
-pub(crate) fn diagnose_type_errors(diagnostics: &str) -> String {
+pub(crate) fn diagnose_type_errors_for(diagnostics: &str, surface: Surface) -> String {
     let trimmed = diagnostics.trim();
+    if surface == Surface::Hosted {
+        if trimmed.contains(UNRESOLVED_ATTRIBUTE_RULE) {
+            return format!(
+                "A name the snippet calls does not exist, so nothing was executed. Check the exact name and signature with search() before calling it.\n{trimmed}"
+            );
+        }
+        if let Some(name) = unresolved_reference(trimmed)
+            && !UNTYPED_BUILTINS.contains(&name)
+        {
+            let detail = format!("`{name}` is not defined");
+            let guidance = if SUBSET_MODULES.contains(&name) {
+                unimported_module_guidance(name, &detail)
+            } else {
+                hosted_name_guidance(&detail)
+            };
+            return format!("{guidance}\n{trimmed}");
+        }
+        if unresolved_import(trimmed).is_none() && !trimmed.contains(UNRESOLVED_REFERENCE_RULE) {
+            return format!(
+                "Type checking rejected this snippet before running it, so nothing was executed. Arguments are checked against each tool's signature; search() shows the exact signature. Annotations are never required, so widen or drop an annotation the diagnostic names rather than adding more.\n{trimmed}"
+            );
+        }
+    }
     if let Some(module) = unresolved_import(trimmed) {
         return format!(
             "{}\n{trimmed}",
@@ -157,6 +259,8 @@ pub(crate) fn diagnose_type_errors(diagnostics: &str) -> String {
         // runtime is the more useful thing to tell the caller than anything about type stubs.
         let guidance = if name == "open" {
             isolation_guidance("`open` is not available")
+        } else if SUBSET_MODULES.contains(&name) {
+            unimported_module_guidance(name, &format!("`{name}` is not defined"))
         } else if UNTYPED_BUILTINS.contains(&name) {
             untyped_name_guidance(name)
         } else if WITHHELD_BUILTINS.contains(&name) {
@@ -185,7 +289,7 @@ fn unresolved_import(diagnostics: &str) -> Option<&str> {
 /// Extracts the name from the checker's `unresolved-reference` rule, if that is the first failure.
 fn unresolved_reference(diagnostics: &str) -> Option<&str> {
     diagnostics
-        .split_once("[unresolved-reference] Name `")?
+        .split_once(UNRESOLVED_REFERENCE_NAME)?
         .1
         .split_once('`')
         .map(|(name, _)| name)
@@ -193,7 +297,37 @@ fn unresolved_reference(diagnostics: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
+
+    fn diagnose(exception: &MontyException) -> Diagnosis {
+        diagnose_for(exception, Surface::Isolated)
+    }
+
+    fn diagnose_type_errors(diagnostics: &str) -> String {
+        diagnose_type_errors_for(diagnostics, Surface::Isolated)
+    }
+
+    #[test]
+    fn hosted_refusals_keep_the_hosts_own_message() {
+        let diagnosis = diagnose_for(
+            &MontyException::new(ExcType::PermissionError, Some("denied".to_owned())),
+            Surface::Hosted,
+        );
+        assert_eq!(diagnosis.outcome, Outcome::Exception);
+        assert!(diagnosis.diagnostic.is_none());
+    }
+
+    #[test]
+    fn hosted_unknown_attributes_point_at_search() {
+        let text = diagnose_type_errors_for(
+            "snippet.py:1:7: error[unresolved-attribute] Object of type `_Github` has no attribute `nope`",
+            Surface::Hosted,
+        );
+        assert!(text.contains("search()"), "{text}");
+        assert!(!text.contains("python_execution"), "{text}");
+    }
 
     /// Type checking is the default, so these are the messages an agent actually receives. Each must
     /// redirect the same way the runtime path does rather than reading as a typo the caller should
@@ -273,6 +407,28 @@ mod tests {
             others.starts_with("filter, getattr, setattr, hasattr, and format"),
             "{text}"
         );
+    }
+
+    const MISSING_ASYNCIO: &str =
+        "name 'asyncio' is not defined. Did you forget to import 'asyncio'?";
+    const IMPORT_ASYNCIO: &str = "add `import asyncio`";
+
+    /// A module the subset provides is a missing import, not a name the subset lacks, whichever
+    /// execution reports it and whether the checker or the interpreter finds it.
+    #[test_case(Surface::Isolated ; "isolated")]
+    #[test_case(Surface::Hosted ; "hosted")]
+    fn an_unimported_module_asks_for_its_import(surface: Surface) {
+        let raised = diagnose_for(&exception(ExcType::NameError, MISSING_ASYNCIO), surface)
+            .diagnostic
+            .expect("guidance");
+        let checked = diagnose_type_errors_for(
+            "snippet.py:1:17: error[unresolved-reference] Name `asyncio` used when not defined",
+            surface,
+        );
+        for text in [raised, checked] {
+            assert!(text.contains(IMPORT_ASYNCIO), "{text}");
+            assert!(!text.contains("are not implemented"), "{text}");
+        }
     }
 
     fn exception(exc_type: ExcType, message: &str) -> MontyException {

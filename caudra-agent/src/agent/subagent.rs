@@ -1780,7 +1780,7 @@ fn build(
             .as_ref()
             .filter(|_| resolved.mcp_enabled)
             .map(|mcp| {
-                mcp.fresh()
+                mcp.fresh(history.as_slice())
                     .with_actor_policy(Arc::clone(&resolved.profile_tool_policy))
             }),
         history,

@@ -567,7 +567,7 @@ fn legend_entry(kind: GridKind, tokens: u32, window: u32, theme: &Theme) -> Vec<
 
 fn inventory_summary_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>> {
     let mcp = &snapshot.inventory.mcp;
-    let (loaded_mcp, deferred_mcp, disabled_mcp) = mcp_status_counts(snapshot);
+    let (available_mcp, search_only_mcp, disabled_mcp) = mcp_status_counts(snapshot);
     let profiles = &snapshot.inventory.profiles;
     let current_profiles = profiles
         .profiles
@@ -610,12 +610,12 @@ fn inventory_summary_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Lin
         inventory_summary_line(
             GridKind::McpTools,
             format!(
-                "{} tools · {} loaded/eager · {} on demand · {} disabled · {} in context",
+                "{} tools · {} via mcp · {} search-only · {} disabled · {} in context",
                 format_usize(mcp.tools.len()),
-                format_usize(loaded_mcp),
-                format_usize(deferred_mcp),
+                format_usize(available_mcp),
+                format_usize(search_only_mcp),
                 format_usize(disabled_mcp),
-                token_label(mcp.request_tokens())
+                token_label(mcp.request_tokens)
             ),
             theme,
         ),
@@ -664,25 +664,18 @@ fn inventory_summary_line(kind: GridKind, value: String, theme: &Theme) -> Line<
 }
 
 fn mcp_status_counts(snapshot: &ContextSnapshot) -> (usize, usize, usize) {
-    snapshot
-        .inventory
-        .mcp
-        .tools
-        .iter()
-        .fold((0, 0, 0), |(loaded, deferred, disabled), tool| {
-            match tool.status {
-                ContextMcpStatus::LoadedOrEager => (loaded.saturating_add(1), deferred, disabled),
-                ContextMcpStatus::AvailableOnDemand => {
-                    (loaded, deferred.saturating_add(1), disabled)
-                }
-                ContextMcpStatus::Disabled => (loaded, deferred, disabled.saturating_add(1)),
-            }
-        })
+    snapshot.inventory.mcp.tools.iter().fold(
+        (0, 0, 0),
+        |(available, search_only, disabled), tool| match tool.status {
+            ContextMcpStatus::Available => (available.saturating_add(1), search_only, disabled),
+            ContextMcpStatus::SearchOnly => (available, search_only.saturating_add(1), disabled),
+            ContextMcpStatus::Disabled => (available, search_only, disabled.saturating_add(1)),
+        },
+    )
 }
 
-/// The catalog line lives here rather than under MCP because one
-/// `tool_search` entry stands in for the deferred built-ins and the deferred
-/// server tools together.
+/// The catalog line is the one `tool_search` entry that stands in for the
+/// deferred built-ins.
 fn builtin_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>> {
     let inventory = &snapshot.inventory.builtins;
     let mut lines = vec![
@@ -734,29 +727,17 @@ fn mcp_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::default(),
         section_line("MCP tools", theme),
-        labeled_line("In context", token_label(inventory.request_tokens()), theme),
-        labeled_line(
-            "Unattributed",
-            token_label(inventory.unattributed_tokens),
-            theme,
-        ),
+        labeled_line("In context", token_label(inventory.request_tokens), theme),
     ];
     if inventory.tools.is_empty() {
         lines.push(Line::from(Span::styled("No MCP tools.", theme.status_dim)));
         return lines;
     }
 
-    let mut tools = inventory.tools.iter().collect::<Vec<_>>();
-    tools.sort_by(|left, right| {
-        left.status
-            .cmp(&right.status)
-            .then_with(|| left.server.cmp(&right.server))
-            .then_with(|| left.qualified_name.cmp(&right.qualified_name))
-    });
-    for tool in tools {
+    for tool in &inventory.tools {
         let (glyph, status, status_style) = match tool.status {
-            ContextMcpStatus::LoadedOrEager => ("●", "loaded/eager", theme.tool_success),
-            ContextMcpStatus::AvailableOnDemand => ("○", "on demand", theme.tool_dim),
+            ContextMcpStatus::Available => ("●", "via mcp", theme.tool_success),
+            ContextMcpStatus::SearchOnly => ("○", "search-only", theme.tool_dim),
             ContextMcpStatus::Disabled => ("×", "disabled", theme.error),
         };
         lines.push(Line::from(vec![
@@ -765,15 +746,10 @@ fn mcp_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>> {
                 escape_terminal_controls(&tool.qualified_name),
                 theme.tool_path,
             ),
-            Span::styled(format!("  {status} · "), status_style),
-            Span::raw(token_label(tool.request_tokens)),
+            Span::styled(format!("  {status}"), status_style),
         ]));
         lines.push(Line::from(Span::styled(
-            format!(
-                "  server {} · wire {}",
-                escape_terminal_controls(&tool.server),
-                escape_terminal_controls(&tool.wire_name)
-            ),
+            format!("  server {}", escape_terminal_controls(&tool.server)),
             theme.status_dim,
         )));
         if let Some(reason) = tool.reason {
@@ -1112,30 +1088,24 @@ mod tests {
                     tools: vec![
                         ContextMcpTool {
                             qualified_name: MCP_TOOL.to_owned(),
-                            wire_name: "mcp_issues_fetch".to_owned(),
                             server: "issues".to_owned(),
-                            status: ContextMcpStatus::LoadedOrEager,
-                            request_tokens: 40,
+                            status: ContextMcpStatus::Available,
                             reason: None,
                         },
                         ContextMcpTool {
                             qualified_name: "search.query".to_owned(),
-                            wire_name: "mcp_search_query".to_owned(),
                             server: "search".to_owned(),
-                            status: ContextMcpStatus::AvailableOnDemand,
-                            request_tokens: 0,
+                            status: ContextMcpStatus::SearchOnly,
                             reason: None,
                         },
                         ContextMcpTool {
                             qualified_name: "admin.delete".to_owned(),
-                            wire_name: "mcp_admin_delete".to_owned(),
                             server: "admin".to_owned(),
                             status: ContextMcpStatus::Disabled,
-                            request_tokens: 0,
                             reason: None,
                         },
                     ],
-                    unattributed_tokens: 0,
+                    request_tokens: 40,
                 },
             },
         }
@@ -1350,13 +1320,13 @@ mod tests {
             "· Free ~300 tokens (30.0%)",
             "░ Reserve 100 tokens (10.0%)",
             "Auto-compact  threshold 900 tokens (90.0%) · reserve 100 tokens (10.0%)",
-            "M MCP tools  3 tools · 1 loaded/eager · 1 on demand · 1 disabled · ~40 tokens in context",
+            "M MCP tools  3 tools · 1 via mcp · 1 search-only · 1 disabled · ~40 tokens in context",
             "T System tools  2 declared · 1 on demand · 0 disabled · ~75 tokens in context · ~90 tokens if loaded",
             "code_map  on demand · ~90 tokens",
             "task  declared · ~30 tokens · counted under profiles",
             "On-load bodies  ~120 tokens across 1 notes",
             "definitions ~25 tokens · loaded bodies ~45 tokens",
-            "issues.fetch  loaded/eager · ~40 tokens",
+            "issues.fetch  via mcp",
             "project.md  on load · ~120 tokens",
             "deploy  loaded · ~45 tokens",
         ] {

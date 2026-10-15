@@ -5,7 +5,6 @@ mod selection;
 #[cfg(test)]
 mod tests;
 mod thinking;
-
 use self::render::{EXPAND_AFFORDANCE, HoverFeedback, Placement, RenderCursor, RenderFeedback};
 use self::segment::{Segment, SegmentCache, wrapped_line_count};
 use self::thinking::ThinkingWindow;
@@ -22,8 +21,8 @@ use super::{
     DisplayMessage, DisplayRole, DisplaySource, GoalTone, ToolProgress, ToolRole, ToolStatus,
     apply_scroll_rows, automation_inspector,
     code_view::{
-        BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, CardPolicy, Disclosure,
-        RowTarget, ScrollSpan, ScrollWindow,
+        BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, BatchViews, CardPolicy,
+        Disclosure, RowTarget, ScrollSpan, ScrollWindow,
     },
     command_text, memory_card, peer_card, review, task_card, workflow_card,
     workflow_card::CardHit,
@@ -65,13 +64,14 @@ use super::tooltip::{Anchor, Tip, TipKey};
 use caudra_agent::background::BackgroundTasks;
 use caudra_agent::commits::{self, CommitRef};
 use caudra_agent::decisions::NoteOutcome;
+use caudra_agent::mcp::code::output::{McpCodeCall, McpCodeOutput};
 use caudra_agent::mentions::{self, Mention};
 use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME, ToolEffect};
 use caudra_agent::{
     BatchToolEntry, BatchToolStatus, BufferSnapshot, CallStage, EventSender, InstructionBlock,
     NO_FILES_FOUND, ReasoningSummary, SharedBuf, SubagentProgress, TaskCard, ToolDoneEvent,
-    ToolOutput, ToolStartEvent, format_live_duration, format_settled_duration, reasoning_summary,
-    streaming_reasoning_summary,
+    ToolInput, ToolOutput, ToolStartEvent, format_live_duration, format_settled_duration,
+    reasoning_summary, streaming_reasoning_summary,
 };
 use caudra_lua::{EventHandle, WARM_TOOL_CAP, WinView};
 use caudra_storage::background::JobKind;
@@ -2127,6 +2127,41 @@ impl MessagesPanel {
         true
     }
 
+    /// A call of a running `mcp` snippet started or settled. Calls arrive in the order the
+    /// snippet made them, so a new index is always the next row.
+    pub fn mcp_code_progress(&mut self, tool_id: &str, index: usize, call: McpCodeCall) -> bool {
+        let Some(msg) = self
+            .messages
+            .iter_mut()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
+        else {
+            return false;
+        };
+        if !Self::is_running(msg) {
+            return false;
+        }
+        let mut output = match msg.tool_output.as_deref() {
+            Some(ToolOutput::McpCode(output)) => output.clone(),
+            _ => McpCodeOutput {
+                code: match msg.tool_input.as_deref() {
+                    Some(ToolInput::Code { code, .. }) => code.clone(),
+                    _ => String::new(),
+                },
+                ..McpCodeOutput::default()
+            },
+        };
+        let known = output.calls.len();
+        match output.calls.get_mut(index) {
+            Some(current) if current.status.is_terminal() => return false,
+            Some(current) => *current = call,
+            None if index == known => output.calls.push(call),
+            None => return false,
+        }
+        msg.tool_output = Some(Arc::new(ToolOutput::McpCode(output)));
+        self.mark_card_dirty(tool_id);
+        true
+    }
+
     pub(crate) fn task_card_update(&mut self, mut card: TaskCard) -> bool {
         card.result = None;
         card.result_preview = None;
@@ -3904,7 +3939,10 @@ impl MessagesPanel {
         // rest of the body falls back to.
         if let Some(target) = seg.row_target_at(rel, width) {
             let tool_id = tool_id.to_owned();
-            self.toggle_batch_child(&tool_id, target.index());
+            match target {
+                RowTarget::Raw(index) => self.toggle_batch_raw(&tool_id, index),
+                _ => self.toggle_batch_child(&tool_id, target.index()),
+            }
             return true;
         }
         let tool_id = tool_id.to_owned();
@@ -3969,12 +4007,16 @@ impl MessagesPanel {
     /// One child opens or folds, which is what the reader asked for, and every
     /// other child stays exactly as it was.
     fn toggle_batch_child(&mut self, tool_id: &str, index: usize) {
-        let views = self
-            .batch_views
-            .get(tool_id)
-            .cloned()
-            .unwrap_or_default()
-            .toggled(index);
+        self.change_batch_views(tool_id, |views| views.toggled(index));
+    }
+
+    /// One child's MCP answer switches between its card and its data.
+    fn toggle_batch_raw(&mut self, tool_id: &str, index: usize) {
+        self.change_batch_views(tool_id, |views| views.raw_toggled(index));
+    }
+
+    fn change_batch_views(&mut self, tool_id: &str, change: impl FnOnce(BatchViews) -> BatchViews) {
+        let views = change(self.batch_views.get(tool_id).cloned().unwrap_or_default());
         self.batch_views.insert(tool_id.to_owned(), views);
         self.rebuild_tool_segment(tool_id);
     }

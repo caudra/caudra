@@ -22,6 +22,11 @@ use caudra_config::mcp::{DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, MCP_FILE, MCP_VERSI
 use caudra_config::own_writes;
 use caudra_config::{global_config_dir, is_valid_server_name};
 
+const SERVERS_KEY: &str = "mcp";
+const REMOVED_TOP_LEVEL_KEY: &str = "defer_tools";
+const REMOVED_SERVER_KEY: &str = "always_load";
+const REMOVED_KEY_REASON: &str = "was removed: MCP tools are reached through the `mcp` tool, which loads nothing up front. Delete the key";
+
 #[derive(Debug, Clone)]
 pub enum McpConfigError {
     Read { path: PathBuf, error: String },
@@ -168,11 +173,6 @@ pub struct McpServerInfo {
 pub struct McpConfig {
     #[serde(skip)]
     pub local_execution: LocalExecutionPolicy,
-    /// Defer tools behind `tool_search` only when more than this many
-    /// non-`always_load` tools exist. `None` means the built-in default;
-    /// 0 always defers, a large value disables deferral.
-    #[serde(default)]
-    pub defer_tools: Option<usize>,
     #[serde(default)]
     pub mcp: HashMap<String, RawServerConfig>,
     #[serde(skip)]
@@ -190,8 +190,6 @@ pub struct RawServerConfig {
     pub enabled: bool,
     #[serde(default = "default_timeout")]
     pub timeout: u64,
-    #[serde(default)]
-    pub always_load: bool,
     #[serde(flatten)]
     pub transport: RawTransport,
 }
@@ -202,7 +200,6 @@ impl RawServerConfig {
         Self {
             enabled: true,
             timeout: DEFAULT_TIMEOUT_MS,
-            always_load: false,
             transport,
         }
     }
@@ -239,9 +236,6 @@ pub struct ServerConfig {
     pub local_execution: LocalExecutionPolicy,
     pub name: String,
     pub timeout: Duration,
-    /// Skip deferral: every tool from this server enters the context upfront
-    /// instead of being discoverable through `tool_search`.
-    pub always_load: bool,
     pub transport: Transport,
 }
 
@@ -388,7 +382,6 @@ pub fn parse_server(name: String, server: RawServerConfig) -> Result<ServerConfi
         local_execution: LocalExecutionPolicy::Embedded,
         name,
         timeout: Duration::from_millis(server.timeout),
-        always_load: server.always_load,
         transport,
     })
 }
@@ -613,7 +606,7 @@ fn hash_field(hasher: &mut Sha256, value: &[u8]) {
 }
 
 /// Call order is precedence: the caller merges global first, project last,
-/// so a project's servers and `defer_tools` beat the global ones.
+/// so a project's servers beat the global ones.
 fn merge_config(
     merged: &mut McpConfig,
     errors: &mut McpConfigErrors,
@@ -632,7 +625,6 @@ fn merge_config(
                 merged.origins.insert(name.clone(), path.to_path_buf());
                 merged.sources.insert(name.clone(), source);
             }
-            merged.defer_tools = cfg.defer_tools.or(merged.defer_tools);
             merged.mcp.extend(cfg.mcp);
         }
         Err(e) => errors.add_error(e),
@@ -763,6 +755,25 @@ pub fn persist_enabled(
 
 /// Only the global file may read the environment: a project file runs no
 /// review before an HTTPS server connects, so it could send a secret anywhere.
+/// The first key `content` sets that code mode removed, spelled as the file spells it. A file
+/// that still tunes deferral would otherwise load as though it did something.
+fn removed_key(content: &str) -> Option<String> {
+    let table: toml::Table = toml::from_str(content).ok()?;
+    if table.contains_key(REMOVED_TOP_LEVEL_KEY) {
+        return Some(REMOVED_TOP_LEVEL_KEY.to_owned());
+    }
+    table
+        .get(SERVERS_KEY)?
+        .as_table()?
+        .iter()
+        .find(|(_, server)| {
+            server
+                .as_table()
+                .is_some_and(|server| server.contains_key(REMOVED_SERVER_KEY))
+        })
+        .map(|(name, _)| format!("{SERVERS_KEY}.{name}.{REMOVED_SERVER_KEY}"))
+}
+
 fn read_config(path: &Path, source: McpConfigSource) -> Result<Option<McpConfig>, McpConfigError> {
     let lookup = match source {
         McpConfigSource::Global => Lookup::Global(path),
@@ -789,6 +800,12 @@ fn read_config(path: &Path, source: McpConfigSource) -> Result<Option<McpConfig>
             });
         }
     };
+    if let Some(key) = removed_key(&content) {
+        return Err(McpConfigError::Parse {
+            path: path.into(),
+            error: format!("`{key}` {REMOVED_KEY_REASON}"),
+        });
+    }
     ConfigVersion::<MCP_VERSION>::check_document(&content)
         .map_err(ConfigTextError::from)
         .and_then(|_| interpolation::from_str(&content, lookup))
@@ -815,8 +832,8 @@ mod tests {
     use caudra_config::example::mcp::{HTTP_SERVER, OAUTH_CLIENT, STDIO_SERVER};
     use caudra_config::example::{self, Render};
     use caudra_config::mcp::{
-        DEFAULT_CALLBACK_HOSTNAME, DEFAULT_CALLBACK_PATH, DEFAULT_DEFER_TOOLS, HTTP_FIELDS,
-        OAUTH_FIELDS, SERVER_FIELDS, STDIO_FIELDS, TOP_LEVEL_FIELDS,
+        DEFAULT_CALLBACK_HOSTNAME, DEFAULT_CALLBACK_PATH, HTTP_FIELDS, OAUTH_FIELDS, SERVER_FIELDS,
+        STDIO_FIELDS,
     };
     use serde_json::Value;
     use test_case::test_case;
@@ -831,7 +848,6 @@ mod tests {
         RawServerConfig {
             enabled: true,
             timeout: DEFAULT_TIMEOUT_MS,
-            always_load: false,
             transport: RawTransport::Stdio(RawStdioFields {
                 command: cmd.iter().map(|s| s.to_string()).collect(),
                 environment: HashMap::new(),
@@ -843,7 +859,6 @@ mod tests {
         RawServerConfig {
             enabled: true,
             timeout: DEFAULT_TIMEOUT_MS,
-            always_load: false,
             transport: RawTransport::Http(RawHttpFields {
                 url: url.to_string(),
                 headers: HashMap::new(),
@@ -923,29 +938,21 @@ mod tests {
         assert!(errors.to_string().contains(MCP_FILE));
     }
 
-    #[test]
-    fn toml_deferral_fields_deserialize_and_default() {
-        let config: McpConfig = toml::from_str(
-            r#"
-defer_tools = 30
-
-[mcp.github]
-command = ["gh", "mcp-server"]
-always_load = true
-
-[mcp.other]
-command = ["other"]
-"#,
-        )
-        .unwrap();
-        assert_eq!(config.defer_tools, Some(30));
-        assert!(config.mcp["github"].always_load);
-        assert!(!config.mcp["other"].always_load);
-        let parsed = parse_server("github".into(), config.mcp["github"].clone()).unwrap();
-        assert!(parsed.always_load);
-
-        let bare: McpConfig = toml::from_str("[mcp.srv]\ncommand = [\"x\"]").unwrap();
-        assert_eq!(bare.defer_tools, None);
+    #[test_case("defer_tools = 30\n[mcp.srv]\ncommand = [\"x\"]\n", Some(REMOVED_TOP_LEVEL_KEY) ; "defer_tools")]
+    #[test_case("[mcp.srv]\ncommand = [\"x\"]\nalways_load = true\n", Some(REMOVED_SERVER_KEY) ; "always_load")]
+    #[test_case("[mcp.srv]\ncommand = [\"x\"]\n", None ; "current_file")]
+    fn removed_keys_fail_the_file(document: &str, removed: Option<&str>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MCP_FILE);
+        fs::write(&path, document).unwrap();
+        let read = read_config(&path, McpConfigSource::Global);
+        match removed {
+            Some(key) => assert!(matches!(
+                read,
+                Err(McpConfigError::Parse { error, .. }) if error.contains(key) && error.contains(REMOVED_KEY_REASON)
+            )),
+            None => assert!(read.is_ok_and(|config| config.is_some())),
+        }
     }
 
     #[test]
@@ -1154,18 +1161,13 @@ enabled = true
         assert_eq!(infos[2].config_path, PathBuf::from("/test.toml"));
     }
 
-    #[test_case("defer_tools = 7\n", Some(7) ; "project_overrides_global")]
-    #[test_case("", Some(5) ; "global_survives_unset_project")]
-    fn merge_config_defer_tools_precedence(project_toml: &str, expected: Option<usize>) {
+    #[test]
+    fn merge_config_project_wins() {
         let dir = tempfile::tempdir().unwrap();
         let global = dir.path().join("global.toml");
         let project = dir.path().join("project.toml");
-        fs::write(&global, "defer_tools = 5\n[mcp.srv]\ncommand = [\"a\"]").unwrap();
-        fs::write(
-            &project,
-            format!("{project_toml}[mcp.srv]\ncommand = [\"b\"]"),
-        )
-        .unwrap();
+        fs::write(&global, "[mcp.srv]\ncommand = [\"a\"]").unwrap();
+        fs::write(&project, "[mcp.srv]\ncommand = [\"b\"]").unwrap();
 
         let mut merged = McpConfig::default();
         let mut errors = McpConfigErrors::new(dir.path().to_path_buf());
@@ -1173,7 +1175,6 @@ enabled = true
         merge_config(&mut merged, &mut errors, &project, McpConfigSource::Project);
 
         assert!(errors.is_empty());
-        assert_eq!(merged.defer_tools, expected);
         assert_eq!(merged.origins["srv"], project, "later config must win");
         assert_eq!(merged.sources["srv"], McpConfigSource::Project);
     }
@@ -1218,7 +1219,6 @@ enabled = true
 
         config.enabled = false;
         config.timeout = 1;
-        config.always_load = true;
         assert_eq!(security_digest(&config), digest);
 
         let RawTransport::Stdio(stdio) = &mut config.transport else {
@@ -1439,7 +1439,6 @@ command = ["echo", "hello"]
     /// What Caudra acts on, with each unset option replaced by the default
     /// Caudra uses in its place.
     fn effective(mut config: McpConfig) -> Value {
-        config.defer_tools.get_or_insert(DEFAULT_DEFER_TOOLS);
         for server in config.mcp.values_mut() {
             if let RawTransport::Http(RawHttpFields {
                 oauth: Some(oauth), ..
@@ -1468,7 +1467,6 @@ command = ["echo", "hello"]
     fn the_reference_adds_no_server() {
         let config = load_reference(Render::Reference);
         assert!(config.mcp.is_empty());
-        assert_eq!(config.defer_tools, None);
     }
 
     #[test]
@@ -1490,7 +1488,7 @@ command = ["echo", "hello"]
         }
     }
 
-    #[test_case("", &[TOP_LEVEL_FIELDS], &[SERVERS_TABLE] ; "top_level")]
+    #[test_case("", &[], &[SERVERS_TABLE] ; "top_level")]
     #[test_case(STDIO_SERVER, &[SERVER_FIELDS, STDIO_FIELDS], &[] ; "stdio_server")]
     #[test_case(HTTP_SERVER, &[SERVER_FIELDS, HTTP_FIELDS], &[] ; "http_server")]
     #[test_case(OAUTH_CLIENT, &[OAUTH_FIELDS], &[] ; "oauth_client")]

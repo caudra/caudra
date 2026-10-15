@@ -9,19 +9,20 @@ use crate::components::command_text::tests::{
 use crate::components::prompt_progress::PROMPT_PROGRESS_LABEL;
 use crate::components::task_card::COMMAND_LABEL;
 use crate::components::tool_display::{
-    AWAITING_APPROVAL, FOLLOWING, NOTICE_PREFIX, PAUSED, WRITING_PROMPT, scroll_footer_text,
-    task_details,
+    AWAITING_APPROVAL, CARD_AFFORDANCE, FOLLOWING, NOTICE_PREFIX, PAUSED, WRITING_PROMPT,
+    scroll_footer_text, task_details,
 };
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
 use caudra_agent::commits::repo::CommitSummary;
+use caudra_agent::mcp::code::output::McpCodeCallStatus;
 use caudra_agent::tools::native::plan;
 use caudra_agent::tools::{
     BATCH_TOOL_NAME, FILE_APPLY_PATCH_TOOL_NAME, FILE_EDIT_TOOL_NAME, FILE_GLOB_TOOL_NAME,
     FILE_GREP_TOOL_NAME, FILE_INDEX_TOOL_NAME, FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME,
-    IMAGE_GENERATE_TOOL_NAME, MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, QUESTION_TOOL_NAME,
-    SHELL_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME, TODOWRITE_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME,
-    ToolEffect, VIEW_IMAGE_TOOL_NAME,
+    IMAGE_GENERATE_TOOL_NAME, MCP_TOOL_NAME, MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME,
+    QUESTION_TOOL_NAME, SHELL_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME, TODOWRITE_TOOL_NAME,
+    TOOL_OUTPUT_TOOL_NAME, ToolEffect, VIEW_IMAGE_TOOL_NAME,
 };
 use caudra_agent::{
     ActivityChild, CodeGraphRow, GrepFileEntry, GrepMatchGroup, McpBlock, McpOutput,
@@ -13933,4 +13934,104 @@ fn copying_a_windowed_block_copies_the_rows_it_shows() {
     )
     .expect("an overflowing block has a footer");
     assert!(!copied.contains(&footer), "{THINKING_COPY_MSG}: {copied}");
+}
+
+/// A snippet's calls arrive in the order it made them, and a settled call is
+/// the record of what it did, so a late report cannot reopen it.
+#[test]
+fn mcp_code_progress_appends_calls_and_keeps_settled_ones() {
+    const SNIPPET: &str = "await github.list_issues()";
+    const ACCEPTED: &str = "the next call is a new row";
+    const REFUSED: &str = "a gap, or a settled call, is not reopened";
+    let call = |status| McpCodeCall {
+        server: "github".into(),
+        tool: "list_issues".into(),
+        input: serde_json::json!({}),
+        status,
+        ..McpCodeCall::default()
+    };
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(ToolStartEvent {
+        input: Some(ToolInput::Code {
+            language: "python".into(),
+            code: SNIPPET.into(),
+        }),
+        ..start(TOOL_ID, MCP_TOOL_NAME)
+    });
+
+    assert!(
+        panel.mcp_code_progress(TOOL_ID, 0, call(McpCodeCallStatus::Running)),
+        "{ACCEPTED}"
+    );
+    assert!(
+        !panel.mcp_code_progress(TOOL_ID, 2, call(McpCodeCallStatus::Running)),
+        "{REFUSED}"
+    );
+    assert!(
+        panel.mcp_code_progress(TOOL_ID, 0, call(McpCodeCallStatus::Success)),
+        "{ACCEPTED}"
+    );
+    assert!(
+        !panel.mcp_code_progress(TOOL_ID, 0, call(McpCodeCallStatus::Running)),
+        "{REFUSED}"
+    );
+
+    let Some(ToolOutput::McpCode(McpCodeOutput { code, calls, .. })) =
+        panel.messages[0].tool_output.as_deref()
+    else {
+        panic!("a running snippet's card carries its calls");
+    };
+    assert_eq!(code, SNIPPET);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].status, McpCodeCallStatus::Success);
+}
+
+/// A call inside an `mcp` card offers the switch its own card would, and it
+/// flips that call alone.
+#[test]
+fn an_mcp_code_call_trades_its_card_for_its_data_and_back() {
+    const BATCH_ID: &str = "t1";
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel
+        .batch_views
+        .insert(BATCH_ID.into(), BatchViews::new([0]));
+    panel.tool_start(start(BATCH_ID, MCP_TOOL_NAME));
+    let answer = McpOutput {
+        blocks: vec![McpBlock::Text {
+            text: serde_json::json!({"k": 1}).to_string(),
+        }],
+        structured: Some(serde_json::json!({"id": 7})),
+        ..McpOutput::default()
+    };
+    panel.tool_done(ToolDoneEvent {
+        tool: MCP_TOOL_NAME.into(),
+        output: ToolOutput::McpCode(McpCodeOutput {
+            calls: vec![McpCodeCall {
+                server: "home".into(),
+                tool: "lights".into(),
+                input: serde_json::json!({}),
+                status: McpCodeCallStatus::Success,
+                output: Some(answer),
+                ..McpCodeCall::default()
+            }],
+            ..McpCodeOutput::default()
+        }),
+        ..done(BATCH_ID)
+    });
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    let shows_data = |panel: &MessagesPanel| seg_text(panel, BATCH_ID).contains(MCP_STRUCTURED_ROW);
+    assert!(!shows_data(&panel), "{MCP_RAW_SWITCH_MSG}");
+
+    assert!(panel.toggle_expansion_at(batch_row(&panel, RowTarget::Raw(0)), area));
+    render(&mut panel, 80, 24);
+    assert!(shows_data(&panel), "{MCP_RAW_SWITCH_MSG}");
+    assert!(
+        seg_text(&panel, BATCH_ID).contains(CARD_AFFORDANCE),
+        "{MCP_RAW_SWITCH_MSG}"
+    );
+
+    assert!(panel.toggle_expansion_at(batch_row(&panel, RowTarget::Raw(0)), area));
+    render(&mut panel, 80, 24);
+    assert!(!shows_data(&panel), "{MCP_RAW_SWITCH_MSG}");
 }

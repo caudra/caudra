@@ -119,7 +119,7 @@ While the terminal UI runs, Caudra watches its config files, skill and command d
 |--------------|-----------------|
 | `caudra.toml` | `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
 | `permissions.toml` | Before the next tool call. |
-| `mcp.toml` | At once. New servers start, even when Caudra started with none. Removed and disabled servers stop, and changed servers restart. The other servers keep running. `defer_tools` applies after `/reload`. |
+| `mcp.toml` | At once. New servers start, even when Caudra started with none. Removed and disabled servers stop, and changed servers restart. The other servers keep running. |
 | `providers.toml` | The next time Caudra reads it, such as when a model list opens. |
 | Skills | At once. |
 | System prompt profiles | From the next turn. |
@@ -151,7 +151,7 @@ Caudra rebuilds at these moments, where the request changes or the cache is gone
 | Switching model or provider | Each model keeps its own cache. |
 | Switching the system prompt profile | The system prompt changes with it. |
 | Changing the thinking level | Claude's cache of the conversation does not survive a change to the thinking settings. |
-| Switching mode | Plan mode declares no MCP tools, and the first switch to it adds the `plan` tool. |
+| Switching mode | The first switch to plan adds the `plan` tool. Later switches rebuild the same definitions, so the cache holds unless an edit is pending. |
 | The cache expires | Claude keeps a cache for five minutes after the last request that used it. Caudra counts from the end of the turn, so it rebuilds a little late rather than too early. Other APIs give no fixed lifetime, so Caudra never rebuilds on a timer for them. |
 
 It also rebuilds at moments you choose, where the cached conversation can still be warm:
@@ -160,9 +160,9 @@ It also rebuilds at moments you choose, where the cached conversation can still 
 - `/cd`, which loads the instruction files and memory of the new directory
 - `/reload`, which applies everything at once
 
-When Caudra started with no MCP servers, the first ones you add connect in the background. A rebuild that falls before they are up lacks their tools, so Caudra rebuilds once more when they are. A session that starts while servers connect waits for them before its first request instead.
+MCP servers never change the definitions. While any server is enabled, they hold one `mcp` tool, and the servers and their tools reach the model in a [`# MCP servers` reminder](/docs/mcp/#code-mode) instead. A server that connects, fails, or changes its tools changes only that reminder.
 
-To keep the cache through a long task, save your edits and let the next rebuild take them in. When the model needs a change right away, such as a new MCP server, run `/reload` and pay for one full read.
+To keep the cache through a long task, save your edits and let the next rebuild take them in. When the model needs a change right away, such as a tool you turned back on, run `/reload` and pay for one full read.
 
 ### What the model is told
 
@@ -191,30 +191,30 @@ Each one starts in the middle of a session, with the cache warm.
 
 #### Add an MCP server
 
-You add the `analytics` server of the [HTTP example](/docs/mcp/#http) to `~/.config/caudra/mcp.toml`. The footer shows `Reloaded mcp.toml`, and the server starts at once. The tool definitions stay as they were, so the next request reads the conversation from the cache. With your next message the model gets this reminder:
+You add the `analytics` server of the [HTTP example](/docs/mcp/#http) to `~/.config/caudra/mcp.toml` while a `github` server runs. The footer shows `Reloaded mcp.toml`, and the server starts at once. The tool definitions stay as they were, so the next request reads the conversation from the cache. With your next message the model gets the server list again, now with `analytics` in it:
 
 ```text
 <system-reminder>
-# Configuration changed
+# MCP servers
 
-Caudra's configuration changed after your tool definitions and system prompt were fixed. They stay
-as they were so the prompt cache holds; what follows is how the current configuration differs from
-them. They are rebuilt after a compaction, on /reload, or once the cache has expired.
+Call these with the `mcp` tool: `await <server>.<tool>(...)`. This list is complete: do not guess other names.
 
-Tools that exist now but are not declared; they become callable once the definitions are rebuilt:
-- analytics__run_query: Run a read-only SQL query against the warehouse.
+## analytics (connected, 1 tool)
+- run_query(*, sql: str) -> Any: Run a read-only SQL query against the warehouse.
+## github (connected, 1 tool)
+- list_issues(*, owner: str, repo: str) -> Any: List the open issues of a repository.
 </system-reminder>
 ```
 
-At the next rebuild the tools are declared, or join the `tool_search` catalog when your servers offer more than `defer_tools` tools. That request reads the conversation once at full price. Run `/reload` to make it happen now.
+The model can call the new tool through `mcp` at once. When `analytics` is the first server you enable, the `mcp` tool itself is new. The model then also gets a `# Configuration changed` reminder for it, and `mcp` becomes callable at the next rebuild. Run `/reload` to make that happen now.
 
 #### Turn off an MCP server
 
-You turn a server off in `/mcp`. Caudra writes `mcp.toml` itself, so the footer stays quiet. The server stops at once. Its tools stay in the definitions until the next rebuild, so the cache holds. A call to one fails, `tool_search` no longer offers them, and the reminder lists them under "Declared tools that no longer exist".
+You turn a server off in `/mcp`. Caudra writes `mcp.toml` itself, so the footer stays quiet. The server stops at once, and the next server list leaves it out. The definitions stay as they were, so the cache holds. When it was the last enabled server, a short reminder tells the model to disregard the list, and `mcp` stays in the definitions until the next rebuild. A call to it then fails.
 
 #### Switch to plan mode
 
-You press `Tab` to plan while MCP servers run. Plan mode declares no MCP tools, so the definitions change, and the next request reads the whole conversation at full price. The switch back to build declares them again at the same price. Without MCP servers, only the first switch to plan changes the definitions, by adding the `plan` tool.
+You press `Tab` to plan while MCP servers run. Plan mode keeps the `mcp` tool and refuses each server call it does not allow, so MCP servers do not change the definitions. Only the first switch to plan changes them, by adding the `plan` tool, and that request reads the whole conversation at full price.
 
 #### Disable a tool
 
@@ -433,7 +433,7 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 | `read` | 3 | `file_read` |
 | `write` | 7 | `file_write`, `file_edit`, `file_apply_patch`, `image_generate`, `memory`, `plan` |
 | `web` | 3 | `webfetch`, `websearch` |
-| `other` | 3 | `automation`, `batch`, `execution_environment`, `list_sessions`, `mcp_resource`, `publish_message`, `question`, `read_topic`, `send_message`, `skill`, `todo_write`, `tool_output`, `view_image`, `work_assignment`, `workflow` |
+| `other` | 3 | `automation`, `batch`, `execution_environment`, `list_sessions`, `mcp`, `publish_message`, `question`, `read_topic`, `send_message`, `skill`, `todo_write`, `tool_output`, `view_image`, `work_assignment`, `workflow` |
 
 ### `agent`
 
