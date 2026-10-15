@@ -1,0 +1,8 @@
+homeassistant:
+  name: Caudra MCP tests
+  unit_system: metric
+  time_zone: UTC
+
+frontend:
+conversation:
+demo:

@@ -84,6 +84,20 @@ Debug builds leave out debug info for dependencies and vendored C code, which ke
 
 Before you ask for review, run `make ci`. CI also runs the macOS and Windows builds and the Nix build. Website checks run in the separate website repository.
 
+## MCP server tests
+
+`make test-mcp-servers` runs the `mcp` tool against real MCP servers: server-everything, Executor, and Home Assistant, each pinned in a Dockerfile under `tests/mcp-servers/`. It needs Docker, and a remote daemon works through `DOCKER_HOST`. CI never runs these tests, and `make test` skips them. `scripts/mcp-servers.py` builds the images, starts and onboards Home Assistant, runs the tests, and then removes every container labelled `caudra-mcp-it`.
+
+The tests in `caudra-workcell/tests/mcp_servers/` run fixed snippets through the `mcp` gateway. The ones in `tests/mcp_sessions/` drive the `caudra` binary over stream-json, as an SDK client would, and answer its permission prompts. Their model answers come from cassettes in `tests/mcp_sessions/cassettes/`, so they need no model and no credentials. When a change alters what Caudra asks the model, record them again with a real model:
+
+```sh
+CAUDRA_IT_RECORD=openai/gpt-6-luna make test-mcp-servers ARGS='-E "binary(mcp_sessions)"'
+```
+
+A recording uses the login a debug build saved, and copies it only while it has at least 30 minutes left, because a copy that refreshed it would sign the original out. Only a test that passes replaces its cassettes. Underneath, `CAUDRA_PROVIDER_RECORD=<file>` and `CAUDRA_PROVIDER_REPLAY=<file>` make any Caudra process record or replay its model answers.
+
+To work on one test, start the servers once with `eval "$(python3 scripts/mcp-servers.py up)"`, run `cargo nextest run` with `--run-ignored only`, and remove them with `python3 scripts/mcp-servers.py down`.
+
 ## Where things live
 
 | Path | What it holds |

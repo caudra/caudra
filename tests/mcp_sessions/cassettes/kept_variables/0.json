@@ -1,0 +1,89 @@
+{
+  "model": "openai/gpt-6-luna",
+  "answers": [
+    {
+      "lane": "openai/gpt-6-luna with tools",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "call_520af5694a6b493d8b1618d56d16cecd",
+            "name": "mcp",
+            "input": {
+              "code": "kept = await everything.get_sum(a=2, b=3)"
+            }
+          }
+        ]
+      },
+      "usage": {
+        "input_tokens": 8979,
+        "output_tokens": 32,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0
+      },
+      "stop_reason": "tool_use"
+    },
+    {
+      "lane": "openai/gpt-6-luna with tools",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "done"
+          }
+        ]
+      },
+      "usage": {
+        "input_tokens": 327,
+        "output_tokens": 5,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 8704
+      },
+      "stop_reason": "end_turn"
+    },
+    {
+      "lane": "openai/gpt-6-luna with tools",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "call_1fa1ea04d163460daced0e9586119298",
+            "name": "mcp",
+            "input": {
+              "code": "kept"
+            }
+          }
+        ]
+      },
+      "usage": {
+        "input_tokens": 371,
+        "output_tokens": 19,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 8704
+      },
+      "stop_reason": "tool_use"
+    },
+    {
+      "lane": "openai/gpt-6-luna with tools",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "done"
+          }
+        ]
+      },
+      "usage": {
+        "input_tokens": 9119,
+        "output_tokens": 5,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0
+      },
+      "stop_reason": "end_turn"
+    }
+  ]
+}

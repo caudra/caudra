@@ -16,7 +16,7 @@ endif
 
 export WORKCELL_BUNDLED_MONTY_WORKER := $(CURDIR)/target/code-worker/bin/$(MONTY_WORKER_NAME)
 
-.PHONY: help code-worker install install-fast build check run test lint lint-fix fmt-check fmt pylint distribution-tests gen-docs gen-docs-check model-watch workcell-build workcell-run workcell-release workcell-check-native workcell-doc-test machete ci
+.PHONY: help code-worker install install-fast build check run test test-mcp-servers lint lint-fix fmt-check fmt pylint distribution-tests gen-docs gen-docs-check model-watch workcell-build workcell-run workcell-release workcell-check-native workcell-doc-test machete ci
 
 help:
 	@printf '%s\n' \
@@ -30,6 +30,7 @@ help:
 		'  make lint           Run workspace Clippy with warnings denied' \
 		'  make lint-fix       Apply Clippy fixes' \
 		'  make test           Run workspace tests with nextest' \
+		'  make test-mcp-servers  Run the MCP server tests against pinned servers in Docker' \
 		'  make fmt            Format Rust, Lua, and Python' \
 		'  make fmt-check      Check Rust, Lua, and Python formatting' \
 		'  make pylint         Check Python lint and types' \
@@ -68,6 +69,10 @@ run: code-worker
 
 test: code-worker
 	WORKCELL_REQUIRE_CODE_WORKER=1 $(CARGO) nextest run --workspace $(ARGS)
+
+test-mcp-servers: export CARGO := $(CARGO)
+test-mcp-servers: code-worker
+	WORKCELL_REQUIRE_CODE_WORKER=1 $(PYTHON) scripts/mcp-servers.py test $(ARGS)
 
 lint: code-worker
 	$(CARGO) clippy --all --tests -- -D warnings

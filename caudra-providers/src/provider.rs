@@ -384,6 +384,10 @@ pub fn seed_setup_thinking(storage: &StateDir, model_spec: &str) {
 }
 
 pub fn provider_for_slug(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    crate::cassette::intercept(|| build_provider(slug, timeouts))
+}
+
+fn build_provider(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
     if let Ok(kind) = ProviderKind::from_str(slug) {
         return kind.create(timeouts);
     }

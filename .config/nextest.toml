@@ -3,3 +3,11 @@ fail-fast = false
 status-level = "slow"
 test-threads = "num-cpus"
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+[test-groups]
+home-assistant = { max-threads = 1 }
+
+# The Home Assistant tests share one running instance and its demo devices.
+[[profile.default.overrides]]
+filter = "binary(mcp_servers) & test(/^home_assistant::/)"
+test-group = "home-assistant"

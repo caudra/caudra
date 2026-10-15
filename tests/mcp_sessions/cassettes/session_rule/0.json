@@ -1,0 +1,47 @@
+{
+  "model": "openai/gpt-6-luna",
+  "answers": [
+    {
+      "lane": "openai/gpt-6-luna with tools",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "call_bf1feba67b294e11bb070845b2b2071c",
+            "name": "mcp",
+            "input": {
+              "code": "first = await everything.get_sum(a=2, b=3)\nsecond = await everything.get_sum(a=2, b=3)\nfirst == second"
+            }
+          }
+        ]
+      },
+      "usage": {
+        "input_tokens": 9004,
+        "output_tokens": 50,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0
+      },
+      "stop_reason": "tool_use"
+    },
+    {
+      "lane": "openai/gpt-6-luna with tools",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "done"
+          }
+        ]
+      },
+      "usage": {
+        "input_tokens": 9068,
+        "output_tokens": 5,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0
+      },
+      "stop_reason": "end_turn"
+    }
+  ]
+}

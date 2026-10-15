@@ -1,0 +1,47 @@
+{
+  "model": "openai/gpt-6-luna",
+  "answers": [
+    {
+      "lane": "openai/gpt-6-luna with tools",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "call_0ad5cf7423234ae28b1b77235321657a",
+            "name": "mcp",
+            "input": {
+              "code": "1 + 1"
+            }
+          }
+        ]
+      },
+      "usage": {
+        "input_tokens": 9165,
+        "output_tokens": 21,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0
+      },
+      "stop_reason": "tool_use"
+    },
+    {
+      "lane": "openai/gpt-6-luna with tools",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "done"
+          }
+        ]
+      },
+      "usage": {
+        "input_tokens": 520,
+        "output_tokens": 5,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 8704
+      },
+      "stop_reason": "end_turn"
+    }
+  ]
+}
