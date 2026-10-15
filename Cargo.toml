@@ -320,7 +320,6 @@ proptest = "1.11.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
 resvg = { version = "=0.47.0", default-features = false }
 rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk.git", rev = "9334c97f0d6e177546fc33593148aa3f942cb1f8", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
-rustix-038 = { package = "rustix", version = "0.38.44", features = ["fs", "process"] }
 schemars = "1.2.1"
 subtle = "2.6.1"
 tree-sitter-cmake = "0.7.5"

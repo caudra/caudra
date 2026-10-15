@@ -6,8 +6,6 @@
 
 #![forbid(unsafe_code)]
 
-extern crate rustix_038 as rustix;
-
 pub mod bash;
 // Process and output internals stay private so all callers retain lifecycle cleanup and bounds.
 mod catalog;

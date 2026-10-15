@@ -1,7 +1,5 @@
 #![forbid(unsafe_code)]
 
-extern crate rustix_038 as rustix;
-
 #[cfg(unix)]
 use std::path::Component;
 use std::{

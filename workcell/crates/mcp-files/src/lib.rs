@@ -3,7 +3,6 @@
 //! Typed confined or host-managed filesystem tools with an optional MCP adapter.
 
 extern crate notify_8 as notify;
-extern crate rustix_038 as rustix;
 
 #[cfg(unix)]
 mod binary;

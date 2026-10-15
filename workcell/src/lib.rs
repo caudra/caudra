@@ -1,7 +1,5 @@
 #![forbid(unsafe_code)]
 
-extern crate rustix_038 as rustix;
-
 pub mod cli;
 pub mod config;
 pub mod environment;

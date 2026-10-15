@@ -15,7 +15,7 @@ mcp = ["dep:rmcp"]
 async-trait.workspace = true
 dunce.workspace = true
 rmcp = { workspace = true, optional = true }
-rustix-038.workspace = true
+rustix = { workspace = true, features = ["fs", "std"] }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
