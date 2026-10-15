@@ -22,7 +22,7 @@ pub const DESCRIPTION: &str = "Run Python that calls the MCP servers this sessio
 - `search(\"query\", server=None, limit=10, offset=0)` finds tools the reminder leaves out and returns their exact signatures. `servers()` lists every server and whether it is connected. Both answer at once, so never `await` them.
 - `await resources(\"server\")` lists what a server offers to be read; `await read_resource(\"server\", uri)` reads one.
 - A failed call raises `RuntimeError` and a refused one `PermissionError`; catch them to carry on. Calls that ran before a failure keep their effects.
-- The value of the last expression is returned along with anything printed. Filter and summarise in the snippet, and return only what you need.
+- A snippet is module code, not a function body: its last expression is the result, returned with anything printed. Do not use `return` at top level. Filter and summarise in the snippet, and return only what you need.
 - Variables persist between runs; `reset: true` starts empty.
 - The interpreter is a sandboxed Python subset: no filesystem, network, subprocesses, class inheritance or third-party packages. Its modules are `asyncio`, `base64`, `binascii`, `collections`, `copy`, `dataclasses`, `datetime`, `functools`, `itertools`, `json`, `math`, `os`, `pathlib`, `random`, `re`, `sys`, `time`, `typing` and `unicodedata`. Type checking can reject `map`, `filter`, `getattr`, `setattr`, `hasattr` and `format`; use comprehensions and f-strings.";
 

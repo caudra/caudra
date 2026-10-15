@@ -185,7 +185,7 @@ const BUILTINS: &[&str] = &[
     "UserWarning",
 ];
 /// What the stubs import from `typing`, which a namespace must not shadow.
-const TYPING_NAMES: &[&str] = &["Any", "Literal"];
+const TYPING_NAMES: &[&str] = &["Any", "Literal", "overload"];
 /// The standard library modules the sandbox resolves.
 const MODULES: &[&str] = &[
     "asyncio",

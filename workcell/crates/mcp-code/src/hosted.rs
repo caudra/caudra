@@ -32,7 +32,7 @@ use crate::{
         Captured, CapturedOutput, CodeToolGroup, Completion, SCRIPT_NAME, captured_empty, execution,
     },
     render::{from_json, to_json},
-    repair::{Repair, repair},
+    repair::{Repair, SETTLED_HELPER, looks_like_javascript, repair},
     suspend::{Answer, answer},
     types::{CodeExecution, MAX_CODE_BYTES, MAX_TIMEOUT_MS, Outcome, PreparedCode},
 };
@@ -57,6 +57,7 @@ const KEYWORD_NAME_MESSAGE: &str = "keyword argument names must be strings";
 const HOSTED_SUSPENSION_LIMIT_MESSAGE: &str = "The snippet made too many host round trips and was stopped. Batch work into fewer calls, and check for an undefined name read inside a loop.";
 /// The checker's builtins lack `PermissionError`, which a refused host call raises, so a snippet that
 /// catches it would be rejected before it ran.
+const JAVASCRIPT_GUIDANCE: &str = "This looks like JavaScript, and `mcp` runs Python. Rewrite it in Python: `await` each call, and use `asyncio.gather` for several at once.";
 const HOSTED_STUBS_PRELUDE: &str = "class PermissionError(Exception): ...\n";
 /// The checker reads the body as reachable and the interpreter skips it, so a snippet under it is
 /// checked without running.
@@ -222,8 +223,12 @@ impl CodeToolGroup {
         cancellation: CancellationToken,
     ) -> HostedExecution {
         let stubs = host.stubs();
+        let javascript = looks_like_javascript(&prepared.code);
         let repaired = repair(prepared.code, &stubs);
-        let imports = repaired.imports();
+        let prelude = Prelude {
+            imports: repaired.imports(),
+            settles: repaired.settles(),
+        };
         let prepared = PreparedCode {
             code: repaired.code,
             ..prepared
@@ -241,17 +246,26 @@ impl CodeToolGroup {
                 prepared,
                 host,
                 &stubs,
-                &imports,
+                &prelude,
                 &mut imported,
                 state.as_ref(),
             ) => executed,
         };
+        if javascript
+            && let Some(execution) = &mut executed.execution
+            && execution.output.outcome == Outcome::Rejected
+        {
+            let diagnostic = execution.output.diagnostic.take().unwrap_or_default();
+            execution.output.diagnostic = Some(format!("{JAVASCRIPT_GUIDANCE}\n{diagnostic}"));
+        }
         executed.repairs = repaired
             .repairs
             .into_iter()
             .filter(|repair| match repair {
                 Repair::Imported(module) => imported.contains(module),
-                Repair::Unfenced | Repair::Unawaited(_) => true,
+                Repair::Unfenced | Repair::Unawaited(_) | Repair::FinalReturn | Repair::Settled => {
+                    true
+                }
             })
             .collect();
         executed
@@ -262,7 +276,7 @@ impl CodeToolGroup {
         prepared: PreparedCode,
         host: Arc<dyn CodeHost>,
         stubs: &str,
-        imports: &[&'static str],
+        prelude: &Prelude,
         imported: &mut Vec<&'static str>,
         prior: Option<&HostedState>,
     ) -> HostedExecution {
@@ -306,12 +320,12 @@ impl CodeToolGroup {
             .as_ref()
             .map(|kept| kept.namespaces.clone())
             .unwrap_or_default();
-        if !imports.is_empty() {
+        if !prelude.is_empty() {
             let unbound = Arc::new(Unbound::default());
             // An import that fails leaves the name undefined, and the snippet reports that itself.
             let fed = drive_hosted(
                 &mut session,
-                &import_source(imports, restored),
+                &prelude.source(restored),
                 !checked,
                 unbound.clone(),
                 &mut namespaces,
@@ -320,7 +334,8 @@ impl CodeToolGroup {
             if fed.is_ok() {
                 let unbound = unbound.names();
                 imported.extend(
-                    imports
+                    prelude
+                        .imports
                         .iter()
                         .filter(|module| !restored || unbound.iter().any(|name| name == *module)),
                 );
@@ -489,22 +504,40 @@ impl CodeHost for Unbound {
     }
 }
 
-/// The imports a repair found missing, run as a turn of their own so the snippet keeps its lines.
-/// The checker reads earlier turns as a stub file, which exports an import only under its own name
-/// written out, hence `import json as json`.
-/// A restored session may hold the name already, bound to something of its own, so there each
-/// module is imported only while its name is undefined.
-fn import_source(modules: &[&str], restored: bool) -> String {
-    modules
-        .iter()
-        .map(|module| {
-            if restored {
-                format!("try:\n    {module}\nexcept NameError:\n    import {module}\n")
-            } else {
-                format!("import {module} as {module}\n")
-            }
-        })
-        .collect()
+/// What a repaired snippet needs defined before it runs, fed as a turn of its own so the snippet
+/// keeps its lines.
+struct Prelude {
+    imports: Vec<&'static str>,
+    // MONTY-GATHER-SHIM: remove with the rest of the shim; see `repair::SETTLED_HELPER`.
+    settles: bool,
+}
+
+impl Prelude {
+    fn is_empty(&self) -> bool {
+        self.imports.is_empty() && !self.settles
+    }
+
+    /// The checker reads earlier turns as a stub file, which exports an import only under its own
+    /// name written out, hence `import json as json`. A restored session may hold the name already,
+    /// bound to something of its own, so there each module is imported only while its name is
+    /// undefined.
+    fn source(&self, restored: bool) -> String {
+        let mut source: String = self
+            .imports
+            .iter()
+            .map(|module| {
+                if restored {
+                    format!("try:\n    {module}\nexcept NameError:\n    import {module}\n")
+                } else {
+                    format!("import {module} as {module}\n")
+                }
+            })
+            .collect();
+        if self.settles {
+            source.push_str(SETTLED_HELPER);
+        }
+        source
+    }
 }
 
 fn check_only(code: &str) -> String {

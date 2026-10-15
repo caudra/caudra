@@ -13,8 +13,8 @@ use std::sync::{Arc, OnceLock};
 
 use caudra_agent::mcp::code::runner::{
     ReplNote, ReplState, RunFuture, ScriptCall, ScriptError, ScriptErrorKind, ScriptException,
-    ScriptHost, ScriptInvocation, ScriptName, ScriptOutcome, ScriptOutput, ScriptRun, ScriptRunner,
-    ScriptStatus,
+    ScriptHost, ScriptInvocation, ScriptName, ScriptOutcome, ScriptOutput, ScriptRepair, ScriptRun,
+    ScriptRunner, ScriptStatus,
 };
 use futures_lite::future;
 use tokio::runtime::{Builder, Handle, Runtime};
@@ -209,7 +209,14 @@ async fn run_hosted(
             StateNote::RunDiscarded => ReplNote::RunDiscarded,
             StateNote::TooLarge { bytes } => ReplNote::TooLarge { bytes },
         }),
-        repairs: executed.repairs.iter().map(ToString::to_string).collect(),
+        repairs: executed
+            .repairs
+            .iter()
+            .map(|repair| ScriptRepair {
+                done: repair.to_string(),
+                lesson: repair.lesson(),
+            })
+            .collect(),
     };
     (outcome, executed.state)
 }

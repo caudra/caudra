@@ -143,7 +143,10 @@ pub async fn run(
     };
     output.calls = gateway.finish();
     output.state_note = (!notes.is_empty()).then(|| notes.join(" "));
-    output.repairs = outcome.repairs;
+    for repair in outcome.repairs {
+        output.lessons.extend(repair.lesson);
+        output.repairs.push(repair.done);
+    }
     output
 }
 

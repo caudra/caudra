@@ -27,7 +27,8 @@ const RECEIVER: &str = "self";
 const KEYWORD_ONLY: &str = "*";
 const POSITIONAL_ONLY: &str = "/";
 const INDENT: &str = "    ";
-const STUB_IMPORTS: &str = "from typing import Any, Literal";
+const STUB_IMPORTS: &str = "from typing import Any, Literal, overload";
+const OVERLOAD: &str = "@overload";
 
 const PROPERTIES: &str = "properties";
 const REQUIRED: &str = "required";
@@ -174,11 +175,24 @@ pub fn stubs(names: &Names, servers: &[ServerView]) -> String {
         for (method, tool) in tools {
             let signature = signature(method, tool);
             let parameters = parameter_list(&signature.params, signature.dict_only);
-            let separator = if parameters.is_empty() { "" } else { ", " };
-            lines.push(format!(
-                "{INDENT}async def {method}({RECEIVER}{separator}{parameters}) -> {}: ...",
-                signature.returns
-            ));
+            let method_stub = |parameters: &str| {
+                let separator = if parameters.is_empty() { "" } else { ", " };
+                format!(
+                    "{INDENT}async def {method}({RECEIVER}{separator}{parameters}) -> {}: ...",
+                    signature.returns
+                )
+            };
+            if signature.dict_only {
+                lines.push(method_stub(&parameters));
+                continue;
+            }
+            // The gateway also takes the arguments as one dict, as the docs promise.
+            lines.extend([
+                format!("{INDENT}{OVERLOAD}"),
+                method_stub(&parameters),
+                format!("{INDENT}{OVERLOAD}"),
+                method_stub(&format!("{ARGUMENTS}: {DICT}, /")),
+            ]);
         }
         lines.push(format!("{namespace}: {class}"));
     }
@@ -629,8 +643,14 @@ mod tests {
             "    pass",
             "empty: _McpServer_empty",
             "class _McpServer_github:",
+            "    @overload",
             "    async def run(self, *, owner: str) -> Any: ...",
+            "    @overload",
+            "    async def run(self, arguments: dict[str, Any], /) -> Any: ...",
+            "    @overload",
             "    async def zap(self) -> Any: ...",
+            "    @overload",
+            "    async def zap(self, arguments: dict[str, Any], /) -> Any: ...",
             "github: _McpServer_github",
             "linear: Any",
         ];

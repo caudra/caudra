@@ -216,8 +216,17 @@ pub struct ScriptOutcome {
     /// `None` when the run was cancelled.
     pub output: Option<ScriptOutput>,
     pub note: Option<ReplNote>,
-    /// What the runner changed in the snippet before running it, each said in a few words.
-    pub repairs: Vec<String>,
+    /// What the runner changed in the snippet before running it.
+    pub repairs: Vec<ScriptRepair>,
+}
+
+/// One change made to a snippet before it ran.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptRepair {
+    /// What was changed, in a few words.
+    pub done: String,
+    /// What the model should write next time, when the change undid a slip of its own.
+    pub lesson: Option<String>,
 }
 
 pub struct ScriptRun {

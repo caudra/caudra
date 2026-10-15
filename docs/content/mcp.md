@@ -132,7 +132,9 @@ A failed call raises `RuntimeError`: the server reported an error, the server is
 
 Before a snippet runs, it is checked against the signatures of the tools it calls, so a misspelt tool or an argument of the wrong type stops it before any call is made, with the closest name and the line. Later runs of the same agent are checked too, but not the variables they take from earlier runs, because those runs alone knew their types.
 
-Some slips have only one possible meaning, so Caudra fixes them before the snippet runs. It imports a standard module the snippet uses without importing it, such as `asyncio` in `asyncio.gather`. It drops `await` before `search()` and `servers()`, and it removes a Markdown fence around the whole snippet. Each fix keeps the snippet's line numbers, so errors still point at the line the model wrote. The card lists the fixes, and the conversation keeps the snippet as the model wrote it.
+Some slips have only one possible meaning, so Caudra fixes them before the snippet runs. It imports a standard module the snippet uses without importing it, such as `asyncio` in `asyncio.gather`. It drops `await` before `search()` and `servers()`, removes a Markdown fence around the whole snippet, and drops `return` from a snippet's last line, since a snippet ends on its value. `asyncio.gather(..., return_exceptions=True)` works: each failed call settles as its exception while the others still answer. Each fix keeps the snippet's line numbers, so errors still point at the line the model wrote. The card lists the fixes, and the model reads in the result what it did wrong, so it can avoid the slip next time. The conversation keeps the snippet as the model wrote it.
+
+Code that is not valid Python never runs. The error says what kind of code a snippet is: module code, so `return` belongs only inside a function, and Python, so JavaScript such as `const` or `Promise.all` is named as such.
 
 Calls that ran before a failure keep their effects. When a run fails, the model reads why, followed by every server call the run made and how each ended, so it can check before it repeats one. The list names each call as the snippet wrote it, such as `my_server.get_sum`. Stopping the turn cancels the run and the calls it has in flight.
 
@@ -143,6 +145,10 @@ Variables that a run defines are still there in the next run of the same agent. 
 ### Where snippets run
 
 Snippets always run on this machine, because your MCP servers are clients of this Caudra process, even when the session's other tools run on a [remote Workcell](/docs/remote-workspaces/). A build without the bundled worker returns an error that says so. With embedded Workcell, Caudra also warns at startup that `python_execution` and `mcp` are unavailable. When a server is configured, the TUI shows the same reason as it starts, and `/mcp` shows it above the server list. `WORKCELL_MCP_CODE_WORKER` can point Caudra at a worker binary.
+
+> **Note**
+>
+> **Snippets run in a worker process of their own, not inside Caudra.** The worker has no filesystem, network, subprocess, or environment access. A snippet reaches the outside only through the MCP calls and helpers Caudra answers, and each call passes the same permission check as before. A snippet that crashes the worker ends only that process, and Caudra starts a new one. This is process isolation, not an operating-system sandbox: the worker runs as your user.
 
 [`python_execution`](/docs/tools/#python_execution) is a separate tool. It runs isolated, needs no approval by default, can run on a remote Workcell, and cannot reach MCP servers.
 

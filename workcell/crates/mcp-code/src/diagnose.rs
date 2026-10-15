@@ -18,6 +18,10 @@ use crate::types::Outcome;
 pub(crate) const UNRESOLVED_REFERENCE_RULE: &str = "[unresolved-reference]";
 const UNRESOLVED_REFERENCE_NAME: &str = "[unresolved-reference] Name `";
 const UNRESOLVED_ATTRIBUTE_RULE: &str = "[unresolved-attribute]";
+const INVALID_SYNTAX_RULE: &str = "[invalid-syntax]";
+const RETURN_OUTSIDE_FUNCTION: &str = "`return` statement outside of a function";
+const TOP_LEVEL_RETURN_GUIDANCE: &str = "A snippet is module code, not a function body, so nothing ran. End on the value you want back instead of returning it, and keep `return` inside functions.";
+const SYNTAX_GUIDANCE: &str = "The snippet is not valid Python, so nothing ran.";
 /// How the interpreter's `NameError` starts, before the name.
 const NAME_ERROR_PREFIX: &str = "name '";
 const NAME_ERROR_QUOTE: char = '\'';
@@ -225,6 +229,14 @@ fn isolation_guidance(detail: &str) -> String {
 /// those two rules lets the caller receive the same redirection it would have received at runtime.
 pub(crate) fn diagnose_type_errors_for(diagnostics: &str, surface: Surface) -> String {
     let trimmed = diagnostics.trim();
+    if surface == Surface::Hosted && trimmed.contains(INVALID_SYNTAX_RULE) {
+        let guidance = if trimmed.contains(RETURN_OUTSIDE_FUNCTION) {
+            TOP_LEVEL_RETURN_GUIDANCE
+        } else {
+            SYNTAX_GUIDANCE
+        };
+        return format!("{guidance}\n{trimmed}");
+    }
     if surface == Surface::Hosted {
         if trimmed.contains(UNRESOLVED_ATTRIBUTE_RULE) {
             return format!(
@@ -407,6 +419,17 @@ mod tests {
             others.starts_with("filter, getattr, setattr, hasattr, and format"),
             "{text}"
         );
+    }
+
+    /// Syntax errors get no advice about arguments or annotations, which cannot be their cause.
+    #[test_case("snippet.py:3:1: error[invalid-syntax] `return` statement outside of a function", TOP_LEVEL_RETURN_GUIDANCE ; "a_return_outside_a_function")]
+    #[test_case("snippet.py:1:7: error[invalid-syntax] Simple statements must be separated by newlines or semicolons", SYNTAX_GUIDANCE ; "other_syntax")]
+    fn a_hosted_syntax_error_says_what_kind_of_code_a_snippet_is(
+        diagnostics: &str,
+        guidance: &str,
+    ) {
+        let text = diagnose_type_errors_for(diagnostics, Surface::Hosted);
+        assert_eq!(text, format!("{guidance}\n{diagnostics}"));
     }
 
     const MISSING_ASYNCIO: &str =

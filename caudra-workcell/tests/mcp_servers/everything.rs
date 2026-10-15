@@ -27,6 +27,12 @@ const IMPORTED_ASYNCIO: &str = "imported `asyncio`";
 const UNAWAITED_SEARCH: &str = "dropped `await` before `search()`";
 const MEANT_GET_SUM: &str = "Did you mean `get_sum`?";
 const TRUE: &str = "true";
+const DROPPED_RETURN: &str = "dropped `return` from the last line";
+// MONTY-GATHER-SHIM: gone once Monty's `gather` takes `return_exceptions`.
+const SETTLED: &str = "ran `asyncio.gather` without `return_exceptions`";
+const GATHER_SETTLED: &str = "import asyncio\n\
+     results = await asyncio.gather(everything.get_sum(a=2, b=3), everything.get_sum(a=10, b=20), return_exceptions=True)\n\
+     [type(r).__name__ if isinstance(r, Exception) else r for r in results]";
 
 fn everything(mode: AgentMode, permission_mode: PermissionMode) -> Servers {
     Servers::connect(
@@ -95,6 +101,44 @@ fn gathered_calls_all_answer(prelude: &str, repairs: &[&str]) {
     );
     assert_eq!(output.calls.len(), 2);
     assert_eq!(output.repairs, repairs);
+}
+
+#[test]
+#[ignore = "needs Docker: make test-mcp-servers"]
+fn a_tool_takes_one_dict_of_arguments() {
+    let output = building().run("await everything.get_sum({'a': 2, 'b': 3})");
+    assert_eq!(completed(&output), SUM);
+}
+
+/// A snippet that ends on `return` runs as though it ended on the value, and the model is told why.
+#[test]
+#[ignore = "needs Docker: make test-mcp-servers"]
+fn a_final_return_is_dropped_and_explained() {
+    let output = building().run(&format!("return {CALL_SUM}"));
+    assert_eq!(completed(&output), SUM);
+    assert_eq!(output.repairs, [DROPPED_RETURN]);
+    assert_eq!(output.lessons.len(), 1, "{output:?}");
+}
+
+/// With `return_exceptions=True` a denied call settles as its error, and the other still answers.
+/// The repair is MONTY-GATHER-SHIM; without the shim it must pass with no repair listed.
+#[test]
+#[ignore = "needs Docker: make test-mcp-servers"]
+fn a_denied_call_in_a_settled_gather_leaves_the_other_answer() {
+    let servers = everything(AgentMode::Build, PermissionMode::Ask);
+    let (output, asked) = servers.run_answering(
+        GATHER_SETTLED,
+        &[PermissionAnswer::AllowOnce, PermissionAnswer::Deny],
+    );
+    assert_eq!(asked.len(), 2);
+    let result = completed(&output);
+    assert!(result.contains(PERMISSION_ERROR), "{result}");
+    assert!(
+        result.contains(SUM) != result.contains(SECOND_SUM),
+        "{result}"
+    );
+    assert_eq!(output.repairs, [SETTLED]);
+    assert!(output.lessons.is_empty(), "{output:?}");
 }
 
 #[test]

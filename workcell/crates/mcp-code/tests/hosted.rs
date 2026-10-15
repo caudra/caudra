@@ -21,7 +21,12 @@ use workcell_mcp_code::{
 const NAMESPACE: &str = "gh";
 const DENIED: &str = "denied by the user";
 const SLOW_REPLY: &str = "answered late";
-const STUBS: &str = "from typing import Any\nclass _Gh:\n    async def list(self, *, owner: str = '') -> dict[str, Any]: ...\n    async def echo(self, value: Any, *, nested: Any) -> Any: ...\n    async def boom(self) -> Any: ...\n    async def hang(self) -> Any: ...\n    async def slow(self) -> str: ...\ngh: _Gh\ndef search(query: str) -> list[str]: ...\n";
+const HOME_ASSISTANT: &str = "homeassistant";
+const EXECUTOR: &str = "executor";
+const MISSING_LIST: &str = "Shopping list";
+const NO_SUCH_LIST: &str = "no such list";
+/// Declared as Caudra's gateway declares them: a tool takes keywords, or one dict of them.
+const STUBS: &str = "from typing import Any, overload\nclass _Gh:\n    @overload\n    async def list(self, *, owner: str = '') -> dict[str, Any]: ...\n    @overload\n    async def list(self, arguments: dict[str, Any], /) -> dict[str, Any]: ...\n    async def echo(self, value: Any, *, nested: Any) -> Any: ...\n    async def boom(self) -> Any: ...\n    async def hang(self) -> Any: ...\n    async def slow(self) -> str: ...\ngh: _Gh\nclass _Homeassistant:\n    async def homeassistant__GetLiveContext(self) -> Any: ...\n    async def llm__GetDateTime(self) -> Any: ...\n    async def todo__get_items(self, *, todo_list: str, status: str | None = None) -> Any: ...\nhomeassistant: _Homeassistant\nclass _Executor:\n    @overload\n    async def skills(self) -> Any: ...\n    @overload\n    async def skills(self, arguments: dict[str, Any], /) -> Any: ...\nexecutor: _Executor\ndef search(query: str) -> list[str]: ...\n";
 const HOSTED_SUSPENSION_LIMIT_MESSAGE: &str = "The snippet made too many host round trips and was stopped. Batch work into fewer calls, and check for an undefined name read inside a loop.";
 const SHORT_TIMEOUT_SECS: u64 = 1;
 /// Well past the short time limit, so a run charged for the wait could not finish within it.
@@ -79,10 +84,10 @@ impl FakeHost {
 impl CodeHost for FakeHost {
     fn lookup(&self, namespace: Option<&str>, name: &str) -> HostName {
         match (namespace, name) {
-            (None, NAMESPACE) => HostName::Namespace,
-            (None, "search") | (Some(NAMESPACE), "list" | "echo" | "boom" | "hang" | "slow") => {
-                HostName::Function
-            }
+            (None, NAMESPACE | HOME_ASSISTANT | EXECUTOR) => HostName::Namespace,
+            (None, "search")
+            | (Some(NAMESPACE), "list" | "echo" | "boom" | "hang" | "slow")
+            | (Some(HOME_ASSISTANT | EXECUTOR), _) => HostName::Function,
             (Some(_), _) => HostName::Undefined(Some(format!("no tool `{name}`; use search()"))),
             (None, _) => HostName::Undefined(None),
         }
@@ -98,13 +103,21 @@ impl CodeHost for FakeHost {
             match call.name.as_str() {
                 "echo" => Ok(json!({"args": call.args, "kwargs": call.kwargs})),
                 "boom" => Err(HostError::new(HostErrorKind::Permission, DENIED)),
+                "todo__get_items" if call.kwargs.get("todo_list") == Some(&json!(MISSING_LIST)) => {
+                    Err(HostError::new(HostErrorKind::Runtime, NO_SUCH_LIST))
+                }
                 "hang" => std::future::pending().await,
                 "slow" => {
                     tokio::time::sleep(HOST_DELAY).await;
                     Ok(json!(SLOW_REPLY))
                 }
                 _ => {
-                    Ok(json!({ "owner": call.kwargs.get("owner").cloned().unwrap_or(Value::Null) }))
+                    let owner = call.kwargs.get("owner").or_else(|| {
+                        call.args
+                            .first()
+                            .and_then(|arguments| arguments.get("owner"))
+                    });
+                    Ok(json!({ "owner": owner.cloned().unwrap_or(Value::Null) }))
                 }
             }
         }))
@@ -387,6 +400,100 @@ async fn a_repaired_snippet_keeps_its_line_numbers() {
     let diagnostic = output(&executed).diagnostic.as_deref().unwrap_or_default();
     assert!(diagnostic.contains("snippet.py:4:"), "{diagnostic}");
     assert!(!diagnostic.contains("unresolved-reference"), "{diagnostic}");
+    group.shutdown().await;
+}
+
+/// A tool takes its arguments as keywords or as one dict, and both forms are checked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tool_takes_one_dict_of_arguments() {
+    let Some(group) = group().await else { return };
+    let host = Arc::new(FakeHost::default());
+    let executed = run(
+        &group,
+        &host,
+        "(await gh.list({'owner': 'a'}))['owner']",
+        None,
+    )
+    .await;
+    assert_eq!(result(&executed), &json!("a"), "{:?}", output(&executed));
+    let rejected = run(&group, &host, "await gh.list(1)", None).await;
+    assert_eq!(outcome(&rejected), Outcome::Rejected);
+    assert_eq!(host.calls(), ["list"]);
+    group.shutdown().await;
+}
+
+const FIELD_GATHER_RETURNED: &str = r#"results = await asyncio.gather(
+    homeassistant.homeassistant__GetLiveContext(),
+    homeassistant.llm__GetDateTime(),
+    homeassistant.todo__get_items(todo_list="To-Do", status="all"),
+    homeassistant.todo__get_items(todo_list="Shopping list", status="all"),
+    return_exceptions=True,
+)
+return {name: r if not isinstance(r, Exception) else f"ERROR: {r}" for name, r in zip(["liveContext", "dateTime", "todo", "shopping"], results)}"#;
+const FIELD_GATHER_LAMBDAS: &str = r#"results = await asyncio.gather(
+    homeassistant.homeassistant__GetLiveContext(),
+    homeassistant.llm__GetDateTime(),
+    homeassistant.todo__get_items(todo_list="To-Do", status="all"),
+    homeassistant.todo__get_items(todo_list="Shopping list", status="all"),
+    return_exceptions=True,
+)
+{
+    "liveContext": (lambda r: f"ERROR: {r}" if isinstance(r, Exception) else r)(results[0]),
+    "dateTime": (lambda r: f"ERROR: {r}" if isinstance(r, Exception) else r)(results[1]),
+    "todo": (lambda r: f"ERROR: {r}" if isinstance(r, Exception) else r)(results[2]),
+    "shopping": (lambda r: f"ERROR: {r}" if isinstance(r, Exception) else r)(results[3]),
+}"#;
+const FIELD_GATHER_PRINTED: &str = r#"results = await asyncio.gather(
+    homeassistant.llm__GetDateTime(),
+    homeassistant.homeassistant__GetLiveContext(),
+    homeassistant.todo__get_items(todo_list='To-Do', status='all'),
+    homeassistant.todo__get_items(todo_list='Shopping list', status='all'),
+    return_exceptions=True,
+)
+for r in results:
+    if isinstance(r, Exception):
+        print(type(r).__name__, r)
+    else:
+        print(r)"#;
+const FIELD_EMPTY_DICT: &str = "await executor.skills({})";
+const FIELD_JAVASCRIPT: &str = "const results = await Promise.all([executor.search({query:'', limit:5}), executor.search({query:'', namespace:'executor', limit:5})]); return results.map(r => ({items:r.items, namespaces:r.namespaces, unavailableApps:r.unavailableApps}));";
+const JAVASCRIPT: &str = "looks like JavaScript";
+const TOP_LEVEL_RETURN: &str = "module code, not a function body";
+
+/// Snippets models wrote against real servers that failed before Caudra repaired or explained
+/// them, verbatim. A failure seen in the field goes here first, with what it should do now.
+///
+/// The `return_exceptions` cases lean on MONTY-GATHER-SHIM. Once Monty's own `gather` takes the
+/// keyword and the shim is gone, they must still pass with `Repair::Settled` dropped from their
+/// expected repairs.
+#[test_case(FIELD_GATHER_RETURNED, &[Repair::Imported("asyncio"), Repair::FinalReturn, Repair::Settled], "ERROR: no such list" ; "gather_with_a_final_return")]
+#[test_case(FIELD_GATHER_LAMBDAS, &[Repair::Imported("asyncio"), Repair::Settled], "ERROR: no such list" ; "gather_into_lambdas")]
+#[test_case(FIELD_GATHER_PRINTED, &[Repair::Imported("asyncio"), Repair::Settled], "RuntimeError no such list" ; "gather_printed")]
+#[test_case(FIELD_EMPTY_DICT, &[], "owner" ; "an_empty_dict_of_arguments")]
+#[tokio::test(flavor = "multi_thread")]
+async fn field_snippets_now_run(code: &str, repairs: &[Repair], shows: &str) {
+    let Some(group) = group().await else { return };
+    let host = Arc::new(FakeHost::default());
+    let executed = run(&group, &host, code, None).await;
+    let output = output(&executed);
+    assert_eq!(output.outcome, Outcome::Completed, "{output:?}");
+    let shown = format!("{}{}", output.stdout, output.result);
+    assert!(shown.contains(shows), "{shown}");
+    assert_eq!(executed.repairs, repairs);
+    group.shutdown().await;
+}
+
+#[test_case(FIELD_JAVASCRIPT, JAVASCRIPT ; "javascript")]
+#[test_case("if True:\n    return 1\n2", TOP_LEVEL_RETURN ; "a_return_before_the_end")]
+#[tokio::test(flavor = "multi_thread")]
+async fn field_snippets_that_cannot_run_say_why(code: &str, explained_by: &str) {
+    let Some(group) = group().await else { return };
+    let host = Arc::new(FakeHost::default());
+    let executed = run(&group, &host, code, None).await;
+    assert_eq!(outcome(&executed), Outcome::Rejected);
+    let diagnostic = output(&executed).diagnostic.as_deref().unwrap_or_default();
+    assert!(diagnostic.contains(explained_by), "{diagnostic}");
+    assert!(host.calls().is_empty());
     group.shutdown().await;
 }
 

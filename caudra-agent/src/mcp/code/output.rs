@@ -19,6 +19,8 @@ const CALL_NOUN: &str = "call";
 const PRINTED_LABEL: &str = "Printed:";
 const RESULT_LABEL: &str = "Result:";
 const NOTE_LABEL: &str = "Note:";
+const REPAIRED_LABEL: &str = "Repaired before running:";
+const LESSON_SEPARATOR: &str = "; ";
 const NOTHING: &str = "The snippet ended on None and printed nothing.";
 const CANCELLED: &str = "The user cancelled the run.";
 const CALLS_LABEL: &str = "Server calls this run made before it stopped. Their effects stand, so check before repeating one:";
@@ -42,10 +44,12 @@ pub struct McpCodeOutput {
     /// What became of the variables kept between runs, when something did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_note: Option<String>,
-    /// What was changed in `code` before it ran. Only the card shows it; the model's text is left
-    /// as the model wrote it.
+    /// What was changed in `code` before it ran, for the card. `code` stays as the model wrote it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repairs: Vec<String>,
+    /// What the model should write next time, for each repair that undid a slip of its own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lessons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,6 +187,12 @@ impl McpCodeOutput {
                 parts.push(self.calls_made());
             }
         }
+        if !self.lessons.is_empty() {
+            parts.push(format!(
+                "{REPAIRED_LABEL} {}.",
+                self.lessons.join(LESSON_SEPARATOR)
+            ));
+        }
         if let Some(note) = &self.state_note {
             parts.push(format!("{NOTE_LABEL} {note}"));
         }
@@ -252,20 +262,26 @@ mod tests {
 
     const RESULT: &str = "5";
     const REPAIR: &str = "imported `asyncio`";
+    const IMPORT_LESSON: &str = "`asyncio` was used without `import asyncio`";
+    const RETURN_LESSON: &str = "end on the expression rather than `return` it";
 
-    /// The model's snippet stays as it wrote it, so what was repaired is the card's alone.
+    /// The model reads what to write next time, once each, and never the card's short form.
     #[test]
-    fn the_model_never_reads_what_was_repaired() {
-        let repaired = McpCodeOutput {
+    fn the_model_reads_the_lesson_of_each_repair() {
+        let output = McpCodeOutput {
             result: Some(RESULT.to_owned()),
             outcome: McpCodeOutcome::Completed,
             repairs: vec![REPAIR.to_owned()],
+            lessons: vec![IMPORT_LESSON.to_owned(), RETURN_LESSON.to_owned()],
             ..McpCodeOutput::default()
         };
-        let plain = McpCodeOutput {
-            repairs: Vec::new(),
-            ..repaired.clone()
-        };
-        assert_eq!(repaired.model_text(), plain.model_text());
+        let text = output.model_text();
+        assert!(
+            text.ends_with(&format!(
+                "{REPAIRED_LABEL} {IMPORT_LESSON}{LESSON_SEPARATOR}{RETURN_LESSON}."
+            )),
+            "{text}"
+        );
+        assert!(!text.contains(REPAIR), "{text}");
     }
 }

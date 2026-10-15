@@ -19,6 +19,40 @@ const CALL: &str = "call";
 const AWAIT: &str = "await";
 const OBJECT_FIELD: &str = "object";
 const FUNCTION_FIELD: &str = "function";
+const ATTRIBUTE_FIELD: &str = "attribute";
+const ARGUMENTS_FIELD: &str = "arguments";
+const NAME_FIELD: &str = "name";
+const VALUE_FIELD: &str = "value";
+const ARGUMENT_LIST: &str = "argument_list";
+const KEYWORD_ARGUMENT: &str = "keyword_argument";
+const LIST_SPLAT: &str = "list_splat";
+const DICTIONARY_SPLAT: &str = "dictionary_splat";
+const COMMA: &str = ",";
+const RETURN_STATEMENT: &str = "return_statement";
+const TRUE: &str = "true";
+const FALSE: &str = "false";
+const ASYNCIO: &str = "asyncio";
+const GATHER: &str = "gather";
+const RETURN_EXCEPTIONS: &str = "return_exceptions";
+const NONE: &str = "None";
+/// Text no Python statement contains.
+const JAVASCRIPT_MARKERS: [&str; 4] = ["=>", "===", "Promise.", "console.log("];
+const JAVASCRIPT_DECLARATIONS: [&str; 4] = ["const ", "let ", "var ", "function "];
+// MONTY-GATHER-SHIM: temporary, until Monty's `asyncio.gather` takes `return_exceptions`.
+// Monty 1.1.0 declares the keyword in `monty-typeshed/custom/asyncio.pyi`, so the checker passes
+// it, but `monty/src/modules/asyncio.rs` rejects every gather keyword at runtime
+// (`kwargs_not_supported_yet`). Once a pinned Monty release accepts it, delete everything tagged
+// MONTY-GATHER-SHIM (`grep -rn MONTY-GATHER-SHIM workcell`): `SETTLED_HELPER`, `Repair::Settled`,
+// `settled_gather`, `Repaired::settles`, and `Prelude::settles` in hosted.rs. The gather cases in
+// `tests/hosted.rs` must then still pass with no repair listed.
+/// Defined before a snippet whose `asyncio.gather(..., return_exceptions=True)` was rewritten: the
+/// interpreter's `gather` takes no keyword arguments, so each awaitable settles on its own instead.
+/// The checker sees earlier turns through `from ... import *`, which skips `_`-prefixed names.
+pub(crate) const SETTLED_HELPER: &str = "async def caudra_settled(awaitable):\n    try:\n        return await awaitable\n    except Exception as error:\n        return error\n";
+const SETTLED_OPEN: &str = "caudra_settled(";
+const SETTLED_CLOSE: &str = ")";
+const SETTLED_SPLAT_OPEN: &str = "[caudra_settled(_caudra_item) for _caudra_item in ";
+const SETTLED_SPLAT_CLOSE: &str = "]";
 /// How a stub declares a top-level function that answers at once. `async def` and indented methods
 /// do not start with it.
 const IMMEDIATE_STUB: &str = "def ";
@@ -32,6 +66,33 @@ pub enum Repair {
     Imported(&'static str),
     /// `await` before a call to a host function that answers at once was dropped.
     Unawaited(String),
+    /// `return` was dropped from the snippet's last statement, which then ends on its value.
+    FinalReturn,
+    /// `asyncio.gather(..., return_exceptions=...)` was rewritten to run without the keyword.
+    // MONTY-GATHER-SHIM: remove with the rest of the shim; see `SETTLED_HELPER`.
+    Settled,
+}
+
+impl Repair {
+    /// What the model should write next time, for a repair that undid its slip. `None` when what
+    /// it wrote was fine and only the interpreter needed the change.
+    #[must_use]
+    pub fn lesson(&self) -> Option<String> {
+        match self {
+            Self::Unfenced => Some("send plain Python, without a Markdown fence".to_owned()),
+            Self::Imported(module) => Some(format!(
+                "`{module}` was used without `import {module}`, so it was imported for this run"
+            )),
+            Self::Unawaited(function) => Some(format!(
+                "`{function}()` answers at once, so the `await` before it was dropped"
+            )),
+            Self::FinalReturn => Some(
+                "a snippet is module code, so end on the expression rather than `return` it"
+                    .to_owned(),
+            ),
+            Self::Settled => None,
+        }
+    }
 }
 
 impl fmt::Display for Repair {
@@ -41,6 +102,10 @@ impl fmt::Display for Repair {
             Self::Imported(module) => write!(formatter, "imported `{module}`"),
             Self::Unawaited(function) => {
                 write!(formatter, "dropped `await` before `{function}()`")
+            }
+            Self::FinalReturn => formatter.write_str("dropped `return` from the last line"),
+            Self::Settled => {
+                formatter.write_str("ran `asyncio.gather` without `return_exceptions`")
             }
         }
     }
@@ -57,9 +122,17 @@ impl Repaired {
             .iter()
             .filter_map(|repair| match repair {
                 Repair::Imported(module) => Some(*module),
-                Repair::Unfenced | Repair::Unawaited(_) => None,
+                Repair::Unfenced | Repair::Unawaited(_) | Repair::FinalReturn | Repair::Settled => {
+                    None
+                }
             })
             .collect()
+    }
+
+    /// Whether the snippet calls the helper [`SETTLED_HELPER`] defines.
+    // MONTY-GATHER-SHIM: remove with the rest of the shim; see `SETTLED_HELPER`.
+    pub(crate) fn settles(&self) -> bool {
+        self.repairs.contains(&Repair::Settled)
     }
 }
 
@@ -76,29 +149,202 @@ pub(crate) fn repair(code: String, stubs: &str) -> Repaired {
     let Some(tree) = parse(&code).filter(|tree| !tree.root_node().has_error()) else {
         return Repaired { code, repairs };
     };
+    let root = tree.root_node();
     let immediate: HashSet<&str> = immediate_functions(stubs).collect();
-    let uses = Uses::of(tree.root_node(), &code, &immediate);
+    let uses = Uses::of(root, &code, &immediate);
     repairs.extend(
         SUBSET_MODULES
             .into_iter()
             .filter(|module| uses.qualified.contains(module) && !uses.elsewhere.contains(module))
             .map(Repair::Imported),
     );
-    let awaits: Vec<Await> = uses
-        .awaits
-        .into_iter()
-        .filter(|awaited| !uses.elsewhere.contains(awaited.function.as_str()))
-        .collect();
-    for awaited in awaits.iter().rev() {
-        code.replace_range(awaited.start..awaited.end, "");
-    }
-    for awaited in awaits {
+    let mut edits = Vec::new();
+    for awaited in uses.awaits {
+        if uses.elsewhere.contains(awaited.function.as_str()) {
+            continue;
+        }
+        edits.push(Edit::remove(awaited.start, awaited.end));
         let repair = Repair::Unawaited(awaited.function);
         if !repairs.contains(&repair) {
             repairs.push(repair);
         }
     }
+    if let Some(edit) = final_return(root, &code) {
+        edits.push(edit);
+        repairs.push(Repair::FinalReturn);
+    }
+    let mut settled = false;
+    walk(root, |node| {
+        if let Some(gather) = settled_gather(node, &code) {
+            edits.extend(gather);
+            settled = true;
+        }
+    });
+    if settled {
+        repairs.push(Repair::Settled);
+    }
+    edits.sort_by_key(|edit| (edit.start, edit.end));
+    for edit in edits.iter().rev() {
+        code.replace_range(edit.start..edit.end, edit.text);
+    }
     Repaired { code, repairs }
+}
+
+/// Whether code Python cannot parse reads as JavaScript, as a model used to a JavaScript code tool
+/// writes it.
+pub(crate) fn looks_like_javascript(code: &str) -> bool {
+    parse(code).is_some_and(|tree| tree.root_node().has_error())
+        && (JAVASCRIPT_MARKERS
+            .iter()
+            .any(|marker| code.contains(marker))
+            || code.lines().any(|line| {
+                let line = line.trim_start();
+                JAVASCRIPT_DECLARATIONS
+                    .iter()
+                    .any(|declaration| line.starts_with(declaration))
+            }))
+}
+
+/// Replaces `start..end` with `text`. An insertion is empty, so it sorts before a removal at the
+/// same place and lands in front of what is left there.
+struct Edit {
+    start: usize,
+    end: usize,
+    text: &'static str,
+}
+
+impl Edit {
+    fn remove(start: usize, end: usize) -> Self {
+        Self {
+            start,
+            end,
+            text: "",
+        }
+    }
+
+    fn insert(at: usize, text: &'static str) -> Self {
+        Self {
+            start: at,
+            end: at,
+            text,
+        }
+    }
+}
+
+/// Drops `return` from the snippet's last top-level statement. A bare `return` becomes `None`.
+fn final_return(root: Node<'_>, code: &str) -> Option<Edit> {
+    let mut cursor = root.walk();
+    let last = root
+        .named_children(&mut cursor)
+        .filter(|node| !node.is_extra())
+        .last()?;
+    if last.kind() != RETURN_STATEMENT {
+        return None;
+    }
+    let keyword = last.child(0)?;
+    let mut cursor = last.walk();
+    let value = last
+        .named_children(&mut cursor)
+        .find(|node| !node.is_extra());
+    let Some(value) = value else {
+        return Some(Edit {
+            start: keyword.start_byte(),
+            end: keyword.end_byte(),
+            text: NONE,
+        });
+    };
+    (!code[keyword.start_byte()..value.start_byte()].contains('\n'))
+        .then(|| Edit::remove(keyword.start_byte(), value.start_byte()))
+}
+
+// MONTY-GATHER-SHIM: remove with the rest of the shim; see `SETTLED_HELPER`.
+/// Rewrites `asyncio.gather(..., return_exceptions=True)` so each awaitable settles on its own,
+/// and drops `return_exceptions=False`. A call with any other keyword, a `**` argument, or a value
+/// that is not a literal is left alone.
+fn settled_gather(call: Node<'_>, code: &str) -> Option<Vec<Edit>> {
+    if call.kind() != CALL {
+        return None;
+    }
+    let function = call.child_by_field_name(FUNCTION_FIELD)?;
+    let object = function.child_by_field_name(OBJECT_FIELD)?;
+    let attribute = function.child_by_field_name(ATTRIBUTE_FIELD)?;
+    if function.kind() != ATTRIBUTE
+        || object.kind() != IDENTIFIER
+        || &code[object.byte_range()] != ASYNCIO
+        || &code[attribute.byte_range()] != GATHER
+    {
+        return None;
+    }
+    let arguments = call
+        .child_by_field_name(ARGUMENTS_FIELD)
+        .filter(|arguments| arguments.kind() == ARGUMENT_LIST)?;
+    let mut cursor = arguments.walk();
+    let children: Vec<Node<'_>> = arguments.named_children(&mut cursor).collect();
+    let mut keyword = None;
+    for child in &children {
+        match child.kind() {
+            KEYWORD_ARGUMENT => {
+                let name = child.child_by_field_name(NAME_FIELD)?;
+                if keyword.is_some() || &code[name.byte_range()] != RETURN_EXCEPTIONS {
+                    return None;
+                }
+                keyword = Some(*child);
+            }
+            DICTIONARY_SPLAT => return None,
+            _ => {}
+        }
+    }
+    let keyword = keyword?;
+    let settles = match keyword.child_by_field_name(VALUE_FIELD)?.kind() {
+        TRUE => true,
+        FALSE => false,
+        _ => return None,
+    };
+    let comma = keyword
+        .next_sibling()
+        .filter(|next| next.kind() == COMMA)
+        .filter(|next| !code[keyword.end_byte()..next.start_byte()].contains('\n'));
+    let mut edits = vec![Edit::remove(
+        keyword.start_byte(),
+        comma.map_or(keyword.end_byte(), |comma| comma.end_byte()),
+    )];
+    if !settles {
+        return Some(edits);
+    }
+    for child in children.into_iter().filter(|child| !child.is_extra()) {
+        match child.kind() {
+            KEYWORD_ARGUMENT => {}
+            LIST_SPLAT => {
+                let spread = child.named_child(0)?;
+                edits.push(Edit::insert(spread.start_byte(), SETTLED_SPLAT_OPEN));
+                edits.push(Edit::insert(spread.end_byte(), SETTLED_SPLAT_CLOSE));
+            }
+            _ => {
+                edits.push(Edit::insert(child.start_byte(), SETTLED_OPEN));
+                edits.push(Edit::insert(child.end_byte(), SETTLED_CLOSE));
+            }
+        }
+    }
+    Some(edits)
+}
+
+/// Visits every node under `root`, parents before their children.
+fn walk<'tree>(root: Node<'tree>, mut visit: impl FnMut(Node<'tree>)) {
+    let mut cursor = root.walk();
+    loop {
+        visit(cursor.node());
+        if cursor.goto_first_child() || cursor.goto_next_sibling() {
+            continue;
+        }
+        loop {
+            if !cursor.goto_parent() {
+                return;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
 }
 
 /// The snippet with a fence around all of it blanked out, line for line.
@@ -151,24 +397,12 @@ struct Uses<'code> {
 impl<'code> Uses<'code> {
     fn of(root: Node<'_>, code: &'code str, immediate: &HashSet<&str>) -> Self {
         let mut uses = Self::default();
-        let mut cursor = root.walk();
-        loop {
-            let node = cursor.node();
+        walk(root, |node| {
             if node.kind() == IDENTIFIER {
                 uses.note(node, &code[node.byte_range()], code, immediate);
             }
-            if cursor.goto_first_child() || cursor.goto_next_sibling() {
-                continue;
-            }
-            loop {
-                if !cursor.goto_parent() {
-                    return uses;
-                }
-                if cursor.goto_next_sibling() {
-                    break;
-                }
-            }
-        }
+        });
+        uses
     }
 
     fn note(&mut self, node: Node<'_>, name: &'code str, code: &str, immediate: &HashSet<&str>) {
@@ -267,6 +501,91 @@ mod tests {
         let repaired = repaired(code);
         assert_eq!(repaired.code, expected);
         assert_eq!(repaired.repairs.first(), Some(&Repair::Unfenced));
+    }
+
+    #[test_case("x = 1\nreturn x", "x = 1\nx" ; "a_value")]
+    #[test_case("return {\n    'a': 1,\n}", "{\n    'a': 1,\n}" ; "across_lines")]
+    #[test_case("x = 1\nreturn", "x = 1\nNone" ; "bare")]
+    #[test_case("return x  # done\n# end", "x  # done\n# end" ; "before_comments")]
+    fn a_final_return_ends_on_its_value(code: &str, expected: &str) {
+        let repaired = repaired(code);
+        assert_eq!(repaired.code, expected);
+        assert_eq!(repaired.repairs, [Repair::FinalReturn]);
+    }
+
+    #[test_case("if x:\n    return 1\n2" ; "not_the_last_statement")]
+    #[test_case("def f():\n    return 1" ; "inside_a_function")]
+    #[test_case("return \\\n    1" ; "value_on_the_next_line")]
+    fn other_returns_are_left_alone(code: &str) {
+        let repaired = repaired(code);
+        assert_eq!(repaired.code, code);
+        assert!(repaired.repairs.is_empty(), "{:?}", repaired.repairs);
+    }
+
+    #[test_case(
+        "await asyncio.gather(gh.list(), gh.list(), return_exceptions=True)",
+        "await asyncio.gather(caudra_settled(gh.list()), caudra_settled(gh.list()), )" ;
+        "positional"
+    )]
+    #[test_case(
+        "await asyncio.gather(\n    gh.list(),\n    return_exceptions=True,\n)",
+        "await asyncio.gather(\n    caudra_settled(gh.list()),\n    \n)" ;
+        "across_lines_with_a_trailing_comma"
+    )]
+    #[test_case(
+        "await asyncio.gather(*calls, return_exceptions=True)",
+        "await asyncio.gather(*[caudra_settled(_caudra_item) for _caudra_item in calls], )" ;
+        "a_spread"
+    )]
+    #[test_case(
+        "return await asyncio.gather(await search('x'), return_exceptions=True)",
+        "await asyncio.gather(caudra_settled(search('x')), )" ;
+        "with_the_other_repairs"
+    )]
+    fn gather_settles_each_awaitable_instead_of_returning_exceptions(code: &str, expected: &str) {
+        let repaired = repaired(code);
+        assert_eq!(repaired.code, expected);
+        assert!(repaired.settles());
+        assert_eq!(repaired.code.lines().count(), code.lines().count());
+    }
+
+    #[test]
+    fn gather_without_exceptions_returned_only_loses_the_keyword() {
+        let repaired = repaired("await asyncio.gather(gh.list(), return_exceptions=False)");
+        assert_eq!(repaired.code, "await asyncio.gather(gh.list(), )");
+        assert_eq!(
+            repaired.repairs,
+            [Repair::Imported("asyncio"), Repair::Settled]
+        );
+    }
+
+    #[test_case("await asyncio.gather(gh.list(), return_exceptions=flag)" ; "a_value_that_is_not_a_literal")]
+    #[test_case("await asyncio.gather(gh.list(), return_exceptions=True, loop=None)" ; "another_keyword")]
+    #[test_case("await asyncio.gather(gh.list(), **options)" ; "a_keyword_spread")]
+    #[test_case("await other.gather(gh.list(), return_exceptions=True)" ; "another_module")]
+    fn other_gathers_are_left_alone(code: &str) {
+        let repaired = repaired(code);
+        assert_eq!(repaired.code, code);
+        assert!(!repaired.settles());
+    }
+
+    /// Only a slip teaches the model something. `return_exceptions` is declared by the
+    /// interpreter's own stubs, so using it was not one.
+    #[test_case(Repair::Imported("json"), true ; "imported")]
+    #[test_case(Repair::FinalReturn, true ; "final_return")]
+    #[test_case(Repair::Settled, false ; "settled")]
+    fn only_slips_carry_a_lesson(repair: Repair, teaches: bool) {
+        assert_eq!(repair.lesson().is_some(), teaches);
+    }
+
+    #[test_case("const results = await Promise.all([gh.list()]); return results;", true ; "promise_all")]
+    #[test_case("items.map(item => item.name)", true ; "an_arrow")]
+    #[test_case("let total = 0\ntotal += 1;", true ; "a_declaration")]
+    #[test_case("const = 1", false ; "python_naming_a_variable_const")]
+    #[test_case("results = await gh.list(\n", false ; "broken_python")]
+    #[test_case("constant = 'a => b'", false ; "valid_python_quoting_javascript")]
+    fn javascript_is_recognised_only_where_python_fails(code: &str, javascript: bool) {
+        assert_eq!(looks_like_javascript(code), javascript);
     }
 
     #[test_case("```js\nx = 1\n```" ; "another_language")]
