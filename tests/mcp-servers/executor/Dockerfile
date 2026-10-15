@@ -1,4 +1,4 @@
-FROM node:24.19.0-bookworm-slim
+FROM node:26.12.0-bookworm-slim
 LABEL caudra-mcp-it=""
 ENV EXECUTOR_DISABLE_ANALYTICS=1 \
     EXECUTOR_DISABLE_UPDATE_CHECK=1 \
