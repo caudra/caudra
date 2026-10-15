@@ -86,6 +86,6 @@ signal-hook-mio = { version = "0.2.4", features = ["support-v1_0"], optional = t
 
 [dev-dependencies]
 serde_json = "1.0"
-serial_test = "3.0.0"
+serial_test = "4.0.1"
 temp-env = "0.3.6"
 test-case = "3"
