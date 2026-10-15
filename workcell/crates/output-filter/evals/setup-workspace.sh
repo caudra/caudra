@@ -229,11 +229,16 @@ cd "$root"
 # measurement that a library is silent is only worth having if it is re-checked,
 # and the wrong assumption there is what leaves a real case unhandled.
 if [ -d /usr/local/share/workcell-progress ]; then
-  cp -r /usr/local/share/workcell-progress progressdemo
-  (cd progressdemo && npm install --no-fund --no-audit --silent) || true
-  (cd progressdemo/rust_indicatif && cargo build --quiet --release) || true
-  (cd progressdemo/go_progressbar && go build -o generator .) || true
-  (cd progressdemo/go_mpb && go build -o generator .) || true
+  mkdir -p progressdemo
+  cp -r /usr/local/share/workcell-progress/. progressdemo/
+  python3 -c 'import rich, tqdm'
+  (cd progressdemo && npm ci --no-fund --no-audit)
+  (cd progressdemo/rust_indicatif && cargo build --locked --quiet --release --target-dir target)
+  (cd progressdemo/go_progressbar && go build -mod=readonly -o generator .)
+  (cd progressdemo/go_mpb && go build -mod=readonly -o generator .)
+else
+  echo "missing required generators: /usr/local/share/workcell-progress" >&2
+  exit 1
 fi
 
 # Point the docker CLI at the daemon through a context rather than DOCKER_HOST.
