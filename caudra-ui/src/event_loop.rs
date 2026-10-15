@@ -47,8 +47,8 @@ use caudra_agent::workflow::WorkflowTransition;
 use caudra_agent::worktree::git::Git;
 use caudra_agent::worktree::{Backend, Request as WorktreeRequest, counterpart, label};
 use caudra_agent::{
-    AgentConfig, AgentEvent, CancelToken, DoneReason, Envelope, McpCommand, McpConfigErrors,
-    McpHandle, mcp,
+    AgentConfig, AgentEvent, AgentMode, CancelToken, DoneReason, Envelope, McpCommand,
+    McpConfigErrors, McpHandle, mcp,
 };
 use caudra_automation::request::ProfileArming;
 use caudra_automation::snapshot::{AutomationEvent, SettleBlocker};
@@ -557,6 +557,9 @@ struct SessionRuntime {
     last_tasks: Vec<(Arc<str>, TaskStatus)>,
     notifications: RunNotificationState,
     restore_transitions: Vec<SessionTransition>,
+    /// The last selection handed over for adoption, so one that fails to
+    /// apply is not asked for again every tick.
+    requested_adoption: Option<(AgentMode, String)>,
 }
 
 impl SessionRuntime {
@@ -582,7 +585,37 @@ impl SessionRuntime {
     }
 
     fn work_quiescent(&self) -> bool {
-        self.handles.queue.is_empty() && self.running_quiescent()
+        self.handles.queue.is_empty()
+            && !self.handles.queue.adoption_pending()
+            && self.running_quiescent()
+    }
+
+    /// A settled session puts what is selected in force at once rather than
+    /// with the next message, so `/compact`, `/context`, `/btw` and tasks see
+    /// it. While anything runs, the switch keeps waiting.
+    fn request_settled_adoption(&mut self) {
+        if !self.quiescent() {
+            return;
+        }
+        let Some(input) = self.app.unapplied_selection() else {
+            return;
+        };
+        let key = (input.mode.clone(), self.app.state.session.model.clone());
+        if self.requested_adoption.as_ref() == Some(&key) {
+            return;
+        }
+        self.requested_adoption = Some(key);
+        self.handles.queue.request_adoption(input);
+    }
+
+    /// The agent loop reports nothing when it adopts, so the applied state is
+    /// read back here, within a tick of it landing.
+    fn sync_adopted_selection(&mut self) -> Dirty {
+        let state = &self.app.state;
+        let before = (state.applied_mode, state.applied_model.clone());
+        self.app.sync_execution_mode();
+        let state = &self.app.state;
+        Dirty::from(before != (state.applied_mode, state.applied_model.clone()))
     }
 
     /// Nothing runs or waits to report back, whatever the queue holds.
@@ -1427,6 +1460,7 @@ impl SpawnCtx {
             last_tasks: Vec::new(),
             notifications: RunNotificationState::default(),
             restore_transitions: Vec::new(),
+            requested_adoption: None,
         })
     }
 }
@@ -2758,6 +2792,10 @@ impl<'t> EventLoop<'t> {
                 && !runtime.app.holds_recovery_text()
                 && runtime.app.shell.active_ids().is_empty();
             runtime.handles.queue.allow_next_turn(ready);
+        }
+        for runtime in &mut self.sessions {
+            dirty |= runtime.sync_adopted_selection();
+            runtime.request_settled_adoption();
         }
         dirty |= self.start_goal_checkins();
         dirty |= self.sync_automations();
@@ -6577,6 +6615,55 @@ mod tests {
             "{CLAIMED_ONLY_WHEN_DELIVERED}"
         );
         linked.stop();
+        runtime.handles.cancel();
+    }
+
+    fn toggle_selected_mode(runtime: &mut SessionRuntime) -> AgentMode {
+        runtime.app.state.mode = match runtime.app.state.mode {
+            crate::app::Mode::Build => crate::app::Mode::Plan,
+            crate::app::Mode::Plan => crate::app::Mode::Build,
+        };
+        runtime
+            .app
+            .unapplied_selection()
+            .expect("a toggled mode is not yet in force")
+            .mode
+    }
+
+    #[test_case(|_| {}, true ; "settled")]
+    #[test_case(start_a_run, false ; "a_run_goes_on")]
+    #[test_case(open_a_permission_prompt, false ; "a_permission_prompt")]
+    fn a_mode_switch_is_handed_over_only_once_the_session_settles(
+        hold: fn(&mut SessionRuntime),
+        handed_over: bool,
+    ) {
+        let mut runtime = idle_runtime();
+        let selected = toggle_selected_mode(&mut runtime);
+        hold(&mut runtime);
+
+        runtime.request_settled_adoption();
+
+        let requested = runtime.requested_adoption.as_ref().map(|(mode, _)| mode);
+        assert_eq!(requested, handed_over.then_some(&selected));
+        runtime.handles.cancel();
+    }
+
+    #[test]
+    fn an_adopted_switch_reaches_the_app_within_a_tick() {
+        let mut runtime = idle_runtime();
+        toggle_selected_mode(&mut runtime);
+
+        runtime.request_settled_adoption();
+        smol::block_on(async {
+            while runtime.handles.queue.adoption_pending() {
+                futures_lite::future::yield_now().await;
+            }
+        });
+
+        assert_eq!(runtime.sync_adopted_selection(), Dirty::YES);
+        assert_eq!(runtime.app.state.applied_mode, runtime.app.state.mode);
+        assert!(runtime.app.unapplied_selection().is_none());
+        assert_eq!(runtime.sync_adopted_selection(), Dirty::NO);
         runtime.handles.cancel();
     }
 }

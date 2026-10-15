@@ -1206,21 +1206,23 @@ impl App {
                 && snapshot.window.tokens == model_slot.model.context_window)
                 .then_some(snapshot);
         }
-        match self.state.applied_mode {
-            Mode::Build => (snapshot.model.spec == self.state.model.spec()
-                && snapshot.window.tokens == self.state.model.context_window)
-                .then_some(snapshot),
-            Mode::Plan => {
-                let expected = Model::resolve_if_available(
-                    ModelPurpose::Plan,
-                    &self.state.model,
-                    &self.model_policy,
-                )
-                .ok()?;
-                (snapshot.model.spec == expected.spec()
-                    && snapshot.window.tokens == expected.context_window)
-                    .then_some(snapshot)
-            }
+        let expected = self.route_model(self.state.applied_mode)?;
+        (snapshot.model.spec == expected.spec()
+            && snapshot.window.tokens == expected.context_window)
+            .then_some(snapshot)
+    }
+
+    /// The model a request in `mode` runs on, given the current selection.
+    pub(super) fn route_model(&self, mode: Mode) -> Option<Cow<'_, Model>> {
+        match mode {
+            Mode::Build => Some(Cow::Borrowed(&self.state.model)),
+            Mode::Plan => Model::resolve_if_available(
+                ModelPurpose::Plan,
+                &self.state.model,
+                &self.model_policy,
+            )
+            .ok()
+            .map(Cow::Owned),
         }
     }
 
@@ -1235,9 +1237,7 @@ impl App {
             return None;
         }
         let snapshot = self.context_store.as_ref()?.latest(&ContextKey::Main)?;
-        let expected =
-            Model::resolve_if_available(ModelPurpose::Plan, &self.state.model, &self.model_policy)
-                .ok()?;
+        let expected = self.route_model(Mode::Plan)?;
         self.effective_model_slot
             .as_ref()
             .map(|slot| slot.load_full())

@@ -52,7 +52,7 @@ use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::tool_outputs::ToolOutputStore;
 use caudra_workspace::WorkspaceSession;
 use serde_json::Value;
-use tracing::error;
+use tracing::{error, warn};
 
 use super::cancel_map::RunCancelMap;
 use super::settings::{LiveSettings, Settings};
@@ -403,6 +403,7 @@ impl AgentLoop {
 
         let mut drain_run_id = None;
         while let Ok(()) = self.queue.recv_notify().await {
+            self.adopt_pending().await;
             let mut last_run_id = None;
             let mut paused = false;
             loop {
@@ -680,32 +681,7 @@ impl AgentLoop {
             background.rearm();
         }
         self.adopt_settings();
-        let selected_slot = if automatic {
-            self.effective_model_slot.load_full()
-        } else {
-            self.model_slot.load_full()
-        };
-        let purpose = model_purpose(&input.mode);
-        let effective_slot = if !automatic && purpose == ModelPurpose::Plan {
-            let (provider, model) = agent::resolve_model_for_purpose(
-                agent::ModelRoute {
-                    provider: &selected_slot.provider,
-                    model: &selected_slot.model,
-                },
-                agent::ModelRoute {
-                    provider: &selected_slot.provider,
-                    model: &selected_slot.model,
-                },
-                purpose,
-                None,
-                self.timeouts,
-                &self.model_policy,
-            )
-            .await?;
-            Arc::new(ModelSlot { model, provider })
-        } else {
-            Arc::clone(&selected_slot)
-        };
+        let (selected_slot, effective_slot) = self.route(&input.mode, automatic).await?;
 
         let relocated = self.workspace_session.is_none() && {
             let old_cwd = self.vars.apply("{cwd}").into_owned();
@@ -752,10 +728,7 @@ impl AgentLoop {
                 rebuild,
             )
             .await;
-        self.mode.store(Arc::new(input.mode.clone()));
-        self.plan = input.plan.clone();
-        self.rebuild_tools(&effective_slot.model, &selected_slot.model, &input.thinking);
-        self.effective_model_slot.store(Arc::clone(&effective_slot));
+        self.install(input, &effective_slot, &selected_slot);
 
         if let Some(ref prompt_ref) = input.prompt {
             let Some(ref mcp) = self.mcp else {
@@ -860,6 +833,94 @@ impl AgentLoop {
         }
 
         result.map(|_| ())
+    }
+
+    /// The selected slot and the one a request in `mode` runs on. An automatic
+    /// continuation keeps the route already in force.
+    async fn route(
+        &self,
+        mode: &AgentMode,
+        automatic: bool,
+    ) -> Result<(Arc<ModelSlot>, Arc<ModelSlot>), AgentError> {
+        let selected_slot = if automatic {
+            self.effective_model_slot.load_full()
+        } else {
+            self.model_slot.load_full()
+        };
+        let purpose = model_purpose(mode);
+        if automatic || purpose != ModelPurpose::Plan {
+            return Ok((Arc::clone(&selected_slot), selected_slot));
+        }
+        let selected = || agent::ModelRoute {
+            provider: &selected_slot.provider,
+            model: &selected_slot.model,
+        };
+        let (provider, model) = agent::resolve_model_for_purpose(
+            selected(),
+            selected(),
+            purpose,
+            None,
+            self.timeouts,
+            &self.model_policy,
+        )
+        .await?;
+        Ok((selected_slot, Arc::new(ModelSlot { model, provider })))
+    }
+
+    fn install(
+        &mut self,
+        input: &AgentInput,
+        effective_slot: &Arc<ModelSlot>,
+        selected: &ModelSlot,
+    ) {
+        self.mode.store(Arc::new(input.mode.clone()));
+        self.plan = input.plan.clone();
+        self.rebuild_tools(&effective_slot.model, &selected.model, &input.thinking);
+        self.effective_model_slot.store(Arc::clone(effective_slot));
+    }
+
+    /// Puts a settled session's selection in force without a turn, so the
+    /// status bar, `/context`, `/btw` and tasks stop describing the old one.
+    async fn adopt(&mut self, input: AgentInput) -> Result<(), AgentError> {
+        if self.delivery_fence.admission_error().is_some() {
+            return Ok(());
+        }
+        self.adopt_settings();
+        let (selected_slot, effective_slot) = self.route(&input.mode, false).await?;
+        self.install(&input, &effective_slot, &selected_slot);
+        let prompt_slots = self
+            .lua_handle
+            .collect_prompt_slots_async(&self.config)
+            .await;
+        self.context_system = self.build_system(&prompt_slots, &self.effective_tool_filter());
+        self.context_options = RequestOptions {
+            thinking: input.thinking,
+            fast: input.fast,
+        };
+        self.publish_btw_prompt(
+            &effective_slot,
+            &self.context_system,
+            self.context_options.clone(),
+        );
+        self.publish_prepared_context(&effective_slot);
+        self.queue.set_execution_mode(input.mode);
+        Ok(())
+    }
+
+    async fn adopt_pending(&mut self) {
+        let Some(input) = self.queue.claim_adoption() else {
+            return;
+        };
+        let planning = input.mode.is_planning();
+        if let Err(error) = self.adopt(input).await {
+            warn!(
+                %error,
+                planning,
+                model = %self.model_slot.load().model.spec(),
+                "failed to adopt the settled selection"
+            );
+        }
+        self.queue.finish_adoption();
     }
 
     fn agent_params(

@@ -1665,6 +1665,84 @@ mod background_runtime {
         .await;
     }
 
+    const ADOPTION_LEFT_PENDING: &str = "the adopted selection must leave nothing to adopt";
+    const ADOPTION_SENT_A_REQUEST: &str = "adopting a selection must not call the model";
+
+    fn in_force_build(app: &mut App, handles: &AgentHandles) {
+        app.state.applied_mode = super::Mode::Build;
+        handles
+            .execution_mode
+            .store(Arc::new(caudra_agent::AgentMode::Build));
+        assert!(app.unapplied_selection().is_none());
+    }
+
+    async fn adopted(handles: &AgentHandles) {
+        while handles.queue.adoption_pending() {
+            futures_lite::future::yield_now().await;
+        }
+    }
+
+    #[test]
+    fn a_settled_toggle_is_adopted_without_a_request() {
+        smol::block_on(bounded(async {
+            let (mut app, handles, _history, requests) = live_app(true);
+            in_force_build(&mut app, &handles);
+            app.toggle_mode();
+            let selection = app.unapplied_selection().expect("the toggle is pending");
+
+            handles.queue.request_adoption(selection);
+            adopted(&handles).await;
+            app.sync_execution_mode();
+
+            assert!(handles.execution_mode.load().is_planning());
+            assert_eq!(app.state.applied_mode, super::Mode::Plan);
+            assert!(
+                app.unapplied_selection().is_none(),
+                "{ADOPTION_LEFT_PENDING}"
+            );
+            let snapshot = app
+                .context_store
+                .as_ref()
+                .and_then(|store| store.latest(&caudra_agent::context::ContextKey::Main))
+                .expect("adoption publishes the prepared context");
+            assert!(snapshot.mode.is_planning());
+            assert_eq!(
+                snapshot.model.spec,
+                handles.effective_model_slot.load().model.spec()
+            );
+            assert!(requests.is_empty(), "{ADOPTION_SENT_A_REQUEST}");
+        }));
+    }
+
+    #[test]
+    fn a_message_queued_behind_an_adoption_runs_in_its_own_mode() {
+        smol::block_on(bounded(async {
+            let (mut app, handles, _history, requests) = live_app(true);
+            in_force_build(&mut app, &handles);
+            app.toggle_mode();
+            handles
+                .queue
+                .request_adoption(app.unapplied_selection().expect("the toggle is pending"));
+            app.toggle_mode();
+            let SubmitOutcome::Started(actions) = app.submit_prompt(QueuedMessage {
+                text: PARENT.into(),
+                images: Vec::new(),
+                mentions: Vec::new(),
+                commits: Vec::new(),
+                paste_ranges: Vec::new(),
+            }) else {
+                panic!("parent prompt was not admitted");
+            };
+            enqueue(&app, &handles, actions);
+
+            let request = requests.recv_async().await.unwrap();
+
+            assert!(!handles.execution_mode.load().is_planning());
+            request.reply.send(final_response()).unwrap();
+            drain_main(&mut app, &handles).await;
+        }));
+    }
+
     const QUESTION_CALL: &str = "deferred-question";
     const QUESTION_TEXT: &str = "Which backend should the cache use?";
     const QUESTION_HEADER: &str = "Backend";

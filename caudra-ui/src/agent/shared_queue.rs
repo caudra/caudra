@@ -198,6 +198,7 @@ pub(crate) struct QueueSender {
     active_run_id: Arc<AtomicU64>,
     execution_mode: Arc<Mutex<AgentMode>>,
     processing: Arc<AtomicBool>,
+    adoption: AdoptionSlot,
 }
 
 pub(crate) struct QueueReceiver {
@@ -210,9 +211,20 @@ pub(crate) struct QueueReceiver {
     active_run_id: Arc<AtomicU64>,
     execution_mode: Arc<Mutex<AgentMode>>,
     processing: Arc<AtomicBool>,
+    adoption: AdoptionSlot,
 }
 
 type SharedDispatchGuard = Arc<Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>>;
+
+type AdoptionSlot = Arc<Mutex<Adoption>>;
+
+/// A selection the session settled on without a message to carry it, waiting
+/// for the agent loop to put it in force.
+#[derive(Default)]
+struct Adoption {
+    next: Option<AgentInput>,
+    applying: bool,
+}
 
 pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
     let (queue, receiver) = editable_queue();
@@ -224,6 +236,7 @@ pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
     let processing = Arc::new(AtomicBool::new(false));
     let dispatch_guard = SharedDispatchGuard::default();
     let next_ready = Arc::new(AtomicBool::new(true));
+    let adoption = AdoptionSlot::default();
     (
         QueueSender {
             dispatch_guard: dispatch_guard.clone(),
@@ -235,6 +248,7 @@ pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
             active_run_id: Arc::clone(&active_run_id),
             execution_mode: Arc::clone(&execution_mode),
             processing: Arc::clone(&processing),
+            adoption: Arc::clone(&adoption),
         },
         QueueReceiver {
             dispatch_guard,
@@ -246,8 +260,15 @@ pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
             active_run_id,
             execution_mode,
             processing,
+            adoption,
         },
     )
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl QueueSender {
@@ -293,6 +314,20 @@ impl QueueSender {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = mode;
         self.queue.wake();
+    }
+
+    /// Hands a settled session's selection to the agent loop. A later request
+    /// replaces one not yet applied: only the newest selection matters.
+    pub(crate) fn request_adoption(&self, input: AgentInput) {
+        lock(&self.adoption).next = Some(input);
+        self.queue.wake();
+    }
+
+    /// Held until the agent loop has finished applying, so the session never
+    /// reads as settled while the selection is half in force.
+    pub(crate) fn adoption_pending(&self) -> bool {
+        let adoption = lock(&self.adoption);
+        adoption.applying || adoption.next.is_some()
     }
 
     pub(crate) fn set_dispatch_guard(&self, guard: Arc<dyn Fn() -> bool + Send + Sync>) {
@@ -585,6 +620,24 @@ impl QueueSender {
 }
 
 impl QueueReceiver {
+    /// Claims the newest selection. It stays pending until
+    /// [`Self::finish_adoption`], and a request made meanwhile waits its turn.
+    pub(crate) fn claim_adoption(&self) -> Option<AgentInput> {
+        let mut adoption = lock(&self.adoption);
+        let next = adoption.next.take();
+        adoption.applying |= next.is_some();
+        next
+    }
+
+    pub(crate) fn finish_adoption(&self) {
+        lock(&self.adoption).applying = false;
+    }
+
+    pub(crate) fn set_execution_mode(&self, mode: AgentMode) {
+        let _claim = lock(&self.claim_gate);
+        *lock(&self.execution_mode) = mode;
+    }
+
     pub(crate) fn hold_next_turn(&self) {
         self.next_ready.store(false, Ordering::Release);
     }
@@ -823,6 +876,8 @@ mod tests {
     const REMOTE_PLAN: &str = "plan-1";
     const OTHER_REMOTE_PLAN: &str = "plan-2";
     const EDITED_PROMPT: &str = "edited prompt";
+    const ADOPTION_RELEASED_EARLY: &str =
+        "the session must not read as settled while an adoption is outstanding";
 
     fn remote_plan(reference: &str) -> AgentMode {
         AgentMode::RemotePlan(PlanRef::new(reference).unwrap())
@@ -1201,28 +1256,81 @@ mod tests {
         msg_with_mode(displayed, AgentMode::Build)
     }
 
+    fn input(mode: AgentMode) -> AgentInput {
+        AgentInput {
+            message: String::new(),
+            mode,
+            plan: None,
+            images: Vec::new(),
+            mentions: Vec::new(),
+            commits: Vec::new(),
+            preamble: Vec::new(),
+            thinking: Default::default(),
+            fast: false,
+            prompt: None,
+            resume: false,
+        }
+    }
+
     fn msg_with_mode(displayed: bool, mode: AgentMode) -> QueueItem {
         QueueItem::Message {
             text: "t".into(),
             image_count: 0,
             paste_ranges: Vec::new(),
-            input: Box::new(AgentInput {
-                message: String::new(),
-                mode,
-                plan: None,
-                images: Vec::new(),
-                mentions: Vec::new(),
-                commits: Vec::new(),
-                preamble: Vec::new(),
-                thinking: Default::default(),
-                fast: false,
-                prompt: None,
-                resume: false,
-            }),
+            input: Box::new(input(mode)),
             run_id: 0,
             admission: PromptAdmission::Queue,
             displayed,
         }
+    }
+
+    #[test]
+    fn adoption_stays_pending_until_the_loop_finishes_applying() {
+        let (tx, rx) = queue();
+        tx.request_adoption(input(AgentMode::ReadOnly));
+        assert!(tx.adoption_pending());
+
+        let claimed = rx.claim_adoption().map(|input| input.mode);
+        assert_eq!(claimed, Some(AgentMode::ReadOnly));
+        assert!(tx.adoption_pending(), "{ADOPTION_RELEASED_EARLY}");
+
+        rx.finish_adoption();
+        assert!(!tx.adoption_pending());
+        assert!(rx.claim_adoption().is_none());
+    }
+
+    #[test]
+    fn a_newer_adoption_replaces_one_not_yet_claimed() {
+        let (tx, rx) = queue();
+        tx.request_adoption(input(AgentMode::Build));
+        tx.request_adoption(input(AgentMode::ReadOnly));
+
+        let claimed = rx.claim_adoption().map(|input| input.mode);
+        assert_eq!(claimed, Some(AgentMode::ReadOnly));
+        rx.finish_adoption();
+        assert!(rx.claim_adoption().is_none());
+    }
+
+    #[test]
+    fn an_adoption_requested_while_applying_waits_its_turn() {
+        let (tx, rx) = queue();
+        tx.request_adoption(input(AgentMode::Build));
+        rx.claim_adoption();
+        tx.request_adoption(input(AgentMode::ReadOnly));
+        rx.finish_adoption();
+
+        assert!(tx.adoption_pending(), "{ADOPTION_RELEASED_EARLY}");
+        let claimed = rx.claim_adoption().map(|input| input.mode);
+        assert_eq!(claimed, Some(AgentMode::ReadOnly));
+    }
+
+    #[test]
+    fn an_adoption_request_wakes_the_agent_loop() {
+        let (tx, rx) = queue();
+        tx.request_adoption(input(AgentMode::ReadOnly));
+
+        let woken = smol::block_on(smol::future::poll_once(rx.recv_notify()));
+        assert!(matches!(woken, Some(Ok(()))));
     }
 
     fn steer(mode: AgentMode) -> QueueItem {

@@ -760,10 +760,10 @@ impl App {
             }),
             false => chat.thinking.clone().map(Cow::Owned),
         };
-        // A toggle swaps the selection to the model its mode was left on, and
-        // neither the mode nor the swap reaches the agent until the next message
-        // carries them. Until it does, the slot names the model still in force
-        // and puts the one arriving behind the arrow.
+        // A toggle swaps the selection to the model its mode was left on. While
+        // work runs, neither reaches the agent until the session settles or the
+        // next message carries them. Until then, the slot names the model still
+        // in force and puts the one arriving behind the arrow.
         let leaving = (main_chat
             && self.state.applied_mode != self.state.mode
             && self.state.applied_model != self.state.session.model)

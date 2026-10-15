@@ -406,7 +406,7 @@ impl App {
         )
     }
 
-    pub(super) fn sync_execution_mode(&mut self) {
+    pub(crate) fn sync_execution_mode(&mut self) {
         let Some(mode) = &self.execution_mode else {
             return;
         };
@@ -480,9 +480,25 @@ impl App {
         }
     }
 
-    /// A toggle does not reach the agent until the next message carries it, so
-    /// a mode that has been switched but not yet handed over reads as a
-    /// transition rather than as an accomplished fact.
+    /// What is selected but not yet in force, as an input with no message for
+    /// a settled session to adopt. The mode or the model it runs on decides;
+    /// thinking and fast ride along without asking for an adoption of their own.
+    pub(crate) fn unapplied_selection(&self) -> Option<AgentInput> {
+        self.execution_mode.as_ref()?;
+        let effective = self.effective_model_slot.as_ref()?.load();
+        let mode = self.agent_mode();
+        let model_pending = self
+            .route_model(self.state.mode)
+            .is_some_and(|model| model.spec() != effective.model.spec());
+        (model_pending || mode != self.execution_agent_mode()).then(|| AgentInput {
+            mode,
+            ..self.continuation_input()
+        })
+    }
+
+    /// A toggle made while work runs reaches the agent once the session
+    /// settles or the next message carries it, so a mode switched but not yet
+    /// handed over reads as a transition rather than as an accomplished fact.
     pub(super) fn mode_label(&self) -> ModeLabel {
         let (full, short) = if self.is_bash_input() {
             (BASH_LABEL, BASH_SHORT_LABEL)
@@ -537,6 +553,7 @@ mod tests {
     use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
     use caudra_agent::{AgentEvent, PromptAdmission, ToolDoneEvent};
     use caudra_automation::event::StartedBy;
+    use caudra_providers::model_registry::Binding;
     use caudra_providers::{ImageMediaType, ImageSource, Message};
     use caudra_storage::id::CaudraId;
     use caudra_storage::sessions::StoredMode;
@@ -549,9 +566,10 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        AgentMode, App, LocalDocumentStore, Mode, PathBuf, PlanRef, PlanState, PlanTrigger,
-        WorkspaceSession,
+        AgentMode, App, LocalDocumentStore, Mode, ModelPurpose, PathBuf, PlanRef, PlanState,
+        PlanTrigger, WorkspaceSession, model_registry,
     };
+    use crate::agent::ModelSlot;
     use crate::agent::shared_queue::{self, QueueItem, QueuedMessage};
     use crate::app::queue::{EMPTY_PROMPT_ERR, SubmitOutcome};
     use crate::app::tests::{agent_msg, test_app};
@@ -572,6 +590,9 @@ mod tests {
     const MAILBOX_RESULT: &str = "Background work completed";
     const RICH_PASTE: &str = "first pasted line\nsecond pasted line\nthird pasted line";
     const IMAGE_DATA: &str = "dGVzdA==";
+    const OTHER_MODEL_ID: &str = "other-chat";
+    const PLAN_ROUTE_MODEL_ID: &str = "plan-route";
+    const PLAN_ROUTE_SPEC: &str = "anthropic/plan-route";
     const EXPECTED_SEND: &str = "expected one automatic continuation";
     const EXPECTED_COMPOSED_SEND: &str = "expected the composed prompt to start a run";
     const EXPECTED_QUEUED_INPUT: &str = "expected the submitted Plan input in the queue";
@@ -874,6 +895,75 @@ mod tests {
         assert!(app.cancelling_run.is_none());
         assert!(app.queue.is_empty());
         assert!(!app.mode_submission.is_open());
+    }
+
+    fn route_in_force(app: &mut App, model_id: Option<&str>) {
+        let mut model = app.state.model.clone();
+        if let Some(id) = model_id {
+            model.id = id.into();
+        }
+        let provider = caudra_providers::provider::from_model_fallback(
+            &mut model,
+            caudra_providers::Timeouts::default(),
+        );
+        app.effective_model_slot = Some(Arc::new(ArcSwap::from_pointee(ModelSlot {
+            model,
+            provider: Arc::from(provider),
+        })));
+    }
+
+    fn select_other_model(app: &mut App) {
+        let mut model = app.state.model.clone();
+        model.id = OTHER_MODEL_ID.into();
+        app.update_model(&model);
+    }
+
+    #[test_case(|_| {}, None; "nothing_pending")]
+    #[test_case(|app| { app.toggle_mode(); }, Some(true); "toggle_pending")]
+    #[test_case(select_other_model, Some(false); "model_only")]
+    fn unapplied_selection_names_what_is_not_in_force(
+        change: fn(&mut App),
+        expected_planning: Option<bool>,
+    ) {
+        let mut app = app_in_mode(Mode::Build);
+        route_in_force(&mut app, None);
+
+        change(&mut app);
+
+        let selection = app.unapplied_selection();
+        assert_eq!(
+            selection.as_ref().map(|input| input.mode.is_planning()),
+            expected_planning
+        );
+        if let Some(input) = selection {
+            assert_eq!(input.mode, app.agent_mode());
+            assert!(input.message.is_empty());
+        }
+    }
+
+    #[test_case(Some(PLAN_ROUTE_MODEL_ID), false; "plan_route_in_force")]
+    #[test_case(None, true; "chat_model_in_force")]
+    fn unapplied_selection_follows_the_plan_binding(in_force: Option<&str>, pending: bool) {
+        let mut app = app_in_mode(Mode::Plan);
+        let previous = model_registry::binding(ModelPurpose::Plan);
+        model_registry::set_binding_and_persist(
+            ModelPurpose::Plan,
+            Binding::Exact(PLAN_ROUTE_SPEC.into()),
+            &app.storage,
+        )
+        .unwrap();
+        route_in_force(&mut app, in_force);
+
+        let selection = app.unapplied_selection();
+        match previous {
+            Some(binding) => {
+                model_registry::set_binding_and_persist(ModelPurpose::Plan, binding, &app.storage)
+            }
+            None => model_registry::clear_binding_and_persist(ModelPurpose::Plan, &app.storage),
+        }
+        .unwrap();
+
+        assert_eq!(selection.is_some(), pending);
     }
 
     #[test_case(Mode::Build, false, false; "mailbox_applied_build")]

@@ -19,7 +19,7 @@ Press `b` while the queue is focused or click its mode control to toggle Togethe
 
 ## Selecting Plan while work runs
 
-Cycling Build and Plan selects the mode for your next submission. It does not stop running agents or shell jobs. The mode indicator shows the pending transition until the new mode runs. Background reports and results continue to be processed in the current execution mode.
+Cycling Build and Plan selects the mode for your next submission. It does not stop running agents or shell jobs. The mode indicator shows the pending transition until the new mode runs. Once nothing runs and nothing waits to report, the new mode and the model it brings back take effect without a message. Until then, background reports and results continue to be processed in the current execution mode.
 
 When you submit in Plan while Build work is outstanding, choose:
 
