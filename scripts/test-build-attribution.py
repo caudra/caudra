@@ -58,6 +58,9 @@ COMPACT_FILES = {
     "attribution.tar.gz",
 }
 NATIVE_NOTICE = b"/* Copyright Native authors\r\nSPDX-License-Identifier: MPL-2.0 */"
+NATIVE_DUAL_EXPRESSION = "GPL-2.0+ or MIT"
+NATIVE_DUAL_NOTICE = b"/*\n * SPDX-License-Identifier: GPL-2.0+ or MIT\n */\n"
+NATIVE_DUAL_PATH = "test/hello.c"
 SOURCE_BYTES = b"// corresponding source\n\x00\xff"
 
 
@@ -409,6 +412,161 @@ class AttributionTests(unittest.TestCase):
                 policy,
             )
 
+    def binary_scope_variants_fixture(self):
+        old_graph, old_lock, policy = self.binary_scope_fixture()
+        graph, locked = copy.deepcopy(old_graph), copy.deepcopy(old_lock)
+        review = policy["binary_scope_review"]
+        variant = {
+            "chain": copy.deepcopy(review["chain"]),
+            "attributed_packages": list(review["excluded_packages"]),
+        }
+        review["chain_variants"] = [variant]
+        for package, lock in zip(graph["selected"][1:], locked["package"][1:]):
+            pin = variant["chain"][package["name"]]
+            package["version"] = lock["version"] = pin["version"] = "2.0.0"
+            lock["checksum"] = pin["checksum"] = "a" * 64
+            old_root = Path(package["manifest_path"]).parent
+            root = old_root.with_name(old_root.name + "-updated")
+            shutil.copytree(old_root, root)
+            package["manifest_path"] = str(root / "Cargo.toml")
+            (root / "LICENSE").write_text(MIT)
+            pin["reviewed_files"]["LICENSE"] = attribution.digest(MIT.encode())
+        return old_graph, old_lock, graph, locked, policy
+
+    def test_binary_scope_variants_keep_old_exclusions_and_attribute_new_licenses(self):
+        old_graph, old_lock, graph, locked, policy = (
+            self.binary_scope_variants_fixture()
+        )
+        self.assertEqual(
+            set(
+                attribution.binary_exclusions(
+                    old_graph, old_lock, policy, "binary-artifact"
+                )
+            ),
+            {"quote-use", "quote-use-macros"},
+        )
+        self.assertEqual(
+            attribution.binary_exclusions(graph, locked, policy, "binary-artifact"), {}
+        )
+        for package in graph["selected"][-2:]:
+            notices, expression, selected = attribution.package_licenses(
+                package, self.root, policy
+            )
+            self.assertEqual(expression, "MIT")
+            self.assertEqual(selected, ["MIT"])
+            self.assertEqual([name for _, name in notices], ["LICENSE"])
+        for distribution in ("source", "build-cache"):
+            with (
+                self.subTest(distribution=distribution),
+                self.assertRaises(attribution.AttributionError),
+            ):
+                attribution.binary_exclusions(graph, locked, policy, distribution)
+
+    def test_binary_scope_variants_reject_drift_mixing_and_ambiguity(self):
+        _, _, graph, locked, policy = self.binary_scope_variants_fixture()
+        for change in (
+            "version",
+            "source",
+            "checksum",
+            "license",
+            "macro_boundary",
+            "runtime",
+            "incoming",
+            "consumer",
+            "mixed",
+            "duplicate",
+            "incomplete",
+            "extra",
+            "source_bytes",
+            "license_bytes",
+        ):
+            altered, lock, rules = (
+                copy.deepcopy(graph),
+                copy.deepcopy(locked),
+                copy.deepcopy(policy),
+            )
+            variant = rules["binary_scope_review"]["chain_variants"][0]
+            if change in {"version", "source", "license"}:
+                altered["selected"][-1][change] = "changed"
+            elif change == "checksum":
+                lock["package"][-1]["checksum"] = "changed"
+            elif change == "macro_boundary":
+                altered["selected"][2]["targets"] = [{"kind": ["lib"]}]
+            elif change == "runtime":
+                altered["runtime_ids"].append("quote-use")
+            elif change == "incoming":
+                altered["dependency_edges"].append(["consumer", "quote-use"])
+            elif change == "consumer":
+                lock["package"][0]["checksum"] = "changed"
+            elif change == "mixed":
+                altered["selected"][-1]["version"] = "1.0.0"
+                lock["package"][-1]["version"] = "1.0.0"
+                lock["package"][-1]["checksum"] = "6" * 64
+            elif change == "duplicate":
+                rules["binary_scope_review"]["chain_variants"].append(
+                    copy.deepcopy(variant)
+                )
+            elif change == "incomplete":
+                variant["chain"].pop("get-size2")
+            elif change == "extra":
+                variant["attributed_packages"].append("consumer")
+            else:
+                path = "LICENSE" if change == "license_bytes" else "src/lib.rs"
+                variant["chain"]["quote-use"]["reviewed_files"][path] = "changed"
+            with (
+                self.subTest(change=change),
+                self.assertRaises(attribution.AttributionError),
+            ):
+                attribution.binary_exclusions(altered, lock, rules, "binary-artifact")
+
+    def test_binary_scope_variant_bundle_preserves_both_independent_graphs(self):
+        old_graph, old_lock, graph, locked, policy = (
+            self.binary_scope_variants_fixture()
+        )
+        (self.root / "LICENSE").write_text(MIT)
+        (self.root / "NOTICE").write_text("fixture root notice")
+        (self.root / "THIRD_PARTY_LICENSES").mkdir()
+        updated = self.root / "updated-workspace"
+        updated.mkdir()
+        graph["workspace_root"] = str(updated)
+        for workspace, lock in ((self.root, old_lock), (updated, locked)):
+            (workspace / "Cargo.lock").write_text(
+                "version = 4\n"
+                + "".join(
+                    "\n[[package]]\n"
+                    + "".join(
+                        f"{key} = {json.dumps(value)}\n"
+                        for key, value in package.items()
+                    )
+                    for package in lock["package"]
+                )
+            )
+        output = self.root / "bundle"
+        output.mkdir()
+        manifest = attribution.write_bundle(
+            output,
+            self.root,
+            [("artifact", graph), ("worker", old_graph)],
+            "fixture-target",
+            policy,
+        )
+        self.assertEqual(manifest["graphs"][0]["binary_scope_exclusions"], [])
+        self.assertEqual(len(manifest["graphs"][1]["binary_scope_exclusions"]), 2)
+        for package in manifest["packages"]:
+            if not package["name"].startswith("quote-use"):
+                continue
+            if package["version"] == "1.0.0":
+                self.assertEqual(package["license_text_status"], "unresolved")
+                self.assertEqual(package["notices"], [])
+            else:
+                self.assertEqual(package["selected_license"], ["MIT"])
+                self.assertEqual(len(package["notices"]), 1)
+                self.assertEqual((output / package["notices"][0]).read_text(), MIT)
+        package = graph["selected"][-1]
+        (Path(package["manifest_path"]).parent / "LICENSE").unlink()
+        with self.assertRaises(attribution.AttributionError):
+            attribution.package_licenses(package, self.root, policy)
+
     def test_unknown_spdx_is_not_hidden_by_or(self):
         for expression in (
             "MIT OR LicenseRef-Unknown",
@@ -529,6 +687,204 @@ class AttributionTests(unittest.TestCase):
             attribution.choose_license(
                 "MPL-2.0",
                 "This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0",
+            )
+
+    def native_review_fixture(self):
+        package = self.package("native-reviewed")
+        package["checksum"] = "1" * 64
+        root = Path(package["manifest_path"]).parent
+        (root / "test").mkdir()
+        source = NATIVE_DUAL_NOTICE + b'int fixture;\nMODULE_LICENSE("Dual MIT/GPL");\n'
+        (root / NATIVE_DUAL_PATH).write_bytes(source)
+        (root / "LICENSE").write_text(MIT)
+        evidence = self.root / "THIRD_PARTY_LICENSES" / "hello.c"
+        evidence.parent.mkdir()
+        evidence.write_bytes(source)
+        review = {
+            "source": package["source"],
+            "checksum": package["checksum"],
+            "declared_license": "MIT",
+            "reviewed_files": {
+                path: attribution.digest((root / path).read_bytes())
+                for path in ("Cargo.toml", "LICENSE", NATIVE_DUAL_PATH)
+            },
+            "evidence_files": {
+                "THIRD_PARTY_LICENSES/hello.c": attribution.digest(source)
+            },
+            "notices": {
+                NATIVE_DUAL_PATH: {
+                    "notice_sha256": attribution.digest(NATIVE_DUAL_NOTICE),
+                    "declared_expression": NATIVE_DUAL_EXPRESSION,
+                    "selected_license": "MIT",
+                }
+            },
+        }
+        return package, {"native_license_reviews": {"native-reviewed@1.0.0": review}}
+
+    def test_native_review_identity_and_source_are_exact(self):
+        package, policy = self.native_review_fixture()
+        root = Path(package["manifest_path"]).parent
+        review = policy["native_license_reviews"]["native-reviewed@1.0.0"]
+        originals = {
+            root / path: (root / path).read_bytes() for path in review["reviewed_files"]
+        } | {
+            self.root / path: (self.root / path).read_bytes()
+            for path in review["evidence_files"]
+        }
+        for change in (
+            "name",
+            "version",
+            "source",
+            "checksum",
+            "license",
+            "missing_checksum",
+            "Cargo.toml",
+            "LICENSE",
+            NATIVE_DUAL_PATH,
+            "missing_source",
+            "THIRD_PARTY_LICENSES/hello.c",
+            "unpinned_path",
+        ):
+            for path, data in originals.items():
+                path.write_bytes(data)
+            altered, rules = copy.deepcopy(package), copy.deepcopy(policy)
+            if change in {"name", "version", "source", "checksum", "license"}:
+                altered[change] = "changed"
+            elif change == "missing_checksum":
+                altered.pop("checksum")
+            elif change == "missing_source":
+                (root / NATIVE_DUAL_PATH).unlink()
+            elif change == "unpinned_path":
+                rules["native_license_reviews"]["native-reviewed@1.0.0"][
+                    "reviewed_files"
+                ].pop(NATIVE_DUAL_PATH)
+            else:
+                path = (
+                    self.root if change.startswith("THIRD_PARTY_LICENSES") else root
+                ) / change
+                path.write_bytes(path.read_bytes() + b"changed")
+            with (
+                self.subTest(change=change),
+                self.assertRaises(attribution.AttributionError),
+            ):
+                notices = attribution.reviewed_native_licenses(
+                    altered, self.root, rules
+                )
+                attribution.validate_native_licenses(
+                    NATIVE_DUAL_NOTICE, MIT, notices.get(NATIVE_DUAL_PATH)
+                )
+
+    def test_native_review_notice_expression_and_alternative_are_exact(self):
+        package, policy = self.native_review_fixture()
+        review = attribution.reviewed_native_licenses(package, self.root, policy)[
+            NATIVE_DUAL_PATH
+        ]
+        self.assertEqual(
+            attribution.validate_native_licenses(NATIVE_DUAL_NOTICE, MIT, review),
+            ["MIT"],
+        )
+        for change in (
+            "notice",
+            "digest",
+            "expression",
+            "selection",
+            "missing_terms",
+            "extra_expression",
+        ):
+            text, evidence, altered = NATIVE_DUAL_NOTICE, MIT, copy.deepcopy(review)
+            if change == "notice":
+                text += b"/* additional copyright */\n"
+            elif change == "digest":
+                altered["notice_sha256"] = "changed"
+            elif change == "expression":
+                altered["declared_expression"] = "GPL-2.0+ OR MIT"
+            elif change == "selection":
+                altered["selected_license"] = "Apache-2.0"
+            elif change == "missing_terms":
+                evidence = ""
+            else:
+                text += b"// SPDX-License-Identifier: MIT\n"
+                altered["notice_sha256"] = attribution.digest(text)
+            with (
+                self.subTest(change=change),
+                self.assertRaises(attribution.AttributionError),
+            ):
+                attribution.validate_native_licenses(text, evidence, altered)
+        for expression in (
+            "GPL-2.0+ AND MIT",
+            "GPL-2.0+ and MIT",
+            "GPL-2.0+ OR MIT AND ISC",
+            "(GPL-2.0+ OR MIT)",
+        ):
+            text = NATIVE_DUAL_NOTICE.replace(
+                NATIVE_DUAL_EXPRESSION.encode(), expression.encode()
+            )
+            altered = dict(
+                review,
+                declared_expression=expression,
+                notice_sha256=attribution.digest(text),
+            )
+            with (
+                self.subTest(expression=expression),
+                self.assertRaises(attribution.AttributionError),
+            ):
+                attribution.validate_native_licenses(text, MIT, altered)
+        with self.assertRaises(attribution.AttributionError):
+            attribution.validate_native_licenses(NATIVE_DUAL_NOTICE, MIT)
+
+    def test_native_review_bundle_preserves_original_notice_source_and_mit(self):
+        package, policy = self.native_review_fixture()
+        (self.root / "LICENSE").write_text(MIT)
+        (self.root / "NOTICE").write_text("fixture root notice")
+        (self.root / "Cargo.lock").write_text(
+            "version = 4\n\n[[package]]\n"
+            + "".join(
+                f"{key} = {json.dumps(package[key])}\n"
+                for key in ("name", "version", "source", "checksum")
+            )
+        )
+        graph = {
+            "workspace_root": str(self.root),
+            "artifact_root": package,
+            "selected": [package],
+        }
+        output = self.root / "bundle"
+        output.mkdir()
+        manifest = attribution.write_bundle(
+            output, self.root, [("artifact", graph)], "fixture-target", policy
+        )
+        record = manifest["packages"][0]
+        self.assertEqual(
+            record["native_selected_licenses"], {NATIVE_DUAL_PATH: ["MIT"]}
+        )
+        self.assertEqual(
+            record["native_reviewed_selections"][NATIVE_DUAL_PATH][
+                "declared_expression"
+            ],
+            NATIVE_DUAL_EXPRESSION,
+        )
+        notice = (
+            output
+            / "packages"
+            / record["id"]
+            / "native-notices"
+            / (NATIVE_DUAL_PATH + ".txt")
+        )
+        self.assertEqual(notice.read_bytes(), NATIVE_DUAL_NOTICE)
+        self.assertEqual(
+            (output / "packages" / record["id"] / "LICENSE").read_text(), MIT
+        )
+        self.assertEqual(
+            (output / "THIRD_PARTY_LICENSES/hello.c").read_bytes(),
+            (self.root / "THIRD_PARTY_LICENSES/hello.c").read_bytes(),
+        )
+        root = Path(package["manifest_path"]).parent
+        (root / "test/unreviewed.c").write_bytes((root / NATIVE_DUAL_PATH).read_bytes())
+        rejected = self.root / "rejected"
+        rejected.mkdir()
+        with self.assertRaisesRegex(attribution.AttributionError, "Unreviewed SPDX"):
+            attribution.write_bundle(
+                rejected, self.root, [("artifact", graph)], "fixture-target", policy
             )
 
     def test_complete_bundle_deterministic_worker_mpl_and_manifest_hashes(self):
