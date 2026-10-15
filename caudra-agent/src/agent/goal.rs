@@ -968,9 +968,7 @@ fn strip_reasoning(messages: &mut Vec<Message>) {
     messages.retain_mut(|message| {
         let before = message.content.len();
         message.content.retain(|block| !block.is_thinking());
-        message.content.len() == before
-            || message.is_empty_padding()
-            || !message.content.is_empty()
+        message.content.len() == before || message.is_empty_padding() || !message.content.is_empty()
     });
 }
 
