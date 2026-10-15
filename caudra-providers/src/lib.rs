@@ -1,3 +1,4 @@
+mod cassette;
 pub(crate) mod error;
 pub mod history;
 pub mod manifest;

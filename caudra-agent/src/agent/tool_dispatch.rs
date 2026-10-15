@@ -15,12 +15,10 @@ use crate::background::ShellJobMetadata;
 use crate::decisions::output_pointers::{self, OmittedOutput};
 use crate::decisions::shell_duration::{ShellCall, ShellDurationPlan};
 use crate::decisions::{DecisionFeature, NoteAnchor, NoteDraft, NoteOutcome, NoteSink, Screening};
+use crate::mcp::McpSession;
 use crate::mcp::call::CallScope;
-use crate::mcp::output::MCP_SUMMARY_PREFIX;
-use crate::mcp::{McpSession, UNKNOWN_MCP};
 use crate::permissions::{
     PermissionAuthorityProfile, PermissionError, RemotePermissionIdentity, canonical_json,
-    mcp_permission_intent,
 };
 use crate::task_set::TaskSet;
 use crate::tools::json_repair::RepairError;
@@ -30,9 +28,9 @@ use crate::tools::registry::{
     PlanModeAccess, RegisteredTool, ToolInvocation, ToolRegistry, TrustedToolSource,
 };
 use crate::tools::{
-    DOOM_LOOP_GUIDANCE, LocalToolEntry, LockKey, PLAN_WRITE_RESTRICTED, READ_ONLY_CALL_GUIDANCE,
-    READ_ONLY_TOOL_RESTRICTED, TOOL_SEARCH_TOOL_NAME, ToolContext, ToolEffect, ToolError,
-    ToolExecResult, ToolFailure, ToolFilter, ToolSource,
+    DOOM_LOOP_GUIDANCE, LocalToolEntry, LockKey, MCP_TOOL_NAME, PLAN_WRITE_RESTRICTED,
+    READ_ONLY_CALL_GUIDANCE, READ_ONLY_TOOL_RESTRICTED, TOOL_SEARCH_TOOL_NAME, ToolContext,
+    ToolEffect, ToolError, ToolExecResult, ToolFailure, ToolSource,
 };
 use crate::{
     AgentError, AgentEvent, AgentMode, LuaToolProvenance, ToolAccounting, ToolDoneEvent,
@@ -73,8 +71,9 @@ impl Emit<'_> {
 
 #[cfg(test)]
 const DOOM_LOOP_THRESHOLD: usize = 3;
-const MCP_BLOCKED_IN_PLAN: &str = "MCP tools are not available in plan mode";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
+const MCP_THROUGH_CODE: &str =
+    ". MCP tools are called from the `mcp` tool: `await <server>.<tool>(...)`";
 pub(crate) const TOOL_DISABLED_SUFFIX: &str = "is disabled for the current agent";
 const INVALID_INPUT_MESSAGE: &str = "arguments were not valid JSON, so the tool did not run. Call it again with complete \
      arguments; if the input is large, split it across several calls. Raw text received:";
@@ -82,7 +81,7 @@ const MAX_INVALID_INPUT_CHARS: usize = 2_000;
 const SOURCE_NATIVE: &str = "native";
 const SOURCE_LOCAL: &str = "local";
 const SOURCE_UNKNOWN: &str = "unknown";
-/// A name that still carries one means the MCP server behind it is gone.
+/// How a direct MCP tool was named on the wire, before code mode.
 const MCP_NAME_SEPARATOR: &str = "__";
 const BASH_TOOL: &str = "bash";
 const SHELL_TOOL: &str = "shell";
@@ -372,17 +371,8 @@ impl ResponseObservations {
 pub(crate) fn observe_context(ctx: &mut ToolContext, name: &str, input: &Value) {
     if let Some(observations) = &ctx.steering_observations {
         let name = canonical_tool_name(name, ctx);
-        let name = if ctx.registry.get(name).is_none()
-            && !ctx.local_tools.contains_key(name)
-            && ctx.mcp.is_some()
-            && name.contains(MCP_NAME_SEPARATOR)
-        {
-            Cow::Owned(crate::mcp::internal_tool_name(name))
-        } else {
-            Cow::Borrowed(name)
-        };
         ctx.steering_observations =
-            Some(observations.reserve(ctx.steering_order.clone(), &name, input));
+            Some(observations.reserve(ctx.steering_order.clone(), name, input));
     }
 }
 
@@ -456,15 +446,11 @@ pub async fn run(
     ctx: &ToolContext,
     mut emit: Emit<'_>,
 ) -> ToolDoneEvent {
-    let filtered_mcp = mcp.cloned().map(|mcp| {
-        let ceiling = if ctx.policy().is_read_only() || ctx.mode.is_planning() {
-            ToolFilter::ReadOnly(Box::new(ToolFilter::All))
-        } else {
-            ToolFilter::All
-        };
-        mcp.with_actor_policy(Arc::clone(&ctx.profile_tool_policy))
-            .narrowed(&ceiling)
-    });
+    // Not narrowed by the mode: the `mcp` tool judges each call against it, so a write a plan
+    // refuses says why instead of looking like a tool that does not exist.
+    let filtered_mcp = mcp
+        .cloned()
+        .map(|mcp| mcp.with_actor_policy(Arc::clone(&ctx.profile_tool_policy)));
     let mcp = filtered_mcp.as_ref();
     let mut policy_ctx = ctx.clone();
     policy_ctx.mcp = filtered_mcp.clone();
@@ -493,7 +479,6 @@ pub async fn run(
     let started = Instant::now();
     let entry = registry.get(canonical);
     let local = ctx.local_tools.get(canonical);
-    let mcp_name = crate::mcp::internal_tool_name(canonical);
     let available = available_for_dispatch(registry, mcp, canonical, ctx);
     let eligible = ctx.config.tool_json_repair
         && available
@@ -501,12 +486,10 @@ pub async fn run(
             .as_ref()
             .is_some_and(|entry| entry.tool.audience().contains(ctx.audience))
             || local.is_some()
-            || (canonical == TOOL_SEARCH_TOOL_NAME && searchable(mcp, ctx))
-            || mcp.is_some_and(|mcp| mcp.has_tool(&mcp_name) && !mcp.is_disabled(&mcp_name)))
+            || (canonical == TOOL_SEARCH_TOOL_NAME && searchable(ctx)))
         && (!ctx.policy().is_read_only()
             || entry.is_some()
-            || local.is_some_and(|local| local.effect.is_safe_in_read_only())
-            || mcp.is_some_and(|mcp| mcp.is_read_only(&mcp_name)));
+            || local.is_some_and(|local| local.effect.is_safe_in_read_only()));
     let invalid = ctx.json_repair.invalid_input(&id);
     let repair = if eligible && invalid.is_some() {
         let schema = repair_schema(registry, mcp, canonical, ctx);
@@ -631,12 +614,11 @@ pub async fn run(
     }
     if !admitted
         && !ctx.cancel.is_cancelled()
-        && (matches!(canonical, "webfetch" | "websearch")
+        && (matches!(canonical, "webfetch" | "websearch" | MCP_TOOL_NAME)
             || matches!(
                 entry.as_ref().map(|entry| &entry.source),
                 Some(ToolSource::Mcp { .. })
-            )
-            || mcp.is_some_and(|mcp| mcp.has_tool(&mcp_name)))
+            ))
         && let Some(decisions) = ctx.permissions.decisions()
         && decisions.enabled(&DecisionFeature::ContentScreening)
     {
@@ -746,22 +728,16 @@ pub(crate) fn repair_schema(
     if let Some(schema) = ctx.json_repair.schema(name) {
         return Some(schema);
     }
-    let mut definitions = Value::Array(Vec::new());
-    if name == TOOL_SEARCH_TOOL_NAME {
-        if let Some(mcp) = mcp {
-            mcp.request_snapshot().extend_tools(&mut definitions);
-        }
-        if let Some(deferral) = &ctx.deferral {
-            deferral.request_snapshot().extend_tools(&mut definitions);
-        }
-    } else if let Some(mcp) = mcp {
-        let lookup = mcp.fresh();
-        lookup.mark_loaded(&crate::mcp::internal_tool_name(name));
-        lookup.request_snapshot().extend_tools(&mut definitions);
+    if name != TOOL_SEARCH_TOOL_NAME {
+        return None;
     }
-    let wire_name = crate::mcp::wire_tool_name(name);
+    let mut definitions = Value::Array(Vec::new());
+    ctx.deferral
+        .as_ref()?
+        .request_snapshot()
+        .extend_tools(&mut definitions);
     definitions.as_array()?.iter().find_map(|definition| {
-        (definition["name"] == name || definition["name"] == wire_name)
+        (definition["name"] == name)
             .then(|| definition.get("input_schema").cloned())
             .flatten()
     })
@@ -783,22 +759,10 @@ async fn run_inner(
     let name = canonical_tool_name(name, ctx);
     let local = ctx.local_tools.get(name);
     let entry = registry.get(name);
-    // LLM providers send tool names in wire format (server__tool) but our
-    // internal index uses server.tool. Only convert if the name isn't a
-    // native tool — avoids mangling native names that happen to contain __.
-    let mcp_name;
-    let mcp_lookup = if entry.is_none() && name.contains("__") && mcp.is_some() {
-        mcp_name = crate::mcp::internal_tool_name(name);
-        mcp_name.as_str()
-    } else {
-        name
-    };
     let tool_id: Arc<str> = entry
         .as_ref()
         .map(|e| Arc::from(e.tool.name()))
-        .or_else(|| local.map(|_| Arc::from(name)))
-        .or_else(|| mcp.map(|m| m.interned_name(mcp_lookup)))
-        .unwrap_or_else(|| Arc::from(UNKNOWN_MCP));
+        .unwrap_or_else(|| Arc::from(name));
     let started = Instant::now();
 
     let done_error = |failure: ToolFailure, msg: String| {
@@ -827,32 +791,10 @@ async fn run_inner(
         .into()
     };
 
-    // Before the read-only gate: a tool the config turned off should say so
-    // even when the mode would have refused it for another reason.
-    if entry.is_none()
-        && local.is_none()
-        && mcp.is_some_and(|mcp| mcp.has_tool(mcp_lookup) && mcp.is_disabled(mcp_lookup))
-    {
-        return done_error(
-            ToolFailure::Denied,
-            format!("tool {mcp_lookup} {TOOL_DISABLED_SUFFIX}"),
-        );
-    }
-
     if ctx.policy().is_read_only() {
         // A registry entry is gated once its input parses, so a tool whose
         // commands differ in effect is judged per call, not per registration.
-        let allowed = match (local, &entry) {
-            (Some(local), _) => local.effect.is_safe_in_read_only(),
-            (None, Some(_)) => true,
-            (None, None) => {
-                name == TOOL_SEARCH_TOOL_NAME && searchable(mcp, ctx)
-                    || !mcp.is_some_and(|mcp| {
-                        mcp.has_tool(mcp_lookup) && !mcp.is_read_only(mcp_lookup)
-                    })
-            }
-        };
-        if !allowed {
+        if !local.is_none_or(|local| local.effect.is_safe_in_read_only()) {
             warn!(tool = %name, "blocked tool in strict read-only mode");
             return done_error(
                 ToolFailure::Denied,
@@ -1375,24 +1317,14 @@ async fn run_inner(
             }
             return DispatchResult::Completed(done, output_label);
         }
-    } else if name == TOOL_SEARCH_TOOL_NAME && searchable(mcp, ctx) {
-        run_tool_search(mcp, id, input, ctx, emit).await.into()
-    } else if mcp.is_some_and(|m| m.has_tool(mcp_lookup)) {
-        emit_raw_start(
-            ctx,
-            emit,
-            &id,
-            &tool_id,
-            ToolEffect::Unknown,
-            format!("{MCP_SUMMARY_PREFIX}{mcp_lookup}"),
-            input,
-        );
-        execute_mcp_tool(ctx, &id, tool_id, mcp_lookup, input)
-            .await
-            .into()
+    } else if name == TOOL_SEARCH_TOOL_NAME && searchable(ctx) {
+        run_tool_search(id, input, ctx, emit).await.into()
     } else {
-        let msg = format!("{UNKNOWN_TOOL_PREFIX}: {mcp_lookup}");
-        warn!(tool = %mcp_lookup, "unknown tool");
+        let mut msg = format!("{UNKNOWN_TOOL_PREFIX}: {name}");
+        if mcp.is_some() && name.contains(MCP_NAME_SEPARATOR) {
+            msg.push_str(MCP_THROUGH_CODE);
+        }
+        warn!(tool = %name, "unknown tool");
         done_error(ToolFailure::NotFound, msg)
     }
 }
@@ -1556,36 +1488,20 @@ fn available_for_dispatch(
     ctx: &ToolContext,
 ) -> bool {
     if !ctx.local_tools.contains_key(name) && !registry.has(name) {
-        if name == TOOL_SEARCH_TOOL_NAME {
-            return true;
-        }
-        if !mcp.is_some_and(|mcp| mcp.has_tool(&crate::mcp::internal_tool_name(name))) {
-            return true;
-        }
+        return true;
     }
     crate::tools::profile_policy::tool_available(registry, mcp, ctx, name)
 }
 
-fn searchable(mcp: Option<&McpSession>, ctx: &ToolContext) -> bool {
-    mcp.is_some_and(|mcp| {
-        mcp.request_snapshot()
-            .tool_inventory()
-            .iter()
-            .any(|tool| tool.deferred)
-    }) || ctx
-        .deferral
+fn searchable(ctx: &ToolContext) -> bool {
+    ctx.deferral
         .as_ref()
         .is_some_and(|d| !d.request_snapshot().pending_names().is_empty())
 }
 
-/// One search over both catalogs: the model is offered one tool, so it must
-/// not have to know whether what it wants is a built-in or an MCP tool.
-/// Built-ins rank first because their catalog is the smaller, curated one.
-///
 /// Runs without a permission gate: search only reveals names the catalog
 /// already showed the model.
 async fn run_tool_search(
-    mcp: Option<&McpSession>,
     id: String,
     input: &Value,
     ctx: &ToolContext,
@@ -1610,8 +1526,7 @@ async fn run_tool_search(
     let exact = ctx
         .deferral
         .as_ref()
-        .is_some_and(|deferral| deferral.has_exact_match(query))
-        || mcp.is_some_and(|mcp| mcp.has_exact_match(query));
+        .is_some_and(|deferral| deferral.has_exact_match(query));
     let revision = ctx.permissions.passive_decision_revision();
     let decisions = ctx.permissions.decisions().filter(|_| !exact);
     let context = ctx.permissions.decision_context(Value::Null);
@@ -1648,32 +1563,10 @@ async fn run_tool_search(
             notes.emit(note);
         }
     }
-    let (output, is_error) = match (builtin, mcp) {
-        (Some(Ok(outcome)), _) if !outcome.loaded.is_empty() => (outcome.message, false),
-        (_, Some(mcp)) => match ctx
-            .cancel
-            .race(ctx.permissions.run_passive_decision(async {
-                mcp.prepare_search_tools_with_decisions(query, current_decisions(), &context)
-                    .await
-            }))
-            .await
-            .ok()
-            .flatten()
-            .map(|prepared| prepared.and_then(|prepared| prepared.commit()))
-            .unwrap_or_else(|| mcp.search_tools(query))
-        {
-            Ok(outcome) => {
-                announce_loads(ctx, outcome.loaded);
-                if let Some(note) = outcome.note {
-                    notes.emit(note);
-                }
-                (outcome.message, false)
-            }
-            Err(e) => (e, true),
-        },
-        (Some(Ok(outcome)), None) => (outcome.message, false),
-        (Some(Err(e)), None) => (e, true),
-        (None, None) => (crate::tools::deferral::SEARCH_EMPTY_QUERY.into(), true),
+    let (output, is_error) = match builtin {
+        Some(Ok(outcome)) => (outcome.message, false),
+        Some(Err(e)) => (e, true),
+        None => (crate::tools::deferral::SEARCH_EMPTY_QUERY.into(), true),
     };
     ToolDoneEvent {
         id,
@@ -1870,123 +1763,6 @@ fn permission_refusal(ctx: &ToolContext, error: &PermissionError) -> ToolError {
     ToolError::new(failure, error.to_string())
 }
 
-async fn execute_mcp_tool(
-    ctx: &ToolContext,
-    id: &str,
-    tool_id: Arc<str>,
-    tool_name: &str,
-    input: &Value,
-) -> ToolDoneEvent {
-    let done = |output: ToolOutput| ToolDoneEvent {
-        id: id.to_owned(),
-        tool: Arc::clone(&tool_id),
-        output,
-        is_error: false,
-        annotation: None,
-        written_path: None,
-        written_paths: Vec::new(),
-        remote_written_paths: false,
-        output_ref: None,
-        output_limits: None,
-        model_suffix: None,
-        model_output: None,
-        model_output_from_ref: false,
-        documents: Vec::new(),
-        accounting: ToolAccounting::default(),
-    };
-    let fail = |message: String| done(ToolOutput::Plain(message.into()));
-
-    let binding = ctx.mcp.as_ref().map(|mcp| mcp.bind_tool(tool_name));
-    let read_only = matches!(&binding, Some(Ok(binding)) if binding.read_only());
-    if ctx.policy().is_read_only() && !read_only {
-        return fail(format!("{READ_ONLY_TOOL_RESTRICTED}: {tool_name}"))
-            .with_failure(ToolFailure::Denied);
-    }
-
-    if ctx.mode.is_planning() && !read_only {
-        return fail(MCP_BLOCKED_IN_PLAN.into()).with_failure(ToolFailure::Denied);
-    }
-
-    let perm_tool = match ToolKey::parse(tool_name) {
-        Ok(k) => k,
-        Err(e) => {
-            return fail(format!("invalid MCP tool key '{tool_name}': {e}"))
-                .with_failure(ToolFailure::Other);
-        }
-    };
-    let (Some(mcp), Some(binding)) = (&ctx.mcp, binding) else {
-        return fail(format!("MCP manager not available for {tool_name}"))
-            .with_failure(ToolFailure::Other);
-    };
-    let binding = match binding {
-        Ok(binding) => binding,
-        Err(error) => return fail(error.to_string()).with_failure(error.failure()),
-    };
-    let intent = mcp_permission_intent(&perm_tool, input, binding.call_facts(input));
-
-    if let Err(e) = ctx
-        .permissions
-        .enforce_with_intent(
-            &perm_tool,
-            &intent,
-            input,
-            &ctx.event_tx,
-            ctx.user_response_rx.as_deref(),
-            id,
-            &ctx.cancel,
-            ctx.mode.plan_path(),
-            Some((
-                binding.subject().clone(),
-                crate::permissions::PermissionExecutorKind::Mcp,
-            )),
-            false,
-        )
-        .await
-    {
-        let refusal = permission_refusal(ctx, &e);
-        return fail(refusal.message).with_failure(refusal.failure);
-    }
-
-    // A permitted call to a deferred tool counts as loading it, so its full
-    // definition joins the next request; a denied call must not load anything.
-    if mcp.mark_loaded(tool_name) {
-        announce_loads(ctx, vec![Arc::from(tool_name)]);
-    }
-    let recording = match change_recording::begin(ctx, id, |_| {
-        change_recording::whole_workspace(ToolEffect::Unknown)
-    })
-    .await
-    {
-        Ok(recording) => recording,
-        Err(message) => return fail(message).with_failure(ToolFailure::Other),
-    };
-    let scope = mcp_call_scope(ctx);
-    let called = recording.around(ctx, binding.call(input, &scope)).await;
-    match called {
-        Ok(output) if output.is_error => {
-            let error = binding.reported_error(&output);
-            ToolDoneEvent {
-                model_output: Some(error.to_string()),
-                ..done(ToolOutput::Mcp(output))
-            }
-            .with_failure(error.failure())
-        }
-        Ok(output) => done(ToolOutput::Mcp(output)),
-        Err(error) => {
-            let interactions = scope.take_interactions();
-            if !interactions.is_empty() {
-                warn!(
-                    tool = tool_name,
-                    %error,
-                    ?interactions,
-                    "MCP call failed after asking the user"
-                );
-            }
-            fail(error.to_string()).with_failure(error.failure())
-        }
-    }
-}
-
 /// What an MCP tool call runs under: its progress reaches the call's card,
 /// the turn's cancel stops it, and a server's questions go to whoever the
 /// front end has answer them. Where nobody can, each one is declined.
@@ -2006,6 +1782,7 @@ pub(super) async fn process_tool_calls(
 ) -> Result<(), AgentError> {
     if let Some(runs) = &ctx.speculative {
         runs.set_aliases(ctx.tool_name_aliases.clone());
+        runs.settle();
         for (id, name, input) in &tool_uses {
             runs.ready(id, name, input.clone());
         }
@@ -2149,7 +1926,7 @@ fn tool_source(registry: &ToolRegistry, ctx: &ToolContext, name: &str) -> Cow<'s
 /// The attribute value collectors already index on. Kept apart from
 /// [`LedgerOutcome::storage_name`] so renaming a storage value can never
 /// silently rewrite a dashboard's history.
-fn error_type(outcome: LedgerOutcome) -> Option<&'static str> {
+pub(crate) fn error_type(outcome: LedgerOutcome) -> Option<&'static str> {
     match outcome {
         LedgerOutcome::Ok => None,
         LedgerOutcome::Cancelled => Some(ERROR_CANCELLED),
@@ -2253,23 +2030,6 @@ fn report(done: &ToolDoneEvent, name: &str, source: &str, input: &Value, took: D
     }
 }
 
-/// Test-only entry that skips native lookup, letting plan-mode and MCP tests
-/// exercise the dispatch path without registering a fake native tool.
-#[cfg(test)]
-async fn dispatch_mcp(
-    ctx: &ToolContext,
-    id: &str,
-    tool_name: &str,
-    input: &Value,
-) -> ToolDoneEvent {
-    let tool_id = ctx
-        .mcp
-        .as_ref()
-        .map(|m| m.interned_name(tool_name))
-        .unwrap_or_else(|| Arc::from(UNKNOWN_MCP));
-    execute_mcp_tool(ctx, id, tool_id, tool_name, input).await
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashMap};
@@ -2280,7 +2040,8 @@ mod tests {
 
     use caudra_config::decisions::{DecisionsConfig, FeatureMode};
     use caudra_config::{
-        DefaultEffect, Effect, ExecutionMode, PermissionRule, PermissionsConfig, ToolKey,
+        DefaultEffect, Effect, ExecutionMode, FeatureFlags, PermissionRule, PermissionsConfig,
+        ToolKey,
     };
     use caudra_decision::{
         Answer, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, NoulAnswer, Usage,
@@ -2324,12 +2085,6 @@ mod tests {
     const READ_TOOL: &str = "file_read";
     const PATCH_TOOL: &str = "file_apply_patch";
     const FETCH_ISSUE: &str = "fetch_issue";
-    const HOME_ASSISTANT_SERVER: &str = "home-assistant";
-    const LOOKALIKE_SERVER: &str = "home-assistant-ish";
-    const LOOKUP_MCP_TOOL: &str = "ha.lookup";
-    const LOOKUP_MCP_WIRE: &str = "ha__lookup";
-    const LOOKUP_RESULT: &str = "the kitchen light is on";
-    const MCP_PLAN_FILE: &str = "/tmp/caudra-plan.md";
     const REPEAT_GUIDANCE: &str = "Inspect the previous result before choosing another tool.";
     const MODEL_REPEAT_GUIDANCE: &str = "Use a different query for this model.";
     const REPEAT_TWO_PREFIX: &str =
@@ -2370,16 +2125,8 @@ mod tests {
     const CONTENT_ROUNDS: usize = 2;
     const WEB_FETCH: &str = "webfetch";
     const SEARCH_QUERY: &str = "lookup";
-    const SEARCH_TOOLS: [(&str, &str); 6] = [
-        ("srv.tool_0", SEARCH_QUERY),
-        ("srv.tool_1", SEARCH_QUERY),
-        ("srv.tool_2", SEARCH_QUERY),
-        ("srv.tool_3", SEARCH_QUERY),
-        ("srv.tool_4", SEARCH_QUERY),
-        ("srv.tool_5", SEARCH_QUERY),
-    ];
     const SEARCH_LAST_CANDIDATE: &str = "c05";
-    const SEARCH_LAST_TOOL: &str = "srv__tool_5";
+    const SEARCH_LAST_TOOL: &str = "builtin_5";
     const SEARCH_BUILTINS: [&str; 6] = [
         "builtin_0",
         "builtin_1",
@@ -2397,9 +2144,6 @@ mod tests {
     const RECORDED_LOCAL: &str = "recorded_local";
     const RECORDED_MCP: &str = "srv.fetch_issue";
     const RECORDED_MCP_CALL: &str = "srv__fetch_issue";
-    const MCP_ERROR_TEXT: &str = "issue tracker is down";
-    /// What the model read when an `isError` result failed the call.
-    const LEGACY_MCP_ERROR: &str = "server stub returned error -1: issue tracker is down";
     const DENIED_OPENS_NOTHING: &str = "a denied call must not open a record";
     const POINTER_REQUEST: &str = "fix the failed deploy";
     const POINTER_MARKER: &str = "deploy failed: missing signing key";
@@ -5142,24 +4886,18 @@ mod tests {
         });
     }
 
-    #[test_case(PermissionMode::Ask, false, |_| {}, false, true; "ask")]
-    #[test_case(PermissionMode::Auto, false, |_| {}, false, true; "auto")]
-    #[test_case(PermissionMode::Yolo, false, |_| {}, false, true; "yolo")]
-    #[test_case(PermissionMode::Yolo, true, |_| {}, false, false; "yolo_exact_bypasses")]
-    #[test_case(PermissionMode::Ask, false, |manager| { manager.toggle_yolo(); }, false, true; "enter_yolo")]
-    #[test_case(PermissionMode::Ask, false, |manager| { manager.toggle_yolo(); manager.toggle_yolo(); }, false, true; "yolo_round_trip")]
-    #[test_case(PermissionMode::Ask, false, |manager| manager.set_decisions(None), false, false; "service_replaced")]
-    #[test_case(PermissionMode::Ask, false, |manager| manager.set_project(&manager.project_cwd()), false, false; "project_replaced")]
-    #[test_case(PermissionMode::Yolo, false, |_| {}, true, true; "yolo_builtin_to_mcp")]
-    #[test_case(PermissionMode::Yolo, true, |_| {}, true, false; "yolo_builtin_to_exact_mcp")]
-    #[test_case(PermissionMode::Ask, false, |manager| { manager.toggle_yolo(); manager.toggle_yolo(); }, true, true; "yolo_round_trip_builtin_to_mcp")]
-    #[test_case(PermissionMode::Ask, false, |manager| manager.set_decisions(None), true, false; "service_replaced_builtin_to_mcp")]
-    #[test_case(PermissionMode::Ask, false, |manager| manager.set_project(&manager.project_cwd()), true, false; "project_replaced_builtin_to_mcp")]
+    #[test_case(PermissionMode::Ask, false, |_| {}, true; "ask")]
+    #[test_case(PermissionMode::Auto, false, |_| {}, true; "auto")]
+    #[test_case(PermissionMode::Yolo, false, |_| {}, true; "yolo")]
+    #[test_case(PermissionMode::Yolo, true, |_| {}, false; "yolo_exact_bypasses")]
+    #[test_case(PermissionMode::Ask, false, |manager| { manager.toggle_yolo(); }, true; "enter_yolo")]
+    #[test_case(PermissionMode::Ask, false, |manager| { manager.toggle_yolo(); manager.toggle_yolo(); }, true; "yolo_round_trip")]
+    #[test_case(PermissionMode::Ask, false, |manager| manager.set_decisions(None), false; "service_replaced")]
+    #[test_case(PermissionMode::Ask, false, |manager| manager.set_project(&manager.project_cwd()), false; "project_replaced")]
     fn tool_search_decisions_follow_general_revision(
         mode: PermissionMode,
         exact: bool,
         change: fn(&PermissionManager),
-        builtin: bool,
         ranked: bool,
     ) {
         smol::block_on(async {
@@ -5185,31 +4923,35 @@ mod tests {
                 &AgentMode::Build,
                 permissions,
             );
-            if builtin {
-                let deferred = SEARCH_BUILTINS.iter().map(|name| {
-                    ctx.registry.register_audited(
-                        Arc::new(NamedMock::new(name, ToolAudience::all())),
-                        NamedMock::source(),
-                        ToolEffect::ReadOnly,
-                    ).unwrap();
-                    DeferredTool::new(name, None, json!({
-                        "name": name, "description": SEARCH_QUERY, "input_schema": {"type": "object"}
-                    }))
-                }).collect();
-                ctx.deferral = Some(DeferralSession::new(
-                    deferred,
-                    SEARCH_BUILTINS.into_iter().map(Arc::from),
-                ));
-            }
-            let mcp = crate::mcp::stub_session(&SEARCH_TOOLS);
+            let deferred = SEARCH_BUILTINS
+                .iter()
+                .map(|name| {
+                    ctx.registry
+                        .register_audited(
+                            Arc::new(NamedMock::new(name, ToolAudience::all())),
+                            NamedMock::source(),
+                            ToolEffect::ReadOnly,
+                        )
+                        .unwrap();
+                    DeferredTool::new(
+                        name,
+                        None,
+                        json!({
+                            "name": name, "description": SEARCH_QUERY, "input_schema": {"type": "object"}
+                        }),
+                    )
+                })
+                .collect();
+            let deferral = DeferralSession::new(deferred, std::iter::empty());
+            ctx.deferral = Some(deferral.clone());
             let query = if exact {
-                SEARCH_TOOLS[0].0
+                SEARCH_BUILTINS[0]
             } else {
                 SEARCH_QUERY
             };
             let done = run(
                 &ctx.registry,
-                Some(&mcp),
+                None,
                 SHELL_CALL.into(),
                 TOOL_SEARCH_TOOL_NAME,
                 &json!({"query": query}),
@@ -5218,75 +4960,14 @@ mod tests {
             )
             .await;
             assert!(!done.is_error, "{}", done.output.as_text());
+            assert_eq!(fixture.requests.lock().unwrap().len(), usize::from(!exact));
             assert_eq!(
-                fixture.requests.lock().unwrap().len(),
-                usize::from(!exact) + usize::from(builtin && ranked)
-            );
-            let mut tools = json!([]);
-            mcp.request_snapshot().extend_tools(&mut tools);
-            assert_eq!(
-                crate::mcp::tool_names(&tools).contains(&SEARCH_LAST_TOOL),
+                deferral
+                    .loaded_names()
+                    .iter()
+                    .any(|name| name.as_ref() == SEARCH_LAST_TOOL),
                 ranked
             );
-        });
-    }
-
-    #[test]
-    fn tool_search_routes_and_loads_matches() {
-        smol::block_on(async {
-            let mcp = crate::mcp::stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
-            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
-            let done = run(
-                ToolRegistry::global(),
-                Some(&mcp),
-                "t1".into(),
-                TOOL_SEARCH_TOOL_NAME,
-                &serde_json::json!({"query": "issue"}),
-                &ctx,
-                Emit::Silent,
-            )
-            .await;
-            assert!(!done.is_error, "got: {}", done.output.as_text());
-            assert_eq!(done.tool.as_ref(), TOOL_SEARCH_TOOL_NAME);
-            assert!(done.output.as_text().contains("srv__fetch_issue"));
-
-            let mut tools = serde_json::json!([]);
-            mcp.request_snapshot().extend_tools(&mut tools);
-            assert!(
-                crate::mcp::tool_names(&tools).contains(&"srv__fetch_issue"),
-                "searched tool must join the next request"
-            );
-        });
-    }
-
-    #[test_case(serde_json::json!({"query": "  "}) ; "blank_query")]
-    #[test_case(serde_json::json!({}) ; "missing_query")]
-    #[test_case(serde_json::json!({"query": 42}) ; "nonstring_query")]
-    #[test_case(serde_json::json!({"query": "!?"}) ; "no_search_tokens")]
-    fn tool_search_bad_query_is_error_event(input: Value) {
-        smol::block_on(async {
-            let mcp = crate::mcp::stub_session(&[("srv.tool", "")]);
-            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
-            let observations = ResponseObservations::new(1);
-            ctx.steering_observations = Some(observations.clone());
-            let done = run(
-                ToolRegistry::global(),
-                Some(&mcp),
-                "t1".into(),
-                TOOL_SEARCH_TOOL_NAME,
-                &input,
-                &ctx,
-                Emit::Silent,
-            )
-            .await;
-            assert!(done.is_error);
-            assert_eq!(
-                done.output.as_text(),
-                crate::tools::deferral::SEARCH_EMPTY_QUERY
-            );
-            let (facts, all_repairable) = observations.take();
-            assert!(all_repairable);
-            assert_eq!(facts[0].outcome, ToolOutcome::Repairable);
         });
     }
 
@@ -5335,181 +5016,35 @@ mod tests {
         });
     }
 
-    /// A name the model kept from earlier in the history must not slip past a
-    /// tool the config has since turned off.
-    #[test_case("srv.fetch_issue" ; "qualified_name")]
-    #[test_case("srv.*" ; "server_wildcard")]
-    fn disabled_mcp_tool_from_history_is_refused(disabled: &str) {
+    /// A wire name the model kept from before code mode reaches nothing, and says where MCP
+    /// tools went.
+    #[test]
+    fn a_legacy_mcp_wire_name_points_at_the_mcp_tool() {
         smol::block_on(async {
-            let mcp = crate::mcp::stub_session(&[("srv.fetch_issue", "")])
-                .with_disabled_tools(&[disabled.to_owned()]);
+            let mcp = crate::mcp::stub_session(&[(RECORDED_MCP, "")]);
             let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
             let done = run(
                 ToolRegistry::global(),
                 Some(&mcp),
                 "t1".into(),
-                "srv__fetch_issue",
-                &serde_json::json!({}),
-                &ctx,
-                Emit::Silent,
-            )
-            .await;
-            assert!(done.is_error);
-            assert!(
-                done.output.as_text().contains(TOOL_DISABLED_SUFFIX),
-                "{}",
-                done.output.as_text()
-            );
-        });
-    }
-
-    #[test]
-    fn calling_deferred_mcp_tool_marks_it_loaded() {
-        smol::block_on(async {
-            let mcp = crate::mcp::stub_session(&[("srv.fetch_issue", "")]);
-            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
-            ctx.mcp = Some(mcp.clone());
-            let done = run(
-                ToolRegistry::global(),
-                Some(&mcp),
-                "t1".into(),
-                "srv__fetch_issue",
-                &serde_json::json!({}),
-                &ctx,
-                Emit::Silent,
-            )
-            .await;
-            assert_eq!(done.tool.as_ref(), "srv.fetch_issue", "must route to MCP");
-
-            let mut tools = serde_json::json!([]);
-            mcp.request_snapshot().extend_tools(&mut tools);
-            assert_eq!(
-                crate::mcp::tool_names(&tools),
-                vec!["srv__fetch_issue"],
-                "called tool must join the next request"
-            );
-        });
-    }
-
-    #[test]
-    fn denied_mcp_call_does_not_load_definition() {
-        smol::block_on(async {
-            let mcp = crate::mcp::stub_session(&[("srv.fetch_issue", "")]);
-            let deny_cfg = PermissionsConfig {
-                rules: vec![PermissionRule {
-                    tool: ToolKey::parse("srv.fetch_issue").unwrap(),
-                    scope: None,
-                    effect: Effect::Deny,
-                }],
-                ..Default::default()
-            };
-            let dir = TempDir::new().unwrap();
-            let permissions = Arc::new(PermissionManager::new_nonpersistent(
-                deny_cfg,
-                dir.path().to_path_buf(),
-                Arc::default(),
-            ));
-            let mut ctx = crate::tools::test_support::stub_ctx_with_permissions(
-                &AgentMode::Build,
-                permissions,
-            );
-            ctx.mcp = Some(mcp.clone());
-            let done = run(
-                ToolRegistry::global(),
-                Some(&mcp),
-                "t1".into(),
-                "srv__fetch_issue",
-                &serde_json::json!({}),
-                &ctx,
-                Emit::Silent,
-            )
-            .await;
-            assert!(done.is_error);
-            assert!(
-                done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX),
-                "got: {}",
-                done.output.as_text()
-            );
-
-            let mut tools = serde_json::json!([]);
-            mcp.request_snapshot().extend_tools(&mut tools);
-            assert_eq!(
-                crate::mcp::tool_names(&tools),
-                vec![TOOL_SEARCH_TOOL_NAME],
-                "denied call must not load the definition"
-            );
-        });
-    }
-
-    #[derive(Debug, PartialEq)]
-    enum McpVerdict {
-        Ran,
-        Asked,
-        Hidden,
-    }
-
-    /// A tool a recognised server annotates read-only stays callable in plan
-    /// mode and under a read-only policy, and still answers to the permission
-    /// mode there. Any other MCP tool stays out of reach, even in Yolo.
-    #[test_case(AgentMode::Plan(PathBuf::from(MCP_PLAN_FILE)), PermissionMode::Yolo, HOME_ASSISTANT_SERVER, true, McpVerdict::Ran ; "plan_runs_a_read_only_tool")]
-    #[test_case(AgentMode::ReadOnly, PermissionMode::Yolo, HOME_ASSISTANT_SERVER, true, McpVerdict::Ran ; "read_only_policy_runs_a_read_only_tool")]
-    #[test_case(AgentMode::Build, PermissionMode::Yolo, HOME_ASSISTANT_SERVER, true, McpVerdict::Ran ; "build_runs_a_read_only_tool")]
-    #[test_case(AgentMode::Plan(PathBuf::from(MCP_PLAN_FILE)), PermissionMode::Ask, HOME_ASSISTANT_SERVER, true, McpVerdict::Asked ; "ask_still_asks_in_plan_mode")]
-    #[test_case(AgentMode::ReadOnly, PermissionMode::Ask, HOME_ASSISTANT_SERVER, true, McpVerdict::Asked ; "ask_still_asks_under_a_read_only_policy")]
-    #[test_case(AgentMode::Plan(PathBuf::from(MCP_PLAN_FILE)), PermissionMode::Yolo, LOOKALIKE_SERVER, true, McpVerdict::Hidden ; "plan_hides_a_stranger_claiming_read_only")]
-    #[test_case(AgentMode::ReadOnly, PermissionMode::Yolo, LOOKALIKE_SERVER, true, McpVerdict::Hidden ; "read_only_policy_hides_a_stranger_claiming_read_only")]
-    #[test_case(AgentMode::Plan(PathBuf::from(MCP_PLAN_FILE)), PermissionMode::Yolo, HOME_ASSISTANT_SERVER, false, McpVerdict::Hidden ; "plan_hides_a_recognised_tool_that_writes")]
-    #[test_case(AgentMode::ReadOnly, PermissionMode::Yolo, HOME_ASSISTANT_SERVER, false, McpVerdict::Hidden ; "read_only_policy_hides_a_recognised_tool_that_writes")]
-    fn read_only_mcp_tools_reach_plan_and_read_only_modes(
-        mode: AgentMode,
-        permission_mode: PermissionMode,
-        server: &str,
-        annotated: bool,
-        expected: McpVerdict,
-    ) {
-        smol::block_on(async {
-            let mcp = crate::mcp::recognised_stub_session(
-                server,
-                &[(LOOKUP_MCP_TOOL, annotated)],
-                json!({"content": [{"type": "text", "text": LOOKUP_RESULT}]}),
-            );
-            let dir = TempDir::new().unwrap();
-            let permissions = Arc::new(PermissionManager::new_nonpersistent(
-                PermissionsConfig::default(),
-                dir.path().to_path_buf(),
-                Arc::default(),
-            ));
-            permissions.set_session_mode(Some(permission_mode));
-            let mut ctx = crate::tools::test_support::stub_ctx_with_permissions(&mode, permissions);
-            ctx.mcp = Some(mcp.clone());
-            let done = run(
-                ToolRegistry::global(),
-                Some(&mcp),
-                "t1".into(),
-                LOOKUP_MCP_WIRE,
+                RECORDED_MCP_CALL,
                 &json!({}),
                 &ctx,
                 Emit::Silent,
             )
             .await;
-            let text = done.output.as_text();
-            let verdict = if !done.is_error && text.contains(LOOKUP_RESULT) {
-                McpVerdict::Ran
-            } else if text.starts_with(PERMISSION_DENIED_PREFIX) {
-                McpVerdict::Asked
-            } else if text.contains(TOOL_DISABLED_SUFFIX) {
-                McpVerdict::Hidden
-            } else {
-                panic!("{text}");
-            };
-            assert_eq!(verdict, expected, "{text}");
+            assert!(done.is_error);
+            assert_eq!(
+                done.output.as_text(),
+                format!("{UNKNOWN_TOOL_PREFIX}: {RECORDED_MCP_CALL}{MCP_THROUGH_CODE}")
+            );
         });
     }
 
     #[test]
-    fn local_tool_named_tool_search_shadows_mcp_search() {
+    fn local_tool_named_tool_search_shadows_the_builtin_search() {
         smol::block_on(async {
-            let mcp = crate::mcp::stub_session(&[("srv.tool", "")]);
+            let mcp = crate::mcp::stub_session(&[(RECORDED_MCP, "")]);
             let ctx = local_ctx(TOOL_SEARCH_TOOL_NAME, |_| Ok("local wins".into()));
             let done = run(
                 ToolRegistry::global(),
@@ -5540,60 +5075,10 @@ mod tests {
             )
             .await;
             assert!(done.is_error);
-            assert_eq!(done.tool.as_ref(), UNKNOWN_MCP);
+            assert_eq!(done.tool.as_ref(), "nonexistent.tool");
             let text = done.output.as_text();
             assert!(text.starts_with(UNKNOWN_TOOL_PREFIX));
             assert!(text.contains("nonexistent.tool"));
-        });
-    }
-
-    #[test]
-    fn mcp_tool_blocked_in_plan_mode() {
-        smol::block_on(async {
-            let result = dispatch_mcp(
-                &crate::tools::test_support::stub_ctx(&AgentMode::Plan(PathBuf::from(
-                    "/tmp/plan.md",
-                ))),
-                "t1",
-                "myserver.mytool",
-                &serde_json::json!({}),
-            )
-            .await;
-            assert!(result.is_error);
-            assert_eq!(result.output.as_text(), MCP_BLOCKED_IN_PLAN);
-        });
-    }
-
-    #[test]
-    fn forged_mcp_tool_is_blocked_in_read_only_mode() {
-        smol::block_on(async {
-            let result = dispatch_mcp(
-                &crate::tools::test_support::stub_ctx(&AgentMode::ReadOnly),
-                "t1",
-                "myserver.mytool",
-                &serde_json::json!({}),
-            )
-            .await;
-            assert!(result.is_error);
-            assert_eq!(
-                result.output.as_text(),
-                format!("{READ_ONLY_TOOL_RESTRICTED}: myserver.mytool")
-            );
-        });
-    }
-
-    #[test]
-    fn mcp_tool_errors_without_mcp_manager() {
-        smol::block_on(async {
-            let result = dispatch_mcp(
-                &crate::tools::test_support::stub_ctx(&AgentMode::Build),
-                "t1",
-                "myserver.mytool",
-                &serde_json::json!({}),
-            )
-            .await;
-            assert!(result.is_error);
-            assert!(result.output.as_text().contains("not available"));
         });
     }
 
@@ -6877,58 +6362,27 @@ mod tests {
     }
 
     #[test]
-    fn an_mcp_call_records_the_workspace_around_it() {
+    fn an_mcp_run_that_calls_no_server_opens_no_record() {
         smol::block_on(async {
             let changes = Arc::new(FakeChanges::default());
             let mcp = crate::mcp::stub_session(&[(RECORDED_MCP, "")]);
             let mut ctx = recorded_ctx(&changes);
+            crate::tools::native::register(&ctx.registry, FeatureFlags::all()).unwrap();
             ctx.mcp = Some(mcp.clone());
 
             let done = run(
-                ToolRegistry::global(),
+                &ctx.registry,
                 Some(&mcp),
                 RECORDED_MCP_CALL.into(),
-                RECORDED_MCP_CALL,
-                &json!({}),
+                MCP_TOOL_NAME,
+                &json!({"code": "1"}),
                 &ctx,
                 Emit::Silent,
             )
             .await;
 
-            assert_eq!(done.tool.as_ref(), RECORDED_MCP);
-            assert_eq!(
-                changes.steps(),
-                [Step::Begin(RecordScope::Workspace), Step::Finish]
-            );
-        });
-    }
-
-    #[test]
-    fn an_mcp_result_flagged_is_error_fails_the_call_but_keeps_its_output() {
-        smol::block_on(async {
-            let reply = json!({
-                "content": [{"type": "text", "text": MCP_ERROR_TEXT}],
-                "isError": true,
-            });
-            let mcp = crate::mcp::stub_session_replying(&[(RECORDED_MCP, "")], Some(reply));
-            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
-            ctx.mcp = Some(mcp.clone());
-
-            let done = run(
-                ToolRegistry::global(),
-                Some(&mcp),
-                RECORDED_MCP_CALL.into(),
-                RECORDED_MCP_CALL,
-                &json!({}),
-                &ctx,
-                Emit::Silent,
-            )
-            .await;
-
-            assert!(done.is_error);
-            assert_eq!(done.accounting.outcome, Some(ToolFailure::Other.into()));
-            assert!(matches!(&done.output, ToolOutput::Mcp(output) if output.is_error));
-            assert_eq!(done.composed_model_output(), LEGACY_MCP_ERROR);
+            assert_eq!(done.tool.as_ref(), MCP_TOOL_NAME);
+            assert!(changes.steps().is_empty());
         });
     }
 

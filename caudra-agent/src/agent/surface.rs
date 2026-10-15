@@ -18,7 +18,6 @@ use serde_json::Value;
 
 use crate::AgentMode;
 use crate::agent::last_announced;
-use crate::mcp::{McpSession, PinnedMcpTools};
 use crate::prompt::{
     CHANGES_SLOT, CONFIGURATION_CHANGED_MARKER, CONFIGURATION_CHANGED_PROMPT,
     CONFIGURATION_RESTORED_PROMPT,
@@ -52,27 +51,14 @@ pub struct Surface {
     pub system: String,
     pub tools: Value,
     pub deferred: Vec<DeferredTool>,
-    /// Empty when the prefix was fixed without MCP, so a manager started
-    /// later declares nothing until the next rebuild.
-    pub mcp: PinnedMcpTools,
-    /// Whether MCP servers were still making their first connection when
-    /// this prefix was built, so the tools they bring are missing from it.
-    connecting: bool,
-    /// By the name the model calls each one, MCP's included, whether declared
-    /// or deferred. What a difference is measured on, so a `tool_search` load
-    /// is never one.
+    /// By the name the model calls each one, whether declared or deferred.
+    /// What a difference is measured on, so a `tool_search` load is never one.
     definitions: BTreeMap<String, Value>,
 }
 
 impl Surface {
-    /// Pins `mcp`'s live tools along with the rest.
-    pub fn new(
-        system: String,
-        tools: Value,
-        deferred: Vec<DeferredTool>,
-        mcp: Option<&McpSession>,
-    ) -> Self {
-        let mut definitions: BTreeMap<String, Value> = tools
+    pub fn new(system: String, tools: Value, deferred: Vec<DeferredTool>) -> Self {
+        let definitions = tools
             .as_array()
             .into_iter()
             .flatten()
@@ -81,15 +67,10 @@ impl Surface {
                 Some((definition["name"].as_str()?.to_owned(), definition.clone()))
             })
             .collect();
-        for (name, definition) in mcp.map(McpSession::live_definitions).unwrap_or_default() {
-            definitions.entry(name).or_insert(definition);
-        }
         Self {
             system,
             tools,
             deferred,
-            mcp: mcp.map(McpSession::live_tools).unwrap_or_default(),
-            connecting: mcp.is_some_and(|mcp| mcp.connecting()),
             definitions,
         }
     }
@@ -141,23 +122,13 @@ impl<K> Default for SurfaceBaseline<K> {
 impl<K: PartialEq> SurfaceBaseline<K> {
     /// Whether the next request rebuilds the prefix: nothing is fixed yet,
     /// `key` moved, the history `epoch` moved because the conversation was
-    /// replaced, or `cache_ttl` passed since the last request. Also once the
-    /// MCP servers that were still `connecting` when it was fixed are up,
-    /// since their tools are missing from it.
-    pub fn stale(
-        &self,
-        key: &K,
-        epoch: u64,
-        cache_ttl: Option<Duration>,
-        connecting: bool,
-        now: Instant,
-    ) -> bool {
+    /// replaced, or `cache_ttl` passed since the last request.
+    pub fn stale(&self, key: &K, epoch: u64, cache_ttl: Option<Duration>, now: Instant) -> bool {
         let Some(fixed) = &self.fixed else {
             return true;
         };
         fixed.key != *key
             || fixed.epoch != epoch
-            || fixed.surface.connecting && !connecting
             || cache_ttl
                 .zip(self.used)
                 .is_some_and(|(ttl, used)| now.saturating_duration_since(used) >= ttl)
@@ -345,12 +316,7 @@ mod tests {
     }
 
     fn surface(system: &str, tools: &[Value]) -> Surface {
-        Surface::new(
-            system.to_owned(),
-            Value::from(tools.to_vec()),
-            Vec::new(),
-            None,
-        )
+        Surface::new(system.to_owned(), Value::from(tools.to_vec()), Vec::new())
     }
 
     fn base() -> Surface {
@@ -434,7 +400,6 @@ mod tests {
             SYSTEM.to_owned(),
             Value::from(vec![tool(KEPT, KEPT_DESCRIPTION), tool(DROPPED, "Write.")]),
             vec![deferred],
-            None,
         );
         let notice = baseline
             .settle(live, false, KEY, EPOCH, &[])
@@ -490,7 +455,7 @@ mod tests {
         let settled = baseline.settle(surface(EDITED_SYSTEM, &[]), true, OTHER_KEY, EPOCH, &[]);
         assert_eq!(settled.surface.system, EDITED_SYSTEM);
         assert!(settled.notice.is_none());
-        assert!(!baseline.stale(&OTHER_KEY, EPOCH, None, false, Instant::now()));
+        assert!(!baseline.stale(&OTHER_KEY, EPOCH, None, Instant::now()));
     }
 
     #[test_case(OTHER_KEY, EPOCH, None, Duration::ZERO => true ; "key_moved")]
@@ -502,29 +467,12 @@ mod tests {
         let mut baseline = fixed_baseline();
         let used = Instant::now();
         baseline.touch(used);
-        baseline.stale(&key, epoch, ttl, false, used + idle)
-    }
-
-    /// A prefix fixed while MCP servers were still making their first
-    /// connection lacks their tools, so it is rebuilt once they are up. A
-    /// manager that started after the prefix was fixed waits for the next
-    /// rebuild.
-    #[test_case(true, false => true ; "servers_connected_since")]
-    #[test_case(true, true => false ; "servers_still_connecting")]
-    #[test_case(false, true => false ; "manager_started_since")]
-    fn connecting_servers(connecting_when_fixed: bool, connecting_now: bool) -> bool {
-        let mut baseline = SurfaceBaseline::default();
-        let fixed = Surface {
-            connecting: connecting_when_fixed,
-            ..base()
-        };
-        baseline.settle(fixed, true, KEY, EPOCH, &[]);
-        baseline.stale(&KEY, EPOCH, None, connecting_now, Instant::now())
+        baseline.stale(&key, epoch, ttl, used + idle)
     }
 
     #[test]
     fn nothing_fixed_is_stale() {
         let baseline: SurfaceBaseline<&str> = SurfaceBaseline::default();
-        assert!(baseline.stale(&KEY, EPOCH, None, false, Instant::now()));
+        assert!(baseline.stale(&KEY, EPOCH, None, Instant::now()));
     }
 }

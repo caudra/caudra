@@ -13,14 +13,13 @@ use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
 use caudra_agent::template::{self, Vars};
 use caudra_agent::tools::deferral::{deferred_names, push_unbound_catalog};
 use caudra_agent::tools::native::skill::{self, SkillDirCandidate, SkillInventoryEntry};
-use caudra_agent::tools::profile_policy::{
-    CEILING_DISABLED, LEGACY_LOADING, PROFILE_DISABLED, PROFILE_LOADING, registered_decision,
-};
+use caudra_agent::tools::profile_policy::{CEILING_DISABLED, LEGACY_LOADING, registered_decision};
 use caudra_agent::tools::registry::ToolDefinitions;
-use caudra_agent::tools::report::{CATALOG_SOURCE, REASON_CATALOG, REASON_CONFIG, REASON_DEFERRED};
+use caudra_agent::tools::report::{CATALOG_SOURCE, REASON_CATALOG};
 use caudra_agent::tools::{
-    BuiltinDeferral, DeferralSession, DescriptionContext, SHELL_TOOL_NAME, TOOL_SEARCH_TOOL_NAME,
-    ToolAudience, ToolFilter, ToolRegistry, ToolState, builtin_report, execution, is_tool_enabled,
+    BuiltinDeferral, DeferralSession, DescriptionContext, MCP_TOOL_NAME, SHELL_TOOL_NAME,
+    TOOL_SEARCH_TOOL_NAME, ToolAudience, ToolFilter, ToolRegistry, ToolState, builtin_report,
+    execution, is_tool_enabled,
 };
 use caudra_config::providers::{
     Protocol, ProviderDef, ProvidersConfig, ProvidersFile, all_builtins, builtin_provider,
@@ -28,8 +27,7 @@ use caudra_config::providers::{
     resolve_display_name, resolve_login_url, slugify,
 };
 use caudra_config::{
-    AgentConfig, Config, DefaultEffect, ModelPolicy, PermissionsConfig, ProfileToolPolicy,
-    ProfileToolSource, ToolKey,
+    AgentConfig, Config, DefaultEffect, ModelPolicy, PermissionsConfig, ProfileToolPolicy, ToolKey,
 };
 use caudra_providers::copilot_auth::{CopilotAccount, CopilotIdentity, EnterpriseHost};
 use caudra_providers::model_registry::{self, Binding};
@@ -57,6 +55,9 @@ use crate::setup::resolve_model;
 const PROMPT_PLAN_PATH: &str = "<active plan document>";
 const PROMPT_PLAN_REFERENCE: &str = "active-plan-inspection";
 const REASON_INSPECTION_UNAVAILABLE: &str = "unavailable for this inspection runtime or mode";
+const REASON_NO_MCP_SERVER: &str = "no MCP server is enabled";
+const REASON_VIA_MCP: &str = "via mcp";
+const REASON_SEARCH_ONLY: &str = "search-only: left out of the server list, found by search()";
 const AUTH_STATUS_EMPTY: &str = "       ";
 const AUTH_STATUS_ENV: &str = "\x1b[33m~ env  \x1b[0m";
 const AUTH_STATUS_KEY: &str = "\x1b[32m✓ key  \x1b[0m";
@@ -1168,20 +1169,17 @@ fn builtin_rows(
 }
 
 /// Derived, not looked up: `tool_search` is synthesized into the request
-/// array whenever something is deferred, so a lazy row anywhere means the
-/// model is offered the catalog too.
-fn catalog_row(builtin: &[ToolRow], mcp: &[ToolRow]) -> Option<ToolRow> {
+/// array whenever a built-in is deferred, so a lazy row means the model is
+/// offered the catalog too. MCP tools never reach it: they are called from
+/// the `mcp` tool.
+fn catalog_row(builtin: &[ToolRow]) -> Option<ToolRow> {
     if builtin
         .iter()
-        .chain(mcp)
         .any(|row| row.name == TOOL_SEARCH_TOOL_NAME && row.state.reaches_model())
     {
         return None;
     }
-    let lazy = builtin
-        .iter()
-        .chain(mcp)
-        .any(|row| row.state == ToolState::Lazy);
+    let lazy = builtin.iter().any(|row| row.state == ToolState::Lazy);
     lazy.then(|| ToolRow {
         name: TOOL_SEARCH_TOOL_NAME.to_owned(),
         source: CATALOG_SOURCE.to_owned(),
@@ -1191,50 +1189,38 @@ fn catalog_row(builtin: &[ToolRow], mcp: &[ToolRow]) -> Option<ToolRow> {
     })
 }
 
-fn mcp_rows(mcp: Option<&McpSession>, config: &Config, policy: &ProfileToolPolicy) -> Vec<ToolRow> {
+fn mcp_rows(mcp: Option<&McpSession>, permissions: &PermissionsConfig) -> Vec<ToolRow> {
     let Some(mcp) = mcp else {
         return Vec::new();
     };
-    let mut rows: Vec<ToolRow> =
-        mcp.request_snapshot()
-            .tool_inventory()
+    let mut rows: Vec<ToolRow> = mcp
+        .tool_inventory()
+        .into_iter()
+        .map(|tool| {
+            let keys = [
+                ToolKey::parse(&tool.qualified_name),
+                ToolKey::parse(&format!("{}.*", tool.server)),
+            ]
             .into_iter()
-            .map(|tool| {
-                let keys = [
-                    ToolKey::parse(&tool.qualified_name),
-                    ToolKey::parse(&format!("{}.*", tool.server)),
-                ]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
-                let (state, mut note) = match (tool.disabled, tool.deferred) {
-                    (true, _) => (ToolState::Off, Some(REASON_INSPECTION_UNAVAILABLE)),
-                    (false, true) => (ToolState::Lazy, Some(REASON_DEFERRED)),
-                    _ => (ToolState::On, None),
-                };
-                if config.agent.disabled_tools.iter().any(|pattern| {
-                    caudra_config::tool_pattern_matches(pattern, &tool.qualified_name)
-                }) {
-                    note = Some(REASON_CONFIG);
-                } else if policy
-                    .exposure(&tool.qualified_name, ProfileToolSource::Mcp)
-                    .is_some()
-                {
-                    note = Some(if tool.disabled {
-                        PROFILE_DISABLED
-                    } else {
-                        PROFILE_LOADING
-                    });
-                }
-                ToolRow {
-                    state,
-                    note,
-                    permission: permission_default(&config.permissions, &keys),
-                    source: format!("{SOURCE_MCP}:{}", tool.server),
-                    name: tool.wire_name,
-                }
-            })
-            .collect();
+            .flatten()
+            .collect::<Vec<_>>();
+            let (state, note) = match (tool.disabled, tool.search_only) {
+                (true, _) => (
+                    ToolState::Off,
+                    tool.reason.unwrap_or(REASON_INSPECTION_UNAVAILABLE),
+                ),
+                (false, true) => (ToolState::On, REASON_SEARCH_ONLY),
+                (false, false) => (ToolState::On, REASON_VIA_MCP),
+            };
+            ToolRow {
+                state,
+                note: Some(note),
+                permission: permission_default(permissions, &keys),
+                source: format!("{SOURCE_MCP}:{}", tool.server),
+                name: tool.qualified_name,
+            }
+        })
+        .collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
     rows
 }
@@ -1316,20 +1302,19 @@ fn inspection_tool_state(definitions: &ToolDefinitions, name: &str) -> ToolState
     }
 }
 
+/// `mcp` is declared only while a server is enabled, as a session decides it.
 fn inspection_catalog(mut definitions: ToolDefinitions, mcp: Option<&McpSession>) -> Value {
+    if !mcp.is_some_and(|mcp| mcp.has_enabled_server())
+        && let Some(tools) = definitions.declared.as_array_mut()
+    {
+        tools.retain(|tool| tool["name"].as_str() != Some(MCP_TOOL_NAME));
+    }
     let deferred = DeferralSession::new(definitions.deferred, std::iter::empty());
-    let mut sections = Vec::new();
-    sections.extend(
+    let sections = Vec::from_iter(
         deferred
             .request_snapshot()
             .extend_declared(&mut definitions.declared),
     );
-    if let Some(mcp) = mcp {
-        sections.extend(
-            mcp.request_snapshot()
-                .extend_declared(&mut definitions.declared),
-        );
-    }
     push_unbound_catalog(
         &mut definitions.declared,
         &sections,
@@ -1480,8 +1465,14 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
         &definitions,
         &policy,
     );
-    let mut mcp_tools = mcp_rows(mcp.as_ref(), &config, &policy);
-    if let Some(catalog) = catalog_row(&builtin, &mcp_tools) {
+    if !mcp.as_ref().is_some_and(|mcp| mcp.has_enabled_server())
+        && let Some(row) = builtin.iter_mut().find(|row| row.name == MCP_TOOL_NAME)
+    {
+        row.state = ToolState::Off;
+        row.note = Some(REASON_NO_MCP_SERVER);
+    }
+    let mut mcp_tools = mcp_rows(mcp.as_ref(), &config.permissions);
+    if let Some(catalog) = catalog_row(&builtin) {
         let at = builtin.partition_point(|row| row.name < catalog.name);
         builtin.insert(at, catalog);
     }
@@ -1822,7 +1813,10 @@ mod auth_tests {
     use caudra_agent::permissions::PermissionManager;
     use caudra_agent::tools::cli_tool_ctx;
     use caudra_agent::tools::native::plan::SESSION_PLAN_LABEL;
-    use caudra_agent::tools::profile_policy::{PLAN_REQUIRED, PLAN_TOOL_NAME};
+    use caudra_agent::tools::profile_policy::{
+        PLAN_REQUIRED, PLAN_TOOL_NAME, PROFILE_DISABLED, PROFILE_LOADING,
+    };
+    use caudra_agent::tools::report::REASON_CONFIG;
     use caudra_config::{Effect, ExecutionMode, FeatureFlags, PermissionRule, RawConfig};
     use caudra_workcell::WorkcellHost;
     use tempfile::TempDir;
@@ -2092,10 +2086,7 @@ Title     default       provider/title\n"
                 PROFILE_LOADING
             })
         );
-        assert_eq!(
-            catalog_row(&rows, &[]).is_some(),
-            expected == ToolState::Lazy
-        );
+        assert_eq!(catalog_row(&rows).is_some(), expected == ToolState::Lazy);
         let catalog = inspection_catalog(definitions, None);
         let tools = catalog.as_array().unwrap();
         assert_eq!(
@@ -2297,17 +2288,12 @@ Title     default       provider/title\n"
     }
 
     /// The catalog has no registry entry, so the row exists exactly when the
-    /// request would carry one: whenever any source has something deferred.
-    #[test_case(&[ToolState::On], &[], false ; "nothing_lazy")]
-    #[test_case(&[ToolState::Off], &[], false ; "disabled_is_not_lazy")]
-    #[test_case(&[ToolState::Lazy], &[], true ; "lazy_builtin")]
-    #[test_case(&[], &[ToolState::Lazy], true ; "lazy_mcp")]
-    fn the_catalog_row_tracks_whether_anything_is_lazy(
-        builtin: &[ToolState],
-        mcp: &[ToolState],
-        expected: bool,
-    ) {
-        let row = catalog_row(&state_rows(builtin), &state_rows(mcp));
+    /// request would carry one: whenever a built-in is deferred.
+    #[test_case(&[ToolState::On], false ; "nothing_lazy")]
+    #[test_case(&[ToolState::Off], false ; "disabled_is_not_lazy")]
+    #[test_case(&[ToolState::Lazy], true ; "lazy_builtin")]
+    fn the_catalog_row_tracks_whether_anything_is_lazy(builtin: &[ToolState], expected: bool) {
+        let row = catalog_row(&state_rows(builtin));
 
         assert_eq!(row.is_some(), expected);
         if let Some(row) = row {

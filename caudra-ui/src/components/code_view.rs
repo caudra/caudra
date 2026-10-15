@@ -18,13 +18,14 @@ use super::mcp_card::McpCall;
 use super::tool_display::{
     ACTIVITY_BODY_PAD, ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, annotation_spans,
     append_annotation, batch_sigil_style, compact_args_for, header_spans, header_timeout,
-    header_workdir, inflected_header, label_spans, names_tool, progress_lines, repeats_tool,
-    report_header, report_markdown, report_message, scroll_footer_text, title,
+    header_workdir, inflected_header, label_spans, names_tool, progress_lines, raw_toggle_label,
+    repeats_tool, report_header, report_markdown, report_message, scroll_footer_text, title,
 };
 use super::{
-    ToolProgress, environment_card, is_collapsible, json_text, mcp_card, memory_card, peer_card,
-    task_card, workflow_card,
+    ToolProgress, environment_card, is_collapsible, json_text, mcp_card, mcp_code_card,
+    memory_card, peer_card, task_card, workflow_card,
 };
+use caudra_agent::mcp::code::output::McpCodeOutput;
 use caudra_agent::tools::{
     PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, timeout_annotation,
 };
@@ -1077,7 +1078,13 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
                 child.scroll = None;
                 child.budget = usize::MAX;
             }
-            child_body(entry, highlight, &child, limits.live.get(&index))
+            child_body(
+                entry,
+                highlight,
+                &child,
+                limits.live.get(&index),
+                limits.views.is_raw(index),
+            )
         });
         let has_body = body.as_ref().is_some_and(|body| !body.lines.is_empty());
         // Every row of a child answers for it, whether or not a click would
@@ -1223,7 +1230,9 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
                 spans_out.push(span.shifted(lines.len(), Some(index)));
             }
             rows.extend((0..body.lines.len()).map(|row| {
-                if let Some(output) = entry.output.as_ref()
+                if let Some(Some(RowTarget::Raw(_))) = body.rows.get(row) {
+                    Some(RowTarget::Raw(index))
+                } else if let Some(output) = entry.output.as_ref()
                     && let Some(Some(task)) = body.rows.get(row)
                     && let Some(task) = task_card::target_index(output, *task)
                 {
@@ -1254,6 +1263,39 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
         rows,
         spans: spans_out,
     }
+}
+
+/// An `mcp` run under its snippet: its calls as batch rows, each opening to the call's own card,
+/// then the tail. The flag says the budget held part of the tail back.
+fn render_mcp_code(
+    output: &McpCodeOutput,
+    highlight: bool,
+    limits: &RenderLimits,
+) -> (BatchCard, bool) {
+    let entries = mcp_code_card::entries(output);
+    let mut card = render_batch(&entries, highlight, limits);
+    let mut trace = SourceTrace::default();
+    match card.source.take() {
+        Some(source) => trace.record(0, source),
+        None if !card.lines.is_empty() => trace.abandon(),
+        None => {}
+    }
+    let (blocks, truncated) = mcp_code_card::tail(output, limits.bounded_budget(), limits.width);
+    for (index, (lines, source)) in blocks.into_iter().enumerate() {
+        if index == 0 && !card.lines.is_empty() {
+            card.links.rows.push(Vec::new());
+            card.rows.push(None);
+            card.lines.push(Line::default());
+        }
+        if let Some(source) = source {
+            trace.record(card.lines.len(), source);
+        }
+        card.links.rows.extend(LinkMap::none_for(&lines).rows);
+        card.rows.resize(card.rows.len() + lines.len(), None);
+        card.lines.extend(lines);
+    }
+    card.source = trace.finish(&card.lines);
+    (card, truncated)
 }
 
 /// The heading a child's summary row copies as, numbered so a reader can match
@@ -1395,11 +1437,15 @@ fn child_elapsed(entry: &BatchToolEntry, started: Option<&Instant>) -> Option<Du
 /// clears its children's live sink, so the only thing a running child would
 /// otherwise draw is the spinner on its summary row, and a long shell inside
 /// a batch would show nothing at all until it finished.
+///
+/// `raw` draws an MCP answer as its data rather than its card, the switch its
+/// own card offers, on a row of the body's own.
 fn child_body(
     entry: &BatchToolEntry,
     highlight: bool,
     limits: &RenderLimits,
     live: Option<&String>,
+    raw: bool,
 ) -> ChildBody {
     let output = entry.output.as_ref();
     if let Some(message) = report_message(&entry.tool, entry.raw_input.as_ref()) {
@@ -1431,6 +1477,29 @@ fn child_body(
         body.links = links;
         let body = child_view(body, limits.scroll, limits.budget, ScrollTail::Settled, "");
         return with_script(entry, highlight, limits, body);
+    }
+    if entry.status != BatchToolStatus::Error
+        && let Some(ToolOutput::Mcp(answer)) = output
+    {
+        let call = McpCall {
+            tool: &entry.tool,
+            arguments: entry.raw_input.as_ref(),
+            raw,
+            ..McpCall::default()
+        };
+        let (content, has_raw_view) = render_mcp_content(None, &call, Some(answer), limits);
+        let mut body = ChildBody::from(content);
+        if has_raw_view {
+            body.lines.push(Line::from(Span::styled(
+                raw_toggle_label(raw),
+                theme::current().tool_dim,
+            )));
+            body.push_chrome();
+            if let Some(row) = body.rows.last_mut() {
+                *row = Some(RowTarget::Raw(0));
+            }
+        }
+        return body;
     }
     // Every answer that is text goes through one place, so no arm can be the
     // one that forgets the script. `render_tool_content` draws the script
@@ -2886,31 +2955,60 @@ pub struct Disclosure {
 /// as the list of what it ran, and one whose body is the only record of what it
 /// did rests at its tool's budget.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
-pub struct BatchViews(Arc<[usize]>);
+pub struct BatchViews {
+    open: Arc<[usize]>,
+    /// The children drawn as their answer came rather than as their card.
+    raw: Arc<[usize]>,
+}
 
 impl BatchViews {
+    #[cfg(test)]
     pub fn new(open: impl IntoIterator<Item = usize>) -> Self {
-        let mut open: Vec<usize> = open.into_iter().collect();
-        open.sort_unstable();
-        open.dedup();
-        Self(open.into())
+        Self {
+            open: index_set(open),
+            raw: Arc::default(),
+        }
     }
 
     fn is_open(&self, index: usize) -> bool {
-        self.0.contains(&index)
+        self.open.contains(&index)
+    }
+
+    fn is_raw(&self, index: usize) -> bool {
+        self.raw.contains(&index)
     }
 
     /// Every control undoes itself: the click that opened a child folds it
     /// again.
     pub fn toggled(&self, index: usize) -> Self {
-        Self::new(
-            self.0
-                .iter()
-                .copied()
-                .filter(|held| *held != index)
-                .chain((!self.is_open(index)).then_some(index)),
-        )
+        Self {
+            open: toggled_index(&self.open, index),
+            raw: Arc::clone(&self.raw),
+        }
     }
+
+    pub fn raw_toggled(&self, index: usize) -> Self {
+        Self {
+            open: Arc::clone(&self.open),
+            raw: toggled_index(&self.raw, index),
+        }
+    }
+}
+
+fn index_set(indices: impl IntoIterator<Item = usize>) -> Arc<[usize]> {
+    let mut indices: Vec<usize> = indices.into_iter().collect();
+    indices.sort_unstable();
+    indices.dedup();
+    indices.into()
+}
+
+fn toggled_index(set: &[usize], index: usize) -> Arc<[usize]> {
+    index_set(
+        set.iter()
+            .copied()
+            .filter(|held| *held != index)
+            .chain((!set.contains(&index)).then_some(index)),
+    )
 }
 
 /// What each dispatched child of one batch is doing, by index in the roster.
@@ -3248,13 +3346,18 @@ pub type BatchStartedMap = HashMap<String, ChildStarted>;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RowTarget {
     Item(usize),
-    Task { child: usize, task: usize },
+    Task {
+        child: usize,
+        task: usize,
+    },
+    /// The switch between a child's card and its answer as it came.
+    Raw(usize),
 }
 
 impl RowTarget {
     pub fn index(self) -> usize {
         match self {
-            Self::Item(index) => index,
+            Self::Item(index) | Self::Raw(index) => index,
             Self::Task { child, .. } => child,
         }
     }
@@ -3644,6 +3747,15 @@ pub fn render_tool_content(
             output_source = card.source;
             output_links = card.links;
             (card.lines, false)
+        }
+        Some(ToolOutput::McpCode(output)) => {
+            let (card, truncated) = render_mcp_code(output, highlight, &limits);
+            output_highlights = card.highlights;
+            output_rows = card.rows;
+            output_spans = card.spans;
+            output_source = card.source;
+            output_links = card.links;
+            (card.lines, truncated)
         }
         Some(ToolOutput::Mcp(output)) => {
             let card = mcp_card::render(
@@ -5591,7 +5703,7 @@ mod tests {
                 offset,
                 follow,
             }));
-        let body = child_body(&markdown_entry(COPY_FENCE), false, &limits, None);
+        let body = child_body(&markdown_entry(COPY_FENCE), false, &limits, None, false);
         let source = body.source.expect(COPY_SOURCE_MISSING);
         let provenance = Provenance::new(source.text.into(), source.rows);
         let last = body.lines.len() - 1;
@@ -6114,7 +6226,19 @@ mod tests {
     #[test_case(&[0], 1, &[0, 1] ; "leaves_the_others")]
     fn toggled_views(start: &[usize], index: usize, expected: &[usize]) {
         let views = BatchViews::new(start.iter().copied()).toggled(index);
-        assert_eq!(views.0.as_ref(), expected);
+        assert_eq!(views, BatchViews::new(expected.iter().copied()));
+    }
+
+    /// A child's raw view is its own switch: opening or folding a child keeps
+    /// it, and switching it opens nothing.
+    #[test]
+    fn raw_views_switch_apart_from_the_open_ones() {
+        let views = BatchViews::new([0]).raw_toggled(1);
+        assert!(views.is_open(0) && !views.is_raw(0));
+        assert!(views.is_raw(1) && !views.is_open(1));
+        let folded = views.toggled(0);
+        assert!(!folded.is_open(0) && folded.is_raw(1));
+        assert!(!folded.raw_toggled(1).is_raw(1));
     }
 
     /// A nested batch has its own roster, so the parent's views must not

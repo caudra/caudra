@@ -239,7 +239,6 @@ mod tests {
     use test_case::test_case;
 
     use crate::cancel::CancelToken;
-    use crate::mcp::McpToolMeta;
     use crate::mcp::call::{ElicitRequest, ElicitResponse, Elicitor};
     use crate::mcp::config::LocalExecutionPolicy;
     use crate::mcp::kind::McpServerKind;
@@ -248,7 +247,7 @@ mod tests {
         PROMPTS_LIST_METHOD, TOOLS_CALL_METHOD, TOOLS_LIST_METHOD,
     };
     use crate::mcp::stdio::StdioTransport;
-    use crate::mcp::transport::{BoxFuture, call_tool, list_prompts, list_tools};
+    use crate::mcp::transport::BoxFuture;
 
     const SERVER: &str = "era";
     const PROBE_METHOD: &str = "probe";
@@ -256,10 +255,6 @@ mod tests {
     const DISCOVER_AGAIN_ENV: &str = "DISCOVER_AGAIN";
     const CALL_TIMEOUT: Duration = Duration::from_secs(5);
     const SILENT_TIMEOUT: Duration = Duration::from_secs(1);
-    const EVERYTHING: &str = "everything";
-    const EVERYTHING_PACKAGE: &str = "@modelcontextprotocol/server-everything";
-    const EVERYTHING_TIMEOUT: Duration = Duration::from_secs(60);
-    const ECHO_TOOL: &str = "echo";
     const DISCOVER_RESULT: &str = r#""result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"home-assistant","version":"2026.10"}},"ttlMs":0,"cacheScope":"public"}"#;
     const UNSUPPORTED_WITH_OURS: &str = r#""error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2026-07-28"],"requested":"2026-07-28"}}"#;
     const UNSUPPORTED_WITHOUT_OURS: &str = r#""error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2025-11-25"],"requested":"2026-07-28"}}"#;
@@ -426,41 +421,6 @@ done
                 meta[PROTOCOL_VERSION_META].as_str(),
                 modern.then_some(version)
             );
-            transport.shutdown().await;
-        });
-    }
-
-    #[test]
-    #[ignore = "needs npx and the network"]
-    fn server_everything_works_in_whichever_era_it_speaks() {
-        let transport = StdioTransport::spawn(
-            EVERYTHING,
-            "npx",
-            &["-y".into(), EVERYTHING_PACKAGE.into()],
-            &HashMap::new(),
-            EVERYTHING_TIMEOUT,
-            LocalExecutionPolicy::Embedded,
-            true,
-        )
-        .unwrap();
-        smol::block_on(async {
-            let discovery = connect(&transport, EVERYTHING_TIMEOUT).await.unwrap();
-            let version = transport.era().modern().unwrap_or(LEGACY_PROTOCOL_VERSION);
-            assert_eq!(discovery.protocol_version, version);
-            let tools = list_tools(&transport).await.unwrap();
-            assert!(tools.iter().any(|tool| tool.name == ECHO_TOOL));
-            let output = call_tool(
-                &transport,
-                ECHO_TOOL,
-                &McpToolMeta::default(),
-                discovery.kind(),
-                &json!({"message": EVERYTHING}),
-                &CallScope::none(),
-            )
-            .await
-            .unwrap();
-            assert!(output.model_text().contains(EVERYTHING), "{output:?}");
-            assert!(!list_prompts(&transport).await.unwrap().is_empty());
             transport.shutdown().await;
         });
     }

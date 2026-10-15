@@ -1,12 +1,11 @@
 //! Built-in tools held out of the request array until the model asks for them.
 //!
-//! The mechanism is the one MCP already uses for oversized servers: what is
-//! not declared is listed by name inside a single `tool_search` catalog, and a
-//! search moves it into the array from the next request on. Here the deferred
-//! set is the fixed list in [`caudra_config::DEFERRED_BUILTIN_TOOLS`] rather
-//! than a per-server threshold, because the reason is different: a built-in is
-//! deferred when most sessions never call it, not when there are too many of
-//! them.
+//! What is not declared is listed by name inside a single `tool_search`
+//! catalog, and a search moves it into the array from the next request on.
+//! The deferred set is the fixed list in
+//! [`caudra_config::DEFERRED_BUILTIN_TOOLS`]: a built-in is deferred when most
+//! sessions never call it. MCP tools never pass through here; the `mcp` tool
+//! reaches them without declaring any.
 //!
 //! Deferring costs a prompt-cache prefix each time something loads, so tools
 //! that are one mode of work carry a group and load together. The code graph
@@ -75,25 +74,6 @@ impl ToolSearchRanking {
 
     pub(crate) fn applied(&self) -> bool {
         self.outcome == NoteOutcome::Acted
-    }
-
-    /// Reorders the head of `items` when it still holds the ranked
-    /// candidates in their lexical order, and leaves it alone otherwise.
-    pub(crate) fn reorder<T>(&self, items: &mut Vec<T>, name: impl Fn(&T) -> &str) {
-        let head = self.names.len();
-        if items.len() < head
-            || !items[..head]
-                .iter()
-                .map(&name)
-                .eq(self.names.iter().map(String::as_str))
-        {
-            return;
-        }
-        let mut lexical: Vec<Option<T>> = items.drain(..head).map(Some).collect();
-        items.splice(
-            0..0,
-            self.order.iter().filter_map(|index| lexical[*index].take()),
-        );
     }
 
     /// When the ranked order loads something other than the `lexical` one
@@ -298,9 +278,8 @@ impl DeferredTool {
     }
 }
 
-/// The deferred catalog for one session. Cloning shares the loaded set, the
-/// way [`crate::mcp::McpSession`] does, so a tool loaded inside a batch child
-/// is loaded for the agent that dispatched it.
+/// The deferred catalog for one session. Cloning shares the loaded set, so a
+/// tool loaded inside a batch child is loaded for the agent that dispatched it.
 #[derive(Clone, Default)]
 pub struct DeferralSession {
     deferred: Arc<Vec<DeferredTool>>,
@@ -345,9 +324,9 @@ impl PreparedDeferredSearch<'_> {
 }
 
 impl DeferralSession {
-    /// `history_names` seeds the loaded set the way MCP reseeds from wire
-    /// names: a restored session keeps the tools it had already searched for,
-    /// instead of making the model find them again.
+    /// `history_names` seeds the loaded set: a restored session keeps the
+    /// tools it had already searched for, instead of making the model find
+    /// them again.
     pub fn new(deferred: Vec<DeferredTool>, history_names: impl Iterator<Item = Arc<str>>) -> Self {
         let known: HashSet<&str> = deferred.iter().map(|tool| tool.name.as_ref()).collect();
         let loaded = history_names
@@ -421,7 +400,7 @@ impl DeferralSession {
 
     /// Ranks the deferred tools against `query` and loads every member of the
     /// best match's group. Exact names win over keyword hits, and a name hit
-    /// outranks a description hit, matching MCP's ordering.
+    /// outranks a description hit.
     pub fn search(&self, query: &str) -> Result<SearchOutcome, String> {
         let matches = self.search_matches(query)?;
         Ok(self.load_search_match(query, &matches, None))
@@ -611,13 +590,10 @@ impl DeferralSnapshot {
     }
 }
 
-/// The one entry that stands in for everything deferred, whatever it came
-/// from. Built-ins and MCP each contribute a section, and `run_tool_search`
-/// already answers for both, so the model never has to know which is which.
+/// The one entry that stands in for every deferred built-in.
 ///
-/// A `tool_search` the caller declared itself wins: a plugin or server owning
-/// that name is a real conflict, unlike the two internal sources that share
-/// this entry by design.
+/// A `tool_search` the caller declared itself wins: a plugin owning that name
+/// is a real conflict.
 pub fn push_catalog(tools: &mut Value, sections: &[String]) {
     let Some(array) = tools.as_array_mut() else {
         debug_assert!(false, "tools must be a JSON array");
@@ -1133,26 +1109,6 @@ pub(crate) mod tests {
         let fixture = SearchDecisions::scored(FeatureMode::Enforce, scores, None, false);
         let outcome = ranked_search(&ranked_session(), &fixture.decisions);
         assert_eq!(outcome.loaded[0].as_ref(), first);
-    }
-
-    #[test_case(&[MAP, REFS, LONELY, GRAPH], &[LONELY, MAP, REFS, GRAPH]; "ranked_head_is_reordered")]
-    #[test_case(&[MAP, LONELY, REFS, GRAPH], &[MAP, LONELY, REFS, GRAPH]; "changed_head_is_kept")]
-    #[test_case(&[MAP, REFS], &[MAP, REFS]; "shorter_list_is_kept")]
-    fn reorder_applies_only_to_the_ranked_head(items: &[&str], expected: &[&str]) {
-        let fixture = SearchDecisions::new(FeatureMode::Enforce, THIRD_CANDIDATE, RELEVANT);
-        let definition = json!({"description": SEARCH_QUERY});
-        let ranking = smol::block_on(rank_tool_search(
-            SEARCH_QUERY,
-            [MAP, REFS, LONELY]
-                .map(|name| (name, &definition))
-                .into_iter(),
-            Some(&fixture.decisions),
-            &DecisionContext::default(),
-        ))
-        .unwrap();
-        let mut items = items.to_vec();
-        ranking.reorder(&mut items, |name| *name);
-        assert_eq!(items, expected);
     }
 
     #[test_case(" CODE_MAP ", true; "exact_case_insensitive")]

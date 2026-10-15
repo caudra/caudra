@@ -81,6 +81,7 @@ pub(super) const PROJECT_READ_TOOLS: &[&str] = &[
 pub(super) const TRUSTED_UNSCOPED_TOOLS: &[&str] = &[
     "automation",
     "batch",
+    "mcp",
     "python_execution",
     "question",
     "skill",

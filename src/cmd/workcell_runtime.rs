@@ -1,6 +1,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+use caudra_agent::mcp::code::runner as script_runner;
 use caudra_agent::mcp::config::{http_endpoints, load_global_config};
 use caudra_agent::tools::{RegistryError, ToolRegistry};
 use caudra_agent::workspace_transfer::RemoteRootIdentity;
@@ -29,7 +30,7 @@ use caudra_workcell::host_contract::ShellEnvironmentSelection;
 use caudra_workcell::{
     GuestShellEnvironment, HostError, NamedBearerCredential, RemoteConnectionStatus,
     RemoteHostRegistrationError, RemoteWorkcellClient, RemoteWorkcellError, RemoteWorkcellHost,
-    ShellEnvironmentTarget, WorkcellHost,
+    ShellEnvironmentTarget, WorkcellHost, WorkcellScriptRunner,
 };
 use caudra_workspace::{
     DirectoryNavigation, IdentifierError, SessionBindingId, WorkspaceCapability, WorkspaceError,
@@ -339,6 +340,9 @@ impl WorkcellRuntime {
             features,
         )
         .map_err(WorkcellRuntimeError::Registry)?;
+        script_runner::install(Arc::new(WorkcellScriptRunner::standalone(
+            std::env::var_os(WORKCELL_CODE_WORKER_ENV).map(PathBuf::from),
+        )));
         Ok(Self {
             backend: WorkcellBackend::Remote(host),
             workspace_session: Some(workspace_session),
@@ -364,6 +368,7 @@ impl WorkcellRuntime {
             .map_err(WorkcellRuntimeError::Registry)?;
         caudra_agent::tools::native::register(registry, features)
             .map_err(WorkcellRuntimeError::Registry)?;
+        script_runner::install(Arc::new(host.script_runner()));
         for warning in host.warnings() {
             eprintln!("warning: {warning}");
         }

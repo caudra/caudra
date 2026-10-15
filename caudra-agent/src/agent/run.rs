@@ -65,7 +65,8 @@ use crate::decisions::{
     NoteDraft, NoteOutcome, push_fitting, question_tool_nudge, redact_decision_text,
     redacted_excerpt,
 };
-use crate::mcp::{McpRequestSnapshot, McpSession};
+use crate::mcp::McpSession;
+use crate::mcp::code::catalog;
 use crate::memory::relevance::{Judge, Recall};
 use crate::memory::search::significant_words;
 use crate::memory::store::MemoryStore;
@@ -78,7 +79,8 @@ use crate::tools::native::peers::WORK_NAME;
 use crate::tools::native::plan::{self, PlanTarget};
 use crate::tools::native::skill::{self, SkillInventoryEntry};
 use crate::tools::{
-    BATCH_TOOL_NAME, MEMORY_TOOL_NAME, QUESTION_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME,
+    BATCH_TOOL_NAME, MCP_TOOL_NAME, MEMORY_TOOL_NAME, QUESTION_TOOL_NAME, SKILL_TOOL_NAME,
+    TASK_TOOL_NAME,
 };
 use crate::tools::{BuiltinDeferral, DeferralSession, DeferredTool};
 use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolContext};
@@ -1171,6 +1173,10 @@ impl<'h> Agent<'h> {
             None
         };
         standing.extend(favorites::notice(self.history.as_slice(), favorites));
+        standing.extend(catalog::notice(
+            self.history.as_slice(),
+            self.catalog_mcp(&tool_context).as_ref(),
+        ));
         standing.extend(mode_switch_notice_with_tools(
             self.history.as_slice(),
             &latest.mode,
@@ -1572,6 +1578,23 @@ impl<'h> Agent<'h> {
     /// The conversation with a person, as opposed to a task's own run.
     fn is_main_session(&self) -> bool {
         self.audience.contains(ToolAudience::MAIN) && self.root_tool_use_id.is_none()
+    }
+
+    /// What the `# MCP servers` reminder lists: the agent's MCP view, narrowed only by what holds
+    /// for its whole life, so switching between plan and build never restates it. `None` when
+    /// the agent cannot reach the `mcp` tool.
+    fn catalog_mcp(&self, tool_context: &ToolContext) -> Option<McpSession> {
+        let mcp = self.mcp.clone()?;
+        if !tool_context.tool_available(MCP_TOOL_NAME) {
+            return None;
+        }
+        Some(
+            if self.tool_filter.is_read_only() || self.audience == ToolAudience::RESEARCH_SUB {
+                mcp.narrowed(&ToolFilter::ReadOnly(Box::new(ToolFilter::All)))
+            } else {
+                mcp
+            },
+        )
     }
 
     /// Whether this agent can pick a task's model, which is what makes the
@@ -2191,24 +2214,19 @@ impl<'h> Agent<'h> {
         );
     }
 
-    /// Deferred tools and MCP are recomputed each turn so loads and late
-    /// server connections take effect on the next request.
-    fn request_tools(&self) -> (Cow<'_, Value>, Option<McpRequestSnapshot>) {
-        if self.mcp.is_none() && self.deferral.is_empty() {
-            return (Cow::Borrowed(&self.tools), None);
+    /// Deferred tools are recomputed each turn so loads take effect on the
+    /// next request.
+    fn request_tools(&self) -> Cow<'_, Value> {
+        if self.deferral.is_empty() {
+            return Cow::Borrowed(&self.tools);
         }
         let mut tools = self.tools.clone();
-        let mut sections: Vec<String> = self
+        let sections: Vec<String> = self
             .deferral
             .request_snapshot()
             .extend_declared(&mut tools)
             .into_iter()
             .collect();
-        let snapshot = self.tool_context().mcp.as_ref().map(|mcp| {
-            let snapshot = mcp.request_snapshot();
-            sections.extend(snapshot.extend_declared(&mut tools));
-            snapshot
-        });
         crate::tools::deferral::push_unbound_catalog(
             &mut tools,
             &sections,
@@ -2217,7 +2235,7 @@ impl<'h> Agent<'h> {
                     .local_tools
                     .contains_key(crate::tools::TOOL_SEARCH_TOOL_NAME),
         );
-        (Cow::Owned(tools), snapshot)
+        Cow::Owned(tools)
     }
 
     fn projected_history<'a>(&'a self, tools: &Value) -> Cow<'a, [Message]> {
@@ -2234,7 +2252,6 @@ impl<'h> Agent<'h> {
         readiness: ContextReadiness,
         full_tools: &Value,
         projected_messages: &[Message],
-        mcp: Option<&McpRequestSnapshot>,
     ) {
         let Some(publisher) = &self.context_publisher else {
             return;
@@ -2264,7 +2281,7 @@ impl<'h> Agent<'h> {
                 deferral: BuiltinDeferral::resolve(&self.config, &self.model),
                 deferred: self.deferral.definitions(),
             }),
-            mcp,
+            self.mcp.as_ref(),
         );
         publisher.publish(ContextSnapshot::capture(ContextCapture {
             readiness,
@@ -2286,13 +2303,12 @@ impl<'h> Agent<'h> {
         if self.context_publisher.is_none() {
             return;
         }
-        let (tools, mcp) = self.request_tools();
+        let tools = self.request_tools();
         let provider_history = self.projected_history(tools.as_ref());
         self.publish_context(
             ContextReadiness::PreparedNextRequest,
             tools.as_ref(),
             provider_history.as_ref(),
-            mcp.as_ref(),
         );
     }
 
@@ -2343,14 +2359,13 @@ impl<'h> Agent<'h> {
         });
         let mut stream_retry = mem::take(&mut self.stream_retry);
         let stream_result = {
-            let (tools, mcp) = self.request_tools();
+            let tools = self.request_tools();
             repair_state.register_definitions(tools.as_ref());
             let provider_history = self.projected_history(tools.as_ref());
             self.publish_context(
                 ContextReadiness::CapturedCurrentRequest,
                 tools.as_ref(),
                 provider_history.as_ref(),
-                mcp.as_ref(),
             );
             stream_with_retry(
                 &*self.provider,
@@ -3462,7 +3477,6 @@ impl<'h> Agent<'h> {
         }
         let has_tools = self
             .request_tools()
-            .0
             .as_array()
             .is_some_and(|tools| !tools.is_empty());
         let message = steering::lock(&self.steering).advisory(
@@ -3674,7 +3688,7 @@ impl<'h> Agent<'h> {
     }
 
     fn request_context_size(&self) -> u32 {
-        let (tools, _) = self.request_tools();
+        let tools = self.request_tools();
         let projected = self.projected_history(tools.as_ref());
         let estimated = estimate_context_usage(
             &self.model,
@@ -5631,6 +5645,8 @@ mod tests {
     const TOOL_ROUNDS: u32 = 5;
     const OUTPUT_TOKENS: u32 = 7;
     const TEST_TOOL: &str = "test_tool";
+    const MCP_FETCH_ISSUE: &str = "stub.fetch_issue";
+    const MCP_FETCH_ISSUE_DESCRIPTION: &str = "Fetch a GitHub issue";
     const TEST_TOOL_RESULT: &str = "completed";
     const TEST_TOOL_ERROR: &str = "test command failed";
     const TEST_EDIT_TOOL: &str = "test_edit";
@@ -5711,6 +5727,7 @@ mod tests {
         "<system-reminder>\n# Memory updated\n\n- 7+1 note cache.md: Cache\n</system-reminder>";
     const FAVORITE_SPEC: &str = "anthropic/claude-opus-5-5";
     const FAVORITES_LISTED: &str = "<system-reminder>\n# Model favorites\n\n- `anthropic/claude-opus-5-5`: lane Best\n</system-reminder>";
+    const MCP_SERVERS_LISTED: &str = "<system-reminder>\n# MCP servers\n\n## github\n- list_issues(owner: str)\n</system-reminder>";
     const MENTION_BODY: &str = "<file path=\"a.rs\">fn main() {}</file>";
     /// Standing, not per turn: the block stays in the transcript and the
     /// contract says the most recent one is the one in force.
@@ -6229,6 +6246,7 @@ mod tests {
     struct MockProvider {
         responses: Mutex<Vec<Result<StreamResponse, AgentError>>>,
         captured_tools: Arc<Mutex<Vec<Value>>>,
+        captured_system: Arc<Mutex<Vec<String>>>,
         captured_models: Arc<Mutex<Vec<String>>>,
         captured_messages: Arc<Mutex<Vec<Vec<Message>>>>,
     }
@@ -6337,6 +6355,7 @@ mod tests {
             Self {
                 responses: Mutex::new(responses),
                 captured_tools: Arc::default(),
+                captured_system: Arc::default(),
                 captured_models: Arc::default(),
                 captured_messages: Arc::default(),
             }
@@ -6348,7 +6367,7 @@ mod tests {
             &'a self,
             model: &'a Model,
             messages: &'a [Message],
-            _: &'a str,
+            system: &'a str,
             tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
@@ -6356,6 +6375,7 @@ mod tests {
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 self.captured_tools.lock().unwrap().push(tools.clone());
+                self.captured_system.lock().unwrap().push(system.to_owned());
                 self.captured_models.lock().unwrap().push(model.spec());
                 self.captured_messages
                     .lock()
@@ -8190,6 +8210,8 @@ mod tests {
     #[test_case(vec![turn(), Message::observation(FAVORITES_LISTED.into()), reply(), turn(), reply()], 3, &[1] ; "a_favorites_list_is_restated")]
     #[test_case(vec![turn(), Message::observation(FAVORITES_LISTED.into()), reply(), turn(), Message::observation(crate::prompt::MODEL_FAVORITES_WITHDRAWN_PROMPT.into()), reply()], 3, &[] ; "a_withdrawal_in_the_tail_supersedes")]
     #[test_case(vec![turn(), Message::observation(MEMORY_UPDATED.into()), reply(), turn(), reply()], 3, &[1] ; "a_memory_update_is_restated")]
+    #[test_case(vec![turn(), Message::observation(MCP_SERVERS_LISTED.into()), reply(), turn(), reply()], 3, &[1] ; "an_mcp_server_list_is_restated")]
+    #[test_case(vec![turn(), Message::observation(MCP_SERVERS_LISTED.into()), reply(), turn(), Message::observation(crate::prompt::MCP_SERVERS_WITHDRAWN_PROMPT.into()), reply()], 3, &[] ; "a_withdrawn_server_list_in_the_tail_supersedes")]
     #[test_case(vec![turn(), Message::observation(crate::prompt::AUTOPILOT_ENGAGED_PROMPT.into()), reply(), turn(), reply()], 3, &[1] ; "an_autopilot_notice_is_restated")]
     #[test_case(vec![turn(), Message::observation(crate::prompt::AUTOPILOT_ENGAGED_PROMPT.into()), reply(), turn(), Message::observation(crate::prompt::AUTOPILOT_ENDED_PROMPT.into()), reply()], 3, &[] ; "an_ended_autopilot_in_the_tail_supersedes")]
     fn a_compaction_restates_the_kinds_its_tail_lacks(
@@ -9026,31 +9048,133 @@ mod tests {
         }
     }
 
+    /// Servers reach the model as the `# MCP servers` reminder, never as tool definitions, so
+    /// every request declares the same tools and the list is stated once.
     #[test]
-    fn mcp_definitions_refresh_per_request() {
+    fn mcp_servers_reach_the_model_as_a_reminder_not_as_tools() {
         smol::block_on(async {
             let provider = MockProvider::new(vec![
-                tool_use_response(
-                    crate::tools::TOOL_SEARCH_TOOL_NAME,
-                    serde_json::json!({"query": "fetch issue"}),
-                ),
+                text_response(StopReason::EndTurn),
                 text_response(StopReason::EndTurn),
             ]);
             let captured = Arc::clone(&provider.captured_tools);
             let mut history = History::new(Vec::new());
             let (agent, _event_rx) = make_agent(provider, &mut history);
+            crate::tools::native::register(&agent.registry, agent.config.features).unwrap();
             let mut agent = agent.with_mcp(Some(crate::mcp::stub_session(&[(
-                "srv.fetch_issue",
-                "Fetch a GitHub issue",
+                MCP_FETCH_ISSUE,
+                MCP_FETCH_ISSUE_DESCRIPTION,
             )])));
             agent.run(default_input()).await.unwrap();
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
 
             let captured = captured.lock().unwrap();
             assert_eq!(captured.len(), 2);
-            let first = tool_names(&captured[0]);
-            assert!(first.contains(&crate::tools::TOOL_SEARCH_TOOL_NAME));
-            assert!(!first.contains(&"srv__fetch_issue"));
-            assert!(tool_names(&captured[1]).contains(&"srv__fetch_issue"));
+            assert_eq!(captured[0], captured[1]);
+            assert!(tool_names(&captured[0]).is_empty(), "{}", captured[0]);
+            let catalogs: Vec<&str> = history
+                .as_slice()
+                .iter()
+                .filter_map(Message::user_text)
+                .filter(|text| text.contains(crate::prompt::MCP_SERVERS_MARKER))
+                .collect();
+            assert_eq!(catalogs.len(), 1, "{catalogs:?}");
+            assert!(catalogs[0].contains("fetch_issue("), "{}", catalogs[0]);
+        });
+    }
+
+    /// The request prefix never depends on what the servers offer: the tools and the system
+    /// prompt read the same byte for byte for any catalog, and an `mcp` run loads nothing into
+    /// them, so the provider's prompt cache survives servers coming and going.
+    #[test]
+    fn mcp_state_never_reaches_the_request_prefix() {
+        const OTHER_TOOL: &str = "stub.close_issue";
+        let prefixes = |tools: &[(&str, &str)], responses: Vec<StreamResponse>| {
+            smol::block_on(async {
+                let provider = MockProvider::new(responses);
+                let captured_tools = Arc::clone(&provider.captured_tools);
+                let captured_system = Arc::clone(&provider.captured_system);
+                let mut history = History::new(Vec::new());
+                let (mut agent, _event_rx) = make_agent(provider, &mut history);
+                agent.tools = serde_json::json!([{ "name": MCP_TOOL_NAME }]);
+                crate::tools::native::register(&agent.registry, agent.config.features).unwrap();
+                let mut agent = agent.with_mcp(Some(crate::mcp::stub_session(tools)));
+                agent.run(default_input()).await.unwrap();
+                drop(agent);
+                let tools = captured_tools.lock().unwrap().clone();
+                let system = captured_system.lock().unwrap().clone();
+                tools.into_iter().zip(system).collect::<Vec<_>>()
+            })
+        };
+        let ran = prefixes(
+            &[(MCP_FETCH_ISSUE, MCP_FETCH_ISSUE_DESCRIPTION)],
+            vec![
+                tool_use_response(MCP_TOOL_NAME, serde_json::json!({ "code": "1" })),
+                text_response(StopReason::EndTurn),
+            ],
+        );
+        let other = prefixes(
+            &[
+                (MCP_FETCH_ISSUE, OTHER_TOOL),
+                (OTHER_TOOL, MCP_FETCH_ISSUE_DESCRIPTION),
+            ],
+            vec![text_response(StopReason::EndTurn)],
+        );
+        assert_eq!(ran.len(), 2);
+        assert_eq!(tool_names(&ran[0].0), [MCP_TOOL_NAME]);
+        assert_eq!(ran[0], ran[1]);
+        assert_eq!(ran[0], other[0]);
+    }
+
+    /// A conversation from before code mode keeps its direct MCP calls: they reach the model as
+    /// they were made, paired with their results, though no tool by that name is declared now.
+    #[test]
+    fn a_direct_mcp_call_from_before_code_mode_reaches_the_model_unchanged() {
+        const LEGACY_CALL: &str = "stub__fetch_issue";
+        smol::block_on(async {
+            let legacy = vec![
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::tool_use(
+                        RESUME_TOOL_ID,
+                        LEGACY_CALL,
+                        json!({}),
+                    )],
+                    ..Message::default()
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: RESUME_TOOL_ID.into(),
+                        content: MCP_FETCH_ISSUE_DESCRIPTION.into(),
+                        is_error: false,
+                        output_ref: None,
+                    }],
+                    ..Message::default()
+                },
+            ];
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let requests = Arc::clone(&provider.captured_messages);
+            let captured_tools = Arc::clone(&provider.captured_tools);
+            let mut history = History::new(legacy.clone());
+            let (mut agent, _events) = make_agent(provider, &mut history);
+            agent.tools = json!([{ "name": MCP_TOOL_NAME }]);
+            let mut agent = agent.with_mcp(Some(crate::mcp::stub_session(&[(
+                MCP_FETCH_ISSUE,
+                MCP_FETCH_ISSUE_DESCRIPTION,
+            )])));
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+            let requests = requests.lock().unwrap();
+            assert_eq!(
+                serde_json::to_value(&requests[0][..legacy.len()]).unwrap(),
+                serde_json::to_value(&legacy).unwrap()
+            );
+            assert_eq!(
+                tool_names(&captured_tools.lock().unwrap()[0]),
+                [MCP_TOOL_NAME]
+            );
         });
     }
 

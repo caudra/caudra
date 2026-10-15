@@ -45,9 +45,9 @@ use caudra_agent::{
     SpanStyle, SubagentActivity, SubagentProgress, TaskCard, ToolInput, ToolOutput,
     format_live_duration, format_settled_duration, mcp_tool_parts, pretty_json,
     tools::{
-        FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, IMAGE_GENERATE_TOOL_NAME, MEMORY_TOOL_NAME,
-        PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME,
-        humanize_duration, timeout_annotation,
+        FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, IMAGE_GENERATE_TOOL_NAME, MCP_TOOL_NAME,
+        MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME,
+        TOOL_OUTPUT_TOOL_NAME, humanize_duration, timeout_annotation,
     },
 };
 use caudra_workcell::{CURRENT_WORKDIR, effective_timeout, requested_workdir};
@@ -355,6 +355,7 @@ const SHELL_COMMAND_KEY: &str = "command";
 const LIVE_SCRIPT_TOOLS: &[(&str, bool)] = &[
     (SHELL_TOOL_NAME, true),
     (PYTHON_EXECUTION_TOOL_NAME, true),
+    (MCP_TOOL_NAME, true),
     (IMAGE_GENERATE_TOOL_NAME, false),
 ];
 /// A delegation is the one member whose live body is not what its settled card
@@ -375,6 +376,7 @@ const DRAFTING_LABELS: &[(&str, &str)] = &[
     (IMAGE_GENERATE_TOOL_NAME, WRITING_PROMPT),
     (SHELL_TOOL_NAME, WRITING_COMMAND),
     (PYTHON_EXECUTION_TOOL_NAME, WRITING_SCRIPT),
+    (MCP_TOOL_NAME, WRITING_SCRIPT),
     (TASK_TOOL_NAME, WRITING_BRIEF),
 ];
 /// What any call whose permission prompt is open is doing.
@@ -870,6 +872,15 @@ pub(super) fn inflected_header<'a>(tool: &str, header: &'a str, tense: Tense) ->
     match rest.is_empty() {
         true => Cow::Borrowed(conjugated),
         false => Cow::Owned(format!("{conjugated} {rest}")),
+    }
+}
+
+/// What the switch between an MCP answer's card and its data says: which view
+/// is up, and what a click turns it into.
+pub(super) fn raw_toggle_label(raw: bool) -> String {
+    match raw {
+        true => format!("{RAW_VIEW_LABEL}{FOOTER_SEPARATOR}{CARD_AFFORDANCE}"),
+        false => RAW_AFFORDANCE.to_owned(),
     }
 }
 
@@ -2251,13 +2262,9 @@ impl ToolLineBuilder {
     /// The switch between an MCP answer's card and its data, on a row of its
     /// own that the hit test finds by its affordance.
     fn push_mcp_raw_toggle(&mut self, raw: bool) {
-        let label = match raw {
-            true => format!("{RAW_VIEW_LABEL}{FOOTER_SEPARATOR}{CARD_AFFORDANCE}"),
-            false => RAW_AFFORDANCE.to_owned(),
-        };
         self.raw_toggle_line = Some(self.lines.len());
         self.lines.push(Line::from(Span::styled(
-            format!("{}{label}", self.body_indent),
+            format!("{}{}", self.body_indent, raw_toggle_label(raw)),
             theme::current().tool_dim,
         )));
     }

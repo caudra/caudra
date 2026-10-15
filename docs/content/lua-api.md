@@ -999,10 +999,9 @@ and tool set.
   - `name` (`string?`) display name for logs and UI.
   - `task_id` (`string?`) completed task to continue with its existing history.
   - `audience` (`string?`) tool audience for capability gating. Default: `"general_sub"`.
-  - `mcp` (`boolean?`) give the session access to MCP tools. Their
-    definitions are injected automatically each turn (deferred behind
-    `tool_search`), so don't put MCP definitions in `tools`. The session
-    starts with no loaded tools of its own. Default: `true`.
+  - `mcp` (`boolean?`) give the session access to your MCP servers. The
+    model calls them from Python through the `mcp` tool, so keep `mcp` in
+    `tools`. Default: `true`.
   - `thinking` (`string|integer?`) thinking mode: `"off"`, `"adaptive"`, an
     effort level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
     `"max"`), or a budget integer (token count). Inherits parent setting

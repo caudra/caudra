@@ -7,6 +7,7 @@ mod native_redirect;
 mod pattern_analysis;
 mod read_only_shell;
 mod remote;
+mod script_runner;
 mod shell_environment;
 mod shell_glob;
 mod shell_record_scope;
@@ -29,6 +30,7 @@ pub use remote::{
     RemotePreparedToolCall, RemoteToolResultEnvelope, RemoteWorkcellClient, RemoteWorkcellError,
 };
 use remote::{RemoteToolExecutionError, STALE_RESOURCE_CODE};
+pub use script_runner::WorkcellScriptRunner;
 pub use shell_environment::{GuestShellEnvironment, ShellEnvironmentTarget};
 use shell_environment::{forwarded_summary, local_shell_environment};
 pub use transfer::LocalTransferPublisher;
@@ -153,6 +155,12 @@ pub const NATIVE_TOOL_NAMES: &[&str] = &[
 ];
 const CODE_WORKER_UNAVAILABLE: &str =
     "Workcell python_execution is unavailable: no code worker path was supplied";
+/// MCP code mode runs its snippets on the same worker, so a startup warning names both.
+const CODE_WORKER_WARNING: &str =
+    "Workcell python_execution and MCP code mode (the mcp tool) are unavailable";
+const NO_CODE_WORKER_PATH: &str = "no code worker path was supplied";
+const CODE_WORKER_INIT_FAILED: &str = "code worker initialization failed";
+const CODE_WORKER_NO_CACHE: &str = "no cache directory for the code worker";
 const SHELL_CANCELLED: &str = "Shell execution cancelled";
 const CODE_CANCELLED: &str = "Code execution cancelled";
 /// Every way a snippet can end, so a remote result's outcome is read by the
@@ -464,12 +472,12 @@ impl WorkcellHost {
             Some(Ok(code)) => Some(Arc::new(code)),
             Some(Err(error)) => {
                 warnings.push(format!(
-                    "Workcell python_execution is unavailable: code worker initialization failed: {error}"
+                    "{CODE_WORKER_WARNING}: {CODE_WORKER_INIT_FAILED}: {error}"
                 ));
                 None
             }
             None => {
-                warnings.push(CODE_WORKER_UNAVAILABLE.to_owned());
+                warnings.push(format!("{CODE_WORKER_WARNING}: {NO_CODE_WORKER_PATH}"));
                 None
             }
         };
@@ -529,7 +537,7 @@ impl WorkcellHost {
                 host.reserve_code = true;
                 host.warnings.clear();
                 host.warnings.push(format!(
-                    "Workcell python_execution cache is unavailable: {error}"
+                    "{CODE_WORKER_WARNING}: {CODE_WORKER_NO_CACHE}: {error}"
                 ));
                 Ok(host)
             }
@@ -538,6 +546,11 @@ impl WorkcellHost {
 
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+
+    /// Runs `mcp` snippets on this host's runtime and worker pool.
+    pub fn script_runner(&self) -> WorkcellScriptRunner {
+        WorkcellScriptRunner::embedded(Arc::clone(&self.inner))
     }
 
     /// The change records of the session directory `cwd`, kept beneath
@@ -5004,6 +5017,7 @@ mod tests {
     use caudra_agent::background::{BackgroundTasks, JobScope, ShellLive};
     use caudra_agent::cancel::CancelToken;
     use caudra_agent::decisions::{Decisions, MAX_RERANK_BATCH, reordered_note};
+    use caudra_agent::mcp::code::runner::ScriptRunner;
     use caudra_agent::permissions::pattern_recognition::{CommandObservation, ShellEffectStatus};
     use caudra_agent::permissions::{
         AutoNote, COMMAND_EXACT_PREFIX, COMMAND_TEMPLATE_PREFIX, ComposedRow, PermissionAnswer,
@@ -8971,9 +8985,11 @@ mod tests {
         assert_eq!(registry.iter().len(), NATIVE_TOOL_NAMES.len() - 1);
         assert!(
             host.warnings()
-                .iter()
-                .any(|warning| warning.contains("python_execution"))
+                .contains(&format!("{CODE_WORKER_WARNING}: {NO_CODE_WORKER_PATH}")),
+            "{:?}",
+            host.warnings()
         );
+        assert!(host.script_runner().unavailable().is_some());
     }
 
     #[test]
@@ -10002,10 +10018,13 @@ mod tests {
 
         assert_eq!(registry.iter().len(), NATIVE_TOOL_NAMES.len());
         assert!(registry.get("python_execution").is_some());
+        let failed = format!("{CODE_WORKER_WARNING}: {CODE_WORKER_INIT_FAILED}: ");
         assert!(
             host.warnings()
                 .iter()
-                .any(|warning| warning.contains("python_execution"))
+                .any(|warning| warning.starts_with(&failed)),
+            "{:?}",
+            host.warnings()
         );
     }
 

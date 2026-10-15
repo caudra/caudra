@@ -21,11 +21,14 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros"] }
 tokio-util.workspace = true
+tree-sitter.workspace = true
+tree-sitter-python.workspace = true
 workcell-tool-contract.workspace = true
 workcell-monty-worker = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+test-case.workspace = true
 
 [lints]
 workspace = true

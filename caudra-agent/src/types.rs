@@ -35,6 +35,7 @@ use crate::autopilot::{
     AutopilotDecision, DecisionKind, DecisionOutcome, EngagementSpend, StoodDown,
 };
 use crate::decisions::DecisionNote;
+use crate::mcp::code::output::{McpCodeOutput, McpCodeProgressEvent};
 use crate::mcp::kind::McpServerKind;
 use crate::mcp::output::McpOutput;
 use crate::peers::{
@@ -2005,6 +2006,8 @@ pub enum ToolOutput {
     Peers(PeerOutput),
     /// An MCP tool's answer, block by block.
     Mcp(McpOutput),
+    /// An `mcp` snippet: its code, every server call it made, and how it ended.
+    McpCode(McpCodeOutput),
 }
 
 /// How far a search reached before a bound stopped it. Both counts are lower
@@ -2145,6 +2148,7 @@ impl ToolOutput {
             Self::Tasks(cards) => Some(counted(cards.len(), "task")),
             Self::Environment { headline, .. } => Some(headline.clone()),
             Self::Mcp(output) => output.annotation(),
+            Self::McpCode(output) => output.annotation(),
             _ => None,
         }
     }
@@ -2241,6 +2245,7 @@ impl ToolOutput {
             | Self::Environment { .. }
             | Self::WorkflowRun(_)
             | Self::Mcp(_)
+            | Self::McpCode(_)
             | Self::Tasks(_) => Some(self.as_display_text()),
             _ => None,
         }
@@ -2276,6 +2281,7 @@ impl ToolOutput {
             Self::Skill(skill) => skill.model_text(),
             Self::Peers(output) => output.model_text(),
             Self::Mcp(output) => output.model_text(),
+            Self::McpCode(output) => output.model_text(),
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => {
                 let mut out = t.text.clone();
                 if let Some(blocks) = &t.instructions {
@@ -2306,6 +2312,7 @@ impl ToolOutput {
         match self {
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.text.clone(),
             Self::Mcp(output) => output.display_text(),
+            Self::McpCode(output) => output.model_text(),
             Self::CodeGraph {
                 headline,
                 rows,
@@ -2847,6 +2854,7 @@ pub enum AgentEvent {
     },
     ToolDone(Box<ToolDoneEvent>),
     BatchProgress(Box<BatchProgressEvent>),
+    McpCodeProgress(Box<McpCodeProgressEvent>),
     Question(Box<QuestionEvent>),
     /// The form this agent opened will never be answered: the server withdrew
     /// it, or the call that asked ended. A front end closes it.

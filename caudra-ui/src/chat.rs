@@ -269,6 +269,11 @@ impl Chat {
                     return ChatEventResult::PlanWritten(plan);
                 }
             }
+            AgentEvent::McpCodeProgress(e) => {
+                let e = *e;
+                self.messages_panel
+                    .mcp_code_progress(&e.id, e.index, e.call);
+            }
             AgentEvent::ToolDone(mut e) => {
                 if let ToolOutput::TodoList(items) = &e.output {
                     self.todos.clone_from(items);

@@ -104,18 +104,6 @@ pub const REGIONS: &[Region] = &[
                 heading: None,
                 paths: &[mcp::STDIO_SERVER, mcp::HTTP_SERVER],
             }],
-            footer: false,
-        },
-    },
-    Region {
-        page: "mcp",
-        name: "mcp-top-level",
-        source: Source::Keys {
-            file: &files::MCP,
-            tables: &[RegionTable {
-                heading: None,
-                paths: &[TOP_LEVEL],
-            }],
             footer: true,
         },
     },

@@ -37,6 +37,7 @@ use caudra_agent::automation::frontend::wake_origin;
 use caudra_agent::background::BackgroundTransition;
 use caudra_agent::command::CustomCommand;
 use caudra_agent::config_watch::ConfigSource;
+use caudra_agent::mcp::code::runner as code_runner;
 use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::{
     BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile,
@@ -1904,6 +1905,14 @@ impl<'t> EventLoop<'t> {
         if !ctx.mcp_config_errors.is_empty() {
             let msg = format!("MCP config error: {}", ctx.mcp_config_errors);
             app.flash(msg);
+        }
+        if ctx
+            .mcp_handle
+            .as_ref()
+            .is_some_and(McpHandle::has_enabled_server)
+            && let Some(reason) = code_runner::unavailable()
+        {
+            app.flash(reason);
         }
         for w in startup_warnings {
             app.flash(w);

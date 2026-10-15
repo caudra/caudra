@@ -225,6 +225,18 @@ class MakeTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual([r["kind"] for r in self.records()], ["worker"])
 
+    def test_mcp_server_tests_require_the_worker_and_forward_arguments(self):
+        result = self.run_make("test-mcp-servers", "ARGS=-E 'test(everything)'")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = self.records()
+        self.assertCountEqual([r["kind"] for r in records], ["worker", "python"])
+        [script] = [r for r in records if r["kind"] == "python"]
+        self.assertEqual(
+            script["args"],
+            ["scripts/mcp-servers.py", "test", "-E", "test(everything)"],
+        )
+        self.assertEqual(script["required"], "1")
+
     def test_run_preserves_cargo_separator_and_quoted_arguments(self):
         result = self.run_make("run", "ARGS=-- auth login --label 'two words'")
         self.assertEqual(result.returncode, 0, result.stderr)

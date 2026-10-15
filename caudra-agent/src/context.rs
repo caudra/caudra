@@ -11,20 +11,22 @@ use serde_json::Value;
 
 use crate::AgentMode;
 use crate::agent::{compaction_reserve, estimate_message_tokens};
-use crate::mcp::{McpRequestSnapshot, McpToolStatus};
+use crate::mcp::{McpSession, McpToolStatus};
 use crate::memory::tree::Block;
 use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog, TaskProfileBindings};
 use crate::tools::TOOL_SEARCH_TOOL_NAME;
 use crate::tools::native::{memory, skill};
 use crate::tools::{
-    BuiltinDeferral, DeferredTool, DescriptionContext, MEMORY_TOOL_NAME, SKILL_TOOL_NAME,
-    TASK_TOOL_NAME, ToolAudience, ToolFilter, ToolRegistry, ToolState, builtin_report,
+    BuiltinDeferral, DeferredTool, DescriptionContext, MCP_TOOL_NAME, MEMORY_TOOL_NAME,
+    SKILL_TOOL_NAME, TASK_TOOL_NAME, ToolAudience, ToolFilter, ToolRegistry, ToolState,
+    builtin_report,
 };
 
 const MEMORY_READ_COMMAND: &str = "read";
 const BILLED_TO_PROFILES: &str = "profiles";
 const BILLED_TO_MEMORY: &str = "memory";
 const BILLED_TO_SKILLS: &str = "skills";
+const BILLED_TO_MCP: &str = "MCP";
 const REQUEST_UNAVAILABLE: &str = "unavailable in this request";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -268,25 +270,27 @@ impl ContextSkillInventory {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ContextMcpStatus {
-    LoadedOrEager,
-    AvailableOnDemand,
+    /// Callable from the `mcp` tool, and in the server catalog when its budget allows.
+    Available,
+    /// Kept out of the catalog by the profile; a snippet still finds it with `search()`.
+    SearchOnly,
     Disabled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextMcpTool {
     pub qualified_name: String,
-    pub wire_name: String,
     pub server: String,
     pub status: ContextMcpStatus,
     pub reason: Option<&'static str>,
-    pub request_tokens: u32,
 }
 
+/// Server tools never reach the request array: the `mcp` tool's one definition is all they cost
+/// there, and that is `request_tokens`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextMcpInventory {
     pub tools: Vec<ContextMcpTool>,
-    pub unattributed_tokens: u32,
+    pub request_tokens: u32,
 }
 
 impl ContextMcpInventory {
@@ -295,17 +299,15 @@ impl ContextMcpInventory {
             .into_iter()
             .map(|status| ContextMcpTool {
                 qualified_name: status.qualified_name,
-                wire_name: status.wire_name,
                 server: status.server,
                 reason: status.reason,
                 status: if status.disabled {
                     ContextMcpStatus::Disabled
-                } else if status.deferred {
-                    ContextMcpStatus::AvailableOnDemand
+                } else if status.search_only {
+                    ContextMcpStatus::SearchOnly
                 } else {
-                    ContextMcpStatus::LoadedOrEager
+                    ContextMcpStatus::Available
                 },
-                request_tokens: 0,
             })
             .collect::<Vec<_>>();
         tools.sort_by(|left, right| {
@@ -318,14 +320,6 @@ impl ContextMcpInventory {
             tools,
             ..Self::default()
         }
-    }
-
-    pub fn request_tokens(&self) -> u32 {
-        self.tools
-            .iter()
-            .map(|tool| tool.request_tokens)
-            .chain([self.unattributed_tokens])
-            .fold(0, u32::saturating_add)
     }
 }
 
@@ -353,9 +347,8 @@ pub struct ContextBuiltinTool {
     pub billed_to: Option<&'static str>,
 }
 
-/// `catalog_tokens` is the one `tool_search` entry. It stands in for the
-/// deferred built-ins and the deferred MCP tools together, so it belongs to
-/// neither inventory alone and is counted here.
+/// `catalog_tokens` is the one `tool_search` entry, which stands in for the
+/// deferred built-ins.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextBuiltinInventory {
     pub tools: Vec<ContextBuiltinTool>,
@@ -479,7 +472,7 @@ impl ContextInventory {
         task_profiles: &TaskProfileBindings,
         active_profile: Option<&str>,
         builtins: Option<&BuiltinToolsInput<'_>>,
-        mcp: Option<&McpRequestSnapshot>,
+        mcp: Option<&McpSession>,
     ) -> Self {
         let available = task_profiles
             .available()
@@ -530,7 +523,7 @@ impl ContextInventory {
             })
             .collect();
         let mcp = mcp
-            .map(McpRequestSnapshot::tool_inventory)
+            .map(McpSession::tool_inventory)
             .map(ContextMcpInventory::from_statuses)
             .unwrap_or_default();
 
@@ -659,7 +652,6 @@ struct RequestAccounting {
     skill_results: BTreeMap<String, u32>,
     builtin_definitions: Vec<BuiltinDefinition>,
     system_unattributed: u32,
-    mcp_definitions: Vec<(String, u32)>,
 }
 
 #[derive(Default)]
@@ -671,7 +663,6 @@ struct ToolAccounting {
     skills: u32,
     builtin_definitions: Vec<BuiltinDefinition>,
     system_unattributed: u32,
-    mcp_definitions: Vec<(String, u32)>,
 }
 
 /// One built-in definition the request array carries, and the category its
@@ -697,7 +688,8 @@ impl ToolCategory {
     /// built-in section can name it rather than repeat the charge.
     fn billed_to(self) -> Option<&'static str> {
         match self {
-            Self::System | Self::Mcp => None,
+            Self::System => None,
+            Self::Mcp => Some(BILLED_TO_MCP),
             Self::Profiles => Some(BILLED_TO_PROFILES),
             Self::Memory => Some(BILLED_TO_MEMORY),
             Self::Skills => Some(BILLED_TO_SKILLS),
@@ -756,7 +748,6 @@ fn account_request(
         skill_results: messages.skill_results,
         builtin_definitions: tools.builtin_definitions,
         system_unattributed: tools.system_unattributed,
-        mcp_definitions: tools.mcp_definitions,
     }
 }
 
@@ -791,9 +782,8 @@ fn account_tools(base_tools: &Value, full_tools: &Value) -> ToolAccounting {
                 TASK_TOOL_NAME => ToolCategory::Profiles,
                 MEMORY_TOOL_NAME => ToolCategory::Memory,
                 SKILL_TOOL_NAME => ToolCategory::Skills,
-                _ if own_names.contains(name) => ToolCategory::System,
-                TOOL_SEARCH_TOOL_NAME => ToolCategory::System,
-                _ => ToolCategory::Mcp,
+                MCP_TOOL_NAME => ToolCategory::Mcp,
+                _ => ToolCategory::System,
             };
             ToolContribution {
                 name: name.to_owned(),
@@ -825,12 +815,7 @@ fn account_tools(base_tools: &Value, full_tools: &Value) -> ToolAccounting {
                     billed_to: None,
                 });
             }
-            ToolCategory::Mcp => {
-                add_tokens(&mut accounting.mcp, contribution.tokens);
-                accounting
-                    .mcp_definitions
-                    .push((contribution.name, contribution.tokens));
-            }
+            ToolCategory::Mcp => add_tokens(&mut accounting.mcp, contribution.tokens),
             ToolCategory::Profiles => add_tokens(&mut accounting.profiles, contribution.tokens),
             ToolCategory::Memory => add_tokens(&mut accounting.memory, contribution.tokens),
             ToolCategory::Skills => add_tokens(&mut accounting.skills, contribution.tokens),
@@ -944,24 +929,7 @@ impl ContextInventory {
             &accounting.builtin_definitions,
             accounting.system_unattributed,
         );
-        self.mcp.apply_request_tokens(&accounting.mcp_definitions);
-    }
-}
-
-impl ContextMcpInventory {
-    fn apply_request_tokens(&mut self, definitions: &[(String, u32)]) {
-        self.unattributed_tokens = 0;
-        for tool in &mut self.tools {
-            tool.request_tokens = 0;
-        }
-
-        for (name, tokens) in definitions {
-            if let Some(tool) = self.tools.iter_mut().find(|tool| tool.wire_name == *name) {
-                add_tokens(&mut tool.request_tokens, *tokens);
-            } else {
-                add_tokens(&mut self.unattributed_tokens, *tokens);
-            }
-        }
+        self.mcp.request_tokens = accounting.usage.mcp_tools;
     }
 }
 
@@ -1109,9 +1077,9 @@ mod tests {
     const EARLY_RESULT: &str = "result before its tool use";
     const TASK_A: &str = "task-a";
     const TASK_B: &str = "task-b";
-    const LOADED_MCP: &str = "issues__fetch";
-    const DEFERRED_MCP: &str = "search__query";
-    const DISABLED_MCP: &str = "admin__delete";
+    const AVAILABLE_MCP: &str = "issues.fetch";
+    const SEARCH_ONLY_MCP: &str = "search.query";
+    const DISABLED_MCP: &str = "admin.delete";
     const TEST_WINDOW: u32 = 200_000;
     /// Below every reserve the cases expect, so they measure the percentage.
     const SMALL_REPLY_ALLOWANCE: u32 = 8_192;
@@ -1173,18 +1141,12 @@ mod tests {
         );
     }
 
-    fn mcp_status(
-        qualified_name: &str,
-        wire_name: &str,
-        disabled: bool,
-        deferred: bool,
-    ) -> McpToolStatus {
+    fn mcp_status(qualified_name: &str, disabled: bool, search_only: bool) -> McpToolStatus {
         McpToolStatus {
             qualified_name: qualified_name.to_owned(),
-            wire_name: wire_name.to_owned(),
             server: qualified_name.split_once('.').unwrap().0.to_owned(),
             disabled,
-            deferred,
+            search_only,
             reason: None,
         }
     }
@@ -1398,13 +1360,14 @@ mod tests {
             definition("file_read", "Read a file"),
             definition(TASK_TOOL_NAME, "Profiles: builtin and review"),
             definition(MEMORY_TOOL_NAME, "Read memory on demand"),
-            definition(SKILL_TOOL_NAME, "Skills: deploy")
+            definition(SKILL_TOOL_NAME, "Skills: deploy"),
+            definition(MCP_TOOL_NAME, "Run Python that calls MCP servers")
         ]);
         let mut full_tools = base_tools.clone();
-        full_tools.as_array_mut().unwrap().extend([
-            definition(LOADED_MCP, "Fetch an issue"),
-            definition(TOOL_SEARCH_TOOL_NAME, "Deferred tools:\nsearch: query"),
-        ]);
+        full_tools.as_array_mut().unwrap().push(definition(
+            TOOL_SEARCH_TOOL_NAME,
+            "Deferred tools:\nsearch: query",
+        ));
         let inventory = ContextInventory {
             memory: ContextMemoryInventory {
                 files: vec![ContextMemoryFile {
@@ -1422,9 +1385,9 @@ mod tests {
                 ..ContextSkillInventory::default()
             },
             mcp: ContextMcpInventory::from_statuses(vec![
-                mcp_status("issues.fetch", LOADED_MCP, false, false),
-                mcp_status("search.query", DEFERRED_MCP, false, true),
-                mcp_status("admin.delete", DISABLED_MCP, true, false),
+                mcp_status(AVAILABLE_MCP, false, false),
+                mcp_status(SEARCH_ONLY_MCP, false, true),
+                mcp_status(DISABLED_MCP, true, false),
             ]),
             ..ContextInventory::default()
         };
@@ -1551,36 +1514,35 @@ mod tests {
             snapshot.inventory.skills.skills[0].loaded_tokens,
             estimate_tokens_cached(SKILL_RESULT)
         );
+        assert!(snapshot.usage.mcp_tools > 0);
         assert_eq!(
-            snapshot.inventory.mcp.request_tokens(),
+            snapshot.inventory.mcp.request_tokens,
             snapshot.usage.mcp_tools
         );
-        assert_eq!(snapshot.inventory.mcp.unattributed_tokens, 0);
-        assert!(snapshot.inventory.builtins.catalog_tokens > 0);
-        let loaded = snapshot
+        let gateway = snapshot
+            .inventory
+            .builtins
+            .tools
+            .iter()
+            .find(|tool| tool.name == MCP_TOOL_NAME)
+            .expect("the `mcp` tool is inventoried as a built-in");
+        assert_eq!(gateway.billed_to, Some(BILLED_TO_MCP));
+        assert_eq!(gateway.tokens, snapshot.usage.mcp_tools);
+        let statuses: Vec<_> = snapshot
             .inventory
             .mcp
             .tools
             .iter()
-            .find(|tool| tool.wire_name == LOADED_MCP)
-            .unwrap();
-        let deferred = snapshot
-            .inventory
-            .mcp
-            .tools
-            .iter()
-            .find(|tool| tool.wire_name == DEFERRED_MCP)
-            .unwrap();
-        let disabled = snapshot
-            .inventory
-            .mcp
-            .tools
-            .iter()
-            .find(|tool| tool.wire_name == DISABLED_MCP)
-            .unwrap();
-        assert!(loaded.request_tokens > 0);
-        assert_eq!(deferred.request_tokens, 0);
-        assert_eq!(disabled.request_tokens, 0);
+            .map(|tool| (tool.qualified_name.as_str(), tool.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                (AVAILABLE_MCP, ContextMcpStatus::Available),
+                (SEARCH_ONLY_MCP, ContextMcpStatus::SearchOnly),
+                (DISABLED_MCP, ContextMcpStatus::Disabled),
+            ]
+        );
     }
 
     #[test_case("file_read"; "native")]
@@ -1589,12 +1551,10 @@ mod tests {
     fn lazy_own_definitions_keep_source_attribution(name: &str) {
         let own_definition = definition(name, "Deferred lookup");
         let sources = json!([own_definition]);
-        let full = json!([own_definition, definition(LOADED_MCP, "MCP lookup")]);
+        let full = json!([own_definition]);
         let accounted = account_tools(&sources, &full);
         assert_eq!(accounted.builtin_definitions[0].name, name);
-        assert_eq!(accounted.mcp_definitions.len(), 1);
-        assert_eq!(accounted.mcp_definitions[0].0, LOADED_MCP);
-        assert_eq!(accounted.system + accounted.mcp, value_tokens(&full));
+        assert_eq!(accounted.system, value_tokens(&full));
     }
 
     /// The reconciliation grows with the tool count, so a request carrying

@@ -328,7 +328,9 @@ Before a tool call that may change files, Caudra records what the call can chang
 | File tools | The paths they write |
 | Shell lines that only read, such as `git status`, `rg`, or `ls` | Nothing |
 | Shell lines whose writes are all literal paths | The paths that `rm`, `mv`, `cp`, `touch`, `mkdir`, `ln`, `tee`, and `sed -i` change, and the targets of output redirects |
-| Other shell lines, MCP tools, and plugin tools | The whole session directory |
+| Other shell lines and plugin tools | The whole session directory |
+| [`mcp`](/docs/mcp/#code-mode) runs | The whole session directory, from the first server call that may change files to the end of the run |
+| `mcp` runs that call no server, or only tools a recognised server marks read-only, as in plan mode and read-only agents | Nothing |
 
 A glob, a variable, a heredoc, an unlisted option, or any other program sends a shell line to the whole directory. `cp` and `ln` record only the destination, and `mv` or `cp` into a directory records that whole directory. Paths outside the session directory are not recorded. Your own edits, including `!` commands from the composer, get no record of their own.
 

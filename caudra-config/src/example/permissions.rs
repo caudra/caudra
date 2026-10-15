@@ -13,7 +13,7 @@ const PROJECT_SCOPE: &str = "A project .caudra/permissions.toml adds rules of it
 const FAILS_CLOSED: &str = "A file that is unreadable, malformed, or newer than this build fails \
      closed: Caudra denies tool calls until you fix it.";
 const MCP_ABOUT: &str = "Each [mcp.SERVER] table holds the rules for the tools of one MCP server, \
-     such as [mcp.github] here. Name each tool as the server does, without the `github__` prefix.";
+     such as [mcp.github] here. Name each tool as the server does, without the `github.` prefix.";
 
 /// Every `permissions.toml` key, with example `[TOOL]` and `[mcp.SERVER]`
 /// tables.

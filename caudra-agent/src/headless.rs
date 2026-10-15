@@ -1610,18 +1610,14 @@ fn tool_definitions(
 fn advertised_tool_names(
     tools: &Value,
     deferred: &[DeferredTool],
-    mcp: Option<&McpSession>,
     local_search_binding: bool,
 ) -> Vec<String> {
     let mut probe = tools.clone();
-    let mut sections: Vec<String> = DeferralSession::new(deferred.to_vec(), std::iter::empty())
+    let sections: Vec<String> = DeferralSession::new(deferred.to_vec(), std::iter::empty())
         .request_snapshot()
         .extend_declared(&mut probe)
         .into_iter()
         .collect();
-    if let Some(mcp) = mcp {
-        sections.extend(mcp.request_snapshot().extend_declared(&mut probe));
-    }
     crate::tools::deferral::push_unbound_catalog(
         &mut probe,
         &sections,
@@ -1708,12 +1704,8 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
         false,
         false,
     );
-    let mcp_instructions = params
-        .mcp_handle
-        .as_ref()
-        .and_then(|handle| crate::prompt::running_mcp_instructions(&handle.reader().load()));
     params.prompt_slots = crate::tools::execution::execution_slots(
-        &params.prompt_slots.with_mcp_instructions(mcp_instructions),
+        &params.prompt_slots,
         &params.config,
         false,
         false,
@@ -1741,7 +1733,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
             .with_disabled_tools(&params.config.disabled_tools)
             .with_actor_policy(Arc::clone(&profile_tool_policy))
     });
-    let tool_names = advertised_tool_names(&tools, &deferred, mcp.as_ref(), false);
+    let tool_names = advertised_tool_names(&tools, &deferred, false);
     let memory_store = memory.store().cloned();
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
@@ -3312,7 +3304,6 @@ async fn spawn_prepared_session(
     let tool_names = advertised_tool_names(
         &tools,
         &deferred,
-        mcp.as_ref(),
         params
             .local_tools
             .contains_key(crate::tools::TOOL_SEARCH_TOOL_NAME),
@@ -4433,11 +4424,8 @@ async fn spawn_prepared_session(
                     background.is_some(),
                 );
                 let live_tool_filter = definitions.available_filter().for_mode(&input.mode);
-                let mcp_instructions = mcp
-                    .as_ref()
-                    .and_then(|mcp| crate::prompt::running_mcp_instructions(&mcp.reader().load()));
                 let execution_slots = crate::tools::execution::execution_slots(
-                    &params.prompt_slots.with_mcp_instructions(mcp_instructions),
+                    &params.prompt_slots,
                     &params.config,
                     background.is_some(),
                     background.is_some(),
@@ -4457,7 +4445,6 @@ async fn spawn_prepared_session(
                     &prefix_key,
                     epoch,
                     turn_provider.prompt_cache_ttl(&turn_model),
-                    mcp.as_ref().is_some_and(|mcp| mcp.connecting()),
                     Instant::now(),
                 );
                 let instructions = {
@@ -4494,12 +4481,7 @@ async fn spawn_prepared_session(
                     system.push_str(append);
                 }
                 let settled = surface.settle(
-                    agent::Surface::new(
-                        system,
-                        definitions.declared,
-                        definitions.deferred,
-                        mcp.as_ref(),
-                    ),
+                    agent::Surface::new(system, definitions.declared, definitions.deferred),
                     rebuild,
                     prefix_key,
                     epoch,
@@ -4510,9 +4492,7 @@ async fn spawn_prepared_session(
                     deferred: settled.surface.deferred.clone(),
                 };
                 let system = settled.surface.system.clone();
-                let turn_mcp = mcp
-                    .clone()
-                    .map(|mcp| mcp.pinned(settled.surface.mcp.clone()));
+                let turn_mcp = mcp.clone();
                 let retired: Vec<&str> = settled.retired.iter().map(String::as_str).collect();
                 let turn_tool_filter = definitions
                     .available_filter()
@@ -4939,7 +4919,6 @@ mod tests {
     const PERMISSION_REQUEST_ID: &str = "headless-permission";
     const PERMISSION_COMMAND: &str = "headless-permission-command";
     const PERMISSION_TOOL: &str = "bash";
-    const DEFERRED_MCP_TOOL: &str = "srv.fetch_issue";
     const PERMISSION_OPTION: &str = "allow_exact";
     const LOST_PERMISSION_ACK: &str = "permission committed but acknowledgment lost";
     const PLANNING_PROMPT: &str = "plan the migration";
@@ -6330,25 +6309,20 @@ mod tests {
         assert_eq!(extract_tool_names(&tools), vec!["read", "bash"]);
     }
 
-    /// Both deferral sources collapse into the one search tool, so a client
-    /// is told what the first request actually carries.
-    #[test_case(true,  false ; "mcp only")]
-    #[test_case(false, true  ; "built-ins only")]
-    #[test_case(true,  true  ; "both share one catalog entry")]
-    fn advertised_names_show_tool_search_not_deferred_tools(mcp: bool, builtin: bool) {
-        let base = serde_json::json!([{"name": "read"}]);
-        let session =
-            mcp.then(|| crate::mcp::stub_session(&[("srv.fetch_issue", "Fetch an issue")]));
-        let deferred = match builtin {
-            true => vec![DeferredTool::new(
-                "code_map",
-                None,
-                serde_json::json!({"name": "code_map", "description": "Rank symbols"}),
-            )],
-            false => Vec::new(),
-        };
+    fn deferred_code_map() -> Vec<DeferredTool> {
+        vec![DeferredTool::new(
+            "code_map",
+            None,
+            serde_json::json!({"name": "code_map", "description": "Rank symbols"}),
+        )]
+    }
 
-        let names = advertised_tool_names(&base, &deferred, session.as_ref(), false);
+    /// Deferred built-ins collapse into the search tool, so a client is told
+    /// what the first request actually carries.
+    #[test]
+    fn advertised_names_show_tool_search_not_deferred_tools() {
+        let base = serde_json::json!([{"name": "read"}]);
+        let names = advertised_tool_names(&base, &deferred_code_map(), false);
 
         assert_eq!(
             names,
@@ -6365,14 +6339,13 @@ mod tests {
     #[test]
     fn advertised_names_omit_the_search_tool_when_nothing_is_deferred() {
         let base = serde_json::json!([{"name": "read"}]);
-        assert_eq!(advertised_tool_names(&base, &[], None, false), vec!["read"]);
+        assert_eq!(advertised_tool_names(&base, &[], false), vec!["read"]);
     }
 
     #[test]
     fn advertised_names_respect_hidden_local_search_binding() {
         let base = serde_json::json!([]);
-        let session = crate::mcp::stub_session(&[(DEFERRED_MCP_TOOL, DEFERRED_MCP_TOOL)]);
-        assert!(advertised_tool_names(&base, &[], Some(&session), true).is_empty());
+        assert!(advertised_tool_names(&base, &deferred_code_map(), true).is_empty());
     }
 
     const WORKFLOW_NAME: &str = "echo";

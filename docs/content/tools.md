@@ -38,7 +38,7 @@ Run [`caudra tools`](/docs/cli/) to see the resulting set, including which rule 
 
 ## Tools loaded on demand
 
-The default loading policy lets 10 built-in tools start outside the request array. The model sees a `tool_search` entry instead, and one call with a query loads the matching tools for the rest of the session. Sessions that never need them never pay for their descriptions. An explicit profile policy can make other native, local or remote Workcell, Lua/plugin, local callback, or MCP tools lazy too. A known-name direct call to an eligible lazy tool is valid and loads its schema. `tool_search` disappears when no eligible pending tools remain.
+The default loading policy lets 10 built-in tools start outside the request array. The model sees a `tool_search` entry instead, and one call with a query loads the matching tools for the rest of the session. Sessions that never need them never pay for their descriptions. An explicit profile policy can make other native, local or remote Workcell, Lua/plugin, or local callback tools lazy too. A lazy MCP tool stays out of the [server list](/docs/mcp/#code-mode) and is found with `search()` inside `mcp`. A known-name direct call to an eligible lazy tool is valid and loads its schema. `tool_search` disappears when no eligible pending tools remain.
 
 `code_map`, `code_context`, `code_refs`, `code_impact`, and `code_expand` load together as the code graph bundle, limited to eligible lazy members. Profile policy groups do not create additional loading bundles.
 
@@ -436,18 +436,18 @@ Load a skill that provides instructions and workflows for specific tasks.
 |-----------|------|----------|-------------|
 | `name` | string | yes | Name of the skill to load |
 
-### `mcp_resource` {#mcp_resource}
+### `mcp` {#mcp}
 
-List or read the resources that running MCP servers offer: documents, records, files and other context a server exposes to be read rather than called.
+Run Python that calls the MCP servers this session connects to. The `# MCP servers` reminder lists each server and the signatures of its tools.
 
-Offered only while a running [MCP server](/docs/mcp/#resources) declares resources. Each call asks first, and the prompt can allow every read from that server for the conversation, the project, or everywhere.
+Offered while at least one [MCP server](/docs/mcp/#code-mode) is enabled, whether or not it has connected. The servers and their tools reach the model in a `# MCP servers` reminder, so a server connecting or changing its tools never changes the tool definitions.
+
+Snippets run on this machine in the bundled Monty worker, even when the session uses a remote Workcell. Variables persist between runs of the same agent, in memory only. Each server call a snippet makes goes through [permissions](/docs/permissions/#mcp-tool-calls) on its own, and reading a resource asks first.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `action` | string | yes | `list` to see what can be read, `read` to read one resource |
-| `server` | string | no | The MCP server's configured name. Required to read; narrows a listing |
-| `uri` | string | no | The resource URI to read, as listed or as a template spells it |
-| `cursor` | string | no | The cursor a previous listing returned, to list the next page |
+| `code` | string | yes | Python to run. Top-level `await` works |
+| `reset` | boolean | no | Drop the variables earlier runs kept before running |
 
 ## Media
 

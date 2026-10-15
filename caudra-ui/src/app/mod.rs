@@ -149,6 +149,7 @@ use caudra_agent::background::{BackgroundTasks, ShellSnapshot};
 use caudra_agent::commits::repo;
 use caudra_agent::context::{ContextKey, ContextSnapshot, ContextStore};
 use caudra_agent::mcp::McpSnapshot;
+use caudra_agent::mcp::code::output as mcp_code;
 use caudra_agent::mentions;
 use caudra_agent::permissions::{AutopilotNote, PermissionManager, PermissionPolicyError};
 use caudra_agent::prompt::profile::PromptProfileCatalog;
@@ -3284,7 +3285,7 @@ impl App {
 
     pub(crate) fn open_awaiting_mcp_trust(&mut self, needs_login: bool) {
         if !needs_login && self.mcp_picker.has_awaiting_trust() {
-            self.mcp_picker.open();
+            self.mcp_picker.open(self.main_context_snapshot());
         }
     }
 
@@ -3333,7 +3334,7 @@ impl App {
     fn review_pending_trust(&mut self) {
         let pending = self.pending_trust();
         if pending.mcp {
-            self.mcp_picker.open();
+            self.mcp_picker.open(self.main_context_snapshot());
         } else if pending.permissions
             && let Err(error) = self.open_permissions_picker()
         {
@@ -6000,7 +6001,7 @@ impl App {
                 vec![]
             }
             "/mcp" => {
-                self.mcp_picker.open();
+                self.mcp_picker.open(self.main_context_snapshot());
                 vec![]
             }
             "/env" => self.open_env(),
@@ -6762,7 +6763,7 @@ impl App {
             | self.tick_stream_modal()
             | self.status_bar.poll_branch_update()
             | self.status_bar.clear_expired_hint()
-            | self.mcp_picker.refresh()
+            | self.refresh_mcp_picker()
             | self.tick_permission_config_trust()
             | self.poll_record_index()
             | self.poll_pattern_suggestions()
@@ -6797,6 +6798,14 @@ impl App {
             | self.poll_commit_index()
             | self.thinking_picker.tick()
             | Dirty::any(self.chats.iter_mut().map(Chat::tick))
+    }
+
+    fn refresh_mcp_picker(&mut self) -> Dirty {
+        if !self.mcp_picker.is_open() {
+            return Dirty::NO;
+        }
+        let tools = self.main_context_snapshot();
+        self.mcp_picker.refresh(tools)
     }
 
     fn poll_context_snapshot(&mut self) -> Dirty {
@@ -7020,24 +7029,46 @@ impl App {
     /// A call with no accounting never reached the dispatch site that fills it
     /// in — a synthetic cancellation, say — and recording a zero for it would
     /// invent activity.
+    ///
+    /// Each server call an `mcp` snippet made counts as a call of its own,
+    /// under its `server.tool` name. The model never reads those results
+    /// directly, so they cost the context window nothing.
     fn record_tool_call(&mut self, done: &caudra_agent::ToolDoneEvent) {
         let (Some(outcome), Some(source)) = (done.accounting.outcome, &done.accounting.source)
         else {
             return;
         };
-        let duration_ms = done.accounting.duration_ms;
-        let tokens = done.accounting.model_tokens;
-        self.state
-            .session_mut()
-            .add_tool_usage(&done.tool, source, outcome, duration_ms, tokens);
-        self.storage_writer.record_tool_call(ToolCall {
+        self.record_tool_usage(ToolCall {
             tool: done.tool.to_string(),
             source: source.to_string(),
             cwd: self.state.session.cwd.clone(),
             outcome,
-            duration_ms,
-            tokens,
+            duration_ms: done.accounting.duration_ms,
+            tokens: done.accounting.model_tokens,
         });
+        if let ToolOutput::McpCode(run) = &done.output {
+            for call in &run.calls {
+                self.record_tool_usage(ToolCall {
+                    tool: call.qualified_name(),
+                    source: mcp_code::CALL_SOURCE.to_owned(),
+                    cwd: self.state.session.cwd.clone(),
+                    outcome: call.ledger_outcome(),
+                    duration_ms: call.duration_ms,
+                    tokens: 0,
+                });
+            }
+        }
+    }
+
+    fn record_tool_usage(&mut self, call: ToolCall) {
+        self.state.session_mut().add_tool_usage(
+            &call.tool,
+            &call.source,
+            call.outcome,
+            call.duration_ms,
+            call.tokens,
+        );
+        self.storage_writer.record_tool_call(call);
     }
 
     /// The one place a turn's spend is recorded. The session keeps its own

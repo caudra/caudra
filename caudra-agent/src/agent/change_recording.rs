@@ -269,14 +269,23 @@ struct Begun {
 impl Recording {
     /// Runs the call, then finishes its record.
     pub(crate) async fn around<T>(mut self, ctx: &ToolContext, call: impl Future<Output = T>) -> T {
+        self.start();
+        let output = call.await;
+        self.finish(&ctx.event_tx).await;
+        output
+    }
+
+    /// Marks the call under way, so a record dropped from here on is finished, not abandoned.
+    pub(crate) fn start(&mut self) {
         if let Some(begun) = &mut self.0 {
             begun.started = true;
         }
-        let output = call.await;
+    }
+
+    pub(crate) async fn finish(mut self, events: &EventSender) {
         if let Some(begun) = self.0.take() {
-            begun.finish(&ctx.event_tx).await;
+            begun.finish(events).await;
         }
-        output
     }
 }
 

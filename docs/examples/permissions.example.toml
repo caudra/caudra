@@ -57,7 +57,7 @@ version = 1
 # [mcp.github]
 # Each [mcp.SERVER] table holds the rules for the tools of one MCP server, such
 # as [mcp.github] here. Name each tool as the server does, without the
-# `github__` prefix.
+# `github.` prefix.
 
 # Tools to allow without asking: a list of names, one name, `"*"` for every
 # tool, or `true` for every tool. MCP allows wait in /permissions for review.

@@ -17,7 +17,9 @@ extern crate monty_types_registry as monty_types;
 mod catalog;
 mod diagnose;
 mod group;
+mod hosted;
 mod render;
+mod repair;
 mod subset;
 mod suspend;
 mod types;
@@ -27,6 +29,12 @@ mod worker;
 pub use catalog::catalog;
 pub use catalog::specs;
 pub use group::{CodeConfiguration, CodeToolGroup};
+pub use hosted::{
+    CodeHost, HostCall, HostError, HostErrorKind, HostFuture, HostInvocation, HostName, HostReply,
+    HostedExecution, HostedState, MAX_CONCURRENT_HOST_CALLS, MAX_HOST_CALLS_PER_RUN,
+    MAX_STATE_BYTES, StateNote,
+};
+pub use repair::Repair;
 pub use worker::{CodeBuildError, WORKER_FILE_NAME, WorkerSource, bundled_worker_available};
 // These limits are public because hosts may need to describe the same contract outside MCP.
 pub use types::{

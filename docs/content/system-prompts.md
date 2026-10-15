@@ -31,7 +31,7 @@ Do not edit files unless the user explicitly asks.
 
 `layout: overlay` is the default, so the frontmatter is optional. Caudra inserts the profile after runtime context and before the mode section.
 
-The system prompt is identical in plan and build mode, and carries no working directory, date, or model. All of those are announced in the conversation instead, and re-announced only when they change, so switching mode, crossing midnight, or changing model leaves the system prompt as it was. A model switch still starts a new cache, and so does a mode switch while MCP servers run, since plan mode declares no MCP tools. See [When Caudra rebuilds](/docs/configuration/#when-caudra-rebuilds). Editing an instruction file mid-session is announced the same way, as a diff against the copy the prompt already carries. Task prompts follow the same rule: a subagent is told its environment and the mode it was granted in the conversation.
+The system prompt is identical in plan and build mode, and carries no working directory, date, or model. All of those are announced in the conversation instead, and re-announced only when they change, so switching mode, crossing midnight, or changing model leaves the system prompt as it was. A model switch still starts a new cache. See [When Caudra rebuilds](/docs/configuration/#when-caudra-rebuilds). Editing an instruction file mid-session is announced the same way, as a diff against the copy the prompt already carries. Task prompts follow the same rule: a subagent is told its environment and the mode it was granted in the conversation.
 
 Those announcements arrive wrapped in `<system-reminder>`. They are appended to the conversation and never edited, so a kind is restated only when its content changes or a compaction summarized the block in force, and earlier blocks of the same kind remain as history. The most recent block of a kind is the only one in force; the system prompt tells the model this, and that a reminder is not the user talking.
 
@@ -98,6 +98,8 @@ tools:
 
 An `eager` tool starts with its full schema in the request. A `lazy` tool is callable and searchable, but initially contributes only a catalog summary. Calling a lazy tool directly by its known name is valid and loads its schema. A `disabled` tool is absent from schemas and search, and calls are refused before argument repair, permission prompts, or execution.
 
+MCP tools never put a schema in the request, because the model calls them through [code mode](/docs/mcp/#code-mode). For them, `lazy` leaves the tool out of the [server list](/docs/mcp/#the-server-list), and `search()` still finds it. `disabled` refuses its calls.
+
 Loaded schemas remain session-local. Restored history and MCP reconnects cannot re-enable disabled tools.
 
 Resolution goes from the most specific rule to the least specific:
@@ -108,9 +110,9 @@ Resolution goes from the most specific rule to the least specific:
 4. Profile default.
 5. Existing loading preferences when the default is `inherit`.
 
-Explicit `eager` and `lazy` settings override model-class deferral, `agent.defer_builtin_tools`, MCP thresholds and `always_load`, and the eager hint from `--allowed-tools`. Loading remains separate from [synchronous and background execution](/docs/sessions/#background-tasks).
+Explicit `eager` and `lazy` settings override model-class deferral, `agent.defer_builtin_tools`, and the eager hint from `--allowed-tools`. Loading remains separate from [synchronous and background execution](/docs/sessions/#background-tasks).
 
-MCP selectors use canonical `server.tool` names, not provider wire aliases. Plugin and custom tools use their exact registered names. Unknown groups, invalid states, malformed selectors, duplicate keys, and reserved infrastructure selectors are errors. Bare custom names must resolve in the runtime registry before the profile can run. Qualified MCP selectors may precede a server connection, but an unavailable tool grants no access. Arbitrary globs, custom groups, and profile inheritance are unsupported.
+MCP selectors use `server.tool` names, with the server's configured name and the tool's own MCP name, not the [Python names](/docs/mcp/#naming-and-namespacing) the model calls. Plugin and custom tools use their exact registered names. Unknown groups, invalid states, malformed selectors, duplicate keys, and reserved infrastructure selectors are errors. Bare custom names must resolve in the runtime registry before the profile can run. Qualified MCP selectors may precede a server connection, but an unavailable tool grants no access. Arbitrary globs, custom groups, and profile inheritance are unsupported.
 
 ### Tool groups
 

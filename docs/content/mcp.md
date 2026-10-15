@@ -14,7 +14,7 @@ Add servers under `[mcp.*]` in your MCP config:
 - **Global**: `~/.config/caudra/mcp.toml`
 - **Project**: `.caudra/mcp.toml`. A project server replaces a global server with the same name.
 
-The TUI applies an edit to either file while it runs. It starts new servers, including the first one when Caudra started with none. It stops removed or disabled ones, and restarts a server whose definition changed. Servers you did not touch keep their connection. A file that fails to load keeps the servers it last loaded, and the error shows in `/mcp`. A changed project server that needs review waits in `/mcp`, and a `[review MCP]` chip in the status bar opens it. The model sees the new tools after its next rebuild, see [Add an MCP server](/docs/configuration/#add-an-mcp-server).
+The TUI applies an edit to either file while it runs. It starts new servers, including the first one when Caudra started with none. It stops removed or disabled ones, and restarts a server whose definition changed. Servers you did not touch keep their connection. A file that fails to load keeps the servers it last loaded, and the error shows in `/mcp`. A changed project server that needs review waits in `/mcp`, and a `[review MCP]` chip in the status bar opens it. The model sees the new tools in its next [server list](#the-server-list), see [Add an MCP server](/docs/configuration/#add-an-mcp-server).
 
 ### Stdio
 
@@ -55,84 +55,117 @@ oauth = { client_id = "acme-client", client_secret = "s3cret", callback_port = 3
 |-------|------|---------|-----|-----|-------------|
 | `enabled` | bool | `true` | - | - | Start the server. `/mcp` sets this key when it turns a server on or off |
 | `timeout` | integer | `30000` | 1 | 300000 | Milliseconds to wait for each response from the server |
-| `always_load` | bool | `false` | - | - | Load every tool of the server up front instead of through `tool_search` |
 | `command` | string[] | required | - | - | Stdio servers: the program and its arguments. It must not be empty. When `url` is also set, `command` wins |
 | `environment` | table | `{}` | - | - | Stdio servers: environment variables for the server process, such as `{ GITHUB_TOKEN = "{env:GITHUB_TOKEN}" }`. In the global file, `{env:NAME}` reads a value from your environment and `{file:PATH}` reads a file. Other values are stored as plain text |
 | `url` | string | required | - | - | HTTP servers: the server URL. It must start with `http://` or `https://` |
 | `headers` | table | `{}` | - | - | HTTP servers: headers sent with every request, such as `{ Authorization = "Bearer {env:GITHUB_TOKEN}" }`. In the global file, `{env:NAME}` reads a value from your environment and `{file:PATH}` reads a file. Other values are stored as plain text |
 | `oauth` | table | unset | - | - | HTTP servers: a static OAuth client, for a server Caudra cannot get a client from on its own |
 
+`caudra config example mcp` prints every `mcp.toml` key with its default, all commented out. [Reference configs](/docs/reference-configs/#mcp-toml) shows the same text.
+
 <!-- /caudra-docgen:mcp-server-fields -->
 
 Set `command` for stdio, `url` for HTTP. Pick one.
 
-Keys at the top level of `mcp.toml`, outside any server:
-
-<!-- caudra-docgen:mcp-top-level -->
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `defer_tools` | integer | `10` | Defer MCP tools behind `tool_search` only when the servers offer more than this many. `0` always defers. A project value replaces the global one |
-
-`caudra config example mcp` prints every `mcp.toml` key with its default, all commented out. [Reference configs](/docs/reference-configs/#mcp-toml) shows the same text.
-
-<!-- /caudra-docgen:mcp-top-level -->
-
 The file can start with `version = 1`, and a file without it counts as version 1. When the version is newer than this build reads, no server in the file starts and Caudra shows the error. See [Config file versions](/docs/configuration/#config-file-versions).
 
-## Tool search
+Earlier versions read a top-level `defer_tools` key and a per-server `always_load` key. MCP tools now load nothing up front (see [Code mode](#code-mode)), so a file that still sets either key fails to load until you delete it.
 
-Every tool definition a server exposes costs context window space, on every request. Take Datadog's MCP server: with all toolsets on it ships over 100 tools, when a task often needs three.
+## Code mode
 
-So Caudra, like Claude Code, defers MCP tools by default. The model sees one small `tool_search` tool that lists the deferred names, searches when it actually needs something, and the matches stay loaded for the rest of the session. Resume a session and the tools it was using come back. Subagents keep their own loads, so their searches don't bloat your main conversation.
+Every tool definition in a request costs tokens on every request, and a server can ship more than 100 tools when a task needs three. Changing the definitions costs more: providers cache a request from its start, so a tool array that changes when a server connects or a tool loads makes the provider read the whole conversation again at full price.
 
-```
-server ships 117 tool definitions
-        │
-  more than defer_tools (10)?
-   │ no          │ yes
-   ▼             ▼
-   all load      context gets one small tool: tool_search
-   upfront       │
-                 │  model: tool_search("logs")
-                 ▼
-                 3 matches load, stay for the session
-                 114 definitions never enter context
+So the model never sees an MCP tool definition. It gets one fixed tool, `mcp`, and reaches your servers by writing Python:
+
+```python
+issues = await github.list_issues(owner="caudra", repo="caudra")
+[issue["title"] for issue in issues if issue["comments"] > 10]
 ```
 
-You don't configure anything for this. Add the server as usual:
+`mcp` is declared while at least one server is enabled in `mcp.toml`, whether it has connected or not. A server that connects, reconnects, fails, or changes its tools never changes the tool definitions or the system prompt, and plan mode keeps `mcp` too. See [The prompt cache](/docs/configuration/#the-prompt-cache).
 
-```toml
-[mcp.datadog]
-url = "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp?toolsets=all"
+A snippet can filter, join, and summarise results before the model reads anything. Only what it prints and the value of its last expression come back, so a list of 500 issues can come back as three lines.
+
+### The server list
+
+The model learns what it can call from a `# MCP servers` [reminder](/docs/context/#what-caudra-writes-on-your-behalf) in the conversation. [Add an MCP server](/docs/configuration/#add-an-mcp-server) shows one.
+
+Each server has a header line with its state: connected with its tool count, `connecting`, `awaiting trust`, `needs login`, or `failed` with the error. The server's [instructions](#server-instructions) follow its header. Then come its tools, one line each, as a Python signature with the first sentence of the tool's description.
+
+The list aims to stay within about 2,000 tokens. Every server keeps its header and instructions, and the tool lines share the rest. Servers take turns adding their cheapest remaining tool, so one large server cannot push the others out. The list says whether it is complete. When it is not, a header reads like `showing 40 of 117 tools`, and the model finds the rest with `search()`.
+
+Caudra sends the list again only when its text changes, such as when a server connects or its tools change, and after compaction. When no server is enabled any more, a short reminder tells the model to disregard the list.
+
+Each agent gets its own list. Tools that `agent.disabled_tools` or a profile turns off are left out. A [read-only agent](/docs/permissions/#read-only-agents) sees only the read-only tools of [recognised servers](#recognised-servers). In plan mode the main agent keeps its whole list, and a call that plan mode does not allow is refused when it runs.
+
+A [system prompt profile](/docs/system-prompts/#choose-tool-availability) can make an MCP tool `lazy`, which leaves it out of the list but lets `search()` find it. `disabled` refuses it.
+
+### Calling tools
+
+Each server is a Python namespace, and each of its tools is an async function of that namespace. Call a tool with keyword arguments, or with one dict of them, and `await` the result. Run independent calls together with `asyncio.gather`:
+
+```python
+import asyncio
+
+issue, pulls = await asyncio.gather(
+    github.get_issue(owner="caudra", repo="caudra", issue_number=42),
+    github.list_pull_requests(owner="caudra", repo="caudra"),
+)
 ```
 
-Ask about an incident, and the model searches for something like `datadog logs`, gets back the few matching tools, and the other hundred definitions never enter the conversation.
+Up to 8 calls run at once, and one run makes at most 100. Four functions sit beside the namespaces:
 
-With 10 or fewer tools across all your servers there is no search step: at that size, searching costs more than it saves, so everything loads upfront. The top-level `defer_tools` key moves that line:
+| Function | What it returns |
+|---|---|
+| `search(query, server=None, limit=10, offset=0)` | The connected tools that match `query`, best first, with their exact signatures and full descriptions. It finds tools the list leaves out. `limit` goes up to 50 |
+| `servers()` | Every enabled server, with its state, tool count, and whether it offers resources |
+| `await resources(server)` | The [resources](#resources) and resource templates a server offers |
+| `await read_resource(server, uri)` | The contents of one resource |
 
-```toml
-defer_tools = 30
+Snippets run in a Python subset on the bundled Monty worker. Top-level `await` works. There is no filesystem, network, subprocess, class inheritance, or third-party package. `asyncio`, `json`, `re`, `math`, `datetime`, `collections`, and `itertools` are among the standard modules it offers.
 
-[mcp.github]
-url = "https://api.githubcopilot.com/mcp/"
-```
+### Results and errors
 
-Set it to 0 to always defer, or above your tool count to never defer.
+A tool returns its `structuredContent` when it has one. Otherwise it returns its text, parsed when the text is a JSON object or array, and a list when there are several content blocks. An image or audio block comes back as a dict with its type, MIME type, and size. The model never receives the image or audio data itself.
 
-If one server should skip the search step entirely, opt it out:
+A failed call raises `RuntimeError`: the server reported an error, the server is not connected, or the result is larger than 8 MiB. A refused call raises `PermissionError`: you declined it, plan mode or a read-only agent does not allow it, or the tool is disabled. A snippet can catch either and carry on. A misspelt tool name raises with the closest name and a hint to search, and a missing argument, or one the tool does not take, raises `TypeError` that names it.
 
-```toml
-[mcp.linear]
-command = ["linear-mcp-server"]
-always_load = true
-```
+Before a snippet runs, it is checked against the signatures of the tools it calls, so a misspelt tool or an argument of the wrong type stops it before any call is made, with the closest name and the line. Later runs of the same agent are checked too, but not the variables they take from earlier runs, because those runs alone knew their types.
 
-Good for small servers you rely on every turn. On a big server it defeats the point: every definition is back in your context on every request.
+Some slips have only one possible meaning, so Caudra fixes them before the snippet runs. It imports a standard module the snippet uses without importing it, such as `asyncio` in `asyncio.gather`. It drops `await` before `search()` and `servers()`, and it removes a Markdown fence around the whole snippet. Each fix keeps the snippet's line numbers, so errors still point at the line the model wrote. The card lists the fixes, and the conversation keeps the snippet as the model wrote it.
+
+Calls that ran before a failure keep their effects. When a run fails, the model reads why, followed by every server call the run made and how each ended, so it can check before it repeats one. The list names each call as the snippet wrote it, such as `my_server.get_sum`. Stopping the turn cancels the run and the calls it has in flight.
+
+### Variables between runs
+
+Variables that a run defines are still there in the next run of the same agent. The main agent and each subagent keep their own. They live in memory, up to 16 MiB. Past that they are dropped and the next run starts empty. They do not survive a restart of Caudra. The model can pass `reset: true` to start a run empty. When variables are lost, the result says so.
+
+### Where snippets run
+
+Snippets always run on this machine, because your MCP servers are clients of this Caudra process, even when the session's other tools run on a [remote Workcell](/docs/remote-workspaces/). A build without the bundled worker returns an error that says so. With embedded Workcell, Caudra also warns at startup that `python_execution` and `mcp` are unavailable. When a server is configured, the TUI shows the same reason as it starts, and `/mcp` shows it above the server list. `WORKCELL_MCP_CODE_WORKER` can point Caudra at a worker binary.
+
+[`python_execution`](/docs/tools/#python_execution) is a separate tool. It runs isolated, needs no approval by default, can run on a remote Workcell, and cannot reach MCP servers.
+
+A run that starts while servers are still making their first connection waits for them, so every server that comes up is in reach.
+
+### Servers with a code mode of their own
+
+Some servers wrap their tools in a code tool of their own. Inside `mcp`, the model would then write Python that writes code for the server. Ask such a server for its plain tools when it offers them:
+
+- **Cloudflare**: add `?codemode=false` to the URL of Cloudflare's MCP server at `mcp.cloudflare.com`.
+- **Executor**: add `?mode=passthrough` to get its search and invoke tools (see [Executor](#executor)).
+
+Caudra does not change a server's URL for you.
+
+### Sessions from earlier versions
+
+A conversation from before code mode resumes and sends as before. When the model calls an MCP tool by its old `server__tool` name, the call fails with an error that points it to `mcp`.
 
 ## Naming and namespacing
 
-Server names are ASCII alphanumeric, hyphens ok (no dots). Tools get prefixed with their server name: a `read` tool on the `filesystem` server becomes `filesystem__read`. Because of this, `__` is reserved and names can't collide with built-in tools.
+Server names are ASCII letters, digits, and hyphens, with no dots, and cannot be the name of a built-in tool. Permission rules, `agent.disabled_tools`, and profiles name a tool as `server.tool`, with the server's configured name and the tool's own MCP name, such as `github.list_issues`.
+
+In `mcp`, a server is a Python namespace and its tools are its functions. Each character other than an ASCII letter, digit, or `_` becomes `_`, so the `my-server` server is `my_server`, and a name that starts with a digit gets a leading `_`. A name that is a Python keyword gets a trailing `_`, such as `class_`. A namespace also gets a trailing `_` when it would hide a Python builtin, a standard module, or one of the four functions, such as `json_` for a server named `json`. When two names come out the same, the later one in name order gets `_2`, then `_3`, so names stay the same whatever order servers connect in. The server list and `search()` always show the names to call.
 
 See [Permissions](/docs/permissions/#mcp-tool-calls) for MCP call review and remembered decisions.
 
@@ -142,17 +175,21 @@ Generic MCP approvals are exact-input by default. The permission review shows th
 
 ## Results in the transcript
 
-An MCP call's card is labelled `server › tool`, with short arguments beside the label. The header also shows the size of the result and an estimate of the tokens the model reads from it, such as `JSON · 128 lines · ~3.2k tokens`.
+An `mcp` card shows the snippet, numbered and highlighted as Python. Below it comes a row for each server call the snippet made, labelled `server › tool` with its status, then what the snippet printed, the value it returned, and why it stopped when it did not finish. The rows fill in while the snippet runs. A row uses the names permission prompts and rules use, so the snippet's `my_server.get_sum` call is the `my-server › get-sum` row.
+
+Open a call's row to see that call's own card, which the rest of this section describes. A call's card keeps up to 64 KiB of the result, and the snippet receives all of it.
+
+A call's card is labelled `server › tool`, with short arguments beside the label. The header also shows the size of the result and an estimate of the tokens the model reads from it, such as `JSON · 128 lines · ~3.2k tokens`.
 
 When a call runs code, the card shows that code above the result, numbered and highlighted like a `python_execution` card. Caudra takes the string under `code`, `script`, `source`, `program`, `sql`, `command`, or `cmd`, or else the longest multi-line string. The key or the text decides the language. Below the code come the remaining arguments. A multi-line string among them is shown as plain text under its name.
 
 An MCP card opens whole: the arguments and all of the result, with no row budget, read-only or not, and it stays open after newer calls. In the auto `/view`, a click folds it to its header and the next opens it whole. The compact view and `ui.always_collapsed` still fold it to one row.
 
-Each block of the result is drawn by its type. A text block that is a whole JSON object or array is indented and coloured. Other text is rendered as markdown. Images, audio, and resources become labelled rows with their type and size. The model receives the same text whatever the card shows, and it never receives image or audio data.
+Each block of the result is drawn by its type. A text block that is a whole JSON object or array is indented and coloured. Other text is rendered as markdown. Images, audio, and resources become labelled rows with their type and size. What the snippet receives does not depend on what the card shows, and the model never receives image or audio data.
 
 A card can also show the result as raw data when that shows something the card does not. That is a card a [recognised server](#recognised-servers) draws its own way, and a card whose `structuredContent` no text block repeats. Such a card ends with a `click for raw` row. The raw view shows each JSON text block indented and coloured and any other text exactly as the server wrote it, followed by the `structuredContent` under its name. Click `click for the card` to switch back. Changing the `/view` keeps the choice.
 
-When the server gives a tool a title, the label shows the title in place of the tool name. While a call runs, the progress the server reports shows beside the label, such as `3/10 · indexing`. A result the server marks as an error draws the card as failed, and the model reads the server's error text.
+When the server gives a tool a title, the label shows the title in place of the tool name. While a call runs, the progress the server reports shows beside the label, such as `3/10 · indexing`. A result the server marks as an error draws the card as failed, and the call raises `RuntimeError` with the server's error text.
 
 A card also lists the questions the server asked during the call (see [Server questions](#server-questions)), with each answer and who gave it. When a structured result does not match the output schema the tool declared, the card says so. The call still succeeds, and the log records the mismatch.
 
@@ -164,7 +201,7 @@ A card also lists the questions the server asked during the call (see [Server qu
 
 Stopping the run cancels the call, and Caudra tells the server. When the connection drops during a call, Caudra sends a list or read request once more, and the same goes for a tool the server marks read-only or idempotent. Any other tool call fails with `connection lost; the call's outcome is unknown`, because sending it again could repeat its effect.
 
-When a server announces that its tools, prompts, or resources changed, Caudra lists them again, and the model sees the change on its next request. Lists are read page by page, up to 64 pages each. A tool whose input schema points to a schema in another document with `$ref` is left out, and the log says why.
+When a server announces that its tools, prompts, or resources changed, Caudra lists them again, and the model sees the change in its next [server list](#the-server-list). Lists are read page by page, up to 64 pages each. A tool whose input schema points to a schema in another document with `$ref` is left out, and the log says why.
 
 ## Server questions
 
@@ -185,7 +222,7 @@ While [autopilot](/docs/autopilot/) is engaged, it may answer a form for you. It
 
 ## Server instructions
 
-A server can describe how its tools should be used. Caudra adds the instructions of every running server to the system prompt, under a heading with the server's name, and cuts each server's text at 4096 bytes. A server that connects later, or whose instructions change, updates the prompt on the next request.
+A server can describe how its tools should be used. Caudra puts each server's instructions under its header in the [server list](#the-server-list), and cuts each server's text at 4096 bytes. A server that connects later, or whose instructions change, updates the list, and the system prompt stays as it was.
 
 ## Recognised servers
 
@@ -208,6 +245,22 @@ url = "https://mcp.executor.sh/mcp?elicitation_mode=native"
 ```
 
 `/mcp` shows the same advice for an Executor server in model mode.
+
+Executor's own tool takes code, so through [code mode](#code-mode) the model writes Python that sends code to Executor. Add `?mode=passthrough` to the URL to get four plain tools in its place:
+
+| Tool | What it does |
+|---|---|
+| `integrations` | Lists your connected accounts |
+| `skills` | Lists or reads Executor's guides |
+| `search` | Finds a service's tools, with their IDs and input schemas |
+| `invoke` | Calls one tool by its ID |
+
+The model can then call them from Python like any other server's tools. Caudra asks before an `invoke` as it does for any MCP tool call. `/mcp` suggests this option for an Executor server whose URL lacks it.
+
+```toml
+[mcp.executor]
+url = "https://mcp.executor.sh/mcp?mode=passthrough"
+```
 
 ### Home Assistant
 
@@ -250,6 +303,8 @@ Print, SDK, and ACP sessions fail with an actionable error when project startup 
 ## Runtime toggling
 
 Open the MCP picker with `/mcp`. Turn servers on or off there; changes save back to your config (project or global, depending on which file defined the server).
+
+A running server's row reads like `stdio · 12 tools via mcp as my_server · 3 search-only`. The model reaches its tools through the `mcp` tool, and `as` names the [namespace](#naming-and-namespacing) to call when it differs from the server name. The search-only count is how many tools the main agent's [profile](/docs/system-prompts/#choose-tool-availability) leaves out of the [server list](#the-server-list), as `/tools` reports them.
 
 Select a running server to see what it reported when it connected: its name and version, the protocol version, the features it offers (resources, completions, and list changes), and the first lines of its [instructions](#server-instructions). A [recognised server](#recognised-servers) shows its kind beside its name.
 
@@ -317,7 +372,7 @@ A mention resolves only when its server is running and the URI is one the server
 
 When you send the message, Caudra reads the resource and adds it ahead of your message, the way it adds a [mentioned file](/docs/context/#mention-a-file-with): text inline, and an image as a real image when the model supports vision. Anything else becomes a line with its type and size. Resource text shares the per-turn budget of mentioned files, and text past it is cut with a note.
 
-The model can read resources with the `mcp_resource` tool. Caudra offers the tool only while a running server lists at least one resource or template. It lists resources and templates a page at a time, and it reads one resource. Reading works in plan mode and in [read-only agents](/docs/permissions/#read-only-agents). It asks first, and the prompt offers to always allow reads from that server for the conversation, the project, or every project.
+The model reads resources from Python in [`mcp`](#calling-tools): `await resources(server)` lists the resources and templates a server offers, and `await read_resource(server, uri)` reads one. `servers()` says which servers offer any. Reading works in plan mode and in [read-only agents](/docs/permissions/#read-only-agents). It asks first, and the prompt offers to always allow reads from that server for the conversation, the project, or every project.
 
 ## Prompts
 

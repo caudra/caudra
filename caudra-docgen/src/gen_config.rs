@@ -1,7 +1,12 @@
 use std::fmt::Write;
 
 use caudra_agent::agent::{Surface, SurfaceBaseline};
-use caudra_agent::prompt::{CHANGES_SLOT, CONFIGURATION_CHANGED_PROMPT};
+use caudra_agent::mcp::code::catalog;
+use caudra_agent::mcp::code::naming::Names;
+use caudra_agent::mcp::code::view::{ServerState, ServerView, ToolView};
+use caudra_agent::prompt::{
+    CATALOG_SLOT, CHANGES_SLOT, CONFIGURATION_CHANGED_PROMPT, MCP_SERVERS_PROMPT,
+};
 use caudra_config::config_file::CONFIG_VERSION;
 use caudra_config::decisions::{DecisionFeatures, DecisionThresholds, FeatureMode};
 use caudra_config::example::Entry;
@@ -26,9 +31,13 @@ const SHELL_DURATION_FEATURE: &str = "shell_duration";
 const SHELL_DURATION_LINK: &str = " See [shell duration](#shell-duration).";
 const MCP_REMINDER_SLOT: &str = "{mcp_reminder}";
 const PROFILE_CHANGES_SLOT: &str = "{profile_changes}";
-const EXAMPLE_MCP_TOOL: &str = "analytics__run_query";
+const EXAMPLE_MCP_SERVER: &str = "analytics";
+const EXAMPLE_MCP_TOOL: &str = "run_query";
 const EXAMPLE_MCP_TOOL_DESCRIPTION: &str =
     "Run a read-only SQL query against the warehouse. Results stop at 1000 rows.";
+const EXAMPLE_RUNNING_SERVER: &str = "github";
+const EXAMPLE_RUNNING_TOOL: &str = "list_issues";
+const EXAMPLE_RUNNING_TOOL_DESCRIPTION: &str = "List the open issues of a repository.";
 /// The `review` profile of the system prompt docs, before and after the edit
 /// the hot reload example makes.
 const EXAMPLE_PROFILE: &str = "Prioritize correctness bugs, regressions, and missing tests.\nDo not edit files unless the user explicitly asks.\n";
@@ -942,7 +951,7 @@ While the terminal UI runs, Caudra watches its config files, skill and command d
 |--------------|-----------------|
 | `caudra.toml` | `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
 | `permissions.toml` | Before the next tool call. |
-| `mcp.toml` | At once. New servers start, even when Caudra started with none. Removed and disabled servers stop, and changed servers restart. The other servers keep running. `defer_tools` applies after `/reload`. |
+| `mcp.toml` | At once. New servers start, even when Caudra started with none. Removed and disabled servers stop, and changed servers restart. The other servers keep running. |
 | `providers.toml` | The next time Caudra reads it, such as when a model list opens. |
 | Skills | At once. |
 | System prompt profiles | From the next turn. |
@@ -974,7 +983,7 @@ Caudra rebuilds at these moments, where the request changes or the cache is gone
 | Switching model or provider | Each model keeps its own cache. |
 | Switching the system prompt profile | The system prompt changes with it. |
 | Changing the thinking level | Claude's cache of the conversation does not survive a change to the thinking settings. |
-| Switching mode | Plan mode declares no MCP tools, and the first switch to it adds the `plan` tool. |
+| Switching mode | The first switch to plan adds the `plan` tool. Later switches rebuild the same definitions, so the cache holds unless an edit is pending. |
 | The cache expires | Claude keeps a cache for five minutes after the last request that used it. Caudra counts from the end of the turn, so it rebuilds a little late rather than too early. Other APIs give no fixed lifetime, so Caudra never rebuilds on a timer for them. |
 
 It also rebuilds at moments you choose, where the cached conversation can still be warm:
@@ -983,9 +992,9 @@ It also rebuilds at moments you choose, where the cached conversation can still 
 - `/cd`, which loads the instruction files and memory of the new directory
 - `/reload`, which applies everything at once
 
-When Caudra started with no MCP servers, the first ones you add connect in the background. A rebuild that falls before they are up lacks their tools, so Caudra rebuilds once more when they are. A session that starts while servers connect waits for them before its first request instead.
+MCP servers never change the definitions. While any server is enabled, they hold one `mcp` tool, and the servers and their tools reach the model in a [`# MCP servers` reminder](/docs/mcp/#code-mode) instead. A server that connects, fails, or changes its tools changes only that reminder.
 
-To keep the cache through a long task, save your edits and let the next rebuild take them in. When the model needs a change right away, such as a new MCP server, run `/reload` and pay for one full read.
+To keep the cache through a long task, save your edits and let the next rebuild take them in. When the model needs a change right away, such as a tool you turned back on, run `/reload` and pay for one full read.
 
 ### What the model is told
 
@@ -1014,21 +1023,21 @@ Each one starts in the middle of a session, with the cache warm.
 
 #### Add an MCP server
 
-You add the `analytics` server of the [HTTP example](/docs/mcp/#http) to `~/.config/caudra/mcp.toml`. The footer shows `Reloaded mcp.toml`, and the server starts at once. The tool definitions stay as they were, so the next request reads the conversation from the cache. With your next message the model gets this reminder:
+You add the `analytics` server of the [HTTP example](/docs/mcp/#http) to `~/.config/caudra/mcp.toml` while a `github` server runs. The footer shows `Reloaded mcp.toml`, and the server starts at once. The tool definitions stay as they were, so the next request reads the conversation from the cache. With your next message the model gets the server list again, now with `analytics` in it:
 
 ```text
 {mcp_reminder}
 ```
 
-At the next rebuild the tools are declared, or join the `tool_search` catalog when your servers offer more than `defer_tools` tools. That request reads the conversation once at full price. Run `/reload` to make it happen now.
+The model can call the new tool through `mcp` at once. When `analytics` is the first server you enable, the `mcp` tool itself is new. The model then also gets a `# Configuration changed` reminder for it, and `mcp` becomes callable at the next rebuild. Run `/reload` to make that happen now.
 
 #### Turn off an MCP server
 
-You turn a server off in `/mcp`. Caudra writes `mcp.toml` itself, so the footer stays quiet. The server stops at once. Its tools stay in the definitions until the next rebuild, so the cache holds. A call to one fails, `tool_search` no longer offers them, and the reminder lists them under "Declared tools that no longer exist".
+You turn a server off in `/mcp`. Caudra writes `mcp.toml` itself, so the footer stays quiet. The server stops at once, and the next server list leaves it out. The definitions stay as they were, so the cache holds. When it was the last enabled server, a short reminder tells the model to disregard the list, and `mcp` stays in the definitions until the next rebuild. A call to it then fails.
 
 #### Switch to plan mode
 
-You press `Tab` to plan while MCP servers run. Plan mode declares no MCP tools, so the definitions change, and the next request reads the whole conversation at full price. The switch back to build declares them again at the same price. Without MCP servers, only the first switch to plan changes the definitions, by adding the `plan` tool.
+You press `Tab` to plan while MCP servers run. Plan mode keeps the `mcp` tool and refuses each server call it does not allow, so MCP servers do not change the definitions. Only the first switch to plan changes them, by adding the `plan` tool, and that request reads the whole conversation at full price.
 
 #### Disable a tool
 
@@ -1074,8 +1083,6 @@ You save a change and put the file back before your next message. The model hear
 /// [`HOT_RELOAD_SECTION`] with its reminders rendered by the code that sends
 /// them, so the page cannot drift from what the model reads.
 fn hot_reload_section() -> String {
-    let tool = json!({ "name": EXAMPLE_MCP_TOOL, "description": EXAMPLE_MCP_TOOL_DESCRIPTION });
-    let mcp_reminder = configuration_notice(surface("", json!([])), surface("", json!([tool])));
     let profile_notice = configuration_notice(
         surface(EXAMPLE_PROFILE, json!([])),
         surface(EXAMPLE_PROFILE_EDITED, json!([])),
@@ -1088,8 +1095,58 @@ fn hot_reload_section() -> String {
         .and_then(|rest| rest.strip_suffix(tail))
         .expect("the notice fills its template");
     HOT_RELOAD_SECTION
-        .replace(MCP_REMINDER_SLOT, mcp_reminder.trim_end())
+        .replace(MCP_REMINDER_SLOT, mcp_servers_reminder().trim_end())
         .replace(PROFILE_CHANGES_SLOT, profile_changes)
+}
+
+/// The `# MCP servers` reminder once the example's `analytics` server joins a
+/// running `github` server.
+fn mcp_servers_reminder() -> String {
+    let servers = [
+        example_server(
+            EXAMPLE_MCP_SERVER,
+            EXAMPLE_MCP_TOOL,
+            EXAMPLE_MCP_TOOL_DESCRIPTION,
+            json!({
+                "type": "object",
+                "properties": { "sql": { "type": "string" } },
+                "required": ["sql"],
+            }),
+        ),
+        example_server(
+            EXAMPLE_RUNNING_SERVER,
+            EXAMPLE_RUNNING_TOOL,
+            EXAMPLE_RUNNING_TOOL_DESCRIPTION,
+            json!({
+                "type": "object",
+                "properties": {
+                    "owner": { "type": "string" },
+                    "repo": { "type": "string" },
+                },
+                "required": ["owner", "repo"],
+            }),
+        ),
+    ];
+    let listed = catalog::render(&servers, &Names::new(&servers));
+    MCP_SERVERS_PROMPT.replace(CATALOG_SLOT, &listed)
+}
+
+fn example_server(name: &str, tool: &str, description: &str, input_schema: Value) -> ServerView {
+    ServerView {
+        name: name.to_owned(),
+        title: None,
+        state: ServerState::Connected,
+        instructions: None,
+        tools: vec![ToolView {
+            name: tool.to_owned(),
+            title: None,
+            description: description.to_owned(),
+            input_schema,
+            output_schema: None,
+            search_only: false,
+        }],
+        resources: false,
+    }
 }
 
 /// The `# Configuration changed` notice a session carries while `live`
@@ -1104,7 +1161,7 @@ fn configuration_notice(fixed: Surface, live: Surface) -> String {
 }
 
 fn surface(system: &str, tools: Value) -> Surface {
-    Surface::new(system.to_owned(), tools, Vec::new(), None)
+    Surface::new(system.to_owned(), tools, Vec::new())
 }
 
 fn write_config_files_section(out: &mut String) {

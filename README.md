@@ -420,7 +420,7 @@ Each one links to its documentation. Experimental items are marked and stay off 
 <details>
 <summary><b>Integrations</b> (14)</summary>
 
-- [MCP servers with tool search](https://caudra.ai/docs/mcp/#tool-search)
+- [MCP code mode: the model calls your servers from Python](https://caudra.ai/docs/mcp/#code-mode)
 - [MCP OAuth with client ID metadata documents](https://caudra.ai/docs/mcp/#oauth)
 - [MCP results drawn by type, with token estimates](https://caudra.ai/docs/mcp/#results-in-the-transcript)
 - [MCP server questions and `@` resources](https://caudra.ai/docs/mcp/#server-questions)

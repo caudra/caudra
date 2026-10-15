@@ -674,6 +674,10 @@ The broader `These directories and descendants` option uses `FilesystemRead`, co
 
 ## MCP tool calls
 
+The model calls MCP tools from Python inside the [`mcp` tool](/docs/mcp/#code-mode). Starting a run does not ask. Each server call the snippet makes is reviewed on its own, under the rules below, by its `server.tool` name, such as `github.list_issues`. A call you decline raises `PermissionError` in the snippet, which can catch it and carry on. A deny rule for `mcp` itself blocks every run.
+
+Reading a resource with `read_resource` asks too, scoped to the server and the resource's URI. It is allowed in [plan mode](#plan-mode) and in [read-only agents](#read-only-agents), and the prompt offers to always allow reads from that server. Listing a server's resources never asks.
+
 Generic MCP tools use the complete canonical JSON input as their exact authority.
 
 Caudra binds approval to one immutable MCP transport, server configuration digest, remote tool name, and discovered tool contract. A reconnect cannot switch the transport after approval. A changed description or schema creates a different contract.
