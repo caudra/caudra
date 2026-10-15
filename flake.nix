@@ -160,7 +160,7 @@
             version = "1.1.0";
             src = montySrc;
             cargoVendorDir = montyVendorDeps;
-            cargoExtraArgs = "--package monty-runtime --no-default-features";
+            cargoExtraArgs = "--locked --package monty-runtime --no-default-features";
             CARGO_PROFILE_RELEASE_LTO = "thin";
             CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "1";
             CARGO_PROFILE_RELEASE_STRIP = "none";
@@ -249,7 +249,7 @@
               inherit version;
               src = workspaceSrc;
               cargoArtifacts = cargoArtifacts;
-              cargoExtraArgs = "--package ${packageName}";
+              cargoExtraArgs = "--locked --package ${packageName}";
               outputs = [
                 "out"
                 "debug"

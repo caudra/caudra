@@ -1559,6 +1559,13 @@ class ReleaseWorkflowTests(unittest.TestCase):
     os.name == "posix" and shutil.which("bash"), "Unix and Bash required"
 )
 class NixSmokeTests(unittest.TestCase):
+    def test_package_builds_keep_locked_dependency_resolution(self):
+        text = (WORKFLOWS.parent.parent / "flake.nix").read_text()
+        overrides = re.findall(r'cargoExtraArgs = "([^"]+)";', text)
+        self.assertEqual(len(overrides), 2)
+        for arguments in overrides:
+            self.assertIn("--locked", arguments.split())
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="nix smoke ")
         self.addCleanup(temporary.cleanup)
