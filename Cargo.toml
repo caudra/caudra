@@ -318,7 +318,7 @@ notify-8 = { package = "notify", version = "8.2.0", default-features = false, fe
 pdf_oxide = { version = "0.3.74", default-features = false }
 proptest = "1.11.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
-resvg = { version = "=0.47.0", default-features = false }
+resvg = { version = "=0.48.1", default-features = false }
 rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk.git", rev = "9334c97f0d6e177546fc33593148aa3f942cb1f8", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
 schemars = "1.2.1"
 subtle = "2.6.1"

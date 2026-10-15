@@ -1,6 +1,7 @@
 use image::{DynamicImage, RgbaImage};
 use resvg::tiny_skia::{Pixmap, Transform};
-use resvg::usvg::{Group, ImageHrefResolver, Node, Options, Tree};
+use resvg::usvg::filter::Kind;
+use resvg::usvg::{ClipPath, Group, ImageHrefResolver, Mask, Node, Options, Paint, Tree};
 use thiserror::Error;
 
 const MAX_DIMENSION: u32 = 4_096;
@@ -10,8 +11,9 @@ const MAX_TREE_NODES: usize = 10_000;
 const MAX_TREE_DEPTH: usize = 64;
 // resvg clips isolated intermediate layers to a 5x-by-5x canvas rectangle.
 const MAX_LAYER_AREA_MULTIPLIER: u64 = 25;
-// Masks/clips and one filter primitive can each retain multiple layer-sized buffers.
-const AUXILIARY_BUFFERS_PER_LAYER: usize = 3;
+// Masks and clips can retain multiple layer-sized buffers.
+const MASK_CLIP_BUFFERS: usize = 3;
+const FILTER_PRIMITIVE_BUFFERS: usize = 5;
 
 /// A parsed SVG whose resource and allocation behavior is fixed by this module.
 pub(crate) struct SafeSvg {
@@ -58,23 +60,11 @@ impl SafeSvg {
             return Err(SvgRasterizeError::UnsupportedFeature("pattern paint"));
         }
         let stats = analyze_tree(tree.root())?;
-        let filter_layers = tree.filters().iter().try_fold(0_usize, |total, filter| {
-            total.checked_add(
-                filter
-                    .primitives()
-                    .len()
-                    .saturating_mul(AUXILIARY_BUFFERS_PER_LAYER),
-            )
-        });
-        let allocation_layers = stats
-            .max_allocation_layer_depth
-            .checked_add(filter_layers.ok_or(SvgRasterizeError::Complexity)?)
-            .ok_or(SvgRasterizeError::Complexity)?;
         Ok(Self {
             tree,
             width,
             height,
-            allocation_layers,
+            allocation_layers: stats.max_allocation_layer_depth,
         })
     }
 
@@ -147,7 +137,7 @@ fn validate_pixmap_budget(
     let allocation_layers = u64::try_from(allocation_layers).unwrap_or(u64::MAX);
     // The output pixmap costs four bytes per pixel. Each simultaneously nested
     // isolated or auxiliary buffer can use up to 25x the canvas area in resvg
-    // 0.47. Filter primitive buffers are also included in `allocation_layers`.
+    // 0.48.1. Filter primitive buffers are also included in `allocation_layers`.
     let allocation_factor =
         1_u64.saturating_add(allocation_layers.saturating_mul(MAX_LAYER_AREA_MULTIPLIER));
     let bytes = pixels.saturating_mul(4).saturating_mul(allocation_factor);
@@ -164,6 +154,22 @@ struct TreeStats {
     max_allocation_layer_depth: usize,
 }
 
+impl TreeStats {
+    fn record(
+        &mut self,
+        depth: usize,
+        allocation_layer_depth: usize,
+    ) -> Result<(), SvgRasterizeError> {
+        self.nodes = self.nodes.saturating_add(1);
+        if depth > MAX_TREE_DEPTH || self.nodes > MAX_TREE_NODES {
+            return Err(SvgRasterizeError::Complexity);
+        }
+        self.max_allocation_layer_depth =
+            self.max_allocation_layer_depth.max(allocation_layer_depth);
+        Ok(())
+    }
+}
+
 fn analyze_tree(root: &Group) -> Result<TreeStats, SvgRasterizeError> {
     let mut stats = TreeStats::default();
     analyze_group(root, 0, 0, &mut stats)?;
@@ -176,35 +182,94 @@ fn analyze_group(
     allocation_layer_depth: usize,
     stats: &mut TreeStats,
 ) -> Result<(), SvgRasterizeError> {
-    if depth > MAX_TREE_DEPTH {
-        return Err(SvgRasterizeError::Complexity);
-    }
+    stats.record(depth, allocation_layer_depth)?;
     for node in group.children() {
-        stats.nodes = stats.nodes.saturating_add(1);
-        if stats.nodes > MAX_TREE_NODES {
-            return Err(SvgRasterizeError::Complexity);
-        }
-        if let Node::Group(group) = node {
-            let next_layer_depth =
-                allocation_layer_depth.saturating_add(usize::from(group.should_isolate()));
-            stats.max_allocation_layer_depth =
-                stats.max_allocation_layer_depth.max(next_layer_depth);
-            analyze_group(group, depth + 1, next_layer_depth, stats)?;
-        }
-
-        let mut subroot_result = Ok(());
-        node.subroots(|subroot| {
-            if subroot_result.is_ok() {
-                // Clip and mask subroots can retain a pixmap, alpha mask, and
-                // destination layer concurrently while their children render.
-                let subroot_layer_depth =
-                    allocation_layer_depth.saturating_add(AUXILIARY_BUFFERS_PER_LAYER);
-                stats.max_allocation_layer_depth =
-                    stats.max_allocation_layer_depth.max(subroot_layer_depth);
-                subroot_result = analyze_group(subroot, depth + 1, subroot_layer_depth, stats);
+        match node {
+            Node::Group(group) => {
+                analyze_render_group(group, depth + 1, allocation_layer_depth, stats)?;
             }
-        });
-        subroot_result?;
+            Node::Text(text) => {
+                analyze_render_group(text.flattened(), depth + 1, allocation_layer_depth, stats)?;
+            }
+            Node::Path(path) => {
+                stats.record(depth + 1, allocation_layer_depth)?;
+                if matches!(
+                    path.fill().map(|fill| fill.paint()),
+                    Some(Paint::Pattern(_))
+                ) || matches!(
+                    path.stroke().map(|stroke| stroke.paint()),
+                    Some(Paint::Pattern(_))
+                ) {
+                    return Err(SvgRasterizeError::UnsupportedFeature("pattern paint"));
+                }
+            }
+            Node::Image(_) => {
+                return Err(SvgRasterizeError::UnsupportedFeature("image"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn analyze_render_group(
+    group: &Group,
+    depth: usize,
+    allocation_layer_depth: usize,
+    stats: &mut TreeStats,
+) -> Result<(), SvgRasterizeError> {
+    let layers = allocation_layer_depth.saturating_add(usize::from(group.should_isolate()));
+    analyze_group(group, depth, layers, stats)?;
+
+    if let Some(clip) = group.clip_path() {
+        analyze_clip(clip, depth + 1, layers, stats)?;
+    }
+    if let Some(mask) = group.mask() {
+        analyze_mask(mask, depth + 1, layers, stats)?;
+    }
+    for filter in group.filters() {
+        for (retained_results, primitive) in filter.primitives().iter().enumerate() {
+            let retained_layers = layers.saturating_add(retained_results);
+            stats.record(
+                depth + 1,
+                retained_layers.saturating_add(FILTER_PRIMITIVE_BUFFERS),
+            )?;
+            if let Kind::Image(image) = primitive.kind() {
+                analyze_group(
+                    image.root(),
+                    depth + 1,
+                    retained_layers.saturating_add(1),
+                    stats,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn analyze_clip(
+    clip: &ClipPath,
+    depth: usize,
+    allocation_layer_depth: usize,
+    stats: &mut TreeStats,
+) -> Result<(), SvgRasterizeError> {
+    let layers = allocation_layer_depth.saturating_add(MASK_CLIP_BUFFERS);
+    analyze_group(clip.root(), depth, layers, stats)?;
+    if let Some(linked) = clip.clip_path() {
+        analyze_clip(linked, depth + 1, layers, stats)?;
+    }
+    Ok(())
+}
+
+fn analyze_mask(
+    mask: &Mask,
+    depth: usize,
+    allocation_layer_depth: usize,
+    stats: &mut TreeStats,
+) -> Result<(), SvgRasterizeError> {
+    let layers = allocation_layer_depth.saturating_add(MASK_CLIP_BUFFERS);
+    analyze_group(mask.root(), depth, layers, stats)?;
+    if let Some(linked) = mask.mask() {
+        analyze_mask(linked, depth + 1, layers, stats)?;
     }
     Ok(())
 }
