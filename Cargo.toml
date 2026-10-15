@@ -286,7 +286,7 @@ tree-sitter-json = "0.24"
 tree-sitter-make = "1.1"
 monty = { git = "https://github.com/pydantic/monty.git", tag = "v1.1.0", package = "monty" }
 monty-types = { git = "https://github.com/pydantic/monty.git", tag = "v1.1.0", package = "monty-types" }
-notify = { version = "9.0.0-rc.2", default-features = false, features = ["flume", "macos_fsevent"] }
+notify = { version = "=9.0.0-rc.4", default-features = false, features = ["flume", "macos_fsevent"] }
 serde_yaml = "0.9"
 shell-words = "1"
 agent-client-protocol-schema = { version = "1", features = ["unstable_end_turn_token_usage"] }
