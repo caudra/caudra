@@ -16,11 +16,11 @@ use unicode_width::UnicodeWidthStr;
 use super::{DecisionsModalContext, DecisionsScope, Logged};
 use crate::clock::hms;
 use crate::components::session_picker::age;
-use crate::components::{escape_terminal_controls, format_integer, json_text};
+use crate::components::{decision_view, escape_terminal_controls, format_integer, json_text};
 use crate::theme::Theme;
 
 const INDENT: &str = "  ";
-const LABEL_COLS: usize = 14;
+const LABEL_COLS: usize = 16;
 const COLUMN_GAP: &str = "  ";
 const LIST_GAP: &str = " \u{b7} ";
 const DASH: &str = "\u{2014}";
@@ -73,7 +73,9 @@ pub(super) const ACTIVITY_FOOTNOTE: [&str; 2] = [
     "Agreement compares raw answers with partial labels.",
     "Effects are a partial record.",
 ];
-pub(super) const JSON_SECTIONS: [&str; 5] = ["State", "Questions", "Answers", "Meta", "Label"];
+const ANSWERS_SECTION: &str = "Answers";
+pub(super) const JSON_SECTIONS: [&str; 5] =
+    ["State", "Questions", ANSWERS_SECTION, "Meta", "Label"];
 
 pub(super) fn overview(ctx: &DecisionsModalContext, theme: &Theme) -> Vec<Line<'static>> {
     let config = ctx.config;
@@ -623,11 +625,20 @@ fn mark(present: bool, glyph: &'static str, style: Style) -> Span<'static> {
     }
 }
 
+/// How a decision's answers are drawn: as the bars of each verdict where they read as such, or as
+/// the JSON the log holds.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Answers {
+    Bars { width: usize },
+    Json,
+}
+
 pub(super) fn recent_detail(
     decision: &LoggedDecision,
     session: &str,
     clock: ClockFormat,
     now: u64,
+    answers: Answers,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
     let record = &decision.record;
@@ -711,6 +722,14 @@ pub(super) fn recent_detail(
         ),
     ];
     let label = label.and_then(|label| serde_json::to_value(label).ok());
+    let verdicts = match answers {
+        Answers::Bars { width } => record
+            .answers
+            .as_ref()
+            .and_then(|answers| decision_view::from_logged(&record.questions, answers))
+            .map(|verdicts| (verdicts, width)),
+        Answers::Json => None,
+    };
     let sections = [
         Some(&record.state),
         Some(&record.questions),
@@ -724,7 +743,12 @@ pub(super) fn recent_detail(
         };
         lines.push(Line::default());
         lines.push(heading(title, theme));
-        lines.extend(json_lines(value));
+        match &verdicts {
+            Some((verdicts, width)) if title == ANSWERS_SECTION => {
+                lines.extend(decision_view::rows(verdicts, *width, theme));
+            }
+            _ => lines.extend(json_lines(value)),
+        }
     }
     lines
 }

@@ -34,6 +34,7 @@ use crate::theme::{self, Theme};
 
 pub(crate) const TITLE: &str = " Decisions ";
 pub(crate) const COPY_LABEL: &str = "y";
+pub(crate) const JSON_LABEL: &str = "j";
 pub(crate) const COPIED_DECISION: &str = "Copied decision";
 pub(crate) const COPIED_SECTION: &str = "Copied section";
 pub(crate) const NOTHING_TO_COPY: &str = "Nothing to copy";
@@ -41,6 +42,7 @@ pub(crate) const NOTHING_TO_COPY: &str = "Nothing to copy";
 /// whole list loads with the stats and a selection never waits on the disk.
 pub(crate) const RECENT_LIMIT: usize = 200;
 const COPY_KEY: char = COPY_LABEL.as_bytes()[0] as char;
+const JSON_KEY: char = JSON_LABEL.as_bytes()[0] as char;
 const WIDTH_PERCENT: u16 = 90;
 const MAX_HEIGHT_PERCENT: u16 = 85;
 const H_PAD: u16 = 1;
@@ -62,10 +64,11 @@ const AS_OF_PREFIX: &str = "as of ";
 const INFO_GAP: &str = "  ";
 const SECTION_GAP: &str = "  ";
 const KEY_GAP: &str = " ";
-const FOOTER: [(&str, &str, FooterCommand); 5] = [
+const FOOTER: [(&str, &str, FooterCommand); 6] = [
     (key::TAB.label, "Section", FooterCommand::Section),
     (key::SCOPE.label, "Scope", FooterCommand::Scope),
     (COPY_LABEL, "Copy", FooterCommand::Copy),
+    (JSON_LABEL, "JSON", FooterCommand::Json),
     (key::REFRESH.label, "Refresh", FooterCommand::Refresh),
     (ESC_LABEL, "Close", FooterCommand::Close),
 ];
@@ -159,6 +162,7 @@ enum FooterCommand {
     Section,
     Scope,
     Copy,
+    Json,
     Refresh,
     Close,
 }
@@ -255,6 +259,8 @@ pub struct DecisionsModal {
     /// The body as last drawn, which is what `y` copies off every tab but
     /// Recent.
     drawn: Vec<Line<'static>>,
+    /// Recent shows a decision's answers as the JSON it logged rather than as bars.
+    json_answers: bool,
     footer_hits: FooterHits,
     fetch: Watch<DecisionsFetchState>,
 }
@@ -280,6 +286,7 @@ impl DecisionsModal {
             pointer: None,
             reveal_cursor: false,
             drawn: Vec::new(),
+            json_answers: false,
             footer_hits: FooterHits::default(),
             fetch: Watch::default(),
         }
@@ -330,6 +337,7 @@ impl DecisionsModal {
             KeyCode::Tab => self.set_tab(self.tab.step(1)),
             KeyCode::BackTab => self.set_tab(self.tab.step(-1)),
             KeyCode::Char(COPY_KEY) if plain => return self.copy(),
+            KeyCode::Char(JSON_KEY) if plain => self.json_answers = !self.json_answers,
             KeyCode::Char(digit) if plain && digit.is_ascii_digit() => {
                 if let Some(tab) = Tab::from_digit(digit) {
                     self.set_tab(tab);
@@ -442,7 +450,7 @@ impl DecisionsModal {
             0 => self.list_bar = Scrollbar::default(),
             _ => self.render_list(frame, list, rows, logged, &theme),
         }
-        let lines = self.body_lines(ctx, logged, now, &theme);
+        let lines = self.body_lines(ctx, logged, now, usize::from(detail.width), &theme);
         match detail.width {
             0 => {
                 self.body_bar = Scrollbar::default();
@@ -619,6 +627,7 @@ impl DecisionsModal {
             Some(FooterCommand::Section) => self.set_tab(self.tab.step(1)),
             Some(FooterCommand::Scope) => self.cycle_scope(),
             Some(FooterCommand::Copy) => return self.copy(),
+            Some(FooterCommand::Json) => self.json_answers = !self.json_answers,
             Some(FooterCommand::Refresh) => return DecisionsAction::Refresh,
             Some(FooterCommand::Close) => return DecisionsAction::Close,
             None => {}
@@ -800,6 +809,7 @@ impl DecisionsModal {
         ctx: &DecisionsModalContext,
         logged: Logged<'_>,
         now: u64,
+        width: usize,
         theme: &Theme,
     ) -> Vec<Line<'static>> {
         match self.tab {
@@ -820,8 +830,12 @@ impl DecisionsModal {
                 if let Logged::Ready { activity, session } = logged
                     && let Some(decision) = activity.recent.get(self.cursor())
                 {
+                    let answers = match self.json_answers {
+                        true => lines::Answers::Json,
+                        false => lines::Answers::Bars { width },
+                    };
                     body.extend(lines::recent_detail(
-                        decision, session, ctx.clock, now, theme,
+                        decision, session, ctx.clock, now, answers, theme,
                     ));
                 }
                 body
@@ -912,6 +926,7 @@ impl DecisionsModal {
             let enabled = match command {
                 FooterCommand::Scope => self.tab.scoped(),
                 FooterCommand::Copy => self.tab != Tab::Recent || !self.recent().is_empty(),
+                FooterCommand::Json => self.tab == Tab::Recent && !self.recent().is_empty(),
                 FooterCommand::Section | FooterCommand::Refresh | FooterCommand::Close => true,
             };
             footer.command(
@@ -1013,6 +1028,8 @@ mod tests {
     const LOG_PATH: &str = "/state/caudra.db";
     const LOADED_AT: &str = "12:34:56";
     const STATE_MARKER: &str = "state-marker";
+    const FLAG: &str = "flag";
+    const FLAG_PROBABILITY: f64 = 0.2;
     const LABEL_KEY: &str = "expected";
     const LABEL_SOURCE: &str = "user";
     const QUESTION_SET_VERSION: &str = "1";
@@ -1092,8 +1109,8 @@ mod tests {
                 endpoint_kind: EndpointKind::Local,
                 model: MODEL.into(),
                 state: json!({ "marker": STATE_MARKER }),
-                questions: json!({ "flag": { "kind": "noul" } }),
-                answers: Some(json!({ "flag": 0.2 })),
+                questions: json!({ FLAG: { "type": "noul", "instructions": "Flag it?" } }),
+                answers: Some(json!({ FLAG: { "type": "noul", "noul": FLAG_PROBABILITY } })),
                 error: None,
                 latency_ms: LATENCY_MS,
                 mode: FeatureMode::Advise.as_str().into(),
@@ -1101,7 +1118,7 @@ mod tests {
                 meta: json!({}),
             },
             label: Some(DecisionLabel {
-                expected: json!({ "flag": false }),
+                expected: json!({ FLAG: false }),
                 source: LABEL_SOURCE.into(),
                 timestamp: LOGGED_AT,
                 meta: json!({}),
@@ -1468,6 +1485,31 @@ mod tests {
         }
         assert!(screen.contains(STATE_MARKER), "{screen}");
         assert!(screen.contains(LABEL_KEY), "{screen}");
+    }
+
+    /// Answers read as bars, `j` shows the JSON the log holds instead, and again brings the bars
+    /// back.
+    #[test]
+    fn j_switches_the_answers_between_bars_and_json() {
+        let fixture = Fixture::new(true);
+        let mut modal = opened(snapshot());
+        let _ = type_char(&mut modal, '4');
+        let verdict = format!("{FLAG}  PREDICATE");
+        let json = format!("\"noul\": {FLAG_PROBABILITY}");
+
+        let bars = draw(&mut modal, &fixture, WIDE, TALL);
+        assert!(
+            bars.contains(&verdict) && bars.contains("no 80.0%"),
+            "{bars}"
+        );
+        assert!(!bars.contains(&json), "{bars}");
+
+        assert_eq!(type_char(&mut modal, 'j'), DecisionsAction::Consumed);
+        let raw = draw(&mut modal, &fixture, WIDE, TALL);
+        assert!(raw.contains(&json) && !raw.contains(&verdict), "{raw}");
+
+        let _ = type_char(&mut modal, 'j');
+        assert!(draw(&mut modal, &fixture, WIDE, TALL).contains(&verdict));
     }
 
     #[test]

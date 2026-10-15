@@ -1207,7 +1207,7 @@ fn shared_prefix(text: &str, other: &str) -> usize {
         .sum()
 }
 
-pub(super) fn truncate_label(label: &str, max_width: usize) -> String {
+pub(crate) fn truncate_label(label: &str, max_width: usize) -> String {
     if label.width() <= max_width {
         return label.to_string();
     }

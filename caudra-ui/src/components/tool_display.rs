@@ -1146,7 +1146,16 @@ pub(super) fn compact_args_for(
     raw_input: Option<&serde_json::Value>,
     output: Option<&ToolOutput>,
 ) -> Option<String> {
-    if matches!(output, Some(ToolOutput::Tasks(_))) {
+    if matches!(
+        output,
+        Some(
+            ToolOutput::Tasks(_)
+                | ToolOutput::Mcp(McpOutput {
+                    helper: Some(_),
+                    ..
+                })
+        )
+    ) {
         return None;
     }
     let row = compact_row(tool);

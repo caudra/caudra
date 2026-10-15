@@ -1090,7 +1090,7 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
         // Every row of a child answers for it, whether or not a click would
         // change what is drawn: this is also how a dispatched child's rows are
         // traced back to the subagent they belong to.
-        let target = Some(RowTarget::Item(index));
+        let target = (!always_whole(entry)).then_some(RowTarget::Item(index));
         // The separator sits above a child that exists, so the trunk always has
         // somewhere left to go: drawn blank it would cut the tree in two at
         // every body.
@@ -2995,6 +2995,18 @@ impl BatchViews {
     }
 }
 
+/// A child whose answer is its whole point and reads short, a snippet's `decide()` or `rerank()`,
+/// always draws whole: it has no fold, no window, and no click of its own.
+fn always_whole(entry: &BatchToolEntry) -> bool {
+    matches!(
+        &entry.output,
+        Some(ToolOutput::Mcp(McpOutput {
+            helper: Some(_),
+            ..
+        }))
+    )
+}
+
 fn index_set(indices: impl IntoIterator<Item = usize>) -> Arc<[usize]> {
     let mut indices: Vec<usize> = indices.into_iter().collect();
     indices.sort_unstable();
@@ -3275,7 +3287,8 @@ impl RenderLimits {
     /// The views and the reports name this card's children, so both are
     /// dropped on the way in or a nested batch would read them as its own.
     fn child(&self, index: usize, entry: &BatchToolEntry) -> Option<Self> {
-        let open = self.views.is_open(index);
+        let whole = always_whole(entry);
+        let open = whole || self.views.is_open(index);
         if (self.policy.compact || self.body_taken) && !open {
             return None;
         }
@@ -3295,11 +3308,14 @@ impl RenderLimits {
         {
             return None;
         }
-        let scroll = self
-            .child_scroll
-            .get(&index)
-            .copied()
-            .or_else(|| self.policy.window(&entry.tool, 0, true));
+        let scroll = match whole {
+            true => None,
+            false => self
+                .child_scroll
+                .get(&index)
+                .copied()
+                .or_else(|| self.policy.window(&entry.tool, 0, true)),
+        };
         let budget = match scroll {
             Some(window) => window.height,
             None if open => usize::MAX,
@@ -3865,10 +3881,12 @@ pub(crate) fn render_mcp_content(
         );
     }
     let card = mcp_card::render(call, !lines.is_empty(), output, limits.budget, limits.width);
-    // The card's rows name no source, and copying them as nothing is worse
-    // than scraping them back.
-    if !card.lines.is_empty() {
-        trace.abandon();
+    match output.and_then(mcp_card::decisions::copied) {
+        Some(answer) => trace.record(lines.len(), whole_source(answer, &card.lines)),
+        // The card's rows name no source, and copying them as nothing is worse
+        // than scraping them back.
+        None if !card.lines.is_empty() => trace.abandon(),
+        None => {}
     }
     let mut links = LinkMap::none_for(&lines);
     links.rows.extend(card.links.rows);
@@ -3887,6 +3905,24 @@ pub(crate) fn render_mcp_content(
         limits.width,
     );
     (content, card.has_raw_view)
+}
+
+/// Rows that all stand for `text` as a whole, so a selection touching any of them copies all of it,
+/// once.
+fn whole_source(text: String, lines: &[Line<'static>]) -> BodySource {
+    let whole = 0..text.len() as u32;
+    let rows = lines
+        .iter()
+        .map(|line| LineProvenance {
+            line: Some(whole.clone()),
+            spans: vec![SpanSource::Range(Source::atomic(whole.clone())); line.spans.len()],
+        })
+        .collect();
+    BodySource {
+        text,
+        rows,
+        code: Vec::new(),
+    }
 }
 
 /// The card, broken to the width it will be drawn at.

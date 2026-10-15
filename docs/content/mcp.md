@@ -140,7 +140,7 @@ Calls that ran before a failure keep their effects. When a run fails, the model 
 
 ### Decisions and reranking
 
-With the [decision engine](/docs/configuration/#decisions) on and a base URL set, snippets get two more functions, `decide()` and `rerank()`. They let a snippet judge and sort what its servers returned before any of it reaches the model:
+With the [decision engine](/docs/configuration/#decisions) on and a base URL set, snippets get two more functions, `decide()` and `rerank()`. They are helpers for what a snippet's servers return, not tools of their own: a snippet calls a server, then judges, filters, or sorts the result before any of it reaches the model, or branches on a judgement without another round trip. The model's list of servers tells it to use them this way:
 
 ```python
 issues = await github.list_issues(owner="caudra", repo="caudra", state="open")
@@ -160,7 +160,9 @@ ranked = await rerank("crashes when saving a file", titles, threshold=0.5, top_k
 
 The model learns about both functions from the `# MCP servers` reminder, which lists them only while the engine is on. Without the engine they do not exist, and a snippet that calls one raises `NameError`. The `mcp` tool still appears only while a server is enabled.
 
-A call needs no approval and works in plan mode, since it only reads. A malformed question or argument raises `TypeError` or `ValueError` before anything is sent. An unreachable engine, a timeout, a refusal, or an invalid answer raises `RuntimeError`, and one failed request fails the whole `rerank()`. The card shows each call as a row, and the opt-in [decision log](/docs/permissions/#decision-engine-advice) records it under the feature `mcp`. Answers are data for the snippet: they never grant a permission.
+A call needs no approval and works in plan mode, since it only reads. A malformed question or argument raises `TypeError` or `ValueError` before anything is sent. An unreachable engine, a timeout, a refusal, or an invalid answer raises `RuntimeError`, and one failed request fails the whole `rerank()`. The opt-in [decision log](/docs/permissions/#decision-engine-advice) records each call under the feature `mcp`. Answers are data for the snippet: they never grant a permission.
+
+The card shows each call as a row. A `decide()` row lists its verdicts, such as `severity high 82.4% · parser_bug yes 91.0%`, and a `rerank()` row says how many candidates it kept and names the best one. Both rows always show in full: a `decide()` row shows each question with a bar for every option. The likeliest option is highlighted, and a winner below 60% is marked uncertain alongside the runner-up. A `rerank()` row shows the candidates it kept, best first, each with its score and the label it was given. Click the row's footer to switch to the JSON the snippet received, and click it again to go back. Selecting any part of either view copies that JSON whole.
 
 ### Variables between runs
 

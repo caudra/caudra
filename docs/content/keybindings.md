@@ -306,6 +306,7 @@ Some pickers add extra bindings on top of the defaults:
 | Decisions | `Left` / `Right` | Focus the list or the detail |
 | Decisions | `g` | Cycle the scope: this session, this project, every session |
 | Decisions | `y` | Copy the selected decision as JSON, or the visible section |
+| Decisions | `j` | Show a decision's answers as JSON, or as bars again |
 | Decisions | `Ctrl+R` | Read the decision log again |
 | Autopilot Panel | `Tab` / `Shift+Tab` | Switch between Status and Log |
 | Autopilot Panel | `1-2` | Jump to Status or Log |

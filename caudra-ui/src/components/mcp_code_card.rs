@@ -7,13 +7,14 @@ use caudra_agent::mcp::code::output::{
 };
 use caudra_agent::tools::ToolEffect;
 use caudra_agent::{
-    BatchToolEntry, BatchToolStatus, MCP_SUMMARY_PREFIX, McpBlock, McpOutput, ToolOutput,
-    pretty_json,
+    BatchToolEntry, BatchToolStatus, MCP_SUMMARY_PREFIX, McpBlock, McpHelper, McpOutput,
+    ToolOutput, pretty_json,
 };
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use super::code_view::{BodySource, body_window, json_body, plain_body, truncation_line};
+use super::mcp_card::decisions;
 use crate::theme;
 
 const PRINTED_LABEL: &str = "Printed";
@@ -42,8 +43,12 @@ fn entry(call: &McpCodeCall) -> BatchToolEntry {
         McpCodeCallStatus::Error | McpCodeCallStatus::Refused => BatchToolStatus::Error,
     };
     let output = shown_output(call);
+    let summary = match call.helper {
+        Some(helper) => helper_summary(call, helper),
+        None => format!("{MCP_SUMMARY_PREFIX}{tool}"),
+    };
     BatchToolEntry {
-        summary: format!("{MCP_SUMMARY_PREFIX}{tool}"),
+        summary,
         tool,
         effect: ToolEffect::Unknown,
         status,
@@ -65,6 +70,7 @@ fn shown_output(call: &McpCodeCall) -> Option<ToolOutput> {
     {
         return Some(ToolOutput::Mcp(McpOutput {
             interactions,
+            helper: call.helper,
             ..output.clone()
         }));
     }
@@ -78,6 +84,16 @@ fn shown_output(call: &McpCodeCall) -> Option<ToolOutput> {
         interactions,
         ..McpOutput::default()
     }))
+}
+
+/// A helper row's line: the verdicts once it has answered, and the call as the snippet made it
+/// until then or when it failed.
+fn helper_summary(call: &McpCodeCall, helper: McpHelper) -> String {
+    call.output
+        .as_ref()
+        .filter(|_| call.status == McpCodeCallStatus::Success)
+        .and_then(|output| decisions::summary(helper, Some(&call.input), output))
+        .unwrap_or_else(|| call.called_as.clone())
 }
 
 /// What the snippet printed and ended on, each held to `budget` lines, then how it failed. The

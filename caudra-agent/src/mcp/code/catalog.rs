@@ -32,8 +32,10 @@ const TOOLS: &str = "tools";
 const MAX_FAILURE_CHARS: usize = 120;
 /// Appended when the session has a decision engine, which the helpers need.
 const DECISIONS_SECTION: &str = "\n\n## Decision helpers\n\
+Use these inside a snippet on what server tools returned, so only what matters reaches you: rank or filter a large result before returning it, or triage and branch on a judgement without another round trip. They reach no server and change nothing.\n\
 - `await decide(input, questions)`: typed answers about `input`. `questions` is a list in the OpenAI Decisions shape. Every question has `type`, `name`, and `instructions`: a `predicate`, a `choice` that adds `choices`, or a `score` that adds `levels`. Read answers by name: `r[\"by_name\"][\"urgent\"][\"probability\"]`.\n\
-- `await rerank(query, candidates, threshold=None, top_k=None)`: `[{\"index\", \"score\"}]`, most relevant first, for up to 256 strings or small dicts. Filter and sort large results with it before returning them.";
+- `await rerank(query, candidates, threshold=None, top_k=None)`: `[{\"index\", \"score\"}]`, most relevant first, for up to 256 strings or small dicts.\n\
+Example: `issues = await github.list_issues(repo=\"r\")`, then `top = await rerank(\"crashes on startup\", [i[\"title\"] for i in issues], top_k=10)`, and return `[issues[t[\"index\"]] for t in top]`.";
 
 /// What keeps a server's tools out of reach, or `None` when it is connected.
 pub fn unavailable(state: &ServerState) -> Option<String> {

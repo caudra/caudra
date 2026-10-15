@@ -18,7 +18,7 @@ pub use mcp::config::{McpConfigError, McpConfigErrors, McpServerInfo, McpServerS
 pub use mcp::elicitation::ElicitAction;
 pub use mcp::kind::{McpCallFacts, McpServerKind};
 pub use mcp::output::{
-    MCP_SUMMARY_PREFIX, McpBlock, McpInteraction, McpOutput, mcp_tool_parts, pretty_json,
+    MCP_SUMMARY_PREFIX, McpBlock, McpHelper, McpInteraction, McpOutput, mcp_tool_parts, pretty_json,
 };
 pub use mcp::protocol::PromptRole;
 pub use mcp::{

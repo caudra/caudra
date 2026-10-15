@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::mcp::SEPARATOR;
-use crate::mcp::output::{McpInteraction, McpOutput};
+use crate::mcp::output::{McpHelper, McpInteraction, McpOutput};
 use crate::tools::ToolFailure;
 use crate::types::counted;
 
@@ -107,6 +107,9 @@ pub struct McpCodeCall {
     /// What the server asked the user during the call, whether or not it answered.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interactions: Vec<McpInteraction>,
+    /// The helper this call was, when it was not a server's tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub helper: Option<McpHelper>,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -258,6 +261,9 @@ impl McpCodeCall {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+    use test_case::test_case;
+
     use super::*;
 
     const RESULT: &str = "5";
@@ -283,5 +289,18 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains(REPAIR), "{text}");
+    }
+
+    /// Calls saved before helpers were marked load as server calls, and a marked one loads as it
+    /// was.
+    #[test_case(json!({"server": "s", "tool": "t", "input": {}, "status": "success"}), None ; "saved_before_helpers")]
+    #[test_case(json!({"server": "s", "tool": "t", "input": {}, "status": "success", "helper": "rerank"}), Some(McpHelper::Rerank) ; "rerank")]
+    #[test_case(json!({"server": "s", "tool": "t", "input": {}, "status": "success", "helper": "decide"}), Some(McpHelper::Decide) ; "decide")]
+    fn a_stored_call_keeps_its_helper(stored: Value, helper: Option<McpHelper>) {
+        let call: McpCodeCall = serde_json::from_value(stored).unwrap();
+        assert_eq!(call.helper, helper);
+        let again: McpCodeCall =
+            serde_json::from_value(serde_json::to_value(&call).unwrap()).unwrap();
+        assert_eq!(again, call);
     }
 }

@@ -38,7 +38,7 @@ use crate::agent::change_recording::{self, Recording};
 use crate::agent::tool_dispatch::error_type;
 use crate::decisions::Decisions;
 use crate::mcp::call::CallScope;
-use crate::mcp::output::{McpBlock, McpInteraction, McpOutput, decoded_len};
+use crate::mcp::output::{McpBlock, McpHelper, McpInteraction, McpOutput, decoded_len};
 use crate::mcp::resources::{ResourceContents, ResourceLists};
 use crate::mcp::{McpSession, McpToolBinding, SEPARATOR};
 use crate::permissions::{
@@ -551,9 +551,9 @@ impl Gateway {
     /// the engine is the user's own, and an answer is data that grants nothing.
     async fn decision(self, decisions: Decisions, call: ScriptCall) -> ScriptReply {
         let rerank = call.name == RERANK_HELPER;
-        let (helper, params) = match rerank {
-            true => (RERANK_HELPER, RERANK_PARAMS),
-            false => (DECIDE_HELPER, DECIDE_PARAMS),
+        let (helper, params, marked) = match rerank {
+            true => (RERANK_HELPER, RERANK_PARAMS, McpHelper::Rerank),
+            false => (DECIDE_HELPER, DECIDE_PARAMS, McpHelper::Decide),
         };
         let arguments = bind(helper, params, &call)?;
         let pending = match rerank {
@@ -574,6 +574,7 @@ impl Gateway {
             tool: helper.to_owned(),
             called_as,
             input: Value::Object(arguments),
+            helper: Some(marked),
             ..McpCodeCall::default()
         });
         let started = Instant::now();
@@ -1784,6 +1785,7 @@ mod tests {
         );
         assert_eq!(calls[0].called_as, "decide: severity, parser_bug, team");
         assert_eq!(calls[0].status, McpCodeCallStatus::Success);
+        assert_eq!(calls[0].helper, Some(McpHelper::Decide));
     }
 
     #[test]
@@ -1803,7 +1805,9 @@ mod tests {
             reply,
             json!([{"index": 1, "score": RELEVANT_SCORE}, {"index": 2, "score": RELEVANT_SCORE}])
         );
-        assert_eq!(gateway.finish()[0].called_as, "rerank: 4 candidates");
+        let calls = gateway.finish();
+        assert_eq!(calls[0].called_as, "rerank: 4 candidates");
+        assert_eq!(calls[0].helper, Some(McpHelper::Rerank));
     }
 
     /// A batch of 16 outlasts one decision, so a rerank without a timeout gets the rerank

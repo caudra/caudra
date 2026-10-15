@@ -20,6 +20,7 @@ use crate::components::{escape_terminal_controls, format_bytes};
 use crate::markdown::LinkMap;
 use crate::theme;
 
+pub(crate) mod decisions;
 mod executor;
 mod home_assistant;
 
@@ -255,12 +256,15 @@ pub(crate) fn render(
 /// not: what a recognised server's card read its rows out of, or a
 /// `structuredContent` the generic card leaves to the text beside it.
 fn answer_rows(call: &McpCall<'_>, output: &McpOutput, width: u16, whole: bool) -> (Rows, bool) {
-    let recognised = match output.kind {
-        Some(McpServerKind::Executor) => executor::render(call.raw_tool(), output, width, whole),
-        Some(McpServerKind::HomeAssistant) => {
+    let recognised = match (output.helper, output.kind) {
+        (Some(helper), _) => decisions::render(helper, call.arguments, output, width),
+        (None, Some(McpServerKind::Executor)) => {
+            executor::render(call.raw_tool(), output, width, whole)
+        }
+        (None, Some(McpServerKind::HomeAssistant)) => {
             home_assistant::render(call.raw_tool(), call.arguments, output, width)
         }
-        None => None,
+        (None, None) => None,
     };
     let has_raw_view = recognised.is_some() || unspelled_structured(output).is_some();
     let rows = match recognised {

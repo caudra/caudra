@@ -1757,6 +1757,11 @@ pub const KEYBINDS: &[Keybind] = &[
         context: KeybindContext::Decisions,
     },
     Keybind {
+        label: KeyLabel::Single(decisions_modal::JSON_LABEL),
+        description: "Show a decision's answers as JSON, or as bars again",
+        context: KeybindContext::Decisions,
+    },
+    Keybind {
         label: KeyLabel::Single(key::REFRESH.label),
         description: "Read the decision log again",
         context: KeybindContext::Decisions,

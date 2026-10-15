@@ -46,6 +46,19 @@ pub struct McpOutput {
     /// Why `structuredContent` did not match the tool's `outputSchema`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_mismatch: Option<String>,
+    /// The code-mode helper that answered, so the card draws the answer as that helper's. Its
+    /// call row keeps it; the card is told when it is drawn.
+    #[serde(skip)]
+    pub helper: Option<McpHelper>,
+}
+
+/// A code-mode helper whose answer is not a server's, marked apart from the server name so a
+/// server called `decisions` never reads as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpHelper {
+    Decide,
+    Rerank,
 }
 
 /// One thing the server asked the user during the call, and what came of it.

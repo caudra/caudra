@@ -31,6 +31,7 @@ use self::outline::{
 };
 use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::document_view::COPIED_SELECTION;
+use crate::components::gauge::{self, CELL_EIGHTHS, GAUGE_CLOSE, GAUGE_OPEN};
 use crate::components::modal::{ESC_LABEL, FooterHits, FooterLine, Modal};
 use crate::components::projection_modal::UNPREPARED;
 use crate::components::scrollbar::{ScrollHint, Scrollbar, ScrollbarMouse};
@@ -64,16 +65,7 @@ const HEADER_ROWS: u16 = 2;
 const CHEVRON_COLS: u16 = 2;
 const KIB: usize = 1024;
 const GAUGE_CELLS: usize = 10;
-const CELL_EIGHTHS: usize = 8;
 const GAUGE_EIGHTHS: usize = GAUGE_CELLS * CELL_EIGHTHS;
-/// A cell filled one eighth to seven eighths.
-const PARTIAL_CELLS: [char; 7] = [
-    '\u{258f}', '\u{258e}', '\u{258d}', '\u{258c}', '\u{258b}', '\u{258a}', '\u{2589}',
-];
-const FULL_CELL: char = '\u{2588}';
-const EMPTY_CELL: char = '\u{2591}';
-const GAUGE_OPEN: &str = "\u{2595}";
-const GAUGE_CLOSE: &str = "\u{258f}";
 const SEPARATOR: &str = " \u{b7} ";
 const LIVE_LABEL: &str = "Live view";
 const SESSION_LABEL: &str = "This session";
@@ -1452,18 +1444,10 @@ fn push_gauge(spans: &mut Vec<Span<'static>>, used: usize, over: bool) {
     let kib = used as f64 / KIB as f64;
     push_fact(spans, format!("{kib:.1} of {} KiB ", VIEW / KIB), style);
     let eighths = (used.saturating_mul(GAUGE_EIGHTHS) / VIEW).min(GAUGE_EIGHTHS);
-    let (whole, partial) = (eighths / CELL_EIGHTHS, eighths % CELL_EIGHTHS);
-    let mut fill = FULL_CELL.to_string().repeat(whole);
-    if let Some(index) = partial.checked_sub(1) {
-        fill.push(PARTIAL_CELLS[index]);
-    }
-    let empty = GAUGE_CELLS - whole - usize::from(partial > 0);
+    let (fill, used) = gauge::fill(eighths);
     spans.push(Span::styled(GAUGE_OPEN, t.tool_dim));
     spans.push(Span::styled(fill, style));
-    spans.push(Span::styled(
-        EMPTY_CELL.to_string().repeat(empty),
-        t.tool_dim,
-    ));
+    spans.push(Span::styled(gauge::track(GAUGE_CELLS - used), t.tool_dim));
     spans.push(Span::styled(GAUGE_CLOSE, t.tool_dim));
 }
 

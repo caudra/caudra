@@ -4,6 +4,7 @@ use std::path::{MAIN_SEPARATOR, Path};
 use std::time::{Duration, Instant};
 
 use super::command::ChatScope;
+use super::gauge::{EMPTY_CELL, FULL_CELL, GAUGE_CLOSE, GAUGE_OPEN, PARTIAL_CELLS};
 use super::keybindings::leader;
 use super::tooltip::{Anchor, Tip, TipKey};
 use super::{RetryInfo, Status, escape_terminal_controls, format_elapsed, hover_style};
@@ -156,15 +157,7 @@ const CLICK_QUESTIONS: &str = "Click to answer the oldest";
 const GAUGE_CELLS: u8 = 10;
 const CELL_EIGHTHS: u8 = 8;
 const GAUGE_EIGHTHS: u8 = GAUGE_CELLS * CELL_EIGHTHS;
-/// A cell filled one eighth to seven eighths.
-const PARTIAL_CELLS: [char; 7] = [
-    '\u{258f}', '\u{258e}', '\u{258d}', '\u{258c}', '\u{258b}', '\u{258a}', '\u{2589}',
-];
-const FULL_CELL: char = '\u{2588}';
-const EMPTY_CELL: char = '\u{2591}';
 const GAUGE_TICK: &str = "\u{2502}";
-const GAUGE_OPEN: &str = "\u{2595}";
-const GAUGE_CLOSE: &str = "\u{258f}";
 
 /// What the bar says about the session's runs: the chip that names what is
 /// going on, and the count it falls back to when the columns run out.

@@ -25,7 +25,7 @@ use caudra_agent::tools::{
     TOOL_OUTPUT_TOOL_NAME, ToolEffect, VIEW_IMAGE_TOOL_NAME,
 };
 use caudra_agent::{
-    ActivityChild, CodeGraphRow, GrepFileEntry, GrepMatchGroup, McpBlock, McpOutput,
+    ActivityChild, CodeGraphRow, GrepFileEntry, GrepMatchGroup, McpBlock, McpHelper, McpOutput,
     NO_FILES_FOUND, SearchCap, ShellFilterInfo, ShellOutput, SkillOutput, SnapshotLine,
     SnapshotSpan, SpanStyle, SubagentActivity, SubagentProgress, ToolAccounting, ToolInput,
     ToolOutput,
@@ -14034,4 +14034,98 @@ fn an_mcp_code_call_trades_its_card_for_its_data_and_back() {
     assert!(panel.toggle_expansion_at(batch_row(&panel, RowTarget::Raw(0)), area));
     render(&mut panel, 80, 24);
     assert!(!shows_data(&panel), "{MCP_RAW_SWITCH_MSG}");
+}
+
+/// A `rerank()` row names what it kept on its line rather than its arguments, always shows the
+/// ranked candidates, and switches to the answer it returned.
+#[test]
+fn a_rerank_row_reads_its_ranking_and_switches_to_its_answer() {
+    const BATCH_ID: &str = "t1";
+    const KEPT: &str = "Kept 1 of 2 \u{b7} parser.rs 62.0%";
+    const NOT_KEPT: &str = "1 not kept";
+    const RAW_INDEX: &str = "\"index\": 1";
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start(BATCH_ID, MCP_TOOL_NAME));
+    let answer = serde_json::json!([{"index": 1, "score": 0.62}]);
+    panel.tool_done(ToolDoneEvent {
+        tool: MCP_TOOL_NAME.into(),
+        output: ToolOutput::McpCode(McpCodeOutput {
+            calls: vec![McpCodeCall {
+                server: "decisions".into(),
+                tool: "rerank".into(),
+                input: serde_json::json!({"query": "where parse errors are", "candidates": ["lexer.rs", "parser.rs"]}),
+                status: McpCodeCallStatus::Success,
+                output: Some(McpOutput {
+                    blocks: vec![McpBlock::Text {
+                        text: serde_json::to_string_pretty(&answer).unwrap(),
+                    }],
+                    ..McpOutput::default()
+                }),
+                helper: Some(McpHelper::Rerank),
+                ..McpCodeCall::default()
+            }],
+            ..McpCodeOutput::default()
+        }),
+        ..done(BATCH_ID)
+    });
+    render(&mut panel, 80, 24);
+    let card = seg_text(&panel, BATCH_ID);
+    assert!(card.contains(KEPT), "{card}");
+    assert!(!card.contains("query="), "{card}");
+    assert!(card.contains(NOT_KEPT), "{card}");
+    assert!(!card.contains(RAW_INDEX), "{MCP_RAW_SWITCH_MSG}: {card}");
+
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.toggle_expansion_at(batch_row(&panel, RowTarget::Raw(0)), area));
+    render(&mut panel, 80, 24);
+    let raw = seg_text(&panel, BATCH_ID);
+    assert!(raw.contains(RAW_INDEX), "{MCP_RAW_SWITCH_MSG}: {raw}");
+}
+
+/// A selection over any row of a `decide()` or `rerank()` card copies the answer the snippet
+/// received, whole, in the card view as in the raw one.
+#[test_case(false ; "card_view")]
+#[test_case(true ; "raw_view")]
+fn copying_a_rerank_card_copies_its_answer(raw: bool) {
+    const COPIED_ANSWER_MSG: &str = "a decision card copies as the JSON the snippet received";
+    let answer =
+        serde_json::to_string_pretty(&serde_json::json!([{"index": 1, "score": 0.62}])).unwrap();
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start(TOOL_ID, MCP_TOOL_NAME));
+    panel.tool_done(ToolDoneEvent {
+        tool: MCP_TOOL_NAME.into(),
+        output: ToolOutput::McpCode(McpCodeOutput {
+            calls: vec![McpCodeCall {
+                server: "decisions".into(),
+                tool: "rerank".into(),
+                input: serde_json::json!({"query": "parse errors", "candidates": ["lexer.rs", "parser.rs"]}),
+                status: McpCodeCallStatus::Success,
+                output: Some(McpOutput {
+                    blocks: vec![McpBlock::Text {
+                        text: answer.clone(),
+                    }],
+                    ..McpOutput::default()
+                }),
+                helper: Some(McpHelper::Rerank),
+                ..McpCodeCall::default()
+            }],
+            ..McpCodeOutput::default()
+        }),
+        ..done(TOOL_ID)
+    });
+    let area = Rect::new(0, 0, COPY_WIDTH, COPY_HEIGHT);
+    render(&mut panel, COPY_WIDTH, COPY_HEIGHT);
+    if raw {
+        assert!(panel.toggle_expansion_at(batch_row(&panel, RowTarget::Raw(0)), area));
+        render(&mut panel, COPY_WIDTH, COPY_HEIGHT);
+    }
+
+    let last_body_row = u32::from(batch_row(&panel, RowTarget::Raw(0))) - 1;
+    let sel = make_sel(area, (last_body_row, 0), (last_body_row, COPY_WIDTH - 1));
+
+    assert_eq!(
+        panel.extract_selection_text(&sel, area),
+        answer,
+        "{COPIED_ANSWER_MSG}"
+    );
 }
