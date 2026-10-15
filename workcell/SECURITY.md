@@ -386,7 +386,7 @@ run in a separate `monty` worker process, never in the server process. The worke
 filesystem access, no network access, no ability to spawn processes, and an explicitly empty
 environment, so `os.getenv` and `os.environ` observe nothing from the host and file access raises
 `PermissionError`. Each call is fed a fresh interpreter state, so nothing persists between calls.
-Workcell overrides Monty 1.0's system-clock, entropy, and sleep defaults: those operations suspend
+Workcell overrides Monty's system-clock, entropy, and sleep defaults: those operations suspend
 and are refused, process-time reads return zero, and the virtual timezone is UTC. No mounts or host
 functions are installed. Explicitly seeded random computation and arithmetic on supplied dates
 remain local to the interpreter.
@@ -545,7 +545,7 @@ appropriate. Protocol headers are routing and consistency checks, not authentica
 - Selected transfers check identity and content before publication or streaming, but cannot isolate
   the filesystem from external writers. Clients must verify downloaded length and digest before
   publishing locally, and replacement retains the revision-check/rename race described above.
-- Monty 1.0 has a version-coupled worker protocol. Workcell pins the
+- Monty has a version-coupled worker protocol. Workcell pins the
   `monty-pool` dependency and the installed worker to the same release and they must be upgraded
   together; the build fails when the pins diverge and the pool reports any remaining skew as a fatal
   error on the first checkout. Treat interpreter escape as possible and do not rely on the code tool

@@ -1103,7 +1103,7 @@ name = "caudra-interpreter"
 version = "0.2.0-preview.8"
 dependencies = [
  "monty",
- "monty-types 1.0.0 (git+https://github.com/pydantic/monty.git?tag=v1.0.0)",
+ "monty-types 1.1.0 (git+https://github.com/pydantic/monty.git?tag=v1.1.0)",
  "serde_json",
  "test-case",
  "thiserror 2.0.18",
@@ -5355,8 +5355,8 @@ dependencies = [
 
 [[package]]
 name = "monty"
-version = "1.0.0"
-source = "git+https://github.com/pydantic/monty.git?tag=v1.0.0#85c5d1f6bef038405cfc40a4eed94806e303567e"
+version = "1.1.0"
+source = "git+https://github.com/pydantic/monty.git?tag=v1.1.0#591527397445bf734873252d1ee20c1b6308fe7f"
 dependencies = [
  "ahash",
  "chrono",
@@ -5370,8 +5370,8 @@ dependencies = [
  "libm",
  "memchr",
  "minicbor-serde",
- "monty-macros 1.0.0 (git+https://github.com/pydantic/monty.git?tag=v1.0.0)",
- "monty-types 1.0.0 (git+https://github.com/pydantic/monty.git?tag=v1.0.0)",
+ "monty-macros 1.1.0 (git+https://github.com/pydantic/monty.git?tag=v1.1.0)",
+ "monty-types 1.1.0 (git+https://github.com/pydantic/monty.git?tag=v1.1.0)",
  "num-bigint",
  "num-integer",
  "num-traits",
@@ -5395,21 +5395,21 @@ dependencies = [
 
 [[package]]
 name = "monty-fs"
-version = "1.0.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b832703ccfaedaae9930ec8984eb37db2998b0fd1ab97bd556551dd4479e5b4"
+checksum = "2e1edf72887e131762ef991f67d4a8fd126554460e0ea8b0dec8a068cf7cf167"
 dependencies = [
  "ahash",
  "cap-std",
- "monty-types 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "monty-types 1.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustix 1.1.4",
 ]
 
 [[package]]
 name = "monty-macros"
-version = "1.0.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18acfe594cfe965254e684f128ec6e0a2e63774bf4ec8eb7eb5b13fd4a182a22"
+checksum = "ff5176d386cd79f7e181c703e10314375ffd3d550285da672da9ae8e5952b751"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5418,8 +5418,8 @@ dependencies = [
 
 [[package]]
 name = "monty-macros"
-version = "1.0.0"
-source = "git+https://github.com/pydantic/monty.git?tag=v1.0.0#85c5d1f6bef038405cfc40a4eed94806e303567e"
+version = "1.1.0"
+source = "git+https://github.com/pydantic/monty.git?tag=v1.1.0#591527397445bf734873252d1ee20c1b6308fe7f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5428,14 +5428,14 @@ dependencies = [
 
 [[package]]
 name = "monty-pool"
-version = "1.0.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0132326a4dc93d42ced6738e638d38a96cf977963316aaf1df5fafefa8d69136"
+checksum = "dce5d1666e27e0fcdad9e0f1aec467d5cd7f595b8f1f270e4f7a1d4ea6867b14"
 dependencies = [
  "futures-util",
  "monty-fs",
  "monty-proto",
- "monty-types 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "monty-types 1.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustls",
  "tokio",
  "tokio-tungstenite",
@@ -5443,24 +5443,24 @@ dependencies = [
 
 [[package]]
 name = "monty-proto"
-version = "1.0.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ecd13d16939361f670687b545ff20d726f0bcdb4c35f1a5a04fa4cb3ed3e5ae"
+checksum = "f62ede58a8426cfcd96ef1a8222579980c771f54ee63b5c20dabcfa7d3d72f85"
 dependencies = [
- "monty-types 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "monty-types 1.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "num-bigint",
  "prost",
 ]
 
 [[package]]
 name = "monty-types"
-version = "1.0.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb42ab8791581458d83352f53028cf84a9225ab22e9c6093e12fd06877ce7ac4"
+checksum = "d80ebea7f98c1e7ad4075c111e03c59ef80d18abd813f1fad8984f8c4827d95d"
 dependencies = [
  "chrono",
  "jiff",
- "monty-macros 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "monty-macros 1.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "num-bigint",
  "num-traits",
  "serde",
@@ -5472,12 +5472,12 @@ dependencies = [
 
 [[package]]
 name = "monty-types"
-version = "1.0.0"
-source = "git+https://github.com/pydantic/monty.git?tag=v1.0.0#85c5d1f6bef038405cfc40a4eed94806e303567e"
+version = "1.1.0"
+source = "git+https://github.com/pydantic/monty.git?tag=v1.1.0#591527397445bf734873252d1ee20c1b6308fe7f"
 dependencies = [
  "chrono",
  "jiff",
- "monty-macros 1.0.0 (git+https://github.com/pydantic/monty.git?tag=v1.0.0)",
+ "monty-macros 1.1.0 (git+https://github.com/pydantic/monty.git?tag=v1.1.0)",
  "num-bigint",
  "num-traits",
  "serde",
@@ -10398,7 +10398,7 @@ name = "workcell-mcp-code"
 version = "0.2.0-preview.8"
 dependencies = [
  "monty-pool",
- "monty-types 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "monty-types 1.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rmcp",
  "schemars 1.2.1",
  "serde",

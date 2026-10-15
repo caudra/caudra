@@ -9,9 +9,9 @@
       "kind": "license",
       "sha256": "5841db47ee6e1f0becafe2d19ca43c08cbc6d2c0952822ccf88cbbf2bd0749bd",
       "repository": "https://github.com/pydantic/monty",
-      "revision": "85c5d1f6bef038405cfc40a4eed94806e303567e",
+      "revision": "591527397445bf734873252d1ee20c1b6308fe7f",
       "upstream_path": "LICENSE",
-      "url": "https://raw.githubusercontent.com/pydantic/monty/85c5d1f6bef038405cfc40a4eed94806e303567e/LICENSE",
+      "url": "https://raw.githubusercontent.com/pydantic/monty/591527397445bf734873252d1ee20c1b6308fe7f/LICENSE",
       "git_blob_sha1": "d30ac52dc1727d9b88cc1ce816a70ca66dc5df31"
     },
     {
@@ -55,7 +55,7 @@
       "git_blob_sha1": "66f2fa32dff88afeceb8d5f9e3093f6b9b604f98"
     },
     {
-      "path": "THIRD_PARTY_LICENSES/dependencies/monty-typeshed-1.0.0/LICENSE-typeshed",
+      "path": "THIRD_PARTY_LICENSES/dependencies/monty-typeshed-1.1.0/LICENSE-typeshed",
       "kind": "embedded_component_license",
       "sha256": "295f8538c94ae5c3043301cf7cff1c852dab6a786a8ddee471e061b40d5ecabe",
       "repository": "https://github.com/python/typeshed",
@@ -356,17 +356,93 @@
       ]
     },
     {
-      "name": "monty-fs",
-      "version": "1.0.0",
+      "name": "monty",
+      "version": "1.1.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "9b832703ccfaedaae9930ec8984eb37db2998b0fd1ab97bd556551dd4479e5b4",
+      "checksum": "c695cb21c9535024e263084451d767d965f69ef65658f24f3a7507763680b81e",
       "declared_license": "MIT",
       "repository": "https://github.com/pydantic/monty",
-      "revision": "85c5d1f6bef038405cfc40a4eed94806e303567e",
+      "revision": "591527397445bf734873252d1ee20c1b6308fe7f",
+      "path_in_vcs": "crates/monty",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "591527397445bf734873252d1ee20c1b6308fe7f"
+        },
+        "path_in_vcs": "crates/monty"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "c66034a1e5248438acc372dc4a55ad2136285616",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/Monty.txt"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "lockfile_evidence": {
+        "package": "monty-runtime",
+        "version": "1.1.0",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "archive_checksum": "9cbbbcc3b8e16c36771a7d21b5fd08d16b40e4c422d135c49855accce1dd5d65",
+        "path": "Cargo.lock",
+        "sha256": "7ecb2e0ea5851fadc06e043d67529837b4d5a32df91df999557dc31a2beb4b6b"
+      },
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "notes": [
+        "The registry archive checksum matches the crates.io index and published monty-runtime 1.1.0 Cargo.lock. Its VCS record and original manifest match the pinned Git revision. The package omits license text; THIRD_PARTY_LICENSES/Monty.txt is byte-identical to that revision's root LICENSE. This is published source evidence, not evidence of a completed worker build."
+      ]
+    },
+    {
+      "name": "monty-alloc",
+      "version": "1.1.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "5ab6540f9aabb557f25a7b71d571ae55ecf9ba2c9f2e6c7dbe329e422faf1195",
+      "declared_license": "MIT",
+      "repository": "https://github.com/pydantic/monty",
+      "revision": "591527397445bf734873252d1ee20c1b6308fe7f",
+      "path_in_vcs": "crates/monty-alloc",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "591527397445bf734873252d1ee20c1b6308fe7f"
+        },
+        "path_in_vcs": "crates/monty-alloc"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "c8d3c8761da010324056cdc5f31e2fe9fab52e5b",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/Monty.txt"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "lockfile_evidence": {
+        "package": "monty-runtime",
+        "version": "1.1.0",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "archive_checksum": "9cbbbcc3b8e16c36771a7d21b5fd08d16b40e4c422d135c49855accce1dd5d65",
+        "path": "Cargo.lock",
+        "sha256": "7ecb2e0ea5851fadc06e043d67529837b4d5a32df91df999557dc31a2beb4b6b"
+      },
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "notes": [
+        "The registry archive checksum matches the crates.io index and published monty-runtime 1.1.0 Cargo.lock. Its VCS record and original manifest match the pinned Git revision. The package omits license text; THIRD_PARTY_LICENSES/Monty.txt is byte-identical to that revision's root LICENSE. This is published source evidence, not evidence of a completed worker build."
+      ]
+    },
+    {
+      "name": "monty-fs",
+      "version": "1.1.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "2e1edf72887e131762ef991f67d4a8fd126554460e0ea8b0dec8a068cf7cf167",
+      "declared_license": "MIT",
+      "repository": "https://github.com/pydantic/monty",
+      "revision": "591527397445bf734873252d1ee20c1b6308fe7f",
       "path_in_vcs": "crates/monty-fs",
       "cargo_vcs_info": {
         "git": {
-          "sha1": "85c5d1f6bef038405cfc40a4eed94806e303567e"
+          "sha1": "591527397445bf734873252d1ee20c1b6308fe7f"
         },
         "path_in_vcs": "crates/monty-fs"
       },
@@ -387,16 +463,16 @@
     },
     {
       "name": "monty-macros",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "18acfe594cfe965254e684f128ec6e0a2e63774bf4ec8eb7eb5b13fd4a182a22",
+      "checksum": "ff5176d386cd79f7e181c703e10314375ffd3d550285da672da9ae8e5952b751",
       "declared_license": "MIT",
       "repository": "https://github.com/pydantic/monty",
-      "revision": "85c5d1f6bef038405cfc40a4eed94806e303567e",
+      "revision": "591527397445bf734873252d1ee20c1b6308fe7f",
       "path_in_vcs": "crates/monty-macros",
       "cargo_vcs_info": {
         "git": {
-          "sha1": "85c5d1f6bef038405cfc40a4eed94806e303567e"
+          "sha1": "591527397445bf734873252d1ee20c1b6308fe7f"
         },
         "path_in_vcs": "crates/monty-macros"
       },
@@ -417,16 +493,16 @@
     },
     {
       "name": "monty-pool",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "0132326a4dc93d42ced6738e638d38a96cf977963316aaf1df5fafefa8d69136",
+      "checksum": "dce5d1666e27e0fcdad9e0f1aec467d5cd7f595b8f1f270e4f7a1d4ea6867b14",
       "declared_license": "MIT",
       "repository": "https://github.com/pydantic/monty",
-      "revision": "85c5d1f6bef038405cfc40a4eed94806e303567e",
+      "revision": "591527397445bf734873252d1ee20c1b6308fe7f",
       "path_in_vcs": "crates/monty-pool",
       "cargo_vcs_info": {
         "git": {
-          "sha1": "85c5d1f6bef038405cfc40a4eed94806e303567e"
+          "sha1": "591527397445bf734873252d1ee20c1b6308fe7f"
         },
         "path_in_vcs": "crates/monty-pool"
       },
@@ -447,16 +523,16 @@
     },
     {
       "name": "monty-proto",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "1ecd13d16939361f670687b545ff20d726f0bcdb4c35f1a5a04fa4cb3ed3e5ae",
+      "checksum": "f62ede58a8426cfcd96ef1a8222579980c771f54ee63b5c20dabcfa7d3d72f85",
       "declared_license": "MIT",
       "repository": "https://github.com/pydantic/monty",
-      "revision": "85c5d1f6bef038405cfc40a4eed94806e303567e",
+      "revision": "591527397445bf734873252d1ee20c1b6308fe7f",
       "path_in_vcs": "crates/monty-proto",
       "cargo_vcs_info": {
         "git": {
-          "sha1": "85c5d1f6bef038405cfc40a4eed94806e303567e"
+          "sha1": "591527397445bf734873252d1ee20c1b6308fe7f"
         },
         "path_in_vcs": "crates/monty-proto"
       },
@@ -476,17 +552,93 @@
       ]
     },
     {
-      "name": "monty-types",
-      "version": "1.0.0",
+      "name": "monty-runtime",
+      "version": "1.1.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "eb42ab8791581458d83352f53028cf84a9225ab22e9c6093e12fd06877ce7ac4",
+      "checksum": "9cbbbcc3b8e16c36771a7d21b5fd08d16b40e4c422d135c49855accce1dd5d65",
       "declared_license": "MIT",
       "repository": "https://github.com/pydantic/monty",
-      "revision": "85c5d1f6bef038405cfc40a4eed94806e303567e",
+      "revision": "591527397445bf734873252d1ee20c1b6308fe7f",
+      "path_in_vcs": "crates/monty-runtime",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "591527397445bf734873252d1ee20c1b6308fe7f"
+        },
+        "path_in_vcs": "crates/monty-runtime"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "7411d9b0ede8170f8fe8f177f0963d30490f0287",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/Monty.txt"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "lockfile_evidence": {
+        "package": "monty-runtime",
+        "version": "1.1.0",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "archive_checksum": "9cbbbcc3b8e16c36771a7d21b5fd08d16b40e4c422d135c49855accce1dd5d65",
+        "path": "Cargo.lock",
+        "sha256": "7ecb2e0ea5851fadc06e043d67529837b4d5a32df91df999557dc31a2beb4b6b"
+      },
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "notes": [
+        "The published worker root archive checksum matches the crates.io index; its own Cargo.lock supplies the worker dependency evidence. Its VCS record and original manifest match the pinned Git revision. The package omits license text; THIRD_PARTY_LICENSES/Monty.txt is byte-identical to that revision's root LICENSE. This is published source evidence, not evidence of a completed worker build."
+      ]
+    },
+    {
+      "name": "monty-type-checking",
+      "version": "1.1.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "58e6efead36b18c3e8c859b28338d608fcd704a82d78b14c558985bf06aa9c51",
+      "declared_license": "MIT",
+      "repository": "https://github.com/pydantic/monty",
+      "revision": "591527397445bf734873252d1ee20c1b6308fe7f",
+      "path_in_vcs": "crates/monty-type-checking",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "591527397445bf734873252d1ee20c1b6308fe7f"
+        },
+        "path_in_vcs": "crates/monty-type-checking"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "a43876768ef5e6199fa0ba7c315c222a2343c859",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/Monty.txt"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "lockfile_evidence": {
+        "package": "monty-runtime",
+        "version": "1.1.0",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "archive_checksum": "9cbbbcc3b8e16c36771a7d21b5fd08d16b40e4c422d135c49855accce1dd5d65",
+        "path": "Cargo.lock",
+        "sha256": "7ecb2e0ea5851fadc06e043d67529837b4d5a32df91df999557dc31a2beb4b6b"
+      },
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "notes": [
+        "The registry archive checksum matches the crates.io index and published monty-runtime 1.1.0 Cargo.lock. Its VCS record and original manifest match the pinned Git revision. The package omits license text; THIRD_PARTY_LICENSES/Monty.txt is byte-identical to that revision's root LICENSE. This is published source evidence, not evidence of a completed worker build."
+      ]
+    },
+    {
+      "name": "monty-types",
+      "version": "1.1.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "d80ebea7f98c1e7ad4075c111e03c59ef80d18abd813f1fad8984f8c4827d95d",
+      "declared_license": "MIT",
+      "repository": "https://github.com/pydantic/monty",
+      "revision": "591527397445bf734873252d1ee20c1b6308fe7f",
       "path_in_vcs": "crates/monty-types",
       "cargo_vcs_info": {
         "git": {
-          "sha1": "85c5d1f6bef038405cfc40a4eed94806e303567e"
+          "sha1": "591527397445bf734873252d1ee20c1b6308fe7f"
         },
         "path_in_vcs": "crates/monty-types"
       },
@@ -507,16 +659,16 @@
     },
     {
       "name": "monty-typeshed",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "ea247929a0eb5bb8b13f9d86ce335c68232f15a211b622ffbdbcb6029d74c8c9",
+      "checksum": "07a30851142ad0a76ea54df919514fc6a12571b963e1677853be22d4249a0781",
       "declared_license": "MIT",
       "repository": "https://github.com/pydantic/monty",
-      "revision": "85c5d1f6bef038405cfc40a4eed94806e303567e",
+      "revision": "591527397445bf734873252d1ee20c1b6308fe7f",
       "path_in_vcs": "crates/monty-typeshed",
       "cargo_vcs_info": {
         "git": {
-          "sha1": "85c5d1f6bef038405cfc40a4eed94806e303567e"
+          "sha1": "591527397445bf734873252d1ee20c1b6308fe7f"
         },
         "path_in_vcs": "crates/monty-typeshed"
       },
@@ -525,17 +677,17 @@
       "manifest_match": "exact",
       "license_files": [
         "THIRD_PARTY_LICENSES/Monty.txt",
-        "THIRD_PARTY_LICENSES/dependencies/monty-typeshed-1.0.0/LICENSE-typeshed"
+        "THIRD_PARTY_LICENSES/dependencies/monty-typeshed-1.1.0/LICENSE-typeshed"
       ],
       "notice_files": [],
       "status": "collected",
       "lockfile_evidence": {
         "package": "monty-runtime",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "source": "registry+https://github.com/rust-lang/crates.io-index",
-        "archive_checksum": "000d04b3bc56ca99aa2c74927fc4abaf90b6baa08ef2e3759e64298a01fe97a0",
+        "archive_checksum": "9cbbbcc3b8e16c36771a7d21b5fd08d16b40e4c422d135c49855accce1dd5d65",
         "path": "Cargo.lock",
-        "sha256": "1734dc50783b06047bad339befec164e9c422d4d998c30117fbc907aa0eb312b"
+        "sha256": "7ecb2e0ea5851fadc06e043d67529837b4d5a32df91df999557dc31a2beb4b6b"
       },
       "inspected_ancestor_legal_paths": [
         "LICENSE"
@@ -548,7 +700,7 @@
           "revision": "0e16ea31d2e188fdc126cb31e7c4fcc6b5a8da96",
           "license_description": "Apache-2.0 with MIT-licensed portions, as specified by the complete upstream LICENSE.",
           "license_files": [
-            "THIRD_PARTY_LICENSES/dependencies/monty-typeshed-1.0.0/LICENSE-typeshed"
+            "THIRD_PARTY_LICENSES/dependencies/monty-typeshed-1.1.0/LICENSE-typeshed"
           ],
           "revision_evidence": {
             "package_path": "vendor/typeshed/source_commit.txt",
@@ -578,7 +730,7 @@
         }
       ],
       "notes": [
-        "This explicitly requested worker package is absent from root Cargo.lock. Its registry checksum comes from the published monty-runtime 1.0.0 Cargo.lock, whose archive checksum was verified against the cached crates.io index.",
+        "This explicitly requested worker package is absent from root Cargo.lock. Its registry checksum comes from the published monty-runtime 1.1.0 Cargo.lock, whose archive checksum was verified against the crates.io index. This is published source evidence, not evidence of a completed worker build.",
         "The checksum-verified package README identifies the embedded stubs as a filtered typeshed subset with Monty custom overrides and acknowledges derivation from Ruff ty_vendored. source_commit.txt pins the typeshed revision. The README does not pin an intermediate Ruff revision, so none is asserted.",
         "Existing THIRD_PARTY_LICENSES/Monty.txt covers the Monty-authored portions. The separately preserved typeshed LICENSE includes the Apache-2.0 terms and the MIT notice for Jukka Lehtosalo and contributors."
       ]

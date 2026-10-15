@@ -25,6 +25,7 @@ Preview 9 lets the model call your MCP servers from Python, so a server with a h
 
 ### MCP
 
+- **Complex numbers in Python.** The Python runtime is now Monty 1.1.0. Python calculations, MCP snippets, and Lua interpreter calls support complex literals and `complex()`. Complex results use a string representation where JSON cannot preserve their type.
 - **Code mode.** The model now reaches your MCP servers by writing Python in one `mcp` tool, instead of receiving a definition for every tool. A snippet can call several tools at once and filter or join their results before the model reads anything, so a list of 500 issues can come back as three lines. The model learns your servers and their tools from a short list in the conversation, and `search()` finds the tools the list leaves out. See [Code mode](/docs/mcp/#code-mode).
 - **MCP servers keep the prompt cache.** The tool definitions stay the same while a server connects, fails, or changes its tools, and when you switch to plan mode, so none of these makes the provider read the whole conversation again at full price. See [The prompt cache](/docs/configuration/#the-prompt-cache).
 - **Approvals work as before.** Each tool call in a snippet asks on its own, and permission rules, `agent.disabled_tools`, and profiles still name a tool `server.tool`. A call you decline raises an error the snippet can catch. Plan mode and read-only agents still allow only the read-only tools of recognised servers. See [MCP tool calls](/docs/permissions/#mcp-tool-calls).

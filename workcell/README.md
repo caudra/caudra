@@ -1627,7 +1627,7 @@ value of its final expression along with anything it printed.
 - The worker has no filesystem access, no network access, no subprocesses, and an empty environment.
   `open`, `os.getenv`, and `os.environ` do not reach the host; attempts raise `PermissionError` or
   observe an empty environment. The result explains which tool to use instead.
-- Host clocks, entropy, and sleep are refused rather than using Monty 1.0's system defaults.
+- Host clocks, entropy, and sleep are refused rather than using Monty's system defaults.
   Seed `random` explicitly and supply dates as data; process-time reads return zero and the virtual
   timezone is UTC. `eval` and `exec` run inside the same interpreter with the same limits and refusals.
 - Only Monty's built-in module subset is importable. There are no third-party packages and no
@@ -1645,7 +1645,7 @@ value of its final expression along with anything it printed.
   the stubs need them, then raise `ModuleNotFoundError` at import.
 - The interpreter is Monty, not CPython. It implements a large but incomplete subset: notably no
   `match` statements, generator functions, or class inheritance, and operators do not dispatch
-  to user-defined dunders. Monty 1.0 supports `str.format()`, percent formatting, subscript and
+  to user-defined dunders. Monty supports complex numbers, `str.format()`, percent formatting, subscript and
   attribute unpacking targets, and generic aliases such as `list[int]` as values. The tool description
   enumerates the divergences that most often cost a caller a wasted turn, and it is generated from
   the same lists the runtime diagnostics quote, so the two cannot disagree.

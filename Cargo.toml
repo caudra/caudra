@@ -284,8 +284,8 @@ tree-sitter-css = "0.25"
 tree-sitter-hcl = "1.1"
 tree-sitter-json = "0.24"
 tree-sitter-make = "1.1"
-monty = { git = "https://github.com/pydantic/monty.git", tag = "v1.0.0", package = "monty" }
-monty-types = { git = "https://github.com/pydantic/monty.git", tag = "v1.0.0", package = "monty-types" }
+monty = { git = "https://github.com/pydantic/monty.git", tag = "v1.1.0", package = "monty" }
+monty-types = { git = "https://github.com/pydantic/monty.git", tag = "v1.1.0", package = "monty-types" }
 notify = { version = "9.0.0-rc.2", default-features = false, features = ["flume", "macos_fsevent"] }
 serde_yaml = "0.9"
 shell-words = "1"
@@ -310,8 +310,8 @@ futures-util = "0.3.32"
 http = "1.4.2"
 httpdate = "1.0.3"
 lru = "0.18.1"
-monty-pool = "=1.0.0"
-monty-types-registry = { package = "monty-types", version = "=1.0.0" }
+monty-pool = "=1.1.0"
+monty-types-registry = { package = "monty-types", version = "=1.1.0" }
 notify-8 = { package = "notify", version = "8.2.0", default-features = false, features = ["macos_kqueue"] }
 pdf_oxide = { version = "0.3.74", default-features = false }
 proptest = "1.11.0"

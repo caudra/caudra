@@ -169,7 +169,8 @@ fn render_inner(object: ObjectRef<'_>, depth: usize) -> Rendered {
 
         // No JSON analogue at all: the repr is the only faithful form, and the string rendering is
         // provided so a caller that only reads `result` still sees something meaningful.
-        MontyNode::Bytes(_)
+        MontyNode::Complex(_)
+        | MontyNode::Bytes(_)
         | MontyNode::Date(_)
         | MontyNode::DateTime(_)
         | MontyNode::Time(_)
@@ -303,6 +304,11 @@ mod tests {
         let (json, repr) = render(&MontyObject::float(f64::INFINITY));
         assert_eq!(json, Value::Null);
         assert!(repr.is_some());
+
+        let complex = MontyObject::complex(1.0, 2.0);
+        let (json, repr) = render(&complex);
+        assert_eq!(json, Value::String(complex.to_string()));
+        assert_eq!(repr.as_deref(), Some("(1+2j)"));
     }
 
     #[test]

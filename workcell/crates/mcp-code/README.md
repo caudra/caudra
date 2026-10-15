@@ -18,7 +18,7 @@ reach outside the process is answered rather than forwarded:
 - Filesystem calls are refused with `PermissionError`, and the result names the filesystem or shell
   tool that the caller should use instead. Other OS calls are refused with `RuntimeError`.
 - Environment reads observe an explicitly empty environment, so no host variable is disclosed.
-- Monty 1.0's system-clock, entropy, and sleep defaults are overridden with refused host calls.
+- Monty's system-clock, entropy, and sleep defaults are overridden with refused host calls.
   Process-time reads return zero and the virtual timezone is UTC. Explicitly seeded random
   computation and arithmetic on supplied dates need no host capability.
 - Absent callables such as `compile` resolve to `NameError` rather than being satisfied by the host.

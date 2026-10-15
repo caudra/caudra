@@ -1,6 +1,6 @@
 //! Feeds monty's memory counters so `max_memory` holds in-process.
 //!
-//! monty v1.0.0 checks `LIVE_MEMORY - BASELINE_MEMORY` at VM checkpoints,
+//! monty v1.1.0 checks `LIVE_MEMORY - BASELINE_MEMORY` at VM checkpoints,
 //! but something must feed those counters. Upstream feeds them with
 //! `monty-alloc` in a throwaway worker process that dies on a breach. caudra
 //! runs the interpreter in-process, so this allocator does the accounting
@@ -23,7 +23,7 @@
 //! threads (never charged) yet often freed inside the scope (refunded), so
 //! a large result grants that much unearned headroom. Good enough as a
 //! guardrail against runaway agent code, not a security boundary. Monty
-//! v1.0.0 still has no thread-local memory probe override.
+//! v1.1.0 still has no thread-local memory probe override.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

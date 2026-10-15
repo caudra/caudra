@@ -9,7 +9,7 @@ from pathlib import Path
 
 import tomllib
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 EXPECTED_VERSION = f"monty-runtime {VERSION}"
 SOURCE_MANIFEST_FILE = "source-manifest-path"
 SOURCE_ERROR = (

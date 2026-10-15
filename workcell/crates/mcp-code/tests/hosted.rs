@@ -21,7 +21,7 @@ use workcell_mcp_code::{
 const NAMESPACE: &str = "gh";
 const DENIED: &str = "denied by the user";
 const SLOW_REPLY: &str = "answered late";
-const STUBS: &str = "from typing import Any\nclass _Gh:\n    async def list(self, *, owner: str = '') -> dict[str, Any]: ...\n    async def boom(self) -> Any: ...\n    async def hang(self) -> Any: ...\n    async def slow(self) -> str: ...\ngh: _Gh\ndef search(query: str) -> list[str]: ...\n";
+const STUBS: &str = "from typing import Any\nclass _Gh:\n    async def list(self, *, owner: str = '') -> dict[str, Any]: ...\n    async def echo(self, value: Any, *, nested: Any) -> Any: ...\n    async def boom(self) -> Any: ...\n    async def hang(self) -> Any: ...\n    async def slow(self) -> str: ...\ngh: _Gh\ndef search(query: str) -> list[str]: ...\n";
 const HOSTED_SUSPENSION_LIMIT_MESSAGE: &str = "The snippet made too many host round trips and was stopped. Batch work into fewer calls, and check for an undefined name read inside a loop.";
 const SHORT_TIMEOUT_SECS: u64 = 1;
 /// Well past the short time limit, so a run charged for the wait could not finish within it.
@@ -80,7 +80,7 @@ impl CodeHost for FakeHost {
     fn lookup(&self, namespace: Option<&str>, name: &str) -> HostName {
         match (namespace, name) {
             (None, NAMESPACE) => HostName::Namespace,
-            (None, "search") | (Some(NAMESPACE), "list" | "boom" | "hang" | "slow") => {
+            (None, "search") | (Some(NAMESPACE), "list" | "echo" | "boom" | "hang" | "slow") => {
                 HostName::Function
             }
             (Some(_), _) => HostName::Undefined(Some(format!("no tool `{name}`; use search()"))),
@@ -96,6 +96,7 @@ impl CodeHost for FakeHost {
         HostInvocation::Deferred(Box::pin(async move {
             calls.lock().expect("calls").push(call.name.clone());
             match call.name.as_str() {
+                "echo" => Ok(json!({"args": call.args, "kwargs": call.kwargs})),
                 "boom" => Err(HostError::new(HostErrorKind::Permission, DENIED)),
                 "hang" => std::future::pending().await,
                 "slow" => {
@@ -263,6 +264,60 @@ async fn variables_and_namespace_references_survive_between_runs() {
     assert_eq!(outcome(&raised), Outcome::Exception);
     let third = run(&group, &host, "[kept, again]", raised.state).await;
     assert_eq!(result(&third), &json!(["o", "lost"]));
+    group.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn complex_values_keep_their_type_through_session_dump_and_restore() {
+    let Some(group) = group().await else { return };
+    let host = Arc::new(FakeHost::default());
+    let first = run(
+        &group,
+        &host,
+        "z = complex(1, 2)\nkept = {'values': [z]}\nkept",
+        None,
+    )
+    .await;
+    assert_eq!(outcome(&first), Outcome::Completed);
+    assert_eq!(result(&first), &json!({"values": ["(1+2j)"]}));
+    assert_eq!(first.state_note, None);
+    let state = first.state.expect("saved complex session");
+    let second = run(
+        &group,
+        &host,
+        "[z * 1j, kept['values'][0] + complex(3, -2)]",
+        Some(state),
+    )
+    .await;
+    assert_eq!(outcome(&second), Outcome::Completed);
+    assert_eq!(result(&second), &json!(["(-2+1j)", "(4+0j)"]));
+    assert_eq!(
+        output(&second).result_repr.as_deref(),
+        Some("[(-2+1j), (4+0j)]")
+    );
+    assert_eq!(second.state_note, None);
+    assert!(second.state.is_some());
+    group.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn complex_host_arguments_cross_as_json_strings_including_nested_values() {
+    let Some(group) = group().await else { return };
+    let host = Arc::new(FakeHost::default());
+    let executed = run(
+        &group,
+        &host,
+        "z = 1 + 2j\nawait gh.echo(z, nested={'values': [z, complex()]})",
+        None,
+    )
+    .await;
+    assert_eq!(outcome(&executed), Outcome::Completed);
+    assert_eq!(
+        result(&executed),
+        &json!({"args": ["(1+2j)"], "kwargs": {"nested": {"values": ["(1+2j)", "0j"]}}})
+    );
+    assert_eq!(output(&executed).result_repr, None);
+    assert_eq!(host.calls(), ["echo"]);
     group.shutdown().await;
 }
 

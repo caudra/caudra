@@ -117,8 +117,8 @@
       #   mismatch that prints the real hash. This is both the recovery
       #   path for updates and a hard stop if pinned content ever changes.
       gitDepHashes = {
-        "git+https://github.com/pydantic/monty.git?tag=v1.0.0#85c5d1f6bef038405cfc40a4eed94806e303567e" =
-          "sha256-tuDFwYLIprdVyAH47rqYiI4xU3RCuNdkBjIyVM1JeWE=";
+        "git+https://github.com/pydantic/monty.git?tag=v1.1.0#591527397445bf734873252d1ee20c1b6308fe7f" =
+          "sha256-FqJIkEVmKeDWQyb/yrJ0+/2tZ1kCNe2Xc4r9UPgQptU=";
         "git+https://github.com/modelcontextprotocol/rust-sdk.git?rev=9334c97f0d6e177546fc33593148aa3f942cb1f8#9334c97f0d6e177546fc33593148aa3f942cb1f8" =
           "sha256-X9WsE8CB5rBwXClvZibtKA6ajoYuAOIA3mj4ETN9gyQ=";
       };
@@ -147,8 +147,8 @@
           workspaceSrc = mkWorkspaceSrc craneLib;
           montySrc = pkgs.fetchgit {
             url = "https://github.com/pydantic/monty.git";
-            rev = "85c5d1f6bef038405cfc40a4eed94806e303567e";
-            hash = "sha256-tuDFwYLIprdVyAH47rqYiI4xU3RCuNdkBjIyVM1JeWE=";
+            rev = "591527397445bf734873252d1ee20c1b6308fe7f";
+            hash = "sha256-FqJIkEVmKeDWQyb/yrJ0+/2tZ1kCNe2Xc4r9UPgQptU=";
           };
           montyVendorDeps = craneLib.vendorCargoDeps { src = montySrc; };
           montyAttributionVendor = pkgs.runCommandLocal "monty-attribution-vendor" { } (
@@ -156,7 +156,7 @@
           );
           montyWorker = craneLib.buildPackage {
             pname = "caudra-monty-worker";
-            version = "1.0.0";
+            version = "1.1.0";
             src = montySrc;
             cargoVendorDir = montyVendorDeps;
             cargoExtraArgs = "--package monty-runtime --no-default-features";
@@ -173,7 +173,7 @@
               cp target/release/monty $debug/bin/monty
               cp target/release/monty $out/bin/monty
               $STRIP $out/bin/monty
-              $out/bin/monty --version | grep -qx 'monty-runtime 1.0.0'
+              $out/bin/monty --version | grep -qx 'monty-runtime 1.1.0'
             '';
             dontStrip = true;
           };

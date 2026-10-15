@@ -15,7 +15,7 @@ macro_rules! available_modules {
 /// Builtins the interpreter does not define at all, so referencing one raises `NameError`.
 macro_rules! withheld_builtins {
     () => {
-        "compile, __import__, globals, vars, dir, input, breakpoint, help, exit, super, callable, issubclass, delattr, staticmethod, classmethod, bytearray, complex, memoryview, ascii, aiter, and anext"
+        "compile, __import__, globals, vars, dir, input, breakpoint, help, exit, super, callable, issubclass, delattr, staticmethod, classmethod, bytearray, memoryview, ascii, aiter, and anext"
     };
 }
 
@@ -64,7 +64,7 @@ pub const SUBSET_MODULES: [&str; 19] = [
 /// Type checking reports each as an unresolved reference, which reads as a typo unless the caller is
 /// told it is withheld on purpose, so `diagnose` uses this to pick its wording. Every entry is
 /// asserted to raise `NameError` on a live worker by `every_withheld_builtin_is_actually_absent`.
-pub const WITHHELD_BUILTINS: [&str; 21] = [
+pub const WITHHELD_BUILTINS: [&str; 20] = [
     "compile",
     "__import__",
     "globals",
@@ -81,7 +81,6 @@ pub const WITHHELD_BUILTINS: [&str; 21] = [
     "staticmethod",
     "classmethod",
     "bytearray",
-    "complex",
     "memoryview",
     "ascii",
     "aiter",

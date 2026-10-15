@@ -13,6 +13,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
+use test_case::test_case;
 use tokio_util::sync::CancellationToken;
 #[cfg(feature = "bundled-worker")]
 use workcell_mcp_code::bundled_worker_available;
@@ -135,6 +136,59 @@ async fn returns_the_value_of_the_final_expression() {
     assert_eq!(output["result"], json!(42));
     assert_eq!(output["version"], json!(1));
     assert_eq!(output["kind"], "code");
+    group.shutdown().await;
+}
+
+#[test_case(false ; "unchecked")]
+#[test_case(true ; "checked")]
+#[tokio::test]
+async fn complex_values_cross_as_strings_with_a_python_repr(type_check: bool) {
+    let group = group_or_skip!(type_check);
+    for (code, expected) in [
+        ("1 + 2j", "(1+2j)"),
+        ("complex(3, -4)", "(3-4j)"),
+        ("complex('2+3j') * 1j", "(-3+2j)"),
+        ("complex()", "0j"),
+    ] {
+        let output = run(&group, code).await;
+        assert_eq!(output["outcome"], "completed", "{code}: {output}");
+        assert_eq!(output["result"], expected, "{code}: {output}");
+        assert_eq!(output["resultRepr"], expected, "{code}: {output}");
+    }
+    let nested = run(&group, "{'values': [1 + 2j, {'zero': complex()}]}").await;
+    assert_eq!(nested["outcome"], "completed", "{nested}");
+    assert_eq!(
+        nested["result"],
+        json!({"values": ["(1+2j)", {"zero": "0j"}]})
+    );
+    assert_eq!(nested["resultRepr"], "{'values': [(1+2j), {'zero': 0j}]}");
+    group.shutdown().await;
+}
+
+#[test_case(false ; "unchecked")]
+#[test_case(true ; "checked")]
+#[tokio::test]
+async fn boolean_arithmetic_regex_and_captured_variables_keep_python_semantics(type_check: bool) {
+    let group = group_or_skip!(type_check);
+    for (code, expected) in [
+        (
+            "[True + True, True - False, False * 3, True / 2, 2 ** True]",
+            json!([2, 1, 0, 0.5, 2]),
+        ),
+        (
+            "import re\n[re.sub('x', r'\\141', 'xx'), re.sub('x', r'\\0', 'x')]",
+            json!(["aa", "\0"]),
+        ),
+        (
+            "def validate(value):\n    assert (lambda: value)() == 7\n    try:\n        raise ValueError(str((lambda: value)()))\n    except ValueError as error:\n        return str(error)\nvalidate(7)",
+            json!("7"),
+        ),
+    ] {
+        let output = run(&group, code).await;
+        assert_eq!(output["outcome"], "completed", "{code}: {output}");
+        assert_eq!(output["result"], expected, "{code}: {output}");
+        assert!(output["resultRepr"].is_null(), "{code}: {output}");
+    }
     group.shutdown().await;
 }
 

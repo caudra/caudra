@@ -30,7 +30,7 @@ Isolation:
 
 This is a Python subset, not CPython. It rejects or fails on:
 - Class inheritance, metaclasses, super(), and decorators on methods, so @classmethod, @staticmethod, and @property are unavailable. Simple classes and @dataclass do work.
-- yield and generator functions, match statements, del, try*/except* groups, async with, async for, PEP 695 type aliases, wildcard imports, complex literals, and t-strings.
+- yield and generator functions, match statements, del, try*/except* groups, async with, async for, PEP 695 type aliases, wildcard imports, and t-strings.
 - str.translate() and str.maketrans(). str.format(), %-formatting, and f-strings work.
 - Defining exception classes, since classes cannot inherit. Raise a built-in such as ValueError. Exception constructors take at most one string, so OSError(errno, message, path) fails, and raise X from Y parses but silently drops the cause.
 - These builtins, which are undefined and raise NameError: "#,

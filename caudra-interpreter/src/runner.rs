@@ -683,23 +683,34 @@ mod tests {
     #[test_case("x = [1, {'a': 2}]\n[x, x]", Some(json!([[1, {"a": 2}], [1, {"a": 2}]])) ; "shared_container")]
     #[test_case("x = []\nx.append(x)\nx", Some(json!(["[...]"])) ; "cyclic_container")]
     #[test_case("from pathlib import Path\nPath('/virtual')", Some(json!("PosixPath('/virtual')")) ; "repr_fallback")]
+    #[test_case("1 + 2j", Some(json!("(1+2j)")) ; "complex_literal_repr")]
+    #[test_case("complex('3-4j')", Some(json!("(3-4j)")) ; "complex_constructor_repr")]
+    #[test_case("{'values': (1j, [complex(2, -3), 0j])}", Some(json!({"values": ["1j", ["(2-3j)", "0j"]]})) ; "nested_complex_repr")]
     fn flat_boundary_values_preserve_json_behavior(code: &str, expected: Option<Value>) {
         let result = run_code(code, &empty_tools(), None, default_limits()).unwrap();
         assert_eq!(result.output, expected);
     }
 
-    #[test_case(false ; "synchronous")]
-    #[test_case(true ; "asynchronous")]
-    fn flat_nested_tool_arguments_and_results_round_trip(asynchronous: bool) {
-        let echo: ToolFn = Box::new(|_, args, kwargs| {
-            assert_eq!(args, [json!([1, {"a": true}])]);
-            assert_eq!(kwargs, [("nested".into(), json!({"x": [1, {"a": true}]}))]);
-            Ok(json!({"args": args, "kwargs": kwargs}))
-        });
-        let resolver: AsyncResolver = Box::new(move |calls| {
+    #[test_case(false, "[1, {'a': True}]", json!([1, {"a": true}]) ; "synchronous")]
+    #[test_case(true, "[1, {'a': True}]", json!([1, {"a": true}]) ; "asynchronous")]
+    #[test_case(false, "1 + 2j", json!("(1+2j)") ; "synchronous_complex")]
+    #[test_case(true, "1 + 2j", json!("(1+2j)") ; "asynchronous_complex")]
+    #[test_case(false, "[1j, {'a': complex(2, -3)}]", json!(["1j", {"a": "(2-3j)"}]) ; "synchronous_nested_complex")]
+    #[test_case(true, "[1j, {'a': complex(2, -3)}]", json!(["1j", {"a": "(2-3j)"}]) ; "asynchronous_nested_complex")]
+    fn flat_nested_tool_arguments_and_results_round_trip(
+        asynchronous: bool,
+        expression: &str,
+        expected: Value,
+    ) {
+        let resolver: AsyncResolver = Box::new(|calls| {
             Ok(calls
                 .into_iter()
-                .map(|call| (call.call_id, echo(&call.name, call.args, call.kwargs)))
+                .map(|call| {
+                    (
+                        call.call_id,
+                        Ok(json!({"args": call.args, "kwargs": call.kwargs})),
+                    )
+                })
                 .collect())
         });
         let sync_echo: ToolFn =
@@ -707,7 +718,7 @@ mod tests {
         let tools = HashMap::from([("echo".into(), sync_echo)]);
         let prefix = if asynchronous { "await " } else { "" };
         let result = run_code(
-            &format!("x = [1, {{'a': True}}]\n{prefix}echo(x, nested={{'x': x}})"),
+            &format!("x = {expression}\n{prefix}echo(x, nested={{'x': x}})"),
             &tools,
             asynchronous.then_some(&resolver),
             default_limits(),
@@ -715,10 +726,38 @@ mod tests {
         .unwrap();
         assert_eq!(
             result.output,
-            Some(
-                json!({"args": [[1, {"a": true}]], "kwargs": [["nested", {"x": [1, {"a": true}]}]]})
-            )
+            Some(json!({"args": [expected], "kwargs": [["nested", {"x": expected}]]}))
         );
+    }
+
+    #[test_case("[True + True, False - True, True % 2, 3 % True]", json!([2, -1, 1, 0]) ; "bool_integer_arithmetic")]
+    #[test_case("[True + 2.5, 2.5 - True, True % 2.5]", json!([3.5, 1.5, 1.0]) ; "bool_float_arithmetic")]
+    #[test_case("[True + 2**80, 2**80 - True]", json!(["1208925819614629174706177", "1208925819614629174706175"]) ; "bool_bigint_arithmetic")]
+    #[test_case("[type(True + True) is int, type(False - True) is int, type(True % True) is int]", json!([true, true, true]) ; "bool_arithmetic_returns_int")]
+    fn boolean_arithmetic_matches_python(code: &str, expected: Value) {
+        let result = run_code(code, &empty_tools(), None, default_limits()).unwrap();
+        assert_eq!(result.output, Some(expected));
+    }
+
+    #[test_case("value = 7\n    if False:\n        raise ValueError((lambda: value)())\n    return value", json!(7) ; "dead_raise_capture")]
+    #[test_case("value = 'captured'\n    try:\n        raise ValueError((lambda: value)())\n    except ValueError as exc:\n        return str(exc)", json!("captured") ; "raise_capture")]
+    #[test_case("value = 2\n    assert (lambda: value)() == 2\n    value = 3\n    return value", json!(3) ; "assert_condition_capture")]
+    #[test_case("value = {}\n    assert True, (lambda: value)()\n    value = 5\n    return value", json!(5) ; "assert_message_capture")]
+    #[test_case("error = KeyError\n    try:\n        {}['missing']\n    except (lambda: error)():\n        return 'caught'", json!("caught") ; "except_type_capture")]
+    fn statement_expressions_capture_closure_variables(body: &str, expected: Value) {
+        let code = format!("def outer():\n    {body}\nouter()");
+        let result = run_code(&code, &empty_tools(), None, default_limits()).unwrap();
+        assert_eq!(result.output, Some(expected));
+    }
+
+    #[test_case("re.sub('(a)', replacement, 'a')" ; "module_sub")]
+    #[test_case("re.compile('(a)').sub(replacement, 'a')" ; "compiled_sub")]
+    fn regex_replacement_distinguishes_octal_from_backreferences(expression: &str) {
+        let code = format!(
+            "import re\n[{expression} for replacement in [r'\\0', r'\\g<0>', r'\\1', r'\\123', r'\\0444']]"
+        );
+        let result = run_code(&code, &empty_tools(), None, default_limits()).unwrap();
+        assert_eq!(result.output, Some(json!(["\0", "a", "a", "S", "$4"])));
     }
 
     /// A run that rebased the shared baseline on entry would forgive an

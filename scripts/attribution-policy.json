@@ -51,12 +51,12 @@
         "aws-lc/LICENSE"
       ]
     },
-    "monty-typeshed@1.0.0": {
+    "monty-typeshed@1.1.0": {
       "expression": "MIT AND Apache-2.0",
       "reason": "The MIT wrapper embeds typeshed stubs under Apache-2.0 with retained MIT portions. Preserve the complete upstream typeshed LICENSE and verify the vendored source_commit.txt against supplemental provenance.",
       "required_files": [
         "supplements/THIRD_PARTY_LICENSES/Monty.txt",
-        "supplements/THIRD_PARTY_LICENSES/dependencies/monty-typeshed-1.0.0/LICENSE-typeshed"
+        "supplements/THIRD_PARTY_LICENSES/dependencies/monty-typeshed-1.1.0/LICENSE-typeshed"
       ]
     },
     "two-face@0.5.1": {
@@ -78,20 +78,20 @@
     }
   },
   "git_sources": {
-    "git+https://github.com/pydantic/monty.git?tag=v1.0.0#85c5d1f6bef038405cfc40a4eed94806e303567e": {
+    "git+https://github.com/pydantic/monty.git?tag=v1.1.0#591527397445bf734873252d1ee20c1b6308fe7f": {
       "reason": "License and original package manifests verified against the exact locked Git revision. Accepted manifest hashes are original Git bytes and Cargo 1.99 vendor-normalized bytes generated offline from that source; neither requires .git or Cargo.toml.orig in the vendor tree.",
       "packages": {
-        "monty@1.0.0": [
+        "monty@1.1.0": [
           "b5687dec15c22818246311c249d94f396b2d12a7e247f17438a68932d9a3769e",
-          "7319a471f76f43352e8818b7413ff89167af56e8f88b86e9a11ecb3d0f1f6514"
+          "0ee4cf7dccef8d8ad0a5e9ddfc0e4e38c0020737ff3366e9165fd960d64a6ccb"
         ],
-        "monty-macros@1.0.0": [
+        "monty-macros@1.1.0": [
           "760b6831d31fb89965805677fad09189777e4fb6055b094216cab7d339fbe353",
-          "57ee236e48b9851e193a4e22029fac02e031e0a57d0a10903f80baf61dc7c883"
+          "c5cf99f1c69a585b5061ef3275bc10b9a4ee15d005618b2bd87641693d236356"
         ],
-        "monty-types@1.0.0": [
+        "monty-types@1.1.0": [
           "9347db352f6f579d7e4748ff1b628db19abf49f21d50c4faa5a494db19ab4904",
-          "3f9ebfcdc4b0752ce0f239172584251eac35f9e3772f9628fdba031ee86f0076"
+          "92ec21884c9ce9e3405f585d206c21a73d5c9e37227ad648581bda7a86aee65d"
         ]
       },
       "notices": [
@@ -122,9 +122,9 @@
   "workspace_sources": [
     {
       "repository": "https://github.com/pydantic/monty.git",
-      "revision": "85c5d1f6bef038405cfc40a4eed94806e303567e",
-      "tree_sha256": "830e4d7829c14610c8325a3523cc68f23fc10019d34eb6bad9f0afa2f0990973",
-      "file_count": 1409,
+      "revision": "591527397445bf734873252d1ee20c1b6308fe7f",
+      "tree_sha256": "c58252b20e45761f1fb89b3eda6d595c96d8757e1b3b4548d3036b845ce4e8c6",
+      "file_count": 1426,
       "reason": "Every tracked Git blob and symlink target verified against this revision. The tree fingerprint excludes only root .git, .cargo, .cargo-ok and target build/config entries; symlinks are hashed without following them."
     }
   ],
