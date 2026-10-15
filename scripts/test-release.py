@@ -1370,7 +1370,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("restore-keys:", cache)
         self.assertIn("steps.identity.outputs.key", cache)
         self.assertIn("scripts/build-code-worker.py", cache)
-        self.assertIn("musl-worker-v2-alpine-3.21-", cache)
+        self.assertIn("musl-worker-v2-alpine-3.24.2-", cache)
         self.assertIn('"$ALPINE_IMAGE" sh -c', body)
         self.assertIn("source-manifest-path", cache)
         self.assertIn("steps.identity.outputs.source", cache)
@@ -1467,7 +1467,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 re.findall(r"(?m)^            (.+)$", operation.split("path: |", 1)[1]),
                 list(ALPINE_CACHE_PATHS),
             )
-        self.assertIn("alpine-cargo-v1-3.21-${{ matrix.target }}-", restore)
+        self.assertIn("alpine-cargo-v1-3.24.2-${{ matrix.target }}-", restore)
         self.assertIn("hashFiles('rust-toolchain.toml', '.cargo/config.toml')", restore)
         self.assertIn(
             "hashFiles('Cargo.lock', 'scripts/build-code-worker.py')", restore

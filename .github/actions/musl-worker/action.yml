@@ -31,14 +31,14 @@ runs:
         worker = runpy.run_path("scripts/build-code-worker.py")
         worker["validate_version"](Path("Cargo.lock"))
         toolchain = tomllib.loads(Path("rust-toolchain.toml").read_text())["toolchain"]["channel"]
-        subprocess.run(["docker", "pull", "alpine:3.21"], check=True)
+        subprocess.run(["docker", "pull", "alpine:3.24.2"], check=True)
         image = subprocess.check_output(
-            ["docker", "image", "inspect", "--format", "{{.Id}}", "alpine:3.21"], text=True
+            ["docker", "image", "inspect", "--format", "{{.Id}}", "alpine:3.24.2"], text=True
         ).strip()
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
             output.write(f"image={image}\n")
             output.write(f"toolchain={toolchain}\n")
-            output.write(f"key=musl-worker-v2-alpine-3.21-{target}-{image.removeprefix('sha256:')}\n")
+            output.write(f"key=musl-worker-v2-alpine-3.24.2-{target}-{image.removeprefix('sha256:')}\n")
             output.write(f"source=target/code-worker/source/*/monty-runtime-{worker['VERSION']}\n")
     - uses: actions/cache/restore@v5
       id: cache

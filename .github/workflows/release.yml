@@ -134,9 +134,9 @@ jobs:
       - uses: actions/cache/restore@v5
         id: cargo-cache
         with:
-          key: alpine-cargo-v1-3.21-${{ matrix.target }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-${{ hashFiles('Cargo.lock', 'scripts/build-code-worker.py') }}
+          key: alpine-cargo-v1-3.24.2-${{ matrix.target }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-${{ hashFiles('Cargo.lock', 'scripts/build-code-worker.py') }}
           restore-keys: |
-            alpine-cargo-v1-3.21-${{ matrix.target }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-
+            alpine-cargo-v1-3.24.2-${{ matrix.target }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-
           path: |
             ${{ runner.temp }}/alpine-cargo/registry/cache
             ${{ runner.temp }}/alpine-cargo/git/db
