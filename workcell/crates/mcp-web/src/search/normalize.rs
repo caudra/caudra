@@ -130,3 +130,24 @@ pub(super) fn safe_png_data_url(value: &str) -> bool {
     let height = u32::from_be_bytes(bytes[20..24].try_into().expect("four height bytes"));
     width > 0 && height > 0 && width <= 256 && height <= 256
 }
+
+#[cfg(test)]
+mod tests {
+    use super::safe_png_data_url;
+    use test_case::test_case;
+
+    const PNG_HEADER: &str = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAEAAAAB";
+
+    #[test_case("YQ==", true; "canonical_padding")]
+    #[test_case("YQ", true; "no_padding")]
+    #[test_case("YQ=", false; "incomplete_padding")]
+    #[test_case("YQ===", false; "excess_padding")]
+    #[test_case("YR==", false; "nonzero_trailing_bits_padded")]
+    #[test_case("YR", false; "nonzero_trailing_bits_unpadded")]
+    #[test_case("Y!==", false; "invalid_symbol")]
+    #[test_case("YQ==\n", false; "trailing_whitespace")]
+    #[test_case("YQ==YQ==", false; "interior_padding")]
+    fn png_data_urls_preserve_base64_acceptance(tail: &str, accepted: bool) {
+        assert_eq!(safe_png_data_url(&format!("{PNG_HEADER}{tail}")), accepted);
+    }
+}

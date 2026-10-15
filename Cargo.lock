@@ -10524,7 +10524,7 @@ name = "workcell-mcp-web"
 version = "0.2.0-preview.9"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "dom_query",
@@ -10607,7 +10607,7 @@ name = "workcell-source-icons"
 version = "0.2.0-preview.9"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "futures-util",
  "http",
