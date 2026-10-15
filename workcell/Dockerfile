@@ -4,11 +4,7 @@
 # leaving a binary that only serves `monty subprocess`.
 #
 # Build from the repository root: docker build -f workcell/Dockerfile .
-FROM rust:1.99.0-trixie AS toolchain
-
-RUN rustup toolchain install 1.99.1 --profile minimal \
-    && rustup default 1.99.1 \
-    && rustup toolchain uninstall 1.99.0
+FROM rust:1.99.1-trixie AS toolchain
 
 FROM toolchain AS worker
 

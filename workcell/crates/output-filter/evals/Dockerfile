@@ -5,10 +5,7 @@
 # captured and replayed through the server. It is a development harness: it is
 # never published and is not part of the runtime image.
 #
-FROM rust:1.99.0-slim-bookworm AS rust
-RUN rustup toolchain install 1.99.1 --profile minimal \
-    && rustup default 1.99.1 \
-    && rustup toolchain uninstall 1.99.0
+FROM rust:1.99.1-slim-bookworm AS rust
 
 FROM golang:1.27.2-bookworm AS go
 
