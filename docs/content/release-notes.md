@@ -11,7 +11,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.10 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.10)
 
-Preview 10 lets MCP snippets ask the decision engine typed questions and rerank long results before the model reads them, moves workflow `decide()` to the same question shape, the one OpenAI Decisions uses, cuts the code graph to two tools that every model sees and that list call sites, copies what you drag over in `/btw` and the question form, and fixes subscription image generation after GPT-5.5 retired from Codex.
+Preview 10 lets MCP snippets ask the decision engine typed questions and rerank long results before the model reads them, moves workflow `decide()` to the same question shape, the one OpenAI Decisions uses, cuts the code-graph tools to two that every model sees, list call sites, and are renamed `source_code_context` and `source_code_refs`, copies what you drag over in `/btw` and the question form, and fixes subscription image generation after GPT-5.5 retired from Codex.
 
 > **Warning**
 >
@@ -20,7 +20,7 @@ Preview 10 lets MCP snippets ask the decision engine typed questions and rerank 
 
 > **Warning**
 >
-> **If your config names `code_map`, `code_impact`, or `code_expand`, remove them when you update.** These tools are gone, and a tool list in your config or a profile that still names one is rejected as an unknown tool. Use `code_refs` with `depth` where you used `code_impact`, and `code_context` where you used `code_map`. Sessions that called them still open and show those calls. See [Code Intelligence](/docs/tools/#code-intelligence).
+> **If your config, profiles, or remote Workcell use the code-graph tools, update them together with Caudra.** `code_context` and `code_refs` are now `source_code_context` and `source_code_refs`, and `code_map`, `code_impact`, and `code_expand` are gone: use `source_code_context` where you used `code_map` or `code_expand`, and `source_code_refs` with `depth` where you used `code_impact`. The profile tool group `code_graph` is now `source_code`, and `[decisions.features] code_context` is now `source_code_context`. A config or profile that still names an old tool, group, or feature is rejected as unknown. Your sessions, `/tools` usage, decision log, and saved permission rules move to the new names the first time Caudra starts, and sessions that called a removed tool still open and show those calls. A remote Workcell must run the same release as Caudra, or connecting fails with an incompatible tool catalog, and its `--tool-group code_graph` is now `--tool-group source_code`. The SDK's tool kinds are now `SourceCodeContext` and `SourceCodeRefs`. See [Code Intelligence](/docs/tools/#code-intelligence).
 
 ### MCP
 
@@ -43,12 +43,12 @@ Preview 10 lets MCP snippets ask the decision engine typed questions and rerank 
 
 - **ChatGPT subscription image generation uses a supported model.** Image requests now run through GPT-6.1 Sol instead of GPT-5.5, which OpenAI retired from Codex with ChatGPT sign-in on October 14. This fixes the unsupported-model error without changing your configured image model or switching to API billing.
 
-### Code graph
+### Source code tools
 
-- **Two code tools instead of five.** `code_context` finds the code a task touches, and `code_refs` lists who calls a symbol. `code_refs` takes `depth` to show what a change could reach, with a count per hop and how many of the reached symbols are tests, which is what `code_impact` did. Both tools are always in the request for every model, so a small model no longer has to search for them first. The system prompt names them with one line each and points the model at `code_refs` instead of grep for callers.
-- **Call sites in `code_refs`.** Each caller row lists the lines that make the call, up to 16 per row with a count of the rest, so one call finds every place a change must touch. Callees come in the order the body calls them. A call linked by its name alone, because the receiver's type was never seen, is marked `~name` and no longer moves the ranking.
-- **Standard library calls stay out of the graph.** In Rust, a call such as `.clone()`, `Vec::new()`, `Arc::new()`, or `std::mem::take()` no longer links to a symbol of the same name in your tree. A common method name links only when the calling file names the type that defines it, and `code_refs` says how many same-name calls it left unlinked. A bare call reaches only free functions, and a method call reaches only methods.
-- **`code_context` lifts only the names you write.** A name in the task lifts its symbol only when written as code, such as `build_csr`, `` `parse` ``, `a::b`, or `run()`. An ordinary word such as "renew" no longer pulls in every `new`, and a symbol that matches only through its file's path, such as a constructor in a file the task names, ranks below one whose own name matches.
+- **Two source code tools instead of five, under new names.** `source_code_context` (formerly `code_context`) finds the code a task touches, and `source_code_refs` lists who calls a symbol. `source_code_refs` takes `depth` to show what a change could reach, with a count per hop and how many of the reached symbols are tests, which is what `code_impact` did. Both tools are always in the request for every model, so a small model no longer has to search for them first. The system prompt names them with one line each and points the model at `source_code_refs` instead of grep for callers.
+- **Call sites in `source_code_refs`.** Each caller row lists the lines that make the call, up to 16 per row with a count of the rest, so one call finds every place a change must touch. Callees come in the order the body calls them. A call linked by its name alone, because the receiver's type was never seen, is marked `~name` and no longer moves the ranking.
+- **Standard library calls stay out of the graph.** In Rust, a call such as `.clone()`, `Vec::new()`, `Arc::new()`, or `std::mem::take()` no longer links to a symbol of the same name in your tree. A common method name links only when the calling file names the type that defines it, and `source_code_refs` says how many same-name calls it left unlinked. A bare call reaches only free functions, and a method call reaches only methods.
+- **`source_code_context` lifts only the names you write.** A name in the task lifts its symbol only when written as code, such as `build_csr`, `` `parse` ``, `a::b`, or `run()`. An ordinary word such as "renew" no longer pulls in every `new`, and a symbol that matches only through its file's path, such as a constructor in a file the task names, ranks below one whose own name matches.
 
 ### Tools
 

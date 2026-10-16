@@ -60,8 +60,8 @@ pub(super) const WORKCELL_TOOL_OWNER: &str = "workcell";
 pub const PERMISSION_DENIED_PREFIX: &str = "Permission denied for";
 
 pub(super) const PROJECT_READ_TOOLS: &[&str] = &[
-    "code_context",
-    "code_refs",
+    "source_code_context",
+    "source_code_refs",
     "file_glob",
     "file_grep",
     "file_read",

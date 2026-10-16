@@ -547,7 +547,7 @@ When a [decision feature](/docs/permissions/#decision-rows-in-the-transcript) ch
 
 ```json
 {"type":"system","subtype":"decision",
- "decision":{"feature":"code_context","mode":"enforce","outcome":"acted",
+ "decision":{"feature":"source_code_context","mode":"enforce","outcome":"acted",
   "summary":"moved 3 of 12 rows up",
   "details":["0.97  src/parser.rs:88 report_error  moved 7th to 1st"],
   "anchor":{"tool":"toolu_01"}},

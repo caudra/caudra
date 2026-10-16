@@ -364,7 +364,7 @@
                 "web",
                 "shell",
                 "code",
-                "codeGraph"
+                "sourceCode"
               ],
               "properties": {
                 "files": {
@@ -379,7 +379,7 @@
                 "code": {
                   "type": "boolean"
                 },
-                "codeGraph": {
+                "sourceCode": {
                   "type": "boolean"
                 }
               }

@@ -270,7 +270,7 @@ version = 1
 # Type: usize, at least 1.
 # task = 12
 
-# Rows for `file_index`, `code_context`, `code_refs`.
+# Rows for `file_index`, `source_code_context`, `source_code_refs`.
 # Type: usize, at least 1.
 # index = 3
 
@@ -708,7 +708,7 @@ version = 1
 # cooldown = 3
 
 [agent.steering.rules.relative_paths]
-# Suggest up to two shorter relative forms when file, patch, code-graph, or
+# Suggest up to two shorter relative forms when file, patch, source-code, or
 # shell `workdir` paths spell out the working directory or its parent. The hint
 # appears once per context.
 
@@ -1142,7 +1142,7 @@ version = 1
 # line span, and reference counts, never source text. Modes: off, shadow,
 # enforce.
 # Type: string.
-# code_context = "off"
+# source_code_context = "off"
 
 [decisions.thresholds]
 # Probabilities between 0 and 1. Flags trigger at or above their threshold,

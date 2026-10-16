@@ -225,7 +225,7 @@ features! {
         "During compaction, keep the tool results most relevant to the active goal, open todos, and latest request instead of only the newest, and keep the most relevant part of a long result. Sends redacted goal, todo, and request excerpts, and each recent result's tool name with redacted input and output excerpts.";
     output_pointers: [Advise],
         "When a saved tool output was truncated, point the agent to at most two omitted line ranges likely to matter. Nothing extra is removed. Sends redacted excerpts of the in-progress todos, latest request, tool input, and omitted lines.";
-    code_context: [Enforce],
+    source_code_context: [Enforce],
         "In local sessions, reorder the first code-context rows by relevance to the task, without pruning. Sends the task and each row's symbol name, kind, path, line span, and reference counts, never source text.";
 }
 
@@ -963,7 +963,7 @@ mod tests {
     #[test_case("memory_duplicates", true, false)]
     #[test_case("compaction_retention", false, true)]
     #[test_case("output_pointers", true, false)]
-    #[test_case("code_context", false, true)]
+    #[test_case("source_code_context", false, true)]
     fn feature_modes_are_validated(feature: &str, advise: bool, enforce: bool) {
         for (mode, allowed) in [
             ("off", true),
@@ -1414,8 +1414,8 @@ mod tests {
         "features.output_pointers"
     )]
     #[test_case(
-        "[decisions.features]\ncode_context = 'shadow'",
-        "features.code_context"
+        "[decisions.features]\nsource_code_context = 'shadow'",
+        "features.source_code_context"
     )]
     #[test_case(
         "[decisions.features]\nquestion_tool_nudge = 'advise'",
@@ -1520,7 +1520,7 @@ mod tests {
     #[test_case("memory_duplicates", FeatureMode::Advise, true; "memory_duplicates_disabled")]
     #[test_case("compaction_retention", FeatureMode::Enforce, true; "compaction_retention_disabled")]
     #[test_case("output_pointers", FeatureMode::Advise, true; "output_pointers_disabled")]
-    #[test_case("code_context", FeatureMode::Enforce, false; "code_context_preserved")]
+    #[test_case("source_code_context", FeatureMode::Enforce, false; "source_code_context_preserved")]
     fn project_can_only_disable_features(feature: &str, global_mode: FeatureMode, disable: bool) {
         let mut global: RawConfig = toml::from_str(&format!(
             "[decisions.features]\n{feature} = '{}'",
@@ -1586,6 +1586,7 @@ mod tests {
     #[test_case("api_key = 'secret'")]
     #[test_case("auto_screening_restricted = false")]
     #[test_case("[features]\nunknown = 'shadow'")]
+    #[test_case("[features]\ncode_context = 'shadow'")]
     #[test_case("[thresholds]\nunknown = 0.1")]
     fn unknown_settings_are_not_silently_ignored(source: &str) {
         assert!(toml::from_str::<RawDecisionsConfig>(source).is_err());

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// The task-shaped bundle.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CodeContextInput {
+pub struct SourceCodeContextInput {
     /// What the caller is about to do, in their own words.
     pub task: String,
     #[serde(default)]
@@ -61,7 +61,7 @@ impl Direction {
 /// Callers or callees of one symbol, and with `depth` what a change to it could reach.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CodeRefsInput {
+pub struct SourceCodeRefsInput {
     /// A symbol name, optionally qualified by path as `path::name` or `path:name`.
     pub symbol: String,
     #[serde(default)]
@@ -202,7 +202,7 @@ pub struct ReferenceRow {
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CodeContextOutput {
+pub struct SourceCodeContextOutput {
     pub task: String,
     pub path: String,
     /// How the router read the task: `nameExact` or `conceptual`.
@@ -225,7 +225,7 @@ pub struct CodeContextOutput {
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CodeRefsOutput {
+pub struct SourceCodeRefsOutput {
     pub symbol: String,
     pub direction: &'static str,
     /// What one row counts, named for the direction.
@@ -255,7 +255,7 @@ pub struct CodeRefsOutput {
     pub graph: GraphSummary,
 }
 
-impl CodeRefsOutput {
+impl SourceCodeRefsOutput {
     /// The file a row's call sites sit in when they need no path: the caller's own body, or for
     /// callees the selected symbol's.
     #[must_use]
@@ -285,8 +285,8 @@ impl ReferenceRow {
 
 /// A selector that named nothing.
 ///
-/// Distinct from an empty result on purpose. `code_refs` on a symbol with no callers is the answer
-/// `0`; `code_refs` on a misspelled symbol is not an answer at all, and returning `0` for it would
+/// Distinct from an empty result on purpose. `source_code_refs` on a symbol with no callers is the answer
+/// `0`; `source_code_refs` on a misspelled symbol is not an answer at all, and returning `0` for it would
 /// let a caller conclude something false about code that exists.
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]

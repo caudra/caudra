@@ -1,10 +1,10 @@
-# workcell-code-graph
+# workcell-source-code-graph
 
-`workcell-code-graph` is the protocol-neutral engine behind Workcell's repository-scale code tools.
+`workcell-source-code-graph` is the protocol-neutral engine behind Workcell's repository-scale code tools.
 It takes source text that someone else read and returns a ranked, queryable symbol graph. It has no
 filesystem access, no protocol dependency, and no notion of a tool call.
 
-The MCP-facing group lives in `workcell-mcp-code-graph`, which owns confinement, crawling, tool
+The MCP-facing group lives in `workcell-mcp-source-code-graph`, which owns confinement, crawling, tool
 schemas, and result shaping. Everything below the crawl lives here.
 
 ## Pipeline

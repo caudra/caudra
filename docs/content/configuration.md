@@ -429,7 +429,7 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 | `bash` | 5 | `shell` |
 | `python_execution` | 5 | `python_execution` |
 | `task` | 12 | `task`, `task_control` |
-| `index` | 3 | `file_index`, `code_context`, `code_refs` |
+| `index` | 3 | `file_index`, `source_code_context`, `source_code_refs` |
 | `grep` | 3 | `file_grep`, `file_glob` |
 | `read` | 3 | `file_read` |
 | `write` | 7 | `file_write`, `file_edit`, `file_apply_patch`, `image_generate`, `memory`, `plan` |
@@ -513,13 +513,13 @@ Automatic steering repairs unusable model output and can add bounded guidance ab
 | `abandoned_turn` | Continue a turn that ended by announcing work the response never performed, up to 2 continuations per episode. Spending the allowance accepts the text rather than failing the turn. |
 | `repetition` | Advise on short exact tool cycles, including normalized native batch leaf calls, or repeated normalized assistant text. |
 | `tool_planning` | Advise after consecutive failed tool attempts across responses, including attempts with different tools or inputs. Any successful tool result ends the failure episode. Repeating a successful call is insufficient. |
-| `relative_paths` | Suggest up to two shorter relative forms when file, patch, code-graph, or shell `workdir` paths spell out the working directory or its parent. The hint appears once per context. |
+| `relative_paths` | Suggest up to two shorter relative forms when file, patch, source-code, or shell `workdir` paths spell out the working directory or its parent. The hint appears once per context. |
 
 Recovery and advisory budgets are separate. Advisory rules allow at most 4 total injections per invocation. Repetition and tool-planning advisories each wait a default cooldown of 3 completed model responses.
 
 Tool-planning evidence starts after the last response containing any successful tool result, including results outside the retained batch window. A background admission ends the failure episode without proving that the background work succeeded. Later terminal outcomes do not retroactively change that admission into a failed attempt.
 
-Relative-path evidence is the latest response only, and the hint yields to repetition and tool-planning advisories. While an earlier hint remains in context, even across user turns, no new hint is added. Once compaction removes it, another hint appears only if a later response uses absolute paths again. A suggestion climbs at most one directory with `../`. Local sessions get suggestions only when the working directory the model sees is the canonical project path. Remote workspaces, sandboxes, and code-graph scopes get suggestions inside the working directory only. Paths with backticks, angle brackets, control characters, or invisible Unicode formatting characters are never quoted. Caudra never rewrites the paths a model sends.
+Relative-path evidence is the latest response only, and the hint yields to repetition and tool-planning advisories. While an earlier hint remains in context, even across user turns, no new hint is added. Once compaction removes it, another hint appears only if a later response uses absolute paths again. A suggestion climbs at most one directory with `../`. Local sessions get suggestions only when the working directory the model sees is the canonical project path. Remote workspaces, sandboxes, and source-code scopes get suggestions inside the working directory only. Paths with backticks, angle brackets, control characters, or invisible Unicode formatting characters are never quoted. Caudra never rewrites the paths a model sends.
 
 An empty-response episode lives in the transcript tail, so it survives a restore and a new invocation. A message typed into a stall is answered, but it does not refill the budget: only a response carrying a tool call or visible text ends the episode. `max_stalled_turns` bounds the turns that interleaved rules spend between them, independently of any single rule's allowance.
 
@@ -788,7 +788,7 @@ Redaction is best effort. Decision context can include commands, task text, tool
 | `memory_duplicates` | `off` | `off`, `shadow`, `advise` | When a new memory note is written, name existing notes that may cover the same topic in the write receipt. The write itself is never blocked or changed. Sends redacted excerpts of the new note and of keyword-matched notes. |
 | `compaction_retention` | `off` | `off`, `shadow`, `enforce` | During compaction, keep the tool results most relevant to the active goal, open todos, and latest request instead of only the newest, and keep the most relevant part of a long result. Sends redacted goal, todo, and request excerpts, and each recent result's tool name with redacted input and output excerpts. |
 | `output_pointers` | `off` | `off`, `shadow`, `advise` | When a saved tool output was truncated, point the agent to at most two omitted line ranges likely to matter. Nothing extra is removed. Sends redacted excerpts of the in-progress todos, latest request, tool input, and omitted lines. |
-| `code_context` | `off` | `off`, `shadow`, `enforce` | In local sessions, reorder the first code-context rows by relevance to the task, without pruning. Sends the task and each row's symbol name, kind, path, line span, and reference counts, never source text. |
+| `source_code_context` | `off` | `off`, `shadow`, `enforce` | In local sessions, reorder the first code-context rows by relevance to the task, without pruning. Sends the task and each row's symbol name, kind, path, line span, and reference counts, never source text. |
 
 #### `decisions.thresholds`
 
@@ -830,11 +830,11 @@ The request contains redacted excerpts of the current visible reply and relevant
 
 #### Reranking
 
-Tool search, `memory_search`, `memory_recall`, `memory_duplicates`, `compaction_retention`, `output_pointers`, and `code_context` use the engine as a reranker. A cheap first pass, such as keyword matching, picks the candidates. The engine then answers one true or false relevance question per candidate, and Caudra orders, prunes, or names candidates by the probability it returns. The feature table above lists what each one sends.
+Tool search, `memory_search`, `memory_recall`, `memory_duplicates`, `compaction_retention`, `output_pointers`, and `source_code_context` use the engine as a reranker. A cheap first pass, such as keyword matching, picks the candidates. The engine then answers one true or false relevance question per candidate, and Caudra orders, prunes, or names candidates by the probability it returns. The feature table above lists what each one sends.
 
 One request holds up to 16 candidates, each with an opaque ID such as `c00`. Larger lists go out as concurrent requests under one deadline. Candidate text is redacted and cut to a fixed size before it is sent, and every question tells the engine to treat the candidate as data rather than instructions. The request state, such as the query, task, or goal, stays within the 1,500-byte state limit.
 
-Enforcing features compare each probability with `thresholds.relevance_floor` (default `0.1`). Tool search and `code_context` only reorder, putting candidates at or above the floor first. `memory_search` omits matches below the floor and names them. `compaction_retention` keeps the same number of tool results as without the engine, choosing them by relevance, and never drops a result it could not otherwise drop. Advisory features name a candidate only at or above `thresholds.routing_confidence` (default `0.9`).
+Enforcing features compare each probability with `thresholds.relevance_floor` (default `0.1`). Tool search and `source_code_context` only reorder, putting candidates at or above the floor first. `memory_search` omits matches below the floor and names them. `compaction_retention` keeps the same number of tool results as without the engine, choosing them by relevance, and never drops a result it could not otherwise drop. Advisory features name a candidate only at or above `thresholds.routing_confidence` (default `0.9`).
 
 When any request fails, is refused, times out, or is cancelled, or the decision service changes while it runs, the feature behaves as if it were `off`. In `shadow`, requests are sent and logged without effect. With `log = true`, an enforcing feature records `rerouted` when the order it used differs from the first pass, and an advisory feature records `advised` when it named a candidate. Workflows and MCP snippets can rerank their own candidates with `rerank()`: see [workflows](/docs/workflows/#reranking-candidates) and [MCP](/docs/mcp/#decisions-and-reranking). See also [memory relevance](/docs/memory/#relevance-from-the-decision-engine).
 

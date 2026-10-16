@@ -719,7 +719,7 @@ pub struct IndexDirectoryEntry {
     pub kind: IndexDirectoryEntryKind,
 }
 
-/// One symbol in a code-graph answer.
+/// One symbol in a source-code answer.
 ///
 /// `inbound`/`outbound` are reference counts and `hops` is a distance, so a row
 /// carries whichever its tool measured and leaves the rest unset rather than
@@ -727,7 +727,7 @@ pub struct IndexDirectoryEntry {
 /// recovered from source text by name, so dynamic dispatch and macros
 /// contribute none.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CodeGraphRow {
+pub struct SourceCodeGraphRow {
     pub name: String,
     pub kind: String,
     pub path: String,
@@ -752,7 +752,7 @@ pub struct CodeGraphRow {
     pub name_only: bool,
 }
 
-impl CodeGraphRow {
+impl SourceCodeGraphRow {
     /// The plain-text form, used when a card cannot be drawn.
     pub fn as_line(&self) -> String {
         let mut line = String::new();
@@ -809,7 +809,7 @@ pub struct EnvironmentCommand {
 
 /// The symbol body a retired `code_expand` card carried, kept so stored sessions still render it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CodeGraphSource {
+pub struct SourceCodeGraphSource {
     pub path: String,
     pub kind: String,
     pub line_start: usize,
@@ -1985,18 +1985,18 @@ pub enum ToolOutput {
     /// A loaded skill, which the model reads numbered and a card draws as the
     /// document it is.
     Skill(SkillOutput),
-    /// A code-graph answer: a headline, ranked or referencing rows, and the
+    /// A source-code answer: a headline, ranked or referencing rows, and the
     /// footer describing the graph they came from. `source` is only set on
     /// cards stored by the retired `code_expand`.
     ///
     /// `annotation` is supplied per call because the rows mean different things
     /// per tool — ranked matches, callers, reached symbols — and one derived
     /// count would be wrong for the others.
-    CodeGraph {
+    SourceCodeGraph {
         headline: String,
-        rows: Vec<CodeGraphRow>,
+        rows: Vec<SourceCodeGraphRow>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        source: Option<CodeGraphSource>,
+        source: Option<SourceCodeGraphSource>,
         footer: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<serde_json::Value>,
@@ -2243,7 +2243,7 @@ impl ToolOutput {
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.state.as_ref(),
             Self::Index(IndexOutput::File { state, .. })
             | Self::Index(IndexOutput::Directory { state, .. })
-            | Self::CodeGraph { state, .. } => state.as_ref(),
+            | Self::SourceCodeGraph { state, .. } => state.as_ref(),
             _ => None,
         }
     }
@@ -2272,7 +2272,7 @@ impl ToolOutput {
             | Self::Memory(_)
             | Self::Peers(_)
             | Self::Skill(_)
-            | Self::CodeGraph { .. }
+            | Self::SourceCodeGraph { .. }
             | Self::Shell(_)
             | Self::TodoList(_)
             | Self::Answers(_)
@@ -2347,7 +2347,7 @@ impl ToolOutput {
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.text.clone(),
             Self::Mcp(output) => output.display_text(),
             Self::McpCode(output) => output.model_text(),
-            Self::CodeGraph {
+            Self::SourceCodeGraph {
                 headline,
                 rows,
                 source,
@@ -2355,7 +2355,7 @@ impl ToolOutput {
                 ..
             } => {
                 let mut out = vec![headline.clone()];
-                out.extend(rows.iter().map(CodeGraphRow::as_line));
+                out.extend(rows.iter().map(SourceCodeGraphRow::as_line));
                 if let Some(source) = source {
                     out.push(format!("{}:{}", source.path, source.line_start));
                     out.extend(source.lines.iter().cloned());
@@ -3901,6 +3901,22 @@ mod tests {
     const PLAN_WRITE_CONTENT: &str = "# Committed plan";
     const RESOLVED_REQUEST: &str = "resolved-request";
     const AUTOPILOT_ANSWERER: &str = "autopilot";
+    /// A card stored before the rename, as storage schema 29 rewrites it.
+    const MIGRATED_SOURCE_CODE_CARD: &str = r#"{"SourceCodeGraph":{"headline":"1 symbols reach restart_server within 1 hops; 0 of them are tests","rows":[{"name":"forward","kind":"function","path":"scripts/test.py","line_start":95,"line_end":160,"hops":1,"test_scope":false}],"footer":"[9 files, 206 symbols]","state":{"symbol":"restart_server","depth":1}}}"#;
+
+    #[test]
+    fn a_migrated_source_code_card_restores() {
+        let output: ToolOutput = serde_json::from_str(MIGRATED_SOURCE_CODE_CARD).unwrap();
+        let ToolOutput::SourceCodeGraph { rows, footer, .. } = &output else {
+            panic!("expected a source-code card, got {output:?}");
+        };
+        assert_eq!(rows[0].name, "forward");
+        assert_eq!(footer, "[9 files, 206 symbols]");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(MIGRATED_SOURCE_CODE_CARD).unwrap(),
+            serde_json::to_value(&output).unwrap()
+        );
+    }
 
     fn shell_output() -> ShellOutput {
         ShellOutput {

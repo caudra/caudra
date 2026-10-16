@@ -1,5 +1,5 @@
 [package]
-name = "workcell-mcp-code-graph"
+name = "workcell-mcp-source-code-graph"
 description = "Task retrieval and call-graph reference tools over a confined source tree"
 readme = "README.md"
 edition.workspace = true
@@ -13,7 +13,7 @@ default = []
 mcp = ["dep:rmcp"]
 # Repository history signals. Optional for the same reason they are optional in the engine: the map
 # is complete without them.
-git = ["workcell-code-graph/git"]
+git = ["workcell-source-code-graph/git"]
 
 [dependencies]
 async-trait.workspace = true
@@ -24,7 +24,7 @@ thiserror.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros"] }
 tokio-util.workspace = true
-workcell-code-graph.workspace = true
+workcell-source-code-graph.workspace = true
 # The confined resolver. This crate never opens a path itself; every read goes through the
 # filesystem group so there is exactly one confinement implementation in the process.
 workcell-mcp-files = { workspace = true, default-features = false }

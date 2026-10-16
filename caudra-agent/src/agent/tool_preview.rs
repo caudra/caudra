@@ -48,8 +48,8 @@ const PREVIEW_KEYS: &[(&str, &[&str])] = &[
     ("skill", &["name"]),
     ("workflow", &["action"]),
     ("automation", &["action"]),
-    ("code_context", &["task"]),
-    ("code_refs", &["symbol"]),
+    ("source_code_context", &["task"]),
+    ("source_code_refs", &["symbol"]),
     ("image_generate", &["out"]),
 ];
 

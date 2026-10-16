@@ -19,7 +19,7 @@ fn token() -> CancellationToken {
 }
 
 /// Pruning is off by default, so a test asking about repository boundaries must turn it on the way
-/// the code graph does.
+/// the source-code graph does.
 fn pruning_limits() -> FilesystemLimits {
     FilesystemLimits {
         prune_nested_repositories: true,
@@ -357,7 +357,7 @@ async fn naming_a_nested_repository_as_the_scope_traverses_it() {
     assert_eq!(paths, vec!["foreign.txt".to_owned()]);
 }
 
-/// Negative fixture for the scope decision: pruning belongs to the code graph, whose ranking a
+/// Negative fixture for the scope decision: pruning belongs to the source-code graph, whose ranking a
 /// foreign tree distorts. A text search has no such problem and must keep descending.
 #[tokio::test]
 async fn a_text_search_still_descends_into_a_nested_repository() {

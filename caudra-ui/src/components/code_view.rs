@@ -32,10 +32,11 @@ use caudra_agent::tools::{
 use caudra_agent::types::Answer;
 use caudra_agent::types::{TodoItem, TodoStatus};
 use caudra_agent::{
-    BatchToolEntry, BatchToolStatus, CodeGraphRow, CodeGraphSource, GrepFileEntry, INDEX_TRUNCATED,
-    IndexDirectoryEntryKind, IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange,
-    InstructionBlock, McpOutput, PatchedFile, SearchCap, SkillOutput, SubagentProgress, ToolInput,
-    ToolOutput, format_live_duration, format_settled_duration, pretty_json,
+    BatchToolEntry, BatchToolStatus, GrepFileEntry, INDEX_TRUNCATED, IndexDirectoryEntryKind,
+    IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange, InstructionBlock, McpOutput,
+    PatchedFile, SearchCap, SkillOutput, SourceCodeGraphRow, SourceCodeGraphSource,
+    SubagentProgress, ToolInput, ToolOutput, format_live_duration, format_settled_duration,
+    pretty_json,
 };
 use caudra_config::ToolOutputLines;
 use caudra_diff::{DiffHunk, DiffLine, DiffSpan, compute_hunks};
@@ -2726,10 +2727,10 @@ const GRAPH_NAME_ONLY: &str = "~name";
 ///
 /// The name column is padded to the widest name actually shown rather than a
 /// fixed width, so a narrow result does not sit in a gutter of blanks.
-fn render_code_graph(
+fn render_source_code_graph(
     headline: &str,
-    rows: &[CodeGraphRow],
-    source: Option<&CodeGraphSource>,
+    rows: &[SourceCodeGraphRow],
+    source: Option<&SourceCodeGraphSource>,
     footer: &str,
     max_lines: usize,
     highlight: bool,
@@ -2765,7 +2766,7 @@ fn render_code_graph(
         .map(|hops| hops.to_string().len());
     for row in rows.iter().take(row_count) {
         lines.extend(wrapped_lines(wrap_styled(
-            code_graph_row(row, name_width, hop_width).spans,
+            source_code_graph_row(row, name_width, hop_width).spans,
             1,
             GRAPH_HANG,
             width,
@@ -2811,8 +2812,8 @@ fn render_code_graph(
     (lines, truncated)
 }
 
-fn code_graph_row(
-    row: &CodeGraphRow,
+fn source_code_graph_row(
+    row: &SourceCodeGraphRow,
     name_width: usize,
     hop_width: Option<usize>,
 ) -> Line<'static> {
@@ -3695,13 +3696,13 @@ pub fn render_tool_content(
         Some(ToolOutput::Index(IndexOutput::File {
             language, lines, ..
         })) => render_index_file(language, lines, limits.budget, highlight),
-        Some(ToolOutput::CodeGraph {
+        Some(ToolOutput::SourceCodeGraph {
             headline,
             rows,
             source,
             footer,
             ..
-        }) => render_code_graph(
+        }) => render_source_code_graph(
             headline,
             rows,
             source.as_ref(),
@@ -3825,7 +3826,7 @@ pub fn render_tool_content(
                     | ToolOutput::Patch { .. }
                     | ToolOutput::GrepResult { .. }
                     | ToolOutput::Index(IndexOutput::File { .. })
-                    | ToolOutput::CodeGraph { .. }
+                    | ToolOutput::SourceCodeGraph { .. }
                     | ToolOutput::Instructions { .. }
             )
         )
@@ -8171,8 +8172,8 @@ mod tests {
         assert_eq!(unique_targets(&rows), vec![RowTarget::Item(0)]);
     }
 
-    fn ranked_row(name: &str, inbound: usize) -> CodeGraphRow {
-        CodeGraphRow {
+    fn ranked_row(name: &str, inbound: usize) -> SourceCodeGraphRow {
+        SourceCodeGraphRow {
             name: name.to_owned(),
             kind: "function".to_owned(),
             path: "src/lib.rs".to_owned(),
@@ -8180,7 +8181,7 @@ mod tests {
             line_end: 20,
             inbound: Some(inbound),
             outbound: Some(1),
-            ..CodeGraphRow::default()
+            ..SourceCodeGraphRow::default()
         }
     }
 
@@ -8192,7 +8193,7 @@ mod tests {
     /// terminal broke it, dropping the tail to the left margin.
     #[test]
     fn a_graph_row_too_wide_for_the_card_hangs_under_its_name() {
-        let row = CodeGraphRow {
+        let row = SourceCodeGraphRow {
             test_scope: true,
             ..ranked_row(
                 "shell_pattern_option_is_absent_without_a_reusable_prefix",
@@ -8200,7 +8201,7 @@ mod tests {
             )
         };
 
-        let (lines, _) = render_code_graph(
+        let (lines, _) = render_source_code_graph(
             "located in .",
             &[row],
             None,
@@ -8229,14 +8230,14 @@ mod tests {
 
     #[test]
     fn a_refs_row_shows_its_call_sites_and_name_only_link() {
-        let row = CodeGraphRow {
+        let row = SourceCodeGraphRow {
             sites: vec!["12".to_owned(), "src/b.rs:7".to_owned()],
             sites_withheld: 3,
             name_only: true,
             ..ranked_row("alpha", 2)
         };
 
-        let (lines, _) = render_code_graph(
+        let (lines, _) = render_source_code_graph(
             "callers of beta",
             &[row],
             None,
@@ -8252,12 +8253,12 @@ mod tests {
     }
 
     #[test]
-    fn a_code_graph_card_keeps_its_headline_and_footer() {
+    fn a_source_code_graph_card_keeps_its_headline_and_footer() {
         const HEADLINE: &str = "ranked symbols in .";
         const FOOTER: &str = "[3 files, 9 symbols, 4 edges]";
 
         let rows = vec![ranked_row("alpha", 3), ranked_row("beta", 1)];
-        let (lines, truncated) = render_code_graph(
+        let (lines, truncated) = render_source_code_graph(
             HEADLINE,
             &rows,
             None,
@@ -8285,9 +8286,10 @@ mod tests {
         const HEADLINE: &str = "ranked symbols in .";
         const FOOTER: &str = "[100 files]";
 
-        let rows: Vec<CodeGraphRow> = (0..40).map(|i| ranked_row(&format!("sym{i}"), i)).collect();
+        let rows: Vec<SourceCodeGraphRow> =
+            (0..40).map(|i| ranked_row(&format!("sym{i}"), i)).collect();
         let (lines, truncated) =
-            render_code_graph(HEADLINE, &rows, None, FOOTER, 8, false, UNCONSTRAINED_WIDTH);
+            render_source_code_graph(HEADLINE, &rows, None, FOOTER, 8, false, UNCONSTRAINED_WIDTH);
 
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert!(truncated);
@@ -8301,7 +8303,7 @@ mod tests {
     #[test]
     fn a_footer_naming_a_caveat_is_not_dimmed_like_an_ordinary_one() {
         let rows = vec![ranked_row("alpha", 1)];
-        let plain = render_code_graph(
+        let plain = render_source_code_graph(
             "h",
             &rows,
             None,
@@ -8311,7 +8313,7 @@ mod tests {
             UNCONSTRAINED_WIDTH,
         )
         .0;
-        let caveated = render_code_graph(
+        let caveated = render_source_code_graph(
             "h",
             &rows,
             None,
@@ -8338,7 +8340,7 @@ mod tests {
         far.name = "far".to_owned();
         far.hops = Some(12);
 
-        let (lines, _) = render_code_graph(
+        let (lines, _) = render_source_code_graph(
             "h",
             &[near, far],
             None,
@@ -8363,14 +8365,14 @@ mod tests {
 
     #[test]
     fn a_stored_code_expand_card_still_renders_its_body() {
-        let source = CodeGraphSource {
+        let source = SourceCodeGraphSource {
             path: "src/lib.rs".to_owned(),
             kind: "function".to_owned(),
             line_start: 10,
             lines: vec!["fn alpha() {".to_owned(), "}".to_owned()],
             whole_file_reason: Some("the bundle would cost more than the file".to_owned()),
         };
-        let (lines, _) = render_code_graph(
+        let (lines, _) = render_source_code_graph(
             "h",
             &[],
             Some(&source),
@@ -8477,8 +8479,8 @@ mod tests {
         }
     }
 
-    fn code_graph_output() -> ToolOutput {
-        ToolOutput::CodeGraph {
+    fn source_code_graph_output() -> ToolOutput {
+        ToolOutput::SourceCodeGraph {
             headline: LONG.to_owned(),
             rows: Vec::new(),
             source: None,
@@ -8522,7 +8524,7 @@ mod tests {
     #[test_case(grep_output() ; "grep_result")]
     #[test_case(environment_output() ; "environment")]
     #[test_case(read_code_output() ; "read_code")]
-    #[test_case(code_graph_output() ; "code_graph")]
+    #[test_case(source_code_graph_output() ; "source_code")]
     #[test_case(skill_output() ; "skill")]
     #[test_case(ToolOutput::Plain(text_output(LONG)) ; "plain")]
     #[test_case(ToolOutput::Markdown(text_output(LONG)) ; "markdown")]

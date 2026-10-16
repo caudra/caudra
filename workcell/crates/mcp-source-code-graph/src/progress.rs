@@ -1,6 +1,6 @@
 //! Phase reporting for the one long call this crate makes.
 //!
-//! A code-graph call crawls, parses, and ranks a whole tree before it can answer anything, which on
+//! A source-code-graph call crawls, parses, and ranks a whole tree before it can answer anything, which on
 //! a large repository is seconds of work with nothing to show. This reports which of the three
 //! phases is running and how many files it has seen.
 //!
@@ -17,7 +17,7 @@ use async_trait::async_trait;
 /// already fast; this is often enough to look continuous and rare enough to be free.
 pub const PROGRESS_FILE_INTERVAL: usize = 64;
 
-/// Which part of a code-graph call is running.
+/// Which part of a source-code-graph call is running.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GraphPhase {
     /// Listing and reading source files.

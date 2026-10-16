@@ -58,10 +58,6 @@ use workcell_host_contract::{
     WorkspaceRequestBinding, WorkspaceWatchCapability, WorkspaceWatchLimits, WorkspaceWatchMethods,
 };
 use workcell_mcp_code::{CodeBuildError, CodeConfiguration, CodeInput, CodeToolGroup};
-use workcell_mcp_code_graph::{
-    CodeContextInput, CodeGraphError, CodeGraphLimits, CodeGraphToolGroup, CodeRefsInput,
-    GraphProgress, GraphProgressSink, ModelText as GraphModelText, SelectorRefusal, Shrinkable,
-};
 use workcell_mcp_files::{
     FileApplyPatchInput, FileEditInput, FileGlobInput, FileGrepInput, FileReadInput, FileResource,
     FileResourceAccess, FileToolGroup, FileWriteInput, FilesystemError, FilesystemLimits,
@@ -71,6 +67,11 @@ use workcell_mcp_files::{
 use workcell_mcp_shell::{
     ShellEnvironment, ShellInput, ShellPermissionPolicy, ShellProgressChunk, ShellProgressSink,
     ShellToolGroup, mcp_progress_sink,
+};
+use workcell_mcp_source_code_graph::{
+    GraphProgress, GraphProgressSink, ModelText as GraphModelText, SelectorRefusal, Shrinkable,
+    SourceCodeContextInput, SourceCodeGraphError, SourceCodeGraphLimits, SourceCodeGraphToolGroup,
+    SourceCodeRefsInput,
 };
 use workcell_mcp_web::{
     PreparedWebOperation, ProxyConfiguration, WebOperationExecution, WebToolGroup, WebfetchError,
@@ -117,9 +118,9 @@ const ISOLATED_PYTHON_RESOURCE: &str = "isolated-python";
 const INVALID_ARGUMENTS_CODE: &str = "invalid_arguments";
 const CAPABILITY_UNAVAILABLE_CODE: &str = "capability_unavailable";
 const UNKNOWN_OPERATION_CODE: &str = "unknown_operation";
-const CODE_GRAPH_DENIED_CODE: &str = "code_graph_denied";
-const CODE_GRAPH_INVALID_CODE: &str = "code_graph_invalid";
-const CODE_GRAPH_INTERNAL_CODE: &str = "code_graph_internal";
+const SOURCE_CODE_DENIED_CODE: &str = "source_code_denied";
+const SOURCE_CODE_INVALID_CODE: &str = "source_code_invalid";
+const SOURCE_CODE_INTERNAL_CODE: &str = "source_code_internal";
 const CANCELLED_CODE: &str = "cancelled";
 const WEB_PREPARATION_FAILED_CODE: &str = "web_preparation_failed";
 const SHELL_COMMAND_REFUSED_CODE: &str = "shell_command_refused";
@@ -158,7 +159,7 @@ pub struct ToolConfiguration<'a> {
     pub shell_output_filter: bool,
     /// What remote-host clients may forward from this process's environment to shell commands.
     pub shell_environment: Option<ShellForwarding>,
-    /// Applies to every group that traverses: the file tools and the code graph.
+    /// Applies to every group that traverses: the file tools and the source-code graph.
     pub honor_gitignore: bool,
     pub code: CodeConfiguration<'a>,
     pub max_transfer_bytes: usize,
@@ -172,9 +173,9 @@ pub struct WorkcellServer {
     files: Option<FileToolGroup>,
     workspace_files: Option<FileToolGroup>,
     scm: Option<ScmGroup>,
-    // The code-graph group owns a bounded extraction cache behind a mutex, which is shared rather
+    // The source-code group owns a bounded extraction cache behind a mutex, which is shared rather
     // than cloned so every server clone reuses the same warm facts.
-    code_graph: Option<Arc<CodeGraphToolGroup>>,
+    source_code: Option<Arc<SourceCodeGraphToolGroup>>,
     web: Option<WebToolGroup>,
     shell: Option<ShellToolGroup>,
     shell_environment: Option<Arc<ShellForwarding>>,
@@ -294,15 +295,18 @@ impl WorkcellServer {
         };
         // Constructed over its own read-only `FileToolGroup` so the group stands alone when the
         // files tools are not exposed. Confinement is identical; only reads are ever performed.
-        let code_graph = if groups.contains(&ToolGroup::CodeGraph) {
-            let limits = CodeGraphLimits {
+        let source_code = if groups.contains(&ToolGroup::SourceCode) {
+            let limits = SourceCodeGraphLimits {
                 honor_gitignore: tools.honor_gitignore,
-                ..CodeGraphLimits::default()
+                ..SourceCodeGraphLimits::default()
             };
             Some(Arc::new(
-                CodeGraphToolGroup::new(root.ok_or(ServerBuildError::Filesystem)?, Some(limits))
-                    .await
-                    .map_err(|_| ServerBuildError::Filesystem)?,
+                SourceCodeGraphToolGroup::new(
+                    root.ok_or(ServerBuildError::Filesystem)?,
+                    Some(limits),
+                )
+                .await
+                .map_err(|_| ServerBuildError::Filesystem)?,
             ))
         } else {
             None
@@ -362,8 +366,8 @@ impl WorkcellServer {
                 Vec::new()
             },
             groups
-                .contains(&ToolGroup::CodeGraph)
-                .then(workcell_mcp_code_graph::specs)
+                .contains(&ToolGroup::SourceCode)
+                .then(workcell_mcp_source_code_graph::specs)
                 .unwrap_or_default(),
             web_specs,
             groups
@@ -384,9 +388,9 @@ impl WorkcellServer {
         let catalog_revision = manifest.revision.clone();
         let catalog = compose_catalog([
             files.as_ref().map_or_else(Vec::new, FileToolGroup::catalog),
-            code_graph
+            source_code
                 .as_ref()
-                .map_or_else(Vec::new, |_| workcell_mcp_code_graph::catalog()),
+                .map_or_else(Vec::new, |_| workcell_mcp_source_code_graph::catalog()),
             web.as_ref()
                 .map_or_else(Vec::new, |group| group.catalog(current_year)),
             shell
@@ -415,7 +419,7 @@ impl WorkcellServer {
             files,
             workspace_files: None,
             scm: None,
-            code_graph,
+            source_code,
             web,
             shell,
             shell_environment,
@@ -898,8 +902,8 @@ impl WorkcellServer {
         {
             return result;
         }
-        if let Some(code_graph) = &self.code_graph
-            && let Some(result) = code_graph
+        if let Some(source_code) = &self.source_code
+            && let Some(result) = source_code
                 .dispatch(name, arguments.clone(), cancellation.clone())
                 .await
         {
@@ -1506,7 +1510,8 @@ impl WorkcellServer {
             )
         };
         let files_failed = |error: FilesystemError| failed(error.code(), &error);
-        let graph_failed = |error: CodeGraphError| failed(code_graph_error_code(&error), &error);
+        let graph_failed =
+            |error: SourceCodeGraphError| failed(source_code_graph_error_code(&error), &error);
         let token = CancellationToken::new();
         let (operation, kind, mutating, resources) = match name {
             "file_read" => {
@@ -1622,36 +1627,37 @@ impl WorkcellServer {
                     Vec::new(),
                 )
             }
-            "code_context" => {
+            "source_code_context" => {
                 let input =
-                    parse::<CodeContextInput>(arguments).map_err(|_| invalid_arguments())?;
-                let graph = self.code_graph.as_ref().ok_or_else(unavailable)?;
+                    parse::<SourceCodeContextInput>(arguments).map_err(|_| invalid_arguments())?;
+                let graph = self.source_code.as_ref().ok_or_else(unavailable)?;
                 let scope = graph
                     .inspect_scope(input.path.as_deref())
                     .await
                     .map_err(graph_failed)?;
                 let prepared = graph
-                    .prepare_code_context(input, scope)
+                    .prepare_source_code_context(input, scope)
                     .map_err(graph_failed)?;
                 (
-                    PreparedRemoteOperation::CodeContext(prepared),
+                    PreparedRemoteOperation::SourceCodeContext(prepared),
                     OperationKind::Search,
                     false,
                     Vec::new(),
                 )
             }
-            "code_refs" => {
-                let input = parse::<CodeRefsInput>(arguments).map_err(|_| invalid_arguments())?;
-                let graph = self.code_graph.as_ref().ok_or_else(unavailable)?;
+            "source_code_refs" => {
+                let input =
+                    parse::<SourceCodeRefsInput>(arguments).map_err(|_| invalid_arguments())?;
+                let graph = self.source_code.as_ref().ok_or_else(unavailable)?;
                 let scope = graph
                     .inspect_scope(input.path.as_deref())
                     .await
                     .map_err(graph_failed)?;
                 let prepared = graph
-                    .prepare_code_refs(input, scope)
+                    .prepare_source_code_refs(input, scope)
                     .map_err(graph_failed)?;
                 (
-                    PreparedRemoteOperation::CodeRefs(prepared),
+                    PreparedRemoteOperation::SourceCodeRefs(prepared),
                     OperationKind::Search,
                     false,
                     Vec::new(),
@@ -1865,23 +1871,31 @@ impl WorkcellServer {
                     .await;
                 file_index_result(output)
             }
-            PreparedRemoteOperation::CodeContext(prepared) => {
+            PreparedRemoteOperation::SourceCodeContext(prepared) => {
                 let progress = progress.map(ToolProgressContext::into_graph_sink);
                 graph_result(
-                    self.code_graph
+                    self.source_code
                         .as_ref()
                         .ok_or_else(remote_invalid)?
-                        .execute_prepared_code_context(prepared, progress.as_deref(), &cancellation)
+                        .execute_prepared_source_code_context(
+                            prepared,
+                            progress.as_deref(),
+                            &cancellation,
+                        )
                         .await,
                 )
             }
-            PreparedRemoteOperation::CodeRefs(prepared) => {
+            PreparedRemoteOperation::SourceCodeRefs(prepared) => {
                 let progress = progress.map(ToolProgressContext::into_graph_sink);
                 graph_selectable_result(
-                    self.code_graph
+                    self.source_code
                         .as_ref()
                         .ok_or_else(remote_invalid)?
-                        .execute_prepared_code_refs(prepared, progress.as_deref(), &cancellation)
+                        .execute_prepared_source_code_refs(
+                            prepared,
+                            progress.as_deref(),
+                            &cancellation,
+                        )
                         .await,
                 )
             }
@@ -2034,7 +2048,7 @@ impl WorkcellServer {
             web: self.web.is_some(),
             shell: self.shell.is_some(),
             code: self.code.is_some(),
-            code_graph: self.code_graph.is_some(),
+            source_code: self.source_code.is_some(),
         }
     }
 
@@ -2874,7 +2888,7 @@ impl GraphProgressSink for CombinedGraphProgressSink {
     async fn publish(&self, progress: GraphProgress) {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
         let message = format!(
-            "code graph {}: {} files",
+            "source-code graph {}: {} files",
             progress.phase.label(),
             progress.files
         );
@@ -2962,7 +2976,7 @@ fn cwd_tool_arguments(name: &str, mut arguments: Value, cwd: &str) -> Result<Val
     let object = arguments.as_object_mut().ok_or_else(remote_invalid)?;
     let path_key = match name {
         "file_read" | "file_write" | "file_edit" => Some(("filePath", false)),
-        "file_glob" | "file_grep" | "file_index" | "code_context" | "code_refs" => {
+        "file_glob" | "file_grep" | "file_index" | "source_code_context" | "source_code_refs" => {
             Some(("path", true))
         }
         "shell" => Some(("workdir", true)),
@@ -3123,10 +3137,10 @@ fn operation_file_intents(
         PreparedRemoteOperation::FileEdit(prepared) => file_intents(prepared.resources()),
         PreparedRemoteOperation::FileApplyPatch(prepared) => file_intents(prepared.resources()),
         PreparedRemoteOperation::FileIndex(prepared) => file_intents(prepared.resources()),
-        PreparedRemoteOperation::CodeContext(prepared) => {
+        PreparedRemoteOperation::SourceCodeContext(prepared) => {
             file_intents(std::slice::from_ref(prepared.scope()))
         }
-        PreparedRemoteOperation::CodeRefs(prepared) => {
+        PreparedRemoteOperation::SourceCodeRefs(prepared) => {
             file_intents(std::slice::from_ref(prepared.scope()))
         }
         _ => Ok(Vec::new()),
@@ -3295,44 +3309,51 @@ fn file_index_result(
 }
 
 fn graph_result<T>(
-    result: Result<T, workcell_mcp_code_graph::CodeGraphError>,
+    result: Result<T, workcell_mcp_source_code_graph::SourceCodeGraphError>,
 ) -> Result<CallToolResult, ErrorData>
 where
     T: Serialize + GraphModelText + Clone + Shrinkable,
 {
     match result {
         Ok(output) => {
-            let output = workcell_mcp_code_graph::fit(output);
+            let output = workcell_mcp_source_code_graph::fit(output);
             typed_tool_result(&output, GraphModelText::model_text(&output).into_owned())
         }
-        Err(error) => operation_error_result(code_graph_error_code(&error), error.to_string()),
+        Err(error) => {
+            operation_error_result(source_code_graph_error_code(&error), error.to_string())
+        }
     }
 }
 
 fn graph_selectable_result<T>(
-    result: Result<Result<T, SelectorRefusal>, workcell_mcp_code_graph::CodeGraphError>,
+    result: Result<
+        Result<T, SelectorRefusal>,
+        workcell_mcp_source_code_graph::SourceCodeGraphError,
+    >,
 ) -> Result<CallToolResult, ErrorData>
 where
     T: Serialize + GraphModelText + Clone + Shrinkable,
 {
     match result {
         Ok(Ok(output)) => {
-            let output = workcell_mcp_code_graph::fit(output);
+            let output = workcell_mcp_source_code_graph::fit(output);
             typed_tool_result(&output, GraphModelText::model_text(&output).into_owned())
         }
         Ok(Err(refusal)) => {
             typed_tool_result(&refusal, GraphModelText::model_text(&refusal).into_owned())
         }
-        Err(error) => operation_error_result(code_graph_error_code(&error), error.to_string()),
+        Err(error) => {
+            operation_error_result(source_code_graph_error_code(&error), error.to_string())
+        }
     }
 }
 
-fn code_graph_error_code(error: &CodeGraphError) -> &'static str {
+fn source_code_graph_error_code(error: &SourceCodeGraphError) -> &'static str {
     match error {
-        CodeGraphError::Denied(_) => CODE_GRAPH_DENIED_CODE,
-        CodeGraphError::Invalid(_) => CODE_GRAPH_INVALID_CODE,
-        CodeGraphError::Aborted => CANCELLED_CODE,
-        CodeGraphError::Internal(_) => CODE_GRAPH_INTERNAL_CODE,
+        SourceCodeGraphError::Denied(_) => SOURCE_CODE_DENIED_CODE,
+        SourceCodeGraphError::Invalid(_) => SOURCE_CODE_INVALID_CODE,
+        SourceCodeGraphError::Aborted => CANCELLED_CODE,
+        SourceCodeGraphError::Internal(_) => SOURCE_CODE_INTERNAL_CODE,
     }
 }
 
@@ -4146,7 +4167,7 @@ mod tests {
     fn composed_catalog_is_exact_and_ordered() {
         let catalog = compose_catalog([
             file_catalog(true),
-            workcell_mcp_code_graph::catalog(),
+            workcell_mcp_source_code_graph::catalog(),
             web_catalog(2026, &WebsearchExecutionConfiguration::unconfigured()),
             workcell_mcp_shell::catalog(),
             workcell_mcp_code::catalog(),
@@ -4188,8 +4209,8 @@ mod tests {
                 "file_edit",
                 "file_apply_patch",
                 "file_index",
-                "code_context",
-                "code_refs",
+                "source_code_context",
+                "source_code_refs",
                 "websearch",
                 "webfetch",
                 "shell",
@@ -4502,7 +4523,7 @@ mod tests {
             Some(root.path()),
             &[
                 ToolGroup::Files,
-                ToolGroup::CodeGraph,
+                ToolGroup::SourceCode,
                 ToolGroup::Web,
                 ToolGroup::Shell,
                 ToolGroup::Transfer,
@@ -4576,7 +4597,7 @@ mod tests {
 
         let operation = stored_operation(
             &server,
-            "code_context",
+            "source_code_context",
             serde_json::json!({"task":"scoped","path":"scope","limit":1}),
         )
         .await;
@@ -4627,7 +4648,7 @@ mod tests {
             Some(root.path()),
             &[
                 ToolGroup::Files,
-                ToolGroup::CodeGraph,
+                ToolGroup::SourceCode,
                 ToolGroup::Web,
                 ToolGroup::Shell,
                 ToolGroup::Transfer,
@@ -4649,7 +4670,7 @@ mod tests {
         .await;
         let graph = stored_operation(
             &server,
-            "code_context",
+            "source_code_context",
             json!({"task":"graph","path":"graph"}),
         )
         .await;
@@ -4707,7 +4728,7 @@ mod tests {
             .unwrap();
         let server = WorkcellServer::configured(
             Some(root.path()),
-            &[ToolGroup::Files, ToolGroup::CodeGraph, ToolGroup::Web],
+            &[ToolGroup::Files, ToolGroup::SourceCode, ToolGroup::Web],
             ServerBehavior::default(),
             test_tools(),
         )
@@ -4725,13 +4746,13 @@ mod tests {
         let index = stored_operation(&server, "file_index", json!({"path": "binary.rs"})).await;
         let graph = stored_operation(
             &server,
-            "code_context",
+            "source_code_context",
             json!({"task": "scoped", "path": "scope"}),
         )
         .await;
         let refs = stored_operation(
             &server,
-            "code_refs",
+            "source_code_refs",
             json!({"symbol": "scoped", "path": "scope"}),
         )
         .await;
@@ -4752,8 +4773,8 @@ mod tests {
         for (operation, cancellation, code) in [
             (grep, CancellationToken::new(), NOT_FOUND_CODE),
             (index, CancellationToken::new(), INVALID_INPUT_CODE),
-            (graph, CancellationToken::new(), CODE_GRAPH_INVALID_CODE),
-            (refs, CancellationToken::new(), CODE_GRAPH_INVALID_CODE),
+            (graph, CancellationToken::new(), SOURCE_CODE_INVALID_CODE),
+            (refs, CancellationToken::new(), SOURCE_CODE_INVALID_CODE),
             (search, CancellationToken::new(), OPERATION_FAILED_CODE),
             (fetch, cancelled, CANCELLED_CODE),
         ] {
@@ -4942,7 +4963,7 @@ mod tests {
             CAPABILITY_UNAVAILABLE_CODE
         );
         assert_eq!(
-            preparation_refusal(&[], "code_context", serde_json::json!({"task": "a"})).await,
+            preparation_refusal(&[], "source_code_context", serde_json::json!({"task": "a"})).await,
             CAPABILITY_UNAVAILABLE_CODE
         );
         assert_eq!(

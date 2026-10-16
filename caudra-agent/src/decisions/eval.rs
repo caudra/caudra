@@ -30,7 +30,7 @@ use super::state::MAX_STATE_BYTES;
 use super::{
     CodeSymbol, DecisionContext, DecisionFeature, DecisionOutcome, DecisionState, Decisions,
     MAX_RERANK_BATCH, PermissionAction, content, permission, question_tool_nudge, questions,
-    rerank_code_context, shell_duration, shell_effect,
+    rerank_source_code_context, shell_duration, shell_effect,
 };
 use crate::agent::subagent::{RoutingTask, routing_state, subagent_job};
 use crate::agent::{
@@ -81,7 +81,7 @@ const NOTE_INVALID: &str = "a memory candidate needs a name, a heading and a bod
 const NEW_NOTE_INVALID: &str =
     "a duplicates query is the new note's name, a newline, then its text";
 const NEW_NOTE_SEPARATOR: char = '\n';
-const SYMBOL_ROW_INVALID: &str = "a code_context candidate is not a symbol row";
+const SYMBOL_ROW_INVALID: &str = "a source_code_context candidate is not a symbol row";
 const TOOL_RESULT_INVALID: &str =
     "a compaction_retention candidate needs a tool, an input and its content";
 const EVAL_OUTPUT_ID: &str = "output-eval";
@@ -402,9 +402,9 @@ fn decision_eval() {
             )
             .await,
             run_ranked(
-                "code_context",
-                include_str!("eval/code_context.json"),
-                |case| code_context_case(decisions, case),
+                "source_code_context",
+                include_str!("eval/source_code_context.json"),
+                |case| source_code_context_case(decisions, case),
             )
             .await,
             run_ranked(
@@ -455,7 +455,7 @@ fn service(url: &str, state_dir: StateDir) -> Decisions {
     features.memory_search = FeatureMode::Enforce;
     features.memory_recall = FeatureMode::Advise;
     features.memory_duplicates = FeatureMode::Advise;
-    features.code_context = FeatureMode::Enforce;
+    features.source_code_context = FeatureMode::Enforce;
     features.compaction_retention = FeatureMode::Enforce;
     features.output_pointers = FeatureMode::Advise;
     Decisions::new(config, &state_dir).expect(SERVICE_INVALID)
@@ -1135,7 +1135,7 @@ fn advised(advice: Option<Advice>, notes: &[Candidate], started: Instant) -> Ran
     }
 }
 
-async fn code_context_case(decisions: &Decisions, case: RankCase) -> Ranking {
+async fn source_code_context_case(decisions: &Decisions, case: RankCase) -> Ranking {
     let mut rows: Vec<(usize, SymbolRow)> = case
         .candidates
         .into_iter()
@@ -1143,7 +1143,7 @@ async fn code_context_case(decisions: &Decisions, case: RankCase) -> Ranking {
         .enumerate()
         .collect();
     let started = Instant::now();
-    rerank_code_context(
+    rerank_source_code_context(
         &mut rows,
         |(_, row)| CodeSymbol {
             name: &row.name,
@@ -1306,8 +1306,9 @@ fn compaction_retention_fixture_candidates_are_tool_results() {
 }
 
 #[test]
-fn code_context_fixture_candidates_are_symbol_rows() {
-    let fixture = rank_fixture(include_str!("eval/code_context.json")).expect(SYMBOL_ROW_INVALID);
+fn source_code_context_fixture_candidates_are_symbol_rows() {
+    let fixture =
+        rank_fixture(include_str!("eval/source_code_context.json")).expect(SYMBOL_ROW_INVALID);
     for candidate in fixture.cases.into_iter().flat_map(|case| case.candidates) {
         serde_json::from_value::<SymbolRow>(candidate).expect(SYMBOL_ROW_INVALID);
     }
@@ -1344,7 +1345,7 @@ fn rank_source(k: usize, candidates: Value, relevant: Value) -> String {
 
 #[test_case(RANK_ENFORCED, None; "enforced")]
 #[test_case(RANK_ADVISED, None; "advised")]
-#[test_case(include_str!("eval/code_context.json"), None; "code_context")]
+#[test_case(include_str!("eval/source_code_context.json"), None; "source_code_context")]
 #[test_case(include_str!("eval/compaction_retention.json"), None; "compaction_retention")]
 #[test_case(include_str!("eval/output_pointers.json"), None; "output_pointers")]
 #[test_case("{}", Some(RANK_FIXTURE_INVALID); "not_a_fixture")]

@@ -35,13 +35,13 @@ pub use workcell_host_contract::{
     WatchPollRequest,
 };
 use workcell_mcp_code::PreparedCode;
-use workcell_mcp_code_graph::{PreparedCodeContext, PreparedCodeRefs};
 use workcell_mcp_files::{
     PreparedFileEdit, PreparedFileGlob, PreparedFileGrep, PreparedFileIndex, PreparedFilePatch,
     PreparedFileRead, PreparedFileWrite, PreparedWorkspaceMutation, WorkspaceWatchBatch,
     WorkspaceWatchFailure, WorkspaceWatcher,
 };
 use workcell_mcp_shell::{PreparedShell, ShellEnvironment};
+use workcell_mcp_source_code_graph::{PreparedSourceCodeContext, PreparedSourceCodeRefs};
 use workcell_mcp_web::{PreparedWebfetchOperation, PreparedWebsearchOperation};
 use workcell_workspace_scm::PreparedScmMutation;
 use workcell_workspace_snapshot::{PreparedCleanup, PreparedRevert};
@@ -122,8 +122,8 @@ pub(crate) enum PreparedRemoteOperation {
     FileEdit(PreparedFileEdit),
     FileApplyPatch(PreparedFilePatch),
     FileIndex(PreparedFileIndex),
-    CodeContext(PreparedCodeContext),
-    CodeRefs(PreparedCodeRefs),
+    SourceCodeContext(PreparedSourceCodeContext),
+    SourceCodeRefs(PreparedSourceCodeRefs),
     Websearch(PreparedWebsearchOperation),
     Webfetch(PreparedWebfetchOperation),
     Shell {
@@ -157,8 +157,8 @@ impl PreparedRemoteOperation {
                 | "file_edit"
                 | "file_apply_patch"
                 | "file_index"
-                | "code_context"
-                | "code_refs"
+                | "source_code_context"
+                | "source_code_refs"
                 | "websearch"
                 | "webfetch"
                 | "shell"
@@ -177,8 +177,8 @@ impl PreparedRemoteOperation {
             Self::FileEdit(prepared) => prepared.retained_bytes(),
             Self::FileApplyPatch(prepared) => prepared.retained_bytes(),
             Self::FileIndex(prepared) => prepared.retained_bytes(),
-            Self::CodeContext(prepared) => prepared.retained_bytes(),
-            Self::CodeRefs(prepared) => prepared.retained_bytes(),
+            Self::SourceCodeContext(prepared) => prepared.retained_bytes(),
+            Self::SourceCodeRefs(prepared) => prepared.retained_bytes(),
             Self::Websearch(prepared) => prepared.retained_bytes(),
             Self::Webfetch(prepared) => prepared.retained_bytes(),
             Self::Shell {

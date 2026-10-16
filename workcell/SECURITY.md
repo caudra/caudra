@@ -409,7 +409,7 @@ not expose a construction-memory ceiling for those limits. Syntax trees and nati
 dropped after each call; no parser cache or scripting runtime is retained. These controls limit
 accidental and adversarial work but do not turn native parser code into a process-isolated sandbox.
 
-The code-graph tool group reads through the same confined filesystem group and adds no write
+The source-code tool group reads through the same confined filesystem group and adds no write
 authority, no second path resolver, and no network access. It parses a whole tree rather than one
 file, so its bounds are wider and all of them are host-owned: files per map, traversal entries,
 single-file and total source bytes, a crawl deadline, per-file and whole-tree definition and

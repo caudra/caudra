@@ -67,15 +67,15 @@ sequenceDiagram
 | Files | `file_read`, `file_glob`, `file_grep` | Root-confined, bounded reads and search. |
 | Files | `file_write`, `file_edit`, `file_apply_patch` | Present in the catalog only when `--allow-write` is set. |
 | Files | `file_index` | Bounded source skeletons and deterministic directory listings. |
-| Code graph | `code_context`, `code_refs` | Task retrieval, callers with their call sites, and change reach over the same confined tree. Reference counts are floors. |
+| Source-code graph | `source_code_context`, `source_code_refs` | Task retrieval, callers with their call sites, and change reach over the same confined tree. Reference counts are floors. |
 | Web | `websearch`, `webfetch` | Search defaults to credential-free Exa; fetch applies SSRF and response bounds. |
 | Shell | `shell` | Applies immutable command policy, then executes with ordered progress and a cleaned environment. |
 | Python execution | `python_execution` | Runs a Python snippet in a separate worker process with no filesystem, network, or environment access. |
 | Server | `execution_environment` | Returns fresh sanitized platform, privilege, package-manager, and command observations. |
 
 All groups except transfer are enabled by default. Use repeatable
-`--tool-group files|code_graph|web|shell|python_execution|transfer` arguments to expose a subset.
-Files, code graph, shell, and transfer require a positional root. Transfer uses authenticated
+`--tool-group files|source_code|web|shell|python_execution|transfer` arguments to expose a subset.
+Files, source-code graph, shell, and transfer require a positional root. Transfer uses authenticated
 remote-host methods rather than model tools. Its byte route requires `--transport http`, remote-host
 discovery, `--allow-write`, and private `--transfer-root` storage; requesting it over stdio is a startup error.
 
@@ -443,7 +443,7 @@ descriptor reports `exactPreparation: true`: execution consumes the typed prepar
 resource, working-directory, content, configuration, catalog, or policy changes that invalidate it.
 Websearch preparation reports the provider connection separately from a search resource whose opaque
 ID and bounded display text bind the exact normalized query used by embedded permission checks.
-A failed file, index, code-graph, or web execution reports its cause as `structuredContent.error.code`
+A failed file, index, source-code, or web execution reports its cause as `structuredContent.error.code`
 beside the message, so a client can tell a refused, missing, cancelled, or timed-out target apart
 without parsing prose. A failed shell, Python, or execution-environment run carries only text.
 
@@ -1083,16 +1083,16 @@ workcell = { git = "https://github.com/caudra/caudra", branch = "main", default-
 | `shell` | `ShellToolGroup`, `PreparedShell`, `ShellPreparationError`, scope analysis, progress streaming, and `output_filter` |
 | `code` | `CodeToolGroup`, isolated interpreter execution (the `python_execution` tool) |
 | `code-bundled` | `code` plus verified extraction of a build-time embedded Monty worker |
-| `code-graph` | `CodeGraphToolGroup` and the two `code_*` tools over a confined source tree |
-| `code-graph-git` | `code-graph` plus repository recency and churn signals through `gix` |
+| `source-code-graph` | `SourceCodeGraphToolGroup` and the two `source_code_*` tools over a confined source tree |
+| `source-code-graph-git` | `source-code-graph` plus repository recency and churn signals through `gix` |
 | `environment` | `ExecutionEnvironment` inspection |
 
 `ToolSpec` carries the protocol-neutral contract: name, description, input and output schemas,
 annotations, presentation profile, and a stable contract identity. A host registers those directly.
 `files::ModelText` renders the content block a result carries, including the notice a truncated
 search reports, so a host presents the same text the MCP adapter does instead of restating it.
-The code-graph group renders its own through `code_graph::ModelText` and bounds its own envelope
-through `code_graph::fit`, both ungated: a native host gets the same text and the same size ceiling
+The source-code group renders its own through `source_code_graph::ModelText` and bounds its own envelope
+through `source_code_graph::fit`, both ungated: a native host gets the same text and the same size ceiling
 as an MCP client rather than reimplementing either. Its two methods take an optional
 `GraphProgressSink`, which reports the crawl, parse, and rank phases with a running file count so a
 host can show what a multi-second call is doing. Unlike shell progress, a dropped report cannot fail
@@ -1253,8 +1253,8 @@ bytes, and matching work are all bounded; a bound that bites stops rule collecti
 rather than leaving a partial rule set applied as though it were complete.
 
 The traversal does not stop at a nested repository. A vendored checkout holds readable code that a
-text search should find, so `file_glob` and `file_grep` descend into it. The code graph makes the
-opposite choice for its own reasons; see [Code graph tools](#code-graph-tools).
+text search should find, so `file_glob` and `file_grep` descend into it. The source-code graph makes the
+opposite choice for its own reasons; see [Source-code graph tools](#source-code-graph-tools).
 
 Confinement is a property of the server's constructor, not of the crate. Native hosts may opt into
 unconfined resolution, which disables both root confinement and protected-path denial; see
@@ -1524,18 +1524,18 @@ PDF responses have a separate 6 MiB transfer ceiling and support two explicit mo
 With `--web-icons`, `webfetch` may also resolve a verified source icon. Already-fetched HTML is reused
 where possible so icon discovery does not refetch the page body.
 
-### `code_context`, `code_refs`
+### `source_code_context`, `source_code_refs`
 
-The code-graph group answers two questions from one graph built over the configured root. It reads
+The source-code group answers two questions from one graph built over the configured root. It reads
 through the same confined resolver the filesystem tools use and never opens a path itself.
 
 | Tool | Answers |
 | --- | --- |
-| `code_context` | what should I read before making this change |
-| `code_refs` | what calls this and from which lines, what does it call, and with `depth` what a change reaches and which tests cover it |
+| `source_code_context` | what should I read before making this change |
+| `source_code_refs` | what calls this and from which lines, what does it call, and with `depth` what a change reaches and which tests cover it |
 
 - Importance is personalized PageRank over a call graph recovered from source text by name.
-  `code_context` fuses that with a BM25 lexical lane, and reports which lane its router picked and
+  `source_code_context` fuses that with a BM25 lexical lane, and reports which lane its router picked and
   why.
 - **Every reference count is a floor.** Dynamic dispatch, callbacks, function pointers, trait objects,
   reflection, and macro-generated call sites contribute no edge at all, so a count of 0 means none was
@@ -1543,13 +1543,13 @@ through the same confined resolver the filesystem tools use and never opens a pa
 - An unknown symbol is refused with did-you-mean candidates rather than answered with zero. A symbol
   that exists and has no callers returns zero. A name matching several definitions returns their union
   and marks itself ambiguous instead of silently picking one.
-- `confidence` on `code_context` is derived from how far the top result separates from the rest. It
+- `confidence` on `source_code_context` is derived from how far the top result separates from the rest. It
   measures separation, never correctness, and a single result is always low.
 - A call whose receiver or path names a type outside the tree, such as `.clone()` on a standard
   library value or `Vec::new()`, is declined rather than linked to an in-tree symbol that shares its
-  name; `code_refs` says how many such calls it left out. A call linked by name alone, because its
+  name; `source_code_refs` says how many such calls it left out. A call linked by name alone, because its
   receiver's type was never seen, is listed and marked but never moves a ranking.
-- `code_refs` lists each direct caller's call sites as `file:line`, callers most important first and
+- `source_code_refs` lists each direct caller's call sites as `file:line`, callers most important first and
   callees in the order the body calls them. `depth` walks callers further back, nearest first, with a
   count per hop and the tests among them.
 - `path` scopes any of them to a subdirectory. Absent, or empty, means the whole configured root.

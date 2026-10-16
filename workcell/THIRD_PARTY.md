@@ -38,7 +38,7 @@ grammars and carry no upstream provenance.
 
 ## Code-graph pipeline
 
-`crates/code-graph/`
+`crates/source-code-graph/`
 
 The ranking pipeline (the resolution ladder, personalized PageRank over an in-edge graph, the BM25
 lexical lane, and their reciprocal-rank fusion) is a reimplementation of the corresponding stages of
@@ -47,7 +47,7 @@ vendored in this pipeline: it is C++, this is Rust, and the data structures, bou
 vocabulary are our own. The debt is to the design, recorded here to explain the connection.
 
 Ripwire's on-disk cache blob, its write verbs, its own transport, and its remaining verb families are
-deliberately not ported. `crates/mcp-code-graph/README.md` records the benchmark comparison against
+deliberately not ported. `crates/mcp-source-code-graph/README.md` records the benchmark comparison against
 the upstream binary.
 
 ## Output filter rules

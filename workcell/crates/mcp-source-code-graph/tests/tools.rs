@@ -2,12 +2,12 @@
 
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
-use workcell_mcp_code_graph::{
-    CodeContextInput, CodeContextOutput, CodeGraphToolGroup, CodeRefsInput, CodeRefsOutput,
-    Direction, GraphPhase, GraphProgress, GraphProgressSink, ModelText, RankedSymbol,
-    SelectorRefusal,
-};
 use workcell_mcp_files::{FileResource, FileResourceAccess};
+use workcell_mcp_source_code_graph::{
+    Direction, GraphPhase, GraphProgress, GraphProgressSink, ModelText, RankedSymbol,
+    SelectorRefusal, SourceCodeContextInput, SourceCodeContextOutput, SourceCodeGraphToolGroup,
+    SourceCodeRefsInput, SourceCodeRefsOutput,
+};
 
 /// A tree with a clear importance gradient: `normalize` is called from three places, `orphan` from
 /// none, and a test reaches the middle of the chain.
@@ -34,7 +34,7 @@ const TREE: &[(&str, &str)] = &[
     ),
 ];
 
-async fn group() -> (TempDir, CodeGraphToolGroup) {
+async fn group() -> (TempDir, SourceCodeGraphToolGroup) {
     let directory = TempDir::new().expect("temp dir");
     for (path, contents) in TREE {
         let full = directory.path().join(path);
@@ -43,7 +43,7 @@ async fn group() -> (TempDir, CodeGraphToolGroup) {
         }
         std::fs::write(full, contents).expect("write");
     }
-    let group = CodeGraphToolGroup::new(directory.path(), None)
+    let group = SourceCodeGraphToolGroup::new(directory.path(), None)
         .await
         .expect("group");
     (directory, group)
@@ -56,8 +56,8 @@ fn token() -> CancellationToken {
 const NORMALIZE: &str = "normalize_sku";
 const NORMALIZE_TASK: &str = "normalize a sku";
 
-fn refs_input(symbol: &str, direction: Direction, depth: Option<usize>) -> CodeRefsInput {
-    CodeRefsInput {
+fn refs_input(symbol: &str, direction: Direction, depth: Option<usize>) -> SourceCodeRefsInput {
+    SourceCodeRefsInput {
         symbol: symbol.to_owned(),
         direction,
         depth,
@@ -66,8 +66,8 @@ fn refs_input(symbol: &str, direction: Direction, depth: Option<usize>) -> CodeR
     }
 }
 
-fn context_input(task: &str, path: Option<&str>, limit: Option<usize>) -> CodeContextInput {
-    CodeContextInput {
+fn context_input(task: &str, path: Option<&str>, limit: Option<usize>) -> SourceCodeContextInput {
+    SourceCodeContextInput {
         task: task.to_owned(),
         path: path.map(str::to_owned),
         limit,
@@ -75,28 +75,31 @@ fn context_input(task: &str, path: Option<&str>, limit: Option<usize>) -> CodeCo
 }
 
 async fn refs(
-    group: &CodeGraphToolGroup,
-    input: CodeRefsInput,
-) -> Result<CodeRefsOutput, SelectorRefusal> {
+    group: &SourceCodeGraphToolGroup,
+    input: SourceCodeRefsInput,
+) -> Result<SourceCodeRefsOutput, SelectorRefusal> {
     group
-        .code_refs(input, None, &token())
+        .source_code_refs(input, None, &token())
         .await
         .expect("refs runs")
 }
 
-async fn context(group: &CodeGraphToolGroup, input: CodeContextInput) -> CodeContextOutput {
+async fn context(
+    group: &SourceCodeGraphToolGroup,
+    input: SourceCodeContextInput,
+) -> SourceCodeContextOutput {
     group
-        .code_context(input, None, &token())
+        .source_code_context(input, None, &token())
         .await
         .expect("context runs")
 }
 
-fn names(rows: &[workcell_mcp_code_graph::ReferenceRow]) -> Vec<&str> {
+fn names(rows: &[workcell_mcp_source_code_graph::ReferenceRow]) -> Vec<&str> {
     rows.iter().map(|row| row.symbol.name.as_str()).collect()
 }
 
 #[tokio::test]
-async fn code_refs_lists_every_caller_with_its_call_site() {
+async fn source_code_refs_lists_every_caller_with_its_call_site() {
     let (_directory, group) = group().await;
     let output = refs(&group, refs_input(NORMALIZE, Direction::Callers, None))
         .await
@@ -135,8 +138,8 @@ async fn code_refs_lists_every_caller_with_its_call_site() {
 async fn preparation_binds_validated_options_without_crawling() {
     let (_directory, group) = group().await;
     let refs = group
-        .prepare_code_refs(
-            CodeRefsInput {
+        .prepare_source_code_refs(
+            SourceCodeRefsInput {
                 limit: Some(usize::MAX),
                 ..refs_input(NORMALIZE, Direction::Callers, Some(usize::MAX))
             },
@@ -151,7 +154,7 @@ async fn preparation_binds_validated_options_without_crawling() {
     assert!(refs.retained_bytes() >= refs.symbol().len() + refs.path().len());
 
     let context = group
-        .prepare_code_context(
+        .prepare_source_code_context(
             context_input("find normalization", None, Some(7)),
             group.inspect_scope(None).await.expect("scope"),
         )
@@ -162,7 +165,7 @@ async fn preparation_binds_validated_options_without_crawling() {
 
     assert!(
         group
-            .prepare_code_context(
+            .prepare_source_code_context(
                 context_input("   ", None, None),
                 group.inspect_scope(None).await.expect("scope"),
             )
@@ -174,7 +177,7 @@ async fn preparation_binds_validated_options_without_crawling() {
 async fn a_walk_over_callees_is_refused_as_invalid() {
     let (_directory, group) = group().await;
     let error = group
-        .code_refs(
+        .source_code_refs(
             refs_input("add_item", Direction::Callees, Some(2)),
             None,
             &token(),
@@ -188,7 +191,7 @@ async fn a_walk_over_callees_is_refused_as_invalid() {
 async fn prepared_execution_uses_the_host_supplied_scope_not_the_raw_selector() {
     let (directory, group) = group().await;
     let prepared = group
-        .prepare_code_context(
+        .prepare_source_code_context(
             context_input(NORMALIZE_TASK, Some("tests"), None),
             FileResource {
                 requested_path: "host-authorized-src".to_owned(),
@@ -202,7 +205,7 @@ async fn prepared_execution_uses_the_host_supplied_scope_not_the_raw_selector() 
     assert!(prepared.retained_bytes() >= prepared.path().len());
 
     let output = group
-        .execute_prepared_code_context(prepared, None, &token())
+        .execute_prepared_source_code_context(prepared, None, &token())
         .await
         .expect("execute prepared context");
     assert!(output.results.iter().any(|symbol| symbol.name == NORMALIZE));
@@ -219,14 +222,14 @@ async fn prepared_execution_fails_when_the_authorized_scope_is_stale() {
     let (directory, group) = group().await;
     let scope = group.inspect_scope(Some("src")).await.expect("scope");
     let prepared = group
-        .prepare_code_context(context_input(NORMALIZE_TASK, Some("src"), None), scope)
+        .prepare_source_code_context(context_input(NORMALIZE_TASK, Some("src"), None), scope)
         .expect("prepare context");
     std::fs::rename(directory.path().join("src"), directory.path().join("moved"))
         .expect("move scope");
 
     assert!(
         group
-            .execute_prepared_code_context(prepared, None, &token())
+            .execute_prepared_source_code_context(prepared, None, &token())
             .await
             .is_err()
     );
@@ -279,7 +282,7 @@ async fn an_empty_path_is_indistinguishable_from_an_absent_one() {
         .expect("selector resolves");
     let empty = refs(
         &group,
-        CodeRefsInput {
+        SourceCodeRefsInput {
             path: Some(String::new()),
             ..refs_input(NORMALIZE, Direction::Callers, None)
         },
@@ -290,7 +293,7 @@ async fn an_empty_path_is_indistinguishable_from_an_absent_one() {
 }
 
 #[tokio::test]
-async fn code_context_finds_a_symbol_the_task_did_not_spell() {
+async fn source_code_context_finds_a_symbol_the_task_did_not_spell() {
     let (_directory, group) = group().await;
     let output = context(
         &group,
@@ -307,7 +310,7 @@ async fn code_context_finds_a_symbol_the_task_did_not_spell() {
 }
 
 #[tokio::test]
-async fn code_context_returns_nothing_for_an_unrelated_task() {
+async fn source_code_context_returns_nothing_for_an_unrelated_task() {
     // The alternative is returning the repository's busiest symbol, which answers a question that
     // was not asked and reads exactly like a real answer.
     let (_directory, group) = group().await;
@@ -326,7 +329,7 @@ async fn code_context_returns_nothing_for_an_unrelated_task() {
 }
 
 #[tokio::test]
-async fn code_refs_names_its_unit_per_direction() {
+async fn source_code_refs_names_its_unit_per_direction() {
     let (_directory, group) = group().await;
     let callers = refs(&group, refs_input(NORMALIZE, Direction::Callers, None))
         .await
@@ -350,7 +353,7 @@ async fn callees_come_in_the_order_the_body_calls_them() {
         "pub fn first() {}\npub fn second() {}\npub fn driver() {\n    second();\n    first();\n}\npub fn other() { first(); }\n",
     )
     .expect("write");
-    let group = CodeGraphToolGroup::new(directory.path(), None)
+    let group = SourceCodeGraphToolGroup::new(directory.path(), None)
         .await
         .expect("group");
     let callees = refs(&group, refs_input("driver", Direction::Callees, None))
@@ -437,7 +440,7 @@ async fn a_qualified_selector_picks_between_same_named_definitions() {
     std::fs::create_dir_all(directory.path().join("src")).expect("mkdir");
     std::fs::write(directory.path().join("src/alpha.rs"), "pub fn handler() {}").expect("write");
     std::fs::write(directory.path().join("src/beta.rs"), "pub fn handler() {}").expect("write");
-    let group = CodeGraphToolGroup::new(directory.path(), None)
+    let group = SourceCodeGraphToolGroup::new(directory.path(), None)
         .await
         .expect("group");
 
@@ -483,7 +486,7 @@ async fn a_limit_narrows_the_result_and_the_truncation_is_disclosed() {
     let (_directory, group) = group().await;
     let output = refs(
         &group,
-        CodeRefsInput {
+        SourceCodeRefsInput {
             limit: Some(2),
             ..refs_input(NORMALIZE, Direction::Callers, None)
         },
@@ -500,7 +503,7 @@ async fn a_limit_narrows_the_result_and_the_truncation_is_disclosed() {
 async fn an_empty_task_is_rejected_rather_than_matching_everything() {
     let (_directory, group) = group().await;
     let error = group
-        .code_context(context_input("   ", None, None), None, &token())
+        .source_code_context(context_input("   ", None, None), None, &token())
         .await
         .expect_err("an empty task is not a query");
     assert_eq!(error.kind(), "invalid");
@@ -526,7 +529,7 @@ async fn a_call_reports_its_phases_in_order() {
     let (_directory, group) = group().await;
     let sink = RecordingSink::default();
     group
-        .code_context(
+        .source_code_context(
             context_input(NORMALIZE_TASK, None, None),
             Some(&sink),
             &token(),

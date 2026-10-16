@@ -500,7 +500,7 @@ impl<'facts> RustScope<'facts> {
     /// Whether a `use` path's first segment reaches into this tree.
     ///
     /// A workspace crate is named for its directory, sometimes behind a prefix
-    /// (`workcell_code_graph` lives in `code-graph`), so every `_`-separated suffix of the root is
+    /// (`workcell_source_code_graph` lives in `source-code-graph`), so every `_`-separated suffix of the root is
     /// tried. That errs toward in-tree on purpose: a mistaken match keeps the plain name ladder,
     /// while a mistaken miss would decline a real call.
     fn reaches_this_tree(&self, root: &str) -> bool {

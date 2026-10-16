@@ -1,7 +1,7 @@
 //! The MCP adapter: argument parsing, result envelopes, and the protocol size ceiling.
 //!
 //! This module is a projection of the group's native methods. It adds no behaviour, no policy, and
-//! no second source of truth; a native host calling `code_refs` and an MCP client calling `code_refs`
+//! no second source of truth; a native host calling `source_code_refs` and an MCP client calling `source_code_refs`
 //! run the same code and receive the same record.
 
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -11,13 +11,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     bound::{Shrinkable, fit},
-    error::CodeGraphError,
-    group::CodeGraphToolGroup,
+    error::SourceCodeGraphError,
+    group::SourceCodeGraphToolGroup,
     model_text::ModelText,
-    types::{CodeContextInput, CodeRefsInput, SelectorRefusal},
+    types::{SelectorRefusal, SourceCodeContextInput, SourceCodeRefsInput},
 };
 
-impl CodeGraphToolGroup {
+impl SourceCodeGraphToolGroup {
     /// Routes one MCP tool call, or returns `None` when the name is not ours.
     ///
     /// `None` rather than an error, so a composing server can offer other groups under the same
@@ -29,12 +29,12 @@ impl CodeGraphToolGroup {
         token: CancellationToken,
     ) -> Option<Result<CallToolResult, rmcp::ErrorData>> {
         Some(match name {
-            "code_context" => match parse::<CodeContextInput>(name, arguments) {
-                Ok(input) => complete(self.code_context(input, None, &token).await),
+            "source_code_context" => match parse::<SourceCodeContextInput>(name, arguments) {
+                Ok(input) => complete(self.source_code_context(input, None, &token).await),
                 Err(message) => invalid(message),
             },
-            "code_refs" => match parse::<CodeRefsInput>(name, arguments) {
-                Ok(input) => selectable(self.code_refs(input, None, &token).await),
+            "source_code_refs" => match parse::<SourceCodeRefsInput>(name, arguments) {
+                Ok(input) => selectable(self.source_code_refs(input, None, &token).await),
                 Err(message) => invalid(message),
             },
             _ => return None,
@@ -51,7 +51,7 @@ fn parse<T: DeserializeOwned>(name: &str, arguments: Value) -> Result<T, String>
     serde_json::from_value(arguments).map_err(|error| format!("Invalid {name} arguments: {error}"))
 }
 
-fn complete<T>(result: Result<T, CodeGraphError>) -> Result<CallToolResult, rmcp::ErrorData>
+fn complete<T>(result: Result<T, SourceCodeGraphError>) -> Result<CallToolResult, rmcp::ErrorData>
 where
     T: Serialize + ModelText + Clone + Shrinkable,
 {
@@ -67,7 +67,7 @@ where
 /// a well-formed question about a symbol that does not exist, and the useful answer is the
 /// did-you-mean list, which an error envelope has nowhere to put.
 fn selectable<T>(
-    result: Result<Result<T, SelectorRefusal>, CodeGraphError>,
+    result: Result<Result<T, SelectorRefusal>, SourceCodeGraphError>,
 ) -> Result<CallToolResult, rmcp::ErrorData>
 where
     T: Serialize + ModelText + Clone + Shrinkable,
@@ -81,7 +81,7 @@ where
 
 fn emit(output: impl Serialize + ModelText) -> Result<CallToolResult, rmcp::ErrorData> {
     let structured = serde_json::to_value(&output).map_err(|_| {
-        rmcp::ErrorData::internal_error("Failed to serialize code-graph result", None)
+        rmcp::ErrorData::internal_error("Failed to serialize source-code-graph result", None)
     })?;
     let mut result = CallToolResult::default();
     result.content = vec![ContentBlock::text(output.model_text().into_owned())];
@@ -89,7 +89,7 @@ fn emit(output: impl Serialize + ModelText) -> Result<CallToolResult, rmcp::Erro
     Ok(result)
 }
 
-fn failure(error: &CodeGraphError) -> CallToolResult {
+fn failure(error: &SourceCodeGraphError) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(error.to_string())])
 }
 
@@ -106,7 +106,7 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_tool_name_is_not_claimed() {
         let directory = tempfile::TempDir::new().expect("temp dir");
-        let group = CodeGraphToolGroup::new(directory.path(), None)
+        let group = SourceCodeGraphToolGroup::new(directory.path(), None)
             .await
             .expect("group");
         assert!(
@@ -121,12 +121,12 @@ mod tests {
     #[tokio::test]
     async fn malformed_arguments_are_rejected_without_running_a_crawl() {
         let directory = tempfile::TempDir::new().expect("temp dir");
-        let group = CodeGraphToolGroup::new(directory.path(), None)
+        let group = SourceCodeGraphToolGroup::new(directory.path(), None)
             .await
             .expect("group");
         let result = group
             .dispatch(
-                "code_refs",
+                "source_code_refs",
                 serde_json::json!({ "symbol": "alpha", "unknownField": 1 }),
                 CancellationToken::new(),
             )
@@ -139,11 +139,11 @@ mod tests {
     #[tokio::test]
     async fn absent_arguments_are_treated_as_an_empty_object() {
         let directory = tempfile::TempDir::new().expect("temp dir");
-        let group = CodeGraphToolGroup::new(directory.path(), None)
+        let group = SourceCodeGraphToolGroup::new(directory.path(), None)
             .await
             .expect("group");
         let result = group
-            .dispatch("code_context", Value::Null, CancellationToken::new())
+            .dispatch("source_code_context", Value::Null, CancellationToken::new())
             .await
             .expect("claimed")
             .expect("returns a result");

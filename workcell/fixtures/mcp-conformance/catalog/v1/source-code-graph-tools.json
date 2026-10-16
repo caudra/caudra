@@ -1,20 +1,20 @@
 {
   "fixtureVersion": 1,
-  "caseID": "catalog.code-graph.sdk-emitted.v1",
+  "caseID": "catalog.source-code-graph.sdk-emitted.v1",
   "catalogKind": "sdk-emitted",
   "server": {
-    "name": "workcell-code-graph",
+    "name": "workcell-source-code-graph",
     "version": "0.1.0"
   },
   "provenance": [
-    "rust/crates/mcp-code-graph/src/catalog.rs",
-    "rust/crates/mcp-code-graph/src/group.rs",
-    "rust/crates/mcp-code-graph/src/dispatch.rs"
+    "rust/crates/mcp-source-code-graph/src/catalog.rs",
+    "rust/crates/mcp-source-code-graph/src/group.rs",
+    "rust/crates/mcp-source-code-graph/src/dispatch.rs"
   ],
   "expected": {
     "tools": [
       {
-        "name": "code_context",
+        "name": "source_code_context",
         "title": "Find code for a task",
         "description": "Return the symbols worth reading before making a specific change. Describe the change in your own words.\n\n- `task` is prose: \"where do we invalidate the cache after a write\" works better than a bare identifier.\n- A router classifies the task as identifier-shaped or prose-shaped and reports which, and why.\n- Results fuse a lexical match against symbol names, paths and doc comments with the graph ranking. Only symbols that actually matched participate, so an unrelated task returns nothing rather than the repository's busiest utility.\n- `confidence` is derived from how far the top result separates from the rest. It is a measure of separation, never a claim of correctness, and a single result is always low.\n- Counts are FLOORS: edges are recovered from source text by name, so dynamic dispatch, callbacks, trait objects and macro-generated calls contribute none.\n- The graph stops at a directory that is its own repository and at files the repository's .gitignore excludes; pass a nested repository as `path` to search it.",
         "inputSchema": {
@@ -115,7 +115,7 @@
             "estimatedTokens",
             "graph"
           ],
-          "title": "CodeContextOutput",
+          "title": "SourceCodeContextOutput",
           "$schema": "http://json-schema.org/draft-07/schema#",
           "definitions": {
             "RankedSymbol": {
@@ -284,16 +284,16 @@
           "openWorldHint": false
         },
         "_meta": {
-          "ai.workcell/presentation-profile": "code.map.v1",
+          "ai.workcell/presentation-profile": "source_code.map.v1",
           "ai.workcell/contract": {
-            "id": "code.context.v1",
+            "id": "source_code.context.v1",
             "version": "v1",
             "resultVersion": "v1"
           }
         }
       },
       {
-        "name": "code_refs",
+        "name": "source_code_refs",
         "title": "List callers, call sites and reach",
         "description": "List what calls a symbol and from which lines, or what it calls. With `depth`, show what a change to it could reach and which tests already cover it. Use it instead of grep for a symbol's callers and call sites.\n\n- `direction` is `callers` (default) or `callees`. Callers come most important first; callees in the order the body calls them.\n- Each direct row lists its call sites as `at=` lines, so one call finds every place a change must touch.\n- `depth` walks callers further back (default 1, host-capped). Rows report their hop, nearest first, with a count per hop and how many of them are tests.\n- `symbol` may be a bare name or `path::name` to disambiguate. A name matching several definitions returns their union and says so, rather than silently picking one.\n- An unknown symbol is REFUSED with did-you-mean candidates, not answered with zero. A symbol that exists and has no callers returns zero.\n- Counts are FLOORS: dynamic dispatch, callbacks, trait objects and macro-generated calls contribute no edge, so 0 means none was found, never that none exists. A call whose receiver or path names a type outside the tree is never linked by name, and a link made by name alone is marked.",
         "inputSchema": {
@@ -437,7 +437,7 @@
                 "estimatedTokens",
                 "graph"
               ],
-              "title": "CodeRefsOutput"
+              "title": "SourceCodeRefsOutput"
             },
             {
               "type": "object",
@@ -472,7 +472,7 @@
                 "didYouMean",
                 "symbolsKnown"
               ],
-              "description": "A selector that named nothing.\n\nDistinct from an empty result on purpose. `code_refs` on a symbol with no callers is the answer\n`0`; `code_refs` on a misspelled symbol is not an answer at all, and returning `0` for it would\nlet a caller conclude something false about code that exists.",
+              "description": "A selector that named nothing.\n\nDistinct from an empty result on purpose. `source_code_refs` on a symbol with no callers is the answer\n`0`; `source_code_refs` on a misspelled symbol is not an answer at all, and returning `0` for it would\nlet a caller conclude something false about code that exists.",
               "title": "SelectorRefusal"
             }
           ],
@@ -720,9 +720,9 @@
           "openWorldHint": false
         },
         "_meta": {
-          "ai.workcell/presentation-profile": "code.map.v1",
+          "ai.workcell/presentation-profile": "source_code.map.v1",
           "ai.workcell/contract": {
-            "id": "code.refs.v1",
+            "id": "source_code.refs.v1",
             "version": "v1",
             "resultVersion": "v1"
           }

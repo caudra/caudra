@@ -334,14 +334,14 @@ const NATIVE_HINTS: &[(&str, Slot, &str)] = &[
         "- Prefer **file_apply_patch** for targeted edits instead of rewriting files through the shell.",
     ),
     (
-        "code_context",
+        "source_code_context",
         Slot::ToolUsage,
-        "- Use **code_context** to find the code a task touches before reading files.",
+        "- Use **source_code_context** to find the code a task touches before reading files.",
     ),
     (
-        "code_refs",
+        "source_code_refs",
         Slot::ToolUsage,
-        "- Use **code_refs** instead of grep or `rg` for a symbol's callers and call sites; `depth` shows what a change reaches and which tests cover it.",
+        "- Use **source_code_refs** instead of grep or `rg` for a symbol's callers and call sites; `depth` shows what a change reaches and which tests cover it.",
     ),
     (FILE_INDEX_TOOL_NAME, Slot::ToolUsage, INDEX_TOOL_USAGE),
     (

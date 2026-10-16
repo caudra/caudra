@@ -12,12 +12,12 @@
 use std::{collections::BTreeSet, path::Path, time::Instant};
 
 use tokio_util::sync::CancellationToken;
-use workcell_code_graph::{Language, SourceInput};
 use workcell_mcp_files::{
     FileGlobInput, FileResourceAccess, FileToolGroup, FilesystemError, FilesystemLimits,
 };
+use workcell_source_code_graph::{Language, SourceInput};
 
-use crate::limits::CodeGraphLimits;
+use crate::limits::SourceCodeGraphLimits;
 use crate::progress::{GraphPhase, GraphProgressSink, PROGRESS_FILE_INTERVAL, report};
 
 /// Why a discovered file contributed nothing.
@@ -28,7 +28,7 @@ use crate::progress::{GraphPhase, GraphProgressSink, PROGRESS_FILE_INTERVAL, rep
 pub enum CrawlSkip {
     /// The extension maps to no grammar.
     UnknownLanguage,
-    /// Larger than [`CodeGraphLimits::max_source_bytes`].
+    /// Larger than [`SourceCodeGraphLimits::max_source_bytes`].
     Oversize,
     /// Not valid UTF-8.
     NotText,
@@ -94,11 +94,11 @@ impl Default for Crawled {
 /// Which bound stopped the crawl.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CrawlTruncation {
-    /// [`CodeGraphLimits::max_files`] was reached.
+    /// [`SourceCodeGraphLimits::max_files`] was reached.
     FileLimit,
-    /// [`CodeGraphLimits::max_total_bytes`] was reached.
+    /// [`SourceCodeGraphLimits::max_total_bytes`] was reached.
     ByteLimit,
-    /// [`CodeGraphLimits::crawl_deadline`] elapsed.
+    /// [`SourceCodeGraphLimits::crawl_deadline`] elapsed.
     Deadline,
 }
 
@@ -119,7 +119,7 @@ impl CrawlTruncation {
 /// is already more than a reader wants. A map of a repository is a different question asked of the
 /// same tree, so the traversal ceilings come from this crate's own limits and remain host-owned.
 #[must_use]
-pub fn crawl_filesystem_limits(limits: &CodeGraphLimits) -> FilesystemLimits {
+pub fn crawl_filesystem_limits(limits: &SourceCodeGraphLimits) -> FilesystemLimits {
     FilesystemLimits {
         max_search_results: limits.max_files,
         max_traversal_entries: limits.max_traversal_entries,
@@ -141,7 +141,7 @@ pub fn crawl_filesystem_limits(limits: &CodeGraphLimits) -> FilesystemLimits {
 pub async fn crawl(
     group: &FileToolGroup,
     relative_path: Option<&str>,
-    limits: &CodeGraphLimits,
+    limits: &SourceCodeGraphLimits,
     progress: Option<&dyn GraphProgressSink>,
     token: &CancellationToken,
 ) -> Result<Crawled, FilesystemError> {
@@ -278,7 +278,7 @@ mod tests {
         directory
     }
 
-    async fn group(root: &Path, limits: &CodeGraphLimits) -> FileToolGroup {
+    async fn group(root: &Path, limits: &SourceCodeGraphLimits) -> FileToolGroup {
         FileToolGroup::new(root, false, Some(crawl_filesystem_limits(limits)))
             .await
             .expect("group")
@@ -286,7 +286,7 @@ mod tests {
 
     #[tokio::test]
     async fn source_files_are_read_and_unknown_extensions_are_reported() {
-        let limits = CodeGraphLimits::default();
+        let limits = SourceCodeGraphLimits::default();
         let directory = tree(&[
             ("src/a.rs", "fn alpha() {}"),
             ("src/b.py", "def beta(): pass"),
@@ -317,7 +317,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_subdirectory_scopes_the_crawl() {
-        let limits = CodeGraphLimits::default();
+        let limits = SourceCodeGraphLimits::default();
         let directory = tree(&[("src/a.rs", "fn a() {}"), ("vendor/b.rs", "fn b() {}")]);
         let crawled = crawl(
             &group(directory.path(), &limits).await,
@@ -336,9 +336,9 @@ mod tests {
     async fn an_oversize_file_is_skipped_with_a_reason_rather_than_truncated() {
         // Truncating source would produce a parse of something that is not the file, and every
         // span after the cut would point at the wrong text.
-        let limits = CodeGraphLimits {
+        let limits = SourceCodeGraphLimits {
             max_source_bytes: 32,
-            ..CodeGraphLimits::default()
+            ..SourceCodeGraphLimits::default()
         };
         let directory = tree(&[("big.rs", &"fn padding_function_name() {}\n".repeat(10))]);
         let crawled = crawl(
@@ -361,7 +361,7 @@ mod tests {
     async fn binary_content_is_reported_as_not_text() {
         let directory = TempDir::new().expect("temp dir");
         std::fs::write(directory.path().join("a.rs"), [0xff, 0xfe, 0x00]).expect("write");
-        let limits = CodeGraphLimits::default();
+        let limits = SourceCodeGraphLimits::default();
         let crawled = crawl(
             &group(directory.path(), &limits).await,
             None,
@@ -379,9 +379,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_file_ceiling_is_disclosed_rather_than_silently_applied() {
-        let limits = CodeGraphLimits {
+        let limits = SourceCodeGraphLimits {
             max_files: 2,
-            ..CodeGraphLimits::default()
+            ..SourceCodeGraphLimits::default()
         };
         let directory = tree(&[
             ("a.rs", "fn a() {}"),
@@ -409,7 +409,7 @@ mod tests {
         std::fs::create_dir_all(&inner).expect("mkdir");
         std::fs::write(inner.join("a.rs"), "fn a() {}").expect("write");
 
-        let limits = CodeGraphLimits::default();
+        let limits = SourceCodeGraphLimits::default();
         let confined = group(&inner, &limits).await;
         let escaped = crawl(
             &confined,
@@ -438,7 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_nested_repository_is_not_mapped_with_the_project_around_it() {
-        let limits = CodeGraphLimits::default();
+        let limits = SourceCodeGraphLimits::default();
         let directory = tree(&[
             ("own.rs", "fn own() {}"),
             ("vendor/inner/foreign.rs", "fn foreign() {}"),
@@ -468,7 +468,7 @@ mod tests {
     /// back in as the next call's `path`.
     #[tokio::test]
     async fn a_pruned_repository_is_named_the_way_the_scope_would_be() {
-        let limits = CodeGraphLimits::default();
+        let limits = SourceCodeGraphLimits::default();
         let directory = tree(&[("vendor/inner/foreign.rs", "fn foreign() {}")]);
         repository(directory.path(), ".");
         repository(directory.path(), "vendor/inner");
@@ -501,7 +501,7 @@ mod tests {
     /// boundary to respect, and pruning there would map it to nothing at all.
     #[tokio::test]
     async fn a_root_that_merely_holds_a_checkout_still_maps_it() {
-        let limits = CodeGraphLimits::default();
+        let limits = SourceCodeGraphLimits::default();
         let directory = tree(&[("project/main.rs", "fn main() {}")]);
         repository(directory.path(), "project");
 
@@ -520,7 +520,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_ignored_source_file_is_absent_from_the_map() {
-        let limits = CodeGraphLimits::default();
+        let limits = SourceCodeGraphLimits::default();
         let directory = tree(&[
             (".gitignore", "generated.rs\n"),
             ("generated.rs", "fn generated() {}"),
@@ -549,9 +549,9 @@ mod tests {
 
     #[tokio::test]
     async fn disabling_gitignore_restores_the_ignored_file() {
-        let limits = CodeGraphLimits {
+        let limits = SourceCodeGraphLimits {
             honor_gitignore: false,
-            ..CodeGraphLimits::default()
+            ..SourceCodeGraphLimits::default()
         };
         let directory = tree(&[
             (".gitignore", "generated.rs\n"),

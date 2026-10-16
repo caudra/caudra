@@ -15,8 +15,8 @@ web = ["dep:workcell-mcp-web", "dep:workcell-net"]
 shell = ["dep:workcell-mcp-shell", "dep:workcell-output-filter"]
 code = ["dep:workcell-mcp-code"]
 code-bundled = ["code", "workcell-mcp-code/bundled-worker"]
-code-graph = ["dep:workcell-mcp-code-graph"]
-code-graph-git = ["code-graph", "workcell-mcp-code-graph/git"]
+source-code-graph = ["dep:workcell-mcp-source-code-graph"]
+source-code-graph-git = ["source-code-graph", "workcell-mcp-source-code-graph/git"]
 environment = ["dep:workcell-environment"]
 host-contract = ["dep:workcell-host-contract"]
 scm = ["files", "dep:workcell-workspace-scm"]
@@ -27,7 +27,7 @@ snapshot-store = ["dep:workcell-snapshot-store"]
 workcell-environment = { workspace = true, optional = true }
 workcell-host-contract = { workspace = true, optional = true }
 workcell-mcp-code = { workspace = true, optional = true }
-workcell-mcp-code-graph = { workspace = true, optional = true }
+workcell-mcp-source-code-graph = { workspace = true, optional = true }
 workcell-mcp-files = { workspace = true, optional = true }
 workcell-mcp-shell = { workspace = true, optional = true }
 workcell-mcp-web = { workspace = true, optional = true }

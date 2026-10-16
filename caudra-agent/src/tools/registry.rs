@@ -42,14 +42,14 @@ const DENIED_CODES: &[&str] = &[
     "path_outside_root",
     "protected_path",
     "filesystem_permission_denied",
-    "code_graph_denied",
+    "source_code_denied",
     "shell_command_refused",
     "web_request_denied",
 ];
 const INVALID_INPUT_CODES: &[&str] = &[
     "invalid_input",
     "invalid_arguments",
-    "code_graph_invalid",
+    "source_code_invalid",
     "shell_preparation_failed",
     "web_preparation_failed",
     "python_preparation_failed",

@@ -10306,9 +10306,9 @@ dependencies = [
  "workcell-environment",
  "workcell-host-contract",
  "workcell-mcp-code",
- "workcell-mcp-code-graph",
  "workcell-mcp-files",
  "workcell-mcp-shell",
+ "workcell-mcp-source-code-graph",
  "workcell-mcp-web",
  "workcell-net",
  "workcell-output-filter",
@@ -10316,20 +10316,6 @@ dependencies = [
  "workcell-tool-contract",
  "workcell-workspace-scm",
  "workcell-workspace-snapshot",
-]
-
-[[package]]
-name = "workcell-code-graph"
-version = "0.2.0-preview.9"
-dependencies = [
- "gix",
- "lru",
- "proptest",
- "sha2 0.11.0",
- "tempfile",
- "test-case",
- "tree-sitter",
- "workcell-source-languages",
 ]
 
 [[package]]
@@ -10385,9 +10371,9 @@ dependencies = [
  "workcell-environment",
  "workcell-host-contract",
  "workcell-mcp-code",
- "workcell-mcp-code-graph",
  "workcell-mcp-files",
  "workcell-mcp-shell",
+ "workcell-mcp-source-code-graph",
  "workcell-mcp-web",
  "workcell-tool-contract",
  "workcell-workspace-scm",
@@ -10411,25 +10397,6 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-python",
  "workcell-monty-worker",
- "workcell-tool-contract",
-]
-
-[[package]]
-name = "workcell-mcp-code-graph"
-version = "0.2.0-preview.9"
-dependencies = [
- "async-trait",
- "rmcp",
- "schemars 1.2.1",
- "serde",
- "serde_json",
- "tempfile",
- "test-case",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "workcell-code-graph",
- "workcell-mcp-files",
  "workcell-tool-contract",
 ]
 
@@ -10483,6 +10450,25 @@ dependencies = [
  "windows-sys 0.61.2",
  "workcell-host-contract",
  "workcell-output-filter",
+ "workcell-tool-contract",
+]
+
+[[package]]
+name = "workcell-mcp-source-code-graph"
+version = "0.2.0-preview.9"
+dependencies = [
+ "async-trait",
+ "rmcp",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "test-case",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "workcell-mcp-files",
+ "workcell-source-code-graph",
  "workcell-tool-contract",
 ]
 
@@ -10567,6 +10553,20 @@ dependencies = [
  "tempfile",
  "test-case",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "workcell-source-code-graph"
+version = "0.2.0-preview.9"
+dependencies = [
+ "gix",
+ "lru",
+ "proptest",
+ "sha2 0.11.0",
+ "tempfile",
+ "test-case",
+ "tree-sitter",
+ "workcell-source-languages",
 ]
 
 [[package]]

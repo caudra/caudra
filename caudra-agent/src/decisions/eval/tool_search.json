@@ -1,6 +1,6 @@
 {
   "baseline": {"right": 4, "wrong": 0, "undecided": 0, "p50_ms": 355, "p95_ms": 357},
-  "baseline_note": "Measured 2026-10-12 with one relevance question per candidate, protocol openai, endpoint http://127.0.0.1:8080/v1 (local ninfer), model systemone-decision-v7. The opaque choice shape it replaced scored right 6, wrong 0, undecided 1 (p50 227 ms, p95 228 ms) on the same endpoint and model. The three code-graph cases were dropped on 2026-10-16 when those tools stopped being deferred; all three had scored right, so the remaining cases keep their measured results.",
+  "baseline_note": "Measured 2026-10-12 with one relevance question per candidate, protocol openai, endpoint http://127.0.0.1:8080/v1 (local ninfer), model systemone-decision-v7. The opaque choice shape it replaced scored right 6, wrong 0, undecided 1 (p50 227 ms, p95 228 ms) on the same endpoint and model. The three source-code-graph cases were dropped on 2026-10-16 when those tools stopped being deferred; all three had scored right, so the remaining cases keep their measured results.",
   "cases": [
     {
       "query": "viewing an image file",

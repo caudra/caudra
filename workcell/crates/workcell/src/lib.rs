@@ -17,20 +17,18 @@ pub use workcell_environment::ExecutionEnvironment;
 pub use workcell_mcp_code as code;
 #[cfg(feature = "code")]
 pub use workcell_mcp_code::CodeToolGroup;
-#[cfg(feature = "code-graph")]
-pub use workcell_mcp_code_graph as code_graph;
-#[cfg(feature = "code-graph")]
-pub use workcell_mcp_code_graph::{
-    CodeContextInput, CodeContextOutput, CodeGraphError, CodeGraphLimits, CodeGraphToolGroup,
-    CodeRefsInput, CodeRefsOutput, Direction, GraphPhase, GraphProgress, GraphProgressSink,
-    GraphSummary, RankedSymbol, ReferenceRow, SelectorRefusal, SiteRef, SymbolRef,
-    crawl_filesystem_limits, fit,
+#[cfg(feature = "source-code-graph")]
+pub use workcell_mcp_source_code_graph as source_code_graph;
+#[cfg(feature = "source-code-graph")]
+pub use workcell_mcp_source_code_graph::{
+    Direction, GraphPhase, GraphProgress, GraphProgressSink, GraphSummary, RankedSymbol,
+    ReferenceRow, SelectorRefusal, SiteRef, SourceCodeContextInput, SourceCodeContextOutput,
+    SourceCodeGraphError, SourceCodeGraphLimits, SourceCodeGraphToolGroup, SourceCodeRefsInput,
+    SourceCodeRefsOutput, SymbolRef, crawl_filesystem_limits, fit,
 };
 // `ModelText` is the name two groups give their model-facing rendering, so the facade cannot
 // re-export both unqualified. Both stay reachable as `files::ModelText` and
-// `code_graph::ModelText`.
-#[cfg(feature = "code-graph")]
-pub use workcell_mcp_code_graph::ModelText as CodeGraphModelText;
+// `source_code_graph::ModelText`.
 #[cfg(feature = "files")]
 pub use workcell_mcp_files as files;
 #[cfg(feature = "files")]
@@ -45,6 +43,8 @@ pub use workcell_mcp_files::{
 pub use workcell_mcp_shell as shell;
 #[cfg(feature = "shell")]
 pub use workcell_mcp_shell::{PreparedShell, ShellPreparationError, ShellToolGroup};
+#[cfg(feature = "source-code-graph")]
+pub use workcell_mcp_source_code_graph::ModelText as SourceCodeGraphModelText;
 #[cfg(feature = "web")]
 pub use workcell_mcp_web as web;
 #[cfg(feature = "web")]

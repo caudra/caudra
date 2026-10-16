@@ -11,7 +11,7 @@ use workcell_tool_contract::{ToolAnnotations as NeutralAnnotations, ToolContract
 
 use crate::{
     group::MAX_REFS_DEPTH,
-    types::{CodeContextOutput, CodeRefsOutput, SelectorRefusal},
+    types::{SelectorRefusal, SourceCodeContextOutput, SourceCodeRefsOutput},
 };
 
 const DRAFT_07: &str = "http://json-schema.org/draft-07/schema#";
@@ -42,20 +42,20 @@ const REFS_DESCRIPTION: &str = r#"List what calls a symbol and from which lines,
 pub fn specs() -> Vec<ToolSpec> {
     vec![
         spec(
-            "code_context",
+            "source_code_context",
             "Find code for a task",
             CONTEXT_DESCRIPTION,
             context_schema(),
-            "code.map.v1",
-            "code.context.v1",
+            "source_code.map.v1",
+            "source_code.context.v1",
         ),
         spec(
-            "code_refs",
+            "source_code_refs",
             "List callers, call sites and reach",
             REFS_DESCRIPTION,
             refs_schema(),
-            "code.map.v1",
-            "code.refs.v1",
+            "source_code.map.v1",
+            "source_code.refs.v1",
         ),
     ]
 }
@@ -85,9 +85,9 @@ fn spec(
         ToolContract::new(contract_id, "v1", "v1"),
     )
     .with_output_schema(match name {
-        "code_context" => output_schema::<CodeContextOutput>(),
-        "code_refs" => output_union::<CodeRefsOutput, SelectorRefusal>(),
-        _ => unreachable!("canonical code-graph spec"),
+        "source_code_context" => output_schema::<SourceCodeContextOutput>(),
+        "source_code_refs" => output_union::<SourceCodeRefsOutput, SelectorRefusal>(),
+        _ => unreachable!("canonical source-code-graph spec"),
     })
 }
 
@@ -115,7 +115,7 @@ fn to_mcp_tool(spec: &ToolSpec) -> Tool {
     let tool = tool.with_raw_output_schema(std::sync::Arc::new(
         spec.output_schema
             .clone()
-            .expect("code-graph output schema"),
+            .expect("source-code-graph output schema"),
     ));
     tool.with_annotations(ToolAnnotations::from_raw(
         None,
@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn catalog_order_is_stable_and_names_are_the_contract() {
         let names: Vec<&str> = specs().iter().map(|spec| spec.name).collect();
-        assert_eq!(names, ["code_context", "code_refs"]);
+        assert_eq!(names, ["source_code_context", "source_code_refs"]);
     }
 
     #[test]

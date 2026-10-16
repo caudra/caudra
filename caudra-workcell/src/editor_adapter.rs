@@ -34,9 +34,9 @@ use workcell::{
 
 use crate::{
     HostInner, Input, OWNER, PreparedExecution, PreparedInvocation, ToolKind, WorkcellHost,
-    code_graph_prepared, confined_traversal_group, exact_custom_prepared, file_patch_prepared,
-    file_prepared, file_read_prepared, index_prepared, missing_read_target, pattern_analysis,
-    read_only_shell, reject_unknown_fields, shell_prepared,
+    confined_traversal_group, exact_custom_prepared, file_patch_prepared, file_prepared,
+    file_read_prepared, index_prepared, missing_read_target, pattern_analysis, read_only_shell,
+    reject_unknown_fields, shell_prepared, source_code_graph_prepared,
 };
 
 const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -493,8 +493,8 @@ fn descriptor(
             | ToolKind::FileGlob
             | ToolKind::FileGrep
             | ToolKind::Index
-            | ToolKind::CodeContext
-            | ToolKind::CodeRefs,
+            | ToolKind::SourceCodeContext
+            | ToolKind::SourceCodeRefs,
         ) => {
             resources.push(resource(
                 PermissionResourceKind::File,
@@ -770,14 +770,14 @@ async fn prepare_example(
                 .map_err(|error| error.to_string())?;
             Ok(index_prepared(resource, &project, groups.files))
         }
-        Input::CodeContext(input) => Ok(code_graph_prepared(
-            groups.code_graph,
+        Input::SourceCodeContext(input) => Ok(source_code_graph_prepared(
+            groups.source_code,
             &project,
             input.path.as_deref(),
             &["/path", "/task"],
         )),
-        Input::CodeRefs(input) => Ok(code_graph_prepared(
-            groups.code_graph,
+        Input::SourceCodeRefs(input) => Ok(source_code_graph_prepared(
+            groups.source_code,
             &project,
             input.path.as_deref(),
             &["/path", "/symbol"],

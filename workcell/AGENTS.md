@@ -39,7 +39,7 @@ deployment controllers, lease brokers, ontology tools, or harness-specific state
 - `crates/mcp-web` owns web tool schemas, provider lowering, fetch extraction, and parser bounds.
 - `crates/mcp-code` owns code tool schemas, worker-process supervision, interpreter isolation, value
   rendering, and the failure taxonomy.
-- `crates/code-graph` owns the protocol-neutral ranking engine: extraction, the resolution ladder,
+- `crates/source-code-graph` owns the protocol-neutral ranking engine: extraction, the resolution ladder,
   PageRank, BM25, fusion, the fact cache, and optional git signals behind its `git` feature. It has
   no filesystem access and no protocol dependency; keep it that way. Every reference count it
   produces is a floor, and no result may present one as exact. Determinism is the property that
@@ -47,7 +47,7 @@ deployment controllers, lease brokers, ontology tools, or harness-specific state
   counts are constants, no ranking module may use a reassociating float operation, and extraction
   worker count must stay invisible in the output. Each of those has a gate; do not weaken one to
   make a diff pass.
-- `crates/mcp-code-graph` owns the crawl, the five `code_*` tool schemas, result shaping, and the
+- `crates/mcp-source-code-graph` owns the crawl, the two `source_code_*` tool schemas, result shaping, and the
   MCP projection. It never opens a path: confinement is delegated to `mcp-files`, which stays the
   only resolver in the process. Do not add a write verb to it — `file_edit` and `file_apply_patch`
   already own mutation, with revalidation and atomic publication.
@@ -124,10 +124,10 @@ worker lease for the full pool lifetime; hosts supply cache and source policy, n
 ## Protocol Contracts
 
 - The supported MCP version is explicit and pinned in the server and SDK dependency.
-- Preserve stable catalog order: files, code graph, web, shell, python_execution, execution environment.
+- Preserve stable catalog order: files, source-code graph, web, shell, python_execution, execution environment.
   Reviewed transfer uses remote-host methods, never model tools or raw path byte routes.
 - Within files, `file_index` follows `file_apply_patch` and precedes every web tool when enabled. The two
-  code-graph tools follow `file_index` in the order `code_context`, `code_refs`.
+  source-code tools follow `file_index` in the order `source_code_context`, `source_code_refs`.
 - Tool names, schemas, annotations, and complete-result envelopes are compatibility contracts.
 - `ai.workcell/*` extension metadata is Workcell-owned. Do not introduce product-specific namespaces.
 - Update conformance fixtures and tests whenever a public contract intentionally changes.
@@ -186,12 +186,12 @@ For code worker or packaging changes, verify both explicit-path and bundled sour
 real snippet through an optimized binary copied away from any adjacent worker. This proves the
 embedded fallback works rather than accidentally resolving the development worker.
 
-For code-graph changes that could affect cost, re-run `cargo run -p workcell-mcp-code-graph --release --example graph_build_bench`
+For source-code-graph changes that could affect cost, re-run `cargo run -p workcell-mcp-source-code-graph --release --example graph_build_bench`
 over a real tree. The standing target is the upstream `ripwire` binary with its on-disk cache warm,
 measured against this pipeline with no cache at all. That comparison is deliberately unfair to us: we
 have no persistent cache, so the target is what one would have to buy. Keep it that way rather than
 crediting the in-process fact cache, which does not survive a process and is not the same capability.
-`crates/mcp-code-graph/README.md` records the current numbers and the host they came from.
+`crates/mcp-source-code-graph/README.md` records the current numbers and the host they came from.
 
 For transport or container changes, also build the image and perform a real discovery/list/call smoke
 test against the resulting process. Use `make -C workcell docker-smoke` as the minimum image check.

@@ -1665,7 +1665,7 @@ mod tests {
     // Verbatim tails from this project's own qwen3.8-27b sessions. Paraphrasing
     // them would test the regex against itself rather than against the model.
     #[test_case("Let me look at the workcell dependency and provider core files.", true ; "promise_only")]
-    #[test_case("Let me verify the out-of-project permission handling for the code-graph crawl root, then I'll have everything for the report.", true ; "promise_with_a_trailing_intention")]
+    #[test_case("Let me verify the out-of-project permission handling for the source-code crawl root, then I'll have everything for the report.", true ; "promise_with_a_trailing_intention")]
     #[test_case("The pinned workcell rev has a cargo checkout there. I can read that for the native tool implementations. Now back to caudra-lua internals:", true ; "dangling_colon")]
     #[test_case("Now the nuclei tuple:", true ; "bare_lead_in")]
     #[test_case("Spot-check confirms: escalated system prompt and a 9-phase kill chain. All work is done — committing this session's fixes:", true ; "a_colon_outranks_completion_words")]

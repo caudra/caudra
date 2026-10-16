@@ -90,7 +90,7 @@ async fn fixture_server_with_options(
         Some(root.path()),
         &[
             ToolGroup::Files,
-            ToolGroup::CodeGraph,
+            ToolGroup::SourceCode,
             ToolGroup::Web,
             ToolGroup::Shell,
         ],
@@ -455,8 +455,8 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
             "file_glob",
             "file_grep",
             "file_index",
-            "code_context",
-            "code_refs",
+            "source_code_context",
+            "source_code_refs",
             "websearch",
             "webfetch",
             "shell",
@@ -510,7 +510,7 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
         &mcp_request(
             32,
             "tools/call",
-            json!({"name":"code_context","arguments":{"task":"visible"}}),
+            json!({"name":"source_code_context","arguments":{"task":"visible"}}),
         ),
     )
     .await;
@@ -544,7 +544,7 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
             "web": true,
             "shell": true,
             "code": false,
-            "codeGraph": true,
+            "sourceCode": true,
         })
     );
 

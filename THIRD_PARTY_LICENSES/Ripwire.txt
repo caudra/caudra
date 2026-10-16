@@ -8,7 +8,7 @@ Local material: workcell/crates/source-languages/queries/{bash,c,c_sharp,cpp,
 go,java,json,lua,objc,php,python,ruby,rust,swift,toml,typescript,yaml}/tags.scm.
 These files adapt ripwire queries, with capture normalization and further
 changes recorded in their headers. Upstream tree-sitter MIT notices are in
-TreeSitterQueries.txt. The separately implemented code-graph pipeline also
+TreeSitterQueries.txt. The separately implemented source-code pipeline also
 credits ripwire's design in workcell/THIRD_PARTY.md.
 
 The original ripwire import revision was not recorded. The inspected revision

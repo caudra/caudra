@@ -52,7 +52,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use caudra_agent::decisions::{CodeSymbol, code_context_out_of_deadline, rerank_code_context};
+use caudra_agent::decisions::{
+    CodeSymbol, rerank_source_code_context, source_code_context_out_of_deadline,
+};
 use caudra_agent::patch;
 use caudra_agent::permissions::pattern_recognition::ObservationProvenance;
 use caudra_agent::permissions::{
@@ -69,13 +71,13 @@ use caudra_agent::tools::{
     expand_tilde, stale_read_message,
 };
 use caudra_agent::{
-    AgentEvent, CodeGraphRow, DocumentSource, EnvironmentCommand, EnvironmentFact, GrepFileEntry,
-    GrepMatchGroup, INDEX_TRUNCATED, IndexDirectoryEntry as AgentIndexDirectoryEntry,
+    AgentEvent, DocumentSource, EnvironmentCommand, EnvironmentFact, GrepFileEntry, GrepMatchGroup,
+    INDEX_TRUNCATED, IndexDirectoryEntry as AgentIndexDirectoryEntry,
     IndexDirectoryEntryKind as AgentIndexDirectoryEntryKind, IndexLine as AgentIndexLine,
     IndexLineSemantic as AgentIndexLineSemantic, IndexOutput as AgentIndexOutput,
     IndexSourceRange as AgentIndexSourceRange, PDF_DATA_URL_PREFIX, PatchedFile, SearchCap,
     SharedBuf, ShellFilterInfo as AgentShellFilterInfo, ShellOutput as AgentShellOutput,
-    SnapshotLine, TextOutput, ToolInput, ToolOutput,
+    SnapshotLine, SourceCodeGraphRow, TextOutput, ToolInput, ToolOutput,
 };
 use caudra_config::ShellNativeRedirect;
 use caudra_storage::StateDir;
@@ -96,12 +98,6 @@ use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use workcell::code::bundled_worker_available;
 use workcell::code::{CodeConfiguration, CodeExecution, CodeInput, Outcome, WorkerSource};
-use workcell::code_graph::{
-    CodeContextInput, CodeContextOutput, CodeGraphError, CodeGraphLimits, CodeGraphToolGroup,
-    CodeRefsInput, CodeRefsOutput, Direction, GraphProgress, GraphProgressSink,
-    ModelText as CodeGraphModelText, RankedSymbol, SelectorRefusal, crawl_filesystem_limits, fit,
-    site_label,
-};
 use workcell::environment::{
     ExecutionEnvironmentError, ExecutionEnvironmentResult, ToolGroupDisclosure,
 };
@@ -119,6 +115,12 @@ use workcell::shell::{
     MAX_TIMEOUT_MS as SHELL_MAX_TIMEOUT_MS, PreparedShell, ShellExecution,
     ShellFilterInfo as WorkcellShellFilterInfo, ShellInput, ShellOutput as WorkcellShellOutput,
     ShellPreparationError, ShellProgressChunk, ShellProgressSink, ShellStream, ShellToolGroup,
+};
+use workcell::source_code_graph::{
+    Direction, GraphProgress, GraphProgressSink, ModelText as SourceCodeGraphModelText,
+    RankedSymbol, SelectorRefusal, SourceCodeContextInput, SourceCodeContextOutput,
+    SourceCodeGraphError, SourceCodeGraphLimits, SourceCodeGraphToolGroup, SourceCodeRefsInput,
+    SourceCodeRefsOutput, crawl_filesystem_limits, fit, site_label,
 };
 use workcell::web::{
     PreparedWebfetch, PreparedWebsearch, ProxyConfiguration, ProxyConfigurationError, WebExecution,
@@ -145,8 +147,8 @@ pub const NATIVE_TOOL_NAMES: &[&str] = &[
     "webfetch",
     "shell",
     "python_execution",
-    "code_context",
-    "code_refs",
+    "source_code_context",
+    "source_code_refs",
     "execution_environment",
 ];
 const REFS_REACHED_UNIT: &str = "reached";
@@ -259,7 +261,7 @@ const NOT_APPLIED: &str = "[not applied: nothing was written]";
 const CODE_ONE_LINE: &str = "1 line";
 const CODE_LINES: &str = "lines";
 const DECISION_TOOL_META: &str = "tool";
-const CODE_CONTEXT_TOOL: &str = "code_context";
+const SOURCE_CODE_CONTEXT_TOOL: &str = "source_code_context";
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
@@ -275,23 +277,23 @@ pub enum HostError {
 struct ProjectGroups {
     files: FileToolGroup,
     shell: ShellToolGroup,
-    code_graph: Arc<CodeGraphToolGroup>,
+    source_code: Arc<SourceCodeGraphToolGroup>,
     environment: Arc<ExecutionEnvironment>,
 }
 
-/// The code graph reads through its own filesystem group.
+/// The source-code graph reads through its own filesystem group.
 ///
 /// It cannot share the one the file tools use: that one is write-enabled and
 /// carries no traversal bound, and `from_files` clamps the crawl to whatever
 /// bound its group was built with. A second read-only group built from the
 /// crawl's own limits is what keeps a whole-tree map from silently stopping
 /// early.
-async fn code_graph_group(cwd: &Path) -> Result<Arc<CodeGraphToolGroup>, String> {
-    let limits = CodeGraphLimits::default();
+async fn source_code_graph_group(cwd: &Path) -> Result<Arc<SourceCodeGraphToolGroup>, String> {
+    let limits = SourceCodeGraphLimits::default();
     let files = FileToolGroup::new_unconfined(cwd, false, Some(crawl_filesystem_limits(&limits)))
         .await
         .map_err(|error| error.to_string())?;
-    Ok(Arc::new(CodeGraphToolGroup::from_files(
+    Ok(Arc::new(SourceCodeGraphToolGroup::from_files(
         Arc::new(files),
         limits,
     )))
@@ -323,7 +325,7 @@ impl HostInner {
             &self.web.snapshot().configuration,
         ));
         specs.extend(workcell::shell::specs());
-        specs.extend(workcell::code_graph::specs());
+        specs.extend(workcell::source_code_graph::specs());
         if self.code.is_some() || include_unavailable_code {
             specs.extend(workcell::code::specs());
         }
@@ -341,12 +343,12 @@ impl HostInner {
             .await
             .map_err(|error| error.to_string())?;
         let shell = shell_group(&cwd).await?;
-        let code_graph = code_graph_group(&cwd).await?;
+        let source_code = source_code_graph_group(&cwd).await?;
         let environment = Arc::new(ExecutionEnvironment::new(Some(&cwd)).await);
         let groups = ProjectGroups {
             files,
             shell,
-            code_graph,
+            source_code,
             environment,
         };
         projects.insert(cwd, groups.clone());
@@ -444,10 +446,10 @@ impl WorkcellHost {
             .map_err(HostError::Runtime)?;
         let project_cwd = std::fs::canonicalize(project_cwd.as_ref())
             .unwrap_or_else(|_| project_cwd.as_ref().to_path_buf());
-        let (files, shell, code_graph, environment, code_result) = runtime.block_on(async {
+        let (files, shell, source_code, environment, code_result) = runtime.block_on(async {
             let files = FileToolGroup::new_unconfined(&project_cwd, ALLOW_WRITE, None).await;
             let shell = shell_group(&project_cwd).await;
-            let code_graph = code_graph_group(&project_cwd).await;
+            let source_code = source_code_graph_group(&project_cwd).await;
             let environment = ExecutionEnvironment::new(Some(&project_cwd)).await;
             let code = if let Some(worker) = worker_source {
                 Some(
@@ -460,11 +462,11 @@ impl WorkcellHost {
             } else {
                 None
             };
-            (files, shell, code_graph, environment, code)
+            (files, shell, source_code, environment, code)
         });
         let files = files.map_err(|error| HostError::Files(error.to_string()))?;
         let shell = shell.map_err(HostError::Shell)?;
-        let code_graph = code_graph.map_err(HostError::Files)?;
+        let source_code = source_code.map_err(HostError::Files)?;
         let mut warnings = Vec::new();
         let code = match code_result {
             Some(Ok(code)) => Some(Arc::new(code)),
@@ -490,7 +492,7 @@ impl WorkcellHost {
             ProjectGroups {
                 files,
                 shell,
-                code_graph,
+                source_code,
                 environment: Arc::new(environment),
             },
         )]);
@@ -694,7 +696,7 @@ fn canonical_remote_specs() -> Vec<ToolSpec> {
         &WebsearchExecutionConfiguration::default(),
     ));
     expected.extend(workcell::shell::specs());
-    expected.extend(workcell::code_graph::specs());
+    expected.extend(workcell::source_code_graph::specs());
     expected.extend(workcell::code::specs());
     expected.push(workcell::environment::spec());
     expected
@@ -811,8 +813,8 @@ enum ToolKind {
     Webfetch,
     Shell,
     Code,
-    CodeContext,
-    CodeRefs,
+    SourceCodeContext,
+    SourceCodeRefs,
     Environment,
 }
 
@@ -830,8 +832,8 @@ impl ToolKind {
             "webfetch" => Some(Self::Webfetch),
             "shell" => Some(Self::Shell),
             "python_execution" => Some(Self::Code),
-            "code_context" => Some(Self::CodeContext),
-            "code_refs" => Some(Self::CodeRefs),
+            "source_code_context" => Some(Self::SourceCodeContext),
+            "source_code_refs" => Some(Self::SourceCodeRefs),
             "execution_environment" => Some(Self::Environment),
             _ => None,
         }
@@ -840,7 +842,7 @@ impl ToolKind {
     fn audience(self) -> ToolAudience {
         let read = ToolAudience::MAIN | ToolAudience::RESEARCH_SUB | ToolAudience::GENERAL_SUB;
         match self {
-            Self::Index | Self::CodeContext | Self::CodeRefs => ToolAudience::all(),
+            Self::Index | Self::SourceCodeContext | Self::SourceCodeRefs => ToolAudience::all(),
             Self::FileWrite | Self::FileEdit | Self::FileApplyPatch => {
                 ToolAudience::MAIN | ToolAudience::GENERAL_SUB
             }
@@ -857,8 +859,8 @@ impl ToolKind {
             Self::FileGlob
             | Self::FileGrep
             | Self::Websearch
-            | Self::CodeContext
-            | Self::CodeRefs => "search",
+            | Self::SourceCodeContext
+            | Self::SourceCodeRefs => "search",
             Self::FileWrite | Self::FileEdit | Self::FileApplyPatch => "edit",
             Self::Webfetch => "fetch",
             Self::Shell | Self::Code | Self::Environment => "execute",
@@ -873,8 +875,8 @@ impl ToolKind {
             | Self::Index
             | Self::Websearch
             | Self::Webfetch
-            | Self::CodeContext
-            | Self::CodeRefs => ToolEffect::ReadOnly,
+            | Self::SourceCodeContext
+            | Self::SourceCodeRefs => ToolEffect::ReadOnly,
             Self::Code => ToolEffect::Isolated,
             Self::FileWrite
             | Self::FileEdit
@@ -983,8 +985,8 @@ enum Input {
     Webfetch(WebfetchInput),
     Shell(ShellInput),
     Code(CodeInput),
-    CodeContext(CodeContextInput),
-    CodeRefs(CodeRefsInput),
+    SourceCodeContext(SourceCodeContextInput),
+    SourceCodeRefs(SourceCodeRefsInput),
     Environment,
 }
 
@@ -1011,8 +1013,12 @@ impl Input {
             ToolKind::Webfetch => parse_input("webfetch", input).map(Self::Webfetch),
             ToolKind::Shell => parse_input("shell", input).map(Self::Shell),
             ToolKind::Code => parse_input("python_execution", input).map(Self::Code),
-            ToolKind::CodeContext => parse_input("code_context", input).map(Self::CodeContext),
-            ToolKind::CodeRefs => parse_input("code_refs", input).map(Self::CodeRefs),
+            ToolKind::SourceCodeContext => {
+                parse_input("source_code_context", input).map(Self::SourceCodeContext)
+            }
+            ToolKind::SourceCodeRefs => {
+                parse_input("source_code_refs", input).map(Self::SourceCodeRefs)
+            }
             ToolKind::Environment => match input {
                 Value::Object(values) if values.is_empty() => Ok(Self::Environment),
                 _ => Err(
@@ -1038,7 +1044,7 @@ enum PreparedExecution {
     Websearch(PreparedWebsearch),
     Webfetch(PreparedWebfetch),
     Shell(ShellToolGroup, Box<PreparedShell>),
-    CodeGraph(Arc<CodeGraphToolGroup>),
+    SourceCodeGraph(Arc<SourceCodeGraphToolGroup>),
     Environment(Arc<ExecutionEnvironment>),
     None,
 }
@@ -1343,13 +1349,18 @@ impl WorkcellInvocation {
                 PermissionResourceAccess::Execute,
                 PermissionRisk::Low,
             ),
-            Input::CodeContext(input) => {
-                let group = self.code_graph_group(ctx, project.clone()).await?;
-                code_graph_prepared(group, &project, input.path.as_deref(), &["/path", "/task"])
+            Input::SourceCodeContext(input) => {
+                let group = self.source_code_graph_group(ctx, project.clone()).await?;
+                source_code_graph_prepared(
+                    group,
+                    &project,
+                    input.path.as_deref(),
+                    &["/path", "/task"],
+                )
             }
-            Input::CodeRefs(input) => {
-                let group = self.code_graph_group(ctx, project.clone()).await?;
-                code_graph_prepared(
+            Input::SourceCodeRefs(input) => {
+                let group = self.source_code_graph_group(ctx, project.clone()).await?;
+                source_code_graph_prepared(
                     group,
                     &project,
                     input.path.as_deref(),
@@ -1388,15 +1399,15 @@ impl WorkcellInvocation {
         Ok(intent)
     }
 
-    async fn code_graph_group(
+    async fn source_code_graph_group(
         &self,
         ctx: &ToolContext,
         project: PathBuf,
-    ) -> Result<Arc<CodeGraphToolGroup>, ToolError> {
+    ) -> Result<Arc<SourceCodeGraphToolGroup>, ToolError> {
         let host = Arc::clone(&self.host);
         self.host
             .run(ctx, move |_| async move {
-                Ok::<_, ToolError>(host.project_groups(project).await?.code_graph)
+                Ok::<_, ToolError>(host.project_groups(project).await?.source_code)
             })
             .await?
     }
@@ -1450,8 +1461,8 @@ fn input_header(input: &Input) -> String {
             1 => CODE_ONE_LINE.to_owned(),
             count => format!("{count} {CODE_LINES}"),
         },
-        Input::CodeContext(input) => search_header(&input.task, input.path.as_deref()),
-        Input::CodeRefs(input) => search_header(&input.symbol, input.path.as_deref()),
+        Input::SourceCodeContext(input) => search_header(&input.task, input.path.as_deref()),
+        Input::SourceCodeRefs(input) => search_header(&input.symbol, input.path.as_deref()),
         Input::Environment => "execution environment".into(),
     }
 }
@@ -1565,8 +1576,8 @@ impl RemoteWorkcellInvocation {
                     | ToolKind::FileEdit
                     | ToolKind::FileApplyPatch
                     | ToolKind::Index
-                    | ToolKind::CodeContext
-                    | ToolKind::CodeRefs => None,
+                    | ToolKind::SourceCodeContext
+                    | ToolKind::SourceCodeRefs => None,
                     ToolKind::Websearch => Some("query"),
                     ToolKind::Webfetch => Some("url"),
                     ToolKind::Shell => match resource.access {
@@ -1590,8 +1601,8 @@ impl RemoteWorkcellInvocation {
                     ToolKind::FileGlob
                         | ToolKind::FileGrep
                         | ToolKind::Index
-                        | ToolKind::CodeContext
-                        | ToolKind::CodeRefs
+                        | ToolKind::SourceCodeContext
+                        | ToolKind::SourceCodeRefs
                 ) {
                     PermissionResourceKind::RemoteDirectory {
                         identity: identity.clone(),
@@ -2461,8 +2472,8 @@ fn remote_result(
             structured_content,
             model_output.clone(),
         )),
-        ToolKind::CodeContext | ToolKind::CodeRefs => {
-            remote_code_graph_result(kind, structured_content, model_output.clone())
+        ToolKind::SourceCodeContext | ToolKind::SourceCodeRefs => {
+            remote_source_code_graph_result(kind, structured_content, model_output.clone())
         }
         ToolKind::Environment => environment_card(&structured_content, None)
             .map(|output| ToolExecResult::from(Ok::<_, String>(output))),
@@ -2645,7 +2656,7 @@ struct RemoteGraphSymbol {
     name_only: bool,
 }
 
-/// The parts of a `code_refs` answer its card headline and annotation read.
+/// The parts of a `source_code_refs` answer its card headline and annotation read.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RefsSummary {
@@ -2680,7 +2691,7 @@ fn default_refs_depth() -> usize {
 }
 
 impl RefsSummary {
-    fn of(output: &CodeRefsOutput) -> Self {
+    fn of(output: &SourceCodeRefsOutput) -> Self {
         Self {
             direction: output.direction.to_owned(),
             symbol: output.symbol.clone(),
@@ -2744,7 +2755,7 @@ impl RefsSummary {
 fn graph_rows(
     value: &Value,
     refs: Option<&RefsSummary>,
-) -> Result<Vec<CodeGraphRow>, serde_json::Error> {
+) -> Result<Vec<SourceCodeGraphRow>, serde_json::Error> {
     let symbols: Vec<RemoteGraphSymbol> = deserialize_remote(value)?;
     Ok(symbols
         .into_iter()
@@ -2755,7 +2766,7 @@ fn graph_rows(
                 .iter()
                 .map(|site| site_label(&site.path, site.line, home))
                 .collect();
-            CodeGraphRow {
+            SourceCodeGraphRow {
                 sites_withheld: symbol.sites_total.saturating_sub(sites.len()),
                 sites,
                 name: symbol.name,
@@ -2773,7 +2784,7 @@ fn graph_rows(
         .collect())
 }
 
-fn remote_code_graph_result(
+fn remote_source_code_graph_result(
     kind: ToolKind,
     value: Value,
     model_output: String,
@@ -2796,7 +2807,7 @@ fn remote_code_graph_result(
     let string = |name: &str| value[name].as_str().unwrap_or_default().to_owned();
     let usize_value = |name: &str| value[name].as_u64().unwrap_or_default() as usize;
     let (headline, rows, annotation) = match kind {
-        ToolKind::CodeContext => (
+        ToolKind::SourceCodeContext => (
             format!(
                 "read as {} ({}); confidence {} at {}% separation",
                 string("shape"),
@@ -2811,7 +2822,7 @@ fn remote_code_graph_result(
                 string("confidence")
             ),
         ),
-        ToolKind::CodeRefs => {
+        ToolKind::SourceCodeRefs => {
             let refs: RefsSummary = deserialize_remote(&value)?;
             (
                 refs.headline(),
@@ -2819,22 +2830,24 @@ fn remote_code_graph_result(
                 refs.annotation(),
             )
         }
-        _ => unreachable!("only code graph tools use this adapter"),
+        _ => unreachable!("only source-code graph tools use this adapter"),
     };
     let footer = model_output
         .lines()
         .next_back()
         .unwrap_or_default()
         .to_owned();
-    Ok(ToolExecResult::from(Ok::<_, String>(ToolOutput::CodeGraph {
-        headline,
-        rows,
-        source: None,
-        footer,
-        state: Some(value),
-    }))
-    .with_model_output(Some(model_output))
-    .with_annotation(Some(annotation)))
+    Ok(
+        ToolExecResult::from(Ok::<_, String>(ToolOutput::SourceCodeGraph {
+            headline,
+            rows,
+            source: None,
+            footer,
+            state: Some(value),
+        }))
+        .with_model_output(Some(model_output))
+        .with_annotation(Some(annotation)),
+    )
 }
 
 impl ToolInvocation for WorkcellInvocation {
@@ -3205,13 +3218,15 @@ impl WorkcellInvocation {
                     Err(error) => failed(error),
                 }
             }
-            (Input::CodeContext(input), PreparedExecution::CodeGraph(group)) => {
+            (Input::SourceCodeContext(input), PreparedExecution::SourceCodeGraph(group)) => {
                 let input = input.clone();
                 let sink = self.graph_progress(ctx);
                 match self
                     .host
                     .run(ctx, move |token| async move {
-                        group.code_context(input, sink.as_deref(), &token).await
+                        group
+                            .source_code_context(input, sink.as_deref(), &token)
+                            .await
                     })
                     .await
                 {
@@ -3230,7 +3245,7 @@ impl WorkcellInvocation {
                             output.margin_percent
                         );
                         let output = fit(output);
-                        code_graph_result(
+                        source_code_graph_result(
                             &output,
                             headline,
                             ranked_rows(&output.results),
@@ -3239,24 +3254,24 @@ impl WorkcellInvocation {
                         )
                         .with_model_suffix(reordered)
                     }
-                    Ok(Err(error)) => failed(code_graph_error(error)),
+                    Ok(Err(error)) => failed(source_code_graph_error(error)),
                     Err(error) => failed(error),
                 }
             }
-            (Input::CodeRefs(input), PreparedExecution::CodeGraph(group)) => {
+            (Input::SourceCodeRefs(input), PreparedExecution::SourceCodeGraph(group)) => {
                 let input = input.clone();
                 let sink = self.graph_progress(ctx);
                 match self
                     .host
                     .run(ctx, move |token| async move {
-                        group.code_refs(input, sink.as_deref(), &token).await
+                        group.source_code_refs(input, sink.as_deref(), &token).await
                     })
                     .await
                 {
                     Ok(Ok(Ok(output))) => {
                         let output = fit(output);
                         let summary = RefsSummary::of(&output);
-                        code_graph_result(
+                        source_code_graph_result(
                             &output,
                             summary.headline(),
                             reference_rows(&output),
@@ -3265,7 +3280,7 @@ impl WorkcellInvocation {
                         )
                     }
                     Ok(Ok(Err(refusal))) => selector_refusal_result(&refusal),
-                    Ok(Err(error)) => failed(code_graph_error(error)),
+                    Ok(Err(error)) => failed(source_code_graph_error(error)),
                     Err(error) => failed(error),
                 }
             }
@@ -3275,7 +3290,7 @@ impl WorkcellInvocation {
                     web: true,
                     shell: true,
                     code: self.host.code.is_some(),
-                    code_graph: true,
+                    source_code: true,
                 };
                 match self
                     .host
@@ -3334,12 +3349,12 @@ fn shell_preparation_error(error: ShellPreparationError) -> ToolError {
     ToolError::new(ToolFailure::from_code(error.code()), error.to_string())
 }
 
-fn code_graph_error(error: CodeGraphError) -> ToolError {
+fn source_code_graph_error(error: SourceCodeGraphError) -> ToolError {
     let failure = match &error {
-        CodeGraphError::Denied(_) => ToolFailure::Denied,
-        CodeGraphError::Invalid(_) => ToolFailure::InvalidInput,
-        CodeGraphError::Aborted => ToolFailure::Cancelled,
-        CodeGraphError::Internal(_) => ToolFailure::Other,
+        SourceCodeGraphError::Denied(_) => ToolFailure::Denied,
+        SourceCodeGraphError::Invalid(_) => ToolFailure::InvalidInput,
+        SourceCodeGraphError::Aborted => ToolFailure::Cancelled,
+        SourceCodeGraphError::Internal(_) => ToolFailure::Other,
     };
     ToolError::new(failure, error.to_string())
 }
@@ -3536,15 +3551,15 @@ fn file_patch_prepared(
     }
 }
 
-/// One read-only intent over the tree a code-graph call will crawl.
+/// One read-only intent over the tree a source-code call will crawl.
 ///
 /// The scope is the directory, never the symbol: the call reads every source
 /// file underneath it to build the graph, and a narrower scope would claim an
 /// access this tool does not have. `read_targets` stays empty for the same
 /// reason `file_grep`'s does — a crawl cannot name the files it will read
 /// before it runs.
-fn code_graph_prepared(
-    group: Arc<CodeGraphToolGroup>,
+fn source_code_graph_prepared(
+    group: Arc<SourceCodeGraphToolGroup>,
     project: &Path,
     path: Option<&str>,
     input_pointers: &[&str],
@@ -3575,7 +3590,7 @@ fn code_graph_prepared(
         .with_authority(PermissionAuthorityProfile::Filesystem {
             input_pointers: input_pointers.iter().map(|p| (*p).to_owned()).collect(),
         }),
-        execution: PreparedExecution::CodeGraph(group),
+        execution: PreparedExecution::SourceCodeGraph(group),
         mutation_targets: Vec::new(),
         read_targets: Vec::new(),
     }
@@ -4304,21 +4319,21 @@ fn shell_status(output: &WorkcellShellOutput) -> String {
     format!("[shell status: {}]", statuses.join("; "))
 }
 
-/// Turns one code-graph answer into a card.
+/// Turns one source-code answer into a card.
 ///
 /// The model text is Workcell's own `ModelText`, never a restatement: that
 /// rendering carries the floor caveats and the truncation notice, and a second
 /// one here would be a second contract to keep in step.
-fn code_graph_result(
-    output: &(impl Serialize + CodeGraphModelText),
+fn source_code_graph_result(
+    output: &(impl Serialize + SourceCodeGraphModelText),
     headline: String,
-    rows: Vec<CodeGraphRow>,
+    rows: Vec<SourceCodeGraphRow>,
     footer: String,
     annotation: String,
 ) -> ToolExecResult {
-    let state = serde_json::to_value(output).expect("code graph output serializes");
+    let state = serde_json::to_value(output).expect("source-code graph output serializes");
     let exact = output.model_text().into_owned();
-    ToolExecResult::from(Ok::<_, String>(ToolOutput::CodeGraph {
+    ToolExecResult::from(Ok::<_, String>(ToolOutput::SourceCodeGraph {
         headline,
         rows,
         source: None,
@@ -4333,13 +4348,16 @@ fn code_graph_result(
 /// before `fit` keeps a prefix, within the call's own deadline. Workcell's
 /// headline and confidence still describe its own ranking; the returned note
 /// tells the model which rows moved, and a row after the card tells the user.
-async fn rerank_context_rows(ctx: &ToolContext, output: &mut CodeContextOutput) -> Option<String> {
+async fn rerank_context_rows(
+    ctx: &ToolContext,
+    output: &mut SourceCodeContextOutput,
+) -> Option<String> {
     let decisions = ctx.permissions.decisions()?;
     let remaining = ctx.deadline.remaining().ok()?;
     let context = ctx
         .permissions
-        .decision_context(json!({DECISION_TOOL_META: CODE_CONTEXT_TOOL}));
-    let rerank = rerank_code_context(
+        .decision_context(json!({DECISION_TOOL_META: SOURCE_CODE_CONTEXT_TOOL}));
+    let rerank = rerank_source_code_context(
         &mut output.results,
         |row| CodeSymbol {
             name: &row.name,
@@ -4360,7 +4378,7 @@ async fn rerank_context_rows(ctx: &ToolContext, output: &mut CodeContextOutput) 
         Some(remaining) => {
             future::or(rerank, async {
                 Timer::after(remaining).await;
-                (None, code_context_out_of_deadline(&decisions))
+                (None, source_code_context_out_of_deadline(&decisions))
             })
             .await
         }
@@ -4390,10 +4408,10 @@ fn selector_refusal_result(refusal: &SelectorRefusal) -> ToolExecResult {
     }))
 }
 
-fn ranked_rows(symbols: &[RankedSymbol]) -> Vec<CodeGraphRow> {
+fn ranked_rows(symbols: &[RankedSymbol]) -> Vec<SourceCodeGraphRow> {
     symbols
         .iter()
-        .map(|symbol| CodeGraphRow {
+        .map(|symbol| SourceCodeGraphRow {
             name: symbol.name.clone(),
             kind: symbol.kind.clone(),
             path: symbol.path.clone(),
@@ -4403,16 +4421,16 @@ fn ranked_rows(symbols: &[RankedSymbol]) -> Vec<CodeGraphRow> {
             outbound: Some(symbol.calls),
             hops: None,
             test_scope: symbol.test_scope,
-            ..CodeGraphRow::default()
+            ..SourceCodeGraphRow::default()
         })
         .collect()
 }
 
-fn reference_rows(output: &CodeRefsOutput) -> Vec<CodeGraphRow> {
+fn reference_rows(output: &SourceCodeRefsOutput) -> Vec<SourceCodeGraphRow> {
     output
         .references
         .iter()
-        .map(|row| CodeGraphRow {
+        .map(|row| SourceCodeGraphRow {
             name: row.symbol.name.clone(),
             kind: row.symbol.kind.clone(),
             path: row.symbol.path.clone(),
@@ -4431,7 +4449,7 @@ fn reference_rows(output: &CodeRefsOutput) -> Vec<CodeGraphRow> {
 
 /// The trailing summary each result carries, taken from Workcell's own
 /// rendering so the card and the model see the same caveats.
-fn graph_footer(output: &impl CodeGraphModelText) -> String {
+fn graph_footer(output: &impl SourceCodeGraphModelText) -> String {
     output
         .model_text()
         .lines()
@@ -4582,7 +4600,7 @@ struct EnvironmentGroups {
     web: bool,
     shell: bool,
     code: bool,
-    code_graph: bool,
+    source_code: bool,
 }
 
 fn environment_card(
@@ -4735,7 +4753,7 @@ fn enabled_tool_groups(groups: &EnvironmentGroups) -> Vec<&'static str> {
         (groups.web, "web"),
         (groups.shell, "shell"),
         (groups.code, "code"),
-        (groups.code_graph, "code-graph"),
+        (groups.source_code, "source-code"),
     ]
     .into_iter()
     .filter_map(|(enabled, name)| enabled.then_some(name))
@@ -4800,7 +4818,7 @@ struct NativeProgressSink {
     tail: Mutex<ProgressTail>,
 }
 
-/// Turns a code-graph phase into the one line the card shows while it runs.
+/// Turns a source-code phase into the one line the card shows while it runs.
 ///
 /// A graph call is silent for seconds: it crawls, parses and ranks the whole
 /// tree before it can answer anything. Without this the card is a bare spinner
@@ -4987,8 +5005,8 @@ mod tests {
     const BROWSE_CONTENT_SENTINEL: &str = "content_not_authorized_by_a_names_only_grant";
     const PATTERN_PACKAGES: [&str; 3] = ["alpha", "beta", "gamma"];
     const PATTERN_COMMAND: &str = "cargo check -p alpha --tests";
-    const CODE_CONTEXT_TASK: &str = "normalize sku item import";
-    const CODE_CONTEXT_COUNTS: [&str; 3] = ["shown", "totalMatched", "truncated"];
+    const SOURCE_CODE_CONTEXT_TASK: &str = "normalize sku item import";
+    const SOURCE_CODE_CONTEXT_COUNTS: [&str; 3] = ["shown", "totalMatched", "truncated"];
     const DECISION_BASE_URL: &str = "http://127.0.0.1:1";
     const RELEVANT_SCORE: f64 = 0.9;
     const UNRELATED_SCORE: f64 = 0.0;
@@ -5316,8 +5334,8 @@ mod tests {
                 "websearch",
                 "webfetch",
                 "shell",
-                "code_context",
-                "code_refs",
+                "source_code_context",
+                "source_code_refs",
                 "python_execution",
                 "execution_environment",
             ]
@@ -5671,7 +5689,7 @@ mod tests {
                 web: populated,
                 shell: populated,
                 code: populated,
-                code_graph: populated,
+                source_code: populated,
             },
             commands: vec![
                 CommandDescriptor {
@@ -6083,7 +6101,7 @@ mod tests {
                 }),
             ),
             (
-                "code_context",
+                "source_code_context",
                 json!({
                     "$schema": DRAFT_07,
                     "type": "object",
@@ -6097,7 +6115,7 @@ mod tests {
                 }),
             ),
             (
-                "code_refs",
+                "source_code_refs",
                 json!({
                     "$schema": DRAFT_07,
                     "type": "object",
@@ -8016,7 +8034,7 @@ mod tests {
 
     /// A tree with a clear gradient: `normalize_sku` is called from three
     /// places and `orphan_helper` from none.
-    fn code_graph_tree(root: &Path) {
+    fn source_code_graph_tree(root: &Path) {
         for (path, source) in [
             (
                 "src/normalize.rs",
@@ -8037,11 +8055,11 @@ mod tests {
         }
     }
 
-    fn run_code_graph(root: &Path, tool: &str, input: Value) -> ToolExecResult {
-        run_code_graph_with(root, tool, input, None)
+    fn run_source_code_graph(root: &Path, tool: &str, input: Value) -> ToolExecResult {
+        run_source_code_graph_with(root, tool, input, None)
     }
 
-    fn run_code_graph_with(
+    fn run_source_code_graph_with(
         root: &Path,
         tool: &str,
         input: Value,
@@ -8066,21 +8084,21 @@ mod tests {
             .unwrap_or_else(|| panic!("registered {tool}"))
             .tool
             .parse(&input)
-            .expect("valid code-graph input");
-        smol::block_on(invocation.preflight(&ctx)).expect("code-graph preflight");
+            .expect("valid source-code input");
+        smol::block_on(invocation.preflight(&ctx)).expect("source-code preflight");
         smol::block_on(invocation.execute(&ctx))
     }
 
-    #[test_case("code_context", "code.context.v1", "search" ; "context")]
-    #[test_case("code_refs", "code.refs.v1", "search" ; "refs")]
-    fn code_graph_tools_register_read_only_with_workcell_contracts(
+    #[test_case("source_code_context", "source_code.context.v1", "search" ; "context")]
+    #[test_case("source_code_refs", "source_code.refs.v1", "search" ; "refs")]
+    fn source_code_graph_tools_register_read_only_with_workcell_contracts(
         tool: &str,
         contract: &str,
         kind: &str,
     ) {
         let root = TempDir::new().expect("tempdir");
         let (_host, registry) = host_and_registry(root.path());
-        let registered = registry.get(tool).expect("registered code-graph tool");
+        let registered = registry.get(tool).expect("registered source-code tool");
 
         assert_eq!(registered.tool.tool_kind(), Some(kind));
         assert_eq!(registered.effect, ToolEffect::ReadOnly);
@@ -8095,17 +8113,17 @@ mod tests {
     }
 
     #[test]
-    fn code_refs_rows_carry_the_call_site_lines() {
+    fn source_code_refs_rows_carry_the_call_site_lines() {
         let root = TempDir::new().expect("tempdir");
-        code_graph_tree(root.path());
-        let result = run_code_graph(
+        source_code_graph_tree(root.path());
+        let result = run_source_code_graph(
             root.path(),
-            "code_refs",
+            "source_code_refs",
             json!({ "symbol": "normalize_sku" }),
         );
 
-        let Ok(ToolOutput::CodeGraph { rows, footer, .. }) = result.output else {
-            panic!("expected a code-graph card");
+        let Ok(ToolOutput::SourceCodeGraph { rows, footer, .. }) = result.output else {
+            panic!("expected a source-code card");
         };
         let add_item = rows
             .iter()
@@ -8124,11 +8142,11 @@ mod tests {
         const LEGEND: &str = "counts are floors";
 
         let root = TempDir::new().expect("tempdir");
-        code_graph_tree(root.path());
-        let result = run_code_graph(
+        source_code_graph_tree(root.path());
+        let result = run_source_code_graph(
             root.path(),
-            "code_context",
-            json!({ "task": CODE_CONTEXT_TASK }),
+            "source_code_context",
+            json!({ "task": SOURCE_CODE_CONTEXT_TASK }),
         );
         let model_output = result.model_output.expect("model output");
 
@@ -8171,14 +8189,16 @@ mod tests {
         }
     }
 
-    fn code_graph_parts(result: ToolExecResult) -> (Vec<String>, Value, String, Option<String>) {
-        let Ok(ToolOutput::CodeGraph {
+    fn source_code_graph_parts(
+        result: ToolExecResult,
+    ) -> (Vec<String>, Value, String, Option<String>) {
+        let Ok(ToolOutput::SourceCodeGraph {
             rows,
             state: Some(state),
             ..
         }) = result.output
         else {
-            panic!("expected a code-graph card");
+            panic!("expected a source-code card");
         };
         (
             rows.into_iter().map(|row| row.name).collect(),
@@ -8190,16 +8210,16 @@ mod tests {
 
     #[test_case(FeatureMode::Enforce, true; "enforced_moves_the_relevant_row_first")]
     #[test_case(FeatureMode::Off, false; "off_keeps_workcells_order")]
-    fn code_context_rows_follow_decision_relevance(mode: FeatureMode, reordered: bool) {
+    fn source_code_context_rows_follow_decision_relevance(mode: FeatureMode, reordered: bool) {
         let root = TempDir::new().expect("tempdir");
         let state_dir = TempDir::new().expect("state tempdir");
-        code_graph_tree(root.path());
-        let input = json!({ "task": CODE_CONTEXT_TASK });
+        source_code_graph_tree(root.path());
+        let input = json!({ "task": SOURCE_CODE_CONTEXT_TASK });
         let mut config = DecisionsConfig {
             base_url: Some(DECISION_BASE_URL.parse().expect("decision URL")),
             ..DecisionsConfig::default()
         };
-        config.features.code_context = mode;
+        config.features.source_code_context = mode;
         let decisions = Decisions::with_engine(
             config,
             &StateDir::from_path(state_dir.path().into()),
@@ -8207,15 +8227,18 @@ mod tests {
         )
         .expect("decision service");
 
-        let (names, state, text, suffix) =
-            code_graph_parts(run_code_graph(root.path(), "code_context", input.clone()));
-        let (actual_names, actual_state, actual_text, actual_suffix) = code_graph_parts(
-            run_code_graph_with(root.path(), "code_context", input, Some(decisions)),
+        let (names, state, text, suffix) = source_code_graph_parts(run_source_code_graph(
+            root.path(),
+            "source_code_context",
+            input.clone(),
+        ));
+        let (actual_names, actual_state, actual_text, actual_suffix) = source_code_graph_parts(
+            run_source_code_graph_with(root.path(), "source_code_context", input, Some(decisions)),
         );
 
         assert!(names.len() > 1, "{NOTHING_TO_REORDER}: {names:?}");
         assert_eq!(suffix, None);
-        for field in CODE_CONTEXT_COUNTS {
+        for field in SOURCE_CODE_CONTEXT_COUNTS {
             assert_eq!(actual_state[field], state[field], "{field}");
         }
         if reordered {
@@ -8238,17 +8261,17 @@ mod tests {
     }
 
     #[test]
-    fn code_refs_with_depth_rows_carry_hop_distance() {
+    fn source_code_refs_with_depth_rows_carry_hop_distance() {
         let root = TempDir::new().expect("tempdir");
-        code_graph_tree(root.path());
-        let result = run_code_graph(
+        source_code_graph_tree(root.path());
+        let result = run_source_code_graph(
             root.path(),
-            "code_refs",
+            "source_code_refs",
             json!({ "symbol": "normalize_sku", "depth": 3 }),
         );
 
-        let Ok(ToolOutput::CodeGraph { rows, headline, .. }) = result.output else {
-            panic!("expected a code-graph card");
+        let Ok(ToolOutput::SourceCodeGraph { rows, headline, .. }) = result.output else {
+            panic!("expected a source-code card");
         };
         assert!(!rows.is_empty(), "three callers reach this symbol");
         assert!(rows.iter().all(|row| row.hops == Some(1)), "{rows:?}");
@@ -8263,10 +8286,10 @@ mod tests {
     #[test]
     fn an_unknown_symbol_is_refused_as_a_successful_call() {
         let root = TempDir::new().expect("tempdir");
-        code_graph_tree(root.path());
-        let result = run_code_graph(
+        source_code_graph_tree(root.path());
+        let result = run_source_code_graph(
             root.path(),
-            "code_refs",
+            "source_code_refs",
             json!({ "symbol": "normalise_sku" }),
         );
 
@@ -8284,16 +8307,16 @@ mod tests {
     /// A crawl reads every source file under the scope, so the grant is the
     /// directory. A narrower scope would claim an access the tool does not have.
     #[test]
-    fn a_code_graph_call_asks_for_the_subtree_it_crawls() {
+    fn a_source_code_graph_call_asks_for_the_subtree_it_crawls() {
         let root = TempDir::new().expect("tempdir");
-        code_graph_tree(root.path());
+        source_code_graph_tree(root.path());
         let (_host, registry) = host_and_registry(root.path());
         let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
         let invocation = registry
-            .get("code_context")
-            .expect("registered code_context")
+            .get("source_code_context")
+            .expect("registered source_code_context")
             .tool
-            .parse(&json!({ "task": CODE_CONTEXT_TASK, "path": "src" }))
+            .parse(&json!({ "task": SOURCE_CODE_CONTEXT_TASK, "path": "src" }))
             .expect("valid input");
 
         let intent = smol::block_on(invocation.preflight(&ctx))
@@ -8610,12 +8633,12 @@ mod tests {
         assert_eq!(shown, "compiling\n 50%");
     }
 
-    #[test_case(workcell::code_graph::GraphPhase::Crawl, 0, "crawl" ; "crawl_started")]
-    #[test_case(workcell::code_graph::GraphPhase::Crawl, 64, "crawl 64 files" ; "crawl_progress")]
-    #[test_case(workcell::code_graph::GraphPhase::Parse, 12, "parse 12 files" ; "parse_progress")]
-    #[test_case(workcell::code_graph::GraphPhase::Rank, 12, "rank 12 files" ; "rank_progress")]
-    fn code_graph_progress_is_exposed_as_a_live_annotation(
-        phase: workcell::code_graph::GraphPhase,
+    #[test_case(workcell::source_code_graph::GraphPhase::Crawl, 0, "crawl" ; "crawl_started")]
+    #[test_case(workcell::source_code_graph::GraphPhase::Crawl, 64, "crawl 64 files" ; "crawl_progress")]
+    #[test_case(workcell::source_code_graph::GraphPhase::Parse, 12, "parse 12 files" ; "parse_progress")]
+    #[test_case(workcell::source_code_graph::GraphPhase::Rank, 12, "rank 12 files" ; "rank_progress")]
+    fn source_code_graph_progress_is_exposed_as_a_live_annotation(
+        phase: workcell::source_code_graph::GraphPhase,
         files: usize,
         expected: &str,
     ) {
@@ -8689,7 +8712,7 @@ mod tests {
             ))
             .chain(workcell::shell::specs())
             .chain(workcell::code::specs())
-            .chain(workcell::code_graph::specs())
+            .chain(workcell::source_code_graph::specs())
             .chain(std::iter::once(workcell::environment::spec()))
             .map(|spec| spec.name)
             .collect();
@@ -8728,12 +8751,17 @@ mod tests {
                 "execute",
             ),
             (
-                "code_context",
-                "code.context.v1",
+                "source_code_context",
+                "source_code.context.v1",
                 ToolEffect::ReadOnly,
                 "search",
             ),
-            ("code_refs", "code.refs.v1", ToolEffect::ReadOnly, "search"),
+            (
+                "source_code_refs",
+                "source_code.refs.v1",
+                ToolEffect::ReadOnly,
+                "search",
+            ),
             (
                 "python_execution",
                 "python.execution.v1",

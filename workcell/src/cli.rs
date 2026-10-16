@@ -29,9 +29,9 @@ pub enum ToolGroup {
     // selector matches the tool it exposes, so it is named explicitly.
     #[value(name = "python_execution")]
     PythonExecution,
-    // Same reason as above: the selector matches the `code_*` tools it exposes.
-    #[value(name = "code_graph")]
-    CodeGraph,
+    // Same reason as above: the selector matches the `source_code_*` tools it exposes.
+    #[value(name = "source_code")]
+    SourceCode,
     Transfer,
 }
 
@@ -43,7 +43,7 @@ impl ToolGroup {
             Self::Web => "web",
             Self::Shell => "shell",
             Self::PythonExecution => "python_execution",
-            Self::CodeGraph => "code_graph",
+            Self::SourceCode => "source_code",
             Self::Transfer => "transfer",
         }
     }
@@ -432,7 +432,7 @@ impl RawOptions {
                 Some(value) => parse_groups(&value)?,
                 None => vec![
                     ToolGroup::Files,
-                    ToolGroup::CodeGraph,
+                    ToolGroup::SourceCode,
                     ToolGroup::Web,
                     ToolGroup::Shell,
                     ToolGroup::PythonExecution,
@@ -645,11 +645,11 @@ impl RawOptions {
             return Err(CliError::InvalidTransferRoot);
         }
 
-        // Transfer and code_graph both resolve every path through a confined `FileToolGroup`, so
+        // Transfer and source_code both resolve every path through a confined `FileToolGroup`, so
         // they need a root for the same reason the files tools do.
         let has_local = groups.contains(&ToolGroup::Files)
             || groups.contains(&ToolGroup::Shell)
-            || groups.contains(&ToolGroup::CodeGraph)
+            || groups.contains(&ToolGroup::SourceCode)
             || groups.contains(&ToolGroup::Transfer)
             || remote_host.is_some();
         if has_local && self.root.is_none() {
@@ -849,7 +849,7 @@ fn parse_groups(value: &str) -> Result<Vec<ToolGroup>, CliError> {
             "web" => Ok(ToolGroup::Web),
             "shell" => Ok(ToolGroup::Shell),
             "python_execution" => Ok(ToolGroup::PythonExecution),
-            "code_graph" => Ok(ToolGroup::CodeGraph),
+            "source_code" => Ok(ToolGroup::SourceCode),
             "transfer" => Ok(ToolGroup::Transfer),
             _ => Err(CliError::InvalidToolGroup),
         })
@@ -883,7 +883,7 @@ mod tests {
             ToolGroup::Web,
             ToolGroup::Shell,
             ToolGroup::PythonExecution,
-            ToolGroup::CodeGraph,
+            ToolGroup::SourceCode,
             ToolGroup::Transfer,
         ] {
             assert_eq!(parse_groups(group.as_str()).unwrap(), [group]);

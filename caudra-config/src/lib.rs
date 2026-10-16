@@ -40,7 +40,7 @@ const MCP_WHOLE_SERVER: &str = "*";
 /// document, and a glob, a grep and an index are ordered by path or by source
 /// rather than by relevance, so the visible lines are the alphabetically
 /// first ones rather than the answer. Each already states its result in the
-/// row annotation, so the fold loses no summary. The code-graph lookups are
+/// row annotation, so the fold loses no summary. The source-code lookups are
 /// absent on purpose: they rank their rows, so the prefix is the headline.
 const DEFAULT_ALWAYS_COLLAPSED: &[&str] = &[
     "file_read",
@@ -363,8 +363,8 @@ pub const WORKCELL_NATIVE_TOOL_NAMES: &[&str] = &[
     "webfetch",
     "shell",
     "python_execution",
-    "code_context",
-    "code_refs",
+    "source_code_context",
+    "source_code_refs",
     "execution_environment",
 ];
 
@@ -2476,7 +2476,10 @@ impl ToolOutputLines {
         ("bash", &["shell"]),
         ("python_execution", &["python_execution"]),
         ("task", &["task", "task_control"]),
-        ("index", &["file_index", "code_context", "code_refs"]),
+        (
+            "index",
+            &["file_index", "source_code_context", "source_code_refs"],
+        ),
         ("grep", &["file_grep", "file_glob"]),
         ("read", &["file_read"]),
         (
@@ -2560,7 +2563,7 @@ impl ToolOutputLines {
             "bash" | "shell" => self.bash,
             "python_execution" => self.python_execution,
             "task" | "task_control" => self.task,
-            "index" | "file_index" | "code_context" | "code_refs" => self.index,
+            "index" | "file_index" | "source_code_context" | "source_code_refs" => self.index,
             "file_grep" | "file_glob" | "grep" | "glob" => self.grep,
             "file_read" | "read" => self.read,
             "memory" | "plan" => self.write,
@@ -7782,6 +7785,8 @@ mod tests {
     #[test_case("bash" ; "legacy_plugin_id_is_not_a_tool")]
     #[test_case("local_document_read" ; "removed_document_read")]
     #[test_case("local_document_write" ; "removed_document_write")]
+    #[test_case("code_context" ; "renamed_source_code_context")]
+    #[test_case("code_refs" ; "renamed_source_code_refs")]
     #[test_case("local_document_apply_patch" ; "removed_document_patch")]
     #[test_case("*" ; "bare_wildcard")]
     fn agent_disabled_tools_rejects_unknown_name(tool: &str) {

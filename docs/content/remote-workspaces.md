@@ -44,7 +44,7 @@ workcell-mcp /srv/workspaces \
   --transport http --http-bind loopback --port 3001 \
   --http-token-file /etc/workcell/token \
   --tool-group files --tool-group web --tool-group shell \
-  --tool-group python_execution --tool-group code_graph --tool-group transfer \
+  --tool-group python_execution --tool-group source_code --tool-group transfer \
   --allow-write --shell-policy /etc/workcell/shell-policy.toml \
   --remote-server-id dev-server \
   --remote-workspace-id dev-workspace \

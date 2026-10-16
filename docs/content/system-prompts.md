@@ -120,7 +120,7 @@ MCP selectors use `server.tool` names, with the server's configured name and the
 | --- | --- |
 | `web` | `websearch`, `webfetch` |
 | `files` | `file_read`, `file_write`, `file_edit`, `file_apply_patch`, `file_glob`, `file_grep`, `file_index` |
-| `code_graph` | `code_context`, `code_refs` |
+| `source_code` | `source_code_context`, `source_code_refs` |
 | `execution` | `shell`, `python_execution`, `execution_environment` |
 | `delegation` | `task`, `task_control`, `workflow` |
 | `support` | `batch`, `question`, `todo_write`, `plan` |

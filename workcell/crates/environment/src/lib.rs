@@ -81,7 +81,7 @@ pub struct ToolGroupDisclosure {
     pub web: bool,
     pub shell: bool,
     pub code: bool,
-    pub code_graph: bool,
+    pub source_code: bool,
 }
 
 pub type ExecutionEnvironment = ExecutionEnvironmentDisclosure;
@@ -681,13 +681,13 @@ fn output_schema() -> serde_json::Map<String, Value> {
             "toolGroups": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["files", "web", "shell", "code", "codeGraph"],
+                "required": ["files", "web", "shell", "code", "sourceCode"],
                 "properties": {
                     "files": {"type": "boolean"},
                     "web": {"type": "boolean"},
                     "shell": {"type": "boolean"},
                     "code": {"type": "boolean"},
-                    "codeGraph": {"type": "boolean"}
+                    "sourceCode": {"type": "boolean"}
                 }
             },
             "commands": {
@@ -1950,7 +1950,7 @@ mod tests {
             web: false,
             shell: true,
             code: false,
-            code_graph: true,
+            source_code: true,
         };
         let first = disclosure
             .call_tool(json!({}), groups, CancellationToken::new())
@@ -2016,7 +2016,7 @@ mod tests {
             web: false,
             shell: false,
             code: true,
-            code_graph: true,
+            source_code: true,
         };
         let permits = disclosure.refresh_gate.available_permits();
         let prepared = disclosure.prepare(groups);
@@ -2031,7 +2031,7 @@ mod tests {
             .expect("prepared inspection");
         assert!(result.output.tool_groups.files);
         assert!(result.output.tool_groups.code);
-        assert!(result.output.tool_groups.code_graph);
+        assert!(result.output.tool_groups.source_code);
         assert!(!result.output.tool_groups.web);
         assert!(!result.output.tool_groups.shell);
     }
@@ -2062,7 +2062,7 @@ mod tests {
     }
 
     // The output schema is hand-written beside structs that derive their own
-    // serialization, so the two drift the moment a field is added: codeGraph
+    // serialization, so the two drift the moment a field is added: sourceCode
     // shipped while the schema still closed toolGroups over the four groups
     // that preceded it, and because the object says additionalProperties:
     // false, every conformant MCP client rejected the tool's own result. A
@@ -2087,7 +2087,7 @@ mod tests {
             let serialized = object.keys().cloned().collect::<BTreeSet<_>>();
             if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
                 // Exactly what additionalProperties: false promises, and what
-                // codeGraph broke.
+                // sourceCode broke.
                 let declared = properties.keys().cloned().collect::<BTreeSet<_>>();
                 let undeclared = &serialized - &declared;
                 assert!(
@@ -2123,7 +2123,7 @@ mod tests {
             web: true,
             shell: true,
             code: true,
-            code_graph: true,
+            source_code: true,
         };
         walk(
             "output",
@@ -2140,7 +2140,7 @@ mod tests {
             web: false,
             shell: false,
             code: false,
-            code_graph: false,
+            source_code: false,
         };
         let first = snapshot.descriptor(groups);
         let second = snapshot.descriptor(groups);

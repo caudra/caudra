@@ -60,7 +60,7 @@ impl SymbolKind {
 
 /// What a reference capture found.
 ///
-/// The distinction is what lets `code_refs` name its counting unit honestly. Call references count
+/// The distinction is what lets `source_code_refs` name its counting unit honestly. Call references count
 /// as caller/callee pairs; the rest are use sites with their own `file:line`.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ReferenceKind {

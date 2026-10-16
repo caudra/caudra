@@ -27,10 +27,10 @@ comma := ,
 empty :=
 space := $(empty) $(empty)
 # Tool groups exposed by the `workcell` embedding facade, each gating one optional dependency.
-NATIVE_GROUPS := files files-index web shell code code-graph code-graph-git environment scm snapshots snapshot-store
+NATIVE_GROUPS := files files-index web shell code source-code-graph source-code-graph-git environment scm snapshots snapshot-store
 NATIVE_FEATURES := $(subst $(space),$(comma),$(NATIVE_GROUPS))
 # Tool crates that must compile with no MCP adapter, so native hosts never link a transport.
-NATIVE_CRATES := workcell-mcp-files workcell-mcp-web workcell-mcp-shell workcell-mcp-code workcell-mcp-code-graph workcell-environment workcell-workspace-scm workcell-workspace-snapshot workcell-snapshot-store
+NATIVE_CRATES := workcell-mcp-files workcell-mcp-web workcell-mcp-shell workcell-mcp-code workcell-mcp-source-code-graph workcell-environment workcell-workspace-scm workcell-workspace-snapshot workcell-snapshot-store
 
 help:
 	@printf '%s\n' \
@@ -162,11 +162,11 @@ test: code-worker test-optional-features
 # Optional features are dark to `--workspace` until something in the workspace turns them on, and a
 # feature nothing exercises is a feature nothing protects. These run the crates that carry one.
 test-optional-features:
-	$(CARGO) test --locked --package workcell-code-graph --features git
-	$(CARGO) clippy --locked --all-targets --package workcell-code-graph --features git \
+	$(CARGO) test --locked --package workcell-source-code-graph --features git
+	$(CARGO) clippy --locked --all-targets --package workcell-source-code-graph --features git \
 		-- -D warnings
-	$(CARGO) test --locked --package workcell-mcp-code-graph --features git
-	$(CARGO) clippy --locked --all-targets --package workcell-mcp-code-graph --features git \
+	$(CARGO) test --locked --package workcell-mcp-source-code-graph --features git
+	$(CARGO) clippy --locked --all-targets --package workcell-mcp-source-code-graph --features git \
 		-- -D warnings
 
 build:
@@ -226,13 +226,13 @@ docker-smoke: docker-build
 		'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"container-smoke","version":"1"}}}' \
 		'{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
 		'{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
-		'{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"code_map","arguments":{}}}' \
-		| $(DOCKER) run --rm --interactive "$(IMAGE):$(TAG)" --tool-group code_graph \
+		'{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"source_code_context","arguments":{"task":"workcell"}}}' \
+		| $(DOCKER) run --rm --interactive "$(IMAGE):$(TAG)" --tool-group source_code \
 			/usr/share/doc/workcell-mcp); \
-	printf '%s\n' "$$output" | grep -q '"name":"code_map"' \
-		|| { printf '%s\n' 'packaged code-graph catalog is incomplete'; exit 2; }; \
+	printf '%s\n' "$$output" | grep -q '"name":"source_code_refs"' \
+		|| { printf '%s\n' 'packaged source-code catalog is incomplete'; exit 2; }; \
 	printf '%s\n' "$$output" | grep -q '"graph":' \
-		|| { printf '%s\n' 'packaged code-graph execution failed'; exit 2; }
+		|| { printf '%s\n' 'packaged source-code execution failed'; exit 2; }
 
 docker-run:
 	@test -n "$(ROOT)" || { printf '%s\n' 'ROOT is required, for example: make docker-run ROOT=/absolute/workspace'; exit 2; }

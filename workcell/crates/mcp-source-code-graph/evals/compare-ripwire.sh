@@ -11,8 +11,8 @@
 # warm one and the comparison inverts. That is not hypothetical — it happened, and it reported a 27x
 # gap that did not exist.
 #
-#   cargo build --release --example graph_build_bench -p workcell-mcp-code-graph
-#   workcell/crates/mcp-code-graph/evals/compare-ripwire.sh <tree> [<tree> ...]
+#   cargo build --release --example graph_build_bench -p workcell-mcp-source-code-graph
+#   workcell/crates/mcp-source-code-graph/evals/compare-ripwire.sh <tree> [<tree> ...]
 #
 # RUNS=n overrides the repetition count. Medians are reported; a single run measures page-cache
 # state as much as anything else.
@@ -30,7 +30,7 @@ if ! command -v ripwire >/dev/null; then
 fi
 if [[ ! -x "$BENCH" ]]; then
   printf '%s\n' "$BENCH is missing; build it with:" >&2
-  printf '%s\n' '  cargo build --release --example graph_build_bench -p workcell-mcp-code-graph' >&2
+  printf '%s\n' '  cargo build --release --example graph_build_bench -p workcell-mcp-source-code-graph' >&2
   exit 2
 fi
 

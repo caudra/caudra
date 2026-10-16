@@ -21,7 +21,10 @@ pub const TOOL_POLICY_GROUPS: &[(ToolPolicyGroup, &[&str])] = &[
             "file_index",
         ],
     ),
-    (ToolPolicyGroup::CodeGraph, &["code_context", "code_refs"]),
+    (
+        ToolPolicyGroup::SourceCode,
+        &["source_code_context", "source_code_refs"],
+    ),
     (
         ToolPolicyGroup::Execution,
         &["shell", "python_execution", "execution_environment"],
@@ -53,7 +56,7 @@ const RESERVED_SELECTORS: &[&str] = &["tool_search", "report_to_parent", "struct
 pub enum ToolPolicyGroup {
     Web,
     Files,
-    CodeGraph,
+    SourceCode,
     Execution,
     Delegation,
     Support,
@@ -216,6 +219,8 @@ mod tests {
     #[test_case(r#"{"extra":true}"#, false; "unknown_field")]
     #[test_case(r#"{"groups":{"unknown":"eager"}}"#, false; "unknown_group")]
     #[test_case(r#"{"groups":{"documents":"eager"}}"#, false; "removed_document_group")]
+    #[test_case(r#"{"groups":{"source_code":"eager"}}"#, true; "source_code_group")]
+    #[test_case(r#"{"groups":{"code_graph":"eager"}}"#, false; "renamed_code_graph_group")]
     #[test_case(r#"{"groups":{"web":"inherit"}}"#, false; "entry_inherit")]
     #[test_case(r#"{"overrides":{"web*":"lazy"}}"#, false; "glob")]
     #[test_case(r#"{"overrides":{"a..b":"lazy"}}"#, false; "malformed_mcp")]
@@ -253,6 +258,8 @@ mod tests {
 
     #[test_case("local_document_read")]
     #[test_case("local_document_write")]
+    #[test_case("code_context")]
+    #[test_case("code_refs")]
     #[test_case("local_document_apply_patch")]
     fn removed_tools_have_no_builtin_binding(name: &str) {
         let policy: ProfileToolPolicy = serde_json::from_value(serde_json::json!({

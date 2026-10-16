@@ -1,5 +1,5 @@
 [package]
-name = "workcell-code-graph"
+name = "workcell-source-code-graph"
 description = "Symbol extraction, reference resolution, and ranking over a source tree"
 readme = "README.md"
 edition.workspace = true

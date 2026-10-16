@@ -5,7 +5,7 @@ parses with. It has no protocol dependency and no filesystem access: callers han
 extension and receive a language, a tree-sitter grammar, and a compiled tags query.
 
 Two consumers share it. `workcell-mcp-files` needs detection and a grammar for the `file_index` tool.
-`workcell-code-graph` additionally needs the tags query and the capture-role mapping. One table is
+`workcell-source-code-graph` additionally needs the tags query and the capture-role mapping. One table is
 what stops the two from disagreeing about what a `.tf` file is.
 
 ## Public API

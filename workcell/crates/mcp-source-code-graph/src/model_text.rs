@@ -15,7 +15,8 @@
 use std::borrow::Cow;
 
 use crate::types::{
-    CodeContextOutput, CodeRefsOutput, GraphSummary, RankedSymbol, ReferenceRow, SelectorRefusal,
+    GraphSummary, RankedSymbol, ReferenceRow, SelectorRefusal, SourceCodeContextOutput,
+    SourceCodeRefsOutput,
 };
 
 /// Renders the content block for a tool result.
@@ -86,7 +87,7 @@ fn symbol_line(symbol: &RankedSymbol) -> String {
 }
 
 /// A reference row: the symbol line, its hop when more than one was walked, and its call sites.
-fn reference_line(output: &CodeRefsOutput, row: &ReferenceRow) -> String {
+fn reference_line(output: &SourceCodeRefsOutput, row: &ReferenceRow) -> String {
     let mut line = symbol_line(&row.symbol);
     if output.depth > 1 {
         line = format!("hop {} {line}", row.hops);
@@ -109,7 +110,7 @@ const SYMBOL_LEGEND: &str = "name kind path:lines in=referencing out=referenced 
 const SITES_LEGEND: &str = "at=call-site lines, path:line in another file";
 const NAME_ONLY_LEGEND: &str = "~name=linked by name alone, the receiver's type was never seen";
 
-impl ModelText for CodeContextOutput {
+impl ModelText for SourceCodeContextOutput {
     fn model_text(&self) -> Cow<'_, str> {
         let mut lines = vec![
             format!(
@@ -137,7 +138,7 @@ impl ModelText for CodeContextOutput {
     }
 }
 
-impl ModelText for CodeRefsOutput {
+impl ModelText for SourceCodeRefsOutput {
     fn model_text(&self) -> Cow<'_, str> {
         let walked = self.depth > 1;
         let mut lines = Vec::new();
@@ -254,8 +255,8 @@ mod tests {
         }
     }
 
-    fn context(results: Vec<RankedSymbol>, graph: GraphSummary) -> CodeContextOutput {
-        CodeContextOutput {
+    fn context(results: Vec<RankedSymbol>, graph: GraphSummary) -> SourceCodeContextOutput {
+        SourceCodeContextOutput {
             task: "a task".to_owned(),
             path: ".".to_owned(),
             shape: "conceptual".to_owned(),
@@ -282,8 +283,8 @@ mod tests {
         }
     }
 
-    fn refs(references: Vec<ReferenceRow>, depth: usize) -> CodeRefsOutput {
-        CodeRefsOutput {
+    fn refs(references: Vec<ReferenceRow>, depth: usize) -> SourceCodeRefsOutput {
+        SourceCodeRefsOutput {
             symbol: "alpha".to_owned(),
             direction: Direction::Callers.name(),
             unit: Direction::Callers.unit(),

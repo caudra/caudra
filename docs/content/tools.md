@@ -165,7 +165,7 @@ The code tools and `file_index` read 37 languages and formats: Rust, Python, Typ
 
 Every count and reach set is a lower bound. A call made through dynamic dispatch, a callback, or a macro adds no edge, so a count of zero means that none was found. A symbol name that matches nothing is refused with up to five close matches to try.
 
-### `code_context` {#code_context}
+### `source_code_context` {#source_code_context}
 
 Return the symbols worth reading before making a specific change. Describe the change in your own words.
 
@@ -175,7 +175,7 @@ Return the symbols worth reading before making a specific change. Describe the c
 | `path` | string | no | Root-relative subdirectory to scope the graph to. Absent means the whole configured root, and an empty string is the same as absent. |
 | `limit` | integer | no | Maximum rows to return. Narrows the result; it can never widen it past the host ceiling. |
 
-### `code_refs` {#code_refs}
+### `source_code_refs` {#source_code_refs}
 
 List what calls a symbol and from which lines, or what it calls. With `depth`, show what a change to it could reach and which tests already cover it. Use it instead of grep for a symbol's callers and call sites.
 

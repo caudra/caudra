@@ -1,4 +1,4 @@
-//! Wall-clock harness for one graph build over a real tree, measured through a `code_context` call.
+//! Wall-clock harness for one graph build over a real tree, measured through a `source_code_context` call.
 //!
 //! Exists to be compared against the upstream `ripwire <dir>` binary this group was ported from,
 //! whose default run builds and ranks the same graph.
@@ -18,7 +18,7 @@
 
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
-use workcell_mcp_code_graph::{CodeContextInput, CodeGraphToolGroup, ModelText};
+use workcell_mcp_source_code_graph::{ModelText, SourceCodeContextInput, SourceCodeGraphToolGroup};
 
 const BENCH_TASK: &str = "where is the call graph ranked";
 
@@ -39,20 +39,20 @@ async fn main() {
     let mut summary = String::new();
     for _ in 0..runs {
         let started = Instant::now();
-        let group = CodeGraphToolGroup::new(&root, None)
+        let group = SourceCodeGraphToolGroup::new(&root, None)
             .await
-            .expect("build code graph group");
+            .expect("build source-code graph group");
         let output = group
-            .code_context(
-                CodeContextInput {
+            .source_code_context(
+                SourceCodeContextInput {
                     task: BENCH_TASK.to_owned(),
-                    ..CodeContextInput::default()
+                    ..SourceCodeContextInput::default()
                 },
                 None,
                 &token,
             )
             .await
-            .expect("code_context");
+            .expect("source_code_context");
         elapsed.push(started.elapsed());
         rendered = output.model_text().len();
         summary = format!("{:?}", output.graph);

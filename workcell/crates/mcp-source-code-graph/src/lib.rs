@@ -4,8 +4,8 @@
 //!
 //! | Tool | Answers |
 //! | --- | --- |
-//! | `code_context` | what should I read before making this change |
-//! | `code_refs` | what calls this and from which lines, what does it call, and with `depth` what a change reaches and which tests cover it |
+//! | `source_code_context` | what should I read before making this change |
+//! | `source_code_refs` | what calls this and from which lines, what does it call, and with `depth` what a change reaches and which tests cover it |
 //!
 //! # What the graph is not
 //!
@@ -35,16 +35,17 @@ pub use bound::{RAW_RESULT_CEILING_BYTES, Shrinkable, fit};
 pub use catalog::catalog;
 pub use catalog::specs;
 pub use crawl::{CrawlSkip, CrawlTruncation, Crawled, crawl, crawl_filesystem_limits};
-pub use engine::{CodeGraph, estimate_tokens};
-pub use error::CodeGraphError;
-pub use group::{CodeGraphToolGroup, PreparedCodeContext, PreparedCodeRefs};
-pub use limits::CodeGraphLimits;
+pub use engine::{SourceCodeGraph, estimate_tokens};
+pub use error::SourceCodeGraphError;
+pub use group::{PreparedSourceCodeContext, PreparedSourceCodeRefs, SourceCodeGraphToolGroup};
+pub use limits::SourceCodeGraphLimits;
 pub use model_text::ModelText;
 pub use progress::{
     GraphPhase, GraphProgress, GraphProgressSink, PROGRESS_FILE_INTERVAL, PhaseNotifier,
 };
 pub use types::{
-    CodeContextInput, CodeContextOutput, CodeRefsInput, CodeRefsOutput, Direction, GraphSummary,
-    RankedSymbol, ReferenceRow, SelectorRefusal, SiteRef, SymbolRef, site_label,
+    Direction, GraphSummary, RankedSymbol, ReferenceRow, SelectorRefusal, SiteRef,
+    SourceCodeContextInput, SourceCodeContextOutput, SourceCodeRefsInput, SourceCodeRefsOutput,
+    SymbolRef, site_label,
 };
 pub use workcell_tool_contract::{ToolAnnotations, ToolSpec};

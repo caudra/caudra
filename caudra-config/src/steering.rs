@@ -274,7 +274,7 @@ rules! {
     tool_planning: ToolPlanningConfig => ToolPlanningPolicy,
         "Advise after consecutive failed tool attempts across responses, including attempts with different tools or inputs. Any successful tool result ends the failure episode. Repeating a successful call is insufficient.";
     relative_paths: RelativePathsConfig => RelativePathsPolicy,
-        "Suggest up to two shorter relative forms when file, patch, code-graph, or shell `workdir` paths spell out the working directory or its parent. The hint appears once per context.";
+        "Suggest up to two shorter relative forms when file, patch, source-code, or shell `workdir` paths spell out the working directory or its parent. The hint appears once per context.";
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

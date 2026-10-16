@@ -160,7 +160,7 @@ Each run writes its report to `target/model-watch/<date>.md` in the worktree and
 
 ## Working on Workcell
 
-The file, shell, web, Python, and code-graph tools come from [Workcell](https://github.com/caudra/caudra/tree/main/workcell). Its crates live under `workcell/` as local members of this Rust workspace and share the root `Cargo.lock`.
+The file, shell, web, Python, and source-code tools come from [Workcell](https://github.com/caudra/caudra/tree/main/workcell). Its crates live under `workcell/` as local members of this Rust workspace and share the root `Cargo.lock`.
 
 Edit Workcell in this checkout and use the same Cargo and Make commands as for Caudra. For example, check the adapter after a tool change:
 

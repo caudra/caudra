@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::{
     model_text::ModelText,
-    types::{CodeContextOutput, CodeRefsOutput},
+    types::{SourceCodeContextOutput, SourceCodeRefsOutput},
 };
 
 /// Largest raw result any host will emit, in bytes.
@@ -32,7 +32,7 @@ pub trait Shrinkable {
     fn retain_prefix(&mut self, retained: usize);
 }
 
-impl Shrinkable for CodeContextOutput {
+impl Shrinkable for SourceCodeContextOutput {
     fn rows(&self) -> usize {
         self.results.len()
     }
@@ -43,7 +43,7 @@ impl Shrinkable for CodeContextOutput {
     }
 }
 
-impl Shrinkable for CodeRefsOutput {
+impl Shrinkable for SourceCodeRefsOutput {
     fn rows(&self) -> usize {
         self.references.len()
     }
@@ -129,7 +129,7 @@ mod tests {
     use super::*;
     use crate::types::{GraphSummary, RankedSymbol};
 
-    fn wide_context(rows: usize) -> CodeContextOutput {
+    fn wide_context(rows: usize) -> SourceCodeContextOutput {
         let results: Vec<RankedSymbol> = (0..rows)
             .map(|index| RankedSymbol {
                 name: format!("a_symbol_with_a_reasonably_long_name_{index}"),
@@ -143,7 +143,7 @@ mod tests {
                 test_scope: false,
             })
             .collect();
-        CodeContextOutput {
+        SourceCodeContextOutput {
             task: "a task".to_owned(),
             path: ".".to_owned(),
             shape: "conceptual".to_owned(),

@@ -1,21 +1,21 @@
-# workcell-mcp-code-graph
+# workcell-mcp-source-code-graph
 
-`workcell-mcp-code-graph` is Workcell's repository-scale code tool group: two tools over one graph
+`workcell-mcp-source-code-graph` is Workcell's repository-scale code tool group: two tools over one graph
 built from a confined source tree.
 
 | Tool | Answers |
 | --- | --- |
-| `code_context` | what should I read before making this change |
-| `code_refs` | what calls this and from which lines, what does it call, and with `depth` what a change reaches and which tests cover it |
+| `source_code_context` | what should I read before making this change |
+| `source_code_refs` | what calls this and from which lines, what does it call, and with `depth` what a change reaches and which tests cover it |
 
-The ranking engine lives in `workcell-code-graph`. This crate owns the crawl, the tool schemas, the
+The ranking engine lives in `workcell-source-code-graph`. This crate owns the crawl, the tool schemas, the
 result shaping, and the MCP projection.
 
 ## Confinement
 
 This crate never opens a path. It is constructed over a `workcell-mcp-files` group and every read
 goes through it, so there is exactly one path resolver and one confinement implementation in the
-process. `CodeGraphToolGroup::from_files` shares a group a host already built rather than creating a
+process. `SourceCodeGraphToolGroup::from_files` shares a group a host already built rather than creating a
 second one with possibly different confinement, which would be two answers to one authorization
 question.
 
@@ -28,14 +28,14 @@ Call edges are recovered from source text by name, so every count is a **floor**
 field, not only a sentence in a description:
 
 - `complete` / `truncated_by` — which bound fired, named, when one did.
-- `confidence` on `code_context` — derived from how far the top result separates from the rest. A
+- `confidence` on `source_code_context` — derived from how far the top result separates from the rest. A
   measure of separation, never a claim of correctness; a single result is always low.
 - `SelectorRefusal` — an unknown symbol is refused with did-you-mean candidates, not answered with
   zero. A symbol that exists and has no callers returns zero. The two are different answers.
 - `ambiguous` — a name matching several definitions returns their union and says so, rather than
   silently picking one.
 - `declined` — a call whose receiver or path names a type outside the tree is never linked to an
-  in-tree symbol that shares its name, and `code_refs` says how many such calls it left out.
+  in-tree symbol that shares its name, and `source_code_refs` says how many such calls it left out.
 - `nameOnly` — a link made by name alone, because the receiver's type was never seen. It is listed
   but never moves a ranking.
 
@@ -52,8 +52,8 @@ estimated.
 `evals/compare-ripwire.sh` runs it beside the upstream binary:
 
 ```bash
-cargo build --release --example graph_build_bench -p workcell-mcp-code-graph
-crates/mcp-code-graph/evals/compare-ripwire.sh <tree> [<tree> ...]
+cargo build --release --example graph_build_bench -p workcell-mcp-source-code-graph
+crates/mcp-source-code-graph/evals/compare-ripwire.sh <tree> [<tree> ...]
 ```
 
 The upstream `ripwire` binary keeps an **on-disk cache** under `/tmp/ripwire-<uid>`, so its second run

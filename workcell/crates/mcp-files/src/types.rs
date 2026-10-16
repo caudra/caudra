@@ -56,7 +56,7 @@ pub struct FilesystemLimits {
     pub honor_gitignore: bool,
     /// Whether broad traversal stops at a directory that is itself a repository.
     ///
-    /// Off by default. The code graph turns it on because a vendored repository's symbols compete
+    /// Off by default. The source-code graph turns it on because a vendored repository's symbols compete
     /// with the host project's in one rank vector; a text search has no such problem and keeps
     /// descending.
     pub prune_nested_repositories: bool,

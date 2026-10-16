@@ -329,13 +329,13 @@ const READ_RESULT_KEYS: &[&str] = &["offset", "limit"];
 const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdx"];
 /// The tools whose header leads with a literal the model wrote, and the input
 /// key it wrote it under. One key per tool: a grep writes a pattern, a
-/// code-graph lookup writes a symbol or a whole task.
+/// source-code lookup writes a symbol or a whole task.
 const QUERY_KEYS: &[(&str, &str)] = &[
     ("file_grep", "pattern"),
     ("file_glob", "pattern"),
     (TOOL_OUTPUT_TOOL_NAME, "pattern"),
-    ("code_context", "task"),
-    ("code_refs", "symbol"),
+    ("source_code_context", "task"),
+    ("source_code_refs", "symbol"),
 ];
 const SHELL_COMMAND_KEY: &str = "command";
 /// The tools whose streaming body is a source the call carries entire rather
@@ -514,7 +514,7 @@ const MEMORY_COMMANDS: &[(&str, Inflection)] = &[
 /// A sigil names its tool, because the label beside it already names the
 /// operation: family-coding both spends the only per-tool identifier on what
 /// the row repeats two columns right. Families survive only where the tools
-/// really are one tool with several verbs — the code graph, the two stores,
+/// really are one tool with several verbs — the source-code graph, the two stores,
 /// and the cold members of read and write.
 const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     tool_row("file_read", '→', READ, &["file_path"]),
@@ -529,8 +529,8 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     tool_row(TOOL_OUTPUT_TOOL_NAME, '↩', RETRIEVE, &[]),
     tool_row("shell", '$', RUN, &["command", "timeoutSec", "workdir"]),
     tool_row("python_execution", 'λ', COMPUTE, &["code", "timeoutSec"]),
-    tool_row("code_context", '◇', LOCATE, &["task", "path"]),
-    tool_row("code_refs", '◇', TRACE, &["symbol", "path"]),
+    tool_row("source_code_context", '◇', LOCATE, &["task", "path"]),
+    tool_row("source_code_refs", '◇', TRACE, &["symbol", "path"]),
     tool_row("execution_environment", '⌂', INSPECT, &[]),
     tool_row("task", '❖', DELEGATE, &["prompt", "description"]),
     tool_row("batch", '⇶', BATCH, &["invocations"]),
@@ -1565,14 +1565,14 @@ fn same_syntax_output(left: &ToolOutput, right: &ToolOutput) -> bool {
             }),
         ) => (ll, lr) == (rl, rr),
         (
-            ToolOutput::CodeGraph {
+            ToolOutput::SourceCodeGraph {
                 headline: lh,
                 rows: lr,
                 source: ls,
                 footer: lf,
                 ..
             },
-            ToolOutput::CodeGraph {
+            ToolOutput::SourceCodeGraph {
                 headline: rh,
                 rows: rr,
                 source: rs,
@@ -7395,7 +7395,7 @@ mod tests {
     const SIGIL_WIDTH_MSG: &str =
         "a sigil holds one cell, or every label behind it sits a column out";
     const SIGIL_CLASH_MSG: &str = "two tools sharing a sigil is a family, and a family is declared";
-    /// The sigils a family deliberately shares: the code graph is one tool with
+    /// The sigils a family deliberately shares: the source-code graph is one tool with
     /// five verbs, the stores are one store with two, and read, write and patch
     /// each keep the cold members whose operation really is the same. Patching
     /// a document is patching a file that happens to live in a remote store.

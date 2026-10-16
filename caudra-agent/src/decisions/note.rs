@@ -341,7 +341,7 @@ mod tests {
 
     fn note(summary: &str, details: Vec<String>) -> DecisionNote {
         DecisionNote::new(
-            DecisionFeature::CodeContext,
+            DecisionFeature::SourceCodeContext,
             FeatureMode::Enforce,
             NoteOutcome::Acted,
             summary,
@@ -416,7 +416,7 @@ mod tests {
         agent: Option<&str>,
     ) {
         let note = DecisionNote::new(
-            DecisionFeature::CodeContext,
+            DecisionFeature::SourceCodeContext,
             FeatureMode::Shadow,
             NoteOutcome::Shadow,
             SUMMARY,
@@ -431,7 +431,7 @@ mod tests {
             StoredEngineDecision {
                 seq: UNASSIGNED_SEQ,
                 at_ms: AT_MS,
-                feature: DecisionFeature::CodeContext.name().into(),
+                feature: DecisionFeature::SourceCodeContext.name().into(),
                 mode: FeatureMode::Shadow.as_str().into(),
                 outcome: StoredDecisionOutcome::Shadow,
                 summary: SUMMARY.into(),

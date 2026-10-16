@@ -6,9 +6,9 @@
 
 use workcell_mcp_files::FilesystemError;
 
-/// Why a code-graph call could not be answered.
+/// Why a source-code-graph call could not be answered.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum CodeGraphError {
+pub enum SourceCodeGraphError {
     /// Confinement or a protected path refused the request.
     #[error("{0}")]
     Denied(String),
@@ -23,7 +23,7 @@ pub enum CodeGraphError {
     Internal(&'static str),
 }
 
-impl CodeGraphError {
+impl SourceCodeGraphError {
     /// A stable category name, for a host that branches on the class rather than the text.
     #[must_use]
     pub const fn kind(&self) -> &'static str {
@@ -40,7 +40,7 @@ impl CodeGraphError {
     }
 }
 
-impl From<FilesystemError> for CodeGraphError {
+impl From<FilesystemError> for SourceCodeGraphError {
     fn from(error: FilesystemError) -> Self {
         match error {
             FilesystemError::Aborted => Self::Aborted,

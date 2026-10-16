@@ -34,7 +34,10 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "view_image",
         ],
     ),
-    (CODE_INTELLIGENCE, &["code_context", "code_refs"]),
+    (
+        CODE_INTELLIGENCE,
+        &["source_code_context", "source_code_refs"],
+    ),
     (
         "Execution & Control",
         &[

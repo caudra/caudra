@@ -28,7 +28,7 @@ const RELEVANCE: Relevance = Relevance {
     unrelated: "It only shares words with the task, or sits in an unrelated part of the code.",
 };
 
-/// One `code_context` row as the decision engine sees it: where the symbol
+/// One `source_code_context` row as the decision engine sees it: where the symbol
 /// is and how connected it is, never its source.
 pub struct CodeSymbol<'a> {
     pub name: &'a str,
@@ -45,7 +45,7 @@ pub struct CodeSymbol<'a> {
 /// rest of that head in its original order. Nothing is dropped and later rows
 /// never move. Returns the note for the model when the order changed, and the
 /// transcript row for a move, a shadow move or a fresh failure.
-pub async fn rerank_code_context<T>(
+pub async fn rerank_source_code_context<T>(
     rows: &mut Vec<T>,
     describe: impl Fn(&T) -> CodeSymbol<'_>,
     task: &str,
@@ -55,7 +55,7 @@ pub async fn rerank_code_context<T>(
     cancel: &CancelToken,
 ) -> (Option<String>, Option<NoteDraft>) {
     let head = rows.len().min(MAX_RERANK_BATCH);
-    let feature = DecisionFeature::CodeContext;
+    let feature = DecisionFeature::SourceCodeContext;
     let Some(floor) = feature
         .rerank_threshold(&decisions.config().thresholds)
         .filter(|_| head >= MIN_RERANKED_ROWS)
@@ -121,8 +121,8 @@ pub async fn rerank_code_context<T>(
 
 /// The row for a rerank the call's own deadline cut short, reported like an
 /// engine failure: once, until the feature answers again.
-pub fn code_context_out_of_deadline(decisions: &Decisions) -> Option<NoteDraft> {
-    let feature = DecisionFeature::CodeContext;
+pub fn source_code_context_out_of_deadline(decisions: &Decisions) -> Option<NoteDraft> {
+    let feature = DecisionFeature::SourceCodeContext;
     let applied = matches!(
         decisions.mode(&feature),
         FeatureMode::Advise | FeatureMode::Enforce
@@ -133,7 +133,7 @@ pub fn code_context_out_of_deadline(decisions: &Decisions) -> Option<NoteDraft> 
 
 pub fn reordered_note(rows: usize) -> String {
     format!(
-        "[The first {rows} rows were reordered by decision-engine relevance to the task; the confidence above describes the code graph's own ranking.]"
+        "[The first {rows} rows were reordered by decision-engine relevance to the task; the confidence above describes the source-code graph's own ranking.]"
     )
 }
 
@@ -166,8 +166,8 @@ mod tests {
 
     use super::{
         CALLEES_KEY, CALLERS_KEY, CodeSymbol, KEPT_WORKCELL_ORDER, KIND_KEY, LINES_KEY,
-        MAX_RERANK_BATCH, OUT_OF_DEADLINE, PATH_KEY, SYMBOL_KEY, TASK_KEY,
-        code_context_out_of_deadline, reordered_note, rerank_code_context,
+        MAX_RERANK_BATCH, OUT_OF_DEADLINE, PATH_KEY, SYMBOL_KEY, TASK_KEY, reordered_note,
+        rerank_source_code_context, source_code_context_out_of_deadline,
     };
     use crate::CancelToken;
     use crate::decisions::rerank::CANDIDATE_KEY;
@@ -242,7 +242,7 @@ mod tests {
                 base_url: Some(BASE_URL.parse().unwrap()),
                 ..Default::default()
             };
-            config.features.code_context = mode;
+            config.features.source_code_context = mode;
             config.thresholds.relevance_floor = FLOOR;
             let requests = Arc::new(Mutex::new(Vec::new()));
             let decisions = Decisions::with_engine(
@@ -268,7 +268,7 @@ mod tests {
             task: &str,
             cancel: &CancelToken,
         ) -> (Option<String>, Option<NoteDraft>) {
-            smol::block_on(rerank_code_context(
+            smol::block_on(rerank_source_code_context(
                 rows,
                 |name| CodeSymbol {
                     name,
@@ -398,10 +398,10 @@ mod tests {
         expected: &[Option<NoteOutcome>],
     ) {
         let fixture = Fixture::new(mode, &[(3, 0.9)], false);
-        let first = code_context_out_of_deadline(&fixture.decisions);
-        let second = code_context_out_of_deadline(&fixture.decisions);
+        let first = source_code_context_out_of_deadline(&fixture.decisions);
+        let second = source_code_context_out_of_deadline(&fixture.decisions);
         fixture.rerank(&mut rows(SHORT), TASK, &CancelToken::none());
-        let after_an_answer = code_context_out_of_deadline(&fixture.decisions);
+        let after_an_answer = source_code_context_out_of_deadline(&fixture.decisions);
         let outcomes: Vec<Option<NoteOutcome>> = [&first, &second, &after_an_answer]
             .map(|row| row.as_ref().map(|row| row.outcome))
             .into();

@@ -664,7 +664,7 @@ Names-only browsing has its own `FilesystemBrowse` authority:
 | `file_read` on a directory | `List`, direct entries in that directory |
 | `file_glob` | Recursive filename enumeration under its root |
 | `file_read` on a file | File content read, outside the browse family |
-| `file_grep`, `file_index`, code-graph tools | Content search or analysis, outside the browse family |
+| `file_grep`, `file_index`, source-code tools | Content search or analysis, outside the browse family |
 
 `List names in this directory` covers only the exact directory's direct entries. `Browse names below this directory` explicitly permits recursive filename enumeration, including `file_glob` with other filename patterns. It also covers directory listings below the approved root. Neither choice permits reading file contents, content search, writes, or shell execution. Protected paths and symlink boundaries remain checked.
 
@@ -861,7 +861,7 @@ The [reranking features](/docs/configuration/#reranking) order or annotate memor
 
 #### Decision rows in the transcript
 
-When a decision feature changes what happens, the transcript shows one dim row that names the feature by its configuration key and says what it did, such as `code_context · moved 3 of 12 rows up` or `goal_prescreen · skipped the goal check`. A row about a tool call sits right after its card, and a row about a turn, such as a memory recall, a skill suggestion, or a compaction, sits where the turn reached it. Subagents' rows appear in their own transcripts. Click a row to see what it was based on: each candidate or value with its score and what became of it. Rows hold names, positions, and scores only, never the state or the candidate text sent to the engine, and any command text in them is redacted.
+When a decision feature changes what happens, the transcript shows one dim row that names the feature by its configuration key and says what it did, such as `source_code_context · moved 3 of 12 rows up` or `goal_prescreen · skipped the goal check`. A row about a tool call sits right after its card, and a row about a turn, such as a memory recall, a skill suggestion, or a compaction, sits where the turn reached it. Subagents' rows appear in their own transcripts. Click a row to see what it was based on: each candidate or value with its score and what became of it. Rows hold names, positions, and scores only, never the state or the candidate text sent to the engine, and any command text in them is redacted.
 
 A feature in `shadow` mode shows a row marked `shadow` with what it would have done, and changes nothing. When an enabled feature's call fails or times out, a warning row says the default applied. It appears once per feature, until the engine answers that feature again, so an engine that stays down does not fill the transcript. Cancelled calls, calls made stale by a mode or configuration change, and answers that changed nothing show no row. Permission advice stays in the permission prompt, and workflow `decide()` and `rerank()` calls show in the [workflow inspector](/docs/workflows/).
 

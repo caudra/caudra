@@ -553,7 +553,7 @@ Recovery and advisory budgets are separate. Advisory rules allow at most 4 total
 
 Tool-planning evidence starts after the last response containing any successful tool result, including results outside the retained batch window. A background admission ends the failure episode without proving that the background work succeeded. Later terminal outcomes do not retroactively change that admission into a failed attempt.
 
-Relative-path evidence is the latest response only, and the hint yields to repetition and tool-planning advisories. While an earlier hint remains in context, even across user turns, no new hint is added. Once compaction removes it, another hint appears only if a later response uses absolute paths again. A suggestion climbs at most one directory with `../`. Local sessions get suggestions only when the working directory the model sees is the canonical project path. Remote workspaces, sandboxes, and code-graph scopes get suggestions inside the working directory only. Paths with backticks, angle brackets, control characters, or invisible Unicode formatting characters are never quoted. Caudra never rewrites the paths a model sends.
+Relative-path evidence is the latest response only, and the hint yields to repetition and tool-planning advisories. While an earlier hint remains in context, even across user turns, no new hint is added. Once compaction removes it, another hint appears only if a later response uses absolute paths again. A suggestion climbs at most one directory with `../`. Local sessions get suggestions only when the working directory the model sees is the canonical project path. Remote workspaces, sandboxes, and source-code scopes get suggestions inside the working directory only. Paths with backticks, angle brackets, control characters, or invisible Unicode formatting characters are never quoted. Caudra never rewrites the paths a model sends.
 
 An empty-response episode lives in the transcript tail, so it survives a restore and a new invocation. A message typed into a stall is answered, but it does not refill the budget: only a response carrying a tool call or visible text ends the episode. `max_stalled_turns` bounds the turns that interleaved rules spend between them, independently of any single rule's allowance.
 
@@ -826,7 +826,7 @@ fn write_decisions_section(out: &mut String) {
          answers, and scores below the threshold leave the reply unchanged.\n\n\
          #### Reranking\n\n\
          Tool search, `memory_search`, `memory_recall`, `memory_duplicates`, `compaction_retention`, \
-         `output_pointers`, and `code_context` use the engine as a reranker. A cheap first pass, such \
+         `output_pointers`, and `source_code_context` use the engine as a reranker. A cheap first pass, such \
          as keyword matching, picks the candidates. The engine then answers one true or false \
          relevance question per candidate, and Caudra orders, prunes, or names candidates by the \
          probability it returns. The feature table above lists what each one sends.\n\n\
@@ -836,7 +836,7 @@ fn write_decisions_section(out: &mut String) {
          data rather than instructions. The request state, such as the query, task, or goal, stays \
          within the 1,500-byte state limit.\n\n\
          Enforcing features compare each probability with `thresholds.relevance_floor` (default \
-         `0.1`). Tool search and `code_context` only reorder, putting candidates at or above the \
+         `0.1`). Tool search and `source_code_context` only reorder, putting candidates at or above the \
          floor first. `memory_search` omits matches below the floor and names them. \
          `compaction_retention` keeps the same number of tool results as without the engine, \
          choosing them by relevance, and never drops a result it could not otherwise drop. Advisory \

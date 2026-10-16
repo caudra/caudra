@@ -1535,7 +1535,7 @@ mod tests {
     /// rewritten anywhere; a name that is also an English word only when fenced.
     #[test_case("use file_read now", "use mcp_File_read now" ; "bare_compound_name")]
     #[test_case("`file_read`", "`mcp_File_read`" ; "fenced_compound_name")]
-    #[test_case("see code_refs.", "see mcp_Code_refs." ; "trailing_punctuation")]
+    #[test_case("see source_code_refs.", "see mcp_Source_code_refs." ; "trailing_punctuation")]
     #[test_case("file_reader", "file_reader" ; "longer_word_is_not_a_mention")]
     #[test_case("my_file_read", "my_file_read" ; "suffix_is_not_a_mention")]
     #[test_case("a shell command pipeline", "a shell command pipeline" ; "english_word_survives")]
@@ -1549,7 +1549,10 @@ mod tests {
     fn tool_mentions_rewrite_by_fencing(text: &str, expected: &str) {
         let renames = HashMap::from([
             ("file_read".to_string(), "mcp_File_read".to_string()),
-            ("code_refs".to_string(), "mcp_Code_refs".to_string()),
+            (
+                "source_code_refs".to_string(),
+                "mcp_Source_code_refs".to_string(),
+            ),
             ("shell".to_string(), "mcp_Shell".to_string()),
             ("automation".to_string(), "mcp_Automation".to_string()),
         ]);

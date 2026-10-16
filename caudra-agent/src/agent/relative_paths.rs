@@ -30,13 +30,13 @@ const TOOLS: &[(&str, Argument)] = &[
     ("file_index", Argument::Path(PATH)),
     ("file_apply_patch", Argument::Patch),
     ("shell", Argument::Path(WORKDIR)),
-    ("code_context", Argument::Scope(PATH)),
-    ("code_refs", Argument::Scope(PATH)),
+    ("source_code_context", Argument::Scope(PATH)),
+    ("source_code_refs", Argument::Scope(PATH)),
 ];
 
 enum Argument {
     Path(&'static str),
-    /// A code-graph scope is root-relative, so it never reaches above the root.
+    /// A source-code scope is root-relative, so it never reaches above the root.
     Scope(&'static str),
     Patch,
 }
@@ -191,8 +191,8 @@ mod tests {
     #[test_case("file_glob", json!({"pattern": "*", "path": ABOVE}), true, &[".."]; "parent")]
     #[test_case("file_read", json!({"filePath": TWO_UP}), true, &[]; "two_levels_up")]
     #[test_case("file_edit", json!({"filePath": SIBLING}), false, &[]; "parent_disallowed")]
-    #[test_case("code_context", json!({"task": "run", "path": SIBLING}), true, &[]; "code_graph_stays_inside")]
-    #[test_case("code_refs", json!({"symbol": "run", "path": INSIDE}), true, &[INSIDE_RELATIVE]; "code_graph_inside")]
+    #[test_case("source_code_context", json!({"task": "run", "path": SIBLING}), true, &[]; "source_code_graph_stays_inside")]
+    #[test_case("source_code_refs", json!({"symbol": "run", "path": INSIDE}), true, &[INSIDE_RELATIVE]; "source_code_graph_inside")]
     #[test_case("file_write", json!({"filePath": LOOKALIKE}), true, &[LOOKALIKE_RELATIVE]; "component_boundary")]
     #[test_case("file_write", json!({"filePath": LOOKALIKE}), false, &[]; "component_boundary_inside_only")]
     #[test_case("file_index", json!({"path": REDUNDANT}), true, &["caudra-agent/src"]; "redundant_components")]

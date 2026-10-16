@@ -7,15 +7,15 @@
 //! contract changes; do not relax this assertion to make a diff pass.
 
 use serde_json::Value;
-use workcell_mcp_code_graph::{catalog, specs};
+use workcell_mcp_source_code_graph::{catalog, specs};
 
 #[test]
 fn matches_the_committed_catalog_fixture() {
     let fixture: Value = serde_json::from_str(include_str!(
-        "../../../fixtures/mcp-conformance/catalog/v1/code-graph-tools.json"
+        "../../../fixtures/mcp-conformance/catalog/v1/source-code-graph-tools.json"
     ))
-    .expect("code graph catalog fixture");
-    let actual = serde_json::to_value(catalog()).expect("serialize code graph catalog");
+    .expect("source-code graph catalog fixture");
+    let actual = serde_json::to_value(catalog()).expect("serialize source-code graph catalog");
     assert_eq!(actual, fixture["expected"]["tools"]);
 }
 
@@ -32,7 +32,7 @@ fn the_mcp_projection_covers_every_neutral_spec_in_order() {
         .map(|spec| spec.name.to_string())
         .collect::<Vec<_>>();
     assert_eq!(names, neutral);
-    assert_eq!(names, ["code_context", "code_refs"]);
+    assert_eq!(names, ["source_code_context", "source_code_refs"]);
 }
 
 /// Every description has to state the floor property, because a caller that reads a count as exact

@@ -51,6 +51,9 @@ use serde_json::Value;
 use tempfile::NamedTempFile;
 use tracing::warn;
 
+#[path = "source_code_rename.rs"]
+mod source_code_rename;
+
 use super::change_stores::{ChangeStores, registered_change_stores, release_everywhere};
 use super::lease::{SessionLease, held_session_ids};
 use super::progress::{MIGRATION, MigrationEvent, PRUNE, PruneEvent};
@@ -86,7 +89,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.db";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.db.lock";
 
-const SCHEMA_VERSION: i64 = 28;
+const SCHEMA_VERSION: i64 = 29;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -796,6 +799,11 @@ const MIGRATIONS: &[Migration] = &[
         from: 27,
         to: 28,
         sql: crate::goal_log::TABLES,
+    },
+    Migration {
+        from: 28,
+        to: 29,
+        sql: source_code_rename::COLUMN_RENAMES,
     },
 ];
 
@@ -5269,6 +5277,9 @@ fn migrate_to_current(
         if step.to == 19 {
             transaction.execute_batch(crate::decision_log::SCHEMA)?;
         }
+        if step.to == 29 {
+            source_code_rename::rewrite_stored(&transaction)?;
+        }
         transaction.pragma_update(None, "user_version", step.to)?;
         transaction.commit()?;
         current = step.to;
@@ -6791,6 +6802,10 @@ mod tests {
     const AUTOPILOT_AUDIT_PREVIOUS_SCHEMA: i64 = 26;
     const GOAL_LOG_DOWNGRADE: &str = "DROP TABLE goal_evaluations; DROP TABLE goals;";
     const GOAL_LOG_PREVIOUS_SCHEMA: i64 = 27;
+    const SOURCE_CODE_PREVIOUS_SCHEMA: i64 = 28;
+    const MIGRATION_RENAMES_SOURCE_CODE: &str =
+        "schema 29 must move every stored code-graph tool name to its source-code name";
+    const MIGRATION_KEEPS_RETIRED: &str = "a retired tool's rows must stay byte-identical";
     const AUDIT_SEQ: u64 = 7;
     const AUDIT_KIND: &str = "permission";
     const AUDIT_ACTION: &str = "allow";
@@ -11908,6 +11923,259 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
                 .unwrap()
                 .is_empty()
         );
+        let (_fresh_temp, fresh_state) = state_dir();
+        let fresh = SessionDatabase::open_state(&fresh_state).unwrap();
+        assert_eq!(
+            schema_objects(&migrated),
+            schema_objects(&fresh),
+            "{MIGRATED_MATCHES_FRESH}"
+        );
+    }
+
+    #[test]
+    fn source_code_rename_migrates_every_stored_name_from_schema_twenty_eight() {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open_state(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        let id = session.id.as_bytes().to_vec();
+        let history = [
+            json!({"type": "tool_call", "name": "code_refs", "input": {"symbol": "code_refs"}}),
+            json!({"type": "tool_call", "name": "batch", "input": {"tool_calls": [
+                {"tool": "code_context", "parameters": {"task": "x"}},
+                {"tool": "code_map"},
+            ]}}),
+            json!({"type": "tool_call", "name": "code_map", "input": {}}),
+        ];
+        let outputs = [
+            (
+                "refs",
+                json!({"CodeGraph": {"headline": "callers", "rows": []}}),
+            ),
+            (
+                "batch",
+                json!({"Batch": {"entries": [
+                    {"tool": "code_refs", "output": {"CodeGraph": {"rows": []}}},
+                ], "text": ""}}),
+            ),
+            ("plain", json!({"Plain": {"text": "code_refs"}})),
+        ];
+        let rules = json!([{
+            "rule": {"subject": {"kind": "native", "owner": "workcell", "contract": "code.refs.v1"}},
+            "review": {"tool": "code_refs"},
+        }, {
+            "rule": {"subject": {"kind": "native", "owner": "workcell", "contract": "code.map.v1"}},
+            "review": {"tool": "code_map"},
+        }]);
+        let connection = &database.connection;
+        connection
+            .execute(
+                "INSERT INTO subagent_streams (session_id, subagent_id) VALUES (?1, 'child')",
+                params![id],
+            )
+            .unwrap();
+        for (ordinal, item) in history.iter().enumerate() {
+            let payload = item.to_string();
+            let stored = compress_payload(&payload).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO main_history_items VALUES (?1, ?2, ?3, ?4)",
+                    params![id, 100 + ordinal as i64, stored, payload.len() as i64],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO subagent_history_items VALUES (?1, 'child', ?2, ?3, ?4)",
+                    params![id, ordinal as i64, stored, payload.len() as i64],
+                )
+                .unwrap();
+        }
+        for (tool_id, output) in &outputs {
+            let payload = output.to_string();
+            connection
+                .execute(
+                    "INSERT INTO tool_outputs VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        id,
+                        tool_id,
+                        compress_payload(&payload).unwrap(),
+                        payload.len() as i64
+                    ],
+                )
+                .unwrap();
+        }
+        for tool in ["code_context", "code_refs", "code_map"] {
+            connection
+                .execute(
+                    "INSERT INTO tool_ledger VALUES (0, ?1, 'builtin', ?2, 'success', 1, 1, 1, x'')",
+                    params![tool, CWD],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO session_tool_usage VALUES (?1, ?2, 'builtin', 'success', 1, 1, 1, x'')",
+                    params![id, tool],
+                )
+                .unwrap();
+        }
+        for feature in ["code_context", "goal"] {
+            connection
+                .execute(
+                    "INSERT INTO decisions (ts, feature, question_set_id, question_set_version, \
+                     endpoint_kind, model, state, questions, latency_ms, mode, effect, meta) \
+                     VALUES (0, ?1, 'set', '1', 'local', ?2, 'answered', '[]', 0, 'shadow', 'none', '{}')",
+                    params![feature, MODEL],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO engine_decisions VALUES (?1, 1, 0, 'code_context', 'enforce', 'acted', '', '{}', NULL, 'call', NULL)",
+                params![id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO state VALUES (?1, ?2, ?3, 0)",
+                params![STATE_SCOPE_GLOBAL, PERMISSION_RULES_KEY, rules.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sessions SET metadata = json_set(metadata, ?2, json(?3)) WHERE id = ?1",
+                params![
+                    id,
+                    format!("$.{PERMISSION_METADATA_KEY}"),
+                    rules.to_string()
+                ],
+            )
+            .unwrap();
+        let generation = |connection: &Connection| -> i64 {
+            connection
+                .query_row("SELECT generation FROM permission_clock", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        let retired_before: Vec<u8> = connection
+            .query_row(
+                "SELECT payload FROM main_history_items WHERE session_id = ?1 AND ordinal = 102",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let generation_before = generation(connection);
+        database
+            .connection
+            .pragma_update(None, "user_version", SOURCE_CODE_PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(database);
+
+        let migrated = SessionDatabase::open_state(&state).unwrap();
+
+        assert_eq!(migrated.stats().unwrap().schema_version, SCHEMA_VERSION);
+        let connection = &migrated.connection;
+        let payload = |table: &str, key: &str, value: SqlValue| -> Value {
+            let (stored, byte_count): (Vec<u8>, i64) = connection
+                .query_row(
+                    &format!("SELECT payload, byte_count FROM {table} WHERE session_id = ?1 AND {key} = ?2"),
+                    params![id, value],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let text = decompress_payload(&stored, "payload").unwrap();
+            assert_eq!(byte_count, text.len() as i64);
+            serde_json::from_str(&text).unwrap()
+        };
+        for (table, first) in [("main_history_items", 100), ("subagent_history_items", 0)] {
+            assert_eq!(
+                payload(table, "ordinal", SqlValue::Integer(first))["name"],
+                "source_code_refs",
+                "{MIGRATION_RENAMES_SOURCE_CODE}"
+            );
+            assert_eq!(
+                payload(table, "ordinal", SqlValue::Integer(first + 1))["input"]["tool_calls"],
+                json!([
+                    {"tool": "source_code_context", "parameters": {"task": "x"}},
+                    {"tool": "code_map"},
+                ]),
+                "{MIGRATION_RENAMES_SOURCE_CODE}"
+            );
+        }
+        let retired_after: Vec<u8> = connection
+            .query_row(
+                "SELECT payload FROM main_history_items WHERE session_id = ?1 AND ordinal = 102",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retired_after, retired_before, "{MIGRATION_KEEPS_RETIRED}");
+        let output =
+            |tool_id: &str| payload("tool_outputs", "tool_id", SqlValue::Text(tool_id.into()));
+        assert_eq!(
+            output("refs"),
+            json!({"SourceCodeGraph": {"headline": "callers", "rows": []}})
+        );
+        assert_eq!(
+            output("batch"),
+            json!({"Batch": {"entries": [
+                {"tool": "source_code_refs", "output": {"SourceCodeGraph": {"rows": []}}},
+            ], "text": ""}})
+        );
+        assert_eq!(output("plain"), outputs[2].1);
+        let names = |sql: &str| -> Vec<String> {
+            connection
+                .prepare(sql)
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let expected_tools = ["code_map", "source_code_context", "source_code_refs"];
+        assert_eq!(
+            names("SELECT tool FROM tool_ledger ORDER BY tool"),
+            expected_tools
+        );
+        assert_eq!(
+            names("SELECT tool FROM session_tool_usage ORDER BY tool"),
+            expected_tools
+        );
+        assert_eq!(
+            names("SELECT feature FROM decisions ORDER BY feature"),
+            ["goal", "source_code_context"]
+        );
+        assert_eq!(
+            names("SELECT feature FROM engine_decisions"),
+            ["source_code_context"]
+        );
+        let renamed_rules = json!([{
+            "rule": {"subject": {"kind": "native", "owner": "workcell", "contract": "source_code.refs.v1"}},
+            "review": {"tool": "source_code_refs"},
+        }, rules[1]]);
+        let global: String = connection
+            .query_row(
+                "SELECT value FROM state WHERE scope = ?1 AND key = ?2",
+                params![STATE_SCOPE_GLOBAL, PERMISSION_RULES_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&global).unwrap(),
+            renamed_rules
+        );
+        let session_rules: String = connection
+            .query_row(
+                "SELECT metadata -> ?2 FROM sessions WHERE id = ?1",
+                params![id, format!("$.{PERMISSION_METADATA_KEY}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&session_rules).unwrap(),
+            renamed_rules
+        );
+        assert!(generation(connection) > generation_before);
         let (_fresh_temp, fresh_state) = state_dir();
         let fresh = SessionDatabase::open_state(&fresh_state).unwrap();
         assert_eq!(

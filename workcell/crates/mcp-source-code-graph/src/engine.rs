@@ -9,14 +9,14 @@ use std::{
     collections::{BTreeSet, HashMap},
 };
 
-use workcell_code_graph::{
+use workcell_source_code_graph::{
     CallSite, Facts, FactsCache, Graph, NodeId, Ranking, SymbolKind, Teleport, ingest_cached,
     pagerank, reaching_hops, resolve, retrieve,
 };
 
 use crate::{
     crawl::Crawled,
-    limits::CodeGraphLimits,
+    limits::SourceCodeGraphLimits,
     progress::{GraphPhase, PhaseNotifier},
     types::{
         Direction, GraphSummary, RankedSymbol, ReferenceRow, SelectorRefusal, SiteRef, SymbolRef,
@@ -72,7 +72,7 @@ fn edit_distance(left: &str, right: &str, ceiling: usize) -> usize {
 }
 
 /// A built graph over one crawl.
-pub struct CodeGraph {
+pub struct SourceCodeGraph {
     pub facts: Facts,
     pub graph: Graph,
     pub ranking: Ranking,
@@ -80,11 +80,11 @@ pub struct CodeGraph {
     pub summary: GraphSummary,
 }
 
-impl CodeGraph {
+impl SourceCodeGraph {
     /// Ingests, resolves, and ranks a crawl.
     pub fn build(
         crawled: Crawled,
-        limits: &CodeGraphLimits,
+        limits: &SourceCodeGraphLimits,
         cache: &mut FactsCache,
         notify: Option<&PhaseNotifier>,
     ) -> Self {
@@ -222,7 +222,7 @@ impl CodeGraph {
     pub fn select(
         &self,
         selector: &str,
-        limits: &CodeGraphLimits,
+        limits: &SourceCodeGraphLimits,
     ) -> Result<Vec<NodeId>, SelectorRefusal> {
         let (path_hint, name) = split_selector(selector);
         let matched: Vec<NodeId> = self

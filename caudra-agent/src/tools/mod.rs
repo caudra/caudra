@@ -1655,7 +1655,7 @@ mod tests {
         let event_tx = EventSender::new(tx, 0);
         let ctx = test_support::stub_ctx_with(&AgentMode::Build, Some(&event_tx), tool_use_id);
         ctx.emit_decision(NoteDraft {
-            feature: DecisionFeature::CodeContext,
+            feature: DecisionFeature::SourceCodeContext,
             mode: FeatureMode::Enforce,
             outcome: NoteOutcome::Acted,
             summary: DECISION_SUMMARY.into(),

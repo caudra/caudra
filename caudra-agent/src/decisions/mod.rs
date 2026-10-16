@@ -1,4 +1,3 @@
-mod code_context;
 mod content;
 #[cfg(test)]
 mod eval;
@@ -10,6 +9,7 @@ pub(crate) mod questions;
 mod rerank;
 pub(crate) mod shell_duration;
 mod shell_effect;
+mod source_code_context;
 mod state;
 mod workflow;
 
@@ -42,9 +42,6 @@ use url::{Host, Url};
 
 use shell_duration::ShellDurationCache;
 
-pub use code_context::{
-    CodeSymbol, code_context_out_of_deadline, reordered_note, rerank_code_context,
-};
 pub use content::Screening;
 pub use note::{
     DecisionNote, NoteAnchor, NoteDraft, NoteOutcome, NoteSink, counted, placement, score_line,
@@ -54,6 +51,9 @@ pub(crate) use rerank::join_answered;
 pub use rerank::{
     CANDIDATE_KEY, CANDIDATE_TEXT_OMITTED, MAX_CANDIDATE_INPUT_BYTES, MAX_RERANK_BATCH, Relevance,
     Rerank, Reranked, Reranking, candidate_text, changed_from,
+};
+pub use source_code_context::{
+    CodeSymbol, reordered_note, rerank_source_code_context, source_code_context_out_of_deadline,
 };
 pub use state::{DecisionState, DecisionStateError};
 pub(crate) use state::{push_fitting, redact_decision_text, redacted_excerpt, redacted_leaves};
@@ -90,7 +90,7 @@ pub enum DecisionFeature {
     MemoryDuplicates,
     CompactionRetention,
     OutputPointers,
-    CodeContext,
+    SourceCodeContext,
 }
 
 impl DecisionFeature {
@@ -111,7 +111,7 @@ impl DecisionFeature {
         Self::MemoryDuplicates,
         Self::CompactionRetention,
         Self::OutputPointers,
-        Self::CodeContext,
+        Self::SourceCodeContext,
         Self::Workflow,
         Self::Mcp,
     ];
@@ -137,7 +137,7 @@ impl DecisionFeature {
             Self::MemoryDuplicates => "memory_duplicates",
             Self::CompactionRetention => "compaction_retention",
             Self::OutputPointers => "output_pointers",
-            Self::CodeContext => "code_context",
+            Self::SourceCodeContext => "source_code_context",
         }
     }
 
@@ -162,7 +162,7 @@ impl DecisionFeature {
             Self::MemoryDuplicates => Some("memory_duplicates"),
             Self::CompactionRetention => Some("compaction_retention"),
             Self::OutputPointers => Some("output_pointers"),
-            Self::CodeContext => Some("code_context"),
+            Self::SourceCodeContext => Some("source_code_context"),
         }
     }
 
@@ -203,7 +203,7 @@ impl DecisionFeature {
             Self::MemoryDuplicates => &features.memory_duplicates,
             Self::CompactionRetention => &features.compaction_retention,
             Self::OutputPointers => &features.output_pointers,
-            Self::CodeContext => &features.code_context,
+            Self::SourceCodeContext => &features.source_code_context,
         }
     }
 
@@ -218,7 +218,7 @@ impl DecisionFeature {
             | Self::MemoryDuplicates
             | Self::CompactionRetention
             | Self::OutputPointers
-            | Self::CodeContext => config.rerank_timeout_ms,
+            | Self::SourceCodeContext => config.rerank_timeout_ms,
             Self::PermissionAdvice
             | Self::AutoScreening
             | Self::ShellEffect
@@ -240,7 +240,7 @@ impl DecisionFeature {
             Self::ToolSearch
             | Self::MemorySearch
             | Self::CompactionRetention
-            | Self::CodeContext => Some(thresholds.relevance_floor),
+            | Self::SourceCodeContext => Some(thresholds.relevance_floor),
             Self::MemoryRecall | Self::MemoryDuplicates | Self::OutputPointers => {
                 Some(thresholds.routing_confidence)
             }
@@ -1681,7 +1681,7 @@ mod tests {
     #[test_case(DecisionFeature::MemoryDuplicates, true; "memory_duplicates")]
     #[test_case(DecisionFeature::CompactionRetention, true; "compaction_retention")]
     #[test_case(DecisionFeature::OutputPointers, true; "output_pointers")]
-    #[test_case(DecisionFeature::CodeContext, true; "code_context")]
+    #[test_case(DecisionFeature::SourceCodeContext, true; "source_code_context")]
     fn pending_engine_cannot_escape_the_feature_budget(feature: DecisionFeature, rerank: bool) {
         smol::block_on(async {
             let root = tempfile::tempdir().unwrap();
@@ -1728,7 +1728,7 @@ mod tests {
     }
 
     #[test_case(DecisionFeature::MemorySearch, Some(RELEVANCE_FLOOR); "enforcing_rerank_uses_the_floor")]
-    #[test_case(DecisionFeature::CodeContext, Some(RELEVANCE_FLOOR); "code_context_uses_the_floor")]
+    #[test_case(DecisionFeature::SourceCodeContext, Some(RELEVANCE_FLOOR); "source_code_context_uses_the_floor")]
     #[test_case(DecisionFeature::ToolSearch, Some(RELEVANCE_FLOOR); "tool_search_uses_the_floor")]
     #[test_case(DecisionFeature::OutputPointers, Some(ROUTING_CONFIDENCE); "advice_uses_routing_confidence")]
     #[test_case(DecisionFeature::SkillSuggestions, None; "choice_features_keep_the_default")]

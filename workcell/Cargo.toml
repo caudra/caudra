@@ -34,7 +34,7 @@ workcell-workspace-scm.workspace = true
 workcell-workspace-snapshot.workspace = true
 workcell-environment = { workspace = true, features = ["mcp"] }
 workcell-mcp-code = { workspace = true, features = ["bundled-worker", "mcp"] }
-workcell-mcp-code-graph = { workspace = true, features = ["git", "mcp"] }
+workcell-mcp-source-code-graph = { workspace = true, features = ["git", "mcp"] }
 workcell-mcp-files = { workspace = true, features = ["index", "mcp"] }
 workcell-mcp-shell = { workspace = true, features = ["mcp"] }
 workcell-mcp-web = { workspace = true, features = ["mcp"] }

@@ -1,4 +1,4 @@
-//! Host-owned bounds for the code-graph tools.
+//! Host-owned bounds for the source-code tools.
 //!
 //! Every field here is startup configuration. None of it is reachable from tool input, for the same
 //! reason `IndexLimits` is not: a model that can raise a ceiling can raise it until the work no
@@ -6,11 +6,11 @@
 
 use std::time::Duration;
 
-use workcell_code_graph::{CacheLimits, ExtractLimits, IngestLimits};
+use workcell_source_code_graph::{CacheLimits, ExtractLimits, IngestLimits};
 
 /// Bounds on crawling, extraction, ranking, and result size.
 #[derive(Clone, Copy, Debug)]
-pub struct CodeGraphLimits {
+pub struct SourceCodeGraphLimits {
     /// Source files admitted to one map.
     pub max_files: usize,
     /// Directory entries the traversal may examine.
@@ -35,7 +35,7 @@ pub struct CodeGraphLimits {
     pub cache: CacheLimits,
 }
 
-impl Default for CodeGraphLimits {
+impl Default for SourceCodeGraphLimits {
     fn default() -> Self {
         Self {
             max_files: 20_000,
@@ -53,7 +53,7 @@ impl Default for CodeGraphLimits {
     }
 }
 
-impl CodeGraphLimits {
+impl SourceCodeGraphLimits {
     /// Clamps a caller-supplied result limit.
     ///
     /// `None` means the caller expressed no preference and gets the default, which is not the
@@ -78,14 +78,14 @@ mod tests {
 
     #[test]
     fn an_absent_limit_is_the_default_not_the_ceiling() {
-        let limits = CodeGraphLimits::default();
+        let limits = SourceCodeGraphLimits::default();
         assert_eq!(limits.resolve_limit(None), limits.default_result_limit);
         assert!(limits.default_result_limit < limits.max_result_limit);
     }
 
     #[test]
     fn a_caller_limit_narrows_but_never_widens() {
-        let limits = CodeGraphLimits::default();
+        let limits = SourceCodeGraphLimits::default();
         assert_eq!(limits.resolve_limit(Some(10)), 10);
         assert_eq!(
             limits.resolve_limit(Some(usize::MAX)),

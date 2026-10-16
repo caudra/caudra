@@ -14,7 +14,7 @@ otherwise.
 
 - `catalog/v1/`: ordered MCP tool catalogs emitted by the Rust server. The filesystem catalog has one
   case per write authority, because the mutation tools exist only when the process can write. The
-  code-graph catalog has one case, because its tools only read and so do not vary with that
+  source-code catalog has one case, because its tools only read and so do not vary with that
   authority.
 - `filesystem/v1/`: independent filesystem calls with setup, normalized MCP output, and complete
   expected post-state.
