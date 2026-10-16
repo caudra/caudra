@@ -48,9 +48,7 @@ WORKFLOWS = Path(__file__).resolve().parent.parent / ".github/workflows"
 SMOKE_WORKER_WARNING = "The code tool is unavailable"
 SMOKE_STARTUP_ERROR = "resolve data directory: Permission denied"
 CURATED_NOTES = (
-    "- One highlight.\n\n"
-    "### Changes\n\n"
-    "- **Version-specific.** User-facing changes.\n"
+    "- One highlight.\n\n### Changes\n\n- **Version-specific.** User-facing changes.\n"
 )
 GENERATED_NEW_USERS = "### New to Caudra?"
 GENERATED_FIRST_UPDATE = "### Updating\n"
