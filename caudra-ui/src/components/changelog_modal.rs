@@ -470,7 +470,7 @@ pub(crate) mod fixture {
             .map(|index| format!("- **Change {index} of {version}.** Details.\n"))
             .collect();
         format!(
-            "Lead for {version}, see [permissions]({DOCS_LINK}) and [elsewhere]({EXTERNAL_LINK}).\n\n> [!IMPORTANT]\n> Restart.\n\n### Changes\n\n{bullets}"
+            "- Lead for {version}, see [permissions]({DOCS_LINK}) and [elsewhere]({EXTERNAL_LINK}).\n\n> [!IMPORTANT]\n> Restart.\n\n### Changes\n\n{bullets}"
         )
     }
 

@@ -65,7 +65,7 @@ A run where nothing needs changing is a normal outcome, not a problem for a pers
 - **Prices.** `PricingTier { above, .. }` bills the whole request at the tier once the prompt passes `above`. `PriceChange { prefix, from, pricing }` goes in the manifest's `price_changes`. Tests never read the real clock for a price: use `billed_cost_at` with fixed instants.
 - **A new `Model` field** goes into every `Model { .. }` literal, about nine files including `caudra-ui/src/components/mod.rs`.
 - **Docs.** `make gen-docs` rewrites the providers tables. Prose notes live in the consts of `caudra-docgen/src/gen_providers.rs`.
-- **Release notes.** Only a change users notice gets a bullet: a model added or removed, or a changed price, limit, default, or thinking level. Add it under `### Models` in the newest `release-notes/*.md` whose version `git tag -l v<version>` does not list yet, in the style of its neighbours, keep the lead paragraph in step, and run `make gen-docs`. A change to `ACCEPTED` or `CAPS` alone, a test, or the report gets none, because CONTRIBUTING's release-notes section leaves out internal tooling.
+- **Release notes.** Only a change users notice gets a bullet: a model added or removed, or a changed price, limit, default, or thinking level. Add it under `### Models` in the newest `release-notes/*.md` whose version `git tag -l v<version>` does not list yet, in the style of its neighbours, keep the highlights at the top in step, and run `make gen-docs`. A change to `ACCEPTED` or `CAPS` alone, a test, or the report gets none, because CONTRIBUTING's release-notes section leaves out internal tooling.
 
 ## Commits
 

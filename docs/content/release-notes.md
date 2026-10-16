@@ -11,7 +11,14 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.10 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.10)
 
-Preview 10 lets MCP snippets ask the decision engine typed questions and rerank long results before the model reads them, moves workflow `decide()` to the same question shape, the one OpenAI Decisions uses, copies what you drag over in `/btw` and the question form, lets you add a note to your answers to the agent's questions, stops a goal's run when it makes no progress, lets a goal waiting on CI or a deploy check back later, tells automations about a stuck goal, and fixes subscription image generation after GPT-5.5 retired from Codex. It also fixes Lua plugin cleanup and source indexing, improves shell-output filtering, and updates Nix builds.
+- MCP snippets can ask the decision engine typed questions and rerank long results before the model reads them.
+- Workflow `decide()` uses the OpenAI Decisions question shape.
+- Pictures in the transcript.
+- Add a note to your answers to the agent's questions.
+- Dragging copies in `/btw` and the question form.
+- Goals stop when they make no progress, wait for CI or a deploy, and tell automations when they are stuck.
+- Subscription image generation works again after GPT-5.5 left Codex.
+- Fixes for Lua plugin cleanup, source indexing, shell-output filtering, and Nix builds.
 
 > **Warning**
 >
@@ -70,7 +77,14 @@ Preview 10 lets MCP snippets ask the decision engine typed questions and rerank 
 
 [v0.2.0-preview.9 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.9)
 
-Preview 9 lets the model call your MCP servers from Python, so a server with a hundred tools costs a short list instead of a hundred definitions, results are filtered before the model reads them, and MCP servers never break the prompt cache. It also adds Gemini 4 Argon as the Google default, along with Gemini 3.8 Flash, 3.6 Flash, and 3.5 Flash-Lite, brings Argon and 3.8 Flash to Copilot, adds Grok 4.7, GLM-5.3, DeepSeek V4.1 Flash, and Mistral Large 4, drops the Claude, Codex, and Copilot models their providers retired, bills announced price changes from their dates, fixes Google requests, which all failed on Caudra's tool definitions, fixes updates on macOS that sat for minutes on the download line, lets update checks use your GitHub token, shows download progress while Caudra updates, opens `/model` on your favorite models, lets `Home` and `End` jump to the ends of a picker's list, lets the agent ask questions without waiting for the answer and lets you answer a question later, runs a task on the favorite model you name, lets autopilot run without a continuation limit, fixes autopilot never answering the agent's questions, keeps a log of what autopilot did and what happened next, keeps a log of every goal check, fixes goal checks that failed every time after you interrupted the agent while it was thinking, lets `/btw` answer when the model reaches for a tool, applies a mode or model switch as soon as nothing is running, adds `/worktree close`, which brings a worktree's commits and changes back to the main checkout before it goes, resumes every session in a tab of its own when you leave a worktree's Herdr or Orca workspace, and breaks `/usage` down by purpose for the session as well as for all time.
+- Code mode: the model calls your MCP servers from Python, so a large server costs a short list, results are filtered before the model reads them, and the prompt cache survives.
+- Gemini 4 Argon is the Google default, with new Gemini Flash models, Grok 4.7, GLM-5.3, DeepSeek V4.1 Flash, and Mistral Large 4. Retired models are gone, and Google requests work again.
+- The agent can ask questions without waiting, and you can answer later.
+- Autopilot runs without a continuation limit, answers the agent's questions, and logs what it did.
+- A log of every goal check, and goal checks survive an interrupted reply.
+- `/worktree close` brings a worktree's work back to the main checkout.
+- `/model` opens on your favorites, and `Home` and `End` reach the ends of a list.
+- macOS updates no longer stall, and updates use your GitHub token and show download progress.
 
 > **Important**
 >
@@ -178,7 +192,14 @@ Preview 9 lets the model call your MCP servers from Python, so a server with a h
 
 [v0.2.0-preview.8 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.8)
 
-Preview 8 adds Claude Haiku 5.5 as the Anthropic Fast model, lets the experimental decision engine rerank memory notes, tool search, retained tool output, and code context, shows in the transcript what each decision feature changed, gives workflows a `rerank()` function, runs a task on the model you name, adds favorite models to `/model` and keeps 10 recent ones, opens forks in a new Herdr or Orca tab, names tabs after the session, lets new sessions open in build mode, lets you delete the current session from `/sessions`, makes the wheel scroll lists instead of moving their selection, stops pending reverts in a destination directory from blocking session moves, rings the bell in Orca when a turn ends in a tab you are not looking at, and has `caudra update` install without printing its installer first.
+- Claude Haiku 5.5 is the Anthropic Fast model.
+- The experimental decision engine reranks memory notes, tool search, retained tool output, and code context, and the transcript shows what each decision changed.
+- Workflows gain `rerank()`.
+- Favorite and 10 recent models in `/model`, and tasks run on the model you name.
+- Forks open in a new Herdr or Orca tab, and tabs are named after the session.
+- New sessions can open in build mode, and `/sessions` can delete the current session.
+- The wheel scrolls lists instead of moving their selection.
+- Fixes for session moves, Orca's bell, and `caudra update` output.
 
 > **Important**
 >
@@ -261,7 +282,12 @@ Preview 8 adds Claude Haiku 5.5 as the Anthropic Fast model, lets the experiment
 
 [v0.2.0-preview.7 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.7)
 
-Preview 7 sizes context windows to the limits providers enforce and lets you set them for built-in providers, reads secrets from files in global config files, keeps the reasoning of GPT models on Copilot in one piece, makes copying from Caudra in WSL reach the Windows clipboard, leaves approving a saved plan to the plan menu, and saves a session again after another Caudra carried it on.
+- Context windows match the limits providers enforce, and can be set for built-in providers.
+- Global config files read secrets from files.
+- GPT reasoning on Copilot stays in one piece.
+- Copying in WSL reaches the Windows clipboard.
+- Only the plan menu approves a saved plan.
+- A session saves again after another Caudra carried it on.
 
 > **Important**
 >
@@ -295,7 +321,12 @@ Preview 7 sizes context windows to the limits providers enforce and lets you set
 
 [v0.2.0-preview.6 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.6)
 
-Preview 6 adds autopilot, an experimental mode that answers permission prompts, questions, and ready plans for you while a session works toward its goal. It also forwards chosen environment variables to shell commands, draws MCP results readably, logs in to MCP servers that offer no client registration, shows what is new after an update, supports Orca terminals, and makes Enter answer a permission prompt in terminals where it did not.
+- Autopilot (experimental) answers permission prompts, questions, and ready plans while a session works toward its goal.
+- Chosen environment variables reach shell commands.
+- MCP results are drawn readably, and MCP servers without client registration can sign in.
+- What is new shows after an update.
+- Orca terminal support.
+- Enter answers a permission prompt in terminals where it did not.
 
 > **Important**
 >
@@ -352,7 +383,9 @@ Preview 6 adds autopilot, an experimental mode that answers permission prompts, 
 
 [v0.2.0-preview.5 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.5)
 
-Preview 5 applies configuration edits while Caudra runs, lets global config files read environment variables, and asks fewer questions about shell lines that set variables.
+- Configuration edits apply while Caudra runs.
+- Global config files can read environment variables.
+- Fewer questions about shell lines that set variables.
 
 > **Important**
 >
@@ -373,7 +406,10 @@ Preview 5 applies configuration edits while Caudra runs, lets global config file
 
 [v0.2.0-preview.4 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.4)
 
-Preview 4 adds hover tooltips, shows Caudra's own files and folders of your choice in the workbench explorer, offers narrower permission scopes for commands that take paths, and makes xAI sign-in work again.
+- Hover tooltips.
+- The workbench explorer shows Caudra's own files and folders you choose.
+- Narrower permission scopes for commands that take paths.
+- xAI sign-in works again.
 
 > **Important**
 >
@@ -407,7 +443,9 @@ Preview 4 adds hover tooltips, shows Caudra's own files and folders of your choi
 
 [v0.2.0-preview.3 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.3)
 
-Preview 3 rebuilds project memory around a summarized journal, adds GitHub sign-in for Copilot and a Copilot Enterprise provider, and shows available updates in every session.
+- Project memory is rebuilt around a summarized journal.
+- GitHub sign-in for Copilot, and a Copilot Enterprise provider.
+- Available updates show in every session.
 
 > **Important**
 >
@@ -445,7 +483,9 @@ Preview 3 rebuilds project memory around a summarized journal, adds GitHub sign-
 
 [v0.2.0-preview.2 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.2)
 
-Preview 2 improves installation and recovery, adds new opt-in decision features, and makes background shell commands easier to read.
+- Installation and recovery are more reliable.
+- New opt-in decision features.
+- Background shell commands are easier to read.
 
 ### Installation and updates
 

@@ -215,11 +215,11 @@ When you draft:
 - Update the draft in the same commit as the change. Leave out refactors, tests, CI and internal tooling.
 - Write for someone updating: what they will notice and what they must do, not how it was built.
 - Fold a follow-up into the bullet it refines, and remove the bullet of a reverted change.
-- Rewrite the lead paragraph as the release grows, so it still sums up the whole release.
+- Keep the highlights in step as the release grows, so they still sum up the whole release.
 
 Every file follows the same format. Run `make gen-docs` after editing one, because CI fails while the docs page is out of date:
 
-1. Start with one paragraph that summarizes the release.
+1. Start with a bullet list of the release's highlights: one plain line per headline change, no bold lead-in, about three to eight items. Nothing comes before it.
 2. Put anything a user must do in a `> [!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`, `[!NOTE]` or `[!TIP]` alert, and say when it applies, such as "Before you update" or "After you update, restart". A release that upgrades the session database says so in an alert like the one in `0.2.0-preview.6.md`.
 3. Group changes under `###` headings, never `#` or `##`.
 4. Start each bullet with a bold lead-in that names the change.

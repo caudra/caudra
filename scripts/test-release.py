@@ -48,15 +48,15 @@ WORKFLOWS = Path(__file__).resolve().parent.parent / ".github/workflows"
 SMOKE_WORKER_WARNING = "Workcell python_execution is unavailable"
 SMOKE_STARTUP_ERROR = "resolve data directory: Permission denied"
 CURATED_NOTES = (
-    "This release summarizes itself.\n\n"
-    "### Highlights\n\n"
+    "- One highlight.\n\n"
+    "### Changes\n\n"
     "- **Version-specific.** User-facing changes.\n"
 )
 GENERATED_NEW_USERS = "### New to Caudra?"
 GENERATED_FIRST_UPDATE = "### Updating\n"
 PREVIEW_CHANNEL = "caudra update --channel preview"
 STABLE_CHANNEL = "caudra update --channel stable"
-LEAD_ERROR = "lead paragraph"
+LEAD_ERROR = "highlights"
 GENERATED_ERROR = "generated section"
 PAGE_HEADING_ERROR = "### headings"
 WORKER_ACTION = WORKFLOWS.parent / "actions/code-worker/action.yml"
@@ -406,11 +406,12 @@ class ReleaseTests(unittest.TestCase):
 
     def test_notes_hold_only_what_changed(self):
         path = self.root / "release-notes" / f"{TAG[1:]}.md"
-        lead = "A summary.\n\n"
+        lead = "- A change.\n\n"
         for content, error in (
             ("### Highlights\n\n- **A.** B.\n", LEAD_ERROR),
             ("> [!IMPORTANT]\n> Restart.\n", LEAD_ERROR),
-            ("- **A.** B.\n", LEAD_ERROR),
+            ("A summary.\n\n### Changes\n\n- **A.** B.\n", LEAD_ERROR),
+            ("* A change.\n", LEAD_ERROR),
             (f"{lead}### New to Caudra?\n\nRead on.\n", GENERATED_ERROR),
             (f"{lead}### Updating from Preview 1\n\nRun it.\n", GENERATED_ERROR),
             (f"{lead}## Updating\n\nRun it.\n", GENERATED_ERROR),

@@ -75,11 +75,11 @@ mod tests {
 
     const OLDER: (&str, &str) = (
         "0.2.0-preview.3.md",
-        "Preview 3 fixes things.\n\n### Fixes\n\n- **A fix.** Details.\n",
+        "- Preview 3 fixes things.\n\n### Fixes\n\n- **A fix.** Details.\n",
     );
     const NEWER: (&str, &str) = (
         "0.2.0-preview.4.md",
-        "Preview 4 adds things, see [Permissions](https://caudra.ai/docs/permissions/#modes).\n\n> [!IMPORTANT]\n> **Restart.** Now.\n\n### Features\n\n- **A feature.** Details.\n",
+        "- Preview 4 adds things, see [Permissions](https://caudra.ai/docs/permissions/#modes).\n\n> [!IMPORTANT]\n> **Restart.** Now.\n\n### Features\n\n- **A feature.** Details.\n",
     );
     const NEWER_HEADING: &str = "## Caudra 0.2 Preview 4 {#v0-2-0-preview-4}";
     const OLDER_HEADING: &str = "## Caudra 0.2 Preview 3 {#v0-2-0-preview-3}";
