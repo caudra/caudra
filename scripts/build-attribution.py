@@ -1141,6 +1141,7 @@ def write_bundle(
                     record["notices"].append(saved["path"])
                     manifest["files"].append(saved)
                 native_reviews = reviewed_native_licenses(package, repository, policy)
+                native_reviewed_selections = {}
                 if package["source"] is not None:
                     evidence = "\n".join(
                         notice_bytes(path).decode("utf-8", errors="replace")
@@ -1165,11 +1166,13 @@ def write_bundle(
                                 native_selected
                             )
                         if relative in native_reviews:
-                            record.setdefault("native_reviewed_selections", {})[
+                            native_reviewed_selections[relative] = native_reviews[
                                 relative
-                            ] = native_reviews[relative]
+                            ]
                         record["notices"].append(saved["path"])
                         manifest["files"].append(saved)
+                if native_reviewed_selections:
+                    record["native_reviewed_selections"] = native_reviewed_selections
                 if "MPL-2.0" in chosen or any(
                     "MPL-2.0" in licenses
                     for licenses in record["native_selected_licenses"].values()
