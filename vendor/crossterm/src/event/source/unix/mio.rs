@@ -160,3 +160,40 @@ impl EventSource for UnixInternalEventSource {
         self.waker.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "libc")]
+    use std::os::fd::IntoRawFd;
+    use std::{os::unix::net::UnixStream, time::Duration};
+
+    use super::{FileDesc, SIGNAL_TOKEN, UnixInternalEventSource};
+    use signal_hook::consts::SIGWINCH;
+
+    const SIGNAL_TIMEOUT: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn resize_signal_wakes_mio_and_is_drained_once() {
+        let (input, _writer) = UnixStream::pair().unwrap();
+        input.set_nonblocking(true).unwrap();
+        #[cfg(feature = "libc")]
+        let input = FileDesc::new(input.into_raw_fd(), true);
+        #[cfg(not(feature = "libc"))]
+        let input = FileDesc::Owned(input.into());
+        let mut source = UnixInternalEventSource::from_file_descriptor(input).unwrap();
+
+        signal_hook::low_level::raise(SIGWINCH).unwrap();
+        source
+            .poll
+            .poll(&mut source.events, Some(SIGNAL_TIMEOUT))
+            .unwrap();
+        assert!(
+            source
+                .events
+                .iter()
+                .any(|event| event.token() == SIGNAL_TOKEN)
+        );
+        assert_eq!(source.signals.pending().collect::<Vec<_>>(), [SIGWINCH]);
+        assert!(source.signals.pending().next().is_none());
+    }
+}
