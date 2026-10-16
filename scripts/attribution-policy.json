@@ -76,22 +76,57 @@
         "supplements/THIRD_PARTY_LICENSES/dependencies/monty-typeshed-1.1.0/LICENSE-typeshed"
       ]
     },
-    "two-face@0.5.1": {
-      "reason": "Embedded syntax/theme assets require separately reviewed notices in addition to the Rust wrapper licenses.",
+    "two-face@0.5.2+bat-0.26.1": {
+      "reason": "Exact 0.5.2+bat-0.26.1 archive and upstream revision verified. All four syntax dumps, theme dump and packaged acknowledgement dump are byte-identical to 0.5.1; all 70 upstream syntax license/notice entries retain their exact texts and paths. The MIT copyright repository link and packaged bat NOTICE links changed and are preserved verbatim. Caudra still uses only syntax::extra_newlines with syntect-default-fancy, not bundled themes. The independently locked monty-runtime worker has no two-face package, so no old-version supplement is required.",
       "files": [
         {
           "path": "THIRD_PARTY_LICENSES/TwoFace.txt",
-          "sha256": "8d763b9ac555a5235e3e1d12e3f65d637564b9e27ba3a40442983300e0368233"
+          "sha256": "3e29e42dfecbca0936ac06e56497bd8de797ae8cf6515b5f94e157960646d119"
         },
         {
           "path": "THIRD_PARTY_LICENSES/TwoFaceSyntaxes.txt",
-          "sha256": "af90b0fb994e50ee688b2de57f57e9b8b1c2a703b70756e1e97d701e35187ad0"
+          "sha256": "d02d5b6f590790bff725a125a474f06c7cb827bc467a59c8819ad81a0de7173a"
         }
       ],
       "required_files": [
         "supplements/THIRD_PARTY_LICENSES/TwoFace.txt",
         "supplements/THIRD_PARTY_LICENSES/TwoFaceSyntaxes.txt"
-      ]
+      ],
+      "provenance": {
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "915be7adc2ff6f4338acbf71f3eda0a146f46003b992a1669c674308610efdac",
+        "declared_license": "MIT OR Apache-2.0",
+        "cargo_vcs_info": {
+          "git": {
+            "sha1": "67b64e632ceefe70e5f20f3eb797d9e33560a11c"
+          },
+          "path_in_vcs": ""
+        }
+      },
+      "review_evidence": {
+        "repository": "https://codeberg.org/CosmicHarper/two-face",
+        "upstream_revision": "67b64e632ceefe70e5f20f3eb797d9e33560a11c",
+        "syntax_license_entries": 70,
+        "upstream_acknowledgements_sha256": "66512fea2f515b498c2972b2cdf361b1405735ec934a85e48fbe39d917074a7f",
+        "source_files_sha256": {
+          "Cargo.toml.orig": "7bf1bd47f7d13d7f7cf113606ff2c401217025e30547b20b160d8722b290bd73",
+          "LICENSE-APACHE": "6da61c67477940fc0bfc3a5f65ae1813b1c54c4e3b2572de26f802f097d8b03c",
+          "LICENSE-MIT": "7206e5cec3869d1c394ba80866d1cc25c0a749e3d4e0d229801a722e37b670c6",
+          "README.md": "82aaf720ca94e01d8510188e409800a09e6af2f708b8d60411c65c15727637fd",
+          "generated/acknowledgements_full.bin": "e4bf45ad159b67de6a7152874904728adb6421996eb15da01ca75406e6cd51fb",
+          "generated/syntaxes-fancy-newlines.bin": "758bf07782d9d81479db7a0c4651aebf844ef20510ceb5bee08c61158368b0f3",
+          "generated/syntaxes-fancy-no-newlines.bin": "14907b8da6438cba2af4dc5650b76a571db583aa1a981e8f1d8e4b9233c34c53",
+          "generated/syntaxes-onig-newlines.bin": "7b567f54cf1b4b33abb7b64258647c256f99043c4bee6804b38f9ef612d0110a",
+          "generated/syntaxes-onig-no-newlines.bin": "45e130ac157619bd2af7a4d50cf180ceda9ebe9058611fea5303b1a28f391fbb",
+          "generated/themes.bin": "be28f0c1a167469c5bd1e5311d4d3503e6503b378791f2afb9e3e5f2f7f4642e",
+          "src/acknowledgement/core_types.rs": "f24131de2a0b67a5bcd1903dd27c58094ed8823e6b327150ce0f235f143d1a82",
+          "src/acknowledgement/mod.rs": "413268f48287009a472065fad6d37192ed02893c69e141b3c8f4f6ee65c5cfc2",
+          "src/lib.rs": "cd451599b5d0def843b8496d6fa9f511d52fd7549f1dc7b5ad43c41043c59846",
+          "src/syntax.rs": "8dd27829491244b7a208a6c22184e2005aefb120a1776ba01eaee7b48ad6d46d",
+          "src/theme/core_types.rs": "dc84060cf2e2568e81c6909caf85e25662ace7170c7ae6cc2e3afbd395e78433",
+          "src/theme/mod.rs": "fa2a9724b14bc695b522ef9af8161266917f9435bf056ee2c95b368d2727f576"
+        }
+      }
     },
     "aws-lc-sys@0.46.0": {
       "reason": "Checksum-verified 0.46.0 archive (aws-lc-rs revision 9df497501436596d4da77109217806b3af7f56cb) preserves the exact declared conjunctive expression. LICENSE, aws-lc/LICENSE and fiat/LICENSE are byte-identical to 0.44.0. Native notice inventory grows from 1580 to 1613: 91 added paths and 58 removed, with every retained-path notice unchanged. Added ML-DSA/ML-KEM assembly retains Arm, Hanno Becker, Amin Abdulrahman, Matthias Kannwischer and project-author notices and public-domain derivation statements under Apache-2.0 OR ISC OR MIT; Brainpool, Keccak and provider files use Apache-2.0 OR ISC. Retain every native notice, not just target-compiled files.",
