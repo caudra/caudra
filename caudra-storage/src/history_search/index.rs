@@ -495,6 +495,20 @@ mod tests {
     const MIN_SQLITE: (u32, u32) = (3, 43);
     const SYNTHETIC_ITEMS: usize = 100_000;
     const SYNTHETIC_SESSIONS: usize = 100;
+    const VOCABULARY: usize = 20_000;
+    const SYLLABLES: [&str; 16] = [
+        "ka", "lo", "mi", "ren", "tu", "sa", "vel", "or", "qui", "dan", "pe", "zor", "il", "mu",
+        "tex", "ba",
+    ];
+    const QUERIES: usize = 400;
+    const SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+    const MEDIAN: f64 = 0.5;
+    const PERCENTILE_95: f64 = 0.95;
+    const SLOWEST: f64 = 1.0;
+    const POOL: usize = 64;
+    const POOL_PER_SESSION: usize = 8;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const MILLIS_PER_SECOND: f64 = 1_000.0;
 
     fn search(database: &SessionDatabase, text: &str) -> Vec<HistoryKind> {
         database
@@ -696,5 +710,139 @@ mod tests {
             progress.indexed_items as f64 / elapsed.as_secs_f64()
         );
         assert_eq!(progress.indexed_items, SYNTHETIC_ITEMS);
+    }
+
+    /// A deterministic generator, so every run measures the same corpus.
+    struct Corpus(u64);
+
+    impl Corpus {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
+        }
+
+        /// A word's rank, log-uniform over the vocabulary, which gives the long tail of
+        /// conversational text: a few words everywhere and most of them rare.
+        fn rank(&mut self) -> usize {
+            let uniform = self.next() as f64 / u64::MAX as f64;
+            ((VOCABULARY as f64).powf(uniform) as usize).clamp(1, VOCABULARY) - 1
+        }
+
+        /// `least` words and up to `spread` more.
+        fn text(&mut self, vocabulary: &[String], least: usize, spread: usize) -> String {
+            let words = least + self.below(spread);
+            (0..words)
+                .map(|_| vocabulary[self.rank()].as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    }
+
+    fn vocabulary() -> Vec<String> {
+        (0..VOCABULARY)
+            .map(|rank| {
+                let mut word = String::new();
+                let mut rest = rank + SYLLABLES.len();
+                while rest > 0 {
+                    word.push_str(SYLLABLES[rest % SYLLABLES.len()]);
+                    rest /= SYLLABLES.len();
+                }
+                word
+            })
+            .collect()
+    }
+
+    fn pages(database: &SessionDatabase) -> u64 {
+        let pragma = |name: &str| -> u64 {
+            database
+                .connection()
+                .query_row(&format!("PRAGMA {name}"), [], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .unsigned_abs()
+        };
+        (pragma("page_count") - pragma("freelist_count")) * pragma("page_size")
+    }
+
+    /// Run with `--ignored --nocapture`: index size against the text it covers, and lexical
+    /// query latency over a varied 100k-item corpus, as the funnel asks for its pool.
+    #[test]
+    #[ignore = "benchmark"]
+    fn query_latency_and_index_size() {
+        let (_temp, mut database) = database();
+        let vocabulary = vocabulary();
+        let mut corpus = Corpus(SEED);
+        let per_session = SYNTHETIC_ITEMS / SYNTHETIC_SESSIONS;
+        let mut text_bytes = 0;
+        for session_index in 0..SYNTHETIC_SESSIONS {
+            let items = (0..per_session)
+                .map(|index| {
+                    let item = match index % 4 {
+                        0 => user(&corpus.text(&vocabulary, 10, 30)),
+                        1 => assistant(&corpus.text(&vocabulary, 30, 120)),
+                        2 => {
+                            tool_call(&format!("c{index}"), SHELL, &corpus.text(&vocabulary, 3, 8))
+                        }
+                        _ => tool_result(
+                            &format!("c{}", index - 1),
+                            &corpus.text(&vocabulary, 50, 350),
+                        ),
+                    };
+                    text_bytes += item.to_string().len();
+                    item
+                })
+                .collect();
+            let session: TestSession =
+                session_with(PROJECT, &format!("bench {session_index}"), items);
+            database.save(&session, None).unwrap();
+        }
+        let before = pages(&database);
+        let started = Instant::now();
+        assert_eq!(
+            catch_up(&database, &HistoryScope::All).indexed_items,
+            SYNTHETIC_ITEMS
+        );
+        let indexed_in = started.elapsed();
+        let index_bytes = pages(&database) - before;
+
+        let mut latencies: Vec<f64> = (0..QUERIES)
+            .map(|index| {
+                let words = 1 + index % 3;
+                let text = (0..words)
+                    .map(|_| vocabulary[corpus.rank()].as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let query = HistoryQuery {
+                    limit: POOL,
+                    per_session_cap: Some(POOL_PER_SESSION),
+                    ..HistoryQuery::new(text, HistoryScope::All)
+                };
+                let started = Instant::now();
+                database.search_history(&query).unwrap();
+                started.elapsed().as_secs_f64() * MILLIS_PER_SECOND
+            })
+            .collect();
+        latencies.sort_by(f64::total_cmp);
+        let at = |share: f64| latencies[((latencies.len() - 1) as f64 * share) as usize];
+        println!(
+            "corpus: {SYNTHETIC_ITEMS} items, {:.1} MiB of item JSON; indexed in {indexed_in:?}",
+            text_bytes as f64 / MIB
+        );
+        println!(
+            "index: {:.1} MiB, {:.2}x the item JSON",
+            index_bytes as f64 / MIB,
+            index_bytes as f64 / text_bytes as f64
+        );
+        println!(
+            "query ({QUERIES} queries, pool {POOL}, {POOL_PER_SESSION} per session): p50 {:.1} ms, p95 {:.1} ms, max {:.1} ms",
+            at(MEDIAN),
+            at(PERCENTILE_95),
+            at(SLOWEST)
+        );
     }
 }
