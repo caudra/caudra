@@ -241,6 +241,15 @@ pub(super) fn presentation_for(
     }
 }
 
+/// A caller's own account of a call, each line bounded and stripped of control characters.
+pub(super) fn action_summary(action: &str) -> String {
+    action
+        .lines()
+        .map(safe_summary)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn update_presentation_coverage(
     presentation: &mut PermissionPresentation,
     coverage: &[Option<ResourceCoverage>],

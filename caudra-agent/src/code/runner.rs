@@ -113,7 +113,7 @@ impl ReplState {
     }
 }
 
-/// The variables one agent's `mcp` runs keep, held only in memory.
+/// The variables one agent's `code` runs keep, held only in memory.
 pub struct ReplSlot {
     state: Option<ReplState>,
     /// Earlier runs kept variables in an agent that has since gone: Caudra restarted, or the

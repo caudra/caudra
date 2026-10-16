@@ -59,9 +59,10 @@ pub use opacity::{OPACITY_ATTRIBUTE, ScriptLanguage, ShellOpacity, UnknownShellO
 pub(super) use options::BROAD_SHELL_PHRASE;
 use options::rule_options;
 pub use options::{
-    COMMAND_EXACT_PREFIX, COMMAND_GROUP_PREFIX, COMMAND_PATTERN_PREFIX, COMMAND_TEMPLATE_PREFIX,
-    COMPOSABLE_SHELL_OPTIONS, MCP_SERVER_READS_OPTION, MCP_SERVER_RESOURCE,
-    READ_ONLY_MCP_TOOL_OPTION,
+    ALL_PROJECTS_HISTORY, COMMAND_EXACT_PREFIX, COMMAND_GROUP_PREFIX, COMMAND_PATTERN_PREFIX,
+    COMMAND_TEMPLATE_PREFIX, COMPOSABLE_SHELL_OPTIONS, MCP_SERVER_READS_OPTION,
+    MCP_SERVER_RESOURCE, READ_ONLY_MCP_TOOL_OPTION, SESSION_HISTORY_READS_OPTION,
+    SESSION_HISTORY_RESOURCE,
 };
 #[cfg(test)]
 use options::{
@@ -71,7 +72,7 @@ use options::{
 pub use presentation::{
     AutoNote, AutopilotNote, EngineFlag, PromptReason, update_presentation_coverage,
 };
-use presentation::{listed_commands, presentation_for, safe_summary};
+use presentation::{action_summary, listed_commands, presentation_for, safe_summary};
 pub use resources::filesystem_permission_resource;
 #[cfg(test)]
 use resources::filesystem_resource_flags;
@@ -477,7 +478,7 @@ impl PermissionRequest {
         subject: PermissionSubject,
         executor: PermissionExecutorKind,
     ) -> Self {
-        Self::from_parts(
+        let mut request = Self::from_parts(
             id,
             tool,
             intent.scopes.scopes.clone(),
@@ -489,7 +490,11 @@ impl PermissionRequest {
             intent.resources.clone(),
             &intent.authority,
             intent.mcp.clone(),
-        )
+        );
+        if let Some(action) = &intent.action {
+            request.presentation.action = action_summary(action);
+        }
+        request
     }
     #[allow(clippy::too_many_arguments)]
     fn from_parts(
@@ -559,6 +564,7 @@ pub fn mcp_permission_intent(
         risk,
         authority: legacy_authority_profile(tool),
         mcp: facts,
+        action: None,
     }
 }
 pub fn prepared_command_binding(resource_value: &str, input: &Value) -> String {

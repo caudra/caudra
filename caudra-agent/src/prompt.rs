@@ -213,7 +213,7 @@ pub const MODEL_FAVORITES_PROMPT: &str = include_str!("prompts/model_favorites.m
 pub const MODEL_FAVORITES_WITHDRAWN_PROMPT: &str =
     include_str!("prompts/model_favorites_withdrawn.md");
 pub const MODEL_FAVORITES_MARKER: &str = "# Model favorites";
-/// What the `mcp` tool can reach. Standing rather than in the system prompt or
+/// What the `code` tool can reach. Standing rather than in the system prompt or
 /// the tool array, so a server connecting or its tools changing never
 /// invalidates the cached prefix.
 pub const MCP_SERVERS_PROMPT: &str = include_str!("prompts/mcp_servers.md");
@@ -305,9 +305,9 @@ const NATIVE_HINTS: &[(&str, Slot, &str)] = &[
         "- Use **task** for delegation. Each worker uses its selected profile within inherited host restrictions.",
     ),
     (
-        "python_execution",
+        "code",
         Slot::ToolUsage,
-        "- Use **python_execution** only for isolated Python computation over values already in context; it cannot call tools or access files, processes, or the network.",
+        "- Use **code** for Python computation over values already in context. It cannot access files, processes, or the network; it reaches only the host modules its description lists.",
     ),
     (
         "file_read",

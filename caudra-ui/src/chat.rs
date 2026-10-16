@@ -270,10 +270,9 @@ impl Chat {
                     return ChatEventResult::PlanWritten(plan);
                 }
             }
-            AgentEvent::McpCodeProgress(e) => {
+            AgentEvent::CodeProgress(e) => {
                 let e = *e;
-                self.messages_panel
-                    .mcp_code_progress(&e.id, e.index, e.call);
+                self.messages_panel.code_progress(&e.id, e.index, e.call);
             }
             AgentEvent::ToolDone(mut e) => {
                 if let ToolOutput::TodoList(items) = &e.output {

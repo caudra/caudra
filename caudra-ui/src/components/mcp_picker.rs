@@ -4,9 +4,9 @@ use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
+use caudra_agent::code::runner as code_runner;
 use caudra_agent::context::{ContextMcpInventory, ContextMcpStatus, ContextSnapshot};
 use caudra_agent::mcp::code::naming::Names;
-use caudra_agent::mcp::code::runner as code_runner;
 use caudra_agent::mcp::code::view::{ServerState, ServerView};
 use caudra_agent::mcp::config::McpConfigSource;
 use caudra_agent::mcp::oauth::REFUSED_ACCESS;
@@ -41,7 +41,7 @@ const SWITCH_ACCOUNT_SUFFIX: &str = "' to sign in with another account.";
 const EXECUTOR_NATIVE_HINT: &str = "Executor asks the model to approve its runs. Add ?elicitation_mode=native to the URL so Caudra asks you.";
 const EXECUTOR_PASSTHROUGH_HINT: &str = "Executor's own tool takes code, so the model writes Python that sends code to it. Add ?mode=passthrough to the URL for its plain tools.";
 /// Worded as `/tools` and `/context` word the same states.
-const VIA_MCP: &str = "via mcp";
+const VIA_MCP: &str = "via code";
 const SEARCH_ONLY: &str = "search-only";
 const NAMESPACE_INFIX: &str = " as ";
 
@@ -125,7 +125,7 @@ fn build_entries(
     (entries, enabled, toggleable)
 }
 
-/// The namespaces an `mcp` snippet calls servers by. They follow only from which servers are
+/// The namespaces an `code` snippet calls servers by. They follow only from which servers are
 /// enabled, so the picker names them as a session does without its tool lists.
 fn namespaces(infos: &[McpServerInfo]) -> Names {
     let servers: Vec<ServerView> = infos
@@ -143,7 +143,7 @@ fn namespaces(infos: &[McpServerInfo]) -> Names {
     Names::new(&servers)
 }
 
-/// How many tools the server has and that the model reaches them through the `mcp` tool, with
+/// How many tools the server has and that the model reaches them through the `code` tool, with
 /// the namespace to call when it is not the server's own name.
 fn tools_text(info: &McpServerInfo, names: &Names) -> String {
     let mut text = format!("{} tools {VIA_MCP}", info.tool_count);
@@ -157,7 +157,7 @@ fn tools_text(info: &McpServerInfo, names: &Names) -> String {
     text
 }
 
-/// The config errors, after the reason no `mcp` snippet can run when there is one, since that
+/// The config errors, after the reason no `code` snippet can run when there is one, since that
 /// leaves every server unreachable.
 fn banner(code_unavailable: Option<String>, errors: &McpConfigErrors) -> Option<String> {
     let parts: Vec<String> = [

@@ -86,7 +86,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.db";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.db.lock";
 
-const SCHEMA_VERSION: i64 = 28;
+const SCHEMA_VERSION: i64 = 29;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -202,7 +202,7 @@ const RELOCATION_WORKFLOW: &str = "stop active or resumable workflows before rel
 const RELOCATION_AUTOMATION: &str = "stop running automation firings before relocating";
 /// The character after [`MAIN_SEPARATOR`], so every path below a directory
 /// sorts before `<directory>` followed by this.
-const AFTER_SEPARATOR: char = '0';
+pub(crate) const AFTER_SEPARATOR: char = '0';
 /// Session metadata about the plan, whose file is kept in the project state a
 /// relocation may leave behind.
 const RELOCATION_PLAN_FIELDS: [&str; 3] = ["plan_path", "plan_target", "plan_written"];
@@ -797,6 +797,11 @@ const MIGRATIONS: &[Migration] = &[
         to: 28,
         sql: crate::goal_log::TABLES,
     },
+    Migration {
+        from: 28,
+        to: 29,
+        sql: crate::history_search::TABLES,
+    },
 ];
 
 /// Which automation sent a message for its session, a stamp ordering every
@@ -1075,7 +1080,7 @@ CREATE TABLE pending_archives (
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
     format!(
-        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}{SESSION_PURPOSE_USAGE_TABLE}{}",
+        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}{SESSION_PURPOSE_USAGE_TABLE}{}{}",
         crate::background::TABLES,
         crate::shell_durations::TABLES,
         crate::shell_history::TABLES,
@@ -1087,7 +1092,8 @@ fn full_schema() -> String {
         crate::memory_journal::TABLES,
         crate::autopilot::TABLES,
         crate::engine_decisions::TABLE,
-        crate::goal_log::TABLES
+        crate::goal_log::TABLES,
+        crate::history_search::TABLES
     )
 }
 
@@ -3972,7 +3978,7 @@ fn history_record_identity(payload: &Value) -> Option<(CaudraId, u64)> {
 }
 
 /// The UNIX millisecond an id was generated at, when it is a UUIDv7.
-pub(super) fn history_uuid_timestamp(id: CaudraId) -> Option<u64> {
+pub(crate) fn history_uuid_timestamp(id: CaudraId) -> Option<u64> {
     let bytes = id.as_bytes();
     if bytes[UUID_VERSION_BYTE] >> UUID_VERSION_SHIFT != UUID_V7
         || bytes[UUID_VARIANT_BYTE] >> UUID_VARIANT_SHIFT != UUID_RFC4122_VARIANT
@@ -4249,14 +4255,14 @@ where
         "SELECT payload FROM main_history_items WHERE session_id = ?1 ORDER BY ordinal",
         id,
     )?;
-    let tool_outputs = query_keyed_json_rows::<T>(
-        connection,
-        "SELECT tool_id, payload FROM tool_outputs WHERE session_id = ?1 ORDER BY tool_id",
-        id,
-    )?
-    .into_iter()
-    .map(|(key, value)| (key, Arc::new(value)))
-    .collect::<HashMap<_, _>>();
+    let StoredToolOutputs {
+        readable: tool_outputs,
+        unreadable: unreadable_tool_ids,
+    } = query_tool_outputs::<T>(connection, id)?;
+    let tool_outputs = tool_outputs
+        .into_iter()
+        .map(|(key, value)| (key, Arc::new(value)))
+        .collect::<HashMap<_, _>>();
     let mut subagent_task_specs = HashMap::new();
     let mut task_spec_bytes = 0usize;
     let mut stream_ids = Vec::new();
@@ -4303,7 +4309,7 @@ where
         ),
         (
             "tool_output_count",
-            tool_outputs.len(),
+            tool_outputs.len() + unreadable_tool_ids.len(),
             root.tool_output_count,
         ),
         (
@@ -4369,13 +4375,16 @@ where
         base_write_version: AtomicI64::new(root.write_version),
         write_version,
     };
-    let cursor = SessionCursor::new(
+    let mut cursor = SessionCursor::new(
         &session,
         root.write_version,
         root.logical_bytes,
         root.token_usage.len() + root.metadata.len() + root.workspace_binding.len(),
         task_spec_bytes,
     );
+    // The session no longer holds these, so the next save cannot be a delta:
+    // the full rewrite it takes instead drops their rows and their count.
+    cursor.saved_tool_ids.extend(unreadable_tool_ids);
     Ok((session, cursor))
 }
 
@@ -5690,7 +5699,10 @@ fn compress_payload(payload: &str) -> Result<Vec<u8>, SessionError> {
 /// A payload that fails to decode is a named error rather than a panic: before
 /// compression a damaged row still parsed as text, and afterwards it fails at
 /// the frame instead.
-fn decompress_payload(stored: &[u8], field: &'static str) -> Result<String, SessionError> {
+pub(crate) fn decompress_payload(
+    stored: &[u8],
+    field: &'static str,
+) -> Result<String, SessionError> {
     let decoded = zstd::decode_all(stored).map_err(|error| SessionError::CorruptDatabaseValue {
         field,
         reason: format!("{PAYLOAD_DECOMPRESSION_FAILED}: {error}"),
@@ -5712,6 +5724,14 @@ fn decompress_payload(stored: &[u8], field: &'static str) -> Result<String, Sess
 fn decode_payloads<T: DeserializeOwned + Send>(
     stored: Vec<Vec<u8>>,
     field: &'static str,
+) -> Result<Vec<T>, SessionError> {
+    decode_payloads_with(stored, field, decode_payload)
+}
+
+fn decode_payloads_with<T: Send>(
+    stored: Vec<Vec<u8>>,
+    field: &'static str,
+    decode_payload: fn(&[u8], &'static str) -> Result<T, SessionError>,
 ) -> Result<Vec<T>, SessionError> {
     let workers = decode_workers(stored.len());
     if workers == 1 {
@@ -5764,6 +5784,16 @@ fn decode_payload<T: DeserializeOwned>(
     field: &'static str,
 ) -> Result<T, SessionError> {
     deserialize_json(&decompress_payload(stored, field)?, field)
+}
+
+/// A payload whose frame is intact but whose JSON this build cannot read, as
+/// the reason. Damaged bytes still fail the load.
+fn decode_readable_payload<T: DeserializeOwned>(
+    stored: &[u8],
+    field: &'static str,
+) -> Result<Result<T, String>, SessionError> {
+    let text = decompress_payload(stored, field)?;
+    Ok(serde_json::from_str(&text).map_err(|error| error.to_string()))
 }
 
 /// Reads one stored payload column and returns the JSON text it holds.
@@ -6249,12 +6279,22 @@ fn query_json_rows<T: DeserializeOwned + Send>(
     decode_payloads(stored, "payload")
 }
 
-fn query_keyed_json_rows<T: DeserializeOwned + Send>(
+/// A session's rich tool outputs, and the ids of those written by a build
+/// whose output types this one no longer has.
+struct StoredToolOutputs<T> {
+    readable: Vec<(String, T)>,
+    unreadable: Vec<String>,
+}
+
+/// Unreadable outputs are left out rather than failing the session: the call
+/// keeps its model-facing result in history, which is what is shown.
+fn query_tool_outputs<T: DeserializeOwned + Send>(
     connection: &Connection,
-    sql: &str,
     id: CaudraId,
-) -> Result<Vec<(String, T)>, SessionError> {
-    let mut statement = connection.prepare(sql)?;
+) -> Result<StoredToolOutputs<T>, SessionError> {
+    let mut statement = connection.prepare(
+        "SELECT tool_id, payload FROM tool_outputs WHERE session_id = ?1 ORDER BY tool_id",
+    )?;
     let mut rows = statement.query(params![id.as_bytes().as_slice()])?;
     let mut keys = Vec::new();
     let mut stored = Vec::new();
@@ -6262,10 +6302,21 @@ fn query_keyed_json_rows<T: DeserializeOwned + Send>(
         keys.push(row.get::<_, String>(0)?);
         stored.push(row.get::<_, Vec<u8>>(1)?);
     }
-    Ok(keys
-        .into_iter()
-        .zip(decode_payloads(stored, "payload")?)
-        .collect())
+    let decoded = decode_payloads_with(stored, "payload", decode_readable_payload::<T>)?;
+    let mut outputs = StoredToolOutputs {
+        readable: Vec::with_capacity(keys.len()),
+        unreadable: Vec::new(),
+    };
+    for (tool_id, decoded) in keys.into_iter().zip(decoded) {
+        match decoded {
+            Ok(output) => outputs.readable.push((tool_id, output)),
+            Err(error) => {
+                warn!(session_id = %id, tool_id, error, "skipping a stored tool output this build cannot read");
+                outputs.unreadable.push(tool_id);
+            }
+        }
+    }
+    Ok(outputs)
 }
 
 /// Every subagent's history in one pass, keyed by the stream that owns it.
@@ -6795,11 +6846,14 @@ mod tests {
     /// Followed by [`crate::autopilot::DECISIONS_TABLE_V24`] in
     /// [`downgrade_autopilot_audit`], which every downgrade to schema 24, 25
     /// or 26 runs first.
-    const AUTOPILOT_AUDIT_DOWNGRADE: &str = "DROP TABLE goal_evaluations; DROP TABLE goals; \
+    const AUTOPILOT_AUDIT_DOWNGRADE: &str = "DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; \
+         DROP TABLE goal_evaluations; DROP TABLE goals; \
          DROP TABLE autopilot_engagements; DROP TABLE autopilot_decisions;";
     const AUTOPILOT_AUDIT_PREVIOUS_SCHEMA: i64 = 26;
-    const GOAL_LOG_DOWNGRADE: &str = "DROP TABLE goal_evaluations; DROP TABLE goals;";
+    const GOAL_LOG_DOWNGRADE: &str = "DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals;";
     const GOAL_LOG_PREVIOUS_SCHEMA: i64 = 27;
+    const HISTORY_SEARCH_DOWNGRADE: &str = "DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs;";
+    const HISTORY_SEARCH_PREVIOUS_SCHEMA: i64 = 28;
     const AUDIT_SEQ: u64 = 7;
     const AUDIT_KIND: &str = "permission";
     const AUDIT_ACTION: &str = "allow";
@@ -6811,17 +6865,17 @@ mod tests {
     const AUDIT_COST: f64 = 0.0125;
     const MIGRATION_KEEPS_DECISIONS: &str =
         "rebuilding the decision log must keep every row, with nothing new recorded on it";
-    const AUTOPILOT_DECISIONS_DOWNGRADE: &str = "DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions;";
+    const AUTOPILOT_DECISIONS_DOWNGRADE: &str = "DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions;";
     const AUTOPILOT_DECISIONS_PREVIOUS_SCHEMA: i64 = 23;
-    const MEMORY_JOURNAL_DOWNGRADE: &str = "DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes;";
+    const MEMORY_JOURNAL_DOWNGRADE: &str = "DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes;";
     const MEMORY_JOURNAL_PREVIOUS_SCHEMA: i64 = 22;
-    const AUTOMATION_MESSAGING_DOWNGRADE: &str = "DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; ALTER TABLE automation_firings DROP COLUMN delivery;";
+    const AUTOMATION_MESSAGING_DOWNGRADE: &str = "DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; ALTER TABLE automation_firings DROP COLUMN delivery;";
     const AUTOMATION_MESSAGING_PREVIOUS_SCHEMA: i64 = 21;
-    const AUTOMATIONS_DOWNGRADE: &str = "DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings;";
+    const AUTOMATIONS_DOWNGRADE: &str = "DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings;";
     const AUTOMATIONS_PREVIOUS_SCHEMA: i64 = 20;
-    const CONSUMER_GROUPS_DOWNGRADE: &str = "DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation;";
+    const CONSUMER_GROUPS_DOWNGRADE: &str = "DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation;";
     const CONSUMER_GROUPS_PREVIOUS_SCHEMA: i64 = 19;
-    const SHARED_REPOSITORIES_DOWNGRADE: &str = "DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP TABLE deliveries; DROP TABLE cursors; DROP TABLE messages; DROP TABLE message_history_revision; DROP TABLE decisions;";
+    const SHARED_REPOSITORIES_DOWNGRADE: &str = "DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP TABLE deliveries; DROP TABLE cursors; DROP TABLE messages; DROP TABLE message_history_revision; DROP TABLE decisions;";
     const SHARED_REPOSITORIES_PREVIOUS_SCHEMA: i64 = 18;
     const OWNER_CHECKPOINT_PREVIOUS_SCHEMA: i64 = 13;
     const WORKFLOW_DECISION_PREVIOUS_SCHEMA: i64 = 14;
@@ -11926,6 +11980,43 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         );
     }
 
+    #[test]
+    fn history_search_migrates_from_schema_twenty_eight_keeping_sessions() {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open_state(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        database
+            .connection
+            .execute_batch(HISTORY_SEARCH_DOWNGRADE)
+            .unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", HISTORY_SEARCH_PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(database);
+
+        let migrated = SessionDatabase::open_state(&state).unwrap();
+
+        assert_eq!(migrated.stats().unwrap().schema_version, SCHEMA_VERSION);
+        let kept: TestSession = migrated.load(session.id).unwrap();
+        assert_eq!(kept.id, session.id);
+        let indexed: i64 = migrated
+            .connection
+            .query_row("SELECT count(*) FROM history_search_docs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(indexed, 0);
+        let (_fresh_temp, fresh_state) = state_dir();
+        let fresh = SessionDatabase::open_state(&fresh_state).unwrap();
+        assert_eq!(
+            schema_objects(&migrated),
+            schema_objects(&fresh),
+            "{MIGRATED_MATCHES_FRESH}"
+        );
+    }
+
     #[test_case(false; "missing_root")]
     #[test_case(true; "existing_empty_root")]
     fn existing_state_open_never_initializes_missing_storage(existing_root: bool) {
@@ -12675,6 +12766,7 @@ CREATE TABLE subagent_history_items (
                 &full_schema()
                     .replace(SESSION_PURPOSE_USAGE_TABLE, "")
                     .replace(crate::engine_decisions::TABLE, "")
+                    .replace(crate::history_search::TABLES, "")
                     .replace(crate::goal_log::TABLES, "")
                     .replace(crate::autopilot::TABLES, "")
                     .replace(crate::memory_journal::TABLES, "")
@@ -12782,6 +12874,7 @@ CREATE TABLE subagents (
                 &full_schema()
                     .replace(SESSION_PURPOSE_USAGE_TABLE, "")
                     .replace(crate::engine_decisions::TABLE, "")
+                    .replace(crate::history_search::TABLES, "")
                     .replace(crate::goal_log::TABLES, "")
                     .replace(crate::autopilot::TABLES, "")
                     .replace(crate::memory_journal::TABLES, "")
@@ -13006,6 +13099,47 @@ CREATE TABLE subagents (
             .load::<TestMessage, Value, Value>(session.id)
             .unwrap();
         assert_eq!(loaded.tool_outputs(), session.tool_outputs());
+    }
+
+    #[test]
+    fn a_tool_output_this_build_cannot_read_is_left_out_of_the_load() {
+        const READABLE_ID: &str = "readable";
+        const RETIRED_ID: &str = "retired";
+        const ADDED_ID: &str = "added";
+        const READABLE_VALUE: u64 = 7;
+        #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        enum KnownOutput {
+            Known(u64),
+        }
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        session.insert_tool_output(READABLE_ID.into(), json!({ "Known": READABLE_VALUE }));
+        session.insert_tool_output(RETIRED_ID.into(), json!({ "Retired": {} }));
+        database.save(&session, None).unwrap();
+
+        let (mut loaded, cursor) = database
+            .load_with_cursor::<TestMessage, Value, KnownOutput>(session.id)
+            .unwrap();
+
+        let outputs: Vec<(&str, &KnownOutput)> = loaded
+            .tool_outputs()
+            .iter()
+            .map(|(id, output)| (id.as_str(), output.as_ref()))
+            .collect();
+        assert_eq!(
+            outputs,
+            [(READABLE_ID, &KnownOutput::Known(READABLE_VALUE))]
+        );
+
+        loaded.insert_tool_output(ADDED_ID.into(), KnownOutput::Known(READABLE_VALUE));
+        database.save(&loaded, Some(&cursor)).unwrap();
+        let resaved = database
+            .load::<TestMessage, Value, Value>(session.id)
+            .unwrap();
+        let mut ids: Vec<&str> = resaved.tool_outputs().keys().map(String::as_str).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, [ADDED_ID, READABLE_ID]);
     }
 
     #[test_case(""; "empty")]

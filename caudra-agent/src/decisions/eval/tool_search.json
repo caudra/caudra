@@ -21,14 +21,6 @@
       "expect": "code_refs"
     },
     {
-      "query": "run a quick python calculation",
-      "candidates": [
-        {"name": "execution_environment", "description": "Inspect the execution host's current environment: installed commands and versions, privilege access, Git status and package managers."},
-        {"name": "python_execution", "description": "Execute a short Python script in an isolated interpreter and return its value and printed output."}
-      ],
-      "expect": "python_execution"
-    },
-    {
       "query": "what breaks if I change this function and which tests cover it",
       "candidates": [
         {"name": "code_refs", "description": "List the symbols that reference a given symbol, or the symbols it references."},
@@ -40,7 +32,7 @@
     {
       "query": "check which version of node is installed",
       "candidates": [
-        {"name": "python_execution", "description": "Execute a short Python script in an isolated interpreter and return its value and printed output."},
+        {"name": "image_generate", "description": "Generate a raster image from a text prompt and save it as a PNG."},
         {"name": "execution_environment", "description": "Inspect the execution host's current environment: installed commands and versions, privilege access, Git status and package managers."},
         {"name": "view_image", "description": "View an image file (png, jpeg, gif, webp) so you can actually see it."}
       ],

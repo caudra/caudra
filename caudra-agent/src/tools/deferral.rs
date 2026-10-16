@@ -4,7 +4,7 @@
 //! catalog, and a search moves it into the array from the next request on.
 //! The deferred set is the fixed list in
 //! [`caudra_config::DEFERRED_BUILTIN_TOOLS`]: a built-in is deferred when most
-//! sessions never call it. MCP tools never pass through here; the `mcp` tool
+//! sessions never call it. MCP tools never pass through here; the `code` tool
 //! reaches them without declaring any.
 //!
 //! Deferring costs a prompt-cache prefix each time something loads, so tools

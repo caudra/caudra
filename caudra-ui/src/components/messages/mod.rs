@@ -65,9 +65,9 @@ use super::scrollbar::{ScrollHint, Scrollbar, ScrollbarMouse};
 use super::streaming_content::StreamingContent;
 use super::tooltip::{Anchor, Tip, TipKey};
 use caudra_agent::background::BackgroundTasks;
+use caudra_agent::code::output::{CodeCall, CodeOutput};
 use caudra_agent::commits::{self, CommitRef};
 use caudra_agent::decisions::NoteOutcome;
-use caudra_agent::mcp::code::output::{McpCodeCall, McpCodeOutput};
 use caudra_agent::mentions::{self, Mention};
 use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME, ToolEffect};
 use caudra_agent::{
@@ -2197,9 +2197,9 @@ impl MessagesPanel {
         true
     }
 
-    /// A call of a running `mcp` snippet started or settled. Calls arrive in the order the
+    /// A call of a running `code` snippet started or settled. Calls arrive in the order the
     /// snippet made them, so a new index is always the next row.
-    pub fn mcp_code_progress(&mut self, tool_id: &str, index: usize, call: McpCodeCall) -> bool {
+    pub fn code_progress(&mut self, tool_id: &str, index: usize, call: CodeCall) -> bool {
         let Some(msg) = self
             .messages
             .iter_mut()
@@ -2211,13 +2211,13 @@ impl MessagesPanel {
             return false;
         }
         let mut output = match msg.tool_output.as_deref() {
-            Some(ToolOutput::McpCode(output)) => output.clone(),
-            _ => McpCodeOutput {
+            Some(ToolOutput::Code(output)) => output.clone(),
+            _ => CodeOutput {
                 code: match msg.tool_input.as_deref() {
                     Some(ToolInput::Code { code, .. }) => code.clone(),
                     _ => String::new(),
                 },
-                ..McpCodeOutput::default()
+                ..CodeOutput::default()
             },
         };
         let known = output.calls.len();
@@ -2227,7 +2227,7 @@ impl MessagesPanel {
             None if index == known => output.calls.push(call),
             None => return false,
         }
-        msg.tool_output = Some(Arc::new(ToolOutput::McpCode(output)));
+        msg.tool_output = Some(Arc::new(ToolOutput::Code(output)));
         self.mark_card_dirty(tool_id);
         true
     }

@@ -1,4 +1,4 @@
-//! Runs `mcp` snippets in Workcell's hosted Monty worker.
+//! Runs `code` snippets in Workcell's hosted Monty worker.
 //!
 //! MCP servers are always clients of this process, so snippets that call them always run here,
 //! whatever Workcell the session's other tools use. An embedded host lends its own runtime and
@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-use caudra_agent::mcp::code::runner::{
+use caudra_agent::code::runner::{
     ReplNote, ReplState, RunFuture, ScriptCall, ScriptError, ScriptErrorKind, ScriptException,
     ScriptHost, ScriptInvocation, ScriptName, ScriptOutcome, ScriptOutput, ScriptRepair, ScriptRun,
     ScriptRunner, ScriptStatus,
@@ -22,17 +22,17 @@ use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 use workcell::CodeToolGroup;
 use workcell::code::{
-    CodeConfiguration, CodeExecution, CodeHost, HostCall, HostError, HostErrorKind, HostInvocation,
-    HostName, HostedState, Outcome, StateNote, WorkerSource,
+    CodeConfiguration, CodeExecution, CodeHost, CodePools, HostCall, HostError, HostErrorKind,
+    HostInvocation, HostName, HostedState, Outcome, StateNote, WorkerSource,
 };
 
 use crate::HostInner;
 
-const RUNTIME_THREAD_NAME: &str = "caudra-mcp-code";
+const RUNTIME_THREAD_NAME: &str = "caudra-code";
 const RUNTIME_WORKERS: usize = 2;
-const NO_WORKER: &str = "MCP code mode needs the code worker, which is unavailable in this build or environment. Set WORKCELL_MCP_CODE_WORKER to a monty worker, or use a release build, which bundles one.";
-const RUNTIME_FAILED: &str = "The MCP code runner could not start its runtime";
-const RUN_FAILED: &str = "The MCP code runner failed while running the snippet";
+const NO_WORKER: &str = "The code tool needs the code worker, which is unavailable in this build or environment. Set WORKCELL_MCP_CODE_WORKER to a monty worker, or use a release build, which bundles one.";
+const RUNTIME_FAILED: &str = "The code runner could not start its runtime";
+const RUN_FAILED: &str = "The code runner failed while running the snippet";
 
 pub struct WorkcellScriptRunner {
     backend: Backend,
@@ -120,6 +120,7 @@ impl Standalone {
         CodeToolGroup::new(CodeConfiguration {
             worker,
             type_check: true,
+            pools: CodePools::HostedOnly,
         })
         .await
         .map(Arc::new)
@@ -310,8 +311,8 @@ mod tests {
     use std::time::Duration;
 
     use caudra_agent::CancelToken;
-    use caudra_agent::mcp::code::runner::{ReplLease, ReplSlot, ScriptFuture, SharedRepl};
-    use caudra_agent::tools::native::mcp::DESCRIPTION;
+    use caudra_agent::code::runner::{ReplLease, ReplSlot, ScriptFuture, SharedRepl};
+    use caudra_agent::tools::native::code::DESCRIPTION;
     use serde_json::{Value, json};
     use workcell::code::{SUBSET_MODULES, UNTYPED_BUILTINS, WITHHELD_BUILTINS};
 
@@ -323,11 +324,14 @@ mod tests {
     const STUBS: &str = "from typing import Any\nclass _S:\n    async def echo(self, *, text: str) -> Any: ...\n    async def hang(self) -> Any: ...\nsrv: _S\n";
     /// Only a deadline for a step that takes milliseconds, so a hang fails the test.
     const STEP_DEADLINE: Duration = Duration::from_secs(60);
+    const PURE_COMPUTATION: &str = "print('summing')\nsum([1, 2, 3, 4])";
+    const PURE_RESULT: i64 = 10;
+    const PURE_STDOUT: &str = "summing\n";
 
-    /// The `mcp` tool restates the worker's subset in its own words, so it is held to Workcell's
+    /// The `code` tool restates the worker's subset in its own words, so it is held to Workcell's
     /// list rather than to a copy of it.
     #[test]
-    fn the_mcp_description_states_the_subset_the_worker_provides() {
+    fn the_code_description_states_the_subset_the_worker_provides() {
         let named = |name: &str| DESCRIPTION.contains(&format!("`{name}`"));
         for name in SUBSET_MODULES.iter().chain(&UNTYPED_BUILTINS) {
             assert!(named(name), "`{name}` is missing from the description");
@@ -440,6 +444,21 @@ mod tests {
         let second = run(&runner, &host, "kept", &repl);
         assert_eq!(second.output.expect("ran").result, json!({ "echo": "hi" }));
         assert_eq!(host.calls.lock().expect("calls").len(), 1);
+    }
+
+    /// Plain computation is the hosted pool's job now: a snippet that calls no host prints and
+    /// returns like any other, with no isolated pool behind it.
+    #[test]
+    fn pure_computation_runs_on_the_hosted_only_pool() {
+        let Some(runner) = runner() else { return };
+        let host = Arc::new(EchoHost::default());
+        let output = run(&runner, &host, PURE_COMPUTATION, &ReplSlot::shared(false))
+            .output
+            .expect("ran");
+        assert_eq!(output.status, ScriptStatus::Completed, "{output:?}");
+        assert_eq!(output.result, json!(PURE_RESULT));
+        assert_eq!(output.stdout, PURE_STDOUT);
+        assert!(host.calls.lock().expect("calls").is_empty());
     }
 
     #[test]

@@ -61,7 +61,7 @@ Both install to `%LOCALAPPDATA%\caudra` and add it to your user PATH. Override w
 cargo install --locked --git https://github.com/caudra/caudra.git caudra
 ```
 
-This build leaves out [`python_execution`](/docs/tools/#python_execution), because only release builds, Nix, and `make install` from a checkout embed its worker. The other tools work as usual.
+This build has no worker for the [`code`](/docs/code/) tool, because only release builds, Nix, and `make install` from a checkout embed it. Caudra warns at startup, a `code` call fails with an error that says so, and the other tools work as usual.
 
 ### With Nix
 

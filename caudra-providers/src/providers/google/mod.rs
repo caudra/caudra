@@ -1166,11 +1166,11 @@ mod tests {
     }
 
     const LEGACY_MCP_CALL: &str = "everything__get-sum";
-    const CODE_MODE_TOOL: &str = "mcp";
+    const CODE_MODE_TOOL: &str = "code";
     const LEGACY_RESULT: &str = "The sum of 4 and 5 is 9.";
 
     /// A session from before MCP code mode called each MCP tool directly. Resumed now, it
-    /// declares only `mcp`, and the old call still goes out under its own name, signed for the
+    /// declares only `code`, and the old call still goes out under its own name, signed for the
     /// models that check, with its response paired to it.
     #[test_case(ARGON_SPEC     ; "gemini_4")]
     #[test_case(FLASH_3_6_SPEC ; "gemini_3")]

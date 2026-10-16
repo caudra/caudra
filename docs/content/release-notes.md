@@ -11,7 +11,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.10 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.10)
 
-- MCP snippets can ask the decision engine typed questions and rerank long results before the model reads them.
+- One `code` tool replaces `mcp` and `python_execution`, searches your past conversations, and can ask the decision engine to judge and rerank results.
 - Workflow `decide()` uses the OpenAI Decisions question shape.
 - Pictures in the transcript.
 - Add a note to your answers to the agent's questions.
@@ -19,6 +19,20 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 - Goals stop when they make no progress, wait for CI or a deploy, and tell automations when they are stuck.
 - Subscription image generation works again after GPT-5.5 left Codex.
 - Fixes for Lua plugin cleanup, source indexing, shell-output filtering, and Nix builds.
+
+> **Important**
+>
+> **Close every other Caudra session before you start Preview 10.** On its first start, Preview 10 upgrades the session database in your [state directory](/docs/configuration/#directory-layout), and the upgrade needs exclusive access. This includes other terminals, editor sessions over ACP, and `caudra storage` commands. While any of them still has the database open, Preview 10 does not start. It lists the open sessions to close instead, and nothing is changed.
+>
+> The upgrade keeps your sessions and saves a copy of the database from before it as `caudra.db.v28.bak` next to `caudra.db`. Preview 9 and earlier cannot open the upgraded database, and `caudra rollback` restores only the previous binary, not the database.
+
+> **Warning**
+>
+> **Before you start Preview 10, rename `ui.tool_output_lines.python_execution` to `ui.tool_output_lines.code`.** The `code` tool replaces `mcp` and `python_execution`, with no alias. A `caudra.toml` that still sets the old key fails to load, with an error that names the new one. Permission rules, `agent.disabled_tools` entries, and system prompt profiles that name the `mcp` or `python_execution` tool no longer match anything, so name `code` in them instead. See [Code](/docs/code/).
+
+> **Warning**
+>
+> **If you run a remote Workcell server, update it with Caudra and rename its `python_execution` tool group to `code`.** Workcell's Python tool is now `code` too, so `--tool-group python_execution` and `python_execution` in `WORKCELL_MCP_TOOL_GROUPS` fail at startup. Caudra requires a server that serves `code`, and refuses an older one. See [Remote workspaces](/docs/remote-workspaces/).
 
 > **Warning**
 >
@@ -28,10 +42,17 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 >
 > **Intel macOS users building with Nix must switch to the native build.** Current nixpkgs no longer supports Intel macOS, so the flake no longer provides `x86_64-darwin` outputs. Native Intel macOS builds and release binaries remain supported.
 
+### Code
+
+- **One `code` tool replaces `mcp` and `python_execution`.** The model runs all of its Python in `code`: computation, MCP server calls, history search, and the decision helpers. It is offered in every session, with or without MCP servers, and its definition never changes, so the prompt cache holds. Variables persist between runs of the same agent, and `reset: true` starts a run empty. A model that still calls `mcp` or `python_execution` gets an unknown-tool error. `/tools`, `caudra tools`, and `/mcp` mark MCP tools `via code`. See [Code](/docs/code/).
+- **Computation runs where snippets run.** Python now always runs on your machine, also in sessions on a remote Workcell. A run has 30 seconds of computation, where `python_execution` stopped at 5 seconds unless the model asked for more, and the clock stops while a snippet waits for a call. `timeoutSec` is gone. One agent's runs go one at a time, so the model gathers parallel work in one snippet, and a `code` call starts once the model's response is complete. See [Where snippets run](/docs/code/#where-snippets-run).
+- **Search your past conversations.** `history.search()` finds what you wrote, what the model answered and reasoned, and what its tools did, in this conversation, this project, another project, or every stored session, compacted turns and subagents included. Each hit carries a snippet around the matched words and a reference that `history.read()` opens in full, and `history.sessions()` lists sessions. A full-text index in the session database fills in the background while the TUI is open, and each search catches it up first. Searching this project never asks. Another project or all projects ask first. The prompt shows the call with its arguments and which session or project's history it reads, and offers to always allow that history. See [Search past conversations](/docs/code/#search-past-conversations).
+- **Reranked history search.** With the experimental decision engine on, set `[decisions.features] history_search = "enforce"` and the engine judges up to 64 keyword matches against the query, drops those below `thresholds.relevance_floor`, and returns the 10 most relevant. Its four requests go out at once, and each waits up to four times `rerank_timeout_ms`, so an engine that answers one request at a time can still judge the whole pool. Otherwise a search returns 20 matches in keyword order. The feature is off by default, and `shadow` logs what it would have kept. See [Ranking](/docs/code/#ranking).
+
 ### MCP
 
-- **Decisions and reranking in snippets.** With the decision engine on, an `mcp` snippet can call `decide()` for typed answers about its data, and `rerank()` to keep only the candidates relevant to a query, best first, for up to 256 candidates. A snippet can rank 200 issue titles and return the ten that matter, so the rest never reach the model. The model is told how to write questions and queries that get reliable answers, such as naming the field each question judges and describing every option. Calls need no approval, work in plan mode, show as rows on the card, and appear in the decision log under the feature `mcp`. See [Decisions and reranking](/docs/mcp/#decisions-and-reranking).
-- **Decision answers you can read at a glance.** A `decide()` row on the `mcp` card shows its verdicts on one line, and always shows each question below it with a bar per option, the likeliest highlighted, and a warning when the winner is uncertain. A `rerank()` row always shows the candidates it kept, best first, under the labels they were given. Click the row's footer to see the JSON the snippet received; selecting any part of the row copies that JSON, in either view. In `/decisions`, Recent draws logged answers the same way, and `j` switches them to JSON.
+- **Decisions and reranking in snippets.** With the decision engine on, a `code` snippet can call `decide()` for typed answers about its data, and `rerank()` to keep only the candidates relevant to a query, best first, for up to 256 candidates. A snippet can rank 200 issue titles and return the ten that matter, so the rest never reach the model. The model is told how to write questions and queries that get reliable answers, such as naming the field each question judges and describing every option. Both work with or without MCP servers. Calls need no approval, work in plan mode, show as rows on the card, and appear in the decision log under the feature `code`. See [Decisions and reranking](/docs/code/#decisions-and-reranking).
+- **Decision answers you can read at a glance.** A `decide()` row on the `code` card shows its verdicts on one line, and always shows each question below it with a bar per option, the likeliest highlighted, and a warning when the winner is uncertain. A `rerank()` row always shows the candidates it kept, best first, under the labels they were given. Click the row's footer to see the JSON the snippet received; selecting any part of the row copies that JSON, in either view. In `/decisions`, Recent draws logged answers the same way, and `j` switches them to JSON.
 
 ### Workflows
 
@@ -61,6 +82,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 ### Fixes
 
+- **A session with a stored tool card this build cannot read opens again.** Such a card, like an `mcp` card from Preview 9, is skipped, and its call shows the text the model received. Before, the whole session failed to open.
 - **Lua job cleanup survives cancellation and deadlines.** Releasing an abandoned `jobwait` during garbage collection no longer aborts the process, including when the plugin host shuts down.
 - **Shell output keeps unrelated subcommands intact.** Updated bundled filters no longer match commands merely because their names start with a filtered subcommand.
 - **PHP indexing handles clone arguments and partial application.** File indexes and code graphs no longer report parse errors for these expressions.

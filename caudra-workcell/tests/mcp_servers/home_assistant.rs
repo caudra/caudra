@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use caudra_agent::AgentMode;
-use caudra_agent::mcp::code::output::McpCodeCallStatus;
+use caudra_agent::code::output::CodeCallStatus;
 use caudra_agent::permissions::{PermissionAnswer, PermissionMode};
 use serde_json::{Value, json};
 
@@ -49,7 +49,7 @@ fn an_intent_changes_the_device() {
     let servers = connect(AgentMode::Build, PermissionMode::Yolo);
     let output = servers.run("await home_assistant.intent__HassTurnOn(name='Bed Light')");
     completed(&output);
-    assert_eq!(output.calls[0].status, McpCodeCallStatus::Success);
+    assert_eq!(output.calls[0].status, CodeCallStatus::Success);
     assert_eq!(home.settled(BED_LIGHT, ON), ON);
 }
 
@@ -77,8 +77,8 @@ fn plan_mode_reads_live_context_and_refuses_an_intent() {
     assert_eq!(
         statuses,
         [
-            (LIVE_CONTEXT, McpCodeCallStatus::Success),
-            (TURN_OFF_TOOL, McpCodeCallStatus::Refused)
+            (LIVE_CONTEXT, CodeCallStatus::Success),
+            (TURN_OFF_TOOL, CodeCallStatus::Refused)
         ]
     );
     assert_eq!(home.state(CEILING_LIGHTS), ON);
@@ -124,7 +124,7 @@ fn a_denied_lock_stays_as_it_was() {
         &[PermissionAnswer::Deny],
     );
     assert_eq!(asked.len(), 1);
-    assert_eq!(output.calls[0].status, McpCodeCallStatus::Refused);
+    assert_eq!(output.calls[0].status, CodeCallStatus::Refused);
     assert_eq!(home.state(FRONT_DOOR), UNLOCKED);
 }
 

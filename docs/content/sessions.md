@@ -228,7 +228,7 @@ A PDF that [`webfetch`](/docs/tools/#webfetch) attaches for a model that reads P
 
 ## Size ceiling
 
-Opening a session hydrates all of it at once: the conversation, every rich tool output record, and every subagent transcript. `storage.max_eager_load_mb` caps what Caudra will hydrate that way, at 1024 MB by default. A session above the cap refuses to open and names both ways out of it.
+Opening a session hydrates all of it at once: the conversation, every rich tool output record, and every subagent transcript. A rich record this build cannot read, such as the card of a tool that no longer exists, is skipped, and that call shows the text the model received. The next save drops the skipped records. `storage.max_eager_load_mb` caps what Caudra will hydrate that way, at 1024 MB by default. A session above the cap refuses to open and names both ways out of it.
 
 The figure measured is the sum of uncompressed payload sizes, which is a proxy for the work of loading rather than for disk or memory. Compression usually puts the file itself at a fraction of that number.
 
@@ -274,6 +274,12 @@ A schema migration prunes as its last step. Rewriting rows puts the pages they o
 `caudra storage trim --dry-run` and `caudra storage forget --dry-run` print the plan with the reason each session is kept. `caudra storage sessions` lists sessions with their tier. `caudra storage pin <ID>` keeps a session regardless of policy. See [CLI](/docs/cli/#caudra-storage) for every flag.
 
 Retention never removes spending records. What a session cost is written to a separate ledger that no session owns, so `caudra storage usage` still answers after the sessions are gone. See [Lifetime spend](/docs/token-economy/#lifetime-spend).
+
+## Search index
+
+The `code` tool's [`history` module](/docs/code/#search-past-conversations) searches stored conversations through a full-text index in `caudra.db`. The index holds which words each item contains, without a copy of the text. Forgetting a session removes its index rows with it. Trimming leaves the conversation, so a trimmed session stays searchable.
+
+The index fills lazily. While the TUI is open, a background thread indexes saved sessions, newest first, in short transactions that never hold a session save back for long, and then checks for new history every 30 seconds. Each search also indexes what changed in its own scope for up to 1.5 seconds before it runs, which is how headless and ACP sessions keep up. An ephemeral session is never indexed.
 
 ## What the state directory holds
 
@@ -329,8 +335,8 @@ Before a tool call that may change files, Caudra records what the call can chang
 | Shell lines that only read, such as `git status`, `rg`, or `ls` | Nothing |
 | Shell lines whose writes are all literal paths | The paths that `rm`, `mv`, `cp`, `touch`, `mkdir`, `ln`, `tee`, and `sed -i` change, and the targets of output redirects |
 | Other shell lines and plugin tools | The whole session directory |
-| [`mcp`](/docs/mcp/#code-mode) runs | The whole session directory, from the first server call that may change files to the end of the run |
-| `mcp` runs that call no server, or only tools a recognised server marks read-only, as in plan mode and read-only agents | Nothing |
+| [`code`](/docs/code/) runs | The whole session directory, from the first server call that may change files to the end of the run |
+| `code` runs that call no server, or only `history`, decision helpers, and tools a recognised server marks read-only, as in plan mode and read-only agents | Nothing |
 
 A glob, a variable, a heredoc, an unlisted option, or any other program sends a shell line to the whole directory. `cp` and `ln` record only the destination, and `mv` or `cp` into a directory records that whole directory. Paths outside the session directory are not recorded. Your own edits, including `!` commands from the composer, get no record of their own.
 

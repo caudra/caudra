@@ -984,14 +984,14 @@ mod tests {
         });
     }
 
-    /// MCP tools are reached only from the `mcp` tool's code, so a name from before code mode has
+    /// MCP tools are reached only from the `code` tool's code, so a name from before code mode has
     /// no schema to repair a call against.
     #[test_case(MCP_TOOL; "qualified_name")]
     #[test_case(MCP_WIRE_TOOL; "wire_name")]
     fn an_mcp_tool_name_has_no_schema_to_repair_against(name: &str) {
-        let (ctx, _) = model_context(REPLY);
-        let mcp = crate::mcp::stub_session(&[(MCP_TOOL, TOOL)]);
-        assert_eq!(repair_schema(&ctx.registry, Some(&mcp), name, &ctx), None);
+        let (mut ctx, _) = model_context(REPLY);
+        ctx.mcp = Some(crate::mcp::stub_session(&[(MCP_TOOL, TOOL)]));
+        assert_eq!(repair_schema(&ctx.registry, name, &ctx), None);
     }
 
     #[test_case(false; "null_schema")]

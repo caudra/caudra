@@ -160,7 +160,7 @@ It also rebuilds at moments you choose, where the cached conversation can still 
 - `/cd`, which loads the instruction files and memory of the new directory
 - `/reload`, which applies everything at once
 
-MCP servers never change the definitions. While any server is enabled, they hold one `mcp` tool, and the servers and their tools reach the model in a [`# MCP servers` reminder](/docs/mcp/#code-mode) instead. A server that connects, fails, or changes its tools changes only that reminder.
+MCP servers never change the definitions. The `code` tool is always there, and the servers and their tools reach the model in a [`# MCP servers` reminder](/docs/mcp/#code-mode) instead. A server that connects, fails, or changes its tools changes only that reminder.
 
 To keep the cache through a long task, save your edits and let the next rebuild take them in. When the model needs a change right away, such as a tool you turned back on, run `/reload` and pay for one full read.
 
@@ -197,7 +197,7 @@ You add the `analytics` server of the [HTTP example](/docs/mcp/#http) to `~/.con
 <system-reminder>
 # MCP servers
 
-Call these with the `mcp` tool: `await <server>.<tool>(...)`. This list is complete: do not guess other names.
+Call these with the `code` tool: `await <server>.<tool>(...)`. This list is complete: do not guess other names.
 
 ## analytics (connected, 1 tool)
 - run_query(*, sql: str) -> Any: Run a read-only SQL query against the warehouse.
@@ -206,15 +206,15 @@ Call these with the `mcp` tool: `await <server>.<tool>(...)`. This list is compl
 </system-reminder>
 ```
 
-The model can call the new tool through `mcp` at once. When `analytics` is the first server you enable, the `mcp` tool itself is new. The model then also gets a `# Configuration changed` reminder for it, and `mcp` becomes callable at the next rebuild. Run `/reload` to make that happen now.
+The model can call the new tool through `code` at once.
 
 #### Turn off an MCP server
 
-You turn a server off in `/mcp`. Caudra writes `mcp.toml` itself, so the footer stays quiet. The server stops at once, and the next server list leaves it out. The definitions stay as they were, so the cache holds. When it was the last enabled server, a short reminder tells the model to disregard the list, and `mcp` stays in the definitions until the next rebuild. A call to it then fails.
+You turn a server off in `/mcp`. Caudra writes `mcp.toml` itself, so the footer stays quiet. The server stops at once, and the next server list leaves it out. The definitions stay as they were, so the cache holds. When it was the last enabled server, a short reminder tells the model to disregard the list.
 
 #### Switch to plan mode
 
-You press `Tab` to plan while MCP servers run. Plan mode keeps the `mcp` tool and refuses each server call it does not allow, so MCP servers do not change the definitions. Only the first switch to plan changes them, by adding the `plan` tool, and that request reads the whole conversation at full price.
+You press `Tab` to plan while MCP servers run. Plan mode keeps the `code` tool and refuses each server call it does not allow, so MCP servers do not change the definitions. Only the first switch to plan changes them, by adding the `plan` tool, and that request reads the whole conversation at full price.
 
 #### Disable a tool
 
@@ -279,7 +279,7 @@ decision_engine = true
 | `sandboxes` | `false` | [Managed sandboxes](/docs/sandboxes/): `caudra sandbox`, `caudra auth sandbox`, `--sandbox`, `/sandbox`, and the workbench Transfer view. Sandboxes bring their own connection to Workcell and do not need `remote_workcell`. |
 | `remote_workcell` | `false` | Direct [remote Workcell](/docs/remote-workspaces/) connections: the `--workcell-*` flags and `caudra auth workcell`. |
 | `lua_plugins` | `false` | Every use of Lua: [plugins](/docs/plugins/), the [Lua API](/docs/lua-api/), global and project `init.lua`, and the `caudra-plugin-dev` skill. `--no-plugins` still turns Lua off for one run. |
-| `decision_engine` | `false` | The [decision engine](#decisions), [Auto mode](/docs/permissions/#auto-mode), `caudra decisions`, workflow [`decide()` calls](/docs/workflows/#typed-decisions), and the [`decide()` and `rerank()` helpers](/docs/mcp/#decisions-and-reranking) of MCP code mode. |
+| `decision_engine` | `false` | The [decision engine](#decisions), [Auto mode](/docs/permissions/#auto-mode), `caudra decisions`, workflow [`decide()` calls](/docs/workflows/#typed-decisions), and the [`decide()` and `rerank()` helpers](/docs/code/#decisions-and-reranking) of the `code` tool. |
 | `cross_session_messaging` | `false` | Local [cross-session messaging](/docs/messaging/): the `list_sessions`, `send_message`, `publish_message`, `read_topic`, and `work_assignment` tools, `/peers`, `/messages`, `/topics`, `/groups`, `caudra message`, live session inboxes, consumer groups, and the message history. Both processes must opt in. |
 | `automations` | `false` | [Automations](/docs/automations/): scripts that act on session events when their conditions hold, within the limits in [`[automations]`](#automations), and the `caudra-automation-dev` skill. Messaging triggers and actions also need `cross_session_messaging`, and workflow triggers and actions also need `workflows`. |
 | `autopilot` | `false` | [Autopilot](/docs/autopilot/): keep a session moving toward its goal unattended, answering permission prompts and questions within the limits in [`[autopilot]`](#autopilot). |
@@ -349,7 +349,7 @@ To keep using `init.lua`, set `lua_plugins = true` under `[experimental]`. Its `
 | `tooltips` | bool | `true` | - | - | Show a tooltip when the mouse rests on a footer chip, a composer, queue or permission prompt control, an icon, a cut-off name or a paste token |
 | `typewriter_ms_per_char` | u64 | `4` | - | - | Typewriter effect speed (ms/char) |
 | `mouse_scroll_lines` | u32 | `3` | - | 1 | Lines per mouse wheel scroll |
-| `scroll_card_lines` | u32 | `10` | - | - | Rows of body a shell, python_execution or task card draws. The window follows new output while it sits at the bottom and pauses when scrolled up. Click inside a window to give it the wheel, which passes back to the transcript at either edge, and drag the bar in its last column to move it directly. `0` turns scrolling off, restoring the `ui.tool_output_lines` budget for those tools. A write is never windowed: it is drawn whole at any setting, as the file it created or as the diff of what it replaced |
+| `scroll_card_lines` | u32 | `10` | - | - | Rows of body a shell, code or task card draws. The window follows new output while it sits at the bottom and pauses when scrolled up. Click inside a window to give it the wheel, which passes back to the transcript at either edge, and drag the bar in its last column to move it directly. `0` turns scrolling off, restoring the `ui.tool_output_lines` budget for those tools. A write is never windowed: it is drawn whole at any setting, as the file it created or as the diff of what it replaced |
 | `always_collapsed` | string[] | `["file_read", "file_glob", "file_grep", "file_index", "webfetch"]` | - | - | Tools whose card never opens on its own: the call stays a single row in every view mode until you click it. A server-qualified name still matches, so `file_read` also covers `mcp_File_read`. Set to `[]` to opt out |
 | `max_input_lines` | u32 | `20` | - | 1 | Maximum visible input lines |
 | `show_thinking` | bool | `true` | - | - | Show full model reasoning live and persisted. Turn this off to start every reasoning block collapsed behind a Thinking or Thought header that can be clicked to expand |
@@ -422,19 +422,19 @@ Enabled by default. The first interactive start after an update opens the releas
 
 How many terminal rows of output an open card shows per tool before it says how many it is holding back. A line that wraps spends a row for each row it wraps to, so an abridged card is the same height whatever its lines are. Clicking the card shows all of it regardless. All values are `usize` with a minimum of 1.
 
-The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_card_lines` is `0`. Above that, those tools draw a fixed window of that many rows instead, and the budget here goes unused. `write` does not reach a `file_write` that created a file, whose body is that file and is always drawn whole. It is also a floor rather than a bound for anything drawn as a diff, since a diff is already only the part that changed: an edit, a patch, and an overwrite are drawn whole until they run long, and raising `write` past that point is what makes this number matter to them. No entry reaches an MCP call's card, which opens with its arguments and its whole answer.
+The `bash`, `code`, and `task` entries apply only when `ui.scroll_card_lines` is `0`. Above that, those tools draw a fixed window of that many rows instead, and the budget here goes unused. `write` does not reach a `file_write` that created a file, whose body is that file and is always drawn whole. It is also a floor rather than a bound for anything drawn as a diff, since a diff is already only the part that changed: an edit, a patch, and an overwrite are drawn whole until they run long, and raising `write` past that point is what makes this number matter to them. No entry reaches an MCP call's card, which opens with its arguments and its whole answer.
 
 | Field | Default | Tools |
 |-------|---------|-------|
 | `bash` | 5 | `shell` |
-| `python_execution` | 5 | `python_execution` |
+| `code` | 5 | `code` |
 | `task` | 12 | `task`, `task_control` |
 | `index` | 3 | `file_index`, `code_map`, `code_context`, `code_refs`, `code_impact`, `code_expand` |
 | `grep` | 3 | `file_grep`, `file_glob` |
 | `read` | 3 | `file_read` |
 | `write` | 7 | `file_write`, `file_edit`, `file_apply_patch`, `image_generate`, `memory`, `plan` |
 | `web` | 3 | `webfetch`, `websearch` |
-| `other` | 3 | `automation`, `batch`, `execution_environment`, `list_sessions`, `mcp`, `publish_message`, `question`, `read_topic`, `send_message`, `skill`, `todo_write`, `tool_output`, `view_image`, `work_assignment`, `workflow` |
+| `other` | 3 | `automation`, `batch`, `execution_environment`, `list_sessions`, `publish_message`, `question`, `read_topic`, `send_message`, `skill`, `todo_write`, `tool_output`, `view_image`, `work_assignment`, `workflow` |
 
 ### `agent`
 
@@ -723,7 +723,7 @@ Connection settings and thresholds are global-only. Projects may set individual 
 | `allow_remote` | boolean | `false` | Explicit global consent to send decision context to a non-loopback endpoint. |
 | `allow_http` | boolean | `false` | Global-only opt-in for non-loopback HTTP. Also requires `allow_remote = true`. Use only with transport protection you control, such as a trusted encrypted tunnel. |
 | `timeout_ms` | integer | `800` | Positive decision-request deadline in milliseconds, separate from shell execution timeouts. Tool search and every reranking feature except memory recall use `rerank_timeout_ms` instead. |
-| `rerank_timeout_ms` | integer | `2000` | Positive deadline in milliseconds for tool search and the reranking features, which judge at most 16 candidates per request and send their requests concurrently. Memory recall keeps `timeout_ms` because it delays the start of a turn. A `decide()` or `rerank()` call from a workflow or an MCP snippet may ask for up to the larger of the two. |
+| `rerank_timeout_ms` | integer | `2000` | Positive deadline in milliseconds for tool search and the reranking features, which judge at most 16 candidates per request and send their requests concurrently. History search lets each request wait one budget per request in its pool, so an engine that answers one request at a time still gets through its pool. Memory recall keeps `timeout_ms` because it delays the start of a turn. A `decide()` or `rerank()` call from a workflow or a `code` snippet may ask for up to the larger of the two. |
 | `log` | boolean | `false` | Retain bounded decision records in the local `caudra.db`. |
 | `log_retention_days` | integer | `90` | Positive retention period for decision records. |
 | `features` | table | `{}` | Per-feature modes below. |
@@ -784,6 +784,7 @@ Redaction is best effort. Decision context can include commands, task text, tool
 | `subagent_routing` | `off` | `off`, `shadow`, `enforce` | Choose a model job for a new unpinned subagent from its task label, mode, profile, and a redacted prompt excerpt. Explicit jobs, models chosen on the `task` call, profile pins, and continuations keep their routing. |
 | `question_tool_nudge` | `off` | `off`, `shadow`, `advise` | At a main-session handoff with a usable question tool, advise adds one visible reminder per user-input episode to ask a live user question through that tool. Shadow only evaluates. Uses a redacted, bounded request and reply excerpt; uncertainty and failures leave the reply unchanged. |
 | `memory_search` | `off` | `off`, `shadow`, `enforce` | Rerank the memory tool's keyword matches against the agent's query and omit those judged unrelated, saying how many were omitted. Sends the query and each candidate note's name, heading, and a redacted body excerpt. |
+| `history_search` | `off` | `off`, `shadow`, `enforce` | Rerank session history search's keyword matches against the agent's query, drop those judged unrelated, and return the rest best first. Sends the query and each candidate's kind, tool, date, session title, and a redacted excerpt. |
 | `memory_recall` | `off` | `off`, `shadow`, `advise` | In main sessions, remind the agent of at most three saved notes likely relevant to a new user message, without loading them. Sends a redacted message excerpt and each keyword-matched note's name, heading, and redacted excerpt. |
 | `memory_duplicates` | `off` | `off`, `shadow`, `advise` | When a new memory note is written, name existing notes that may cover the same topic in the write receipt. The write itself is never blocked or changed. Sends redacted excerpts of the new note and of keyword-matched notes. |
 | `compaction_retention` | `off` | `off`, `shadow`, `enforce` | During compaction, keep the tool results most relevant to the active goal, open todos, and latest request instead of only the newest, and keep the most relevant part of a long result. Sends redacted goal, todo, and request excerpts, and each recent result's tool name with redacted input and output excerpts. |
@@ -830,11 +831,11 @@ The request contains redacted excerpts of the current visible reply and relevant
 
 #### Reranking
 
-Tool search, `memory_search`, `memory_recall`, `memory_duplicates`, `compaction_retention`, `output_pointers`, and `code_context` use the engine as a reranker. A cheap first pass, such as keyword matching, picks the candidates. The engine then answers one true or false relevance question per candidate, and Caudra orders, prunes, or names candidates by the probability it returns. The feature table above lists what each one sends.
+Tool search, `memory_search`, `history_search`, `memory_recall`, `memory_duplicates`, `compaction_retention`, `output_pointers`, and `code_context` use the engine as a reranker. A cheap first pass, such as keyword matching, picks the candidates. The engine then answers one true or false relevance question per candidate, and Caudra orders, prunes, or names candidates by the probability it returns. The feature table above lists what each one sends.
 
 One request holds up to 16 candidates, each with an opaque ID such as `c00`. Larger lists go out as concurrent requests under one deadline. Candidate text is redacted and cut to a fixed size before it is sent, and every question tells the engine to treat the candidate as data rather than instructions. The request state, such as the query, task, or goal, stays within the 1,500-byte state limit.
 
-Enforcing features compare each probability with `thresholds.relevance_floor` (default `0.1`). Tool search and `code_context` only reorder, putting candidates at or above the floor first. `memory_search` omits matches below the floor and names them. `compaction_retention` keeps the same number of tool results as without the engine, choosing them by relevance, and never drops a result it could not otherwise drop. Advisory features name a candidate only at or above `thresholds.routing_confidence` (default `0.9`).
+Enforcing features compare each probability with `thresholds.relevance_floor` (default `0.1`). Tool search and `code_context` only reorder, putting candidates at or above the floor first. `memory_search` omits matches below the floor and names them. `history_search` drops matches below the floor and returns the rest best first, as [Ranking](/docs/code/#ranking) describes. `compaction_retention` keeps the same number of tool results as without the engine, choosing them by relevance, and never drops a result it could not otherwise drop. Advisory features name a candidate only at or above `thresholds.routing_confidence` (default `0.9`).
 
 When any request fails, is refused, times out, or is cancelled, or the decision service changes while it runs, the feature behaves as if it were `off`. In `shadow`, requests are sent and logged without effect. With `log = true`, an enforcing feature records `rerouted` when the order it used differs from the first pass, and an advisory feature records `advised` when it named a candidate. Workflows and MCP snippets can rerank their own candidates with `rerank()`: see [workflows](/docs/workflows/#reranking-candidates) and [MCP](/docs/mcp/#decisions-and-reranking). See also [memory relevance](/docs/memory/#relevance-from-the-decision-engine).
 

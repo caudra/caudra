@@ -28,10 +28,12 @@ use caudra_config::sandbox::SandboxName;
 use caudra_config::{Config, Feature, StorageConfig};
 use caudra_lua::PluginHost;
 use caudra_providers::model::Model;
+use caudra_storage::history_search::HistoryScope;
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::sweep::{SweepPolicy, sweep_if_due};
 use caudra_storage::sessions::{
-    SessionDatabase, SessionLease, SessionLocation, SessionRelocation, SessionRelocationResult,
+    SessionDatabase, SessionError, SessionLease, SessionLocation, SessionRelocation,
+    SessionRelocationResult,
 };
 use caudra_storage::state::{WorkspaceTabs, read_workspace_tabs};
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
@@ -71,6 +73,12 @@ const SWEEP_STARTUP_DELAY: Duration = Duration::from_secs(60);
 /// How often the sweep thread re-checks whether the interval has elapsed.
 const SWEEP_POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const SECONDS_PER_HOUR: u64 = 60 * 60;
+const HISTORY_INDEX_STARTUP_DELAY: Duration = Duration::from_secs(5);
+/// How long one indexing pass may hold the index, between short breaks for session saves.
+const HISTORY_INDEX_PASS: Duration = Duration::from_secs(2);
+const HISTORY_INDEX_BREAK: Duration = Duration::from_millis(250);
+/// How often a caught-up index looks for newly saved history.
+const HISTORY_INDEX_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const RELOCATION_ABORTED: &str = "Session relocation was not committed";
 const RELOCATION_DONOR_CHANGED: &str =
     "Destination session disappeared or changed directory; refresh the relocation preview";
@@ -527,6 +535,56 @@ impl RetentionSweeper {
             }
         }
     }
+}
+
+/// Keeps the history search index caught up with saved sessions while the TUI is open: it
+/// backfills in deadline-bounded passes, then looks for new history on an interval. Dropping the
+/// sender wakes and stops the thread; a pass is a series of short transactions, so shutdown never
+/// waits on one. Headless and ACP runs catch up when a search asks.
+struct HistoryIndexer {
+    _stop: Option<Sender<()>>,
+}
+
+impl HistoryIndexer {
+    fn spawn(storage: StateDir) -> Self {
+        if storage.is_ephemeral() {
+            return Self { _stop: None };
+        }
+        let (stop, stopped) = mpsc::channel();
+        let spawned = thread::Builder::new()
+            .name("history-index".into())
+            .spawn(move || {
+                let mut delay = HISTORY_INDEX_STARTUP_DELAY;
+                loop {
+                    match stopped.recv_timeout(delay) {
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+                    }
+                    delay = match index_history(&storage) {
+                        Ok(0) => HISTORY_INDEX_POLL_INTERVAL,
+                        Ok(_) => HISTORY_INDEX_BREAK,
+                        Err(error) => {
+                            tracing::warn!(%error, "history search indexing failed");
+                            HISTORY_INDEX_POLL_INTERVAL
+                        }
+                    };
+                }
+            });
+        match spawned {
+            Ok(_) => Self { _stop: Some(stop) },
+            Err(error) => {
+                tracing::warn!(%error, "history index thread not started");
+                Self { _stop: None }
+            }
+        }
+    }
+}
+
+/// One indexing pass over every session, returning how many still have history to index.
+fn index_history(storage: &StateDir) -> Result<usize, SessionError> {
+    let progress = SessionDatabase::open_state(storage)?
+        .catch_up_history(&HistoryScope::All, Instant::now() + HISTORY_INDEX_PASS)?;
+    Ok(progress.pending_sessions)
 }
 
 /// One generation of the app: everything torn down and rebuilt on `/reload`.
@@ -1600,6 +1658,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
     let mut host_reporter = terminal_host.as_deref().and_then(Reporter::for_host);
     crate::progress::uninstall();
     let mut sweeper = RetentionSweeper::spawn(storage.clone(), stack.config.storage);
+    let _history_indexer = HistoryIndexer::spawn(storage.clone());
     let mut committed_relocation: Option<String> = None;
     let sandboxes = cli.startup.features.enabled(Feature::Sandboxes);
     let messaging_flags = cli.requests_messaging();

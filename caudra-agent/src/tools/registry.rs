@@ -562,6 +562,8 @@ pub struct PermissionIntent {
     pub authority: PermissionAuthorityProfile,
     /// What the prompt knows about a call to a recognised MCP server.
     pub mcp: Option<McpCallFacts>,
+    /// What the prompt says the call does, one line each, in place of the tool's own summary.
+    pub action: Option<String>,
 }
 
 impl PermissionIntent {
@@ -576,11 +578,17 @@ impl PermissionIntent {
             risk,
             authority: PermissionAuthorityProfile::default(),
             mcp: None,
+            action: None,
         }
     }
 
     pub fn with_authority(mut self, authority: PermissionAuthorityProfile) -> Self {
         self.authority = authority;
+        self
+    }
+
+    pub fn with_action(mut self, action: String) -> Self {
+        self.action = Some(action);
         self
     }
 }

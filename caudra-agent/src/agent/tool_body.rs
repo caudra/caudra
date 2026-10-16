@@ -78,7 +78,7 @@ const BODY_ARGS: &[(&str, &[&str], Body)] = &[
     ("file_edit", &["oldString", "newString"], Body::Counted),
     ("file_apply_patch", &["patchText"], Body::Named),
     ("shell", &["command"], Body::Drawn),
-    ("python_execution", &["code"], Body::Drawn),
+    ("code", &["code"], Body::Drawn),
     ("memory", &["content"], Body::Drawn),
     ("plan", &["content"], Body::Drawn),
     ("task", &["prompt"], Body::Drawn),
@@ -443,7 +443,7 @@ mod tests {
     #[test_case(EDIT, Some((EDIT_KEYS, Body::Counted)) ; "an_edit_reads_both_sides")]
     #[test_case(PATCH, Some((PATCH_TEXT_KEYS, Body::Named)) ; "a_patch_reads_its_envelope")]
     #[test_case(SHELL, Some((COMMAND_KEYS, Body::Drawn)) ; "a_command_is_drawn")]
-    #[test_case("python_execution", Some((CODE_KEYS, Body::Drawn)) ; "a_script_is_drawn")]
+    #[test_case("code", Some((CODE_KEYS, Body::Drawn)) ; "a_script_is_drawn")]
     #[test_case(MEMORY, Some((CONTENT_KEYS, Body::Drawn)) ; "a_note_is_drawn")]
     #[test_case("plan", Some((CONTENT_KEYS, Body::Drawn)) ; "a_plan_is_drawn")]
     #[test_case(TASK, Some((PROMPT_KEYS, Body::Drawn)) ; "a_delegation_draws_its_prompt")]

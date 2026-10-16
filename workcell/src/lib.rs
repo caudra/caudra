@@ -19,7 +19,7 @@ use shell_environment::ShellForwarding;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use transports::{TransportError, TransportOutcome, http::HttpAuthentication};
-use workcell_mcp_code::{CodeConfiguration, WorkerSource};
+use workcell_mcp_code::{CodeConfiguration, CodePools, WorkerSource};
 use workcell_mcp_shell::ShellPermissionPolicy;
 use workcell_mcp_web::WebsearchExecutionConfiguration;
 
@@ -60,6 +60,7 @@ pub async fn run(
                     WorkerSource::Path,
                 ),
                 type_check: options.code_type_check,
+                pools: CodePools::All,
             },
             max_transfer_bytes: options.max_transfer_bytes,
             snapshot_root: options.snapshot_root.as_deref(),

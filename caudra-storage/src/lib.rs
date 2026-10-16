@@ -16,6 +16,7 @@ pub mod digest_trust;
 pub mod engine_decisions;
 #[path = "sessions/goal_log.rs"]
 pub mod goal_log;
+pub mod history_search;
 pub mod id;
 pub mod input_history;
 pub mod local_documents;

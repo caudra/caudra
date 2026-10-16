@@ -55,6 +55,7 @@ use crate::autopilot::review::{self, Stall, TurnEnd, Verdict};
 use crate::autopilot::{self, AutopilotHandle, AutopilotSnapshot, ChatSession, DelegateAction};
 use crate::background::{BackgroundTasks, JobScope, SessionWork};
 use crate::cancel::{CancelMap, CancelToken};
+use crate::code::CodeSession;
 use crate::context::{
     BuiltinToolsInput, ContextCapture, ContextInventory, ContextPublisher, ContextReadiness,
     ContextSnapshot, estimate_context_usage,
@@ -80,7 +81,7 @@ use crate::tools::native::peers::WORK_NAME;
 use crate::tools::native::plan::{self, PlanTarget};
 use crate::tools::native::skill::{self, SkillInventoryEntry};
 use crate::tools::{
-    BATCH_TOOL_NAME, MCP_TOOL_NAME, MEMORY_TOOL_NAME, QUESTION_TOOL_NAME, SKILL_TOOL_NAME,
+    BATCH_TOOL_NAME, CODE_TOOL_NAME, MEMORY_TOOL_NAME, QUESTION_TOOL_NAME, SKILL_TOOL_NAME,
     TASK_TOOL_NAME,
 };
 use crate::tools::{BuiltinDeferral, DeferralSession, DeferredTool};
@@ -469,6 +470,7 @@ pub struct Agent<'h> {
     loaded_instructions: LoadedInstructions,
     rollback_len: usize,
     mcp: Option<McpSession>,
+    code: CodeSession,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     tool_output_store: Option<Arc<ToolOutputStore>>,
@@ -608,6 +610,7 @@ impl<'h> Agent<'h> {
         };
         let steering = Steering::new(params.config.steering.resolve(&model.spec()));
         let recent_calls = RecentCalls::with_threshold(steering.repeat_threshold());
+        let code = CodeSession::new(run.history.as_slice());
         Self {
             provider: params.provider,
             model,
@@ -651,6 +654,7 @@ impl<'h> Agent<'h> {
             loaded_instructions: LoadedInstructions::new(),
             rollback_len: 0,
             mcp: None,
+            code,
             reauth_attempts: 0,
             opts: RequestOptions::default(),
             session_id: params.session_id,
@@ -707,6 +711,13 @@ impl<'h> Agent<'h> {
 
     pub fn with_mcp(mut self, mcp: Option<McpSession>) -> Self {
         self.mcp = mcp.map(|mcp| mcp.with_actor_policy(Arc::clone(&self.profile_tool_policy)));
+        self
+    }
+
+    /// The variables this agent's `code` runs keep, when they must outlive the agent: a front
+    /// end that builds an agent per turn passes the conversation's own.
+    pub fn with_code(mut self, code: CodeSession) -> Self {
+        self.code = code;
         self
     }
 
@@ -1180,10 +1191,11 @@ impl<'h> Agent<'h> {
             None
         };
         standing.extend(favorites::notice(self.history.as_slice(), favorites));
+        let code_available = tool_context.tool_available(CODE_TOOL_NAME);
         standing.extend(catalog::notice(
             self.history.as_slice(),
-            self.catalog_mcp(&tool_context).as_ref(),
-            self.permissions.decisions().is_some(),
+            self.catalog_mcp().filter(|_| code_available).as_ref(),
+            code_available && self.permissions.decisions().is_some(),
         ));
         standing.extend(mode_switch_notice_with_tools(
             self.history.as_slice(),
@@ -1589,13 +1601,9 @@ impl<'h> Agent<'h> {
     }
 
     /// What the `# MCP servers` reminder lists: the agent's MCP view, narrowed only by what holds
-    /// for its whole life, so switching between plan and build never restates it. `None` when
-    /// the agent cannot reach the `mcp` tool.
-    fn catalog_mcp(&self, tool_context: &ToolContext) -> Option<McpSession> {
+    /// for its whole life, so switching between plan and build never restates it.
+    fn catalog_mcp(&self) -> Option<McpSession> {
         let mcp = self.mcp.clone()?;
-        if !tool_context.tool_available(MCP_TOOL_NAME) {
-            return None;
-        }
         Some(
             if self.tool_filter.is_read_only() || self.audience == ToolAudience::RESEARCH_SUB {
                 mcp.narrowed(&ToolFilter::ReadOnly(Box::new(ToolFilter::All)))
@@ -3739,6 +3747,7 @@ impl<'h> Agent<'h> {
                     ToolFilter::All.for_mcp_mode(&self.mode)
                 })
             }),
+            code: self.code.clone(),
             deferral: Some(self.deferral.clone()),
             deadline: Deadline::None,
             config: self.config.clone(),
@@ -9347,7 +9356,7 @@ mod tests {
     }
 
     /// The request prefix never depends on what the servers offer: the tools and the system
-    /// prompt read the same byte for byte for any catalog, and an `mcp` run loads nothing into
+    /// prompt read the same byte for byte for any catalog, and an `code` run loads nothing into
     /// them, so the provider's prompt cache survives servers coming and going.
     #[test]
     fn mcp_state_never_reaches_the_request_prefix() {
@@ -9359,7 +9368,7 @@ mod tests {
                 let captured_system = Arc::clone(&provider.captured_system);
                 let mut history = History::new(Vec::new());
                 let (mut agent, _event_rx) = make_agent(provider, &mut history);
-                agent.tools = serde_json::json!([{ "name": MCP_TOOL_NAME }]);
+                agent.tools = serde_json::json!([{ "name": CODE_TOOL_NAME }]);
                 crate::tools::native::register(&agent.registry, agent.config.features).unwrap();
                 let mut agent = agent.with_mcp(Some(crate::mcp::stub_session(tools)));
                 agent.run(default_input()).await.unwrap();
@@ -9372,7 +9381,7 @@ mod tests {
         let ran = prefixes(
             &[(MCP_FETCH_ISSUE, MCP_FETCH_ISSUE_DESCRIPTION)],
             vec![
-                tool_use_response(MCP_TOOL_NAME, serde_json::json!({ "code": "1" })),
+                tool_use_response(CODE_TOOL_NAME, serde_json::json!({ "code": "1" })),
                 text_response(StopReason::EndTurn),
             ],
         );
@@ -9384,7 +9393,7 @@ mod tests {
             vec![text_response(StopReason::EndTurn)],
         );
         assert_eq!(ran.len(), 2);
-        assert_eq!(tool_names(&ran[0].0), [MCP_TOOL_NAME]);
+        assert_eq!(tool_names(&ran[0].0), [CODE_TOOL_NAME]);
         assert_eq!(ran[0], ran[1]);
         assert_eq!(ran[0], other[0]);
     }
@@ -9421,7 +9430,7 @@ mod tests {
             let captured_tools = Arc::clone(&provider.captured_tools);
             let mut history = History::new(legacy.clone());
             let (mut agent, _events) = make_agent(provider, &mut history);
-            agent.tools = json!([{ "name": MCP_TOOL_NAME }]);
+            agent.tools = json!([{ "name": CODE_TOOL_NAME }]);
             let mut agent = agent.with_mcp(Some(crate::mcp::stub_session(&[(
                 MCP_FETCH_ISSUE,
                 MCP_FETCH_ISSUE_DESCRIPTION,
@@ -9435,7 +9444,7 @@ mod tests {
             );
             assert_eq!(
                 tool_names(&captured_tools.lock().unwrap()[0]),
-                [MCP_TOOL_NAME]
+                [CODE_TOOL_NAME]
             );
         });
     }

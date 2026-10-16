@@ -49,7 +49,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
         &[
             "batch",
             "shell",
-            "python_execution",
+            "code",
             "execution_environment",
             "question",
         ],
@@ -70,7 +70,6 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "plan",
             "memory",
             "skill",
-            "mcp",
         ],
     ),
     ("Media", &["image_generate"]),
@@ -154,7 +153,7 @@ fn write_on_demand_section(out: &mut String) {
          rest of the session. Sessions that never need them never pay for their descriptions. \
          An explicit profile policy can make other native, local or remote Workcell, Lua/plugin, \
          or local callback tools lazy too. A lazy MCP tool stays out of the \
-         [server list](/docs/mcp/#code-mode) and is found with `search()` inside `mcp`. \
+         [server list](/docs/mcp/#code-mode) and is found with `search()` inside `code`. \
          A known-name direct call to an eligible lazy tool is valid and loads its schema. \
          `tool_search` disappears when no eligible pending tools remain."
     )
@@ -360,9 +359,11 @@ fn tool_notes(name: &str) -> &'static [&'static str] {
             "A directory search skips the `.git`, `.ssh`, and `.workcell` directories below it and these credential files, in any letter case: `.env` and `.env.*`, `.npmrc`, `.pypirc`, `.netrc`, files ending in `.key`, and the SSH private keys `id_rsa`, `id_dsa`, `id_ecdsa`, and `id_ed25519`. Naming one of these files by its path still reaches it, subject to [permissions](/docs/permissions/).",
         ],
         "view_image" => &["Only models that accept images are offered `view_image`."],
-        "mcp" => &[
-            "Offered while at least one [MCP server](/docs/mcp/#code-mode) is enabled, whether or not it has connected. The servers and their tools reach the model in a `# MCP servers` reminder, so a server connecting or changing its tools never changes the tool definitions.",
-            "Snippets run on this machine in the bundled Monty worker, even when the session uses a remote Workcell. Variables persist between runs of the same agent, in memory only. Each server call a snippet makes goes through [permissions](/docs/permissions/#mcp-tool-calls) on its own, and reading a resource asks first.",
+        "code" => &[
+            "Offered in every session, with or without [MCP servers](/docs/mcp/#code-mode). [Code](/docs/code/) covers snippets, [history search](/docs/code/#search-past-conversations), and the decision helpers. Snippets run on this machine in the bundled Monty worker, even when the session uses a remote Workcell. Variables persist between runs of the same agent, in memory only.",
+            "A snippet has no file system, network, environment variables, or subprocesses, and runs under time, memory, and recursion limits. Host clocks, unseeded randomness, and sleep are refused. A snippet that calls nothing outside the interpreter has nothing to ask about, so it runs without a prompt.",
+            "Release builds include the Monty worker. `WORKCELL_MCP_CODE_WORKER` can override it with an operator-supplied worker binary.",
+            "Enabled servers and their tools reach the model in a `# MCP servers` reminder, so a server connecting or changing its tools never changes the tool definitions. Each server call a snippet makes goes through [permissions](/docs/permissions/#mcp-tool-calls) on its own, and reading a resource asks first.",
         ],
         "shell" => &[
             "`agent.shell_execution` selects `sync`, `auto`, or `async` independently of task execution. In `auto`, a validated requested timeout above `agent.shell_async_threshold_secs` returns an admission receipt. The default threshold is 120 seconds. This is not elapsed-time promotion and never extends the hard execution deadline. Shell has no per-call `background` argument. See [execution policies](/docs/sessions/#execution-policies) for frontend support and child-owned command results.",
@@ -370,10 +371,6 @@ fn tool_notes(name: &str) -> &'static [&'static str] {
             "A rule that would report success applies only when the command exited zero, so a failure is never shown as a success. When a failing command reaches a rule's line cap, the result keeps its first and last lines. Filtering never makes a result larger than the raw output, and a filtered result ends with a `[filtered: …]` line that names the stages which changed it. Most rules come from [RTK](https://github.com/rtk-ai/rtk), credited in Workcell's notice file.",
             "A progress bar redraws a row instead of printing lines. Caudra renders both the live view and the capture as a terminal would show them, so a bar appears as one updating row rather than a single very long line, and the output printed before it is not pushed out of the retained window. Rendering is decoding rather than filtering, so `--no-rtk` does not disable it. The footer reports how many frames were absorbed.",
             "Commands start from a cleared environment. [Shell host configuration](/docs/cli/#shell-host-configuration) lists the variables they receive.",
-        ],
-        "python_execution" => &[
-            "Scripts run in a separate worker process with no file system, network, environment variables, or subprocesses, under time, memory, and recursion limits. Host clocks, unseeded randomness, and sleep are refused. Because that isolation fixes what a script can reach, the default permission policy allows the tool without a prompt.",
-            "Release builds include the isolated Monty worker. `WORKCELL_MCP_CODE_WORKER` can override it with an operator-supplied worker binary.",
         ],
         "webfetch" => &[
             "Every URL is checked before a connection opens. A private, loopback, link-local, or carrier-grade NAT address is refused, including an IPv6 form that maps to one, and so is a special-use name such as `localhost`, `.local`, or `home.arpa`. Every address a name resolves to must pass, and the connection goes only to those checked addresses. Up to 5 redirects are followed, each checked the same way, and a redirect to another origin carries only the `Accept`, `Accept-Language`, `Cache-Control`, `Pragma`, `Range`, and `User-Agent` headers. With a proxy configured, the proxy resolves the name and the URL checks still run locally.",
@@ -439,9 +436,7 @@ fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
     let registry = Arc::new(ToolRegistry::new());
     let workcell =
         caudra_workcell::WorkcellHost::new(repository_path(""), None).expect("Workcell host");
-    workcell
-        .register_documented_tools(&registry)
-        .expect("Workcell tools");
+    workcell.register(&registry).expect("Workcell tools");
     caudra_agent::tools::native::register(&registry, FeatureFlags::all())
         .expect("native Caudra tools");
     let mut host = PluginHost::new(Arc::clone(&registry)).expect("plugin host");

@@ -212,7 +212,7 @@ let answer = agent(args.objective, #{ model_job: job });
 complete(answer.output);
 ```
 
-Questions follow the shape of OpenAI Decisions: an array of maps, each with a `type`, a unique `name`, and `instructions`, which can be a string or a map. The same shape works in [MCP code mode](/docs/mcp/#decisions-and-reranking).
+Questions follow the shape of OpenAI Decisions: an array of maps, each with a `type`, a unique `name`, and `instructions`, which can be a string or a map. The same shape works in the [`code` tool](/docs/code/#decisions-and-reranking).
 
 | Type | Extra field | Answer |
 |------|-------------|--------|

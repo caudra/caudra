@@ -45,7 +45,7 @@ PUBLISHED_ERROR = "Published releases must never be modified"
 INVENTORY_ERROR = "Asset inventory mismatch"
 UPLOAD_ERROR = "simulated interrupted upload"
 WORKFLOWS = Path(__file__).resolve().parent.parent / ".github/workflows"
-SMOKE_WORKER_WARNING = "Workcell python_execution is unavailable"
+SMOKE_WORKER_WARNING = "The code tool is unavailable"
 SMOKE_STARTUP_ERROR = "resolve data directory: Permission denied"
 CURATED_NOTES = (
     "- One highlight.\n\n"
@@ -1682,7 +1682,7 @@ class NixSmokeTests(unittest.TestCase):
         )
 
     def test_success_uses_private_home_and_xdg_directories(self):
-        result = self.run_smoke("file_read\npython_execution")
+        result = self.run_smoke("file_read\ncode")
         self.assertEqual(result.returncode, 0, result.stderr)
         *directories, arguments = self.record.read_text().splitlines()
         self.assertEqual(len(directories), len(SMOKE_DIRECTORIES))
@@ -1701,9 +1701,9 @@ class NixSmokeTests(unittest.TestCase):
     def test_missing_worker_and_command_failures_report_captured_output(self):
         for stdout, stderr, status in (
             ("file_read", "", 0),
-            ("python_execution_unavailable", "", 0),
-            ("python_execution", SMOKE_WORKER_WARNING, 0),
-            ("python_execution", SMOKE_STARTUP_ERROR, 7),
+            ("code_map", "", 0),
+            ("code", SMOKE_WORKER_WARNING, 0),
+            ("code", SMOKE_STARTUP_ERROR, 7),
         ):
             with self.subTest(stdout=stdout, stderr=stderr, status=status):
                 result = self.run_smoke(stdout, stderr, status)

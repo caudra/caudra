@@ -9,7 +9,7 @@
           {
             "type": "tool_use",
             "id": "call_bf1feba67b294e11bb070845b2b2071c",
-            "name": "mcp",
+            "name": "code",
             "input": {
               "code": "first = await everything.get_sum(a=2, b=3)\nsecond = await everything.get_sum(a=2, b=3)\nfirst == second"
             }

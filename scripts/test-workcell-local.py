@@ -698,7 +698,7 @@ def main():
                 "--snapshot-root",
                 str(temp / "snapshots"),
             ]
-            for group in ("files", "code_graph", "web", "shell", "python_execution"):
+            for group in ("files", "code_graph", "web", "shell", "code"):
                 args += ["--tool-group", group]
             for flag in (
                 "server-id",

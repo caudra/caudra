@@ -28,7 +28,7 @@ Install these yourself:
 
 - [rustup](https://rustup.rs). `rust-toolchain.toml` pins Rust 1.99.1, and rustup fetches it with clippy and rustfmt the first time you build.
 - GNU Make and Bash for the targets in the `Makefile`, and [cargo-nextest](https://nexte.st) for the tests.
-- Python 3, which builds the worker behind the `python_execution` tool, and [ripgrep](https://github.com/BurntSushi/ripgrep), which some tests call.
+- Python 3, which builds the worker behind the `code` tool, and [ripgrep](https://github.com/BurntSushi/ripgrep), which some tests call.
 - [stylua](https://github.com/JohnnyMorganz/StyLua), [ruff](https://docs.astral.sh/ruff/), [ty](https://github.com/astral-sh/ty), and [cargo-machete](https://github.com/bnjbvr/cargo-machete) for the formatting and lint checks.
 
 On Windows, run Make from Git Bash and install GNU Make separately. CI provisions GNU Make explicitly. The Makefile uses `python3` by default. If your Python 3 executable is named `python`, use `make PYTHON=python <target>`.
@@ -43,7 +43,7 @@ cd caudra
 make run           # start a debug build
 ```
 
-Cargo-compiling targets depend on `code-worker` automatically: `build`, `check`, `run`, `test`, `lint`, `install`, `install-fast`, `gen-docs`, `gen-docs-check`, and the Workcell targets that compile Rust. No manual bootstrap is needed. The first run downloads and compiles the worker, and later runs reuse it. Run `make code-worker` for an optional warmup. A plain `cargo build` works without the worker, but that binary has no `python_execution` tool and says so at startup.
+Cargo-compiling targets depend on `code-worker` automatically: `build`, `check`, `run`, `test`, `lint`, `install`, `install-fast`, `gen-docs`, `gen-docs-check`, and the Workcell targets that compile Rust. No manual bootstrap is needed. The first run downloads and compiles the worker, and later runs reuse it. Run `make code-worker` for an optional warmup. A plain `cargo build` works without the worker, but in that binary the `code` tool cannot run, and it says so at startup.
 
 A debug build keeps its own config, sessions, sign-ins, and logs in `caudra-debug` directories, such as `~/.config/caudra-debug/`. Your everyday Caudra keeps using its own, and the two share only project `.caudra/` directories. Sign in once inside the debug build with `make run ARGS='-- auth login'`. The `run` target passes `ARGS` to Cargo, so arguments for Caudra go after the `--`. To choose another directory name, set `CAUDRA_NAMESPACE`.
 
@@ -86,9 +86,9 @@ Before you ask for review, run `make ci`. CI also runs the macOS and Windows bui
 
 ## MCP server tests
 
-`make test-mcp-servers` runs the `mcp` tool against real MCP servers: server-everything, Executor, and Home Assistant, each pinned in a Dockerfile under `tests/mcp-servers/`. It needs Docker, and a remote daemon works through `DOCKER_HOST`. CI never runs these tests, and `make test` skips them. `scripts/mcp-servers.py` builds the images, starts and onboards Home Assistant, runs the tests, and then removes every container labelled `caudra-mcp-it`.
+`make test-mcp-servers` runs the `code` tool against real MCP servers: server-everything, Executor, and Home Assistant, each pinned in a Dockerfile under `tests/mcp-servers/`. It needs Docker, and a remote daemon works through `DOCKER_HOST`. CI never runs these tests, and `make test` skips them. `scripts/mcp-servers.py` builds the images, starts and onboards Home Assistant, runs the tests, and then removes every container labelled `caudra-mcp-it`.
 
-The tests in `caudra-workcell/tests/mcp_servers/` run fixed snippets through the `mcp` gateway. The ones in `tests/mcp_sessions/` drive the `caudra` binary over stream-json, as an SDK client would, and answer its permission prompts. Their model answers come from cassettes in `tests/mcp_sessions/cassettes/`, so they need no model and no credentials. When a change alters what Caudra asks the model, record them again with a real model:
+The tests in `caudra-workcell/tests/mcp_servers/` run fixed snippets through the `code` gateway. The ones in `tests/mcp_sessions/` drive the `caudra` binary over stream-json, as an SDK client would, and answer its permission prompts. Their model answers come from cassettes in `tests/mcp_sessions/cassettes/`, so they need no model and no credentials. When a change alters what Caudra asks the model, record them again with a real model:
 
 ```sh
 CAUDRA_IT_RECORD=openai/gpt-6-luna make test-mcp-servers ARGS='-E "binary(mcp_sessions)"'

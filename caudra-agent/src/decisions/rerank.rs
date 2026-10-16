@@ -119,13 +119,14 @@ impl Decisions {
             self.mode(&feature),
             FeatureMode::Advise | FeatureMode::Enforce
         );
+        let timeout_ms = feature.rerank_batch_timeout_ms(self.config(), batches.len());
         let answered = join_answered(batches.iter().map(|batch| {
             let feature = feature.clone();
             async move {
                 let Some(Some(outcome)) = admit(
                     permissions,
                     cancel,
-                    self.evaluate(feature, query, &batch.questions, context),
+                    self.evaluate_within(feature, query, &batch.questions, context, timeout_ms),
                 )
                 .await
                 else {
@@ -438,6 +439,7 @@ mod tests {
     }
 
     struct Fixture {
+        feature: DecisionFeature,
         decisions: Decisions,
         session: CaudraId,
         requests: Arc<Mutex<Vec<(DecisionRequest, Duration)>>>,
@@ -446,6 +448,15 @@ mod tests {
 
     impl Fixture {
         fn new(mode: FeatureMode, log: bool, concurrent_batches: Option<usize>) -> Self {
+            Self::for_feature(DecisionFeature::MemorySearch, mode, log, concurrent_batches)
+        }
+
+        fn for_feature(
+            feature: DecisionFeature,
+            mode: FeatureMode,
+            log: bool,
+            concurrent_batches: Option<usize>,
+        ) -> Self {
             let root = tempfile::tempdir().unwrap();
             let mut config = DecisionsConfig {
                 base_url: Some(BASE_URL.parse().unwrap()),
@@ -454,7 +465,8 @@ mod tests {
                 log,
                 ..Default::default()
             };
-            config.features.memory_search = mode;
+            config.features.memory_search = mode.clone();
+            config.features.history_search = mode;
             let requests = Arc::new(Mutex::new(Vec::new()));
             let session = CaudraId::generate();
             let decisions = Decisions::with_engine(
@@ -468,6 +480,7 @@ mod tests {
             .unwrap()
             .for_session(session);
             Self {
+                feature,
                 decisions,
                 session,
                 requests,
@@ -484,7 +497,7 @@ mod tests {
             self.decisions
                 .rerank(
                     Rerank {
-                        feature: DecisionFeature::MemorySearch,
+                        feature: self.feature.clone(),
                         relevance: &RELEVANCE,
                         query: &json!({QUERY_KEY: QUERY}),
                         candidates,
@@ -591,10 +604,11 @@ mod tests {
         });
     }
 
-    #[test]
-    fn batches_run_concurrently_within_the_rerank_deadline() {
+    #[test_case(DecisionFeature::MemorySearch, 1; "one_budget_for_all_batches")]
+    #[test_case(DecisionFeature::HistorySearch, 2; "history_search_gives_each_batch_the_pool_budget")]
+    fn batches_run_concurrently_within_the_rerank_deadline(feature: DecisionFeature, budgets: u32) {
         smol::block_on(async {
-            let fixture = Fixture::new(FeatureMode::Enforce, false, Some(2));
+            let fixture = Fixture::for_feature(feature, FeatureMode::Enforce, false, Some(2));
             let scores: Vec<f64> = (0..SPLIT)
                 .map(|index| index as f64 / SPLIT as f64)
                 .collect();
@@ -611,10 +625,14 @@ mod tests {
                 .collect();
             sizes.sort_unstable();
             assert_eq!(sizes, [SPLIT - MAX_RERANK_BATCH, MAX_RERANK_BATCH]);
+            let rerank_budget = Duration::from_millis(RERANK_TIMEOUT_MS);
             for (request, budget) in &requests {
                 assert_eq!(request.questions.keys().next().unwrap(), FIRST_ID);
-                assert!(*budget > Duration::from_millis(SHORT_TIMEOUT_MS));
-                assert!(*budget <= Duration::from_millis(RERANK_TIMEOUT_MS));
+                assert!(
+                    *budget
+                        > rerank_budget * (budgets - 1) + Duration::from_millis(SHORT_TIMEOUT_MS)
+                );
+                assert!(*budget <= rerank_budget * budgets);
             }
         });
     }

@@ -9,7 +9,7 @@
           {
             "type": "tool_use",
             "id": "call_0ad5cf7423234ae28b1b77235321657a",
-            "name": "mcp",
+            "name": "code",
             "input": {
               "code": "1 + 1"
             }

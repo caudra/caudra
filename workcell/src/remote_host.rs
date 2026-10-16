@@ -136,7 +136,7 @@ pub(crate) enum PreparedRemoteOperation {
         /// Resolved when prepared; `None` runs with the group's own environment.
         environment: Option<ShellEnvironment>,
     },
-    PythonExecution(PreparedCode),
+    Code(PreparedCode),
     ExecutionEnvironment(PreparedExecutionEnvironment),
     WorkspaceMutation(PreparedWorkspaceMutation),
     #[cfg(unix)]
@@ -170,7 +170,7 @@ impl PreparedRemoteOperation {
                 | "websearch"
                 | "webfetch"
                 | "shell"
-                | "python_execution"
+                | "code"
                 | EXECUTION_ENVIRONMENT_TOOL
         )
     }
@@ -204,7 +204,7 @@ impl PreparedRemoteOperation {
                             .map(|(name, value)| name.len() + value.len())
                             .sum::<usize>()
                 })),
-            Self::PythonExecution(prepared) => prepared.retained_bytes(),
+            Self::Code(prepared) => prepared.retained_bytes(),
             Self::ExecutionEnvironment(prepared) => prepared.retained_bytes(),
             Self::WorkspaceMutation(prepared) => prepared.retained_bytes(),
             #[cfg(unix)]

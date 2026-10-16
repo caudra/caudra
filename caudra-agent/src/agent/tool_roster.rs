@@ -572,7 +572,7 @@ mod tests {
     const SCRIPT_MSG: &str = "a script tool's child carries its whole command, newlines and all, \
         so the body the reader watches while it streams is the body the call is dispatched with";
     const MULTILINE_COMMAND: &str = "set -e\ncargo build\ncargo test";
-    const PYTHON: &str = "python_execution";
+    const PYTHON: &str = "code";
     const BASH_LANG: &str = "bash";
     const PYTHON_LANG: &str = "python";
 

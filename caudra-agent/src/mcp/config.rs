@@ -25,7 +25,7 @@ use caudra_config::{global_config_dir, is_valid_server_name};
 const SERVERS_KEY: &str = "mcp";
 const REMOVED_TOP_LEVEL_KEY: &str = "defer_tools";
 const REMOVED_SERVER_KEY: &str = "always_load";
-const REMOVED_KEY_REASON: &str = "was removed: MCP tools are reached through the `mcp` tool, which loads nothing up front. Delete the key";
+const REMOVED_KEY_REASON: &str = "was removed: MCP tools are reached through the `code` tool, which loads nothing up front. Delete the key";
 
 #[derive(Debug, Clone)]
 pub enum McpConfigError {

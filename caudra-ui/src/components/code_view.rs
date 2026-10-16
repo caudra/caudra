@@ -22,12 +22,12 @@ use super::tool_display::{
     repeats_tool, report_header, report_markdown, report_message, scroll_footer_text, title,
 };
 use super::{
-    ToolProgress, environment_card, is_collapsible, json_text, mcp_card, mcp_code_card,
-    memory_card, peer_card, task_card, workflow_card,
+    ToolProgress, code_card, environment_card, is_collapsible, json_text, mcp_card, memory_card,
+    peer_card, task_card, workflow_card,
 };
-use caudra_agent::mcp::code::output::McpCodeOutput;
+use caudra_agent::code::output::CodeOutput;
 use caudra_agent::tools::{
-    PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, timeout_annotation,
+    CODE_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, timeout_annotation,
 };
 use caudra_agent::types::{AnswerSheet, TodoItem, TodoStatus};
 use caudra_agent::{
@@ -1276,14 +1276,15 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
     }
 }
 
-/// An `mcp` run under its snippet: its calls as batch rows, each opening to the call's own card,
-/// then the tail. The flag says the budget held part of the tail back.
-fn render_mcp_code(
-    output: &McpCodeOutput,
+/// A `code` run under its snippet: its calls as batch rows, each opening to the call's own card,
+/// then the tail. A scrolling card draws the tail in its window, as a script's output always was;
+/// otherwise the flag says the budget held part of the tail back.
+fn render_code_card(
+    output: &CodeOutput,
     highlight: bool,
     limits: &RenderLimits,
 ) -> (BatchCard, bool) {
-    let entries = mcp_code_card::entries(output);
+    let entries = code_card::entries(output);
     let mut card = render_batch(&entries, highlight, limits);
     let mut trace = SourceTrace::default();
     match card.source.take() {
@@ -1291,13 +1292,26 @@ fn render_mcp_code(
         None if !card.lines.is_empty() => trace.abandon(),
         None => {}
     }
-    let (blocks, truncated) = mcp_code_card::tail(output, limits.bounded_budget(), limits.width);
-    for (index, (lines, source)) in blocks.into_iter().enumerate() {
-        if index == 0 && !card.lines.is_empty() {
-            card.links.rows.push(Vec::new());
-            card.rows.push(None);
-            card.lines.push(Line::default());
+    let window = limits.scroll.filter(|_| !limits.is_expanded());
+    let budget = match window {
+        Some(_) => usize::MAX,
+        None => limits.bounded_budget(),
+    };
+    let (blocks, mut truncated) = code_card::tail(output, budget, limits.width);
+    let (blocks, windowed) = match window {
+        Some(window) => {
+            let (blocks, windowed) = window_code_tail(blocks, window);
+            (blocks, Some(windowed))
         }
+        None => (blocks, None),
+    };
+    if !blocks.is_empty() && !card.lines.is_empty() {
+        card.links.rows.push(Vec::new());
+        card.rows.push(None);
+        card.lines.push(Line::default());
+    }
+    let tail_start = card.lines.len();
+    for (lines, source) in blocks {
         if let Some(source) = source {
             trace.record(card.lines.len(), source);
         }
@@ -1305,8 +1319,57 @@ fn render_mcp_code(
         card.rows.resize(card.rows.len() + lines.len(), None);
         card.lines.extend(lines);
     }
+    if let Some(WindowedTail { start, end, total }) = windowed {
+        card.spans.push(ScrollSpan {
+            child: None,
+            first: tail_start,
+            lines: end - start,
+            extent_lines: end - start,
+            total,
+            offset: start,
+            history_start: None,
+        });
+        if let Some(footer) = scroll_footer_text(start, total - end, ScrollTail::Settled) {
+            card.links.rows.push(Vec::new());
+            card.rows.push(None);
+            card.lines
+                .push(Line::from(Span::styled(footer, theme::current().tool_dim)));
+            truncated = true;
+        }
+    }
     card.source = trace.finish(&card.lines);
     (card, truncated)
+}
+
+/// The rows of a code card's tail its window shows, out of `total`.
+struct WindowedTail {
+    start: usize,
+    end: usize,
+    total: usize,
+}
+
+/// The rows of `blocks` that `window` shows, each block keeping the part of its source those
+/// rows came from.
+fn window_code_tail(
+    blocks: Vec<code_card::Block>,
+    window: ScrollWindow,
+) -> (Vec<code_card::Block>, WindowedTail) {
+    let total = blocks.iter().map(|(lines, _)| lines.len()).sum();
+    let (start, end) = window.range(total);
+    let mut first = 0;
+    let mut kept = Vec::new();
+    for (lines, source) in blocks {
+        let block = first..first + lines.len();
+        first = block.end;
+        let shown = block.start.max(start)..block.end.min(end);
+        if shown.is_empty() {
+            continue;
+        }
+        let local = shown.start - block.start..shown.end - block.start;
+        let source = source.and_then(|source| source.keep_rows(local.clone()));
+        kept.push((lines[local].to_vec(), source));
+    }
+    (kept, WindowedTail { start, end, total })
 }
 
 /// The heading a child's summary row copies as, numbered so a reader can match
@@ -3102,7 +3165,15 @@ pub(crate) fn window_rows<T>(
 /// A write is deliberately absent. Its body is the file it wrote, so a window
 /// on the tail hides the head of what it just did, which is the part worth
 /// reading.
-const SCROLL_CARD_TOOLS: &[&str] = &[SHELL_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, TASK_TOOL_NAME];
+///
+/// `python_execution` is no longer offered and stays only for the cards of
+/// restored sessions, which drew its output in a window too.
+const SCROLL_CARD_TOOLS: &[&str] = &[
+    SHELL_TOOL_NAME,
+    CODE_TOOL_NAME,
+    PYTHON_EXECUTION_TOOL_NAME,
+    TASK_TOOL_NAME,
+];
 
 /// What the reader's configuration and view mode say about a tool. Carried
 /// with the limits rather than looked up at the card, because a batch child is
@@ -3776,8 +3847,8 @@ pub fn render_tool_content(
             output_links = card.links;
             (card.lines, false)
         }
-        Some(ToolOutput::McpCode(output)) => {
-            let (card, truncated) = render_mcp_code(output, highlight, &limits);
+        Some(ToolOutput::Code(output)) => {
+            let (card, truncated) = render_code_card(output, highlight, &limits);
             output_highlights = card.highlights;
             output_rows = card.rows;
             output_spans = card.spans;

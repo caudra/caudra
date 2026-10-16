@@ -34,8 +34,8 @@ use crate::agent::{GoalResult, GoalVerdict};
 use crate::autopilot::{
     AutopilotDecision, DecisionKind, DecisionOutcome, EngagementSpend, StoodDown,
 };
+use crate::code::output::{CodeOutput, CodeProgressEvent};
 use crate::decisions::DecisionNote;
-use crate::mcp::code::output::{McpCodeOutput, McpCodeProgressEvent};
 use crate::mcp::kind::McpServerKind;
 use crate::mcp::output::McpOutput;
 use crate::peers::{
@@ -2098,8 +2098,8 @@ pub enum ToolOutput {
     Peers(PeerOutput),
     /// An MCP tool's answer, block by block.
     Mcp(McpOutput),
-    /// An `mcp` snippet: its code, every server call it made, and how it ended.
-    McpCode(McpCodeOutput),
+    /// An `code` snippet: its code, every server call it made, and how it ended.
+    Code(CodeOutput),
 }
 
 /// How far a search reached before a bound stopped it. Both counts are lower
@@ -2240,7 +2240,7 @@ impl ToolOutput {
             Self::Tasks(cards) => Some(counted(cards.len(), "task")),
             Self::Environment { headline, .. } => Some(headline.clone()),
             Self::Mcp(output) => output.annotation(),
-            Self::McpCode(output) => output.annotation(),
+            Self::Code(output) => output.annotation(),
             _ => None,
         }
     }
@@ -2337,7 +2337,7 @@ impl ToolOutput {
             | Self::Environment { .. }
             | Self::WorkflowRun(_)
             | Self::Mcp(_)
-            | Self::McpCode(_)
+            | Self::Code(_)
             | Self::Tasks(_) => Some(self.as_display_text()),
             _ => None,
         }
@@ -2373,7 +2373,7 @@ impl ToolOutput {
             Self::Skill(skill) => skill.model_text(),
             Self::Peers(output) => output.model_text(),
             Self::Mcp(output) => output.model_text(),
-            Self::McpCode(output) => output.model_text(),
+            Self::Code(output) => output.model_text(),
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => {
                 let mut out = t.text.clone();
                 if let Some(blocks) = &t.instructions {
@@ -2404,7 +2404,7 @@ impl ToolOutput {
         match self {
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.text.clone(),
             Self::Mcp(output) => output.display_text(),
-            Self::McpCode(output) => output.model_text(),
+            Self::Code(output) => output.model_text(),
             Self::CodeGraph {
                 headline,
                 rows,
@@ -2956,7 +2956,7 @@ pub enum AgentEvent {
     },
     ToolDone(Box<ToolDoneEvent>),
     BatchProgress(Box<BatchProgressEvent>),
-    McpCodeProgress(Box<McpCodeProgressEvent>),
+    CodeProgress(Box<CodeProgressEvent>),
     Question(Box<QuestionEvent>),
     /// The form this agent opened will never be answered: the server withdrew
     /// it, or the call that asked ended. A front end closes it.
@@ -4953,8 +4953,8 @@ mod tests {
         assert_eq!(restored.as_text(), text);
     }
 
-    /// A web result is sized by what the model pays for it. Other Workcell
-    /// text, such as a `python_execution` result, keeps its line count.
+    /// A web result is sized by what the model pays for it. Other text, such
+    /// as a `code` result, keeps its line count.
     #[test_case(ToolOutput::Markdown, "webfetch", token_label(estimate_tokens(WEB_RESULT)) ; "a_fetched_page_counts_tokens")]
     #[test_case(ToolOutput::Plain, "webfetch", token_label(estimate_tokens(WEB_RESULT)) ; "a_page_fetched_as_text_counts_tokens")]
     #[test_case(ToolOutput::Markdown, "websearch", token_label(estimate_tokens(WEB_RESULT)) ; "search_results_count_tokens")]

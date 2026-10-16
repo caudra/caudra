@@ -6,10 +6,7 @@
 //! and the status line can say *which* file is being edited before the model
 //! has finished saying it.
 
-use crate::tools::{
-    IMAGE_GENERATE_TOOL_NAME, MCP_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME,
-    relative_path,
-};
+use crate::tools::{CODE_TOOL_NAME, IMAGE_GENERATE_TOOL_NAME, SHELL_TOOL_NAME, relative_path};
 
 /// Wide enough for a path or a short command, short enough that a header row
 /// never becomes the payload.
@@ -82,13 +79,7 @@ const SCRIPT_TOOLS: &[ScriptTool] = &[
         names_row: true,
     },
     ScriptTool {
-        tool: PYTHON_EXECUTION_TOOL_NAME,
-        language: "python",
-        key: "code",
-        names_row: true,
-    },
-    ScriptTool {
-        tool: MCP_TOOL_NAME,
+        tool: CODE_TOOL_NAME,
         language: "python",
         key: "code",
         names_row: true,
@@ -108,8 +99,7 @@ const SCRIPT_TOOLS: &[ScriptTool] = &[
 /// from the envelope [`super::tool_body`] decodes, which keeps the newlines
 /// this scanner collapses into spaces.
 const NO_PREVIEW: &[&str] = &[
-    "python_execution",
-    MCP_TOOL_NAME,
+    CODE_TOOL_NAME,
     "file_apply_patch",
     "batch",
     "todo_write",
@@ -544,6 +534,7 @@ impl<'a> Scanner<'a> {
 #[cfg(test)]
 mod tests {
     use super::{PREVIEW_SCAN_CAP, Preview, preview_for, size_label};
+    use crate::tools::CODE_TOOL_NAME;
     use test_case::test_case;
 
     const EDIT: &str = "file_edit";
@@ -567,7 +558,7 @@ mod tests {
     #[test_case(SHELL, r#"{"command": "a\nb""#, Some("a b") ; "escape_collapses_to_space")]
     #[test_case(SHELL, r#"{"command": "a\"#, Some("a") ; "truncated_mid_escape")]
     #[test_case(SHELL, r#"{"command": "sp   aced""#, Some("sp aced") ; "whitespace_collapsed")]
-    #[test_case("python_execution", r#"{"code": "print(1)""#, None ; "blob_tool_suppressed")]
+    #[test_case(CODE_TOOL_NAME, r#"{"code": "print(1)""#, None ; "blob_tool_suppressed")]
     #[test_case("batch", r#"{"tool_calls": []}"#, None ; "aggregate_tool_suppressed")]
     #[test_case("mcp_File_read", r#"{"filePath": "a.rs""#, Some("a.rs") ; "mcp_qualified_name")]
     #[test_case("some_plugin_tool", r#"{"target": "thing""#, Some("thing") ; "unknown_tool_fallback")]
@@ -679,7 +670,7 @@ mod tests {
         because the call is named by the file it writes";
 
     #[test_case(SHELL, Some(("bash", "command", true)) ; "a_command_names_its_own_row")]
-    #[test_case("python_execution", Some(("python", "code", true)) ; "a_script_names_its_own_row")]
+    #[test_case(CODE_TOOL_NAME, Some(("python", "code", true)) ; "a_script_names_its_own_row")]
     #[test_case(IMAGE, Some(("markdown", "prompt", false)) ; "a_prompt_names_no_row")]
     #[test_case(EDIT, None ; "a_tool_called_with_arguments_has_no_script")]
     fn a_tools_script_argument(tool: &str, expected: Option<(&str, &str, bool)>) {

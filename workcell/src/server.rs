@@ -265,7 +265,7 @@ impl WorkcellServer {
             "webIcons": groups.contains(&ToolGroup::Web).then_some(tools.web_icons),
             "shell": groups.contains(&ToolGroup::Shell).then_some(shell_policy_revision),
             "shellOutputFilter": groups.contains(&ToolGroup::Shell).then_some(tools.shell_output_filter),
-            "codeTypeCheck": groups.contains(&ToolGroup::PythonExecution).then_some(tools.code.type_check),
+            "codeTypeCheck": groups.contains(&ToolGroup::Code).then_some(tools.code.type_check),
             "maxTransferBytes": groups.contains(&ToolGroup::Transfer).then_some(tools.max_transfer_bytes),
             "changes": tools.snapshot_root.is_some(),
             "reviewedTransfer": tools.transfer_root.is_some(),
@@ -331,7 +331,7 @@ impl WorkcellServer {
             None
         };
         // Building the group starts a worker, so a missing or unrunnable binary fails here.
-        let code = if groups.contains(&ToolGroup::PythonExecution) {
+        let code = if groups.contains(&ToolGroup::Code) {
             Some(Arc::new(
                 CodeToolGroup::new(tools.code)
                     .await
@@ -372,7 +372,7 @@ impl WorkcellServer {
                 .then(workcell_mcp_shell::specs)
                 .unwrap_or_default(),
             groups
-                .contains(&ToolGroup::PythonExecution)
+                .contains(&ToolGroup::Code)
                 .then(workcell_mcp_code::specs)
                 .unwrap_or_default(),
             if behavior.expose_execution_environment {
@@ -1794,7 +1794,7 @@ impl WorkcellServer {
                     intents,
                 )
             }
-            "python_execution" => {
+            "code" => {
                 let input = parse::<CodeInput>(arguments).map_err(|_| invalid_arguments())?;
                 let prepared = self
                     .code
@@ -1803,7 +1803,7 @@ impl WorkcellServer {
                     .prepare(input)
                     .map_err(|error| failed(PYTHON_PREPARATION_FAILED_CODE, &error))?;
                 (
-                    PreparedRemoteOperation::PythonExecution(prepared),
+                    PreparedRemoteOperation::Code(prepared),
                     OperationKind::Execute,
                     false,
                     vec![resource_intent(
@@ -2002,7 +2002,7 @@ impl WorkcellServer {
                     Err(error) => Ok(tool_error_result(error)),
                 }
             }
-            PreparedRemoteOperation::PythonExecution(prepared) => {
+            PreparedRemoteOperation::Code(prepared) => {
                 let execution = self
                     .code
                     .as_ref()
@@ -3756,7 +3756,7 @@ mod tests {
         RecordScope,
     };
     use workcell_host_contract::{RevertCounts, SnapshotLimit};
-    use workcell_mcp_code::{WORKER_FILE_NAME, WorkerSource};
+    use workcell_mcp_code::{CodePools, WORKER_FILE_NAME, WorkerSource};
     use workcell_mcp_files::{
         WorkspaceWatchErrorKind, WorkspaceWatchPhase, catalog as file_catalog,
     };
@@ -3873,6 +3873,7 @@ mod tests {
                     bundled_cache_root: None,
                 },
                 type_check: true,
+                pools: CodePools::All,
             },
             max_transfer_bytes: crate::cli::DEFAULT_MAX_TRANSFER_BYTES,
             snapshot_root: None,
@@ -4284,7 +4285,7 @@ mod tests {
                 "websearch",
                 "webfetch",
                 "shell",
-                "python_execution",
+                "code",
                 "execution_environment",
             ]
         );
@@ -4847,7 +4848,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_python_execution_consumes_the_stored_snippet() {
+    async fn remote_code_consumes_the_stored_snippet() {
         let Some(worker) = test_worker() else {
             eprintln!("skipping: no monty worker; run make code-worker");
             return;
@@ -4857,10 +4858,11 @@ mod tests {
         tools.code = CodeConfiguration {
             worker: WorkerSource::Path(&worker),
             type_check: true,
+            pools: CodePools::All,
         };
         let server = WorkcellServer::configured(
             Some(root.path()),
-            &[ToolGroup::PythonExecution],
+            &[ToolGroup::Code],
             ServerBehavior::default(),
             tools,
         )
@@ -4870,7 +4872,7 @@ mod tests {
         .await
         .unwrap();
         let (operation, intent) = server
-            .prepare_operation("python_execution", serde_json::json!({"code":"40 + 2"}))
+            .prepare_operation("code", serde_json::json!({"code":"40 + 2"}))
             .await
             .unwrap();
         assert!(!intent.mutating);

@@ -193,7 +193,7 @@ fn unimported_module(message: &str) -> Option<&str> {
 /// Guidance for a name the subset does not provide.
 fn undefined_name_guidance(detail: &str) -> String {
     format!(
-        "Undefined name. Note that {} are not implemented, and nothing persists between python_execution calls. ({detail})",
+        "Undefined name. Note that {} are not implemented, and nothing persists between code calls. ({detail})",
         withheld_builtins!()
     )
 }
@@ -217,7 +217,7 @@ fn untyped_name_guidance(name: &str) -> String {
 /// Guidance for an attempt to reach the host.
 fn isolation_guidance(detail: &str) -> String {
     format!(
-        "python_execution has no filesystem, network, or environment access. Read or write files with the file tools, fetch URLs with webfetch, or use the shell tool when host access is genuinely required. ({detail})"
+        "The code tool has no filesystem, network, or environment access. Read or write files with the file tools, fetch URLs with webfetch, or use the shell tool when host access is genuinely required. ({detail})"
     )
 }
 
@@ -338,7 +338,7 @@ mod tests {
             Surface::Hosted,
         );
         assert!(text.contains("search()"), "{text}");
-        assert!(!text.contains("python_execution"), "{text}");
+        assert!(!text.contains("between code calls"), "{text}");
     }
 
     /// Type checking is the default, so these are the messages an agent actually receives. Each must

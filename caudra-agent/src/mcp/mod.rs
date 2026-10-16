@@ -44,7 +44,6 @@ use std::time::Duration;
 use crate::tools::{ToolContext, ToolFilter};
 use arc_swap::{ArcSwap, Guard};
 use caudra_config::{ProfileToolExposure, ProfileToolPolicy, ProfileToolSource};
-use caudra_providers::{ContentBlock, Message};
 use caudra_storage::StateDir;
 use caudra_storage::mcp_trust::{is_project_trusted, revoke_project_trust, trust_project};
 use serde_json::{Value, json};
@@ -52,7 +51,6 @@ use smol::Timer;
 use tracing::{info, warn};
 
 use self::call::{CallScope, Elicitor};
-use self::code::runner::{ReplSlot, SharedRepl};
 use self::code::view::{ServerState, ServerView, ToolView, cut_instructions};
 use self::config::{
     LocalExecutionPolicy, McpConfig, McpConfigErrors, McpConfigSource, McpReviewSummary,
@@ -73,13 +71,12 @@ use self::resources::{
 use self::stdio::StdioTransport;
 use self::transport::McpTransport;
 use crate::permissions::{PermissionSubject, canonical_json_sha256};
-use crate::tools::MCP_TOOL_NAME;
 use crate::tools::profile_policy::{
     CEILING_DISABLED, MODE_DISABLED, PROFILE_DISABLED, PROFILE_LOADING,
 };
 use crate::tools::report::REASON_CONFIG;
 
-const SEPARATOR: &str = ".";
+pub(crate) const SEPARATOR: &str = ".";
 pub(super) const WIRE_SEPARATOR: &str = "__";
 pub const UNKNOWN_MCP: &str = "unknown_mcp";
 const STARTUP_EPOCH: u64 = 0;
@@ -769,8 +766,8 @@ pub struct McpHandle {
     ready_rx: flume::Receiver<Infallible>,
 }
 
-/// One agent's view of MCP: the shared handle, the policy that decides which tools this agent
-/// may reach, and the variables its `mcp` runs keep, so a subagent's never mix with its parent's.
+/// One agent's view of MCP: the shared handle, and the policy that decides which tools this agent
+/// may reach.
 #[derive(Clone)]
 pub struct McpSession {
     handle: McpHandle,
@@ -783,8 +780,6 @@ pub struct McpSession {
     /// How the front end asks the user what a server wants to know; `None`
     /// declines every such request.
     elicitors: Option<Arc<dyn ElicitorFactory>>,
-    /// Held for the whole of a run, so one agent's runs never interleave.
-    repl: SharedRepl,
 }
 
 impl std::ops::Deref for McpSession {
@@ -795,9 +790,7 @@ impl std::ops::Deref for McpSession {
 }
 
 impl McpSession {
-    /// `history` says whether the conversation ran `mcp` before: if it did, the variables those
-    /// runs kept died with the process that ran them, and the next run says so.
-    pub fn new(handle: McpHandle, history: &[Message]) -> Self {
+    pub fn new(handle: McpHandle) -> Self {
         Self {
             handle,
             disabled: Arc::from([]),
@@ -805,7 +798,6 @@ impl McpSession {
             ceiling: ToolFilter::All,
             inherited_profiles: Vec::new(),
             elicitors: None,
-            repl: repl_for(history),
         }
     }
 
@@ -875,19 +867,6 @@ impl McpSession {
             self.inherited_profiles.push(Arc::clone(&self.profile));
         }
         self
-    }
-
-    /// A view over the same handle and policy with variables of its own, for a subagent whose
-    /// conversation is `history`.
-    pub fn fresh(&self, history: &[Message]) -> Self {
-        Self {
-            repl: repl_for(history),
-            ..self.clone()
-        }
-    }
-
-    pub fn repl(&self) -> &SharedRepl {
-        &self.repl
     }
 
     /// Every enabled server and the tools this agent may call on it, as code mode presents
@@ -975,14 +954,6 @@ impl McpSession {
     }
 }
 
-fn repl_for(history: &[Message]) -> SharedRepl {
-    let ran_before = history
-        .iter()
-        .flat_map(|message| &message.content)
-        .any(|block| matches!(block, ContentBlock::ToolUse { name, .. } if name == MCP_TOOL_NAME));
-    ReplSlot::shared(ran_before)
-}
-
 /// A read-only ceiling keeps only tools a recognised server annotated
 /// read-only (`read_only`).
 fn policy_disabled(
@@ -1047,8 +1018,8 @@ impl McpHandle {
         self.index.load().tools.contains_key(name)
     }
 
-    /// Whether configuration enables some server, which is what offers the `mcp` tool. Whether
-    /// it has connected does not matter, so a server coming up never changes the tool list.
+    /// Whether configuration enables some server, which is what lists servers in the
+    /// `# MCP servers` reminder. Whether it has connected does not matter.
     pub fn has_enabled_server(&self) -> bool {
         self.snapshot
             .load()
@@ -2363,15 +2334,12 @@ fn stub_session_from(
     let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
     let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
     publish(&inner, &index, &snapshot);
-    McpSession::new(
-        McpHandle {
-            cmd_tx: flume::unbounded().0,
-            index,
-            snapshot,
-            ready_rx: flume::bounded(0).1,
-        },
-        &[],
-    )
+    McpSession::new(McpHandle {
+        cmd_tx: flume::unbounded().0,
+        index,
+        snapshot,
+        ready_rx: flume::bounded(0).1,
+    })
 }
 
 #[cfg(test)]
@@ -2704,7 +2672,7 @@ mod tests {
             local_execution: LocalExecutionPolicy::Embedded,
         };
         let handle = published(&inner);
-        (inner, McpSession::new(handle, &[]))
+        (inner, McpSession::new(handle))
     }
 
     /// A handle over what `inner` publishes, so tests read the same index and
@@ -3153,7 +3121,6 @@ mod tests {
         let session = stub_session(&[(REPLACEMENT_TOOL_NAME, REPLACEMENT_DESCRIPTION)])
             .with_actor_policy(profile)
             .freeze_actor_ceiling()
-            .fresh(&[])
             .with_actor_policy(Arc::default());
         assert!(session.is_disabled(REPLACEMENT_TOOL_NAME));
         assert!(session.tool_inventory()[0].disabled);

@@ -4733,13 +4733,11 @@ fn delegation_msg(delegations: Vec<caudra_agent::Delegation>) -> Msg {
 }
 
 /// Each server call a snippet made lands in `/tools` under its own name, beside
-/// the `mcp` run that made it, and costs the context window nothing.
+/// the `code` run that made it, and costs the context window nothing.
 #[test]
 fn an_mcp_run_counts_each_server_call_it_made() {
-    use caudra_agent::mcp::code::output::{
-        CALL_SOURCE, McpCodeCall, McpCodeCallStatus, McpCodeOutput,
-    };
-    use caudra_agent::tools::{MCP_TOOL_NAME, ToolFailure};
+    use caudra_agent::code::output::{CALL_SOURCE, CodeCall, CodeCallStatus, CodeOutput};
+    use caudra_agent::tools::{CODE_TOOL_NAME, ToolFailure};
     use caudra_storage::tool_ledger::ToolOutcome;
 
     const SERVER: &str = "github";
@@ -4751,28 +4749,28 @@ fn an_mcp_run_counts_each_server_call_it_made() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
-    let call = |tool: &str, status, failure, duration_ms| McpCodeCall {
+    let call = |tool: &str, status, failure, duration_ms| CodeCall {
         server: SERVER.into(),
         tool: tool.into(),
         status,
         failure,
         duration_ms,
-        ..McpCodeCall::default()
+        ..CodeCall::default()
     };
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t1".into(),
-        tool: MCP_TOOL_NAME.into(),
-        output: ToolOutput::McpCode(McpCodeOutput {
+        tool: CODE_TOOL_NAME.into(),
+        output: ToolOutput::Code(CodeOutput {
             calls: vec![
-                call(LISTED, McpCodeCallStatus::Success, None, LISTED_MS),
+                call(LISTED, CodeCallStatus::Success, None, LISTED_MS),
                 call(
                     CREATED,
-                    McpCodeCallStatus::Refused,
+                    CodeCallStatus::Refused,
                     Some(ToolFailure::Denied),
                     0,
                 ),
             ],
-            ..McpCodeOutput::default()
+            ..CodeOutput::default()
         }),
         accounting: ToolAccounting {
             source: Some(RUN_SOURCE.into()),
@@ -4800,7 +4798,7 @@ fn an_mcp_run_counts_each_server_call_it_made() {
         .collect();
     assert!(
         rows.iter()
-            .any(|(tool, source, ..)| *tool == MCP_TOOL_NAME && *source == RUN_SOURCE),
+            .any(|(tool, source, ..)| *tool == CODE_TOOL_NAME && *source == RUN_SOURCE),
         "{rows:?}"
     );
     let listed = format!("{SERVER}.{LISTED}");

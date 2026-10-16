@@ -99,9 +99,21 @@ pub const fn bundled_worker_available() -> bool {
     }
 }
 
+/// Which worker pools a group builds.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CodePools {
+    /// Isolated execution (`code`) and hosted snippets.
+    #[default]
+    All,
+    /// Hosted snippets only, for an embedder that runs plain computation through its own host.
+    HostedOnly,
+}
+
 pub(crate) struct PoolBuild {
-    pub(crate) pool: Pool,
-    /// Starts empty: a worker is spawned the first time a hosted snippet runs.
+    /// `None` when the group was built [`CodePools::HostedOnly`].
+    pub(crate) pool: Option<Pool>,
+    /// Starts empty when the isolated pool is built: a worker is spawned the first time a hosted
+    /// snippet runs. Otherwise it is the pool that prewarms.
     pub(crate) hosted: Pool,
     #[cfg(feature = "bundled-worker")]
     pub(crate) worker_lease: Option<WorkerLease>,
@@ -125,32 +137,39 @@ impl ResolvedWorker {
 
 pub(crate) async fn build_pool(
     source: WorkerSource<'_>,
+    pools: CodePools,
     max_timeout: Duration,
 ) -> Result<PoolBuild, CodeBuildError> {
     let resolved = resolve_worker(source)?;
+    let path = resolved.path.as_path();
     // One prewarmed worker makes the first call fast and catches spawn failures at startup.
-    let pool = Pool::new(pool_config(
-        &resolved.path,
-        1,
-        CODE_CONCURRENCY,
-        max_timeout,
-    ))
-    .await
-    .map_err(|_| CodeBuildError::PoolUnavailable)?;
-    let hosted = Pool::new(pool_config(
-        &resolved.path,
-        0,
-        HOSTED_CONCURRENCY,
-        max_timeout,
-    ))
-    .await
-    .map_err(|_| CodeBuildError::PoolUnavailable)?;
+    let (pool, hosted) = match pools {
+        CodePools::All => (
+            Some(start_pool(path, 1, CODE_CONCURRENCY, max_timeout).await?),
+            start_pool(path, 0, HOSTED_CONCURRENCY, max_timeout).await?,
+        ),
+        CodePools::HostedOnly => (
+            None,
+            start_pool(path, 1, HOSTED_CONCURRENCY, max_timeout).await?,
+        ),
+    };
     Ok(PoolBuild {
         pool,
         hosted,
         #[cfg(feature = "bundled-worker")]
         worker_lease: resolved.lease,
     })
+}
+
+async fn start_pool(
+    path: &Path,
+    min: usize,
+    max: usize,
+    max_timeout: Duration,
+) -> Result<Pool, CodeBuildError> {
+    Pool::new(pool_config(path, min, max, max_timeout))
+        .await
+        .map_err(|_| CodeBuildError::PoolUnavailable)
 }
 
 /// `max_timeout` bounds one request to the worker. A hosted snippet waiting on its host has no

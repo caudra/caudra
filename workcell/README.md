@@ -70,11 +70,11 @@ sequenceDiagram
 | Code graph | `code_map`, `code_context`, `code_refs`, `code_impact`, `code_expand` | Repository-scale symbol ranking, retrieval, and impact over the same confined tree. Reference counts are floors. |
 | Web | `websearch`, `webfetch` | Search defaults to credential-free Exa; fetch applies SSRF and response bounds. |
 | Shell | `shell` | Applies immutable command policy, then executes with ordered progress and a cleaned environment. |
-| Python execution | `python_execution` | Runs a Python snippet in a separate worker process with no filesystem, network, or environment access. |
+| Python execution | `code` | Runs a Python snippet in a separate worker process with no filesystem, network, or environment access. |
 | Server | `execution_environment` | Returns fresh sanitized platform, privilege, package-manager, and command observations. |
 
 All groups except transfer are enabled by default. Use repeatable
-`--tool-group files|code_graph|web|shell|python_execution|transfer` arguments to expose a subset.
+`--tool-group files|code_graph|web|shell|code|transfer` arguments to expose a subset.
 Files, code graph, shell, and transfer require a positional root. Transfer uses authenticated
 remote-host methods rather than model tools. Its byte route requires `--transport http`, remote-host
 discovery, `--allow-write`, and private `--transfer-root` storage; requesting it over stdio is a startup error.
@@ -87,7 +87,7 @@ Shell execution is denied by default. Configure `--shell-policy` for explicit al
 `--yolo` inside an appropriate isolation boundary to permit unmatched commands. Explicit policy denies
 still win under `--yolo`.
 
-The `python_execution` tool is unrelated to the shell policy. It evaluates a snippet in a `monty` worker process
+The `code` tool is unrelated to the shell policy. It evaluates a snippet in a `monty` worker process
 that has no filesystem, no network, no subprocesses, and an empty environment, so it needs no root
 and no policy. It is for computation, not for reaching the host. It requires the `monty` worker
 binary, which is installed from a pinned release rather than built with the workspace. Workcell
@@ -100,7 +100,7 @@ rather than exposing a tool that cannot run.
 
 - Rust 1.99 for source builds
 - Python 3.11 or later for the worker build helper that `make -C workcell code-worker` and `make -C workcell test` run
-- The `python_execution` tool group needs the pinned `monty` worker binary: `make -C workcell code-worker`
+- The `code` tool group needs the pinned `monty` worker binary: `make -C workcell code-worker`
 - Linux is the primary production target
 - Bash is required for the shell tool in the production container
 
@@ -1081,7 +1081,7 @@ workcell = { git = "https://github.com/caudra/caudra", branch = "main", default-
 | `files-index` | `files` plus `file_index`, its typed output, and the feature-gated parser bundle |
 | `web` | `WebToolGroup`, `PreparedWebsearch`, `PreparedWebfetch`, extraction and provider lowering, and `net`, the bounded HTTP client those tools share |
 | `shell` | `ShellToolGroup`, `PreparedShell`, `ShellPreparationError`, scope analysis, progress streaming, and `output_filter` |
-| `code` | `CodeToolGroup`, isolated interpreter execution (the `python_execution` tool) |
+| `code` | `CodeToolGroup`, isolated interpreter execution (the `code` tool) |
 | `code-bundled` | `code` plus verified extraction of a build-time embedded Monty worker |
 | `code-graph` | `CodeGraphToolGroup` and the five `code_*` tools over a confined source tree |
 | `code-graph-git` | `code-graph` plus repository recency and churn signals through `gix` |
@@ -1615,9 +1615,9 @@ through the same confined resolver the filesystem tools use and never opens a pa
 
 At most four shell calls execute concurrently within one process. Queued calls remain cancellable.
 
-### `python_execution`
+### `code`
 
-`python_execution` evaluates one Python snippet in a separate `monty` worker process and returns the
+`code` evaluates one Python snippet in a separate `monty` worker process and returns the
 value of its final expression along with anything it printed.
 
 - `code` is required and limited to 65,536 UTF-8 bytes. `timeoutSec` is optional, measured in

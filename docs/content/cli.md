@@ -35,7 +35,7 @@ caudra decisions purge --yes
 
 `status` shows effective configuration without contacting the endpoint. Reachability is `not_probed`. `stats` prints JSON with counts, errors, latency percentiles and labelled agreement, using the currently configured thresholds. `acted_count` counts the rows whose effect is not `none`, and `last_timestamp` is the newest row's time in epoch seconds. `export` writes JSONL with only labelled questions in laya-evals format. These commands do not enable logging or create a database. The decision log uses tables in `caudra.db`. `purge --yes` deletes recorded decisions and labels from those live tables, leaving sessions, messages, and shell duration history intact. It does not erase copies in SQLite free pages, WAL files, or backups.
 
-`stats` and `export` accept `--feature`. Log feature names are `permission`, `auto`, `shell_effect`, `content`, `shell_duration`, `tool_search`, `skill_suggestions`, `goal`, `subagent_routing`, `question_tool_nudge`, `memory_search`, `memory_recall`, `memory_duplicates`, `compaction_retention`, `output_pointers`, `code_context`, and `workflow`. They differ from some configuration keys. With no database, statistics are empty and export writes nothing. Administration requires local persistent storage and rejects `--ephemeral` and `--workcell`.
+`stats` and `export` accept `--feature`. Log feature names are `permission`, `auto`, `shell_effect`, `content`, `shell_duration`, `tool_search`, `skill_suggestions`, `goal`, `subagent_routing`, `question_tool_nudge`, `memory_search`, `history_search`, `memory_recall`, `memory_duplicates`, `compaction_retention`, `output_pointers`, `code_context`, `code`, and `workflow`. They differ from some configuration keys. With no database, statistics are empty and export writes nothing. Administration requires local persistent storage and rejects `--ephemeral` and `--workcell`.
 
 Labels are partial evidence, not a complete evaluation dataset. Tool-search actual-use labels and shell-effect observed-filesystem labels are not collected. Effect fields are a partial action record. A value of `none` does not prove that no advice or routing was applied. Redaction is best effort. Review exported states and question text before sharing them. See [decision engine advice](/docs/permissions/#decision-engine-advice) and [configuration](/docs/configuration/#decisions).
 
@@ -536,7 +536,7 @@ caudra prompt --tools --names  # tool names only, one per line
 
 Debug helper for inspecting the prompt and tool surface the agent sees. The `research` and `general` variants include the selected system prompt profile and their final host mode contract. `--plan` previews an active main-agent plan target without creating a document or changing session mode. It is rejected on non-system variants.
 
-`--tools` applies the selected profile, model, audience, tool flags, and execution policy. It connects MCP servers and prints the initial request schemas, with one combined catalog for eligible lazy built-ins. MCP tools appear only as the `mcp` tool, which is left out when no server is enabled. `--names` lists declared schemas, including `tool_search` when needed, rather than expanding the pending catalog. Use `caudra tools --enabled-only --names` to include lazy tool names too.
+`--tools` applies the selected profile, model, audience, tool flags, and execution policy. It connects MCP servers and prints the initial request schemas, with one combined catalog for eligible lazy built-ins. MCP tools appear only through the [`code`](/docs/code/) tool, which is declared with or without servers. `--names` lists declared schemas, including `tool_search` when needed, rather than expanding the pending catalog. Use `caudra tools --enabled-only --names` to include lazy tool names too.
 
 ### `caudra tools`
 
@@ -552,7 +552,7 @@ caudra --system-prompt-profile researcher tools --schemas
 
 Resolves config the way a real run does, so the output reflects `agent.disabled_tools`, the plugin table, `--allowed-tools`, `--disallowed-tools`, the selected [system prompt profile](/docs/system-prompts/#choose-tool-availability), and the model you select with `-m`. Built-in tools come first, then MCP tools grouped by server, by their `server.tool` names. MCP servers connect on every run, so a slow or failed server shows its status instead of its tools.
 
-An MCP tool that is on has the note `via mcp`, because the model calls it from the [`mcp` tool](/docs/mcp/#code-mode). One that a profile makes `lazy` is `search-only`: left out of the [server list](/docs/mcp/#the-server-list) and found by `search()`. When no server is enabled, `mcp` itself is off with the reason `no MCP server is enabled`.
+An MCP tool that is on has the note `via code`, because the model calls it from the [`code` tool](/docs/mcp/#code-mode). One that a profile makes `lazy` is `search-only`: left out of the [server list](/docs/mcp/#the-server-list) and found by `search()`.
 
 A tool that is off carries the rule that turned it off: `--disallowed-tools`, `disabled by config`, `not in --allowed-tools`, `model has no vision support`, `model uses the other editing tool`, or `no ChatGPT subscription`. A `deny` or `allow` default from [Permissions](/docs/permissions/) appears next to the tool it applies to. See [Disabling tools](/docs/tools/#disabling-tools).
 

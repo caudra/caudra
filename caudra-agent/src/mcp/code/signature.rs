@@ -27,13 +27,7 @@ const RECEIVER: &str = "self";
 const KEYWORD_ONLY: &str = "*";
 const POSITIONAL_ONLY: &str = "/";
 const INDENT: &str = "    ";
-const STUB_IMPORTS: &str = "from typing import Any, Literal, overload";
 const OVERLOAD: &str = "@overload";
-/// The decision helpers' signatures, for the type checker and the `# MCP servers` reminder.
-pub const DECISION_STUBS: [&str; 2] = [
-    "async def decide(input: Any, questions: list[dict[str, Any]], model: str | None = None, timeout_ms: int | None = None) -> dict[str, Any]: ...",
-    "async def rerank(query: str, candidates: list[Any], threshold: float | None = None, top_k: int | None = None, model: str | None = None, timeout_ms: int | None = None) -> list[dict[str, Any]]: ...",
-];
 
 const PROPERTIES: &str = "properties";
 const REQUIRED: &str = "required";
@@ -156,14 +150,13 @@ pub fn doc(signature: &Signature, tool: &ToolView) -> String {
         .join("\n")
 }
 
-/// Stubs declaring every namespace and helper, for the type checker. `decisions` adds the
-/// decision helpers, which only a session with a decision engine has.
-pub fn stubs(names: &Names, servers: &[ServerView], decisions: bool) -> String {
+/// Stubs declaring every namespace and helper, for the type checker.
+pub fn stubs(names: &Names, servers: &[ServerView]) -> String {
     let by_name: HashMap<&str, &ServerView> = servers
         .iter()
         .map(|server| (server.name.as_str(), server))
         .collect();
-    let mut lines = vec![STUB_IMPORTS.to_owned()];
+    let mut lines = Vec::new();
     for (namespace, server_name) in names.namespaces() {
         let Some(server) = by_name.get(server_name) else {
             continue;
@@ -208,9 +201,6 @@ pub fn stubs(names: &Names, servers: &[ServerView], decisions: bool) -> String {
         format!("async def resources(server: str) -> list[{DICT}]: ..."),
         format!("async def read_resource(server: str, uri: str) -> {ANY}: ..."),
     ]);
-    if decisions {
-        lines.extend(DECISION_STUBS.iter().map(|stub| (*stub).to_owned()));
-    }
     let mut stubs = lines.join("\n");
     stubs.push('\n');
     stubs
@@ -512,8 +502,8 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::code::names::MCP_HELPERS;
     use crate::mcp::code::naming::tests::{server, tool};
-    use crate::mcp::code::naming::{DECISION_HELPERS, HELPERS};
 
     const METHOD: &str = "run";
     const DESCRIBED: &str = "List issues in a repository. Results are paginated.";
@@ -645,9 +635,8 @@ mod tests {
             ..server("linear", vec![tool("list")])
         };
         let servers = [linear, github, empty];
-        let stubs = stubs(&Names::new(&servers), &servers, true);
+        let stubs = stubs(&Names::new(&servers), &servers);
         let expected = [
-            STUB_IMPORTS,
             "class _McpServer_empty:",
             "    pass",
             "empty: _McpServer_empty",
@@ -665,21 +654,13 @@ mod tests {
         ];
         let lines: Vec<&str> = stubs.lines().collect();
         assert_eq!(lines[..expected.len()], expected);
-        for helper in HELPERS {
+        for helper in MCP_HELPERS {
             assert!(
                 lines[expected.len()..]
                     .iter()
                     .any(|line| line.contains(&format!("def {helper}("))),
                 "{helper} missing from {stubs}"
             );
-        }
-    }
-
-    #[test]
-    fn decision_helpers_are_declared_only_with_an_engine() {
-        let without = stubs(&Names::default(), &[], false);
-        for helper in DECISION_HELPERS {
-            assert!(!without.contains(&format!("def {helper}(")), "{without}");
         }
     }
 
@@ -691,7 +672,7 @@ mod tests {
                 json!({"properties": {"per-page": {"type": "integer"}}}),
             )],
         )];
-        let stubs = stubs(&Names::new(&servers), &servers, false);
+        let stubs = stubs(&Names::new(&servers), &servers);
         assert!(
             stubs.contains(
                 "    async def run(self, arguments: dict[str, Any] | None = None, /) -> Any: ..."

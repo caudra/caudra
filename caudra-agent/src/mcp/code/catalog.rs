@@ -1,4 +1,4 @@
-//! The `# MCP servers` reminder: what the `mcp` tool can reach, within a token budget.
+//! The `# MCP servers` reminder: what the `code` tool can reach, within a token budget.
 //!
 //! Every server is announced; tool lines share what the budget leaves, round-robin across
 //! servers and cheapest first, so one large server cannot crowd out the rest.
@@ -18,7 +18,8 @@ use crate::prompt::{
 
 pub const CATALOG_BUDGET_TOKENS: usize = 2_000;
 
-const USAGE: &str = "Call these with the `mcp` tool: `await <server>.<tool>(...)`.";
+const USAGE: &str = "Call these with the `code` tool: `await <server>.<tool>(...)`.";
+const NO_SERVERS: &str = "No MCP server is enabled.";
 const COMPLETE: &str = "This list is complete: do not guess other names.";
 const PARTIAL: &str = "Some tools are not listed: find them with `search(\"query\")`, which returns exact signatures.";
 const CONNECTED: &str = "connected";
@@ -32,7 +33,7 @@ const TOOLS: &str = "tools";
 const MAX_FAILURE_CHARS: usize = 120;
 /// Appended when the session has a decision engine, which the helpers need.
 const DECISIONS_SECTION: &str = "\n\n## Decision helpers\n\
-Use these in a snippet on what its server calls returned, to keep only what matters before it reaches you or to branch on a judgement without another round trip. They change nothing, and their answers are probabilities.\n\
+Use these in a `code` snippet on what it gathered, to keep only what matters before it reaches you or to branch on a judgement without another round trip. They change nothing, and their answers are probabilities.\n\
 - `await decide(input, questions)`: answers every question about `input` in one request. Questions follow the OpenAI Decisions shape: `type`, `name`, `instructions`, as a `predicate`, a `choice` with `choices`, or a `score` with 2 to 10 `levels`, low to high. Read `r[\"by_name\"][name]`.\n\
 - `await rerank(query, candidates, threshold=None, top_k=None)`: `[{\"index\", \"score\"}]`, best first, for up to 256 strings or small dicts. `score` is the probability of relevance.\n\
 For good answers:\n\
@@ -58,27 +59,29 @@ pub fn unavailable(state: &ServerState) -> Option<String> {
 }
 
 /// The `# MCP servers` block a turn should carry, `None` when the transcript already states it.
-/// `session` is what the agent reaches through the `mcp` tool, `None` when it cannot reach the
+/// `session` is what the agent reaches through the `code` tool, `None` when it cannot reach the
 /// tool; with nothing to list, a list still in force is withdrawn. `decisions` adds the decision
-/// helpers, which only a session with a decision engine has.
+/// helpers, which only a session with a decision engine has, and states the block even when no
+/// server is listed.
 pub fn notice(
     history: &[Message],
     session: Option<&McpSession>,
     decisions: bool,
 ) -> Option<Message> {
-    let listed = session
+    let catalog = session
         .filter(|session| session.has_enabled_server())
         .map(|session| {
             let servers = session.servers();
             render(&servers, &Names::new(&servers))
         })
-        .filter(|catalog| !catalog.is_empty())
-        .map(|mut catalog| {
-            if decisions {
-                catalog.push_str(DECISIONS_SECTION);
-            }
-            MCP_SERVERS_PROMPT.replace(CATALOG_SLOT, &catalog)
-        });
+        .filter(|catalog| !catalog.is_empty());
+    let listed = (catalog.is_some() || decisions).then(|| {
+        let mut body = catalog.unwrap_or_else(|| NO_SERVERS.to_owned());
+        if decisions {
+            body.push_str(DECISIONS_SECTION);
+        }
+        MCP_SERVERS_PROMPT.replace(CATALOG_SLOT, &body)
+    });
     let withdrawn =
         || last_announced(history, &[MCP_SERVERS_MARKER]).map(|_| MCP_SERVERS_WITHDRAWN_PROMPT);
     standing_notice(
@@ -438,6 +441,16 @@ mod tests {
         let listed = notice(&[], Some(&session), decisions).expect(LISTED);
         let text = listed.user_text().unwrap();
         assert_eq!(text.contains(DECISIONS_SECTION), decisions, "{text}");
+    }
+
+    #[test]
+    fn decision_helpers_are_stated_without_a_server() {
+        let expected =
+            MCP_SERVERS_PROMPT.replace(CATALOG_SLOT, &format!("{NO_SERVERS}{DECISIONS_SECTION}"));
+        let listed = notice(&[], None, true).expect(LISTED);
+        assert_eq!(listed.user_text(), Some(expected.as_str()));
+        let history = [listed];
+        assert!(notice(&history, None, true).is_none(), "{REPEATED}");
     }
 
     #[test]

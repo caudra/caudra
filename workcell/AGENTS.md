@@ -124,7 +124,7 @@ worker lease for the full pool lifetime; hosts supply cache and source policy, n
 ## Protocol Contracts
 
 - The supported MCP version is explicit and pinned in the server and SDK dependency.
-- Preserve stable catalog order: files, code graph, web, shell, python_execution, execution environment.
+- Preserve stable catalog order: files, code graph, web, shell, code, execution environment.
   Reviewed transfer uses remote-host methods, never model tools or raw path byte routes.
 - Within files, `file_index` follows `file_apply_patch` and precedes every web tool when enabled. The five
   code-graph tools follow `file_index` in the order `code_map`, `code_context`, `code_refs`, `code_impact`,

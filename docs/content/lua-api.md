@@ -1000,7 +1000,7 @@ and tool set.
   - `task_id` (`string?`) completed task to continue with its existing history.
   - `audience` (`string?`) tool audience for capability gating. Default: `"general_sub"`.
   - `mcp` (`boolean?`) give the session access to your MCP servers. The
-    model calls them from Python through the `mcp` tool, so keep `mcp` in
+    model calls them from Python through the `code` tool, so keep `code` in
     `tools`. Default: `true`.
   - `thinking` (`string|integer?`) thinking mode: `"off"`, `"adaptive"`, an
     effort level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,

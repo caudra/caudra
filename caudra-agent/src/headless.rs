@@ -83,6 +83,7 @@ use crate::automation::workflows::Workflows;
 use crate::autopilot::{AutopilotHandle, DecisionOutcome, EngagementSpend};
 use crate::background::{BackgroundTasks, BackgroundTransition, SessionWork};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
+use crate::code::CodeSession;
 use crate::commits;
 use crate::mcp::elicitor::ElicitorFactory;
 use crate::memory::baseline::{MemoryBaseline, open_store as open_memory_store};
@@ -1730,7 +1731,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
     );
 
     let mcp = params.mcp_handle.clone().map(|h| {
-        McpSession::new(h, &[])
+        McpSession::new(h)
             .with_disabled_tools(&params.config.disabled_tools)
             .with_actor_policy(Arc::clone(&profile_tool_policy))
     });
@@ -3313,9 +3314,9 @@ async fn spawn_prepared_session(
     )
     .await;
 
-    let initial_messages = history.as_slice();
+    let code = CodeSession::new(history.as_slice());
     let mcp = params.mcp_handle.clone().map(|h| {
-        McpSession::new(h, initial_messages)
+        McpSession::new(h)
             .with_disabled_tools(&params.config.disabled_tools)
             .with_elicitors(params.mcp_elicitors.clone())
             .with_actor_policy(Arc::new(
@@ -4596,7 +4597,8 @@ async fn spawn_prepared_session(
                 .with_local_tools(Arc::clone(&params.local_tools))
                 .with_goal(goal.clone())
                 .with_interrupt_source(Arc::new(QueuedPrompts(input_rx.clone())))
-                .with_mcp(turn_mcp);
+                .with_mcp(turn_mcp)
+                .with_code(code.clone());
                 if let Some(autopilot) = &autopilot {
                     agent = agent.with_autopilot(autopilot.clone());
                 }

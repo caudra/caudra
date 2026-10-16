@@ -9,11 +9,13 @@ use std::{
 #[cfg(unix)]
 use async_trait::async_trait;
 use caudra_agent::agent::tool_dispatch::{self, Emit};
+use caudra_agent::code::runner::{
+    ReplLease, ReplSlot, ScriptCall, ScriptHost, ScriptInvocation, ScriptName, ScriptRun,
+    ScriptRunner, ScriptStatus,
+};
 #[cfg(unix)]
 use caudra_agent::permissions::{PermissionSubject, PluginRuleStore};
-use caudra_agent::tools::{
-    FileReadTracker, ToolEffect, ToolRegistry, interpreter_ctx, stale_read_message,
-};
+use caudra_agent::tools::{FileReadTracker, ToolRegistry, interpreter_ctx, stale_read_message};
 #[cfg(unix)]
 use caudra_agent::workspace_transfer::{
     CleanBufferLease, ComparisonKind, ExclusionReason, FileOutcome, LocalAccess, LocalRootIdentity,
@@ -23,17 +25,14 @@ use caudra_agent::workspace_transfer::{
 };
 use caudra_agent::{
     AgentEvent, AgentMode, CancelToken, EventSender, ToolOutput,
-    permissions::{
-        PermissionAnswer, PermissionAuthorityProfile, PermissionManager, PermissionResourceAccess,
-        PermissionResourceKind, RemotePermissionIdentity,
-    },
+    permissions::{PermissionAnswer, PermissionManager},
 };
 #[cfg(unix)]
 use caudra_config::sandbox::TransferPolicy;
 use caudra_config::workcell::{
     ExpectedWorkcellId, RemoteWorkcellSelection, WorkcellEndpoint, WorkcellSourceRef,
 };
-use caudra_config::{Effect, FeatureFlags, PermissionRule, PermissionsConfig, ToolKey};
+use caudra_config::{FeatureFlags, PermissionsConfig};
 use caudra_storage::{
     StateDir,
     auth::{WorkcellCredential, WorkcellCredentialName, WorkcellCredentialRef},
@@ -44,12 +43,12 @@ use caudra_workbench::{
     Workbench, WorkbenchBackend, WorkbenchFilesystem, WorkbenchPath, WorkbenchStyles,
     WorkspaceFilesystem,
 };
-use caudra_workcell::RemoteWorkcellHost;
 #[cfg(unix)]
 use caudra_workcell::{LocalTransferPublisher, ReviewedTransferHost, reviewed_workspace_transfer};
 use caudra_workcell::{
     NamedBearerCredential, RemoteToolResultEnvelope, RemoteWorkcellClient, RemoteWorkcellError,
 };
+use caudra_workcell::{RemoteWorkcellHost, WorkcellScriptRunner};
 #[cfg(unix)]
 use caudra_workcell::{TransferSession, TransferSessionHost};
 #[cfg(unix)]
@@ -180,12 +179,10 @@ const EXECUTE_METHOD: &str = "ai.workcell/execute";
 const RPC_REQUEST_TRACE: &str = "batch-rpc-trace";
 #[cfg(unix)]
 const TRANSFER_SESSION_ID: &str = "transfer-session";
-const ISOLATED_PYTHON_RESOURCE: &str = "isolated-python";
+const REMOTE_ISOLATED_CODE: &str = "code";
+const CODE_WORKER_ENV: &str = "WORKCELL_MCP_CODE_WORKER";
 const PYTHON_SUM: &str = "1 + 1";
-const PYTHON_SUM_RESULT: &str = "result: 2";
-const PYTHON_NO_HOST_ACCESS: &str =
-    "python_execution has no filesystem, network, or environment access";
-const PYTHON_NO_SOCKET: &str = "Cannot resolve imported module `socket`";
+const PYTHON_SUM_RESULT: i64 = 2;
 const PERMISSION_DENIED: &str = "Permission denied";
 const BATCH_TIMEOUT: Duration = Duration::from_secs(15);
 const BATCH_POLL: Duration = Duration::from_millis(10);
@@ -1560,232 +1557,51 @@ async fn tool(
     panic!("{name}: operation exceeded bounded polling");
 }
 
-async fn isolated_python_permissions(client: &RemoteWorkcellClient, root: &Path, state: &StateDir) {
-    let registry = Arc::new(ToolRegistry::new());
+struct NoModules;
+
+impl ScriptHost for NoModules {
+    fn lookup(&self, _namespace: Option<&str>, _name: &str) -> ScriptName {
+        ScriptName::Undefined(None)
+    }
+
+    fn call(&self, call: ScriptCall) -> ScriptInvocation {
+        panic!("plain computation made a host call: {}", call.name)
+    }
+
+    fn stubs(&self) -> String {
+        String::new()
+    }
+}
+
+/// The remote catalog carries Workcell's isolated `code`, and Caudra checks its contract, but
+/// never registers it: plain computation runs through Caudra's own `code` on this machine's worker, which a
+/// remote session builds as its runtime does, so a missing worker fails here.
+async fn remote_sessions_compute_through_code(client: &RemoteWorkcellClient) {
+    assert!(
+        client
+            .canonical_catalog()
+            .contains_key(REMOTE_ISOLATED_CODE)
+    );
+    let registry = ToolRegistry::new();
     RemoteWorkcellHost::new(client.clone())
         .register(&registry)
         .unwrap();
-    let config = PermissionsConfig::default();
-    assert!(!config.yolo);
-    let permissions = Arc::new(PermissionManager::new_nonpersistent(
-        config,
-        root.to_path_buf(),
-        Arc::default(),
-    ));
-    let policy = || {
-        permissions
-            .active_policy()
-            .into_iter()
-            .map(|entry| (entry.origin, entry.rule))
-            .collect::<Vec<_>>()
-    };
-    let policy_before = policy();
-    let journal = RemoteOperationJournal::open(state).unwrap();
-    let snapshot = || {
-        let path = journal.path();
-        [
-            path.to_path_buf(),
-            PathBuf::from(format!("{}-wal", path.display())),
-        ]
-        .map(|path| fs::read(path).ok())
-    };
-    let journal_before = snapshot();
-    let (tx, rx) = flume::unbounded();
-    let (_response_tx, response_rx) = flume::unbounded();
-    let mut ctx = interpreter_ctx(
-        &AgentMode::Build,
-        &EventSender::new(tx, 0),
-        CancelToken::none(),
-        permissions.clone(),
-        Arc::new(FileReadTracker::new()),
-        Some(Arc::new(smol::lock::Mutex::new(response_rx))),
-        registry.clone(),
-    );
-    ctx.workspace_session = Some(
-        caudra_workspace::WorkspaceSession::new(
-            client.workspace_handle().unwrap(),
-            client.session_binding().clone(),
-            client.root_cursor().clone(),
-        )
-        .unwrap(),
-    );
-    let tool = registry.get("python_execution").unwrap();
-    let invocation = tool.tool.parse(&json!({"code":PYTHON_SUM})).unwrap();
-    let intent = invocation.preflight(&ctx).await.unwrap().unwrap();
-    assert_eq!(invocation.call_effect(tool.effect), ToolEffect::Isolated);
-    assert_eq!(intent.authority, PermissionAuthorityProfile::RemoteResource);
-    assert_eq!(intent.resources.len(), 1);
-    let resource = &intent.resources[0];
-    assert_eq!(
-        resource.kind,
-        PermissionResourceKind::RemoteResource {
-            identity: RemotePermissionIdentity::from_binding(client.session_binding()),
-            resource_kind: "code".into(),
-        }
-    );
-    assert!(!resource.value.is_empty());
-    assert_eq!(resource.access, Some(PermissionResourceAccess::Execute));
-    assert!(!resource.protected && !resource.requires_prompt);
-    assert_eq!(
-        resource.attributes["display_code"],
-        ISOLATED_PYTHON_RESOURCE
-    );
-    assert_eq!(resource.attributes["operation_kind"], "execute");
-    invocation.abandon(&ctx).await;
-
-    for (mode, answer, code) in [
-        (AgentMode::Build, PermissionAnswer::AllowOnce, PYTHON_SUM),
-        (AgentMode::Build, PermissionAnswer::Deny, PYTHON_SUM),
-        (
-            AgentMode::RemotePlan(caudra_workspace::PlanRef::new("python-plan").unwrap()),
-            PermissionAnswer::AllowOnce,
-            PYTHON_SUM,
-        ),
-        (
-            AgentMode::Build,
-            PermissionAnswer::AllowOnce,
-            "open('python-escape', 'w')",
-        ),
-        (
-            AgentMode::Build,
-            PermissionAnswer::AllowOnce,
-            "import socket\nsocket.socket()",
-        ),
-    ] {
-        ctx.mode = mode;
-        let denied = matches!(answer, PermissionAnswer::Deny);
-        let input = json!({"code":code});
-        let dispatch = tool_dispatch::run(
-            &registry,
-            None,
-            "ordinary-python".into(),
-            "python_execution",
-            &input,
-            &ctx,
-            Emit::Silent,
-        );
-        let respond = async {
-            loop {
-                let envelope = rx.recv_async().await.unwrap();
-                if let AgentEvent::PermissionRequest(request) = envelope.event {
-                    assert_eq!(request.resources, intent.resources);
-                    assert!(permissions.answer(&request.id, answer));
-                    return;
-                }
-            }
-        };
-        let done = futures_lite::future::race(
-            async { futures_lite::future::zip(dispatch, respond).await.0 },
-            async {
-                smol::Timer::after(Duration::from_secs(15)).await;
-                panic!("normal remote Python policy did not finish with exactly one prompt");
-            },
-        )
+    assert!(registry.get(REMOTE_ISOLATED_CODE).is_none());
+    assert!(registry.get("file_read").is_some());
+    let runner = WorkcellScriptRunner::standalone(env::var_os(CODE_WORKER_ENV).map(PathBuf::from));
+    let repl = ReplSlot::shared(false);
+    let outcome = runner
+        .run(ScriptRun {
+            code: PYTHON_SUM.to_owned(),
+            host: Arc::new(NoModules),
+            state: ReplLease::acquire(&repl).await,
+            cancel: CancelToken::none(),
+        })
         .await;
-        assert_eq!(
-            done.is_error,
-            denied || code != PYTHON_SUM,
-            "{}",
-            done.output.as_text()
-        );
-        if code != PYTHON_SUM {
-            let diagnostic = if code.starts_with("import") {
-                PYTHON_NO_SOCKET
-            } else {
-                PYTHON_NO_HOST_ACCESS
-            };
-            assert!(
-                done.output.as_text().contains(diagnostic),
-                "{}",
-                done.output.as_text()
-            );
-        } else if !denied {
-            assert_eq!(done.output.as_text().trim(), PYTHON_SUM_RESULT);
-        } else {
-            assert!(done.output.as_text().contains(PERMISSION_DENIED));
-        }
-        assert_eq!(policy(), policy_before);
-        assert!(
-            permissions
-                .structured_conversation_rules_snapshot()
-                .is_empty()
-        );
-        assert!(client.pending_remote_operations().is_empty());
-        assert_eq!(
-            snapshot(),
-            journal_before,
-            "isolated execution wrote the durable journal"
-        );
-    }
-    ctx.user_response_rx = None;
-    for (name, input) in [
-        ("shell", json!({"command":"touch python-shell-grant"})),
-        (
-            "file_write",
-            json!({"filePath":"python-file-grant", "content":"forbidden"}),
-        ),
-        ("python_execution", json!({"code":PYTHON_SUM})),
-    ] {
-        let done = tool_dispatch::run(
-            &registry,
-            None,
-            "no-broad-python-grant".into(),
-            name,
-            &input,
-            &ctx,
-            Emit::Silent,
-        )
-        .await;
-        assert!(done.is_error, "{name}: {}", done.output.as_text());
-        assert!(
-            done.output.as_text().contains(PERMISSION_DENIED),
-            "{}",
-            done.output.as_text()
-        );
-    }
-    assert!(!root.join("python-shell-grant").exists());
-    assert!(!root.join("python-file-grant").exists());
-    ctx.permissions = Arc::new(PermissionManager::new_nonpersistent(
-        PermissionsConfig {
-            rules: vec![PermissionRule {
-                tool: ToolKey::native("python_execution"),
-                scope: None,
-                effect: Effect::Deny,
-            }],
-            ..Default::default()
-        },
-        root.to_path_buf(),
-        Arc::default(),
-    ));
-    let (_response_tx, response_rx) = flume::unbounded();
-    ctx.user_response_rx = Some(Arc::new(smol::lock::Mutex::new(response_rx)));
-    let input = json!({"code":PYTHON_SUM});
-    let done = futures_lite::future::race(
-        tool_dispatch::run(
-            &registry,
-            None,
-            "configured-python-deny".into(),
-            "python_execution",
-            &input,
-            &ctx,
-            Emit::Silent,
-        ),
-        async {
-            loop {
-                if let AgentEvent::PermissionRequest(_) = rx.recv_async().await.unwrap().event {
-                    panic!("configured deny must not offer an approval prompt");
-                }
-            }
-        },
-    )
-    .await;
-    assert!(done.is_error);
-    assert!(done.output.as_text().contains(PERMISSION_DENIED));
-    assert_eq!(snapshot(), journal_before);
-    assert!(!root.join("python-escape").exists());
-    eprintln!(
-        "PASS non-yolo Python exact remote authority, AllowOnce, deny, plan, no persistent grants/journal, no filesystem/network access"
-    );
+    let output = outcome.output.expect("the snippet ran");
+    assert_eq!(output.status, ScriptStatus::Completed, "{output:?}");
+    assert_eq!(output.result, json!(PYTHON_SUM_RESULT));
+    eprintln!("PASS remote isolated code is verified but not registered, and code computes");
 }
 
 async fn concurrent_registry_regressions(
@@ -2311,18 +2127,6 @@ async fn canonical_registry_regressions(client: &RemoteWorkcellClient, root: &Pa
         assert!(done.is_error, "{command}");
         assert!(!root.join("forbidden-plan-write").exists());
     }
-    let done = tool_dispatch::run(
-        &registry,
-        None,
-        "isolated-python".into(),
-        "python_execution",
-        &json!({"code":"1 + 1"}),
-        &ctx,
-        Emit::Silent,
-    )
-    .await;
-    assert!(!done.is_error, "{}", done.output.as_text());
-    assert!(client.pending_remote_operations().is_empty());
     ctx.mode = AgentMode::Build;
     let progress_fault =
         PathBuf::from(env::var_os("WORKCELL_TEST_FAULT").unwrap()).with_extension("progress");
@@ -2449,11 +2253,6 @@ async fn canonical_registry_regressions(client: &RemoteWorkcellClient, root: &Pa
     for (id, name, input) in [
         ("index-beside-uncertain", "file_index", json!({"path":"."})),
         (
-            "python-beside-uncertain",
-            "python_execution",
-            json!({"code":"2 + 2"}),
-        ),
-        (
             "shell-beside-uncertain",
             "shell",
             json!({"command":format!("printf '{BESIDE_UNCERTAIN_CONTENT}' > {BESIDE_UNCERTAIN_SHELL}")}),
@@ -2480,7 +2279,7 @@ async fn canonical_registry_regressions(client: &RemoteWorkcellClient, root: &Pa
         .unwrap();
     assert!(client.pending_remote_operations().is_empty());
     eprintln!(
-        "PASS dropped future sends cancel/status, keeps the uncertain record, and index, Python, shell and write all run beside it"
+        "PASS dropped future sends cancel/status, keeps the uncertain record, and index, shell and write all run beside it"
     );
 }
 
@@ -3834,7 +3633,7 @@ fn authenticated_local() {
             "code_expand",
             "websearch",
             "webfetch",
-            "python_execution",
+            "code",
             "execution_environment",
         ] {
             assert!(
@@ -3843,7 +3642,7 @@ fn authenticated_local() {
             );
         }
         eprintln!("PASS authenticated handshake, full catalog, validated workspace capabilities");
-        Box::pin(isolated_python_permissions(&client, &root, &state)).await;
+        remote_sessions_compute_through_code(&client).await;
         Box::pin(concurrent_registry_regressions(
             &client,
             &root,
@@ -3926,7 +3725,7 @@ fn authenticated_local() {
         drop(session);
         tool(&client, cursor, "file_index", json!({"path":"."})).await;
         tool(&client, cursor, "execution_environment", json!({})).await;
-        let python = tool(&client, cursor, "python_execution", json!({"code":"1 + 1"})).await;
+        let python = tool(&client, cursor, "code", json!({"code":"1 + 1"})).await;
         assert!(python.model_output.contains('2'));
         for nested in [false, true] {
             let resolved;

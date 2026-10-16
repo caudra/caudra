@@ -48,7 +48,7 @@ fn server_about() -> String {
     format!(
         "Each [mcp.NAME] table is one server, and a stdio server like this one runs `command`. \
          NAME is 1 to {MAX_SERVER_NAME_LEN} ASCII letters, digits, and hyphens, and cannot be \
-         the name of a built-in tool. In the `mcp` tool the server is a Python namespace, and its \
+         the name of a built-in tool. In the `code` tool the server is a Python namespace, and its \
          tools are that namespace's async functions."
     )
 }

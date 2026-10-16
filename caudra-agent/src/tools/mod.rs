@@ -53,6 +53,7 @@ use crate::agent::LoadedInstructions;
 use crate::agent::change_recording::ChangeRecorder;
 use crate::background::{JobScope, ShellLive};
 use crate::cancel::{CancelMap, CancelToken};
+use crate::code::CodeSession;
 use crate::context::ContextPublisher;
 use crate::decisions::{NoteAnchor, NoteDraft, NoteSink};
 use crate::mcp::McpSession;
@@ -332,6 +333,9 @@ fn exclusions_without(openai_subscription: bool) -> &'static [&'static str] {
 
 pub const AUTOMATION_TOOL_NAME: &str = "automation";
 pub const BATCH_TOOL_NAME: &str = "batch";
+pub const CODE_TOOL_NAME: &str = "code";
+/// No longer registered: `code` runs plain computation. Kept so a restored session's earlier
+/// calls still draw as scripts.
 pub const PYTHON_EXECUTION_TOOL_NAME: &str = "python_execution";
 pub const EXECUTION_ENVIRONMENT_TOOL_NAME: &str = "execution_environment";
 pub const FILE_APPLY_PATCH_TOOL_NAME: &str = "file_apply_patch";
@@ -344,7 +348,6 @@ pub const FILE_WRITE_TOOL_NAME: &str = "file_write";
 pub const IMAGE_GENERATE_TOOL_NAME: &str = "image_generate";
 /// The only backend `image_generate` can reach today.
 const OPENAI_PROVIDER_SLUG: &str = "openai";
-pub const MCP_TOOL_NAME: &str = "mcp";
 pub const MEMORY_TOOL_NAME: &str = "memory";
 pub const QUESTION_TOOL_NAME: &str = "question";
 pub const SHELL_TOOL_NAME: &str = "shell";
@@ -543,6 +546,8 @@ pub struct ToolContext {
     pub loaded_instructions: LoadedInstructions,
     pub cancel: CancelToken,
     pub mcp: Option<McpSession>,
+    /// The variables this agent's `code` runs keep.
+    pub code: CodeSession,
     /// Built-ins withheld from this request until `tool_search` loads them.
     /// Shared with the agent, so a load inside a batch child reaches the
     /// array the parent builds next turn.
@@ -876,6 +881,7 @@ pub fn interpreter_ctx(
         loaded_instructions: LoadedInstructions::new(),
         cancel,
         mcp: None,
+        code: CodeSession::default(),
         deferral: None,
         deadline: Deadline::None,
         config: AgentConfig::default(),

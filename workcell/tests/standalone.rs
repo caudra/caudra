@@ -40,7 +40,7 @@ use workcell_mcp::{
     server::{ServerBehavior, ToolConfiguration, WorkcellServer},
     transports::http::{HttpAuthentication, HttpConfiguration, HttpServer, ShutdownOutcome},
 };
-use workcell_mcp_code::{CodeConfiguration, WorkerSource};
+use workcell_mcp_code::{CodeConfiguration, CodePools, WorkerSource};
 use workcell_mcp_shell::ShellPermissionPolicy;
 use workcell_mcp_web::{ProxyConfiguration, WebsearchExecutionConfiguration};
 
@@ -112,6 +112,7 @@ async fn fixture_server_with_options(
                     bundled_cache_root: None,
                 },
                 type_check: true,
+                pools: CodePools::All,
             },
             max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
             snapshot_root: None,
@@ -902,6 +903,7 @@ async fn authenticated_change_records_round_trip_every_method_and_use_the_common
                     bundled_cache_root: None,
                 },
                 type_check: true,
+                pools: CodePools::All,
             },
             max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
             snapshot_root: Some(change_root.path()),
@@ -1218,6 +1220,7 @@ async fn authenticated_remote_mutation_is_prepared_once_replayed_and_released() 
                     bundled_cache_root: None,
                 },
                 type_check: true,
+                pools: CodePools::All,
             },
             max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
             snapshot_root: None,
@@ -1444,6 +1447,7 @@ async fn authenticated_scm_is_negotiated_structured_and_uses_the_common_ledger()
                     bundled_cache_root: None,
                 },
                 type_check: true,
+                pools: CodePools::All,
             },
             max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
             snapshot_root: None,
@@ -1656,6 +1660,7 @@ async fn authenticated_workspace_operations_bind_cursors_mutations_and_direct_ex
                     bundled_cache_root: None,
                 },
                 type_check: true,
+                pools: CodePools::All,
             },
             max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
             snapshot_root: None,
@@ -2162,6 +2167,7 @@ async fn authenticated_watch_replays_changes_and_assets_remain_allowlisted_bytes
                     bundled_cache_root: None,
                 },
                 type_check: true,
+                pools: CodePools::All,
             },
             max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
             snapshot_root: None,
@@ -3120,7 +3126,7 @@ fn code_worker() -> Option<PathBuf> {
 /// Local runs may skip without a worker; CI requires it with WORKCELL_REQUIRE_CODE_WORKER.
 #[cfg(unix)]
 #[tokio::test]
-async fn stdio_serves_the_full_catalog_including_python_execution() {
+async fn stdio_serves_the_full_catalog_including_code() {
     let Some(worker) = code_worker() else {
         eprintln!(
             "skipping: no `monty` worker found. Run `make code-worker` or set WORKCELL_MCP_CODE_WORKER."
@@ -3134,7 +3140,7 @@ async fn stdio_serves_the_full_catalog_including_python_execution() {
             ToolGroup::Files,
             ToolGroup::Web,
             ToolGroup::Shell,
-            ToolGroup::PythonExecution,
+            ToolGroup::Code,
         ],
         ServerBehavior {
             expose_execution_environment: true,
@@ -3154,6 +3160,7 @@ async fn stdio_serves_the_full_catalog_including_python_execution() {
             code: CodeConfiguration {
                 worker: WorkerSource::Path(&worker),
                 type_check: true,
+                pools: CodePools::All,
             },
             max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
             snapshot_root: None,
@@ -3188,7 +3195,7 @@ async fn stdio_serves_the_full_catalog_including_python_execution() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect::<Vec<_>>();
-    // Catalog order is a compatibility contract; `python_execution` sits after `shell`.
+    // Catalog order is a compatibility contract; `code` sits after `shell`.
     assert_eq!(
         names,
         [
@@ -3202,7 +3209,7 @@ async fn stdio_serves_the_full_catalog_including_python_execution() {
             "websearch",
             "webfetch",
             "shell",
-            "python_execution",
+            "code",
             "execution_environment",
         ]
     );
@@ -3212,7 +3219,7 @@ async fn stdio_serves_the_full_catalog_including_python_execution() {
         &mcp_request(
             3,
             "tools/call",
-            json!({"name": "python_execution", "arguments": {"code": "sum([1, 2, 3, 4])"}}),
+            json!({"name": "code", "arguments": {"code": "sum([1, 2, 3, 4])"}}),
         ),
     )
     .await;
@@ -3227,7 +3234,7 @@ async fn stdio_serves_the_full_catalog_including_python_execution() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|tool| tool["name"] == "python_execution")
+        .find(|tool| tool["name"] == "code")
         .expect("code tool listed");
     assert_eq!(code_tool["annotations"]["readOnlyHint"], json!(true));
     assert_eq!(code_tool["annotations"]["openWorldHint"], json!(false));
@@ -3263,6 +3270,7 @@ async fn write_authority_decides_whether_mutation_tools_exist_at_all() {
                         bundled_cache_root: None,
                     },
                     type_check: true,
+                    pools: CodePools::All,
                 },
                 max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
                 snapshot_root: None,
@@ -3360,6 +3368,7 @@ async fn transfer_server(root: &Path, private: Option<&Path>, allow_write: bool)
                     bundled_cache_root: None,
                 },
                 type_check: true,
+                pools: CodePools::All,
             },
             max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
             snapshot_root: None,

@@ -1,0 +1,62 @@
+{
+  "k": 3,
+  "baseline": {"ndcg_at_k": 0.476, "recall_at_k": 0.633},
+  "baseline_note": "Synthetic, hand-labelled cases, each pool in keyword order. Not yet measured against an engine: the baseline is the keyword order's own score, which reranking must at least match.",
+  "cases": [
+    {
+      "query": "why did we switch the session store to WAL",
+      "candidates": [
+        {"kind": "tool_result", "tool": "shell", "date": "2026-09-02", "title": "Release prep", "snippet": "$ grep -rn session store\nsrc/store.rs:12: // session store"},
+        {"kind": "user", "tool": null, "date": "2026-08-14", "title": "Tune SQLite", "snippet": "Can we switch the session store to WAL? Readers keep blocking the writer during long saves."},
+        {"kind": "assistant", "tool": null, "date": "2026-08-14", "title": "Tune SQLite", "snippet": "Switched the session store to WAL mode: readers no longer block the writer, and checkpoints run after every 64 commits."},
+        {"kind": "assistant", "tool": null, "date": "2026-07-30", "title": "Docs pass", "snippet": "The session store section in the docs now links to the storage reference."},
+        {"kind": "reasoning", "tool": null, "date": "2026-08-14", "title": "Tune SQLite", "snippet": "WAL needs the -shm and -wal sidecars next to the database, so the backup command has to copy them too."}
+      ],
+      "relevant": [1, 2, 4]
+    },
+    {
+      "query": "flaky integration test port conflict",
+      "candidates": [
+        {"kind": "tool_call", "tool": "shell", "date": "2026-09-10", "title": "CI cleanup", "snippet": "cargo nextest run --test integration"},
+        {"kind": "assistant", "tool": null, "date": "2026-09-10", "title": "CI cleanup", "snippet": "The integration test is flaky because two tests bind port 8080; I gave each a free port from portpicker."},
+        {"kind": "summary", "tool": null, "date": "2026-09-11", "title": "CI cleanup", "snippet": "Fixed the flaky integration test (port conflict on 8080) and pinned the runner image."},
+        {"kind": "user", "tool": null, "date": "2026-06-02", "title": "Onboarding", "snippet": "Which port does the dev server use? I keep forgetting."},
+        {"kind": "tool_result", "tool": "shell", "date": "2026-09-10", "title": "CI cleanup", "snippet": "test integration::upload ... ok\ntest integration::download ... ok"}
+      ],
+      "relevant": [1, 2]
+    },
+    {
+      "query": "decision about release tag signing",
+      "candidates": [
+        {"kind": "tool_result", "tool": "file_read", "date": "2026-05-20", "title": "Release prep", "snippet": "release.md: Tag vX.Y.Z from main after CI is green."},
+        {"kind": "user", "tool": null, "date": "2026-05-21", "title": "Release prep", "snippet": "Let's sign the release tags with the hardware key from now on, not the CI key."},
+        {"kind": "assistant", "tool": null, "date": "2026-04-02", "title": "Logo", "snippet": "The tag line under the logo is now centred."},
+        {"kind": "assistant", "tool": null, "date": "2026-05-21", "title": "Release prep", "snippet": "Agreed: release tags are signed with the hardware key; CI only verifies the signature."},
+        {"kind": "tool_call", "tool": "shell", "date": "2026-05-21", "title": "Release prep", "snippet": "git tag -s v0.9.0 -m 'v0.9.0'"}
+      ],
+      "relevant": [1, 3]
+    },
+    {
+      "query": "how did we fix the retry loop timeout",
+      "candidates": [
+        {"kind": "tool_result", "tool": "shell", "date": "2026-03-03", "title": "HTTP client", "snippet": "retry 1/5 ... retry 2/5 ... timeout"},
+        {"kind": "assistant", "tool": null, "date": "2026-03-03", "title": "HTTP client", "snippet": "The retry loop slept the full timeout between attempts; it now backs off exponentially from 200 ms and gives up after five tries."},
+        {"kind": "user", "tool": null, "date": "2026-02-11", "title": "Game loop", "snippet": "The main loop stutters; can we drop the frame timeout?"},
+        {"kind": "tool_call", "tool": "file_edit", "date": "2026-03-03", "title": "HTTP client", "snippet": "src/retry.rs: replace sleep(timeout) with sleep(backoff.next())"},
+        {"kind": "assistant", "tool": null, "date": "2026-01-15", "title": "Docs pass", "snippet": "Added a section on loop syntax to the template docs."}
+      ],
+      "relevant": [1, 3]
+    },
+    {
+      "query": "OAuth callback port",
+      "candidates": [
+        {"kind": "assistant", "tool": null, "date": "2026-07-01", "title": "Ports audit", "snippet": "Port 8080 is the dev server, 5432 is Postgres."},
+        {"kind": "tool_result", "tool": "file_read", "date": "2026-06-18", "title": "Login flow", "snippet": "auth.rs: const CALLBACK_PORT: u16 = 53682;"},
+        {"kind": "user", "tool": null, "date": "2026-06-18", "title": "Login flow", "snippet": "The OAuth callback fails behind the corporate proxy. Which port does it listen on?"},
+        {"kind": "assistant", "tool": null, "date": "2026-06-18", "title": "Login flow", "snippet": "The OAuth callback listens on 127.0.0.1:53682; the proxy must bypass loopback for it to work."},
+        {"kind": "assistant", "tool": null, "date": "2026-05-09", "title": "Billing", "snippet": "The billing callback retries three times."}
+      ],
+      "relevant": [1, 3]
+    }
+  ]
+}

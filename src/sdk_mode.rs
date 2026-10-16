@@ -225,7 +225,6 @@ const TOOL_NAME_MAP: &[(&str, &str)] = &[
     ("webfetch", "WebFetch"),
     ("websearch", "WebSearch"),
     ("task", "Task"),
-    ("python_execution", "PythonExecution"),
     ("code_map", "CodeMap"),
     ("code_context", "CodeContext"),
     ("code_refs", "CodeRefs"),
@@ -3829,7 +3828,7 @@ impl EventPump {
             | AgentEvent::ToolAnnotation { .. }
             | AgentEvent::ToolDone(_)
             | AgentEvent::BatchProgress(_)
-            | AgentEvent::McpCodeProgress(_)
+            | AgentEvent::CodeProgress(_)
             | AgentEvent::Question(_)
             | AgentEvent::QuestionClosed
             | AgentEvent::QueueItemConsumed { .. }
@@ -4922,7 +4921,6 @@ mod tests {
     #[test_case("webfetch", "WebFetch")]
     #[test_case("websearch", "WebSearch")]
     #[test_case("task", "Task")]
-    #[test_case("python_execution", "PythonExecution")]
     #[test_case("execution_environment", "ExecutionEnvironment")]
     #[test_case("file_index", "Index")]
     #[test_case("memory", "Memory")]

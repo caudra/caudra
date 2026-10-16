@@ -4,8 +4,9 @@ use super::{
     PermissionExecutorKind, PermissionLifetime, PermissionManager, PermissionRequest,
     PermissionResourceAccess, PermissionResourceConstraint, PermissionResourceKind,
     PermissionResourceSelector, PermissionRuleRecord, PermissionSubject, PolicyRule, RuleOrigin,
-    SUBTREE_SCOPE_SUFFIX, StructuredPermissionEffect, StructuredPermissionRule, command_pattern,
-    hex_encode, normalize_configured_selector, permission_rules_cover_request,
+    SESSION_HISTORY_RESOURCE, SUBTREE_SCOPE_SUFFIX, StructuredPermissionEffect,
+    StructuredPermissionRule, command_pattern, hex_encode, normalize_configured_selector,
+    permission_rules_cover_request,
 };
 use crate::tools::native;
 use crate::tools::native::memory::{self, LOCAL_MEMORY_RESOURCE};
@@ -52,6 +53,16 @@ pub const CONFINED_READ_ATTRIBUTE: &str = "confined_read";
 
 pub const CONFINED_READ_VALUE: &str = "true";
 
+/// Set by the `code` tool's `history` module on a session history read whose
+/// project is the session's own: its checkout and verified linked worktrees,
+/// or its remote workspace. The module judges that against the project the
+/// permissions are bound to at the time of the call, so `/cd` moves it.
+/// Nothing else may set it: the builtin rule below reads it as the whole
+/// justification for reading without asking.
+pub const CURRENT_PROJECT_ATTRIBUTE: &str = "current_project";
+
+pub const CURRENT_PROJECT_VALUE: &str = "true";
+
 pub(super) const SHELL_EXECUTION_CONTRACT: &str = "shell.execution.v1";
 
 pub(super) const WORKCELL_TOOL_OWNER: &str = "workcell";
@@ -81,8 +92,7 @@ pub(super) const PROJECT_READ_TOOLS: &[&str] = &[
 pub(super) const TRUSTED_UNSCOPED_TOOLS: &[&str] = &[
     "automation",
     "batch",
-    "mcp",
-    "python_execution",
+    "code",
     "question",
     "skill",
     "task",
@@ -169,6 +179,12 @@ pub(super) fn builtin_rules(cwd: &Path, state_dir: Option<&StateDir>) -> Vec<Per
 /// Browsing a remote session's notes is the same read of the project's own
 /// notes that a local session's memory rules already allow; only the memory
 /// tool's own identity reaches the opaque resource those notes are named by.
+///
+/// Reading this project's own stored conversations is the same kind of read,
+/// so the `code` tool's identity reaches a session history resource marked
+/// as the current project's. Another project's, or every project's, carries
+/// no mark and asks; the unscoped allow on the `code` tool itself is never
+/// weighed for a call a snippet makes.
 pub(super) fn builtin_structured_rules() -> Vec<PolicyRule> {
     let allow = |subject: PermissionSubject, resource: PermissionResourceConstraint| PolicyRule {
         origin: RuleOrigin::Builtin,
@@ -214,6 +230,26 @@ pub(super) fn builtin_structured_rules() -> Vec<PolicyRule> {
                 access: Some(PermissionResourceAccess::Read),
                 protected: Some(false),
                 attributes: BTreeMap::new(),
+            },
+        ),
+        allow(
+            PermissionSubject::Native {
+                owner: native::OWNER.into(),
+                contract: native::code::permission_contract().into(),
+            },
+            PermissionResourceConstraint {
+                kind: PermissionResourceKind::Custom {
+                    name: SESSION_HISTORY_RESOURCE.into(),
+                },
+                selector: PermissionResourceSelector::Any,
+                access: Some(PermissionResourceAccess::Read),
+                protected: Some(false),
+                attributes: BTreeMap::from([(
+                    CURRENT_PROJECT_ATTRIBUTE.into(),
+                    PermissionResourceSelector::Exact {
+                        value: CURRENT_PROJECT_VALUE.into(),
+                    },
+                )]),
             },
         ),
     ]

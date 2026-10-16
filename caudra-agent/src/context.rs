@@ -17,7 +17,7 @@ use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog, TaskPro
 use crate::tools::TOOL_SEARCH_TOOL_NAME;
 use crate::tools::native::{memory, skill};
 use crate::tools::{
-    BuiltinDeferral, DeferredTool, DescriptionContext, MCP_TOOL_NAME, MEMORY_TOOL_NAME,
+    BuiltinDeferral, CODE_TOOL_NAME, DeferredTool, DescriptionContext, MEMORY_TOOL_NAME,
     SKILL_TOOL_NAME, TASK_TOOL_NAME, ToolAudience, ToolFilter, ToolRegistry, ToolState,
     builtin_report,
 };
@@ -270,7 +270,7 @@ impl ContextSkillInventory {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ContextMcpStatus {
-    /// Callable from the `mcp` tool, and in the server catalog when its budget allows.
+    /// Callable from the `code` tool, and in the server catalog when its budget allows.
     Available,
     /// Kept out of the catalog by the profile; a snippet still finds it with `search()`.
     SearchOnly,
@@ -285,7 +285,7 @@ pub struct ContextMcpTool {
     pub reason: Option<&'static str>,
 }
 
-/// Server tools never reach the request array: the `mcp` tool's one definition is all they cost
+/// Server tools never reach the request array: the `code` tool's one definition is all they cost
 /// there, and that is `request_tokens`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextMcpInventory {
@@ -782,7 +782,7 @@ fn account_tools(base_tools: &Value, full_tools: &Value) -> ToolAccounting {
                 TASK_TOOL_NAME => ToolCategory::Profiles,
                 MEMORY_TOOL_NAME => ToolCategory::Memory,
                 SKILL_TOOL_NAME => ToolCategory::Skills,
-                MCP_TOOL_NAME => ToolCategory::Mcp,
+                CODE_TOOL_NAME => ToolCategory::Mcp,
                 _ => ToolCategory::System,
             };
             ToolContribution {
@@ -1361,7 +1361,7 @@ mod tests {
             definition(TASK_TOOL_NAME, "Profiles: builtin and review"),
             definition(MEMORY_TOOL_NAME, "Read memory on demand"),
             definition(SKILL_TOOL_NAME, "Skills: deploy"),
-            definition(MCP_TOOL_NAME, "Run Python that calls MCP servers")
+            definition(CODE_TOOL_NAME, "Run Python that calls MCP servers")
         ]);
         let mut full_tools = base_tools.clone();
         full_tools.as_array_mut().unwrap().push(definition(
@@ -1524,8 +1524,8 @@ mod tests {
             .builtins
             .tools
             .iter()
-            .find(|tool| tool.name == MCP_TOOL_NAME)
-            .expect("the `mcp` tool is inventoried as a built-in");
+            .find(|tool| tool.name == CODE_TOOL_NAME)
+            .expect("the `code` tool is inventoried as a built-in");
         assert_eq!(gateway.billed_to, Some(BILLED_TO_MCP));
         assert_eq!(gateway.tokens, snapshot.usage.mcp_tools);
         let statuses: Vec<_> = snapshot

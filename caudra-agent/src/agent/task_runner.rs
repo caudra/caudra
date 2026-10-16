@@ -37,6 +37,7 @@ use crate::agent::run::AgentParams;
 use crate::agent::subagent::{self, STRUCTURED_OUTPUT_TOOL, Subagent, TaskIdentity, TaskModel};
 use crate::background::JobScope;
 use crate::cancel::{CancelMap, CancelToken};
+use crate::code::CodeSession;
 use crate::context::ContextPublisher;
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
@@ -798,6 +799,7 @@ impl WorkflowHostContext {
             loaded_instructions: self.loaded_instructions.clone(),
             cancel,
             mcp: self.mcp.clone(),
+            code: CodeSession::default(),
             deferral: None,
             deadline: Deadline::None,
             config: self.config.clone(),
@@ -975,7 +977,7 @@ mod tests {
     const CALL_ID: &str = "toolu_01";
     const SEARCH_CALL_ID: &str = "toolu_search";
     const LOADED_CALL_ID: &str = "toolu_loaded";
-    const DEFERRED_TOOL: &str = "python_execution";
+    const DEFERRED_TOOL: &str = "execution_environment";
     const FRESH_ID: &str = "wf-run-1-call-7";
     const LABEL: &str = "find auth";
     const LABEL_ID: &str = "find-auth";

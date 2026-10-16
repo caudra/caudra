@@ -1,5 +1,5 @@
 //! `decide()` and `rerank()` in a snippet: the decision dialect workflows use, sent through the
-//! session's decision engine under the `mcp` feature, so a snippet can judge and sort what its
+//! session's decision engine under the `code` feature, so a snippet can judge and sort what its
 //! servers returned before any of it reaches the context.
 
 use caudra_decision::DecisionError;
@@ -10,10 +10,16 @@ use caudra_workflow::decision::{
 };
 use serde_json::{Map, Value, json};
 
+use super::names::{DECIDE_HELPER, RERANK_HELPER};
 use super::runner::{ScriptError, ScriptErrorKind};
 use crate::CancelToken;
 use crate::decisions::{DecisionContext, DecisionFeature, Decisions, join_answered};
 
+/// The decision helpers' signatures, for the type checker.
+pub const DECISION_STUBS: [&str; 2] = [
+    "async def decide(input: Any, questions: list[dict[str, Any]], model: str | None = None, timeout_ms: int | None = None) -> dict[str, Any]: ...",
+    "async def rerank(query: str, candidates: list[Any], threshold: float | None = None, top_k: int | None = None, model: str | None = None, timeout_ms: int | None = None) -> list[dict[str, Any]]: ...",
+];
 pub const DECIDE_PARAMS: &[&str] = &[INPUT_PARAM, QUESTIONS_PARAM, MODEL_PARAM, TIMEOUT_PARAM];
 pub const RERANK_PARAMS: &[&str] = &[
     QUERY_PARAM,
@@ -56,7 +62,7 @@ pub struct Decide {
 
 /// Reads `decide(input, questions, model=None, timeout_ms=None)`.
 pub fn decide_request(arguments: &Map<String, Value>) -> Result<Decide, ScriptError> {
-    let helper = super::naming::DECIDE_HELPER;
+    let helper = DECIDE_HELPER;
     let input = arguments
         .get(INPUT_PARAM)
         .filter(|input| !input.is_null())
@@ -80,12 +86,12 @@ pub fn decide_request(arguments: &Map<String, Value>) -> Result<Decide, ScriptEr
 /// Reads `rerank(query, candidates, threshold=None, top_k=None, model=None, timeout_ms=None)`.
 pub fn rerank_request(arguments: &Map<String, Value>) -> Result<RerankRequest, ScriptError> {
     let query = match arguments.get(QUERY_PARAM) {
-        None => return Err(missing(super::naming::RERANK_HELPER, QUERY_PARAM)),
+        None => return Err(missing(RERANK_HELPER, QUERY_PARAM)),
         Some(Value::String(query)) if !query.trim().is_empty() => query.clone(),
         Some(_) => return Err(value_error(RERANK_QUERY_TYPE)),
     };
     let candidates = match arguments.get(CANDIDATES_PARAM) {
-        None => return Err(missing(super::naming::RERANK_HELPER, CANDIDATES_PARAM)),
+        None => return Err(missing(RERANK_HELPER, CANDIDATES_PARAM)),
         Some(Value::Array(candidates))
             if candidates
                 .iter()
@@ -135,7 +141,7 @@ pub async fn ask(
     cancel: &CancelToken,
 ) -> Result<Value, ScriptError> {
     let outcome = cancel
-        .race(decisions.scripted(DecisionFeature::Mcp, request, context))
+        .race(decisions.scripted(DecisionFeature::Code, request, context))
         .await
         .map_err(|_| runtime_error(CANCELLED))?;
     let response = outcome.result.map_err(failure)?;

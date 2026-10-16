@@ -13,7 +13,7 @@ use crate::mcp::McpSession;
 use crate::permissions::canonical_json;
 use crate::tools::json_repair::RepairState;
 use crate::tools::native::batch;
-use crate::tools::{MCP_TOOL_NAME, ToolContext, ToolEffect, ToolLive};
+use crate::tools::{CODE_TOOL_NAME, ToolContext, ToolEffect, ToolLive};
 use crate::types::{BatchToolEntry, BatchToolStatus, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use caudra_providers::{ContentBlock, Message, Role, StreamResponse, ToolNameAliases};
 
@@ -294,18 +294,18 @@ impl SpeculativeRuns {
         self.settled.store(true, Ordering::Release);
     }
 
-    /// `mcp` reaches servers whose effects no retried or abandoned response
+    /// `code` reaches servers whose effects no retried or abandoned response
     /// takes back, so it waits until the response carrying it is whole, and
     /// so does a batch that would run it.
     fn waits_for_settled_response(&self, ctx: &ToolContext, name: &str, input: &Value) -> bool {
         if self.settled.load(Ordering::Acquire) {
             return false;
         }
-        name == MCP_TOOL_NAME
+        name == CODE_TOOL_NAME
             || (name == crate::tools::BATCH_TOOL_NAME
                 && batch::child_calls(input)
                     .iter()
-                    .any(|(tool, _)| ctx.resolve_tool_name_alias(tool) == MCP_TOOL_NAME))
+                    .any(|(tool, _)| ctx.resolve_tool_name_alias(tool) == CODE_TOOL_NAME))
     }
 
     pub(crate) fn register(&self, id: &str, name: &str) {
@@ -531,7 +531,7 @@ impl SpeculativeRuns {
         let Some((tool, params)) = batch::dispatchable(entry, &ctx) else {
             return;
         };
-        if ctx.resolve_tool_name_alias(&tool) == MCP_TOOL_NAME {
+        if ctx.resolve_tool_name_alias(&tool) == CODE_TOOL_NAME {
             return;
         }
         ctx.tool_use_id = Some(batch::child_tool_use_id(Some(batch_id), index));
@@ -1329,16 +1329,16 @@ mod tests {
         smol::block_on(async {
             let (mut ctx, ran) = counting_ctx();
             let read = ctx.local_tools[READ].clone();
-            Arc::make_mut(&mut ctx.local_tools).insert(MCP_TOOL_NAME.into(), read);
+            Arc::make_mut(&mut ctx.local_tools).insert(CODE_TOOL_NAME.into(), read);
             let runs = SpeculativeRuns::new(&ctx, None);
-            let script = json!({ "tool": MCP_TOOL_NAME, "parameters": { "code": "1" } });
+            let script = json!({ "tool": CODE_TOOL_NAME, "parameters": { "code": "1" } });
             let (name, input) = if batched {
                 (
                     crate::tools::BATCH_TOOL_NAME,
                     json!({ "tool_calls": [script] }),
                 )
             } else {
-                (MCP_TOOL_NAME, script["parameters"].clone())
+                (CODE_TOOL_NAME, script["parameters"].clone())
             };
             runs.register(BATCH_ID, name);
             runs.start(BATCH_ID, 0, &script.to_string());
@@ -1366,11 +1366,11 @@ mod tests {
         smol::block_on(async {
             let (mut ctx, ran) = counting_ctx();
             let read = ctx.local_tools[READ].clone();
-            Arc::make_mut(&mut ctx.local_tools).insert(MCP_TOOL_NAME.into(), read);
+            Arc::make_mut(&mut ctx.local_tools).insert(CODE_TOOL_NAME.into(), read);
             let runs = SpeculativeRuns::new(&ctx, None);
             runs.settle();
             runs.begin_attempt();
-            runs.ready(BATCH_ID, MCP_TOOL_NAME, json!({ "code": "1" }));
+            runs.ready(BATCH_ID, CODE_TOOL_NAME, json!({ "code": "1" }));
             runs.settled().await;
             assert!(!runs.has_admitted());
             assert_eq!(ran.load(Ordering::SeqCst), 0);

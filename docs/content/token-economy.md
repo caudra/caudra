@@ -46,7 +46,7 @@ task("find auth") ───────►  file_glob, file_grep ×6, file_read 
 one line stays              ~20k tokens stay outside main
 ```
 
-**MCP code mode.** An MCP server with 100 tools would ship 100 definitions in every request. Caudra sends one `mcp` tool instead, and the model calls your servers from Python. It learns their tools from a compact server list, searches for the rest, and filters results in the snippet, so only what it keeps reaches the context. A server that connects or changes its tools never touches the cached prefix. See [Code mode](/docs/mcp/#code-mode).
+**MCP code mode.** An MCP server with 100 tools would ship 100 definitions in every request. Caudra sends none of them, and the model calls your servers from Python in the one fixed [`code`](/docs/code/) tool. It learns their tools from a compact server list, searches for the rest, and filters results in the snippet, so only what it keeps reaches the context. A server that connects or changes its tools never touches the cached prefix. See [Code mode](/docs/mcp/#code-mode).
 
 **Deferred built-in tools.** Selected built-ins can start outside the request array behind a `tool_search` entry. Caudra defers them for small and supply-unknown models, where the shorter array helps and the prompt cache is cheap to rebuild. Known non-small models receive them upfront because loading one mid-session can cost more than carrying the full set. See [Tools loaded on demand](/docs/tools/#which-models-defer).
 
@@ -56,7 +56,7 @@ Successful text results larger than 8 KiB are retained. This lets Caudra prune o
 
 Use [`tool_output`](/docs/tools/#tool_output) with that ID as `output_id` and a regex `pattern` to find relevant lines. Its `offset` is the first line to search, `limit` caps matches, and `context_before` and `context_after` add nearby lines. Omit `pattern` to page through the needed range with a 1-indexed `offset` and line `limit`. The tool includes an exact next-call hint when more results remain. IDs belong to the current session. [Sessions](/docs/sessions/#managed-tool-outputs) covers retention and cleanup.
 
-**Interrupted work is not wasted.** Press Esc on a long tool, or let its deadline hit, and whatever it printed so far still reaches the model, tagged as partial: `shell` keeps its streamed lines, `python_execution` the script output, a `task` subagent its half transcript. Otherwise the next turn starts from nothing and you pay to run it all again.
+**Interrupted work is not wasted.** Press Esc on a long tool, or let its deadline hit, and whatever it printed so far still reaches the model, tagged as partial: `shell` keeps its streamed lines, a `task` subagent its half transcript. Otherwise the next turn starts from nothing and you pay to run it all again.
 
 ## Fewer round-trips
 
@@ -78,10 +78,10 @@ Repair accepts at most 64 KiB of complete argument text and refuses truncated va
 
 Model repair adds usage charged under `tool_json_repair`. Its separate request leaves the main conversation prefix and tool catalog unchanged, avoiding an unnecessary prompt-cache invalidation. Cache hits still depend on the provider.
 
-**python_execution** runs pure computation in an isolated Python subset. It can reshape JSON, aggregate values, process text, and perform calculations without host filesystem or network access.
+**code** runs pure computation in a Python subset, in a worker process with no host filesystem or network access. It can reshape JSON, aggregate values, process text, and perform calculations, and its variables carry over to the next run, so a large result is loaded once and questioned many times. It also [searches past conversations](/docs/code/#search-past-conversations), so the model finds an earlier decision with one call instead of re-reading old sessions.
 
 ```
-manual calculation              with python_execution
+manual calculation              with code
 ─────────────────────            ─────────────────────────────
 inspect a large JSON result      data = json.loads(source)
 reason over every value          print(sum(row["cost"] for row in data))
@@ -197,7 +197,7 @@ Each view starts with a totals line and then one row per tool, ordered by call c
 
 The table is wider than the modal, so a sideways scroll pans it.
 
-Each server call an [`mcp`](/docs/mcp/#code-mode) run makes gets its own row, named `server.tool`, with its own calls, errors, and time. It adds no tokens: what the run returned to the model counts once, on the `mcp` row.
+Each server call a [`code`](/docs/mcp/#code-mode) run makes gets its own row, named `server.tool`, with its own calls, errors, and time. It adds no tokens: what the run returned to the model counts once, on the `code` row.
 
 Token figures carry a `~` because they are estimates. Caudra measures them with the o200k tokenizer, which is exact only for OpenAI models, and it measures the result the model actually received, after [result limits](#smaller-results) trimmed it. A tool with a small share of calls and a large share of tokens is the one to configure differently.
 

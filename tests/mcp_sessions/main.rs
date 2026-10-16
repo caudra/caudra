@@ -1,4 +1,4 @@
-//! `caudra -p` sessions that reach server-everything through the `mcp` tool: the SDK permission
+//! `caudra -p` sessions that reach server-everything through the `code` tool: the SDK permission
 //! flow, variables kept between turns, and a resumed session. Every test is ignored;
 //! `make test-mcp-servers` builds the server image and runs them.
 #![cfg(unix)]
@@ -20,7 +20,7 @@ const CALL_SUM: &str = "await everything.get_sum(a=2, b=3)";
 
 fn run(code: &str) -> String {
     format!(
-        "Call the `mcp` tool once, with exactly this Python as its `code`, then reply with only the word done.\n\n```python\n{code}\n```"
+        "Call the `code` tool once, with exactly this Python as its `code`, then reply with only the word done.\n\n```python\n{code}\n```"
     )
 }
 

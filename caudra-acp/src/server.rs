@@ -74,7 +74,7 @@ const PERMISSION_QUESTION_CLIENT: &str = "openmausbot";
 /// ACP has no fast-mode toggle, so a restored total is priced at standard rates.
 const RESTORED_FAST: bool = false;
 const DECISION_ADVISORY_GUIDANCE: &str = "Decision engine estimates do not authorize this action.";
-/// Joins a call's id to a child's index: a `batch` or `mcp` child runs as
+/// Joins a call's id to a child's index: a `batch` or `code` child runs as
 /// `<parent>:<n>`, and its own children append another `:<n>`.
 const CHILD_CALL_SEPARATOR: char = ':';
 
@@ -811,7 +811,7 @@ impl ElicitorFactory for McpElicitors {
     }
 }
 
-/// The client never sees a subagent's own calls, nor a `batch` or `mcp`
+/// The client never sees a subagent's own calls, nor a `batch` or `code`
 /// child's, so either is scoped to the root call the client was shown.
 fn shown_tool_call(ctx: &ToolContext) -> Option<String> {
     ctx.root_tool_use_id
@@ -1325,7 +1325,7 @@ fn permission_scope_summary(scopes: &[String]) -> String {
     )
 }
 
-/// The announced call a request belongs to. A `batch` or `mcp` child asks
+/// The announced call a request belongs to. A `batch` or `code` child asks
 /// under `<parent>:<n>`, an id the client never saw, so it is attributed to
 /// the nearest ancestor that was announced; an id with none passes through.
 fn shown_call<'a>(announced: &HashSet<String>, id: &'a str) -> &'a str {

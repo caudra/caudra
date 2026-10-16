@@ -149,10 +149,10 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use caudra_agent::agent::task_runner::WorkflowHostContext;
 use caudra_agent::autopilot::{ActionName, DecisionKind};
 use caudra_agent::background::{BackgroundTasks, ShellSnapshot};
+use caudra_agent::code::output as code_output;
 use caudra_agent::commits::repo;
 use caudra_agent::context::{ContextKey, ContextSnapshot, ContextStore};
 use caudra_agent::mcp::McpSnapshot;
-use caudra_agent::mcp::code::output as mcp_code;
 use caudra_agent::mentions;
 use caudra_agent::permissions::{AutopilotNote, PermissionManager, PermissionPolicyError};
 use caudra_agent::prompt::profile::PromptProfileCatalog;
@@ -7108,7 +7108,7 @@ impl App {
     /// in — a synthetic cancellation, say — and recording a zero for it would
     /// invent activity.
     ///
-    /// Each server call an `mcp` snippet made counts as a call of its own,
+    /// Each server call an `code` snippet made counts as a call of its own,
     /// under its `server.tool` name. The model never reads those results
     /// directly, so they cost the context window nothing.
     fn record_tool_call(&mut self, done: &caudra_agent::ToolDoneEvent) {
@@ -7124,11 +7124,11 @@ impl App {
             duration_ms: done.accounting.duration_ms,
             tokens: done.accounting.model_tokens,
         });
-        if let ToolOutput::McpCode(run) = &done.output {
+        if let ToolOutput::Code(run) = &done.output {
             for call in &run.calls {
                 self.record_tool_usage(ToolCall {
                     tool: call.qualified_name(),
-                    source: mcp_code::CALL_SOURCE.to_owned(),
+                    source: code_output::CALL_SOURCE.to_owned(),
                     cwd: self.state.session.cwd.clone(),
                     outcome: call.ledger_outcome(),
                     duration_ms: call.duration_ms,

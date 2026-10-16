@@ -35,11 +35,12 @@ use crate::{
         CodeException, CodeExecution, CodeInput, CodeOutput, MAX_CODE_BYTES, MAX_MEMORY_BYTES,
         MAX_SUSPENSIONS, MAX_TIMEOUT_MS, Outcome, PreparedCode, STREAM_CAPTURE_BYTES,
     },
-    worker::{CodeBuildError, WorkerSource, build_pool},
+    worker::{CodeBuildError, CodePools, WorkerSource, build_pool},
 };
 
 #[cfg(feature = "mcp")]
-const TOOL_NAME: &str = "python_execution";
+const TOOL_NAME: &str = "code";
+const ISOLATED_UNAVAILABLE: &str = "isolated code execution is not enabled in this code tool group";
 /// Name shown in tracebacks the caller sees. It is not a real path and never touches a filesystem.
 pub(crate) const SCRIPT_NAME: &str = "snippet.py";
 
@@ -50,10 +51,12 @@ pub struct CodeConfiguration<'a> {
     pub worker: WorkerSource<'a>,
     /// Type check each snippet before running it.
     pub type_check: bool,
+    /// Which worker pools to build. The eager startup check runs on the first pool built.
+    pub pools: CodePools,
 }
 
 pub struct CodeToolGroup {
-    pool: Pool,
+    pool: Option<Pool>,
     pub(crate) hosted: Pool,
     #[cfg(feature = "bundled-worker")]
     _worker_lease: Option<WorkerLease>,
@@ -73,7 +76,12 @@ impl std::fmt::Debug for CodeToolGroup {
 impl CodeToolGroup {
     /// Builds the group and eagerly starts a worker, so a broken deployment fails at startup.
     pub async fn new(configuration: CodeConfiguration<'_>) -> Result<Self, CodeBuildError> {
-        let built = build_pool(configuration.worker, Duration::from_millis(MAX_TIMEOUT_MS)).await?;
+        let built = build_pool(
+            configuration.worker,
+            configuration.pools,
+            Duration::from_millis(MAX_TIMEOUT_MS),
+        )
+        .await?;
         Ok(Self {
             pool: built.pool,
             hosted: built.hosted,
@@ -92,7 +100,9 @@ impl CodeToolGroup {
     /// Asks idle workers to exit cleanly. Dropping the group kills them instead, which is equally
     /// safe but leaves a SIGKILL in the operator's logs.
     pub async fn shutdown(&self) {
-        self.pool.close().await;
+        if let Some(pool) = &self.pool {
+            pool.close().await;
+        }
         self.hosted.close().await;
     }
 
@@ -151,13 +161,16 @@ impl CodeToolGroup {
             timeout_ms,
             type_check,
         } = prepared;
+        let Some(pool) = &self.pool else {
+            return Err(ISOLATED_UNAVAILABLE.into());
+        };
 
         let started = Instant::now();
         let repl = Self::repl_config(type_check, timeout_ms);
         let session = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Ok(None),
-            session = self.pool.checkout(&repl) => session,
+            session = pool.checkout(&repl) => session,
         };
         let mut session = match session {
             Ok(session) => session,
@@ -629,6 +642,7 @@ mod tests {
                 cache_root: cache.path(),
             },
             type_check: false,
+            pools: CodePools::All,
         })
         .await
         .expect("bundled worker pool");

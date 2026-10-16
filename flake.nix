@@ -294,8 +294,8 @@
                   printf '%s\n' "$smoke_output" >&2
                   exit 1
                 fi
-                if ! printf '%s\n' "$smoke_output" | grep -qx python_execution ||
-                  printf '%s\n' "$smoke_output" | grep -q 'Workcell python_execution is unavailable'; then
+                if ! printf '%s\n' "$smoke_output" | grep -qx code ||
+                  printf '%s\n' "$smoke_output" | grep -q 'The code tool is unavailable'; then
                   printf '%s\n' "$smoke_output" >&2
                   exit 1
                 fi
