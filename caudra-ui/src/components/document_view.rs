@@ -14,12 +14,11 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 use crate::components::input::apply_selection;
 use crate::components::modal::{FooterHits, FooterLine, Modal};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
+use crate::components::sweep::{Sweep, char_at_column};
 use crate::components::{ModalScroll, bar_area};
 use crate::selection::line_text;
 use crate::theme;
@@ -137,44 +136,6 @@ impl Painted {
     }
 }
 
-/// A sweep over the body, in rows of the painted content and characters within
-/// a row. Held as the two ends the pointer gave rather than as an ordered pair,
-/// so a backwards drag keeps tracking the end that is moving.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Selection {
-    anchor: (usize, usize),
-    cursor: (usize, usize),
-}
-
-impl Selection {
-    fn at(position: (usize, usize)) -> Self {
-        Self {
-            anchor: position,
-            cursor: position,
-        }
-    }
-
-    fn ordered(self) -> ((usize, usize), (usize, usize)) {
-        if self.anchor <= self.cursor {
-            (self.anchor, self.cursor)
-        } else {
-            (self.cursor, self.anchor)
-        }
-    }
-
-    /// The characters of `row` this selection covers, or `None` where it covers
-    /// none of them. `len` closes a row the selection runs past.
-    fn on_row(self, row: usize, len: usize) -> Option<Range<usize>> {
-        let (start, end) = self.ordered();
-        if row < start.0 || row > end.0 {
-            return None;
-        }
-        let from = if row == start.0 { start.1 } else { 0 };
-        let to = if row == end.0 { end.1.min(len) } else { len };
-        (from < to).then_some(from..to)
-    }
-}
-
 pub(crate) enum Jump {
     Next,
     Previous,
@@ -197,7 +158,7 @@ pub(crate) struct DocumentView<K> {
     key: Option<K>,
     painted: Painted,
     gutter: u16,
-    selection: Option<Selection>,
+    selection: Option<Sweep>,
     /// Between a press on the body and its release, which is the sweep's to
     /// copy rather than the owner's to read as a click.
     dragging: bool,
@@ -377,7 +338,7 @@ impl<K: PartialEq> DocumentView<K> {
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(at) = self.position_at(&event) {
-                    self.selection = Some(Selection::at(at));
+                    self.selection = Some(Sweep::at(at));
                     self.dragging = true;
                     return DocumentMouse::Consumed;
                 }
@@ -386,7 +347,7 @@ impl<K: PartialEq> DocumentView<K> {
                 if let Some(at) = self.position_at(&event)
                     && let Some(selection) = &mut self.selection
                 {
-                    selection.cursor = at;
+                    selection.drag_to(at);
                 }
                 return DocumentMouse::Consumed;
             }
@@ -431,14 +392,13 @@ impl<K: PartialEq> DocumentView<K> {
     /// Where the sweep starts and where it stops short of, in painted rows and
     /// characters within them, first end first.
     pub(crate) fn sweep_ends(&self) -> Option<((usize, usize), (usize, usize))> {
-        self.selection.map(Selection::ordered)
+        self.selection.map(Sweep::ordered)
     }
 
     pub(crate) fn select_all(&mut self) {
-        self.selection = Some(Selection {
-            anchor: (0, 0),
-            cursor: self.painted.last_position(),
-        });
+        let mut sweep = Sweep::at((0, 0));
+        sweep.drag_to(self.painted.last_position());
+        self.selection = Some(sweep);
     }
 
     /// Where a press landed in the body, in the same rows and characters the
@@ -585,21 +545,6 @@ fn widest(lines: &[Line<'static>]) -> u16 {
         .max()
         .and_then(|width| u16::try_from(width).ok())
         .unwrap_or(u16::MAX)
-}
-
-/// The character a display column falls on, so a press lands where the reader
-/// sees the pointer rather than that many chars along a row of wide glyphs.
-fn char_at_column(text: &str, column: usize) -> usize {
-    let mut width = 0;
-    let mut index = 0;
-    for grapheme in text.graphemes(true) {
-        if width >= column {
-            return index;
-        }
-        width += grapheme.width();
-        index += grapheme.chars().count();
-    }
-    index
 }
 
 #[cfg(test)]
@@ -952,13 +897,5 @@ mod tests {
 
         assert_eq!(view.painted.lines.len(), MAX_ROWS, "{CAP_WRONG}");
         assert_eq!(view.painted.lines[0].to_string(), TRUNCATED, "{CAP_WRONG}");
-    }
-
-    #[test_case("abc",  0, 0 ; "column_zero_is_the_first_char")]
-    #[test_case("abc",  2, 2 ; "a_narrow_column_is_its_own_char")]
-    #[test_case("abc", 99, 3 ; "past_the_end_is_the_end")]
-    #[test_case("日本",  2, 1 ; "a_wide_glyph_holds_two_columns")]
-    fn a_column_reads_back_as_its_character(text: &str, column: usize, expected: usize) {
-        assert_eq!(char_at_column(text, column), expected);
     }
 }

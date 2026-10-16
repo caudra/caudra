@@ -131,6 +131,7 @@ These keys work the same in every text field: the composer, a picker's filter, f
 | `F3` | Decline an MCP server's request |
 | `F4` | Answer the question later, or show the next waiting question |
 | `Enter` | Select option |
+| `Ctrl+C` | Copy the text dragged over, or stop the agent that asked |
 | `Esc` | Close |
 
 ## Pickers

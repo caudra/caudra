@@ -71,6 +71,7 @@ use crate::components::commit_popup::{CommitAction, CommitIndex, CommitPopup};
 use crate::components::context_modal::ContextModal;
 use crate::components::decisions_modal::{DecisionsFetchState, DecisionsModal};
 use crate::components::docs_modal::{DocsAction, DocsModal};
+use crate::components::document_view::COPIED_SELECTION;
 use crate::components::env_modal::EnvModal;
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::goal_panel::{
@@ -1911,6 +1912,10 @@ impl App {
                 self.copy_to_clipboard(&text);
                 return Vec::new();
             }
+            QuestionFormAction::CopySelection(text) => {
+                self.copy_labelled(&text, COPIED_SELECTION);
+                return Vec::new();
+            }
             QuestionFormAction::Later => {
                 self.defer_question();
                 return Vec::new();
@@ -2545,6 +2550,7 @@ impl App {
             match self.stream_modal.handle_key(key) {
                 StreamAction::Ignored | StreamAction::Consumed => {}
                 StreamAction::Copy(text) => self.copy_to_clipboard(&text),
+                StreamAction::CopySelection(text) => self.copy_labelled(&text, COPIED_SELECTION),
                 StreamAction::Submit(question) => self.continue_btw(question),
             }
             return Some(vec![]);

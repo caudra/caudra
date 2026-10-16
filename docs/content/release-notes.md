@@ -11,7 +11,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.10 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.10)
 
-Preview 10 lets MCP snippets ask the decision engine typed questions and rerank long results before the model reads them, moves workflow `decide()` to the same question shape, the one OpenAI Decisions uses, and fixes subscription image generation after GPT-5.5 retired from Codex.
+Preview 10 lets MCP snippets ask the decision engine typed questions and rerank long results before the model reads them, moves workflow `decide()` to the same question shape, the one OpenAI Decisions uses, copies what you drag over in `/btw` and the question form, and fixes subscription image generation after GPT-5.5 retired from Codex.
 
 > **Warning**
 >
@@ -29,6 +29,10 @@ Preview 10 lets MCP snippets ask the decision engine typed questions and rerank 
 ### Transcript
 
 - **Pictures in the transcript.** `view_image` and `image_generate` cards, Markdown images that point at local files, and prompts with attached images now show the picture as a thumbnail. Terminals that support Kitty graphics get the full-resolution picture, and other terminals get coloured blocks, two by two pixels to a cell, or two by three with `inline_images = "sextants"` in terminals and fonts that draw sextants. Click a picture to open it at full size, then press `o` to open it in your system viewer, `w` to open it in the workbench, or `y` to copy its path. Images attached to a draft show as `[Image #1]` chips you can click, and the workbench shows image files instead of the binary file notice. Markdown images are never fetched from the network. Set `[ui] inline_images` to `"blocks"`, `"sextants"`, `"kitty"`, or `"off"` to choose. See [Images](/docs/markdown/#images).
+
+### Selection
+
+- **Drag to copy in `/btw` and the question form.** Dragging over a `/btw` answer copies the passage when you let go, as Markdown where it came from the answer, without the footer, the follow-up field, or a line break at every wrapped row, and the passage stays selected while the answer streams and scrolls. `Ctrl+Y`, `Ctrl+C`, and the footer's copy take the selection before the whole answer. In the question form, a drag starts anywhere, including on an option, and copies instead of picking what it ends on. A drag in the answer box selects and copies its text, and `Ctrl+C` copies a selection before it stops the agent. The form's border is no longer copied with the text. See [Commands](/docs/commands/) and [Keybindings](/docs/keybindings/#form).
 
 ### Image generation
 

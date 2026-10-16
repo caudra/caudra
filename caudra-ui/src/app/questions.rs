@@ -17,6 +17,7 @@ use caudra_storage::autopilot::AutopilotStopper;
 
 use super::{App, Status};
 use crate::components::Action;
+use crate::components::document_view::COPIED_SELECTION;
 use crate::components::question_form::{QuestionForm, QuestionFormAction};
 
 pub(crate) const QUESTION_CLOSED_MSG: &str = "That question is no longer open";
@@ -234,6 +235,9 @@ impl App {
             QuestionFormAction::Consumed => {}
             QuestionFormAction::AskBtw => self.open_question_btw(),
             QuestionFormAction::Copy(text) => self.copy_to_clipboard(&text),
+            QuestionFormAction::CopySelection(text) => {
+                self.copy_labelled(&text, COPIED_SELECTION);
+            }
             QuestionFormAction::Submit(answers) => {
                 let reply = serde_json::to_string(&answers)
                     .unwrap_or_else(|_| QUESTION_DISMISSED_REPLY.to_owned());

@@ -13,6 +13,7 @@ use crate::components::context_modal::{
     EXPANDED_TITLE as CONTEXT_EXPANDED_TITLE, TITLE as CONTEXT_TITLE,
 };
 use crate::components::docs_modal::fixture as docs_fixture;
+use crate::components::document_view::COPIED_SELECTION;
 use crate::components::env_modal::PATTERN_KEY as ENV_PATTERN_KEY;
 use crate::components::file_walk::UNREADABLE_DIR_MSG;
 use crate::components::goal_panel::{FooterCommand, GOAL_CLEAR, GOAL_MODEL, PanelCommand};
@@ -18679,6 +18680,97 @@ fn question_btw_owns_overlapping_wheel_and_mouse_and_outside_click_returns_to_th
     assert_eq!(app.status, Status::Streaming);
     app.open_question_btw();
     assert_eq!(app.stream_modal.input_text(), BTW_QUESTION);
+}
+
+const SWEEP_NOT_COPIED: &str = "letting go of a sweep must copy it under the selection label";
+const APP_SWEPT_MODAL: &str =
+    "the screen-cell sweep must not run over a surface that sweeps itself";
+const SWEEP_ANSWERED: &str = "a sweep over an option must copy it and answer nothing";
+
+/// The first cell `text` is drawn at on a fresh frame of the whole app.
+fn drawn_cell(app: &mut App, text: &str) -> (u16, u16) {
+    let mut terminal = Terminal::new(TestBackend::new(TEST_AREA.width, TEST_AREA.height)).unwrap();
+    terminal.draw(|frame| app.view(frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    buffer
+        .area
+        .positions()
+        .find(|position| {
+            text.chars().enumerate().all(|(offset, ch)| {
+                let x = position.x + offset as u16;
+                x < buffer.area.right() && buffer[(x, position.y)].symbol() == ch.to_string()
+            })
+        })
+        .map(|position| (position.x, position.y))
+        .unwrap_or_else(|| panic!("{text:?} was not drawn"))
+}
+
+/// Presses at `from`, drags to `to` and lets go there, checking after each
+/// event that the app's own sweep stayed out of it.
+fn sweep_app(app: &mut App, from: (u16, u16), to: (u16, u16)) {
+    for (kind, (column, row)) in [
+        (MouseEventKind::Down(MouseButton::Left), from),
+        (MouseEventKind::Drag(MouseButton::Left), to),
+        (MouseEventKind::Up(MouseButton::Left), to),
+    ] {
+        assert!(app.update(mouse_event(kind, column, row)).is_empty());
+        assert!(app.selection_state.is_none(), "{APP_SWEPT_MODAL}");
+    }
+}
+
+fn assert_selection_copied(app: &App) {
+    let flash = app.status_bar.flash_text().expect(SWEEP_NOT_COPIED);
+    assert!(
+        flash == COPIED_SELECTION || flash.starts_with(super::COPY_FAILED),
+        "{SWEEP_NOT_COPIED}: {flash:?}"
+    );
+}
+
+#[test]
+fn a_sweep_over_a_btw_answer_is_the_modals_to_copy() {
+    let mut app = btw_ready_app();
+    let _tx = btw_streaming(&mut app);
+    let (column, row) = drawn_cell(&mut app, BTW_HEADER);
+
+    sweep_app(
+        &mut app,
+        (column, row),
+        (column + BTW_HEADER.width() as u16, row),
+    );
+
+    assert_selection_copied(&app);
+    assert!(app.stream_modal.is_open());
+}
+
+#[test_case(false; "transcript")]
+#[test_case(true; "workbench")]
+fn a_sweep_over_a_question_option_copies_it_and_answers_nothing(workbench: bool) {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let (answer_tx, answers) = flume::unbounded();
+    app.answer_tx = Some(answer_tx);
+    open_question(&mut app);
+    if workbench {
+        app.execute_command(cmd("/workbench"), 0);
+        assert!(app.workbench.is_open());
+    }
+    let from = drawn_cell(&mut app, QUESTION_TEXT);
+    let (column, row) = drawn_cell(&mut app, QUESTION_OPTION);
+
+    sweep_app(
+        &mut app,
+        from,
+        (column + QUESTION_OPTION.width() as u16, row),
+    );
+
+    assert_selection_copied(&app);
+    assert!(app.question_form.is_open(), "{SWEEP_ANSWERED}");
+    assert_eq!(
+        answers.try_recv(),
+        Err(TryRecvError::Empty),
+        "{SWEEP_ANSWERED}"
+    );
 }
 
 #[test_case(false; "escape")]

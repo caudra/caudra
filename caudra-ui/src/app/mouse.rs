@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use crate::agent::AgentCommand;
 use crate::components::audit_log::PanelTab;
 use crate::components::command::ChatScope;
+use crate::components::document_view::COPIED_SELECTION;
 use crate::components::help_modal::HelpMouse;
 use crate::components::input::{ChordHint, InputHit, image_chip_label};
 use crate::components::paste_editor::PasteEditorAction;
@@ -170,6 +171,10 @@ impl App {
                 StreamAction::Consumed => return Vec::new(),
                 StreamAction::Copy(text) => {
                     self.copy_to_clipboard(&text);
+                    return Vec::new();
+                }
+                StreamAction::CopySelection(text) => {
+                    self.copy_labelled(&text, COPIED_SELECTION);
                     return Vec::new();
                 }
                 StreamAction::Submit(question) => {

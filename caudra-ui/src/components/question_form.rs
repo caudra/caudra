@@ -29,6 +29,7 @@ use caudra_workbench::text_field::{FieldKind, FieldStyles, TextField, TextKey, i
 use super::autopilot_panel::card_note;
 use super::form::render_form;
 use super::keybindings::{Bind, key};
+use super::sweep::{self, Sweep};
 use super::tab_bar::{Tab, tab_spans};
 use super::{Hint, Overlay, VisualRows, field_styles, hanging_lines, visual_rows};
 use crate::repaint::Cadence;
@@ -148,6 +149,8 @@ pub enum QuestionFormAction {
     PutAside,
     /// Text the answer box copied or cut, for the clipboard.
     Copy(String),
+    /// What a sweep over the form, or a drag in the answer box, covers.
+    CopySelection(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +196,13 @@ pub struct QuestionForm {
     place: Option<(usize, usize)>,
     /// The user acted on the form, so a new ask must not push it aside.
     touched: bool,
+    /// The body's lines as the last frame wrapped them into `body_area`,
+    /// which is what a sweep is read back against.
+    painted: Vec<Line<'static>>,
+    body_area: Rect,
+    sweep: Option<Sweep>,
+    /// Between a press on the body and its release.
+    sweeping: bool,
 }
 
 /// Everything on the form a click can name. The form is rebuilt from scratch
@@ -276,6 +286,10 @@ impl QuestionForm {
             delivery: QuestionDelivery::Blocking,
             place: None,
             touched: false,
+            painted: Vec::new(),
+            body_area: Rect::default(),
+            sweep: None,
+            sweeping: false,
         }
     }
 
@@ -338,6 +352,8 @@ impl QuestionForm {
         self.row_hits.clear();
         self.mouse_down = None;
         self.hover = None;
+        self.sweep = None;
+        self.sweeping = false;
         self.enter(0);
     }
 
@@ -403,11 +419,22 @@ impl QuestionForm {
         self.mouse_down = None;
         self.hover = None;
         self.area = Rect::default();
+        self.painted.clear();
+        self.sweep = None;
+        self.sweeping = false;
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> QuestionFormAction {
         if !self.is_open() {
             return QuestionFormAction::Consumed;
+        }
+        // Every key reshapes the body, so the sweep over it goes. The one that
+        // copies takes it first, ahead of the cancel it otherwise means.
+        if let Some(sweep) = self.sweep.take()
+            && key::QUIT.matches(key)
+            && let Some(text) = sweep::swept_text(&self.painted, sweep)
+        {
+            return QuestionFormAction::CopySelection(text);
         }
         if key::QUESTION_ASK_BTW.matches(key) && !self.is_consent() {
             self.hover = None;
@@ -494,12 +521,23 @@ impl QuestionForm {
             (None, Some((place, of))) => format!(" {DEFERRED_TITLE} {place} of {of} "),
             (None, None) => TITLE.to_owned(),
         };
+        let mut lines = body.lines;
+        if let Some(sweep) = self.sweep {
+            sweep::highlight(&mut lines, sweep);
+        }
+        self.painted = lines.clone();
+        self.body_area = Rect {
+            x: area.x + 1,
+            y: area.y + 1,
+            width,
+            height: visible,
+        };
         let hint = render_form(
             &t,
             &title,
             frame,
             area,
-            body.lines,
+            lines,
             (self.scroll, 0),
             Some(self.hint(width)),
         );
@@ -597,6 +635,11 @@ impl QuestionForm {
 
     /// `None` where the event missed everything the form drew. The form is
     /// not modal, so the transcript behind it acts on what it does not want.
+    ///
+    /// A press on the body starts a sweep over it, and one in the answer box
+    /// a selection in the box. Either is copied when it is let go. A press
+    /// that drags off its target is a sweep rather than a click, so a release
+    /// over an option copies instead of picking it.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> Option<QuestionFormAction> {
         let position = Position::new(event.column, event.row);
         let hit = self
@@ -607,9 +650,43 @@ impl QuestionForm {
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.mouse_down = hit.map(|hit| hit.target);
-                let hit = hit?;
-                if hit.target != FormTarget::Hint(ASK_HINT_INDEX) {
+                self.sweep = None;
+                self.sweeping = false;
+                if let Some(hit) = hit
+                    && hit.target != FormTarget::Hint(ASK_HINT_INDEX)
+                {
                     self.aim(hit, event);
+                }
+                if !matches!(self.mouse_down, Some(FormTarget::Editor(_)))
+                    && self.body_area.contains(position)
+                {
+                    self.sweep = Some(Sweep::at(self.position_at(position)));
+                    self.sweeping = true;
+                    self.custom.clear_selection();
+                }
+                self.area
+                    .contains(position)
+                    .then_some(QuestionFormAction::Consumed)
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if matches!(self.mouse_down, Some(FormTarget::Editor(_))) {
+                    if let Some(hit) = hit
+                        && let FormTarget::Editor(line) = hit.target
+                    {
+                        self.custom
+                            .set_cursor(editor_cursor(line, hit.area, event), true);
+                    }
+                    return Some(QuestionFormAction::Consumed);
+                }
+                if !self.sweeping {
+                    return None;
+                }
+                let at = self.position_at(position);
+                if let Some(sweep) = &mut self.sweep {
+                    sweep.drag_to(at);
+                    if !sweep.is_empty() {
+                        self.mouse_down = None;
+                    }
                 }
                 Some(QuestionFormAction::Consumed)
             }
@@ -626,7 +703,25 @@ impl QuestionForm {
             // A press and release on the same target is the click; anything
             // else is a drag that only moved the cursor.
             MouseEventKind::Up(MouseButton::Left) => {
-                let pressed = self.mouse_down.take()?;
+                let swept = std::mem::take(&mut self.sweeping);
+                if swept {
+                    if let Some(text) = self
+                        .sweep
+                        .and_then(|sweep| sweep::swept_text(&self.painted, sweep))
+                    {
+                        self.mouse_down = None;
+                        return Some(QuestionFormAction::CopySelection(text));
+                    }
+                    self.sweep = None;
+                }
+                let Some(pressed) = self.mouse_down.take() else {
+                    return swept.then_some(QuestionFormAction::Consumed);
+                };
+                if let FormTarget::Editor(_) = pressed
+                    && let Some(text) = self.custom.selected_text()
+                {
+                    return Some(QuestionFormAction::CopySelection(text));
+                }
                 if hit.map(|hit| hit.target) != Some(pressed) {
                     return Some(QuestionFormAction::Consumed);
                 }
@@ -647,17 +742,15 @@ impl QuestionForm {
         match hit.target {
             FormTarget::Option(index) => self.cursor = index,
             FormTarget::Editor(line) => {
-                // The prefix is part of the line, so it occupies the first
-                // cells of the wrapped content rather than a gutter beside it.
-                let width = usize::from(hit.area.width.max(1));
-                let wrap_row = usize::from(event.row.saturating_sub(hit.area.y));
-                let column = usize::from(event.column.saturating_sub(hit.area.x));
-                let cell = wrap_row * width + column;
-                let col = cell.saturating_sub(CUSTOM_PROMPT.chars().count());
-                self.custom.set_cursor(Cursor::new(line, col), false);
+                self.custom
+                    .set_cursor(editor_cursor(line, hit.area, event), false);
             }
             _ => {}
         }
+    }
+
+    fn position_at(&self, position: Position) -> (usize, usize) {
+        sweep::wrapped_position(&self.painted, self.body_area, self.scroll, position)
     }
 
     fn activate(&mut self, target: FormTarget) -> QuestionFormAction {
@@ -1350,6 +1443,17 @@ fn ends_with_backslash(field: &TextField) -> bool {
         == Some('\\')
 }
 
+/// Where a pointer at `event` lands in box line `line`, drawn over `area`.
+/// The prefix is part of the line, so it occupies the first cells of the
+/// wrapped content rather than a gutter beside it.
+fn editor_cursor(line: usize, area: Rect, event: MouseEvent) -> Cursor {
+    let width = usize::from(area.width.max(1));
+    let wrap_row = usize::from(event.row.saturating_sub(area.y));
+    let column = usize::from(event.column.saturating_sub(area.x));
+    let cell = wrap_row * width + column;
+    Cursor::new(line, cell.saturating_sub(CUSTOM_PROMPT.chars().count()))
+}
+
 /// Line `index` of the box with its selection and caret painted on. Nothing
 /// places a terminal cursor over the form, so the caret is painted like the
 /// composer's.
@@ -1855,22 +1959,147 @@ mod tests {
         assert!(matches!(action, Some(QuestionFormAction::Consumed)));
     }
 
-    /// The border belongs to no control, and the form is not modal, so the
-    /// event has to reach whatever is behind it rather than being swallowed.
+    /// A press on the border is the form's, so nothing behind it starts a
+    /// sweep over the cells it draws. It does nothing else: the release and
+    /// the pointer resting there are left alone.
     #[test]
-    fn clicking_the_chrome_passes_the_event_through() {
+    fn a_press_on_the_chrome_is_claimed_and_does_nothing() {
         let mut form = opened(vec![question(HEADER, false)]);
         let drawn = render(&mut form);
-        for kind in [
-            MouseEventKind::Down(MouseButton::Left),
-            MouseEventKind::Up(MouseButton::Left),
-            MouseEventKind::Moved,
-        ] {
+        assert!(matches!(
+            form.handle_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                drawn.x,
+                drawn.y
+            )),
+            Some(QuestionFormAction::Consumed)
+        ));
+        assert!(form.sweep.is_none(), "{CHROME_SWEPT}");
+        for kind in [MouseEventKind::Up(MouseButton::Left), MouseEventKind::Moved] {
             assert!(
                 form.handle_mouse(mouse(kind, drawn.x, drawn.y)).is_none(),
                 "{kind:?} on the border is not the form's to take"
             );
         }
+    }
+
+    const CHROME_SWEPT: &str = "a press on the border must start no sweep";
+    const SWEEP_PICKED: &str = "a drag over an option copies it and picks nothing";
+    const SWEEP_WRONG: &str = "a sweep must copy the text it was drawn over";
+    const SWEEP_KEPT: &str = "a key reshapes the form, so the sweep must go";
+
+    /// The cell `text` starts at on the screen the form drew.
+    fn cell_of(form: &mut QuestionForm, text: &str) -> (u16, u16) {
+        painted(form)
+            .iter()
+            .enumerate()
+            .find_map(|(row, line)| {
+                line.find(text)
+                    .map(|byte| (line[..byte].chars().count() as u16, row as u16))
+            })
+            .unwrap_or_else(|| panic!("{text:?} was not drawn"))
+    }
+
+    /// Presses at `from`, drags to `to`, and lets go there.
+    fn sweep(
+        form: &mut QuestionForm,
+        from: (u16, u16),
+        to: (u16, u16),
+    ) -> Option<QuestionFormAction> {
+        form.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            from.0,
+            from.1,
+        ));
+        form.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), to.0, to.1));
+        form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), to.0, to.1))
+    }
+
+    /// A form with a sweep over the question text standing.
+    fn swept_question() -> QuestionForm {
+        let mut form = opened(vec![question(HEADER, false)]);
+        render(&mut form);
+        let (column, row) = cell_of(&mut form, PICK);
+        let action = sweep(
+            &mut form,
+            (column, row),
+            (column + PICK.width() as u16, row),
+        );
+        assert!(
+            matches!(&action, Some(QuestionFormAction::CopySelection(text)) if text == PICK),
+            "{SWEEP_WRONG}"
+        );
+        form
+    }
+
+    #[test]
+    fn a_drag_from_the_question_over_an_option_copies_and_picks_nothing() {
+        let mut form = opened(vec![question(HEADER, false)]);
+        render(&mut form);
+        let from = cell_of(&mut form, PICK);
+        let (column, row) = cell_of(&mut form, YES);
+
+        let action = sweep(&mut form, from, (column + YES.width() as u16, row));
+
+        let Some(QuestionFormAction::CopySelection(text)) = action else {
+            panic!("{SWEEP_PICKED}");
+        };
+        assert!(
+            text.starts_with(PICK) && text.ends_with(YES),
+            "{SWEEP_WRONG}: {text:?}"
+        );
+        assert!(form.picked().is_empty(), "{SWEEP_PICKED}");
+    }
+
+    #[test]
+    fn ctrl_c_copies_a_standing_sweep_before_it_cancels() {
+        let mut form = swept_question();
+
+        let copied = chord(&mut form, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let cancelled = chord(&mut form, KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        assert!(matches!(&copied, QuestionFormAction::CopySelection(text) if text == PICK));
+        assert!(matches!(cancelled, QuestionFormAction::Cancel));
+    }
+
+    #[test]
+    fn a_key_drops_the_sweep() {
+        let mut form = swept_question();
+
+        press(&mut form, KeyCode::Down);
+
+        assert!(form.sweep.is_none(), "{SWEEP_KEPT}");
+    }
+
+    #[test]
+    fn the_swept_text_is_drawn_selected() {
+        let mut form = swept_question();
+        let backend = ratatui::backend::TestBackend::new(TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let area = docked(&form);
+        terminal.draw(|frame| form.view(frame, area)).unwrap();
+        let (column, row) = cell_of(&mut form, PICK);
+
+        let cell = &terminal.backend().buffer()[(column, row)];
+        assert!(cell.modifier.contains(ratatui::style::Modifier::REVERSED));
+    }
+
+    #[test]
+    fn a_drag_in_the_answer_box_selects_and_copies_its_text() {
+        let mut form = typing(false);
+        render(&mut form);
+        let editor = hit_area(&form, FormTarget::Editor(0));
+        let start = editor.x + CUSTOM_PROMPT.width() as u16;
+
+        let action = sweep(
+            &mut form,
+            (start, editor.y),
+            (start + TYPED.width() as u16, editor.y),
+        );
+
+        assert!(matches!(&action, Some(QuestionFormAction::CopySelection(text)) if text == TYPED));
+        assert_eq!(form.custom.selected_text().as_deref(), Some(TYPED));
+        assert!(form.sweep.is_none());
     }
 
     #[test]

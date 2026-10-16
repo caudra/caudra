@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use crate::animation::{live_elapsed, spinner_str};
@@ -7,6 +8,7 @@ use crate::components::modal::{ESC_LABEL, FooterHits, FooterLine, Modal};
 use crate::components::prompt_progress::{self, PromptProgress, PromptRate};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::streaming_content::StreamingContent;
+use crate::components::sweep::{self, Sweep};
 use crate::components::{field_styles, input_text_style};
 use crate::theme;
 
@@ -15,13 +17,14 @@ use caudra_grab::grab_scope;
 use caudra_providers::{Billing, TokenUsage};
 use caudra_storage::usage_ledger::LedgerPurpose;
 use caudra_workbench::text_field::{FieldKind, FieldStyles, TextField, TextKey};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
+use crate::provenance::Provenance;
 use crate::repaint::{Cadence, Dirty};
 
 const H_PAD: u16 = 2;
@@ -183,6 +186,8 @@ pub enum StreamAction {
     Ignored,
     Consumed,
     Copy(String),
+    /// What a sweep over the thread covers.
+    CopySelection(String),
     Submit(String),
 }
 
@@ -208,6 +213,14 @@ struct StreamSection {
 }
 
 /// One question and the answer streaming under it.
+/// The rows of the thread one section painted, so a sweep over them can be
+/// traced back to the Markdown it was rendered from.
+struct SectionRows {
+    rows: Range<usize>,
+    exchange: usize,
+    section: usize,
+}
+
 struct Exchange {
     header: String,
     sections: Vec<StreamSection>,
@@ -321,6 +334,14 @@ pub struct StreamModal {
     /// host can extend the thread with it.
     queued: Option<String>,
     popup: Rect,
+    /// The thread's lines as the last frame wrapped them into `viewport`,
+    /// which is what a press is read back against.
+    body: Vec<Line<'static>>,
+    sections: Vec<SectionRows>,
+    viewport: Rect,
+    sweep: Option<Sweep>,
+    /// Between a press on the thread and its release.
+    sweeping: bool,
 }
 
 impl StreamModal {
@@ -343,6 +364,11 @@ impl StreamModal {
             rate: PromptRate::default(),
             queued: None,
             popup: Rect::default(),
+            body: Vec::new(),
+            sections: Vec::new(),
+            viewport: Rect::default(),
+            sweep: None,
+            sweeping: false,
         }
     }
 
@@ -396,6 +422,8 @@ impl StreamModal {
         self.open = false;
         self.footer_hits.reset();
         self.scrollbar = Scrollbar::default();
+        self.sweep = None;
+        self.sweeping = false;
     }
 
     /// Appends the next question to the thread and streams its answer under
@@ -425,6 +453,10 @@ impl StreamModal {
         self.scroll.reset();
         self.footer_hits.reset();
         self.queued = None;
+        self.body.clear();
+        self.sections.clear();
+        self.sweep = None;
+        self.sweeping = false;
         self.finish_stream();
     }
 
@@ -551,7 +583,10 @@ impl StreamModal {
         self.scroll.scroll(delta);
     }
 
-    /// The bar and the footer controls are all the modal reads from the pointer.
+    /// The bar, a sweep over the thread, and the footer controls. A sweep is
+    /// copied when it is let go and stays standing until the next press. Every
+    /// other press inside the popup is claimed, so nothing behind it sweeps
+    /// the cells it draws.
     pub fn handle_mouse(&mut self, event: &MouseEvent) -> StreamAction {
         match self.scrollbar.handle(event) {
             ScrollbarMouse::Ignored => {}
@@ -561,39 +596,136 @@ impl StreamModal {
                 return StreamAction::Consumed;
             }
         }
-        let Some(index) = self.footer_hits.handle_mouse(*event) else {
-            return StreamAction::Ignored;
-        };
-        match self.controls()[index].command {
-            StreamCommand::Copy => StreamAction::Copy(self.text()),
-            StreamCommand::Send => self
-                .take_question()
-                .map_or(StreamAction::Consumed, StreamAction::Submit),
-            StreamCommand::Close => {
-                self.dismiss();
-                StreamAction::Consumed
+        let at = Position::new(event.column, event.row);
+        if self.sweeping {
+            match event.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    let position = self.position_at(at);
+                    if let Some(sweep) = &mut self.sweep {
+                        sweep.drag_to(position);
+                    }
+                    return StreamAction::Consumed;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.sweeping = false;
+                    return match self.swept() {
+                        Some(text) => StreamAction::CopySelection(text),
+                        None => {
+                            self.sweep = None;
+                            StreamAction::Consumed
+                        }
+                    };
+                }
+                _ => {}
             }
         }
+        if let Some(index) = self.footer_hits.handle_mouse(*event) {
+            return match self.controls()[index].command {
+                StreamCommand::Copy => self.copy(),
+                StreamCommand::Send => self
+                    .take_question()
+                    .map_or(StreamAction::Consumed, StreamAction::Submit),
+                StreamCommand::Close => {
+                    self.dismiss();
+                    StreamAction::Consumed
+                }
+            };
+        }
+        if !self.contains(at) {
+            return StreamAction::Ignored;
+        }
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) if self.viewport.contains(at) => {
+                self.sweep = Some(Sweep::at(self.position_at(at)));
+                self.sweeping = true;
+                self.input.clear_selection();
+                StreamAction::Consumed
+            }
+            MouseEventKind::Down(_) | MouseEventKind::Drag(_) | MouseEventKind::Up(_) => {
+                StreamAction::Consumed
+            }
+            _ => StreamAction::Ignored,
+        }
+    }
+
+    fn position_at(&self, at: Position) -> (usize, usize) {
+        sweep::wrapped_position(&self.body, self.viewport, self.scroll.offset(), at)
+    }
+
+    /// The sweep if one stands, the whole answer otherwise.
+    fn copy(&self) -> StreamAction {
+        self.swept().map_or_else(
+            || StreamAction::Copy(self.text()),
+            StreamAction::CopySelection,
+        )
+    }
+
+    /// What the sweep covers: the Markdown behind the rows a section can trace
+    /// back to it, as a sweep over the transcript copies, and the text drawn
+    /// everywhere else.
+    fn swept(&self) -> Option<String> {
+        let sweep = self.sweep.filter(|sweep| !sweep.is_empty())?;
+        let (start, end) = sweep.ordered();
+        let mut pieces = Vec::new();
+        let mut row = start.0;
+        while row <= end.0 && row < self.body.len() {
+            let section = self
+                .sections
+                .iter()
+                .find(|section| section.rows.contains(&row));
+            let rows = section.map_or(row..row + 1, |section| section.rows.clone());
+            let last = end.0.min(rows.end - 1);
+            let from = (row, if row == start.0 { start.1 } else { 0 });
+            let to = (last, if last == end.0 { end.1 } else { usize::MAX });
+            let source = section
+                .and_then(|section| self.provenance(section))
+                .and_then(|provenance| {
+                    provenance.extract_rows(
+                        &self.body[rows.clone()],
+                        (from.0 - rows.start, from.1),
+                        (to.0 - rows.start, to.1),
+                    )
+                })
+                .filter(|source| !source.is_empty());
+            let piece = source.unwrap_or_else(|| {
+                let mut covered = Sweep::at(from);
+                covered.drag_to(to);
+                sweep::swept_text(&self.body, covered).unwrap_or_default()
+            });
+            pieces.push(piece);
+            row = last + 1;
+        }
+        let text = pieces.join("\n");
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn provenance(&self, rows: &SectionRows) -> Option<&Provenance> {
+        self.exchanges
+            .get(rows.exchange)?
+            .sections
+            .get(rows.section)?
+            .body
+            .provenance()
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) -> StreamAction {
         let chord = key_event.modifiers.contains(KeyModifiers::CONTROL);
         if chord && key_event.code == KeyCode::Char('y') {
-            return StreamAction::Copy(self.text());
+            return self.copy();
         }
         if self.footer == StreamFooter::FollowUp {
             return self.handle_follow_up_key(key_event);
         }
         if chord {
             if key_event.code == KeyCode::Char('c') {
-                self.interrupt();
+                return self.copy_or_interrupt();
             }
             return StreamAction::Consumed;
         }
         match key_event.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') => self.dismiss(),
             KeyCode::Char('y') if self.footer == StreamFooter::Copy => {
-                return StreamAction::Copy(self.text());
+                return self.copy();
             }
             _ => {
                 self.scroll.handle_key(key_event);
@@ -624,11 +756,20 @@ impl StreamModal {
                     if key_event.code == KeyCode::Char('c')
                         && key_event.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
-                    self.interrupt();
+                    return self.copy_or_interrupt();
                 }
                 _ => {}
             },
         }
+        StreamAction::Consumed
+    }
+
+    /// A standing sweep is what the gesture copies; with none it interrupts.
+    fn copy_or_interrupt(&mut self) -> StreamAction {
+        if let Some(text) = self.swept() {
+            return StreamAction::CopySelection(text);
+        }
+        self.interrupt();
         StreamAction::Consumed
     }
 
@@ -738,7 +879,8 @@ impl StreamModal {
         let theme = theme::current();
         let padded_width = Modal::inner_width(area.width, WIDTH_PERCENT).saturating_sub(H_PAD * 2);
 
-        let mut lines: Vec<Line> = Vec::new();
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut sections = Vec::new();
         if let Some(context) = &self.context {
             lines.extend(
                 context
@@ -760,6 +902,7 @@ impl StreamModal {
                 if section_index > 0 {
                     lines.push(Line::default());
                 }
+                let first = lines.len();
                 for line in section.body.render_lines(padded_width) {
                     let mut line = line.clone();
                     if section.kind == SectionKind::Thinking {
@@ -769,13 +912,21 @@ impl StreamModal {
                     }
                     lines.push(line);
                 }
+                sections.push(SectionRows {
+                    rows: first..lines.len(),
+                    exchange: index,
+                    section: section_index,
+                });
             }
         }
 
+        let mut shown = lines.clone();
+        if let Some(sweep) = self.sweep {
+            sweep::highlight(&mut shown, sweep);
+        }
+        let paragraph = Paragraph::new(shown).wrap(Wrap { trim: false });
         let chrome = self.chrome_rows();
-        let total = Paragraph::new(lines.clone())
-            .wrap(Wrap { trim: false })
-            .line_count(padded_width) as u16;
+        let total = paragraph.line_count(padded_width) as u16;
         let modal = Modal {
             title: self.title,
             width_percent: WIDTH_PERCENT,
@@ -810,10 +961,10 @@ impl StreamModal {
 
         self.scroll.update_dimensions(total, viewport.height);
         let scroll = self.scroll.offset();
-        let paragraph = Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0));
-        frame.render_widget(paragraph, viewport);
+        frame.render_widget(paragraph.scroll((scroll, 0)), viewport);
+        self.body = lines;
+        self.sections = sections;
+        self.viewport = viewport;
 
         self.scrollbar.draw(
             frame,
@@ -2286,5 +2437,189 @@ mod tests {
         m.open_clarification(UPDATED_CONTEXT.into());
         assert!(m.exchanges.is_empty());
         assert!(!m.is_streaming());
+    }
+
+    const WRAPPED_ANSWER: &str = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo";
+    const FIRST_WORD: &str = "alpha";
+    const LAST_WORD: &str = "romeo";
+    const MORE: &str = " sierra";
+    const SWEEP_WRONG: &str =
+        "a sweep must copy the words it was drawn over, with no break at a wrap";
+    const SWEEP_UNMARKED: &str = "the swept cells must be drawn selected";
+    const CHROME_SWEPT: &str = "a press off the thread must start no sweep";
+    const SWEEP_LOST: &str = "a standing sweep must outlive the thread growing under it";
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// The first cell `text` is drawn at.
+    fn cell_of(terminal: &Terminal<TestBackend>, text: &str) -> Rect {
+        let buffer = terminal.backend().buffer();
+        let position = buffer
+            .area
+            .positions()
+            .find(|position| {
+                text.chars().enumerate().all(|(offset, ch)| {
+                    let x = position.x + offset as u16;
+                    x < buffer.area.right() && buffer[(x, position.y)].symbol() == ch.to_string()
+                })
+            })
+            .expect(CONTENT_MISSING);
+        Rect::new(position.x, position.y, 1, 1)
+    }
+
+    fn after(cell: Rect, text: &str) -> Rect {
+        Rect {
+            x: cell.x + text.width() as u16,
+            ..cell
+        }
+    }
+
+    /// A modal showing [`WRAPPED_ANSWER`], drawn once.
+    fn answered(
+        footer: StreamFooter,
+    ) -> (
+        StreamModal,
+        Terminal<TestBackend>,
+        flume::Sender<StreamEvent>,
+    ) {
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, footer);
+        tx.send(StreamEvent::TextDelta(WRAPPED_ANSWER.into()))
+            .unwrap();
+        let _ = m.poll();
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        draw(&mut m, &mut terminal);
+        (m, terminal, tx)
+    }
+
+    fn sweep(m: &mut StreamModal, from: Rect, to: Rect) -> StreamAction {
+        m.handle_mouse(&mouse(MouseEventKind::Down(MouseButton::Left), from));
+        m.handle_mouse(&mouse(MouseEventKind::Drag(MouseButton::Left), to));
+        m.handle_mouse(&mouse(MouseEventKind::Up(MouseButton::Left), to))
+    }
+
+    fn sweep_first_word(m: &mut StreamModal, terminal: &Terminal<TestBackend>) {
+        let first = cell_of(terminal, FIRST_WORD);
+        assert!(
+            matches!(
+                sweep(m, first, after(first, FIRST_WORD)),
+                StreamAction::CopySelection(text) if text == FIRST_WORD
+            ),
+            "{SWEEP_WRONG}"
+        );
+    }
+
+    #[test]
+    fn a_sweep_across_a_wrapped_answer_copies_it_without_breaks() {
+        let (mut m, mut terminal, _tx) = answered(StreamFooter::Close);
+        let first = cell_of(&terminal, FIRST_WORD);
+        let last = cell_of(&terminal, LAST_WORD);
+        assert!(
+            last.y > first.y,
+            "the answer must wrap for this test to mean anything"
+        );
+
+        let action = sweep(&mut m, first, after(last, LAST_WORD));
+        draw(&mut m, &mut terminal);
+
+        assert!(
+            matches!(&action, StreamAction::CopySelection(text) if text == WRAPPED_ANSWER),
+            "{SWEEP_WRONG}"
+        );
+        let marked = reversed_cells(&terminal);
+        assert!(
+            marked.contains(&Position::new(first.x, first.y)),
+            "{SWEEP_UNMARKED}"
+        );
+        assert!(
+            marked.contains(&Position::new(last.x, last.y)),
+            "{SWEEP_UNMARKED}"
+        );
+    }
+
+    #[test_case(true  ; "border")]
+    #[test_case(false ; "status_row")]
+    fn a_press_off_the_thread_is_claimed_without_sweeping(border: bool) {
+        let (mut m, _terminal, _tx) = answered(StreamFooter::Close);
+        let at = match border {
+            true => Rect::new(m.popup.x, m.popup.y, 1, 1),
+            false => Rect::new(m.viewport.x, m.viewport.bottom(), 1, 1),
+        };
+
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            assert!(matches!(
+                m.handle_mouse(&mouse(kind, at)),
+                StreamAction::Consumed
+            ));
+        }
+        assert!(m.sweep.is_none(), "{CHROME_SWEPT}");
+    }
+
+    #[test]
+    fn the_footer_copy_takes_a_standing_sweep() {
+        let (mut m, terminal, _tx) = answered(StreamFooter::Copy);
+        sweep_first_word(&mut m, &terminal);
+        let copy = m.footer_hit(COPY);
+
+        assert!(matches!(
+            click(&mut m, copy),
+            StreamAction::CopySelection(text) if text == FIRST_WORD
+        ));
+    }
+
+    #[test_case('y' ; "ctrl_y")]
+    #[test_case('c' ; "ctrl_c")]
+    fn a_copy_chord_takes_a_standing_sweep_and_stops_nothing(c: char) {
+        let (mut m, terminal, _tx) = answered(StreamFooter::FollowUp);
+        sweep_first_word(&mut m, &terminal);
+
+        assert!(matches!(
+            m.handle_key(ctrl(c)),
+            StreamAction::CopySelection(text) if text == FIRST_WORD
+        ));
+        assert!(m.is_streaming() && m.is_open());
+    }
+
+    #[test]
+    fn ctrl_c_without_a_sweep_still_stops_the_answer() {
+        let (mut m, _terminal, _tx) = answered(StreamFooter::FollowUp);
+
+        assert!(matches!(m.handle_key(ctrl('c')), StreamAction::Consumed));
+        assert!(!m.is_streaming() && m.is_open());
+    }
+
+    #[test]
+    fn a_sweep_outlives_the_answer_growing_and_scrolling_but_not_closing() {
+        let (mut m, mut terminal, tx) = answered(StreamFooter::Close);
+        sweep_first_word(&mut m, &terminal);
+        tx.send(StreamEvent::TextDelta(MORE.into())).unwrap();
+        let _ = m.poll();
+        m.scroll(-1);
+        draw(&mut m, &mut terminal);
+
+        assert!(
+            matches!(m.handle_key(ctrl('y')), StreamAction::CopySelection(text) if text == FIRST_WORD),
+            "{SWEEP_LOST}"
+        );
+        m.close();
+        assert!(m.sweep.is_none() && m.body.is_empty());
+    }
+
+    #[test]
+    fn a_click_on_the_thread_drops_the_sweep() {
+        let (mut m, terminal, _tx) = answered(StreamFooter::Close);
+        sweep_first_word(&mut m, &terminal);
+
+        assert!(matches!(
+            click(&mut m, cell_of(&terminal, LAST_WORD)),
+            StreamAction::Consumed
+        ));
+        assert!(m.sweep.is_none());
     }
 }

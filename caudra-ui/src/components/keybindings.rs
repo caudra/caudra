@@ -1163,6 +1163,11 @@ pub const KEYBINDS: &[Keybind] = &[
         context: KeybindContext::FormInput,
     },
     Keybind {
+        label: KeyLabel::Single(key::QUIT.label),
+        description: "Copy the text dragged over, or stop the agent that asked",
+        context: KeybindContext::FormInput,
+    },
+    Keybind {
         label: KeyLabel::Single("Esc"),
         description: "Close",
         context: KeybindContext::FormInput,
