@@ -6,6 +6,10 @@
 # Build from the repository root: docker build -f workcell/Dockerfile .
 FROM rust:1.99.1-trixie AS toolchain
 
+RUN apt-get update \
+    && apt-get upgrade --yes --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
 FROM toolchain AS worker
 
 RUN apt-get update \
@@ -53,6 +57,7 @@ COPY --from=builder /out/licenses /licenses
 FROM debian:13.7-slim AS runtime
 
 RUN apt-get update \
+    && apt-get upgrade --yes --no-install-recommends \
     && apt-get install --yes --no-install-recommends bash ca-certificates libgcc-s1 tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 workcell \

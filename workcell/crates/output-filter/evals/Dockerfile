@@ -7,7 +7,15 @@
 #
 FROM rust:1.99.1-slim-bookworm AS rust
 
+RUN apt-get update \
+    && apt-get upgrade --yes --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
 FROM golang:1.27.2-bookworm AS go
+
+RUN apt-get update \
+    && apt-get upgrade --yes --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
 
 # The base matches the development host so a host-built `workcell-mcp` can be
 # mounted instead of rebuilt. Keep this in sync with the host distribution.
@@ -15,6 +23,7 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
+    && apt-get upgrade --yes --no-install-recommends \
     && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
