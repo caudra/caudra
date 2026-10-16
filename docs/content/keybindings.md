@@ -46,6 +46,7 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `Ctrl+X p` | Restore the newest stashed prompt |
 | `Ctrl+X m` | Model picker |
 | `Ctrl+X c` | Next favorite model |
+| `Ctrl+X d` | Next decision endpoint |
 | `Shift+Left` / `Shift+Right` | Pan a modal too wide for the screen left / right |
 | `Ctrl+X w` | Open the workbench |
 
@@ -380,7 +381,6 @@ Some of these contexts belong to an [experimental feature](/docs/configuration/#
 - Workflow Inspector: `workflows`
 - Workflow Catalog: `workflows`
 - Automation Inspector: `automations`
-- Decisions: `decision_engine`
 - Autopilot Panel: `autopilot`
 - Workbench Transfer: `sandboxes`
 

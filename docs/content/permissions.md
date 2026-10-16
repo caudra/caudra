@@ -797,7 +797,7 @@ Lua plugin API capabilities remain separate. `plugin.toml` controls whether plug
 
 ## Auto mode
 
-Auto mode is experimental and belongs to the decision engine. Turn it on with `decision_engine = true` under `[experimental]` in the global `caudra.toml`, then restart Caudra. See [Experimental features](/docs/configuration/#experimental-features).
+Auto mode belongs to the decision engine, which screens what deterministic checks cannot. Screening runs only while a [decision endpoint](/docs/providers/#decision-endpoints) is active.
 
 `/auto` toggles between Ask and Auto. `--auto` selects Auto at startup. The status bar shows `[auto]`, or `[a]` in a narrow terminal. Clicking the chip returns to Ask. `--auto` and `--yolo` are mutually exclusive.
 
@@ -825,27 +825,24 @@ When Auto leaves a call to you, a muted line in the prompt says why:
 
 An explicit mode choice is saved with the root conversation. A command-line mode overrides the restored choice. Global `always_auto = true` supplies the default when neither exists. Global YOLO settings take precedence if both defaults are enabled. Projects cannot set `always_auto` or `always_yolo`.
 
-While the switch is off, `/auto`, `--auto`, SDK `--permission-mode auto`, and an SDK `set_permission_mode` request for `auto` fail with an error, and the mode does not change. With `always_auto = true`, sessions start in Ask and Caudra shows a notice. A session saved in Auto also starts in Ask. The saved choice is kept, so turning the switch on later brings Auto back. Ask, Plan, and YOLO are unaffected.
-
-With the switch on, Auto works without a configured decision endpoint. With enforced engine screening, a flagged call, engine error, or timeout takes the ordinary prompt path. Without a channel for answering that prompt, the call is denied. Disabling globally required screening in project configuration also restores prompting for eligible calls.
+Auto works without an active decision endpoint. Calls that deterministic checks clear still run, and a line that needs screening prompts. With enforced engine screening, a flagged call, engine error, or timeout takes the ordinary prompt path. Without a channel for answering that prompt, the call is denied. Disabling globally required screening in project configuration also restores prompting for eligible calls.
 
 Auto is not a security boundary. An engine miss can let an eligible call run. Engine predictions never grant read-only access or weaken deterministic permission rules.
 
 ### Decision engine advice
 
-The decision engine needs the same `experimental.decision_engine` switch, and so do `caudra decisions` and `/decisions`. While the switch is off, `[decisions]` settings have no effect, and existing decision logs and shell duration history stay untouched. Turning the switch on enables nothing by itself. The engine still needs a base URL and a mode for each feature, and Auto still has to be selected.
+The decision engine sends its requests to the active decision endpoint, a `[decisions.<name>]` table in the global `providers.toml`. Add one with `/login` or `caudra auth login --decision`, which offer TypeSafe Jev, OpenAI Luna, and a custom endpoint. Switch with `/decision-model`, `/decision-next`, or `caudra decisions use <name|off>`. With no active endpoint, `[decisions]` settings have no effect, and existing decision logs and shell duration history stay untouched. An active endpoint enables nothing by itself either. Each feature still needs a mode, and Auto still has to be selected. See [Decision endpoints](/docs/providers/#decision-endpoints) for the fields, the presets, and how keys are found.
 
-Decision features are opt-in and configured in the `[decisions]` table of the global `caudra.toml`. A project may disable a feature or logging and shorten retention, but cannot change the base URL or thresholds, or enable a feature. A non-loopback base URL requires `allow_remote = true` because decision context leaves the machine. See the [configuration reference](/docs/configuration/#decisions) for fields, defaults, and supported modes.
+Decision features are opt-in and configured in the `[decisions]` table of the global `caudra.toml`. A project may disable a feature or logging and shorten retention, but cannot change thresholds or enable a feature. Projects cannot add or select an endpoint, because endpoints live only in the global `providers.toml`. See the [configuration reference](/docs/configuration/#decisions) for fields, defaults, and supported modes.
 
-The default `typesafe` protocol calls System One. Set `protocol = "openai"` for OpenAI Decisions or a compatible ninfer server. Protocol selection is global-only and does not grant remote or HTTP consent. Both protocols send text only. The configuration reference covers endpoint paths, protocol-specific model and key defaults, and base URL overrides from the global environment.
+Configuring an endpoint, by hand or through login, is the consent to send decision context to it. HTTPS needs no other opt-in, and neither does plain HTTP to numeric loopback. Plain HTTP to any other host needs `allow_http = true` on the endpoint. Use it only when you control the transport protection, such as an encrypted tunnel. Private and CGNAT addresses do not prove that a tunnel exists. Workcell transport rules remain unchanged. Both protocols send text only.
 
-Decision requests connect directly to the configured endpoint. They ignore ambient proxy variables and do not follow HTTP redirects, so project environment settings cannot redirect a loopback request.
+Decision requests connect directly to the endpoint. They ignore ambient proxy variables and do not follow HTTP redirects, so project environment settings cannot redirect a loopback request.
 
-HTTPS is required except for numeric loopback HTTP. A user-global `allow_http = true` permits non-loopback HTTP only together with `allow_remote = true`. Use this opt-in only when you control the transport protection, such as an encrypted tunnel. Private and CGNAT addresses do not prove that a tunnel exists. Projects cannot set either opt-in, and Workcell transport rules remain unchanged.
+With an endpoint active, this `caudra.toml` evaluates permission advice and Auto screening without changing any prompt:
 
 ```toml
 [decisions]
-base_url = "http://127.0.0.1:8000"
 timeout_ms = 800
 log = false
 
@@ -880,9 +877,9 @@ The rows are saved with the session and return in place when you reopen it. They
 
 Set `log = true` to retain bounded, redacted decision states and answers in decision-log tables in `caudra.db`. A state over the bound is never sent. Its row records a `rejected` error and the state's size in place of the state. Redaction is best effort both before transmission and before storage. It is not a guarantee that sensitive text has been removed. Human permission answers can supply training labels, but approval is not proof that a predicted effect occurred. Effect fields are a partial action record. A value of `none` does not prove that no advice or routing was applied. Tool-search records do not have actual-use labels, and shell-effect records do not have observed-filesystem labels.
 
-`/decisions` opens a read-only inspector with four tabs. Overview shows the engine and protocol, its cached health, the session's permission mode and taint, logging, and thresholds. Features lists each feature with its mode, allowed modes, and thresholds. Activity counts logged decisions per feature, and Recent lists the newest logged decisions with their state, questions, answers, and label. Answers are drawn as a bar for each option, with the likeliest one highlighted. Press `j` to see them as the logged JSON instead. Press `g` to switch Activity and Recent between this session, this project, and every logged row. Both tabs read the decision log in `caudra.db`. Recording new rows requires `log = true`. The inspector reads the log when it opens and on `Ctrl+R`. It does not contact the endpoint. When the status bar shows `[decisions offline]`, click it to open the inspector.
+`/decisions` opens a read-only inspector with four tabs. Overview shows the active endpoint with its protocol, model, and key source, its cached health, the session's permission mode and taint, logging, and thresholds. Features lists each feature with its mode, allowed modes, and thresholds. Activity counts logged decisions per feature, and Recent lists the newest logged decisions with their state, questions, answers, and label. Answers are drawn as a bar for each option, with the likeliest one highlighted. Press `j` to see them as the logged JSON instead. Press `g` to switch Activity and Recent between this session, this project, and every logged row. Both tabs read the decision log in `caudra.db`. Recording new rows requires `log = true`. The inspector reads the log when it opens and on `Ctrl+R`. It does not contact the endpoint. While an endpoint is active, the status bar shows `[decisions: <name>]`, styled as offline when the last request could not reach it. Click the chip to open the inspector.
 
-Use [`caudra decisions`](/docs/cli/#caudra-decisions) to inspect configuration and manage the log. `status` includes the selected protocol without contacting the endpoint. `purge --yes` deletes decision records and labels from the live tables without deleting sessions, messages, or shell duration history. This is not secure erasure. SQLite free pages, WAL files, and backups can retain copies. Review exports before sharing them. Only `decisions/permission.json` in the global configuration directory currently supports a question-file override. See [question overrides](/docs/configuration/#question-overrides).
+Use [`caudra decisions`](/docs/cli/#caudra-decisions) to inspect configuration and manage the log. `list` and `use` show and switch endpoints, and `status` includes the active endpoint and its protocol without contacting it. `purge --yes` deletes decision records and labels from the live tables without deleting sessions, messages, or shell duration history. This is not secure erasure. SQLite free pages, WAL files, and backups can retain copies. Review exports before sharing them. Only `decisions/permission.json` in the global configuration directory currently supports a question-file override. See [question overrides](/docs/configuration/#question-overrides).
 
 ## YOLO mode
 
@@ -892,7 +889,7 @@ An explicit `/yolo` choice is stored with the root conversation. A user-created 
 
 YOLO approves each call once and stores no rule, so turning it off brings back the prompts your rules do not cover. In plan mode it also skips the prompts for commands plan mode cannot prove read-only, for `send_message` and `publish_message`, and for `execution_environment`. Plan mode still refuses what it always refuses, such as file writes outside the plan.
 
-YOLO bypasses decision-engine permission advice, Auto screening, and permission-related shell-effect checks, including in plan mode. Shell duration, content screening, tool search, skill selection, goal prescreening, subagent routing, the question-tool nudge, and the [reranking features](/docs/configuration/#reranking) still follow their feature settings. An unreachable engine can still show `[decisions offline]`. Deterministic denies and hard capability restrictions still apply.
+YOLO bypasses decision-engine permission advice, Auto screening, and permission-related shell-effect checks, including in plan mode. Shell duration, content screening, tool search, skill selection, goal prescreening, subagent routing, the question-tool nudge, and the [reranking features](/docs/configuration/#reranking) still follow their feature settings. An unreachable engine can still show its chip as offline. Deterministic denies and hard capability restrictions still apply.
 
 ## Autopilot
 

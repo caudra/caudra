@@ -699,6 +699,7 @@ pub(crate) mod tests {
         native::{OWNER, workflow::WorkflowTool},
     };
     use async_trait::async_trait;
+    use caudra_config::decisions::{DecisionEndpoint, DecisionProtocol};
     use caudra_config::decisions::{DecisionsConfig, FeatureMode};
     use caudra_config::{Feature, FeatureFlags};
     use caudra_decision::{
@@ -819,7 +820,11 @@ pub(crate) mod tests {
             let root = tempfile::tempdir().unwrap();
             let requests = Arc::new(Mutex::new(Vec::new()));
             let mut config = DecisionsConfig {
-                base_url: Some(TEST_BASE_URL.parse().unwrap()),
+                endpoint: Some(DecisionEndpoint::new(
+                    DecisionProtocol::TypeSafe.as_str(),
+                    DecisionProtocol::TypeSafe,
+                    TEST_BASE_URL.parse().unwrap(),
+                )),
                 timeout_ms: TEST_TIMEOUT_MS,
                 rerank_timeout_ms: TEST_TIMEOUT_MS,
                 log,

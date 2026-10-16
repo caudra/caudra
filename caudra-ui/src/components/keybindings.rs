@@ -367,6 +367,7 @@ pub mod leader {
     /// `Ctrl+B` is the tmux prefix and never reaches a session inside tmux.
     pub const SCROLL_BOTTOM: Bind = leader_bind!('b');
     pub const CYCLE_FAVORITE: Bind = leader_bind!('c');
+    pub const CYCLE_DECISION: Bind = leader_bind!('d');
     pub const EDIT_INPUT: Bind = leader_bind!('e');
     pub const FILE_PICKER: Bind = leader_bind!('f');
     pub const STEER_PROMPT: Bind = leader_bind!('g');
@@ -394,6 +395,7 @@ pub mod leader {
         WORKFLOWS,
         SCROLL_BOTTOM,
         CYCLE_FAVORITE,
+        CYCLE_DECISION,
         EDIT_INPUT,
         FILE_PICKER,
         STEER_PROMPT,
@@ -512,7 +514,6 @@ impl KeybindContext {
             Self::PeerManager => Some(Feature::CrossSessionMessaging),
             Self::WorkflowInspector | Self::WorkflowCatalogPicker => Some(Feature::Workflows),
             Self::AutomationInspector => Some(Feature::Automations),
-            Self::Decisions => Some(Feature::DecisionEngine),
             Self::AutopilotPanel => Some(Feature::Autopilot),
             Self::SandboxManager | Self::WorkbenchTransfer => Some(Feature::Sandboxes),
             _ => None,
@@ -892,6 +893,11 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(leader::CYCLE_FAVORITE.label),
         description: "Next favorite model",
+        context: KeybindContext::General,
+    },
+    Keybind {
+        label: KeyLabel::Single(leader::CYCLE_DECISION.label),
+        description: "Next decision endpoint",
         context: KeybindContext::General,
     },
     Keybind {

@@ -141,7 +141,6 @@ impl WorkflowRuntime {
                 store,
                 decisions,
                 project,
-                features: deps.features,
                 runner: deps.runner,
                 events: deps.events,
                 mode: deps.mode,
@@ -934,6 +933,7 @@ fn internal(error: impl std::fmt::Display) -> WorkflowError {
 
 #[cfg(test)]
 mod tests {
+    use caudra_config::decisions::{DecisionEndpoint, DecisionProtocol};
     use std::collections::HashSet;
     use std::fs;
     use std::path::Path;
@@ -960,6 +960,7 @@ mod tests {
     use crate::decisions::DecisionFeature;
     use crate::subagent_history::{SubagentHistoryLease, SubagentHistoryStore};
     use crate::workflow::SettledRuns;
+    use crate::workflow::run::DECISION_UNAVAILABLE;
     use crate::workflow::state::stored_status;
 
     const MODEL: &str = "test/model";
@@ -1149,7 +1150,6 @@ complete(result);
     const DECISION_ONLY_BODY: &str = r#"
 complete(decide(#{ command: "ls" }, [#{ type: "predicate", name: "ready", instructions: "Is it ready?" }]));
 "#;
-    const DECISION_ENGINE_KEY: &str = "experimental.decision_engine";
     const DECISION_DEADLINE_BODY: &str = r#"
 let result = "not caught";
 try {
@@ -1225,8 +1225,14 @@ complete(result);
             block,
         });
         let config = DecisionsConfig {
-            base_url: Some(DECISION_BASE_URL.parse().unwrap()),
-            model: MODEL.into(),
+            endpoint: Some(DecisionEndpoint {
+                model: MODEL.into(),
+                ..DecisionEndpoint::new(
+                    DecisionProtocol::TypeSafe.as_str(),
+                    DecisionProtocol::TypeSafe,
+                    DECISION_BASE_URL.parse().unwrap(),
+                )
+            }),
             timeout_ms: DECISION_TIMEOUT_MS,
             log: true,
             ..DecisionsConfig::default()
@@ -1236,10 +1242,9 @@ complete(result);
         (decisions, engine, entered, ended)
     }
 
-    #[test_case(None; "resume")]
-    #[test_case(Some(false); "restart_without_service")]
-    #[test_case(Some(true); "restart_without_engine")]
-    fn workflow_decision_is_committed_before_reply_and_replayed(restart: Option<bool>) {
+    #[test_case(false; "resume")]
+    #[test_case(true; "restart_without_service")]
+    fn workflow_decision_is_committed_before_reply_and_replayed(restart: bool) {
         smol::block_on(async {
             let fixture = Fixture::new();
             fixture.user_workflow(DECIDING, DECIDING_BODY);
@@ -1280,13 +1285,9 @@ complete(result);
             )
             .await;
             assert_eq!(paused.status, RunStatus::Paused);
-            if let Some(engine_off) = restart {
+            if restart {
                 runtime.shutdown().await;
-                runtime = if engine_off {
-                    fixture.spawn_without_engine().await
-                } else {
-                    fixture.spawn().await
-                };
+                runtime = fixture.spawn().await;
             }
             let handle = runtime.handle();
             resume(&handle, &started.run_id, None).await.unwrap();
@@ -1442,18 +1443,18 @@ complete(result);
     }
 
     #[test]
-    fn disabled_engine_fails_a_new_decision_before_journaling_it() {
+    fn missing_endpoint_fails_a_new_decision_before_journaling_it() {
         smol::block_on(async {
             let fixture = Fixture::new();
             fixture.user_workflow(DECIDING, DECISION_ERROR_BODY);
-            let runtime = fixture.spawn_without_engine().await;
+            let runtime = fixture.spawn().await;
             let started = start(&runtime.handle(), DECIDING, Some(0)).await;
             let completed = fixture
                 .wait_for(&started.run_id, RunStatus::Completed)
                 .await;
             let error = completed.result.unwrap();
             assert!(
-                error.as_str().unwrap().contains(DECISION_ENGINE_KEY),
+                error.as_str().unwrap().contains(DECISION_UNAVAILABLE),
                 "{error}"
             );
             assert!(
@@ -1915,15 +1916,6 @@ complete(result);
         ) -> WorkflowRuntime {
             self.spawn_with(session_id, decisions, FeatureFlags::all())
                 .await
-        }
-
-        async fn spawn_without_engine(&self) -> WorkflowRuntime {
-            self.spawn_with(
-                self.session_id,
-                None,
-                FeatureFlags::all().without(Feature::DecisionEngine),
-            )
-            .await
         }
 
         async fn spawn_with(

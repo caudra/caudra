@@ -633,6 +633,7 @@ fn query_words(query: &Value) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
+    use caudra_config::decisions::{DecisionEndpoint, DecisionProtocol};
     use std::iter;
     use std::path::Path;
     use std::sync::Arc;
@@ -767,7 +768,11 @@ mod tests {
 
     fn retention(root: &Path, mode: FeatureMode, engine: MarkerEngine) -> Retention {
         let mut config = DecisionsConfig {
-            base_url: Some(BASE_URL.parse().unwrap()),
+            endpoint: Some(DecisionEndpoint::new(
+                DecisionProtocol::TypeSafe.as_str(),
+                DecisionProtocol::TypeSafe,
+                BASE_URL.parse().unwrap(),
+            )),
             log: true,
             ..Default::default()
         };

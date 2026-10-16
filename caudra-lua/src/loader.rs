@@ -858,9 +858,8 @@ mod tests {
     use caudra_config::{ConfigError, FeatureMode, PermissionsConfig, ToolKey};
     use std::time::Instant;
     use test_case::test_case;
-    use url::Url;
 
-    const REMOVED_ENDPOINT_MESSAGE: &str = "unknown field `endpoint`, expected one of `base_url`";
+    const REMOVED_ENDPOINT_MESSAGE: &str = "unknown field `endpoint`";
 
     #[test_case(false; "plugin_file")]
     #[test_case(true; "init_file")]
@@ -1413,11 +1412,6 @@ mod tests {
         Ok(())
     }
 
-    #[test_case("base_url = 'https://project.example.test'", "base_url")]
-    #[test_case("allow_remote = true", "allow_remote")]
-    #[test_case("allow_http = true", "allow_http")]
-    #[test_case("allow_http = false", "allow_http")]
-    #[test_case("api_key_env = 'PROJECT_KEY'", "api_key_env")]
     #[test_case("log = true", "log")]
     #[test_case("log_retention_days = 999", "log_retention_days")]
     #[test_case("thresholds = { auto_flag = 1.0 }", "thresholds")]
@@ -1452,7 +1446,7 @@ mod tests {
 
     #[test]
     fn decision_setup_global_enablement_and_project_restrictions() {
-        const GLOBAL: &str = "caudra.setup({ decisions = { base_url = 'http://100.64.0.3:8000/typesafe', allow_remote = true, allow_http = true, log = true, features = { permission_advice = 'advise', auto_screening = 'enforce' } } })";
+        const GLOBAL: &str = "caudra.setup({ decisions = { log = true, features = { permission_advice = 'advise', auto_screening = 'enforce' } } })";
         const PROJECT: &str = "caudra.setup({ decisions = { log = false, log_retention_days = 7, features = { permission_advice = 'off' } } })";
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("init.lua");
@@ -1477,16 +1471,37 @@ mod tests {
         )
         .unwrap();
         let config = merged.unwrap().into_config(false).unwrap().decisions;
-        assert!(config.allow_remote);
-        assert!(config.allow_http);
-        assert_eq!(
-            config.endpoint().as_ref().map(Url::as_str),
-            Some("http://100.64.0.3:8000/typesafe/v1/systemone")
-        );
+        assert!(config.endpoint.is_none());
         assert_eq!(config.features.permission_advice, FeatureMode::Off);
         assert_eq!(config.features.auto_screening, FeatureMode::Enforce);
         assert!(!config.log);
         assert_eq!(config.log_retention_days, 7);
+    }
+
+    #[test_case("global/init.lua", PermissionRulePolicy::Trusted, None)]
+    #[test_case("project/init.lua", PermissionRulePolicy::DenyOnly, None)]
+    #[test_case(
+        "project/init.lua",
+        PermissionRulePolicy::DenyOnly,
+        Some(RawConfig::default())
+    )]
+    fn decision_setup_legacy_connection_keys_point_to_providers_toml(
+        label: &str,
+        policy: PermissionRulePolicy,
+        mut merged: Option<RawConfig>,
+    ) {
+        const LEGACY: &str = "caudra.setup({ decisions = { base_url = 'http://127.0.0.1:8000', allow_remote = true } })";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        fs::write(&path, LEGACY).unwrap();
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        run_layer(&host, &path, label, policy, &mut merged).unwrap();
+        assert!(matches!(
+            merged.unwrap().into_config(false),
+            Err(ConfigError::Decisions(
+                DecisionsConfigError::LegacyEndpointKeys { .. }
+            ))
+        ));
     }
 
     #[test]

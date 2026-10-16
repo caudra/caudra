@@ -47,6 +47,8 @@ A command with an Experiment entry exists only while that switch is on under `[e
 | `/rename` | Rename the current session |  |  |
 | `/model` | Switch chat model or assign job models | Main only |  |
 | `/favorite-next` | Switch to the next favorite model | Main only |  |
+| `/decision-model` | Pick the decision endpoint that screens tool calls | Main only |  |
+| `/decision-next` | Switch to the next decision endpoint | Main only |  |
 | `/system-prompt` | Inspect the system prompt and switch profile | Main only |  |
 | `/projection` | Inspect the conversation as the provider receives it | Main only |  |
 | `/review` | Review the last reply passage by passage |  |  |
@@ -66,8 +68,8 @@ A command with an Experiment entry exists only while that switch is on under `[e
 | `/goal-clear` | Stop the active completion goal | Main only |  |
 | `/goal-model` | Assign the completion goal model | Main only |  |
 | `/autopilot` | Keep the session moving: answer prompts, questions, and plans for you (off, model, log) | Main only | `autopilot` |
-| `/auto` | Toggle Auto permissions (skip unmatched prompts, keep safeguards) |  | `decision_engine` |
-| `/decisions` | Inspect decision engine status, features, activity, and recent decisions |  | `decision_engine` |
+| `/auto` | Toggle Auto permissions (skip unmatched prompts, keep safeguards) |  |  |
+| `/decisions` | Inspect decision engine status, features, activity, and recent decisions |  |  |
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |  |  |
 | `/thinking` | Set reasoning (off, adaptive/provider default, effort, or token budget) |  |  |
 | `/fast` | Toggle fast mode (models that sell a fast tier) |  |  |

@@ -5,12 +5,11 @@ use serde::de::{self, Deserialize, Deserializer, MapAccess, Visitor};
 use thiserror::Error;
 
 /// Indexed by [`Feature`] discriminant, so the enum and its config keys stay one list.
-const FEATURE_KEYS: [&str; 8] = [
+const FEATURE_KEYS: [&str; 7] = [
     "workflows",
     "sandboxes",
     "remote_workcell",
     "lua_plugins",
-    "decision_engine",
     "cross_session_messaging",
     "automations",
     "autopilot",
@@ -24,19 +23,17 @@ pub enum Feature {
     Sandboxes,
     RemoteWorkcell,
     LuaPlugins,
-    DecisionEngine,
     CrossSessionMessaging,
     Automations,
     Autopilot,
 }
 
 impl Feature {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 7] = [
         Self::Workflows,
         Self::Sandboxes,
         Self::RemoteWorkcell,
         Self::LuaPlugins,
-        Self::DecisionEngine,
         Self::CrossSessionMessaging,
         Self::Automations,
         Self::Autopilot,
@@ -57,7 +54,6 @@ impl Feature {
             Self::Sandboxes => "managed sandboxes",
             Self::RemoteWorkcell => "direct remote Workcell connections",
             Self::LuaPlugins => "Lua plugins and init.lua",
-            Self::DecisionEngine => "the decision engine and Auto mode",
             Self::CrossSessionMessaging => "cross-session messages",
             Self::Automations => "automations",
             Self::Autopilot => "Autopilot runs",
@@ -197,7 +193,6 @@ mod tests {
     }
 
     #[test_case(Feature::Workflows, "experimental.workflows"; "workflows")]
-    #[test_case(Feature::DecisionEngine, "experimental.decision_engine"; "decision_engine")]
     #[test_case(Feature::CrossSessionMessaging, "experimental.cross_session_messaging"; "cross_session_messaging")]
     #[test_case(Feature::Automations, "experimental.automations"; "automations")]
     #[test_case(Feature::Autopilot, "experimental.autopilot"; "autopilot")]
@@ -205,5 +200,17 @@ mod tests {
         let message = FeatureDisabled(feature).to_string();
         assert!(message.contains(&format!("`{key} = true`")), "{message}");
         assert!(message.contains("caudra.toml"), "{message}");
+    }
+
+    #[test]
+    fn promoted_decision_engine_key_is_unknown() {
+        const PROMOTED: &str = "decision_engine";
+        let error = toml::from_str::<FeatureFlags>(&format!("{PROMOTED} = true")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("unknown field `{PROMOTED}`")),
+            "{error}"
+        );
     }
 }

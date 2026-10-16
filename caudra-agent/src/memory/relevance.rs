@@ -469,6 +469,7 @@ fn quoted(text: &str) -> String {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use caudra_config::decisions::{DecisionEndpoint, DecisionProtocol};
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
@@ -597,7 +598,11 @@ pub(crate) mod tests {
         engine: NoteEngine,
     ) -> Decisions {
         let mut config = DecisionsConfig {
-            base_url: Some(BASE_URL.parse().unwrap()),
+            endpoint: Some(DecisionEndpoint::new(
+                DecisionProtocol::TypeSafe.as_str(),
+                DecisionProtocol::TypeSafe,
+                BASE_URL.parse().unwrap(),
+            )),
             log: true,
             ..Default::default()
         };

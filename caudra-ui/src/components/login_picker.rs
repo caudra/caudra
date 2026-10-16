@@ -4,6 +4,10 @@ use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use caudra_agent::decisions::{DecisionsError, SavedDecisionEndpoint, save_decision_endpoint};
+use caudra_config::decisions::{
+    DECISION_PRESETS, DecisionEndpointDef, DecisionPreset, DecisionProtocol, DecisionsConfigError,
+};
 use caudra_config::providers::{
     self, Protocol, ProviderDef, ProviderSlugError, ProvidersConfig, ProvidersFile,
     custom_provider_slug,
@@ -13,8 +17,10 @@ use caudra_providers::catalog_providers_if_available;
 use caudra_providers::copilot_auth::{self, CopilotIdentity};
 use caudra_storage::StateDir;
 use caudra_storage::auth::{
-    ProviderAuthKind, ProviderCredentials, save_provider_credentials, try_load_provider_auth,
+    DecisionEndpointNameError, ProviderAuthKind, ProviderCredentials, load_decision_credentials,
+    save_provider_credentials, try_load_provider_auth, validate_decision_endpoint_name,
 };
+use caudra_storage::decisions::read_active_decision_endpoint;
 use caudra_storage::model::persist_model_for_every_mode;
 use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 
@@ -28,9 +34,38 @@ use crate::theme;
 
 const TITLE: &str = " Login ";
 const CATALOG_UNAVAILABLE_SLUG: &str = "catalog-unavailable";
+const CATALOG_SECTION: &str = "Providers from Models.dev";
+const DECISION_SECTION: &str = "Decision models";
+const CUSTOM_DECISION_LABEL: &str = "Custom decision endpoint...";
+const DETAIL_ACTIVE: &str = "active";
+const DETAIL_SAVED_KEY: &str = "saved key";
+const DETAIL_ENV: &str = "env";
+const DETAIL_CONFIGURED: &str = "configured";
+const DECISION_NAME_TITLE: &str = " Decision endpoint name ";
+const DECISION_NAME_HINT: &str = "Lowercase letters, digits, - and _, then Enter";
+const DECISION_PROTOCOL_TITLE: &str = " Decision protocol ";
+const DECISION_URL_TITLE: &str = " Decision base URL ";
+const DECISION_MODEL_HINT: &str = "Edit the model, then Enter";
+const PLAIN_HTTP_TITLE: &str = " Plain HTTP ";
+const PLAIN_HTTP_PROMPT: &str =
+    "Send decision context over plain HTTP? Enter to allow, Esc to edit";
+const PLAIN_HTTP_WARNING: &str = "Plain HTTP sends decision context and the key unencrypted; use it only over a tunnel you trust.";
+const KEEPS_SAVED_KEY: &str = "Enter keeps the saved key";
+const SKIPS_KEY: &str = "Enter to skip";
+const NOT_ACTIVE: &str = "; saved, not active";
 const PROMPT_WIDTH_PERCENT: u16 = 65;
 const PROMPT_HEIGHT_PERCENT: u16 = 40;
 const PROMPT_ROWS: u16 = 2;
+const DONE_WIDTH_PERCENT: u16 = 50;
+const DONE_HEIGHT_PERCENT: u16 = 30;
+
+/// How a decision endpoint is saved, [`save_decision_endpoint`] outside tests.
+type SaveDecision = fn(
+    &StateDir,
+    &str,
+    DecisionEndpointDef,
+    Option<&str>,
+) -> Result<SavedDecisionEndpoint, DecisionsError>;
 
 const PROTOCOLS: &[(&str, &str)] = &[
     ("openai", "OpenAI Chat Completions"),
@@ -47,6 +82,14 @@ struct ProviderItem {
     has_env: bool,
     configured: bool,
     section: Option<&'static str>,
+    kind: ItemKind,
+}
+
+#[derive(Clone)]
+enum ItemKind {
+    Chat,
+    Decision { draft: DecisionDraft, active: bool },
+    CustomDecision,
 }
 
 impl PickerItem for ProviderItem {
@@ -59,21 +102,77 @@ impl PickerItem for ProviderItem {
     }
 
     fn detail(&self) -> Option<&str> {
-        if self.stored_auth == Some(ProviderAuthKind::OAuth) {
+        if matches!(self.kind, ItemKind::Decision { active: true, .. }) {
+            Some(DETAIL_ACTIVE)
+        } else if self.stored_auth == Some(ProviderAuthKind::OAuth) {
             Some("oauth")
         } else if self.stored_auth == Some(ProviderAuthKind::ApiKey) {
-            Some(if CopilotIdentity::from_slug(&self.slug).is_some() {
-                "saved token"
-            } else {
-                "saved key"
-            })
+            Some(
+                if matches!(self.kind, ItemKind::Chat)
+                    && CopilotIdentity::from_slug(&self.slug).is_some()
+                {
+                    "saved token"
+                } else {
+                    DETAIL_SAVED_KEY
+                },
+            )
         } else if self.has_env {
-            Some("env")
+            Some(DETAIL_ENV)
         } else if self.configured {
-            Some("configured")
+            Some(DETAIL_CONFIGURED)
         } else {
             None
         }
+    }
+}
+
+/// A decision endpoint on its way to `providers.toml`.
+#[derive(Clone)]
+struct DecisionDraft {
+    name: String,
+    display_name: String,
+    def: DecisionEndpointDef,
+}
+
+impl DecisionDraft {
+    fn custom(name: String, protocol: DecisionProtocol) -> Self {
+        Self {
+            display_name: name.clone(),
+            name,
+            def: DecisionEndpointDef {
+                protocol,
+                base_url: String::new(),
+                model: None,
+                api_key_env: None,
+                allow_http: None,
+            },
+        }
+    }
+
+    /// Why `base_url` would never save, or `None` while it might: blank, valid,
+    /// or plain HTTP that waits for consent.
+    fn url_error(&self, base_url: &str) -> Option<String> {
+        let def = DecisionEndpointDef {
+            base_url: base_url.trim().into(),
+            allow_http: None,
+            ..self.def.clone()
+        };
+        if def.base_url.is_empty() || def.needs_allow_http() {
+            return None;
+        }
+        def.resolve(&self.name).err().map(inline_error)
+    }
+}
+
+struct DecisionProtocolItem(DecisionProtocol);
+
+impl PickerItem for DecisionProtocolItem {
+    fn label(&self) -> &str {
+        self.0.as_str()
+    }
+
+    fn detail(&self) -> Option<&str> {
+        Some(self.0.endpoint_path())
     }
 }
 
@@ -123,9 +222,36 @@ impl PickerItem for ProtocolItem {
     }
 }
 
+#[derive(Clone)]
 struct CustomInfo {
     base_url: String,
     protocol: String,
+}
+
+#[derive(Clone)]
+struct ProviderKey {
+    slug: String,
+    plan: Option<String>,
+    display_name: String,
+    custom: Option<CustomInfo>,
+    builtin_url: Option<String>,
+    api_key_optional: bool,
+}
+
+/// What the key typed at [`Step::EnterKey`] is for.
+#[derive(Clone)]
+enum KeyTarget {
+    Provider(ProviderKey),
+    Decision(DecisionDraft),
+}
+
+impl KeyTarget {
+    fn display_name(&self) -> &str {
+        match self {
+            Self::Provider(provider) => &provider.display_name,
+            Self::Decision(draft) => &draft.display_name,
+        }
+    }
 }
 
 enum Step {
@@ -156,14 +282,28 @@ enum Step {
         slug: String,
         display_name: String,
     },
+    DecisionName {
+        input: TextField,
+    },
+    DecisionProtocol {
+        picker: ListPicker<DecisionProtocolItem>,
+        name: String,
+    },
+    DecisionUrl {
+        input: TextField,
+        draft: DecisionDraft,
+    },
+    DecisionHttp {
+        draft: DecisionDraft,
+    },
+    DecisionModel {
+        input: TextField,
+        draft: DecisionDraft,
+    },
     EnterKey {
         input: TextField,
-        slug: String,
-        plan: Option<String>,
-        display_name: String,
-        custom: Option<CustomInfo>,
-        builtin_url: Option<String>,
-        api_key_optional: bool,
+        target: KeyTarget,
+        hint: String,
     },
     Done {
         message: String,
@@ -172,14 +312,7 @@ enum Step {
 
 enum StepAction {
     None,
-    GoEnterKey {
-        slug: String,
-        plan: Option<String>,
-        display_name: String,
-        custom: Option<CustomInfo>,
-        builtin_url: Option<String>,
-        api_key_optional: bool,
-    },
+    GoEnterKey(KeyTarget),
     GoPickAuthMethod {
         provider: SubscriptionProvider,
     },
@@ -201,10 +334,22 @@ enum StepAction {
         slug: String,
         display_name: String,
     },
+    GoDecisionName,
+    GoDecisionProtocol {
+        name: String,
+    },
+    GoDecisionUrl(DecisionDraft),
+    GoDecisionHttp(DecisionDraft),
+    GoDecisionModel(DecisionDraft),
     GoDone {
         message: String,
         model_spec: Option<String>,
         slug: String,
+    },
+    GoDecisionDone {
+        message: String,
+        name: String,
+        activate: bool,
     },
     GoError {
         message: String,
@@ -218,6 +363,7 @@ pub struct LoginPicker {
     step: Step,
     provider_items: Vec<ProviderItem>,
     storage: Option<caudra_storage::StateDir>,
+    save_decision: SaveDecision,
 }
 
 impl LoginPicker {
@@ -226,7 +372,25 @@ impl LoginPicker {
             step: Step::Closed,
             provider_items: Vec::new(),
             storage: None,
+            save_decision: save_decision_endpoint,
         }
+    }
+
+    /// The provider list with the cursor on the first decision endpoint.
+    pub fn open_decisions(&mut self, storage: StateDir) {
+        self.open(storage);
+        if let Step::PickProvider(picker) = &mut self.step {
+            picker.select_item_by(|item| matches!(item.kind, ItemKind::Decision { .. }));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn on_decision_row(&self) -> bool {
+        matches!(
+            &self.step,
+            Step::PickProvider(list)
+                if matches!(list.selected_item().map(|item| &item.kind), Some(ItemKind::Decision { .. }))
+        )
     }
 
     pub fn open(&mut self, storage: caudra_storage::StateDir) {
@@ -253,6 +417,7 @@ impl LoginPicker {
                     has_env,
                     configured,
                     section: None,
+                    kind: ItemKind::Chat,
                 }
             })
             .collect();
@@ -276,8 +441,11 @@ impl LoginPicker {
                 has_env,
                 configured: false,
                 section: None,
+                kind: ItemKind::Chat,
             });
         }
+
+        items.extend(decision_items(&config, &storage));
 
         if let Some(catalog) = catalog_providers_if_available() {
             let state_dir = StateDir::resolve().ok();
@@ -293,7 +461,8 @@ impl LoginPicker {
                     stored_auth,
                     has_env,
                     configured: false,
-                    section: Some("Providers from Models.dev"),
+                    section: Some(CATALOG_SECTION),
+                    kind: ItemKind::Chat,
                 });
             }
         } else {
@@ -303,7 +472,8 @@ impl LoginPicker {
                 stored_auth: None,
                 has_env: false,
                 configured: false,
-                section: Some("Providers from Models.dev"),
+                section: Some(CATALOG_SECTION),
+                kind: ItemKind::Chat,
             });
         }
 
@@ -314,6 +484,7 @@ impl LoginPicker {
             has_env: false,
             configured: false,
             section: None,
+            kind: ItemKind::Chat,
         });
 
         self.provider_items = items.clone();
@@ -333,14 +504,18 @@ impl LoginPicker {
             Step::PickAuthMethod { picker, .. } => picker.handle_text(text, paste),
             Step::PickPlan { picker, .. } => picker.handle_text(text, paste),
             Step::CustomProtocol { picker, .. } => picker.handle_text(text, paste),
+            Step::DecisionProtocol { picker, .. } => picker.handle_text(text, paste),
             Step::EnterKey { input, .. }
             | Step::CustomName { input }
             | Step::CustomUrl { input, .. }
-            | Step::BuiltinUrl { input, .. } => {
+            | Step::BuiltinUrl { input, .. }
+            | Step::DecisionName { input }
+            | Step::DecisionUrl { input, .. }
+            | Step::DecisionModel { input, .. } => {
                 input.handle_text(text, paste);
                 true
             }
-            Step::Closed | Step::Done { .. } => false,
+            Step::Closed | Step::DecisionHttp { .. } | Step::Done { .. } => false,
         }
     }
 
@@ -350,6 +525,9 @@ impl LoginPicker {
             Step::CustomName { .. }
                 | Step::CustomUrl { .. }
                 | Step::BuiltinUrl { .. }
+                | Step::DecisionName { .. }
+                | Step::DecisionUrl { .. }
+                | Step::DecisionModel { .. }
                 | Step::EnterKey { .. }
         )
     }
@@ -386,7 +564,7 @@ impl LoginPicker {
                     if base_url.is_empty() {
                         return LoginPickerAction::Consumed;
                     }
-                    StepAction::GoEnterKey {
+                    StepAction::GoEnterKey(KeyTarget::Provider(ProviderKey {
                         slug: slug.clone(),
                         plan: None,
                         display_name: format!("Custom ({})", slug),
@@ -396,126 +574,92 @@ impl LoginPicker {
                         }),
                         builtin_url: None,
                         api_key_optional: false,
+                    }))
+                }
+                KeyCode::Esc => StepAction::Back,
+                _ => return Self::edit(input, key),
+            },
+            Step::DecisionName { input } => match key.code {
+                KeyCode::Enter => {
+                    let name = input.text().trim().to_ascii_lowercase();
+                    match validate_decision_endpoint_name(&name) {
+                        Ok(()) => StepAction::GoDecisionProtocol { name },
+                        Err(DecisionEndpointNameError::Empty) => {
+                            return LoginPickerAction::Consumed;
+                        }
+                        Err(error) => StepAction::GoError {
+                            message: format!("Error: {error}"),
+                        },
                     }
                 }
                 KeyCode::Esc => StepAction::Back,
                 _ => return Self::edit(input, key),
             },
-            Step::EnterKey {
-                input,
-                slug,
-                plan,
-                display_name,
-                custom,
-                builtin_url,
-                api_key_optional,
-            } => match key.code {
+            Step::DecisionProtocol { picker, name } => {
+                Self::map_decision_protocol_action(picker.handle_key(key), name)
+            }
+            Step::DecisionUrl { input, draft } => match key.code {
                 KeyCode::Enter => {
-                    let api_key = input.text().trim().to_string();
-                    if api_key.is_empty() && !*api_key_optional {
+                    let base_url = input.text().trim().to_string();
+                    if base_url.is_empty() || draft.url_error(&base_url).is_some() {
                         return LoginPickerAction::Consumed;
                     }
-                    let Some(storage) = self.storage.as_ref() else {
+                    let mut draft = draft.clone();
+                    draft.def.base_url = base_url;
+                    draft.def.allow_http = None;
+                    if draft.def.needs_allow_http() {
+                        StepAction::GoDecisionHttp(draft)
+                    } else {
+                        StepAction::GoDecisionModel(draft)
+                    }
+                }
+                KeyCode::Esc => StepAction::Back,
+                _ => return Self::edit(input, key),
+            },
+            Step::DecisionHttp { draft } => match key.code {
+                KeyCode::Enter => {
+                    let mut draft = draft.clone();
+                    draft.def.allow_http = Some(true);
+                    StepAction::GoDecisionModel(draft)
+                }
+                KeyCode::Esc => StepAction::GoDecisionUrl(draft.clone()),
+                _ => StepAction::None,
+            },
+            Step::DecisionModel { input, draft } => match key.code {
+                KeyCode::Enter => {
+                    let model = input.text().trim().to_string();
+                    let mut draft = draft.clone();
+                    draft.def.model = (!model.is_empty()).then_some(model);
+                    match draft.def.resolve(&draft.name) {
+                        Ok(_) => StepAction::GoEnterKey(KeyTarget::Decision(draft)),
+                        Err(error) => StepAction::GoError {
+                            message: format!("Error: {error}"),
+                        },
+                    }
+                }
+                KeyCode::Esc => StepAction::Back,
+                _ => return Self::edit(input, key),
+            },
+            Step::EnterKey { input, target, .. } => match key.code {
+                KeyCode::Enter => {
+                    let api_key = input.text().trim().to_string();
+                    if api_key.is_empty()
+                        && matches!(target, KeyTarget::Provider(provider) if !provider.api_key_optional)
+                    {
+                        return LoginPickerAction::Consumed;
+                    }
+                    let target = target.clone();
+                    let Some(storage) = self.storage.clone() else {
                         self.step = Step::Closed;
                         return LoginPickerAction::Close;
                     };
-                    let slug_c = slug.clone();
-                    let plan_c = plan.clone();
-                    let dn_c = display_name.clone();
-                    let storage = storage.clone();
-                    let custom_c = custom.take();
-                    let builtin_url_c = builtin_url.take();
-
-                    let has_key = !api_key.is_empty();
-                    if has_key {
-                        let creds = ProviderCredentials {
-                            api_key,
-                            host: None,
-                        };
-                        if let Err(e) = save_provider_credentials(&storage, &slug_c, &creds) {
-                            return self.transition(StepAction::GoError {
-                                message: format!("Error: {e}"),
-                            });
+                    match target {
+                        KeyTarget::Provider(provider) => {
+                            save_provider_key(&storage, provider, api_key)
                         }
-                    }
-
-                    let mut config = match ProvidersFile::load() {
-                        Ok(config) => config,
-                        Err(e) => {
-                            return self.transition(StepAction::GoError {
-                                message: format!("Error: {e}"),
-                            });
+                        KeyTarget::Decision(draft) => {
+                            self.save_decision_key(&storage, draft, &api_key)
                         }
-                    };
-
-                    if let Some(info) = &custom_c {
-                        let api_key_env =
-                            format!("{}_API_KEY", slug_c.to_uppercase().replace('-', "_"));
-                        let provider_def = ProviderDef {
-                            display_name: Some(dn_c.clone()),
-                            protocol: Some(
-                                info.protocol
-                                    .parse::<Protocol>()
-                                    .unwrap_or(Protocol::Openai),
-                            ),
-                            base_url: Some(info.base_url.clone()),
-                            api_key_env: Some(api_key_env),
-                            discover_models: true,
-                            ..Default::default()
-                        };
-                        config.upsert(slug_c.clone(), provider_def);
-                        if let Err(e) = config.save() {
-                            return self.transition(StepAction::GoError {
-                                message: format!("Error saving config: {e}"),
-                            });
-                        }
-                    } else {
-                        let needs_url =
-                            providers::builtin_provider(&slug_c).is_some_and(|b| b.needs_url);
-                        if plan_c.is_some() || builtin_url_c.is_some() || needs_url {
-                            let mut def = config.get(&slug_c).cloned().unwrap_or_default();
-                            def.plan = plan_c.clone();
-                            if let Some(url) = builtin_url_c {
-                                def.base_url = Some(url);
-                            }
-                            config.upsert(slug_c.clone(), def);
-                            if let Err(e) = config.save() {
-                                return self.transition(StepAction::GoError {
-                                    message: format!("Error saving config: {e}"),
-                                });
-                            }
-                        }
-                    }
-
-                    let needs_url =
-                        providers::builtin_provider(&slug_c).is_some_and(|b| b.needs_url);
-                    let default_model = if needs_url {
-                        None
-                    } else {
-                        providers::resolve_default_model(&slug_c, config.get(&slug_c))
-                    };
-                    if let Some(model) = &default_model {
-                        persist_model_for_every_mode(&storage, model);
-                    }
-
-                    let verb = if has_key {
-                        "Authenticated"
-                    } else {
-                        "Configured"
-                    };
-                    let msg = format!(
-                        "{}: {}{}",
-                        verb,
-                        dn_c,
-                        plan_c
-                            .as_deref()
-                            .map(|p| format!(" ({p})"))
-                            .unwrap_or_default()
-                    );
-                    StepAction::GoDone {
-                        message: msg,
-                        model_spec: default_model,
-                        slug: slug_c.clone(),
                     }
                 }
                 KeyCode::Esc => StepAction::Back,
@@ -531,14 +675,14 @@ impl LoginPicker {
                     if base_url.is_empty() {
                         base_url = providers::resolve_base_url(slug, None).unwrap_or_default();
                     }
-                    StepAction::GoEnterKey {
+                    StepAction::GoEnterKey(KeyTarget::Provider(ProviderKey {
                         slug: slug.clone(),
                         plan: None,
                         display_name: display_name.clone(),
                         custom: None,
                         builtin_url: Some(base_url),
                         api_key_optional: true,
-                    }
+                    }))
                 }
                 KeyCode::Esc => StepAction::Back,
                 _ => return Self::edit(input, key),
@@ -574,10 +718,17 @@ impl LoginPicker {
             Step::CustomProtocol { picker, slug } => {
                 Self::map_protocol_action(picker.handle_mouse(event), slug)
             }
+            Step::DecisionProtocol { picker, name } => {
+                Self::map_decision_protocol_action(picker.handle_mouse(event), name)
+            }
             Step::Closed
             | Step::CustomName { .. }
             | Step::CustomUrl { .. }
             | Step::BuiltinUrl { .. }
+            | Step::DecisionName { .. }
+            | Step::DecisionUrl { .. }
+            | Step::DecisionHttp { .. }
+            | Step::DecisionModel { .. }
             | Step::EnterKey { .. }
             | Step::Done { .. } => return LoginPickerAction::Consumed,
         };
@@ -593,10 +744,15 @@ impl LoginPicker {
             Step::PickAuthMethod { picker, .. } => picker.contains(pos),
             Step::PickPlan { picker, .. } => picker.contains(pos),
             Step::CustomProtocol { picker, .. } => picker.contains(pos),
+            Step::DecisionProtocol { picker, .. } => picker.contains(pos),
             Step::Closed
             | Step::CustomName { .. }
             | Step::CustomUrl { .. }
             | Step::BuiltinUrl { .. }
+            | Step::DecisionName { .. }
+            | Step::DecisionUrl { .. }
+            | Step::DecisionHttp { .. }
+            | Step::DecisionModel { .. }
             | Step::EnterKey { .. }
             | Step::Done { .. } => false,
         }
@@ -608,19 +764,48 @@ impl LoginPicker {
             Step::PickAuthMethod { picker, .. } => picker.scroll(delta),
             Step::PickPlan { picker, .. } => picker.scroll(delta),
             Step::CustomProtocol { picker, .. } => picker.scroll(delta),
+            Step::DecisionProtocol { picker, .. } => picker.scroll(delta),
             Step::Closed
             | Step::CustomName { .. }
             | Step::CustomUrl { .. }
             | Step::BuiltinUrl { .. }
+            | Step::DecisionName { .. }
+            | Step::DecisionUrl { .. }
+            | Step::DecisionHttp { .. }
+            | Step::DecisionModel { .. }
             | Step::EnterKey { .. }
             | Step::Done { .. } => {}
+        }
+    }
+
+    /// Saves the endpoint, then its key unless `api_key` is blank, which keeps
+    /// the stored key or leaves the endpoint to its environment variable.
+    fn save_decision_key(
+        &self,
+        storage: &StateDir,
+        draft: DecisionDraft,
+        api_key: &str,
+    ) -> StepAction {
+        match (self.save_decision)(storage, &draft.name, draft.def, Some(api_key)) {
+            Ok(saved) => StepAction::GoDecisionDone {
+                message: decision_done_message(&saved),
+                name: draft.name,
+                activate: saved.active,
+            },
+            Err(error) => StepAction::GoError {
+                message: format!("Error: {error}"),
+            },
         }
     }
 
     fn map_provider_action(action: PickerAction<ProviderItem>) -> StepAction {
         match action {
             PickerAction::Select(item) => {
-                if item.slug == CATALOG_UNAVAILABLE_SLUG {
+                if let ItemKind::Decision { draft, .. } = item.kind {
+                    StepAction::GoEnterKey(KeyTarget::Decision(draft))
+                } else if matches!(item.kind, ItemKind::CustomDecision) {
+                    StepAction::GoDecisionName
+                } else if item.slug == CATALOG_UNAVAILABLE_SLUG {
                     StepAction::None
                 } else if item.slug == "custom" {
                     StepAction::GoCustomName
@@ -651,14 +836,14 @@ impl LoginPicker {
                         if needs_url {
                             StepAction::GoBuiltinUrl { slug, display_name }
                         } else {
-                            StepAction::GoEnterKey {
+                            StepAction::GoEnterKey(KeyTarget::Provider(ProviderKey {
                                 slug,
                                 plan: None,
                                 display_name,
                                 custom: None,
                                 builtin_url: None,
                                 api_key_optional: false,
-                            }
+                            }))
                         }
                     }
                 }
@@ -678,14 +863,14 @@ impl LoginPicker {
         match action {
             PickerAction::Select(item) => match item.method {
                 LoginMethod::Oauth => StepAction::GoOauth { provider },
-                LoginMethod::ApiKey => StepAction::GoEnterKey {
+                LoginMethod::ApiKey => StepAction::GoEnterKey(KeyTarget::Provider(ProviderKey {
                     slug: provider.slug().into(),
                     plan: None,
                     display_name: provider.display_name().into(),
                     custom: None,
                     builtin_url: None,
                     api_key_optional: false,
-                },
+                })),
             },
             PickerAction::Close => StepAction::Back,
             PickerAction::Copy(text) => StepAction::Copy(text),
@@ -699,14 +884,14 @@ impl LoginPicker {
         match action {
             PickerAction::Select(item) => {
                 let config = providers::ProvidersConfig::load();
-                StepAction::GoEnterKey {
+                StepAction::GoEnterKey(KeyTarget::Provider(ProviderKey {
                     slug: slug.to_string(),
                     plan: Some(item.key.clone()),
                     display_name: providers::resolve_display_name(slug, config.get(slug)),
                     custom: None,
                     builtin_url: None,
                     api_key_optional: false,
-                }
+                }))
             }
             PickerAction::Close => StepAction::Back,
             PickerAction::Copy(text) => StepAction::Copy(text),
@@ -730,33 +915,101 @@ impl LoginPicker {
         }
     }
 
+    fn map_decision_protocol_action(
+        action: PickerAction<DecisionProtocolItem>,
+        name: &str,
+    ) -> StepAction {
+        match action {
+            PickerAction::Select(item) => {
+                StepAction::GoDecisionUrl(DecisionDraft::custom(name.into(), item.0))
+            }
+            PickerAction::Close => StepAction::Back,
+            PickerAction::Copy(text) => StepAction::Copy(text),
+            PickerAction::Consumed | PickerAction::Toggle(..) | PickerAction::Key(_) => {
+                StepAction::None
+            }
+        }
+    }
+
     fn transition(&mut self, action: StepAction) -> LoginPickerAction {
         match action {
             StepAction::None => LoginPickerAction::Consumed,
-            StepAction::GoEnterKey {
-                slug,
-                plan,
-                display_name,
-                custom,
-                builtin_url,
-                api_key_optional,
-            } => {
-                if custom.is_none()
-                    && let Some(url) = providers::resolve_login_url(&slug, plan.as_deref())
-                    && let Err(e) = open::that(&url)
-                {
-                    tracing::warn!(error = %e, url, "failed to open browser");
-                }
+            StepAction::GoEnterKey(target) => {
+                let hint = match &target {
+                    KeyTarget::Provider(provider) => {
+                        if provider.custom.is_none()
+                            && let Some(url) = providers::resolve_login_url(
+                                &provider.slug,
+                                provider.plan.as_deref(),
+                            )
+                            && let Err(e) = open::that(&url)
+                        {
+                            tracing::warn!(error = %e, url, "failed to open browser");
+                        }
+                        if provider.api_key_optional {
+                            "Paste API key, or Enter to skip"
+                        } else {
+                            "Paste API key, then Enter"
+                        }
+                        .to_owned()
+                    }
+                    KeyTarget::Decision(draft) => decision_key_hint(self.storage.as_ref(), draft),
+                };
                 self.step = Step::EnterKey {
                     input: TextField::new(FieldKind::Line).secret(),
-                    slug,
-                    plan,
-                    display_name,
-                    custom,
-                    builtin_url,
-                    api_key_optional,
+                    target,
+                    hint,
                 };
                 LoginPickerAction::Consumed
+            }
+            StepAction::GoDecisionName => {
+                self.step = Step::DecisionName {
+                    input: TextField::new(FieldKind::Line),
+                };
+                LoginPickerAction::Consumed
+            }
+            StepAction::GoDecisionProtocol { name } => {
+                let mut picker = ListPicker::new();
+                picker.open(
+                    DecisionProtocol::ALL
+                        .into_iter()
+                        .map(DecisionProtocolItem)
+                        .collect(),
+                    DECISION_PROTOCOL_TITLE,
+                );
+                self.step = Step::DecisionProtocol { picker, name };
+                LoginPickerAction::Consumed
+            }
+            StepAction::GoDecisionUrl(draft) => {
+                self.step = Step::DecisionUrl {
+                    input: TextField::with_text(FieldKind::Line, &draft.def.base_url),
+                    draft,
+                };
+                LoginPickerAction::Consumed
+            }
+            StepAction::GoDecisionHttp(draft) => {
+                self.step = Step::DecisionHttp { draft };
+                LoginPickerAction::Consumed
+            }
+            StepAction::GoDecisionModel(draft) => {
+                let model = draft
+                    .def
+                    .model
+                    .as_deref()
+                    .unwrap_or_else(|| draft.def.protocol.default_model());
+                self.step = Step::DecisionModel {
+                    input: TextField::with_text(FieldKind::Line, model),
+                    draft,
+                };
+                LoginPickerAction::Consumed
+            }
+            StepAction::GoDecisionDone {
+                message,
+                name,
+                activate,
+            } => {
+                self.step = Step::Done { message };
+                LoginPickerAction::DecisionConfigured { name, activate }
             }
             StepAction::GoPickAuthMethod { provider } => {
                 let items = vec![
@@ -919,33 +1172,45 @@ impl LoginPicker {
                 "Edit host URL, or Enter to confirm",
                 input,
             ),
+            Step::DecisionName { input } => {
+                render_prompt(frame, area, DECISION_NAME_TITLE, DECISION_NAME_HINT, input)
+            }
+            Step::DecisionProtocol { picker, .. } => picker.view(frame, area),
+            Step::DecisionUrl { input, draft } => {
+                let hint = match draft.url_error(&input.text()) {
+                    Some(error) => Span::styled(error, theme::current().error),
+                    None => Span::styled(
+                        decision_url_hint(&draft.def.protocol),
+                        theme::current().input_placeholder,
+                    ),
+                };
+                render_prompt_line(frame, area, DECISION_URL_TITLE, hint, input)
+            }
+            Step::DecisionHttp { .. } => render_message(
+                frame,
+                area,
+                PLAIN_HTTP_TITLE,
+                &format!("{PLAIN_HTTP_WARNING}\n{PLAIN_HTTP_PROMPT}"),
+            ),
+            Step::DecisionModel { input, draft } => render_prompt(
+                frame,
+                area,
+                &format!(" {} model ", draft.name),
+                DECISION_MODEL_HINT,
+                input,
+            ),
             Step::EnterKey {
                 input,
-                display_name,
-                api_key_optional,
-                ..
-            } => {
-                let hint = if *api_key_optional {
-                    "Paste API key, or Enter to skip"
-                } else {
-                    "Paste API key, then Enter"
-                };
-                render_prompt(frame, area, &format!(" {display_name} "), hint, input)
-            }
-            Step::Done { message } => {
-                let modal = Modal {
-                    title: " Login ",
-                    width_percent: 50,
-                    max_height_percent: 30,
-                };
-                let (popup, inner) = modal.render(frame, area, 1);
-                frame.render_widget(
-                    Paragraph::new(Line::from(message.clone()))
-                        .style(theme::current().surface_style()),
-                    inner,
-                );
-                popup
-            }
+                target,
+                hint,
+            } => render_prompt(
+                frame,
+                area,
+                &format!(" {} ", target.display_name()),
+                hint,
+                input,
+            ),
+            Step::Done { message } => render_message(frame, area, TITLE, message),
         }
     }
 }
@@ -956,6 +1221,17 @@ fn render_prompt(
     area: Rect,
     title: &str,
     hint: &str,
+    input: &TextField,
+) -> Rect {
+    let hint = Span::styled(hint, theme::current().input_placeholder);
+    render_prompt_line(frame, area, title, hint, input)
+}
+
+fn render_prompt_line(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    hint: Span<'_>,
     input: &TextField,
 ) -> Rect {
     let modal = Modal {
@@ -970,11 +1246,24 @@ fn render_prompt(
     let mut field = input.paint(width, &field_styles(input_text_style()), true, "");
     field.spans.insert(0, chevron);
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(hint, t.input_placeholder)),
-            field,
-        ])
-        .style(t.surface_style()),
+        Paragraph::new(vec![Line::from(hint), field]).style(t.surface_style()),
+        inner,
+    );
+    popup
+}
+
+/// `message`, one row per line.
+fn render_message(frame: &mut Frame, area: Rect, title: &str, message: &str) -> Rect {
+    let modal = Modal {
+        title,
+        width_percent: DONE_WIDTH_PERCENT,
+        max_height_percent: DONE_HEIGHT_PERCENT,
+    };
+    let lines: Vec<Line> = message.lines().map(Line::from).collect();
+    let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let (popup, inner) = modal.render(frame, area, rows);
+    frame.render_widget(
+        Paragraph::new(lines).style(theme::current().surface_style()),
         inner,
     );
     popup
@@ -995,6 +1284,7 @@ impl Overlay for LoginPicker {
             Step::PickAuthMethod { picker, .. } => picker.tooltip(),
             Step::PickPlan { picker, .. } => picker.tooltip(),
             Step::CustomProtocol { picker, .. } => picker.tooltip(),
+            Step::DecisionProtocol { picker, .. } => picker.tooltip(),
             _ => None,
         }
     }
@@ -1013,6 +1303,12 @@ pub enum LoginPickerAction {
         provider: SubscriptionProvider,
         model_spec: String,
     },
+    /// `name` was saved; `activate` when it is the active endpoint now, new
+    /// or re-keyed, so the running engine has to be rebuilt from it.
+    DecisionConfigured {
+        name: String,
+        activate: bool,
+    },
     Copy(String),
 }
 
@@ -1024,12 +1320,219 @@ fn subscription_provider(slug: &str) -> Option<SubscriptionProvider> {
     }
 }
 
+fn save_provider_key(storage: &StateDir, provider: ProviderKey, api_key: String) -> StepAction {
+    let ProviderKey {
+        slug,
+        plan,
+        display_name,
+        custom,
+        builtin_url,
+        ..
+    } = provider;
+    let has_key = !api_key.is_empty();
+    if has_key {
+        let creds = ProviderCredentials {
+            api_key,
+            host: None,
+        };
+        if let Err(e) = save_provider_credentials(storage, &slug, &creds) {
+            return StepAction::GoError {
+                message: format!("Error: {e}"),
+            };
+        }
+    }
+
+    let mut config = match ProvidersFile::load() {
+        Ok(config) => config,
+        Err(e) => {
+            return StepAction::GoError {
+                message: format!("Error: {e}"),
+            };
+        }
+    };
+
+    let needs_url = providers::builtin_provider(&slug).is_some_and(|b| b.needs_url);
+    if let Some(info) = &custom {
+        let api_key_env = format!("{}_API_KEY", slug.to_uppercase().replace('-', "_"));
+        let provider_def = ProviderDef {
+            display_name: Some(display_name.clone()),
+            protocol: Some(
+                info.protocol
+                    .parse::<Protocol>()
+                    .unwrap_or(Protocol::Openai),
+            ),
+            base_url: Some(info.base_url.clone()),
+            api_key_env: Some(api_key_env),
+            discover_models: true,
+            ..Default::default()
+        };
+        if let Err(e) = config
+            .upsert(slug.clone(), provider_def)
+            .and_then(|()| config.save())
+        {
+            return StepAction::GoError {
+                message: format!("Error saving config: {e}"),
+            };
+        }
+    } else if plan.is_some() || builtin_url.is_some() || needs_url {
+        let mut def = config.get(&slug).cloned().unwrap_or_default();
+        def.plan = plan.clone();
+        if let Some(url) = builtin_url {
+            def.base_url = Some(url);
+        }
+        if let Err(e) = config
+            .upsert(slug.clone(), def)
+            .and_then(|()| config.save())
+        {
+            return StepAction::GoError {
+                message: format!("Error saving config: {e}"),
+            };
+        }
+    }
+
+    let default_model = if needs_url {
+        None
+    } else {
+        providers::resolve_default_model(&slug, config.get(&slug))
+    };
+    if let Some(model) = &default_model {
+        persist_model_for_every_mode(storage, model);
+    }
+
+    let verb = if has_key {
+        "Authenticated"
+    } else {
+        "Configured"
+    };
+    StepAction::GoDone {
+        message: format!(
+            "{verb}: {display_name}{}",
+            plan.as_deref()
+                .map(|p| format!(" ({p})"))
+                .unwrap_or_default()
+        ),
+        model_spec: default_model,
+        slug,
+    }
+}
+
+/// The presets, each as configured when it is, every other configured
+/// endpoint, then the row that adds one.
+fn decision_items(config: &ProvidersConfig, storage: &StateDir) -> Vec<ProviderItem> {
+    let active = read_active_decision_endpoint(storage);
+    let presets = DECISION_PRESETS.iter().map(|preset| DecisionDraft {
+        name: preset.name.into(),
+        display_name: preset.display_name.into(),
+        def: config
+            .decisions
+            .get(preset.name)
+            .cloned()
+            .unwrap_or_else(|| preset.def()),
+    });
+    let configured = config
+        .decisions
+        .iter()
+        .filter(|(name, _)| DecisionPreset::find(name).is_none())
+        .map(|(name, def)| DecisionDraft {
+            name: name.clone(),
+            display_name: name.clone(),
+            def: def.clone(),
+        });
+    presets
+        .chain(configured)
+        .map(|draft| ProviderItem {
+            slug: draft.name.clone(),
+            display_name: draft.display_name.clone(),
+            stored_auth: load_decision_credentials(storage, &draft.name)
+                .ok()
+                .flatten()
+                .map(|_| ProviderAuthKind::ApiKey),
+            has_env: draft
+                .def
+                .api_key_env
+                .as_deref()
+                .is_some_and(|variable| std::env::var_os(variable).is_some()),
+            configured: config.decisions.contains_key(&draft.name),
+            section: Some(DECISION_SECTION),
+            kind: ItemKind::Decision {
+                active: active.as_deref() == Some(draft.name.as_str()),
+                draft,
+            },
+        })
+        .chain([ProviderItem {
+            slug: String::new(),
+            display_name: CUSTOM_DECISION_LABEL.into(),
+            stored_auth: None,
+            has_env: false,
+            configured: false,
+            section: Some(DECISION_SECTION),
+            kind: ItemKind::CustomDecision,
+        }])
+        .collect()
+}
+
+/// Where to get a key, and what a blank one does.
+fn decision_key_hint(storage: Option<&StateDir>, draft: &DecisionDraft) -> String {
+    let stored = storage.is_some_and(|storage| {
+        load_decision_credentials(storage, &draft.name)
+            .ok()
+            .flatten()
+            .is_some()
+    });
+    let blank = match (&draft.def.api_key_env, stored) {
+        (_, true) => KEEPS_SAVED_KEY.to_owned(),
+        (Some(variable), false) => format!("Enter falls back to {variable}"),
+        (None, false) => SKIPS_KEY.to_owned(),
+    };
+    match DecisionPreset::find(&draft.name) {
+        Some(preset) => format!("Key from {}; {blank}", preset.key_url),
+        None => format!("Paste API key; {blank}"),
+    }
+}
+
+fn decision_url_hint(protocol: &DecisionProtocol) -> String {
+    format!(
+        "API base such as {}, not the full endpoint: Caudra appends {}",
+        protocol.preset().base_url,
+        protocol.endpoint_path()
+    )
+}
+
+fn decision_done_message(saved: &SavedDecisionEndpoint) -> String {
+    let endpoint = &saved.endpoint;
+    let mut message = format!(
+        "Decision endpoint: {} ({} · {})",
+        endpoint.name,
+        endpoint.protocol.as_str(),
+        endpoint.model
+    );
+    if !saved.active {
+        message.push_str(NOT_ACTIVE);
+    }
+    if endpoint.allow_http {
+        message.push('\n');
+        message.push_str(PLAIN_HTTP_WARNING);
+    }
+    message
+}
+
+/// The reason alone: the prompt already names the endpoint and the field.
+fn inline_error(error: DecisionsConfigError) -> String {
+    match error {
+        DecisionsConfigError::Invalid { message, .. }
+        | DecisionsConfigError::InvalidEndpoint { message, .. } => message.into(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::components::buffer_text;
     use crate::components::keybindings::key;
+    use caudra_config::config_version::CONFIG_VERSION_KEY;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+    use tempfile::TempDir;
     use test_case::test_case;
 
     const TEST_WIDTH: u16 = 80;
@@ -1064,7 +1567,7 @@ mod tests {
     /// The key step for a custom provider, which opens no login page.
     fn entering_key() -> LoginPicker {
         let mut picker = LoginPicker::new();
-        picker.transition(StepAction::GoEnterKey {
+        picker.transition(StepAction::GoEnterKey(KeyTarget::Provider(ProviderKey {
             slug: CUSTOM_SLUG.into(),
             plan: None,
             display_name: CUSTOM_SLUG.into(),
@@ -1074,7 +1577,7 @@ mod tests {
             }),
             builtin_url: None,
             api_key_optional: false,
-        });
+        })));
         picker
     }
 
@@ -1113,6 +1616,7 @@ mod tests {
                 has_env: false,
                 configured: false,
                 section: None,
+                kind: ItemKind::Chat,
             }],
             TITLE,
         );
@@ -1144,6 +1648,7 @@ mod tests {
                 has_env: false,
                 configured: false,
                 section: None,
+                kind: ItemKind::Chat,
             }],
             TITLE,
         );
@@ -1176,6 +1681,7 @@ mod tests {
                 has_env: false,
                 configured: false,
                 section: None,
+                kind: ItemKind::Chat,
             }],
             TITLE,
         );
@@ -1204,6 +1710,7 @@ mod tests {
             has_env: false,
             configured: false,
             section: None,
+            kind: ItemKind::Chat,
         };
         assert_eq!(item.detail(), Some(expected));
     }
@@ -1242,7 +1749,7 @@ mod tests {
 
         assert!(matches!(
             &picker.step,
-            Step::Done { message } if message.contains(&ProviderSlugError::Reserved.to_string())
+            Step::Done { message } if message.contains(&ProviderSlugError::Reserved { key: CONFIG_VERSION_KEY }.to_string())
         ));
     }
 
@@ -1273,5 +1780,212 @@ mod tests {
             &picker.step,
             Step::Done { message } if message == "complete"
         ));
+    }
+
+    const TUNNEL: &str = "tunnel";
+    const TYPED_TUNNEL: &str = " Tunnel ";
+    const REMOTE_HTTP_URL: &str = "http://100.64.0.2:8080/v1";
+    const LOOPBACK_HTTP_URL: &str = "http://127.0.0.1:8080/v1";
+    const REMOTE_HTTPS_URL: &str = "https://decisions.example.test/v1";
+    const FULL_ENDPOINT_URL: &str = "https://api.openai.com/v1/decisions";
+    const NOT_A_URL: &str = "decisions example";
+    const SHOWN_ERROR_CHARS: usize = 24;
+    const NOT_ON_URL: &str = "the flow left the base URL step";
+    const NO_ERROR: &str = "the URL was accepted";
+    const NOT_LISTED: &str = "the provider list did not open";
+
+    fn enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    }
+
+    fn saved_in_memory(
+        _storage: &StateDir,
+        name: &str,
+        def: DecisionEndpointDef,
+        _api_key: Option<&str>,
+    ) -> Result<SavedDecisionEndpoint, DecisionsError> {
+        Ok(SavedDecisionEndpoint {
+            endpoint: def.resolve(name)?,
+            added: true,
+            active: true,
+        })
+    }
+
+    /// The decision rows of an empty `providers.toml`, saving in memory.
+    fn decision_picker() -> (TempDir, LoginPicker) {
+        let tmp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let mut list = ListPicker::new();
+        list.open(decision_items(&ProvidersConfig::default(), &storage), TITLE);
+        let mut picker = LoginPicker::new();
+        picker.save_decision = saved_in_memory;
+        picker.storage = Some(storage);
+        picker.step = Step::PickProvider(list);
+        (tmp, picker)
+    }
+
+    /// A custom endpoint named and given the OpenAI protocol, at its URL.
+    fn at_custom_url() -> (TempDir, LoginPicker) {
+        let (tmp, mut picker) = decision_picker();
+        if let Step::PickProvider(list) = &mut picker.step {
+            list.select_item_by(|item| matches!(item.kind, ItemKind::CustomDecision));
+        }
+        picker.handle_key(enter());
+        assert!(matches!(picker.step, Step::DecisionName { .. }));
+        picker.handle_paste(TYPED_TUNNEL);
+        picker.handle_key(enter());
+        assert!(matches!(&picker.step, Step::DecisionProtocol { name, .. } if name == TUNNEL));
+        picker.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        picker.handle_key(enter());
+        assert!(matches!(
+            &picker.step,
+            Step::DecisionUrl { draft, .. } if draft.def.protocol == DecisionProtocol::OpenAI
+        ));
+        (tmp, picker)
+    }
+
+    fn configured(action: LoginPickerAction) -> Option<(String, bool)> {
+        match action {
+            LoginPickerAction::DecisionConfigured { name, activate } => Some((name, activate)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_preset_goes_straight_to_its_key() {
+        let (_tmp, mut picker) = decision_picker();
+        let preset = &DECISION_PRESETS[0];
+
+        picker.handle_key(enter());
+        assert!(matches!(
+            &picker.step,
+            Step::EnterKey { target: KeyTarget::Decision(draft), hint, .. }
+                if draft.name == preset.name && hint.contains(preset.key_url)
+        ));
+        picker.handle_paste(API_KEY);
+
+        assert_eq!(
+            configured(picker.handle_key(enter())),
+            Some((preset.name.to_owned(), true))
+        );
+        assert!(matches!(picker.step, Step::Done { .. }));
+    }
+
+    #[test_case(REMOTE_HTTP_URL, true; "remote_http_asks_first")]
+    #[test_case(LOOPBACK_HTTP_URL, false; "loopback_http")]
+    #[test_case(REMOTE_HTTPS_URL, false; "https")]
+    fn the_custom_flow_walks_every_step(url: &str, plain_http: bool) {
+        let (_tmp, mut picker) = at_custom_url();
+        picker.handle_paste(url);
+        picker.handle_key(enter());
+        if plain_http {
+            assert!(matches!(picker.step, Step::DecisionHttp { .. }));
+            picker.handle_key(enter());
+        }
+
+        let protocol = DecisionProtocol::OpenAI;
+        assert!(matches!(
+            &picker.step,
+            Step::DecisionModel { input, draft }
+                if input.text() == protocol.default_model()
+                    && draft.def.base_url == url
+                    && draft.def.allow_http == plain_http.then_some(true)
+        ));
+        picker.handle_key(enter());
+        assert!(matches!(
+            &picker.step,
+            Step::EnterKey { target: KeyTarget::Decision(draft), .. } if draft.name == TUNNEL
+        ));
+
+        assert_eq!(
+            configured(picker.handle_key(enter())),
+            Some((TUNNEL.to_owned(), true))
+        );
+        assert!(matches!(
+            &picker.step,
+            Step::Done { message } if message.contains(PLAIN_HTTP_WARNING) == plain_http
+        ));
+    }
+
+    #[test]
+    fn declining_plain_http_returns_to_the_url() {
+        let (_tmp, mut picker) = at_custom_url();
+        picker.handle_paste(REMOTE_HTTP_URL);
+        picker.handle_key(enter());
+
+        picker.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(matches!(
+            &picker.step,
+            Step::DecisionUrl { input, draft }
+                if input.text() == REMOTE_HTTP_URL && draft.def.allow_http.is_none()
+        ));
+    }
+
+    #[test_case(FULL_ENDPOINT_URL; "full_endpoint")]
+    #[test_case(NOT_A_URL; "not_a_url")]
+    fn a_bad_url_is_rejected_live(url: &str) {
+        let (_tmp, mut picker) = at_custom_url();
+        picker.handle_paste(url);
+        let Step::DecisionUrl { draft, .. } = &picker.step else {
+            panic!("{NOT_ON_URL}");
+        };
+        let error = draft.url_error(url).expect(NO_ERROR);
+
+        let (_, screen) = render(&mut picker);
+        let shown: String = error.chars().take(SHOWN_ERROR_CHARS).collect();
+        assert!(screen.contains(&shown), "{screen}");
+
+        picker.handle_key(enter());
+        assert!(
+            matches!(picker.step, Step::DecisionUrl { .. }),
+            "{NOT_ON_URL}"
+        );
+    }
+
+    #[test]
+    fn open_decisions_lands_on_the_first_endpoint() {
+        let tmp = TempDir::new().unwrap();
+        let mut picker = LoginPicker::new();
+
+        picker.open_decisions(StateDir::from_path(tmp.path().to_path_buf()));
+
+        let Step::PickProvider(list) = &picker.step else {
+            panic!("{NOT_LISTED}");
+        };
+        assert!(matches!(
+            list.selected_item().map(|item| &item.kind),
+            Some(ItemKind::Decision { draft, .. }) if draft.name == DECISION_PRESETS[0].name
+        ));
+    }
+
+    #[test_case(true, Some(ProviderAuthKind::ApiKey), true, Some(DETAIL_ACTIVE); "active_first")]
+    #[test_case(false, Some(ProviderAuthKind::ApiKey), true, Some(DETAIL_SAVED_KEY); "saved_key")]
+    #[test_case(false, None, true, Some(DETAIL_ENV); "env")]
+    #[test_case(false, None, false, Some(DETAIL_CONFIGURED); "configured")]
+    fn decision_rows_say_how_they_authenticate(
+        active: bool,
+        stored_auth: Option<ProviderAuthKind>,
+        has_env: bool,
+        expected: Option<&str>,
+    ) {
+        let preset = &DECISION_PRESETS[0];
+        let item = ProviderItem {
+            slug: preset.name.into(),
+            display_name: preset.display_name.into(),
+            stored_auth,
+            has_env,
+            configured: true,
+            section: Some(DECISION_SECTION),
+            kind: ItemKind::Decision {
+                draft: DecisionDraft {
+                    name: preset.name.into(),
+                    display_name: preset.display_name.into(),
+                    def: preset.def(),
+                },
+                active,
+            },
+        };
+        assert_eq!(item.detail(), expected);
     }
 }

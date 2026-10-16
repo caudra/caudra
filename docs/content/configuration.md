@@ -270,7 +270,7 @@ Some features are experimental and stay off until you turn them on. Each one has
 ```toml
 [experimental]
 workflows = true
-decision_engine = true
+automations = true
 ```
 
 | Key | Default | Turns on |
@@ -279,7 +279,6 @@ decision_engine = true
 | `sandboxes` | `false` | [Managed sandboxes](/docs/sandboxes/): `caudra sandbox`, `caudra auth sandbox`, `--sandbox`, `/sandbox`, and the workbench Transfer view. Sandboxes bring their own connection to Workcell and do not need `remote_workcell`. |
 | `remote_workcell` | `false` | Direct [remote Workcell](/docs/remote-workspaces/) connections: the `--workcell-*` flags and `caudra auth workcell`. |
 | `lua_plugins` | `false` | Every use of Lua: [plugins](/docs/plugins/), the [Lua API](/docs/lua-api/), global and project `init.lua`, and the `caudra-plugin-dev` skill. `--no-plugins` still turns Lua off for one run. |
-| `decision_engine` | `false` | The [decision engine](#decisions), [Auto mode](/docs/permissions/#auto-mode), `caudra decisions`, workflow [`decide()` calls](/docs/workflows/#typed-decisions), and the [`decide()` and `rerank()` helpers](/docs/code/#decisions-and-reranking) of the `code` tool. |
 | `cross_session_messaging` | `false` | Local [cross-session messaging](/docs/messaging/): the `list_sessions`, `send_message`, `publish_message`, `read_topic`, and `work_assignment` tools, `/peers`, `/messages`, `/topics`, `/groups`, `caudra message`, live session inboxes, consumer groups, and the message history. Both processes must opt in. |
 | `automations` | `false` | [Automations](/docs/automations/): scripts that act on session events when their conditions hold, within the limits in [`[automations]`](#automations), and the `caudra-automation-dev` skill. Messaging triggers and actions also need `cross_session_messaging`, and workflow triggers and actions also need `workflows`. |
 | `autopilot` | `false` | [Autopilot](/docs/autopilot/): keep a session moving toward its goal unattended, answering permission prompts and questions within the limits in [`[autopilot]`](#autopilot). |
@@ -291,8 +290,6 @@ Only the global file may hold `[experimental]`. Caudra rejects a project `.caudr
 Caudra reads the switches once at startup and keeps them until it exits. `/reload`, session switches, and ACP sessions all use the startup values. When the table changes on disk, Caudra shows a notice asking for a restart.
 
 A feature that is off is hidden and does no work. Its tools, commands, shortcuts, help entries, and status chips are gone, and startup skips it. Asking for it directly, such as typing its command or passing its flag, fails with a message that names the switch. A saved session attached to a sandbox or a remote workspace does not resume while its switch is off, and it never falls back to local execution. Turning a feature off keeps its data and leaves external resources alone, so a running sandbox keeps running until you stop it.
-
-With `decision_engine` off, `always_auto = true` and sessions saved in Auto start in Ask. Caudra keeps the saved choice, so Auto returns once the switch is on again.
 
 ## Migrating from Lua settings
 
@@ -329,7 +326,7 @@ To keep using `init.lua`, set `lua_plugins = true` under `[experimental]`. Its `
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `always_yolo` | bool | `false` | Start every session with YOLO mode (skip permission prompts, deny rules still apply); global config only |
-| `always_auto` | bool | `false` | Start every session with Auto permission mode (preserve required prompts and screen unmatched calls); global config only. Needs `experimental.decision_engine`, otherwise sessions start in Ask |
+| `always_auto` | bool | `false` | Start every session with Auto permission mode (preserve required prompts and screen unmatched calls); global config only. Screening runs only while a decision endpoint is active |
 | `always_fast` | bool | `false` | Start every session with fast mode, on the models that sell a fast tier (ignored otherwise) |
 | `always_thinking` | bool \| string | unset | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget) |
 
@@ -355,7 +352,7 @@ To keep using `init.lua`, set `lua_plugins = true` under `[experimental]`. Its `
 | `show_thinking` | bool | `true` | - | - | Show full model reasoning live and persisted. Turn this off to start every reasoning block collapsed behind a Thinking or Thought header that can be clicked to expand |
 | `thinking_lines` | u32 | `10` | - | - | Rows of body an open reasoning block draws. The window follows the reasoning while it streams and pauses when scrolled up, and a footer reports how much sits above and below. Click inside a window to give it the wheel, which passes back to the transcript at either edge, and drag the bar in its last column to move it directly. Click the footer to follow again. A finished block rests on its last rows until you move it. `0` draws every block whole |
 | `show_reminders` | bool | `true` | - | - | Show the messages Caudra writes into the conversation on your behalf: standing reminders, goal check-ins, nudges, and continuations. Each is one dim row that expands on click to the exact text the model was sent. Turn this off to keep the transcript to the conversation alone |
-| `show_decisions` | bool | `true` | - | - | Show what the experimental decision engine changed: one row where it reordered, pruned or pointed out results, suggested a skill or model, skipped a goal check, or flagged a call, and one where it failed and the default applied. A dim `shadow` row shows what a feature in shadow mode would have done. Each row expands on click to the candidates and scores behind it. The model never sees these rows |
+| `show_decisions` | bool | `true` | - | - | Show what the decision engine changed: one row where it reordered, pruned or pointed out results, suggested a skill or model, skipped a goal check, or flagged a call, and one where it failed and the default applied. A dim `shadow` row shows what a feature in shadow mode would have done. Each row expands on click to the candidates and scores behind it. The model never sees these rows |
 | `clock_format` | String | `system` | - | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
 | `update_check` | bool | `true` | `CAUDRA_ENABLE_UPDATE_CHECK` | - | Check GitHub releases in the background at interactive startup and show a banner above the prompt when a newer version is available. Uses a shared 24-hour cache and never installs automatically. Set false to disable |
 | `update_channel` | string | `auto` | - | - | Release channel: `auto` follows stable from a stable build and preview from a prerelease, including graduation to stable. `stable` excludes prereleases. `preview` includes prereleases and stable releases |
@@ -710,18 +707,12 @@ Inside a Herdr pane, `auto` asks Herdr to create and remove worktrees, so each o
 
 ### `decisions`
 
-Configure the optional typed decision engine in the `[decisions]` table. The engine is experimental and needs `decision_engine = true` under [`[experimental]`](#experimental-features). Without that switch Caudra still validates this table and starts no engine. It then sends no decision requests, reads no engine credentials, and leaves decision logs and shell duration history untouched. No base URL, passive feature, or decision logging is enabled by default. Explicit workflow [`decide()` calls](/docs/workflows/#typed-decisions) and the MCP [`decide()` and `rerank()` helpers](/docs/mcp/#decisions-and-reranking) need a base URL but do not need a passive feature enabled. Shell duration history can work without a base URL.
+The `[decisions]` table holds the settings every decision endpoint shares: deadlines, logging, features, and thresholds. The endpoints themselves are `[decisions.<name>]` tables in the global `providers.toml`, and the engine runs only while one of them is active. `caudra auth login --decision` adds one and makes it active. See [Decision endpoints](/docs/providers/#decision-endpoints). With no active endpoint, Caudra still validates this table. It starts no engine, sends no decision requests, reads no engine credentials, and leaves decision logs and shell duration history untouched. No passive feature or decision logging is enabled by default. Explicit workflow [`decide()` calls](/docs/workflows/#typed-decisions) and the MCP [`decide()` and `rerank()` helpers](/docs/mcp/#decisions-and-reranking) need an active endpoint but no passive feature. Shell duration history works without an endpoint.
 
-Connection settings and thresholds are global-only. Projects may set individual features to `"off"`, set `log = false`, or keep or shorten inherited log retention. Other project overrides are errors, even when they repeat a global value. Disabling globally required Auto screening or its active content screening restores prompting for eligible Auto calls.
+These settings are global-only. Projects may set individual features to `"off"`, set `log = false`, or keep or shorten inherited log retention. Other project overrides are errors, even when they repeat a global value. Disabling globally required Auto screening or its active content screening restores prompting for eligible Auto calls. `base_url`, `protocol`, `model`, `api_key_env`, `allow_remote`, and `allow_http` are not accepted here. The error for each one shows the `providers.toml` table that replaces it.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `protocol` | string | `typesafe` | Global-only decision wire protocol: `typesafe` or `openai`. Never inferred from the URL, model, or environment. Selecting a protocol does not enable decisions. |
-| `base_url` | string | unset | Global-only decision API base URL. TypeSafe uses a root such as `https://api.typesafe.ai` and appends `/v1/systemone`; OpenAI uses a versioned base such as `https://api.openai.com/v1` and appends `/decisions`. Path prefixes are preserved; full endpoints are rejected. Only the selected protocol's `TYPESAFE_BASE_URL` or `OPENAI_BASE_URL`, from the process or global environment, replaces an explicitly configured base. Environment alone never enables decisions. HTTPS required except for numeric loopback HTTP or explicit `allow_http` consent. No credentials, query, fragment, whitespace, or control characters. |
-| `model` | string | `jev-latest` for typesafe; `gpt-6-luna` for openai | Decision model identifier, nonblank and without control characters. |
-| `api_key_env` | string | `TYPESAFE_API_KEY` for typesafe; `OPENAI_API_KEY` for openai | Environment variable containing the optional credential, never the credential itself. Project environment values are excluded. |
-| `allow_remote` | boolean | `false` | Explicit global consent to send decision context to a non-loopback endpoint. |
-| `allow_http` | boolean | `false` | Global-only opt-in for non-loopback HTTP. Also requires `allow_remote = true`. Use only with transport protection you control, such as a trusted encrypted tunnel. |
 | `timeout_ms` | integer | `800` | Positive decision-request deadline in milliseconds, separate from shell execution timeouts. Tool search and every reranking feature except memory recall use `rerank_timeout_ms` instead. |
 | `rerank_timeout_ms` | integer | `2000` | Positive deadline in milliseconds for tool search and the reranking features, which judge at most 16 candidates per request and send their requests concurrently. History search lets each request wait one budget per request in its pool, so an engine that answers one request at a time still gets through its pool. Memory recall keeps `timeout_ms` because it delays the start of a turn. A `decide()` or `rerank()` call from a workflow or a `code` snippet may ask for up to the larger of the two. |
 | `log` | boolean | `false` | Retain bounded decision records in the local `caudra.db`. |
@@ -729,41 +720,11 @@ Connection settings and thresholds are global-only. Projects may set individual 
 | `features` | table | `{}` | Per-feature modes below. |
 | `thresholds` | table | `{}` | Probability thresholds, all finite and within 0–1 inclusive. |
 
-`protocol = "typesafe"` is the default. It appends `/v1/systemone` to the root base URL. A path prefix stays in place, so a server mounted under `/typesafe` uses `base_url = "http://127.0.0.1:8080/typesafe"` and receives requests at `/typesafe/v1/systemone`. Leave `/v1/systemone` out of `base_url`. The default model is `jev-latest` and the default key variable is `TYPESAFE_API_KEY`. The hosted API needs explicit remote consent:
-
-```toml
-[decisions]
-base_url = "https://api.typesafe.ai"
-allow_remote = true
-```
-
-`protocol = "openai"` appends `/decisions` to a versioned base URL. Use `https://api.openai.com/v1` for the hosted OpenAI Decisions API. The default model is `gpt-6-luna` and the default key variable is `OPENAI_API_KEY`. Explicit `model` and `api_key_env` values override these protocol-specific defaults. Hosted OpenAI also needs remote consent:
-
-```toml
-[decisions]
-protocol = "openai"
-base_url = "https://api.openai.com/v1"
-allow_remote = true
-```
-
-For a local ninfer server, use the OpenAI protocol with the actual served model name. `systemone-decision-v7` is not a Luna alias:
-
-```toml
-[decisions]
-protocol = "openai"
-base_url = "http://127.0.0.1:8080/v1"
-model = "systemone-decision-v7"
-```
-
-`TYPESAFE_BASE_URL` for `typesafe`, or `OPENAI_BASE_URL` for `openai`, replaces the whole configured base URL, path prefix included, and passes the same URL and transport opt-in checks. Only the selected protocol's variable applies, and only when `base_url` is set. A variable alone never activates the engine. Overrides and API keys come from the global environment, not project `.env` files. Neither protocol implies remote or HTTP consent.
-
 Both protocols send text only. OpenAI maps native boolean questions to predicates, retaining the true and false criteria in the instruction text. Answers normalize to the same typed results, so workflows and MCP snippets read the same answers under either protocol. A refusal fails the whole evaluation without applying partial answers.
 
 Caudra retries HTTP 408, 429, and 5xx responses at most twice. Each retry waits for the delay the server requests in `retry-after-ms` or `Retry-After`, or else for an exponential backoff that starts near half a second. No retry waits past the request deadline, so under the default 800 ms `timeout_ms` most retries need a short server-requested delay. Connection failures, 401, 422, and other client errors fail at once.
 
 Tool search and the [reranking features](#reranking) judge up to 16 candidates in one request and use `rerank_timeout_ms` (default 2000 ms) instead. Memory recall keeps `timeout_ms` because it delays the start of a turn. A `decide()` or `rerank()` call from a workflow or an MCP snippet may ask for up to the larger of the two.
-
-Requests ignore ambient proxies and do not follow redirects. `localhost` is a DNS name, not numeric loopback for this policy. Private and CGNAT addresses receive no automatic HTTP exemption. These settings do not change Workcell transport policy.
 
 Redaction is best effort. Decision context can include commands, task text, tool output, and candidate descriptions. Review what you send and any exports before sharing them. See [decision advice and logging](/docs/permissions/#decision-engine-advice).
 

@@ -11,7 +11,7 @@ use std::path::Path;
 use arc_swap::ArcSwapOption;
 use caudra_agent::decisions::{DecisionFeature, DecisionStatus};
 use caudra_config::ClockFormat;
-use caudra_config::decisions::DecisionsConfig;
+use caudra_config::decisions::{DecisionKeySource, DecisionsConfig};
 use caudra_grab::grab_scope;
 use caudra_storage::decision_log::{DecisionStats, LoggedDecision};
 use caudra_storage::sessions::PermissionMode;
@@ -210,7 +210,7 @@ pub struct DecisionsModalContext<'a> {
     pub status: &'a DecisionStatus,
     pub tainted: bool,
     pub mode: &'a PermissionMode,
-    pub api_key_set: bool,
+    pub key_source: Option<DecisionKeySource>,
     pub log_path: &'a Path,
     pub clock: ClockFormat,
 }
@@ -1001,7 +1001,9 @@ fn plain_text(lines: &[Line<'static>]) -> String {
 mod tests {
     use std::sync::Arc;
 
-    use caudra_config::decisions::{DecisionFeatures, DecisionProtocol, FeatureMode};
+    use caudra_config::decisions::{
+        DecisionEndpoint, DecisionFeatures, DecisionProtocol, FeatureMode,
+    };
     use caudra_storage::decision_log::{
         DecisionEffect, DecisionLabel, DecisionRecord, EndpointKind,
     };
@@ -1013,8 +1015,8 @@ mod tests {
     use test_case::test_case;
 
     use super::lines::{
-        ACTIVITY_FOOTNOTE, ENGINE_CONFIGURED, ERROR_MARK, JSON_SECTIONS, LABEL_MARK, LOGGING_HINT,
-        NO_DECISIONS, NO_SESSION_DECISIONS, READING, recent_row,
+        ACTIVITY_FOOTNOTE, API_KEY_FIELD, ENGINE_CONFIGURED, ENGINE_OFF, ERROR_MARK, JSON_SECTIONS,
+        LABEL_MARK, LOGGING_HINT, NO_DECISIONS, NO_SESSION_DECISIONS, READING, recent_row,
     };
     use super::*;
     use crate::components::{buffer_text, escape_terminal_controls, key as press};
@@ -1063,14 +1065,21 @@ mod tests {
         config: DecisionsConfig,
         status: DecisionStatus,
         mode: PermissionMode,
+        key_source: Option<DecisionKeySource>,
     }
 
     impl Fixture {
         fn new(log: bool) -> Self {
             Self {
                 config: DecisionsConfig {
-                    base_url: Some(BASE_URL.parse().unwrap()),
-                    model: MODEL.into(),
+                    endpoint: Some(DecisionEndpoint {
+                        model: MODEL.into(),
+                        ..DecisionEndpoint::new(
+                            DecisionProtocol::TypeSafe.as_str(),
+                            DecisionProtocol::TypeSafe,
+                            BASE_URL.parse().unwrap(),
+                        )
+                    }),
                     log,
                     features: DecisionFeatures {
                         permission_advice: FeatureMode::Advise,
@@ -1080,6 +1089,7 @@ mod tests {
                 },
                 status: DecisionStatus::default(),
                 mode: PermissionMode::Ask,
+                key_source: None,
             }
         }
 
@@ -1089,7 +1099,7 @@ mod tests {
                 status: &self.status,
                 tainted: false,
                 mode: &self.mode,
-                api_key_set: false,
+                key_source: self.key_source,
                 log_path: Path::new(LOG_PATH),
                 clock: ClockFormat::default(),
             }
@@ -1296,11 +1306,45 @@ mod tests {
         assert!(overview.contains(MODEL), "{overview}");
     }
 
+    #[test]
+    fn with_no_endpoint_the_overview_says_how_to_add_one() {
+        let mut fixture = Fixture::new(true);
+        fixture.config.endpoint = None;
+        let mut modal = opened(DecisionsFetchState::Loading);
+
+        let screen = draw(&mut modal, &fixture, WIDE, TALL);
+
+        assert!(screen.contains(ENGINE_OFF), "{screen}");
+    }
+
+    #[test_case(Some(DecisionKeySource::Stored); "saved")]
+    #[test_case(Some(DecisionKeySource::Environment); "env")]
+    #[test_case(None; "none")]
+    fn the_overview_names_the_endpoint_and_its_key_source(key_source: Option<DecisionKeySource>) {
+        let mut fixture = Fixture::new(true);
+        fixture.key_source = key_source;
+        let mut modal = opened(DecisionsFetchState::Loading);
+
+        let screen = draw(&mut modal, &fixture, WIDE, TALL);
+
+        let name = &fixture.config.endpoint.as_ref().unwrap().name;
+        assert!(screen.contains(name.as_str()), "{screen}");
+        assert!(
+            screen.lines().any(|line| {
+                line.contains(API_KEY_FIELD)
+                    && line
+                        .split_whitespace()
+                        .any(|field| field == DecisionKeySource::label(key_source))
+            }),
+            "{screen}"
+        );
+    }
+
     #[test_case(DecisionProtocol::TypeSafe, "typesafe"; "typesafe")]
     #[test_case(DecisionProtocol::OpenAI, "openai"; "openai")]
     fn the_overview_shows_the_protocol(protocol: DecisionProtocol, expected: &str) {
         let mut fixture = Fixture::new(true);
-        fixture.config.protocol = protocol;
+        fixture.config.endpoint.as_mut().unwrap().protocol = protocol;
         let mut modal = opened(DecisionsFetchState::Loading);
 
         let screen = draw(&mut modal, &fixture, WIDE, TALL);
@@ -1335,8 +1379,9 @@ mod tests {
         origin: &str,
     ) {
         let mut fixture = Fixture::new(true);
-        fixture.config.base_url = Some(base_url.parse().unwrap());
-        fixture.config.model = CONTROL_MODEL.into();
+        let endpoint = fixture.config.endpoint.as_mut().unwrap();
+        endpoint.base_url = base_url.parse().unwrap();
+        endpoint.model = CONTROL_MODEL.into();
         let mut modal = opened(DecisionsFetchState::Loading);
 
         let screen = draw(&mut modal, &fixture, WIDE, TALL);

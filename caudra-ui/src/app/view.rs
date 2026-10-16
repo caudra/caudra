@@ -9,7 +9,9 @@ use crate::components::keybindings;
 use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
 use crate::components::split_layout::{MIN_CHAT_ROWS, SplitLayout, carve};
-use crate::components::status_bar::{self, StatusBarContext, UsageStats, workflow_chip};
+use crate::components::status_bar::{
+    self, DecisionsChip, StatusBarContext, UsageStats, workflow_chip,
+};
 use crate::components::tools_modal::ToolsModalContext;
 use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
@@ -778,6 +780,7 @@ impl App {
             });
         let activity = self.task_activity();
         let autopilot = self.autopilot_chip();
+        let decisions = self.permissions.decisions();
         let hover_hint = (!self.has_modal_overlay())
             .then(|| chat.hovered_hint())
             .flatten();
@@ -823,8 +826,11 @@ impl App {
             },
             workflows: workflow_chip(self.workflow.runs()),
             permission_mode: self.permissions.mode(),
-            decisions_offline: self.permissions.decisions().is_some_and(|decisions| {
-                decisions.config().base_url.is_some() && decisions.status().reachable == Some(false)
+            decisions: decisions.as_ref().and_then(|decisions| {
+                decisions.endpoint().map(|endpoint| DecisionsChip {
+                    endpoint: &endpoint.name,
+                    offline: decisions.status().reachable == Some(false),
+                })
             }),
             waiting_questions: self.waiting_question_count(),
             config_problems: &config_problems,

@@ -349,6 +349,20 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         features: &[],
     },
     BuiltinCommand {
+        name: "/decision-model",
+        description: "Pick the decision endpoint that screens tool calls",
+        max_args: 0,
+        scope: ChatScope::MainOnly,
+        features: &[],
+    },
+    BuiltinCommand {
+        name: "/decision-next",
+        description: "Switch to the next decision endpoint",
+        max_args: 0,
+        scope: ChatScope::MainOnly,
+        features: &[],
+    },
+    BuiltinCommand {
         name: "/system-prompt",
         description: "Inspect the system prompt and switch profile",
         max_args: 0,
@@ -486,14 +500,14 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Toggle Auto permissions (skip unmatched prompts, keep safeguards)",
         max_args: 0,
         scope: ChatScope::Any,
-        features: &[Feature::DecisionEngine],
+        features: &[],
     },
     BuiltinCommand {
         name: "/decisions",
         description: "Inspect decision engine status, features, activity, and recent decisions",
         max_args: 0,
         scope: ChatScope::Any,
-        features: &[Feature::DecisionEngine],
+        features: &[],
     },
     BuiltinCommand {
         name: "/yolo",
@@ -1523,8 +1537,6 @@ mod tests {
     #[test_case("/automations", Feature::Automations; "automations")]
     #[test_case("/autopilot", Feature::Autopilot; "autopilot")]
     #[test_case("/sandbox", Feature::Sandboxes; "sandbox")]
-    #[test_case("/decisions", Feature::DecisionEngine; "decisions")]
-    #[test_case("/auto", Feature::DecisionEngine; "auto")]
     fn a_command_is_absent_until_its_experiment_is_on(name: &str, feature: Feature) {
         let mut off = synced_with(name, FeatureFlags::all().without(feature));
         assert!(off.rows(false).iter().all(|row| row.name != name));
@@ -1552,15 +1564,18 @@ mod tests {
         synced_with(REMOTE, features).resolve(REMOTE).is_some()
     }
 
-    #[test]
-    fn ordinary_commands_need_no_experiment() {
-        const MEMORY: &str = "/memory";
-        assert_eq!(disabled_feature(MEMORY, FeatureFlags::NONE), None);
+    #[test_case("/memory"; "memory")]
+    #[test_case("/auto"; "auto")]
+    #[test_case("/decisions"; "decisions")]
+    #[test_case("/decision-model"; "decision_model")]
+    #[test_case("/decision-next"; "decision_next")]
+    fn ordinary_commands_need_no_experiment(name: &str) {
+        assert_eq!(disabled_feature(name, FeatureFlags::NONE), None);
         assert_eq!(
-            synced_with(MEMORY, FeatureFlags::NONE)
-                .resolve(MEMORY)
+            synced_with(name, FeatureFlags::NONE)
+                .resolve(name)
                 .as_deref(),
-            Some(MEMORY)
+            Some(name)
         );
     }
 
@@ -2018,7 +2033,7 @@ mod tests {
 
     #[test]
     fn filter_mcp_prompt_by_substring() {
-        let p = synced_with_prompts("/code");
+        let p = synced_with_prompts("/code-r");
         assert!(p.is_active());
         assert_eq!(p.filtered.len(), 1);
         assert!(matches!(

@@ -4693,6 +4693,7 @@ impl<'t> EventLoop<'t> {
                 };
                 self.sessions[idx].app.flash(message);
             }
+            Action::SetDecisionEndpoint(name) => self.set_decision_endpoint(idx, name.as_deref()),
             Action::Compact => {
                 let rt = &mut self.sessions[idx];
                 rt.reset_run_notifications();
@@ -4795,6 +4796,23 @@ impl<'t> EventLoop<'t> {
             Action::ForceRefreshUsage => self.force_refresh_usage(),
             Action::RefreshStorage => self.refresh_storage(),
             Action::ManualExit => self.sessions[idx].notifications.on_manual_exit(),
+        }
+    }
+
+    /// Every open session screens with the new engine at once, and the base
+    /// manager carries it to each session forked later.
+    fn set_decision_endpoint(&mut self, idx: usize, name: Option<&str>) {
+        let Some(decisions) = self.sessions[idx]
+            .app
+            .switch_decision_endpoint(name, ProvidersConfig::load)
+        else {
+            return;
+        };
+        self.ctx.permissions.set_decisions(Some(decisions.clone()));
+        for (index, runtime) in self.sessions.iter().enumerate() {
+            if index != idx {
+                runtime.app.adopt_decisions(&decisions);
+            }
         }
     }
 

@@ -2025,6 +2025,7 @@ fn report(done: &ToolDoneEvent, name: &str, source: &str, input: &Value, took: D
 
 #[cfg(test)]
 mod tests {
+    use caudra_config::decisions::{DecisionEndpoint, DecisionProtocol};
     use std::collections::{BTreeSet, HashMap};
     use std::path::{Path, PathBuf};
     use std::slice;
@@ -2338,7 +2339,6 @@ mod tests {
                         scope: None,
                         effect: permission,
                     }],
-                    decision_engine: true,
                     ..Default::default()
                 },
                 root.path().to_owned(),
@@ -2969,7 +2969,11 @@ mod tests {
                     .unwrap();
             }
             let mut config = DecisionsConfig {
-                base_url: Some(CONTENT_BASE_URL.parse().unwrap()),
+                endpoint: Some(DecisionEndpoint::new(
+                    DecisionProtocol::TypeSafe.as_str(),
+                    DecisionProtocol::TypeSafe,
+                    CONTENT_BASE_URL.parse().unwrap(),
+                )),
                 ..Default::default()
             };
             config.features.content_screening = FeatureMode::Advise;
@@ -3044,7 +3048,11 @@ mod tests {
         smol::block_on(async {
             let fixture = ShellDispatchFixture::named(None, Effect::Allow, WEB_FETCH).await;
             let mut config = DecisionsConfig {
-                base_url: Some(CONTENT_BASE_URL.parse().unwrap()),
+                endpoint: Some(DecisionEndpoint::new(
+                    DecisionProtocol::TypeSafe.as_str(),
+                    DecisionProtocol::TypeSafe,
+                    CONTENT_BASE_URL.parse().unwrap(),
+                )),
                 ..Default::default()
             };
             config.features.content_screening = mode.clone();
@@ -3169,7 +3177,11 @@ mod tests {
                 .flatten();
             let calls = Arc::new(AtomicUsize::new(0));
             let mut config = DecisionsConfig {
-                base_url: Some(CONTENT_BASE_URL.parse().unwrap()),
+                endpoint: Some(DecisionEndpoint::new(
+                    DecisionProtocol::TypeSafe.as_str(),
+                    DecisionProtocol::TypeSafe,
+                    CONTENT_BASE_URL.parse().unwrap(),
+                )),
                 ..Default::default()
             };
             config.features.output_pointers = mode;
@@ -4897,7 +4909,6 @@ mod tests {
             let root = TempDir::new().unwrap();
             let permissions = Arc::new(PermissionManager::new_nonpersistent(
                 PermissionsConfig {
-                    decision_engine: true,
                     ..Default::default()
                 },
                 root.path().to_owned(),

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -6,20 +6,23 @@ use std::process;
 use std::str::FromStr;
 use std::sync::{Mutex, PoisonError};
 
+use serde::ser::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use toml::de::Error as TomlError;
+use toml_edit::{DocumentMut, Item, Table};
 use tracing::debug;
 
 use caudra_storage::paths;
 use caudra_storage::thinking::ReasoningOptions;
 
 use crate::config_version::{CONFIG_VERSION_KEY, ConfigVersion};
+use crate::decisions::{DECISIONS_TABLE, DecisionEndpointDef};
 use crate::interpolation::{self, Lookup};
 use crate::own_writes;
 use crate::{ConfigField, ConfigValue};
 
-pub(crate) const PROVIDERS_FILE: &str = "providers.toml";
+pub const PROVIDERS_FILE: &str = "providers.toml";
 pub(crate) const PROVIDERS_VERSION: u32 = 1;
 const BAD_CONFIG_EXIT_CODE: i32 = 2;
 /// The only built-in that reads `enable_free_models`.
@@ -553,21 +556,22 @@ pub fn slugify(name: &str) -> String {
 pub enum ProviderSlugError {
     #[error("provider name cannot be empty")]
     Empty,
-    #[error(
-        "`{key}` is reserved in {file}; choose another provider name",
-        key = CONFIG_VERSION_KEY,
-        file = PROVIDERS_FILE
-    )]
-    Reserved,
+    #[error("`{key}` is reserved in {file}; choose another provider name", file = PROVIDERS_FILE)]
+    Reserved { key: &'static str },
 }
 
 /// Slug for a new custom provider. Top-level keys of `providers.toml` are
-/// slugs, so the file's own `version` key cannot be one.
+/// slugs, so the file's own `version` and `decisions` keys cannot be one.
 pub fn custom_provider_slug(name: &str) -> Result<String, ProviderSlugError> {
     let slug = slugify(name);
     match slug.as_str() {
         "" => Err(ProviderSlugError::Empty),
-        CONFIG_VERSION_KEY => Err(ProviderSlugError::Reserved),
+        CONFIG_VERSION_KEY => Err(ProviderSlugError::Reserved {
+            key: CONFIG_VERSION_KEY,
+        }),
+        DECISIONS_TABLE => Err(ProviderSlugError::Reserved {
+            key: DECISIONS_TABLE,
+        }),
         _ => Ok(slug),
     }
 }
@@ -909,6 +913,9 @@ pub struct ProvidersConfig {
     /// Named ahead of the flattened map, so the key never reads as a slug.
     #[serde(default)]
     version: ConfigVersion<PROVIDERS_VERSION>,
+    /// Named decision endpoints, `[decisions.<name>]`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub decisions: BTreeMap<String, DecisionEndpointDef>,
     #[serde(flatten)]
     pub providers: HashMap<String, ProviderDef>,
 }
@@ -1000,15 +1007,35 @@ pub enum ProvidersFileError {
     Invalid {
         path: PathBuf,
         #[source]
-        source: Box<TomlError>,
+        source: Box<ProvidersParseError>,
     },
+    #[error("write {}: {source}", path.display())]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("render {PROVIDERS_FILE}: {0}")]
+    Render(#[from] toml::ser::Error),
 }
 
-/// `providers.toml` as written, `{env:NAME}` references included, for the
-/// commands that change it. Saving what [`ProvidersConfig::load`] returned
-/// would write every expanded secret into the file.
+#[derive(Debug, Error)]
+pub enum ProvidersParseError {
+    #[error(transparent)]
+    Config(#[from] TomlError),
+    #[error(transparent)]
+    Document(#[from] toml_edit::TomlError),
+}
+
+/// `providers.toml` as written, `{env:NAME}` references and comments included,
+/// for the commands that change it. Saving what [`ProvidersConfig::load`]
+/// returned would write every expanded secret into the file. Each edit
+/// replaces only the table it names.
 #[derive(Debug, Default)]
-pub struct ProvidersFile(ProvidersConfig);
+pub struct ProvidersFile {
+    document: DocumentMut,
+    config: ProvidersConfig,
+}
 
 impl ProvidersFile {
     /// A file that cannot be read is an error rather than an empty one, since
@@ -1025,39 +1052,121 @@ impl ProvidersFile {
         }
     }
 
-    pub fn save(&self) -> Result<(), io::Error> {
+    pub fn save(&self) -> Result<(), ProvidersFileError> {
         let path = providers_file_path(paths::config_dir());
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+        let content = self.render();
+        let written = path
+            .parent()
+            .map_or(Ok(()), fs::create_dir_all)
+            .and_then(|()| fs::write(&path, &content));
+        if let Err(source) = written {
+            return Err(ProvidersFileError::Write { path, source });
         }
-        let content = self
-            .render()
-            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-        fs::write(&path, &content)?;
         own_writes::record(&path, content.as_bytes());
         debug!(path = %path.display(), "saved providers config");
         Ok(())
     }
 
-    fn parse(text: &str) -> Result<Self, TomlError> {
-        toml::from_str(text).map(Self)
+    fn parse(text: &str) -> Result<Self, ProvidersParseError> {
+        Ok(Self {
+            config: toml::from_str(text)?,
+            document: text.parse()?,
+        })
     }
 
-    fn render(&self) -> Result<String, toml::ser::Error> {
-        toml::to_string_pretty(&self.0)
+    fn render(&self) -> String {
+        self.document.to_string()
     }
 
     pub fn get(&self, slug: &str) -> Option<&ProviderDef> {
-        self.0.get(slug)
+        self.config.get(slug)
     }
 
-    pub fn upsert(&mut self, slug: String, def: ProviderDef) {
-        self.0.upsert(slug, def);
+    pub fn upsert(&mut self, slug: String, def: ProviderDef) -> Result<(), ProvidersFileError> {
+        replace_table(self.document.as_table_mut(), &slug, to_table(&def)?);
+        self.config.upsert(slug, def);
+        Ok(())
     }
 
     pub fn remove(&mut self, slug: &str) -> bool {
-        self.0.providers.remove(slug).is_some()
+        self.document.remove(slug);
+        self.config.providers.remove(slug).is_some()
     }
+
+    pub fn decision_endpoints(&self) -> &BTreeMap<String, DecisionEndpointDef> {
+        &self.config.decisions
+    }
+
+    pub fn upsert_decision_endpoint(
+        &mut self,
+        name: &str,
+        def: &DecisionEndpointDef,
+    ) -> Result<(), ProvidersFileError> {
+        let table = to_table(def)?;
+        let decisions = self
+            .document
+            .entry(DECISIONS_TABLE)
+            .or_insert_with(|| {
+                let mut table = Table::new();
+                table.set_implicit(true);
+                Item::Table(table)
+            })
+            .as_table_mut()
+            .ok_or_else(|| {
+                toml::ser::Error::custom(format!("`{DECISIONS_TABLE}` must be a table"))
+            })?;
+        replace_table(decisions, name, table);
+        self.config.decisions.insert(name.into(), def.clone());
+        Ok(())
+    }
+
+    pub fn remove_decision_endpoint(&mut self, name: &str) -> bool {
+        if let Some(decisions) = self
+            .document
+            .get_mut(DECISIONS_TABLE)
+            .and_then(Item::as_table_mut)
+        {
+            decisions.remove(name);
+            if decisions.is_empty() {
+                self.document.remove(DECISIONS_TABLE);
+            }
+        }
+        self.config.decisions.remove(name).is_some()
+    }
+}
+
+fn to_table(value: &impl Serialize) -> Result<Table, toml::ser::Error> {
+    let rendered = toml::to_string(value)?;
+    let document: DocumentMut = rendered
+        .parse()
+        .map_err(|error: toml_edit::TomlError| toml::ser::Error::custom(error.to_string()))?;
+    let mut table = document.into_table();
+    clear_positions(&mut table);
+    table.set_implicit(false);
+    Ok(table)
+}
+
+/// Positions come from the scratch document, so they would interleave the
+/// new tables with the edited file's; without them each follows its parent.
+fn clear_positions(table: &mut Table) {
+    table.set_position(None);
+    for (_, item) in table.iter_mut() {
+        match item {
+            Item::Table(table) => clear_positions(table),
+            Item::ArrayOfTables(array) => array.iter_mut().for_each(clear_positions),
+            _ => {}
+        }
+    }
+}
+
+/// Replaces `key` in `parent`, keeping a replaced table's place and the
+/// comments above its header.
+fn replace_table(parent: &mut Table, key: &str, mut table: Table) {
+    if let Some(Item::Table(existing)) = parent.get(key) {
+        table.set_position(existing.position());
+        *table.decor_mut() = existing.decor().clone();
+    }
+    parent.insert(key, Item::Table(table));
 }
 
 fn providers_file_path(directory: Result<PathBuf, io::Error>) -> PathBuf {
@@ -1218,6 +1327,7 @@ pub fn resolve_login_url(slug: &str, plan: Option<&str>) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config_version::ConfigVersionError;
+    use crate::decisions::DECISION_PRESETS;
     use test_case::test_case;
 
     const UNKNOWN_PURPOSE: &str = "unknown variant `compaction`";
@@ -1716,7 +1826,8 @@ best = "gpt-4.1"
     #[test_case("My Proxy", Ok("my-proxy".into()) ; "usable_name")]
     #[test_case("", Err(ProviderSlugError::Empty) ; "empty")]
     #[test_case(" -- ", Err(ProviderSlugError::Empty) ; "separators_only")]
-    #[test_case(" Version ", Err(ProviderSlugError::Reserved) ; "reserved_after_slugify")]
+    #[test_case(" Version ", Err(ProviderSlugError::Reserved { key: CONFIG_VERSION_KEY }) ; "reserved_after_slugify")]
+    #[test_case("Decisions", Err(ProviderSlugError::Reserved { key: DECISIONS_TABLE }) ; "decisions_reserved")]
     fn custom_provider_slug_refuses_unusable_names(
         name: &str,
         expected: Result<String, ProviderSlugError>,
@@ -1769,14 +1880,142 @@ best = "gpt-4.1"
             "[{REFERENCED}]\nprotocol = \"openai\"\napi_key = \"{API_KEY}\"\nbase_url = \"{BASE_URL}\"\n"
         ))
         .unwrap();
-        file.upsert(ADDED.into(), ProviderDef::default());
+        file.upsert(ADDED.into(), ProviderDef::default()).unwrap();
 
-        let reparsed = ProvidersFile::parse(&file.render().unwrap()).unwrap();
+        let reparsed = ProvidersFile::parse(&file.render()).unwrap();
         let referenced = reparsed.get(REFERENCED).unwrap();
 
         assert_eq!(referenced.api_key.as_deref(), Some(API_KEY));
         assert_eq!(referenced.base_url.as_deref(), Some(BASE_URL));
         assert!(reparsed.get(ADDED).is_some());
+    }
+
+    const EDITED_FILE: &str = r#"# providers I use
+version = 1
+
+# my proxy, keep this note
+[proxy]
+protocol = "openai" # inline note
+base_url = "https://{env:PROXY_HOST}/v1"
+
+# the tunnel endpoint
+[decisions.tunnel]
+protocol = "openai"
+base_url = "http://100.64.0.2:8080/v1"
+allow_http = true
+
+[untouched]
+protocol = "anthropic"
+"#;
+    const FILE_COMMENT: &str = "# providers I use";
+    const PROXY_COMMENT: &str = "# my proxy, keep this note";
+    const TUNNEL_COMMENT: &str = "# the tunnel endpoint";
+    const INLINE_COMMENT: &str = "# inline note";
+    const UNTOUCHED_TABLE: &str = "[untouched]\nprotocol = \"anthropic\"\n";
+    const TUNNEL: &str = "tunnel";
+
+    fn assert_survives(rendered: &str, comments: &[&str]) {
+        for kept in [FILE_COMMENT, UNTOUCHED_TABLE].iter().chain(comments) {
+            assert!(rendered.contains(kept), "{kept} lost:\n{rendered}");
+        }
+    }
+
+    #[test]
+    fn decision_endpoints_are_not_providers() {
+        let file = ProvidersFile::parse(EDITED_FILE).unwrap();
+
+        assert!(file.get(DECISIONS_TABLE).is_none());
+        assert!(file.decision_endpoints()[TUNNEL].resolve(TUNNEL).is_ok());
+        assert_eq!(file.config.providers.len(), 2);
+    }
+
+    #[test]
+    fn allow_remote_is_unknown_in_decision_endpoints() {
+        let error = toml::from_str::<ProvidersConfig>(
+            "[decisions.remote]\nprotocol = \"typesafe\"\nbase_url = \"https://api.typesafe.ai\"\nallow_remote = true\n",
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("unknown field `allow_remote`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn provider_edits_keep_comments_and_other_tables() {
+        const ADDED: &str = "added";
+        let mut file = ProvidersFile::parse(EDITED_FILE).unwrap();
+        let mut proxy = file.get("proxy").unwrap().clone();
+        proxy.default_model = Some("model".into());
+
+        file.upsert("proxy".into(), proxy).unwrap();
+        file.upsert(ADDED.into(), ProviderDef::default()).unwrap();
+        let rendered = file.render();
+
+        assert_survives(&rendered, &[PROXY_COMMENT, TUNNEL_COMMENT]);
+        let reparsed = ProvidersFile::parse(&rendered).unwrap();
+        assert_eq!(
+            reparsed.get("proxy").unwrap().default_model.as_deref(),
+            Some("model")
+        );
+        assert!(reparsed.get(ADDED).is_some());
+        assert!(reparsed.decision_endpoints().contains_key(TUNNEL));
+
+        assert!(file.remove(ADDED));
+        assert!(!file.remove(ADDED));
+        let rendered = file.render();
+        assert_survives(&rendered, &[PROXY_COMMENT, TUNNEL_COMMENT]);
+        assert!(
+            ProvidersFile::parse(&rendered)
+                .unwrap()
+                .get(ADDED)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn decision_endpoint_edits_keep_comments_and_other_tables() {
+        let preset = &DECISION_PRESETS[1];
+        let mut file = ProvidersFile::parse(EDITED_FILE).unwrap();
+
+        file.upsert_decision_endpoint(preset.name, &preset.def())
+            .unwrap();
+        let rendered = file.render();
+
+        assert_survives(&rendered, &[PROXY_COMMENT, INLINE_COMMENT, TUNNEL_COMMENT]);
+        assert!(
+            !rendered.contains(&format!("[{DECISIONS_TABLE}]")),
+            "{rendered}"
+        );
+        let reparsed = ProvidersFile::parse(&rendered).unwrap();
+        assert_eq!(reparsed.decision_endpoints()[preset.name], preset.def());
+        assert!(reparsed.decision_endpoints().contains_key(TUNNEL));
+
+        assert!(file.remove_decision_endpoint(TUNNEL));
+        assert!(file.remove_decision_endpoint(preset.name));
+        assert!(!file.remove_decision_endpoint(preset.name));
+        let rendered = file.render();
+        assert_survives(&rendered, &[PROXY_COMMENT, INLINE_COMMENT]);
+        assert!(!rendered.contains(DECISIONS_TABLE), "{rendered}");
+        assert!(
+            ProvidersFile::parse(&rendered)
+                .unwrap()
+                .get("proxy")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn decision_endpoint_upsert_into_an_empty_file() {
+        let preset = &DECISION_PRESETS[0];
+        let mut file = ProvidersFile::default();
+
+        file.upsert_decision_endpoint(preset.name, &preset.def())
+            .unwrap();
+
+        let reparsed = ProvidersFile::parse(&file.render()).unwrap();
+        assert_eq!(reparsed.decision_endpoints()[preset.name], preset.def());
     }
 
     #[test]

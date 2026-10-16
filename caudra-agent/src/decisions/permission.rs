@@ -204,6 +204,7 @@ mod tests {
     };
 
     const TAINT_PROBABILITY: f64 = 0.8;
+    const MODEL: &str = "taint-model";
 
     #[test_case(FeatureMode::Enforce, true; "taint_escalates_only_exfiltration_flags")]
     #[test_case(FeatureMode::Shadow, false; "taint_does_not_change_shadow")]
@@ -212,7 +213,7 @@ mod tests {
         let mut config = DecisionsConfig::default();
         config.features.auto_screening = mode;
         config.thresholds.auto_flag = 1.0;
-        let model = config.model.clone();
+        let model = MODEL.to_owned();
         let service = Decisions::new(config, &StateDir::from_path(root.path().into())).unwrap();
         let response = Ok(DecisionResponse {
             model,

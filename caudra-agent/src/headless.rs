@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
-use crate::decisions::{DecisionNote, Decisions};
+use crate::decisions::{DecisionNote, Decisions, resolve_active_decisions};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_lock::Mutex;
 use caudra_automation::event::{GoalView, SessionStatus, SessionView, StartedBy, WorkView};
@@ -17,6 +17,7 @@ use caudra_automation::untrusted::Untrusted;
 #[cfg(test)]
 use caudra_config::ToolKey;
 use caudra_config::decisions::DecisionsConfig;
+use caudra_config::providers::ProvidersConfig;
 use caudra_config::{
     AutomationsConfig, AutopilotConfig, Feature, FeatureFlags, ModelPolicy, SnapshotsConfig,
 };
@@ -1663,11 +1664,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
     }
     let state_dir =
         StateDir::resolve().map_err(|error| InteractiveStartError(error.to_string()))?;
-    let decisions = initialize_decisions(
-        params.decisions_config.clone(),
-        &state_dir,
-        params.config.features,
-    )?;
+    let decisions = initialize_decisions(&params.decisions_config, &state_dir)?;
     let provider_model = params.model.clone();
     if let Err(error) = provider::adjust_model(&mut params.model, params.timeouts) {
         warn!(%error, "failed to adjust headless model before setup");
@@ -3093,17 +3090,14 @@ impl InteractiveHandle {
 #[error("{0}")]
 pub struct InteractiveStartError(String);
 
-/// `None` while the decision engine is off, before anything engine-specific
-/// is read, so no endpoint, credential, or question file can switch it on.
+/// The shared settings joined with the endpoint active when the run starts.
+/// Without one the service has no engine and every feature stays off.
 fn initialize_decisions(
-    config: DecisionsConfig,
+    config: &DecisionsConfig,
     state_dir: &StateDir,
-    features: FeatureFlags,
 ) -> Result<Option<Decisions>, InteractiveStartError> {
-    if !features.enabled(Feature::DecisionEngine) {
-        return Ok(None);
-    }
-    Decisions::new(config, state_dir)
+    resolve_active_decisions(config, state_dir, ProvidersConfig::load)
+        .and_then(|config| Decisions::new(config, state_dir))
         .map(Some)
         .map_err(|error| InteractiveStartError(format!("{DECISIONS_STARTUP_FAILED}: {error}")))
 }
@@ -3263,11 +3257,7 @@ async fn spawn_prepared_session(
         mut store,
         changes,
     } = prepared;
-    let decisions = initialize_decisions(
-        params.decisions_config.clone(),
-        &store.dir,
-        params.config.features,
-    )?;
+    let decisions = initialize_decisions(&params.decisions_config, &store.dir)?;
     if !params.config.features.enabled(Feature::Workflows) {
         params.workflow_mode = None;
     }
@@ -4944,7 +4934,6 @@ mod tests {
     };
     use caudra_storage::autopilot::{AutopilotBudget, StoredAutopilot};
     use caudra_storage::background::TaskRecord;
-    use caudra_storage::decision_log::DecisionLog;
     use caudra_storage::engine_decisions::StoredDecisionAnchor;
     use caudra_storage::goal_log::{GoalEnd, GoalEvaluationOutcome};
     use caudra_storage::permission_state::PermissionRuleRecord;
@@ -4996,7 +4985,6 @@ mod tests {
     const FIRST_TODO: &str = "draft the schema";
     const REVISED_TODO: &str = "backfill the rows";
     const CHANGE_PROMPT: &str = "change the files";
-    const ENGINE_ON: FeatureFlags = FeatureFlags::NONE.with(Feature::DecisionEngine);
 
     #[test_case(true ; "a_remote_run_records_on_its_host")]
     #[test_case(false ; "a_local_run_records_nothing")]
@@ -5046,12 +5034,8 @@ mod tests {
             auto_screening_restricted: restricted,
             ..DecisionsConfig::default()
         };
-        let first = initialize_decisions(config.clone(), &state, ENGINE_ON)
-            .unwrap()
-            .unwrap();
-        let second = initialize_decisions(config, &state, ENGINE_ON)
-            .unwrap()
-            .unwrap();
+        let first = initialize_decisions(&config, &state).unwrap().unwrap();
+        let second = initialize_decisions(&config, &state).unwrap().unwrap();
         let manager = permission_manager();
         manager.set_decisions(Some(first.clone()));
         assert_eq!(
@@ -5065,7 +5049,6 @@ mod tests {
         first.mark_tainted();
         assert!(manager.decisions().unwrap().is_tainted());
         assert!(!second.is_tainted());
-        assert!(!DecisionLog::file_path(&state).exists());
     }
 
     #[test]
@@ -5073,29 +5056,26 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let state = StateDir::from_path(temp.path().to_path_buf());
         let config = DecisionsConfig {
-            model: String::new(),
+            timeout_ms: 0,
             ..DecisionsConfig::default()
         };
-        let error = initialize_decisions(config, &state, ENGINE_ON)
-            .err()
-            .unwrap();
+        let error = initialize_decisions(&config, &state).err().unwrap();
         assert!(error.to_string().contains(DECISIONS_STARTUP_FAILED));
     }
 
     #[test]
-    fn disabled_engine_reads_no_decision_config() {
+    fn no_active_endpoint_starts_a_service_without_an_engine() {
         let temp = TempDir::new().unwrap();
         let state = StateDir::from_path(temp.path().to_path_buf());
-        let unusable = DecisionsConfig {
-            model: String::new(),
-            ..DecisionsConfig::default()
-        };
+        let decisions = initialize_decisions(&DecisionsConfig::default(), &state)
+            .unwrap()
+            .unwrap();
+        assert!(decisions.endpoint().is_none());
         assert!(
-            initialize_decisions(unusable, &state, FeatureFlags::NONE)
-                .unwrap()
-                .is_none()
+            DecisionFeature::ALL
+                .iter()
+                .all(|feature| !decisions.enabled(feature))
         );
-        assert!(!DecisionLog::file_path(&state).exists());
     }
 
     #[test_case("!pwd", Some("pwd"); "visible_command")]
@@ -5195,10 +5175,7 @@ mod tests {
 
     fn permission_manager() -> PermissionManager {
         PermissionManager::new_nonpersistent(
-            PermissionsConfig {
-                decision_engine: true,
-                ..PermissionsConfig::default()
-            },
+            PermissionsConfig::default(),
             PathBuf::from(CWD),
             Arc::default(),
         )
@@ -6639,10 +6616,7 @@ complete(#{ report: first.output });
                     features: self.features,
                     ..AgentConfig::default()
                 },
-                permissions_config: PermissionsConfig {
-                    decision_engine: self.features.enabled(Feature::DecisionEngine),
-                    ..PermissionsConfig::default()
-                },
+                permissions_config: PermissionsConfig::default(),
                 decisions_config: DecisionsConfig::default(),
                 snapshots: SnapshotsConfig::default(),
                 timeouts: Timeouts::default(),

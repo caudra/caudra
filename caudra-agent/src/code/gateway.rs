@@ -774,6 +774,7 @@ fn excerpt(output: &mut McpOutput) {
 
 #[cfg(test)]
 mod tests {
+    use caudra_config::decisions::{DecisionEndpoint, DecisionProtocol};
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1283,13 +1284,16 @@ mod tests {
     /// A gateway whose session has a decision engine when `engine` is given.
     fn deciding_gateway(mode: AgentMode, engine: Option<TypedEngine>) -> (TempDir, Gateway) {
         let config = PermissionsConfig {
-            decision_engine: true,
             ..Default::default()
         };
         let (dir, permissions) = permissions(config, PermissionMode::Ask);
         if let Some(engine) = engine {
             let config = DecisionsConfig {
-                base_url: Some(DECISION_BASE_URL.parse().unwrap()),
+                endpoint: Some(DecisionEndpoint::new(
+                    DecisionProtocol::TypeSafe.as_str(),
+                    DecisionProtocol::TypeSafe,
+                    DECISION_BASE_URL.parse().unwrap(),
+                )),
                 ..Default::default()
             };
             let state = StateDir::from_path(dir.path().join("state"));

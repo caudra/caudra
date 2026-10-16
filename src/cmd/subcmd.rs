@@ -8,6 +8,7 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, bail, eyre};
 
 use caudra_agent::AgentMode;
+use caudra_agent::decisions::{remove_decision_endpoint, save_decision_endpoint};
 use caudra_agent::mcp::{McpSession, config as mcp_config, oauth as mcp_oauth};
 use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
 use caudra_agent::template::{self, Vars};
@@ -19,6 +20,9 @@ use caudra_agent::tools::report::{CATALOG_SOURCE, REASON_CATALOG};
 use caudra_agent::tools::{
     BuiltinDeferral, DeferralSession, DescriptionContext, SHELL_TOOL_NAME, TOOL_SEARCH_TOOL_NAME,
     ToolAudience, ToolFilter, ToolRegistry, ToolState, builtin_report, execution, is_tool_enabled,
+};
+use caudra_config::decisions::{
+    DECISION_PRESETS, DecisionEndpointDef, DecisionPreset, DecisionProtocol,
 };
 use caudra_config::providers::{
     Protocol, ProviderDef, ProvidersConfig, ProvidersFile, all_builtins, builtin_provider,
@@ -39,15 +43,17 @@ use caudra_storage::StateDir;
 use caudra_storage::auth::{
     MAX_WORKCELL_BEARER_TOKEN_BYTES, McpAuthData, ProviderAuth, ProviderCredentials,
     WorkcellCredential, WorkcellCredentialName, delete_provider_credentials,
-    delete_workcell_credential, list_workcell_credentials, load_mcp_auth,
-    load_provider_credentials, save_mcp_auth, save_provider_credentials, save_workcell_credential,
-    try_load_provider_auth,
+    delete_workcell_credential, list_workcell_credentials, load_decision_credentials,
+    load_mcp_auth, load_provider_credentials, save_mcp_auth, save_provider_credentials,
+    save_workcell_credential, try_load_provider_auth, validate_decision_endpoint_name,
 };
+use caudra_storage::decisions::read_active_decision_endpoint;
 use caudra_storage::model::persist_model_for_every_mode;
 use caudra_storage::sessions::StoredMode;
 use caudra_workspace::PlanRef;
 use serde_json::Value;
 
+use super::decisions::{self, DecisionKey, DecisionRow};
 use crate::cli::{AuthMethod, Cli, normalize_tool_name};
 use crate::setup::resolve_model;
 
@@ -79,6 +85,17 @@ const SKILL_DIRS_HEADING: &str = "Directories";
 const NO_SKILLS_FOUND: &str = "No skills found.";
 const SKILL_SCOPE_WIDTH: usize = 8;
 const SKILL_DIR_STATE_WIDTH: usize = 11;
+const CUSTOM_DECISION_TARGET: &str = "custom";
+const DECISION_FLAGS_ERR: &str = "--method and --hostname do not apply to --decision";
+const DECISION_MENU_HEADING: &str = "Decision models:";
+const CUSTOM_DECISION_LABEL: &str = "Custom decision endpoint...";
+const DECISION_STATUS_HEADING: &str = "\x1b[1mDecision endpoints:\x1b[0m";
+const DECISION_ACTIVE_MARKER: &str = " \x1b[1m(active)\x1b[0m";
+const DECISION_BADGE_SAVED: &str = "\x1b[32m✓\x1b[0m";
+const DECISION_BADGE_ENV: &str = "\x1b[33m~\x1b[0m";
+const DECISION_BADGE_CONFIGURED: &str = "\x1b[34m●\x1b[0m";
+const PLAIN_HTTP_WARNING: &str = "Plain HTTP sends decision context and the key unencrypted; use it only over a tunnel you trust.";
+const INPUT_CLOSED: &str = "input closed before an answer was entered";
 
 #[derive(Debug, PartialEq, Eq)]
 enum LoginRoute {
@@ -88,16 +105,37 @@ enum LoginRoute {
     CopilotOauth(CopilotIdentity),
     CopilotImport(CopilotIdentity),
     ApiKey,
+    Decision(DecisionTarget),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DecisionTarget {
+    Menu,
+    Custom,
+    /// A preset or a configured endpoint.
+    Named(String),
+}
+
+impl DecisionTarget {
+    fn parse(name: &str) -> Self {
+        match name.trim().to_ascii_lowercase() {
+            name if name == CUSTOM_DECISION_TARGET => Self::Custom,
+            name => Self::Named(name),
+        }
+    }
 }
 
 pub fn auth_login(
     provider: Option<&str>,
+    decision: bool,
     method: Option<AuthMethod>,
     hostname: Option<&str>,
     storage: &StateDir,
 ) -> Result<()> {
     match provider {
-        Some(provider) => login_slug(&slugify(provider), method, hostname, storage)?,
+        Some(provider) if decision => login_slug(provider, true, method, hostname, storage)?,
+        Some(provider) => login_slug(&slugify(provider), false, method, hostname, storage)?,
+        None if decision => login_decision(DecisionTarget::Menu, storage)?,
         None => login_interactive(storage)?,
     }
     Ok(())
@@ -159,12 +197,14 @@ pub fn workcell_credential_delete(name: &WorkcellCredentialName, storage: &State
 
 fn login_slug(
     slug: &str,
+    decision: bool,
     method: Option<AuthMethod>,
     hostname: Option<&str>,
     storage: &StateDir,
 ) -> Result<()> {
-    let route = login_route(slug, method, hostname.is_some())?;
+    let route = login_route(slug, decision, method, hostname.is_some())?;
     match route {
+        LoginRoute::Decision(target) => login_decision(target, storage)?,
         LoginRoute::AnthropicOauth => anthropic_auth::login(storage)?,
         LoginRoute::OpenAiOauth => openai_auth::login(storage)?,
         LoginRoute::XaiOauth => xai_auth::login(storage)?,
@@ -179,7 +219,18 @@ fn login_slug(
     Ok(())
 }
 
-fn login_route(slug: &str, method: Option<AuthMethod>, has_hostname: bool) -> Result<LoginRoute> {
+fn login_route(
+    slug: &str,
+    decision: bool,
+    method: Option<AuthMethod>,
+    has_hostname: bool,
+) -> Result<LoginRoute> {
+    if decision {
+        if method.is_some() || has_hostname {
+            bail!(DECISION_FLAGS_ERR);
+        }
+        return Ok(LoginRoute::Decision(DecisionTarget::parse(slug)));
+    }
     let copilot = CopilotIdentity::from_slug(slug);
     if has_hostname && copilot != Some(CopilotIdentity::Enterprise) {
         bail!(HOSTNAME_SCOPE_ERR);
@@ -319,7 +370,9 @@ fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
     }
 
     if plan.is_some() || needs_url || host_url.is_some() || builtin.is_none() {
-        config.upsert(slug.to_string(), provider_def);
+        config
+            .upsert(slug.to_string(), provider_def)
+            .context("update providers.toml")?;
         config.save().context("save providers.toml")?;
     }
 
@@ -364,13 +417,22 @@ fn login_interactive(storage: &StateDir) -> Result<()> {
         .filter(|s| builtin_provider(s).is_none() && *s != "opencode")
         .collect();
     let catalog_entries = catalog_providers();
-    let custom_idx = builtins.len() + custom_slugs.len() + catalog_entries.len() + 1;
-    let number_width = custom_idx.to_string().len();
+    let decision_entries = decision_entries(&config);
+    let menu = LoginMenu {
+        builtins: builtins.len(),
+        custom_slugs: custom_slugs.len(),
+        catalog: catalog_entries.len(),
+        decisions: decision_entries.len(),
+    };
+    let custom_idx = menu.custom_idx();
+    let last_idx = menu.last_idx();
+    let number_width = last_idx.to_string().len();
     let slug_width = builtins
         .iter()
         .map(|provider| provider.slug.len())
         .chain(custom_slugs.iter().map(|slug| slug.len()))
         .chain(catalog_entries.iter().map(|provider| provider.slug.len()))
+        .chain(decision_entries.iter().map(|entry| entry.name.len()))
         .max()
         .unwrap_or(PROVIDER_SLUG_WIDTH)
         .max(PROVIDER_SLUG_WIDTH);
@@ -421,38 +483,374 @@ fn login_interactive(storage: &StateDir) -> Result<()> {
     }
     println!("  {AUTH_STATUS_EMPTY} {custom_idx:>number_width$}. Custom provider...");
     println!();
+    print_decision_menu(
+        &decision_entries,
+        storage,
+        custom_idx + 1,
+        number_width,
+        slug_width,
+    )?;
 
-    print!("  Select [1-{}]: ", custom_idx);
+    print!("  Select [1-{last_idx}]: ");
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     let choice: usize = input.trim().parse().context("enter a number")?;
 
-    if choice == 0 || choice > custom_idx {
-        bail!("invalid selection");
-    }
-
-    if choice == custom_idx {
-        login_custom(storage)?;
-    } else if choice <= builtins.len() {
-        let slug = builtins[choice - 1].slug;
-        let method = match slug {
-            "anthropic" | "openai" => Some(prompt_auth_method(&resolve_display_name(
-                slug,
-                config.get(slug),
-            ))?),
-            _ => None,
-        };
-        login_slug(slug, method, None, storage)?;
-    } else if choice <= builtins.len() + custom_slugs.len() {
-        let slug = custom_slugs[choice - builtins.len() - 1];
-        login_provider(slug, storage)?;
-    } else {
-        let provider = &catalog_entries[choice - builtins.len() - custom_slugs.len() - 1];
-        login_catalog_provider(provider, storage)?;
+    match menu
+        .choice(choice)
+        .ok_or_else(|| eyre!("invalid selection"))?
+    {
+        LoginChoice::CustomProvider => login_custom(storage)?,
+        LoginChoice::Builtin(index) => {
+            let slug = builtins[index].slug;
+            let method = match slug {
+                "anthropic" | "openai" => Some(prompt_auth_method(&resolve_display_name(
+                    slug,
+                    config.get(slug),
+                ))?),
+                _ => None,
+            };
+            login_slug(slug, false, method, None, storage)?;
+        }
+        LoginChoice::CustomSlug(index) => login_provider(custom_slugs[index], storage)?,
+        LoginChoice::Catalog(index) => login_catalog_provider(&catalog_entries[index], storage)?,
+        LoginChoice::Decision(choice) => configure_decision(choice, decision_entries, storage)?,
     }
 
     Ok(())
+}
+
+/// Numbering of the `auth login` menu: built-in, custom and catalog providers,
+/// "Custom provider...", then the decision block.
+struct LoginMenu {
+    builtins: usize,
+    custom_slugs: usize,
+    catalog: usize,
+    decisions: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LoginChoice {
+    Builtin(usize),
+    CustomSlug(usize),
+    Catalog(usize),
+    CustomProvider,
+    Decision(DecisionChoice),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DecisionChoice {
+    Endpoint(usize),
+    Custom,
+}
+
+impl LoginMenu {
+    fn custom_idx(&self) -> usize {
+        self.builtins + self.custom_slugs + self.catalog + 1
+    }
+
+    fn last_idx(&self) -> usize {
+        self.custom_idx() + self.decisions + 1
+    }
+
+    fn choice(&self, number: usize) -> Option<LoginChoice> {
+        let custom_slugs_end = self.builtins + self.custom_slugs;
+        let custom_idx = self.custom_idx();
+        match number {
+            0 => None,
+            number if number <= self.builtins => Some(LoginChoice::Builtin(number - 1)),
+            number if number <= custom_slugs_end => {
+                Some(LoginChoice::CustomSlug(number - self.builtins - 1))
+            }
+            number if number < custom_idx => {
+                Some(LoginChoice::Catalog(number - custom_slugs_end - 1))
+            }
+            number if number == custom_idx => Some(LoginChoice::CustomProvider),
+            number => {
+                decision_choice(self.decisions, number - custom_idx).map(LoginChoice::Decision)
+            }
+        }
+    }
+}
+
+/// `number` counted from 1 within a decision block of `endpoints` rows and
+/// the trailing custom row.
+fn decision_choice(endpoints: usize, number: usize) -> Option<DecisionChoice> {
+    match number {
+        0 => None,
+        number if number <= endpoints => Some(DecisionChoice::Endpoint(number - 1)),
+        number if number == endpoints + 1 => Some(DecisionChoice::Custom),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecisionEntry {
+    name: String,
+    label: String,
+    def: DecisionEndpointDef,
+}
+
+/// The presets, each as configured when it is, then every other configured
+/// endpoint.
+fn decision_entries(providers: &ProvidersConfig) -> Vec<DecisionEntry> {
+    let presets = DECISION_PRESETS.iter().map(|preset| DecisionEntry {
+        name: preset.name.into(),
+        label: preset.display_name.into(),
+        def: providers
+            .decisions
+            .get(preset.name)
+            .cloned()
+            .unwrap_or_else(|| preset.def()),
+    });
+    let configured = providers
+        .decisions
+        .iter()
+        .filter(|(name, _)| DecisionPreset::find(name).is_none())
+        .map(|(name, def)| DecisionEntry {
+            name: name.clone(),
+            label: endpoint_summary(def),
+            def: def.clone(),
+        });
+    presets.chain(configured).collect()
+}
+
+fn endpoint_summary(def: &DecisionEndpointDef) -> String {
+    format!(
+        "{} · {}",
+        def.protocol.as_str(),
+        def.model
+            .as_deref()
+            .unwrap_or_else(|| def.protocol.default_model())
+    )
+}
+
+fn print_decision_menu(
+    entries: &[DecisionEntry],
+    storage: &StateDir,
+    first: usize,
+    number_width: usize,
+    name_width: usize,
+) -> Result<()> {
+    let active = read_active_decision_endpoint(storage);
+    println!("  {DECISION_MENU_HEADING}");
+    println!();
+    for (number, entry) in (first..).zip(entries) {
+        let status = match decisions::decision_key(
+            storage,
+            &entry.name,
+            entry.def.api_key_env.as_deref(),
+        )? {
+            DecisionKey::Saved(_) => AUTH_STATUS_KEY,
+            DecisionKey::Env(_) => AUTH_STATUS_ENV,
+            DecisionKey::Missing => AUTH_STATUS_EMPTY,
+        };
+        let marker = if active.as_deref() == Some(entry.name.as_str()) {
+            DECISION_ACTIVE_MARKER
+        } else {
+            ""
+        };
+        let DecisionEntry { name, label, .. } = entry;
+        println!("  {status} {number:>number_width$}. {name:<name_width$} {label}{marker}");
+    }
+    let custom = first + entries.len();
+    println!("  {AUTH_STATUS_EMPTY} {custom:>number_width$}. {CUSTOM_DECISION_LABEL}");
+    println!();
+    Ok(())
+}
+
+fn login_decision(target: DecisionTarget, storage: &StateDir) -> Result<()> {
+    let entries = decision_entries(&ProvidersConfig::load());
+    let choice = match target {
+        DecisionTarget::Menu => {
+            let last = entries.len() + 1;
+            let width = last.to_string().len();
+            let name_width = entries
+                .iter()
+                .map(|entry| entry.name.len())
+                .max()
+                .unwrap_or_default()
+                .max(PROVIDER_SLUG_WIDTH);
+            println!();
+            print_decision_menu(&entries, storage, 1, width, name_width)?;
+            let input = prompt_line(&format!("  Select [1-{last}]: "))?;
+            let number = input.parse().context("enter a number")?;
+            decision_choice(entries.len(), number).ok_or_else(|| eyre!("invalid selection"))?
+        }
+        DecisionTarget::Custom => DecisionChoice::Custom,
+        DecisionTarget::Named(name) => entries
+            .iter()
+            .position(|entry| entry.name == name)
+            .map(DecisionChoice::Endpoint)
+            .ok_or_else(|| {
+                let presets: Vec<&str> = DECISION_PRESETS.iter().map(|preset| preset.name).collect();
+                eyre!(
+                    "unknown decision endpoint '{name}'; use a preset ({}), {CUSTOM_DECISION_TARGET}, or a configured endpoint name",
+                    presets.join(", ")
+                )
+            })?,
+    };
+    configure_decision(choice, entries, storage)
+}
+
+fn configure_decision(
+    choice: DecisionChoice,
+    entries: Vec<DecisionEntry>,
+    storage: &StateDir,
+) -> Result<()> {
+    let (name, def) = match choice {
+        DecisionChoice::Endpoint(index) => {
+            let entry = entries
+                .into_iter()
+                .nth(index)
+                .ok_or_else(|| eyre!("invalid selection"))?;
+            (entry.name, entry.def)
+        }
+        DecisionChoice::Custom => prompt_custom_decision()?,
+    };
+    let api_key = prompt_decision_key(storage, &name, &def)?;
+    let saved = save_decision_endpoint(storage, &name, def, Some(&api_key))
+        .with_context(|| format!("save decision endpoint '{name}'"))?;
+    let endpoint = &saved.endpoint;
+    let key = decisions::decision_key(storage, &name, endpoint.api_key_env.as_deref())?;
+    println!();
+    println!(
+        "  \x1b[32m✓\x1b[0m Decision endpoint: {} ({} · {})",
+        endpoint.name,
+        endpoint.protocol.as_str(),
+        endpoint.model
+    );
+    println!("  Base URL: {}", endpoint.base_url);
+    match key {
+        DecisionKey::Saved(masked) => println!("  Key: saved ({masked})"),
+        DecisionKey::Env(variable) => println!("  Key: via {variable}"),
+        DecisionKey::Missing => println!("  Key: none"),
+    }
+    if endpoint.allow_http {
+        println!("  \x1b[33m!\x1b[0m {PLAIN_HTTP_WARNING}");
+    }
+    if saved.active {
+        println!("  Active: new sessions screen with it");
+    } else {
+        println!(
+            "  Not active; switch with: caudra decisions use {}",
+            endpoint.name
+        );
+    }
+    Ok(())
+}
+
+fn prompt_decision_key(
+    storage: &StateDir,
+    name: &str,
+    def: &DecisionEndpointDef,
+) -> Result<String> {
+    if let Some(preset) = DecisionPreset::find(name) {
+        println!("  Get a key at {}", preset.key_url);
+    }
+    let stored = load_decision_credentials(storage, name)
+        .with_context(|| format!("load the key for decision endpoint '{name}'"))?
+        .is_some();
+    let hint = match (&def.api_key_env, stored) {
+        (_, true) => "Enter keeps the saved key".to_owned(),
+        (Some(variable), false) => format!("Enter falls back to {variable}"),
+        (None, false) => "Enter to skip".to_owned(),
+    };
+    prompt_line(&format!("  {name} API key ({hint}): "))
+}
+
+fn decision_protocol(input: &str) -> Option<DecisionProtocol> {
+    match input.trim() {
+        "1" => Some(DecisionProtocol::TypeSafe),
+        "2" => Some(DecisionProtocol::OpenAI),
+        input => DecisionProtocol::ALL
+            .into_iter()
+            .find(|protocol| protocol.as_str() == input),
+    }
+}
+
+fn confirmed(input: &str) -> bool {
+    matches!(input.to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn prompt_custom_decision() -> Result<(String, DecisionEndpointDef)> {
+    let name = loop {
+        let name = prompt_line("  Endpoint name: ")?;
+        match validate_decision_endpoint_name(&name) {
+            Ok(()) => break name,
+            Err(error) => println!("  {error}"),
+        }
+    };
+
+    println!("  Protocol:");
+    for (number, protocol) in (1..).zip(DecisionProtocol::ALL) {
+        println!(
+            "    {number}. {:<9} (appends {})",
+            protocol.as_str(),
+            protocol.endpoint_path()
+        );
+    }
+    let protocol = loop {
+        match decision_protocol(&prompt_line("  Select [1-2]: ")?) {
+            Some(protocol) => break protocol,
+            None => println!("  invalid protocol selection"),
+        }
+    };
+
+    let mut def = DecisionEndpointDef {
+        base_url: String::new(),
+        model: None,
+        api_key_env: None,
+        allow_http: None,
+        protocol,
+    };
+    println!(
+        "  The base URL is the API base, not the full endpoint: Caudra appends {}.",
+        def.protocol.endpoint_path()
+    );
+    loop {
+        def.base_url = prompt_line(&format!(
+            "  Base URL (e.g. {}): ",
+            def.protocol.preset().base_url
+        ))?;
+        def.allow_http = None;
+        if def.needs_allow_http() {
+            println!("  \x1b[33m!\x1b[0m {PLAIN_HTTP_WARNING}");
+            if !confirmed(&prompt_line(
+                "  Send decision context over plain HTTP? [y/N]: ",
+            )?) {
+                continue;
+            }
+            def.allow_http = Some(true);
+        }
+        match def.resolve(&name) {
+            Ok(_) => break,
+            Err(error) => println!("  {error}"),
+        }
+    }
+
+    loop {
+        let model = prompt_line(&format!("  Model [{}]: ", def.protocol.default_model()))?;
+        def.model = (!model.is_empty()).then_some(model);
+        match def.resolve(&name) {
+            Ok(_) => break,
+            Err(error) => println!("  {error}"),
+        }
+    }
+    Ok((name, def))
+}
+
+/// One trimmed line from stdin. Closed input is an error, so a re-prompting
+/// loop never spins on a pipe that has ended.
+fn prompt_line(prompt: &str) -> Result<String> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input)? == 0 {
+        bail!(INPUT_CLOSED);
+    }
+    Ok(input.trim().to_owned())
 }
 
 fn login_catalog_provider(provider: &ProviderData, storage: &StateDir) -> Result<()> {
@@ -558,7 +956,9 @@ fn login_custom(storage: &StateDir) -> Result<()> {
         save_provider_credentials(storage, &slug, &creds).context("save credentials")?;
     }
 
-    config.upsert(slug.clone(), provider_def);
+    config
+        .upsert(slug.clone(), provider_def)
+        .context("update providers.toml")?;
     config.save().context("save providers.toml")?;
 
     println!();
@@ -675,6 +1075,51 @@ pub fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
+pub fn decision_logout(name: &str, storage: &StateDir) -> Result<()> {
+    let name = name.trim().to_ascii_lowercase();
+    let removed = remove_decision_endpoint(storage, &name)
+        .with_context(|| format!("remove decision endpoint '{name}'"))?;
+    if !removed.removed {
+        println!("Decision endpoint '{name}' was not configured.");
+        return Ok(());
+    }
+    println!("Removed decision endpoint '{name}'.");
+    if removed.deactivated {
+        println!("It was the active endpoint; decisions are off.");
+    }
+    Ok(())
+}
+
+fn render_decision_status(rows: &[DecisionRow]) -> String {
+    let mut output = format!("  {DECISION_STATUS_HEADING}\n");
+    if rows.is_empty() {
+        let _ = writeln!(
+            output,
+            "  none configured, {}",
+            decisions::DECISION_LOGIN_HINT
+        );
+    }
+    for row in rows {
+        let (badge, detail) = match &row.key {
+            DecisionKey::Saved(masked) => (DECISION_BADGE_SAVED, format!("key: {masked}")),
+            DecisionKey::Env(variable) => (DECISION_BADGE_ENV, format!("via {variable}")),
+            DecisionKey::Missing => (DECISION_BADGE_CONFIGURED, "configured".to_owned()),
+        };
+        let marker = if row.active {
+            DECISION_ACTIVE_MARKER
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            output,
+            "  {badge} {:<PROVIDER_SLUG_WIDTH$} {} · {} ({detail}){marker}",
+            row.name, row.protocol, row.model
+        );
+    }
+    output.push('\n');
+    output
+}
+
 pub fn auth_status(storage: &StateDir) -> Result<()> {
     let config = ProvidersConfig::load();
     let builtins = all_builtins();
@@ -746,6 +1191,10 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
             }
         }
     }
+    print!(
+        "{}",
+        render_decision_status(&decisions::decision_rows(storage, &config)?)
+    );
     // Catalog providers from models.dev
     let catalog_entries = catalog_providers();
     if !catalog_entries.is_empty() {
@@ -1800,6 +2249,21 @@ mod auth_tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
+    const OPENAI: &str = "openai";
+    const TYPESAFE: &str = "typesafe";
+    const TUNNEL: &str = "tunnel";
+    const TUNNEL_BASE_URL: &str = "http://100.64.0.2:8080/v1";
+    const TUNNEL_MODEL: &str = "systemone-decision-v7";
+    const TUNNEL_LABEL: &str = "openai · systemone-decision-v7";
+    const MASKED_KEY: &str = "sk-1...cdef";
+    const KEY_VARIABLE: &str = "TYPESAFE_API_KEY";
+    const MENU: LoginMenu = LoginMenu {
+        builtins: 2,
+        custom_slugs: 1,
+        catalog: 2,
+        decisions: 3,
+    };
+
     #[test_case(Effect::Allow; "authorized")]
     #[test_case(Effect::Deny; "denied")]
     fn index_subcommand_uses_permission_dispatch(effect: Effect) {
@@ -1843,7 +2307,149 @@ mod auth_tests {
     #[test_case("copilot-enterprise", Some(AuthMethod::Import), LoginRoute::CopilotImport(CopilotIdentity::Enterprise) ; "enterprise_import")]
     #[test_case("google", None, LoginRoute::ApiKey ; "ordinary_provider")]
     fn provider_login_routes(raw: &str, method: Option<AuthMethod>, expected: LoginRoute) {
-        assert_eq!(login_route(&slugify(raw), method, false).unwrap(), expected);
+        assert_eq!(
+            login_route(&slugify(raw), false, method, false).unwrap(),
+            expected
+        );
+    }
+
+    #[test_case("openai", DecisionTarget::Named(OPENAI.into()) ; "preset")]
+    #[test_case(" TypeSafe ", DecisionTarget::Named(TYPESAFE.into()) ; "normalized_preset")]
+    #[test_case("my_tunnel", DecisionTarget::Named("my_tunnel".into()) ; "underscores_survive")]
+    #[test_case("custom", DecisionTarget::Custom ; "custom")]
+    #[test_case("Custom", DecisionTarget::Custom ; "normalized_custom")]
+    fn decision_login_routes(raw: &str, expected: DecisionTarget) {
+        assert_eq!(
+            login_route(raw, true, None, false).unwrap(),
+            LoginRoute::Decision(expected)
+        );
+    }
+
+    #[test_case(Some(AuthMethod::ApiKey), false ; "method")]
+    #[test_case(None, true ; "hostname")]
+    fn decision_login_rejects_provider_options(method: Option<AuthMethod>, has_hostname: bool) {
+        let error = login_route(OPENAI, true, method, has_hostname).unwrap_err();
+        assert_eq!(error.to_string(), DECISION_FLAGS_ERR);
+    }
+
+    #[test_case(MENU, 0, None ; "zero")]
+    #[test_case(MENU, 1, Some(LoginChoice::Builtin(0)) ; "first_builtin")]
+    #[test_case(MENU, 2, Some(LoginChoice::Builtin(1)) ; "last_builtin")]
+    #[test_case(MENU, 3, Some(LoginChoice::CustomSlug(0)) ; "custom_slug")]
+    #[test_case(MENU, 4, Some(LoginChoice::Catalog(0)) ; "first_catalog")]
+    #[test_case(MENU, 5, Some(LoginChoice::Catalog(1)) ; "last_catalog")]
+    #[test_case(MENU, 6, Some(LoginChoice::CustomProvider) ; "custom_provider")]
+    #[test_case(MENU, 7, Some(LoginChoice::Decision(DecisionChoice::Endpoint(0))) ; "first_decision")]
+    #[test_case(MENU, 9, Some(LoginChoice::Decision(DecisionChoice::Endpoint(2))) ; "last_decision")]
+    #[test_case(MENU, 10, Some(LoginChoice::Decision(DecisionChoice::Custom)) ; "custom_decision")]
+    #[test_case(MENU, 11, None ; "past_the_end")]
+    #[test_case(LoginMenu { builtins: 1, custom_slugs: 0, catalog: 0, decisions: 2 }, 2, Some(LoginChoice::CustomProvider) ; "empty_sections_custom_provider")]
+    #[test_case(LoginMenu { builtins: 1, custom_slugs: 0, catalog: 0, decisions: 2 }, 3, Some(LoginChoice::Decision(DecisionChoice::Endpoint(0))) ; "empty_sections_decision")]
+    #[test_case(LoginMenu { builtins: 1, custom_slugs: 0, catalog: 0, decisions: 2 }, 5, Some(LoginChoice::Decision(DecisionChoice::Custom)) ; "empty_sections_custom_decision")]
+    fn login_menu_numbers_every_section(
+        menu: LoginMenu,
+        number: usize,
+        expected: Option<LoginChoice>,
+    ) {
+        assert_eq!(menu.choice(number), expected);
+        assert!(menu.choice(menu.last_idx()).is_some());
+        assert!(menu.choice(menu.last_idx() + 1).is_none());
+    }
+
+    #[test_case(2, 1, Some(DecisionChoice::Endpoint(0)) ; "first")]
+    #[test_case(2, 3, Some(DecisionChoice::Custom) ; "custom")]
+    #[test_case(0, 1, Some(DecisionChoice::Custom) ; "custom_only")]
+    #[test_case(2, 0, None ; "zero")]
+    #[test_case(2, 4, None ; "past_the_end")]
+    fn decision_menu_numbers_endpoints_then_custom(
+        endpoints: usize,
+        number: usize,
+        expected: Option<DecisionChoice>,
+    ) {
+        assert_eq!(decision_choice(endpoints, number), expected);
+    }
+
+    #[test]
+    fn decision_entries_list_presets_then_configured_endpoints() {
+        let mut providers = ProvidersConfig::default();
+        let mut typesafe = DECISION_PRESETS[0].def();
+        typesafe.model = Some(TUNNEL_MODEL.into());
+        providers
+            .decisions
+            .insert(TYPESAFE.into(), typesafe.clone());
+        providers.decisions.insert(
+            TUNNEL.into(),
+            DecisionEndpointDef {
+                protocol: DecisionProtocol::OpenAI,
+                base_url: TUNNEL_BASE_URL.into(),
+                model: Some(TUNNEL_MODEL.into()),
+                api_key_env: None,
+                allow_http: Some(true),
+            },
+        );
+
+        let entries = decision_entries(&providers);
+
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, [TYPESAFE, OPENAI, TUNNEL]);
+        assert_eq!(entries[0].def, typesafe);
+        assert_eq!(entries[0].label, DECISION_PRESETS[0].display_name);
+        assert_eq!(entries[1].def, DECISION_PRESETS[1].def());
+        assert_eq!(entries[2].label, TUNNEL_LABEL);
+    }
+
+    #[test_case("1", Some(DecisionProtocol::TypeSafe) ; "first")]
+    #[test_case(" 2 ", Some(DecisionProtocol::OpenAI) ; "second")]
+    #[test_case("openai", Some(DecisionProtocol::OpenAI) ; "by_name")]
+    #[test_case("3", None ; "out_of_range")]
+    fn decision_protocol_selection(input: &str, expected: Option<DecisionProtocol>) {
+        assert_eq!(decision_protocol(input), expected);
+    }
+
+    #[test]
+    fn decision_status_marks_key_sources_and_the_active_endpoint() {
+        let row = |name: &str, key: DecisionKey, active: bool| DecisionRow {
+            name: name.into(),
+            protocol: DecisionProtocol::OpenAI.as_str(),
+            model: TUNNEL_MODEL.into(),
+            host: String::new(),
+            key,
+            active,
+        };
+        let rows = [
+            row(OPENAI, DecisionKey::Saved(MASKED_KEY.into()), true),
+            row(TYPESAFE, DecisionKey::Env(KEY_VARIABLE.into()), false),
+            row(TUNNEL, DecisionKey::Missing, false),
+        ];
+
+        let rendered = render_decision_status(&rows);
+
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines[0], format!("  {DECISION_STATUS_HEADING}"));
+        assert_eq!(
+            lines[1],
+            format!(
+                "  {DECISION_BADGE_SAVED} {OPENAI:<PROVIDER_SLUG_WIDTH$} {TUNNEL_LABEL} (key: {MASKED_KEY}){DECISION_ACTIVE_MARKER}"
+            )
+        );
+        assert_eq!(
+            lines[2],
+            format!(
+                "  {DECISION_BADGE_ENV} {TYPESAFE:<PROVIDER_SLUG_WIDTH$} {TUNNEL_LABEL} (via {KEY_VARIABLE})"
+            )
+        );
+        assert_eq!(
+            lines[3],
+            format!(
+                "  {DECISION_BADGE_CONFIGURED} {TUNNEL:<PROVIDER_SLUG_WIDTH$} {TUNNEL_LABEL} (configured)"
+            )
+        );
+    }
+
+    #[test]
+    fn decision_status_without_endpoints_points_at_login() {
+        let rendered = render_decision_status(&[]);
+        assert!(rendered.contains(decisions::DECISION_LOGIN_HINT));
     }
 
     #[test_case("google", Some(AuthMethod::Oauth), false, METHOD_SCOPE_ERR ; "oauth_on_non_subscription_provider")]
@@ -1857,7 +2463,7 @@ mod auth_tests {
         has_hostname: bool,
         expected: &str,
     ) {
-        let error = login_route(slug, method, has_hostname).unwrap_err();
+        let error = login_route(slug, false, method, has_hostname).unwrap_err();
         assert_eq!(error.to_string(), expected);
     }
 

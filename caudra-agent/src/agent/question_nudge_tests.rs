@@ -29,7 +29,11 @@ const QN_PLAN_MODE_ASKS: &str = "a question in plan mode without a saved plan mu
 
 fn qn_config(mode: FeatureMode) -> DecisionsConfig {
     let mut config = DecisionsConfig {
-        base_url: Some(DECISION_BASE_URL.parse().unwrap()),
+        endpoint: Some(DecisionEndpoint::new(
+            DecisionProtocol::TypeSafe.as_str(),
+            DecisionProtocol::TypeSafe,
+            DECISION_BASE_URL.parse().unwrap(),
+        )),
         log: true,
         timeout_ms: QN_TIMEOUT_MS,
         ..DecisionsConfig::default()
@@ -338,7 +342,7 @@ fn question_nudge_ineligible_handoffs_make_no_decision_call(gate: QnGate) {
             QnGate::NoEngine => agent.permissions.set_decisions(None),
             QnGate::NoEndpoint => {
                 let mut config = qn_config(FeatureMode::Advise);
-                config.base_url = None;
+                config.endpoint = None;
                 agent.permissions.set_decisions(Some(qn_service(
                     &directory,
                     config,

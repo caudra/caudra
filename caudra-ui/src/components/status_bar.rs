@@ -62,7 +62,8 @@ const YOLO_LABEL: &str = " [yolo]";
 const YOLO_SHORT_LABEL: &str = " [!]";
 const AUTO_LABEL: &str = " [auto]";
 const AUTO_SHORT_LABEL: &str = " [a]";
-const DECISIONS_OFFLINE_LABEL: &str = "[decisions offline]";
+const DECISIONS_PREFIX: &str = "[decisions: ";
+const DECISIONS_SUFFIX: &str = "]";
 /// `[? 2]`: deferred questions waiting off the dock.
 const QUESTIONS_MARK: &str = "?";
 /// `[permissions.toml invalid]` names the one file; past one, the count.
@@ -129,7 +130,8 @@ const TIP_YOLO: &str = "YOLO: tool calls run without asking. Deny rules still ap
 const TIP_AUTO: &str = "Auto: the decision engine approves calls no rule covers";
 const TIP_FAST: &str = "Fast mode is on";
 const TIP_SANDBOX: &str = "Attached sandbox: ";
-const TIP_DECISIONS: &str = "The decision engine is unreachable";
+const TIP_DECISIONS: &str = "Decision endpoint: ";
+const TIP_DECISIONS_OFFLINE: &str = "\nUnreachable on the last attempt";
 const TIP_CONFIG_PROBLEMS: &str = "Config failed to load";
 const TIP_TRUST_REVIEW: &str = "Project config is waiting for your trust";
 const TIP_QUESTIONS: &str = "unanswered questions";
@@ -399,6 +401,13 @@ impl ModeLabel {
     }
 }
 
+/// The decision endpoint the session screens with.
+pub struct DecisionsChip<'a> {
+    pub endpoint: &'a str,
+    /// The last attempt to reach it failed.
+    pub offline: bool,
+}
+
 pub struct StatusBarContext<'a> {
     pub status: &'a Status,
     pub mode: ModeLabel,
@@ -425,7 +434,8 @@ pub struct StatusBarContext<'a> {
     /// strings rather than formatting one per rung.
     pub workflows: Option<WorkflowChip>,
     pub permission_mode: PermissionMode,
-    pub decisions_offline: bool,
+    /// `None` while decisions are off.
+    pub decisions: Option<DecisionsChip<'a>>,
     /// Deferred questions waiting off the dock.
     pub waiting_questions: usize,
     /// Config files the session runs without because they failed to load.
@@ -1956,7 +1966,13 @@ fn chip_tip(
         StatusBarHitTarget::Auto => TIP_AUTO.to_owned(),
         StatusBarHitTarget::Fast => TIP_FAST.to_owned(),
         StatusBarHitTarget::Sandbox => format!("{TIP_SANDBOX}{}", ctx.sandbox?),
-        StatusBarHitTarget::Decisions => TIP_DECISIONS.to_owned(),
+        StatusBarHitTarget::Decisions => {
+            let chip = ctx.decisions.as_ref()?;
+            match chip.offline {
+                true => format!("{TIP_DECISIONS}{}{TIP_DECISIONS_OFFLINE}", chip.endpoint),
+                false => format!("{TIP_DECISIONS}{}", chip.endpoint),
+            }
+        }
         StatusBarHitTarget::ConfigProblems => TIP_CONFIG_PROBLEMS.to_owned(),
         StatusBarHitTarget::TrustReview => TIP_TRUST_REVIEW.to_owned(),
         StatusBarHitTarget::Automations => match automations.unseen_failures {
@@ -2036,15 +2052,19 @@ fn usage_tip(stats: &UsageStats) -> Option<String> {
 }
 
 /// A control rather than a label: `/decisions` names what the engine last
-/// failed on.
+/// failed on, so an unreachable endpoint draws as a warning.
 fn push_decisions_status(strip: &mut Strip, ctx: &StatusBarContext<'_>) {
-    if ctx.decisions_offline {
+    if let Some(chip) = &ctx.decisions {
+        let style = match chip.offline {
+            true => theme::current().tool_warning,
+            false => control_style(ctx, StatusBarHitTarget::Decisions),
+        };
         strip.chip(
             ctx,
             StatusBarHitTarget::Decisions,
             [Span::styled(
-                DECISIONS_OFFLINE_LABEL,
-                theme::current().tool_warning,
+                format!("{DECISIONS_PREFIX}{}{DECISIONS_SUFFIX}", chip.endpoint),
+                style,
             )],
         );
     }
@@ -2540,7 +2560,17 @@ mod tests {
     const MISSING_SANDBOX_HIT_MSG: &str =
         "an attached session must reach its sandbox from the footer";
     const MISSING_DECISIONS_HIT_MSG: &str =
-        "an offline decision engine must be inspectable from the footer";
+        "an active decision endpoint must be inspectable from the footer";
+    const DECISION_ENDPOINT: &str = "tunnel";
+    const DECISIONS_CHIP: &str = "[decisions: tunnel]";
+    const DECISIONS_CHIP_PREFIX: &str = "[decisions";
+
+    fn decisions_chip(offline: bool) -> Option<DecisionsChip<'static>> {
+        Some(DecisionsChip {
+            endpoint: DECISION_ENDPOINT,
+            offline,
+        })
+    }
     const SANDBOX_CLIPPED_MSG: &str =
         "the bar drew part of the sandbox chip with no hit to click it";
     const SANDBOX_CROWDED_MSG: &str = "the sandbox chip pushed a footer control off the bar";
@@ -2612,7 +2642,7 @@ mod tests {
         global_cost: Option<f64>,
         show_global: bool,
         permission_mode: PermissionMode,
-        decisions_offline: bool,
+        decisions: Option<DecisionsChip<'a>>,
         waiting_questions: usize,
         config_problems: &'a [ConfigProblem],
         pending_trust: PendingTrust,
@@ -2646,7 +2676,7 @@ mod tests {
                 global_cost: None,
                 show_global: false,
                 permission_mode: PermissionMode::Ask,
-                decisions_offline: false,
+                decisions: None,
                 waiting_questions: 0,
                 config_problems: &[],
                 pending_trust: PendingTrust::default(),
@@ -2700,7 +2730,7 @@ mod tests {
                 fast: self.fast,
                 workflows: self.workflows,
                 permission_mode: self.permission_mode,
-                decisions_offline: self.decisions_offline,
+                decisions: self.decisions,
                 waiting_questions: self.waiting_questions,
                 config_problems: self.config_problems,
                 pending_trust: self.pending_trust,
@@ -2864,7 +2894,7 @@ mod tests {
             fast: true,
             workflows: ladder_workflows(),
             permission_mode: PermissionMode::Yolo,
-            decisions_offline: false,
+            decisions: None,
             waiting_questions: 0,
             config_problems: &[],
             pending_trust: PendingTrust::default(),
@@ -4372,19 +4402,22 @@ mod tests {
         )));
     }
 
-    #[test_case(PermissionMode::Ask, SINGLE_ROW; "ask_single")]
-    #[test_case(PermissionMode::Auto, SINGLE_ROW; "auto_single")]
-    #[test_case(PermissionMode::Yolo, SINGLE_ROW; "yolo_single")]
-    #[test_case(PermissionMode::Ask, SPLIT_ROWS; "ask_split")]
-    #[test_case(PermissionMode::Auto, SPLIT_ROWS; "auto_split")]
-    #[test_case(PermissionMode::Yolo, SPLIT_ROWS; "yolo_split")]
-    fn decisions_offline_is_a_warning_control_in_every_mode(
+    #[test_case(PermissionMode::Ask, SINGLE_ROW, true; "ask_single_offline")]
+    #[test_case(PermissionMode::Auto, SINGLE_ROW, true; "auto_single_offline")]
+    #[test_case(PermissionMode::Yolo, SINGLE_ROW, true; "yolo_single_offline")]
+    #[test_case(PermissionMode::Ask, SPLIT_ROWS, true; "ask_split_offline")]
+    #[test_case(PermissionMode::Auto, SPLIT_ROWS, true; "auto_split_offline")]
+    #[test_case(PermissionMode::Yolo, SPLIT_ROWS, true; "yolo_split_offline")]
+    #[test_case(PermissionMode::Auto, SINGLE_ROW, false; "auto_single_reachable")]
+    #[test_case(PermissionMode::Auto, SPLIT_ROWS, false; "auto_split_reachable")]
+    fn the_active_endpoint_is_a_control_in_every_mode(
         permission_mode: PermissionMode,
         rows: u16,
+        offline: bool,
     ) {
         let ctx = Fixture {
             permission_mode,
-            decisions_offline: true,
+            decisions: decisions_chip(offline),
             ..Default::default()
         }
         .into_ctx();
@@ -4396,17 +4429,21 @@ mod tests {
             .into_iter()
             .find(|hit| hit.target == StatusBarHitTarget::Decisions);
         let hit = hit.expect(MISSING_DECISIONS_HIT_MSG);
-        let offset = text.find(DECISIONS_OFFLINE_LABEL).unwrap();
+        let offset = text.find(DECISIONS_CHIP).unwrap();
         let start = text[..offset].width();
-        let end = start + DECISIONS_OFFLINE_LABEL.width();
+        let end = start + DECISIONS_CHIP.width();
         assert_eq!(
             (usize::from(hit.area.x), usize::from(hit.area.right())),
             (start, end)
         );
+        let expected = match offline {
+            true => theme::current().tool_warning,
+            false => theme::current().status_notice,
+        };
         assert!(
             drawn.styles[usize::from(row)][start..end]
                 .iter()
-                .all(|style| style.fg == theme::current().tool_warning.fg)
+                .all(|style| style.fg == expected.fg)
         );
         assert!(hit.target.accepts_click());
     }
@@ -4417,7 +4454,7 @@ mod tests {
     fn hovering_the_decisions_control_highlights_its_chip_alone(permission_mode: PermissionMode) {
         let (_, hits, styles) = render_at(Fixture {
             permission_mode,
-            decisions_offline: true,
+            decisions: decisions_chip(true),
             hovered: Some(StatusBarHitTarget::Decisions),
             ..Default::default()
         });
@@ -4442,7 +4479,7 @@ mod tests {
     #[test_case(PermissionMode::Ask, SPLIT_ROWS; "ask_split")]
     #[test_case(PermissionMode::Auto, SPLIT_ROWS; "auto_split")]
     #[test_case(PermissionMode::Yolo, SPLIT_ROWS; "yolo_split")]
-    fn decisions_status_is_absent_without_a_cached_failure(
+    fn decisions_status_is_absent_while_decisions_are_off(
         permission_mode: PermissionMode,
         rows: u16,
     ) {
@@ -4456,7 +4493,7 @@ mod tests {
             drawn
                 .rows
                 .iter()
-                .all(|row| !row.contains(DECISIONS_OFFLINE_LABEL))
+                .all(|row| !row.contains(DECISIONS_CHIP_PREFIX))
         );
         assert!(
             drawn
@@ -5413,6 +5450,21 @@ mod tests {
             Some(click) => assert!(tip.ends_with(click), "{TIP_MISSING}: {tip}"),
             None => assert!(!tip.contains(CLICK_MODEL), "{TIP_PROMISES_CLICK}: {tip}"),
         }
+    }
+
+    #[test_case(false; "reachable")]
+    #[test_case(true; "offline")]
+    fn the_decisions_tip_names_the_endpoint(offline: bool) {
+        let tip = tip_for(
+            StatusBarHitTarget::Decisions,
+            Fixture {
+                decisions: decisions_chip(offline),
+                ..Default::default()
+            },
+        );
+        assert!(tip.contains(DECISION_ENDPOINT), "{TIP_MISSING}: {tip}");
+        assert_eq!(tip.contains(TIP_DECISIONS_OFFLINE), offline, "{tip}");
+        assert!(tip.ends_with(CLICK_DETAILS), "{TIP_MISSING}: {tip}");
     }
 
     #[test]

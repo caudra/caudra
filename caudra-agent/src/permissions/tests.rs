@@ -33,12 +33,9 @@ pub(super) const SHELL_WORKDIR: &str = "/tmp";
 
 pub(super) const LEGACY_REQUEST_ID: &str = "legacy-request";
 
-/// The decision engine experiment is on; the tests that need it off build
-/// their config without it.
 pub(super) fn make_config(rules: Vec<PermissionRule>) -> PermissionsConfig {
     PermissionsConfig {
         rules,
-        decision_engine: true,
         ..Default::default()
     }
 }

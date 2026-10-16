@@ -6,11 +6,16 @@
 use std::sync::{Arc, LazyLock};
 
 use caudra_agent::automation::clock::{Clock, SystemClock};
-use caudra_agent::decisions::{DecisionNote, Decisions, stats_thresholds};
+use caudra_agent::decisions::{
+    DecisionNote, Decisions, DecisionsError, endpoint_api_key, resolve_decision_endpoint,
+    stats_thresholds,
+};
 use caudra_config::ClockFormat;
-use caudra_config::decisions::{DecisionThresholds, DecisionsConfig};
+use caudra_config::decisions::{DecisionEndpoint, DecisionThresholds, DecisionsConfig};
+use caudra_config::providers::ProvidersConfig;
 use caudra_storage::StateDir;
 use caudra_storage::decision_log::{DecisionFilter, DecisionLog, DecisionLogError};
+use caudra_storage::decisions::persist_active_decision_endpoint;
 use caudra_storage::engine_decisions::StoredEngineDecision;
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::SessionDatabase;
@@ -19,19 +24,158 @@ use ratatui::layout::Rect;
 use tracing::warn;
 
 use super::{App, DECISIONS_USAGE};
+use crate::components::Action;
 use crate::components::decisions_modal::{
     DecisionsAction, DecisionsFetchState, DecisionsModalContext, DecisionsScope, DecisionsSnapshot,
     RECENT_LIMIT, ScopeActivity,
 };
+use crate::components::model_picker::DecisionChoice;
 use crate::components::tool_display::format_timestamp_now;
 
 /// What the modal describes when no service is bound: the engine of an
 /// install that never configured one.
 static UNCONFIGURED: LazyLock<DecisionsConfig> = LazyLock::new(DecisionsConfig::default);
 
+const DECISIONS_OFF: &str = "Decisions off";
+const NO_DECISION_ENDPOINTS: &str = "No decision endpoints configured: add one with /login";
+
 type Scopes = [ScopeActivity; DecisionsScope::ALL.len()];
 
+/// Every `[decisions.<name>]` table in name order, with where its key comes
+/// from. A table that does not resolve lists with its error.
+pub(super) fn decision_choices(
+    providers: &ProvidersConfig,
+    state_dir: &StateDir,
+) -> Vec<DecisionChoice> {
+    providers
+        .decisions
+        .iter()
+        .map(|(name, def)| {
+            let endpoint = def.resolve(name).map_err(|error| error.to_string());
+            let key = endpoint.as_ref().ok().and_then(|endpoint| {
+                endpoint_api_key(endpoint, state_dir)
+                    .inspect_err(|error| warn!(endpoint = %name, %error, "decision key unreadable"))
+                    .ok()
+                    .flatten()
+                    .map(|key| key.source)
+            });
+            DecisionChoice {
+                name: name.clone(),
+                endpoint,
+                key,
+            }
+        })
+        .collect()
+}
+
+/// The endpoint after `active` among those that resolve, wrapping, or the
+/// first when decisions are off or the active one is not listed.
+fn next_decision_endpoint(providers: &ProvidersConfig, active: Option<&str>) -> Option<String> {
+    let valid: Vec<&String> = providers
+        .decisions
+        .iter()
+        .filter(|(name, def)| def.resolve(name).is_ok())
+        .map(|(name, _)| name)
+        .collect();
+    let next = active
+        .and_then(|active| valid.iter().position(|name| *name == active))
+        .map_or(0, |index| (index + 1) % valid.len());
+    valid.get(next).map(|name| (*name).clone())
+}
+
+/// A fresh engine for `name` over the `shared` settings. The active row moves
+/// only once it builds, so a failed switch leaves everything as it was.
+fn switch_decisions(
+    shared: &DecisionsConfig,
+    state_dir: &StateDir,
+    name: Option<&str>,
+    providers: impl FnOnce() -> ProvidersConfig,
+) -> Result<Decisions, DecisionsError> {
+    let endpoint = name
+        .map(|name| {
+            resolve_decision_endpoint(&providers(), name)?
+                .ok_or_else(|| DecisionsError::UnknownEndpoint(name.into()))
+        })
+        .transpose()?;
+    let decisions = Decisions::new(shared.clone().with_endpoint(endpoint), state_dir)?;
+    persist_active_decision_endpoint(state_dir, name).map_err(DecisionsError::ActiveRow)?;
+    Ok(decisions)
+}
+
+fn switched(decisions: &Decisions) -> String {
+    decisions.endpoint().map_or_else(
+        || DECISIONS_OFF.to_owned(),
+        |endpoint| format!("Decisions: {} · {}", endpoint.name, endpoint.model),
+    )
+}
+
 impl App {
+    /// The endpoint this session screens with, `None` while decisions are off.
+    pub fn active_decision_endpoint(&self) -> Option<DecisionEndpoint> {
+        self.permissions
+            .decisions()
+            .and_then(|decisions| decisions.endpoint().cloned())
+    }
+
+    /// Switches this session to `name`, or off for `None`, and answers the
+    /// session-free engine for the caller to hand every other session. A
+    /// failure is flashed and changes nothing.
+    pub(crate) fn switch_decision_endpoint(
+        &mut self,
+        name: Option<&str>,
+        providers: impl FnOnce() -> ProvidersConfig,
+    ) -> Option<Decisions> {
+        let shared = self
+            .permissions
+            .decisions()
+            .map_or_else(DecisionsConfig::default, |decisions| {
+                decisions.config().clone()
+            });
+        match switch_decisions(&shared, &self.storage, name, providers) {
+            Ok(decisions) => {
+                self.adopt_decisions(&decisions);
+                self.flash(switched(&decisions));
+                Some(decisions)
+            }
+            Err(error) => {
+                warn!(endpoint = name, %error, "decision endpoint switch failed");
+                self.flash(error.to_string());
+                None
+            }
+        }
+    }
+
+    pub(super) fn open_decision_model_picker(&mut self) -> Vec<Action> {
+        self.model_picker.open_decisions(
+            &self.state.model,
+            &self.model_policy,
+            self.active_decision_endpoint(),
+        );
+        vec![Action::RefreshModels]
+    }
+
+    /// `/decision-next`: the endpoint after the active one, in name order.
+    pub(super) fn cycle_decision_endpoint(
+        &mut self,
+        providers: impl FnOnce() -> ProvidersConfig,
+    ) -> Vec<Action> {
+        let active = self
+            .active_decision_endpoint()
+            .map(|endpoint| endpoint.name);
+        match next_decision_endpoint(&providers(), active.as_deref()) {
+            Some(name) => vec![Action::SetDecisionEndpoint(Some(name))],
+            None => {
+                self.flash(NO_DECISION_ENDPOINTS.into());
+                vec![]
+            }
+        }
+    }
+
+    pub(crate) fn adopt_decisions(&self, decisions: &Decisions) {
+        self.permissions
+            .set_decisions(Some(decisions.for_session(self.state.session.id)));
+    }
+
     pub(super) fn execute_decisions(&mut self, args: &str) {
         if !args.trim().is_empty() {
             self.flash(DECISIONS_USAGE.into());
@@ -90,7 +234,7 @@ impl App {
             status: &status,
             tainted: decisions.as_ref().is_some_and(Decisions::is_tainted),
             mode: &mode,
-            api_key_set: matches!(config.api_key(), Ok(Some(_))),
+            key_source: decisions.as_ref().and_then(Decisions::key_source),
             log_path: &log_path,
             clock: self.ui_config.clock_format,
         };
@@ -192,11 +336,15 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use arc_swap::ArcSwapOption;
     use async_trait::async_trait;
     use caudra_agent::decisions::{DecisionContext, DecisionFeature, PermissionPurpose};
-    use caudra_config::decisions::{DecisionFeatures, FeatureMode};
+    use caudra_config::decisions::{
+        DecisionEndpoint, DecisionEndpointDef, DecisionFeatures, DecisionProtocol, FeatureMode,
+    };
     use caudra_decision::{DecisionEngine, DecisionError, DecisionRequest, DecisionResponse};
     use caudra_storage::decision_log::{DecisionEffect, DecisionRecord, EndpointKind};
+    use caudra_storage::decisions::read_active_decision_endpoint;
     use caudra_storage::sessions::{SESSIONS_DB_FILE, SessionDatabase};
     use serde_json::json;
     use tempfile::TempDir;
@@ -205,11 +353,18 @@ mod tests {
     use super::*;
     use crate::agent::shared_queue;
     use crate::app::Msg;
-    use crate::app::tests::{DECISIONS_TEST_BASE_URL, click_status, private_tempdir, tempdir_app};
+    use crate::app::tests::{
+        DECISIONS_TEST_BASE_URL, click_status, cmd, private_tempdir, tempdir_app,
+    };
+    use crate::components::Action;
+    use crate::components::Overlay;
     use crate::components::keybindings::key;
+    use crate::components::login_picker::LoginPickerAction;
+    use crate::components::model_picker::{ModelPicker, ModelPickerAction};
     use crate::components::now_secs;
     use crate::components::status_bar::StatusBarHitTarget;
 
+    const DECISION_MODEL_COMMAND: &str = "/decision-model";
     const OTHER_SESSION: &str = "other-session";
     const OTHER_PROJECT: &str = "/elsewhere";
     const QUESTION_SET: &str = "test-questions";
@@ -414,7 +569,11 @@ mod tests {
     fn clicking_the_offline_chip_opens_the_inspector() {
         let (_tmp, mut app) = isolated_app();
         let config = DecisionsConfig {
-            base_url: Some(DECISIONS_TEST_BASE_URL.parse().unwrap()),
+            endpoint: Some(DecisionEndpoint::new(
+                DecisionProtocol::TypeSafe.as_str(),
+                DecisionProtocol::TypeSafe,
+                DECISIONS_TEST_BASE_URL.parse().unwrap(),
+            )),
             features: DecisionFeatures {
                 permission_advice: FeatureMode::Shadow,
                 ..Default::default()
@@ -433,5 +592,212 @@ mod tests {
 
         assert!(app.decisions_modal.is_open());
         assert_eq!(app.status_hover, None);
+    }
+
+    const ENDPOINT: &str = "tunnel";
+    const UNKNOWN_ENDPOINT: &str = "gone";
+    const SWITCHED_FLASH: &str = "Decisions: tunnel · test-decision-model";
+    const LAST_ENDPOINT: &str = "zeta";
+    const BROKEN_ENDPOINT: &str = "broken";
+    const REMOTE_HTTP_URL: &str = "http://192.0.2.1";
+
+    fn endpoint_def(base_url: &str) -> DecisionEndpointDef {
+        DecisionEndpointDef {
+            protocol: DecisionProtocol::OpenAI,
+            base_url: base_url.into(),
+            model: Some(MODEL.into()),
+            api_key_env: None,
+            allow_http: None,
+        }
+    }
+
+    fn endpoint_providers() -> ProvidersConfig {
+        let mut providers = ProvidersConfig::default();
+        providers
+            .decisions
+            .insert(ENDPOINT.into(), endpoint_def(DECISIONS_TEST_BASE_URL));
+        providers
+    }
+
+    /// `broken` sorts first but never resolves, so cycling skips it.
+    fn cycle_providers() -> ProvidersConfig {
+        let mut providers = endpoint_providers();
+        providers
+            .decisions
+            .insert(LAST_ENDPOINT.into(), endpoint_def(DECISIONS_TEST_BASE_URL));
+        providers
+            .decisions
+            .insert(BROKEN_ENDPOINT.into(), endpoint_def(REMOTE_HTTP_URL));
+        providers
+    }
+
+    fn active_name(app: &App) -> Option<String> {
+        app.active_decision_endpoint().map(|endpoint| endpoint.name)
+    }
+
+    #[test]
+    fn switching_to_an_endpoint_rebuilds_the_session_engine() {
+        let (_tmp, mut app) = isolated_app();
+
+        let decisions = app.switch_decision_endpoint(Some(ENDPOINT), endpoint_providers);
+
+        assert!(decisions.is_some_and(|decisions| decisions.session().is_none()));
+        assert_eq!(active_name(&app).as_deref(), Some(ENDPOINT));
+        assert_eq!(
+            app.permissions
+                .decisions()
+                .and_then(|decisions| decisions.session()),
+            Some(app.state.session.id)
+        );
+        assert_eq!(
+            read_active_decision_endpoint(&app.storage).as_deref(),
+            Some(ENDPOINT)
+        );
+        assert_eq!(app.status_bar.flash_text(), Some(SWITCHED_FLASH));
+    }
+
+    #[test]
+    fn switching_off_drops_the_endpoint() {
+        let (_tmp, mut app) = isolated_app();
+        app.switch_decision_endpoint(Some(ENDPOINT), endpoint_providers);
+
+        assert!(
+            app.switch_decision_endpoint(None, endpoint_providers)
+                .is_some()
+        );
+
+        assert_eq!(active_name(&app), None);
+        assert_eq!(read_active_decision_endpoint(&app.storage), None);
+        assert_eq!(app.status_bar.flash_text(), Some(DECISIONS_OFF));
+    }
+
+    #[test_case(true; "active")]
+    #[test_case(false; "inactive")]
+    fn a_configured_endpoint_switches_only_when_active(activate: bool) {
+        let (_tmp, mut app) = isolated_app();
+
+        let actions = app.handle_login_picker_action(LoginPickerAction::DecisionConfigured {
+            name: ENDPOINT.into(),
+            activate,
+        });
+
+        let switched: Vec<_> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::SetDecisionEndpoint(name) => name.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            switched,
+            activate.then_some(ENDPOINT).into_iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_unknown_endpoint_flashes_and_changes_nothing() {
+        let (_tmp, mut app) = isolated_app();
+        app.switch_decision_endpoint(Some(ENDPOINT), endpoint_providers);
+
+        assert!(
+            app.switch_decision_endpoint(Some(UNKNOWN_ENDPOINT), endpoint_providers)
+                .is_none()
+        );
+
+        assert_eq!(active_name(&app).as_deref(), Some(ENDPOINT));
+        assert_eq!(
+            read_active_decision_endpoint(&app.storage).as_deref(),
+            Some(ENDPOINT)
+        );
+        assert_eq!(
+            app.status_bar.flash_text(),
+            Some(
+                DecisionsError::UnknownEndpoint(UNKNOWN_ENDPOINT.into())
+                    .to_string()
+                    .as_str()
+            )
+        );
+    }
+
+    #[test_case(None, ENDPOINT; "off_picks_the_first_valid")]
+    #[test_case(Some(ENDPOINT), LAST_ENDPOINT; "steps_forward")]
+    #[test_case(Some(LAST_ENDPOINT), ENDPOINT; "last_wraps_to_first")]
+    fn decision_next_cycles_through_valid_endpoints(active: Option<&str>, expected: &str) {
+        let (_tmp, mut app) = isolated_app();
+        if let Some(name) = active {
+            app.switch_decision_endpoint(Some(name), cycle_providers);
+        }
+
+        let actions = app.cycle_decision_endpoint(cycle_providers);
+
+        assert!(matches!(
+            &actions[..],
+            [Action::SetDecisionEndpoint(Some(name))] if name == expected
+        ));
+    }
+
+    #[test]
+    fn decision_next_without_endpoints_says_how_to_add_one() {
+        let (_tmp, mut app) = isolated_app();
+
+        assert!(
+            app.cycle_decision_endpoint(ProvidersConfig::default)
+                .is_empty()
+        );
+
+        assert_eq!(app.status_bar.flash_text(), Some(NO_DECISION_ENDPOINTS));
+    }
+
+    #[test]
+    fn choices_list_every_table_and_explain_the_invalid_one() {
+        let (_tmp, app) = isolated_app();
+
+        let choices = decision_choices(&cycle_providers(), &app.storage);
+
+        let names: Vec<_> = choices.iter().map(|choice| choice.name.as_str()).collect();
+        assert_eq!(names, [BROKEN_ENDPOINT, ENDPOINT, LAST_ENDPOINT]);
+        assert!(choices[0].endpoint.is_err());
+        assert!(
+            choices[1..]
+                .iter()
+                .all(|choice| choice.endpoint.is_ok() && choice.key.is_none())
+        );
+    }
+
+    #[test]
+    fn decision_model_opens_the_picker() {
+        let (_tmp, mut app) = isolated_app();
+        app.model_picker = ModelPicker::new(Arc::new(ArcSwapOption::empty()));
+
+        let actions = app.execute_command(cmd(DECISION_MODEL_COMMAND), 0);
+
+        assert!(app.model_picker.is_open());
+        assert!(matches!(&actions[..], [Action::RefreshModels]));
+    }
+
+    #[test_case(None; "off")]
+    #[test_case(Some(ENDPOINT); "endpoint")]
+    fn a_picked_decision_switches_the_endpoint(name: Option<&str>) {
+        let (_tmp, mut app) = isolated_app();
+
+        let actions =
+            app.handle_model_picker_action(ModelPickerAction::SelectDecision(name.map(Into::into)));
+
+        assert!(matches!(
+            &actions[..],
+            [Action::SetDecisionEndpoint(picked)] if picked.as_deref() == name
+        ));
+    }
+
+    #[test]
+    fn adding_an_endpoint_opens_login_at_the_decision_section() {
+        let (_tmp, mut app) = isolated_app();
+
+        let actions = app.handle_model_picker_action(ModelPickerAction::AddDecisionEndpoint);
+
+        assert!(actions.is_empty());
+        assert!(!app.model_picker.is_open());
+        assert!(app.login_picker.is_open());
+        assert!(app.login_picker.on_decision_row());
     }
 }

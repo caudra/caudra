@@ -323,7 +323,6 @@ impl Cli {
             .mut_arg("endpoint", |arg| arg.hide(direct_off))
             .mut_arg("cwd", |arg| arg.hide(direct_off))
             .mut_arg("credential_ref", |arg| arg.hide(direct_off))
-            .mut_arg("auto", |arg| arg.hide(off(Feature::DecisionEngine)))
             .mut_arg("name", |arg| arg.hide(off(Feature::CrossSessionMessaging)))
             .mut_arg("topics", |arg| {
                 arg.hide(off(Feature::CrossSessionMessaging))
@@ -340,9 +339,6 @@ impl Cli {
             .mut_subcommand("sandbox", |command| command.hide(sandboxes_off))
             .mut_subcommand("remote", |command| {
                 command.hide(sandboxes_off && direct_off)
-            })
-            .mut_subcommand("decisions", |command| {
-                command.hide(off(Feature::DecisionEngine))
             })
             .mut_subcommand("message", |command| {
                 command.hide(off(Feature::CrossSessionMessaging))
@@ -676,7 +672,7 @@ pub enum Command {
         #[command(subcommand)]
         action: StorageAction,
     },
-    #[command(about = "Inspect and export the opt-in decision-engine log")]
+    #[command(about = "Manage decision endpoints and inspect the opt-in decision-engine log")]
     Decisions {
         #[command(subcommand)]
         action: DecisionAction,
@@ -976,6 +972,15 @@ fn example_file_parser() -> impl TypedValueParser<Value = &'static ConfigFile> {
 pub enum DecisionAction {
     #[command(about = "Show decision-engine configuration without contacting the endpoint")]
     Status,
+    #[command(about = "List configured decision endpoints and which one is active")]
+    List,
+    #[command(
+        about = "Make a configured decision endpoint active for new sessions, or turn decisions off"
+    )]
+    Use {
+        #[arg(value_name = "NAME|off")]
+        name: String,
+    },
     #[command(about = "Show logged decision counts, latency and labelled agreement as JSON")]
     Stats {
         #[arg(long)]
@@ -1339,7 +1344,8 @@ pub enum AuthAction {
     },
     /// Authenticate with a provider (interactive if no provider specified)
     Login {
-        /// Provider slug (e.g. zai, openai, xai). Omit for interactive selection.
+        /// Provider slug (e.g. zai, openai, xai). Omit for interactive selection. With
+        /// --decision: a preset (typesafe, openai), custom, or a configured endpoint name.
         provider: Option<String>,
         /// Authentication method: oauth or api-key for Anthropic and OpenAI, oauth or import for
         /// copilot and copilot-enterprise
@@ -1348,11 +1354,17 @@ pub enum AuthAction {
         /// GitHub Enterprise hostname for copilot-enterprise (e.g. company.ghe.com)
         #[arg(long, requires = "provider")]
         hostname: Option<String>,
+        /// Set up a decision model endpoint instead of a chat provider
+        #[arg(long, conflicts_with_all = ["method", "hostname"])]
+        decision: bool,
     },
     /// Remove stored credentials for a provider
     Logout {
-        /// Provider slug (e.g. openai, xai)
+        /// Provider slug (e.g. openai, xai), or with --decision a decision endpoint name
         provider: String,
+        /// Remove a decision endpoint: its stored key and its providers.toml table
+        #[arg(long)]
+        decision: bool,
     },
     /// Show authentication status for all providers
     Status,
@@ -2510,8 +2522,53 @@ mod tests {
                     provider: Some(provider),
                     method: Some(AuthMethod::ApiKey),
                     hostname: None,
+                    decision: false,
                 }
             }) if provider == "openai"
+        ));
+    }
+
+    #[test_case(&["caudra", "auth", "login", "--decision"], None; "menu")]
+    #[test_case(&["caudra", "auth", "login", "--decision", "openai"], Some("openai"); "preset")]
+    #[test_case(&["caudra", "auth", "login", "custom", "--decision"], Some("custom"); "custom")]
+    fn decision_login_parses(args: &[&str], expected: Option<&str>) {
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Auth {
+                action: AuthAction::Login { provider, decision: true, .. }
+            }) if provider.as_deref() == expected
+        ));
+    }
+
+    #[test_case(&["caudra", "auth", "login", "openai", "--decision", "--method", "api-key"]; "method")]
+    #[test_case(&["caudra", "auth", "login", "openai", "--decision", "--hostname", "company.ghe.com"]; "hostname")]
+    fn decision_login_rejects_provider_flags(args: &[&str]) {
+        assert_eq!(
+            Cli::try_parse_from(args).err().map(|error| error.kind()),
+            Some(ErrorKind::ArgumentConflict)
+        );
+    }
+
+    #[test]
+    fn decision_logout_parses() {
+        let cli =
+            Cli::try_parse_from(["caudra", "auth", "logout", "--decision", "tunnel"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Auth {
+                action: AuthAction::Logout { provider, decision: true }
+            }) if provider == "tunnel"
+        ));
+    }
+
+    #[test_case("tunnel"; "endpoint")]
+    #[test_case("off"; "off")]
+    fn decisions_use_parses(name: &str) {
+        let cli = Cli::try_parse_from(["caudra", "decisions", "use", name]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Decisions { action: DecisionAction::Use { name: parsed } }) if parsed == name
         ));
     }
 

@@ -4692,6 +4692,7 @@ fn add_opaque_blob_tokens(total: &mut u32, blob: &str) {
 
 #[cfg(test)]
 mod tests {
+    use caudra_config::decisions::{DecisionEndpoint, DecisionProtocol};
     include!("automation_tests.rs");
     include!("autopilot_tests.rs");
     include!("owned_jobs_tests.rs");
@@ -4876,7 +4877,11 @@ mod tests {
         calls: Arc<AtomicUsize>,
     ) -> Decisions {
         let mut config = DecisionsConfig {
-            base_url: Some(DECISION_BASE_URL.parse().unwrap()),
+            endpoint: Some(DecisionEndpoint::new(
+                DecisionProtocol::TypeSafe.as_str(),
+                DecisionProtocol::TypeSafe,
+                DECISION_BASE_URL.parse().unwrap(),
+            )),
             log: true,
             ..DecisionsConfig::default()
         };
@@ -6949,7 +6954,6 @@ mod tests {
                 caudra_config::PermissionsConfig {
                     default: caudra_config::DefaultEffect::Allow,
                     rules: vec![],
-                    decision_engine: true,
                     ..Default::default()
                 },
                 std::path::PathBuf::from("/tmp"),

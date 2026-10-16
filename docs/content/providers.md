@@ -13,6 +13,8 @@ Caudra routes work through eleven jobs: **Chat**, **Plan**, **Subagent**, **Comp
 
 Press `Ctrl+F` on a model to mark it as a favorite, and again to unmark it. The list shows your favorites first, newest first, then the last 10 models you switched to under Recent. With favorites, `/model` opens on the current model's favorite row, or on the first favorite, instead of on the Chat job. Each model also stays in its provider's section, where a `★` marks a favorite and a `↺` a recent model. `/favorite-next` or `Ctrl+X c` switches Chat to the favorite after the current model, and to the first favorite when the current model is not one. Favorites are saved globally, like bindings, and a favorite that `allowed_models` or `excluded_models` rules out is not shown. A task model name such as `sonnet` runs on the favorite it matches, and the main agent is told your favorites. See [Models and reasoning](/docs/commands/#models-and-reasoning).
 
+The last row of the Jobs section, **Decisions**, names the active decision endpoint, or `off`. Select it to switch endpoints, turn decisions off, or add an endpoint through `/login`. An endpoint whose table does not validate stays listed with its error. `/decision-model` opens that page directly, and `/decision-next` or `Ctrl+X d` switches to the next valid endpoint in name order. Decision endpoints never appear under Favorites or Recent.
+
 Bindings are saved globally in the `model.purposes` row of Caudra's SQLite state database and apply across sessions. Unbound jobs use these rules:
 
 | Job | Default when unbound |
@@ -567,6 +569,57 @@ Provider-level fields apply to every model from that upstream. Per-model entries
 | `models` | table | `{}` | Overrides for single models, keyed by model id, which win key by key. Quote an id that holds a dot, such as `models."qwen-3.6"` |
 
 Caudra sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.AI), and Aperture appends that path to the upstream's base url. If an upstream base url already carries its own path, set `path_prefix = ""` for it to avoid a doubled path. Z.AI defaults to no prefix since its API path has no `/v1` segment; point the upstream base url at the full API root (e.g. `https://api.z.ai/api/paas/v4`).
+
+### Decision endpoints
+
+The optional typed decision engine behind [Auto mode](/docs/permissions/#auto-mode), workflow [`decide()` calls](/docs/workflows/#typed-decisions), and the [`decide()` and `rerank()` helpers](/docs/code/#decisions-and-reranking) sends its requests to a decision endpoint. Each endpoint is a `[decisions.<name>]` table in this file. One endpoint is active at a time, and with none active the engine is off. The settings every endpoint shares, such as deadlines, features, and thresholds, stay in [`[decisions]`](/docs/configuration/#decisions) in `caudra.toml`.
+
+The quickest way to add one is `caudra auth login --decision`, or the **Decision models** section of `/login`. Both offer two presets, **TypeSafe Jev** (`typesafe`) and **OpenAI Luna** (`openai`), and a custom endpoint, which asks for a name, the protocol, the base URL, the model, and a key. Login writes the table, saves the key, and makes a new endpoint active. Logging in again to an existing endpoint replaces its key and keeps whichever endpoint is active. The presets write these tables:
+
+```toml
+[decisions.typesafe]
+protocol = "typesafe"
+base_url = "https://api.typesafe.ai"
+model = "jev-latest"
+api_key_env = "TYPESAFE_API_KEY"
+
+[decisions.openai]
+protocol = "openai"
+base_url = "https://api.openai.com/v1"
+model = "gpt-6-luna"
+api_key_env = "OPENAI_API_KEY"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `protocol` | string | required | Decision wire protocol: `typesafe` or `openai`. Never inferred from the URL or model. |
+| `base_url` | string | required | Decision API base URL. TypeSafe takes a root such as `https://api.typesafe.ai` and appends `/v1/systemone`. OpenAI takes a versioned base such as `https://api.openai.com/v1` and appends `/decisions`. A path prefix stays, and a full endpoint is rejected. `{env:NAME}` reads the base from the environment. HTTPS is required, except for numeric loopback HTTP or with `allow_http`. No credentials, query, fragment, whitespace, or control characters. |
+| `model` | string | `jev-latest` for typesafe, `gpt-6-luna` for openai | Decision model identifier, nonblank and without control characters. |
+| `api_key_env` | string | unset | Environment variable holding the credential when no key is saved for this endpoint, never the credential itself. Project environment values are excluded. The presets set `TYPESAFE_API_KEY` and `OPENAI_API_KEY`. |
+| `allow_http` | boolean | `false` | Opt-in for plain HTTP to a non-loopback host. Use only with transport protection you control, such as a trusted encrypted tunnel. |
+
+`protocol = "typesafe"` appends `/v1/systemone` to a root base URL. A path prefix stays in place, so a server mounted under `/typesafe` uses `base_url = "http://127.0.0.1:8080/typesafe"` and receives requests at `/typesafe/v1/systemone`. `protocol = "openai"` appends `/decisions` to a versioned base URL, such as `https://api.openai.com/v1` for the hosted OpenAI Decisions API. Leave the appended path out of `base_url`, because a full endpoint is rejected.
+
+Configuring an endpoint is the consent to send decision context to it, so HTTPS needs no other opt-in. Plain HTTP to numeric loopback, such as `127.0.0.1` or `[::1]`, needs nothing either. Plain HTTP to any other host needs `allow_http = true`, which sends decision context and the key without TLS. Use it only with transport protection you control, such as a trusted encrypted tunnel. `localhost` is a DNS name for this rule, and private and CGNAT addresses get no exemption. For a local ninfer server, or one behind a tunnel, use the OpenAI protocol with the model name the server actually serves. `systemone-decision-v7` is not a Luna alias:
+
+```toml
+[decisions.local]
+protocol = "openai"
+base_url = "http://127.0.0.1:8080/v1"
+model = "systemone-decision-v7"
+
+[decisions.tunnel]
+protocol = "openai"
+base_url = "http://100.64.0.2:8080/v1"
+model = "systemone-decision-v7"
+allow_http = true
+```
+
+Requests ignore ambient proxies and do not follow redirects. These settings do not change Workcell transport policy.
+
+A key saved by login, in `auth/decisions/<name>.json` under the state directory, wins. Otherwise Caudra reads the global environment variable that `api_key_env` names, never a value from a project `.env` file. A custom endpoint has no `api_key_env` until you add one, and an endpoint with no key sends none, which suits a local server. To take the base URL from the environment, write `base_url = "{env:TYPESAFE_BASE_URL}"`. The `TYPESAFE_BASE_URL` and `OPENAI_BASE_URL` variables do not change a decision endpoint on their own.
+
+Switch the active endpoint with the **Decisions** row of `/model`, `/decision-model`, `/decision-next` (`Ctrl+X d`), or `caudra decisions use <name|off>`. `caudra decisions list` shows every endpoint, its key source, and which one is active. The choice is saved globally. A switch in the TUI applies to every open session of that process at once, and other Caudra processes and headless runs read it when they start. An edit to the active endpoint's table applies when you select the endpoint again or restart. When the active endpoint's table is gone, decisions are off and Caudra logs a warning that names it. `caudra auth logout --decision <name>` deletes the saved key and the table, and turns decisions off when that endpoint was active.
 
 ### Plans
 

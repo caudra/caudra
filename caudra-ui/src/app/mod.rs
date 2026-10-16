@@ -53,6 +53,7 @@ use caudra_workbench::{DocumentKey, Layout as WorkbenchLayout, Workbench, Workbe
 use crate::agent::ModelSlot;
 use crate::agent::SharedMode;
 use crate::agent::ToolsPreviewSource;
+use crate::app::decisions::decision_choices;
 use crate::app::env::ShellEnvLink;
 use crate::app::tasks::TaskOutcome;
 use crate::app::workbench::{MountScope, StoredDocument};
@@ -168,6 +169,7 @@ use caudra_agent::{
     QueueItemId, SharedHistory, SteeringQueue, SubagentInfo, ToolOutput, project_for_inspection,
 };
 use caudra_automation::event::{StartedBy, TurnOutcome};
+use caudra_config::providers::ProvidersConfig;
 use caudra_config::{
     Feature, FeatureDisabled, FeatureFlags, ModelPolicy, PermissionsConfig, SnapshotsConfig,
     UiConfig,
@@ -825,7 +827,10 @@ impl App {
             theme_picker: ThemePicker::new(),
             thinking_picker: ThinkingPicker::new(),
             prompt_profile_picker: PromptProfilePicker::new(Arc::clone(&prompt_profiles)),
-            model_picker: ModelPicker::new(available_models),
+            model_picker: ModelPicker::new(available_models).with_decision_source({
+                let storage = storage.clone();
+                move || decision_choices(&ProvidersConfig::load(), &storage)
+            }),
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             env_modal: EnvModal::new(),
@@ -2962,6 +2967,12 @@ impl App {
                 self.toggle_favorite_model(&spec);
                 vec![]
             }
+            ModelPickerAction::SelectDecision(name) => vec![Action::SetDecisionEndpoint(name)],
+            ModelPickerAction::AddDecisionEndpoint => {
+                self.model_picker.close();
+                self.login_picker.open_decisions(self.storage.clone());
+                vec![]
+            }
             ModelPickerAction::Copy(text) => {
                 self.copy_to_clipboard(&text);
                 vec![]
@@ -3252,7 +3263,9 @@ impl App {
     fn handle_login_picker_action(&mut self, action: LoginPickerAction) -> Vec<Action> {
         let closed = !matches!(
             &action,
-            LoginPickerAction::Consumed | LoginPickerAction::Copy(_)
+            LoginPickerAction::Consumed
+                | LoginPickerAction::Copy(_)
+                | LoginPickerAction::DecisionConfigured { .. }
         );
         let actions = match action {
             LoginPickerAction::Consumed | LoginPickerAction::Close => Vec::new(),
@@ -3276,6 +3289,10 @@ impl App {
                 provider,
                 model_spec,
             }],
+            LoginPickerAction::DecisionConfigured { name, activate } => activate
+                .then(|| Action::SetDecisionEndpoint(Some(name)))
+                .into_iter()
+                .collect(),
         };
         if closed {
             self.login_picker.close();
@@ -3537,8 +3554,11 @@ impl App {
                 self.sync_todo_panel();
             }
             BuiltinAction::ModelPicker => {
-                self.model_picker
-                    .open(&self.state.model, &self.model_policy);
+                self.model_picker.open(
+                    &self.state.model,
+                    &self.model_policy,
+                    self.active_decision_endpoint(),
+                );
                 return vec![Action::RefreshModels];
             }
             BuiltinAction::ViewToggle => {
@@ -3926,6 +3946,9 @@ impl App {
         }
         if leader::CYCLE_FAVORITE.matches(key) {
             return self.cycle_favorite_model();
+        }
+        if leader::CYCLE_DECISION.matches(key) {
+            return self.cycle_decision_endpoint(ProvidersConfig::load);
         }
         if leader::WORKFLOWS.matches(key) {
             return self.execute_workflow("");
@@ -6036,11 +6059,16 @@ impl App {
             },
             "/rename" => self.rename_session(&cmd.args),
             "/model" => {
-                self.model_picker
-                    .open(&self.state.model, &self.model_policy);
+                self.model_picker.open(
+                    &self.state.model,
+                    &self.model_policy,
+                    self.active_decision_endpoint(),
+                );
                 vec![Action::RefreshModels]
             }
             "/favorite-next" => self.cycle_favorite_model(),
+            "/decision-model" => self.open_decision_model_picker(),
+            "/decision-next" => self.cycle_decision_endpoint(ProvidersConfig::load),
             "/system-prompt" => {
                 self.execute_system_prompt();
                 vec![]
@@ -6177,6 +6205,7 @@ impl App {
         self.model_picker.open_purpose(
             &self.state.model,
             &self.model_policy,
+            self.active_decision_endpoint(),
             caudra_providers::ModelPurpose::Goal,
         );
         vec![Action::RefreshModels]

@@ -4808,7 +4808,9 @@ mod tests {
         AgentMode, ContentBlock, Envelope, EventSender, History, Mention, Message, StoredSession,
         TaskCard, ToolFilter,
     };
-    use caudra_config::decisions::{DecisionsConfig, FeatureMode};
+    use caudra_config::decisions::{
+        DecisionEndpoint, DecisionProtocol, DecisionsConfig, FeatureMode,
+    };
     use caudra_config::shell_env::ShellEnvConfig;
     use caudra_config::{
         AgentConfig, DefaultEffect, Effect, ExecutionMode, PermissionRule, PermissionsConfig,
@@ -7494,10 +7496,7 @@ mod tests {
             let root = TempDir::new().expect("project");
             let (_host, registry) = host_and_registry(root.path());
             let manager = PermissionManager::new_nonpersistent(
-                PermissionsConfig {
-                    decision_engine: true,
-                    ..PermissionsConfig::default()
-                },
+                PermissionsConfig::default(),
                 root.path().to_path_buf(),
                 Arc::default(),
             );
@@ -7883,7 +7882,6 @@ mod tests {
             ctx.permissions = Arc::new(PermissionManager::new_nonpersistent(
                 PermissionsConfig {
                     default: DefaultEffect::Allow,
-                    decision_engine: true,
                     ..PermissionsConfig::default()
                 },
                 root.to_path_buf(),
@@ -8028,7 +8026,11 @@ mod tests {
         source_code_graph_tree(root.path());
         let input = json!({ "task": SOURCE_CODE_CONTEXT_TASK });
         let mut config = DecisionsConfig {
-            base_url: Some(DECISION_BASE_URL.parse().expect("decision URL")),
+            endpoint: Some(DecisionEndpoint::new(
+                DecisionProtocol::TypeSafe.as_str(),
+                DecisionProtocol::TypeSafe,
+                DECISION_BASE_URL.parse().expect("decision URL"),
+            )),
             ..DecisionsConfig::default()
         };
         config.features.source_code_context = mode;

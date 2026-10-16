@@ -6,6 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
 use caudra_config::ModelPolicy;
+use caudra_config::decisions::{DecisionEndpoint, DecisionKeySource};
 use caudra_grab::grab_scope;
 use caudra_providers::dynamic;
 use caudra_providers::model_registry::{self, Binding};
@@ -40,6 +41,17 @@ const UNAVAILABLE_PREFIX: &str = "Unavailable: ";
 const JOB_KEY_PREFIX: &str = "@job:";
 const PICKER_WIDTH_PERCENT: u16 = 90;
 const UNBIND_LABEL: &str = "R";
+const DECISIONS_ROW: &str = "Decisions";
+const DECISIONS_TITLE: &str = " Models · Decisions ";
+const DECISIONS_SECTION: &str = "Decision endpoint";
+const DECISIONS_OFF: &str = "off";
+const DECISIONS_OFF_DETAIL: &str = "no endpoint screens tool calls";
+const DECISION_OFF_ROW: &str = "Off";
+const DECISION_ADD_ROW: &str = "Add decision endpoint…";
+const DECISION_ADD_DETAIL: &str = "opens /login";
+const DECISION_INVALID: &str = "invalid";
+const DECISION_KEY_PREFIX: &str = "key: ";
+const DECISION_SPEC_PREFIX: &str = "@decision:";
 
 fn home_footer_line() -> Vec<Hint> {
     vec![
@@ -58,6 +70,10 @@ fn assignment_footer_line() -> Vec<Hint> {
     ]
 }
 
+fn decisions_footer_line() -> Vec<Hint> {
+    vec![Hint::bind(key::ENTER, "use"), Hint::bind(key::ESC, "back")]
+}
+
 fn is_reset_key(key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('R') => key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT,
@@ -72,8 +88,31 @@ pub enum ModelPickerAction {
     Bind(ModelPurpose, Binding),
     Unbind(ModelPurpose),
     ToggleFavorite(String),
+    /// The endpoint to screen with, `None` for off.
+    SelectDecision(Option<String>),
+    AddDecisionEndpoint,
     Close,
     Copy(String),
+}
+
+/// One `[decisions.<name>]` table as the Decisions page lists it, read once
+/// when the page opens.
+pub struct DecisionChoice {
+    pub name: String,
+    /// Why the table does not resolve, shown in place of its details.
+    pub endpoint: Result<DecisionEndpoint, String>,
+    pub key: Option<DecisionKeySource>,
+}
+
+type DecisionSource = Box<dyn Fn() -> Vec<DecisionChoice>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DecisionRow {
+    /// The Home row that opens the Decisions page.
+    Menu,
+    Off,
+    Endpoint(String),
+    Add,
 }
 
 struct ModelEntry {
@@ -86,6 +125,7 @@ struct ModelEntry {
     claimed_by: Vec<ModelPurpose>,
     binds: Option<Binding>,
     job: Option<ModelPurpose>,
+    decision: Option<DecisionRow>,
     selected: bool,
     free: bool,
     mark: Option<&'static str>,
@@ -109,6 +149,9 @@ impl ModelEntry {
     }
 
     fn identity(&self) -> RowIdentity {
+        if let Some(row) = &self.decision {
+            return RowIdentity::Decision(row.clone());
+        }
         if let Some(purpose) = self.job {
             return RowIdentity::Job(purpose);
         }
@@ -164,11 +207,13 @@ fn title_for(purpose: ModelPurpose) -> String {
 enum PickerPage {
     Home,
     Job(ModelPurpose),
+    Decisions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RowIdentity {
     Job(ModelPurpose),
+    Decision(DecisionRow),
     Binding(Option<ModelPurpose>),
     /// A row in Favorites or Recent, told apart by section because a model can
     /// sit in either.
@@ -183,7 +228,7 @@ impl RowIdentity {
     fn model_spec(&self) -> Option<&str> {
         match self {
             Self::Shortlisted { spec, .. } | Self::ExactModel(spec) => Some(spec),
-            Self::Job(_) | Self::Binding(_) => None,
+            Self::Job(_) | Self::Decision(_) | Self::Binding(_) => None,
         }
     }
 }
@@ -206,6 +251,9 @@ pub struct ModelPicker {
     binding: Option<Binding>,
     needs_rebuild: bool,
     anchor: Option<SelectionAnchor>,
+    active_decision: Option<DecisionEndpoint>,
+    decision_choices: Vec<DecisionChoice>,
+    decision_source: DecisionSource,
 }
 
 impl ModelPicker {
@@ -226,7 +274,19 @@ impl ModelPicker {
             binding: None,
             needs_rebuild: false,
             anchor: None,
+            active_decision: None,
+            decision_choices: Vec::new(),
+            decision_source: Box::new(Vec::new),
         }
+    }
+
+    /// Where the Decisions page reads its endpoints from when it opens.
+    pub fn with_decision_source(
+        mut self,
+        source: impl Fn() -> Vec<DecisionChoice> + 'static,
+    ) -> Self {
+        self.decision_source = Box::new(source);
+        self
     }
 
     pub fn set_recents(&mut self, recents: Vec<String>) {
@@ -247,9 +307,17 @@ impl ModelPicker {
         &self.favorites
     }
 
-    pub fn open(&mut self, current_model: &Model, model_policy: &ModelPolicy) {
+    /// `active_decision` is the endpoint the session screens with, `None`
+    /// while decisions are off.
+    pub fn open(
+        &mut self,
+        current_model: &Model,
+        model_policy: &ModelPolicy,
+        active_decision: Option<DecisionEndpoint>,
+    ) {
         self.current_model = Some(current_model.clone());
         self.model_policy = Some(model_policy.clone());
+        self.active_decision = active_decision;
         self.anchor = None;
         self.needs_rebuild = false;
         let _ = self.available.poll(self.models.load_full());
@@ -261,12 +329,23 @@ impl ModelPicker {
         &mut self,
         current_model: &Model,
         model_policy: &ModelPolicy,
+        active_decision: Option<DecisionEndpoint>,
         purpose: ModelPurpose,
     ) {
-        self.open(current_model, model_policy);
+        self.open(current_model, model_policy, active_decision);
         if purpose != ModelPurpose::Chat {
             self.open_job_page(purpose);
         }
+    }
+
+    pub fn open_decisions(
+        &mut self,
+        current_model: &Model,
+        model_policy: &ModelPolicy,
+        active_decision: Option<DecisionEndpoint>,
+    ) {
+        self.open(current_model, model_policy, active_decision);
+        self.open_decisions_page();
     }
 
     fn open_home_page(&mut self) {
@@ -290,11 +369,25 @@ impl ModelPicker {
         self.capture_anchor();
     }
 
-    fn return_home(&mut self, purpose: ModelPurpose) {
+    fn open_decisions_page(&mut self) {
+        self.page = PickerPage::Decisions;
+        self.binding = None;
+        self.anchor = None;
+        self.decision_choices = (self.decision_source)();
+        self.picker.set_footer_builder(decisions_footer_line);
+        self.sync_empty_text();
+        let entries = self.load_entries();
+        self.picker.open(entries, DECISIONS_TITLE);
+        self.preselect_page();
+        self.capture_anchor();
+    }
+
+    /// Home again, with the cursor back on the row the page was opened from.
+    fn return_home(&mut self, from: impl Fn(&ModelEntry) -> bool) {
         self.anchor = None;
         self.open_home_page();
-        self.picker
-            .select_item_by(|entry| entry.job == Some(purpose));
+        self.sync_empty_text();
+        self.picker.select_item_by(from);
         self.capture_anchor();
     }
 
@@ -339,12 +432,12 @@ impl ModelPicker {
     }
 
     fn sync_empty_text(&mut self) {
-        self.picker
-            .set_empty_text(if self.available.get().is_some() {
-                NO_MATCHES
-            } else {
-                LOADING_MODELS
-            });
+        let models_listed = self.available.get().is_some() || self.page == PickerPage::Decisions;
+        self.picker.set_empty_text(if models_listed {
+            NO_MATCHES
+        } else {
+            LOADING_MODELS
+        });
     }
 
     fn load_entries(&self) -> Vec<ModelEntry> {
@@ -357,6 +450,7 @@ impl ModelPicker {
         let mut entries = match self.page {
             PickerPage::Home => self.job_entries(),
             PickerPage::Job(purpose) => binding_entries(purpose),
+            PickerPage::Decisions => return self.decision_entries(),
         };
         for entry in &mut entries {
             self.mark_selection(entry, &current_spec);
@@ -455,13 +549,43 @@ impl ModelPicker {
         ModelPurpose::ALL
             .into_iter()
             .map(|purpose| job_entry(purpose, current_model, model_policy))
+            .chain([decisions_menu_entry(self.active_decision.as_ref())])
             .collect()
+    }
+
+    /// Off, every configured endpoint in name order, then the row that adds
+    /// one. The active choice is the selected row.
+    fn decision_entries(&self) -> Vec<ModelEntry> {
+        let active = self
+            .active_decision
+            .as_ref()
+            .map(|endpoint| endpoint.name.as_str());
+        let off = decision_entry(
+            DecisionRow::Off,
+            DECISION_OFF_ROW,
+            None,
+            DECISIONS_OFF_DETAIL.into(),
+            active.is_none(),
+        );
+        let endpoints = self
+            .decision_choices
+            .iter()
+            .map(|choice| decision_choice_entry(choice, active == Some(choice.name.as_str())));
+        let add = decision_entry(
+            DecisionRow::Add,
+            DECISION_ADD_ROW,
+            None,
+            DECISION_ADD_DETAIL.into(),
+            false,
+        );
+        std::iter::once(off).chain(endpoints).chain([add]).collect()
     }
 
     fn mark_selection(&self, entry: &mut ModelEntry, current_spec: &str) {
         entry.selected = match self.page {
             PickerPage::Home => entry.job.is_none() && entry.spec == current_spec,
             PickerPage::Job(_) => entry.job.is_none() && entry.binds == self.binding,
+            PickerPage::Decisions => false,
         };
     }
 
@@ -489,7 +613,7 @@ impl ModelPicker {
                         .select_item_by(|entry| entry.job == Some(ModelPurpose::Chat));
                 }
             }
-            PickerPage::Job(_) => {
+            PickerPage::Job(_) | PickerPage::Decisions => {
                 if let Some(spec) = self.bound_spec().map(str::to_owned) {
                     self.preselect_spec(&spec);
                 } else {
@@ -585,10 +709,11 @@ impl ModelPicker {
     }
 
     fn handle_key_inner(&mut self, key: KeyEvent) -> ModelPickerAction {
-        if key.code == KeyCode::Esc
-            && let PickerPage::Job(purpose) = self.page
-        {
-            self.return_home(purpose);
+        if key.code == KeyCode::Esc && self.page != PickerPage::Home {
+            match self.page {
+                PickerPage::Job(purpose) => self.return_home(|entry| entry.job == Some(purpose)),
+                _ => self.return_home(|entry| entry.decision == Some(DecisionRow::Menu)),
+            }
             return ModelPickerAction::Consumed;
         }
         if is_reset_key(key)
@@ -620,7 +745,20 @@ impl ModelPicker {
     fn map_picker_action(&mut self, action: PickerAction<ModelEntry>) -> ModelPickerAction {
         match action {
             PickerAction::Consumed => ModelPickerAction::Consumed,
+            PickerAction::Select(ModelEntry {
+                decision: Some(row),
+                ..
+            }) => match row {
+                DecisionRow::Menu => {
+                    self.open_decisions_page();
+                    ModelPickerAction::Consumed
+                }
+                DecisionRow::Off => ModelPickerAction::SelectDecision(None),
+                DecisionRow::Endpoint(name) => ModelPickerAction::SelectDecision(Some(name)),
+                DecisionRow::Add => ModelPickerAction::AddDecisionEndpoint,
+            },
             PickerAction::Select(entry) => match self.page {
+                PickerPage::Decisions => ModelPickerAction::Consumed,
                 PickerPage::Home => match entry.job {
                     Some(purpose) => {
                         if purpose == ModelPurpose::Chat {
@@ -701,6 +839,7 @@ fn job_entry_with_binding(
         claimed_by: Vec::new(),
         binds: binding,
         job: Some(purpose),
+        decision: None,
         selected: false,
         free: false,
         mark: None,
@@ -739,6 +878,7 @@ fn binding_row(id: &str, detail: &str, binds: Option<Binding>) -> ModelEntry {
         claimed_by: Vec::new(),
         binds,
         job: None,
+        decision: None,
         selected: false,
         free: false,
         mark: None,
@@ -763,7 +903,83 @@ fn saved_binding_entry(spec: &str) -> ModelEntry {
         claimed_by: Vec::new(),
         binds: Some(Binding::Exact(spec.to_string())),
         job: None,
+        decision: None,
         selected: true,
+        free: false,
+        mark: None,
+    }
+    .with_search_text()
+}
+
+/// The Jobs row that opens the Decisions page: the active endpoint's name,
+/// protocol and model, or off.
+fn decisions_menu_entry(active: Option<&DecisionEndpoint>) -> ModelEntry {
+    let (suffix, detail) = match active {
+        Some(endpoint) => (
+            endpoint.name.clone(),
+            format!(
+                "{}{DETAIL_SEPARATOR}{}",
+                endpoint.protocol.as_str(),
+                endpoint.model
+            ),
+        ),
+        None => (DECISIONS_OFF.to_owned(), DECISIONS_OFF_DETAIL.to_owned()),
+    };
+    let mut entry = decision_entry(
+        DecisionRow::Menu,
+        DECISIONS_ROW,
+        Some(suffix),
+        detail,
+        false,
+    );
+    entry.provider_display = JOBS_SECTION.into();
+    entry.rebuild_search_text();
+    entry
+}
+
+/// An endpoint that does not resolve still lists, its error in place of the
+/// details, so choosing it explains why it cannot screen.
+fn decision_choice_entry(choice: &DecisionChoice, selected: bool) -> ModelEntry {
+    let (suffix, detail) = match &choice.endpoint {
+        Ok(endpoint) => (
+            endpoint.protocol.as_str().to_owned(),
+            format!(
+                "{}{DETAIL_SEPARATOR}{}{DETAIL_SEPARATOR}{DECISION_KEY_PREFIX}{}",
+                endpoint.model,
+                endpoint.base_url.authority(),
+                DecisionKeySource::label(choice.key)
+            ),
+        ),
+        Err(error) => (DECISION_INVALID.to_owned(), error.clone()),
+    };
+    decision_entry(
+        DecisionRow::Endpoint(choice.name.clone()),
+        &choice.name,
+        Some(suffix),
+        detail,
+        selected,
+    )
+}
+
+fn decision_entry(
+    row: DecisionRow,
+    label: &str,
+    suffix: Option<String>,
+    detail: String,
+    selected: bool,
+) -> ModelEntry {
+    ModelEntry {
+        spec: format!("{DECISION_SPEC_PREFIX}{label}"),
+        id: label.into(),
+        provider_display: DECISIONS_SECTION.into(),
+        suffix,
+        detail,
+        search_text: String::new(),
+        claimed_by: Vec::new(),
+        binds: None,
+        job: None,
+        decision: Some(row),
+        selected,
         free: false,
         mark: None,
     }
@@ -851,6 +1067,7 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
             claimed_by,
             binds: Some(Binding::Exact(spec.to_string())),
             job: None,
+            decision: None,
             selected: false,
             free,
             mark: None,
@@ -865,6 +1082,7 @@ mod tests {
     use crate::components::buffer_text;
     use crate::components::key;
     use crate::components::keybindings::key as kb;
+    use caudra_config::decisions::DecisionProtocol;
     use caudra_providers::ModelInfo;
     use caudra_providers::ModelPricing;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -890,11 +1108,11 @@ mod tests {
     }
 
     fn open_picker(picker: &mut ModelPicker, spec: &str) {
-        picker.open(&current_model(spec), &ModelPolicy::default());
+        picker.open(&current_model(spec), &ModelPolicy::default(), None);
     }
 
     fn open_job_picker(picker: &mut ModelPicker, spec: &str, purpose: ModelPurpose) {
-        picker.open_purpose(&current_model(spec), &ModelPolicy::default(), purpose);
+        picker.open_purpose(&current_model(spec), &ModelPolicy::default(), None, purpose);
     }
 
     fn navigate_to_model(picker: &mut ModelPicker, spec: &str, section: &str) {
@@ -1715,6 +1933,237 @@ mod tests {
             p.handle_key(kb::TOGGLE_FAVORITE.to_key_event()),
             ModelPickerAction::ToggleFavorite(spec) if spec == OPUS_SPEC
         ));
+    }
+
+    const FIRST_ENDPOINT: &str = "local";
+    const SECOND_ENDPOINT: &str = "tunnel";
+    const BROKEN_ENDPOINT: &str = "broken";
+    const ENDPOINT_URL: &str = "http://127.0.0.1:8080/v1";
+    const ENDPOINT_AUTHORITY: &str = "127.0.0.1:8080";
+    const BROKEN_ERROR: &str = "base_url must use https";
+    const SAVED_KEY_DETAIL: &str = "key: saved";
+    const OPENAI_PROTOCOL: &str = "openai";
+    const UNEXPECTED_DECISION_ACTION: &str = "unexpected action for the decision row";
+
+    fn endpoint(name: &str) -> DecisionEndpoint {
+        DecisionEndpoint::new(
+            name,
+            DecisionProtocol::OpenAI,
+            ENDPOINT_URL.parse().unwrap(),
+        )
+    }
+
+    fn decision_choices() -> Vec<DecisionChoice> {
+        vec![
+            DecisionChoice {
+                name: BROKEN_ENDPOINT.into(),
+                endpoint: Err(BROKEN_ERROR.into()),
+                key: None,
+            },
+            DecisionChoice {
+                name: FIRST_ENDPOINT.into(),
+                endpoint: Ok(endpoint(FIRST_ENDPOINT)),
+                key: Some(DecisionKeySource::Stored),
+            },
+            DecisionChoice {
+                name: SECOND_ENDPOINT.into(),
+                endpoint: Ok(endpoint(SECOND_ENDPOINT)),
+                key: None,
+            },
+        ]
+    }
+
+    fn decisions_picker() -> ModelPicker {
+        ModelPicker::new(test_models()).with_decision_source(decision_choices)
+    }
+
+    fn open_decisions(picker: &mut ModelPicker, active: Option<&str>) {
+        picker.open_decisions(
+            &current_model(SONNET_SPEC),
+            &ModelPolicy::default(),
+            active.map(endpoint),
+        );
+    }
+
+    fn decision_rows(picker: &ModelPicker) -> Vec<DecisionRow> {
+        picker
+            .load_entries()
+            .into_iter()
+            .filter_map(|entry| entry.decision)
+            .collect()
+    }
+
+    fn selected_decision(picker: &ModelPicker) -> Option<DecisionRow> {
+        picker
+            .picker
+            .selected_item()
+            .and_then(|entry| entry.decision.clone())
+    }
+
+    fn select_decision(picker: &mut ModelPicker, row: DecisionRow) {
+        let selected = picker.track_anchor(|p| {
+            p.picker
+                .select_item_by(|entry| entry.decision == Some(row.clone()))
+        });
+        assert!(selected);
+    }
+
+    #[test_case(None, DECISIONS_OFF, DECISIONS_OFF_DETAIL; "off")]
+    #[test_case(Some(SECOND_ENDPOINT), SECOND_ENDPOINT, OPENAI_PROTOCOL; "active")]
+    fn home_lists_the_decisions_row_after_the_jobs(
+        active: Option<&str>,
+        suffix: &str,
+        detail: &str,
+    ) {
+        let mut p = decisions_picker();
+        p.open(
+            &current_model(SONNET_SPEC),
+            &ModelPolicy::default(),
+            active.map(endpoint),
+        );
+
+        let entries = p.load_entries();
+        let index = entries
+            .iter()
+            .position(|entry| entry.decision == Some(DecisionRow::Menu))
+            .unwrap();
+        let row = &entries[index];
+        assert_eq!(index, ModelPurpose::ALL.len());
+        assert_eq!(row.section(), Some(JOBS_SECTION));
+        assert_eq!(row.label(), DECISIONS_ROW);
+        assert_eq!(row.suffix(), Some(suffix));
+        assert!(row.detail.starts_with(detail), "{}", row.detail);
+    }
+
+    #[test]
+    fn the_decisions_row_opens_its_page_and_escape_returns_to_it() {
+        let mut p = decisions_picker();
+        open_picker(&mut p, SONNET_SPEC);
+        select_decision(&mut p, DecisionRow::Menu);
+
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Enter)),
+            ModelPickerAction::Consumed
+        ));
+        assert_eq!(p.page, PickerPage::Decisions);
+        assert!(render(&mut p).contains(DECISION_ADD_ROW));
+
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Esc)),
+            ModelPickerAction::Consumed
+        ));
+        assert_eq!(p.page, PickerPage::Home);
+        assert_eq!(selected_decision(&p), Some(DecisionRow::Menu));
+    }
+
+    #[test_case(None, DecisionRow::Off; "off")]
+    #[test_case(Some(SECOND_ENDPOINT), DecisionRow::Endpoint(SECOND_ENDPOINT.into()); "active")]
+    fn the_page_lists_off_every_endpoint_and_add(active: Option<&str>, preselected: DecisionRow) {
+        let mut p = decisions_picker();
+        open_decisions(&mut p, active);
+
+        assert_eq!(
+            decision_rows(&p),
+            [
+                DecisionRow::Off,
+                DecisionRow::Endpoint(BROKEN_ENDPOINT.into()),
+                DecisionRow::Endpoint(FIRST_ENDPOINT.into()),
+                DecisionRow::Endpoint(SECOND_ENDPOINT.into()),
+                DecisionRow::Add,
+            ]
+        );
+        assert_eq!(selected_decision(&p), Some(preselected));
+        let marked: Vec<_> = p
+            .load_entries()
+            .into_iter()
+            .filter(|entry| entry.selected)
+            .filter_map(|entry| entry.decision)
+            .collect();
+        assert_eq!(marked.len(), 1);
+    }
+
+    #[test_case(FIRST_ENDPOINT, OPENAI_PROTOCOL, SAVED_KEY_DETAIL; "valid")]
+    #[test_case(BROKEN_ENDPOINT, DECISION_INVALID, BROKEN_ERROR; "invalid")]
+    fn endpoint_rows_say_how_they_connect(name: &str, suffix: &str, detail: &str) {
+        let mut p = decisions_picker();
+        open_decisions(&mut p, None);
+
+        let row = p
+            .load_entries()
+            .into_iter()
+            .find(|entry| entry.decision == Some(DecisionRow::Endpoint(name.into())))
+            .unwrap();
+        assert_eq!(row.suffix(), Some(suffix));
+        assert!(row.detail.contains(detail), "{}", row.detail);
+        if row.suffix() != Some(DECISION_INVALID) {
+            assert!(row.detail.contains(ENDPOINT_AUTHORITY), "{}", row.detail);
+        }
+    }
+
+    #[test_case(DecisionRow::Off, Some(None); "off")]
+    #[test_case(DecisionRow::Endpoint(SECOND_ENDPOINT.into()), Some(Some(SECOND_ENDPOINT)); "endpoint")]
+    #[test_case(DecisionRow::Add, None; "add")]
+    fn enter_on_a_decision_row_names_the_choice(row: DecisionRow, expected: Option<Option<&str>>) {
+        let mut p = decisions_picker();
+        open_decisions(&mut p, Some(FIRST_ENDPOINT));
+        select_decision(&mut p, row);
+
+        match (p.handle_key(key(KeyCode::Enter)), expected) {
+            (ModelPickerAction::SelectDecision(name), Some(expected)) => {
+                assert_eq!(name.as_deref(), expected);
+            }
+            (ModelPickerAction::AddDecisionEndpoint, None) => {}
+            _ => panic!("{UNEXPECTED_DECISION_ACTION}"),
+        }
+    }
+
+    #[test]
+    fn the_decision_filter_narrows_the_page() {
+        let mut p = decisions_picker();
+        open_decisions(&mut p, None);
+
+        p.handle_paste(SECOND_ENDPOINT);
+
+        assert_eq!(
+            selected_decision(&p),
+            Some(DecisionRow::Endpoint(SECOND_ENDPOINT.into()))
+        );
+    }
+
+    #[test_case(true; "decisions_page")]
+    #[test_case(false; "home_row")]
+    fn toggling_a_favorite_on_a_decision_row_does_nothing(on_page: bool) {
+        let mut p = decisions_picker();
+        if on_page {
+            open_decisions(&mut p, None);
+            select_decision(&mut p, DecisionRow::Endpoint(FIRST_ENDPOINT.into()));
+        } else {
+            open_picker(&mut p, SONNET_SPEC);
+            select_decision(&mut p, DecisionRow::Menu);
+        }
+
+        assert!(matches!(
+            p.handle_key(kb::TOGGLE_FAVORITE.to_key_event()),
+            ModelPickerAction::Consumed
+        ));
+        assert!(p.favorites().is_empty());
+        assert!(p.is_open());
+    }
+
+    #[test]
+    fn the_decision_selection_survives_a_refresh() {
+        let models = test_models();
+        let mut p = ModelPicker::new(Arc::clone(&models)).with_decision_source(decision_choices);
+        open_decisions(&mut p, None);
+        select_decision(&mut p, DecisionRow::Endpoint(SECOND_ENDPOINT.into()));
+
+        models.store(Some(Arc::new(vec![SWAPPED_SPEC.into()])));
+        assert_eq!(p.refresh(), Dirty::YES);
+
+        assert_eq!(
+            selected_decision(&p),
+            Some(DecisionRow::Endpoint(SECOND_ENDPOINT.into()))
+        );
     }
 
     fn discovered(id: &str, pricing: ModelPricing) -> ModelInfo {

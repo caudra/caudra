@@ -324,6 +324,7 @@ impl App {
         self.model_picker.open_purpose(
             &self.state.model,
             &self.model_policy,
+            self.active_decision_endpoint(),
             ModelPurpose::Autopilot,
         );
         vec![Action::RefreshModels]

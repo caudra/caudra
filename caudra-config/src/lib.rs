@@ -557,7 +557,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
-        description: "Start every session with Auto permission mode (preserve required prompts and screen unmatched calls); global config only. Needs `experimental.decision_engine`, otherwise sessions start in Ask",
+        description: "Start every session with Auto permission mode (preserve required prompts and screen unmatched calls); global config only. Screening runs only while a decision endpoint is active",
     },
     ConfigField {
         name: "always_fast",
@@ -876,7 +876,7 @@ impl RawConfig {
         let builtin_skills = self.builtin_skills()?;
         let disabled_tools = self.resolve_disabled_tools()?;
         let config = Config {
-            decisions: self.decisions.resolve_env()?,
+            decisions: self.decisions.resolve()?,
             always_yolo: self.always_yolo.unwrap_or(false),
             always_auto: self.always_auto.unwrap_or(false),
             always_fast: self.always_fast.unwrap_or(false),
@@ -2137,9 +2137,6 @@ pub struct PermissionsConfig {
     pub review_candidates: Vec<PermissionReviewCandidate>,
     pub loaded_sources: Vec<LoadedPermissionSource>,
     pub yolo: bool,
-    /// The decision engine experiment. Without it no decision service
-    /// attaches and a seeded or stored Auto acts as Ask.
-    pub decision_engine: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2325,7 +2322,7 @@ pub struct UiConfig {
 
     #[config(
         default = true,
-        desc = "Show what the experimental decision engine changed: one row where it reordered, pruned or pointed out results, suggested a skill or model, skipped a goal check, or flagged a call, and one where it failed and the default applied. A dim `shadow` row shows what a feature in shadow mode would have done. Each row expands on click to the candidates and scores behind it. The model never sees these rows"
+        desc = "Show what the decision engine changed: one row where it reordered, pruned or pointed out results, suggested a skill or model, skipped a goal check, or flagged a call, and one where it failed and the default applied. A dim `shadow` row shows what a feature in shadow mode would have done. Each row expands on click to the candidates and scores behind it. The model never sees these rows"
     )]
     pub show_decisions: bool,
 
@@ -4085,7 +4082,6 @@ fn build_permissions(
         review_candidates,
         loaded_sources,
         yolo: false,
-        decision_engine: false,
     }
 }
 
@@ -4255,7 +4251,6 @@ fn env_file_layers(
     let mut project_vars = HashMap::new();
     if include_project {
         collect_env_vars(&cwd.join(PROJECT_DIR).join(ENV_FILE), &mut project_vars);
-        project_vars.remove(decisions::BASE_URL_ENV);
     }
     let project_fallbacks = project_vars
         .keys()
@@ -4475,8 +4470,8 @@ pub fn global_config_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::config_version::CONFIG_VERSION_KEY;
-    use crate::decisions::{DecisionProtocol, RawDecisionsConfig};
-    use std::{env, fs, process::Command};
+    use crate::decisions::{DecisionEndpoint, DecisionProtocol};
+    use std::{env, fs};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -4515,8 +4510,8 @@ mod tests {
     const AUTOPILOT_TABLE: &str = "[autopilot]";
     const CUSTOM_AUTOPILOT_CONTINUATIONS: u32 = 40;
     const CUSTOM_AUTOPILOT_COST: f64 = 2.5;
-    const DECISION_ENV_CHILD: &str = "CAUDRA_TEST_DECISION_ENV_CHILD";
-    const DECISION_ENV_TEST: &str = "tests::decision_protocol_environment";
+    const DECISION_ENDPOINT_NAME: &str = "typesafe";
+    const DECISION_BASE_URL: &str = "https://decisions.example.test";
 
     #[test_case(b"", EMPTY_SOURCE_DIGEST; "empty_source")]
     #[test_case(b"abc", ABC_SOURCE_DIGEST; "known_source")]
@@ -6837,172 +6832,58 @@ mod tests {
         }
     }
 
-    #[test_case(false; "project_alone")]
-    #[test_case(true; "global_base_url_preserved")]
-    fn decision_base_url_environment_is_global_only(has_global: bool) {
-        const GLOBAL_BASE_URL: &str = "https://global.example.test/typesafe";
-        const PROJECT_BASE_URL: &str = "https://project.example.test";
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        fs::create_dir_all(&global).unwrap();
-        if has_global {
-            fs::write(
-                global.join(".env"),
-                format!("{}={GLOBAL_BASE_URL}", decisions::BASE_URL_ENV),
+    fn decision_endpoint(api_key_env: &str) -> DecisionEndpoint {
+        DecisionEndpoint {
+            api_key_env: Some(api_key_env.into()),
+            ..DecisionEndpoint::new(
+                DECISION_ENDPOINT_NAME,
+                DecisionProtocol::TypeSafe,
+                DECISION_BASE_URL.parse().unwrap(),
             )
-            .unwrap();
         }
-        let project = dir.path().join(PROJECT_DIR);
-        fs::create_dir_all(&project).unwrap();
-        fs::write(
-            project.join(".env"),
-            format!("{}={PROJECT_BASE_URL}", decisions::BASE_URL_ENV),
-        )
-        .unwrap();
-        let (vars, project_fallbacks) = env_file_layers(dir.path(), Some(&global), true);
-        assert_eq!(
-            vars.get(decisions::BASE_URL_ENV).map(String::as_str),
-            has_global.then_some(GLOBAL_BASE_URL)
-        );
-        assert!(!project_fallbacks.contains_key(decisions::BASE_URL_ENV));
     }
 
-    #[test_case(DecisionProtocol::TypeSafe; "typesafe")]
-    #[test_case(DecisionProtocol::OpenAI; "openai")]
-    fn decision_protocol_environment(protocol: DecisionProtocol) {
-        const CONFIGURED: &str = "http://127.0.0.1/configured/v1";
-        const PROCESS: &str = "http://127.0.0.1/process/v1";
-        const GLOBAL: &str = "http://127.0.0.1/global/v1";
-        const PROJECT: &str = "http://127.0.0.1/project/v1";
-        const INVALID: &str = "not-an-absolute-url";
+    fn decision_env_key(endpoint: &DecisionEndpoint) -> Option<String> {
+        endpoint.api_key(None).unwrap().map(|key| key.value)
+    }
+
+    #[test]
+    fn decision_credentials_follow_the_global_environment_layers() {
         const KEY: &str = "CAUDRA_TEST_DECISION_COLLIDING_KEY";
         const PROCESS_CREDENTIAL: &str = "process-test-credential";
         const GLOBAL_CREDENTIAL: &str = "global-test-credential";
         const PROJECT_CREDENTIAL: &str = "project-test-credential";
 
-        if env::var_os(DECISION_ENV_CHILD).is_none() {
-            let status = Command::new(env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    &format!("{DECISION_ENV_TEST}::{}", protocol.as_str()),
-                ])
-                .env(DECISION_ENV_CHILD, "1")
-                .env(decisions::BASE_URL_ENV, INVALID)
-                .env(decisions::OPENAI_BASE_URL_ENV, INVALID)
-                .env(protocol.base_url_env(), PROCESS)
-                .env_remove(KEY)
-                .status()
-                .unwrap();
-            assert!(status.success());
-            return;
-        }
-
-        let raw: RawDecisionsConfig = toml::from_str(&format!(
-            "protocol = '{}'\nbase_url = '{CONFIGURED}'",
-            protocol.as_str()
-        ))
-        .unwrap();
-        let resolved_base = || {
-            raw.clone()
-                .resolve_env()
-                .unwrap()
-                .base_url
-                .unwrap()
-                .to_string()
-        };
-        assert_eq!(resolved_base(), PROCESS);
-        let mut disabled = raw.clone();
-        disabled.base_url = None;
-        assert!(disabled.clone().resolve_env().unwrap().endpoint().is_none());
-        unsafe { env::set_var(protocol.base_url_env(), INVALID) };
-        assert!(disabled.resolve_env().unwrap().endpoint().is_none());
-        let error = raw.clone().resolve_env().unwrap_err();
-        assert!(matches!(
-            &error,
-            decisions::DecisionsConfigError::Environment { variable, .. }
-                if *variable == protocol.base_url_env()
-        ));
-        assert!(error.to_string().contains(protocol.base_url_env()));
-        unsafe { env::remove_var(protocol.base_url_env()) };
-        assert_eq!(resolved_base(), CONFIGURED);
-
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
         fs::create_dir_all(&global).unwrap();
-        fs::write(
-            global.join(ENV_FILE),
-            format!("{}={GLOBAL}", protocol.base_url_env()),
-        )
-        .unwrap();
-        load_env_files_scoped(dir.path(), Some(&global), false);
-        assert_eq!(resolved_base(), GLOBAL);
-
         let project = dir.path().join(PROJECT_DIR);
         fs::create_dir_all(&project).unwrap();
-        fs::write(
-            project.join(ENV_FILE),
-            format!("{}={PROJECT}", protocol.base_url_env()),
-        )
-        .unwrap();
-        unsafe { env::set_var(protocol.base_url_env(), PROCESS) };
-        load_env_files_scoped(dir.path(), Some(&global), true);
-        assert_eq!(resolved_base(), PROCESS);
-        unsafe { env::remove_var(protocol.base_url_env()) };
-        load_env_files_scoped(dir.path(), None, true);
-        assert_eq!(resolved_base(), CONFIGURED);
-        assert_eq!(global_env_value(protocol.base_url_env()).unwrap(), None);
-        match protocol {
-            DecisionProtocol::TypeSafe => assert!(env::var_os(protocol.base_url_env()).is_none()),
-            DecisionProtocol::OpenAI => {
-                assert_eq!(env::var(protocol.base_url_env()).unwrap(), PROJECT)
-            }
-        }
-
-        unsafe { env::remove_var(protocol.base_url_env()) };
-        load_env_files_scoped(dir.path(), Some(&global), true);
-        assert_eq!(resolved_base(), GLOBAL);
-        assert_eq!(
-            global_env_value(protocol.base_url_env())
-                .unwrap()
-                .as_deref(),
-            Some(GLOBAL)
-        );
-        assert_eq!(
-            env::var(protocol.base_url_env()).unwrap(),
-            if protocol == DecisionProtocol::OpenAI {
-                PROJECT
-            } else {
-                GLOBAL
-            }
-        );
-
         fs::write(global.join(ENV_FILE), format!("{KEY}={GLOBAL_CREDENTIAL}")).unwrap();
         fs::write(
             project.join(ENV_FILE),
             format!("{KEY}={PROJECT_CREDENTIAL}"),
         )
         .unwrap();
-        let config = DecisionsConfig {
-            api_key_env: KEY.into(),
-            ..DecisionsConfig::default()
-        };
+        let endpoint = decision_endpoint(KEY);
         unsafe { env::set_var(KEY, PROCESS_CREDENTIAL) };
         load_env_files_scoped(dir.path(), Some(&global), true);
         assert_eq!(
-            config.api_key().unwrap().as_deref(),
+            decision_env_key(&endpoint).as_deref(),
             Some(PROCESS_CREDENTIAL)
         );
         unsafe { env::remove_var(KEY) };
         load_env_files_scoped(dir.path(), Some(&global), true);
         assert_eq!(env::var(KEY).unwrap(), PROJECT_CREDENTIAL);
         assert_eq!(
-            config.api_key().unwrap().as_deref(),
+            decision_env_key(&endpoint).as_deref(),
             Some(GLOBAL_CREDENTIAL)
         );
         unsafe { env::remove_var(KEY) };
         load_env_files_scoped(dir.path(), None, true);
         assert_eq!(env::var(KEY).unwrap(), PROJECT_CREDENTIAL);
-        assert_eq!(config.api_key().unwrap(), None);
+        assert_eq!(decision_env_key(&endpoint), None);
+        unsafe { env::remove_var(KEY) };
     }
 
     #[test]
@@ -7015,11 +6896,7 @@ mod tests {
         fs::write(project.join(".env"), format!("{KEY}={VALUE}")).unwrap();
         load_env_files_scoped(dir.path(), None, true);
         assert_eq!(std::env::var(KEY).unwrap(), VALUE);
-        let config = DecisionsConfig {
-            api_key_env: KEY.into(),
-            ..DecisionsConfig::default()
-        };
-        assert_eq!(config.api_key().unwrap(), None);
+        assert_eq!(decision_env_key(&decision_endpoint(KEY)), None);
         unsafe { std::env::remove_var(KEY) };
     }
 
@@ -7030,13 +6907,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join(".env"), format!("{KEY}={VALUE}")).unwrap();
         load_env_files_scoped(dir.path(), Some(dir.path()), false);
-        let config = DecisionsConfig {
-            api_key_env: KEY.into(),
-            ..DecisionsConfig::default()
-        };
-        assert_eq!(config.api_key().unwrap().as_deref(), Some(VALUE));
+        let endpoint = decision_endpoint(KEY);
+        assert_eq!(decision_env_key(&endpoint).as_deref(), Some(VALUE));
         unsafe { std::env::set_var(KEY, "invalid\r\nheader") };
-        assert!(config.api_key().is_err());
+        assert!(endpoint.api_key(None).is_err());
         unsafe { std::env::remove_var(KEY) };
     }
 

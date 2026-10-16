@@ -2697,12 +2697,6 @@ fn handle_control_request(
         "set_permission_mode" => {
             let mode_str = cr.request.extra.get("mode").and_then(Value::as_str);
             match mode_str.and_then(PermissionMode::parse) {
-                Some(PermissionMode::Auto) if !handle.permissions.decision_engine() => writer
-                    .emit_control_response(
-                        &cr.request_id,
-                        None,
-                        Some(FeatureDisabled(Feature::DecisionEngine).to_string()),
-                    ),
                 Some(mode) => {
                     let execution_mode =
                         mode.preserve_plan(prompts.shared.lock().unwrap().permission_mode);

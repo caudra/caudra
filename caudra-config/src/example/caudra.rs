@@ -35,8 +35,9 @@ const RETENTION_ABOUT: &str = "`trim` and `forget` take keep policies in `restic
 const SNAPSHOTS_ABOUT: &str = "Each tool call that changes files leaves a change record, which \
      file revert undoes. A record over a limit is refused and its call runs unrecorded.";
 const TELEMETRY_ABOUT: &str = "Each setting that names an environment variable gives way to it.";
-const DECISIONS_ABOUT: &str = "The typed decision engine. It needs `decision_engine = true` under \
-     [experimental]. Connection settings and thresholds are global-only.";
+const DECISIONS_ABOUT: &str = "Shared settings for the typed decision engine, which runs only \
+     while a decision endpoint is active. Endpoints are `[decisions.<name>]` tables in the global \
+     providers.toml. Timeouts and thresholds are global-only.";
 const DECISION_FEATURES_ABOUT: &str = "`off` turns a feature off, `shadow` collects predictions \
      without applying them, `advise` adds caution or suggestions, and `enforce` applies the \
      feature's own behavior. Each feature lists the modes it takes.";
@@ -219,12 +220,10 @@ fn plugins_about() -> String {
 mod tests {
     use super::document;
     use crate::config_file::GlobalConfigFile;
-    use crate::decisions::DecisionProtocol;
     use crate::example::Render;
     use crate::experimental::FeatureFlags;
     use crate::interpolation::Lookup;
     use crate::{Config, RawConfig};
-    use test_case::test_case;
     use toml::Value;
 
     const MODEL: &str = "provider/model";
@@ -293,28 +292,20 @@ mod tests {
         assert_eq!(format!("{stated:?}"), format!("{built_in:?}"));
     }
 
-    #[test_case(DecisionProtocol::TypeSafe, "jev-latest", "TYPESAFE_API_KEY"; "typesafe")]
-    #[test_case(DecisionProtocol::OpenAI, "gpt-6-luna", "OPENAI_API_KEY"; "openai")]
-    fn reference_does_not_pin_protocol_dependent_defaults(
-        protocol: DecisionProtocol,
-        model: &str,
-        api_key_env: &str,
-    ) {
+    #[test]
+    fn reference_holds_no_endpoint_and_activates_nothing() {
         let live = document().render(Render::Live { defaults: true });
-        let mut example: Value = toml::from_str(&live).unwrap();
-        let decisions = example["decisions"].as_table_mut().unwrap();
-        assert!(!decisions.contains_key("model"));
-        assert!(!decisions.contains_key("api_key_env"));
-        decisions.insert("protocol".into(), Value::String(protocol.as_str().into()));
-        let config = GlobalConfigFile::parse(&toml::to_string(&example).unwrap(), Lookup::Refused)
+        let example: Value = toml::from_str(&live).unwrap();
+        let decisions = example["decisions"].as_table().unwrap();
+        for moved in ["base_url", "protocol", "model", "api_key_env", "allow_http"] {
+            assert!(!decisions.contains_key(moved), "{moved}");
+        }
+        let config = GlobalConfigFile::parse(&live, Lookup::Refused)
             .unwrap()
             .settings
             .into_config(false)
             .unwrap();
-        assert_eq!(config.decisions.protocol, protocol);
-        assert_eq!(config.decisions.model, model);
-        assert_eq!(config.decisions.api_key_env, api_key_env);
-        assert!(config.decisions.endpoint().is_none());
+        assert!(config.decisions.endpoint.is_none());
         assert!(!config.decisions.features.any_enabled());
     }
 

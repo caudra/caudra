@@ -140,7 +140,7 @@ Calls that ran before a failure keep their effects. When a run fails, the model 
 
 ### Decisions and reranking
 
-With the [decision engine](/docs/configuration/#decisions) on, a snippet can judge what a server returned before any of it reaches the model. `decide()` gives typed answers about one item, and `rerank()` keeps the candidates relevant to a query, best first:
+With a [decision endpoint](/docs/providers/#decision-endpoints) active, a snippet can judge what a server returned before any of it reaches the model. `decide()` gives typed answers about one item, and `rerank()` keeps the candidates relevant to a query, best first:
 
 ```python
 issues = await github.list_issues(owner="caudra", repo="caudra", state="open")

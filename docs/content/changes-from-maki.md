@@ -81,7 +81,7 @@ Maki provided the native Rust TUI, Lua plugin system, provider integrations, MCP
 
 ## Declarative settings and opt-in experiments
 
-**What changed:** Settings live in a plain `caudra.toml` instead of a Lua `init.lua` script. Workflows, managed sandboxes, direct remote Workcell connections, Lua plugins, the decision engine, and cross-session messages are [experimental features](/docs/configuration/#experimental-features). Each stays off until the `[experimental]` table of the global `caudra.toml` turns it on. A feature that is off adds no tools, commands, or startup work.
+**What changed:** Settings live in a plain `caudra.toml` instead of a Lua `init.lua` script. Workflows, managed sandboxes, direct remote Workcell connections, Lua plugins, and cross-session messages are [experimental features](/docs/configuration/#experimental-features). Each stays off until the `[experimental]` table of the global `caudra.toml` turns it on. A feature that is off adds no tools, commands, or startup work.
 
 **Why:** Settings should load without running code, so a default install starts no Lua runtime. Keeping experiments off by default limits a new install to the stable features. Only the user's global file can turn one on, so a repository cannot opt its users into an experiment.
 

@@ -10,8 +10,8 @@
 # The global file is ~/.config/caudra/providers.toml, or
 # %APPDATA%\caudra\providers.toml on Windows. There is no project file.
 #
-# `caudra auth login` and `caudra auth logout` rewrite this file and drop its
-# comments, so keep a copy of the ones you want.
+# `caudra auth login` and `caudra auth logout` replace only the table they
+# change, and keep the rest of the file and its comments.
 #
 # Full reference: https://caudra.ai/docs/providers/#providers-toml
 
@@ -277,3 +277,38 @@ version = 1
 # an id that holds a dot, such as `models."qwen-3.6"`.
 # Type: table.
 # models = {}
+
+# [decisions.my-endpoint]
+# One decision endpoint, named my-endpoint here. Configuring it is the consent
+# to send decision context to it, and `/decision-model` or
+# `caudra decisions use` makes it the active one.
+
+# Decision wire protocol: `typesafe` or `openai`. Never inferred from the URL
+# or model.
+# Type: string. Required.
+# protocol = "typesafe"
+
+# Decision API base URL. TypeSafe takes a root such as
+# `https://api.typesafe.ai` and appends `/v1/systemone`. OpenAI takes a
+# versioned base such as `https://api.openai.com/v1` and appends `/decisions`.
+# A path prefix stays, and a full endpoint is rejected. `{env:NAME}` reads the
+# base from the environment. HTTPS is required, except for numeric loopback
+# HTTP or with `allow_http`. No credentials, query, fragment, whitespace, or
+# control characters.
+# Type: string. Required.
+# base_url = "https://api.typesafe.ai"
+
+# Decision model identifier, nonblank and without control characters.
+# Type: string. Default: `jev-latest` for typesafe, `gpt-6-luna` for openai.
+# model = <string>
+
+# Environment variable holding the credential when no key is saved for this
+# endpoint, never the credential itself. Project environment values are
+# excluded. The presets set `TYPESAFE_API_KEY` and `OPENAI_API_KEY`.
+# Type: string. Default: unset.
+# api_key_env = <string>
+
+# Opt-in for plain HTTP to a non-loopback host. Use only with transport
+# protection you control, such as a trusted encrypted tunnel.
+# Type: boolean.
+# allow_http = false

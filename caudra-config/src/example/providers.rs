@@ -1,3 +1,4 @@
+use crate::decisions::DecisionEndpoint;
 use crate::files;
 use crate::providers::{
     BUILTIN_IGNORED_FIELDS, BUILTIN_MODEL_FIELDS, ModelDef, ModelFields, OverrideFields,
@@ -11,8 +12,9 @@ pub const PURPOSES: &str = "my-provider.purposes";
 pub const MODEL_DEFAULTS: &str = "my-provider.model_defaults";
 pub const MODELS: &str = "my-provider.models";
 pub const UPSTREAM: &str = "aperture.overrides.llmserver";
-const REWRITES: &str = "`caudra auth login` and `caudra auth logout` rewrite this file and drop \
-     its comments, so keep a copy of the ones you want.";
+pub const DECISION_ENDPOINT: &str = "decisions.my-endpoint";
+const REWRITES: &str = "`caudra auth login` and `caudra auth logout` replace only the table they \
+     change, and keep the rest of the file and its comments.";
 const PURPOSES_ABOUT: &str = "Which models of my-provider are small and which are flagships. Each \
      key takes one prefix or a list.";
 const MODEL_DEFAULTS_ABOUT: &str = "Model keys for every model of my-provider, including the ones \
@@ -23,9 +25,12 @@ const MODELS_ABOUT: &str = "One model my-provider serves, so repeat the table fo
 const UPSTREAM_ABOUT: &str = "Aperture routes the models of upstream providers as \
      `aperture/UPSTREAM/MODEL`. Each [aperture.overrides.UPSTREAM] table overrides the models of \
      one upstream, such as llmserver here.";
+const DECISION_ENDPOINT_ABOUT: &str = "One decision endpoint, named my-endpoint here. Configuring \
+     it is the consent to send decision context to it, and `/decision-model` or `caudra decisions \
+     use` makes it the active one.";
 
-/// Every `providers.toml` key, on an example custom provider and an Aperture
-/// upstream.
+/// Every `providers.toml` key, on an example custom provider, an Aperture
+/// upstream, and a decision endpoint.
 pub fn document() -> Document {
     let file = &files::PROVIDERS;
     Document {
@@ -55,6 +60,11 @@ pub fn document() -> Document {
                     .chain(ProviderOverride::FIELDS),
             )
             .about(UPSTREAM_ABOUT),
+            Table::of(
+                Header::Record(DECISION_ENDPOINT.into()),
+                DecisionEndpoint::FIELDS,
+            )
+            .about(DECISION_ENDPOINT_ABOUT),
         ],
     }
 }
@@ -75,11 +85,15 @@ fn provider_about() -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashMap};
+    use std::mem;
 
     use caudra_storage::thinking::ReasoningOptions;
     use serde::Serialize;
 
-    use super::{MODEL_DEFAULTS, MODELS, PROVIDER, PURPOSES, UPSTREAM, document};
+    use super::{
+        DECISION_ENDPOINT, MODEL_DEFAULTS, MODELS, PROVIDER, PURPOSES, UPSTREAM, document,
+    };
+    use crate::decisions::{DecisionEndpoint, DecisionEndpointDef, DecisionProtocol};
     use crate::example::Render;
     use crate::providers::{
         ModelDef, ModelFields, ModelPurpose, OverrideFields, Protocol, ProviderDef,
@@ -92,6 +106,17 @@ mod tests {
 
     fn parse(render: Render) -> ProvidersConfig {
         toml::from_str(&document().render(render)).unwrap()
+    }
+
+    /// Decision endpoints compare once resolved, since an unset `allow_http`
+    /// and a stated `false` are the same endpoint.
+    fn resolved(render: Render) -> (serde_json::Value, Vec<DecisionEndpoint>) {
+        let mut config = parse(render);
+        let endpoints = mem::take(&mut config.decisions)
+            .iter()
+            .map(|(name, def)| def.resolve(name).unwrap())
+            .collect();
+        (serde_json::to_value(config).unwrap(), endpoints)
     }
 
     fn names(path: &str) -> BTreeSet<String> {
@@ -142,14 +167,16 @@ mod tests {
 
     #[test]
     fn the_reference_declares_no_provider() {
-        assert!(parse(Render::Reference).providers.is_empty());
+        let reference = parse(Render::Reference);
+        assert!(reference.providers.is_empty());
+        assert!(reference.decisions.is_empty());
     }
 
     #[test]
     fn every_stated_default_is_the_built_in_one() {
         assert_eq!(
-            serde_json::to_value(parse(Render::Live { defaults: true })).unwrap(),
-            serde_json::to_value(parse(Render::Live { defaults: false })).unwrap()
+            resolved(Render::Live { defaults: true }),
+            resolved(Render::Live { defaults: false })
         );
     }
 
@@ -179,11 +206,19 @@ mod tests {
             default: override_fields(),
             models: HashMap::from([(TEXT.into(), override_fields())]),
         };
+        let endpoint = DecisionEndpointDef {
+            protocol: DecisionProtocol::OpenAI,
+            base_url: TEXT.into(),
+            model: Some(TEXT.into()),
+            api_key_env: Some(TEXT.into()),
+            allow_http: Some(true),
+        };
         let classes = ModelPurpose::CLASSES.map(|purpose| purpose.to_string());
         assert_eq!(names(PROVIDER), keys(provider));
         assert_eq!(names(PURPOSES), BTreeSet::from(classes));
         assert_eq!(names(MODEL_DEFAULTS), keys(model_fields()));
         assert_eq!(names(MODELS), keys(model));
         assert_eq!(names(UPSTREAM), keys(upstream));
+        assert_eq!(names(DECISION_ENDPOINT), keys(endpoint));
     }
 }

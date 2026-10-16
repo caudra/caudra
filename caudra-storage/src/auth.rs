@@ -24,11 +24,48 @@ const API_KEY_FIELD: &str = "api_key";
 const EXPIRES_FIELD: &str = "expires";
 const REFRESH_FIELD: &str = "refresh";
 const WORKCELL_AUTH_DIR: &str = "workcell";
+const DECISION_AUTH_DIR: &str = "decisions";
 const WORKCELL_CREDENTIAL_VERSION: u32 = 1;
 const WORKCELL_CREDENTIAL_FILE_MAX_BYTES: usize = MAX_WORKCELL_BEARER_TOKEN_BYTES + 1024;
 
 pub const MAX_WORKCELL_CREDENTIAL_NAME_BYTES: usize = 64;
 pub const MAX_WORKCELL_BEARER_TOKEN_BYTES: usize = 16 * 1024;
+pub const MAX_DECISION_ENDPOINT_NAME_BYTES: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DecisionEndpointNameError {
+    #[error("decision endpoint name must not be empty")]
+    Empty,
+    #[error("decision endpoint name exceeds {MAX_DECISION_ENDPOINT_NAME_BYTES} bytes")]
+    TooLong,
+    #[error("decision endpoint name must start with a lowercase ASCII letter or digit")]
+    InvalidStart,
+    #[error(
+        "decision endpoint name may contain only lowercase ASCII letters, digits, '-', and '_'"
+    )]
+    InvalidCharacter,
+}
+
+/// Endpoint names key both `[decisions.<name>]` in `providers.toml` and the
+/// credential file, so they stay safe as a file stem and a bare TOML key.
+pub fn validate_decision_endpoint_name(name: &str) -> Result<(), DecisionEndpointNameError> {
+    let first = name
+        .bytes()
+        .next()
+        .ok_or(DecisionEndpointNameError::Empty)?;
+    if name.len() > MAX_DECISION_ENDPOINT_NAME_BYTES {
+        return Err(DecisionEndpointNameError::TooLong);
+    }
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return Err(DecisionEndpointNameError::InvalidStart);
+    }
+    if !name.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+    }) {
+        return Err(DecisionEndpointNameError::InvalidCharacter);
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum WorkcellCredentialNameError {
@@ -337,6 +374,19 @@ fn workcell_auth_lock_path(dir: &StateDir, name: &WorkcellCredentialName) -> Pat
         .join(format!("{name}.lock"))
 }
 
+fn decision_auth_path(
+    dir: &StateDir,
+    name: &str,
+    extension: &str,
+) -> Result<PathBuf, StorageError> {
+    validate_decision_endpoint_name(name)?;
+    Ok(dir
+        .persistent_path()
+        .join(AUTH_DIR)
+        .join(DECISION_AUTH_DIR)
+        .join(format!("{name}.{extension}")))
+}
+
 fn load_auth<T: DeserializeOwned>(path: &Path) -> Option<T> {
     try_load_auth(path).ok().flatten()
 }
@@ -632,6 +682,31 @@ pub fn delete_provider_credentials(dir: &StateDir, slug: &str) -> Result<bool, S
     }
 }
 
+pub fn load_decision_credentials(
+    dir: &StateDir,
+    name: &str,
+) -> Result<Option<ProviderCredentials>, StorageError> {
+    try_load_auth(&decision_auth_path(dir, name, "json")?)
+}
+
+pub fn save_decision_credentials(
+    dir: &StateDir,
+    name: &str,
+    api_key: &str,
+) -> Result<(), StorageError> {
+    let _lock = exclusive_state_lock(&decision_auth_path(dir, name, "lock")?, AUTH_FILE_MODE)?;
+    let credentials = ProviderCredentials {
+        api_key: api_key.to_owned(),
+        host: None,
+    };
+    save_auth(&decision_auth_path(dir, name, "json")?, &credentials)
+}
+
+pub fn delete_decision_credentials(dir: &StateDir, name: &str) -> Result<bool, StorageError> {
+    let _lock = exclusive_state_lock(&decision_auth_path(dir, name, "lock")?, AUTH_FILE_MODE)?;
+    delete_auth(&decision_auth_path(dir, name, "json")?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -884,6 +959,63 @@ mod tests {
             load_workcell_credential(&dir, &name),
             Err(StorageError::InvalidWorkcellCredential(_))
         ));
+    }
+
+    #[test]
+    fn decision_credentials_round_trip_owner_only() {
+        const NAME: &str = "openai";
+        const KEY: &str = "sk-decision-test";
+
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        assert!(load_decision_credentials(&dir, NAME).unwrap().is_none());
+
+        save_decision_credentials(&dir, NAME, KEY).unwrap();
+
+        let loaded = load_decision_credentials(&dir, NAME).unwrap().unwrap();
+        assert_eq!(loaded.api_key, KEY);
+        assert!(loaded.host.is_none());
+        let path = decision_auth_path(&dir, NAME, "json").unwrap();
+        assert!(path.ends_with(format!("{AUTH_DIR}/{DECISION_AUTH_DIR}/{NAME}.json")));
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            AUTH_FILE_MODE
+        );
+        assert!(load_provider_credentials(&dir, NAME).is_none());
+
+        assert!(delete_decision_credentials(&dir, NAME).unwrap());
+        assert!(load_decision_credentials(&dir, NAME).unwrap().is_none());
+        assert!(!delete_decision_credentials(&dir, NAME).unwrap());
+    }
+
+    #[test_case("", DecisionEndpointNameError::Empty; "empty")]
+    #[test_case("-tunnel", DecisionEndpointNameError::InvalidStart; "leading_hyphen")]
+    #[test_case("Tunnel", DecisionEndpointNameError::InvalidStart; "uppercase")]
+    #[test_case("../escape", DecisionEndpointNameError::InvalidStart; "traversal")]
+    #[test_case("a/b", DecisionEndpointNameError::InvalidCharacter; "separator")]
+    #[test_case("a.b", DecisionEndpointNameError::InvalidCharacter; "dot")]
+    fn decision_credential_names_are_validated(name: &str, expected: DecisionEndpointNameError) {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        assert_eq!(validate_decision_endpoint_name(name), Err(expected));
+        assert!(matches!(
+            save_decision_credentials(&dir, name, "key"),
+            Err(StorageError::InvalidDecisionEndpointName(actual)) if actual == expected
+        ));
+        assert!(load_decision_credentials(&dir, name).is_err());
+        assert!(delete_decision_credentials(&dir, name).is_err());
+    }
+
+    #[test]
+    fn decision_credential_names_are_bounded() {
+        assert_eq!(
+            validate_decision_endpoint_name(&"x".repeat(MAX_DECISION_ENDPOINT_NAME_BYTES + 1)),
+            Err(DecisionEndpointNameError::TooLong)
+        );
+        assert!(
+            validate_decision_endpoint_name(&"x".repeat(MAX_DECISION_ENDPOINT_NAME_BYTES)).is_ok()
+        );
     }
 
     #[test]

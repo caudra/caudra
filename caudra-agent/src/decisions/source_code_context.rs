@@ -150,6 +150,7 @@ fn candidate(symbol: &CodeSymbol<'_>) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use caudra_config::decisions::{DecisionEndpoint, DecisionProtocol};
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
@@ -239,7 +240,11 @@ mod tests {
         fn new(mode: FeatureMode, scores: &[(usize, f64)], fail: bool) -> Self {
             let root = tempfile::tempdir().unwrap();
             let mut config = DecisionsConfig {
-                base_url: Some(BASE_URL.parse().unwrap()),
+                endpoint: Some(DecisionEndpoint::new(
+                    DecisionProtocol::TypeSafe.as_str(),
+                    DecisionProtocol::TypeSafe,
+                    BASE_URL.parse().unwrap(),
+                )),
                 ..Default::default()
             };
             config.features.source_code_context = mode;

@@ -1822,6 +1822,7 @@ fn expand_history(messages: &[Message]) -> Vec<HistoryItem> {
 
 #[cfg(test)]
 mod tests {
+    use caudra_config::decisions::{DecisionEndpoint, DecisionProtocol};
     use std::path::Path;
     use std::sync::atomic::AtomicUsize;
 
@@ -1999,7 +2000,11 @@ mod tests {
         engine: RoutingEngine,
     ) -> Decisions {
         let mut config = DecisionsConfig {
-            base_url: Some(ROUTING_BASE_URL.parse().unwrap()),
+            endpoint: Some(DecisionEndpoint::new(
+                DecisionProtocol::TypeSafe.as_str(),
+                DecisionProtocol::TypeSafe,
+                ROUTING_BASE_URL.parse().unwrap(),
+            )),
             log: true,
             ..DecisionsConfig::default()
         };
@@ -2017,7 +2022,6 @@ mod tests {
             &AgentMode::Build,
             Arc::new(PermissionManager::new_nonpersistent(
                 PermissionsConfig {
-                    decision_engine: true,
                     ..Default::default()
                 },
                 Path::new("/tmp").to_path_buf(),

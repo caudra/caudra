@@ -42,8 +42,8 @@ version = 1
 # always_yolo = false
 
 # Start every session with Auto permission mode (preserve required prompts and
-# screen unmatched calls); global config only. Needs
-# `experimental.decision_engine`, otherwise sessions start in Ask.
+# screen unmatched calls); global config only. Screening runs only while a
+# decision endpoint is active.
 # Type: bool.
 # always_auto = false
 
@@ -77,10 +77,6 @@ version = 1
 # Turn on Lua plugins and init.lua.
 # Type: bool.
 # lua_plugins = false
-
-# Turn on the decision engine and Auto mode.
-# Type: bool.
-# decision_engine = false
 
 # Turn on cross-session messages.
 # Type: bool.
@@ -204,12 +200,12 @@ version = 1
 # Type: bool.
 # show_reminders = true
 
-# Show what the experimental decision engine changed: one row where it
-# reordered, pruned or pointed out results, suggested a skill or model, skipped
-# a goal check, or flagged a call, and one where it failed and the default
-# applied. A dim `shadow` row shows what a feature in shadow mode would have
-# done. Each row expands on click to the candidates and scores behind it. The
-# model never sees these rows.
+# Show what the decision engine changed: one row where it reordered, pruned or
+# pointed out results, suggested a skill or model, skipped a goal check, or
+# flagged a call, and one where it failed and the default applied. A dim
+# `shadow` row shows what a feature in shadow mode would have done. Each row
+# expands on click to the candidates and scores behind it. The model never sees
+# these rows.
 # Type: bool.
 # show_decisions = true
 
@@ -972,46 +968,9 @@ version = 1
 # directory = <string>
 
 [decisions]
-# The typed decision engine. It needs `decision_engine = true` under
-# [experimental]. Connection settings and thresholds are global-only.
-
-# Global-only decision wire protocol: `typesafe` or `openai`. Never inferred
-# from the URL, model, or environment. Selecting a protocol does not enable
-# decisions.
-# Type: string.
-# protocol = "typesafe"
-
-# Global-only decision API base URL. TypeSafe uses a root such as
-# `https://api.typesafe.ai` and appends `/v1/systemone`; OpenAI uses a
-# versioned base such as `https://api.openai.com/v1` and appends `/decisions`.
-# Path prefixes are preserved; full endpoints are rejected. Only the selected
-# protocol's `TYPESAFE_BASE_URL` or `OPENAI_BASE_URL`, from the process or
-# global environment, replaces an explicitly configured base. Environment alone
-# never enables decisions. HTTPS required except for numeric loopback HTTP or
-# explicit `allow_http` consent. No credentials, query, fragment, whitespace,
-# or control characters.
-# Type: string. Default: unset.
-# base_url = <string>
-
-# Decision model identifier, nonblank and without control characters.
-# Type: string. Default: `jev-latest` for typesafe; `gpt-6-luna` for openai.
-# model = <string>
-
-# Environment variable containing the optional credential, never the credential
-# itself. Project environment values are excluded.
-# Type: string. Default: `TYPESAFE_API_KEY` for typesafe; `OPENAI_API_KEY` for
-# openai.
-# api_key_env = <string>
-
-# Explicit global consent to send decision context to a non-loopback endpoint.
-# Type: boolean.
-# allow_remote = false
-
-# Global-only opt-in for non-loopback HTTP. Also requires
-# `allow_remote = true`. Use only with transport protection you control, such
-# as a trusted encrypted tunnel.
-# Type: boolean.
-# allow_http = false
+# Shared settings for the typed decision engine, which runs only while a
+# decision endpoint is active. Endpoints are `[decisions.<name>]` tables in the
+# global providers.toml. Timeouts and thresholds are global-only.
 
 # Positive decision-request deadline in milliseconds, separate from shell
 # execution timeouts. Tool search and every reranking feature except memory
@@ -1499,8 +1458,8 @@ version = 1
 # The global file is ~/.config/caudra/providers.toml, or
 # %APPDATA%\caudra\providers.toml on Windows. There is no project file.
 #
-# `caudra auth login` and `caudra auth logout` rewrite this file and drop its
-# comments, so keep a copy of the ones you want.
+# `caudra auth login` and `caudra auth logout` replace only the table they
+# change, and keep the rest of the file and its comments.
 #
 # Full reference: https://caudra.ai/docs/providers/#providers-toml
 
@@ -1766,6 +1725,41 @@ version = 1
 # an id that holds a dot, such as `models."qwen-3.6"`.
 # Type: table.
 # models = {}
+
+# [decisions.my-endpoint]
+# One decision endpoint, named my-endpoint here. Configuring it is the consent
+# to send decision context to it, and `/decision-model` or
+# `caudra decisions use` makes it the active one.
+
+# Decision wire protocol: `typesafe` or `openai`. Never inferred from the URL
+# or model.
+# Type: string. Required.
+# protocol = "typesafe"
+
+# Decision API base URL. TypeSafe takes a root such as
+# `https://api.typesafe.ai` and appends `/v1/systemone`. OpenAI takes a
+# versioned base such as `https://api.openai.com/v1` and appends `/decisions`.
+# A path prefix stays, and a full endpoint is rejected. `{env:NAME}` reads the
+# base from the environment. HTTPS is required, except for numeric loopback
+# HTTP or with `allow_http`. No credentials, query, fragment, whitespace, or
+# control characters.
+# Type: string. Required.
+# base_url = "https://api.typesafe.ai"
+
+# Decision model identifier, nonblank and without control characters.
+# Type: string. Default: `jev-latest` for typesafe, `gpt-6-luna` for openai.
+# model = <string>
+
+# Environment variable holding the credential when no key is saved for this
+# endpoint, never the credential itself. Project environment values are
+# excluded. The presets set `TYPESAFE_API_KEY` and `OPENAI_API_KEY`.
+# Type: string. Default: unset.
+# api_key_env = <string>
+
+# Opt-in for plain HTTP to a non-loopback host. Use only with transport
+# protection you control, such as a trusted encrypted tunnel.
+# Type: boolean.
+# allow_http = false
 ```
 
 ## workcell.toml

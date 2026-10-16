@@ -3,7 +3,9 @@
 
 use caudra_agent::decisions::{DecisionFeature, endpoint_kind};
 use caudra_config::ClockFormat;
-use caudra_config::decisions::{DecisionThresholds, DecisionsConfig, FeatureMode};
+use caudra_config::decisions::{
+    DecisionKeySource, DecisionThresholds, DecisionsConfig, FeatureMode,
+};
 use caudra_storage::decision_log::{DecisionEffect, DecisionStats, EndpointKind, LoggedDecision};
 use caudra_storage::sessions::PermissionMode;
 use jiff::Timestamp;
@@ -56,7 +58,9 @@ pub(super) const REACHABLE: &str = "reachable (last attempt)";
 pub(super) const OFFLINE: &str = "offline (last attempt)";
 pub(super) const NOT_CHECKED: &str = "not checked yet";
 pub(super) const ENGINE_CONFIGURED: &str = "configured";
-pub(super) const ENGINE_OFF: &str = "off: set base_url under [decisions] in the global caudra.toml";
+pub(super) const API_KEY_FIELD: &str = "API key";
+pub(super) const ENGINE_OFF: &str =
+    "No decision endpoint is active. Add one with /login or pick one with /decision-model.";
 pub(super) const CONTENT_FLAGGED: &str = "flagged";
 pub(super) const LOGGING_HINT: &str =
     "Logging is off: set log = true under [decisions] in the global caudra.toml";
@@ -66,7 +70,7 @@ pub(super) const NO_SESSION_DECISIONS: &str = "No decisions in this session yet"
 pub(super) const NO_PROJECT_DECISIONS: &str = "No decisions in this project yet";
 pub(super) const SHADOW_UNLOGGED: &str =
     "Shadow mode only records answers, so with logging off it shows nothing";
-pub(super) const WORKFLOW_DETAIL: &str = "Always on with a base URL; used by decide()";
+pub(super) const WORKFLOW_DETAIL: &str = "Always on with an active endpoint; used by decide()";
 /// Short lines, because the table body never wraps and a cut sentence would
 /// hide its end behind the pan bar.
 pub(super) const ACTIVITY_FOOTNOTE: [&str; 2] = [
@@ -81,45 +85,38 @@ pub(super) fn overview(ctx: &DecisionsModalContext, theme: &Theme) -> Vec<Line<'
     let config = ctx.config;
     let status = ctx.status;
     let mut lines = vec![heading(ENGINE_HEADING, theme)];
-    match &config.base_url {
-        Some(url) => {
+    match &config.endpoint {
+        Some(endpoint) => {
             lines.push(field("Status", ENGINE_CONFIGURED, theme));
             lines.push(field(
                 "Endpoint",
                 format!(
-                    "{} ({})",
-                    url.origin().ascii_serialization(),
+                    "{} {} ({})",
+                    escape_terminal_controls(&endpoint.name),
+                    endpoint.base_url.origin().ascii_serialization(),
                     kind_label(&endpoint_kind(config))
                 ),
+                theme,
+            ));
+            lines.push(field("Protocol", endpoint.protocol.as_str(), theme));
+            lines.push(field(
+                "Model",
+                escape_terminal_controls(&endpoint.model),
+                theme,
+            ));
+            lines.push(field("allow_http", yes_no(endpoint.allow_http), theme));
+            lines.push(field(
+                API_KEY_FIELD,
+                DecisionKeySource::label(ctx.key_source),
                 theme,
             ));
         }
         None => lines.push(field("Status", ENGINE_OFF, theme)),
     }
-    lines.push(field("Protocol", config.protocol.as_str(), theme));
-    lines.push(field(
-        "Model",
-        escape_terminal_controls(&config.model),
-        theme,
-    ));
     lines.push(field("Timeout", format!("{} ms", config.timeout_ms), theme));
     lines.push(field(
         "Rerank timeout",
         format!("{} ms", config.rerank_timeout_ms),
-        theme,
-    ));
-    lines.push(field("allow_remote", yes_no(config.allow_remote), theme));
-    lines.push(field("allow_http", yes_no(config.allow_http), theme));
-    lines.push(field(
-        "API key",
-        format!(
-            "{} {}",
-            escape_terminal_controls(&config.api_key_env),
-            match ctx.api_key_set {
-                true => "is set",
-                false => "is not set",
-            }
-        ),
         theme,
     ));
 
@@ -259,7 +256,7 @@ pub(super) fn feature_mode<'a>(
     feature: &DecisionFeature,
     config: &'a DecisionsConfig,
 ) -> &'a FeatureMode {
-    match (feature, &config.base_url) {
+    match (feature, &config.endpoint) {
         (DecisionFeature::Workflow | DecisionFeature::Code, None) => &FeatureMode::Off,
         _ => feature.mode(&config.features),
     }

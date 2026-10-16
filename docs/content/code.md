@@ -3,14 +3,14 @@ title: "Code"
 description: "The code tool: Python snippets for computation, search over past conversations, MCP servers, and decision helpers."
 ---
 
-The model has one tool for running Python, `code`. A snippet computes, reshapes data, and reaches what the session connects it to: the [stored history](#search-past-conversations) of your conversations, your [MCP servers](/docs/mcp/#code-mode), and, with the decision engine on, the [decision helpers](#decisions-and-reranking). It filters and summarises before anything reaches the model, so a search over hundreds of results can come back as three lines.
+The model has one tool for running Python, `code`. A snippet computes, reshapes data, and reaches what the session connects it to: the [stored history](#search-past-conversations) of your conversations, your [MCP servers](/docs/mcp/#code-mode), and, with a decision endpoint active, the [decision helpers](#decisions-and-reranking). It filters and summarises before anything reaches the model, so a search over hundreds of results can come back as three lines.
 
 ```python
 hits = await history.search("flaky retry test", since="2026-09-01")
 [(hit["when"], hit["title"], hit["snippet"]) for hit in hits["hits"][:3]]
 ```
 
-`code` is offered in every session, with or without MCP servers. Its definition never changes, so connecting a server, enabling the decision engine, or switching to plan mode leaves the [prompt cache](/docs/configuration/#the-prompt-cache) intact. The [Tools](/docs/tools/#code) page lists its parameters.
+`code` is offered in every session, with or without MCP servers. Its definition never changes, so connecting a server, switching decision endpoints, or switching to plan mode leaves the [prompt cache](/docs/configuration/#the-prompt-cache) intact. The [Tools](/docs/tools/#code) page lists its parameters.
 
 ## Snippets
 
@@ -111,7 +111,7 @@ Before each query, Caudra indexes what changed in the query's scope for up to 1.
 
 Without reranking, matches come back in keyword order. Items that contain every word come first, and items that contain some of them fill any shortfall. Within each tier, the BM25 score orders them, weighted by kind: your messages and compaction summaries count most, then assistant text, reasoning, tool calls, and tool results. `score` is that weighted BM25 score, and `ranking` is `"keyword"`.
 
-With the experimental [decision engine](/docs/configuration/#decisions) on and the `history_search` feature set to `enforce`, Caudra reranks:
+With a [decision endpoint](/docs/providers/#decision-endpoints) active and the `history_search` feature set to `enforce`, Caudra reranks:
 
 1. Keyword search picks a pool of up to 64 matches, at most 8 from any one session when the scope spans sessions. With `sort="newest"`, the pool is the 64 newest matches.
 2. The engine judges each match against the query: does this excerpt help answer it? It answers 16 matches to a request, all four requests at once. Because an engine may answer one request at a time, in any order, each request waits up to one [`rerank_timeout_ms`](/docs/configuration/#decisions) per request in the pool, so four requests wait up to four budgets.
@@ -151,7 +151,7 @@ The model learns the servers and their tools from a `# MCP servers` reminder, an
 
 ## Decisions and reranking
 
-With the [decision engine](/docs/configuration/#decisions) on and a base URL set, snippets get two more functions, `decide()` and `rerank()`. They work on what a snippet gathered: a snippet calls a server or searches history, then judges, filters, or sorts the result before any of it reaches the model, or branches on a judgement without another round trip.
+With a [decision endpoint](/docs/providers/#decision-endpoints) active, snippets get two more functions, `decide()` and `rerank()`. They work on what a snippet gathered: a snippet calls a server or searches history, then judges, filters, or sorts the result before any of it reaches the model, or branches on a judgement without another round trip.
 
 ```python
 issues = await github.list_issues(owner="caudra", repo="caudra", state="open")
@@ -169,7 +169,7 @@ ranked = await rerank("crashes when saving a file", titles, threshold=0.5, top_k
 
 `rerank()` judges up to 256 candidates, each a string or a small dict. `index` is a candidate's position in `candidates`, and `score` is the probability that it is relevant. `threshold` drops candidates below it, and `top_k` keeps at most that many. Candidates go out 16 to a request, with up to 4 requests at once. Each request waits up to [`rerank_timeout_ms`](/docs/configuration/#decisions), like Caudra's own reranking, unless the call passes a shorter `timeout_ms`. A `decide()` call waits up to `timeout_ms` from the configuration. An empty list returns `[]` without a request.
 
-The model learns about both functions from the `# MCP servers` reminder, which describes them while the engine is on, with or without servers. Without the engine they do not exist, and a snippet that calls one raises `NameError`.
+The model learns about both functions from the `# MCP servers` reminder, which describes them while an endpoint is active, with or without servers. Without one they do not exist, and a snippet that calls one raises `NameError`.
 
 The reminder also tells the model how to get reliable answers, following the habits of Caudra's own question sets:
 

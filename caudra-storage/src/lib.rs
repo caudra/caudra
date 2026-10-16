@@ -11,6 +11,7 @@ pub mod background;
 pub mod changelog;
 pub mod checkout;
 pub mod decision_log;
+pub mod decisions;
 pub mod digest_trust;
 #[path = "sessions/engine_decisions.rs"]
 pub mod engine_decisions;
@@ -249,6 +250,8 @@ pub enum StorageError {
     InvalidProviderAuth(String),
     #[error("invalid Workcell credential: {0}")]
     InvalidWorkcellCredential(String),
+    #[error(transparent)]
+    InvalidDecisionEndpointName(#[from] auth::DecisionEndpointNameError),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("slug collision after max attempts")]

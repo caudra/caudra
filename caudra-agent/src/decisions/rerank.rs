@@ -334,6 +334,7 @@ pub(crate) async fn join_answered<T, E>(
 
 #[cfg(test)]
 mod tests {
+    use caudra_config::decisions::{DecisionEndpoint, DecisionProtocol};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -459,7 +460,11 @@ mod tests {
         ) -> Self {
             let root = tempfile::tempdir().unwrap();
             let mut config = DecisionsConfig {
-                base_url: Some(BASE_URL.parse().unwrap()),
+                endpoint: Some(DecisionEndpoint::new(
+                    DecisionProtocol::TypeSafe.as_str(),
+                    DecisionProtocol::TypeSafe,
+                    BASE_URL.parse().unwrap(),
+                )),
                 timeout_ms: SHORT_TIMEOUT_MS,
                 rerank_timeout_ms: RERANK_TIMEOUT_MS,
                 log,

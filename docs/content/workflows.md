@@ -164,8 +164,8 @@ Everything after the metadata is ordinary Rhai with these host functions:
 | `pause(kind, message)` | Suspends the run in a resumable state |
 | `complete()`, `complete(value)` | Ends the run with `value` as its result |
 | `write_scratch_file(name, content)` | Writes an artifact and returns its path |
-| `decide(state, questions)`, `decide(state, questions, opts)` | Calls the configured decision endpoint. Needs `experimental.decision_engine`. Returns `#{ model, answers, by_name }` |
-| `rerank(query, candidates)`, `rerank(query, candidates, opts)` | Orders candidates by relevance to `query` through the decision endpoint. Needs `experimental.decision_engine`. Returns `[#{ index, score }]`, best first |
+| `decide(state, questions)`, `decide(state, questions, opts)` | Calls the active decision endpoint. Returns `#{ model, answers, by_name }` |
+| `rerank(query, candidates)`, `rerank(query, candidates, opts)` | Orders candidates by relevance to `query` through the active decision endpoint. Returns `[#{ index, score }]`, best first |
 | `json_encode(value)` | Serializes a value to JSON text |
 | `budget()` | Returns `#{ issued, limit, remaining }` for the run's agent budget |
 | `args` | The launch arguments, or `()` when none were given |
@@ -196,7 +196,7 @@ Precedence runs from most specific configuration to least. A `subagent_model` pi
 
 ### Typed decisions
 
-`decide()` calls the endpoint selected by `protocol` and `base_url` in your global [`decisions` configuration](/docs/configuration/#decisions) and needs `experimental.decision_engine` as well as `experimental.workflows`. The default `typesafe` protocol calls System One. `openai` calls OpenAI Decisions or a compatible ninfer server. With the engine switch on, it is available even when passive decision features are configured off. YOLO bypasses permission-related decision checks, while explicit `decide()` calls and unrelated passive features still follow their configuration. A non-loopback base URL requires `allow_remote = true`. Calls go directly to that endpoint without ambient proxies or HTTP redirects. Both protocols send text only.
+`decide()` calls the active [decision endpoint](/docs/providers/#decision-endpoints), which you add with `/login` or `caudra auth login --decision` and switch with `/decision-model` or `caudra decisions use`. The `typesafe` protocol calls System One. `openai` calls OpenAI Decisions or a compatible ninfer server. With an endpoint active, `decide()` is available even when passive decision features are configured off, and without one it fails with a catchable error. A run reads the endpoint that is active when its session starts. YOLO bypasses permission-related decision checks, while explicit `decide()` calls and unrelated passive features still follow their configuration. Calls go directly to that endpoint without ambient proxies or HTTP redirects. Both protocols send text only.
 
 ```rhai
 let result = decide(

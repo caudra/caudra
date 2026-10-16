@@ -79,7 +79,7 @@ use caudra_agent::{
     SubagentActivity, SubagentProgress, TaskProvenance, TextOutput, ToolAccounting, ToolDoneEvent,
     ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
-use caudra_config::decisions::DecisionsConfig;
+use caudra_config::decisions::{DecisionEndpoint, DecisionProtocol, DecisionsConfig};
 use caudra_config::sandbox::SandboxName;
 use caudra_config::{
     Effect, FeatureFlags, InboundPolicy, PermissionReviewCandidate, PermissionReviewKind,
@@ -489,7 +489,6 @@ fn build_app_with_lua(
         Arc::new(PermissionManager::new_nonpersistent(
             PermissionsConfig {
                 rules: vec![],
-                decision_engine: true,
                 ..Default::default()
             },
             PathBuf::from("/tmp"),
@@ -4446,7 +4445,7 @@ pub(crate) fn error_app(app: &mut App) {
     }));
 }
 
-fn cmd(name: &str) -> ParsedCommand {
+pub(crate) fn cmd(name: &str) -> ParsedCommand {
     ParsedCommand {
         name: name.to_string(),
         args: String::new(),
@@ -6194,8 +6193,6 @@ fn main_only_commands_still_run_from_the_main_composer() {
 #[test_case("/deep-research", Feature::Workflows; "workflow_shortcut")]
 #[test_case("/automations", Feature::Automations; "automations")]
 #[test_case("/sandbox", Feature::Sandboxes; "sandbox")]
-#[test_case("/decisions", Feature::DecisionEngine; "decisions")]
-#[test_case("/auto", Feature::DecisionEngine; "auto")]
 #[test_case("/autopilot", Feature::Autopilot; "autopilot")]
 fn a_command_whose_experiment_is_off_names_the_switch(command: &str, feature: Feature) {
     let mut app = test_app();
@@ -12931,8 +12928,14 @@ fn decisions_command_opens_the_modal_without_changing_permissions(
 fn decisions_command_reads_configuration_without_probing(mode: PermissionMode) {
     let mut app = test_app();
     let config = DecisionsConfig {
-        base_url: Some(DECISIONS_TEST_BASE_URL.parse().unwrap()),
-        model: DECISIONS_TEST_MODEL.into(),
+        endpoint: Some(DecisionEndpoint {
+            model: DECISIONS_TEST_MODEL.into(),
+            ..DecisionEndpoint::new(
+                DecisionProtocol::TypeSafe.as_str(),
+                DecisionProtocol::TypeSafe,
+                DECISIONS_TEST_BASE_URL.parse().unwrap(),
+            )
+        }),
         ..Default::default()
     };
     let decisions = Decisions::new(config, &app.storage).unwrap();
@@ -19256,7 +19259,8 @@ fn picker_overlay_blocks_plan_row_clicks() {
     app.plan_form.on_plan_ready();
     let _ = rendered(&mut app);
     let row = app.plan_form.row_area(2).unwrap();
-    app.model_picker.open(&app.state.model, &app.model_policy);
+    app.model_picker
+        .open(&app.state.model, &app.model_policy, None);
     let _ = rendered(&mut app);
 
     app.update(mouse_event(
@@ -19343,7 +19347,8 @@ fn open_peer_manager(app: &mut App) {
 }
 
 fn open_model_picker(app: &mut App) {
-    app.model_picker.open(&app.state.model, &app.model_policy);
+    app.model_picker
+        .open(&app.state.model, &app.model_policy, None);
 }
 
 fn open_command_modal(app: &mut App) {
@@ -22337,6 +22342,7 @@ fn associated_composed_text_over_a_model_reset_key_edits_the_filter() {
     app.model_picker.open_purpose(
         &app.state.model,
         &ModelPolicy::default(),
+        None,
         ModelPurpose::Plan,
     );
     assert!(

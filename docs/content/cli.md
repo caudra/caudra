@@ -24,16 +24,21 @@ Some flags and subcommands belong to [experimental features](/docs/configuration
 
 ## caudra decisions
 
-Decision log administration needs `experimental.decision_engine` and does not start an agent:
+Manages [decision endpoints](/docs/providers/#decision-endpoints) and the decision log, and does not start an agent:
 
 ```bash
+caudra decisions list
+caudra decisions use openai
+caudra decisions use off
 caudra decisions status
 caudra decisions stats --feature permission
 caudra decisions export --feature permission > decisions.jsonl
 caudra decisions purge --yes
 ```
 
-`status` shows effective configuration without contacting the endpoint. Reachability is `not_probed`. `stats` prints JSON with counts, errors, latency percentiles and labelled agreement, using the currently configured thresholds. `acted_count` counts the rows whose effect is not `none`, and `last_timestamp` is the newest row's time in epoch seconds. `export` writes JSONL with only labelled questions in laya-evals format. These commands do not enable logging or create a database. The decision log uses tables in `caudra.db`. `purge --yes` deletes recorded decisions and labels from those live tables, leaving sessions, messages, and shell duration history intact. It does not erase copies in SQLite free pages, WAL files, or backups.
+`list` shows every endpoint in `providers.toml` with its protocol, model, host, and key source, and marks the active one. An endpoint whose table does not validate shows its host as `(invalid)`. `use <name>` checks the endpoint, names any problem, and makes it active, and `use off` turns decisions off. The choice is saved globally, and Caudra processes that are already running keep their endpoint until they restart.
+
+`status` shows effective configuration without contacting the endpoint, including the active `endpoint` name. Reachability is `not_probed`. `stats` prints JSON with counts, errors, latency percentiles and labelled agreement, using the currently configured thresholds. `acted_count` counts the rows whose effect is not `none`, and `last_timestamp` is the newest row's time in epoch seconds. `export` writes JSONL with only labelled questions in laya-evals format. These commands do not enable logging or create a database. The decision log uses tables in `caudra.db`. `purge --yes` deletes recorded decisions and labels from those live tables, leaving sessions, messages, and shell duration history intact. It does not erase copies in SQLite free pages, WAL files, or backups.
 
 `stats` and `export` accept `--feature`. Log feature names are `permission`, `auto`, `shell_effect`, `content`, `shell_duration`, `tool_search`, `skill_suggestions`, `goal`, `subagent_routing`, `question_tool_nudge`, `memory_search`, `history_search`, `memory_recall`, `memory_duplicates`, `compaction_retention`, `output_pointers`, `source_code_context`, `code`, and `workflow`. They differ from some configuration keys. With no database, statistics are empty and export writes nothing. Administration requires local persistent storage and rejects `--ephemeral` and `--workcell`.
 
@@ -152,7 +157,7 @@ A state is one of `pending`, `leased`, `pausing`, `paused`, `completed`, `failed
 | `--no-plugins` | Turn Lua off for this process, even when `experimental.lua_plugins` is on. No Lua runtime starts, so no `init.lua` or Lua plugin runs. `caudra.toml`, `permissions.toml`, custom commands, and env files load as usual. Use it to recover from a broken `init.lua` or keymap override |
 | `--no-jit` | Run plugin Lua on the interpreter with full debug info. Hidden, and without effect, while `experimental.lua_plugins` is off |
 | `--yolo` | Skip permission prompts on gated tools (alias: `--dangerously-skip-permissions`). Deny rules still apply |
-| `--auto` | Start in [Auto mode](/docs/permissions/#auto-mode). Needs `experimental.decision_engine`. Cannot be combined with `--yolo` |
+| `--auto` | Start in [Auto mode](/docs/permissions/#auto-mode). Cannot be combined with `--yolo` |
 | `--exit-on-done` | Exit when the agent finishes (TUI automation wrappers) |
 | `--name <NAME>` | Give the initial TUI session this [messaging name](/docs/messaging/#messaging-names) instead of a generated one. Needs `experimental.cross_session_messaging` |
 | `--topic <PATTERN>` | Subscribe the initial TUI session to a [topic pattern](/docs/messaging/#topics-and-broadcasts), in addition to its saved ones (repeatable). Needs `experimental.cross_session_messaging` |
@@ -215,14 +220,12 @@ These selectors also work with ACP. `--session ID` restores a saved sandbox sour
 | Mode | Effect |
 |------|--------|
 | `default` | Normal permission prompts |
-| `auto` | Same as `--auto` for the SDK path. Needs `experimental.decision_engine` |
+| `auto` | Same as `--auto` for the SDK path |
 | `acceptEdits` | Accepted for Claude Code compatibility; currently same as `default` |
 | `plan` | Agent mode plan with plan file `./plan.md` under cwd |
 | `bypassPermissions` | Same as `--yolo` for the SDK path |
 
 If both `--yolo` and `--permission-mode` are set, the explicit mode wins. Unknown mode names warn and fall back to `default`.
-
-While `experimental.decision_engine` is off, `--permission-mode auto` stops Caudra with an error. A `set_permission_mode` control request for `auto` returns the same error and leaves the mode unchanged.
 
 Several other Claude Code flags are accepted and ignored so existing scripts keep parsing. Caudra prints a warning when you pass one of them.
 
@@ -439,7 +442,9 @@ A remote selector is required. `remote` is available when `experimental.sandboxe
 
 ```bash
 caudra auth login [provider] [--method oauth|api-key|import] [--hostname HOST]
+caudra auth login --decision [typesafe|openai|custom|<name>]
 caudra auth logout <provider>
+caudra auth logout --decision <name>
 caudra auth status
 caudra auth workcell set <NAME> [--stdin]
 caudra auth workcell list
@@ -454,9 +459,11 @@ caudra auth sandbox delete <NAME>
 
 Anthropic OAuth is experimental. The command explains the Anthropic terms limitation before opening the browser. OpenAI uses a device authorization flow. xAI retains its dedicated named login flow. Other providers prompt for an API key and a plan when more than one plan exists. The interactive picker can also create custom providers.
 
+`login --decision` sets up a [decision endpoint](/docs/providers/#decision-endpoints) instead of a chat provider. `typesafe` and `openai` are the presets, `custom` asks for a name, protocol, base URL, and model, and a configured name replaces that endpoint's key. Without a name, it shows the decision menu, which the plain `login` menu also lists. Before it saves plain HTTP to a non-loopback host, it asks for confirmation and sets `allow_http = true`. It saves the key under the state directory, writes the `[decisions.<name>]` table, and makes a new endpoint active. An empty key keeps the saved one, or falls back to the variable that `api_key_env` names. `logout --decision <name>` deletes the key and the table, and turns decisions off when that endpoint was active.
+
 `copilot` and `copilot-enterprise` sign in with GitHub through a device code. Pass `--method import` to copy a token from the gh CLI, the Copilot editor plugin, or the system keyring instead. `copilot-enterprise` also needs the GitHub Enterprise host. Pass it with `--hostname company.ghe.com`, or answer the prompt. Without a terminal and without `--hostname`, the command stops with an error. The two providers keep separate credentials, so logging out of one leaves the other signed in. See [Copilot Enterprise](/docs/providers/#copilot-enterprise).
 
-The TUI `/login` command offers the same method choice for Anthropic and OpenAI, and starts the GitHub sign-in directly for both Copilot providers. `status` distinguishes saved OAuth, saved API keys, saved Copilot tokens with their enterprise host, environment credentials, configured endpoints, and missing credentials.
+The TUI `/login` command offers the same method choice for Anthropic and OpenAI, and starts the GitHub sign-in directly for both Copilot providers. `status` distinguishes saved OAuth, saved API keys, saved Copilot tokens with their enterprise host, environment credentials, configured endpoints, and missing credentials. A **Decision endpoints** block lists each decision endpoint with its key source and marks the active one with `●`.
 
 `auth workcell set` reads a bearer token from a hidden terminal prompt, or from stdin with `--stdin`. It stores or replaces a named credential, referenced as `credential:NAME`. `list` shows names and update times without bearer values. Credentials are stored in owner-only local files, without OS-keyring encryption. They are separate from provider login and MCP OAuth credentials. `auth workcell` needs `experimental.remote_workcell`.
 

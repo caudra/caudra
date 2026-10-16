@@ -373,6 +373,7 @@ fn insert_fitting(focus: &mut Value, key: &str, value: Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use caudra_config::decisions::{DecisionEndpoint, DecisionProtocol};
     use std::ops::RangeInclusive;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
@@ -497,7 +498,11 @@ mod tests {
             let root = tempdir();
             let requests = Arc::default();
             let mut config = DecisionsConfig {
-                base_url: Some(BASE_URL.parse().unwrap()),
+                endpoint: Some(DecisionEndpoint::new(
+                    DecisionProtocol::TypeSafe.as_str(),
+                    DecisionProtocol::TypeSafe,
+                    BASE_URL.parse().unwrap(),
+                )),
                 log: true,
                 ..Default::default()
             };

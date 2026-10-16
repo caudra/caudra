@@ -33,7 +33,6 @@ use caudra_ui::SettingsReloader;
 
 use crate::cli::{AuthAction, Cli, Command, McpAction, WorkcellAuthAction, normalize_tool_name};
 use crate::docs;
-use crate::sdk_mode::AUTO_PERMISSION_MODE;
 use crate::startup::Startup;
 use crate::update;
 
@@ -43,7 +42,6 @@ const TEMP_DIR_VARS: [&str; 3] = ["TMPDIR", "TMP", "TEMP"];
 const INIT_LUA_SKIPPED: &str = "init.lua not loaded, because Lua plugins are experimental and turned off; move its settings to caudra.toml (`caudra config example` lists them all), or set `experimental.lua_plugins = true` in the global caudra.toml and restart Caudra";
 const FEATURES_CHANGED: &str =
     "the [experimental] table in the global caudra.toml changed; restart Caudra to apply it";
-const AUTO_NEEDS_ENGINE: &str = "always_auto is set, but Auto mode is experimental and turned off, so sessions start in Ask; set `experimental.decision_engine = true` in the global caudra.toml and restart Caudra to use it";
 
 fn run_storage(persistent: StateDir, ephemeral: bool) -> Result<(StateDir, Option<EphemeralRoot>)> {
     if !ephemeral {
@@ -207,18 +205,10 @@ fn settings_notices(cli: &Cli, cwd: &Path, remote: bool) -> Vec<String> {
     notices
 }
 
-/// A configured Auto that the startup policy cannot honour starts sessions in
-/// Ask; saying so keeps the setting from looking ignored.
-fn auto_notice(config: &Config) -> Option<String> {
-    (config.always_auto && !config.permissions.decision_engine)
-        .then(|| AUTO_NEEDS_ENGINE.to_owned())
-}
-
 /// Settles what only the startup policy decides, once the permissions are
 /// loaded, so no settings layer or reload can change it.
 fn apply_startup_policy(config: &mut Config, features: FeatureFlags) {
     config.agent.features = features;
-    config.permissions.decision_engine = features.enabled(Feature::DecisionEngine);
 }
 
 /// The command-line flags settings are resolved under, apart from `Cli` so a
@@ -435,9 +425,6 @@ fn redirect_temp_dir() {
 fn require_requested_features(cli: &Cli) -> Result<(), FeatureDisabled> {
     let features = cli.startup.features;
     cli.workcell.require_features(features)?;
-    if cli.auto || cli.permission_mode.as_deref() == Some(AUTO_PERMISSION_MODE) {
-        features.require(Feature::DecisionEngine)?;
-    }
     if cli.requests_messaging() {
         features.require(Feature::CrossSessionMessaging)?;
     }
@@ -460,7 +447,6 @@ fn require_requested_features(cli: &Cli) -> Result<(), FeatureDisabled> {
         Some(Command::Remote { .. }) if !features.enabled(Feature::Sandboxes) => {
             features.require(Feature::RemoteWorkcell)
         }
-        Some(Command::Decisions { .. }) => features.require(Feature::DecisionEngine),
         Some(Command::Message { .. }) => features.require(Feature::CrossSessionMessaging),
         _ => Ok(()),
     }
@@ -523,10 +509,22 @@ pub fn dispatch(mut cli: Cli, startup: Result<Startup, ConfigFileError>) -> Resu
                     provider,
                     method,
                     hostname,
-                } => {
-                    subcmd::auth_login(provider.as_deref(), method, hostname.as_deref(), &storage)?
-                }
-                AuthAction::Logout { provider } => subcmd::auth_logout(&provider, &storage)?,
+                    decision,
+                } => subcmd::auth_login(
+                    provider.as_deref(),
+                    decision,
+                    method,
+                    hostname.as_deref(),
+                    &storage,
+                )?,
+                AuthAction::Logout {
+                    provider,
+                    decision: true,
+                } => subcmd::decision_logout(&provider, &storage)?,
+                AuthAction::Logout {
+                    provider,
+                    decision: false,
+                } => subcmd::auth_logout(&provider, &storage)?,
                 AuthAction::Status => subcmd::auth_status(&storage)?,
                 AuthAction::Workcell { action } => match action {
                     WorkcellAuthAction::Set { name, stdin } => {
@@ -653,7 +651,7 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        INIT_LUA_SKIPPED, Result, auto_notice, cli_plugin_host, load_config, load_settings,
+        INIT_LUA_SKIPPED, Result, cli_plugin_host, load_config, load_settings,
         permission_mode_seed, require_requested_features, settings_notices,
     };
     use crate::cli::Cli;
@@ -789,16 +787,13 @@ mod tests {
         assert!(fixture.settings(false).is_err());
     }
 
-    #[test_case(FeatureFlags::NONE, true; "engine_off")]
-    #[test_case(FeatureFlags::NONE.with(Feature::DecisionEngine), false; "engine_on")]
-    fn configured_auto_follows_the_decision_engine(features: FeatureFlags, noticed: bool) {
-        let fixture = Fixture::new(features, &[(GLOBAL_TOML, "always_auto = true\n")]);
+    #[test]
+    fn configured_auto_seeds_auto_without_an_experiment() {
+        let fixture = Fixture::new(FeatureFlags::NONE, &[(GLOBAL_TOML, "always_auto = true\n")]);
         let cli = fixture.cli(&["caudra"]);
         let host = cli_plugin_host(&cli, Arc::new(ToolRegistry::new())).unwrap();
         let config = load_config(&host, &cli, &fixture.project(), false).unwrap();
-        assert_eq!(config.permissions.decision_engine, !noticed);
         assert_eq!(permission_mode_seed(&config), PermissionMode::Auto);
-        assert_eq!(auto_notice(&config).is_some(), noticed);
     }
 
     #[test_case(FeatureFlags::NONE, &["--name", MESSAGING_NAME], false; "name_experiment_off")]

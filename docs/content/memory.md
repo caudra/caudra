@@ -115,7 +115,7 @@ Subagents get the `memory` tool without the view.
 
 ## Relevance from the decision engine
 
-Three experimental [decision features](/docs/configuration/#reranking) can judge which notes matter. Each is off by default and needs a configured decision engine. They send note names, headings, and redacted excerpts of up to 400 bytes to that engine.
+Three [decision features](/docs/configuration/#reranking) can judge which notes matter. Each is off by default and needs an active [decision endpoint](/docs/providers/#decision-endpoints). They send note names, headings, and redacted excerpts of up to 400 bytes to that engine.
 
 | Feature | Mode | Effect |
 |---------|------|--------|

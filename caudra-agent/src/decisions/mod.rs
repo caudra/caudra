@@ -1,3 +1,4 @@
+mod active;
 mod content;
 #[cfg(test)]
 mod eval;
@@ -20,9 +21,10 @@ use std::time::{Duration, Instant};
 
 use async_io::Timer;
 use caudra_config::decisions::{
-    DecisionFeature as FeatureSetting, DecisionFeatures, DecisionProtocol, DecisionThresholds,
-    DecisionsConfig, DecisionsConfigError, FeatureMode,
+    DecisionEndpoint, DecisionFeature as FeatureSetting, DecisionFeatures, DecisionKeySource,
+    DecisionProtocol, DecisionThresholds, DecisionsConfig, DecisionsConfigError, FeatureMode,
 };
+use caudra_config::providers::{PROVIDERS_FILE, ProvidersFileError};
 use caudra_decision::{
     CachedDecisionEngine, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse,
     HttpDecisionClient, QuestionSet,
@@ -34,14 +36,19 @@ use caudra_storage::decision_log::{
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::SessionError;
 use caudra_storage::usage_ledger::{LedgerPurpose, TurnUsage, UsageLedger};
-use caudra_storage::{StateDir, now_epoch};
+use caudra_storage::{StateDir, StorageError, now_epoch};
 use futures_lite::future;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
-use url::{Host, Url};
+use url::Host;
 
 use shell_duration::ShellDurationCache;
 
+pub use active::{
+    RemovedDecisionEndpoint, SavedDecisionEndpoint, endpoint_api_key, remove_decision_endpoint,
+    resolve_active_decisions, resolve_decision_endpoint, save_decision_endpoint,
+    use_decision_endpoint,
+};
 pub use content::Screening;
 pub use note::{
     DecisionNote, NoteAnchor, NoteDraft, NoteOutcome, NoteSink, counted, placement, score_line,
@@ -64,6 +71,7 @@ const DEADLINE_REJECTED: &str = "timeout exceeds the supported clock range";
 const USAGE_PROVIDER: &str = "decision";
 const EFFECT_RECORD_TIMEOUT: Duration = Duration::from_secs(5);
 const PROTOCOL_META: &str = "protocol";
+const ENDPOINT_META: &str = "endpoint";
 pub(crate) const ENGINE_UNREACHABLE: &str = "engine unreachable";
 const ENGINE_TIMED_OUT: &str = "engine timed out after";
 const ENGINE_HTTP: &str = "engine returned HTTP";
@@ -327,9 +335,9 @@ pub fn stats_thresholds(config: &DecisionThresholds, feature: &str) -> StatsThre
 /// Local only for a numeric loopback host: a name can resolve anywhere.
 pub fn endpoint_kind(config: &DecisionsConfig) -> EndpointKind {
     let loopback = config
-        .base_url
+        .endpoint
         .as_ref()
-        .and_then(Url::host)
+        .and_then(|endpoint| endpoint.base_url.host())
         .is_some_and(|host| match host {
             Host::Ipv4(address) => address.is_loopback(),
             Host::Ipv6(address) => address.is_loopback(),
@@ -351,6 +359,16 @@ pub enum DecisionsError {
     Log(#[from] DecisionLogError),
     #[error(transparent)]
     State(#[from] DecisionStateError),
+    #[error("decision endpoint credential: {0}")]
+    Credential(#[from] StorageError),
+    #[error(transparent)]
+    Providers(#[from] ProvidersFileError),
+    #[error("persist the active decision endpoint: {0}")]
+    ActiveRow(#[source] StorageError),
+    #[error(
+        "no decision endpoint named `{0}` in {PROVIDERS_FILE}; run: caudra auth login --decision"
+    )]
+    UnknownEndpoint(String),
     #[error("decision receipt belongs to a different service")]
     ForeignReceipt,
 }
@@ -402,6 +420,8 @@ pub struct Decisions(Arc<Inner>);
 struct Inner {
     config: DecisionsConfig,
     engine: Option<Arc<dyn DecisionEngine>>,
+    /// Where the active endpoint's credential came from, if it has one.
+    key_source: Option<DecisionKeySource>,
     /// The session every row this service logs belongs to.
     session: Option<CaudraId>,
     state_dir: StateDir,
@@ -416,24 +436,28 @@ struct Inner {
 }
 
 impl Decisions {
+    /// Builds a fresh engine and cache for `config.endpoint`, so a switch to
+    /// another endpoint never answers from the previous one's cache. No
+    /// endpoint means no engine, and every feature stays off.
     pub fn new(config: DecisionsConfig, state_dir: &StateDir) -> Result<Self, DecisionsError> {
         config.validate()?;
-        let engine = config
-            .endpoint()
-            .map(|endpoint| {
-                let api_key = config.api_key()?;
-                let client = match config.protocol {
-                    DecisionProtocol::TypeSafe => {
-                        HttpDecisionClient::new(endpoint.as_str(), api_key.as_deref())
-                    }
-                    DecisionProtocol::OpenAI => {
-                        HttpDecisionClient::openai(endpoint.as_str(), api_key.as_deref())
-                    }
+        let (engine, key_source) = match &config.endpoint {
+            Some(endpoint) => {
+                let api_key = endpoint_api_key(endpoint, state_dir)?;
+                let key = api_key.as_ref().map(|key| key.value.as_str());
+                let url = endpoint.endpoint();
+                let client = match endpoint.protocol {
+                    DecisionProtocol::TypeSafe => HttpDecisionClient::new(url.as_str(), key),
+                    DecisionProtocol::OpenAI => HttpDecisionClient::openai(url.as_str(), key),
                 }?;
-                Ok::<_, DecisionsError>(Arc::new(CachedDecisionEngine::new(client, CACHE_ENTRIES))
-                    as Arc<dyn DecisionEngine>)
-            })
-            .transpose()?;
+                (
+                    Some(Arc::new(CachedDecisionEngine::new(client, CACHE_ENTRIES))
+                        as Arc<dyn DecisionEngine>),
+                    api_key.map(|key| key.source),
+                )
+            }
+            None => (None, None),
+        };
         let questions = if engine.is_some()
             && (config.features.permission_advice != FeatureMode::Off
                 || config.features.auto_screening != FeatureMode::Off)
@@ -442,7 +466,9 @@ impl Decisions {
         } else {
             Self::permission_questions()?
         };
-        Ok(Self::build(config, state_dir, engine, None, questions))
+        Ok(Self::build(
+            config, state_dir, engine, key_source, None, questions,
+        ))
     }
 
     pub fn with_engine<E: DecisionEngine + 'static>(
@@ -451,13 +477,14 @@ impl Decisions {
         engine: E,
     ) -> Result<Self, DecisionsError> {
         config.validate()?;
-        let engine = config.base_url.is_some().then(|| {
+        let engine = config.endpoint.is_some().then(|| {
             Arc::new(CachedDecisionEngine::new(engine, CACHE_ENTRIES)) as Arc<dyn DecisionEngine>
         });
         Ok(Self::build(
             config,
             state_dir,
             engine,
+            None,
             None,
             Self::permission_questions()?,
         ))
@@ -467,12 +494,14 @@ impl Decisions {
         config: DecisionsConfig,
         state_dir: &StateDir,
         engine: Option<Arc<dyn DecisionEngine>>,
+        key_source: Option<DecisionKeySource>,
         session: Option<CaudraId>,
         permission_questions: QuestionSet,
     ) -> Self {
         Self(Arc::new(Inner {
             config,
             engine,
+            key_source,
             session,
             state_dir: state_dir.clone(),
             log: Arc::new(Mutex::new(None)),
@@ -489,6 +518,19 @@ impl Decisions {
         &self.0.config
     }
 
+    pub fn endpoint(&self) -> Option<&DecisionEndpoint> {
+        self.0.config.endpoint.as_ref()
+    }
+
+    pub fn key_source(&self) -> Option<DecisionKeySource> {
+        self.0.key_source
+    }
+
+    fn model(&self) -> &str {
+        self.endpoint()
+            .map_or("", |endpoint| endpoint.model.as_str())
+    }
+
     /// A service of its own for one session: health, taint and caches start
     /// fresh, and every row it logs carries `session`.
     pub fn for_session(&self, session: CaudraId) -> Self {
@@ -496,6 +538,7 @@ impl Decisions {
             self.0.config.clone(),
             &self.0.state_dir,
             self.0.engine.clone(),
+            self.0.key_source,
             Some(session),
             self.0.permission_questions.clone(),
         )
@@ -561,7 +604,7 @@ impl Decisions {
             );
         };
         let request = DecisionRequest {
-            model: self.0.config.model.clone(),
+            model: self.model().to_owned(),
             state: bounded.value().clone(),
             questions: questions.questions().clone(),
         };
@@ -589,11 +632,11 @@ impl Decisions {
             feature.name(),
             "none",
             latency_ms,
-            &self.config().model,
+            self.model(),
             result.as_ref().err().map(error_kind),
         );
         let request = DecisionRequest {
-            model: self.0.config.model.clone(),
+            model: self.model().to_owned(),
             state: json!({"rejected": STATE_REJECTED, "bytes": state.to_string().len()}),
             questions: questions.questions().clone(),
         };
@@ -735,7 +778,7 @@ impl Decisions {
             latency_ms,
             mode: mode_name(self.mode(feature)).into(),
             effect: DecisionEffect::None,
-            meta: record_meta(&context.meta, &self.config().protocol),
+            meta: record_meta(&context.meta, self.endpoint()),
         };
         let writer = log.clone();
         let state_dir = self.0.state_dir.clone();
@@ -891,14 +934,19 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-fn record_meta(context: &Value, protocol: &DecisionProtocol) -> Value {
-    let mut meta = Map::from_iter([(PROTOCOL_META.into(), json!(protocol.as_str()))]);
+fn record_meta(context: &Value, endpoint: Option<&DecisionEndpoint>) -> Value {
+    let mut meta = Map::from_iter(endpoint.into_iter().flat_map(|endpoint| {
+        [
+            (PROTOCOL_META.into(), json!(endpoint.protocol.as_str())),
+            (ENDPOINT_META.into(), json!(endpoint.name)),
+        ]
+    }));
     let Ok(context) = DecisionState::new(context) else {
         return Value::Object(meta);
     };
     if let Some(fields) = context.value().as_object() {
         for (key, value) in fields {
-            if key == PROTOCOL_META {
+            if key == PROTOCOL_META || key == ENDPOINT_META {
                 continue;
             }
             meta.insert(key.clone(), value.clone());
@@ -957,8 +1005,8 @@ mod tests {
     use async_io::{Async, Timer};
     use async_trait::async_trait;
     use caudra_config::decisions::{
-        DecisionFeatures, DecisionProtocol, DecisionThresholds, DecisionsConfig, FeatureMode,
-        RawDecisionsConfig,
+        DecisionEndpoint, DecisionFeatures, DecisionProtocol, DecisionThresholds, DecisionsConfig,
+        FeatureMode, RawDecisionsConfig,
     };
     use caudra_decision::wire::MAX_REQUEST_BYTES;
     use caudra_decision::{
@@ -978,10 +1026,10 @@ mod tests {
 
     use super::state::MAX_STATE_BYTES;
     use super::{
-        DecisionContext, DecisionFeature, Decisions, DecisionsError, ENGINE_HTTP, ENGINE_INVALID,
-        ENGINE_REFUSED, ENGINE_TIMED_OUT, ENGINE_UNREACHABLE, PROTOCOL_META, PermissionAction,
-        PermissionPurpose, REQUEST_REJECTED, STATE_REJECTED, Screening, questions, record_meta,
-        stats_thresholds,
+        DecisionContext, DecisionFeature, Decisions, DecisionsError, ENDPOINT_META, ENGINE_HTTP,
+        ENGINE_INVALID, ENGINE_REFUSED, ENGINE_TIMED_OUT, ENGINE_UNREACHABLE, PROTOCOL_META,
+        PermissionAction, PermissionPurpose, REQUEST_REJECTED, STATE_REJECTED, Screening,
+        questions, record_meta, stats_thresholds,
     };
 
     const SECRET: &str = "never-store-this-credential";
@@ -989,6 +1037,7 @@ mod tests {
     /// credentials, so a verbatim column is distinguishable from a redacted one.
     const SECRET_PATH: &str = "/work/ssh://user:password@host/project";
     const BASE_URL: &str = "http://127.0.0.1:1";
+    const ENDPOINT_NAME: &str = "local";
     const TEST_TIMEOUT_MS: u64 = 10;
     const TEST_NORMAL_TIMEOUT_MS: u64 = 5_000;
     const LABEL_SOURCE: &str = "user";
@@ -1077,7 +1126,11 @@ mod tests {
 
     fn config(log: bool) -> DecisionsConfig {
         let mut config = DecisionsConfig {
-            base_url: Some(BASE_URL.parse().unwrap()),
+            endpoint: Some(DecisionEndpoint::new(
+                DecisionProtocol::TypeSafe.as_str(),
+                DecisionProtocol::TypeSafe,
+                BASE_URL.parse().unwrap(),
+            )),
             timeout_ms: TEST_NORMAL_TIMEOUT_MS,
             log,
             ..DecisionsConfig::default()
@@ -1089,17 +1142,41 @@ mod tests {
 
     #[test_case(DecisionProtocol::TypeSafe)]
     #[test_case(DecisionProtocol::OpenAI)]
-    fn protocol_metadata_is_host_owned_redacted_and_bounded(protocol: DecisionProtocol) {
-        let context = json!({PROTOCOL_META: "forged", "api_key": SECRET, "feature_field": true});
-        let meta = record_meta(&context, &protocol);
+    fn endpoint_metadata_is_host_owned_redacted_and_bounded(protocol: DecisionProtocol) {
+        let endpoint =
+            DecisionEndpoint::new(ENDPOINT_NAME, protocol.clone(), BASE_URL.parse().unwrap());
+        let context = json!({
+            PROTOCOL_META: "forged",
+            ENDPOINT_META: "forged",
+            "api_key": SECRET,
+            "feature_field": true,
+        });
+        let meta = record_meta(&context, Some(&endpoint));
         assert_eq!(meta[PROTOCOL_META], protocol.as_str());
+        assert_eq!(meta[ENDPOINT_META], ENDPOINT_NAME);
         assert_eq!(meta["feature_field"], true);
         assert!(!meta.to_string().contains(SECRET));
         let context = json!({"large": "x".repeat(MAX_STATE_BYTES - 12)});
-        let meta = record_meta(&context, &protocol);
+        let meta = record_meta(&context, Some(&endpoint));
         assert_eq!(meta[PROTOCOL_META], protocol.as_str());
+        assert_eq!(meta[ENDPOINT_META], ENDPOINT_NAME);
         assert!(meta.to_string().len() <= MAX_STATE_BYTES);
         assert!(super::DecisionState::new(&meta).is_ok());
+    }
+
+    #[test]
+    fn each_build_gets_a_fresh_engine_and_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let state_dir = StateDir::from_path(root.path().into());
+        let first = Decisions::new(config(false), &state_dir).unwrap();
+        let second = Decisions::new(config(false), &state_dir).unwrap();
+        let (Some(first), Some(second)) = (&first.0.engine, &second.0.engine) else {
+            panic!("an active endpoint must build an engine");
+        };
+        assert!(!Arc::ptr_eq(first, second));
+        let off = Decisions::new(config(false).with_endpoint(None), &state_dir).unwrap();
+        assert!(off.0.engine.is_none());
+        assert!(off.key_source().is_none());
     }
 
     #[test_case(FeatureMode::Shadow, false; "shadow")]
@@ -1109,7 +1186,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let state_dir = StateDir::from_path(root.path().into());
             let mut config = config(true);
-            config.protocol = DecisionProtocol::OpenAI;
+            config.endpoint.as_mut().unwrap().protocol = DecisionProtocol::OpenAI;
             config.features.auto_screening = mode;
             let service = Decisions::with_engine(
                 config,
@@ -1140,6 +1217,10 @@ mod tests {
             assert_eq!(rows[0].record.error.as_deref(), Some(REFUSED_ERROR));
             assert!(rows[0].record.answers.is_none());
             assert_eq!(rows[0].record.meta[PROTOCOL_META], "openai");
+            assert_eq!(
+                rows[0].record.meta[ENDPOINT_META],
+                DecisionProtocol::TypeSafe.as_str()
+            );
         });
     }
 
@@ -1217,13 +1298,16 @@ mod tests {
                 let root = tempfile::tempdir().unwrap();
                 let state_dir = StateDir::from_path(root.path().into());
                 let mut config = config(true);
-                config.protocol = DecisionProtocol::OpenAI;
-                config.base_url = Some(
-                    format!("http://{}/v1", listener.get_ref().local_addr().unwrap())
-                        .parse()
-                        .unwrap(),
-                );
-                config.api_key_env = HTTP_TEST_CREDENTIAL_ENV.into();
+                config.endpoint = Some(DecisionEndpoint {
+                    api_key_env: Some(HTTP_TEST_CREDENTIAL_ENV.into()),
+                    ..DecisionEndpoint::new(
+                        ENDPOINT_NAME,
+                        DecisionProtocol::OpenAI,
+                        format!("http://{}/v1", listener.get_ref().local_addr().unwrap())
+                            .parse()
+                            .unwrap(),
+                    )
+                });
                 config.features = Default::default();
                 let session = CaudraId::generate();
                 let service = Decisions::new(config, &state_dir)
@@ -1394,7 +1478,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let mut config = config(false);
             if !api {
-                config.base_url = None;
+                config.endpoint = None;
             }
             config.features.question_tool_nudge = mode;
             let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1534,7 +1618,7 @@ mod tests {
                 config.features = Default::default();
             }
             if !base_url {
-                config.base_url = None;
+                config.endpoint = None;
             }
             let requests = Arc::new(Mutex::new(Vec::new()));
             let service = Decisions::with_engine(
@@ -1727,7 +1811,7 @@ mod tests {
             let config = DecisionsConfig {
                 timeout_ms,
                 rerank_timeout_ms,
-                features: features.resolve(None).unwrap().features,
+                features: features.resolve().unwrap().features,
                 ..config(false)
             };
             assert_eq!(feature.timeout_ms(&config), TEST_TIMEOUT_MS);

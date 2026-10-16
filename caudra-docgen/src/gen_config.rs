@@ -145,12 +145,6 @@ fn experiment_scope(feature: Feature) -> &'static str {
              and project `init.lua`, and the `caudra-plugin-dev` skill. `--no-plugins` still \
              turns Lua off for one run."
         }
-        Feature::DecisionEngine => {
-            "The [decision engine](#decisions), [Auto mode](/docs/permissions/#auto-mode), \
-              `caudra decisions`, workflow [`decide()` calls](/docs/workflows/#typed-decisions), and \
-              the [`decide()` and `rerank()` helpers](/docs/code/#decisions-and-reranking) of the \
-              `code` tool."
-        }
         Feature::CrossSessionMessaging => {
             "Local [cross-session messaging](/docs/messaging/): the `list_sessions`, `send_message`, `publish_message`, `read_topic`, and `work_assignment` tools, `/peers`, `/messages`, `/topics`, `/groups`, `caudra message`, live session inboxes, consumer groups, and the message history. Both processes must opt in."
         }
@@ -175,7 +169,7 @@ fn write_experimental_section(out: &mut String) {
          ```toml\n\
          [experimental]\n\
          workflows = true\n\
-         decision_engine = true\n\
+         automations = true\n\
          ```\n\n\
          | Key | Default | Turns on |\n\
          |-----|---------|----------|\n",
@@ -207,9 +201,7 @@ fn write_experimental_section(out: &mut String) {
          A saved session attached to a sandbox or a remote workspace does not resume while its \
          switch is off, and it never falls back to local execution. Turning a feature off keeps \
          its data and leaves external resources alone, so a running sandbox keeps running until \
-         you stop it.\n\n\
-         With `decision_engine` off, `always_auto = true` and sessions saved in Auto start in \
-         Ask. Caudra keeps the saved choice, so Auto returns once the switch is on again.\n\n",
+         you stop it.\n\n",
     );
 }
 
@@ -658,60 +650,29 @@ Disabling the master switch or setting `rules.truncation.enabled = false` stops 
 fn write_decisions_section(out: &mut String) {
     out.push_str(
         "### `decisions`\n\n\
-         Configure the optional typed decision engine in the `[decisions]` table. \
-         The engine is experimental and needs `decision_engine = true` under \
-         [`[experimental]`](#experimental-features). Without that switch Caudra still validates \
-         this table and starts no engine. It then sends no decision requests, reads no engine \
-         credentials, and leaves decision logs and shell duration history untouched. \
-         No base URL, passive feature, or decision logging is enabled by default. \
-         Explicit workflow [`decide()` calls](/docs/workflows/#typed-decisions) and the MCP \
-         [`decide()` and `rerank()` helpers](/docs/mcp/#decisions-and-reranking) need a base URL \
-         but do not need a passive feature enabled. Shell duration history can work without a base URL.\n\n\
-         Connection settings and thresholds are global-only. Projects may set individual features \
+         The `[decisions]` table holds the settings every decision endpoint shares: deadlines, \
+         logging, features, and thresholds. The endpoints themselves are `[decisions.<name>]` \
+         tables in the global `providers.toml`, and the engine runs only while one of them is \
+         active. `caudra auth login --decision` adds one and makes it active. See \
+         [Decision endpoints](/docs/providers/#decision-endpoints). With no active endpoint, \
+         Caudra still validates this table. It starts no engine, sends no decision requests, \
+         reads no engine credentials, and leaves decision logs and shell duration history \
+         untouched. No passive feature or decision logging is enabled by default. Explicit \
+         workflow [`decide()` calls](/docs/workflows/#typed-decisions) and the MCP \
+         [`decide()` and `rerank()` helpers](/docs/mcp/#decisions-and-reranking) need an active \
+         endpoint but no passive feature. Shell duration history works without an endpoint.\n\n\
+         These settings are global-only. Projects may set individual features \
          to `\"off\"`, set `log = false`, or keep or shorten inherited log retention. \
          Other project overrides are errors, even when they repeat a global value. \
          Disabling globally required Auto screening or its active content screening restores \
-         prompting for eligible Auto calls.\n\n",
+         prompting for eligible Auto calls. `base_url`, `protocol`, `model`, `api_key_env`, \
+         `allow_remote`, and `allow_http` are not accepted here. The error for each one shows \
+         the `providers.toml` table that replaces it.\n\n",
     );
     write_table(out, DecisionsConfig::FIELDS);
     write!(
         out,
-        "\n`protocol = \"typesafe\"` is the default. It appends `/v1/systemone` to the root base URL. \
-         A path prefix stays in place, so a server mounted under `/typesafe` uses \
-         `base_url = \"http://127.0.0.1:8080/typesafe\"` and receives requests at \
-         `/typesafe/v1/systemone`. Leave `/v1/systemone` out of `base_url`. The default model is \
-         `jev-latest` and the default key variable is `TYPESAFE_API_KEY`. The hosted API needs \
-         explicit remote consent:\n\n\
-         ```toml\n\
-         [decisions]\n\
-         base_url = \"https://api.typesafe.ai\"\n\
-         allow_remote = true\n\
-         ```\n\n\
-         `protocol = \"openai\"` appends `/decisions` to a versioned base URL. Use \
-         `https://api.openai.com/v1` for the hosted OpenAI Decisions API. The default model is \
-         `gpt-6-luna` and the default key variable is `OPENAI_API_KEY`. Explicit `model` and \
-         `api_key_env` values override these protocol-specific defaults. Hosted OpenAI also \
-         needs remote consent:\n\n\
-         ```toml\n\
-         [decisions]\n\
-         protocol = \"openai\"\n\
-         base_url = \"https://api.openai.com/v1\"\n\
-         allow_remote = true\n\
-         ```\n\n\
-         For a local ninfer server, use the OpenAI protocol with the actual served model name. \
-         `systemone-decision-v7` is not a Luna alias:\n\n\
-         ```toml\n\
-         [decisions]\n\
-         protocol = \"openai\"\n\
-         base_url = \"http://127.0.0.1:8080/v1\"\n\
-         model = \"systemone-decision-v7\"\n\
-         ```\n\n\
-         `TYPESAFE_BASE_URL` for `typesafe`, or `OPENAI_BASE_URL` for `openai`, replaces the whole \
-         configured base URL, path prefix included, and passes the same URL and transport opt-in \
-         checks. Only the selected protocol's variable applies, and only when `base_url` is set. \
-         A variable alone never activates the engine. Overrides and API keys come from the global \
-         environment, not project `.env` files. Neither protocol implies remote or HTTP consent.\n\n\
-         Both protocols send text only. OpenAI maps native boolean questions to predicates, \
+        "\nBoth protocols send text only. OpenAI maps native boolean questions to predicates, \
          retaining the true and false criteria in the instruction text. Answers normalize to the \
          same typed results, so workflows and MCP snippets read the same answers under either \
          protocol. A refusal fails the whole \
@@ -725,9 +686,6 @@ fn write_decisions_section(out: &mut String) {
          request and use `rerank_timeout_ms` (default {rerank_timeout_ms} ms) instead. Memory recall \
          keeps `timeout_ms` because it delays the start of a turn. A `decide()` or `rerank()` call \
          from a workflow or an MCP snippet may ask for up to the larger of the two.\n\n\
-         Requests ignore ambient proxies and do not follow redirects. `localhost` is a DNS name, \
-         not numeric loopback for this policy. Private and CGNAT addresses receive no automatic HTTP exemption. \
-         These settings do not change Workcell transport policy.\n\n\
          Redaction is best effort. Decision context can include commands, task text, tool output, \
          and candidate descriptions. Review what you send and any exports before sharing them. \
          See [decision advice and logging](/docs/permissions/#decision-engine-advice).\n\n\
@@ -1490,13 +1448,17 @@ mod tests {
         }
     }
 
-    #[test_case("allow_remote", DecisionsConfig::default().allow_remote)]
-    #[test_case("allow_http", DecisionsConfig::default().allow_http)]
-    fn decision_reference_covers_transport_defaults(field: &str, default: bool) {
+    #[test_case("base_url")]
+    #[test_case("protocol")]
+    #[test_case("model")]
+    #[test_case("api_key_env")]
+    #[test_case("allow_remote")]
+    #[test_case("allow_http")]
+    fn decision_reference_lists_no_connection_keys(field: &str) {
         let mut reference = String::new();
         write_decisions_section(&mut reference);
-        let prefix = format!("| `{field}` | boolean | `{default}` |");
-        assert!(reference.lines().any(|line| line.starts_with(&prefix)));
+        let prefix = format!("| `{field}` |");
+        assert!(!reference.lines().any(|line| line.starts_with(&prefix)));
     }
 
     #[test_case("off")]
@@ -1523,7 +1485,7 @@ mod tests {
                 .contains(&format!("`{mode}`"));
             let raw: RawDecisionsConfig =
                 serde_json::from_value(json!({"features": {feature: mode}})).unwrap();
-            assert_eq!(documented, raw.resolve(None).is_ok(), "{feature}: {mode}");
+            assert_eq!(documented, raw.resolve().is_ok(), "{feature}: {mode}");
         }
     }
 

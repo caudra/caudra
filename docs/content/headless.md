@@ -97,7 +97,7 @@ Inbound messages (`user`, `control_request`, `control_response`, `control_cancel
 
 SDK-only flags (`--system-prompt`, `--max-turns`, `--session-id`, `--fork-session`, `--permission-mode`, `--include-partial-messages`, ...) are listed in the [CLI flag matrix](/docs/cli/#flags-by-run-path).
 
-Auto mode needs `experimental.decision_engine`. Without it, `--permission-mode auto` stops Caudra with an error, and a `set_permission_mode` control request for `auto` returns that error and leaves the mode unchanged. See [SDK permission modes](/docs/cli/#permission-modes-sdk).
+A headless run reads the active [decision endpoint](/docs/providers/#decision-endpoints) when it starts, and keeps it until it exits. A switch made in the TUI or with `caudra decisions use` meanwhile applies to the next run. Auto mode works without an endpoint, and then prompts for every line that needs screening. See [SDK permission modes](/docs/cli/#permission-modes-sdk).
 
 Two caveats:
 

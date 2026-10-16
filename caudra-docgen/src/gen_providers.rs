@@ -21,6 +21,8 @@ Caudra routes work through eleven jobs: **Chat**, **Plan**, **Subagent**, **Comp
 
 Press `Ctrl+F` on a model to mark it as a favorite, and again to unmark it. The list shows your favorites first, newest first, then the last 10 models you switched to under Recent. With favorites, `/model` opens on the current model's favorite row, or on the first favorite, instead of on the Chat job. Each model also stays in its provider's section, where a `★` marks a favorite and a `↺` a recent model. `/favorite-next` or `Ctrl+X c` switches Chat to the favorite after the current model, and to the first favorite when the current model is not one. Favorites are saved globally, like bindings, and a favorite that `allowed_models` or `excluded_models` rules out is not shown. A task model name such as `sonnet` runs on the favorite it matches, and the main agent is told your favorites. See [Models and reasoning](/docs/commands/#models-and-reasoning).
 
+The last row of the Jobs section, **Decisions**, names the active decision endpoint, or `off`. Select it to switch endpoints, turn decisions off, or add an endpoint through `/login`. An endpoint whose table does not validate stays listed with its error. `/decision-model` opens that page directly, and `/decision-next` or `Ctrl+X d` switches to the next valid endpoint in name order. Decision endpoints never appear under Favorites or Recent.
+
 Bindings are saved globally in the `model.purposes` row of Caudra's SQLite state database and apply across sessions. Unbound jobs use these rules:
 
 | Job | Default when unbound |
@@ -227,6 +229,7 @@ Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this fil
     let purpose_fields = keys_table(&document, &[example::providers::PURPOSES]);
     let model_fields = keys_table(&document, &[example::providers::MODELS]);
     let override_fields = keys_table(&document, &[example::providers::UPSTREAM]);
+    let decision_fields = keys_table(&document, &[example::providers::DECISION_ENDPOINT]);
     let builtin_ignored = join_and(&BUILTIN_IGNORED_FIELDS.map(|name| format!("`{name}`")));
     let builtin_model = join_and(&BUILTIN_MODEL_FIELDS.map(|name| format!("`{name}`")));
     let reference = footer(&files::PROVIDERS);
@@ -347,6 +350,50 @@ Provider-level fields apply to every model from that upstream. Per-model entries
 
 {override_fields}
 Caudra sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.AI), and Aperture appends that path to the upstream's base url. If an upstream base url already carries its own path, set `path_prefix = ""` for it to avoid a doubled path. Z.AI defaults to no prefix since its API path has no `/v1` segment; point the upstream base url at the full API root (e.g. `https://api.z.ai/api/paas/v4`).
+
+### Decision endpoints
+
+The optional typed decision engine behind [Auto mode](/docs/permissions/#auto-mode), workflow [`decide()` calls](/docs/workflows/#typed-decisions), and the [`decide()` and `rerank()` helpers](/docs/code/#decisions-and-reranking) sends its requests to a decision endpoint. Each endpoint is a `[decisions.<name>]` table in this file. One endpoint is active at a time, and with none active the engine is off. The settings every endpoint shares, such as deadlines, features, and thresholds, stay in [`[decisions]`](/docs/configuration/#decisions) in `caudra.toml`.
+
+The quickest way to add one is `caudra auth login --decision`, or the **Decision models** section of `/login`. Both offer two presets, **TypeSafe Jev** (`typesafe`) and **OpenAI Luna** (`openai`), and a custom endpoint, which asks for a name, the protocol, the base URL, the model, and a key. Login writes the table, saves the key, and makes a new endpoint active. Logging in again to an existing endpoint replaces its key and keeps whichever endpoint is active. The presets write these tables:
+
+```toml
+[decisions.typesafe]
+protocol = "typesafe"
+base_url = "https://api.typesafe.ai"
+model = "jev-latest"
+api_key_env = "TYPESAFE_API_KEY"
+
+[decisions.openai]
+protocol = "openai"
+base_url = "https://api.openai.com/v1"
+model = "gpt-6-luna"
+api_key_env = "OPENAI_API_KEY"
+```
+
+{decision_fields}
+`protocol = "typesafe"` appends `/v1/systemone` to a root base URL. A path prefix stays in place, so a server mounted under `/typesafe` uses `base_url = "http://127.0.0.1:8080/typesafe"` and receives requests at `/typesafe/v1/systemone`. `protocol = "openai"` appends `/decisions` to a versioned base URL, such as `https://api.openai.com/v1` for the hosted OpenAI Decisions API. Leave the appended path out of `base_url`, because a full endpoint is rejected.
+
+Configuring an endpoint is the consent to send decision context to it, so HTTPS needs no other opt-in. Plain HTTP to numeric loopback, such as `127.0.0.1` or `[::1]`, needs nothing either. Plain HTTP to any other host needs `allow_http = true`, which sends decision context and the key without TLS. Use it only with transport protection you control, such as a trusted encrypted tunnel. `localhost` is a DNS name for this rule, and private and CGNAT addresses get no exemption. For a local ninfer server, or one behind a tunnel, use the OpenAI protocol with the model name the server actually serves. `systemone-decision-v7` is not a Luna alias:
+
+```toml
+[decisions.local]
+protocol = "openai"
+base_url = "http://127.0.0.1:8080/v1"
+model = "systemone-decision-v7"
+
+[decisions.tunnel]
+protocol = "openai"
+base_url = "http://100.64.0.2:8080/v1"
+model = "systemone-decision-v7"
+allow_http = true
+```
+
+Requests ignore ambient proxies and do not follow redirects. These settings do not change Workcell transport policy.
+
+A key saved by login, in `auth/decisions/<name>.json` under the state directory, wins. Otherwise Caudra reads the global environment variable that `api_key_env` names, never a value from a project `.env` file. A custom endpoint has no `api_key_env` until you add one, and an endpoint with no key sends none, which suits a local server. To take the base URL from the environment, write `base_url = "{{env:TYPESAFE_BASE_URL}}"`. The `TYPESAFE_BASE_URL` and `OPENAI_BASE_URL` variables do not change a decision endpoint on their own.
+
+Switch the active endpoint with the **Decisions** row of `/model`, `/decision-model`, `/decision-next` (`Ctrl+X d`), or `caudra decisions use <name|off>`. `caudra decisions list` shows every endpoint, its key source, and which one is active. The choice is saved globally. A switch in the TUI applies to every open session of that process at once, and other Caudra processes and headless runs read it when they start. An edit to the active endpoint's table applies when you select the endpoint again or restart. When the active endpoint's table is gone, decisions are off and Caudra logs a warning that names it. `caudra auth logout --decision <name>` deletes the saved key and the table, and turns decisions off when that endpoint was active.
 
 ### Plans
 
@@ -791,12 +838,18 @@ pub fn generate() -> String {
 #[cfg(test)]
 mod tests {
     use caudra_config::files;
+    use caudra_config::interpolation::{self, Lookup};
+    use caudra_config::providers::ProvidersConfig;
     use caudra_providers::manifest::ManifestRegistry;
     use caudra_providers::model::ModelEntry;
     use test_case::test_case;
 
     use super::{format_pricing, providers_toml_section};
     use crate::gen_regions::reference;
+
+    const TOML_FENCE: &str = "```toml\n";
+    const FENCE_END: &str = "```";
+    const DECISION_HEADER: &str = "[decisions.";
 
     #[test_case("gemini-4-argon", "$2.00 / $10.00, then $4.00 / $20.00 from 2026-12-01" ; "an_announced_change_follows_todays_price")]
     #[test_case("gemini-3.5-flash-lite", "$0.30 / $2.50"                               ; "a_steady_price_stands_alone")]
@@ -818,6 +871,22 @@ mod tests {
                 let row = format!("| `{}` |", entry.name);
                 assert!(section.contains(&row), "{row}");
             }
+        }
+    }
+
+    #[test]
+    fn every_decision_endpoint_example_resolves() {
+        let section = providers_toml_section();
+        let examples: Vec<ProvidersConfig> = section
+            .split(TOML_FENCE)
+            .skip(1)
+            .filter_map(|rest| rest.split_once(FENCE_END).map(|(body, _)| body))
+            .filter(|body| body.contains(DECISION_HEADER))
+            .map(|body| interpolation::from_str(body, Lookup::Refused).unwrap())
+            .collect();
+        assert!(!examples.is_empty());
+        for (name, def) in examples.iter().flat_map(|config| &config.decisions) {
+            def.resolve(name).unwrap();
         }
     }
 }

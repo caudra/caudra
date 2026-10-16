@@ -577,6 +577,7 @@ mod tests {
     use crate::types::Answerer;
     use crate::{AgentEvent, CancelToken, EventSender};
     use async_trait::async_trait;
+    use caudra_config::decisions::{DecisionEndpoint, DecisionProtocol};
     use caudra_config::decisions::{DecisionsConfig, FeatureMode};
     use caudra_config::{Effect, PermissionsConfig, ToolKey};
     use caudra_decision::{
@@ -686,7 +687,11 @@ mod tests {
         delayed: bool,
     ) -> Service {
         let mut config = DecisionsConfig {
-            base_url: Some(BASE_URL.parse().unwrap()),
+            endpoint: Some(DecisionEndpoint::new(
+                DecisionProtocol::TypeSafe.as_str(),
+                DecisionProtocol::TypeSafe,
+                BASE_URL.parse().unwrap(),
+            )),
             timeout_ms: TIMEOUT_MS,
             ..Default::default()
         };
@@ -766,7 +771,11 @@ mod tests {
         smol::block_on(async {
             let service = engine.map(|behavior| {
                 let mut config = DecisionsConfig {
-                    base_url: Some(BASE_URL.parse().unwrap()),
+                    endpoint: Some(DecisionEndpoint::new(
+                        DecisionProtocol::TypeSafe.as_str(),
+                        DecisionProtocol::TypeSafe,
+                        BASE_URL.parse().unwrap(),
+                    )),
                     timeout_ms: TIMEOUT_MS,
                     auto_screening_restricted: restricted,
                     ..Default::default()
@@ -870,31 +879,6 @@ mod tests {
                 allowed
             );
             assert_eq!(service.calls.load(Ordering::Relaxed), 0);
-        });
-    }
-
-    #[test_case(Some(PermissionMode::Auto); "stored_auto")]
-    #[test_case(None; "seeded_auto")]
-    fn auto_without_the_experiment_prompts_like_ask(stored: Option<PermissionMode>) {
-        smol::block_on(async {
-            let service = service(
-                Behavior::Probability(0.0),
-                FeatureMode::Enforce,
-                FeatureMode::Off,
-                false,
-            );
-            let manager = mgr_with(PermissionsConfig::default(), PathBuf::from(SHELL_WORKDIR));
-            manager.set_seed_mode(PermissionMode::Auto);
-            manager.set_session_mode(stored.clone());
-            manager.set_decisions(Some(service.decisions));
-            assert!(manager.decisions().is_none());
-            assert!(
-                enforce_shell_without_prompt(&manager, &[FIRST_COMMAND], false)
-                    .await
-                    .is_err()
-            );
-            assert_eq!(service.calls.load(Ordering::Relaxed), 0);
-            assert_eq!(manager.persisted_mode(), stored);
         });
     }
 
@@ -1354,7 +1338,11 @@ mod tests {
 
     fn advisory_service(behavior: Behavior, delayed: bool) -> Service {
         let mut config = DecisionsConfig {
-            base_url: Some(BASE_URL.parse().unwrap()),
+            endpoint: Some(DecisionEndpoint::new(
+                DecisionProtocol::TypeSafe.as_str(),
+                DecisionProtocol::TypeSafe,
+                BASE_URL.parse().unwrap(),
+            )),
             timeout_ms: TIMEOUT_MS,
             ..Default::default()
         };
@@ -1434,7 +1422,11 @@ mod tests {
     ) {
         smol::block_on(async {
             let mut config = DecisionsConfig {
-                base_url: Some(BASE_URL.parse().unwrap()),
+                endpoint: Some(DecisionEndpoint::new(
+                    DecisionProtocol::TypeSafe.as_str(),
+                    DecisionProtocol::TypeSafe,
+                    BASE_URL.parse().unwrap(),
+                )),
                 timeout_ms: TIMEOUT_MS,
                 ..Default::default()
             };
@@ -1475,7 +1467,11 @@ mod tests {
     fn shell_effect_and_permission_flags_merge_without_changing_authority() {
         smol::block_on(async {
             let mut config = DecisionsConfig {
-                base_url: Some(BASE_URL.parse().unwrap()),
+                endpoint: Some(DecisionEndpoint::new(
+                    DecisionProtocol::TypeSafe.as_str(),
+                    DecisionProtocol::TypeSafe,
+                    BASE_URL.parse().unwrap(),
+                )),
                 timeout_ms: TIMEOUT_MS,
                 ..Default::default()
             };
@@ -1530,7 +1526,11 @@ mod tests {
 
     fn logged_service() -> Service {
         let mut config = DecisionsConfig {
-            base_url: Some(BASE_URL.parse().unwrap()),
+            endpoint: Some(DecisionEndpoint::new(
+                DecisionProtocol::TypeSafe.as_str(),
+                DecisionProtocol::TypeSafe,
+                BASE_URL.parse().unwrap(),
+            )),
             timeout_ms: TIMEOUT_MS,
             log: true,
             ..Default::default()
@@ -1691,7 +1691,11 @@ mod tests {
 
     async fn advised_receipt() -> (Service, DecisionReceipt) {
         let mut config = DecisionsConfig {
-            base_url: Some(BASE_URL.parse().unwrap()),
+            endpoint: Some(DecisionEndpoint::new(
+                DecisionProtocol::TypeSafe.as_str(),
+                DecisionProtocol::TypeSafe,
+                BASE_URL.parse().unwrap(),
+            )),
             timeout_ms: TIMEOUT_MS,
             log: true,
             ..Default::default()
@@ -1926,7 +1930,11 @@ mod tests {
     ) {
         smol::block_on(async {
             let mut config = DecisionsConfig {
-                base_url: Some(BASE_URL.parse().unwrap()),
+                endpoint: Some(DecisionEndpoint::new(
+                    DecisionProtocol::TypeSafe.as_str(),
+                    DecisionProtocol::TypeSafe,
+                    BASE_URL.parse().unwrap(),
+                )),
                 timeout_ms: TIMEOUT_MS,
                 ..Default::default()
             };

@@ -15,7 +15,7 @@ use color_eyre::eyre::{Context, bail, eyre};
 use flume::{RecvTimeoutError as PatternRecvError, Sender as ChannelSender};
 
 use caudra_agent::command::{self, CustomCommand};
-use caudra_agent::decisions::Decisions;
+use caudra_agent::decisions::{Decisions, resolve_active_decisions};
 use caudra_agent::peers::topics::add_patterns;
 use caudra_agent::peers::{MAX_MEMBERSHIPS, PeerHost, TOO_MANY_MEMBERSHIPS};
 use caudra_agent::permissions::pattern_recognition::{PatternCandidate, RecognitionExclusion};
@@ -23,7 +23,7 @@ use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
 use caudra_agent::tools::native::skill;
 use caudra_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
 use caudra_agent::worktree::Backend;
-use caudra_config::providers::builtin_provider;
+use caudra_config::providers::{ProvidersConfig, builtin_provider};
 use caudra_config::sandbox::SandboxName;
 use caudra_config::{Config, Feature, StorageConfig};
 use caudra_lua::PluginHost;
@@ -717,9 +717,7 @@ fn build_stack(
     );
     let (config, prompt_profiles, default_prompt_profile, lua_layers) =
         config_or_fallback(loaded, fallback_config, &mut warnings)?;
-    let notices = super::settings_notices(cli, cwd, remote)
-        .into_iter()
-        .chain(super::auto_notice(&config));
+    let notices = super::settings_notices(cli, cwd, remote);
     if cli.print {
         for notice in notices {
             eprintln!("warning: {notice}");
@@ -1731,12 +1729,11 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 .clone()
                 .unwrap_or_else(|| super::permission_mode_seed(&stack.config)),
         );
-        if stack.config.permissions.decision_engine {
-            permissions.set_decisions(Some(
-                Decisions::new(stack.config.decisions.clone(), &storage)
-                    .context("initialize decision engine; check decisions configuration, credentials and question overrides")?,
-            ));
-        }
+        permissions.set_decisions(Some(
+            resolve_active_decisions(&stack.config.decisions, &storage, ProvidersConfig::load)
+                .and_then(|config| Decisions::new(config, &storage))
+                .context("initialize decision engine; check the active decision endpoint in providers.toml, its credential and question overrides")?,
+        ));
         permissions
             .replace_remote_permission_asset(
                 workcell_runtime

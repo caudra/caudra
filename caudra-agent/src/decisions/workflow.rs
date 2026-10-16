@@ -60,7 +60,7 @@ impl Decisions {
         if request.state.is_null() || request.timeout_ms == Some(0) {
             return Err(DecisionError::Rejected(INVALID_REQUEST));
         }
-        let model = request.model.as_deref().unwrap_or(&self.config().model);
+        let model = request.model.as_deref().unwrap_or(self.model());
         if model.trim().is_empty() || stable_text(model).is_err() {
             return Err(DecisionError::Rejected(UNSAFE_MODEL));
         }
@@ -160,6 +160,7 @@ fn redact(value: &Value) -> Result<Value, DecisionError> {
 
 #[cfg(test)]
 mod tests {
+    use caudra_config::decisions::{DecisionEndpoint, DecisionProtocol};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -229,7 +230,11 @@ mod tests {
 
     fn config(log: bool) -> DecisionsConfig {
         DecisionsConfig {
-            base_url: Some(BASE_URL.parse().unwrap()),
+            endpoint: Some(DecisionEndpoint::new(
+                DecisionProtocol::TypeSafe.as_str(),
+                DecisionProtocol::TypeSafe,
+                BASE_URL.parse().unwrap(),
+            )),
             timeout_ms: TIMEOUT_MS,
             log,
             ..Default::default()
@@ -350,7 +355,7 @@ mod tests {
             rerank_timeout_ms,
             ..config(false)
         };
-        let model = config.model.clone();
+        let model = config.endpoint.as_ref().unwrap().model.clone();
         let service = Decisions::with_engine(
             config,
             &StateDir::from_path(root.path().into()),

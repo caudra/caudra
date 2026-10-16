@@ -9,7 +9,6 @@ use crate::background_reminder::RuntimeHealth;
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 
-use caudra_config::{Feature, FeatureFlags};
 use caudra_decision::DecisionError;
 use caudra_providers::ModelPurpose;
 use caudra_storage::workflow::{
@@ -46,7 +45,7 @@ const AGENT_FAILED_PREFIX: &str = "agent failed: ";
 const RUN_ROW_MISSING: &str = "workflow run row disappeared";
 const KEY_OVERFLOW: &str = "workflow call key overflowed";
 const ENGINE_LOST: &str = "workflow engine stopped without reporting an outcome";
-const DECISION_UNAVAILABLE: &str = "workflow decisions require a configured decision endpoint";
+pub(super) const DECISION_UNAVAILABLE: &str = "workflow decisions require an active decision endpoint; add one with `caudra auth login --decision`";
 const DECISION_TIMEOUT: &str = "workflow decision deadline exceeded";
 const DECISION_FAILED: &str = "workflow decision engine failed";
 const DECISION_INVALID: &str = "workflow decision response was invalid";
@@ -60,7 +59,6 @@ pub(super) struct RunEnv {
     pub store: WorkflowStore,
     pub decisions: Option<Decisions>,
     pub project: String,
-    pub features: FeatureFlags,
     pub runner: Arc<dyn TaskRunner>,
     pub events: Sender<Envelope>,
     pub mode: ModeResolver,
@@ -479,10 +477,6 @@ impl Driver {
             return Err(HostError::Cancelled);
         }
         request.validate()?;
-        self.env
-            .features
-            .require(Feature::DecisionEngine)
-            .map_err(|disabled| HostError::Failed(disabled.to_string()))?;
         let decisions = self
             .env
             .decisions

@@ -1109,6 +1109,9 @@ pub enum Action {
     },
     Bind(ModelPurpose, Binding),
     Unbind(ModelPurpose),
+    /// Makes the named decision endpoint active in every open session, or
+    /// turns decisions off for `None`.
+    SetDecisionEndpoint(Option<String>),
     RefreshModels,
     RefreshUsage,
     /// A click on the quota's age: the user has seen the retry window and asks

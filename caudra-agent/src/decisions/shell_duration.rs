@@ -707,6 +707,7 @@ mod tests {
         },
     };
     use async_trait::async_trait;
+    use caudra_config::decisions::{DecisionEndpoint, DecisionProtocol};
     use caudra_config::{
         PermissionsConfig,
         decisions::{DecisionsConfig, FeatureMode},
@@ -1120,7 +1121,11 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let dir = StateDir::from_path(temp.path().join("state"));
             let mut config = DecisionsConfig {
-                base_url: Some(BASE_URL.parse().unwrap()),
+                endpoint: Some(DecisionEndpoint::new(
+                    DecisionProtocol::TypeSafe.as_str(),
+                    DecisionProtocol::TypeSafe,
+                    BASE_URL.parse().unwrap(),
+                )),
                 ..Default::default()
             };
             config.features.shell_duration = FeatureMode::Enforce;

@@ -173,7 +173,7 @@ mod tests {
     const MISSING_THEME: &str = "CAUDRA_TEST_CONFIG_FILE_MISSING_THEME";
     const GLOBAL_SCOPE: &str = "global";
     const PROJECT_SCOPE: &str = "project";
-    const EVERY_FLAG: &str = "[experimental]\nworkflows = true\nsandboxes = true\nremote_workcell = true\nlua_plugins = true\ndecision_engine = true\ncross_session_messaging = true\nautomations = true\nautopilot = true\n";
+    const EVERY_FLAG: &str = "[experimental]\nworkflows = true\nsandboxes = true\nremote_workcell = true\nlua_plugins = true\ncross_session_messaging = true\nautomations = true\nautopilot = true\n";
 
     fn write(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
