@@ -7,7 +7,7 @@ let meta = #{
     triggers: [
         #{ kind: "schedule", every: "30m" },
         #{ kind: "armed" },
-        #{ kind: "goal_finished" },
+        #{ kind: "goal_finished", verdicts: ["met", "impossible", "cleared", "stalled"] },
         #{ kind: "idle" },
     ],
     args: #{
@@ -17,6 +17,7 @@ let meta = #{
         first_since: #{ type: "string", default_value: "2026-10-01", description: "Survey start date (YYYY-MM-DD) of the first run. Later runs start at the date of the last run that landed" },
         continuation_limit: #{ type: "int", default_value: 40, min: 1, max: 100, description: "Automatic continuations each step's goal may take" },
         wait_notice_hours: #{ type: "int", default_value: 12, min: 1, max: 168, description: "Hours landing may wait on a busy main checkout before you are told" },
+        step_notice_hours: #{ type: "int", default_value: 6, min: 1, max: 168, description: "Hours a step's goal may stay open before you are told it may be looping" },
     },
 };
 
@@ -46,7 +47,15 @@ switch event.trigger {
         }
         if step != () {
             let gone = event.session.goal == () && event.session.status == "idle" && t.unix - event.session.status_since > 7200;
-            if !gone { skip("the " + step + " step is in progress"); }
+            if !gone {
+                let started = state.step_at ?? t.unix;
+                if state.stuck_notice != started && t.unix - started > args.step_notice_hours * 3600 {
+                    state.stuck_notice = started;
+                    notify("model-watch's " + step + " step of the " + state.run + " run has had its goal open for over " + args.step_notice_hours + " hours, so it may be looping. Check the session: /goal-clear stops the step, and arming model-watch again retries it.");
+                    return;
+                }
+                skip("the " + step + " step is in progress");
+            }
             state.halted = true;
             notify("model-watch stopped: the " + step + " goal of the " + state.run + " run ended without finishing. Arm model-watch again in /automations to retry the step.");
             return;
@@ -64,9 +73,16 @@ switch event.trigger {
         state.since = state.last_landed ?? args.first_since;
         state.step = "sync";
         state.current = set_goal(goal_for("sync", args, state.run, state.since), goal_options).condition;
+        state.step_at = t.unix;
     }
     "goal_finished" => {
         if state.current == () || event.condition != state.current { skip("not a model-watch goal"); }
+        if event.verdict == "stalled" {
+            if state.step_at != () && state.stuck_notice == state.step_at { skip("already told that this step is stuck"); }
+            state.stuck_notice = state.step_at;
+            notify("model-watch's " + step + " step of the " + state.run + " run stopped making progress, and its goal stays open. Check the session: a reply there lets it go on, /goal-clear stops the step, and arming model-watch again retries it.");
+            return;
+        }
         state.current = ();
         if event.verdict != "met" {
             state.halted = true;
@@ -85,9 +101,11 @@ switch event.trigger {
         state.step = next;
         if next != "land" {
             state.current = set_goal(goal_for(next, args, state.run, state.since), goal_options).condition;
+            state.step_at = t.unix;
             return;
         }
         state.resync = ();
+        state.step_at = ();
         message(land_message(args, state.run));
         state.landing = true;
         state.land_fire = event.fire_id;
@@ -116,6 +134,7 @@ switch event.trigger {
             state.resync = true;
             state.step = "sync";
             state.current = set_goal(goal_for("sync", args, state.run, state.since), goal_options).condition;
+            state.step_at = t.unix;
             return;
         }
         let landed = reply.ends_with("MODEL-WATCH LAND: DONE");
@@ -167,6 +186,7 @@ switch event.trigger {
             state.step = step;
         }
         state.current = set_goal(goal_for(step, args, state.run, state.since), goal_options).condition;
+        state.step_at = t.unix;
     }
 }
 
@@ -183,8 +203,8 @@ fn goal_for(step, a, run, since) {
     let lead = "model-watch run " + run + ", ";
     switch step {
         "sync" => lead + "step 1 of 4, sync: this worktree is on branch " + a.branch + " with no uncommitted changes, local main is an ancestor of HEAD (`git merge-base --is-ancestor main HEAD` succeeds), and `make check` passes. Get there by running `git merge main` in this worktree and resolving every conflict on " + a.branch + ", keeping the intent of both sides. Commit leftovers from an earlier run if they are finished model updates, and revert them otherwise. Change nothing in " + a.main_worktree + ".",
-        "survey" => lead + "step 2 of 4, survey: " + report + " lists every model change since " + since + " that `make model-watch ARGS='-- --since " + since + "'` reports or that a source in the model-updates skill announces. Each row names the provider's own page and is marked apply or unconfirmed, and a \"For a person\" section lists what is unconfirmed. Load the model-updates skill first, and change no code in this step.",
-        "apply" => lead + "step 3 of 4, apply: every apply row of " + report + " is applied following the model-updates skill and committed on " + a.branch + ", with release notes and `make gen-docs`, and the report says for each row what was done or why not. `git status` is clean.",
+        "survey" => lead + "step 2 of 4, survey: " + report + " lists every model change since " + since + " that `make model-watch ARGS='-- --since " + since + "'` reports or that a source in the model-updates skill announces. Each row names the provider's own page and is marked apply, due, or unconfirmed as the skill defines them, and a \"For a person\" section lists what is unconfirmed. A survey that finds nothing to change meets this step. Load the model-updates skill first, and change no code in this step.",
+        "apply" => lead + "step 3 of 4, apply: every apply row of " + report + " is settled following the model-updates skill, and the report says for each row what was done or why nothing was. A row that changes what users see (a model added or removed, a price, limit, default, or thinking level) is committed on " + a.branch + " with a release-notes bullet and `make gen-docs`. A row that changes only `ACCEPTED` or `CAPS` is committed without release notes. A row that needs no change today, such as a shutdown date still ahead, is left alone. A run with no apply rows, or with nothing to commit, meets this step as it is. `git status` is clean. This step needs no decision from a person: anything that would is listed under \"For a person\" in the report and does not hold the step open.",
         _ => lead + "step 4 of 4, validate: either `git rev-list --count main..HEAD` prints 0, or `make lint`, `make test`, and `make gen-docs-check` all pass on a clean HEAD of " + a.branch + ". A change that cannot be made to pass is reverted with a commit and listed under \"For a person\" in " + report + ".",
     }
 }

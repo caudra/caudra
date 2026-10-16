@@ -327,6 +327,8 @@ impl Chat {
             | AgentEvent::GoalFinished { .. }
             | AgentEvent::GoalDeferred { .. }
             | AgentEvent::GoalLoopCap { .. }
+            | AgentEvent::GoalStalled { .. }
+            | AgentEvent::GoalWaiting { .. }
             | AgentEvent::GoalTurnLimit { .. }
             | AgentEvent::GoalEvaluationFailed { .. }
             | AgentEvent::GoalClearedAfterError { .. } => {}

@@ -2902,6 +2902,24 @@ pub enum AgentEvent {
         evaluations: u32,
         continuations: u32,
         limit: u32,
+        /// Whether autopilot set the goal, which stays active.
+        autopilot_owned: bool,
+    },
+    /// The goal's last `turns` turns in a row made no progress, so the run
+    /// stopped. The goal stays active.
+    GoalStalled {
+        evaluations: u32,
+        turns: u32,
+        autopilot_owned: bool,
+    },
+    /// The goal waits on a change outside the session, so the run stopped and
+    /// the frontend checks the goal again after `delay_ms`. `attempt` counts
+    /// the waits since it last moved, out of `limit`. The goal stays active.
+    GoalWaiting {
+        evaluations: u32,
+        attempt: u32,
+        limit: u32,
+        delay_ms: u64,
     },
     GoalTurnLimit {
         evaluations: u32,

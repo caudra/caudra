@@ -3,6 +3,7 @@ pub mod commit_preamble;
 mod compaction;
 mod favorites;
 mod goal;
+mod goal_progress;
 mod history;
 mod instructions;
 pub(crate) mod judging;
@@ -36,7 +37,7 @@ pub use compaction::{
 pub use goal::{
     DEFAULT_GOAL_CONTINUATION_LIMIT, GoalError, GoalHandle, GoalResult, GoalSnapshot, GoalStatus,
     GoalVerdict, MAX_GOAL_CHARS, MAX_GOAL_CONTINUATION_LIMIT, goal_checkin_message,
-    goal_kickoff_message,
+    goal_kickoff_message, goal_wait_message,
 };
 pub(crate) use goal::{JudgeRole, ResolvedEvaluator, evaluator_request, resolve_evaluator};
 pub use history::{

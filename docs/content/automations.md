@@ -98,7 +98,7 @@ The agent can write one for you. The builtin `caudra-automation-dev` [skill](/do
 | `armed` | the automation is armed: at launch, on resume, when you arm it again, and when the pause latch clears | none |
 | `idle` | the session settles after a busy period and stays settled for `after` | `after` |
 | `needs_input` | the session has waited on you for `after`, such as at a permission prompt, a question, a plan, or an item [autopilot](#autopilot) left to you | `after`, `inputs` |
-| `goal_finished` | the session goal ends as met, impossible, or cleared by an error | `verdicts` |
+| `goal_finished` | the session goal ends as met, impossible, or cleared by an error, or, when `verdicts` lists `stalled`, the run stops on a goal that made no progress and stays active | `verdicts` |
 | `schedule` | an occurrence comes due, `every` a period or `at` a time of day | `every` or `at`, `weekdays`, `catch_up` |
 | `message_received` | a message from another session or a script reaches this session | filters and `consume`, under [Messaging](#messaging) |
 | `work_finished` | consumer-group work this session published reaches an outcome | `groups`, `states` |

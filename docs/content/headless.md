@@ -200,6 +200,8 @@ Every goal event arrives as a `system` message with subtype `goal`, before the `
 | `deferred` | `active_background_tasks` | The run ended before session work settled, so evaluation waits. See [Check-ins and resume](#check-ins-and-resume) |
 | `finished` | `goal`, `condition`, `set_at_ms`, `verdict`, `reason`, `evaluations`, `duration_ms`, `usage`, `cost`, `subscription_cost` | The goal was met or judged impossible, and cleared itself |
 | `loop_cap` | `evaluations`, `continuations`, `limit` | The run used all its automatic continuations. The goal stays active |
+| `stalled` | `evaluations`, `turns` | The goal's last `turns` turns in a row made no progress, so the run stopped. The goal stays active |
+| `waiting` | `evaluations`, `attempt`, `limit`, `delay_ms` | The goal waits on a change outside the session, so the run stopped. The goal stays active and is checked again after `delay_ms`. See [Check-ins and resume](#check-ins-and-resume) |
 | `turn_limit` | `evaluations` | The run reached its turn limit. The goal stays active |
 | `cleared_after_error` | `condition`, `message` | An unrecoverable error ended the run and cleared the goal |
 
@@ -226,7 +228,9 @@ A `deferred` goal waits for session tasks, shell jobs, and workflows to settle, 
 
 A prompt that arrives first takes the check-in's place. An `interrupt`, a `set_permission_mode` request, or a run that stops short of a normal end of turn calls the check-in off. That covers an error, a cancellation, and the turn or output-token limit. In each case the goal stays active and is evaluated when the next run ends.
 
-The goal belongs to the session, which saves it after every run and when stdin closes. `--resume <ID>` restores the active goal with its evaluation count, spend, elapsed time, and latest verdict and reason, along with the last finished goal and the continuation limit. `goal_status` reports what came back. A resumed goal waits for the next prompt and is evaluated at the end of that run. The [goal log](#goal-log) lives in the session's database, so it survives `--resume` too.
+A `waiting` goal gets the same check-in once `delay_ms` has passed, with stdin still open. Its hidden prompt asks the model to check whether the outside change came. A prompt or an `interrupt` that arrives first ends the wait. A one-shot `-p` run reports the wait as its result and does not check again, but the wait is saved with the session, so resuming it later picks the wait up.
+
+The goal belongs to the session, which saves it after every run and when stdin closes. `--resume <ID>` restores the active goal with its evaluation count, spend, elapsed time, and latest verdict and reason, along with the last finished goal and the continuation limit. `goal_status` reports what came back. A resumed goal waits for the next prompt and is evaluated at the end of that run. A goal that was `waiting` keeps its wait and its count of waits: the check-in comes when the wait is over, or as soon as the session is resumed if it already is. The [goal log](#goal-log) lives in the session's database, so it survives `--resume` too.
 
 #### Goal log
 

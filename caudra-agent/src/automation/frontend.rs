@@ -35,6 +35,8 @@ const BUILD_MODE: &str = "build";
 const READ_ONLY_MODE: &str = "read_only";
 const PLAN_MODE: &str = "plan";
 const RESPONSE_SEPARATOR: &str = "\n";
+/// The reason a stalled goal reports before the evaluator gave one.
+const STALLED_REASON: &str = "the goal made no progress";
 /// How long a session waits for its firings to stop and its store to close before letting the
 /// runtime go. Past this the next open marks the firings it cut off as interrupted.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -257,6 +259,20 @@ pub fn goal_finished(result: &GoalResult, autopilot_owned: bool) -> SessionSigna
         evaluations: result.evaluations,
         duration_s: result.duration.as_secs(),
         cost: result.cost,
+        autopilot: autopilot_owned,
+    }))
+}
+
+/// A run that stopped on `goal`, which stays active: it made no progress, or it used its
+/// continuations. Only scripts that list the `stalled` verdict hear of it.
+pub fn goal_stalled(goal: &GoalSnapshot, autopilot_owned: bool) -> SessionSignal {
+    SessionSignal::GoalFinished(Box::new(GoalFinishedDetail {
+        verdict: FinishedVerdict::Stalled,
+        condition: goal.condition.to_string(),
+        reason: Untrusted::text(goal.last_reason.as_deref().unwrap_or(STALLED_REASON)),
+        evaluations: goal.evaluations,
+        duration_s: goal.elapsed().as_secs(),
+        cost: goal.cost,
         autopilot: autopilot_owned,
     }))
 }

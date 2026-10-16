@@ -153,6 +153,7 @@ pub(super) fn blocker_text(blocker: SettleBlocker) -> String {
         SettleBlocker::GroupWork => "group work is offered".to_owned(),
         SettleBlocker::MailboxWake => "a mailbox wake is pending".to_owned(),
         SettleBlocker::GoalCheckin => "a goal check-in is due".to_owned(),
+        SettleBlocker::GoalWaiting => "the goal waits to check again".to_owned(),
         SettleBlocker::AgentEvents => "agent events wait to be handled".to_owned(),
     }
 }

@@ -36,16 +36,18 @@ Pages that render with JavaScript may need `webfetch` with `format: "text"`, or 
 1. Run `make model-watch ARGS='-- --since <YYYY-MM-DD>'`. It prints new models released since that date, deprecated models, changed prices and limits, table models that models.dev does not list, and stale acceptances.
 2. Read every source above for entries since the same date. A release the catalog has not picked up yet still counts.
 3. Write `target/model-watch/<run date>.md`:
-   - A table with one row per finding: kind (new, deprecated, retired, price, limit, default, thinking), provider, model, ours, theirs, the source URL, and `apply` or `unconfirmed`.
+   - A table with one row per finding: kind (new, deprecated, retired, price, limit, default, thinking), provider, model, ours, theirs, the source URL, and `apply`, `due <date>`, or `unconfirmed`.
    - A "For a person" section listing every `unconfirmed` row and anything you chose not to apply, each with the reason.
 
-A row is `apply` only when the provider's own page states the fact. A divergence that is deliberate, such as a window Caudra caps on purpose, is `apply` too: the change is a row in `ACCEPTED` (see below).
+A row is `apply` only when the provider's own page states the fact and Caudra must change for it today. A divergence that is deliberate, such as a window Caudra caps on purpose, is `apply` too: the change is a row in `ACCEPTED` (see below). A confirmed change that takes effect later, such as a shutdown date still ahead, is `due <date>`: nothing changes in this run, and a later run applies it once the date passes. A finding Caudra already handles is not a row.
+
+A run where nothing needs changing is a normal outcome, not a problem for a person.
 
 ## Apply rules
 
-- Apply every confirmed row, including default switches and removals.
+- Apply every `apply` row, including default switches and removals.
 - Add a model the provider has released through its API with tool calling.
-- Remove a model once the provider says it is retired or its shutdown date has passed. Before that date, keep it and note the date in the report.
+- Remove a model once the provider says it is retired or its shutdown date has passed. Before that date, keep it: the report lists it as `due <date>`.
 - Switch a lane's default (Best, Fast, or the first-run model) when the provider presents the new model as the successor in that lane.
 - Announced future prices become a `PriceChange`, never an edit of today's price.
 - A divergence from models.dev that the provider's page shows is right in Caudra goes into `ACCEPTED` in `caudra-providers/src/model_watch.rs`: provider slug, table prefix (or the catalog id for an unlisted model), field, the models.dev value exactly as the report printed it, and a reason that names the page. Delete the rows the report lists as stale.
@@ -63,7 +65,7 @@ A row is `apply` only when the provider's own page states the fact. A divergence
 - **Prices.** `PricingTier { above, .. }` bills the whole request at the tier once the prompt passes `above`. `PriceChange { prefix, from, pricing }` goes in the manifest's `price_changes`. Tests never read the real clock for a price: use `billed_cost_at` with fixed instants.
 - **A new `Model` field** goes into every `Model { .. }` literal, about nine files including `caudra-ui/src/components/mod.rs`.
 - **Docs.** `make gen-docs` rewrites the providers tables. Prose notes live in the consts of `caudra-docgen/src/gen_providers.rs`.
-- **Release notes.** Add a bullet under `### Models` in the newest `release-notes/*.md` whose version `git tag -l v<version>` does not list yet, in the style of its neighbours, and keep the lead paragraph in step. Follow CONTRIBUTING's release-notes section.
+- **Release notes.** Only a change users notice gets a bullet: a model added or removed, or a changed price, limit, default, or thinking level. Add it under `### Models` in the newest `release-notes/*.md` whose version `git tag -l v<version>` does not list yet, in the style of its neighbours, keep the lead paragraph in step, and run `make gen-docs`. A change to `ACCEPTED` or `CAPS` alone, a test, or the report gets none, because CONTRIBUTING's release-notes section leaves out internal tooling.
 
 ## Commits
 

@@ -22,9 +22,11 @@ const PLAN_LABEL: &str = "The plan this run wrote, waiting for approval to imple
 const REPLY_LABEL: &str = "The reply the agent handed back with, which asks the user:";
 const ON_BEHALF_PREFIX: &str = "Autopilot (on the user's behalf):";
 const LOOP_CAP_SUBJECT: &str = "Goal continuation limit";
+const NO_PROGRESS_SUBJECT: &str = "Goal made no progress";
 const TURN_LIMIT_SUBJECT: &str = "Turn limit";
 const STEERING_SUBJECT: &str = "Steering exhausted";
 const LOOP_CAP_LABEL: &str = "The run is about to stop with its goal open. The evaluator judged the goal not met after every continuation this run allows. Continuations used:";
+const NO_PROGRESS_LABEL: &str = "The run is about to stop with its goal open, because its last turns made no progress: the evaluator saw nothing new, a turn repeated an earlier one, or the agent stopped to ask a person. Continue only with guidance that changes the approach or settles what the agent waits on; otherwise let a human decide. Turns without progress:";
 const TURN_LIMIT_LABEL: &str =
     "The run is about to stop: it used every turn it was given. Turns allowed:";
 const STEERING_LABEL: &str = "The run is about to fail: steering spent its allowance recovering the agent from a stall and gave up. The steering rule:";
@@ -40,6 +42,8 @@ pub const STREAK_REASON: &str = "autopilot already continued as many reviews in 
 pub enum Stall<'a> {
     /// The goal was still not met after the continuations the run allows.
     LoopCap { continuations: u32 },
+    /// The goal's last turns in a row made no progress.
+    NoProgress { turns: u32 },
     /// The run used the turns it was given.
     TurnLimit { turns: u32 },
     /// A steering rule spent its allowance.
@@ -100,6 +104,9 @@ impl TurnEnd {
         let (subject, label, detail) = match stall {
             Stall::LoopCap { continuations } => {
                 (LOOP_CAP_SUBJECT, LOOP_CAP_LABEL, continuations.to_string())
+            }
+            Stall::NoProgress { turns } => {
+                (NO_PROGRESS_SUBJECT, NO_PROGRESS_LABEL, turns.to_string())
             }
             Stall::TurnLimit { turns } => (TURN_LIMIT_SUBJECT, TURN_LIMIT_LABEL, turns.to_string()),
             Stall::Steering { rule } => (STEERING_SUBJECT, STEERING_LABEL, (*rule).to_owned()),
@@ -261,6 +268,7 @@ mod tests {
     }
 
     #[test_case(Stall::LoopCap { continuations: LIMIT }, LOOP_CAP_LABEL, &LIMIT.to_string() ; "loop_cap")]
+    #[test_case(Stall::NoProgress { turns: LIMIT }, NO_PROGRESS_LABEL, &LIMIT.to_string() ; "no_progress")]
     #[test_case(Stall::TurnLimit { turns: LIMIT }, TURN_LIMIT_LABEL, &LIMIT.to_string() ; "turn_limit")]
     #[test_case(Stall::Steering { rule: RULE }, STEERING_LABEL, RULE ; "steering")]
     fn a_stall_says_which_it_is_and_where_the_goal_stands(stall: Stall, label: &str, detail: &str) {

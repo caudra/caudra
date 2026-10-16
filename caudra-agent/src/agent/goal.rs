@@ -16,13 +16,15 @@ use caudra_storage::goal_log::{
     StoredGoalRecord,
 };
 use caudra_storage::sessions::{
-    SessionMeta, StoredActiveGoal, StoredGoalResult, StoredGoalVerdict, StoredTokenUsage,
+    SessionMeta, StoredActiveGoal, StoredGoalResult, StoredGoalVerdict, StoredGoalWait,
+    StoredTokenUsage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use strum::Display;
 use tracing::warn;
 
+use super::goal_progress::{GoalPace, GoalTurn, StallTracker};
 use super::judging::{
     self, INITIAL_TRANSCRIPT_PERCENT, ONE_JSON_OBJECT_ERROR, RETRY_TRANSCRIPT_PERCENT,
     TOOL_CALL_LINE, ToolBlock, correction, drop_oldest_rounds, json_object, result_line,
@@ -132,6 +134,14 @@ pub struct GoalResult {
     pub subscription_cost: Option<f64>,
 }
 
+/// A goal's wait on a change outside the session: its `attempt`th since it
+/// last moved, over at `until_ms`, Unix milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GoalWait {
+    pub attempt: u32,
+    pub until_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 pub enum GoalStatus {
     Active(GoalSnapshot),
@@ -182,6 +192,9 @@ struct GoalState {
     last_seq: u64,
     /// Goal log writes the frontend has yet to take, oldest first.
     unlogged: VecDeque<GoalLogWrite>,
+    stalls: StallTracker,
+    /// The active goal's wait, `None` while it is not waiting.
+    wait: Option<GoalWait>,
 }
 
 impl Default for GoalState {
@@ -194,6 +207,8 @@ impl Default for GoalState {
             last_goal: 0,
             last_seq: 0,
             unlogged: VecDeque::new(),
+            stalls: StallTracker::default(),
+            wait: None,
         }
     }
 }
@@ -213,6 +228,7 @@ impl GoalState {
     /// Takes the active goal, journaling how it ended.
     fn end_active(&mut self, end: GoalEnd, at_ms: u64) -> Option<GoalSnapshot> {
         let active = self.active.take()?;
+        self.wait = None;
         self.generation = self.generation.wrapping_add(1);
         self.journal(GoalLogWrite::Ended(ended_record(&active, end, at_ms)));
         Some(active)
@@ -303,6 +319,12 @@ impl GoalHandle {
             if legacy {
                 state.journal(GoalLogWrite::Begun(begun_record(&snapshot)));
             }
+            state.wait = stored.wait.map(|wait| GoalWait {
+                attempt: wait.attempt,
+                until_ms: wait.until_ms,
+            });
+            state.stalls =
+                StallTracker::resumed(state.generation, state.wait.map(|wait| wait.attempt));
             state.active = Some(snapshot);
         }
         if let Some(stored) = meta.goal_result.as_deref()
@@ -340,6 +362,10 @@ impl GoalHandle {
                     usage: goal.usage.spent(goal.cost, goal.subscription_cost),
                     last_verdict: goal.last_verdict.map(Into::into),
                     last_reason: goal.last_reason.as_deref().map(str::to_owned),
+                    wait: state.wait.map(|wait| StoredGoalWait {
+                        attempt: wait.attempt,
+                        until_ms: wait.until_ms,
+                    }),
                 })
             }),
             result: state
@@ -436,7 +462,7 @@ impl GoalHandle {
         if Arc::ptr_eq(&self.inner, &other.inner) {
             return;
         }
-        let (generation, active, finished, last_goal, last_seq, mut unlogged) = {
+        let (generation, active, finished, last_goal, last_seq, wait, mut unlogged) = {
             let mut other = other.lock();
             (
                 other.generation,
@@ -444,12 +470,15 @@ impl GoalHandle {
                 other.finished.clone(),
                 other.last_goal,
                 other.last_seq,
+                other.wait,
                 mem::take(&mut other.unlogged),
             )
         };
         let mut state = self.lock();
         state.generation = state.generation.max(generation).wrapping_add(1);
         let current = state.generation;
+        state.wait = wait.filter(|_| active.is_some());
+        state.stalls = StallTracker::resumed(current, state.wait.map(|wait| wait.attempt));
         state.active = active.map(|goal| GoalSnapshot {
             generation: current,
             ..goal
@@ -562,6 +591,58 @@ impl GoalHandle {
             .is_some_and(|goal| goal.generation == generation)
     }
 
+    /// Records a turn of goal `generation` and says what the goal does next,
+    /// [`GoalPace::Going`] once that goal is no longer active. A wait is kept
+    /// on the goal, so it is saved with the session and outlives this process.
+    pub(crate) fn record_turn(&self, generation: u64, turn: &GoalTurn) -> GoalPace {
+        let now_ms = self.now_ms();
+        let mut state = self.lock();
+        if !state
+            .active
+            .as_ref()
+            .is_some_and(|goal| goal.generation == generation)
+        {
+            return GoalPace::Going;
+        }
+        let pace = state.stalls.record(generation, turn);
+        if let GoalPace::Wait { attempt, delay } = pace {
+            state.wait = Some(GoalWait {
+                attempt,
+                until_ms: now_ms.saturating_add(saturating_millis(delay)),
+            });
+        }
+        pace
+    }
+
+    /// The active goal's wait on an outside change.
+    pub fn wait(&self) -> Option<GoalWait> {
+        self.lock().wait
+    }
+
+    /// How long the active goal still waits, `Some(ZERO)` once its wait is
+    /// over and `None` while it is not waiting.
+    pub fn wait_left(&self) -> Option<Duration> {
+        let now_ms = self.now_ms();
+        self.wait()
+            .map(|wait| Duration::from_millis(wait.until_ms.saturating_sub(now_ms)))
+    }
+
+    /// Whether the active goal's wait is over, so its check-in is due.
+    pub fn wait_over(&self) -> bool {
+        self.wait_left().is_some_and(|left| left.is_zero())
+    }
+
+    /// Ends the active goal's wait: a run started, or the user stopped it.
+    pub fn end_wait(&self) {
+        self.lock().wait = None;
+    }
+
+    /// Leaves goal `generation`, stalled and sent on, one turn short of
+    /// stalling again.
+    pub(crate) fn hold_stall(&self, generation: u64) {
+        self.lock().stalls.hold(generation);
+    }
+
     pub(crate) fn apply_evaluation(
         &self,
         generation: u64,
@@ -658,6 +739,11 @@ impl Goal {
 pub(crate) struct EvaluationResult {
     pub verdict: GoalVerdict,
     pub reason: String,
+    /// Whether the evaluator saw the goal move since its previous verdict.
+    pub progress: bool,
+    /// Whether the evaluator saw the goal waiting on a change outside the
+    /// session that may come by itself.
+    pub waiting: bool,
     pub usage: TokenUsage,
     pub cost: Option<f64>,
     pub billing: Billing,
@@ -812,6 +898,15 @@ struct EvaluationWire {
     reason: String,
     #[serde(default)]
     impossible: bool,
+    #[serde(default = "assume_progress")]
+    progress: bool,
+    #[serde(default)]
+    waiting: bool,
+}
+
+/// An evaluator that leaves `progress` out has not seen the goal stall.
+fn assume_progress() -> bool {
+    true
 }
 
 pub(crate) struct Evaluator<'a> {
@@ -876,10 +971,17 @@ impl Evaluator<'_> {
 
             let (error, output) = match response_text(&response.message) {
                 Ok(output) => match parse_evaluation(&output) {
-                    Ok((verdict, reason)) => {
+                    Ok(Evaluation {
+                        verdict,
+                        reason,
+                        progress,
+                        waiting,
+                    }) => {
                         return Ok(EvaluationResult {
                             verdict,
                             reason,
+                            progress,
+                            waiting,
                             usage,
                             cost,
                             billing: model.billing,
@@ -1030,7 +1132,15 @@ fn response_text(message: &Message) -> Result<String, String> {
     Ok(output)
 }
 
-fn parse_evaluation(output: &str) -> Result<(GoalVerdict, String), String> {
+#[derive(Debug, PartialEq)]
+struct Evaluation {
+    verdict: GoalVerdict,
+    reason: String,
+    progress: bool,
+    waiting: bool,
+}
+
+fn parse_evaluation(output: &str) -> Result<Evaluation, String> {
     let candidate = json_object(output).ok_or_else(|| ONE_JSON_OBJECT_ERROR.to_owned())?;
     let value =
         serde_json::from_str::<EvaluationWire>(candidate).map_err(|error| error.to_string())?;
@@ -1048,7 +1158,12 @@ fn parse_evaluation(output: &str) -> Result<(GoalVerdict, String), String> {
     } else {
         GoalVerdict::NotMet
     };
-    Ok((verdict, reason.to_string()))
+    Ok(Evaluation {
+        verdict,
+        reason: reason.to_string(),
+        progress: value.progress,
+        waiting: value.waiting && !value.ok,
+    })
 }
 
 /// Saturates rather than wraps: a goal left open for longer than `u64`
@@ -1093,6 +1208,15 @@ pub fn goal_checkin_message(condition: &str) -> String {
     )
 }
 
+/// The hidden prompt of the run that checks a goal again once its wait on an
+/// outside change is over.
+pub fn goal_wait_message(condition: &str) -> String {
+    let condition = serde_json::to_string(condition).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        "Goal check-in: {condition} is still active. It was waiting on a change outside the session, and the wait is over. Check whether that change came, then continue toward the goal."
+    )
+}
+
 pub(crate) fn is_unrecoverable(error: &AgentError) -> bool {
     if error.is_auth_error() || error.is_context_overflow() || error.is_model_unavailable() {
         return true;
@@ -1117,6 +1241,7 @@ pub(crate) fn is_unrecoverable(error: &AgentError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::goal_progress::Judgement;
     use crate::agent::judging::{TOOL_ERROR_LINE, TOOL_RESULT_LINE, UNNAMED_TOOL};
     use crate::automation::clock::FakeClock;
     use caudra_providers::provider::BoxFuture;
@@ -1390,6 +1515,7 @@ mod tests {
             usage: Default::default(),
             last_verdict: None,
             last_reason: None,
+            wait: None,
         }
     }
 
@@ -1514,6 +1640,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_wait_outlives_the_session_and_its_backoff_carries_on() {
+        const WAIT_SURVIVES: &str = "a goal's wait and its count must survive a resume";
+        let waiting = GoalTurn {
+            judgement: Some(Judgement {
+                progressed: false,
+                waiting: true,
+            }),
+            ..GoalTurn::default()
+        };
+        let (clock, handle) = clocked();
+        let generation = handle.set(PROMPT).unwrap().generation;
+        handle.record_turn(generation, &waiting);
+        handle.record_turn(generation, &waiting);
+        let wait = handle.wait().expect(WAIT_SURVIVES);
+        let stored = handle.stored();
+
+        let resumed = GoalHandle::from_meta_with_clock(
+            &SessionMeta {
+                active_goal: stored.active,
+                ..SessionMeta::default()
+            },
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        );
+
+        assert_eq!(resumed.wait(), Some(wait), "{WAIT_SURVIVES}");
+        assert!(!resumed.wait_over(), "{WAIT_SURVIVES}");
+        clock.advance(Duration::from_millis(wait.until_ms - START_MS_U64));
+        assert!(resumed.wait_over(), "{WAIT_SURVIVES}");
+        let generation = resumed.snapshot().unwrap().generation;
+        assert!(
+            matches!(
+                resumed.record_turn(generation, &waiting),
+                GoalPace::Wait { attempt, .. } if attempt == wait.attempt + 1
+            ),
+            "{WAIT_SURVIVES}"
+        );
+        resumed.end_wait();
+        assert_eq!(resumed.wait(), None);
+    }
+
     #[test_case(0, NUMBERED_GOAL + 1, true ; "legacy_goal_takes_the_next_number")]
     #[test_case(NUMBERED_GOAL, NUMBERED_GOAL, false ; "numbered_goal_keeps_its_number")]
     fn a_restored_goal_is_numbered(stored_goal: u32, expected_goal: u32, begins: bool) {
@@ -1615,6 +1782,26 @@ mod tests {
         ] {
             assert!(parse_evaluation(input).is_ok(), "{input}");
         }
+    }
+
+    #[test_case(r#"{"ok":false,"reason":"same as before","impossible":false,"progress":false}"#, false ; "no_progress")]
+    #[test_case(r#"{"ok":false,"reason":"lint fixed","impossible":false,"progress":true}"#, true ; "progress")]
+    #[test_case(r#"{"ok":false,"reason":"lint missing","impossible":false}"#, true ; "left_out_assumes_progress")]
+    fn reads_whether_the_goal_moved(input: &str, progress: bool) {
+        assert_eq!(
+            parse_evaluation(input).map(|parsed| parsed.progress),
+            Ok(progress)
+        );
+    }
+
+    #[test_case(r#"{"ok":false,"reason":"CI still running","progress":false,"waiting":true}"#, true ; "waiting")]
+    #[test_case(r#"{"ok":false,"reason":"lint missing"}"#, false ; "left_out_is_not_waiting")]
+    #[test_case(r#"{"ok":true,"reason":"CI passed","waiting":true}"#, false ; "a_met_goal_never_waits")]
+    fn reads_whether_the_goal_waits_on_an_outside_change(input: &str, waiting: bool) {
+        assert_eq!(
+            parse_evaluation(input).map(|parsed| parsed.waiting),
+            Ok(waiting)
+        );
     }
 
     #[test]
@@ -2032,7 +2219,7 @@ mod tests {
 
         let output = response_text(&message).unwrap();
 
-        assert_eq!(parse_evaluation(&output).unwrap().0, GoalVerdict::Met);
+        assert_eq!(parse_evaluation(&output).unwrap().verdict, GoalVerdict::Met);
     }
 
     #[test]

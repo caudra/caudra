@@ -31,6 +31,7 @@ use super::goal::{
     GoalStatus, GoalVerdict, ResolvedEvaluator, continuation_message, is_unrecoverable,
     resolve_evaluator,
 };
+use super::goal_progress::{GoalPace, GoalTurn, Judgement, MAX_GOAL_WAITS, turn_fingerprint};
 use super::history::{
     CANCEL_MARKER, History, sanitize_cancelled_history, sanitize_failed_history,
     settle_failed_attempt, user_request,
@@ -517,6 +518,9 @@ pub struct Agent<'h> {
     goal_evaluator: Option<ResolvedEvaluator>,
     goal_blocks: u32,
     goal_prescreen_skips: u32,
+    /// Where the goal's current turn starts: the history epoch and length as
+    /// the run began or the last continuation went in.
+    goal_turn_from: (u64, usize),
     todos_reminded: bool,
     /// Whether this run saved the plan in plan mode. Approving it is then the
     /// host's plan handoff, which a `question` answer cannot stand in for.
@@ -690,6 +694,7 @@ impl<'h> Agent<'h> {
             goal_evaluator: None,
             goal_blocks: 0,
             goal_prescreen_skips: 0,
+            goal_turn_from: (0, 0),
             todos_reminded: false,
             plan_saved: false,
             wait_for_background: false,
@@ -891,6 +896,8 @@ impl<'h> Agent<'h> {
             )
             .map_err(|message| AgentError::Config { message })?;
         self.goal_prescreen_skips = 0;
+        self.goal.end_wait();
+        self.mark_goal_turn();
         self.todos_reminded = false;
         self.plan_saved = false;
         self.work_reminded = None;
@@ -2763,6 +2770,83 @@ impl<'h> Agent<'h> {
         Ok(TurnOutcome::Done(done_reason))
     }
 
+    /// Starts the goal's next turn at the end of the history as it stands.
+    fn mark_goal_turn(&mut self) {
+        self.goal_turn_from = (self.history.epoch(), self.history.len());
+    }
+
+    /// What the goal's turn since [`Self::mark_goal_turn`] showed. A
+    /// compaction since then leaves it without a fingerprint.
+    fn goal_turn(&self, judgement: Option<Judgement>) -> GoalTurn {
+        let (epoch, from) = self.goal_turn_from;
+        let turn = if epoch == self.history.epoch() {
+            self.history.as_slice().get(from..).unwrap_or_default()
+        } else {
+            &[]
+        };
+        GoalTurn {
+            judgement,
+            fingerprint: turn_fingerprint(turn),
+            asked_user: !turn.iter().any(Message::has_tool_calls)
+                && self
+                    .response_text
+                    .as_deref()
+                    .is_some_and(steering::solicits),
+        }
+    }
+
+    /// Stops a run whose goal made no progress for
+    /// [`MAX_STALLED_TURNS`](super::goal_progress::MAX_STALLED_TURNS) turns in
+    /// a row, unless an engaged autopilot sends it on, which leaves the goal
+    /// one turn short of stalling again. A goal waiting on an outside change
+    /// stops the run too, for the frontend to check it again once the wait is
+    /// over. `None` when the goal goes on as usual.
+    async fn stop_stalled_goal(
+        &mut self,
+        generation: u64,
+        evaluations: u32,
+        judgement: Option<Judgement>,
+        done_reason: DoneReason,
+    ) -> Result<Option<TurnOutcome>, AgentError> {
+        let turns = match self
+            .goal
+            .record_turn(generation, &self.goal_turn(judgement))
+        {
+            GoalPace::Going => return Ok(None),
+            GoalPace::Wait { attempt, delay } => {
+                let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                info!(
+                    attempt,
+                    delay_ms, evaluations, "goal waits on an outside change, stopping the run"
+                );
+                self.event_tx.send(AgentEvent::GoalWaiting {
+                    evaluations,
+                    attempt,
+                    limit: MAX_GOAL_WAITS,
+                    delay_ms,
+                })?;
+                return Ok(Some(TurnOutcome::Done(done_reason)));
+            }
+            GoalPace::Stalled { turns } => turns,
+        };
+        if let Some(guidance) = Box::pin(self.review_stall(Stall::NoProgress { turns })).await? {
+            self.goal.hold_stall(generation);
+            let outcome = Box::pin(self.continue_for_autopilot(guidance)).await?;
+            self.mark_goal_turn();
+            return Ok(Some(outcome));
+        }
+        warn!(
+            turns,
+            evaluations, "goal made no progress, stopping the run"
+        );
+        self.event_tx.send(AgentEvent::GoalStalled {
+            evaluations,
+            turns,
+            autopilot_owned: self.autopilot_owns_goal(),
+        })?;
+        Ok(Some(TurnOutcome::Done(done_reason)))
+    }
+
     async fn goal_completion(
         &mut self,
         done_reason: DoneReason,
@@ -2835,6 +2919,15 @@ impl<'h> Agent<'h> {
                         probability,
                         at_ms: logged.at_ms,
                     })?;
+                    if let Some(receipt) = &outcome.receipt {
+                        decisions.record_effect_detached(receipt, DecisionEffect::Skipped);
+                    }
+                    if let Some(stopped) = self
+                        .stop_stalled_goal(goal.generation, goal.evaluations, None, done_reason)
+                        .await?
+                    {
+                        return Ok(stopped);
+                    }
                     self.goal_blocks += 1;
                     self.goal_prescreen_skips += 1;
                     self.count_continuation();
@@ -2842,9 +2935,7 @@ impl<'h> Agent<'h> {
                         &goal.condition,
                         GOAL_PRESCREEN_CONTINUATION,
                     )));
-                    if let Some(receipt) = &outcome.receipt {
-                        decisions.record_effect_detached(receipt, DecisionEffect::Skipped);
-                    }
+                    self.mark_goal_turn();
                     return Ok(TurnOutcome::Continue);
                 }
                 (FeatureMode::Shadow, Some(probability)) => {
@@ -3036,6 +3127,10 @@ impl<'h> Agent<'h> {
         } else {
             result.verdict
         };
+        let judgement = Judgement {
+            progressed: result.progress || guidance.is_some(),
+            waiting: result.waiting && guidance.is_none(),
+        };
         let deferred = !self.goal_completion_ready() || self.cancel.is_cancelled();
         let apply = if deferred {
             GoalApply::Stale
@@ -3100,6 +3195,12 @@ impl<'h> Agent<'h> {
                 Ok(TurnOutcome::Done(done_reason))
             }
             GoalApply::Continue { evaluation } => {
+                if let Some(stopped) = self
+                    .stop_stalled_goal(goal.generation, evaluation, Some(judgement), done_reason)
+                    .await?
+                {
+                    return Ok(stopped);
+                }
                 let continuation_limit = self.goal.continuation_limit();
                 if self.goal_blocks >= continuation_limit {
                     let stall = Stall::LoopCap {
@@ -3110,11 +3211,14 @@ impl<'h> Agent<'h> {
                             evaluations: evaluation,
                             continuations: self.goal_blocks,
                             limit: continuation_limit,
+                            autopilot_owned: self.autopilot_owns_goal(),
                         })?;
                         return Ok(TurnOutcome::Done(done_reason));
                     };
                     self.goal_blocks = 0;
-                    return Box::pin(self.continue_for_autopilot(guidance)).await;
+                    let outcome = Box::pin(self.continue_for_autopilot(guidance)).await?;
+                    self.mark_goal_turn();
+                    return Ok(outcome);
                 }
                 self.goal_blocks += 1;
                 self.count_continuation();
@@ -3125,6 +3229,7 @@ impl<'h> Agent<'h> {
                 if let Some(guidance) = guidance {
                     self.push_injected(guidance);
                 }
+                self.mark_goal_turn();
                 Ok(TurnOutcome::Continue)
             }
         }
@@ -4615,6 +4720,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::agent::goal_progress::MAX_STALLED_TURNS;
     use crate::background_reminder::{RuntimeHealth, RuntimeSnapshot, render};
     use crate::cancel::CancelTrigger;
     use crate::context::{ContextKey, ContextStore};
@@ -7857,6 +7963,160 @@ mod tests {
         });
     }
 
+    fn judged_response(progress: bool) -> StreamResponse {
+        assistant_response(vec![ContentBlock::Text {
+            text: serde_json::json!({
+                "ok": false,
+                "reason": "more work remains",
+                "impossible": false,
+                "progress": progress,
+            })
+            .to_string(),
+        }])
+    }
+
+    fn worded_response(turn: u32) -> StreamResponse {
+        assistant_response(vec![ContentBlock::Text {
+            text: format!("Turn {turn} reports where things stand."),
+        }])
+    }
+
+    /// Distinct turns the evaluator judges without progress, and identical
+    /// turns it judges as progress, both stall: the first on the evaluator's
+    /// word, the second on the repeat, after the turn that opened the run.
+    #[test_case(|turn| (worded_response(turn), judged_response(false)), MAX_STALLED_TURNS ; "evaluator_sees_no_progress")]
+    #[test_case(|_| (text_response(StopReason::EndTurn), judged_response(true)), MAX_STALLED_TURNS + 2 ; "turns_repeat")]
+    fn a_goal_without_progress_stops_its_run_and_stays_active(
+        turn: fn(u32) -> (StreamResponse, StreamResponse),
+        evaluations: u32,
+    ) {
+        const STALL_STOPS: &str =
+            "a goal without progress must stop its run, not use its continuations";
+        smol::block_on(async {
+            let mut responses = Vec::new();
+            for index in 0..evaluations {
+                let (reply, verdict) = turn(index);
+                responses.extend([reply, verdict]);
+            }
+            let goal = GoalHandle::default();
+            goal.set("never met").unwrap();
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            let mut agent = agent.with_goal(goal.clone());
+
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            assert_eq!(
+                goal.snapshot().unwrap().evaluations,
+                evaluations,
+                "{STALL_STOPS}"
+            );
+            let events: Vec<_> = event_rx.try_iter().map(|envelope| envelope.event).collect();
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::GoalStalled { evaluations: stalled_at, turns, autopilot_owned: false }
+                        if *stalled_at == evaluations && *turns == MAX_STALLED_TURNS
+                )),
+                "{STALL_STOPS}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::GoalLoopCap { .. })),
+                "{STALL_STOPS}"
+            );
+        });
+    }
+
+    fn waiting_response() -> StreamResponse {
+        assistant_response(vec![ContentBlock::Text {
+            text: serde_json::json!({
+                "ok": false,
+                "reason": "the CI run has not finished",
+                "progress": false,
+                "waiting": true,
+            })
+            .to_string(),
+        }])
+    }
+
+    #[test]
+    fn a_waiting_goal_stops_each_run_and_backs_off() {
+        const WAIT_BACKS_OFF: &str =
+            "a goal waiting on an outside change must stop its run and wait longer each time";
+        const FIRST_WAIT_MS: u64 = 60_000;
+        smol::block_on(async {
+            let goal = GoalHandle::default();
+            goal.set("CI passes").unwrap();
+            let mut history = History::new(Vec::new());
+            let responses = (0..2)
+                .flat_map(|turn| [worded_response(turn), waiting_response()])
+                .collect();
+            let (agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            let mut agent = agent.with_goal(goal.clone());
+
+            agent.run(default_input()).await.unwrap();
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            let waits: Vec<_> = event_rx
+                .try_iter()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::GoalWaiting {
+                        attempt,
+                        limit,
+                        delay_ms,
+                        ..
+                    } => Some((attempt, limit, delay_ms)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                waits,
+                [
+                    (1, MAX_GOAL_WAITS, FIRST_WAIT_MS),
+                    (2, MAX_GOAL_WAITS, FIRST_WAIT_MS * 2)
+                ],
+                "{WAIT_BACKS_OFF}"
+            );
+            assert_eq!(goal.snapshot().unwrap().evaluations, 2, "{WAIT_BACKS_OFF}");
+        });
+    }
+
+    #[test]
+    fn a_goal_that_keeps_moving_is_never_stalled() {
+        const MOVING_GOES_ON: &str = "turns that make progress must not stall the goal";
+        smol::block_on(async {
+            let turns = MAX_STALLED_TURNS * 2;
+            let mut responses = Vec::new();
+            for turn in 0..turns {
+                responses.extend([worded_response(turn), judged_response(true)]);
+            }
+            responses.extend([worded_response(turns), goal_response(true, false, "done")]);
+            let goal = GoalHandle::default();
+            goal.set("met eventually").unwrap();
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            let mut agent = agent.with_goal(goal.clone());
+
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            assert!(
+                matches!(goal.status(), Some(GoalStatus::Finished(result)) if result.verdict == GoalVerdict::Met),
+                "{MOVING_GOES_ON}"
+            );
+            assert!(
+                !event_rx
+                    .try_iter()
+                    .any(|envelope| matches!(envelope.event, AgentEvent::GoalStalled { .. })),
+                "{MOVING_GOES_ON}"
+            );
+        });
+    }
+
     #[test]
     fn goal_loop_cap_uses_the_session_limit() {
         smol::block_on(async {
@@ -7883,6 +8143,7 @@ mod tests {
                     evaluations,
                     continuations,
                     limit,
+                    ..
                 } if evaluations == continuation_limit + 1
                     && continuations == continuation_limit
                     && limit == continuation_limit

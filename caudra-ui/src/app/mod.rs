@@ -135,7 +135,7 @@ use crate::components::workflow_inspector::WorkflowInspector;
 use crate::components::worktree_picker::{WorktreePicker, WorktreeView};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, DisplaySource, ExitRequest, GoalTone, Overlay,
-    PlanHandoff, RetryInfo, Status, is_ctrl,
+    PlanHandoff, RetryInfo, Status, format_elapsed, is_ctrl,
 };
 use crate::config_problems::ConfigProblems;
 use crate::image;
@@ -5425,11 +5425,43 @@ impl App {
                 evaluations,
                 continuations,
                 limit,
+                autopilot_owned,
             } => {
+                self.automation_goal_stalled(autopilot_owned);
                 self.main_chat().push(DisplayMessage::new(
                     DisplayRole::Notice,
                     format!(
                         "Goal remains active after {continuations} automatic continuations in this run ({evaluations} total evaluations); the session limit is {limit}. Send another message to resume."
+                    ),
+                ));
+                return vec![];
+            }
+            AgentEvent::GoalStalled {
+                evaluations,
+                turns,
+                autopilot_owned,
+            } => {
+                self.automation_goal_stalled(autopilot_owned);
+                self.main_chat().push(DisplayMessage::new(
+                    DisplayRole::Notice,
+                    format!(
+                        "Goal remains active, but its last {turns} turns made no progress ({evaluations} total evaluations), so the run stopped. Send another message to resume."
+                    ),
+                ));
+                return vec![];
+            }
+            AgentEvent::GoalWaiting {
+                evaluations,
+                attempt,
+                limit,
+                delay_ms,
+            } => {
+                let delay = Duration::from_millis(delay_ms);
+                self.main_chat().push(DisplayMessage::new(
+                    DisplayRole::Notice,
+                    format!(
+                        "Goal waits on a change outside the session ({evaluations} total evaluations); checking again in {} (wait {attempt}/{limit}). Send a message to go on sooner.",
+                        format_elapsed(delay.as_secs())
                     ),
                 ));
                 return vec![];
@@ -6723,7 +6755,16 @@ impl App {
     }
 
     pub(crate) fn goal_checkin_due(&self) -> bool {
-        (self.goal_deferred || self.autopilot_checkin_due) && self.state.goal.snapshot().is_some()
+        (self.goal_deferred || self.autopilot_checkin_due || self.state.goal.wait_over())
+            && self.state.goal.snapshot().is_some()
+    }
+
+    /// The goal waits on an outside change, and its check-in is still to come.
+    pub(crate) fn goal_waits(&self) -> bool {
+        self.state
+            .goal
+            .wait_left()
+            .is_some_and(|left| !left.is_zero())
     }
 
     pub(crate) fn attention(&self) -> Option<Notification> {

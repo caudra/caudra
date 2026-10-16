@@ -106,6 +106,8 @@ Approving switches to build mode and starts a turn that implements the plan, as 
 | Stall | Without autopilot | With autopilot |
 |-------|-------------------|----------------|
 | Goal loop cap | The run ends and the goal stays | The delegate reviews the progress and continues with guidance, or leaves it to you |
+| A goal makes no progress for three turns in a row | The run ends and the goal stays | The same review. A continue buys one more turn, so the next turn without progress is reviewed again |
+| A goal waits on a change outside the session | The run ends and the goal is checked again after 1, 2, 4, 8, and 16 minutes, then every 30 minutes, for eight waits | No review until the waits run out, which is the stall above |
 | `max_turns` reached | The run ends | The same review |
 | Steering exhausted on unusable output | The run fails | The same review |
 | The evaluator says the goal is impossible | The goal finishes | The delegate gives one second opinion for each goal. It agrees, or continues the work with guidance |

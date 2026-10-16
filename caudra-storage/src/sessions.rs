@@ -338,6 +338,19 @@ pub struct StoredActiveGoal {
     pub last_verdict: Option<StoredGoalVerdict>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_reason: Option<String>,
+    /// The goal's wait on a change outside the session, `None` while it is
+    /// not waiting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<StoredGoalWait>,
+}
+
+/// A goal's wait on a change outside the session: its `attempt`th in a row,
+/// over at `until_ms`, Unix milliseconds. Wall-clock time, so a session closed
+/// past it checks its goal as soon as it is resumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredGoalWait {
+    pub attempt: u32,
+    pub until_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

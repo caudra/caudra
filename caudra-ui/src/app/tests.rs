@@ -107,9 +107,9 @@ use caudra_storage::plans::PlanFile;
 use caudra_storage::prompt_stash::{PromptStash, StashEntry};
 use caudra_storage::sessions::{
     PermissionMode, SessionLocation, SessionMeta, StoredActiveGoal, StoredAutomationControls,
-    StoredGoalVerdict, StoredImage, StoredInboundPolicy, StoredMode, StoredPasteRange,
-    StoredPeerControls, StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt,
-    StoredSubagent, StoredSubagentOutcome, StoredTokenUsage, UnrecordedCall,
+    StoredGoalVerdict, StoredGoalWait, StoredImage, StoredInboundPolicy, StoredMode,
+    StoredPasteRange, StoredPeerControls, StoredPromptAdmission, StoredQueuedDraft,
+    StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome, StoredTokenUsage, UnrecordedCall,
 };
 use caudra_storage::state::{self as stored_state, SCOPE_GLOBAL, StateKey};
 use caudra_storage::thinking::StoredThinking;
@@ -13315,6 +13315,7 @@ fn goal_loop_cap_notice_separates_run_continuations_from_total_evaluations() {
         evaluations: 23,
         continuations: 16,
         limit: 16,
+        autopilot_owned: false,
     }));
 
     assert_eq!(
@@ -13633,6 +13634,60 @@ fn deferred_goal_builds_an_automatic_checkin() {
     assert!(!app.goal_checkin_due());
 }
 
+/// A wait is saved with the goal on wall-clock time, so a session resumed
+/// before it is over keeps waiting, and one resumed after checks in at once.
+#[test_case(u64::MAX, false ; "resumed_before_the_wait_is_over")]
+#[test_case(0, true ; "resumed_after_the_wait_is_over")]
+fn a_resumed_waiting_goal_checks_in_once_its_wait_is_over(until_ms: u64, due: bool) {
+    const WAIT_OVER: &str = "the wait is over";
+    const WAIT_SURVIVES: &str = "a goal's wait must survive a resume";
+    let mut app = test_app();
+    app.state.session_mut().meta.active_goal = Some(Box::new(StoredActiveGoal {
+        goal: 1,
+        set_at_ms: 0,
+        condition: GOAL_CONDITION.into(),
+        evaluations: 1,
+        elapsed_ms: 0,
+        usage: StoredTokenUsage::default(),
+        last_verdict: Some(StoredGoalVerdict::NotMet),
+        last_reason: None,
+        wait: Some(StoredGoalWait {
+            attempt: 1,
+            until_ms,
+        }),
+    }));
+    let model = app.state.model.clone();
+    let mut resumed = test_app();
+    resumed.state = SessionState::from_session(
+        Arc::unwrap_or_clone(app.state.session),
+        &model,
+        &resumed.storage,
+        &resumed.model_policy,
+        Mode::Plan,
+    );
+
+    assert_eq!(resumed.goal_waits(), !due, "{WAIT_SURVIVES}");
+    assert_eq!(resumed.goal_checkin_due(), due, "{WAIT_SURVIVES}");
+    if !due {
+        return;
+    }
+    let actions = resumed.start_goal_checkin();
+    let input = actions
+        .iter()
+        .find_map(|action| match action {
+            Action::SendMessage(input) => Some(input),
+            _ => None,
+        })
+        .expect("the wait's end should start a run");
+    assert!(input.preamble.iter().any(|message| {
+        message
+            .first_text_content()
+            .is_some_and(|text| text.contains(WAIT_OVER))
+    }));
+    assert!(!resumed.goal_checkin_due());
+    assert!(resumed.state.goal.wait().is_none());
+}
+
 #[test]
 fn active_goal_round_trips_through_session_metadata() {
     let continuation_limit = 24;
@@ -13689,6 +13744,7 @@ fn a_resumed_active_goal_keeps_its_spend_evaluations_and_clock() {
         },
         last_verdict: Some(StoredGoalVerdict::NotMet),
         last_reason: Some(GOAL_REASON.into()),
+        wait: None,
     }));
 
     let model = app.state.model.clone();
@@ -16176,6 +16232,7 @@ fn fork_copies_execution_settings_but_resets_conversation_state() {
         usage: StoredTokenUsage::default(),
         last_verdict: None,
         last_reason: None,
+        wait: None,
     }));
     let items = crate::history_items(&[Message::user("prompt".into())]);
     let source = DisplaySource::User(items[0].id);

@@ -672,6 +672,7 @@ impl SessionRuntime {
             self.app
                 .goal_checkin_due()
                 .then_some(SettleBlocker::GoalCheckin),
+            self.app.goal_waits().then_some(SettleBlocker::GoalWaiting),
             (!self.handles.agent_rx.is_empty()).then_some(SettleBlocker::AgentEvents),
         ]
         .into_iter()

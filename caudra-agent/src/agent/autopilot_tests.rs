@@ -1526,6 +1526,88 @@ mod autopilot_tests {
         });
     }
 
+    /// A continue buys the stalled goal one turn, never a fresh count, so the
+    /// next turn without progress is put to the delegate again.
+    #[test_case(Some(CONTINUE_VERDICT), true ; "goes_on")]
+    #[test_case(Some(ESCALATE_VERDICT), false ; "escalate")]
+    #[test_case(None, false ; "not_engaged")]
+    fn a_stalled_goal_review_goes_on_for_one_turn_or_stops_the_run(
+        verdict: Option<&str>,
+        continues: bool,
+    ) {
+        smol::block_on(async {
+            let handle = AutopilotHandle::default();
+            if verdict.is_some() {
+                handle.engage(false, None);
+            }
+            let mut responses = vec![assistant_response(vec![ContentBlock::Text {
+                text: json!({
+                    "ok": false,
+                    "reason": DECISION_VERDICT,
+                    "impossible": false,
+                    "progress": false,
+                })
+                .to_string(),
+            }])];
+            responses.extend(verdict.map(answer));
+            let mut history = History::default();
+            let (agent, events) = make_agent(MockProvider::new(responses), &mut history);
+            let mut agent = agent.with_autopilot(handle.clone());
+            let generation = agent.goal.set(DECISION_GOAL).unwrap().generation;
+            let stuck = GoalTurn {
+                judgement: Some(Judgement {
+                    progressed: false,
+                    waiting: false,
+                }),
+                ..GoalTurn::default()
+            };
+            for _ in 1..MAX_STALLED_TURNS {
+                agent.goal.record_turn(generation, &stuck);
+            }
+            let goal = agent.goal.clone();
+
+            let outcome = agent.goal_completion(DoneReason::EndTurn).await.unwrap();
+            drop(agent);
+
+            let events = drain_events(&events);
+            assert_eq!(
+                asked_kinds(&events),
+                verdict
+                    .map(|_| DecisionKind::Review)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                matches!(outcome, TurnOutcome::Continue),
+                continues,
+                "{STALL_REVIEWED}"
+            );
+            assert_eq!(
+                count(&events, |event| matches!(
+                    event,
+                    AgentEvent::GoalStalled { .. }
+                )),
+                usize::from(!continues),
+                "{STALL_REVIEWED}"
+            );
+            assert_eq!(
+                written(&history, AutopilotMessageKind::Guidance),
+                guidance_if(continues),
+                "{STALL_REVIEWED}"
+            );
+            assert!(goal.snapshot().is_some(), "{STALL_REVIEWED}");
+            if continues {
+                assert_eq!(
+                    goal.record_turn(generation, &stuck),
+                    GoalPace::Stalled {
+                        turns: MAX_STALLED_TURNS
+                    },
+                    "{STALL_REVIEWED}"
+                );
+            }
+        });
+    }
+
     #[test_case(CONTINUE_VERDICT, true ; "goes_on")]
     #[test_case(ESCALATE_VERDICT, false ; "escalate")]
     fn a_turn_limit_review_rearms_the_turns_or_stops_the_run(verdict: &str, continues: bool) {

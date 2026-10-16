@@ -135,6 +135,10 @@ Caudra defers evaluation while tracked background agents are running and starts 
 
 Sixteen automatic continuations are allowed in one query by default. The `/goal` panel accepts a session-only limit from 0 through 100. When that safety cap or the configured turn limit is reached, Caudra returns control with the goal still active and reports this-run continuations separately from total evaluations. Send another message to resume. Evaluator errors also leave the goal active. Authentication, billing, context-limit, and unavailable-model errors clear it when retrying cannot recover.
 
+A run also stops when its goal makes no progress for three turns in a row: the evaluator saw nothing new, a turn repeated an earlier one exactly, or the agent stopped to ask you something. Progress is read from the conversation, so work on a remote system counts once a tool result shows it. The goal stays active, and a message from you resumes it.
+
+When the evaluator sees the goal waiting on something outside the session that changes by itself, such as a CI run or a deploy, the run ends instead and the goal is checked again later: after a minute, then twice as long each time, up to 30 minutes, for eight waits (about two hours). A turn that moves the goal resets the waits. After the eighth wait, the goal stalls as above. Waiting on you never counts as waiting: a question to you still counts toward the stall at once. A message from you ends the wait early. The wait is saved with the session, so a resumed session checks the goal when the wait is over, or right away if it already is.
+
 One-shot headless mode accepts the same form:
 
 ```bash

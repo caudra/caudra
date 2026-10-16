@@ -71,8 +71,9 @@ use crate::agent::{self, History};
 use crate::automation::catalog::Frontend;
 use crate::automation::clock::{Clock, SystemClock};
 use crate::automation::frontend::{
-    SessionSignals, autopilot_view, claim_next, delivery_due, goal_finished, launch_armings,
-    mode_name, run_end, saved_controls, set_claimed_goal, stop_runtime, wake_origin,
+    SessionSignals, autopilot_view, claim_next, delivery_due, goal_finished, goal_stalled,
+    launch_armings, mode_name, run_end, saved_controls, set_claimed_goal, stop_runtime,
+    wake_origin,
 };
 use crate::automation::handle::AutomationHandle;
 use crate::automation::http::HttpClient;
@@ -2152,6 +2153,17 @@ impl GoalDeferral {
     }
 }
 
+/// Resolves once `goal`'s wait on an outside change is over, never while it
+/// is not waiting or already over.
+async fn goal_wait_over(goal: &GoalHandle) {
+    match goal.wait_left().filter(|left| !left.is_zero()) {
+        Some(left) => {
+            smol::Timer::after(left).await;
+        }
+        None => futures_lite::future::pending().await,
+    }
+}
+
 /// The plan autopilot chose to implement, as the event stream reports it.
 #[derive(Default)]
 struct PlanHandoff(StdMutex<HandoffState>);
@@ -2271,10 +2283,12 @@ fn record_subagent_autopilot_spend(
 }
 
 /// Resolves once `due` holds, looking again whenever an event is forwarded,
-/// background work changes, or the last foreground task ends.
+/// background work changes, the last foreground task ends, or the goal's wait
+/// is over.
 async fn until_due(
     due: impl Fn() -> bool,
     deferral: &GoalDeferral,
+    goal: &GoalHandle,
     background: Option<&BackgroundTasks>,
     tasks: &CancelMap<String>,
 ) {
@@ -2285,12 +2299,15 @@ async fn until_due(
             return;
         }
         futures_lite::future::or(
-            futures_lite::future::or(forwarded, async {
-                match background_changed {
-                    Some(changed) => changed.await,
-                    None => futures_lite::future::pending().await,
-                }
-            }),
+            futures_lite::future::or(
+                futures_lite::future::or(forwarded, goal_wait_over(goal)),
+                async {
+                    match background_changed {
+                        Some(changed) => changed.await,
+                        None => futures_lite::future::pending().await,
+                    }
+                },
+            ),
             async {
                 if tasks.active_count() == 0 {
                     futures_lite::future::pending::<()>().await;
@@ -2540,6 +2557,14 @@ impl SessionAutomations {
                     tally.signals.observe_goal(goal.snapshot());
                     None
                 }
+                AgentEvent::GoalStalled {
+                    autopilot_owned, ..
+                }
+                | AgentEvent::GoalLoopCap {
+                    autopilot_owned, ..
+                } => goal
+                    .snapshot()
+                    .map(|goal| goal_stalled(&goal, *autopilot_owned)),
                 AgentEvent::Injected {
                     automation_event: Some(origin),
                     ..
@@ -3349,6 +3374,28 @@ async fn spawn_prepared_session(
         ),
         None => (None, None),
     };
+    // The mode a goal's check-in starts in once its wait is over, when no
+    // prompt set the session's mode since it was resumed.
+    let wait_fallback = autopilot_fallback
+        .clone()
+        .or_else(|| {
+            params
+                .automations
+                .as_ref()
+                .filter(|_| params.config.features.enabled(Feature::Automations))
+                .map(|automations| {
+                    (
+                        routed_mode(&mode_route, Arc::clone(&automations.mode)),
+                        automations.fast,
+                    )
+                })
+        })
+        .or_else(|| {
+            params
+                .workflow_mode
+                .clone()
+                .map(|mode| (routed_mode(&mode_route, mode), false))
+        });
     let pending_automations = params
         .automations
         .take()
@@ -3704,16 +3751,20 @@ async fn spawn_prepared_session(
                     Automation,
                 }
                 // The TUI's check-in rule: the last run deferred its goal
-                // evaluation, or a resumed engagement owes one, the goal is
-                // still active, nothing stopped the session since, no prompt
-                // waits, and the work it deferred behind has settled.
+                // evaluation, a resumed engagement owes one, or the goal's
+                // wait on an outside change is over, the goal is still active,
+                // nothing stopped the session since, no prompt waits, and the
+                // work it deferred behind has settled.
                 let checkin_due = || {
                     (resumed_checkin
+                        || goal.wait_over()
                         || run_id
                             .checked_sub(1)
                             .is_some_and(|last| goal_deferral.deferred(last)))
                         && mode_route.control_epoch.load(Ordering::Acquire) == run_epoch
-                        && (continuation.is_some() || resumed_checkin)
+                        && (continuation.is_some()
+                            || resumed_checkin
+                            || (goal.wait_over() && wait_fallback.is_some()))
                         && input_rx.is_empty()
                         && goal.snapshot().is_some()
                         && !SessionWork::capture(
@@ -3722,6 +3773,10 @@ async fn spawn_prepared_session(
                             base.subagent_cancels.active_count(),
                         )
                         .pending()
+                };
+                let goal_waits = || {
+                    goal.wait_left().is_some_and(|left| !left.is_zero())
+                        && mode_route.control_epoch.load(Ordering::Acquire) == run_epoch
                 };
                 // The plan the last run's review chose to implement, while
                 // autopilot is still engaged, nothing stopped the session
@@ -3760,6 +3815,8 @@ async fn spawn_prepared_session(
                             (wakes_deliver && completions).then_some(SettleBlocker::MailboxWake),
                             ((background_enabled || resumed_checkin) && checkin_due())
                                 .then_some(SettleBlocker::GoalCheckin),
+                            (background_enabled && goal_waits())
+                                .then_some(SettleBlocker::GoalWaiting),
                         ]
                         .into_iter()
                         .flatten()
@@ -3783,6 +3840,7 @@ async fn spawn_prepared_session(
                             until_due(
                                 || !automations.running(),
                                 &goal_deferral,
+                                &goal,
                                 background.as_ref(),
                                 &base.subagent_cancels,
                             )
@@ -3825,6 +3883,7 @@ async fn spawn_prepared_session(
                                                                 && checkin_due())
                                                     },
                                                     &goal_deferral,
+                                                    &goal,
                                                     background.as_ref(),
                                                     &base.subagent_cancels,
                                                 )
@@ -3859,6 +3918,7 @@ async fn spawn_prepared_session(
                                                             ))
                                                         },
                                                         &goal_deferral,
+                                                        &goal,
                                                         background.as_ref(),
                                                         &base.subagent_cancels,
                                                     ),
@@ -3912,6 +3972,7 @@ async fn spawn_prepared_session(
                     }
                     NextInput::Stop => {
                         mode_route.control_epoch.fetch_add(1, Ordering::AcqRel);
+                        goal.end_wait();
                         stop_session_work(background.as_ref(), workflow.as_ref()).await;
                         continue;
                     }
@@ -3929,21 +3990,26 @@ async fn spawn_prepared_session(
                         automatic_input(continuation, Vec::new())
                     }
                     NextInput::GoalCheckin => {
+                        let deferred = run_id
+                            .checked_sub(1)
+                            .is_some_and(|last| goal_deferral.deferred(last));
+                        let waited = goal.wait_over() && !deferred;
                         let resumed = autopilot_fallback
                             .as_ref()
                             .filter(|_| autopilots_run)
+                            .or(wait_fallback.as_ref().filter(|_| waited))
                             .map(|(mode, fast)| (mode(), params.thinking.clone(), *fast));
                         let (Some(continuation), Some(active)) =
                             (continuation.clone().or(resumed), goal.snapshot())
                         else {
                             continue;
                         };
-                        automatic_input(
-                            &continuation,
-                            vec![Message::synthetic(agent::goal_checkin_message(
-                                &active.condition,
-                            ))],
-                        )
+                        let checkin = if waited {
+                            agent::goal_wait_message(&active.condition)
+                        } else {
+                            agent::goal_checkin_message(&active.condition)
+                        };
+                        automatic_input(&continuation, vec![Message::synthetic(checkin)])
                     }
                     NextInput::Implement => {
                         let (Some(continuation), Some((seq, plan))) = (

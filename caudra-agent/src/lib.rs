@@ -36,8 +36,8 @@ pub use agent::{
     History, HistorySnapshot, InstructionBaseline, InstructionSource, Instructions,
     LoadedInstructions, MAX_GOAL_CHARS, MAX_GOAL_CONTINUATION_LIMIT, ProjectedHistory,
     SharedHistory, UNAVAILABLE_RESULT, find_subdirectory_instructions, goal_checkin_message,
-    goal_kickoff_message, is_instruction_file, is_run_failure_marker, project_for_inspection,
-    project_request, stored_todos,
+    goal_kickoff_message, goal_wait_message, is_instruction_file, is_run_failure_marker,
+    project_for_inspection, project_request, stored_todos,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
 pub use caudra_config::{AgentConfig, PermissionsConfig, ToolOutputLines};
