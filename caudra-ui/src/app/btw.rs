@@ -13,7 +13,9 @@ use futures_lite::future;
 
 use crate::agent::BtwPrompt;
 use crate::components::prompt_progress::PromptProgress;
-use crate::components::stream_modal::{StreamDone, StreamEvent, StreamFooter, StreamUsage};
+use crate::components::stream_modal::{
+    QUESTION_PREFIX, StreamDone, StreamEvent, StreamFooter, StreamUsage,
+};
 use crate::components::{DisplayMessage, DisplayRole};
 
 use super::{App, HISTORY_UNREADABLE};
@@ -293,7 +295,7 @@ impl App {
         let (trigger, cancel) = CancelToken::new();
         self.stream_modal.open(
             TITLE,
-            format!("Q: {question}"),
+            format!("{QUESTION_PREFIX}{question}"),
             StreamFooter::FollowUp,
             rx,
             trigger,
@@ -328,7 +330,7 @@ impl App {
         let (tx, rx) = flume::bounded(64);
         let (trigger, cancel) = CancelToken::new();
         self.stream_modal
-            .begin_exchange(format!("Q: {question}"), rx, trigger);
+            .begin_exchange(format!("{QUESTION_PREFIX}{question}"), rx, trigger);
         self.spawn_btw(tx, cancel);
     }
 

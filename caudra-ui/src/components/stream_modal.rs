@@ -4,6 +4,9 @@ use std::time::{Duration, Instant};
 use crate::animation::{live_elapsed, spinner_str};
 use crate::components::ModalScroll;
 use crate::components::Overlay;
+use crate::components::messages::{
+    ASSISTANT_HEADING, ERROR_HEADING, THINKING_HEADING, USER_HEADING, append_selection_section,
+};
 use crate::components::modal::{ESC_LABEL, FooterHits, FooterLine, Modal};
 use crate::components::prompt_progress::{self, PromptProgress, PromptRate};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
@@ -28,6 +31,12 @@ use crate::provenance::Provenance;
 use crate::repaint::{Cadence, Dirty};
 
 const H_PAD: u16 = 2;
+/// What a `/btw` exchange's header puts before the question it asks.
+pub(crate) const QUESTION_PREFIX: &str = "Q: ";
+/// Over a copied clarification thread's context, the question form it is about.
+const CONTEXT_HEADING: &str = "Question form";
+/// Over a copied header that names no question, such as `/extract`'s.
+const REQUEST_HEADING: &str = "Request";
 const WIDTH_PERCENT: u16 = 65;
 const MAX_HEIGHT_PERCENT: u16 = 80;
 pub(crate) const COPY_LABEL: &str = "y";
@@ -213,12 +222,24 @@ struct StreamSection {
 }
 
 /// One question and the answer streaming under it.
-/// The rows of the thread one section painted, so a sweep over them can be
-/// traced back to the Markdown it was rendered from.
-struct SectionRows {
+/// What one run of the thread's rows shows, which is what a sweep over it is
+/// copied under.
+#[derive(Clone, Copy)]
+enum PartKind {
+    /// The question form a clarification thread is about.
+    Context,
+    /// An exchange's header: the question asked, where it names one.
+    Header,
+    /// One of an exchange's sections, by index.
+    Section(usize),
+}
+
+/// The rows of the thread one part painted, so a sweep over them can be
+/// traced back to what they were rendered from.
+struct ThreadPart {
     rows: Range<usize>,
     exchange: usize,
-    section: usize,
+    kind: PartKind,
 }
 
 struct Exchange {
@@ -337,7 +358,7 @@ pub struct StreamModal {
     /// The thread's lines as the last frame wrapped them into `viewport`,
     /// which is what a press is read back against.
     body: Vec<Line<'static>>,
-    sections: Vec<SectionRows>,
+    parts: Vec<ThreadPart>,
     viewport: Rect,
     sweep: Option<Sweep>,
     /// Between a press on the thread and its release.
@@ -365,7 +386,7 @@ impl StreamModal {
             queued: None,
             popup: Rect::default(),
             body: Vec::new(),
-            sections: Vec::new(),
+            parts: Vec::new(),
             viewport: Rect::default(),
             sweep: None,
             sweeping: false,
@@ -454,7 +475,7 @@ impl StreamModal {
         self.footer_hits.reset();
         self.queued = None;
         self.body.clear();
-        self.sections.clear();
+        self.parts.clear();
         self.sweep = None;
         self.sweeping = false;
         self.finish_stream();
@@ -660,50 +681,122 @@ impl StreamModal {
         )
     }
 
-    /// What the sweep covers: the Markdown behind the rows a section can trace
-    /// back to it, as a sweep over the transcript copies, and the text drawn
-    /// everywhere else.
+    /// What the sweep covers, copied as a sweep over the transcript copies:
+    /// the text of one part as it is, and a sweep over several as a Markdown
+    /// document with a section for each, under the headings the transcript
+    /// uses. An answer's section is its Markdown wherever its rows can trace
+    /// it.
     fn swept(&self) -> Option<String> {
         let sweep = self.sweep.filter(|sweep| !sweep.is_empty())?;
         let (start, end) = sweep.ordered();
-        let mut pieces = Vec::new();
-        let mut row = start.0;
-        while row <= end.0 && row < self.body.len() {
-            let section = self
-                .sections
-                .iter()
-                .find(|section| section.rows.contains(&row));
-            let rows = section.map_or(row..row + 1, |section| section.rows.clone());
-            let last = end.0.min(rows.end - 1);
-            let from = (row, if row == start.0 { start.1 } else { 0 });
-            let to = (last, if last == end.0 { end.1 } else { usize::MAX });
-            let source = section
-                .and_then(|section| self.provenance(section))
-                .and_then(|provenance| {
-                    provenance.extract_rows(
-                        &self.body[rows.clone()],
-                        (from.0 - rows.start, from.1),
-                        (to.0 - rows.start, to.1),
-                    )
-                })
-                .filter(|source| !source.is_empty());
-            let piece = source.unwrap_or_else(|| {
-                let mut covered = Sweep::at(from);
-                covered.drag_to(to);
-                sweep::swept_text(&self.body, covered).unwrap_or_default()
-            });
-            pieces.push(piece);
-            row = last + 1;
-        }
-        let text = pieces.join("\n");
+        let covered: Vec<_> = self
+            .parts
+            .iter()
+            .filter(|part| part.rows.start <= end.0 && part.rows.end > start.0)
+            .map(|part| {
+                let from = start.max((part.rows.start, 0));
+                let to = end.min((part.rows.end - 1, usize::MAX));
+                (part, from, to)
+            })
+            .collect();
+        let text = match covered.as_slice() {
+            [] => return None,
+            [(part, from, to)] => self.part_text(part, *from, *to)?,
+            _ => {
+                let mut document = String::new();
+                for &(part, from, to) in &covered {
+                    self.append_part(&mut document, part, from, to);
+                }
+                document
+            }
+        };
         (!text.is_empty()).then_some(text)
     }
 
-    fn provenance(&self, rows: &SectionRows) -> Option<&Provenance> {
+    /// The rows of `part` from `from` up to `to`, as their source where they
+    /// trace one and as drawn otherwise.
+    fn part_text(
+        &self,
+        part: &ThreadPart,
+        from: (usize, usize),
+        to: (usize, usize),
+    ) -> Option<String> {
+        let source = match part.kind {
+            PartKind::Section(section) => self
+                .provenance(part.exchange, section)
+                .and_then(|provenance| {
+                    provenance.extract_rows(
+                        &self.body[part.rows.clone()],
+                        (from.0 - part.rows.start, from.1),
+                        (to.0 - part.rows.start, to.1),
+                    )
+                })
+                .filter(|source| !source.is_empty()),
+            PartKind::Context | PartKind::Header => None,
+        };
+        source.or_else(|| {
+            let mut covered = Sweep::at(from);
+            covered.drag_to(to);
+            sweep::swept_text(&self.body, covered)
+        })
+    }
+
+    fn append_part(
+        &self,
+        document: &mut String,
+        part: &ThreadPart,
+        from: (usize, usize),
+        to: (usize, usize),
+    ) {
+        let exchange = &self.exchanges[part.exchange];
+        let (heading, body, fenced) = match part.kind {
+            PartKind::Context => (
+                CONTEXT_HEADING,
+                self.part_text(part, from, to).unwrap_or_default(),
+                true,
+            ),
+            PartKind::Header => {
+                let (heading, lead) = match exchange.header.strip_prefix(QUESTION_PREFIX) {
+                    Some(_) => (USER_HEADING, QUESTION_PREFIX.chars().count()),
+                    None => (REQUEST_HEADING, 0),
+                };
+                let header: Vec<char> = exchange.header.chars().collect();
+                let range = from.1.max(lead)..to.1.min(header.len());
+                let body = header
+                    .get(range)
+                    .map_or_else(String::new, String::from_iter);
+                (heading, body, false)
+            }
+            PartKind::Section(section) => {
+                let heading = match exchange.sections[section].kind {
+                    SectionKind::Text => ASSISTANT_HEADING,
+                    SectionKind::Thinking => THINKING_HEADING,
+                    SectionKind::Error => ERROR_HEADING,
+                };
+                let fenced = exchange.sections[section].kind == SectionKind::Error;
+                (
+                    heading,
+                    self.part_text(part, from, to).unwrap_or_default(),
+                    fenced,
+                )
+            }
+        };
+        append_selection_section(
+            document,
+            heading,
+            None,
+            &body,
+            fenced,
+            None,
+            self.viewport.width,
+        );
+    }
+
+    fn provenance(&self, exchange: usize, section: usize) -> Option<&Provenance> {
         self.exchanges
-            .get(rows.exchange)?
+            .get(exchange)?
             .sections
-            .get(rows.section)?
+            .get(section)?
             .body
             .provenance()
     }
@@ -880,19 +973,29 @@ impl StreamModal {
         let padded_width = Modal::inner_width(area.width, WIDTH_PERCENT).saturating_sub(H_PAD * 2);
 
         let mut lines: Vec<Line<'static>> = Vec::new();
-        let mut sections = Vec::new();
+        let mut parts = Vec::new();
         if let Some(context) = &self.context {
             lines.extend(
                 context
                     .lines()
                     .map(|line| Line::styled(line.to_owned(), theme.tool_dim)),
             );
+            parts.push(ThreadPart {
+                rows: 0..lines.len(),
+                exchange: 0,
+                kind: PartKind::Context,
+            });
             lines.push(Line::default());
         }
         for (index, exchange) in self.exchanges.iter_mut().enumerate() {
             if index > 0 {
                 lines.push(Line::default());
             }
+            parts.push(ThreadPart {
+                rows: lines.len()..lines.len() + 1,
+                exchange: index,
+                kind: PartKind::Header,
+            });
             lines.push(Line::from(vec![
                 Span::styled(exchange.header.clone(), theme.tool_dim),
                 Span::styled(exchange.suffix(), theme.tool_dim),
@@ -912,10 +1015,10 @@ impl StreamModal {
                     }
                     lines.push(line);
                 }
-                sections.push(SectionRows {
+                parts.push(ThreadPart {
                     rows: first..lines.len(),
                     exchange: index,
-                    section: section_index,
+                    kind: PartKind::Section(section_index),
                 });
             }
         }
@@ -963,7 +1066,7 @@ impl StreamModal {
         let scroll = self.scroll.offset();
         frame.render_widget(paragraph.scroll((scroll, 0)), viewport);
         self.body = lines;
-        self.sections = sections;
+        self.parts = parts;
         self.viewport = viewport;
 
         self.scrollbar.draw(
@@ -2609,6 +2712,73 @@ mod tests {
         );
         m.close();
         assert!(m.sweep.is_none() && m.body.is_empty());
+    }
+
+    const QUESTION: &str = "why?";
+    const THOUGHT: &str = "pondering";
+    const ACROSS_TURNS_WRONG: &str =
+        "a sweep over several parts must copy as the transcript does, a section for each";
+
+    #[test]
+    fn a_sweep_from_the_question_into_the_answer_copies_a_section_for_each() {
+        let (mut m, terminal, _tx) = answered(StreamFooter::Close);
+        let header = cell_of(&terminal, HEADER);
+        let last = cell_of(&terminal, LAST_WORD);
+
+        let action = sweep(&mut m, header, after(last, LAST_WORD));
+
+        let expected = format!(
+            "## {USER_HEADING}\n\n{QUESTION}\n\n---\n\n## {ASSISTANT_HEADING}\n\n{WRAPPED_ANSWER}"
+        );
+        assert!(
+            matches!(&action, StreamAction::CopySelection(text) if *text == expected),
+            "{ACROSS_TURNS_WRONG}"
+        );
+    }
+
+    #[test]
+    fn thinking_and_errors_copy_under_their_own_headings() {
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::Close);
+        tx.send(StreamEvent::ThinkingDelta(THOUGHT.into())).unwrap();
+        tx.send(StreamEvent::TextDelta(ANSWER.into())).unwrap();
+        tx.send(done()).unwrap();
+        let _ = m.poll();
+        let (tx, _cancel) = follow_up(&mut m, FOLLOW_UP);
+        tx.send(StreamEvent::Error(ERROR.into())).unwrap();
+        let _ = m.poll();
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        draw(&mut m, &mut terminal);
+        let thought = cell_of(&terminal, THOUGHT);
+        let error = cell_of(&terminal, ERROR);
+
+        let action = sweep(&mut m, thought, after(error, ERROR));
+
+        let StreamAction::CopySelection(text) = action else {
+            panic!("{ACROSS_TURNS_WRONG}");
+        };
+        let headings: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("## "))
+            .collect();
+        assert_eq!(
+            headings,
+            [
+                THINKING_HEADING,
+                ASSISTANT_HEADING,
+                USER_HEADING,
+                ERROR_HEADING
+            ],
+            "{ACROSS_TURNS_WRONG}"
+        );
+        assert!(
+            text.contains(THOUGHT) && text.contains(ANSWER),
+            "{ACROSS_TURNS_WRONG}"
+        );
+        assert!(
+            text.contains(&format!("\n{ERROR}\n```")),
+            "an error is fenced: {text:?}"
+        );
     }
 
     #[test]

@@ -89,6 +89,12 @@ use ratatui::text::{Line, Span};
 use tracing::warn;
 
 /// The actions glyph is a bare `⋮`, so its tooltip names what is behind it.
+/// The headings a copied selection names the turns it covers under.
+pub(crate) const USER_HEADING: &str = "User";
+pub(crate) const ASSISTANT_HEADING: &str = "Assistant";
+pub(crate) const THINKING_HEADING: &str = "Thinking";
+pub(crate) const ERROR_HEADING: &str = "Error";
+
 const MESSAGE_ACTION_TIP: &str = "Message actions: review, fork or revert from here";
 const THOUGHT_PREFIX: &str = "Thought";
 const INJECTED_FALLBACK_TITLE: &str = "injected message";
@@ -658,6 +664,61 @@ fn fenced_text(text: &str, language: Option<&str>) -> String {
     let newline = if text.ends_with('\n') { "" } else { "\n" };
     let language = language.unwrap_or(PLAIN_FENCE_LANGUAGE);
     format!("{delimiter}{language}\n{text}{newline}{delimiter}")
+}
+
+/// Appends one section of a copied selection, under `heading`, to the
+/// Markdown document a sweep over several parts of a transcript copies as.
+/// `language` names the fence when the body is one language's source, and is
+/// ignored when the body is not fenced at all. `width` is what an unfenced
+/// body whose blocks cannot be closed is rendered at instead.
+pub(crate) fn append_selection_section(
+    document: &mut String,
+    heading: &str,
+    metadata: Option<&str>,
+    body: &str,
+    fenced: bool,
+    language: Option<&str>,
+    width: u16,
+) {
+    if !document.is_empty() {
+        document.push_str("\n\n---\n\n");
+    }
+    document.push_str("## ");
+    document.push_str(heading);
+    if let Some(metadata) = metadata {
+        document.push_str("\n\n_");
+        document.push_str(metadata);
+        document.push('_');
+    }
+    if body.is_empty() {
+        return;
+    }
+    document.push_str("\n\n");
+    if fenced {
+        document.push_str(&fenced_text(body, language));
+    } else {
+        let caudra_block = unclosed_caudra_fenced_block(body);
+        let commonmark_block = unclosed_markdown_block(body);
+        if caudra_block != commonmark_block {
+            // Conflicting parser states have no shared invisible closer.
+            document.push_str(&fenced_text(&rendered_markdown_text(body, width), language));
+        } else {
+            document.push_str(body);
+        }
+        if let Some(block) = caudra_block.filter(|_| caudra_block == commonmark_block) {
+            if !document.ends_with('\n') {
+                document.push('\n');
+            }
+            match block {
+                MarkdownBlock::Fence(marker, run) => {
+                    document.extend(std::iter::repeat_n(marker, run));
+                }
+                MarkdownBlock::Html(closing) => document.push_str(closing),
+                MarkdownBlock::Math(closing) => document.push_str(closing),
+                MarkdownBlock::HtmlBlankLine => {}
+            }
+        }
+    }
 }
 
 fn rendered_markdown_text(text: &str, width: u16) -> String {
@@ -4773,7 +4834,7 @@ impl MessagesPanel {
                 .msg_index
                 .and_then(|index| self.messages.get(index));
             let (heading, metadata, body, fenced) = match fragment.kind {
-                SegmentKind::User => ("User".to_owned(), None, fragment.text.as_str(), false),
+                SegmentKind::User => (USER_HEADING.to_owned(), None, fragment.text.as_str(), false),
                 SegmentKind::TaskDelivery => (
                     "Task delivery".to_owned(),
                     None,
@@ -4800,7 +4861,12 @@ impl MessagesPanel {
                             fragment.text.as_str(),
                             false,
                         ),
-                        None => ("Assistant".to_owned(), None, fragment.text.as_str(), false),
+                        None => (
+                            ASSISTANT_HEADING.to_owned(),
+                            None,
+                            fragment.text.as_str(),
+                            false,
+                        ),
                     }
                 }
                 SegmentKind::Thinking => {
@@ -4814,7 +4880,7 @@ impl MessagesPanel {
                         None => reasoning_summary(self.streaming_thinking.buffer()),
                     };
                     let heading = summary.title.map_or_else(
-                        || "Thinking".to_owned(),
+                        || THINKING_HEADING.to_owned(),
                         |title| format!("Thinking: {}", markdown_inline(title)),
                     );
                     let duration = match message {
@@ -4879,84 +4945,33 @@ impl MessagesPanel {
                     // a language, and that still gets a fence of its own.
                     let fenced =
                         fragment.language.is_some() || !names_tool(BATCH_TOOL_NAME, tool_name);
-                    self.append_selection_section(
+                    append_selection_section(
                         &mut document,
                         &heading,
                         Some(&metadata),
                         fragment.text.as_str(),
                         fenced,
                         fragment.language.as_deref(),
+                        self.viewport_width,
                     );
                     continue;
                 }
-                SegmentKind::Error => ("Error".to_owned(), None, fragment.text.as_str(), true),
+                SegmentKind::Error => {
+                    (ERROR_HEADING.to_owned(), None, fragment.text.as_str(), true)
+                }
                 SegmentKind::Done => ("Done".to_owned(), None, fragment.text.as_str(), true),
             };
-            self.append_selection_section(
+            append_selection_section(
                 &mut document,
                 &heading,
                 metadata.as_deref(),
                 body,
                 fenced,
                 None,
+                self.viewport_width,
             );
         }
         document
-    }
-
-    /// `language` names the fence when the body is one language's source, and
-    /// is ignored when the body is not fenced at all.
-    fn append_selection_section(
-        &self,
-        document: &mut String,
-        heading: &str,
-        metadata: Option<&str>,
-        body: &str,
-        fenced: bool,
-        language: Option<&str>,
-    ) {
-        if !document.is_empty() {
-            document.push_str("\n\n---\n\n");
-        }
-        document.push_str("## ");
-        document.push_str(heading);
-        if let Some(metadata) = metadata {
-            document.push_str("\n\n_");
-            document.push_str(metadata);
-            document.push('_');
-        }
-        if body.is_empty() {
-            return;
-        }
-        document.push_str("\n\n");
-        if fenced {
-            document.push_str(&fenced_text(body, language));
-        } else {
-            let caudra_block = unclosed_caudra_fenced_block(body);
-            let commonmark_block = unclosed_markdown_block(body);
-            if caudra_block != commonmark_block {
-                // Conflicting parser states have no shared invisible closer.
-                document.push_str(&fenced_text(
-                    &rendered_markdown_text(body, self.viewport_width),
-                    language,
-                ));
-            } else {
-                document.push_str(body);
-            }
-            if let Some(block) = caudra_block.filter(|_| caudra_block == commonmark_block) {
-                if !document.ends_with('\n') {
-                    document.push('\n');
-                }
-                match block {
-                    MarkdownBlock::Fence(marker, run) => {
-                        document.extend(std::iter::repeat_n(marker, run));
-                    }
-                    MarkdownBlock::Html(closing) => document.push_str(closing),
-                    MarkdownBlock::Math(closing) => document.push_str(closing),
-                    MarkdownBlock::HtmlBlankLine => {}
-                }
-            }
-        }
     }
 
     fn tool_in_progress(&self, tool_id: &str) -> bool {
