@@ -169,7 +169,7 @@ Caudra sends a per-conversation cache key where providers accept one, and `/usag
 
 Every session keeps its full history, subagent transcripts included, in compact local storage. Revert the conversation, the files, or both from a message, and preview the file changes first.
 
-- **Large sessions open fast.** Payloads are compressed, appending saves write only new rows, and the transcript lays out only what is on screen. In the creator's use, a 10k-turn session loads in under a second.
+- **Search every past session.** `/search-history` finds your words in the sessions of this project or of every project, previews each match with the items around it, and opens the session at that point. The model can search the same history from a `code` snippet to find an earlier decision or a command that worked.
 - **Revert with a preview.** Each tool call that may change files is recorded before and after it runs, so a revert touches only those files. The first **Revert files** shows what would change, and repeating it applies the revert. **Unrevert** puts the files and the conversation back.
 - **Memory that outlasts the session.** The agent keeps notes on project gotchas and decisions outside your repository. Older notes fold into one-line summaries, so the view in each request stays within 32 KiB. The model opens a summary or searches the notes when it needs more, and `/memory` shows what it reads.
 - **Fork and branch out.** Fork from a message to try another approach. `/worktree new` moves a session into a fresh Git worktree with its conversation and plan.
@@ -199,7 +199,7 @@ Passage review was inspired by [Plannotator](https://plannotator.ai/).
 
 `/goal` keeps a session working until a separate evaluator finds evidence that your condition is met, for example "tests pass and clippy is clean". Background work reports back without polling, and your permission rules decide what runs while you are away.
 
-- **Goals that check evidence.** After each work turn, a separate model call with no tools reads the transcript. An unmet goal starts another turn. A met goal clears itself. `/goal log` lists every check with its model, cost, and reason.
+- **Goals that check evidence.** After each work turn, a separate model call with no tools reads the transcript. An unmet goal starts another turn. A met goal clears itself. A goal that waits on CI or a deploy is checked again later, and three turns without progress end the run. `/goal log` lists every check with its model, cost, and reason.
 - **Background work wakes the agent.** Tasks and shell jobs can keep running in the background. Their reports start the next step at a safe boundary, with no polling.
 - **Permissions that read the command.** Shell chains and pipelines split into separate commands for approval. Approve once, for the conversation, the project, or every project, and accept patterns Caudra suggests from repeated approvals.
 - **Plan first, then hear back.** By default, new sessions open in Plan mode, where the agent edits only its plan and asks before commands it cannot prove read-only. Notifications tell you when a turn finishes or a prompt needs your answer.
@@ -248,7 +248,7 @@ In daily use, the `abandoned_turn` rule matched 35 of 386 final Qwen3.8-27B repl
 
 *When a tool reaches a limit*
 
-When a tool stops at a limit or leaves something out, its result says what is missing, and the model can go back for it. The file, shell, web, code, and Python tools come from [Workcell](https://github.com/caudra/caudra/tree/main/workcell), which also runs on its own as an MCP server.
+When a tool stops at a limit or leaves something out, its result says what is missing, and the model can go back for it. The file, shell, web, source code, and Python tools come from [Workcell](https://github.com/caudra/caudra/tree/main/workcell), which also runs on its own as an MCP server.
 
 - **Searches that report what they withheld.** A `file_grep` or `file_glob` call that reaches its bounds returns what it found and reports how much it withheld, so the model can tell a missing match from a file it never searched. Directory searches skip credential files such as `.env` and SSH private keys.
 - **Guarded web fetching.** `webfetch` refuses private, loopback, and link-local addresses and checks every redirect the same way. Pages arrive in the character set they declare, and a page cut at 2,000 lines or 50 KiB ends with a line that names the limit.
@@ -321,25 +321,27 @@ Eleven jobs decide which model serves each kind of work. Pin a job to a model in
 
 See [Model jobs](https://caudra.ai/docs/providers/#model-jobs).
 
-The [JEV decision engine](https://caudra.ai/docs/providers/#decision-endpoints) sends typed questions to one decision endpoint you pick: TypeSafe Jev, OpenAI Luna, or a server of your own. It powers permission advice, Auto mode screening, shell effect and duration predictions, sampled web and MCP content screening, tool search ranking, skill suggestions, goal prescreening, and subagent routing to the Fast or Best model. As a reranker, it can put the most relevant memory notes, code context rows, and omitted tool output first, and the transcript shows what each feature changed. Add an endpoint in `/login` and switch it in `/model`. Each feature is off until you turn it on, and predictions add to deterministic permission rules and can miss risks.
+The [JEV decision engine](https://caudra.ai/docs/providers/#decision-endpoints) sends typed questions to one decision endpoint you pick: TypeSafe Jev, OpenAI Luna, or a server of your own. It powers permission advice, Auto mode screening, shell effect and duration predictions, sampled web and MCP content screening, tool search ranking, skill suggestions, goal prescreening, and subagent routing to the Fast or Best model. As a reranker, it can put the most relevant memory notes, `source_code_context` rows, history matches, and omitted tool output first, and the transcript shows what each feature changed. In a `code` snippet, [`decide()` and `rerank()`](https://caudra.ai/docs/code/#decisions-and-reranking) judge what the snippet gathered before any of it reaches the model. Add an endpoint in `/login` and switch it in `/model`. Each feature is off until you turn it on, and predictions add to deterministic permission rules and can miss risks.
 
 <!-- BEGIN caudra.ai capabilities: generated by `bun run readme:snippet` in caudra/website. Edit there. -->
-## 75 capabilities, designed together.
+## 81 capabilities, designed together.
 
 *Everything in the box*
 
 Each one links to its documentation. Experimental items are marked and stay off until you switch them on.
 
 <details>
-<summary><b>Agents</b> (14)</summary>
+<summary><b>Agents</b> (16)</summary>
 
 - [Steerable subagents](https://caudra.ai/docs/commands/#tasks)
 - [Background tasks and shell jobs](https://caudra.ai/docs/sessions/#background-tasks)
 - [Next, Guide, and Replace queue](https://caudra.ai/docs/queue/)
 - [Completion goals with a log of every check](https://caudra.ai/docs/commands/#completion-goals)
+- [Goals that wait for CI and stop when stuck](https://caudra.ai/docs/commands/#completion-goals)
 - [Autopilot toward a goal](https://caudra.ai/docs/autopilot/) (experimental)
 - [Side questions with `/btw`](https://caudra.ai/docs/commands/#modes-and-toggles)
 - [Questions you can answer later](https://caudra.ai/docs/sessions/#deferred-questions)
+- [Notes on your answers to the agent](https://caudra.ai/docs/keybindings/#form)
 - [A model for each job](https://caudra.ai/docs/providers/#model-jobs)
 - [Tasks on the model you name](https://caudra.ai/docs/commands/#models-and-reasoning)
 - [Favorite models in `/model`](https://caudra.ai/docs/providers/#model-jobs)
@@ -350,13 +352,14 @@ Each one links to its documentation. Experimental items are marked and stay off 
 
 </details>
 <details>
-<summary><b>Tools</b> (11)</summary>
+<summary><b>Tools</b> (12)</summary>
 
 - [File read and search, with one editor per model](https://caudra.ai/docs/tools/#file-operations)
 - [File outlines with `file_index`](https://caudra.ai/docs/tools/#file_index)
-- [Code maps for 37 languages and formats](https://caudra.ai/docs/tools/#code-intelligence)
+- [Source code graph for 37 languages and formats](https://caudra.ai/docs/tools/#code-intelligence)
 - [Shell with output filtering](https://caudra.ai/docs/tools/#shell)
 - [Python for computation, history search, and MCP](https://caudra.ai/docs/code/)
+- [`decide()` and `rerank()` inside snippets](https://caudra.ai/docs/code/#decisions-and-reranking)
 - [Parallel calls with `batch`](https://caudra.ai/docs/tools/#batch)
 - [Retained output search](https://caudra.ai/docs/tools/#tool_output)
 - [Web search and fetch, with PDFs as text or as the file](https://caudra.ai/docs/tools/#web)
@@ -381,7 +384,7 @@ Each one links to its documentation. Experimental items are marked and stay off 
 
 </details>
 <details>
-<summary><b>Sessions</b> (11)</summary>
+<summary><b>Sessions</b> (12)</summary>
 
 - [Revert conversation, files, or both](https://caudra.ai/docs/sessions/#message-actions)
 - [File changes recorded per call](https://caudra.ai/docs/sessions/#recording)
@@ -391,17 +394,19 @@ Each one links to its documentation. Experimental items are marked and stay off 
 - [Git worktrees you open and close](https://caudra.ai/docs/worktrees/#closing-a-worktree)
 - [Retention policies and `/storage`](https://caudra.ai/docs/sessions/#retention)
 - [Move sessions between directories](https://caudra.ai/docs/sessions/#moving-sessions-to-another-directory)
+- [Search past sessions with `/search-history`](https://caudra.ai/docs/sessions/#search-past-sessions)
 - [Search past conversations from Python](https://caudra.ai/docs/code/#search-past-conversations)
 - [Spend by model and purpose in `/usage`](https://caudra.ai/docs/token-economy/#cache-hit-rate)
 - [Release notes after an update, with `/changelog`](https://caudra.ai/docs/release-notes/)
 
 </details>
 <details>
-<summary><b>Interface</b> (8)</summary>
+<summary><b>Interface</b> (9)</summary>
 
 - [Workbench with Git and search](https://caudra.ai/docs/workbench/)
 - [Passage review](https://caudra.ai/docs/review/)
 - [Markdown with maths and Mermaid](https://caudra.ai/docs/markdown/)
+- [Pictures in the transcript](https://caudra.ai/docs/markdown/#images)
 - [Tool calls drawn as they stream](https://caudra.ai/docs/token-economy/#fewer-round-trips)
 - [Draft stash and command palette](https://caudra.ai/docs/commands/#stash)
 - [Paired light and dark themes](https://caudra.ai/docs/configuration/#ui-theme)
@@ -410,7 +415,7 @@ Each one links to its documentation. Experimental items are marked and stay off 
 
 </details>
 <details>
-<summary><b>Safety</b> (7)</summary>
+<summary><b>Safety</b> (8)</summary>
 
 - [Parsed shell permissions](https://caudra.ai/docs/permissions/#shell-parsing)
 - [Scoped approvals, down to a folder](https://caudra.ai/docs/permissions/#per-command-scopes)
@@ -418,7 +423,8 @@ Each one links to its documentation. Experimental items are marked and stay off 
 - [Plan mode](https://caudra.ai/docs/permissions/#plan-mode)
 - [No tracking, opt-in telemetry](https://caudra.ai/docs/telemetry/)
 - [Managed VM sandboxes](https://caudra.ai/docs/sandboxes/) (experimental)
-- [JEV decision engine](https://caudra.ai/docs/configuration/#decisions) (experimental)
+- [Auto mode with decision screening](https://caudra.ai/docs/permissions/#auto-mode)
+- [JEV decision engine](https://caudra.ai/docs/providers/#decision-endpoints)
 
 </details>
 <details>
@@ -587,7 +593,7 @@ The projects whose ideas Caudra builds on are listed [above](#the-last-coding-ag
 - Most of Workcell's filter rules are copied from [RTK](https://www.rtk-ai.app/docs/) under the Apache License 2.0.
 - The built-in `deep-research` workflow is adapted from [Grok Build](https://x.ai/news/workflows) under the Apache License 2.0.
 
-The file, shell, web, code, and Python tools come from [Workcell](https://github.com/caudra/caudra/tree/main/workcell), released under the Apache License 2.0 and developed in this workspace under `workcell/`. The isolated Python tool runs on [Monty](https://github.com/pydantic/monty) by Pydantic.
+The file, shell, web, source code, and Python tools come from [Workcell](https://github.com/caudra/caudra/tree/main/workcell), released under the Apache License 2.0 and developed in this workspace under `workcell/`. The isolated Python tool runs on [Monty](https://github.com/pydantic/monty) by Pydantic.
 
 ## License
 
