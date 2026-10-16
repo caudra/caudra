@@ -32,10 +32,15 @@ const TOOLS: &str = "tools";
 const MAX_FAILURE_CHARS: usize = 120;
 /// Appended when the session has a decision engine, which the helpers need.
 const DECISIONS_SECTION: &str = "\n\n## Decision helpers\n\
-Use these inside a snippet on what server tools returned, so only what matters reaches you: rank or filter a large result before returning it, or triage and branch on a judgement without another round trip. They reach no server and change nothing.\n\
-- `await decide(input, questions)`: typed answers about `input`. `questions` is a list in the OpenAI Decisions shape. Every question has `type`, `name`, and `instructions`: a `predicate`, a `choice` that adds `choices`, or a `score` that adds `levels`. Read answers by name: `r[\"by_name\"][\"urgent\"][\"probability\"]`.\n\
-- `await rerank(query, candidates, threshold=None, top_k=None)`: `[{\"index\", \"score\"}]`, most relevant first, for up to 256 strings or small dicts.\n\
-Example: `issues = await github.list_issues(repo=\"r\")`, then `top = await rerank(\"crashes on startup\", [i[\"title\"] for i in issues], top_k=10)`, and return `[issues[t[\"index\"]] for t in top]`.";
+Use these in a snippet on what its server calls returned, to keep only what matters before it reaches you or to branch on a judgement without another round trip. They change nothing, and their answers are probabilities.\n\
+- `await decide(input, questions)`: answers every question about `input` in one request. Questions follow the OpenAI Decisions shape: `type`, `name`, `instructions`, as a `predicate`, a `choice` with `choices`, or a `score` with 2 to 10 `levels`, low to high. Read `r[\"by_name\"][name]`.\n\
+- `await rerank(query, candidates, threshold=None, top_k=None)`: `[{\"index\", \"score\"}]`, best first, for up to 256 strings or small dicts. `score` is the probability of relevance.\n\
+For good answers:\n\
+- Make `input` a dict under 1,500 bytes of only the judged fields, and name them: \"Does `body` report a crash?\". `instructions` can be `{\"question\": ..., \"focus\": \"what counts and what does not\"}`.\n\
+- Describe each choice or level by what sets it apart: `{\"value\": \"high\", \"description\": \"loses data\"}`.\n\
+- Write `query` as the need, not keywords, and pass short labels as candidates. `index` maps back to the full item.\n\
+- Act on about 0.85 or more; below 0.6 is a guess. Run independent `decide()` calls under `asyncio.gather`.\n\
+Example: `top = await rerank(\"issues reporting a crash at startup\", [i[\"title\"] for i in issues], top_k=10)`.";
 
 /// What keeps a server's tools out of reach, or `None` when it is connected.
 pub fn unavailable(state: &ServerState) -> Option<String> {
@@ -432,6 +437,17 @@ mod tests {
         let listed = notice(&[], Some(&session), decisions).expect(LISTED);
         let text = listed.user_text().unwrap();
         assert_eq!(text.contains(DECISIONS_SECTION), decisions, "{text}");
+    }
+
+    #[test]
+    fn decision_helpers_stay_within_their_budget() {
+        const DECISIONS_SECTION_TOKENS: usize = 400;
+        const OVER_BUDGET: &str = "the decision helpers outgrew their share of the reminder";
+        let tokens = estimate_tokens(DECISIONS_SECTION) as usize;
+        assert!(
+            tokens <= DECISIONS_SECTION_TOKENS,
+            "{OVER_BUDGET}: {tokens}"
+        );
     }
 
     #[test]

@@ -477,7 +477,8 @@ mod tests {
         let (_, internal) = parsed(json!([
             { "type": "score", "name": "severity", "instructions": "How bad?",
               "levels": ["Cosmetic", { "label": "Blocked", "description": "No workaround." }] },
-            { "type": "predicate", "name": "urgent", "instructions": "Urgent?" },
+            { "type": "predicate", "name": "urgent",
+              "instructions": { "question": "Urgent?", "focus": "Only outages count." } },
             { "type": "choice", "name": "team", "instructions": "Which team?",
               "choices": [{ "value": "web", "description": "Frontend." }, "api"] },
         ]))
@@ -487,7 +488,8 @@ mod tests {
             json!({
                 "severity": { "type": "score", "instructions": "How bad?",
                     "criteria": ["Cosmetic", { "label": "Blocked", "description": "No workaround." }] },
-                "urgent": { "type": "noul", "instructions": "Urgent?" },
+                "urgent": { "type": "noul",
+                    "instructions": { "question": "Urgent?", "focus": "Only outages count." } },
                 "team": { "type": "choice", "instructions": "Which team?",
                     "criteria": { "web": "Frontend.", "api": null } },
             })

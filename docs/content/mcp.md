@@ -140,7 +140,7 @@ Calls that ran before a failure keep their effects. When a run fails, the model 
 
 ### Decisions and reranking
 
-With the [decision engine](/docs/configuration/#decisions) on and a base URL set, snippets get two more functions, `decide()` and `rerank()`. They are helpers for what a snippet's servers return, not tools of their own: a snippet calls a server, then judges, filters, or sorts the result before any of it reaches the model, or branches on a judgement without another round trip. The model's list of servers tells it to use them this way:
+With the [decision engine](/docs/configuration/#decisions) on and a base URL set, snippets get two more functions, `decide()` and `rerank()`. They work on what a snippet's servers return: a snippet calls a server, then judges, filters, or sorts the result before any of it reaches the model, or branches on a judgement without another round trip. The model's list of servers tells it to use them this way:
 
 ```python
 issues = await github.list_issues(owner="caudra", repo="caudra", state="open")
@@ -159,6 +159,15 @@ ranked = await rerank("crashes when saving a file", titles, threshold=0.5, top_k
 `rerank()` judges up to 256 candidates, each a string or a small dict. `index` is a candidate's position in `candidates`, and `score` is the probability that it is relevant. `threshold` drops candidates below it, and `top_k` keeps at most that many. Candidates go out 16 to a request, with up to 4 requests at once. Each request waits up to [`rerank_timeout_ms`](/docs/configuration/#decisions), like Caudra's own reranking, unless the call passes a shorter `timeout_ms`. A `decide()` call waits up to `timeout_ms` from the configuration. An empty list returns `[]` without a request.
 
 The model learns about both functions from the `# MCP servers` reminder, which lists them only while the engine is on. Without the engine they do not exist, and a snippet that calls one raises `NameError`. The `mcp` tool still appears only while a server is enabled.
+
+The reminder also tells the model how to get reliable answers, following the habits of Caudra's own question sets:
+
+- Keep `input` to the fields the questions judge, and name the field in each question: "Does `body` report a crash?".
+- Write `instructions` as a map when a question has edge cases: `{"question": "...", "focus": "what counts and what does not"}`.
+- Give each choice and level a `description` that sets it apart from the others.
+- Write the rerank `query` as the need rather than keywords, and send each candidate as a short label and summary. `index` maps back to the full item.
+- Act on a predicate at about 0.85 or more. Below 0.6 the answer is a guess.
+- Judge independent items with one `decide()` call each, run together under `asyncio.gather`. Questions about the same `input` share one call.
 
 A call needs no approval and works in plan mode, since it only reads. A malformed question or argument raises `TypeError` or `ValueError` before anything is sent. An unreachable engine, a timeout, a refusal, or an invalid answer raises `RuntimeError`, and one failed request fails the whole `rerank()`. The opt-in [decision log](/docs/permissions/#decision-engine-advice) records each call under the feature `mcp`. Answers are data for the snippet: they never grant a permission.
 
