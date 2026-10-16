@@ -11,7 +11,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.10 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.10)
 
-This release fixes Lua plugin cleanup, improves shell-output filtering, and updates Nix builds.
+This release fixes Lua plugin cleanup and source indexing, improves shell-output filtering, and updates Nix builds.
 
 > **Important**
 >
@@ -22,6 +22,7 @@ This release fixes Lua plugin cleanup, improves shell-output filtering, and upda
 - **Lua job cleanup survives cancellation and deadlines.** Releasing an abandoned `jobwait` during garbage collection no longer aborts the process, including when the plugin host shuts down.
 - **Shell output keeps unrelated subcommands intact.** Updated bundled filters no longer match commands merely because their names start with a filtered subcommand.
 - **PHP indexing handles clone arguments and partial application.** File indexes and code graphs no longer report parse errors for these expressions.
+- **Go type aliases appear in file indexes and code graphs.** Declarations such as `type Alias = Target` are now included as type definitions.
 - **SVG source icons enforce pixel-buffer limits across nested effects.** Allocation checks now include linked masks and clips, retained filter results, and drop-shadow scratch buffers. Over-budget icons are skipped.
 - **HTML conversion preserves code layout and lazy-loaded images.** Code blocks retain blank lines and image placeholders resolve correctly. Equally scored article candidates now follow document order.
 

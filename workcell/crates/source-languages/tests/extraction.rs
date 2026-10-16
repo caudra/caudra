@@ -406,6 +406,31 @@ fn cpp_header_recovery_mints_no_false_definition(source: &str, unexpected: &str)
     );
 }
 
+#[test_case("type Alias = Target" ; "named_type")]
+#[test_case("type Alias = pkg.Target" ; "qualified_type")]
+#[test_case("type Alias = func(int) int" ; "function_type")]
+#[test_case("type Alias = struct { Value int }" ; "struct_type")]
+#[test_case("type Alias = interface { Run() }" ; "interface_type")]
+fn go_aliases_keep_the_existing_type_vocabulary_without_referencing_the_target(declaration: &str) {
+    let captured = capture(Language::Go, &format!("package example\n{declaration}\n"));
+    assert_eq!(captured.definitions.get("class:Alias"), Some(&1));
+    assert!(!captured.definitions.contains_key("function:Alias"));
+    assert!(!captured.definitions.contains_key("class:Target"));
+    assert_eq!(captured.named_references, 0);
+    assert_eq!(captured.unnamed_definitions, 0);
+}
+
+#[test]
+fn go_aliases_do_not_widen_ambiguous_index_calls() {
+    let captured = capture(
+        Language::Go,
+        "package example\ntype Alias = func(int)\nfunc run(fs []Alias, i int) { fs[i](3) }\n",
+    );
+    assert_eq!(captured.definitions.get("class:Alias"), Some(&1));
+    assert!(!captured.references.contains_key("call:fs"));
+    assert!(!captured.references.contains_key("call:Alias"));
+}
+
 #[test]
 fn rust_captures_the_exact_shape_the_span_fix_depends_on() {
     // Ripwire's most expensive query bug: `@definition.method` captured on the `declaration_list`
