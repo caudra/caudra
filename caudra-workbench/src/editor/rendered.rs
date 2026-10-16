@@ -9,12 +9,18 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::text::Line;
 use std::ops::Range;
+use std::path::Path;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{buffer::Cursor, words::is_word};
 
 /// Paints Markdown wrapped to a width, the way the host's transcript does.
 pub type PaintMarkdown = fn(&str, u16) -> PaintedMarkdown;
+
+/// Draws the picture in a local file within `cols` by `rows` cells, or `None`
+/// when the file is no picture the host can draw. The workbench has no image
+/// decoder of its own, so a file that is not text is shown through this.
+pub type PaintImage = fn(&Path, u16, u16) -> Option<Vec<Line<'static>>>;
 
 type ExtractMarkdown =
     dyn Fn(&[Line<'static>], (usize, usize), (usize, usize)) -> Option<String> + Send + Sync;

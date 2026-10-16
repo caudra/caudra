@@ -1528,6 +1528,7 @@ fn child_body(
             Some(ToolOutput::Plain(text) | ToolOutput::ReadDir(text)) => {
                 Some(plain_body(&text.text, limits.width))
             }
+            Some(ToolOutput::SavedImage { text, .. }) => Some(plain_body(text, limits.width)),
             Some(ToolOutput::Shell(shell)) => Some(plain_body(&shell.raw_text(), limits.width)),
             _ => None,
         }

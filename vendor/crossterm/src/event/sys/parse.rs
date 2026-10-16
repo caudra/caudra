@@ -13,6 +13,8 @@ const OSC_SEQUENCE_LIMIT: usize = 4096;
 const CSI_SEQUENCE_LIMIT: usize = OSC_SEQUENCE_LIMIT;
 const PROGRAM_STATUS_REPLY_PREFIX: &[u8] = b"\x1b]7501;?";
 const PROGRAM_STATUS_KEY_LIMIT: usize = 16;
+const KITTY_GRAPHICS_REPLY_PREFIX: &[u8] = b"\x1b_G";
+const KITTY_GRAPHICS_OK: &[u8] = b"OK";
 
 // Event parsing
 //
@@ -153,6 +155,28 @@ fn parse_osc(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
         Ok(Some(InternalEvent::ProgramStatusSupported))
     } else {
         Err(could_not_parse_event_error())
+    }
+}
+
+/// A Kitty graphics reply, `ESC _ G <keys> ; <message> ESC \`. The message is
+/// `OK` on success and an error code otherwise.
+fn parse_apc(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
+    if buffer.len() > OSC_SEQUENCE_LIMIT {
+        return Err(could_not_parse_event_error());
+    }
+    let Some(payload) = buffer.strip_suffix(b"\x1b\\") else {
+        return Ok(None);
+    };
+    let reply = payload
+        .strip_prefix(KITTY_GRAPHICS_REPLY_PREFIX)
+        .filter(|fields| !fields.contains(&b'\x1b'))
+        .and_then(|fields| {
+            let separator = fields.iter().position(|byte| *byte == b';')?;
+            Some(&fields[separator + 1..] == KITTY_GRAPHICS_OK)
+        });
+    match reply {
+        Some(ok) => Ok(Some(InternalEvent::KittyGraphicsReply(ok))),
+        None => Err(could_not_parse_event_error()),
     }
 }
 
@@ -2080,6 +2104,7 @@ pub(crate) struct Parser {
     discarding_osc: bool,
     discarding_csi: Option<CsiDiscard>,
     program_status_query: bool,
+    graphics_query: bool,
 }
 
 impl Default for Parser {
@@ -2105,6 +2130,7 @@ impl Default for Parser {
             discarding_osc: false,
             discarding_csi: None,
             program_status_query: false,
+            graphics_query: false,
         }
     }
 }
@@ -2115,6 +2141,18 @@ impl Parser {
         self.program_status_query = enabled;
         if !enabled {
             if self.buffer.starts_with(b"\x1b]") && self.buffer.len() > 2 {
+                self.buffer.clear();
+            }
+            self.discarding_osc = false;
+            self.flush();
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn set_graphics_query(&mut self, enabled: bool) {
+        self.graphics_query = enabled;
+        if !enabled {
+            if self.buffer.starts_with(b"\x1b_") && self.buffer.len() > 2 {
                 self.buffer.clear();
             }
             self.discarding_osc = false;
@@ -2149,8 +2187,9 @@ impl Parser {
                 continue;
             }
 
-            if self.program_status_query
-                && self.buffer.starts_with(b"\x1b]")
+            let osc_reply = self.program_status_query && self.buffer.starts_with(b"\x1b]");
+            let apc_reply = self.graphics_query && self.buffer.starts_with(b"\x1b_");
+            if (osc_reply || apc_reply)
                 && (self.discarding_osc || self.buffer.len() > OSC_SEQUENCE_LIMIT)
             {
                 self.discarding_osc = !osc_terminated(&self.buffer);
@@ -2163,10 +2202,15 @@ impl Parser {
                 continue;
             }
 
-            let event = if self.program_status_query && self.buffer.starts_with(b"\x1b]") {
+            let event = if osc_reply {
                 parse_osc(&self.buffer)
+            } else if apc_reply {
+                parse_apc(&self.buffer)
             } else {
-                parse_event(&self.buffer, more || self.program_status_query)
+                parse_event(
+                    &self.buffer,
+                    more || self.program_status_query || self.graphics_query,
+                )
             };
             match event {
                 Ok(None) => {}
@@ -2409,6 +2453,89 @@ mod parser_flush_tests {
         let mut p = Parser::default();
         p.flush();
         assert!(p.next().is_none());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod kitty_graphics_tests {
+    use super::{OSC_SEQUENCE_LIMIT, Parser, parse_apc};
+    use crate::event::{Event, KeyCode, KeyEvent, KeyModifiers, internal::InternalEvent};
+    use test_case::test_case;
+
+    const OK: &[u8] = b"\x1b_Gi=31;OK\x1b\\";
+
+    #[test_case(OK, true; "ok")]
+    #[test_case(b"\x1b_Gi=31,p=2;OK\x1b\\", true; "extra_keys")]
+    #[test_case(b"\x1b_Gi=31;ENOENT:no such image\x1b\\", false; "error")]
+    fn complete_reply_survives_every_split(reply: &[u8], ok: bool) {
+        let expected = Some(InternalEvent::KittyGraphicsReply(ok));
+        assert_eq!(parse_apc(reply).unwrap(), expected);
+        for split in 1..reply.len() {
+            let mut parser = Parser::default();
+            parser.set_graphics_query(true);
+            parser.advance(&reply[..split], false);
+            assert_eq!(parser.next(), None);
+            parser.advance(&reply[split..], false);
+            assert_eq!(parser.next(), expected);
+            assert_eq!(parser.next(), None);
+        }
+    }
+
+    #[test_case(b"\x1b_Gi=31\x1b\\"; "missing_message")]
+    #[test_case(b"\x1b_Xi=31;OK\x1b\\"; "not_graphics")]
+    #[test_case(b"\x1b_Gi=31;\x1b[31mOK\x1b\\"; "embedded_escape")]
+    fn malformed_reply_never_becomes_input(reply: &[u8]) {
+        assert!(parse_apc(reply).is_err());
+        let mut parser = Parser::default();
+        parser.set_graphics_query(true);
+        parser.advance(&[reply, b"a", OK].concat(), false);
+        assert_eq!(
+            parser.collect::<Vec<_>>(),
+            vec![
+                InternalEvent::Event(Event::Key(KeyCode::Char('a').into())),
+                InternalEvent::KittyGraphicsReply(true),
+            ]
+        );
+    }
+
+    #[test]
+    fn truncated_reply_does_not_capture_input_after_query() {
+        let mut parser = Parser::default();
+        parser.set_graphics_query(true);
+        parser.advance(b"\x1b_Gi=31;O", false);
+        parser.set_graphics_query(false);
+        assert_eq!(parser.next(), None);
+        parser.advance(b"a", false);
+        assert_eq!(
+            parser.next(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Char('a').into())))
+        );
+    }
+
+    #[test]
+    fn oversized_reply_is_discarded_without_leaking_tail() {
+        let mut parser = Parser::default();
+        parser.set_graphics_query(true);
+        parser.advance(b"\x1b_Gi=31;", false);
+        parser.advance(&vec![b'x'; OSC_SEQUENCE_LIMIT], false);
+        parser.advance(b"\x1b\\z", false);
+        assert_eq!(
+            parser.collect::<Vec<_>>(),
+            vec![InternalEvent::Event(Event::Key(KeyCode::Char('z').into()))]
+        );
+    }
+
+    #[test]
+    fn alt_underscore_outside_a_query_stays_a_key() {
+        let mut parser = Parser::default();
+        parser.advance(b"\x1b_", false);
+        assert_eq!(
+            parser.next(),
+            Some(InternalEvent::Event(Event::Key(KeyEvent::new(
+                KeyCode::Char('_'),
+                KeyModifiers::ALT
+            ))))
+        );
     }
 }
 

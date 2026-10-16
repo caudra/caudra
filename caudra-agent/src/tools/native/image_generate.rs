@@ -507,7 +507,10 @@ fn save(requested: &str, bytes: &[u8]) -> Result<ToolOutput, String> {
             relative_path(requested)
         ));
     }
-    Ok(ToolOutput::Plain(message.into()))
+    Ok(ToolOutput::SavedImage {
+        path: saved,
+        text: message,
+    })
 }
 
 /// Generations are expensive and unreproducible, so an existing file is never
@@ -841,6 +844,13 @@ mod tests {
         }
     }
 
+    fn saved_image(output: &ToolOutput) -> (&str, &str) {
+        match output {
+            ToolOutput::SavedImage { path, text } => (path, text),
+            other => panic!("expected a saved image, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_fresh_path_is_used_as_requested() {
         let dir = tempfile::tempdir().unwrap();
@@ -894,7 +904,7 @@ mod tests {
         let output = save(&requested, &png(2, 2)).unwrap();
 
         assert!(nested.exists());
-        assert!(text(&output).contains(SAVED), "{output:?}");
+        assert!(saved_image(&output).1.contains(SAVED), "{output:?}");
     }
 
     #[test]
@@ -902,8 +912,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let requested = dir.path().join("art.png").to_string_lossy().into_owned();
 
-        let message = text(&save(&requested, &png(2, 2)).unwrap());
+        let output = save(&requested, &png(2, 2)).unwrap();
+        let (path, message) = saved_image(&output);
 
+        assert_eq!(path, requested);
         assert!(message.contains(VIEW_HINT), "{message}");
         assert!(!message.contains("versioned"), "{message}");
     }
@@ -913,8 +925,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let requested = write(&dir, "art.png", &png(1, 1));
 
-        let message = text(&save(&requested, &png(2, 2)).unwrap());
+        let output = save(&requested, &png(2, 2)).unwrap();
+        let (path, message) = saved_image(&output);
 
+        assert_eq!(path, dir.path().join("art-v2.png").to_string_lossy());
+        assert_eq!(std::fs::read(path).unwrap(), png(2, 2));
         assert!(message.contains("already existed"), "{message}");
         assert!(message.contains("art-v2.png"), "{message}");
     }

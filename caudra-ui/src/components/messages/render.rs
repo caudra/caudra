@@ -6,6 +6,7 @@ use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use crate::components::hover_style;
 use crate::components::tool_display::{CARD_AFFORDANCE, FILTERED_AFFORDANCE, RAW_AFFORDANCE};
+use crate::inline_image::is_pixel;
 use crate::markdown::{LinkMap, TerminalLink};
 use crate::theme;
 
@@ -262,10 +263,15 @@ fn hover_lines(
 /// a whole child: the row that names it takes the accent. That row is the
 /// label and not the thing, so reversing it would shout about one line while
 /// the press acts on everything under it.
+///
+/// A picture's cells keep their colours: tinting them would repaint the pixels.
 fn tint_line(line: Option<&mut Line<'static>>, accent: Color) {
     let Some(line) = line else {
         return;
     };
+    if line.spans.iter().any(|span| is_pixel(span.style)) {
+        return;
+    }
     line.style = line.style.fg(accent);
     for span in &mut line.spans {
         span.style = span.style.fg(accent);

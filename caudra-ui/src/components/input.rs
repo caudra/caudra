@@ -39,6 +39,7 @@ const CHEVRON: &str = super::CHEVRON;
 const NEWLINE_PAD: &str = "  ";
 const PREFIX_WIDTH: u16 = 2;
 const SPACE: char = ' ';
+const IMAGE_CHIP_GAP: &str = " ";
 const COMPOSER_RAIL_WIDTH: u16 = 1;
 const COMPOSER_VERTICAL_PADDING: u16 = 1;
 const ADMISSION_SEPARATOR: &str = "  ";
@@ -146,6 +147,8 @@ pub enum Placeholder {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum InputHit {
     Paste(PasteId),
+    /// A picture attached to the draft, by its index in the attachments.
+    Image(usize),
     Mention {
         range: Range<usize>,
         mention: Mention,
@@ -732,15 +735,7 @@ impl InputBox {
         };
 
         if !self.pending_images.is_empty() {
-            let n = self.pending_images.len();
-            let label = match n {
-                1 => "1 image".to_string(),
-                _ => format!("{n} images"),
-            };
-            styled_lines.push(Line::from(Span::styled(
-                label,
-                theme::current().input_placeholder,
-            )));
+            styled_lines.push(self.image_chips_line());
         }
 
         frame.render_widget(
@@ -765,6 +760,39 @@ impl InputBox {
 
         self.scrollbar
             .draw(frame, content_area, total_vl, self.scroll_y);
+    }
+
+    /// One chip per attached picture, on the row under the draft, each lit
+    /// while the pointer rests on it because a click opens it.
+    fn image_chips_line(&self) -> Line<'static> {
+        let style = theme::current().active;
+        let mut spans = vec![Span::raw(" ".repeat(PREFIX_WIDTH as usize))];
+        for (index, _) in image_chip_columns(self.pending_images.len()) {
+            if index > 0 {
+                spans.push(Span::raw(IMAGE_CHIP_GAP));
+            }
+            let on = self.hover == Some(InputHit::Image(index));
+            spans.push(Span::styled(
+                image_chip_label(index),
+                hover_style(style, on),
+            ));
+        }
+        Line::from(spans)
+    }
+
+    /// The attached picture whose chip sits under the pointer.
+    fn image_hit(&self, area: Rect, row: u16, col: u16, focused: bool) -> Option<usize> {
+        let content_y = row.checked_sub(area.y)?;
+        let content_x = col.checked_sub(area.x)? as usize;
+        let ew = effective_width(area.width as usize);
+        let cursor_visible = focused && self.buffer.focused_paste().is_none();
+        let chips_row = total_visual_lines(&self.buffer, ew, cursor_visible);
+        if content_y as usize + self.scroll_y as usize != chips_row {
+            return None;
+        }
+        image_chip_columns(self.pending_images.len())
+            .find(|(_, columns)| columns.contains(&content_x))
+            .map(|(index, _)| index)
     }
 
     fn max_scroll(&self) -> u16 {
@@ -820,6 +848,9 @@ impl InputBox {
         col: u16,
         focused: bool,
     ) -> Option<InputHit> {
+        if let Some(index) = self.image_hit(area, row, col, focused) {
+            return Some(InputHit::Image(index));
+        }
         let (y, x, text_hit) = self.click_position_with_hit(area, row, col, focused)?;
         let hit = text_hit.then(|| self.hit_at(y, x)).flatten();
         match hit {
@@ -861,8 +892,12 @@ impl InputBox {
 
     pub(crate) fn update_hover(&mut self, area: Rect, row: u16, col: u16, focused: bool) {
         self.hover = self
-            .click_position_with_hit(area, row, col, focused)
-            .and_then(|(y, x, text_hit)| text_hit.then(|| self.hit_at(y, x)).flatten());
+            .image_hit(area, row, col, focused)
+            .map(InputHit::Image)
+            .or_else(|| {
+                self.click_position_with_hit(area, row, col, focused)
+                    .and_then(|(y, x, text_hit)| text_hit.then(|| self.hit_at(y, x)).flatten())
+            });
     }
 
     pub(crate) fn clear_hover(&mut self) {
@@ -1376,6 +1411,23 @@ fn token_ranges_on_line(
     }
     tokens.sort_by_key(|(range, _)| range.start);
     tokens
+}
+
+/// What the composer and the viewer call the picture attached at `index`.
+pub(crate) fn image_chip_label(index: usize) -> String {
+    format!("[Image #{}]", index + 1)
+}
+
+/// Each attached picture's index with the columns its chip covers, counted
+/// from the composer's content edge.
+fn image_chip_columns(count: usize) -> impl Iterator<Item = (usize, Range<usize>)> {
+    let gap = IMAGE_CHIP_GAP.len();
+    (0..count).scan(PREFIX_WIDTH as usize, move |start, index| {
+        let end = *start + image_chip_label(index).len();
+        let columns = *start..end;
+        *start = end + gap;
+        Some((index, columns))
+    })
 }
 
 fn token_spans(line: &str, tokens: &[(Range<usize>, Style)]) -> Vec<Span<'static>> {
@@ -2030,16 +2082,44 @@ mod tests {
         assert_eq!(sub.images.len(), 1);
     }
 
-    const IMAGE_LABEL: &str = "1 image";
+    const IMAGE_CHIPS: &str = "[Image #1] [Image #2]";
+    const NO_IMAGE_CHIPS: &str = "image chips not found in rendered output";
+    const CHIP_WIDTH: u16 = 40;
+    const SECOND_CHIP_COLUMN: u16 = 14;
 
     #[test]
-    fn image_label_rendered() {
+    fn image_chips_rendered() {
         let mut input = InputBox::new(InputHistory::default(), 20);
         input.attach_image(test_image());
-        let h = input.height(40);
-        let terminal = render_input(&mut input, 40, h);
-        let found = (0..h).any(|row| rendered_row(&terminal, row).contains(IMAGE_LABEL));
-        assert!(found, "image label not found in rendered output");
+        input.attach_image(test_image());
+        let h = input.height(CHIP_WIDTH);
+        let terminal = render_input(&mut input, CHIP_WIDTH, h);
+        let found = (0..h).any(|row| rendered_row(&terminal, row).contains(IMAGE_CHIPS));
+        assert!(found, "{NO_IMAGE_CHIPS}");
+    }
+
+    #[test_case("", 1, SECOND_CHIP_COLUMN, Some(InputHit::Image(1)) ; "second_chip_under_an_empty_draft")]
+    #[test_case("hello", 1, 3, Some(InputHit::Image(0)) ; "first_chip_under_text")]
+    #[test_case("hello", 1, 12, None ; "gap_between_chips")]
+    #[test_case("hello", 0, 3, None ; "draft_row")]
+    fn a_click_on_an_image_chip_names_the_picture(
+        draft: &str,
+        row: u16,
+        column: u16,
+        expected: Option<InputHit>,
+    ) {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        type_text(&mut input, draft);
+        input.attach_image(test_image());
+        input.attach_image(test_image());
+        let area = Rect::new(0, 0, CHIP_WIDTH, 2);
+
+        let hit = input.handle_click(area, row, column, true);
+
+        assert_eq!(
+            hit.filter(|hit| matches!(hit, InputHit::Image(_))),
+            expected
+        );
     }
 
     #[test]

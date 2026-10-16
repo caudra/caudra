@@ -952,6 +952,7 @@ impl Workbench {
     fn render_body(&mut self, buf: &mut Surface, area: Rect) {
         grab_scope!("workbench_editor_body", area);
         let focused = self.focus == Focus::Editor && self.focused_field().is_none();
+        let paint_image = self.image;
         let Some(tab) = self.editor.active_mut() else {
             self.panes.text = Rect::default();
             placeholder(buf, area, EMPTY_EDITOR_HINT, self.styles.dim);
@@ -959,7 +960,13 @@ impl Workbench {
         };
         if let Some(notice) = tab.notice() {
             self.panes.text = Rect::default();
-            placeholder(buf, area, notice.reason(), self.styles.dim);
+            match paint_image
+                .zip(tab.path.local())
+                .and_then(|(paint, path)| paint(path, area.width, area.height))
+            {
+                Some(picture) => render_picture(buf, area, picture),
+                None => placeholder(buf, area, notice.reason(), self.styles.dim),
+            }
             return;
         }
         if tab.is_rendered()
@@ -1558,6 +1565,27 @@ fn overwrite(buf: &mut Surface, at: (u16, u16), symbol: &str, style: Style) {
     if let Some(cell) = buf.cell_mut(at) {
         cell.set_symbol(symbol);
         cell.set_style(style);
+    }
+}
+
+/// A picture centred in `area`, for a file the editor cannot show as text.
+fn render_picture(buf: &mut Surface, area: Rect, picture: Vec<Line<'static>>) {
+    let width = picture.iter().map(Line::width).max().unwrap_or_default() as u16;
+    let height = picture.len() as u16;
+    let [_, column, _] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(width),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    let [_, centred, _] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(height),
+        Constraint::Fill(1),
+    ])
+    .areas(column);
+    for (offset, line) in picture.into_iter().enumerate() {
+        chrome::render_line(buf, line_at(centred, offset), line);
     }
 }
 

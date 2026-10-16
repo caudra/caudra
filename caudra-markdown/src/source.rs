@@ -150,16 +150,17 @@ impl Painter {
             let range = widen(&span.source.range);
             self.paint(cursor..range.start, StyleToken::Syntax);
             cursor = range.end;
-            let style = match span.kind {
-                SpanKind::Text => base.clone(),
-                SpanKind::Code => StyleToken::InlineCode,
-                SpanKind::Math => StyleToken::Math,
+            let (style, link) = match span.kind {
+                SpanKind::Text => (base.clone(), span.link),
+                SpanKind::Code => (StyleToken::InlineCode, span.link),
+                SpanKind::Math => (StyleToken::Math, span.link),
+                SpanKind::Image => (StyleToken::Image, None),
             };
             self.paints.push(Paint {
                 range,
                 style,
                 emphasis: span.emphasis,
-                link: span.link,
+                link,
             });
         }
         self.paint(cursor..content.end, StyleToken::Syntax);

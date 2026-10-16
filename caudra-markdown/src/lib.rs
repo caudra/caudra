@@ -91,6 +91,9 @@ pub enum SpanKind {
     /// LaTeX source. The renderer decides how to present it, so `text` here
     /// is the math itself with its delimiters stripped.
     Math,
+    /// `![alt](src)`. `text` is the alt text and `link` is the destination
+    /// as written, which is a file to show and never a hyperlink to follow.
+    Image,
 }
 
 /// Where a rendered span came from in the parsed text.
@@ -1064,7 +1067,16 @@ fn parse_inline_impl(
                 .copied()
             && let Some(image) = try_explicit_link(text, pos + 1, label_end)
         {
+            flush_plain(&mut spans, &text[plain_start..pos], plain_start);
+            spans.push(InlineSpan {
+                text: text[image.label].trim().to_owned(),
+                kind: SpanKind::Image,
+                emphasis,
+                source: Source::atomic(offset + pos as u32..offset + image.end as u32),
+                link: Some(Arc::from(&text[image.target])),
+            });
             pos = image.end;
+            plain_start = pos;
             continue;
         }
 
@@ -1910,9 +1922,27 @@ mod tests {
 
     #[test_case("`https://example.com`"; "code")]
     #[test_case("$https://example.com$"; "math")]
-    #[test_case("![alt](https://example.com/image.png)"; "image")]
     fn parse_inline_non_link_constructs_do_not_expose_urls(input: &str) {
         assert!(parse_inline(input).iter().all(|span| span.link.is_none()));
+    }
+
+    #[test_case("![a plot](out/plot.png)", "a plot", "out/plot.png", 0..23 ; "alone")]
+    #[test_case("see ![](x.png) here", "", "x.png", 4..14 ; "inline_without_alt")]
+    #[test_case("![chart](<my chart.png> \"Title\")", "chart", "my chart.png", 0..32 ; "angle_destination_with_title")]
+    fn parse_inline_image_carries_alt_and_destination(
+        input: &str,
+        alt: &str,
+        destination: &str,
+        source: Range<u32>,
+    ) {
+        let spans = parse_inline(input);
+        let image = spans
+            .iter()
+            .find(|span| span.kind == SpanKind::Image)
+            .expect("an image span");
+        assert_eq!(image.text, alt);
+        assert_eq!(image.link.as_deref(), Some(destination));
+        assert_eq!(image.source, Source::atomic(source));
     }
 
     #[test]

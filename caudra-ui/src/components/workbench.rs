@@ -4,10 +4,14 @@
 //! translation of theme roles into the palette it paints with lives here, and
 //! so does the Markdown painter its rendered view borrows.
 
+use std::path::Path;
+
 use caudra_workbench::{PaintedMarkdown, Workbench, WorkbenchStyles};
 use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
 
 use crate::components::Overlay;
+use crate::inline_image::{self, ImageRef};
 use crate::markdown::text_to_rows;
 use crate::provenance::Provenance;
 use crate::repaint::Cadence;
@@ -68,6 +72,13 @@ pub(crate) fn paint_markdown(text: &str, width: u16) -> PaintedMarkdown {
     })
 }
 
+/// The transcript's picture renderer, lent to the workbench so an image tab
+/// shows the picture instead of the binary-file notice.
+pub(crate) fn paint_image(path: &Path, cols: u16, rows: u16) -> Option<Vec<Line<'static>>> {
+    let image = ImageRef::from_file(path, "")?;
+    inline_image::draw_fitted(&image, cols, rows)
+}
+
 impl Overlay for Workbench {
     fn is_open(&self) -> bool {
         Workbench::is_open(self)
@@ -78,17 +89,24 @@ impl Overlay for Workbench {
     }
 
     fn cadence(&self) -> Cadence {
-        Cadence::when(self.is_busy(), Cadence::PENDING)
+        Cadence::when(
+            self.is_busy() || inline_image::is_pending(),
+            Cadence::PENDING,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PaintedMarkdown, Workbench, paint_markdown, styles};
+    use std::fs;
+
+    use super::{PaintedMarkdown, Workbench, paint_image, paint_markdown, styles};
+    use crate::inline_image::tests::{PIXEL_SYMBOL, decode_queued, png_bytes};
     use caudra_markdown::render::{CODE_BAR, TOOL_OUTPUT_MAX_LINE_BYTES};
     use caudra_workbench::{DocumentKey, TabLabel, WorkbenchAction, keys};
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::{Terminal, backend::TestBackend, style::Modifier};
+    use tempfile::TempDir;
     use test_case::test_case;
 
     const WIDTH: u16 = 80;
@@ -126,6 +144,10 @@ mod tests {
     const NO_EDIT: &str = "the source document did not accept the unsaved edit";
     const DOCUMENT_KEY: &str = "markdown-selection";
     const DOCUMENT_TITLE: &str = "Markdown selection";
+    const PICTURE: &str = "picture.png";
+    const PICTURE_SIDE: u32 = 32;
+    const BINARY_NOTICE: &str = "Binary file";
+    const NO_PICTURE: &str = "an image tab must draw the picture only when a painter is lent";
 
     fn last(painted: &PaintedMarkdown) -> (usize, usize) {
         let row = painted.lines().len() - 1;
@@ -440,5 +462,31 @@ mod tests {
             },
             "{NO_COPY}"
         );
+    }
+
+    #[test_case(true ; "painted")]
+    #[test_case(false ; "without_a_painter")]
+    fn an_image_tab_shows_the_picture_instead_of_the_binary_notice(painter: bool) {
+        let dir = TempDir::new().expect(NO_FRAME);
+        let path = dir.path().join(PICTURE);
+        fs::write(&path, png_bytes(PICTURE_SIDE, PICTURE_SIDE)).expect(NO_FRAME);
+        let mut workbench = Workbench::new(styles());
+        if painter {
+            workbench.set_image_painter(paint_image);
+        }
+        workbench.open_at(dir.path(), &path, None);
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect(NO_FRAME);
+        terminal
+            .draw(|frame| workbench.view(frame, frame.area()))
+            .expect(NO_FRAME);
+        decode_queued();
+        terminal
+            .draw(|frame| workbench.view(frame, frame.area()))
+            .expect(NO_FRAME);
+        let surface = terminal.backend().buffer();
+        let screen: String = surface.content().iter().map(|cell| cell.symbol()).collect();
+
+        assert_eq!(screen.contains(PIXEL_SYMBOL), painter, "{NO_PICTURE}");
+        assert_eq!(screen.contains(BINARY_NOTICE), !painter, "{NO_PICTURE}");
     }
 }

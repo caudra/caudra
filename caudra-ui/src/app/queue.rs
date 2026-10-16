@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::mem;
 use std::ops::Range;
+use std::sync::Arc;
 
 use caudra_agent::autopilot::ActionName;
 use caudra_agent::{AgentInput, AgentMode};
@@ -1412,8 +1413,8 @@ impl App {
     pub(super) fn on_queue_item_consumed(
         &mut self,
         id: QueueItemId,
-        text: &str,
-        image_count: usize,
+        display: String,
+        images: Arc<[ImageSource]>,
     ) {
         if self.replacement_item == Some(id) {
             self.replacement_item = None;
@@ -1425,8 +1426,7 @@ impl App {
         self.autopilot_checkin_due = false;
         self.queue.clamp_focus();
         self.status = Status::Streaming;
-        self.main_chat()
-            .show_user_message(format_with_images(text, image_count));
+        self.main_chat().show_user_prompt(display, images);
     }
 
     pub(super) fn on_queue_batch_consumed(&mut self, items: &[caudra_agent::QueueConsumedItem]) {
@@ -1443,10 +1443,7 @@ impl App {
         self.autopilot_checkin_due = false;
         self.queue.clamp_focus();
         self.status = Status::Streaming;
-        let messages = items
-            .iter()
-            .map(|item| format_with_images(&item.text, item.image_count));
-        self.main_chat().show_user_messages(messages);
+        self.main_chat().show_consumed_prompts(items);
     }
 
     /// Immediate path: kick off the agent and draw the bubble in the same
@@ -1598,7 +1595,8 @@ impl App {
         // talks costs nothing and the run starts without waiting on a walk.
         self.fire_session_autocmd("TurnStart", serde_json::json!({}));
         if !display.is_empty() {
-            self.main_chat().show_user_message(display);
+            let images = Arc::from(input.images.as_slice());
+            self.main_chat().show_user_prompt(display, images);
         }
         vec![Action::SendMessage(Box::new(input))]
     }

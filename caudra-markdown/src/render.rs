@@ -28,6 +28,7 @@ const HR_CHAR: char = '─';
 const MIN_COL_WIDTH: usize = 5;
 const LONG_LINE_SUFFIX: &str = "...";
 const MERMAID_LANG: &str = "mermaid";
+const IMAGE_LABEL_FALLBACK: &str = "[image]";
 /// Marks a diagram row that continues past an edge.
 const DIAGRAM_MORE_RIGHT: &str = "›";
 const DIAGRAM_MORE_LEFT: &str = "‹";
@@ -65,6 +66,8 @@ pub enum StyleToken {
     /// keeps in place: emphasis delimiters, backticks, code fences, and
     /// link brackets and destinations.
     Syntax,
+    /// An image named in running text, drawn as its bracketed alt text.
+    Image,
 }
 
 impl From<&StyledSegment> for StyleToken {
@@ -259,6 +262,13 @@ pub enum LineKind {
     Diagram {
         id: u16,
         full_width: u16,
+    },
+    /// A paragraph that is one image and nothing else. Its single span is
+    /// the bracketed alt text; a consumer that can draw pixels replaces the
+    /// row with the picture, and one that cannot keeps the text.
+    Image {
+        src: Arc<str>,
+        alt: String,
     },
     Blank,
 }
@@ -715,6 +725,13 @@ fn render_line_block(lb: &LineBlock, lines: &mut Vec<Line>, ctx: &RenderCtx) {
         _ => LineKind::Paragraph,
     };
 
+    let inline = parse_inline_at(&lb.inline, lb.inline_start);
+    if lb.kind == BlockKind::Paragraph
+        && let Some(line) = standalone_image(&inline, source.clone())
+    {
+        lines.push(line);
+        return;
+    }
     let mut content_spans: Vec<Span> = Vec::new();
     for InlineSpan {
         text,
@@ -722,15 +739,20 @@ fn render_line_block(lb: &LineBlock, lines: &mut Vec<Line>, ctx: &RenderCtx) {
         emphasis,
         source,
         link,
-    } in parse_inline_at(&lb.inline, lb.inline_start)
+    } in inline
     {
         // Code and maths keep their own token inside headings so consumers
         // can layer colours on top. The Lua bridge collapses to one name.
-        let (style, text) = match sk {
-            SpanKind::Code => (StyleToken::InlineCode, text),
-            SpanKind::Math => (StyleToken::Math, ctx.math.apply(&text).unwrap_or(text)),
-            SpanKind::Text if is_heading => (StyleToken::Heading, text),
-            SpanKind::Text => (StyleToken::Text, text),
+        let (style, text, link) = match sk {
+            SpanKind::Code => (StyleToken::InlineCode, text, link),
+            SpanKind::Math => (
+                StyleToken::Math,
+                ctx.math.apply(&text).unwrap_or(text),
+                link,
+            ),
+            SpanKind::Image => (StyleToken::Image, image_label(&text), None),
+            SpanKind::Text if is_heading => (StyleToken::Heading, text, link),
+            SpanKind::Text => (StyleToken::Text, text, link),
         };
         content_spans.push(Span::sourced(text, style, emphasis, source).with_link(link));
     }
@@ -801,6 +823,39 @@ fn render_line_block(lb: &LineBlock, lines: &mut Vec<Line>, ctx: &RenderCtx) {
             source: source.clone(),
         });
     }
+}
+
+/// What an image shows wherever its pixels are not drawn.
+pub fn image_label(alt: &str) -> String {
+    match alt {
+        "" => IMAGE_LABEL_FALLBACK.to_owned(),
+        alt => format!("[{alt}]"),
+    }
+}
+
+/// The row for a paragraph line holding exactly one image, with only blank
+/// text around it.
+fn standalone_image(spans: &[InlineSpan], source: Option<Range<u32>>) -> Option<Line> {
+    let mut images = spans.iter().filter(|span| span.kind == SpanKind::Image);
+    let image = images.next()?;
+    let alone = images.next().is_none()
+        && spans
+            .iter()
+            .all(|span| span.kind == SpanKind::Image || span.text.trim().is_empty());
+    let src = image.link.clone().filter(|_| alone)?;
+    Some(Line {
+        kind: LineKind::Image {
+            src,
+            alt: image.text.clone(),
+        },
+        spans: vec![Span::sourced(
+            image_label(&image.text),
+            StyleToken::Image,
+            Emphasis::default(),
+            image.source.clone(),
+        )],
+        source,
+    })
 }
 
 fn finalize_lines(lines: &mut Vec<Line>) {
@@ -1040,8 +1095,10 @@ fn cell_spans(cell: &str, header: bool, row: Option<&Range<u32>>, math: MathStyl
                 let (style, text) = match kind {
                     SpanKind::Code => (StyleToken::InlineCode, text),
                     SpanKind::Math => (StyleToken::Math, math.apply(&text).unwrap_or(text)),
+                    SpanKind::Image => (StyleToken::Image, image_label(&text)),
                     SpanKind::Text => (StyleToken::Text, text),
                 };
+                let link = link.filter(|_| kind != SpanKind::Image);
                 match row {
                     Some(range) => {
                         Span::sourced(text, style, emphasis, Source::atomic(range.clone()))
@@ -1293,6 +1350,42 @@ mod tests {
     use test_case::test_case;
 
     const TEST_WIDTH: u16 = 80;
+    const IMAGE_PATH: &str = "shots/plot.png";
+
+    #[test_case("![A plot](shots/plot.png)", "A plot" ; "alt")]
+    #[test_case("  ![](shots/plot.png)  ", "" ; "blank_around_without_alt")]
+    fn a_paragraph_of_one_image_becomes_an_image_line(input: &str, alt: &str) {
+        let lines = render(input, TEST_WIDTH);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0].kind,
+            LineKind::Image {
+                src: Arc::from(IMAGE_PATH),
+                alt: alt.to_owned()
+            }
+        );
+        assert_eq!(lines[0].spans[0].text, image_label(alt));
+        assert_eq!(lines[0].source, Some(0..input.len() as u32));
+    }
+
+    #[test_case("see ![A plot](shots/plot.png) here", "see [A plot] here" ; "inline")]
+    #[test_case("- ![A plot](shots/plot.png)", "• [A plot]" ; "list_item")]
+    fn an_image_in_running_text_reads_as_its_label(input: &str, shown: &str) {
+        let lines = render(input, TEST_WIDTH);
+        assert!(
+            lines
+                .iter()
+                .all(|line| !matches!(line.kind, LineKind::Image { .. }))
+        );
+        let text: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect();
+        assert_eq!(text.trim_end(), shown);
+        assert!(lines[0].spans.iter().all(|span| span.link.is_none()));
+    }
+
     const CODE_BODY: &str = "let x = \"é界\";\n\n    x";
     const CODE_FENCE: &str = "```rust\nlet x = \"é界\";\n\n    x\n```";
     const RHAI_FRAGMENTS: [&str; 5] = [

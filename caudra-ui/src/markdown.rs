@@ -4,6 +4,7 @@ use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::inline_image::{self, ImageSpan};
 use crate::provenance::LineProvenance;
 use crate::theme;
 use crate::theme::Theme;
@@ -106,6 +107,8 @@ fn style_for_token(
         StyleToken::TableBorder => t.table_border,
         StyleToken::HorizontalRule => t.horizontal_rule,
         StyleToken::Syntax => overlay_style(base, t.tool_dim),
+        StyleToken::Image => apply_emphasis(overlay_style(base, t.tool_dim), emphasis, true, t)
+            .add_modifier(Modifier::UNDERLINED),
     }
 }
 
@@ -475,6 +478,69 @@ pub(crate) struct Painted {
     pub provenance: Vec<LineProvenance>,
     pub diagrams: Vec<DiagramSpan>,
     pub links: LinkMap,
+    /// Rows holding an image paragraph, drawn as its label until
+    /// [`Self::draw_images`] swaps in the picture.
+    pub images: Vec<MarkdownImage>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MarkdownImage {
+    pub row: usize,
+    pub src: Arc<str>,
+    pub alt: String,
+}
+
+impl Painted {
+    /// Replaces each image label with the picture it names, at most
+    /// `max_cols` wide, and reports where the pictures landed. A label whose
+    /// target is not a local picture stays as it is.
+    ///
+    /// Every row of a picture copies as the markdown that named it: each one
+    /// repeats the label's source range, and the label span is atomic.
+    pub fn draw_images(&mut self, max_cols: u16) -> Vec<ImageSpan> {
+        let mut spans: Vec<ImageSpan> = Vec::new();
+        for MarkdownImage { row, src, alt } in mem::take(&mut self.images).into_iter().rev() {
+            let Some(image) = inline_image::resolve_markdown(&src, &alt) else {
+                continue;
+            };
+            let Some(drawn) = inline_image::draw(&image, max_cols) else {
+                continue;
+            };
+            let label = &self.provenance[row];
+            let source = label.spans.first().cloned().unwrap_or(SpanSource::Unknown);
+            let provenance: Vec<LineProvenance> = drawn
+                .iter()
+                .map(|line| LineProvenance {
+                    line: label.line.clone(),
+                    spans: vec![source.clone(); line.spans.len()],
+                })
+                .collect();
+            let links: Vec<Vec<Option<Arc<str>>>> = drawn
+                .iter()
+                .map(|line| vec![None; line.spans.len()])
+                .collect();
+            let added = drawn.len() - 1;
+            self.lines.splice(row..=row, drawn);
+            self.provenance.splice(row..=row, provenance);
+            self.links.rows.splice(row..=row, links);
+            for diagram in self
+                .diagrams
+                .iter_mut()
+                .filter(|span| span.rows.start > row)
+            {
+                diagram.rows = diagram.rows.start + added..diagram.rows.end + added;
+            }
+            for later in &mut spans {
+                later.rows = later.rows.start + added..later.rows.end + added;
+            }
+            spans.push(ImageSpan {
+                rows: row..row + added + 1,
+                image,
+            });
+        }
+        spans.reverse();
+        spans
+    }
 }
 
 /// Consecutive rows carrying the same diagram id collapse into one span.
@@ -515,6 +581,18 @@ pub(crate) fn paint_semantic(
     let mut links = LinkMap { rows: link_rows };
     let mut provenance: Vec<LineProvenance> = semantic.iter().map(line_provenance).collect();
     let mut diagrams = diagram_spans(semantic);
+    let mut images: Vec<MarkdownImage> = semantic
+        .iter()
+        .enumerate()
+        .filter_map(|(row, line)| match &line.kind {
+            LineKind::Image { src, alt } => Some(MarkdownImage {
+                row,
+                src: Arc::clone(src),
+                alt: alt.clone(),
+            }),
+            _ => None,
+        })
+        .collect();
 
     if lines.is_empty() {
         lines.push(prefix_line(prefix, prefix_style));
@@ -525,6 +603,7 @@ pub(crate) fn paint_semantic(
             provenance,
             diagrams,
             links,
+            images,
         };
     }
 
@@ -545,6 +624,9 @@ pub(crate) fn paint_semantic(
             span.rows.start += 1;
             span.rows.end += 1;
         }
+        for image in &mut images {
+            image.row += 1;
+        }
     }
 
     Painted {
@@ -552,6 +634,7 @@ pub(crate) fn paint_semantic(
         provenance,
         diagrams,
         links,
+        images,
     }
 }
 

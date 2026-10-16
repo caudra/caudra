@@ -18,6 +18,7 @@ mod exit_summary;
 pub use exit_summary::ExitSummary;
 mod highlight;
 pub mod image;
+mod inline_image;
 mod input_document;
 mod markdown;
 mod pane_signals;

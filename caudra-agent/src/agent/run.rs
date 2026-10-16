@@ -3849,7 +3849,7 @@ impl<'h> Agent<'h> {
                 self.event_tx.send(AgentEvent::QueueItemConsumed {
                     id,
                     text: input.message.clone(),
-                    image_count: input.images.len(),
+                    images: input.images.clone(),
                 })?;
                 self.push_user_inputs(vec![*input], true).await;
                 let _ = run_id;
@@ -3861,7 +3861,7 @@ impl<'h> Agent<'h> {
                         .map(|queued| QueueConsumedItem {
                             id: queued.id,
                             text: queued.input.message.clone(),
-                            image_count: queued.input.images.len(),
+                            images: queued.input.images.clone(),
                         })
                         .collect(),
                 })?;

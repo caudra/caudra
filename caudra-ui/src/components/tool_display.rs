@@ -31,6 +31,7 @@ use jiff::tz::TimeZone;
 
 use caudra_markdown::render::truncate_long_lines;
 
+use crate::inline_image::{self, ImageRef, ImageSpan};
 use crate::markdown::{LinkMap, expand_notice, should_truncate, text_to_painted};
 use caudra_agent::decisions::NoteOutcome;
 use caudra_agent::tools::native::peers::{
@@ -58,6 +59,7 @@ use serde_json::Value;
 const JSON_ESCAPE_CHARS: usize = 6;
 const REPORT_TOOL_NAME: &str = "report_to_parent";
 const REPORT_BLOCKED: &str = "Blocked";
+const IMAGE_MISSING_PREFIX: &str = "[image missing: ";
 const REPORT_TITLE_MAX_CHARS: usize = 80;
 
 pub(crate) fn task_details(task: &TaskCard) -> String {
@@ -1397,6 +1399,8 @@ pub struct ToolLines {
     /// script instead of scraping its line-number gutter off the screen.
     /// `None` when something in the card names no source at all.
     pub source: Option<BodySource>,
+    /// The picture a card shows under its output, which a click opens.
+    pub images: Vec<ImageSpan>,
 }
 
 #[derive(Clone)]
@@ -1812,6 +1816,7 @@ fn resolve_output<'a>(
         Some(ToolOutput::Plain(t) | ToolOutput::Markdown(t) | ToolOutput::ReadDir(t)) => {
             Some(Cow::Borrowed(t.text.as_str()))
         }
+        Some(ToolOutput::SavedImage { text, .. }) => Some(Cow::Borrowed(text.as_str())),
         // A batch with children draws them structurally; only a session from
         // when batch was a Lua plugin falls back to the model's own text.
         Some(ToolOutput::Batch { entries, text }) if entries.is_empty() => {
@@ -1926,12 +1931,14 @@ struct ToolLineBuilder {
     /// Where the call is before it runs, which its title names in place of
     /// the verb its indicator would give it.
     stage: Option<CallStage>,
+    images: Vec<ImageSpan>,
 }
 
 impl ToolLineBuilder {
     fn new(width: u16, indicator: Indicator, limits: RenderLimits) -> Self {
         Self {
             stage: None,
+            images: Vec::new(),
             sigil: COMPACT_FALLBACK_SIGIL,
             lines: Vec::new(),
             link_rows: Vec::new(),
@@ -2505,6 +2512,39 @@ impl ToolLineBuilder {
         )));
     }
 
+    /// The picture a tool showed or saved, drawn under its caption. A saved
+    /// file that is gone since says so instead.
+    fn push_picture(&mut self, output: Option<&ToolOutput>) {
+        let image = match output {
+            Some(ToolOutput::Image { source, .. }) => ImageRef::from_source(source, ""),
+            Some(ToolOutput::SavedImage { path, .. }) => {
+                let file = Path::new(path);
+                if !file.exists() {
+                    let dim = theme::current().tool_dim;
+                    self.lines.push(Line::from(vec![
+                        Span::styled(self.body_indent, dim),
+                        Span::styled(format!("{IMAGE_MISSING_PREFIX}{path}]"), dim),
+                    ]));
+                    return;
+                }
+                ImageRef::from_file(file, "")
+            }
+            _ => return,
+        };
+        let Some(image) = image else {
+            return;
+        };
+        let Some(drawn) = inline_image::draw(&image, self.body_width()) else {
+            return;
+        };
+        let start = self.lines.len();
+        self.lines.extend(indented(drawn, self.body_indent));
+        self.images.push(ImageSpan {
+            rows: start..self.lines.len(),
+            image,
+        });
+    }
+
     /// The markdown renderer keeps its own provenance against the text it
     /// parsed, which is not the card's source, so a card that draws prose
     /// copies by scraping rather than by slicing the wrong string.
@@ -2643,6 +2683,14 @@ impl ToolLineBuilder {
             truncation: self.truncation,
             rows: wrapped.expand(rows),
             source: source.map(|source| wrapped.body(source)),
+            images: self
+                .images
+                .into_iter()
+                .map(|image| ImageSpan {
+                    rows: wrapped.row_of(image.rows.start)..wrapped.row_of(image.rows.end),
+                    ..image
+                })
+                .collect(),
         }
     }
 }
@@ -3072,6 +3120,7 @@ pub fn build_tool_lines(
                 ToolOutput::Plain(t) | ToolOutput::Markdown(t) | ToolOutput::ReadDir(t) => {
                     Some(t.text.as_str())
                 }
+                ToolOutput::SavedImage { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .or(body);
@@ -3122,6 +3171,9 @@ pub fn build_tool_lines(
             resolved.dropped = 0;
         }
         b.push_resolved_output(&resolved);
+    }
+    if status == ToolStatus::Success && !rctx.compact {
+        b.push_picture(msg.tool_output.as_deref());
     }
     if let Some(ToolOutput::Shell(output)) = msg.tool_output.as_deref() {
         b.push_shell_footer(output, expanded.raw_view);
@@ -3389,6 +3441,7 @@ fn compact_instruction_lines(blocks: &[InstructionBlock]) -> ToolLines {
         rows: Vec::new(),
         truncation: true,
         source: None,
+        images: Vec::new(),
     }
 }
 
@@ -3403,6 +3456,7 @@ mod tests {
         NOT_TOLD_APART, assert_command_coloured, coloured,
     };
     use crate::components::{DisplayRole, ToolRole};
+    use crate::inline_image::tests::{png_bytes, png_source};
     use crate::markdown::{TRUNCATION_PREFIX, truncate_output};
     use crate::provenance::Provenance;
     use crate::selection::ScreenSelection;
@@ -3588,6 +3642,7 @@ mod tests {
             body_open: None,
             thinking_duration: None,
             tool_started: None,
+            images: Arc::default(),
         }
     }
 
@@ -3678,6 +3733,7 @@ mod tests {
             body_open: None,
             thinking_duration: None,
             tool_started: None,
+            images: Arc::default(),
         }
     }
 
@@ -5118,6 +5174,7 @@ mod tests {
             body_open: None,
             thinking_duration: None,
             tool_started: None,
+            images: Arc::default(),
         }
     }
 
@@ -5221,6 +5278,7 @@ mod tests {
             body_open: None,
             thinking_duration: None,
             tool_started: None,
+            images: Arc::default(),
         }
     }
 
@@ -5321,6 +5379,7 @@ mod tests {
             body_open: None,
             thinking_duration: None,
             tool_started: None,
+            images: Arc::default(),
         }
     }
 
@@ -5636,6 +5695,7 @@ mod tests {
             body_open: None,
             thinking_duration: None,
             tool_started: None,
+            images: Arc::default(),
         }
     }
 
@@ -6278,6 +6338,7 @@ mod tests {
             body_open: None,
             thinking_duration: None,
             tool_started: None,
+            images: Arc::default(),
         }
     }
 
@@ -7614,6 +7675,7 @@ mod tests {
             body_open: None,
             thinking_duration: None,
             tool_started: None,
+            images: Arc::default(),
         };
         let tl = build_tool_lines(
             &msg,
@@ -7661,6 +7723,7 @@ mod tests {
             body_open: None,
             thinking_duration: None,
             tool_started: None,
+            images: Arc::default(),
         };
         let tl = build_tool_lines(
             &msg,
@@ -8937,5 +9000,73 @@ mod tests {
             [MCP_COMPLETED, MCP_RESULT, RAW_AFFORDANCE]
         );
         assert_eq!(tl.raw_toggle_line, Some(rows.len() - 1));
+    }
+
+    const SAVED_PICTURE: &str = "saved.png";
+    const SAVED_TEXT: &str = "Generated image saved to saved.png";
+    const PICTURE_SIDE: u32 = 32;
+    const NO_CARD_PICTURE: &str = "a settled card draws its picture only when open and not compact";
+
+    #[derive(Clone, Copy, Debug)]
+    enum Shown {
+        Bytes,
+        SavedFile,
+        MissingFile,
+    }
+
+    fn picture_card(shown: Shown, status: ToolStatus, compact: bool) -> ToolLines {
+        let dir = tempfile::TempDir::new().expect(NO_CARD_PICTURE);
+        let path = dir.path().join(SAVED_PICTURE);
+        if !matches!(shown, Shown::MissingFile) {
+            std::fs::write(&path, png_bytes(PICTURE_SIDE, PICTURE_SIDE)).expect(NO_CARD_PICTURE);
+        }
+        let output = match shown {
+            Shown::Bytes => ToolOutput::Image {
+                source: png_source(PICTURE_SIDE, PICTURE_SIDE),
+                text: SAVED_TEXT.into(),
+            },
+            Shown::SavedFile | Shown::MissingFile => ToolOutput::SavedImage {
+                path: path.display().to_string(),
+                text: SAVED_TEXT.into(),
+            },
+        };
+        let msg = bash_msg(SAVED_TEXT, status, None, Some(output));
+        let rctx = match compact {
+            true => compact_rctx(80),
+            false => test_rctx(80),
+        };
+        build_tool_lines(&msg, status, &rctx, Some(exp(true)))
+    }
+
+    #[test_case(Shown::Bytes, ToolStatus::Success, false, true ; "viewed_bytes")]
+    #[test_case(Shown::SavedFile, ToolStatus::Success, false, true ; "saved_file")]
+    #[test_case(Shown::SavedFile, ToolStatus::Success, true, false ; "compact_card")]
+    #[test_case(Shown::SavedFile, ToolStatus::Error, false, false ; "failed_call")]
+    #[test_case(Shown::MissingFile, ToolStatus::Success, false, false ; "missing_file")]
+    fn a_picture_card_reserves_rows_for_its_picture(
+        shown: Shown,
+        status: ToolStatus,
+        compact: bool,
+        drawn: bool,
+    ) {
+        let tl = picture_card(shown, status, compact);
+
+        assert_eq!(tl.images.len(), usize::from(drawn), "{NO_CARD_PICTURE}");
+        if let Some(span) = tl.images.first() {
+            assert!(span.rows.end <= tl.lines.len(), "{NO_CARD_PICTURE}");
+            assert!(span.rows.start > 0, "{NO_CARD_PICTURE}");
+        }
+    }
+
+    #[test_case(Shown::SavedFile ; "saved_file")]
+    #[test_case(Shown::MissingFile ; "missing_file")]
+    fn a_saved_picture_keeps_its_caption(shown: Shown) {
+        let text = lines_text(&picture_card(shown, ToolStatus::Success, false));
+        assert!(text.contains(SAVED_TEXT), "{text}");
+        assert_eq!(
+            text.contains(IMAGE_MISSING_PREFIX),
+            matches!(shown, Shown::MissingFile),
+            "{text}"
+        );
     }
 }

@@ -222,6 +222,23 @@ pub mod key {
         label: "g",
     };
 
+    /// The image viewer's keys. Bare, since nothing in it takes text.
+    pub const IMAGE_OPEN_EXTERNAL: Bind = Bind {
+        code: KeyCode::Char('o'),
+        modifiers: KeyModifiers::NONE,
+        label: "o",
+    };
+    pub const IMAGE_OPEN_WORKBENCH: Bind = Bind {
+        code: KeyCode::Char('w'),
+        modifiers: KeyModifiers::NONE,
+        label: "w",
+    };
+    pub const IMAGE_COPY_PATH: Bind = Bind {
+        code: KeyCode::Char('y'),
+        modifiers: KeyModifiers::NONE,
+        label: "y",
+    };
+
     /// The plain keys every overlay's hint bar names. They carry no chord of
     /// their own; they exist so a hint can quote the same spelling a click
     /// resolves.
@@ -406,6 +423,7 @@ pub enum KeybindContext {
     QueueFocus,
     CommandPalette,
     PasteEditor,
+    ImageViewer,
     Review,
     Search,
     Logs,
@@ -450,6 +468,7 @@ impl KeybindContext {
             Self::QueueFocus => "Queue",
             Self::CommandPalette => "Commands",
             Self::PasteEditor => "Pasted Text",
+            Self::ImageViewer => "Image Viewer",
             Self::Review => "Review",
             Self::Search => "Search",
             Self::Logs => "Logs",
@@ -1032,6 +1051,26 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single("Esc"),
         description: "Cancel editing",
         context: KeybindContext::PasteEditor,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::IMAGE_OPEN_EXTERNAL.label),
+        description: "Open the picture in the system's image viewer",
+        context: KeybindContext::ImageViewer,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::IMAGE_OPEN_WORKBENCH.label),
+        description: "Open the picture's file in the workbench",
+        context: KeybindContext::ImageViewer,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::IMAGE_COPY_PATH.label),
+        description: "Copy the picture's path",
+        context: KeybindContext::ImageViewer,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::ESC.label),
+        description: "Close the viewer",
+        context: KeybindContext::ImageViewer,
     },
     Keybind {
         label: KeyLabel::Alt("↑", "↓"),

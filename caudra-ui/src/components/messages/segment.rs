@@ -1,3 +1,4 @@
+use crate::inline_image::ImageSpan;
 use crate::markdown::{DiagramSpan, LinkMap};
 use crate::provenance::Provenance;
 use crate::render_worker::RenderWorker;
@@ -111,6 +112,10 @@ pub(super) struct Segment {
     /// Drawn diagrams in `lines`, so a hover or a pan can find one by row.
     /// Like `provenance`, cleared by `set_lines` and restored after it.
     diagrams: Vec<DiagramSpan>,
+    /// Pictures drawn in `lines`, so a click can open one and a decode that
+    /// lands can find the segments still showing its placeholder. Cleared by
+    /// `set_lines` like `diagrams`.
+    images: Vec<ImageSpan>,
     links: LinkMap,
     pub search_text: String,
     pub tool_id: Option<String>,
@@ -280,6 +285,19 @@ impl Segment {
         self.diagrams = diagrams;
     }
 
+    pub fn images(&self) -> &[ImageSpan] {
+        &self.images
+    }
+
+    pub fn set_images(&mut self, images: Vec<ImageSpan>) {
+        self.images = images;
+    }
+
+    /// The picture drawn on `line`, if any.
+    pub fn image_at_line(&self, line: usize) -> Option<&ImageSpan> {
+        self.images.iter().find(|span| span.rows.contains(&line))
+    }
+
     pub fn set_links(&mut self, links: LinkMap) {
         debug_assert!(links.is_aligned(&self.lines));
         self.links = links;
@@ -323,6 +341,7 @@ impl Segment {
     pub fn set_lines(&mut self, lines: Vec<Line<'static>>) {
         self.lines = lines;
         self.diagrams.clear();
+        self.images.clear();
         self.links = LinkMap::none_for(&self.lines);
         // Line indices moved, so any provenance or row recorded for the old
         // vector no longer lines up.
@@ -491,6 +510,7 @@ impl Segment {
         self.truncation = tl.truncation;
         self.set_lines(tl.lines);
         self.set_links(tl.links);
+        self.set_images(tl.images);
         self.rows = tl.rows;
         self.set_source(tl.source);
         for index in 0..self.highlights.len() {
@@ -1169,6 +1189,7 @@ mod tests {
             rows: Vec::new(),
             truncation: false,
             source: None,
+            images: Vec::new(),
         }
     }
 

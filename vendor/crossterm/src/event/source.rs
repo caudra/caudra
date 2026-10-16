@@ -24,6 +24,9 @@ pub(crate) trait EventSource: Sync + Send {
     #[cfg(unix)]
     fn set_program_status_query(&mut self, _enabled: bool) {}
 
+    #[cfg(unix)]
+    fn set_graphics_query(&mut self, _enabled: bool) {}
+
     /// Returns a `Waker` allowing to wake/force the `try_read` method to return `Ok(None)`.
     #[cfg(feature = "event-stream")]
     fn waker(&self) -> Waker;

@@ -23,7 +23,7 @@ pub mod transfer;
 mod view;
 
 pub use action::WorkbenchAction;
-pub use editor::rendered::{PaintMarkdown, PaintedMarkdown};
+pub use editor::rendered::{PaintImage, PaintMarkdown, PaintedMarkdown};
 pub use editor::{DocumentKey, TabLabel, buffer, history, render, text_field};
 pub use fs::backend::{
     BackendDriver, BackendError, BackendEvent, BackendRevision, ListResult, LoadedFile,
@@ -536,6 +536,7 @@ pub struct Workbench {
     /// The host's Markdown painter, lent for the rendered view. Without one no
     /// tab is offered that view and its chord stays the host's.
     markdown: Option<PaintMarkdown>,
+    image: Option<PaintImage>,
     panes: PaneRects,
     /// One per bar drawn, so a grab knows which pane it is holding and a drag
     /// survives the pointer wandering out of that pane's column.
@@ -633,6 +634,7 @@ impl Workbench {
             scrollbars: true,
             theme_generation: 0,
             markdown: None,
+            image: None,
             panes: PaneRects::default(),
             bars: Bars::default(),
             tree: Tree::default(),
@@ -1129,6 +1131,10 @@ impl Workbench {
     /// Markdown tab its rendered view.
     pub fn set_markdown_painter(&mut self, paint: PaintMarkdown) {
         self.markdown = Some(paint);
+    }
+
+    pub fn set_image_painter(&mut self, paint: PaintImage) {
+        self.image = Some(paint);
     }
 
     /// Whether a background worker owes an answer, so the host knows to look

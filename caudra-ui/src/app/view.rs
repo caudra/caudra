@@ -713,6 +713,10 @@ impl App {
         if r.width > 0 {
             overlay_rect = r;
         }
+        let r = self.image_viewer.view(frame, full);
+        if r.width > 0 {
+            overlay_rect = r;
+        }
         // Last, so a pending chord's list sits over whatever it was armed on.
         let chords = keybindings::leader_chords(&self.leader_contexts(), self.features);
         let r = self.which_key.view(frame, full, &chords);
@@ -997,6 +1001,8 @@ impl App {
             if self.workbench.focus() == Focus::Editor && !self.workbench.transfer_input_active() {
                 contexts.push(KeybindContext::WorkbenchEditor);
             }
+        } else if self.image_viewer.is_open() {
+            contexts.push(KeybindContext::ImageViewer);
         } else if self.paste_editor.is_open() {
             contexts.push(KeybindContext::PasteEditor);
         } else if self.review.is_open() {

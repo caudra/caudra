@@ -4,6 +4,8 @@ use super::segment::{Segment, SegmentCache};
 use crate::provenance::Provenance;
 use crate::selection::{self, LineBreaks, ScreenSelection, Selection};
 
+use std::ops::Range;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::{Paragraph, Widget, Wrap};
@@ -110,46 +112,56 @@ pub(super) fn extract_segment_fragment(
             .saturating_sub(msg_area.x.saturating_add(chrome.left))
     };
 
-    let screen_selection = ScreenSelection {
-        start_row: rel_start,
-        start_col,
-        end_row: rel_end.saturating_sub(1),
-        end_col,
+    let extract = |from: u16, to: u16| {
+        let screen_selection = ScreenSelection {
+            start_row: rel_start,
+            start_col,
+            end_row: rel_end.saturating_sub(1),
+            end_col,
+        };
+        segment
+            .provenance()
+            .and_then(|provenance| {
+                extract_with_code_block(
+                    segment,
+                    provenance,
+                    viewport_width,
+                    content_width,
+                    &screen_selection,
+                    from,
+                    to,
+                )
+            })
+            .unwrap_or_else(|| {
+                let area = Rect::new(0, 0, content_width, content_height);
+                let mut buffer = Buffer::empty(area);
+                Paragraph::new(segment.lines().to_vec())
+                    .wrap(Wrap { trim: false })
+                    .render(area, &mut buffer);
+
+                let breaks = LineBreaks::from_lines(segment.lines(), content_width);
+                let mut text = String::new();
+                selection::append_rows(
+                    &buffer,
+                    area,
+                    &screen_selection,
+                    from,
+                    to,
+                    &mut text,
+                    &breaks,
+                );
+                (text, None)
+            })
     };
-
-    let (text, language) = segment
-        .provenance()
-        .and_then(|provenance| {
-            extract_with_code_block(
-                segment,
-                provenance,
-                viewport_width,
-                content_width,
-                &screen_selection,
-                rel_start,
-                rel_end,
-            )
-        })
-        .unwrap_or_else(|| {
-            let area = Rect::new(0, 0, content_width, content_height);
-            let mut buffer = Buffer::empty(area);
-            Paragraph::new(segment.lines().to_vec())
-                .wrap(Wrap { trim: false })
-                .render(area, &mut buffer);
-
-            let breaks = LineBreaks::from_lines(segment.lines(), content_width);
-            let mut text = String::new();
-            selection::append_rows(
-                &buffer,
-                area,
-                &screen_selection,
-                rel_start,
-                rel_end,
-                &mut text,
-                &breaks,
-            );
-            (text, None)
-        });
+    let (text, language) = match picture_rows(segment, viewport_width, content_start) {
+        pictures if pictures.is_empty() => extract(rel_start, rel_end),
+        pictures => (
+            splice_pictures(&pictures, rel_start, rel_end, |from, to| {
+                extract(from, to).0
+            }),
+            None,
+        ),
+    };
     Some(SelectionFragment {
         kind: segment.kind(),
         msg_index: segment.msg_index,
@@ -157,6 +169,57 @@ pub(super) fn extract_segment_fragment(
         text,
         language,
     })
+}
+
+/// The content rows each picture in `segment` covers, with the markdown that
+/// names it. A picture with no file, such as a pasted one, has nothing to name
+/// and copies as nothing.
+fn picture_rows(segment: &Segment, width: u16, content_start: u16) -> Vec<(Range<u16>, String)> {
+    segment
+        .images()
+        .iter()
+        .map(|span| {
+            let (first, count) = segment.rows_for_lines(span.rows.start, span.rows.len(), width);
+            let start = first.saturating_sub(content_start);
+            let markdown = span
+                .image
+                .path()
+                .map_or_else(String::new, |_| span.image.markdown());
+            (start..start + count, markdown)
+        })
+        .collect()
+}
+
+/// The selected rows with every picture they cross copied as its markdown,
+/// rather than as the glyphs that draw it.
+fn splice_pictures(
+    pictures: &[(Range<u16>, String)],
+    rel_start: u16,
+    rel_end: u16,
+    extract: impl Fn(u16, u16) -> String,
+) -> String {
+    let rows = |from: u16, to: u16| match from < to {
+        true => extract(from, to),
+        false => String::new(),
+    };
+    let mut parts = Vec::new();
+    let mut at = rel_start;
+    for (picture, markdown) in pictures {
+        let first = picture.start.clamp(at, rel_end);
+        let last = picture.end.clamp(first, rel_end);
+        if first == last {
+            continue;
+        }
+        parts.push(rows(at, first));
+        parts.push(markdown.clone());
+        at = last;
+    }
+    parts.push(rows(at, rel_end));
+    parts
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Copies the selected rows, keeping a card's code apart from whatever else

@@ -18,6 +18,8 @@ use crossterm::event::{
 #[cfg(not(windows))]
 use crossterm::event::{DisableFocusChange, EnableFocusChange};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+
+use crate::inline_image;
 use ratatui::buffer::{Cell, CellDiffOption};
 
 /// XTPUSHTITLE saves whatever title the shell left on the window, so the
@@ -129,6 +131,9 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let started = Instant::now();
+        if let Some(sequence) = inline_image::exit_output() {
+            let _ = write_sequence(&sequence);
+        }
         pop_terminal_modes();
         ratatui::restore();
         tracing::info!(
@@ -183,7 +188,19 @@ fn resume(terminal: &mut ratatui::DefaultTerminal) {
     terminal::enable_raw_mode().ok();
     push_keyboard_enhancement();
     set_appearance_reporting(true);
+    inline_image::forget_uploads();
     let _ = terminal.clear();
+}
+
+/// Sends the terminal what the pictures about to be drawn need: uploads, and
+/// deletes for recycled ids. Kept out of the frame so the diff never carries
+/// image data.
+pub(crate) fn flush_image_output() -> std::io::Result<()> {
+    let output = inline_image::take_output();
+    match output.is_empty() {
+        true => Ok(()),
+        false => write_sequence(&output),
+    }
 }
 
 pub(crate) fn set_appearance_reporting(enabled: bool) {

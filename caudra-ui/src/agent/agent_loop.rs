@@ -453,7 +453,6 @@ impl AgentLoop {
         let result = match entry {
             QueueItem::Message {
                 text,
-                image_count,
                 input,
                 displayed,
                 ..
@@ -462,7 +461,7 @@ impl AgentLoop {
                     let _ = event_tx.send(AgentEvent::QueueItemConsumed {
                         id,
                         text,
-                        image_count,
+                        images: input.images.clone(),
                     });
                 }
                 self.do_agent_run(*input, event_tx, run_id).await
@@ -498,7 +497,6 @@ impl AgentLoop {
         for (id, entry) in entries {
             let QueueItem::Message {
                 text,
-                image_count,
                 input,
                 displayed: false,
                 ..
@@ -509,7 +507,7 @@ impl AgentLoop {
             consumed.push(caudra_agent::QueueConsumedItem {
                 id,
                 text,
-                image_count,
+                images: input.images.clone(),
             });
             inputs.push(*input);
         }

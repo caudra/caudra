@@ -195,6 +195,15 @@ pub fn query_program_status(timeout: Duration) -> io::Result<bool> {
     internal::query_program_status(timeout)
 }
 
+/// Asks the terminal whether it implements the Kitty graphics protocol, with
+/// a primary device attributes request as the fence a terminal that does not
+/// answers anyway, so an unsupporting terminal costs one round trip rather
+/// than the whole timeout.
+#[cfg(unix)]
+pub fn query_kitty_graphics(timeout: Duration) -> io::Result<bool> {
+    internal::query_kitty_graphics(timeout)
+}
+
 /// Reads a single [`Event`](enum.Event.html).
 ///
 /// This function blocks until an [`Event`](enum.Event.html) is available. Combine it with the

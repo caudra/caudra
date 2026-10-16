@@ -117,6 +117,16 @@ version = 1
 # Type: string.
 # mermaid = "unicode"
 
+# How the transcript draws images that `view_image` reads, `image_generate`
+# saves, and markdown names with `![alt](path)`: auto (Kitty graphics where the
+# terminal supports them, coloured quadrant blocks anywhere else), kitty,
+# blocks, sextants (sharper blocks, for fonts and terminals that draw Unicode
+# 13 sextants, such as Ghostty, kitty, WezTerm, and foot), or off (show only
+# the caption; `false` also turns them off). Markdown images are read from
+# local files only and never fetched.
+# Type: string.
+# inline_images = "auto"
+
 # Duration of ordinary status-bar messages (ms). Confirmation prompts use a
 # fixed 3-second window.
 # Type: u64.

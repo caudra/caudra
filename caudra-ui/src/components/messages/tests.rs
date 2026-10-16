@@ -12,6 +12,7 @@ use crate::components::tool_display::{
     AWAITING_APPROVAL, CARD_AFFORDANCE, FOLLOWING, NOTICE_PREFIX, PAUSED, WRITING_PROMPT,
     scroll_footer_text, task_details,
 };
+use crate::inline_image::tests::{PIXEL_SYMBOL, decode_queued, png_bytes, png_source};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
 use caudra_agent::commits::repo::CommitSummary;
@@ -14128,4 +14129,70 @@ fn copying_a_rerank_card_copies_its_answer(raw: bool) {
         answer,
         "{COPIED_ANSWER_MSG}"
     );
+}
+
+const PROMPT_WITH_PICTURE: &str = "look at this";
+const PICTURE_PANEL: (u16, u16) = (60, 30);
+const PROMPT_PICTURE_SIDE: u32 = 32;
+const NO_PROMPT_PICTURE: &str = "a prompt's attached picture was not drawn or not clickable";
+
+#[test]
+fn a_prompt_draws_its_pictures_and_a_click_opens_them() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let mut message = DisplayMessage::new(DisplayRole::User, PROMPT_WITH_PICTURE.into());
+    message.images = Arc::from([png_source(PROMPT_PICTURE_SIDE, PROMPT_PICTURE_SIDE)]);
+    panel.push(message);
+    render(&mut panel, PICTURE_PANEL.0, PICTURE_PANEL.1);
+    decode_queued();
+    let _ = panel.tick();
+    let terminal = render(&mut panel, PICTURE_PANEL.0, PICTURE_PANEL.1);
+    let buffer = terminal.backend().buffer();
+    let area = buffer.area;
+
+    let (column, row) = (0..area.height)
+        .flat_map(|row| (0..area.width).map(move |column| (column, row)))
+        .find(|&at| buffer[at].symbol() == PIXEL_SYMBOL)
+        .expect(NO_PROMPT_PICTURE);
+    let image = panel.image_at(row, column, area).expect(NO_PROMPT_PICTURE);
+
+    assert_eq!(image.alt(), image_chip_label(0), "{NO_PROMPT_PICTURE}");
+    assert_eq!(
+        panel
+            .image_at(0, 0, area)
+            .map(|image| image.alt().to_owned()),
+        None
+    );
+}
+
+const SAVED_CARD_PICTURE: &str = "card.png";
+const SAVED_CARD_TEXT: &str = "Generated image saved to card.png";
+const COPIED_GLYPHS: &str = "copying a picture card copied the glyphs that draw it";
+
+#[test]
+fn copying_a_picture_card_names_the_file_instead_of_its_glyphs() {
+    let dir = tempfile::TempDir::new().expect(COPIED_GLYPHS);
+    let path = dir.path().join(SAVED_CARD_PICTURE);
+    std::fs::write(&path, png_bytes(PROMPT_PICTURE_SIDE, PROMPT_PICTURE_SIDE))
+        .expect(COPIED_GLYPHS);
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start(TOOL_ID, IMAGE_GENERATE_TOOL_NAME));
+    panel.tool_done(ToolDoneEvent {
+        tool: IMAGE_GENERATE_TOOL_NAME.into(),
+        output: ToolOutput::SavedImage {
+            path: path.display().to_string(),
+            text: SAVED_CARD_TEXT.into(),
+        },
+        ..done(TOOL_ID)
+    });
+    render(&mut panel, PICTURE_PANEL.0, PICTURE_PANEL.1);
+    decode_queued();
+    let _ = panel.tick();
+
+    let copied = extract_entire_document(&mut panel);
+
+    assert!(
+        copied.contains(&format!("![]({})", path.display())),
+        "{copied}"
+    );
+    assert!(!copied.contains(PIXEL_SYMBOL), "{COPIED_GLYPHS}: {copied}");
 }

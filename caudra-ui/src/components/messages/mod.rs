@@ -30,9 +30,11 @@ use super::{
 use crate::animation::{live_elapsed, spinner_str};
 use crate::chat::batch_child_id;
 use crate::components::commit_popup::CommitIndex;
+use crate::components::input::image_chip_label;
 use crate::components::keybindings::key;
 use crate::components::prompt_progress::{self, PromptProgress, PromptRate};
 use crate::highlight;
+use crate::inline_image::{self, ImageRef, ImageSpan};
 use crate::markdown::{
     DiagramSpan, LinkMap, TerminalLink, hr_line, plain_lines, text_to_painted, text_to_rows,
     truncate_output, truncate_output_tail,
@@ -51,6 +53,7 @@ use caudra_workflow::RunSnapshot;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::iter;
 use std::mem::{self, Discriminant};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -945,6 +948,8 @@ pub struct MessagesPanel {
     last_total_lines: u32,
     hl_worker: RenderWorker,
     theme_generation: u64,
+    /// The picture store's generation this transcript last drew against.
+    image_generation: u64,
     highlight_segment: Option<usize>,
     idle_splash: Splash,
     accent: ColorTransition,
@@ -1103,6 +1108,7 @@ impl MessagesPanel {
             last_total_lines: 0,
             hl_worker: RenderWorker::new(),
             theme_generation: theme::generation(),
+            image_generation: inline_image::generation(),
             highlight_segment: None,
             idle_splash: Splash::new(ui_config.splash_animation),
             accent: ColorTransition::new(theme::current().mode_build),
@@ -1265,10 +1271,13 @@ impl MessagesPanel {
     /// to a server Caudra knows nothing else about, and three rows of either
     /// say next to nothing. A session restored from before the server's
     /// blocks were kept has only text, and keeps resting at the budget.
+    ///
+    /// A card with a picture rests open too, since the picture is what the
+    /// call was for.
     fn rests_whole(&self, msg_index: usize) -> bool {
         matches!(
             self.messages[msg_index].tool_output.as_deref(),
-            Some(ToolOutput::Mcp(_))
+            Some(ToolOutput::Mcp(_) | ToolOutput::Image { .. } | ToolOutput::SavedImage { .. })
         )
     }
 
@@ -3476,6 +3485,25 @@ impl MessagesPanel {
         Some((source, offset))
     }
 
+    /// The picture drawn under the pointer, which a click opens in the viewer.
+    pub(crate) fn image_at(&self, row: u16, col: u16, area: Rect) -> Option<ImageRef> {
+        if !area.contains(Position::new(col, row)) {
+            return None;
+        }
+        let width = self.viewport_width;
+        let doc_row = self.doc_row(row, area);
+        let (_, segment, start) = self.cache.segment_at_row(doc_row, width)?;
+        if segment.images().is_empty() {
+            return None;
+        }
+        let rel = u16::try_from(doc_row - start).ok()?;
+        let line = segment.source_line_at(rel, width)?;
+        let span = segment.image_at_line(line)?;
+        let column = col.checked_sub(area.x + segment.chrome(width).left)?;
+        let drawn = segment.lines().get(line)?.width();
+        (usize::from(column) < drawn).then(|| span.image.clone())
+    }
+
     fn mention_at_mode(
         &self,
         row: u16,
@@ -4046,7 +4074,26 @@ impl MessagesPanel {
     /// run inside [`Self::view`], which is why a running tool had to claim it
     /// was animating: it was the only way to keep them fed.
     pub fn tick(&mut self) -> Dirty {
-        self.drain_highlights() | self.poll_live_bufs()
+        self.drain_highlights() | self.poll_live_bufs() | self.refresh_images()
+    }
+
+    /// Redraws the segments holding a picture once anything they could show
+    /// has changed: a decode landed, or the mode, cell size or workspace
+    /// moved. Their rows were reserved up front, so only their content changes.
+    fn refresh_images(&mut self) -> Dirty {
+        let generation = inline_image::generation();
+        if generation == self.image_generation {
+            return Dirty::NO;
+        }
+        self.image_generation = generation;
+        let mut dirty = Dirty::NO;
+        for seg in self.cache.segments_mut() {
+            if !seg.images().is_empty() {
+                seg.stale = true;
+                dirty = Dirty::YES;
+            }
+        }
+        dirty
     }
 
     pub fn cadence(&self) -> Cadence {
@@ -4064,6 +4111,7 @@ impl MessagesPanel {
             Cadence::when(!self.streaming_thinking.is_empty(), Cadence::SPINNER),
             Cadence::when(smooth, Cadence::SMOOTH),
             Cadence::when(self.show_idle_splash(), self.idle_splash.cadence()),
+            Cadence::when(inline_image::is_pending(), Cadence::PENDING),
         ])
     }
 
@@ -6297,12 +6345,13 @@ fn build_message_lines(
             lines,
             provenance: Some(Provenance::new(msg.text.as_str().into(), provenance)),
             diagrams: Vec::new(),
+            images: Vec::new(),
             scroll_span: None,
             scroll_footer_line: None,
         };
     }
-    let (mut lines, mut provenance, mut diagrams, mut links) = if style.use_markdown {
-        let (painted, parsed) = text_to_painted(
+    let (mut lines, mut provenance, mut diagrams, mut links, mut images) = if style.use_markdown {
+        let (mut painted, parsed) = text_to_painted(
             &msg.text,
             prefix,
             style.text_style,
@@ -6311,16 +6360,18 @@ fn build_message_lines(
             style.max_line_bytes,
             diagram_pans,
         );
+        let images = painted.draw_images(width);
         (
             painted.lines,
             Some(Provenance::new(parsed, painted.provenance)),
             painted.diagrams,
             painted.links,
+            images,
         )
     } else {
         let lines = plain_lines(&msg.text, prefix, style.text_style, style.prefix_style);
         let links = LinkMap::none_for(&lines);
-        (lines, None, Vec::new(), links)
+        (lines, None, Vec::new(), links, Vec::new())
     };
     if let Some(pp) = &msg.plan_path {
         if !msg.text.is_empty() {
@@ -6330,6 +6381,9 @@ fn build_message_lines(
             }
             for diagram in &mut diagrams {
                 diagram.rows = diagram.rows.start + 1..diagram.rows.end + 1;
+            }
+            for image in &mut images {
+                image.rows = image.rows.start + 1..image.rows.end + 1;
             }
             lines.insert(0, rule.clone());
             links.rows.insert(0, vec![None; rule.spans.len()]);
@@ -6345,6 +6399,7 @@ fn build_message_lines(
             links.rows.clear();
             provenance = None;
             diagrams.clear();
+            images.clear();
         }
         if !msg.text.is_empty() {
             lines.push(Line::from(""));
@@ -6376,6 +6431,26 @@ fn build_message_lines(
             provenance.push_chrome_line(lines.last().unwrap().spans.len());
         }
     }
+    for (index, source) in msg.images.iter().enumerate() {
+        let Some(image) = ImageRef::from_source(source, &image_chip_label(index)) else {
+            continue;
+        };
+        let Some(drawn) = inline_image::draw(&image, width) else {
+            continue;
+        };
+        let start = lines.len() + 1;
+        for line in iter::once(Line::default()).chain(drawn) {
+            links.rows.push(vec![None; line.spans.len()]);
+            if let Some(provenance) = provenance.as_mut() {
+                provenance.push_chrome_line(line.spans.len());
+            }
+            lines.push(line);
+        }
+        images.push(ImageSpan {
+            rows: start..lines.len(),
+            image,
+        });
+    }
     let search_text = format!("{prefix}{}", msg.text);
     BuiltMessage {
         lines,
@@ -6383,6 +6458,7 @@ fn build_message_lines(
         provenance,
         diagrams,
         links,
+        images,
         scroll_span: None,
         scroll_footer_line: None,
     }
@@ -6435,6 +6511,7 @@ struct BuiltMessage {
     provenance: Option<Provenance>,
     diagrams: Vec<DiagramSpan>,
     links: LinkMap,
+    images: Vec<ImageSpan>,
     /// The window a reasoning body is drawn in, present only while it hides
     /// rows, and the footer row that says which.
     scroll_span: Option<ScrollSpan>,
@@ -6450,6 +6527,7 @@ impl BuiltMessage {
             search_text,
             provenance: None,
             diagrams: Vec::new(),
+            images: Vec::new(),
             scroll_span: None,
             scroll_footer_line: None,
         }
@@ -6463,6 +6541,7 @@ fn install_built(seg: &mut Segment, built: BuiltMessage) {
     seg.set_links(built.links);
     seg.set_provenance(built.provenance);
     seg.set_diagrams(built.diagrams);
+    seg.set_images(built.images);
     seg.search_text = built.search_text;
     seg.scroll_spans = built.scroll_span.into_iter().collect();
     seg.scroll_footer_line = built.scroll_footer_line;

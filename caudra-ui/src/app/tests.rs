@@ -3870,7 +3870,7 @@ fn the_interrupt_chord_replaces_active_run_and_preserves_pending_queue() {
         .find(|entry| entry.admission == Some(caudra_agent::PromptAdmission::Interrupt))
         .unwrap()
         .id;
-    app.on_queue_item_consumed(replacement_id, "replace now", 0);
+    app.on_queue_item_consumed(replacement_id, "replace now".into(), Arc::default());
 
     assert_eq!(app.cancelling_run, None);
     assert_eq!(app.status, Status::Streaming);
@@ -4078,7 +4078,7 @@ fn queue_item_consumed_pushes_deferred_user_message() {
         AgentEvent::QueueItemConsumed {
             id: caudra_agent::QueueItemId::new(),
             text: "queued".into(),
-            image_count: 0,
+            images: Vec::new(),
         },
         app.run_id,
     ));
@@ -4089,6 +4089,30 @@ fn queue_item_consumed_pushes_deferred_user_message() {
         app.main_chat().last_message_role(),
         Some(&DisplayRole::User),
     );
+}
+
+#[test]
+fn a_queued_prompt_keeps_its_pictures_when_the_agent_picks_it_up() {
+    const QUEUED_PROMPT: &str = "look at this";
+    let mut app = test_app();
+    type_and_submit(&mut app, "first");
+    let image = ImageSource::new(ImageMediaType::Png, Arc::from("aW1hZ2U="));
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::QueueItemConsumed {
+            id: caudra_agent::QueueItemId::new(),
+            text: QUEUED_PROMPT.into(),
+            images: vec![image.clone()],
+        },
+        app.run_id,
+    ));
+
+    let chat = app.main_chat();
+    let bubble = chat
+        .message_at(chat.message_count() - 1)
+        .expect("queued bubble missing");
+    assert_eq!(bubble.text, format_with_images(QUEUED_PROMPT, 1));
+    assert_eq!(&*bubble.images, [image]);
 }
 
 #[test]
@@ -4144,7 +4168,7 @@ fn queue_item_consumed_marks_agent_streaming() {
         AgentEvent::QueueItemConsumed {
             id: caudra_agent::QueueItemId::new(),
             text: "restored".into(),
-            image_count: 0,
+            images: Vec::new(),
         },
         app.run_id,
     ));
@@ -5949,7 +5973,7 @@ fn focused_running_subagent_composer_steers_at_the_child_queue() {
         AgentEvent::QueueItemConsumed {
             id: queued[0].id,
             text: STEER.into(),
-            image_count: 0,
+            images: Vec::new(),
         },
         info,
     ));
@@ -11353,12 +11377,12 @@ fn consumed_batch_renders_separate_grouped_user_bubbles() {
             caudra_agent::QueueConsumedItem {
                 id: caudra_agent::QueueItemId::new(),
                 text: "first".into(),
-                image_count: 0,
+                images: Vec::new(),
             },
             caudra_agent::QueueConsumedItem {
                 id: caudra_agent::QueueItemId::new(),
                 text: "second".into(),
-                image_count: 0,
+                images: Vec::new(),
             },
         ],
     }));
@@ -28480,6 +28504,18 @@ mod theme_colours {
             name: "paste_editor",
             open: |app, _| open_permission_test_editor(app),
             shown: |app| app.paste_editor.is_open(),
+        },
+        Surface {
+            name: "image_viewer",
+            open: |app, _| {
+                let image = crate::inline_image::ImageRef::from_source(
+                    &crate::inline_image::tests::png_source(4, 4),
+                    "",
+                )
+                .unwrap();
+                app.open_image_viewer(image);
+            },
+            shown: |app| app.image_viewer.is_open(),
         },
         Surface {
             name: "rewind_picker",

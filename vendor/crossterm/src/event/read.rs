@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use crate::event::filter::ProgramStatusFilter;
+use crate::event::filter::{KittyGraphicsFilter, ProgramStatusFilter};
 #[cfg(unix)]
 use std::io::Write;
 use std::{collections::vec_deque::VecDeque, io, time::Duration};
@@ -68,6 +68,39 @@ impl InternalEventReader {
         })();
         if let Some(source) = self.source.as_mut() {
             source.set_program_status_query(false);
+        }
+        result
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn query_kitty_graphics(
+        &mut self,
+        timeout: Duration,
+        output: &mut impl Write,
+    ) -> io::Result<bool> {
+        const QUERY: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c";
+        if let Some(source) = self.source.as_mut() {
+            source.set_graphics_query(true);
+        }
+        let result = (|| {
+            let timeout = PollTimeout::new(Some(timeout));
+            output.write_all(QUERY)?;
+            output.flush()?;
+            let mut supported = false;
+            while self.poll(timeout.leftover(), &KittyGraphicsFilter)? {
+                match self.try_read(&KittyGraphicsFilter) {
+                    Some(InternalEvent::KittyGraphicsReply(ok)) => supported = ok,
+                    Some(InternalEvent::PrimaryDeviceAttributes) => return Ok(supported),
+                    _ => return Ok(false),
+                }
+                if timeout.elapsed() {
+                    break;
+                }
+            }
+            Ok(supported)
+        })();
+        if let Some(source) = self.source.as_mut() {
+            source.set_graphics_query(false);
         }
         result
     }
@@ -188,6 +221,10 @@ mod program_status_tests {
             self.parser.set_program_status_query(enabled);
         }
 
+        fn set_graphics_query(&mut self, enabled: bool) {
+            self.parser.set_graphics_query(enabled);
+        }
+
         fn try_read(&mut self, _timeout: Option<Duration>) -> io::Result<Option<InternalEvent>> {
             loop {
                 if let Some(event) = self.parser.next() {
@@ -285,6 +322,28 @@ mod program_status_tests {
             vec![InternalEvent::Event(Event::Key(KeyCode::Char('a').into()))]
         );
         assert!(reader.events.is_empty());
+    }
+
+    const GRAPHICS_QUERY: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c";
+
+    #[test_case(b"\x1b_Gi=31;OK\x1b\\\x1b[?62;4c", true; "ok_then_fence")]
+    #[test_case(b"\x1b_Gi=31;ENOTSUPPORTED:no\x1b\\\x1b[?62c", false; "error_then_fence")]
+    #[test_case(b"\x1b[?62c", false; "fence_only")]
+    #[test_case(b"", false; "timeout")]
+    fn kitty_graphics_query_needs_ok_before_fence(reply: &[u8], expected: bool) {
+        for chunk_size in [1, 3, usize::MAX] {
+            let mut reader = reader(&[b"a".as_slice(), reply].concat(), chunk_size, None);
+            let mut output = Vec::new();
+            assert_eq!(
+                reader.query_kitty_graphics(TIMEOUT, &mut output).unwrap(),
+                expected
+            );
+            assert_eq!(output, GRAPHICS_QUERY);
+            assert_eq!(
+                remaining_input(&mut reader),
+                vec![InternalEvent::Event(Event::Key(KeyCode::Char('a').into()))]
+            );
+        }
     }
 
     #[test_case(io::ErrorKind::BrokenPipe; "io_error")]

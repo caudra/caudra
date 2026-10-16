@@ -26,6 +26,10 @@ Preview 10 lets MCP snippets ask the decision engine typed questions and rerank 
 
 - **`decide()` takes OpenAI Decisions questions.** A choice option or a score level can carry a description, as a map with `value` or `label` and `description`, and each answer lists the probability of every option or level. Both decision protocols return the same shape. `rerank()` is unchanged.
 
+### Transcript
+
+- **Pictures in the transcript.** `view_image` and `image_generate` cards, Markdown images that point at local files, and prompts with attached images now show the picture as a thumbnail. Terminals that support Kitty graphics get the full-resolution picture, and other terminals get coloured blocks, two by two pixels to a cell, or two by three with `inline_images = "sextants"` in terminals and fonts that draw sextants. Click a picture to open it at full size, then press `o` to open it in your system viewer, `w` to open it in the workbench, or `y` to copy its path. Images attached to a draft show as `[Image #1]` chips you can click, and the workbench shows image files instead of the binary file notice. Markdown images are never fetched from the network. Set `[ui] inline_images` to `"blocks"`, `"sextants"`, `"kitty"`, or `"off"` to choose. See [Images](/docs/markdown/#images).
+
 ### Image generation
 
 - **ChatGPT subscription image generation uses a supported model.** Image requests now run through GPT-6.1 Sol instead of GPT-5.5, which OpenAI retired from Codex with ChatGPT sign-in on October 14. This fixes the unsupported-model error without changing your configured image model or switching to API billing.

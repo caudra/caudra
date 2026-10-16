@@ -21,6 +21,7 @@ pub(crate) mod form;
 pub(crate) mod gauge;
 pub(crate) mod goal_panel;
 pub(crate) mod help_modal;
+pub(crate) mod image_viewer;
 pub mod input;
 pub(crate) mod json_text;
 pub(crate) mod json_tree;
@@ -1132,6 +1133,8 @@ pub enum Action {
     },
     GenerateSessionTitle(caudra_storage::id::CaudraId),
     OpenUrl(String),
+    /// A local file for the system's own viewer.
+    OpenFile(std::path::PathBuf),
     Btw(String),
     Extract,
 }
@@ -1368,6 +1371,8 @@ pub struct DisplayMessage {
     /// verdict: the clock measures the command, not the prompt in front of it.
     /// Absent on a restored card, which has no live phase to time.
     pub tool_started: Option<Instant>,
+    /// Pictures a prompt carried, drawn under its text.
+    pub images: Arc<[ImageSource]>,
 }
 
 impl DisplayMessage {
@@ -1446,6 +1451,7 @@ impl DisplayMessage {
             body_open: None,
             thinking_duration: None,
             tool_started: None,
+            images: Arc::default(),
         }
     }
 
@@ -1473,6 +1479,7 @@ impl DisplayMessage {
             body_open: None,
             thinking_duration: None,
             tool_started: None,
+            images: Arc::default(),
         }
     }
 

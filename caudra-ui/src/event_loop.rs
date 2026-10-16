@@ -119,6 +119,7 @@ use crate::components::{
     Action, ExitRequest, ForkDraft, ForkedSession, PlanHandoff, Status, SubscriptionProvider,
 };
 use crate::config_problems::ConfigProblems;
+use crate::inline_image;
 use crate::input::InputReader;
 use crate::repaint::{Dirty, FrameLimiter, IDLE_POLL};
 use crate::theme;
@@ -1852,6 +1853,7 @@ impl<'t> EventLoop<'t> {
         .set_global();
 
         caudra_workbench::scroll::set_touch(ui_config.touch.enabled(terminal::detect_touch));
+        inline_image::configure(ui_config.inline_images);
 
         let pane_signals = PaneSignals::new(ui_config.notifications, host_reporter);
         let mut ctx = SpawnCtx {
@@ -2081,6 +2083,10 @@ impl<'t> EventLoop<'t> {
             if painted {
                 urgent = false;
                 let app = &mut self.sessions[self.focused].app;
+                app.sync_image_root();
+                if let Err(error) = terminal::flush_image_output() {
+                    tracing::warn!(%error, "image upload failed");
+                }
                 if let Err(e) = self.terminal.draw(|f| {
                     app.view(f);
                     color_compat::downgrade_if_needed(f.buffer_mut());
@@ -3689,6 +3695,7 @@ impl<'t> EventLoop<'t> {
             // Reattaching a multiplexer to another terminal resizes the
             // viewport, and that terminal may not share the old background.
             Event::Resize(..) => {
+                inline_image::refresh_cell_size();
                 for runtime in &mut self.sessions {
                     runtime.app.peer_manager.invalidate_layout();
                     runtime.app.dismiss_tooltip();
@@ -4762,6 +4769,15 @@ impl<'t> EventLoop<'t> {
                             .app
                             .flash(format!("Failed to open URL: {error}"));
                     }
+                }
+            }
+            Action::OpenFile(path) => {
+                if terminal::local_url_opener_available()
+                    && let Err(error) = open::that(&path)
+                {
+                    self.sessions[idx]
+                        .app
+                        .flash(format!("Failed to open {}: {error}", path.display()));
                 }
             }
             Action::Btw(question) => {

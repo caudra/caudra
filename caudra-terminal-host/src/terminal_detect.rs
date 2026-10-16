@@ -10,6 +10,8 @@ use wait_timeout::ChildExt;
 /// must not be able to hang startup with Ctrl-C disabled.
 const TMUX_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 const TMUX: &str = "tmux";
+const TMUX_ENV: &str = "TMUX";
+const ALLOW_PASSTHROUGH: &str = "allow-passthrough";
 
 #[derive(Default)]
 struct TerminalEnvironment<'a> {
@@ -94,12 +96,63 @@ fn supports_osc9_in(environment: &TerminalEnvironment<'_>, tmux: Option<&TmuxCli
 }
 
 fn query_tmux_client() -> Option<TmuxClient> {
+    let output = query_tmux(&[
+        "display-message",
+        "-p",
+        "#{client_termtype}\t#{client_termname}",
+    ])?;
+    let (term_type, term_name) = output.trim_end().split_once('\t')?;
+    Some(TmuxClient {
+        term_type: term_type.into(),
+        term_name: term_name.into(),
+    })
+}
+
+/// Whether Kitty graphics written through tmux reach a terminal that draws
+/// them: passthrough has to be on, and the client tmux is attached to has to
+/// be one of the terminals that implement Unicode placeholders.
+pub fn tmux_passes_kitty_graphics() -> bool {
+    query_tmux(&["show-options", "-gv", ALLOW_PASSTHROUGH]).is_some_and(|value| {
+        passthrough_enabled(&value)
+            && query_tmux_client().is_some_and(|client| draws_kitty_placeholders(&client))
+    })
+}
+
+/// Whether Caudra runs inside tmux, which answers terminal queries itself.
+pub fn inside_tmux() -> bool {
+    env::var_os(TMUX_ENV).is_some()
+}
+
+/// Whether Caudra runs in a Herdr pane, which composes its own grid.
+pub fn inside_herdr() -> bool {
+    env::var_os(crate::herdr::HERDR_ENV).is_some()
+}
+
+fn passthrough_enabled(value: &str) -> bool {
+    matches!(value.trim(), "on" | "all")
+}
+
+fn draws_kitty_placeholders(client: &TmuxClient) -> bool {
+    [
+        client
+            .term_type
+            .split_whitespace()
+            .next()
+            .unwrap_or_default(),
+        client.term_name.as_str(),
+    ]
+    .into_iter()
+    .any(|value| {
+        matches!(
+            normalize_terminal_id(value).as_str(),
+            "kitty" | "xtermkitty" | "ghostty" | "xtermghostty"
+        )
+    })
+}
+
+fn query_tmux(args: &[&str]) -> Option<String> {
     let mut child = Command::new(TMUX)
-        .args([
-            "display-message",
-            "-p",
-            "#{client_termtype}\t#{client_termname}",
-        ])
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -110,13 +163,7 @@ fn query_tmux_client() -> Option<TmuxClient> {
         let _ = child.wait();
         return None;
     }
-    let output = child.wait_with_output().ok()?;
-    let output = String::from_utf8(output.stdout).ok()?;
-    let (term_type, term_name) = output.trim_end().split_once('\t')?;
-    Some(TmuxClient {
-        term_type: term_type.into(),
-        term_name: term_name.into(),
-    })
+    String::from_utf8(child.wait_with_output().ok()?.stdout).ok()
 }
 
 fn finished_in_time(child: &mut Child) -> bool {
@@ -126,6 +173,7 @@ fn finished_in_time(child: &mut Child) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_case::test_case;
 
     fn environment(term_program: Option<&str>) -> TerminalEnvironment<'_> {
         TerminalEnvironment {
@@ -190,6 +238,25 @@ mod tests {
             ..TerminalEnvironment::default()
         };
         assert!(!supports_osc9_in(&terminal, None));
+    }
+
+    #[test_case("on\n", true ; "on")]
+    #[test_case("all", true ; "all")]
+    #[test_case("off\n", false ; "off")]
+    #[test_case("", false ; "unset")]
+    fn tmux_passthrough_values(value: &str, enabled: bool) {
+        assert_eq!(passthrough_enabled(value), enabled);
+    }
+
+    #[test_case("ghostty 1.2.3", "xterm-256color", true ; "ghostty_type")]
+    #[test_case("xterm-256color", "xterm-kitty", true ; "kitty_name")]
+    #[test_case("WezTerm 2024", "xterm-256color", false ; "no_placeholders")]
+    fn tmux_clients_that_draw_kitty_placeholders(term_type: &str, term_name: &str, draws: bool) {
+        let client = TmuxClient {
+            term_type: term_type.into(),
+            term_name: term_name.into(),
+        };
+        assert_eq!(draws_kitty_placeholders(&client), draws);
     }
 
     #[test]

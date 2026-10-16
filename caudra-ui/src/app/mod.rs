@@ -77,6 +77,7 @@ use crate::components::goal_panel::{
     GoalPanel, cleared_after_error_row, evaluation_failed_row, finished_row, not_met_row,
 };
 use crate::components::help_modal::HelpModal;
+use crate::components::image_viewer::{ImageViewer, ImageViewerAction};
 use crate::components::input::{
     AdmissionHit, ChordHint, ChordHintHit, InputAction, InputBox, InputState, Submission,
 };
@@ -127,7 +128,7 @@ use crate::components::tools_modal::{ToolsModal, ToolsScope};
 use crate::components::tooltip::{TipArea, Tooltip};
 use crate::components::usage_modal::{UsageFetchState, UsageModal, UsageScope};
 use crate::components::which_key::WhichKey;
-use crate::components::workbench::{paint_markdown, styles as workbench_styles};
+use crate::components::workbench::{paint_image, paint_markdown, styles as workbench_styles};
 use crate::components::workflow_catalog_picker::WorkflowCatalogPicker;
 use crate::components::workflow_inspector::WorkflowInspector;
 use crate::components::worktree_picker::{WorktreePicker, WorktreeView};
@@ -137,6 +138,7 @@ use crate::components::{
 };
 use crate::config_problems::ConfigProblems;
 use crate::image;
+use crate::inline_image::{self, ImageRef};
 use crate::input_document::InputDraft;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::sandbox::{SandboxWorkers, StoreReply};
@@ -526,6 +528,7 @@ pub struct App {
     pub(super) commit_popup: CommitPopup,
     commit_reload: CommitReload,
     pub(super) paste_editor: PasteEditor,
+    pub(super) image_viewer: ImageViewer,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) permissions_picker: PermissionsPicker,
     pub(super) sandbox_manager: SandboxManager,
@@ -582,6 +585,9 @@ pub struct App {
     pub(super) todo_panel: TodoPanel,
     pub(crate) workbench: Workbench,
     pub(super) workbench_theme_gen: u64,
+    /// The picture generation the workbench last painted, so a decode that
+    /// lands while an image tab is showing repaints it.
+    pub(super) workbench_image_gen: u64,
     /// The layout last read or written, so a tick only reaches storage when
     /// something actually moved. `None` until the workbench first opens.
     pub(super) workbench_layout: Option<WorkbenchLayout>,
@@ -860,6 +866,7 @@ impl App {
             commit_popup: CommitPopup::new(),
             commit_reload: CommitReload::Idle,
             paste_editor: PasteEditor::new(),
+            image_viewer: ImageViewer::default(),
             permission_prompt: PermissionPrompt::new(),
             permissions_picker: PermissionsPicker::new(),
             sandbox_manager: SandboxManager::default(),
@@ -899,6 +906,7 @@ impl App {
             todo_panel: TodoPanel::default(),
             workbench: Workbench::new(workbench_styles()),
             workbench_theme_gen: crate::theme::generation(),
+            workbench_image_gen: 0,
             workbench_layout: None,
             workbench_mounts: None,
             stored_documents: HashMap::new(),
@@ -1018,6 +1026,7 @@ impl App {
         app.chats[0].context_window = app.state.model.context_window;
         app.sync_composer_cwd();
         app.workbench.set_markdown_painter(paint_markdown);
+        app.workbench.set_image_painter(paint_image);
         if let Some(workspace) = workspace_session
             && let Err(error) = app.workbench.bind_workspace(workspace)
         {
@@ -2376,6 +2385,14 @@ impl App {
                     return Some(vec![]);
                 }
             };
+        }
+        if self.image_viewer.is_open() {
+            guard_repeat!(false);
+            let action = self.image_viewer.handle_key(key);
+            if matches!(action, ImageViewerAction::Passthrough) {
+                return None;
+            }
+            return Some(self.handle_image_viewer_action(action));
         }
         if self.paste_editor.is_open() {
             keyboard_text!(paste_editor, true);
@@ -5489,10 +5506,7 @@ impl App {
                 if chat_idx == 0 {
                     self.on_queue_batch_consumed(&items);
                 } else if let Some(task_id) = subagent_id {
-                    let messages = items
-                        .iter()
-                        .map(|item| format_with_images(&item.text, item.image_count));
-                    self.chats[chat_idx].show_user_messages(messages);
+                    self.chats[chat_idx].show_consumed_prompts(&items);
                     if let Some(pending) = self.pending_subagent_steers.get_mut(&task_id) {
                         pending.retain(|queued| items.iter().all(|item| item.id != queued.id));
                         if pending.is_empty() {
@@ -5506,16 +5520,13 @@ impl App {
             result => result,
         };
 
-        if let ChatEventResult::QueueItemConsumed {
-            id,
-            text,
-            image_count,
-        } = result
-        {
+        if let ChatEventResult::QueueItemConsumed { id, text, images } = result {
+            let display = format_with_images(&text, images.len());
+            let images = Arc::from(images);
             if chat_idx == 0 {
-                self.on_queue_item_consumed(id, &text, image_count);
+                self.on_queue_item_consumed(id, display, images);
             } else if let Some(task_id) = subagent_id {
-                self.chats[chat_idx].show_user_message(text.clone());
+                self.chats[chat_idx].show_user_prompt(display, images);
                 if let Some(pending) = self.pending_subagent_steers.get_mut(&task_id) {
                     pending.retain(|queued| queued.id != id);
                     if pending.is_empty() {
@@ -6416,7 +6427,16 @@ impl App {
         }
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 48] {
+    /// Where a markdown image's relative path resolves, and whether local
+    /// paths are read at all: a remote workspace's paths mean nothing here.
+    /// Pictures are drawn for one session at a time, so the focused one sets
+    /// it before each frame.
+    pub(crate) fn sync_image_root(&self) {
+        let local = self.workspace_session.is_none();
+        inline_image::set_local_root(local.then(|| Path::new(&self.state.session.cwd)));
+    }
+
+    fn overlays(&self) -> [&dyn Overlay; 49] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -6438,6 +6458,7 @@ impl App {
             &self.search_modal,
             &self.file_picker,
             &self.paste_editor,
+            &self.image_viewer,
             &self.rewind_picker,
             &self.message_actions,
             &self.queue_actions,
@@ -6469,7 +6490,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 48] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 49] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -6491,6 +6512,7 @@ impl App {
             &mut self.search_modal,
             &mut self.file_picker,
             &mut self.paste_editor,
+            &mut self.image_viewer,
             &mut self.rewind_picker,
             &mut self.message_actions,
             &mut self.queue_actions,
@@ -6940,7 +6962,10 @@ impl App {
             self.status_bar.flash(flash);
         }
         self.persist_workbench_layout();
-        parked_dirty | Dirty::from(dirty || moved)
+        let images = inline_image::generation();
+        let decoded = self.workbench_image_gen != images;
+        self.workbench_image_gen = images;
+        parked_dirty | Dirty::from(dirty || moved || decoded)
     }
 
     /// A layout moves when a tab opens or a pane resizes, which is rare enough
@@ -7361,6 +7386,25 @@ impl App {
         if let InputAction::PaletteSync(val) = self.active_input_box_mut().handle_paste(text) {
             self.sync_dropdowns(&val);
         }
+    }
+
+    pub(crate) fn open_image_viewer(&mut self, image: ImageRef) {
+        self.selection_state = None;
+        self.image_viewer.open(image);
+    }
+
+    pub(super) fn handle_image_viewer_action(&mut self, action: ImageViewerAction) -> Vec<Action> {
+        match action {
+            ImageViewerAction::Consumed | ImageViewerAction::Passthrough => {}
+            ImageViewerAction::Close => self.image_viewer.close(),
+            ImageViewerAction::CopyPath(path) => self.copy_to_clipboard(&path),
+            ImageViewerAction::OpenExternal(path) => return vec![Action::OpenFile(path)],
+            ImageViewerAction::OpenInWorkbench(path) => {
+                self.image_viewer.close();
+                self.open_workbench_file(&path, None);
+            }
+        }
+        Vec::new()
     }
 
     pub(super) fn open_paste_editor(&mut self, id: crate::input_document::PasteId) {

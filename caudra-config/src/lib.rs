@@ -1108,6 +1108,7 @@ pub struct UiFileConfig {
     pub notifications: Option<NotificationMethod>,
     pub math: Option<MathStyle>,
     pub mermaid: Option<MermaidStyle>,
+    inline_images: Option<InlineImagesSetting>,
     pub flash_duration_ms: Option<u64>,
     pub which_key_delay_ms: Option<u64>,
     pub tooltips: Option<bool>,
@@ -1140,6 +1141,7 @@ impl UiFileConfig {
             touch,
             math,
             mermaid,
+            inline_images,
             notifications,
             flash_duration_ms,
             which_key_delay_ms,
@@ -1183,6 +1185,39 @@ pub enum MermaidStyle {
     #[default]
     Unicode,
     Off,
+}
+
+/// How the transcript draws images: Kitty graphics placeholders where the
+/// terminal answers for them, coloured block characters anywhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InlineImages {
+    #[default]
+    Auto,
+    Kitty,
+    /// Quadrant blocks, which every font has.
+    Blocks,
+    /// Sextant blocks, sharper, for fonts and terminals that draw them.
+    Sextants,
+    Off,
+}
+
+/// `inline_images` as written: a mode, or `false` for off and `true` for auto.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(untagged)]
+enum InlineImagesSetting {
+    Switch(bool),
+    Mode(InlineImages),
+}
+
+impl From<InlineImagesSetting> for InlineImages {
+    fn from(setting: InlineImagesSetting) -> Self {
+        match setting {
+            InlineImagesSetting::Switch(true) => Self::Auto,
+            InlineImagesSetting::Switch(false) => Self::Off,
+            InlineImagesSetting::Mode(mode) => mode,
+        }
+    }
 }
 
 /// Minimum severity written to the log file. `RUST_LOG` overrides it when set,
@@ -2256,6 +2291,14 @@ pub struct UiConfig {
     pub mermaid: MermaidStyle,
 
     #[config(
+        default = InlineImages::Auto,
+        ty = "string",
+        default_doc = "auto",
+        desc = "How the transcript draws images that `view_image` reads, `image_generate` saves, and markdown names with `![alt](path)`: auto (Kitty graphics where the terminal supports them, coloured quadrant blocks anywhere else), kitty, blocks, sextants (sharper blocks, for fonts and terminals that draw Unicode 13 sextants, such as Ghostty, kitty, WezTerm, and foot), or off (show only the caption; `false` also turns them off). Markdown images are read from local files only and never fetched"
+    )]
+    pub inline_images: InlineImages,
+
+    #[config(
         default = DEFAULT_FLASH_DURATION_MS,
         desc = "Duration of ordinary status-bar messages (ms). Confirmation prompts use a fixed 3-second window"
     )]
@@ -2382,6 +2425,7 @@ impl UiConfig {
             notifications: f.notifications.unwrap_or_default(),
             math: f.math.unwrap_or_default(),
             mermaid: f.mermaid.unwrap_or_default(),
+            inline_images: f.inline_images.map(InlineImages::from).unwrap_or_default(),
             flash_duration_ms: f.flash_duration_ms.unwrap_or(DEFAULT_FLASH_DURATION_MS),
             which_key_delay_ms: f.which_key_delay_ms.unwrap_or(DEFAULT_WHICH_KEY_DELAY_MS),
             tooltips: f.tooltips.unwrap_or(true),
@@ -7317,6 +7361,18 @@ mod tests {
         let config = base.into_config(false).unwrap();
         assert_eq!(config.ui.update_channel, expected);
         assert!(!config.ui.update_check);
+    }
+
+    #[test_case("" => InlineImages::Auto; "missing_defaults_to_auto")]
+    #[test_case("[ui]\ninline_images = 'kitty'\n" => InlineImages::Kitty; "kitty")]
+    #[test_case("[ui]\ninline_images = 'blocks'\n" => InlineImages::Blocks; "blocks")]
+    #[test_case("[ui]\ninline_images = 'sextants'\n" => InlineImages::Sextants; "sextants")]
+    #[test_case("[ui]\ninline_images = 'off'\n" => InlineImages::Off; "off")]
+    #[test_case("[ui]\ninline_images = false\n" => InlineImages::Off; "false_is_off")]
+    #[test_case("[ui]\ninline_images = true\n" => InlineImages::Auto; "true_is_auto")]
+    fn inline_images_deserializes(toml: &str) -> InlineImages {
+        let raw: RawConfig = toml::from_str(toml).unwrap();
+        raw.into_config(false).unwrap().ui.inline_images
     }
 
     #[test_case("" => StoredMode::Plan; "missing_defaults_to_plan")]

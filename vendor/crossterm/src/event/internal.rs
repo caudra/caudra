@@ -26,6 +26,15 @@ pub(crate) fn query_program_status(timeout: Duration) -> io::Result<bool> {
     reader.query_program_status(timeout.leftover().unwrap_or_default(), &mut stdout().lock())
 }
 
+#[cfg(unix)]
+pub(crate) fn query_kitty_graphics(timeout: Duration) -> io::Result<bool> {
+    let timeout = PollTimeout::new(Some(timeout));
+    let Some(mut reader) = try_lock_event_reader_for(timeout.leftover().unwrap_or_default()) else {
+        return Ok(false);
+    };
+    reader.query_kitty_graphics(timeout.leftover().unwrap_or_default(), &mut stdout().lock())
+}
+
 fn try_lock_event_reader_for(
     duration: Duration,
 ) -> Option<MappedMutexGuard<'static, InternalEventReader>> {
@@ -86,4 +95,6 @@ pub(crate) enum InternalEvent {
     /// Attributes and architectural class of the terminal.
     PrimaryDeviceAttributes,
     ProgramStatusSupported,
+    /// The terminal's answer to a Kitty graphics query: whether it said `OK`.
+    KittyGraphicsReply(bool),
 }

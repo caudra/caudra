@@ -176,6 +176,25 @@ Explicit Markdown links, HTTP(S) autolinks, and bare HTTP(S) URLs are underlined
 
 Interactive targets must use HTTP or HTTPS, include a host, and contain no control characters. Other schemes remain visible text without an interactive target.
 
+## Images
+
+The transcript draws pictures as thumbnails up to 16 rows tall. They appear on `view_image` and `image_generate` tool cards, for Markdown images such as `![plot](out/plot.png)`, and under a prompt you sent with attached images.
+
+Markdown images load only from local files. A relative path resolves against the session's working directory, and a `file:` URL works too. Caudra never fetches an image over the network, and a session on a remote workspace never reads this machine's disk. When a picture cannot be drawn, its alt text stays as a label.
+
+Click a picture to open it at full size. In the viewer, `o` opens the file in your system viewer, `w` opens it in the workbench, `y` copies its path, and `Esc` closes it. A pasted image has no file, so only `Esc` applies to it. Each image attached to a draft shows as an `[Image #1]` chip under the composer, and a click on a chip opens the same viewer. The workbench shows an image file as a picture instead of the binary file notice.
+
+A terminal that answers the Kitty graphics query draws the picture itself, at full resolution. Every other terminal gets coloured block characters, two by two pixels to a cell. Inside tmux, Caudra uses Kitty graphics only when `allow-passthrough` is on, and inside Herdr only when you ask for it.
+
+Set `"sextants"` for sharper blocks, two by three pixels to a cell. They need a font that has the Unicode 13 sextant characters, or a terminal that draws them itself, such as Ghostty, kitty, WezTerm, or foot. Without one, pictures show as boxes.
+
+```toml
+[ui]
+inline_images = "sextants" # "auto" (default), "kitty", "blocks", "sextants", or "off"
+```
+
+`inline_images = false` is the same as `"off"`, which keeps every picture as its label.
+
 ## Copying
 
 Releasing a mouse drag copies the selected Markdown source, not the glyphs on
@@ -189,6 +208,8 @@ construct, because half of `\frac{a}{b}` is not valid LaTeX. Touching any cell
 of a drawn diagram copies the whole fenced block, fence lines included, since
 no part of the artwork maps back to a slice of the source. Emphasis, headings,
 and inline code copy at character precision.
+
+A picture copies as Markdown that names it again, such as `![plot](out/plot.png)`.
 
 The role prefix is part of the interface and never reaches the clipboard.
 

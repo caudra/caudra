@@ -16,9 +16,8 @@ use std::sync::Arc;
 use crate::host::{StatusChannel, TerminalHost};
 use crate::skill::SkillSource;
 use crate::workspaces::Workspaces;
-use env::{
-    HERDR_BIN_PATH, HERDR_ENV, HERDR_PANE_ID, HERDR_SOCKET_PATH, HERDR_TAB_ID, HERDR_WORKSPACE_ID,
-};
+pub(crate) use env::HERDR_ENV;
+use env::{HERDR_BIN_PATH, HERDR_PANE_ID, HERDR_SOCKET_PATH, HERDR_TAB_ID, HERDR_WORKSPACE_ID};
 
 pub use env::HerdrEnv;
 

@@ -373,7 +373,7 @@ fn bound_presentation(
         ToolOutput::Index(IndexOutput::Directory { listing, .. }) => {
             *listing = preview_body(&rendered, marker, "", max_lines, max_bytes).0;
         }
-        ToolOutput::Batch { text, .. } => {
+        ToolOutput::Batch { text, .. } | ToolOutput::SavedImage { text, .. } => {
             *text = preview_body(&rendered, marker, "", max_lines, max_bytes).0;
         }
         // Cut from the pretty form, so what survives still breaks into lines a

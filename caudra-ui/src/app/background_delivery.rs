@@ -505,7 +505,7 @@ mod tests {
                 QueueItem::Message { input, run_id: REPLACEMENT_RUN, .. }
                     if matches!(input.mode, AgentMode::Plan(_))
             ));
-            app.on_queue_item_consumed(replacement, PROMPT, 0);
+            app.on_queue_item_consumed(replacement, PROMPT.into(), Arc::default());
             app.state.applied_mode = Mode::Plan;
             assert_eq!(app.cancelling_run, None);
             assert_eq!(app.replacement_item, None);

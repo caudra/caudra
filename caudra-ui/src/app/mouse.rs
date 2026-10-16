@@ -4,7 +4,7 @@ use crate::agent::AgentCommand;
 use crate::components::audit_log::PanelTab;
 use crate::components::command::ChatScope;
 use crate::components::help_modal::HelpMouse;
-use crate::components::input::{ChordHint, InputHit};
+use crate::components::input::{ChordHint, InputHit, image_chip_label};
 use crate::components::paste_editor::PasteEditorAction;
 use crate::components::permission_prompt::PromptMouse;
 use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
@@ -13,6 +13,7 @@ use crate::components::stream_modal::StreamAction;
 use crate::components::usage_modal::UsageMouse;
 use crate::components::workflow_card::CardHit;
 use crate::components::{Action, Overlay};
+use crate::inline_image::ImageRef;
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
 use caudra_agent::{CommitRef, Mention};
 use caudra_storage::sessions::PermissionMode;
@@ -195,6 +196,11 @@ impl App {
             }
             let action = self.workbench.handle_mouse(event);
             return self.handle_workbench_action(action);
+        }
+        if self.image_viewer.is_open() {
+            self.clear_control_hovers();
+            let action = self.image_viewer.handle_mouse(event);
+            return self.handle_image_viewer_action(action);
         }
         if self.paste_editor.is_open() {
             self.clear_control_hovers();
@@ -654,6 +660,20 @@ impl App {
                                 self.open_workbench_at(&mention);
                                 return Vec::new();
                             }
+                            Some(InputHit::Image(index)) => {
+                                self.selection_state = None;
+                                let image = self
+                                    .active_input_box_mut()
+                                    .pending_images()
+                                    .get(index)
+                                    .and_then(|source| {
+                                        ImageRef::from_source(source, &image_chip_label(index))
+                                    });
+                                if let Some(image) = image {
+                                    self.open_image_viewer(image);
+                                }
+                                return Vec::new();
+                            }
                             // The caret moved, so the `@` popup has to decide
                             // again whether it is still inside its query.
                             None => self.resync_dropdowns(),
@@ -795,6 +815,20 @@ impl App {
                             self.queue_mouse_down = None;
                             self.status_mouse_down = None;
                             self.open_workbench_commit(&pressed);
+                            return Vec::new();
+                        }
+                        if zone == SelectionZone::Messages
+                            && !self.has_modal_overlay()
+                            && let Some(image) = self.chats[self.active_chat].image_at(
+                                event.row,
+                                event.column,
+                                self.msg_area(),
+                            )
+                        {
+                            self.message_action_mouse_down = None;
+                            self.queue_mouse_down = None;
+                            self.status_mouse_down = None;
+                            self.open_image_viewer(image);
                             return Vec::new();
                         }
                         self.message_action_mouse_down = None;
@@ -975,6 +1009,9 @@ impl App {
         }
         if self.paste_editor.is_open() {
             self.paste_editor.scroll(delta);
+            return;
+        }
+        if self.image_viewer.is_open() {
             return;
         }
         if !self.has_modal_overlay() && self.queue_hit_at(row, column).is_some() {

@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use caudra_providers::{
     AgentError, AutomationEventOrigin, AutopilotOrigin, Billing, ContentBlock, DocumentSource,
-    Message, PEER_SCRIPT_SENDER, PEER_SESSION_SENDER, PeerMessageOrigin, Role, StopReason,
-    TaskEventOrigin, TokenUsage, estimate_tokens_cached, token_label,
+    ImageSource, Message, PEER_SCRIPT_SENDER, PEER_SESSION_SENDER, PeerMessageOrigin, Role,
+    StopReason, TaskEventOrigin, TokenUsage, estimate_tokens_cached, token_label,
 };
 use caudra_storage::autopilot::AutopilotEnd;
 use caudra_storage::background::{JobKind, JobOwner, ShellJobMetadata};
@@ -2000,6 +2000,12 @@ pub enum ToolOutput {
         /// the pixels ride separately as a `ContentBlock::Image`.
         text: String,
     },
+    /// An image a tool wrote to local disk. `path` is absolute so a card can
+    /// draw it from disk; `text` is all the model reads, never the pixels.
+    SavedImage {
+        path: String,
+        text: String,
+    },
     /// A workflow run the transcript follows live and restores settled.
     WorkflowRun(Box<WorkflowRunCard>),
     Tasks(TaskOutput),
@@ -2463,7 +2469,9 @@ impl ToolOutput {
                 }
                 out
             }
-            Self::Batch { text, .. } | Self::Image { text, .. } => text.clone(),
+            Self::Batch { text, .. } | Self::Image { text, .. } | Self::SavedImage { text, .. } => {
+                text.clone()
+            }
             Self::Instructions { blocks } => {
                 let mut out = String::new();
                 append_instructions(&mut out, blocks);
@@ -2946,7 +2954,8 @@ pub enum AgentEvent {
     QueueItemConsumed {
         id: crate::QueueItemId,
         text: String,
-        image_count: usize,
+        #[serde(skip)]
+        images: Vec<ImageSource>,
     },
     QueueBatchConsumed {
         items: Vec<QueueConsumedItem>,
@@ -3094,7 +3103,8 @@ impl From<DecisionNote> for AgentEvent {
 pub struct QueueConsumedItem {
     pub id: crate::QueueItemId,
     pub text: String,
-    pub image_count: usize,
+    #[serde(skip)]
+    pub images: Vec<ImageSource>,
 }
 
 /// Append-only buffer for streaming tool output to the UI. Writers append
@@ -5527,6 +5537,56 @@ mod tests {
         };
         assert_eq!(event.written_path(), Some(plan));
         assert!(!event.wrote_to(Path::new(plan)));
+    }
+
+    const SAVED_IMAGE_PATH: &str = "/work/art.png";
+    const SAVED_IMAGE_TEXT: &str =
+        "Generated image saved to art.png. Call view_image on it to see the result.";
+
+    fn saved_image() -> ToolOutput {
+        ToolOutput::SavedImage {
+            path: SAVED_IMAGE_PATH.into(),
+            text: SAVED_IMAGE_TEXT.into(),
+        }
+    }
+
+    #[test]
+    fn saved_image_round_trips_through_serde() {
+        let stored = serde_json::to_string(&saved_image()).unwrap();
+        let restored: ToolOutput = serde_json::from_str(&stored).unwrap();
+
+        let ToolOutput::SavedImage { path, text } = restored else {
+            panic!("expected a saved image, got {restored:?}");
+        };
+        assert_eq!(path, SAVED_IMAGE_PATH);
+        assert_eq!(text, SAVED_IMAGE_TEXT);
+    }
+
+    #[test]
+    fn a_save_stored_as_plain_still_loads_as_plain() {
+        let stored = json!({ "Plain": { "text": SAVED_IMAGE_TEXT } });
+        let restored: ToolOutput = serde_json::from_value(stored).unwrap();
+
+        let ToolOutput::Plain(text) = restored else {
+            panic!("expected plain output, got {restored:?}");
+        };
+        assert_eq!(text.text, SAVED_IMAGE_TEXT);
+    }
+
+    #[test]
+    fn saved_image_tells_the_model_exactly_what_plain_did() {
+        let plain = ToolOutput::Plain(SAVED_IMAGE_TEXT.into());
+        let done = |output| ToolDoneEvent {
+            output,
+            is_error: false,
+            ..ToolDoneEvent::error(String::new(), String::new())
+        };
+
+        assert_eq!(saved_image().as_text(), plain.as_text());
+        assert_eq!(
+            format!("{:?}", tool_results(vec![done(saved_image())]).content),
+            format!("{:?}", tool_results(vec![done(plain)]).content)
+        );
     }
 
     #[test]

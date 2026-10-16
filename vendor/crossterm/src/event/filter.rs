@@ -59,6 +59,19 @@ impl Filter for ProgramStatusFilter {
     }
 }
 
+#[cfg(unix)]
+pub(crate) struct KittyGraphicsFilter;
+
+#[cfg(unix)]
+impl Filter for KittyGraphicsFilter {
+    fn eval(&self, event: &InternalEvent) -> bool {
+        matches!(
+            event,
+            InternalEvent::KittyGraphicsReply(_) | InternalEvent::PrimaryDeviceAttributes
+        )
+    }
+}
+
 impl Filter for EventFilter {
     fn eval(&self, event: &InternalEvent) -> bool {
         matches!(*event, InternalEvent::Event(_))

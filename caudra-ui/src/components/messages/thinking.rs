@@ -111,6 +111,7 @@ pub(super) fn assemble(
         provenance: None,
         diagrams,
         links,
+        images: Vec::new(),
         scroll_span: None,
         scroll_footer_line: None,
     };

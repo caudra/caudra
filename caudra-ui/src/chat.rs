@@ -19,6 +19,7 @@ use crate::components::workflow_card::CardHit;
 use crate::components::{
     DisplayMessage, DisplayRole, DisplaySource, RetryInfo, ToolRole, ToolStatus, workflow_card,
 };
+use crate::inline_image::ImageRef;
 use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
@@ -34,8 +35,8 @@ use caudra_agent::tools::{
 use caudra_agent::types::{Answer, QuestionEvent, TodoItem, WorkflowRunCard};
 use caudra_agent::{
     AgentEvent, BatchToolEntry, BufferSnapshot, COMPACTION_ANCHOR, CallStage, CommitRef,
-    EMPTY_RESPONSE_RULE, Mention, SubagentProgress, TaskCard, ToolDoneEvent, ToolOutput,
-    ToolStartEvent,
+    EMPTY_RESPONSE_RULE, ImageSource, Mention, QueueConsumedItem, SubagentProgress, TaskCard,
+    ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use caudra_config::{ToolOutputLines, UiConfig};
 use caudra_lua::WinView;
@@ -75,10 +76,10 @@ pub enum ChatEventResult {
     QueueItemConsumed {
         id: caudra_agent::QueueItemId,
         text: String,
-        image_count: usize,
+        images: Vec<ImageSource>,
     },
     QueueBatchConsumed {
-        items: Vec<caudra_agent::QueueConsumedItem>,
+        items: Vec<QueueConsumedItem>,
     },
     Error(String),
     PermissionRequest(Box<PermissionRequest>),
@@ -344,16 +345,8 @@ impl Chat {
             AgentEvent::CompactionDone => {
                 self.messages_panel.flush();
             }
-            AgentEvent::QueueItemConsumed {
-                id,
-                text,
-                image_count,
-            } => {
-                return ChatEventResult::QueueItemConsumed {
-                    id,
-                    text,
-                    image_count,
-                };
+            AgentEvent::QueueItemConsumed { id, text, images } => {
+                return ChatEventResult::QueueItemConsumed { id, text, images };
             }
             AgentEvent::QueueBatchConsumed { items } => {
                 return ChatEventResult::QueueBatchConsumed { items };
@@ -743,6 +736,10 @@ impl Chat {
         self.messages_panel.mention_at_remote(row, col, area)
     }
 
+    pub(crate) fn image_at(&self, row: u16, col: u16, area: Rect) -> Option<ImageRef> {
+        self.messages_panel.image_at(row, col, area)
+    }
+
     pub(crate) fn commit_at(&self, row: u16, col: u16, area: Rect) -> Option<CommitRef> {
         self.messages_panel.commit_at(row, col, area)
     }
@@ -1002,15 +999,28 @@ impl Chat {
     /// Flush, push, and re-pin scroll in one shot to avoid
     /// the one-frame hop where the bubble briefly lands in the wrong row.
     pub fn show_user_message(&mut self, text: impl Into<String>) {
+        self.show_user_prompt(text.into(), Arc::default());
+    }
+
+    /// [`Self::show_user_message`] for a prompt that carried pictures, which
+    /// its bubble draws under the text.
+    pub fn show_user_prompt(&mut self, text: String, images: Arc<[ImageSource]>) {
         self.flush();
-        self.push_user_message(text);
+        let mut message = DisplayMessage::new(DisplayRole::User, text);
+        message.images = images;
+        self.messages_panel.push(message);
         self.enable_auto_scroll();
     }
 
-    pub fn show_user_messages(&mut self, messages: impl IntoIterator<Item = String>) {
+    /// The bubbles of queued prompts the agent picked up together, each with
+    /// the pictures it was sent with.
+    pub fn show_consumed_prompts(&mut self, items: &[QueueConsumedItem]) {
         self.flush();
-        for message in messages {
-            self.push_user_message(message);
+        for item in items {
+            let text = format_with_images(&item.text, item.images.len());
+            let mut message = DisplayMessage::new(DisplayRole::User, text);
+            message.images = item.images.as_slice().into();
+            self.messages_panel.push(message);
         }
         self.enable_auto_scroll();
     }
@@ -1219,12 +1229,15 @@ pub fn interleaved_history_to_display(
     inserts.sort_by_key(|(position, _)| *position);
     let mut inserts = inserts.into_iter().peekable();
     let results = build_tool_results_map(items);
-    let mut image_counts: HashMap<CaudraId, usize> = HashMap::new();
+    let mut group_images: HashMap<CaudraId, Vec<ImageSource>> = HashMap::new();
     for item in items {
         if let HistoryItemKind::User { images, .. } = &item.kind
             && !images.is_empty()
         {
-            *image_counts.entry(item.group_id).or_default() += images.len();
+            group_images
+                .entry(item.group_id)
+                .or_default()
+                .extend(images.iter().cloned());
         }
     }
     let mut display = Vec::new();
@@ -1299,12 +1312,15 @@ pub fn interleaved_history_to_display(
                 if displayed_user_groups.insert(item.group_id)
                     && let Some((id, text)) = visible_user_text(items, item.group_id)
                 {
-                    let image_count = image_counts.get(&item.group_id).copied().unwrap_or(0);
+                    let images: Arc<[ImageSource]> = group_images
+                        .remove(&item.group_id)
+                        .map_or_else(Arc::default, Arc::from);
                     let mut message = DisplayMessage::new(
                         DisplayRole::User,
-                        format_with_images(text, image_count),
+                        format_with_images(text, images.len()),
                     );
                     message.source = Some(DisplaySource::User(id));
+                    message.images = images;
                     display.push(message);
                 }
             }
@@ -1447,6 +1463,7 @@ pub fn interleaved_history_to_display(
                     body_open: saved_plan.as_ref().map(|_| false),
                     thinking_duration: None,
                     tool_started: None,
+                    images: Arc::default(),
                 });
                 if let Some(plan) = saved_plan {
                     display.push(plan_message(&plan));
