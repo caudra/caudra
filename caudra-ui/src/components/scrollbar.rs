@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::event::MouseEvent;
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
 use caudra_grab::grab_leaf;
 use caudra_workbench::scroll;
@@ -83,5 +83,12 @@ impl Scrollbar {
 
     pub fn handle(&mut self, event: &MouseEvent) -> ScrollbarMouse {
         self.0.handle(event)
+    }
+
+    /// Whether `event` is the bar's to handle: on its track, or part of a drag it holds. Asked
+    /// before anything else reads the event, so a press on the bar never starts a text selection.
+    pub fn claims(&self, event: &MouseEvent) -> bool {
+        let at = Position::new(event.column, event.row);
+        self.0.is_dragging() || self.0.track().is_some_and(|track| track.contains(at))
     }
 }

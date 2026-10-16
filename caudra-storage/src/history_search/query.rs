@@ -7,6 +7,7 @@
 //! most recently updated session.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
@@ -279,6 +280,16 @@ impl SessionDatabase {
         let mut rows = statement.query(params_from_iter(values))?;
         rows.next()?.map(session_hit).transpose()
     }
+}
+
+/// The byte ranges in `text` of the tokens a search for `query` matches, stems and folded
+/// accents included, so a reader can mark what the index found. Empty for a blank query.
+pub fn highlight_history(text: &str, query: &str) -> Result<Vec<Range<usize>>, SessionError> {
+    let terms = terms(query);
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    Highlighter::new()?.ranges(text, &terms.join(ANY_TERM))
 }
 
 fn session_hit(row: &Row<'_>) -> Result<SessionHit, SessionError> {
@@ -831,6 +842,17 @@ mod tests {
         assert_eq!(page.hits[0].project, PROJECT);
         assert_eq!(page.hits[0].at_ms, BASE_MS);
         assert!(page.hits[0].score > 0.0);
+    }
+
+    #[test_case(RETRY_LOOP, "sleeping retries", &["retry", "sleeps"] ; "stems")]
+    #[test_case("é zebra café", "cafe", &["café"] ; "folded_accents_on_char_boundaries")]
+    #[test_case(RETRY_LOOP, "\"retry loop\"", &["retry loop"] ; "phrase_as_one_span")]
+    #[test_case(RETRY_LOOP, "  ", &[] ; "blank")]
+    #[test_case(RETRY_LOOP, "-- ::", &[] ; "punctuation_only")]
+    fn highlights_mark_what_a_search_matches(text: &str, query: &str, expected: &[&str]) {
+        let ranges = highlight_history(text, query).unwrap();
+        let marked: Vec<&str> = ranges.iter().map(|range| &text[range.clone()]).collect();
+        assert_eq!(marked, expected);
     }
 
     #[test]

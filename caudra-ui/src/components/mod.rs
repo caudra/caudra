@@ -1130,6 +1130,12 @@ pub enum Action {
         id: caudra_storage::id::CaudraId,
         cwd: PathBuf,
     },
+    /// Goes to a search hit in another session: opens it where it works, `cwd` for a local
+    /// session, then scrolls to the item.
+    OpenHistoryHit {
+        reference: caudra_storage::history_search::HistoryRef,
+        cwd: Option<PathBuf>,
+    },
     DeleteSession(caudra_storage::id::CaudraId),
     SetSessionTitle {
         id: caudra_storage::id::CaudraId,

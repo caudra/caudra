@@ -13,17 +13,12 @@ use std::sync::Arc;
 
 use caudra_config::ToolKey;
 use caudra_storage::StateDir;
-use caudra_storage::checkout;
 use caudra_storage::history_search::{
     HistoryEntry, HistoryHit, HistoryKind, HistoryQuery, HistoryRef, HistoryScope, HistorySort,
-    HistoryStream, NeighbourPreview, ProjectScope, SessionHit, Snippet, WorkspaceIdentity,
+    HistoryStream, NeighbourPreview, SessionHit, Snippet, WorkspaceIdentity,
 };
 use caudra_storage::id::CaudraId;
-use caudra_storage::paths::canonicalize_clean;
 use caudra_storage::sessions::SessionError;
-use caudra_storage::workspace_binding::StoredWorkspaceBinding;
-use jiff::tz::TimeZone;
-use jiff::{Timestamp, civil};
 use serde_json::{Map, Value, json};
 
 use super::args::{bind, count, required_text, text};
@@ -33,7 +28,9 @@ use super::names::HISTORY_MODULE;
 use super::output::CodeCall;
 use super::runner::{ScriptCall, ScriptError, ScriptErrorKind, ScriptName};
 use crate::decisions::{NoteSink, counted};
-use crate::history::{self, HistoryResults, HistorySearch, HistoryStore, Ranking, iso_time};
+use crate::history::{
+    self, HistoryProject, HistoryResults, HistorySearch, HistoryStore, Ranking, iso_time,
+};
 use crate::mcp::output::{McpBlock, McpOutput};
 use crate::memory::relevance::Judge;
 use crate::permissions::{
@@ -217,7 +214,7 @@ impl Caller {
                 current: false,
             },
             Requested::Path(path) => {
-                let project = local_project(&self.here.resolve(path)?);
+                let project = HistoryProject::local(&self.here.resolve(path)?);
                 Reach {
                     current: project.label == self.here.project().label,
                     label: project.label,
@@ -239,28 +236,14 @@ impl Here {
     fn of(ctx: &ToolContext) -> Self {
         ctx.workspace_session
             .as_ref()
-            .and_then(|workspace| {
-                StoredWorkspaceBinding::new_with_cursor(
-                    workspace.binding().clone(),
-                    workspace.cursor().clone(),
-                    None,
-                )
-                .ok()
-            })
-            .filter(|binding| !binding.is_local())
-            .map_or_else(
-                || Self::Local(ctx.permissions.project_cwd()),
-                |binding| Self::Remote(WorkspaceIdentity::from(&binding)),
-            )
+            .and_then(history::remote_identity)
+            .map_or_else(|| Self::Local(ctx.permissions.project_cwd()), Self::Remote)
     }
 
-    fn project(&self) -> Project {
+    fn project(&self) -> HistoryProject {
         match self {
-            Self::Local(cwd) => local_project(cwd),
-            Self::Remote(identity) => Project {
-                label: identity.project.clone(),
-                scope: ProjectScope::Workspace(identity.clone()),
-            },
+            Self::Local(cwd) => HistoryProject::local(cwd),
+            Self::Remote(identity) => HistoryProject::workspace(identity.clone()),
         }
     }
 
@@ -274,36 +257,6 @@ impl Here {
                 "scope '{path}' must be an absolute project path in a remote session"
             ))),
         }
-    }
-}
-
-struct Project {
-    /// What prompts and remembered rules name the project by.
-    label: String,
-    scope: ProjectScope,
-}
-
-/// A local project: its main checkout and every verified linked worktree, named by the main
-/// checkout. Outside a repository, the directory alone.
-fn local_project(cwd: &Path) -> Project {
-    let Some(found) = checkout::discover(cwd) else {
-        let root = canonicalize_clean(cwd);
-        return Project {
-            label: root.display().to_string(),
-            scope: ProjectScope::Local(vec![root]),
-        };
-    };
-    let mut roots: Vec<PathBuf> = checkout::members(&found.repository)
-        .into_iter()
-        .filter(|member| !member.prunable)
-        .map(|member| member.root)
-        .collect();
-    if !roots.contains(&found.root) {
-        roots.push(found.root);
-    }
-    Project {
-        label: found.main_root.display().to_string(),
-        scope: ProjectScope::Local(roots),
     }
 }
 
@@ -670,7 +623,7 @@ fn summary(text: String) -> McpOutput {
 fn session_project(session: &SessionHit) -> String {
     let path = Path::new(&session.project);
     match path.is_absolute() {
-        true => local_project(path).label,
+        true => HistoryProject::local(path).label,
         false => session.project.clone(),
     }
 }
@@ -821,17 +774,7 @@ fn time(
     let Some(written) = text(arguments, helper, param)? else {
         return Ok(None);
     };
-    written
-        .parse::<Timestamp>()
-        .ok()
-        .or_else(|| {
-            written
-                .parse::<civil::DateTime>()
-                .ok()
-                .and_then(|datetime| datetime.to_zoned(TimeZone::UTC).ok())
-                .map(|zoned| zoned.timestamp())
-        })
-        .and_then(|timestamp| u64::try_from(timestamp.as_millisecond()).ok())
+    history::parse_iso_time(&written)
         .map(Some)
         .ok_or_else(|| {
             value_error(format!(
@@ -863,6 +806,7 @@ mod tests {
 
     use caudra_config::PermissionsConfig;
     use caudra_storage::id::SessionRef;
+    use caudra_storage::paths::canonicalize_clean;
     use tempfile::TempDir;
     use test_case::test_case;
 

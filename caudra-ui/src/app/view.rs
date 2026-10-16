@@ -530,7 +530,11 @@ impl App {
         let mut overlay_rect = Rect::default();
 
         if self.search_modal.is_open() {
-            overlay_rect = self.search_modal.view(frame, msg_area);
+            let area = match self.search_modal.tab().searches_history() {
+                true => full,
+                false => msg_area,
+            };
+            overlay_rect = self.search_modal.view(frame, area);
         }
 
         if self.file_picker.is_open() {
@@ -905,6 +909,13 @@ impl App {
         if overlay_rect.width > 0 {
             self.zones
                 .push_overlay(selection::inset_border(overlay_rect));
+        }
+        if self.search_modal.is_open() && overlay_rect == self.search_modal.area() {
+            for pane in self.search_modal.text_panes() {
+                if !pane.is_empty() {
+                    self.zones.push_overlay(pane);
+                }
+            }
         }
 
         // Overlay zone was removed (e.g. dialog closed), drop the dangling selection

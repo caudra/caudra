@@ -256,6 +256,7 @@ impl App {
                             self.chats.push(chat);
                             self.chats.len() - 1
                         };
+                        self.land_archived_jump(&id);
                         self.task_history.cached_chat = Some(id);
                         self.task_history.detail = Some(loaded.card);
                         self.sync_todo_panel();

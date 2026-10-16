@@ -11,6 +11,8 @@ mod index;
 mod query;
 mod snippet;
 
+pub use query::highlight_history;
+
 use std::fmt;
 use std::ops::Range;
 use std::path::{MAIN_SEPARATOR, PathBuf};

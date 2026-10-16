@@ -16,6 +16,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 - Workflow `decide()` uses the OpenAI Decisions question shape.
 - Add decision models in `/login` and switch them in `/model`, with Auto mode and the decision engine out of experimental.
 - Pictures in the transcript.
+- Search past sessions from the TUI with `/search-history`, beside `Ctrl+F` for the current chat.
 - Notes on your answers to the agent's questions, and drag to copy in `/btw` and the question form.
 - Goals stop when they make no progress, wait for CI or a deploy, and tell automations when they are stuck.
 - Subscription image generation works again after GPT-5.5 left Codex.
@@ -90,6 +91,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 ### Transcript
 
 - **Pictures in the transcript.** `view_image` and `image_generate` cards, Markdown images that point at local files, and prompts with attached images now show the picture as a thumbnail. Terminals that support Kitty graphics get the full-resolution picture, and other terminals get coloured blocks, two by two pixels to a cell, or two by three with `inline_images = "sextants"` in terminals and fonts that draw sextants. Click a picture to open it at full size, then press `o` to open it in your system viewer, `w` to open it in the workbench, or `y` to copy its path. Images attached to a draft show as `[Image #1]` chips you can click, and the workbench shows image files instead of the binary file notice. Markdown images are never fetched from the network. Set `[ui] inline_images` to `"blocks"`, `"sextants"`, `"kitty"`, or `"off"` to choose. See [Images](/docs/markdown/#images).
+- **Search past sessions.** `/search-history` opens the search on this project's saved sessions, and `Ctrl+F` opens it on the current chat, which works as before. `Tab` switches between This chat, Project, and All projects and keeps what you typed. The history tabs search whole words, list each match with its session and age, and preview the selected item with its neighbours. Words can carry `kind:`, `tool:`, `since:`, and `until:` filters, and `Ctrl+S` sorts newest first. With the `history_search` decision feature on `enforce`, results are reranked once you stop typing, and `Ctrl+R` returns to keyword order. `Enter` scrolls to the match in this session, or opens the other session and scrolls there. See [Search past sessions](/docs/sessions/#search-past-sessions).
 
 ### Questions
 

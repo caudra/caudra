@@ -53,6 +53,7 @@ const STEP_DIVISOR: u32 = 2;
 const FINE_DIVISOR: i64 = 8;
 const LINE_HINT: &str = "line";
 const MESSAGE_HINT: &str = "message";
+const MATCH_HINT: &str = "match";
 /// Columns between the position hint and the bar, so the chip does not touch
 /// the thumb it describes.
 const HINT_GAP: u16 = 1;
@@ -246,6 +247,7 @@ pub enum ThumbState {
 pub enum ScrollUnit {
     Line,
     Message,
+    Match,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -272,10 +274,20 @@ impl ScrollHint {
         }
     }
 
+    /// A list of search results reads in the matches its reader is stepping through.
+    pub fn matches(current: u32, total: u32) -> Self {
+        Self {
+            current,
+            total,
+            unit: ScrollUnit::Match,
+        }
+    }
+
     fn text(&self) -> String {
         let label = match self.unit {
             ScrollUnit::Line => LINE_HINT,
             ScrollUnit::Message => MESSAGE_HINT,
+            ScrollUnit::Match => MATCH_HINT,
         };
         format!("{label} {}/{}", self.current, self.total)
     }

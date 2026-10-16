@@ -49,6 +49,7 @@ use caudra_config::{ClockFormat, ToolOutputLines, UiConfig};
 use caudra_grab::grab_leaf;
 use caudra_markdown::render::SpanSource;
 use caudra_providers::AutomationEventOrigin;
+use caudra_storage::id::CaudraId;
 use caudra_workflow::RunSnapshot;
 
 use std::borrow::Cow;
@@ -1012,6 +1013,8 @@ pub struct MessagesPanel {
     /// The picture store's generation this transcript last drew against.
     image_generation: u64,
     highlight_segment: Option<usize>,
+    /// The message a search went to, marked until the reader moves on.
+    landing: Option<usize>,
     idle_splash: Splash,
     accent: ColorTransition,
     /// What the reader asked of a card, keyed by tool id. Absent leaves the
@@ -1171,6 +1174,7 @@ impl MessagesPanel {
             theme_generation: theme::generation(),
             image_generation: inline_image::generation(),
             highlight_segment: None,
+            landing: None,
             idle_splash: Splash::new(ui_config.splash_animation),
             accent: ColorTransition::new(theme::current().mode_build),
             disclosure: HashMap::new(),
@@ -1890,6 +1894,7 @@ impl MessagesPanel {
         self.retained_shell_outputs.clear();
         self.rebake_requested.clear();
         self.highlight_segment = None;
+        self.landing = None;
         self.streaming_reasoning_open = None;
     }
 
@@ -3281,6 +3286,60 @@ impl MessagesPanel {
         self.highlight_segment = idx;
     }
 
+    /// The message drawn from history item `item`, and whether it is that item. A message the
+    /// transcript does not draw, being reverted, injected or hidden, falls back to the nearest
+    /// one before it: item ids are UUIDv7, so they order by time.
+    pub fn message_for_item(&self, item: CaudraId) -> Option<(usize, bool)> {
+        let ids = |message: &DisplayMessage| match message.source {
+            Some(
+                DisplaySource::User(id)
+                | DisplaySource::AssistantText(id)
+                | DisplaySource::Reasoning(id)
+                | DisplaySource::ToolResult(id),
+            ) => [Some(id), None],
+            Some(DisplaySource::ToolCall { id, result_id }) => [Some(id), result_id],
+            None => [None, None],
+        };
+        if let Some(exact) = self
+            .messages
+            .iter()
+            .position(|message| ids(message).contains(&Some(item)))
+        {
+            return Some((exact, true));
+        }
+        self.messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| {
+                let earlier = ids(message).into_iter().flatten().filter(|id| *id <= item);
+                earlier.max().map(|id| (id, index))
+            })
+            .max()
+            .map(|(_, index)| (index, false))
+    }
+
+    /// The card of tool call `tool_id`.
+    pub fn message_for_tool(&self, tool_id: &str) -> Option<usize> {
+        self.messages
+            .iter()
+            .rposition(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
+    }
+
+    /// Scrolls `msg_index` to the top and marks it until [`Self::clear_landing`].
+    pub fn land_on_message(&mut self, msg_index: usize) {
+        self.scroll_to_message(msg_index);
+        self.landing = Some(msg_index);
+    }
+
+    pub fn landing(&self) -> Option<usize> {
+        self.landing
+    }
+
+    /// Whether a landing mark was cleared, so the caller knows to redraw.
+    pub fn clear_landing(&mut self) -> bool {
+        self.landing.take().is_some()
+    }
+
     pub fn half_page(&self) -> i32 {
         self.viewport_height as i32 / 2
     }
@@ -4397,7 +4456,8 @@ impl MessagesPanel {
             if cursor.skip_above(height) {
                 continue;
             }
-            let highlight = self.highlight_segment == Some(i);
+            let highlight = self.highlight_segment == Some(i)
+                || (self.landing.is_some() && seg.msg_index == self.landing);
             let hover = self
                 .hover_feedback_for_segment(seg)
                 .map(|feedback| (feedback, accent));

@@ -24,6 +24,7 @@ pub(crate) mod permission_editor;
 pub(crate) mod questions;
 mod queue;
 mod sandbox;
+mod search;
 mod session;
 pub(crate) mod session_state;
 pub(crate) mod shell;
@@ -66,7 +67,9 @@ use crate::components::autopilot_panel::AutopilotPanel;
 use crate::components::changelog_modal::{
     self, ChangelogAction, ChangelogModal, View as ChangelogView,
 };
-use crate::components::command::{CommandAction, CommandPalette, ParsedCommand, disabled_feature};
+use crate::components::command::{
+    CommandAction, CommandPalette, ParsedCommand, SEARCH_HISTORY_COMMAND, disabled_feature,
+};
 use crate::components::command_modal::{CommandModal, CommandModalAction};
 use crate::components::commit_popup::{CommitAction, CommitIndex, CommitPopup};
 use crate::components::context_modal::ContextModal;
@@ -110,7 +113,7 @@ use crate::components::review::{ReviewAction, ReviewModal};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::sandbox_manager::SandboxManager;
 use crate::components::scrollbar;
-use crate::components::search_modal::{SearchAction, SearchModal};
+use crate::components::search_modal::{SearchAction, SearchModal, SearchTab};
 use crate::components::session_picker::{SessionPicker, SessionRow};
 use crate::components::session_relocation::SessionRelocationPicker;
 use crate::components::shell_modal::ShellModal;
@@ -526,6 +529,7 @@ pub struct App {
     pub(super) stream_modal: StreamModal,
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
+    history_search: search::HistorySearchRun,
     pub(super) file_picker: FilePickerModal,
     pub(super) mention_popup: MentionPopup,
     pub(super) commit_popup: CommitPopup,
@@ -867,6 +871,7 @@ impl App {
             stream_modal: StreamModal::new(typewriter),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
+            history_search: search::HistorySearchRun::default(),
             file_picker: FilePickerModal::new(),
             mention_popup,
             commit_popup: CommitPopup::new(),
@@ -2125,7 +2130,12 @@ impl App {
             };
         }
         try_picker!(self.command_modal);
-        try_picker!(self.search_modal);
+        if self.search_modal.is_open() {
+            if self.search_modal.contains(pos) {
+                self.search_modal.scroll_at(pos, delta);
+            }
+            return None;
+        }
         try_picker!(self.theme_picker);
         try_picker!(self.mcp_picker);
         try_picker!(self.env_modal);
@@ -2580,14 +2590,11 @@ impl App {
 
         if self.search_modal.is_open() {
             if let Some(text) = generated {
-                if !text.is_empty() {
-                    self.search_modal.handle_text(text, false);
-                    let chat = &mut self.chats[self.active_chat];
-                    let texts = chat.segment_search_texts();
-                    self.search_modal.update_matches(&texts);
-                    sync_search_highlight(&self.search_modal, chat);
+                if text.is_empty() {
+                    return Some(vec![]);
                 }
-                return Some(vec![]);
+                self.search_modal.handle_text(text, false);
+                return Some(self.handle_search_action(SearchAction::QueryChanged));
             }
             guard_repeat!(true);
             let action = self.search_modal.handle_key(key);
@@ -3007,41 +3014,6 @@ impl App {
                 Vec::new()
             }
         }
-    }
-
-    fn handle_search_action(&mut self, action: SearchAction) -> Vec<Action> {
-        match action {
-            SearchAction::Consumed => {}
-            SearchAction::QueryChanged => {
-                let chat = &mut self.chats[self.active_chat];
-                let texts = chat.segment_search_texts();
-                self.search_modal.update_matches(&texts);
-                sync_search_highlight(&self.search_modal, chat);
-            }
-            SearchAction::Navigate => {
-                sync_search_highlight(&self.search_modal, &mut self.chats[self.active_chat]);
-            }
-            SearchAction::Copy(text) => self.copy_to_clipboard(&text),
-            SearchAction::Cut(text) => {
-                self.copy_to_clipboard(&text);
-                return self.handle_search_action(SearchAction::QueryChanged);
-            }
-            SearchAction::Select(idx) => {
-                let chat = &mut self.chats[self.active_chat];
-                chat.scroll_to_segment(idx);
-                chat.set_highlight_segment(None);
-                self.search_modal.close();
-            }
-            SearchAction::Close(saved) => {
-                let chat = &mut self.chats[self.active_chat];
-                chat.set_highlight_segment(None);
-                if let Some((top, auto)) = saved {
-                    chat.restore_scroll(top, auto);
-                }
-                self.search_modal.close();
-            }
-        }
-        Vec::new()
     }
 
     /// The one way a surface that holds the mouse hands text to the system
@@ -3511,11 +3483,7 @@ impl App {
                     self.file_picker.open(&self.state.session.cwd);
                 }
             }
-            BuiltinAction::Search => {
-                let top = self.chats[self.active_chat].scroll_top();
-                let auto = self.chats[self.active_chat].auto_scroll();
-                self.search_modal.open(top, auto);
-            }
+            BuiltinAction::Search => self.open_search(SearchTab::ThisChat, ""),
             BuiltinAction::Help => self.help_modal.toggle(),
             BuiltinAction::PlanToggle => {
                 if self.plan_toggle_ready() {
@@ -3728,6 +3696,7 @@ impl App {
         }
         self.clear_selection_unless_pending_copy();
         self.sync_subagent_input_target();
+        self.chats[self.active_chat].clear_landing();
 
         if !key::EXIT.matches(key) {
             self.last_exit = None;
@@ -5980,6 +5949,10 @@ impl App {
                 self.docs_modal.open(&cmd.args);
                 vec![]
             }
+            SEARCH_HISTORY_COMMAND => {
+                self.open_search(SearchTab::Project, cmd.args.trim());
+                vec![]
+            }
             "/changelog" => {
                 self.execute_changelog(&cmd.args);
                 vec![]
@@ -6897,6 +6870,7 @@ impl App {
             | self.poll_task_controls()
             | self.poll_task_continuation()
             | self.poll_task_history()
+            | self.poll_history_search(Instant::now())
             | self.poll_shells()
             | self.tick_workbench()
             | self.poll_commit_index()
@@ -7445,10 +7419,7 @@ impl App {
         }
         if self.search_modal.is_open() {
             self.search_modal.handle_paste(text);
-            let chat = &mut self.chats[self.active_chat];
-            let texts = chat.segment_search_texts();
-            self.search_modal.update_matches(&texts);
-            sync_search_highlight(&self.search_modal, chat);
+            self.handle_search_action(SearchAction::QueryChanged);
             return;
         }
         macro_rules! try_picker {
@@ -7734,12 +7705,4 @@ fn is_streaming_stop_key(key: KeyEvent) -> bool {
 fn is_shift_tab(key: KeyEvent) -> bool {
     key.code == KeyCode::BackTab
         || (key.code == KeyCode::Tab && key.modifiers == KeyModifiers::SHIFT)
-}
-
-fn sync_search_highlight(modal: &SearchModal, chat: &mut Chat) {
-    let idx = modal.current_segment_index();
-    if let Some(i) = idx {
-        chat.scroll_to_segment(i);
-    }
-    chat.set_highlight_segment(idx);
 }

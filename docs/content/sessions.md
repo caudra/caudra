@@ -275,9 +275,32 @@ A schema migration prunes as its last step. Rewriting rows puts the pages they o
 
 Retention never removes spending records. What a session cost is written to a separate ledger that no session owns, so `caudra storage usage` still answers after the sessions are gone. See [Lifetime spend](/docs/token-economy/#lifetime-spend).
 
+## Search past sessions
+
+`Ctrl+F` opens the search on the current chat, and `/search-history [words]` opens it on this project's past sessions with the words already typed. One modal holds three tabs, and `Tab` or `Shift+Tab` moves between them while keeping what you typed. `Alt+1` to `Alt+3` jump straight to a tab.
+
+| Tab | Searches | Matching |
+|-----|----------|----------|
+| This chat | The open transcript as it is drawn | Fuzzy, live. The transcript scrolls behind the modal to the selected match, and `Esc` puts it back |
+| Project | Saved sessions of this checkout and its linked worktrees, or of the remote workspace | Whole words, ranked by relevance |
+| All projects | Every saved session on this machine | Whole words, ranked by relevance |
+
+The two history tabs list each match with its session, project, and age, and a preview pane shows the selected item in full with its neighbours. The preview is dropped when the terminal is too narrow for both panes. `Shift+↑` and `Shift+↓` scroll the preview, and the wheel or the scrollbar scrolls whichever pane the pointer is over without moving the selection. Dragging over text selects and copies it within the pane the drag started in. On every tab, the end of the query row shows the selected match and how many are listed, with `+` while another page can still load.
+
+Words can carry filters: `kind:user`, `kind:tool_result`, `tool:shell`, `since:7d`, `since:12h`, `until:2026-10-01`. A filter that does not parse stays a search word, and a quoted phrase is matched as a phrase. `Ctrl+S` switches between best and newest first.
+
+With a [decision endpoint](/docs/providers/#decision-endpoints) active and the `history_search` feature set to `enforce`, a query you stop typing for a moment is reranked, as [Decisions and reranking](/docs/code/#decisions-and-reranking) describes for the `code` tool. Keyword results show first, and the reranked list replaces them with the selection kept on the same match. Matches the engine judged unrelated are hidden and counted on the status line. `Ctrl+R` turns reranking off for keyword order and on again.
+
+`Enter` goes to the match:
+
+- In this session, the transcript scrolls to the item and marks it until the next key. An item the transcript does not draw, such as a compacted one, lands on the nearest message before it. A match inside a task opens that task's transcript.
+- In another session, Caudra opens it, moving to its directory as [`/cd`](#moving-sessions-to-another-directory) would when it works elsewhere, and then scrolls to the item. Inside Herdr or Orca a session in another checkout resumes in its own pane, without the scroll.
+
+An [ephemeral session](#ephemeral-sessions) can still search its own chat, and its history tabs say why they are empty.
+
 ## Search index
 
-The `code` tool's [`history` module](/docs/code/#search-past-conversations) searches stored conversations through a full-text index in `caudra.db`. The index holds which words each item contains, without a copy of the text. Forgetting a session removes its index rows with it. Trimming leaves the conversation, so a trimmed session stays searchable.
+The `code` tool's [`history` module](/docs/code/#search-past-conversations) and the [history search](#search-past-sessions) find stored conversations through a full-text index in `caudra.db`. The index holds which words each item contains, without a copy of the text. Forgetting a session removes its index rows with it. Trimming leaves the conversation, so a trimmed session stays searchable.
 
 The index fills lazily. While the TUI is open, a background thread indexes saved sessions, newest first, in short transactions that never hold a session save back for long, and then checks for new history every 30 seconds. Each search also indexes what changed in its own scope for up to 1.5 seconds before it runs, which is how headless and ACP sessions keep up. An ephemeral session is never indexed.
 

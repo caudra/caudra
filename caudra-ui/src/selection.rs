@@ -81,7 +81,7 @@ pub struct SelectableZone {
     pub zone: SelectionZone,
 }
 
-const ZONE_CAP: usize = 12;
+const ZONE_CAP: usize = 16;
 
 const EMPTY_ZONE: SelectableZone = SelectableZone {
     area: Rect::new(0, 0, 0, 0),

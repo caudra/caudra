@@ -32,6 +32,7 @@ const SECTION_CUSTOM: &str = "Project & User";
 const SECTION_MCP: &str = "MCP Prompts";
 const SECTION_PLUGIN: &str = "Plugins";
 const VALUE_PAD: usize = 1;
+pub(crate) const SEARCH_HISTORY_COMMAND: &str = "/search-history";
 
 /// Which chat a command can act on. [`ChatScope::MainOnly`] reaches the main
 /// session's turn or history, which a focused task has no equivalent of, so
@@ -169,6 +170,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "/docs",
         description: "Read Caudra's documentation, or search it",
+        max_args: usize::MAX,
+        scope: ChatScope::Any,
+        features: &[],
+    },
+    BuiltinCommand {
+        name: SEARCH_HISTORY_COMMAND,
+        description: "Search past sessions of this project or every project",
         max_args: usize::MAX,
         scope: ChatScope::Any,
         features: &[],

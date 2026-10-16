@@ -632,6 +632,26 @@ impl Chat {
         self.messages_panel.set_highlight_segment(idx);
     }
 
+    pub fn message_for_item(&self, item: CaudraId) -> Option<(usize, bool)> {
+        self.messages_panel.message_for_item(item)
+    }
+
+    pub fn message_for_tool(&self, tool_id: &str) -> Option<usize> {
+        self.messages_panel.message_for_tool(tool_id)
+    }
+
+    pub fn land_on_message(&mut self, msg_index: usize) {
+        self.messages_panel.land_on_message(msg_index);
+    }
+
+    pub fn landing(&self) -> Option<usize> {
+        self.messages_panel.landing()
+    }
+
+    pub fn clear_landing(&mut self) -> bool {
+        self.messages_panel.clear_landing()
+    }
+
     pub fn set_accent(&mut self, color: Color) {
         self.messages_panel.set_accent(color);
     }

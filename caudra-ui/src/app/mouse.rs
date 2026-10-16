@@ -30,7 +30,7 @@ use super::{AUTO_OFF_MSG, App, FAST_OFF_MSG, KeyFocus, YOLO_OFF_MSG};
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
 const MESSAGE_ACTIONS_UNAVAILABLE: &str = "Message actions unavailable here";
-const SELECTION_COPIED: &str = "Copied selection";
+pub(super) const SELECTION_COPIED: &str = "Copied selection";
 /// Rows either side of the origin that scroll nothing, so parking the pointer
 /// where it started holds the view still.
 const AUTOSCROLL_DEAD_ZONE: i32 = 2;
@@ -499,6 +499,12 @@ impl App {
                 return actions;
             }
         } else if self.search_modal.is_open() {
+            if self.search_modal.bar_claims(&event) {
+                self.clear_control_hovers();
+                self.selection_state = None;
+                let action = self.search_modal.handle_mouse(event);
+                return self.handle_search_action(action);
+            }
             if let Some(actions) = self.route_overlay_mouse(
                 event,
                 |app, event| app.search_modal.handle_mouse(event),

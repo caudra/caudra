@@ -3,7 +3,9 @@
 //! `caudra-storage` owns the keyword index. This adds what needs the agent: catching the index up
 //! before a query, and the funnel that lets the decision engine rerank the keyword matches.
 
+mod filters;
 mod funnel;
+mod project;
 
 use std::time::{Duration, Instant};
 
@@ -13,10 +15,12 @@ use caudra_storage::sessions::{SessionDatabase, SessionError};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
+pub use filters::{QueryFilters, parse_filters, parse_iso_time};
 pub use funnel::{
     HistoryResults, HistorySearch, LEXICAL_LIMIT, MAX_LIMIT, MAX_POOL_PER_SESSION, PoolJudgement,
     RERANK_POOL, RERANKED_LIMIT, Ranking, judge_pool, search,
 };
+pub use project::{HistoryProject, remote_identity};
 
 /// How long a query waits for the index to catch up with its scope before it searches what is
 /// indexed and counts the rest as unindexed.

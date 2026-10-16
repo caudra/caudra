@@ -74,6 +74,7 @@ use caudra_storage::StateDir;
 use caudra_storage::StorageError;
 use caudra_storage::changelog;
 use caudra_storage::checkout;
+use caudra_storage::history_search::HistoryRef;
 use caudra_storage::id::{CaudraId, CaudraIdParseError, SessionRef};
 use caudra_storage::remote_operation_journal::RemoteOperationJournal;
 use caudra_storage::sessions::change_stores::{registered_change_stores, store_summaries};
@@ -179,6 +180,7 @@ const WORKTREE_REPOSITORY_ERR: &str =
 const SESSION_OPEN_ELSEWHERE: &str =
     "Another Caudra has that session open, so only its workspace was focused";
 const NO_CHANGE_STORES: &str = "The file change record stores could not be opened";
+const HIT_JUMP_STAYS: &str = "scroll to the match there, the search can't follow into that pane";
 const AUTH_LOGIN_ARGS: [&str; 2] = ["auth", "login"];
 const OAUTH_METHOD_ARGS: [&str; 2] = ["--method", "oauth"];
 const AUTH_EXECUTABLE_ERR: &str = "could not locate the Caudra executable for login";
@@ -4182,6 +4184,37 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    /// Goes to a search hit in another session: focuses it, here or after moving to the
+    /// directory it works in, then lands on the match. A host resumes it in a pane of its own,
+    /// where the jump cannot follow.
+    fn open_history_hit(&mut self, idx: usize, reference: HistoryRef, cwd: Option<&Path>) {
+        let id = reference.session;
+        let here = canonical_cwd(Path::new(&self.sessions[idx].app.state.session.cwd)).ok();
+        let elsewhere =
+            cwd.filter(|cwd| self.position(id).is_none() && cwd.canonicalize().ok() != here);
+        match elsewhere {
+            Some(cwd) if let Some(host) = self.worktrees.host() => {
+                let outcome = resume_in_host(host, &self.ctx.storage, id, cwd)
+                    .map(|outcome| format!("{outcome}; {HIT_JUMP_STAYS}"));
+                self.sessions[idx]
+                    .app
+                    .flash(outcome.unwrap_or_else(|error| error));
+                return;
+            }
+            Some(cwd) => self.open_session_elsewhere(idx, id, cwd),
+            None => {
+                if let Err(error) = self.focus_session(id) {
+                    self.sessions[idx].app.flash(error);
+                    return;
+                }
+            }
+        }
+        let focused = &mut self.sessions[self.focused].app;
+        if focused.state.session.id == id {
+            focused.jump_to_history(reference);
+        }
+    }
+
     /// The host a fork from the session at `idx` opens a tab in, when a
     /// Caudra there can load the fork.
     fn fork_host(&self, idx: usize, fork: &AppSession) -> Option<&dyn Workspaces> {
@@ -4406,6 +4439,9 @@ impl<'t> EventLoop<'t> {
                 }
             }
             Action::OpenSessionElsewhere { id, cwd } => self.open_session_elsewhere(idx, id, &cwd),
+            Action::OpenHistoryHit { reference, cwd } => {
+                self.open_history_hit(idx, reference, cwd.as_deref());
+            }
             Action::DeleteSession(id) => {
                 let released = if self.position(id) == Some(self.focused) {
                     self.replace_focused_for_delete()

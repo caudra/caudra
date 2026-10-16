@@ -300,6 +300,10 @@ pub mod key {
     };
     pub const POP_QUEUE: Bind = ctrl_bind!('q');
     pub const SEARCH: Bind = ctrl_bind!('f');
+    /// The search modal's past-sessions tabs: best first or newest first, and whether the
+    /// decision engine reranks the keyword matches.
+    pub const SEARCH_SORT: Bind = ctrl_bind!('s');
+    pub const SEARCH_RERANK: Bind = ctrl_bind!('r');
     /// Inside the model picker, where nothing searches the transcript. The
     /// key opencode spends on the same toggle.
     pub const TOGGLE_FAVORITE: Bind = ctrl_bind!('f');
@@ -817,8 +821,33 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single(key::SEARCH.label),
-        description: "Search messages",
+        description: "Search this chat or past sessions",
         context: KeybindContext::General,
+    },
+    Keybind {
+        label: KeyLabel::Single("Tab"),
+        description: "Search this chat, this project, or all projects",
+        context: KeybindContext::Search,
+    },
+    Keybind {
+        label: KeyLabel::Single("Enter"),
+        description: "Go to the match, opening its session",
+        context: KeybindContext::Search,
+    },
+    Keybind {
+        label: KeyLabel::Single("Shift+↑↓"),
+        description: "Scroll the preview of a past session's match",
+        context: KeybindContext::Search,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::SEARCH_SORT.label),
+        description: "Past sessions: best or newest matches first",
+        context: KeybindContext::Search,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::SEARCH_RERANK.label),
+        description: "Past sessions: rerank with the decision engine, or keyword order",
+        context: KeybindContext::Search,
     },
     Keybind {
         label: KeyLabel::Single(leader::COPY_MESSAGE.label),

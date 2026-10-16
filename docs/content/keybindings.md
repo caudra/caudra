@@ -30,7 +30,7 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `Ctrl+P` | Command palette |
 | `Ctrl+X` | Leader: lists the chords below, then runs the one you press |
 | `F1` / `Ctrl+X ?` | Show keybindings |
-| `Ctrl+F` | Search messages |
+| `Ctrl+F` | Search this chat or past sessions |
 | `Ctrl+X y` | Copy last reply as markdown |
 | `Ctrl+X r` | Review the last reply |
 | `Ctrl+S` / `Ctrl+X f` | File picker |
@@ -230,6 +230,11 @@ Some pickers add extra bindings on top of the defaults:
 
 | Context | Key | Action |
 |---------|-----|--------|
+| Search | `Tab` | Search this chat, this project, or all projects |
+| Search | `Enter` | Go to the match, opening its session |
+| Search | `Shift+↑↓` | Scroll the preview of a past session's match |
+| Search | `Ctrl+S` | Past sessions: best or newest matches first |
+| Search | `Ctrl+R` | Past sessions: rerank with the decision engine, or keyword order |
 | Queue | `Shift+Up` / `Shift+Down` | Move item up / down |
 | Queue | `Enter` | Edit item |
 | Queue | `d` / `Delete` | Delete item |
