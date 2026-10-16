@@ -167,7 +167,7 @@ The reminder also tells the model how to get reliable answers, following the hab
 - Give each choice and level a `description` that sets it apart from the others.
 - Write the rerank `query` as the need rather than keywords, and send each candidate as a short label and summary. `index` maps back to the full item.
 - Act on a predicate at about 0.85 or more. Below 0.6 the answer is a guess.
-- Judge independent items with one `decide()` call each, run together under `asyncio.gather`. Questions about the same `input` share one call.
+- Judge one item per call. `decide()` answers each question once for the whole `input`, so a list of items gets one call per item, with every question about that item in the call. A local engine answers overlapping calls one at a time, and each call waits only `timeout_ms`, so a snippet that runs many calls under `asyncio.gather` passes a larger `timeout_ms`.
 
 A call needs no approval and works in plan mode, since it only reads. A malformed question or argument raises `TypeError` or `ValueError` before anything is sent. An unreachable engine, a timeout, a refusal, or an invalid answer raises `RuntimeError`, and one failed request fails the whole `rerank()`. The opt-in [decision log](/docs/permissions/#decision-engine-advice) records each call under the feature `mcp`. Answers are data for the snippet: they never grant a permission.
 

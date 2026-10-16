@@ -36,11 +36,12 @@ Use these in a snippet on what its server calls returned, to keep only what matt
 - `await decide(input, questions)`: answers every question about `input` in one request. Questions follow the OpenAI Decisions shape: `type`, `name`, `instructions`, as a `predicate`, a `choice` with `choices`, or a `score` with 2 to 10 `levels`, low to high. Read `r[\"by_name\"][name]`.\n\
 - `await rerank(query, candidates, threshold=None, top_k=None)`: `[{\"index\", \"score\"}]`, best first, for up to 256 strings or small dicts. `score` is the probability of relevance.\n\
 For good answers:\n\
-- Make `input` a dict under 1,500 bytes of only the judged fields, and name them: \"Does `body` report a crash?\". `instructions` can be `{\"question\": ..., \"focus\": \"what counts and what does not\"}`.\n\
-- Describe each choice or level by what sets it apart: `{\"value\": \"high\", \"description\": \"loses data\"}`.\n\
+- Make `input` a dict under 1,500 bytes of only the judged fields, and name them in the questions. `instructions` can be `{\"question\": ..., \"focus\": \"what counts and what does not\"}`.\n\
+- Describe each choice or level by what sets it apart.\n\
 - Write `query` as the need, not keywords, and pass short labels as candidates. `index` maps back to the full item.\n\
-- Act on about 0.85 or more; below 0.6 is a guess. Run independent `decide()` calls under `asyncio.gather`.\n\
-Example: `top = await rerank(\"issues reporting a crash at startup\", [i[\"title\"] for i in issues], top_k=10)`.";
+- Act on about 0.85 or more; below 0.6 is a guess.\n\
+- `decide()` judges `input` as one item: call it once per item. A local engine queues overlapping calls, and each waits only `timeout_ms` (800 by default), so raise it to `gather` many.\n\
+Examples: `await decide({\"body\": b}, [{\"type\": \"score\", \"name\": \"severity\", \"instructions\": \"How severe is the bug `body` reports?\", \"levels\": [\"cosmetic\", {\"label\": \"blocking\", \"description\": \"no workaround\"}]}])`, `await rerank(\"issues reporting a crash at startup\", titles, top_k=10)`.";
 
 /// What keeps a server's tools out of reach, or `None` when it is connected.
 pub fn unavailable(state: &ServerState) -> Option<String> {
@@ -441,7 +442,7 @@ mod tests {
 
     #[test]
     fn decision_helpers_stay_within_their_budget() {
-        const DECISIONS_SECTION_TOKENS: usize = 400;
+        const DECISIONS_SECTION_TOKENS: usize = 420;
         const OVER_BUDGET: &str = "the decision helpers outgrew their share of the reminder";
         let tokens = estimate_tokens(DECISIONS_SECTION) as usize;
         assert!(
