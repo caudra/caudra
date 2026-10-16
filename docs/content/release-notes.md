@@ -11,7 +11,29 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.10 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.10)
 
-Preview 10 lets MCP snippets ask the decision engine typed questions and rerank long results before the model reads them, moves workflow `decide()` to the same question shape, the one OpenAI Decisions uses, cuts the code-graph tools to two that every model sees, list call sites, and are renamed `source_code_context` and `source_code_refs`, copies what you drag over in `/btw` and the question form, and fixes subscription image generation after GPT-5.5 retired from Codex.
+- One `code` tool replaces `mcp` and `python_execution`, searches your past conversations, and can ask the decision engine to judge and rerank results.
+- Two source code tools instead of five, renamed `source_code_context` and `source_code_refs`, that every model sees and that list call sites.
+- Workflow `decide()` uses the OpenAI Decisions question shape.
+- Pictures in the transcript.
+- Add a note to your answers to the agent's questions.
+- Dragging copies in `/btw` and the question form.
+- Goals stop when they make no progress, wait for CI or a deploy, and tell automations when they are stuck.
+- Subscription image generation works again after GPT-5.5 left Codex.
+- Fixes for Lua plugin cleanup, source indexing, shell-output filtering, and Nix builds.
+
+> **Important**
+>
+> **Close every other Caudra session before you start Preview 10.** On its first start, Preview 10 upgrades the session database in your [state directory](/docs/configuration/#directory-layout), and the upgrade needs exclusive access. This includes other terminals, editor sessions over ACP, and `caudra storage` commands. While any of them still has the database open, Preview 10 does not start. It lists the open sessions to close instead, and nothing is changed.
+>
+> The upgrade keeps your sessions and saves a copy of the database from before it as `caudra.db.v28.bak` next to `caudra.db`. Preview 9 and earlier cannot open the upgraded database, and `caudra rollback` restores only the previous binary, not the database.
+
+> **Warning**
+>
+> **Before you start Preview 10, rename `ui.tool_output_lines.python_execution` to `ui.tool_output_lines.code`.** The `code` tool replaces `mcp` and `python_execution`, with no alias. A `caudra.toml` that still sets the old key fails to load, with an error that names the new one. Permission rules, `agent.disabled_tools` entries, and system prompt profiles that name the `mcp` or `python_execution` tool no longer match anything, so name `code` in them instead. See [Code](/docs/code/).
+
+> **Warning**
+>
+> **If you run a remote Workcell server, update it with Caudra and rename its `python_execution` tool group to `code`.** Workcell's Python tool is now `code` too, so `--tool-group python_execution` and `python_execution` in `WORKCELL_MCP_TOOL_GROUPS` fail at startup. Caudra requires a server that serves `code`, and refuses an older one. See [Remote workspaces](/docs/remote-workspaces/).
 
 > **Warning**
 >
@@ -22,10 +44,21 @@ Preview 10 lets MCP snippets ask the decision engine typed questions and rerank 
 >
 > **If your config, profiles, or remote Workcell use the code-graph tools, update them together with Caudra.** `code_context` and `code_refs` are now `source_code_context` and `source_code_refs`, and `code_map`, `code_impact`, and `code_expand` are gone: use `source_code_context` where you used `code_map` or `code_expand`, and `source_code_refs` with `depth` where you used `code_impact`. The profile tool group `code_graph` is now `source_code`, and `[decisions.features] code_context` is now `source_code_context`. A config or profile that still names an old tool, group, or feature is rejected as unknown. Your sessions, `/tools` usage, decision log, and saved permission rules move to the new names the first time Caudra starts, and sessions that called a removed tool still open and show those calls. A remote Workcell must run the same release as Caudra, or connecting fails with an incompatible tool catalog, and its `--tool-group code_graph` is now `--tool-group source_code`. The SDK's tool kinds are now `SourceCodeContext` and `SourceCodeRefs`. See [Code Intelligence](/docs/tools/#code-intelligence).
 
+> **Important**
+>
+> **Intel macOS users building with Nix must switch to the native build.** Current nixpkgs no longer supports Intel macOS, so the flake no longer provides `x86_64-darwin` outputs. Native Intel macOS builds and release binaries remain supported.
+
+### Code
+
+- **One `code` tool replaces `mcp` and `python_execution`.** The model runs all of its Python in `code`: computation, MCP server calls, history search, and the decision helpers. It is offered in every session, with or without MCP servers, and its definition never changes, so the prompt cache holds. Variables persist between runs of the same agent, and `reset: true` starts a run empty. A model that still calls `mcp` or `python_execution` gets an unknown-tool error. `/tools`, `caudra tools`, and `/mcp` mark MCP tools `via code`. See [Code](/docs/code/).
+- **Computation runs where snippets run.** Python now always runs on your machine, also in sessions on a remote Workcell. A run has 30 seconds of computation, where `python_execution` stopped at 5 seconds unless the model asked for more, and the clock stops while a snippet waits for a call. `timeoutSec` is gone. One agent's runs go one at a time, so the model gathers parallel work in one snippet, and a `code` call starts once the model's response is complete. See [Where snippets run](/docs/code/#where-snippets-run).
+- **Search your past conversations.** `history.search()` finds what you wrote, what the model answered and reasoned, and what its tools did, in this conversation, this project, another project, or every stored session, compacted turns and subagents included. Each hit carries a snippet around the matched words and a reference that `history.read()` opens in full, and `history.sessions()` lists sessions. A full-text index in the session database fills in the background while the TUI is open, and each search catches it up first. Searching this project never asks. Another project or all projects ask first. The prompt shows the call with its arguments and which session or project's history it reads, and offers to always allow that history. See [Search past conversations](/docs/code/#search-past-conversations).
+- **Reranked history search.** With the experimental decision engine on, set `[decisions.features] history_search = "enforce"` and the engine judges up to 64 keyword matches against the query, drops those below `thresholds.relevance_floor`, and returns the 10 most relevant. Its four requests go out at once, and each waits up to four times `rerank_timeout_ms`, so an engine that answers one request at a time can still judge the whole pool. Otherwise a search returns 20 matches in keyword order. The feature is off by default, and `shadow` logs what it would have kept. See [Ranking](/docs/code/#ranking).
+
 ### MCP
 
-- **Decisions and reranking in snippets.** With the decision engine on, an `mcp` snippet can call `decide()` for typed answers about its data, and `rerank()` to keep only the candidates relevant to a query, best first, for up to 256 candidates. A snippet can rank 200 issue titles and return the ten that matter, so the rest never reach the model. The model is told how to write questions and queries that get reliable answers, such as naming the field each question judges and describing every option. Calls need no approval, work in plan mode, show as rows on the card, and appear in the decision log under the feature `mcp`. See [Decisions and reranking](/docs/mcp/#decisions-and-reranking).
-- **Decision answers you can read at a glance.** A `decide()` row on the `mcp` card shows its verdicts on one line, and always shows each question below it with a bar per option, the likeliest highlighted, and a warning when the winner is uncertain. A `rerank()` row always shows the candidates it kept, best first, under the labels they were given. Click the row's footer to see the JSON the snippet received; selecting any part of the row copies that JSON, in either view. In `/decisions`, Recent draws logged answers the same way, and `j` switches them to JSON.
+- **Decisions and reranking in snippets.** With the decision engine on, a `code` snippet can call `decide()` for typed answers about its data, and `rerank()` to keep only the candidates relevant to a query, best first, for up to 256 candidates. A snippet can rank 200 issue titles and return the ten that matter, so the rest never reach the model. The model is told how to write questions and queries that get reliable answers, such as naming the field each question judges and describing every option. Both work with or without MCP servers. Calls need no approval, work in plan mode, show as rows on the card, and appear in the decision log under the feature `code`. See [Decisions and reranking](/docs/code/#decisions-and-reranking).
+- **Decision answers you can read at a glance.** A `decide()` row on the `code` card shows its verdicts on one line, and always shows each question below it with a bar per option, the likeliest highlighted, and a warning when the winner is uncertain. A `rerank()` row always shows the candidates it kept, best first, under the labels they were given. Click the row's footer to see the JSON the snippet received; selecting any part of the row copies that JSON, in either view. In `/decisions`, Recent draws logged answers the same way, and `j` switches them to JSON.
 
 ### Workflows
 
@@ -35,9 +68,19 @@ Preview 10 lets MCP snippets ask the decision engine typed questions and rerank 
 
 - **Pictures in the transcript.** `view_image` and `image_generate` cards, Markdown images that point at local files, and prompts with attached images now show the picture as a thumbnail. Terminals that support Kitty graphics get the full-resolution picture, and other terminals get coloured blocks, two by two pixels to a cell, or two by three with `inline_images = "sextants"` in terminals and fonts that draw sextants. Click a picture to open it at full size, then press `o` to open it in your system viewer, `w` to open it in the workbench, or `y` to copy its path. Images attached to a draft show as `[Image #1]` chips you can click, and the workbench shows image files instead of the binary file notice. Markdown images are never fetched from the network. Set `[ui] inline_images` to `"blocks"`, `"sextants"`, `"kitty"`, or `"off"` to choose. See [Images](/docs/markdown/#images).
 
+### Questions
+
+- **Add a note to your answers.** On a question the agent asks, `F5` opens a note for anything the options and your answers leave out, even while you type an answer. The note shows on every tab and in the review, and a click edits it. `Enter`, `Esc`, or `F5` again leaves it with the text kept. It reaches the agent with your answers, and with the dismissal when you press `Esc` on the form. `Ctrl+C` still stops the agent, and moves the note to the composer to start your next message. Questions from MCP servers and consent requests have no note. The form's hints now start with `Enter submit`, then `F2 Ask /btw`. See [Keybindings](/docs/keybindings/#form).
+
 ### Selection
 
 - **Drag to copy in `/btw` and the question form.** Dragging over a `/btw` thread copies the passage when you let go, the way the transcript copies: within one answer as its Markdown, and across questions and answers as sections headed `User`, `Assistant`, `Thinking`, and `Error`, without the footer, the follow-up field, or a line break at every wrapped row, and the passage stays selected while the answer streams and scrolls. `Ctrl+Y`, `Ctrl+C`, and the footer's copy take the selection before the whole answer. In the question form, a drag starts anywhere, including on an option, and copies instead of picking what it ends on. A drag in the answer box selects and copies its text, and `Ctrl+C` copies a selection before it stops the agent. The form's border is no longer copied with the text. See [Commands](/docs/commands/) and [Keybindings](/docs/keybindings/#form).
+
+### Goals
+
+- **A goal that stops getting anywhere stops its run.** When three turns in a row make no progress, the run ends with the goal still active instead of spending continuations until the limit. A turn makes no progress when the evaluator saw nothing new, when it repeats an earlier turn exactly, or when the agent stops to ask you something. Progress is read from the conversation, so work on a remote system counts once a tool result shows it. Autopilot reviews the stall like a loop cap: a continue buys one more turn, and its review streak still leaves the fourth continue in a row to you. Headless clients get a `stalled` goal event. See [Commands](/docs/commands/).
+- **A goal waiting on something outside the session waits instead of stalling.** When the evaluator sees the goal waiting on a change that comes by itself, such as a CI run or a deploy, the run ends and the goal is checked again after a minute, then twice as long each time up to 30 minutes, for eight waits, about two hours. Then it stalls as before. A question to you never waits, and a message from you ends the wait. The wait is saved with the session, so a resumed session checks in when it is over. Headless clients get a `waiting` goal event. See [Commands](/docs/commands/).
+- **Automations hear about a stuck goal.** A `goal_finished` trigger that lists `stalled` in `verdicts` fires when a run stops on a goal that made no progress or used its continuations. The goal stays active, so a reply can still finish it. See [Automations](/docs/automations/).
 
 ### Image generation
 
@@ -54,11 +97,33 @@ Preview 10 lets MCP snippets ask the decision engine typed questions and rerank 
 
 - **`/tools` counts calls made inside `batch`.** Each call a batch makes now has its own row with its own outcome, time, and tokens, and the `batch` row keeps the wall time of the whole batch. The token total is unchanged.
 
+### Fixes
+
+- **A session with a stored tool card this build cannot read opens again.** Such a card, like an `mcp` card from Preview 9, is skipped, and its call shows the text the model received. Before, the whole session failed to open.
+- **Lua job cleanup survives cancellation and deadlines.** Releasing an abandoned `jobwait` during garbage collection no longer aborts the process, including when the plugin host shuts down.
+- **Shell output keeps unrelated subcommands intact.** Updated bundled filters no longer match commands merely because their names start with a filtered subcommand.
+- **PHP indexing handles clone arguments and partial application.** File indexes and code graphs no longer report parse errors for these expressions.
+- **Go type aliases appear in file indexes and code graphs.** Declarations such as `type Alias = Target` are now included as type definitions.
+- **SVG source icons enforce pixel-buffer limits across nested effects.** Allocation checks now include linked masks and clips, retained filter results, and drop-shadow scratch buffers. Over-budget icons are skipped.
+- **HTML conversion preserves code layout and lazy-loaded images.** Code blocks retain blank lines and image placeholders resolve correctly. Equally scored article candidates now follow document order.
+
+### Builds
+
+- **Nix evaluation works without building the worker source first.** The pinned Python worker source is fetched and verified during evaluation, without import from derivation.
+- **Workcell container builds include all attribution sources.** The Debian 13.7 image fetches both locked dependency graphs before generating its offline license bundle.
+
 ## Caudra 0.2 Preview 9 {#v0-2-0-preview-9}
 
 [v0.2.0-preview.9 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.9)
 
-Preview 9 lets the model call your MCP servers from Python, so a server with a hundred tools costs a short list instead of a hundred definitions, results are filtered before the model reads them, and MCP servers never break the prompt cache. It also adds Gemini 4 Argon as the Google default, along with Gemini 3.8 Flash, 3.6 Flash, and 3.5 Flash-Lite, brings Argon and 3.8 Flash to Copilot, adds Grok 4.7, GLM-5.3, DeepSeek V4.1 Flash, and Mistral Large 4, drops the Claude, Codex, and Copilot models their providers retired, bills announced price changes from their dates, fixes Google requests, which all failed on Caudra's tool definitions, fixes updates on macOS that sat for minutes on the download line, lets update checks use your GitHub token, shows download progress while Caudra updates, opens `/model` on your favorite models, lets `Home` and `End` jump to the ends of a picker's list, lets the agent ask questions without waiting for the answer and lets you answer a question later, runs a task on the favorite model you name, lets autopilot run without a continuation limit, fixes autopilot never answering the agent's questions, keeps a log of what autopilot did and what happened next, keeps a log of every goal check, fixes goal checks that failed every time after you interrupted the agent while it was thinking, lets `/btw` answer when the model reaches for a tool, applies a mode or model switch as soon as nothing is running, adds `/worktree close`, which brings a worktree's commits and changes back to the main checkout before it goes, resumes every session in a tab of its own when you leave a worktree's Herdr or Orca workspace, and breaks `/usage` down by purpose for the session as well as for all time.
+- Code mode: the model calls your MCP servers from Python, so a large server costs a short list, results are filtered before the model reads them, and the prompt cache survives.
+- Gemini 4 Argon is the Google default, with new Gemini Flash models, Grok 4.7, GLM-5.3, DeepSeek V4.1 Flash, and Mistral Large 4. Retired models are gone, and Google requests work again.
+- The agent can ask questions without waiting, and you can answer later.
+- Autopilot runs without a continuation limit, answers the agent's questions, and logs what it did.
+- A log of every goal check, and goal checks survive an interrupted reply.
+- `/worktree close` brings a worktree's work back to the main checkout.
+- `/model` opens on your favorites, and `Home` and `End` reach the ends of a list.
+- macOS updates no longer stall, and updates use your GitHub token and show download progress.
 
 > **Important**
 >
@@ -166,7 +231,14 @@ Preview 9 lets the model call your MCP servers from Python, so a server with a h
 
 [v0.2.0-preview.8 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.8)
 
-Preview 8 adds Claude Haiku 5.5 as the Anthropic Fast model, lets the experimental decision engine rerank memory notes, tool search, retained tool output, and code context, shows in the transcript what each decision feature changed, gives workflows a `rerank()` function, runs a task on the model you name, adds favorite models to `/model` and keeps 10 recent ones, opens forks in a new Herdr or Orca tab, names tabs after the session, lets new sessions open in build mode, lets you delete the current session from `/sessions`, makes the wheel scroll lists instead of moving their selection, stops pending reverts in a destination directory from blocking session moves, rings the bell in Orca when a turn ends in a tab you are not looking at, and has `caudra update` install without printing its installer first.
+- Claude Haiku 5.5 is the Anthropic Fast model.
+- The experimental decision engine reranks memory notes, tool search, retained tool output, and code context, and the transcript shows what each decision changed.
+- Workflows gain `rerank()`.
+- Favorite and 10 recent models in `/model`, and tasks run on the model you name.
+- Forks open in a new Herdr or Orca tab, and tabs are named after the session.
+- New sessions can open in build mode, and `/sessions` can delete the current session.
+- The wheel scrolls lists instead of moving their selection.
+- Fixes for session moves, Orca's bell, and `caudra update` output.
 
 > **Important**
 >
@@ -249,7 +321,12 @@ Preview 8 adds Claude Haiku 5.5 as the Anthropic Fast model, lets the experiment
 
 [v0.2.0-preview.7 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.7)
 
-Preview 7 sizes context windows to the limits providers enforce and lets you set them for built-in providers, reads secrets from files in global config files, keeps the reasoning of GPT models on Copilot in one piece, makes copying from Caudra in WSL reach the Windows clipboard, leaves approving a saved plan to the plan menu, and saves a session again after another Caudra carried it on.
+- Context windows match the limits providers enforce, and can be set for built-in providers.
+- Global config files read secrets from files.
+- GPT reasoning on Copilot stays in one piece.
+- Copying in WSL reaches the Windows clipboard.
+- Only the plan menu approves a saved plan.
+- A session saves again after another Caudra carried it on.
 
 > **Important**
 >
@@ -283,7 +360,12 @@ Preview 7 sizes context windows to the limits providers enforce and lets you set
 
 [v0.2.0-preview.6 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.6)
 
-Preview 6 adds autopilot, an experimental mode that answers permission prompts, questions, and ready plans for you while a session works toward its goal. It also forwards chosen environment variables to shell commands, draws MCP results readably, logs in to MCP servers that offer no client registration, shows what is new after an update, supports Orca terminals, and makes Enter answer a permission prompt in terminals where it did not.
+- Autopilot (experimental) answers permission prompts, questions, and ready plans while a session works toward its goal.
+- Chosen environment variables reach shell commands.
+- MCP results are drawn readably, and MCP servers without client registration can sign in.
+- What is new shows after an update.
+- Orca terminal support.
+- Enter answers a permission prompt in terminals where it did not.
 
 > **Important**
 >
@@ -340,7 +422,9 @@ Preview 6 adds autopilot, an experimental mode that answers permission prompts, 
 
 [v0.2.0-preview.5 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.5)
 
-Preview 5 applies configuration edits while Caudra runs, lets global config files read environment variables, and asks fewer questions about shell lines that set variables.
+- Configuration edits apply while Caudra runs.
+- Global config files can read environment variables.
+- Fewer questions about shell lines that set variables.
 
 > **Important**
 >
@@ -361,7 +445,10 @@ Preview 5 applies configuration edits while Caudra runs, lets global config file
 
 [v0.2.0-preview.4 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.4)
 
-Preview 4 adds hover tooltips, shows Caudra's own files and folders of your choice in the workbench explorer, offers narrower permission scopes for commands that take paths, and makes xAI sign-in work again.
+- Hover tooltips.
+- The workbench explorer shows Caudra's own files and folders you choose.
+- Narrower permission scopes for commands that take paths.
+- xAI sign-in works again.
 
 > **Important**
 >
@@ -395,7 +482,9 @@ Preview 4 adds hover tooltips, shows Caudra's own files and folders of your choi
 
 [v0.2.0-preview.3 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.3)
 
-Preview 3 rebuilds project memory around a summarized journal, adds GitHub sign-in for Copilot and a Copilot Enterprise provider, and shows available updates in every session.
+- Project memory is rebuilt around a summarized journal.
+- GitHub sign-in for Copilot, and a Copilot Enterprise provider.
+- Available updates show in every session.
 
 > **Important**
 >
@@ -433,7 +522,9 @@ Preview 3 rebuilds project memory around a summarized journal, adds GitHub sign-
 
 [v0.2.0-preview.2 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.2)
 
-Preview 2 improves installation and recovery, adds new opt-in decision features, and makes background shell commands easier to read.
+- Installation and recovery are more reliable.
+- New opt-in decision features.
+- Background shell commands are easier to read.
 
 ### Installation and updates
 

@@ -20,6 +20,10 @@ use caudra_config::decisions::{DecisionProtocol, FeatureMode, RawDecisionsConfig
 use caudra_decision::{Answer, QuestionSet};
 use caudra_providers::ModelPurpose;
 use caudra_storage::StateDir;
+use caudra_storage::history_search::{HistoryHit, HistoryRef, HistorySort, HistoryStream, Snippet};
+use caudra_storage::id::CaudraId;
+use jiff::civil;
+use jiff::tz::TimeZone;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -38,6 +42,7 @@ use crate::agent::{
     select_tool_results, should_skip_goal, skill_questions, skill_shortlist, skill_state,
     suggested_skill,
 };
+use crate::history::{self, PoolJudgement};
 use crate::memory::relevance::{self, Advice, Judge};
 use crate::memory::search::{Candidate, Hit};
 use crate::permissions::{PermissionResource, decision_state};
@@ -78,6 +83,8 @@ const RANK_CASE_EMPTY: &str = "a case needs a query and candidates";
 const RANK_RELEVANT_OUT_OF_RANGE: &str = "a relevant index is not a candidate";
 const RANK_CANDIDATE_UNBOUNDED: &str = "a candidate exceeds the bounded decision context";
 const NOTE_INVALID: &str = "a memory candidate needs a name, a heading and a body";
+const EXCERPT_INVALID: &str =
+    "a history candidate needs a known kind, an ISO date, a title and a snippet";
 const NEW_NOTE_INVALID: &str =
     "a duplicates query is the new note's name, a newline, then its text";
 const NEW_NOTE_SEPARATOR: char = '\n';
@@ -224,6 +231,16 @@ struct RankCase {
     query: String,
     candidates: Vec<Value>,
     relevant: BTreeSet<usize>,
+}
+
+/// A match in a history fixture, as the keyword ranker would offer it.
+#[derive(Deserialize)]
+struct FixtureExcerpt {
+    kind: String,
+    tool: Option<String>,
+    date: String,
+    title: String,
+    snippet: String,
 }
 
 /// A note in a memory fixture, as the store would offer it.
@@ -390,6 +407,12 @@ fn decision_eval() {
             )
             .await,
             run_ranked(
+                "history_search",
+                include_str!("eval/history_search.json"),
+                |case| history_search_case(judge, case),
+            )
+            .await,
+            run_ranked(
                 "memory_recall",
                 include_str!("eval/memory_recall.json"),
                 |case| memory_recall_case(judge, case),
@@ -453,6 +476,7 @@ fn service(url: &str, state_dir: StateDir) -> Decisions {
     features.subagent_routing = FeatureMode::Enforce;
     features.question_tool_nudge = FeatureMode::Advise;
     features.memory_search = FeatureMode::Enforce;
+    features.history_search = FeatureMode::Enforce;
     features.memory_recall = FeatureMode::Advise;
     features.memory_duplicates = FeatureMode::Advise;
     features.source_code_context = FeatureMode::Enforce;
@@ -1089,6 +1113,54 @@ async fn memory_duplicates_case(judge: &Judge, case: RankCase) -> Ranking {
     advised(advice.ok(), &notes, started)
 }
 
+async fn history_search_case(judge: &Judge, case: RankCase) -> Ranking {
+    let hits = history_hits(&case.candidates).expect(RANK_FIXTURE_INVALID);
+    let started = Instant::now();
+    let judged = history::judge_pool(judge, &case.query, &hits, HistorySort::Relevance).await;
+    Ranking {
+        order: judged
+            .ok()
+            .filter(PoolJudgement::applied)
+            .map_or_else(|| (0..hits.len()).collect(), |judged| judged.kept),
+        advised: Vec::new(),
+        latency_ms: latency_since(started),
+    }
+}
+
+/// The matches a history case offers, in keyword order, as the index would.
+fn history_hits(candidates: &[Value]) -> Result<Vec<HistoryHit>, &'static str> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            let excerpt = FixtureExcerpt::deserialize(candidate).map_err(|_| EXCERPT_INVALID)?;
+            let at_ms = excerpt
+                .date
+                .parse::<civil::Date>()
+                .ok()
+                .and_then(|date| date.to_zoned(TimeZone::UTC).ok())
+                .and_then(|day| u64::try_from(day.timestamp().as_millisecond()).ok())
+                .ok_or(EXCERPT_INVALID)?;
+            Ok(HistoryHit {
+                reference: HistoryRef {
+                    session: CaudraId::generate(),
+                    stream: HistoryStream::Main,
+                    item: CaudraId::generate(),
+                },
+                session_title: excerpt.title,
+                project: String::new(),
+                kind: excerpt.kind.parse().map_err(|_| EXCERPT_INVALID)?,
+                tool: excerpt.tool,
+                at_ms,
+                score: 0.0,
+                snippet: Snippet {
+                    text: excerpt.snippet,
+                    highlights: Vec::new(),
+                },
+            })
+        })
+        .collect()
+}
+
 /// The notes a memory case offers, in its order, as the store would.
 fn memory_notes(candidates: &[Value]) -> Result<Vec<Candidate>, &'static str> {
     (0..)
@@ -1416,6 +1488,20 @@ fn memory_fixtures_hold_what_their_surfaces_take(source: &str, new_note_query: b
             new_note(&case.query).unwrap();
         }
     }
+}
+
+#[test]
+fn the_history_fixture_holds_what_the_funnel_takes() {
+    let fixture = rank_fixture(include_str!("eval/history_search.json")).unwrap();
+    for case in &fixture.cases {
+        history_hits(&case.candidates).unwrap();
+    }
+}
+
+#[test_case(json!({"kind": "tool", "tool": null, "date": "2026-01-01", "title": "T", "snippet": "S"}); "unknown_kind")]
+#[test_case(json!({"kind": "user", "tool": null, "date": "yesterday", "title": "T", "snippet": "S"}); "not_a_date")]
+fn a_history_candidate_must_be_a_match(candidate: Value) {
+    assert_eq!(history_hits(&[candidate]).err(), Some(EXCERPT_INVALID));
 }
 
 #[test_case(json!({"name": "a.md", "heading": "A"}); "no_body")]

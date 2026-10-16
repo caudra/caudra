@@ -15,13 +15,13 @@ use crate::components::tool_display::{
 use crate::inline_image::tests::{PIXEL_SYMBOL, decode_queued, png_bytes, png_source};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
+use caudra_agent::code::output::CodeCallStatus;
 use caudra_agent::commits::repo::CommitSummary;
-use caudra_agent::mcp::code::output::McpCodeCallStatus;
 use caudra_agent::tools::native::plan;
 use caudra_agent::tools::{
-    BATCH_TOOL_NAME, FILE_APPLY_PATCH_TOOL_NAME, FILE_EDIT_TOOL_NAME, FILE_GLOB_TOOL_NAME,
-    FILE_GREP_TOOL_NAME, FILE_INDEX_TOOL_NAME, FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME,
-    IMAGE_GENERATE_TOOL_NAME, MCP_TOOL_NAME, MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME,
+    BATCH_TOOL_NAME, CODE_TOOL_NAME, FILE_APPLY_PATCH_TOOL_NAME, FILE_EDIT_TOOL_NAME,
+    FILE_GLOB_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_INDEX_TOOL_NAME, FILE_READ_TOOL_NAME,
+    FILE_WRITE_TOOL_NAME, IMAGE_GENERATE_TOOL_NAME, MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME,
     QUESTION_TOOL_NAME, SHELL_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME, TODOWRITE_TOOL_NAME,
     TOOL_OUTPUT_TOOL_NAME, ToolEffect, VIEW_IMAGE_TOOL_NAME,
 };
@@ -13992,12 +13992,12 @@ fn mcp_code_progress_appends_calls_and_keeps_settled_ones() {
     const SNIPPET: &str = "await github.list_issues()";
     const ACCEPTED: &str = "the next call is a new row";
     const REFUSED: &str = "a gap, or a settled call, is not reopened";
-    let call = |status| McpCodeCall {
+    let call = |status| CodeCall {
         server: "github".into(),
         tool: "list_issues".into(),
         input: serde_json::json!({}),
         status,
-        ..McpCodeCall::default()
+        ..CodeCall::default()
     };
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(ToolStartEvent {
@@ -14005,34 +14005,34 @@ fn mcp_code_progress_appends_calls_and_keeps_settled_ones() {
             language: "python".into(),
             code: SNIPPET.into(),
         }),
-        ..start(TOOL_ID, MCP_TOOL_NAME)
+        ..start(TOOL_ID, CODE_TOOL_NAME)
     });
 
     assert!(
-        panel.mcp_code_progress(TOOL_ID, 0, call(McpCodeCallStatus::Running)),
+        panel.code_progress(TOOL_ID, 0, call(CodeCallStatus::Running)),
         "{ACCEPTED}"
     );
     assert!(
-        !panel.mcp_code_progress(TOOL_ID, 2, call(McpCodeCallStatus::Running)),
+        !panel.code_progress(TOOL_ID, 2, call(CodeCallStatus::Running)),
         "{REFUSED}"
     );
     assert!(
-        panel.mcp_code_progress(TOOL_ID, 0, call(McpCodeCallStatus::Success)),
+        panel.code_progress(TOOL_ID, 0, call(CodeCallStatus::Success)),
         "{ACCEPTED}"
     );
     assert!(
-        !panel.mcp_code_progress(TOOL_ID, 0, call(McpCodeCallStatus::Running)),
+        !panel.code_progress(TOOL_ID, 0, call(CodeCallStatus::Running)),
         "{REFUSED}"
     );
 
-    let Some(ToolOutput::McpCode(McpCodeOutput { code, calls, .. })) =
+    let Some(ToolOutput::Code(CodeOutput { code, calls, .. })) =
         panel.messages[0].tool_output.as_deref()
     else {
         panic!("a running snippet's card carries its calls");
     };
     assert_eq!(code, SNIPPET);
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].status, McpCodeCallStatus::Success);
+    assert_eq!(calls[0].status, CodeCallStatus::Success);
 }
 
 /// A call inside an `mcp` card offers the switch its own card would, and it
@@ -14044,7 +14044,7 @@ fn an_mcp_code_call_trades_its_card_for_its_data_and_back() {
     panel
         .batch_views
         .insert(BATCH_ID.into(), BatchViews::new([0]));
-    panel.tool_start(start(BATCH_ID, MCP_TOOL_NAME));
+    panel.tool_start(start(BATCH_ID, CODE_TOOL_NAME));
     let answer = McpOutput {
         blocks: vec![McpBlock::Text {
             text: serde_json::json!({"k": 1}).to_string(),
@@ -14053,17 +14053,17 @@ fn an_mcp_code_call_trades_its_card_for_its_data_and_back() {
         ..McpOutput::default()
     };
     panel.tool_done(ToolDoneEvent {
-        tool: MCP_TOOL_NAME.into(),
-        output: ToolOutput::McpCode(McpCodeOutput {
-            calls: vec![McpCodeCall {
+        tool: CODE_TOOL_NAME.into(),
+        output: ToolOutput::Code(CodeOutput {
+            calls: vec![CodeCall {
                 server: "home".into(),
                 tool: "lights".into(),
                 input: serde_json::json!({}),
-                status: McpCodeCallStatus::Success,
+                status: CodeCallStatus::Success,
                 output: Some(answer),
-                ..McpCodeCall::default()
+                ..CodeCall::default()
             }],
-            ..McpCodeOutput::default()
+            ..CodeOutput::default()
         }),
         ..done(BATCH_ID)
     });
@@ -14094,16 +14094,16 @@ fn a_rerank_row_reads_its_ranking_and_switches_to_its_answer() {
     const NOT_KEPT: &str = "1 not kept";
     const RAW_INDEX: &str = "\"index\": 1";
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_start(start(BATCH_ID, MCP_TOOL_NAME));
+    panel.tool_start(start(BATCH_ID, CODE_TOOL_NAME));
     let answer = serde_json::json!([{"index": 1, "score": 0.62}]);
     panel.tool_done(ToolDoneEvent {
-        tool: MCP_TOOL_NAME.into(),
-        output: ToolOutput::McpCode(McpCodeOutput {
-            calls: vec![McpCodeCall {
+        tool: CODE_TOOL_NAME.into(),
+        output: ToolOutput::Code(CodeOutput {
+            calls: vec![CodeCall {
                 server: "decisions".into(),
                 tool: "rerank".into(),
                 input: serde_json::json!({"query": "where parse errors are", "candidates": ["lexer.rs", "parser.rs"]}),
-                status: McpCodeCallStatus::Success,
+                status: CodeCallStatus::Success,
                 output: Some(McpOutput {
                     blocks: vec![McpBlock::Text {
                         text: serde_json::to_string_pretty(&answer).unwrap(),
@@ -14111,9 +14111,9 @@ fn a_rerank_row_reads_its_ranking_and_switches_to_its_answer() {
                     ..McpOutput::default()
                 }),
                 helper: Some(McpHelper::Rerank),
-                ..McpCodeCall::default()
+                ..CodeCall::default()
             }],
-            ..McpCodeOutput::default()
+            ..CodeOutput::default()
         }),
         ..done(BATCH_ID)
     });
@@ -14140,15 +14140,15 @@ fn copying_a_rerank_card_copies_its_answer(raw: bool) {
     let answer =
         serde_json::to_string_pretty(&serde_json::json!([{"index": 1, "score": 0.62}])).unwrap();
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_start(start(TOOL_ID, MCP_TOOL_NAME));
+    panel.tool_start(start(TOOL_ID, CODE_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
-        tool: MCP_TOOL_NAME.into(),
-        output: ToolOutput::McpCode(McpCodeOutput {
-            calls: vec![McpCodeCall {
+        tool: CODE_TOOL_NAME.into(),
+        output: ToolOutput::Code(CodeOutput {
+            calls: vec![CodeCall {
                 server: "decisions".into(),
                 tool: "rerank".into(),
                 input: serde_json::json!({"query": "parse errors", "candidates": ["lexer.rs", "parser.rs"]}),
-                status: McpCodeCallStatus::Success,
+                status: CodeCallStatus::Success,
                 output: Some(McpOutput {
                     blocks: vec![McpBlock::Text {
                         text: answer.clone(),
@@ -14156,9 +14156,9 @@ fn copying_a_rerank_card_copies_its_answer(raw: bool) {
                     ..McpOutput::default()
                 }),
                 helper: Some(McpHelper::Rerank),
-                ..McpCodeCall::default()
+                ..CodeCall::default()
             }],
-            ..McpCodeOutput::default()
+            ..CodeOutput::default()
         }),
         ..done(TOOL_ID)
     });
@@ -14177,6 +14177,44 @@ fn copying_a_rerank_card_copies_its_answer(raw: bool) {
         answer,
         "{COPIED_ANSWER_MSG}"
     );
+}
+
+/// A long `code` output rests in the scroll window `python_execution` used: its tail shows, its
+/// head waits above the window, and the footer counts what it hid.
+#[test]
+fn a_code_card_windows_its_output_on_its_tail() {
+    const CODE_WINDOW_MSG: &str = "a code card draws its output in the scroll window";
+    const OUTPUT_LINES: usize = 40;
+    const SNIPPET: &str = "for i in range(40): print(i)";
+    const HIDDEN_ABOVE: &str = " above";
+    let line = |index: usize| format!("computed row {index}");
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start(TOOL_ID, CODE_TOOL_NAME));
+    panel.tool_done(ToolDoneEvent {
+        tool: CODE_TOOL_NAME.into(),
+        output: ToolOutput::Code(CodeOutput {
+            code: SNIPPET.into(),
+            stdout: (0..OUTPUT_LINES).map(line).collect::<Vec<_>>().join("\n"),
+            ..CodeOutput::default()
+        }),
+        ..done(TOOL_ID)
+    });
+    render(&mut panel, 80, 24);
+
+    let segment = panel
+        .cache
+        .segments()
+        .iter()
+        .find(|segment| segment.tool_id.as_deref() == Some(TOOL_ID))
+        .expect("the card was built");
+    assert!(!segment.scroll_spans.is_empty(), "{CODE_WINDOW_MSG}");
+    let text = seg_text(&panel, TOOL_ID);
+    assert!(
+        text.contains(&line(OUTPUT_LINES - 1)),
+        "{CODE_WINDOW_MSG}: {text}"
+    );
+    assert!(!text.contains(&line(0)), "{CODE_WINDOW_MSG}: {text}");
+    assert!(text.contains(HIDDEN_ABOVE), "{CODE_WINDOW_MSG}: {text}");
 }
 
 const PROMPT_WITH_PICTURE: &str = "look at this";

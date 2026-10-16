@@ -83,7 +83,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: nixbuild/nix-quick-install-action@v30
+      - uses: nixbuild/nix-quick-install-action@v35
         with:
           nix_conf: |
             keep-env-derivations = true

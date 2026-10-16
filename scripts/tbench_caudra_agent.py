@@ -39,7 +39,7 @@ Analytics:
 import json
 import os
 import shlex
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from collect import append_csv, compute_cost, lookup_pricing
@@ -210,7 +210,7 @@ class CaudraAgent(BaseInstalledAgent):
 
         csv_path = Path(os.environ.get("TBENCH_CSV", "tbench_runs.csv"))
         meta = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "agent": "caudra",
             "session_id": result.get("session_id", ""),
             "tag": "tbench",

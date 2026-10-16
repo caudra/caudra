@@ -260,7 +260,7 @@ pub(super) fn feature_mode<'a>(
     config: &'a DecisionsConfig,
 ) -> &'a FeatureMode {
     match (feature, &config.base_url) {
-        (DecisionFeature::Workflow | DecisionFeature::Mcp, None) => &FeatureMode::Off,
+        (DecisionFeature::Workflow | DecisionFeature::Code, None) => &FeatureMode::Off,
         _ => feature.mode(&config.features),
     }
 }

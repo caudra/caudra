@@ -45,9 +45,9 @@ skill names + descriptions           MCP tool defs   search() in mcp
 MCP server list (about 2k tokens)
 ```
 
-The left column is the fixed overhead of every single request, so Caudra keeps it small on purpose. A selected [system prompt profile](/docs/system-prompts/) changes the effective system prompt and its overhead. A skill contributes one description line, memory a [view of its notes](/docs/memory/#the-view) capped at 32 KiB, and your MCP servers one `mcp` tool and a [server list](/docs/mcp/#the-server-list) of about 2,000 tokens. The bodies stay on disk until the agent asks.
+The left column is the fixed overhead of every single request, so Caudra keeps it small on purpose. A selected [system prompt profile](/docs/system-prompts/) changes the effective system prompt and its overhead. A skill contributes one description line, memory a [view of its notes](/docs/memory/#the-view) capped at 32 KiB, and your MCP servers a [server list](/docs/mcp/#the-server-list) of about 2,000 tokens, which the `code` tool reaches. The bodies stay on disk until the agent asks.
 
-The `/context` views report what currently contributes without loading deferred material to size it. MCP servers contribute the `mcp` tool and their server list, and a tool's full description arrives only when `search()` returns it. Memory contributes its view and skills contribute their names and descriptions. A note or a skill body enters the transcript only when its tool reads it. These loads belong to the Main or task context that requested them.
+The `/context` views report what currently contributes without loading deferred material to size it. MCP servers contribute their server list, and a tool's full description arrives only when `search()` returns it. Memory contributes its view and skills contribute their names and descriptions. A note or a skill body enters the transcript only when its tool reads it. These loads belong to the Main or task context that requested them.
 
 ## Mention a file with @
 
@@ -326,6 +326,8 @@ mv <session-id>.jsonl <session-id>.jsonl.bak
 cp archive/<session-id>/<n>.jsonl <session-id>.jsonl
 caudra -s <session-id>
 ```
+
+The model can still find what a summary left out. In the `code` tool, `history.search(query, scope="session")` searches the whole stored conversation, compacted turns and subagent transcripts included, and `history.read()` returns an item in full. See [Search past conversations](/docs/code/#search-past-conversations).
 
 `CAUDRA_DISABLE_AUTOCOMPACT=1` turns off the automatic compaction. A manual `/compact` still compacts.
 

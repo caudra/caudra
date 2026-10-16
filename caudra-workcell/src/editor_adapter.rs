@@ -149,7 +149,7 @@ impl PermissionAuthorityProvider for WorkcellAuthorityProvider {
         let specs = self
             .host
             .as_ref()
-            .map(|host| host.specs(true))
+            .map(|host| host.specs())
             .unwrap_or_default();
         let authorities = registry
             .tools()
@@ -195,10 +195,6 @@ impl PermissionAuthorityProvider for WorkcellAuthorityProvider {
                         .map(|error| error.to_string())
                 } else if kind.is_none() {
                     Some(UNSUPPORTED.into())
-                } else if kind == Some(ToolKind::Code)
-                    && self.host.as_ref().is_none_or(|host| host.code.is_none())
-                {
-                    Some(crate::CODE_WORKER_UNAVAILABLE.into())
                 } else {
                     None
                 };
@@ -360,7 +356,7 @@ impl WorkcellAuthorityLease<'_> {
         let host = Arc::clone(self.host.ok_or_else(|| unavailable(NO_HOST))?);
         let contract = local_contract(&authority.source).ok_or_else(|| unavailable(UNSUPPORTED))?;
         let spec = host
-            .specs(true)
+            .specs()
             .into_iter()
             .find(|spec| spec.contract_id == contract)
             .ok_or_else(|| unavailable(UNSUPPORTED))?;
@@ -552,21 +548,12 @@ fn descriptor(
             vec![SelectorMode::Exact, SelectorMode::Any],
             vec![PermissionResourceAccess::Search],
         )),
-        Some(ToolKind::Code | ToolKind::Environment) => resources.push(resource(
+        Some(ToolKind::Environment) => resources.push(resource(
             PermissionResourceKind::Custom {
-                name: if kind == Some(ToolKind::Code) {
-                    "isolated_compute"
-                } else {
-                    "host_inspection"
-                }
-                .into(),
+                name: "host_inspection".into(),
             },
             vec![SelectorMode::Exact, SelectorMode::Any],
-            vec![if kind == Some(ToolKind::Code) {
-                PermissionResourceAccess::Execute
-            } else {
-                PermissionResourceAccess::Read
-            }],
+            vec![PermissionResourceAccess::Read],
         )),
         None => {}
     }
@@ -806,12 +793,6 @@ async fn prepare_example(
                 read_targets: Vec::new(),
             })
         }
-        Input::Code(_) => Ok(exact_custom_prepared(
-            "isolated_compute",
-            "python",
-            PermissionResourceAccess::Execute,
-            PermissionRisk::Low,
-        )),
         Input::Environment => Ok(exact_custom_prepared(
             "host_inspection",
             "execution_environment",

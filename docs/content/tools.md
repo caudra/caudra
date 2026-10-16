@@ -3,7 +3,7 @@ title: "Tools"
 description: "Every built-in tool and its parameters."
 ---
 
-Caudra ships with 33 built-in tools in this reference (33 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Caudra ships with 32 built-in tools in this reference (32 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 First-party file, web, shell, index, Python, and environment tools run through protocol-neutral Workcell contracts. Workcell owns schemas, validation, execution bounds, atomic file changes, network policy, subprocess cleanup, cancellation, and the bundled worker lifecycle. Caudra owns registration, authorization, retained session output, and model or UI presentation. Release builds pin an exact Workcell revision.
 
@@ -38,9 +38,9 @@ Run [`caudra tools`](/docs/cli/) to see the resulting set, including which rule 
 
 ## Tools loaded on demand
 
-The default loading policy lets 5 built-in tools start outside the request array. The model sees a `tool_search` entry instead, and one call with a query loads the best-matching tool for the rest of the session. Sessions that never need them never pay for their descriptions. An explicit profile policy can make other native, local or remote Workcell, Lua/plugin, or local callback tools lazy too. A lazy MCP tool stays out of the [server list](/docs/mcp/#code-mode) and is found with `search()` inside `mcp`. A known-name direct call to an eligible lazy tool is valid and loads its schema. `tool_search` disappears when no eligible pending tools remain.
+The default loading policy lets 4 built-in tools start outside the request array. The model sees a `tool_search` entry instead, and one call with a query loads the best-matching tool for the rest of the session. Sessions that never need them never pay for their descriptions. An explicit profile policy can make other native, local or remote Workcell, Lua/plugin, or local callback tools lazy too. A lazy MCP tool stays out of the [server list](/docs/mcp/#code-mode) and is found with `search()` inside `code`. A known-name direct call to an eligible lazy tool is valid and loads its schema. `tool_search` disappears when no eligible pending tools remain.
 
-`execution_environment`, `image_generate`, `python_execution`, `workflow`, and `automation` each load on their own.
+`execution_environment`, `image_generate`, `workflow`, and `automation` each load on their own.
 
 Loading changes the tool array, so the provider's prompt cache prefix resets and the next request re-reads the history as fresh input. Caudra posts a notice naming what loaded when it happens.
 
@@ -217,18 +217,22 @@ Commands start from a cleared environment. [Shell host configuration](/docs/cli/
 | `timeoutSec` | integer | no | Optional timeout in seconds, from 1 to 21600. Omit it for the 120 second default unless the command needs longer; a value outside that range is rejected. |
 | `workdir` | string | no | Optional configured-root-relative or absolute initial working directory inside the configured root. |
 
-### `python_execution` <span class="badge">on demand</span> {#python_execution}
+### `code` {#code}
 
-Execute a short Python script in an isolated interpreter and return its value and printed output.
+Run Python in an isolated interpreter: compute, reshape data, and reach what the session connects it to.
 
-Scripts run in a separate worker process with no file system, network, environment variables, or subprocesses, under time, memory, and recursion limits. Host clocks, unseeded randomness, and sleep are refused. Because that isolation fixes what a script can reach, the default permission policy allows the tool without a prompt.
+Offered in every session, with or without [MCP servers](/docs/mcp/#code-mode). [Code](/docs/code/) covers snippets, [history search](/docs/code/#search-past-conversations), and the decision helpers. Snippets run on this machine in the bundled Monty worker, even when the session uses a remote Workcell. Variables persist between runs of the same agent, in memory only.
 
-Release builds include the isolated Monty worker. `WORKCELL_MCP_CODE_WORKER` can override it with an operator-supplied worker binary.
+A snippet has no file system, network, environment variables, or subprocesses, and runs under time, memory, and recursion limits. Host clocks, unseeded randomness, and sleep are refused. A snippet that calls nothing outside the interpreter has nothing to ask about, so it runs without a prompt.
+
+Release builds include the Monty worker. `WORKCELL_MCP_CODE_WORKER` can override it with an operator-supplied worker binary.
+
+Enabled servers and their tools reach the model in a `# MCP servers` reminder, so a server connecting or changing its tools never changes the tool definitions. Each server call a snippet makes goes through [permissions](/docs/permissions/#mcp-tool-calls) on its own, and reading a resource asks first.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `code` | string | yes | Python source to execute. The value of the final expression is returned. |
-| `timeoutSec` | integer | no | Optional timeout in seconds, from 1 to 30. Omit it for the 5 second default unless the snippet needs longer; a value outside that range is rejected. |
+| `code` | string | yes | Python to run. Top-level `await` works |
+| `reset` | boolean | no | Drop the variables earlier runs kept before running |
 
 ### `execution_environment` <span class="badge">on demand</span> {#execution_environment}
 
@@ -405,19 +409,6 @@ Load a skill that provides instructions and workflows for specific tasks.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `name` | string | yes | Name of the skill to load |
-
-### `mcp` {#mcp}
-
-Run Python that calls the MCP servers this session connects to. The `# MCP servers` reminder lists each server and the signatures of its tools.
-
-Offered while at least one [MCP server](/docs/mcp/#code-mode) is enabled, whether or not it has connected. The servers and their tools reach the model in a `# MCP servers` reminder, so a server connecting or changing its tools never changes the tool definitions.
-
-Snippets run on this machine in the bundled Monty worker, even when the session uses a remote Workcell. Variables persist between runs of the same agent, in memory only. Each server call a snippet makes goes through [permissions](/docs/permissions/#mcp-tool-calls) on its own, and reading a resource asks first.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `code` | string | yes | Python to run. Top-level `await` works |
-| `reset` | boolean | no | Drop the variables earlier runs kept before running |
 
 ## Media
 

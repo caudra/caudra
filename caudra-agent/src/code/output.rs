@@ -1,4 +1,4 @@
-//! What one `mcp` run did, as a card draws it live and restored. The model reads its own text,
+//! What one `code` run did, as a card draws it live and restored. The model reads its own text,
 //! rendered from the same run.
 
 use caudra_storage::tool_ledger::ToolOutcome as LedgerOutcome;
@@ -11,7 +11,7 @@ use crate::tools::ToolFailure;
 use crate::types::counted;
 
 /// The ledger source of a call a snippet made.
-pub const CALL_SOURCE: &str = "mcp";
+pub const CALL_SOURCE: &str = "code";
 
 /// Calls a failed run lists for the model before summarising the rest.
 const MAX_LISTED_CALLS: usize = 20;
@@ -23,24 +23,25 @@ const REPAIRED_LABEL: &str = "Repaired before running:";
 const LESSON_SEPARATOR: &str = "; ";
 const NOTHING: &str = "The snippet ended on None and printed nothing.";
 const CANCELLED: &str = "The user cancelled the run.";
-const CALLS_LABEL: &str = "Server calls this run made before it stopped. Their effects stand, so check before repeating one:";
+const CALLS_LABEL: &str =
+    "Calls this run made before it stopped. Their effects stand, so check before repeating one:";
 const SUCCEEDED: &str = "succeeded";
 const FAILED: &str = "failed";
 const REFUSED: &str = "refused";
 const RUNNING: &str = "did not finish";
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct McpCodeOutput {
+pub struct CodeOutput {
     pub code: String,
-    /// Every server call the snippet made, in the order it made them.
+    /// Every host call the snippet made, in the order it made them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub calls: Vec<McpCodeCall>,
+    pub calls: Vec<CodeCall>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub stdout: String,
     /// The value the snippet ended on, rendered for reading. `None` when it ended on `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
-    pub outcome: McpCodeOutcome,
+    pub outcome: CodeOutcome,
     /// What became of the variables kept between runs, when something did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_note: Option<String>,
@@ -54,7 +55,7 @@ pub struct McpCodeOutput {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-pub enum McpCodeOutcome {
+pub enum CodeOutcome {
     #[default]
     Running,
     Completed,
@@ -78,11 +79,12 @@ pub enum McpCodeOutcome {
     Cancelled,
 }
 
-/// One server call a snippet made.
+/// One host call a snippet made: a server's tool, a resource read, or a decision.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct McpCodeCall {
+pub struct CodeCall {
+    /// The MCP server, or the module the call reached, such as `decisions`.
     pub server: String,
-    /// The tool's MCP name, or the helper's for a resource read.
+    /// The tool's MCP name, or the helper's for any other call.
     pub tool: String,
     /// The call as the snippet wrote it, `namespace.method` for a tool, so the model reads back
     /// the names it uses.
@@ -91,8 +93,8 @@ pub struct McpCodeCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub input: Value,
-    pub status: McpCodeCallStatus,
-    /// What the server answered. Its questions to the user are in `interactions` instead.
+    pub status: CodeCallStatus,
+    /// What the call answered. Its questions to the user are in `interactions` instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<McpOutput>,
     /// Why the call failed or was refused.
@@ -118,7 +120,7 @@ fn is_zero(value: &u64) -> bool {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum McpCodeCallStatus {
+pub enum CodeCallStatus {
     #[default]
     Running,
     Success,
@@ -128,22 +130,22 @@ pub enum McpCodeCallStatus {
     Refused,
 }
 
-/// One call of a running `mcp` snippet changing state. The run's own card is the only row it has.
+/// One call of a running `code` snippet changing state. The run's own card is the only row it has.
 #[derive(Debug, Clone, Serialize)]
-pub struct McpCodeProgressEvent {
-    /// The `mcp` call's tool-use id.
+pub struct CodeProgressEvent {
+    /// The `code` call's tool-use id.
     pub id: String,
     pub index: usize,
-    pub call: McpCodeCall,
+    pub call: CodeCall,
 }
 
-impl McpCodeCallStatus {
+impl CodeCallStatus {
     pub fn is_terminal(self) -> bool {
         !matches!(self, Self::Running)
     }
 }
 
-impl McpCodeOutcome {
+impl CodeOutcome {
     pub fn is_failure(&self) -> bool {
         self.failure().is_some()
     }
@@ -173,7 +175,7 @@ impl McpCodeOutcome {
     }
 }
 
-impl McpCodeOutput {
+impl CodeOutput {
     /// What the model reads: printed output, the result, and for a failed run why, with the
     /// calls already made so their side effects are not blindly repeated.
     pub fn model_text(&self) -> String {
@@ -211,12 +213,7 @@ impl McpCodeOutput {
 
     fn calls_made(&self) -> String {
         let mut lines = vec![CALLS_LABEL.to_owned()];
-        lines.extend(
-            self.calls
-                .iter()
-                .take(MAX_LISTED_CALLS)
-                .map(McpCodeCall::line),
-        );
+        lines.extend(self.calls.iter().take(MAX_LISTED_CALLS).map(CodeCall::line));
         if let Some(rest) = self
             .calls
             .len()
@@ -229,7 +226,7 @@ impl McpCodeOutput {
     }
 }
 
-impl McpCodeCall {
+impl CodeCall {
     /// The `server.tool` name permission rules, the ledger and cards know the call by.
     pub fn qualified_name(&self) -> String {
         format!("{}{SEPARATOR}{}", self.server, self.tool)
@@ -237,20 +234,20 @@ impl McpCodeCall {
 
     pub fn ledger_outcome(&self) -> LedgerOutcome {
         match (self.status, self.failure) {
-            (McpCodeCallStatus::Success, _) => LedgerOutcome::Ok,
+            (CodeCallStatus::Success, _) => LedgerOutcome::Ok,
             (_, Some(failure)) => LedgerOutcome::from(failure),
-            (McpCodeCallStatus::Refused, None) => LedgerOutcome::Denied,
-            (McpCodeCallStatus::Running | McpCodeCallStatus::Error, None) => LedgerOutcome::Other,
+            (CodeCallStatus::Refused, None) => LedgerOutcome::Denied,
+            (CodeCallStatus::Running | CodeCallStatus::Error, None) => LedgerOutcome::Other,
         }
     }
 
     fn line(&self) -> String {
         let name = &self.called_as;
         let status = match self.status {
-            McpCodeCallStatus::Running => RUNNING,
-            McpCodeCallStatus::Success => SUCCEEDED,
-            McpCodeCallStatus::Error => FAILED,
-            McpCodeCallStatus::Refused => REFUSED,
+            CodeCallStatus::Running => RUNNING,
+            CodeCallStatus::Success => SUCCEEDED,
+            CodeCallStatus::Error => FAILED,
+            CodeCallStatus::Refused => REFUSED,
         };
         match &self.error {
             Some(error) => format!("- {name} {status}: {error}"),
@@ -274,12 +271,12 @@ mod tests {
     /// The model reads what to write next time, once each, and never the card's short form.
     #[test]
     fn the_model_reads_the_lesson_of_each_repair() {
-        let output = McpCodeOutput {
+        let output = CodeOutput {
             result: Some(RESULT.to_owned()),
-            outcome: McpCodeOutcome::Completed,
+            outcome: CodeOutcome::Completed,
             repairs: vec![REPAIR.to_owned()],
             lessons: vec![IMPORT_LESSON.to_owned(), RETURN_LESSON.to_owned()],
-            ..McpCodeOutput::default()
+            ..CodeOutput::default()
         };
         let text = output.model_text();
         assert!(
@@ -297,10 +294,9 @@ mod tests {
     #[test_case(json!({"server": "s", "tool": "t", "input": {}, "status": "success", "helper": "rerank"}), Some(McpHelper::Rerank) ; "rerank")]
     #[test_case(json!({"server": "s", "tool": "t", "input": {}, "status": "success", "helper": "decide"}), Some(McpHelper::Decide) ; "decide")]
     fn a_stored_call_keeps_its_helper(stored: Value, helper: Option<McpHelper>) {
-        let call: McpCodeCall = serde_json::from_value(stored).unwrap();
+        let call: CodeCall = serde_json::from_value(stored).unwrap();
         assert_eq!(call.helper, helper);
-        let again: McpCodeCall =
-            serde_json::from_value(serde_json::to_value(&call).unwrap()).unwrap();
+        let again: CodeCall = serde_json::from_value(serde_json::to_value(&call).unwrap()).unwrap();
         assert_eq!(again, call);
     }
 }

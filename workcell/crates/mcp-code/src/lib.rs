@@ -35,7 +35,9 @@ pub use hosted::{
     MAX_STATE_BYTES, StateNote,
 };
 pub use repair::Repair;
-pub use worker::{CodeBuildError, WORKER_FILE_NAME, WorkerSource, bundled_worker_available};
+pub use worker::{
+    CodeBuildError, CodePools, WORKER_FILE_NAME, WorkerSource, bundled_worker_available,
+};
 // These limits are public because hosts may need to describe the same contract outside MCP.
 pub use types::{
     CodeException, CodeExecution, CodeInput, CodeOutput, DEFAULT_TIMEOUT_MS, DEFAULT_TIMEOUT_SECS,

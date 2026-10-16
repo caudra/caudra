@@ -102,6 +102,7 @@ const TASK_ASYNC_UNSUPPORTED: &str = "task_execution = async requires a frontend
 const SHELL_ASYNC_UNSUPPORTED: &str = "shell_execution = async requires a frontend with shell delivery support; use a supported session or change agent.shell_execution";
 const TASK_SYNC_REQUIRED: &str = "agent.task_execution requires task calls to wait for completion";
 const TASK_ASYNC_REQUIRED: &str = "agent.task_execution requires background: true or omission";
+pub const CODE_LINES_RENAMED: &str = "`ui.tool_output_lines.python_execution` was renamed to `ui.tool_output_lines.code`, because the `code` tool now runs plain computation. Rename the key";
 /// Windows that already exclude output need less held back, since the reserve
 /// only has to absorb estimation drift rather than a whole response.
 pub const DEFAULT_INPUT_BUDGET_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(10);
@@ -332,9 +333,9 @@ pub const ACTIVE_DEFAULT_LUA_PLUGINS: &[&str] = &[];
 pub const CAUDRA_NATIVE_TOOL_NAMES: &[&str] = &[
     "automation",
     "batch",
+    "code",
     "image_generate",
     "list_sessions",
-    "mcp",
     "memory",
     "plan",
     "publish_message",
@@ -362,7 +363,6 @@ pub const WORKCELL_NATIVE_TOOL_NAMES: &[&str] = &[
     "websearch",
     "webfetch",
     "shell",
-    "python_execution",
     "source_code_context",
     "source_code_refs",
     "execution_environment",
@@ -378,10 +378,7 @@ pub const INTERNAL_COMPANION_TOOL_NAMES: &[&str] = &["tool_output"];
 /// Deferred because most sessions never call them, not because there are too
 /// many: `image_generate` needs a subscription and an intent to draw, and
 /// `execution_environment` reports host facts `shell` can also reach.
-/// `python_execution` is deferred for its size as well as its rate: its manual
-/// for Monty's Python subset is the largest definition in the array, and
-/// `shell`'s own description already tells the model a code execution tool
-/// exists. Everything else is either used constantly or is the only way to do
+/// Everything else is either used constantly or is the only way to do
 /// something. `plan` is the only way to write the plan in Plan mode, and a
 /// small model that never searches for it cannot save one.
 ///
@@ -395,7 +392,6 @@ pub const INTERNAL_COMPANION_TOOL_NAMES: &[&str] = &["tool_output"];
 pub const DEFERRED_BUILTIN_TOOLS: &[&str] = &[
     "execution_environment",
     "image_generate",
-    "python_execution",
     "workflow",
     "automation",
 ];
@@ -1354,7 +1350,11 @@ impl ImageModel {
 #[serde(default, deny_unknown_fields)]
 pub struct ToolOutputLinesFile {
     pub bash: Option<usize>,
-    pub python_execution: Option<usize>,
+    pub code: Option<usize>,
+    /// Refuses the budget's old name, so a file that still sets it fails to load rather than
+    /// silently losing the setting.
+    #[serde(rename = "python_execution")]
+    renamed_python_execution: RenamedCodeLines,
     pub task: Option<usize>,
     pub index: Option<usize>,
     pub grep: Option<usize>,
@@ -1364,20 +1364,19 @@ pub struct ToolOutputLinesFile {
     pub other: Option<usize>,
 }
 
+#[derive(Default, Debug, Clone)]
+struct RenamedCodeLines;
+
+impl<'de> Deserialize<'de> for RenamedCodeLines {
+    fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+        Err(serde::de::Error::custom(CODE_LINES_RENAMED))
+    }
+}
+
 impl ToolOutputLinesFile {
     fn merge(&mut self, overlay: ToolOutputLinesFile) {
         merge_option!(
-            self,
-            overlay,
-            bash,
-            python_execution,
-            task,
-            index,
-            grep,
-            read,
-            write,
-            web,
-            other
+            self, overlay, bash, code, task, index, grep, read, write, web, other
         );
     }
 }
@@ -2291,7 +2290,7 @@ pub struct UiConfig {
 
     #[config(
         default = DEFAULT_SCROLL_CARD_LINES,
-        desc = "Rows of body a shell, python_execution or task card draws. The window follows new output while it sits at the bottom and pauses when scrolled up. Click inside a window to give it the wheel, which passes back to the transcript at either edge, and drag the bar in its last column to move it directly. `0` turns scrolling off, restoring the `ui.tool_output_lines` budget for those tools. A write is never windowed: it is drawn whole at any setting, as the file it created or as the diff of what it replaced"
+        desc = "Rows of body a shell, code or task card draws. The window follows new output while it sits at the bottom and pauses when scrolled up. Click inside a window to give it the wheel, which passes back to the transcript at either edge, and drag the bar in its last column to move it directly. `0` turns scrolling off, restoring the `ui.tool_output_lines` budget for those tools. A write is never windowed: it is drawn whole at any setting, as the file it created or as the diff of what it replaced"
     )]
     pub scroll_card_lines: u32,
 
@@ -2434,7 +2433,7 @@ impl UiConfig {
 #[serde(default)]
 pub struct ToolOutputLines {
     pub bash: usize,
-    pub python_execution: usize,
+    pub code: usize,
     pub task: usize,
     pub index: usize,
     pub grep: usize,
@@ -2447,7 +2446,7 @@ pub struct ToolOutputLines {
 impl ToolOutputLines {
     pub const DEFAULT: Self = Self {
         bash: 5,
-        python_execution: 5,
+        code: 5,
         task: 12,
         index: 3,
         grep: 3,
@@ -2459,7 +2458,7 @@ impl ToolOutputLines {
 
     pub const FIELD_DEFAULTS: &[(&'static str, usize)] = &[
         ("bash", Self::DEFAULT.bash),
-        ("python_execution", Self::DEFAULT.python_execution),
+        ("code", Self::DEFAULT.code),
         ("task", Self::DEFAULT.task),
         ("index", Self::DEFAULT.index),
         ("grep", Self::DEFAULT.grep),
@@ -2474,7 +2473,7 @@ impl ToolOutputLines {
     /// quietly falling through to `other` the way `file_grep` once did.
     pub const FIELD_TOOLS: &[(&'static str, &'static [&'static str])] = &[
         ("bash", &["shell"]),
-        ("python_execution", &["python_execution"]),
+        ("code", &["code"]),
         ("task", &["task", "task_control"]),
         (
             "index",
@@ -2501,7 +2500,6 @@ impl ToolOutputLines {
                 "batch",
                 "execution_environment",
                 "list_sessions",
-                "mcp",
                 "publish_message",
                 "question",
                 "read_topic",
@@ -2521,7 +2519,7 @@ impl ToolOutputLines {
         let f = f.unwrap_or_default();
         Self {
             bash: f.bash.unwrap_or(d.bash),
-            python_execution: f.python_execution.unwrap_or(d.python_execution),
+            code: f.code.unwrap_or(d.code),
             task: f.task.unwrap_or(d.task),
             index: f.index.unwrap_or(d.index),
             grep: f.grep.unwrap_or(d.grep),
@@ -2535,7 +2533,7 @@ impl ToolOutputLines {
     fn fields(&self) -> [(&'static str, usize); 9] {
         [
             ("bash", self.bash),
-            ("python_execution", self.python_execution),
+            ("code", self.code),
             ("task", self.task),
             ("index", self.index),
             ("grep", self.grep),
@@ -2561,7 +2559,7 @@ impl ToolOutputLines {
     pub fn get(&self, name: &str) -> usize {
         match name {
             "bash" | "shell" => self.bash,
-            "python_execution" => self.python_execution,
+            "code" => self.code,
             "task" | "task_control" => self.task,
             "index" | "file_index" | "source_code_context" | "source_code_refs" => self.index,
             "file_grep" | "file_glob" | "grep" | "glob" => self.grep,
@@ -5723,6 +5721,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tool_output_lines_code_budget_loads() {
+        let raw: RawConfig = toml::from_str("[ui.tool_output_lines]\ncode = 9\n").unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert_eq!(config.ui.tool_output_lines.get("code"), 9);
+    }
+
+    #[test]
+    fn tool_output_lines_old_python_execution_key_names_its_replacement() {
+        let error = toml::from_str::<RawConfig>("[ui.tool_output_lines]\npython_execution = 9\n")
+            .unwrap_err();
+        assert!(error.to_string().contains(CODE_LINES_RENAMED), "{error}");
+    }
+
     #[test_case(false, None,        true  ; "enabled_by_default")]
     #[test_case(false, Some(false), false ; "disabled_in_config")]
     #[test_case(true,  Some(true),  false ; "cli_flag_forces_disabled")]
@@ -8114,7 +8126,7 @@ mod tests {
     /// coinciding with the right value.
     const DISTINCT_BUDGETS: ToolOutputLines = ToolOutputLines {
         bash: 1,
-        python_execution: 2,
+        code: 2,
         task: 3,
         index: 4,
         grep: 5,

@@ -652,6 +652,7 @@ pub(crate) mod tests {
     #[test_case("CE013625030BA8DBA906F756967F9E9CA394464A", false ; "uppercase")]
     #[test_case("ce013625", false ; "a prefix")]
     #[test_case("ce013625030ba8dba906f756967f9e9ca394464g", false ; "a non hex digit")]
+    #[test_case("0000000000000000000000000000000000000000000000000000000000000000", false ; "a sha256 id")]
     fn only_full_lowercase_ids_parse(hex: &str, parses: bool) {
         assert_eq!(parse_oid(hex).is_some(), parses);
         assert_eq!(hex.parse::<SnapshotId>().is_ok(), parses);

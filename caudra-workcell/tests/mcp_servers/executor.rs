@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use caudra_agent::AgentMode;
-use caudra_agent::mcp::code::output::McpCodeCallStatus;
+use caudra_agent::code::output::CodeCallStatus;
 use caudra_agent::permissions::PermissionMode;
 
 use crate::support::{
@@ -29,7 +29,7 @@ fn execute_runs_typescript_in_the_executor_sandbox() {
     let output = servers.run("await executor.execute(code='return 6 * 7')");
     assert!(completed(&output).contains(ANSWER), "{output:?}");
     assert_eq!(output.calls[0].tool, EXECUTE);
-    assert_eq!(output.calls[0].status, McpCodeCallStatus::Success);
+    assert_eq!(output.calls[0].status, CodeCallStatus::Success);
 }
 
 #[test]
@@ -51,8 +51,8 @@ fn plan_mode_reads_skills_and_refuses_execute() {
     assert_eq!(
         statuses,
         [
-            (SKILLS, McpCodeCallStatus::Success),
-            (EXECUTE, McpCodeCallStatus::Refused)
+            (SKILLS, CodeCallStatus::Success),
+            (EXECUTE, CodeCallStatus::Refused)
         ]
     );
 }

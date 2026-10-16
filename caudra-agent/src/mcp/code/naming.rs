@@ -7,25 +7,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use super::view::{ServerView, ToolView};
+use crate::code::names::is_reserved;
 
-pub const SEARCH_HELPER: &str = "search";
-pub const SERVERS_HELPER: &str = "servers";
-pub const RESOURCES_HELPER: &str = "resources";
-pub const READ_RESOURCE_HELPER: &str = "read_resource";
-pub const DECIDE_HELPER: &str = "decide";
-pub const RERANK_HELPER: &str = "rerank";
-/// Functions the snippet's globals may hold beside the server namespaces. The decision helpers
-/// exist only with a decision engine, but their names stay reserved so namespaces never shift.
-pub const HELPERS: &[&str] = &[
-    SEARCH_HELPER,
-    SERVERS_HELPER,
-    RESOURCES_HELPER,
-    READ_RESOURCE_HELPER,
-    DECIDE_HELPER,
-    RERANK_HELPER,
-];
-/// The helpers a session without a decision engine lacks.
-pub const DECISION_HELPERS: &[&str] = &[DECIDE_HELPER, RERANK_HELPER];
 /// Prefix of the stub class that types a namespace, `_McpServer_<namespace>`.
 pub const CLASS_PREFIX: &str = "_McpServer_";
 
@@ -43,178 +26,6 @@ const KEYWORDS: &[&str] = &[
 ];
 /// Legal identifiers, but a name chosen here avoids them so it never reads as syntax.
 const SOFT_KEYWORDS: &[&str] = &["match", "case", "type"];
-const BUILTINS: &[&str] = &[
-    "abs",
-    "aiter",
-    "all",
-    "anext",
-    "any",
-    "ascii",
-    "bin",
-    "bool",
-    "breakpoint",
-    "bytearray",
-    "bytes",
-    "callable",
-    "chr",
-    "classmethod",
-    "compile",
-    "complex",
-    "copyright",
-    "credits",
-    "delattr",
-    "dict",
-    "dir",
-    "divmod",
-    "enumerate",
-    "eval",
-    "exec",
-    "exit",
-    "filter",
-    "float",
-    "format",
-    "frozenset",
-    "getattr",
-    "globals",
-    "hasattr",
-    "hash",
-    "help",
-    "hex",
-    "id",
-    "input",
-    "int",
-    "isinstance",
-    "issubclass",
-    "iter",
-    "len",
-    "license",
-    "list",
-    "locals",
-    "map",
-    "max",
-    "memoryview",
-    "min",
-    "next",
-    "object",
-    "oct",
-    "open",
-    "ord",
-    "pow",
-    "print",
-    "property",
-    "quit",
-    "range",
-    "repr",
-    "reversed",
-    "round",
-    "set",
-    "setattr",
-    "slice",
-    "sorted",
-    "staticmethod",
-    "str",
-    "sum",
-    "super",
-    "tuple",
-    "type",
-    "vars",
-    "zip",
-    "Ellipsis",
-    "NotImplemented",
-    "BaseException",
-    "BaseExceptionGroup",
-    "Exception",
-    "ExceptionGroup",
-    "ArithmeticError",
-    "AssertionError",
-    "AttributeError",
-    "BlockingIOError",
-    "BrokenPipeError",
-    "BufferError",
-    "ChildProcessError",
-    "ConnectionAbortedError",
-    "ConnectionError",
-    "ConnectionRefusedError",
-    "ConnectionResetError",
-    "EOFError",
-    "EnvironmentError",
-    "FileExistsError",
-    "FileNotFoundError",
-    "FloatingPointError",
-    "GeneratorExit",
-    "IOError",
-    "ImportError",
-    "IndentationError",
-    "IndexError",
-    "InterruptedError",
-    "IsADirectoryError",
-    "KeyError",
-    "KeyboardInterrupt",
-    "LookupError",
-    "MemoryError",
-    "ModuleNotFoundError",
-    "NameError",
-    "NotADirectoryError",
-    "NotImplementedError",
-    "OSError",
-    "OverflowError",
-    "PermissionError",
-    "ProcessLookupError",
-    "RecursionError",
-    "ReferenceError",
-    "RuntimeError",
-    "StopAsyncIteration",
-    "StopIteration",
-    "SyntaxError",
-    "SystemError",
-    "SystemExit",
-    "TabError",
-    "TimeoutError",
-    "TypeError",
-    "UnboundLocalError",
-    "UnicodeDecodeError",
-    "UnicodeEncodeError",
-    "UnicodeError",
-    "UnicodeTranslateError",
-    "ValueError",
-    "ZeroDivisionError",
-    "Warning",
-    "BytesWarning",
-    "DeprecationWarning",
-    "EncodingWarning",
-    "FutureWarning",
-    "ImportWarning",
-    "PendingDeprecationWarning",
-    "ResourceWarning",
-    "RuntimeWarning",
-    "SyntaxWarning",
-    "UnicodeWarning",
-    "UserWarning",
-];
-/// What the stubs import from `typing`, which a namespace must not shadow.
-const TYPING_NAMES: &[&str] = &["Any", "Literal", "overload"];
-/// The standard library modules the sandbox resolves.
-const MODULES: &[&str] = &[
-    "asyncio",
-    "base64",
-    "binascii",
-    "collections",
-    "copy",
-    "dataclasses",
-    "datetime",
-    "functools",
-    "itertools",
-    "json",
-    "math",
-    "os",
-    "pathlib",
-    "random",
-    "re",
-    "sys",
-    "time",
-    "typing",
-    "unicodedata",
-];
 
 /// The Python form of `raw`: invalid characters become `_`, a leading digit or an empty name is
 /// prefixed with `_`, and a keyword gets a trailing `_`.
@@ -361,10 +172,7 @@ fn namespace_base(server: &str) -> String {
     let mut base = identifier(server);
     if base.starts_with(CLASS_PREFIX) {
         base.insert(0, RESERVED_MARK);
-    } else if [HELPERS, BUILTINS, TYPING_NAMES, MODULES]
-        .iter()
-        .any(|reserved| reserved.contains(&base.as_str()))
-    {
+    } else if is_reserved(&base) {
         base.push(RESERVED_MARK);
     }
     base
@@ -467,6 +275,7 @@ pub(super) mod tests {
 
     #[test_case("search", "search_" ; "helper")]
     #[test_case("decide", "decide_" ; "decision_helper")]
+    #[test_case("history", "history_" ; "module_namespace")]
     #[test_case("print", "print_" ; "builtin")]
     #[test_case("Exception", "Exception_" ; "builtin_exception")]
     #[test_case("json", "json_" ; "module")]

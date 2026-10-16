@@ -8,7 +8,7 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import quote
 
 SOURCE = "caudra/caudra"
@@ -244,9 +244,9 @@ def eligible_tag(tag):
 def published_at(release):
     value = release.get("published_at")
     require(isinstance(value, str), "Published release is missing its publication time")
-    timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    timestamp = datetime.fromisoformat(value)
     require(timestamp.tzinfo is not None, "Release publication time needs a timezone")
-    return timestamp.astimezone(timezone.utc)
+    return timestamp.astimezone(UTC)
 
 
 def verified_release(source, run_id):

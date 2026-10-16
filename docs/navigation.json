@@ -41,6 +41,7 @@
       "label": "Reference",
       "pages": [
         "tools",
+        "code",
         "providers",
         "permissions",
         "notifications",

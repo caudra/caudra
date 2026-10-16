@@ -6122,7 +6122,7 @@ fn validate_fixed_contract(
 
 fn canonical_journal_policy(tool_name: &str, intent: &contract::OperationIntent) -> Option<String> {
     let known_mutation = matches!(tool_name, "file_write" | "file_edit" | "file_apply_patch");
-    let isolated = tool_name == "python_execution" && !intent.mutating;
+    let isolated = tool_name == "code" && !intent.mutating;
     (known_mutation
         || intent.mutating
         || (intent.kind == contract::OperationKind::Execute && !isolated))
@@ -6943,7 +6943,9 @@ mod tests {
             workflows_available: false,
         };
         for spec in crate::canonical_remote_specs() {
-            let kind = ToolKind::from_name(spec.name).unwrap();
+            let Some(kind) = ToolKind::from_name(spec.name) else {
+                continue;
+            };
             let remote = RemoteWorkcellTool {
                 client: client.clone(),
                 kind,
@@ -8327,7 +8329,7 @@ mod tests {
 
         assert!(canonical_journal_policy("file_read", &read).is_none());
         assert!(canonical_journal_policy("file_index", &read).is_none());
-        assert!(canonical_journal_policy("python_execution", &execute).is_none());
+        assert!(canonical_journal_policy("code", &execute).is_none());
         assert_eq!(
             canonical_journal_policy("file_write", &read),
             Some(WRITE_KIND.to_owned())

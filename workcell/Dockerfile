@@ -4,7 +4,13 @@
 # leaving a binary that only serves `monty subprocess`.
 #
 # Build from the repository root: docker build -f workcell/Dockerfile .
-FROM rust:1.99.0-bookworm AS worker
+FROM rust:1.99.1-trixie AS toolchain
+
+RUN apt-get update \
+    && apt-get upgrade --yes --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM toolchain AS worker
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends python3 \
@@ -14,7 +20,7 @@ COPY Cargo.lock ./
 COPY scripts/build-code-worker.py scripts/build-code-worker.py
 RUN python3 scripts/build-code-worker.py --root /out --target-dir /build/target/code-worker-build
 
-FROM rust:1.99.0-bookworm AS builder
+FROM toolchain AS builder
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends cmake python3 \
@@ -28,7 +34,9 @@ COPY --from=worker /out/source-manifest-path /out/source-manifest-path
 # Built as a single package rather than `--workspace`: the workspace build is only used for
 # verification, and the shipped server must not link anything the code group needs. Symbols are
 # kept in the build for the diagnostics stage and stripped from the copy the runtime ships.
-RUN CARGO_PROFILE_RELEASE_STRIP=none cargo build --locked --release --package workcell-mcp \
+RUN cargo fetch --locked \
+    && cargo fetch --locked --manifest-path "$(cat /out/source-manifest-path)" \
+    && CARGO_PROFILE_RELEASE_STRIP=none cargo build --locked --release --package workcell-mcp \
     && mkdir -p /out/bin \
     && strip -o /out/bin/workcell-mcp target/release/workcell-mcp \
     && python3 scripts/build-attribution.py \
@@ -46,9 +54,10 @@ COPY --from=builder /build/target/release/workcell-mcp /workcell-mcp
 COPY --from=worker /out/symbols/bin/monty /monty
 COPY --from=builder /out/licenses /licenses
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:13.7-slim AS runtime
 
 RUN apt-get update \
+    && apt-get upgrade --yes --no-install-recommends \
     && apt-get install --yes --no-install-recommends bash ca-certificates libgcc-s1 tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 workcell \

@@ -130,9 +130,9 @@ pub(super) fn exact_local_plan_write(
 /// standing in for the path scoping the tool should have supplied.
 ///
 /// The tools in [`TRUSTED_UNSCOPED_TOOLS`] are the exception, because for them
-/// the empty list is the true answer rather than a missing one: `python_execution`
-/// runs isolated with no filesystem, network or subprocess, and `batch`, `task`,
-/// `mcp` and `workflow` reach the manager again for every inner call. Denying those
+/// the empty list is the true answer rather than a missing one: a `code` snippet
+/// has no filesystem, network or subprocess of its own, and it, `batch`, `task`
+/// and `workflow` reach the manager again for every inner call. Denying those
 /// leaves the tool unusable and teaches the model nothing, so the request goes
 /// on to be evaluated as the unscoped call it is. Evaluation still runs, so a
 /// deny rule aimed at one of these tools keeps blocking it.
@@ -1638,8 +1638,8 @@ pub(super) mod tests {
     use crate::tools::registry::Tool;
     use crate::tools::test_support::stub_ctx;
     use crate::tools::{
-        MEMORY_TOOL_NAME, PermissionIntent, PermissionScopes, SHELL_TOOL_NAME, ToolAudience,
-        ToolContext,
+        CODE_TOOL_NAME, MEMORY_TOOL_NAME, PermissionIntent, PermissionScopes, SHELL_TOOL_NAME,
+        ToolAudience, ToolContext,
     };
     use caudra_storage::id::SessionRef;
     use caudra_storage::local_documents::LocalDocumentStore;
@@ -1672,13 +1672,14 @@ pub(super) mod tests {
     };
     use crate::permissions::{
         AutoNote, CONFINED_READ_ATTRIBUTE, CONFINED_READ_AUTHORITY, CONFINED_READ_VALUE,
-        ComposedRow, PROMPT_REASON_ASK_RULE, PROMPT_REASON_FORCED, PROMPT_REASON_PROTECTED,
-        PROMPT_REASON_UNCOVERED, PermissionAnswer, PermissionAuthorityProfile,
-        PermissionExecutorKind, PermissionLifetime, PermissionManager, PermissionMode,
-        PermissionPolicyError, PermissionPresentation, PermissionRequest, PermissionResource,
-        PermissionResourceAccess, PermissionResourceKind, PermissionRisk, PermissionRowGrant,
-        PermissionRuleRecord, PermissionSubject, PromptReason, RemotePermissionIdentity,
-        ResourceCoverage, RevokedRuleScope, RuleOrigin, ShellOpacity, StructuredPermissionDecision,
+        CURRENT_PROJECT_ATTRIBUTE, CURRENT_PROJECT_VALUE, ComposedRow, PROMPT_REASON_ASK_RULE,
+        PROMPT_REASON_FORCED, PROMPT_REASON_PROTECTED, PROMPT_REASON_UNCOVERED, PermissionAnswer,
+        PermissionAuthorityProfile, PermissionExecutorKind, PermissionLifetime, PermissionManager,
+        PermissionMode, PermissionPolicyError, PermissionPresentation, PermissionRequest,
+        PermissionResource, PermissionResourceAccess, PermissionResourceKind, PermissionRisk,
+        PermissionRowGrant, PermissionRuleRecord, PermissionSubject, PromptReason,
+        RemotePermissionIdentity, ResourceCoverage, RevokedRuleScope, RuleOrigin,
+        SESSION_HISTORY_RESOURCE, ShellOpacity, StructuredPermissionDecision,
         StructuredPermissionEffect, builtin_structured_rules, canonical_json,
         canonical_json_sha256, filesystem_permission_resource, is_shell_tool, normalize_scope_path,
         prompt_forcing_reason,
@@ -1699,6 +1700,7 @@ pub(super) mod tests {
     const PLAN_DOCUMENT: &str = "active-plan.md";
     const PLAN_CONTENT: &str = "The complete plan";
     const LOCAL_MEMORY_SCOPE: &str = "local-memory:read:architecture.md";
+    const HISTORY_PROJECT: &str = "/work/project";
     const IMPOSTOR_PLUGIN: &str = "impostor";
     const PRIVILEGED_LINE: &str = "sudo cargo build";
     const DENY_GUIDANCE: &str = "run the narrower test instead";
@@ -2531,6 +2533,54 @@ pub(super) mod tests {
         ))
     }
 
+    /// Stored session history goes unasked only as the `code` tool, and only for the project the
+    /// history module marked as the session's own.
+    #[test_case(caudra_native(native::code::permission_contract()), true => vec![true] ; "this_projects_history_is_covered")]
+    #[test_case(caudra_native(native::code::permission_contract()), false => vec![false] ; "another_projects_history_is_not")]
+    #[test_case(caudra_native(plan::permission_contract()), true => vec![false] ; "another_native_tool_is_not")]
+    fn the_builtin_history_rule_covers_only_this_projects_history(
+        subject: PermissionSubject,
+        current_project: bool,
+    ) -> Vec<bool> {
+        let attributes = match current_project {
+            true => BTreeMap::from([(
+                CURRENT_PROJECT_ATTRIBUTE.into(),
+                CURRENT_PROJECT_VALUE.into(),
+            )]),
+            false => BTreeMap::new(),
+        };
+        let intent = PermissionIntent::new(
+            PermissionScopes::single(HISTORY_PROJECT.into()),
+            vec![PermissionResource {
+                kind: PermissionResourceKind::Custom {
+                    name: SESSION_HISTORY_RESOURCE.into(),
+                },
+                value: HISTORY_PROJECT.into(),
+                access: Some(PermissionResourceAccess::Read),
+                protected: false,
+                requires_prompt: false,
+                attributes,
+            }],
+            PermissionRisk::Low,
+        );
+        let request = PermissionRequest::from_intent_with_identity(
+            CONTROLLED_REQUEST.into(),
+            ToolKey::native(CODE_TOOL_NAME),
+            &intent,
+            json!({}),
+            Path::new(SHELL_WORKDIR),
+            subject,
+            PermissionExecutorKind::Native,
+        );
+
+        covered_flags(&coverage_with(
+            &default_mgr(),
+            &request,
+            false,
+            &builtin_structured_rules(),
+        ))
+    }
+
     #[test]
     fn a_local_confined_read_never_covers_a_remote_resource() {
         let manager = default_mgr();
@@ -2773,7 +2823,7 @@ pub(super) mod tests {
         });
     }
 
-    /// `python_execution` runs isolated, so the resource list it declares is
+    /// A `code` snippet runs isolated, so the resource list it declares is
     /// empty because there is nothing to declare. Failing that closed leaves a
     /// tool that cannot be called at all, which is what remote mode hit. The
     /// request is evaluated instead, so an explicit deny still stops it and the
@@ -2781,7 +2831,7 @@ pub(super) mod tests {
     #[test_case(false => true ; "isolated_tool_runs_without_naming_a_resource")]
     #[test_case(true => false ; "an_explicit_deny_still_stops_it")]
     fn an_unscoped_tool_may_declare_no_resources(denied: bool) -> bool {
-        const ISOLATED_TOOL: &str = "python_execution";
+        const ISOLATED_TOOL: &str = "code";
 
         smol::block_on(async {
             let rules = if denied {

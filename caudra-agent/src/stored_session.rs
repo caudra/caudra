@@ -217,7 +217,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::mcp::kind::McpServerKind;
-    use crate::types::{Answer, Answerer, QuestionOption};
+    use crate::types::{Answer, AnswerSheet, Answerer, QuestionOption};
     use crate::{
         IndexDirectoryEntry, IndexDirectoryEntryKind, IndexLine, IndexLineSemantic, IndexOutput,
         IndexSourceRange, ShellFilterInfo, ShellOutput,
@@ -237,6 +237,8 @@ pub(crate) mod tests {
     const ANSWERS_EXPECTED: &str = "the transcript keeps the structured answers";
     const FORM_NOT_PERSISTED: &str = "the form lives in the tool call input, not the result";
     const FORM_COMES_FROM_INPUT: &str = "a bare answer is filled in from the input on restore";
+    const ANSWER_NOTE: &str = "Keep the bucket private";
+    const NOTE_PERSISTED: &str = "the note the user wrote is stored with the picks";
 
     pub(crate) struct ResumeService {
         pub revision: AtomicUsize,
@@ -797,20 +799,11 @@ pub(crate) mod tests {
     fn a_stored_answer_keeps_the_picks_and_not_the_form() {
         let temp = TempDir::new().unwrap();
         let storage = StateDir::from_path(temp.path().to_path_buf());
-        let output = ToolOutput::Answers(vec![Answer {
-            header: ANSWER_HEADER.into(),
-            labels: vec![ANSWER_LABEL.into()],
-            question: ANSWER_QUESTION.into(),
-            options: vec![QuestionOption {
-                label: ANSWER_LABEL.into(),
-                description: ANSWER_DESCRIPTION.into(),
-            }],
-            by: Answerer::User,
-        }]);
+        let output = ToolOutput::Answers(vec![formed_answer()].into());
 
         let actual = answered_call(&storage, output);
 
-        let ToolOutput::Answers(answers) = actual.as_ref() else {
+        let ToolOutput::Answers(AnswerSheet { answers, .. }) = actual.as_ref() else {
             panic!("{ANSWERS_EXPECTED}");
         };
         assert_eq!(answers[0].header, ANSWER_HEADER);
@@ -837,11 +830,50 @@ pub(crate) mod tests {
 
         let actual = answered_call(&storage, bare);
 
-        let ToolOutput::Answers(answers) = actual.as_ref() else {
+        let ToolOutput::Answers(AnswerSheet { answers, .. }) = actual.as_ref() else {
             panic!("{ANSWERS_EXPECTED}");
         };
         assert_eq!(answers[0].labels, [ANSWER_LABEL]);
         assert!(answers[0].question.is_empty(), "{FORM_COMES_FROM_INPUT}");
         assert!(answers[0].options.is_empty(), "{FORM_COMES_FROM_INPUT}");
+    }
+
+    #[test]
+    fn a_stored_answer_keeps_the_users_note() {
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let output = ToolOutput::Answers(AnswerSheet {
+            answers: vec![formed_answer()],
+            note: ANSWER_NOTE.into(),
+        });
+
+        let actual = answered_call(&storage, output);
+
+        let ToolOutput::Answers(sheet) = actual.as_ref() else {
+            panic!("{ANSWERS_EXPECTED}");
+        };
+        assert_eq!(sheet.answers[0].labels, [ANSWER_LABEL]);
+        assert_eq!(sheet.note, ANSWER_NOTE, "{NOTE_PERSISTED}");
+        assert_eq!(
+            serde_json::to_value(actual.as_ref()).unwrap(),
+            serde_json::json!({ "Answers": {
+                "answers": [{ "header": ANSWER_HEADER, "labels": [ANSWER_LABEL] }],
+                "note": ANSWER_NOTE,
+            } }),
+            "{FORM_NOT_PERSISTED}"
+        );
+    }
+
+    fn formed_answer() -> Answer {
+        Answer {
+            header: ANSWER_HEADER.into(),
+            labels: vec![ANSWER_LABEL.into()],
+            question: ANSWER_QUESTION.into(),
+            options: vec![QuestionOption {
+                label: ANSWER_LABEL.into(),
+                description: ANSWER_DESCRIPTION.into(),
+            }],
+            by: Answerer::User,
+        }
     }
 }

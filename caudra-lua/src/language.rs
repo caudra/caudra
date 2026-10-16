@@ -150,3 +150,23 @@ impl Language {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Language;
+    use tree_sitter::Parser;
+
+    #[test]
+    fn php_clone_arguments_and_partial_application_parse_without_recovery() {
+        const SOURCE: &str =
+            "<?php function copy($object) { return clone($object, ['name' => apply(?, 1)]); }";
+        let mut parser = Parser::new();
+        parser.set_language(&Language::Php.ts_language()).unwrap();
+        let tree = parser.parse(SOURCE, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+    }
+}

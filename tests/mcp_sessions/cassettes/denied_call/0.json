@@ -9,7 +9,7 @@
           {
             "type": "tool_use",
             "id": "call_7079bce7d6024e0aafa15e17e93cd65f",
-            "name": "mcp",
+            "name": "code",
             "input": {
               "code": "await everything.get_sum(a=2, b=3)"
             }

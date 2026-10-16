@@ -37,6 +37,7 @@ use crate::agent::run::AgentParams;
 use crate::agent::subagent::{self, STRUCTURED_OUTPUT_TOOL, Subagent, TaskIdentity, TaskModel};
 use crate::background::JobScope;
 use crate::cancel::{CancelMap, CancelToken};
+use crate::code::CodeSession;
 use crate::context::ContextPublisher;
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
@@ -535,7 +536,9 @@ fn structured_output_tool(
     if schema.get("type").and_then(Value::as_str) != Some("object") {
         return Err(SCHEMA_ROOT_ERROR.to_owned());
     }
-    let validator = jsonschema::validator_for(schema)
+    let validator = jsonschema::options()
+        .offline()
+        .build(schema)
         .map_err(|error| format!("{SCHEMA_COMPILE_ERROR}: {error}"))?;
     let definition = serde_json::json!({
         "name": STRUCTURED_OUTPUT_TOOL,
@@ -796,6 +799,7 @@ impl WorkflowHostContext {
             loaded_instructions: self.loaded_instructions.clone(),
             cancel,
             mcp: self.mcp.clone(),
+            code: CodeSession::default(),
             deferral: None,
             deadline: Deadline::None,
             config: self.config.clone(),
@@ -973,7 +977,7 @@ mod tests {
     const CALL_ID: &str = "toolu_01";
     const SEARCH_CALL_ID: &str = "toolu_search";
     const LOADED_CALL_ID: &str = "toolu_loaded";
-    const DEFERRED_TOOL: &str = "python_execution";
+    const DEFERRED_TOOL: &str = "execution_environment";
     const FRESH_ID: &str = "wf-run-1-call-7";
     const LABEL: &str = "find auth";
     const LABEL_ID: &str = "find-auth";
@@ -981,6 +985,7 @@ mod tests {
     const PROMPT: &str = "search the codebase";
     const SUMMARY: &str = "found the middleware in src/auth.rs:12";
     const REQUIRED_FIELD: &str = "answer";
+    const RETRIEVAL_DISABLED: &str = "Retrieval is disabled";
     const PARTIAL: &str = "half a transcript";
     const BOOM: &str = "boom";
     const CUSTOM_CORRECTION: &str = "Return the requested report using its schema.";
@@ -1340,6 +1345,42 @@ mod tests {
     fn an_uncompilable_schema_is_refused_before_any_session() {
         let error = schema_error(json!({ "type": "object", "properties": 7 }));
         assert!(error.starts_with(SCHEMA_COMPILE_ERROR), "got: {error}");
+    }
+
+    #[test_case("#/definitions/missing"; "missing_local_reference")]
+    #[test_case("http://127.0.0.1:9/schema.json"; "http_reference")]
+    #[test_case("https://127.0.0.1:9/schema.json"; "https_reference")]
+    #[test_case("file:///schema.json"; "file_reference")]
+    fn unresolved_schema_references_are_refused_before_any_session(reference: &str) {
+        let error = schema_error(json!({
+            "type": "object",
+            "properties": { REQUIRED_FIELD: { "$ref": reference } },
+        }));
+        assert!(error.starts_with(SCHEMA_COMPILE_ERROR), "{error}");
+        if !reference.starts_with('#') {
+            assert!(error.contains(RETRIEVAL_DISABLED), "{error}");
+        }
+    }
+
+    #[test]
+    fn local_schema_references_validate_reports_without_retrieval() {
+        let schema = json!({
+            "type": "object",
+            "$defs": { "answer": { "type": "string" } },
+            "properties": { REQUIRED_FIELD: { "$ref": "#/$defs/answer" } },
+            "required": [REQUIRED_FIELD],
+        });
+        assert!(tool_for(&schema).is_ok());
+        let validator = jsonschema::options().offline().build(&schema).unwrap();
+        let captured = Mutex::new(Captured::default());
+        assert!(record(&validator, &captured, json!({ REQUIRED_FIELD: 42 })).is_err());
+        assert!(lock(&captured).value.is_none());
+        let value = json!({ REQUIRED_FIELD: SUMMARY });
+        assert_eq!(
+            record(&validator, &captured, value.clone()),
+            Ok(STRUCTURED_OUTPUT_ACK.to_owned())
+        );
+        assert_eq!(lock(&captured).value.as_ref(), Some(&value));
     }
 
     #[test]

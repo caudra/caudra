@@ -9,6 +9,7 @@ use caudra_agent::agent;
 use caudra_agent::agent::task_runner::{HostExtras, ModelResolver, WorkflowHostContext};
 use caudra_agent::agent::{PrefixKey, Surface, SurfaceBaseline};
 use caudra_agent::background::BackgroundTasks;
+use caudra_agent::code::CodeSession;
 use caudra_agent::context::{
     BuiltinToolsInput, ContextCapture, ContextInventory, ContextMcpInventory, ContextPublisher,
     ContextReadiness, ContextSnapshot,
@@ -213,6 +214,7 @@ pub(super) struct AgentLoop {
     /// rebuild moves on.
     bound_profile: Option<Arc<SystemPromptProfile>>,
     mcp: Option<McpSession>,
+    code: CodeSession,
     history: History,
     history_restore_error: Option<String>,
     btw_prompt: SharedBtwPrompt,
@@ -310,8 +312,9 @@ impl AgentLoop {
             .as_ref()
             .map(|history| history.as_slice())
             .unwrap_or_default();
+        let code = CodeSession::new(initial_messages);
         let mcp = mcp_handle.map(|h| {
-            McpSession::new(h, initial_messages)
+            McpSession::new(h)
                 .with_disabled_tools(&config.disabled_tools)
                 .with_elicitors(Some(Arc::new(QuestionForms)))
                 .with_profile_policy(
@@ -350,6 +353,7 @@ impl AgentLoop {
             surface: SurfaceBaseline::default(),
             bound_profile: system_prompt_profile.clone(),
             mcp,
+            code,
             history,
             history_restore_error,
             btw_prompt,
@@ -796,7 +800,8 @@ impl AgentLoop {
         .with_cancel(cancel)
         .with_retry_now(self.retry_now.clone())
         .with_goal(self.goal.clone())
-        .with_mcp(self.mcp.clone());
+        .with_mcp(self.mcp.clone())
+        .with_code(self.code.clone());
         if let Some(autopilot) = self.permissions.autopilot() {
             agent = agent.with_autopilot(autopilot);
         }
@@ -1018,7 +1023,7 @@ impl AgentLoop {
         ))
     }
 
-    /// Server tools never join the array: the `mcp` tool reaches them, and the
+    /// Server tools never join the array: the `code` tool reaches them, and the
     /// mode is judged per call, so the session keeps no mode ceiling.
     fn rebuild_tools(
         &mut self,
@@ -1113,8 +1118,7 @@ impl AgentLoop {
         prompt_profiles.refresh(&mut self.system_prompt_profile);
         if self.mcp.is_none() {
             self.mcp = mcp.map(|handle| {
-                McpSession::new(handle, self.history.as_slice())
-                    .with_elicitors(Some(Arc::new(QuestionForms)))
+                McpSession::new(handle).with_elicitors(Some(Arc::new(QuestionForms)))
             });
         }
         self.mcp = self

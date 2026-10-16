@@ -225,7 +225,6 @@ const TOOL_NAME_MAP: &[(&str, &str)] = &[
     ("webfetch", "WebFetch"),
     ("websearch", "WebSearch"),
     ("task", "Task"),
-    ("python_execution", "PythonExecution"),
     ("source_code_context", "SourceCodeContext"),
     ("source_code_refs", "SourceCodeRefs"),
     ("execution_environment", "ExecutionEnvironment"),
@@ -476,6 +475,16 @@ enum GoalSystemPayload<'a> {
         continuations: u32,
         limit: u32,
     },
+    Stalled {
+        evaluations: u32,
+        turns: u32,
+    },
+    Waiting {
+        evaluations: u32,
+        attempt: u32,
+        limit: u32,
+        delay_ms: u64,
+    },
     TurnLimit {
         evaluations: u32,
     },
@@ -569,10 +578,28 @@ impl<'a> GoalSystemPayload<'a> {
                 evaluations,
                 continuations,
                 limit,
+                ..
             } => Self::LoopCap {
                 evaluations: *evaluations,
                 continuations: *continuations,
                 limit: *limit,
+            },
+            AgentEvent::GoalStalled {
+                evaluations, turns, ..
+            } => Self::Stalled {
+                evaluations: *evaluations,
+                turns: *turns,
+            },
+            AgentEvent::GoalWaiting {
+                evaluations,
+                attempt,
+                limit,
+                delay_ms,
+            } => Self::Waiting {
+                evaluations: *evaluations,
+                attempt: *attempt,
+                limit: *limit,
+                delay_ms: *delay_ms,
             },
             AgentEvent::GoalTurnLimit { evaluations } => Self::TurnLimit {
                 evaluations: *evaluations,
@@ -3798,7 +3825,7 @@ impl EventPump {
             | AgentEvent::ToolAnnotation { .. }
             | AgentEvent::ToolDone(_)
             | AgentEvent::BatchProgress(_)
-            | AgentEvent::McpCodeProgress(_)
+            | AgentEvent::CodeProgress(_)
             | AgentEvent::Question(_)
             | AgentEvent::QuestionClosed
             | AgentEvent::QueueItemConsumed { .. }
@@ -3884,6 +3911,8 @@ impl EventPump {
             | AgentEvent::GoalFinished { .. }
             | AgentEvent::GoalDeferred { .. }
             | AgentEvent::GoalLoopCap { .. }
+            | AgentEvent::GoalStalled { .. }
+            | AgentEvent::GoalWaiting { .. }
             | AgentEvent::GoalTurnLimit { .. }
             | AgentEvent::GoalClearedAfterError { .. } => self.emit_goal(&envelope.event)?,
             AgentEvent::GoalEvaluation { cost, billing, .. }
@@ -4889,7 +4918,6 @@ mod tests {
     #[test_case("webfetch", "WebFetch")]
     #[test_case("websearch", "WebSearch")]
     #[test_case("task", "Task")]
-    #[test_case("python_execution", "PythonExecution")]
     #[test_case("execution_environment", "ExecutionEnvironment")]
     #[test_case("file_index", "Index")]
     #[test_case("memory", "Memory")]
@@ -6617,6 +6645,9 @@ mod tests {
     const GOAL_EVALUATION: u32 = 2;
     const GOAL_CONTINUATIONS: u32 = 1;
     const GOAL_LIMIT: u32 = 4;
+    const GOAL_STALLED_TURNS: u32 = 3;
+    const GOAL_WAIT_ATTEMPT: u32 = 2;
+    const GOAL_WAIT_DELAY_MS: u64 = 120_000;
     const GOAL_DURATION_MS: u64 = 1_500;
     const GOAL_TASKS: usize = 2;
     const GOAL_CWD: &str = "/project";
@@ -6760,11 +6791,39 @@ mod tests {
                     evaluations: GOAL_EVALUATION,
                     continuations: GOAL_CONTINUATIONS,
                     limit: GOAL_LIMIT,
+                    autopilot_owned: false,
                 },
                 serde_json::json!({
                     "evaluations": GOAL_EVALUATION,
                     "continuations": GOAL_CONTINUATIONS,
                     "limit": GOAL_LIMIT,
+                }),
+                None,
+            ),
+            "stalled" => (
+                AgentEvent::GoalStalled {
+                    evaluations: GOAL_EVALUATION,
+                    turns: GOAL_STALLED_TURNS,
+                    autopilot_owned: false,
+                },
+                serde_json::json!({
+                    "evaluations": GOAL_EVALUATION,
+                    "turns": GOAL_STALLED_TURNS,
+                }),
+                None,
+            ),
+            "waiting" => (
+                AgentEvent::GoalWaiting {
+                    evaluations: GOAL_EVALUATION,
+                    attempt: GOAL_WAIT_ATTEMPT,
+                    limit: GOAL_LIMIT,
+                    delay_ms: GOAL_WAIT_DELAY_MS,
+                },
+                serde_json::json!({
+                    "evaluations": GOAL_EVALUATION,
+                    "attempt": GOAL_WAIT_ATTEMPT,
+                    "limit": GOAL_LIMIT,
+                    "delay_ms": GOAL_WAIT_DELAY_MS,
                 }),
                 None,
             ),
@@ -6795,6 +6854,8 @@ mod tests {
     #[test_case("deferred"; "deferred")]
     #[test_case("finished"; "finished")]
     #[test_case("loop_cap"; "loop_cap")]
+    #[test_case("stalled"; "stalled")]
+    #[test_case("waiting"; "waiting")]
     #[test_case("turn_limit"; "turn_limit")]
     #[test_case("cleared_after_error"; "cleared_after_error")]
     fn a_goal_event_is_a_goal_system_message(kind: &str) {

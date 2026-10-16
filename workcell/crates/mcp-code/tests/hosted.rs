@@ -13,9 +13,10 @@ use serde_json::{Value, json};
 use test_case::test_case;
 use tokio_util::sync::CancellationToken;
 use workcell_mcp_code::{
-    CodeConfiguration, CodeHost, CodeInput, CodeOutput, CodeToolGroup, HostCall, HostError,
-    HostErrorKind, HostInvocation, HostName, HostedExecution, HostedState, MAX_HOST_CALLS_PER_RUN,
-    Outcome, PreparedCode, Repair, StateNote, WORKER_FILE_NAME, WorkerSource,
+    CodeConfiguration, CodeHost, CodeInput, CodeOutput, CodePools, CodeToolGroup, HostCall,
+    HostError, HostErrorKind, HostInvocation, HostName, HostedExecution, HostedState,
+    MAX_HOST_CALLS_PER_RUN, Outcome, PreparedCode, Repair, StateNote, WORKER_FILE_NAME,
+    WorkerSource,
 };
 
 const NAMESPACE: &str = "gh";
@@ -63,6 +64,7 @@ async fn group() -> Option<CodeToolGroup> {
         CodeToolGroup::new(CodeConfiguration {
             worker: WorkerSource::Path(&worker),
             type_check: true,
+            pools: CodePools::All,
         })
         .await
         .expect("worker pool"),
@@ -737,5 +739,36 @@ async fn isolated_execution_still_refuses_host_names() {
         .expect("valid snippet")
         .expect("not cancelled");
     assert_ne!(executed.output.outcome, Outcome::Completed);
+    group.shutdown().await;
+}
+
+/// A host that only runs hosted snippets builds one pool: plain computation runs on it, and an
+/// isolated run is refused rather than borrowing it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hosted_only_group_computes_and_refuses_isolated_runs() {
+    let Some(worker) = worker() else { return };
+    let group = CodeToolGroup::new(CodeConfiguration {
+        worker: WorkerSource::Path(&worker),
+        type_check: true,
+        pools: CodePools::HostedOnly,
+    })
+    .await
+    .expect("hosted pool");
+    let host = Arc::new(FakeHost::default());
+
+    let executed = run(&group, &host, "sum([1, 2, 3, 4])", None).await;
+    assert_eq!(result(&executed), &json!(10));
+    assert!(host.calls().is_empty());
+
+    let isolated = group
+        .execute(
+            CodeInput {
+                code: "1 + 1".to_owned(),
+                timeout_sec: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(isolated.is_err());
     group.shutdown().await;
 }

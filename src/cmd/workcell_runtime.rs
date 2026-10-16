@@ -1,7 +1,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-use caudra_agent::mcp::code::runner as script_runner;
+use caudra_agent::code::runner as script_runner;
 use caudra_agent::mcp::config::{http_endpoints, load_global_config};
 use caudra_agent::tools::{RegistryError, ToolRegistry};
 use caudra_agent::workspace_transfer::RemoteRootIdentity;

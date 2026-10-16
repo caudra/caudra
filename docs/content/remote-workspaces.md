@@ -13,7 +13,7 @@ Direct Workcell connections are experimental and off by default. Turn them on wi
 
 ## Prepare the server
 
-Use a compatible Workcell build with a working Python execution worker. A generic MCP endpoint or a read-only Workcell server is insufficient. Caudra requires the full first-party catalog with matching schemas, contract and result versions, annotations, and presentation metadata.
+Use a compatible Workcell build with a working Python execution worker. A generic MCP endpoint or a read-only Workcell server is insufficient. Caudra requires the full first-party catalog with matching schemas, contract and result versions, annotations, and presentation metadata. That catalog includes Workcell's own isolated `code` tool, so the server keeps its `code` tool group. Caudra checks that tool but does not offer it to the model: Python runs in Caudra's own [`code`](/docs/code/#where-snippets-run) tool, on your machine.
 
 Live discovery must advertise these capabilities. Capability contracts use version `v1`, and declared limits must pass Caudra's bounds checks. Listed methods and guarantees must be enabled unless stated otherwise.
 
@@ -44,7 +44,7 @@ workcell-mcp /srv/workspaces \
   --transport http --http-bind loopback --port 3001 \
   --http-token-file /etc/workcell/token \
   --tool-group files --tool-group web --tool-group shell \
-  --tool-group python_execution --tool-group source_code --tool-group transfer \
+  --tool-group code --tool-group source_code --tool-group transfer \
   --allow-write --shell-policy /etc/workcell/shell-policy.toml \
   --remote-server-id dev-server \
   --remote-workspace-id dev-workspace \
@@ -218,7 +218,7 @@ On connection and recovery, confirmed terminal outcomes can clear pending record
 
 The journal only records operations. A pending or indeterminate operation does not hold back later tool calls or workbench saves, in this Caudra process or in another one. Sandbox lifecycle actions, reviewed transfers, and attaching a session to a sandbox still refuse to start until the pending operations of the current workspace generation are reconciled or acknowledged.
 
-Within one session, remote tool calls follow the local concurrency rules. Two writes to one file wait for each other and both apply, because the second is prepared only after the first has published. A write waiting at its permission prompt holds back later writes to the same file. Writes to different files run in parallel. Shell and Python calls take no file locks, so they never wait for a write and no write waits for them. Any remote call can still wait for a free operation slot when the host is at capacity.
+Within one session, remote tool calls follow the local concurrency rules. Two writes to one file wait for each other and both apply, because the second is prepared only after the first has published. A write waiting at its permission prompt holds back later writes to the same file. Writes to different files run in parallel. Shell calls take no file locks, so they never wait for a write and no write waits for them. Any remote call can still wait for a free operation slot when the host is at capacity.
 
 File locks are shared within one session only, and a relative and an absolute path to one file take different locks. In those cases two writes can prepare against the same version of the file. Another session or a shell command can also change a file between preparation and publication, for example while the write waits at its permission prompt. The host then refuses to publish and leaves the file as it is. The model gets the answer a stale local edit gets: the file changed since it was last read and must be read again. Nothing was written, so the refusal leaves no pending record.
 

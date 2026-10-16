@@ -75,14 +75,14 @@ Earlier versions read a top-level `defer_tools` key and a per-server `always_loa
 
 Every tool definition in a request costs tokens on every request, and a server can ship more than 100 tools when a task needs three. Changing the definitions costs more: providers cache a request from its start, so a tool array that changes when a server connects or a tool loads makes the provider read the whole conversation again at full price.
 
-So the model never sees an MCP tool definition. It gets one fixed tool, `mcp`, and reaches your servers by writing Python:
+So the model never sees an MCP tool definition. It reaches your servers by writing Python in the [`code`](/docs/code/) tool, the same fixed tool it uses for computation and history search:
 
 ```python
 issues = await github.list_issues(owner="caudra", repo="caudra")
 [issue["title"] for issue in issues if issue["comments"] > 10]
 ```
 
-`mcp` is declared while at least one server is enabled in `mcp.toml`, whether it has connected or not. A server that connects, reconnects, fails, or changes its tools never changes the tool definitions or the system prompt, and plan mode keeps `mcp` too. See [The prompt cache](/docs/configuration/#the-prompt-cache).
+`code` is declared in every session, with or without servers. A server that connects, reconnects, fails, or changes its tools never changes the tool definitions or the system prompt, and plan mode keeps `code` too. See [The prompt cache](/docs/configuration/#the-prompt-cache).
 
 A snippet can filter, join, and summarise results before the model reads anything. Only what it prints and the value of its last expression come back, so a list of 500 issues can come back as three lines.
 
@@ -122,7 +122,7 @@ Up to 8 calls run at once, and one run makes at most 100. Four functions sit bes
 | `await resources(server)` | The [resources](#resources) and resource templates a server offers |
 | `await read_resource(server, uri)` | The contents of one resource |
 
-Snippets run in a Python subset on the bundled Monty worker. Top-level `await` works. There is no filesystem, network, subprocess, class inheritance, or third-party package. `asyncio`, `json`, `re`, `math`, `datetime`, `collections`, and `itertools` are among the standard modules it offers.
+Snippets run in a Python subset on the bundled Monty worker. Top-level `await` works. There is no filesystem, network, subprocess, class inheritance, or third-party package. [The Python subset](/docs/code/#the-python-subset) lists the standard modules it offers.
 
 ### Results and errors
 
@@ -140,7 +140,7 @@ Calls that ran before a failure keep their effects. When a run fails, the model 
 
 ### Decisions and reranking
 
-With the [decision engine](/docs/configuration/#decisions) on and a base URL set, snippets get two more functions, `decide()` and `rerank()`. They work on what a snippet's servers return: a snippet calls a server, then judges, filters, or sorts the result before any of it reaches the model, or branches on a judgement without another round trip. The model's list of servers tells it to use them this way:
+With the [decision engine](/docs/configuration/#decisions) on, a snippet can judge what a server returned before any of it reaches the model. `decide()` gives typed answers about one item, and `rerank()` keeps the candidates relevant to a query, best first:
 
 ```python
 issues = await github.list_issues(owner="caudra", repo="caudra", state="open")
@@ -149,49 +149,21 @@ ranked = await rerank("crashes when saving a file", titles, threshold=0.5, top_k
 [issues[entry["index"]]["number"] for entry in ranked]
 ```
 
-| Function | What it returns |
-|---|---|
-| `await decide(input, questions, model=None, timeout_ms=None)` | `{"model", "answers", "by_name"}`: typed answers about `input` |
-| `await rerank(query, candidates, threshold=None, top_k=None, model=None, timeout_ms=None)` | `[{"index", "score"}]`: the candidates relevant to `query`, best first |
-
-`decide()` takes the same questions as a workflow's [`decide()`](/docs/workflows/#typed-decisions): a list of `predicate`, `choice`, and `score` questions in the shape of OpenAI Decisions, each with a `name`. `input` is the state the questions are about, and it must stay within 1,500 bytes as JSON. Read an answer by its question's name, as in `result["by_name"]["urgent"]["probability"]`.
-
-`rerank()` judges up to 256 candidates, each a string or a small dict. `index` is a candidate's position in `candidates`, and `score` is the probability that it is relevant. `threshold` drops candidates below it, and `top_k` keeps at most that many. Candidates go out 16 to a request, with up to 4 requests at once. Each request waits up to [`rerank_timeout_ms`](/docs/configuration/#decisions), like Caudra's own reranking, unless the call passes a shorter `timeout_ms`. A `decide()` call waits up to `timeout_ms` from the configuration. An empty list returns `[]` without a request.
-
-The model learns about both functions from the `# MCP servers` reminder, which lists them only while the engine is on. Without the engine they do not exist, and a snippet that calls one raises `NameError`. The `mcp` tool still appears only while a server is enabled.
-
-The reminder also tells the model how to get reliable answers, following the habits of Caudra's own question sets:
-
-- Keep `input` to the fields the questions judge, and name the field in each question: "Does `body` report a crash?".
-- Write `instructions` as a map when a question has edge cases: `{"question": "...", "focus": "what counts and what does not"}`.
-- Give each choice and level a `description` that sets it apart from the others.
-- Write the rerank `query` as the need rather than keywords, and send each candidate as a short label and summary. `index` maps back to the full item.
-- Act on a predicate at about 0.85 or more. Below 0.6 the answer is a guess.
-- Judge one item per call. `decide()` answers each question once for the whole `input`, so a list of items gets one call per item, with every question about that item in the call. A local engine answers overlapping calls one at a time, and each call waits only `timeout_ms`, so a snippet that runs many calls under `asyncio.gather` passes a larger `timeout_ms`.
-
-A call needs no approval and works in plan mode, since it only reads. A malformed question or argument raises `TypeError` or `ValueError` before anything is sent. An unreachable engine, a timeout, a refusal, or an invalid answer raises `RuntimeError`, and one failed request fails the whole `rerank()`. The opt-in [decision log](/docs/permissions/#decision-engine-advice) records each call under the feature `mcp`. Answers are data for the snippet: they never grant a permission.
-
-The card shows each call as a row. A `decide()` row lists its verdicts, such as `severity high 82.4% · parser_bug yes 91.0%`, and a `rerank()` row says how many candidates it kept and names the best one. Both rows always show in full: a `decide()` row shows each question with a bar for every option. The likeliest option is highlighted, and a winner below 60% is marked uncertain alongside the runner-up. A `rerank()` row shows the candidates it kept, best first, each with its score and the label it was given. Click the row's footer to switch to the JSON the snippet received, and click it again to go back. Selecting any part of either view copies that JSON whole.
+Both belong to the `code` tool rather than to MCP, and work without any server. [Decisions and reranking](/docs/code/#decisions-and-reranking) describes their arguments, limits, and rows on the card.
 
 ### Variables between runs
 
-Variables that a run defines are still there in the next run of the same agent. The main agent and each subagent keep their own. They live in memory, up to 16 MiB. Past that they are dropped and the next run starts empty. They do not survive a restart of Caudra, and a resumed, rewound, or forked conversation starts without them. The model can pass `reset: true` to start a run empty. When variables are lost, the result says so.
+Variables that a run defines are still there in the next run of the same agent, so a snippet can fetch once and filter in later runs. See [Variables between runs](/docs/code/#variables-between-runs).
 
 ### Where snippets run
 
-Snippets always run on this machine, because your MCP servers are clients of this Caudra process, even when the session's other tools run on a [remote Workcell](/docs/remote-workspaces/). A build without the bundled worker returns an error that says so. With embedded Workcell, Caudra also warns at startup that `python_execution` and `mcp` are unavailable. When a server is configured, the TUI shows the same reason as it starts, and `/mcp` shows it above the server list. `WORKCELL_MCP_CODE_WORKER` can point Caudra at a worker binary.
-
-> **Note**
->
-> **Snippets run in a worker process of their own, not inside Caudra.** The worker has no filesystem, network, subprocess, or environment access. A snippet reaches the outside only through the MCP calls and helpers Caudra answers, and each call passes the same permission check as before. A snippet that crashes the worker ends only that process, and Caudra starts a new one. This is process isolation, not an operating-system sandbox: the worker runs as your user.
-
-[`python_execution`](/docs/tools/#python_execution) is a separate tool. It runs isolated, needs no approval by default, can run on a remote Workcell, and cannot reach MCP servers.
+Snippets always run on this machine, because your MCP servers are clients of this Caudra process, even when the session's other tools run on a [remote Workcell](/docs/remote-workspaces/). Each server call passes the same permission check as a direct call would. [Where snippets run](/docs/code/#where-snippets-run) covers the worker process, its limits, and what happens in a build without it.
 
 A run that starts while servers are still making their first connection waits for them, so every server that comes up is in reach.
 
 ### Servers with a code mode of their own
 
-Some servers wrap their tools in a code tool of their own. Inside `mcp`, the model would then write Python that writes code for the server. Ask such a server for its plain tools when it offers them:
+Some servers wrap their tools in a code tool of their own. Inside `code`, the model would then write Python that writes code for the server. Ask such a server for its plain tools when it offers them:
 
 - **Cloudflare**: add `?codemode=false` to the URL of Cloudflare's MCP server at `mcp.cloudflare.com`.
 - **Executor**: add `?mode=passthrough` to get its search and invoke tools (see [Executor](#executor)).
@@ -200,13 +172,13 @@ Caudra does not change a server's URL for you.
 
 ### Sessions from earlier versions
 
-A conversation from before code mode resumes and sends as before. When the model calls an MCP tool by its old `server__tool` name, the call fails with an error that points it to `mcp`.
+A conversation from before code mode resumes and sends as before. When the model calls an MCP tool by its old `server__tool` name, the call fails with an error that points it to `code`.
 
 ## Naming and namespacing
 
 Server names are ASCII letters, digits, and hyphens, with no dots, and cannot be the name of a built-in tool. Permission rules, `agent.disabled_tools`, and profiles name a tool as `server.tool`, with the server's configured name and the tool's own MCP name, such as `github.list_issues`.
 
-In `mcp`, a server is a Python namespace and its tools are its functions. Each character other than an ASCII letter, digit, or `_` becomes `_`, so the `my-server` server is `my_server`, and a name that starts with a digit gets a leading `_`. A name that is a Python keyword gets a trailing `_`, such as `class_`. A namespace also gets a trailing `_` when it would hide a Python builtin, a standard module, or one of the four functions, such as `json_` for a server named `json`. When two names come out the same, the later one in name order gets `_2`, then `_3`, so names stay the same whatever order servers connect in. The server list and `search()` always show the names to call.
+In `code`, a server is a Python namespace and its tools are its functions. Each character other than an ASCII letter, digit, or `_` becomes `_`, so the `my-server` server is `my_server`, and a name that starts with a digit gets a leading `_`. A name that is a Python keyword gets a trailing `_`, such as `class_`. A namespace also gets a trailing `_` when it would hide a Python builtin, a standard module, a function such as `search` or `rerank`, or a module of the `code` tool such as `history`. So a server named `json` is `json_`. When two names come out the same, the later one in name order gets `_2`, then `_3`, so names stay the same whatever order servers connect in. The server list and `search()` always show the names to call.
 
 See [Permissions](/docs/permissions/#mcp-tool-calls) for MCP call review and remembered decisions.
 
@@ -216,13 +188,13 @@ Generic MCP approvals are exact-input by default. The permission review shows th
 
 ## Results in the transcript
 
-An `mcp` card shows the snippet, numbered and highlighted as Python. Below it comes a row for each server call the snippet made, labelled `server › tool` with its status, then what the snippet printed, the value it returned, and why it stopped when it did not finish. The rows fill in while the snippet runs. A row uses the names permission prompts and rules use, so the snippet's `my_server.get_sum` call is the `my-server › get-sum` row.
+A `code` card shows the snippet, numbered and highlighted as Python. Below it comes a row for each server call the snippet made, labelled `server › tool` with its status, then what the snippet printed, the value it returned, and why it stopped when it did not finish. The rows fill in while the snippet runs. A row uses the names permission prompts and rules use, so the snippet's `my_server.get_sum` call is the `my-server › get-sum` row.
 
 Open a call's row to see that call's own card, which the rest of this section describes. A call's card keeps up to 64 KiB of the result, and the snippet receives all of it.
 
 A call's card is labelled `server › tool`, with short arguments beside the label. The header also shows the size of the result and an estimate of the tokens the model reads from it, such as `JSON · 128 lines · ~3.2k tokens`.
 
-When a call runs code, the card shows that code above the result, numbered and highlighted like a `python_execution` card. Caudra takes the string under `code`, `script`, `source`, `program`, `sql`, `command`, or `cmd`, or else the longest multi-line string. The key or the text decides the language. Below the code come the remaining arguments. A multi-line string among them is shown as plain text under its name.
+When a call runs code, the card shows that code above the result, numbered and highlighted like the snippet on a `code` card. Caudra takes the string under `code`, `script`, `source`, `program`, `sql`, `command`, or `cmd`, or else the longest multi-line string. The key or the text decides the language. Below the code come the remaining arguments. A multi-line string among them is shown as plain text under its name.
 
 An MCP card opens whole: the arguments and all of the result, with no row budget, read-only or not, and it stays open after newer calls. In the auto `/view`, a click folds it to its header and the next opens it whole. The compact view and `ui.always_collapsed` still fold it to one row.
 
@@ -345,7 +317,7 @@ Print, SDK, and ACP sessions fail with an actionable error when project startup 
 
 Open the MCP picker with `/mcp`. Turn servers on or off there; changes save back to your config (project or global, depending on which file defined the server).
 
-A running server's row reads like `stdio · 12 tools via mcp as my_server · 3 search-only`. The model reaches its tools through the `mcp` tool, and `as` names the [namespace](#naming-and-namespacing) to call when it differs from the server name. The search-only count is how many tools the main agent's [profile](/docs/system-prompts/#choose-tool-availability) leaves out of the [server list](#the-server-list), as `/tools` reports them.
+A running server's row reads like `stdio · 12 tools via code as my_server · 3 search-only`. The model reaches its tools through the `code` tool, and `as` names the [namespace](#naming-and-namespacing) to call when it differs from the server name. The search-only count is how many tools the main agent's [profile](/docs/system-prompts/#choose-tool-availability) leaves out of the [server list](#the-server-list), as `/tools` reports them.
 
 Select a running server to see what it reported when it connected: its name and version, the protocol version, the features it offers (resources, completions, and list changes), and the first lines of its [instructions](#server-instructions). A [recognised server](#recognised-servers) shows its kind beside its name.
 
@@ -413,7 +385,7 @@ A mention resolves only when its server is running and the URI is one the server
 
 When you send the message, Caudra reads the resource and adds it ahead of your message, the way it adds a [mentioned file](/docs/context/#mention-a-file-with): text inline, and an image as a real image when the model supports vision. Anything else becomes a line with its type and size. Resource text shares the per-turn budget of mentioned files, and text past it is cut with a note.
 
-The model reads resources from Python in [`mcp`](#calling-tools): `await resources(server)` lists the resources and templates a server offers, and `await read_resource(server, uri)` reads one. `servers()` says which servers offer any. Reading works in plan mode and in [read-only agents](/docs/permissions/#read-only-agents). It asks first, and the prompt offers to always allow reads from that server for the conversation, the project, or every project.
+The model reads resources from Python in [`code`](#calling-tools): `await resources(server)` lists the resources and templates a server offers, and `await read_resource(server, uri)` reads one. `servers()` says which servers offer any. Reading works in plan mode and in [read-only agents](/docs/permissions/#read-only-agents). It asks first, and the prompt offers to always allow reads from that server for the conversation, the project, or every project.
 
 ## Prompts
 

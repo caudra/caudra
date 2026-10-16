@@ -1,7 +1,5 @@
 #![forbid(unsafe_code)]
 
-extern crate rustix_038 as rustix;
-
 #[cfg(unix)]
 use std::path::Component;
 use std::{
@@ -1652,7 +1650,10 @@ fn open_repository_after_config_snapshot(
     if config
         .raw_values_by("gitoxide", "core", "shallowFile")
         .is_ok()
-        || repository.shallow_file() != canonical_git_dir.join(SHALLOW_FILE_NAME)
+        || repository
+            .shallow_file()
+            .map_err(|_| ScmError::UnsupportedRepository)?
+            != canonical_git_dir.join(SHALLOW_FILE_NAME)
     {
         return Err(ScmError::UnsupportedRepository);
     }

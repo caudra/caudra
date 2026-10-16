@@ -18,9 +18,9 @@ use tokio_util::sync::CancellationToken;
 #[cfg(feature = "bundled-worker")]
 use workcell_mcp_code::bundled_worker_available;
 use workcell_mcp_code::{
-    CodeConfiguration, CodeInput, CodeToolGroup, DEFAULT_TIMEOUT_MS, DEFAULT_TIMEOUT_SECS,
-    MAX_TIMEOUT_SECS, SUBSET_MODULES, UNTYPED_BUILTINS, WITHHELD_BUILTINS, WORKER_FILE_NAME,
-    WorkerSource, catalog,
+    CodeConfiguration, CodeInput, CodePools, CodeToolGroup, DEFAULT_TIMEOUT_MS,
+    DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS, SUBSET_MODULES, UNTYPED_BUILTINS, WITHHELD_BUILTINS,
+    WORKER_FILE_NAME, WorkerSource, catalog,
 };
 
 /// Resolves the worker the same way the server does, plus the in-repo build location so a developer
@@ -106,6 +106,7 @@ macro_rules! group_or_skip {
         CodeToolGroup::new(CodeConfiguration {
             worker: WorkerSource::Path(&worker),
             type_check: $type_check,
+            pools: CodePools::All,
         })
             .await
             .expect("worker pool starts")
@@ -119,7 +120,7 @@ async fn run(group: &CodeToolGroup, code: &str) -> Value {
 
 async fn run_with(group: &CodeToolGroup, arguments: Value) -> Value {
     let result = group
-        .dispatch("python_execution", arguments, CancellationToken::new())
+        .dispatch("code", arguments, CancellationToken::new())
         .await
         .expect("tool is claimed by this group")
         .expect("dispatch does not fault");
@@ -258,6 +259,7 @@ async fn bundled_worker_executes_without_an_external_path() {
             cache_root: cache.path(),
         },
         type_check: true,
+        pools: CodePools::All,
     })
     .await
     .expect("bundled worker pool starts");
@@ -1048,11 +1050,7 @@ async fn rejects_input_outside_the_advertised_schema() {
         json!({ "code": "1", "unexpected": true }),
     ] {
         let result = group
-            .dispatch(
-                "python_execution",
-                arguments.clone(),
-                CancellationToken::new(),
-            )
+            .dispatch("code", arguments.clone(), CancellationToken::new())
             .await
             .expect("claimed")
             .expect("no fault");
@@ -1082,6 +1080,7 @@ async fn type_checking_rejects_before_execution_when_enabled() {
     let group = CodeToolGroup::new(CodeConfiguration {
         worker: WorkerSource::Path(&worker),
         type_check: true,
+        pools: CodePools::All,
     })
     .await
     .expect("worker pool starts");

@@ -1,12 +1,11 @@
-//! The gateway: everything a snippet run by the `mcp` tool can reach, and the only way code mode
-//! touches a server.
+//! The gateway: everything a snippet run by the `code` tool can reach, and the only way a run
+//! touches anything beyond its interpreter.
 //!
-//! Every server call passes the checks a direct MCP call always did: the agent's tool policy, plan
-//! and read-only modes, then the permission prompt, under an id of its own (`<run>:<n>`) so the
-//! prompt and the run's card can find each other. A refusal raises `PermissionError` where the
-//! call was made; only the user cancelling stops the run.
+//! Host modules describe the calls they offer. Every call they plan passes the checks a direct
+//! tool call always did: plan and read-only modes, then the permission prompt, under an id of its
+//! own (`<run>:<n>`) so the prompt and the run's card can find each other. A refusal raises
+//! `PermissionError` where the call was made; only the user cancelling stops the run.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -14,112 +13,75 @@ use async_lock::Mutex as AsyncMutex;
 use caudra_config::ToolKey;
 use caudra_storage::tool_ledger::ToolOutcome as LedgerOutcome;
 use caudra_workflow::decision::{RerankRequest, decide_label, rerank_label};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
-use super::catalog::unavailable;
-use super::decide::{self, DECIDE_PARAMS, Decide, RERANK_PARAMS, decide_request, rerank_request};
-use super::naming::{
-    CLASS_PREFIX, DECIDE_HELPER, DECISION_HELPERS, HELPERS, Names, READ_RESOURCE_HELPER,
-    RERANK_HELPER, RESOURCES_HELPER, SEARCH_HELPER, SERVERS_HELPER,
+use super::args::bind;
+use super::decide::{
+    self, DECIDE_PARAMS, DECISION_STUBS, Decide, RERANK_PARAMS, decide_request, rerank_request,
 };
+use super::history::HistoryModule;
+use super::module::{CallFailure, CallRun, HostCallPlan, HostModule, Prepared};
+use super::names::{DECIDE_HELPER, DECISION_HELPERS, RERANK_HELPER, STUB_IMPORTS};
 use super::output::{
-    CALL_SOURCE, McpCodeCall, McpCodeCallStatus, McpCodeOutcome, McpCodeOutput,
-    McpCodeProgressEvent,
+    CALL_SOURCE, CodeCall, CodeCallStatus, CodeOutcome, CodeOutput, CodeProgressEvent,
 };
 use super::runner::{
     ReplLease, ReplNote, ScriptCall, ScriptError, ScriptErrorKind, ScriptHost, ScriptInvocation,
     ScriptName, ScriptOutput, ScriptReply, ScriptRun, ScriptStatus, installed,
 };
-use super::search::{DEFAULT_LIMIT, search};
-use super::signature::stubs;
-use super::view::ServerView;
 use crate::AgentEvent;
 use crate::agent::change_recording::{self, Recording};
 use crate::agent::tool_dispatch::error_type;
 use crate::decisions::Decisions;
-use crate::mcp::call::CallScope;
-use crate::mcp::output::{McpBlock, McpHelper, McpInteraction, McpOutput, decoded_len};
-use crate::mcp::resources::{ResourceContents, ResourceLists};
-use crate::mcp::{McpSession, McpToolBinding, SEPARATOR};
-use crate::permissions::{
-    MCP_SERVER_RESOURCE, PermissionExecutorKind, PermissionResource, PermissionResourceAccess,
-    PermissionResourceKind, PermissionRisk, mcp_permission_intent,
-};
+use crate::mcp::code::module::McpModule;
+use crate::mcp::output::{McpBlock, McpHelper, McpInteraction, McpOutput};
+use crate::permissions::{PermissionExecutorKind, PermissionSubject};
 use crate::tools::native::batch::child_tool_use_id;
-use crate::tools::registry::{PermissionIntent, PermissionScopes, TrustedToolSource};
-use crate::tools::{
-    MCP_TOOL_NAME, READ_ONLY_TOOL_RESTRICTED, ToolContext, ToolEffect, ToolFailure,
-};
+use crate::tools::registry::PermissionIntent;
+use crate::tools::{READ_ONLY_TOOL_RESTRICTED, ToolContext, ToolEffect, ToolFailure};
 
 /// A result larger than this raises rather than reaching the snippet.
 pub const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
 /// What a call's card keeps of its result; the rest becomes an excerpt.
 pub const MAX_CALL_DISPLAY_BYTES: usize = 64 * 1024;
-
-const PROPERTIES: &str = "properties";
-const REQUIRED: &str = "required";
-const ADDITIONAL_PROPERTIES: &str = "additionalProperties";
-const QUERY_PARAM: &str = "query";
-const SERVER_PARAM: &str = "server";
-const LIMIT_PARAM: &str = "limit";
-const OFFSET_PARAM: &str = "offset";
-const URI_PARAM: &str = "uri";
-const SEARCH_PARAMS: &[&str] = &[QUERY_PARAM, SERVER_PARAM, LIMIT_PARAM, OFFSET_PARAM];
-const RESOURCES_PARAMS: &[&str] = &[SERVER_PARAM];
-const READ_RESOURCE_PARAMS: &[&str] = &[SERVER_PARAM, URI_PARAM];
-const RESOURCE_SCOPE_SEPARATOR: &str = ":";
-const CONNECTED: &str = "connected";
-const IMAGE_TYPE: &str = "image";
-const AUDIO_TYPE: &str = "audio";
-const RESOURCE_TYPE: &str = "resource";
-const RESOURCE_LINK_TYPE: &str = "resource_link";
-const EXCERPT_MARKER: &str = "\n[cut: the rest of this result was not kept]";
-const BLOCKED_IN_PLAN: &str =
-    "plan mode allows only the MCP tools a recognised server marks read-only";
-const UNFINISHED: &str = "did not finish: the run stopped first";
-/// What the type checker says after the stub class of a namespace whose tool it cannot find.
-const NO_ATTRIBUTE: &str = " has no attribute `";
-const QUOTE: char = '`';
 /// The server column of a `decide()` or `rerank()` row.
 pub const DECISIONS_ROW: &str = "decisions";
-const NO_RUNNER: &str = "MCP code mode is unavailable: no code runner is installed in this process";
-const GONE_NOTE: &str = "Variables from earlier `mcp` runs in this conversation are gone (Caudra restarted, or the conversation was resumed, rewound or forked); this run started empty. Fetch again what you need.";
+
+const EXCERPT_MARKER: &str = "\n[cut: the rest of this result was not kept]";
+const BLOCKED_IN_PLAN: &str = "plan mode allows only calls that change nothing, such as the MCP tools a recognised server marks read-only";
+const UNFINISHED: &str = "did not finish: the run stopped first";
+const NO_RUNNER: &str =
+    "The `code` tool is unavailable: no code runner is installed in this process";
+const GONE_NOTE: &str = "Variables from earlier `code` runs in this conversation are gone (Caudra restarted, or the conversation was resumed, rewound or forked); this run started empty. Fetch again what you need.";
 const RESTORE_FAILED_NOTE: &str =
     "Variables from earlier runs could not be restored; this run started empty.";
 const RUN_DISCARDED_NOTE: &str =
     "This run's variables could not be kept; the next run sees the variables from before it.";
 
-/// Runs `code` for the agent `session` belongs to, holding its variables for the whole run. A
-/// run started while servers are still making their first connection waits for them, so its
-/// names cover every server that comes up.
-pub async fn run(
-    session: &McpSession,
-    ctx: &ToolContext,
-    code: String,
-    reset: bool,
-) -> McpCodeOutput {
-    if session.connecting() && ctx.cancel.race(session.ready()).await.is_err() {
-        return McpCodeOutput {
+/// Runs `code` for the agent `ctx` belongs to, holding its variables for the whole run.
+pub async fn run(ctx: &ToolContext, code: String, reset: bool) -> CodeOutput {
+    let Some(modules) = modules(ctx).await else {
+        return CodeOutput {
             code,
-            outcome: McpCodeOutcome::Cancelled,
-            ..McpCodeOutput::default()
+            outcome: CodeOutcome::Cancelled,
+            ..CodeOutput::default()
         };
-    }
-    let mut lease = ReplLease::acquire(session.repl()).await;
+    };
+    let mut lease = ReplLease::acquire(ctx.code.repl()).await;
     let forgotten = lease.take_forgotten() && !reset;
     if reset {
         lease.keep(None);
     }
     let Some(runner) = installed() else {
-        return McpCodeOutput {
+        return CodeOutput {
             code,
-            outcome: McpCodeOutcome::Unavailable {
+            outcome: CodeOutcome::Unavailable {
                 message: NO_RUNNER.to_owned(),
             },
-            ..McpCodeOutput::default()
+            ..CodeOutput::default()
         };
     };
-    let gateway = Gateway::new(session.clone(), ctx.clone());
+    let gateway = Gateway::new(ctx.clone(), modules);
     let host: Arc<dyn ScriptHost> = Arc::new(gateway.clone());
     let outcome = runner
         .run(ScriptRun {
@@ -138,11 +100,11 @@ pub async fn run(
     .flatten()
     .collect();
     let mut output = match outcome.output {
-        Some(output) => finished(code, with_tool_hints(&gateway.0.names, output)),
-        None => McpCodeOutput {
+        Some(output) => finished(code, gateway.with_rejection_hints(output)),
+        None => CodeOutput {
             code,
-            outcome: McpCodeOutcome::Cancelled,
-            ..McpCodeOutput::default()
+            outcome: CodeOutcome::Cancelled,
+            ..CodeOutput::default()
         },
     };
     output.calls = gateway.finish();
@@ -152,6 +114,21 @@ pub async fn run(
         output.repairs.push(repair.done);
     }
     output
+}
+
+/// The modules a run reaches, in the order its names resolve. A run started while MCP servers are
+/// still making their first connection waits for them, so its names cover every server that comes
+/// up; `None` when the run was cancelled first.
+async fn modules(ctx: &ToolContext) -> Option<Vec<Arc<dyn HostModule>>> {
+    let mut modules: Vec<Arc<dyn HostModule>> = Vec::new();
+    if let Some(session) = &ctx.mcp {
+        if session.connecting() && ctx.cancel.race(session.ready()).await.is_err() {
+            return None;
+        }
+        modules.push(Arc::new(McpModule::new(session.clone())));
+    }
+    modules.push(Arc::new(HistoryModule::for_session(ctx)));
+    Some(modules)
 }
 
 fn note_text(note: ReplNote) -> String {
@@ -164,35 +141,7 @@ fn note_text(note: ReplNote) -> String {
     }
 }
 
-/// Type checking rejects a call to a tool a server lacks before the host can answer for it, so
-/// the rejection gets the "did you mean" the call would have raised at runtime.
-fn with_tool_hints(names: &Names, mut output: ScriptOutput) -> ScriptOutput {
-    let Some(diagnostic) = output
-        .diagnostic
-        .as_deref()
-        .filter(|_| output.status == ScriptStatus::Rejected)
-    else {
-        return output;
-    };
-    let mut hints: Vec<String> = diagnostic
-        .split(CLASS_PREFIX)
-        .skip(1)
-        .filter_map(|rest| {
-            let (namespace, rest) = rest.split_once(QUOTE)?;
-            let (method, _) = rest.strip_prefix(NO_ATTRIBUTE)?.split_once(QUOTE)?;
-            names.server(namespace)?;
-            Some(no_tool_message(names, namespace, method))
-        })
-        .collect();
-    hints.dedup();
-    if !hints.is_empty() {
-        hints.push(diagnostic.to_owned());
-        output.diagnostic = Some(hints.join("\n"));
-    }
-    output
-}
-
-fn finished(code: String, output: ScriptOutput) -> McpCodeOutput {
+fn finished(code: String, output: ScriptOutput) -> CodeOutput {
     let ScriptOutput {
         status,
         result,
@@ -215,33 +164,33 @@ fn finished(code: String, output: ScriptOutput) -> McpCodeOutput {
         None => message,
     };
     let outcome = match status {
-        ScriptStatus::Completed => McpCodeOutcome::Completed,
+        ScriptStatus::Completed => CodeOutcome::Completed,
         ScriptStatus::Exception => {
             let (kind, message) = exception
                 .map(|exception| (exception.kind, exception.message))
                 .unwrap_or_default();
-            McpCodeOutcome::Raised {
+            CodeOutcome::Raised {
                 kind,
                 message: with_diagnostic(message),
             }
         }
-        ScriptStatus::Rejected => McpCodeOutcome::Rejected {
+        ScriptStatus::Rejected => CodeOutcome::Rejected {
             message: with_diagnostic(exception.map(|e| e.message).unwrap_or_default()),
         },
-        ScriptStatus::Limited => McpCodeOutcome::Limited {
+        ScriptStatus::Limited => CodeOutcome::Limited {
             message: with_diagnostic(String::new()),
         },
-        ScriptStatus::Unavailable => McpCodeOutcome::Unavailable {
+        ScriptStatus::Unavailable => CodeOutcome::Unavailable {
             message: with_diagnostic(String::new()),
         },
     };
-    McpCodeOutput {
+    CodeOutput {
         code,
         calls: Vec::new(),
         stdout,
         result: result_repr.or_else(|| rendered(&result)),
         outcome,
-        ..McpCodeOutput::default()
+        ..CodeOutput::default()
     }
 }
 
@@ -253,16 +202,50 @@ fn rendered(value: &Value) -> Option<String> {
     }
 }
 
+/// Whether, and as what, a planned call asks before it runs. Only the gateway can make a call that
+/// asks nothing, and only for `decide()` and `rerank()`, whose answers are data that grants
+/// nothing from the user's own engine.
+pub struct Permission(Option<Box<Enforcement>>);
+
+struct Enforcement {
+    key: ToolKey,
+    intent: PermissionIntent,
+    identity: Option<(PermissionSubject, PermissionExecutorKind)>,
+    context: Option<String>,
+}
+
+impl Permission {
+    pub fn ask(
+        key: ToolKey,
+        intent: PermissionIntent,
+        identity: Option<(PermissionSubject, PermissionExecutorKind)>,
+    ) -> Self {
+        Self(Some(Box::new(Enforcement {
+            key,
+            intent,
+            identity,
+            context: None,
+        })))
+    }
+
+    /// What a prompt for a call that asks as a native tool says under the call itself, such as
+    /// whose history it reads.
+    pub fn with_context(mut self, context: String) -> Self {
+        if let Some(enforcement) = &mut self.0 {
+            enforcement.context = Some(context);
+        }
+        self
+    }
+}
+
 /// One run's host: what its names resolve to, and the calls it made.
 #[derive(Clone)]
-struct Gateway(Arc<Inner>);
+pub(super) struct Gateway(Arc<Inner>);
 
 struct Inner {
-    session: McpSession,
     ctx: ToolContext,
-    servers: Vec<ServerView>,
-    names: Names,
-    calls: Mutex<Vec<McpCodeCall>>,
+    modules: Vec<Arc<dyn HostModule>>,
+    calls: Mutex<Vec<CodeCall>>,
     /// The run's change record, `None` until a call that could change files is let through.
     record: AsyncMutex<Option<Recording>>,
     /// The session's decision engine, which `decide()` and `rerank()` need.
@@ -270,19 +253,46 @@ struct Inner {
 }
 
 impl Gateway {
-    fn new(session: McpSession, ctx: ToolContext) -> Self {
-        let servers = session.servers();
-        let names = Names::new(&servers);
+    pub(super) fn new(ctx: ToolContext, modules: Vec<Arc<dyn HostModule>>) -> Self {
         let decisions = ctx.permissions.decisions();
         Self(Arc::new(Inner {
-            session,
             ctx,
-            servers,
-            names,
+            modules,
             calls: Mutex::new(Vec::new()),
             record: AsyncMutex::new(None),
             decisions,
         }))
+    }
+
+    /// The module that defines `name` as `kind`.
+    fn defining(&self, name: &str, kind: &ScriptName) -> Option<&Arc<dyn HostModule>> {
+        self.0
+            .modules
+            .iter()
+            .find(|module| module.global(name).as_ref() == Some(kind))
+    }
+
+    /// A rejected snippet's diagnostic, led by what the modules can say about it.
+    fn with_rejection_hints(&self, mut output: ScriptOutput) -> ScriptOutput {
+        let Some(diagnostic) = output
+            .diagnostic
+            .as_deref()
+            .filter(|_| output.status == ScriptStatus::Rejected)
+        else {
+            return output;
+        };
+        let mut hints: Vec<String> = self
+            .0
+            .modules
+            .iter()
+            .flat_map(|module| module.rejection_hints(diagnostic))
+            .collect();
+        hints.dedup();
+        if !hints.is_empty() {
+            hints.push(diagnostic.to_owned());
+            output.diagnostic = Some(hints.join("\n"));
+        }
+        output
     }
 
     /// Opens the one record that covers the whole run, before the first permitted call that could
@@ -315,44 +325,21 @@ impl Gateway {
     }
 
     /// The calls the run made, any still running settled as unfinished.
-    fn finish(&self) -> Vec<McpCodeCall> {
+    pub(super) fn finish(&self) -> Vec<CodeCall> {
         let mut calls = std::mem::take(&mut *self.calls());
         for call in calls.iter_mut().filter(|call| !call.status.is_terminal()) {
-            call.status = McpCodeCallStatus::Error;
+            call.status = CodeCallStatus::Error;
             call.error = Some(UNFINISHED.to_owned());
             call.failure = Some(ToolFailure::Cancelled);
         }
         calls
     }
 
-    fn calls(&self) -> MutexGuard<'_, Vec<McpCodeCall>> {
+    fn calls(&self) -> MutexGuard<'_, Vec<CodeCall>> {
         self.0.calls.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn view(&self, server: &str) -> Option<&ServerView> {
-        self.0.servers.iter().find(|view| view.name == server)
-    }
-
-    /// The configured server a snippet names by namespace or by configured name.
-    fn server_named(&self, requested: &str) -> Result<String, ScriptError> {
-        let names = &self.0.names;
-        names
-            .server(requested)
-            .or_else(|| names.namespace(requested).and(Some(requested)))
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                let suggestion = names
-                    .suggest_namespace(requested)
-                    .map(|namespace| format!(" Did you mean `{namespace}`?"))
-                    .unwrap_or_default();
-                ScriptError::new(
-                    ScriptErrorKind::Value,
-                    format!("No MCP server `{requested}`.{suggestion}"),
-                )
-            })
-    }
-
-    fn begin(&self, call: McpCodeCall) -> usize {
+    fn begin(&self, call: CodeCall) -> usize {
         let index = {
             let mut calls = self.calls();
             calls.push(call.clone());
@@ -392,7 +379,7 @@ impl Gateway {
         self.publish(index, call);
     }
 
-    fn publish(&self, index: usize, call: McpCodeCall) {
+    fn publish(&self, index: usize, call: CodeCall) {
         let Some(id) = self.0.ctx.tool_use_id.clone() else {
             return;
         };
@@ -400,9 +387,11 @@ impl Gateway {
             .0
             .ctx
             .event_tx
-            .send(AgentEvent::McpCodeProgress(Box::new(
-                McpCodeProgressEvent { id, index, call },
-            )));
+            .send(AgentEvent::CodeProgress(Box::new(CodeProgressEvent {
+                id,
+                index,
+                call,
+            })));
     }
 
     /// The context a call runs under: the run's, with the call's own id.
@@ -417,138 +406,38 @@ impl Gateway {
         child
     }
 
-    fn helper(&self, call: ScriptCall) -> ScriptInvocation {
-        match call.name.as_str() {
-            SEARCH_HELPER => ScriptInvocation::Ready(self.search(&call)),
-            SERVERS_HELPER => ScriptInvocation::Ready(Ok(self.server_list())),
-            RESOURCES_HELPER => {
-                let gateway = self.clone();
-                ScriptInvocation::Deferred(Box::pin(async move { gateway.resources(&call) }))
-            }
-            READ_RESOURCE_HELPER => {
-                let gateway = self.clone();
-                ScriptInvocation::Deferred(Box::pin(
-                    async move { gateway.read_resource(call).await },
-                ))
-            }
-            DECIDE_HELPER | RERANK_HELPER if let Some(decisions) = self.0.decisions.clone() => {
-                let gateway = self.clone();
-                ScriptInvocation::Deferred(Box::pin(async move {
-                    gateway.decision(decisions, call).await
-                }))
-            }
-            name => ScriptInvocation::Ready(Err(ScriptError::new(
-                ScriptErrorKind::Name,
-                format!("name '{name}' is not defined"),
-            ))),
-        }
-    }
-
-    fn search(&self, call: &ScriptCall) -> ScriptReply {
-        let arguments = bind(SEARCH_HELPER, SEARCH_PARAMS, call)?;
-        let query = text(&arguments, SEARCH_HELPER, QUERY_PARAM)?.unwrap_or_default();
-        let server = text(&arguments, SEARCH_HELPER, SERVER_PARAM)?;
-        let limit = count(&arguments, SEARCH_HELPER, LIMIT_PARAM)?.unwrap_or(DEFAULT_LIMIT);
-        let offset = count(&arguments, SEARCH_HELPER, OFFSET_PARAM)?.unwrap_or_default();
-        let hits = search(
-            &self.0.servers,
-            &self.0.names,
-            &query,
-            server.as_deref(),
-            limit,
-            offset,
-        )
-        .map_err(|message| ScriptError::new(ScriptErrorKind::Value, message))?;
-        Ok(hits
-            .into_iter()
-            .map(|hit| {
-                json!({
-                    "name": format!("{}.{}", hit.namespace, hit.method),
-                    "signature": format!("{}.{}", hit.namespace, hit.signature),
-                    "doc": hit.doc,
-                })
-            })
-            .collect())
-    }
-
-    fn server_list(&self) -> Value {
-        self.0
-            .names
-            .namespaces()
-            .filter_map(|(namespace, server)| {
-                let view = self.view(server)?;
-                Some(json!({
-                    "name": namespace,
-                    "server": server,
-                    "title": view.title,
-                    "status": unavailable(&view.state).unwrap_or_else(|| CONNECTED.to_owned()),
-                    "tools": view.tools.len(),
-                    "resources": view.resources,
-                }))
-            })
-            .collect()
-    }
-
-    fn resources(&self, call: &ScriptCall) -> ScriptReply {
-        let arguments = bind(RESOURCES_HELPER, RESOURCES_PARAMS, call)?;
-        let requested = required_text(&arguments, RESOURCES_HELPER, SERVER_PARAM)?;
-        let server = self.server_named(&requested)?;
-        let snapshot = self.0.session.reader().load_full();
-        Ok(snapshot
-            .resources_of(&server)
-            .map(|offer| resource_entries(&offer.lists))
-            .unwrap_or_default())
-    }
-
-    async fn read_resource(self, call: ScriptCall) -> ScriptReply {
-        let arguments = bind(READ_RESOURCE_HELPER, READ_RESOURCE_PARAMS, &call)?;
-        let requested = required_text(&arguments, READ_RESOURCE_HELPER, SERVER_PARAM)?;
-        let uri = required_text(&arguments, READ_RESOURCE_HELPER, URI_PARAM)?;
-        let server = self.server_named(&requested)?;
-        let input = json!({ URI_PARAM: uri });
-        let index = self.begin(McpCodeCall {
-            server: server.clone(),
-            tool: READ_RESOURCE_HELPER.to_owned(),
-            called_as: format!(
-                "{READ_RESOURCE_HELPER}({}, {})",
-                Value::from(requested),
-                Value::from(uri.as_str())
-            ),
-            input: input.clone(),
-            ..McpCodeCall::default()
-        });
+    /// Shows a planned call as a row, holds it to the session's mode and permissions, and runs it
+    /// once it is let through.
+    async fn execute(self, plan: HostCallPlan) -> ScriptReply {
+        let HostCallPlan {
+            row,
+            permission,
+            read_only,
+            run,
+        } = plan;
+        let name = row.qualified_name();
+        let input = row.input.clone();
+        let index = self.begin(row);
         let child = self.child(index);
         let started = Instant::now();
-        if let Err(error) = authorize_read(&child, &server, &uri, &input).await {
+        if let Err(error) = authorize(&child, &name, &input, permission, read_only).await {
             return self.refused(index, started, error);
         }
-        let session = &self.0.session;
-        let scope = CallScope::new(
-            session.elicitor_for(&child),
-            self.0.ctx.live_sink.clone(),
-            self.0.ctx.cancel.clone(),
-        );
-        match session.read_resource(&server, &uri, &scope).await {
-            Ok(contents) => {
-                let value = contents_value(&contents);
-                let output = McpOutput {
-                    blocks: contents.into_iter().map(read_block).collect(),
-                    interactions: scope.take_interactions(),
-                    ..McpOutput::default()
-                };
-                self.succeeded(index, started, output, value)
-            }
-            Err(error) => self.failed(
+        if let Err(message) = self.open_record(read_only).await {
+            return self.failed(
                 index,
                 started,
-                Ending::failed(error.failure(), error.to_string())
-                    .with_interactions(scope.take_interactions()),
-            ),
+                CallFailure::new(ToolFailure::Other, message),
+            );
+        }
+        match run(child).await {
+            Ok((output, value)) => self.succeeded(index, started, output, value),
+            Err(failure) => self.failed(index, started, failure),
         }
     }
 
-    /// A `decide()` or `rerank()` call, shown as a row like any server call. It asks no permission:
-    /// the engine is the user's own, and an answer is data that grants nothing.
+    /// A `decide()` or `rerank()` call, shown as a row like any other call. It asks no
+    /// permission: the engine is the user's own, and an answer is data that grants nothing.
     async fn decision(self, decisions: Decisions, call: ScriptCall) -> ScriptReply {
         let rerank = call.name == RERANK_HELPER;
         let (helper, params, marked) = match rerank {
@@ -569,120 +458,24 @@ impl Gateway {
             Pending::Decide(decide) => decide_label(&decide.request.questions),
             Pending::Rerank(request) => rerank_label(request.candidates.len(), 1, 1),
         };
-        let index = self.begin(McpCodeCall {
+        let row = CodeCall {
             server: DECISIONS_ROW.to_owned(),
             tool: helper.to_owned(),
             called_as,
             input: Value::Object(arguments),
             helper: Some(marked),
-            ..McpCodeCall::default()
+            ..CodeCall::default()
+        };
+        let run: CallRun = Box::new(move |ctx: ToolContext| {
+            Box::pin(async move { pending.answer(&decisions, &ctx).await })
         });
-        let started = Instant::now();
-        let ctx = &self.0.ctx;
-        let context = ctx.permissions.decision_context(json!({
-            "tool_use_id": child_tool_use_id(ctx.tool_use_id.as_deref(), index),
-        }));
-        let answered = match &pending {
-            Pending::Decide(decide) => {
-                decide::ask(&decisions, &context, &decide.request, &ctx.cancel)
-                    .await
-                    .and_then(|result| {
-                        decide
-                            .questions
-                            .answers(&result)
-                            .map_err(|message| ScriptError::new(ScriptErrorKind::Runtime, message))
-                    })
-            }
-            Pending::Rerank(request) => {
-                decide::rerank(&decisions, &context, request, &ctx.cancel).await
-            }
-        };
-        match answered {
-            Ok(value) => {
-                let output = McpOutput {
-                    blocks: vec![McpBlock::Text {
-                        text: serde_json::to_string_pretty(&value).unwrap_or_default(),
-                    }],
-                    ..McpOutput::default()
-                };
-                self.succeeded(index, started, output, value)
-            }
-            Err(error) => {
-                let failure = match ctx.cancel.is_cancelled() {
-                    true => ToolFailure::Cancelled,
-                    false => ToolFailure::Other,
-                };
-                self.failed(index, started, Ending::failed(failure, error.message))
-            }
-        }
-    }
-
-    async fn call_tool(self, namespace: String, method: String, call: ScriptCall) -> ScriptReply {
-        let names = &self.0.names;
-        let server = names.server(&namespace).unwrap_or_default().to_owned();
-        let Some(view) = self.view(&server) else {
-            return Err(undefined_namespace(&namespace));
-        };
-        if let Some(reason) = unavailable(&view.state) {
-            return Err(ScriptError::new(
-                ScriptErrorKind::Runtime,
-                format!("MCP server `{namespace}` is not connected ({reason})"),
-            ));
-        }
-        let Some(tool) = names
-            .raw_tool(&namespace, &method)
-            .and_then(|raw| view.tools.iter().find(|tool| tool.name == raw))
-        else {
-            return Err(ScriptError::new(
-                ScriptErrorKind::Attribute,
-                no_tool_message(names, &namespace, &method),
-            ));
-        };
-        let input = Value::Object(tool_arguments(&method, call, &tool.input_schema)?);
-        let qualified = format!("{server}{SEPARATOR}{}", tool.name);
-        let index = self.begin(McpCodeCall {
-            server: server.clone(),
-            tool: tool.name.clone(),
-            called_as: format!("{namespace}{SEPARATOR}{method}"),
-            title: tool.title.clone(),
-            input: input.clone(),
-            ..McpCodeCall::default()
-        });
-        let child = self.child(index);
-        let started = Instant::now();
-        let session = &self.0.session;
-        let binding = match authorize(&child, session, &qualified, &input).await {
-            Ok(binding) => binding,
-            Err(error) => return self.refused(index, started, error),
-        };
-        if let Err(message) = self.open_record(binding.read_only()).await {
-            return self.failed(index, started, Ending::failed(ToolFailure::Other, message));
-        }
-        let scope = CallScope::new(
-            session.elicitor_for(&child),
-            self.0.ctx.live_sink.clone(),
-            self.0.ctx.cancel.clone(),
-        );
-        match binding.call(&input, &scope).await {
-            Ok(output) if output.is_error => {
-                let error = binding.reported_error(&output);
-                self.failed(
-                    index,
-                    started,
-                    Ending::failed(error.failure(), error.to_string()).with_output(output),
-                )
-            }
-            Ok(output) => {
-                let value = output_value(&output);
-                self.succeeded(index, started, output, value)
-            }
-            Err(error) => self.failed(
-                index,
-                started,
-                Ending::failed(error.failure(), error.to_string())
-                    .with_interactions(scope.take_interactions()),
-            ),
-        }
+        self.execute(HostCallPlan {
+            row,
+            permission: Permission(None),
+            read_only: true,
+            run,
+        })
+        .await
     }
 
     fn succeeded(
@@ -705,14 +498,14 @@ impl Gateway {
             return self.failed(
                 index,
                 started,
-                Ending::failed(ToolFailure::Other, message).with_output(output),
+                CallFailure::new(ToolFailure::Other, message).with_output(output),
             );
         }
         self.settle(
             index,
             started,
             Ending {
-                status: McpCodeCallStatus::Success,
+                status: CodeCallStatus::Success,
                 output: Some(output),
                 ..Ending::default()
             },
@@ -720,9 +513,9 @@ impl Gateway {
         Ok(value)
     }
 
-    fn failed(&self, index: usize, started: Instant, ending: Ending) -> ScriptReply {
-        let message = ending.error.clone().unwrap_or_default();
-        self.settle(index, started, ending);
+    fn failed(&self, index: usize, started: Instant, failure: CallFailure) -> ScriptReply {
+        let message = failure.error.clone();
+        self.settle(index, started, Ending::from(failure));
         Err(ScriptError::new(ScriptErrorKind::Runtime, message))
     }
 
@@ -735,8 +528,10 @@ impl Gateway {
             index,
             started,
             Ending {
-                status: McpCodeCallStatus::Refused,
-                ..Ending::failed(failure, error.message.clone())
+                status: CodeCallStatus::Refused,
+                failure: Some(failure),
+                error: Some(error.message.clone()),
+                ..Ending::default()
             },
         );
         Err(error)
@@ -749,153 +544,169 @@ enum Pending {
     Rerank(RerankRequest),
 }
 
+impl Pending {
+    async fn answer(
+        &self,
+        decisions: &Decisions,
+        ctx: &ToolContext,
+    ) -> Result<(McpOutput, Value), CallFailure> {
+        let context = ctx.permissions.decision_context(json!({
+            "tool_use_id": ctx.tool_use_id,
+        }));
+        let answered = match self {
+            Self::Decide(decide) => decide::ask(decisions, &context, &decide.request, &ctx.cancel)
+                .await
+                .and_then(|result| {
+                    decide
+                        .questions
+                        .answers(&result)
+                        .map_err(|message| ScriptError::new(ScriptErrorKind::Runtime, message))
+                }),
+            Self::Rerank(request) => {
+                decide::rerank(decisions, &context, request, &ctx.cancel).await
+            }
+        };
+        match answered {
+            Ok(value) => {
+                let output = McpOutput {
+                    blocks: vec![McpBlock::Text {
+                        text: serde_json::to_string_pretty(&value).unwrap_or_default(),
+                    }],
+                    ..McpOutput::default()
+                };
+                Ok((output, value))
+            }
+            Err(error) => {
+                let failure = match ctx.cancel.is_cancelled() {
+                    true => ToolFailure::Cancelled,
+                    false => ToolFailure::Other,
+                };
+                Err(CallFailure::new(failure, error.message))
+            }
+        }
+    }
+}
+
 /// How a call ended, as its row keeps it.
 #[derive(Default)]
 struct Ending {
-    status: McpCodeCallStatus,
+    status: CodeCallStatus,
     failure: Option<ToolFailure>,
     output: Option<McpOutput>,
     interactions: Vec<McpInteraction>,
     error: Option<String>,
 }
 
-impl Ending {
-    fn failed(failure: ToolFailure, message: String) -> Self {
+impl From<CallFailure> for Ending {
+    fn from(failure: CallFailure) -> Self {
         Self {
-            status: McpCodeCallStatus::Error,
-            failure: Some(failure),
-            error: Some(message),
-            ..Self::default()
-        }
-    }
-
-    fn with_output(self, output: McpOutput) -> Self {
-        Self {
-            output: Some(output),
-            ..self
-        }
-    }
-
-    fn with_interactions(self, interactions: Vec<McpInteraction>) -> Self {
-        Self {
-            interactions,
-            ..self
+            status: CodeCallStatus::Error,
+            failure: Some(failure.failure),
+            output: failure.output.map(|output| *output),
+            interactions: failure.interactions,
+            error: Some(failure.error),
         }
     }
 }
 
 impl ScriptHost for Gateway {
     fn lookup(&self, namespace: Option<&str>, name: &str) -> ScriptName {
-        let names = &self.0.names;
         let Some(namespace) = namespace else {
-            if names.server(name).is_some() {
-                return ScriptName::Namespace;
-            }
-            if HELPERS.contains(&name)
-                && (self.0.decisions.is_some() || !DECISION_HELPERS.contains(&name))
-            {
+            if DECISION_HELPERS.contains(&name) && self.0.decisions.is_some() {
                 return ScriptName::Function;
             }
-            return ScriptName::Undefined(names.suggest_namespace(name).map(|namespace| {
-                format!("name '{name}' is not defined. Did you mean the MCP server `{namespace}`?")
-            }));
+            let mut hint = None;
+            for module in &self.0.modules {
+                match module.global(name) {
+                    Some(ScriptName::Undefined(message)) => hint = hint.or(message),
+                    Some(found) => return found,
+                    None => {}
+                }
+            }
+            return ScriptName::Undefined(hint);
         };
-        let reachable = names
-            .server(namespace)
-            .and_then(|server| self.view(server))
-            .is_some_and(|view| unavailable(&view.state).is_none());
-        // A server that is not connected answers every name, so the call raises why.
-        if !reachable || names.raw_tool(namespace, name).is_some() {
-            return ScriptName::Function;
-        }
-        ScriptName::Undefined(Some(no_tool_message(names, namespace, name)))
+        self.defining(namespace, &ScriptName::Namespace)
+            .map_or(ScriptName::Undefined(None), |module| {
+                module.member(namespace, name)
+            })
     }
 
     fn call(&self, call: ScriptCall) -> ScriptInvocation {
-        let Some(namespace) = call.namespace.clone() else {
-            return self.helper(call);
+        if call.namespace.is_none()
+            && DECISION_HELPERS.contains(&call.name.as_str())
+            && let Some(decisions) = self.0.decisions.clone()
+        {
+            let gateway = self.clone();
+            return ScriptInvocation::Deferred(Box::pin(gateway.decision(decisions, call)));
+        }
+        let owner = match &call.namespace {
+            Some(namespace) => self.defining(namespace, &ScriptName::Namespace),
+            None => self.defining(&call.name, &ScriptName::Function),
         };
-        let gateway = self.clone();
-        let method = call.name.clone();
-        ScriptInvocation::Deferred(Box::pin(gateway.call_tool(namespace, method, call)))
+        let Some(module) = owner else {
+            let name = call.namespace.as_deref().unwrap_or(&call.name);
+            return ScriptInvocation::Ready(Err(ScriptError::new(
+                ScriptErrorKind::Name,
+                format!("name '{name}' is not defined"),
+            )));
+        };
+        match module.prepare(&self.0.ctx, call) {
+            Prepared::Answer(invocation) => invocation,
+            Prepared::Plan(plan) => {
+                let gateway = self.clone();
+                ScriptInvocation::Deferred(Box::pin(async move { gateway.execute(*plan?).await }))
+            }
+            Prepared::Later(plan) => {
+                let gateway = self.clone();
+                ScriptInvocation::Deferred(Box::pin(
+                    async move { gateway.execute(*plan.await?).await },
+                ))
+            }
+        }
     }
 
     fn stubs(&self) -> String {
-        stubs(&self.0.names, &self.0.servers, self.0.decisions.is_some())
+        let mut stubs = format!("{STUB_IMPORTS}\n");
+        for module in &self.0.modules {
+            stubs.push_str(&module.stubs());
+        }
+        if self.0.decisions.is_some() {
+            for stub in DECISION_STUBS {
+                stubs.push_str(stub);
+                stubs.push('\n');
+            }
+        }
+        stubs
     }
 }
 
-/// Lets `ctx`'s agent call `qualified` with `input`, or says why not: the checks a direct MCP
-/// call made, then the permission prompt.
+/// Holds a call to the session's mode, then asks as its plan says.
 async fn authorize(
     ctx: &ToolContext,
-    session: &McpSession,
-    qualified: &str,
+    name: &str,
     input: &Value,
-) -> Result<McpToolBinding, ScriptError> {
+    permission: Permission,
+    read_only: bool,
+) -> Result<(), ScriptError> {
     let refuse = |message: String| ScriptError::new(ScriptErrorKind::Permission, message);
-    let binding = session
-        .bind_tool(qualified)
-        .map_err(|error| ScriptError::new(ScriptErrorKind::Runtime, error.to_string()))?;
-    if ctx.mode.is_planning() && !binding.read_only() {
+    if ctx.mode.is_planning() && !read_only {
         return Err(refuse(BLOCKED_IN_PLAN.to_owned()));
     }
-    if ctx.policy().is_read_only() && !binding.read_only() {
-        return Err(refuse(format!("{READ_ONLY_TOOL_RESTRICTED}: {qualified}")));
+    if ctx.policy().is_read_only() && !read_only {
+        return Err(refuse(format!("{READ_ONLY_TOOL_RESTRICTED}: {name}")));
     }
-    if session.is_disabled(qualified) {
-        return Err(refuse(format!("`{qualified}` is disabled for this agent")));
+    let Some(enforcement) = permission.0 else {
+        return Ok(());
+    };
+    let Enforcement {
+        key,
+        mut intent,
+        identity,
+        context,
+    } = *enforcement;
+    if matches!(key, ToolKey::Native(_)) {
+        intent = intent.with_action(prompt_action(name, input, context.as_deref()));
     }
-    let key = ToolKey::parse(qualified)
-        .map_err(|error| ScriptError::new(ScriptErrorKind::Runtime, error.to_string()))?;
-    let intent = mcp_permission_intent(&key, input, binding.call_facts(input));
-    ctx.permissions
-        .enforce_with_intent(
-            &key,
-            &intent,
-            input,
-            &ctx.event_tx,
-            ctx.user_response_rx.as_deref(),
-            ctx.tool_use_id.as_deref().unwrap_or_default(),
-            &ctx.cancel,
-            ctx.mode.plan_path(),
-            Some((binding.subject().clone(), PermissionExecutorKind::Mcp)),
-            false,
-        )
-        .await
-        .map_err(|error| refuse(error.to_string()))?;
-    Ok(binding)
-}
-
-/// Reading a server's resources asks as the `mcp` tool, scoped to the server and URI, and stays
-/// in reach while planning and under a read-only policy. The built-in allow that lets the `mcp`
-/// tool itself run unasked never covers a read.
-async fn authorize_read(
-    ctx: &ToolContext,
-    server: &str,
-    uri: &str,
-    input: &Value,
-) -> Result<(), ScriptError> {
-    let key = ToolKey::native(MCP_TOOL_NAME);
-    let identity = ctx
-        .registry
-        .get(MCP_TOOL_NAME)
-        .and_then(|entry| TrustedToolSource::from_registered(&entry, None))
-        .map(|source| (source.subject().clone(), source.executor().clone()));
-    let intent = PermissionIntent::new(
-        PermissionScopes::single(format!("{server}{RESOURCE_SCOPE_SEPARATOR}{uri}")),
-        vec![PermissionResource {
-            kind: PermissionResourceKind::Custom {
-                name: MCP_SERVER_RESOURCE.to_owned(),
-            },
-            value: server.to_owned(),
-            access: Some(PermissionResourceAccess::Read),
-            protected: false,
-            requires_prompt: false,
-            attributes: BTreeMap::new(),
-        }],
-        PermissionRisk::Low,
-    );
     ctx.permissions
         .enforce_with_intent(
             &key,
@@ -910,10 +721,29 @@ async fn authorize_read(
             false,
         )
         .await
-        .map_err(|error| ScriptError::new(ScriptErrorKind::Permission, error.to_string()))
+        .map_err(|error| refuse(error.to_string()))
 }
 
-fn report(call: &McpCodeCall) {
+/// The call as the snippet made it, `history.read(ref="…", limit=5000)`, then the module's
+/// context, so a prompt names what runs rather than the `code` tool around it.
+fn prompt_action(name: &str, input: &Value, context: Option<&str>) -> String {
+    let arguments = match input {
+        Value::Object(arguments) => arguments
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        Value::Null => String::new(),
+        value => value.to_string(),
+    };
+    let call = format!("{name}({arguments})");
+    match context {
+        Some(context) => format!("{call}\n{context}"),
+        None => call,
+    }
+}
+
+fn report(call: &CodeCall) {
     let tool_input = caudra_otel::logs_tool_details().then(|| call.input.to_string());
     let outcome = call.ledger_outcome();
     caudra_otel::emit::tool_result(&caudra_otel::emit::ToolResult {
@@ -924,281 +754,6 @@ fn report(call: &McpCodeCall) {
         error_type: error_type(outcome),
         tool_input: tool_input.as_deref(),
     });
-}
-
-fn undefined_namespace(namespace: &str) -> ScriptError {
-    ScriptError::new(
-        ScriptErrorKind::Name,
-        format!("name '{namespace}' is not defined"),
-    )
-}
-
-fn no_tool_message(names: &Names, namespace: &str, method: &str) -> String {
-    let suggestion = names
-        .suggest_tool(namespace, method)
-        .map(|tool| format!(" Did you mean `{tool}`?"))
-        .unwrap_or_default();
-    format!(
-        "MCP server `{namespace}` has no tool `{method}`.{suggestion} Find tools with `search(\"...\", server=\"{namespace}\")`."
-    )
-}
-
-/// A helper's arguments by parameter name, positional ones first.
-fn bind(
-    helper: &str,
-    params: &[&str],
-    call: &ScriptCall,
-) -> Result<Map<String, Value>, ScriptError> {
-    let type_error = |message: String| ScriptError::new(ScriptErrorKind::Type, message);
-    if call.args.len() > params.len() {
-        return Err(type_error(format!(
-            "{helper}() takes at most {} positional arguments ({} given)",
-            params.len(),
-            call.args.len()
-        )));
-    }
-    let mut bound: Map<String, Value> = params
-        .iter()
-        .zip(&call.args)
-        .map(|(param, value)| ((*param).to_owned(), value.clone()))
-        .collect();
-    for (name, value) in &call.kwargs {
-        if !params.contains(&name.as_str()) {
-            return Err(type_error(format!(
-                "{helper}() got an unexpected keyword argument '{name}'"
-            )));
-        }
-        if bound.insert(name.clone(), value.clone()).is_some() {
-            return Err(type_error(format!(
-                "{helper}() got multiple values for argument '{name}'"
-            )));
-        }
-    }
-    Ok(bound)
-}
-
-fn text(
-    arguments: &Map<String, Value>,
-    helper: &str,
-    param: &str,
-) -> Result<Option<String>, ScriptError> {
-    match arguments.get(param) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(text)) => Ok(Some(text.clone())),
-        Some(_) => Err(ScriptError::new(
-            ScriptErrorKind::Type,
-            format!("{helper}() argument '{param}' must be a str"),
-        )),
-    }
-}
-
-fn required_text(
-    arguments: &Map<String, Value>,
-    helper: &str,
-    param: &str,
-) -> Result<String, ScriptError> {
-    text(arguments, helper, param)?.ok_or_else(|| {
-        ScriptError::new(
-            ScriptErrorKind::Type,
-            format!("{helper}() missing required argument: '{param}'"),
-        )
-    })
-}
-
-fn count(
-    arguments: &Map<String, Value>,
-    helper: &str,
-    param: &str,
-) -> Result<Option<usize>, ScriptError> {
-    match arguments.get(param) {
-        None | Some(Value::Null) => Ok(None),
-        Some(value) => value
-            .as_u64()
-            .and_then(|count| usize::try_from(count).ok())
-            .map(Some)
-            .ok_or_else(|| {
-                ScriptError::new(
-                    ScriptErrorKind::Value,
-                    format!("{helper}() argument '{param}' must be a non-negative int"),
-                )
-            }),
-    }
-}
-
-/// A tool call's arguments: keywords, or one positional dict, checked against what the tool's
-/// schema requires and allows.
-fn tool_arguments(
-    method: &str,
-    call: ScriptCall,
-    schema: &Value,
-) -> Result<Map<String, Value>, ScriptError> {
-    let type_error = |message: String| ScriptError::new(ScriptErrorKind::Type, message);
-    let ScriptCall { args, kwargs, .. } = call;
-    let arguments = match <[Value; 1]>::try_from(args) {
-        Ok([Value::Object(arguments)]) if kwargs.is_empty() => arguments,
-        Err(args) if args.is_empty() => kwargs,
-        _ => {
-            return Err(type_error(format!(
-                "{method}() takes keyword arguments, or a single dict of them"
-            )));
-        }
-    };
-    let properties = schema.get(PROPERTIES).and_then(Value::as_object);
-    let missing: Vec<&str> = schema
-        .get(REQUIRED)
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .filter(|name| !arguments.contains_key(*name))
-        .collect();
-    if !missing.is_empty() {
-        return Err(type_error(format!(
-            "{method}() missing required arguments: {}",
-            quoted(missing.into_iter())
-        )));
-    }
-    let open = schema
-        .get(ADDITIONAL_PROPERTIES)
-        .is_some_and(|allowed| allowed.as_bool() != Some(false));
-    if let Some(properties) = properties.filter(|_| !open) {
-        let unknown: Vec<&str> = arguments
-            .keys()
-            .map(String::as_str)
-            .filter(|name| !properties.contains_key(*name))
-            .collect();
-        if !unknown.is_empty() {
-            let known = properties.keys().map(String::as_str);
-            return Err(type_error(format!(
-                "{method}() got unexpected arguments: {}. It takes: {}",
-                quoted(unknown.into_iter()),
-                quoted(known)
-            )));
-        }
-    }
-    Ok(arguments)
-}
-
-fn quoted<'a>(names: impl Iterator<Item = &'a str>) -> String {
-    names
-        .map(|name| format!("'{name}'"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// What a snippet receives: `structuredContent`, else the content, a JSON text parsed.
-fn output_value(output: &McpOutput) -> Value {
-    if let Some(structured) = output.structured_content() {
-        return structured.clone();
-    }
-    let mut values: Vec<Value> = output.blocks.iter().map(block_value).collect();
-    match values.len() {
-        0 => Value::Null,
-        1 => values.remove(0),
-        _ => Value::Array(values),
-    }
-}
-
-fn block_value(block: &McpBlock) -> Value {
-    match block {
-        McpBlock::Text { text } | McpBlock::Excerpt { text } => json_text(text),
-        McpBlock::Structured { value } => value.clone(),
-        McpBlock::Image { mime_type, bytes } => media(IMAGE_TYPE, mime_type, *bytes),
-        McpBlock::Audio { mime_type, bytes } => media(AUDIO_TYPE, mime_type, *bytes),
-        McpBlock::Resource {
-            uri,
-            mime_type,
-            text,
-            bytes,
-        } => json!({
-            "type": RESOURCE_TYPE,
-            "uri": uri,
-            "mime_type": mime_type,
-            "text": text,
-            "bytes": bytes,
-        }),
-        McpBlock::ResourceLink {
-            uri,
-            name,
-            mime_type,
-        } => json!({
-            "type": RESOURCE_LINK_TYPE,
-            "uri": uri,
-            "name": name,
-            "mime_type": mime_type,
-        }),
-    }
-}
-
-/// Text that is a JSON object or array, parsed; anything else stays text.
-fn json_text(text: &str) -> Value {
-    let trimmed = text.trim();
-    trimmed
-        .starts_with(['{', '['])
-        .then(|| serde_json::from_str(trimmed).ok())
-        .flatten()
-        .unwrap_or_else(|| Value::String(text.to_owned()))
-}
-
-/// Media the model never reads, named by kind and size.
-fn media(kind: &str, mime_type: &Option<String>, bytes: usize) -> Value {
-    json!({ "type": kind, "mime_type": mime_type, "bytes": bytes })
-}
-
-fn resource_entries(lists: &ResourceLists) -> Value {
-    let resources = lists.resources.iter().map(|resource| {
-        json!({
-            "uri": resource.uri,
-            "name": resource.label(),
-            "description": resource.description,
-            "mime_type": resource.mime_type,
-            "template": false,
-        })
-    });
-    let templates = lists.templates.iter().map(|template| {
-        json!({
-            "uri": template.uri_template,
-            "name": template.label(),
-            "description": template.description,
-            "mime_type": template.mime_type,
-            "template": true,
-        })
-    });
-    resources.chain(templates).collect()
-}
-
-fn contents_value(contents: &[ResourceContents]) -> Value {
-    contents
-        .iter()
-        .map(|content| match &content.blob {
-            Some(blob) => json!({
-                "uri": content.uri,
-                "mime_type": content.mime_type,
-                "bytes": decoded_len(blob),
-            }),
-            None => json!({
-                "uri": content.uri,
-                "mime_type": content.mime_type,
-                "text": content.text.clone().unwrap_or_default(),
-            }),
-        })
-        .collect()
-}
-
-fn read_block(content: ResourceContents) -> McpBlock {
-    let bytes = content.blob.as_deref().map(decoded_len);
-    match bytes {
-        Some(bytes) if content.is_image() => McpBlock::Image {
-            mime_type: content.mime_type,
-            bytes,
-        },
-        _ => McpBlock::Resource {
-            uri: content.uri,
-            mime_type: content.mime_type,
-            text: content.text,
-            bytes,
-        },
-    }
 }
 
 /// Keeps what a card draws of `output` within [`MAX_CALL_DISPLAY_BYTES`].
@@ -1219,7 +774,9 @@ fn excerpt(output: &mut McpOutput) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use caudra_config::decisions::DecisionsConfig;
@@ -1231,15 +788,23 @@ mod tests {
     use caudra_providers::{ContentBlock, Message, Role};
     use caudra_storage::StateDir;
     use caudra_workspace::RecordScope;
+    use serde_json::Map;
     use tempfile::TempDir;
     use test_case::test_case;
 
     use super::*;
     use crate::AgentMode;
     use crate::agent::change_recording::fixture::{FakeChanges, Step};
-    use crate::mcp::code::runner::{ReplState, RunFuture, ScriptOutcome, ScriptRunner, install};
-    use crate::mcp::{recognised_stub_session, stub_session_replying};
-    use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager, PermissionMode};
+    use crate::code::CodeSession;
+    use crate::code::runner::{ReplState, RunFuture, ScriptOutcome, ScriptRunner, install};
+    use crate::mcp::code::naming::CLASS_PREFIX;
+    use crate::mcp::{McpSession, SEPARATOR, recognised_stub_session, stub_session_replying};
+    use crate::permissions::{
+        PERMISSION_DENIED_PREFIX, PermissionManager, PermissionMode, PermissionResource,
+        PermissionResourceAccess, PermissionResourceKind, PermissionRisk,
+    };
+    use crate::tools::CODE_TOOL_NAME;
+    use crate::tools::registry::PermissionScopes;
     use crate::tools::test_support::{stub_ctx, stub_ctx_with_permissions};
 
     const NAMESPACE: &str = "stub";
@@ -1278,12 +843,12 @@ mod tests {
         }
     }
 
-    fn earlier_mcp_run() -> Message {
+    fn earlier_code_run() -> Message {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
                 id: String::new(),
-                name: MCP_TOOL_NAME.to_owned(),
+                name: CODE_TOOL_NAME.to_owned(),
                 input: Value::Null,
                 thought_signature: None,
             }],
@@ -1295,8 +860,12 @@ mod tests {
         json!({"content": [{"type": "text", "text": LOOKUP_RESULT}]})
     }
 
-    fn lookup(session: McpSession, ctx: ToolContext) -> (ScriptReply, Vec<McpCodeCall>) {
-        let gateway = Gateway::new(session, ctx);
+    fn mcp_gateway(session: McpSession, ctx: ToolContext) -> Gateway {
+        Gateway::new(ctx, vec![Arc::new(McpModule::new(session))])
+    }
+
+    fn lookup(session: McpSession, ctx: ToolContext) -> (ScriptReply, Vec<CodeCall>) {
+        let gateway = mcp_gateway(session, ctx);
         let reply = smol::block_on(call_lookup(&gateway));
         (reply, gateway.finish())
     }
@@ -1310,16 +879,23 @@ mod tests {
         method: &str,
         kwargs: Map<String, Value>,
     ) -> ScriptReply {
-        let call = ScriptCall {
-            namespace: Some(NAMESPACE.to_owned()),
-            name: method.to_owned(),
-            args: Vec::new(),
-            kwargs,
-        };
-        gateway
-            .clone()
-            .call_tool(NAMESPACE.into(), method.into(), call)
-            .await
+        invoke(
+            gateway,
+            ScriptCall {
+                namespace: Some(NAMESPACE.to_owned()),
+                name: method.to_owned(),
+                args: Vec::new(),
+                kwargs,
+            },
+        )
+        .await
+    }
+
+    async fn invoke(gateway: &Gateway, call: ScriptCall) -> ScriptReply {
+        match gateway.call(call) {
+            ScriptInvocation::Ready(reply) => reply,
+            ScriptInvocation::Deferred(future) => future.await,
+        }
     }
 
     fn verdict(reply: &ScriptReply) -> Verdict {
@@ -1373,8 +949,8 @@ mod tests {
         let (reply, calls) = lookup(session, stub_ctx_with_permissions(&mode, permissions));
         assert_eq!(verdict(&reply), expected, "{reply:?}");
         let status = match expected {
-            Verdict::Ran => McpCodeCallStatus::Success,
-            Verdict::Asked | Verdict::Refused => McpCodeCallStatus::Refused,
+            Verdict::Ran => CodeCallStatus::Success,
+            Verdict::Asked | Verdict::Refused => CodeCallStatus::Refused,
         };
         assert_eq!(
             calls.iter().map(|call| call.status).collect::<Vec<_>>(),
@@ -1405,7 +981,7 @@ mod tests {
             "{}",
             error.message
         );
-        assert_eq!(calls[0].status, McpCodeCallStatus::Refused);
+        assert_eq!(calls[0].status, CodeCallStatus::Refused);
         assert_eq!(calls[0].error.as_deref(), Some(error.message.as_str()));
     }
 
@@ -1425,13 +1001,13 @@ mod tests {
         let error = reply.unwrap_err();
         assert_eq!(error.kind, ScriptErrorKind::Runtime);
         assert!(error.message.contains(ERROR_TEXT), "{}", error.message);
-        assert_eq!(calls[0].status, McpCodeCallStatus::Error);
+        assert_eq!(calls[0].status, CodeCallStatus::Error);
         assert!(calls[0].output.is_some());
     }
 
-    /// Variables live only in memory, so a conversation that ran `mcp` under another agent, in an
+    /// Variables live only in memory, so a conversation that ran `code` under another agent, in an
     /// earlier process or before a rewind or fork, says once that they are gone, unless the run
-    /// asked to start empty anyway.
+    /// asked to start empty anyway. No MCP server is needed for any of it.
     #[test_case(true, false, Some(GONE_NOTE) ; "a_resumed_conversation_says_its_variables_are_gone")]
     #[test_case(true, true, None ; "a_reset_run_has_nothing_to_miss")]
     #[test_case(false, false, None ; "a_new_conversation_lost_nothing")]
@@ -1442,13 +1018,13 @@ mod tests {
     ) {
         install(Arc::new(KeepsVariables));
         let history = match ran_before {
-            true => vec![earlier_mcp_run()],
+            true => vec![earlier_code_run()],
             false => Vec::new(),
         };
-        let session = stub_session_replying(&[], None).fresh(&history);
-        let ctx = stub_ctx(&AgentMode::Build);
-        let first = smol::block_on(run(&session, &ctx, String::new(), reset));
-        let second = smol::block_on(run(&session, &ctx, String::new(), false));
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.code = CodeSession::new(&history);
+        let first = smol::block_on(run(&ctx, String::new(), reset));
+        let second = smol::block_on(run(&ctx, String::new(), false));
         assert_eq!(first.state_note.as_deref(), expected);
         assert_eq!(second.state_note, None);
     }
@@ -1477,7 +1053,7 @@ mod tests {
         ctx.changes = Some(changes.recorder(Path::new(RECORD_ROOT)));
         let session =
             recognised_stub_session(HOME_ASSISTANT, &[(LOOKUP_TOOL, annotated)], lookup_result());
-        let gateway = Gateway::new(session, ctx);
+        let gateway = mcp_gateway(session, ctx);
         smol::block_on(async {
             for _ in 0..2 {
                 assert_eq!(call_lookup(&gateway).await.is_ok(), effect == Effect::Allow);
@@ -1511,7 +1087,7 @@ mod tests {
         let (_dir, permissions) = permissions(config, PermissionMode::Ask);
         let session =
             recognised_stub_session(server, &[(qualified.as_str(), false)], lookup_result());
-        let gateway = Gateway::new(
+        let gateway = mcp_gateway(
             session,
             stub_ctx_with_permissions(&AgentMode::Build, permissions),
         );
@@ -1534,7 +1110,7 @@ mod tests {
         let (_dir, permissions) = permissions(PermissionsConfig::default(), PermissionMode::Yolo);
         let session = stub_session_replying(&[(LOOKUP_TOOL, "")], Some(lookup_result()))
             .with_actor_policy(profile);
-        let gateway = Gateway::new(
+        let gateway = mcp_gateway(
             session,
             stub_ctx_with_permissions(&AgentMode::Build, permissions),
         );
@@ -1565,11 +1141,11 @@ mod tests {
             "snippet.py:1:7: error[unresolved-attribute] Object of type `{CLASS_PREFIX}{namespace}` has no attribute `{method}`"
         );
         let session = stub_session_replying(&[(LOOKUP_TOOL, "")], None);
-        let gateway = Gateway::new(session, stub_ctx(&AgentMode::Build));
-        let output = with_tool_hints(
-            &gateway.0.names,
-            ScriptOutput::refused(ScriptStatus::Rejected, rejection.clone()),
-        );
+        let gateway = mcp_gateway(session, stub_ctx(&AgentMode::Build));
+        let output = gateway.with_rejection_hints(ScriptOutput::refused(
+            ScriptStatus::Rejected,
+            rejection.clone(),
+        ));
         let diagnostic = output.diagnostic.expect("diagnostic");
         match hint {
             Some(hint) => assert!(
@@ -1593,20 +1169,20 @@ mod tests {
         });
         let session = stub_session_replying(&[(SERVER_TOOL, "")], Some(reply));
         let (_dir, permissions) = permissions(PermissionsConfig::default(), PermissionMode::Yolo);
-        let gateway = Gateway::new(
+        let gateway = mcp_gateway(
             session,
             stub_ctx_with_permissions(&AgentMode::Build, permissions),
         );
         let error = smol::block_on(call_method(&gateway, METHOD, Map::new())).unwrap_err();
         let calls = gateway.finish();
         assert_eq!(calls[0].qualified_name(), SERVER_TOOL);
-        let text = McpCodeOutput {
+        let text = CodeOutput {
             calls,
-            outcome: McpCodeOutcome::Raised {
+            outcome: CodeOutcome::Raised {
                 kind: RAISED.to_owned(),
                 message: error.message,
             },
-            ..McpCodeOutput::default()
+            ..CodeOutput::default()
         }
         .model_text();
         assert!(
@@ -1722,7 +1298,7 @@ mod tests {
             ));
         }
         let session = stub_session_replying(&[(LOOKUP_TOOL, "")], None);
-        let gateway = Gateway::new(session, stub_ctx_with_permissions(&mode, permissions));
+        let gateway = mcp_gateway(session, stub_ctx_with_permissions(&mode, permissions));
         (dir, gateway)
     }
 
@@ -1736,10 +1312,7 @@ mod tests {
             args: Vec::new(),
             kwargs,
         };
-        match gateway.call(call) {
-            ScriptInvocation::Ready(reply) => reply,
-            ScriptInvocation::Deferred(future) => future.await,
-        }
+        invoke(gateway, call).await
     }
 
     /// `decide()` asks no permission, so it answers while planning too, in the snippet's own
@@ -1784,7 +1357,7 @@ mod tests {
             format!("{DECISIONS_ROW}{SEPARATOR}{DECIDE_HELPER}")
         );
         assert_eq!(calls[0].called_as, "decide: severity, parser_bug, team");
-        assert_eq!(calls[0].status, McpCodeCallStatus::Success);
+        assert_eq!(calls[0].status, CodeCallStatus::Success);
         assert_eq!(calls[0].helper, Some(McpHelper::Decide));
     }
 
@@ -1858,7 +1431,7 @@ mod tests {
         );
         let error = smol::block_on(call_helper(&gateway, helper, kwargs)).unwrap_err();
         assert_eq!(error.kind, ScriptErrorKind::Runtime);
-        assert_eq!(gateway.finish()[0].status, McpCodeCallStatus::Error);
+        assert_eq!(gateway.finish()[0].status, CodeCallStatus::Error);
     }
 
     #[test_case(DECIDE_HELPER ; "decide")]
@@ -1872,6 +1445,122 @@ mod tests {
         assert!(!gateway.stubs().contains(&format!("def {helper}(")));
         let reply = smol::block_on(call_helper(&gateway, helper, json!({})));
         assert_eq!(reply.unwrap_err().kind, ScriptErrorKind::Name);
+    }
+
+    const FAKE_MODULE: &str = "ledger";
+    const FAKE_METHOD: &str = "append";
+
+    /// A module that plans one call which could change files, and counts the times it ran.
+    #[derive(Default)]
+    struct FakeModule {
+        runs: Arc<AtomicUsize>,
+    }
+
+    impl HostModule for FakeModule {
+        fn global(&self, name: &str) -> Option<ScriptName> {
+            (name == FAKE_MODULE).then_some(ScriptName::Namespace)
+        }
+
+        fn member(&self, _namespace: &str, name: &str) -> ScriptName {
+            match name == FAKE_METHOD {
+                true => ScriptName::Function,
+                false => ScriptName::Undefined(None),
+            }
+        }
+
+        fn stubs(&self) -> String {
+            String::new()
+        }
+
+        fn prepare(&self, _ctx: &ToolContext, call: ScriptCall) -> Prepared {
+            let runs = Arc::clone(&self.runs);
+            let run: CallRun = Box::new(move |_ctx: ToolContext| {
+                Box::pin(async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    Ok((McpOutput::default(), json!(LOOKUP_RESULT)))
+                })
+            });
+            let qualified = format!("{FAKE_MODULE}{SEPARATOR}{}", call.name);
+            Prepared::Plan(Ok(Box::new(HostCallPlan {
+                row: CodeCall {
+                    server: FAKE_MODULE.to_owned(),
+                    tool: call.name.clone(),
+                    called_as: qualified.clone(),
+                    ..CodeCall::default()
+                },
+                permission: Permission::ask(
+                    ToolKey::parse(&qualified).unwrap(),
+                    PermissionIntent::new(
+                        PermissionScopes::single(qualified),
+                        vec![PermissionResource {
+                            kind: PermissionResourceKind::Custom {
+                                name: FAKE_MODULE.to_owned(),
+                            },
+                            value: FAKE_MODULE.to_owned(),
+                            access: Some(PermissionResourceAccess::Write),
+                            protected: false,
+                            requires_prompt: false,
+                            attributes: BTreeMap::new(),
+                        }],
+                        PermissionRisk::Low,
+                    ),
+                    None,
+                ),
+                read_only: false,
+                run,
+            })))
+        }
+    }
+
+    /// Whatever module plans a call, the gateway holds it to the mode and the permission mode
+    /// before it runs.
+    #[test_case(AgentMode::Build, PermissionMode::Yolo, Verdict::Ran ; "build_runs_it")]
+    #[test_case(AgentMode::Build, PermissionMode::Ask, Verdict::Asked ; "ask_asks")]
+    #[test_case(AgentMode::Plan(PathBuf::from(PLAN_FILE)), PermissionMode::Yolo, Verdict::Refused ; "plan_refuses_it")]
+    #[test_case(AgentMode::ReadOnly, PermissionMode::Yolo, Verdict::Refused ; "read_only_refuses_it")]
+    fn the_gateway_authorizes_every_module_call(
+        mode: AgentMode,
+        permission_mode: PermissionMode,
+        expected: Verdict,
+    ) {
+        let module = FakeModule::default();
+        let runs = Arc::clone(&module.runs);
+        let (_dir, permissions) = permissions(PermissionsConfig::default(), permission_mode);
+        let gateway = Gateway::new(
+            stub_ctx_with_permissions(&mode, permissions),
+            vec![Arc::new(module)],
+        );
+        assert!(matches!(
+            gateway.lookup(Some(FAKE_MODULE), FAKE_METHOD),
+            ScriptName::Function
+        ));
+        let call = ScriptCall {
+            namespace: Some(FAKE_MODULE.to_owned()),
+            name: FAKE_METHOD.to_owned(),
+            args: Vec::new(),
+            kwargs: Map::new(),
+        };
+        let reply = smol::block_on(invoke(&gateway, call));
+        assert_eq!(verdict(&reply), expected, "{reply:?}");
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            usize::from(expected == Verdict::Ran)
+        );
+        assert_eq!(gateway.finish().len(), 1);
+    }
+
+    const HISTORY_READ: &str = "history.read";
+    const READ_CONTEXT: &str = "Reads from \"Release notes\" in the history of /work/other";
+
+    /// A prompt for a host call names the call as the snippet made it, then what the module adds.
+    #[test_case(json!({"ref": "abc/def", "limit": 5000}), Some(READ_CONTEXT), "history.read(ref=\"abc/def\", limit=5000)\nReads from \"Release notes\" in the history of /work/other" ; "arguments_and_context")]
+    #[test_case(json!({}), None, "history.read()" ; "no_arguments")]
+    fn a_prompt_names_the_call_and_its_context(
+        input: Value,
+        context: Option<&str>,
+        expected: &str,
+    ) {
+        assert_eq!(prompt_action(HISTORY_READ, &input, context), expected);
     }
 
     #[test]

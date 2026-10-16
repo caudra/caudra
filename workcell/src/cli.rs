@@ -25,11 +25,9 @@ pub enum ToolGroup {
     Files,
     Web,
     Shell,
-    // clap derives kebab-case value names, which would spell this `python-execution`. The group
-    // selector matches the tool it exposes, so it is named explicitly.
-    #[value(name = "python_execution")]
-    PythonExecution,
-    // Same reason as above: the selector matches the `source_code_*` tools it exposes.
+    Code,
+    // clap derives kebab-case value names, which would spell this `source-code`. The selector
+    // matches the `source_code_*` tools it exposes, so it is named explicitly.
     #[value(name = "source_code")]
     SourceCode,
     Transfer,
@@ -42,7 +40,7 @@ impl ToolGroup {
             Self::Files => "files",
             Self::Web => "web",
             Self::Shell => "shell",
-            Self::PythonExecution => "python_execution",
+            Self::Code => "code",
             Self::SourceCode => "source_code",
             Self::Transfer => "transfer",
         }
@@ -318,7 +316,7 @@ pub enum CliError {
     InvalidProxy,
     ProxyOptionRequiresWeb,
     ShellOptionRequiresShell,
-    CodeOptionRequiresPythonExecution,
+    CodeOptionRequiresCode,
     HttpOptionRequiresHttp,
     InvalidAllowedHost,
     TransferRequiresHttp,
@@ -340,7 +338,7 @@ impl fmt::Display for CliError {
         formatter.write_str(match self {
             Self::InvalidEnvironment => "Workcell environment configuration is invalid",
             Self::InvalidToolGroup => {
-                "WORKCELL_MCP_TOOL_GROUPS must contain only files, web, shell, python_execution, and transfer"
+                "WORKCELL_MCP_TOOL_GROUPS must contain only files, source_code, web, shell, code, and transfer"
             }
             Self::DuplicateToolGroup => "each tool group may be selected only once",
             Self::RootRequired => "files, shell, and transfer tools require a root directory",
@@ -360,8 +358,8 @@ impl fmt::Display for CliError {
             Self::ShellOptionRequiresShell => {
                 "--shell-policy, --yolo, --no-shell-output-filter, and --shell-env-ceiling require the shell tool group"
             }
-            Self::CodeOptionRequiresPythonExecution => {
-                "--code-worker, --code-worker-cache, and --no-code-type-check require the python_execution tool group"
+            Self::CodeOptionRequiresCode => {
+                "--code-worker, --code-worker-cache, and --no-code-type-check require the code tool group"
             }
             Self::HttpOptionRequiresHttp => "HTTP options require --transport http",
             Self::InvalidAllowedHost => {
@@ -435,7 +433,7 @@ impl RawOptions {
                     ToolGroup::SourceCode,
                     ToolGroup::Web,
                     ToolGroup::Shell,
-                    ToolGroup::PythonExecution,
+                    ToolGroup::Code,
                 ],
             }
         } else {
@@ -680,13 +678,13 @@ impl RawOptions {
         {
             return Err(CliError::ShellOptionRequiresShell);
         }
-        if !groups.contains(&ToolGroup::PythonExecution)
+        if !groups.contains(&ToolGroup::Code)
             && (explicit_code_options
                 || code_worker.is_some()
                 || code_worker_cache.is_some()
                 || !code_type_check)
         {
-            return Err(CliError::CodeOptionRequiresPythonExecution);
+            return Err(CliError::CodeOptionRequiresCode);
         }
         if transport == Transport::Stdio && (explicit_http_options || http_token_file.is_some()) {
             return Err(CliError::HttpOptionRequiresHttp);
@@ -848,7 +846,7 @@ fn parse_groups(value: &str) -> Result<Vec<ToolGroup>, CliError> {
             "files" => Ok(ToolGroup::Files),
             "web" => Ok(ToolGroup::Web),
             "shell" => Ok(ToolGroup::Shell),
-            "python_execution" => Ok(ToolGroup::PythonExecution),
+            "code" => Ok(ToolGroup::Code),
             "source_code" => Ok(ToolGroup::SourceCode),
             "transfer" => Ok(ToolGroup::Transfer),
             _ => Err(CliError::InvalidToolGroup),
@@ -882,7 +880,7 @@ mod tests {
             ToolGroup::Files,
             ToolGroup::Web,
             ToolGroup::Shell,
-            ToolGroup::PythonExecution,
+            ToolGroup::Code,
             ToolGroup::SourceCode,
             ToolGroup::Transfer,
         ] {
@@ -1479,13 +1477,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             without_code.resolve(&environment).unwrap_err(),
-            CliError::CodeOptionRequiresPythonExecution
+            CliError::CodeOptionRequiresCode
         );
 
         let with_code = RawOptions::try_parse_from([
             "workcell-mcp",
             "--tool-group",
-            "python_execution",
+            "code",
             "--code-worker-cache",
             "/private/cache",
         ])
@@ -1510,7 +1508,7 @@ mod tests {
 
         assert_eq!(
             raw.resolve(&environment).unwrap_err(),
-            CliError::CodeOptionRequiresPythonExecution
+            CliError::CodeOptionRequiresCode
         );
     }
 }

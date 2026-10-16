@@ -5,35 +5,53 @@
 # captured and replayed through the server. It is a development harness: it is
 # never published and is not part of the runtime image.
 #
+FROM rust:1.99.1-slim-bookworm AS rust
+
+RUN apt-get update \
+    && apt-get upgrade --yes --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM golang:1.27.2-bookworm AS go
+
+RUN apt-get update \
+    && apt-get upgrade --yes --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
 # The base matches the development host so a host-built `workcell-mcp` can be
 # mounted instead of rebuilt. Keep this in sync with the host distribution.
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
+    && apt-get upgrade --yes --no-install-recommends \
     && apt-get install -y --no-install-recommends \
+        build-essential \
         ca-certificates \
-        cargo \
         curl \
         docker-compose-v2 \
         docker.io \
         git \
-        golang-go \
         make \
         maven \
         python3 \
         python3-pip \
         python3-venv \
-        rustc \
         wget \
         xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# This distribution ships Node 18, but current ESLint, Jest, and Vitest releases
-# require Node 20 or newer. A pinned upstream tarball is used rather than a
-# remote setup script so the toolchain is reproducible and no third-party script
-# runs during the build.
-ARG NODE_VERSION=20.20.2
+ENV GOTOOLCHAIN=local \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:/usr/local/go/bin:${PATH}
+COPY --from=rust /usr/local/rustup /usr/local/rustup
+COPY --from=rust /usr/local/cargo /usr/local/cargo
+COPY --from=go /usr/local/go /usr/local/go
+RUN rustc --version && cargo --version && go version
+
+# This distribution's Node is too old for the current tools. A pinned upstream
+# tarball avoids running a remote setup script during the build.
+ARG NODE_VERSION=26.12.0
 RUN curl -fsSLo /tmp/node.tar.xz \
         "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
     && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
@@ -44,7 +62,8 @@ RUN curl -fsSLo /tmp/node.tar.xz \
 # Node and Python tools the corpus targets, installed once at image build time.
 # Cases that deliberately exercise a resolver, such as `npm install` or
 # `pip install`, still reach the network when they run.
-RUN npm install --global --no-fund --no-audit typescript eslint jest vitest \
+RUN npm install --global npm@12.2.0 \
+    && npm install --global --no-fund --no-audit typescript eslint jest vitest \
     && npm cache clean --force
 # `tqdm` and `rich` are the progress libraries the reduction is measured
 # against. `tqdm` does not consult isatty, so it redraws into a pipe and is the
@@ -57,7 +76,7 @@ RUN python3 -m pip install --break-system-packages --no-cache-dir pytest tqdm ri
 # for the same reason as Node above. Its report format differs from `cargo test`
 # in every respect except Cargo's build preamble, which is why the corpus gives
 # it a rule of its own and why that rule needs its own measured case.
-ARG NEXTEST_VERSION=0.9.143
+ARG NEXTEST_VERSION=0.9.148
 RUN curl -fsSLo /tmp/nextest.tar.gz "https://get.nexte.st/${NEXTEST_VERSION}/linux" \
     && tar -xzf /tmp/nextest.tar.gz -C /usr/local/bin cargo-nextest \
     && rm /tmp/nextest.tar.gz \

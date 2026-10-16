@@ -247,6 +247,8 @@ const MS_PER_MINUTE: i64 = 60_000;
 const MS_PER_SECOND: i64 = 1_000;
 const RETRY_GAP_MINUTES: i64 = 30;
 const PAST_NOTICE_MINUTES: i64 = 13 * 60;
+const PAST_STEP_NOTICE_MINUTES: i64 = 7 * 60;
+const STEP_FINISHED_MINUTES: i64 = 60;
 const SYNC_STEP: &str = "step 1 of 4, sync";
 const SURVEY_STEP: &str = "step 2 of 4, survey";
 const APPLY_STEP: &str = "step 3 of 4, apply";
@@ -265,6 +267,11 @@ const MODEL_WATCH_WAITED: &str = "model-watch has waited 12 hours to land on mai
 const MODEL_WATCH_NO_AUTOPILOT: &str =
     "model-watch cannot start today's run: autopilot is not engaged, run /autopilot.";
 const MODEL_WATCH_IMPOSSIBLE: &str = "model-watch stopped at the survey step of the 2026-10-05 run: the goal was impossible. Fix what blocked it, then arm model-watch again in /automations.";
+const MODEL_WATCH_SYNC_OPEN: &str = "model-watch's sync step of the 2026-10-05 run has had its goal open for over 6 hours, so it may be looping. Check the session: /goal-clear stops the step, and arming model-watch again retries it.";
+const MODEL_WATCH_SURVEY_OPEN: &str = "model-watch's survey step of the 2026-10-05 run has had its goal open for over 6 hours, so it may be looping. Check the session: /goal-clear stops the step, and arming model-watch again retries it.";
+const MODEL_WATCH_SYNC_STALLED: &str = "model-watch's sync step of the 2026-10-05 run stopped making progress, and its goal stays open. Check the session: a reply there lets it go on, /goal-clear stops the step, and arming model-watch again retries it.";
+const ALREADY_TOLD_STUCK: &str = "already told that this step is stuck";
+const SYNC_IN_PROGRESS: &str = "the sync step is in progress";
 const RUN_DONE: &str = "today's run is done";
 const BEFORE_START: &str = "before 7:00";
 const NO_AUTOPILOT: &str = "autopilot is not engaged, run /autopilot";
@@ -1808,7 +1815,10 @@ fn finish_step(watch: &mut Automation, verdict: GoalVerdict) -> Fired {
         .as_str()
         .expect(MUST_HOLD_GOAL)
         .to_owned();
-    watch.fire(&goal_finished(verdict, &condition), &at_work(60))
+    watch.fire(
+        &goal_finished(verdict, &condition),
+        &at_work(STEP_FINISHED_MINUTES),
+    )
 }
 
 /// A run that reached its landing step and asked to land.
@@ -1901,6 +1911,70 @@ fn model_watch_halts_on_a_failed_step_and_resumes_it_when_armed_again() {
     );
     assert_step(&watch.fire(&rearmed, &at_work(120)), SURVEY_STEP);
     assert_eq!(watch.state.get("halted"), None);
+}
+
+#[test]
+fn model_watch_says_once_per_step_when_its_goal_stays_open_for_hours() {
+    let mut watch = model_watch();
+    watch.fire(&tick(), &at_work(0));
+    let open = |watch: &Automation| {
+        pursuing(
+            tick(),
+            watch.state["current"].as_str().expect(MUST_HOLD_GOAL),
+        )
+    };
+    assert_eq!(
+        watch.fire(&open(&watch), &at_work(RETRY_GAP_MINUTES)),
+        (skipped(SYNC_IN_PROGRESS), Vec::new())
+    );
+    assert_eq!(
+        watch.fire(&open(&watch), &at_work(PAST_STEP_NOTICE_MINUTES)),
+        (FiringEnd::Completed, vec![notified(MODEL_WATCH_SYNC_OPEN)])
+    );
+    assert_eq!(
+        watch.fire(
+            &open(&watch),
+            &at_work(PAST_STEP_NOTICE_MINUTES + RETRY_GAP_MINUTES)
+        ),
+        (skipped(SYNC_IN_PROGRESS), Vec::new())
+    );
+    assert_step(&finish_step(&mut watch, GoalVerdict::Met), SURVEY_STEP);
+    assert_eq!(
+        watch.fire(
+            &open(&watch),
+            &at_work(STEP_FINISHED_MINUTES + PAST_STEP_NOTICE_MINUTES)
+        ),
+        (
+            FiringEnd::Completed,
+            vec![notified(MODEL_WATCH_SURVEY_OPEN)]
+        )
+    );
+}
+
+#[test]
+fn model_watch_says_once_when_its_step_stalls_and_carries_on_when_it_is_met() {
+    let mut watch = model_watch();
+    watch.fire(&tick(), &at_work(0));
+    assert_eq!(
+        finish_step(&mut watch, GoalVerdict::Stalled),
+        (
+            FiringEnd::Completed,
+            vec![notified(MODEL_WATCH_SYNC_STALLED)]
+        )
+    );
+    assert_eq!(
+        finish_step(&mut watch, GoalVerdict::Stalled),
+        (skipped(ALREADY_TOLD_STUCK), Vec::new())
+    );
+    let open = pursuing(
+        tick(),
+        watch.state["current"].as_str().expect(MUST_HOLD_GOAL),
+    );
+    assert_eq!(
+        watch.fire(&open, &at_work(PAST_STEP_NOTICE_MINUTES)),
+        (skipped(SYNC_IN_PROGRESS), Vec::new())
+    );
+    assert_step(&finish_step(&mut watch, GoalVerdict::Met), SURVEY_STEP);
 }
 
 #[test]

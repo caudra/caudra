@@ -1034,6 +1034,35 @@ async fn rust_index_preserves_compact_skeleton_and_semantic_ranges() {
 }
 
 #[tokio::test]
+async fn php_modern_syntax_indexes_methods_without_parse_recovery() {
+    const FILE: &str = "record.php";
+    const SOURCE: &str = "<?php\nclass Record {\n    public function __construct(public private(set) string $name) {}\n    public function copy() { return clone($this, ['name' => apply(?, 1)]); }\n}\n";
+    let root = tempdir().unwrap();
+    fs::write(root.path().join(FILE), SOURCE).unwrap();
+    let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+    let output = group
+        .index(IndexInput { path: FILE.into() }, &CancellationToken::new())
+        .await
+        .unwrap();
+    let IndexOutput::File {
+        language,
+        skeleton,
+        parse_error,
+        truncated,
+        ..
+    } = output
+    else {
+        panic!("expected file output")
+    };
+    assert_eq!(language, "php");
+    assert!(!parse_error, "{skeleton}");
+    assert!(!truncated);
+    for name in ["Record", "__construct", "copy"] {
+        assert!(skeleton.contains(name), "{skeleton}");
+    }
+}
+
+#[tokio::test]
 async fn html_and_all_bazel_modes_preserve_exact_inferred_metadata() {
     let root = tempdir().expect("root");
     for (path, source) in [

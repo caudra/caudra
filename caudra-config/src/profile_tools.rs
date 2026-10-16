@@ -27,7 +27,7 @@ pub const TOOL_POLICY_GROUPS: &[(ToolPolicyGroup, &[&str])] = &[
     ),
     (
         ToolPolicyGroup::Execution,
-        &["shell", "python_execution", "execution_environment"],
+        &["shell", "execution_environment"],
     ),
     (
         ToolPolicyGroup::Delegation,

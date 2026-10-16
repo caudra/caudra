@@ -109,7 +109,7 @@ Each trigger is a map with a `kind`. Durations are strings such as `"30s"`, `"2m
 | `armed` | none | the automation is armed: at launch, on resume, when the user arms it again, and when the pause latch clears |
 | `idle` | `after`: default `"0s"`, at most `"24h"` | the session settles after a busy period and stays settled for `after` |
 | `needs_input` | `after`: as for `idle`. `inputs`: default `["permission", "question", "plan", "auth", "plugin", "autopilot"]` | the session has waited on a person for one of `inputs` for `after` |
-| `goal_finished` | `verdicts`: default `["met", "impossible", "cleared"]` | the session goal ends with one of `verdicts` |
+| `goal_finished` | `verdicts`: default `["met", "impossible", "cleared"]`, and `"stalled"` may join them | the session goal ends with one of `verdicts`, or for `stalled`, the run stops on a goal that stays active |
 | `message_received` | `audiences`, `topics`, `senders`, `scripts`, `admissions`, `from_automations`, and `consume`, under Messaging below | a message from another session or a script reaches this session |
 | `work_finished` | `groups`: every group by default. `states`: default `["completed", "failed", "cancelled"]`, and `"paused"` may join them | an item of consumer-group work that this session published reaches one of `states` |
 | `workflow_finished` | `workflows`: every workflow by default. `statuses`: default `["completed", "failed", "cancelled", "interrupted"]` | a workflow run in this session reaches one of `statuses`, under Workflows below |
@@ -117,7 +117,7 @@ Each trigger is a map with a `kind`. Durations are strings such as `"30s"`, `"2m
 
 - `idle` and `needs_input` fire once per transition. The opposite edge cancels a pending `after` timer, so `after: "2m"` waits for two quiet minutes.
 - The `needs_input` kinds are a tool `permission` prompt, the `question` form, a ready `plan` awaiting approval, an `auth` prompt, a `plugin` float, and `autopilot`: a permission prompt, a question, or a plan that autopilot left to the user. While autopilot is still deciding a prompt, the session does not wait on a person, and nothing fires. Add `"messages"` to `inputs` to fire while messages from other sessions wait for the user's review.
-- `goal_finished` with `cleared` means an error cleared the goal. A goal that runs out of continuations or reaches the turn limit stays active and does not fire.
+- `goal_finished` with `cleared` means an error cleared the goal. With `stalled`, the run stopped because the goal's last turns made no progress or it used its continuations: the goal stays active, `event.session.goal` still shows it, and a later `met` or `impossible` may follow once someone replies. A goal that reaches the turn limit stays active and does not fire.
 - A schedule takes exactly one of `every` and `at`. `every` is a period of at least `"1m"`, counted from the moment the automation was armed. `at` is `"HH:MM"` on a 24-hour clock in `meta.timezone`, and `weekdays`, allowed only with `at`, limits it to days such as `["mon", "tue", "wed", "thu", "fri"]`.
 - Missed occurrences, for example while the session was closed, collapse into the latest one. Within a minute of its time it fires as usual. Later than that, `catch_up: "once"` (the default) fires it late, and `catch_up: "skip"` drops it.
 
@@ -300,9 +300,9 @@ The fields of each trigger follow. Untrusted ones are marked U.
 
 `goal_finished`:
 
-- `verdict`: `"met"`, `"impossible"`, or `"cleared"`
+- `verdict`: `"met"`, `"impossible"`, `"cleared"`, or `"stalled"`
 - `condition`: the goal's condition
-- `reason` U: the evaluator's reason, or for `cleared`, the error
+- `reason` U: the evaluator's reason, its last one for `stalled`, or for `cleared`, the error
 - `evaluations`, `duration_s`, and `cost` (USD, or `()`)
 - `autopilot`: `true` when the goal was the one autopilot set. Autopilot ends with its goal, so `event.session.autopilot` may already be `()`.
 

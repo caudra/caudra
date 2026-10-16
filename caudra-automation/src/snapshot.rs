@@ -174,6 +174,8 @@ pub enum SettleBlocker {
     GroupWork,
     MailboxWake,
     GoalCheckin,
+    /// The goal waits on an outside change and is checked again later.
+    GoalWaiting,
     /// Agent events wait to be handled.
     AgentEvents,
 }

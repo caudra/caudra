@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use caudra_agent::code::gateway;
+use caudra_agent::code::output::{CodeOutcome, CodeOutput};
+use caudra_agent::code::runner::install;
 use caudra_agent::mcp::McpSession;
-use caudra_agent::mcp::code::gateway;
-use caudra_agent::mcp::code::output::{McpCodeOutcome, McpCodeOutput};
-use caudra_agent::mcp::code::runner::install;
 use caudra_agent::mcp::code::view::ServerState;
 use caudra_agent::mcp::config::{
     McpConfig, McpConfigSource, RawHttpFields, RawServerConfig, RawStdioFields, RawTransport,
@@ -35,8 +35,7 @@ pub const EXECUTOR: &str = "executor";
 pub const EXECUTOR_IMAGE: &str = "caudra-mcp-it/executor";
 pub const HOME_ASSISTANT: &str = "home-assistant";
 pub const PLAN_FILE: &str = "/tmp/caudra-mcp-it-plan.md";
-pub const PLAN_REFUSAL: &str =
-    "plan mode allows only the MCP tools a recognised server marks read-only";
+pub const PLAN_REFUSAL: &str = "plan mode allows only calls that change nothing, such as the MCP tools a recognised server marks read-only";
 
 const WORKER_ENV: &str = "WORKCELL_MCP_CODE_WORKER";
 const HOME_ASSISTANT_URL_ENV: &str = "CAUDRA_IT_HOME_ASSISTANT_URL";
@@ -91,7 +90,7 @@ pub fn home_assistant() -> Server {
     }
 }
 
-/// Connected servers and one agent's `mcp` session on them, with a permission prompt the test
+/// Connected servers and one agent's `code` session on them, with a permission prompt the test
 /// answers.
 pub struct Servers {
     session: McpSession,
@@ -126,7 +125,7 @@ impl Servers {
         };
         let handle = start_with_config(config).expect("servers are configured");
         smol::block_on(handle.ready());
-        let session = McpSession::new(handle, &[]);
+        let session = McpSession::new(handle);
         for server in session.servers() {
             assert_eq!(
                 server.state,
@@ -145,6 +144,7 @@ impl Servers {
         let (tx, events) = flume::unbounded();
         let mut ctx = stub_ctx_asking(&mode, Arc::clone(&permissions), &EventSender::new(tx, 0));
         ctx.tool_use_id = Some(PARENT_CALL.to_owned());
+        ctx.mcp = Some(session.clone());
         Self {
             session,
             permissions,
@@ -154,17 +154,12 @@ impl Servers {
         }
     }
 
-    pub fn run(&self, code: &str) -> McpCodeOutput {
+    pub fn run(&self, code: &str) -> CodeOutput {
         self.run_answering(code, &[]).0
     }
 
-    pub fn reset_and_run(&self, code: &str) -> McpCodeOutput {
-        smol::block_on(gateway::run(
-            &self.session,
-            &self.ctx,
-            code.to_owned(),
-            true,
-        ))
+    pub fn reset_and_run(&self, code: &str) -> CodeOutput {
+        smol::block_on(gateway::run(&self.ctx, code.to_owned(), true))
     }
 
     /// Runs `code`, giving each permission prompt the next of `answers`, and returns what it
@@ -173,10 +168,10 @@ impl Servers {
         &self,
         code: &str,
         answers: &[PermissionAnswer],
-    ) -> (McpCodeOutput, Vec<PermissionRequest>) {
+    ) -> (CodeOutput, Vec<PermissionRequest>) {
         let mut answers = answers.iter().cloned();
         let mut asked = Vec::new();
-        let run = gateway::run(&self.session, &self.ctx, code.to_owned(), false);
+        let run = gateway::run(&self.ctx, code.to_owned(), false);
         let answering = async {
             loop {
                 let envelope = self.events.recv_async().await.expect("events stay open");
@@ -208,10 +203,10 @@ pub fn whole_tool_for_the_session() -> PermissionAnswer {
 }
 
 /// The snippet's result, once it ran to the end.
-pub fn completed(output: &McpCodeOutput) -> &str {
+pub fn completed(output: &CodeOutput) -> &str {
     assert_eq!(
         output.outcome,
-        McpCodeOutcome::Completed,
+        CodeOutcome::Completed,
         "{}",
         output.model_text()
     );

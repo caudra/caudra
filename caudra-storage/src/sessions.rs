@@ -44,6 +44,10 @@ pub mod sweep;
 #[path = "sessions/types.rs"]
 mod types;
 
+pub(crate) use database::{
+    AFTER_SEPARATOR, decompress_payload, deserialize_json, from_i64, from_i64_usize,
+    history_uuid_timestamp, id_from_row, to_i64,
+};
 pub use database::{
     CheckpointResult, HistoryReadLimits, HistoryReadReport, HistoryRecord,
     HistorySessionReadReport, LedgerEntry, RuntimeRetry, SESSIONS_DB_FILE, SESSIONS_DB_LOCK_FILE,
@@ -51,7 +55,6 @@ pub use database::{
     ToolLedgerEntry, TrimReport, UsageBucket, WAL_RETENTION_LIMIT_BYTES, WORKSPACE_CHANGES_DIR,
     eager_load_limit, set_eager_load_limit,
 };
-pub(crate) use database::{deserialize_json, from_i64, from_i64_usize, id_from_row, to_i64};
 pub use lease::SessionLease;
 pub use types::PermissionMode;
 
@@ -338,6 +341,19 @@ pub struct StoredActiveGoal {
     pub last_verdict: Option<StoredGoalVerdict>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_reason: Option<String>,
+    /// The goal's wait on a change outside the session, `None` while it is
+    /// not waiting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<StoredGoalWait>,
+}
+
+/// A goal's wait on a change outside the session: its `attempt`th in a row,
+/// over at `until_ms`, Unix milliseconds. Wall-clock time, so a session closed
+/// past it checks its goal as soon as it is resumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredGoalWait {
+    pub attempt: u32,
+    pub until_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

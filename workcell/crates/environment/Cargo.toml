@@ -13,7 +13,7 @@ mcp = ["dep:rmcp"]
 
 [dependencies]
 rmcp = { workspace = true, optional = true }
-rustix-038.workspace = true
+rustix = { workspace = true, features = ["fs", "std"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = { workspace = true, default-features = true }

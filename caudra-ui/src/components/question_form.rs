@@ -8,6 +8,7 @@
 //! derived from that plus the questions, so a resize or a theme switch can
 //! never disagree with what will be submitted.
 
+use std::mem;
 use std::ops::Range;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -20,7 +21,9 @@ use url::Url;
 
 use caudra_agent::mcp::elicitation::{REQUIRED, describe_answer, validate_answer};
 use caudra_agent::permissions::AutopilotNote;
-use caudra_agent::types::{AskedQuestion, QuestionDelivery, QuestionEvent, QuestionSource};
+use caudra_agent::types::{
+    AskedQuestion, QuestionDelivery, QuestionEvent, QuestionReply, QuestionSource,
+};
 use caudra_grab::grab_scope;
 use caudra_workbench::buffer::Cursor;
 use caudra_workbench::render::Row;
@@ -60,6 +63,9 @@ const REVIEW_HEADING: &str = " Review your answers:";
 const DESC_INDENT: &str = "    ";
 const ANSWER_ARROW: &str = "    → ";
 const CUSTOM_PROMPT: &str = "  ❯ ";
+/// As wide as [`CUSTOM_PROMPT`], so both boxes wrap at the same column.
+const NOTE_PROMPT: &str = "  ✎ ";
+const NOTE_HEADING: &str = " Note for the agent";
 /// Two borders, the blank row above the hint, and the hint row.
 const CHROME_ROWS: u16 = 4;
 const MAX_HEIGHT_PERCENT: u16 = 75;
@@ -68,7 +74,9 @@ const UNCLIPPED: usize = usize::MAX;
 const LINE_BREAK: &str = "\n";
 const ASK_HINT: Hint = Hint::bind(key::QUESTION_ASK_BTW, "Ask /btw");
 const COMPACT_ASK_HINT: Hint = Hint::bind(key::QUESTION_ASK_BTW, "Ask");
-const ASK_HINT_INDEX: usize = 0;
+/// Every bar but consent's opens on what `Enter` does, then Ask.
+const ASK_HINT_INDEX: usize = 1;
+const NOTE_HINT: Hint = Hint::bind(key::QUESTION_NOTE, "note");
 const DECLINE_HINT: Hint = Hint::bind(key::QUESTION_DECLINE, "decline");
 const DEFER_HINT: Hint = Hint::bind(key::QUESTION_LATER, "later");
 const NEXT_HINT: Hint = Hint::bind(key::QUESTION_LATER, "next");
@@ -86,8 +94,16 @@ const SHIFT_ENTER: Bind = Bind {
 };
 
 const EDITING_HINTS: [Hint; 5] = [
-    ASK_HINT,
     Hint::bind(key::ENTER, "submit"),
+    ASK_HINT,
+    Hint::bind(SHIFT_ENTER, "newline"),
+    Hint::bind(key::ESC, "back"),
+    Hint::bind(key::QUIT, "cancel"),
+];
+/// `Enter` and `Esc` both leave the note box, and neither loses the note.
+const NOTE_HINTS: [Hint; 5] = [
+    Hint::bind(key::ENTER, "done"),
+    ASK_HINT,
     Hint::bind(SHIFT_ENTER, "newline"),
     Hint::bind(key::ESC, "back"),
     Hint::bind(key::QUIT, "cancel"),
@@ -95,29 +111,29 @@ const EDITING_HINTS: [Hint; 5] = [
 /// A server's text or number field has no list to go back to, so `Esc`
 /// dismisses it like every other question.
 const TYPED_HINTS: [Hint; 5] = [
-    ASK_HINT,
     Hint::bind(key::ENTER, "next"),
+    ASK_HINT,
     Hint::bind(key::SHIFT_TAB, "back"),
     Hint::bind(key::ESC, "dismiss"),
     Hint::bind(key::QUIT, "cancel"),
 ];
 const CONFIRMING_HINTS: [Hint; 5] = [
-    ASK_HINT,
     Hint::bind(key::ENTER, "submit"),
+    ASK_HINT,
     Hint::bind(key::SHIFT_TAB, "back"),
     Hint::bind(key::ESC, "dismiss"),
     Hint::bind(key::QUIT, "cancel"),
 ];
 const MULTI_SELECT_HINTS: [Hint; 5] = [
-    ASK_HINT,
     Hint::bind(key::ENTER, "toggle"),
+    ASK_HINT,
     Hint::bind(key::TAB, "next"),
     Hint::bind(key::ESC, "dismiss"),
     Hint::bind(key::QUIT, "cancel"),
 ];
 const SINGLE_SELECT_HINTS: [Hint; 5] = [
-    ASK_HINT,
     Hint::bind(key::ENTER, "submit"),
+    ASK_HINT,
     Hint::bind(key::TAB, "next"),
     Hint::bind(key::ESC, "dismiss"),
     Hint::bind(key::QUIT, "cancel"),
@@ -171,6 +187,12 @@ pub struct QuestionForm {
     cursor: usize,
     answers: Vec<Vec<String>>,
     custom: TextField,
+    /// What the user wrote for the agent about the whole form, sent with the
+    /// answers or with a dismissal.
+    note: TextField,
+    /// The note box has the keys. It sits over `mode`, which is where leaving
+    /// the box returns.
+    editing_note: bool,
     scroll: u16,
     /// Whether the viewport is tracking the cursor. A keystroke turns it back
     /// on, the wheel turns it off: a reader looking around a long option list
@@ -219,8 +241,17 @@ enum FormTarget {
     ReviewRow(usize),
     /// A line of the custom-answer box, which takes the cursor to the cell.
     Editor(usize),
+    /// A line of the note box, which opens it with the cursor at the cell.
+    Note(usize),
     /// A hint in the bottom bar, by its position in `hint_pairs`.
     Hint(usize),
+}
+
+impl FormTarget {
+    /// A line of a text box, which a press types into rather than sweeps.
+    fn is_text(self) -> bool {
+        matches!(self, Self::Editor(_) | Self::Note(_))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -275,6 +306,8 @@ impl QuestionForm {
             cursor: 0,
             answers: Vec::new(),
             custom: TextField::new(FieldKind::Block),
+            note: TextField::new(FieldKind::Block),
+            editing_note: false,
             scroll: 0,
             follow_cursor: true,
             hover: None,
@@ -347,6 +380,8 @@ impl QuestionForm {
         self.source = source;
         self.mode = Mode::Selecting;
         self.custom.clear();
+        self.note.clear();
+        self.editing_note = false;
         self.scroll = 0;
         self.follow_cursor = true;
         self.row_hits.clear();
@@ -362,7 +397,22 @@ impl QuestionForm {
     }
 
     pub(crate) fn text_input_active(&self) -> bool {
-        self.is_open() && self.mode == Mode::EditingCustom
+        self.is_open() && (self.editing_note || self.mode == Mode::EditingCustom)
+    }
+
+    /// What goes down the answer channel: the label lists, or `None` for a
+    /// dismissal, with the note the user wrote for the whole form.
+    pub(crate) fn reply(&self, answers: Option<Vec<Vec<String>>>) -> String {
+        QuestionReply {
+            answers,
+            note: self.note_text(),
+        }
+        .encode()
+    }
+
+    /// The note as it will be sent, empty when there is none.
+    pub(crate) fn note_text(&self) -> String {
+        self.note.text().trim().to_owned()
     }
 
     pub(crate) fn clarification_context(&self) -> String {
@@ -415,6 +465,8 @@ impl QuestionForm {
         self.source = None;
         self.error = None;
         self.answers.clear();
+        self.note.clear();
+        self.editing_note = false;
         self.row_hits.clear();
         self.mouse_down = None;
         self.hover = None;
@@ -448,8 +500,15 @@ impl QuestionForm {
             return QuestionFormAction::Later;
         }
         self.follow_cursor = true;
+        if key::QUESTION_NOTE.matches(key) && self.offers_custom() {
+            self.editing_note = !self.editing_note;
+            return QuestionFormAction::Consumed;
+        }
         if self.is_consent() {
             return self.key_consent(key);
+        }
+        if self.editing_note {
+            return self.key_note(key);
         }
         match self.mode {
             Mode::Selecting => self.key_selecting(key),
@@ -463,14 +522,17 @@ impl QuestionForm {
     }
 
     pub fn handle_text(&mut self, text: &str, paste: bool) -> bool {
-        if self.mode != Mode::EditingCustom {
+        if self.editing_note {
+            self.note.handle_text(text, paste);
+        } else if self.mode == Mode::EditingCustom {
+            self.error = None;
+            self.custom.handle_text(text, paste);
+        } else {
             return false;
         }
         if !paste {
             self.follow_cursor = true;
         }
-        self.error = None;
-        self.custom.handle_text(text, paste);
         true
     }
 
@@ -657,24 +719,27 @@ impl QuestionForm {
                 {
                     self.aim(hit, event);
                 }
-                if !matches!(self.mouse_down, Some(FormTarget::Editor(_)))
+                if !self.mouse_down.is_some_and(FormTarget::is_text)
                     && self.body_area.contains(position)
                 {
                     self.sweep = Some(Sweep::at(self.position_at(position)));
                     self.sweeping = true;
                     self.custom.clear_selection();
+                    self.note.clear_selection();
                 }
                 self.area
                     .contains(position)
                     .then_some(QuestionFormAction::Consumed)
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                if matches!(self.mouse_down, Some(FormTarget::Editor(_))) {
+                if let Some(pressed) = self.mouse_down
+                    && pressed.is_text()
+                {
                     if let Some(hit) = hit
-                        && let FormTarget::Editor(line) = hit.target
+                        && mem::discriminant(&hit.target) == mem::discriminant(&pressed)
+                        && let Some((field, prompt, line)) = self.text_box(hit.target)
                     {
-                        self.custom
-                            .set_cursor(editor_cursor(line, hit.area, event), true);
+                        field.set_cursor(editor_cursor(prompt, line, hit.area, event), true);
                     }
                     return Some(QuestionFormAction::Consumed);
                 }
@@ -703,7 +768,7 @@ impl QuestionForm {
             // A press and release on the same target is the click; anything
             // else is a drag that only moved the cursor.
             MouseEventKind::Up(MouseButton::Left) => {
-                let swept = std::mem::take(&mut self.sweeping);
+                let swept = mem::take(&mut self.sweeping);
                 if swept {
                     if let Some(text) = self
                         .sweep
@@ -717,8 +782,8 @@ impl QuestionForm {
                 let Some(pressed) = self.mouse_down.take() else {
                     return swept.then_some(QuestionFormAction::Consumed);
                 };
-                if let FormTarget::Editor(_) = pressed
-                    && let Some(text) = self.custom.selected_text()
+                if let Some((field, _, _)) = self.text_box(pressed)
+                    && let Some(text) = field.selected_text()
                 {
                     return Some(QuestionFormAction::CopySelection(text));
                 }
@@ -737,15 +802,27 @@ impl QuestionForm {
 
     /// What a press does before the release decides whether it was a click:
     /// move whatever cursor the target owns, so the form reads as pressed.
+    /// A press on the note opens its box, and one anywhere else on the form
+    /// leaves it; a hint stands for its key, which decides for itself.
     fn aim(&mut self, hit: RowHit, event: MouseEvent) {
         self.follow_cursor = true;
-        match hit.target {
-            FormTarget::Option(index) => self.cursor = index,
-            FormTarget::Editor(line) => {
-                self.custom
-                    .set_cursor(editor_cursor(line, hit.area, event), false);
-            }
-            _ => {}
+        if !matches!(hit.target, FormTarget::Hint(_)) {
+            self.editing_note = matches!(hit.target, FormTarget::Note(_));
+        }
+        if let FormTarget::Option(index) = hit.target {
+            self.cursor = index;
+        }
+        if let Some((field, prompt, line)) = self.text_box(hit.target) {
+            field.set_cursor(editor_cursor(prompt, line, hit.area, event), false);
+        }
+    }
+
+    /// The box a line of text belongs to, with its prompt and the line.
+    fn text_box(&mut self, target: FormTarget) -> Option<(&mut TextField, &'static str, usize)> {
+        match target {
+            FormTarget::Editor(line) => Some((&mut self.custom, CUSTOM_PROMPT, line)),
+            FormTarget::Note(line) => Some((&mut self.note, NOTE_PROMPT, line)),
+            _ => None,
         }
     }
 
@@ -769,7 +846,7 @@ impl QuestionForm {
             }
             // The press already placed the cursor; a release must not move it
             // again or a click that drifted a cell would land somewhere else.
-            FormTarget::Editor(_) => QuestionFormAction::Consumed,
+            FormTarget::Editor(_) | FormTarget::Note(_) => QuestionFormAction::Consumed,
             FormTarget::Hint(index) => self.activate_hint(index),
         }
     }
@@ -835,8 +912,9 @@ impl QuestionForm {
         }
     }
 
-    /// Only the agent's own questions take words of the user's choosing: a
-    /// server checks every answer against the choices it listed.
+    /// Only the agent's own questions take words of the user's choosing, as an
+    /// answer or as a note: a server checks every answer against the choices
+    /// it listed, and has nowhere to put a note.
     fn offers_custom(&self) -> bool {
         self.source.is_none()
     }
@@ -1009,15 +1087,8 @@ impl QuestionForm {
                     self.go_to(self.tab - 1);
                 }
             }
-            // A trailing backslash is the plain-terminal way to ask for a
-            // newline where the modifier combination never arrives. The break
-            // is typed over the backslash, so one undo brings it back.
             KeyCode::Enter if submit && ends_with_backslash(&self.custom) => {
-                let caret = self.custom.cursor();
-                self.custom
-                    .set_cursor(Cursor::new(caret.line, caret.col - 1), false);
-                self.custom.set_cursor(caret, true);
-                self.custom.insert_text(LINE_BREAK);
+                break_line(&mut self.custom);
             }
             KeyCode::Enter if submit => return self.commit_custom(),
             KeyCode::Esc => self.mode = Mode::Selecting,
@@ -1026,16 +1097,23 @@ impl QuestionForm {
                 if outcome.changed() {
                     self.error = None;
                 }
-                match outcome {
-                    TextKey::Copy(text) | TextKey::Cut(text) => {
-                        return QuestionFormAction::Copy(text);
-                    }
-                    TextKey::Ignored if key::QUIT.matches(key) => {
-                        return QuestionFormAction::Cancel;
-                    }
-                    _ => {}
-                }
+                return box_action(outcome, key);
             }
+        }
+        QuestionFormAction::Consumed
+    }
+
+    /// The note box sees every key before the form, as the answer box does.
+    /// `Enter` and `Esc` both leave it with the note as typed.
+    fn key_note(&mut self, key: KeyEvent) -> QuestionFormAction {
+        let submit = key.code == KeyCode::Enter && !is_newline_key(key);
+        match key.code {
+            KeyCode::Enter if submit && ends_with_backslash(&self.note) => {
+                break_line(&mut self.note);
+            }
+            KeyCode::Enter if submit => self.editing_note = false,
+            KeyCode::Esc => self.editing_note = false,
+            _ => return box_action(self.note.handle_key(key), key),
         }
         QuestionFormAction::Consumed
     }
@@ -1127,7 +1205,7 @@ impl QuestionForm {
             self.error = Some(problem);
             return QuestionFormAction::Consumed;
         }
-        QuestionFormAction::Submit(std::mem::take(&mut self.answers))
+        QuestionFormAction::Submit(mem::take(&mut self.answers))
     }
 
     /// The hint bar's contents, which a click on one of them turns back into
@@ -1135,6 +1213,7 @@ impl QuestionForm {
     fn hint_pairs(&self) -> Vec<Hint> {
         let pairs: &[Hint] = match self.mode {
             _ if self.is_consent() => &CONSENT_HINTS,
+            _ if self.editing_note => &NOTE_HINTS,
             Mode::EditingCustom if self.is_typed() => &TYPED_HINTS,
             Mode::EditingCustom => &EDITING_HINTS,
             Mode::Confirming => &CONFIRMING_HINTS,
@@ -1142,6 +1221,9 @@ impl QuestionForm {
             Mode::Selecting => &SINGLE_SELECT_HINTS,
         };
         let mut hints = pairs.to_vec();
+        if self.offers_custom() && !self.editing_note {
+            hints.insert(ASK_HINT_INDEX + 1, NOTE_HINT);
+        }
         if self.source.is_some() {
             hints.insert(hints.len() - CLOSING_HINTS, DECLINE_HINT);
         }
@@ -1165,7 +1247,9 @@ impl QuestionForm {
     fn visible_hints(&self, width: u16) -> Vec<Hint> {
         let mut hints = self.hint_pairs();
         let area = Rect::new(0, 0, width, 1);
-        if !self.is_consent() && super::hint_hits(&hints[..1], area).is_empty() {
+        if !self.is_consent()
+            && super::hint_hits(&hints[..=ASK_HINT_INDEX], area).len() <= ASK_HINT_INDEX
+        {
             hints[ASK_HINT_INDEX] = COMPACT_ASK_HINT;
         }
         hints.truncate(super::hint_hits(&hints, area).len());
@@ -1183,15 +1267,16 @@ impl QuestionForm {
     fn body(&self, width: u16, focused: bool) -> Body {
         match self.mode {
             _ if self.is_consent() => self.consent_body(),
-            Mode::Confirming => self.review_body(width),
+            Mode::Confirming => self.review_body(width, focused),
             _ => self.selecting_body(width, focused),
         }
     }
 
-    /// What the viewport has to keep on screen. The review draws neither, so
-    /// it falls back to the top of the body.
+    /// What the viewport has to keep on screen. The review draws neither an
+    /// option nor the answer box, so it falls back to the top of the body.
     fn focus_target(&self) -> FormTarget {
         match self.mode {
+            _ if self.editing_note => FormTarget::Note(self.note.cursor().line),
             Mode::EditingCustom => FormTarget::Editor(0),
             _ => FormTarget::Option(self.cursor),
         }
@@ -1267,7 +1352,8 @@ impl QuestionForm {
             body.push(FormTarget::Option(index), self.option_lines(index, width));
         }
         if self.mode == Mode::EditingCustom {
-            for (index, line) in self.custom_editor_lines(focused).into_iter().enumerate() {
+            let lines = box_lines(&self.custom, CUSTOM_PROMPT, focused && !self.editing_note);
+            for (index, line) in lines.into_iter().enumerate() {
                 body.push(FormTarget::Editor(index), vec![line]);
             }
         } else if self.offers_custom() {
@@ -1277,7 +1363,25 @@ impl QuestionForm {
         if let Some(error) = &self.error {
             body.lines.push(marked_line(ERROR_MARK, error, t.error));
         }
+        self.push_note(&mut body, focused);
         body
+    }
+
+    /// The note under the form, on every tab and in the review, once it has
+    /// words in it or its box is open.
+    fn push_note(&self, body: &mut Body, focused: bool) {
+        let has_note = self.note.lines().iter().any(|line| !line.trim().is_empty());
+        if !self.editing_note && !has_note {
+            return;
+        }
+        body.lines.extend([
+            Line::default(),
+            Line::styled(NOTE_HEADING, theme::current().panel_title),
+        ]);
+        let lines = box_lines(&self.note, NOTE_PROMPT, focused && self.editing_note);
+        for (index, line) in lines.into_iter().enumerate() {
+            body.push(FormTarget::Note(index), vec![line]);
+        }
     }
 
     /// A request that asks only for consent: the server's message, the
@@ -1372,30 +1476,7 @@ impl QuestionForm {
         Line::from(spans)
     }
 
-    /// The answer box, caret and all. A `TextField` always keeps a line, so
-    /// an emptied box still draws its prompt row rather than losing a line as
-    /// the user clears what they typed.
-    fn custom_editor_lines(&self, focused: bool) -> Vec<Line<'static>> {
-        let t = theme::current();
-        let styles = field_styles(Style::default());
-        let indent = " ".repeat(CUSTOM_PROMPT.chars().count());
-        (0..self.custom.lines().len())
-            .map(|index| {
-                let mut spans = vec![Span::styled(
-                    if index == 0 {
-                        CUSTOM_PROMPT.to_owned()
-                    } else {
-                        indent.clone()
-                    },
-                    t.active,
-                )];
-                spans.extend(caret_spans(&self.custom, index, &styles, focused));
-                Line::from(spans)
-            })
-            .collect()
-    }
-
-    fn review_body(&self, width: u16) -> Body {
+    fn review_body(&self, width: u16, focused: bool) -> Body {
         let t = theme::current();
         let mut body = self.noted_body();
         body.lines.extend([
@@ -1428,8 +1509,46 @@ impl QuestionForm {
             }
             body.push(FormTarget::ReviewRow(index), lines);
         }
+        self.push_note(&mut body, focused);
         body
     }
+}
+
+/// A text box, caret and all. A `TextField` always keeps a line, so an
+/// emptied box still draws its prompt row rather than losing a line as the
+/// user clears what they typed.
+fn box_lines(field: &TextField, prompt: &str, focused: bool) -> Vec<Line<'static>> {
+    let t = theme::current();
+    let styles = field_styles(Style::default());
+    let indent = " ".repeat(prompt.chars().count());
+    (0..field.lines().len())
+        .map(|index| {
+            let lead = if index == 0 { prompt } else { &indent };
+            let mut spans = vec![Span::styled(lead.to_owned(), t.active)];
+            spans.extend(caret_spans(field, index, &styles, focused));
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// What a key the box handled means for the form: copied or cut text for the
+/// clipboard, and `Ctrl+C` with nothing to copy, which cancels.
+fn box_action(outcome: TextKey, key: KeyEvent) -> QuestionFormAction {
+    match outcome {
+        TextKey::Copy(text) | TextKey::Cut(text) => QuestionFormAction::Copy(text),
+        TextKey::Ignored if key::QUIT.matches(key) => QuestionFormAction::Cancel,
+        _ => QuestionFormAction::Consumed,
+    }
+}
+
+/// Types a line break over the backslash before the caret, the plain-terminal
+/// way to ask for one where the modifier combination never arrives. One undo
+/// brings the backslash back.
+fn break_line(field: &mut TextField) {
+    let caret = field.cursor();
+    field.set_cursor(Cursor::new(caret.line, caret.col - 1), false);
+    field.set_cursor(caret, true);
+    field.insert_text(LINE_BREAK);
 }
 
 /// A trailing backslash is the plain-terminal way to ask for a newline where
@@ -1443,15 +1562,15 @@ fn ends_with_backslash(field: &TextField) -> bool {
         == Some('\\')
 }
 
-/// Where a pointer at `event` lands in box line `line`, drawn over `area`.
-/// The prefix is part of the line, so it occupies the first cells of the
-/// wrapped content rather than a gutter beside it.
-fn editor_cursor(line: usize, area: Rect, event: MouseEvent) -> Cursor {
+/// Where a pointer at `event` lands in box line `line`, drawn over `area`
+/// after `prompt`. The prompt is part of the line, so it occupies the first
+/// cells of the wrapped content rather than a gutter beside it.
+fn editor_cursor(prompt: &str, line: usize, area: Rect, event: MouseEvent) -> Cursor {
     let width = usize::from(area.width.max(1));
     let wrap_row = usize::from(event.row.saturating_sub(area.y));
     let column = usize::from(event.column.saturating_sub(area.x));
     let cell = wrap_row * width + column;
-    Cursor::new(line, cell.saturating_sub(CUSTOM_PROMPT.chars().count()))
+    Cursor::new(line, cell.saturating_sub(prompt.chars().count()))
 }
 
 /// Line `index` of the box with its selection and caret painted on. Nothing
@@ -1576,7 +1695,7 @@ mod tests {
     use caudra_agent::mcp::elicitation::{
         ABOVE_MAXIMUM, ElicitForm, NO_LABEL, NOT_A_WHOLE_NUMBER, YES_LABEL,
     };
-    use caudra_agent::types::{AnswerKind, QuestionOption};
+    use caudra_agent::types::{AnswerKind, QUESTION_DISMISSED_REPLY, QuestionOption};
 
     const PICK: &str = "Pick one";
     const HEADER: &str = "Choice";
@@ -2574,14 +2693,20 @@ mod tests {
         assert!(matches!(action, QuestionFormAction::Cancel));
     }
 
+    /// Wide enough for the longest bar, which an 80-column form cuts short.
+    const WIDE_TERMINAL: u16 = 120;
+
     /// A hint that resolves to no key is a control the form draws and then
     /// ignores, which is worse than not drawing it.
     #[test]
     fn every_hint_stands_for_a_key_and_gets_a_hit() {
         let mut form = opened(two_questions());
+        let backend = ratatui::backend::TestBackend::new(WIDE_TERMINAL, TERMINAL_HEIGHT);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, WIDE_TERMINAL, TERMINAL_HEIGHT);
         for mode in [Mode::Selecting, Mode::EditingCustom, Mode::Confirming] {
             form.mode = mode;
-            render(&mut form);
+            terminal.draw(|frame| form.view(frame, area)).unwrap();
             for (index, hint) in form.hint_pairs().iter().enumerate() {
                 let label = hint.label();
                 assert!(hint.press().is_some(), "{label:?} in {mode:?} names no key");
@@ -2981,10 +3106,12 @@ mod tests {
         let before = form.clarification_context();
         form.answers = vec![vec![TYPED.into()], vec![YES.into(), TYPED.into()]];
         form.custom.set_text(UNCOMMITTED);
+        form.note.set_text(NOTE_TEXT);
         let context = form.clarification_context();
         assert_eq!(context, before);
         assert!(!context.contains(TYPED));
         assert!(!context.contains(UNCOMMITTED));
+        assert!(!context.contains(NOTE_TEXT));
         let active = format!(
             "About: 2/2 · {SECOND}\n{FULL_QUESTION}\n({MULTIPLE_ANSWERS})\n- {YES}\n  {FULL_DESCRIPTION}\n- {NO}\n  {NO_DESC}",
         );
@@ -3016,9 +3143,9 @@ mod tests {
         ));
     }
 
-    #[test_case(10, COMPACT_ASK_HINT ; "compact")]
-    #[test_case(15, ASK_HINT ; "ask_only")]
-    #[test_case(30, ASK_HINT ; "narrow")]
+    #[test_case(24, COMPACT_ASK_HINT ; "compact")]
+    #[test_case(29, ASK_HINT ; "enter_and_ask")]
+    #[test_case(40, ASK_HINT ; "narrow")]
     #[test_case(TERMINAL_WIDTH, ASK_HINT ; "normal")]
     fn ask_hint_stays_visible_and_clickable(width: u16, expected: Hint) {
         for mode in [Mode::Selecting, Mode::EditingCustom, Mode::Confirming] {
@@ -3506,5 +3633,208 @@ mod tests {
     #[test_case("mailto:someone", None ; "no_authority")]
     fn the_host_is_found_where_it_is_written(url: &str, host: Option<&str>) {
         assert_eq!(host_range(url).map(|range| &url[range]), host);
+    }
+
+    const NOTE_TEXT: &str = "keep the old config around";
+    const BLANK_NOTE: &str = "  ";
+    const LINE_CONTINUATION: &str = "\\";
+    const EXPECT_NOTE_KEPT: &str = "the note keeps what the user wrote";
+
+    /// A form with the note box open and `NOTE_TEXT` typed into it.
+    fn noting(questions: Vec<AskedQuestion>) -> QuestionForm {
+        let mut form = opened(questions);
+        form.handle_key(key::QUESTION_NOTE.to_key_event());
+        type_text(&mut form, NOTE_TEXT);
+        form
+    }
+
+    fn shows_note(form: &mut QuestionForm) -> bool {
+        painted(form).join(LINE_BREAK).contains(NOTE_HEADING.trim())
+    }
+
+    #[test_case(false, Mode::Selecting, false ; "single_select")]
+    #[test_case(true, Mode::Selecting, false ; "multi_select")]
+    #[test_case(false, Mode::EditingCustom, false ; "editing")]
+    #[test_case(false, Mode::Confirming, false ; "review")]
+    #[test_case(false, Mode::Selecting, true ; "note")]
+    fn enter_leads_the_bar_and_ask_follows(multiple: bool, mode: Mode, editing_note: bool) {
+        let mut form = opened(vec![question(HEADER, multiple)]);
+        form.mode = mode;
+        form.editing_note = editing_note;
+        assert_eq!(offers(&form, key::ENTER), Some(0));
+        assert_eq!(offers(&form, key::QUESTION_ASK_BTW), Some(ASK_HINT_INDEX));
+        let note = offers(&form, key::QUESTION_NOTE);
+        assert_eq!(note, (!editing_note).then_some(ASK_HINT_INDEX + 1));
+    }
+
+    #[test]
+    fn a_server_field_leads_with_enter_too() {
+        let form = asked_by_server(vec![note_question()]);
+        assert_eq!(offers(&form, key::ENTER), Some(0));
+        assert_eq!(offers(&form, key::QUESTION_ASK_BTW), Some(ASK_HINT_INDEX));
+    }
+
+    #[test_case(Mode::Selecting ; "selecting")]
+    #[test_case(Mode::EditingCustom ; "editing")]
+    #[test_case(Mode::Confirming ; "review")]
+    fn the_note_opens_over_any_mode_and_leaves_it_as_it_was(mode: Mode) {
+        let mut form = opened(two_questions());
+        form.mode = mode;
+        form.tab = 1;
+        form.answers = vec![vec![YES.into()], Vec::new()];
+        form.custom.set_text(UNCOMMITTED);
+        let state = |form: &QuestionForm| {
+            (
+                form.mode,
+                form.tab,
+                form.cursor,
+                form.answers.clone(),
+                form.custom.text(),
+            )
+        };
+        let before = state(&form);
+
+        form.handle_key(key::QUESTION_NOTE.to_key_event());
+        assert!(form.editing_note);
+        type_text(&mut form, NOTE_TEXT);
+        assert!(shows_note(&mut form));
+        form.handle_key(key::QUESTION_NOTE.to_key_event());
+
+        assert!(!form.editing_note);
+        assert_eq!(state(&form), before);
+        assert_eq!(form.note_text(), NOTE_TEXT, "{EXPECT_NOTE_KEPT}");
+        assert!(shows_note(&mut form), "a written note stays on the form");
+    }
+
+    #[test_case(KeyCode::Enter ; "enter")]
+    #[test_case(KeyCode::Esc ; "esc")]
+    fn leaving_the_note_box_keeps_the_note(code: KeyCode) {
+        let mut form = noting(vec![question(HEADER, false)]);
+        assert!(matches!(
+            press(&mut form, code),
+            QuestionFormAction::Consumed
+        ));
+        assert!(!form.editing_note);
+        assert_eq!(form.mode, Mode::Selecting);
+        assert_eq!(form.note_text(), NOTE_TEXT, "{EXPECT_NOTE_KEPT}");
+    }
+
+    #[test]
+    fn a_trailing_backslash_breaks_the_note_line() {
+        let mut form = noting(vec![question(HEADER, false)]);
+        type_text(&mut form, LINE_CONTINUATION);
+        press(&mut form, KeyCode::Enter);
+        assert!(form.editing_note);
+        assert_eq!(form.note.text(), format!("{NOTE_TEXT}{LINE_BREAK}"));
+    }
+
+    #[test]
+    fn the_note_takes_the_keys_while_an_answer_is_being_typed() {
+        let mut form = typing(false);
+        form.handle_key(key::QUESTION_NOTE.to_key_event());
+        assert!(form.text_input_active());
+        assert!(form.handle_paste(NOTE_TEXT));
+        assert_eq!(form.note.text(), NOTE_TEXT);
+        assert_eq!(form.custom.text(), TYPED);
+        assert_eq!(form.mode, Mode::EditingCustom);
+    }
+
+    #[test]
+    fn asking_keeps_the_open_note() {
+        let mut form = noting(vec![question(HEADER, false)]);
+        assert!(matches!(
+            form.handle_key(key::QUESTION_ASK_BTW.to_key_event()),
+            QuestionFormAction::AskBtw
+        ));
+        assert!(form.editing_note);
+        assert_eq!(form.note.text(), NOTE_TEXT, "{EXPECT_NOTE_KEPT}");
+    }
+
+    #[test_case(true ; "submitted")]
+    #[test_case(false ; "dismissed")]
+    fn the_reply_carries_the_note(submitted: bool) {
+        let mut form = noting(vec![question(HEADER, false)]);
+        press(&mut form, KeyCode::Esc);
+        let answers = match press(
+            &mut form,
+            if submitted {
+                KeyCode::Enter
+            } else {
+                KeyCode::Esc
+            },
+        ) {
+            QuestionFormAction::Submit(answers) => Some(answers),
+            QuestionFormAction::Dismiss => None,
+            _ => panic!("the form neither submitted nor dismissed"),
+        };
+        assert_eq!(answers.is_some(), submitted);
+        assert_eq!(
+            QuestionReply::decode(&form.reply(answers.clone())),
+            QuestionReply {
+                answers,
+                note: NOTE_TEXT.into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_blank_note_leaves_the_reply_as_it_always_was() {
+        let mut form = opened(vec![question(HEADER, false)]);
+        form.handle_key(key::QUESTION_NOTE.to_key_event());
+        type_text(&mut form, BLANK_NOTE);
+        let answers = vec![vec![YES.to_owned()]];
+        assert_eq!(form.reply(None), QUESTION_DISMISSED_REPLY);
+        assert_eq!(
+            form.reply(Some(answers.clone())),
+            serde_json::to_string(&answers).unwrap()
+        );
+    }
+
+    #[test_case(true ; "a_server_form")]
+    #[test_case(false ; "a_consent_request")]
+    fn a_servers_request_takes_no_note(fields: bool) {
+        let questions = if fields {
+            vec![count_question()]
+        } else {
+            Vec::new()
+        };
+        let mut form = asked_by_server(questions);
+        assert_eq!(offers(&form, key::QUESTION_NOTE), None);
+        form.handle_key(key::QUESTION_NOTE.to_key_event());
+        assert!(!form.editing_note);
+        assert!(!shows_note(&mut form));
+    }
+
+    #[test]
+    fn a_click_edits_the_note_on_any_tab() {
+        let mut form = noting(two_questions());
+        press(&mut form, KeyCode::Esc);
+        render(&mut form);
+        click_target(&mut form, FormTarget::Note(0));
+        assert!(form.editing_note, "a click on the note opens its box");
+
+        render(&mut form);
+        click_target(&mut form, FormTarget::Tab(1));
+        assert!(!form.editing_note, "a click elsewhere leaves the box");
+        assert_eq!(form.tab, 1);
+        render(&mut form);
+        click_target(&mut form, FormTarget::Note(0));
+        assert!(form.editing_note, "the note follows the user to every tab");
+        assert_eq!(form.note_text(), NOTE_TEXT, "{EXPECT_NOTE_KEPT}");
+    }
+
+    #[test_case(true ; "selected")]
+    #[test_case(false ; "nothing_selected")]
+    fn ctrl_c_in_the_note_copies_before_it_cancels(selected: bool) {
+        let mut form = noting(vec![question(HEADER, false)]);
+        if selected {
+            chord(&mut form, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        }
+        let action = chord(&mut form, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        match selected {
+            true => assert!(matches!(&action, QuestionFormAction::Copy(text) if text == NOTE_TEXT)),
+            false => assert!(matches!(action, QuestionFormAction::Cancel)),
+        }
+        assert_eq!(form.note_text(), NOTE_TEXT, "{EXPECT_NOTE_KEPT}");
     }
 }

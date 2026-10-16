@@ -15,8 +15,8 @@ use caudra_agent::automation::busy::pause_reason;
 pub(crate) use caudra_agent::automation::frontend::InputWait;
 pub(super) use caudra_agent::automation::frontend::run_end;
 use caudra_agent::automation::frontend::{
-    SessionSignals, autopilot_view, claim_next, delivery_due, goal_finished, mode_name,
-    needs_input, profile_armings, saved_controls, set_claimed_goal,
+    SessionSignals, autopilot_view, claim_next, delivery_due, goal_finished, goal_stalled,
+    mode_name, needs_input, profile_armings, saved_controls, set_claimed_goal,
 };
 use caudra_agent::automation::handle::AutomationHandle;
 use caudra_agent::automation::outbox::claim_message;
@@ -655,6 +655,13 @@ impl App {
 
     pub(super) fn automation_goal_finished(&self, result: &GoalResult, autopilot_owned: bool) {
         self.signal_automations(goal_finished(result, autopilot_owned));
+    }
+
+    /// A run that stopped on its goal, which stays active.
+    pub(super) fn automation_goal_stalled(&self, autopilot_owned: bool) {
+        if let Some(goal) = self.state.goal.snapshot() {
+            self.signal_automations(goal_stalled(&goal, autopilot_owned));
+        }
     }
 
     pub(super) fn automation_goal_cleared(

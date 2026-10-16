@@ -56,6 +56,17 @@ pub const MCP_SERVER_RESOURCE: &str = "mcp_server";
 
 const MCP_SERVER_READS_PREFIX: &str = "reads from ";
 
+pub const SESSION_HISTORY_READS_OPTION: &str = "allow_session_history_reads";
+
+/// The custom resource kind naming the project whose stored session history a call reads.
+pub const SESSION_HISTORY_RESOURCE: &str = "session_history";
+
+/// The value of a [`SESSION_HISTORY_RESOURCE`] that reads every project.
+pub const ALL_PROJECTS_HISTORY: &str = "*";
+
+const SESSION_HISTORY_READS_PREFIX: &str = "reads history of ";
+const ALL_PROJECTS_LABEL: &str = "all projects";
+
 /// How many path prefixes a URL ladder offers below its origin. The rungs share
 /// one row, so this bounds the request a deep path serializes to rather than
 /// anything the prompt draws. Real paths stay well under it.
@@ -833,6 +844,37 @@ pub(super) fn rule_options(
             reusable.clone(),
             false,
             false,
+            None,
+        ));
+    }
+    // Reading another project's stored history earns the same, per project, and is what the
+    // prompt offers to remember: an exact call names one search or one item.
+    if !resources.is_empty()
+        && resources.iter().all(|resource| {
+            matches!(&resource.kind, PermissionResourceKind::Custom { name } if name == SESSION_HISTORY_RESOURCE)
+        })
+    {
+        let projects: Vec<String> = resources
+            .iter()
+            .map(|resource| match resource.value.as_str() {
+                ALL_PROJECTS_HISTORY => ALL_PROJECTS_LABEL.to_owned(),
+                project => safe_summary(project),
+            })
+            .collect();
+        let label = format!("{SESSION_HISTORY_READS_PREFIX}{}", projects.join(", "));
+        for option in &mut options {
+            option.is_default = false;
+        }
+        options.push(option(
+            SESSION_HISTORY_READS_OPTION,
+            &label,
+            &format!("{ALWAYS_ALLOW_PREFIX}{label}."),
+            StructuredPermissionEffect::Allow,
+            resource_constraints.clone(),
+            PermissionArgumentConstraint::Unconstrained,
+            reusable.clone(),
+            false,
+            true,
             None,
         ));
     }
@@ -2266,18 +2308,26 @@ mod tests {
         remote_request_resource, subtree_ladder, url_ladder, webfetch_request, workcell_request,
     };
     use crate::permissions::structured::{
-        EXACT_COMMAND_CHIP, GIT_METADATA_DIR, MAX_URL_LADDER_RUNGS, NATIVE_OWNER,
-        OUTSIDE_HOME_PHRASE, PermissionArgumentConstraint, PermissionAuthorityProfile,
-        PermissionCapabilityFamily, PermissionCaution, PermissionExecutorKind, PermissionIntent,
-        PermissionLifetime, PermissionRequest, PermissionResource, PermissionResourceAccess,
-        PermissionResourceKind, PermissionResourceSelector, PermissionRisk, PermissionSubject,
-        StructuredPermissionEffect, URL_ORIGIN_OPTION_ID, URL_SUBTREE_OPTION_ID, WORKCELL_OWNER,
-        canonical_json, exact_resource_constraints, permission_rule_covers_request,
+        ALL_PROJECTS_HISTORY, EXACT_COMMAND_CHIP, GIT_METADATA_DIR, MAX_URL_LADDER_RUNGS,
+        NATIVE_OWNER, OUTSIDE_HOME_PHRASE, PermissionArgumentConstraint,
+        PermissionAuthorityProfile, PermissionCapabilityFamily, PermissionCaution,
+        PermissionExecutorKind, PermissionIntent, PermissionLifetime, PermissionRequest,
+        PermissionResource, PermissionResourceAccess, PermissionResourceKind,
+        PermissionResourceSelector, PermissionRisk, PermissionSubject,
+        SESSION_HISTORY_READS_OPTION, SESSION_HISTORY_RESOURCE, StructuredPermissionEffect,
+        URL_ORIGIN_OPTION_ID, URL_SUBTREE_OPTION_ID, WORKCELL_OWNER, canonical_json,
+        exact_resource_constraints, permission_rule_covers_request,
         permission_rule_covers_resource,
     };
     use caudra_config::ToolKey;
     use std::collections::BTreeMap;
     use std::path::Path;
+
+    const HISTORY_REQUEST: &str = "history";
+    const HISTORY_TOOL: &str = "code";
+    const HISTORY_PROJECT: &str = "/work/other";
+    const HISTORY_ELSEWHERE: &str = "/work/third";
+
     #[test]
     fn remote_directory_grant_uses_complete_opaque_ancestry() {
         let identity = default_remote_identity();
@@ -2303,6 +2353,63 @@ mod tests {
 
         descendant.resources[0].value = "root\u{1f}cloned-directory\u{1f}file".into();
         assert!(!permission_rule_covers_request(&rule, &descendant));
+    }
+
+    fn history_read(project: &str) -> PermissionRequest {
+        let intent = PermissionIntent::new(
+            PermissionScopes::single(project.into()),
+            vec![PermissionResource {
+                kind: PermissionResourceKind::Custom {
+                    name: SESSION_HISTORY_RESOURCE.into(),
+                },
+                value: project.into(),
+                access: Some(PermissionResourceAccess::Read),
+                protected: false,
+                requires_prompt: false,
+                attributes: BTreeMap::new(),
+            }],
+            PermissionRisk::Low,
+        );
+        PermissionRequest::from_intent_with_identity(
+            HISTORY_REQUEST.into(),
+            ToolKey::native(HISTORY_TOOL),
+            &intent,
+            json!({}),
+            Path::new(HISTORY_PROJECT),
+            PermissionSubject::Native {
+                owner: NATIVE_OWNER.into(),
+                contract: READ_CONTRACT.into(),
+            },
+            PermissionExecutorKind::Native,
+        )
+    }
+
+    /// Reading another project's history, or every project's, can be remembered for that project
+    /// alone, so allowing one never reads another, and that is the scope the prompt remembers.
+    #[test_case(HISTORY_PROJECT, "reads history of /work/other" ; "one_project")]
+    #[test_case(ALL_PROJECTS_HISTORY, "reads history of all projects" ; "all_projects")]
+    fn a_history_read_offers_to_remember_its_project(project: &str, label: &str) {
+        let request = history_read(project);
+
+        let defaults: Vec<&str> = request
+            .options
+            .iter()
+            .filter(|option| option.is_default)
+            .map(|option| option.id.as_str())
+            .collect();
+        let option = request
+            .options
+            .iter()
+            .find(|option| option.id == SESSION_HISTORY_READS_OPTION)
+            .unwrap();
+
+        assert_eq!(defaults, [SESSION_HISTORY_READS_OPTION]);
+        assert_eq!(option.label, label);
+        assert!(permission_rule_covers_request(&option.rule, &request));
+        assert!(!permission_rule_covers_request(
+            &option.rule,
+            &history_read(HISTORY_ELSEWHERE)
+        ));
     }
 
     #[test]

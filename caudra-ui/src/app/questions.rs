@@ -10,9 +10,7 @@ use std::mem;
 
 use caudra_agent::autopilot::DecisionKind;
 use caudra_agent::permissions::AutopilotNote;
-use caudra_agent::types::{
-    QUESTION_DEFERRED_REPLY, QUESTION_DISMISSED_REPLY, QuestionDelivery, QuestionEvent,
-};
+use caudra_agent::types::{QUESTION_DEFERRED_REPLY, QuestionDelivery, QuestionEvent};
 use caudra_storage::autopilot::AutopilotStopper;
 
 use super::{App, Status};
@@ -24,6 +22,7 @@ pub(crate) const QUESTION_CLOSED_MSG: &str = "That question is no longer open";
 pub(crate) const NO_WAITING_QUESTION_MSG: &str = "No unanswered questions";
 pub(crate) const ANSWER_OPEN_QUESTION_MSG: &str = "Answer or dismiss the open question first";
 const NO_BACKGROUND_RUNTIME: &str = "this session runs no background jobs";
+pub(crate) const NOTE_DRAFT_SEPARATOR: &str = "\n\n";
 
 #[derive(Default)]
 pub(crate) struct QuestionQueue {
@@ -239,8 +238,7 @@ impl App {
                 self.copy_labelled(&text, COPIED_SELECTION);
             }
             QuestionFormAction::Submit(answers) => {
-                let reply = serde_json::to_string(&answers)
-                    .unwrap_or_else(|_| QUESTION_DISMISSED_REPLY.to_owned());
+                let reply = self.question_form.reply(Some(answers));
                 self.answer_deferred_question(reply);
             }
             QuestionFormAction::Later => self.rotate_questions(),
@@ -251,10 +249,28 @@ impl App {
             // Stopping the run withdraws every deferred question with it.
             QuestionFormAction::Cancel => {
                 self.user_stopped(AutopilotStopper::QuestionCancel);
-                return self.handle_cancel();
+                let note = self.question_form.note_text();
+                let actions = self.handle_cancel();
+                self.keep_question_note(note);
+                return actions;
             }
         }
         Vec::new()
+    }
+
+    /// `Ctrl+C` stops the agent that asked, and the note the user wrote for it
+    /// waits in the composer for their next message, after any draft there.
+    /// It goes in after the stop, which may hand a queued draft back first.
+    pub(super) fn keep_question_note(&mut self, note: String) {
+        if note.is_empty() {
+            return;
+        }
+        let input = self.active_input_box_mut();
+        input.move_to_end();
+        if !input.is_empty() {
+            input.buffer.insert_text(NOTE_DRAFT_SEPARATOR);
+        }
+        input.buffer.insert_text(&note);
     }
 
     fn answer_deferred_question(&mut self, reply: String) {

@@ -217,6 +217,8 @@ features! {
         "At a main-session handoff with a usable question tool, advise adds one visible reminder per user-input episode to ask a live user question through that tool. Shadow only evaluates. Uses a redacted, bounded request and reply excerpt; uncertainty and failures leave the reply unchanged.";
     memory_search: [Enforce],
         "Rerank the memory tool's keyword matches against the agent's query and omit those judged unrelated, saying how many were omitted. Sends the query and each candidate note's name, heading, and a redacted body excerpt.";
+    history_search: [Enforce],
+        "Rerank session history search's keyword matches against the agent's query, drop those judged unrelated, and return the rest best first. Sends the query and each candidate's kind, tool, date, session title, and a redacted excerpt.";
     memory_recall: [Advise],
         "In main sessions, remind the agent of at most three saved notes likely relevant to a new user message, without loading them. Sends a redacted message excerpt and each keyword-matched note's name, heading, and redacted excerpt.";
     memory_duplicates: [Advise],
@@ -668,7 +670,7 @@ impl DecisionsConfig {
             min: None,
             max: None,
             env: None,
-            description: "Positive deadline in milliseconds for tool search and the reranking features, which judge at most 16 candidates per request and send their requests concurrently. Memory recall keeps `timeout_ms` because it delays the start of a turn. A `decide()` or `rerank()` call from a workflow or an MCP snippet may ask for up to the larger of the two.",
+            description: "Positive deadline in milliseconds for tool search and the reranking features, which judge at most 16 candidates per request and send their requests concurrently. History search lets each request wait one budget per request in its pool, so an engine that answers one request at a time still gets through its pool. Memory recall keeps `timeout_ms` because it delays the start of a turn. A `decide()` or `rerank()` call from a workflow or a `code` snippet may ask for up to the larger of the two.",
         },
         ConfigField {
             name: "log",

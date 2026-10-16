@@ -11,7 +11,7 @@ use super::{AutopilotHandle, DecisionOutcome};
 use crate::EventSender;
 use crate::cancel::CancelToken;
 use crate::mcp::elicitation::describe_answer;
-use crate::types::AskedQuestion;
+use crate::types::{AskedQuestion, QUESTION_DISMISSED_REPLY, QuestionReply};
 
 const MAX_ITEM_BYTES: usize = 32 * 1024;
 const MAX_SUBJECT_BYTES: usize = 160;
@@ -27,6 +27,7 @@ const MAY_BE_EMPTY: &str = ", or none to leave it unanswered";
 const LABEL_SEPARATOR: &str = ", ";
 const QUESTION_SEPARATOR: &str = "; ";
 const NO_ANSWER: &str = "(no answer)";
+const NOTE_SEPARATOR: &str = "; note: ";
 
 /// Autopilot's part in one `question` form, made for the main agent. Dropped
 /// before the form is settled, the decision ends as cancelled.
@@ -128,19 +129,26 @@ impl QuestionDelegate {
 }
 
 /// A human's reply as the log words it: the labels picked for each question,
-/// or the reply itself when it picks none, such as a dismissal.
+/// or the reply itself when it picks none, such as a dismissal, then the note
+/// the user wrote for the whole form.
 fn human_answer(raw: &str) -> String {
-    let Ok(picked) = serde_json::from_str::<Vec<Vec<String>>>(raw) else {
-        return raw.to_owned();
+    let QuestionReply { answers, note } = QuestionReply::decode(raw);
+    let picked = match answers {
+        Some(picked) => picked
+            .iter()
+            .map(|labels| match labels.as_slice() {
+                [] => NO_ANSWER.to_owned(),
+                labels => labels.join(LABEL_SEPARATOR),
+            })
+            .collect::<Vec<_>>()
+            .join(QUESTION_SEPARATOR),
+        None if note.is_empty() => return raw.to_owned(),
+        None => QUESTION_DISMISSED_REPLY.to_owned(),
     };
-    picked
-        .iter()
-        .map(|labels| match labels.as_slice() {
-            [] => NO_ANSWER.to_owned(),
-            labels => labels.join(LABEL_SEPARATOR),
-        })
-        .collect::<Vec<_>>()
-        .join(QUESTION_SEPARATOR)
+    match note.is_empty() {
+        true => picked,
+        false => format!("{picked}{NOTE_SEPARATOR}{note}"),
+    }
 }
 
 /// The first question's header, or the question itself when it has none.
@@ -321,6 +329,8 @@ mod tests {
     #[test_case(r#"[["SQLite"],["core","cli"]]"#, "SQLite; core, cli" ; "the_labels_of_each_question")]
     #[test_case(r#"[["SQLite"],[]]"#, "SQLite; (no answer)" ; "a_question_left_unanswered")]
     #[test_case(DISMISSAL, DISMISSAL ; "a_reply_that_picks_none")]
+    #[test_case(r#"{"answers":[["SQLite"]],"note":"stay portable"}"#, "SQLite; note: stay portable" ; "the_labels_and_the_note")]
+    #[test_case(r#"{"answers":null,"note":"stay portable"}"#, "dismissed; note: stay portable" ; "a_dismissal_and_the_note")]
     fn a_human_reply_is_logged_as_the_labels_it_picked(raw: &str, expected: &str) {
         assert_eq!(human_answer(raw), expected, "{LOGGED}");
     }

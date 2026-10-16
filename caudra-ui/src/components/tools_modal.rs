@@ -442,7 +442,7 @@ fn mcp_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>> {
     }
     for tool in &inventory.tools {
         let (glyph, state, style) = match tool.status {
-            ContextMcpStatus::Available => (DECLARED_GLYPH, "via mcp", theme.tool_success),
+            ContextMcpStatus::Available => (DECLARED_GLYPH, "via code", theme.tool_success),
             ContextMcpStatus::SearchOnly => (DEFERRED_GLYPH, "search-only", theme.tool_dim),
             ContextMcpStatus::Disabled => (DISABLED_GLYPH, "off", theme.error),
         };

@@ -357,7 +357,7 @@ def print_top_expensive_calls(all_calls, n=15):
                 t.get("tool", "?") for t in tools[:5]
             )
             detail = detail[:60]
-        elif name == "python_execution":
+        elif name in ("code", "python_execution"):
             detail = str(inp.get("code", ""))[:60].replace("\n", "\\n")
         else:
             detail = str(inp)[:60]

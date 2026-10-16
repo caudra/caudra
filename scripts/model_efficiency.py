@@ -58,7 +58,7 @@ import os
 import sqlite3
 import sys
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 if os.name == "nt":
@@ -1155,7 +1155,7 @@ def build_report(conn, models, purpose, cwd):
     return {
         "checks": audit["checks"],
         "scope": {
-            "generated": datetime.now(timezone.utc).astimezone().date().isoformat(),
+            "generated": datetime.now(UTC).astimezone().date().isoformat(),
             "models": models,
             "purpose": purpose or "all",
             "cwd": cwd or "all",

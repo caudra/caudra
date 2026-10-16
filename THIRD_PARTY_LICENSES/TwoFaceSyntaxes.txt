@@ -1,7 +1,7 @@
-two-face 0.5.1 embedded syntax asset licenses and notices
+two-face 0.5.2+bat-0.26.1 embedded syntax asset licenses and notices
 
 Source: generated/acknowledgements_full.md at
-https://github.com/CosmicHorrorDev/two-face/tree/61d1e8d42cfe3c80e5f3d1bc9a71a4a59ee9ebee
+https://codeberg.org/CosmicHarper/two-face/src/commit/67b64e632ceefe70e5f20f3eb797d9e33560a11c
 Package provenance and crate licenses: TwoFace.txt.
 
 This preserves every syntax license/notice in the pinned upstream listing,

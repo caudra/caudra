@@ -201,7 +201,7 @@ impl WorkflowSession {
         // map the agent loop's cancel sweep clears.
         let subagent_cancels = Arc::new(CancelMap::new());
         let mcp = spawn.mcp_handle.map(|handle| {
-            McpSession::new(handle.clone(), &[])
+            McpSession::new(handle.clone())
                 .with_disabled_tools(&spawn.config.disabled_tools)
                 .with_elicitors(Some(Arc::new(QuestionForms)))
         });

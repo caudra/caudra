@@ -148,8 +148,8 @@ fn experiment_scope(feature: Feature) -> &'static str {
         Feature::DecisionEngine => {
             "The [decision engine](#decisions), [Auto mode](/docs/permissions/#auto-mode), \
               `caudra decisions`, workflow [`decide()` calls](/docs/workflows/#typed-decisions), and \
-              the [`decide()` and `rerank()` helpers](/docs/mcp/#decisions-and-reranking) of MCP \
-              code mode."
+              the [`decide()` and `rerank()` helpers](/docs/code/#decisions-and-reranking) of the \
+              `code` tool."
         }
         Feature::CrossSessionMessaging => {
             "Local [cross-session messaging](/docs/messaging/): the `list_sessions`, `send_message`, `publish_message`, `read_topic`, and `work_assignment` tools, `/peers`, `/messages`, `/topics`, `/groups`, `caudra message`, live session inboxes, consumer groups, and the message history. Both processes must opt in."
@@ -825,9 +825,9 @@ fn write_decisions_section(out: &mut String) {
          a larger tail, so questions in the omitted middle can be missed. Errors, timeouts, invalid \
          answers, and scores below the threshold leave the reply unchanged.\n\n\
          #### Reranking\n\n\
-         Tool search, `memory_search`, `memory_recall`, `memory_duplicates`, `compaction_retention`, \
-         `output_pointers`, and `source_code_context` use the engine as a reranker. A cheap first pass, such \
-         as keyword matching, picks the candidates. The engine then answers one true or false \
+         Tool search, `memory_search`, `history_search`, `memory_recall`, `memory_duplicates`, \
+         `compaction_retention`, `output_pointers`, and `source_code_context` use the engine as a \
+         reranker. A cheap first pass, such as keyword matching, picks the candidates. The engine then answers one true or false \
          relevance question per candidate, and Caudra orders, prunes, or names candidates by the \
          probability it returns. The feature table above lists what each one sends.\n\n\
          One request holds up to 16 candidates, each with an opaque ID such as `c00`. Larger lists \
@@ -838,6 +838,8 @@ fn write_decisions_section(out: &mut String) {
          Enforcing features compare each probability with `thresholds.relevance_floor` (default \
          `0.1`). Tool search and `source_code_context` only reorder, putting candidates at or above the \
          floor first. `memory_search` omits matches below the floor and names them. \
+         `history_search` drops matches below the floor and returns the rest best first, as \
+         [Ranking](/docs/code/#ranking) describes. \
          `compaction_retention` keeps the same number of tool results as without the engine, \
          choosing them by relevance, and never drops a result it could not otherwise drop. Advisory \
          features name a candidate only at or above `thresholds.routing_confidence` (default \
@@ -868,7 +870,7 @@ fn write_tool_output_section(out: &mut String) {
          so an abridged card is the same height whatever its lines are. Clicking the card \
          shows all of it regardless. \
          All values are `usize` with a minimum of {MIN_TOOL_OUTPUT_LINES}.\n\n\
-         The `bash`, `python_execution`, and `task` entries apply only when \
+         The `bash`, `code`, and `task` entries apply only when \
          `ui.scroll_card_lines` is `0`. Above that, those tools draw a fixed window of \
          that many rows instead, and the budget here goes unused. `write` does not reach \
          a `file_write` that created a file, whose body is that file and is always drawn \
@@ -997,7 +999,7 @@ It also rebuilds at moments you choose, where the cached conversation can still 
 - `/cd`, which loads the instruction files and memory of the new directory
 - `/reload`, which applies everything at once
 
-MCP servers never change the definitions. While any server is enabled, they hold one `mcp` tool, and the servers and their tools reach the model in a [`# MCP servers` reminder](/docs/mcp/#code-mode) instead. A server that connects, fails, or changes its tools changes only that reminder.
+MCP servers never change the definitions. The `code` tool is always there, and the servers and their tools reach the model in a [`# MCP servers` reminder](/docs/mcp/#code-mode) instead. A server that connects, fails, or changes its tools changes only that reminder.
 
 To keep the cache through a long task, save your edits and let the next rebuild take them in. When the model needs a change right away, such as a tool you turned back on, run `/reload` and pay for one full read.
 
@@ -1034,15 +1036,15 @@ You add the `analytics` server of the [HTTP example](/docs/mcp/#http) to `~/.con
 {mcp_reminder}
 ```
 
-The model can call the new tool through `mcp` at once. When `analytics` is the first server you enable, the `mcp` tool itself is new. The model then also gets a `# Configuration changed` reminder for it, and `mcp` becomes callable at the next rebuild. Run `/reload` to make that happen now.
+The model can call the new tool through `code` at once.
 
 #### Turn off an MCP server
 
-You turn a server off in `/mcp`. Caudra writes `mcp.toml` itself, so the footer stays quiet. The server stops at once, and the next server list leaves it out. The definitions stay as they were, so the cache holds. When it was the last enabled server, a short reminder tells the model to disregard the list, and `mcp` stays in the definitions until the next rebuild. A call to it then fails.
+You turn a server off in `/mcp`. Caudra writes `mcp.toml` itself, so the footer stays quiet. The server stops at once, and the next server list leaves it out. The definitions stay as they were, so the cache holds. When it was the last enabled server, a short reminder tells the model to disregard the list.
 
 #### Switch to plan mode
 
-You press `Tab` to plan while MCP servers run. Plan mode keeps the `mcp` tool and refuses each server call it does not allow, so MCP servers do not change the definitions. Only the first switch to plan changes them, by adding the `plan` tool, and that request reads the whole conversation at full price.
+You press `Tab` to plan while MCP servers run. Plan mode keeps the `code` tool and refuses each server call it does not allow, so MCP servers do not change the definitions. Only the first switch to plan changes them, by adding the `plan` tool, and that request reads the whole conversation at full price.
 
 #### Disable a tool
 

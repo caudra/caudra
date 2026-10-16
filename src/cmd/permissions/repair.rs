@@ -410,7 +410,6 @@ pub(super) fn tool_name(subject: &PermissionSubject) -> &str {
                 "file.patch.v1" => "file_apply_patch",
                 "file.index.v1" => "file_index",
                 "shell.execution.v1" => "shell",
-                "python.execution.v1" => "python_execution",
                 "web.search.v1" => "websearch",
                 "web.fetch.v1" => "webfetch",
                 "source_code.context.v1" => "source_code_context",

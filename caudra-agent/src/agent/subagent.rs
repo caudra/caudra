@@ -38,6 +38,7 @@ use super::steering::{SharedSteering, Steering};
 use super::{ModelRoute, resolve_model_for_purpose, resolve_purpose_model_for_inspection};
 use crate::background::JobScope;
 use crate::cancel::{CancelMap, CancelSlot};
+use crate::code::CodeSession;
 use crate::decisions::questions as decision_questions;
 use crate::decisions::{
     DecisionFeature, DecisionReceipt, DecisionState, Decisions, NoteDraft, NoteOutcome,
@@ -403,6 +404,8 @@ pub struct Subagent {
     /// Fresh per session so `tool_search` loads never leak between a
     /// subagent and its parent.
     mcp: Option<McpSession>,
+    /// Its own, so its `code` variables never mix with its parent's.
+    code: CodeSession,
     history: History,
     history_lease: Option<SubagentHistoryLease>,
     sub_event_tx: EventSender,
@@ -668,6 +671,7 @@ impl Subagent {
         .with_interrupt_source(interrupt_source)
         .with_cancel(self.child_cancel.clone())
         .with_mcp(self.mcp.clone())
+        .with_code(self.code.clone())
         .with_local_tools(Arc::clone(&self.local_tools))
         .with_steering(Arc::clone(&self.steering));
         if let Some(ready) = &self.report_ready {
@@ -1780,9 +1784,10 @@ fn build(
             .as_ref()
             .filter(|_| resolved.mcp_enabled)
             .map(|mcp| {
-                mcp.fresh(history.as_slice())
+                mcp.clone()
                     .with_actor_policy(Arc::clone(&resolved.profile_tool_policy))
             }),
+        code: CodeSession::new(history.as_slice()),
         history,
         history_lease: Some(resolved.history_lease),
         sub_event_tx,
@@ -2378,7 +2383,7 @@ mod tests {
     const PLAN_CONTENT: &str = "# Plan";
     const ENVIRONMENT_MISSING: &str = "a task must be told its environment";
     /// A real entry of `DEFERRED_BUILTIN_TOOLS`, so the split under test happens.
-    const DEFERRED_TOOL: &str = "python_execution";
+    const DEFERRED_TOOL: &str = "execution_environment";
     const MAIN_ONLY_TOOL: &str = "main_only_mock";
     const PUBLISHER_MISSING: &str = "subagent must inherit a task-scoped context publisher";
     const IGNORED_ERROR: &str = "handled by the session caller";

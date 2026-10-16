@@ -82,7 +82,7 @@ pub fn specs() -> Vec<ToolSpec> {
     // environment value. They are still presentation hints; the isolation is enforced by the worker.
     vec![
         ToolSpec::new(
-            "python_execution",
+            "code",
             Some("Execute Python code"),
             DESCRIPTION,
             schema.as_object().expect("schema object").clone(),
@@ -138,7 +138,7 @@ mod tests {
     fn uses_standard_presentation_key() {
         let tools = catalog();
         let specs = specs();
-        assert_eq!(tools[0].name, "python_execution");
+        assert_eq!(tools[0].name, "code");
         let description = tools[0].description.as_deref().expect("tool description");
         assert!(description.contains("No filesystem, no network"));
         assert!(description.contains("Prefer this over the shell tool"));

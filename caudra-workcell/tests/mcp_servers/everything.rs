@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use caudra_agent::AgentMode;
-use caudra_agent::mcp::code::output::{McpCodeCallStatus, McpCodeOutcome};
+use caudra_agent::code::output::{CodeCallStatus, CodeOutcome};
 use caudra_agent::permissions::{PermissionAnswer, PermissionMode};
 use test_case::test_case;
 
@@ -84,7 +84,7 @@ fn a_call_answers_with_the_server_result_and_is_recorded_as_written() {
     assert_eq!(call.server, EVERYTHING);
     assert_eq!(call.tool, GET_SUM);
     assert_eq!(call.called_as, GET_SUM_CALLED_AS);
-    assert_eq!(call.status, McpCodeCallStatus::Success);
+    assert_eq!(call.status, CodeCallStatus::Success);
 }
 
 /// `asyncio` used without its import is imported before the snippet runs.
@@ -149,7 +149,7 @@ fn variables_last_between_runs_until_a_reset() {
     assert_eq!(completed(&servers.run("kept")), SUM);
     let reset = servers.reset_and_run("kept");
     assert!(
-        matches!(reset.outcome, McpCodeOutcome::Rejected { .. }),
+        matches!(reset.outcome, CodeOutcome::Rejected { .. }),
         "{reset:?}"
     );
 }
@@ -172,19 +172,19 @@ fn resources_are_listed_and_read() {
 fn a_misspelt_tool_never_runs_and_names_the_real_one() {
     let servers = building();
     let output = servers.run("await everything.get_summ(a=2, b=3)");
-    let McpCodeOutcome::Rejected { message } = &output.outcome else {
+    let CodeOutcome::Rejected { message } = &output.outcome else {
         panic!("{output:?}");
     };
     assert!(message.contains(MEANT_GET_SUM), "{message}");
     assert!(output.calls.is_empty());
 }
 
-#[test_case(PermissionAnswer::AllowOnce, McpCodeCallStatus::Success ; "allowed")]
-#[test_case(PermissionAnswer::Deny, McpCodeCallStatus::Refused ; "denied")]
+#[test_case(PermissionAnswer::AllowOnce, CodeCallStatus::Success ; "allowed")]
+#[test_case(PermissionAnswer::Deny, CodeCallStatus::Refused ; "denied")]
 #[ignore = "needs Docker: make test-mcp-servers"]
 fn each_call_asks_and_a_denial_raises_permission_error(
     answer: PermissionAnswer,
-    status: McpCodeCallStatus,
+    status: CodeCallStatus,
 ) {
     let servers = everything(AgentMode::Build, PermissionMode::Ask);
     let (output, asked) = servers.run_answering(CALL_SUM, &[answer]);
@@ -194,9 +194,9 @@ fn each_call_asks_and_a_denial_raises_permission_error(
     assert_eq!(request.tool.to_string(), GET_SUM_KEY);
     assert_eq!(output.calls[0].status, status);
     match status {
-        McpCodeCallStatus::Success => assert_eq!(completed(&output), SUM),
+        CodeCallStatus::Success => assert_eq!(completed(&output), SUM),
         _ => assert!(
-            matches!(&output.outcome, McpCodeOutcome::Raised { kind, .. } if kind == PERMISSION_ERROR),
+            matches!(&output.outcome, CodeOutcome::Raised { kind, .. } if kind == PERMISSION_ERROR),
             "{output:?}"
         ),
     }
@@ -227,10 +227,10 @@ fn plan_mode_refuses_an_unrecognised_server() {
         PermissionMode::Yolo,
     );
     let output = servers.run(CALL_SUM);
-    let McpCodeOutcome::Raised { kind, message } = &output.outcome else {
+    let CodeOutcome::Raised { kind, message } = &output.outcome else {
         panic!("{output:?}");
     };
     assert_eq!(kind, PERMISSION_ERROR);
     assert!(message.contains(PLAN_REFUSAL), "{message}");
-    assert_eq!(output.calls[0].status, McpCodeCallStatus::Refused);
+    assert_eq!(output.calls[0].status, CodeCallStatus::Refused);
 }

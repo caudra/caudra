@@ -70,7 +70,14 @@ Rust workspace, key crates in root dir:
 - caudra-terminal-host: Everything Caudra tells the surrounding terminal: host detection (Herdr, then Orca, then the OSC 7501 probe), the pane status lane, OSC 9/BEL alerts, multiplexer wrapping, the routing table, and host worktrees and panes. A new host is one adapter module (`TerminalHost`, optionally `Workspaces`) plus one entry in `detect_from`. caudra-ui derives the `PaneStatus` and owns the stdout writer
 - caudra-script: The Rhai sandbox workflows and automations share: a restricted engine, a header read without running the script, a bridge that serves host calls while the interpreter runs on its own thread, and canonical JSON and SHA-256 request digests
 
-First-party Workcell tools are native Rust: file_read, file_glob, file_grep, file_write, file_edit, file_apply_patch, file_index, websearch, webfetch, shell, python_execution, execution_environment, and the source-code pair source_code_context and source_code_refs.
+First-party Workcell tools are native Rust: file_read, file_glob, file_grep, file_write, file_edit, file_apply_patch, file_index, websearch, webfetch, shell, execution_environment, and the source-code pair source_code_context and source_code_refs.
+Workcell's own isolated `code` tool stays in its standalone server and remote catalog, which Caudra checks
+but never registers in place of its own `code`. Python runs in Caudra's native `code` tool (`caudra-agent/src/tools/native/code.rs`,
+its description the source of truth) on Workcell's hosted pool only, always locally. Its gateway and
+`HostModule` framework live in `caudra-agent/src/code/`: a module turns a call into a plan, and only the
+gateway authorizes and runs it. MCP (`caudra-agent/src/mcp/code/`) and `history` are the modules. The
+`history` module searches the FTS5 index in `caudra-storage/src/history_search/` through the rerank
+funnel in `caudra-agent/src/history/`, which a UI history search can reuse.
 Caudra owns authorization, registration, and presentation. Workcell owns protocol-neutral contracts,
 validation, bounds, atomicity, network policy, subprocess cleanup, and the bundled Monty worker
 lifecycle. Its crates live under `workcell/` in this workspace. Keep Workcell logic there rather than
@@ -102,12 +109,12 @@ Development and release builds use the same local Workcell workspace members and
 Edit `workcell/` directly. There are no sibling checkout overrides or separate Workcell revision bumps.
 
 For worker or release changes, run the production bundled-worker execution test with a real pinned
-worker, not only a catalog check. Release smoke tests must fail when `python_execution` is reserved but
+worker, not only a catalog check. Release smoke tests must fail when `code` is reserved but
 unavailable. Keep Monty's worker and `monty-pool` versions in lockstep.
 
 Caudra's own tools are native Rust in `caudra-agent/src/tools/native`, registered from
 `CAUDRA_NATIVE_TOOL_NAMES`: session work, orchestration, and interactive surfaces such as task,
-workflow, tool_output, and view_image. They emit structured `ToolOutput` so the UI renders and
+workflow, code, tool_output, and view_image. They emit structured `ToolOutput` so the UI renders and
 restores them in Rust, with no Lua round-trip on session load, click, or theme change.
 `src/cmd::register_builtin_tools` is the single registration choke point for both native families.
 

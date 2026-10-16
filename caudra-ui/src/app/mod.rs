@@ -135,7 +135,7 @@ use crate::components::workflow_inspector::WorkflowInspector;
 use crate::components::worktree_picker::{WorktreePicker, WorktreeView};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, DisplaySource, ExitRequest, GoalTone, Overlay,
-    PlanHandoff, RetryInfo, Status, is_ctrl,
+    PlanHandoff, RetryInfo, Status, format_elapsed, is_ctrl,
 };
 use crate::config_problems::ConfigProblems;
 use crate::image;
@@ -149,10 +149,10 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use caudra_agent::agent::task_runner::WorkflowHostContext;
 use caudra_agent::autopilot::{ActionName, DecisionKind};
 use caudra_agent::background::{BackgroundTasks, ShellSnapshot};
+use caudra_agent::code::output as code_output;
 use caudra_agent::commits::repo;
 use caudra_agent::context::{ContextKey, ContextSnapshot, ContextStore};
 use caudra_agent::mcp::McpSnapshot;
-use caudra_agent::mcp::code::output as mcp_code;
 use caudra_agent::mentions;
 use caudra_agent::permissions::{AutopilotNote, PermissionManager, PermissionPolicyError};
 use caudra_agent::prompt::profile::PromptProfileCatalog;
@@ -160,7 +160,7 @@ use caudra_agent::tools::ToolAudience;
 use caudra_agent::tools::native::plan::{self, PlanTarget};
 use caudra_agent::types::{
     AutopilotEvent, BACKGROUND_EVENT_RUN_ID, QUESTION_ACCEPTED_REPLY, QUESTION_DECLINED_REPLY,
-    QUESTION_DISMISSED_REPLY, QuestionDelivery, WorkflowProvenance,
+    QuestionDelivery, WorkflowProvenance,
 };
 use caudra_agent::{
     AgentEvent, AgentInput, AgentMode, CommitRef, Envelope, GoalVerdict, HistorySnapshot,
@@ -1896,7 +1896,11 @@ impl App {
                 .as_ref()
                 .is_some_and(|origin| !self.task_response_current(origin))
         {
+            let note = self.question_form.note_text();
             self.close_blocking_question();
+            if matches!(action, QuestionFormAction::Cancel) {
+                self.keep_question_note(note);
+            }
             return Vec::new();
         }
         if answered {
@@ -1924,20 +1928,22 @@ impl App {
             // path, and the run only moves again when the user says so.
             QuestionFormAction::Cancel => {
                 self.user_stopped(AutopilotStopper::QuestionCancel);
+                let note = self.question_form.note_text();
                 let subagent = self.question_subagent.take();
                 self.close_blocking_question();
-                return match subagent {
+                let actions = match subagent {
                     Some(task_id) => self.cancel_subagent(task_id),
                     None => self.handle_cancel(),
                 };
+                self.keep_question_note(note);
+                return actions;
             }
             QuestionFormAction::Dismiss | QuestionFormAction::PutAside => {
-                QUESTION_DISMISSED_REPLY.to_owned()
+                self.question_form.reply(None)
             }
             QuestionFormAction::Decline => QUESTION_DECLINED_REPLY.to_owned(),
             QuestionFormAction::Accept => QUESTION_ACCEPTED_REPLY.to_owned(),
-            QuestionFormAction::Submit(answers) => serde_json::to_string(&answers)
-                .unwrap_or_else(|_| QUESTION_DISMISSED_REPLY.to_owned()),
+            QuestionFormAction::Submit(answers) => self.question_form.reply(Some(answers)),
         };
         let subagent = self.question_subagent.take();
         self.close_blocking_question();
@@ -5425,11 +5431,43 @@ impl App {
                 evaluations,
                 continuations,
                 limit,
+                autopilot_owned,
             } => {
+                self.automation_goal_stalled(autopilot_owned);
                 self.main_chat().push(DisplayMessage::new(
                     DisplayRole::Notice,
                     format!(
                         "Goal remains active after {continuations} automatic continuations in this run ({evaluations} total evaluations); the session limit is {limit}. Send another message to resume."
+                    ),
+                ));
+                return vec![];
+            }
+            AgentEvent::GoalStalled {
+                evaluations,
+                turns,
+                autopilot_owned,
+            } => {
+                self.automation_goal_stalled(autopilot_owned);
+                self.main_chat().push(DisplayMessage::new(
+                    DisplayRole::Notice,
+                    format!(
+                        "Goal remains active, but its last {turns} turns made no progress ({evaluations} total evaluations), so the run stopped. Send another message to resume."
+                    ),
+                ));
+                return vec![];
+            }
+            AgentEvent::GoalWaiting {
+                evaluations,
+                attempt,
+                limit,
+                delay_ms,
+            } => {
+                let delay = Duration::from_millis(delay_ms);
+                self.main_chat().push(DisplayMessage::new(
+                    DisplayRole::Notice,
+                    format!(
+                        "Goal waits on a change outside the session ({evaluations} total evaluations); checking again in {} (wait {attempt}/{limit}). Send a message to go on sooner.",
+                        format_elapsed(delay.as_secs())
                     ),
                 ));
                 return vec![];
@@ -6723,7 +6761,16 @@ impl App {
     }
 
     pub(crate) fn goal_checkin_due(&self) -> bool {
-        (self.goal_deferred || self.autopilot_checkin_due) && self.state.goal.snapshot().is_some()
+        (self.goal_deferred || self.autopilot_checkin_due || self.state.goal.wait_over())
+            && self.state.goal.snapshot().is_some()
+    }
+
+    /// The goal waits on an outside change, and its check-in is still to come.
+    pub(crate) fn goal_waits(&self) -> bool {
+        self.state
+            .goal
+            .wait_left()
+            .is_some_and(|left| !left.is_zero())
     }
 
     pub(crate) fn attention(&self) -> Option<Notification> {
@@ -7061,7 +7108,7 @@ impl App {
     /// in — a synthetic cancellation, say — and recording a zero for it would
     /// invent activity.
     ///
-    /// Each server call an `mcp` snippet made counts as a call of its own,
+    /// Each server call an `code` snippet made counts as a call of its own,
     /// under its `server.tool` name. The model never reads those results
     /// directly, so they cost the context window nothing.
     ///
@@ -7093,7 +7140,7 @@ impl App {
                     tokens: child_tokens,
                 });
                 if let Some(output) = &entry.output {
-                    self.record_mcp_calls(output);
+                    self.record_code_calls(output);
                 }
             }
         }
@@ -7105,17 +7152,17 @@ impl App {
             duration_ms: done.accounting.duration_ms,
             tokens,
         });
-        self.record_mcp_calls(&done.output);
+        self.record_code_calls(&done.output);
     }
 
-    fn record_mcp_calls(&mut self, output: &ToolOutput) {
-        let ToolOutput::McpCode(run) = output else {
+    fn record_code_calls(&mut self, output: &ToolOutput) {
+        let ToolOutput::Code(run) = output else {
             return;
         };
         for call in &run.calls {
             self.record_tool_usage(ToolCall {
                 tool: call.qualified_name(),
-                source: mcp_code::CALL_SOURCE.to_owned(),
+                source: code_output::CALL_SOURCE.to_owned(),
                 cwd: self.state.session.cwd.clone(),
                 outcome: call.ledger_outcome(),
                 duration_ms: call.duration_ms,

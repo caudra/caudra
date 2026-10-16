@@ -699,6 +699,82 @@ mod tests {
         extract(source, language, ExtractLimits::default()).expect("parses")
     }
 
+    #[test_case("<?php function run($object) { return clone($object, ['name' => value()]); }", "value" ; "clone arguments")]
+    #[test_case("<?php function run() { return apply(?, 1); }", "apply" ; "partial application")]
+    fn php_modern_calls_keep_their_enclosing_function(source: &str, callee: &str) {
+        let facts = facts(source, Language::Php);
+        assert!(!facts.parse_error);
+        let caller = facts
+            .definitions
+            .iter()
+            .position(|definition| definition.name == "run")
+            .unwrap();
+        let call = facts
+            .references
+            .iter()
+            .find(|reference| reference.name == callee)
+            .unwrap();
+        assert_eq!(call.kind, ReferenceKind::Call);
+        assert_eq!(call.enclosing, Some(caller));
+    }
+
+    #[test]
+    fn php_dynamic_partial_calls_do_not_invent_named_edges() {
+        let facts = facts(
+            "<?php function run($object, $method, $callback) { $object->$method(?); $callback(?); }",
+            Language::Php,
+        );
+        assert!(!facts.parse_error);
+        assert!(facts.references.is_empty());
+        assert_eq!(facts.definitions.len(), 1);
+        assert_eq!(facts.definitions[0].name, "run");
+    }
+
+    #[test]
+    fn go_alias_spans_do_not_steal_calls_from_the_enclosing_function() {
+        const SOURCE: &str = "package example\ntype Alias = Target\nfunc run() { type Local = Target; helper() }\nfunc helper() {}\n";
+        let facts = facts(SOURCE, Language::Go);
+        assert!(!facts.parse_error);
+        for (name, declaration) in [("Alias", "Alias = Target"), ("Local", "Local = Target")] {
+            let definition = facts
+                .definitions
+                .iter()
+                .find(|definition| definition.name == name)
+                .unwrap();
+            assert_eq!(definition.kind, SymbolKind::Class);
+            assert_eq!(
+                &SOURCE[definition.span.start..definition.span.end],
+                declaration
+            );
+        }
+        let caller = facts
+            .definitions
+            .iter()
+            .position(|definition| definition.name == "run")
+            .unwrap();
+        assert_eq!(facts.references.len(), 1);
+        assert_eq!(facts.references[0].name, "helper");
+        assert_eq!(facts.references[0].kind, ReferenceKind::Call);
+        assert_eq!(facts.references[0].enclosing, Some(caller));
+    }
+
+    #[test]
+    fn go_aliases_respect_the_definition_bound() {
+        let facts = extract(
+            "package example\ntype First = int\ntype Second = string\n",
+            Language::Go,
+            ExtractLimits {
+                max_definitions_per_file: 1,
+                ..ExtractLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(facts.definitions.len(), 1);
+        assert_eq!(facts.definitions[0].name, "First");
+        assert!(facts.definitions_truncated);
+        assert!(facts.references.is_empty());
+    }
+
     #[test]
     fn attributes_a_call_to_the_method_that_contains_it() {
         // The regression ripwire paid for: when the method span is the whole impl block, this call

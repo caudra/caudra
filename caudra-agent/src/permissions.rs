@@ -21,7 +21,7 @@ use structured::NORMALIZED_COMMAND_ATTRIBUTE;
 pub(crate) use structured::hex_encode;
 pub use structured::review;
 pub use structured::{
-    AutoNote, AutopilotNote, COMMAND_EXACT_PREFIX, COMMAND_GROUP_PREFIX,
+    ALL_PROJECTS_HISTORY, AutoNote, AutopilotNote, COMMAND_EXACT_PREFIX, COMMAND_GROUP_PREFIX,
     COMMAND_OBSERVATION_ATTRIBUTE, COMMAND_OBSERVATION_BINDING_ATTRIBUTE, COMMAND_PATTERN_PREFIX,
     COMMAND_TEMPLATE_PREFIX, COMPOSABLE_SHELL_OPTIONS, CONFINED_READ_AUTHORITY,
     ComposedAnswerError, ComposedRow, EngineFlag, MCP_SERVER_READS_OPTION, MCP_SERVER_RESOURCE,
@@ -32,8 +32,9 @@ pub use structured::{
     PermissionResourceKind, PermissionResourcePresentation, PermissionResourceSelector,
     PermissionRisk, PermissionRowGrant, PermissionRuleOption, PermissionRuleRecord,
     PermissionSubject, PolicyRule, PromptReason, READ_ONLY_MCP_TOOL_OPTION,
-    RemotePermissionIdentity, ResourceCoverage, ResourceStanding, RuleOrigin, ScriptLanguage,
-    SelectedInputError, SelectedPermissionArgument, ShellOpacity, StructuredPermissionDecision,
+    RemotePermissionIdentity, ResourceCoverage, ResourceStanding, RuleOrigin,
+    SESSION_HISTORY_READS_OPTION, SESSION_HISTORY_RESOURCE, ScriptLanguage, SelectedInputError,
+    SelectedPermissionArgument, ShellOpacity, StructuredPermissionDecision,
     StructuredPermissionEffect, StructuredPermissionRule, UnknownShellOpacity,
     argument_constraint_matches, canonical_json, canonical_json_sha256,
     escape_json_pointer_segment, evaluate_structured_permission_rules,
@@ -50,8 +51,9 @@ pub(crate) use manager::PassiveDecisionRevision;
 pub use manager::{PermissionManager, PermissionProjectFilter, RevokedRuleScope};
 mod policy;
 pub use policy::{
-    ActivePolicyRule, CONFINED_READ_ATTRIBUTE, CONFINED_READ_VALUE, PERMISSION_DENIED_PREFIX,
-    PermissionPolicyError, PluginRuleStore, VerifiedLocalSourceLocator,
+    ActivePolicyRule, CONFINED_READ_ATTRIBUTE, CONFINED_READ_VALUE, CURRENT_PROJECT_ATTRIBUTE,
+    CURRENT_PROJECT_VALUE, PERMISSION_DENIED_PREFIX, PermissionPolicyError, PluginRuleStore,
+    VerifiedLocalSourceLocator,
 };
 use policy::{
     ConfiguredPolicy, SharedPermissionState, builtin_rules, configured_policy, shared_policy,

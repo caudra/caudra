@@ -1831,9 +1831,9 @@ mod tests {
 
     #[test_case("FileRead", "file_read")]
     #[test_case("Shell", "shell")]
-    #[test_case("PythonExecution", "python_execution")]
+    #[test_case("Code", "code")]
     #[test_case("ExecutionEnvironment", "execution_environment")]
-    #[test_case("python_execution", "python_execution"; "snake_passthrough")]
+    #[test_case("image_generate", "image_generate"; "snake_passthrough")]
     fn normalize_tool_name_valid_inputs(input: &str, expected: &str) {
         assert_eq!(normalize_tool_name(input).unwrap(), expected);
     }
@@ -1983,9 +1983,10 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("unknown tool"));
     }
 
-    #[test]
-    fn normalize_tool_name_rejects_removed_lua_tool() {
-        assert!(normalize_tool_name("MultiEdit").is_err());
+    #[test_case("MultiEdit"; "removed_lua_tool")]
+    #[test_case("PythonExecution"; "folded_into_code")]
+    fn normalize_tool_name_rejects_removed_tools(name: &str) {
+        assert!(normalize_tool_name(name).is_err());
     }
 
     #[test]

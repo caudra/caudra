@@ -323,7 +323,7 @@ fn signal_group(pid: Option<u32>, force: bool) {
         .and_then(|v| i32::try_from(v).ok())
         .and_then(Pid::from_raw)
     {
-        let _ = kill_process_group(pid, if force { Signal::Kill } else { Signal::Term });
+        let _ = kill_process_group(pid, if force { Signal::KILL } else { Signal::TERM });
     }
 }
 #[cfg(unix)]
@@ -359,10 +359,19 @@ pub(crate) fn exit_signal(_status: &ExitStatus) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
+    #[cfg(unix)]
+    use std::process::Stdio;
+
+    #[cfg(unix)]
+    use rustix::process::Signal;
+    #[cfg(unix)]
+    use tokio::io::AsyncReadExt;
 
     use super::*;
 
     const LAUNCH_CANARY: &str = "echo launcher-canary";
+    #[cfg(unix)]
+    const SIGNAL_DEADLINE: Duration = Duration::from_secs(5);
     const STARTUP_ENVIRONMENT: &[(&str, &str)] = &[
         ("WORKCELL_BASH_EXECUTABLE", "/host/bash"),
         ("BASH_ENV", "startup-canary"),
@@ -492,6 +501,40 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn group_cleanup_preserves_graceful_and_forceful_signals() {
+        let launcher = ShellLauncher::from_host().await.unwrap();
+        for (force, script, expected) in [
+            (false, "printf x; read -r line", Signal::TERM),
+            (true, "trap '' TERM; printf x; read -r line", Signal::KILL),
+        ] {
+            let mut child = platform_command(&launcher, script, &[])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let mut ready = [0];
+            tokio::time::timeout(
+                SIGNAL_DEADLINE,
+                child.stdout.as_mut().unwrap().read_exact(&mut ready),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(group_exists(pid));
+            signal_group(pid, force);
+            let status = tokio::time::timeout(SIGNAL_DEADLINE, child.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(exit_signal(&status), Some(expected.as_raw()));
+            assert!(!group_exists(pid));
+        }
     }
 
     #[test]

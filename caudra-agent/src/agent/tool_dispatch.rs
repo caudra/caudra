@@ -28,7 +28,7 @@ use crate::tools::registry::{
     PlanModeAccess, RegisteredTool, ToolInvocation, ToolRegistry, TrustedToolSource,
 };
 use crate::tools::{
-    DOOM_LOOP_GUIDANCE, LocalToolEntry, LockKey, MCP_TOOL_NAME, PLAN_WRITE_RESTRICTED,
+    CODE_TOOL_NAME, DOOM_LOOP_GUIDANCE, LocalToolEntry, LockKey, PLAN_WRITE_RESTRICTED,
     READ_ONLY_CALL_GUIDANCE, READ_ONLY_TOOL_RESTRICTED, TOOL_SEARCH_TOOL_NAME, ToolContext,
     ToolEffect, ToolError, ToolExecResult, ToolFailure, ToolSource,
 };
@@ -73,7 +73,7 @@ impl Emit<'_> {
 const DOOM_LOOP_THRESHOLD: usize = 3;
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
 const MCP_THROUGH_CODE: &str =
-    ". MCP tools are called from the `mcp` tool: `await <server>.<tool>(...)`";
+    ". MCP tools are called from the `code` tool: `await <server>.<tool>(...)`";
 pub(crate) const TOOL_DISABLED_SUFFIX: &str = "is disabled for the current agent";
 const INVALID_INPUT_MESSAGE: &str = "arguments were not valid JSON, so the tool did not run. Call it again with complete \
      arguments; if the input is large, split it across several calls. Raw text received:";
@@ -446,7 +446,7 @@ pub async fn run(
     ctx: &ToolContext,
     mut emit: Emit<'_>,
 ) -> ToolDoneEvent {
-    // Not narrowed by the mode: the `mcp` tool judges each call against it, so a write a plan
+    // Not narrowed by the mode: the `code` tool judges each call against it, so a write a plan
     // refuses says why instead of looking like a tool that does not exist.
     let filtered_mcp = mcp
         .cloned()
@@ -455,8 +455,7 @@ pub async fn run(
     let mut policy_ctx = ctx.clone();
     policy_ctx.mcp = filtered_mcp.clone();
     policy_ctx.deferral = ctx.deferral.as_ref().map(|deferral| {
-        deferral
-            .filtered(|name| crate::tools::profile_policy::tool_available(registry, mcp, ctx, name))
+        deferral.filtered(|name| crate::tools::profile_policy::tool_available(registry, ctx, name))
     });
     let ctx = &policy_ctx;
     let mut observed_ctx;
@@ -479,7 +478,7 @@ pub async fn run(
     let started = Instant::now();
     let entry = registry.get(canonical);
     let local = ctx.local_tools.get(canonical);
-    let available = available_for_dispatch(registry, mcp, canonical, ctx);
+    let available = available_for_dispatch(registry, canonical, ctx);
     let eligible = ctx.config.tool_json_repair
         && available
         && (entry
@@ -492,7 +491,7 @@ pub async fn run(
             || local.is_some_and(|local| local.effect.is_safe_in_read_only()));
     let invalid = ctx.json_repair.invalid_input(&id);
     let repair = if eligible && invalid.is_some() {
-        let schema = repair_schema(registry, mcp, canonical, ctx);
+        let schema = repair_schema(registry, canonical, ctx);
         Some(match schema {
             Some(schema) => ctx.json_repair.repair(&id, canonical, &schema, ctx).await,
             None => Err(RepairError::Schema),
@@ -614,7 +613,7 @@ pub async fn run(
     }
     if !admitted
         && !ctx.cancel.is_cancelled()
-        && (matches!(canonical, "webfetch" | "websearch" | MCP_TOOL_NAME)
+        && (matches!(canonical, "webfetch" | "websearch" | CODE_TOOL_NAME)
             || matches!(
                 entry.as_ref().map(|entry| &entry.source),
                 Some(ToolSource::Mcp { .. })
@@ -698,11 +697,10 @@ pub async fn run(
 
 pub(crate) fn repair_schema(
     registry: &ToolRegistry,
-    mcp: Option<&McpSession>,
     name: &str,
     ctx: &ToolContext,
 ) -> Option<Value> {
-    if !available_for_dispatch(registry, mcp, name, ctx) {
+    if !available_for_dispatch(registry, name, ctx) {
         return None;
     }
     if ctx.local_tools.contains_key(name) {
@@ -803,7 +801,7 @@ async fn run_inner(
         }
     }
 
-    if !available_for_dispatch(registry, mcp, name, ctx) {
+    if !available_for_dispatch(registry, name, ctx) {
         return done_error(
             ToolFailure::Denied,
             format!("tool {name} {TOOL_DISABLED_SUFFIX}"),
@@ -1481,16 +1479,11 @@ fn announce_loads(ctx: &ToolContext, loaded: Vec<Arc<str>>) {
 /// Whether anything is deferred at all. The search tool is declared only when
 /// it has something to find, so being asked for it otherwise is an unknown
 /// tool rather than an empty answer.
-fn available_for_dispatch(
-    registry: &ToolRegistry,
-    mcp: Option<&McpSession>,
-    name: &str,
-    ctx: &ToolContext,
-) -> bool {
+fn available_for_dispatch(registry: &ToolRegistry, name: &str, ctx: &ToolContext) -> bool {
     if !ctx.local_tools.contains_key(name) && !registry.has(name) {
         return true;
     }
-    crate::tools::profile_policy::tool_available(registry, mcp, ctx, name)
+    crate::tools::profile_policy::tool_available(registry, ctx, name)
 }
 
 fn searchable(ctx: &ToolContext) -> bool {
@@ -6372,14 +6365,14 @@ mod tests {
                 &ctx.registry,
                 Some(&mcp),
                 RECORDED_MCP_CALL.into(),
-                MCP_TOOL_NAME,
+                CODE_TOOL_NAME,
                 &json!({"code": "1"}),
                 &ctx,
                 Emit::Silent,
             )
             .await;
 
-            assert_eq!(done.tool.as_ref(), MCP_TOOL_NAME);
+            assert_eq!(done.tool.as_ref(), CODE_TOOL_NAME);
             assert!(changes.steps().is_empty());
         });
     }

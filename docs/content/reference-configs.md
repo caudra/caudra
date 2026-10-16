@@ -162,13 +162,13 @@ version = 1
 # Type: u32, at least 1.
 # mouse_scroll_lines = 3
 
-# Rows of body a shell, python_execution or task card draws. The window follows
-# new output while it sits at the bottom and pauses when scrolled up. Click
-# inside a window to give it the wheel, which passes back to the transcript at
-# either edge, and drag the bar in its last column to move it directly. `0`
-# turns scrolling off, restoring the `ui.tool_output_lines` budget for those
-# tools. A write is never windowed: it is drawn whole at any setting, as the
-# file it created or as the diff of what it replaced.
+# Rows of body a shell, code or task card draws. The window follows new output
+# while it sits at the bottom and pauses when scrolled up. Click inside a
+# window to give it the wheel, which passes back to the transcript at either
+# edge, and drag the bar in its last column to move it directly. `0` turns
+# scrolling off, restoring the `ui.tool_output_lines` budget for those tools. A
+# write is never windowed: it is drawn whole at any setting, as the file it
+# created or as the diff of what it replaced.
 # Type: u32.
 # scroll_card_lines = 10
 
@@ -262,9 +262,9 @@ version = 1
 # Type: usize, at least 1.
 # bash = 5
 
-# Rows for `python_execution`.
+# Rows for `code`.
 # Type: usize, at least 1.
-# python_execution = 5
+# code = 5
 
 # Rows for `task`, `task_control`.
 # Type: usize, at least 1.
@@ -292,7 +292,7 @@ version = 1
 # web = 3
 
 # Rows for `automation`, `batch`, `execution_environment`, `list_sessions`,
-# `mcp`, `publish_message`, `question`, `read_topic`, `send_message`, `skill`,
+# `publish_message`, `question`, `read_topic`, `send_message`, `skill`,
 # `todo_write`, `tool_output`, `view_image`, `work_assignment`, `workflow`.
 # Type: usize, at least 1.
 # other = 3
@@ -1021,8 +1021,10 @@ version = 1
 
 # Positive deadline in milliseconds for tool search and the reranking features,
 # which judge at most 16 candidates per request and send their requests
-# concurrently. Memory recall keeps `timeout_ms` because it delays the start of
-# a turn. A `decide()` or `rerank()` call from a workflow or an MCP snippet may
+# concurrently. History search lets each request wait one budget per request in
+# its pool, so an engine that answers one request at a time still gets through
+# its pool. Memory recall keeps `timeout_ms` because it delays the start of a
+# turn. A `decide()` or `rerank()` call from a workflow or a `code` snippet may
 # ask for up to the larger of the two.
 # Type: integer.
 # rerank_timeout_ms = 2000
@@ -1107,6 +1109,13 @@ version = 1
 # shadow, enforce.
 # Type: string.
 # memory_search = "off"
+
+# Rerank session history search's keyword matches against the agent's query,
+# drop those judged unrelated, and return the rest best first. Sends the query
+# and each candidate's kind, tool, date, session title, and a redacted excerpt.
+# Modes: off, shadow, enforce.
+# Type: string.
+# history_search = "off"
 
 # In main sessions, remind the agent of at most three saved notes likely
 # relevant to a new user message, without loading them. Sends a redacted
@@ -1404,7 +1413,7 @@ version = 1
 # [mcp.filesystem]
 # Each [mcp.NAME] table is one server, and a stdio server like this one runs
 # `command`. NAME is 1 to 64 ASCII letters, digits, and hyphens, and cannot be
-# the name of a built-in tool. In the `mcp` tool the server is a Python
+# the name of a built-in tool. In the `code` tool the server is a Python
 # namespace, and its tools are that namespace's async functions.
 
 # Start the server. `/mcp` sets this key when it turns a server on or off.

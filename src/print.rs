@@ -467,7 +467,7 @@ pub fn run(
             | AgentEvent::ToolDone(_)
             | AgentEvent::TaskAdmitted(_)
             | AgentEvent::BatchProgress(_)
-            | AgentEvent::McpCodeProgress(_)
+            | AgentEvent::CodeProgress(_)
             | AgentEvent::Question(_)
             | AgentEvent::QuestionClosed
             | AgentEvent::QueueItemConsumed { .. }
@@ -540,10 +540,30 @@ pub fn run(
                 evaluations,
                 continuations,
                 limit,
+                ..
             } => {
                 is_error = true;
                 result_text = format!(
                     "Goal remains active after {continuations} automatic continuations in this run ({evaluations} total evaluations); the session limit is {limit}"
+                );
+            }
+            AgentEvent::GoalStalled {
+                evaluations, turns, ..
+            } => {
+                is_error = true;
+                result_text = format!(
+                    "Goal remains active, but its last {turns} turns made no progress ({evaluations} total evaluations)"
+                );
+            }
+            AgentEvent::GoalWaiting {
+                evaluations,
+                attempt,
+                limit,
+                ..
+            } => {
+                is_error = true;
+                result_text = format!(
+                    "Goal remains active, waiting on a change outside the session (wait {attempt}/{limit}, {evaluations} total evaluations)"
                 );
             }
             AgentEvent::GoalTurnLimit { evaluations } => {

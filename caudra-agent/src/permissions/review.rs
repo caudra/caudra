@@ -107,7 +107,7 @@ const KNOWN_TOOLS: &[&str] = &[
     "index",
     "webfetch",
     "websearch",
-    "python_execution",
+    "code",
     "source_code_context",
     "source_code_refs",
     "tool_output",

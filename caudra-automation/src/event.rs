@@ -289,6 +289,10 @@ pub enum GoalVerdict {
     Met,
     Impossible,
     Cleared,
+    /// The run stopped because the goal made no progress or used its
+    /// continuations. The goal stays active, so only scripts that list it
+    /// hear of it.
+    Stalled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

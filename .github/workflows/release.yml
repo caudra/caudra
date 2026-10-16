@@ -71,13 +71,16 @@ jobs:
     needs: validate
     runs-on: ubuntu-24.04
     env:
-      RUFF_VERSION: 0.16.2
-      TY_VERSION: 0.0.70
+      RUFF_VERSION: 0.17.1
+      TY_VERSION: 0.0.88
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.15.0"
       - name: Install verification tools
         run: .github/scripts/retry.sh pip install "ruff==${RUFF_VERSION}" "ty==${TY_VERSION}"
       - run: ruff format --check scripts/
@@ -128,12 +131,12 @@ jobs:
       - name: Prepare Alpine cache directories
         run: mkdir -p target "$RUNNER_TEMP/alpine-cargo"
 
-      - uses: actions/cache/restore@v5
+      - uses: actions/cache/restore@v6.1.0
         id: cargo-cache
         with:
-          key: alpine-cargo-v1-3.21-${{ matrix.target }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-${{ hashFiles('Cargo.lock', 'scripts/build-code-worker.py') }}
+          key: alpine-cargo-v1-3.24.2-${{ matrix.target }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-${{ hashFiles('Cargo.lock', 'scripts/build-code-worker.py') }}
           restore-keys: |
-            alpine-cargo-v1-3.21-${{ matrix.target }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-
+            alpine-cargo-v1-3.24.2-${{ matrix.target }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-
           path: |
             ${{ runner.temp }}/alpine-cargo/registry/cache
             ${{ runner.temp }}/alpine-cargo/git/db
@@ -192,8 +195,8 @@ jobs:
                 XDG_CACHE_HOME="$PWD/target/release-smoke-cache" \
                 target/${{ matrix.target }}/release/caudra --model openai/gpt-5.1 \
                 tools --enabled-only --names 2>&1)"
-              printf "%s\n" "$smoke_output" | grep -qx python_execution
-              ! printf "%s\n" "$smoke_output" | grep -q "Workcell python_execution is unavailable"
+              printf "%s\n" "$smoke_output" | grep -qx code
+              ! printf "%s\n" "$smoke_output" | grep -q "The code tool is unavailable"
               '
 
       - name: Restore ownership after Alpine
@@ -205,7 +208,7 @@ jobs:
             fi
           done
 
-      - uses: actions/cache/save@v5
+      - uses: actions/cache/save@v6.1.0
         if: ${{ !cancelled() && steps.cargo-cache.outputs.cache-primary-key != '' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
@@ -273,12 +276,12 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
-          python-version: "3.13"
+          python-version: "3.15.0"
 
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.99.0 --profile minimal --target ${{ matrix.target }}
+        run: rustup toolchain install 1.99.1 --profile minimal --target ${{ matrix.target }}
 
       - name: Provision macOS installer shells
         if: runner.os == 'macOS'
@@ -352,8 +355,8 @@ jobs:
           smoke_output="$(OPENAI_API_KEY=release-smoke \
             XDG_CACHE_HOME="$PWD/target/release-smoke-cache" \
             "$binary" --model openai/gpt-5.1 tools --enabled-only --names 2>&1)"
-          printf '%s\n' "$smoke_output" | grep -qx python_execution
-          ! printf '%s\n' "$smoke_output" | grep -q 'Workcell python_execution is unavailable'
+          printf '%s\n' "$smoke_output" | grep -qx code
+          ! printf '%s\n' "$smoke_output" | grep -q 'The code tool is unavailable'
 
       - name: Upload build timings
         if: ${{ !cancelled() }}

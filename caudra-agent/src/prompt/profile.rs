@@ -1569,6 +1569,37 @@ mod tests {
         format!("automations: [{{name: {GOAL_CHAIN}, args: {args}}}]")
     }
 
+    #[test]
+    fn yaml_aliases_preserve_typed_profile_args() {
+        let profile = load_frontmatter(&format!(
+            "description: &name {GOAL_CHAIN}\nlayout: overlay\nsubagent_thinking: 8192\nautomations:\n  - name: *name\n    args: {{enabled: true, label: 'true', count: 2, unset: null}}"
+        ))
+        .unwrap();
+        assert_eq!(profile.description(), Some(GOAL_CHAIN));
+        assert_eq!(profile.layout(), PromptProfileLayout::Overlay);
+        assert_eq!(
+            profile.subagent_thinking(),
+            Some(&StoredThinking::Budget { tokens: 8192 })
+        );
+        assert_eq!(
+            profile.automations(),
+            [ProfileAutomation {
+                name: GOAL_CHAIN.into(),
+                args: Some(json!({"enabled": true, "label": "true", "count": 2, "unset": null})),
+            }]
+        );
+    }
+
+    #[test_case("description: first\ndescription: second"; "duplicate_field")]
+    #[test_case("description: *missing"; "unknown_alias")]
+    #[test_case("description: [unterminated"; "malformed_yaml")]
+    fn invalid_yaml_frontmatter_is_not_silently_defaulted(yaml: &str) {
+        assert!(matches!(
+            load_frontmatter(yaml),
+            Err(PromptProfileError::InvalidFrontmatter(_))
+        ));
+    }
+
     #[test_case("description: Worker", Vec::new(); "omitted")]
     #[test_case(&format!("automations: [{JOIN_SWARM}]"), vec![ProfileAutomation { name: JOIN_SWARM.into(), args: None }]; "bare_name")]
     #[test_case(

@@ -5,8 +5,6 @@ use caudra_config::{
 use serde_json::Value;
 use std::mem;
 
-use crate::mcp::McpSession;
-
 use super::{
     DescriptionContext, LocalToolEntry, LocalTools, RegisteredTool, TOOL_OUTPUT_TOOL_NAME,
     ToolContext, ToolDefinitions, ToolFilter, ToolRegistry, ToolSource, deferral::DeferredTool,
@@ -220,16 +218,11 @@ pub fn configure_definitions(definitions: &mut ToolDefinitions, ctx: &ToolContex
 
 impl ToolContext {
     pub fn tool_available(&self, name: &str) -> bool {
-        tool_available(&self.registry, self.mcp.as_ref(), self, name)
+        tool_available(&self.registry, self, name)
     }
 }
 
-pub fn tool_available(
-    registry: &ToolRegistry,
-    mcp: Option<&McpSession>,
-    ctx: &ToolContext,
-    name: &str,
-) -> bool {
+pub fn tool_available(registry: &ToolRegistry, ctx: &ToolContext, name: &str) -> bool {
     let name = ctx.resolve_tool_name_alias(name);
     let filter = ctx
         .tool_filter
@@ -245,7 +238,6 @@ pub fn tool_available(
                 && effective_task_execution(&ctx.config, ctx.background.is_some()).is_none())
             || (name == super::SHELL_TOOL_NAME
                 && effective_shell_execution(&ctx.config, ctx.job_scope().is_some()).is_none())
-            || (name == super::MCP_TOOL_NAME && !mcp.is_some_and(|mcp| mcp.has_enabled_server()))
         {
             return false;
         }

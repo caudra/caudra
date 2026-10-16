@@ -16,7 +16,7 @@ const UNSAFE_MODEL: &str =
     "workflow model must be a bounded identifier without credentials or control characters";
 
 impl Decisions {
-    /// A script's own request, from a workflow or an MCP code-mode run: `feature` names the
+    /// A script's own request, from a workflow or a `code` run: `feature` names the
     /// caller in the log and sets the deadline ceiling.
     pub async fn scripted(
         &self,

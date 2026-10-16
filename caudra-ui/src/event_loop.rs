@@ -35,9 +35,9 @@ use crate::sandbox::{
 };
 use caudra_agent::automation::frontend::wake_origin;
 use caudra_agent::background::BackgroundTransition;
+use caudra_agent::code::runner as code_runner;
 use caudra_agent::command::CustomCommand;
 use caudra_agent::config_watch::ConfigSource;
-use caudra_agent::mcp::code::runner as code_runner;
 use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::{
     BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile,
@@ -672,6 +672,7 @@ impl SessionRuntime {
             self.app
                 .goal_checkin_due()
                 .then_some(SettleBlocker::GoalCheckin),
+            self.app.goal_waits().then_some(SettleBlocker::GoalWaiting),
             (!self.handles.agent_rx.is_empty()).then_some(SettleBlocker::AgentEvents),
         ]
         .into_iter()

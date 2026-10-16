@@ -46,7 +46,7 @@ use caudra_agent::{
     SpanStyle, SubagentActivity, SubagentProgress, TaskCard, ToolInput, ToolOutput,
     format_live_duration, format_settled_duration, mcp_tool_parts, pretty_json,
     tools::{
-        FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, IMAGE_GENERATE_TOOL_NAME, MCP_TOOL_NAME,
+        CODE_TOOL_NAME, FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, IMAGE_GENERATE_TOOL_NAME,
         MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME,
         TOOL_OUTPUT_TOOL_NAME, humanize_duration, timeout_annotation,
     },
@@ -355,7 +355,7 @@ const SHELL_COMMAND_KEY: &str = "command";
 const LIVE_SCRIPT_TOOLS: &[(&str, bool)] = &[
     (SHELL_TOOL_NAME, true),
     (PYTHON_EXECUTION_TOOL_NAME, true),
-    (MCP_TOOL_NAME, true),
+    (CODE_TOOL_NAME, true),
     (IMAGE_GENERATE_TOOL_NAME, false),
 ];
 /// A delegation is the one member whose live body is not what its settled card
@@ -376,7 +376,7 @@ const DRAFTING_LABELS: &[(&str, &str)] = &[
     (IMAGE_GENERATE_TOOL_NAME, WRITING_PROMPT),
     (SHELL_TOOL_NAME, WRITING_COMMAND),
     (PYTHON_EXECUTION_TOOL_NAME, WRITING_SCRIPT),
-    (MCP_TOOL_NAME, WRITING_SCRIPT),
+    (CODE_TOOL_NAME, WRITING_SCRIPT),
     (TASK_TOOL_NAME, WRITING_BRIEF),
 ];
 /// What any call whose permission prompt is open is doing.

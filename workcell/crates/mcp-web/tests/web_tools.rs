@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use bytes::Bytes;
 use http::StatusCode;
 use serde_json::{Map, Value, json};
@@ -1666,11 +1667,16 @@ async fn webfetch_pdf_extract_attachment_and_parser_failures_are_classified() {
         structured["pdfAttachment"]["filename"],
         json!("study copy.pdf")
     );
-    assert!(
-        structured["pdfAttachment"]["url"]
-            .as_str()
-            .expect("data URL")
-            .starts_with("data:application/pdf;base64,")
+    let encoded = structured["pdfAttachment"]["url"]
+        .as_str()
+        .expect("data URL")
+        .strip_prefix("data:application/pdf;base64,")
+        .expect("PDF data URL");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("canonical base64"),
+        pdf
     );
 
     for outcome in [PdfOutcome::Failure, PdfOutcome::Panic] {

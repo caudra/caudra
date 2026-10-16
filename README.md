@@ -157,7 +157,7 @@ Every turn re-sends the conversation, so a noisy result costs tokens again on ev
 - **RTK-style output filtering.** Command-aware rules, most of them from RTK, trim build and test noise before the model reads the output, and a filtered result is always smaller than the raw one. A failure is never reported as a success, and a failing command keeps its first and last lines. Progress bars collapse to one row, and you can switch between filtered and raw views.
 - **Structure before content.** `file_index` returns a file outline with signatures and line numbers. The `source_code_*` tools rank the symbols a task touches and show callers, call sites, and the tests they can trace to a change. They parse the source on the fly, so there is no index to build or maintain and nothing to configure.
 - **Fewer, smaller turns.** Oversized results reach the model as a bounded head and tail, and `tool_output` searches the rest. `batch` runs independent calls in one turn, and subagents keep their exploration out of the main context.
-- **MCP servers through Python.** The model reaches your MCP servers by writing Python in one `mcp` tool. A snippet calls several tools at once and filters their results before the model reads anything, and a server that connects or changes its tools never changes the tool definitions, so the prompt cache holds.
+- **MCP servers through Python.** The model reaches your MCP servers by writing Python in its one `code` tool. A snippet calls several tools at once and filters their results before the model reads anything, and a server that connects or changes its tools never changes the tool definitions, so the prompt cache holds.
 
 Caudra sends a per-conversation cache key where providers accept one, and `/usage` scores the cache hit rate for every model. In the creator's daily use, about 97% of Anthropic and 94% of OpenAI prompt tokens came from cache. With credit to the ideas in [RTK](https://www.rtk-ai.app/docs/) and [ripwire](https://github.com/redhat-et/ripwire).
 
@@ -253,7 +253,7 @@ When a tool stops at a limit or leaves something out, its result says what is mi
 - **Searches that report what they withheld.** A `file_grep` or `file_glob` call that reaches its bounds returns what it found and reports how much it withheld, so the model can tell a missing match from a file it never searched. Directory searches skip credential files such as `.env` and SSH private keys.
 - **Guarded web fetching.** `webfetch` refuses private, loopback, and link-local addresses and checks every redirect the same way. Pages arrive in the character set they declare, and a page cut at 2,000 lines or 50 KiB ends with a line that names the limit.
 - **PDFs as text or as the file.** A fetched PDF arrives as its text. In attachment mode, a model that reads PDFs receives the file itself inside the tool result, within a quarter of its context window. Saved sessions keep only the URL, name, and page count.
-- **Python in an isolated worker.** `python_execution` runs scripts in a separate worker with no file system, network, environment variables, or subprocesses. That isolation is why the default permission policy runs it without a prompt.
+- **Python in an isolated worker.** `code` runs snippets in a separate worker with no file system, network, environment variables, or subprocesses. A snippet that calls nothing outside the worker runs without a prompt, and each call it makes, such as a search of your past conversations, is checked on its own.
 
 Attached PDFs reach Claude through Anthropic or Amazon Bedrock, and custom models on a compatible API that declare PDF support. Other models receive the extracted text with a line that says why.
 
@@ -298,7 +298,7 @@ Caudra reads the instruction files and skills you already have and connects to y
 
 - **[Instruction files](https://caudra.ai/docs/context/#instruction-files).** At session start, Caudra loads `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `GEMINI.md`, or one of six other instruction file names.
 - **[Skills](https://caudra.ai/docs/skills/#where-skills-live).** Caudra reads skills from `.claude/skills` and `.agents/skills` folders.
-- **[MCP servers](https://caudra.ai/docs/mcp/#configuration).** Add stdio or HTTP MCP servers in `mcp.toml`, with OAuth sign-in. The model calls them by writing Python in one `mcp` tool, and Caudra speaks the current MCP protocol and the older one.
+- **[MCP servers](https://caudra.ai/docs/mcp/#configuration).** Add stdio or HTTP MCP servers in `mcp.toml`, with OAuth sign-in. The model calls them by writing Python in its `code` tool, and Caudra speaks the current MCP protocol and the older one.
 - **[Scripts](https://caudra.ai/docs/headless/#claude-code-compatibility).** `--print` writes the same JSON fields as Claude Code, so scripts that parse its output keep working.
 
 ### A model for each job
@@ -322,7 +322,7 @@ Eleven jobs decide which model serves each kind of work. Pin a job to a model in
 See [Model jobs](https://caudra.ai/docs/providers/#model-jobs).
 
 <!-- BEGIN caudra.ai capabilities: generated by `bun run readme:snippet` in caudra/website. Edit there. -->
-## 74 capabilities, designed together.
+## 75 capabilities, designed together.
 
 *Everything in the box*
 
@@ -354,7 +354,7 @@ Each one links to its documentation. Experimental items are marked and stay off 
 - [File outlines with `file_index`](https://caudra.ai/docs/tools/#file_index)
 - [Code maps for 37 languages and formats](https://caudra.ai/docs/tools/#code-intelligence)
 - [Shell with output filtering](https://caudra.ai/docs/tools/#shell)
-- [Isolated Python for computation](https://caudra.ai/docs/tools/#python_execution)
+- [Python for computation, history search, and MCP](https://caudra.ai/docs/code/)
 - [Parallel calls with `batch`](https://caudra.ai/docs/tools/#batch)
 - [Retained output search](https://caudra.ai/docs/tools/#tool_output)
 - [Web search and fetch, with PDFs as text or as the file](https://caudra.ai/docs/tools/#web)
@@ -379,7 +379,7 @@ Each one links to its documentation. Experimental items are marked and stay off 
 
 </details>
 <details>
-<summary><b>Sessions</b> (10)</summary>
+<summary><b>Sessions</b> (11)</summary>
 
 - [Revert conversation, files, or both](https://caudra.ai/docs/sessions/#message-actions)
 - [File changes recorded per call](https://caudra.ai/docs/sessions/#recording)
@@ -389,6 +389,7 @@ Each one links to its documentation. Experimental items are marked and stay off 
 - [Git worktrees you open and close](https://caudra.ai/docs/worktrees/#closing-a-worktree)
 - [Retention policies and `/storage`](https://caudra.ai/docs/sessions/#retention)
 - [Move sessions between directories](https://caudra.ai/docs/sessions/#moving-sessions-to-another-directory)
+- [Search past conversations from Python](https://caudra.ai/docs/code/#search-past-conversations)
 - [Spend by model and purpose in `/usage`](https://caudra.ai/docs/token-economy/#cache-hit-rate)
 - [Release notes after an update, with `/changelog`](https://caudra.ai/docs/release-notes/)
 
@@ -514,7 +515,7 @@ Prebuilt binaries for Linux and macOS on x86_64 and ARM64, and for Windows on x8
 cargo install --locked --git https://github.com/caudra/caudra.git caudra
 ```
 
-A plain `cargo install` build leaves out `python_execution`, the isolated Python tool, because only release builds, Nix, and `make install` from a checkout embed its worker. The other tools work as usual.
+A plain `cargo install` build has no worker for the `code` tool, the isolated Python tool, because only release builds, Nix, and `make install` from a checkout embed it. The other tools work as usual.
 
 ### First steps
 

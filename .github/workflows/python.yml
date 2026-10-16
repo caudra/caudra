@@ -45,15 +45,22 @@ on:
       - "workcell/Dockerfile*"
 
 env:
-  RUFF_VERSION: 0.16.2
-  TY_VERSION: 0.0.70
+  RUFF_VERSION: 0.17.1
+  TY_VERSION: 0.0.88
 
 jobs:
   distribution:
-    name: Distribution tests
+    name: Distribution tests (Python ${{ matrix.python }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.13", "3.15.0"]
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
       - run: make distribution-tests
 
   website-docs:
@@ -61,6 +68,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.15.0"
       - run: python3 scripts/test-update-website-docs.py
 
   lint:
@@ -68,6 +78,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.15.0"
       - run: .github/scripts/retry.sh pip install "ruff==${RUFF_VERSION}"
       - run: ruff check scripts/
       - run: ruff format --check scripts/
@@ -77,5 +90,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.15.0"
       - run: .github/scripts/retry.sh pip install "ty==${TY_VERSION}"
       - run: ty check scripts/

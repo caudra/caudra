@@ -9,7 +9,7 @@
           {
             "type": "tool_use",
             "id": "call_520af5694a6b493d8b1618d56d16cecd",
-            "name": "mcp",
+            "name": "code",
             "input": {
               "code": "kept = await everything.get_sum(a=2, b=3)"
             }
@@ -51,7 +51,7 @@
           {
             "type": "tool_use",
             "id": "call_1fa1ea04d163460daced0e9586119298",
-            "name": "mcp",
+            "name": "code",
             "input": {
               "code": "kept"
             }

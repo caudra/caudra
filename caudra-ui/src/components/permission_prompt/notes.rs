@@ -19,7 +19,7 @@ const OUTSIDE_HOME: &str = "Outside your home directory";
 const OUTSIDE_PROJECT: &str = "Outside this project";
 const REMOTE_NOTE: &str = "Runs on a remote workspace";
 pub(super) const READ_ONLY_BADGE: &str = "read-only, as the server describes it";
-/// Every MCP tool is reached through code the `mcp` tool runs, so a request
+/// Every MCP tool is reached through code the `code` tool runs, so a request
 /// for one is a single call out of a snippet that may make many.
 pub(super) const FROM_MCP_SNIPPET: &str = "called from an mcp snippet";
 const WORKDIR_PREFIX: &str = "in ";

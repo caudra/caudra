@@ -695,7 +695,7 @@ on_exit = "detach"
         ]
         tools = self.rpc("tools/list")["tools"]
         require(
-            {"shell", "python_execution", "file_read", "file_write"}
+            {"shell", "code", "file_read", "file_write"}
             <= {tool["name"] for tool in tools},
             "missing VM tools",
         )
@@ -709,7 +709,7 @@ on_exit = "detach"
             generation=self.descriptor["workspaceGeneration"],
         )
         require(
-            "42" in self.tool("python_execution", {"code": "6 * 7"}),
+            "42" in self.tool("code", {"code": "6 * 7"}),
             "bundled Python worker failed",
         )
         self.tool(

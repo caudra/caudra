@@ -1424,6 +1424,7 @@ impl App {
         self.automation_queue_consumed();
         self.goal_deferred = false;
         self.autopilot_checkin_due = false;
+        self.state.goal.end_wait();
         self.queue.clamp_focus();
         self.status = Status::Streaming;
         self.main_chat().show_user_prompt(display, images);
@@ -1441,6 +1442,7 @@ impl App {
         self.automation_queue_consumed();
         self.goal_deferred = false;
         self.autopilot_checkin_due = false;
+        self.state.goal.end_wait();
         self.queue.clamp_focus();
         self.status = Status::Streaming;
         self.main_chat().show_consumed_prompts(items);
@@ -1520,10 +1522,15 @@ impl App {
             return vec![];
         };
         let resumed = mem::take(&mut self.autopilot_checkin_due);
+        let checkin = if self.state.goal.wait().is_some() && !self.goal_deferred {
+            caudra_agent::goal_wait_message(&goal.condition)
+        } else {
+            caudra_agent::goal_checkin_message(&goal.condition)
+        };
         let mut input = self.continuation_input();
-        input.preamble.push(caudra_providers::Message::synthetic(
-            caudra_agent::goal_checkin_message(&goal.condition),
-        ));
+        input
+            .preamble
+            .push(caudra_providers::Message::synthetic(checkin));
         if !resumed {
             return self.start_run(input, String::new(), StartedBy::Goal);
         }
@@ -1583,6 +1590,7 @@ impl App {
         self.automation_run_started(started_by);
         self.goal_deferred = false;
         self.autopilot_checkin_due = false;
+        self.state.goal.end_wait();
         self.clear_exit_request();
         // New work supersedes text held for recovery after an agent error.
         self.recoverable_queue.clear();

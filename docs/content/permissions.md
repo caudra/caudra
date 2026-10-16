@@ -471,7 +471,7 @@ Targets offers only the selected registration's resource kinds, access types, co
 | Shell command | Exact command, token prefix, command template, Any |
 | URL | Exact URL, URL origin, URL subtree, Any |
 | Search query | Exact query, Any |
-| Isolated Python or environment-inspection custom resource | Exact value, Any |
+| Environment-inspection custom resource | Exact value, Any |
 
 Shell targets can have an exact, subtree, or Any workdir condition. Directory targets offer an exact recursion condition. Glob and Regex are command-slot modes, not general resource match modes. A rule matches when any of its targets does, and a target matches when all of its access, protection, and attribute conditions hold. Removing the last target leaves an invalid blank. Unrestricted resources and wildcard conditions require explicit choices.
 
@@ -653,7 +653,7 @@ Structured requests distinguish files, directories, URLs, commands, queries, and
 
 File-write tools remain pre-allowed inside the project working directory and anywhere under the [scratch root](/docs/configuration/#directory-layout), which holds the directory `TMPDIR` points at. Approval covers the root rather than one project's subdirectory inside it, so `/cd` cannot strand a path the model was already given. Paths beside the root under the shared temp root still prompt. Read-only filesystem tools declare scopes and trusted native policy allows them by default. Loading a skill is allowed by default wherever the skill lives. A skill name is a catalog key rather than a path, so the tool can only open a `SKILL.md` under Caudra's own skill directories or read a skill built into the binary. Explicit deny rules can therefore block `file_read`, `file_glob`, `file_grep`, `file_index`, `skill`, or image access without adding normal prompt noise.
 
-Every registered model tool reaches the permission manager. A tool without declared scopes receives its canonical validated input as an exact fallback scope. The `batch` container routes inner calls through the same manager. Native `python_execution` is isolated and has no inner tool calls.
+Every registered model tool reaches the permission manager. A tool without declared scopes receives its canonical validated input as an exact fallback scope. The `batch` container routes inner calls through the same manager. The [`code`](/docs/code/#permissions) tool routes each call its snippet makes through it too: MCP tools, resource reads, and [session history](#session-history).
 
 ### Directory browsing and content reads
 
@@ -674,7 +674,7 @@ The broader `These directories and descendants` option uses `FilesystemRead`, co
 
 ## MCP tool calls
 
-The model calls MCP tools from Python inside the [`mcp` tool](/docs/mcp/#code-mode). Starting a run does not ask. Each server call the snippet makes is reviewed on its own, under the rules below, by its `server.tool` name, such as `github.list_issues`. A call you decline raises `PermissionError` in the snippet, which can catch it and carry on. A deny rule for `mcp` itself blocks every run.
+The model calls MCP tools from Python inside the [`code` tool](/docs/mcp/#code-mode). Starting a run does not ask. Each server call the snippet makes is reviewed on its own, under the rules below, by its `server.tool` name, such as `github.list_issues`. A call you decline raises `PermissionError` in the snippet, which can catch it and carry on. A deny rule for `code` itself blocks every run.
 
 Reading a resource with `read_resource` asks too, scoped to the server and the resource's URI. It is allowed in [plan mode](#plan-mode) and in [read-only agents](#read-only-agents), and the prompt offers to always allow reads from that server. Listing a server's resources never asks.
 
@@ -693,6 +693,17 @@ A [recognised server](/docs/mcp/#recognised-servers) gets more care, and its rea
 - **Executor approvals.** An Executor `resume` call that accepts a paused run always asks in the same way. The prompt shows what the run is waiting for, such as `Executor run waiting for: Deploy to prod? · deploy.run({"env":"prod"})`. A run Caudra did not see pause shows as `Executor run <id>: not a run Caudra saw pause`. Caudra remembers the last 64 paused runs of each server.
 
 [YOLO mode](#yolo-mode) runs these calls without asking, as it runs every forced prompt. Recognition uses the name a server reports. A server that reports one of these names gains only its read-only tools in plan mode, and they still ask. Any other server's tools stay blocked in plan mode and in read-only agents, whatever annotations they carry.
+
+## Session history
+
+A snippet in the [`code` tool](/docs/code/#search-past-conversations) can search and read stored conversations through its `history` module. Each call asks as the `code` tool to read a `session_history` resource, named by its project: the main checkout of a local project, the project of a remote workspace, or `*` for `scope="all"`.
+
+- **The current project.** A built-in rule allows reading the history of the session's own project: its main checkout and verified linked worktrees, or its remote workspace. It follows `/cd`. Only the `history` module marks a read as the current project's, and the rule allows nothing else.
+- **Other projects.** A search, listing, or `read()` that reaches another project, or every project, asks. The prompt offers to always allow `reads history of <project>`, or `reads history of all projects`, so later reads of that history do not ask.
+- **Broad grants.** An allow for `code` with any arguments covers running snippets and never covers another project's history.
+- **Modes.** History calls only read, so they are allowed in [plan mode](#plan-mode) and in [read-only agents](#read-only-agents). Where nobody can answer a prompt, such as an unattended headless run, a read of another project is denied unless a rule allows it.
+
+History results are not redacted, so a tool output that once printed a secret can come back in a search. Keep that in mind before you allow all projects.
 
 ## Shell parsing
 

@@ -43,7 +43,7 @@ const TOOLS: &[&str] = &[
     "index",
     "file_index",
     "shell",
-    "python_execution",
+    "code",
     "execution_environment",
     "webfetch",
     "websearch",

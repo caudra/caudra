@@ -26,9 +26,9 @@ For a larger change, open an issue first and describe your plan. That covers new
 
 Install these yourself:
 
-- [rustup](https://rustup.rs). `rust-toolchain.toml` pins Rust 1.99.0, and rustup fetches it with clippy and rustfmt the first time you build.
+- [rustup](https://rustup.rs). `rust-toolchain.toml` pins Rust 1.99.1, and rustup fetches it with clippy and rustfmt the first time you build.
 - GNU Make and Bash for the targets in the `Makefile`, and [cargo-nextest](https://nexte.st) for the tests.
-- Python 3, which builds the worker behind the `python_execution` tool, and [ripgrep](https://github.com/BurntSushi/ripgrep), which some tests call.
+- Python 3, which builds the worker behind the `code` tool, and [ripgrep](https://github.com/BurntSushi/ripgrep), which some tests call.
 - [stylua](https://github.com/JohnnyMorganz/StyLua), [ruff](https://docs.astral.sh/ruff/), [ty](https://github.com/astral-sh/ty), and [cargo-machete](https://github.com/bnjbvr/cargo-machete) for the formatting and lint checks.
 
 On Windows, run Make from Git Bash and install GNU Make separately. CI provisions GNU Make explicitly. The Makefile uses `python3` by default. If your Python 3 executable is named `python`, use `make PYTHON=python <target>`.
@@ -43,7 +43,7 @@ cd caudra
 make run           # start a debug build
 ```
 
-Cargo-compiling targets depend on `code-worker` automatically: `build`, `check`, `run`, `test`, `lint`, `install`, `install-fast`, `gen-docs`, `gen-docs-check`, and the Workcell targets that compile Rust. No manual bootstrap is needed. The first run downloads and compiles the worker, and later runs reuse it. Run `make code-worker` for an optional warmup. A plain `cargo build` works without the worker, but that binary has no `python_execution` tool and says so at startup.
+Cargo-compiling targets depend on `code-worker` automatically: `build`, `check`, `run`, `test`, `lint`, `install`, `install-fast`, `gen-docs`, `gen-docs-check`, and the Workcell targets that compile Rust. No manual bootstrap is needed. The first run downloads and compiles the worker, and later runs reuse it. Run `make code-worker` for an optional warmup. A plain `cargo build` works without the worker, but in that binary the `code` tool cannot run, and it says so at startup.
 
 A debug build keeps its own config, sessions, sign-ins, and logs in `caudra-debug` directories, such as `~/.config/caudra-debug/`. Your everyday Caudra keeps using its own, and the two share only project `.caudra/` directories. Sign in once inside the debug build with `make run ARGS='-- auth login'`. The `run` target passes `ARGS` to Cargo, so arguments for Caudra go after the `--`. To choose another directory name, set `CAUDRA_NAMESPACE`.
 
@@ -86,9 +86,9 @@ Before you ask for review, run `make ci`. CI also runs the macOS and Windows bui
 
 ## MCP server tests
 
-`make test-mcp-servers` runs the `mcp` tool against real MCP servers: server-everything, Executor, and Home Assistant, each pinned in a Dockerfile under `tests/mcp-servers/`. It needs Docker, and a remote daemon works through `DOCKER_HOST`. CI never runs these tests, and `make test` skips them. `scripts/mcp-servers.py` builds the images, starts and onboards Home Assistant, runs the tests, and then removes every container labelled `caudra-mcp-it`.
+`make test-mcp-servers` runs the `code` tool against real MCP servers: server-everything, Executor, and Home Assistant, each pinned in a Dockerfile under `tests/mcp-servers/`. It needs Docker, and a remote daemon works through `DOCKER_HOST`. CI never runs these tests, and `make test` skips them. `scripts/mcp-servers.py` builds the images, starts and onboards Home Assistant, runs the tests, and then removes every container labelled `caudra-mcp-it`.
 
-The tests in `caudra-workcell/tests/mcp_servers/` run fixed snippets through the `mcp` gateway. The ones in `tests/mcp_sessions/` drive the `caudra` binary over stream-json, as an SDK client would, and answer its permission prompts. Their model answers come from cassettes in `tests/mcp_sessions/cassettes/`, so they need no model and no credentials. When a change alters what Caudra asks the model, record them again with a real model:
+The tests in `caudra-workcell/tests/mcp_servers/` run fixed snippets through the `code` gateway. The ones in `tests/mcp_sessions/` drive the `caudra` binary over stream-json, as an SDK client would, and answer its permission prompts. Their model answers come from cassettes in `tests/mcp_sessions/cassettes/`, so they need no model and no credentials. When a change alters what Caudra asks the model, record them again with a real model:
 
 ```sh
 CAUDRA_IT_RECORD=openai/gpt-6-luna make test-mcp-servers ARGS='-E "binary(mcp_sessions)"'
@@ -172,6 +172,8 @@ Development and release builds use the same Workcell source. There are no siblin
 
 ## Nix
 
+The flake supports x86_64 and aarch64 Linux, and Apple Silicon macOS. Intel macOS uses the native build because current nixpkgs no longer supports it.
+
 CI checks the flake when the Nix files, the Rust or Lua sources, or the docs change. If you edit `flake.nix`, run the same checks locally:
 
 ```sh
@@ -213,11 +215,11 @@ When you draft:
 - Update the draft in the same commit as the change. Leave out refactors, tests, CI and internal tooling.
 - Write for someone updating: what they will notice and what they must do, not how it was built.
 - Fold a follow-up into the bullet it refines, and remove the bullet of a reverted change.
-- Rewrite the lead paragraph as the release grows, so it still sums up the whole release.
+- Keep the highlights in step as the release grows, so they still sum up the whole release.
 
 Every file follows the same format. Run `make gen-docs` after editing one, because CI fails while the docs page is out of date:
 
-1. Start with one paragraph that summarizes the release.
+1. Start with a bullet list of the release's highlights: one plain line per headline change, no bold lead-in, about three to eight items. Nothing comes before it.
 2. Put anything a user must do in a `> [!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`, `[!NOTE]` or `[!TIP]` alert, and say when it applies, such as "Before you update" or "After you update, restart". A release that upgrades the session database says so in an alert like the one in `0.2.0-preview.6.md`.
 3. Group changes under `###` headings, never `#` or `##`.
 4. Start each bullet with a bold lead-in that names the change.

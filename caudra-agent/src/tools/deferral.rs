@@ -4,7 +4,7 @@
 //! catalog, and a search moves it into the array from the next request on.
 //! The deferred set is the fixed list in
 //! [`caudra_config::DEFERRED_BUILTIN_TOOLS`]: a built-in is deferred when most
-//! sessions never call it. MCP tools never pass through here; the `mcp` tool
+//! sessions never call it. MCP tools never pass through here; the `code` tool
 //! reaches them without declaring any.
 //!
 //! Each search loads one tool, and every load costs a prompt-cache prefix,
@@ -1606,7 +1606,7 @@ pub(crate) mod tests {
     #[test_case(BuiltinDeferral::EagerByConfig ; "by config")]
     fn an_eager_run_withholds_nothing(deferral: BuiltinDeferral) {
         assert!(deferred_names(&[], deferral).is_empty());
-        assert!(!is_deferred(PYTHON, &[], deferral));
+        assert!(!is_deferred(AUTOMATION, &[], deferral));
     }
 
     #[test]
@@ -1614,7 +1614,7 @@ pub(crate) mod tests {
         let names = deferred_names(&[], BuiltinDeferral::Lazy);
 
         assert_eq!(names.len(), caudra_config::DEFERRED_BUILTIN_TOOLS.len());
-        assert!(is_deferred(PYTHON, &[], BuiltinDeferral::Lazy));
+        assert!(is_deferred(AUTOMATION, &[], BuiltinDeferral::Lazy));
     }
 
     /// Definitions the caller already put in the array win, so a tool forced

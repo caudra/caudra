@@ -15,10 +15,11 @@ real case gets missed, so every library here is built and run rather than
 described.
 
 A generator whose library, toolchain, or network is unavailable is reported and
-skipped. Its fixture is left alone, because a partial refresh that mixes stale
-and fresh captures is worse than no refresh.
+skipped, leaving its fixture unchanged and making the command exit nonzero.
+Use --output-dir to capture elsewhere without changing the committed fixtures.
 """
 
+import argparse
 import os
 import shutil
 import subprocess
@@ -33,20 +34,24 @@ OUT = os.path.abspath(os.path.join(HERE, "..", "tests", "fixtures", "progress"))
 # from the cargo workspace.
 BUILDS = {
     "rust-indicatif": (
-        ["cargo", "build", "--quiet", "--release"],
+        ["cargo", "build", "--locked", "--quiet", "--release", "--target-dir", "target"],
         "rust_indicatif",
         "rust_indicatif/target/release/indicatif-generator",
     ),
     "go-progressbar": (
-        ["go", "build", "-o", "generator", "."],
+        ["go", "build", "-mod=readonly", "-o", "generator", "."],
         "go_progressbar",
         "go_progressbar/generator",
     ),
-    "go-mpb": (["go", "build", "-o", "generator", "."], "go_mpb", "go_mpb/generator"),
+    "go-mpb": (
+        ["go", "build", "-mod=readonly", "-o", "generator", "."],
+        "go_mpb",
+        "go_mpb/generator",
+    ),
     # Node resolves ESM imports from the importing file's directory and ignores
     # NODE_PATH, so the libraries are installed beside the generators rather than
     # relied on from a global prefix.
-    "node": (["npm", "install", "--no-fund", "--no-audit", "--silent"], ".", None),
+    "node": (["npm", "ci", "--no-fund", "--no-audit"], ".", None),
 }
 
 # name -> (argv or build key, stream). The stream names the pipe the progress
@@ -135,7 +140,10 @@ def capture(argv, stream):
 
 
 def main():
-    os.makedirs(OUT, exist_ok=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-dir", default=OUT, help="directory for captured fixtures")
+    output = parser.parse_args().output_dir
+    os.makedirs(output, exist_ok=True)
     print(f"{'fixture':<22}{'bytes':>8}{'CR':>7}{'LF':>7}{'ESC':>6}  form")
     print("-" * 68)
     written = 0
@@ -158,18 +166,19 @@ def main():
         feeds = data.count(b"\n")
         escapes = data.count(b"\x1b")
         form = "redraw" if carriage else ("lines" if feeds else "single row")
-        with open(os.path.join(OUT, f"{name}.raw"), "wb") as handle:
+        with open(os.path.join(output, f"{name}.raw"), "wb") as handle:
             handle.write(data)
         written += 1
         print(f"{name:<22}{len(data):>8}{carriage:>7}{feeds:>7}{escapes:>6}  {form}")
     print("-" * 68)
-    print(f"{written} fixtures written to {OUT}")
+    print(f"{written} fixtures written to {output}")
     if silent:
         print(f"\nsilent on a pipe, no reduction needed: {', '.join(silent)}")
     if skipped:
         print(f"\nnot regenerated: {', '.join(skipped)}")
         print("their fixtures are unchanged; install the dependencies to refresh them")
+    return 1 if skipped else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

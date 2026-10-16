@@ -610,7 +610,7 @@ fn inventory_summary_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Lin
         inventory_summary_line(
             GridKind::McpTools,
             format!(
-                "{} tools · {} via mcp · {} search-only · {} disabled · {} in context",
+                "{} tools · {} via code · {} search-only · {} disabled · {} in context",
                 format_usize(mcp.tools.len()),
                 format_usize(available_mcp),
                 format_usize(search_only_mcp),
@@ -736,7 +736,7 @@ fn mcp_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>> {
 
     for tool in &inventory.tools {
         let (glyph, status, status_style) = match tool.status {
-            ContextMcpStatus::Available => ("●", "via mcp", theme.tool_success),
+            ContextMcpStatus::Available => ("●", "via code", theme.tool_success),
             ContextMcpStatus::SearchOnly => ("○", "search-only", theme.tool_dim),
             ContextMcpStatus::Disabled => ("×", "disabled", theme.error),
         };
@@ -1320,13 +1320,13 @@ mod tests {
             "· Free ~300 tokens (30.0%)",
             "░ Reserve 100 tokens (10.0%)",
             "Auto-compact  threshold 900 tokens (90.0%) · reserve 100 tokens (10.0%)",
-            "M MCP tools  3 tools · 1 via mcp · 1 search-only · 1 disabled · ~40 tokens in context",
+            "M MCP tools  3 tools · 1 via code · 1 search-only · 1 disabled · ~40 tokens in context",
             "T System tools  2 declared · 1 on demand · 0 disabled · ~75 tokens in context · ~90 tokens if loaded",
             "execution_environment  on demand · ~90 tokens",
             "task  declared · ~30 tokens · counted under profiles",
             "On-load bodies  ~120 tokens across 1 notes",
             "definitions ~25 tokens · loaded bodies ~45 tokens",
-            "issues.fetch  via mcp",
+            "issues.fetch  via code",
             "project.md  on load · ~120 tokens",
             "deploy  loaded · ~45 tokens",
         ] {

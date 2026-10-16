@@ -130,6 +130,7 @@ These keys work the same in every text field: the composer, a picker's filter, f
 | `F2` | Ask /btw about a pending main-agent question without answering it |
 | `F3` | Decline an MCP server's request |
 | `F4` | Answer the question later, or show the next waiting question |
+| `F5` | Write a note for the agent that goes with your answers |
 | `Enter` | Select option |
 | `Ctrl+C` | Copy the text dragged over, or stop the agent that asked |
 | `Esc` | Close |

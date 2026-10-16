@@ -11,11 +11,10 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import tomllib
 import zipfile
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
-
-import tomllib
 
 REPOSITORY = "caudra/caudra"
 ROOT = Path(__file__).resolve().parent.parent
@@ -54,7 +53,7 @@ GENERATED_HEADING = re.compile(
     r"^#{1,6}\s*(?:New to Caudra\?|Updating\b)", re.IGNORECASE
 )
 PAGE_HEADING = re.compile(r"^#{1,2}\s")
-LEAD_BLOCK = re.compile(r"^(?:#|>|[-*+]\s|\d+[.)]\s|\||<| {4}|```|~~~)")
+HIGHLIGHTS = re.compile(r"^- ")
 COMPACT_MARKER = b"CAUDRA-ATTRIBUTION compact-v2\n"
 GRAPH_IDENTITY = ("name", "package", "version", "default_features")
 
@@ -118,12 +117,12 @@ def previous_release(tag: str) -> str | None:
 
 def check_notes_structure(content: str) -> None:
     """Release notes are also what Caudra shows after an update, so they hold
-    only what changed: a lead paragraph, then `###` groups. The sections a
-    GitHub reader needs to install or update are added by `release_notes`."""
-    first = content.lstrip().splitlines()[0]
+    only what changed: a bullet list of highlights, then `###` groups. The
+    sections a GitHub reader needs to install or update are added by
+    `release_notes`."""
     require(
-        LEAD_BLOCK.match(first) is None,
-        "Release notes must start with a lead paragraph that summarizes the release",
+        HIGHLIGHTS.match(content.lstrip()) is not None,
+        "Release notes must start with a bullet list of the release's highlights",
     )
     fenced = False
     for line in content.splitlines():

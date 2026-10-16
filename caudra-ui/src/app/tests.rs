@@ -2,6 +2,7 @@ use super::*;
 use crate::agent::shared_queue::{self, QueueReceiver};
 use crate::agent::tools_preview_source;
 use crate::app::permission_editor::tests::workbench_workspace;
+use crate::app::questions::NOTE_DRAFT_SEPARATOR;
 use crate::app::sandbox::attached_sandbox_instance;
 use crate::app::tasks::{MAIN_TASK_ID, TaskStatus};
 use crate::app::tooltip::ChordTopic;
@@ -68,8 +69,8 @@ use caudra_agent::tools::{
     VIEW_IMAGE_TOOL_NAME, native,
 };
 use caudra_agent::types::{
-    AnswerKind, AskedQuestion, QuestionEvent, QuestionOption, QuestionSource, TodoItem,
-    TodoPriority, TodoStatus,
+    AnswerKind, AskedQuestion, QUESTION_DISMISSED_REPLY, QuestionEvent, QuestionOption,
+    QuestionReply, QuestionSource, TodoItem, TodoPriority, TodoStatus,
 };
 use caudra_agent::{
     BatchProgressEvent, BatchToolEntry, BatchToolStatus, CallStage, CancelToken, DoneReason,
@@ -107,9 +108,9 @@ use caudra_storage::plans::PlanFile;
 use caudra_storage::prompt_stash::{PromptStash, StashEntry};
 use caudra_storage::sessions::{
     PermissionMode, SessionLocation, SessionMeta, StoredActiveGoal, StoredAutomationControls,
-    StoredGoalVerdict, StoredImage, StoredInboundPolicy, StoredMode, StoredPasteRange,
-    StoredPeerControls, StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt,
-    StoredSubagent, StoredSubagentOutcome, StoredTokenUsage, UnrecordedCall,
+    StoredGoalVerdict, StoredGoalWait, StoredImage, StoredInboundPolicy, StoredMode,
+    StoredPasteRange, StoredPeerControls, StoredPromptAdmission, StoredQueuedDraft,
+    StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome, StoredTokenUsage, UnrecordedCall,
 };
 use caudra_storage::state::{self as stored_state, SCOPE_GLOBAL, StateKey};
 use caudra_storage::thinking::StoredThinking;
@@ -4732,13 +4733,11 @@ fn delegation_msg(delegations: Vec<caudra_agent::Delegation>) -> Msg {
 }
 
 /// Each server call a snippet made lands in `/tools` under its own name, beside
-/// the `mcp` run that made it, and costs the context window nothing.
+/// the `code` run that made it, and costs the context window nothing.
 #[test]
 fn an_mcp_run_counts_each_server_call_it_made() {
-    use caudra_agent::mcp::code::output::{
-        CALL_SOURCE, McpCodeCall, McpCodeCallStatus, McpCodeOutput,
-    };
-    use caudra_agent::tools::{MCP_TOOL_NAME, ToolFailure};
+    use caudra_agent::code::output::{CALL_SOURCE, CodeCall, CodeCallStatus, CodeOutput};
+    use caudra_agent::tools::{CODE_TOOL_NAME, ToolFailure};
     use caudra_storage::tool_ledger::ToolOutcome;
 
     const SERVER: &str = "github";
@@ -4750,28 +4749,28 @@ fn an_mcp_run_counts_each_server_call_it_made() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
-    let call = |tool: &str, status, failure, duration_ms| McpCodeCall {
+    let call = |tool: &str, status, failure, duration_ms| CodeCall {
         server: SERVER.into(),
         tool: tool.into(),
         status,
         failure,
         duration_ms,
-        ..McpCodeCall::default()
+        ..CodeCall::default()
     };
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t1".into(),
-        tool: MCP_TOOL_NAME.into(),
-        output: ToolOutput::McpCode(McpCodeOutput {
+        tool: CODE_TOOL_NAME.into(),
+        output: ToolOutput::Code(CodeOutput {
             calls: vec![
-                call(LISTED, McpCodeCallStatus::Success, None, LISTED_MS),
+                call(LISTED, CodeCallStatus::Success, None, LISTED_MS),
                 call(
                     CREATED,
-                    McpCodeCallStatus::Refused,
+                    CodeCallStatus::Refused,
                     Some(ToolFailure::Denied),
                     0,
                 ),
             ],
-            ..McpCodeOutput::default()
+            ..CodeOutput::default()
         }),
         accounting: ToolAccounting {
             source: Some(RUN_SOURCE.into()),
@@ -4799,7 +4798,7 @@ fn an_mcp_run_counts_each_server_call_it_made() {
         .collect();
     assert!(
         rows.iter()
-            .any(|(tool, source, ..)| *tool == MCP_TOOL_NAME && *source == RUN_SOURCE),
+            .any(|(tool, source, ..)| *tool == CODE_TOOL_NAME && *source == RUN_SOURCE),
         "{rows:?}"
     );
     let listed = format!("{SERVER}.{LISTED}");
@@ -7413,6 +7412,62 @@ fn ctrl_c_on_a_subagent_question_cancels_only_that_subagent() {
     assert_eq!(app.run_id, run_id, "{EXPECT_RUN_LEFT_ALONE}");
     assert!(app.chats[1].is_finished());
     assert!(!app.question_form.is_open());
+}
+
+const QUESTION_NOTE_TEXT: &str = "the staging box is down this week";
+const QUESTION_COMPOSER_DRAFT: &str = "half a thought";
+
+/// The main agent's run waiting on its question, with a note written for it
+/// and the note box closed again.
+fn noted_question_app() -> (App, flume::Receiver<String>) {
+    let mut app = question_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let (answer_tx, answers) = flume::unbounded();
+    app.answer_tx = Some(answer_tx);
+    let _ = rendered(&mut app);
+    app.update(Msg::Key(kb::QUESTION_NOTE.to_key_event()));
+    app.update(Msg::Paste(QUESTION_NOTE_TEXT.into()));
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    (app, answers)
+}
+
+#[test_case(KeyCode::Enter, Some(vec![vec![QUESTION_OPTION.to_owned()]]) ; "answered")]
+#[test_case(KeyCode::Esc, None ; "dismissed")]
+fn the_note_goes_to_the_agent_with_the_reply(code: KeyCode, answers: Option<Vec<Vec<String>>>) {
+    let (mut app, replies) = noted_question_app();
+
+    let actions = app.update(Msg::Key(key(code)));
+
+    assert!(actions.is_empty(), "{EXPECT_RUN_LEFT_ALONE}");
+    assert!(!app.question_form.is_open());
+    assert_eq!(
+        QuestionReply::decode(&replies.try_recv().unwrap()),
+        QuestionReply {
+            answers,
+            note: QUESTION_NOTE_TEXT.into(),
+        }
+    );
+}
+
+#[test_case("" ; "into_an_empty_composer")]
+#[test_case(QUESTION_COMPOSER_DRAFT ; "after_the_draft")]
+fn ctrl_c_moves_the_note_to_the_composer(draft: &str) {
+    let (mut app, replies) = noted_question_app();
+    app.input_box.set_input(draft.into());
+
+    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::CancelAgent { run_id: 1 }]
+    ));
+    assert!(replies.is_empty(), "a cancel sends nothing back");
+    let expected = match draft.is_empty() {
+        true => QUESTION_NOTE_TEXT.to_owned(),
+        false => format!("{draft}{NOTE_DRAFT_SEPARATOR}{QUESTION_NOTE_TEXT}"),
+    };
+    assert_eq!(app.input_box.buffer.value(), expected);
 }
 
 const EXPECT_NO_REPLY: &str = "a withdrawn form has nobody waiting for its answer";
@@ -13410,6 +13465,7 @@ fn goal_loop_cap_notice_separates_run_continuations_from_total_evaluations() {
         evaluations: 23,
         continuations: 16,
         limit: 16,
+        autopilot_owned: false,
     }));
 
     assert_eq!(
@@ -13728,6 +13784,60 @@ fn deferred_goal_builds_an_automatic_checkin() {
     assert!(!app.goal_checkin_due());
 }
 
+/// A wait is saved with the goal on wall-clock time, so a session resumed
+/// before it is over keeps waiting, and one resumed after checks in at once.
+#[test_case(u64::MAX, false ; "resumed_before_the_wait_is_over")]
+#[test_case(0, true ; "resumed_after_the_wait_is_over")]
+fn a_resumed_waiting_goal_checks_in_once_its_wait_is_over(until_ms: u64, due: bool) {
+    const WAIT_OVER: &str = "the wait is over";
+    const WAIT_SURVIVES: &str = "a goal's wait must survive a resume";
+    let mut app = test_app();
+    app.state.session_mut().meta.active_goal = Some(Box::new(StoredActiveGoal {
+        goal: 1,
+        set_at_ms: 0,
+        condition: GOAL_CONDITION.into(),
+        evaluations: 1,
+        elapsed_ms: 0,
+        usage: StoredTokenUsage::default(),
+        last_verdict: Some(StoredGoalVerdict::NotMet),
+        last_reason: None,
+        wait: Some(StoredGoalWait {
+            attempt: 1,
+            until_ms,
+        }),
+    }));
+    let model = app.state.model.clone();
+    let mut resumed = test_app();
+    resumed.state = SessionState::from_session(
+        Arc::unwrap_or_clone(app.state.session),
+        &model,
+        &resumed.storage,
+        &resumed.model_policy,
+        Mode::Plan,
+    );
+
+    assert_eq!(resumed.goal_waits(), !due, "{WAIT_SURVIVES}");
+    assert_eq!(resumed.goal_checkin_due(), due, "{WAIT_SURVIVES}");
+    if !due {
+        return;
+    }
+    let actions = resumed.start_goal_checkin();
+    let input = actions
+        .iter()
+        .find_map(|action| match action {
+            Action::SendMessage(input) => Some(input),
+            _ => None,
+        })
+        .expect("the wait's end should start a run");
+    assert!(input.preamble.iter().any(|message| {
+        message
+            .first_text_content()
+            .is_some_and(|text| text.contains(WAIT_OVER))
+    }));
+    assert!(!resumed.goal_checkin_due());
+    assert!(resumed.state.goal.wait().is_none());
+}
+
 #[test]
 fn active_goal_round_trips_through_session_metadata() {
     let continuation_limit = 24;
@@ -13784,6 +13894,7 @@ fn a_resumed_active_goal_keeps_its_spend_evaluations_and_clock() {
         },
         last_verdict: Some(StoredGoalVerdict::NotMet),
         last_reason: Some(GOAL_REASON.into()),
+        wait: None,
     }));
 
     let model = app.state.model.clone();
@@ -16271,6 +16382,7 @@ fn fork_copies_execution_settings_but_resets_conversation_state() {
         usage: StoredTokenUsage::default(),
         last_verdict: None,
         last_reason: None,
+        wait: None,
     }));
     let items = crate::history_items(&[Message::user("prompt".into())]);
     let source = DisplaySource::User(items[0].id);
@@ -29106,6 +29218,7 @@ mod deferred_questions {
     const HELD: &str = "a blocking ask must not take the place of a form the user started";
     const GIVEN_BACK: &str = "a deferred form must dock again once the blocking ask is answered";
     const DOCKS_AT_ONCE: &str = "a deferred question docks at once when the dock is free";
+    const NOTE: &str = "ask again after the deploy";
 
     fn asked(call: &str, delivery: QuestionDelivery) -> QuestionEvent {
         QuestionEvent {
@@ -29289,6 +29402,31 @@ mod deferred_questions {
         assert_eq!(app.waiting_question_count(), 1);
         assert!(app.reopen_question(Some(FIRST)));
         assert_eq!(app.question_form.call_id(), Some(BLOCKING_CALL));
+    }
+
+    #[test]
+    fn the_note_stays_with_a_question_put_off_and_put_aside() {
+        let (mut app, answers) = streaming();
+        ask_blocking(&mut app, QuestionDelivery::Deferrable);
+        app.update(Msg::Key(kb::QUESTION_NOTE.to_key_event()));
+        app.update(Msg::Paste(NOTE.into()));
+        app.update(Msg::Key(key(KeyCode::Esc)));
+
+        app.update(Msg::Key(kb::QUESTION_LATER.to_key_event()));
+        assert_eq!(
+            answers.try_recv().as_deref(),
+            Ok(QUESTION_DEFERRED_REPLY),
+            "the receipt says nothing of the note"
+        );
+        app.receive_deferred_question(asked(BLOCKING_CALL, deferred(FIRST, true)));
+        assert_eq!(docked(&app), Some(FIRST));
+        assert_eq!(app.question_form.note_text(), NOTE);
+
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert!(!app.question_form.is_open(), "Esc only puts it aside");
+        assert!(answers.is_empty(), "{RUN_LEFT_ALONE}");
+        assert!(app.reopen_question(Some(FIRST)));
+        assert_eq!(app.question_form.note_text(), NOTE);
     }
 
     #[test]

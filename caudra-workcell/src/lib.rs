@@ -97,7 +97,7 @@ use tokio::runtime::{Builder, Runtime};
 use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use workcell::code::bundled_worker_available;
-use workcell::code::{CodeConfiguration, CodeExecution, CodeInput, Outcome, WorkerSource};
+use workcell::code::{CodeConfiguration, CodeInput, CodePools, WorkerSource};
 use workcell::environment::{
     ExecutionEnvironmentError, ExecutionEnvironmentResult, ToolGroupDisclosure,
 };
@@ -146,34 +146,17 @@ pub const NATIVE_TOOL_NAMES: &[&str] = &[
     "websearch",
     "webfetch",
     "shell",
-    "python_execution",
     "source_code_context",
     "source_code_refs",
     "execution_environment",
 ];
 const REFS_REACHED_UNIT: &str = "reached";
 const REFS_DECLINED: &str = "same-name calls declined";
-const CODE_WORKER_UNAVAILABLE: &str =
-    "Workcell python_execution is unavailable: no code worker path was supplied";
-/// MCP code mode runs its snippets on the same worker, so a startup warning names both.
-const CODE_WORKER_WARNING: &str =
-    "Workcell python_execution and MCP code mode (the mcp tool) are unavailable";
+const CODE_WORKER_WARNING: &str = "The code tool is unavailable";
 const NO_CODE_WORKER_PATH: &str = "no code worker path was supplied";
 const CODE_WORKER_INIT_FAILED: &str = "code worker initialization failed";
 const CODE_WORKER_NO_CACHE: &str = "no cache directory for the code worker";
 const SHELL_CANCELLED: &str = "Shell execution cancelled";
-const CODE_CANCELLED: &str = "Code execution cancelled";
-/// Every way a snippet can end, so a remote result's outcome is read by the
-/// names Workcell itself serializes rather than by a copy of them.
-const CODE_OUTCOMES: [Outcome; 5] = [
-    Outcome::Completed,
-    Outcome::Exception,
-    Outcome::Rejected,
-    Outcome::Limited,
-    Outcome::Unavailable,
-];
-const CODE_OUTCOME_FIELD: &str = "outcome";
-const CODE_TIMED_OUT_FIELD: &str = "timedOut";
 const PROGRESS_MAX_BYTES: usize = 64 * 1024;
 const PROGRESS_TRUNCATED: &str = "[earlier output truncated]\n";
 const BYTES_PER_MIB: usize = 1024 * 1024;
@@ -258,8 +241,6 @@ const GIT_REPOSITORY_NO: &str = "no";
 /// A diff on its own reads as a change that landed, so a result that changed
 /// nothing says so where the model cannot miss it.
 const NOT_APPLIED: &str = "[not applied: nothing was written]";
-const CODE_ONE_LINE: &str = "1 line";
-const CODE_LINES: &str = "lines";
 const DECISION_TOOL_META: &str = "tool";
 const SOURCE_CODE_CONTEXT_TOOL: &str = "source_code_context";
 
@@ -313,7 +294,7 @@ struct HostInner {
 }
 
 impl HostInner {
-    fn specs(&self, include_unavailable_code: bool) -> Vec<ToolSpec> {
+    fn specs(&self) -> Vec<ToolSpec> {
         let mut specs = workcell::files::specs(ALLOW_WRITE);
         let year = jiff::Timestamp::now()
             .strftime("%Y")
@@ -326,9 +307,6 @@ impl HostInner {
         ));
         specs.extend(workcell::shell::specs());
         specs.extend(workcell::source_code_graph::specs());
-        if self.code.is_some() || include_unavailable_code {
-            specs.extend(workcell::code::specs());
-        }
         specs.push(workcell::environment::spec());
         specs
     }
@@ -424,7 +402,6 @@ impl Drop for HostInner {
 pub struct WorkcellHost {
     inner: Arc<HostInner>,
     warnings: Vec<String>,
-    reserve_code: bool,
 }
 
 impl WorkcellHost {
@@ -456,6 +433,7 @@ impl WorkcellHost {
                     CodeToolGroup::new(CodeConfiguration {
                         worker,
                         type_check: true,
+                        pools: CodePools::HostedOnly,
                     })
                     .await,
                 )
@@ -508,7 +486,6 @@ impl WorkcellHost {
                 code,
             }),
             warnings,
-            reserve_code: false,
         })
     }
 
@@ -517,24 +494,17 @@ impl WorkcellHost {
         configured_worker: Option<&Path>,
     ) -> Result<Self, HostError> {
         if let Some(worker) = configured_worker {
-            let mut host = Self::new(project_cwd, Some(worker))?;
-            host.reserve_code = true;
-            return Ok(host);
+            return Self::new(project_cwd, Some(worker));
         }
         match caudra_storage::paths::cache_dir() {
-            Ok(cache_root) => {
-                let mut host = Self::with_worker_source(
-                    project_cwd,
-                    Some(WorkerSource::Bundled {
-                        cache_root: &cache_root,
-                    }),
-                )?;
-                host.reserve_code = true;
-                Ok(host)
-            }
+            Ok(cache_root) => Self::with_worker_source(
+                project_cwd,
+                Some(WorkerSource::Bundled {
+                    cache_root: &cache_root,
+                }),
+            ),
             Err(error) => {
                 let mut host = Self::new(project_cwd, None)?;
-                host.reserve_code = true;
                 host.warnings.clear();
                 host.warnings.push(format!(
                     "{CODE_WORKER_WARNING}: {CODE_WORKER_NO_CACHE}: {error}"
@@ -548,7 +518,7 @@ impl WorkcellHost {
         &self.warnings
     }
 
-    /// Runs `mcp` snippets on this host's runtime and worker pool.
+    /// Runs `code` snippets on this host's runtime and worker pool.
     pub fn script_runner(&self) -> WorkcellScriptRunner {
         WorkcellScriptRunner::embedded(Arc::clone(&self.inner))
     }
@@ -562,19 +532,12 @@ impl WorkcellHost {
     }
 
     pub fn register(&self, registry: &ToolRegistry) -> Result<(), RegistryError> {
-        registry.register_many_audited(self.entries(false))
+        registry.register_many_audited(self.entries())
     }
 
-    pub fn register_documented_tools(&self, registry: &ToolRegistry) -> Result<(), RegistryError> {
-        registry.register_many_audited(self.entries(true))
-    }
-
-    fn entries(
-        &self,
-        include_unavailable_code: bool,
-    ) -> Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)> {
+    fn entries(&self) -> Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)> {
         self.inner
-            .specs(self.reserve_code || include_unavailable_code)
+            .specs()
             .into_iter()
             .filter_map(|spec| {
                 let kind = ToolKind::from_name(spec.name)?;
@@ -702,11 +665,13 @@ fn canonical_remote_specs() -> Vec<ToolSpec> {
     expected
 }
 
+/// Every tool of the canonical catalog must match, including Workcell's isolated `code`, which
+/// Caudra never registers because its own `code` serves the name: a host whose code contract drifted is not the Workcell this build speaks to.
 fn canonical_remote_catalog(tools: &[OwnedToolSpec]) -> bool {
     let expected = canonical_remote_specs();
     let actual: Vec<_> = tools
         .iter()
-        .filter(|spec| ToolKind::from_name(&spec.name).is_some())
+        .filter(|spec| expected.iter().any(|expected| expected.name == spec.name))
         .collect();
     actual.len() == expected.len()
         && expected.iter().all(|expected| {
@@ -812,7 +777,6 @@ enum ToolKind {
     Websearch,
     Webfetch,
     Shell,
-    Code,
     SourceCodeContext,
     SourceCodeRefs,
     Environment,
@@ -831,7 +795,6 @@ impl ToolKind {
             "websearch" => Some(Self::Websearch),
             "webfetch" => Some(Self::Webfetch),
             "shell" => Some(Self::Shell),
-            "python_execution" => Some(Self::Code),
             "source_code_context" => Some(Self::SourceCodeContext),
             "source_code_refs" => Some(Self::SourceCodeRefs),
             "execution_environment" => Some(Self::Environment),
@@ -863,7 +826,7 @@ impl ToolKind {
             | Self::SourceCodeRefs => "search",
             Self::FileWrite | Self::FileEdit | Self::FileApplyPatch => "edit",
             Self::Webfetch => "fetch",
-            Self::Shell | Self::Code | Self::Environment => "execute",
+            Self::Shell | Self::Environment => "execute",
         }
     }
 
@@ -877,7 +840,6 @@ impl ToolKind {
             | Self::Webfetch
             | Self::SourceCodeContext
             | Self::SourceCodeRefs => ToolEffect::ReadOnly,
-            Self::Code => ToolEffect::Isolated,
             Self::FileWrite
             | Self::FileEdit
             | Self::FileApplyPatch
@@ -984,7 +946,6 @@ enum Input {
     Websearch(WebsearchInput),
     Webfetch(WebfetchInput),
     Shell(ShellInput),
-    Code(CodeInput),
     SourceCodeContext(SourceCodeContextInput),
     SourceCodeRefs(SourceCodeRefsInput),
     Environment,
@@ -1012,7 +973,6 @@ impl Input {
             ToolKind::Websearch => parse_input("websearch", input).map(Self::Websearch),
             ToolKind::Webfetch => parse_input("webfetch", input).map(Self::Webfetch),
             ToolKind::Shell => parse_input("shell", input).map(Self::Shell),
-            ToolKind::Code => parse_input("python_execution", input).map(Self::Code),
             ToolKind::SourceCodeContext => {
                 parse_input("source_code_context", input).map(Self::SourceCodeContext)
             }
@@ -1343,12 +1303,6 @@ impl WorkcellInvocation {
                     ctx.config.shell_workdir_redirect,
                 )?
             }
-            Input::Code(_) => exact_custom_prepared(
-                "isolated_compute",
-                "python",
-                PermissionResourceAccess::Execute,
-                PermissionRisk::Low,
-            ),
             Input::SourceCodeContext(input) => {
                 let group = self.source_code_graph_group(ctx, project.clone()).await?;
                 source_code_graph_prepared(
@@ -1457,10 +1411,6 @@ fn input_header(input: &Input) -> String {
         Input::Websearch(input) => input.query.clone(),
         Input::Webfetch(input) => input.url.clone(),
         Input::Shell(input) => input.command.lines().next().unwrap_or_default().into(),
-        Input::Code(input) => match input.code.lines().count() {
-            1 => CODE_ONE_LINE.to_owned(),
-            count => format!("{count} {CODE_LINES}"),
-        },
         Input::SourceCodeContext(input) => search_header(&input.task, input.path.as_deref()),
         Input::SourceCodeRefs(input) => search_header(&input.symbol, input.path.as_deref()),
         Input::Environment => "execution environment".into(),
@@ -1474,6 +1424,7 @@ fn input_header(input: &Input) -> String {
 /// `None` when the executor would refuse the input, because naming a deadline
 /// that never applies is worse than naming none. The input is decoded as the
 /// executor's own type and asked for its deadline, so the rule has one home.
+/// `python_execution` is no longer offered and stays for the cards of restored sessions.
 pub fn effective_timeout(tool: &str, raw_input: &Value) -> Option<Duration> {
     let millis = match tool {
         SHELL_TOOL_NAME => ShellInput::deserialize(raw_input).ok()?.timeout_ms(),
@@ -1524,10 +1475,6 @@ fn input_start_input(input: &Input) -> Option<ToolInput> {
         Input::Shell(input) => Some(ToolInput::Code {
             language: "bash".into(),
             code: input.command.clone(),
-        }),
-        Input::Code(input) => Some(ToolInput::Code {
-            language: "python".into(),
-            code: input.code.clone(),
         }),
         _ => None,
     }
@@ -1585,7 +1532,6 @@ impl RemoteWorkcellInvocation {
                         host_contract::ResourceAccess::Inspect => Some("environment"),
                         _ => Some("command"),
                     },
-                    ToolKind::Code => Some("code"),
                     ToolKind::Environment => Some("environment"),
                 };
                 let kind = if let Some(resource_kind) = remote_kind {
@@ -1632,7 +1578,6 @@ impl RemoteWorkcellInvocation {
                         host_contract::ResourceAccess::Inspect => "display_environment",
                         _ => "display_command",
                     },
-                    ToolKind::Code => "display_code",
                     ToolKind::Environment => "display_environment",
                     _ => "display_path",
                 };
@@ -2221,8 +2166,6 @@ impl ToolInvocation for RemoteWorkcellInvocation {
             .map_or(registered, |mutating| {
                 if mutating {
                     registered
-                } else if self.kind == ToolKind::Code {
-                    ToolEffect::Isolated
                 } else {
                     ToolEffect::ReadOnly
                 }
@@ -2458,10 +2401,6 @@ fn remote_result(
         ToolKind::Index => deserialize_remote(&structured_content)
             .map(|output| remote_index_result(output, &model_output)),
         ToolKind::Shell => remote_shell_result(&structured_content, model_output.clone()),
-        ToolKind::Code => Ok(remote_code_result(
-            &structured_content,
-            model_output.clone(),
-        )),
         ToolKind::Websearch => Ok(text_result(
             &structured_content,
             model_output.clone(),
@@ -2623,17 +2562,6 @@ fn remote_shell_result(
         filter: None,
     };
     Ok(shell_exec_result(output, model_output))
-}
-
-fn remote_code_result(value: &Value, model_output: String) -> ToolExecResult {
-    let result = text_result(value, model_output.clone(), false, model_output);
-    let outcome = CODE_OUTCOMES.into_iter().find(|outcome| {
-        serde_json::to_value(outcome).is_ok_and(|name| name == value[CODE_OUTCOME_FIELD])
-    });
-    match outcome {
-        Some(outcome) => code_outcome_result(result, outcome, value[CODE_TIMED_OUT_FIELD] == true),
-        None => result.with_failure(ToolFailure::Other),
-    }
 }
 
 #[derive(Deserialize)]
@@ -3196,25 +3124,6 @@ impl WorkcellInvocation {
                     Ok(Ok(Some(execution))) => shell_result(execution),
                     Ok(Ok(None)) => ToolExecResult::failed(ToolFailure::Cancelled, SHELL_CANCELLED),
                     Ok(Err(error)) => ToolExecResult::failed(ToolFailure::Other, error),
-                    Err(error) => failed(error),
-                }
-            }
-            (Input::Code(input), PreparedExecution::None) => {
-                let Some(code) = self.host.code.clone() else {
-                    return ToolExecResult::failed(ToolFailure::Other, CODE_WORKER_UNAVAILABLE);
-                };
-                let input = input.clone();
-                match self
-                    .host
-                    .run(
-                        ctx,
-                        move |token| async move { code.execute(input, token).await },
-                    )
-                    .await
-                {
-                    Ok(Ok(Some(execution))) => code_result(execution),
-                    Ok(Ok(None)) => ToolExecResult::failed(ToolFailure::Cancelled, CODE_CANCELLED),
-                    Ok(Err(error)) => failed(invalid_input(error)),
                     Err(error) => failed(error),
                 }
             }
@@ -4466,33 +4375,6 @@ fn shown_of(shown: usize, total: usize, unit: &str) -> String {
     }
 }
 
-fn code_result(execution: CodeExecution) -> ToolExecResult {
-    let (outcome, timed_out) = (execution.output.outcome, execution.output.timed_out);
-    let result = text_result(
-        &execution.output,
-        execution.model_text.clone(),
-        false,
-        execution.model_text,
-    );
-    code_outcome_result(result, outcome, timed_out)
-}
-
-/// A snippet's failure is placed by the outcome Workcell typed. A spent budget
-/// is a timeout only when time was the budget.
-fn code_outcome_result(
-    result: ToolExecResult,
-    outcome: Outcome,
-    timed_out: bool,
-) -> ToolExecResult {
-    let failure = match outcome {
-        Outcome::Completed => return result,
-        Outcome::Rejected => ToolFailure::InvalidInput,
-        Outcome::Limited if timed_out => ToolFailure::Timeout,
-        Outcome::Exception | Outcome::Limited | Outcome::Unavailable => ToolFailure::Other,
-    };
-    result.with_failure(failure)
-}
-
 /// The host as a card rather than as its record. Workcell's `model_text` is the
 /// same descriptor pretty-printed, which costs the model 168 lines to say what
 /// fourteen say, so the mapping renders the descriptor once and both the card
@@ -4900,8 +4782,12 @@ mod tests {
     use caudra_agent::agent::tool_dispatch::{self, Emit};
     use caudra_agent::background::{BackgroundTasks, JobScope, ShellLive};
     use caudra_agent::cancel::CancelToken;
+    use caudra_agent::code::runner::ScriptRunner;
+    use caudra_agent::code::runner::{
+        ReplLease, ReplSlot, ScriptCall, ScriptHost, ScriptInvocation, ScriptName, ScriptRun,
+        ScriptStatus,
+    };
     use caudra_agent::decisions::{Decisions, MAX_RERANK_BATCH, reordered_note};
-    use caudra_agent::mcp::code::runner::ScriptRunner;
     use caudra_agent::permissions::pattern_recognition::{CommandObservation, ShellEffectStatus};
     use caudra_agent::permissions::{
         AutoNote, COMMAND_EXACT_PREFIX, COMMAND_TEMPLATE_PREFIX, ComposedRow, PermissionAnswer,
@@ -4958,10 +4844,6 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
     use test_case::test_case;
-    use workcell::code::{
-        CodeOutput, DEFAULT_TIMEOUT_MS as CODE_DEFAULT_TIMEOUT_MS,
-        MAX_TIMEOUT_MS as CODE_MAX_TIMEOUT_MS, MAX_TIMEOUT_SECS as CODE_MAX_TIMEOUT_SECS,
-    };
     use workcell::environment::{
         CommandDescriptor, ContainerDescriptor, DeclaredPackageManager,
         ExecutionEnvironmentExecution, ExecutionEnvironmentOutput, GitDescriptor, OsDescriptor,
@@ -4976,6 +4858,11 @@ mod tests {
     use workcell_tool_contract::shell_env::EnvPattern;
 
     const REQUIRED_CODE_WORKER: &str = "WORKCELL_REQUIRE_CODE_WORKER";
+    /// Workcell's isolated tool, which the canonical remote catalog carries and Caudra never
+    /// registers: Caudra's own `code` runs plain computation on this machine instead.
+    const UNREGISTERED_REMOTE_TOOL: &str = "code";
+    const PURE_COMPUTATION: &str = "sum([1, 2, 3, 4])";
+    const PURE_RESULT: i64 = 10;
     const MISSING_REQUIRED_WORKER: &str = "the required worker was not embedded";
     const PATCH: &str = "*** Begin Patch\n*** Add File: created.txt\n+hello\n*** End Patch";
     const PDF_URL: &str = "https://example.com/paper.pdf";
@@ -5020,7 +4907,6 @@ mod tests {
     };
     const PATTERN_TIMEOUT_SECS: u64 = 1;
     const DEADLINE_COMMAND: &str = "cargo test";
-    const DEADLINE_CODE: &str = "21 * 2";
     const GENERIC_NAME_REGEX: &str = "(?:alpha|beta|gamma|delta-[0-9]+)";
     const POSSIBLE_WORKDIRS_ATTRIBUTE: &str = "possible_workdirs";
     const POSSIBLE_WORKDIRS_LABEL: &str = "Possible working directories:";
@@ -5336,15 +5222,18 @@ mod tests {
                 "shell",
                 "source_code_context",
                 "source_code_refs",
-                "python_execution",
+                "code",
                 "execution_environment",
             ]
         );
         let catalog: Vec<_> = specs.iter().map(OwnedToolSpec::from).collect();
         assert!(canonical_remote_catalog(&catalog));
         for spec in &catalog {
+            let Some(kind) = ToolKind::from_name(&spec.name) else {
+                assert_eq!(spec.name, UNREGISTERED_REMOTE_TOOL);
+                continue;
+            };
             let expected = match spec.name.as_str() {
-                "python_execution" => ToolEffect::Isolated,
                 "file_write"
                 | "file_edit"
                 | "file_apply_patch"
@@ -5352,7 +5241,7 @@ mod tests {
                 | "execution_environment" => ToolEffect::Mutating,
                 _ => ToolEffect::ReadOnly,
             };
-            assert_eq!(ToolKind::from_name(&spec.name).unwrap().effect(), expected);
+            assert_eq!(kind.effect(), expected);
         }
         let mut reordered = catalog.clone();
         reordered.reverse();
@@ -5367,7 +5256,6 @@ mod tests {
     /// why the shell ceiling is not the one every other tool uses.
     #[test_case(ToolKind::Shell => SHELL_EXECUTION_TIMEOUT ; "a command waits out the deadline it was given")]
     #[test_case(ToolKind::FileRead => REMOTE_EXECUTION_TIMEOUT ; "a read keeps the ordinary ceiling")]
-    #[test_case(ToolKind::Code => REMOTE_EXECUTION_TIMEOUT ; "so does the code worker, which bounds itself")]
     fn the_execution_ceiling_is_raised_only_for_the_shell(kind: ToolKind) -> Duration {
         remote_execution_ceiling(kind)
     }
@@ -5420,11 +5308,6 @@ mod tests {
     #[test_case(SHELL_TOOL_NAME, json!({ "command": DEADLINE_COMMAND, "timeoutSec": -1 }) => None ; "a negative deadline names nothing")]
     #[test_case(SHELL_TOOL_NAME, json!({ "command": DEADLINE_COMMAND, "timeoutSec": "30m" }) => None ; "a deadline that is not a number names nothing")]
     #[test_case(SHELL_TOOL_NAME, json!({ "timeoutSec": 1 }) => None ; "a call with no command never runs")]
-    #[test_case(PYTHON_EXECUTION_TOOL_NAME, json!({ "code": DEADLINE_CODE }) => Some(Duration::from_millis(CODE_DEFAULT_TIMEOUT_MS)) ; "an omitted code deadline is its own default")]
-    #[test_case(PYTHON_EXECUTION_TOOL_NAME, json!({ "code": DEADLINE_CODE, "timeoutSec": 0 }) => None ; "zero is refused by the code worker")]
-    #[test_case(PYTHON_EXECUTION_TOOL_NAME, json!({ "code": DEADLINE_CODE, "timeoutSec": CODE_MAX_TIMEOUT_SECS }) => Some(Duration::from_millis(CODE_MAX_TIMEOUT_MS)) ; "the code maximum is allowed")]
-    #[test_case(PYTHON_EXECUTION_TOOL_NAME, json!({ "code": DEADLINE_CODE, "timeoutSec": CODE_MAX_TIMEOUT_SECS + 1 }) => None ; "a code deadline past the maximum is refused")]
-    #[test_case(PYTHON_EXECUTION_TOOL_NAME, json!({ "code": DEADLINE_CODE, "timeout": CODE_MAX_TIMEOUT_SECS }) => None ; "the code worker refuses the millisecond key too")]
     #[test_case("file_read", json!({ "timeoutSec": 1 }) => None ; "a tool without a deadline has none to report")]
     fn a_header_deadline_is_the_one_the_executor_will_enforce(
         tool: &str,
@@ -5448,7 +5331,7 @@ mod tests {
     #[test_case(SHELL_TOOL_NAME, json!({ "workdir": "/elsewhere" }) => Some("/elsewhere".to_owned()) ; "an outside path stays absolute")]
     #[test_case(SHELL_TOOL_NAME, json!({ "workdir": "/project2" }) => Some("/project2".to_owned()) ; "a shared text prefix is not containment")]
     #[test_case(SHELL_TOOL_NAME, json!({ "workdir": 1 }) => None ; "a workdir that is not a path names nothing")]
-    #[test_case(PYTHON_EXECUTION_TOOL_NAME, json!({ "workdir": "crates" }) => None ; "a tool without a workdir has none to report")]
+    #[test_case("file_read", json!({ "workdir": "crates" }) => None ; "a tool without a workdir has none to report")]
     fn a_header_workdir_is_spelled_the_way_the_result_will_spell_it(
         tool: &str,
         raw_input: Value,
@@ -6085,19 +5968,6 @@ mod tests {
                         "workdir": { "type": "string", "minLength": 1 }
                     },
                     "required": ["command"]
-                }),
-            ),
-            (
-                "python_execution",
-                json!({
-                    "$schema": DRAFT_07,
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "code": { "type": "string", "minLength": 1, "maxLength": 65_536 },
-                        "timeoutSec": { "type": "integer", "minimum": 1, "maximum": 30, "default": 5 }
-                    },
-                    "required": ["code"]
                 }),
             ),
             (
@@ -7938,64 +7808,6 @@ mod tests {
         (local.is_error, local.failure)
     }
 
-    fn code_output(outcome: Outcome, timed_out: bool) -> CodeOutput {
-        CodeOutput {
-            version: 1,
-            kind: "code",
-            outcome,
-            timeout_ms: CODE_DEFAULT_TIMEOUT_MS,
-            duration_ms: 10,
-            type_checked: true,
-            result: Value::Null,
-            result_repr: None,
-            stdout: MISLEADING_OUTPUT.into(),
-            stderr: String::new(),
-            stdout_truncated: false,
-            stderr_truncated: false,
-            stdout_utf8_bytes: 0,
-            stderr_utf8_bytes: 0,
-            exception: None,
-            diagnostic: None,
-            timed_out,
-            memory_exceeded: false,
-            suspension_limit_exceeded: false,
-        }
-    }
-
-    /// The outcome Workcell typed places a snippet's failure, and reads the
-    /// same whether the worker ran here or on a remote host.
-    #[test_case(Outcome::Completed, false => (false, None) ; "completed")]
-    #[test_case(Outcome::Rejected, false => (true, Some(ToolFailure::InvalidInput)) ; "rejected_before_running")]
-    #[test_case(Outcome::Exception, false => (true, Some(ToolFailure::Other)) ; "raised")]
-    #[test_case(Outcome::Limited, true => (true, Some(ToolFailure::Timeout)) ; "out_of_time")]
-    #[test_case(Outcome::Limited, false => (true, Some(ToolFailure::Other)) ; "out_of_another_budget")]
-    #[test_case(Outcome::Unavailable, false => (true, Some(ToolFailure::Other)) ; "unavailable")]
-    fn a_snippet_fails_by_its_outcome_locally_and_remotely(
-        outcome: Outcome,
-        timed_out: bool,
-    ) -> (bool, Option<ToolFailure>) {
-        let remote = remote_result(
-            ToolKind::Code,
-            &Input::parse(ToolKind::Code, json!({"code": DEADLINE_CODE})).expect("valid input"),
-            RemoteToolResultEnvelope {
-                structured_content: serde_json::to_value(code_output(outcome, timed_out))
-                    .expect("structured output"),
-                model_output: MISLEADING_OUTPUT.into(),
-                is_error: false,
-            },
-        );
-        let local = code_result(CodeExecution {
-            output: code_output(outcome, timed_out),
-            model_text: MISLEADING_OUTPUT.into(),
-        });
-
-        assert_eq!(
-            (remote.is_error, remote.failure),
-            (local.is_error, local.failure)
-        );
-        (local.is_error, local.failure)
-    }
-
     #[test]
     fn no_rtk_disables_native_shell_output_filtering() {
         if std::process::Command::new("make")
@@ -8711,7 +8523,6 @@ mod tests {
                 &WebsearchExecutionConfiguration::default(),
             ))
             .chain(workcell::shell::specs())
-            .chain(workcell::code::specs())
             .chain(workcell::source_code_graph::specs())
             .chain(std::iter::once(workcell::environment::spec()))
             .map(|spec| spec.name)
@@ -8723,12 +8534,11 @@ mod tests {
     }
 
     #[test]
-    fn documented_catalog_preserves_canonical_order_contracts_and_effects() {
+    fn catalog_preserves_canonical_order_contracts_and_effects() {
         let root = TempDir::new().expect("tempdir");
         let host = WorkcellHost::new(root.path(), None).expect("Workcell host");
         let registry = ToolRegistry::new();
-        host.register_documented_tools(&registry)
-            .expect("Workcell registration");
+        host.register(&registry).expect("Workcell registration");
         let expected = [
             ("file_read", "file.read.v1", ToolEffect::ReadOnly, "read"),
             ("file_glob", "file.glob.v1", ToolEffect::ReadOnly, "search"),
@@ -8763,12 +8573,6 @@ mod tests {
                 "search",
             ),
             (
-                "python_execution",
-                "python.execution.v1",
-                ToolEffect::Isolated,
-                "execute",
-            ),
-            (
                 "execution_environment",
                 "execution-environment.snapshot.v1",
                 ToolEffect::Mutating,
@@ -8796,12 +8600,11 @@ mod tests {
     }
 
     #[test]
-    fn documented_catalog_input_schema_contracts_are_stable() {
+    fn catalog_input_schema_contracts_are_stable() {
         let root = TempDir::new().expect("tempdir");
         let host = WorkcellHost::new(root.path(), None).expect("Workcell host");
         let registry = ToolRegistry::new();
-        host.register_documented_tools(&registry)
-            .expect("Workcell registration");
+        host.register(&registry).expect("Workcell registration");
 
         for (name, expected) in canonical_input_schemas() {
             let registered = registry
@@ -8813,15 +8616,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_worker_omits_code_without_affecting_other_tools() {
+    fn missing_worker_warns_without_affecting_the_tools() {
         let root = TempDir::new().expect("tempdir");
         let (host, registry) = host_and_registry(root.path());
 
-        assert!(registry.get("python_execution").is_none());
         assert!(registry.get("file_read").is_some());
         assert!(registry.get("shell").is_some());
         assert!(registry.get("execution_environment").is_some());
-        assert_eq!(registry.iter().len(), NATIVE_TOOL_NAMES.len() - 1);
+        assert_eq!(registry.iter().len(), NATIVE_TOOL_NAMES.len());
         assert!(
             host.warnings()
                 .contains(&format!("{CODE_WORKER_WARNING}: {NO_CODE_WORKER_PATH}")),
@@ -8831,8 +8633,24 @@ mod tests {
         assert!(host.script_runner().unavailable().is_some());
     }
 
+    struct NoModules;
+
+    impl ScriptHost for NoModules {
+        fn lookup(&self, _namespace: Option<&str>, _name: &str) -> ScriptName {
+            ScriptName::Undefined(None)
+        }
+
+        fn call(&self, call: ScriptCall) -> ScriptInvocation {
+            panic!("plain computation made a host call: {}", call.name)
+        }
+
+        fn stubs(&self) -> String {
+            String::new()
+        }
+    }
+
     #[test]
-    fn production_host_executes_code_with_the_embedded_worker() {
+    fn production_host_computes_on_the_hosted_only_pool() {
         if !bundled_worker_available() {
             assert!(
                 option_env!("WORKCELL_BUNDLED_MONTY_WORKER").is_none()
@@ -8844,26 +8662,23 @@ mod tests {
         let root = TempDir::new().expect("tempdir");
         let host = WorkcellHost::new_production(root.path(), None).expect("Workcell host");
         assert!(host.warnings().is_empty());
-        let registry = Arc::new(ToolRegistry::new());
-        host.register(&registry).expect("Workcell registration");
+        let runner = host.script_runner();
         drop(host);
-        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
-        let invocation = registry
-            .get("python_execution")
-            .expect("registered code execution")
-            .tool
-            .parse(&json!({"code": "sum([1, 2, 3, 4])"}))
-            .expect("valid code input");
+        let repl = ReplSlot::shared(false);
+        let outcome = smol::block_on(async {
+            runner
+                .run(ScriptRun {
+                    code: PURE_COMPUTATION.to_owned(),
+                    host: Arc::new(NoModules),
+                    state: ReplLease::acquire(&repl).await,
+                    cancel: CancelToken::none(),
+                })
+                .await
+        });
 
-        smol::block_on(invocation.preflight(&ctx)).expect("code preflight");
-        let result = smol::block_on(invocation.execute(&ctx));
-
-        assert!(!result.is_error);
-        assert_eq!(result.model_output.as_deref(), Some("result: 10"));
-        let output = result.output.expect("successful tool output");
-        let state = output.state().expect("structured code output");
-        assert_eq!(state["outcome"], "completed");
-        assert_eq!(state["result"], 10);
+        let output = outcome.output.expect("the snippet ran");
+        assert_eq!(output.status, ScriptStatus::Completed, "{output:?}");
+        assert_eq!(output.result, json!(PURE_RESULT));
     }
 
     #[test]
@@ -9204,9 +9019,6 @@ mod tests {
             ("shell", ToolEffect::Mutating),
         ] {
             assert_eq!(registry.get(name).unwrap().effect, expected, "{name}");
-        }
-        if let Some(code) = registry.get("python_execution") {
-            assert_eq!(code.effect, ToolEffect::Isolated);
         }
     }
 
@@ -9847,7 +9659,7 @@ mod tests {
     }
 
     #[test]
-    fn production_reserves_python_execution_when_an_override_is_invalid() {
+    fn production_warns_that_code_is_unavailable_when_an_override_is_invalid() {
         let root = TempDir::new().expect("tempdir");
         let missing = root.path().join("missing-worker");
         let host =
@@ -9856,7 +9668,8 @@ mod tests {
         host.register(&registry).expect("Workcell registration");
 
         assert_eq!(registry.iter().len(), NATIVE_TOOL_NAMES.len());
-        assert!(registry.get("python_execution").is_some());
+        assert!(registry.get(UNREGISTERED_REMOTE_TOOL).is_none());
+        assert!(host.script_runner().unavailable().is_some());
         let failed = format!("{CODE_WORKER_WARNING}: {CODE_WORKER_INIT_FAILED}: ");
         assert!(
             host.warnings()
@@ -9961,7 +9774,6 @@ mod tests {
     #[test_case(ToolKind::FileEdit, json!({"filePath": REMOTE_ABSOLUTE, "oldString": "a", "newString": "b"}), &[REMOTE_ABSOLUTE] ; "absolute_edit_keeps_its_spelling")]
     #[test_case(ToolKind::FileApplyPatch, json!({"patchText": REMOTE_MOVE_PATCH}), &[REMOTE_TARGET, REMOTE_MOVED] ; "patch_names_every_file")]
     #[test_case(ToolKind::Shell, json!({"command": "echo > src/lib.rs"}), &[] ; "shell_names_nothing")]
-    #[test_case(ToolKind::Code, json!({"code": "1"}), &[] ; "python_names_nothing")]
     #[test_case(ToolKind::FileRead, json!({"filePath": "src/lib.rs"}), &[] ; "read_names_nothing")]
     fn remote_writes_lock_the_host_files_they_prepare(
         kind: ToolKind,
@@ -9980,7 +9792,7 @@ mod tests {
     #[test_case(ToolKind::FileApplyPatch, json!({"patchText": REMOTE_MOVE_PATCH}) => recorded(&["project/src/lib.rs", "project/src/moved.rs"]) ; "a_patch_records_every_file")]
     #[test_case(ToolKind::FileEdit, json!({"filePath": REMOTE_ABSOLUTE, "oldString": "a", "newString": "b"}) => Some(RecordScope::Workspace) ; "an_absolute_write_is_unplaced")]
     #[test_case(ToolKind::FileEdit, json!({"filePath": "./src/../src/lib.rs", "oldString": "a", "newString": "b"}) => Some(RecordScope::Workspace) ; "a_parent_step_is_unplaced")]
-    #[test_case(ToolKind::Code, json!({"code": "1"}) => Some(RecordScope::Workspace) ; "a_call_naming_no_file_records_everything")]
+    #[test_case(ToolKind::Environment, json!({}) => Some(RecordScope::Workspace) ; "a_call_naming_no_file_records_everything")]
     fn a_remote_write_records_the_files_it_names(
         kind: ToolKind,
         input: Value,

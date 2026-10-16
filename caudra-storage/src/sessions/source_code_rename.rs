@@ -1,4 +1,4 @@
-//! Schema 29: the code-graph tools became the source-code tools. Every stored
+//! Schema 30: the code-graph tools became the source-code tools. Every stored
 //! use of their names, contracts, decision feature and output tag moves to the
 //! new spelling, so nothing reads the old one again. Retired tools such as
 //! `code_map` keep their names; nothing serves them any more.
@@ -57,9 +57,14 @@ UPDATE session_tool_usage SET tool = 'source_code_refs' WHERE tool = 'code_refs'
 UPDATE decisions SET feature = 'source_code_context' WHERE feature = 'code_context';
 UPDATE engine_decisions SET feature = 'source_code_context' WHERE feature = 'code_context';
 "#;
+/// The history search index holds transcript text with the old names, and its
+/// cursors would not notice a rewritten item, so it is rebuilt from the
+/// renamed transcripts.
+const HISTORY_INDEX_RESET: &str =
+    "DELETE FROM history_search_docs; DELETE FROM history_search_cursors;";
 
 /// The JSON half of the step: compressed transcripts and tool outputs, then the
-/// global and per-session permission rules.
+/// global and per-session permission rules, then the history search index.
 pub(super) fn rewrite_stored(transaction: &Transaction<'_>) -> Result<(), SessionError> {
     for rewrite in &COMPRESSED_PAYLOAD_TABLES {
         let rename = if rewrite.table == TOOL_OUTPUTS_TABLE {
@@ -70,7 +75,9 @@ pub(super) fn rewrite_stored(transaction: &Transaction<'_>) -> Result<(), Sessio
         rewrite_payloads(transaction, rewrite, rename)?;
     }
     rewrite_global_rules(transaction)?;
-    rewrite_session_rules(transaction)
+    rewrite_session_rules(transaction)?;
+    transaction.execute_batch(HISTORY_INDEX_RESET)?;
+    Ok(())
 }
 
 /// Streams every payload of one table and keeps only those `rename` changed.

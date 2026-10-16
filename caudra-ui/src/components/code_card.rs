@@ -1,10 +1,8 @@
-//! The `mcp` tool's card under its snippet: a row for each server call the snippet made, which
+//! The `code` tool's card under its snippet: a row for each server call the snippet made, which
 //! opens to that call's own MCP card, then what the snippet printed, the value it ended on, and
 //! why it stopped when it did not finish.
 
-use caudra_agent::mcp::code::output::{
-    McpCodeCall, McpCodeCallStatus, McpCodeOutcome, McpCodeOutput,
-};
+use caudra_agent::code::output::{CodeCall, CodeCallStatus, CodeOutcome, CodeOutput};
 use caudra_agent::tools::ToolEffect;
 use caudra_agent::{
     BatchToolEntry, BatchToolStatus, MCP_SUMMARY_PREFIX, McpBlock, McpHelper, McpOutput,
@@ -31,16 +29,16 @@ pub(crate) type Block = (Vec<Line<'static>>, Option<BodySource>);
 
 /// Each call as a batch child, so its row reads, folds and opens as a direct MCP call's card
 /// would.
-pub(crate) fn entries(output: &McpCodeOutput) -> Vec<BatchToolEntry> {
+pub(crate) fn entries(output: &CodeOutput) -> Vec<BatchToolEntry> {
     output.calls.iter().map(entry).collect()
 }
 
-fn entry(call: &McpCodeCall) -> BatchToolEntry {
+fn entry(call: &CodeCall) -> BatchToolEntry {
     let tool = call.qualified_name();
     let status = match call.status {
-        McpCodeCallStatus::Running => BatchToolStatus::Running,
-        McpCodeCallStatus::Success => BatchToolStatus::Success,
-        McpCodeCallStatus::Error | McpCodeCallStatus::Refused => BatchToolStatus::Error,
+        CodeCallStatus::Running => BatchToolStatus::Running,
+        CodeCallStatus::Success => BatchToolStatus::Success,
+        CodeCallStatus::Error | CodeCallStatus::Refused => BatchToolStatus::Error,
     };
     let output = shown_output(call);
     let summary = match call.helper {
@@ -57,14 +55,14 @@ fn entry(call: &McpCodeCall) -> BatchToolEntry {
         annotation: output.as_ref().and_then(ToolOutput::annotation),
         output,
         model_suffix: None,
-        refused: call.status == McpCodeCallStatus::Refused,
+        refused: call.status == CodeCallStatus::Refused,
         accounting: Default::default(),
     }
 }
 
 /// What a call's row opens to: the server's answer when it gave one the call stands on, else why
 /// the call failed, drawn as an MCP card whenever the server asked the user something on the way.
-fn shown_output(call: &McpCodeCall) -> Option<ToolOutput> {
+fn shown_output(call: &CodeCall) -> Option<ToolOutput> {
     let interactions = call.interactions.clone();
     if let Some(output) = &call.output
         && (call.error.is_none() || output.is_error)
@@ -89,17 +87,17 @@ fn shown_output(call: &McpCodeCall) -> Option<ToolOutput> {
 
 /// A helper row's line: the verdicts once it has answered, and the call as the snippet made it
 /// until then or when it failed.
-fn helper_summary(call: &McpCodeCall, helper: McpHelper) -> String {
+fn helper_summary(call: &CodeCall, helper: McpHelper) -> String {
     call.output
         .as_ref()
-        .filter(|_| call.status == McpCodeCallStatus::Success)
+        .filter(|_| call.status == CodeCallStatus::Success)
         .and_then(|output| decisions::summary(helper, Some(&call.input), output))
         .unwrap_or_else(|| call.called_as.clone())
 }
 
 /// What the snippet printed and ended on, each held to `budget` lines, then how it failed. The
 /// flag says the budget left something out.
-pub(crate) fn tail(output: &McpCodeOutput, budget: usize, width: u16) -> (Vec<Block>, bool) {
+pub(crate) fn tail(output: &CodeOutput, budget: usize, width: u16) -> (Vec<Block>, bool) {
     let theme = theme::current();
     let mut blocks = Vec::new();
     let mut truncated = false;
@@ -138,16 +136,14 @@ pub(crate) fn tail(output: &McpCodeOutput, budget: usize, width: u16) -> (Vec<Bl
     (blocks, truncated)
 }
 
-fn failure(outcome: &McpCodeOutcome) -> Option<String> {
+fn failure(outcome: &CodeOutcome) -> Option<String> {
     match outcome {
-        McpCodeOutcome::Running | McpCodeOutcome::Completed => None,
-        McpCodeOutcome::Raised { kind, message } => {
-            Some(format!("{kind}{KIND_SEPARATOR}{message}"))
-        }
-        McpCodeOutcome::Rejected { message } => Some(format!("{DID_NOT_RUN}{message}")),
-        McpCodeOutcome::Limited { message } => Some(format!("{STOPPED}{message}")),
-        McpCodeOutcome::Unavailable { message } => Some(message.clone()),
-        McpCodeOutcome::Cancelled => Some(CANCELLED.to_owned()),
+        CodeOutcome::Running | CodeOutcome::Completed => None,
+        CodeOutcome::Raised { kind, message } => Some(format!("{kind}{KIND_SEPARATOR}{message}")),
+        CodeOutcome::Rejected { message } => Some(format!("{DID_NOT_RUN}{message}")),
+        CodeOutcome::Limited { message } => Some(format!("{STOPPED}{message}")),
+        CodeOutcome::Unavailable { message } => Some(message.clone()),
+        CodeOutcome::Cancelled => Some(CANCELLED.to_owned()),
     }
 }
 
@@ -171,15 +167,15 @@ mod tests {
     const PRINTED: &str = "first\nsecond\nthird\nfourth\nlast";
     const WIDTH: u16 = 80;
 
-    fn call(status: McpCodeCallStatus, error: Option<&str>) -> McpCodeCall {
-        McpCodeCall {
+    fn call(status: CodeCallStatus, error: Option<&str>) -> CodeCall {
+        CodeCall {
             server: SERVER.to_owned(),
             tool: TOOL.to_owned(),
             input: json!({"owner": "o"}),
             status,
             output: Some(McpOutput::default()),
             error: error.map(str::to_owned),
-            ..McpCodeCall::default()
+            ..CodeCall::default()
         }
     }
 
@@ -204,14 +200,14 @@ mod tests {
         failed: bool,
         shows_error: bool,
     ) {
-        let call = McpCodeCall {
+        let call = CodeCall {
             output: answer.map(|is_error| McpOutput {
                 is_error,
                 ..McpOutput::default()
             }),
             error: failed.then(|| REFUSAL.to_owned()),
             interactions: vec![interaction()],
-            ..call(McpCodeCallStatus::Error, None)
+            ..call(CodeCallStatus::Error, None)
         };
         let Some(ToolOutput::Mcp(shown)) = shown_output(&call) else {
             panic!("expected an MCP card");
@@ -234,18 +230,18 @@ mod tests {
             .collect()
     }
 
-    #[test_case(McpCodeCallStatus::Running, None, BatchToolStatus::Running, false ; "running")]
-    #[test_case(McpCodeCallStatus::Success, None, BatchToolStatus::Success, false ; "success")]
-    #[test_case(McpCodeCallStatus::Refused, Some(REFUSAL), BatchToolStatus::Error, true ; "refused")]
+    #[test_case(CodeCallStatus::Running, None, BatchToolStatus::Running, false ; "running")]
+    #[test_case(CodeCallStatus::Success, None, BatchToolStatus::Success, false ; "success")]
+    #[test_case(CodeCallStatus::Refused, Some(REFUSAL), BatchToolStatus::Error, true ; "refused")]
     fn a_call_reads_as_a_batch_child(
-        status: McpCodeCallStatus,
+        status: CodeCallStatus,
         error: Option<&str>,
         expected: BatchToolStatus,
         refused: bool,
     ) {
-        let [entry] = entries(&McpCodeOutput {
+        let [entry] = entries(&CodeOutput {
             calls: vec![call(status, error)],
-            ..McpCodeOutput::default()
+            ..CodeOutput::default()
         })
         .try_into()
         .unwrap();
@@ -267,14 +263,14 @@ mod tests {
 
     #[test]
     fn the_tail_holds_each_part_to_the_budget_and_names_the_failure() {
-        let output = McpCodeOutput {
+        let output = CodeOutput {
             stdout: PRINTED.to_owned(),
             result: Some("[1, 2]".to_owned()),
-            outcome: McpCodeOutcome::Raised {
+            outcome: CodeOutcome::Raised {
                 kind: "RuntimeError".to_owned(),
                 message: "boom".to_owned(),
             },
-            ..McpCodeOutput::default()
+            ..CodeOutput::default()
         };
         let (blocks, truncated) = tail(&output, 2, WIDTH);
         let texts = texts(&blocks);
@@ -288,18 +284,18 @@ mod tests {
 
     #[test]
     fn a_quiet_completed_run_has_no_tail() {
-        let (blocks, truncated) = tail(&McpCodeOutput::default(), usize::MAX, WIDTH);
+        let (blocks, truncated) = tail(&CodeOutput::default(), usize::MAX, WIDTH);
         assert!(blocks.is_empty() && !truncated);
     }
 
     #[test]
     fn the_tail_ends_on_what_was_repaired_before_the_run() {
-        let output = McpCodeOutput {
+        let output = CodeOutput {
             repairs: vec![
                 "imported `asyncio`".to_owned(),
                 "imported `json`".to_owned(),
             ],
-            ..McpCodeOutput::default()
+            ..CodeOutput::default()
         };
         let (blocks, _) = tail(&output, usize::MAX, WIDTH);
         assert_eq!(

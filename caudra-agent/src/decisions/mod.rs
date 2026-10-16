@@ -74,7 +74,7 @@ const ENGINE_REFUSED: &str = "engine refused";
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DecisionFeature {
     Workflow,
-    Mcp,
+    Code,
     PermissionAdvice,
     AutoScreening,
     ShellEffect,
@@ -86,6 +86,7 @@ pub enum DecisionFeature {
     SubagentRouting,
     QuestionToolNudge,
     MemorySearch,
+    HistorySearch,
     MemoryRecall,
     MemoryDuplicates,
     CompactionRetention,
@@ -95,7 +96,7 @@ pub enum DecisionFeature {
 
 impl DecisionFeature {
     /// Configured features in `[decisions.features]` order, then the script callers.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::PermissionAdvice,
         Self::AutoScreening,
         Self::ShellEffect,
@@ -107,13 +108,14 @@ impl DecisionFeature {
         Self::SubagentRouting,
         Self::QuestionToolNudge,
         Self::MemorySearch,
+        Self::HistorySearch,
         Self::MemoryRecall,
         Self::MemoryDuplicates,
         Self::CompactionRetention,
         Self::OutputPointers,
         Self::SourceCodeContext,
         Self::Workflow,
-        Self::Mcp,
+        Self::Code,
     ];
 
     /// The name the log records, which differs from the configuration key
@@ -121,7 +123,7 @@ impl DecisionFeature {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Workflow => "workflow",
-            Self::Mcp => "mcp",
+            Self::Code => "code",
             Self::PermissionAdvice => "permission",
             Self::AutoScreening => "auto",
             Self::ShellEffect => "shell_effect",
@@ -133,6 +135,7 @@ impl DecisionFeature {
             Self::SubagentRouting => "subagent_routing",
             Self::QuestionToolNudge => "question_tool_nudge",
             Self::MemorySearch => "memory_search",
+            Self::HistorySearch => "history_search",
             Self::MemoryRecall => "memory_recall",
             Self::MemoryDuplicates => "memory_duplicates",
             Self::CompactionRetention => "compaction_retention",
@@ -141,12 +144,12 @@ impl DecisionFeature {
         }
     }
 
-    /// The `[decisions.features]` key. Workflow and MCP code mode have none:
+    /// The `[decisions.features]` key. Workflow and the `code` tool have none:
     /// a script's `decide()` call is the request, so it runs whenever an
     /// engine is set.
     pub fn config_key(&self) -> Option<&'static str> {
         match self {
-            Self::Workflow | Self::Mcp => None,
+            Self::Workflow | Self::Code => None,
             Self::PermissionAdvice => Some("permission_advice"),
             Self::AutoScreening => Some("auto_screening"),
             Self::ShellEffect => Some("shell_effect"),
@@ -158,6 +161,7 @@ impl DecisionFeature {
             Self::SubagentRouting => Some("subagent_routing"),
             Self::QuestionToolNudge => Some("question_tool_nudge"),
             Self::MemorySearch => Some("memory_search"),
+            Self::HistorySearch => Some("history_search"),
             Self::MemoryRecall => Some("memory_recall"),
             Self::MemoryDuplicates => Some("memory_duplicates"),
             Self::CompactionRetention => Some("compaction_retention"),
@@ -187,7 +191,7 @@ impl DecisionFeature {
 
     pub fn mode<'a>(&self, features: &'a DecisionFeatures) -> &'a FeatureMode {
         match self {
-            Self::Workflow | Self::Mcp => &FeatureMode::Enforce,
+            Self::Workflow | Self::Code => &FeatureMode::Enforce,
             Self::PermissionAdvice => &features.permission_advice,
             Self::AutoScreening => &features.auto_screening,
             Self::ShellEffect => &features.shell_effect,
@@ -199,6 +203,7 @@ impl DecisionFeature {
             Self::SubagentRouting => &features.subagent_routing,
             Self::QuestionToolNudge => &features.question_tool_nudge,
             Self::MemorySearch => &features.memory_search,
+            Self::HistorySearch => &features.history_search,
             Self::MemoryRecall => &features.memory_recall,
             Self::MemoryDuplicates => &features.memory_duplicates,
             Self::CompactionRetention => &features.compaction_retention,
@@ -212,9 +217,10 @@ impl DecisionFeature {
     /// either budget.
     pub fn timeout_ms(&self, config: &DecisionsConfig) -> u64 {
         match self {
-            Self::Workflow | Self::Mcp => config.timeout_ms.max(config.rerank_timeout_ms),
+            Self::Workflow | Self::Code => config.timeout_ms.max(config.rerank_timeout_ms),
             Self::ToolSearch
             | Self::MemorySearch
+            | Self::HistorySearch
             | Self::MemoryDuplicates
             | Self::CompactionRetention
             | Self::OutputPointers
@@ -232,6 +238,18 @@ impl DecisionFeature {
         }
     }
 
+    /// The deadline for each of a rerank's `batches` concurrent requests. History search gives
+    /// every request one budget per batch, because an engine that answers one request at a
+    /// time, in whatever order they arrive, would otherwise spend a single budget on the pool.
+    pub fn rerank_batch_timeout_ms(&self, config: &DecisionsConfig, batches: usize) -> u64 {
+        match self {
+            Self::HistorySearch => config
+                .rerank_timeout_ms
+                .saturating_mul(u64::try_from(batches).unwrap_or(u64::MAX)),
+            _ => self.timeout_ms(config),
+        }
+    }
+
     /// The relevance probability a reranked candidate needs before the
     /// feature acts on it: the floor for enforcing surfaces, the routing
     /// confidence for advice.
@@ -239,13 +257,14 @@ impl DecisionFeature {
         match self {
             Self::ToolSearch
             | Self::MemorySearch
+            | Self::HistorySearch
             | Self::CompactionRetention
             | Self::SourceCodeContext => Some(thresholds.relevance_floor),
             Self::MemoryRecall | Self::MemoryDuplicates | Self::OutputPointers => {
                 Some(thresholds.routing_confidence)
             }
             Self::Workflow
-            | Self::Mcp
+            | Self::Code
             | Self::PermissionAdvice
             | Self::AutoScreening
             | Self::ShellEffect
@@ -517,6 +536,19 @@ impl Decisions {
         questions: &QuestionSet,
         context: &DecisionContext,
     ) -> Option<DecisionOutcome> {
+        let timeout_ms = feature.timeout_ms(self.config());
+        self.evaluate_within(feature, state, questions, context, timeout_ms)
+            .await
+    }
+
+    async fn evaluate_within(
+        &self,
+        feature: DecisionFeature,
+        state: &Value,
+        questions: &QuestionSet,
+        context: &DecisionContext,
+        timeout_ms: u64,
+    ) -> Option<DecisionOutcome> {
         if !self.enabled(&feature) {
             return None;
         }
@@ -533,7 +565,6 @@ impl Decisions {
             state: bounded.value().clone(),
             questions: questions.questions().clone(),
         };
-        let timeout_ms = feature.timeout_ms(self.config());
         Some(
             self.run(feature, questions, request, context, timeout_ms)
                 .await,
@@ -585,7 +616,6 @@ impl Decisions {
         timeout_ms: u64,
     ) -> DecisionOutcome {
         let started = Instant::now();
-        let timeout_ms = timeout_ms.min(feature.timeout_ms(self.config()));
         let result = self.call(&request, started, timeout_ms).await;
         let latency_ms = elapsed_ms(started);
         {
@@ -1678,6 +1708,7 @@ mod tests {
     #[test_case(DecisionFeature::MemoryRecall, false; "memory_recall_delays_the_turn")]
     #[test_case(DecisionFeature::ToolSearch, true; "tool_search")]
     #[test_case(DecisionFeature::MemorySearch, true; "memory_search")]
+    #[test_case(DecisionFeature::HistorySearch, true; "history_search")]
     #[test_case(DecisionFeature::MemoryDuplicates, true; "memory_duplicates")]
     #[test_case(DecisionFeature::CompactionRetention, true; "compaction_retention")]
     #[test_case(DecisionFeature::OutputPointers, true; "output_pointers")]
@@ -1729,6 +1760,7 @@ mod tests {
 
     #[test_case(DecisionFeature::MemorySearch, Some(RELEVANCE_FLOOR); "enforcing_rerank_uses_the_floor")]
     #[test_case(DecisionFeature::SourceCodeContext, Some(RELEVANCE_FLOOR); "source_code_context_uses_the_floor")]
+    #[test_case(DecisionFeature::HistorySearch, Some(RELEVANCE_FLOOR); "history_search_uses_the_floor")]
     #[test_case(DecisionFeature::ToolSearch, Some(RELEVANCE_FLOOR); "tool_search_uses_the_floor")]
     #[test_case(DecisionFeature::OutputPointers, Some(ROUTING_CONFIDENCE); "advice_uses_routing_confidence")]
     #[test_case(DecisionFeature::SkillSuggestions, None; "choice_features_keep_the_default")]

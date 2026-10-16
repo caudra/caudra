@@ -1,6 +1,6 @@
 {
-  "baseline": {"right": 4, "wrong": 0, "undecided": 0, "p50_ms": 355, "p95_ms": 357},
-  "baseline_note": "Measured 2026-10-12 with one relevance question per candidate, protocol openai, endpoint http://127.0.0.1:8080/v1 (local ninfer), model systemone-decision-v7. The opaque choice shape it replaced scored right 6, wrong 0, undecided 1 (p50 227 ms, p95 228 ms) on the same endpoint and model. The three source-code-graph cases were dropped on 2026-10-16 when those tools stopped being deferred; all three had scored right, so the remaining cases keep their measured results.",
+  "baseline": {"right": 3, "wrong": 0, "undecided": 0, "p50_ms": 355, "p95_ms": 357},
+  "baseline_note": "Measured 2026-10-12 with one relevance question per candidate, protocol openai, endpoint http://127.0.0.1:8080/v1 (local ninfer), model systemone-decision-v7. The opaque choice shape it replaced scored right 6, wrong 0, undecided 1 (p50 227 ms, p95 228 ms) on the same endpoint and model. The three source-code-graph cases were dropped on 2026-10-16 when those tools stopped being deferred; all three had scored right, so the remaining cases keep their measured results. The python_execution case went the same day, when Python moved into the always-declared code tool.",
   "cases": [
     {
       "query": "viewing an image file",
@@ -12,17 +12,9 @@
       "expect": "view_image"
     },
     {
-      "query": "run a quick python calculation",
-      "candidates": [
-        {"name": "execution_environment", "description": "Inspect the execution host's current environment: installed commands and versions, privilege access, Git status and package managers."},
-        {"name": "python_execution", "description": "Execute a short Python script in an isolated interpreter and return its value and printed output."}
-      ],
-      "expect": "python_execution"
-    },
-    {
       "query": "check which version of node is installed",
       "candidates": [
-        {"name": "python_execution", "description": "Execute a short Python script in an isolated interpreter and return its value and printed output."},
+        {"name": "image_generate", "description": "Generate a raster image from a text prompt and save it as a PNG."},
         {"name": "execution_environment", "description": "Inspect the execution host's current environment: installed commands and versions, privilege access, Git status and package managers."},
         {"name": "view_image", "description": "View an image file (png, jpeg, gif, webp) so you can actually see it."}
       ],

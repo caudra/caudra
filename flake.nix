@@ -23,7 +23,6 @@
       systems = [
         "x86_64-linux"
         "aarch64-linux"
-        "x86_64-darwin"
         "aarch64-darwin"
       ];
       forEachSystem =
@@ -41,7 +40,7 @@
       mkCraneLib =
         pkgs:
         let
-          rustToolchain = pkgs.rust-bin.stable."1.99.0".default.override {
+          rustToolchain = pkgs.rust-bin.stable."1.99.1".default.override {
             extensions = [
               "rust-src"
               "rust-analyzer"
@@ -119,8 +118,6 @@
       gitDepHashes = {
         "git+https://github.com/pydantic/monty.git?tag=v1.1.0#591527397445bf734873252d1ee20c1b6308fe7f" =
           "sha256-FqJIkEVmKeDWQyb/yrJ0+/2tZ1kCNe2Xc4r9UPgQptU=";
-        "git+https://github.com/modelcontextprotocol/rust-sdk.git?rev=9334c97f0d6e177546fc33593148aa3f942cb1f8#9334c97f0d6e177546fc33593148aa3f942cb1f8" =
-          "sha256-X9WsE8CB5rBwXClvZibtKA6ajoYuAOIA3mj4ETN9gyQ=";
       };
 
       missingGitDepHashes = builtins.filter (s: !(builtins.hasAttr s gitDepHashes)) gitDepSources;
@@ -145,10 +142,12 @@
         let
           craneLib = mkCraneLib pkgs;
           workspaceSrc = mkWorkspaceSrc craneLib;
-          montySrc = pkgs.fetchgit {
-            url = "https://github.com/pydantic/monty.git";
+          montySrc = builtins.fetchTree {
+            type = "github";
+            owner = "pydantic";
+            repo = "monty";
             rev = "591527397445bf734873252d1ee20c1b6308fe7f";
-            hash = "sha256-FqJIkEVmKeDWQyb/yrJ0+/2tZ1kCNe2Xc4r9UPgQptU=";
+            narHash = "sha256-FqJIkEVmKeDWQyb/yrJ0+/2tZ1kCNe2Xc4r9UPgQptU=";
           };
           montyVendorDeps = craneLib.vendorCargoDeps { src = montySrc; };
           montyAttributionVendor = pkgs.runCommandLocal "monty-attribution-vendor" { } (
@@ -159,7 +158,7 @@
             version = "1.1.0";
             src = montySrc;
             cargoVendorDir = montyVendorDeps;
-            cargoExtraArgs = "--package monty-runtime --no-default-features";
+            cargoExtraArgs = "--locked --package monty-runtime --no-default-features";
             CARGO_PROFILE_RELEASE_LTO = "thin";
             CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "1";
             CARGO_PROFILE_RELEASE_STRIP = "none";
@@ -248,7 +247,7 @@
               inherit version;
               src = workspaceSrc;
               cargoArtifacts = cargoArtifacts;
-              cargoExtraArgs = "--package ${packageName}";
+              cargoExtraArgs = "--locked --package ${packageName}";
               outputs = [
                 "out"
                 "debug"
@@ -295,8 +294,8 @@
                   printf '%s\n' "$smoke_output" >&2
                   exit 1
                 fi
-                if ! printf '%s\n' "$smoke_output" | grep -qx python_execution ||
-                  printf '%s\n' "$smoke_output" | grep -q 'Workcell python_execution is unavailable'; then
+                if ! printf '%s\n' "$smoke_output" | grep -qx code ||
+                  printf '%s\n' "$smoke_output" | grep -q 'The code tool is unavailable'; then
                   printf '%s\n' "$smoke_output" >&2
                   exit 1
                 fi

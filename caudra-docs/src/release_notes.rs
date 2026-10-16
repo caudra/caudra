@@ -1,7 +1,7 @@
 //! The release notes under `release-notes/`, one `<version>.md` file per release, as Caudra shows them after an
 //! update and in `/changelog`. The same files are the GitHub release bodies, and the release pipeline adds the
-//! install and update steps there, so a file holds only what changed: a lead paragraph, alerts for anything a
-//! user must do, and `###` groups.
+//! install and update steps there, so a file holds only what changed: a bullet list of highlights, alerts for
+//! anything a user must do, and `###` groups.
 
 use std::cmp::Ordering;
 
@@ -33,8 +33,8 @@ const ALERT_KINDS: [(&str, &str); 5] = [
 ];
 /// Sections the release pipeline writes for GitHub readers, which someone already running the release does not need.
 const GENERATED_HEADINGS: [&str; 2] = ["new to caudra?", "updating"];
-/// What can open a Markdown block other than a paragraph.
-const BLOCK_MARKERS: [&str; 9] = ["#", ">", "- ", "* ", "+ ", "|", "<", "    ", "\t"];
+/// How each of the highlights that open a release starts.
+const HIGHLIGHT_MARKER: &str = "- ";
 
 /// How the TUI reaches the notes the binary parses on first use.
 pub type ReleaseNotesSource = fn() -> &'static ReleaseNotes;
@@ -183,11 +183,10 @@ fn title(version: &Version) -> String {
 /// Checks the authoring rules and spells each alert marker as a bold label.
 fn display(path: &str, text: &str) -> Result<String, SourceError> {
     let text = text.trim();
-    let lead = text.lines().next().unwrap_or_default();
-    if lead.is_empty() || BLOCK_MARKERS.iter().any(|marker| lead.starts_with(marker)) {
+    if !text.starts_with(HIGHLIGHT_MARKER) {
         return Err(SourceError::new(
             path,
-            "start with a lead paragraph that summarizes the release",
+            "start with a bullet list of the release's highlights",
         ));
     }
     let mut display = String::with_capacity(text.len());
@@ -260,11 +259,11 @@ mod tests {
     use super::{Release, ReleaseNotes, title};
     use crate::fixture::leak;
 
-    const LEAD: &str = "A summary.\n\n";
+    const LEAD: &str = "- A change.\n\n";
     const PREVIEW_3: &str = "0.2.0-preview.3";
     const PREVIEW_4: &str = "0.2.0-preview.4";
     const PREVIEW_6: &str = "0.2.0-preview.6";
-    const LEAD_ERROR: &str = "lead paragraph";
+    const LEAD_ERROR: &str = "highlights";
     const GROUP_ERROR: &str = "### headings";
     const GENERATED_ERROR: &str = "release pipeline adds";
     const ALERT_ERROR: &str = "unknown alert";
@@ -293,16 +292,18 @@ mod tests {
 
     #[test_case("0.2.0-preview.4.md", "### Groups\n", Some(LEAD_ERROR) ; "group_first")]
     #[test_case("0.2.0-preview.4.md", "> [!IMPORTANT]\n> Restart.\n", Some(LEAD_ERROR) ; "alert_first")]
-    #[test_case("0.2.0-preview.4.md", "- **A.** B.\n", Some(LEAD_ERROR) ; "bullet_first")]
+    #[test_case("0.2.0-preview.4.md", "A summary.\n\n### Changes\n\n- **A.** B.\n", Some(LEAD_ERROR) ; "paragraph_first")]
+    #[test_case("0.2.0-preview.4.md", "* A change.\n", Some(LEAD_ERROR) ; "star_bullet_first")]
     #[test_case("0.2.0-preview.4.md", "  \n", Some(LEAD_ERROR) ; "empty")]
-    #[test_case("0.2.0-preview.4.md", "A summary.\n\n## Changes\n", Some(GROUP_ERROR) ; "h2")]
-    #[test_case("0.2.0-preview.4.md", "A summary.\n\n# Caudra\n", Some(GROUP_ERROR) ; "h1")]
-    #[test_case("0.2.0-preview.4.md", "A summary.\n\n### New to Caudra?\n", Some(GENERATED_ERROR) ; "new_users")]
-    #[test_case("0.2.0-preview.4.md", "A summary.\n\n### Updating from Preview 3\n", Some(GENERATED_ERROR) ; "updating")]
-    #[test_case("0.2.0-preview.4.md", "A summary.\n\n> [!DANGER]\n> Stop.\n", Some(ALERT_ERROR) ; "unknown_alert")]
-    #[test_case("preview-4.md", "A summary.\n", Some(NAME_ERROR) ; "not_a_version")]
-    #[test_case("0.2.0-preview.4.txt", "A summary.\n", Some(NAME_ERROR) ; "not_markdown")]
-    #[test_case("0.2.0-preview.4.md", "A summary.\n\n### Updates\n\n```md\n## Updating\n```\n", None ; "fenced_and_similar_headings_pass")]
+    #[test_case("0.2.0-preview.4.md", "- A change.\n\n## Changes\n", Some(GROUP_ERROR) ; "h2")]
+    #[test_case("0.2.0-preview.4.md", "- A change.\n\n# Caudra\n", Some(GROUP_ERROR) ; "h1")]
+    #[test_case("0.2.0-preview.4.md", "- A change.\n\n### New to Caudra?\n", Some(GENERATED_ERROR) ; "new_users")]
+    #[test_case("0.2.0-preview.4.md", "- A change.\n\n### Updating from Preview 3\n", Some(GENERATED_ERROR) ; "updating")]
+    #[test_case("0.2.0-preview.4.md", "- A change.\n\n> [!DANGER]\n> Stop.\n", Some(ALERT_ERROR) ; "unknown_alert")]
+    #[test_case("preview-4.md", "- A change.\n", Some(NAME_ERROR) ; "not_a_version")]
+    #[test_case("0.2.0-preview.4.txt", "- A change.\n", Some(NAME_ERROR) ; "not_markdown")]
+    #[test_case("0.2.0-preview.4.md", "- A change.\n- Another.\n\n> [!IMPORTANT]\n> Restart.\n\n### Changes\n\n- **A.** B.\n", None ; "highlights_then_alert_and_groups")]
+    #[test_case("0.2.0-preview.4.md", "- A change.\n\n### Updates\n\n```md\n## Updating\n```\n", None ; "fenced_and_similar_headings_pass")]
     fn notes_follow_the_authoring_rules(
         path: &'static str,
         text: &'static str,
@@ -318,8 +319,8 @@ mod tests {
     #[test]
     fn two_files_for_one_version_are_refused() {
         let error = ReleaseNotes::parse([
-            ("1.0.0.md", "A summary.\n"),
-            ("1.0.0+build.md", "A summary.\n"),
+            ("1.0.0.md", "- A change.\n"),
+            ("1.0.0+build.md", "- A change.\n"),
         ])
         .unwrap_err();
         assert!(error.message.contains(DUPLICATE_ERROR), "{error}");
@@ -403,13 +404,13 @@ mod tests {
     fn alerts_become_bold_labels_and_links_name_the_tag() {
         let notes = ReleaseNotes::parse([(
             "0.2.0-preview.4.md",
-            "A summary.\n\n> [!IMPORTANT]\n> **Restart.** Now.\n\n```md\n> [!TIP]\n```\n",
+            "- A change.\n\n> [!IMPORTANT]\n> **Restart.** Now.\n\n```md\n> [!TIP]\n```\n",
         )])
         .unwrap();
         let release = &notes.releases()[0];
         assert_eq!(
             release.display,
-            "A summary.\n\n> **Important**\n>\n> **Restart.** Now.\n\n```md\n> [!TIP]\n```\n"
+            "- A change.\n\n> **Important**\n>\n> **Restart.** Now.\n\n```md\n> [!TIP]\n```\n"
         );
         assert_eq!(release.tag, "v0.2.0-preview.4");
         assert_eq!(
@@ -417,7 +418,7 @@ mod tests {
             "https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.4"
         );
         assert!(release.body().starts_with(
-            "[v0.2.0-preview.4 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.4)\n\nA summary."
+            "[v0.2.0-preview.4 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.4)\n\n- A change."
         ));
         assert_eq!(release.anchor(), "v0-2-0-preview-4");
     }

@@ -17,9 +17,8 @@ use caudra_agent::tools::profile_policy::{CEILING_DISABLED, LEGACY_LOADING, regi
 use caudra_agent::tools::registry::ToolDefinitions;
 use caudra_agent::tools::report::{CATALOG_SOURCE, REASON_CATALOG};
 use caudra_agent::tools::{
-    BuiltinDeferral, DeferralSession, DescriptionContext, MCP_TOOL_NAME, SHELL_TOOL_NAME,
-    TOOL_SEARCH_TOOL_NAME, ToolAudience, ToolFilter, ToolRegistry, ToolState, builtin_report,
-    execution, is_tool_enabled,
+    BuiltinDeferral, DeferralSession, DescriptionContext, SHELL_TOOL_NAME, TOOL_SEARCH_TOOL_NAME,
+    ToolAudience, ToolFilter, ToolRegistry, ToolState, builtin_report, execution, is_tool_enabled,
 };
 use caudra_config::providers::{
     Protocol, ProviderDef, ProvidersConfig, ProvidersFile, all_builtins, builtin_provider,
@@ -55,8 +54,7 @@ use crate::setup::resolve_model;
 const PROMPT_PLAN_PATH: &str = "<active plan document>";
 const PROMPT_PLAN_REFERENCE: &str = "active-plan-inspection";
 const REASON_INSPECTION_UNAVAILABLE: &str = "unavailable for this inspection runtime or mode";
-const REASON_NO_MCP_SERVER: &str = "no MCP server is enabled";
-const REASON_VIA_MCP: &str = "via mcp";
+const REASON_VIA_CODE: &str = "via code";
 const REASON_SEARCH_ONLY: &str = "search-only: left out of the server list, found by search()";
 const AUTH_STATUS_EMPTY: &str = "       ";
 const AUTH_STATUS_ENV: &str = "\x1b[33m~ env  \x1b[0m";
@@ -1171,7 +1169,7 @@ fn builtin_rows(
 /// Derived, not looked up: `tool_search` is synthesized into the request
 /// array whenever a built-in is deferred, so a lazy row means the model is
 /// offered the catalog too. MCP tools never reach it: they are called from
-/// the `mcp` tool.
+/// the `code` tool.
 fn catalog_row(builtin: &[ToolRow]) -> Option<ToolRow> {
     if builtin
         .iter()
@@ -1210,7 +1208,7 @@ fn mcp_rows(mcp: Option<&McpSession>, permissions: &PermissionsConfig) -> Vec<To
                     tool.reason.unwrap_or(REASON_INSPECTION_UNAVAILABLE),
                 ),
                 (false, true) => (ToolState::On, REASON_SEARCH_ONLY),
-                (false, false) => (ToolState::On, REASON_VIA_MCP),
+                (false, false) => (ToolState::On, REASON_VIA_CODE),
             };
             ToolRow {
                 state,
@@ -1302,13 +1300,7 @@ fn inspection_tool_state(definitions: &ToolDefinitions, name: &str) -> ToolState
     }
 }
 
-/// `mcp` is declared only while a server is enabled, as a session decides it.
-fn inspection_catalog(mut definitions: ToolDefinitions, mcp: Option<&McpSession>) -> Value {
-    if !mcp.is_some_and(|mcp| mcp.has_enabled_server())
-        && let Some(tools) = definitions.declared.as_array_mut()
-    {
-        tools.retain(|tool| tool["name"].as_str() != Some(MCP_TOOL_NAME));
-    }
+fn inspection_catalog(mut definitions: ToolDefinitions) -> Value {
     let deferred = DeferralSession::new(definitions.deferred, std::iter::empty());
     let sections = Vec::from_iter(
         deferred
@@ -1344,7 +1336,7 @@ fn inspection_mcp(
         mode
     });
     handle.map(|handle| {
-        McpSession::new(handle, &[])
+        McpSession::new(handle)
             .with_disabled_tools(&config.disabled_tools)
             .with_profile_policy(policy, ceiling)
     })
@@ -1437,6 +1429,11 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
     let vars = inspection_vars(vars, &profiles, &config, &model);
     let definitions =
         inspection_definitions(reg, &vars, &ctx, &config.agent, &model, &policy, false)?;
+    if schemas {
+        let defs = inspection_catalog(definitions);
+        println!("{}", serde_json::to_string_pretty(&defs)?);
+        return Ok(());
+    }
     let mcp = inspection_mcp(
         &cwd,
         runtime.is_remote(),
@@ -1444,12 +1441,6 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
         Arc::clone(&policy),
         &AgentMode::Build,
     );
-
-    if schemas {
-        let defs = inspection_catalog(definitions, mcp.as_ref());
-        println!("{}", serde_json::to_string_pretty(&defs)?);
-        return Ok(());
-    }
 
     let cli_disallowed = cli
         .disallowed_tools
@@ -1465,12 +1456,6 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
         &definitions,
         &policy,
     );
-    if !mcp.as_ref().is_some_and(|mcp| mcp.has_enabled_server())
-        && let Some(row) = builtin.iter_mut().find(|row| row.name == MCP_TOOL_NAME)
-    {
-        row.state = ToolState::Off;
-        row.note = Some(REASON_NO_MCP_SERVER);
-    }
     let mut mcp_tools = mcp_rows(mcp.as_ref(), &config.permissions);
     if let Some(catalog) = catalog_row(&builtin) {
         let at = builtin.partition_point(|row| row.name < catalog.name);
@@ -1707,14 +1692,7 @@ pub fn prompt(
         mode.has_session_plan(None),
     )?;
     if tools {
-        let mcp = inspection_mcp(
-            &cwd,
-            runtime.is_remote(),
-            &config.agent,
-            Arc::clone(&policy),
-            &mode,
-        );
-        let defs = inspection_catalog(definitions, mcp.as_ref());
+        let defs = inspection_catalog(definitions);
         if names {
             for name in defs
                 .as_array()
@@ -2087,7 +2065,7 @@ Title     default       provider/title\n"
             })
         );
         assert_eq!(catalog_row(&rows).is_some(), expected == ToolState::Lazy);
-        let catalog = inspection_catalog(definitions, None);
+        let catalog = inspection_catalog(definitions);
         let tools = catalog.as_array().unwrap();
         assert_eq!(
             tools.iter().any(|tool| tool["name"] == INSPECTION_TODO),
@@ -2210,7 +2188,7 @@ Title     default       provider/title\n"
             assert!(!reminder.contains("`file_write`"));
         }
         assert_eq!(
-            inspection_catalog(definitions, None)
+            inspection_catalog(definitions)
                 .as_array()
                 .unwrap()
                 .iter()
