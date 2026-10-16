@@ -29,8 +29,7 @@ use caudra_agent::mcp::code::output::McpCodeOutput;
 use caudra_agent::tools::{
     PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, timeout_annotation,
 };
-use caudra_agent::types::Answer;
-use caudra_agent::types::{TodoItem, TodoStatus};
+use caudra_agent::types::{AnswerSheet, TodoItem, TodoStatus};
 use caudra_agent::{
     BatchToolEntry, BatchToolStatus, CodeGraphRow, CodeGraphSource, GrepFileEntry, INDEX_TRUNCATED,
     IndexDirectoryEntryKind, IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange,
@@ -60,6 +59,8 @@ const ANSWER_INDENT: &str = "    ";
 /// belonging to the row above it rather than as another choice.
 const DESCRIPTION_INDENT: &str = "      ";
 const NO_ANSWER: &str = "(no answer)";
+/// Heads the note the user wrote for the whole form, under its answers.
+const ANSWERS_NOTE_HEADER: &str = "Note";
 /// Indented past the child's own sigil, so the activity reads as belonging to
 /// the row above it rather than as another entry in the roster.
 const CHILD_ACTIVITY_SEPARATOR: &str = " · ";
@@ -960,10 +961,10 @@ fn render_todos(items: &[TodoItem]) -> Vec<Line<'static>> {
 /// loads, so an answer that arrives without them is one whose input no longer
 /// lines up. That still has its picks, and they are drawn the way they always
 /// were rather than dropped.
-fn render_answers(answers: &[Answer], budget: usize) -> (Vec<Line<'static>>, bool) {
+fn render_answers(sheet: &AnswerSheet, budget: usize) -> (Vec<Line<'static>>, bool) {
     let t = theme::current();
     let mut lines = Vec::new();
-    for (index, answer) in answers.iter().enumerate() {
+    for (index, answer) in sheet.answers.iter().enumerate() {
         if lines.len() >= budget {
             return (lines, true);
         }
@@ -1007,6 +1008,16 @@ fn render_answers(answers: &[Answer], budget: usize) -> (Vec<Line<'static>>, boo
                 Span::styled(NO_ANSWER, t.tool_dim),
             ])));
         }
+    }
+    if !sheet.note.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::styled(ANSWERS_NOTE_HEADER, t.tool_prefix));
+        lines.extend(sheet.note.lines().map(|row| {
+            Line::from(Vec::from([
+                Span::raw(ANSWER_INDENT),
+                Span::raw(row.to_owned()),
+            ]))
+        }));
     }
     let truncated = lines.len() > budget;
     lines.truncate(budget);
@@ -3737,7 +3748,7 @@ pub fn render_tool_content(
             limits.width,
         ),
         Some(ToolOutput::TodoList(items)) => (render_todos(items), false),
-        Some(ToolOutput::Answers(answers)) => render_answers(answers, limits.bounded_budget()),
+        Some(ToolOutput::Answers(sheet)) => render_answers(sheet, limits.bounded_budget()),
         Some(ToolOutput::WorkflowRun(card)) => {
             let (card_lines, rows) = workflow_card::render(card, limits.width);
             output_rows = rows;
@@ -4022,7 +4033,7 @@ mod tests {
     use caudra_agent::tools::{
         BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME, SKILL_TOOL_NAME, ToolEffect,
     };
-    use caudra_agent::types::{Answerer, QuestionOption};
+    use caudra_agent::types::{Answer, Answerer, QuestionOption};
     use caudra_agent::{
         ActivityChild, EnvironmentFact, GrepLine, GrepMatchGroup, ShellOutput, SubagentActivity,
         TextOutput,
@@ -5229,6 +5240,7 @@ mod tests {
     const Q_DECLINED: &str = "Base64 in JSON-RPC";
     const Q_DESCRIPTION: &str = "Short-lived URLs instead of bytes";
     const Q_TYPED: &str = "hybrid, but on the same port";
+    const Q_NOTE: &str = "Keep the bucket private\nand rotate the keys";
     const UNBOUNDED: usize = usize::MAX;
     const DECLINED_SHOWN: &str = "a declined option is half of what the decision was";
 
@@ -5252,9 +5264,38 @@ mod tests {
         vec![(Q_PICKED, Q_DESCRIPTION), (Q_DECLINED, "")]
     }
 
+    fn sheet<const N: usize>(answers: [Answer; N]) -> AnswerSheet {
+        Vec::from(answers).into()
+    }
+
+    #[test]
+    fn an_answer_card_draws_the_users_note_under_the_answers() {
+        let noted = AnswerSheet {
+            answers: vec![answer(&[Q_PICKED], &offered())],
+            note: Q_NOTE.into(),
+        };
+
+        let (lines, _) = render_answers(&noted, UNBOUNDED);
+
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let header = texts
+            .iter()
+            .position(|text| text == ANSWERS_NOTE_HEADER)
+            .expect("the note has a header");
+        assert!(header > texts.iter().position(|t| t.contains(Q_PICKED)).unwrap());
+        assert_eq!(
+            texts[header + 1..],
+            Q_NOTE
+                .lines()
+                .map(|row| format!("{ANSWER_INDENT}{row}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn an_answer_card_draws_the_question_and_every_option_it_offered() {
-        let (lines, truncated) = render_answers(&[answer(&[Q_PICKED], &offered())], UNBOUNDED);
+        let (lines, truncated) =
+            render_answers(&sheet([answer(&[Q_PICKED], &offered())]), UNBOUNDED);
 
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert!(!truncated);
@@ -5278,7 +5319,7 @@ mod tests {
     /// a pick like any other even though no option carries it.
     #[test]
     fn a_typed_answer_is_drawn_as_a_pick_of_its_own() {
-        let (lines, _) = render_answers(&[answer(&[Q_TYPED], &offered())], UNBOUNDED);
+        let (lines, _) = render_answers(&sheet([answer(&[Q_TYPED], &offered())]), UNBOUNDED);
 
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert!(
@@ -5296,7 +5337,7 @@ mod tests {
 
     #[test]
     fn a_skipped_question_still_draws_its_form() {
-        let (lines, _) = render_answers(&[answer(&[], &offered())], UNBOUNDED);
+        let (lines, _) = render_answers(&sheet([answer(&[], &offered())]), UNBOUNDED);
 
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert!(texts.iter().any(|t| t.contains(NO_ANSWER)));
@@ -5317,7 +5358,7 @@ mod tests {
             options: Vec::new(),
             by: Answerer::User,
         };
-        let (lines, _) = render_answers(&[bare], UNBOUNDED);
+        let (lines, _) = render_answers(&sheet([bare]), UNBOUNDED);
 
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert_eq!(texts.len(), 2);
@@ -5336,7 +5377,7 @@ mod tests {
             .collect();
         const BUDGET: usize = 10;
 
-        let (lines, truncated) = render_answers(&[answer(&[], &borrowed)], BUDGET);
+        let (lines, truncated) = render_answers(&sheet([answer(&[], &borrowed)]), BUDGET);
 
         assert!(truncated);
         assert_eq!(lines.len(), BUDGET);
@@ -8386,7 +8427,7 @@ mod tests {
     }
 
     fn answers_output() -> ToolOutput {
-        ToolOutput::Answers(Vec::from([Answer {
+        ToolOutput::Answers(sheet([Answer {
             header: LONG.to_owned(),
             labels: Vec::from([LONG.to_owned()]),
             question: LONG.to_owned(),

@@ -74,6 +74,7 @@ pub const QUESTION_ACCEPTED_REPLY: &str = "accepted";
 /// The user put a waiting `question` off to answer later: the agent gets a
 /// receipt and carries on, and the form joins the deferred questions.
 pub const QUESTION_DEFERRED_REPLY: &str = "deferred";
+const ANSWERS_NOTE_PREFIX: &str = "\nNote: ";
 /// Log lines a card keeps under its roster while the run works.
 pub const CARD_LOG_LINES: usize = 3;
 const CARD_REPORT_FIELD: &str = "report";
@@ -420,6 +421,91 @@ pub struct Answer {
     pub options: Vec<QuestionOption>,
     #[serde(default, skip_serializing_if = "Answerer::is_user")]
     pub by: Answerer,
+}
+
+/// The answers to a whole form, and the note the user wrote to go with them.
+///
+/// Without a note it is stored as the bare answer list, the shape every
+/// earlier session holds, so only a noted answer needs a reader that knows
+/// the note.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "AnswerSheetWire", into = "AnswerSheetWire")]
+pub struct AnswerSheet {
+    pub answers: Vec<Answer>,
+    pub note: String,
+}
+
+impl From<Vec<Answer>> for AnswerSheet {
+    fn from(answers: Vec<Answer>) -> Self {
+        Self {
+            answers,
+            note: String::new(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum AnswerSheetWire {
+    Bare(Vec<Answer>),
+    Noted { answers: Vec<Answer>, note: String },
+}
+
+impl From<AnswerSheetWire> for AnswerSheet {
+    fn from(wire: AnswerSheetWire) -> Self {
+        match wire {
+            AnswerSheetWire::Bare(answers) => answers.into(),
+            AnswerSheetWire::Noted { answers, note } => Self { answers, note },
+        }
+    }
+}
+
+impl From<AnswerSheet> for AnswerSheetWire {
+    fn from(sheet: AnswerSheet) -> Self {
+        match sheet.note.is_empty() {
+            true => Self::Bare(sheet.answers),
+            false => Self::Noted {
+                answers: sheet.answers,
+                note: sheet.note,
+            },
+        }
+    }
+}
+
+/// What a front end sends down the answer channel for a `question` form: one
+/// label list per question, `None` for a form dismissed unanswered, and the
+/// note the user wrote for the whole response.
+///
+/// A reply without a note keeps the shapes every front end already sends: the
+/// bare label lists, or [`QUESTION_DISMISSED_REPLY`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionReply {
+    #[serde(default)]
+    pub answers: Option<Vec<Vec<String>>>,
+    #[serde(default)]
+    pub note: String,
+}
+
+impl QuestionReply {
+    pub fn encode(&self) -> String {
+        let encoded = match (&self.answers, self.note.is_empty()) {
+            (None, true) => return QUESTION_DISMISSED_REPLY.to_owned(),
+            (Some(answers), true) => serde_json::to_string(answers),
+            (_, false) => serde_json::to_string(self),
+        };
+        encoded.unwrap_or_else(|_| QUESTION_DISMISSED_REPLY.to_owned())
+    }
+
+    /// Anything that is neither shape is a dismissal with no note.
+    pub fn decode(raw: &str) -> Self {
+        match serde_json::from_str::<Vec<Vec<String>>>(raw) {
+            Ok(answers) => Self {
+                answers: Some(answers),
+                note: String::new(),
+            },
+            Err(_) => serde_json::from_str(raw).unwrap_or_default(),
+        }
+    }
 }
 
 /// The run has parked on a question. The front end that shows the form answers
@@ -1930,7 +2016,7 @@ pub enum ToolOutput {
         summary: String,
     },
     TodoList(Vec<TodoItem>),
-    Answers(Vec<Answer>),
+    Answers(AnswerSheet),
     WriteCode {
         path: String,
         byte_count: usize,
@@ -2419,11 +2505,19 @@ impl ToolOutput {
                 .map(|f| f.patch.as_str())
                 .collect::<Vec<_>>()
                 .join("\n"),
-            Self::Answers(answers) => answers
-                .iter()
-                .map(|a| format!("{}: {}", a.header, a.labels.join(", ")))
-                .collect::<Vec<_>>()
-                .join("\n"),
+            Self::Answers(sheet) => {
+                let mut text = sheet
+                    .answers
+                    .iter()
+                    .map(|a| format!("{}: {}", a.header, a.labels.join(", ")))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !sheet.note.is_empty() {
+                    text.push_str(ANSWERS_NOTE_PREFIX);
+                    text.push_str(&sheet.note);
+                }
+                text
+            }
             Self::WorkflowRun(card) => card.display_text(),
             Self::Tasks(cards) => cards
                 .iter()
@@ -6350,5 +6444,55 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&event).unwrap()).unwrap();
 
         assert_eq!(restored.delivery, delivery);
+    }
+
+    const REPLY_NOTE: &str = "keep the schema portable";
+
+    fn reply(answers: Option<Vec<Vec<String>>>, note: &str) -> QuestionReply {
+        QuestionReply {
+            answers,
+            note: note.into(),
+        }
+    }
+
+    #[test_case(reply(Some(vec![vec![ASKED_LABEL.into()]]), ""), json!([[ASKED_LABEL]]).to_string() ; "answers_without_a_note_stay_bare")]
+    #[test_case(reply(None, ""), QUESTION_DISMISSED_REPLY.to_owned() ; "a_dismissal_without_a_note_stays_the_sentinel")]
+    #[test_case(reply(Some(vec![vec![ASKED_LABEL.into()]]), REPLY_NOTE), json!({ "answers": [[ASKED_LABEL]], "note": REPLY_NOTE }).to_string() ; "answers_with_a_note")]
+    #[test_case(reply(None, REPLY_NOTE), json!({ "answers": null, "note": REPLY_NOTE }).to_string() ; "a_dismissal_with_a_note")]
+    fn a_question_reply_encodes_and_decodes(reply: QuestionReply, encoded: String) {
+        assert_eq!(reply.encode(), encoded);
+        assert_eq!(QuestionReply::decode(&encoded), reply);
+    }
+
+    #[test_case(QUESTION_DECLINED_REPLY ; "a_sentinel")]
+    #[test_case("not json" ; "garbage")]
+    #[test_case("{\"note\": 3}" ; "a_malformed_object")]
+    fn an_unreadable_reply_is_a_dismissal_with_no_note(raw: &str) {
+        assert_eq!(QuestionReply::decode(raw), QuestionReply::default());
+    }
+
+    fn asked_answer() -> Answer {
+        Answer {
+            header: ASKED_HEADER.into(),
+            labels: vec![ASKED_LABEL.into()],
+            question: String::new(),
+            options: Vec::new(),
+            by: Answerer::User,
+        }
+    }
+
+    #[test_case("", json!([{ "header": ASKED_HEADER, "labels": [ASKED_LABEL] }]) ; "bare_without_a_note")]
+    #[test_case(REPLY_NOTE, json!({ "answers": [{ "header": ASKED_HEADER, "labels": [ASKED_LABEL] }], "note": REPLY_NOTE }) ; "noted")]
+    fn an_answer_sheet_round_trips(note: &str, stored: Value) {
+        let sheet = AnswerSheet {
+            answers: vec![asked_answer()],
+            note: note.into(),
+        };
+
+        assert_eq!(serde_json::to_value(&sheet).unwrap(), stored);
+        assert_eq!(
+            serde_json::from_value::<AnswerSheet>(stored).unwrap(),
+            sheet
+        );
     }
 }

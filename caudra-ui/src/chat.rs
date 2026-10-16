@@ -32,7 +32,7 @@ use caudra_agent::tools::{
     BATCH_TOOL_NAME, FILE_WRITE_TOOL_NAME, ToolEffect, ToolInvocation, ToolRegistry,
     WORKFLOW_TOOL_NAME,
 };
-use caudra_agent::types::{Answer, QuestionEvent, TodoItem, WorkflowRunCard};
+use caudra_agent::types::{Answer, AnswerSheet, QuestionEvent, TodoItem, WorkflowRunCard};
 use caudra_agent::{
     AgentEvent, BatchToolEntry, BufferSnapshot, COMPACTION_ANCHOR, CallStage, CommitRef,
     EMPTY_RESPONSE_RULE, ImageSource, Mention, QueueConsumedItem, SubagentProgress, TaskCard,
@@ -1582,20 +1582,25 @@ fn stamped_batch_effects(output: Arc<ToolOutput>, reg: &ToolRegistry) -> Arc<Too
 /// anything but the picks restores through this same path, which is what makes
 /// it look like one written after.
 fn restored_answers(output: Arc<ToolOutput>, input: &serde_json::Value) -> Arc<ToolOutput> {
-    let ToolOutput::Answers(answers) = output.as_ref() else {
+    let ToolOutput::Answers(sheet) = output.as_ref() else {
         return output;
     };
-    if answers.iter().all(|answer| !answer.question.is_empty()) {
+    if sheet
+        .answers
+        .iter()
+        .all(|answer| !answer.question.is_empty())
+    {
         return output;
     }
     let questions = asked_questions(input);
     // An input that no longer lines up with its answers is one the card cannot
     // redraw; the picks it does have are worth more than a form built from the
     // wrong questions.
-    if questions.len() != answers.len() {
+    if questions.len() != sheet.answers.len() {
         return output;
     }
-    let answers = answers
+    let answers = sheet
+        .answers
         .iter()
         .zip(questions)
         .map(|(answer, asked)| Answer {
@@ -1604,7 +1609,10 @@ fn restored_answers(output: Arc<ToolOutput>, input: &serde_json::Value) -> Arc<T
             ..answer.clone()
         })
         .collect();
-    Arc::new(ToolOutput::Answers(answers))
+    Arc::new(ToolOutput::Answers(AnswerSheet {
+        answers,
+        note: sheet.note.clone(),
+    }))
 }
 
 /// Mirrors the live `tool_done` path so restored sessions
@@ -3469,6 +3477,7 @@ mod tests {
     const ANSWER_DECLINED: &str = "Base64 in JSON-RPC";
     const ANSWER_DESCRIPTION: &str = "Mint short-lived URLs instead of returning bytes";
     const FORM_RESTORED: &str = "the form is filled back in from the tool call input";
+    const ANSWER_NOTE: &str = "Keep the bucket private";
 
     fn question_input() -> serde_json::Value {
         serde_json::json!({ "questions": [{
@@ -3482,6 +3491,10 @@ mod tests {
     }
 
     fn bare_answers(count: usize) -> HashMap<String, Arc<ToolOutput>> {
+        noted_answers(count, "")
+    }
+
+    fn noted_answers(count: usize, note: &str) -> HashMap<String, Arc<ToolOutput>> {
         let answers = (0..count)
             .map(|_| Answer {
                 header: ANSWER_HEADER.into(),
@@ -3491,19 +3504,40 @@ mod tests {
                 by: Answerer::User,
             })
             .collect();
-        HashMap::from([("t1".to_owned(), Arc::new(ToolOutput::Answers(answers)))])
+        let sheet = AnswerSheet {
+            answers,
+            note: note.into(),
+        };
+        HashMap::from([("t1".to_owned(), Arc::new(ToolOutput::Answers(sheet)))])
+    }
+
+    fn restored_sheet(
+        input: serde_json::Value,
+        outputs: &HashMap<String, Arc<ToolOutput>>,
+    ) -> AnswerSheet {
+        let msgs = tool_use_pair("question", input, "Transfer channel: Signed URLs", false);
+        let (display, _) = display_messages(&msgs, outputs);
+        let Some(ToolOutput::Answers(sheet)) = display[0].tool_output.as_deref().cloned() else {
+            panic!("a restored question keeps its structured answers");
+        };
+        sheet
     }
 
     fn restored_answer(
         input: serde_json::Value,
         outputs: &HashMap<String, Arc<ToolOutput>>,
     ) -> Answer {
-        let msgs = tool_use_pair("question", input, "Transfer channel: Signed URLs", false);
-        let (display, _) = display_messages(&msgs, outputs);
-        let Some(ToolOutput::Answers(answers)) = display[0].tool_output.as_deref().cloned() else {
-            panic!("a restored question keeps its structured answers");
-        };
-        answers[0].clone()
+        restored_sheet(input, outputs).answers[0].clone()
+    }
+
+    #[test]
+    fn a_restored_answer_keeps_the_users_note() {
+        let sheet = restored_sheet(question_input(), &noted_answers(1, ANSWER_NOTE));
+        assert_eq!(sheet.note, ANSWER_NOTE);
+        assert_eq!(
+            sheet.answers[0].question, ANSWER_QUESTION,
+            "{FORM_RESTORED}"
+        );
     }
 
     /// An answer is persisted as the picks alone, so the card's form comes back

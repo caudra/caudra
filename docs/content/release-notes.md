@@ -11,7 +11,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.10 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.10)
 
-Preview 10 lets MCP snippets ask the decision engine typed questions and rerank long results before the model reads them, moves workflow `decide()` to the same question shape, the one OpenAI Decisions uses, copies what you drag over in `/btw` and the question form, stops a goal's run when it makes no progress, lets a goal waiting on CI or a deploy check back later, tells automations about a stuck goal, and fixes subscription image generation after GPT-5.5 retired from Codex. It also fixes Lua plugin cleanup and source indexing, improves shell-output filtering, and updates Nix builds.
+Preview 10 lets MCP snippets ask the decision engine typed questions and rerank long results before the model reads them, moves workflow `decide()` to the same question shape, the one OpenAI Decisions uses, copies what you drag over in `/btw` and the question form, lets you add a note to your answers to the agent's questions, stops a goal's run when it makes no progress, lets a goal waiting on CI or a deploy check back later, tells automations about a stuck goal, and fixes subscription image generation after GPT-5.5 retired from Codex. It also fixes Lua plugin cleanup and source indexing, improves shell-output filtering, and updates Nix builds.
 
 > **Warning**
 >
@@ -33,6 +33,10 @@ Preview 10 lets MCP snippets ask the decision engine typed questions and rerank 
 ### Transcript
 
 - **Pictures in the transcript.** `view_image` and `image_generate` cards, Markdown images that point at local files, and prompts with attached images now show the picture as a thumbnail. Terminals that support Kitty graphics get the full-resolution picture, and other terminals get coloured blocks, two by two pixels to a cell, or two by three with `inline_images = "sextants"` in terminals and fonts that draw sextants. Click a picture to open it at full size, then press `o` to open it in your system viewer, `w` to open it in the workbench, or `y` to copy its path. Images attached to a draft show as `[Image #1]` chips you can click, and the workbench shows image files instead of the binary file notice. Markdown images are never fetched from the network. Set `[ui] inline_images` to `"blocks"`, `"sextants"`, `"kitty"`, or `"off"` to choose. See [Images](/docs/markdown/#images).
+
+### Questions
+
+- **Add a note to your answers.** On a question the agent asks, `F5` opens a note for anything the options and your answers leave out, even while you type an answer. The note shows on every tab and in the review, and a click edits it. `Enter`, `Esc`, or `F5` again leaves it with the text kept. It reaches the agent with your answers, and with the dismissal when you press `Esc` on the form. `Ctrl+C` still stops the agent, and moves the note to the composer to start your next message. Questions from MCP servers and consent requests have no note. The form's hints now start with `Enter submit`, then `F2 Ask /btw`. See [Keybindings](/docs/keybindings/#form).
 
 ### Selection
 

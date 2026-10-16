@@ -160,7 +160,7 @@ use caudra_agent::tools::ToolAudience;
 use caudra_agent::tools::native::plan::{self, PlanTarget};
 use caudra_agent::types::{
     AutopilotEvent, BACKGROUND_EVENT_RUN_ID, QUESTION_ACCEPTED_REPLY, QUESTION_DECLINED_REPLY,
-    QUESTION_DISMISSED_REPLY, QuestionDelivery, WorkflowProvenance,
+    QuestionDelivery, WorkflowProvenance,
 };
 use caudra_agent::{
     AgentEvent, AgentInput, AgentMode, CommitRef, Envelope, GoalVerdict, HistorySnapshot,
@@ -1896,7 +1896,11 @@ impl App {
                 .as_ref()
                 .is_some_and(|origin| !self.task_response_current(origin))
         {
+            let note = self.question_form.note_text();
             self.close_blocking_question();
+            if matches!(action, QuestionFormAction::Cancel) {
+                self.keep_question_note(note);
+            }
             return Vec::new();
         }
         if answered {
@@ -1924,20 +1928,22 @@ impl App {
             // path, and the run only moves again when the user says so.
             QuestionFormAction::Cancel => {
                 self.user_stopped(AutopilotStopper::QuestionCancel);
+                let note = self.question_form.note_text();
                 let subagent = self.question_subagent.take();
                 self.close_blocking_question();
-                return match subagent {
+                let actions = match subagent {
                     Some(task_id) => self.cancel_subagent(task_id),
                     None => self.handle_cancel(),
                 };
+                self.keep_question_note(note);
+                return actions;
             }
             QuestionFormAction::Dismiss | QuestionFormAction::PutAside => {
-                QUESTION_DISMISSED_REPLY.to_owned()
+                self.question_form.reply(None)
             }
             QuestionFormAction::Decline => QUESTION_DECLINED_REPLY.to_owned(),
             QuestionFormAction::Accept => QUESTION_ACCEPTED_REPLY.to_owned(),
-            QuestionFormAction::Submit(answers) => serde_json::to_string(&answers)
-                .unwrap_or_else(|_| QUESTION_DISMISSED_REPLY.to_owned()),
+            QuestionFormAction::Submit(answers) => self.question_form.reply(Some(answers)),
         };
         let subagent = self.question_subagent.take();
         self.close_blocking_question();

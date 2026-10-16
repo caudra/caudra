@@ -195,6 +195,12 @@ pub mod key {
         modifiers: KeyModifiers::NONE,
         label: "F4",
     };
+    /// A function key, since the answer box may be open.
+    pub const QUESTION_NOTE: Bind = Bind {
+        code: KeyCode::F(5),
+        modifiers: KeyModifiers::NONE,
+        label: "F5",
+    };
     pub const COMMAND_PALETTE: Bind = ctrl_bind!('p');
     pub const SCROLL_HALF_UP: Bind = ctrl_bind!('u');
     /// Text fields take plain, Ctrl, Super and Shift arrows, and Alt cannot be
@@ -1155,6 +1161,11 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::QUESTION_LATER.label),
         description: "Answer the question later, or show the next waiting question",
+        context: KeybindContext::FormInput,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::QUESTION_NOTE.label),
+        description: "Write a note for the agent that goes with your answers",
         context: KeybindContext::FormInput,
     },
     Keybind {

@@ -2,6 +2,7 @@ use super::*;
 use crate::agent::shared_queue::{self, QueueReceiver};
 use crate::agent::tools_preview_source;
 use crate::app::permission_editor::tests::workbench_workspace;
+use crate::app::questions::NOTE_DRAFT_SEPARATOR;
 use crate::app::sandbox::attached_sandbox_instance;
 use crate::app::tasks::{MAIN_TASK_ID, TaskStatus};
 use crate::app::tooltip::ChordTopic;
@@ -68,8 +69,8 @@ use caudra_agent::tools::{
     VIEW_IMAGE_TOOL_NAME, native,
 };
 use caudra_agent::types::{
-    AnswerKind, AskedQuestion, QuestionEvent, QuestionOption, QuestionSource, TodoItem,
-    TodoPriority, TodoStatus,
+    AnswerKind, AskedQuestion, QUESTION_DISMISSED_REPLY, QuestionEvent, QuestionOption,
+    QuestionReply, QuestionSource, TodoItem, TodoPriority, TodoStatus,
 };
 use caudra_agent::{
     BatchProgressEvent, BatchToolEntry, BatchToolStatus, CallStage, CancelToken, DoneReason,
@@ -7318,6 +7319,62 @@ fn ctrl_c_on_a_subagent_question_cancels_only_that_subagent() {
     assert_eq!(app.run_id, run_id, "{EXPECT_RUN_LEFT_ALONE}");
     assert!(app.chats[1].is_finished());
     assert!(!app.question_form.is_open());
+}
+
+const QUESTION_NOTE_TEXT: &str = "the staging box is down this week";
+const QUESTION_COMPOSER_DRAFT: &str = "half a thought";
+
+/// The main agent's run waiting on its question, with a note written for it
+/// and the note box closed again.
+fn noted_question_app() -> (App, flume::Receiver<String>) {
+    let mut app = question_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let (answer_tx, answers) = flume::unbounded();
+    app.answer_tx = Some(answer_tx);
+    let _ = rendered(&mut app);
+    app.update(Msg::Key(kb::QUESTION_NOTE.to_key_event()));
+    app.update(Msg::Paste(QUESTION_NOTE_TEXT.into()));
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    (app, answers)
+}
+
+#[test_case(KeyCode::Enter, Some(vec![vec![QUESTION_OPTION.to_owned()]]) ; "answered")]
+#[test_case(KeyCode::Esc, None ; "dismissed")]
+fn the_note_goes_to_the_agent_with_the_reply(code: KeyCode, answers: Option<Vec<Vec<String>>>) {
+    let (mut app, replies) = noted_question_app();
+
+    let actions = app.update(Msg::Key(key(code)));
+
+    assert!(actions.is_empty(), "{EXPECT_RUN_LEFT_ALONE}");
+    assert!(!app.question_form.is_open());
+    assert_eq!(
+        QuestionReply::decode(&replies.try_recv().unwrap()),
+        QuestionReply {
+            answers,
+            note: QUESTION_NOTE_TEXT.into(),
+        }
+    );
+}
+
+#[test_case("" ; "into_an_empty_composer")]
+#[test_case(QUESTION_COMPOSER_DRAFT ; "after_the_draft")]
+fn ctrl_c_moves_the_note_to_the_composer(draft: &str) {
+    let (mut app, replies) = noted_question_app();
+    app.input_box.set_input(draft.into());
+
+    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::CancelAgent { run_id: 1 }]
+    ));
+    assert!(replies.is_empty(), "a cancel sends nothing back");
+    let expected = match draft.is_empty() {
+        true => QUESTION_NOTE_TEXT.to_owned(),
+        false => format!("{draft}{NOTE_DRAFT_SEPARATOR}{QUESTION_NOTE_TEXT}"),
+    };
+    assert_eq!(app.input_box.buffer.value(), expected);
 }
 
 const EXPECT_NO_REPLY: &str = "a withdrawn form has nobody waiting for its answer";
@@ -29067,6 +29124,7 @@ mod deferred_questions {
     const HELD: &str = "a blocking ask must not take the place of a form the user started";
     const GIVEN_BACK: &str = "a deferred form must dock again once the blocking ask is answered";
     const DOCKS_AT_ONCE: &str = "a deferred question docks at once when the dock is free";
+    const NOTE: &str = "ask again after the deploy";
 
     fn asked(call: &str, delivery: QuestionDelivery) -> QuestionEvent {
         QuestionEvent {
@@ -29250,6 +29308,31 @@ mod deferred_questions {
         assert_eq!(app.waiting_question_count(), 1);
         assert!(app.reopen_question(Some(FIRST)));
         assert_eq!(app.question_form.call_id(), Some(BLOCKING_CALL));
+    }
+
+    #[test]
+    fn the_note_stays_with_a_question_put_off_and_put_aside() {
+        let (mut app, answers) = streaming();
+        ask_blocking(&mut app, QuestionDelivery::Deferrable);
+        app.update(Msg::Key(kb::QUESTION_NOTE.to_key_event()));
+        app.update(Msg::Paste(NOTE.into()));
+        app.update(Msg::Key(key(KeyCode::Esc)));
+
+        app.update(Msg::Key(kb::QUESTION_LATER.to_key_event()));
+        assert_eq!(
+            answers.try_recv().as_deref(),
+            Ok(QUESTION_DEFERRED_REPLY),
+            "the receipt says nothing of the note"
+        );
+        app.receive_deferred_question(asked(BLOCKING_CALL, deferred(FIRST, true)));
+        assert_eq!(docked(&app), Some(FIRST));
+        assert_eq!(app.question_form.note_text(), NOTE);
+
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert!(!app.question_form.is_open(), "Esc only puts it aside");
+        assert!(answers.is_empty(), "{RUN_LEFT_ALONE}");
+        assert!(app.reopen_question(Some(FIRST)));
+        assert_eq!(app.question_form.note_text(), NOTE);
     }
 
     #[test]

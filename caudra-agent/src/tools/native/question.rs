@@ -32,8 +32,9 @@ use crate::tools::registry::{
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{DescriptionContext, ToolAudience, ToolContext};
 use crate::types::{
-    Answer, Answerer, AskedQuestion, QUESTION_DEFERRED_REPLY, QuestionDelivery, QuestionEvent,
-    QuestionOption, TaskCard, TaskProvenance, ToolDoneEvent, ToolOutput,
+    Answer, AnswerSheet, Answerer, AskedQuestion, QUESTION_DEFERRED_REPLY, QuestionDelivery,
+    QuestionEvent, QuestionOption, QuestionReply, TaskCard, TaskProvenance, ToolDoneEvent,
+    ToolOutput,
 };
 use crate::{AgentEvent, EventSender};
 
@@ -61,6 +62,8 @@ const DEFERRAL_HEADING: &str = "\n\nDeferred questions:\n";
 const BACKGROUND_FIELD: &str = "background";
 const NO_QUESTIONS: &str = "error: at least one question is required";
 const DISMISSED: &str = "(question dismissed by user)";
+/// Heads the note the user wrote for the whole form, under the answers.
+const NOTE_LEAD: &str = "Note from the user:";
 const NO_ANSWER: &str = "(no answer)";
 const NO_UI: &str = "no answer channel: the question tool needs an interactive front end";
 const CANCELLED: &str = "cancelled";
@@ -391,7 +394,7 @@ impl ToolInvocation for QuestionCall {
                         }
                     }
                     Some(Reply::Human(raw)) => return self.report(&raw),
-                    Some(Reply::Autopilot(answers)) => return self.answered(answers),
+                    Some(Reply::Autopilot(answers)) => return self.answered(answers.into()),
                     // A cancel and a dropped channel are both "no answer is
                     // coming"; the run is ending either way.
                     None => return error(ToolFailure::Cancelled, CANCELLED),
@@ -540,11 +543,11 @@ impl PendingQuestion {
         };
         let wait = wait_for_answer(&answers, delegate, &cancel, fit);
         let result = match cancel.race(wait).await.ok().flatten() {
-            Some(Reply::Human(raw)) => match parse_answers(&self.questions, &raw) {
-                Some(answers) => deferred_answers(&self.questions, answers),
-                None => ToolExecResult::from(Ok(ToolOutput::Plain(DISMISSED.into()))),
+            Some(Reply::Human(raw)) => match human_reply(&self.questions, &raw) {
+                HumanReply::Answered(sheet) => deferred_answers(&self.questions, sheet),
+                HumanReply::Dismissed { note } => dismissed(&note),
             },
-            Some(Reply::Autopilot(answers)) => deferred_answers(&self.questions, answers),
+            Some(Reply::Autopilot(answers)) => deferred_answers(&self.questions, answers.into()),
             None => {
                 let _ = event_tx.send(AgentEvent::QuestionClosed);
                 withdrawn()
@@ -572,7 +575,7 @@ fn withdrawn() -> ToolExecResult {
 
 /// The answers, with each question again: the call that asked may be far
 /// back by the time they arrive.
-fn deferred_answers(questions: &[AskedQuestion], answers: Vec<Answer>) -> ToolExecResult {
+fn deferred_answers(questions: &[AskedQuestion], sheet: AnswerSheet) -> ToolExecResult {
     let lines = questions
         .iter()
         .enumerate()
@@ -581,7 +584,8 @@ fn deferred_answers(questions: &[AskedQuestion], answers: Vec<Answer>) -> ToolEx
                 false => question.header.clone(),
                 true => format!("Q{}", index + 1),
             };
-            let picked = answers
+            let picked = sheet
+                .answers
                 .get(index)
                 .map(|answer| answer.labels.join(LABEL_SEPARATOR))
                 .filter(|labels| !labels.is_empty())
@@ -590,14 +594,28 @@ fn deferred_answers(questions: &[AskedQuestion], answers: Vec<Answer>) -> ToolEx
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let lead = match answers.iter().all(|answer| answer.by.is_user()) {
+    let lead = match sheet.answers.iter().all(|answer| answer.by.is_user()) {
         true => String::new(),
         false => format!("{AUTOPILOT_ANSWERED}\n"),
     };
+    let body = with_note(format!("{lead}{lines}"), &sheet.note);
     ToolExecResult {
-        model_output: Some(format!("{lead}{lines}\n\n{DEFERRED_CLOSING}")),
-        ..ToolExecResult::from(Ok(ToolOutput::Answers(answers)))
+        model_output: Some(format!("{body}\n\n{DEFERRED_CLOSING}")),
+        ..ToolExecResult::from(Ok(ToolOutput::Answers(sheet)))
     }
+}
+
+/// `text`, and under it the note the user wrote for the whole form, if any.
+fn with_note(text: String, note: &str) -> String {
+    match note.is_empty() {
+        true => text,
+        false => format!("{text}\n\n{NOTE_LEAD}\n{note}"),
+    }
+}
+
+fn dismissed(note: &str) -> ToolExecResult {
+    let text = with_note(DISMISSED.to_owned(), note);
+    ToolExecResult::from(Ok(ToolOutput::Plain(text.into())))
 }
 
 fn receipt(card: TaskCard, by: DeferredBy) -> ToolExecResult {
@@ -702,27 +720,40 @@ impl QuestionCall {
     /// reply that does not parse is a dismissal: the form is gone and there is
     /// nothing left to ask.
     fn report(&self, raw: &str) -> ToolExecResult {
-        let Some(answers) = parse_answers(&self.questions, raw) else {
-            return ToolExecResult::from(Ok(ToolOutput::Plain(DISMISSED.into())));
-        };
-        self.answered(answers)
+        match human_reply(&self.questions, raw) {
+            HumanReply::Answered(sheet) => self.answered(sheet),
+            HumanReply::Dismissed { note } => dismissed(&note),
+        }
     }
 
-    fn answered(&self, answers: Vec<Answer>) -> ToolExecResult {
-        let text = format_answers(&self.questions, &answers);
+    fn answered(&self, sheet: AnswerSheet) -> ToolExecResult {
+        let text = with_note(format_answers(&self.questions, &sheet.answers), &sheet.note);
         ToolExecResult {
             model_output: Some(text),
-            ..ToolExecResult::from(Ok(ToolOutput::Answers(answers)))
+            ..ToolExecResult::from(Ok(ToolOutput::Answers(sheet)))
         }
     }
 }
 
-/// `None` for a dismissal. The form leaves a hole for every question the user
-/// skipped, so the list is padded back out to one entry per question: a caller
-/// indexes by question number, never by answer position.
-fn parse_answers(questions: &[AskedQuestion], raw: &str) -> Option<Vec<Answer>> {
-    let picked: Vec<Vec<String>> = serde_json::from_str(raw).ok()?;
-    Some(answers_to(questions, &picked, Answerer::User))
+/// What the user sent back for a form, either way with the note they wrote
+/// for the whole of it.
+enum HumanReply {
+    Answered(AnswerSheet),
+    Dismissed { note: String },
+}
+
+/// The form leaves a hole for every question the user skipped, so the list is
+/// padded back out to one entry per question: a caller indexes by question
+/// number, never by answer position.
+fn human_reply(questions: &[AskedQuestion], raw: &str) -> HumanReply {
+    let QuestionReply { answers, note } = QuestionReply::decode(raw);
+    match answers {
+        Some(picked) => HumanReply::Answered(AnswerSheet {
+            answers: answers_to(questions, &picked, Answerer::User),
+            note,
+        }),
+        None => HumanReply::Dismissed { note },
+    }
 }
 
 /// The delegate's picks as the answers a human reply would make, `None` when
@@ -854,6 +885,8 @@ mod tests {
     const FULL: &str = "past the cap a form must not offer a way to put it off";
     const NOT_DEFERRED: &str = "a refused deferral must open no question";
     const CAP_IN_DESCRIPTION: &str = "the description must state the cap the tool enforces";
+    const NOTE: &str = "keep the schema portable";
+    const NOTE_KEPT: &str = "the note the user wrote must reach the model with the answer";
 
     /// A session that runs background jobs, where a question can be deferred.
     struct Jobs {
@@ -993,10 +1026,18 @@ mod tests {
     }
 
     fn answers(result: ToolExecResult) -> Vec<Answer> {
-        let Ok(ToolOutput::Answers(answers)) = result.output else {
+        let Ok(ToolOutput::Answers(sheet)) = result.output else {
             panic!("the question was answered");
         };
-        answers
+        sheet.answers
+    }
+
+    /// `None` for a dismissal.
+    fn parse_answers(questions: &[AskedQuestion], raw: &str) -> Option<Vec<Answer>> {
+        match human_reply(questions, raw) {
+            HumanReply::Answered(sheet) => Some(sheet.answers),
+            HumanReply::Dismissed { .. } => None,
+        }
     }
 
     fn gated() -> (
@@ -1415,10 +1456,58 @@ mod tests {
         };
         let result = call.report(&json!([[YES]]).to_string());
         assert_eq!(result.model_output.as_deref(), Some("Choice: Yes"));
-        let Ok(ToolOutput::Answers(answers)) = result.output else {
+        let Ok(ToolOutput::Answers(sheet)) = result.output else {
             panic!("the transcript keeps the structured answers");
         };
-        assert_eq!(answers[0].labels, [YES]);
+        assert_eq!(sheet.answers[0].labels, [YES]);
+    }
+
+    fn noted(answers: Option<Vec<Vec<String>>>) -> String {
+        QuestionReply {
+            answers,
+            note: NOTE.into(),
+        }
+        .encode()
+    }
+
+    #[test]
+    fn a_note_reaches_the_model_under_the_answers_and_the_card_with_them() {
+        let result = call().report(&noted(Some(vec![vec![YES.into()]])));
+
+        assert_eq!(
+            result.model_output.as_deref(),
+            Some(format!("{HEADER}: {YES}\n\n{NOTE_LEAD}\n{NOTE}").as_str())
+        );
+        let Ok(ToolOutput::Answers(sheet)) = result.output else {
+            panic!("the transcript keeps the structured answers");
+        };
+        assert_eq!(sheet.answers[0].labels, [YES]);
+        assert_eq!(sheet.note, NOTE, "{NOTE_KEPT}");
+    }
+
+    #[test]
+    fn a_note_with_a_dismissal_reaches_the_model() {
+        let result = call().report(&noted(None));
+
+        assert!(!result.is_error, "the user chose not to answer");
+        assert_eq!(
+            result.output.expect("output").as_text(),
+            format!("{DISMISSED}\n\n{NOTE_LEAD}\n{NOTE}"),
+            "{NOTE_KEPT}"
+        );
+    }
+
+    #[test]
+    fn autopilots_answer_carries_no_note() {
+        let autopilot = delegated_answers(&[question(HEADER, false)], &[vec![YES.to_owned()]]);
+
+        let result = call().answered(autopilot.unwrap().into());
+
+        let Ok(ToolOutput::Answers(sheet)) = result.output else {
+            panic!("the transcript keeps the structured answers");
+        };
+        assert!(sheet.note.is_empty());
+        assert!(!result.model_output.unwrap().contains(NOTE_LEAD));
     }
 
     /// The card redraws the form, so the answer has to carry what the pick was
@@ -1654,7 +1743,9 @@ mod tests {
     fn a_delivered_answer_reads_back_without_its_closing() {
         let questions = [question(HEADER, false)];
         let answers = parse_answers(&questions, &json!([[YES]]).to_string()).unwrap();
-        let body = deferred_answers(&questions, answers).model_output.unwrap();
+        let body = deferred_answers(&questions, answers.into())
+            .model_output
+            .unwrap();
 
         let answered = delivery_text(TASK_ID, ANSWERED_KIND, &body);
         let withdrawn = delivery_text(TASK_ID, WITHDRAWN_KIND, WITHDRAWN);
@@ -1664,6 +1755,26 @@ mod tests {
             Some(format!("{HEADER} — {PICK}: {YES}").as_str())
         );
         assert_eq!(deferred_answer(&withdrawn), None);
+    }
+
+    #[test]
+    fn a_delivered_note_reads_back_as_the_users_and_the_closing_stays_last() {
+        let questions = [question(HEADER, false)];
+        let HumanReply::Answered(sheet) =
+            human_reply(&questions, &noted(Some(vec![vec![YES.into()]])))
+        else {
+            panic!("the noted reply answers the form");
+        };
+        let body = deferred_answers(&questions, sheet).model_output.unwrap();
+
+        let answered = delivery_text(TASK_ID, ANSWERED_KIND, &body);
+
+        assert!(body.ends_with(DEFERRED_CLOSING));
+        assert_eq!(
+            deferred_answer(&answered),
+            Some(format!("{HEADER} — {PICK}: {YES}\n\n{NOTE_LEAD}\n{NOTE}").as_str()),
+            "{NOTE_KEPT}"
+        );
     }
 
     #[test]
