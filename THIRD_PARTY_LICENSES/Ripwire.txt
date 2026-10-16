@@ -11,6 +11,16 @@ changes recorded in their headers. Upstream tree-sitter MIT notices are in
 TreeSitterQueries.txt. The separately implemented code-graph pipeline also
 credits ripwire's design in workcell/THIRD_PARTY.md.
 
+The Go type_alias pattern was adapted from ripwire v0.6.7, released on
+2026-10-11, at 0e0f67c73ca332ed58bb8478677f916f7ccc1e84. Its definition.alias
+capture is normalized to Workcell's existing definition.type vocabulary;
+the other local patterns are retained. This is a selective adaptation, not
+a replacement of all query sets with that release. LICENSE and THIRD_PARTY.md
+are unchanged between the inspected revision above and v0.6.7, and v0.6.7
+has no root NOTICE. The Go grammar origin remains tree-sitter-go v0.23.4,
+3c3775faa968158a8b4ac190a7fda867fd5fb748 (MIT), as preserved in
+TreeSitterQueries.txt; that origin is distinct from Workcell's parser version.
+
 The original ripwire import revision was not recorded. The inspected revision
 is a reproducible source for license and grammar-pin verification, not a claim
 that it was the imported revision. That import provenance remains unresolved.

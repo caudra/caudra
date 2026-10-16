@@ -449,7 +449,7 @@ async fn complete_url_elicitations(
 /// Why `structured` breaks the tool's declared `outputSchema`. A schema that
 /// does not compile checks nothing; either way the call still succeeds.
 fn schema_mismatch(server: &str, tool: &str, schema: &Value, structured: &Value) -> Option<String> {
-    let validator = match jsonschema::validator_for(schema) {
+    let validator = match jsonschema::options().offline().build(schema) {
         Ok(validator) => validator,
         Err(error) => {
             warn!(server, tool, %error, "MCP outputSchema does not compile");
@@ -790,6 +790,28 @@ mod tests {
             schema_mismatch(SERVER, TOOL, &schema, &structured).map(|_| ()),
             mismatch
         );
+    }
+
+    #[test_case(json!({"count": 1}), false; "valid_local_reference")]
+    #[test_case(json!({"count": "one"}), true; "invalid_local_reference")]
+    fn structured_content_checks_local_schema_references(structured: Value, mismatch: bool) {
+        let schema = json!({
+            "$defs": { "count": { "type": "integer" } },
+            "properties": { "count": { "$ref": "#/$defs/count" } },
+        });
+        assert_eq!(
+            schema_mismatch(SERVER, TOOL, &schema, &structured).is_some(),
+            mismatch
+        );
+    }
+
+    #[test_case("#/missing"; "missing_local_reference")]
+    #[test_case("http://127.0.0.1:9/schema.json"; "http_reference")]
+    #[test_case("https://127.0.0.1:9/schema.json"; "https_reference")]
+    #[test_case("file:///schema.json"; "file_reference")]
+    fn unresolvable_output_schema_still_does_not_fail_the_call(reference: &str) {
+        let schema = json!({ "$ref": reference });
+        assert_eq!(schema_mismatch(SERVER, TOOL, &schema, &json!({})), None);
     }
 
     const INPUT_KEY: &str = "login";

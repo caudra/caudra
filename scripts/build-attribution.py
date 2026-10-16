@@ -18,11 +18,10 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
-
-import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
 POLICY = Path(__file__).with_name("attribution-policy.json")
@@ -470,8 +469,23 @@ def binary_exclusions(metadata, locked, policy, distribution):
     profile = review["consumer_profiles"].get(metadata["artifact_root"]["name"])
     if profile is None:
         raise AttributionError("Unreviewed binary-scope consumer profile")
+    variants = [{"chain": review["chain"]}, *review.get("chain_variants", [])]
+    matching = [
+        variant
+        for variant in variants
+        if set(variant["chain"]) == set(review["chain"])
+        and all(
+            [p["version"] for p in metadata["selected"] if p["name"] == name]
+            == [pin["version"]]
+            for name, pin in variant["chain"].items()
+        )
+    ]
+    if len(matching) != 1:
+        raise AttributionError("Unreviewed or ambiguous binary-scope chain variant")
+    variant = matching[0]
+    chain = variant["chain"]
     checked = {}
-    for name, pin in (review["chain"] | profile).items():
+    for name, pin in (chain | profile).items():
         candidates = [p for p in metadata["selected"] if p["name"] == name]
         if len(candidates) != 1:
             raise AttributionError(f"Binary-scope chain changed: {name}")
@@ -498,7 +512,7 @@ def binary_exclusions(metadata, locked, policy, distribution):
                     f"Binary-scope reviewed source changed: {name}/{path}"
                 )
         checked[name] = package
-    for name, pin in review["chain"].items():
+    for name, pin in chain.items():
         expected_names = (
             pin["incoming"] if pin["incoming"] is not None else list(profile)
         )
@@ -514,6 +528,9 @@ def binary_exclusions(metadata, locked, policy, distribution):
             )
     if any(p["id"] in metadata["runtime_ids"] for p in excluded):
         raise AttributionError("Binary-scope excluded package is runtime reachable")
+    attributed = variant.get("attributed_packages", [])
+    if not set(attributed) <= {p["name"] for p in excluded}:
+        raise AttributionError("Unreviewed binary-scope attributed package")
     proof = {
         "review_id": review["id"],
         "root": metadata["artifact_root"]["name"],
@@ -531,7 +548,7 @@ def binary_exclusions(metadata, locked, policy, distribution):
             for name, p in sorted(checked.items())
         ],
     }
-    return {p["id"]: proof for p in excluded}
+    return {p["id"]: proof for p in excluded if p["name"] not in attributed}
 
 
 def load_policy(repository):
@@ -663,8 +680,51 @@ def native_notices(root):
             yield path.relative_to(root).as_posix(), b"\n\n".join(comments) + b"\n"
 
 
-def validate_native_licenses(text, evidence):
+def reviewed_native_licenses(package, repository, policy):
+    key = package["name"] + "@" + package["version"]
+    review = policy.get("native_license_reviews", {}).get(key)
+    if review is None:
+        return {}
+    if (
+        package["source"] != review["source"]
+        or package.get("checksum") != review["checksum"]
+        or package["license"] != review["declared_license"]
+    ):
+        raise AttributionError(f"Native review package identity changed: {key}")
+    root = Path(package["manifest_path"]).parent
+    for base, entries in (
+        (root, review["reviewed_files"]),
+        (repository, review["evidence_files"]),
+    ):
+        for relative, expected in entries.items():
+            if digest(regular_file(confined_file(base, relative))) != expected:
+                raise AttributionError(
+                    f"Native reviewed source changed: {key}/{relative}"
+                )
+    for relative in review["notices"]:
+        if relative not in review["reviewed_files"]:
+            raise AttributionError(f"Native review lacks source pin: {key}/{relative}")
+    return review["notices"]
+
+
+def validate_native_licenses(text, evidence, review=None):
     decoded = text.decode("utf-8", errors="replace")
+    if review is not None:
+        expression = review["declared_expression"]
+        alternatives = re.fullmatch(
+            r"([A-Za-z0-9.+-]+) (?:OR|or) ([A-Za-z0-9.+-]+)", expression
+        )
+        if (
+            digest(text) != review["notice_sha256"]
+            or re.findall(r"SPDX-License-Identifier:\s*([^\r\n]+)", decoded)
+            != [expression]
+            or alternatives is None
+            or review["selected_license"] not in alternatives.groups()
+        ):
+            raise AttributionError(
+                "Native reviewed notice or license alternatives changed"
+            )
+        return choose_license(review["selected_license"], evidence)
     selected = set()
     for expression in re.findall(r"SPDX-License-Identifier:\s*([^\r\n]+)", decoded):
         selected.update(
@@ -1080,6 +1140,8 @@ def write_bundle(
                     )
                     record["notices"].append(saved["path"])
                     manifest["files"].append(saved)
+                native_reviews = reviewed_native_licenses(package, repository, policy)
+                native_reviewed_selections = {}
                 if package["source"] is not None:
                     evidence = "\n".join(
                         notice_bytes(path).decode("utf-8", errors="replace")
@@ -1087,7 +1149,9 @@ def write_bundle(
                     )
                     for relative, text in native_notices(root):
                         try:
-                            native_selected = validate_native_licenses(text, evidence)
+                            native_selected = validate_native_licenses(
+                                text, evidence, native_reviews.get(relative)
+                            )
                         except AttributionError as error:
                             raise AttributionError(
                                 f"Native subcomponent {relative}: {error}"
@@ -1101,8 +1165,14 @@ def write_bundle(
                             record["native_selected_licenses"][relative] = (
                                 native_selected
                             )
+                        if relative in native_reviews:
+                            native_reviewed_selections[relative] = native_reviews[
+                                relative
+                            ]
                         record["notices"].append(saved["path"])
                         manifest["files"].append(saved)
+                if native_reviewed_selections:
+                    record["native_reviewed_selections"] = native_reviewed_selections
                 if "MPL-2.0" in chosen or any(
                     "MPL-2.0" in licenses
                     for licenses in record["native_selected_licenses"].values()

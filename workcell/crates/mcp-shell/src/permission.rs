@@ -558,6 +558,24 @@ fn open_policy_file(path: &Path) -> Result<File, ShellPermissionPolicyError> {
 #[cfg(all(test, feature = "mcp"))]
 mod tests {
     use super::*;
+    use test_case::test_case;
+
+    const INVALID_DOCUMENT_MESSAGE: &str = "shell permission policy is invalid";
+
+    #[test_case("version = 1\nversion = 1"; "duplicate_key")]
+    #[test_case("version = 1\nyolo = true"; "unknown_authority")]
+    #[test_case("version = 1\nallow = '*'"; "wrong_rule_type")]
+    #[test_case("version = 1\ndefault = 'ALLOW'"; "unknown_default")]
+    #[test_case("allow = ['*']"; "missing_version")]
+    #[test_case("version = 1\nallow = ["; "malformed_array")]
+    #[test_case("version = 1\n[deny]\ncommand = '*'"; "table_instead_of_rules")]
+    fn invalid_policy_documents_remain_fail_closed(contents: &str) {
+        for yolo in [false, true] {
+            let error = ShellPermissionPolicy::from_toml(contents, yolo).unwrap_err();
+            assert_eq!(error, ShellPermissionPolicyError::InvalidDocument);
+            assert_eq!(error.to_string(), INVALID_DOCUMENT_MESSAGE);
+        }
+    }
 
     fn policy(contents: &str, yolo: bool) -> ShellPermissionPolicy {
         ShellPermissionPolicy::from_toml(contents, yolo).unwrap()

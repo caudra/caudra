@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "rust_runtime": {
-    "release": "1.99.0",
-    "commit_hash": "b940084d7eb6a299eb4bfeb8e34901bc051e7ac4",
+    "release": "1.99.1",
+    "commit_hash": "58cf8f9c35b355199727627d07ae34a4e2846d67",
     "required_license_files": [
       "licenses/Apache-2.0.txt",
       "licenses/BSD-2-Clause.txt",
@@ -31,11 +31,28 @@
         "supplements/THIRD_PARTY_LICENSES/SublimeRhai.txt"
       ]
     },
-    "rmcp@3.0.0-beta.5": {
+    "rmcp@3.5.1": {
       "expression": "Apache-2.0 AND MIT",
-      "reason": "Upstream repository LICENSE explicitly retains MIT for contributions without relicensing consent; documentation is separately CC-BY-4.0 and the complete upstream LICENSE is preserved.",
+      "reason": "The published crate omits LICENSE. Its .cargo_vcs_info.json pins upstream revision 79437f291b2c44053d00dcd5db969fd0cca7c887, whose complete LICENSE is preserved: it explicitly retains MIT for contributions without relicensing consent alongside Apache-2.0; documentation is separately CC-BY-4.0.",
+      "provenance": {
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "ab5023804cbe0304cbe06197ac16e645a0a0d0ffa2953bf735c15c2fa0213350",
+        "declared_license": "Apache-2.0",
+        "cargo_vcs_info": {
+          "git": {
+            "sha1": "79437f291b2c44053d00dcd5db969fd0cca7c887"
+          },
+          "path_in_vcs": "crates/rmcp"
+        }
+      },
+      "files": [
+        {
+          "path": "THIRD_PARTY_LICENSES/Rmcp.txt",
+          "sha256": "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a"
+        }
+      ],
       "required_files": [
-        "upstream/LICENSE"
+        "supplements/THIRD_PARTY_LICENSES/Rmcp.txt"
       ]
     },
     "ring@0.17.14": {
@@ -59,22 +76,119 @@
         "supplements/THIRD_PARTY_LICENSES/dependencies/monty-typeshed-1.1.0/LICENSE-typeshed"
       ]
     },
-    "two-face@0.5.1": {
-      "reason": "Embedded syntax/theme assets require separately reviewed notices in addition to the Rust wrapper licenses.",
+    "two-face@0.5.2+bat-0.26.1": {
+      "reason": "Exact 0.5.2+bat-0.26.1 archive and upstream revision verified. All four syntax dumps, theme dump and packaged acknowledgement dump are byte-identical to 0.5.1; all 70 upstream syntax license/notice entries retain their exact texts and paths. The MIT copyright repository link and packaged bat NOTICE links changed and are preserved verbatim. Caudra still uses only syntax::extra_newlines with syntect-default-fancy, not bundled themes. The independently locked monty-runtime worker has no two-face package, so no old-version supplement is required.",
       "files": [
         {
           "path": "THIRD_PARTY_LICENSES/TwoFace.txt",
-          "sha256": "8d763b9ac555a5235e3e1d12e3f65d637564b9e27ba3a40442983300e0368233"
+          "sha256": "3e29e42dfecbca0936ac06e56497bd8de797ae8cf6515b5f94e157960646d119"
         },
         {
           "path": "THIRD_PARTY_LICENSES/TwoFaceSyntaxes.txt",
-          "sha256": "af90b0fb994e50ee688b2de57f57e9b8b1c2a703b70756e1e97d701e35187ad0"
+          "sha256": "d02d5b6f590790bff725a125a474f06c7cb827bc467a59c8819ad81a0de7173a"
         }
       ],
       "required_files": [
         "supplements/THIRD_PARTY_LICENSES/TwoFace.txt",
         "supplements/THIRD_PARTY_LICENSES/TwoFaceSyntaxes.txt"
-      ]
+      ],
+      "provenance": {
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "915be7adc2ff6f4338acbf71f3eda0a146f46003b992a1669c674308610efdac",
+        "declared_license": "MIT OR Apache-2.0",
+        "cargo_vcs_info": {
+          "git": {
+            "sha1": "67b64e632ceefe70e5f20f3eb797d9e33560a11c"
+          },
+          "path_in_vcs": ""
+        }
+      },
+      "review_evidence": {
+        "repository": "https://codeberg.org/CosmicHarper/two-face",
+        "upstream_revision": "67b64e632ceefe70e5f20f3eb797d9e33560a11c",
+        "syntax_license_entries": 70,
+        "upstream_acknowledgements_sha256": "66512fea2f515b498c2972b2cdf361b1405735ec934a85e48fbe39d917074a7f",
+        "source_files_sha256": {
+          "Cargo.toml.orig": "7bf1bd47f7d13d7f7cf113606ff2c401217025e30547b20b160d8722b290bd73",
+          "LICENSE-APACHE": "6da61c67477940fc0bfc3a5f65ae1813b1c54c4e3b2572de26f802f097d8b03c",
+          "LICENSE-MIT": "7206e5cec3869d1c394ba80866d1cc25c0a749e3d4e0d229801a722e37b670c6",
+          "README.md": "82aaf720ca94e01d8510188e409800a09e6af2f708b8d60411c65c15727637fd",
+          "generated/acknowledgements_full.bin": "e4bf45ad159b67de6a7152874904728adb6421996eb15da01ca75406e6cd51fb",
+          "generated/syntaxes-fancy-newlines.bin": "758bf07782d9d81479db7a0c4651aebf844ef20510ceb5bee08c61158368b0f3",
+          "generated/syntaxes-fancy-no-newlines.bin": "14907b8da6438cba2af4dc5650b76a571db583aa1a981e8f1d8e4b9233c34c53",
+          "generated/syntaxes-onig-newlines.bin": "7b567f54cf1b4b33abb7b64258647c256f99043c4bee6804b38f9ef612d0110a",
+          "generated/syntaxes-onig-no-newlines.bin": "45e130ac157619bd2af7a4d50cf180ceda9ebe9058611fea5303b1a28f391fbb",
+          "generated/themes.bin": "be28f0c1a167469c5bd1e5311d4d3503e6503b378791f2afb9e3e5f2f7f4642e",
+          "src/acknowledgement/core_types.rs": "f24131de2a0b67a5bcd1903dd27c58094ed8823e6b327150ce0f235f143d1a82",
+          "src/acknowledgement/mod.rs": "413268f48287009a472065fad6d37192ed02893c69e141b3c8f4f6ee65c5cfc2",
+          "src/lib.rs": "cd451599b5d0def843b8496d6fa9f511d52fd7549f1dc7b5ad43c41043c59846",
+          "src/syntax.rs": "8dd27829491244b7a208a6c22184e2005aefb120a1776ba01eaee7b48ad6d46d",
+          "src/theme/core_types.rs": "dc84060cf2e2568e81c6909caf85e25662ace7170c7ae6cc2e3afbd395e78433",
+          "src/theme/mod.rs": "fa2a9724b14bc695b522ef9af8161266917f9435bf056ee2c95b368d2727f576"
+        }
+      }
+    },
+    "aws-lc-sys@0.46.0": {
+      "reason": "Checksum-verified 0.46.0 archive (aws-lc-rs revision 9df497501436596d4da77109217806b3af7f56cb) preserves the exact declared conjunctive expression. LICENSE, aws-lc/LICENSE and fiat/LICENSE are byte-identical to 0.44.0. Native notice inventory grows from 1580 to 1613: 91 added paths and 58 removed, with every retained-path notice unchanged. Added ML-DSA/ML-KEM assembly retains Arm, Hanno Becker, Amin Abdulrahman, Matthias Kannwischer and project-author notices and public-domain derivation statements under Apache-2.0 OR ISC OR MIT; Brainpool, Keccak and provider files use Apache-2.0 OR ISC. Retain every native notice, not just target-compiled files.",
+      "required_files": [
+        "LICENSE",
+        "aws-lc/LICENSE",
+        "aws-lc/third_party/fiat/LICENSE"
+      ],
+      "provenance": {
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "f1622d8446a2d4b2ce0c7eefc73dd43a99779028d5ee5c2dd8073a658ba8a2bc",
+        "declared_license": "ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)",
+        "cargo_vcs_info": {
+          "git": {
+            "sha1": "9df497501436596d4da77109217806b3af7f56cb"
+          },
+          "path_in_vcs": "aws-lc-sys"
+        }
+      }
+    }
+  },
+  "native_license_reviews": {
+    "nix@0.31.3": {
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d",
+      "declared_license": "MIT",
+      "repository": "https://github.com/nix-rust/nix",
+      "revision": "b5933ca178802b558a667514f717a86b3a1cedcc",
+      "reason": "The exact hello.c source expressly offers GPL-2.0+ or MIT and separately declares MODULE_LICENSE(\"Dual MIT/GPL\"). Select the offered MIT alternative using the upstream package LICENSE, retaining Carl Lerche + nix-rust Authors attribution and the complete original dual-license source and notice. This is not a reinterpretation of an AND expression, a general unknown-SPDX exception, a test-directory exemption or legal clearance.",
+      "verification": "The published archive SHA-256 matches Cargo.lock and every extracted file matches the archive. Cargo.toml.orig, LICENSE, build.rs, test/test.rs, test/test_kmod/mod.rs, hello.c and its Makefile match raw upstream files at the exact recorded revision. Git blob identities below record those upstream bytes.",
+      "reachability": "build.rs only establishes cfg aliases. test/test.rs:14-15 includes test_kmod only under linux_android. test/test_kmod/mod.rs:7-32 copies hello.c and runs its kernel-module Makefile from integration tests; no production build step compiles it, and Darwin does not enable that test module. The file is nevertheless scanned, preserved and attributed; reachability is corroboration, not an exclusion criterion.",
+      "upstream_git_blobs": {
+        "Cargo.toml": "c4c109a4b6879fb4a34893e78d54cb32f7da96d3",
+        "LICENSE": "aff9096fdf11d161613202fe9329fcfa5e35d212",
+        "build.rs": "eb279438f5ae02b94f3da3bb44e11e51d6550ee4",
+        "test/test.rs": "71a42a64441832d37756bd56534d6bc5b1c2ab46",
+        "test/test_kmod/mod.rs": "6f9aaa897f1ded10bdcb85754a298cb8feb97b9d",
+        "test/test_kmod/hello_mod/hello.c": "1c34987d2ac399af2a498233967a425119036f71",
+        "test/test_kmod/hello_mod/Makefile": "74c99b77e96e1434c00eee89f44b0baa07951760"
+      },
+      "reviewed_files": {
+        ".cargo_vcs_info.json": "563a879fe783003584f1f73d6df93890a0d60c3ba87b3f2c0a083753118da3b5",
+        "Cargo.toml": "36654c48d8a7941649b643d42b15750a0dd024095f8670b3e928c503339eefe6",
+        "Cargo.toml.orig": "7c1441f69ccaec69ec8f7219ee008c97f53fd2ca655a27b8f8825641ac24fa35",
+        "LICENSE": "66e3ee1fa7f909ad3c612d556f2a0cdabcd809ad6e66f3b0605015ac64841b70",
+        "build.rs": "b41a7d4331f46c610c5f2bcb151894b5cf49527677d39174223c634c0d7162ed",
+        "test/test.rs": "6518d60fd48f5a4084c9d665e7409b5691c5e6de077f05501ca5930ed67a8b2f",
+        "test/test_kmod/mod.rs": "b4ae25841c2f06f32de9f1acd8230eeccd7095721302ebe78ad454e4e4f9c783",
+        "test/test_kmod/hello_mod/hello.c": "bcac6b19c5bd807e1f3878c15e426acc85785a8ade9840c3bb4d068635c9188c",
+        "test/test_kmod/hello_mod/Makefile": "0219f7bce0603f97d997fb377ca071966c90333ecc665e78a54dfeb97a9c811b"
+      },
+      "evidence_files": {
+        "THIRD_PARTY_LICENSES/dependencies/nix-0.31.3/hello.c": "bcac6b19c5bd807e1f3878c15e426acc85785a8ade9840c3bb4d068635c9188c",
+        "THIRD_PARTY_LICENSES/dependencies/nix-0.31.3/LICENSE": "66e3ee1fa7f909ad3c612d556f2a0cdabcd809ad6e66f3b0605015ac64841b70"
+      },
+      "notices": {
+        "test/test_kmod/hello_mod/hello.c": {
+          "notice_sha256": "84f6d530934fb1b8e57b01a43698621e5ea42532a4d3c43cb4a21e5fcfbf3846",
+          "declared_expression": "GPL-2.0+ or MIT",
+          "selected_license": "MIT"
+        }
+      }
     }
   },
   "git_sources": {
@@ -99,22 +213,6 @@
           "name": "upstream/LICENSE",
           "sha256": "5841db47ee6e1f0becafe2d19ca43c08cbc6d2c0952822ccf88cbbf2bd0749bd",
           "path": "THIRD_PARTY_LICENSES/Monty.txt"
-        }
-      ]
-    },
-    "git+https://github.com/modelcontextprotocol/rust-sdk.git?rev=9334c97f0d6e177546fc33593148aa3f942cb1f8#9334c97f0d6e177546fc33593148aa3f942cb1f8": {
-      "reason": "License and original package manifests verified against the exact locked Git revision. Accepted manifest hashes are original Git bytes and Cargo 1.99 vendor-normalized bytes generated offline from that source; neither requires .git or Cargo.toml.orig in the vendor tree.",
-      "packages": {
-        "rmcp@3.0.0-beta.5": [
-          "7f14522ec0cb948bc32527aaa9cada127ea574912552b103bab944452da3e42b",
-          "c5e4db8cf9c818e230dfc72ff6a032c5d1fc36a9e7c6c85e7f96a9cef0171697"
-        ]
-      },
-      "notices": [
-        {
-          "name": "upstream/LICENSE",
-          "sha256": "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a",
-          "text": "The MCP project is undergoing a licensing transition from the MIT License to the Apache License, Version 2.0 (\"Apache-2.0\"). All new code and specification contributions to the project are licensed under Apache-2.0. Documentation contributions (excluding specifications) are licensed under CC-BY-4.0.\n\nContributions for which relicensing consent has been obtained are licensed under Apache-2.0. Contributions made by authors who originally licensed their work under the MIT License and who have not yet granted explicit permission to relicense remain licensed under the MIT License.\n\nNo rights beyond those granted by the applicable original license are conveyed for such contributions.\n\n---\n\n                                 Apache License\n                           Version 2.0, January 2004\n                        http://www.apache.org/licenses/\n\n   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION\n\n   1. Definitions.\n\n      \"License\" shall mean the terms and conditions for use, reproduction,\n      and distribution as defined by Sections 1 through 9 of this document.\n\n      \"Licensor\" shall mean the copyright owner or entity authorized by\n      the copyright owner that is granting the License.\n\n      \"Legal Entity\" shall mean the union of the acting entity and all\n      other entities that control, are controlled by, or are under common\n      control with that entity. For the purposes of this definition,\n      \"control\" means (i) the power, direct or indirect, to cause the\n      direction or management of such entity, whether by contract or\n      otherwise, or (ii) ownership of fifty percent (50%) or more of the\n      outstanding shares, or (iii) beneficial ownership of such entity.\n\n      \"You\" (or \"Your\") shall mean an individual or Legal Entity\n      exercising permissions granted by this License.\n\n      \"Source\" form shall mean the preferred form for making modifications,\n      including but not limited to software source code, documentation\n      source, and configuration files.\n\n      \"Object\" form shall mean any form resulting from mechanical\n      transformation or translation of a Source form, including but\n      not limited to compiled object code, generated documentation,\n      and conversions to other media types.\n\n      \"Work\" shall mean the work of authorship, whether in Source or\n      Object form, made available under the License, as indicated by a\n      copyright notice that is included in or attached to the work\n      (an example is provided in the Appendix below).\n\n      \"Derivative Works\" shall mean any work, whether in Source or Object\n      form, that is based on (or derived from) the Work and for which the\n      editorial revisions, annotations, elaborations, or other modifications\n      represent, as a whole, an original work of authorship. For the purposes\n      of this License, Derivative Works shall not include works that remain\n      separable from, or merely link (or bind by name) to the interfaces of,\n      the Work and Derivative Works thereof.\n\n      \"Contribution\" shall mean any work of authorship, including\n      the original version of the Work and any modifications or additions\n      to that Work or Derivative Works thereof, that is intentionally\n      submitted to the Licensor for inclusion in the Work by the copyright\n      owner or by an individual or Legal Entity authorized to submit on behalf\n      of the copyright owner. For the purposes of this definition, \"submitted\"\n      means any form of electronic, verbal, or written communication sent\n      to the Licensor or its representatives, including but not limited to\n      communication on electronic mailing lists, source code control systems,\n      and issue tracking systems that are managed by, or on behalf of, the\n      Licensor for the purpose of discussing and improving the Work, but\n      excluding communication that is conspicuously marked or otherwise\n      designated in writing by the copyright owner as \"Not a Contribution.\"\n\n      \"Contributor\" shall mean Licensor and any individual or Legal Entity\n      on behalf of whom a Contribution has been received by Licensor and\n      subsequently incorporated within the Work.\n\n   2. Grant of Copyright License. Subject to the terms and conditions of\n      this License, each Contributor hereby grants to You a perpetual,\n      worldwide, non-exclusive, no-charge, royalty-free, irrevocable\n      copyright license to reproduce, prepare Derivative Works of,\n      publicly display, publicly perform, sublicense, and distribute the\n      Work and such Derivative Works in Source or Object form.\n\n   3. Grant of Patent License. Subject to the terms and conditions of\n      this License, each Contributor hereby grants to You a perpetual,\n      worldwide, non-exclusive, no-charge, royalty-free, irrevocable\n      (except as stated in this section) patent license to make, have made,\n      use, offer to sell, sell, import, and otherwise transfer the Work,\n      where such license applies only to those patent claims licensable\n      by such Contributor that are necessarily infringed by their\n      Contribution(s) alone or by combination of their Contribution(s)\n      with the Work to which such Contribution(s) was submitted. If You\n      institute patent litigation against any entity (including a\n      cross-claim or counterclaim in a lawsuit) alleging that the Work\n      or a Contribution incorporated within the Work constitutes direct\n      or contributory patent infringement, then any patent licenses\n      granted to You under this License for that Work shall terminate\n      as of the date such litigation is filed.\n\n   4. Redistribution. You may reproduce and distribute copies of the\n      Work or Derivative Works thereof in any medium, with or without\n      modifications, and in Source or Object form, provided that You\n      meet the following conditions:\n\n      (a) You must give any other recipients of the Work or\n          Derivative Works a copy of this License; and\n\n      (b) You must cause any modified files to carry prominent notices\n          stating that You changed the files; and\n\n      (c) You must retain, in the Source form of any Derivative Works\n          that You distribute, all copyright, patent, trademark, and\n          attribution notices from the Source form of the Work,\n          excluding those notices that do not pertain to any part of\n          the Derivative Works; and\n\n      (d) If the Work includes a \"NOTICE\" text file as part of its\n          distribution, then any Derivative Works that You distribute must\n          include a readable copy of the attribution notices contained\n          within such NOTICE file, excluding those notices that do not\n          pertain to any part of the Derivative Works, in at least one\n          of the following places: within a NOTICE text file distributed\n          as part of the Derivative Works; within the Source form or\n          documentation, if provided along with the Derivative Works; or,\n          within a display generated by the Derivative Works, if and\n          wherever such third-party notices normally appear. The contents\n          of the NOTICE file are for informational purposes only and\n          do not modify the License. You may add Your own attribution\n          notices within Derivative Works that You distribute, alongside\n          or as an addendum to the NOTICE text from the Work, provided\n          that such additional attribution notices cannot be construed\n          as modifying the License.\n\n      You may add Your own copyright statement to Your modifications and\n      may provide additional or different license terms and conditions\n      for use, reproduction, or distribution of Your modifications, or\n      for any such Derivative Works as a whole, provided Your use,\n      reproduction, and distribution of the Work otherwise complies with\n      the conditions stated in this License.\n\n   5. Submission of Contributions. Unless You explicitly state otherwise,\n      any Contribution intentionally submitted for inclusion in the Work\n      by You to the Licensor shall be under the terms and conditions of\n      this License, without any additional terms or conditions.\n      Notwithstanding the above, nothing herein shall supersede or modify\n      the terms of any separate license agreement you may have executed\n      with Licensor regarding such Contributions.\n\n   6. Trademarks. This License does not grant permission to use the trade\n      names, trademarks, service marks, or product names of the Licensor,\n      except as required for reasonable and customary use in describing the\n      origin of the Work and reproducing the content of the NOTICE file.\n\n   7. Disclaimer of Warranty. Unless required by applicable law or\n      agreed to in writing, Licensor provides the Work (and each\n      Contributor provides its Contributions) on an \"AS IS\" BASIS,\n      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or\n      implied, including, without limitation, any warranties or conditions\n      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A\n      PARTICULAR PURPOSE. You are solely responsible for determining the\n      appropriateness of using or redistributing the Work and assume any\n      risks associated with Your exercise of permissions under this License.\n\n   8. Limitation of Liability. In no event and under no legal theory,\n      whether in tort (including negligence), contract, or otherwise,\n      unless required by applicable law (such as deliberate and grossly\n      negligent acts) or agreed to in writing, shall any Contributor be\n      liable to You for damages, including any direct, indirect, special,\n      incidental, or consequential damages of any character arising as a\n      result of this License or out of the use or inability to use the\n      Work (including but not limited to damages for loss of goodwill,\n      work stoppage, computer failure or malfunction, or any and all\n      other commercial damages or losses), even if such Contributor\n      has been advised of the possibility of such damages.\n\n   9. Accepting Warranty or Additional Liability. While redistributing\n      the Work or Derivative Works thereof, You may choose to offer,\n      and charge a fee for, acceptance of support, warranty, indemnity,\n      or other liability obligations and/or rights consistent with this\n      License. However, in accepting such obligations, You may act only\n      on Your own behalf and on Your sole responsibility, not on behalf\n      of any other Contributor, and only if You agree to indemnify,\n      defend, and hold each Contributor harmless for any liability\n      incurred by, or claims asserted against, such Contributor by reason\n      of your accepting any such warranty or additional liability.\n\n   END OF TERMS AND CONDITIONS\n\n---\n\nMIT License\n\nCopyright (c) 2024-2025 Model Context Protocol a Series of LF Projects, LLC.\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n\n---\n\nCreative Commons Attribution 4.0 International (CC-BY-4.0)\n\nDocumentation in this project (excluding specifications) is licensed under\nCC-BY-4.0. See https://creativecommons.org/licenses/by/4.0/legalcode for\nthe full license text.\n"
         }
       ]
     }
@@ -386,6 +484,166 @@
           "declared_license": "MIT"
         }
       }
-    }
+    },
+    "chain_variants": [
+      {
+        "id": "quote-use-0.9.0-reviewed-licensed-host-parser",
+        "attributed_packages": [
+          "quote-use",
+          "quote-use-macros"
+        ],
+        "reason": "The complete new chain is reviewed separately from the independently locked worker chain. Both quote-use 0.9.0 archives now supply the original MIT grant and Roland Fredenhagen copyright notice; attribute them normally, never mark their license text unresolved or reuse the old binary exclusion. All exact identities, source hashes, consumer edges, host macro boundaries and runtime reachability gates still apply.",
+        "evidence": [
+          "All six published archives match Cargo.lock SHA-256 and every extracted file matches its archive. Declared expressions remain MIT OR Apache-2.0 for get-size2, get-size-derive2 and attribute-derive; MIT for attribute-derive-macro and quote-use/macros.",
+          "get-size-derive2@0.11.1 src/lib.rs is byte-identical to 0.11.0: StructFieldAttribute at lines 6-18,323-324 remains host parsing; target GetSize implementations at 355-384 still use ordinary quote. get-size2@0.11.1 only adds optional arcstr/uuid implementations and tests; no new path around the macro boundary.",
+          "attribute-derive@0.11.0 updates syn 3 parsing types and removes unused derive-where; attribute-derive-macro@0.11.0 changes imports, comments and an equivalent conditional. Its parser templates at src/lib.rs:914-981 remain host-side. Incoming chains and all four caudra get-size2 consumers are unchanged.",
+          "quote-use@0.9.0 and quote-use-macros@0.9.0 Rust sources are byte-identical to 0.8.4. Manifests upgrade syn to 3; both new LICENSE files have SHA-256 522c909460ec03b8ea01e5126d2948fb55897f613fd3520c86546d8268c90ad8. New licenses do not retroactively supply missing texts to the independently locked 0.8.4 worker."
+        ],
+        "chain": {
+          "get-size2": {
+            "version": "0.11.1",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "050a5d07359ebfac7f0b74916d94cfa30575e45fdc7e9bfbb0f76d5d4203325a",
+            "declared_license": "MIT OR Apache-2.0",
+            "incoming": null,
+            "proc_macro": false,
+            "reviewed_files": {
+              "Cargo.toml": "854057c059af7ae9e1f848903de85d8f9f78a1f35c134bce7eed677103ec75d7",
+              "Cargo.toml.orig": "539b7796ae85b4e3cdcdc812ac4859e0d8199c6657b633983ff34b4591571545",
+              "LICENSE": "013ca8b1499479ce162f0d68ff25f4ac0a98dae625d55a8eabfb1fb4aa38933d",
+              "src/impls/alloc_impls/collections.rs": "6bf36e977cd555c207600637101afd5d830b998478809031b482bc4366acf6a3",
+              "src/impls/alloc_impls/mod.rs": "5fa0d3aaaf0648af831e81e10850323781d4cc2bb672ba4b86433a9bdb95be78",
+              "src/impls/alloc_impls/ownership.rs": "058f8387cab6d10400871e27e8c28bea728011f57867b2c1c4af6af8ac248eb0",
+              "src/impls/alloc_impls/strings.rs": "c65bd49728a9ec0e78c1231367470fb271b8488f5276257dd4b80788c1e99ba7",
+              "src/impls/core_impls/mod.rs": "781092704c853e88e8344de0575a390d3ab2c67280b3809ce079d78e08701bf4",
+              "src/impls/core_impls/primitives.rs": "acbf04610aaaba73d291ffb87da929f48996f8a53d98de266e554c86707229e9",
+              "src/impls/core_impls/ranges.rs": "0d058a10a13f46562f5812e7e0aac1835efcc7134c1243c62412ac8915fda4f8",
+              "src/impls/core_impls/references.rs": "3c7added967af42db9f88db1ca91d1099832e52f2d23fe4d9663923b95c9e234",
+              "src/impls/core_impls/tuples.rs": "26d2983a80487c8cb11f575eee99ae6a099b371694f0877393fa9d40efcbdd73",
+              "src/impls/core_impls/wrappers.rs": "9de928a5f44cffb8a49d8a11a4150da23bae58d0da3f5e69445f72592e8ea963",
+              "src/impls/feature/arcstr.rs": "d4316eba88edc33b3b6cb1f8ef57e10eb02068e1d5e1bf02f094d439951002e4",
+              "src/impls/feature/bytes.rs": "2d734284591e0a1abfbeb18088b010fadbe6726586fc426ec6cee5d54a956d35",
+              "src/impls/feature/chrono.rs": "a73cbade3633a90e3954d19e167e1da75a40d46b95a541ad6628ed6b6a5ca69e",
+              "src/impls/feature/chrono_tz.rs": "9cbb8b81ddd7fe7cd07f930325d2ec0de82b4ffc82e881d92738f2cfd5d7ebdf",
+              "src/impls/feature/compact_str.rs": "de4d449615166c4d5eab907fd10e525768bfbf3a68e9bf0cb5fc101a31fbd402",
+              "src/impls/feature/dashmap.rs": "e3d1c16a9143290b28dde0eaa6441ddd8cdc05b8bb4cda4f7d325c6a6b4b802a",
+              "src/impls/feature/half.rs": "ebebf85a66310a421ad8370427334934930a43d56901498c4c418fee6bc5614f",
+              "src/impls/feature/hashbrown.rs": "0168b0a404dc1dfe470f21d7884820a3e3462a5c9b370c859e28e9c854b05529",
+              "src/impls/feature/indexmap.rs": "b9f6ccc502a2c452037bb5c73746268f723a9d0a861dcfe0f3aefbc4ef3a99f4",
+              "src/impls/feature/mod.rs": "261b5cd688a72f3ca1ab658c85e9a7bae0ccf82b272d1e4ee2fdf0f03c3efef3",
+              "src/impls/feature/ordermap.rs": "c2184bb59f7fedbb6d26d5284fc96242e6499d94399880822c5111730be196f7",
+              "src/impls/feature/orx_concurrent_vec.rs": "7d51aa8b2c0713ed228772ecb20804f0c9f16544727d46b9c4e2a5b2bb5c8443",
+              "src/impls/feature/parking_lot.rs": "acfacb36f6cbd157d3a4ed2c08abf864a7cdd874d2faeafce3372e5e2c74ee21",
+              "src/impls/feature/portable_atomic.rs": "fb93763fb07c0026e149788394953576207e1194c0e0cdc85854732bce52e40e",
+              "src/impls/feature/roaring.rs": "da38e64cfbf1f9b9c2914efd33ccda00a1ff20f087395be975cc907fa8e97ff2",
+              "src/impls/feature/smallvec.rs": "f71a55f46336c69bdbdf36ae110d90335e95d3b689678752528222c618e81dd7",
+              "src/impls/feature/thin_vec.rs": "48acc9210e76f9026e49134ae9a12f09de46565f36fecf306cc462f57003087c",
+              "src/impls/feature/url.rs": "c6485a802df9efbb8e54c944f1b3311027ce5e8ade07fe37e434ff7c0ca633cb",
+              "src/impls/feature/uuid.rs": "8eb04e4189cbb94fc1c2a54167800b7d1220ab96e8e93284299e0275555718b7",
+              "src/impls/mod.rs": "462e954f57c6d16d16d0240ea5de54ef1fdbdc21bcdb025cfc7a069bece0e073",
+              "src/impls/std_impls/collections.rs": "542eed6285423bcc7e30d8b2540a096e12d011b58dd5270331a0e6ea5806b7cd",
+              "src/impls/std_impls/mod.rs": "b140711036731f0b4cfb452abdff4a51ddd605bdc970adf542d37dc7a63cd6cf",
+              "src/impls/std_impls/sync.rs": "c20f8b16e19fc96be363b852b93df43cee48a2f12819eb486539b60c67705848",
+              "src/impls/std_impls/types.rs": "7104ca867e935154b86b1da54e54bde480c61c95c5d28172fff99f041d284114",
+              "src/lib.rs": "86da1fd76d8082d30b97cdaa4fca6f8ebb3225e09e8182c0ab0a722c4fbbe4b7",
+              "src/tests/feature.rs": "13254692d44146f5c3ccec63c5cf5b699acf6c354abf64c002047d4ef81e3e7e",
+              "src/tests/mod.rs": "498d27db48355fcd72df90a1302f5e772c927d98b35a0b67e5ef93b5d0ac3d94",
+              "src/tracker.rs": "1d2bddf2ee4aa35f42c557a578fff3d2ce48b6780cd248a2750a5407d8ace045"
+            }
+          },
+          "get-size-derive2": {
+            "version": "0.11.1",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "28f0daa179069133df60523e0f59d0a6bd2d3db9ccae01b630896d269c4a802e",
+            "declared_license": "MIT OR Apache-2.0",
+            "incoming": [
+              "get-size2"
+            ],
+            "proc_macro": true,
+            "reviewed_files": {
+              "Cargo.toml": "29a07093594606c9ee43c9bedafae26cb0c90e67444051b48e90b0a9db2428d6",
+              "Cargo.toml.orig": "8e99fd280e72a113d9eda48da45249ce9d7ae5c739c88e0a01a86a6c1d0d6328",
+              "LICENSE": "d5b9c11d6cc93e6ffc28197564a15c7a2f50209317c02810f96b34bf24a17d11",
+              "src/lib.rs": "6bd5a329a216efbc01155a4909936255cf2b73cbce4e8d224735dc5b626c6413"
+            }
+          },
+          "attribute-derive": {
+            "version": "0.11.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "d2f9ef7a68684657ce9da341c934c73b63df7a3585a61e366d84c84ed5d3d167",
+            "declared_license": "MIT OR Apache-2.0",
+            "incoming": [
+              "get-size-derive2"
+            ],
+            "proc_macro": false,
+            "reviewed_files": {
+              "Cargo.toml": "30b1a2db6a657bf210473e1186cfdc807a9845dc89caab474af68a2f650c5bfe",
+              "Cargo.toml.orig": "7d44f9bfcb4ed17da3974dbd63d640c5a565dedb651224105a00d142763c1292",
+              "LICENSE-APACHE": "abf8f3253498c07abb340315b01c73c2151f9f2a5622ea0b44bd8cadfa34072a",
+              "LICENSE-MIT": "562c625100a5ee635f35de5908c206b7d8783e4dcd10ede1c90e4c0e7dddfe5f",
+              "src/from_partial.rs": "c8695862e07d4319b02750bf4c82df947907e593f58ca67fada9ce7fad5e5ac6",
+              "src/lib.rs": "50c1b4a9ad6ef4f2dad1448e3552ea55148a2dab87bdb1eb8dd9996a6e1e4973",
+              "src/parsing.rs": "b90b80198aa958e2d06828510df75305f8b701527769c98d29ed0423af766b77",
+              "src/std_impls.rs": "0153092f39ff0b4a38c25f4f89e27fc5723282f0327b58b40b0d88917982c417",
+              "src/syn_impls.rs": "332a562aaa0bd8c7fa6f07806f10a0d245c8cca63f0647ce796855c0a2bbe5f5",
+              "src/utils.rs": "6fda796501c14634585307ed8d9da70cda235e5e1765cee4023758c63c2bbd4c"
+            }
+          },
+          "attribute-derive-macro": {
+            "version": "0.11.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "300d426e5e73549125bb8e4649bdd5508f82c94ddf898fb0517246e71dfb8e98",
+            "declared_license": "MIT",
+            "incoming": [
+              "attribute-derive"
+            ],
+            "proc_macro": true,
+            "reviewed_files": {
+              "Cargo.toml": "8e0ca635bfbfb74d2847b6e5ab599b3fdd109d3c014334baeef139070b5a6335",
+              "Cargo.toml.orig": "6b029154fb8a066f6e4d1ff5d3bf88ec4d35bac66d65255c7840a2a57878fbaa",
+              "LICENSE": "7b273685779bddaafd4c83040dc25fe8c747b73d21f894741df9065609abdff9",
+              "src/lib.rs": "e3b91a17e24656d10b2839c66cc437883adc9c6e64a311a1c3fcece500b72ae4"
+            }
+          },
+          "quote-use": {
+            "version": "0.9.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "48356e493823dc3c1d7e9fc7b3ff204ecec48afbdd718fc4134091b88eb63f3d",
+            "declared_license": "MIT",
+            "incoming": [
+              "attribute-derive-macro"
+            ],
+            "proc_macro": false,
+            "reviewed_files": {
+              "Cargo.toml": "66cc881eb2de0927c8339a3f06bef3032f2c6f0b717c7b8194ac0a9b14c3f11a",
+              "Cargo.toml.orig": "eae06a95319fe0702fa9d9e7d7f2e0eb6d902b19f3ebb8cc8b2984d7ce8128d6",
+              "LICENSE": "522c909460ec03b8ea01e5126d2948fb55897f613fd3520c86546d8268c90ad8",
+              "src/lib.rs": "3bf07141d2478ccd2ca24a418ebbe34ff3d9b79a4bc579035a90849a6398b93e"
+            }
+          },
+          "quote-use-macros": {
+            "version": "0.9.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "8cf1c5de6a7cc231c71e03c77aa4c7019097859ea7029156b54d2894a8430704",
+            "declared_license": "MIT",
+            "incoming": [
+              "quote-use"
+            ],
+            "proc_macro": true,
+            "reviewed_files": {
+              "Cargo.toml": "c4263c7461691dc95a6ea37b77eec24156100559a71df4e00ffb51825a3cff8b",
+              "Cargo.toml.orig": "4ad66bbe14aaa1a0e1a8a16feb0e2b6dd32797818a3702dcd6c3d32322757e69",
+              "LICENSE": "522c909460ec03b8ea01e5126d2948fb55897f613fd3520c86546d8268c90ad8",
+              "src/lib.rs": "184b915bb61b839f775e2ea00a3b891c099a48d257ef0895165c19e12f860e1c",
+              "src/prelude/2021.rs": "97603603be151e231518e7760307129f28081f9473d643a135129ccd1ccc0d2c",
+              "src/prelude/core.rs": "33cd688afb240a353a629a369b45628879e472649e8bb12ccde425cd38844293",
+              "src/prelude/std.rs": "5e52806875ed22c66c06c7bf3776c78943b876a593dbff811c9a1e3fbeb548eb",
+              "src/prelude.rs": "f85895a7af808f62dd0fb11546315700ea70a002ca5e5d26e6fc1725cde768ea",
+              "src/use_parser.rs": "b1a084b633ce3182f14ae564cedeb41d9a056890ed94c754bd85aa4e3e5d6840"
+            }
+          }
+        }
+      }
+    ]
   }
 }

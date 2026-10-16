@@ -15,7 +15,8 @@ use std::thread;
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use mlua::{Compiler, Lua, VmState, ffi};
+use mlua::chunk::Compiler;
+use mlua::{Lua, VmState, ffi};
 
 const MEMORY_LIMIT: usize = 512 * 1024 * 1024;
 const OPT_LEVEL: u8 = 2;

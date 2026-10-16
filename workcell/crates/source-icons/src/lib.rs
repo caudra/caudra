@@ -7,8 +7,6 @@
 //! normalization. Network safety is delegated to `workcell-net`, so HTML links,
 //! fallback guesses, DNS answers, and every redirect share one SSRF policy.
 
-extern crate base64_022 as base64;
-
 mod budget;
 mod cache;
 mod candidates;

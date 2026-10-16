@@ -109,7 +109,7 @@ fn decode(lua: &Lua, str: String) -> LuaResult<Pair<Value>> {
 #[lua_fn]
 fn schema_validator(lua: &Lua, schema: Value) -> LuaResult<Pair<AnyUserData>> {
     let schema_json = try_pair!(lua_to_json(lua, &schema));
-    let validator = try_pair!(jsonschema::validator_for(&schema_json));
+    let validator = try_pair!(jsonschema::options().offline().build(&schema_json));
     Ok((
         Some(lua.create_userdata(LuaSchemaValidator { validator })?),
         None,
@@ -133,12 +133,71 @@ lua_table! {
 #[cfg(test)]
 mod tests {
     use mlua::Lua;
+    use serde_json::{Value as JsonValue, json};
+    use test_case::test_case;
+
+    use super::json_to_lua;
+
+    const RETRIEVAL_DISABLED: &str = "Retrieval is disabled";
+    const ANSWER_PATH: &str = "at /answer: ";
 
     fn lua_with_json() -> Lua {
         let lua = Lua::new();
         let json = super::create_json_table(&lua).unwrap();
         lua.globals().set("json", json).unwrap();
         lua
+    }
+
+    #[test_case("http://json-schema.org/draft-07/schema#"; "draft_07")]
+    #[test_case("https://json-schema.org/draft/2019-09/schema"; "draft_2019_09")]
+    #[test_case("https://json-schema.org/draft/2020-12/schema"; "draft_2020_12")]
+    fn schema_validator_resolves_local_references_and_preserves_return_shapes(draft: &str) {
+        let lua = lua_with_json();
+        let schema = json!({
+            "$schema": draft,
+            "type": "object",
+            "definitions": { "answer": { "type": "string" } },
+            "properties": { "answer": { "$ref": "#/definitions/answer" } },
+            "required": ["answer"],
+        });
+        lua.globals()
+            .set("schema", json_to_lua(&lua, &schema).unwrap())
+            .unwrap();
+        let (no_compile_error, errors, valid): (bool, Vec<String>, bool) = lua
+            .load(
+                r#"
+                local validator, err = json.schema_validator(schema)
+                local errors = validator:validate({ answer = 42 })
+                return err == nil, errors, validator:validate({ answer = "ok" }) == nil
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(no_compile_error);
+        assert!(valid);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].starts_with(ANSWER_PATH), "{errors:?}");
+    }
+
+    #[test_case(json!({ "type": "object", "properties": 7 }), false; "malformed_schema")]
+    #[test_case(json!({ "$ref": "#/definitions/missing" }), false; "missing_local_reference")]
+    #[test_case(json!({ "$ref": "http://127.0.0.1:9/schema.json" }), true; "http_reference")]
+    #[test_case(json!({ "$ref": "https://127.0.0.1:9/schema.json" }), true; "https_reference")]
+    #[test_case(json!({ "$ref": "file:///schema.json" }), true; "file_reference")]
+    fn schema_compile_errors_return_a_pair_without_fetching(schema: JsonValue, offline: bool) {
+        let lua = lua_with_json();
+        lua.globals()
+            .set("schema", json_to_lua(&lua, &schema).unwrap())
+            .unwrap();
+        let (is_nil, error): (bool, String) = lua
+            .load("local validator, err = json.schema_validator(schema); return validator == nil, err")
+            .eval()
+            .unwrap();
+        assert!(is_nil);
+        assert!(!error.is_empty());
+        if offline {
+            assert!(error.contains(RETRIEVAL_DISABLED), "{error}");
+        }
     }
 
     #[test]

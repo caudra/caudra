@@ -57,9 +57,9 @@ the upstream binary.
 Vendored verbatim from RTK. The corpus must stay byte-identical so a refresh is a clean copy.
 Rules authored here live in `crates/output-filter/rules-workcell/` instead.
 
-Source: `rtk-ai/rtk` revision `aa408534859949ebac1dcc82ec4d25b575a539fa`,
-`src/filters/*.toml` (tag `dev-0.47.0-rc.386`). `RTK.txt` preserves that revision's `LICENSE`,
-including `Copyright 2024 rtk-ai and rtk-ai Labs`. No root upstream `NOTICE` exists at that revision.
+Source: `rtk-ai/rtk` revision `4ef8730cf3a0dea11c8d64a9b90bc0616fe52100`,
+`src/filters/*.toml` (tag `v1.0.1`). `RTK.txt` preserves that revision's `LICENSE`,
+including `Copyright 2026 RTK AI Labs`. No root upstream `NOTICE` exists at that revision.
 `crates/output-filter/NOTICE` records the incorporated material and local behavioral differences.
 
 ## Monty worker

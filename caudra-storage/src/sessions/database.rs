@@ -6708,6 +6708,15 @@ mod tests {
     const BYTE_COUNT_IS_UNCOMPRESSED: &str =
         "byte_count must stay the uncompressed length that trim and the history bounds read";
     const COMPRESSION_PREVIOUS_SCHEMA: i64 = 9;
+    const LEGACY_ZSTD_PAYLOAD: &str = r#"{"text":"saved session: café\nsaved session: café\nsaved session: café","is_error":false,"items":[1,2,3]}"#;
+    const LEGACY_ZSTD_FRAME: &[u8] = &[
+        40, 181, 47, 253, 32, 108, 85, 2, 0, 36, 4, 123, 34, 116, 101, 120, 116, 34, 58, 34, 115,
+        97, 118, 101, 100, 32, 115, 101, 115, 115, 105, 111, 110, 58, 32, 99, 97, 102, 195, 169,
+        92, 110, 34, 44, 34, 105, 115, 95, 101, 114, 114, 111, 114, 34, 58, 102, 97, 108, 115, 101,
+        44, 34, 105, 116, 101, 109, 115, 34, 58, 91, 49, 44, 50, 44, 51, 93, 125, 1, 0, 79, 104,
+        58, 1,
+    ];
+    const LEGACY_PAYLOAD_FIELD: &str = "legacy payload";
     const REQUEST_COLUMNS_PREVIOUS_SCHEMA: i64 = 10;
     const MIGRATION_KEEPS_SUBAGENTS: &str =
         "rebuilding the subagents table must carry every row across unchanged";
@@ -12964,6 +12973,77 @@ CREATE TABLE subagents (
             0,
             "{MIGRATION_RECLAIMS_FREELIST}"
         );
+    }
+
+    #[test]
+    fn legacy_zstd_payload_fixture_decodes() {
+        assert_eq!(
+            decompress_payload(LEGACY_ZSTD_FRAME, LEGACY_PAYLOAD_FIELD).unwrap(),
+            LEGACY_ZSTD_PAYLOAD
+        );
+        assert_eq!(
+            zstd::bulk::decompress(LEGACY_ZSTD_FRAME, MAX_PAYLOAD_BYTES).unwrap(),
+            LEGACY_ZSTD_PAYLOAD.as_bytes()
+        );
+    }
+
+    #[test]
+    fn a_legacy_zstd_tool_output_is_still_loadable() {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        let output = serde_json::from_str(LEGACY_ZSTD_PAYLOAD).unwrap();
+        session.insert_tool_output(SMALL_OUTPUT_ID.into(), output);
+        database.save(&session, None).unwrap();
+        database
+            .connection
+            .execute(
+                "UPDATE tool_outputs SET payload = ?1",
+                params![LEGACY_ZSTD_FRAME],
+            )
+            .unwrap();
+        let loaded = database
+            .load::<TestMessage, Value, Value>(session.id)
+            .unwrap();
+        assert_eq!(loaded.tool_outputs(), session.tool_outputs());
+    }
+
+    #[test_case(""; "empty")]
+    #[test_case(LEGACY_ZSTD_PAYLOAD; "json_with_unicode_and_escapes")]
+    fn current_zstd_payload_roundtrips(payload: &str) {
+        let stored = compress_payload(payload).unwrap();
+        assert_eq!(
+            decompress_payload(&stored, LEGACY_PAYLOAD_FIELD).unwrap(),
+            payload
+        );
+    }
+
+    #[test_case(&[0; 8]; "invalid_magic")]
+    #[test_case(&LEGACY_ZSTD_FRAME[..LEGACY_ZSTD_FRAME.len() - 1]; "truncated_frame")]
+    fn corrupt_zstd_payload_keeps_the_field_and_error_kind(stored: &[u8]) {
+        let error = decompress_payload(stored, LEGACY_PAYLOAD_FIELD).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                SessionError::CorruptDatabaseValue { field, reason }
+                    if *field == LEGACY_PAYLOAD_FIELD
+                        && reason.starts_with(PAYLOAD_DECOMPRESSION_FAILED)
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn zstd_payload_with_invalid_utf8_is_a_named_error() {
+        let stored = zstd::bulk::compress(&[0xff], PAYLOAD_COMPRESSION_LEVEL).unwrap();
+        let error = decompress_payload(&stored, LEGACY_PAYLOAD_FIELD).unwrap_err();
+        assert!(matches!(
+            error,
+            SessionError::CorruptDatabaseValue {
+                field: LEGACY_PAYLOAD_FIELD,
+                ..
+            }
+        ));
     }
 
     #[test]

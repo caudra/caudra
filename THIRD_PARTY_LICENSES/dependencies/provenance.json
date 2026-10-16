@@ -209,6 +209,53 @@
       "upstream_path": "LICENSE.md",
       "url": "https://raw.githubusercontent.com/wez/wezterm/d5ca5509b95edc31291ba29bd1fcbf3f0b12c92d/LICENSE.md",
       "git_blob_sha1": "cf22ae0b4062eb94de58d05012bd8ef3ebfc8f15"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/additional/alloc-stdlib-0.2.4/LICENSE",
+      "kind": "license",
+      "repository": "https://github.com/dropbox/rust-alloc-no-stdlib",
+      "revision": "ae42d22078b98549e987d2f03d12df7b984fde47",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/dropbox/rust-alloc-no-stdlib/ae42d22078b98549e987d2f03d12df7b984fde47/LICENSE",
+      "git_blob_sha1": "cd496ba72eb37e83a44958358d1f89a8a28cbc15",
+      "sha256": "c0c56f26d9c051cac4d200c34c84e7ae9aaa853e01a982a1df08b09931e518ae"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/taffy-0.14.0/LICENSE",
+      "kind": "license",
+      "sha256": "f97daf1a0124413dccf399a4e6626b4b74acd05282f80b6d64ac82225650b77a",
+      "repository": "https://github.com/DioxusLabs/taffy",
+      "revision": "77f385683c1d698c91a23a259f87fdddf26925fb",
+      "upstream_path": "LICENSE",
+      "git_blob_sha1": "f6b3d8f95569d0dfca076b6b24901b2a4a89aca8"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/additional/objc2/LICENSE.md",
+      "kind": "source_license_notice",
+      "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+      "repository": "https://github.com/madsmtm/objc2",
+      "upstream_path": "LICENSE.md",
+      "git_blob_sha1": "540ae4c81adb5f64a9f61e222b688880da24300e",
+      "verified_revisions": [
+        "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+        "8852b424193ca41602281b3d7540d7c8ed51e49a",
+        "8d214f5477365ffcbcbb7de058c86ed9a518efb7"
+      ],
+      "sources": [
+        {
+          "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "revision": "8852b424193ca41602281b3d7540d7c8ed51e49a",
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/8852b424193ca41602281b3d7540d7c8ed51e49a/LICENSE.md"
+        },
+        {
+          "revision": "8d214f5477365ffcbcbb7de058c86ed9a518efb7",
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/8d214f5477365ffcbcbb7de058c86ed9a518efb7/LICENSE.md"
+        }
+      ],
+      "origin": "Verbatim identical upstream licensing notice at all three package VCS pins. Explicitly licenses objc2, objc2-encode and objc2-foundation under MIT, and the other framework crates under Zlib OR Apache-2.0 OR MIT. Links full terms rather than containing them. Its Apple SDK licensing caveat is preserved without asserting legal clearance."
     }
   ],
   "packages": [
@@ -1311,6 +1358,241 @@
       "status": "collected",
       "inspected_ancestor_legal_paths": [
         "LICENSE.md"
+      ]
+    },
+    {
+      "name": "agent-client-protocol-schema",
+      "version": "1.11.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "3d9a84a76a4f44721e0d8dabcd85b219893c43d6171a4a033d84844d85880823",
+      "declared_license": "Apache-2.0",
+      "repository": "https://github.com/agentclientprotocol/agent-client-protocol",
+      "revision": "4cf3dd858c819fc3ab99ae53f76883ede0345a10",
+      "path_in_vcs": "agent-client-protocol-schema",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "4cf3dd858c819fc3ab99ae53f76883ede0345a10"
+        },
+        "path_in_vcs": "agent-client-protocol-schema"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "7ec42b0a4aafc865bea2f97a970b2e0910fce58c",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/agent-client-protocol-schema-1.7.0/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "upstream_legal_blobs": {
+        "LICENSE": "1de02305f81f6dc087b6229a1d86a31774d2fa31"
+      },
+      "notes": [
+        "Exact new archive and all extracted bytes match Cargo.lock; original manifest matches the recorded upstream Git blob. Ancestor legal files were fetched at the package revision and verified by Git blob SHA-1. Existing evidence is reused only when byte-identical to that exact revision."
+      ]
+    },
+    {
+      "name": "alloc-stdlib",
+      "version": "0.3.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "0b5c1865780388bfa186411ab5f247819487fc4864c6e9c3106611fa347586e1",
+      "declared_license": "BSD-3-Clause",
+      "repository": "https://github.com/dropbox/rust-alloc-no-stdlib",
+      "revision": "0a81fd6928ea3b33c8cd484aa4575d50ffb98012",
+      "path_in_vcs": "alloc-stdlib",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "0a81fd6928ea3b33c8cd484aa4575d50ffb98012"
+        },
+        "path_in_vcs": "alloc-stdlib"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "75d6b948bd23f05a0c2331b9aa537c301a351c0f",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/additional/alloc-stdlib-0.2.4/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "upstream_legal_blobs": {
+        "LICENSE": "cd496ba72eb37e83a44958358d1f89a8a28cbc15"
+      },
+      "notes": [
+        "Exact new archive and all extracted bytes match Cargo.lock; original manifest matches the recorded upstream Git blob. Ancestor legal files were fetched at the package revision and verified by Git blob SHA-1. Existing evidence is reused only when byte-identical to that exact revision."
+      ]
+    },
+    {
+      "name": "mlua-sys",
+      "version": "0.13.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "1631cda17bd6486410ab751d91f5fd4484f441589278cdad879eb3afc721a285",
+      "declared_license": "MIT",
+      "repository": "https://github.com/mlua-rs/mlua",
+      "revision": "a186d461c7772aed4cb0a9fa1d1899121c6450e7",
+      "path_in_vcs": "mlua-sys",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "a186d461c7772aed4cb0a9fa1d1899121c6450e7"
+        },
+        "path_in_vcs": "mlua-sys"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "9324784115f0ea98e02a09d42127e8530a5134e7",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/mlua-sys-0.12.0/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "upstream_legal_blobs": {
+        "LICENSE": "66f2fa32dff88afeceb8d5f9e3093f6b9b604f98"
+      },
+      "notes": [
+        "Exact new archive and all extracted bytes match Cargo.lock; original manifest matches the recorded upstream Git blob. Ancestor legal files were fetched at the package revision and verified by Git blob SHA-1. Existing evidence is reused only when byte-identical to that exact revision."
+      ]
+    },
+    {
+      "name": "mlua_derive",
+      "version": "0.12.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "9c4070bd35dad9477c94311c4668145bae8991b8accacf7201a77b14cab8a9e3",
+      "declared_license": "MIT",
+      "repository": "https://github.com/mlua-rs/mlua",
+      "revision": "a186d461c7772aed4cb0a9fa1d1899121c6450e7",
+      "path_in_vcs": "mlua_derive",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "a186d461c7772aed4cb0a9fa1d1899121c6450e7"
+        },
+        "path_in_vcs": "mlua_derive"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "9c598b3e6918945992d2fad0cf761fb79e9edc17",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/mlua-sys-0.12.0/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "upstream_legal_blobs": {
+        "LICENSE": "66f2fa32dff88afeceb8d5f9e3093f6b9b604f98"
+      },
+      "notes": [
+        "Exact new archive and all extracted bytes match Cargo.lock; original manifest matches the recorded upstream Git blob. Ancestor legal files were fetched at the package revision and verified by Git blob SHA-1. Existing evidence is reused only when byte-identical to that exact revision."
+      ]
+    },
+    {
+      "name": "taffy",
+      "version": "0.14.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "639627c87f43b9181c811f40a6296409e093a17bc761214cba3c15df74f86b99",
+      "declared_license": "MIT",
+      "repository": "https://github.com/DioxusLabs/taffy",
+      "revision": "77f385683c1d698c91a23a259f87fdddf26925fb",
+      "path_in_vcs": "",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "77f385683c1d698c91a23a259f87fdddf26925fb"
+        },
+        "path_in_vcs": ""
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "1775cf2693828b1887ac855a91a71488d004b059",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/taffy-0.14.0/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "upstream_legal_blobs": {
+        "LICENSE": "f6b3d8f95569d0dfca076b6b24901b2a4a89aca8"
+      },
+      "notes": [
+        "Exact new archive and all extracted bytes match Cargo.lock; original manifest matches the recorded upstream Git blob. Ancestor legal files were fetched at the package revision and verified by Git blob SHA-1. Existing evidence is reused only when byte-identical to that exact revision.",
+        "The new upstream LICENSE replaces LICENSE.md and explicitly retains Visly 2018 and Taffy Authors 2026 copyright notices. Preserve both old and new evidence for their respective versions."
+      ]
+    },
+    {
+      "name": "tiktoken-rs",
+      "version": "0.12.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "2aeff724640cfe13037336ddf35befdffd2909cbdb65cf041cc8a4cf8c584cfa",
+      "declared_license": "MIT",
+      "repository": "https://github.com/zurawiki/tiktoken-rs",
+      "revision": "72a5a800651a1cea1ad609292446ba02c80e3bcd",
+      "path_in_vcs": "tiktoken-rs",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "72a5a800651a1cea1ad609292446ba02c80e3bcd"
+        },
+        "path_in_vcs": "tiktoken-rs"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "92b3f77cb35ae00e5b8ed7ac038c2bbd73f08440",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/tiktoken-rs-0.12.0/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "upstream_legal_blobs": {
+        "LICENSE": "39aa2a22b04e732499c3f3cf6df84f50215d8f5f"
+      },
+      "notes": [
+        "Exact new archive and all extracted bytes match Cargo.lock; original manifest matches the recorded upstream Git blob. Ancestor legal files were fetched at the package revision and verified by Git blob SHA-1. Existing evidence is reused only when byte-identical to that exact revision."
+      ]
+    },
+    {
+      "name": "objc2",
+      "version": "0.6.5",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "08849bbd4767dfae9457696856ae1c84fe4e0281bbe4a7abff2d0e06fb7981f8",
+      "declared_license": "MIT",
+      "repository": "https://github.com/madsmtm/objc2",
+      "revision": "d7d2fa23ceaa5e6096c923b081040e5d81b3b9df",
+      "path_in_vcs": "crates/objc2",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "d7d2fa23ceaa5e6096c923b081040e5d81b3b9df"
+        },
+        "path_in_vcs": "crates/objc2"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "d6ea622d9c0067f40ca92e54d5db5b0f51f05ce7",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/siphasher-1.0.3/LICENSE-MIT.txt"
+      ],
+      "notice_files": [
+        "THIRD_PARTY_LICENSES/additional/objc2/LICENSE.md"
+      ],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE.md"
+      ],
+      "upstream_legal_blobs": {
+        "LICENSE.md": "540ae4c81adb5f64a9f61e222b688880da24300e"
+      },
+      "notes": [
+        "Exact new archive and all extracted bytes match Cargo.lock; original manifest matches the recorded upstream Git blob. Ancestor legal files were fetched at the package revision and verified by Git blob SHA-1. Existing evidence is reused only when byte-identical to that exact revision.",
+        "The unchanged upstream LICENSE.md grants MIT by reference, with canonical MIT terms supplied separately as before. It still states uncertainty about Apple SDK-derived bindings; this evidence does not resolve that caveat or assert distribution clearance."
       ]
     }
   ]

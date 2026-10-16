@@ -124,6 +124,9 @@ repository = "https://github.com/caudra/caudra"
 rust-version = "1.99"
 
 [workspace.dependencies]
+syn = { version = "3.0.9", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
 caudra-agent = { path = "caudra-agent" }
 caudra-acp = { path = "caudra-acp" }
 caudra-config = { path = "caudra-config" }
@@ -192,12 +195,12 @@ ignore = "0.4"
 memchr = "2"
 strsim = "0.11"
 strum = { version = "0.28", features = ["derive"] }
-htmd = "=0.5.4"
+htmd = "=0.5.6"
 tempfile = "3"
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }
 tiktoken-rs = "0.12"
 regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "nfa-thompson", "hybrid", "unicode-perl", "unicode-word-boundary"] }
-gix = { version = "0.87", default-features = false, features = [
+gix = { version = "0.89", default-features = false, features = [
     "sha1",
     "status",
     "index",
@@ -210,12 +213,12 @@ grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
-two-face = { version = "0.5", default-features = false, features = ["syntect-default-fancy"] }
+two-face = { version = "0.5.2", default-features = false, features = ["syntect-default-fancy"] }
 unicode-width = "0.2"
 unicode-segmentation = "1"
 similar = { version = "3", features = ["inline", "unicode"] }
 jsonrepair = { version = "0.1", default-features = false, features = ["serde"] }
-jsonschema = { version = "0.52", default-features = false }
+jsonschema = { version = "0.58.6", default-features = false }
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system"] }
 keyring = "4"
 arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }
@@ -237,7 +240,7 @@ futures-lite = "2"
 futures = "0.3"
 isahc = { version = "2.0", default-features = false, features = ["text-decoding", "static-curl", "rustls-tls", "http2"] }
 flate2 = "1"
-zstd = "0.13"
+zstd = "0.14.2"
 indicatif = "0.18"
 libc = "0.2"
 winapi-util = "0.1.11"
@@ -246,7 +249,7 @@ nucleo = "0.5"
 nucleo-matcher = "0.3"
 open = "5"
 rpassword = "7"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8.2", features = ["html_reports"] }
 etcetera = "0.11"
 dotenvy = "0.15"
 tree-sitter = "0.27"
@@ -266,7 +269,7 @@ tree-sitter-kotlin-ng = "1.1"
 tree-sitter-lua = "0.5"
 tree-sitter-md = "0.5"
 tree-sitter-nix = "0.3.0"
-tree-sitter-php = "0.24"
+tree-sitter-php = "0.25"
 tree-sitter-python = "0.25"
 tree-sitter-ruby = "0.23"
 tree-sitter-rust = "0.24"
@@ -286,8 +289,8 @@ tree-sitter-json = "0.24"
 tree-sitter-make = "1.1"
 monty = { git = "https://github.com/pydantic/monty.git", tag = "v1.1.0", package = "monty" }
 monty-types = { git = "https://github.com/pydantic/monty.git", tag = "v1.1.0", package = "monty-types" }
-notify = { version = "9.0.0-rc.2", default-features = false, features = ["flume", "macos_fsevent"] }
-serde_yaml = "0.9"
+notify = { version = "=9.0.0-rc.4", default-features = false, features = ["flume", "macos_fsevent"] }
+serde_yaml = { package = "yaml_serde", version = "0.10.7" }
 shell-words = "1"
 agent-client-protocol-schema = { version = "1", features = ["unstable_end_turn_token_usage"] }
 async-trait = "0.1"
@@ -298,11 +301,10 @@ wait-timeout = "0.2"
 inventory = "0.3"
 rhai = { version = "1.26", default-features = false, features = ["std", "serde", "internals", "no_time", "no_module"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
-base64-022 = { package = "base64", version = "0.22.1" }
 bytes = "1.12.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 dom_query = { version = "=0.28.0", features = ["markdown", "mini_selector"] }
-dom_smoothie = "=0.18.0"
+dom_smoothie = "=0.18.2"
 dunce = "1.0.5"
 encoding_rs = "0.8.35"
 file-format = { version = "0.29.0", default-features = false }
@@ -316,12 +318,10 @@ notify-8 = { package = "notify", version = "8.2.0", default-features = false, fe
 pdf_oxide = { version = "0.3.74", default-features = false }
 proptest = "1.11.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
-resvg = { version = "=0.47.0", default-features = false }
-rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk.git", rev = "9334c97f0d6e177546fc33593148aa3f942cb1f8", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
-rustix-038 = { package = "rustix", version = "0.38.44", features = ["fs", "process"] }
+resvg = { version = "=0.48.1", default-features = false }
+rmcp = { version = "=3.5.1", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
 schemars = "1.2.1"
 subtle = "2.6.1"
-toml-09 = { package = "toml", version = "0.9.8" }
 tree-sitter-cmake = "0.7.5"
 tree-sitter-cuda = "0.21.2"
 tree-sitter-objc = "3.0.2"

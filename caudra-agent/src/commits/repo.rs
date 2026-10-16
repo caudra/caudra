@@ -6,7 +6,6 @@
 //! writes, and nothing here reads a blob: a commit mention carries a message
 //! and a list of paths, never a diff.
 
-use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 
 use caudra_workspace::ScmChangeKind;
@@ -161,7 +160,7 @@ fn files_of(
         .for_each_to_obtain_tree(&tree, |change| {
             if files.len() >= COMMIT_FILES {
                 truncated = true;
-                return Ok::<Action, Infallible>(Action::Break(()));
+                return Ok(Action::Break(()));
             }
             let kind = match change {
                 TreeChange::Addition { entry_mode, .. } if entry_mode.is_blob() => {
@@ -223,6 +222,7 @@ mod tests {
     use gix::ObjectId;
     use gix::actor::SignatureRef;
     use gix::bstr::BString;
+    use test_case::test_case;
 
     const AUTHOR: &str = "Ada Lovelace";
     const EMAIL: &str = "ada@example.com";
@@ -363,6 +363,21 @@ mod tests {
             ],
             "{EXPECT_FILES}"
         );
+        assert!(!detail.files_truncated);
+    }
+
+    #[test_case(0 ; "an empty commit")]
+    #[test_case(COMMIT_FILES ; "at the limit")]
+    fn commits_at_or_below_the_file_limit_are_complete(count: usize) {
+        let fixture = fixture();
+        let repo = gix::open(&fixture.root).unwrap();
+        let blob = write_blob(&repo, BODY);
+        let names: Vec<_> = (0..count).map(|index| format!("file-{index}")).collect();
+        let entries: Vec<_> = names.iter().map(|name| (name.as_str(), blob)).collect();
+        let tree = write_tree(&repo, &entries);
+        let id = commit(&repo, SUBJECT, tree, Vec::new());
+        let detail = show(&fixture.root, &id.to_string()).unwrap();
+        assert_eq!(detail.files.len(), count);
         assert!(!detail.files_truncated);
     }
 

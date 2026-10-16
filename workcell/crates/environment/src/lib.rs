@@ -2,8 +2,6 @@
 
 //! Typed, sanitized execution-environment inspection with an optional MCP adapter.
 
-extern crate rustix_038 as rustix;
-
 use std::{
     collections::BTreeMap,
     ffi::OsStr,
@@ -1283,7 +1281,7 @@ async fn terminate_probe(child: &mut tokio::process::Child, _pid: Option<u32>) {
             .and_then(|pid| i32::try_from(pid).ok())
             .and_then(Pid::from_raw)
         {
-            let _ = kill_process_group(pid, Signal::Kill);
+            let _ = kill_process_group(pid, Signal::KILL);
         }
     }
     let _ = child.kill().await;

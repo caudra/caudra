@@ -974,6 +974,13 @@ mod tests {
     #[test_case("github.com:\n  oauth_token: token-1\n  user: octocat\n", PUBLIC_HOST => Some("token-1".to_owned()) ; "yaml_public")]
     #[test_case("myco.ghe.com:\n  oauth_token: ghe\n", PUBLIC_HOST => None ; "yaml_enterprise_not_public")]
     #[test_case("github.com:\n  oauth_token: pub\nmyco.ghe.com:\n  oauth_token: ghe\n", HOST => Some("ghe".to_owned()) ; "yaml_exact_enterprise")]
+    #[test_case("token: &token fake-token\ngithub.com:\n  oauth_token: *token\n", PUBLIC_HOST => Some("fake-token".to_owned()) ; "yaml_alias")]
+    #[test_case("github.com:\n  oauth_token: true\n", PUBLIC_HOST => None ; "yaml_boolean_is_not_token")]
+    #[test_case("github.com:\n  oauth_token: 'true'\n", PUBLIC_HOST => Some("true".to_owned()) ; "yaml_quoted_token")]
+    #[test_case("github.com:\n  oauth_token: first\n  oauth_token: second\n", PUBLIC_HOST => None ; "yaml_duplicate_token")]
+    #[test_case("github.com:\n  oauth_token: fake-token\n---\ngithub.com: {}", PUBLIC_HOST => None ; "yaml_multiple_documents")]
+    #[test_case("42: {}\ngithub.com:\n  oauth_token: fake-token", PUBLIC_HOST => Some("fake-token".to_owned()) ; "yaml_nonstring_host_skipped")]
+    #[test_case("github.com:\n  oauth_token: fake-token\n  user: [", PUBLIC_HOST => None ; "yaml_malformed_is_ignored")]
     fn extract_yaml_token(contents: &str, host: &str) -> Option<String> {
         extract_oauth_token_yaml(contents, host)
     }
@@ -1006,6 +1013,14 @@ mod tests {
     #[test_case(
         "github.com:\n  user: janedoe\n", "myco.ghe.com" =>
         Vec::<String>::new(); "missing_host"
+    )]
+    #[test_case(
+        "github.com:\n  user: true\n  users: {42: {}, octocat: {}}", PUBLIC_HOST =>
+        vec!["octocat".to_owned()]; "yaml_nonstring_usernames_skipped"
+    )]
+    #[test_case(
+        r#"{"github.com": {"user": "first", "user": "second"}}"#, PUBLIC_HOST =>
+        Vec::<String>::new(); "json_duplicate_user_is_ignored"
     )]
     fn test_config_usernames(contents: &str, host: &str) -> Vec<String> {
         config_usernames(contents, host)

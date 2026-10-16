@@ -11,11 +11,10 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import tomllib
 import zipfile
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
-
-import tomllib
 
 REPOSITORY = "caudra/caudra"
 ROOT = Path(__file__).resolve().parent.parent

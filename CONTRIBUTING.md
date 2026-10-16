@@ -26,7 +26,7 @@ For a larger change, open an issue first and describe your plan. That covers new
 
 Install these yourself:
 
-- [rustup](https://rustup.rs). `rust-toolchain.toml` pins Rust 1.99.0, and rustup fetches it with clippy and rustfmt the first time you build.
+- [rustup](https://rustup.rs). `rust-toolchain.toml` pins Rust 1.99.1, and rustup fetches it with clippy and rustfmt the first time you build.
 - GNU Make and Bash for the targets in the `Makefile`, and [cargo-nextest](https://nexte.st) for the tests.
 - Python 3, which builds the worker behind the `python_execution` tool, and [ripgrep](https://github.com/BurntSushi/ripgrep), which some tests call.
 - [stylua](https://github.com/JohnnyMorganz/StyLua), [ruff](https://docs.astral.sh/ruff/), [ty](https://github.com/astral-sh/ty), and [cargo-machete](https://github.com/bnjbvr/cargo-machete) for the formatting and lint checks.
@@ -171,6 +171,8 @@ cargo nextest run -p caudra-workcell
 Development and release builds use the same Workcell source. There are no sibling checkout overrides or separate revision bumps. Keep protocol-neutral tool behavior in `workcell/` and Caudra authorization, registration, and presentation in `caudra-workcell/`.
 
 ## Nix
+
+The flake supports x86_64 and aarch64 Linux, and Apple Silicon macOS. Intel macOS uses the native build because current nixpkgs no longer supports it.
 
 CI checks the flake when the Nix files, the Rust or Lua sources, or the docs change. If you edit `flake.nix`, run the same checks locally:
 

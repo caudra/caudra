@@ -19,7 +19,7 @@ use rmcp::{
         CustomRequest, CustomResult, DiscoverResult, ErrorCode, ExtensionCapabilities,
         Implementation, InitializeRequestParams, InitializeResult, ListToolsResult,
         PaginatedRequestParams, ProgressNotificationParam, ProgressToken, ProtocolVersion,
-        RequestMetaObject, ServerCapabilities, ServerInfo, Tool,
+        RequestMetaObject, ServerCapabilities, ServerConfig, Tool,
     },
     service::{Peer, RequestContext},
 };
@@ -2127,8 +2127,8 @@ impl WorkcellServer {
 }
 
 impl ServerHandler for WorkcellServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
             Implementation::new("workcell-mcp", env!("CARGO_PKG_VERSION")),
         )
     }

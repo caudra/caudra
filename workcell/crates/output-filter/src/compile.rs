@@ -223,6 +223,20 @@ fn compile_pattern(rule: &str, pattern: &str) -> Result<Regex, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_case::test_case;
+
+    const INVALID_CORPUS_PREFIX: &str = "corpus is not valid TOML:";
+    const PARSE_LOCATION: &str = "TOML parse error at line";
+    const DUPLICATE_KEY: &str = "duplicate";
+
+    #[test_case("[filters.demo]\nmatch_command = '^demo'\nmatch_command = '^other'\n"; "duplicate_rule_field")]
+    #[test_case("[filters.demo]\nmatch_command = '^demo'\n[filters.demo]\nmatch_command = '^other'\n"; "duplicate_rule_table")]
+    fn duplicate_rules_retain_located_configuration_errors(document: &str) {
+        let error = compile(document).unwrap_err();
+        assert!(error.starts_with(INVALID_CORPUS_PREFIX), "{error}");
+        assert!(error.contains(PARSE_LOCATION), "{error}");
+        assert!(error.contains(DUPLICATE_KEY), "{error}");
+    }
 
     #[test]
     fn embedded_corpus_compiles_within_bounds() {

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 MAKE = shutil.which("make")
@@ -89,6 +90,7 @@ class MakeTests(unittest.TestCase):
             "MFLAGS",
             "MAKELEVEL",
             "MAKEOVERRIDES",
+            "ARGS",
             "SCCACHE",
             *CACHE_VARIABLES,
             *WRAPPER_VARIABLES,
@@ -141,6 +143,21 @@ class MakeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("make build", result.stdout)
         self.assertEqual(self.records(), [])
+
+    def test_ambient_args_are_isolated_but_explicit_args_are_forwarded(self):
+        with patch.dict(os.environ, {"ARGS": "--locked --test-threads 8"}):
+            harness = MakeTests()
+            self.addCleanup(harness.doCleanups)
+            harness.setUp()
+            for arguments, expected in (
+                ((), ["build"]),
+                (("ARGS=--release",), ["build", "--release"]),
+            ):
+                with self.subTest(arguments=arguments):
+                    result = harness.run_make("build", *arguments)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    [cargo] = [r for r in harness.records() if r["kind"] == "cargo"]
+                    self.assertEqual(cargo["args"], expected)
 
     def test_all_compiling_targets_prepare_worker_even_with_named_files(self):
         for target in COMPILING_TARGETS:

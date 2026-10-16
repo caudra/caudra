@@ -25,6 +25,9 @@
 (type_spec
   name: (type_identifier) @name) @definition.type
 
+(type_alias
+  name: (type_identifier) @name) @definition.type
+
 (type_declaration (type_spec name: (type_identifier) @name type: (interface_type))) @definition.interface
 
 (type_declaration (type_spec name: (type_identifier) @name type: (struct_type))) @definition.struct

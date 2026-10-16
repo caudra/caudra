@@ -284,6 +284,21 @@ mod tests {
         "test-cmd", "Quick fix", false
         ; "no_args_placeholder"
     )]
+    #[test_case(
+        "---\nname: &name review\ndescription: *name\n---\nReview",
+        "review", "review", false
+        ; "yaml_alias"
+    )]
+    #[test_case(
+        "---\nname: first\nname: second\ndescription: Ignored\n---\nReview",
+        "test-cmd", "", false
+        ; "duplicate_yaml_field_uses_defaults"
+    )]
+    #[test_case(
+        "---\nname: [unterminated\n---\nReview",
+        "test-cmd", "", false
+        ; "malformed_yaml_uses_defaults"
+    )]
     fn parse_command_fields(
         content: &str,
         expected_name: &str,

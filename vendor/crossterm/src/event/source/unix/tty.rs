@@ -212,3 +212,42 @@ impl EventSource for UnixInternalEventSource {
         self.wake_pipe.waker.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "libc")]
+    use std::os::fd::IntoRawFd;
+    use std::{
+        io::{ErrorKind, Read},
+        os::unix::net::UnixStream,
+    };
+
+    use super::{FileDesc, UnixInternalEventSource};
+    use signal_hook::consts::SIGWINCH;
+
+    #[test]
+    fn resize_signal_writes_to_the_owned_pipe_and_is_drained_once() {
+        let (input, _writer) = UnixStream::pair().unwrap();
+        input.set_nonblocking(true).unwrap();
+        #[cfg(feature = "libc")]
+        let input = FileDesc::new(input.into_raw_fd(), true);
+        #[cfg(not(feature = "libc"))]
+        let input = FileDesc::Owned(input.into());
+        let mut source = UnixInternalEventSource::from_file_descriptor(input).unwrap();
+
+        signal_hook::low_level::raise(SIGWINCH).unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            source.winch_signal_receiver.read(&mut byte).unwrap(),
+            byte.len()
+        );
+        assert_eq!(
+            source
+                .winch_signal_receiver
+                .read(&mut byte)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::WouldBlock
+        );
+    }
+}

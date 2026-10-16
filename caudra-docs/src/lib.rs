@@ -532,6 +532,7 @@ mod tests {
     const LISTED_INDEX: &str = "page `index` must be listed exactly once; index must not be listed";
     const MISSING_PAGE: &str = "group `Guides` references missing page `missing.md`";
     const EMPTY_GROUP: &str = "each group needs a nonempty label and pages";
+    const DUPLICATE_TITLE: &str = "duplicate field `title`";
 
     fn pages() -> super::Library {
         library(&[("alpha", ALPHA), ("beta", BETA)])
@@ -557,10 +558,22 @@ mod tests {
     #[test_case("---\ntitle: ''\ndescription: Description\n---\n", "`title` must be" ; "empty_title")]
     #[test_case("---\ntitle: Title\ndescription: Description\nweight: 2\n---\n", "unknown field `weight`" ; "legacy_metadata")]
     #[test_case("---\ntitle: Title\ndescription: Description\n---\n# Duplicate\n", "not a body H1" ; "duplicate_title")]
+    #[test_case("---\ntitle: First\ntitle: Second\ndescription: Description\n---\n", DUPLICATE_TITLE ; "duplicate_yaml_field")]
     fn invalid_metadata_names_the_page(source: &'static str, expected: &str) {
         let error = Page::parse("invalid", source).unwrap_err();
         assert_eq!(error.path, "invalid.md");
         assert!(error.message.contains(expected), "{error}");
+    }
+
+    #[test_case("title: &title 'true'\ndescription: *title", "true", "true"; "quoted_scalar_alias")]
+    #[test_case("title: true\ndescription: 42", "true", "42"; "typed_strings")]
+    #[test_case("title: YAML\ndescription: >-\n  folded\n  text", "YAML", "folded text"; "folded_scalar")]
+    fn yaml_metadata_keeps_strings_and_body(yaml: &str, title: &str, description: &str) {
+        let source = format!("---\n{yaml}\n---\n{BETA}");
+        let (metadata, body) = super::metadata("beta.md", &source).unwrap();
+        assert_eq!(metadata.title, title);
+        assert_eq!(metadata.description, description);
+        assert_eq!(body, BETA);
     }
 
     #[test]

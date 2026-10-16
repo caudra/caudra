@@ -1,8 +1,8 @@
-two-face 0.5.1
-Source: https://github.com/CosmicHorrorDev/two-face
-Revision: 61d1e8d42cfe3c80e5f3d1bc9a71a4a59ee9ebee
+two-face 0.5.2+bat-0.26.1
+Source: https://codeberg.org/CosmicHarper/two-face
+Revision: 67b64e632ceefe70e5f20f3eb797d9e33560a11c
 Crates.io archive SHA-256:
-b285c51f8a6ade109ed4566d33ac4fb289fb5d6cf87ed70908a5eaf65e948e34
+915be7adc2ff6f4338acbf71f3eda0a146f46003b992a1669c674308610efdac
 
 caudra-highlight/src/lib.rs loads two_face::syntax::extra_newlines().
 The Cargo feature is syntect-default-fancy. The crate's code is offered under
@@ -20,14 +20,14 @@ Copyright (c) 2018-2021 bat-developers (https://github.com/sharkdp/bat).
 bat is made available under the terms of either the MIT License or the Apache
 License 2.0, at your option.
 
-See the [LICENSE-APACHE](./bat/LICENSE-APACHE) and
-[LICENSE-MIT](./bat/LICENSE-MIT) files for license details.
+See the [LICENSE-APACHE](https://github.com/sharkdp/bat/blob/master/LICENSE-APACHE) and
+[LICENSE-MIT](https://github.com/sharkdp/bat/blob/master/LICENSE-MIT) files for license details.
 
 === two-face LICENSE-MIT ===
 
 MIT License
 
-Copyright (c) 2023-2025 The `two-face` developers (https://github.com/CosmicHorrorDev/two-face).
+Copyright (c) 2023-2025 The `two-face` developers (https://codeberg.org/CosmicHarper/two-face).
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
