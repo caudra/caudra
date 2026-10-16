@@ -200,6 +200,7 @@ impl Child {
             output: None,
             annotation: None,
             refused: false,
+            accounting: Default::default(),
         })
     }
 }

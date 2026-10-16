@@ -59,9 +59,21 @@ pub struct SourceFile {
     pub language: Language,
     pub bytes: usize,
     pub lines: usize,
+    /// Type and import names the file spells, sorted and deduplicated.
+    ///
+    /// Evidence for the resolver, never a use site: a member call that could equally be a standard
+    /// library method binds an in-tree method only when its file names the type that owns it.
+    pub mentions: Vec<String>,
 }
 
 impl SourceFile {
+    #[must_use]
+    pub fn mentions(&self, name: &str) -> bool {
+        self.mentions
+            .binary_search_by(|mention| mention.as_str().cmp(name))
+            .is_ok()
+    }
+
     /// The directory portion of the path, or an empty string at the root.
     ///
     /// Used by resolution tier two, which prefers a definition in the same directory.
@@ -112,6 +124,33 @@ pub struct Definition {
     pub test_scope: bool,
     /// A doc comment attached to the definition, already trimmed of comment markers.
     pub documentation: Option<String>,
+    /// The type this definition is a member of, as its last path segment without generics.
+    ///
+    /// Rust records the self type of the enclosing `impl` or the enclosing trait's name. Other
+    /// languages record none, so a missing owner means "free function" only for Rust.
+    pub owner: Option<String>,
+}
+
+/// How a call reference spelled its target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallForm {
+    /// `name()`: nothing but the name.
+    Bare,
+    /// `value.name()`: a call through a receiver whose type the syntax does not state.
+    Member,
+    /// `Scope::name()`: a call through a path that names its scope.
+    Qualified,
+}
+
+impl CallForm {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Bare => "bare",
+            Self::Member => "member",
+            Self::Qualified => "qualified",
+        }
+    }
 }
 
 /// One unresolved use site.
@@ -123,11 +162,16 @@ pub struct Reference {
     pub file: FileId,
     pub name: String,
     pub kind: ReferenceKind,
-    /// The leading segment of a qualified reference, when the syntax supplies one.
+    /// The scope a qualified reference names, when the syntax supplies one.
     ///
-    /// `Widget::new()` records `Widget`. The precise resolution tiers use it; the base ladder
-    /// ignores it.
+    /// A call records the path's last segment without generics: `Widget::new()` and
+    /// `crate::ui::Widget::<T>::new()` both record `Widget`. A path rooted in `std`, `core` or
+    /// `alloc` records that root instead, since nothing under it is in the tree. An import records
+    /// the path's first segment, the crate it reaches into.
     pub qualifier: Option<String>,
+    pub call_form: CallForm,
+    /// The receiver of a member call, when it is a single identifier such as `self`.
+    pub receiver: Option<String>,
     pub byte: usize,
     pub line: usize,
     /// The definition this reference sits inside, if any.
@@ -230,6 +274,7 @@ mod tests {
             language: Language::Rust,
             bytes: 0,
             lines: 0,
+            mentions: Vec::new(),
         };
         assert_eq!(file("src/index/mod.rs").directory(), "src/index");
         assert_eq!(file("main.rs").directory(), "");

@@ -1917,6 +1917,7 @@ mod tests {
                     output: None,
                     annotation: None,
                     refused: false,
+                    accounting: Default::default(),
                 })
                 .collect(),
             text: String::new(),
@@ -2181,6 +2182,7 @@ mod tests {
             annotation: None,
             model_suffix: None,
             refused: false,
+            accounting: Default::default(),
         };
         for index in [1, 0] {
             let event = || {
@@ -2642,6 +2644,7 @@ mod tests {
                     annotation: None,
                     model_suffix: None,
                     refused: false,
+                    accounting: Default::default(),
                 }],
                 text: RETRIEVED_TEXT.into(),
             };

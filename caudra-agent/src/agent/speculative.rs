@@ -180,6 +180,7 @@ impl Peeked {
                 output: None,
                 annotation: None,
                 refused: false,
+                accounting: Default::default(),
             }
         };
         if let Some(done) = &self.done {

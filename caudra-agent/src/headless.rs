@@ -6309,11 +6309,10 @@ mod tests {
         assert_eq!(extract_tool_names(&tools), vec!["read", "bash"]);
     }
 
-    fn deferred_code_map() -> Vec<DeferredTool> {
+    fn deferred_execution_environment() -> Vec<DeferredTool> {
         vec![DeferredTool::new(
-            "code_map",
-            None,
-            serde_json::json!({"name": "code_map", "description": "Rank symbols"}),
+            "execution_environment",
+            serde_json::json!({"name": "execution_environment", "description": "Inspect the host"}),
         )]
     }
 
@@ -6322,7 +6321,7 @@ mod tests {
     #[test]
     fn advertised_names_show_tool_search_not_deferred_tools() {
         let base = serde_json::json!([{"name": "read"}]);
-        let names = advertised_tool_names(&base, &deferred_code_map(), false);
+        let names = advertised_tool_names(&base, &deferred_execution_environment(), false);
 
         assert_eq!(
             names,
@@ -6345,7 +6344,7 @@ mod tests {
     #[test]
     fn advertised_names_respect_hidden_local_search_binding() {
         let base = serde_json::json!([]);
-        assert!(advertised_tool_names(&base, &deferred_code_map(), true).is_empty());
+        assert!(advertised_tool_names(&base, &deferred_execution_environment(), true).is_empty());
     }
 
     const WORKFLOW_NAME: &str = "echo";

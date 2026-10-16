@@ -272,7 +272,7 @@ mod tests {
 
     use super::{Fences, headings, plain_inline, without_comments};
 
-    #[test_case("`code_map` <span class=\"badge\">on demand</span>", "code_map on demand" ; "code and html")]
+    #[test_case("`python_execution` <span class=\"badge\">on demand</span>", "python_execution on demand" ; "code and html")]
     #[test_case("See [Permissions](/docs/permissions/#modes).", "See Permissions." ; "link keeps its label")]
     #[test_case("**What changed:** a lot", "What changed: a lot" ; "strong emphasis")]
     #[test_case("one<br>two<br/>three", "one two three" ; "line breaks")]
@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn headings_take_explicit_ids_and_number_repeats() {
-        let body = "# Title\n\n## Labels\n\n## Labels\n\n### `code_map` <span class=\"badge\">x</span> {#code_map}\n";
+        let body = "# Title\n\n## Labels\n\n## Labels\n\n### `python_execution` <span class=\"badge\">x</span> {#python_execution}\n";
         let headings = headings(body);
         let anchors: Vec<(u8, &str, &str)> = headings
             .iter()
@@ -327,7 +327,7 @@ mod tests {
                 (1, "Title", "title"),
                 (2, "Labels", "labels"),
                 (2, "Labels", "labels-1"),
-                (3, "code_map x", "code_map"),
+                (3, "python_execution x", "python_execution"),
             ]
         );
     }

@@ -498,6 +498,11 @@ pub struct BatchToolEntry {
     /// batch's result, so a restored row never needs it.
     #[serde(skip)]
     pub refused: bool,
+    /// The child's own accounting, from its done event, so `/tools` counts
+    /// each child as the call it was rather than folding it into the batch.
+    /// Host-only like `refused`; a child that never answered carries none.
+    #[serde(skip)]
+    pub accounting: ToolAccounting,
 }
 
 /// One child of a running batch changing state. Only the child that moved is
@@ -721,7 +726,7 @@ pub struct IndexDirectoryEntry {
 /// reporting a zero it did not compute. Every count is a floor: edges are
 /// recovered from source text by name, so dynamic dispatch and macros
 /// contribute none.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeGraphRow {
     pub name: String,
     pub kind: String,
@@ -736,6 +741,15 @@ pub struct CodeGraphRow {
     pub hops: Option<usize>,
     #[serde(default)]
     pub test_scope: bool,
+    /// Call-site lines, a bare number when the site is in the row's home file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sites: Vec<String>,
+    /// Call sites the per-row cap left out of `sites`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub sites_withheld: usize,
+    /// Linked by name alone, so the call may mean another symbol of that name.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub name_only: bool,
 }
 
 impl CodeGraphRow {
@@ -752,11 +766,24 @@ impl CodeGraphRow {
         if let (Some(inbound), Some(outbound)) = (self.inbound, self.outbound) {
             line.push_str(&format!(" in={inbound} out={outbound}"));
         }
+        if !self.sites.is_empty() {
+            line.push_str(&format!(" at={}", self.sites.join(",")));
+        }
+        if self.sites_withheld > 0 {
+            line.push_str(&format!(" +{} more", self.sites_withheld));
+        }
+        if self.name_only {
+            line.push_str(" ~name");
+        }
         if self.test_scope {
             line.push_str(" [test]");
         }
         line
     }
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// One labelled line of an environment card, e.g. `packages` / `apt 2.8.3`.
@@ -780,7 +807,7 @@ pub struct EnvironmentCommand {
     pub version: Option<String>,
 }
 
-/// The body `code_expand` returns alongside its neighbours.
+/// The symbol body a retired `code_expand` card carried, kept so stored sessions still render it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeGraphSource {
     pub path: String,
@@ -1958,12 +1985,13 @@ pub enum ToolOutput {
     /// A loaded skill, which the model reads numbered and a card draws as the
     /// document it is.
     Skill(SkillOutput),
-    /// A code-graph answer: a headline, ranked or reached rows, an optional
-    /// body, and the footer describing the graph they came from.
+    /// A code-graph answer: a headline, ranked or referencing rows, and the
+    /// footer describing the graph they came from. `source` is only set on
+    /// cards stored by the retired `code_expand`.
     ///
     /// `annotation` is supplied per call because the rows mean different things
-    /// per tool — callers, reached symbols, ranked symbols — and one derived
-    /// count would be wrong for four of the five.
+    /// per tool — ranked matches, callers, reached symbols — and one derived
+    /// count would be wrong for the others.
     CodeGraph {
         headline: String,
         rows: Vec<CodeGraphRow>,
@@ -3950,6 +3978,7 @@ mod tests {
                     annotation: None,
                     model_suffix: None,
                     refused: false,
+                    accounting: ToolAccounting::default(),
                 })
                 .collect(),
             text: String::new(),
@@ -5477,6 +5506,7 @@ mod tests {
             annotation: Some(result.annotation().unwrap()),
             model_suffix: None,
             refused: false,
+            accounting: ToolAccounting::default(),
         };
         assert_eq!(entry.plan_write_result(), expected.then_some(result));
     }

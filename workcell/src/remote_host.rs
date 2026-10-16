@@ -35,9 +35,7 @@ pub use workcell_host_contract::{
     WatchPollRequest,
 };
 use workcell_mcp_code::PreparedCode;
-use workcell_mcp_code_graph::{
-    PreparedCodeContext, PreparedCodeExpand, PreparedCodeImpact, PreparedCodeMap, PreparedCodeRefs,
-};
+use workcell_mcp_code_graph::{PreparedCodeContext, PreparedCodeRefs};
 use workcell_mcp_files::{
     PreparedFileEdit, PreparedFileGlob, PreparedFileGrep, PreparedFileIndex, PreparedFilePatch,
     PreparedFileRead, PreparedFileWrite, PreparedWorkspaceMutation, WorkspaceWatchBatch,
@@ -124,11 +122,8 @@ pub(crate) enum PreparedRemoteOperation {
     FileEdit(PreparedFileEdit),
     FileApplyPatch(PreparedFilePatch),
     FileIndex(PreparedFileIndex),
-    CodeMap(PreparedCodeMap),
     CodeContext(PreparedCodeContext),
     CodeRefs(PreparedCodeRefs),
-    CodeImpact(PreparedCodeImpact),
-    CodeExpand(PreparedCodeExpand),
     Websearch(PreparedWebsearchOperation),
     Webfetch(PreparedWebfetchOperation),
     Shell {
@@ -162,11 +157,8 @@ impl PreparedRemoteOperation {
                 | "file_edit"
                 | "file_apply_patch"
                 | "file_index"
-                | "code_map"
                 | "code_context"
                 | "code_refs"
-                | "code_impact"
-                | "code_expand"
                 | "websearch"
                 | "webfetch"
                 | "shell"
@@ -185,11 +177,8 @@ impl PreparedRemoteOperation {
             Self::FileEdit(prepared) => prepared.retained_bytes(),
             Self::FileApplyPatch(prepared) => prepared.retained_bytes(),
             Self::FileIndex(prepared) => prepared.retained_bytes(),
-            Self::CodeMap(prepared) => prepared.retained_bytes(),
             Self::CodeContext(prepared) => prepared.retained_bytes(),
             Self::CodeRefs(prepared) => prepared.retained_bytes(),
-            Self::CodeImpact(prepared) => prepared.retained_bytes(),
-            Self::CodeExpand(prepared) => prepared.retained_bytes(),
             Self::Websearch(prepared) => prepared.retained_bytes(),
             Self::Webfetch(prepared) => prepared.retained_bytes(),
             Self::Shell {

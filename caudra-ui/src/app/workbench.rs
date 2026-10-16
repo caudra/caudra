@@ -1410,6 +1410,7 @@ mod tests {
             annotation: None,
             model_suffix: None,
             refused: false,
+            accounting: Default::default(),
         };
         let earlier = entry(EARLIER_PLAN);
         let later = entry(REWRITTEN_PLAN);

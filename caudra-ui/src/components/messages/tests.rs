@@ -878,7 +878,7 @@ const COMMIT_MARKED_GLYPHS: &str = "a hovered commit repainted the message aroun
 /// a card built on it answers the view mode rather than the reader's collapse
 /// list. It shares `file_grep`'s row budget, so a test that moved off grep to
 /// keep testing disclosure rests at the same number of rows it always did.
-const CODE_MAP_TOOL_NAME: &str = "code_map";
+const CODE_REFS_TOOL_NAME: &str = "code_refs";
 const TOOL_ID: &str = "t1";
 const WORKFLOW_TOOL_ID: &str = "workflow:run-1";
 const WORKFLOW_RUN_ID: &str = "run-1";
@@ -985,7 +985,7 @@ fn effect_of(tool: &str) -> ToolEffect {
         | FILE_GREP_TOOL_NAME
         | FILE_GLOB_TOOL_NAME
         | FILE_INDEX_TOOL_NAME
-        | CODE_MAP_TOOL_NAME
+        | CODE_REFS_TOOL_NAME
         | VIEW_IMAGE_TOOL_NAME
         | TOOL_OUTPUT_TOOL_NAME => ToolEffect::ReadOnly,
         BATCH_TOOL_NAME | TASK_TOOL_NAME => ToolEffect::Orchestrator,
@@ -3377,11 +3377,11 @@ fn collapsed_tool_copies_only_its_visible_header() {
 
 #[test]
 fn open_tool_copies_its_visible_body() {
-    let mut panel = panel_with_copyable_tool(CODE_MAP_TOOL_NAME, ViewMode::Expanded);
+    let mut panel = panel_with_copyable_tool(CODE_REFS_TOOL_NAME, ViewMode::Expanded);
 
     let copied = extract_entire_document(&mut panel);
 
-    assert!(copied.contains("## Tool: `code_map`"), "{copied}");
+    assert!(copied.contains("## Tool: `code_refs`"), "{copied}");
     assert!(copied.contains("Status: success | View: open"), "{copied}");
     assert!(copied.contains("hidden tool output"), "{copied}");
 }
@@ -3567,7 +3567,7 @@ fn title_only_open_streaming_thinking_still_copies_its_header() {
 
 #[test]
 fn cross_message_copy_does_not_restore_truncated_tool_output() {
-    let mut panel = panel_with_long_tool(CODE_MAP_TOOL_NAME, 200);
+    let mut panel = panel_with_long_tool(CODE_REFS_TOOL_NAME, 200);
     panel.set_view(ViewMode::Expanded);
     render(&mut panel, 80, 24);
     panel.push(DisplayMessage::new(
@@ -3577,7 +3577,7 @@ fn cross_message_copy_does_not_restore_truncated_tool_output() {
 
     let copied = extract_entire_document(&mut panel);
 
-    assert!(copied.contains("## Tool: `code_map`"), "{copied}");
+    assert!(copied.contains("## Tool: `code_refs`"), "{copied}");
     assert!(copied.contains("line 0"), "{copied}");
     assert!(!copied.contains("line 50"), "{copied}");
 }
@@ -3779,7 +3779,7 @@ fn panel_with_long_tool(tool: &'static str, line_count: usize) -> MessagesPanel 
 
 #[test]
 fn toggle_expand_collapse_truncated_tool() {
-    let mut panel = panel_with_long_tool(CODE_MAP_TOOL_NAME, 200);
+    let mut panel = panel_with_long_tool(CODE_REFS_TOOL_NAME, 200);
     panel.set_view(ViewMode::Expanded);
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
@@ -3937,7 +3937,7 @@ fn shell_live_output_uses_the_larger_running_budget_and_survives_completion() {
 
 #[test]
 fn native_tool_hover_reverses_only_the_expand_affordance_without_mutating_cache() {
-    let mut panel = panel_with_long_tool(CODE_MAP_TOOL_NAME, 200);
+    let mut panel = panel_with_long_tool(CODE_REFS_TOOL_NAME, 200);
     let area = Rect::new(0, 0, 80, 24);
     let source = panel.messages[0].text.clone();
     let cached = panel.cache.find_by_tool_id("t1").and_then(|index| {
@@ -3978,9 +3978,9 @@ fn native_tool_hover_reverses_only_the_expand_affordance_without_mutating_cache(
 #[test]
 fn expanded_native_tool_hover_accents_header_and_rail_not_body() {
     const HEIGHT: u16 = 240;
-    const MAP_LABEL: &str = "Mapped";
+    const TRACE_LABEL: &str = "Traced";
 
-    let mut panel = panel_with_long_tool(CODE_MAP_TOOL_NAME, 200);
+    let mut panel = panel_with_long_tool(CODE_REFS_TOOL_NAME, 200);
     panel.set_view(ViewMode::Expanded);
     let area = Rect::new(0, 0, 80, HEIGHT);
     render(&mut panel, area.width, area.height);
@@ -3991,7 +3991,7 @@ fn expanded_native_tool_hover_accents_header_and_rail_not_body() {
     let terminal = render(&mut panel, area.width, area.height);
     let buffer = terminal.backend().buffer();
     let rail = buffer.cell((area.x, area.y)).unwrap().style();
-    let header = style_of(&terminal, MAP_LABEL);
+    let header = style_of(&terminal, TRACE_LABEL);
 
     assert_eq!(header.fg, rail.fg, "header and rail share the hover accent");
     assert!(
@@ -4235,14 +4235,13 @@ fn panel_with_map_tool(row_count: usize) -> MessagesPanel {
             line_end: i + 1,
             inbound: Some(i),
             outbound: Some(1),
-            hops: None,
-            test_scope: false,
+            ..CodeGraphRow::default()
         })
         .collect();
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_start(start("t1", CODE_MAP_TOOL_NAME));
+    panel.tool_start(start("t1", CODE_REFS_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
-        tool: CODE_MAP_TOOL_NAME.into(),
+        tool: CODE_REFS_TOOL_NAME.into(),
         output: ToolOutput::CodeGraph {
             headline: HEADLINE.into(),
             rows,
@@ -4259,6 +4258,52 @@ fn panel_with_map_tool(row_count: usize) -> MessagesPanel {
 /// A structured body discloses through the same cycle a plain one does, so the
 /// card cannot grow a second way to be opened out of the renderer it happens
 /// to use.
+#[test]
+fn a_stored_call_to_a_retired_code_tool_still_renders() {
+    const RETIRED_TOOL: &str = "code_expand";
+    const BODY_LINE: &str = "fn alpha() {}";
+    const NEIGHBOUR: &str = "beta";
+
+    let stored = serde_json::json!({
+        "CodeGraph": {
+            "headline": "alpha function src/lib.rs:1-1",
+            "rows": [{
+                "name": NEIGHBOUR,
+                "kind": "function",
+                "path": "src/lib.rs",
+                "line_start": 3,
+                "line_end": 4,
+                "inbound": 1
+            }],
+            "source": {
+                "path": "src/lib.rs",
+                "kind": "function",
+                "line_start": 1,
+                "lines": [BODY_LINE]
+            },
+            "footer": "[1 files]"
+        }
+    });
+    let output: ToolOutput = serde_json::from_value(stored).expect("a stored card deserializes");
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(ViewMode::Expanded);
+    panel.tool_start(start("t1", RETIRED_TOOL));
+    panel.tool_done(ToolDoneEvent {
+        tool: RETIRED_TOOL.into(),
+        output,
+        ..done("t1")
+    });
+
+    let text = buffer_text(&render(&mut panel, 80, 24));
+    assert!(text.contains(RETIRED_TOOL), "{text}");
+    assert!(text.contains(NEIGHBOUR), "{text}");
+
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.toggle_expansion_at(area.y, area));
+    let opened = buffer_text(&render(&mut panel, 80, 24));
+    assert!(opened.contains(BODY_LINE), "{opened}");
+}
+
 #[test]
 fn toggle_expand_collapse_map_tool() {
     let mut panel = panel_with_map_tool(8);
@@ -7060,7 +7105,7 @@ fn a_dense_call_keeps_the_card_background(view: ViewMode) {
 fn an_expanded_one_line_call_stays_flat() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.set_view(ViewMode::Expanded);
-    panel.tool_start(call_with_summary("t1", CODE_MAP_TOOL_NAME));
+    panel.tool_start(call_with_summary("t1", CODE_REFS_TOOL_NAME));
     let terminal = render(&mut panel, WIDE_ENOUGH_TO_NOT_WRAP, 24);
 
     assert_eq!(
@@ -7140,10 +7185,10 @@ fn a_wrapped_row_takes_air_from_the_rows_around_it(view: ViewMode) {
 /// not run into the dense rows above it.
 #[test]
 fn the_card_auto_opens_separates_from_the_list_above_it() {
-    let mut panel = panel_with_tools(&[("t1", CODE_MAP_TOOL_NAME)]);
+    let mut panel = panel_with_tools(&[("t1", CODE_REFS_TOOL_NAME)]);
     panel.set_view(ViewMode::Auto);
     panel.tool_done(done("t1"));
-    panel.tool_start(start("t2", CODE_MAP_TOOL_NAME));
+    panel.tool_start(start("t2", CODE_REFS_TOOL_NAME));
     panel.tool_done(long_done("t2", HELD_BODY_LINES));
     render(&mut panel, WIDE_ENOUGH_TO_NOT_WRAP, 24);
 
@@ -7461,7 +7506,7 @@ fn a_truncated_compact_row_cycles_back_to_its_header() {
 
 #[test]
 fn an_expanded_row_stays_put_when_it_has_nothing_left_to_open() {
-    let mut panel = compact_panel(&[("t1", CODE_MAP_TOOL_NAME)]);
+    let mut panel = compact_panel(&[("t1", CODE_REFS_TOOL_NAME)]);
     panel.set_view(ViewMode::Expanded);
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
@@ -7768,9 +7813,9 @@ fn live_thinking_duration_always_keeps_tenths(duration: Duration, expected: &str
 fn expanded_density_keeps_the_sigil_and_the_card() {
     // The spinner's slot is held blank once the call lands, so the sigil sits
     // in the column it occupied while the call ran.
-    const CARD_HEADER: &str = "  ◇ Mapped ";
+    const CARD_HEADER: &str = "  ◇ Traced ";
 
-    let mut panel = panel_with_tools(&[("t1", CODE_MAP_TOOL_NAME)]);
+    let mut panel = panel_with_tools(&[("t1", CODE_REFS_TOOL_NAME)]);
     panel.set_view(ViewMode::Expanded);
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
@@ -7804,9 +7849,9 @@ fn mode_panel(view: ViewMode, ids: &[(&str, &'static str)]) -> MessagesPanel {
 /// call that wrote something keeps its body, or the transcript stops showing
 /// what happened to the workspace. Compact is the one mode that answers for
 /// every tool, because a list with the writes still drawn is not a list.
-#[test_case(ViewMode::Expanded, CODE_MAP_TOOL_NAME, true; "expanded opens a map")]
-#[test_case(ViewMode::Compact, CODE_MAP_TOOL_NAME, false; "compact closes a map")]
-#[test_case(ViewMode::Auto, CODE_MAP_TOOL_NAME, true; "auto opens the newest map")]
+#[test_case(ViewMode::Expanded, CODE_REFS_TOOL_NAME, true; "expanded opens a trace")]
+#[test_case(ViewMode::Compact, CODE_REFS_TOOL_NAME, false; "compact closes a trace")]
+#[test_case(ViewMode::Auto, CODE_REFS_TOOL_NAME, true; "auto opens the newest trace")]
 #[test_case(ViewMode::Expanded, FILE_WRITE_TOOL_NAME, true; "expanded opens a write")]
 #[test_case(ViewMode::Compact, FILE_WRITE_TOOL_NAME, false; "compact closes a write too")]
 #[test_case(ViewMode::Auto, FILE_WRITE_TOOL_NAME, true; "auto still opens a write")]
@@ -7902,7 +7947,7 @@ fn an_mcp_card_rests_whole(view: ViewMode, whole: bool) {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.set_view(view);
     mcp_call(&mut panel, TOOL_ID, None);
-    panel.tool_start(start(LATER_TOOL_ID, CODE_MAP_TOOL_NAME));
+    panel.tool_start(start(LATER_TOOL_ID, CODE_REFS_TOOL_NAME));
     panel.tool_done(done(LATER_TOOL_ID));
     rebuild(&mut panel);
 
@@ -7947,7 +7992,7 @@ const COMPACT_KEEPS_BATCH_MSG: &str = "a folded batch says nothing at all, so it
 #[test_case(PYTHON_EXECUTION_TOOL_NAME, false ; "isolated")]
 #[test_case(TASK_TOOL_NAME, false ; "orchestrator")]
 #[test_case(UNCLASSIFIED_TOOL, false ; "unclassified")]
-#[test_case(CODE_MAP_TOOL_NAME, false ; "read only")]
+#[test_case(CODE_REFS_TOOL_NAME, false ; "read only")]
 #[test_case(BATCH_TOOL_NAME, true ; "a batch is the exception")]
 fn compact_folds_every_call_but_a_batch(tool: &'static str, open: bool) {
     let panel = mode_panel(ViewMode::Compact, &[("t1", tool)]);
@@ -7997,7 +8042,7 @@ fn one_click_opens_the_whole_body(view: ViewMode) {
 /// way back out of a full body is the resting budget.
 #[test]
 fn a_full_card_in_expanded_falls_back_to_the_budget() {
-    let mut panel = panel_with_tools(&[("t1", CODE_MAP_TOOL_NAME)]);
+    let mut panel = panel_with_tools(&[("t1", CODE_REFS_TOOL_NAME)]);
     panel.set_view(ViewMode::Expanded);
     panel.tool_done(long_done("t1", CLICKED_BODY_LINES));
     rebuild(&mut panel);
@@ -8069,10 +8114,10 @@ fn a_script_and_its_output_are_disclosed_together() {
 /// behind it fall back to a row without the reader touching anything.
 #[test]
 fn auto_opens_the_newest_read_and_closes_the_one_before_it() {
-    let mut panel = mode_panel(ViewMode::Auto, &[("t1", CODE_MAP_TOOL_NAME)]);
+    let mut panel = mode_panel(ViewMode::Auto, &[("t1", CODE_REFS_TOOL_NAME)]);
     assert!(!panel.card_closed("t1"), "{AUTO_TAIL_MSG}");
 
-    panel.tool_start(start("t2", CODE_MAP_TOOL_NAME));
+    panel.tool_start(start("t2", CODE_REFS_TOOL_NAME));
     panel.tool_done(done("t2"));
     rebuild(&mut panel);
 
@@ -8084,7 +8129,7 @@ fn auto_opens_the_newest_read_and_closes_the_one_before_it() {
 /// the thing being written and has no claim on staying open.
 #[test]
 fn auto_hands_the_newest_slot_to_the_reply_being_written() {
-    let mut panel = mode_panel(ViewMode::Auto, &[("t1", CODE_MAP_TOOL_NAME)]);
+    let mut panel = mode_panel(ViewMode::Auto, &[("t1", CODE_REFS_TOOL_NAME)]);
     assert!(!panel.card_closed("t1"), "{AUTO_TAIL_MSG}");
 
     panel.streaming_text.set_buffer("answering");
@@ -8176,6 +8221,7 @@ fn batch_child(tool: &str, marker: &str) -> caudra_agent::BatchToolEntry {
         )),
         annotation: None,
         refused: false,
+        accounting: Default::default(),
     }
 }
 
@@ -9276,7 +9322,7 @@ const SPACER_SETUP_MSG: &str = "the test must start from a card with a body to g
 const HELD_BODY_LINES: usize = 5;
 
 fn auto_panel_with_body(lines: usize) -> MessagesPanel {
-    let mut panel = panel_with_tools(&[("t1", CODE_MAP_TOOL_NAME)]);
+    let mut panel = panel_with_tools(&[("t1", CODE_REFS_TOOL_NAME)]);
     panel.set_view(ViewMode::Auto);
     panel.tool_done(long_done("t1", lines));
     rebuild(&mut panel);
@@ -9284,7 +9330,7 @@ fn auto_panel_with_body(lines: usize) -> MessagesPanel {
 }
 
 fn supersede(panel: &mut MessagesPanel) {
-    panel.tool_start(start("t2", CODE_MAP_TOOL_NAME));
+    panel.tool_start(start("t2", CODE_REFS_TOOL_NAME));
     panel.tool_done(done("t2"));
     rebuild(panel);
 }
@@ -9411,6 +9457,7 @@ fn pending_child(tool: &str) -> caudra_agent::BatchToolEntry {
         output: None,
         annotation: None,
         refused: false,
+        accounting: Default::default(),
     }
 }
 
@@ -9734,6 +9781,7 @@ fn eager_entry(status: BatchToolStatus) -> BatchToolEntry {
         output: Some(ToolOutput::Plain(EAGER_BODY.into())),
         annotation: Some(EAGER_ANNOTATION.into()),
         refused: false,
+        accounting: Default::default(),
     }
 }
 
@@ -11790,7 +11838,7 @@ const OFF_SCREEN_SUMMARY: &str = "ranked while nobody was looking";
 #[test]
 fn a_theme_change_still_flushes_an_off_screen_card() {
     theme::set(theme::load_by_name("dracula").unwrap());
-    let mut panel = panel_with_tools(&[(TOOL_ID, CODE_MAP_TOOL_NAME)]);
+    let mut panel = panel_with_tools(&[(TOOL_ID, CODE_REFS_TOOL_NAME)]);
     for row in 0..OFF_SCREEN_FILLER {
         panel.push(DisplayMessage::new(
             DisplayRole::Assistant,

@@ -7,14 +7,11 @@
 //! sessions never call it. MCP tools never pass through here; the `mcp` tool
 //! reaches them without declaring any.
 //!
-//! Deferring costs a prompt-cache prefix each time something loads, so tools
-//! that are one mode of work carry a group and load together. The code graph
-//! is five tools and one decision.
-//!
-//! That prefix is also why deferral is per model rather than global. A small
-//! model gains from the shorter array and rebuilds its prefix cheaply; a known
-//! non-small one would spend a large prefix to load what it was going to reach
-//! for anyway. [`BuiltinDeferral`] is that decision, taken once per definitions
+//! Each search loads one tool, and every load costs a prompt-cache prefix,
+//! which is why deferral is per model rather than global. A small model gains
+//! from the shorter array and rebuilds its prefix cheaply; a known non-small
+//! one would spend a large prefix to load what it was going to reach for
+//! anyway. [`BuiltinDeferral`] is that decision, taken once per definitions
 //! build and carried as a value, because reading it is a `providers.toml` parse
 //! ([`Model::class_of`]) and the tool report asks per registry entry.
 
@@ -238,7 +235,7 @@ impl BuiltinDeferral {
 pub fn deferred_names(allowed_tools: &[String], deferral: BuiltinDeferral) -> Vec<&'static str> {
     caudra_config::DEFERRED_BUILTIN_TOOLS
         .iter()
-        .map(|deferred| deferred.name)
+        .copied()
         .filter(|name| is_deferred(name, allowed_tools, deferral))
         .collect()
 }
@@ -253,28 +250,18 @@ pub fn is_deferred(name: &str, allowed_tools: &[String], deferral: BuiltinDeferr
 #[derive(Clone, Debug)]
 pub struct DeferredTool {
     pub name: Arc<str>,
-    /// Tools sharing a group load together, so one search buys the whole
-    /// mode of work and one cache miss instead of one per tool.
-    pub group: Option<&'static str>,
     pub definition: Value,
     haystack: String,
 }
 
 impl DeferredTool {
-    pub fn new(name: &str, group: Option<&'static str>, definition: Value) -> Self {
+    pub fn new(name: &str, definition: Value) -> Self {
         let haystack = haystack(&definition);
         Self {
             name: Arc::from(name),
-            group,
             definition,
             haystack,
         }
-    }
-
-    /// Members of the same group, plus the tool itself. An ungrouped tool
-    /// loads alone.
-    fn loads_with(&self, other: &Self) -> bool {
-        self.name == other.name || self.group.is_some_and(|group| other.group == Some(group))
     }
 }
 
@@ -395,12 +382,12 @@ impl DeferralSession {
         let Some(hit) = self.deferred.iter().find(|tool| tool.name.as_ref() == name) else {
             return Vec::new();
         };
-        self.load_group(&mut self.lock_loaded(), hit)
+        load(&mut self.lock_loaded(), hit)
     }
 
-    /// Ranks the deferred tools against `query` and loads every member of the
-    /// best match's group. Exact names win over keyword hits, and a name hit
-    /// outranks a description hit.
+    /// Ranks the deferred tools against `query` and loads the best match.
+    /// Exact names win over keyword hits, and a name hit outranks a
+    /// description hit.
     pub fn search(&self, query: &str) -> Result<SearchOutcome, String> {
         let matches = self.search_matches(query)?;
         Ok(self.load_search_match(query, &matches, None))
@@ -485,17 +472,12 @@ impl DeferralSession {
         ranking: Option<ToolSearchRanking>,
     ) -> SearchOutcome {
         let mut guard = self.lock_loaded();
-        let unloaded_group = |index: usize, loaded: &HashSet<Arc<str>>| -> Vec<Arc<str>> {
+        let unloaded = |index: usize, loaded: &HashSet<Arc<str>>| -> Vec<Arc<str>> {
             matches
                 .get(index)
+                .filter(|(_, _, hit)| !loaded.contains(&hit.name))
+                .map(|(_, _, hit)| Arc::clone(&hit.name))
                 .into_iter()
-                .flat_map(|(_, _, hit)| {
-                    self.deferred
-                        .iter()
-                        .filter(move |tool| hit.loads_with(tool))
-                })
-                .filter(|tool| !loaded.contains(&tool.name))
-                .map(|tool| Arc::clone(&tool.name))
                 .collect()
         };
         let top = ranking
@@ -504,14 +486,14 @@ impl DeferralSession {
             .unwrap_or_default();
         let compared = ranking
             .as_ref()
-            .map(|_| (unloaded_group(top, &guard), unloaded_group(0, &guard)));
+            .map(|_| (unloaded(top, &guard), unloaded(0, &guard)));
         let chosen = match ranking.as_ref().is_some_and(ToolSearchRanking::applied) {
             true => top,
             false => 0,
         };
         let loaded: Vec<Arc<str>> = matches
             .get(chosen)
-            .map(|(_, _, hit)| self.load_group(&mut guard, hit))
+            .map(|(_, _, hit)| load(&mut guard, hit))
             .unwrap_or_default();
         drop(guard);
 
@@ -524,17 +506,6 @@ impl DeferralSession {
             loaded,
             note,
         }
-    }
-
-    /// Loading is per group, so the returned list is what the array gains,
-    /// never a tool that was already declared.
-    fn load_group(&self, loaded: &mut HashSet<Arc<str>>, hit: &DeferredTool) -> Vec<Arc<str>> {
-        self.deferred
-            .iter()
-            .filter(|tool| hit.loads_with(tool))
-            .filter(|tool| loaded.insert(Arc::clone(&tool.name)))
-            .map(|tool| Arc::clone(&tool.name))
-            .collect()
     }
 
     fn lock_loaded(&self) -> MutexGuard<'_, HashSet<Arc<str>>> {
@@ -633,9 +604,8 @@ fn catalog_definition(listing: &str) -> Value {
         "description": format!(
             "Load a tool that is not declared yet; it becomes callable from your \
              next message on. Keywords match tool names and descriptions, and an \
-             exact name always wins. Related tools load together, and every load \
-             resets the prompt cache, so search once for the work you are about \
-             to do rather than tool by tool.\n{listing}"
+             exact name always wins. Every load resets the prompt cache, so load \
+             a tool only when the work at hand needs it.\n{listing}"
         ),
         "input_schema": {
             "type": "object",
@@ -648,6 +618,15 @@ fn catalog_definition(listing: &str) -> Value {
             "required": ["query"]
         }
     })
+}
+
+/// What the array gains: the tool, or nothing when it was already declared.
+fn load(loaded: &mut HashSet<Arc<str>>, hit: &DeferredTool) -> Vec<Arc<str>> {
+    loaded
+        .insert(Arc::clone(&hit.name))
+        .then(|| Arc::clone(&hit.name))
+        .into_iter()
+        .collect()
 }
 
 fn describe(loaded: &[Arc<str>], query: &str) -> String {
@@ -665,29 +644,12 @@ fn describe(loaded: &[Arc<str>], query: &str) -> String {
     out
 }
 
-/// One line per load: a group names its members, an ungrouped tool carries
-/// the sentence its own description opens with. A group is a mode of work
-/// rather than a capability, and summarising its members separately would
-/// invite loading them one at a time, which is what the group exists to stop.
+/// One line per tool, carrying the sentence its own description opens with.
 fn catalog_listing(pending: &[&DeferredTool]) -> String {
-    let mut listing = String::new();
-    let mut listed: Vec<&str> = Vec::new();
-    for tool in pending {
-        match tool.group {
-            Some(group) if listed.contains(&group) => continue,
-            Some(group) => {
-                listed.push(group);
-                let members: Vec<&str> = pending
-                    .iter()
-                    .filter(|other| other.group == Some(group))
-                    .map(|other| other.name.as_ref())
-                    .collect();
-                listing.push_str(&format!("\n- {group}: {}", members.join(", ")));
-            }
-            None => listing.push_str(&format!("\n- {}: {}", tool.name, summary(&tool.definition))),
-        }
-    }
-    listing
+    pending
+        .iter()
+        .map(|tool| format!("\n- {}: {}", tool.name, summary(&tool.definition)))
+        .collect()
 }
 
 /// The first sentence of a description, derived rather than authored so the
@@ -750,13 +712,13 @@ pub(crate) mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
-    const GRAPH: &str = "code_graph";
-    const MAP: &str = "code_map";
-    const REFS: &str = "code_refs";
+    const AUTOMATION: &str = "automation";
+    const PYTHON: &str = "python_execution";
     const LONELY: &str = "execution_environment";
-    const MAP_DESCRIPTION: &str = "Rank every symbol in a source tree";
-    const REFS_DESCRIPTION: &str = "List the symbols that reference one";
+    const AUTOMATION_DESCRIPTION: &str = "Run a script when a session event fires";
+    const PYTHON_DESCRIPTION: &str = "Execute a short Python script";
     const LONELY_DESCRIPTION: &str = "Inspect the execution host";
+    const SCRIPT_QUERY: &str = "script";
     const FIRST_SENTENCE: &str = "Inspect the execution host's environment.";
     const SECOND_SENTENCE: &str = "Each call collects a fresh snapshot.";
     const TWO_SENTENCES: &str =
@@ -765,7 +727,6 @@ pub(crate) mod tests {
     const BEST_SPEC: &str = "anthropic/claude-opus-4-8";
     const NON_SMALL_SPEC: &str = "anthropic/claude-sonnet-4-6";
     const FAST_SPEC: &str = "anthropic/claude-haiku-4-5";
-    const DEFERRABLE: &str = "code_map";
     const SEARCH_SECRET: &str = "never-send-this-search-secret";
     const SEARCH_QUERY: &str = "inspect";
     const CANDIDATE_ID_PREFIX: &str = "c";
@@ -784,13 +745,12 @@ pub(crate) mod tests {
     const TEST_TIMEOUT_MS: u64 = 5_000;
     const EFFECT_TIMEOUT: Duration = Duration::from_secs(5);
     const SEARCH_REDACTED: &str = "[redacted]";
-    const RANKED_SUMMARY: &str = "loaded execution_environment instead of code_map, code_refs";
-    const SHADOW_RANKED_SUMMARY: &str =
-        "would have loaded execution_environment instead of code_map, code_refs";
+    const RANKED_SUMMARY: &str = "loaded python_execution instead of automation";
+    const SHADOW_RANKED_SUMMARY: &str = "would have loaded python_execution instead of automation";
     const RANKED_DETAILS: [&str; 3] = [
-        "1.00  execution_environment  moved 3rd to 1st",
-        "0.00  code_map  moved 1st to 2nd",
-        "0.00  code_refs  moved 2nd to 3rd",
+        "1.00  python_execution  moved 3rd to 1st",
+        "0.00  automation  moved 1st to 2nd",
+        "0.00  execution_environment  moved 2nd to 3rd",
     ];
     const WORKFLOWS_ON: FeatureFlags = FeatureFlags::NONE.with(Feature::Workflows);
 
@@ -903,9 +863,9 @@ pub(crate) mod tests {
     fn ranked_session() -> DeferralSession {
         DeferralSession::new(
             vec![
-                tool(MAP, Some(GRAPH), SEARCH_QUERY),
-                tool(REFS, Some(GRAPH), SEARCH_QUERY),
-                tool(LONELY, None, SEARCH_QUERY),
+                tool(AUTOMATION, SEARCH_QUERY),
+                tool(LONELY, SEARCH_QUERY),
+                tool(PYTHON, SEARCH_QUERY),
             ],
             std::iter::empty(),
         )
@@ -937,7 +897,7 @@ pub(crate) mod tests {
         assert!(session.lock_loaded().is_empty());
         assert_eq!(
             session.search(SEARCH_QUERY).unwrap().loaded,
-            [Arc::<str>::from(MAP), Arc::<str>::from(REFS)]
+            [Arc::<str>::from(AUTOMATION)]
         );
     }
 
@@ -961,9 +921,8 @@ pub(crate) mod tests {
     }
 
     #[test_case(FIRST_CANDIDATE, false, false; "lexical_choice")]
-    #[test_case(SECOND_CANDIDATE, false, false; "same_group")]
-    #[test_case(THIRD_CANDIDATE, false, true; "different_group")]
-    #[test_case(THIRD_CANDIDATE, true, false; "selected_group_already_loaded_at_commit")]
+    #[test_case(THIRD_CANDIDATE, false, true; "different_tool")]
+    #[test_case(THIRD_CANDIDATE, true, false; "selected_tool_already_loaded_at_commit")]
     #[test_case(NO_CANDIDATE, false, false; "nothing_relevant_falls_back")]
     fn builtin_commit_accounts_only_changed_new_loads(
         favoured: &str,
@@ -981,22 +940,19 @@ pub(crate) mod tests {
         .unwrap();
         assert!(session.lock_loaded().is_empty());
         if preload {
-            session.mark_loaded(LONELY);
-            lexical.mark_loaded(LONELY);
+            session.mark_loaded(PYTHON);
+            lexical.mark_loaded(PYTHON);
         }
         let baseline = lexical.search(SEARCH_QUERY).unwrap();
         let outcome = prepared.commit().unwrap();
         assert_eq!(outcome.rerouted_from(&baseline.loaded), rerouted);
-        if favoured == SECOND_CANDIDATE {
-            assert_eq!(outcome.loaded, baseline.loaded);
-        }
         if preload {
             assert!(outcome.loaded.is_empty());
         }
     }
 
     #[test]
-    fn rerouted_is_recorded_when_another_group_loads() {
+    fn rerouted_is_recorded_when_another_tool_loads() {
         let fixture = SearchDecisions::scored(
             FeatureMode::Enforce,
             &[(THIRD_CANDIDATE, RELEVANT)],
@@ -1004,7 +960,7 @@ pub(crate) mod tests {
             true,
         );
         let outcome = ranked_search(&ranked_session(), &fixture.decisions);
-        assert_eq!(outcome.loaded, [Arc::<str>::from(LONELY)]);
+        assert_eq!(outcome.loaded, [Arc::<str>::from(PYTHON)]);
         let log = DecisionLog::open_read_only(&StateDir::from_path(fixture.root.path().into()))
             .unwrap()
             .unwrap();
@@ -1026,10 +982,10 @@ pub(crate) mod tests {
         });
     }
 
-    #[test_case(FeatureMode::Enforce, THIRD_CANDIDATE, RELEVANT, true; "ranked_group")]
+    #[test_case(FeatureMode::Enforce, THIRD_CANDIDATE, RELEVANT, true; "ranked_tool")]
     #[test_case(FeatureMode::Enforce, THIRD_CANDIDATE, TEST_FLOOR, true; "floor_inclusive")]
     #[test_case(FeatureMode::Enforce, THIRD_CANDIDATE, BELOW_FLOOR, false; "below_floor")]
-    #[test_case(FeatureMode::Shadow, THIRD_CANDIDATE, RELEVANT, false; "shadow_preserves_lexical_group")]
+    #[test_case(FeatureMode::Shadow, THIRD_CANDIDATE, RELEVANT, false; "shadow_preserves_lexical_choice")]
     #[test_case(FeatureMode::Off, THIRD_CANDIDATE, RELEVANT, false; "off")]
     #[test_case(FeatureMode::Enforce, NO_CANDIDATE, RELEVANT, false; "nothing_relevant")]
     #[test_case(FeatureMode::Enforce, UNREACHABLE_REPLY, RELEVANT, false; "unreachable")]
@@ -1041,11 +997,7 @@ pub(crate) mod tests {
     ) {
         let fixture = SearchDecisions::new(mode.clone(), favoured, score);
         let outcome = ranked_search(&ranked_session(), &fixture.decisions);
-        let expected: Vec<Arc<str>> = if ranked {
-            vec![LONELY.into()]
-        } else {
-            vec![MAP.into(), REFS.into()]
-        };
+        let expected: Vec<Arc<str>> = vec![if ranked { PYTHON } else { AUTOMATION }.into()];
         assert_eq!(outcome.loaded, expected);
         assert_eq!(
             fixture.requests.lock().unwrap().len(),
@@ -1053,17 +1005,17 @@ pub(crate) mod tests {
         );
     }
 
-    #[test_case(FeatureMode::Enforce, NoteOutcome::Acted, RANKED_SUMMARY, &[LONELY]; "acted")]
-    #[test_case(FeatureMode::Shadow, NoteOutcome::Shadow, SHADOW_RANKED_SUMMARY, &[MAP, REFS]; "shadow_loads_the_keyword_group")]
+    #[test_case(FeatureMode::Enforce, NoteOutcome::Acted, RANKED_SUMMARY, PYTHON; "acted")]
+    #[test_case(FeatureMode::Shadow, NoteOutcome::Shadow, SHADOW_RANKED_SUMMARY, AUTOMATION; "shadow_loads_the_keyword_match")]
     fn a_rerouted_search_names_what_it_loaded_instead(
         mode: FeatureMode,
         outcome: NoteOutcome,
         summary: &str,
-        loaded: &[&str],
+        loaded: &str,
     ) {
         let fixture = SearchDecisions::new(mode, THIRD_CANDIDATE, RELEVANT);
         let searched = ranked_search(&ranked_session(), &fixture.decisions);
-        let expected: Vec<Arc<str>> = loaded.iter().map(|name| Arc::from(*name)).collect();
+        let expected: Vec<Arc<str>> = vec![Arc::from(loaded)];
         assert_eq!(searched.loaded, expected);
         assert_eq!(searched.message, describe(&expected, SEARCH_QUERY));
         let note = searched.note.unwrap();
@@ -1073,7 +1025,6 @@ pub(crate) mod tests {
     }
 
     #[test_case(FIRST_CANDIDATE; "lexical_choice")]
-    #[test_case(SECOND_CANDIDATE; "same_group")]
     #[test_case(NO_CANDIDATE; "nothing_relevant")]
     fn an_unchanged_search_has_no_row(favoured: &str) {
         let fixture = SearchDecisions::new(FeatureMode::Enforce, favoured, RELEVANT);
@@ -1103,15 +1054,15 @@ pub(crate) mod tests {
         );
     }
 
-    #[test_case(&[(FIRST_CANDIDATE, LESS_RELEVANT), (THIRD_CANDIDATE, MORE_RELEVANT)], LONELY; "more_relevant_outranks_the_lexical_head")]
-    #[test_case(&[(FIRST_CANDIDATE, MORE_RELEVANT), (THIRD_CANDIDATE, LESS_RELEVANT)], MAP; "lexical_head_keeps_a_higher_score")]
+    #[test_case(&[(FIRST_CANDIDATE, LESS_RELEVANT), (THIRD_CANDIDATE, MORE_RELEVANT)], PYTHON; "more_relevant_outranks_the_lexical_head")]
+    #[test_case(&[(FIRST_CANDIDATE, MORE_RELEVANT), (THIRD_CANDIDATE, LESS_RELEVANT)], AUTOMATION; "lexical_head_keeps_a_higher_score")]
     fn the_most_relevant_candidate_loads(scores: &[(&str, f64)], first: &str) {
         let fixture = SearchDecisions::scored(FeatureMode::Enforce, scores, None, false);
         let outcome = ranked_search(&ranked_session(), &fixture.decisions);
         assert_eq!(outcome.loaded[0].as_ref(), first);
     }
 
-    #[test_case(" CODE_MAP ", true; "exact_case_insensitive")]
+    #[test_case(" PYTHON_EXECUTION ", true; "exact_case_insensitive")]
     #[test_case("not_found", false; "no_matches")]
     fn exact_or_missing_names_do_not_call_decisions(query: &str, exact: bool) {
         let fixture = SearchDecisions::new(FeatureMode::Enforce, SECOND_CANDIDATE, RELEVANT);
@@ -1152,10 +1103,7 @@ pub(crate) mod tests {
         let last = MAX_RERANK_BATCH - 1;
         let fixture = SearchDecisions::new(FeatureMode::Enforce, &candidate_id(last), RELEVANT);
         let session = DeferralSession::new(
-            names
-                .iter()
-                .map(|name| tool(name, None, SEARCH_QUERY))
-                .collect(),
+            names.iter().map(|name| tool(name, SEARCH_QUERY)).collect(),
             std::iter::empty(),
         );
         let outcome = ranked_search(&session, &fixture.decisions);
@@ -1181,8 +1129,8 @@ pub(crate) mod tests {
         let description = format!("{SEARCH_QUERY} token={SEARCH_SECRET}");
         let session = DeferralSession::new(
             vec![
-                tool(MAP, None, &description),
-                tool(&secret_name, None, &description),
+                tool(AUTOMATION, &description),
+                tool(&secret_name, &description),
             ],
             std::iter::empty(),
         );
@@ -1197,7 +1145,7 @@ pub(crate) mod tests {
         let expected = if secret_selected {
             secret_name.as_str()
         } else {
-            MAP
+            AUTOMATION
         };
         assert_eq!(outcome.loaded, vec![Arc::<str>::from(expected)]);
         let requests = fixture.requests.lock().unwrap();
@@ -1301,10 +1249,7 @@ pub(crate) mod tests {
             "x".repeat(MAX_CANDIDATE_INPUT_BYTES)
         );
         let session = DeferralSession::new(
-            vec![
-                tool(MAP, None, &description),
-                tool(LONELY, None, SEARCH_QUERY),
-            ],
+            vec![tool(AUTOMATION, &description), tool(LONELY, SEARCH_QUERY)],
             std::iter::empty(),
         );
         ranked_search(&session, &fixture.decisions);
@@ -1319,10 +1264,9 @@ pub(crate) mod tests {
         );
     }
 
-    fn tool(name: &str, group: Option<&'static str>, description: &str) -> DeferredTool {
+    fn tool(name: &str, description: &str) -> DeferredTool {
         DeferredTool::new(
             name,
-            group,
             json!({ "name": name, "description": description, "input_schema": {} }),
         )
     }
@@ -1330,9 +1274,9 @@ pub(crate) mod tests {
     fn session() -> DeferralSession {
         DeferralSession::new(
             vec![
-                tool(MAP, Some(GRAPH), MAP_DESCRIPTION),
-                tool(REFS, Some(GRAPH), REFS_DESCRIPTION),
-                tool(LONELY, None, LONELY_DESCRIPTION),
+                tool(AUTOMATION, AUTOMATION_DESCRIPTION),
+                tool(PYTHON, PYTHON_DESCRIPTION),
+                tool(LONELY, LONELY_DESCRIPTION),
             ],
             std::iter::empty(),
         )
@@ -1362,7 +1306,7 @@ pub(crate) mod tests {
     }
 
     fn lonely(description: &str) -> DeferralSession {
-        DeferralSession::new(vec![tool(LONELY, None, description)], std::iter::empty())
+        DeferralSession::new(vec![tool(LONELY, description)], std::iter::empty())
     }
 
     fn workflow_definitions(
@@ -1411,9 +1355,7 @@ pub(crate) mod tests {
         assert_eq!(definitions.deferred.len(), 1);
         let expected = definitions.deferred[0].definition.clone();
         if other_pending {
-            definitions
-                .deferred
-                .push(tool(LONELY, None, LONELY_DESCRIPTION));
+            definitions.deferred.push(tool(LONELY, LONELY_DESCRIPTION));
         }
         let session = DeferralSession::new(definitions.deferred, std::iter::empty());
         let mut tools = definitions.declared.clone();
@@ -1476,7 +1418,7 @@ pub(crate) mod tests {
                 Vec::new()
             },
             allowed_tools: if filtered {
-                vec![MAP.into()]
+                vec![AUTOMATION.into()]
             } else {
                 Vec::new()
             },
@@ -1495,7 +1437,7 @@ pub(crate) mod tests {
     /// The catalog is what the model reads when deciding to spend a load, so
     /// it carries one sentence and stops.
     #[test]
-    fn an_ungrouped_tool_is_listed_with_its_first_sentence() {
+    fn a_pending_tool_is_listed_with_its_first_sentence() {
         let description = catalog_description(&lonely(TWO_SENTENCES));
 
         assert!(
@@ -1503,20 +1445,6 @@ pub(crate) mod tests {
             "{description}"
         );
         assert!(!description.contains(SECOND_SENTENCE), "{description}");
-    }
-
-    /// A group is one decision. Summarising each member separately would
-    /// invite loading them one at a time.
-    #[test]
-    fn a_group_is_named_once_and_its_members_are_not_summarised() {
-        let description = catalog_description(&session());
-
-        assert!(
-            description.contains(&format!("- {GRAPH}: {MAP}, {REFS}")),
-            "{description}"
-        );
-        assert_eq!(description.matches(GRAPH).count(), 1, "{description}");
-        assert!(!description.contains(MAP_DESCRIPTION), "{description}");
     }
 
     #[test]
@@ -1557,55 +1485,53 @@ pub(crate) mod tests {
         );
     }
 
-    /// The whole point of the group: five code tools are one decision and one
-    /// cache miss, not five.
+    /// Every load is a cache miss, so a query that matches several tools
+    /// loads only the best of them.
     #[test]
-    fn a_match_loads_its_whole_group() {
+    fn a_search_loads_only_its_best_match() {
         let session = session();
-        let outcome = session.search("symbol references").unwrap();
+        let outcome = session.search(SCRIPT_QUERY).unwrap();
 
-        assert_eq!(outcome.loaded.len(), 2, "{:?}", outcome.loaded);
+        assert_eq!(outcome.loaded, [Arc::<str>::from(AUTOMATION)]);
         let mut tools = json!([]);
         session.request_snapshot().extend_tools(&mut tools);
-        assert_eq!(names(&tools), [MAP, REFS, TOOL_SEARCH_TOOL_NAME]);
-    }
-
-    #[test]
-    fn an_ungrouped_tool_loads_alone() {
-        let session = session();
-        session.search(LONELY).unwrap();
-
-        let mut tools = json!([]);
-        session.request_snapshot().extend_tools(&mut tools);
-        assert_eq!(names(&tools), [LONELY, TOOL_SEARCH_TOOL_NAME]);
+        assert_eq!(names(&tools), [AUTOMATION, TOOL_SEARCH_TOOL_NAME]);
     }
 
     #[test]
     fn the_catalog_disappears_once_everything_is_loaded() {
         let session = session();
-        session.search(MAP).unwrap();
+        session.search(AUTOMATION).unwrap();
+        session.search(PYTHON).unwrap();
         session.search(LONELY).unwrap();
 
         let mut tools = json!([]);
         session.request_snapshot().extend_tools(&mut tools);
-        assert_eq!(names(&tools), [MAP, REFS, LONELY], "{NOTHING_DEFERRED}");
+        assert_eq!(
+            names(&tools),
+            [AUTOMATION, PYTHON, LONELY],
+            "{NOTHING_DEFERRED}"
+        );
     }
 
     /// A model that guesses the name right should not be told to search for
     /// what it just called successfully.
     #[test]
-    fn calling_a_deferred_tool_directly_loads_its_group() {
+    fn calling_a_deferred_tool_directly_loads_it() {
         let session = session();
 
-        assert_eq!(session.mark_loaded(MAP).len(), 2);
-        assert!(session.mark_loaded(MAP).is_empty(), "already loaded");
+        assert_eq!(
+            session.mark_loaded(AUTOMATION),
+            [Arc::<str>::from(AUTOMATION)]
+        );
+        assert!(session.mark_loaded(AUTOMATION).is_empty(), "already loaded");
         assert!(session.mark_loaded("file_read").is_empty(), "not deferred");
     }
 
     #[test]
     fn a_restored_session_keeps_what_it_already_loaded() {
         let session = DeferralSession::new(
-            vec![tool(LONELY, None, "Inspect the execution host")],
+            vec![tool(LONELY, "Inspect the execution host")],
             [Arc::from("file_read"), Arc::from(LONELY)].into_iter(),
         );
 
@@ -1638,7 +1564,7 @@ pub(crate) mod tests {
     #[test]
     fn a_fresh_view_starts_with_nothing_loaded() {
         let parent = session();
-        parent.search(MAP).unwrap();
+        parent.search(AUTOMATION).unwrap();
         let child = parent.fresh();
 
         let mut tools = json!([]);
@@ -1680,7 +1606,7 @@ pub(crate) mod tests {
     #[test_case(BuiltinDeferral::EagerByConfig ; "by config")]
     fn an_eager_run_withholds_nothing(deferral: BuiltinDeferral) {
         assert!(deferred_names(&[], deferral).is_empty());
-        assert!(!is_deferred(DEFERRABLE, &[], deferral));
+        assert!(!is_deferred(PYTHON, &[], deferral));
     }
 
     #[test]
@@ -1688,7 +1614,7 @@ pub(crate) mod tests {
         let names = deferred_names(&[], BuiltinDeferral::Lazy);
 
         assert_eq!(names.len(), caudra_config::DEFERRED_BUILTIN_TOOLS.len());
-        assert!(is_deferred(DEFERRABLE, &[], BuiltinDeferral::Lazy));
+        assert!(is_deferred(PYTHON, &[], BuiltinDeferral::Lazy));
     }
 
     /// Definitions the caller already put in the array win, so a tool forced
@@ -1696,11 +1622,12 @@ pub(crate) mod tests {
     #[test]
     fn an_already_declared_tool_is_not_appended_again() {
         let session = session();
-        session.search(MAP).unwrap();
+        session.search(AUTOMATION).unwrap();
+        session.search(PYTHON).unwrap();
 
-        let mut tools = json!([{ "name": MAP }]);
+        let mut tools = json!([{ "name": AUTOMATION }]);
         session.request_snapshot().extend_tools(&mut tools);
-        assert_eq!(names(&tools), [MAP, REFS, TOOL_SEARCH_TOOL_NAME]);
+        assert_eq!(names(&tools), [AUTOMATION, PYTHON, TOOL_SEARCH_TOOL_NAME]);
     }
 
     #[test_case(false ; "no_deferred_tools")]
@@ -1711,7 +1638,7 @@ pub(crate) mod tests {
         } else {
             DeferralSession::default()
         };
-        let mut tools = json!([{ "name": MAP }, { "name": REFS }, { "name": LONELY }]);
+        let mut tools = json!([{ "name": AUTOMATION }, { "name": PYTHON }, { "name": LONELY }]);
         let expected = tools.clone();
 
         session.request_snapshot().extend_tools(&mut tools);

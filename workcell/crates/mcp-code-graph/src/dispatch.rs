@@ -1,7 +1,7 @@
 //! The MCP adapter: argument parsing, result envelopes, and the protocol size ceiling.
 //!
 //! This module is a projection of the group's native methods. It adds no behaviour, no policy, and
-//! no second source of truth; a native host calling `code_map` and an MCP client calling `code_map`
+//! no second source of truth; a native host calling `code_refs` and an MCP client calling `code_refs`
 //! run the same code and receive the same record.
 
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -14,10 +14,7 @@ use crate::{
     error::CodeGraphError,
     group::CodeGraphToolGroup,
     model_text::ModelText,
-    types::{
-        CodeContextInput, CodeExpandInput, CodeImpactInput, CodeMapInput, CodeRefsInput,
-        SelectorRefusal,
-    },
+    types::{CodeContextInput, CodeRefsInput, SelectorRefusal},
 };
 
 impl CodeGraphToolGroup {
@@ -32,24 +29,12 @@ impl CodeGraphToolGroup {
         token: CancellationToken,
     ) -> Option<Result<CallToolResult, rmcp::ErrorData>> {
         Some(match name {
-            "code_map" => match parse::<CodeMapInput>(name, arguments) {
-                Ok(input) => complete(self.code_map(input, None, &token).await),
-                Err(message) => invalid(message),
-            },
             "code_context" => match parse::<CodeContextInput>(name, arguments) {
                 Ok(input) => complete(self.code_context(input, None, &token).await),
                 Err(message) => invalid(message),
             },
             "code_refs" => match parse::<CodeRefsInput>(name, arguments) {
                 Ok(input) => selectable(self.code_refs(input, None, &token).await),
-                Err(message) => invalid(message),
-            },
-            "code_impact" => match parse::<CodeImpactInput>(name, arguments) {
-                Ok(input) => selectable(self.code_impact(input, None, &token).await),
-                Err(message) => invalid(message),
-            },
-            "code_expand" => match parse::<CodeExpandInput>(name, arguments) {
-                Ok(input) => selectable(self.code_expand(input, None, &token).await),
                 Err(message) => invalid(message),
             },
             _ => return None,
@@ -116,6 +101,8 @@ fn invalid(message: String) -> Result<CallToolResult, rmcp::ErrorData> {
 mod tests {
     use super::*;
 
+    const MISSING_TASK: &str = "missing field `task`";
+
     #[tokio::test]
     async fn an_unknown_tool_name_is_not_claimed() {
         let directory = tempfile::TempDir::new().expect("temp dir");
@@ -139,8 +126,8 @@ mod tests {
             .expect("group");
         let result = group
             .dispatch(
-                "code_map",
-                serde_json::json!({ "unknownField": 1 }),
+                "code_refs",
+                serde_json::json!({ "symbol": "alpha", "unknownField": 1 }),
                 CancellationToken::new(),
             )
             .await
@@ -152,16 +139,19 @@ mod tests {
     #[tokio::test]
     async fn absent_arguments_are_treated_as_an_empty_object() {
         let directory = tempfile::TempDir::new().expect("temp dir");
-        std::fs::write(directory.path().join("a.rs"), "fn alpha() {}").expect("write");
         let group = CodeGraphToolGroup::new(directory.path(), None)
             .await
             .expect("group");
         let result = group
-            .dispatch("code_map", Value::Null, CancellationToken::new())
+            .dispatch("code_context", Value::Null, CancellationToken::new())
             .await
             .expect("claimed")
             .expect("returns a result");
-        assert_ne!(result.is_error, Some(true));
-        assert!(result.structured_content.is_some());
+        assert_eq!(result.is_error, Some(true));
+        let text = serde_json::to_string(&result.content).expect("serialize");
+        assert!(
+            text.contains(MISSING_TASK),
+            "null must parse as an empty object, so the error names the missing field: {text}"
+        );
     }
 }

@@ -1073,7 +1073,7 @@ mod tests {
                             billed_to: Some(BILLED_TO),
                         },
                         ContextBuiltinTool {
-                            name: "code_map".to_owned(),
+                            name: "execution_environment".to_owned(),
                             source: "native:workcell".to_owned(),
                             state: ContextBuiltinState::Deferred,
                             reason: Some("deferred behind tool_search"),
@@ -1322,7 +1322,7 @@ mod tests {
             "Auto-compact  threshold 900 tokens (90.0%) · reserve 100 tokens (10.0%)",
             "M MCP tools  3 tools · 1 via mcp · 1 search-only · 1 disabled · ~40 tokens in context",
             "T System tools  2 declared · 1 on demand · 0 disabled · ~75 tokens in context · ~90 tokens if loaded",
-            "code_map  on demand · ~90 tokens",
+            "execution_environment  on demand · ~90 tokens",
             "task  declared · ~30 tokens · counted under profiles",
             "On-load bodies  ~120 tokens across 1 notes",
             "definitions ~25 tokens · loaded bodies ~45 tokens",

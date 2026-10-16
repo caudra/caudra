@@ -4935,7 +4935,6 @@ mod tests {
                         .unwrap();
                     DeferredTool::new(
                         name,
-                        None,
                         json!({
                             "name": name, "description": SEARCH_QUERY, "input_schema": {"type": "object"}
                         }),
@@ -4990,7 +4989,6 @@ mod tests {
             ctx.deferral = Some(DeferralSession::new(
                 vec![DeferredTool::new(
                     FETCH_ISSUE,
-                    None,
                     serde_json::json!({
                         "name": FETCH_ISSUE, "description": "Fetch an issue", "input_schema": {"type": "object"}
                     }),

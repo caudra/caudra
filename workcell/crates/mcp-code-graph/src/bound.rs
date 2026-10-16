@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::{
     model_text::ModelText,
-    types::{CodeContextOutput, CodeExpandOutput, CodeImpactOutput, CodeMapOutput, CodeRefsOutput},
+    types::{CodeContextOutput, CodeRefsOutput},
 };
 
 /// Largest raw result any host will emit, in bytes.
@@ -30,17 +30,6 @@ const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 pub trait Shrinkable {
     fn rows(&self) -> usize;
     fn retain_prefix(&mut self, retained: usize);
-}
-
-impl Shrinkable for CodeMapOutput {
-    fn rows(&self) -> usize {
-        self.symbols.len()
-    }
-    fn retain_prefix(&mut self, retained: usize) {
-        self.symbols.truncate(retained);
-        self.shown = self.symbols.len();
-        self.truncated = self.total > self.shown;
-    }
 }
 
 impl Shrinkable for CodeContextOutput {
@@ -62,38 +51,6 @@ impl Shrinkable for CodeRefsOutput {
         self.references.truncate(retained);
         self.shown = self.references.len();
         self.truncated = self.total > self.shown;
-    }
-}
-
-impl Shrinkable for CodeImpactOutput {
-    fn rows(&self) -> usize {
-        self.reached.len()
-    }
-    fn retain_prefix(&mut self, retained: usize) {
-        self.reached.truncate(retained);
-        self.tests_reaching.retain(|row| {
-            self.reached.iter().any(|kept| {
-                kept.symbol.path == row.symbol.path
-                    && kept.symbol.line_start == row.symbol.line_start
-            })
-        });
-        self.shown = self.reached.len();
-        self.truncated = self.total > self.shown;
-    }
-}
-
-impl Shrinkable for CodeExpandOutput {
-    fn rows(&self) -> usize {
-        // The body is the payload and cannot be dropped row-wise, so the neighbourhood is what
-        // gives. A caller asked for this symbol; returning it without its callers is a smaller
-        // answer than returning its callers without it.
-        self.callers.len() + self.callees.len()
-    }
-    fn retain_prefix(&mut self, retained: usize) {
-        let callers = retained.min(self.callers.len());
-        self.callers.truncate(callers);
-        self.callees.truncate(retained.saturating_sub(callers));
-        self.truncated = true;
     }
 }
 
@@ -172,8 +129,8 @@ mod tests {
     use super::*;
     use crate::types::{GraphSummary, RankedSymbol};
 
-    fn wide_map(rows: usize) -> CodeMapOutput {
-        let symbols: Vec<RankedSymbol> = (0..rows)
+    fn wide_context(rows: usize) -> CodeContextOutput {
+        let results: Vec<RankedSymbol> = (0..rows)
             .map(|index| RankedSymbol {
                 name: format!("a_symbol_with_a_reasonably_long_name_{index}"),
                 kind: "function".to_owned(),
@@ -186,12 +143,17 @@ mod tests {
                 test_scope: false,
             })
             .collect();
-        CodeMapOutput {
+        CodeContextOutput {
+            task: "a task".to_owned(),
             path: ".".to_owned(),
-            shown: symbols.len(),
-            total: symbols.len(),
+            shape: "conceptual".to_owned(),
+            shape_reason: "prose".to_owned(),
+            confidence: "low".to_owned(),
+            margin_percent: 0,
+            shown: results.len(),
+            total_matched: results.len(),
             truncated: false,
-            symbols,
+            results,
             counts_floor: true,
             estimated_tokens: 0,
             graph: GraphSummary::default(),
@@ -200,7 +162,7 @@ mod tests {
 
     #[test]
     fn an_oversized_result_is_shortened_to_fit_the_envelope() {
-        let output = wide_map(4_000);
+        let output = wide_context(4_000);
         assert!(
             response_size(&output).expect("size") > RAW_RESULT_CEILING_BYTES,
             "the fixture must actually exceed the ceiling"
@@ -218,14 +180,14 @@ mod tests {
             "a shortened result must say it was shortened"
         );
         assert_eq!(
-            fitted.total, 4_000,
+            fitted.total_matched, 4_000,
             "the total must survive: it is what tells the caller what was withheld"
         );
     }
 
     #[test]
     fn a_result_that_already_fits_is_returned_unchanged() {
-        let output = wide_map(3);
+        let output = wide_context(3);
         let fitted = fit(output.clone());
         assert_eq!(fitted.shown, output.shown);
         assert!(!fitted.truncated);

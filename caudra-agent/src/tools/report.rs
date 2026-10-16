@@ -202,7 +202,7 @@ mod tests {
     };
 
     const MODEL_SPEC: &str = "anthropic/claude-opus-4-8";
-    const DEFERRED_TOOL: &str = "code_map";
+    const DEFERRED_TOOL: &str = "execution_environment";
     const PLAN_PATH: &str = "plan.md";
     const CUSTOM_SOURCE: &str = "custom_plan";
 

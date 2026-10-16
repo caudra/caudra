@@ -1,10 +1,11 @@
-//! End-to-end behaviour of the five tools against a real tree on disk.
+//! End-to-end behaviour of the two tools against a real tree on disk.
 
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use workcell_mcp_code_graph::{
-    CodeContextInput, CodeExpandInput, CodeGraphToolGroup, CodeImpactInput, CodeMapInput,
-    CodeRefsInput, Direction, GraphPhase, GraphProgress, GraphProgressSink, ModelText,
+    CodeContextInput, CodeContextOutput, CodeGraphToolGroup, CodeRefsInput, CodeRefsOutput,
+    Direction, GraphPhase, GraphProgress, GraphProgressSink, ModelText, RankedSymbol,
+    SelectorRefusal,
 };
 use workcell_mcp_files::{FileResource, FileResourceAccess};
 
@@ -52,60 +53,106 @@ fn token() -> CancellationToken {
     CancellationToken::new()
 }
 
-#[tokio::test]
-async fn code_map_ranks_the_most_referenced_symbol_first() {
-    let (_directory, group) = group().await;
-    let output = group
-        .code_map(CodeMapInput::default(), None, &token())
+const NORMALIZE: &str = "normalize_sku";
+const NORMALIZE_TASK: &str = "normalize a sku";
+
+fn refs_input(symbol: &str, direction: Direction, depth: Option<usize>) -> CodeRefsInput {
+    CodeRefsInput {
+        symbol: symbol.to_owned(),
+        direction,
+        depth,
+        path: None,
+        limit: None,
+    }
+}
+
+fn context_input(task: &str, path: Option<&str>, limit: Option<usize>) -> CodeContextInput {
+    CodeContextInput {
+        task: task.to_owned(),
+        path: path.map(str::to_owned),
+        limit,
+    }
+}
+
+async fn refs(
+    group: &CodeGraphToolGroup,
+    input: CodeRefsInput,
+) -> Result<CodeRefsOutput, SelectorRefusal> {
+    group
+        .code_refs(input, None, &token())
         .await
-        .expect("map");
+        .expect("refs runs")
+}
+
+async fn context(group: &CodeGraphToolGroup, input: CodeContextInput) -> CodeContextOutput {
+    group
+        .code_context(input, None, &token())
+        .await
+        .expect("context runs")
+}
+
+fn names(rows: &[workcell_mcp_code_graph::ReferenceRow]) -> Vec<&str> {
+    rows.iter().map(|row| row.symbol.name.as_str()).collect()
+}
+
+#[tokio::test]
+async fn code_refs_lists_every_caller_with_its_call_site() {
+    let (_directory, group) = group().await;
+    let output = refs(&group, refs_input(NORMALIZE, Direction::Callers, None))
+        .await
+        .expect("resolved");
 
     assert!(output.graph.files_indexed >= 5);
     assert!(output.counts_floor, "every count here is a floor");
-    assert!(output.graph.pr_converged);
-    assert_eq!(
-        output.symbols.first().map(|symbol| symbol.name.as_str()),
-        Some("normalize_sku"),
-        "the symbol three others call should lead: {:?}",
-        output
-            .symbols
-            .iter()
-            .map(|s| (&s.name, s.callers))
-            .collect::<Vec<_>>()
+    assert_eq!(output.total, 3, "three distinct callers");
+    assert_eq!(output.depth, 1);
+    assert!(
+        output.by_depth.is_empty(),
+        "a one-hop answer carries no per-hop summary"
     );
-    let leader = &output.symbols[0];
-    assert_eq!(leader.callers, 3, "three distinct callers");
-    assert_eq!(leader.path, "src/normalize.rs");
+    let add_item = output
+        .references
+        .iter()
+        .find(|row| row.symbol.name == "add_item")
+        .expect("add_item calls normalize_sku");
+    assert_eq!(add_item.hops, 1);
+    assert_eq!(
+        add_item
+            .sites
+            .iter()
+            .map(|site| (site.path.as_str(), site.line))
+            .collect::<Vec<_>>(),
+        [("src/catalog.rs", 2)]
+    );
+    assert!(
+        output.model_text().contains("at=2"),
+        "{}",
+        output.model_text()
+    );
 }
 
 #[tokio::test]
 async fn preparation_binds_validated_options_without_crawling() {
     let (_directory, group) = group().await;
-    let scope = group.inspect_scope(None).await.expect("scope");
-    let impact = group
-        .prepare_code_impact(
-            CodeImpactInput {
-                symbol: "normalize_sku".to_owned(),
-                depth: Some(usize::MAX),
-                path: None,
+    let refs = group
+        .prepare_code_refs(
+            CodeRefsInput {
                 limit: Some(usize::MAX),
+                ..refs_input(NORMALIZE, Direction::Callers, Some(usize::MAX))
             },
-            scope,
+            group.inspect_scope(None).await.expect("scope"),
         )
-        .expect("prepare impact");
-    assert_eq!(impact.symbol(), "normalize_sku");
-    assert_eq!(impact.depth(), 8);
-    assert_eq!(impact.limit(), group.limits().max_result_limit);
-    assert_eq!(impact.path(), ".");
-    assert!(impact.retained_bytes() >= impact.symbol().len() + impact.path().len());
+        .expect("prepare refs");
+    assert_eq!(refs.symbol(), NORMALIZE);
+    assert_eq!(refs.direction(), Direction::Callers);
+    assert_eq!(refs.depth(), 8);
+    assert_eq!(refs.limit(), group.limits().max_result_limit);
+    assert_eq!(refs.path(), ".");
+    assert!(refs.retained_bytes() >= refs.symbol().len() + refs.path().len());
 
     let context = group
         .prepare_code_context(
-            CodeContextInput {
-                task: "find normalization".to_owned(),
-                path: None,
-                limit: Some(7),
-            },
+            context_input("find normalization", None, Some(7)),
             group.inspect_scope(None).await.expect("scope"),
         )
         .expect("prepare context");
@@ -113,58 +160,36 @@ async fn preparation_binds_validated_options_without_crawling() {
     assert_eq!(context.limit(), 7);
     assert!(context.retained_bytes() >= context.task().len() + context.path().len());
 
-    let refs = group
-        .prepare_code_refs(
-            CodeRefsInput {
-                symbol: "normalize_sku".to_owned(),
-                direction: Direction::Callees,
-                path: None,
-                limit: Some(9),
-            },
-            group.inspect_scope(None).await.expect("scope"),
-        )
-        .expect("prepare refs");
-    assert_eq!(refs.symbol(), "normalize_sku");
-    assert_eq!(refs.direction(), Direction::Callees);
-    assert_eq!(refs.limit(), 9);
-    assert!(refs.retained_bytes() >= refs.symbol().len() + refs.path().len());
-
-    let expand = group
-        .prepare_code_expand(
-            CodeExpandInput {
-                symbol: "normalize_sku".to_owned(),
-                path: None,
-            },
-            group.inspect_scope(None).await.expect("scope"),
-        )
-        .expect("prepare expand");
-    assert_eq!(expand.symbol(), "normalize_sku");
-    assert!(expand.retained_bytes() >= expand.symbol().len() + expand.path().len());
-
-    let scope = group.inspect_scope(None).await.expect("scope");
     assert!(
         group
             .prepare_code_context(
-                CodeContextInput {
-                    task: "   ".to_owned(),
-                    path: None,
-                    limit: None,
-                },
-                scope,
+                context_input("   ", None, None),
+                group.inspect_scope(None).await.expect("scope"),
             )
             .is_err()
     );
 }
 
 #[tokio::test]
+async fn a_walk_over_callees_is_refused_as_invalid() {
+    let (_directory, group) = group().await;
+    let error = group
+        .code_refs(
+            refs_input("add_item", Direction::Callees, Some(2)),
+            None,
+            &token(),
+        )
+        .await
+        .expect_err("callees have no depth");
+    assert_eq!(error.kind(), "invalid");
+}
+
+#[tokio::test]
 async fn prepared_execution_uses_the_host_supplied_scope_not_the_raw_selector() {
     let (directory, group) = group().await;
     let prepared = group
-        .prepare_code_map(
-            CodeMapInput {
-                path: Some("tests".to_owned()),
-                limit: None,
-            },
+        .prepare_code_context(
+            context_input(NORMALIZE_TASK, Some("tests"), None),
             FileResource {
                 requested_path: "host-authorized-src".to_owned(),
                 path: directory.path().join("src"),
@@ -172,23 +197,18 @@ async fn prepared_execution_uses_the_host_supplied_scope_not_the_raw_selector() 
                 access: FileResourceAccess::Traverse,
             },
         )
-        .expect("prepare map");
+        .expect("prepare context");
     assert_eq!(prepared.path(), "tests");
     assert!(prepared.retained_bytes() >= prepared.path().len());
 
     let output = group
-        .execute_prepared_code_map(prepared, None, &token())
+        .execute_prepared_code_context(prepared, None, &token())
         .await
-        .expect("execute prepared map");
+        .expect("execute prepared context");
+    assert!(output.results.iter().any(|symbol| symbol.name == NORMALIZE));
     assert!(
         output
-            .symbols
-            .iter()
-            .any(|symbol| symbol.name == "normalize_sku")
-    );
-    assert!(
-        output
-            .symbols
+            .results
             .iter()
             .all(|symbol| !symbol.path.starts_with("tests/"))
     );
@@ -199,56 +219,37 @@ async fn prepared_execution_fails_when_the_authorized_scope_is_stale() {
     let (directory, group) = group().await;
     let scope = group.inspect_scope(Some("src")).await.expect("scope");
     let prepared = group
-        .prepare_code_map(
-            CodeMapInput {
-                path: Some("src".to_owned()),
-                limit: None,
-            },
-            scope,
-        )
-        .expect("prepare map");
+        .prepare_code_context(context_input(NORMALIZE_TASK, Some("src"), None), scope)
+        .expect("prepare context");
     std::fs::rename(directory.path().join("src"), directory.path().join("moved"))
         .expect("move scope");
 
     assert!(
         group
-            .execute_prepared_code_map(prepared, None, &token())
+            .execute_prepared_code_context(prepared, None, &token())
             .await
             .is_err()
     );
 }
 
 #[tokio::test]
-async fn code_map_paths_are_root_relative_whether_or_not_the_map_is_scoped() {
+async fn paths_are_root_relative_whether_or_not_the_graph_is_scoped() {
     let (_directory, group) = group().await;
-    let whole = group
-        .code_map(CodeMapInput::default(), None, &token())
-        .await
-        .expect("map");
-    let scoped = group
-        .code_map(
-            CodeMapInput {
-                path: Some("src".to_owned()),
-                limit: None,
-            },
-            None,
-            &token(),
-        )
-        .await
-        .expect("scoped map");
+    let whole = context(&group, context_input(NORMALIZE_TASK, None, None)).await;
+    let scoped = context(&group, context_input(NORMALIZE_TASK, Some("src"), None)).await;
 
-    let find = |symbols: &[workcell_mcp_code_graph::RankedSymbol]| {
+    let find = |symbols: &[RankedSymbol]| {
         symbols
             .iter()
-            .find(|symbol| symbol.name == "normalize_sku")
+            .find(|symbol| symbol.name == NORMALIZE)
             .map(|symbol| symbol.path.clone())
     };
     assert_eq!(
-        find(&whole.symbols),
-        find(&scoped.symbols),
-        "a path from a scoped map must be usable against the whole map"
+        find(&whole.results),
+        find(&scoped.results),
+        "a path from a scoped search must be usable against the whole tree"
     );
-    assert_eq!(find(&scoped.symbols).as_deref(), Some("src/normalize.rs"));
+    assert_eq!(find(&scoped.results).as_deref(), Some("src/normalize.rs"));
     assert!(
         scoped.graph.files_indexed < whole.graph.files_indexed,
         "scoping must actually narrow the crawl"
@@ -263,21 +264,8 @@ async fn code_map_paths_are_root_relative_whether_or_not_the_map_is_scoped() {
 async fn an_empty_path_is_indistinguishable_from_an_absent_one() {
     let (_directory, group) = group().await;
 
-    let absent = group
-        .code_map(CodeMapInput::default(), None, &token())
-        .await
-        .expect("map without a path");
-    let empty = group
-        .code_map(
-            CodeMapInput {
-                path: Some(String::new()),
-                limit: None,
-            },
-            None,
-            &token(),
-        )
-        .await
-        .expect("map with an empty path");
+    let absent = context(&group, context_input(NORMALIZE_TASK, None, None)).await;
+    let empty = context(&group, context_input(NORMALIZE_TASK, Some(""), None)).await;
     assert_eq!(format!("{empty:?}"), format!("{absent:?}"));
     assert_eq!(
         empty.path, ".",
@@ -285,53 +273,30 @@ async fn an_empty_path_is_indistinguishable_from_an_absent_one() {
     );
 
     // A second tool, because the normalization is applied per call site and one passing site proves
-    // nothing about the other four.
-    let absent = group
-        .code_refs(
-            CodeRefsInput {
-                symbol: "normalize_sku".to_owned(),
-                direction: Direction::Callers,
-                path: None,
-                limit: None,
-            },
-            None,
-            &token(),
-        )
+    // nothing about the other.
+    let absent = refs(&group, refs_input(NORMALIZE, Direction::Callers, None))
         .await
-        .expect("refs without a path")
         .expect("selector resolves");
-    let empty = group
-        .code_refs(
-            CodeRefsInput {
-                symbol: "normalize_sku".to_owned(),
-                direction: Direction::Callers,
-                path: Some(String::new()),
-                limit: None,
-            },
-            None,
-            &token(),
-        )
-        .await
-        .expect("refs with an empty path")
-        .expect("selector resolves");
+    let empty = refs(
+        &group,
+        CodeRefsInput {
+            path: Some(String::new()),
+            ..refs_input(NORMALIZE, Direction::Callers, None)
+        },
+    )
+    .await
+    .expect("selector resolves");
     assert_eq!(format!("{empty:?}"), format!("{absent:?}"));
 }
 
 #[tokio::test]
 async fn code_context_finds_a_symbol_the_task_did_not_spell() {
     let (_directory, group) = group().await;
-    let output = group
-        .code_context(
-            CodeContextInput {
-                task: "where do we invalidate a cache entry".to_owned(),
-                path: None,
-                limit: Some(5),
-            },
-            None,
-            &token(),
-        )
-        .await
-        .expect("context");
+    let output = context(
+        &group,
+        context_input("where do we invalidate a cache entry", None, Some(5)),
+    )
+    .await;
 
     assert_eq!(output.shape, "conceptual");
     assert_eq!(
@@ -346,18 +311,11 @@ async fn code_context_returns_nothing_for_an_unrelated_task() {
     // The alternative is returning the repository's busiest symbol, which answers a question that
     // was not asked and reads exactly like a real answer.
     let (_directory, group) = group().await;
-    let output = group
-        .code_context(
-            CodeContextInput {
-                task: "quantum chromodynamics lattice solver".to_owned(),
-                path: None,
-                limit: Some(5),
-            },
-            None,
-            &token(),
-        )
-        .await
-        .expect("context");
+    let output = context(
+        &group,
+        context_input("quantum chromodynamics lattice solver", None, Some(5)),
+    )
+    .await;
     assert!(output.results.is_empty(), "{:?}", output.results);
     assert_eq!(output.total_matched, 0);
     assert!(
@@ -370,69 +328,55 @@ async fn code_context_returns_nothing_for_an_unrelated_task() {
 #[tokio::test]
 async fn code_refs_names_its_unit_per_direction() {
     let (_directory, group) = group().await;
-    let callers = group
-        .code_refs(
-            CodeRefsInput {
-                symbol: "normalize_sku".to_owned(),
-                direction: Direction::Callers,
-                path: None,
-                limit: None,
-            },
-            None,
-            &token(),
-        )
+    let callers = refs(&group, refs_input(NORMALIZE, Direction::Callers, None))
         .await
-        .expect("refs")
         .expect("resolved");
     assert_eq!(callers.total, 3);
     assert_eq!(callers.unit, "referencing symbol");
 
-    let callees = group
-        .code_refs(
-            CodeRefsInput {
-                symbol: "add_item".to_owned(),
-                direction: Direction::Callees,
-                path: None,
-                limit: None,
-            },
-            None,
-            &token(),
-        )
+    let callees = refs(&group, refs_input("add_item", Direction::Callees, None))
         .await
-        .expect("refs")
         .expect("resolved");
     assert_eq!(callees.unit, "referenced symbol");
-    assert_eq!(
+    assert_eq!(names(&callees.references), [NORMALIZE]);
+}
+
+#[tokio::test]
+async fn callees_come_in_the_order_the_body_calls_them() {
+    // Rank order would lead with `first`, which two symbols call; the body calls `second` first.
+    let directory = TempDir::new().expect("temp dir");
+    std::fs::write(
+        directory.path().join("lib.rs"),
+        "pub fn first() {}\npub fn second() {}\npub fn driver() {\n    second();\n    first();\n}\npub fn other() { first(); }\n",
+    )
+    .expect("write");
+    let group = CodeGraphToolGroup::new(directory.path(), None)
+        .await
+        .expect("group");
+    let callees = refs(&group, refs_input("driver", Direction::Callees, None))
+        .await
+        .expect("resolved");
+    assert_eq!(names(&callees.references), ["second", "first"]);
+    assert!(
         callees
-            .references
-            .iter()
-            .map(|symbol| symbol.name.as_str())
-            .collect::<Vec<_>>(),
-        ["normalize_sku"]
+            .model_text()
+            .contains("second function lib.rs:2-2 in=1 out=0 at=4")
     );
 }
 
 #[tokio::test]
 async fn an_unknown_symbol_is_refused_with_candidates_not_answered_with_zero() {
     let (_directory, group) = group().await;
-    let refusal = group
-        .code_refs(
-            CodeRefsInput {
-                symbol: "normalize_sku_typo".to_owned(),
-                direction: Direction::Callers,
-                path: None,
-                limit: None,
-            },
-            None,
-            &token(),
-        )
-        .await
-        .expect("call succeeds")
-        .expect_err("selector does not resolve");
+    let refusal = refs(
+        &group,
+        refs_input("normalize_sku_typo", Direction::Callers, None),
+    )
+    .await
+    .expect_err("selector does not resolve");
 
     assert!(refusal.refused);
     assert!(
-        refusal.did_you_mean.contains(&"normalize_sku".to_owned()),
+        refusal.did_you_mean.contains(&NORMALIZE.to_owned()),
         "{:?}",
         refusal.did_you_mean
     );
@@ -443,122 +387,48 @@ async fn an_unknown_symbol_is_refused_with_candidates_not_answered_with_zero() {
 async fn a_symbol_that_exists_with_no_callers_is_a_zero_not_a_refusal() {
     // The distinction the refusal type exists to preserve.
     let (_directory, group) = group().await;
-    let output = group
-        .code_refs(
-            CodeRefsInput {
-                symbol: "orphan_helper".to_owned(),
-                direction: Direction::Callers,
-                path: None,
-                limit: None,
-            },
-            None,
-            &token(),
-        )
-        .await
-        .expect("refs")
-        .expect("orphan_helper is defined, so this must resolve");
+    let output = refs(
+        &group,
+        refs_input("orphan_helper", Direction::Callers, None),
+    )
+    .await
+    .expect("orphan_helper is defined, so this must resolve");
     assert_eq!(output.total, 0);
     assert!(output.model_text().contains("not a proof"));
 }
 
 #[tokio::test]
-async fn code_impact_reports_hop_distance_and_the_tests_that_reach_it() {
+async fn a_walk_reports_hop_distance_and_the_tests_that_reach_it() {
     let (_directory, group) = group().await;
-    let output = group
-        .code_impact(
-            CodeImpactInput {
-                symbol: "normalize_sku".to_owned(),
-                depth: Some(3),
-                path: None,
-                limit: None,
-            },
-            None,
-            &token(),
-        )
+    let output = refs(&group, refs_input(NORMALIZE, Direction::Callers, Some(3)))
         .await
-        .expect("impact")
         .expect("resolved");
 
     assert!(output.total >= 3, "three direct callers at least");
     let direct: Vec<_> = output
-        .reached
+        .references
         .iter()
         .filter(|row| row.hops == 1)
         .map(|row| row.symbol.name.as_str())
         .collect();
     assert!(direct.contains(&"add_item"), "{direct:?}");
-    assert!(
-        output.reached.iter().any(|row| row.hops == 2),
-        "the test reaching add_item sits two hops from normalize_sku"
-    );
-    assert!(
-        output
-            .tests_reaching
-            .iter()
-            .any(|row| row.symbol.name == "covers_add_item"),
-        "existing coverage must be named: {:?}",
-        output.tests_reaching
-    );
-}
-
-#[tokio::test]
-async fn code_expand_returns_the_body_and_its_neighbours() {
-    let (_directory, group) = group().await;
-    let output = group
-        .code_expand(
-            CodeExpandInput {
-                symbol: "add_item".to_owned(),
-                path: None,
-            },
-            None,
-            &token(),
-        )
-        .await
-        .expect("expand")
-        .expect("resolved");
-
-    assert_eq!(output.path, "src/catalog.rs");
-    assert!(output.source.contains("normalize_sku(sku)"));
+    let test = output
+        .references
+        .iter()
+        .find(|row| row.symbol.name == "covers_add_item")
+        .expect("the test reaching add_item sits two hops from normalize_sku");
+    assert_eq!(test.hops, 2);
+    assert!(test.symbol.test_scope);
+    assert_eq!(output.tests_reaching, Some(1));
+    assert_eq!(output.by_depth.iter().sum::<usize>(), output.total);
+    assert_eq!(output.by_depth.len(), 3);
     assert!(
         output
-            .callees
-            .iter()
-            .any(|symbol| symbol.name == "normalize_sku")
+            .references
+            .windows(2)
+            .all(|pair| pair[0].hops <= pair[1].hops),
+        "nearest first"
     );
-}
-
-#[tokio::test]
-async fn code_expand_serves_the_whole_file_when_the_bundle_would_cost_more() {
-    // Ripwire's honest counterexample: a summary that costs more than the thing it summarizes is
-    // strictly worse, so the file is served and the result says why.
-    let directory = TempDir::new().expect("temp dir");
-    std::fs::write(
-        directory.path().join("tiny.rs"),
-        "pub fn only_function() -> u32 { 42 }\n",
-    )
-    .expect("write");
-    let group = CodeGraphToolGroup::new(directory.path(), None)
-        .await
-        .expect("group");
-
-    let output = group
-        .code_expand(
-            CodeExpandInput {
-                symbol: "only_function".to_owned(),
-                path: None,
-            },
-            None,
-            &token(),
-        )
-        .await
-        .expect("expand")
-        .expect("resolved");
-
-    assert!(
-        output.served_whole_file.is_some(),
-        "a symbol occupying most of a small file should come with the file"
-    );
-    assert!(output.model_text().contains("[whole file:"));
 }
 
 #[tokio::test]
@@ -571,19 +441,8 @@ async fn a_qualified_selector_picks_between_same_named_definitions() {
         .await
         .expect("group");
 
-    let both = group
-        .code_refs(
-            CodeRefsInput {
-                symbol: "handler".to_owned(),
-                direction: Direction::Callers,
-                path: None,
-                limit: None,
-            },
-            None,
-            &token(),
-        )
+    let both = refs(&group, refs_input("handler", Direction::Callers, None))
         .await
-        .expect("refs")
         .expect("resolved");
     assert_eq!(
         both.matched.len(),
@@ -592,20 +451,12 @@ async fn a_qualified_selector_picks_between_same_named_definitions() {
     );
     assert!(both.model_text().contains("names 2 definitions"));
 
-    let one = group
-        .code_refs(
-            CodeRefsInput {
-                symbol: "src/beta.rs::handler".to_owned(),
-                direction: Direction::Callers,
-                path: None,
-                limit: None,
-            },
-            None,
-            &token(),
-        )
-        .await
-        .expect("refs")
-        .expect("resolved");
+    let one = refs(
+        &group,
+        refs_input("src/beta.rs::handler", Direction::Callers, None),
+    )
+    .await
+    .expect("resolved");
     assert_eq!(one.matched.len(), 1);
     assert_eq!(one.matched[0].path, "src/beta.rs");
 }
@@ -614,14 +465,12 @@ async fn a_qualified_selector_picks_between_same_named_definitions() {
 async fn repeated_calls_return_byte_identical_results() {
     // The cache is shared across calls. If it could change an answer, this is where it would show.
     let (_directory, group) = group().await;
-    let first = group
-        .code_map(CodeMapInput::default(), None, &token())
+    let first = refs(&group, refs_input(NORMALIZE, Direction::Callers, Some(3)))
         .await
-        .expect("map");
-    let second = group
-        .code_map(CodeMapInput::default(), None, &token())
+        .expect("resolved");
+    let second = refs(&group, refs_input(NORMALIZE, Direction::Callers, Some(3)))
         .await
-        .expect("map");
+        .expect("resolved");
     assert_eq!(
         serde_json::to_string(&first).expect("json"),
         serde_json::to_string(&second).expect("json")
@@ -632,36 +481,26 @@ async fn repeated_calls_return_byte_identical_results() {
 #[tokio::test]
 async fn a_limit_narrows_the_result_and_the_truncation_is_disclosed() {
     let (_directory, group) = group().await;
-    let output = group
-        .code_map(
-            CodeMapInput {
-                path: None,
-                limit: Some(2),
-            },
-            None,
-            &token(),
-        )
-        .await
-        .expect("map");
-    assert_eq!(output.symbols.len(), 2);
+    let output = refs(
+        &group,
+        CodeRefsInput {
+            limit: Some(2),
+            ..refs_input(NORMALIZE, Direction::Callers, None)
+        },
+    )
+    .await
+    .expect("resolved");
+    assert_eq!(output.references.len(), 2);
     assert!(output.truncated);
-    assert!(output.total > 2);
-    assert!(output.model_text().contains("[truncated: showing 2 of"));
+    assert_eq!(output.total, 3);
+    assert!(output.model_text().contains("[truncated: showing 2 of 3]"));
 }
 
 #[tokio::test]
 async fn an_empty_task_is_rejected_rather_than_matching_everything() {
     let (_directory, group) = group().await;
     let error = group
-        .code_context(
-            CodeContextInput {
-                task: "   ".to_owned(),
-                path: None,
-                limit: None,
-            },
-            None,
-            &token(),
-        )
+        .code_context(context_input("   ", None, None), None, &token())
         .await
         .expect_err("an empty task is not a query");
     assert_eq!(error.kind(), "invalid");
@@ -687,9 +526,13 @@ async fn a_call_reports_its_phases_in_order() {
     let (_directory, group) = group().await;
     let sink = RecordingSink::default();
     group
-        .code_map(CodeMapInput::default(), Some(&sink), &token())
+        .code_context(
+            context_input(NORMALIZE_TASK, None, None),
+            Some(&sink),
+            &token(),
+        )
         .await
-        .expect("map");
+        .expect("context");
 
     let phases = sink.phases.lock().expect("sink").clone();
     assert_eq!(
@@ -701,12 +544,9 @@ async fn a_call_reports_its_phases_in_order() {
 #[tokio::test]
 async fn a_call_without_a_sink_still_answers() {
     let (_directory, group) = group().await;
-    let output = group
-        .code_map(CodeMapInput::default(), None, &token())
-        .await
-        .expect("map");
+    let output = context(&group, context_input(NORMALIZE_TASK, None, None)).await;
     assert!(
-        !output.symbols.is_empty(),
+        !output.results.is_empty(),
         "progress is advisory and must never gate the result"
     );
 }

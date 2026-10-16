@@ -13,17 +13,6 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Ranked symbols for a tree.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CodeMapInput {
-    /// Root-relative subdirectory. Absent means the whole configured root.
-    #[serde(default)]
-    pub path: Option<String>,
-    #[serde(default)]
-    pub limit: Option<usize>,
-}
-
 /// The task-shaped bundle.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -69,7 +58,7 @@ impl Direction {
     }
 }
 
-/// Callers or callees of one symbol.
+/// Callers or callees of one symbol, and with `depth` what a change to it could reach.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CodeRefsInput {
@@ -77,33 +66,13 @@ pub struct CodeRefsInput {
     pub symbol: String,
     #[serde(default)]
     pub direction: Direction,
-    #[serde(default)]
-    pub path: Option<String>,
-    #[serde(default)]
-    pub limit: Option<usize>,
-}
-
-/// Blast radius of a change to one symbol.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CodeImpactInput {
-    pub symbol: String,
-    /// Hops to walk backwards along call edges. Bounded by the host.
+    /// Hops to walk backwards along call edges. Callers only; absent means 1. Bounded by the host.
     #[serde(default)]
     pub depth: Option<usize>,
     #[serde(default)]
     pub path: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
-}
-
-/// One symbol's body and its immediate neighbourhood.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CodeExpandInput {
-    pub symbol: String,
-    #[serde(default)]
-    pub path: Option<String>,
 }
 
 /// What the graph run itself had to say.
@@ -122,6 +91,10 @@ pub struct GraphSummary {
     pub unresolved_references: usize,
     /// References matching more than one definition, whose weight was split rather than guessed.
     pub ambiguous_references: usize,
+    /// Calls whose receiver or qualifier points outside the tree, so they were never linked to the
+    /// in-tree symbol that happens to share their name.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub declined_references: usize,
     pub edges: usize,
     /// Power iterations performed.
     pub pr_iterations: usize,
@@ -181,32 +154,50 @@ pub struct SymbolRef {
     pub line_end: usize,
 }
 
-/// A symbol reached by walking the graph, with how far away it is.
+/// One line of source where a reference was made.
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ReachedSymbol {
-    #[serde(flatten)]
-    pub symbol: SymbolRef,
-    /// Edges traversed from the seed. One means a direct caller.
-    pub hops: usize,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub test_scope: bool,
+pub struct SiteRef {
+    pub path: String,
+    pub line: usize,
 }
 
+impl SiteRef {
+    /// The site as a reader with `home` in view needs it: a bare line in that file, else `path:line`.
+    #[must_use]
+    pub fn label(&self, home: &str) -> String {
+        site_label(&self.path, self.line, home)
+    }
+}
+
+/// [`SiteRef::label`] for a site that arrived as separate fields.
+#[must_use]
+pub fn site_label(path: &str, line: usize, home: &str) -> String {
+    if path == home {
+        line.to_string()
+    } else {
+        format!("{path}:{line}")
+    }
+}
+
+/// One symbol reached from the selected one, with where the calls are.
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CodeMapOutput {
-    /// The subtree that was mapped, root-relative. `.` is the whole root.
-    pub path: String,
-    pub symbols: Vec<RankedSymbol>,
-    pub shown: usize,
-    /// Symbols in the graph. Exceeds `shown` when the result window withheld some.
-    pub total: usize,
-    pub truncated: bool,
-    /// Always true. See the module docs.
-    pub counts_floor: bool,
-    pub estimated_tokens: usize,
-    pub graph: GraphSummary,
+pub struct ReferenceRow {
+    #[serde(flatten)]
+    pub symbol: RankedSymbol,
+    /// Edges walked from the selected symbol. One means a direct caller or callee.
+    pub hops: usize,
+    /// The call sites between this row and the selected symbol, in source order. Direct rows only.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sites: Vec<SiteRef>,
+    /// Every call site, when `sites` was capped.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub sites_total: usize,
+    /// Linked by name alone: the receiver's type was never seen, so the call may mean another
+    /// symbol with the same name. Such a link never moves a ranking.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub name_only: bool,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -239,58 +230,57 @@ pub struct CodeRefsOutput {
     pub direction: &'static str,
     /// What one row counts, named for the direction.
     pub unit: &'static str,
+    /// Hops walked. One is the direct neighbourhood.
+    pub depth: usize,
     /// Definitions the selector matched. More than one means the answer is a union.
     pub matched: Vec<SymbolRef>,
-    pub references: Vec<RankedSymbol>,
-    pub shown: usize,
-    pub total: usize,
-    pub truncated: bool,
-    pub counts_floor: bool,
-    pub estimated_tokens: usize,
-    pub graph: GraphSummary,
-}
-
-#[derive(Clone, Debug, JsonSchema, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CodeImpactOutput {
-    pub symbol: String,
-    pub depth: usize,
-    pub matched: Vec<SymbolRef>,
-    /// Symbols that reach the seed within `depth` hops, nearest first.
-    pub reached: Vec<ReachedSymbol>,
-    /// The subset of `reached` sitting in test scope, which is the existing coverage of this change.
-    pub tests_reaching: Vec<ReachedSymbol>,
-    pub shown: usize,
-    pub total: usize,
-    pub truncated: bool,
-    pub counts_floor: bool,
-    pub estimated_tokens: usize,
-    pub graph: GraphSummary,
-}
-
-#[derive(Clone, Debug, JsonSchema, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CodeExpandOutput {
-    pub symbol: String,
-    pub path: String,
-    pub kind: String,
-    pub line_start: usize,
-    pub line_end: usize,
-    pub source: String,
-    /// Symbols referencing this one. A floor.
-    pub callers: Vec<SymbolRef>,
-    /// Symbols this one references. A floor.
-    pub callees: Vec<SymbolRef>,
-    /// Set when the whole file was served instead of the ranked bundle.
-    ///
-    /// The bundle can cost more than the file it was assembled from. When it does, the file is the
-    /// cheaper and more complete answer, and pretending otherwise sells a summary at a premium.
+    /// Nearest first; within one hop, callers by rank and callees in source order.
+    pub references: Vec<ReferenceRow>,
+    /// Rows found at each hop, from hop one. Present when more than one hop was walked.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub by_depth: Vec<usize>,
+    /// Rows sitting in test scope: the existing coverage of a change. Present when more than one
+    /// hop was walked.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub served_whole_file: Option<String>,
+    pub tests_reaching: Option<usize>,
+    /// Calls spelling the selected name that were not linked to it, because their receiver or
+    /// qualifier points at a type outside the tree.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub declined: usize,
+    pub shown: usize,
+    pub total: usize,
     pub truncated: bool,
     pub counts_floor: bool,
     pub estimated_tokens: usize,
     pub graph: GraphSummary,
+}
+
+impl CodeRefsOutput {
+    /// The file a row's call sites sit in when they need no path: the caller's own body, or for
+    /// callees the selected symbol's.
+    #[must_use]
+    pub fn site_home<'a>(&'a self, row: &'a ReferenceRow) -> &'a str {
+        if self.direction == Direction::Callees.name() {
+            self.matched.first().map_or("", |seed| seed.path.as_str())
+        } else {
+            row.symbol.path.as_str()
+        }
+    }
+
+    /// A row's call sites labelled against [`Self::site_home`].
+    #[must_use]
+    pub fn site_labels(&self, row: &ReferenceRow) -> Vec<String> {
+        let home = self.site_home(row);
+        row.sites.iter().map(|site| site.label(home)).collect()
+    }
+}
+
+impl ReferenceRow {
+    /// Call sites the per-row cap left out.
+    #[must_use]
+    pub fn sites_withheld(&self) -> usize {
+        self.sites_total.saturating_sub(self.sites.len())
+    }
 }
 
 /// A selector that named nothing.

@@ -7,10 +7,16 @@
 //! The tree is dropped as soon as facts are extracted. A whole-repository parse that retained trees
 //! would not fit any bound worth committing to.
 
+use std::collections::BTreeSet;
+
 use tree_sitter::{Node, Parser, QueryCursor, StreamingIterator as _, Tree};
 use workcell_source_languages::{CaptureRole, Language, LanguageFamily, ReferenceKind, SymbolKind};
 
-use crate::model::{ByteSpan, LineSpan, Metrics};
+use crate::model::{ByteSpan, CallForm, LineSpan, Metrics};
+
+/// Path roots that are never this tree: the standard library's three crates.
+pub(crate) const STANDARD_CRATE_ROOTS: &[&str] = &["std", "core", "alloc"];
+const PATH_SEPARATOR: &str = "::";
 
 /// Extraction limits. Host-owned; never accepted from model input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +53,8 @@ impl Default for ExtractLimits {
 pub struct FileFacts {
     pub definitions: Vec<RawDefinition>,
     pub references: Vec<RawReference>,
+    /// Type names, qualifiers and imported names the file spells, sorted and deduplicated.
+    pub mentions: Vec<String>,
     pub parse_error: bool,
     pub definitions_truncated: bool,
     pub references_truncated: bool,
@@ -63,6 +71,7 @@ pub struct RawDefinition {
     pub metrics: Metrics,
     pub test_scope: bool,
     pub documentation: Option<String>,
+    pub owner: Option<String>,
 }
 
 /// A reference before its enclosing definition has a node id.
@@ -71,6 +80,8 @@ pub struct RawReference {
     pub name: String,
     pub kind: ReferenceKind,
     pub qualifier: Option<String>,
+    pub call_form: CallForm,
+    pub receiver: Option<String>,
     pub byte: usize,
     pub line: usize,
     /// Index into this file's definition list, resolved to a `NodeId` once ids are assigned.
@@ -191,11 +202,20 @@ fn extract_from_tree(
     // document order across patterns, so nothing downstream may assume ordering here.
     let mut definitions: Vec<(RawDefinition, ByteSpan)> = Vec::new();
     let mut references: Vec<RawReference> = Vec::new();
+    // Bounded by the reference ceiling: evidence, like references, is a floor once truncated.
+    let mut mentions: BTreeSet<String> = BTreeSet::new();
+    let mut mention = |text: &str| {
+        if mentions.len() < limits.max_references_per_file && !mentions.contains(text) {
+            mentions.insert(text.to_owned());
+        }
+    };
 
     while let Some(matched) = matches.next() {
         let mut anchor: Option<(CaptureRole, Node<'_>)> = None;
         let mut name_node: Option<Node<'_>> = None;
         let mut qualifier_node: Option<Node<'_>> = None;
+        let mut receiver_node: Option<Node<'_>> = None;
+        let mut owner_node: Option<Node<'_>> = None;
         let mut doc_node: Option<Node<'_>> = None;
 
         for capture in matched.captures() {
@@ -205,6 +225,15 @@ fn extract_from_tree(
                 }
                 CaptureRole::Name => name_node = Some(capture.node),
                 CaptureRole::Qualifier => qualifier_node = Some(capture.node),
+                CaptureRole::Receiver => receiver_node = Some(capture.node),
+                CaptureRole::Owner => owner_node = Some(capture.node),
+                CaptureRole::Mention => {
+                    if let Ok(text) = capture.node.utf8_text(bytes)
+                        && text.len() <= limits.max_name_bytes
+                    {
+                        mention(text);
+                    }
+                }
                 CaptureRole::Doc => doc_node = Some(capture.node),
                 CaptureRole::Ignored => {}
             }
@@ -243,6 +272,12 @@ fn extract_from_tree(
                         documentation: doc_node
                             .and_then(|node| text_of(node, bytes, limits.max_documentation_bytes))
                             .map(|text| clean_documentation(&text)),
+                        owner: owner_node
+                            .and_then(|node| node.utf8_text(bytes).ok())
+                            .and_then(path_ends)
+                            .map(|(_, last)| last)
+                            .filter(|owner| owner.len() <= limits.max_name_bytes)
+                            .map(str::to_owned),
                     },
                     span,
                 ));
@@ -258,11 +293,32 @@ fn extract_from_tree(
                     facts.references_truncated = true;
                     continue;
                 }
+                let qualifier = qualifier_node
+                    .and_then(|node| node.utf8_text(bytes).ok())
+                    .and_then(|path| reference_qualifier(path, kind))
+                    .filter(|qualifier| qualifier.len() <= limits.max_name_bytes);
+                if let Some(qualifier) = qualifier {
+                    mention(qualifier);
+                }
+                if kind == ReferenceKind::Import {
+                    mention(&name);
+                }
+                let call_form = if receiver_node.is_some() {
+                    CallForm::Member
+                } else if qualifier_node.is_some() {
+                    CallForm::Qualified
+                } else {
+                    CallForm::Bare
+                };
                 references.push(RawReference {
                     name,
                     kind,
-                    qualifier: qualifier_node
-                        .and_then(|node| text_of(node, bytes, limits.max_name_bytes)),
+                    qualifier: qualifier.map(str::to_owned),
+                    call_form,
+                    receiver: receiver_node
+                        .and_then(|node| node.utf8_text(bytes).ok())
+                        .filter(|text| text.len() <= limits.max_name_bytes && is_identifier(text))
+                        .map(str::to_owned),
                     byte: node.start_byte(),
                     line: node.start_position().row + 1,
                     enclosing: None,
@@ -279,7 +335,74 @@ fn extract_from_tree(
         .map(|(definition, _)| definition)
         .collect();
     facts.references = references;
+    facts.mentions = mentions.into_iter().collect();
     facts
+}
+
+/// The scope a reference's path names, normalized the way [`crate::model::Reference::qualifier`]
+/// documents.
+fn reference_qualifier(path: &str, kind: ReferenceKind) -> Option<&str> {
+    let (first, last) = path_ends(path)?;
+    Some(
+        if kind == ReferenceKind::Import || STANDARD_CRATE_ROOTS.contains(&first) {
+            first
+        } else {
+            last
+        },
+    )
+}
+
+/// The first and last segments of a `::` path, with generic arguments, references and pointer
+/// sigils removed: `Vec::<u32>` is `(Vec, Vec)`, `&'a mut crate::ui::Widget<T>` is
+/// `(crate, Widget)`.
+///
+/// A segment that is not an identifier once stripped, such as `<T as Trait>` or a slice type,
+/// contributes nothing, so a path made only of those has no ends.
+fn path_ends<'path>(path: &'path str) -> Option<(&'path str, &'path str)> {
+    let mut first = None;
+    let mut last = None;
+    let mut depth = 0usize;
+    let mut start = 0;
+    let mut index = 0;
+    let bytes = path.as_bytes();
+    let mut close = |segment: &'path str| {
+        if let Some(segment) = path_segment(segment) {
+            first.get_or_insert(segment);
+            last = Some(segment);
+        }
+    };
+    while index < bytes.len() {
+        match bytes[index] {
+            b'<' => depth += 1,
+            b'>' => depth = depth.saturating_sub(1),
+            b':' if depth == 0 && path[index..].starts_with(PATH_SEPARATOR) => {
+                close(&path[start..index]);
+                index += PATH_SEPARATOR.len();
+                start = index;
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    close(&path[start..]);
+    Some((first?, last?))
+}
+
+fn path_segment(segment: &str) -> Option<&str> {
+    let before_generics = segment.split('<').next()?;
+    let word = before_generics
+        .split_whitespace()
+        .last()?
+        .trim_start_matches(['&', '*']);
+    is_identifier(word).then_some(word)
+}
+
+fn is_identifier(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|character| character.is_alphanumeric() || character == '_')
 }
 
 /// Collapses captures that describe the same definition.
@@ -324,6 +447,9 @@ fn dedup(mut captured: Vec<(RawDefinition, ByteSpan)>) -> Vec<(RawDefinition, By
                 previous.test_scope |= definition.test_scope;
                 if previous.documentation.is_none() {
                     previous.documentation = definition.documentation;
+                }
+                if previous.owner.is_none() {
+                    previous.owner = definition.owner;
                 }
             }
             _ => merged.push((definition, span)),
@@ -786,6 +912,68 @@ fn branchy(value: u32) -> u32 {
                 .collect::<Vec<_>>()
         };
         assert_eq!(names(&first), names(&second));
+    }
+
+    #[test_case("fn c() { helper(); }", "helper", CallForm::Bare, None ; "a bare call")]
+    #[test_case("fn c(v: V) { v.clone(); }", "clone", CallForm::Member, None ; "a member call")]
+    #[test_case("fn c() { Vec::<u32>::new(); }", "new", CallForm::Qualified, Some("Vec") ; "a turbofish type")]
+    #[test_case("fn c() { crate::a::Widget::new(); }", "new", CallForm::Qualified, Some("Widget") ; "a crate path")]
+    #[test_case("fn c() { a::Widget::<T>::new(); }", "new", CallForm::Qualified, Some("Widget") ; "a generic type in a module")]
+    #[test_case("fn c() { Self::helper(); }", "helper", CallForm::Qualified, Some("Self") ; "the self type")]
+    #[test_case("fn c(v: u8) { std::mem::take(v); }", "take", CallForm::Qualified, Some("std") ; "a std path")]
+    #[test_case("fn c() { <W as Shape>::area(); }", "area", CallForm::Qualified, None ; "a qualified self type")]
+    fn a_rust_call_records_its_form_and_its_normalized_qualifier(
+        source: &str,
+        name: &str,
+        form: CallForm,
+        qualifier: Option<&str>,
+    ) {
+        let facts = facts(source, Language::Rust);
+        let call = facts
+            .references
+            .iter()
+            .find(|reference| reference.name == name)
+            .expect("call");
+        assert_eq!(call.call_form, form);
+        assert_eq!(call.qualifier.as_deref(), qualifier);
+    }
+
+    #[test_case("impl<T> Foo<T> { fn a(&self) {} }", Some("Foo") ; "a generic impl")]
+    #[test_case("impl ui::Foo { fn a(&self) {} }", Some("Foo") ; "a path impl")]
+    #[test_case("impl<'a> Shape for &'a mut Foo { fn a(&self) {} }", Some("Foo") ; "a trait impl for a reference")]
+    #[test_case("trait Shape { fn a(&self) {} }", Some("Shape") ; "a trait default method")]
+    #[test_case("mod m { fn a() {} }", None ; "a function in an inline module")]
+    #[test_case("fn a() {}", None ; "a free function")]
+    fn a_rust_definition_records_the_type_that_owns_it(source: &str, owner: Option<&str>) {
+        let facts = facts(source, Language::Rust);
+        let definition = facts
+            .definitions
+            .iter()
+            .find(|definition| definition.name == "a")
+            .expect("a");
+        assert_eq!(definition.owner.as_deref(), owner);
+    }
+
+    #[test]
+    fn a_rust_file_mentions_the_types_and_imports_it_spells() {
+        let facts = facts(
+            "use std::collections::HashMap;\nuse crate::store::{Store as Shelf};\nfn c(w: &Widget) { Panel::open(); }",
+            Language::Rust,
+        );
+        for name in ["HashMap", "Shelf", "Widget", "Panel"] {
+            assert!(
+                facts.mentions.binary_search(&name.to_owned()).is_ok(),
+                "{name} missing from {:?}",
+                facts.mentions
+            );
+        }
+        let import = facts
+            .references
+            .iter()
+            .find(|reference| reference.name == "HashMap")
+            .expect("import");
+        assert_eq!(import.kind, ReferenceKind::Import);
+        assert_eq!(import.qualifier.as_deref(), Some("std"));
     }
 
     #[test]

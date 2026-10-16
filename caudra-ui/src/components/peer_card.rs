@@ -1181,6 +1181,7 @@ mod tests {
                 raw_input: None,
                 model_suffix: None,
                 refused: false,
+                accounting: Default::default(),
             }],
             text: RAW_JSON.into(),
         };

@@ -21,10 +21,9 @@ pub use workcell_mcp_code::CodeToolGroup;
 pub use workcell_mcp_code_graph as code_graph;
 #[cfg(feature = "code-graph")]
 pub use workcell_mcp_code_graph::{
-    CodeContextInput, CodeContextOutput, CodeExpandInput, CodeExpandOutput, CodeGraphError,
-    CodeGraphLimits, CodeGraphToolGroup, CodeImpactInput, CodeImpactOutput, CodeMapInput,
-    CodeMapOutput, CodeRefsInput, CodeRefsOutput, Direction, GraphPhase, GraphProgress,
-    GraphProgressSink, GraphSummary, RankedSymbol, ReachedSymbol, SelectorRefusal, SymbolRef,
+    CodeContextInput, CodeContextOutput, CodeGraphError, CodeGraphLimits, CodeGraphToolGroup,
+    CodeRefsInput, CodeRefsOutput, Direction, GraphPhase, GraphProgress, GraphProgressSink,
+    GraphSummary, RankedSymbol, ReferenceRow, SelectorRefusal, SiteRef, SymbolRef,
     crawl_filesystem_limits, fit,
 };
 // `ModelText` is the name two groups give their model-facing rendering, so the facade cannot

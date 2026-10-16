@@ -3,7 +3,7 @@ title: "Tools"
 description: "Every built-in tool and its parameters."
 ---
 
-Caudra ships with 36 built-in tools in this reference (36 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Caudra ships with 33 built-in tools in this reference (33 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 First-party file, web, shell, index, Python, and environment tools run through protocol-neutral Workcell contracts. Workcell owns schemas, validation, execution bounds, atomic file changes, network policy, subprocess cleanup, cancellation, and the bundled worker lifecycle. Caudra owns registration, authorization, retained session output, and model or UI presentation. Release builds pin an exact Workcell revision.
 
@@ -38,11 +38,9 @@ Run [`caudra tools`](/docs/cli/) to see the resulting set, including which rule 
 
 ## Tools loaded on demand
 
-The default loading policy lets 10 built-in tools start outside the request array. The model sees a `tool_search` entry instead, and one call with a query loads the matching tools for the rest of the session. Sessions that never need them never pay for their descriptions. An explicit profile policy can make other native, local or remote Workcell, Lua/plugin, or local callback tools lazy too. A lazy MCP tool stays out of the [server list](/docs/mcp/#code-mode) and is found with `search()` inside `mcp`. A known-name direct call to an eligible lazy tool is valid and loads its schema. `tool_search` disappears when no eligible pending tools remain.
+The default loading policy lets 5 built-in tools start outside the request array. The model sees a `tool_search` entry instead, and one call with a query loads the best-matching tool for the rest of the session. Sessions that never need them never pay for their descriptions. An explicit profile policy can make other native, local or remote Workcell, Lua/plugin, or local callback tools lazy too. A lazy MCP tool stays out of the [server list](/docs/mcp/#code-mode) and is found with `search()` inside `mcp`. A known-name direct call to an eligible lazy tool is valid and loads its schema. `tool_search` disappears when no eligible pending tools remain.
 
-`code_map`, `code_context`, `code_refs`, `code_impact`, and `code_expand` load together as the code graph bundle, limited to eligible lazy members. Profile policy groups do not create additional loading bundles.
-
-`execution_environment`, `image_generate`, `python_execution`, `workflow`, and `automation` load on their own.
+`execution_environment`, `image_generate`, `python_execution`, `workflow`, and `automation` each load on their own.
 
 Loading changes the tool array, so the provider's prompt cache prefix resets and the next request re-reads the history as fresh input. Caudra posts a notice naming what loaded when it happens.
 
@@ -167,55 +165,27 @@ The code tools and `file_index` read 37 languages and formats: Rust, Python, Typ
 
 Every count and reach set is a lower bound. A call made through dynamic dispatch, a callback, or a macro adds no edge, so a count of zero means that none was found. A symbol name that matches nothing is refused with up to five close matches to try.
 
-### `code_map` <span class="badge">on demand</span> {#code_map}
-
-Rank every symbol in a source tree by importance and return the top ones. Start here when you do not know a codebase.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent. |
-| `limit` | integer | no | Maximum rows to return. Narrows the result; it can never widen it past the host ceiling. |
-
-### `code_context` <span class="badge">on demand</span> {#code_context}
+### `code_context` {#code_context}
 
 Return the symbols worth reading before making a specific change. Describe the change in your own words.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `task` | string | yes | The change you are about to make, in your own words. |
-| `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent. |
+| `path` | string | no | Root-relative subdirectory to scope the graph to. Absent means the whole configured root, and an empty string is the same as absent. |
 | `limit` | integer | no | Maximum rows to return. Narrows the result; it can never widen it past the host ceiling. |
 
-### `code_refs` <span class="badge">on demand</span> {#code_refs}
+### `code_refs` {#code_refs}
 
-List the symbols that reference a given symbol, or the symbols it references.
+List what calls a symbol and from which lines, or what it calls. With `depth`, show what a change to it could reach and which tests already cover it. Use it instead of grep for a symbol's callers and call sites.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `symbol` | string | yes | A symbol name, optionally qualified as `path::name` to disambiguate. |
 | `direction` | string | no | `callers` lists symbols referencing this one; `callees` lists the ones it references. |
-| `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent. |
+| `depth` | integer | no | Hops to walk back along call edges, callers only. Above 1 the result is what a change could reach. Beyond a few hops a reachability set describes the repository rather than a blast radius. |
+| `path` | string | no | Root-relative subdirectory to scope the graph to. Absent means the whole configured root, and an empty string is the same as absent. |
 | `limit` | integer | no | Maximum rows to return. Narrows the result; it can never widen it past the host ceiling. |
-
-### `code_impact` <span class="badge">on demand</span> {#code_impact}
-
-Show what a change to a symbol could reach, and which tests already cover it.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `symbol` | string | yes | A symbol name, optionally qualified as `path::name` to disambiguate. |
-| `depth` | integer | no | Hops to walk backwards along call edges. Beyond a few hops a reachability set describes the repository rather than a blast radius. |
-| `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent. |
-| `limit` | integer | no | Maximum rows to return. Narrows the result; it can never widen it past the host ceiling. |
-
-### `code_expand` <span class="badge">on demand</span> {#code_expand}
-
-Return one symbol's source together with its immediate callers and callees.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `symbol` | string | yes | A symbol name, optionally qualified as `path::name` to disambiguate. |
-| `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent. |
 
 ## Execution & Control
 

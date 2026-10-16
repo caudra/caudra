@@ -1,21 +1,26 @@
-//! Building one graph and answering the five questions against it.
+//! Building one graph and answering the two questions against it.
 //!
 //! Each tool call builds a graph, answers, and drops it. The group is stateless between calls
 //! except for the extraction cache, which is a cost decision that cannot change an answer: the
 //! engine's warm==cold gate is what makes that claim checkable rather than aspirational.
 
-use std::collections::{BTreeSet, HashMap};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeSet, HashMap},
+};
 
 use workcell_code_graph::{
-    Facts, FactsCache, Graph, NodeId, Ranking, SymbolKind, Teleport, ingest_cached, pagerank,
-    reaching_hops, resolve, retrieve,
+    CallSite, Facts, FactsCache, Graph, NodeId, Ranking, SymbolKind, Teleport, ingest_cached,
+    pagerank, reaching_hops, resolve, retrieve,
 };
 
 use crate::{
     crawl::Crawled,
     limits::CodeGraphLimits,
     progress::{GraphPhase, PhaseNotifier},
-    types::{Direction, GraphSummary, RankedSymbol, ReachedSymbol, SelectorRefusal, SymbolRef},
+    types::{
+        Direction, GraphSummary, RankedSymbol, ReferenceRow, SelectorRefusal, SiteRef, SymbolRef,
+    },
 };
 
 /// Bytes per token used for the `estimatedTokens` field.
@@ -26,6 +31,9 @@ use crate::{
 /// estimate errs toward overstating cost. A caller budgeting against it will under-fill rather than
 /// overrun, which is the safe direction for a context window.
 const BYTES_PER_TOKEN: usize = 4;
+/// Call sites listed on one row. Past this the row says how many more there are, so a symbol called
+/// from one loop body a hundred times does not crowd out every other caller.
+const MAX_SITES_PER_ROW: usize = 16;
 
 /// A calibrated token estimate for a byte count.
 #[must_use]
@@ -130,6 +138,7 @@ impl CodeGraph {
             resolved_references: resolved,
             unresolved_references: graph.diagnostics.unresolved,
             ambiguous_references: graph.diagnostics.ambiguous,
+            declined_references: graph.diagnostics.declined,
             edges: graph.edge_count(),
             pr_iterations: ranking.iterations,
             pr_converged: ranking.converged,
@@ -204,12 +213,6 @@ impl CodeGraph {
         })
     }
 
-    /// Symbols ranked highest first, as node ids.
-    #[must_use]
-    pub fn ordered(&self) -> Vec<NodeId> {
-        self.ranking.ordered()
-    }
-
     /// Resolves a selector to every definition it names.
     ///
     /// A selector may be a bare name or `path::name`, where `path` is any suffix of the defining
@@ -271,45 +274,135 @@ impl CodeGraph {
             .collect()
     }
 
-    /// Callers or callees of every node in `seeds`, ranked.
+    /// Every row reachable from `seeds` within `depth` hops, nearest first, and how many there
+    /// were at each hop.
+    ///
+    /// Callers within one hop keep rank order, which is what a reader scanning for the important
+    /// caller wants. Callees keep the order the body calls them in: ranking a body's calls by global
+    /// importance floats the utilities every body calls to the top and buries what this one does.
     #[must_use]
-    pub fn references(&self, seeds: &[NodeId], direction: Direction) -> Vec<RankedSymbol> {
-        let mut nodes: Vec<NodeId> = match direction {
+    pub fn references(
+        &self,
+        seeds: &[NodeId],
+        direction: Direction,
+        depth: usize,
+    ) -> (Vec<ReferenceRow>, Vec<usize>) {
+        let seed_set: BTreeSet<NodeId> = seeds.iter().copied().collect();
+        let reached: Vec<(NodeId, usize)> = match direction {
+            Direction::Callers if depth > 1 => {
+                reaching_hops(&self.graph, seeds, depth, self.graph.node_count())
+            }
             Direction::Callers => seeds
                 .iter()
                 .flat_map(|&seed| self.callers_of(seed))
+                .map(|node| (node, 1))
                 .collect(),
             Direction::Callees => seeds
                 .iter()
-                .flat_map(|&seed| self.callees_of(seed).iter().copied())
+                .flat_map(|&seed| self.callees_of(seed).iter().map(|&node| (node, 1)))
                 .collect(),
         };
-        nodes.sort_unstable();
-        nodes.dedup();
-        let seeds: BTreeSet<NodeId> = seeds.iter().copied().collect();
-        let mut rows: Vec<RankedSymbol> = nodes
+        let mut nodes: Vec<(NodeId, usize)> = reached
             .into_iter()
-            .filter(|node| !seeds.contains(node))
-            .filter_map(|node| self.ranked(node))
+            .filter(|(node, _)| !seed_set.contains(node))
             .collect();
-        sort_by_rank(&mut rows);
-        rows
-    }
+        nodes.sort_unstable();
+        nodes.dedup_by_key(|(node, _)| *node);
 
-    /// Symbols reaching `seeds` within `depth` hops, nearest first.
-    #[must_use]
-    pub fn impact(&self, seeds: &[NodeId], depth: usize, limit: usize) -> Vec<ReachedSymbol> {
-        reaching_hops(&self.graph, seeds, depth, limit)
+        let mut by_depth = vec![0_usize; depth];
+        let mut rows: Vec<(ReferenceRow, Option<(u32, usize)>)> = nodes
             .into_iter()
             .filter_map(|(node, hops)| {
-                let definition = self.facts.definition(node)?;
-                Some(ReachedSymbol {
-                    symbol: self.symbol_ref(node)?,
-                    hops,
-                    test_scope: definition.test_scope,
-                })
+                if let Some(count) = by_depth.get_mut(hops.saturating_sub(1)) {
+                    *count += 1;
+                }
+                let symbol = self.ranked(node)?;
+                let (sites, name_only) = if hops == 1 {
+                    self.sites_between(seeds, node, direction)
+                } else {
+                    (Vec::new(), false)
+                };
+                let first = sites.first().map(|site| (site.file, site.byte));
+                let sites_total = sites.len();
+                let sites = sites
+                    .iter()
+                    .take(MAX_SITES_PER_ROW)
+                    .filter_map(|site| self.site_ref(site))
+                    .collect::<Vec<_>>();
+                Some((
+                    ReferenceRow {
+                        symbol,
+                        hops,
+                        sites_total: if sites_total > sites.len() {
+                            sites_total
+                        } else {
+                            0
+                        },
+                        sites,
+                        name_only,
+                    },
+                    first,
+                ))
             })
-            .collect()
+            .collect();
+        match direction {
+            Direction::Callees => rows.sort_by_key(|row| row.1),
+            Direction::Callers => rows.sort_by(|left, right| {
+                left.0
+                    .hops
+                    .cmp(&right.0.hops)
+                    .then_with(|| compare_rank(&left.0.symbol, &right.0.symbol))
+            }),
+        }
+        if depth == 1 {
+            by_depth.clear();
+        }
+        (rows.into_iter().map(|(row, _)| row).collect(), by_depth)
+    }
+
+    /// The call sites joining `node` to any seed, in source order, and whether every edge between
+    /// them was a name-only guess.
+    fn sites_between(
+        &self,
+        seeds: &[NodeId],
+        node: NodeId,
+        direction: Direction,
+    ) -> (Vec<CallSite>, bool) {
+        let mut sites = Vec::new();
+        let mut name_only = true;
+        for &seed in seeds {
+            let (from, to) = match direction {
+                Direction::Callers => (node, seed),
+                Direction::Callees => (seed, node),
+            };
+            let between = self.graph.call_sites(from, to);
+            if between.is_empty() {
+                continue;
+            }
+            name_only &= self.graph.name_only(from, to);
+            sites.extend_from_slice(between);
+        }
+        sites.sort_by_key(|site| (site.file, site.byte));
+        sites.dedup_by_key(|site| (site.file, site.byte));
+        let name_only = name_only && !sites.is_empty();
+        (sites, name_only)
+    }
+
+    fn site_ref(&self, site: &CallSite) -> Option<SiteRef> {
+        Some(SiteRef {
+            path: self.facts.file(site.file)?.path.clone(),
+            line: site.line,
+        })
+    }
+
+    /// Calls spelling `name` that resolution declined to link to any in-tree definition.
+    #[must_use]
+    pub fn declined(&self, name: &str) -> usize {
+        self.graph
+            .diagnostics
+            .declined_by_name
+            .get(name)
+            .map_or(0, |&count| count as usize)
     }
 
     /// Task-shaped retrieval over the built graph.
@@ -321,15 +414,17 @@ impl CodeGraph {
 
 /// Orders by descending rank, then by path and line so equal ranks do not churn between runs.
 pub fn sort_by_rank(rows: &mut [RankedSymbol]) {
-    rows.sort_by(|left, right| {
-        right
-            .rank
-            .partial_cmp(&left.rank)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.path.cmp(&right.path))
-            .then_with(|| left.line_start.cmp(&right.line_start))
-            .then_with(|| left.name.cmp(&right.name))
-    });
+    rows.sort_by(compare_rank);
+}
+
+fn compare_rank(left: &RankedSymbol, right: &RankedSymbol) -> Ordering {
+    right
+        .rank
+        .partial_cmp(&left.rank)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| left.path.cmp(&right.path))
+        .then_with(|| left.line_start.cmp(&right.line_start))
+        .then_with(|| left.name.cmp(&right.name))
 }
 
 /// Splits `path::name` or `path:name` into its parts.

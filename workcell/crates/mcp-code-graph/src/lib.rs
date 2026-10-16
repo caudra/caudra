@@ -1,14 +1,11 @@
-//! Repository-scale symbol map, retrieval, and impact tools over one confined source tree.
+//! Task retrieval and call-graph reference tools over one confined source tree.
 //!
-//! Five questions, one graph:
+//! Two questions, one graph:
 //!
 //! | Tool | Answers |
 //! | --- | --- |
-//! | `code_map` | orient: what are the important symbols here |
 //! | `code_context` | what should I read before making this change |
-//! | `code_refs` | what references this, or what does this reference |
-//! | `code_impact` | what breaks if I change this, and what tests cover it |
-//! | `code_expand` | show me this symbol and what sits next to it |
+//! | `code_refs` | what calls this and from which lines, what does it call, and with `depth` what a change reaches and which tests cover it |
 //!
 //! # What the graph is not
 //!
@@ -40,18 +37,14 @@ pub use catalog::specs;
 pub use crawl::{CrawlSkip, CrawlTruncation, Crawled, crawl, crawl_filesystem_limits};
 pub use engine::{CodeGraph, estimate_tokens};
 pub use error::CodeGraphError;
-pub use group::{
-    CodeGraphToolGroup, PreparedCodeContext, PreparedCodeExpand, PreparedCodeImpact,
-    PreparedCodeMap, PreparedCodeRefs,
-};
+pub use group::{CodeGraphToolGroup, PreparedCodeContext, PreparedCodeRefs};
 pub use limits::CodeGraphLimits;
 pub use model_text::ModelText;
 pub use progress::{
     GraphPhase, GraphProgress, GraphProgressSink, PROGRESS_FILE_INTERVAL, PhaseNotifier,
 };
 pub use types::{
-    CodeContextInput, CodeContextOutput, CodeExpandInput, CodeExpandOutput, CodeImpactInput,
-    CodeImpactOutput, CodeMapInput, CodeMapOutput, CodeRefsInput, CodeRefsOutput, Direction,
-    GraphSummary, RankedSymbol, ReachedSymbol, SelectorRefusal, SymbolRef,
+    CodeContextInput, CodeContextOutput, CodeRefsInput, CodeRefsOutput, Direction, GraphSummary,
+    RankedSymbol, ReferenceRow, SelectorRefusal, SiteRef, SymbolRef, site_label,
 };
 pub use workcell_tool_contract::{ToolAnnotations, ToolSpec};

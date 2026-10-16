@@ -58,6 +58,7 @@ fn entry(call: &McpCodeCall) -> BatchToolEntry {
         output,
         model_suffix: None,
         refused: call.status == McpCodeCallStatus::Refused,
+        accounting: Default::default(),
     }
 }
 

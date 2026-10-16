@@ -100,6 +100,12 @@ pub enum CaptureRole {
     Doc,
     /// The qualifier segment of a qualified reference, used by the precise resolution tiers.
     Qualifier,
+    /// The receiver expression of a member call: the `value` of `value.name()`.
+    Receiver,
+    /// The type a definition is a member of: the self type of a Rust `impl`, or the trait it sits in.
+    Owner,
+    /// A type name the file mentions, recorded as evidence and never as a use site of its own.
+    Mention,
     /// A capture the extractor ignores. Queries may name intermediate nodes for readability.
     Ignored,
 }
@@ -141,6 +147,9 @@ impl CaptureRole {
             "name" => Self::Name,
             "doc" => Self::Doc,
             "qualifier" | "scope" => Self::Qualifier,
+            "receiver" => Self::Receiver,
+            "owner" => Self::Owner,
+            "mention" => Self::Mention,
             _ => Self::Ignored,
         }
     }
@@ -176,6 +185,9 @@ mod tests {
         );
         assert_eq!(CaptureRole::classify("name"), CaptureRole::Name);
         assert_eq!(CaptureRole::classify("qualifier"), CaptureRole::Qualifier);
+        assert_eq!(CaptureRole::classify("receiver"), CaptureRole::Receiver);
+        assert_eq!(CaptureRole::classify("owner"), CaptureRole::Owner);
+        assert_eq!(CaptureRole::classify("mention"), CaptureRole::Mention);
     }
 
     #[test]

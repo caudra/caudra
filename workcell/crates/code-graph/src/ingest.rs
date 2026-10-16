@@ -205,6 +205,7 @@ fn ingest_with(
             language,
             bytes: input.source.len(),
             lines: input.source.lines().count(),
+            mentions: file_facts.mentions.clone(),
         });
         per_file.push((id, file_facts));
     }
@@ -230,6 +231,7 @@ fn ingest_with(
                 metrics: raw.metrics,
                 test_scope: raw.test_scope,
                 documentation: raw.documentation.clone(),
+                owner: raw.owner.clone(),
             });
         }
     }
@@ -258,6 +260,8 @@ fn ingest_with(
                 name: raw.name.clone(),
                 kind: raw.kind,
                 qualifier: raw.qualifier.clone(),
+                call_form: raw.call_form,
+                receiver: raw.receiver.clone(),
                 byte: raw.byte,
                 line: raw.line,
                 enclosing,

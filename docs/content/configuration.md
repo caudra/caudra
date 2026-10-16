@@ -429,7 +429,7 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 | `bash` | 5 | `shell` |
 | `python_execution` | 5 | `python_execution` |
 | `task` | 12 | `task`, `task_control` |
-| `index` | 3 | `file_index`, `code_map`, `code_context`, `code_refs`, `code_impact`, `code_expand` |
+| `index` | 3 | `file_index`, `code_context`, `code_refs` |
 | `grep` | 3 | `file_grep`, `file_glob` |
 | `read` | 3 | `file_read` |
 | `write` | 7 | `file_write`, `file_edit`, `file_apply_patch`, `image_generate`, `memory`, `plan` |

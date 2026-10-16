@@ -2074,7 +2074,7 @@ mod browse_tests {
     #[test_case("file.grep.v1", PermissionResourceKind::Directory, PermissionResourceAccess::Search; "grep")]
     #[test_case("file.index.v1", PermissionResourceKind::Directory, PermissionResourceAccess::Search; "directory_index")]
     #[test_case("file.index.v1", PermissionResourceKind::File, PermissionResourceAccess::Read; "source_index")]
-    #[test_case("code.map.v1", PermissionResourceKind::Directory, PermissionResourceAccess::Search; "code_graph")]
+    #[test_case("code.refs.v1", PermissionResourceKind::Directory, PermissionResourceAccess::Search; "code_graph")]
     #[test_case("file.write.v1", PermissionResourceKind::File, PermissionResourceAccess::Write; "write")]
     #[test_case("shell.execution.v1", PermissionResourceKind::Command, PermissionResourceAccess::Execute; "shell")]
     #[test_case(GLOB_CONTRACT, PermissionResourceKind::Directory, PermissionResourceAccess::Search; "generic_directory_search")]

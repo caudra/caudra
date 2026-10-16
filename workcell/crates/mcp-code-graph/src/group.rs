@@ -8,7 +8,7 @@ use std::{
 use tokio::sync::mpsc;
 
 use tokio_util::sync::CancellationToken;
-use workcell_code_graph::FactsCache;
+use workcell_code_graph::{FactsCache, NodeId};
 use workcell_mcp_files::{FileResource, FileResourceAccess, FileToolGroup};
 
 use crate::{
@@ -19,19 +19,20 @@ use crate::{
     model_text::ModelText,
     progress::{GraphPhase, GraphProgress, GraphProgressSink, report},
     types::{
-        CodeContextInput, CodeContextOutput, CodeExpandInput, CodeExpandOutput, CodeImpactInput,
-        CodeImpactOutput, CodeMapInput, CodeMapOutput, CodeRefsInput, CodeRefsOutput, RankedSymbol,
-        SelectorRefusal, SymbolRef,
+        CodeContextInput, CodeContextOutput, CodeRefsInput, CodeRefsOutput, Direction,
+        RankedSymbol, SelectorRefusal,
     },
 };
 
-/// Deepest impact walk, regardless of what the caller asks for.
+/// Deepest reference walk, regardless of what the caller asks for.
 ///
 /// Beyond a handful of hops a backwards reachability set stops describing a blast radius and starts
 /// describing the repository: in a connected call graph almost everything reaches almost everything
 /// given enough hops, and the answer is true, useless, and expensive.
-const MAX_IMPACT_DEPTH: usize = 8;
-const DEFAULT_IMPACT_DEPTH: usize = 3;
+pub(crate) const MAX_REFS_DEPTH: usize = 8;
+const DEFAULT_REFS_DEPTH: usize = 1;
+const CALLEES_DEPTH_REFUSED: &str =
+    "depth walks callers only; callees are one body's own calls, so ask for them with depth 1";
 
 #[derive(Debug)]
 struct PreparedScope {
@@ -48,12 +49,6 @@ impl PreparedScope {
 }
 
 #[derive(Debug)]
-pub struct PreparedCodeMap {
-    scope: PreparedScope,
-    limit: usize,
-}
-
-#[derive(Debug)]
 pub struct PreparedCodeContext {
     scope: PreparedScope,
     task: String,
@@ -64,22 +59,9 @@ pub struct PreparedCodeContext {
 pub struct PreparedCodeRefs {
     scope: PreparedScope,
     symbol: String,
-    direction: crate::types::Direction,
-    limit: usize,
-}
-
-#[derive(Debug)]
-pub struct PreparedCodeImpact {
-    scope: PreparedScope,
-    symbol: String,
+    direction: Direction,
     depth: usize,
     limit: usize,
-}
-
-#[derive(Debug)]
-pub struct PreparedCodeExpand {
-    scope: PreparedScope,
-    symbol: String,
 }
 
 macro_rules! scope_accessors {
@@ -98,23 +80,8 @@ macro_rules! scope_accessors {
     };
 }
 
-scope_accessors!(PreparedCodeMap);
 scope_accessors!(PreparedCodeContext);
 scope_accessors!(PreparedCodeRefs);
-scope_accessors!(PreparedCodeImpact);
-scope_accessors!(PreparedCodeExpand);
-
-impl PreparedCodeMap {
-    #[must_use]
-    pub fn retained_bytes(&self) -> usize {
-        size_of::<Self>().saturating_add(self.scope.retained_bytes())
-    }
-
-    #[must_use]
-    pub const fn limit(&self) -> usize {
-        self.limit
-    }
-}
 
 impl PreparedCodeContext {
     #[must_use]
@@ -149,27 +116,8 @@ impl PreparedCodeRefs {
     }
 
     #[must_use]
-    pub const fn direction(&self) -> crate::types::Direction {
+    pub const fn direction(&self) -> Direction {
         self.direction
-    }
-
-    #[must_use]
-    pub const fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-impl PreparedCodeImpact {
-    #[must_use]
-    pub fn retained_bytes(&self) -> usize {
-        size_of::<Self>()
-            .saturating_add(self.scope.retained_bytes())
-            .saturating_add(self.symbol.capacity())
-    }
-
-    #[must_use]
-    pub fn symbol(&self) -> &str {
-        &self.symbol
     }
 
     #[must_use]
@@ -183,21 +131,7 @@ impl PreparedCodeImpact {
     }
 }
 
-impl PreparedCodeExpand {
-    #[must_use]
-    pub fn retained_bytes(&self) -> usize {
-        size_of::<Self>()
-            .saturating_add(self.scope.retained_bytes())
-            .saturating_add(self.symbol.capacity())
-    }
-
-    #[must_use]
-    pub fn symbol(&self) -> &str {
-        &self.symbol
-    }
-}
-
-/// Repository-scale symbol map, retrieval, and impact tools over one confined root.
+/// Task retrieval and reference tools over one confined root.
 ///
 /// Holds no per-call state. The extraction cache is shared across calls and cannot change an
 /// answer; see the engine's warm==cold gate.
@@ -281,17 +215,6 @@ impl CodeGraphToolGroup {
             .map_err(CodeGraphError::from)
     }
 
-    pub fn prepare_code_map(
-        &self,
-        input: CodeMapInput,
-        scope: FileResource,
-    ) -> Result<PreparedCodeMap, CodeGraphError> {
-        Ok(PreparedCodeMap {
-            scope: prepare_scope(scope, input.path.as_deref())?,
-            limit: self.limits.resolve_limit(input.limit),
-        })
-    }
-
     pub fn prepare_code_context(
         &self,
         input: CodeContextInput,
@@ -315,44 +238,19 @@ impl CodeGraphToolGroup {
         if input.symbol.trim().is_empty() {
             return Err(CodeGraphError::invalid("symbol must not be empty"));
         }
+        let depth = input
+            .depth
+            .unwrap_or(DEFAULT_REFS_DEPTH)
+            .clamp(1, MAX_REFS_DEPTH);
+        if depth > 1 && input.direction == Direction::Callees {
+            return Err(CodeGraphError::invalid(CALLEES_DEPTH_REFUSED));
+        }
         Ok(PreparedCodeRefs {
             scope: prepare_scope(scope, input.path.as_deref())?,
             symbol: input.symbol,
             direction: input.direction,
+            depth,
             limit: self.limits.resolve_limit(input.limit),
-        })
-    }
-
-    pub fn prepare_code_impact(
-        &self,
-        input: CodeImpactInput,
-        scope: FileResource,
-    ) -> Result<PreparedCodeImpact, CodeGraphError> {
-        if input.symbol.trim().is_empty() {
-            return Err(CodeGraphError::invalid("symbol must not be empty"));
-        }
-        Ok(PreparedCodeImpact {
-            scope: prepare_scope(scope, input.path.as_deref())?,
-            symbol: input.symbol,
-            depth: input
-                .depth
-                .unwrap_or(DEFAULT_IMPACT_DEPTH)
-                .clamp(1, MAX_IMPACT_DEPTH),
-            limit: self.limits.resolve_limit(input.limit),
-        })
-    }
-
-    pub fn prepare_code_expand(
-        &self,
-        input: CodeExpandInput,
-        scope: FileResource,
-    ) -> Result<PreparedCodeExpand, CodeGraphError> {
-        if input.symbol.trim().is_empty() {
-            return Err(CodeGraphError::invalid("symbol must not be empty"));
-        }
-        Ok(PreparedCodeExpand {
-            scope: prepare_scope(scope, input.path.as_deref())?,
-            symbol: input.symbol,
         })
     }
 
@@ -416,49 +314,6 @@ impl CodeGraphToolGroup {
         };
         let (built, ()) = tokio::join!(build, drain);
         built.map_err(|_| CodeGraphError::Internal("graph construction did not complete"))?
-    }
-
-    /// Ranked symbols for a tree.
-    pub async fn code_map(
-        &self,
-        input: CodeMapInput,
-        progress: Option<&dyn GraphProgressSink>,
-        token: &CancellationToken,
-    ) -> Result<CodeMapOutput, CodeGraphError> {
-        let scope = self.inspect_scope(input.path.as_deref()).await?;
-        let prepared = self.prepare_code_map(input, scope)?;
-        self.execute_prepared_code_map(prepared, progress, token)
-            .await
-    }
-
-    pub async fn execute_prepared_code_map(
-        &self,
-        prepared: PreparedCodeMap,
-        progress: Option<&dyn GraphProgressSink>,
-        token: &CancellationToken,
-    ) -> Result<CodeMapOutput, CodeGraphError> {
-        let graph = self.graph_for(&prepared.scope, progress, token).await?;
-
-        let ordered = graph.ordered();
-        let total = ordered.len();
-        let symbols: Vec<RankedSymbol> = ordered
-            .into_iter()
-            .take(prepared.limit)
-            .filter_map(|node| graph.ranked(node))
-            .collect();
-
-        let mut output = CodeMapOutput {
-            path: prepared.scope.display_path,
-            shown: symbols.len(),
-            truncated: total > symbols.len(),
-            symbols,
-            total,
-            counts_floor: true,
-            estimated_tokens: 0,
-            graph: graph.summary,
-        };
-        output.estimated_tokens = estimate_tokens(output.model_text().len());
-        Ok(output)
     }
 
     /// The task-shaped bundle.
@@ -534,191 +389,35 @@ impl CodeGraphToolGroup {
             Err(refusal) => return Ok(Err(refusal)),
         };
 
-        let mut references = graph.references(&seeds, prepared.direction);
+        let (mut references, by_depth) =
+            graph.references(&seeds, prepared.direction, prepared.depth);
         let total = references.len();
         references.truncate(prepared.limit);
+        let walked = prepared.depth > 1;
+        let tests_reaching = walked.then(|| {
+            references
+                .iter()
+                .filter(|row| row.symbol.test_scope)
+                .count()
+        });
+        let declined = match prepared.direction {
+            Direction::Callers => graph.declined(selected_name(&graph, &seeds)),
+            Direction::Callees => 0,
+        };
 
         let mut output = CodeRefsOutput {
             symbol: prepared.symbol,
             direction: prepared.direction.name(),
             unit: prepared.direction.unit(),
+            depth: prepared.depth,
             matched: seeds.iter().filter_map(|&n| graph.symbol_ref(n)).collect(),
             shown: references.len(),
             truncated: total > references.len(),
             references,
-            total,
-            counts_floor: true,
-            estimated_tokens: 0,
-            graph: graph.summary,
-        };
-        output.estimated_tokens = estimate_tokens(output.model_text().len());
-        Ok(Ok(output))
-    }
-
-    /// Blast radius of a change to one symbol.
-    pub async fn code_impact(
-        &self,
-        input: CodeImpactInput,
-        progress: Option<&dyn GraphProgressSink>,
-        token: &CancellationToken,
-    ) -> Result<Result<CodeImpactOutput, SelectorRefusal>, CodeGraphError> {
-        let scope = self.inspect_scope(input.path.as_deref()).await?;
-        let prepared = self.prepare_code_impact(input, scope)?;
-        self.execute_prepared_code_impact(prepared, progress, token)
-            .await
-    }
-
-    pub async fn execute_prepared_code_impact(
-        &self,
-        prepared: PreparedCodeImpact,
-        progress: Option<&dyn GraphProgressSink>,
-        token: &CancellationToken,
-    ) -> Result<Result<CodeImpactOutput, SelectorRefusal>, CodeGraphError> {
-        let graph = self.graph_for(&prepared.scope, progress, token).await?;
-
-        let seeds = match graph.select(&prepared.symbol, &self.limits) {
-            Ok(seeds) => seeds,
-            Err(refusal) => return Ok(Err(refusal)),
-        };
-
-        // One past the limit, so the truncation flag reflects whether more exist rather than
-        // whether the walk happened to stop exactly at the boundary.
-        let mut reached = graph.impact(&seeds, prepared.depth, prepared.limit.saturating_add(1));
-        let total = reached.len();
-        reached.truncate(prepared.limit);
-        let tests_reaching = reached
-            .iter()
-            .filter(|row| row.test_scope)
-            .cloned()
-            .collect();
-
-        let mut output = CodeImpactOutput {
-            symbol: prepared.symbol,
-            depth: prepared.depth,
-            matched: seeds.iter().filter_map(|&n| graph.symbol_ref(n)).collect(),
-            shown: reached.len(),
-            truncated: total > reached.len(),
-            reached,
+            by_depth,
             tests_reaching,
+            declined,
             total,
-            counts_floor: true,
-            estimated_tokens: 0,
-            graph: graph.summary,
-        };
-        output.estimated_tokens = estimate_tokens(output.model_text().len());
-        Ok(Ok(output))
-    }
-
-    /// One symbol's body plus its one-hop neighbourhood.
-    pub async fn code_expand(
-        &self,
-        input: CodeExpandInput,
-        progress: Option<&dyn GraphProgressSink>,
-        token: &CancellationToken,
-    ) -> Result<Result<CodeExpandOutput, SelectorRefusal>, CodeGraphError> {
-        let scope = self.inspect_scope(input.path.as_deref()).await?;
-        let prepared = self.prepare_code_expand(input, scope)?;
-        self.execute_prepared_code_expand(prepared, progress, token)
-            .await
-    }
-
-    pub async fn execute_prepared_code_expand(
-        &self,
-        prepared: PreparedCodeExpand,
-        progress: Option<&dyn GraphProgressSink>,
-        token: &CancellationToken,
-    ) -> Result<Result<CodeExpandOutput, SelectorRefusal>, CodeGraphError> {
-        let graph = self.graph_for(&prepared.scope, progress, token).await?;
-        let seeds = match graph.select(&prepared.symbol, &self.limits) {
-            Ok(seeds) => seeds,
-            Err(refusal) => return Ok(Err(refusal)),
-        };
-
-        // The highest-ranked match. Every match is disclosed through `callers`/`callees` counts on
-        // the map, so choosing one body here narrows the answer without hiding the ambiguity.
-        let node = *seeds
-            .iter()
-            .max_by(|&&left, &&right| {
-                let left_rank = graph
-                    .ranking
-                    .scores
-                    .get(left as usize)
-                    .copied()
-                    .unwrap_or(0.0);
-                let right_rank = graph
-                    .ranking
-                    .scores
-                    .get(right as usize)
-                    .copied()
-                    .unwrap_or(0.0);
-                left_rank
-                    .partial_cmp(&right_rank)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| right.cmp(&left))
-            })
-            .ok_or(CodeGraphError::Internal("selection returned no node"))?;
-
-        let definition = graph
-            .facts
-            .definition(node)
-            .ok_or(CodeGraphError::Internal("selected node has no definition"))?;
-        let path = graph.facts.path_of(node).unwrap_or_default().to_owned();
-
-        let resource = self
-            .files
-            .inspect_path(&path, FileResourceAccess::Read)
-            .await
-            .map_err(CodeGraphError::from)?;
-        let file_source = std::fs::read_to_string(&resource.path)
-            .map_err(|_| CodeGraphError::invalid("the defining file could not be read"))?;
-
-        let span = definition.span;
-        let body = file_source
-            .get(span.start..span.end.min(file_source.len()))
-            .unwrap_or_default();
-
-        let mut truncated = false;
-        let mut source = body.to_owned();
-        let mut served_whole_file = None;
-
-        // Ripwire's honest counterexample. A ranked bundle assembled from a small file can cost
-        // more than the file, and selling a summary at a premium over the thing it summarizes is
-        // strictly worse for the caller. Serve the file and say so.
-        if file_source.len() <= self.limits.max_expand_bytes && body.len() * 2 > file_source.len() {
-            source = file_source.clone();
-            served_whole_file = Some(format!(
-                "the symbol spans {} of {} bytes, so the whole file is served: it costs no more \
-                 and omits nothing",
-                body.len(),
-                file_source.len()
-            ));
-        } else if source.len() > self.limits.max_expand_bytes {
-            source.truncate(floor_char_boundary(&source, self.limits.max_expand_bytes));
-            truncated = true;
-        }
-
-        let callers: Vec<SymbolRef> = graph
-            .callers_of(node)
-            .into_iter()
-            .filter_map(|caller| graph.symbol_ref(caller))
-            .collect();
-        let callees: Vec<SymbolRef> = graph
-            .callees_of(node)
-            .iter()
-            .filter_map(|&callee| graph.symbol_ref(callee))
-            .collect();
-
-        let mut output = CodeExpandOutput {
-            symbol: prepared.symbol,
-            path,
-            kind: definition.kind.name().to_owned(),
-            line_start: definition.lines.start,
-            line_end: definition.lines.end,
-            source,
-            callers,
-            callees,
-            served_whole_file,
-            truncated,
             counts_floor: true,
             estimated_tokens: 0,
             graph: graph.summary,
@@ -756,14 +455,10 @@ fn scope(path: Option<&str>) -> Option<&str> {
     path.filter(|path| !path.is_empty())
 }
 
-/// Largest index at or below `limit` that is a char boundary.
-fn floor_char_boundary(text: &str, limit: usize) -> usize {
-    if limit >= text.len() {
-        return text.len();
-    }
-    let mut index = limit;
-    while index > 0 && !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
+/// The name every matched definition shares.
+fn selected_name<'a>(graph: &'a CodeGraph, seeds: &[NodeId]) -> &'a str {
+    seeds
+        .first()
+        .and_then(|&seed| graph.facts.definition(seed))
+        .map_or("", |definition| definition.name.as_str())
 }

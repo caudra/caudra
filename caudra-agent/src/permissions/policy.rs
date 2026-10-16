@@ -61,9 +61,6 @@ pub const PERMISSION_DENIED_PREFIX: &str = "Permission denied for";
 
 pub(super) const PROJECT_READ_TOOLS: &[&str] = &[
     "code_context",
-    "code_expand",
-    "code_impact",
-    "code_map",
     "code_refs",
     "file_glob",
     "file_grep",

@@ -363,11 +363,8 @@ pub const WORKCELL_NATIVE_TOOL_NAMES: &[&str] = &[
     "webfetch",
     "shell",
     "python_execution",
-    "code_map",
     "code_context",
     "code_refs",
-    "code_impact",
-    "code_expand",
     "execution_environment",
 ];
 
@@ -376,65 +373,35 @@ pub const WORKCELL_NATIVE_TOOL_NAMES: &[&str] = &[
 /// unreadable.
 pub const INTERNAL_COMPANION_TOOL_NAMES: &[&str] = &["tool_output"];
 
-/// The code graph is one mode of work, entered once. Loading its five tools
-/// separately would spend five prompt-cache prefixes to answer one question.
-pub const CODE_GRAPH_GROUP: &str = "code graph";
-
 /// Built-ins kept out of the request array until `tool_search` loads them.
 ///
 /// Deferred because most sessions never call them, not because there are too
-/// many: the code graph answers "I do not know this codebase", `image_generate`
-/// needs a subscription and an intent to draw, and `execution_environment`
-/// reports host facts `shell` can also reach. `python_execution` is deferred for
-/// its size as well as its rate: its manual for Monty's Python subset is the
-/// largest definition in the array, and `shell`'s own description already tells
-/// the model a code execution tool exists. Everything else is either used
-/// constantly or is the only way to do something. `plan` is the only way to
-/// write the plan in Plan mode, and a small model that never searches for it
-/// cannot save one.
+/// many: `image_generate` needs a subscription and an intent to draw, and
+/// `execution_environment` reports host facts `shell` can also reach.
+/// `python_execution` is deferred for its size as well as its rate: its manual
+/// for Monty's Python subset is the largest definition in the array, and
+/// `shell`'s own description already tells the model a code execution tool
+/// exists. Everything else is either used constantly or is the only way to do
+/// something. `plan` is the only way to write the plan in Plan mode, and a
+/// small model that never searches for it cannot save one.
 ///
-/// Tools sharing a group load together. A name here must also appear in one of
-/// the registration lists above, or it defers something that does not exist.
+/// A name here must also appear in one of the registration lists above, or it
+/// defers something that does not exist.
 ///
 /// Whether a run actually withholds them is decided per model by
 /// [`DeferBuiltinTools`]: the saving is real for a small model and a loss for a
 /// capable one, which pays a prompt-cache prefix to load what it would have
 /// used anyway.
-pub const DEFERRED_BUILTIN_TOOLS: &[DeferredBuiltin] = &[
-    DeferredBuiltin::grouped("code_map", CODE_GRAPH_GROUP),
-    DeferredBuiltin::grouped("code_context", CODE_GRAPH_GROUP),
-    DeferredBuiltin::grouped("code_refs", CODE_GRAPH_GROUP),
-    DeferredBuiltin::grouped("code_impact", CODE_GRAPH_GROUP),
-    DeferredBuiltin::grouped("code_expand", CODE_GRAPH_GROUP),
-    DeferredBuiltin::alone("execution_environment"),
-    DeferredBuiltin::alone("image_generate"),
-    DeferredBuiltin::alone("python_execution"),
-    DeferredBuiltin::alone("workflow"),
-    DeferredBuiltin::alone("automation"),
+pub const DEFERRED_BUILTIN_TOOLS: &[&str] = &[
+    "execution_environment",
+    "image_generate",
+    "python_execution",
+    "workflow",
+    "automation",
 ];
 
-pub struct DeferredBuiltin {
-    pub name: &'static str,
-    pub group: Option<&'static str>,
-}
-
-impl DeferredBuiltin {
-    const fn grouped(name: &'static str, group: &'static str) -> Self {
-        Self {
-            name,
-            group: Some(group),
-        }
-    }
-
-    const fn alone(name: &'static str) -> Self {
-        Self { name, group: None }
-    }
-}
-
 pub fn is_deferred_builtin(name: &str) -> bool {
-    DEFERRED_BUILTIN_TOOLS
-        .iter()
-        .any(|deferred| deferred.name == name)
+    DEFERRED_BUILTIN_TOOLS.contains(&name)
 }
 
 /// `INTERNAL_COMPANION_TOOL_NAMES` overlaps the native list: it marks tools
@@ -2509,17 +2476,7 @@ impl ToolOutputLines {
         ("bash", &["shell"]),
         ("python_execution", &["python_execution"]),
         ("task", &["task", "task_control"]),
-        (
-            "index",
-            &[
-                "file_index",
-                "code_map",
-                "code_context",
-                "code_refs",
-                "code_impact",
-                "code_expand",
-            ],
-        ),
+        ("index", &["file_index", "code_context", "code_refs"]),
         ("grep", &["file_grep", "file_glob"]),
         ("read", &["file_read"]),
         (
@@ -2603,8 +2560,7 @@ impl ToolOutputLines {
             "bash" | "shell" => self.bash,
             "python_execution" => self.python_execution,
             "task" | "task_control" => self.task,
-            "index" | "file_index" | "code_map" | "code_context" | "code_refs" | "code_impact"
-            | "code_expand" => self.index,
+            "index" | "file_index" | "code_context" | "code_refs" => self.index,
             "file_grep" | "file_glob" | "grep" | "glob" => self.grep,
             "file_read" | "read" => self.read,
             "memory" | "plan" => self.write,

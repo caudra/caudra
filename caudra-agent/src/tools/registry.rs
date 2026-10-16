@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bitflags::bitflags;
-use caudra_config::{ProfileToolExposure, ProfileToolPolicy, ProfileToolSource};
+use caudra_config::{ProfileToolExposure, ProfileToolPolicy};
 use caudra_providers::DocumentSource;
 use caudra_storage::local_documents::LocalDocumentError;
 use caudra_storage::tool_ledger::ToolOutcome;
@@ -1199,14 +1199,7 @@ impl ToolRegistry {
                 }
             }
             match decision.exposure == ProfileToolExposure::Lazy {
-                true => held.push(DeferredTool::new(
-                    entry.name(),
-                    (super::profile_policy::source_kind(&entry.source)
-                        == ProfileToolSource::Native)
-                        .then(|| group_of(entry.name()))
-                        .flatten(),
-                    def,
-                )),
+                true => held.push(DeferredTool::new(entry.name(), def)),
                 false => out.push(def),
             }
         }
@@ -1268,15 +1261,6 @@ impl ToolDefinitions {
                 .collect(),
         )
     }
-}
-
-/// Grouping is policy, so it is read from the same list that names the
-/// deferred tools rather than from the tool itself.
-fn group_of(name: &str) -> Option<&'static str> {
-    caudra_config::DEFERRED_BUILTIN_TOOLS
-        .iter()
-        .find(|deferred| deferred.name == name)
-        .and_then(|deferred| deferred.group)
 }
 
 pub struct RegistrySnapshot(Arc<Vec<RegisteredTool>>);

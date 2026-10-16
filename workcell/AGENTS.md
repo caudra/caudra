@@ -126,9 +126,8 @@ worker lease for the full pool lifetime; hosts supply cache and source policy, n
 - The supported MCP version is explicit and pinned in the server and SDK dependency.
 - Preserve stable catalog order: files, code graph, web, shell, python_execution, execution environment.
   Reviewed transfer uses remote-host methods, never model tools or raw path byte routes.
-- Within files, `file_index` follows `file_apply_patch` and precedes every web tool when enabled. The five
-  code-graph tools follow `file_index` in the order `code_map`, `code_context`, `code_refs`, `code_impact`,
-  `code_expand`.
+- Within files, `file_index` follows `file_apply_patch` and precedes every web tool when enabled. The two
+  code-graph tools follow `file_index` in the order `code_context`, `code_refs`.
 - Tool names, schemas, annotations, and complete-result envelopes are compatibility contracts.
 - `ai.workcell/*` extension metadata is Workcell-owned. Do not introduce product-specific namespaces.
 - Update conformance fixtures and tests whenever a public contract intentionally changes.
@@ -187,7 +186,7 @@ For code worker or packaging changes, verify both explicit-path and bundled sour
 real snippet through an optimized binary copied away from any adjacent worker. This proves the
 embedded fallback works rather than accidentally resolving the development worker.
 
-For code-graph changes that could affect cost, re-run `cargo run -p workcell-mcp-code-graph --release --example code_map_bench`
+For code-graph changes that could affect cost, re-run `cargo run -p workcell-mcp-code-graph --release --example graph_build_bench`
 over a real tree. The standing target is the upstream `ripwire` binary with its on-disk cache warm,
 measured against this pipeline with no cache at all. That comparison is deliberately unfair to us: we
 have no persistent cache, so the target is what one would have to buy. Keep it that way rather than

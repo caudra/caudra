@@ -7064,30 +7064,63 @@ impl App {
     /// Each server call an `mcp` snippet made counts as a call of its own,
     /// under its `server.tool` name. The model never reads those results
     /// directly, so they cost the context window nothing.
+    ///
+    /// Each child a batch ran counts as a call of its own too. The batch's
+    /// tokens are what the model read of the whole answer, the children's
+    /// sections included, so each child takes its own share out of them and
+    /// the batch keeps the remainder: the rows still add up to what the
+    /// context window was charged.
     fn record_tool_call(&mut self, done: &caudra_agent::ToolDoneEvent) {
         let (Some(outcome), Some(source)) = (done.accounting.outcome, &done.accounting.source)
         else {
             return;
         };
+        let mut tokens = done.accounting.model_tokens;
+        if let ToolOutput::Batch { entries, .. } = &done.output {
+            for entry in entries {
+                let accounting = &entry.accounting;
+                let (Some(outcome), Some(source)) = (accounting.outcome, &accounting.source) else {
+                    continue;
+                };
+                let child_tokens = accounting.model_tokens.min(tokens);
+                tokens -= child_tokens;
+                self.record_tool_usage(ToolCall {
+                    tool: entry.tool.clone(),
+                    source: source.to_string(),
+                    cwd: self.state.session.cwd.clone(),
+                    outcome,
+                    duration_ms: accounting.duration_ms,
+                    tokens: child_tokens,
+                });
+                if let Some(output) = &entry.output {
+                    self.record_mcp_calls(output);
+                }
+            }
+        }
         self.record_tool_usage(ToolCall {
             tool: done.tool.to_string(),
             source: source.to_string(),
             cwd: self.state.session.cwd.clone(),
             outcome,
             duration_ms: done.accounting.duration_ms,
-            tokens: done.accounting.model_tokens,
+            tokens,
         });
-        if let ToolOutput::McpCode(run) = &done.output {
-            for call in &run.calls {
-                self.record_tool_usage(ToolCall {
-                    tool: call.qualified_name(),
-                    source: mcp_code::CALL_SOURCE.to_owned(),
-                    cwd: self.state.session.cwd.clone(),
-                    outcome: call.ledger_outcome(),
-                    duration_ms: call.duration_ms,
-                    tokens: 0,
-                });
-            }
+        self.record_mcp_calls(&done.output);
+    }
+
+    fn record_mcp_calls(&mut self, output: &ToolOutput) {
+        let ToolOutput::McpCode(run) = output else {
+            return;
+        };
+        for call in &run.calls {
+            self.record_tool_usage(ToolCall {
+                tool: call.qualified_name(),
+                source: mcp_code::CALL_SOURCE.to_owned(),
+                cwd: self.state.session.cwd.clone(),
+                outcome: call.ledger_outcome(),
+                duration_ms: call.duration_ms,
+                tokens: 0,
+            });
         }
     }
 

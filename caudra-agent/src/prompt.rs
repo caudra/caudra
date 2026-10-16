@@ -288,7 +288,6 @@ const TASK_TOOLS_HEADING: &str = "# Tool usage\n";
 const RESEARCH_CONVENTIONS_HEADING: &str = "# Guidelines\n";
 const GENERAL_CONVENTIONS_HEADING: &str = "# Conventions\n";
 const GENERAL_COMPLETION_HEADING: &str = "# When done\n";
-const CODE_MAP_TOOL_USAGE: &str = "- In an unfamiliar codebase, use **code_map** to see what matters before reading. Graph counts are floors: a zero means no reference was found, never that none exists.";
 const INDEX_TOOL_USAGE: &str =
     "- Use **file_index** first on individual files to get their structure.";
 
@@ -337,19 +336,13 @@ const NATIVE_HINTS: &[(&str, Slot, &str)] = &[
     (
         "code_context",
         Slot::ToolUsage,
-        "- Use **code_context** to find the symbols a change touches.",
+        "- Use **code_context** to find the code a task touches before reading files.",
     ),
     (
         "code_refs",
         Slot::ToolUsage,
-        "- Use **code_refs** to inspect callers and callees before editing a shared symbol.",
+        "- Use **code_refs** instead of grep or `rg` for a symbol's callers and call sites; `depth` shows what a change reaches and which tests cover it.",
     ),
-    (
-        "code_impact",
-        Slot::ToolUsage,
-        "- Use **code_impact** to inspect change reach and existing tests.",
-    ),
-    ("code_map", Slot::ToolUsage, CODE_MAP_TOOL_USAGE),
     (FILE_INDEX_TOOL_NAME, Slot::ToolUsage, INDEX_TOOL_USAGE),
     (
         crate::tools::TODOWRITE_TOOL_NAME,

@@ -4814,6 +4814,100 @@ fn an_mcp_run_counts_each_server_call_it_made() {
     );
 }
 
+const BATCH_SOURCE: &str = "native";
+const BATCH_TOKENS: u32 = 100;
+const BATCH_MS: u64 = 90;
+
+/// Each child a batch ran lands in `/tools` as its own call beside the batch,
+/// a refused one as denied, and the rows still add up to the tokens the
+/// batch's answer cost: the children's sections are part of that answer.
+#[test_case([10, 20, 30], [10, 20, 30], 40 ; "children_inside_the_batch_figure")]
+#[test_case([50, 40, 30], [50, 40, 10], 0 ; "children_past_the_batch_figure_are_clamped")]
+fn a_batch_counts_each_child_it_ran(
+    child_tokens: [u32; 3],
+    expected_child_tokens: [u32; 3],
+    expected_batch_tokens: u32,
+) {
+    use caudra_agent::tools::{BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME};
+    use caudra_storage::tool_ledger::ToolOutcome;
+
+    const CHILDREN: [(&str, ToolOutcome, u64); 3] = [
+        (FILE_READ_TOOL_NAME, ToolOutcome::Ok, 5),
+        (FILE_GREP_TOOL_NAME, ToolOutcome::NotFound, 7),
+        (SHELL_TOOL_NAME, ToolOutcome::Denied, 0),
+    ];
+
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let entries = CHILDREN
+        .iter()
+        .zip(child_tokens)
+        .map(
+            |(&(tool, outcome, duration_ms), model_tokens)| BatchToolEntry {
+                model_suffix: None,
+                tool: tool.into(),
+                effect: ToolEffect::Unknown,
+                summary: String::new(),
+                status: BatchToolStatus::Error,
+                input: None,
+                raw_input: None,
+                output: None,
+                annotation: None,
+                refused: outcome == ToolOutcome::Denied,
+                accounting: ToolAccounting {
+                    duration_ms,
+                    source: Some(BATCH_SOURCE.into()),
+                    outcome: Some(outcome),
+                    model_tokens,
+                },
+            },
+        )
+        .collect();
+    let done = ToolDoneEvent {
+        id: "t1".into(),
+        tool: BATCH_TOOL_NAME.into(),
+        output: ToolOutput::Batch {
+            entries,
+            text: String::new(),
+        },
+        accounting: ToolAccounting {
+            duration_ms: BATCH_MS,
+            source: Some(BATCH_SOURCE.into()),
+            outcome: Some(ToolOutcome::Ok),
+            model_tokens: BATCH_TOKENS,
+        },
+        is_error: false,
+        ..ToolDoneEvent::error("t1".into(), String::new())
+    };
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(done))));
+
+    let usage = app.state.session.tool_usage();
+    let rows: Vec<_> = usage
+        .iter()
+        .map(|row| (row.tool.as_str(), row.outcome, row.duration_ms, row.tokens))
+        .collect();
+    let mut expected: Vec<_> = CHILDREN
+        .iter()
+        .zip(expected_child_tokens)
+        .map(|(&(tool, outcome, duration_ms), tokens)| {
+            (tool, outcome, duration_ms, u64::from(tokens))
+        })
+        .collect();
+    expected.push((
+        BATCH_TOOL_NAME,
+        ToolOutcome::Ok,
+        BATCH_MS,
+        u64::from(expected_batch_tokens),
+    ));
+    assert_eq!(rows, expected);
+    assert_eq!(usage.iter().map(|row| row.calls).sum::<u64>(), 4);
+    assert_eq!(
+        usage.iter().map(|row| row.tokens).sum::<u64>(),
+        u64::from(BATCH_TOKENS)
+    );
+}
+
 fn tool_done_msg(id: &str) -> Msg {
     agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: id.into(),
@@ -5497,6 +5591,7 @@ fn batch_roster(id: &str, children: usize) -> AgentEvent {
                 output: None,
                 annotation: None,
                 refused: false,
+                accounting: ToolAccounting::default(),
             })
             .collect(),
         text: String::new(),
@@ -20340,6 +20435,7 @@ fn batch_plan_completion_checks_authority(
                 annotation: None,
                 model_suffix: None,
                 refused: false,
+                accounting: ToolAccounting::default(),
             },
         }))
     };

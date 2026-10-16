@@ -2719,6 +2719,7 @@ const GRAPH_CAVEATS: &[&str] = &["NOT converged", "truncated by", "stopped early
 /// than under the sigil that opened the row.
 const GRAPH_HANG: &str = "  ";
 const GRAPH_ROW_SIGIL: &str = "\u{25c7} ";
+const GRAPH_NAME_ONLY: &str = "~name";
 
 /// One symbol per line, with the name leading and everything measured about it
 /// trailing in dimmed columns.
@@ -2840,6 +2841,21 @@ fn code_graph_row(
             format!("  in {inbound:>3} out {outbound:>3}"),
             theme.tool_dim,
         ));
+    }
+    if !row.sites.is_empty() {
+        spans.push(Span::styled(
+            format!("  at {}", row.sites.join(",")),
+            theme.index_line_nr,
+        ));
+    }
+    if row.sites_withheld > 0 {
+        spans.push(Span::styled(
+            format!(" +{} more", row.sites_withheld),
+            theme.tool_dim,
+        ));
+    }
+    if row.name_only {
+        spans.push(Span::styled(format!("  {GRAPH_NAME_ONLY}"), theme.tool_dim));
     }
     if row.test_scope {
         spans.push(Span::styled("  [test]".to_owned(), theme.index_section));
@@ -5609,6 +5625,7 @@ mod tests {
             })),
             annotation: None,
             refused: false,
+            accounting: Default::default(),
         }
     }
 
@@ -5782,6 +5799,7 @@ mod tests {
             })),
             annotation: None,
             refused: false,
+            accounting: Default::default(),
         }
     }
 
@@ -8162,8 +8180,7 @@ mod tests {
             line_end: 20,
             inbound: Some(inbound),
             outbound: Some(1),
-            hops: None,
-            test_scope: false,
+            ..CodeGraphRow::default()
         }
     }
 
@@ -8208,6 +8225,30 @@ mod tests {
                 .all(|row| row.starts_with(GRAPH_HANG) && !row.starts_with(GRAPH_ROW_SIGIL)),
             "{GRAPH_HANGS}: {body:?}"
         );
+    }
+
+    #[test]
+    fn a_refs_row_shows_its_call_sites_and_name_only_link() {
+        let row = CodeGraphRow {
+            sites: vec!["12".to_owned(), "src/b.rs:7".to_owned()],
+            sites_withheld: 3,
+            name_only: true,
+            ..ranked_row("alpha", 2)
+        };
+
+        let (lines, _) = render_code_graph(
+            "callers of beta",
+            &[row],
+            None,
+            "[f]",
+            20,
+            false,
+            UNCONSTRAINED_WIDTH,
+        );
+
+        let drawn = spans_text(&lines[1].spans);
+        assert!(drawn.contains("at 12,src/b.rs:7 +3 more"), "{drawn:?}");
+        assert!(drawn.contains(GRAPH_NAME_ONLY), "{drawn:?}");
     }
 
     #[test]
@@ -8321,7 +8362,7 @@ mod tests {
     }
 
     #[test]
-    fn code_expand_renders_the_body_under_its_path() {
+    fn a_stored_code_expand_card_still_renders_its_body() {
         let source = CodeGraphSource {
             path: "src/lib.rs".to_owned(),
             kind: "function".to_owned(),

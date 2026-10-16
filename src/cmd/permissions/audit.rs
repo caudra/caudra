@@ -47,11 +47,8 @@ const TOOLS: &[&str] = &[
     "execution_environment",
     "webfetch",
     "websearch",
-    "code_map",
     "code_context",
     "code_refs",
-    "code_impact",
-    "code_expand",
     "batch",
 ];
 const NOTES: &[&str] = &[

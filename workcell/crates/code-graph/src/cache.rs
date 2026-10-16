@@ -233,6 +233,7 @@ impl FactsCache {
 fn weigh(facts: &FileFacts) -> usize {
     const DEFINITION_OVERHEAD: usize = 128;
     const REFERENCE_OVERHEAD: usize = 64;
+    const MENTION_OVERHEAD: usize = 24;
 
     let definitions: usize = facts
         .definitions
@@ -240,10 +241,8 @@ fn weigh(facts: &FileFacts) -> usize {
         .map(|definition| {
             DEFINITION_OVERHEAD
                 + definition.name.len()
-                + definition
-                    .documentation
-                    .as_ref()
-                    .map_or(0, std::string::String::len)
+                + definition.documentation.as_ref().map_or(0, String::len)
+                + definition.owner.as_ref().map_or(0, String::len)
         })
         .sum();
     let references: usize = facts
@@ -252,13 +251,16 @@ fn weigh(facts: &FileFacts) -> usize {
         .map(|reference| {
             REFERENCE_OVERHEAD
                 + reference.name.len()
-                + reference
-                    .qualifier
-                    .as_ref()
-                    .map_or(0, std::string::String::len)
+                + reference.qualifier.as_ref().map_or(0, String::len)
+                + reference.receiver.as_ref().map_or(0, String::len)
         })
         .sum();
-    definitions + references
+    let mentions: usize = facts
+        .mentions
+        .iter()
+        .map(|mention| MENTION_OVERHEAD + mention.len())
+        .sum();
+    definitions + references + mentions
 }
 
 #[cfg(test)]

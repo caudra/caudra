@@ -32,16 +32,7 @@ fn the_mcp_projection_covers_every_neutral_spec_in_order() {
         .map(|spec| spec.name.to_string())
         .collect::<Vec<_>>();
     assert_eq!(names, neutral);
-    assert_eq!(
-        names,
-        [
-            "code_map",
-            "code_context",
-            "code_refs",
-            "code_impact",
-            "code_expand"
-        ]
-    );
+    assert_eq!(names, ["code_context", "code_refs"]);
 }
 
 /// Every description has to state the floor property, because a caller that reads a count as exact

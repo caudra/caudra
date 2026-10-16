@@ -1,6 +1,6 @@
 [package]
 name = "workcell-mcp-code-graph"
-description = "Repository-scale symbol map, retrieval, and impact tools over a confined source tree"
+description = "Task retrieval and call-graph reference tools over a confined source tree"
 readme = "README.md"
 edition.workspace = true
 license = "Apache-2.0"
@@ -32,6 +32,7 @@ workcell-tool-contract.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+test-case.workspace = true
 
 [lints]
 workspace = true

@@ -455,11 +455,8 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
             "file_glob",
             "file_grep",
             "file_index",
-            "code_map",
             "code_context",
             "code_refs",
-            "code_impact",
-            "code_expand",
             "websearch",
             "webfetch",
             "shell",
@@ -510,12 +507,16 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
 
     write_json(
         &mut write,
-        &mcp_request(32, "tools/call", json!({"name":"code_map","arguments":{}})),
+        &mcp_request(
+            32,
+            "tools/call",
+            json!({"name":"code_context","arguments":{"task":"visible"}}),
+        ),
     )
     .await;
     let mapped = read_json(&mut read).await;
     assert_eq!(
-        mapped["result"]["structuredContent"]["symbols"][0]["name"],
+        mapped["result"]["structuredContent"]["results"][0]["name"],
         "visible"
     );
     assert!(
@@ -617,7 +618,7 @@ async fn authenticated_http_has_one_stateless_mcp_route() {
             .as_array()
             .unwrap()
             .len(),
-        13
+        10
     );
 
     let private_route = client
@@ -2495,7 +2496,7 @@ async fn http_supports_stateless_legacy_calls_and_progress() {
     .await;
     assert!(!listed.headers().contains_key("mcp-session-id"));
     let listed = final_sse_json(listed).await;
-    assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 13);
+    assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 10);
     assert!(listed["result"].get("ttlMs").is_none());
     assert!(listed["result"].get("cacheScope").is_none());
 

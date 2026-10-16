@@ -493,11 +493,8 @@ fn descriptor(
             | ToolKind::FileGlob
             | ToolKind::FileGrep
             | ToolKind::Index
-            | ToolKind::CodeMap
             | ToolKind::CodeContext
-            | ToolKind::CodeRefs
-            | ToolKind::CodeImpact
-            | ToolKind::CodeExpand,
+            | ToolKind::CodeRefs,
         ) => {
             resources.push(resource(
                 PermissionResourceKind::File,
@@ -773,12 +770,6 @@ async fn prepare_example(
                 .map_err(|error| error.to_string())?;
             Ok(index_prepared(resource, &project, groups.files))
         }
-        Input::CodeMap(input) => Ok(code_graph_prepared(
-            groups.code_graph,
-            &project,
-            input.path.as_deref(),
-            &["/path"],
-        )),
         Input::CodeContext(input) => Ok(code_graph_prepared(
             groups.code_graph,
             &project,
@@ -786,18 +777,6 @@ async fn prepare_example(
             &["/path", "/task"],
         )),
         Input::CodeRefs(input) => Ok(code_graph_prepared(
-            groups.code_graph,
-            &project,
-            input.path.as_deref(),
-            &["/path", "/symbol"],
-        )),
-        Input::CodeImpact(input) => Ok(code_graph_prepared(
-            groups.code_graph,
-            &project,
-            input.path.as_deref(),
-            &["/path", "/symbol"],
-        )),
-        Input::CodeExpand(input) => Ok(code_graph_prepared(
             groups.code_graph,
             &project,
             input.path.as_deref(),

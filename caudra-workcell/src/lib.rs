@@ -69,9 +69,8 @@ use caudra_agent::tools::{
     expand_tilde, stale_read_message,
 };
 use caudra_agent::{
-    AgentEvent, CodeGraphRow, CodeGraphSource, DocumentSource, EnvironmentCommand, EnvironmentFact,
-    GrepFileEntry, GrepMatchGroup, INDEX_TRUNCATED,
-    IndexDirectoryEntry as AgentIndexDirectoryEntry,
+    AgentEvent, CodeGraphRow, DocumentSource, EnvironmentCommand, EnvironmentFact, GrepFileEntry,
+    GrepMatchGroup, INDEX_TRUNCATED, IndexDirectoryEntry as AgentIndexDirectoryEntry,
     IndexDirectoryEntryKind as AgentIndexDirectoryEntryKind, IndexLine as AgentIndexLine,
     IndexLineSemantic as AgentIndexLineSemantic, IndexOutput as AgentIndexOutput,
     IndexSourceRange as AgentIndexSourceRange, PDF_DATA_URL_PREFIX, PatchedFile, SearchCap,
@@ -98,10 +97,10 @@ use tokio_util::sync::CancellationToken;
 use workcell::code::bundled_worker_available;
 use workcell::code::{CodeConfiguration, CodeExecution, CodeInput, Outcome, WorkerSource};
 use workcell::code_graph::{
-    CodeContextInput, CodeContextOutput, CodeExpandInput, CodeGraphError, CodeGraphLimits,
-    CodeGraphToolGroup, CodeImpactInput, CodeMapInput, CodeRefsInput, GraphProgress,
-    GraphProgressSink, ModelText as CodeGraphModelText, RankedSymbol, ReachedSymbol,
-    SelectorRefusal, SymbolRef, crawl_filesystem_limits, fit,
+    CodeContextInput, CodeContextOutput, CodeGraphError, CodeGraphLimits, CodeGraphToolGroup,
+    CodeRefsInput, CodeRefsOutput, Direction, GraphProgress, GraphProgressSink,
+    ModelText as CodeGraphModelText, RankedSymbol, SelectorRefusal, crawl_filesystem_limits, fit,
+    site_label,
 };
 use workcell::environment::{
     ExecutionEnvironmentError, ExecutionEnvironmentResult, ToolGroupDisclosure,
@@ -146,13 +145,12 @@ pub const NATIVE_TOOL_NAMES: &[&str] = &[
     "webfetch",
     "shell",
     "python_execution",
-    "code_map",
     "code_context",
     "code_refs",
-    "code_impact",
-    "code_expand",
     "execution_environment",
 ];
+const REFS_REACHED_UNIT: &str = "reached";
+const REFS_DECLINED: &str = "same-name calls declined";
 const CODE_WORKER_UNAVAILABLE: &str =
     "Workcell python_execution is unavailable: no code worker path was supplied";
 /// MCP code mode runs its snippets on the same worker, so a startup warning names both.
@@ -813,11 +811,8 @@ enum ToolKind {
     Webfetch,
     Shell,
     Code,
-    CodeMap,
     CodeContext,
     CodeRefs,
-    CodeImpact,
-    CodeExpand,
     Environment,
 }
 
@@ -835,11 +830,8 @@ impl ToolKind {
             "webfetch" => Some(Self::Webfetch),
             "shell" => Some(Self::Shell),
             "python_execution" => Some(Self::Code),
-            "code_map" => Some(Self::CodeMap),
             "code_context" => Some(Self::CodeContext),
             "code_refs" => Some(Self::CodeRefs),
-            "code_impact" => Some(Self::CodeImpact),
-            "code_expand" => Some(Self::CodeExpand),
             "execution_environment" => Some(Self::Environment),
             _ => None,
         }
@@ -848,10 +840,7 @@ impl ToolKind {
     fn audience(self) -> ToolAudience {
         let read = ToolAudience::MAIN | ToolAudience::RESEARCH_SUB | ToolAudience::GENERAL_SUB;
         match self {
-            Self::Index => ToolAudience::all(),
-            Self::CodeMap | Self::CodeContext | Self::CodeRefs | Self::CodeImpact => {
-                ToolAudience::all()
-            }
+            Self::Index | Self::CodeContext | Self::CodeRefs => ToolAudience::all(),
             Self::FileWrite | Self::FileEdit | Self::FileApplyPatch => {
                 ToolAudience::MAIN | ToolAudience::GENERAL_SUB
             }
@@ -864,14 +853,12 @@ impl ToolKind {
 
     fn presentation_kind(self) -> &'static str {
         match self {
-            Self::FileRead | Self::Index | Self::CodeExpand => "read",
+            Self::FileRead | Self::Index => "read",
             Self::FileGlob
             | Self::FileGrep
             | Self::Websearch
-            | Self::CodeMap
             | Self::CodeContext
-            | Self::CodeRefs
-            | Self::CodeImpact => "search",
+            | Self::CodeRefs => "search",
             Self::FileWrite | Self::FileEdit | Self::FileApplyPatch => "edit",
             Self::Webfetch => "fetch",
             Self::Shell | Self::Code | Self::Environment => "execute",
@@ -886,11 +873,8 @@ impl ToolKind {
             | Self::Index
             | Self::Websearch
             | Self::Webfetch
-            | Self::CodeMap
             | Self::CodeContext
-            | Self::CodeRefs
-            | Self::CodeImpact
-            | Self::CodeExpand => ToolEffect::ReadOnly,
+            | Self::CodeRefs => ToolEffect::ReadOnly,
             Self::Code => ToolEffect::Isolated,
             Self::FileWrite
             | Self::FileEdit
@@ -999,11 +983,8 @@ enum Input {
     Webfetch(WebfetchInput),
     Shell(ShellInput),
     Code(CodeInput),
-    CodeMap(CodeMapInput),
     CodeContext(CodeContextInput),
     CodeRefs(CodeRefsInput),
-    CodeImpact(CodeImpactInput),
-    CodeExpand(CodeExpandInput),
     Environment,
 }
 
@@ -1030,11 +1011,8 @@ impl Input {
             ToolKind::Webfetch => parse_input("webfetch", input).map(Self::Webfetch),
             ToolKind::Shell => parse_input("shell", input).map(Self::Shell),
             ToolKind::Code => parse_input("python_execution", input).map(Self::Code),
-            ToolKind::CodeMap => parse_input("code_map", input).map(Self::CodeMap),
             ToolKind::CodeContext => parse_input("code_context", input).map(Self::CodeContext),
             ToolKind::CodeRefs => parse_input("code_refs", input).map(Self::CodeRefs),
-            ToolKind::CodeImpact => parse_input("code_impact", input).map(Self::CodeImpact),
-            ToolKind::CodeExpand => parse_input("code_expand", input).map(Self::CodeExpand),
             ToolKind::Environment => match input {
                 Value::Object(values) if values.is_empty() => Ok(Self::Environment),
                 _ => Err(
@@ -1365,33 +1343,11 @@ impl WorkcellInvocation {
                 PermissionResourceAccess::Execute,
                 PermissionRisk::Low,
             ),
-            Input::CodeMap(input) => {
-                let group = self.code_graph_group(ctx, project.clone()).await?;
-                code_graph_prepared(group, &project, input.path.as_deref(), &["/path"])
-            }
             Input::CodeContext(input) => {
                 let group = self.code_graph_group(ctx, project.clone()).await?;
                 code_graph_prepared(group, &project, input.path.as_deref(), &["/path", "/task"])
             }
             Input::CodeRefs(input) => {
-                let group = self.code_graph_group(ctx, project.clone()).await?;
-                code_graph_prepared(
-                    group,
-                    &project,
-                    input.path.as_deref(),
-                    &["/path", "/symbol"],
-                )
-            }
-            Input::CodeImpact(input) => {
-                let group = self.code_graph_group(ctx, project.clone()).await?;
-                code_graph_prepared(
-                    group,
-                    &project,
-                    input.path.as_deref(),
-                    &["/path", "/symbol"],
-                )
-            }
-            Input::CodeExpand(input) => {
                 let group = self.code_graph_group(ctx, project.clone()).await?;
                 code_graph_prepared(
                     group,
@@ -1494,11 +1450,8 @@ fn input_header(input: &Input) -> String {
             1 => CODE_ONE_LINE.to_owned(),
             count => format!("{count} {CODE_LINES}"),
         },
-        Input::CodeMap(input) => input.path.clone().unwrap_or_else(|| ".".into()),
         Input::CodeContext(input) => search_header(&input.task, input.path.as_deref()),
         Input::CodeRefs(input) => search_header(&input.symbol, input.path.as_deref()),
-        Input::CodeImpact(input) => search_header(&input.symbol, input.path.as_deref()),
-        Input::CodeExpand(input) => search_header(&input.symbol, input.path.as_deref()),
         Input::Environment => "execution environment".into(),
     }
 }
@@ -1612,11 +1565,8 @@ impl RemoteWorkcellInvocation {
                     | ToolKind::FileEdit
                     | ToolKind::FileApplyPatch
                     | ToolKind::Index
-                    | ToolKind::CodeMap
                     | ToolKind::CodeContext
-                    | ToolKind::CodeRefs
-                    | ToolKind::CodeImpact
-                    | ToolKind::CodeExpand => None,
+                    | ToolKind::CodeRefs => None,
                     ToolKind::Websearch => Some("query"),
                     ToolKind::Webfetch => Some("url"),
                     ToolKind::Shell => match resource.access {
@@ -1640,11 +1590,8 @@ impl RemoteWorkcellInvocation {
                     ToolKind::FileGlob
                         | ToolKind::FileGrep
                         | ToolKind::Index
-                        | ToolKind::CodeMap
                         | ToolKind::CodeContext
                         | ToolKind::CodeRefs
-                        | ToolKind::CodeImpact
-                        | ToolKind::CodeExpand
                 ) {
                     PermissionResourceKind::RemoteDirectory {
                         identity: identity.clone(),
@@ -2514,11 +2461,7 @@ fn remote_result(
             structured_content,
             model_output.clone(),
         )),
-        ToolKind::CodeMap
-        | ToolKind::CodeContext
-        | ToolKind::CodeRefs
-        | ToolKind::CodeImpact
-        | ToolKind::CodeExpand => {
+        ToolKind::CodeContext | ToolKind::CodeRefs => {
             remote_code_graph_result(kind, structured_content, model_output.clone())
         }
         ToolKind::Environment => environment_card(&structured_content, None)
@@ -2694,22 +2637,138 @@ struct RemoteGraphSymbol {
     calls: Option<usize>,
     test_scope: Option<bool>,
     hops: Option<usize>,
+    #[serde(default)]
+    sites: Vec<RemoteSite>,
+    #[serde(default)]
+    sites_total: usize,
+    #[serde(default)]
+    name_only: bool,
 }
 
-fn graph_rows(value: &Value) -> Result<Vec<CodeGraphRow>, serde_json::Error> {
+/// The parts of a `code_refs` answer its card headline and annotation read.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RefsSummary {
+    direction: String,
+    symbol: String,
+    unit: String,
+    #[serde(default = "default_refs_depth")]
+    depth: usize,
+    #[serde(default)]
+    matched: Vec<RemoteGraphHome>,
+    shown: usize,
+    total: usize,
+    #[serde(default)]
+    tests_reaching: Option<usize>,
+    #[serde(default)]
+    declined: usize,
+}
+
+#[derive(Deserialize)]
+struct RemoteSite {
+    path: String,
+    line: usize,
+}
+
+#[derive(Deserialize)]
+struct RemoteGraphHome {
+    path: String,
+}
+
+fn default_refs_depth() -> usize {
+    1
+}
+
+impl RefsSummary {
+    fn of(output: &CodeRefsOutput) -> Self {
+        Self {
+            direction: output.direction.to_owned(),
+            symbol: output.symbol.clone(),
+            unit: output.unit.to_owned(),
+            depth: output.depth,
+            matched: Vec::new(),
+            shown: output.shown,
+            total: output.total,
+            tests_reaching: output.tests_reaching,
+            declined: output.declined,
+        }
+    }
+
+    fn walked(&self) -> bool {
+        self.depth > 1
+    }
+
+    fn headline(&self) -> String {
+        let headline = if self.walked() {
+            format!(
+                "{} symbols reach {} within {} hops; {} of them are tests",
+                self.total,
+                self.symbol,
+                self.depth,
+                self.tests_reaching.unwrap_or_default()
+            )
+        } else {
+            format!(
+                "{} of {}, each row one {}",
+                self.direction, self.symbol, self.unit
+            )
+        };
+        match self.declined {
+            0 => headline,
+            declined => format!("{headline}; {declined} {REFS_DECLINED}"),
+        }
+    }
+
+    fn annotation(&self) -> String {
+        if self.walked() {
+            format!(
+                "{} \u{b7} {} tests",
+                shown_of(self.shown, self.total, REFS_REACHED_UNIT),
+                self.tests_reaching.unwrap_or_default()
+            )
+        } else {
+            shown_of(self.shown, self.total, &self.unit)
+        }
+    }
+
+    /// Where a row's call sites are labelled from: the seed for callees, the row for callers.
+    fn site_home<'a>(&'a self, row_path: &'a str) -> &'a str {
+        if self.direction == Direction::Callees.name() {
+            self.matched.first().map_or("", |seed| seed.path.as_str())
+        } else {
+            row_path
+        }
+    }
+}
+
+fn graph_rows(
+    value: &Value,
+    refs: Option<&RefsSummary>,
+) -> Result<Vec<CodeGraphRow>, serde_json::Error> {
     let symbols: Vec<RemoteGraphSymbol> = deserialize_remote(value)?;
     Ok(symbols
         .into_iter()
-        .map(|symbol| CodeGraphRow {
-            name: symbol.name,
-            kind: symbol.kind,
-            path: symbol.path,
-            line_start: symbol.line_start,
-            line_end: symbol.line_end,
-            inbound: symbol.callers,
-            outbound: symbol.calls,
-            hops: symbol.hops,
-            test_scope: symbol.test_scope.unwrap_or(false),
+        .map(|symbol| {
+            let home = refs.map_or(symbol.path.as_str(), |refs| refs.site_home(&symbol.path));
+            let sites: Vec<String> = symbol
+                .sites
+                .iter()
+                .map(|site| site_label(&site.path, site.line, home))
+                .collect();
+            CodeGraphRow {
+                sites_withheld: symbol.sites_total.saturating_sub(sites.len()),
+                sites,
+                name: symbol.name,
+                kind: symbol.kind,
+                path: symbol.path,
+                line_start: symbol.line_start,
+                line_end: symbol.line_end,
+                inbound: symbol.callers,
+                outbound: symbol.calls,
+                hops: symbol.hops.filter(|_| refs.is_none_or(RefsSummary::walked)),
+                test_scope: symbol.test_scope.unwrap_or(false),
+                name_only: symbol.name_only,
+            }
         })
         .collect())
 }
@@ -2736,13 +2795,7 @@ fn remote_code_graph_result(
     }
     let string = |name: &str| value[name].as_str().unwrap_or_default().to_owned();
     let usize_value = |name: &str| value[name].as_u64().unwrap_or_default() as usize;
-    let (headline, rows, source, annotation) = match kind {
-        ToolKind::CodeMap => (
-            format!("ranked symbols in {}", string("path")),
-            graph_rows(&value["symbols"])?,
-            None,
-            shown_of(usize_value("shown"), usize_value("total"), "symbols"),
-        ),
+    let (headline, rows, annotation) = match kind {
         ToolKind::CodeContext => (
             format!(
                 "read as {} ({}); confidence {} at {}% separation",
@@ -2751,78 +2804,19 @@ fn remote_code_graph_result(
                 string("confidence"),
                 usize_value("marginPercent")
             ),
-            graph_rows(&value["results"])?,
-            None,
+            graph_rows(&value["results"], None)?,
             format!(
                 "{} \u{b7} {} confidence",
                 shown_of(usize_value("shown"), usize_value("totalMatched"), "matches"),
                 string("confidence")
             ),
         ),
-        ToolKind::CodeRefs => (
-            format!(
-                "{} of {}, each row one {}",
-                string("direction"),
-                string("symbol"),
-                string("unit")
-            ),
-            graph_rows(&value["references"])?,
-            None,
-            shown_of(usize_value("shown"), usize_value("total"), &string("unit")),
-        ),
-        ToolKind::CodeImpact => (
-            format!(
-                "{} symbols reach {} within {} hops; {} of them are tests",
-                usize_value("total"),
-                string("symbol"),
-                usize_value("depth"),
-                value["testsReaching"].as_array().map_or(0, Vec::len)
-            ),
-            graph_rows(&value["reached"])?,
-            None,
-            format!(
-                "{} \u{b7} {} tests",
-                shown_of(usize_value("shown"), usize_value("total"), "reached"),
-                value["testsReaching"].as_array().map_or(0, Vec::len)
-            ),
-        ),
-        ToolKind::CodeExpand => {
-            let callers = graph_rows(&value["callers"])?;
-            let callees = graph_rows(&value["callees"])?;
-            let rows = callers
-                .into_iter()
-                .map(|mut row| {
-                    row.inbound = Some(1);
-                    row
-                })
-                .chain(callees.into_iter().map(|mut row| {
-                    row.outbound = Some(1);
-                    row
-                }))
-                .collect();
-            let source_text = string("source");
+        ToolKind::CodeRefs => {
+            let refs: RefsSummary = deserialize_remote(&value)?;
             (
-                format!(
-                    "{} {} {}:{}-{}",
-                    string("symbol"),
-                    string("kind"),
-                    string("path"),
-                    usize_value("lineStart"),
-                    usize_value("lineEnd")
-                ),
-                rows,
-                Some(CodeGraphSource {
-                    path: string("path"),
-                    kind: string("kind"),
-                    line_start: usize_value("lineStart"),
-                    lines: source_text.lines().map(str::to_owned).collect(),
-                    whole_file_reason: value["servedWholeFile"].as_str().map(str::to_owned),
-                }),
-                format!(
-                    "{} callers \u{b7} {} callees",
-                    value["callers"].as_array().map_or(0, Vec::len),
-                    value["callees"].as_array().map_or(0, Vec::len)
-                ),
+                refs.headline(),
+                graph_rows(&value["references"], Some(&refs))?,
+                refs.annotation(),
             )
         }
         _ => unreachable!("only code graph tools use this adapter"),
@@ -2835,7 +2829,7 @@ fn remote_code_graph_result(
     Ok(ToolExecResult::from(Ok::<_, String>(ToolOutput::CodeGraph {
         headline,
         rows,
-        source,
+        source: None,
         footer,
         state: Some(value),
     }))
@@ -3211,32 +3205,6 @@ impl WorkcellInvocation {
                     Err(error) => failed(error),
                 }
             }
-            (Input::CodeMap(input), PreparedExecution::CodeGraph(group)) => {
-                let input = input.clone();
-                let sink = self.graph_progress(ctx);
-                match self
-                    .host
-                    .run(ctx, move |token| async move {
-                        group.code_map(input, sink.as_deref(), &token).await
-                    })
-                    .await
-                {
-                    Ok(Ok(output)) => {
-                        let output = fit(output);
-                        let annotation = shown_of(output.shown, output.total, "symbols");
-                        code_graph_result(
-                            &output,
-                            format!("ranked symbols in {}", output.path),
-                            ranked_rows(&output.symbols),
-                            None,
-                            graph_footer(&output),
-                            annotation,
-                        )
-                    }
-                    Ok(Err(error)) => failed(code_graph_error(error)),
-                    Err(error) => failed(error),
-                }
-            }
             (Input::CodeContext(input), PreparedExecution::CodeGraph(group)) => {
                 let input = input.clone();
                 let sink = self.graph_progress(ctx);
@@ -3266,7 +3234,6 @@ impl WorkcellInvocation {
                             &output,
                             headline,
                             ranked_rows(&output.results),
-                            None,
                             graph_footer(&output),
                             annotation,
                         )
@@ -3288,99 +3255,13 @@ impl WorkcellInvocation {
                 {
                     Ok(Ok(Ok(output))) => {
                         let output = fit(output);
-                        let annotation = shown_of(output.shown, output.total, output.unit);
+                        let summary = RefsSummary::of(&output);
                         code_graph_result(
                             &output,
-                            format!(
-                                "{} of {}, each row one {}",
-                                output.direction, output.symbol, output.unit
-                            ),
-                            ranked_rows(&output.references),
-                            None,
+                            summary.headline(),
+                            reference_rows(&output),
                             graph_footer(&output),
-                            annotation,
-                        )
-                    }
-                    Ok(Ok(Err(refusal))) => selector_refusal_result(&refusal),
-                    Ok(Err(error)) => failed(code_graph_error(error)),
-                    Err(error) => failed(error),
-                }
-            }
-            (Input::CodeImpact(input), PreparedExecution::CodeGraph(group)) => {
-                let input = input.clone();
-                let sink = self.graph_progress(ctx);
-                match self
-                    .host
-                    .run(ctx, move |token| async move {
-                        group.code_impact(input, sink.as_deref(), &token).await
-                    })
-                    .await
-                {
-                    Ok(Ok(Ok(output))) => {
-                        let output = fit(output);
-                        let annotation = format!(
-                            "{} \u{b7} {} tests",
-                            shown_of(output.shown, output.total, "reached"),
-                            output.tests_reaching.len()
-                        );
-                        code_graph_result(
-                            &output,
-                            format!(
-                                "{} symbols reach {} within {} hops; {} of them are tests",
-                                output.total,
-                                output.symbol,
-                                output.depth,
-                                output.tests_reaching.len()
-                            ),
-                            reached_rows(&output.reached),
-                            None,
-                            graph_footer(&output),
-                            annotation,
-                        )
-                    }
-                    Ok(Ok(Err(refusal))) => selector_refusal_result(&refusal),
-                    Ok(Err(error)) => failed(code_graph_error(error)),
-                    Err(error) => failed(error),
-                }
-            }
-            (Input::CodeExpand(input), PreparedExecution::CodeGraph(group)) => {
-                let input = input.clone();
-                let sink = self.graph_progress(ctx);
-                match self
-                    .host
-                    .run(ctx, move |token| async move {
-                        group.code_expand(input, sink.as_deref(), &token).await
-                    })
-                    .await
-                {
-                    Ok(Ok(Ok(output))) => {
-                        let output = fit(output);
-                        let annotation = format!(
-                            "{} callers \u{b7} {} callees",
-                            output.callers.len(),
-                            output.callees.len()
-                        );
-                        let source = CodeGraphSource {
-                            path: output.path.clone(),
-                            kind: output.kind.clone(),
-                            line_start: output.line_start,
-                            lines: output.source.lines().map(str::to_owned).collect(),
-                            whole_file_reason: output.served_whole_file.clone(),
-                        };
-                        code_graph_result(
-                            &output,
-                            format!(
-                                "{} {} {}:{}-{}",
-                                output.symbol,
-                                output.kind,
-                                output.path,
-                                output.line_start,
-                                output.line_end
-                            ),
-                            neighbour_rows(&output.callers, &output.callees),
-                            Some(source),
-                            graph_footer(&output),
-                            annotation,
+                            summary.annotation(),
                         )
                     }
                     Ok(Ok(Err(refusal))) => selector_refusal_result(&refusal),
@@ -4432,7 +4313,6 @@ fn code_graph_result(
     output: &(impl Serialize + CodeGraphModelText),
     headline: String,
     rows: Vec<CodeGraphRow>,
-    source: Option<CodeGraphSource>,
     footer: String,
     annotation: String,
 ) -> ToolExecResult {
@@ -4441,7 +4321,7 @@ fn code_graph_result(
     ToolExecResult::from(Ok::<_, String>(ToolOutput::CodeGraph {
         headline,
         rows,
-        source,
+        source: None,
         footer,
         state: Some(state),
     }))
@@ -4523,12 +4403,14 @@ fn ranked_rows(symbols: &[RankedSymbol]) -> Vec<CodeGraphRow> {
             outbound: Some(symbol.calls),
             hops: None,
             test_scope: symbol.test_scope,
+            ..CodeGraphRow::default()
         })
         .collect()
 }
 
-fn reached_rows(reached: &[ReachedSymbol]) -> Vec<CodeGraphRow> {
-    reached
+fn reference_rows(output: &CodeRefsOutput) -> Vec<CodeGraphRow> {
+    output
+        .references
         .iter()
         .map(|row| CodeGraphRow {
             name: row.symbol.name.clone(),
@@ -4536,29 +4418,13 @@ fn reached_rows(reached: &[ReachedSymbol]) -> Vec<CodeGraphRow> {
             path: row.symbol.path.clone(),
             line_start: row.symbol.line_start,
             line_end: row.symbol.line_end,
-            inbound: None,
-            outbound: None,
-            hops: Some(row.hops),
-            test_scope: row.test_scope,
-        })
-        .collect()
-}
-
-fn neighbour_rows(callers: &[SymbolRef], callees: &[SymbolRef]) -> Vec<CodeGraphRow> {
-    callers
-        .iter()
-        .map(|symbol| (symbol, Some(1_usize), None))
-        .chain(callees.iter().map(|symbol| (symbol, None, Some(1_usize))))
-        .map(|(symbol, inbound, outbound)| CodeGraphRow {
-            name: symbol.name.clone(),
-            kind: symbol.kind.clone(),
-            path: symbol.path.clone(),
-            line_start: symbol.line_start,
-            line_end: symbol.line_end,
-            inbound,
-            outbound,
-            hops: None,
-            test_scope: false,
+            inbound: Some(row.symbol.callers),
+            outbound: Some(row.symbol.calls),
+            hops: (output.depth > 1).then_some(row.hops),
+            test_scope: row.symbol.test_scope,
+            sites: output.site_labels(row),
+            sites_withheld: row.sites_withheld(),
+            name_only: row.name_only,
         })
         .collect()
 }
@@ -5127,6 +4993,7 @@ mod tests {
     const RELEVANT_SCORE: f64 = 0.9;
     const UNRELATED_SCORE: f64 = 0.0;
     const NOTHING_TO_REORDER: &str = "the task must match more than one symbol";
+    const ONE_HOP_HAS_NO_DISTANCE: &str = "a direct caller row reports no hop distance";
     const REORDER_ONLY: &str = "reranking reorders rows and never adds or drops one";
     const LEARNED_TEMPLATE: &str = "cargo check -p <value> --tests";
     const INTERPRETER_SIBLING: &str = "cargo check -p core && python3 -c 'print(1)'";
@@ -5449,11 +5316,8 @@ mod tests {
                 "websearch",
                 "webfetch",
                 "shell",
-                "code_map",
                 "code_context",
                 "code_refs",
-                "code_impact",
-                "code_expand",
                 "python_execution",
                 "execution_environment",
             ]
@@ -6219,18 +6083,6 @@ mod tests {
                 }),
             ),
             (
-                "code_map",
-                json!({
-                    "$schema": DRAFT_07,
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "path": { "type": "string" },
-                        "limit": { "type": "integer", "minimum": 1 }
-                    }
-                }),
-            ),
-            (
                 "code_context",
                 json!({
                     "$schema": DRAFT_07,
@@ -6253,36 +6105,9 @@ mod tests {
                     "properties": {
                         "symbol": { "type": "string", "minLength": 1 },
                         "direction": { "type": "string", "enum": ["callers", "callees"], "default": "callers" },
+                        "depth": { "type": "integer", "minimum": 1, "maximum": 8, "default": 1 },
                         "path": { "type": "string" },
                         "limit": { "type": "integer", "minimum": 1 }
-                    },
-                    "required": ["symbol"]
-                }),
-            ),
-            (
-                "code_impact",
-                json!({
-                    "$schema": DRAFT_07,
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "symbol": { "type": "string", "minLength": 1 },
-                        "depth": { "type": "integer", "minimum": 1, "maximum": 8, "default": 3 },
-                        "path": { "type": "string" },
-                        "limit": { "type": "integer", "minimum": 1 }
-                    },
-                    "required": ["symbol"]
-                }),
-            ),
-            (
-                "code_expand",
-                json!({
-                    "$schema": DRAFT_07,
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "symbol": { "type": "string", "minLength": 1 },
-                        "path": { "type": "string" }
                     },
                     "required": ["symbol"]
                 }),
@@ -8246,11 +8071,8 @@ mod tests {
         smol::block_on(invocation.execute(&ctx))
     }
 
-    #[test_case("code_map", "code.map.v1", "search" ; "map")]
     #[test_case("code_context", "code.context.v1", "search" ; "context")]
     #[test_case("code_refs", "code.refs.v1", "search" ; "refs")]
-    #[test_case("code_impact", "code.impact.v1", "search" ; "impact")]
-    #[test_case("code_expand", "code.expand.v1", "read" ; "expand")]
     fn code_graph_tools_register_read_only_with_workcell_contracts(
         tool: &str,
         contract: &str,
@@ -8273,26 +8095,24 @@ mod tests {
     }
 
     #[test]
-    fn code_map_ranks_the_referenced_symbol_above_the_orphan() {
+    fn code_refs_rows_carry_the_call_site_lines() {
         let root = TempDir::new().expect("tempdir");
         code_graph_tree(root.path());
-        let result = run_code_graph(root.path(), "code_map", json!({}));
+        let result = run_code_graph(
+            root.path(),
+            "code_refs",
+            json!({ "symbol": "normalize_sku" }),
+        );
 
         let Ok(ToolOutput::CodeGraph { rows, footer, .. }) = result.output else {
             panic!("expected a code-graph card");
         };
-        let ranked: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
-        assert_eq!(
-            ranked.first(),
-            Some(&"normalize_sku"),
-            "three callers must outrank an uncalled helper, got {ranked:?}"
-        );
-        assert!(
-            rows.iter()
-                .find(|row| row.name == "normalize_sku")
-                .is_some_and(|row| row.inbound == Some(3)),
-            "the row must carry the reference count it was ranked by"
-        );
+        let add_item = rows
+            .iter()
+            .find(|row| row.name == "add_item")
+            .expect("add_item calls normalize_sku");
+        assert_eq!(add_item.sites, ["2"]);
+        assert_eq!(add_item.hops, None, "{ONE_HOP_HAS_NO_DISTANCE}");
         assert!(footer.contains("symbols"), "footer was {footer:?}");
     }
 
@@ -8305,7 +8125,11 @@ mod tests {
 
         let root = TempDir::new().expect("tempdir");
         code_graph_tree(root.path());
-        let result = run_code_graph(root.path(), "code_map", json!({}));
+        let result = run_code_graph(
+            root.path(),
+            "code_context",
+            json!({ "task": CODE_CONTEXT_TASK }),
+        );
         let model_output = result.model_output.expect("model output");
 
         assert!(model_output.contains(LEGEND), "got {model_output:?}");
@@ -8414,23 +8238,23 @@ mod tests {
     }
 
     #[test]
-    fn code_impact_rows_carry_hop_distance_rather_than_reference_counts() {
+    fn code_refs_with_depth_rows_carry_hop_distance() {
         let root = TempDir::new().expect("tempdir");
         code_graph_tree(root.path());
         let result = run_code_graph(
             root.path(),
-            "code_impact",
-            json!({ "symbol": "normalize_sku" }),
+            "code_refs",
+            json!({ "symbol": "normalize_sku", "depth": 3 }),
         );
 
-        let Ok(ToolOutput::CodeGraph { rows, .. }) = result.output else {
+        let Ok(ToolOutput::CodeGraph { rows, headline, .. }) = result.output else {
             panic!("expected a code-graph card");
         };
         assert!(!rows.is_empty(), "three callers reach this symbol");
+        assert!(rows.iter().all(|row| row.hops == Some(1)), "{rows:?}");
         assert!(
-            rows.iter()
-                .all(|row| row.hops.is_some() && row.inbound.is_none()),
-            "a reach row measures distance, never references"
+            headline.contains("within 3 hops"),
+            "headline was {headline:?}"
         );
     }
 
@@ -8466,10 +8290,10 @@ mod tests {
         let (_host, registry) = host_and_registry(root.path());
         let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
         let invocation = registry
-            .get("code_map")
-            .expect("registered code_map")
+            .get("code_context")
+            .expect("registered code_context")
             .tool
-            .parse(&json!({ "path": "src" }))
+            .parse(&json!({ "task": CODE_CONTEXT_TASK, "path": "src" }))
             .expect("valid input");
 
         let intent = smol::block_on(invocation.preflight(&ctx))
@@ -8903,7 +8727,6 @@ mod tests {
                 ToolEffect::Mutating,
                 "execute",
             ),
-            ("code_map", "code.map.v1", ToolEffect::ReadOnly, "search"),
             (
                 "code_context",
                 "code.context.v1",
@@ -8911,18 +8734,6 @@ mod tests {
                 "search",
             ),
             ("code_refs", "code.refs.v1", ToolEffect::ReadOnly, "search"),
-            (
-                "code_impact",
-                "code.impact.v1",
-                ToolEffect::ReadOnly,
-                "search",
-            ),
-            (
-                "code_expand",
-                "code.expand.v1",
-                ToolEffect::ReadOnly,
-                "read",
-            ),
             (
                 "python_execution",
                 "python.execution.v1",

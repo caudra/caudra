@@ -413,11 +413,8 @@ pub(super) fn tool_name(subject: &PermissionSubject) -> &str {
                 "python.execution.v1" => "python_execution",
                 "web.search.v1" => "websearch",
                 "web.fetch.v1" => "webfetch",
-                "code.map.v1" => "code_map",
                 "code.context.v1" => "code_context",
                 "code.refs.v1" => "code_refs",
-                "code.impact.v1" => "code_impact",
-                "code.expand.v1" => "code_expand",
                 "execution-environment.snapshot.v1" => "execution_environment",
                 _ => UNAVAILABLE_TOOL,
             }

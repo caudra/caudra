@@ -112,12 +112,14 @@
 
 (call_expression
   function: (member_expression
+    object: (_) @receiver
     property: (property_identifier) @name)) @reference.call
 
 ; `this.#retry()` — the ref half of the #private method pattern above (326 openclaw sites;
 ; property_identifier never matches a private_property_identifier).
 (call_expression
   function: (member_expression
+    object: (_) @receiver
     property: (private_property_identifier) @name)) @reference.call
 
 (new_expression

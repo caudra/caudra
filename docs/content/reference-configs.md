@@ -270,8 +270,7 @@ version = 1
 # Type: usize, at least 1.
 # task = 12
 
-# Rows for `file_index`, `code_map`, `code_context`, `code_refs`,
-# `code_impact`, `code_expand`.
+# Rows for `file_index`, `code_context`, `code_refs`.
 # Type: usize, at least 1.
 # index = 3
 

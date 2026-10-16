@@ -34,16 +34,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "view_image",
         ],
     ),
-    (
-        CODE_INTELLIGENCE,
-        &[
-            "code_map",
-            "code_context",
-            "code_refs",
-            "code_impact",
-            "code_expand",
-        ],
-    ),
+    (CODE_INTELLIGENCE, &["code_context", "code_refs"]),
     (
         "Execution & Control",
         &[
@@ -133,24 +124,14 @@ fn code_list(names: &[&str]) -> String {
 /// Derived from `DEFERRED_BUILTIN_TOOLS` so the page cannot drift from the set
 /// the agent actually withholds.
 fn write_on_demand_section(out: &mut String) {
-    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
-    let mut ungrouped: Vec<&str> = Vec::new();
-    for deferred in caudra_config::DEFERRED_BUILTIN_TOOLS {
-        match deferred.group {
-            Some(group) => match groups.iter_mut().find(|(name, _)| *name == group) {
-                Some((_, members)) => members.push(deferred.name),
-                None => groups.push((group, vec![deferred.name])),
-            },
-            None => ungrouped.push(deferred.name),
-        }
-    }
-    let total = caudra_config::DEFERRED_BUILTIN_TOOLS.len();
+    let deferred = caudra_config::DEFERRED_BUILTIN_TOOLS;
+    let total = deferred.len();
 
     writeln!(
         out,
         "\n## Tools loaded on demand\n\n\
          The default loading policy lets {total} built-in tools start outside the request array. The model sees a \
-         `tool_search` entry instead, and one call with a query loads the matching tools for the \
+         `tool_search` entry instead, and one call with a query loads the best-matching tool for the \
          rest of the session. Sessions that never need them never pay for their descriptions. \
          An explicit profile policy can make other native, local or remote Workcell, Lua/plugin, \
          or local callback tools lazy too. A lazy MCP tool stays out of the \
@@ -159,18 +140,7 @@ fn write_on_demand_section(out: &mut String) {
          `tool_search` disappears when no eligible pending tools remain."
     )
     .unwrap();
-    for (group, members) in &groups {
-        writeln!(
-            out,
-            "\n{} load together as the {group} bundle, limited to eligible lazy members. \
-              Profile policy groups do not create additional loading bundles.",
-            code_list(members)
-        )
-        .unwrap();
-    }
-    if !ungrouped.is_empty() {
-        writeln!(out, "\n{} load on their own.", code_list(&ungrouped)).unwrap();
-    }
+    writeln!(out, "\n{} each load on their own.", code_list(deferred)).unwrap();
     writeln!(
         out,
         "\nLoading changes the tool array, so the provider's prompt cache prefix resets and the \

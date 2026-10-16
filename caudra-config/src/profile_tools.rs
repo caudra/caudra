@@ -21,16 +21,7 @@ pub const TOOL_POLICY_GROUPS: &[(ToolPolicyGroup, &[&str])] = &[
             "file_index",
         ],
     ),
-    (
-        ToolPolicyGroup::CodeGraph,
-        &[
-            "code_map",
-            "code_context",
-            "code_refs",
-            "code_impact",
-            "code_expand",
-        ],
-    ),
+    (ToolPolicyGroup::CodeGraph, &["code_context", "code_refs"]),
     (
         ToolPolicyGroup::Execution,
         &["shell", "python_execution", "execution_environment"],

@@ -29,8 +29,6 @@ pub struct CodeGraphLimits {
     ///
     /// A caller-supplied limit narrows the result; it can never widen it past this.
     pub max_result_limit: usize,
-    /// Bytes of source `code_expand` may return for one symbol.
-    pub max_expand_bytes: usize,
     /// Did-you-mean candidates offered for an unknown selector.
     pub max_suggestions: usize,
     pub ingest: IngestLimits,
@@ -48,7 +46,6 @@ impl Default for CodeGraphLimits {
             honor_gitignore: true,
             default_result_limit: 200,
             max_result_limit: 2_000,
-            max_expand_bytes: 32 * 1024,
             max_suggestions: 5,
             ingest: IngestLimits::default(),
             cache: CacheLimits::default(),

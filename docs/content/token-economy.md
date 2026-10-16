@@ -34,7 +34,7 @@ file_read main.rs            file_index main.rs
                              + file_read offset=812 limit=40
 ```
 
-**Code maps instead of exploring.** `code_map`, `code_context`, `code_refs`, `code_impact`, and `code_expand` show where to start, who calls what, and the tests they can trace to a change, so the agent opens fewer whole files to find out. They build their symbol graph from the source when called, and a repeat call parses only the files that changed. There is no index to build or maintain, and they work without configuration. See [Code Intelligence](/docs/tools/#code-intelligence).
+**Code graph instead of exploring.** `code_context` finds the code a task touches, and `code_refs` lists who calls a symbol and from which lines. With `depth`, `code_refs` also shows what a change could reach and which tests cover it. One call replaces a round of grep and whole-file reads. They build their symbol graph from the source when called, and a repeat call parses only the files that changed. There is no index to build or maintain, and they work without configuration. See [Code Intelligence](/docs/tools/#code-intelligence).
 
 **Subagents as garbage collectors.** A `task` subagent gets its own isolated context. It can search, read files, and hit dead ends without adding its whole transcript to the main conversation. The parent receives its final summary and any intentional [child reports](/docs/sessions/#child-reports). Its transcript stays attached to the task for later `task_id` continuation without inflating the main context. System prompt profiles can assign a different model to their subagents when a task needs a cheaper or stronger model.
 

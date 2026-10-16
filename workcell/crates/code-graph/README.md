@@ -29,7 +29,11 @@ flowchart LR
   reproducible across machines whatever order the filesystem enumerated in.
 - **`resolve`** turns a reference name into an edge through a fixed ladder: same file, then same
   directory, then whole tree. A name that still matches several definitions splits its weight `1/k`
-  and is counted as ambiguous rather than guessed at.
+  and is counted as ambiguous rather than guessed at. Scope rules run first, where a language's
+  syntax makes them sound: in Rust a bare call never reaches a method, a member call never reaches a
+  free function, `Vec::new()` or a name imported from outside the crate is declined, and a member
+  call named like a standard-library method binds only when its file names the owning type. A
+  member call bound by name alone is still listed, at weight zero, so it never moves PageRank.
 - **`rank`** is personalized PageRank over the in-edge graph, plus `reaching_hops` for shortest-path
   distance from a seed set.
 - **`retrieve`** fuses a BM25 lexical lane with the graph lane by reciprocal rank. A lane with no

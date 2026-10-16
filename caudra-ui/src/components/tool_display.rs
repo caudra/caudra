@@ -336,8 +336,6 @@ const QUERY_KEYS: &[(&str, &str)] = &[
     (TOOL_OUTPUT_TOOL_NAME, "pattern"),
     ("code_context", "task"),
     ("code_refs", "symbol"),
-    ("code_impact", "symbol"),
-    ("code_expand", "symbol"),
 ];
 const SHELL_COMMAND_KEY: &str = "command";
 /// The tools whose streaming body is a source the call carries entire rather
@@ -491,11 +489,8 @@ const VIEW: Inflection = ("View", "Viewing", "Viewed");
 const DRAW: Inflection = ("Generate image", "Generating image", "Generated image");
 /// A store reached by sub-command. The verb is the `command` argument, which
 /// the `[k=v]` suffix already shows, so the row names the store instead.
-const MAP: Inflection = ("Map", "Mapping", "Mapped");
 const LOCATE: Inflection = ("Locate", "Locating", "Located");
 const TRACE: Inflection = ("Trace", "Tracing", "Traced");
-const IMPACT: Inflection = ("Impact", "Assessing", "Assessed");
-const EXPAND: Inflection = ("Expand", "Expanding", "Expanded");
 const MEMORY: Inflection = ("Memory", "Memory", "Memory");
 const SESSIONS: Inflection = ("Sessions", "Sessions", "Sessions");
 const PEERS: Inflection = ("Peers", "Peers", "Peers");
@@ -534,11 +529,8 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     tool_row(TOOL_OUTPUT_TOOL_NAME, '↩', RETRIEVE, &[]),
     tool_row("shell", '$', RUN, &["command", "timeoutSec", "workdir"]),
     tool_row("python_execution", 'λ', COMPUTE, &["code", "timeoutSec"]),
-    tool_row("code_map", '◇', MAP, &["path"]),
     tool_row("code_context", '◇', LOCATE, &["task", "path"]),
     tool_row("code_refs", '◇', TRACE, &["symbol", "path"]),
-    tool_row("code_impact", '◇', IMPACT, &["symbol", "path"]),
-    tool_row("code_expand", '◇', EXPAND, &["symbol", "path"]),
     tool_row("execution_environment", '⌂', INSPECT, &[]),
     tool_row("task", '❖', DELEGATE, &["prompt", "description"]),
     tool_row("batch", '⇶', BATCH, &["invocations"]),
@@ -3846,6 +3838,7 @@ mod tests {
                     output: Some(ToolOutput::Plain(REPORT_ACK.into())),
                     annotation: None,
                     refused: false,
+                    accounting: Default::default(),
                 }],
                 text: String::new(),
             };
@@ -5068,6 +5061,7 @@ mod tests {
                     annotation: None,
                     model_suffix: None,
                     refused: false,
+                    accounting: Default::default(),
                 }],
                 text: BODY.into(),
             }
@@ -6489,6 +6483,7 @@ mod tests {
             annotation: None,
             model_suffix: None,
             refused: false,
+            accounting: Default::default(),
         }
     }
 

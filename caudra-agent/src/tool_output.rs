@@ -1067,6 +1067,7 @@ mod tests {
                 output: Some(ToolOutput::Plain("child body".into())),
                 annotation: None,
                 refused: false,
+                accounting: Default::default(),
             }],
             text: (0..400)
                 .map(|line| format!("{line}: <p align=\"center\">"))

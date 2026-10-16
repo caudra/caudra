@@ -70,7 +70,7 @@ Rust workspace, key crates in root dir:
 - caudra-terminal-host: Everything Caudra tells the surrounding terminal: host detection (Herdr, then Orca, then the OSC 7501 probe), the pane status lane, OSC 9/BEL alerts, multiplexer wrapping, the routing table, and host worktrees and panes. A new host is one adapter module (`TerminalHost`, optionally `Workspaces`) plus one entry in `detect_from`. caudra-ui derives the `PaneStatus` and owns the stdout writer
 - caudra-script: The Rhai sandbox workflows and automations share: a restricted engine, a header read without running the script, a bridge that serves host calls while the interpreter runs on its own thread, and canonical JSON and SHA-256 request digests
 
-First-party Workcell tools are native Rust: file_read, file_glob, file_grep, file_write, file_edit, file_apply_patch, file_index, websearch, webfetch, shell, python_execution, execution_environment, and the code-graph family code_map, code_context, code_refs, code_impact, and code_expand.
+First-party Workcell tools are native Rust: file_read, file_glob, file_grep, file_write, file_edit, file_apply_patch, file_index, websearch, webfetch, shell, python_execution, execution_environment, and the code-graph pair code_context and code_refs.
 Caudra owns authorization, registration, and presentation. Workcell owns protocol-neutral contracts,
 validation, bounds, atomicity, network policy, subprocess cleanup, and the bundled Monty worker
 lifecycle. Its crates live under `workcell/` in this workspace. Keep Workcell logic there rather than

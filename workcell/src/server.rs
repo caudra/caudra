@@ -59,9 +59,8 @@ use workcell_host_contract::{
 };
 use workcell_mcp_code::{CodeBuildError, CodeConfiguration, CodeInput, CodeToolGroup};
 use workcell_mcp_code_graph::{
-    CodeContextInput, CodeExpandInput, CodeGraphError, CodeGraphLimits, CodeGraphToolGroup,
-    CodeImpactInput, CodeMapInput, CodeRefsInput, GraphProgress, GraphProgressSink,
-    ModelText as GraphModelText, SelectorRefusal, Shrinkable,
+    CodeContextInput, CodeGraphError, CodeGraphLimits, CodeGraphToolGroup, CodeRefsInput,
+    GraphProgress, GraphProgressSink, ModelText as GraphModelText, SelectorRefusal, Shrinkable,
 };
 use workcell_mcp_files::{
     FileApplyPatchInput, FileEditInput, FileGlobInput, FileGrepInput, FileReadInput, FileResource,
@@ -1623,21 +1622,6 @@ impl WorkcellServer {
                     Vec::new(),
                 )
             }
-            "code_map" => {
-                let input = parse::<CodeMapInput>(arguments).map_err(|_| invalid_arguments())?;
-                let graph = self.code_graph.as_ref().ok_or_else(unavailable)?;
-                let scope = graph
-                    .inspect_scope(input.path.as_deref())
-                    .await
-                    .map_err(graph_failed)?;
-                let prepared = graph.prepare_code_map(input, scope).map_err(graph_failed)?;
-                (
-                    PreparedRemoteOperation::CodeMap(prepared),
-                    OperationKind::Search,
-                    false,
-                    Vec::new(),
-                )
-            }
             "code_context" => {
                 let input =
                     parse::<CodeContextInput>(arguments).map_err(|_| invalid_arguments())?;
@@ -1669,40 +1653,6 @@ impl WorkcellServer {
                 (
                     PreparedRemoteOperation::CodeRefs(prepared),
                     OperationKind::Search,
-                    false,
-                    Vec::new(),
-                )
-            }
-            "code_impact" => {
-                let input = parse::<CodeImpactInput>(arguments).map_err(|_| invalid_arguments())?;
-                let graph = self.code_graph.as_ref().ok_or_else(unavailable)?;
-                let scope = graph
-                    .inspect_scope(input.path.as_deref())
-                    .await
-                    .map_err(graph_failed)?;
-                let prepared = graph
-                    .prepare_code_impact(input, scope)
-                    .map_err(graph_failed)?;
-                (
-                    PreparedRemoteOperation::CodeImpact(prepared),
-                    OperationKind::Search,
-                    false,
-                    Vec::new(),
-                )
-            }
-            "code_expand" => {
-                let input = parse::<CodeExpandInput>(arguments).map_err(|_| invalid_arguments())?;
-                let graph = self.code_graph.as_ref().ok_or_else(unavailable)?;
-                let scope = graph
-                    .inspect_scope(input.path.as_deref())
-                    .await
-                    .map_err(graph_failed)?;
-                let prepared = graph
-                    .prepare_code_expand(input, scope)
-                    .map_err(graph_failed)?;
-                (
-                    PreparedRemoteOperation::CodeExpand(prepared),
-                    OperationKind::Read,
                     false,
                     Vec::new(),
                 )
@@ -1915,16 +1865,6 @@ impl WorkcellServer {
                     .await;
                 file_index_result(output)
             }
-            PreparedRemoteOperation::CodeMap(prepared) => {
-                let progress = progress.map(ToolProgressContext::into_graph_sink);
-                graph_result(
-                    self.code_graph
-                        .as_ref()
-                        .ok_or_else(remote_invalid)?
-                        .execute_prepared_code_map(prepared, progress.as_deref(), &cancellation)
-                        .await,
-                )
-            }
             PreparedRemoteOperation::CodeContext(prepared) => {
                 let progress = progress.map(ToolProgressContext::into_graph_sink);
                 graph_result(
@@ -1942,26 +1882,6 @@ impl WorkcellServer {
                         .as_ref()
                         .ok_or_else(remote_invalid)?
                         .execute_prepared_code_refs(prepared, progress.as_deref(), &cancellation)
-                        .await,
-                )
-            }
-            PreparedRemoteOperation::CodeImpact(prepared) => {
-                let progress = progress.map(ToolProgressContext::into_graph_sink);
-                graph_selectable_result(
-                    self.code_graph
-                        .as_ref()
-                        .ok_or_else(remote_invalid)?
-                        .execute_prepared_code_impact(prepared, progress.as_deref(), &cancellation)
-                        .await,
-                )
-            }
-            PreparedRemoteOperation::CodeExpand(prepared) => {
-                let progress = progress.map(ToolProgressContext::into_graph_sink);
-                graph_selectable_result(
-                    self.code_graph
-                        .as_ref()
-                        .ok_or_else(remote_invalid)?
-                        .execute_prepared_code_expand(prepared, progress.as_deref(), &cancellation)
                         .await,
                 )
             }
@@ -3042,8 +2962,9 @@ fn cwd_tool_arguments(name: &str, mut arguments: Value, cwd: &str) -> Result<Val
     let object = arguments.as_object_mut().ok_or_else(remote_invalid)?;
     let path_key = match name {
         "file_read" | "file_write" | "file_edit" => Some(("filePath", false)),
-        "file_glob" | "file_grep" | "file_index" | "code_map" | "code_context" | "code_refs"
-        | "code_impact" | "code_expand" => Some(("path", true)),
+        "file_glob" | "file_grep" | "file_index" | "code_context" | "code_refs" => {
+            Some(("path", true))
+        }
         "shell" => Some(("workdir", true)),
         _ => None,
     };
@@ -3202,19 +3123,10 @@ fn operation_file_intents(
         PreparedRemoteOperation::FileEdit(prepared) => file_intents(prepared.resources()),
         PreparedRemoteOperation::FileApplyPatch(prepared) => file_intents(prepared.resources()),
         PreparedRemoteOperation::FileIndex(prepared) => file_intents(prepared.resources()),
-        PreparedRemoteOperation::CodeMap(prepared) => {
-            file_intents(std::slice::from_ref(prepared.scope()))
-        }
         PreparedRemoteOperation::CodeContext(prepared) => {
             file_intents(std::slice::from_ref(prepared.scope()))
         }
         PreparedRemoteOperation::CodeRefs(prepared) => {
-            file_intents(std::slice::from_ref(prepared.scope()))
-        }
-        PreparedRemoteOperation::CodeImpact(prepared) => {
-            file_intents(std::slice::from_ref(prepared.scope()))
-        }
-        PreparedRemoteOperation::CodeExpand(prepared) => {
             file_intents(std::slice::from_ref(prepared.scope()))
         }
         _ => Ok(Vec::new()),
@@ -4276,11 +4188,8 @@ mod tests {
                 "file_edit",
                 "file_apply_patch",
                 "file_index",
-                "code_map",
                 "code_context",
                 "code_refs",
-                "code_impact",
-                "code_expand",
                 "websearch",
                 "webfetch",
                 "shell",
@@ -4667,8 +4576,8 @@ mod tests {
 
         let operation = stored_operation(
             &server,
-            "code_map",
-            serde_json::json!({"path":"scope","limit":1}),
+            "code_context",
+            serde_json::json!({"task":"scoped","path":"scope","limit":1}),
         )
         .await;
         let result = server
@@ -4738,8 +4647,12 @@ mod tests {
             serde_json::json!({"filePath":"mutable.txt","content":"prepared"}),
         )
         .await;
-        let graph =
-            stored_operation(&server, "code_map", serde_json::json!({"path":"graph"})).await;
+        let graph = stored_operation(
+            &server,
+            "code_context",
+            json!({"task":"graph","path":"graph"}),
+        )
+        .await;
         let shell = stored_operation(
             &server,
             "shell",
@@ -4810,7 +4723,12 @@ mod tests {
         )
         .await;
         let index = stored_operation(&server, "file_index", json!({"path": "binary.rs"})).await;
-        let graph = stored_operation(&server, "code_map", json!({"path": "scope"})).await;
+        let graph = stored_operation(
+            &server,
+            "code_context",
+            json!({"task": "scoped", "path": "scope"}),
+        )
+        .await;
         let refs = stored_operation(
             &server,
             "code_refs",
@@ -5024,7 +4942,7 @@ mod tests {
             CAPABILITY_UNAVAILABLE_CODE
         );
         assert_eq!(
-            preparation_refusal(&[], "code_map", serde_json::json!({})).await,
+            preparation_refusal(&[], "code_context", serde_json::json!({"task": "a"})).await,
             CAPABILITY_UNAVAILABLE_CODE
         );
         assert_eq!(

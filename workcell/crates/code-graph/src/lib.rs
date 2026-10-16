@@ -36,10 +36,10 @@ pub use git::{
 };
 pub use ingest::{IngestLimits, IngestTruncation, Ingested, SourceInput, ingest, ingest_cached};
 pub use model::{
-    ByteSpan, Definition, Facts, FileId, LineSpan, Metrics, NodeId, Reference, SkipReason,
-    SkippedFile, SourceFile,
+    ByteSpan, CallForm, Definition, Facts, FileId, LineSpan, Metrics, NodeId, Reference,
+    SkipReason, SkippedFile, SourceFile,
 };
 pub use rank::{Ranking, Teleport, pagerank, reaching, reaching_hops};
-pub use resolve::{Edge, Graph, ResolutionDiagnostics, ResolutionTier, resolve};
+pub use resolve::{CallSite, Edge, Graph, ResolutionDiagnostics, ResolutionTier, resolve};
 pub use retrieve::{Confidence, QueryShape, Retrieval, Scored, retrieve, route, subtokens};
 pub use workcell_source_languages::{Language, LanguageFamily, ReferenceKind, SymbolKind};

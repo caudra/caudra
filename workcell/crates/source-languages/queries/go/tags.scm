@@ -39,8 +39,8 @@
   function: [
     (identifier) @name
     (parenthesized_expression (identifier) @name)
-    (selector_expression field: (field_identifier) @name)
-    (parenthesized_expression (selector_expression field: (field_identifier) @name))
+    (selector_expression operand: (_) @receiver field: (field_identifier) @name)
+    (parenthesized_expression (selector_expression operand: (_) @receiver field: (field_identifier) @name))
   ]) @reference.call
 
 ; H4 (2026-07-31): explicit generic instantiation `Generic[int](1)` was investigated for widening

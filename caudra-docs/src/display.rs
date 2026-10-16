@@ -97,7 +97,7 @@ mod tests {
 
     use super::render;
 
-    #[test_case("### `code_map` <span class=\"badge\">on demand</span> {#code_map}", "### `code_map` `on demand`" ; "badge heading")]
+    #[test_case("### `python_execution` <span class=\"badge\">on demand</span> {#python_execution}", "### `python_execution` `on demand`" ; "badge heading")]
     #[test_case("## Modes {#modes}", "## Modes" ; "explicit id")]
     #[test_case("See [modes](/docs/permissions/#modes).", "See [modes](https://caudra.ai/docs/permissions/#modes)." ; "page link")]
     #[test_case("See [below](#details).", "See [below](https://caudra.ai/docs/alpha/#details)." ; "same page link")]

@@ -405,6 +405,29 @@ impl Widget {
     }
 }
 
+#[test_case("use std::collections::HashMap;\n", "import:HashMap" ; "a path")]
+#[test_case("use std::io::Error as IoError;\n", "import:IoError" ; "an alias")]
+#[test_case("use std::collections::{HashMap, btree_map::Entry};\n", "import:Entry" ; "a brace group")]
+#[test_case("use std::{fmt, io::Write as _W};\n", "import:_W" ; "an alias in a brace group")]
+fn rust_captures_each_name_a_use_binds(source: &str, expected: &str) {
+    let captured = capture(Language::Rust, source);
+    assert!(
+        captured.references.contains_key(expected),
+        "missing {expected}; captured {:?}",
+        captured.references
+    );
+}
+
+#[test]
+fn a_free_function_in_an_inline_rust_module_is_not_a_method() {
+    let captured = capture(
+        Language::Rust,
+        "mod tests { fn helper() {} }\nimpl W { fn bump() {} }\n",
+    );
+    assert_eq!(captured.definitions.get("method:helper"), None);
+    assert_eq!(captured.definitions.get("method:bump"), Some(&1));
+}
+
 #[test]
 fn rust_captures_qualified_and_turbofish_calls() {
     // The dominant Rust call form is a `::` path. Upstream tree-sitter-rust's tags query has no

@@ -27,8 +27,19 @@ const RRF_K: f64 = 60.0;
 /// Not a filter. Such a symbol can still be the answer, and demoting rather than dropping is what
 /// keeps a genuine hit in a `testdata` directory reachable.
 const DEPRIORITIZED_PATH_WEIGHT: f64 = 0.35;
+/// Multiplier for a prose match that reached a symbol only through its path or doc comment. A
+/// constructor in a file the task happens to name is weaker evidence than a symbol named for it.
+const PATH_ONLY_WEIGHT: f64 = 0.4;
 /// Multiplier applied when the task text names a symbol's file or module outright.
 const MENTION_ANCHOR_BOOST: f64 = 2.5;
+/// Most files a named identifier may be defined in and still be lifted. A name defined in more
+/// places points at no one symbol.
+const LIFT_MAX_DEFINING_FILES: usize = 3;
+/// Most named identifiers lifted for one task.
+const LIFT_MAX_NAMES: usize = 2;
+const CALL_SUFFIX: &str = "()";
+const PATH_SEPARATOR: &str = "::";
+const BACKTICK: char = '`';
 
 /// Which lane the query-shape router chose, and why.
 ///
@@ -312,13 +323,16 @@ pub fn retrieve(facts: &Facts, ranking: &Ranking, task: &str, limit: usize) -> R
             QueryShape::NameExact => prose_score.mul_add(0.25, name_score * 2.0),
             QueryShape::Conceptual => name_score.mul_add(0.5, prose_score),
         };
+        if score > 0.0 && name_score == 0.0 && shape == QueryShape::Conceptual {
+            score *= PATH_ONLY_WEIGHT;
+        }
         if score > 0.0 {
             let path = facts
                 .file(definition.file)
                 .map_or("", |file| file.path.as_str());
             // Query-mention anchoring: the task naming a file or module outright is a much stronger
             // signal than any term overlap, because it is a caller pointing at a location.
-            if mentions(&lowered, path) || lowered.contains(&definition.name.to_lowercase()) {
+            if mentions(&lowered, path) {
                 score *= MENTION_ANCHOR_BOOST;
             }
             if deprioritized(path) {
@@ -332,7 +346,9 @@ pub fn retrieve(facts: &Facts, ranking: &Ranking, task: &str, limit: usize) -> R
     }
 
     let total_matched = lexical.iter().filter(|scored| scored.score > 0.0).count();
-    let fused = fuse(&lexical, ranking, limit);
+    let mut fused = fuse(&lexical, ranking);
+    lift_named(facts, task, &mut fused);
+    fused.truncate(limit);
     let (confidence, margin_percent) = separation(&fused);
 
     Retrieval {
@@ -406,7 +422,7 @@ fn tied_ranks<F: Fn(&Scored) -> f64>(candidates: &[&Scored], score: F) -> Vec<us
 /// fusion would promote an arbitrary ordering into a vote: two symbols a lane genuinely cannot
 /// distinguish would arrive with different ranks, and that manufactured difference would outweigh
 /// the other lane's real one. A lane that has no opinion must cast no vote.
-fn fuse(lexical: &[Scored], ranking: &Ranking, limit: usize) -> Vec<Scored> {
+fn fuse(lexical: &[Scored], ranking: &Ranking) -> Vec<Scored> {
     let mut candidates: Vec<&Scored> = lexical.iter().filter(|scored| scored.score > 0.0).collect();
     candidates.sort_by(|left, right| {
         right
@@ -446,8 +462,95 @@ fn fuse(lexical: &[Scored], ranking: &Ranking, limit: usize) -> Vec<Scored> {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| left.node.cmp(&right.node))
     });
-    fused.truncate(limit);
     fused
+}
+
+/// Names the task states as identifiers, in order of appearance and without repeats.
+///
+/// A word counts only when its spelling says the writer meant code: backticked, written as a path
+/// (`Graph::resolve`) or a call (`resolve()`), or shaped like an identifier (`build_csr`,
+/// `parseHeader`). A plain word never counts, which is what keeps "renew the mapping" from lifting
+/// every `new` and `map` in the tree. A path or call contributes its last segment.
+fn named_identifiers(task: &str) -> Vec<&str> {
+    let mut named: Vec<&str> = Vec::new();
+    for (index, part) in task.split(BACKTICK).enumerate() {
+        let backticked = index % 2 == 1;
+        for word in part.split_whitespace() {
+            let word = word.trim_matches(|character: char| {
+                !(character.is_alphanumeric() || matches!(character, '_' | ':' | '(' | ')'))
+            });
+            let called = word.ends_with(CALL_SUFFIX);
+            let word = word.trim_end_matches(CALL_SUFFIX).trim_start_matches('(');
+            let qualified = word.contains(PATH_SEPARATOR);
+            let name = word.rsplit(PATH_SEPARATOR).next().unwrap_or_default();
+            let identifier = !name.is_empty()
+                && name
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || character == '_');
+            if identifier
+                && (backticked || called || qualified || has_identifier_shape(name))
+                && !named.contains(&name)
+            {
+                named.push(name);
+            }
+        }
+    }
+    named
+}
+
+/// An interior underscore (`snake_case`) or a lower-to-upper step (`camelCase`). Plain words have
+/// neither.
+fn has_identifier_shape(word: &str) -> bool {
+    let characters: Vec<char> = word.chars().collect();
+    characters.windows(2).enumerate().any(|(index, pair)| {
+        (pair[0].is_lowercase() && pair[1].is_uppercase())
+            || (index > 0 && pair[0] == '_' && pair[1] != '_')
+    })
+}
+
+/// Places the symbols the task names as identifiers directly below the current head.
+///
+/// A name qualifies when it is defined in at most [`LIFT_MAX_DEFINING_FILES`] files, and at most
+/// [`LIFT_MAX_NAMES`] names are lifted. Every definition of a lifted name that already matched
+/// moves up. The head itself never moves: a task naming an identifier is strong evidence that the
+/// symbol is relevant, not that it outranks what the task is mostly about. Lifted results take the
+/// score of the slot they move into, so the list stays ordered by score.
+fn lift_named(facts: &Facts, task: &str, fused: &mut Vec<Scored>) {
+    if fused.len() < 2 {
+        return;
+    }
+    let mut lifted: Vec<NodeId> = Vec::new();
+    let mut lifted_names = 0;
+    for name in named_identifiers(task) {
+        if lifted_names == LIFT_MAX_NAMES {
+            break;
+        }
+        let defining: Vec<_> = facts
+            .definitions
+            .iter()
+            .filter(|definition| definition.name == name)
+            .collect();
+        let mut files: Vec<_> = defining.iter().map(|definition| definition.file).collect();
+        files.sort_unstable();
+        files.dedup();
+        if files.is_empty() || files.len() > LIFT_MAX_DEFINING_FILES {
+            continue;
+        }
+        lifted.extend(defining.iter().map(|definition| definition.node));
+        lifted_names += 1;
+    }
+    if lifted.is_empty() {
+        return;
+    }
+    let ceiling = fused[1].score;
+    let (mut raised, rest): (Vec<Scored>, Vec<Scored>) = fused
+        .drain(1..)
+        .partition(|scored| lifted.contains(&scored.node));
+    for scored in &mut raised {
+        scored.score = ceiling;
+    }
+    fused.extend(raised);
+    fused.extend(rest);
 }
 
 /// Derives confidence from how far the top score sits above the head's median.
@@ -482,6 +585,8 @@ fn separation(results: &[Scored]) -> (Confidence, u32) {
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
     use crate::{
         ingest::{IngestLimits, SourceInput, ingest},
@@ -724,6 +829,109 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(first, run());
         }
+    }
+
+    #[test_case("renew the mapping", &[] ; "plain words that contain short names")]
+    #[test_case("why does `build_csr` drop self loops", &["build_csr"] ; "a backticked name")]
+    #[test_case("why does build_csr drop self loops", &["build_csr"] ; "a snake case word")]
+    #[test_case("where is parseHeader called", &["parseHeader"] ; "a camel case word")]
+    #[test_case("what does resolve() return, and Graph::call_sites?", &["resolve", "call_sites"] ; "a call and a path")]
+    #[test_case("`new` and `new`", &["new"] ; "a repeated name once")]
+    fn a_task_names_only_identifiers_it_spells_as_code(task: &str, expected: &[&str]) {
+        assert_eq!(named_identifiers(task), expected);
+    }
+
+    fn scored(nodes: &[NodeId]) -> Vec<Scored> {
+        let mut score = 1.0;
+        nodes
+            .iter()
+            .map(|&node| {
+                score /= 2.0;
+                Scored { node, score }
+            })
+            .collect()
+    }
+
+    fn defined(facts: &Facts, name: &str) -> NodeId {
+        facts
+            .definitions
+            .iter()
+            .find(|definition| definition.name == name)
+            .expect("defined")
+            .node
+    }
+
+    #[test]
+    fn a_symbol_named_for_the_task_outranks_one_only_in_a_named_file() {
+        let (facts, ranking) = corpus(&[
+            (
+                "src/editor/selection.rs",
+                "pub struct Span;\nimpl Span { pub fn new() -> Self { Span } }\n",
+            ),
+            ("src/view.rs", "pub fn clear() {}\n"),
+        ]);
+        let retrieval = retrieve(&facts, &ranking, "clear the editor selection", 5);
+        let ordered = names(&facts, &retrieval);
+        let position = |name: &str| ordered.iter().position(|found| found == name);
+        let named = position("clear").expect("the named symbol matches");
+        assert!(
+            position("new").is_none_or(|path_only| named < path_only),
+            "a name match must lead a path-only match, got {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn a_named_identifier_is_lifted_directly_below_the_head() {
+        let (facts, _) = corpus(&[(
+            "src/a.rs",
+            "fn drop_self_loops() {}\nfn self_loops() {}\nfn loops() {}\nfn build_csr() {}",
+        )]);
+        let order = ["drop_self_loops", "self_loops", "loops", "build_csr"]
+            .map(|name| defined(&facts, name));
+        let mut fused = scored(&order);
+        lift_named(&facts, "why does build_csr drop self loops", &mut fused);
+        let lifted: Vec<_> = fused.iter().map(|scored| scored.node).collect();
+        assert_eq!(lifted, [order[0], order[3], order[1], order[2]]);
+        assert!(fused.windows(2).all(|pair| pair[0].score >= pair[1].score));
+    }
+
+    #[test]
+    fn a_lifted_head_stays_the_head() {
+        let (facts, _) = corpus(&[("src/a.rs", "fn build_csr() {}\nfn loops() {}")]);
+        let order = ["build_csr", "loops"].map(|name| defined(&facts, name));
+        let mut fused = scored(&order);
+        lift_named(&facts, "`build_csr` loops", &mut fused);
+        assert_eq!(
+            fused.iter().map(|scored| scored.node).collect::<Vec<_>>(),
+            order
+        );
+    }
+
+    #[test]
+    fn a_name_defined_in_too_many_files_is_not_lifted() {
+        let files: Vec<(String, &str)> = (0..=LIFT_MAX_DEFINING_FILES)
+            .map(|index| (format!("src/m{index}.rs"), "fn build_csr() {}"))
+            .chain(std::iter::once((
+                "src/z.rs".to_owned(),
+                "fn loops() {}\nfn csr_loops() {}",
+            )))
+            .collect();
+        let borrowed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, source)| (path.as_str(), *source))
+            .collect();
+        let (facts, _) = corpus(&borrowed);
+        let order = [
+            defined(&facts, "loops"),
+            defined(&facts, "csr_loops"),
+            defined(&facts, "build_csr"),
+        ];
+        let mut fused = scored(&order);
+        lift_named(&facts, "build_csr loops", &mut fused);
+        assert_eq!(
+            fused.iter().map(|scored| scored.node).collect::<Vec<_>>(),
+            order
+        );
     }
 
     #[test]

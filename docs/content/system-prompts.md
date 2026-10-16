@@ -120,7 +120,7 @@ MCP selectors use `server.tool` names, with the server's configured name and the
 | --- | --- |
 | `web` | `websearch`, `webfetch` |
 | `files` | `file_read`, `file_write`, `file_edit`, `file_apply_patch`, `file_glob`, `file_grep`, `file_index` |
-| `code_graph` | `code_map`, `code_context`, `code_refs`, `code_impact`, `code_expand` |
+| `code_graph` | `code_context`, `code_refs` |
 | `execution` | `shell`, `python_execution`, `execution_environment` |
 | `delegation` | `task`, `task_control`, `workflow` |
 | `support` | `batch`, `question`, `todo_write`, `plan` |
@@ -129,7 +129,7 @@ MCP selectors use `server.tool` names, with the server's configured name and the
 
 Select `memory` and `skill` individually. Messaging is optional and separate from support and delegation. It still requires its experimental opt-in, an eligible main-session runtime, peer inbound controls, and outgoing permissions.
 
-Groups are authoring shortcuts. They do not guarantee that every member exists in a runtime or cause members to load together. The existing code-graph loading bundle remains, limited to its eligible lazy members. A custom tool using a built-in name does not acquire that built-in's group or infrastructure privileges.
+Groups are authoring shortcuts. They do not guarantee that every member exists in a runtime or cause members to load together. A custom tool using a built-in name does not acquire that built-in's group or infrastructure privileges.
 
 ### Restrictions and infrastructure
 

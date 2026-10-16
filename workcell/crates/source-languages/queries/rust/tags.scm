@@ -38,9 +38,22 @@
 ; sits inside a declaration_list" — that is expressed by the pattern SHAPE, so the capture belongs on the
 ; function_item, where `body:` is found immediately and no climb happens. Dedup is unaffected: identity is
 ; (fileId, name-token start byte) and Method still outranks Function on specificity.
-(declaration_list
-    (function_item
-        name: (identifier) @name) @definition.method)
+;
+; Anchored on the `impl`/`trait` that owns the list rather than on any `declaration_list`: an inline
+; `mod` body is a declaration_list too, and a free function in `mod tests { … }` is not a method. The
+; `@owner` is the impl's self type or the trait's name, which the resolver pairs with a call's
+; qualifier and with the types a calling file mentions.
+(impl_item
+    type: (_) @owner
+    body: (declaration_list
+        (function_item
+            name: (identifier) @name) @definition.method))
+
+(trait_item
+    name: (type_identifier) @owner
+    body: (declaration_list
+        (function_item
+            name: (identifier) @name) @definition.method))
 
 ; function definitions
 
@@ -79,6 +92,7 @@
 
 (call_expression
     function: (field_expression
+        value: (_) @receiver
         field: (field_identifier) @name)) @reference.call
 
 ; Qualified `::`-path calls — the DOMINANT Rust call form
@@ -91,6 +105,7 @@
 ; second pattern. ingest.cpp mints the ref's `qualifier` from the `path:` sibling (see rustPathQualifier).
 (call_expression
     function: (scoped_identifier
+        path: (_) @qualifier
         name: (identifier) @name)) @reference.call
 
 ; H4: turbofish on a BARE function — `generic::<u32>(1)` — contains no `::`-PATH at all; its `function:`
@@ -104,3 +119,34 @@
 
 (macro_invocation
     macro: (identifier) @name) @reference.call
+
+; `use` declarations: one import per name the declaration binds, with the path as `@qualifier`.
+; The resolver reads the path's first segment to tell an outside crate (`std::…`, `serde::…`) from
+; this one (`crate::…`, `self::…`, `super::…`, an in-tree module). A glob binds no name and a nested
+; brace group's inner path is relative, so neither is captured.
+
+(use_declaration
+    argument: (scoped_identifier
+        path: (_) @qualifier
+        name: (identifier) @name)) @reference.import
+
+(use_declaration
+    argument: (use_as_clause
+        path: (scoped_identifier) @qualifier
+        alias: (identifier) @name)) @reference.import
+
+(use_declaration
+    argument: (scoped_use_list
+        path: (_) @qualifier
+        list: (use_list
+            [
+                (identifier) @name
+                (scoped_identifier
+                    name: (identifier) @name)
+                (use_as_clause
+                    alias: (identifier) @name)
+            ]))) @reference.import
+
+; Every type the file spells. Evidence only: a member call named like a std method binds an in-tree
+; method only when its file mentions the type that owns it.
+(type_identifier) @mention

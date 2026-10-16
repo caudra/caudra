@@ -696,7 +696,7 @@ mod tests {
     const MODEL_SPEC: &str = "test/model";
     const WINDOW_TOKENS: u32 = 1_000;
     const DECLARED: &str = "file_read";
-    const DEFERRED: &str = "code_map";
+    const DEFERRED: &str = "execution_environment";
     const DISABLED: &str = "file_edit";
     const SHELL: &str = "shell";
     const DISABLED_REASON: &str = "model uses the other editing tool";
@@ -781,7 +781,7 @@ mod tests {
             "On demand  1 built-in · ~90 tokens if loaded",
             "Off  1 built-in",
             "file_read  on · ~55 tokens in context · native:workcell",
-            "code_map  lazy · ~90 tokens if loaded · native:workcell",
+            "execution_environment  lazy · ~90 tokens if loaded · native:workcell",
             "file_edit  off · model uses the other editing tool · native:workcell",
             NO_MCP,
         ] {

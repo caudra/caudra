@@ -271,6 +271,7 @@ impl Child {
             output,
             annotation: None,
             refused: false,
+            accounting: Default::default(),
         }
     }
 }
@@ -515,6 +516,7 @@ pub(crate) fn started_entry(start: &ToolStartEvent) -> BatchToolEntry {
         output: None,
         annotation: None,
         refused: false,
+        accounting: Default::default(),
     }
 }
 
@@ -543,6 +545,7 @@ pub(crate) fn settle_entry(entry: &mut BatchToolEntry, done: &crate::ToolDoneEve
     entry.model_suffix = done.model_suffix.clone();
     entry.output = Some(done.output.clone());
     entry.refused = done.refused();
+    entry.accounting = done.accounting.clone();
 }
 
 /// Addresses one child's row on the batch that owns it, which is the only row
@@ -678,6 +681,7 @@ mod tests {
     use async_lock::Barrier;
     use caudra_providers::DocumentSource;
     use caudra_storage::sessions::PermissionMode;
+    use caudra_storage::tool_ledger::ToolOutcome as LedgerOutcome;
     use futures_lite::future;
     use serde_json::json;
     use std::collections::HashMap;
@@ -1189,6 +1193,7 @@ mod tests {
             output: Some(ToolOutput::Plain(text.into())),
             annotation: None,
             refused: false,
+            accounting: Default::default(),
         }
     }
 
@@ -1539,6 +1544,40 @@ mod tests {
             panic!("expected a batch result");
         };
         assert_eq!(entries[0].summary, HEADER_PATH, "{EXPECT_SUMMARY}");
+    }
+
+    /// `/tools` records each child as its own call, which it can only do from
+    /// the accounting the child's own dispatch filled in.
+    #[test]
+    fn a_child_keeps_its_own_accounting() {
+        let registry = Arc::new(ToolRegistry::new());
+        registry
+            .register(
+                Arc::new(HeaderTool),
+                crate::tools::ToolSource::Native {
+                    owner: super::super::OWNER.into(),
+                    contract: HEADER_TOOL.into(),
+                    trusted: true,
+                },
+            )
+            .expect("registering a stub child");
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.registry = Arc::clone(&registry);
+
+        let result = smol::block_on(async {
+            parsed(calls(json!([{ "tool": HEADER_TOOL, "path": HEADER_PATH }])))
+                .unwrap()
+                .execute(&ctx)
+                .await
+        });
+
+        let Ok(ToolOutput::Batch { entries, .. }) = result.output else {
+            panic!("expected a batch result");
+        };
+        let accounting = &entries[0].accounting;
+        assert_eq!(accounting.outcome, Some(LedgerOutcome::Ok));
+        assert!(accounting.source.is_some());
+        assert!(accounting.model_tokens > 0);
     }
 
     const EXPECT_PENDING_SUMMARY: &str = "a child settled without ever starting keeps the header the batch resolved from the call, \

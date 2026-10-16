@@ -1,15 +1,12 @@
 # workcell-mcp-code-graph
 
-`workcell-mcp-code-graph` is Workcell's repository-scale code tool group: five tools over one graph
+`workcell-mcp-code-graph` is Workcell's repository-scale code tool group: two tools over one graph
 built from a confined source tree.
 
 | Tool | Answers |
 | --- | --- |
-| `code_map` | orient: what are the important symbols here |
 | `code_context` | what should I read before making this change |
-| `code_refs` | what references this, or what does this reference |
-| `code_impact` | what breaks if I change this, and what tests cover it |
-| `code_expand` | show me this symbol and what sits next to it |
+| `code_refs` | what calls this and from which lines, what does it call, and with `depth` what a change reaches and which tests cover it |
 
 The ranking engine lives in `workcell-code-graph`. This crate owns the crawl, the tool schemas, the
 result shaping, and the MCP projection.
@@ -37,6 +34,10 @@ field, not only a sentence in a description:
   zero. A symbol that exists and has no callers returns zero. The two are different answers.
 - `ambiguous` — a name matching several definitions returns their union and says so, rather than
   silently picking one.
+- `declined` — a call whose receiver or path names a type outside the tree is never linked to an
+  in-tree symbol that shares its name, and `code_refs` says how many such calls it left out.
+- `nameOnly` — a link made by name alone, because the receiver's type was never seen. It is listed
+  but never moves a ranking.
 
 ## Output convention
 
@@ -47,11 +48,11 @@ estimated.
 
 ## Benchmarks
 
-`examples/code_map_bench.rs` times one `code_map` call over a real tree, and
+`examples/graph_build_bench.rs` times one graph build over a real tree, and
 `evals/compare-ripwire.sh` runs it beside the upstream binary:
 
 ```bash
-cargo build --release --example code_map_bench -p workcell-mcp-code-graph
+cargo build --release --example graph_build_bench -p workcell-mcp-code-graph
 crates/mcp-code-graph/evals/compare-ripwire.sh <tree> [<tree> ...]
 ```
 

@@ -65,5 +65,6 @@
   function: [
       (identifier) @name
       (attribute
+        object: (_) @receiver
         attribute: (identifier) @name)
   ]) @reference.call

@@ -55,7 +55,7 @@ pub fn configure_tools(
             let mut definitions = Value::Array(vec![tool.definition]);
             configure_declared(&mut definitions, config, tasks_supported, shell_supported);
             let definition = definitions.as_array_mut()?.pop()?;
-            Some(DeferredTool::new(&tool.name, tool.group, definition))
+            Some(DeferredTool::new(&tool.name, definition))
         })
         .collect();
 }

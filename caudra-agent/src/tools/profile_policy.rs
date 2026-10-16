@@ -145,11 +145,9 @@ pub fn append_local_definitions(
                     declared.push(definition);
                 }
             }
-            ProfileToolExposure::Lazy => {
-                definitions
-                    .deferred
-                    .push(DeferredTool::new(name, None, definition.clone()))
-            }
+            ProfileToolExposure::Lazy => definitions
+                .deferred
+                .push(DeferredTool::new(name, definition.clone())),
         }
     }
 }
@@ -169,14 +167,10 @@ pub fn configure_definitions(definitions: &mut ToolDefinitions, ctx: &ToolContex
     let deferred = mem::take(&mut definitions.deferred);
     let session_plan = ctx.has_session_plan();
     let mut eager = Vec::new();
-    for (definition, was_lazy, group) in declared
+    for (definition, was_lazy) in declared
         .into_iter()
-        .map(|definition| (definition, false, None))
-        .chain(
-            deferred
-                .into_iter()
-                .map(|tool| (tool.definition, true, tool.group)),
-        )
+        .map(|definition| (definition, false))
+        .chain(deferred.into_iter().map(|tool| (tool.definition, true)))
     {
         let Some(name) = definition["name"].as_str() else {
             continue;
@@ -209,11 +203,9 @@ pub fn configure_definitions(definitions: &mut ToolDefinitions, ctx: &ToolContex
         match decision.exposure {
             ProfileToolExposure::Disabled => {}
             ProfileToolExposure::Eager => eager.push(definition),
-            ProfileToolExposure::Lazy => {
-                definitions
-                    .deferred
-                    .push(DeferredTool::new(name, group, definition.clone()))
-            }
+            ProfileToolExposure::Lazy => definitions
+                .deferred
+                .push(DeferredTool::new(name, definition.clone())),
         }
     }
     definitions.declared = Value::Array(eager);

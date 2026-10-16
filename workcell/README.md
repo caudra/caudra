@@ -67,7 +67,7 @@ sequenceDiagram
 | Files | `file_read`, `file_glob`, `file_grep` | Root-confined, bounded reads and search. |
 | Files | `file_write`, `file_edit`, `file_apply_patch` | Present in the catalog only when `--allow-write` is set. |
 | Files | `file_index` | Bounded source skeletons and deterministic directory listings. |
-| Code graph | `code_map`, `code_context`, `code_refs`, `code_impact`, `code_expand` | Repository-scale symbol ranking, retrieval, and impact over the same confined tree. Reference counts are floors. |
+| Code graph | `code_context`, `code_refs` | Task retrieval, callers with their call sites, and change reach over the same confined tree. Reference counts are floors. |
 | Web | `websearch`, `webfetch` | Search defaults to credential-free Exa; fetch applies SSRF and response bounds. |
 | Shell | `shell` | Applies immutable command policy, then executes with ordered progress and a cleaned environment. |
 | Python execution | `python_execution` | Runs a Python snippet in a separate worker process with no filesystem, network, or environment access. |
@@ -1083,7 +1083,7 @@ workcell = { git = "https://github.com/caudra/caudra", branch = "main", default-
 | `shell` | `ShellToolGroup`, `PreparedShell`, `ShellPreparationError`, scope analysis, progress streaming, and `output_filter` |
 | `code` | `CodeToolGroup`, isolated interpreter execution (the `python_execution` tool) |
 | `code-bundled` | `code` plus verified extraction of a build-time embedded Monty worker |
-| `code-graph` | `CodeGraphToolGroup` and the five `code_*` tools over a confined source tree |
+| `code-graph` | `CodeGraphToolGroup` and the two `code_*` tools over a confined source tree |
 | `code-graph-git` | `code-graph` plus repository recency and churn signals through `gix` |
 | `environment` | `ExecutionEnvironment` inspection |
 
@@ -1093,7 +1093,7 @@ annotations, presentation profile, and a stable contract identity. A host regist
 search reports, so a host presents the same text the MCP adapter does instead of restating it.
 The code-graph group renders its own through `code_graph::ModelText` and bounds its own envelope
 through `code_graph::fit`, both ungated: a native host gets the same text and the same size ceiling
-as an MCP client rather than reimplementing either. Its five methods take an optional
+as an MCP client rather than reimplementing either. Its two methods take an optional
 `GraphProgressSink`, which reports the crawl, parse, and rank phases with a running file count so a
 host can show what a multi-second call is doing. Unlike shell progress, a dropped report cannot fail
 the call.
@@ -1524,18 +1524,15 @@ PDF responses have a separate 6 MiB transfer ceiling and support two explicit mo
 With `--web-icons`, `webfetch` may also resolve a verified source icon. Already-fetched HTML is reused
 where possible so icon discovery does not refetch the page body.
 
-### `code_map`, `code_context`, `code_refs`, `code_impact`, `code_expand`
+### `code_context`, `code_refs`
 
-The code-graph group answers five questions from one graph built over the configured root. It reads
+The code-graph group answers two questions from one graph built over the configured root. It reads
 through the same confined resolver the filesystem tools use and never opens a path itself.
 
 | Tool | Answers |
 | --- | --- |
-| `code_map` | orient: what are the important symbols here |
 | `code_context` | what should I read before making this change |
-| `code_refs` | what references this, or what does this reference |
-| `code_impact` | what breaks if I change this, and what tests cover it |
-| `code_expand` | show me this symbol and what sits next to it |
+| `code_refs` | what calls this and from which lines, what does it call, and with `depth` what a change reaches and which tests cover it |
 
 - Importance is personalized PageRank over a call graph recovered from source text by name.
   `code_context` fuses that with a BM25 lexical lane, and reports which lane its router picked and
@@ -1548,6 +1545,13 @@ through the same confined resolver the filesystem tools use and never opens a pa
   and marks itself ambiguous instead of silently picking one.
 - `confidence` on `code_context` is derived from how far the top result separates from the rest. It
   measures separation, never correctness, and a single result is always low.
+- A call whose receiver or path names a type outside the tree, such as `.clone()` on a standard
+  library value or `Vec::new()`, is declined rather than linked to an in-tree symbol that shares its
+  name; `code_refs` says how many such calls it left out. A call linked by name alone, because its
+  receiver's type was never seen, is listed and marked but never moves a ranking.
+- `code_refs` lists each direct caller's call sites as `file:line`, callers most important first and
+  callees in the order the body calls them. `depth` walks callers further back, nearest first, with a
+  count per hop and the tests among them.
 - `path` scopes any of them to a subdirectory. Absent, or empty, means the whole configured root.
 - **A map does not cross a repository boundary its root is inside.** Ranking is global and normalized,
   so a vendored checkout's symbols compete with the project's in one rank vector and can dominate the

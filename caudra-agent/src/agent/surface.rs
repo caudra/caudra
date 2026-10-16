@@ -395,7 +395,7 @@ mod tests {
     #[test]
     fn a_deferred_tool_counts_as_defined() {
         let mut baseline = fixed_baseline();
-        let deferred = DeferredTool::new(DEFERRED, None, tool(DEFERRED, "Run workflows."));
+        let deferred = DeferredTool::new(DEFERRED, tool(DEFERRED, "Run workflows."));
         let live = Surface::new(
             SYSTEM.to_owned(),
             Value::from(vec![tool(KEPT, KEPT_DESCRIPTION), tool(DROPPED, "Write.")]),
