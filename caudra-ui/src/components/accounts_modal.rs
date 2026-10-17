@@ -1059,6 +1059,7 @@ pub(crate) mod tests {
             masked_key: None,
             env_var: (kind == AccountKind::EnvKey).then(|| ENV_VAR.into()),
             windows: Vec::new(),
+            observed_at: 0,
             blocked_until: None,
             tier: AccountTier::Healthy,
             left_percent: None,

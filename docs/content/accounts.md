@@ -99,7 +99,7 @@ Claude and ChatGPT subscriptions report their quota with every response, so the 
 
 ## In the TUI
 
-`/accounts` or `Ctrl+X i` lists the accounts of the current model's provider, with the quota left in each window.
+`/accounts` or `Ctrl+X i` lists the accounts of the current model's provider, with the quota left in each window, such as the 5-hour and weekly windows of a subscription, and when each one resets. Opening it asks every subscription whose reading is more than a minute old for a new one, and the list updates when they answer.
 
 | Key | Action |
 |---|---|

@@ -4,6 +4,7 @@
 //! elsewhere.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use caudra_agent::automation::clock::{Clock, SystemClock};
 use caudra_config::providers::{ProvidersConfig, resolve_display_name};
@@ -32,13 +33,26 @@ const SWITCH_HINT: &str = "Ctrl+X i chooses another account";
 const MILLIS_PER_SECOND: u64 = 1_000;
 const NO_SUBSCRIPTION: &str = "No signed-in subscription to ask for its quota.";
 const MIN_POOL_FOR_CHIP: usize = 2;
+/// A reading this fresh is kept when `/accounts` opens, so opening it again
+/// and again stays clear of a provider's usage limit. Ctrl+R asks anyway.
+const OPEN_REFRESH_AGE: Duration = Duration::from_secs(60);
 
 impl App {
+    /// Opens on the latest readings and asks the subscriptions whose reading
+    /// is older than [`OPEN_REFRESH_AGE`] for a new one.
     pub(super) fn open_accounts(&mut self) {
         let provider = self.state.model.provider.to_string();
-        match self.accounts_view(&provider) {
-            Ok(view) => self.accounts_modal.open(view),
-            Err(error) => self.flash(error.to_string()),
+        let view = match self.accounts_view(&provider) {
+            Ok(view) => view,
+            Err(error) => {
+                self.flash(error.to_string());
+                return;
+            }
+        };
+        let stale = stale_subscriptions(&view.pool.accounts, view.now_ms);
+        self.accounts_modal.open(view);
+        if !stale.is_empty() {
+            self.fetch_quotas(provider, stale);
         }
     }
 
@@ -139,6 +153,10 @@ impl App {
             self.accounts_modal.show_error(NO_SUBSCRIPTION.into());
             return;
         }
+        self.fetch_quotas(provider, accounts);
+    }
+
+    fn fetch_quotas(&mut self, provider: String, accounts: Vec<String>) {
         let slot = Arc::clone(&self.accounts_refresh);
         smol::spawn(async move {
             let mut failures = Vec::new();
@@ -315,6 +333,19 @@ pub(super) fn account_chip<'a>(
         })
 }
 
+/// The signed-in subscriptions whose quota reading, if any, is older than
+/// [`OPEN_REFRESH_AGE`]. Keys report no quota to ask for.
+fn stale_subscriptions(accounts: &[AccountStatus], now_ms: u64) -> Vec<String> {
+    let fresh_after = now_ms.saturating_sub(OPEN_REFRESH_AGE.as_millis() as u64);
+    accounts
+        .iter()
+        .filter(|account| {
+            account.kind == AccountKind::Subscription && account.observed_at < fresh_after
+        })
+        .map(|account| account.name.clone())
+        .collect()
+}
+
 /// `current`, else the pinned account, moved to the front.
 fn current_first(pool: PoolStatus, current: Option<&str>) -> Vec<AccountStatus> {
     let pinned = match &pool.selection {
@@ -416,13 +447,14 @@ fn display_name(provider: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use caudra_providers::accounts::WindowKind;
+    use caudra_providers::accounts::{AccountTier, WindowKind};
     use test_case::test_case;
 
     use super::*;
 
     const NOW_MS: u64 = 1_767_225_600_000;
     const HOUR_MS: u64 = 3_600_000;
+    const MINUTE_MS: u64 = 60_000;
     const PROVIDER: &str = "anthropic";
     const DISPLAY: &str = "Anthropic";
     const PERSONAL: &str = "personal";
@@ -515,5 +547,33 @@ mod tests {
     )]
     fn an_exhausted_row_offers_the_alternatives(exhaustion: AccountExhaustion, expected: &str) {
         assert_eq!(exhausted_row(DISPLAY, &exhaustion, NOW_MS), expected);
+    }
+
+    fn status(name: &str, kind: AccountKind, observed_at: u64) -> AccountStatus {
+        AccountStatus {
+            name: name.into(),
+            kind,
+            billing: Billing::from_oauth(kind == AccountKind::Subscription),
+            fallback: false,
+            configured: false,
+            identity: Default::default(),
+            masked_key: None,
+            env_var: None,
+            windows: Vec::new(),
+            observed_at,
+            blocked_until: None,
+            tier: AccountTier::Healthy,
+            left_percent: None,
+        }
+    }
+
+    #[test_case(AccountKind::Subscription, 0, true ; "never_read")]
+    #[test_case(AccountKind::Subscription, NOW_MS - 2 * MINUTE_MS, true ; "read_before_the_age")]
+    #[test_case(AccountKind::Subscription, NOW_MS - MINUTE_MS / 2, false ; "read_just_now")]
+    #[test_case(AccountKind::StoredKey, 0, false ; "a_key_reports_no_quota")]
+    #[test_case(AccountKind::SignedOut, 0, false ; "signed_out_cannot_be_asked")]
+    fn opening_asks_only_stale_subscriptions(kind: AccountKind, observed_at: u64, asked: bool) {
+        let accounts = [status(PERSONAL, kind, observed_at)];
+        assert_eq!(stale_subscriptions(&accounts, NOW_MS) == [PERSONAL], asked);
     }
 }
