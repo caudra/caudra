@@ -1,3 +1,4 @@
+use std::array;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
@@ -10,6 +11,7 @@ use caudra_providers::{
     AgentError, Billing, Model, ModelSpend, ProviderUsage, TokenUsage, add_cost, format_hit_rate,
     format_tokens, format_tokens_u64, model_cost,
 };
+use caudra_storage::cache_warming::{EpisodeKind, WarmingSummary};
 use caudra_storage::sessions::StoredTokenUsage;
 use caudra_storage::usage_ledger::{LifetimeUsage, UsageSlice};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -74,6 +76,12 @@ const NOTE_SEPARATOR: &str = " · ";
 /// no invoice behind it.
 const SUBSCRIPTION_LINE: &str = "subscription (not billed)";
 const NOT_BILLED_MARK: &str = "~";
+const WARMING_HEADING: &str = "Cache warming";
+const WARMING_HEADER: [&str; 7] = ["mode", "episodes", "warms", "cost", "saved", "net", "hit"];
+/// A shadow row is what warming would have done, never what it did.
+const SHADOW_SUFFIX: &str = " (estimated if enabled)";
+const UNCALIBRATED_NOTE: &str =
+    " of estimated savings left out: too few cache hits observed on that model yet";
 const MINUTE: i64 = 60;
 const HOUR: i64 = 60 * MINUTE;
 const DAY: i64 = 24 * HOUR;
@@ -177,6 +185,9 @@ pub struct UsageModalContext<'a> {
     /// Every account of the model's provider, the one requests go to first.
     /// Listed only once there are two.
     pub accounts: &'a [AccountStatus],
+    /// Cache-warming episodes for the scope on screen. `None` until read, or
+    /// when the table could not be.
+    pub warming: Option<&'a WarmingSummary>,
 }
 
 pub struct UsageModal {
@@ -383,6 +394,7 @@ impl UsageModal {
                 (lines, None, toggles)
             }
         };
+        lines.extend(warming_lines(ctx.warming, &theme));
 
         let total = lines.len() as u16;
         let modal = Modal {
@@ -912,6 +924,93 @@ fn slice_rows(slices: &[UsageSlice], fg: Style, dim: Style) -> Vec<Line<'static>
         .collect()
 }
 
+/// What warming sent and saved, and beside it what it would have done while it
+/// was off. Absent until a conversation has recorded an episode.
+fn warming_lines(
+    summary: Option<&WarmingSummary>,
+    theme: &crate::theme::Theme,
+) -> Vec<Line<'static>> {
+    let Some(summary) = summary.filter(|summary| !summary.is_empty()) else {
+        return Vec::new();
+    };
+    let fg = Style::new().fg(theme.foreground);
+    let labels: Vec<String> = summary
+        .keys()
+        .map(|(kind, mode)| match kind {
+            EpisodeKind::Real => mode.clone(),
+            EpisodeKind::Shadow => format!("{mode}{SHADOW_SUFFIX}"),
+        })
+        .collect();
+    let cells: Vec<[String; 6]> = summary
+        .iter()
+        .map(|((kind, _), totals)| {
+            [
+                totals.episodes.to_string(),
+                totals.warms.to_string(),
+                format!("{:.3}", totals.warm_cost),
+                format!("{:.3}", totals.saved_cost),
+                format!("{:.3}", totals.net()),
+                // A shadow never sees whether its warms would have hit.
+                format_hit_rate(
+                    totals
+                        .post_warm_hit_rate()
+                        .filter(|_| *kind == EpisodeKind::Real),
+                ),
+            ]
+        })
+        .collect();
+    let label_w = labels
+        .iter()
+        .map(|label| label.chars().count())
+        .chain([WARMING_HEADER[0].len()])
+        .max()
+        .unwrap_or(0);
+    let widths = column_widths(
+        &cells,
+        array::from_fn(|index| WARMING_HEADER[index + 1].len()),
+    );
+    let gap = " ".repeat(COL_GAP);
+    let mut header = format!("{PREFIX}{:<label_w$}", WARMING_HEADER[0]);
+    for (title, width) in WARMING_HEADER[1..].iter().zip(widths) {
+        header.push_str(&format!("{gap}{title:>width$}"));
+    }
+    let mut lines = vec![
+        Line::default(),
+        Line::from(Span::styled(
+            format!("{PREFIX}{WARMING_HEADING}"),
+            theme.keybind_section,
+        )),
+        Line::from(Span::styled(header, theme.status_dim)),
+    ];
+    for ((label, row), totals) in labels.iter().zip(&cells).zip(summary.values()) {
+        let mut text = format!("{PREFIX}{label:<label_w$}");
+        for (cell, width) in row.iter().zip(widths) {
+            text.push_str(&format!("{gap}{cell:>width$}"));
+        }
+        lines.push(Line::from(Span::styled(text, fg)));
+        let outcomes: Vec<String> = totals
+            .outcomes
+            .iter()
+            .map(|(outcome, count)| format!("{} {count}", outcome.as_str()))
+            .collect();
+        lines.push(Line::from(Span::styled(
+            format!("{PREFIX}{PREFIX}{}", outcomes.join(NOTE_SEPARATOR)),
+            theme.status_dim,
+        )));
+    }
+    let uncalibrated: f64 = summary
+        .values()
+        .map(|totals| totals.uncalibrated_cost)
+        .sum();
+    if uncalibrated > 0.0 {
+        lines.push(Line::from(Span::styled(
+            format!("{PREFIX}${uncalibrated:.3}{UNCALIBRATED_NOTE}"),
+            theme.status_dim,
+        )));
+    }
+    lines
+}
+
 /// Its own line rather than a share of the total: the headline number is money
 /// owed, and a subscription owes none. Absent when there is none to report.
 fn subscription_line(cost: Option<f64>, theme: &crate::theme::Theme) -> Option<Line<'static>> {
@@ -1263,6 +1362,7 @@ mod tests {
     use crate::components::{buffer_text, test_model};
     use crate::repaint::expect::{OWED, QUIET};
     use caudra_providers::UsageLimit;
+    use caudra_storage::cache_warming::{EpisodeOutcome, WarmingTotals};
     use caudra_workbench::scroll::{SCROLLBAR_STEP_FORWARD, SCROLLBAR_THUMB_HORIZONTAL};
     use crossterm::event::KeyModifiers;
     use ratatui::buffer::Buffer;
@@ -1371,6 +1471,74 @@ mod tests {
         (Some(0.002), true, "~0.002"),
         (Some(999.9996), false, "1000.000"),
     ];
+
+    const RUNNING_MODE: &str = "running";
+    const WARMING_ABSENT: &str = "no episode means no warming block";
+    const SHADOW_LABELLED: &str = "a shadow row must say it is an estimate";
+    const OUTCOMES_LISTED: &str = "each row lists how its episodes ended";
+    const UNCALIBRATED_SHOWN: &str = "savings left out of the estimate are named, not dropped";
+
+    fn warming_summary() -> WarmingSummary {
+        let totals = |outcomes: &[(EpisodeOutcome, u64)], uncalibrated_cost| WarmingTotals {
+            episodes: outcomes.iter().map(|(_, count)| count).sum(),
+            warms: 4,
+            warm_cost: 0.12,
+            saved_cost: 1.5,
+            uncalibrated_cost,
+            outcomes: outcomes.iter().copied().collect(),
+        };
+        WarmingSummary::from([
+            (
+                (EpisodeKind::Real, RUNNING_MODE.to_owned()),
+                totals(
+                    &[(EpisodeOutcome::Saved, 3), (EpisodeOutcome::Missed, 1)],
+                    0.0,
+                ),
+            ),
+            (
+                (EpisodeKind::Shadow, RUNNING_MODE.to_owned()),
+                totals(&[(EpisodeOutcome::Saved, 2)], 0.4),
+            ),
+        ])
+    }
+
+    #[test_case(None ; "unread")]
+    #[test_case(Some(WarmingSummary::new()) ; "empty")]
+    fn warming_is_absent_without_episodes(summary: Option<WarmingSummary>) {
+        assert!(
+            warming_lines(summary.as_ref(), &crate::theme::current()).is_empty(),
+            "{WARMING_ABSENT}"
+        );
+    }
+
+    #[test]
+    fn warming_rows_tell_real_from_estimated() {
+        let summary = warming_summary();
+        let texts = line_texts(&warming_lines(Some(&summary), &crate::theme::current()));
+        let row = |label: &str| {
+            texts
+                .iter()
+                .find(|text| text.trim_start().starts_with(label))
+                .unwrap_or_else(|| panic!("missing row {label}: {texts:#?}"))
+                .clone()
+        };
+        assert!(
+            row(&format!("{RUNNING_MODE}{SHADOW_SUFFIX}")).contains("—"),
+            "{SHADOW_LABELLED}"
+        );
+        let real = row(&format!("{RUNNING_MODE} "));
+        assert!(real.contains("1.380") && real.contains("75%"), "{real}");
+        assert!(
+            texts.iter().any(|text| text.contains("saved 3 · missed 1")),
+            "{OUTCOMES_LISTED}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains(&format!("$0.400{UNCALIBRATED_NOTE}"))),
+            "{UNCALIBRATED_SHOWN}"
+        );
+    }
 
     #[test_case(0, "0   " ; "zero")]
     #[test_case(999, "999   " ; "raw_integer")]
@@ -1865,6 +2033,7 @@ mod tests {
             clock_format: ClockFormat::Hour24,
             lifetime: None,
             accounts: &[],
+            warming: None,
         };
         let rows = line_texts(&build_lines(&ctx, None, &crate::theme::current()).0);
 
@@ -2182,6 +2351,7 @@ mod tests {
             clock_format: ClockFormat::Hour24,
             lifetime: None,
             accounts: &[],
+            warming: None,
         };
         line_texts(&build_lines(&ctx, None, &crate::theme::current()).0)
     }
@@ -2511,6 +2681,7 @@ mod tests {
             clock_format: ClockFormat::Hour24,
             lifetime,
             accounts: &[],
+            warming: None,
         };
         terminal
             .draw(|f| {

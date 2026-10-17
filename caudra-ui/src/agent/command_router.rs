@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use caudra_agent::agent::cache_warming::{WarmStop, WarmerRef};
 use caudra_agent::{CancelMap, Nudge};
 
 use super::AgentCommand;
@@ -10,6 +11,7 @@ pub(super) fn spawn_command_router(
     cancel_map: Arc<RunCancelMap>,
     subagent_cancels: Arc<CancelMap<String>>,
     retry_now: Nudge,
+    cache_warmer: WarmerRef,
 ) {
     smol::spawn(async move {
         while let Ok(cmd) = cmd_rx.recv_async().await {
@@ -25,6 +27,7 @@ pub(super) fn spawn_command_router(
                     subagent_cancels.cancel_or_precancel(tool_use_id);
                 }
                 AgentCommand::RetryNow => retry_now.notify(),
+                AgentCommand::PrefixChanged => cache_warmer.stop(WarmStop::PrefixChanged),
             }
         }
     })

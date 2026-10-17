@@ -32,11 +32,35 @@ const HOME_MODEL: &str = "test-home/claude-opus-4-8";
 const AWAY_MODEL: &str = "test-away/claude-opus-4-8";
 const LOW_PERCENT: f32 = 90.0;
 const HEALTHY_PERCENT: f32 = 10.0;
+const NEARLY_SPENT_PERCENT: f32 = 95.0;
+const WARM_TTL: Duration = Duration::from_secs(300);
+const WARM_STAYS: &str = "a warm goes to the lineage's account, never another";
+const WARM_KEEPS_LINEAGE_WARM: &str = "a warm counts as a use, so the lineage stays warm";
+const WARM_SPARES_LOW_ACCOUNT: &str = "an account nearly out of quota is not warmed";
 
 #[derive(Default)]
 struct Script {
     replies: HashMap<String, VecDeque<StreamResponse>>,
     served: Vec<String>,
+    warmed: Vec<String>,
+}
+
+struct FakeWarm {
+    name: String,
+    script: Arc<Mutex<Script>>,
+}
+
+impl CacheWarm for FakeWarm {
+    fn ttl(&self) -> Duration {
+        WARM_TTL
+    }
+
+    fn warm(&self) -> BoxFuture<'_, Result<TokenUsage, AgentError>> {
+        Box::pin(async move {
+            self.script.lock().unwrap().warmed.push(self.name.clone());
+            Ok(TokenUsage::default())
+        })
+    }
 }
 
 struct FakeAccount {
@@ -64,6 +88,21 @@ impl Provider for FakeAccount {
                 .and_then(VecDeque::pop_front)
                 .unwrap_or_default())
         })
+    }
+
+    fn cache_warmer(
+        &self,
+        _model: &Model,
+        _messages: &[Message],
+        _system: &str,
+        _tools: &Value,
+        _opts: &RequestOptions,
+        _cache_key: Option<&CacheKey>,
+    ) -> Option<Box<dyn CacheWarm>> {
+        Some(Box::new(FakeWarm {
+            name: self.name.clone(),
+            script: Arc::clone(&self.script),
+        }))
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
@@ -167,6 +206,24 @@ impl Harness {
             self.router
                 .failover(error, Some(&CacheKey::task(None, key))),
         )
+    }
+
+    fn warmer(&self, key: &str) -> Option<Box<dyn CacheWarm>> {
+        self.router.cache_warmer(
+            &self.model,
+            &[],
+            "",
+            &Value::Null,
+            &self.opts,
+            Some(&CacheKey::task(None, key)),
+        )
+    }
+
+    fn idle_for(&self, key: &str) -> Duration {
+        let key = CacheKey::task(None, key);
+        self.state.lineages.lock().unwrap().map[key.as_str()]
+            .used_at
+            .elapsed()
     }
 
     fn served(&self) -> Vec<String> {
@@ -550,4 +607,61 @@ fn list_models_asks_every_signed_in_account() {
     let models = smol::block_on(harness.router.list_models()).unwrap();
     assert!(models.is_empty());
     assert_eq!(harness.state.built_instances().len(), 2);
+}
+
+#[test]
+fn a_warm_stays_on_the_lineage_account_and_keeps_it_warm() {
+    let harness = Harness::new(&[PRIMARY, SECONDARY], AccountSelection::Auto);
+    harness.send(SESSION).unwrap();
+    let warmer = harness.warmer(SESSION).unwrap();
+    harness
+        .state
+        .lineages
+        .lock()
+        .unwrap()
+        .age(CacheKey::task(None, SESSION).as_str(), LONG_WAIT);
+
+    smol::block_on(warmer.warm()).unwrap();
+
+    assert_eq!(
+        warmer.account().map(|account| account.name.as_str()),
+        Some(PRIMARY),
+        "{WARM_STAYS}"
+    );
+    assert_eq!(
+        harness.script.lock().unwrap().warmed,
+        [PRIMARY],
+        "{WARM_STAYS}"
+    );
+    assert!(
+        harness.idle_for(SESSION) < SHORT_WAIT,
+        "{WARM_KEEPS_LINEAGE_WARM}"
+    );
+}
+
+#[test]
+fn a_conversation_with_no_lineage_has_nothing_to_warm() {
+    let harness = Harness::new(&[PRIMARY], AccountSelection::Auto);
+    assert!(harness.warmer(SESSION).is_none());
+}
+
+#[test]
+fn an_account_nearly_out_of_quota_is_not_warmed() {
+    let harness = Harness::new(&[PRIMARY], AccountSelection::Auto);
+    harness.send(SESSION).unwrap();
+    let warmer = harness.warmer(SESSION).unwrap();
+    harness.observe(PRIMARY, NEARLY_SPENT_PERCENT);
+
+    assert!(
+        harness.warmer(SESSION).is_none(),
+        "{WARM_SPARES_LOW_ACCOUNT}"
+    );
+    assert!(
+        smol::block_on(warmer.warm()).is_err(),
+        "{WARM_SPARES_LOW_ACCOUNT}"
+    );
+    assert!(
+        harness.script.lock().unwrap().warmed.is_empty(),
+        "{WARM_SPARES_LOW_ACCOUNT}"
+    );
 }

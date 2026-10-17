@@ -460,6 +460,7 @@ impl Delegate<'_> {
             provider: model.provider.to_string(),
             model: model.id.clone(),
             purpose: LedgerPurpose::Autopilot,
+            account: None,
         });
         if let Some(ended) = self.handle.record_spend(cost, model.billing, self.limits) {
             self.event_tx.try_send(ended);

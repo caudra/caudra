@@ -420,6 +420,14 @@ version = 1
 # Type: string.
 # image_model = "sunburst"
 
+# Keep the prompt cache from expiring by re-sending the last request with no
+# output, on the Anthropic API only: `running` while a run waits on a long
+# tool, subagent, question or permission prompt, `idle` also for up to 30
+# minutes after it ends, `off` never. Each refresh is billed as a cache read;
+# global config only.
+# Type: string.
+# cache_warming = "off"
+
 # Tools to withhold from the model: built-in names, `server.tool`, or
 # `server.*` for a whole MCP server. A project list extends the global one.
 # Type: string[].

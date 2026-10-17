@@ -235,6 +235,7 @@ pub(super) async fn compact_history(
                 provider: extractor.model.provider.to_string(),
                 model: extractor.model.id.clone(),
                 purpose: LedgerPurpose::Extract,
+                account: None,
             });
             Some((outcome.text, spend))
         }

@@ -15,6 +15,7 @@ use caudra_providers::{
 };
 use caudra_storage::autopilot::AutopilotEnd;
 use caudra_storage::background::{JobKind, JobOwner, ShellJobMetadata};
+use caudra_storage::cache_warming::{CacheWarmEpisode, HitSamples};
 use caudra_storage::goal_log::GoalEvaluationOutcome;
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::UnrecordedCall;
@@ -3088,7 +3089,14 @@ pub enum AgentEvent {
         provider: String,
         model: String,
         purpose: LedgerPurpose,
+        /// The provider account that paid, when the sender knows it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
     },
+    /// What one cache-warming episode cost and saved, for the ledger.
+    CacheWarmEpisode(Box<CacheWarmEpisode>),
+    /// Request pairs inside the cache lifetime, and how many of them hit.
+    CacheHitSamples(Vec<HitSamples>),
     ToolResultsSubmitted {
         message: Box<Message>,
     },

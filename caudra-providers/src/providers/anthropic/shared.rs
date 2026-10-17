@@ -130,6 +130,19 @@ impl Usage {
     }
 }
 
+#[derive(Deserialize)]
+struct MessageReply {
+    usage: Usage,
+}
+
+/// The usage a non-streaming Messages reply reports.
+pub(crate) fn reply_usage(body: &[u8]) -> Result<TokenUsage, serde_json::Error> {
+    let reply: MessageReply = serde_json::from_slice(body)?;
+    let mut usage = TokenUsage::default();
+    reply.usage.apply(&mut usage);
+    Ok(usage)
+}
+
 /// A change the API made to the request before the model read it. Later
 /// checks add kinds and reasons, so both stay open strings.
 #[derive(Deserialize, Default)]

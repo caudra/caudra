@@ -3870,6 +3870,8 @@ impl EventPump {
             | AgentEvent::Nudge { .. }
             | AgentEvent::ToolsLoaded { .. }
             | AgentEvent::Unrecorded { .. }
+            | AgentEvent::CacheWarmEpisode(_)
+            | AgentEvent::CacheHitSamples(_)
             | AgentEvent::PromptProgress { .. } => {}
             AgentEvent::Autopilot(event) => self.emit_autopilot(event)?,
             AgentEvent::AccountRouted {
@@ -4862,6 +4864,7 @@ mod tests {
                     provider: REPAIR_PARENT.into(),
                     model: model.clone(),
                     purpose: LedgerPurpose::ToolJsonRepair,
+                    account: None,
                 },
                 subagent,
                 run_id: 1,

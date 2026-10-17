@@ -26,8 +26,8 @@ use super::route::{
     RoutedAccount, SwitchReason,
 };
 use crate::AgentError;
-use crate::model::{Model, ModelInfo};
-use crate::provider::{BoxFuture, Provider, WireRequest};
+use crate::model::{Model, ModelInfo, TokenUsage};
+use crate::provider::{BoxFuture, CacheWarm, Provider, WireRequest};
 use crate::providers::Timeouts;
 use crate::types::{
     CacheKey, Message, ProviderEvent, ProviderUsage, ReasoningTransport, RequestOptions,
@@ -52,6 +52,9 @@ const STATUS_NOT_FOUND: u16 = 404;
 const EVENT_ACCOUNT_SWITCHED: &str = "account_switched";
 const EVENT_ACCOUNT_FAILOVER: &str = "account_failover";
 const EVENT_PROVIDER_REROUTED: &str = "provider_rerouted";
+/// Below this share of its tightest window an account is not warmed.
+const MIN_WARM_LEFT_PERCENT: u8 = 10;
+const WARM_ACCOUNT_LOW: &str = "the account is too low on quota to warm its cache";
 
 /// What the router remembers about one conversation's last request.
 struct LineageState {
@@ -348,6 +351,34 @@ impl RoutedProvider {
         }
     }
 
+    /// The account the conversation's lineage is on and its provider, while
+    /// it has quota to spare for a warm. A warm never reroutes, fails over, or
+    /// switches.
+    fn warm_target(
+        &self,
+        model: &Model,
+        cache_key: Option<&CacheKey>,
+    ) -> Option<(Arc<dyn Provider>, RoutedAccount)> {
+        let name = self
+            .state
+            .lineages
+            .lock()
+            .ok()?
+            .map
+            .get(cache_key?.as_str())?
+            .account
+            .clone();
+        let snapshot = self.state.snapshot();
+        let index = snapshot.position(&name)?;
+        let credential = snapshot.accounts[index].credential.clone()?;
+        let account = self.routed_account(&snapshot, index, &model.id, self.state.now_ms());
+        if !may_warm(&account) {
+            return None;
+        }
+        let instance = self.state.instance(&credential, self.timeouts).ok()?;
+        Some((instance, account))
+    }
+
     fn routed_account(
         &self,
         snapshot: &PoolSnapshot,
@@ -572,6 +603,59 @@ enum Refusal {
     Model,
 }
 
+/// A warm must not spend the last of an account's quota on a turn that may
+/// never come.
+fn may_warm(account: &RoutedAccount) -> bool {
+    account.tier != AccountTier::Spent
+        && account
+            .left_percent
+            .is_none_or(|left| left >= MIN_WARM_LEFT_PERCENT)
+}
+
+/// A lineage account's warm, re-checked before every send because a long wait
+/// can drain or block the account it armed on.
+struct RoutedWarm {
+    inner: Box<dyn CacheWarm>,
+    account: RoutedAccount,
+    router: RoutedProvider,
+    key: String,
+    model_id: String,
+}
+
+impl CacheWarm for RoutedWarm {
+    fn ttl(&self) -> Duration {
+        self.inner.ttl()
+    }
+
+    fn account(&self) -> Option<&RoutedAccount> {
+        Some(&self.account)
+    }
+
+    fn warm(&self) -> BoxFuture<'_, Result<TokenUsage, AgentError>> {
+        Box::pin(async move {
+            let state = &self.router.state;
+            let snapshot = state.snapshot();
+            let current = snapshot.position(&self.account.name).map(|index| {
+                self.router
+                    .routed_account(&snapshot, index, &self.model_id, state.now_ms())
+            });
+            if !current.as_ref().is_some_and(may_warm) {
+                return Err(AgentError::Config {
+                    message: WARM_ACCOUNT_LOW.into(),
+                });
+            }
+            let usage = self.inner.warm().await?;
+            if let Ok(mut lineages) = state.lineages.lock()
+                && let Some(lineage) = lineages.map.get_mut(&self.key)
+                && lineage.account == self.account.name
+            {
+                lineage.used_at = Instant::now();
+            }
+            Ok(usage)
+        })
+    }
+}
+
 impl Provider for RoutedProvider {
     fn stream_message<'a>(
         &'a self,
@@ -722,6 +806,41 @@ impl Provider for RoutedProvider {
         self.state
             .instance(&credential, self.timeouts)?
             .wire_request(model, messages, system, tools, opts, cache_key)
+    }
+
+    /// Warms only the account the lineage is on, and only while it has quota
+    /// to spare: a warm never reroutes, fails over, or switches.
+    fn cache_warmer(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+        cache_key: Option<&CacheKey>,
+    ) -> Option<Box<dyn CacheWarm>> {
+        let (instance, account) = self.warm_target(model, cache_key)?;
+        let inner = instance.cache_warmer(model, messages, system, tools, opts, cache_key)?;
+        Some(Box::new(RoutedWarm {
+            inner,
+            account,
+            router: Self {
+                state: Arc::clone(&self.state),
+                timeouts: self.timeouts,
+            },
+            key: cache_key?.as_str().to_owned(),
+            model_id: model.id.clone(),
+        }))
+    }
+
+    fn cache_warm_ttl(
+        &self,
+        model: &Model,
+        opts: &RequestOptions,
+        cache_key: Option<&CacheKey>,
+    ) -> Option<Duration> {
+        let (instance, _) = self.warm_target(model, cache_key)?;
+        instance.cache_warm_ttl(model, opts, cache_key)
     }
 
     /// Every signed-in account's models, the preferred account's first.

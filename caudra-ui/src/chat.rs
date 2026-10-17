@@ -319,7 +319,9 @@ impl Chat {
                     self.messages_panel.adopt_final_text(text);
                 }
             }
-            AgentEvent::ModelUsage { .. } => {}
+            AgentEvent::ModelUsage { .. }
+            | AgentEvent::CacheWarmEpisode(_)
+            | AgentEvent::CacheHitSamples(_) => {}
             AgentEvent::GoalEvaluating { .. }
             | AgentEvent::GoalSkipped { .. }
             | AgentEvent::GoalEvaluation { .. }

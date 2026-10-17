@@ -120,6 +120,42 @@ Custom endpoints that speak the Responses protocol get the breakpoint when a mod
 
 Cache writes on GPT-5.6 and later cost more than plain input, and `/usage` books them as cache creation so the hit column and the cost stay honest.
 
+## Cache warming
+
+Anthropic keeps a prompt cache entry for 5 minutes after the request that last read or wrote it. A shell command, a subagent, or a question that takes longer lets the entry expire, and the next request writes the whole prompt again at the cache-write price. On a long conversation that one write can cost more than a dozen reads.
+
+Cache warming sends the last request again just before the entry expires, with `max_tokens` set to 0. The model generates nothing, the provider bills the prompt as a cache read, and the entry lives another 5 minutes. It is off by default. Turn it on in the global `caudra.toml`:
+
+```toml
+[agent]
+cache_warming = "running"
+```
+
+| Mode | Warms |
+| --- | --- |
+| `off` | Never. This is the default. |
+| `running` | While a run waits on a tool, a subagent, a question, or a permission prompt. |
+| `idle` | Also for up to 30 minutes after a run ends, so a reply after a short break still reads the cache. |
+
+A project `caudra.toml` cannot set it, because it spends your quota. Subagents warm their own conversations, and in `idle` mode they stop when their run ends.
+
+Warming covers requests sent straight to the Anthropic API. Bedrock, Vertex, other gateways, and a custom base URL never warm. A request also never warms when it has a fixed thinking budget, structured output, or a forced tool choice, because the provider either refuses `max_tokens: 0` for it or caches it under a different key.
+
+Caudra warms only when it is likely to pay off:
+
+- The prompt has at least 4,096 tokens, and one avoided cache write is worth at least $0.05 more than a warm.
+- Each warm goes to the account that served the request, never to another one, and never refreshes a login. An account that is spent, or that has less than 10% of its quota left, is not warmed.
+- Warming stops when the conversation changes underneath it: a new model, thinking level, or effort, a compaction, a revert, a rewind, `/clear`, a fork, or a session switch. It also stops 30 minutes after the last real request (in `idle` mode, 30 minutes after the run ends), and when Caudra exits.
+- Each real request cancels the pending warm. Compaction, titles, goal checks, and other side requests never start one.
+- One warm is in flight at a time, and a failed warm is not retried. A refused request turns warming off for the rest of the session.
+- A warm that wrote the prompt again instead of reading it means the cache was already gone, so warming stops for the session. Warms since the last real request never cost more than the write they protect.
+
+Warms appear in `/usage` under the `cache_warm` purpose and count toward session, goal, and autopilot budgets like any other request. They add nothing to the transcript.
+
+The `Cache warming` block in `/usage` shows, for the session and for all time, how many warms were sent, what they cost, what they saved, and how often the request after a warm read the cache. A warm counts as a saving only when the next request came more than 30 seconds after the entry would have expired and read it.
+
+While warming is off, Caudra still works out what it would have done and shows those rows as `estimated if enabled`, so you can compare before you turn it on. An estimate sends nothing. It is weighted by how often requests that arrived in time actually read the cache on the same model, and a model with too few such requests is left out of the estimate until it has more.
+
 ## Spend on a subscription
 
 A Claude, ChatGPT, or Copilot login pays a flat monthly fee, so its turns never reach an invoice. Caudra still prices them at the provider's published API rates and files the figure separately, labelled `subscription (not billed)`. That is what the same work would have cost through the API.
@@ -162,6 +198,7 @@ Every row records why the model was called, so you can separate the conversation
 | `memory` | Summarizing [project memory](/docs/memory/#summaries-and-spend) in the background |
 | `autopilot` | [Autopilot](/docs/autopilot/) decisions about prompts, questions, plans, and stalls |
 | `tool_json_repair` | Isolated syntax repair for malformed tool arguments |
+| `cache_warm` | [Cache warming](#cache-warming) refreshes, booked on the model whose cache they kept |
 
 The model cannot answer that question on its own, because goals, compaction, and titles often run on the model already in use.
 

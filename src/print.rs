@@ -506,6 +506,8 @@ pub fn run(
             | AgentEvent::ToolsLoaded { .. }
             | AgentEvent::Unrecorded { .. }
             | AgentEvent::Decision(_)
+            | AgentEvent::CacheWarmEpisode(_)
+            | AgentEvent::CacheHitSamples(_)
             | AgentEvent::PromptProgress { .. } => {}
             AgentEvent::Autopilot(event) => {
                 note_autopilot(event, &mut tally, verbose_out.as_mut(), &session_id)?;

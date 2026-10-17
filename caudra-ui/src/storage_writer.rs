@@ -22,6 +22,7 @@ use caudra_storage::account_switches::StoredAccountSwitch;
 use caudra_storage::autopilot::{
     DecisionOutcome, StoredAutopilotDecision, StoredAutopilotEngagement,
 };
+use caudra_storage::cache_warming::{CacheWarmEpisode, CacheWarmLedger, HitSamples};
 use caudra_storage::engine_decisions::StoredEngineDecision;
 use caudra_storage::goal_log::GoalLogWrite;
 use caudra_storage::id::CaudraId;
@@ -83,6 +84,7 @@ type PendingToolCalls = Arc<Mutex<Vec<QueuedToolCall>>>;
 /// Written after the snapshots queued with them, so the session row a
 /// row references is on disk first.
 type PendingRows<R> = Arc<Mutex<Vec<QueuedRow<R>>>>;
+type PendingWarming = Arc<Mutex<Vec<WarmingWrite>>>;
 
 type DeleteCallback = Box<dyn FnOnce(Result<(), SessionError>) + Send>;
 type SaveCallback = flume::Sender<Result<(), SessionError>>;
@@ -158,6 +160,13 @@ struct QueuedRow<R> {
     row: R,
 }
 
+/// One write to the cache-warming tables. Dropped with a warning on failure:
+/// they describe spend the usage ledger already holds, not spend itself.
+pub enum WarmingWrite {
+    Episode(Box<CacheWarmEpisode>),
+    Samples(Vec<HitSamples>),
+}
+
 /// One change to a session's autopilot log. They are written in the order
 /// they were queued, so a settle never overtakes the decision it updates.
 #[derive(Clone)]
@@ -179,6 +188,7 @@ pub struct StorageWriter {
     goal_writes: PendingRows<GoalLogWrite>,
     engine_decisions: PendingRows<StoredEngineDecision>,
     account_switches: PendingRows<StoredAccountSwitch>,
+    warming: PendingWarming,
     done_rx: flume::Receiver<Result<(), SessionError>>,
     thread: JoinHandle<()>,
     generation: Arc<AtomicU64>,
@@ -205,6 +215,8 @@ impl StorageWriter {
         let writer_engine_decisions = Arc::clone(&engine_decisions);
         let account_switches: PendingRows<StoredAccountSwitch> = Arc::default();
         let writer_account_switches = Arc::clone(&account_switches);
+        let warming: PendingWarming = Arc::default();
+        let writer_warming = Arc::clone(&warming);
         let (wake, wake_rx) = flume::bounded::<()>(1);
         let wake = Arc::new(wake);
         let (done_tx, done_rx) = flume::bounded(1);
@@ -228,6 +240,8 @@ impl StorageWriter {
                     goal_writes: writer_goal_writes,
                     engine_decisions: writer_engine_decisions,
                     account_switches: writer_account_switches,
+                    warming: writer_warming,
+                    warm_ledger: None,
                     deleted_sessions: HashMap::new(),
                     failing: HashSet::new(),
                     workspace_tabs_errors: HashMap::new(),
@@ -269,6 +283,7 @@ impl StorageWriter {
             goal_writes,
             engine_decisions,
             account_switches,
+            warming,
             done_rx,
             thread,
             generation,
@@ -384,6 +399,16 @@ impl StorageWriter {
             switch,
             ACCOUNT_SWITCH_ROW,
         );
+    }
+
+    pub fn record_cache_warm(&self, write: WarmingWrite) {
+        self.warming
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(write);
+        if let Err(flume::TrySendError::Disconnected(())) = self.wake.try_send(()) {
+            warn!("storage writer unavailable; a cache-warming record may not be kept");
+        }
     }
 
     fn queue_row<T>(&self, rows: &PendingRows<T>, session_id: CaudraId, row: T, kind: &str) {
@@ -586,6 +611,8 @@ struct Writer {
     goal_writes: PendingRows<GoalLogWrite>,
     engine_decisions: PendingRows<StoredEngineDecision>,
     account_switches: PendingRows<StoredAccountSwitch>,
+    warming: PendingWarming,
+    warm_ledger: Option<CacheWarmLedger>,
     /// Explicit recreation capability retained only by the writer that
     /// completed an ordered delete; ordinary stale saves cannot cross tombstones.
     deleted_sessions: HashMap<CaudraId, SessionRecreation>,
@@ -894,6 +921,32 @@ impl Writer {
         }
     }
 
+    fn write_warming(&mut self) {
+        let writes = mem::take(&mut *self.warming.lock().unwrap_or_else(|e| e.into_inner()));
+        if writes.is_empty() {
+            return;
+        }
+        let ledger = match &self.warm_ledger {
+            Some(ledger) => ledger,
+            None => match CacheWarmLedger::open(&self.dir) {
+                Ok(ledger) => self.warm_ledger.insert(ledger),
+                Err(error) => {
+                    warn!(%error, writes = writes.len(), "cache-warming ledger unavailable");
+                    return;
+                }
+            },
+        };
+        for write in writes {
+            let written = match &write {
+                WarmingWrite::Episode(episode) => ledger.record_episode(episode),
+                WarmingWrite::Samples(samples) => ledger.record_samples(samples),
+            };
+            if let Err(error) = written {
+                warn!(%error, "cache-warming record write failed");
+            }
+        }
+    }
+
     /// One pass over everything queued. The tabs request is claimed before the
     /// snapshots are written, because `write_workspace_tabs` keeps only the ids
     /// the database still holds and the slot is emptied by the claim. Reading
@@ -930,6 +983,7 @@ impl Writer {
         }
         self.flush_usage(usage);
         self.flush_tool_calls(tool_calls);
+        self.write_warming();
     }
 
     fn finish(
@@ -1660,6 +1714,8 @@ mod tests {
             goal_writes: Arc::default(),
             engine_decisions: Arc::default(),
             account_switches: Arc::default(),
+            warming: Arc::default(),
+            warm_ledger: None,
             deleted_sessions: HashMap::new(),
             failing: HashSet::new(),
             workspace_tabs_errors: HashMap::new(),

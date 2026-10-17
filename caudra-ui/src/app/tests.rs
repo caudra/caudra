@@ -13602,6 +13602,7 @@ fn repair_accounting_persists_once_without_changing_context(subagent: bool, stal
         provider: OTHER_PROVIDER.into(),
         model: LEDGER_MODEL.into(),
         purpose: LedgerPurpose::ToolJsonRepair,
+        account: None,
     };
     let message = if subagent {
         subagent_msg(event, TASK_ID, Some(RESEARCH_NAME))
@@ -26758,6 +26759,7 @@ mod autopilot {
             provider: PROVIDER.into(),
             model: MODEL.into(),
             purpose,
+            account: None,
         }
     }
 

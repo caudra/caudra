@@ -15,8 +15,8 @@ use caudra_config::providers::{ProvidersConfig, builtin_provider};
 use caudra_storage::StateDir;
 use caudra_storage::thinking::{self, StoredThinking};
 
-use crate::accounts::{AccountCredential, Failover, RoutedProvider};
-use crate::model::{Model, ModelFamily, ModelInfo};
+use crate::accounts::{AccountCredential, Failover, RoutedAccount, RoutedProvider};
+use crate::model::{Model, ModelFamily, ModelInfo, TokenUsage};
 use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
 use crate::providers::anthropic::bedrock;
@@ -421,6 +421,23 @@ impl WireRequest {
     }
 }
 
+/// A turn's request kept ready to send again with no output, so the prompt
+/// cache it wrote outlives a wait for the next turn. Only a provider that bills
+/// such a send as a plain cache read hands one out.
+pub trait CacheWarm: Send + Sync {
+    /// How long the entry lives after a send refreshes it.
+    fn ttl(&self) -> Duration;
+
+    /// The account every warm goes to, when a router chose it.
+    fn account(&self) -> Option<&RoutedAccount> {
+        None
+    }
+
+    /// Sends the request once, never retrying and never refreshing
+    /// credentials, and returns what it was billed.
+    fn warm(&self) -> BoxFuture<'_, Result<TokenUsage, AgentError>>;
+}
+
 pub trait Provider: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn stream_message<'a>(
@@ -451,6 +468,33 @@ pub trait Provider: Send + Sync {
         Err(AgentError::Config {
             message: NO_WIRE_BODY.into(),
         })
+    }
+
+    /// The request [`Self::stream_message`] just sent for the same inputs,
+    /// ready to re-send with no output. `None` when the provider cannot warm
+    /// its cache that way, or not for this request.
+    fn cache_warmer(
+        &self,
+        _model: &Model,
+        _messages: &[Message],
+        _system: &str,
+        _tools: &Value,
+        _opts: &RequestOptions,
+        _cache_key: Option<&CacheKey>,
+    ) -> Option<Box<dyn CacheWarm>> {
+        None
+    }
+
+    /// How long [`Self::cache_warmer`]'s warm would keep the entry for a
+    /// request with these options, decided without building the request, so
+    /// warming that is off can still say what it would have done.
+    fn cache_warm_ttl(
+        &self,
+        _model: &Model,
+        _opts: &RequestOptions,
+        _cache_key: Option<&CacheKey>,
+    ) -> Option<Duration> {
+        None
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;

@@ -193,6 +193,7 @@ use caudra_providers::{
 use caudra_storage::StateDir;
 use caudra_storage::autopilot::AutopilotStopper;
 use caudra_storage::background::JobKind;
+use caudra_storage::cache_warming::{CacheWarmLedger, WarmingSummary};
 use caudra_storage::id::SessionRef;
 use caudra_storage::input_history::InputHistory;
 use caudra_storage::model::persist_model;
@@ -206,7 +207,7 @@ use flume::{Receiver, TryRecvError};
 use serde_json::Value;
 use smol::Task;
 
-use crate::storage_writer::StorageWriter;
+use crate::storage_writer::{StorageWriter, WarmingWrite};
 use crate::update::{self, Available, UpdateNotice};
 use ratatui::layout::{Position, Rect};
 
@@ -533,6 +534,9 @@ pub struct App {
     /// Read from the ledger when the modal asks for it, not on every frame:
     /// the table outlives sessions and only grows.
     pub(super) lifetime_usage: Option<LifetimeUsage>,
+    /// Cache-warming totals for the scope they were read for, re-read when
+    /// the modal opens, switches scope or reloads.
+    pub(super) warming_summary: Option<(UsageScope, WarmingSummary)>,
     /// Recorded tool activity for the scope `/tools` is showing. `None` means
     /// not loaded yet or unreadable; the modal tells those apart by scope.
     pub(super) tool_stats: Option<ToolStats>,
@@ -881,6 +885,7 @@ impl App {
             tools_preview_cache: ToolsPreviewCache::default(),
             tools_preview_source: None,
             lifetime_usage: None,
+            warming_summary: None,
             tool_stats: None,
             goal_panel: GoalPanel::default(),
             autopilot_panel: AutopilotPanel::default(),
@@ -1594,6 +1599,9 @@ impl App {
     /// [`SessionState::update_model`] instead, which must not overwrite what
     /// the user asked for on a model that could honor it.
     fn apply_thinking(&mut self, thinking: ThinkingConfig) {
+        if self.state.thinking != thinking {
+            self.prefix_changed();
+        }
         self.state.thinking = thinking;
         self.state.thinking_explicit = true;
         caudra_storage::thinking::persist(
@@ -1654,8 +1662,19 @@ impl App {
         if fast && !self.state.model.supports_fast() {
             return Err(FAST_UNSUPPORTED_MSG.into());
         }
+        if self.state.fast != fast {
+            self.prefix_changed();
+        }
         self.state.fast = fast;
         Ok(())
+    }
+
+    /// Tells the agent its last request's cache will not be read again, so
+    /// warming it would be spent for nothing.
+    fn prefix_changed(&self) {
+        if let Some(cmd_tx) = &self.cmd_tx {
+            let _ = cmd_tx.try_send(super::AgentCommand::PrefixChanged);
+        }
     }
 
     /// What `caudra.model.get` hands to Lua.
@@ -2484,6 +2503,7 @@ impl App {
             guard_repeat!(false);
             if key::REFRESH.matches(key) {
                 self.lifetime_usage = None;
+                self.warming_summary = None;
                 self.load_lifetime_usage();
                 return Some(vec![Action::RefreshUsage]);
             }
@@ -4197,6 +4217,7 @@ impl App {
     fn toggle_usage_modal(&mut self) -> Vec<Action> {
         self.usage_modal.toggle();
         if self.usage_modal.is_open() {
+            self.warming_summary = None;
             self.load_lifetime_usage();
             self.reload_usage_accounts();
             vec![Action::RefreshUsage]
@@ -5119,7 +5140,12 @@ impl App {
         }
         if !session_owned
             && envelope.run_id != self.run_id
-            && !matches!(envelope.event, AgentEvent::ModelUsage { .. })
+            && !matches!(
+                envelope.event,
+                AgentEvent::ModelUsage { .. }
+                    | AgentEvent::CacheWarmEpisode(_)
+                    | AgentEvent::CacheHitSamples(_)
+            )
         {
             let cancelled_terminal = envelope.subagent.is_none()
                 && self.cancelling_run == Some(envelope.run_id)
@@ -5381,6 +5407,7 @@ impl App {
                 provider,
                 model,
                 purpose,
+                account,
             } => {
                 self.state.token_usage += usage;
                 self.add_session_spend(cost, billing);
@@ -5388,7 +5415,25 @@ impl App {
                 if subagent_id.is_some() {
                     self.record_external_spend(usage, cost, billing, purpose);
                 }
-                self.record_model_usage(&provider, None, &model, purpose, usage, cost, billing);
+                self.record_model_usage(
+                    &provider,
+                    account.as_deref(),
+                    &model,
+                    purpose,
+                    usage,
+                    cost,
+                    billing,
+                );
+                return vec![];
+            }
+            AgentEvent::CacheWarmEpisode(episode) => {
+                self.storage_writer
+                    .record_cache_warm(WarmingWrite::Episode(episode));
+                return vec![];
+            }
+            AgentEvent::CacheHitSamples(samples) => {
+                self.storage_writer
+                    .record_cache_warm(WarmingWrite::Samples(samples));
                 return vec![];
             }
             AgentEvent::GoalEvaluating { evaluation } => {
@@ -7127,6 +7172,7 @@ impl App {
     /// failure leaves `None`, which the modal renders as unavailable rather
     /// than as zero spend.
     fn load_lifetime_usage(&mut self) {
+        self.load_warming_summary();
         if self.usage_modal.scope() != UsageScope::Lifetime || self.lifetime_usage.is_some() {
             return;
         }
@@ -7134,6 +7180,27 @@ impl App {
             Ok(lifetime) => self.lifetime_usage = Some(lifetime),
             Err(error) => tracing::warn!(%error, "lifetime usage unavailable"),
         }
+    }
+
+    fn load_warming_summary(&mut self) {
+        let scope = self.usage_modal.scope();
+        if self
+            .warming_summary
+            .as_ref()
+            .is_some_and(|(loaded, _)| *loaded == scope)
+        {
+            return;
+        }
+        let session = (scope == UsageScope::Session).then(|| self.state.session.id.to_string());
+        self.warming_summary = match CacheWarmLedger::open(&self.storage)
+            .and_then(|ledger| ledger.summary(session.as_deref()))
+        {
+            Ok(summary) => Some((scope, summary)),
+            Err(error) => {
+                tracing::warn!(%error, "cache warming summary unavailable");
+                None
+            }
+        };
     }
 
     /// Reads the ledger for the scope `/tools` is showing, which is a snapshot

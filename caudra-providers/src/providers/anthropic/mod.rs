@@ -21,10 +21,10 @@ use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use crate::accounts::{AccountCredential, AccountSecret, QuotaWindow, WindowKind, quota};
-use crate::model::Model;
-use crate::provider::{BoxFuture, Provider, WireRequest};
+use crate::model::{Model, TokenUsage};
+use crate::provider::{BoxFuture, CacheWarm, Provider, WireRequest};
 use crate::providers::oauth::AccountStore;
-use crate::types::THINKING_ADAPTIVE;
+use crate::types::{THINKING_ADAPTIVE, THINKING_BUDGET};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
     UsageLimit,
@@ -62,6 +62,9 @@ const OAUTH_METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_CHANGED_STATUS: u16 = 503;
 const AUTH_CHANGED_MESSAGE: &str = "Anthropic authentication changed while retrying";
 const NO_CREDENTIAL: &str = "this Anthropic account has neither a login nor an API key";
+const STATUS_OK: u16 = 200;
+/// `tool_choice` types that make the model call a tool, so it must output.
+const FORCED_TOOL_CHOICES: &[&str] = &["any", "tool"];
 
 const PROVIDER: &str = "anthropic";
 const ENV_VAR: &str = "ANTHROPIC_API_KEY";
@@ -831,27 +834,74 @@ impl Anthropic {
         url: &str,
         session_id: Option<&str>,
     ) -> isahc::http::request::Builder {
-        let user_agent = if oauth {
-            format!("claude-cli/{} (external, cli)", auth::CLAUDE_CODE_VERSION)
-        } else {
-            super::user_agent().into()
-        };
-        let mut builder = Request::builder()
-            .method(method)
-            .uri(url)
-            .header("anthropic-version", API_VERSION)
-            .header("user-agent", user_agent);
-        if oauth {
-            builder = builder
-                .header("x-app", "cli")
-                .header(
-                    "x-claude-code-session-id",
-                    session_id.unwrap_or(&self.oauth_session_id),
-                )
-                .header("x-client-request-id", random_id())
-                .header("anthropic-dangerous-direct-browser-access", "true");
+        request_builder(
+            auth,
+            oauth,
+            method,
+            url,
+            session_id.unwrap_or(&self.oauth_session_id),
+        )
+    }
+
+    /// `None` unless the request goes to the first-party API, where a send with
+    /// `max_tokens: 0` refreshes the cache and bills only a cache read. Budget
+    /// thinking, a structured format, and a forced tool choice each refuse it.
+    fn prepare_warm(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+        cache_key: Option<&CacheKey>,
+    ) -> Option<AnthropicWarm> {
+        let auth = self.auth_snapshot();
+        let ttl = self.warm_ttl(&auth, model, opts)?;
+        let mut request = self.prepare(&auth, model, messages, system, tools, opts);
+        let body = &mut request.wire.body;
+        if !warmable_body(body) {
+            return None;
         }
-        auth.configure_request(builder)
+        body["max_tokens"] = json!(0);
+        body.as_object_mut()?.remove("stream");
+        Some(AnthropicWarm {
+            client: self.client.clone(),
+            oauth: auth.mode == AuthMode::ClaudeOauth,
+            auth: auth.resolved,
+            session_id: cache_key
+                .map_or(self.oauth_session_id.as_str(), CacheKey::as_str)
+                .to_owned(),
+            method: request.wire.method,
+            url: request.wire.url,
+            betas: request.betas.join(","),
+            body: serde_json::to_vec(&request.wire.body).ok()?,
+            ttl,
+        })
+    }
+
+    /// The lifetime a warm refreshes, when the request would warm at all:
+    /// first-party only, and with thinking that can run with no output.
+    fn warm_ttl(
+        &self,
+        auth: &AuthSnapshot,
+        model: &Model,
+        opts: &RequestOptions,
+    ) -> Option<Duration> {
+        if auth.mode == AuthMode::Injected
+            || !auth
+                .resolved
+                .base_url
+                .as_deref()
+                .is_none_or(|url| first_party(url, None))
+        {
+            return None;
+        }
+        let mut thinking = json!({});
+        opts.thinking.apply_to_body(&mut thinking, model);
+        if !warmable_body(&thinking) {
+            return None;
+        }
+        self.prompt_cache_ttl(model)
     }
 
     async fn do_stream_request(
@@ -878,7 +928,7 @@ impl Anthropic {
         let response = self.client.send_async(builder.body(json_body)?).await?;
         let status = response.status().as_u16();
 
-        if status == 200 {
+        if status == STATUS_OK {
             let quota = quota::from_anthropic_headers(response.headers());
             let mut streamed = parse_sse_inner(
                 response,
@@ -1038,6 +1088,85 @@ fn normalize_oauth_auth_error(error: AgentError) -> AgentError {
     }
 }
 
+fn request_builder(
+    auth: &super::ResolvedAuth,
+    oauth: bool,
+    method: &str,
+    url: &str,
+    session_id: &str,
+) -> isahc::http::request::Builder {
+    let user_agent = if oauth {
+        format!("claude-cli/{} (external, cli)", auth::CLAUDE_CODE_VERSION)
+    } else {
+        super::user_agent().into()
+    };
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(url)
+        .header("anthropic-version", API_VERSION)
+        .header("user-agent", user_agent);
+    if oauth {
+        builder = builder
+            .header("x-app", "cli")
+            .header("x-claude-code-session-id", session_id)
+            .header("x-client-request-id", random_id())
+            .header("anthropic-dangerous-direct-browser-access", "true");
+    }
+    auth.configure_request(builder)
+}
+
+/// Budget thinking cannot run with no output, a structured format and a forced
+/// tool choice must produce some, so the API refuses `max_tokens: 0` for each.
+fn warmable_body(body: &Value) -> bool {
+    body["thinking"]["type"] != THINKING_BUDGET
+        && body["output_config"].get("format").is_none()
+        && !FORCED_TOOL_CHOICES.contains(&body["tool_choice"]["type"].as_str().unwrap_or_default())
+}
+
+/// A turn's request as [`Anthropic::prepare`] built it, with `max_tokens: 0`
+/// and no stream, on the credential the turn was sent with.
+struct AnthropicWarm {
+    client: HttpClient,
+    oauth: bool,
+    auth: super::ResolvedAuth,
+    session_id: String,
+    method: &'static str,
+    url: String,
+    betas: String,
+    body: Vec<u8>,
+    ttl: Duration,
+}
+
+impl CacheWarm for AnthropicWarm {
+    fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
+    fn warm(&self) -> BoxFuture<'_, Result<TokenUsage, AgentError>> {
+        Box::pin(async move {
+            let mut builder = request_builder(
+                &self.auth,
+                self.oauth,
+                self.method,
+                &self.url,
+                &self.session_id,
+            )
+            .header("content-type", "application/json");
+            if !self.betas.is_empty() {
+                builder = builder.header("anthropic-beta", &self.betas);
+            }
+            let mut response = self
+                .client
+                .send_async(builder.body(self.body.clone())?)
+                .await?;
+            if response.status().as_u16() != STATUS_OK {
+                return Err(AgentError::from_response(response).await);
+            }
+            Ok(shared::reply_usage(&response.bytes().await?)?)
+        })
+    }
+}
+
 fn random_id() -> String {
     let high = fastrand::u64(..);
     let low = fastrand::u64(..);
@@ -1133,6 +1262,28 @@ impl Provider for Anthropic {
         Ok(self
             .prepare(&self.auth_snapshot(), model, messages, system, tools, opts)
             .wire)
+    }
+
+    fn cache_warmer(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+        cache_key: Option<&CacheKey>,
+    ) -> Option<Box<dyn CacheWarm>> {
+        self.prepare_warm(model, messages, system, tools, opts, cache_key)
+            .map(|warm| Box::new(warm) as Box<dyn CacheWarm>)
+    }
+
+    fn cache_warm_ttl(
+        &self,
+        model: &Model,
+        opts: &RequestOptions,
+        _cache_key: Option<&CacheKey>,
+    ) -> Option<Duration> {
+        self.warm_ttl(&self.auth_snapshot(), model, opts)
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
@@ -1304,11 +1455,21 @@ mod tests {
     const SYSTEM_PREFIX: &str = "Operator prefix";
     const CACHE_CONTROL_KEY: &str = "\"cache_control\"";
     const BREAKPOINT_BUDGET: usize = 4;
-    const THINKING_BUDGET: u32 = 4_096;
+    const BUDGET_TOKENS: u32 = 4_096;
     const OVER_BUDGET: &str = "the Messages API rejects a request with more than four breakpoints";
     const BREAKPOINT_MISPLACED: &str =
         "only the last tool and the last block of the last message cache what precedes them";
     const REPLY_TEXT: &str = "reply";
+    const WARM_BODY_DRIFTED: &str =
+        "a warm must send the turn's body byte for byte apart from max_tokens and stream";
+    const UNWARMABLE_WARMED: &str = "a request the API refuses at max_tokens 0 must not warm";
+    /// A model that keeps an explicit thinking budget instead of adapting it.
+    const BUDGET_MODEL: &str = "anthropic/claude-sonnet-4-5";
+    const CHEAP_TTL_DISAGREES: &str =
+        "the cheap lifetime check must agree with the warm the request builds";
+    const WARM_REPLY: &str = r#"{"id":"msg_1","type":"message","role":"assistant","content":[],
+        "stop_reason":"max_tokens","usage":{"input_tokens":3,"output_tokens":0,
+        "cache_creation_input_tokens":0,"cache_read_input_tokens":150000}}"#;
     const FOLLOW_UP_TEXT: &str = "and then";
     const ACCOUNT_NAME: &str = "personal";
     const PROFILE_UUID: &str = "4f1c9e2a-account";
@@ -1641,6 +1802,121 @@ mod tests {
         assert_eq!(wire.body["model"], WIRE_MODEL);
         assert_eq!(wire.body.pointer(system_at), Some(&json!(SYSTEM_PROMPT)));
         assert_eq!(wire.body["tools"][0]["name"], tool_name);
+    }
+
+    fn warm_for(provider: &Anthropic, opts: &RequestOptions) -> Option<AnthropicWarm> {
+        provider.prepare_warm(
+            &Model::from_spec(LONG_CONTEXT_MODEL).unwrap(),
+            &[Message::user(USER_TEXT.into())],
+            SYSTEM_PROMPT,
+            &shell_tool(),
+            opts,
+            None,
+        )
+    }
+
+    /// Anything but `max_tokens` and the stream flag differing from the sent
+    /// body would write a new cache entry instead of refreshing the old one.
+    #[test_case(resolve_auth_from_key(CREDENTIAL, None), AuthMode::ApiKey ; "api_key")]
+    #[test_case(oauth_auth(), AuthMode::ClaudeOauth ; "subscription")]
+    fn a_warm_resends_the_turn_with_no_output(resolved: ResolvedAuth, mode: AuthMode) {
+        let provider = Anthropic::with_test_auth(resolved, mode);
+        let opts = RequestOptions::default();
+        let wire = provider
+            .wire_request(
+                &Model::from_spec(LONG_CONTEXT_MODEL).unwrap(),
+                &[Message::user(USER_TEXT.into())],
+                SYSTEM_PROMPT,
+                &shell_tool(),
+                &opts,
+                None,
+            )
+            .unwrap();
+
+        let warm = warm_for(&provider, &opts).unwrap();
+
+        let mut expected = wire.body;
+        expected["max_tokens"] = json!(0);
+        expected.as_object_mut().unwrap().remove("stream");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&warm.body).unwrap(),
+            expected,
+            "{WARM_BODY_DRIFTED}"
+        );
+        assert_eq!(warm.url, wire.url, "{WARM_BODY_DRIFTED}");
+        assert_eq!(warm.ttl(), Duration::from_secs(5 * 60));
+    }
+
+    #[test_case(
+        resolve_auth_from_key(CREDENTIAL, Some(THIRD_PARTY_BASE_URL.into())),
+        AuthMode::ApiKey
+        ; "a_proxy_base_url"
+    )]
+    #[test_case(
+        resolve_auth_from_key(CREDENTIAL, None),
+        AuthMode::Injected
+        ; "injected_auth"
+    )]
+    fn only_first_party_turns_warm(resolved: ResolvedAuth, mode: AuthMode) {
+        let provider = Anthropic::with_test_auth(resolved, mode);
+        assert!(
+            warm_for(&provider, &RequestOptions::default()).is_none(),
+            "{UNWARMABLE_WARMED}"
+        );
+    }
+
+    #[test_case(json!({"thinking": {"type": THINKING_BUDGET, "budget_tokens": BUDGET_TOKENS}}) ; "budget_thinking")]
+    #[test_case(json!({"output_config": {"format": {"type": "json_schema"}}}) ; "structured_output")]
+    #[test_case(json!({"tool_choice": {"type": "tool", "name": "shell"}}) ; "a_named_tool")]
+    #[test_case(json!({"tool_choice": {"type": "any"}}) ; "any_tool")]
+    fn a_body_that_must_output_cannot_warm(body: Value) {
+        assert!(!warmable_body(&body), "{UNWARMABLE_WARMED}");
+    }
+
+    /// A shadow episode trusts the cheap answer, so it must never disagree
+    /// with the warm the same request would really build.
+    #[test_case(LONG_CONTEXT_MODEL, ThinkingConfig::Off ; "no_thinking")]
+    #[test_case(LONG_CONTEXT_MODEL, ThinkingConfig::Adaptive ; "adaptive")]
+    #[test_case(BUDGET_MODEL, ThinkingConfig::Budget(BUDGET_TOKENS) ; "budget_thinking")]
+    fn the_cheap_ttl_matches_the_built_warm(spec: &str, thinking: ThinkingConfig) {
+        let provider =
+            Anthropic::with_test_auth(resolve_auth_from_key(CREDENTIAL, None), AuthMode::ApiKey);
+        let model = Model::from_spec(spec).unwrap();
+        let opts = RequestOptions {
+            thinking,
+            ..RequestOptions::default()
+        }
+        .clamped(&model);
+        let built = provider
+            .prepare_warm(
+                &model,
+                &[Message::user(USER_TEXT.into())],
+                SYSTEM_PROMPT,
+                &shell_tool(),
+                &opts,
+                None,
+            )
+            .map(|warm| warm.ttl);
+
+        assert_eq!(
+            provider.cache_warm_ttl(&model, &opts, None),
+            built,
+            "{CHEAP_TTL_DISAGREES}"
+        );
+    }
+
+    #[test]
+    fn a_warm_reads_its_usage_from_the_reply() {
+        let usage = shared::reply_usage(WARM_REPLY.as_bytes()).unwrap();
+        assert_eq!(
+            usage,
+            TokenUsage {
+                input: 3,
+                output: 0,
+                cache_creation: 0,
+                cache_read: 150_000,
+            }
+        );
     }
 
     #[test]
@@ -2245,7 +2521,7 @@ data: {\"type\":\"content_block_stop\"}\n";
     #[test_case(resolve_auth_from_key(CREDENTIAL, None), AuthMode::ApiKey, "anthropic/claude-sonnet-5-5", ThinkingConfig::Adaptive, true ; "adaptive_sonnet_5_5_binds")]
     #[test_case(oauth_auth(), AuthMode::ClaudeOauth, "anthropic/claude-opus-5-5", ThinkingConfig::Adaptive, true ; "adaptive_opus_5_5_binds_on_a_subscription")]
     #[test_case(resolve_auth_from_key(CREDENTIAL, None), AuthMode::ApiKey, "anthropic/claude-sonnet-5-5", ThinkingConfig::Off, false ; "between_tools_takes_no_binding")]
-    #[test_case(resolve_auth_from_key(CREDENTIAL, None), AuthMode::ApiKey, "anthropic/claude-sonnet-4-5", ThinkingConfig::Budget(THINKING_BUDGET), false ; "a_budget_takes_no_binding")]
+    #[test_case(resolve_auth_from_key(CREDENTIAL, None), AuthMode::ApiKey, "anthropic/claude-sonnet-4-5", ThinkingConfig::Budget(BUDGET_TOKENS), false ; "a_budget_takes_no_binding")]
     #[test_case(resolve_auth_from_key(CREDENTIAL, None), AuthMode::ApiKey, "anthropic/claude-haiku-5-5", ThinkingConfig::Adaptive, true ; "adaptive_haiku_5_5_binds")]
     #[test_case(resolve_auth_from_key(CREDENTIAL, None), AuthMode::ApiKey, "anthropic/claude-haiku-5-5", ThinkingConfig::Off, false ; "disabled_takes_no_binding")]
     fn only_adaptive_thinking_binds_its_blocks(

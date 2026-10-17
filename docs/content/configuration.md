@@ -462,6 +462,7 @@ The `bash`, `code`, and `task` entries apply only when `ui.scroll_card_lines` is
 | `shell_native_redirect` | string | `enforce` | - | What happens when a shell command only re-implements a native tool, such as bare `rg` or `cat`: `enforce` refuses it and names the tool to call instead, `annotate` only logs the finding, `off` disables the check. A command using any flag the native tool cannot express is never affected |
 | `defer_builtin_tools` | string | `auto` | - | When the on-demand built-in tools start outside the request array: `auto` defers them for a small model or one with no supply metadata and declares them upfront for a known non-small model, `always` defers for every model, `never` declares them upfront |
 | `image_model` | string | `sunburst` | - | GPT Image 2.5 model behind `image_generate`: `sunburst` is the most capable and the better editor, `flare` is faster at the same price |
+| `cache_warming` | string | `off` | - | Keep the prompt cache from expiring by re-sending the last request with no output, on the Anthropic API only: `running` while a run waits on a long tool, subagent, question or permission prompt, `idle` also for up to 30 minutes after it ends, `off` never. Each refresh is billed as a cache read; global config only |
 | `disabled_tools` | string[] | `[]` | - | Tools to withhold from the model: built-in names, `server.tool`, or `server.*` for a whole MCP server. A project list extends the global one |
 
 ### `agent.messaging`

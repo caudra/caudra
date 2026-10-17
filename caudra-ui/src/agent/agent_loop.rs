@@ -6,6 +6,7 @@ use crate::app::background_delivery::DeliveryFence;
 use crate::app::file_revert::RecorderSlot;
 use arc_swap::ArcSwap;
 use caudra_agent::agent;
+use caudra_agent::agent::cache_warming::{CacheWarmer, WarmStop, WarmerContext, WarmerRef};
 use caudra_agent::agent::task_runner::{HostExtras, ModelResolver, WorkflowHostContext};
 use caudra_agent::agent::{PrefixKey, Surface, SurfaceBaseline};
 use caudra_agent::background::BackgroundTasks;
@@ -259,6 +260,10 @@ pub(super) struct AgentLoop {
     /// where `{cwd}` names a path inside the VM and this one does not.
     host_cwd: Option<PathBuf>,
     local_documents: Option<Arc<LocalDocumentStore>>,
+    /// Shared by every run, so idle warming outlives the run that armed it.
+    /// Dropped with the loop, which a revert, a clear or a session switch
+    /// replaces, ending its episode.
+    cache_warmer: CacheWarmer,
 }
 
 impl AgentLoop {
@@ -337,6 +342,17 @@ impl AgentLoop {
             ),
             Err(error) => (History::default(), Some(error.to_string())),
         };
+        let cache_warmer = CacheWarmer::new(
+            config.cache_warming,
+            WarmerContext {
+                session_id: session_id
+                    .as_ref()
+                    .map(|id| id.id().to_string())
+                    .unwrap_or_default(),
+                subagent: None,
+                cwd: template::env_vars().apply("{cwd}").into_owned(),
+            },
+        );
         Self {
             model_slot,
             effective_model_slot,
@@ -390,6 +406,7 @@ impl AgentLoop {
             remote_project_context,
             host_cwd,
             local_documents,
+            cache_warmer,
         }
     }
 
@@ -580,6 +597,7 @@ impl AgentLoop {
     }
 
     async fn do_compact(&mut self, event_tx: &EventSender) -> Result<(), AgentError> {
+        self.cache_warmer.stop(WarmStop::PrefixChanged);
         let slot = self.model_slot.load_full();
         let (provider, model) = agent::resolve_compaction_model(
             &slot.provider,
@@ -776,6 +794,11 @@ impl AgentLoop {
         self.publish_btw_prompt(&effective_slot, &system, opts.clone());
         let (trigger, cancel) = CancelToken::new();
         self.set_cancel_trigger(run_id, trigger);
+        let model_slot = Arc::clone(&self.model_slot);
+        let selected_spec = selected_slot.model.spec();
+        self.cache_warmer.set_guard(Arc::new(move || {
+            model_slot.load().model.spec() == selected_spec
+        }));
 
         let mut agent = Agent::new(
             self.agent_params(&effective_slot, &selected_slot, prompt_slots, tool_filter),
@@ -803,7 +826,8 @@ impl AgentLoop {
         .with_goal(self.goal.clone())
         .with_mcp(self.mcp.clone())
         .with_code(self.code.clone())
-        .with_home_model(selected_slot.home.clone());
+        .with_home_model(selected_slot.home.clone())
+        .with_cache_warmer(self.cache_warmer.clone());
         if let Some(autopilot) = self.permissions.autopilot() {
             agent = agent.with_autopilot(autopilot);
         }
@@ -1073,6 +1097,10 @@ impl AgentLoop {
 
     fn has_session_plan(&self) -> bool {
         self.mode.load().has_session_plan(self.plan.as_ref())
+    }
+
+    pub(super) fn cache_warmer(&self) -> WarmerRef {
+        self.cache_warmer.downgrade()
     }
 
     pub(super) fn tools_preview_source(&self) -> ToolsPreviewSource {

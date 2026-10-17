@@ -1088,6 +1088,8 @@ const HAIKU_REASONS_UNASKED_SINCE: (u32, u32) = (5, 5);
 const BETWEEN_TOOLS_SINCE: (u32, u32) = (5, 5);
 /// Read back by the Anthropic provider, which binds only adaptive thinking.
 pub(crate) const THINKING_ADAPTIVE: &str = "adaptive";
+/// Budget thinking, which a send with no output cannot carry.
+pub(crate) const THINKING_BUDGET: &str = "enabled";
 const THINKING_DISABLED: &str = "disabled";
 const THINKING_BETWEEN_TOOLS: &str = "between_tools";
 const OPUS: &str = "opus";
@@ -1377,14 +1379,14 @@ impl ThinkingConfig {
             ResolvedThinking::Off => {}
             ResolvedThinking::On => body["thinking"] = json!({"type": THINKING_ADAPTIVE}),
             ResolvedThinking::Budget(tokens) => {
-                body["thinking"] = json!({"type": "enabled", "budget_tokens": tokens});
+                body["thinking"] = json!({"type": THINKING_BUDGET, "budget_tokens": tokens});
             }
             // Opus 4.5 names a level but still requires the budget field.
             ResolvedThinking::Effort(level) => {
                 let tokens = model
                     .reasoning_options()
                     .budget_for_effort(&level, model.max_output_tokens);
-                body["thinking"] = json!({"type": "enabled", "budget_tokens": tokens});
+                body["thinking"] = json!({"type": THINKING_BUDGET, "budget_tokens": tokens});
                 body["output_config"]["effort"] = json!(level);
             }
         }

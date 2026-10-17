@@ -13,10 +13,11 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 - Sign in to one provider with several subscriptions and API keys, and let Caudra switch between them without breaking the prompt cache.
 - Config edits keep your comments.
+- Opt-in cache warming keeps the Anthropic prompt cache alive through long tool runs.
 
 > **Important**
 >
-> **Close every other Caudra session before you start Preview 11.** On its first start, Preview 11 upgrades the session database in your [state directory](/docs/configuration/#directory-layout) to record which account served each turn, and the upgrade needs exclusive access. This includes other terminals, editor sessions over ACP, and `caudra storage` commands. While any of them still has the database open, Preview 11 does not start. It lists the open sessions to close instead, and nothing is changed.
+> **Close every other Caudra session before you start Preview 11.** On its first start, Preview 11 upgrades the session database in your [state directory](/docs/configuration/#directory-layout) to record which account served each turn and what cache warming cost and saved, and the upgrade needs exclusive access. This includes other terminals, editor sessions over ACP, and `caudra storage` commands. While any of them still has the database open, Preview 11 does not start. It lists the open sessions to close instead, and nothing is changed.
 >
 > The upgrade keeps your sessions and saves a copy of the database from before it as `caudra.db.v30.bak` next to `caudra.db`. It also moves each saved provider login to `auth/accounts/<provider>/default.json`. Preview 10 and earlier cannot open the upgraded database or read the moved logins, and `caudra rollback` restores only the previous binary.
 
@@ -28,6 +29,11 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 - **Across providers**: With `[switching] providers = ["anthropic", "openai"]` in `providers.toml`, Auto moves a conversation to another provider's subscription once every subscription of its own runs out, on the first of your favorite models there, and back once the first provider has quota again. Each move adds a transcript row with its cause and cache cost. `/accounts` now lists every provider's accounts, and `o` and `Alt+↑↓` set the order. See [Across providers](/docs/accounts/#across-providers).
 - **One run on another account**: `--account <provider>:<name|auto>` and `CAUDRA_ACCOUNT` choose an account for one run without saving the choice.
 - **xAI sign-in in the TUI**: `/login` offers the xAI subscription sign-in beside an API key, and `caudra auth login xai --method api-key` stores a key.
+
+### Cache warming
+
+- **Opt-in cache warming**: `cache_warming = "running"` under `[agent]` in the global `caudra.toml` sends the last request again with `max_tokens: 0` shortly before its Anthropic prompt cache expires, while a run waits on a long tool, subagent, question, or permission prompt. `"idle"` also warms for up to 30 minutes after a run ends. It is off by default, covers the Anthropic API only, and warms only when one avoided cache write is worth more than the warms. See [Cache warming](/docs/token-economy/#cache-warming).
+- **What warming would save**: `/usage` has a `Cache warming` block for the session and for all time, with what warms cost and saved. While warming is off, it shows what warming would have done as `estimated if enabled`, so you can decide before turning it on.
 
 ### Changes
 

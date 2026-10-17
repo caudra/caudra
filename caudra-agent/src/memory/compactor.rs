@@ -111,6 +111,7 @@ impl Spend {
             provider: model.provider.to_string(),
             model: model.id.clone(),
             purpose: LedgerPurpose::Memory,
+            account: None,
         });
         let Some(Ledger { state, cwd }) = self.ledger.clone() else {
             return;

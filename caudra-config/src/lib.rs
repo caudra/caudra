@@ -598,6 +598,10 @@ pub enum ConfigError {
         "invalid project config: [agent.shell_env] is global-only; move it to the global caudra.toml"
     )]
     ProjectShellEnv,
+    #[error(
+        "invalid project config: agent.cache_warming is global-only because it spends quota; move it to the global caudra.toml"
+    )]
+    ProjectCacheWarming,
     #[error("invalid config: {key}: {source}")]
     ShellEnv {
         key: String,
@@ -740,6 +744,9 @@ pub struct RawConfig {
     #[serde(skip)]
     #[doc(hidden)]
     pub project_shell_env_override: bool,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub project_cache_warming_override: bool,
     pub always_fast: Option<bool>,
     pub always_thinking: Option<AlwaysThinking>,
     #[serde(default)]
@@ -773,6 +780,9 @@ impl RawConfig {
             overlay.project_autopilot_override || overlay.autopilot.is_some();
         let holds_shell_env = overlay.agent.shell_env.take().is_some();
         self.project_shell_env_override |= overlay.project_shell_env_override || holds_shell_env;
+        let holds_cache_warming = overlay.agent.cache_warming.take().is_some();
+        self.project_cache_warming_override |=
+            overlay.project_cache_warming_override || holds_cache_warming;
         self.decisions.restrict(mem::take(&mut overlay.decisions));
         let messaging = &mut overlay.agent.messaging;
         self.project_message_history_override = self
@@ -826,6 +836,7 @@ impl RawConfig {
         self.project_automations_override |= overlay.project_automations_override;
         self.project_autopilot_override |= overlay.project_autopilot_override;
         self.project_shell_env_override |= overlay.project_shell_env_override;
+        self.project_cache_warming_override |= overlay.project_cache_warming_override;
         merge_option!(self, overlay, always_yolo, always_auto);
         if let Some(automations) = overlay.automations.take() {
             self.automations.get_or_insert_default().merge(automations);
@@ -869,6 +880,9 @@ impl RawConfig {
         }
         if self.project_shell_env_override {
             return Err(ConfigError::ProjectShellEnv);
+        }
+        if self.project_cache_warming_override {
+            return Err(ConfigError::ProjectCacheWarming);
         }
         let shell_env = ShellEnvConfig::from_file(self.agent.shell_env.take().unwrap_or_default())?;
         self.validate_plugin_tables()?;
@@ -1260,6 +1274,29 @@ pub enum ShellNativeRedirect {
     Off,
 }
 
+/// When Caudra re-sends the last request with no output to keep its prompt
+/// cache from expiring. `Running` covers only a run that is still working, such
+/// as one waiting on a long tool; `Idle` also covers the wait for the next
+/// prompt after the run ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheWarmingMode {
+    #[default]
+    Off,
+    Running,
+    Idle,
+}
+
+impl CacheWarmingMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Running => "running",
+            Self::Idle => "idle",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionMode {
@@ -1481,6 +1518,7 @@ pub struct AgentFileConfig {
     pub shell_native_redirect: Option<ShellNativeRedirect>,
     pub defer_builtin_tools: Option<DeferBuiltinTools>,
     pub image_model: Option<ImageModel>,
+    pub cache_warming: Option<CacheWarmingMode>,
     pub disabled_tools: Option<Vec<String>>,
     /// `Some` for any `[agent.shell_env]` table, even an empty one, so a
     /// project layer that holds one is refused.
@@ -1524,7 +1562,8 @@ impl AgentFileConfig {
             shell_workdir_redirect,
             shell_native_redirect,
             defer_builtin_tools,
-            image_model
+            image_model,
+            cache_warming
         );
         // Restriction only, unlike every other list here: a project must not be
         // able to hand itself back a tool the global config took away.
@@ -2808,6 +2847,14 @@ pub struct AgentConfig {
     )]
     pub image_model: ImageModel,
 
+    #[config(
+        default = CacheWarmingMode::Off,
+        ty = "string",
+        default_doc = "off",
+        desc = "Keep the prompt cache from expiring by re-sending the last request with no output, on the Anthropic API only: `running` while a run waits on a long tool, subagent, question or permission prompt, `idle` also for up to 30 minutes after it ends, `off` never. Each refresh is billed as a cache read; global config only"
+    )]
+    pub cache_warming: CacheWarmingMode,
+
     #[config(skip, default = false)]
     pub no_rtk: bool,
 
@@ -2892,6 +2939,7 @@ impl AgentConfig {
             shell_native_redirect: file.shell_native_redirect.unwrap_or_default(),
             defer_builtin_tools: file.defer_builtin_tools.unwrap_or_default(),
             image_model: file.image_model.unwrap_or_default(),
+            cache_warming: file.cache_warming.unwrap_or_default(),
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools,
@@ -4997,6 +5045,29 @@ mod tests {
                 error_retries: DEFAULT_AUTOPILOT_ERROR_RETRIES,
             }
         );
+    }
+
+    #[test_case("", CacheWarmingMode::Off; "default_off")]
+    #[test_case("cache_warming = 'running'", CacheWarmingMode::Running; "running")]
+    #[test_case("cache_warming = 'idle'", CacheWarmingMode::Idle; "idle")]
+    fn global_layers_set_cache_warming(option: &str, expected: CacheWarmingMode) {
+        let mut raw: RawConfig = toml::from_str(&format!("[agent]\n{option}")).unwrap();
+        raw.merge(RawConfig::default());
+        assert_eq!(
+            raw.into_config(false).unwrap().agent.cache_warming,
+            expected
+        );
+    }
+
+    #[test_case("off"; "off")]
+    #[test_case("idle"; "idle")]
+    fn project_layers_cannot_hold_cache_warming(mode: &str) {
+        let mut raw = RawConfig::default();
+        raw.merge(toml::from_str(&format!("[agent]\ncache_warming = '{mode}'")).unwrap());
+        assert!(matches!(
+            raw.into_config(false),
+            Err(ConfigError::ProjectCacheWarming)
+        ));
     }
 
     #[test_case("sync", ExecutionMode::Sync)]

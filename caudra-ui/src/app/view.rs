@@ -605,6 +605,7 @@ impl App {
             overlay_rect = r;
         }
         if self.usage_modal.is_open() {
+            let scope = self.usage_modal.scope();
             let ctx = UsageModalContext {
                 total: &self.state.token_usage,
                 total_cost: self.state.cost,
@@ -616,6 +617,11 @@ impl App {
                 clock_format: self.ui_config.clock_format,
                 lifetime: self.lifetime_usage.as_ref(),
                 accounts: &self.usage_accounts,
+                warming: self
+                    .warming_summary
+                    .as_ref()
+                    .filter(|(loaded, _)| *loaded == scope)
+                    .map(|(_, summary)| summary),
             };
             let r = self.usage_modal.view(frame, full, &ctx);
             if r.width > 0 {

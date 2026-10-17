@@ -24,6 +24,7 @@ use caudra_providers::{
     estimate_tokens_cached,
 };
 
+use super::cache_warming::{CacheWarmer, FinishedRequest, WarmStop, Warmable, prefix_fingerprint};
 use super::commit_preamble;
 use super::compaction;
 use super::favorites;
@@ -100,6 +101,7 @@ use caudra_config::{Feature, ModelPolicy, ProfileToolPolicy, ToolOutputLines};
 use caudra_decision::{Answer, ChoiceAnswer, Question, QuestionSet, QuestionType};
 use caudra_storage::autopilot::AutopilotEnd;
 use caudra_storage::background::JobOwner;
+use caudra_storage::cache_warming::Boundary;
 use caudra_storage::decision_log::{DecisionEffect, DecisionLabel};
 use caudra_storage::goal_log::GoalEvaluationOutcome;
 use caudra_storage::id::SessionRef;
@@ -543,6 +545,8 @@ pub struct Agent<'h> {
     /// host's plan handoff, which a `question` answer cannot stand in for.
     plan_saved: bool,
     wait_for_background: bool,
+    /// Keeps the conversation's prompt cache alive between its requests.
+    cache_warmer: Option<CacheWarmer>,
     /// The session's autopilot. Only the main session acts for it.
     autopilot: Option<AutopilotHandle>,
     /// The history epoch and length autopilot last saw.
@@ -719,6 +723,7 @@ impl<'h> Agent<'h> {
             todos_reminded: false,
             plan_saved: false,
             wait_for_background: false,
+            cache_warmer: None,
             autopilot: None,
             autopilot_observed: None,
             work_reminded: None,
@@ -850,6 +855,11 @@ impl<'h> Agent<'h> {
 
     pub fn with_goal(mut self, goal: GoalHandle) -> Self {
         self.goal = goal;
+        self
+    }
+
+    pub fn with_cache_warmer(mut self, warmer: CacheWarmer) -> Self {
+        self.cache_warmer = Some(warmer);
         self
     }
 
@@ -1057,6 +1067,9 @@ impl<'h> Agent<'h> {
                 DoneReason::Cancelled
             }
             Err(e) => {
+                if let Some(warmer) = &self.cache_warmer {
+                    warmer.stop(WarmStop::RunEnded);
+                }
                 if is_unrecoverable(&e) {
                     let autopilot_owned = self.autopilot_owns_goal();
                     self.end_autopilot(AutopilotEnd::Error {
@@ -2380,6 +2393,7 @@ impl<'h> Agent<'h> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
+        self.hold_cache_warmer();
         // Whatever the previous turn started and nobody took is reported
         // before this request, not after the one that abandoned it: the model
         // must learn what already ran before it decides what to run next.
@@ -2417,7 +2431,14 @@ impl<'h> Agent<'h> {
             )
         });
         let mut stream_retry = mem::take(&mut self.stream_retry);
-        let stream_result = {
+        let boundary = if self.num_turns == 0 {
+            Boundary::NewRun
+        } else {
+            Boundary::WithinRun
+        };
+        let request_epoch = self.history.epoch();
+        let request_started = Instant::now();
+        let (stream_result, warm, prefix) = {
             let tools = self.request_tools();
             repair_state.register_definitions(tools.as_ref());
             let provider_history = self.projected_history(tools.as_ref());
@@ -2426,7 +2447,7 @@ impl<'h> Agent<'h> {
                 tools.as_ref(),
                 provider_history.as_ref(),
             );
-            stream_with_retry(
+            let result = stream_with_retry(
                 &*self.provider,
                 &self.model,
                 provider_history.as_ref(),
@@ -2440,9 +2461,55 @@ impl<'h> Agent<'h> {
                 self.speculative.as_ref(),
                 &mut stream_retry,
             )
-            .await
+            .await;
+            let opts = self.opts.clamped(&self.model);
+            let warm = self
+                .cache_warmer
+                .as_ref()
+                .filter(|warmer| result.is_ok() && warmer.wants_warm())
+                .and_then(|warmer| {
+                    if warmer.sends() {
+                        self.provider
+                            .cache_warmer(
+                                &self.model,
+                                provider_history.as_ref(),
+                                &self.system,
+                                tools.as_ref(),
+                                &opts,
+                                self.cache_key.as_ref(),
+                            )
+                            .map(Warmable::Handle)
+                    } else {
+                        self.provider
+                            .cache_warm_ttl(&self.model, &opts, self.cache_key.as_ref())
+                            .map(Warmable::Shadow)
+                    }
+                });
+            let prefix = self
+                .cache_warmer
+                .as_ref()
+                .filter(|_| result.is_ok())
+                .map(|_| prefix_fingerprint(&self.model, &self.system, tools.as_ref(), &opts));
+            (result, warm, prefix)
         };
         self.stream_retry = stream_retry;
+        match (&stream_result, &self.cache_warmer) {
+            (Ok(response), Some(warmer)) => warmer.finish_request(FinishedRequest {
+                started: request_started,
+                epoch: request_epoch,
+                prefix,
+                boundary,
+                usage: response.usage,
+                model: &self.model,
+                fast: self.opts.clamped(&self.model).fast,
+                billing: response.billing(&self.model),
+                account: response.account_name(),
+                warm,
+                events: &self.event_tx,
+            }),
+            (Err(_), Some(warmer)) => warmer.stop(WarmStop::RequestFailed),
+            (_, None) => {}
+        }
         self.drain_repair_usage(&repair_state);
         let mut interrupted = None;
         let mut response = match stream_result {
@@ -3644,6 +3711,9 @@ impl<'h> Agent<'h> {
     }
 
     fn emit_done(&self, reason: DoneReason) -> Result<(), AgentError> {
+        if let Some(warmer) = &self.cache_warmer {
+            warmer.run_settled();
+        }
         info!(
             self.num_turns,
             total_input = self.total_usage.input,
@@ -3785,6 +3855,18 @@ impl<'h> Agent<'h> {
         PathBase::new(&cwd, local, min_saved_chars)
     }
 
+    /// Stops warming before a request, and books what the warms since the
+    /// last one spent against the run's budgets.
+    fn hold_cache_warmer(&self) {
+        let Some(warmer) = &self.cache_warmer else {
+            return;
+        };
+        warmer.hold();
+        for spend in warmer.take_spend() {
+            self.record_spend(spend.usage, spend.cost, spend.billing);
+        }
+    }
+
     fn drain_repair_usage(&mut self, state: &RepairState) {
         for repair in state.take_usage() {
             self.total_usage += repair.usage;
@@ -3796,6 +3878,7 @@ impl<'h> Agent<'h> {
                 provider: repair.provider,
                 model: repair.model,
                 purpose: repair.purpose,
+                account: None,
             });
         }
     }
@@ -3974,6 +4057,9 @@ impl<'h> Agent<'h> {
     }
 
     async fn do_compact(&mut self) -> Result<(), AgentError> {
+        if let Some(warmer) = &self.cache_warmer {
+            warmer.stop(WarmStop::PrefixChanged);
+        }
         let (compact_provider, compact_model) = resolve_compaction_model(
             &self.provider,
             &self.model,
@@ -7236,6 +7322,7 @@ mod tests {
                 model,
                 cost,
                 billing,
+                ..
             } = accounting[0]
             else {
                 unreachable!()

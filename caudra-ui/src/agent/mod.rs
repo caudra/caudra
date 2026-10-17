@@ -221,6 +221,9 @@ pub(crate) enum AgentCommand {
     },
     /// Stop waiting out a retry backoff and try again now.
     RetryNow,
+    /// The next request sends different thinking or speed settings, so the
+    /// cache the last one wrote will not be read again.
+    PrefixChanged,
 }
 
 /// Input channels (`cmd_tx`, `answer_tx`, `queue`) are per-agent, so an old
@@ -891,13 +894,6 @@ fn spawn_agent_internal(
                 })
         }
     };
-    spawn_command_router(
-        cmd_rx,
-        Arc::clone(&cancel_map),
-        Arc::clone(&subagent_cancels),
-        retry_now.clone(),
-    );
-
     let settings = LiveSettings::default();
     let agent_loop = AgentLoop::new(
         Arc::clone(model_slot),
@@ -917,8 +913,8 @@ fn spawn_agent_internal(
         agent_tx.clone(),
         answer_rx,
         queue_rx,
-        cancel_map,
-        retry_now,
+        Arc::clone(&cancel_map),
+        retry_now.clone(),
         init_cancel,
         session_id.clone(),
         mailbox.clone(),
@@ -942,6 +938,13 @@ fn spawn_agent_internal(
         local_documents.clone(),
     );
 
+    spawn_command_router(
+        cmd_rx,
+        cancel_map,
+        Arc::clone(&subagent_cancels),
+        retry_now,
+        agent_loop.cache_warmer(),
+    );
     let tools_preview_source = Arc::new(agent_loop.tools_preview_source());
     let task_host = agent_loop
         .task_host()

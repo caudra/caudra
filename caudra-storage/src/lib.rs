@@ -11,6 +11,8 @@ pub mod automation;
 #[path = "sessions/autopilot.rs"]
 pub mod autopilot;
 pub mod background;
+#[path = "sessions/cache_warming.rs"]
+pub mod cache_warming;
 pub mod changelog;
 pub mod checkout;
 pub mod decision_log;

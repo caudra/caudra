@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
+use crate::agent::cache_warming::{CacheWarmer, WarmStop, WarmerContext, WarmerRef};
 use crate::decisions::{DecisionNote, Decisions, resolve_active_decisions};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_lock::Mutex;
@@ -1821,6 +1822,14 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                     }
                 }
             });
+            let cache_warmer = CacheWarmer::new(
+                params.config.cache_warming,
+                WarmerContext {
+                    session_id: session_ref_clone.id().to_string(),
+                    subagent: None,
+                    cwd: vars.apply("{cwd}").into_owned(),
+                },
+            );
             let mut agent = Agent::new(
                 AgentParams {
                     provider: Arc::clone(&provider),
@@ -1881,7 +1890,8 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
             .with_goal(params.goal)
             .with_background_wait()
             .with_peer_exit()
-            .with_mcp(mcp);
+            .with_mcp(mcp)
+            .with_cache_warmer(cache_warmer);
             if let Some(autopilot) = params.autopilot {
                 agent = agent.with_autopilot(autopilot);
             }
@@ -2034,6 +2044,8 @@ pub struct InteractiveHandle {
     pub cancel_tx: flume::Sender<()>,
     pub model_tx: flume::Sender<Model>,
     pub model_route: Option<InteractiveModelRoute>,
+    /// Stopped by a model change, which leaves the warmed prefix behind.
+    cache_warmer: WarmerRef,
     pub session_id: SessionRef,
     pub session_lease: Arc<SessionLease>,
     /// Where the session's database lives, for the host's own reads of it.
@@ -2864,6 +2876,7 @@ impl InteractiveHandle {
             cancel_tx: flume::unbounded().0,
             model_tx: flume::unbounded().0,
             model_route: None,
+            cache_warmer: WarmerRef::default(),
             session_id: SessionRef::from(session_lease.id()),
             session_lease,
             state_dir,
@@ -2900,6 +2913,7 @@ impl InteractiveHandle {
         self.model_tx
             .send(model.clone())
             .map_err(|_| AgentError::Channel)?;
+        self.cache_warmer.stop(WarmStop::PrefixChanged);
         Ok(model)
     }
 
@@ -3329,6 +3343,15 @@ async fn spawn_prepared_session(
     let session_ref = params.session_id.clone();
     let session_id = session_ref.id();
     let memory_origin = session_ref.as_str().to_owned();
+    let cache_warmer = CacheWarmer::new(
+        params.config.cache_warming,
+        WarmerContext {
+            session_id: session_id.to_string(),
+            subagent: None,
+            cwd: vars.apply("{cwd}").into_owned(),
+        },
+    );
+    let warmer_ref = cache_warmer.downgrade();
     let session_lease = Arc::clone(&params.session_lease);
     let subagent_history = store.subagent_history.clone();
     let goal = store.goal.clone();
@@ -4591,7 +4614,8 @@ async fn spawn_prepared_session(
                 .with_interrupt_source(Arc::new(QueuedPrompts(input_rx.clone())))
                 .with_mcp(turn_mcp)
                 .with_code(code.clone())
-                .with_home_model(home_model.clone());
+                .with_home_model(home_model.clone())
+                .with_cache_warmer(cache_warmer.clone());
                 if let Some(autopilot) = &autopilot {
                     agent = agent.with_autopilot(autopilot.clone());
                 }
@@ -4694,6 +4718,8 @@ async fn spawn_prepared_session(
             }
             drop(base);
             drop(memory_pump);
+            // Holds a sender for its last episode, which it emits on drop.
+            drop(cache_warmer);
             drop(agent_tx);
             event_forwarder.await;
             if let Some(store) = &mut *store.lock().await {
@@ -4721,6 +4747,7 @@ async fn spawn_prepared_session(
         cancel_tx,
         model_tx,
         model_route,
+        cache_warmer: warmer_ref,
         session_id: session_ref,
         session_lease,
         state_dir,

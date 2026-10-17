@@ -33,6 +33,7 @@ use caudra_storage::{
     tool_outputs::ToolOutputStore,
 };
 
+use super::cache_warming::{CacheWarmer, WarmerContext, subagent_mode};
 use super::favorites;
 use super::steering::{SharedSteering, Steering};
 use super::{ModelRoute, resolve_model_for_purpose, resolve_purpose_model_for_inspection};
@@ -673,7 +674,20 @@ impl Subagent {
         .with_mcp(self.mcp.clone())
         .with_code(self.code.clone())
         .with_local_tools(Arc::clone(&self.local_tools))
-        .with_steering(Arc::clone(&self.steering));
+        .with_steering(Arc::clone(&self.steering))
+        .with_cache_warmer(CacheWarmer::new(
+            subagent_mode(self.params.config.cache_warming),
+            WarmerContext {
+                session_id: self
+                    .params
+                    .session_id
+                    .as_ref()
+                    .map(|id| id.id().to_string())
+                    .unwrap_or_default(),
+                subagent: Some(self.parent_tool_use_id.clone()),
+                cwd: self.params.task_environment.apply("{cwd}").into_owned(),
+            },
+        ));
         if let Some(ready) = &self.report_ready {
             agent = agent.with_report_ready(Arc::clone(ready));
         }
