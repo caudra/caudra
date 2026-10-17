@@ -3041,14 +3041,18 @@ pub struct Disclosure {
     pub raw_view: bool,
 }
 
-/// The batch children the reader has asked to see whole, by their index in the
-/// roster. A child not named here is drawn the way its own card would be: a
+/// The batch children the reader has opened or folded, by their index in the
+/// roster. A child named in neither is drawn the way its own card would be: a
 /// read-only one folds to its summary row, so a batch nobody has touched reads
-/// as the list of what it ran, and one whose body is the only record of what it
-/// did rests at its tool's budget.
+/// as the list of what it ran, one whose body is the only record of what it
+/// did rests at its tool's budget, and one with a card of its own
+/// [rests open](rests_open). Either choice outlives a mode change, like the
+/// raw view does: it is about the child's body, not about the mode.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct BatchViews {
     open: Arc<[usize]>,
+    /// The children folded although they would rest open.
+    folded: Arc<[usize]>,
     /// The children drawn as their answer came rather than as their card.
     raw: Arc<[usize]>,
 }
@@ -3058,7 +3062,7 @@ impl BatchViews {
     pub fn new(open: impl IntoIterator<Item = usize>) -> Self {
         Self {
             open: index_set(open),
-            raw: Arc::default(),
+            ..Self::default()
         }
     }
 
@@ -3066,23 +3070,45 @@ impl BatchViews {
         self.open.contains(&index)
     }
 
+    fn is_folded(&self, index: usize) -> bool {
+        self.folded.contains(&index)
+    }
+
     fn is_raw(&self, index: usize) -> bool {
         self.raw.contains(&index)
     }
 
     /// Every control undoes itself: the click that opened a child folds it
-    /// again.
-    pub fn toggled(&self, index: usize) -> Self {
+    /// again, and the click that folded one opens it. Whether the child is
+    /// open now depends on where it rests, which `rests_open` says. Folding an
+    /// opened child that would not rest open hands it back to its rest, so a
+    /// write goes back to its budget rather than to its row.
+    pub fn toggled(&self, index: usize, rests_open: bool) -> Self {
+        let shown = self.is_open(index) || (rests_open && !self.is_folded(index));
+        let (open, folded) = match shown {
+            true => (
+                without_index(&self.open, index),
+                match rests_open {
+                    true => with_index(&self.folded, index),
+                    false => Arc::clone(&self.folded),
+                },
+            ),
+            false => (
+                with_index(&self.open, index),
+                without_index(&self.folded, index),
+            ),
+        };
         Self {
-            open: toggled_index(&self.open, index),
+            open,
+            folded,
             raw: Arc::clone(&self.raw),
         }
     }
 
     pub fn raw_toggled(&self, index: usize) -> Self {
         Self {
-            open: Arc::clone(&self.open),
             raw: toggled_index(&self.raw, index),
+            ..self.clone()
         }
     }
 }
@@ -3099,11 +3125,36 @@ fn always_whole(entry: &BatchToolEntry) -> bool {
     )
 }
 
+/// Whether a child Caudra draws a card of its own for, a source graph or a
+/// recognised server's answer, rests whole: its card is already shaped to be
+/// read, and three rows of it say next to nothing. Unlike [`always_whole`] a
+/// click still folds it, and compact and the always-collapsed list fold it
+/// the way they fold its own card.
+pub(crate) fn rests_open(policy: &CardPolicy, entry: &BatchToolEntry) -> bool {
+    !policy.compact
+        && !policy.stays_collapsed(&entry.tool)
+        && matches!(
+            &entry.output,
+            Some(
+                ToolOutput::SourceCodeGraph { .. }
+                    | ToolOutput::Mcp(McpOutput { kind: Some(_), .. })
+            )
+        )
+}
+
 fn index_set(indices: impl IntoIterator<Item = usize>) -> Arc<[usize]> {
     let mut indices: Vec<usize> = indices.into_iter().collect();
     indices.sort_unstable();
     indices.dedup();
     indices.into()
+}
+
+fn with_index(set: &[usize], index: usize) -> Arc<[usize]> {
+    index_set(set.iter().copied().chain([index]))
+}
+
+fn without_index(set: &[usize], index: usize) -> Arc<[usize]> {
+    set.iter().copied().filter(|held| *held != index).collect()
 }
 
 fn toggled_index(set: &[usize], index: usize) -> Arc<[usize]> {
@@ -3349,7 +3400,9 @@ impl RenderLimits {
     /// A child the reader asked for draws whole. Otherwise it answers the
     /// question its own card answers: a call whose body is the only record of
     /// what it did is drawn, resting at the budget that card would rest at,
-    /// and one the header already accounts for folds away. Opening the parent
+    /// one Caudra draws a card of its own for [rests open](rests_open), and
+    /// one the header already accounts for folds away. A child the reader
+    /// folded stays folded. Opening the parent
     /// says nothing about any of it: the card's own body is the list of what
     /// ran, and each child answers for itself.
     ///
@@ -3388,7 +3441,12 @@ impl RenderLimits {
     /// dropped on the way in or a nested batch would read them as its own.
     fn child(&self, index: usize, entry: &BatchToolEntry) -> Option<Self> {
         let whole = always_whole(entry);
-        let open = whole || self.views.is_open(index);
+        if !whole && self.views.is_folded(index) {
+            return None;
+        }
+        let open = whole
+            || self.views.is_open(index)
+            || (!self.body_taken && rests_open(&self.policy, entry));
         if (self.policy.compact || self.body_taken) && !open {
             return None;
         }
@@ -6393,8 +6451,35 @@ mod tests {
     #[test_case(&[1], 1, &[] ; "an_open_child_folds_again")]
     #[test_case(&[0], 1, &[0, 1] ; "leaves_the_others")]
     fn toggled_views(start: &[usize], index: usize, expected: &[usize]) {
-        let views = BatchViews::new(start.iter().copied()).toggled(index);
+        let views = BatchViews::new(start.iter().copied()).toggled(index, false);
         assert_eq!(views, BatchViews::new(expected.iter().copied()));
+    }
+
+    const RESTS_OPEN_CLICKS_MSG: &str = "a click on a child that rests open folds it, and the next \
+        click opens it again, even when the mode no longer rests it open";
+
+    #[test]
+    fn a_child_that_rests_open_folds_and_opens_again() {
+        let folded = BatchViews::default().toggled(0, true);
+        assert!(
+            folded.is_folded(0) && !folded.is_open(0),
+            "{RESTS_OPEN_CLICKS_MSG}"
+        );
+        assert_eq!(
+            folded.toggled(0, true),
+            BatchViews::new([0]),
+            "{RESTS_OPEN_CLICKS_MSG}"
+        );
+        assert_eq!(
+            folded.toggled(0, false),
+            BatchViews::new([0]),
+            "{RESTS_OPEN_CLICKS_MSG}"
+        );
+        let opened = BatchViews::new([0]).toggled(0, true);
+        assert!(
+            opened.is_folded(0) && !opened.is_open(0),
+            "{RESTS_OPEN_CLICKS_MSG}"
+        );
     }
 
     /// A child's raw view is its own switch: opening or folding a child keeps
@@ -6404,9 +6489,10 @@ mod tests {
         let views = BatchViews::new([0]).raw_toggled(1);
         assert!(views.is_open(0) && !views.is_raw(0));
         assert!(views.is_raw(1) && !views.is_open(1));
-        let folded = views.toggled(0);
+        let folded = views.toggled(0, false);
         assert!(!folded.is_open(0) && folded.is_raw(1));
         assert!(!folded.raw_toggled(1).is_raw(1));
+        assert!(views.toggled(1, true).is_raw(1));
     }
 
     /// A nested batch has its own roster, so the parent's views must not
@@ -8242,6 +8328,110 @@ mod tests {
         limits.policy.compact = true;
         limits.views = BatchViews::new([0]);
         assert!(limits.child(0, &entry).is_some(), "{OPEN_MSG}");
+    }
+
+    const OWN_CARD_CHILD: &str = "home-assistant.HassTurnOn";
+
+    #[derive(Clone, Copy, Debug)]
+    enum ChildAnswer {
+        Recognised,
+        Graph,
+        Generic,
+        Plain,
+    }
+
+    fn answered_child(answer: ChildAnswer) -> BatchToolEntry {
+        let mcp = |kind| {
+            Some(ToolOutput::Mcp(McpOutput {
+                kind,
+                ..McpOutput::default()
+            }))
+        };
+        let output = match answer {
+            ChildAnswer::Recognised => mcp(Some(caudra_agent::McpServerKind::HomeAssistant)),
+            ChildAnswer::Graph => Some(ToolOutput::SourceCodeGraph {
+                headline: String::new(),
+                rows: vec![ranked_row(OWN_CARD_CHILD, 1)],
+                source: None,
+                footer: String::new(),
+                state: None,
+            }),
+            ChildAnswer::Generic => mcp(None),
+            ChildAnswer::Plain => return batch_entry(OWN_CARD_CHILD, 1),
+        };
+        BatchToolEntry {
+            output,
+            ..batch_entry(OWN_CARD_CHILD, 0)
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Rest {
+        Free,
+        Compact,
+        BodyTaken,
+        AlwaysCollapsed,
+    }
+
+    /// A child Caudra draws a card of its own for rests whole and a click
+    /// folds it; compact, a body taken above, and the always-collapsed list
+    /// still fold it. `None` folds; `Some(whole)` draws, whole or at a budget.
+    #[test_case(ChildAnswer::Recognised, Rest::Free, false => Some(true); "recognised_rests_whole")]
+    #[test_case(ChildAnswer::Recognised, Rest::Free, true => None; "recognised_click_folds")]
+    #[test_case(ChildAnswer::Graph, Rest::Free, false => Some(true); "graph_rests_whole")]
+    #[test_case(ChildAnswer::Graph, Rest::Free, true => None; "graph_click_folds")]
+    #[test_case(ChildAnswer::Graph, Rest::Compact, false => None; "compact_folds")]
+    #[test_case(ChildAnswer::Graph, Rest::Compact, true => Some(true); "compact_click_opens")]
+    #[test_case(ChildAnswer::Recognised, Rest::BodyTaken, false => None; "body_taken_folds")]
+    #[test_case(ChildAnswer::Graph, Rest::AlwaysCollapsed, false => None; "always_collapsed_folds")]
+    #[test_case(ChildAnswer::Graph, Rest::AlwaysCollapsed, true => Some(true); "always_collapsed_click_opens")]
+    #[test_case(ChildAnswer::Generic, Rest::Free, false => None; "generic_read_only_folds")]
+    #[test_case(ChildAnswer::Plain, Rest::Free, false => None; "plain_read_only_folds")]
+    #[test_case(ChildAnswer::Plain, Rest::Free, true => Some(true); "plain_click_opens")]
+    fn a_child_with_its_own_card_rests_whole(
+        answer: ChildAnswer,
+        rest: Rest,
+        clicked: bool,
+    ) -> Option<bool> {
+        clicked_child(answer, rest, clicked, ToolEffect::ReadOnly)
+    }
+
+    /// The child as drawn after `clicked` says whether the reader clicked its
+    /// row once, the way the transcript records a click.
+    fn clicked_child(
+        answer: ChildAnswer,
+        rest: Rest,
+        clicked: bool,
+        effect: ToolEffect,
+    ) -> Option<bool> {
+        let entry = BatchToolEntry {
+            effect,
+            ..answered_child(answer)
+        };
+        let mut limits = limits(BatchViews::default());
+        match rest {
+            Rest::Free => {}
+            Rest::Compact => limits.policy.compact = true,
+            Rest::BodyTaken => limits.body_taken = true,
+            Rest::AlwaysCollapsed => {
+                limits.policy.always_collapsed = Arc::from([OWN_CARD_CHILD.to_owned()]);
+            }
+        }
+        if clicked {
+            limits.views = limits.views.toggled(0, rests_open(&limits.policy, &entry));
+        }
+        limits.child(0, &entry).map(|child| child.is_expanded())
+    }
+
+    /// A call from a `code` snippet is `Unknown`, so it never folds by effect:
+    /// without its own card it rests at the generic budget, and with one it
+    /// rests whole and a click folds it.
+    #[test_case(ChildAnswer::Recognised, false => Some(true); "recognised_rests_whole")]
+    #[test_case(ChildAnswer::Recognised, true => None; "recognised_click_folds")]
+    #[test_case(ChildAnswer::Generic, false => Some(false); "generic_rests_at_budget")]
+    #[test_case(ChildAnswer::Generic, true => Some(true); "generic_click_opens_whole")]
+    fn a_snippet_call_rests_by_its_card(answer: ChildAnswer, clicked: bool) -> Option<bool> {
+        clicked_child(answer, Rest::Free, clicked, ToolEffect::Unknown)
     }
 
     /// Otherwise a batch of five writes is five whole files, which is the

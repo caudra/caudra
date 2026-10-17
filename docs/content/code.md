@@ -46,7 +46,7 @@ Release builds, Nix, and `make install` from a checkout bundle the worker. A bui
 
 ## In the transcript
 
-A `code` card shows the snippet, numbered and highlighted as Python. Below it comes a row for each call the snippet made, labelled like `history › search` or `github › list_issues` with its status, then what the snippet printed, the value it returned, and why it stopped when it did not finish. The rows fill in while the snippet runs, and opening a row shows that call's own card. Output that runs long scrolls in a window of [`ui.scroll_card_lines`](/docs/configuration/#ui) rows, like a `shell` card. MCP call cards are described in [Results in the transcript](/docs/mcp/#results-in-the-transcript).
+A `code` card shows the snippet, numbered and highlighted as Python. Below it comes a row for each call the snippet made, labelled like `history › search` or `github › list_issues` with its status, then what the snippet printed, the value it returned, and why it stopped when it did not finish. The rows fill in while the snippet runs. A [Home Assistant](/docs/mcp/#home-assistant) or [Executor](/docs/mcp/#executor) row shows its call's card without a click, and a click folds it. Opening any other row shows that call's own card. Output that runs long scrolls in a window of [`ui.scroll_card_lines`](/docs/configuration/#ui) rows, like a `shell` card. MCP call cards are described in [Results in the transcript](/docs/mcp/#results-in-the-transcript).
 
 ## Search past conversations
 

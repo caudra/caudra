@@ -13,6 +13,7 @@ use crate::components::tool_display::{
     scroll_footer_text, task_details,
 };
 use crate::inline_image::tests::{PIXEL_SYMBOL, decode_queued, png_bytes, png_source};
+use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
 use caudra_agent::code::output::CodeCallStatus;
@@ -26,10 +27,10 @@ use caudra_agent::tools::{
     TOOL_OUTPUT_TOOL_NAME, ToolEffect, VIEW_IMAGE_TOOL_NAME,
 };
 use caudra_agent::{
-    ActivityChild, GrepFileEntry, GrepMatchGroup, McpBlock, McpHelper, McpOutput, NO_FILES_FOUND,
-    SearchCap, ShellFilterInfo, ShellOutput, SkillOutput, SnapshotLine, SnapshotSpan,
-    SourceCodeGraphRow, SpanStyle, SubagentActivity, SubagentProgress, ToolAccounting, ToolInput,
-    ToolOutput,
+    ActivityChild, GrepFileEntry, GrepMatchGroup, McpBlock, McpHelper, McpOutput, McpServerKind,
+    NO_FILES_FOUND, SearchCap, ShellFilterInfo, ShellOutput, SkillOutput, SnapshotLine,
+    SnapshotSpan, SourceCodeGraphRow, SpanStyle, SubagentActivity, SubagentProgress,
+    ToolAccounting, ToolInput, ToolOutput,
 };
 use caudra_providers::{PeerAudience, PeerMessageOrigin};
 use caudra_storage::background::ShellJobMetadata;
@@ -4297,28 +4298,61 @@ fn a_stored_call_to_a_retired_code_tool_still_renders() {
     let text = buffer_text(&render(&mut panel, 80, 24));
     assert!(text.contains(RETIRED_TOOL), "{text}");
     assert!(text.contains(NEIGHBOUR), "{text}");
+    assert!(text.contains(BODY_LINE), "{GRAPH_WHOLE_MSG}: {text}");
+}
 
-    let area = Rect::new(0, 0, 80, 24);
-    assert!(panel.toggle_expansion_at(area.y, area));
-    let opened = buffer_text(&render(&mut panel, 80, 24));
-    assert!(opened.contains(BODY_LINE), "{opened}");
+const GRAPH_ROWS: usize = 8;
+const GRAPH_LAST_ROW: &str = "symbol_8";
+const GRAPH_WHOLE_MSG: &str = "a source graph card rests whole, every row of it, even after a \
+    newer call replaced it; only compact folds it";
+const GRAPH_CLOSES_MSG: &str = "a click on a whole source graph card takes it back to its header";
+const GRAPH_REOPENS_MSG: &str = "the next click opens the source graph card whole again";
+
+#[test_case(ViewMode::Auto, true ; "auto")]
+#[test_case(ViewMode::Expanded, true ; "expanded")]
+#[test_case(ViewMode::Compact, false ; "compact")]
+fn a_source_code_graph_card_rests_whole(view: ViewMode, whole: bool) {
+    let mut panel = panel_with_map_tool(GRAPH_ROWS);
+    panel.set_view(view);
+    panel.tool_start(start(LATER_TOOL_ID, FILE_WRITE_TOOL_NAME));
+    panel.tool_done(done(LATER_TOOL_ID));
+    rebuild(&mut panel);
+
+    let text = seg_text(&panel, "t1");
+    assert_eq!(
+        text.contains(GRAPH_LAST_ROW) && !text.contains(TRUNCATION_PREFIX),
+        whole,
+        "{GRAPH_WHOLE_MSG}: {text:?}"
+    );
 }
 
 #[test]
-fn toggle_expand_collapse_map_tool() {
-    let mut panel = panel_with_map_tool(8);
-    panel.set_view(ViewMode::Expanded);
+fn a_click_closes_a_whole_source_graph_card_and_the_next_opens_it_whole() {
+    let mut panel = panel_with_map_tool(GRAPH_ROWS);
+    panel.set_view(ViewMode::Auto);
+    render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
-    render(&mut panel, 80, 24);
-    assert!(seg_text(&panel, "t1").contains("click to expand"));
+    assert!(
+        seg_text(&panel, "t1").contains(GRAPH_LAST_ROW),
+        "{GRAPH_WHOLE_MSG}"
+    );
 
-    assert!(panel.toggle_expansion_at(area.y, area));
+    assert!(
+        panel.toggle_expansion_at(area.y, area),
+        "{GRAPH_CLOSES_MSG}"
+    );
     render(&mut panel, 80, 24);
-    assert!(!seg_text(&panel, "t1").contains("click to expand"));
+    assert!(panel.card_closed("t1"), "{GRAPH_CLOSES_MSG}");
 
-    assert!(panel.toggle_expansion_at(area.y, area));
+    assert!(
+        panel.toggle_expansion_at(area.y, area),
+        "{GRAPH_REOPENS_MSG}"
+    );
     render(&mut panel, 80, 24);
-    assert!(seg_text(&panel, "t1").contains("click to expand"));
+    assert!(
+        seg_text(&panel, "t1").contains(GRAPH_LAST_ROW),
+        "{GRAPH_REOPENS_MSG}"
+    );
 }
 
 fn buffer_text(terminal: &ratatui::Terminal<TestBackend>) -> String {
@@ -14083,6 +14117,69 @@ fn an_mcp_code_call_trades_its_card_for_its_data_and_back() {
     assert!(panel.toggle_expansion_at(batch_row(&panel, RowTarget::Raw(0)), area));
     render(&mut panel, 80, 24);
     assert!(!shows_data(&panel), "{MCP_RAW_SWITCH_MSG}");
+}
+
+const OWN_CARD_CALL_WHOLE_MSG: &str =
+    "a snippet's call to a server Caudra draws a card for opens whole, with nothing held back";
+const OWN_CARD_CALL_FOLDS_MSG: &str = "a click on the call's row folds it";
+const OWN_CARD_MODE_KEEPS_MSG: &str = "a call the reader folded stays folded across a mode change, and reopens on the view it was \
+     switched to";
+
+/// The reported click: a Home Assistant answer inside a `code` card rested at
+/// three rows behind "click to expand".
+#[test]
+fn a_recognised_code_call_opens_whole_and_folds_on_a_click() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(ViewMode::Auto);
+    panel.tool_start(start(TOOL_ID, CODE_TOOL_NAME));
+    let answer: serde_json::Map<_, _> = (1..=MCP_ANSWER_ROWS)
+        .map(|n| (format!("k{n}"), n.into()))
+        .collect();
+    panel.tool_done(ToolDoneEvent {
+        tool: CODE_TOOL_NAME.into(),
+        output: ToolOutput::Code(CodeOutput {
+            calls: vec![CodeCall {
+                server: "home-assistant".into(),
+                tool: "GetLiveContext".into(),
+                input: serde_json::json!({}),
+                status: CodeCallStatus::Success,
+                output: Some(McpOutput {
+                    blocks: vec![McpBlock::Text {
+                        text: serde_json::Value::Object(answer).to_string(),
+                    }],
+                    structured: Some(serde_json::json!({"id": 7})),
+                    kind: Some(McpServerKind::HomeAssistant),
+                    ..McpOutput::default()
+                }),
+                ..CodeCall::default()
+            }],
+            ..CodeOutput::default()
+        }),
+        ..done(TOOL_ID)
+    });
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    let whole = |panel: &MessagesPanel| seg_text(panel, TOOL_ID).contains(MCP_LAST_ANSWER_ROW);
+    let shows_data = |panel: &MessagesPanel| seg_text(panel, TOOL_ID).contains(MCP_STRUCTURED_ROW);
+    assert!(whole(&panel), "{OWN_CARD_CALL_WHOLE_MSG}");
+    assert!(
+        !seg_text(&panel, TOOL_ID).contains(TRUNCATION_PREFIX),
+        "{OWN_CARD_CALL_WHOLE_MSG}"
+    );
+
+    assert!(panel.toggle_expansion_at(batch_row(&panel, RowTarget::Raw(0)), area));
+    render(&mut panel, 80, 24);
+    assert!(shows_data(&panel), "{MCP_RAW_SWITCH_MSG}");
+    assert!(panel.toggle_expansion_at(batch_row(&panel, RowTarget::Item(0)), area));
+    render(&mut panel, 80, 24);
+    assert!(!shows_data(&panel), "{OWN_CARD_CALL_FOLDS_MSG}");
+
+    panel.set_view(ViewMode::Expanded);
+    render(&mut panel, 80, 24);
+    assert!(!shows_data(&panel), "{OWN_CARD_MODE_KEEPS_MSG}");
+    assert!(panel.toggle_expansion_at(batch_row(&panel, RowTarget::Item(0)), area));
+    render(&mut panel, 80, 24);
+    assert!(shows_data(&panel), "{OWN_CARD_MODE_KEEPS_MSG}");
 }
 
 /// A `rerank()` row names what it kept on its line rather than its arguments, always shows the

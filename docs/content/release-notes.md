@@ -36,6 +36,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 - **Short rate limits wait**: A rate limit shorter than 30 seconds now waits on the same account, which keeps its prompt cache, instead of moving to the next key.
 - **Logout keeps `providers.toml`**: `caudra auth logout` now deletes only the credential. An account entry in `providers.toml` stays and shows as signed out, and the next login without `--name` fills it.
 - **Hidden key prompts**: `caudra auth login` no longer shows an API key as you type it.
+- **Cards that open whole**: A `source_code_context` or `source_code_refs` card shows every row without a click and stays open after newer calls. A [Home Assistant](/docs/mcp/#home-assistant) or [Executor](/docs/mcp/#executor) call inside a `code` or `batch` card shows its whole card too, and a source code call inside a `batch` card no longer folds to one row. A click folds such a row, and in the auto `/view` such a card. The compact view and `ui.always_collapsed` still fold them.
 
 ### Fixes
 

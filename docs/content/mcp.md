@@ -198,6 +198,8 @@ When a call runs code, the card shows that code above the result, numbered and h
 
 An MCP card opens whole: the arguments and all of the result, with no row budget, read-only or not, and it stays open after newer calls. In the auto `/view`, a click folds it to its header and the next opens it whole. The compact view and `ui.always_collapsed` still fold it to one row.
 
+As a row of a `code` card or a `batch` card, a call to a [recognised server](#recognised-servers) also opens whole. A click on the row folds it and the next opens it again. The compact view and `ui.always_collapsed` fold it, as they fold its own card.
+
 Each block of the result is drawn by its type. A text block that is a whole JSON object or array is indented and coloured. Other text is rendered as markdown. Images, audio, and resources become labelled rows with their type and size. What the snippet receives does not depend on what the card shows, and the model never receives image or audio data.
 
 A card can also show the result as raw data when that shows something the card does not. That is a card a [recognised server](#recognised-servers) draws its own way, and a card whose `structuredContent` no text block repeats. Such a card ends with a `click for raw` row. The raw view shows each JSON text block indented and coloured and any other text exactly as the server wrote it, followed by the `structuredContent` under its name. Click `click for the card` to switch back. Changing the `/view` keeps the choice.

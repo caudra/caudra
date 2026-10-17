@@ -19,10 +19,10 @@ use super::tool_display::{
 };
 use super::{
     DisplayMessage, DisplayRole, DisplaySource, GoalTone, ToolProgress, ToolRole, ToolStatus,
-    apply_scroll_rows, automation_inspector,
+    apply_scroll_rows, automation_inspector, code_card,
     code_view::{
-        BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, BatchViews, CardPolicy,
-        Disclosure, RowTarget, ScrollSpan, ScrollWindow,
+        self, BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, BatchViews,
+        CardPolicy, Disclosure, RowTarget, ScrollSpan, ScrollWindow,
     },
     command_text, memory_card, peer_card, review, task_card, workflow_card,
     workflow_card::CardHit,
@@ -1338,11 +1338,17 @@ impl MessagesPanel {
     /// blocks were kept has only text, and keeps resting at the budget.
     ///
     /// A card with a picture rests open too, since the picture is what the
-    /// call was for.
+    /// call was for, and so does a source graph: its rows are the answer, and
+    /// three of them are rarely the ones the call was after.
     fn rests_whole(&self, msg_index: usize) -> bool {
         matches!(
             self.messages[msg_index].tool_output.as_deref(),
-            Some(ToolOutput::Mcp(_) | ToolOutput::Image { .. } | ToolOutput::SavedImage { .. })
+            Some(
+                ToolOutput::Mcp(_)
+                    | ToolOutput::Image { .. }
+                    | ToolOutput::SavedImage { .. }
+                    | ToolOutput::SourceCodeGraph { .. }
+            )
         )
     }
 
@@ -4155,7 +4161,22 @@ impl MessagesPanel {
     /// One child opens or folds, which is what the reader asked for, and every
     /// other child stays exactly as it was.
     fn toggle_batch_child(&mut self, tool_id: &str, index: usize) {
-        self.change_batch_views(tool_id, |views| views.toggled(index));
+        let rests_open = self.batch_child_rests_open(tool_id, index);
+        self.change_batch_views(tool_id, |views| views.toggled(index, rests_open));
+    }
+
+    /// Whether this child opens without a click in the current mode, which is
+    /// what a click on it has to undo.
+    fn batch_child_rests_open(&self, tool_id: &str, index: usize) -> bool {
+        let Some((msg_index, _)) = self.tool_card(tool_id) else {
+            return false;
+        };
+        let entry = match self.messages[msg_index].tool_output.as_deref() {
+            Some(ToolOutput::Batch { entries, .. }) => entries.get(index).cloned(),
+            Some(ToolOutput::Code(output)) => code_card::entries(output).into_iter().nth(index),
+            _ => None,
+        };
+        entry.is_some_and(|entry| code_view::rests_open(&self.policy, &entry))
     }
 
     /// One child's MCP answer switches between its card and its data.
