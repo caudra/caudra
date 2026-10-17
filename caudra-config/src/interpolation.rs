@@ -585,6 +585,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::disallowed_methods, reason = "checks what serde renders")]
     fn references_expand_at_every_depth() {
         let table = expanded(
             "top = '{env:TOKEN}'\n[a.b]\nlist = ['{env:TOKEN}', { inner = '{file:key}' }, [ '{env:TOKEN}' ]]\n[[c]]\nd = '{file:key}'\n",

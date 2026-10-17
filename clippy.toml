@@ -2,4 +2,6 @@ disallowed-methods = [
   { path = "uuid::Uuid::new_v4", reason = "use caudra_storage::id::CaudraId::generate (base58-encoded UUIDv7)", allow-invalid = true },
   { path = "uuid::Uuid::new_v7", reason = "use caudra_storage::id::CaudraId::generate (base58-encoded UUIDv7)", allow-invalid = true },
   { path = "uuid::Uuid::now_v7", reason = "use caudra_storage::id::CaudraId::generate (base58-encoded UUIDv7)", allow-invalid = true },
+  { path = "toml::to_string", reason = "edit TOML files through caudra_config::toml_document (toml_edit) so user comments survive", allow-invalid = true },
+  { path = "toml::to_string_pretty", reason = "edit TOML files through caudra_config::toml_document (toml_edit) so user comments survive", allow-invalid = true },
 ]

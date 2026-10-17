@@ -20,6 +20,7 @@ use workcell_tool_contract::shell_env::{
 
 use crate::config_file::GlobalConfigFile;
 use crate::interpolation::Lookup;
+use crate::toml_document::set_value;
 use crate::{ConfigError, ConfigField, ConfigValue, own_writes, shell_visible_environment};
 
 const AGENT_KEY: &str = "agent";
@@ -346,16 +347,7 @@ fn edit_document(document: &mut DocumentMut, edit: ShellEnvEdit) -> Result<(), (
                 .or_insert(Item::Value(Value::InlineTable(InlineTable::new())))
                 .as_table_like_mut()
                 .ok_or(())?;
-            match set.get_mut(&name) {
-                Some(Item::Value(current)) => {
-                    let decor = current.decor().clone();
-                    *current = Value::from(value);
-                    *current.decor_mut() = decor;
-                }
-                _ => {
-                    set.insert(&name, Item::Value(Value::from(value)));
-                }
-            }
+            set_value(set, &name, Value::from(value));
         }
         ShellEnvEdit::RemoveValue(name) => {
             if let Some(section) = written_section_mut(document) {

@@ -818,6 +818,10 @@ impl DecisionEndpointDef {
     }
 
     /// This definition as a `providers.toml` table named `name`.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a snippet to show, never written into a file"
+    )]
     pub fn to_table(&self, name: &str) -> String {
         let body = toml::to_string(self).unwrap_or_default();
         format!("[{DECISIONS_TABLE}.{name}]\n{body}")

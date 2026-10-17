@@ -3,12 +3,13 @@ use super::{
     SavedSandboxes,
 };
 use crate::own_writes;
+use crate::toml_document::merge_table;
 use caudra_storage::paths;
 use caudra_storage::private_file::{FileRevision, PrivateFile, PrivateFileError};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-use toml_edit::{DocumentMut, Item, Table};
+use toml_edit::DocumentMut;
 use workcell_tool_contract::shell_env::ShellEnvironmentSelection;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -176,51 +177,6 @@ impl SandboxStore {
     }
 }
 
-fn merge_table(current: &mut Table, previous: &Table, desired: &Table) {
-    current.retain(|key, _| desired.contains_key(key));
-    for (key, value) in desired {
-        if previous
-            .get(key)
-            .is_some_and(|before| same_item(before, value))
-        {
-            continue;
-        }
-        match (current.get_mut(key), value) {
-            (Some(Item::Table(current)), Item::Table(desired)) => {
-                merge_table(
-                    current,
-                    previous
-                        .get(key)
-                        .and_then(Item::as_table)
-                        .unwrap_or(&Table::new()),
-                    desired,
-                );
-            }
-            (Some(Item::Value(current)), Item::Value(desired)) => {
-                let decor = current.decor().clone();
-                *current = desired.clone();
-                *current.decor_mut() = decor;
-            }
-            _ => {
-                current.insert(key, value.clone());
-            }
-        }
-    }
-}
-
-fn same_item(left: &Item, right: &Item) -> bool {
-    match (left, right) {
-        (Item::Table(left), Item::Table(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .all(|(key, value)| right.get(key).is_some_and(|other| same_item(value, other)))
-        }
-        (Item::Value(left), Item::Value(right)) => left.to_string() == right.to_string(),
-        _ => false,
-    }
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::{SandboxStore, SandboxStoreError};
@@ -240,6 +196,7 @@ mod tests {
     use std::process::Command;
     use tempfile::{Builder, TempDir};
     use test_case::test_case;
+    use toml_edit::DocumentMut;
     use workcell_tool_contract::shell_env::{EnvPattern, ShellEnvironmentSelection};
 
     const FILE_MODE: u32 = 0o600;
@@ -361,6 +318,33 @@ mod tests {
         edited.remove(kind, &copy).unwrap();
         let removed = store.save(&added, &edited).unwrap();
         assert_eq!(removed.saved(), baseline.saved());
+    }
+
+    #[test]
+    fn an_added_record_follows_its_kind_and_leaves_the_file_as_written() {
+        const COPY: &str = "copy";
+        const COPY_HEADER: &str = "[sandbox.networks.copy]";
+        const NEXT_HEADER: &str = "[sandbox.transfers.source]";
+        let temp = tempdir().unwrap();
+        write(temp.path(), SAMPLE);
+        let store = SandboxStore::from_config_dir(temp.path()).unwrap();
+        let loaded = store.load().unwrap();
+        let mut draft = loaded.draft();
+        draft
+            .duplicate(RecordKind::Network, &name("build"), name(COPY))
+            .unwrap();
+
+        store.save(&loaded, &draft).unwrap();
+
+        let source = fs::read_to_string(temp.path().join(SANDBOX_FILE)).unwrap();
+        let copy = source.find(COPY_HEADER).expect(COPY_HEADER);
+        assert!(copy < source.find(NEXT_HEADER).unwrap(), "{source}");
+        let mut without_copy: DocumentMut = source.parse().unwrap();
+        without_copy["sandbox"]["networks"]
+            .as_table_mut()
+            .unwrap()
+            .remove(COPY);
+        assert_eq!(without_copy.to_string(), SAMPLE);
     }
 
     #[test]

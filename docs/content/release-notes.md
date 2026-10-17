@@ -7,6 +7,16 @@ Each release lists what changed, newest first. After an update, the first intera
 
 To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run [`caudra update`](/docs/cli/#caudra-update-caudra-rollback). Each release links to its GitHub page, which holds the downloads.
 
+## Caudra 0.2 Preview 11 {#v0-2-0-preview-11}
+
+[v0.2.0-preview.11 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.11)
+
+- Config edits keep your comments.
+
+### Fixes
+
+- **Config edits keep your comments**: Saving a provider or decision endpoint, toggling an MCP server, or saving sandbox records now changes only the keys that changed. Comments on the other keys, quoting, inline tables, and table order stay as you wrote them, and a new table goes after the existing ones of its kind.
+
 ## Caudra 0.2 Preview 10 {#v0-2-0-preview-10}
 
 [v0.2.0-preview.10 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.10)

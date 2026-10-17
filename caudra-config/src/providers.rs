@@ -20,6 +20,7 @@ use crate::config_version::{CONFIG_VERSION_KEY, ConfigVersion};
 use crate::decisions::{DECISIONS_TABLE, DecisionEndpointDef};
 use crate::interpolation::{self, Lookup};
 use crate::own_writes;
+use crate::toml_document::{merge_item, to_table};
 use crate::{ConfigField, ConfigValue};
 
 pub const PROVIDERS_FILE: &str = "providers.toml";
@@ -1083,7 +1084,12 @@ impl ProvidersFile {
     }
 
     pub fn upsert(&mut self, slug: String, def: ProviderDef) -> Result<(), ProvidersFileError> {
-        replace_table(self.document.as_table_mut(), &slug, to_table(&def)?);
+        merge_item(
+            self.document.as_table_mut(),
+            &slug,
+            rendered(self.config.get(&slug))?.as_ref(),
+            &Item::Table(to_table(&def)?),
+        );
         self.config.upsert(slug, def);
         Ok(())
     }
@@ -1102,7 +1108,8 @@ impl ProvidersFile {
         name: &str,
         def: &DecisionEndpointDef,
     ) -> Result<(), ProvidersFileError> {
-        let table = to_table(def)?;
+        let previous = rendered(self.config.decisions.get(name))?;
+        let desired = Item::Table(to_table(def)?);
         let decisions = self
             .document
             .entry(DECISIONS_TABLE)
@@ -1111,11 +1118,11 @@ impl ProvidersFile {
                 table.set_implicit(true);
                 Item::Table(table)
             })
-            .as_table_mut()
+            .as_table_like_mut()
             .ok_or_else(|| {
                 toml::ser::Error::custom(format!("`{DECISIONS_TABLE}` must be a table"))
             })?;
-        replace_table(decisions, name, table);
+        merge_item(decisions, name, previous.as_ref(), &desired);
         self.config.decisions.insert(name.into(), def.clone());
         Ok(())
     }
@@ -1135,38 +1142,11 @@ impl ProvidersFile {
     }
 }
 
-fn to_table(value: &impl Serialize) -> Result<Table, toml::ser::Error> {
-    let rendered = toml::to_string(value)?;
-    let document: DocumentMut = rendered
-        .parse()
-        .map_err(|error: toml_edit::TomlError| toml::ser::Error::custom(error.to_string()))?;
-    let mut table = document.into_table();
-    clear_positions(&mut table);
-    table.set_implicit(false);
-    Ok(table)
-}
-
-/// Positions come from the scratch document, so they would interleave the
-/// new tables with the edited file's; without them each follows its parent.
-fn clear_positions(table: &mut Table) {
-    table.set_position(None);
-    for (_, item) in table.iter_mut() {
-        match item {
-            Item::Table(table) => clear_positions(table),
-            Item::ArrayOfTables(array) => array.iter_mut().for_each(clear_positions),
-            _ => {}
-        }
-    }
-}
-
-/// Replaces `key` in `parent`, keeping a replaced table's place and the
-/// comments above its header.
-fn replace_table(parent: &mut Table, key: &str, mut table: Table) {
-    if let Some(Item::Table(existing)) = parent.get(key) {
-        table.set_position(existing.position());
-        *table.decor_mut() = existing.decor().clone();
-    }
-    parent.insert(key, Item::Table(table));
+/// What the file held for an entry before an edit, as serde renders it.
+fn rendered(previous: Option<&impl Serialize>) -> Result<Option<Item>, toml::ser::Error> {
+    previous
+        .map(|previous| to_table(previous).map(Item::Table))
+        .transpose()
 }
 
 fn providers_file_path(directory: Result<PathBuf, io::Error>) -> PathBuf {
@@ -1434,6 +1414,7 @@ context_window = 8192
     /// file on upsert, so a shape that parses but cannot be re-serialized would
     /// corrupt the user's config on the next write.
     #[test]
+    #[expect(clippy::disallowed_methods, reason = "checks what serde renders")]
     fn defaults_and_models_survive_a_serialize_roundtrip() {
         let parsed: ProvidersConfig = toml::from_str(DEFAULTS_TOML).unwrap();
         let rewritten = toml::to_string_pretty(&parsed).unwrap();
@@ -1487,6 +1468,7 @@ context_window = 8192
     }
 
     #[test]
+    #[expect(clippy::disallowed_methods, reason = "checks what serde renders")]
     fn provider_def_roundtrip() {
         let mut config = ProvidersConfig::default();
         config.upsert(
@@ -1595,6 +1577,7 @@ best = "gpt-4.1"
     fn purpose_models_preserve_their_one_or_many_shape(value: &str, expected_array: bool) {
         let input = format!("[local.purposes]\nfast = {value}\n");
         let parsed: ProvidersConfig = toml::from_str(&input).unwrap();
+        #[expect(clippy::disallowed_methods, reason = "checks what serde renders")]
         let rewritten = toml::to_string_pretty(&parsed).unwrap();
         let rewritten_value: toml::Value = toml::from_str(&rewritten).unwrap();
         let fast = &rewritten_value["local"]["purposes"]["fast"];
@@ -1837,6 +1820,7 @@ best = "gpt-4.1"
 
     /// Caudra rewrites the whole file on save, in the current shape.
     #[test]
+    #[expect(clippy::disallowed_methods, reason = "checks what serde renders")]
     fn saving_stamps_the_version_without_turning_it_into_a_provider() {
         let unversioned: ProvidersConfig = toml::from_str(DEFAULTS_TOML).unwrap();
         let rewritten = toml::to_string_pretty(&unversioned).unwrap();
@@ -1942,6 +1926,26 @@ protocol = "anthropic"
         );
     }
 
+    #[test_case(
+        "[proxy]\nprotocol = 'openai' # inline note\nbase_url = \"https://{env:PROXY_HOST}/v1\"\n",
+        "[proxy]\nprotocol = 'openai' # inline note\nbase_url = \"https://{env:PROXY_HOST}/v1\"\ndefault_model = \"model\"\n";
+        "table"
+    )]
+    #[test_case(
+        "proxy = { protocol = 'openai', base_url = 'https://example.test/v1' } # inline note\n",
+        "proxy = { protocol = 'openai', base_url = 'https://example.test/v1', default_model = \"model\" } # inline note\n";
+        "inline_table"
+    )]
+    fn a_provider_edit_changes_only_the_edited_key(source: &str, expected: &str) {
+        let mut file = ProvidersFile::parse(source).unwrap();
+        let mut proxy = file.get("proxy").unwrap().clone();
+        proxy.default_model = Some("model".into());
+
+        file.upsert("proxy".into(), proxy).unwrap();
+
+        assert_eq!(file.render(), expected);
+    }
+
     #[test]
     fn provider_edits_keep_comments_and_other_tables() {
         const ADDED: &str = "added";
@@ -1953,7 +1957,7 @@ protocol = "anthropic"
         file.upsert(ADDED.into(), ProviderDef::default()).unwrap();
         let rendered = file.render();
 
-        assert_survives(&rendered, &[PROXY_COMMENT, TUNNEL_COMMENT]);
+        assert_survives(&rendered, &[PROXY_COMMENT, INLINE_COMMENT, TUNNEL_COMMENT]);
         let reparsed = ProvidersFile::parse(&rendered).unwrap();
         assert_eq!(
             reparsed.get("proxy").unwrap().default_model.as_deref(),
@@ -1965,7 +1969,7 @@ protocol = "anthropic"
         assert!(file.remove(ADDED));
         assert!(!file.remove(ADDED));
         let rendered = file.render();
-        assert_survives(&rendered, &[PROXY_COMMENT, TUNNEL_COMMENT]);
+        assert_survives(&rendered, &[PROXY_COMMENT, INLINE_COMMENT, TUNNEL_COMMENT]);
         assert!(
             ProvidersFile::parse(&rendered)
                 .unwrap()

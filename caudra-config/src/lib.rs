@@ -69,6 +69,7 @@ pub mod providers;
 pub mod sandbox;
 pub mod shell_env;
 pub mod steering;
+pub mod toml_document;
 pub mod workcell;
 
 pub use decisions::{DecisionsConfig, FeatureMode};

@@ -9,7 +9,7 @@ use serde::Deserialize;
 #[cfg(test)]
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use toml_edit::DocumentMut;
+use toml_edit::{DocumentMut, Value};
 use url::{Host, Url};
 
 use super::error::McpError;
@@ -20,9 +20,11 @@ use caudra_config::config_version::ConfigVersion;
 use caudra_config::interpolation::{self, ConfigTextError, Lookup};
 use caudra_config::mcp::{DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, MCP_FILE, MCP_VERSION};
 use caudra_config::own_writes;
+use caudra_config::toml_document::set_value;
 use caudra_config::{global_config_dir, is_valid_server_name};
 
 const SERVERS_KEY: &str = "mcp";
+const ENABLED_KEY: &str = "enabled";
 const REMOVED_TOP_LEVEL_KEY: &str = "defer_tools";
 const REMOVED_SERVER_KEY: &str = "always_load";
 const REMOVED_KEY_REASON: &str = "was removed: MCP tools are reached through the `code` tool, which loads nothing up front. Delete the key";
@@ -736,11 +738,10 @@ pub fn persist_enabled(
         .as_table_like_mut()
         .ok_or_else(|| McpError::Config("[mcp] is not a table".into()))?
         .entry(server_name)
-        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-    server
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
         .as_table_like_mut()
         .ok_or_else(|| McpError::Config(format!("[mcp.{server_name}] is not a table")))?;
-    server["enabled"] = toml_edit::value(enabled);
+    set_value(server, ENABLED_KEY, Value::from(enabled));
 
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent)
@@ -1135,6 +1136,18 @@ enabled = true
         assert_eq!(doc["mcp"]["srv"]["enabled"].as_bool(), Some(false));
         assert!(doc["mcp"]["srv"]["command"].is_array());
         assert_eq!(doc["mcp"]["srv"]["timeout"].as_integer(), Some(5000));
+    }
+
+    #[test_case("[mcp.srv] # server note\ncommand = [\"echo\"] # command note\nenabled = true # toggle note\n", "[mcp.srv] # server note\ncommand = [\"echo\"] # command note\nenabled = false # toggle note\n"; "table")]
+    #[test_case("[mcp]\nsrv = { command = [\"echo\"], enabled = true } # server note\n", "[mcp]\nsrv = { command = [\"echo\"], enabled = false } # server note\n"; "inline_table")]
+    fn persist_enabled_keeps_comments(source: &str, expected: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MCP_FILE);
+        fs::write(&path, source).unwrap();
+
+        persist_enabled(&path, "srv", false).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
     }
 
     #[test]

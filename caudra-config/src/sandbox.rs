@@ -1006,6 +1006,10 @@ impl SandboxDraft {
     }
 
     /// Exports only configuration and purpose-scoped references, never secrets or instance IDs.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a whole new document; saves merge it into the file through toml_document"
+    )]
     pub fn export(&self) -> Result<String, SandboxError> {
         let document = SandboxDocument {
             version: SANDBOX_VERSION,
