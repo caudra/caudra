@@ -20,6 +20,7 @@ use ratatui::layout::{Position, Rect};
 use self::projection::GUTTER;
 use self::wire::Wire;
 use crate::agent::BtwPrompt;
+use crate::components::docs_link::DocsTopic;
 use crate::components::document_view::{
     COPIED_SELECTION, COPY_HINT, COPY_LABEL, DocumentMouse, DocumentView, Jump, body_width,
 };
@@ -338,6 +339,10 @@ impl ProjectionModal {
 }
 
 impl Overlay for ProjectionModal {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Projection)
+    }
+
     fn is_open(&self) -> bool {
         self.open
     }

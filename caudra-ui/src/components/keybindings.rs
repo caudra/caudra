@@ -824,6 +824,11 @@ pub const KEYBINDS: &[Keybind] = &[
         context: KeybindContext::General,
     },
     Keybind {
+        label: KeyLabel::Single(key::HELP.label),
+        description: "In a modal with a ? on its border: open its docs above it",
+        context: KeybindContext::General,
+    },
+    Keybind {
         label: KeyLabel::Single(key::SEARCH.label),
         description: "Search this chat or past sessions",
         context: KeybindContext::General,

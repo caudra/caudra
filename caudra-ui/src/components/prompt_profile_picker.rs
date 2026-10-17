@@ -7,6 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
 use crate::components::Overlay;
+use crate::components::docs_link::DocsTopic;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::tooltip::Tip;
 use crate::repaint::Cadence;
@@ -121,6 +122,10 @@ impl PromptProfilePicker {
 }
 
 impl Overlay for PromptProfilePicker {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::PromptProfiles)
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

@@ -1,3 +1,4 @@
+use crate::components::docs_link::DocsTopic;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::tooltip::Tip;
 use crate::components::{DisplaySource, Overlay};
@@ -166,6 +167,10 @@ impl MessageActions {
 }
 
 impl Overlay for MessageActions {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::MessageActions)
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

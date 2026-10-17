@@ -24,6 +24,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::components::command_text::ellipsize_spans;
+use crate::components::docs_link::DocsTopic;
 use crate::components::keybindings::key;
 use crate::components::modal::{ESC_LABEL, FooterHits, FooterLine, Modal, SEPARATOR};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
@@ -951,6 +952,10 @@ impl Default for DecisionsModal {
 }
 
 impl Overlay for DecisionsModal {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Decisions)
+    }
+
     fn is_open(&self) -> bool {
         self.open
     }

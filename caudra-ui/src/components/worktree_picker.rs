@@ -16,6 +16,7 @@ use ratatui::layout::{Position, Rect};
 use super::status_bar::collapse_home;
 use super::tooltip::Tip;
 use super::{Hint, Overlay};
+use crate::components::docs_link::DocsTopic;
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::Cadence;
@@ -632,6 +633,10 @@ impl WorktreePicker {
 }
 
 impl Overlay for WorktreePicker {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Worktrees)
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

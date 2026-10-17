@@ -11,6 +11,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
+use crate::components::docs_link::DocsTopic;
 use crate::components::keybindings::key;
 use crate::components::modal::{
     CHROME_LINES, CLOSE_HINT, ESC_LABEL, FooterHits, FooterLine, Modal, SEPARATOR,
@@ -182,6 +183,10 @@ impl Default for ContextModal {
 }
 
 impl Overlay for ContextModal {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Context)
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

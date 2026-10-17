@@ -12,6 +12,7 @@ mod clock;
 mod color_compat;
 mod components;
 pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand, ChatScope};
+pub use components::docs_link::DocsTopic;
 pub use components::keybindings;
 mod config_problems;
 mod exit_summary;

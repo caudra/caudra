@@ -76,6 +76,7 @@ use crate::components::command_modal::{CommandModal, CommandModalAction};
 use crate::components::commit_popup::{CommitAction, CommitIndex, CommitPopup};
 use crate::components::context_modal::ContextModal;
 use crate::components::decisions_modal::{DecisionsFetchState, DecisionsModal};
+use crate::components::docs_link::DocsTopic;
 use crate::components::docs_modal::{DocsAction, DocsModal};
 use crate::components::document_view::COPIED_SELECTION;
 use crate::components::env_modal::EnvModal;
@@ -519,6 +520,8 @@ pub struct App {
     pub(super) context_modal: ContextModal,
     pub(super) logs_modal: LogsModal,
     pub(super) docs_modal: DocsModal,
+    /// The topmost modal's `?` as last drawn, and the docs it opens.
+    pub(super) docs_badge: Option<(DocsTopic, Rect)>,
     pub(super) changelog_modal: ChangelogModal,
     pub(super) tools_modal: ToolsModal,
     pub(super) decisions_modal: DecisionsModal,
@@ -872,6 +875,7 @@ impl App {
             context_modal: ContextModal::new(),
             logs_modal: LogsModal::new(max_log_files),
             docs_modal: DocsModal::new(docs),
+            docs_badge: None,
             changelog_modal: ChangelogModal::new(release_notes, update::CURRENT),
             tools_modal: ToolsModal::new(),
             decisions_modal: DecisionsModal::new(),
@@ -1812,6 +1816,10 @@ impl App {
                 self.handle_keyboard(key, Some(text.as_deref()))
             }
             Msg::Paste(text) => {
+                if self.docs_holds_input() {
+                    self.docs_modal.handle_paste(&text);
+                    return vec![];
+                }
                 if self.mode_submission.is_open()
                     && !self.permission_prompt_holds_input()
                     && !self.question_form.is_open()
@@ -1847,7 +1855,6 @@ impl App {
                     || self.worktree_picker.is_open()
                     || self.accounts_modal.is_open()
                     || self.logs_modal.is_open()
-                    || self.docs_modal.is_open()
                 {
                     self.route_text_paste(&text);
                     return vec![];
@@ -2081,6 +2088,10 @@ impl App {
             self.permission_prompt.scroll(delta);
             return None;
         }
+        if self.docs_modal.is_open() {
+            self.docs_modal.scroll_at(pos, delta);
+            return None;
+        }
         if self.peer_manager.is_open() {
             if self.peer_manager.contains(pos) {
                 self.peer_manager.scroll_at(pos, delta);
@@ -2105,10 +2116,6 @@ impl App {
         }
         if self.logs_modal.is_open() {
             self.logs_modal.scroll(delta);
-            return None;
-        }
-        if self.docs_modal.is_open() {
-            self.docs_modal.scroll_at(pos, delta);
             return None;
         }
         if self.changelog_modal.is_open() {
@@ -2419,6 +2426,23 @@ impl App {
                 }
             };
         }
+        macro_rules! guard_repeat {
+            ($editing:expr) => {
+                if command_key.is_none() {
+                    return Some(vec![]);
+                }
+                if key.kind == KeyEventKind::Repeat && !Self::repeat_key_allowed(key, $editing) {
+                    return Some(vec![]);
+                }
+            };
+        }
+        // Above whichever modal opened it, so it answers first.
+        if self.docs_modal.is_open() {
+            keyboard_text!(docs_modal, self.docs_modal.text_input_active());
+            guard_repeat!(self.docs_modal.text_input_active());
+            let action = self.docs_modal.handle_key(key);
+            return Some(self.handle_docs_action(action));
+        }
         if self.mode_submission.is_open()
             && !self.permission_prompt_holds_input()
             && !self.question_form.is_open()
@@ -2437,16 +2461,6 @@ impl App {
             let action = self.sandbox_manager.handle_key(key);
             self.handle_sandbox_action(action);
             return Some(vec![]);
-        }
-        macro_rules! guard_repeat {
-            ($editing:expr) => {
-                if command_key.is_none() {
-                    return Some(vec![]);
-                }
-                if key.kind == KeyEventKind::Repeat && !Self::repeat_key_allowed(key, $editing) {
-                    return Some(vec![]);
-                }
-            };
         }
         if self.image_viewer.is_open() {
             guard_repeat!(false);
@@ -2518,13 +2532,6 @@ impl App {
             let action = self.logs_modal.handle_key(key);
             self.handle_logs_action(action);
             return Some(vec![]);
-        }
-
-        if self.docs_modal.is_open() {
-            keyboard_text!(docs_modal, self.docs_modal.text_input_active());
-            guard_repeat!(self.docs_modal.text_input_active());
-            let action = self.docs_modal.handle_key(key);
-            return Some(self.handle_docs_action(action));
         }
 
         if self.changelog_modal.is_open() {
@@ -3704,7 +3711,13 @@ impl App {
         if !self.permission_prompt.is_open() {
             self.permission_prompt.handle_key(key);
         }
-        if self.permissions_picker.is_open() && self.permissions_picker.editor_mut().is_some() {
+        if key.kind == KeyEventKind::Press && self.open_badge_docs(key) {
+            return vec![];
+        }
+        if self.permissions_picker.is_open()
+            && self.permissions_picker.editor_mut().is_some()
+            && !self.docs_modal.is_open()
+        {
             if self.permission_mutation_pending() {
                 return vec![];
             }
@@ -3726,7 +3739,7 @@ impl App {
             return self.handle_permissions_picker_action(action);
         }
         match key.kind {
-            KeyEventKind::Release if self.peer_manager.is_open() => {
+            KeyEventKind::Release if self.peer_manager.is_open() && !self.docs_modal.is_open() => {
                 let action = self.peer_manager.handle_key(key);
                 return self.handle_peer_manager_action(action);
             }
@@ -4263,6 +4276,35 @@ impl App {
         }
     }
 
+    /// The docs take every input while open, whatever they were opened over,
+    /// short of a permission prompt that holds it.
+    pub(super) fn docs_holds_input(&self) -> bool {
+        self.docs_modal.is_open() && !self.permission_prompt_holds_input()
+    }
+
+    /// Opens over the modal that asked, which stays open beneath so closing
+    /// the docs returns to it.
+    pub(super) fn open_docs(&mut self, topic: DocsTopic) {
+        self.docs_modal.open_at(topic.address());
+    }
+
+    /// `F1` on a modal that links to the docs opens them, as its `?` does.
+    /// Help keeps `F1` as the key that closes it.
+    fn open_badge_docs(&mut self, key: KeyEvent) -> bool {
+        if !key::HELP.matches(key)
+            || self.help_modal.is_open()
+            || self.docs_modal.is_open()
+            || self.which_key.is_armed()
+        {
+            return false;
+        }
+        let Some((topic, _)) = self.docs_badge else {
+            return false;
+        };
+        self.open_docs(topic);
+        true
+    }
+
     fn handle_docs_action(&mut self, action: DocsAction) -> Vec<Action> {
         match action {
             DocsAction::Consumed => {}
@@ -4274,8 +4316,8 @@ impl App {
         vec![]
     }
 
-    /// A link into the docs opens there, in place of the notes; any other goes
-    /// to the browser.
+    /// A link into the docs opens there, above the notes; any other goes to
+    /// the browser.
     pub(super) fn handle_changelog_action(&mut self, action: ChangelogAction) -> Vec<Action> {
         match action {
             ChangelogAction::Consumed => {}
@@ -4287,7 +4329,6 @@ impl App {
             }
             ChangelogAction::Copy { text, label } => self.copy_labelled(&text, label),
             ChangelogAction::Follow(target) if self.docs_modal.knows(&target) => {
-                self.changelog_modal.close();
                 self.docs_modal.open(&target);
             }
             ChangelogAction::Follow(target) => return vec![Action::OpenUrl(target)],
@@ -7523,6 +7564,10 @@ impl App {
     }
 
     fn route_text_paste(&mut self, text: &str) {
+        if self.docs_holds_input() {
+            self.docs_modal.handle_paste(text);
+            return;
+        }
         if self.mode_submission.is_open()
             && !self.permission_prompt_holds_input()
             && !self.question_form.is_open()
@@ -7550,10 +7595,6 @@ impl App {
         }
         if self.logs_modal.is_open() {
             self.logs_modal.handle_paste(text);
-            return;
-        }
-        if self.docs_modal.is_open() {
-            self.docs_modal.handle_paste(text);
             return;
         }
         if self.search_modal.is_open() {

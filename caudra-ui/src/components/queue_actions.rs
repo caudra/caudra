@@ -1,4 +1,5 @@
 use crate::components::Overlay;
+use crate::components::docs_link::DocsTopic;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::queue_panel::QueueEntry;
 use crate::components::tooltip::Tip;
@@ -164,6 +165,10 @@ impl QueueActions {
 }
 
 impl Overlay for QueueActions {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Queue)
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

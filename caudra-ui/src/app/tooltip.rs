@@ -6,12 +6,14 @@ use ratatui::Frame;
 
 use crate::components::Overlay;
 use crate::components::input::{CLICK_OR_PRESS, ChordHint};
+use crate::components::keybindings::key;
 use crate::components::queue_panel::QueueHitTarget;
 use crate::components::tooltip::{self, Tip, TipKey};
 use crate::update;
 
 use super::App;
 
+pub(super) const TIP_DOCS: &str = "Docs: ";
 const TIP_PLAN: &str = "A plan is ready for review";
 const TIP_TASKS: &str = "Tasks and agents this session started";
 const CLICK_PLAN: &str = " to reopen it";
@@ -50,6 +52,9 @@ impl App {
         if self.leader_holds_pointer() {
             return None;
         }
+        if let Some(tip) = self.docs_badge_tip() {
+            return Some(tip);
+        }
         let open = self
             .overlays()
             .into_iter()
@@ -69,6 +74,19 @@ impl App {
                 .filter(|overlay| overlay.is_open())
                 .find_map(Overlay::tooltip),
         }
+    }
+
+    fn docs_badge_tip(&self) -> Option<Tip> {
+        let (topic, area) = self.docs_badge?;
+        if !area.contains(self.tooltip.pointer()?) {
+            return None;
+        }
+        let place = self.docs_modal.place_of(topic.address());
+        Some(Tip::at(
+            TipKey::DocsBadge,
+            area,
+            format!("{TIP_DOCS}{place} · {}", key::HELP.label),
+        ))
     }
 
     /// What the screen under no overlay explains.
@@ -164,10 +182,11 @@ mod tests {
         announced, app_with_finished_subagent, app_with_todos, app_without_splash, mouse_event,
         test_app, type_and_submit,
     };
-    use super::{ChordTopic, TIP_PLAN, TIP_TASKS};
+    use super::{ChordTopic, TIP_DOCS, TIP_PLAN, TIP_TASKS};
     use crate::app::{App, Msg};
+    use crate::components::docs_link::DocsTopic;
     use crate::components::input::CLICK_OR_PRESS;
-    use crate::components::keybindings::leader;
+    use crate::components::keybindings::{key as kb, leader};
     use crate::components::queue_panel::{
         QueueAction, QueueHit, QueueHitTarget, TIP_SEPARATE, TIP_TOGETHER,
     };
@@ -557,5 +576,26 @@ mod tests {
         app.update(Msg::Key(key(KeyCode::Right)));
 
         assert_eq!(row_of(&screen(&mut app, WIDE), &click), None, "{LINGERED}");
+    }
+
+    #[test]
+    fn the_docs_badge_names_where_it_leads_over_the_modal_tips() {
+        let mut app = app_without_splash();
+        app.usage_modal.toggle();
+        let _ = screen(&mut app, WIDE);
+        let (topic, badge) = app.docs_badge.expect(CONTROL_MISSING);
+
+        let rows = rest_at(&mut app, WIDE, badge);
+
+        let tip = app.tooltip_candidate().expect(SHOWN);
+        assert_eq!(tip.key, TipKey::DocsBadge, "{WRONG_TIP}");
+        assert!(tip.text.starts_with(TIP_DOCS), "{WRONG_TIP}: {}", tip.text);
+        assert!(
+            tip.text.ends_with(kb::HELP.label),
+            "{WRONG_TIP}: {}",
+            tip.text
+        );
+        assert_eq!(topic, DocsTopic::Usage);
+        assert!(row_of(&rows, TIP_DOCS).is_some(), "{SHOWN}");
     }
 }

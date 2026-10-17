@@ -1,4 +1,5 @@
 use crate::components::Overlay;
+use crate::components::docs_link::DocsTopic;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::tooltip::Tip;
 use crate::repaint::Cadence;
@@ -152,6 +153,10 @@ fn user_turn_text(items: &[HistoryItem]) -> Option<&str> {
 }
 
 impl Overlay for RewindPicker {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Rewind)
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

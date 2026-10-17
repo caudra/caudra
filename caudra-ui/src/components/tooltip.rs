@@ -54,6 +54,7 @@ pub(crate) enum TipKey {
     Queue(QueueHitTarget),
     TodoHeader,
     UpdateClose,
+    DocsBadge,
 }
 
 /// Where the box hangs from.

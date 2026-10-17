@@ -27,6 +27,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::components::code_view::{WrappedRows, highlight_spans};
+use crate::components::docs_link::DocsTopic;
 use crate::components::keybindings::{Bind, key};
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::Modal;
@@ -660,6 +661,10 @@ impl ShellModal {
 }
 
 impl Overlay for ShellModal {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Shells)
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

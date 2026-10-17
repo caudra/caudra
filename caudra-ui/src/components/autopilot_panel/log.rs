@@ -24,6 +24,7 @@ use crate::components::audit_log::{
     AuditLog, DATE_FORMAT, EntryFilter, LogRow, counted, field, hint, local_time, section,
     text_lines,
 };
+use crate::components::docs_link::DocsTopic;
 use crate::components::escape_terminal_controls;
 use crate::storage_writer::AutopilotWrite;
 use crate::theme::Theme;
@@ -156,6 +157,7 @@ impl AuditLog for AutopilotLog {
     type Filter = LogFilter;
     type Group = Group;
     const TITLE: &'static str = TITLE;
+    const DOCS: DocsTopic = DocsTopic::Autopilot;
     #[cfg(debug_assertions)]
     const SCOPE: &'static str = "autopilot_panel";
     const READING: &'static str = READING_LOG;

@@ -12,6 +12,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
+use crate::components::docs_link::DocsTopic;
 use crate::components::modal::{CHROME_LINES, Modal};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{ModalScroll, Overlay, escape_terminal_controls};
@@ -159,6 +160,10 @@ impl Default for SkillsModal {
 }
 
 impl Overlay for SkillsModal {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Skills)
+    }
+
     fn is_open(&self) -> bool {
         self.open
     }

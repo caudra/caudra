@@ -23,6 +23,7 @@ use crate::components::audit_log::{
     AuditLog, DATE_FORMAT, EntryFilter, LogRow, counted, field, hint, local_time, section,
     text_lines,
 };
+use crate::components::docs_link::DocsTopic;
 use crate::components::escape_terminal_controls;
 use crate::theme::Theme;
 
@@ -139,6 +140,7 @@ impl AuditLog for GoalLog {
     type Filter = LogFilter;
     type Group = u32;
     const TITLE: &'static str = TITLE;
+    const DOCS: DocsTopic = DocsTopic::Goal;
     #[cfg(debug_assertions)]
     const SCOPE: &'static str = "goal_panel";
     const READING: &'static str = READING_LOG;

@@ -30,6 +30,7 @@ use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
+use crate::components::docs_link::DocsTopic;
 use crate::components::document_view::COPIED_SELECTION;
 use crate::components::json_tree::{self, JsonRow};
 use crate::components::modal::{FooterHits, FooterLine, Modal};
@@ -2198,6 +2199,10 @@ impl Default for WorkflowInspector {
 }
 
 impl Overlay for WorkflowInspector {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::WorkflowRuns)
+    }
+
     fn is_open(&self) -> bool {
         self.open
     }

@@ -19,6 +19,7 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::components::docs_link::DocsTopic;
 use crate::components::keybindings::key;
 use crate::components::modal::{CLOSE_HINT, ESC_LABEL, FooterHits, FooterLine, Modal, SEPARATOR};
 use crate::components::scrollbar::{ScrollHint, Scrollbar, ScrollbarMouse};
@@ -785,6 +786,10 @@ impl SearchModal {
 }
 
 impl Overlay for SearchModal {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Search)
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

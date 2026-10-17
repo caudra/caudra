@@ -35,6 +35,7 @@ use super::modal::Modal;
 use super::scrollbar::{Scrollbar, ScrollbarMouse};
 use super::text_editor::{EditorKey, EditorMouse, TextEditor};
 use super::{DisplaySource, Hint, HintBar, Overlay};
+use crate::components::docs_link::DocsTopic;
 use crate::markdown;
 use crate::provenance::{LineProvenance, Provenance};
 use crate::selection::{self, LineBreaks, ScreenSelection, line_chars, wrap_breaks};
@@ -931,6 +932,10 @@ impl ReviewModal {
 }
 
 impl Overlay for ReviewModal {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Review)
+    }
+
     fn is_open(&self) -> bool {
         self.target.is_some()
     }

@@ -13,6 +13,7 @@ use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::ProviderKind;
 use caudra_providers::{Model, ModelPurpose};
 
+use crate::components::docs_link::DocsTopic;
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::tooltip::Tip;
@@ -1019,6 +1020,10 @@ fn row_detail(class: Option<ModelPurpose>, claimed_by: &[ModelPurpose], free: bo
 }
 
 impl Overlay for ModelPicker {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Models)
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

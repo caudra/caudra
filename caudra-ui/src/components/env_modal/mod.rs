@@ -20,6 +20,7 @@ use workcell_tool_contract::shell_env::{
     is_valid_variable_name, looks_secret, validate_literal,
 };
 
+use crate::components::docs_link::DocsTopic;
 use crate::components::keybindings::key;
 use crate::components::list_picker::{FooterBuilder, ListPicker, PickerAction, PickerItem};
 use crate::components::tooltip::Tip;
@@ -823,6 +824,10 @@ impl EnvModal {
 }
 
 impl Overlay for EnvModal {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::ShellEnv)
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

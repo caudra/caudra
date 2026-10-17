@@ -29,6 +29,7 @@ use caudra_storage::decisions::read_active_decision_endpoint;
 use caudra_storage::model::persist_model_for_every_mode;
 use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 
+use crate::components::docs_link::DocsTopic;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::Modal;
 use crate::components::tooltip::Tip;
@@ -1383,6 +1384,10 @@ fn render_message(frame: &mut Frame, area: Rect, title: &str, message: &str) -> 
 }
 
 impl Overlay for LoginPicker {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Login)
+    }
+
     fn is_open(&self) -> bool {
         !matches!(self.step, Step::Closed)
     }

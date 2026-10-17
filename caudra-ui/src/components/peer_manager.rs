@@ -26,6 +26,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::components::docs_link::DocsTopic;
 use crate::components::document_view::{DocumentMouse, DocumentView, MAX_ROWS, Painted};
 use crate::components::key_freshness::KeyFreshness;
 use crate::components::keybindings::key;
@@ -2920,6 +2921,10 @@ impl Default for PeerManager {
 }
 
 impl Overlay for PeerManager {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Peers)
+    }
+
     fn is_open(&self) -> bool {
         self.open
     }

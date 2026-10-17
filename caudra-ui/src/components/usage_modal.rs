@@ -24,6 +24,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::components::accounts_modal::account_detail;
+use crate::components::docs_link::{BADGE_COLUMNS, DocsTopic};
 use crate::components::keybindings::{Bind, key};
 use crate::components::modal::{FooterHits, Modal};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
@@ -486,7 +487,7 @@ impl UsageModal {
         // belongs to the pan bar, and a hint sharing it would be overpainted
         // exactly when the modal is narrow enough to need both.
         let hint_area = Rect {
-            x: popup.x + popup.width.saturating_sub(hint_w + 1),
+            x: popup.x + popup.width.saturating_sub(hint_w + 1 + BADGE_COLUMNS),
             y: popup.y,
             width: hint_w,
             height: 1,
@@ -1158,6 +1159,10 @@ fn model_row(
 }
 
 impl crate::components::Overlay for UsageModal {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Usage)
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

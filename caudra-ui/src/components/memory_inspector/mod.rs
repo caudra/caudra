@@ -30,6 +30,7 @@ use self::outline::{
     Columns, Look, Row, RowKind, TailMark, line_text, one_line, row_line, tree_rows,
 };
 use crate::animation::{animation_elapsed_ms, spinner_str};
+use crate::components::docs_link::DocsTopic;
 use crate::components::document_view::COPIED_SELECTION;
 use crate::components::gauge::{self, CELL_EIGHTHS, GAUGE_CLOSE, GAUGE_OPEN};
 use crate::components::modal::{ESC_LABEL, FooterHits, FooterLine, Modal};
@@ -1357,6 +1358,10 @@ impl Default for MemoryInspector {
 }
 
 impl Overlay for MemoryInspector {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Memory)
+    }
+
     fn is_open(&self) -> bool {
         self.open
     }

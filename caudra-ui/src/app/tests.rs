@@ -8778,7 +8778,10 @@ fn a_link_in_the_release_notes_opens_where_it_leads(keys: &[KeyCode], browser: O
         None => assert!(actions.is_empty()),
     }
     assert_eq!(app.docs_modal.is_open(), browser.is_none());
-    assert_eq!(app.changelog_modal.is_open(), browser.is_some());
+    assert!(
+        app.changelog_modal.is_open(),
+        "{CHANGELOG_CLOSED_UNDER_DOCS}"
+    );
 }
 
 #[test]
@@ -8794,6 +8797,85 @@ fn closing_notes_that_opened_on_their_own_says_how_to_read_them_again() {
         app.status_bar.flash_text(),
         Some(changelog_modal::REOPEN_HINT)
     );
+}
+
+const CHANGELOG_CLOSED_UNDER_DOCS: &str = "the release notes must stay open under the docs";
+const BADGE_MISSING: &str = "a modal that links to the docs must draw its `?`";
+const OPENER_CLOSED: &str = "the modal the docs opened over must stay open beneath them";
+const DOCS_NOT_OPENED: &str = "the `?` or F1 must open the docs";
+const DOCS_NOT_ON_TOP: &str = "the docs must be the topmost modal, with no `?` of their own";
+const DOCS_KEPT_OPEN: &str = "Esc or a click outside must close the docs";
+
+fn badge(app: &mut App) -> Rect {
+    let _ = rendered(app);
+    app.docs_badge.expect(BADGE_MISSING).1
+}
+
+#[test_case(open_usage_modal   ; "usage")]
+#[test_case(open_context_modal ; "context")]
+#[test_case(open_tools_modal   ; "tools")]
+#[test_case(open_help_modal    ; "help")]
+fn the_docs_badge_opens_the_docs_above_the_modal_until_esc(open: fn(&mut App)) {
+    let mut app = app_without_splash();
+    open(&mut app);
+    let opener = app.overlays().iter().position(|overlay| overlay.is_open());
+    let area = badge(&mut app);
+
+    let actions = click_at(&mut app, area);
+
+    assert!(actions.is_empty());
+    assert!(app.docs_modal.is_open(), "{DOCS_NOT_OPENED}");
+    let _ = rendered(&mut app);
+    assert_eq!(app.docs_badge, None, "{DOCS_NOT_ON_TOP}");
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(!app.docs_modal.is_open(), "{DOCS_KEPT_OPEN}");
+    let open_now = app.overlays().iter().position(|overlay| overlay.is_open());
+    assert_eq!(open_now, opener, "{OPENER_CLOSED}");
+    let _ = badge(&mut app);
+}
+
+#[test]
+fn a_click_outside_the_stacked_docs_closes_only_the_docs() {
+    let mut app = app_without_splash();
+    open_usage_modal(&mut app);
+    let area = badge(&mut app);
+    click_at(&mut app, area);
+    let _ = rendered(&mut app);
+
+    click_at(&mut app, Rect::new(0, 0, 1, 1));
+
+    assert!(!app.docs_modal.is_open(), "{DOCS_KEPT_OPEN}");
+    assert!(app.usage_modal.is_open(), "{OPENER_CLOSED}");
+}
+
+#[test]
+fn f1_opens_the_docs_of_the_modal_on_top() {
+    let mut app = app_without_splash();
+    open_usage_modal(&mut app);
+    let _ = badge(&mut app);
+
+    app.update(Msg::Key(kb::HELP.to_key_event()));
+
+    assert!(app.docs_modal.is_open(), "{DOCS_NOT_OPENED}");
+    assert!(app.usage_modal.is_open(), "{OPENER_CLOSED}");
+    assert!(!app.help_modal.is_open());
+}
+
+#[test_case(true  ; "closes_help")]
+#[test_case(false ; "opens_help_over_no_modal")]
+fn f1_keeps_toggling_help(help_open: bool) {
+    let mut app = app_without_splash();
+    if help_open {
+        open_help_modal(&mut app);
+    }
+    let _ = rendered(&mut app);
+
+    app.update(Msg::Key(kb::HELP.to_key_event()));
+
+    assert_eq!(app.help_modal.is_open(), !help_open);
+    assert!(!app.docs_modal.is_open());
 }
 
 const HELP_FOOTER_MISSING: &str = "the help footer must offer /docs";
@@ -28589,6 +28671,7 @@ mod theme_colours {
         test_app,
     };
     use crate::components::accounts_modal;
+    use crate::components::docs_link::BADGE;
     use crate::components::messages::ASSISTANT_LABEL;
     use crate::components::permission_prompt::{MCP_NOTE, mcp_request};
     use crate::components::sandbox_manager::SandboxView;
@@ -28622,6 +28705,10 @@ mod theme_colours {
     const QUEUED: &str = "queued";
     const PROFILE_KEY: char = 'p';
     const FLOAT_CHANNEL: usize = 8;
+    const BORDER: &str = "\u{2500}";
+    const BADGE_UNDRAWN: &str = "an open overlay links to the docs, but no `?` was drawn";
+    const BADGE_UNASKED: &str = "a `?` was drawn though no open overlay links to the docs";
+    const BADGE_OFF_BORDER: &str = "the `?` must sit on the top border, between runs of it";
 
     /// What an opener must keep alive for its surface to stay up, such as the
     /// sender a float closes on losing.
@@ -29184,6 +29271,35 @@ mod theme_colours {
                 old_backgrounds.contains(&cell.bg) || cell.fg == old_foreground
             });
             report(&mut failures, surface.name, to, STALE_THEME, &stale);
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn a_surface_that_links_to_the_docs_draws_its_badge_on_its_border() {
+        let mut failures = Vec::new();
+        for surface in SURFACES {
+            let mut app = test_app();
+            let mut held = Held::new();
+            (surface.open)(&mut app, &mut held);
+            let buffer = draw(&mut app);
+            let linked = app
+                .overlays()
+                .iter()
+                .any(|overlay| overlay.is_open() && overlay.docs_topic().is_some());
+            match app.docs_badge {
+                None if linked => failures.push(format!("{}: {BADGE_UNDRAWN}", surface.name)),
+                Some(_) if !linked => failures.push(format!("{}: {BADGE_UNASKED}", surface.name)),
+                Some((_, area)) => {
+                    let row: String = (area.x - 1..=area.right())
+                        .map(|x| buffer[(x, area.y)].symbol())
+                        .collect();
+                    if row != format!("{BORDER}{BADGE}{BORDER}") {
+                        failures.push(format!("{}: {BADGE_OFF_BORDER}: {row:?}", surface.name));
+                    }
+                }
+                None => {}
+            }
         }
         assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     }

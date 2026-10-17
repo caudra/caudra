@@ -20,6 +20,7 @@ use smol::Task;
 use unicode_width::UnicodeWidthStr;
 
 use crate::components::command_text::ellipsize_spans;
+use crate::components::docs_link::DocsTopic;
 use crate::components::modal::{FooterHits, FooterLine, Modal, SEPARATOR};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::section_tabs::{SectionTab, tab_strip};
@@ -91,6 +92,7 @@ pub(crate) trait AuditLog: Sized + Send + 'static {
     /// What a header heads.
     type Group: Copy;
     const TITLE: &'static str;
+    const DOCS: DocsTopic;
     /// The grab scope the panel draws under, which only debug builds record.
     #[cfg(debug_assertions)]
     const SCOPE: &'static str;
@@ -892,6 +894,10 @@ impl<L: AuditLog, C: Copy> AuditPanel<L, C> {
 }
 
 impl<L: AuditLog, C> Overlay for AuditPanel<L, C> {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(L::DOCS)
+    }
+
     fn is_open(&self) -> bool {
         self.open
     }

@@ -56,4 +56,12 @@ mod tests {
         );
         assert!(library().load("/permissions#plan-mode").is_ok());
     }
+
+    #[test]
+    fn every_modal_links_to_a_section_that_exists() {
+        let broken: Vec<_> = caudra_ui::DocsTopic::addresses()
+            .filter_map(|address| library().load(address).err())
+            .collect();
+        assert!(broken.is_empty(), "{broken:#?}");
+    }
 }

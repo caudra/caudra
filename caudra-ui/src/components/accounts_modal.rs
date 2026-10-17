@@ -29,6 +29,7 @@ use super::list_picker::{ListPicker, PickerAction, PickerItem};
 use super::tooltip::Tip;
 use super::usage_modal::format_reset;
 use super::{Hint, Overlay, format_elapsed};
+use crate::components::docs_link::DocsTopic;
 use crate::repaint::Cadence;
 use crate::theme;
 
@@ -800,6 +801,10 @@ impl AccountsModal {
 }
 
 impl Overlay for AccountsModal {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Accounts)
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

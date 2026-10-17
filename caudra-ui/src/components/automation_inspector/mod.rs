@@ -54,6 +54,7 @@ use serde_json::Value;
 use text::now_ms;
 use trace::{Shown, Trace};
 
+use crate::components::docs_link::DocsTopic;
 use crate::components::json_tree;
 use crate::components::keybindings::key;
 use crate::components::modal::{ESC_LABEL, FooterHits, FooterLine, Modal};
@@ -2192,6 +2193,10 @@ impl Default for AutomationInspector {
 }
 
 impl Overlay for AutomationInspector {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Automations)
+    }
+
     fn is_open(&self) -> bool {
         self.open
     }

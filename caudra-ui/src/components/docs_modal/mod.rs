@@ -188,22 +188,25 @@ impl DocsModal {
     /// Opens where it was left, or where `args` points: a page or section in
     /// any form the site spells it, or failing that a search for the words.
     pub fn open(&mut self, args: &str) {
+        let args = args.trim();
+        if !self.open_at(args) && !args.is_empty() {
+            self.search.set_query(args, self.library());
+            self.pane = Pane::Search;
+        }
+    }
+
+    /// Opens on `address`, or where it was left when `address` names no
+    /// place in the docs, and says which.
+    pub fn open_at(&mut self, address: &str) -> bool {
         self.open = true;
         self.pane = Pane::Reader;
-        let args = args.trim();
-        if args.is_empty() {
-            return;
+        let found = (!address.is_empty())
+            .then(|| self.library().locate(address))
+            .flatten();
+        if let Some(target) = found {
+            self.visit(target);
         }
-        let library = self.library();
-        match library.locate(args) {
-            Some(target) => {
-                self.visit(target);
-            }
-            None => {
-                self.search.set_query(args, library);
-                self.pane = Pane::Search;
-            }
-        }
+        found.is_some()
     }
 
     pub fn close(&mut self) {
@@ -224,6 +227,15 @@ impl DocsModal {
     /// browser.
     pub fn knows(&self, target: &str) -> bool {
         self.library().locate(target).is_some()
+    }
+
+    /// `Page › Section` for `target`, or `target` itself when it names no
+    /// place in the docs.
+    pub(crate) fn place_of(&self, target: &str) -> String {
+        let library = self.library();
+        library
+            .locate(target)
+            .map_or_else(|| target.to_owned(), |found| crumb(library, found))
     }
 
     pub(crate) fn text_input_active(&self) -> bool {

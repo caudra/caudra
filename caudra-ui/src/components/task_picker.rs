@@ -16,6 +16,7 @@ use ratatui::text::Line;
 
 use crate::app::tasks::{TaskInfo, TaskStatus};
 use crate::components::code_view::{WrappedRows, truncation_line};
+use crate::components::docs_link::DocsTopic;
 use crate::components::keybindings::{Bind, key};
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::Modal;
@@ -386,6 +387,10 @@ impl TaskPicker {
 }
 
 impl Overlay for TaskPicker {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Tasks)
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

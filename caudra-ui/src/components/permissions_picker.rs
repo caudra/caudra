@@ -30,6 +30,7 @@ use std::sync::Arc;
 use unicode_width::UnicodeWidthStr;
 
 use crate::components::command_text::{code_spans_in, pattern_spans};
+use crate::components::docs_link::DocsTopic;
 use crate::components::keybindings::Bind;
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
@@ -1353,6 +1354,10 @@ impl PermissionsPicker {
 }
 
 impl Overlay for PermissionsPicker {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Permissions)
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

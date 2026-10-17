@@ -1,4 +1,5 @@
 use crate::components::Overlay;
+use crate::components::docs_link::DocsTopic;
 use crate::components::keybindings::{
     ALT_SEP, KEYBINDS, KeyLabel, KeybindContext, all_contexts, key,
 };
@@ -354,6 +355,10 @@ impl HelpModal {
 }
 
 impl Overlay for HelpModal {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Keybindings)
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

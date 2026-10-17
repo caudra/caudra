@@ -13,6 +13,7 @@ pub(crate) mod completion;
 pub(crate) mod context_modal;
 pub(crate) mod decision_view;
 pub(crate) mod decisions_modal;
+pub mod docs_link;
 pub(crate) mod docs_modal;
 pub(crate) mod document_view;
 pub(crate) mod env_modal;
@@ -242,6 +243,11 @@ pub(crate) trait Overlay {
     /// What the pointer rests on inside the overlay, when that deserves a
     /// tooltip. Asked only of overlays that are open.
     fn tooltip(&self) -> Option<tooltip::Tip> {
+        None
+    }
+    /// The section of the manual that explains this overlay, offered by a
+    /// `?` on its border while it is the topmost one drawn.
+    fn docs_topic(&self) -> Option<docs_link::DocsTopic> {
         None
     }
 }

@@ -22,6 +22,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::components::docs_link::DocsTopic;
 use crate::components::document_view::COPIED_SELECTION;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
@@ -883,6 +884,10 @@ impl Default for LogsModal {
 }
 
 impl Overlay for LogsModal {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Logs)
+    }
+
     fn is_open(&self) -> bool {
         self.open
     }

@@ -15,6 +15,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
+use crate::components::docs_link::DocsTopic;
 use crate::components::document_view::{
     COPIED_SELECTION, COPY_HINT, COPY_LABEL, DocumentMouse, DocumentView, Painted, UNBOUND_HINT,
     body_width,
@@ -213,6 +214,10 @@ impl SystemPromptModal {
 }
 
 impl Overlay for SystemPromptModal {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::SystemPrompt)
+    }
+
     fn is_open(&self) -> bool {
         self.open
     }

@@ -15,6 +15,7 @@ use caudra_agent::{
 };
 use caudra_grab::grab_scope;
 
+use crate::components::docs_link::DocsTopic;
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::tooltip::Tip;
@@ -642,6 +643,10 @@ fn safe_url(url: &str) -> String {
 }
 
 impl Overlay for McpPicker {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Mcp)
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

@@ -257,6 +257,8 @@ Press `/` to search every page. A section matches when it contains every word, i
 
 `Tab` and `Shift+Tab` select a link on screen, and `Enter` follows it. A link to another page opens here, and a link out of the docs opens in your browser. `Backspace` or `[` goes back, and `]` goes forward again. `n` and `p` jump to the next or previous heading. A click follows a link or opens a contents row or a result. A drag over the page copies the [Markdown source](/docs/markdown/#copying) of what it covers, as in the transcript. While the pointer is on a link, the bottom row shows where it goes: the page and section for a link into the docs, or the address of any other link.
 
+Most modals carry a `?` at the right of their top border. A click on it, or `F1` while the modal is open, opens the section about that modal above it, and `Esc` closes the docs and returns to the modal. In the keybindings list, `F1` closes the list instead. A link from `/changelog` into the docs also opens above the release notes.
+
 On a terminal about 110 columns wide or more, the contents stay beside the page and mark the page and section you are reading. On a narrower one, `c` shows the contents in place of the page. Typing there filters the pages, and `Tab` or `Esc` returns to the page. The agent reads the same pages through the [`caudra-docs` skill](/docs/skills/#caudra-docs).
 
 ## Logs

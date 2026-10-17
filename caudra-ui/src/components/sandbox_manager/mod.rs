@@ -6,6 +6,7 @@ mod view;
 use super::scrollbar::{Scrollbar, ScrollbarMouse};
 use super::text_editor::{EditorKey, EditorMouse, TextEditor};
 use super::{HintBar, Overlay, keybindings::key};
+use crate::components::docs_link::DocsTopic;
 use crate::sandbox::{
     LiveOperation, LiveOutcome, LiveReply, LiveRequest, NETWORK_SAVE_NOTICE, SandboxAttachment,
     SandboxProviderSnapshot, SandboxSnapshot, SandboxSnapshotRequest, SnapshotState, StoreEffect,
@@ -787,6 +788,10 @@ impl SandboxManager {
 }
 
 impl Overlay for SandboxManager {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Sandboxes)
+    }
+
     fn is_open(&self) -> bool {
         self.state.as_ref().is_some_and(|state| state.open)
     }

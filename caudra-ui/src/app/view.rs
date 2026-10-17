@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::sync::atomic::Ordering;
 
-use crate::components::Overlay;
+use crate::components::docs_link::{self, DocsTopic};
 use crate::components::goal_panel::StatusContent;
 use crate::components::input::{self, Placeholder};
 use crate::components::keybindings;
@@ -14,6 +14,7 @@ use crate::components::status_bar::{
 };
 use crate::components::tools_modal::ToolsModalContext;
 use crate::components::usage_modal::UsageModalContext;
+use crate::components::{Overlay, hover_style};
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
 use crate::update;
@@ -55,6 +56,13 @@ struct ViewLayout {
     bottom_takeover: bool,
 }
 
+/// The overlay drawn last, so on top: where it is, and the docs it links to.
+#[derive(Default)]
+struct Topmost {
+    rect: Rect,
+    topic: Option<DocsTopic>,
+}
+
 impl App {
     /// Recording brackets the whole draw, so anything painted after
     /// `caudra_grab::end_frame` is invisible to the grab hit test. The grab
@@ -91,13 +99,26 @@ impl App {
             height: layout.status_area.y.saturating_sub(frame.area().y),
             ..frame.area()
         };
-        let mut overlay_rect = self.render_picker_overlays(frame, layout.msg_area, above_footer);
+        let below = self.render_picker_overlays(frame, layout.msg_area, above_footer);
         self.render_status_bar(frame, layout.status_area, render_chat);
-        overlay_rect = self.render_top_modals(frame, overlay_rect);
-        self.register_zones(&layout, overlay_rect);
+        let topmost = self.render_top_modals(frame, below);
+        self.register_zones(&layout, topmost.rect);
+        self.render_docs_badge(frame, &topmost);
         self.apply_selection(frame, render_chat);
         self.render_autoscroll_origin(frame);
         self.render_tooltip(frame);
+    }
+
+    /// The `?` on the topmost modal's border. Where it landed is kept for the
+    /// click, the tooltip and `F1`, so all three answer for the modal on top.
+    fn render_docs_badge(&mut self, frame: &mut Frame, topmost: &Topmost) {
+        self.docs_badge = topmost.topic.zip(docs_link::badge_area(topmost.rect));
+        let Some((_, area)) = self.docs_badge else {
+            return;
+        };
+        let hovered = self.tooltip.pointer().is_some_and(|at| area.contains(at));
+        let style = hover_style(theme::current().panel_title, hovered);
+        frame.render_widget(Span::styled(docs_link::BADGE, style), area);
     }
 
     fn render_autoscroll_origin(&self, frame: &mut Frame) {
@@ -142,13 +163,14 @@ impl App {
         self.render_status_bar(frame, status, render_chat);
 
         let prompt = self.render_workbench_prompt(frame, body);
-        let mut overlay_rect = self.render_picker_overlays(frame, body, frame.area());
-        overlay_rect = self.render_top_modals(frame, overlay_rect);
-        for rect in [prompt, overlay_rect] {
+        let below = self.render_picker_overlays(frame, body, frame.area());
+        let topmost = self.render_top_modals(frame, below);
+        for rect in [prompt, topmost.rect] {
             if rect.width > 0 {
                 self.zones.push_overlay(rect);
             }
         }
+        self.render_docs_badge(frame, &topmost);
         self.render_tooltip(frame);
     }
 
@@ -524,11 +546,12 @@ impl App {
     /// `full` is what a picker may cover. The transcript view keeps its footer
     /// out of it, since the footer draws last and would hide whatever a picker
     /// put in its rows.
-    fn render_picker_overlays(&mut self, frame: &mut Frame, msg_area: Rect, full: Rect) -> Rect {
+    fn render_picker_overlays(&mut self, frame: &mut Frame, msg_area: Rect, full: Rect) -> Topmost {
         if self.permission_prompt.is_open() {
-            return Rect::default();
+            return Topmost::default();
         }
         let mut overlay_rect = Rect::default();
+        let mut topic = None;
 
         if self.search_modal.is_open() {
             let area = match self.search_modal.tab().searches_history() {
@@ -536,16 +559,19 @@ impl App {
                 false => msg_area,
             };
             overlay_rect = self.search_modal.view(frame, area);
+            topic = self.search_modal.docs_topic();
         }
 
         if self.file_picker.is_open() {
             overlay_rect = self.file_picker.view(frame, full);
+            topic = self.file_picker.docs_topic();
         }
 
         macro_rules! render_if_open {
             ($overlay:expr) => {
                 if $overlay.is_open() {
                     overlay_rect = $overlay.view(frame, full);
+                    topic = $overlay.docs_topic();
                 }
             };
         }
@@ -578,6 +604,7 @@ impl App {
             overlay_rect = self
                 .automation_inspector
                 .view(frame, full, self.workflow.runs());
+            topic = self.automation_inspector.docs_topic();
         }
         render_if_open!(self.session_picker);
         render_if_open!(self.session_relocation_picker);
@@ -588,22 +615,40 @@ impl App {
             render_if_open!(self.mode_submission);
         }
 
-        overlay_rect
+        Topmost {
+            rect: overlay_rect,
+            topic,
+        }
     }
 
-    fn render_top_modals(&mut self, frame: &mut Frame, mut overlay_rect: Rect) -> Rect {
+    /// The docs draw above every modal but the chord list, since a `?` on any
+    /// of them opens the docs over it and closing them returns there.
+    fn render_top_modals(&mut self, frame: &mut Frame, below: Topmost) -> Topmost {
         if self.permission_prompt.is_open() {
-            return overlay_rect;
+            return below;
         }
+        let Topmost {
+            rect: mut overlay_rect,
+            mut topic,
+        } = below;
         let full = frame.area();
-        let r = self.stream_modal.view(frame, full);
-        if r.width > 0 {
-            overlay_rect = r;
+        macro_rules! claim {
+            ($rect:expr, topic: $topic:expr) => {{
+                let r = $rect;
+                if r.width > 0 {
+                    overlay_rect = r;
+                    topic = $topic;
+                }
+            }};
+            ($rect:expr, $overlay:expr) => {
+                claim!($rect, topic: $overlay.docs_topic())
+            };
         }
-        let r = self.help_modal.view(frame, full, self.features);
-        if r.width > 0 {
-            overlay_rect = r;
-        }
+        claim!(self.stream_modal.view(frame, full), self.stream_modal);
+        claim!(
+            self.help_modal.view(frame, full, self.features),
+            self.help_modal
+        );
         if self.usage_modal.is_open() {
             let scope = self.usage_modal.scope();
             let ctx = UsageModalContext {
@@ -623,36 +668,21 @@ impl App {
                     .filter(|(loaded, _)| *loaded == scope)
                     .map(|(_, summary)| summary),
             };
-            let r = self.usage_modal.view(frame, full, &ctx);
-            if r.width > 0 {
-                overlay_rect = r;
-            }
+            claim!(self.usage_modal.view(frame, full, &ctx), self.usage_modal);
         }
         if self.logs_modal.is_open() {
             let theme = crate::theme::current();
-            let r = self.logs_modal.view(frame, full, &theme);
-            if r.width > 0 {
-                overlay_rect = r;
-            }
-        }
-        if self.docs_modal.is_open() {
-            let r = self.docs_modal.view(frame, full);
-            if r.width > 0 {
-                overlay_rect = r;
-            }
+            claim!(self.logs_modal.view(frame, full, &theme), self.logs_modal);
         }
         if self.changelog_modal.is_open() {
-            let r = self.changelog_modal.view(frame, full);
-            if r.width > 0 {
-                overlay_rect = r;
-            }
+            claim!(self.changelog_modal.view(frame, full), self.changelog_modal);
         }
         if self.context_modal.is_open() {
             let snapshot = self.context_snapshot.get();
-            let r = self.context_modal.view(frame, full, snapshot);
-            if r.width > 0 {
-                overlay_rect = r;
-            }
+            claim!(
+                self.context_modal.view(frame, full, snapshot),
+                self.context_modal
+            );
         }
         if self.tools_modal.is_open() {
             let ctx = ToolsModalContext {
@@ -661,41 +691,32 @@ impl App {
                 session: self.state.session.tool_usage(),
                 recorded: self.tool_stats.as_ref(),
             };
-            let r = self.tools_modal.view(frame, full, &ctx);
-            if r.width > 0 {
-                overlay_rect = r;
-            }
+            claim!(self.tools_modal.view(frame, full, &ctx), self.tools_modal);
         }
         if self.decisions_modal.is_open() {
-            let r = self.view_decisions_modal(frame, full);
-            if r.width > 0 {
-                overlay_rect = r;
-            }
+            claim!(self.view_decisions_modal(frame, full), self.decisions_modal);
         }
         if self.skills_modal.is_open() {
             let snapshot = self.context_snapshot.get();
-            let r = self.skills_modal.view(frame, full, snapshot);
-            if r.width > 0 {
-                overlay_rect = r;
-            }
+            claim!(
+                self.skills_modal.view(frame, full, snapshot),
+                self.skills_modal
+            );
         }
         if self.storage_modal.is_open() {
-            let r = self.storage_modal.view(frame, full);
-            if r.width > 0 {
-                overlay_rect = r;
-            }
+            claim!(self.storage_modal.view(frame, full), self.storage_modal);
         }
         if self.system_prompt_modal.is_open() {
-            let r = self.system_prompt_modal.view(frame, full);
-            if r.width > 0 {
-                overlay_rect = r;
-            }
+            claim!(
+                self.system_prompt_modal.view(frame, full),
+                self.system_prompt_modal
+            );
         }
         if self.projection_modal.is_open() {
-            let r = self.projection_modal.view(frame, full);
-            if r.width > 0 {
-                overlay_rect = r;
-            }
+            claim!(
+                self.projection_modal.view(frame, full),
+                self.projection_modal
+            );
         }
         if self.goal_panel.is_open() {
             let status = self.state.goal.status();
@@ -706,39 +727,28 @@ impl App {
                 evaluator: evaluator.as_ref(),
                 continuation_limit: self.state.goal.continuation_limit(),
             };
-            let r = self.goal_panel.view(frame, full, &content);
-            if r.width > 0 {
-                overlay_rect = r;
-            }
+            claim!(self.goal_panel.view(frame, full, &content), self.goal_panel);
         }
         if self.autopilot_panel.is_open() {
-            let r = self.draw_autopilot_panel(frame, full);
-            if r.width > 0 {
-                overlay_rect = r;
-            }
+            claim!(self.draw_autopilot_panel(frame, full), self.autopilot_panel);
         }
-        let r = self.float_mgr.view(frame, full);
-        if r.width > 0 {
-            overlay_rect = r;
-        }
+        claim!(self.float_mgr.view(frame, full), self.float_mgr);
         if self.peer_manager.is_open() {
             overlay_rect = self.peer_manager.view(frame, full);
+            topic = self.peer_manager.docs_topic();
         }
-        let r = self.paste_editor.view(frame, full);
-        if r.width > 0 {
-            overlay_rect = r;
-        }
-        let r = self.image_viewer.view(frame, full);
-        if r.width > 0 {
-            overlay_rect = r;
+        claim!(self.paste_editor.view(frame, full), self.paste_editor);
+        claim!(self.image_viewer.view(frame, full), self.image_viewer);
+        if self.docs_modal.is_open() {
+            claim!(self.docs_modal.view(frame, full), self.docs_modal);
         }
         // Last, so a pending chord's list sits over whatever it was armed on.
         let chords = keybindings::leader_chords(&self.leader_contexts(), self.features);
-        let r = self.which_key.view(frame, full, &chords);
-        if r.width > 0 {
-            overlay_rect = r;
+        claim!(self.which_key.view(frame, full, &chords), topic: None);
+        Topmost {
+            rect: overlay_rect,
+            topic,
         }
-        overlay_rect
     }
 
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect, render_chat: usize) {

@@ -70,6 +70,27 @@ fn autoscroll_rows(distance: i32) -> i32 {
 
 impl App {
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> Vec<Action> {
+        let at = Position::new(event.column, event.row);
+        if self.docs_holds_input() && !self.leader_holds_pointer() {
+            self.clear_control_hovers();
+            if event.kind == MouseEventKind::Down(MouseButton::Left)
+                && !self.docs_modal.contains(at)
+            {
+                self.docs_modal.close();
+                return Vec::new();
+            }
+            let action = self.docs_modal.handle_mouse(event);
+            return self.handle_docs_action(action);
+        }
+        if event.kind == MouseEventKind::Down(MouseButton::Left)
+            && !self.permission_prompt_holds_input()
+            && let Some((topic, area)) = self.docs_badge
+            && area.contains(at)
+        {
+            self.clear_control_hovers();
+            self.open_docs(topic);
+            return Vec::new();
+        }
         if self.mode_submission.is_open()
             && !self.permission_prompt_holds_input()
             && !self.question_form.is_open()
@@ -88,7 +109,6 @@ impl App {
             self.handle_sandbox_action(action);
             return Vec::new();
         }
-        let at = Position::new(event.column, event.row);
         #[cfg(debug_assertions)]
         if let Some(actions) = self.handle_grab_mouse(event) {
             return actions;
@@ -231,11 +251,6 @@ impl App {
             let action = self.logs_modal.handle_mouse(event);
             self.handle_logs_action(action);
             return Vec::new();
-        }
-        if self.docs_modal.is_open() && !self.permission_prompt_holds_input() {
-            self.clear_control_hovers();
-            let action = self.docs_modal.handle_mouse(event);
-            return self.handle_docs_action(action);
         }
         if self.changelog_modal.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
@@ -991,6 +1006,10 @@ impl App {
     }
 
     pub(super) fn handle_scroll(&mut self, column: u16, row: u16, delta: i32) {
+        if self.docs_holds_input() {
+            self.docs_modal.scroll_at(Position::new(column, row), delta);
+            return;
+        }
         if self.sandbox_manager.is_open() {
             self.sandbox_manager
                 .scroll_at(Position::new(column, row), delta);
@@ -1483,7 +1502,6 @@ impl App {
         dismiss!(self.help_modal);
         dismiss!(self.usage_modal);
         dismiss!(self.logs_modal);
-        dismiss!(self.docs_modal);
         dismiss!(
             self.changelog_modal,
             self.handle_changelog_action(self.changelog_modal.close_action())

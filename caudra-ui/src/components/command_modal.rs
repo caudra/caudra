@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::components::command::{CommandRow, ParsedCommand};
+use crate::components::docs_link::DocsTopic;
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction};
 use crate::components::modal::Modal;
@@ -278,6 +279,10 @@ impl CommandModal {
 }
 
 impl Overlay for CommandModal {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Commands)
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

@@ -15,6 +15,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use std::time::Duration;
 
+use crate::components::docs_link::{BADGE_COLUMNS, DocsTopic};
 use crate::components::keybindings::key;
 use crate::components::modal::{CHROME_LINES, Modal};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
@@ -281,7 +282,7 @@ pub struct ToolsModalContext<'a> {
 fn hint_area(popup: Rect) -> Rect {
     let width = (key::SCOPE.label.len() + ToolsScope::Global.hint().len()) as u16;
     Rect {
-        x: popup.x + popup.width.saturating_sub(width + 1),
+        x: popup.x + popup.width.saturating_sub(width + 1 + BADGE_COLUMNS),
         y: popup.y,
         width,
         height: 1,
@@ -302,6 +303,10 @@ impl Default for ToolsModal {
 }
 
 impl Overlay for ToolsModal {
+    fn docs_topic(&self) -> Option<DocsTopic> {
+        Some(DocsTopic::Tools)
+    }
+
     fn is_open(&self) -> bool {
         self.open
     }
