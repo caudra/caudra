@@ -1386,9 +1386,13 @@ pub fn interleaved_history_to_display(
                 let static_name = name.as_str();
                 let reg = ToolRegistry::global();
                 let entry = reg.get(name);
-                let effect = entry.as_ref().map_or(ToolEffect::Unknown, |e| e.effect);
                 let tool_call: Option<Box<dyn ToolInvocation>> =
-                    entry.and_then(|entry| entry.try_parse(input));
+                    entry.as_ref().and_then(|entry| entry.try_parse(input));
+                let effect = entry.as_ref().map_or(ToolEffect::Unknown, |entry| {
+                    tool_call
+                        .as_deref()
+                        .map_or(entry.effect, |call| entry.effect_for(call))
+                });
                 let summary = reg.resolve_header(name, input);
                 let result = results.get(call_id.as_str());
                 let (status, result_text) = result

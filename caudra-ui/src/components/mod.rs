@@ -1545,6 +1545,12 @@ impl ToolRole {
     pub fn is_collapsible(&self) -> bool {
         is_collapsible(self.effect, &self.name)
     }
+
+    /// A call whose card is the only record of what it changed, which a shell
+    /// command is not: its header names it in full.
+    pub fn is_write(&self) -> bool {
+        self.effect == ToolEffect::Mutating && !self.is_collapsible()
+    }
 }
 
 /// Whether a call can be put away behind its header without losing the record
@@ -1611,6 +1617,13 @@ impl DisplayRole {
     pub fn tool_name(&self) -> Option<&str> {
         match self {
             DisplayRole::Tool(t) => Some(&t.name),
+            _ => None,
+        }
+    }
+
+    pub fn tool_effect(&self) -> Option<ToolEffect> {
+        match self {
+            DisplayRole::Tool(t) => Some(t.effect),
             _ => None,
         }
     }

@@ -170,9 +170,11 @@ version = 1
 
 # Tools whose card never opens on its own: the call stays a single row in every
 # view mode until you click it. A server-qualified name still matches, so
-# `file_read` also covers `mcp_File_read`. Set to `[]` to opt out.
+# `file_read` also covers `mcp_File_read`. `memory_read` covers the `memory`
+# tool's view, zoom, search, and read calls and leaves its writes open, while
+# `memory` covers all of them. Set to `[]` to opt out.
 # Type: string[].
-# always_collapsed = ["file_read", "file_glob", "file_grep", "file_index", "webfetch"]
+# always_collapsed = ["file_read", "file_glob", "file_grep", "file_index", "webfetch", "source_code_context", "source_code_refs", "memory_read"]
 
 # Maximum visible input lines.
 # Type: u32, at least 1.

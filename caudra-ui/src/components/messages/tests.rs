@@ -28,9 +28,9 @@ use caudra_agent::tools::{
 };
 use caudra_agent::{
     ActivityChild, GrepFileEntry, GrepMatchGroup, McpBlock, McpHelper, McpOutput, McpServerKind,
-    NO_FILES_FOUND, SearchCap, ShellFilterInfo, ShellOutput, SkillOutput, SnapshotLine,
-    SnapshotSpan, SourceCodeGraphRow, SpanStyle, SubagentActivity, SubagentProgress,
-    ToolAccounting, ToolInput, ToolOutput,
+    MemoryNote, MemoryOrigin, MemoryOutput, NO_FILES_FOUND, SearchCap, ShellFilterInfo,
+    ShellOutput, SkillOutput, SnapshotLine, SnapshotSpan, SourceCodeGraphRow, SpanStyle,
+    SubagentActivity, SubagentProgress, ToolAccounting, ToolInput, ToolOutput,
 };
 use caudra_providers::{PeerAudience, PeerMessageOrigin};
 use caudra_storage::background::ShellJobMetadata;
@@ -875,11 +875,17 @@ const COMMIT_UNIX_SECONDS: i64 = 1_700_003_600;
 const COMMIT_MISSED: &str = "the pointer sat on a commit the panel did not resolve";
 const COMMIT_CLAIMED: &str = "a message the reader did not write answered with a commit";
 const COMMIT_MARKED_GLYPHS: &str = "a hovered commit repainted the message around it";
-/// A read-only tool the `always_collapsed` default deliberately leaves out, so
-/// a card built on it answers the view mode rather than the reader's collapse
-/// list. It shares `file_grep`'s row budget, so a test that moved off grep to
-/// keep testing disclosure rests at the same number of rows it always did.
+/// A read-only tool the `always_collapsed` default does not list, so a card
+/// built on it answers the view mode rather than the reader's collapse list.
+/// Made up, so a tool joining the default list cannot quietly change what the
+/// tests on it measure. It rests at the `other` budget, the same number of
+/// rows as `file_grep`'s, so a test that moved off grep to keep testing
+/// disclosure rests where it always did.
+const UNLISTED_READ_TOOL: &str = "symbol_lookup";
 const SOURCE_CODE_REFS_TOOL_NAME: &str = "source_code_refs";
+/// A native read-only tool the default list leaves out, for the tests that
+/// need the sigil and label a native tool draws in its header.
+const NATIVE_UNLISTED_READ_TOOL: &str = "websearch";
 const TOOL_ID: &str = "t1";
 const WORKFLOW_TOOL_ID: &str = "workflow:run-1";
 const WORKFLOW_RUN_ID: &str = "run-1";
@@ -986,7 +992,9 @@ fn effect_of(tool: &str) -> ToolEffect {
         | FILE_GREP_TOOL_NAME
         | FILE_GLOB_TOOL_NAME
         | FILE_INDEX_TOOL_NAME
+        | UNLISTED_READ_TOOL
         | SOURCE_CODE_REFS_TOOL_NAME
+        | NATIVE_UNLISTED_READ_TOOL
         | VIEW_IMAGE_TOOL_NAME
         | TOOL_OUTPUT_TOOL_NAME => ToolEffect::ReadOnly,
         BATCH_TOOL_NAME | TASK_TOOL_NAME => ToolEffect::Orchestrator,
@@ -3378,11 +3386,14 @@ fn collapsed_tool_copies_only_its_visible_header() {
 
 #[test]
 fn open_tool_copies_its_visible_body() {
-    let mut panel = panel_with_copyable_tool(SOURCE_CODE_REFS_TOOL_NAME, ViewMode::Expanded);
+    let mut panel = panel_with_copyable_tool(UNLISTED_READ_TOOL, ViewMode::Expanded);
 
     let copied = extract_entire_document(&mut panel);
 
-    assert!(copied.contains("## Tool: `source_code_refs`"), "{copied}");
+    assert!(
+        copied.contains(&format!("## Tool: `{UNLISTED_READ_TOOL}`")),
+        "{copied}"
+    );
     assert!(copied.contains("Status: success | View: open"), "{copied}");
     assert!(copied.contains("hidden tool output"), "{copied}");
 }
@@ -3568,7 +3579,7 @@ fn title_only_open_streaming_thinking_still_copies_its_header() {
 
 #[test]
 fn cross_message_copy_does_not_restore_truncated_tool_output() {
-    let mut panel = panel_with_long_tool(SOURCE_CODE_REFS_TOOL_NAME, 200);
+    let mut panel = panel_with_long_tool(UNLISTED_READ_TOOL, 200);
     panel.set_view(ViewMode::Expanded);
     render(&mut panel, 80, 24);
     panel.push(DisplayMessage::new(
@@ -3578,7 +3589,10 @@ fn cross_message_copy_does_not_restore_truncated_tool_output() {
 
     let copied = extract_entire_document(&mut panel);
 
-    assert!(copied.contains("## Tool: `source_code_refs`"), "{copied}");
+    assert!(
+        copied.contains(&format!("## Tool: `{UNLISTED_READ_TOOL}`")),
+        "{copied}"
+    );
     assert!(copied.contains("line 0"), "{copied}");
     assert!(!copied.contains("line 50"), "{copied}");
 }
@@ -3780,7 +3794,7 @@ fn panel_with_long_tool(tool: &'static str, line_count: usize) -> MessagesPanel 
 
 #[test]
 fn toggle_expand_collapse_truncated_tool() {
-    let mut panel = panel_with_long_tool(SOURCE_CODE_REFS_TOOL_NAME, 200);
+    let mut panel = panel_with_long_tool(UNLISTED_READ_TOOL, 200);
     panel.set_view(ViewMode::Expanded);
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
@@ -3938,7 +3952,7 @@ fn shell_live_output_uses_the_larger_running_budget_and_survives_completion() {
 
 #[test]
 fn native_tool_hover_reverses_only_the_expand_affordance_without_mutating_cache() {
-    let mut panel = panel_with_long_tool(SOURCE_CODE_REFS_TOOL_NAME, 200);
+    let mut panel = panel_with_long_tool(UNLISTED_READ_TOOL, 200);
     let area = Rect::new(0, 0, 80, 24);
     let source = panel.messages[0].text.clone();
     let cached = panel.cache.find_by_tool_id("t1").and_then(|index| {
@@ -3979,9 +3993,9 @@ fn native_tool_hover_reverses_only_the_expand_affordance_without_mutating_cache(
 #[test]
 fn expanded_native_tool_hover_accents_header_and_rail_not_body() {
     const HEIGHT: u16 = 240;
-    const TRACE_LABEL: &str = "Traced";
+    const SEARCH_LABEL: &str = "Searched";
 
-    let mut panel = panel_with_long_tool(SOURCE_CODE_REFS_TOOL_NAME, 200);
+    let mut panel = panel_with_long_tool(NATIVE_UNLISTED_READ_TOOL, 200);
     panel.set_view(ViewMode::Expanded);
     let area = Rect::new(0, 0, 80, HEIGHT);
     render(&mut panel, area.width, area.height);
@@ -3992,7 +4006,7 @@ fn expanded_native_tool_hover_accents_header_and_rail_not_body() {
     let terminal = render(&mut panel, area.width, area.height);
     let buffer = terminal.backend().buffer();
     let rail = buffer.cell((area.x, area.y)).unwrap().style();
-    let header = style_of(&terminal, TRACE_LABEL);
+    let header = style_of(&terminal, SEARCH_LABEL);
 
     assert_eq!(header.fg, rail.fg, "header and rail share the hover accent");
     assert!(
@@ -4298,43 +4312,46 @@ fn a_stored_call_to_a_retired_code_tool_still_renders() {
     let text = buffer_text(&render(&mut panel, 80, 24));
     assert!(text.contains(RETIRED_TOOL), "{text}");
     assert!(text.contains(NEIGHBOUR), "{text}");
-    assert!(text.contains(BODY_LINE), "{GRAPH_WHOLE_MSG}: {text}");
+
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.toggle_expansion_at(area.y, area));
+    let opened = buffer_text(&render(&mut panel, 80, 24));
+    assert!(opened.contains(BODY_LINE), "{opened}");
 }
 
 const GRAPH_ROWS: usize = 8;
 const GRAPH_LAST_ROW: &str = "symbol_8";
-const GRAPH_WHOLE_MSG: &str = "a source graph card rests whole, every row of it, even after a \
-    newer call replaced it; only compact folds it";
-const GRAPH_CLOSES_MSG: &str = "a click on a whole source graph card takes it back to its header";
-const GRAPH_REOPENS_MSG: &str = "the next click opens the source graph card whole again";
+const GRAPH_ROW_MSG: &str =
+    "a source graph card rests as its row in every view, the way a file read does";
+const GRAPH_OPENS_WHOLE_MSG: &str =
+    "a click on the row opens the source graph whole, every row of it";
+const GRAPH_CLOSES_MSG: &str = "the next click takes the source graph card back to its row";
 
-#[test_case(ViewMode::Auto, true ; "auto")]
-#[test_case(ViewMode::Expanded, true ; "expanded")]
-#[test_case(ViewMode::Compact, false ; "compact")]
-fn a_source_code_graph_card_rests_whole(view: ViewMode, whole: bool) {
+/// The reported click: a source graph card that rested whole could not be
+/// folded from its title bar in expanded, where no card has a row of its own.
+#[test_case(ViewMode::Auto ; "auto")]
+#[test_case(ViewMode::Expanded ; "expanded")]
+#[test_case(ViewMode::Compact ; "compact")]
+fn a_source_code_graph_card_opens_and_folds_like_a_file_read(view: ViewMode) {
     let mut panel = panel_with_map_tool(GRAPH_ROWS);
     panel.set_view(view);
-    panel.tool_start(start(LATER_TOOL_ID, FILE_WRITE_TOOL_NAME));
-    panel.tool_done(done(LATER_TOOL_ID));
-    rebuild(&mut panel);
-
-    let text = seg_text(&panel, "t1");
-    assert_eq!(
-        text.contains(GRAPH_LAST_ROW) && !text.contains(TRUNCATION_PREFIX),
-        whole,
-        "{GRAPH_WHOLE_MSG}: {text:?}"
-    );
-}
-
-#[test]
-fn a_click_closes_a_whole_source_graph_card_and_the_next_opens_it_whole() {
-    let mut panel = panel_with_map_tool(GRAPH_ROWS);
-    panel.set_view(ViewMode::Auto);
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.card_closed("t1"), "{GRAPH_ROW_MSG}");
     assert!(
-        seg_text(&panel, "t1").contains(GRAPH_LAST_ROW),
-        "{GRAPH_WHOLE_MSG}"
+        !seg_text(&panel, "t1").contains(GRAPH_LAST_ROW),
+        "{GRAPH_ROW_MSG}"
+    );
+
+    assert!(
+        panel.toggle_expansion_at(area.y, area),
+        "{GRAPH_OPENS_WHOLE_MSG}"
+    );
+    render(&mut panel, 80, 24);
+    let text = seg_text(&panel, "t1");
+    assert!(
+        text.contains(GRAPH_LAST_ROW) && !text.contains(TRUNCATION_PREFIX),
+        "{GRAPH_OPENS_WHOLE_MSG}: {text:?}"
     );
 
     assert!(
@@ -4343,16 +4360,112 @@ fn a_click_closes_a_whole_source_graph_card_and_the_next_opens_it_whole() {
     );
     render(&mut panel, 80, 24);
     assert!(panel.card_closed("t1"), "{GRAPH_CLOSES_MSG}");
+}
+
+const MEMORY_NOTE_LINES: usize = 20;
+const MEMORY_LAST_LINE: &str = "note line 19";
+const MEMORY_READ_ROW_MSG: &str =
+    "a memory read rests as its row in every view, the way a file read does";
+const MEMORY_READ_OPENS_MSG: &str = "a click on a memory read's row opens every note it found";
+const MEMORY_READ_CLOSES_MSG: &str = "the next click takes the memory read back to its row";
+const MEMORY_WRITE_WHOLE_MSG: &str =
+    "a memory write draws the whole note it stored, the way a file write draws the whole file";
+const MEMORY_WRITE_CLOSES_MSG: &str =
+    "a click on a memory write's title folds it, expanded included";
+const MEMORY_WRITE_REOPENS_MSG: &str = "the next click opens the memory write whole again";
+
+fn memory_note_body() -> String {
+    (0..MEMORY_NOTE_LINES)
+        .map(|i| format!("note line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// One `memory` call, stamped with the effect the call itself reports, since
+/// the one tool both reads and writes.
+fn memory_panel(view: ViewMode, effect: ToolEffect, output: ToolOutput) -> MessagesPanel {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(view);
+    panel.tool_start(ToolStartEvent {
+        effect,
+        ..start(TOOL_ID, MEMORY_TOOL_NAME)
+    });
+    panel.tool_done(ToolDoneEvent {
+        tool: MEMORY_TOOL_NAME.into(),
+        output,
+        ..done(TOOL_ID)
+    });
+    render(&mut panel, 80, 60);
+    panel
+}
+
+fn shows_whole_note(panel: &MessagesPanel) -> bool {
+    let text = seg_text(panel, TOOL_ID);
+    text.contains(MEMORY_LAST_LINE) && !text.contains(TRUNCATION_PREFIX)
+}
+
+#[test_case(ViewMode::Auto ; "auto")]
+#[test_case(ViewMode::Expanded ; "expanded")]
+#[test_case(ViewMode::Compact ; "compact")]
+fn a_memory_read_opens_and_folds_like_a_file_read(view: ViewMode) {
+    let output = ToolOutput::Memory(MemoryOutput::Notes {
+        directory: None,
+        notes: Vec::from([MemoryNote {
+            name: "architecture.md".into(),
+            tokens: 1,
+            tags: Vec::new(),
+            origin: MemoryOrigin::File {
+                path: "architecture.md".into(),
+            },
+            body: memory_note_body(),
+        }]),
+        notices: Vec::new(),
+    });
+    let mut panel = memory_panel(view, ToolEffect::ReadOnly, output);
+    let area = Rect::new(0, 0, 80, 60);
+    assert!(panel.card_closed(TOOL_ID), "{MEMORY_READ_ROW_MSG}");
 
     assert!(
         panel.toggle_expansion_at(area.y, area),
-        "{GRAPH_REOPENS_MSG}"
+        "{MEMORY_READ_OPENS_MSG}"
     );
-    render(&mut panel, 80, 24);
+    render(&mut panel, 80, 60);
+    assert!(shows_whole_note(&panel), "{MEMORY_READ_OPENS_MSG}");
+
     assert!(
-        seg_text(&panel, "t1").contains(GRAPH_LAST_ROW),
-        "{GRAPH_REOPENS_MSG}"
+        panel.toggle_expansion_at(area.y, area),
+        "{MEMORY_READ_CLOSES_MSG}"
     );
+    render(&mut panel, 80, 60);
+    assert!(panel.card_closed(TOOL_ID), "{MEMORY_READ_CLOSES_MSG}");
+}
+
+/// Compact folds a write like every other card, so its first click opens it
+/// and the next folds it again: the same two states, the other way round.
+#[test_case(ViewMode::Auto, true ; "auto")]
+#[test_case(ViewMode::Expanded, true ; "expanded")]
+#[test_case(ViewMode::Compact, false ; "compact")]
+fn a_memory_write_opens_whole_and_folds_on_a_title_click(view: ViewMode, rests_open: bool) {
+    let output = ToolOutput::Markdown(memory_note_body().into());
+    let mut panel = memory_panel(view, ToolEffect::Mutating, output);
+    let area = Rect::new(0, 0, 80, 60);
+    assert_eq!(
+        shows_whole_note(&panel),
+        rests_open,
+        "{MEMORY_WRITE_WHOLE_MSG}"
+    );
+
+    for open in [!rests_open, rests_open] {
+        let msg = if open {
+            MEMORY_WRITE_REOPENS_MSG
+        } else {
+            MEMORY_WRITE_CLOSES_MSG
+        };
+        assert!(panel.toggle_expansion_at(area.y, area), "{msg}");
+        render(&mut panel, 80, 60);
+        assert_eq!(panel.card_closed(TOOL_ID), !open, "{msg}");
+        assert_eq!(shows_whole_note(&panel), open, "{msg}");
+    }
 }
 
 fn buffer_text(terminal: &ratatui::Terminal<TestBackend>) -> String {
@@ -7139,7 +7252,7 @@ fn a_dense_call_keeps_the_card_background(view: ViewMode) {
 fn an_expanded_one_line_call_stays_flat() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.set_view(ViewMode::Expanded);
-    panel.tool_start(call_with_summary("t1", SOURCE_CODE_REFS_TOOL_NAME));
+    panel.tool_start(call_with_summary("t1", UNLISTED_READ_TOOL));
     let terminal = render(&mut panel, WIDE_ENOUGH_TO_NOT_WRAP, 24);
 
     assert_eq!(
@@ -7219,10 +7332,10 @@ fn a_wrapped_row_takes_air_from_the_rows_around_it(view: ViewMode) {
 /// not run into the dense rows above it.
 #[test]
 fn the_card_auto_opens_separates_from_the_list_above_it() {
-    let mut panel = panel_with_tools(&[("t1", SOURCE_CODE_REFS_TOOL_NAME)]);
+    let mut panel = panel_with_tools(&[("t1", UNLISTED_READ_TOOL)]);
     panel.set_view(ViewMode::Auto);
     panel.tool_done(done("t1"));
-    panel.tool_start(start("t2", SOURCE_CODE_REFS_TOOL_NAME));
+    panel.tool_start(start("t2", UNLISTED_READ_TOOL));
     panel.tool_done(long_done("t2", HELD_BODY_LINES));
     render(&mut panel, WIDE_ENOUGH_TO_NOT_WRAP, 24);
 
@@ -7540,7 +7653,7 @@ fn a_truncated_compact_row_cycles_back_to_its_header() {
 
 #[test]
 fn an_expanded_row_stays_put_when_it_has_nothing_left_to_open() {
-    let mut panel = compact_panel(&[("t1", SOURCE_CODE_REFS_TOOL_NAME)]);
+    let mut panel = compact_panel(&[("t1", UNLISTED_READ_TOOL)]);
     panel.set_view(ViewMode::Expanded);
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
@@ -7847,9 +7960,9 @@ fn live_thinking_duration_always_keeps_tenths(duration: Duration, expected: &str
 fn expanded_density_keeps_the_sigil_and_the_card() {
     // The spinner's slot is held blank once the call lands, so the sigil sits
     // in the column it occupied while the call ran.
-    const CARD_HEADER: &str = "  ◇ Traced ";
+    const CARD_HEADER: &str = "  ◈ Searched ";
 
-    let mut panel = panel_with_tools(&[("t1", SOURCE_CODE_REFS_TOOL_NAME)]);
+    let mut panel = panel_with_tools(&[("t1", NATIVE_UNLISTED_READ_TOOL)]);
     panel.set_view(ViewMode::Expanded);
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
@@ -7883,9 +7996,9 @@ fn mode_panel(view: ViewMode, ids: &[(&str, &'static str)]) -> MessagesPanel {
 /// call that wrote something keeps its body, or the transcript stops showing
 /// what happened to the workspace. Compact is the one mode that answers for
 /// every tool, because a list with the writes still drawn is not a list.
-#[test_case(ViewMode::Expanded, SOURCE_CODE_REFS_TOOL_NAME, true; "expanded opens a trace")]
-#[test_case(ViewMode::Compact, SOURCE_CODE_REFS_TOOL_NAME, false; "compact closes a trace")]
-#[test_case(ViewMode::Auto, SOURCE_CODE_REFS_TOOL_NAME, true; "auto opens the newest trace")]
+#[test_case(ViewMode::Expanded, UNLISTED_READ_TOOL, true; "expanded opens a trace")]
+#[test_case(ViewMode::Compact, UNLISTED_READ_TOOL, false; "compact closes a trace")]
+#[test_case(ViewMode::Auto, UNLISTED_READ_TOOL, true; "auto opens the newest trace")]
 #[test_case(ViewMode::Expanded, FILE_WRITE_TOOL_NAME, true; "expanded opens a write")]
 #[test_case(ViewMode::Compact, FILE_WRITE_TOOL_NAME, false; "compact closes a write too")]
 #[test_case(ViewMode::Auto, FILE_WRITE_TOOL_NAME, true; "auto still opens a write")]
@@ -7981,7 +8094,7 @@ fn an_mcp_card_rests_whole(view: ViewMode, whole: bool) {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.set_view(view);
     mcp_call(&mut panel, TOOL_ID, None);
-    panel.tool_start(start(LATER_TOOL_ID, SOURCE_CODE_REFS_TOOL_NAME));
+    panel.tool_start(start(LATER_TOOL_ID, UNLISTED_READ_TOOL));
     panel.tool_done(done(LATER_TOOL_ID));
     rebuild(&mut panel);
 
@@ -8026,7 +8139,7 @@ const COMPACT_KEEPS_BATCH_MSG: &str = "a folded batch says nothing at all, so it
 #[test_case(PYTHON_EXECUTION_TOOL_NAME, false ; "isolated")]
 #[test_case(TASK_TOOL_NAME, false ; "orchestrator")]
 #[test_case(UNCLASSIFIED_TOOL, false ; "unclassified")]
-#[test_case(SOURCE_CODE_REFS_TOOL_NAME, false ; "read only")]
+#[test_case(UNLISTED_READ_TOOL, false ; "read only")]
 #[test_case(BATCH_TOOL_NAME, true ; "a batch is the exception")]
 fn compact_folds_every_call_but_a_batch(tool: &'static str, open: bool) {
     let panel = mode_panel(ViewMode::Compact, &[("t1", tool)]);
@@ -8076,7 +8189,7 @@ fn one_click_opens_the_whole_body(view: ViewMode) {
 /// way back out of a full body is the resting budget.
 #[test]
 fn a_full_card_in_expanded_falls_back_to_the_budget() {
-    let mut panel = panel_with_tools(&[("t1", SOURCE_CODE_REFS_TOOL_NAME)]);
+    let mut panel = panel_with_tools(&[("t1", UNLISTED_READ_TOOL)]);
     panel.set_view(ViewMode::Expanded);
     panel.tool_done(long_done("t1", CLICKED_BODY_LINES));
     rebuild(&mut panel);
@@ -8148,10 +8261,10 @@ fn a_script_and_its_output_are_disclosed_together() {
 /// behind it fall back to a row without the reader touching anything.
 #[test]
 fn auto_opens_the_newest_read_and_closes_the_one_before_it() {
-    let mut panel = mode_panel(ViewMode::Auto, &[("t1", SOURCE_CODE_REFS_TOOL_NAME)]);
+    let mut panel = mode_panel(ViewMode::Auto, &[("t1", UNLISTED_READ_TOOL)]);
     assert!(!panel.card_closed("t1"), "{AUTO_TAIL_MSG}");
 
-    panel.tool_start(start("t2", SOURCE_CODE_REFS_TOOL_NAME));
+    panel.tool_start(start("t2", UNLISTED_READ_TOOL));
     panel.tool_done(done("t2"));
     rebuild(&mut panel);
 
@@ -8163,7 +8276,7 @@ fn auto_opens_the_newest_read_and_closes_the_one_before_it() {
 /// the thing being written and has no claim on staying open.
 #[test]
 fn auto_hands_the_newest_slot_to_the_reply_being_written() {
-    let mut panel = mode_panel(ViewMode::Auto, &[("t1", SOURCE_CODE_REFS_TOOL_NAME)]);
+    let mut panel = mode_panel(ViewMode::Auto, &[("t1", UNLISTED_READ_TOOL)]);
     assert!(!panel.card_closed("t1"), "{AUTO_TAIL_MSG}");
 
     panel.streaming_text.set_buffer("answering");
@@ -9356,7 +9469,7 @@ const SPACER_SETUP_MSG: &str = "the test must start from a card with a body to g
 const HELD_BODY_LINES: usize = 5;
 
 fn auto_panel_with_body(lines: usize) -> MessagesPanel {
-    let mut panel = panel_with_tools(&[("t1", SOURCE_CODE_REFS_TOOL_NAME)]);
+    let mut panel = panel_with_tools(&[("t1", UNLISTED_READ_TOOL)]);
     panel.set_view(ViewMode::Auto);
     panel.tool_done(long_done("t1", lines));
     rebuild(&mut panel);
@@ -9364,7 +9477,7 @@ fn auto_panel_with_body(lines: usize) -> MessagesPanel {
 }
 
 fn supersede(panel: &mut MessagesPanel) {
-    panel.tool_start(start("t2", SOURCE_CODE_REFS_TOOL_NAME));
+    panel.tool_start(start("t2", UNLISTED_READ_TOOL));
     panel.tool_done(done("t2"));
     rebuild(panel);
 }
@@ -10410,11 +10523,12 @@ const WRITE_REOPENS_MSG: &str = "a card the reader shut has to come back on the 
 const BODY_HEAD: &str = "line 0";
 
 /// A write was exempt from every collapse rule, including the reader's own
-/// press, so a long diff could not be put away at all. Expanded is left out on
-/// purpose: it gives no card a header to fall back to, which is a property of
-/// the mode rather than of writes. Compact is left out because a write starts
-/// folded there, so the same two presses run the other way round.
+/// press, so a long diff could not be put away at all. Expanded gives most
+/// cards no header to fall back to, but a write keeps one there too, or a
+/// click on a whole file changes nothing. Compact is left out because a write
+/// starts folded there, so the same two presses run the other way round.
 #[test_case(ViewMode::Auto ; "auto")]
+#[test_case(ViewMode::Expanded ; "expanded")]
 fn a_write_shuts_on_a_press_and_comes_back_on_the_next(view: ViewMode) {
     let mut panel = panel_with_tools(&[(TOOL_ID, FILE_WRITE_TOOL_NAME)]);
     panel.set_view(view);
@@ -11872,7 +11986,7 @@ const OFF_SCREEN_SUMMARY: &str = "ranked while nobody was looking";
 #[test]
 fn a_theme_change_still_flushes_an_off_screen_card() {
     theme::set(theme::load_by_name("dracula").unwrap());
-    let mut panel = panel_with_tools(&[(TOOL_ID, SOURCE_CODE_REFS_TOOL_NAME)]);
+    let mut panel = panel_with_tools(&[(TOOL_ID, UNLISTED_READ_TOOL)]);
     for row in 0..OFF_SCREEN_FILLER {
         panel.push(DisplayMessage::new(
             DisplayRole::Assistant,

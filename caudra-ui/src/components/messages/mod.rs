@@ -1266,23 +1266,23 @@ impl MessagesPanel {
         self.view != ViewMode::Expanded
     }
 
-    /// Whether this tool's card never opens on its own. Configured by bare
+    /// Whether this call's card never opens on its own. Configured by bare
     /// name, so a call the same tool makes through an MCP server matches too.
-    fn stays_collapsed(&self, tool: &str) -> bool {
-        self.policy.stays_collapsed(tool)
+    fn stays_collapsed(&self, tool: &str, effect: ToolEffect) -> bool {
+        self.policy.stays_collapsed(tool, effect)
     }
 
     /// Whether this call is drawn as a one-line row rather than a card. The
     /// mode answers for most tools; an always-collapsed one answers for
     /// itself, so expanded draws it as the row it would be anywhere else.
-    fn draws_compact(&self, tool: &str) -> bool {
-        self.compact() || self.stays_collapsed(tool)
+    fn draws_compact(&self, tool: &str, effect: ToolEffect) -> bool {
+        self.compact() || self.stays_collapsed(tool, effect)
     }
 
     fn card_draws_compact(&self, tool_id: &str) -> bool {
         self.tool_card(tool_id).map_or_else(
             || self.compact(),
-            |(_, role)| self.draws_compact(&role.name),
+            |(_, role)| self.draws_compact(&role.name, role.effect),
         )
     }
 
@@ -1325,7 +1325,7 @@ impl MessagesPanel {
         if !role.is_collapsible() {
             return true;
         }
-        if self.stays_collapsed(&role.name) {
+        if self.stays_collapsed(&role.name, role.effect) {
             return false;
         }
         self.view == ViewMode::Expanded || self.is_latest(msg_index) || self.rests_whole(msg_index)
@@ -1338,17 +1338,11 @@ impl MessagesPanel {
     /// blocks were kept has only text, and keeps resting at the budget.
     ///
     /// A card with a picture rests open too, since the picture is what the
-    /// call was for, and so does a source graph: its rows are the answer, and
-    /// three of them are rarely the ones the call was after.
+    /// call was for.
     fn rests_whole(&self, msg_index: usize) -> bool {
         matches!(
             self.messages[msg_index].tool_output.as_deref(),
-            Some(
-                ToolOutput::Mcp(_)
-                    | ToolOutput::Image { .. }
-                    | ToolOutput::SavedImage { .. }
-                    | ToolOutput::SourceCodeGraph { .. }
-            )
+            Some(ToolOutput::Mcp(_) | ToolOutput::Image { .. } | ToolOutput::SavedImage { .. })
         )
     }
 
@@ -1370,23 +1364,29 @@ impl MessagesPanel {
             .is_some_and(|(idx, role)| self.opens_by_default(role, idx))
     }
 
-    /// Whether a click can take this card back to its header. The only bar is
-    /// that there is a row to fall back to, which an expanded transcript does
-    /// not give a card of its own.
+    /// Whether a click can take this card back to its header. The bar is that
+    /// there is a row to fall back to, which an expanded transcript does not
+    /// give most cards of their own: there the click hands the card back to
+    /// the mode instead.
     ///
-    /// A write clears that bar. It cannot be folded *by mode* — hiding a diff
-    /// nobody asked to hide loses the change — but the reader asking for it is
-    /// a different thing, and the row still names the file and carries the
-    /// stat the diff would have shown.
+    /// A write clears that bar in every mode. It cannot be folded *by mode* —
+    /// hiding a diff nobody asked to hide loses the change — but the reader
+    /// asking for it is a different thing, and the header still names what was
+    /// written. Expanded opens a write whole, so without this a click there
+    /// would have nothing to change.
     fn card_can_close(&self, tool_id: &str) -> bool {
-        self.card_draws_compact(tool_id) && self.tool_card(tool_id).is_some()
+        self.tool_card(tool_id)
+            .is_some_and(|(_, role)| role.is_write() || self.draws_compact(&role.name, role.effect))
     }
 
     /// Whether this card draws its body in a fixed window rather than
     /// abridging it to a budget.
     fn card_scrolls(&self, tool_id: &str) -> bool {
-        self.tool_card(tool_id)
-            .is_some_and(|(_, role)| self.rctx(&role.name, tool_id).card_scroll.is_some())
+        self.tool_card(tool_id).is_some_and(|(_, role)| {
+            self.rctx(&role.name, role.effect, tool_id)
+                .card_scroll
+                .is_some()
+        })
     }
 
     /// `None` means header-only. A card the reader has not spoken about rests
@@ -1726,7 +1726,7 @@ impl MessagesPanel {
         let governed = match &self.messages[idx].role {
             DisplayRole::Tool(t) => {
                 t.is_collapsible()
-                    && !self.stays_collapsed(&t.name)
+                    && !self.stays_collapsed(&t.name, t.effect)
                     && !self.disclosure.contains_key(&t.id)
             }
             _ => false,
@@ -5262,8 +5262,8 @@ impl MessagesPanel {
     /// than per panel: an always-collapsed tool draws its row inside an
     /// expanded transcript, and the row's width comes from the chrome that
     /// row actually gets.
-    fn rctx(&self, tool: &str, tool_id: &str) -> RenderCtx<'_> {
-        let compact = self.draws_compact(tool);
+    fn rctx(&self, tool: &str, effect: ToolEffect, tool_id: &str) -> RenderCtx<'_> {
+        let compact = self.draws_compact(tool, effect);
         let kind = if compact {
             SegmentKind::ToolInline
         } else {
@@ -5416,7 +5416,11 @@ impl MessagesPanel {
         let floor = self.card_floor.get(tool_id).copied().unwrap_or_default();
         let build = |panel: &Self| {
             let msg = &panel.messages[msg_index];
-            let rctx = panel.rctx(msg.role.tool_name().unwrap_or_default(), tool_id);
+            let rctx = panel.rctx(
+                msg.role.tool_name().unwrap_or_default(),
+                msg.role.tool_effect().unwrap_or_default(),
+                tool_id,
+            );
             Self::build_held_tool_lines(msg, status, &rctx, exp, floor)
         };
         let lines = build(self);
@@ -5736,7 +5740,10 @@ impl MessagesPanel {
             .as_deref()
             .and_then(|o| o.owned_instructions());
 
-        let compact = self.draws_compact(msg.role.tool_name().unwrap_or_default());
+        let compact = self.draws_compact(
+            msg.role.tool_name().unwrap_or_default(),
+            msg.role.tool_effect().unwrap_or_default(),
+        );
         let drawn = tl.lines.len();
         let seg = self.cache.get_mut(seg_idx).unwrap();
         seg.search_text = tl.search_text.clone();
@@ -5766,7 +5773,7 @@ impl MessagesPanel {
                 let exp = self.tool_expansion(&t.id, self.opens_by_default(t, i));
                 let status = t.status;
                 let id = t.id.clone();
-                let compact = self.draws_compact(&t.name);
+                let compact = self.draws_compact(&t.name, t.effect);
                 let blocks = msg
                     .tool_output
                     .as_deref()
@@ -6763,7 +6770,7 @@ mod shell_receipt_tests {
         buf.append(SnapshotLine::plain(OUTPUT.into()));
         let _ = panel.poll_live_bufs();
         if depth < 2 {
-            let mut ctx = panel.rctx(tool, ROOT);
+            let mut ctx = panel.rctx(tool, ToolEffect::Unknown, ROOT);
             ctx.width = 100;
             ctx.policy.expanded = true;
             ctx.policy.scroll_card_lines = 0;
@@ -6876,7 +6883,7 @@ mod retained_progress_tests {
     #[test_case(Some(HISTORY_PREFIX) ; "history_never_refills")]
     fn only_pure_output_root_windows_offer_refill_rows(history_start: Option<usize>) {
         let panel = panel(false);
-        let rctx = panel.rctx(TASK_TOOL_NAME, PARENT_ID);
+        let rctx = panel.rctx(TASK_TOOL_NAME, ToolEffect::Orchestrator, PARENT_ID);
         let mut lines = MessagesPanel::build_tool_segment_lines(
             &panel.messages[0],
             ToolStatus::InProgress,

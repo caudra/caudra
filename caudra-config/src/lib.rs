@@ -40,15 +40,22 @@ const MCP_WHOLE_SERVER: &str = "*";
 /// document, and a glob, a grep and an index are ordered by path or by source
 /// rather than by relevance, so the visible lines are the alphabetically
 /// first ones rather than the answer. Each already states its result in the
-/// row annotation, so the fold loses no summary. The source-code lookups are
-/// absent on purpose: they rank their rows, so the prefix is the headline.
+/// row annotation, so the fold loses no summary. The source-code lookups and a
+/// memory read are lookups too: what they found is read on a click, whole.
 const DEFAULT_ALWAYS_COLLAPSED: &[&str] = &[
     "file_read",
     "file_glob",
     "file_grep",
     "file_index",
     "webfetch",
+    "source_code_context",
+    "source_code_refs",
+    MEMORY_READ_ENTRY,
 ];
+/// An `ui.always_collapsed` entry for the `memory` tool's reading calls alone,
+/// since one tool both reads notes and writes them and a write's card is the
+/// only record of the note it stored.
+pub const MEMORY_READ_ENTRY: &str = "memory_read";
 /// Set only by the process that starts Caudra, never by a `.env` file, like
 /// every terminal host's pane variables.
 const PROCESS_ONLY_ENV_VARS: &[&str] = &["WORKCELL_MCP_CODE_WORKER"];
@@ -2334,8 +2341,8 @@ pub struct UiConfig {
     #[config(
         ty = "string[]",
         default = "DEFAULT_ALWAYS_COLLAPSED.iter().map(|t| (*t).to_owned()).collect()",
-        default_doc = "[\"file_read\", \"file_glob\", \"file_grep\", \"file_index\", \"webfetch\"]",
-        desc = "Tools whose card never opens on its own: the call stays a single row in every view mode until you click it. A server-qualified name still matches, so `file_read` also covers `mcp_File_read`. Set to `[]` to opt out"
+        default_doc = "[\"file_read\", \"file_glob\", \"file_grep\", \"file_index\", \"webfetch\", \"source_code_context\", \"source_code_refs\", \"memory_read\"]",
+        desc = "Tools whose card never opens on its own: the call stays a single row in every view mode until you click it. A server-qualified name still matches, so `file_read` also covers `mcp_File_read`. `memory_read` covers the `memory` tool's view, zoom, search, and read calls and leaves its writes open, while `memory` covers all of them. Set to `[]` to opt out"
     )]
     pub always_collapsed: Vec<String>,
 

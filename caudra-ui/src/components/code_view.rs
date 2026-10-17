@@ -27,7 +27,8 @@ use super::{
 };
 use caudra_agent::code::output::CodeOutput;
 use caudra_agent::tools::{
-    CODE_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, timeout_annotation,
+    CODE_TOOL_NAME, MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME,
+    ToolEffect, timeout_annotation,
 };
 use caudra_agent::types::{AnswerSheet, TodoItem, TodoStatus};
 use caudra_agent::{
@@ -37,7 +38,7 @@ use caudra_agent::{
     SubagentProgress, ToolInput, ToolOutput, format_live_duration, format_settled_duration,
     pretty_json,
 };
-use caudra_config::ToolOutputLines;
+use caudra_config::{MEMORY_READ_ENTRY, ToolOutputLines};
 use caudra_diff::{DiffHunk, DiffLine, DiffSpan, compute_hunks};
 use caudra_markdown::Source;
 use caudra_markdown::render::SpanSource;
@@ -3125,20 +3126,16 @@ fn always_whole(entry: &BatchToolEntry) -> bool {
     )
 }
 
-/// Whether a child Caudra draws a card of its own for, a source graph or a
-/// recognised server's answer, rests whole: its card is already shaped to be
-/// read, and three rows of it say next to nothing. Unlike [`always_whole`] a
-/// click still folds it, and compact and the always-collapsed list fold it
-/// the way they fold its own card.
+/// Whether a child that is a recognised server's answer rests whole: Caudra
+/// draws that card to be read, and three rows of it say next to nothing.
+/// Unlike [`always_whole`] a click still folds it, and compact and the
+/// always-collapsed list fold it the way they fold its own card.
 pub(crate) fn rests_open(policy: &CardPolicy, entry: &BatchToolEntry) -> bool {
     !policy.compact
-        && !policy.stays_collapsed(&entry.tool)
+        && !policy.stays_collapsed(&entry.tool, entry.effect)
         && matches!(
             &entry.output,
-            Some(
-                ToolOutput::SourceCodeGraph { .. }
-                    | ToolOutput::Mcp(McpOutput { kind: Some(_), .. })
-            )
+            Some(ToolOutput::Mcp(McpOutput { kind: Some(_), .. }))
         )
 }
 
@@ -3260,11 +3257,14 @@ pub struct CardPolicy {
 }
 
 impl CardPolicy {
-    /// Whether no view mode opens this tool's body.
-    pub fn stays_collapsed(&self, tool: &str) -> bool {
-        self.always_collapsed
-            .iter()
-            .any(|pattern| names_tool(pattern, tool))
+    /// Whether no view mode opens this call's body. An entry names a tool,
+    /// except [`MEMORY_READ_ENTRY`], which names the `memory` calls that only
+    /// read, so the effect the call ran with is asked as well.
+    pub fn stays_collapsed(&self, tool: &str, effect: ToolEffect) -> bool {
+        let memory_read = effect.is_collapsible() && names_tool(MEMORY_TOOL_NAME, tool);
+        self.always_collapsed.iter().any(|pattern| {
+            names_tool(pattern, tool) || (memory_read && pattern == MEMORY_READ_ENTRY)
+        })
     }
 
     /// Whether this tool's body is drawn in a fixed window rather than
@@ -3461,7 +3461,7 @@ impl RenderLimits {
             Some(_) => false,
         };
         if !open
-            && (self.policy.stays_collapsed(&entry.tool)
+            && (self.policy.stays_collapsed(&entry.tool, entry.effect)
                 || (!streaming && is_collapsible(entry.effect, &entry.tool)))
         {
             return None;
@@ -4184,6 +4184,7 @@ mod tests {
         ActivityChild, EnvironmentFact, GrepLine, GrepMatchGroup, ShellOutput, SubagentActivity,
         TextOutput,
     };
+    use caudra_config::UiConfig;
     use std::{slice::from_ref, time::Duration};
     use test_case::test_case;
 
@@ -8335,7 +8336,6 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum ChildAnswer {
         Recognised,
-        Graph,
         Generic,
         Plain,
     }
@@ -8349,13 +8349,6 @@ mod tests {
         };
         let output = match answer {
             ChildAnswer::Recognised => mcp(Some(caudra_agent::McpServerKind::HomeAssistant)),
-            ChildAnswer::Graph => Some(ToolOutput::SourceCodeGraph {
-                headline: String::new(),
-                rows: vec![ranked_row(OWN_CARD_CHILD, 1)],
-                source: None,
-                footer: String::new(),
-                state: None,
-            }),
             ChildAnswer::Generic => mcp(None),
             ChildAnswer::Plain => return batch_entry(OWN_CARD_CHILD, 1),
         };
@@ -8378,13 +8371,11 @@ mod tests {
     /// still fold it. `None` folds; `Some(whole)` draws, whole or at a budget.
     #[test_case(ChildAnswer::Recognised, Rest::Free, false => Some(true); "recognised_rests_whole")]
     #[test_case(ChildAnswer::Recognised, Rest::Free, true => None; "recognised_click_folds")]
-    #[test_case(ChildAnswer::Graph, Rest::Free, false => Some(true); "graph_rests_whole")]
-    #[test_case(ChildAnswer::Graph, Rest::Free, true => None; "graph_click_folds")]
-    #[test_case(ChildAnswer::Graph, Rest::Compact, false => None; "compact_folds")]
-    #[test_case(ChildAnswer::Graph, Rest::Compact, true => Some(true); "compact_click_opens")]
+    #[test_case(ChildAnswer::Recognised, Rest::Compact, false => None; "compact_folds")]
+    #[test_case(ChildAnswer::Recognised, Rest::Compact, true => Some(true); "compact_click_opens")]
     #[test_case(ChildAnswer::Recognised, Rest::BodyTaken, false => None; "body_taken_folds")]
-    #[test_case(ChildAnswer::Graph, Rest::AlwaysCollapsed, false => None; "always_collapsed_folds")]
-    #[test_case(ChildAnswer::Graph, Rest::AlwaysCollapsed, true => Some(true); "always_collapsed_click_opens")]
+    #[test_case(ChildAnswer::Recognised, Rest::AlwaysCollapsed, false => None; "always_collapsed_folds")]
+    #[test_case(ChildAnswer::Recognised, Rest::AlwaysCollapsed, true => Some(true); "always_collapsed_click_opens")]
     #[test_case(ChildAnswer::Generic, Rest::Free, false => None; "generic_read_only_folds")]
     #[test_case(ChildAnswer::Plain, Rest::Free, false => None; "plain_read_only_folds")]
     #[test_case(ChildAnswer::Plain, Rest::Free, true => Some(true); "plain_click_opens")]
@@ -8421,6 +8412,41 @@ mod tests {
             limits.views = limits.views.toggled(0, rests_open(&limits.policy, &entry));
         }
         limits.child(0, &entry).map(|child| child.is_expanded())
+    }
+
+    /// The default list folds the lookups the way it folds a file read, and
+    /// `memory_read` only the `memory` calls that read, so a write keeps the
+    /// note it stored on screen.
+    #[test_case("source_code_refs", ToolEffect::ReadOnly => true; "source_graph")]
+    #[test_case("mcp_source_code_context", ToolEffect::ReadOnly => true; "server_qualified_source_graph")]
+    #[test_case(MEMORY_TOOL_NAME, ToolEffect::ReadOnly => true; "memory_read")]
+    #[test_case(MEMORY_TOOL_NAME, ToolEffect::Mutating => false; "memory_write")]
+    #[test_case(SKILL_TOOL_NAME, ToolEffect::ReadOnly => false; "unlisted_read")]
+    fn the_default_list_folds_lookups(tool: &str, effect: ToolEffect) -> bool {
+        let policy = CardPolicy {
+            always_collapsed: UiConfig::default().always_collapsed.into(),
+            ..CardPolicy::default()
+        };
+        policy.stays_collapsed(tool, effect)
+    }
+
+    /// A `memory` write child stays drawn under the default list, while a
+    /// read beside it folds as its own card does.
+    #[test_case(ToolEffect::Mutating => true; "write_draws")]
+    #[test_case(ToolEffect::ReadOnly => false; "read_folds")]
+    fn a_memory_child_folds_only_when_it_reads(effect: ToolEffect) -> bool {
+        let entry = BatchToolEntry {
+            effect,
+            ..batch_entry(MEMORY_TOOL_NAME, 1)
+        };
+        let policy = CardPolicy {
+            always_collapsed: UiConfig::default().always_collapsed.into(),
+            ..CardPolicy::default()
+        };
+        limits(BatchViews::default())
+            .with_policy(policy, Arc::default())
+            .child(0, &entry)
+            .is_some()
     }
 
     /// A call from a `code` snippet is `Unknown`, so it never folds by effect:

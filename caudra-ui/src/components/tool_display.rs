@@ -244,10 +244,11 @@ impl RenderCtx<'_> {
     /// The rows a card rests at, `usize::MAX` for a call with no useful
     /// abridgement.
     ///
-    /// A created file is the only body that *is* its result rather than a
-    /// report of one. Seven lines of it say nothing its header did not, and the
-    /// notice offering the rest is on every write, so abridging it buys a click
-    /// and costs the thing the card is for.
+    /// A created file is a body that *is* its result rather than a report of
+    /// one. Seven lines of it say nothing its header did not, and the notice
+    /// offering the rest is on every write, so abridging it buys a click and
+    /// costs the thing the card is for. A stored memory note is the same, and
+    /// so is the receipt a memory change draws in its place.
     ///
     /// Everything else a write settles into is a diff, which keeps the budget
     /// it shares with an edit and a patch. That budget is a floor there rather
@@ -262,7 +263,12 @@ impl RenderCtx<'_> {
         if self.scrolls(tool) {
             return self.policy.scroll_card_lines as usize;
         }
-        if tool == FILE_WRITE_TOOL_NAME && matches!(output, Some(ToolOutput::WriteCode { .. })) {
+        let whole = match output {
+            Some(ToolOutput::WriteCode { .. }) => tool == FILE_WRITE_TOOL_NAME,
+            Some(ToolOutput::Markdown(_)) => tool == MEMORY_TOOL_NAME,
+            _ => false,
+        };
+        if whole {
             return usize::MAX;
         }
         self.tool_output_lines.get(tool)
