@@ -89,7 +89,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.db";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.db.lock";
 
-const SCHEMA_VERSION: i64 = 30;
+const SCHEMA_VERSION: i64 = 31;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -246,10 +246,15 @@ pub fn eager_load_limit() -> usize {
 /// `subscription` says whether anyone was invoiced. A subscription bucket holds
 /// the API list price for its tokens, which is a real number about a bill that
 /// never arrives, so summing the two together would overstate spend.
+///
+/// `account` names which of the provider's accounts answered, so spend can be
+/// split per account. Empty means unknown: every row recorded before accounts
+/// existed, and any turn that reached no named account.
 const USAGE_LEDGER_TABLE: &str = r#"
 CREATE TABLE usage_ledger (
     bucket_start   INTEGER NOT NULL,
     provider       TEXT NOT NULL,
+    account        TEXT NOT NULL DEFAULT '',
     model          TEXT NOT NULL,
     cwd            TEXT NOT NULL,
     purpose        TEXT NOT NULL,
@@ -262,7 +267,7 @@ CREATE TABLE usage_ledger (
     cost           REAL NOT NULL,
     priced_turns   INTEGER NOT NULL,
     unpriced_turns INTEGER NOT NULL,
-    PRIMARY KEY(bucket_start, provider, model, cwd, purpose, ephemeral, subscription)
+    PRIMARY KEY(bucket_start, provider, account, model, cwd, purpose, ephemeral, subscription)
 ) STRICT, WITHOUT ROWID;
 "#;
 
@@ -344,6 +349,39 @@ INSERT INTO usage_ledger
     FROM usage_ledger_v3;
 DROP TABLE usage_ledger_v3;
 ALTER TABLE model_usage ADD COLUMN subscription_cost REAL;
+"#;
+
+/// Rebuilt a third time, now for the account. No row recorded before accounts
+/// can say which one answered, so every existing row keeps the empty account
+/// and every existing total stays where it was. The columns are named rather
+/// than taken by position because the new one sits inside the old order.
+const USAGE_LEDGER_ADD_ACCOUNT: &str = r#"
+ALTER TABLE usage_ledger RENAME TO usage_ledger_v4;
+CREATE TABLE usage_ledger (
+    bucket_start   INTEGER NOT NULL,
+    provider       TEXT NOT NULL,
+    account        TEXT NOT NULL DEFAULT '',
+    model          TEXT NOT NULL,
+    cwd            TEXT NOT NULL,
+    purpose        TEXT NOT NULL,
+    ephemeral      INTEGER NOT NULL CHECK(ephemeral IN (0, 1)),
+    subscription   INTEGER NOT NULL CHECK(subscription IN (0, 1)),
+    input_tokens   INTEGER NOT NULL,
+    output_tokens  INTEGER NOT NULL,
+    cache_creation INTEGER NOT NULL,
+    cache_read     INTEGER NOT NULL,
+    cost           REAL NOT NULL,
+    priced_turns   INTEGER NOT NULL,
+    unpriced_turns INTEGER NOT NULL,
+    PRIMARY KEY(bucket_start, provider, account, model, cwd, purpose, ephemeral, subscription)
+) STRICT, WITHOUT ROWID;
+INSERT INTO usage_ledger (bucket_start, provider, model, cwd, purpose, ephemeral, subscription,
+                          input_tokens, output_tokens, cache_creation, cache_read, cost,
+                          priced_turns, unpriced_turns)
+    SELECT bucket_start, provider, model, cwd, purpose, ephemeral, subscription, input_tokens,
+           output_tokens, cache_creation, cache_read, cost, priced_turns, unpriced_turns
+    FROM usage_ledger_v4;
+DROP TABLE usage_ledger_v4;
 "#;
 
 /// What tools did, in the same two shapes spend is kept in: a per-session
@@ -810,6 +848,11 @@ const MIGRATIONS: &[Migration] = &[
         to: 30,
         sql: source_code_rename::COLUMN_RENAMES,
     },
+    Migration {
+        from: 30,
+        to: 31,
+        sql: USAGE_LEDGER_ADD_ACCOUNT,
+    },
 ];
 
 /// Which automation sent a message for its session, a stamp ordering every
@@ -1088,7 +1131,7 @@ CREATE TABLE pending_archives (
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
     format!(
-        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}{SESSION_PURPOSE_USAGE_TABLE}{}{}",
+        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}{SESSION_PURPOSE_USAGE_TABLE}{}{}{}{}",
         crate::background::TABLES,
         crate::shell_durations::TABLES,
         crate::shell_history::TABLES,
@@ -1101,7 +1144,9 @@ fn full_schema() -> String {
         crate::autopilot::TABLES,
         crate::engine_decisions::TABLE,
         crate::goal_log::TABLES,
-        crate::history_search::TABLES
+        crate::history_search::TABLES,
+        crate::accounts::health::TABLE,
+        crate::account_switches::TABLE
     )
 }
 
@@ -1110,6 +1155,8 @@ fn full_schema() -> String {
 pub struct LedgerEntry<'a> {
     pub bucket_start: i64,
     pub provider: &'a str,
+    /// Empty when no named account answered.
+    pub account: &'a str,
     pub model: &'a str,
     pub cwd: &'a str,
     pub purpose: LedgerPurpose,
@@ -1198,6 +1245,8 @@ pub struct HistoryRecord<'a> {
 pub struct UsageBucket {
     pub bucket_start: i64,
     pub provider: String,
+    /// Empty when unknown, which every bucket from before accounts is.
+    pub account: String,
     pub model: String,
     pub cwd: String,
     pub purpose: String,
@@ -2143,11 +2192,12 @@ impl SessionDatabase {
         // RAISE(FAIL) can retain statement changes; a failed contribution must be safe to retry.
         let transaction = self.connection.unchecked_transaction()?;
         transaction.execute(
-            "INSERT INTO usage_ledger (bucket_start, provider, model, cwd, purpose, ephemeral, \
-                 subscription, input_tokens, output_tokens, cache_creation, cache_read, cost, \
-                 priced_turns, unpriced_turns) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
-             ON CONFLICT(bucket_start, provider, model, cwd, purpose, ephemeral, subscription) \
+            "INSERT INTO usage_ledger (bucket_start, provider, account, model, cwd, purpose, \
+                 ephemeral, subscription, input_tokens, output_tokens, cache_creation, \
+                 cache_read, cost, priced_turns, unpriced_turns) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+             ON CONFLICT(bucket_start, provider, account, model, cwd, purpose, ephemeral, \
+                 subscription) \
              DO UPDATE SET \
                  input_tokens = input_tokens + excluded.input_tokens, \
                  output_tokens = output_tokens + excluded.output_tokens, \
@@ -2159,6 +2209,7 @@ impl SessionDatabase {
             params![
                 entry.bucket_start,
                 entry.provider,
+                entry.account,
                 entry.model,
                 entry.cwd,
                 entry.purpose.storage_name(),
@@ -2194,11 +2245,12 @@ impl SessionDatabase {
 
     pub fn usage_buckets(&self, since: Option<i64>) -> Result<Vec<UsageBucket>, SessionError> {
         let mut statement = self.connection.prepare(
-            "SELECT bucket_start, provider, model, cwd, purpose, ephemeral, subscription, \
-                    input_tokens, output_tokens, cache_creation, cache_read, cost, \
-                    priced_turns, unpriced_turns  \
+            "SELECT bucket_start, provider, account, model, cwd, purpose, ephemeral, \
+                    subscription, input_tokens, output_tokens, cache_creation, cache_read, \
+                    cost, priced_turns, unpriced_turns  \
              FROM usage_ledger WHERE ?1 IS NULL OR bucket_start >= ?1  \
-             ORDER BY bucket_start DESC, provider ASC, model ASC, cwd ASC, purpose ASC",
+             ORDER BY bucket_start DESC, provider ASC, account ASC, model ASC, cwd ASC, \
+                 purpose ASC",
         )?;
         let mut rows = statement.query(params![since])?;
         let mut buckets = Vec::new();
@@ -2206,18 +2258,19 @@ impl SessionDatabase {
             buckets.push(UsageBucket {
                 bucket_start: row.get(0)?,
                 provider: row.get(1)?,
-                model: row.get(2)?,
-                cwd: row.get(3)?,
-                purpose: row.get(4)?,
-                ephemeral: row.get::<_, i64>(5)? != 0,
-                subscription: row.get::<_, i64>(6)? != 0,
-                input: from_i64(row.get(7)?, "usage_ledger.input_tokens")?,
-                output: from_i64(row.get(8)?, "usage_ledger.output_tokens")?,
-                cache_creation: from_i64(row.get(9)?, "usage_ledger.cache_creation")?,
-                cache_read: from_i64(row.get(10)?, "usage_ledger.cache_read")?,
-                cost: row.get(11)?,
-                priced_turns: from_i64(row.get(12)?, "usage_ledger.priced_turns")?,
-                unpriced_turns: from_i64(row.get(13)?, "usage_ledger.unpriced_turns")?,
+                account: row.get(2)?,
+                model: row.get(3)?,
+                cwd: row.get(4)?,
+                purpose: row.get(5)?,
+                ephemeral: row.get::<_, i64>(6)? != 0,
+                subscription: row.get::<_, i64>(7)? != 0,
+                input: from_i64(row.get(8)?, "usage_ledger.input_tokens")?,
+                output: from_i64(row.get(9)?, "usage_ledger.output_tokens")?,
+                cache_creation: from_i64(row.get(10)?, "usage_ledger.cache_creation")?,
+                cache_read: from_i64(row.get(11)?, "usage_ledger.cache_read")?,
+                cost: row.get(12)?,
+                priced_turns: from_i64(row.get(13)?, "usage_ledger.priced_turns")?,
+                unpriced_turns: from_i64(row.get(14)?, "usage_ledger.unpriced_turns")?,
             });
         }
         Ok(buckets)
@@ -4129,19 +4182,20 @@ fn relocate_project_usage_on(
     }
     let buckets_merged: i64 = transaction.query_row(
         "SELECT count(*) FROM usage_ledger AS source JOIN usage_ledger AS destination \
-         USING (bucket_start, provider, model, purpose, ephemeral, subscription) \
+         USING (bucket_start, provider, account, model, purpose, ephemeral, subscription) \
          WHERE source.cwd = ?1 AND destination.cwd = ?2",
         params![source, destination],
         |row| row.get(0),
     )?;
     let buckets_moved = transaction.execute(
-        "INSERT INTO usage_ledger (bucket_start, provider, model, cwd, purpose, ephemeral, \
-             subscription, input_tokens, output_tokens, cache_creation, cache_read, cost, \
-             priced_turns, unpriced_turns) \
-         SELECT bucket_start, provider, model, ?2, purpose, ephemeral, subscription, \
+        "INSERT INTO usage_ledger (bucket_start, provider, account, model, cwd, purpose, \
+             ephemeral, subscription, input_tokens, output_tokens, cache_creation, cache_read, \
+             cost, priced_turns, unpriced_turns) \
+         SELECT bucket_start, provider, account, model, ?2, purpose, ephemeral, subscription, \
              input_tokens, output_tokens, cache_creation, cache_read, cost, priced_turns, unpriced_turns \
          FROM usage_ledger WHERE cwd = ?1 \
-         ON CONFLICT(bucket_start, provider, model, cwd, purpose, ephemeral, subscription) \
+         ON CONFLICT(bucket_start, provider, account, model, cwd, purpose, ephemeral, \
+             subscription) \
          DO UPDATE SET \
              input_tokens = input_tokens + excluded.input_tokens, \
              output_tokens = output_tokens + excluded.output_tokens, \
@@ -5288,6 +5342,10 @@ fn migrate_to_current(
         }
         if step.to == 30 {
             source_code_rename::rewrite_stored(&transaction)?;
+        }
+        if step.to == 31 {
+            transaction.execute_batch(crate::accounts::health::TABLE)?;
+            transaction.execute_batch(crate::account_switches::TABLE)?;
         }
         transaction.pragma_update(None, "user_version", step.to)?;
         transaction.commit()?;
@@ -6828,6 +6886,8 @@ mod tests {
     const EMPTY_JSON_OBJECT: &str = "{}";
     const LEDGER_PROVIDER: &str = "test/provider";
     const OTHER_LEDGER_PROVIDER: &str = "other/provider";
+    const LEDGER_ACCOUNT: &str = "work";
+    const OTHER_LEDGER_ACCOUNT: &str = "personal";
     const OTHER_LEDGER_MODEL: &str = "other/model";
     const REPAIR_FAILURE: &str = "injected permission repair failure";
     const OLD_REVIEW: &str = "old untyped review";
@@ -6857,15 +6917,42 @@ mod tests {
     /// Followed by [`crate::autopilot::DECISIONS_TABLE_V24`] in
     /// [`downgrade_autopilot_audit`], which every downgrade to schema 24, 25
     /// or 26 runs first.
-    const AUTOPILOT_AUDIT_DOWNGRADE: &str = "DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; \
+    const AUTOPILOT_AUDIT_DOWNGRADE: &str = "DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; \
          DROP TABLE goal_evaluations; DROP TABLE goals; \
          DROP TABLE autopilot_engagements; DROP TABLE autopilot_decisions;";
     const AUTOPILOT_AUDIT_PREVIOUS_SCHEMA: i64 = 26;
-    const GOAL_LOG_DOWNGRADE: &str = "DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals;";
+    const GOAL_LOG_DOWNGRADE: &str = "DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals;";
     const GOAL_LOG_PREVIOUS_SCHEMA: i64 = 27;
-    const HISTORY_SEARCH_DOWNGRADE: &str = "DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs;";
+    const HISTORY_SEARCH_DOWNGRADE: &str = "DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs;";
     const HISTORY_SEARCH_PREVIOUS_SCHEMA: i64 = 28;
     const SOURCE_CODE_PREVIOUS_SCHEMA: i64 = 29;
+    /// Followed by [`USAGE_LEDGER_BEFORE_ACCOUNTS`] in [`downgrade_accounts`].
+    const ACCOUNTS_DOWNGRADE: &str =
+        "DROP TABLE account_switches; DROP TABLE account_health; DROP TABLE usage_ledger;";
+    const ACCOUNTS_PREVIOUS_SCHEMA: i64 = 30;
+    /// The ledger as schema 30 left it, keyed without the account.
+    const USAGE_LEDGER_BEFORE_ACCOUNTS: &str = r#"
+CREATE TABLE usage_ledger (
+    bucket_start   INTEGER NOT NULL,
+    provider       TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    cwd            TEXT NOT NULL,
+    purpose        TEXT NOT NULL,
+    ephemeral      INTEGER NOT NULL CHECK(ephemeral IN (0, 1)),
+    subscription   INTEGER NOT NULL CHECK(subscription IN (0, 1)),
+    input_tokens   INTEGER NOT NULL,
+    output_tokens  INTEGER NOT NULL,
+    cache_creation INTEGER NOT NULL,
+    cache_read     INTEGER NOT NULL,
+    cost           REAL NOT NULL,
+    priced_turns   INTEGER NOT NULL,
+    unpriced_turns INTEGER NOT NULL,
+    PRIMARY KEY(bucket_start, provider, model, cwd, purpose, ephemeral, subscription)
+) STRICT, WITHOUT ROWID;
+"#;
+    const MIGRATION_KEEPS_UNATTRIBUTED_SPEND: &str =
+        "schema 31 must carry every ledger row across with the empty account";
+    const ACCOUNTS_SPLIT_LEDGER: &str = "two accounts on one key must keep a row each";
     const MIGRATION_RENAMES_SOURCE_CODE: &str =
         "schema 30 must move every stored code-graph tool name to its source-code name";
     const MIGRATION_KEEPS_RETIRED: &str = "a retired tool's rows must stay byte-identical";
@@ -6882,17 +6969,17 @@ mod tests {
     const AUDIT_COST: f64 = 0.0125;
     const MIGRATION_KEEPS_DECISIONS: &str =
         "rebuilding the decision log must keep every row, with nothing new recorded on it";
-    const AUTOPILOT_DECISIONS_DOWNGRADE: &str = "DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions;";
+    const AUTOPILOT_DECISIONS_DOWNGRADE: &str = "DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions;";
     const AUTOPILOT_DECISIONS_PREVIOUS_SCHEMA: i64 = 23;
-    const MEMORY_JOURNAL_DOWNGRADE: &str = "DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes;";
+    const MEMORY_JOURNAL_DOWNGRADE: &str = "DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes;";
     const MEMORY_JOURNAL_PREVIOUS_SCHEMA: i64 = 22;
-    const AUTOMATION_MESSAGING_DOWNGRADE: &str = "DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; ALTER TABLE automation_firings DROP COLUMN delivery;";
+    const AUTOMATION_MESSAGING_DOWNGRADE: &str = "DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; ALTER TABLE automation_firings DROP COLUMN delivery;";
     const AUTOMATION_MESSAGING_PREVIOUS_SCHEMA: i64 = 21;
-    const AUTOMATIONS_DOWNGRADE: &str = "DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings;";
+    const AUTOMATIONS_DOWNGRADE: &str = "DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings;";
     const AUTOMATIONS_PREVIOUS_SCHEMA: i64 = 20;
-    const CONSUMER_GROUPS_DOWNGRADE: &str = "DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation;";
+    const CONSUMER_GROUPS_DOWNGRADE: &str = "DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation;";
     const CONSUMER_GROUPS_PREVIOUS_SCHEMA: i64 = 19;
-    const SHARED_REPOSITORIES_DOWNGRADE: &str = "DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP TABLE deliveries; DROP TABLE cursors; DROP TABLE messages; DROP TABLE message_history_revision; DROP TABLE decisions;";
+    const SHARED_REPOSITORIES_DOWNGRADE: &str = "DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP TABLE deliveries; DROP TABLE cursors; DROP TABLE messages; DROP TABLE message_history_revision; DROP TABLE decisions;";
     const SHARED_REPOSITORIES_PREVIOUS_SCHEMA: i64 = 18;
     const OWNER_CHECKPOINT_PREVIOUS_SCHEMA: i64 = 13;
     const WORKFLOW_DECISION_PREVIOUS_SCHEMA: i64 = 14;
@@ -8816,6 +8903,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         LedgerEntry {
             bucket_start: 0,
             provider: LEDGER_PROVIDER,
+            account: "",
             model: MODEL,
             cwd,
             purpose: LedgerPurpose::Chat,
@@ -9015,6 +9103,10 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
                 ..ledger_entry(CWD)
             },
             LedgerEntry {
+                account: LEDGER_ACCOUNT,
+                ..ledger_entry(CWD)
+            },
+            LedgerEntry {
                 model: OTHER_LEDGER_MODEL,
                 ..ledger_entry(CWD)
             },
@@ -9053,7 +9145,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         assert_eq!(
             result,
             ProjectUsageRelocation {
-                buckets_moved: 7,
+                buckets_moved: 8,
                 buckets_merged: usize::from(collision),
                 ..ProjectUsageRelocation::default()
             }
@@ -9068,6 +9160,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
                 row.cwd == RELOCATION_DESTINATION
                     && row.bucket_start == source.bucket_start
                     && row.provider == source.provider
+                    && row.account == source.account
                     && row.model == source.model
                     && row.purpose == source.purpose
                     && row.ephemeral == source.ephemeral
@@ -12180,6 +12273,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
                 params![id],
             )
             .unwrap();
+        downgrade_accounts(&database.connection);
         database
             .connection
             .pragma_update(None, "user_version", SOURCE_CODE_PREVIOUS_SCHEMA)
@@ -12299,6 +12393,75 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             renamed_rules
         );
         assert!(generation(connection) > generation_before);
+        let (_fresh_temp, fresh_state) = state_dir();
+        let fresh = SessionDatabase::open_state(&fresh_state).unwrap();
+        assert_eq!(
+            schema_objects(&migrated),
+            schema_objects(&fresh),
+            "{MIGRATED_MATCHES_FRESH}"
+        );
+    }
+
+    /// Puts the accounts schema back as schema 30 left it: no health or
+    /// switch tables, and a ledger keyed without the account.
+    fn downgrade_accounts(connection: &Connection) {
+        connection.execute_batch(ACCOUNTS_DOWNGRADE).unwrap();
+        connection
+            .execute_batch(USAGE_LEDGER_BEFORE_ACCOUNTS)
+            .unwrap();
+    }
+
+    #[test]
+    fn accounts_migrate_from_schema_thirty_keeping_spend_unattributed() {
+        let (_temp, state) = state_dir();
+        let database = SessionDatabase::open_state(&state).unwrap();
+        downgrade_accounts(&database.connection);
+        database
+            .connection
+            .execute(
+                "INSERT INTO usage_ledger VALUES (0, ?1, ?2, ?3, 'chat', 0, 0, 2, 3, 5, 7, ?4, 1, 0)",
+                params![LEDGER_PROVIDER, MODEL, CWD, LEDGER_COST],
+            )
+            .unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", ACCOUNTS_PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(database);
+
+        let migrated = SessionDatabase::open_state(&state).unwrap();
+
+        assert_eq!(migrated.stats().unwrap().schema_version, SCHEMA_VERSION);
+        let unattributed = ledger_entry(CWD);
+        let kept = migrated.usage_buckets(None).unwrap();
+        assert_eq!(kept.len(), 1, "{MIGRATION_KEEPS_UNATTRIBUTED_SPEND}");
+        assert_eq!(
+            kept[0].account, unattributed.account,
+            "{MIGRATION_KEEPS_UNATTRIBUTED_SPEND}"
+        );
+        assert_eq!(
+            kept[0].cost, LEDGER_COST,
+            "{MIGRATION_KEEPS_UNATTRIBUTED_SPEND}"
+        );
+        for account in [LEDGER_ACCOUNT, OTHER_LEDGER_ACCOUNT] {
+            migrated
+                .record_usage(&LedgerEntry {
+                    account,
+                    ..ledger_entry(CWD)
+                })
+                .unwrap();
+        }
+        let accounts: Vec<String> = migrated
+            .usage_buckets(None)
+            .unwrap()
+            .into_iter()
+            .map(|bucket| bucket.account)
+            .collect();
+        assert_eq!(
+            accounts,
+            [unattributed.account, OTHER_LEDGER_ACCOUNT, LEDGER_ACCOUNT],
+            "{ACCOUNTS_SPLIT_LEDGER}"
+        );
         let (_fresh_temp, fresh_state) = state_dir();
         let fresh = SessionDatabase::open_state(&fresh_state).unwrap();
         assert_eq!(
@@ -12774,7 +12937,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             .unwrap();
         old.execute_batch("VACUUM").unwrap();
         old.execute_batch(&format!(
-            "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}"
+            "{SCHEMA}{USAGE_LEDGER_BEFORE_ACCOUNTS}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}"
         ))
         .unwrap();
         old.pragma_update(None, "application_id", APPLICATION_ID)
@@ -12969,7 +13132,9 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         connection
             .execute_batch(SESSIONS_BEFORE_WORKSPACE_BINDING)
             .unwrap();
-        connection.execute_batch(USAGE_LEDGER_TABLE).unwrap();
+        connection
+            .execute_batch(USAGE_LEDGER_BEFORE_ACCOUNTS)
+            .unwrap();
         connection
             .pragma_update(None, "application_id", APPLICATION_ID)
             .unwrap();
@@ -12993,7 +13158,9 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         connection
             .execute_batch(SESSIONS_BEFORE_WORKSPACE_BINDING)
             .unwrap();
-        connection.execute_batch(USAGE_LEDGER_TABLE).unwrap();
+        connection
+            .execute_batch(USAGE_LEDGER_BEFORE_ACCOUNTS)
+            .unwrap();
         connection.execute_batch(WORKFLOW_TABLES).unwrap();
         connection
             .pragma_update(None, "application_id", APPLICATION_ID)
@@ -13055,6 +13222,9 @@ CREATE TABLE subagent_history_items (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(crate::account_switches::TABLE, "")
+                    .replace(crate::accounts::health::TABLE, "")
+                    .replace(USAGE_LEDGER_TABLE, USAGE_LEDGER_BEFORE_ACCOUNTS)
                     .replace(SESSION_PURPOSE_USAGE_TABLE, "")
                     .replace(crate::engine_decisions::TABLE, "")
                     .replace(crate::history_search::TABLES, "")
@@ -13163,6 +13333,9 @@ CREATE TABLE subagents (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(crate::account_switches::TABLE, "")
+                    .replace(crate::accounts::health::TABLE, "")
+                    .replace(USAGE_LEDGER_TABLE, USAGE_LEDGER_BEFORE_ACCOUNTS)
                     .replace(SESSION_PURPOSE_USAGE_TABLE, "")
                     .replace(crate::engine_decisions::TABLE, "")
                     .replace(crate::history_search::TABLES, "")

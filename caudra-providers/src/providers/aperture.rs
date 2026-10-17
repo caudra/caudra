@@ -7,6 +7,7 @@ use flume::Sender;
 use serde_json::Value;
 use tracing::warn;
 
+use crate::accounts::AccountCredential;
 use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
 use crate::provider::{BoxFuture, Provider, ProviderKind, WireRequest, adjust_model_metadata};
@@ -33,7 +34,6 @@ const GEMINI_PATH_PREFIX: &str = "/v1beta";
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "aperture",
-    api_key_env: "",
     base_url: "",
     max_tokens_field: "max_tokens",
     include_stream_usage: true,
@@ -273,11 +273,16 @@ pub struct Aperture {
 }
 
 impl Aperture {
-    pub fn new(timeouts: Timeouts) -> Result<Self, AgentError> {
+    /// The gateway authenticates by tailnet identity, so a key is sent only
+    /// when one is configured.
+    pub fn new(account: &AccountCredential, timeouts: Timeouts) -> Result<Self, AgentError> {
         let base_url = resolve_base_url()?;
         let auth = Arc::new(Mutex::new(ResolvedAuth {
             base_url: Some(base_url),
-            headers: Vec::new(),
+            headers: account
+                .optional_api_key()
+                .map(|key| ResolvedAuth::bearer(key).headers)
+                .unwrap_or_default(),
         }));
         Ok(Self::with_auth_and_overrides(
             auth,

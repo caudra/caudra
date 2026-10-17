@@ -113,19 +113,28 @@ fn replace_value(existing: &mut Value, value: Value) {
 }
 
 fn same_item(left: &Item, right: &Item) -> bool {
+    if let (Some(left), Some(right)) = (left.as_array_of_tables(), right.as_array_of_tables()) {
+        return left.len() == right.len()
+            && left
+                .iter()
+                .zip(right.iter())
+                .all(|(left, right)| same_table(left, right));
+    }
     match (left.as_table_like(), right.as_table_like()) {
-        (Some(left), Some(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .all(|(key, value)| right.get(key).is_some_and(|other| same_item(value, other)))
-        }
+        (Some(left), Some(right)) => same_table(left, right),
         (None, None) => match (left.as_value(), right.as_value()) {
             (Some(left), Some(right)) => left.to_string() == right.to_string(),
             _ => false,
         },
         _ => false,
     }
+}
+
+fn same_table(left: &dyn TableLike, right: &dyn TableLike) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .all(|(key, value)| right.get(key).is_some_and(|other| same_item(value, other)))
 }
 
 /// Positions and spacing come from the scratch document a value was rendered
@@ -139,7 +148,7 @@ fn detach(item: &mut Item) {
     }
 }
 
-fn detach_table(table: &mut Table) {
+pub(crate) fn detach_table(table: &mut Table) {
     table.set_position(None);
     table.decor_mut().clear();
     table.iter_mut().for_each(|(_, child)| detach(child));

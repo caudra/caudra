@@ -5,6 +5,7 @@ use arc_swap::ArcSwapOption;
 
 use caudra_config::ClockFormat;
 use caudra_grab::grab_scope;
+use caudra_providers::accounts::AccountStatus;
 use caudra_providers::{
     AgentError, Billing, Model, ModelSpend, ProviderUsage, TokenUsage, add_cost, format_hit_rate,
     format_tokens, format_tokens_u64, model_cost,
@@ -20,6 +21,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::components::accounts_modal::account_detail;
 use crate::components::keybindings::{Bind, key};
 use crate::components::modal::{FooterHits, Modal};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
@@ -28,6 +30,7 @@ use crate::repaint::{Dirty, Watch};
 use crate::theme;
 
 const TITLE: &str = " Token usage ";
+const ACCOUNTS_TITLE: &str = "Accounts";
 const LIFETIME_TITLE: &str = " Token usage - lifetime ";
 const SLICE_LIMIT: usize = 8;
 /// A cap hides rows only when it hides at least two: the line saying one row
@@ -171,6 +174,9 @@ pub struct UsageModalContext<'a> {
     /// `None` when the ledger could not be read, which is different from an
     /// empty ledger and says so.
     pub lifetime: Option<&'a LifetimeUsage>,
+    /// Every account of the model's provider, the one requests go to first.
+    /// Listed only once there are two.
+    pub accounts: &'a [AccountStatus],
 }
 
 pub struct UsageModal {
@@ -199,6 +205,7 @@ pub struct UsageModal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum LifetimeSection {
     Provider,
+    Account,
     Model,
     Project,
     Month,
@@ -512,6 +519,9 @@ fn build_lines(
             refresh_row = lines.len().checked_sub(1);
         }
     }
+    if ctx.accounts.len() > 1 {
+        lines.extend(account_lines(ctx.accounts, theme));
+    }
 
     if ctx.by_model.is_empty() {
         return (lines, refresh_row);
@@ -793,6 +803,12 @@ fn build_lifetime_lines(
             &lifetime.by_provider,
             2,
             Some(LifetimeSection::Provider),
+        ),
+        (
+            "Per account",
+            &lifetime.by_account,
+            2,
+            Some(LifetimeSection::Account),
         ),
         (
             "Per model",
@@ -1114,6 +1130,35 @@ fn quota_lines(
     }
 }
 
+/// Where each account stands as of its latest reading, which the quota above
+/// covers for one of them only.
+fn account_lines(accounts: &[AccountStatus], theme: &crate::theme::Theme) -> Vec<Line<'static>> {
+    let now_ms = u64::try_from(Timestamp::now().as_millisecond()).unwrap_or_default();
+    let fg = Style::new().fg(theme.foreground);
+    let width = accounts
+        .iter()
+        .map(|account| account.name.chars().count())
+        .max()
+        .unwrap_or_default();
+    let mut lines = vec![
+        Line::default(),
+        Line::from(Span::styled(
+            format!("{PREFIX}{ACCOUNTS_TITLE}"),
+            theme.keybind_section,
+        )),
+    ];
+    lines.extend(accounts.iter().map(|account| {
+        Line::from(vec![
+            Span::styled(format!("{PREFIX}{:<width$}", account.name), fg),
+            Span::styled(
+                format!("  {}", account_detail(account, now_ms)),
+                theme.status_dim,
+            ),
+        ])
+    }));
+    lines
+}
+
 /// The figures' age is the line's last span on its own, which is what
 /// [`refresh_hit`] measures and the pointer marks.
 fn aged_note(lead: String, age: String, style: Style) -> Line<'static> {
@@ -1183,7 +1228,7 @@ fn retry_wait(seconds: i64) -> String {
     }
 }
 
-fn format_reset(epoch_ms: u64, tz: &TimeZone, clock: ClockFormat) -> String {
+pub(crate) fn format_reset(epoch_ms: u64, tz: &TimeZone, clock: ClockFormat) -> String {
     let secs = (epoch_ms / 1000) as i64;
     let Ok(ts) = Timestamp::from_second(secs) else {
         return epoch_ms.to_string();
@@ -1819,6 +1864,7 @@ mod tests {
             fast: false,
             clock_format: ClockFormat::Hour24,
             lifetime: None,
+            accounts: &[],
         };
         let rows = line_texts(&build_lines(&ctx, None, &crate::theme::current()).0);
 
@@ -1901,12 +1947,16 @@ mod tests {
                     percentage: Some(16),
                     reset_at: Some(0),
                     detail: None,
+                    window: None,
+                    length_secs: None,
                 },
                 UsageLimit {
                     label: "Usage credits".into(),
                     percentage: Some(4),
                     reset_at: None,
                     detail: Some("$2.33 spent".into()),
+                    window: None,
+                    length_secs: None,
                 },
             ],
         }
@@ -2131,6 +2181,7 @@ mod tests {
             fast: false,
             clock_format: ClockFormat::Hour24,
             lifetime: None,
+            accounts: &[],
         };
         line_texts(&build_lines(&ctx, None, &crate::theme::current()).0)
     }
@@ -2459,6 +2510,7 @@ mod tests {
             fast: false,
             clock_format: ClockFormat::Hour24,
             lifetime,
+            accounts: &[],
         };
         terminal
             .draw(|f| {

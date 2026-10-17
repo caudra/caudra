@@ -70,7 +70,7 @@ const AUTH_RELOADING: &str = r#"## Auth Reloading
 
 Caudra re-reads auth from storage and environment variables each time a new agent spawns (`/new`, retry, session load). If you run `caudra auth login` in another terminal or change an env var, the next session picks it up without a restart.
 
-You can set multiple API keys in one env var (`ANTHROPIC_API_KEY=sk-1,sk-2,sk-3`) and they rotate automatically on rate-limit or auth errors."#;
+A provider can have several accounts, such as two subscriptions and an API key, and an env var with keys separated by commas (`ANTHROPIC_API_KEY=sk-1,sk-2`) gives one account per key. A login, a logout, or an account choice made in another process reaches a running conversation at its next [cold point](/docs/accounts/#how-auto-switches). See [Accounts](/docs/accounts/) for how Caudra chooses between them."#;
 
 const BASE_URL_OVERRIDES: &str = r#"## Base URL Overrides
 
@@ -229,6 +229,8 @@ Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this fil
     let purpose_fields = keys_table(&document, &[example::providers::PURPOSES]);
     let model_fields = keys_table(&document, &[example::providers::MODELS]);
     let override_fields = keys_table(&document, &[example::providers::UPSTREAM]);
+    let switching_fields = keys_table(&document, &[example::providers::SWITCHING]);
+    let account_fields = keys_table(&document, &[example::providers::ACCOUNTS]);
     let decision_fields = keys_table(&document, &[example::providers::DECISION_ENDPOINT]);
     let builtin_ignored = join_and(&BUILTIN_IGNORED_FIELDS.map(|name| format!("`{name}`")));
     let builtin_model = join_and(&BUILTIN_MODEL_FIELDS.map(|name| format!("`{name}`")));
@@ -350,6 +352,31 @@ Provider-level fields apply to every model from that upstream. Per-model entries
 
 {override_fields}
 Caudra sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.AI), and Aperture appends that path to the upstream's base url. If an upstream base url already carries its own path, set `path_prefix = ""` for it to avoid a doubled path. Z.AI defaults to no prefix since its API path has no `/v1` segment; point the upstream base url at the full API root (e.g. `https://api.z.ai/api/paas/v4`).
+
+### Accounts
+
+`[[SLUG.accounts]]` entries list a provider's [accounts](/docs/accounts/) in priority order, and `[SLUG.switching]` sets how Auto moves conversations between them. A table that holds only these two changes nothing else about a built-in provider:
+
+```toml
+[anthropic.switching]
+strategy = "paced"
+prefer_below = 25
+
+[[anthropic.accounts]]
+name = "personal"
+
+[[anthropic.accounts]]
+name = "api"
+fallback = true
+```
+
+A `[SLUG.switching]` table takes these keys:
+
+{switching_fields}
+Each `[[SLUG.accounts]]` entry takes these keys:
+
+{account_fields}
+See [How Auto switches](/docs/accounts/#how-auto-switches) for what the thresholds do.
 
 ### Decision endpoints
 

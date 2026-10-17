@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::warn;
 
+use crate::accounts::{AccountCredential, QuotaWindow, WindowKind};
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -14,11 +15,10 @@ use crate::{
     ThinkingConfig, UsageLimit,
 };
 
-use super::{KeyPool, ResolvedAuth};
+use super::ResolvedAuth;
 
 static CONFIG_STANDARD: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "zai",
-    api_key_env: "ZHIPU_API_KEY",
     base_url: "https://api.z.ai/api/paas/v4",
     max_tokens_field: "max_tokens",
     include_stream_usage: false,
@@ -53,6 +53,14 @@ struct QuotaLimit {
     next_reset_time: Option<u64>,
 }
 
+fn quota_window(kind: &str, unit: u32) -> Option<WindowKind> {
+    match (kind, unit) {
+        ("TOKENS_LIMIT", 3) => Some(WindowKind::FiveHour),
+        ("TOKENS_LIMIT", 6) => Some(WindowKind::Weekly),
+        _ => None,
+    }
+}
+
 fn quota_label(kind: &str, unit: u32) -> String {
     match (kind, unit) {
         ("TOKENS_LIMIT", 3) => "5-hour tokens".into(),
@@ -70,11 +78,18 @@ impl From<QuotaResponse> for ProviderUsage {
                 .data
                 .limits
                 .into_iter()
-                .map(|l| UsageLimit {
-                    label: quota_label(&l.kind, l.unit),
-                    percentage: Some(l.percentage),
-                    reset_at: l.next_reset_time,
-                    detail: None,
+                .map(|l| {
+                    let window = quota_window(&l.kind, l.unit);
+                    UsageLimit {
+                        label: quota_label(&l.kind, l.unit),
+                        percentage: Some(l.percentage),
+                        reset_at: l.next_reset_time,
+                        detail: None,
+                        length_secs: window
+                            .as_ref()
+                            .and_then(|kind| QuotaWindow::new(kind.clone(), 0.0, None).length_secs),
+                        window,
+                    }
                 })
                 .collect(),
         }
@@ -337,14 +352,12 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
 pub struct Zai {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
-    key_pool: Option<KeyPool>,
     system_prefix: Option<String>,
 }
 
 impl Zai {
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve("zai", CONFIG_STANDARD.api_key_env)?;
-        let mut auth = ResolvedAuth::bearer(pool.current());
+    pub fn new(account: &AccountCredential, timeouts: super::Timeouts) -> Result<Self, AgentError> {
+        let mut auth = ResolvedAuth::bearer(account.api_key()?);
         let provider_config = caudra_config::providers::ProvidersConfig::load();
         if let Some(url) =
             caudra_config::providers::resolve_base_url("zai", provider_config.get("zai"))
@@ -354,7 +367,6 @@ impl Zai {
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG_STANDARD, timeouts),
             auth: Arc::new(Mutex::new(auth)),
-            key_pool: Some(pool),
             system_prefix: None,
         })
     }
@@ -363,7 +375,6 @@ impl Zai {
         Self {
             compat: OpenAiCompatProvider::new(&CONFIG_STANDARD, timeouts),
             auth,
-            key_pool: None,
             system_prefix: None,
         }
     }
@@ -451,15 +462,6 @@ impl Provider for Zai {
             let body = self.compat.get_text(&auth, QUOTA_LIMIT_URL).await?;
             let parsed: QuotaResponse = serde_json::from_str(&body)?;
             Ok(Some(parsed.into()))
-        })
-    }
-
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            Ok(self
-                .key_pool
-                .as_ref()
-                .is_some_and(|p| p.rotate_auth(&self.auth, ResolvedAuth::bearer)))
         })
     }
 

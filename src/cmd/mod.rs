@@ -1,3 +1,4 @@
+mod accounts;
 mod acp;
 mod config;
 mod decisions;
@@ -25,8 +26,11 @@ use caudra_agent::tools::native::skill::{host_skill, install_builtin_skill};
 use caudra_config::config_file::{
     self, ConfigFileError, global_init_lua_path, project_init_lua_path,
 };
+use caudra_config::providers::slugify;
 use caudra_config::{AgentConfig, Config, Feature, FeatureDisabled, FeatureFlags, RawConfig};
 use caudra_lua::PluginHost;
+use caudra_providers::accounts::{parse_account_overrides, set_process_selection};
+use caudra_storage::accounts::{AccountSelection, ensure_legacy_auth_migrated};
 use caudra_storage::sessions::PermissionMode;
 use caudra_storage::{EphemeralRoot, StateDir};
 use caudra_ui::SettingsReloader;
@@ -42,6 +46,22 @@ const TEMP_DIR_VARS: [&str; 3] = ["TMPDIR", "TMP", "TEMP"];
 const INIT_LUA_SKIPPED: &str = "init.lua not loaded, because Lua plugins are experimental and turned off; move its settings to caudra.toml (`caudra config example` lists them all), or set `experimental.lua_plugins = true` in the global caudra.toml and restart Caudra";
 const FEATURES_CHANGED: &str =
     "the [experimental] table in the global caudra.toml changed; restart Caudra to apply it";
+const ACCOUNT_ENV: &str = "CAUDRA_ACCOUNT";
+
+/// `CAUDRA_ACCOUNT` first, so a `--account` for the same provider wins. Both
+/// hold for this process only.
+fn apply_account_overrides(flags: &[(String, AccountSelection)]) -> Result<()> {
+    let from_env = match env::var(ACCOUNT_ENV) {
+        Ok(specs) => {
+            parse_account_overrides(&specs).with_context(|| format!("invalid {ACCOUNT_ENV}"))?
+        }
+        Err(_) => Vec::new(),
+    };
+    for (provider, selection) in from_env.into_iter().chain(flags.iter().cloned()) {
+        set_process_selection(&provider, Some(selection));
+    }
+    Ok(())
+}
 
 fn run_storage(persistent: StateDir, ephemeral: bool) -> Result<(StateDir, Option<EphemeralRoot>)> {
     if !ephemeral {
@@ -484,6 +504,10 @@ pub fn dispatch(mut cli: Cli, startup: Result<Startup, ConfigFileError>) -> Resu
     // and before the scratch redirect creates any more of them.
     let tightened = caudra_storage::paths::tighten_private_dirs();
     redirect_temp_dir();
+    if let Ok(storage) = StateDir::resolve() {
+        ensure_legacy_auth_migrated(&storage);
+    }
+    apply_account_overrides(&cli.accounts)?;
     match cli.command.take() {
         Some(Command::Sandbox { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
@@ -509,23 +533,34 @@ pub fn dispatch(mut cli: Cli, startup: Result<Startup, ConfigFileError>) -> Resu
                     provider,
                     method,
                     hostname,
+                    name,
                     decision,
                 } => subcmd::auth_login(
                     provider.as_deref(),
                     decision,
                     method,
                     hostname.as_deref(),
+                    name,
                     &storage,
                 )?,
                 AuthAction::Logout {
                     provider,
                     decision: true,
+                    ..
                 } => subcmd::decision_logout(&provider, &storage)?,
                 AuthAction::Logout {
                     provider,
+                    name,
+                    all,
                     decision: false,
-                } => subcmd::auth_logout(&provider, &storage)?,
-                AuthAction::Status => subcmd::auth_status(&storage)?,
+                } => subcmd::auth_logout(&provider, name, all, &storage)?,
+                AuthAction::Status { refresh } => subcmd::auth_status(&storage, refresh)?,
+                AuthAction::Use { provider, account } => {
+                    accounts::use_account(&storage, &slugify(&provider), &account)?
+                }
+                AuthAction::Rename { provider, from, to } => {
+                    accounts::rename(&storage, &slugify(&provider), &from, &to)?
+                }
                 AuthAction::Workcell { action } => match action {
                     WorkcellAuthAction::Set { name, stdin } => {
                         subcmd::workcell_credential_set(&name, stdin, &storage)?

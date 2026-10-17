@@ -24,12 +24,12 @@ description: "Every TOML config file in full, with each key commented out and de
 # caudra.toml holds the settings only you write. Other files hold what Caudra
 # writes itself, or what needs rules of its own: permissions.toml (permission
 # rules for tools and MCP servers), mcp.toml (MCP servers), providers.toml
-# (model providers and their models), workcell.toml (profiles for direct remote
-# Workcell connections), sandboxes.toml (managed sandbox providers, networks,
-# transfers, and profiles), init.lua (Lua code that sets up plugins), .env
-# (environment variables, such as API keys, for any the environment does not
-# set), commands/ (custom slash commands, one Markdown file each).
-# `caudra config files` shows where each one lives, and
+# (model providers, their models, and their accounts), workcell.toml (profiles
+# for direct remote Workcell connections), sandboxes.toml (managed sandbox
+# providers, networks, transfers, and profiles), init.lua (Lua code that sets
+# up plugins), .env (environment variables, such as API keys, for any the
+# environment does not set), commands/ (custom slash commands, one Markdown
+# file each). `caudra config files` shows where each one lives, and
 # `caudra config example FILE` prints the reference of a TOML file.
 #
 # Full reference: https://caudra.ai/docs/configuration/
@@ -1443,7 +1443,7 @@ version = 1
 
 ## providers.toml
 
-[`providers.toml`](/docs/providers/#providers-toml) holds model providers and their models. Download this reference as [providers.example.toml](/docs/providers.example.toml).
+[`providers.toml`](/docs/providers/#providers-toml) holds model providers, their models, and their accounts. Download this reference as [providers.example.toml](/docs/providers.example.toml).
 
 ```toml
 # Every providers.toml setting. Each one is commented out, so this file changes
@@ -1687,6 +1687,57 @@ version = 1
 # USD per million output tokens in fast mode.
 # Type: float. Default: unset.
 # pricing_fast_output = <float>
+
+# [my-provider.switching]
+# When Auto moves a session from one account of my-provider to another. It
+# applies once the provider has two or more accounts and its selection is Auto.
+
+# How Auto picks an account. `ordered` takes the first usable account in
+# `accounts` order and returns to it after its quota resets. `paced` takes the
+# account furthest ahead of its quota schedule, so capacity that is about to
+# reset gets used first.
+# Type: string.
+# strategy = "ordered"
+
+# The quota left in a watched window, in percent, below which a session moves
+# to another account at its next request, even when that loses a warm prompt
+# cache. It has to be lower than `prefer_below`.
+# Type: integer, 0 to 99.
+# switch_below = 5
+
+# The quota left in a watched window, in percent, below which a session moves
+# to another account once its prompt cache is cold anyway, such as in a new
+# session or after compaction.
+# Type: integer, 1 to 100.
+# prefer_below = 20
+
+# The quota windows the thresholds watch: `5h`, `weekly`, and `monthly`.
+# Type: string[]. Default: every window the provider reports for the model.
+# windows = <string[]>
+
+# [[my-provider.accounts]]
+# One account to sign in to my-provider with, so repeat the table for each
+# account. The first entry has the highest priority. Accounts saved by
+# `caudra auth login` that no entry lists come after these. A slug whose table
+# holds only accounts and switching, such as a built-in one, stays the provider
+# it was.
+
+# The account name, which `caudra auth login --name` saves a credential under
+# and `caudra auth use` selects. It takes lowercase letters, digits, `-`, and
+# `_`, and `auto` is reserved.
+# Type: string. Required.
+# name = "personal"
+
+# The environment variable that holds this account's API key. Leave it out to
+# use the credential `caudra auth login` saved.
+# Type: string. Default: unset.
+# api_key_env = <string>
+
+# Let Auto move a subscription session onto this pay-per-token account, which
+# it does only when every subscription is spent. A subscription account ignores
+# it.
+# Type: bool.
+# fallback = false
 
 # [aperture.overrides.llmserver]
 # Aperture routes the models of upstream providers as

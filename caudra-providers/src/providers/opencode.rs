@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use flume::Sender;
 use serde_json::Value;
 
+use crate::accounts::AccountCredential;
 use crate::model::{Model, ModelInfo};
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::providers::catalog::{
@@ -18,7 +19,6 @@ const ZEN_SLUG: &str = "opencode";
 
 static CATALOG_CHAT_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: ZEN_SLUG,
-    api_key_env: "",
     base_url: "",
     max_tokens_field: "max_tokens",
     include_stream_usage: true,
@@ -28,6 +28,9 @@ static CATALOG_CHAT_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 pub struct Opencode {
     chat_compat: OpenAiCompatProvider,
     auth: Option<Arc<Mutex<ResolvedAuth>>>,
+    /// The account's key for Zen itself. Every other catalog provider a model
+    /// routes to signs with its own.
+    zen_key: Option<String>,
     system_prefix: Option<String>,
 }
 
@@ -43,12 +46,15 @@ fn route(
     catalog: &CatalogData,
     model: &Model,
     auth_override: Option<&Arc<Mutex<ResolvedAuth>>>,
+    zen_key: Option<&str>,
 ) -> Result<Route, AgentError> {
     let (sub_provider, actual_id) = model.id.split_once('/').unwrap_or((ZEN_SLUG, &model.id));
     let (meta, provider_data) = catalog.lookup(sub_provider, actual_id)?;
-    let auth = provider_data
-        .resolve_auth_with_override(auth_override, &catalog.state_dir)
-        .ok_or_else(|| {
+    let auth = match auth_override {
+        None if sub_provider == ZEN_SLUG => provider_data.auth_for_key(zen_key).into_resolved(),
+        _ => provider_data.resolve_auth_with_override(auth_override, &catalog.state_dir),
+    }
+    .ok_or_else(|| {
             config_error(format!(
                 "authentication required for provider '{sub_provider}', run `caudra auth login {sub_provider}`"
             ))
@@ -66,10 +72,11 @@ fn route(
 }
 
 impl Opencode {
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
+    pub fn new(account: &AccountCredential, timeouts: super::Timeouts) -> Result<Self, AgentError> {
         Ok(Self {
             chat_compat: OpenAiCompatProvider::new(&CATALOG_CHAT_CONFIG, timeouts),
             auth: None,
+            zen_key: account.optional_api_key().map(str::to_owned),
             system_prefix: None,
         })
     }
@@ -78,6 +85,7 @@ impl Opencode {
         Self {
             chat_compat: OpenAiCompatProvider::new(&CATALOG_CHAT_CONFIG, timeouts),
             auth: Some(auth),
+            zen_key: None,
             system_prefix: None,
         }
     }
@@ -98,11 +106,13 @@ impl Opencode {
     async fn lookup(&self, model: &Model) -> Result<Route, AgentError> {
         let model = model.clone();
         let auth_override = self.auth.clone();
+        let zen_key = self.zen_key.clone();
         smol::unblock(move || {
             route(
                 &init_shared_catalog_if_needed().lock().unwrap(),
                 &model,
                 auth_override.as_ref(),
+                zen_key.as_deref(),
             )
         })
         .await
@@ -166,7 +176,12 @@ impl Provider for Opencode {
         opts: &RequestOptions,
         _cache_key: Option<&CacheKey>,
     ) -> Result<WireRequest, AgentError> {
-        let route = route(&*warm_catalog_data()?, model, self.auth.as_ref())?;
+        let route = route(
+            &*warm_catalog_data()?,
+            model,
+            self.auth.as_ref(),
+            self.zen_key.as_deref(),
+        )?;
         Ok(self.request(&route, messages, system, tools, opts))
     }
 

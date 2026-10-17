@@ -898,6 +898,7 @@ impl Decisions {
             .unwrap_or_default();
         let turn = TurnUsage {
             provider: USAGE_PROVIDER.into(),
+            account: String::new(),
             model: model.into(),
             cwd,
             purpose: LedgerPurpose::Decision,

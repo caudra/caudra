@@ -47,6 +47,7 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `Ctrl+X m` | Model picker |
 | `Ctrl+X c` | Next favorite model |
 | `Ctrl+X d` | Next decision endpoint |
+| `Ctrl+X i` | Choose the provider account requests go to |
 | `Shift+Left` / `Shift+Right` | Pan a modal too wide for the screen left / right |
 | `Ctrl+X w` | Open the workbench |
 

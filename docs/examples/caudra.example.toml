@@ -12,12 +12,12 @@
 # caudra.toml holds the settings only you write. Other files hold what Caudra
 # writes itself, or what needs rules of its own: permissions.toml (permission
 # rules for tools and MCP servers), mcp.toml (MCP servers), providers.toml
-# (model providers and their models), workcell.toml (profiles for direct remote
-# Workcell connections), sandboxes.toml (managed sandbox providers, networks,
-# transfers, and profiles), init.lua (Lua code that sets up plugins), .env
-# (environment variables, such as API keys, for any the environment does not
-# set), commands/ (custom slash commands, one Markdown file each).
-# `caudra config files` shows where each one lives, and
+# (model providers, their models, and their accounts), workcell.toml (profiles
+# for direct remote Workcell connections), sandboxes.toml (managed sandbox
+# providers, networks, transfers, and profiles), init.lua (Lua code that sets
+# up plugins), .env (environment variables, such as API keys, for any the
+# environment does not set), commands/ (custom slash commands, one Markdown
+# file each). `caudra config files` shows where each one lives, and
 # `caudra config example FILE` prints the reference of a TOML file.
 #
 # Full reference: https://caudra.ai/docs/configuration/

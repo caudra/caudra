@@ -2599,7 +2599,6 @@ impl<'h> Agent<'h> {
             self.stream_retry
                 .wait(
                     error,
-                    &*self.provider,
                     &self.model,
                     Some(&self.event_tx),
                     &self.cancel,
@@ -3534,7 +3533,8 @@ impl<'h> Agent<'h> {
                 cost: self
                     .model
                     .billed_cost(&response.usage, self.opts.clamped(&self.model).fast),
-                billing: self.model.billing,
+                billing: response.billing(&self.model),
+                account: response.account_name(),
                 // The reply reaches history after this fires but is replayed by
                 // the next request all the same, so count it here too. Leaving
                 // it out is what the session would persist, and the bar would

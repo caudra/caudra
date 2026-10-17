@@ -49,6 +49,7 @@ use caudra_config::{
     AutomationsConfig, AutopilotConfig, ExecutionMode, Feature, FeatureDisabled, ModelPolicy,
     SnapshotsConfig, effective_shell_execution, effective_task_execution,
 };
+use caudra_providers::accounts::{AccountExhaustion, AccountSwitch, RoutedAccount};
 use caudra_providers::model::Model;
 use caudra_providers::{
     AutomationEventOrigin, AutopilotMessageKind, Billing, HistoryItem, HistoryItemKind,
@@ -133,6 +134,8 @@ const GOAL_FINISHED: &str = "finished";
 const NO_GOAL: &str = "none";
 pub(crate) const AUTOPILOT_SYSTEM_SUBTYPE: &str = "autopilot";
 const DECISION_SYSTEM_SUBTYPE: &str = "decision";
+pub(crate) const ACCOUNT_SWITCH_SYSTEM_SUBTYPE: &str = "account_switch";
+pub(crate) const ACCOUNT_EXHAUSTED_SYSTEM_SUBTYPE: &str = "account_exhausted";
 const AUTOPILOT_START: &str = "autopilot_start";
 const AUTOPILOT_STOP: &str = "autopilot_stop";
 const AUTOPILOT_STATUS: &str = "autopilot_status";
@@ -389,6 +392,24 @@ struct DecisionSystemPayload<'a> {
     decision: &'a DecisionNote,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_tool_use_id: Option<&'a str>,
+}
+
+/// The `system` / `account_switch` body: where requests went and why.
+#[derive(Serialize)]
+pub(crate) struct AccountSwitchPayload<'a> {
+    pub(crate) account: &'a RoutedAccount,
+    pub(crate) switch: &'a AccountSwitch,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) parent_tool_use_id: Option<&'a str>,
+}
+
+/// The `system` / `account_exhausted` body: the spent account, when it
+/// refills, and where else requests could go.
+#[derive(Serialize)]
+pub(crate) struct AccountExhaustedPayload<'a> {
+    pub(crate) exhaustion: &'a AccountExhaustion,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) parent_tool_use_id: Option<&'a str>,
 }
 
 /// The `system` / `workflow` body: the run's event plus the envelope's
@@ -3841,6 +3862,25 @@ impl EventPump {
             | AgentEvent::Unrecorded { .. }
             | AgentEvent::PromptProgress { .. } => {}
             AgentEvent::Autopilot(event) => self.emit_autopilot(event)?,
+            AgentEvent::AccountRouted {
+                account,
+                switch: Some(switch),
+            } => self.writer.emit_system(
+                ACCOUNT_SWITCH_SYSTEM_SUBTYPE,
+                serde_json::to_value(AccountSwitchPayload {
+                    account,
+                    switch,
+                    parent_tool_use_id: parent_tool_use_id.as_deref(),
+                })?,
+            )?,
+            AgentEvent::AccountRouted { switch: None, .. } => {}
+            AgentEvent::AccountExhausted(exhaustion) => self.writer.emit_system(
+                ACCOUNT_EXHAUSTED_SYSTEM_SUBTYPE,
+                serde_json::to_value(AccountExhaustedPayload {
+                    exhaustion,
+                    parent_tool_use_id: parent_tool_use_id.as_deref(),
+                })?,
+            )?,
             AgentEvent::Decision(note) => self.writer.emit_system(
                 DECISION_SYSTEM_SUBTYPE,
                 serde_json::to_value(DecisionSystemPayload {

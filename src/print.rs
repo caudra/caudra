@@ -37,7 +37,10 @@ use color_eyre::eyre::eyre;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::sdk_mode::{AUTOPILOT_SYSTEM_SUBTYPE, AutopilotSystemPayload};
+use crate::sdk_mode::{
+    ACCOUNT_EXHAUSTED_SYSTEM_SUBTYPE, ACCOUNT_SWITCH_SYSTEM_SUBTYPE, AUTOPILOT_SYSTEM_SUBTYPE,
+    AccountExhaustedPayload, AccountSwitchPayload, AutopilotSystemPayload,
+};
 
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const NO_PROMPT: &str = "no prompt: pass --prompt \"<text>\" or pipe text on stdin";
@@ -113,15 +116,26 @@ struct AutopilotSummary {
     escalations: u32,
 }
 
-/// An autopilot event, in the body an SDK client reads it in.
+/// A `system` event, in the body an SDK client reads it in.
 #[derive(Serialize)]
-struct AutopilotSystemEvent<'a> {
+struct SystemEvent<'a, P> {
     #[serde(rename = "type")]
     event_type: &'static str,
     subtype: &'static str,
     #[serde(flatten)]
-    payload: AutopilotSystemPayload<'a>,
+    payload: P,
     session_id: &'a SessionRef,
+}
+
+impl<'a, P: Serialize> SystemEvent<'a, P> {
+    fn new(subtype: &'static str, payload: P, session_id: &'a SessionRef) -> Self {
+        Self {
+            event_type: SYSTEM_EVENT,
+            subtype,
+            payload,
+            session_id,
+        }
+    }
 }
 
 /// What the run's autopilot events add up to.
@@ -217,12 +231,11 @@ fn note_autopilot(
 ) -> Result<()> {
     tally.observe(event);
     match (out, AutopilotSystemPayload::from_event(event)) {
-        (Some(out), Some(payload)) => out.emit(&AutopilotSystemEvent {
-            event_type: SYSTEM_EVENT,
-            subtype: AUTOPILOT_SYSTEM_SUBTYPE,
+        (Some(out), Some(payload)) => out.emit(&SystemEvent::new(
+            AUTOPILOT_SYSTEM_SUBTYPE,
             payload,
             session_id,
-        }),
+        )),
         _ => Ok(()),
     }
 }
@@ -496,6 +509,39 @@ pub fn run(
             AgentEvent::Autopilot(event) => {
                 note_autopilot(event, &mut tally, verbose_out.as_mut(), &session_id)?;
             }
+            AgentEvent::AccountRouted {
+                account,
+                switch: Some(switch),
+            } => match &mut verbose_out {
+                Some(out) => out.emit(&SystemEvent::new(
+                    ACCOUNT_SWITCH_SYSTEM_SUBTYPE,
+                    AccountSwitchPayload {
+                        account,
+                        switch,
+                        parent_tool_use_id,
+                    },
+                    &session_id,
+                ))?,
+                None => eprintln!(
+                    "Switched {} account {} → {}",
+                    account.provider, switch.from, account.name
+                ),
+            },
+            AgentEvent::AccountRouted { switch: None, .. } => {}
+            AgentEvent::AccountExhausted(exhaustion) => match &mut verbose_out {
+                Some(out) => out.emit(&SystemEvent::new(
+                    ACCOUNT_EXHAUSTED_SYSTEM_SUBTYPE,
+                    AccountExhaustedPayload {
+                        exhaustion,
+                        parent_tool_use_id,
+                    },
+                    &session_id,
+                ))?,
+                None => eprintln!(
+                    "{} account {} is spent; retrying once it refills, or pass --account {}:<name>",
+                    exhaustion.provider, exhaustion.account, exhaustion.provider
+                ),
+            },
             AgentEvent::Injected {
                 text, peer_event, ..
             } => {

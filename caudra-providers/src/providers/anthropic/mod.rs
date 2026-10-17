@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use caudra_storage::StateDir;
+use caudra_storage::accounts::AccountIdentity;
 use caudra_storage::auth::OAuthTokens;
 use caudra_storage::log::{outcome, target};
 use flume::Sender;
@@ -20,15 +20,17 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
-use crate::model::{Billing, Model};
+use crate::accounts::{AccountCredential, AccountSecret, QuotaWindow, WindowKind, quota};
+use crate::model::Model;
 use crate::provider::{BoxFuture, Provider, WireRequest};
+use crate::providers::oauth::AccountStore;
 use crate::types::THINKING_ADAPTIVE;
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
     UsageLimit,
 };
 
-use super::{KeyPool, Timeouts};
+use super::Timeouts;
 
 pub(crate) const API_VERSION: &str = "2023-06-01";
 const API_ORIGIN: &str = auth::API_ORIGIN;
@@ -59,11 +61,13 @@ const EMPTY_USAGE_ERROR: &str =
 const OAUTH_METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_CHANGED_STATUS: u16 = 503;
 const AUTH_CHANGED_MESSAGE: &str = "Anthropic authentication changed while retrying";
+const NO_CREDENTIAL: &str = "this Anthropic account has neither a login nor an API key";
 
+const PROVIDER: &str = "anthropic";
 const ENV_VAR: &str = "ANTHROPIC_API_KEY";
 
 inventory::submit!(caudra_config::providers::BuiltInProvider {
-    slug: "anthropic",
+    slug: PROVIDER,
     display_name: "Anthropic",
     protocol: caudra_config::providers::Protocol::Anthropic,
     default_base_url: API_ORIGIN,
@@ -171,6 +175,8 @@ struct OauthProfile {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct ProfileAccount {
+    uuid: Option<String>,
+    email_address: Option<String>,
     has_claude_pro: bool,
     has_claude_max: bool,
 }
@@ -178,6 +184,7 @@ struct ProfileAccount {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct ProfileOrganization {
+    name: Option<String>,
     organization_type: Option<String>,
 }
 
@@ -233,6 +240,8 @@ fn credits_limit(u: &OauthUsage) -> Option<UsageLimit> {
                 percentage,
                 reset_at: None,
                 detail,
+                window: None,
+                length_secs: None,
             });
         }
     }
@@ -246,7 +255,27 @@ fn credits_limit(u: &OauthUsage) -> Option<UsageLimit> {
         percentage,
         reset_at: None,
         detail,
+        window: None,
+        length_secs: None,
     })
+}
+
+fn limit_window(l: &ApiLimit) -> Option<WindowKind> {
+    match l.kind.as_str() {
+        "session" => Some(WindowKind::FiveHour),
+        "weekly_all" | "weekly_oauth_apps" | "seven_day_oauth_apps" => Some(WindowKind::Weekly),
+        "weekly_scoped" => Some(
+            match l
+                .scope
+                .pointer("/model/display_name")
+                .and_then(Value::as_str)
+            {
+                Some(model) => WindowKind::WeeklyScoped(model.to_ascii_lowercase()),
+                None => WindowKind::Weekly,
+            },
+        ),
+        other => Some(WindowKind::Other(other.replace('_', " "))),
+    }
 }
 
 impl From<OauthUsage> for ProviderUsage {
@@ -285,37 +314,74 @@ impl From<OauthUsage> for ProviderUsage {
             let percentage = limit.percent.and_then(usage_percentage);
             let reset_at = limit.resets_at.as_deref().and_then(parse_reset);
             if percentage.is_some() || reset_at.is_some() {
+                let window = limit_window(&limit);
                 limits.push(UsageLimit {
                     label: limit_label(&limit),
                     percentage,
                     reset_at,
                     detail: None,
+                    length_secs: window
+                        .as_ref()
+                        .and_then(|kind| QuotaWindow::new(kind.clone(), 0.0, None).length_secs),
+                    window,
                 });
             }
         }
         let windows = [
-            (!has_session, LABEL_SESSION, &u.five_hour),
-            (!has_weekly, LABEL_WEEK_ALL, &u.seven_day),
+            (
+                !has_session,
+                LABEL_SESSION,
+                &u.five_hour,
+                WindowKind::FiveHour,
+            ),
+            (
+                !has_weekly,
+                LABEL_WEEK_ALL,
+                &u.seven_day,
+                WindowKind::Weekly,
+            ),
             (
                 !has_oauth_apps,
                 "Weekly OAuth apps usage",
                 &u.seven_day_oauth_apps,
+                WindowKind::Weekly,
             ),
-            (!has_sonnet, "Weekly Sonnet usage", &u.seven_day_sonnet),
-            (!has_opus, "Weekly Opus usage", &u.seven_day_opus),
-            (!has_cinder_cove, "Cinder Cove usage", &u.cinder_cove),
+            (
+                !has_sonnet,
+                "Weekly Sonnet usage",
+                &u.seven_day_sonnet,
+                WindowKind::WeeklyScoped("sonnet".into()),
+            ),
+            (
+                !has_opus,
+                "Weekly Opus usage",
+                &u.seven_day_opus,
+                WindowKind::WeeklyScoped("opus".into()),
+            ),
+            (
+                !has_cinder_cove,
+                "Cinder Cove usage",
+                &u.cinder_cove,
+                WindowKind::Other("cinder cove".into()),
+            ),
         ];
-        limits.extend(windows.into_iter().filter_map(|(missing, label, window)| {
-            let window = missing.then_some(window)?.as_ref()?;
-            let percentage = window.utilization.and_then(usage_percentage);
-            let reset_at = window.resets_at.as_deref().and_then(parse_reset);
-            (percentage.is_some() || reset_at.is_some()).then_some(UsageLimit {
-                label: label.into(),
-                percentage,
-                reset_at,
-                detail: None,
-            })
-        }));
+        limits.extend(
+            windows
+                .into_iter()
+                .filter_map(|(missing, label, window, kind)| {
+                    let window = missing.then_some(window)?.as_ref()?;
+                    let percentage = window.utilization.and_then(usage_percentage);
+                    let reset_at = window.resets_at.as_deref().and_then(parse_reset);
+                    (percentage.is_some() || reset_at.is_some()).then(|| UsageLimit {
+                        label: label.into(),
+                        percentage,
+                        reset_at,
+                        detail: None,
+                        length_secs: QuotaWindow::new(kind.clone(), 0.0, None).length_secs,
+                        window: Some(kind),
+                    })
+                }),
+        );
         limits.extend(credits_limit(&u));
         ProviderUsage { plan: None, limits }
     }
@@ -329,6 +395,24 @@ fn parse_usage(response: &str) -> Result<ProviderUsage, AgentError> {
         });
     }
     Ok(usage)
+}
+
+fn profile_identity(profile: &OauthProfile) -> AccountIdentity {
+    AccountIdentity {
+        subject: profile
+            .account
+            .as_ref()
+            .and_then(|account| account.uuid.clone()),
+        email: profile
+            .account
+            .as_ref()
+            .and_then(|account| account.email_address.clone()),
+        organization: profile
+            .organization
+            .as_ref()
+            .and_then(|organization| organization.name.clone()),
+        plan: profile_plan(profile),
+    }
 }
 
 fn profile_plan(profile: &OauthProfile) -> Option<String> {
@@ -419,36 +503,25 @@ enum AuthMode {
     Injected,
 }
 
-fn resolve_native_auth(
-    storage: &StateDir,
+fn native_auth(
+    secret: &AccountSecret,
     base_url: Option<String>,
-) -> Result<
-    (
-        super::ResolvedAuth,
-        AuthMode,
-        Option<KeyPool>,
-        Option<OAuthTokens>,
-    ),
-    AgentError,
-> {
-    match auth::load_oauth_tokens(storage) {
-        Ok(Some(tokens)) => {
-            let resolved = auth::build_oauth_resolved(&tokens);
-            return Ok((resolved, AuthMode::ClaudeOauth, None, Some(tokens)));
-        }
-        Ok(None) => {}
-        Err(oauth_error) => match KeyPool::resolve("anthropic", ENV_VAR) {
-            Ok(pool) => {
-                warn!(error = %oauth_error, "Anthropic OAuth unavailable; using API key");
-                let resolved = resolve_auth_from_key(pool.current(), base_url);
-                return Ok((resolved, AuthMode::ApiKey, Some(pool), None));
-            }
-            Err(_) => return Err(oauth_error),
-        },
+) -> Result<AuthSnapshot, AgentError> {
+    match secret {
+        AccountSecret::OAuth(tokens) => Ok(AuthSnapshot {
+            resolved: auth::build_oauth_resolved(tokens),
+            mode: AuthMode::ClaudeOauth,
+            oauth_tokens: Some(tokens.clone()),
+        }),
+        AccountSecret::ApiKey { key, .. } => Ok(AuthSnapshot {
+            resolved: resolve_auth_from_key(key, base_url),
+            mode: AuthMode::ApiKey,
+            oauth_tokens: None,
+        }),
+        AccountSecret::Keyless => Err(AgentError::Config {
+            message: NO_CREDENTIAL.into(),
+        }),
     }
-    let pool = KeyPool::resolve("anthropic", ENV_VAR)?;
-    let resolved = resolve_auth_from_key(pool.current(), base_url);
-    Ok((resolved, AuthMode::ApiKey, Some(pool), None))
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -470,7 +543,6 @@ struct PreparedRequest {
 struct AuthState {
     resolved: Arc<Mutex<super::ResolvedAuth>>,
     mode: AuthMode,
-    key_pool: Option<KeyPool>,
     oauth_tokens: Option<OAuthTokens>,
 }
 
@@ -479,7 +551,7 @@ pub struct Anthropic {
     auth_state: Mutex<AuthState>,
     auth_update: async_lock::Mutex<()>,
     rejected_auth_credentials: Mutex<HashSet<String>>,
-    storage: Option<StateDir>,
+    store: Option<AccountStore>,
     system_prefix: Option<String>,
     stream_timeout: Duration,
     oauth_session_id: String,
@@ -493,25 +565,19 @@ pub struct Anthropic {
 }
 
 impl Anthropic {
-    pub fn new(timeouts: Timeouts) -> Result<Self, AgentError> {
-        let storage = StateDir::resolve()?;
+    pub fn new(account: &AccountCredential, timeouts: Timeouts) -> Result<Self, AgentError> {
         let resolved_base_url = resolve_anthropic_base_url();
-        let (resolved, auth_mode, pool, oauth_tokens) =
-            resolve_native_auth(&storage, resolved_base_url.clone())?;
-        if let Some(pool) = &pool {
-            debug!(keys = pool.len(), "using API key authentication");
-        }
+        let auth = native_auth(&account.secret, resolved_base_url.clone())?;
         Ok(Self {
             client: super::http_client(timeouts),
             auth_state: Mutex::new(AuthState {
-                resolved: Arc::new(Mutex::new(resolved)),
-                mode: auth_mode,
-                key_pool: pool,
-                oauth_tokens,
+                resolved: Arc::new(Mutex::new(auth.resolved)),
+                mode: auth.mode,
+                oauth_tokens: auth.oauth_tokens,
             }),
             auth_update: async_lock::Mutex::new(()),
             rejected_auth_credentials: Mutex::new(HashSet::new()),
-            storage: Some(storage),
+            store: AccountStore::for_account(account)?,
             system_prefix: None,
             stream_timeout: timeouts.stream,
             oauth_session_id: random_id(),
@@ -526,12 +592,11 @@ impl Anthropic {
             auth_state: Mutex::new(AuthState {
                 resolved: auth,
                 mode: AuthMode::Injected,
-                key_pool: None,
                 oauth_tokens: None,
             }),
             auth_update: async_lock::Mutex::new(()),
             rejected_auth_credentials: Mutex::new(HashSet::new()),
-            storage: None,
+            store: None,
             system_prefix: None,
             stream_timeout: timeouts.stream,
             oauth_session_id: random_id(),
@@ -598,7 +663,6 @@ impl Anthropic {
         let mut state = self.auth_state.lock().unwrap();
         *state.resolved.lock().unwrap() = auth::build_oauth_resolved(tokens);
         state.mode = AuthMode::ClaudeOauth;
-        state.key_pool = None;
         state.oauth_tokens = Some(tokens.clone());
         drop(state);
         let mut rejected = self.rejected_auth_credentials.lock().unwrap();
@@ -607,25 +671,18 @@ impl Anthropic {
         }
     }
 
-    fn install_resolved_auth(
-        &self,
-        resolved: super::ResolvedAuth,
-        mode: AuthMode,
-        key_pool: Option<KeyPool>,
-        oauth_tokens: Option<OAuthTokens>,
-    ) {
+    fn install_resolved_auth(&self, auth: AuthSnapshot) {
         let mut state = self.auth_state.lock().unwrap();
-        *state.resolved.lock().unwrap() = resolved;
-        state.mode = mode;
-        state.key_pool = key_pool;
-        state.oauth_tokens = oauth_tokens;
+        *state.resolved.lock().unwrap() = auth.resolved;
+        state.mode = auth.mode;
+        state.oauth_tokens = auth.oauth_tokens;
     }
 
     async fn refresh_oauth(
         &self,
         mut rejected_accesses: Vec<String>,
     ) -> Result<AuthSnapshot, AgentError> {
-        let storage = self.storage.clone().ok_or_else(|| AgentError::Config {
+        let store = self.store.clone().ok_or_else(|| AgentError::Config {
             message: "OAuth refresh not available for externally-managed auth".into(),
         })?;
         let _update = self.auth_update.lock().await;
@@ -639,7 +696,7 @@ impl Anthropic {
             }
         }
         let tokens =
-            smol::unblock(move || auth::refresh_from_storage(&storage, &rejected_accesses)).await?;
+            smol::unblock(move || auth::refresh_from_storage(&store, &rejected_accesses)).await?;
         self.install_oauth_tokens(&tokens);
         info!(
             target: target::PROVIDER,
@@ -653,8 +710,8 @@ impl Anthropic {
 
     async fn auth_for_request(&self) -> Result<AuthSnapshot, AgentError> {
         let snapshot = self.auth_snapshot();
-        let Some(storage) = self
-            .storage
+        let Some(store) = self
+            .store
             .clone()
             .filter(|_| snapshot.mode == AuthMode::ClaudeOauth)
         else {
@@ -667,15 +724,14 @@ impl Anthropic {
         }
         let attempted_access = auth_credential(&current.resolved);
         let rejected_accesses = self.rejected_auth_credentials();
-        let tokens =
-            smol::unblock(move || auth::refresh_from_storage(&storage, &rejected_accesses))
-                .await
-                .inspect_err(|error| {
-                    if oauth_auth_error(error) {
-                        self.mark_auth_rejected(attempted_access);
-                    }
-                    warn!(%error, "proactive Anthropic OAuth refresh failed");
-                })?;
+        let tokens = smol::unblock(move || auth::refresh_from_storage(&store, &rejected_accesses))
+            .await
+            .inspect_err(|error| {
+                if oauth_auth_error(error) {
+                    self.mark_auth_rejected(attempted_access);
+                }
+                warn!(%error, "proactive Anthropic OAuth refresh failed");
+            })?;
         self.install_oauth_tokens(&tokens);
         Ok(self.auth_snapshot())
     }
@@ -823,13 +879,16 @@ impl Anthropic {
         let status = response.status().as_u16();
 
         if status == 200 {
-            parse_sse_inner(
+            let quota = quota::from_anthropic_headers(response.headers());
+            let mut streamed = parse_sse_inner(
                 response,
                 event_tx,
                 self.stream_timeout,
                 request.oauth_tool_names.as_ref(),
             )
-            .await
+            .await?;
+            streamed.quota = quota;
+            Ok(streamed)
         } else {
             Err(AgentError::from_response(response).await)
         }
@@ -1087,14 +1146,13 @@ impl Provider for Anthropic {
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
-            let Some(storage) = self.storage.clone() else {
+            let Some(store) = self.store.clone() else {
                 return Ok(());
             };
             let _update = self.auth_update.lock().await;
             let base_url = self.resolved_base_url.clone();
-            let (resolved, mode, pool, oauth_tokens) =
-                smol::unblock(move || resolve_native_auth(&storage, base_url)).await?;
-            self.install_resolved_auth(resolved, mode, pool, oauth_tokens);
+            let auth = smol::unblock(move || native_auth(&store.reload()?, base_url)).await?;
+            self.install_resolved_auth(auth);
             let snapshot = self.auth_snapshot();
             let mut rejected = self.rejected_auth_credentials.lock().unwrap();
             if auth_credential(&snapshot.resolved)
@@ -1102,7 +1160,7 @@ impl Provider for Anthropic {
             {
                 rejected.clear();
             }
-            debug!("reloaded Anthropic auth from storage and environment");
+            debug!("reloaded Anthropic auth from storage");
             Ok(())
         })
     }
@@ -1132,22 +1190,6 @@ impl Provider for Anthropic {
         })
     }
 
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            let base_url = self.resolved_base_url.clone();
-            let state = self.auth_state.lock().unwrap();
-            let Some(pool) = state.key_pool.as_ref() else {
-                return Ok(false);
-            };
-            if !pool.rotate() {
-                return Ok(false);
-            }
-            *state.resolved.lock().unwrap() =
-                resolve_auth_from_key(pool.current(), base_url.clone());
-            Ok(true)
-        })
-    }
-
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
         Box::pin(async move {
             if !usage_eligible(&self.current_auth(), self.resolved_base_url.as_deref()) {
@@ -1162,11 +1204,9 @@ impl Provider for Anthropic {
     }
 
     fn adjust_model(&self, model: &mut Model) {
-        let mode = self.auth_snapshot().mode;
-        model.billing = Billing::from_oauth(mode == AuthMode::ClaudeOauth);
         // A custom endpoint speaks the protocol but may refuse a document,
         // so there a model reads PDFs only when its config declares it.
-        if mode != AuthMode::Injected {
+        if self.auth_snapshot().mode != AuthMode::Injected {
             model.supports_pdf = true;
         }
     }
@@ -1238,6 +1278,7 @@ async fn parse_sse_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Billing;
     use crate::providers::ResolvedAuth;
     use crate::providers::test_support::CREDENTIAL_IN_URL;
     use crate::{
@@ -1269,6 +1310,10 @@ mod tests {
         "only the last tool and the last block of the last message cache what precedes them";
     const REPLY_TEXT: &str = "reply";
     const FOLLOW_UP_TEXT: &str = "and then";
+    const ACCOUNT_NAME: &str = "personal";
+    const PROFILE_UUID: &str = "4f1c9e2a-account";
+    const PROFILE_EMAIL: &str = "jane@example.com";
+    const PROFILE_ORGANIZATION: &str = "Jane's Organization";
 
     const USAGE_BODY: &str = r#"{
         "five_hour": {"utilization": 14.0, "resets_at": "2026-02-06T22:00:00+00:00"},
@@ -1408,10 +1453,55 @@ mod tests {
         let profile = OauthProfile {
             organization: Some(ProfileOrganization {
                 organization_type: Some(organization_type.into()),
+                ..Default::default()
             }),
             ..Default::default()
         };
         assert_eq!(profile_plan(&profile).as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn profile_names_the_account_it_signs_in_as() {
+        let profile: OauthProfile = serde_json::from_value(json!({
+            "account": {
+                "uuid": PROFILE_UUID,
+                "email_address": PROFILE_EMAIL,
+                "has_claude_max": true,
+            },
+            "organization": {"name": PROFILE_ORGANIZATION, "organization_type": "claude_max"},
+        }))
+        .unwrap();
+
+        assert_eq!(
+            profile_identity(&profile),
+            AccountIdentity {
+                subject: Some(PROFILE_UUID.into()),
+                email: Some(PROFILE_EMAIL.into()),
+                organization: Some(PROFILE_ORGANIZATION.into()),
+                plan: Some("max".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn expired_tokens_do_not_refresh_at_construction() {
+        let account = AccountCredential {
+            secret: AccountSecret::OAuth(OAuthTokens {
+                access: CREDENTIAL.into(),
+                refresh: REFRESH_TOKEN.into(),
+                expires: 0,
+                account_id: None,
+            }),
+            ..crate::accounts::credential::test_support::api_key_account(
+                PROVIDER,
+                ACCOUNT_NAME,
+                CREDENTIAL,
+            )
+        };
+
+        let provider = Anthropic::new(&account, crate::providers::Timeouts::default()).unwrap();
+
+        assert_eq!(provider.current_auth().headers, oauth_auth().headers);
     }
 
     #[test]
@@ -2061,11 +2151,11 @@ data: {\"type\":\"content_block_stop\"}\n";
     const RATES_SURVIVE: &str = "a subscription still prices its tokens; only the payer changes, so zeroing the \
          rates would lose the figure instead of labelling it";
 
-    /// The inverse of what this used to assert. Pricing was zeroed under OAuth,
-    /// which is why a Claude subscription reported no cost at all.
-    #[test_case(AuthMode::ClaudeOauth, Billing::Subscription ; "a_subscription_owes_nothing")]
-    #[test_case(AuthMode::Injected,    Billing::Api          ; "an_api_key_is_invoiced")]
-    fn oauth_sets_the_payer_and_leaves_the_rates_alone(mode: AuthMode, expected: Billing) {
+    /// Pricing was once zeroed under OAuth, which is why a Claude subscription
+    /// reported no cost at all. The payer is the routed account's to set.
+    #[test_case(AuthMode::ClaudeOauth ; "a_subscription")]
+    #[test_case(AuthMode::Injected ; "an_api_key")]
+    fn adjusting_leaves_the_payer_and_the_rates_alone(mode: AuthMode) {
         let provider = Anthropic::with_auth(
             Arc::new(Mutex::new(ResolvedAuth::bearer("test-key"))),
             crate::providers::Timeouts::default(),
@@ -2076,7 +2166,7 @@ data: {\"type\":\"content_block_stop\"}\n";
         provider.auth_state.lock().unwrap().mode = mode;
         provider.adjust_model(&mut model);
 
-        assert_eq!(model.billing, expected);
+        assert_eq!(model.billing, Billing::default());
         assert_eq!(model.pricing.input, baseline.input, "{RATES_SURVIVE}");
         assert_eq!(model.pricing.output, baseline.output, "{RATES_SURVIVE}");
         assert_eq!(
@@ -2116,12 +2206,11 @@ data: {\"type\":\"content_block_stop\"}\n";
         provider.mark_auth_rejected(Some("rejected".into()));
         assert!(!provider.auth_replacement_available(&provider.auth_snapshot()));
 
-        provider.install_resolved_auth(
-            ResolvedAuth::bearer("replacement"),
-            AuthMode::Injected,
-            None,
-            None,
-        );
+        provider.install_resolved_auth(AuthSnapshot {
+            resolved: ResolvedAuth::bearer("replacement"),
+            mode: AuthMode::Injected,
+            oauth_tokens: None,
+        });
         assert!(provider.auth_replacement_available(&provider.auth_snapshot()));
     }
 

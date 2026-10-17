@@ -7,13 +7,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use caudra_storage::StateDir;
-use caudra_storage::auth::{
-    ProviderCredentials, delete_provider_credentials, load_provider_credentials,
-    save_provider_credentials,
-};
+use caudra_storage::accounts::{AccountIdentity, StoredSecret};
+use caudra_storage::auth::ProviderCredentials;
 use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
-use isahc::{HttpClient, Request};
+use isahc::{Body, HttpClient, Request, Response};
 use keyring::Entry;
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
@@ -27,6 +24,7 @@ use super::{
     PUBLIC_SLUG, PUBLIC_TOKEN_ENV,
 };
 use crate::AgentError;
+use crate::accounts::{AccountCredential, CredentialSource, LoginCredential};
 
 const PUBLIC_TOKEN_ENV_VARS: &[&str] = &[PUBLIC_TOKEN_ENV, "COPILOT_GITHUB_TOKEN"];
 const ENTERPRISE_TOKEN_ENV_VARS: &[&str] = &[ENTERPRISE_TOKEN_ENV];
@@ -34,6 +32,10 @@ pub const ENTERPRISE_HOST_ENV: &str = "GH_COPILOT_ENTERPRISE_HOST";
 const PUBLIC_HOST: &str = "github.com";
 const PUBLIC_SUBDOMAIN_SUFFIX: &str = ".github.com";
 pub(crate) const PUBLIC_GRAPHQL_URL: &str = "https://api.github.com/graphql";
+const PUBLIC_USER_URL: &str = "https://api.github.com/user";
+const ENTERPRISE_REST_PREFIX: &str = "https://api.";
+const USER_PATH: &str = "/user";
+const GITHUB_JSON_CONTENT_TYPE: &str = "application/vnd.github+json";
 const ENTERPRISE_API_PREFIX: &str = "https://copilot-api.";
 const HTTPS_SCHEME: &str = "https";
 const SCHEME_SEPARATOR: &str = "://";
@@ -110,7 +112,7 @@ impl CopilotIdentity {
             .find(|identity| identity.slug() == slug)
     }
 
-    const fn token_env_vars(self) -> &'static [&'static str] {
+    pub(crate) const fn token_env_vars(self) -> &'static [&'static str] {
         match self {
             Self::Public => PUBLIC_TOKEN_ENV_VARS,
             Self::Enterprise => ENTERPRISE_TOKEN_ENV_VARS,
@@ -214,6 +216,20 @@ impl CopilotAccount {
             Self::Enterprise(host) => Some(host.as_str().to_owned()),
         }
     }
+
+    fn user_url(&self) -> String {
+        match self {
+            Self::Public => PUBLIC_USER_URL.to_owned(),
+            Self::Enterprise(host) => {
+                format!("{ENTERPRISE_REST_PREFIX}{}{USER_PATH}", host.as_str())
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct GithubUser {
+    login: String,
 }
 
 /// A token and the enterprise host it belongs to; `None` is public GitHub.
@@ -228,38 +244,35 @@ fn config_error(message: impl Into<String>) -> AgentError {
     }
 }
 
-pub(crate) fn load_token(identity: CopilotIdentity) -> Result<CopilotCredentials, AgentError> {
-    resolve_credentials(
-        identity,
-        |name| env::var(name).ok(),
-        || {
-            StateDir::resolve()
-                .ok()
-                .and_then(|dir| load_provider_credentials(&dir, identity.slug()))
-        },
-    )
+/// The token and host `account` signs in with. A token from the environment
+/// or `providers.toml` carries no host, so an enterprise one takes it from
+/// the environment.
+pub(crate) fn account_credentials(
+    identity: CopilotIdentity,
+    account: &AccountCredential,
+) -> Result<CopilotCredentials, AgentError> {
+    credentials_from(identity, account, |name| env::var(name).ok())
 }
 
-fn resolve_credentials(
+fn credentials_from(
     identity: CopilotIdentity,
+    account: &AccountCredential,
     read_env: impl Fn(&str) -> Option<String>,
-    saved: impl FnOnce() -> Option<ProviderCredentials>,
 ) -> Result<CopilotCredentials, AgentError> {
-    if let Some((_, token)) = env_token(identity, &read_env) {
-        let host = match identity {
-            CopilotIdentity::Public => None,
-            CopilotIdentity::Enterprise => Some(env_enterprise_host(&read_env)?),
-        };
-        return Ok(CopilotCredentials { token, host });
-    }
-    let saved = saved().ok_or_else(|| config_error(not_authenticated(identity)))?;
-    debug!(
-        provider = identity.slug(),
-        "using saved Copilot credentials"
-    );
-    let host = saved_host(identity, saved.host.as_deref())?;
+    let token = account
+        .optional_api_key()
+        .ok_or_else(|| config_error(not_authenticated(identity)))?;
+    let host = match (account.host(), identity, &account.source) {
+        (
+            None,
+            CopilotIdentity::Enterprise,
+            CredentialSource::Env(_) | CredentialSource::Config,
+        ) => Some(env_enterprise_host(&read_env)?),
+        (host, _, _) => saved_host(identity, host)?,
+    };
+    debug!(account = %account.id, "using Copilot credentials");
     Ok(CopilotCredentials {
-        token: saved.api_key,
+        token: token.to_owned(),
         host,
     })
 }
@@ -326,29 +339,28 @@ fn not_authenticated(identity: CopilotIdentity) -> String {
     }
 }
 
-pub fn login(dir: &StateDir, account: &CopilotAccount) -> Result<(), AgentError> {
-    login_with(&NetworkIo::new()?, dir, account, present_challenge)
+pub fn login(account: &CopilotAccount) -> Result<LoginCredential, AgentError> {
+    let token = login_with(&NetworkIo::new()?, account, present_challenge)?;
+    Ok(signed_in(account, token))
 }
 
 fn login_with(
     io: &impl DeviceFlowIo,
-    dir: &StateDir,
     account: &CopilotAccount,
     present: impl FnOnce(&DeviceChallenge),
-) -> Result<(), AgentError> {
+) -> Result<String, AgentError> {
     let host = account.host();
     let token = device_login(io, host, present).inspect_err(|error| {
         warn!(%error, host, "Copilot device authorization failed");
     })?;
-    save(dir, account, token)?;
     println!(
         "Authenticated with {} ({host}).",
         account.identity().display_name()
     );
-    Ok(())
+    Ok(token)
 }
 
-pub fn import(dir: &StateDir, account: &CopilotAccount) -> Result<(), AgentError> {
+pub fn import(account: &CopilotAccount) -> Result<LoginCredential, AgentError> {
     let host = account.host();
     let mut hints = Vec::new();
     let Some(token) = discover_token(host, &mut hints) else {
@@ -361,38 +373,67 @@ pub fn import(dir: &StateDir, account: &CopilotAccount) -> Result<(), AgentError
             account.identity().slug()
         )));
     };
-    save(dir, account, token)?;
     println!("Copilot token for {host} imported from gh CLI / Copilot client / system keyring.");
-    Ok(())
+    Ok(signed_in(account, token))
 }
 
-fn save(dir: &StateDir, account: &CopilotAccount, token: String) -> Result<(), AgentError> {
-    let identity = account.identity();
-    save_provider_credentials(
-        dir,
-        identity.slug(),
-        &ProviderCredentials {
+fn signed_in(account: &CopilotAccount, token: String) -> LoginCredential {
+    let identity = fetch_identity(account, &token).unwrap_or_else(|error| {
+        warn!(%error, host = account.host(), "could not read which GitHub user the token belongs to");
+        AccountIdentity::default()
+    });
+    login_credential(account, token, identity)
+}
+
+fn login_credential(
+    account: &CopilotAccount,
+    token: String,
+    identity: AccountIdentity,
+) -> LoginCredential {
+    LoginCredential {
+        secret: StoredSecret::ApiKey(ProviderCredentials {
             api_key: token,
             host: account.stored_host(),
-        },
-    )?;
-    if let Some(name) = env_override(identity) {
-        eprintln!(
-            "warning: {name} is set and overrides the saved {} token",
-            identity.display_name()
-        );
+        }),
+        identity,
     }
-    Ok(())
 }
 
-pub fn logout(dir: &StateDir, identity: CopilotIdentity) -> Result<(), AgentError> {
-    let name = identity.display_name();
-    if delete_provider_credentials(dir, identity.slug())? {
-        println!("Logged out of {name}.");
-    } else {
-        println!("Not currently logged in to {name}.");
+fn fetch_identity(account: &CopilotAccount, token: &str) -> Result<AccountIdentity, AgentError> {
+    let request = Request::get(account.user_url())
+        .header("accept", GITHUB_JSON_CONTENT_TYPE)
+        .header("authorization", format!("Bearer {token}"))
+        .header("user-agent", crate::providers::user_agent())
+        .body(())?;
+    let mut response = NetworkIo::new()?.client.send(request)?;
+    let status = response.status().as_u16();
+    if status != HTTP_OK {
+        return Err(http_failure(status));
     }
-    Ok(())
+    Ok(github_identity(&read_bounded(&mut response)?)?)
+}
+
+/// GitHub names a user only by login, which is both who signed in and what
+/// the account is called.
+fn github_identity(body: &str) -> Result<AccountIdentity, serde_json::Error> {
+    let user: GithubUser = serde_json::from_str(body)?;
+    Ok(AccountIdentity {
+        subject: Some(user.login.clone()),
+        organization: Some(user.login),
+        ..AccountIdentity::default()
+    })
+}
+
+fn read_bounded(response: &mut Response<Body>) -> Result<String, AgentError> {
+    let mut bytes = Vec::new();
+    response
+        .body_mut()
+        .take(MAX_RESPONSE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(config_error(RESPONSE_TOO_LARGE));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 struct HttpReply {
@@ -426,17 +467,9 @@ impl NetworkIo {
 impl DeviceFlowIo for NetworkIo {
     fn post_json(&self, url: &str, body: &JsonValue) -> Result<HttpReply, AgentError> {
         let mut response = self.client.send(oauth_request(url, body)?)?;
-        let mut bytes = Vec::new();
-        response
-            .body_mut()
-            .take(MAX_RESPONSE_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_RESPONSE_BYTES {
-            return Err(config_error(RESPONSE_TOO_LARGE));
-        }
         Ok(HttpReply {
             status: response.status().as_u16(),
-            body: String::from_utf8_lossy(&bytes).into_owned(),
+            body: read_bounded(&mut response)?,
         })
     }
 
@@ -816,20 +849,20 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::{HashMap, VecDeque};
 
-    use caudra_storage::auth::load_provider_credentials;
-    use tempfile::TempDir;
+    use caudra_storage::accounts::{AccountId, AccountName};
     use test_case::test_case;
 
     use super::*;
+    use crate::accounts::AccountSecret;
 
     const HOST: &str = "myco.ghe.com";
     const DEVICE_CODE: &str = "device-secret-3584d83530557fdd";
     const USER_CODE: &str = "WDJB-MJHT";
     const ACCESS_TOKEN: &str = "gho_access_token";
-    const OLD_TOKEN: &str = "gho_old_token";
-    const PUBLIC_ENV_TOKEN: &str = "public-env-token";
     const ENTERPRISE_ENV_TOKEN: &str = "enterprise-env-token";
     const SAVED_TOKEN: &str = "saved-token";
+    const ACCOUNT: &str = "work";
+    const GITHUB_LOGIN: &str = "octocat";
     const ENTERPRISE_API: &str = "https://copilot-api.myco.ghe.com";
 
     fn enterprise_host() -> EnterpriseHost {
@@ -883,30 +916,40 @@ mod tests {
         move |name| map.get(name).cloned()
     }
 
-    fn saved(host: Option<&str>) -> Option<ProviderCredentials> {
-        Some(ProviderCredentials {
-            api_key: SAVED_TOKEN.into(),
-            host: host.map(str::to_owned),
-        })
+    fn account(
+        identity: CopilotIdentity,
+        secret: AccountSecret,
+        source: CredentialSource,
+    ) -> AccountCredential {
+        AccountCredential {
+            id: AccountId::new(identity.slug(), AccountName::new(ACCOUNT).unwrap()),
+            secret,
+            source,
+            identity: AccountIdentity::default(),
+        }
     }
 
-    #[test_case(&[(PUBLIC_TOKEN_ENV, PUBLIC_ENV_TOKEN)], PUBLIC_ENV_TOKEN ; "primary_env")]
-    #[test_case(&[("COPILOT_GITHUB_TOKEN", PUBLIC_ENV_TOKEN)], PUBLIC_ENV_TOKEN ; "secondary_env")]
-    #[test_case(&[(PUBLIC_TOKEN_ENV, " ")], SAVED_TOKEN ; "blank_env_falls_to_saved")]
-    #[test_case(&[(ENTERPRISE_TOKEN_ENV, ENTERPRISE_ENV_TOKEN), (ENTERPRISE_HOST_ENV, HOST)], SAVED_TOKEN ; "enterprise_env_ignored")]
-    fn public_credentials_resolve_in_order(env: &[(&str, &str)], expected: &str) {
-        let creds = resolve_credentials(CopilotIdentity::Public, env_of(env), || saved(None))
-            .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(creds.token, expected);
-        assert!(creds.host.is_none());
+    fn token(token: &str, host: Option<&str>) -> AccountSecret {
+        AccountSecret::ApiKey {
+            key: token.into(),
+            host: host.map(str::to_owned),
+        }
+    }
+
+    fn env_account(identity: CopilotIdentity) -> AccountCredential {
+        account(
+            identity,
+            token(ENTERPRISE_ENV_TOKEN, None),
+            CredentialSource::Env(ENTERPRISE_TOKEN_ENV.into()),
+        )
     }
 
     #[test]
     fn enterprise_env_needs_its_host() {
-        let error = resolve_credentials(
+        let error = credentials_from(
             CopilotIdentity::Enterprise,
-            env_of(&[(ENTERPRISE_TOKEN_ENV, ENTERPRISE_ENV_TOKEN)]),
-            || saved(Some(HOST)),
+            &env_account(CopilotIdentity::Enterprise),
+            env_of(&[]),
         )
         .err()
         .unwrap();
@@ -914,14 +957,11 @@ mod tests {
     }
 
     #[test]
-    fn enterprise_env_wins_with_its_host() {
-        let creds = resolve_credentials(
+    fn enterprise_env_takes_its_host_from_the_environment() {
+        let creds = credentials_from(
             CopilotIdentity::Enterprise,
-            env_of(&[
-                (ENTERPRISE_TOKEN_ENV, ENTERPRISE_ENV_TOKEN),
-                (ENTERPRISE_HOST_ENV, HOST),
-            ]),
-            || saved(Some("other.ghe.com")),
+            &env_account(CopilotIdentity::Enterprise),
+            env_of(&[(ENTERPRISE_HOST_ENV, HOST)]),
         )
         .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(creds.token, ENTERPRISE_ENV_TOKEN);
@@ -929,13 +969,16 @@ mod tests {
     }
 
     #[test]
-    fn enterprise_never_reads_public_env() {
-        let result = resolve_credentials(
+    fn an_account_without_a_token_is_not_authenticated() {
+        let keyless = account(
             CopilotIdentity::Enterprise,
-            env_of(&[(PUBLIC_TOKEN_ENV, PUBLIC_ENV_TOKEN)]),
-            || None,
+            AccountSecret::Keyless,
+            CredentialSource::Config,
         );
-        assert!(message(result.err().unwrap()).contains(ENTERPRISE_SLUG));
+        let error = credentials_from(CopilotIdentity::Enterprise, &keyless, env_of(&[]))
+            .err()
+            .unwrap();
+        assert!(message(error).contains(ENTERPRISE_SLUG));
     }
 
     #[test_case(CopilotIdentity::Enterprise, Some(HOST), Some(HOST) ; "enterprise_saved_host")]
@@ -947,7 +990,12 @@ mod tests {
         stored: Option<&str>,
         expected: Option<&str>,
     ) {
-        let creds = resolve_credentials(identity, env_of(&[]), || saved(stored))
+        let saved = account(
+            identity,
+            token(SAVED_TOKEN, stored),
+            CredentialSource::Stored,
+        );
+        let creds = credentials_from(identity, &saved, env_of(&[(ENTERPRISE_HOST_ENV, HOST)]))
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(creds.token, SAVED_TOKEN);
         assert_eq!(creds.host.as_ref().map(EnterpriseHost::as_str), expected);
@@ -956,10 +1004,40 @@ mod tests {
     #[test_case(None ; "missing_host")]
     #[test_case(Some("http://bad host") ; "invalid_host")]
     fn enterprise_saved_without_valid_host_asks_for_relogin(stored: Option<&str>) {
-        let error = resolve_credentials(CopilotIdentity::Enterprise, env_of(&[]), || saved(stored))
-            .err()
-            .unwrap();
+        let saved = account(
+            CopilotIdentity::Enterprise,
+            token(SAVED_TOKEN, stored),
+            CredentialSource::Stored,
+        );
+        let error = credentials_from(
+            CopilotIdentity::Enterprise,
+            &saved,
+            env_of(&[(ENTERPRISE_HOST_ENV, HOST)]),
+        )
+        .err()
+        .unwrap();
         assert!(message(error).contains(&format!("caudra auth login {ENTERPRISE_SLUG}")));
+    }
+
+    #[test_case(CopilotAccount::Public, PUBLIC_USER_URL ; "public")]
+    #[test_case(CopilotAccount::Enterprise(enterprise_host()), "https://api.myco.ghe.com/user" ; "enterprise")]
+    fn identity_is_read_from_the_accounts_own_api(account: CopilotAccount, expected: &str) {
+        assert_eq!(account.user_url(), expected);
+    }
+
+    #[test]
+    fn github_login_names_the_account() {
+        let identity =
+            github_identity(&json!({"login": GITHUB_LOGIN, "id": 1}).to_string()).unwrap();
+
+        assert_eq!(identity.subject.as_deref(), Some(GITHUB_LOGIN));
+        assert_eq!(
+            identity
+                .suggested_name()
+                .map(|name| name.to_string())
+                .as_deref(),
+            Some(GITHUB_LOGIN)
+        );
     }
 
     #[test_case(r#"{"github.com": {"oauth_token": "token-1"}}"#, PUBLIC_HOST => Some("token-1".to_owned()) ; "json_public")]
@@ -1265,67 +1343,25 @@ mod tests {
         assert!(error.ends_with("unauthorized_client"), "{error}");
     }
 
-    fn storage() -> (TempDir, StateDir) {
-        let temp = TempDir::new().unwrap();
-        let dir = StateDir::from_path(temp.path().to_path_buf());
-        (temp, dir)
-    }
+    #[test_case(CopilotAccount::Public, PUBLIC_HOST, None ; "public")]
+    #[test_case(CopilotAccount::Enterprise(enterprise_host()), HOST, Some(HOST) ; "enterprise")]
+    fn login_returns_the_token_and_its_host(
+        account: CopilotAccount,
+        host: &str,
+        stored_host: Option<&str>,
+    ) {
+        let io = FakeIo::new(vec![(HTTP_OK, challenge(host)), granted()]);
 
-    fn stored(dir: &StateDir, identity: CopilotIdentity) -> Option<ProviderCredentials> {
-        load_provider_credentials(dir, identity.slug())
-    }
+        let token = login_with(&io, &account, |_| {}).unwrap();
+        let login = login_credential(&account, token, AccountIdentity::default());
 
-    #[test]
-    fn login_saves_token_and_host_per_identity() {
-        let (_temp, dir) = storage();
-        let public = FakeIo::new(vec![(HTTP_OK, challenge(PUBLIC_HOST)), granted()]);
-        let enterprise = FakeIo::new(vec![(HTTP_OK, challenge(HOST)), granted()]);
-
-        login_with(&public, &dir, &CopilotAccount::Public, |_| {}).unwrap();
-        login_with(
-            &enterprise,
-            &dir,
-            &CopilotAccount::Enterprise(enterprise_host()),
-            |_| {},
-        )
-        .unwrap();
-
-        let public_creds = stored(&dir, CopilotIdentity::Public).unwrap();
-        assert_eq!(public_creds.api_key, ACCESS_TOKEN);
-        assert_eq!(public_creds.host, None);
-        let enterprise_creds = stored(&dir, CopilotIdentity::Enterprise).unwrap();
-        assert_eq!(enterprise_creds.host.as_deref(), Some(HOST));
-
-        logout(&dir, CopilotIdentity::Public).unwrap();
-        assert!(stored(&dir, CopilotIdentity::Public).is_none());
         assert_eq!(
-            stored(&dir, CopilotIdentity::Enterprise),
-            Some(enterprise_creds)
+            login.secret,
+            StoredSecret::ApiKey(ProviderCredentials {
+                api_key: ACCESS_TOKEN.into(),
+                host: stored_host.map(str::to_owned),
+            })
         );
-    }
-
-    #[test]
-    fn failed_login_keeps_the_previous_record() {
-        let (_temp, dir) = storage();
-        let previous = ProviderCredentials {
-            api_key: OLD_TOKEN.into(),
-            host: Some(HOST.into()),
-        };
-        save_provider_credentials(&dir, ENTERPRISE_SLUG, &previous).unwrap();
-        let io = FakeIo::new(vec![
-            (HTTP_OK, challenge(HOST)),
-            (HTTP_OK, json!({"error": ACCESS_DENIED})),
-        ]);
-
-        let result = login_with(
-            &io,
-            &dir,
-            &CopilotAccount::Enterprise(enterprise_host()),
-            |_| {},
-        );
-
-        assert!(result.is_err());
-        assert_eq!(stored(&dir, CopilotIdentity::Enterprise), Some(previous));
     }
 
     #[test]

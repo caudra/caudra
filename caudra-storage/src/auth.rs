@@ -1,5 +1,5 @@
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -11,13 +11,12 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use crate::{
-    StateDir, StorageError, atomic_write_permissions, exclusive_state_lock,
-    try_exclusive_state_lock,
-};
+use crate::{StateDir, StorageError, atomic_write_permissions, exclusive_state_lock};
 
-const AUTH_DIR: &str = "auth";
-const AUTH_FILE_MODE: u32 = 0o600;
+pub(crate) const AUTH_DIR: &str = "auth";
+pub(crate) const AUTH_FILE_MODE: u32 = 0o600;
+#[cfg(unix)]
+const PRIVATE_MODE_MASK: u32 = 0o077;
 const REFRESH_BUFFER_SECS: u64 = 60;
 const ACCESS_FIELD: &str = "access";
 const API_KEY_FIELD: &str = "api_key";
@@ -30,39 +29,34 @@ const WORKCELL_CREDENTIAL_FILE_MAX_BYTES: usize = MAX_WORKCELL_BEARER_TOKEN_BYTE
 
 pub const MAX_WORKCELL_CREDENTIAL_NAME_BYTES: usize = 64;
 pub const MAX_WORKCELL_BEARER_TOKEN_BYTES: usize = 16 * 1024;
-pub const MAX_DECISION_ENDPOINT_NAME_BYTES: usize = 64;
+pub const MAX_NAME_BYTES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum DecisionEndpointNameError {
-    #[error("decision endpoint name must not be empty")]
+pub enum NameError {
+    #[error("name must not be empty")]
     Empty,
-    #[error("decision endpoint name exceeds {MAX_DECISION_ENDPOINT_NAME_BYTES} bytes")]
+    #[error("name exceeds {MAX_NAME_BYTES} bytes")]
     TooLong,
-    #[error("decision endpoint name must start with a lowercase ASCII letter or digit")]
+    #[error("name must start with a lowercase ASCII letter or digit")]
     InvalidStart,
-    #[error(
-        "decision endpoint name may contain only lowercase ASCII letters, digits, '-', and '_'"
-    )]
+    #[error("name may contain only lowercase ASCII letters, digits, '-', and '_'")]
     InvalidCharacter,
 }
 
-/// Endpoint names key both `[decisions.<name>]` in `providers.toml` and the
-/// credential file, so they stay safe as a file stem and a bare TOML key.
-pub fn validate_decision_endpoint_name(name: &str) -> Result<(), DecisionEndpointNameError> {
-    let first = name
-        .bytes()
-        .next()
-        .ok_or(DecisionEndpointNameError::Empty)?;
-    if name.len() > MAX_DECISION_ENDPOINT_NAME_BYTES {
-        return Err(DecisionEndpointNameError::TooLong);
+/// Decision endpoint and account names key both a `providers.toml` entry and
+/// a credential file, so they stay safe as a file stem and a bare TOML key.
+pub fn validate_name(name: &str) -> Result<(), NameError> {
+    let first = name.bytes().next().ok_or(NameError::Empty)?;
+    if name.len() > MAX_NAME_BYTES {
+        return Err(NameError::TooLong);
     }
     if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
-        return Err(DecisionEndpointNameError::InvalidStart);
+        return Err(NameError::InvalidStart);
     }
     if !name.bytes().all(|byte| {
         byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
     }) {
-        return Err(DecisionEndpointNameError::InvalidCharacter);
+        return Err(NameError::InvalidCharacter);
     }
     Ok(())
 }
@@ -324,15 +318,6 @@ pub enum ProviderAuthKind {
     ApiKey,
 }
 
-impl ProviderAuth {
-    pub fn kind(&self) -> ProviderAuthKind {
-        match self {
-            Self::OAuth(_) => ProviderAuthKind::OAuth,
-            Self::ApiKey(_) => ProviderAuthKind::ApiKey,
-        }
-    }
-}
-
 impl ProviderCredentials {
     pub fn masked_api_key(&self) -> String {
         if self.api_key.len() > 8 {
@@ -379,7 +364,7 @@ fn decision_auth_path(
     name: &str,
     extension: &str,
 ) -> Result<PathBuf, StorageError> {
-    validate_decision_endpoint_name(name)?;
+    validate_name(name)?;
     Ok(dir
         .persistent_path()
         .join(AUTH_DIR)
@@ -400,7 +385,9 @@ fn try_load_auth<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, StorageE
     Ok(Some(serde_json::from_str(&data)?))
 }
 
-fn try_load_provider_auth_path(path: &Path) -> Result<Option<ProviderAuth>, StorageError> {
+pub(crate) fn try_load_provider_auth_path(
+    path: &Path,
+) -> Result<Option<ProviderAuth>, StorageError> {
     let data = match fs::read_to_string(path) {
         Ok(data) => data,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -432,7 +419,7 @@ fn try_load_provider_auth_path(path: &Path) -> Result<Option<ProviderAuth>, Stor
     }
 }
 
-fn save_auth(path: &Path, data: &impl Serialize) -> Result<(), StorageError> {
+pub(crate) fn save_auth(path: &Path, data: &impl Serialize) -> Result<(), StorageError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -442,7 +429,7 @@ fn save_auth(path: &Path, data: &impl Serialize) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn delete_auth(path: &Path) -> Result<bool, StorageError> {
+pub(crate) fn delete_auth(path: &Path) -> Result<bool, StorageError> {
     if path.exists() {
         fs::remove_file(path)?;
         return Ok(true);
@@ -454,18 +441,14 @@ pub fn load_workcell_credential(
     dir: &StateDir,
     name: &WorkcellCredentialName,
 ) -> Result<Option<WorkcellCredential>, StorageError> {
-    let path = workcell_auth_path(dir, name);
-    let Some(file) = open_workcell_credential(&path)? else {
+    let Some(data) = read_private_credential(
+        &workcell_auth_path(dir, name),
+        WORKCELL_CREDENTIAL_FILE_MAX_BYTES,
+        StorageError::InvalidWorkcellCredential,
+    )?
+    else {
         return Ok(None);
     };
-    let mut data = String::new();
-    file.take(WORKCELL_CREDENTIAL_FILE_MAX_BYTES as u64 + 1)
-        .read_to_string(&mut data)?;
-    if data.len() > WORKCELL_CREDENTIAL_FILE_MAX_BYTES {
-        return Err(StorageError::InvalidWorkcellCredential(
-            "credential record exceeds the size limit".into(),
-        ));
-    }
     let record: WorkcellCredentialRecord = serde_json::from_str(&data)?;
     if record.version != WORKCELL_CREDENTIAL_VERSION {
         return Err(StorageError::InvalidWorkcellCredential(format!(
@@ -476,12 +459,20 @@ pub fn load_workcell_credential(
     WorkcellCredential::new(record.bearer_token).map(Some)
 }
 
-fn open_workcell_credential(path: &Path) -> Result<Option<File>, StorageError> {
+/// Reads a secret only the current user can reach: never through a symlink,
+/// only from a regular file, owner-only on Unix, and at most `max_bytes`.
+/// `invalid` names the refusal in the caller's own error.
+pub(crate) fn read_private_credential(
+    path: &Path,
+    max_bytes: usize,
+    invalid: fn(String) -> StorageError,
+) -> Result<Option<String>, StorageError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err(StorageError::InvalidWorkcellCredential(
-                "credential path must be a regular non-symlink file".into(),
-            ));
+            return Err(invalid(format!(
+                "{} must be a regular file, not a symlink",
+                path.display()
+            )));
         }
         Ok(_) => {}
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -494,19 +485,29 @@ fn open_workcell_credential(path: &Path) -> Result<Option<File>, StorageError> {
     let file = options.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
-        return Err(StorageError::InvalidWorkcellCredential(
-            "credential path must be a regular file".into(),
-        ));
+        return Err(invalid(format!(
+            "{} must be a regular file",
+            path.display()
+        )));
     }
     #[cfg(unix)]
     if metadata.uid() != rustix::process::geteuid().as_raw()
-        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.permissions().mode() & PRIVATE_MODE_MASK != 0
     {
-        return Err(StorageError::InvalidWorkcellCredential(
-            "credential file must be owner-only and owned by the current user".into(),
-        ));
+        return Err(invalid(format!(
+            "{0} must be owner-only and owned by the current user; try: chmod 600 {0}",
+            path.display()
+        )));
     }
-    Ok(Some(file))
+    let mut data = String::new();
+    file.take(max_bytes as u64 + 1).read_to_string(&mut data)?;
+    if data.len() > max_bytes {
+        return Err(invalid(format!(
+            "{} exceeds the {max_bytes}-byte limit",
+            path.display()
+        )));
+    }
+    Ok(Some(data))
 }
 
 pub fn save_workcell_credential(
@@ -570,69 +571,6 @@ pub fn delete_workcell_credential(
     delete_auth(&workcell_auth_path(dir, name))
 }
 
-pub fn load_tokens(dir: &StateDir, provider: &str) -> Option<OAuthTokens> {
-    try_load_tokens(dir, provider).ok().flatten()
-}
-
-pub fn try_load_tokens(
-    dir: &StateDir,
-    provider: &str,
-) -> Result<Option<OAuthTokens>, StorageError> {
-    Ok(match try_load_provider_auth(dir, provider)? {
-        Some(ProviderAuth::OAuth(tokens)) => Some(tokens),
-        Some(ProviderAuth::ApiKey(_)) | None => None,
-    })
-}
-
-pub fn try_load_provider_auth(
-    dir: &StateDir,
-    provider: &str,
-) -> Result<Option<ProviderAuth>, StorageError> {
-    try_load_provider_auth_path(&auth_path(dir, provider))
-}
-
-pub fn save_tokens(
-    dir: &StateDir,
-    provider: &str,
-    tokens: &OAuthTokens,
-) -> Result<(), StorageError> {
-    save_auth(&auth_path(dir, provider), tokens)
-}
-
-pub fn delete_tokens(dir: &StateDir, provider: &str) -> Result<bool, StorageError> {
-    let path = auth_path(dir, provider);
-    match try_load_provider_auth_path(&path)? {
-        Some(ProviderAuth::OAuth(_)) => delete_auth(&path),
-        Some(ProviderAuth::ApiKey(_)) | None => Ok(false),
-    }
-}
-
-pub fn delete_provider_auth(dir: &StateDir, provider: &str) -> Result<bool, StorageError> {
-    let _lock = lock_provider_auth(dir, provider)?;
-    delete_auth(&auth_path(dir, provider))
-}
-
-pub fn lock_provider_auth(dir: &StateDir, provider: &str) -> Result<File, StorageError> {
-    exclusive_state_lock(
-        &dir.persistent_path()
-            .join(AUTH_DIR)
-            .join(format!("{provider}.lock")),
-        AUTH_FILE_MODE,
-    )
-}
-
-pub fn try_lock_provider_auth(
-    dir: &StateDir,
-    provider: &str,
-) -> Result<Option<File>, StorageError> {
-    try_exclusive_state_lock(
-        &dir.persistent_path()
-            .join(AUTH_DIR)
-            .join(format!("{provider}.lock")),
-        AUTH_FILE_MODE,
-    )
-}
-
 pub fn load_mcp_auth(dir: &StateDir, server_name: &str, expected_url: &str) -> Option<McpAuthData> {
     let data: McpAuthData = load_auth(&auth_path(dir, &format!("mcp-{server_name}")))?;
     if data.server_url != expected_url {
@@ -656,30 +594,6 @@ pub fn save_mcp_auth(
 
 pub fn delete_mcp_auth(dir: &StateDir, server_name: &str) -> Result<bool, StorageError> {
     delete_auth(&auth_path(dir, &format!("mcp-{server_name}")))
-}
-
-pub fn load_provider_credentials(dir: &StateDir, slug: &str) -> Option<ProviderCredentials> {
-    match try_load_provider_auth(dir, slug).ok().flatten()? {
-        ProviderAuth::ApiKey(credentials) => Some(credentials),
-        ProviderAuth::OAuth(_) => None,
-    }
-}
-
-pub fn save_provider_credentials(
-    dir: &StateDir,
-    slug: &str,
-    creds: &ProviderCredentials,
-) -> Result<(), StorageError> {
-    let _lock = lock_provider_auth(dir, slug)?;
-    save_auth(&auth_path(dir, slug), creds)
-}
-
-pub fn delete_provider_credentials(dir: &StateDir, slug: &str) -> Result<bool, StorageError> {
-    let path = auth_path(dir, slug);
-    match try_load_provider_auth_path(&path)? {
-        Some(ProviderAuth::ApiKey(_)) => delete_auth(&path),
-        Some(ProviderAuth::OAuth(_)) | None => Ok(false),
-    }
 }
 
 pub fn load_decision_credentials(
@@ -752,27 +666,8 @@ mod tests {
         assert_eq!(tokens.is_expired(), expected);
     }
 
-    #[test]
-    fn save_load_delete_round_trip() {
-        let tmp = TempDir::new().unwrap();
-        let dir = StateDir::from_path(tmp.path().to_path_buf());
-        let tokens = test_tokens();
-        save_tokens(&dir, TEST_PROVIDER, &tokens).unwrap();
-
-        let loaded = load_tokens(&dir, TEST_PROVIDER).unwrap();
-        assert_eq!(loaded.access, "access_tok");
-        assert_eq!(loaded.refresh, "refresh_tok");
-        assert_eq!(loaded.expires, 9_999_999_999);
-
-        #[cfg(unix)]
-        {
-            let metadata = fs::metadata(auth_path(&dir, TEST_PROVIDER)).unwrap();
-            assert_eq!(metadata.permissions().mode() & 0o777, AUTH_FILE_MODE);
-        }
-
-        assert!(delete_tokens(&dir, TEST_PROVIDER).unwrap());
-        assert!(load_tokens(&dir, TEST_PROVIDER).is_none());
-        assert!(!delete_tokens(&dir, TEST_PROVIDER).unwrap());
+    fn legacy_auth(dir: &StateDir, provider: &str) -> Result<Option<ProviderAuth>, StorageError> {
+        try_load_provider_auth_path(&auth_path(dir, provider))
     }
 
     #[test]
@@ -780,9 +675,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
         let tokens = test_tokens();
-        save_tokens(&dir, TEST_PROVIDER, &tokens).unwrap();
+        save_auth(&auth_path(&dir, TEST_PROVIDER), &tokens).unwrap();
         assert_eq!(
-            try_load_provider_auth(&dir, TEST_PROVIDER).unwrap(),
+            legacy_auth(&dir, TEST_PROVIDER).unwrap(),
             Some(ProviderAuth::OAuth(tokens))
         );
 
@@ -790,15 +685,10 @@ mod tests {
             api_key: "api-key".into(),
             host: None,
         };
-        save_provider_credentials(&dir, TEST_PROVIDER, &credentials).unwrap();
+        save_auth(&auth_path(&dir, TEST_PROVIDER), &credentials).unwrap();
         assert_eq!(
-            try_load_provider_auth(&dir, TEST_PROVIDER).unwrap(),
-            Some(ProviderAuth::ApiKey(credentials.clone()))
-        );
-        assert!(try_load_tokens(&dir, TEST_PROVIDER).unwrap().is_none());
-        assert_eq!(
-            load_provider_credentials(&dir, TEST_PROVIDER),
-            Some(credentials)
+            legacy_auth(&dir, TEST_PROVIDER).unwrap(),
+            Some(ProviderAuth::ApiKey(credentials))
         );
     }
 
@@ -815,30 +705,9 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            try_load_provider_auth(&dir, TEST_PROVIDER),
+            legacy_auth(&dir, TEST_PROVIDER),
             Err(StorageError::InvalidProviderAuth(_))
         ));
-    }
-
-    #[test]
-    fn typed_delete_preserves_other_auth_method() {
-        let tmp = TempDir::new().unwrap();
-        let dir = StateDir::from_path(tmp.path().to_path_buf());
-        let credentials = ProviderCredentials {
-            api_key: "api-key".into(),
-            host: None,
-        };
-        save_provider_credentials(&dir, TEST_PROVIDER, &credentials).unwrap();
-        assert!(!delete_tokens(&dir, TEST_PROVIDER).unwrap());
-        assert_eq!(
-            load_provider_credentials(&dir, TEST_PROVIDER),
-            Some(credentials)
-        );
-
-        let tokens = test_tokens();
-        save_tokens(&dir, TEST_PROVIDER, &tokens).unwrap();
-        assert!(!delete_provider_credentials(&dir, TEST_PROVIDER).unwrap());
-        assert_eq!(load_tokens(&dir, TEST_PROVIDER), Some(tokens));
     }
 
     #[test]
@@ -847,17 +716,16 @@ mod tests {
         let persistent = tmp.path().join("persistent");
         let volatile = tmp.path().join("volatile");
         let dir = StateDir::split(volatile.clone(), persistent.clone());
-        let tokens = OAuthTokens {
-            access: "access_tok".into(),
-            refresh: "refresh_tok".into(),
-            expires: 9_999_999_999,
-            account_id: None,
-        };
 
-        save_tokens(&dir, "anthropic", &tokens).unwrap();
+        save_auth(&auth_path(&dir, TEST_PROVIDER), &test_tokens()).unwrap();
 
-        assert_eq!(load_tokens(&dir, "anthropic").unwrap().access, "access_tok");
-        assert!(persistent.join(AUTH_DIR).join("anthropic.json").is_file());
+        assert!(legacy_auth(&dir, TEST_PROVIDER).unwrap().is_some());
+        assert!(
+            persistent
+                .join(AUTH_DIR)
+                .join(format!("{TEST_PROVIDER}.json"))
+                .is_file()
+        );
         assert!(!volatile.join(AUTH_DIR).exists());
     }
 
@@ -982,26 +850,26 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             AUTH_FILE_MODE
         );
-        assert!(load_provider_credentials(&dir, NAME).is_none());
+        assert!(legacy_auth(&dir, NAME).unwrap().is_none());
 
         assert!(delete_decision_credentials(&dir, NAME).unwrap());
         assert!(load_decision_credentials(&dir, NAME).unwrap().is_none());
         assert!(!delete_decision_credentials(&dir, NAME).unwrap());
     }
 
-    #[test_case("", DecisionEndpointNameError::Empty; "empty")]
-    #[test_case("-tunnel", DecisionEndpointNameError::InvalidStart; "leading_hyphen")]
-    #[test_case("Tunnel", DecisionEndpointNameError::InvalidStart; "uppercase")]
-    #[test_case("../escape", DecisionEndpointNameError::InvalidStart; "traversal")]
-    #[test_case("a/b", DecisionEndpointNameError::InvalidCharacter; "separator")]
-    #[test_case("a.b", DecisionEndpointNameError::InvalidCharacter; "dot")]
-    fn decision_credential_names_are_validated(name: &str, expected: DecisionEndpointNameError) {
+    #[test_case("", NameError::Empty; "empty")]
+    #[test_case("-tunnel", NameError::InvalidStart; "leading_hyphen")]
+    #[test_case("Tunnel", NameError::InvalidStart; "uppercase")]
+    #[test_case("../escape", NameError::InvalidStart; "traversal")]
+    #[test_case("a/b", NameError::InvalidCharacter; "separator")]
+    #[test_case("a.b", NameError::InvalidCharacter; "dot")]
+    fn decision_credential_names_are_validated(name: &str, expected: NameError) {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
-        assert_eq!(validate_decision_endpoint_name(name), Err(expected));
+        assert_eq!(validate_name(name), Err(expected));
         assert!(matches!(
             save_decision_credentials(&dir, name, "key"),
-            Err(StorageError::InvalidDecisionEndpointName(actual)) if actual == expected
+            Err(StorageError::InvalidName(actual)) if actual == expected
         ));
         assert!(load_decision_credentials(&dir, name).is_err());
         assert!(delete_decision_credentials(&dir, name).is_err());
@@ -1010,12 +878,10 @@ mod tests {
     #[test]
     fn decision_credential_names_are_bounded() {
         assert_eq!(
-            validate_decision_endpoint_name(&"x".repeat(MAX_DECISION_ENDPOINT_NAME_BYTES + 1)),
-            Err(DecisionEndpointNameError::TooLong)
+            validate_name(&"x".repeat(MAX_NAME_BYTES + 1)),
+            Err(NameError::TooLong)
         );
-        assert!(
-            validate_decision_endpoint_name(&"x".repeat(MAX_DECISION_ENDPOINT_NAME_BYTES)).is_ok()
-        );
+        assert!(validate_name(&"x".repeat(MAX_NAME_BYTES)).is_ok());
     }
 
     #[test]

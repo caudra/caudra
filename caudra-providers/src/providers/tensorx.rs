@@ -3,18 +3,18 @@ use std::sync::{Arc, Mutex};
 use flume::Sender;
 use serde_json::{Value, json};
 
+use crate::accounts::AccountCredential;
 use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
 };
 
+use super::ResolvedAuth;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyPool, ResolvedAuth};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "tensorx",
-    api_key_env: "TENSORX_API_KEY",
     base_url: "https://api.tensorx.ai/v1",
     max_tokens_field: "max_tokens",
     include_stream_usage: true,
@@ -46,17 +46,14 @@ struct TensorXModelInfo {
 pub struct TensorX {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
-    key_pool: Option<KeyPool>,
     system_prefix: Option<String>,
 }
 
 impl TensorX {
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve("tensorx", CONFIG.api_key_env)?;
+    pub fn new(account: &AccountCredential, timeouts: super::Timeouts) -> Result<Self, AgentError> {
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(pool.current()))),
-            key_pool: Some(pool),
+            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(account.api_key()?))),
             system_prefix: None,
         })
     }
@@ -65,7 +62,6 @@ impl TensorX {
         Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth,
-            key_pool: None,
             system_prefix: None,
         }
     }
@@ -244,15 +240,6 @@ impl Provider for TensorX {
                 .unwrap_or_default();
             models.sort_by(|a, b| a.id.cmp(&b.id));
             Ok(models)
-        })
-    }
-
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            Ok(self
-                .key_pool
-                .as_ref()
-                .is_some_and(|p| p.rotate_auth(&self.auth, ResolvedAuth::bearer)))
         })
     }
 }

@@ -117,6 +117,7 @@ impl Spend {
         };
         let turn = TurnUsage {
             provider: model.provider.to_string(),
+            account: String::new(),
             model: model.id.clone(),
             cwd,
             purpose: LedgerPurpose::Memory,

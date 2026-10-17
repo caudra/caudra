@@ -16,16 +16,15 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use caudra_config::ImageModel;
 use caudra_storage::StateDir;
-use caudra_storage::auth::try_load_tokens;
 use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use isahc::Request;
 use serde_json::{Value, json};
 use tracing::debug;
 
-use super::auth::{
-    CODING_PLAN_BASE_URL, PROVIDER, build_coding_plan_resolved, refresh_from_storage,
-};
+use super::auth::{CODING_PLAN_BASE_URL, PROVIDER, build_coding_plan_resolved, refresh_tokens};
 use crate::AgentError;
+use crate::accounts::oauth_account;
+use crate::providers::oauth::{AccountStore, RefreshReason};
 use crate::providers::{
     ResolvedAuth, SseErrorDetail, SseErrorPayload, Timeouts, http_client, next_sse_line, user_agent,
 };
@@ -131,17 +130,14 @@ pub async fn generate(dir: &StateDir, req: &ImageRequest<'_>) -> Result<Vec<u8>,
     parse_sse(BufReader::new(response.into_body()), timeouts.stream).await
 }
 
-/// Unlike `openai_auth::resolve`, this refreshes rather than handing back an
-/// expired access token: a one-shot request has no retry loop behind it.
+/// Refreshes rather than handing back an expired access token: a one-shot
+/// request has no retry loop behind it.
 fn resolve_auth(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
-    let tokens = try_load_tokens(dir, PROVIDER)?.ok_or_else(|| AgentError::Config {
+    let account = oauth_account(PROVIDER).ok_or_else(|| AgentError::Config {
         message: NOT_AUTHENTICATED.into(),
     })?;
-    let tokens = if tokens.is_expired() {
-        refresh_from_storage(dir, &[])?
-    } else {
-        tokens
-    };
+    let tokens = AccountStore::new(dir.clone(), account.id)
+        .refresh(RefreshReason::Proactive, refresh_tokens)?;
     Ok(build_coding_plan_resolved(&tokens))
 }
 

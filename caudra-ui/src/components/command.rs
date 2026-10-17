@@ -357,6 +357,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         features: &[],
     },
     BuiltinCommand {
+        name: "/accounts",
+        description: "Choose which account of the model's provider requests go to",
+        max_args: 0,
+        scope: ChatScope::MainOnly,
+        features: &[],
+    },
+    BuiltinCommand {
         name: "/decision-model",
         description: "Pick the decision endpoint that screens tool calls",
         max_args: 0,

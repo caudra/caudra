@@ -242,10 +242,6 @@ impl AgentError {
         model_unavailable_message(message)
     }
 
-    pub fn should_rotate_key(&self) -> bool {
-        matches!(self, Self::Api { status, .. } if *status == 429 || *status == 401 || *status == 403)
-    }
-
     pub fn user_message(&self) -> String {
         let message = self.user_message_without_wait();
         // Retrying stopped somewhere the user cannot see; when the provider named a
@@ -556,7 +552,6 @@ mod tests {
         assert_eq!(error.to_string(), STEERING_DISPLAY);
         assert_eq!(error.retry_message(), STEERING_DISPLAY);
         assert!(!error.is_retryable());
-        assert!(!error.should_rotate_key());
         assert!(!error.is_context_overflow());
         assert_eq!(error.status(), None);
         assert_eq!(error.retry_after(), None);

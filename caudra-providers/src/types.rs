@@ -20,12 +20,14 @@ pub use caudra_storage::thinking::{
 use caudra_storage::thinking::{EFFORT_NONE, StoredThinking, effort_rank};
 use caudra_storage::tool_outputs::ToolOutputRef;
 use serde::{Deserialize, Serialize};
+
+use crate::accounts::{AccountSwitch, QuotaWindow, RoutedAccount, WindowKind};
 use serde_json::{Map, Value, json};
 use strum::{Display, IntoStaticStr};
 use tracing::warn;
 
 use crate::TokenUsage;
-use crate::model::Model;
+use crate::model::{Billing, Model};
 
 const LOCAL_BUDGET_FIELD: &str = "thinking_budget_tokens";
 const INVALID_TOOL_JSON_EXCERPT: usize = 2_000;
@@ -1012,6 +1014,14 @@ pub enum ProviderEvent {
         total: u32,
         cache: u32,
     },
+    /// The account a request goes to, sent before it does, and again once its
+    /// response changed what the account has left. `switch` is set when a
+    /// conversation moved from another account.
+    AccountRouted {
+        account: RoutedAccount,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        switch: Option<AccountSwitch>,
+    },
 }
 
 impl ProviderEvent {
@@ -1593,6 +1603,25 @@ pub struct StreamResponse {
     pub stop_reason: Option<StopReason>,
     pub tool_name_aliases: Option<ToolNameAliases>,
     pub invalid_tool_inputs: HashMap<String, InvalidToolInput>,
+    /// The account that served the request, set by the routing provider.
+    pub account: Option<RoutedAccount>,
+    /// Quota windows the response headers reported, which the routing
+    /// provider takes before the response leaves it.
+    pub quota: Vec<QuotaWindow>,
+}
+
+impl StreamResponse {
+    /// Who pays for this response: the account that served it, else whatever
+    /// the model was resolved with.
+    pub fn billing(&self, model: &Model) -> Billing {
+        self.account
+            .as_ref()
+            .map_or(model.billing, |account| account.billing)
+    }
+
+    pub fn account_name(&self) -> Option<String> {
+        self.account.as_ref().map(|account| account.name.clone())
+    }
 }
 
 /// Provider-reported usage quota, independent of local token accounting. Not every
@@ -1619,6 +1648,23 @@ pub struct UsageLimit {
     /// Extra provider-supplied context, e.g. "$2.33 spent" for usage credits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The normalized window, when the limit is one that refills.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<WindowKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length_secs: Option<u64>,
+}
+
+impl UsageLimit {
+    /// The limit as switching reads it, when it is a refilling window.
+    pub fn quota_window(&self) -> Option<QuotaWindow> {
+        let kind = self.window.clone()?;
+        let mut window = QuotaWindow::new(kind, self.percentage? as f32, self.reset_at);
+        if let Some(length_secs) = self.length_secs {
+            window.length_secs = Some(length_secs);
+        }
+        Some(window)
+    }
 }
 
 #[cfg(test)]

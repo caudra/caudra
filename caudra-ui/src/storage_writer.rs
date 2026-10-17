@@ -18,6 +18,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use caudra_agent::peers::PeerSession;
+use caudra_storage::account_switches::StoredAccountSwitch;
 use caudra_storage::autopilot::{
     DecisionOutcome, StoredAutopilotDecision, StoredAutopilotEngagement,
 };
@@ -59,6 +60,8 @@ const CHECKPOINT_COMMIT_INTERVAL: u32 = 128;
 const CHECKPOINT_STALL_WARNING_COUNT: u32 = 2;
 const WRITER_UNAVAILABLE: &str = "storage writer unavailable";
 const WRITER_TIMEOUT: &str = "storage writer operation timed out";
+const DECISION_ROW: &str = "decision";
+const ACCOUNT_SWITCH_ROW: &str = "account switch";
 const WRITER_DRAIN_FAILED: &str = "storage writer stopped with unsaved session operations";
 const USAGE_DRAIN_FAILED: &str = "storage writer stopped with unsaved usage contributions";
 const TOOL_DRAIN_FAILED: &str = "storage writer stopped with unsaved tool activity";
@@ -175,6 +178,7 @@ pub struct StorageWriter {
     autopilot_writes: PendingRows<AutopilotWrite>,
     goal_writes: PendingRows<GoalLogWrite>,
     engine_decisions: PendingRows<StoredEngineDecision>,
+    account_switches: PendingRows<StoredAccountSwitch>,
     done_rx: flume::Receiver<Result<(), SessionError>>,
     thread: JoinHandle<()>,
     generation: Arc<AtomicU64>,
@@ -199,6 +203,8 @@ impl StorageWriter {
         let writer_goal_writes = Arc::clone(&goal_writes);
         let engine_decisions: PendingRows<StoredEngineDecision> = Arc::default();
         let writer_engine_decisions = Arc::clone(&engine_decisions);
+        let account_switches: PendingRows<StoredAccountSwitch> = Arc::default();
+        let writer_account_switches = Arc::clone(&account_switches);
         let (wake, wake_rx) = flume::bounded::<()>(1);
         let wake = Arc::new(wake);
         let (done_tx, done_rx) = flume::bounded(1);
@@ -221,6 +227,7 @@ impl StorageWriter {
                     autopilot_writes: writer_autopilot_writes,
                     goal_writes: writer_goal_writes,
                     engine_decisions: writer_engine_decisions,
+                    account_switches: writer_account_switches,
                     deleted_sessions: HashMap::new(),
                     failing: HashSet::new(),
                     workspace_tabs_errors: HashMap::new(),
@@ -261,6 +268,7 @@ impl StorageWriter {
             autopilot_writes,
             goal_writes,
             engine_decisions,
+            account_switches,
             done_rx,
             thread,
             generation,
@@ -364,17 +372,28 @@ impl StorageWriter {
     /// already exist or be queued. Never coalesced: the transcript shows every
     /// one.
     pub fn record_engine_decision(&self, session_id: CaudraId, decision: StoredEngineDecision) {
-        self.engine_decisions
-            .lock()
+        self.queue_row(&self.engine_decisions, session_id, decision, DECISION_ROW);
+    }
+
+    /// Keeps an account-switch transcript row for `session_id`, on the same
+    /// terms as [`Self::record_engine_decision`].
+    pub fn record_account_switch(&self, session_id: CaudraId, switch: StoredAccountSwitch) {
+        self.queue_row(
+            &self.account_switches,
+            session_id,
+            switch,
+            ACCOUNT_SWITCH_ROW,
+        );
+    }
+
+    fn queue_row<T>(&self, rows: &PendingRows<T>, session_id: CaudraId, row: T, kind: &str) {
+        rows.lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(QueuedRow {
-                session_id,
-                row: decision,
-            });
+            .push(QueuedRow { session_id, row });
         match self.wake.try_send(()) {
             Ok(()) | Err(flume::TrySendError::Full(())) => {}
             Err(flume::TrySendError::Disconnected(())) => {
-                warn!(%session_id, "storage writer unavailable; a decision row may not be recorded");
+                warn!(%session_id, kind, "storage writer unavailable; a transcript row may not be recorded");
             }
         }
     }
@@ -566,6 +585,7 @@ struct Writer {
     autopilot_writes: PendingRows<AutopilotWrite>,
     goal_writes: PendingRows<GoalLogWrite>,
     engine_decisions: PendingRows<StoredEngineDecision>,
+    account_switches: PendingRows<StoredAccountSwitch>,
     /// Explicit recreation capability retained only by the writer that
     /// completed an ordered delete; ordinary stale saves cannot cross tombstones.
     deleted_sessions: HashMap<CaudraId, SessionRecreation>,
@@ -862,6 +882,18 @@ impl Writer {
         }
     }
 
+    /// Dropped with a warning on failure, like decisions.
+    fn write_account_switches(&mut self, switches: Vec<QueuedRow<StoredAccountSwitch>>) {
+        let Some(database) = self.decisions_database(switches.len()) else {
+            return;
+        };
+        for QueuedRow { session_id, row } in switches {
+            if let Err(error) = database.insert_account_switches(session_id, &[row]) {
+                warn!(%error, %session_id, "account switch row write failed");
+            }
+        }
+    }
+
     /// One pass over everything queued. The tabs request is claimed before the
     /// snapshots are written, because `write_workspace_tabs` keeps only the ids
     /// the database still holds and the slot is emptied by the claim. Reading
@@ -884,12 +916,14 @@ impl Writer {
         let autopilot_writes = snapshot(&self.autopilot_writes);
         let goal_writes = snapshot(&self.goal_writes);
         let engine_decisions = claim(&self.engine_decisions);
+        let account_switches = claim(&self.account_switches);
         self.flush(pending);
         self.write_autopilot(&autopilot_writes);
         drain_written(&self.autopilot_writes, autopilot_writes.len());
         self.write_goal_log(&goal_writes);
         drain_written(&self.goal_writes, goal_writes.len());
         self.write_engine_decisions(engine_decisions);
+        self.write_account_switches(account_switches);
         self.flush_permissions();
         if let Some(request) = request {
             self.flush_workspace_tabs(request);
@@ -1625,6 +1659,7 @@ mod tests {
             autopilot_writes: Arc::default(),
             goal_writes: Arc::default(),
             engine_decisions: Arc::default(),
+            account_switches: Arc::default(),
             deleted_sessions: HashMap::new(),
             failing: HashSet::new(),
             workspace_tabs_errors: HashMap::new(),
@@ -2308,6 +2343,7 @@ mod tests {
     fn spend(model: &str, cost: Option<f64>) -> TurnUsage {
         TurnUsage {
             provider: PROVIDER.into(),
+            account: String::new(),
             model: model.into(),
             cwd: CWD.into(),
             purpose: LedgerPurpose::Chat,

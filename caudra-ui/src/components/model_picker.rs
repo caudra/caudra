@@ -1049,7 +1049,9 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         builtin.display_name.to_string()
     } else {
         let config = caudra_config::providers::ProvidersConfig::load();
-        config.get(provider_str)?;
+        if !config.defines_provider(provider_str) {
+            return None;
+        }
         caudra_config::providers::resolve_display_name(provider_str, config.get(provider_str))
     };
 

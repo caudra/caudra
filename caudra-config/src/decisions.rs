@@ -1,6 +1,6 @@
 use std::fmt;
 
-use caudra_storage::auth::{DecisionEndpointNameError, validate_decision_endpoint_name};
+use caudra_storage::auth::{NameError, validate_name};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
@@ -187,10 +187,7 @@ pub enum DecisionsConfigError {
         message: &'static str,
     },
     #[error("invalid providers.toml: decisions.{name}: {source}")]
-    EndpointName {
-        name: String,
-        source: DecisionEndpointNameError,
-    },
+    EndpointName { name: String, source: NameError },
     #[error(
         "invalid config: [decisions] no longer takes {keys}; decision endpoints are named tables in the global providers.toml now. Remove them from caudra.toml and add this to providers.toml:\n\n{table}\nor run `caudra auth login --decision` to set one up"
     )]
@@ -787,11 +784,9 @@ pub struct DecisionEndpointDef {
 
 impl DecisionEndpointDef {
     pub fn resolve(&self, name: &str) -> Result<DecisionEndpoint, DecisionsConfigError> {
-        validate_decision_endpoint_name(name).map_err(|source| {
-            DecisionsConfigError::EndpointName {
-                name: name.into(),
-                source,
-            }
+        validate_name(name).map_err(|source| DecisionsConfigError::EndpointName {
+            name: name.into(),
+            source,
         })?;
         let allow_http = self.allow_http.unwrap_or(false);
         let endpoint = DecisionEndpoint {
@@ -952,11 +947,9 @@ impl DecisionEndpoint {
     }
 
     pub fn validate(&self) -> Result<(), DecisionsConfigError> {
-        validate_decision_endpoint_name(&self.name).map_err(|source| {
-            DecisionsConfigError::EndpointName {
-                name: self.name.clone(),
-                source,
-            }
+        validate_name(&self.name).map_err(|source| DecisionsConfigError::EndpointName {
+            name: self.name.clone(),
+            source,
         })?;
         self.check().map_err(|error| error.for_endpoint(&self.name))
     }
@@ -1064,7 +1057,7 @@ mod tests {
         PLAIN_HTTP_MESSAGE, RawDecisionsConfig,
     };
     use crate::{ConfigError, RawConfig};
-    use caudra_storage::auth::DecisionEndpointNameError;
+    use caudra_storage::auth::NameError;
     use test_case::test_case;
 
     const NAME: &str = "tunnel";
@@ -1390,10 +1383,10 @@ mod tests {
         assert_eq!(endpoint.path(), path);
     }
 
-    #[test_case("", DecisionEndpointNameError::Empty; "empty")]
-    #[test_case("My Endpoint", DecisionEndpointNameError::InvalidStart; "unslugged")]
-    #[test_case("a.b", DecisionEndpointNameError::InvalidCharacter; "dotted")]
-    fn endpoint_names_must_be_slugs(name: &str, expected: DecisionEndpointNameError) {
+    #[test_case("", NameError::Empty; "empty")]
+    #[test_case("My Endpoint", NameError::InvalidStart; "unslugged")]
+    #[test_case("a.b", NameError::InvalidCharacter; "dotted")]
+    fn endpoint_names_must_be_slugs(name: &str, expected: NameError) {
         assert_eq!(
             def(DecisionProtocol::TypeSafe, REMOTE_BASE_URL, false).resolve(name),
             Err(DecisionsConfigError::EndpointName {

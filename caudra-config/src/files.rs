@@ -92,7 +92,7 @@ pub const MCP: ConfigFile = ConfigFile {
 pub const PROVIDERS: ConfigFile = ConfigFile {
     name: PROVIDERS_FILE,
     scopes: GLOBAL,
-    holds: "model providers and their models",
+    holds: "model providers, their models, and their accounts",
     separate_because: "`caudra auth login` and `caudra auth logout` write it, and it can hold API keys",
     feature: None,
     docs: "/docs/providers/#providers-toml",

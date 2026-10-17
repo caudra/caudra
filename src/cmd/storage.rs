@@ -1071,6 +1071,7 @@ mod tests {
         UsageBucket {
             bucket_start,
             provider: provider.into(),
+            account: String::new(),
             model: model.into(),
             cwd: cwd.into(),
             purpose: purpose.storage_name().into(),

@@ -3088,6 +3088,7 @@ mod tests {
             purpose: LedgerPurpose::Chat,
             cost: Some(cost),
             billing: Billing::Api,
+            account: None,
             context_size: None,
             context_window: 0,
         }))

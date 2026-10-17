@@ -375,6 +375,9 @@ pub mod leader {
     pub const EDIT_INPUT: Bind = leader_bind!('e');
     pub const FILE_PICKER: Bind = leader_bind!('f');
     pub const STEER_PROMPT: Bind = leader_bind!('g');
+    /// Opens the picker rather than cycling: a blind move to another account
+    /// would throw away the prompt cache.
+    pub const ACCOUNTS: Bind = leader_bind!('i');
     pub const SESSION_PICKER: Bind = leader_bind!('l');
     pub const MODEL_PICKER: Bind = leader_bind!('m');
     pub const NEW_SESSION: Bind = leader_bind!('n');
@@ -403,6 +406,7 @@ pub mod leader {
         EDIT_INPUT,
         FILE_PICKER,
         STEER_PROMPT,
+        ACCOUNTS,
         SESSION_PICKER,
         MODEL_PICKER,
         NEW_SESSION,
@@ -927,6 +931,11 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(leader::CYCLE_DECISION.label),
         description: "Next decision endpoint",
+        context: KeybindContext::General,
+    },
+    Keybind {
+        label: KeyLabel::Single(leader::ACCOUNTS.label),
+        description: "Choose the provider account requests go to",
         context: KeybindContext::General,
     },
     Keybind {

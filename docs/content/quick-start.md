@@ -84,7 +84,7 @@ caudra auth login openai                    # ChatGPT/Codex subscription OAuth
 caudra auth login anthropic --method api-key
 ```
 
-Open `/login` inside the TUI for the same OAuth and API-key choices. You can also set provider environment variables such as `ANTHROPIC_API_KEY`. Multiple keys in one variable rotate on rate limits. Every env var and model catalog is in [Providers](/docs/providers/).
+Open `/login` inside the TUI for the same OAuth and API-key choices. You can also set provider environment variables such as `ANTHROPIC_API_KEY`. Every env var and model catalog is in [Providers](/docs/providers/). To use more than one subscription or key of a provider, see [Accounts](/docs/accounts/).
 
 ## First session
 

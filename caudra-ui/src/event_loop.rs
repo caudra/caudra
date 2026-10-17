@@ -67,11 +67,14 @@ use caudra_lua::{
     TaskRequest, UiAction, UiReply,
 };
 use caudra_providers::Timeouts;
+use caudra_providers::accounts::save_login;
 use caudra_providers::manifest::ManifestRegistry;
+use caudra_providers::openai_auth;
 use caudra_providers::provider::{Provider, fetch_all_models, from_model};
 use caudra_providers::{HistoryItem, Message, Model};
 use caudra_storage::StateDir;
 use caudra_storage::StorageError;
+use caudra_storage::accounts::AccountName;
 use caudra_storage::changelog;
 use caudra_storage::checkout;
 use caudra_storage::history_search::HistoryRef;
@@ -183,18 +186,26 @@ const NO_CHANGE_STORES: &str = "The file change record stores could not be opene
 const HIT_JUMP_STAYS: &str = "scroll to the match there, the search can't follow into that pane";
 const AUTH_LOGIN_ARGS: [&str; 2] = ["auth", "login"];
 const OAUTH_METHOD_ARGS: [&str; 2] = ["--method", "oauth"];
+const AUTH_NAME_ARG: &str = "--name";
 const AUTH_EXECUTABLE_ERR: &str = "could not locate the Caudra executable for login";
 const AUTH_PROCESS_ERR: &str = "could not run the OAuth login process";
 const AUTH_EXIT_ERR: &str = "OAuth login process failed";
 
 /// Runs the CLI login in a child so its prompts and stdin readers end with it
 /// instead of competing with the TUI for input.
-fn oauth_login_command(provider: SubscriptionProvider) -> Result<Command> {
+fn oauth_login_command(
+    provider: SubscriptionProvider,
+    account: Option<&AccountName>,
+) -> Result<Command> {
     let mut command = Command::new(env::current_exe().wrap_err(AUTH_EXECUTABLE_ERR)?);
     command
         .args(AUTH_LOGIN_ARGS)
         .arg(provider.slug())
-        .args(OAUTH_METHOD_ARGS)
+        .args(OAUTH_METHOD_ARGS);
+    if let Some(account) = account {
+        command.arg(AUTH_NAME_ARG).arg(account.as_str());
+    }
+    command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -4666,6 +4677,7 @@ impl<'t> EventLoop<'t> {
             Action::AuthenticateProvider {
                 provider,
                 model_spec,
+                account,
             } => {
                 let storage = self.ctx.storage.clone();
                 let pause = match self.input.try_pause() {
@@ -4676,11 +4688,16 @@ impl<'t> EventLoop<'t> {
                     }
                 };
                 let result = terminal::with_normal_terminal(self.terminal, || match provider {
-                    SubscriptionProvider::OpenAi => {
-                        caudra_providers::openai_auth::login(&storage).map_err(Into::into)
-                    }
-                    SubscriptionProvider::Anthropic | SubscriptionProvider::Copilot(_) => {
-                        oauth_login_command(provider).and_then(run_oauth_login)
+                    SubscriptionProvider::OpenAi => openai_auth::login()
+                        .and_then(|login| {
+                            save_login(&storage, provider.slug(), login, account.as_ref())
+                        })
+                        .map(drop)
+                        .map_err(Into::into),
+                    SubscriptionProvider::Anthropic
+                    | SubscriptionProvider::Xai
+                    | SubscriptionProvider::Copilot(_) => {
+                        oauth_login_command(provider, account.as_ref()).and_then(run_oauth_login)
                     }
                 });
                 drop(pause);
@@ -5319,19 +5336,20 @@ mod tests {
         assert!(!should_open_startup_login(false, &providers));
     }
 
-    #[test_case(SubscriptionProvider::Anthropic, "anthropic" ; "anthropic")]
-    #[test_case(SubscriptionProvider::Copilot(CopilotIdentity::Public), "copilot" ; "copilot")]
-    #[test_case(SubscriptionProvider::Copilot(CopilotIdentity::Enterprise), "copilot-enterprise" ; "copilot_enterprise")]
+    #[test_case(SubscriptionProvider::Anthropic, None, &["auth", "login", "anthropic", "--method", "oauth"] ; "anthropic")]
+    #[test_case(SubscriptionProvider::Xai, None, &["auth", "login", "xai", "--method", "oauth"] ; "xai")]
+    #[test_case(SubscriptionProvider::Copilot(CopilotIdentity::Public), None, &["auth", "login", "copilot", "--method", "oauth"] ; "copilot")]
+    #[test_case(SubscriptionProvider::Copilot(CopilotIdentity::Enterprise), None, &["auth", "login", "copilot-enterprise", "--method", "oauth"] ; "copilot_enterprise")]
+    #[test_case(SubscriptionProvider::Anthropic, Some("work"), &["auth", "login", "anthropic", "--method", "oauth", "--name", "work"] ; "an_account_signs_in_again_by_name")]
     fn login_child_uses_current_executable_and_explicit_oauth(
         provider: SubscriptionProvider,
-        slug: &str,
+        account: Option<&str>,
+        expected: &[&str],
     ) {
-        let command = oauth_login_command(provider).unwrap();
+        let account = account.map(|name| AccountName::new(name).unwrap());
+        let command = oauth_login_command(provider, account.as_ref()).unwrap();
         assert_eq!(command.get_program(), env::current_exe().unwrap());
-        assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
-            ["auth", "login", slug, "--method", "oauth"]
-        );
+        assert_eq!(command.get_args().collect::<Vec<_>>(), expected);
         assert_eq!(command.get_envs().count(), 0);
         assert!(command.get_current_dir().is_none());
     }

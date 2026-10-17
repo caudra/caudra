@@ -497,7 +497,7 @@ fn discover() -> &'static [DynamicProviderMeta] {
         // loses, the same way it already loses to a builtin, and we say so
         // instead of silently picking a winner.
         metas.retain(|m| {
-            if custom.get(&m.slug).is_some() {
+            if custom.defines_provider(&m.slug) {
                 warn!(
                     slug = %m.slug,
                     "provider slug also defined in providers.toml, skipping script"

@@ -23,7 +23,6 @@ const MAX_TOOL_CALLS_PER_MESSAGE: usize = 512;
 
 pub(crate) struct OpenAiCompatConfig {
     pub slug: &'static str,
-    pub api_key_env: &'static str,
     pub base_url: &'static str,
     pub max_tokens_field: &'static str,
     pub include_stream_usage: bool,
@@ -1192,7 +1191,9 @@ data: [DONE]\n";
                     ProviderEvent::ToolInputDelta { .. } => {}
                     ProviderEvent::PromptProgress { .. } => {}
                     ProviderEvent::ThinkingBoundary => {}
-                    ProviderEvent::ToolAliases { .. } | ProviderEvent::ToolInputReady { .. } => {}
+                    ProviderEvent::ToolAliases { .. }
+                    | ProviderEvent::ToolInputReady { .. }
+                    | ProviderEvent::AccountRouted { .. } => {}
                 }
             }
             assert_eq!(thinking, vec!["Let me think", "..."]);

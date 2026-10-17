@@ -4,6 +4,7 @@ use flume::Sender;
 use jiff::civil;
 use serde_json::{Value, json};
 
+use crate::accounts::AccountCredential;
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ThinkingSupport};
 use crate::pricing::PriceChange;
 use crate::provider::{BoxFuture, Provider, WireRequest};
@@ -11,8 +12,8 @@ use crate::{
     AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
 };
 
+use super::ResolvedAuth;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyPool, ResolvedAuth};
 
 const LARGE_4: &str = "mistral-large-4";
 
@@ -34,7 +35,6 @@ pub(crate) const PRICE_CHANGES: &[PriceChange] = &[PriceChange {
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "mistral",
-    api_key_env: "MISTRAL_API_KEY",
     base_url: "https://api.mistral.ai/v1",
     max_tokens_field: "max_tokens",
     include_stream_usage: true,
@@ -194,7 +194,6 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
 pub struct Mistral {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
-    key_pool: Option<KeyPool>,
     system_prefix: Option<String>,
 }
 
@@ -241,12 +240,10 @@ fn convert_assistant_messages_in_place(messages: &mut Value) {
 }
 
 impl Mistral {
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve("mistral", CONFIG.api_key_env)?;
+    pub fn new(account: &AccountCredential, timeouts: super::Timeouts) -> Result<Self, AgentError> {
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(pool.current()))),
-            key_pool: Some(pool),
+            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(account.api_key()?))),
             system_prefix: None,
         })
     }
@@ -255,7 +252,6 @@ impl Mistral {
         Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth,
-            key_pool: None,
             system_prefix: None,
         }
     }
@@ -366,15 +362,6 @@ impl Provider for Mistral {
                     })
                 })
                 .await
-        })
-    }
-
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            Ok(self
-                .key_pool
-                .as_ref()
-                .is_some_and(|p| p.rotate_auth(&self.auth, ResolvedAuth::bearer)))
         })
     }
 

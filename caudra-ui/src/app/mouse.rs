@@ -143,6 +143,18 @@ impl App {
             let action = self.worktree_picker.handle_mouse(event);
             return self.handle_worktree_action(action);
         }
+        if self.accounts_modal.is_open() {
+            self.clear_control_hovers();
+            self.autoscroll = None;
+            self.selection_state = None;
+            if event.kind == MouseEventKind::Down(MouseButton::Left)
+                && !self.accounts_modal.contains(at)
+            {
+                self.accounts_modal.close();
+                return Vec::new();
+            }
+            return self.accounts_mouse(event);
+        }
         match event.kind {
             MouseEventKind::Down(MouseButton::Middle) => {
                 self.toggle_autoscroll(at);
@@ -1002,6 +1014,10 @@ impl App {
             self.worktree_picker.scroll(delta);
             return;
         }
+        if self.accounts_modal.is_open() {
+            self.accounts_modal.scroll(delta);
+            return;
+        }
         // The wheel is aggregated into `Msg::Scroll` before `handle_mouse` ever
         // runs, so the workbench has to be offered it here as well or its panes
         // never see a wheel at all. Its rows count downwards.
@@ -1332,6 +1348,11 @@ impl App {
             StatusBarHitTarget::Decisions => {
                 self.clear_control_hovers();
                 self.execute_decisions("");
+                Vec::new()
+            }
+            StatusBarHitTarget::Account => {
+                self.clear_control_hovers();
+                self.open_accounts();
                 Vec::new()
             }
             StatusBarHitTarget::Questions => {

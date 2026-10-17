@@ -40,12 +40,11 @@ use caudra_providers::{
 };
 use caudra_providers::{anthropic_auth, copilot_auth, dynamic, openai_auth, xai_auth};
 use caudra_storage::StateDir;
+use caudra_storage::accounts::{AccountName, StoredSecret, list_accounts};
 use caudra_storage::auth::{
-    MAX_WORKCELL_BEARER_TOKEN_BYTES, McpAuthData, ProviderAuth, ProviderCredentials,
-    WorkcellCredential, WorkcellCredentialName, delete_provider_credentials,
+    MAX_WORKCELL_BEARER_TOKEN_BYTES, McpAuthData, WorkcellCredential, WorkcellCredentialName,
     delete_workcell_credential, list_workcell_credentials, load_decision_credentials,
-    load_mcp_auth, load_provider_credentials, save_mcp_auth, save_provider_credentials,
-    save_workcell_credential, try_load_provider_auth, validate_decision_endpoint_name,
+    load_mcp_auth, save_mcp_auth, save_workcell_credential, validate_name,
 };
 use caudra_storage::decisions::read_active_decision_endpoint;
 use caudra_storage::model::persist_model_for_every_mode;
@@ -53,6 +52,7 @@ use caudra_storage::sessions::StoredMode;
 use caudra_workspace::PlanRef;
 use serde_json::Value;
 
+use super::accounts;
 use super::decisions::{self, DecisionKey, DecisionRow};
 use crate::cli::{AuthMethod, Cli, normalize_tool_name};
 use crate::setup::resolve_model;
@@ -67,13 +67,13 @@ const AUTH_STATUS_ENV: &str = "\x1b[33m~ env  \x1b[0m";
 const AUTH_STATUS_KEY: &str = "\x1b[32m✓ key  \x1b[0m";
 const AUTH_STATUS_OAUTH: &str = "\x1b[32m✓ oauth\x1b[0m";
 const AUTH_STATUS_TOKEN: &str = "\x1b[32m✓ token\x1b[0m";
-const METHOD_SCOPE_ERR: &str = "--method is supported only for Anthropic, OpenAI, and Copilot";
+const METHOD_SCOPE_ERR: &str = "--method is supported only for Anthropic, OpenAI, xAI, and Copilot";
 const COPILOT_METHOD_ERR: &str = "Copilot supports --method oauth or --method import";
 const HOSTNAME_SCOPE_ERR: &str = "--hostname is supported only for copilot-enterprise";
 const ENTERPRISE_HOST_PROMPT: &str = "  GitHub Enterprise hostname (e.g. company.ghe.com): ";
 const ENTERPRISE_HOST_REQUIRED: &str =
     "copilot-enterprise needs a hostname; pass --hostname company.ghe.com";
-const PROVIDER_SLUG_WIDTH: usize = 14;
+pub(super) const PROVIDER_SLUG_WIDTH: usize = 14;
 const MODEL_COLUMN_GAP: &str = "  ";
 const MODEL_JOB_HEADING: &str = "Job";
 const MODEL_BINDING_HEADING: &str = "Binding";
@@ -130,11 +130,12 @@ pub fn auth_login(
     decision: bool,
     method: Option<AuthMethod>,
     hostname: Option<&str>,
+    name: Option<AccountName>,
     storage: &StateDir,
 ) -> Result<()> {
     match provider {
-        Some(provider) if decision => login_slug(provider, true, method, hostname, storage)?,
-        Some(provider) => login_slug(&slugify(provider), false, method, hostname, storage)?,
+        Some(provider) if decision => login_slug(provider, true, method, hostname, None, storage)?,
+        Some(provider) => login_slug(&slugify(provider), false, method, hostname, name, storage)?,
         None if decision => login_decision(DecisionTarget::Menu, storage)?,
         None => login_interactive(storage)?,
     }
@@ -200,22 +201,24 @@ fn login_slug(
     decision: bool,
     method: Option<AuthMethod>,
     hostname: Option<&str>,
+    name: Option<AccountName>,
     storage: &StateDir,
 ) -> Result<()> {
     let route = login_route(slug, decision, method, hostname.is_some())?;
-    match route {
-        LoginRoute::Decision(target) => login_decision(target, storage)?,
-        LoginRoute::AnthropicOauth => anthropic_auth::login(storage)?,
-        LoginRoute::OpenAiOauth => openai_auth::login(storage)?,
-        LoginRoute::XaiOauth => xai_auth::login(storage)?,
+    let login = match route {
+        LoginRoute::Decision(target) => return login_decision(target, storage),
+        LoginRoute::ApiKey => return login_api_key_slug(slug, name, storage),
+        LoginRoute::AnthropicOauth => anthropic_auth::login()?,
+        LoginRoute::OpenAiOauth => openai_auth::login()?,
+        LoginRoute::XaiOauth => xai_auth::login()?,
         LoginRoute::CopilotOauth(identity) => {
-            copilot_auth::login(storage, &copilot_account(identity, hostname)?)?
+            copilot_auth::login(&copilot_account(identity, hostname)?)?
         }
         LoginRoute::CopilotImport(identity) => {
-            copilot_auth::import(storage, &copilot_account(identity, hostname)?)?
+            copilot_auth::import(&copilot_account(identity, hostname)?)?
         }
-        LoginRoute::ApiKey => login_api_key_slug(slug, storage)?,
-    }
+    };
+    accounts::save(storage, slug, login, name)?;
     Ok(())
 }
 
@@ -243,12 +246,10 @@ fn login_route(
         };
     }
     match (slug, method) {
-        ("anthropic", Some(AuthMethod::ApiKey)) | ("openai", Some(AuthMethod::ApiKey)) => {
-            Ok(LoginRoute::ApiKey)
-        }
+        ("anthropic" | "openai" | "xai", Some(AuthMethod::ApiKey)) => Ok(LoginRoute::ApiKey),
         ("anthropic", None | Some(AuthMethod::Oauth)) => Ok(LoginRoute::AnthropicOauth),
         ("openai", None | Some(AuthMethod::Oauth)) => Ok(LoginRoute::OpenAiOauth),
-        ("xai", None) => Ok(LoginRoute::XaiOauth),
+        ("xai", None | Some(AuthMethod::Oauth)) => Ok(LoginRoute::XaiOauth),
         (_, Some(_)) => Err(eyre!(METHOD_SCOPE_ERR)),
         _ => Ok(LoginRoute::ApiKey),
     }
@@ -284,15 +285,15 @@ fn env_credential(slug: &str, default_env: &'static str) -> Option<&'static str>
     }
 }
 
-fn login_api_key_slug(slug: &str, storage: &StateDir) -> Result<()> {
+fn login_api_key_slug(slug: &str, name: Option<AccountName>, storage: &StateDir) -> Result<()> {
     if builtin_provider(slug).is_none()
         && dynamic::display_name(slug).is_none()
-        && ProvidersConfig::load().get(slug).is_none()
+        && !ProvidersConfig::load().defines_provider(slug)
         && let Some(provider_data) = caudra_providers::catalog_provider(slug)
     {
-        login_catalog_provider(&provider_data, storage)
+        login_catalog_provider(&provider_data, name, storage)
     } else {
-        login_provider(slug, storage)
+        login_provider(slug, name, storage)
     }
 }
 
@@ -316,9 +317,9 @@ fn prompt_auth_method(display_name: &str) -> Result<AuthMethod> {
     }
 }
 
-fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
+fn login_provider(slug: &str, name: Option<AccountName>, storage: &StateDir) -> Result<()> {
     let builtin = builtin_provider(slug);
-    let is_custom = ProvidersConfig::load().get(slug).is_some();
+    let is_custom = ProvidersConfig::load().defines_provider(slug);
     if builtin.is_none() && dynamic::display_name(slug).is_none() && !is_custom {
         bail!("unknown provider '{slug}'");
     }
@@ -362,11 +363,7 @@ fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
 
     let has_key = !api_key.is_empty();
     if has_key {
-        let creds = ProviderCredentials {
-            api_key,
-            host: None,
-        };
-        save_provider_credentials(storage, slug, &creds).context("save credentials")?;
+        accounts::save_key(storage, slug, api_key, name)?;
     }
 
     if plan.is_some() || needs_url || host_url.is_some() || builtin.is_none() {
@@ -395,9 +392,7 @@ fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
     if let Some(model) = &default_model {
         println!("  Default model: {}", model);
     }
-    if has_key {
-        println!("  Credentials: ~/.local/state/caudra/auth/{}.json", slug);
-    } else {
+    if !has_key {
         let env_var = resolve_api_key_env(slug, config.get(slug));
         println!(
             "  Set API key via: {} or run: caudra auth login {}",
@@ -414,7 +409,7 @@ fn login_interactive(storage: &StateDir) -> Result<()> {
     let custom_slugs: Vec<&String> = config
         .providers
         .keys()
-        .filter(|s| builtin_provider(s).is_none() && *s != "opencode")
+        .filter(|s| builtin_provider(s).is_none() && *s != "opencode" && config.defines_provider(s))
         .collect();
     let catalog_entries = catalog_providers();
     let decision_entries = decision_entries(&config);
@@ -441,15 +436,9 @@ fn login_interactive(storage: &StateDir) -> Result<()> {
     println!("  Available providers:");
     println!();
     for (i, b) in builtins.iter().enumerate() {
-        let status = match try_load_provider_auth(storage, b.slug) {
-            Ok(Some(ProviderAuth::OAuth(_))) => AUTH_STATUS_OAUTH,
-            Ok(Some(ProviderAuth::ApiKey(_))) if CopilotIdentity::from_slug(b.slug).is_some() => {
-                AUTH_STATUS_TOKEN
-            }
-            Ok(Some(ProviderAuth::ApiKey(_))) => AUTH_STATUS_KEY,
-            _ if env_credential(b.slug, b.default_api_key_env).is_some() => AUTH_STATUS_ENV,
-            _ => AUTH_STATUS_EMPTY,
-        };
+        let status = stored_badge(storage, b.slug)
+            .or_else(|| env_credential(b.slug, b.default_api_key_env).map(|_| AUTH_STATUS_ENV))
+            .unwrap_or(AUTH_STATUS_EMPTY);
         let number = i + 1;
         let slug = b.slug;
         let display = b.display_name;
@@ -458,11 +447,7 @@ fn login_interactive(storage: &StateDir) -> Result<()> {
     let mut idx = builtins.len();
     for slug in &custom_slugs {
         idx += 1;
-        let status = if load_provider_credentials(storage, slug).is_some() {
-            AUTH_STATUS_KEY
-        } else {
-            AUTH_STATUS_EMPTY
-        };
+        let status = stored_badge(storage, slug).unwrap_or(AUTH_STATUS_EMPTY);
         let display = config
             .get(slug)
             .and_then(|d| d.display_name.as_deref())
@@ -472,11 +457,7 @@ fn login_interactive(storage: &StateDir) -> Result<()> {
 
     for cat in &catalog_entries {
         idx += 1;
-        let status = if load_provider_credentials(storage, &cat.slug).is_some() {
-            AUTH_STATUS_KEY
-        } else {
-            AUTH_STATUS_EMPTY
-        };
+        let status = stored_badge(storage, &cat.slug).unwrap_or(AUTH_STATUS_EMPTY);
         let slug = &cat.slug;
         let display = &cat.display_name;
         println!("  {status} {idx:>number_width$}. {slug:<slug_width$} {display}");
@@ -511,14 +492,33 @@ fn login_interactive(storage: &StateDir) -> Result<()> {
                 ))?),
                 _ => None,
             };
-            login_slug(slug, false, method, None, storage)?;
+            login_slug(slug, false, method, None, None, storage)?;
         }
-        LoginChoice::CustomSlug(index) => login_provider(custom_slugs[index], storage)?,
-        LoginChoice::Catalog(index) => login_catalog_provider(&catalog_entries[index], storage)?,
+        LoginChoice::CustomSlug(index) => login_provider(custom_slugs[index], None, storage)?,
+        LoginChoice::Catalog(index) => {
+            login_catalog_provider(&catalog_entries[index], None, storage)?
+        }
         LoginChoice::Decision(choice) => configure_decision(choice, decision_entries, storage)?,
     }
 
     Ok(())
+}
+
+/// How the login menu marks a provider with a stored account: OAuth wins,
+/// since one subscription is what most users came to sign in with.
+fn stored_badge(storage: &StateDir, slug: &str) -> Option<&'static str> {
+    let accounts = list_accounts(storage, slug).ok()?;
+    if accounts
+        .iter()
+        .any(|(_, account)| matches!(account.secret, StoredSecret::OAuth(_)))
+    {
+        return Some(AUTH_STATUS_OAUTH);
+    }
+    accounts.first()?;
+    Some(match CopilotIdentity::from_slug(slug) {
+        Some(_) => AUTH_STATUS_TOKEN,
+        None => AUTH_STATUS_KEY,
+    })
 }
 
 /// Numbering of the `auth login` menu: built-in, custom and catalog providers,
@@ -777,7 +777,7 @@ fn confirmed(input: &str) -> bool {
 fn prompt_custom_decision() -> Result<(String, DecisionEndpointDef)> {
     let name = loop {
         let name = prompt_line("  Endpoint name: ")?;
-        match validate_decision_endpoint_name(&name) {
+        match validate_name(&name) {
             Ok(()) => break name,
             Err(error) => println!("  {error}"),
         }
@@ -853,32 +853,23 @@ fn prompt_line(prompt: &str) -> Result<String> {
     Ok(input.trim().to_owned())
 }
 
-fn login_catalog_provider(provider: &ProviderData, storage: &StateDir) -> Result<()> {
+fn login_catalog_provider(
+    provider: &ProviderData,
+    name: Option<AccountName>,
+    storage: &StateDir,
+) -> Result<()> {
     println!();
     if let Some(ref var) = provider.env_keys.first() {
         println!("  Provider: {} (env: {var})", provider.slug);
     } else {
         println!("  Provider: {}", provider.slug);
     }
-    print!("  API key: ");
-    io::stdout().flush()?;
-    let mut key = String::new();
-    io::stdin().read_line(&mut key)?;
-    let key = key.trim().to_string();
+    let key = accounts::read_key("  API key: ")?;
     if key.is_empty() {
         println!("  Skipped (no key entered)");
         return Ok(());
     }
-    let creds = ProviderCredentials {
-        api_key: key,
-        host: None,
-    };
-    save_provider_credentials(storage, &provider.slug, &creds).context("save credentials")?;
-    println!("  \x1b[32m✓\x1b[0m Saved credentials for {}", provider.slug);
-    println!(
-        "  Credentials: ~/.local/state/caudra/auth/{}.json",
-        provider.slug
-    );
+    accounts::save_key(storage, &provider.slug, key, name)?;
     println!(
         "  You can also set via: {}",
         provider
@@ -931,11 +922,7 @@ fn login_custom(storage: &StateDir) -> Result<()> {
     let display_name = format!("Custom ({slug})");
     let api_key_env = format!("{}_API_KEY", slug.to_uppercase().replace('-', "_"));
 
-    print!("  API key (or Enter to skip): ");
-    io::stdout().flush()?;
-    let mut key_input = String::new();
-    io::stdin().read_line(&mut key_input)?;
-    let api_key = key_input.trim().to_string();
+    let api_key = accounts::read_key("  API key (or Enter to skip): ")?;
 
     let mut config = ProvidersFile::load()?;
     let provider_def = ProviderDef {
@@ -947,26 +934,20 @@ fn login_custom(storage: &StateDir) -> Result<()> {
         ..Default::default()
     };
 
-    let has_key = !api_key.is_empty();
-    if has_key {
-        let creds = ProviderCredentials {
-            api_key,
-            host: None,
-        };
-        save_provider_credentials(storage, &slug, &creds).context("save credentials")?;
-    }
-
     config
         .upsert(slug.clone(), provider_def)
         .context("update providers.toml")?;
     config.save().context("save providers.toml")?;
 
+    let has_key = !api_key.is_empty();
+    if has_key {
+        accounts::save_key(storage, &slug, api_key, None)?;
+    }
+
     println!();
     println!("  \x1b[32m✓\x1b[0m Configured: {}", slug);
     println!("  Endpoint: {}", base_url);
-    if has_key {
-        println!("  Credentials: ~/.local/state/caudra/auth/{}.json", slug);
-    } else {
+    if !has_key {
         println!(
             "  Set API key via: {} or run: caudra auth login {}",
             api_key_env, slug
@@ -1033,46 +1014,31 @@ fn prompt_api_key(url: Option<&str>, display_name: &str, optional: bool) -> Resu
         }
         println!("  Opened {} in your browser.", url);
     }
-    if optional {
-        print!("  {} API key (or Enter to skip): ", display_name);
+    let prompt = if optional {
+        format!("  {display_name} API key (or Enter to skip): ")
     } else {
-        print!("  {} API key: ", display_name);
-    }
-    io::stdout().flush()?;
-
-    let mut api_key = String::new();
-    io::stdin().read_line(&mut api_key)?;
-    let api_key = api_key.trim().to_string();
-
-    Ok(api_key)
+        format!("  {display_name} API key: ")
+    };
+    accounts::read_key(&prompt)
 }
 
-pub fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
+/// Signs out of provider accounts and leaves `providers.toml` alone, so a
+/// configured provider and the accounts it lists stay for the next login. A
+/// scripted provider with its own sign-in signs out through its script.
+pub fn auth_logout(
+    provider: &str,
+    name: Option<AccountName>,
+    all: bool,
+    storage: &StateDir,
+) -> Result<()> {
     let slug = slugify(provider);
-    if let Some(identity) = CopilotIdentity::from_slug(&slug) {
-        copilot_auth::logout(storage, identity)?;
+    let scripted = builtin_provider(&slug).is_none()
+        && dynamic::auth_providers().iter().any(|(s, _)| *s == slug);
+    if scripted && list_accounts(storage, &slug)?.is_empty() {
+        dynamic::logout(&slug)?;
         return Ok(());
     }
-    match slug.as_str() {
-        "anthropic" => anthropic_auth::logout(storage)?,
-        "openai" => openai_auth::logout(storage)?,
-        "xai" => xai_auth::logout(storage)?,
-        _ => {
-            let mut config = ProvidersFile::load()?;
-            let deleted =
-                delete_provider_credentials(storage, &slug).context("delete credentials")?;
-            if deleted {
-                println!("Removed credentials for '{}'.", slug);
-            }
-            if config.remove(&slug) {
-                config.save().context("save providers.toml")?;
-            }
-            if !deleted && builtin_provider(&slug).is_none() {
-                dynamic::logout(&slug)?;
-            }
-        }
-    }
-    Ok(())
+    accounts::logout(storage, &slug, name, all)
 }
 
 pub fn decision_logout(name: &str, storage: &StateDir) -> Result<()> {
@@ -1120,109 +1086,66 @@ fn render_decision_status(rows: &[DecisionRow]) -> String {
     output
 }
 
-pub fn auth_status(storage: &StateDir) -> Result<()> {
+pub fn auth_status(storage: &StateDir, refresh: bool) -> Result<()> {
     let config = ProvidersConfig::load();
-    let builtins = all_builtins();
 
     println!();
-    for b in &builtins {
+    for b in &all_builtins() {
         let def = config.get(b.slug);
-        let display = resolve_display_name(b.slug, def);
-        let auth = try_load_provider_auth(storage, b.slug)
-            .with_context(|| format!("load credentials for '{}'", b.slug))?;
-
-        if matches!(&auth, Some(ProviderAuth::OAuth(_))) {
-            println!("  \x1b[32m✓\x1b[0m {:<14} {} (oauth)", b.slug, display);
-        } else if let Some(ProviderAuth::ApiKey(creds)) = &auth {
-            let (label, detail) = match CopilotIdentity::from_slug(b.slug) {
-                Some(_) => ("token", creds.host.as_deref()),
-                None => ("key", def.and_then(|d| d.plan.as_deref())),
-            };
-            let detail = detail.map(|d| format!(" ({d})")).unwrap_or_default();
-            println!(
-                "  \x1b[32m✓\x1b[0m {:<14} {} ({label}: {}){detail}",
-                b.slug,
-                display,
-                creds.masked_api_key(),
-            );
-        } else if let Some(env_var) = env_credential(b.slug, b.default_api_key_env) {
-            println!(
-                "  \x1b[33m~\x1b[0m {:<14} {} (via {env_var})",
-                b.slug, display
-            );
-        } else if def.is_some_and(|d| d.base_url.is_some()) {
-            println!("  \x1b[34m●\x1b[0m {:<14} {} (configured)", b.slug, display);
-        } else {
-            println!(
-                "  \x1b[31m✗\x1b[0m {:<14} {} (run: caudra auth login {})",
-                b.slug, display, b.slug
-            );
-        }
+        let configured = def.is_some_and(|d| d.base_url.is_some());
+        print_provider_status(
+            b.slug,
+            &resolve_display_name(b.slug, def),
+            refresh,
+            configured,
+        );
     }
-
     for (slug, def) in &config.providers {
         // 'opencode' could show up here, when the user configured free models on that provider.
         if builtin_provider(slug).is_some()
+            || !config.defines_provider(slug)
             || (slug == "opencode" && def.enable_free_models.is_some())
         {
             continue;
         }
-        let display = def.display_name.as_deref().unwrap_or(slug);
-        if let Some(creds) = load_provider_credentials(storage, slug) {
-            println!(
-                "  \x1b[32m✓\x1b[0m {:<14} {} (key: {})",
-                slug,
-                display,
-                creds.masked_api_key()
-            );
-        } else {
-            let default_env = format!("{}_API_KEY", slug.to_uppercase().replace('-', "_"));
-            let env_var = def.api_key_env.as_deref().unwrap_or(&default_env);
-            if env::var(env_var).is_ok() {
-                println!(
-                    "  \x1b[33m~\x1b[0m {:<14} {} (via {})",
-                    slug, display, env_var
-                );
-            } else {
-                println!(
-                    "  \x1b[31m✗\x1b[0m {:<14} {} (run: caudra auth login {})",
-                    slug, display, slug
-                );
-            }
-        }
+        print_provider_status(
+            slug,
+            def.display_name.as_deref().unwrap_or(slug),
+            refresh,
+            false,
+        );
     }
     print!(
         "{}",
         render_decision_status(&decisions::decision_rows(storage, &config)?)
     );
-    // Catalog providers from models.dev
     let catalog_entries = catalog_providers();
     if !catalog_entries.is_empty() {
         println!("  \x1b[1mCatalog Providers (models.dev):\x1b[0m");
         for entry in &catalog_entries {
-            if let Some(creds) = load_provider_credentials(storage, &entry.slug) {
-                println!(
-                    "  \x1b[32m✓\x1b[0m {:<14} {} (key: {})",
-                    entry.slug,
-                    entry.display_name,
-                    creds.masked_api_key()
-                );
-            } else if let Some(env) = entry.env_key_set() {
-                println!(
-                    "  \x1b[33m~\x1b[0m {:<14} {} (via {})",
-                    entry.slug, entry.display_name, env
-                );
-            } else {
-                println!(
-                    "  \x1b[31m✗\x1b[0m {:<14} {} (run: caudra auth login {})",
-                    entry.slug, entry.display_name, entry.slug
-                );
-            }
+            print_provider_status(&entry.slug, &entry.display_name, refresh, false);
         }
         println!();
     }
 
     Ok(())
+}
+
+/// A provider that cannot list its accounts still gets its line, with the
+/// reason, so one broken entry leaves the rest of the status readable.
+fn print_provider_status(slug: &str, display: &str, refresh: bool, configured: bool) {
+    match accounts::provider_status(slug, display, refresh) {
+        Ok(Some(lines)) => print!("{lines}"),
+        Ok(None) if configured => {
+            println!("  \x1b[34m●\x1b[0m {slug:<PROVIDER_SLUG_WIDTH$} {display} (configured)");
+        }
+        Ok(None) => println!(
+            "  \x1b[31m✗\x1b[0m {slug:<PROVIDER_SLUG_WIDTH$} {display} (run: caudra auth login {slug})"
+        ),
+        Err(error) => {
+            println!("  \x1b[31m✗\x1b[0m {slug:<PROVIDER_SLUG_WIDTH$} {display} ({error})");
+        }
+    }
 }
 
 /// Specs stay first, and a batch with no supply markers stays unpadded, so
@@ -2300,6 +2223,8 @@ mod auth_tests {
     #[test_case("openai", Some(AuthMethod::ApiKey), LoginRoute::ApiKey ; "openai_api_key")]
     #[test_case("anthropic", Some(AuthMethod::ApiKey), LoginRoute::ApiKey ; "anthropic_api_key")]
     #[test_case("xAI", None, LoginRoute::XaiOauth ; "normalized_xai")]
+    #[test_case("xai", Some(AuthMethod::Oauth), LoginRoute::XaiOauth ; "xai_oauth")]
+    #[test_case("xai", Some(AuthMethod::ApiKey), LoginRoute::ApiKey ; "xai_api_key")]
     #[test_case("Copilot", None, LoginRoute::CopilotOauth(CopilotIdentity::Public) ; "normalized_copilot_defaults_to_oauth")]
     #[test_case("copilot", Some(AuthMethod::Import), LoginRoute::CopilotImport(CopilotIdentity::Public) ; "copilot_import")]
     #[test_case("Copilot Enterprise", None, LoginRoute::CopilotOauth(CopilotIdentity::Enterprise) ; "normalized_enterprise_defaults_to_oauth")]

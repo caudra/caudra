@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -6,6 +7,7 @@ use std::process;
 use std::str::FromStr;
 use std::sync::{Mutex, PoisonError};
 
+use serde::de::{Error as _, MapAccess, Visitor};
 use serde::ser::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
@@ -22,6 +24,13 @@ use crate::interpolation::{self, Lookup};
 use crate::own_writes;
 use crate::toml_document::{merge_item, to_table};
 use crate::{ConfigField, ConfigValue};
+
+mod accounts;
+
+pub use accounts::{
+    AccountDef, AccountsConfigError, DEFAULT_PREFER_BELOW, DEFAULT_SWITCH_BELOW, QuotaWindowName,
+    SwitchStrategy, SwitchingDef,
+};
 
 pub const PROVIDERS_FILE: &str = "providers.toml";
 pub(crate) const PROVIDERS_VERSION: u32 = 1;
@@ -768,6 +777,11 @@ pub struct ProviderDef {
     pub purposes: HashMap<ModelPurpose, PurposeModels>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ModelDef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switching: Option<SwitchingDef>,
+    /// The accounts to sign in with, highest priority first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<AccountDef>,
 }
 
 impl ProviderDef {
@@ -889,7 +903,61 @@ impl ProviderDef {
             env: None,
             description: "The models the provider serves",
         },
+        ConfigField {
+            name: "switching",
+            ty: "table",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "When Auto moves a session to another of the provider's accounts",
+        },
+        ConfigField {
+            name: "accounts",
+            ty: "table[]",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "The accounts to sign in with, highest priority first",
+        },
     ];
+
+    /// Whether the entry sets nothing beyond `accounts` and `switching`, so it
+    /// tunes how Caudra signs in to the slug and neither declares a custom
+    /// provider nor changes a built-in one. An empty table counts too.
+    pub fn is_accounts_only(&self) -> bool {
+        let Self {
+            display_name,
+            protocol,
+            base_url,
+            plan,
+            api_key_env,
+            api_key,
+            default_model,
+            discover_models,
+            enable_free_models,
+            overrides,
+            model_defaults,
+            purposes,
+            models,
+            switching: _,
+            accounts: _,
+        } = self;
+        display_name.is_none()
+            && protocol.is_none()
+            && base_url.is_none()
+            && plan.is_none()
+            && api_key_env.is_none()
+            && api_key.is_none()
+            && default_model.is_none()
+            && !discover_models
+            && enable_free_models.is_none()
+            && overrides.is_empty()
+            && model_defaults.is_none()
+            && purposes.is_empty()
+            && models.is_empty()
+    }
 
     /// Effective declared settings for `model_id`.
     ///
@@ -917,8 +985,43 @@ pub struct ProvidersConfig {
     /// Named decision endpoints, `[decisions.<name>]`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub decisions: BTreeMap<String, DecisionEndpointDef>,
-    #[serde(flatten)]
+    #[serde(flatten, deserialize_with = "deserialize_providers")]
     pub providers: HashMap<String, ProviderDef>,
+}
+
+fn deserialize_providers<'de, D>(deserializer: D) -> Result<HashMap<String, ProviderDef>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_map(ProvidersVisitor)
+}
+
+/// A flattened table loses its place in the file, so each error names the
+/// provider it came from. Account rules span a provider's entries, so they are
+/// checked once it parsed.
+struct ProvidersVisitor;
+
+impl<'de> Visitor<'de> for ProvidersVisitor {
+    type Value = HashMap<String, ProviderDef>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("provider tables keyed by slug")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut providers = HashMap::new();
+        while let Some(slug) = map.next_key::<String>()? {
+            let def: ProviderDef = map
+                .next_value()
+                .map_err(|error| A::Error::custom(format!("{slug}: {error}")))?;
+            accounts::validate(&slug, &def).map_err(A::Error::custom)?;
+            providers.insert(slug, def);
+        }
+        Ok(providers)
+    }
 }
 
 struct LastGood {
@@ -991,6 +1094,12 @@ impl ProvidersConfig {
         self.providers.get(slug)
     }
 
+    /// Whether `slug` has an entry that declares or changes a provider, as
+    /// opposed to one that only lists its accounts.
+    pub fn defines_provider(&self, slug: &str) -> bool {
+        self.get(slug).is_some_and(|def| !def.is_accounts_only())
+    }
+
     pub fn upsert(&mut self, slug: String, def: ProviderDef) {
         self.providers.insert(slug, def);
     }
@@ -1018,6 +1127,8 @@ pub enum ProvidersFileError {
     },
     #[error("render {PROVIDERS_FILE}: {0}")]
     Render(#[from] toml::ser::Error),
+    #[error("{PROVIDERS_FILE}: {0}")]
+    Accounts(#[from] AccountsConfigError),
 }
 
 #[derive(Debug, Error)]

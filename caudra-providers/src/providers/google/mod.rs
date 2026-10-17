@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
+use crate::accounts::AccountCredential;
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, StaticReasoningOption};
 use crate::pricing::PriceChange;
 use crate::provider::{BoxFuture, Provider, WireRequest};
@@ -20,7 +21,7 @@ use crate::{
     StreamResponse, ThinkingConfig, TokenUsage,
 };
 
-use super::{KeyPool, ResolvedAuth, http_client, next_sse_line};
+use super::{ResolvedAuth, http_client, next_sse_line};
 
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const ENV_VAR: &str = "GEMINI_API_KEY";
@@ -194,23 +195,16 @@ fn resolve_auth_from_key(key: &str, base_url: Option<String>) -> ResolvedAuth {
 pub struct Google {
     client: HttpClient,
     auth: Arc<Mutex<ResolvedAuth>>,
-    key_pool: Option<KeyPool>,
     stream_timeout: Duration,
-    /// Env / `providers.toml` / inventory default, resolved once at construction.
-    resolved_base_url: Option<String>,
 }
 
 impl Google {
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve("google", ENV_VAR)?;
-        let resolved_base_url = resolve_google_base_url();
-        let resolved = resolve_auth_from_key(pool.current(), resolved_base_url.clone());
+    pub fn new(account: &AccountCredential, timeouts: super::Timeouts) -> Result<Self, AgentError> {
+        let resolved = resolve_auth_from_key(account.api_key()?, resolve_google_base_url());
         Ok(Self {
             client: http_client(timeouts),
             auth: Arc::new(Mutex::new(resolved)),
-            key_pool: Some(pool),
             stream_timeout: timeouts.stream,
-            resolved_base_url,
         })
     }
 
@@ -218,13 +212,10 @@ impl Google {
         auth: Arc<Mutex<super::ResolvedAuth>>,
         timeouts: super::Timeouts,
     ) -> Self {
-        let resolved_base_url = auth.lock().unwrap().base_url.clone();
         Self {
             client: http_client(timeouts),
             auth,
-            key_pool: None,
             stream_timeout: timeouts.stream,
-            resolved_base_url,
         }
     }
 
@@ -439,26 +430,6 @@ impl Provider for Google {
                 .collect();
             infos.sort_by(|a, b| a.id.cmp(&b.id));
             Ok(infos)
-        })
-    }
-
-    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
-        Box::pin(async {
-            let pool = KeyPool::resolve("google", ENV_VAR)?;
-            *self.auth.lock().unwrap() =
-                resolve_auth_from_key(pool.current(), self.resolved_base_url.clone());
-            Ok(())
-        })
-    }
-
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            let base_url = self.resolved_base_url.clone();
-            Ok(self.key_pool.as_ref().is_some_and(|p| {
-                p.rotate_auth(&self.auth, |key| {
-                    resolve_auth_from_key(key, base_url.clone())
-                })
-            }))
         })
     }
 

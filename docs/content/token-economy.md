@@ -112,6 +112,8 @@ A hit needs the request to begin with the same bytes as an earlier one, so Caudr
 
 Some providers keep a cache per machine and route a request by a key the client supplies. Caudra sends one per conversation: the session id for the main agent, and `session/task` for a subagent, so siblings never compete for the parent's cache. Title, goal evaluator, requirements extraction, and tool-repair requests have their own system prompt and send no key. The key reaches OpenAI (as `prompt_cache_key`, plus the `session-id` header on a ChatGPT login), custom OpenAI-compatible endpoints, xAI, OpenRouter, Mistral, and a Claude login. It is a routing hint only, so a stale key costs a cache miss and never changes output.
 
+A cache belongs to one account. When a provider has [several accounts](/docs/accounts/), Caudra keeps each conversation on its account and moves it at a point where its cache is cold anyway, such as a new session or a compaction. It moves a warm conversation only when its account is nearly spent or refused, and the transcript row for that switch says how many cached tokens the new account sends again.
+
 Routing finds the right machine. Whether that machine holds a usable prefix is a separate matter. OpenAI writes a cache entry through the latest message of each request, so a conversation that shares the system prompt and tool definitions but opens with a different user turn, which is every new session and every subagent, finds no entry ending where its shared prefix ends. On GPT-5.6 and later Caudra places an explicit cache breakpoint after the system prompt, so that prefix is written once and read by every later conversation in the project. The mark is a field on an input block, and top-level `instructions` cannot carry it, so for these models the system prompt travels as the first developer message instead. A ChatGPT login does not take part: the Codex backend rejects the field, so a login keeps implicit caching, as do earlier models on either path.
 
 Custom endpoints that speak the Responses protocol get the breakpoint when a model declares `supports_cache_breakpoints = true` in `providers.toml`. Leave it unset unless the server documents support, since a strict endpoint rejects the unknown field.
@@ -132,7 +134,7 @@ Deleting a session deletes its transcript. The record of what it cost lives in a
 
 Project totals use the exact directory recorded for each turn. [Bulk session migration](/docs/sessions/#moving-sessions-to-another-directory) includes historical project usage by default, with an option to leave it unchanged. Moving one session preserves its own counters without reattributing the shared ledger.
 
-Press `g` in `/usage` to switch from this session to everything ever recorded: totals, the providers, models, projects, and purposes that cost the most, and a month by month breakdown. Press `g` again to go back.
+Press `g` in `/usage` to switch from this session to everything ever recorded: totals, the providers, accounts, models, projects, and purposes that cost the most, and a month by month breakdown. Turns recorded before Caudra tracked [accounts](/docs/accounts/) have none and stay out of the account list. Press `g` again to go back.
 
 A long list of providers, models, projects, or months shows the 8 that cost the most and ends in `... and N more`. Click that line to show the rest, and `show less` to fold it again, or press `e` to open or close every list at once. Purposes always show in full.
 

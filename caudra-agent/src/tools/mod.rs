@@ -68,6 +68,8 @@ use caudra_config::{Feature, FeatureFlags, ModelPolicy, ProfileToolPolicy, ToolO
 use caudra_providers::Model;
 use caudra_providers::RequestOptions;
 use caudra_providers::provider::Provider;
+use caudra_storage::StateDir;
+use caudra_storage::accounts::{StoredSecret, list_accounts};
 use caudra_storage::id::SessionRef;
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::tool_outputs::ToolOutputStore;
@@ -317,8 +319,13 @@ pub fn credential_exclusions() -> &'static [&'static str] {
 }
 
 fn openai_subscription_available() -> bool {
-    caudra_storage::StateDir::resolve()
-        .is_ok_and(|dir| caudra_storage::auth::load_tokens(&dir, OPENAI_PROVIDER_SLUG).is_some())
+    StateDir::resolve().is_ok_and(|dir| {
+        list_accounts(&dir, OPENAI_PROVIDER_SLUG).is_ok_and(|accounts| {
+            accounts
+                .iter()
+                .any(|(_, account)| matches!(account.secret, StoredSecret::OAuth(_)))
+        })
+    })
 }
 
 /// Split from the lookup so the policy is testable without depending on

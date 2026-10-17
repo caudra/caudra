@@ -62,7 +62,7 @@ The first entry also names the model that wins automatic resolution, so it has t
 
 Caudra re-reads auth from storage and environment variables each time a new agent spawns (`/new`, retry, session load). If you run `caudra auth login` in another terminal or change an env var, the next session picks it up without a restart.
 
-You can set multiple API keys in one env var (`ANTHROPIC_API_KEY=sk-1,sk-2,sk-3`) and they rotate automatically on rate-limit or auth errors.
+A provider can have several accounts, such as two subscriptions and an API key, and an env var with keys separated by commas (`ANTHROPIC_API_KEY=sk-1,sk-2`) gives one account per key. A login, a logout, or an account choice made in another process reaches a running conversation at its next [cold point](/docs/accounts/#how-auto-switches). See [Accounts](/docs/accounts/) for how Caudra chooses between them.
 
 ## Base URL Overrides
 
@@ -469,6 +469,8 @@ The file can start with `version = 1`, and a file without it counts as version 1
 | `model_defaults` | table | unset | - | Model keys for every model of the provider |
 | `purposes` | table | unset | - | Model id prefixes for the `fast` and `best` purposes |
 | `models` | table[] | unset | - | The models the provider serves |
+| `switching` | table | unset | - | When Auto moves a session to another of the provider's accounts |
+| `accounts` | table[] | unset | - | The accounts to sign in with, highest priority first |
 
 A built-in slug keeps its compiled protocol, model catalog, and auth setup, so it ignores `protocol`, `api_key_env`, `discover_models` and `enable_free_models`. Opencode still reads `enable_free_models`. From `model_defaults` and `models`, a built-in reads only `context_window` and `max_output_tokens`, see [Model limits on a built-in provider](#model-limits-on-a-built-in-provider).
 
@@ -569,6 +571,42 @@ Provider-level fields apply to every model from that upstream. Per-model entries
 | `models` | table | `{}` | Overrides for single models, keyed by model id, which win key by key. Quote an id that holds a dot, such as `models."qwen-3.6"` |
 
 Caudra sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.AI), and Aperture appends that path to the upstream's base url. If an upstream base url already carries its own path, set `path_prefix = ""` for it to avoid a doubled path. Z.AI defaults to no prefix since its API path has no `/v1` segment; point the upstream base url at the full API root (e.g. `https://api.z.ai/api/paas/v4`).
+
+### Accounts
+
+`[[SLUG.accounts]]` entries list a provider's [accounts](/docs/accounts/) in priority order, and `[SLUG.switching]` sets how Auto moves conversations between them. A table that holds only these two changes nothing else about a built-in provider:
+
+```toml
+[anthropic.switching]
+strategy = "paced"
+prefer_below = 25
+
+[[anthropic.accounts]]
+name = "personal"
+
+[[anthropic.accounts]]
+name = "api"
+fallback = true
+```
+
+A `[SLUG.switching]` table takes these keys:
+
+| Field | Type | Default | Min | Max | Description |
+|-------|------|---------|-----|-----|-------------|
+| `strategy` | string | `ordered` | - | - | How Auto picks an account. `ordered` takes the first usable account in `accounts` order and returns to it after its quota resets. `paced` takes the account furthest ahead of its quota schedule, so capacity that is about to reset gets used first |
+| `switch_below` | integer | `5` | 0 | 99 | The quota left in a watched window, in percent, below which a session moves to another account at its next request, even when that loses a warm prompt cache. It has to be lower than `prefer_below` |
+| `prefer_below` | integer | `20` | 1 | 100 | The quota left in a watched window, in percent, below which a session moves to another account once its prompt cache is cold anyway, such as in a new session or after compaction |
+| `windows` | string[] | every window the provider reports for the model | - | - | The quota windows the thresholds watch: `5h`, `weekly`, and `monthly` |
+
+Each `[[SLUG.accounts]]` entry takes these keys:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name` | string | required | The account name, which `caudra auth login --name` saves a credential under and `caudra auth use` selects. It takes lowercase letters, digits, `-`, and `_`, and `auto` is reserved |
+| `api_key_env` | string | unset | The environment variable that holds this account's API key. Leave it out to use the credential `caudra auth login` saved |
+| `fallback` | bool | `false` | Let Auto move a subscription session onto this pay-per-token account, which it does only when every subscription is spent. A subscription account ignores it |
+
+See [How Auto switches](/docs/accounts/#how-auto-switches) for what the thresholds do.
 
 ### Decision endpoints
 

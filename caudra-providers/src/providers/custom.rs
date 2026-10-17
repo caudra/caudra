@@ -5,18 +5,19 @@ use flume::Sender;
 use serde_json::Value;
 
 use caudra_config::providers::{
-    ModelFields, ModelPurpose, Protocol, ProviderDef, ProvidersConfig, resolve_api_key_env,
-    resolve_base_url, resolve_protocol,
+    ModelFields, ModelPurpose, Protocol, ProviderDef, ProvidersConfig, resolve_base_url,
+    resolve_protocol,
 };
 
 use super::ResolvedAuth;
 use super::openai::responses;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::accounts::AccountCredential;
 use crate::manifest::ManifestRegistry;
 use crate::model::{
     Billing, FastPricing, Model, ModelFacts, ModelFamily, ModelPricing, ThinkingSupport,
 };
-use crate::provider::{BoxFuture, Provider, ProviderKind, WireRequest};
+use crate::provider::{BoxFuture, Provider, ProviderKind, WireRequest, provider_for_slug};
 use crate::providers::Timeouts;
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
@@ -26,7 +27,6 @@ static CUSTOM_OPENAI_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     // Custom providers resolve their own base URL (including any override) from
     // config, so the compat-layer fallback slug is unused here.
     slug: "",
-    api_key_env: "",
     base_url: "",
     max_tokens_field: "max_tokens",
     include_stream_usage: true,
@@ -53,31 +53,25 @@ pub fn base_kind(slug: &str) -> Option<ProviderKind> {
     Some(protocol_kind(config.get(slug)?.protocol?))
 }
 
-fn resolve_custom_auth(slug: &str) -> Result<ResolvedAuth, AgentError> {
-    let config = ProvidersConfig::load();
-    let def = config.get(slug).ok_or_else(|| AgentError::Config {
-        message: format!("unknown custom provider '{slug}'"),
-    })?;
-
-    let resolved_env = resolve_api_key_env(slug, Some(def));
-    let env_var = def.api_key_env.as_deref().unwrap_or(&resolved_env);
-    let pool = super::KeyPool::resolve(slug, env_var)?;
-
-    let base_url = resolve_base_url(slug, Some(def));
-    let mut auth = ResolvedAuth::bearer(pool.current());
-    auth.base_url = base_url;
-    Ok(auth)
-}
-
-pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+/// An endpoint that needs no key gets no `authorization` header at all.
+pub fn create(
+    slug: &str,
+    account: &AccountCredential,
+    timeouts: Timeouts,
+) -> Result<Box<dyn Provider>, AgentError> {
     let kind = base_kind(slug).ok_or_else(|| AgentError::Config {
         message: format!("unknown custom provider '{slug}'"),
     })?;
-    let resolved = resolve_custom_auth(slug)?;
-    let auth = Arc::new(Mutex::new(resolved));
-
     let config = ProvidersConfig::load();
-    let protocol = resolve_protocol(slug, config.get(slug)).unwrap_or(Protocol::Openai);
+    let def = config.get(slug);
+    let auth = Arc::new(Mutex::new(ResolvedAuth {
+        base_url: resolve_base_url(slug, def),
+        headers: account
+            .optional_api_key()
+            .map(|key| ResolvedAuth::bearer(key).headers)
+            .unwrap_or_default(),
+    }));
+    let protocol = resolve_protocol(slug, def).unwrap_or(Protocol::Openai);
 
     match kind {
         ProviderKind::Anthropic => Ok(Box::new(super::anthropic::Anthropic::with_auth(
@@ -347,7 +341,7 @@ pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
         if resolve_protocol(slug, Some(def)).is_none() {
             continue;
         }
-        match create(slug, timeouts) {
+        match provider_for_slug(slug, timeouts) {
             Ok(provider) => {
                 let slug_c = slug.clone();
                 let result = smol::block_on(provider.list_models());

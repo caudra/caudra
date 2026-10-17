@@ -82,6 +82,8 @@ impl LedgerPurpose {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnUsage {
     pub provider: String,
+    /// The provider account that answered, empty when unknown.
+    pub account: String,
     pub model: String,
     pub cwd: String,
     pub purpose: LedgerPurpose,
@@ -127,6 +129,7 @@ impl UsageLedger {
         self.database.record_usage(&LedgerEntry {
             bucket_start: bucket_for(now),
             provider: &turn.provider,
+            account: &turn.account,
             model: &turn.model,
             cwd: &turn.cwd,
             purpose: turn.purpose,
@@ -213,6 +216,8 @@ pub struct LifetimeUsage {
     /// back it reaches.
     pub since: Option<i64>,
     pub by_provider: Vec<UsageSlice>,
+    /// `provider/account`, for the turns that know which account answered.
+    pub by_account: Vec<UsageSlice>,
     pub by_model: Vec<UsageSlice>,
     pub by_project: Vec<UsageSlice>,
     pub by_purpose: Vec<UsageSlice>,
@@ -247,6 +252,7 @@ impl LifetimeUsage {
 fn summarize(buckets: &[UsageBucket]) -> LifetimeUsage {
     let mut summary = LifetimeUsage::default();
     let mut by_provider: BTreeMap<String, UsageSlice> = BTreeMap::new();
+    let mut by_account: BTreeMap<String, UsageSlice> = BTreeMap::new();
     let mut by_model: BTreeMap<String, UsageSlice> = BTreeMap::new();
     let mut by_project: BTreeMap<String, UsageSlice> = BTreeMap::new();
     let mut by_purpose: BTreeMap<String, UsageSlice> = BTreeMap::new();
@@ -272,6 +278,13 @@ fn summarize(buckets: &[UsageBucket]) -> LifetimeUsage {
                 .map_or(bucket.bucket_start, |since| since.min(bucket.bucket_start)),
         );
         add_slice(&mut by_provider, bucket.provider.clone(), bucket);
+        if !bucket.account.is_empty() {
+            add_slice(
+                &mut by_account,
+                format!("{}/{}", bucket.provider, bucket.account),
+                bucket,
+            );
+        }
         add_slice(
             &mut by_model,
             format!("{}/{}", bucket.provider, bucket.model),
@@ -282,6 +295,7 @@ fn summarize(buckets: &[UsageBucket]) -> LifetimeUsage {
         add_slice(&mut by_month, month_label(bucket.bucket_start), bucket);
     }
     summary.by_provider = ranked(by_provider);
+    summary.by_account = ranked(by_account);
     summary.by_model = ranked(by_model);
     summary.by_project = ranked(by_project);
     summary.by_purpose = ranked(by_purpose);
@@ -359,6 +373,9 @@ mod tests {
     const UNPRICED_COUNTED: &str = "an unpriced turn must be counted, not dropped";
     const PURPOSE_SEPARATES: &str =
         "spend Caudra makes on its own must stay tellable from the chat";
+    const PERSONAL_ACCOUNT: &str = "personal";
+    const WORK_ACCOUNT: &str = "work";
+    const ACCOUNT_SEPARATES: &str = "two accounts of one provider must keep separate rows";
 
     fn turn(model: &str, cost: Option<f64>) -> TurnUsage {
         subscription_turn(model, cost, false)
@@ -367,6 +384,7 @@ mod tests {
     fn subscription_turn(model: &str, cost: Option<f64>, subscription: bool) -> TurnUsage {
         TurnUsage {
             provider: PROVIDER.into(),
+            account: String::new(),
             model: model.into(),
             cwd: CWD.into(),
             purpose: LedgerPurpose::Chat,
@@ -429,6 +447,71 @@ mod tests {
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows.iter().map(|row| row.cost).sum::<f64>(), 2.0);
+    }
+
+    #[test]
+    fn each_account_keeps_its_own_row() {
+        let (_temp, dir) = state_dir();
+        for (account, cost) in [(PERSONAL_ACCOUNT, 1.0), (WORK_ACCOUNT, 2.0)] {
+            ledger(&dir)
+                .record_at(
+                    &TurnUsage {
+                        account: account.into(),
+                        ..turn(MODEL, Some(cost))
+                    },
+                    0,
+                )
+                .unwrap();
+        }
+
+        let rows: Vec<(String, f64)> = ledger(&dir)
+            .buckets(None)
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.account, row.cost))
+            .collect();
+
+        assert_eq!(
+            rows,
+            [
+                (PERSONAL_ACCOUNT.to_owned(), 1.0),
+                (WORK_ACCOUNT.to_owned(), 2.0)
+            ],
+            "{ACCOUNT_SEPARATES}"
+        );
+    }
+
+    #[test]
+    fn the_lifetime_splits_spend_by_account_and_skips_unknown_ones() {
+        let (_temp, dir) = state_dir();
+        for (account, cost) in [(PERSONAL_ACCOUNT, 1.0), (WORK_ACCOUNT, 2.0), ("", 4.0)] {
+            ledger(&dir)
+                .record_at(
+                    &TurnUsage {
+                        account: account.into(),
+                        ..turn(MODEL, Some(cost))
+                    },
+                    0,
+                )
+                .unwrap();
+        }
+
+        let accounts: Vec<(String, f64)> = ledger(&dir)
+            .lifetime()
+            .unwrap()
+            .by_account
+            .into_iter()
+            .map(|slice| (slice.label, slice.cost))
+            .collect();
+
+        assert_eq!(
+            accounts,
+            [
+                (format!("{PROVIDER}/{WORK_ACCOUNT}"), 2.0),
+                (format!("{PROVIDER}/{PERSONAL_ACCOUNT}"), 1.0)
+            ],
+            "{ACCOUNT_SEPARATES}"
+        );
     }
 
     #[test]

@@ -363,6 +363,8 @@ impl Chat {
                 }
             }
             AgentEvent::StreamReset
+            | AgentEvent::AccountRouted { .. }
+            | AgentEvent::AccountExhausted(_)
             | AgentEvent::TaskAdmitted(_)
             | AgentEvent::Retry { .. }
             | AgentEvent::SubagentProgress { .. }
@@ -3654,6 +3656,7 @@ mod tests {
             purpose,
             cost: None,
             billing: Billing::Api,
+            account: None,
             context_size: None,
             context_window: 0,
         }))

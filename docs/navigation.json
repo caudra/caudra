@@ -11,6 +11,7 @@
       "label": "Guides",
       "pages": [
         "skills",
+        "accounts",
         "remote-workspaces",
         "sandboxes",
         "sessions",

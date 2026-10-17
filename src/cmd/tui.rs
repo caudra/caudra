@@ -3197,6 +3197,7 @@ mod tests {
                     .record_usage(&LedgerEntry {
                         bucket_start,
                         provider: TEST_MODEL,
+                        account: "",
                         model: TEST_MODEL,
                         cwd: &cwd.to_string_lossy(),
                         purpose: LedgerPurpose::Chat,

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use caudra_storage::StateDir;
 use caudra_storage::auth::OAuthTokens;
 use caudra_storage::log::{outcome, target};
 use flume::Sender;
@@ -9,7 +9,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
-use crate::model::{Billing, Model, ModelInfo};
+use crate::accounts::{AccountCredential, WindowKind};
+use crate::model::{Model, ModelInfo};
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
@@ -18,12 +19,12 @@ use crate::{
 
 use super::auth;
 use super::responses::apply_prompt_cache_key;
+use crate::providers::oauth::AccountStore;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use crate::providers::{ResolvedAuth, catalog};
+use crate::providers::{ResolvedAuth, Timeouts, catalog};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "openai",
-    api_key_env: "OPENAI_API_KEY",
     base_url: "https://api.openai.com/v1",
     max_tokens_field: "max_completion_tokens",
     include_stream_usage: true,
@@ -167,7 +168,7 @@ pub struct OpenAi {
     auth_update: async_lock::Mutex<()>,
     rejected_auth_credentials: Mutex<HashSet<String>>,
     model_context_windows: Mutex<HashMap<String, u32>>,
-    storage: Option<StateDir>,
+    store: Option<AccountStore>,
     system_prefix: Option<String>,
     /// Env / `providers.toml` override for the platform API, resolved once at
     /// construction. Used by the Responses (codex) path only; ChatGPT Coding
@@ -176,9 +177,8 @@ pub struct OpenAi {
 }
 
 impl OpenAi {
-    pub fn new(timeouts: crate::providers::Timeouts) -> Result<Self, AgentError> {
-        let storage = StateDir::resolve()?;
-        let (resolved, oauth_tokens) = auth::resolve_with_tokens(&storage)?;
+    pub fn new(account: &AccountCredential, timeouts: Timeouts) -> Result<Self, AgentError> {
+        let (resolved, oauth_tokens) = auth::account_auth(&account.secret)?;
         let compat = OpenAiCompatProvider::new(&CONFIG, timeouts);
         Ok(Self {
             resolved_base_url: resolve_openai_base_url(),
@@ -190,15 +190,12 @@ impl OpenAi {
             auth_update: async_lock::Mutex::new(()),
             rejected_auth_credentials: Mutex::new(HashSet::new()),
             model_context_windows: Mutex::new(HashMap::new()),
-            storage: Some(storage),
+            store: AccountStore::for_account(account)?,
             system_prefix: None,
         })
     }
 
-    pub(crate) fn with_auth(
-        auth: Arc<Mutex<ResolvedAuth>>,
-        timeouts: crate::providers::Timeouts,
-    ) -> Self {
+    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: Timeouts) -> Self {
         Self {
             resolved_base_url: resolve_openai_base_url(),
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
@@ -209,7 +206,7 @@ impl OpenAi {
             auth_update: async_lock::Mutex::new(()),
             rejected_auth_credentials: Mutex::new(HashSet::new()),
             model_context_windows: Mutex::new(HashMap::new()),
-            storage: None,
+            store: None,
             system_prefix: None,
         }
     }
@@ -298,7 +295,7 @@ impl OpenAi {
         &self,
         mut rejected_accesses: Vec<String>,
     ) -> Result<AuthSnapshot, AgentError> {
-        let storage = self.storage.clone().ok_or_else(|| AgentError::Config {
+        let store = self.store.clone().ok_or_else(|| AgentError::Config {
             message: "OAuth refresh not available for externally-managed auth".into(),
         })?;
         let _update = self.auth_update.lock().await;
@@ -312,7 +309,7 @@ impl OpenAi {
             }
         }
         let tokens =
-            smol::unblock(move || auth::refresh_from_storage(&storage, &rejected_accesses)).await?;
+            smol::unblock(move || auth::refresh_from_storage(&store, &rejected_accesses)).await?;
         self.install_oauth_tokens(&tokens);
         info!(
             target: target::PROVIDER,
@@ -326,8 +323,8 @@ impl OpenAi {
 
     async fn auth_for_request(&self) -> Result<AuthSnapshot, AgentError> {
         let snapshot = self.auth_snapshot();
-        let Some(storage) = self
-            .storage
+        let Some(store) = self
+            .store
             .clone()
             .filter(|_| snapshot.oauth_tokens.is_some())
         else {
@@ -340,15 +337,14 @@ impl OpenAi {
         }
         let attempted_access = bearer_token(&current.resolved);
         let rejected_accesses = self.rejected_auth_credentials();
-        let tokens =
-            smol::unblock(move || auth::refresh_from_storage(&storage, &rejected_accesses))
-                .await
-                .inspect_err(|error| {
-                    if error.is_auth_error() {
-                        self.mark_auth_rejected(attempted_access);
-                    }
-                    warn!(%error, "proactive OpenAI OAuth refresh failed");
-                })?;
+        let tokens = smol::unblock(move || auth::refresh_from_storage(&store, &rejected_accesses))
+            .await
+            .inspect_err(|error| {
+                if error.is_auth_error() {
+                    self.mark_auth_rejected(attempted_access);
+                }
+                warn!(%error, "proactive OpenAI OAuth refresh failed");
+            })?;
         self.install_oauth_tokens(&tokens);
         Ok(self.auth_snapshot())
     }
@@ -552,13 +548,16 @@ fn usage_label(seconds: u64) -> String {
 }
 
 fn usage_limit(window: CodexUsageWindow) -> Option<UsageLimit> {
+    let length_secs = window.limit_window_seconds?;
     Some(UsageLimit {
-        label: usage_label(window.limit_window_seconds?),
+        label: usage_label(length_secs),
         percentage: usage_percentage(window.used_percent?),
         reset_at: window
             .reset_at
             .and_then(|seconds| seconds.checked_mul(MILLIS_PER_SECOND)),
         detail: None,
+        window: Some(WindowKind::from_length(Duration::from_secs(length_secs))),
+        length_secs: Some(length_secs),
     })
 }
 
@@ -709,12 +708,12 @@ impl Provider for OpenAi {
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
-            let Some(storage) = self.storage.clone() else {
+            let Some(store) = self.store.clone() else {
                 return Ok(());
             };
             let _update = self.auth_update.lock().await;
             let (resolved, oauth_tokens) =
-                smol::unblock(move || auth::resolve_with_tokens(&storage)).await?;
+                smol::unblock(move || auth::account_auth(&store.reload()?)).await?;
             self.install_resolved_auth(resolved, oauth_tokens);
             let snapshot = self.auth_snapshot();
             let mut rejected = self.rejected_auth_credentials.lock().unwrap();
@@ -738,7 +737,6 @@ impl Provider for OpenAi {
     /// The baseline already holds any window `providers.toml` declares, so the
     /// plan cap narrows a declared window just as it does the table's.
     fn adjust_model(&self, model: &mut Model) {
-        model.billing = Billing::from_oauth(self.is_oauth());
         let baseline_context_window = *self
             .model_context_windows
             .lock()
@@ -1142,12 +1140,16 @@ mod tests {
                     percentage: Some(13),
                     reset_at: Some(1_760_000_000_000),
                     detail: None,
+                    window: Some(WindowKind::FiveHour),
+                    length_secs: Some(18_000),
                 },
                 UsageLimit {
                     label: "Weekly usage".into(),
                     percentage: Some(100),
                     reset_at: Some(1_760_100_000_000),
                     detail: None,
+                    window: Some(WindowKind::Weekly),
+                    length_secs: Some(604_800),
                 },
             ]
         );
@@ -1169,6 +1171,8 @@ mod tests {
                 percentage: Some(0),
                 reset_at: None,
                 detail: None,
+                window: Some(WindowKind::Other("1d".into())),
+                length_secs: Some(86_400),
             }]
         );
     }

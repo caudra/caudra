@@ -13,6 +13,7 @@ use tracing::{debug, warn};
 use super::anthropic::{self, shared};
 use super::openai::responses;
 use super::openai_compat;
+use crate::accounts::AccountCredential;
 use crate::model::{
     Billing, Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, StaticReasoningOption,
     lookup_entry,
@@ -604,10 +605,10 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
     MODELS
 }
 
-/// Where a Copilot instance gets its token: a native credential slot, or the
-/// Bearer and base URL a dynamic provider script resolved.
+/// Where a Copilot instance gets its token: the account it signs in as, or
+/// the Bearer and base URL a dynamic provider script resolved.
 enum AuthSource {
-    Stored(CopilotIdentity),
+    Account(auth::CopilotCredentials),
     Resolved(Arc<Mutex<super::ResolvedAuth>>),
 }
 
@@ -621,9 +622,16 @@ pub struct Copilot {
 }
 
 impl Copilot {
-    pub fn new(identity: CopilotIdentity, timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        auth::load_token(identity)?;
-        Ok(Self::with_source(AuthSource::Stored(identity), timeouts))
+    pub fn new(
+        account: &AccountCredential,
+        identity: CopilotIdentity,
+        timeouts: super::Timeouts,
+    ) -> Result<Self, AgentError> {
+        let credentials = auth::account_credentials(identity, account)?;
+        Ok(Self::with_source(
+            AuthSource::Account(credentials),
+            timeouts,
+        ))
     }
 
     pub(crate) fn with_auth(
@@ -655,26 +663,25 @@ impl Copilot {
             AuthSource::Resolved(auth) => {
                 copilot_auth_from_resolved(&auth.lock().unwrap()).map(Some)
             }
-            AuthSource::Stored(_) => Ok(self.auth.lock().unwrap().clone()),
+            AuthSource::Account(_) => Ok(self.auth.lock().unwrap().clone()),
         }
     }
 
     async fn auth(&self) -> Result<CopilotAuth, AgentError> {
-        let identity = match &self.source {
+        let creds = match &self.source {
             AuthSource::Resolved(auth) => {
                 return copilot_auth_from_resolved(&auth.lock().unwrap());
             }
-            AuthSource::Stored(identity) => *identity,
+            AuthSource::Account(creds) => creds,
         };
         let cached = self.auth.lock().unwrap().clone();
         if let Some(auth) = cached {
             return Ok(auth);
         }
 
-        let creds = auth::load_token(identity)?;
         let auth = CopilotAuth {
-            endpoint: resolve_endpoint(&self.client, &creds).await,
-            token: creds.token,
+            endpoint: resolve_endpoint(&self.client, creds).await,
+            token: creds.token.clone(),
         };
         *self.auth.lock().unwrap() = Some(auth.clone());
         Ok(auth)
@@ -1761,7 +1768,7 @@ mod tests {
 
     fn enterprise_provider() -> Copilot {
         let provider = Copilot::with_source(
-            AuthSource::Stored(CopilotIdentity::Enterprise),
+            AuthSource::Account(enterprise_credentials()),
             Timeouts::default(),
         );
         *provider.auth.lock().unwrap() = Some(CopilotAuth {

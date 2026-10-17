@@ -1,17 +1,17 @@
+use std::thread;
 use std::time::Duration;
-use std::{env, thread};
 
-use caudra_storage::StateDir;
-use caudra_storage::auth::{
-    OAuthTokens, delete_tokens, lock_provider_auth, now_millis, save_tokens, try_load_tokens,
-};
+use caudra_storage::accounts::{AccountIdentity, StoredSecret};
+use caudra_storage::auth::{OAuthTokens, now_millis};
 use isahc::ReadResponseExt;
 use isahc::config::{Configurable, VersionNegotiation};
 use serde::Deserialize;
+use serde_json::Value;
 use tracing::{debug, error};
 
 use crate::AgentError;
-use crate::providers::oauth::{self, RefreshReason};
+use crate::accounts::{AccountSecret, LoginCredential};
+use crate::providers::oauth::{AccountStore, RefreshReason, jwt_claims};
 use crate::providers::{ResolvedAuth, urlenc};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -25,6 +25,10 @@ const REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 const POLL_SAFETY_MARGIN: Duration = Duration::from_secs(3);
 const TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_TIMEOUT: Duration = Duration::from_secs(300);
+const PROFILE_EMAIL_CLAIM: &str = "/https:~1~1api.openai.com~1profile/email";
+const EMAIL_CLAIM: &str = "/email";
+const PLAN_CLAIM: &str = "/https:~1~1api.openai.com~1auth/chatgpt_plan_type";
+const NO_CREDENTIAL: &str = "this OpenAI account has neither a login nor an API key";
 
 #[derive(Deserialize)]
 struct DeviceCodeResponse {
@@ -62,15 +66,7 @@ fn http_client(timeout: Duration) -> Result<isahc::HttpClient, AgentError> {
 }
 
 fn extract_account_id(token: &str) -> Option<String> {
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    use base64::Engine;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let payload = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
-
+    let claims = jwt_claims(token)?;
     claims
         .get("chatgpt_account_id")
         .and_then(|v| v.as_str())
@@ -97,6 +93,26 @@ fn extract_account_id_from_tokens(resp: &TokenResponse) -> Option<String> {
         return Some(id);
     }
     extract_account_id(&resp.access_token)
+}
+
+/// Who a login signs in as, from the claims its tokens carry.
+fn login_identity(resp: &TokenResponse) -> AccountIdentity {
+    let claims: Vec<Value> = [resp.id_token.as_deref(), Some(resp.access_token.as_str())]
+        .into_iter()
+        .flatten()
+        .filter_map(jwt_claims)
+        .collect();
+    let claim = |pointer: &str| {
+        claims
+            .iter()
+            .find_map(|claims| claims.pointer(pointer)?.as_str().map(str::to_owned))
+    };
+    AccountIdentity {
+        subject: extract_account_id_from_tokens(resp),
+        email: claim(PROFILE_EMAIL_CLAIM).or_else(|| claim(EMAIL_CLAIM)),
+        organization: None,
+        plan: claim(PLAN_CLAIM),
+    }
 }
 
 fn request_device_code() -> Result<DeviceCodeResponse, AgentError> {
@@ -290,15 +306,13 @@ fn oauth_error_status(status: u16, body: &str) -> u16 {
 }
 
 pub(crate) fn refresh_from_storage(
-    storage: &StateDir,
+    store: &AccountStore,
     rejected_accesses: &[String],
 ) -> Result<OAuthTokens, AgentError> {
-    let reason = if rejected_accesses.is_empty() {
-        RefreshReason::Proactive
-    } else {
-        RefreshReason::Rejected(rejected_accesses)
-    };
-    oauth::refresh_from_storage(storage, PROVIDER, reason, refresh_tokens)
+    store.refresh(
+        RefreshReason::for_rejected(rejected_accesses),
+        refresh_tokens,
+    )
 }
 
 pub(crate) const CODING_PLAN_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
@@ -321,49 +335,21 @@ pub(crate) fn build_coding_plan_resolved(tokens: &OAuthTokens) -> ResolvedAuth {
     }
 }
 
-pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
-    resolve_with_tokens(dir).map(|(resolved, _)| resolved)
-}
-
-pub(crate) fn resolve_with_tokens(
-    dir: &StateDir,
+/// The platform auth `secret` signs in with, and its tokens when it is a
+/// login rather than an API key.
+pub(crate) fn account_auth(
+    secret: &AccountSecret,
 ) -> Result<(ResolvedAuth, Option<OAuthTokens>), AgentError> {
-    if let Some(tokens) = try_load_tokens(dir, PROVIDER)? {
-        debug!(
-            expired = tokens.is_expired(),
-            "using OpenAI OAuth authentication"
-        );
-        return Ok((build_oauth_resolved(&tokens), Some(tokens)));
+    match secret {
+        AccountSecret::OAuth(tokens) => Ok((build_oauth_resolved(tokens), Some(tokens.clone()))),
+        AccountSecret::ApiKey { key, .. } => Ok((ResolvedAuth::bearer(key), None)),
+        AccountSecret::Keyless => Err(AgentError::Config {
+            message: NO_CREDENTIAL.into(),
+        }),
     }
-
-    if let Ok(key) = env::var("OPENAI_API_KEY") {
-        debug!("using OpenAI API key authentication");
-        return Ok((
-            ResolvedAuth {
-                base_url: None,
-                headers: vec![("authorization".into(), format!("Bearer {key}"))],
-            },
-            None,
-        ));
-    }
-
-    if let Some(creds) = caudra_storage::auth::load_provider_credentials(dir, PROVIDER) {
-        debug!("using OpenAI saved API key");
-        return Ok((
-            ResolvedAuth {
-                base_url: None,
-                headers: vec![("authorization".into(), format!("Bearer {}", creds.api_key))],
-            },
-            None,
-        ));
-    }
-
-    Err(AgentError::Config {
-        message: "not authenticated, run `caudra auth login openai` or set OPENAI_API_KEY".into(),
-    })
 }
 
-pub fn login(dir: &StateDir) -> Result<(), AgentError> {
+pub fn login() -> Result<LoginCredential, AgentError> {
     let device = request_device_code()?;
 
     println!("Open this URL in your browser:\n\n  {DEVICE_AUTH_URL}\n");
@@ -380,41 +366,30 @@ pub fn login(dir: &StateDir) -> Result<(), AgentError> {
         e
     })?;
 
+    let identity = login_identity(&token_resp);
     let tokens = into_oauth_tokens(token_resp, None)?;
-    let _lock = lock_provider_auth(dir, PROVIDER)?;
-    save_tokens(dir, PROVIDER, &tokens)?;
     println!("Authenticated successfully.");
-    Ok(())
-}
-
-pub fn logout(dir: &StateDir) -> Result<(), AgentError> {
-    let _lock = lock_provider_auth(dir, PROVIDER)?;
-    if delete_tokens(dir, PROVIDER)? {
-        println!("Logged out of OpenAI.");
-    } else {
-        println!("Not currently logged in to OpenAI.");
-    }
-    Ok(())
+    Ok(LoginCredential {
+        secret: StoredSecret::OAuth(tokens),
+        identity,
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
-    use tempfile::TempDir;
+    use crate::providers::oauth::unsigned_jwt;
+
+    const ACCOUNT_ID: &str = "acct_123";
+    const EMAIL: &str = "jane@example.com";
+    const PLAN: &str = "pro";
 
     #[test]
     fn extract_account_id_from_jwt() {
-        use base64::Engine;
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-
-        let header = URL_SAFE_NO_PAD.encode(b"{}");
-        let payload = URL_SAFE_NO_PAD.encode(
-            serde_json::json!({"chatgpt_account_id": "acct_123"})
-                .to_string()
-                .as_bytes(),
-        );
-        let token = format!("{header}.{payload}.sig");
-        assert_eq!(extract_account_id(&token).as_deref(), Some("acct_123"));
+        let token = unsigned_jwt(&json!({"chatgpt_account_id": ACCOUNT_ID}));
+        assert_eq!(extract_account_id(&token).as_deref(), Some(ACCOUNT_ID));
 
         assert_eq!(extract_account_id("not.a.jwt"), None);
         assert_eq!(extract_account_id("invalid"), None);
@@ -455,26 +430,24 @@ mod tests {
     }
 
     #[test]
-    fn expired_tokens_do_not_refresh_during_resolution() {
-        let temp = TempDir::new().unwrap();
-        let storage = StateDir::from_path(temp.path().to_path_buf());
-        save_tokens(
-            &storage,
-            PROVIDER,
-            &OAuthTokens {
-                access: "expired-access".into(),
-                refresh: "refresh".into(),
-                expires: 0,
-                account_id: None,
-            },
-        )
-        .unwrap();
-
-        let resolved = resolve(&storage).unwrap();
+    fn login_identity_reads_the_account_email_and_plan() {
+        let response = TokenResponse {
+            access_token: unsigned_jwt(&json!({
+                "https://api.openai.com/auth": {"chatgpt_account_id": ACCOUNT_ID, "chatgpt_plan_type": PLAN},
+            })),
+            refresh_token: None,
+            id_token: Some(unsigned_jwt(&json!({"email": EMAIL}))),
+            expires_in: None,
+        };
 
         assert_eq!(
-            resolved.headers,
-            vec![("authorization".into(), "Bearer expired-access".into())]
+            login_identity(&response),
+            AccountIdentity {
+                subject: Some(ACCOUNT_ID.into()),
+                email: Some(EMAIL.into()),
+                organization: None,
+                plan: Some(PLAN.into()),
+            }
         );
     }
 }

@@ -2,6 +2,9 @@
 //! directory then persists (atomic rename) for crash safety.
 //! `atomic_write_permissions` sets file mode before persist (for auth keys at 0600).
 
+#[path = "sessions/account_switches.rs"]
+pub mod account_switches;
+pub mod accounts;
 pub mod auth;
 #[path = "sessions/automation.rs"]
 pub mod automation;
@@ -251,7 +254,15 @@ pub enum StorageError {
     #[error("invalid Workcell credential: {0}")]
     InvalidWorkcellCredential(String),
     #[error(transparent)]
-    InvalidDecisionEndpointName(#[from] auth::DecisionEndpointNameError),
+    InvalidName(#[from] auth::NameError),
+    #[error(transparent)]
+    InvalidAccountName(#[from] accounts::AccountNameError),
+    #[error(transparent)]
+    InvalidProviderSlug(#[from] accounts::ProviderSlugError),
+    #[error("invalid account credential: {0}")]
+    InvalidAccountRecord(String),
+    #[error("account {0} already exists; choose another name or log it out first")]
+    AccountExists(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("slug collision after max attempts")]

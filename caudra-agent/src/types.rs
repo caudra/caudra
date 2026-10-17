@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use caudra_providers::accounts::{AccountExhaustion, AccountSwitch, RoutedAccount};
 use caudra_providers::{
     AgentError, AutomationEventOrigin, AutopilotOrigin, Billing, ContentBlock, DocumentSource,
     ImageSource, Message, PEER_SCRIPT_SENDER, PEER_SESSION_SENDER, PeerMessageOrigin, Role,
@@ -3133,6 +3134,17 @@ pub enum AgentEvent {
         message: String,
         delay_ms: u64,
     },
+    /// The provider account a conversation's request went to, on its first
+    /// request, whenever it moves, and whenever a response changes what is
+    /// left of its quota.
+    AccountRouted {
+        account: RoutedAccount,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        switch: Option<AccountSwitch>,
+    },
+    /// The conversation's account ran out and no other took over, so the user
+    /// may choose one instead of waiting.
+    AccountExhausted(Box<AccountExhaustion>),
     Error {
         message: String,
     },
@@ -3478,6 +3490,9 @@ pub struct TurnCompleteEvent {
     /// reporting, so the number is only meaningful next to its payer.
     #[serde(skip)]
     pub billing: Billing,
+    /// The provider account that served the turn, when routing named one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_size: Option<u32>,
     /// The model's context window, so consumers can gauge `context_size`

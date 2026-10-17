@@ -117,6 +117,7 @@ A state is one of `pending`, `leased`, `pausing`, `paused`, `completed`, `failed
 |------|-----|-----------|---------------------|
 | `--prompt` | yes | yes | no (messages arrive on the wire) |
 | `-m` / `--model` | yes | yes | yes |
+| `--account` | yes | yes | yes |
 | `--yolo` | yes | yes | yes (or `--permission-mode bypassPermissions`) |
 | `--auto` | yes | yes | yes (or `--permission-mode auto`) |
 | `--no-plugins` / `--no-commands` / `--no-jit` | yes | yes | yes |
@@ -148,6 +149,7 @@ A state is one of `pending`, `leased`, `pausing`, `paused`, `completed`, `failed
 | `--no-snapshots` | Turn off file change recording and file revert for this process, locally and remotely. Also applies to ACP. Records already made stay stored, and an existing file revert can still be unreverted. See [Disable change recording](/docs/sessions/#disable-change-recording) |
 | `--image <PATH>` | Attach an image in `--print` mode (repeatable). Paths must be png, jpeg, gif, or webp |
 | `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used → `provider.default_model` in config → auto-detect from available providers |
+| `--account <PROVIDER:NAME>` | Use one [account](/docs/accounts/#choose-the-account) of a provider for this run, or `PROVIDER:auto` to let Caudra choose (repeatable, once per provider). Nothing is saved. `CAUDRA_ACCOUNT` takes the same values separated by commas, and the flag wins over it |
 | `--verbose` | Full turn-by-turn messages in `--print` output |
 | `-c`, `--continue` | Resume the most recent session in this directory (TUI / SDK only) |
 | `-s`, `--session` / `--resume <ID>` | Resume a specific session (TUI / SDK only) |
@@ -441,11 +443,13 @@ A remote selector is required. `remote` is available when `experimental.sandboxe
 ### `caudra auth`
 
 ```bash
-caudra auth login [provider] [--method oauth|api-key|import] [--hostname HOST]
+caudra auth login [provider] [--name NAME] [--method oauth|api-key|import] [--hostname HOST]
 caudra auth login --decision [typesafe|openai|custom|<name>]
-caudra auth logout <provider>
+caudra auth logout <provider> [NAME] [--all]
 caudra auth logout --decision <name>
-caudra auth status
+caudra auth status [--refresh]
+caudra auth use <provider> <NAME|auto>
+caudra auth rename <provider> <FROM> <TO>
 caudra auth workcell set <NAME> [--stdin]
 caudra auth workcell list
 caudra auth workcell delete <NAME>
@@ -455,15 +459,17 @@ caudra auth sandbox list
 caudra auth sandbox delete <NAME>
 ```
 
-`login` stores credentials under the state directory and can write plan or base URL choices into `providers.toml` (see [Configuration](/docs/configuration/#directory-layout) for the platform path). The picker asks for subscription OAuth or an API key when you choose Anthropic or OpenAI. Named Anthropic and OpenAI logins default to OAuth. Pass `--method api-key` to store a key instead.
+`login` stores credentials under the state directory and can write plan or base URL choices into `providers.toml` (see [Configuration](/docs/configuration/#directory-layout) for the platform path). The picker asks for subscription OAuth or an API key when you choose Anthropic, OpenAI, or xAI. Named Anthropic, OpenAI, and xAI logins default to OAuth. Pass `--method api-key` to store a key instead. Key prompts hide what you type.
 
-Anthropic OAuth is experimental. The command explains the Anthropic terms limitation before opening the browser. OpenAI uses a device authorization flow. xAI retains its dedicated named login flow. Other providers prompt for an API key and a plan when more than one plan exists. The interactive picker can also create custom providers.
+Each login adds an [account](/docs/accounts/), or refreshes the account it signs in as again. `--name` chooses the account. `status` groups the accounts by provider, with the selection, each account's kind and quota, and `--refresh` asks each subscription for its quota first. `use` pins an account or turns Auto on, `rename` renames one, and `logout` signs out of one, of every one with `--all`, or of the only one when you leave the name out. See [Accounts](/docs/accounts/#add-an-account).
+
+Anthropic OAuth is experimental. The command explains the Anthropic terms limitation before opening the browser. OpenAI uses a device authorization flow. xAI uses the browser or a device code, as the Grok CLI does. Other providers prompt for an API key and a plan when more than one plan exists. The interactive picker can also create custom providers.
 
 `login --decision` sets up a [decision endpoint](/docs/providers/#decision-endpoints) instead of a chat provider. `typesafe` and `openai` are the presets, `custom` asks for a name, protocol, base URL, and model, and a configured name replaces that endpoint's key. Without a name, it shows the decision menu, which the plain `login` menu also lists. Before it saves plain HTTP to a non-loopback host, it asks for confirmation and sets `allow_http = true`. It saves the key under the state directory, writes the `[decisions.<name>]` table, and makes a new endpoint active. An empty key keeps the saved one, or falls back to the variable that `api_key_env` names. `logout --decision <name>` deletes the key and the table, and turns decisions off when that endpoint was active.
 
 `copilot` and `copilot-enterprise` sign in with GitHub through a device code. Pass `--method import` to copy a token from the gh CLI, the Copilot editor plugin, or the system keyring instead. `copilot-enterprise` also needs the GitHub Enterprise host. Pass it with `--hostname company.ghe.com`, or answer the prompt. Without a terminal and without `--hostname`, the command stops with an error. The two providers keep separate credentials, so logging out of one leaves the other signed in. See [Copilot Enterprise](/docs/providers/#copilot-enterprise).
 
-The TUI `/login` command offers the same method choice for Anthropic and OpenAI, and starts the GitHub sign-in directly for both Copilot providers. `status` distinguishes saved OAuth, saved API keys, saved Copilot tokens with their enterprise host, environment credentials, configured endpoints, and missing credentials. A **Decision endpoints** block lists each decision endpoint with its key source and marks the active one with `●`.
+The TUI `/login` command offers the same method choice for Anthropic, OpenAI, and xAI, and starts the GitHub sign-in directly for both Copilot providers. For a provider that has accounts, it asks first whether to add one or sign in again as one of them. `status` distinguishes saved OAuth, saved API keys, saved Copilot tokens with their enterprise host, environment credentials, configured endpoints, and signed-out accounts. A **Decision endpoints** block lists each decision endpoint with its key source and marks the active one with `●`.
 
 `auth workcell set` reads a bearer token from a hidden terminal prompt, or from stdin with `--stdin`. It stores or replaces a named credential, referenced as `credential:NAME`. `list` shows names and update times without bearer values. Credentials are stored in owner-only local files, without OS-keyring encryption. They are separate from provider login and MCP OAuth credentials. `auth workcell` needs `experimental.remote_workcell`.
 
@@ -520,7 +526,7 @@ caudra --ephemeral acp
 caudra --no-jit acp
 ```
 
-Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are only `-m` / `--model` and `--yolo`. `--ephemeral` must come before the subcommand. `-m`, `--no-jit`, `--no-plugins`, `--no-rtk`, `--allowed-tools`, and `--disallowed-tools` work on either side.
+Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are only `-m` / `--model` and `--yolo`. `--ephemeral` must come before the subcommand. `-m`, `--account`, `--no-jit`, `--no-plugins`, `--no-rtk`, `--allowed-tools`, and `--disallowed-tools` work on either side.
 
 ### `caudra index`
 

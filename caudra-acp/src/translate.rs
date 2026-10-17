@@ -1024,6 +1024,7 @@ mod tests {
             purpose: LedgerPurpose::Chat,
             cost,
             billing: caudra_providers::Billing::Api,
+            account: None,
             context_size,
             context_window,
         }

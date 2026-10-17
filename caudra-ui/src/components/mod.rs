@@ -1,3 +1,4 @@
+pub(crate) mod accounts_modal;
 pub(crate) mod audit_log;
 pub(crate) mod automation_inspector;
 pub(crate) mod autopilot_panel;
@@ -117,6 +118,7 @@ use caudra_providers::model_registry::Binding;
 use caudra_providers::{
     AutomationEventOrigin, CaudraId, HistoryItem, ModelPurpose, PeerMessageOrigin, TaskEventOrigin,
 };
+use caudra_storage::accounts::AccountName;
 use caudra_storage::sessions::SessionRelocation;
 use caudra_workbench::keys::{ListEnd, list_end};
 use caudra_workbench::text_field::FieldStyles;
@@ -1006,6 +1008,7 @@ pub struct LoadedSession {
 pub enum SubscriptionProvider {
     Anthropic,
     OpenAi,
+    Xai,
     Copilot(CopilotIdentity),
 }
 
@@ -1014,6 +1017,7 @@ impl SubscriptionProvider {
         match self {
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
+            Self::Xai => "xai",
             Self::Copilot(identity) => identity.slug(),
         }
     }
@@ -1022,7 +1026,17 @@ impl SubscriptionProvider {
         match self {
             Self::Anthropic => "Anthropic",
             Self::OpenAi => "OpenAI",
+            Self::Xai => "xAI",
             Self::Copilot(identity) => identity.display_name(),
+        }
+    }
+
+    pub(crate) fn from_slug(slug: &str) -> Option<Self> {
+        match slug {
+            "anthropic" => Some(Self::Anthropic),
+            "openai" => Some(Self::OpenAi),
+            "xai" => Some(Self::Xai),
+            _ => CopilotIdentity::from_slug(slug).map(Self::Copilot),
         }
     }
 
@@ -1106,6 +1120,7 @@ pub enum Action {
     AuthenticateProvider {
         provider: SubscriptionProvider,
         model_spec: String,
+        account: Option<AccountName>,
     },
     Bind(ModelPurpose, Binding),
     Unbind(ModelPurpose),

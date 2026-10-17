@@ -11,19 +11,23 @@ use strum::{Display, EnumIter, EnumString};
 use tracing::{debug, warn};
 
 use caudra_config::ModelPolicy;
+use caudra_config::providers::{ProvidersConfig, builtin_provider};
 use caudra_storage::StateDir;
 use caudra_storage::thinking::{self, StoredThinking};
 
+use crate::accounts::{AccountCredential, Failover, RoutedProvider};
 use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
 use crate::providers::anthropic::bedrock;
 use crate::providers::aperture::{self, Aperture};
 use crate::providers::catalog::{
-    OPENCODE_FAMILY_SLUGS, available_if_warm, catalog_providers, catalog_providers_if_available,
+    self, OPENCODE_FAMILY_SLUGS, available_if_warm, catalog_providers,
+    catalog_providers_if_available,
 };
 use crate::providers::copilot::auth::CopilotIdentity;
 use crate::providers::copilot::{self, Copilot};
+use crate::providers::custom;
 use crate::providers::deepseek::DeepSeek;
 use crate::providers::dynamic;
 use crate::providers::google::Google;
@@ -48,6 +52,20 @@ const POST: &str = "POST";
 const SETUP_THINKING_EFFORT: &str = "medium";
 /// Anthropic's default `ephemeral` breakpoint lifetime, the only one Caudra sets.
 const EPHEMERAL_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Where the accounts of a provider may come from besides `caudra auth login`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CredentialSpec {
+    /// The environment variables an implicit account may come from, the
+    /// first set one winning.
+    pub env_vars: Vec<String>,
+    /// The provider runs with no credential at all.
+    pub keyless: bool,
+    /// `caudra auth login` signs in instead of only storing a key.
+    pub oauth: bool,
+    /// The provider-level `api_key` in `providers.toml`.
+    pub config_key: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString, EnumIter)]
 #[strum(serialize_all = "kebab-case")]
@@ -244,35 +262,142 @@ impl ProviderKind {
         }
     }
 
-    pub fn create(self, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    /// Bedrock and the cloud SDKs bring their own credentials, so a provider
+    /// built on them ignores `account`.
+    pub fn create(
+        self,
+        account: &AccountCredential,
+        timeouts: Timeouts,
+    ) -> Result<Box<dyn Provider>, AgentError> {
         match self {
             Self::Anthropic => {
                 if bedrock::is_enabled() {
                     Ok(Box::new(bedrock::Bedrock::new(timeouts)?))
                 } else {
-                    Ok(Box::new(Anthropic::new(timeouts)?))
+                    Ok(Box::new(Anthropic::new(account, timeouts)?))
                 }
             }
-            Self::OpenAi => Ok(Box::new(OpenAi::new(timeouts)?)),
-            Self::Google => Ok(Box::new(Google::new(timeouts)?)),
-            Self::Copilot => Ok(Box::new(Copilot::new(CopilotIdentity::Public, timeouts)?)),
+            Self::OpenAi => Ok(Box::new(OpenAi::new(account, timeouts)?)),
+            Self::Google => Ok(Box::new(Google::new(account, timeouts)?)),
+            Self::Copilot => Ok(Box::new(Copilot::new(
+                account,
+                CopilotIdentity::Public,
+                timeouts,
+            )?)),
             Self::CopilotEnterprise => Ok(Box::new(Copilot::new(
+                account,
                 CopilotIdentity::Enterprise,
                 timeouts,
             )?)),
-            Self::Ollama => Ok(Box::new(LocalEndpoint::new(&OLLAMA, timeouts)?)),
-            Self::LlamaCpp => Ok(Box::new(LocalEndpoint::new(&LLAMACPP, timeouts)?)),
-            Self::Mistral => Ok(Box::new(Mistral::new(timeouts)?)),
-            Self::Zai => Ok(Box::new(Zai::new(timeouts)?)),
-            Self::DeepSeek => Ok(Box::new(DeepSeek::new(timeouts)?)),
-            Self::OpenRouter => Ok(Box::new(OpenRouter::new(timeouts)?)),
-            Self::Synthetic => Ok(Box::new(Synthetic::new(timeouts)?)),
-            Self::TensorX => Ok(Box::new(TensorX::new(timeouts)?)),
-            Self::Opencode => Ok(Box::new(Opencode::new(timeouts)?)),
-            Self::Xai => Ok(Box::new(Xai::new(timeouts)?)),
-            Self::Aperture => Ok(Box::new(Aperture::new(timeouts)?)),
+            Self::Ollama => Ok(Box::new(LocalEndpoint::new(&OLLAMA, account, timeouts)?)),
+            Self::LlamaCpp => Ok(Box::new(LocalEndpoint::new(&LLAMACPP, account, timeouts)?)),
+            Self::Mistral => Ok(Box::new(Mistral::new(account, timeouts)?)),
+            Self::Zai => Ok(Box::new(Zai::new(account, timeouts)?)),
+            Self::DeepSeek => Ok(Box::new(DeepSeek::new(account, timeouts)?)),
+            Self::OpenRouter => Ok(Box::new(OpenRouter::new(account, timeouts)?)),
+            Self::Synthetic => Ok(Box::new(Synthetic::new(account, timeouts)?)),
+            Self::TensorX => Ok(Box::new(TensorX::new(account, timeouts)?)),
+            Self::Opencode => Ok(Box::new(Opencode::new(account, timeouts)?)),
+            Self::Xai => Ok(Box::new(Xai::new(account, timeouts)?)),
+            Self::Aperture => Ok(Box::new(Aperture::new(account, timeouts)?)),
         }
     }
+
+    fn credential_env_vars(self, slug: &str) -> Vec<String> {
+        let names: &[&str] = match self {
+            Self::Copilot => CopilotIdentity::Public.token_env_vars(),
+            Self::CopilotEnterprise => CopilotIdentity::Enterprise.token_env_vars(),
+            Self::Opencode => return catalog::credential_env_vars(slug).unwrap_or_default(),
+            _ => &[builtin_provider(slug).map_or("", |builtin| builtin.default_api_key_env)],
+        };
+        names
+            .iter()
+            .filter(|name| !name.is_empty())
+            .map(|name| (*name).to_owned())
+            .collect()
+    }
+
+    /// Local servers and gateways need no key, Bedrock signs with AWS
+    /// credentials, and Opencode Zen serves its free models without one.
+    fn keyless(self) -> bool {
+        match self {
+            Self::Ollama | Self::LlamaCpp | Self::Aperture | Self::Opencode => true,
+            Self::Anthropic => bedrock::is_enabled(),
+            _ => false,
+        }
+    }
+
+    const fn signs_in(self) -> bool {
+        matches!(
+            self,
+            Self::Anthropic | Self::OpenAi | Self::Xai | Self::Copilot | Self::CopilotEnterprise
+        )
+    }
+}
+
+/// How the accounts of `slug` may be supplied. Fails for a slug no provider
+/// answers to, with the message building one would give.
+pub fn credential_spec(slug: &str) -> Result<CredentialSpec, AgentError> {
+    let config = ProvidersConfig::load();
+    let definition = config.get(slug);
+    let config_key = definition.and_then(|definition| definition.api_key.clone());
+    if let Ok(kind) = ProviderKind::from_str(slug) {
+        return Ok(CredentialSpec {
+            env_vars: kind.credential_env_vars(slug),
+            keyless: kind.keyless(),
+            oauth: kind.signs_in(),
+            config_key,
+        });
+    }
+    if dynamic::display_name(slug).is_some() {
+        return Ok(CredentialSpec {
+            keyless: true,
+            config_key,
+            ..CredentialSpec::default()
+        });
+    }
+    if let Some(definition) = definition.filter(|_| custom::base_kind(slug).is_some()) {
+        return Ok(CredentialSpec {
+            env_vars: definition.api_key_env.iter().cloned().collect(),
+            keyless: definition.api_key.is_none() && definition.api_key_env.is_none(),
+            oauth: false,
+            config_key,
+        });
+    }
+    match catalog::credential_env_vars(slug) {
+        Some(env_vars) => Ok(CredentialSpec {
+            env_vars,
+            keyless: OPENCODE_FAMILY_SLUGS.contains(&slug),
+            oauth: false,
+            config_key,
+        }),
+        None => Err(AgentError::Config {
+            message: catalog::unresolved_slug_reason(slug),
+        }),
+    }
+}
+
+/// The provider for `slug` signing in as `account`.
+pub(crate) fn create_for_account(
+    slug: &str,
+    account: &AccountCredential,
+    timeouts: Timeouts,
+) -> Result<Box<dyn Provider>, AgentError> {
+    if let Ok(kind) = ProviderKind::from_str(slug) {
+        return kind.create(account, timeouts);
+    }
+    if dynamic::display_name(slug).is_some() {
+        return dynamic::create(slug, timeouts);
+    }
+    if custom::base_kind(slug).is_some() {
+        return custom::create(slug, account, timeouts);
+    }
+    if let Some(catalog) = catalog::try_create(slug, account, timeouts) {
+        return catalog;
+    }
+    Err(AgentError::Config {
+        message: catalog::unresolved_slug_reason(slug),
+    })
 }
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -348,8 +473,15 @@ pub trait Provider: Send + Sync {
         Box::pin(async { Ok(false) })
     }
 
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async { Ok(false) })
+    /// Called with a failed request's error before the agent waits to retry
+    /// it. A provider with several accounts may move the conversation `key`
+    /// names to another one, so the retry should go out at once.
+    fn failover<'a>(
+        &'a self,
+        _error: &'a AgentError,
+        _cache_key: Option<&'a CacheKey>,
+    ) -> BoxFuture<'a, Failover> {
+        Box::pin(async { Failover::STAY })
     }
 
     /// An adjustment that replaces the window or the output cap ends with
@@ -388,21 +520,7 @@ pub fn provider_for_slug(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provi
 }
 
 fn build_provider(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-    if let Ok(kind) = ProviderKind::from_str(slug) {
-        return kind.create(timeouts);
-    }
-    if dynamic::display_name(slug).is_some() {
-        return dynamic::create(slug, timeouts);
-    }
-    if crate::providers::custom::base_kind(slug).is_some() {
-        return crate::providers::custom::create(slug, timeouts);
-    }
-    if let Some(catalog) = crate::providers::catalog::try_create(slug, timeouts) {
-        return catalog;
-    }
-    Err(AgentError::Config {
-        message: crate::providers::catalog::unresolved_slug_reason(slug),
-    })
+    Ok(Box::new(RoutedProvider::new(slug, timeouts)?))
 }
 
 pub fn provider_available(slug: &str) -> bool {

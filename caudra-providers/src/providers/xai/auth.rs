@@ -8,8 +8,8 @@ use std::{env, fs, thread};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use caudra_storage::StateDir;
-use caudra_storage::auth::{OAuthTokens, delete_tokens, load_tokens, now_millis, save_tokens};
+use caudra_storage::accounts::{AccountIdentity, StoredSecret};
+use caudra_storage::auth::{OAuthTokens, now_millis};
 use isahc::ReadResponseExt;
 use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
 use serde::Deserialize;
@@ -17,7 +17,9 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, error, warn};
 
 use crate::AgentError;
-use crate::providers::{KeyPool, ResolvedAuth, urlenc};
+use crate::accounts::{AccountSecret, LoginCredential};
+use crate::providers::oauth::{AccountStore, RefreshReason, jwt_claims};
+use crate::providers::{ResolvedAuth, urlenc};
 
 use super::catalog;
 
@@ -62,6 +64,8 @@ const MAX_USER_CODE_LEN: usize = 128;
 const MAX_DEVICE_CODE_LEN: usize = 4096;
 const MAX_VERIFICATION_URI_LEN: usize = 2048;
 const MAX_DEVICE_EXPIRY_SECS: u64 = 24 * 60 * 60;
+const SUBJECT_CLAIM: &str = "sub";
+const EMAIL_CLAIM: &str = "email";
 
 const NOT_AUTHENTICATED: &str = "not authenticated, run `caudra auth login xai` or set XAI_API_KEY";
 const DEVICE_TIMEOUT: &str = "xAI device authorization timed out";
@@ -239,47 +243,50 @@ pub(crate) fn build_oauth_resolved(tokens: &OAuthTokens) -> ResolvedAuth {
     }
 }
 
-pub(crate) fn is_oauth(dir: &StateDir) -> bool {
-    load_tokens(dir, PROVIDER).is_some()
+/// The auth `secret` signs in with: the CLI proxy over a login, the public
+/// API over a key.
+pub(crate) fn account_auth(secret: &AccountSecret) -> Result<ResolvedAuth, AgentError> {
+    match secret {
+        AccountSecret::OAuth(tokens) => Ok(build_oauth_resolved(tokens)),
+        AccountSecret::ApiKey { key, .. } => Ok(ResolvedAuth::bearer(key)),
+        AccountSecret::Keyless => Err(AgentError::Config {
+            message: NOT_AUTHENTICATED.into(),
+        }),
+    }
 }
 
-pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
-    if let Some(tokens) = load_tokens(dir, PROVIDER) {
-        if !tokens.is_expired() {
-            debug!("using xAI OAuth authentication");
-            return Ok(build_oauth_resolved(&tokens));
-        }
-        match refresh_tokens(&tokens) {
-            Ok(fresh) => {
-                save_tokens(dir, PROVIDER, &fresh)?;
-                debug!("using xAI OAuth authentication (refreshed)");
-                return Ok(build_oauth_resolved(&fresh));
-            }
-            Err(e) => {
-                warn!(error = %e, "xAI OAuth refresh failed, clearing stale tokens");
-                delete_tokens(dir, PROVIDER).ok();
-                catalog::invalidate();
-            }
-        }
-    }
-
-    if let Ok(pool) = KeyPool::resolve(PROVIDER, API_KEY_ENV) {
-        debug!("using xAI API key authentication");
-        return Ok(ResolvedAuth::bearer(pool.current()));
-    }
-
-    Err(AgentError::Config {
-        message: NOT_AUTHENTICATED.into(),
-    })
+pub(crate) fn refresh_from_storage(
+    store: &AccountStore,
+    rejected_accesses: &[String],
+) -> Result<OAuthTokens, AgentError> {
+    store.refresh(
+        RefreshReason::for_rejected(rejected_accesses),
+        refresh_tokens,
+    )
 }
 
-pub fn login(dir: &StateDir) -> Result<(), AgentError> {
+/// Who a login signs in as, when its access token carries the claims.
+fn login_identity(tokens: &OAuthTokens) -> AccountIdentity {
+    let claims = jwt_claims(&tokens.access);
+    let claim = |name: &str| {
+        claims
+            .as_ref()
+            .and_then(|claims| claims.get(name)?.as_str().map(str::to_owned))
+    };
+    AccountIdentity {
+        subject: claim(SUBJECT_CLAIM),
+        email: claim(EMAIL_CLAIM),
+        ..AccountIdentity::default()
+    }
+}
+
+pub fn login() -> Result<LoginCredential, AgentError> {
     if let Some(existing) = grok_cli_credentials() {
         println!("Found official Grok CLI credentials in ~/.grok/auth.json.");
         let answer = prompt("Use them instead of a new xAI OAuth login? [Y/n] ")?;
         if answer.is_empty() || answer.to_ascii_lowercase().starts_with('y') {
             match ensure_fresh(existing) {
-                Ok(tokens) => return finish_login(dir, tokens),
+                Ok(tokens) => return Ok(finish_login(tokens)),
                 Err(e) => {
                     warn!(error = %e, "existing Grok CLI credentials could not be refreshed");
                     println!(
@@ -295,23 +302,10 @@ pub fn login(dir: &StateDir) -> Result<(), AgentError> {
         LoginMethod::Device => device_login()?,
         LoginMethod::Browser => browser_login()?,
     };
-    finish_login(dir, tokens)
+    Ok(finish_login(tokens))
 }
 
-pub fn logout(dir: &StateDir) -> Result<(), AgentError> {
-    catalog::invalidate();
-    if delete_tokens(dir, PROVIDER)? {
-        println!("Logged out of xAI.");
-    } else if caudra_storage::auth::delete_provider_credentials(dir, PROVIDER)? {
-        println!("Removed saved xAI API key.");
-    } else {
-        println!("Not currently logged in to xAI.");
-    }
-    Ok(())
-}
-
-fn finish_login(dir: &StateDir, tokens: OAuthTokens) -> Result<(), AgentError> {
-    save_tokens(dir, PROVIDER, &tokens)?;
+fn finish_login(tokens: OAuthTokens) -> LoginCredential {
     println!("Authenticated successfully.");
     match catalog::refresh(&tokens.access) {
         Ok(models) => {
@@ -324,7 +318,10 @@ fn finish_login(dir: &StateDir, tokens: OAuthTokens) -> Result<(), AgentError> {
             );
         }
     }
-    Ok(())
+    LoginCredential {
+        identity: login_identity(&tokens),
+        secret: StoredSecret::OAuth(tokens),
+    }
 }
 
 fn ensure_fresh(tokens: OAuthTokens) -> Result<OAuthTokens, AgentError> {
@@ -909,7 +906,12 @@ fn normalize_epoch_ms(value: f64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::oauth::unsigned_jwt;
     use test_case::test_case;
+
+    const SUBJECT: &str = "user-42";
+    const EMAIL: &str = "jane@example.com";
+    const OPAQUE_ACCESS: &str = "opaque-access-token";
 
     #[test]
     fn parse_grok_oidc_scope() {
@@ -1003,6 +1005,37 @@ mod tests {
             .iter()
             .find_map(|(name, value)| (name == "x-grok-client-version").then_some(value.as_str()));
         assert_eq!(version, Some(client_version()));
+    }
+
+    #[test]
+    fn login_identity_reads_the_subject_and_email_claims() {
+        let tokens = OAuthTokens {
+            access: unsigned_jwt(&serde_json::json!({SUBJECT_CLAIM: SUBJECT, EMAIL_CLAIM: EMAIL})),
+            refresh: String::new(),
+            expires: 0,
+            account_id: None,
+        };
+
+        assert_eq!(
+            login_identity(&tokens),
+            AccountIdentity {
+                subject: Some(SUBJECT.into()),
+                email: Some(EMAIL.into()),
+                ..AccountIdentity::default()
+            }
+        );
+    }
+
+    #[test]
+    fn opaque_access_tokens_name_no_one() {
+        let tokens = OAuthTokens {
+            access: OPAQUE_ACCESS.into(),
+            refresh: String::new(),
+            expires: 0,
+            account_id: None,
+        };
+
+        assert_eq!(login_identity(&tokens), AccountIdentity::default());
     }
 
     #[test]

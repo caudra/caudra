@@ -2,16 +2,18 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::types::{append_tool_input, parse_tool_input};
+use caudra_storage::auth::now_millis;
 use flume::Sender;
 use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use isahc::{HttpClient, Request};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
+use crate::accounts::quota;
 use crate::model::Model;
 use crate::provider::WireRequest;
 use crate::providers::ResolvedAuth;
+use crate::types::{append_tool_input, parse_tool_input};
 use crate::{
     AgentError, CacheKey, ContentBlock, DocumentSource, Message, ProviderEvent, ResponsesReasoning,
     Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
@@ -303,12 +305,15 @@ pub(crate) async fn do_stream(
     let status = response.status().as_u16();
 
     if status == 200 {
-        parse_sse(
+        let quota = quota::from_codex_headers(response.headers(), now_millis());
+        let mut streamed = parse_sse(
             BufReader::new(response.into_body()),
             event_tx,
             stream_timeout,
         )
-        .await
+        .await?;
+        streamed.quota = quota;
+        Ok(streamed)
     } else {
         Err(AgentError::from_response(response).await)
     }

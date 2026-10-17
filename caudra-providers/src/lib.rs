@@ -1,3 +1,4 @@
+pub mod accounts;
 mod cassette;
 pub(crate) mod error;
 pub mod history;

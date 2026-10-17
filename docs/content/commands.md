@@ -48,6 +48,7 @@ A command with an Experiment entry exists only while that switch is on under `[e
 | `/rename` | Rename the current session |  |  |
 | `/model` | Switch chat model or assign job models | Main only |  |
 | `/favorite-next` | Switch to the next favorite model | Main only |  |
+| `/accounts` | Choose which account of the model's provider requests go to | Main only |  |
 | `/decision-model` | Pick the decision endpoint that screens tool calls | Main only |  |
 | `/decision-next` | Switch to the next decision endpoint | Main only |  |
 | `/system-prompt` | Inspect the system prompt and switch profile | Main only |  |

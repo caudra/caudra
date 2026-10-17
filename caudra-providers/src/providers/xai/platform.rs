@@ -1,17 +1,19 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use caudra_storage::StateDir;
 use caudra_storage::log::{outcome, target};
 use flume::Sender;
 use serde_json::{Value, json};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
+use crate::accounts::{AccountCredential, AccountSecret};
 use crate::error::{DETAIL_CAP, provider_detail};
-use crate::model::{Billing, Model};
+use crate::model::Model;
 use crate::provider::{BoxFuture, Provider, WireRequest};
-use crate::providers::ResolvedAuth;
+use crate::providers::oauth::AccountStore;
 use crate::providers::openai::responses;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::providers::{ResolvedAuth, Timeouts};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
 };
@@ -24,7 +26,6 @@ const PROXY_SAID: &str = "The proxy said:";
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "xai",
-    api_key_env: auth::API_KEY_ENV,
     base_url: "https://api.x.ai/v1",
     max_tokens_field: "max_tokens",
     include_stream_usage: true,
@@ -34,30 +35,28 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 pub struct Xai {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
-    storage: Option<StateDir>,
+    oauth: AtomicBool,
+    store: Option<AccountStore>,
     system_prefix: Option<String>,
 }
 
 impl Xai {
-    pub fn new(timeouts: crate::providers::Timeouts) -> Result<Self, AgentError> {
-        let storage = StateDir::resolve()?;
-        let resolved = auth::resolve(&storage)?;
+    pub fn new(account: &AccountCredential, timeouts: Timeouts) -> Result<Self, AgentError> {
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: Arc::new(Mutex::new(resolved)),
-            storage: Some(storage),
+            auth: Arc::new(Mutex::new(auth::account_auth(&account.secret)?)),
+            oauth: AtomicBool::new(account.is_oauth()),
+            store: AccountStore::for_account(account)?,
             system_prefix: None,
         })
     }
 
-    pub(crate) fn with_auth(
-        auth: Arc<Mutex<ResolvedAuth>>,
-        timeouts: crate::providers::Timeouts,
-    ) -> Self {
+    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: Timeouts) -> Self {
         Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth,
-            storage: None,
+            oauth: AtomicBool::new(false),
+            store: None,
             system_prefix: None,
         }
     }
@@ -72,38 +71,30 @@ impl Xai {
     }
 
     fn is_oauth(&self) -> bool {
-        self.storage.as_ref().is_some_and(auth::is_oauth)
+        self.oauth.load(Ordering::Relaxed)
     }
 
-    async fn refresh_oauth(&self) -> Result<(), AgentError> {
-        let storage = self.storage.clone().ok_or_else(|| AgentError::Config {
+    /// Renews a token near expiry when nothing is rejected, and replaces a
+    /// rejected one otherwise. Either way the tokens on disk win when another
+    /// process already rotated them.
+    async fn refresh_oauth(&self, rejected_accesses: Vec<String>) -> Result<(), AgentError> {
+        let store = self.store.clone().ok_or_else(|| AgentError::Config {
             message: "OAuth refresh not available for externally-managed auth".into(),
         })?;
-        let resolved = smol::unblock(move || {
-            let tokens = caudra_storage::auth::load_tokens(&storage, auth::PROVIDER)
-                .ok_or_else(|| AgentError::api(401, "xAI OAuth tokens not found on disk"))?;
-            match auth::refresh_tokens(&tokens) {
-                Ok(fresh) => {
-                    caudra_storage::auth::save_tokens(&storage, auth::PROVIDER, &fresh)?;
-                    Ok(auth::build_oauth_resolved(&fresh))
-                }
-                Err(e) => {
-                    warn!(error = %e, "xAI OAuth refresh failed, clearing stale tokens");
-                    let _ = caudra_storage::auth::delete_tokens(&storage, auth::PROVIDER);
-                    catalog::invalidate();
-                    Err(e)
-                }
-            }
-        })
-        .await?;
-        *self.auth.lock().unwrap() = resolved;
-        info!(
-            target: target::PROVIDER,
-            event = crate::auth_events::REFRESHED,
-            provider = "xai",
-            outcome = outcome::OK,
-            "refreshed OAuth token"
-        );
+        let tokens =
+            smol::unblock(move || auth::refresh_from_storage(&store, &rejected_accesses)).await?;
+        let resolved = auth::build_oauth_resolved(&tokens);
+        let mut current = self.auth.lock().unwrap();
+        if *current != resolved {
+            *current = resolved;
+            info!(
+                target: target::PROVIDER,
+                event = crate::auth_events::REFRESHED,
+                provider = auth::PROVIDER,
+                outcome = outcome::OK,
+                "refreshed OAuth token"
+            );
+        }
         Ok(())
     }
 
@@ -112,14 +103,29 @@ impl Xai {
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<T, AgentError>>,
     {
+        let refreshable = self.is_oauth() && self.store.is_some();
+        if refreshable {
+            self.refresh_oauth(Vec::new()).await?;
+        }
         let result = f().await;
-        if self.is_oauth()
+        if refreshable
             && matches!(&result, Err(e) if e.is_auth_error())
-            && self.refresh_oauth().await.is_ok()
+            && self.refresh_oauth(self.rejected_access()).await.is_ok()
         {
             return f().await;
         }
         result
+    }
+
+    fn rejected_access(&self) -> Vec<String> {
+        bearer_token(&self.current_auth()).into_iter().collect()
+    }
+
+    fn install_secret(&self, secret: &AccountSecret) -> Result<(), AgentError> {
+        *self.auth.lock().unwrap() = auth::account_auth(secret)?;
+        self.oauth
+            .store(matches!(secret, AccountSecret::OAuth(_)), Ordering::Relaxed);
+        Ok(())
     }
 
     /// What one attempt posts with `auth`, for the send and the dry run alike:
@@ -315,27 +321,34 @@ impl Provider for Xai {
     fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
             if self.is_oauth() {
-                self.refresh_oauth().await
+                self.refresh_oauth(self.rejected_access()).await
             } else {
-                Ok(())
+                self.reload_auth().await
             }
         })
     }
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
-            let Some(storage) = self.storage.clone() else {
+            let Some(store) = self.store.clone() else {
                 return Ok(());
             };
-            let resolved = smol::unblock(move || auth::resolve(&storage)).await?;
-            *self.auth.lock().unwrap() = resolved;
+            let secret = smol::unblock(move || store.reload()).await?;
+            self.install_secret(&secret)?;
             debug!("reloaded xAI auth from storage");
             Ok(())
         })
     }
 
+    fn reload_auth_if_changed(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
+        Box::pin(async {
+            let previous = self.current_auth();
+            self.reload_auth().await?;
+            Ok(previous != self.current_auth())
+        })
+    }
+
     fn adjust_model(&self, model: &mut Model) {
-        model.billing = Billing::from_oauth(self.is_oauth());
         catalog::adjust_model(model);
     }
 }
@@ -354,13 +367,11 @@ fn bearer_token(auth: &ResolvedAuth) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use caudra_storage::auth::{OAuthTokens, save_tokens};
-    use tempfile::TempDir;
+    use caudra_storage::auth::OAuthTokens;
     use test_case::test_case;
 
     use super::*;
     use crate::ReasoningOptions;
-    use crate::providers::Timeouts;
     use crate::providers::openai::responses::RESPONSES_PATH;
     use crate::providers::openai_compat::CHAT_COMPLETIONS_PATH;
     use crate::providers::test_support::CREDENTIAL_IN_URL;
@@ -377,17 +388,15 @@ mod tests {
         "Your Grok CLI version (1.0.50) is outdated. Please update to version 1.0.60 or later.";
     const VERSION_GATE_BODY: &str = r#"{"error":"Your Grok CLI version (1.0.50) is outdated. Please update to version 1.0.60 or later."}"#;
 
-    fn provider_with_login(state: &TempDir) -> Xai {
-        let storage = StateDir::from_path(state.path().to_path_buf());
+    fn provider_with_login() -> Xai {
         let tokens = OAuthTokens {
             access: LOGIN_ACCESS.into(),
             refresh: LOGIN_REFRESH.into(),
             expires: u64::MAX,
             account_id: None,
         };
-        save_tokens(&storage, auth::PROVIDER, &tokens).unwrap();
         Xai {
-            storage: Some(storage),
+            oauth: AtomicBool::new(true),
             ..Xai::with_auth(
                 Arc::new(Mutex::new(auth::build_oauth_resolved(&tokens))),
                 Timeouts::default(),
@@ -446,9 +455,8 @@ mod tests {
 
     #[test]
     fn grok_reasoning_sets_effort_and_include() {
-        let state = TempDir::new().unwrap();
         let wire = dry_run(
-            &provider_with_login(&state),
+            &provider_with_login(),
             &RequestOptions {
                 thinking: ThinkingConfig::Effort("high".into()),
                 ..RequestOptions::default()
@@ -465,9 +473,8 @@ mod tests {
     #[test_case(true, auth::CLI_BASE_URL, RESPONSES_PATH ; "a_login_posts_responses_to_the_cli_proxy")]
     #[test_case(false, TEST_BASE_URL, CHAT_COMPLETIONS_PATH ; "a_key_posts_chat_completions_to_the_api")]
     fn wire_request_posts_where_the_send_does(login: bool, base: &str, path: &str) {
-        let state = TempDir::new().unwrap();
         let provider = if login {
-            provider_with_login(&state)
+            provider_with_login()
         } else {
             provider_with_key()
         };

@@ -29,6 +29,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
+use super::accounts::account_chip;
 use super::permission_editor::LOCAL_SOURCE_NOTICE;
 use super::sandbox::attached_sandbox_instance;
 use super::tooltip::ChordTopic;
@@ -581,6 +582,7 @@ impl App {
         render_if_open!(self.session_picker);
         render_if_open!(self.session_relocation_picker);
         render_if_open!(self.worktree_picker);
+        render_if_open!(self.accounts_modal);
         render_if_open!(self.sandbox_manager);
         if !self.question_form.is_open() {
             render_if_open!(self.mode_submission);
@@ -613,6 +615,7 @@ impl App {
                 fast: self.state.fast,
                 clock_format: self.ui_config.clock_format,
                 lifetime: self.lifetime_usage.as_ref(),
+                accounts: &self.usage_accounts,
             };
             let r = self.usage_modal.view(frame, full, &ctx);
             if r.width > 0 {
@@ -836,6 +839,7 @@ impl App {
                     offline: decisions.status().reachable == Some(false),
                 })
             }),
+            account: account_chip(self.routed_account.as_ref(), &self.state.model.provider),
             waiting_questions: self.waiting_question_count(),
             config_problems: &config_problems,
             pending_trust,

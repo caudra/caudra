@@ -8,15 +8,16 @@ use tracing::warn;
 
 use caudra_config::providers::Protocol;
 
+use crate::accounts::AccountCredential;
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
 };
 
+use super::ResolvedAuth;
 use super::openai::responses;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyPool, ResolvedAuth};
 
 pub(crate) struct LocalEndpointConfig {
     pub slug: &'static str,
@@ -41,7 +42,6 @@ fn resolve_protocol_for_local(slug: &str) -> Option<Protocol> {
 pub(crate) struct LocalEndpoint {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
-    key_pool: Option<KeyPool>,
     system_prefix: Option<String>,
     thinking_budget_field: bool,
     discovery_mode: DiscoveryMode,
@@ -51,9 +51,9 @@ pub(crate) struct LocalEndpoint {
 impl LocalEndpoint {
     pub fn new(
         cfg: &'static LocalEndpointConfig,
+        account: &AccountCredential,
         timeouts: super::Timeouts,
     ) -> Result<Self, AgentError> {
-        let key_pool = KeyPool::resolve(cfg.slug, cfg.api_key_env).ok();
         let host = caudra_config::providers::ProvidersConfig::load()
             .get(cfg.slug)
             .and_then(|d| d.base_url.clone())
@@ -61,7 +61,7 @@ impl LocalEndpoint {
         Self::build(
             cfg,
             timeouts,
-            key_pool,
+            account.optional_api_key(),
             host,
             resolve_protocol_for_local(cfg.slug),
         )
@@ -75,7 +75,6 @@ impl LocalEndpoint {
         Self {
             compat: OpenAiCompatProvider::new(&cfg.compat, timeouts),
             auth,
-            key_pool: None,
             system_prefix: None,
             thinking_budget_field: cfg.thinking_budget_field,
             discovery_mode: cfg.discovery_mode,
@@ -91,11 +90,10 @@ impl LocalEndpoint {
     fn build(
         cfg: &'static LocalEndpointConfig,
         timeouts: super::Timeouts,
-        key_pool: Option<KeyPool>,
+        api_key: Option<&str>,
         host: Option<String>,
         protocol: Option<Protocol>,
     ) -> Result<Self, AgentError> {
-        let api_key = key_pool.as_ref().map(|p| p.current().to_string());
         let base_url = match host {
             Some(h) => format!("{h}/v1"),
             None if api_key.is_some() && cfg.cloud_fallback_url.is_some() => {
@@ -118,7 +116,6 @@ impl LocalEndpoint {
                 base_url: Some(base_url),
                 headers,
             })),
-            key_pool,
             system_prefix: None,
             thinking_budget_field: cfg.thinking_budget_field,
             discovery_mode: cfg.discovery_mode,
@@ -217,16 +214,6 @@ impl Provider for LocalEndpoint {
         } else {
             crate::ReasoningTransport::Other
         }
-    }
-
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            Ok(self.key_pool.as_ref().is_some_and(|p| {
-                p.rotate_headers(&self.auth, |key| {
-                    vec![("authorization".into(), format!("Bearer {key}"))]
-                })
-            }))
-        })
     }
 }
 
@@ -583,7 +570,6 @@ pub(crate) const OLLAMA: LocalEndpointConfig = LocalEndpointConfig {
     discovery_mode: DiscoveryMode::Ollama,
     compat: OpenAiCompatConfig {
         slug: "ollama",
-        api_key_env: "",
         base_url: "http://localhost:11434/v1",
         max_tokens_field: "max_tokens",
         include_stream_usage: true,
@@ -603,7 +589,6 @@ pub(crate) const LLAMACPP: LocalEndpointConfig = LocalEndpointConfig {
     discovery_mode: DiscoveryMode::LlamaCpp,
     compat: OpenAiCompatConfig {
         slug: "llama-cpp",
-        api_key_env: "",
         base_url: "http://localhost:8080/v1",
         max_tokens_field: "max_tokens",
         include_stream_usage: true,
@@ -635,7 +620,7 @@ mod tests {
         let endpoint = LocalEndpoint::build(
             &LLAMACPP,
             TEST_TIMEOUTS,
-            Some(KeyPool::from_keys(vec![TEST_API_KEY.into()])),
+            Some(TEST_API_KEY),
             Some(TEST_HOST.into()),
             protocol,
         )
@@ -684,21 +669,20 @@ mod tests {
 
     #[test]
     fn from_env_with_api_key_uses_cloud_for_ollama() {
-        let pool = KeyPool::from_keys(vec!["test-key".into()]);
-        let ep = LocalEndpoint::build(&OLLAMA, TEST_TIMEOUTS, Some(pool), None, None).unwrap();
+        let ep =
+            LocalEndpoint::build(&OLLAMA, TEST_TIMEOUTS, Some(TEST_API_KEY), None, None).unwrap();
         let auth = ep.auth.lock().unwrap();
         assert_eq!(auth.base_url.as_deref(), Some("https://ollama.com/v1"));
         assert_eq!(auth.headers.len(), 1);
-        assert_eq!(auth.headers[0].1, "Bearer test-key");
+        assert_eq!(auth.headers[0].1, format!("Bearer {TEST_API_KEY}"));
     }
 
     #[test]
     fn from_env_both_host_and_api_key_uses_host_with_auth() {
-        let pool = KeyPool::from_keys(vec!["test-key".into()]);
         let ep = LocalEndpoint::build(
             &OLLAMA,
             TEST_TIMEOUTS,
-            Some(pool),
+            Some(TEST_API_KEY),
             Some("http://local:1234".into()),
             None,
         )
@@ -706,7 +690,7 @@ mod tests {
         let auth = ep.auth.lock().unwrap();
         assert_eq!(auth.base_url.as_deref(), Some("http://local:1234/v1"));
         assert_eq!(auth.headers.len(), 1);
-        assert_eq!(auth.headers[0].1, "Bearer test-key");
+        assert_eq!(auth.headers[0].1, format!("Bearer {TEST_API_KEY}"));
     }
 
     #[test]
@@ -736,8 +720,7 @@ mod tests {
 
     #[test]
     fn llamacpp_no_cloud_fallback() {
-        let pool = KeyPool::from_keys(vec!["key".into()]);
-        match LocalEndpoint::build(&LLAMACPP, TEST_TIMEOUTS, Some(pool), None, None) {
+        match LocalEndpoint::build(&LLAMACPP, TEST_TIMEOUTS, Some(TEST_API_KEY), None, None) {
             Err(AgentError::Config { message }) => {
                 assert_eq!(message, "LLAMA_CPP_HOST not set");
             }

@@ -21,6 +21,8 @@ use caudra_automation::request::ProfileArming;
 use caudra_config::files::{self, ConfigFile};
 use caudra_config::sandbox::LeaseSeconds;
 use caudra_config::{Feature, FeatureDisabled, FeatureFlags, is_disableable_tool};
+use caudra_providers::accounts::parse_account_override;
+use caudra_storage::accounts::{AccountName, AccountSelection};
 use caudra_storage::auth::WorkcellCredentialName;
 use caudra_storage::messages::{MAX_ATTEMPTS, MAX_BACKLOG, MAX_CONCURRENCY, WorkState};
 use caudra_storage::retention::{Duration as RetentionDuration, GroupBy, KeepPolicy};
@@ -122,6 +124,15 @@ pub struct Cli {
     /// Model spec (provider/model-id). Defaults to last used model, or claude-opus-4-6
     #[arg(short, long, global = true)]
     pub model: Option<String>,
+
+    /// Use one provider account for this run only, never saved: PROVIDER:NAME or PROVIDER:auto. Repeat for more providers. CAUDRA_ACCOUNT takes the same list, comma-separated, and this flag wins over it
+    #[arg(
+        long = "account",
+        value_name = "PROVIDER:NAME",
+        value_parser = parse_account_override,
+        global = true
+    )]
+    pub accounts: Vec<(String, AccountSelection)>,
 
     /// Include full turn-by-turn messages in --print output
     #[arg(long)]
@@ -1347,27 +1358,55 @@ pub enum AuthAction {
         /// Provider slug (e.g. zai, openai, xai). Omit for interactive selection. With
         /// --decision: a preset (typesafe, openai), custom, or a configured endpoint name.
         provider: Option<String>,
-        /// Authentication method: oauth or api-key for Anthropic and OpenAI, oauth or import for
-        /// copilot and copilot-enterprise
+        /// Authentication method: oauth or api-key for Anthropic, OpenAI, and xAI, oauth or import
+        /// for copilot and copilot-enterprise
         #[arg(long, value_enum, requires = "provider")]
         method: Option<AuthMethod>,
         /// GitHub Enterprise hostname for copilot-enterprise (e.g. company.ghe.com)
         #[arg(long, requires = "provider")]
         hostname: Option<String>,
+        /// Account to sign in as. A new login is named after who it signs in as, and a
+        /// login as an account already stored refreshes it.
+        #[arg(long, requires = "provider")]
+        name: Option<AccountName>,
         /// Set up a decision model endpoint instead of a chat provider
-        #[arg(long, conflicts_with_all = ["method", "hostname"])]
+        #[arg(long, conflicts_with_all = ["method", "hostname", "name"])]
         decision: bool,
     },
-    /// Remove stored credentials for a provider
+    /// Sign out of a provider account, or remove a decision endpoint
     Logout {
         /// Provider slug (e.g. openai, xai), or with --decision a decision endpoint name
         provider: String,
+        /// Account to sign out of. May be left out when the provider has one.
+        #[arg(conflicts_with = "decision")]
+        name: Option<AccountName>,
+        /// Sign out of every account of the provider
+        #[arg(long, conflicts_with_all = ["name", "decision"])]
+        all: bool,
         /// Remove a decision endpoint: its stored key and its providers.toml table
         #[arg(long)]
         decision: bool,
     },
-    /// Show authentication status for all providers
-    Status,
+    /// Show every provider's accounts, the one in use, and their quota
+    Status {
+        /// Ask each subscription for its quota first, rather than showing the latest readings
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Choose the account a provider uses, or `auto` to let switching choose
+    Use {
+        /// Provider slug (e.g. anthropic, openai)
+        provider: String,
+        /// Account name, or `auto`
+        account: AccountSelection,
+    },
+    /// Rename a provider account
+    Rename {
+        /// Provider slug (e.g. anthropic, openai)
+        provider: String,
+        from: AccountName,
+        to: AccountName,
+    },
     /// Manage named Workcell bearer credentials in owner-only local auth state
     Workcell {
         #[command(subcommand)]
@@ -1607,6 +1646,8 @@ mod tests {
     const GROUP_NAME: &str = "reviewers";
     const GROUP_TOPIC: &str = "ci.*";
     const WORK_NAME: &str = "steady-maple-wren";
+    const WORK_ACCOUNT: &str = "work";
+    const ACCOUNT_LOGOUT_NOT_PARSED: &str = "expected an account logout";
     const MESSAGING_LAUNCH_FLAGS: [&str; 4] = ["name", "topics", "groups", "receive_broadcasts"];
     const AUTOMATIONS_ARG: &str = "automations";
     const AUTOMATION: &str = "goal-chain";
@@ -2522,6 +2563,7 @@ mod tests {
                     provider: Some(provider),
                     method: Some(AuthMethod::ApiKey),
                     hostname: None,
+                    name: None,
                     decision: false,
                 }
             }) if provider == "openai"
@@ -2557,9 +2599,61 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Auth {
-                action: AuthAction::Logout { provider, decision: true }
+                action: AuthAction::Logout { provider, name: None, all: false, decision: true }
             }) if provider == "tunnel"
         ));
+    }
+
+    #[test_case(&["caudra", "auth", "logout", "anthropic", "work"], Some(WORK_ACCOUNT), false; "named")]
+    #[test_case(&["caudra", "auth", "logout", "anthropic", "--all"], None, true; "every_account")]
+    #[test_case(&["caudra", "auth", "logout", "anthropic"], None, false; "the_only_one")]
+    fn account_logout_parses(args: &[&str], name: Option<&str>, every: bool) {
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Some(Command::Auth {
+            action:
+                AuthAction::Logout {
+                    provider,
+                    name: parsed,
+                    all,
+                    decision: false,
+                },
+        }) = cli.command
+        else {
+            panic!("{ACCOUNT_LOGOUT_NOT_PARSED}");
+        };
+        assert_eq!(provider, "anthropic");
+        assert_eq!(parsed.as_ref().map(AccountName::as_str), name);
+        assert_eq!(all, every);
+    }
+
+    #[test_case(&["caudra", "auth", "logout", "anthropic", "work", "--all"]; "name_and_all")]
+    #[test_case(&["caudra", "auth", "logout", "tunnel", "work", "--decision"]; "name_and_decision")]
+    #[test_case(&["caudra", "auth", "login", "--decision", "openai", "--name", "work"]; "login_name_and_decision")]
+    fn account_flags_conflict(args: &[&str]) {
+        assert_eq!(
+            Cli::try_parse_from(args).err().map(|error| error.kind()),
+            Some(ErrorKind::ArgumentConflict)
+        );
+    }
+
+    #[test_case("auto", AccountSelection::Auto; "auto")]
+    #[test_case(WORK_ACCOUNT, AccountSelection::Pinned(AccountName::new(WORK_ACCOUNT).unwrap()); "pinned")]
+    fn auth_use_parses(account: &str, expected: AccountSelection) {
+        let cli = Cli::try_parse_from(["caudra", "auth", "use", "anthropic", account]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Auth { action: AuthAction::Use { account: parsed, .. } }) if parsed == expected
+        ));
+    }
+
+    #[test]
+    fn an_invalid_account_name_is_refused() {
+        assert_eq!(
+            Cli::try_parse_from(["caudra", "auth", "rename", "anthropic", "work", "no/slash"])
+                .err()
+                .map(|error| error.kind()),
+            Some(ErrorKind::ValueValidation)
+        );
     }
 
     #[test_case("tunnel"; "endpoint")]

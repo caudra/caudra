@@ -1,8 +1,8 @@
 use crate::decisions::DecisionEndpoint;
 use crate::files;
 use crate::providers::{
-    BUILTIN_IGNORED_FIELDS, BUILTIN_MODEL_FIELDS, ModelDef, ModelFields, OverrideFields,
-    PROVIDERS_VERSION, PURPOSE_FIELDS, ProviderDef, ProviderOverride,
+    AccountDef, BUILTIN_IGNORED_FIELDS, BUILTIN_MODEL_FIELDS, ModelDef, ModelFields,
+    OverrideFields, PROVIDERS_VERSION, PURPOSE_FIELDS, ProviderDef, ProviderOverride, SwitchingDef,
 };
 
 use super::{Document, Header, RECORDS_USAGE, Table, code_list, global_location, preamble};
@@ -11,6 +11,8 @@ pub const PROVIDER: &str = "my-provider";
 pub const PURPOSES: &str = "my-provider.purposes";
 pub const MODEL_DEFAULTS: &str = "my-provider.model_defaults";
 pub const MODELS: &str = "my-provider.models";
+pub const SWITCHING: &str = "my-provider.switching";
+pub const ACCOUNTS: &str = "my-provider.accounts";
 pub const UPSTREAM: &str = "aperture.overrides.llmserver";
 pub const DECISION_ENDPOINT: &str = "decisions.my-endpoint";
 const REWRITES: &str = "`caudra auth login` and `caudra auth logout` replace only the table they \
@@ -22,6 +24,12 @@ const MODEL_DEFAULTS_ABOUT: &str = "Model keys for every model of my-provider, i
 const MODELS_ABOUT: &str = "One model my-provider serves, so repeat the table for each model. A key \
      it leaves out comes from [my-provider.model_defaults], then from discovery, and then from the \
      default shown.";
+const SWITCHING_ABOUT: &str = "When Auto moves a session from one account of my-provider to \
+     another. It applies once the provider has two or more accounts and its selection is Auto.";
+const ACCOUNTS_ABOUT: &str = "One account to sign in to my-provider with, so repeat the table for \
+     each account. The first entry has the highest priority. Accounts saved by `caudra auth login` \
+     that no entry lists come after these. A slug whose table holds only accounts and switching, \
+     such as a built-in one, stays the provider it was.";
 const UPSTREAM_ABOUT: &str = "Aperture routes the models of upstream providers as \
      `aperture/UPSTREAM/MODEL`. Each [aperture.overrides.UPSTREAM] table overrides the models of \
      one upstream, such as llmserver here.";
@@ -53,6 +61,10 @@ pub fn document() -> Document {
                 ModelDef::FIELDS.iter().chain(ModelFields::FIELDS),
             )
             .about(MODELS_ABOUT),
+            Table::of(Header::Record(SWITCHING.into()), SwitchingDef::FIELDS)
+                .about(SWITCHING_ABOUT),
+            Table::of(Header::RecordArray(ACCOUNTS.into()), AccountDef::FIELDS)
+                .about(ACCOUNTS_ABOUT),
             Table::of(
                 Header::Record(UPSTREAM.into()),
                 OverrideFields::FIELDS
@@ -91,16 +103,21 @@ mod tests {
     use serde::Serialize;
 
     use super::{
-        DECISION_ENDPOINT, MODEL_DEFAULTS, MODELS, PROVIDER, PURPOSES, UPSTREAM, document,
+        ACCOUNTS, DECISION_ENDPOINT, MODEL_DEFAULTS, MODELS, PROVIDER, PURPOSES, SWITCHING,
+        UPSTREAM, document,
     };
     use crate::decisions::{DecisionEndpoint, DecisionEndpointDef, DecisionProtocol};
     use crate::example::Render;
     use crate::providers::{
-        ModelDef, ModelFields, ModelPurpose, OverrideFields, Protocol, ProviderDef,
-        ProviderOverride, ProvidersConfig, PurposeModels,
+        AccountDef, ModelDef, ModelFields, ModelPurpose, OverrideFields, Protocol, ProviderDef,
+        ProviderOverride, ProvidersConfig, PurposeModels, QuotaWindowName, SwitchStrategy,
+        SwitchingDef,
     };
 
     const TEXT: &str = "text";
+    const ACCOUNT_NAME: &str = "personal";
+    const SWITCH_BELOW: u8 = 1;
+    const PREFER_BELOW: u8 = 2;
     const NUMBER: u32 = 1;
     const PRICE: f64 = 1.0;
 
@@ -187,6 +204,17 @@ mod tests {
             fields: model_fields(),
         };
         let prefixes: PurposeModels = toml::Value::from(TEXT).try_into().unwrap();
+        let switching = SwitchingDef {
+            strategy: SwitchStrategy::Paced,
+            switch_below: SWITCH_BELOW,
+            prefer_below: PREFER_BELOW,
+            windows: Some(vec![QuotaWindowName::Weekly]),
+        };
+        let account = AccountDef {
+            name: ACCOUNT_NAME.into(),
+            api_key_env: Some(TEXT.into()),
+            fallback: true,
+        };
         let provider = ProviderDef {
             display_name: Some(TEXT.into()),
             protocol: Some(Protocol::Openai),
@@ -201,6 +229,8 @@ mod tests {
             model_defaults: Some(model_fields()),
             purposes: HashMap::from([(ModelPurpose::Fast, prefixes)]),
             models: vec![model.clone()],
+            switching: Some(switching.clone()),
+            accounts: vec![account.clone()],
         };
         let upstream = ProviderOverride {
             default: override_fields(),
@@ -218,6 +248,8 @@ mod tests {
         assert_eq!(names(PURPOSES), BTreeSet::from(classes));
         assert_eq!(names(MODEL_DEFAULTS), keys(model_fields()));
         assert_eq!(names(MODELS), keys(model));
+        assert_eq!(names(SWITCHING), keys(switching));
+        assert_eq!(names(ACCOUNTS), keys(account));
         assert_eq!(names(UPSTREAM), keys(upstream));
         assert_eq!(names(DECISION_ENDPOINT), keys(endpoint));
     }

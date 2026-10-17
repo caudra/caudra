@@ -13,6 +13,7 @@ use crate::animation::spinner_frame;
 use crate::config_problems::ConfigProblem;
 use crate::theme;
 
+use caudra_providers::accounts::AccountTier;
 use caudra_providers::format_tokens;
 use caudra_storage::sessions::PermissionMode;
 use ratatui::Frame;
@@ -64,6 +65,8 @@ const AUTO_LABEL: &str = " [auto]";
 const AUTO_SHORT_LABEL: &str = " [a]";
 const DECISIONS_PREFIX: &str = "[decisions: ";
 const DECISIONS_SUFFIX: &str = "]";
+/// `[auto·personal 41%]`: Auto's pick, or the pinned account alone.
+const ACCOUNT_AUTO_PREFIX: &str = "auto\u{b7}";
 /// `[? 2]`: deferred questions waiting off the dock.
 const QUESTIONS_MARK: &str = "?";
 /// `[permissions.toml invalid]` names the one file; past one, the count.
@@ -132,6 +135,10 @@ const TIP_FAST: &str = "Fast mode is on";
 const TIP_SANDBOX: &str = "Attached sandbox: ";
 const TIP_DECISIONS: &str = "Decision endpoint: ";
 const TIP_DECISIONS_OFFLINE: &str = "\nUnreachable on the last attempt";
+const TIP_ACCOUNT: &str = "Requests go to account ";
+const TIP_ACCOUNT_AUTO: &str = "\nAuto moves them when it runs low";
+const TIP_ACCOUNT_PINNED: &str = "\nPinned: they stay on it";
+const TIP_ACCOUNT_LEFT: &str = "% left in its tightest window";
 const TIP_CONFIG_PROBLEMS: &str = "Config failed to load";
 const TIP_TRUST_REVIEW: &str = "Project config is waiting for your trust";
 const TIP_QUESTIONS: &str = "unanswered questions";
@@ -150,6 +157,7 @@ const CLICK_ASK: &str = "Click to go back to Ask";
 const CLICK_FAST: &str = "Click to turn it off";
 const CLICK_SANDBOX: &str = "Click to manage it";
 const CLICK_DETAILS: &str = "Click for details";
+const CLICK_ACCOUNT: &str = "Click to choose another account";
 const CLICK_TRUST_REVIEW: &str = "Click to review it";
 const CLICK_AUTOMATIONS: &str = "Click to open automations";
 const CLICK_AUTOPILOT: &str = "Click to open autopilot";
@@ -303,6 +311,7 @@ pub enum StatusBarHitTarget {
     Fast,
     Sandbox,
     Decisions,
+    Account,
     ConfigProblems,
     TrustReview,
     Automations,
@@ -351,6 +360,7 @@ impl StatusBarHitTarget {
             | Self::Workflows
             | Self::Automations
             | Self::Autopilot
+            | Self::Account
             | Self::Fast
             | Self::Retry => ChatScope::MainOnly,
         }
@@ -408,6 +418,15 @@ pub struct DecisionsChip<'a> {
     pub offline: bool,
 }
 
+/// The provider account the main agent's requests go to, shown once the
+/// provider has more than one.
+pub struct AccountChip<'a> {
+    pub name: &'a str,
+    pub auto: bool,
+    pub left_percent: Option<u8>,
+    pub tier: AccountTier,
+}
+
 pub struct StatusBarContext<'a> {
     pub status: &'a Status,
     pub mode: ModeLabel,
@@ -436,6 +455,7 @@ pub struct StatusBarContext<'a> {
     pub permission_mode: PermissionMode,
     /// `None` while decisions are off.
     pub decisions: Option<DecisionsChip<'a>>,
+    pub account: Option<AccountChip<'a>>,
     /// Deferred questions waiting off the dock.
     pub waiting_questions: usize,
     /// Config files the session runs without because they failed to load.
@@ -1200,6 +1220,7 @@ impl StatusBar {
         push_retry(&mut left, ctx, Instant::now());
         push_questions(&mut left, ctx);
         push_decisions_status(&mut left, ctx);
+        push_account(&mut left, ctx);
         push_config_problems(&mut left, ctx);
         push_trust_review(&mut left, ctx);
         shorten_mode(&mut left, ctx, area.width, false);
@@ -1281,6 +1302,7 @@ impl StatusBar {
         }
         push_questions(&mut messages, ctx);
         push_decisions_status(&mut messages, ctx);
+        push_account(&mut messages, ctx);
         push_config_problems(&mut messages, ctx);
         push_trust_review(&mut messages, ctx);
         let spend = SpendText::new(&ctx.stats);
@@ -1973,6 +1995,7 @@ fn chip_tip(
                 false => format!("{TIP_DECISIONS}{}", chip.endpoint),
             }
         }
+        StatusBarHitTarget::Account => account_tip(ctx.account.as_ref()?),
         StatusBarHitTarget::ConfigProblems => TIP_CONFIG_PROBLEMS.to_owned(),
         StatusBarHitTarget::TrustReview => TIP_TRUST_REVIEW.to_owned(),
         StatusBarHitTarget::Automations => match automations.unseen_failures {
@@ -2010,6 +2033,7 @@ fn click_tip(target: StatusBarHitTarget) -> Option<&'static str> {
         StatusBarHitTarget::Fast => CLICK_FAST,
         StatusBarHitTarget::Sandbox => CLICK_SANDBOX,
         StatusBarHitTarget::Decisions | StatusBarHitTarget::ConfigProblems => CLICK_DETAILS,
+        StatusBarHitTarget::Account => CLICK_ACCOUNT,
         StatusBarHitTarget::TrustReview => CLICK_TRUST_REVIEW,
         StatusBarHitTarget::Automations => CLICK_AUTOMATIONS,
         StatusBarHitTarget::Autopilot => CLICK_AUTOPILOT,
@@ -2068,6 +2092,43 @@ fn push_decisions_status(strip: &mut Strip, ctx: &StatusBarContext<'_>) {
             )],
         );
     }
+}
+
+/// A control rather than a label: the click opens `/accounts`. An account
+/// running low draws as a warning, a spent one as an error.
+fn push_account(strip: &mut Strip, ctx: &StatusBarContext<'_>) {
+    if let Some(chip) = &ctx.account {
+        let style = match chip.tier {
+            AccountTier::Healthy => control_style(ctx, StatusBarHitTarget::Account),
+            AccountTier::Low => theme::current().tool_warning,
+            AccountTier::Spent => theme::current().error,
+        };
+        strip.chip(
+            ctx,
+            StatusBarHitTarget::Account,
+            [Span::styled(account_label(chip), style)],
+        );
+    }
+}
+
+fn account_label(chip: &AccountChip<'_>) -> String {
+    let mode = if chip.auto { ACCOUNT_AUTO_PREFIX } else { "" };
+    match chip.left_percent {
+        Some(left) => format!("[{mode}{} {left}%]", chip.name),
+        None => format!("[{mode}{}]", chip.name),
+    }
+}
+
+fn account_tip(chip: &AccountChip<'_>) -> String {
+    let mut tip = format!("{TIP_ACCOUNT}{}", chip.name);
+    if let Some(left) = chip.left_percent {
+        tip.push_str(&format!(", {left}{TIP_ACCOUNT_LEFT}"));
+    }
+    tip.push_str(match chip.auto {
+        true => TIP_ACCOUNT_AUTO,
+        false => TIP_ACCOUNT_PINNED,
+    });
+    tip
 }
 
 /// A control rather than a label: the click docks the oldest question.
@@ -2643,6 +2704,7 @@ mod tests {
         show_global: bool,
         permission_mode: PermissionMode,
         decisions: Option<DecisionsChip<'a>>,
+        account: Option<AccountChip<'a>>,
         waiting_questions: usize,
         config_problems: &'a [ConfigProblem],
         pending_trust: PendingTrust,
@@ -2677,6 +2739,7 @@ mod tests {
                 show_global: false,
                 permission_mode: PermissionMode::Ask,
                 decisions: None,
+                account: None,
                 waiting_questions: 0,
                 config_problems: &[],
                 pending_trust: PendingTrust::default(),
@@ -2731,6 +2794,7 @@ mod tests {
                 workflows: self.workflows,
                 permission_mode: self.permission_mode,
                 decisions: self.decisions,
+                account: self.account,
                 waiting_questions: self.waiting_questions,
                 config_problems: self.config_problems,
                 pending_trust: self.pending_trust,
@@ -2895,6 +2959,7 @@ mod tests {
             workflows: ladder_workflows(),
             permission_mode: PermissionMode::Yolo,
             decisions: None,
+            account: None,
             waiting_questions: 0,
             config_problems: &[],
             pending_trust: PendingTrust::default(),
@@ -5388,7 +5453,8 @@ mod tests {
     /// Every control that opens a command carries that command's scope, so the
     /// bar cannot refuse a click the palette accepts. `Mode`, `BackToMain`,
     /// `Retry` and `Thinking` are absent because their click runs no command.
-    const SCOPED_COMMANDS: [(StatusBarHitTarget, &str); 10] = [
+    const SCOPED_COMMANDS: [(StatusBarHitTarget, &str); 11] = [
+        (StatusBarHitTarget::Account, "/accounts"),
         (StatusBarHitTarget::Model, "/model"),
         (StatusBarHitTarget::Goal, "/goal"),
         (StatusBarHitTarget::Autopilot, "/autopilot"),
@@ -5465,6 +5531,78 @@ mod tests {
         assert!(tip.contains(DECISION_ENDPOINT), "{TIP_MISSING}: {tip}");
         assert_eq!(tip.contains(TIP_DECISIONS_OFFLINE), offline, "{tip}");
         assert!(tip.ends_with(CLICK_DETAILS), "{TIP_MISSING}: {tip}");
+    }
+
+    const ACCOUNT_NAME: &str = "personal";
+
+    fn account_chip(
+        auto: bool,
+        left_percent: Option<u8>,
+        tier: AccountTier,
+    ) -> AccountChip<'static> {
+        AccountChip {
+            name: ACCOUNT_NAME,
+            auto,
+            left_percent,
+            tier,
+        }
+    }
+
+    #[test_case(true, Some(41), "[auto\u{b7}personal 41%]" ; "auto_with_a_reading")]
+    #[test_case(false, Some(41), "[personal 41%]" ; "pinned")]
+    #[test_case(true, None, "[auto\u{b7}personal]" ; "no_reading_yet")]
+    fn the_account_chip_names_the_account_and_what_is_left(
+        auto: bool,
+        left_percent: Option<u8>,
+        expected: &str,
+    ) {
+        let (text, hits, _) = render_at(Fixture {
+            account: Some(account_chip(auto, left_percent, AccountTier::Healthy)),
+            ..Default::default()
+        });
+
+        assert!(text.contains(expected), "{text}");
+        assert!(
+            hits.iter()
+                .any(|hit| hit.target == StatusBarHitTarget::Account)
+        );
+    }
+
+    #[test_case(AccountTier::Low ; "low")]
+    #[test_case(AccountTier::Spent ; "spent")]
+    fn an_account_running_out_is_not_drawn_as_a_plain_control(tier: AccountTier) {
+        let drawn = render_rows(Fixture {
+            account: Some(account_chip(true, Some(3), tier)),
+            ..Default::default()
+        });
+        let hit = drawn.hit(StatusBarHitTarget::Account);
+        let expected = match tier {
+            AccountTier::Low => theme::current().tool_warning,
+            _ => theme::current().error,
+        };
+
+        assert!(
+            drawn
+                .styles(hit)
+                .iter()
+                .all(|style| style.fg == expected.fg)
+        );
+    }
+
+    #[test_case(true, TIP_ACCOUNT_AUTO ; "auto")]
+    #[test_case(false, TIP_ACCOUNT_PINNED ; "pinned")]
+    fn the_account_tip_says_whether_auto_may_move_it(auto: bool, meaning: &str) {
+        let tip = tip_for(
+            StatusBarHitTarget::Account,
+            Fixture {
+                account: Some(account_chip(auto, Some(41), AccountTier::Healthy)),
+                ..Default::default()
+            },
+        );
+
+        assert!(tip.contains(ACCOUNT_NAME), "{TIP_MISSING}: {tip}");
+        assert!(tip.contains(meaning), "{TIP_MISSING}: {tip}");
+        assert!(tip.ends_with(CLICK_ACCOUNT), "{TIP_MISSING}: {tip}");
     }
 
     #[test]

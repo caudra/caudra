@@ -699,6 +699,7 @@ impl App {
         let decisions = self.stored_engine_decisions();
         let mut log_rows = self.autopilot_log_rows();
         log_rows.extend(self.goal_log_rows());
+        log_rows.extend(self.account_switch_rows());
         log_rows.sort_by_key(|(place, _)| *place);
         let mut inserts: Vec<_> = log_rows
             .into_iter()

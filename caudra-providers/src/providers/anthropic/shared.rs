@@ -899,6 +899,7 @@ impl EventParser {
             stop_reason: self.stop_reason,
             tool_name_aliases: self.oauth_tool_names.map(Arc::new),
             invalid_tool_inputs: self.invalid_tool_inputs,
+            ..StreamResponse::default()
         }
     }
 }

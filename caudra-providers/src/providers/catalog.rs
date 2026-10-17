@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use caudra_config::providers::builtin_provider;
+use caudra_config::providers::{builtin_provider, resolve_api_key_env};
 use flume::Sender;
 use isahc::config::{Configurable, VersionNegotiation};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
@@ -24,10 +24,11 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use caudra_storage::StateDir;
-use caudra_storage::auth::load_provider_credentials;
+use caudra_storage::accounts::{StoredSecret, list_accounts};
 
 use caudra_storage::thinking::ReasoningOptions;
 
+use crate::accounts::AccountCredential;
 use crate::model::{Model, ModelInfo, ModelPricing, PricingTier};
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::providers::anthropic::{self, shared};
@@ -47,6 +48,8 @@ const BLOCKED_PROVIDER_IN_CATALOG: &[&str] = &["zai", "zai-coding-plan", "github
 pub(crate) const OPENCODE_FAMILY_SLUGS: &[&str] = &["opencode", "opencode-go"];
 
 const CATALOG_URL: &str = "https://models.dev/api.json";
+/// The token Opencode accepts for its free models when no key is set.
+const PUBLIC_FREE_KEY: &str = "public";
 const CATALOG_CACHE_FILE: &str = "models-dev-catalog.json";
 /// Bumped whenever the parsed shape gains a field, since the cache stores the
 /// parsed form and an older file would silently be missing it. Carried inside
@@ -108,9 +111,16 @@ impl ProviderData {
         }
     }
 
+    /// The key of the first stored account, for discovery and listings. A
+    /// provider instance signs with the account it was built for instead.
     pub fn load_key_from_storage(&self, state_dir: &StateDir) -> Option<String> {
-        let creds = load_provider_credentials(state_dir, &self.slug)?;
-        Some(creds.api_key)
+        list_accounts(state_dir, &self.slug)
+            .ok()?
+            .into_iter()
+            .find_map(|(_, account)| match account.secret {
+                StoredSecret::ApiKey(credentials) => Some(credentials.api_key),
+                StoredSecret::OAuth(_) => None,
+            })
     }
 
     pub fn resolve_api_key(&self, state_dir: &StateDir) -> Option<String> {
@@ -142,27 +152,29 @@ impl ProviderData {
     }
 
     pub fn build_auth(&self, state_dir: &StateDir) -> Authentication {
-        let api_key = match self.resolve_api_key(state_dir) {
-            Some(key) => key,
+        self.auth_for_key(self.resolve_api_key(state_dir).as_deref())
+    }
+
+    /// What `api_key` signs with here; without one only the Opencode family
+    /// still answers, on its public free-models token.
+    pub(crate) fn auth_for_key(&self, api_key: Option<&str>) -> Authentication {
+        match api_key {
+            Some(key) => Authentication::KeyBased(ResolvedAuth {
+                base_url: self.base_url.clone(),
+                headers: self.auth_headers(key),
+            }),
             None if OPENCODE_FAMILY_SLUGS.contains(&self.slug.as_str()) => {
-                return Authentication::OpenCodeFreeKey(ResolvedAuth {
+                Authentication::OpenCodeFreeKey(ResolvedAuth {
                     base_url: self.base_url.clone(),
-                    headers: self.auth_headers("public"),
-                });
+                    headers: self.auth_headers(PUBLIC_FREE_KEY),
+                })
             }
-            None => return Authentication::NoAuth,
-        };
-        Authentication::KeyBased(ResolvedAuth {
-            base_url: self.base_url.clone(),
-            headers: self.auth_headers(&api_key),
-        })
+            None => Authentication::NoAuth,
+        }
     }
 
     pub fn resolve_auth(&self, state_dir: &StateDir) -> Option<ResolvedAuth> {
-        match self.build_auth(state_dir) {
-            Authentication::KeyBased(auth) | Authentication::OpenCodeFreeKey(auth) => Some(auth),
-            Authentication::NoAuth => None,
-        }
+        self.build_auth(state_dir).into_resolved()
     }
 
     /// Resolve auth with optional dynamic override (e.g. from Lua).
@@ -310,6 +322,15 @@ pub enum Authentication {
     OpenCodeFreeKey(ResolvedAuth),
     /// No authentication available
     NoAuth,
+}
+
+impl Authentication {
+    pub(crate) fn into_resolved(self) -> Option<ResolvedAuth> {
+        match self {
+            Self::KeyBased(auth) | Self::OpenCodeFreeKey(auth) => Some(auth),
+            Self::NoAuth => None,
+        }
+    }
 }
 
 pub(crate) struct CatalogData {
@@ -469,7 +490,6 @@ pub(crate) fn config_error(message: String) -> AgentError {
 
 static CATALOG_PROVIDER_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "",
-    api_key_env: "",
     base_url: "",
     max_tokens_field: "max_tokens",
     include_stream_usage: true,
@@ -545,6 +565,16 @@ pub fn available_if_warm(slug: &str) -> bool {
         return false;
     };
     data.resolve_auth(&state_dir).is_some()
+}
+
+/// The env keys an implicit account of `slug` may come from: models.dev's own,
+/// or the conventional `<SLUG>_API_KEY` while the catalog is cold. `None`
+/// when the warm catalog does not know the slug.
+pub(crate) fn credential_env_vars(slug: &str) -> Option<Vec<String>> {
+    if SHARED_CATALOG.get().is_none() {
+        return Some(vec![resolve_api_key_env(slug, None)]);
+    }
+    catalog_provider_if_available(slug).map(|data| data.env_keys)
 }
 
 /// The cached catalog, tagged with the shape it was written against. A file
@@ -810,11 +840,11 @@ enum CatalogAuth {
 impl CatalogProvider {
     pub fn new(
         data: ProviderData,
-        state_dir: &StateDir,
+        account: &AccountCredential,
         timeouts: Timeouts,
         allow_free_fallback: bool,
     ) -> Result<Self, AgentError> {
-        let auth = match data.build_auth(state_dir) {
+        let auth = match data.auth_for_key(account.optional_api_key()) {
             Authentication::KeyBased(auth) => CatalogAuth::Keyed(auth),
             Authentication::OpenCodeFreeKey(auth) if allow_free_fallback => {
                 CatalogAuth::FreeOnly(auth)
@@ -962,6 +992,7 @@ pub(crate) fn warm_empty_catalog_for_tests(state_dir: StateDir) {
 /// unknown slug, surface on the first request instead.
 struct LazyCatalogProvider {
     slug: String,
+    account: AccountCredential,
     timeouts: Timeouts,
     inner: OnceLock<Result<CatalogProvider, String>>,
 }
@@ -970,8 +1001,9 @@ impl LazyCatalogProvider {
     async fn resolve(&self) -> Result<&CatalogProvider, AgentError> {
         if self.inner.get().is_none() {
             let slug = self.slug.clone();
+            let account = self.account.clone();
             let timeouts = self.timeouts;
-            let created = smol::unblock(move || create_resolved(&slug, timeouts)).await;
+            let created = smol::unblock(move || create_resolved(&slug, &account, timeouts)).await;
             let _ = self.inner.set(created.map_err(|e| e.to_string()));
         }
         self.resolved()
@@ -1025,14 +1057,15 @@ impl Provider for LazyCatalogProvider {
     }
 }
 
-fn create_resolved(slug: &str, timeouts: Timeouts) -> Result<CatalogProvider, AgentError> {
+fn create_resolved(
+    slug: &str,
+    account: &AccountCredential,
+    timeouts: Timeouts,
+) -> Result<CatalogProvider, AgentError> {
     let data = catalog_provider(slug).ok_or_else(|| AgentError::Config {
         message: unresolved_slug_reason(slug),
     })?;
-    let state_dir = StateDir::resolve().map_err(|e| AgentError::Config {
-        message: format!("failed to resolve state dir: {e}"),
-    })?;
-    CatalogProvider::new(data, &state_dir, timeouts, free_fallback_allowed())
+    CatalogProvider::new(data, account, timeouts, free_fallback_allowed())
 }
 
 /// Why a catalog-backed slug did not resolve. An empty catalog means models.dev
@@ -1067,17 +1100,21 @@ fn free_fallback_allowed() -> bool {
 /// the catalog is warm and the slug is not in it. With a cold catalog it
 /// returns a [`LazyCatalogProvider`] instead of blocking on the fetch;
 /// membership is then checked on first use.
-pub fn try_create(slug: &str, timeouts: Timeouts) -> Option<Result<Box<dyn Provider>, AgentError>> {
+pub fn try_create(
+    slug: &str,
+    account: &AccountCredential,
+    timeouts: Timeouts,
+) -> Option<Result<Box<dyn Provider>, AgentError>> {
     if SHARED_CATALOG.get().is_some() {
         let data = catalog_provider_if_available(slug)?;
-        let state_dir = StateDir::resolve().ok()?;
         return Some(
-            CatalogProvider::new(data, &state_dir, timeouts, free_fallback_allowed())
+            CatalogProvider::new(data, account, timeouts, free_fallback_allowed())
                 .map(|c| Box::new(c) as Box<dyn Provider>),
         );
     }
     Some(Ok(Box::new(LazyCatalogProvider {
         slug: slug.to_string(),
+        account: account.clone(),
         timeouts,
         inner: OnceLock::new(),
     })))
@@ -1166,7 +1203,10 @@ mod tests {
     use super::schema::{CatalogCost, CatalogIndex, CatalogLimits, CatalogModel, CatalogProvider};
     use std::sync::{Arc, OnceLock};
 
-    use caudra_storage::auth::{ProviderCredentials, save_provider_credentials};
+    use caudra_storage::accounts::{
+        AccountId, AccountIdentity, AccountName, StoredAccount, StoredSecret, save_account,
+    };
+    use caudra_storage::auth::ProviderCredentials;
     use serde_json::json;
 
     use super::{
@@ -1174,6 +1214,7 @@ mod tests {
         LazyCatalogProvider, PROVIDER_NOT_RESOLVED, ProviderData, StateDir, available_if_warm,
         determine_catalog_format,
     };
+    use crate::accounts::credential::test_support::{api_key_account, keyless_account};
     use crate::model::{Model, ModelPricing};
     use crate::provider::Provider;
     use crate::providers::Timeouts;
@@ -1187,11 +1228,11 @@ mod tests {
     const MODEL_OUTPUT: u32 = 64_000;
     const UNSET_KEY_ENV: &str = "CAUDRA_TEST_OPENCODE_GO_UNSET_KEY_30571";
     const CATALOG_CREDENTIAL: &str = "sk-catalog-credential";
+    const ACCOUNT: &str = "work";
     const SYSTEM_PROMPT: &str = "catalog system";
 
     #[test]
     fn new_rejects_no_auth() {
-        let (_tmp, state_dir) = temp_state_dir();
         let data = ProviderData {
             slug: "test".into(),
             display_name: "Test".into(),
@@ -1201,7 +1242,8 @@ mod tests {
             api_format: EndpointType::ChatCompletions,
             models: HashMap::new(),
         };
-        let result = super::CatalogProvider::new(data, &state_dir, Timeouts::default(), true);
+        let result =
+            super::CatalogProvider::new(data, &keyless_account("test"), Timeouts::default(), true);
         assert!(matches!(result, Err(AgentError::Config { .. })));
     }
 
@@ -1275,10 +1317,14 @@ mod tests {
     /// The dry run refuses exactly where the send does.
     #[test]
     fn gated_free_fallback_hides_models_and_refuses_streaming() {
-        let (_tmp, state_dir) = temp_state_dir();
-        let data = opencode_go_provider_data("CAUDRA_TEST_OPENCODE_GO_UNSET_KEY_52814");
-        let provider =
-            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
+        let data = opencode_go_provider_data(UNSET_KEY_ENV);
+        let provider = super::CatalogProvider::new(
+            data,
+            &keyless_account(OPENCODE_GO),
+            Timeouts::default(),
+            false,
+        )
+        .unwrap();
         assert!(smol::block_on(provider.list_models()).unwrap().is_empty());
 
         let model = catalog_model(FREE_MODEL);
@@ -1329,22 +1375,17 @@ mod tests {
         url: &str,
         system_at: &str,
     ) {
-        let (_tmp, state_dir) = temp_state_dir();
-        save_provider_credentials(
-            &state_dir,
-            OPENCODE_GO,
-            &ProviderCredentials {
-                api_key: CATALOG_CREDENTIAL.into(),
-                host: None,
-            },
-        )
-        .unwrap();
         let data = ProviderData {
             api_format,
             ..opencode_go_provider_data(UNSET_KEY_ENV)
         };
-        let provider =
-            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
+        let provider = super::CatalogProvider::new(
+            data,
+            &api_key_account(OPENCODE_GO, ACCOUNT, CATALOG_CREDENTIAL),
+            Timeouts::default(),
+            false,
+        )
+        .unwrap();
 
         let wire = provider
             .wire_request(
@@ -1371,6 +1412,7 @@ mod tests {
     fn a_cold_lazy_provider_never_resolves_for_a_dry_run() {
         let provider = LazyCatalogProvider {
             slug: OPENCODE_GO.into(),
+            account: keyless_account(OPENCODE_GO),
             timeouts: Timeouts::default(),
             inner: OnceLock::new(),
         };
@@ -1392,10 +1434,14 @@ mod tests {
 
     #[test]
     fn catalog_provider_list_models_free_fallback_hides_paid_models() {
-        let (_tmp, state_dir) = temp_state_dir();
-        let data = opencode_go_provider_data("CAUDRA_TEST_OPENCODE_GO_UNSET_KEY_91472");
-        let provider =
-            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), true).unwrap();
+        let data = opencode_go_provider_data(UNSET_KEY_ENV);
+        let provider = super::CatalogProvider::new(
+            data,
+            &keyless_account(OPENCODE_GO),
+            Timeouts::default(),
+            true,
+        )
+        .unwrap();
         let models = smol::block_on(provider.list_models()).unwrap();
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["free-model"]);
@@ -1403,16 +1449,18 @@ mod tests {
 
     #[test]
     fn catalog_provider_list_models_with_key_shows_all() {
-        let (_tmp, state_dir) = temp_state_dir();
-        unsafe { std::env::set_var("CAUDRA_TEST_OPENCODE_GO_KEY_41827", "real-key") };
-        let data = opencode_go_provider_data("CAUDRA_TEST_OPENCODE_GO_KEY_41827");
-        let provider =
-            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
+        let data = opencode_go_provider_data(UNSET_KEY_ENV);
+        let provider = super::CatalogProvider::new(
+            data,
+            &api_key_account(OPENCODE_GO, ACCOUNT, CATALOG_CREDENTIAL),
+            Timeouts::default(),
+            false,
+        )
+        .unwrap();
         let models = smol::block_on(provider.list_models()).unwrap();
         let mut ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         ids.sort_unstable();
         assert_eq!(ids, ["free-model", "paid-model"]);
-        unsafe { std::env::remove_var("CAUDRA_TEST_OPENCODE_GO_KEY_41827") };
     }
 
     const ONE_BAD_MODEL: &str =
@@ -2549,9 +2597,19 @@ mod tests {
     #[test]
     fn catalog_all_models_filters_keyless_providers() {
         let (_tmp, state_dir) = temp_state_dir();
-        let auth_dir = state_dir.path().join("auth");
-        std::fs::create_dir_all(&auth_dir).unwrap();
-        std::fs::write(auth_dir.join("keyed.json"), r#"{"api_key": "sk-abc123"}"#).unwrap();
+        save_account(
+            &state_dir,
+            &AccountId::new("keyed", AccountName::new("default").unwrap()),
+            &StoredAccount {
+                secret: StoredSecret::ApiKey(ProviderCredentials {
+                    api_key: "sk-abc123".into(),
+                    host: None,
+                }),
+                identity: AccountIdentity::default(),
+                created_at: 0,
+            },
+        )
+        .unwrap();
 
         let mut providers: CatalogIndex = HashMap::new();
         providers.insert(

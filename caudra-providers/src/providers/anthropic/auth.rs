@@ -6,11 +6,8 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use caudra_storage::StateDir;
-use caudra_storage::auth::{
-    OAuthTokens, delete_provider_credentials, delete_tokens, lock_provider_auth, now_millis,
-    save_tokens, try_load_tokens,
-};
+use caudra_storage::accounts::{AccountIdentity, StoredSecret};
+use caudra_storage::auth::{OAuthTokens, now_millis};
 use isahc::ReadResponseExt;
 use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
 use serde::{Deserialize, Serialize};
@@ -19,7 +16,8 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::AgentError;
-use crate::providers::oauth::{self, RefreshReason};
+use crate::accounts::LoginCredential;
+use crate::providers::oauth::{AccountStore, RefreshReason};
 use crate::providers::{ResolvedAuth, urlenc};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -31,7 +29,6 @@ const REDIRECT_HOST: &str = "127.0.0.1";
 const REDIRECT_URI_HOST: &str = "localhost";
 const REDIRECT_PATH: &str = "/callback";
 
-pub(crate) const PROVIDER: &str = "anthropic";
 pub(crate) const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 pub(crate) const AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
 pub(crate) const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
@@ -203,20 +200,14 @@ pub(crate) fn build_oauth_resolved(tokens: &OAuthTokens) -> ResolvedAuth {
     }
 }
 
-pub(crate) fn load_oauth_tokens(storage: &StateDir) -> Result<Option<OAuthTokens>, AgentError> {
-    Ok(try_load_tokens(storage, PROVIDER)?)
-}
-
 pub(crate) fn refresh_from_storage(
-    storage: &StateDir,
+    store: &AccountStore,
     rejected_accesses: &[String],
 ) -> Result<OAuthTokens, AgentError> {
-    let reason = if rejected_accesses.is_empty() {
-        RefreshReason::Proactive
-    } else {
-        RefreshReason::Rejected(rejected_accesses)
-    };
-    oauth::refresh_from_storage(storage, PROVIDER, reason, refresh_tokens)
+    store.refresh(
+        RefreshReason::for_rejected(rejected_accesses),
+        refresh_tokens,
+    )
 }
 
 pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentError> {
@@ -238,15 +229,15 @@ pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentE
     into_oauth_tokens(response, Some(tokens.refresh.clone()))
 }
 
-pub fn login(storage: &StateDir) -> Result<(), AgentError> {
-    login_inner(storage, true)
+pub fn login() -> Result<LoginCredential, AgentError> {
+    login_inner(true)
 }
 
-pub fn login_browser_callback(storage: &StateDir) -> Result<(), AgentError> {
-    login_inner(storage, false)
+pub fn login_browser_callback() -> Result<LoginCredential, AgentError> {
+    login_inner(false)
 }
 
-fn login_inner(storage: &StateDir, allow_paste: bool) -> Result<(), AgentError> {
+fn login_inner(allow_paste: bool) -> Result<LoginCredential, AgentError> {
     println!(
         "Anthropic subscription OAuth uses Claude Code's public client registration.\nThis may conflict with Anthropic's terms for Claude subscriptions."
     );
@@ -254,22 +245,41 @@ fn login_inner(storage: &StateDir, allow_paste: bool) -> Result<(), AgentError> 
         return Err(AgentError::Cancelled);
     }
     let tokens = browser_login(allow_paste)?;
-    let _lock = lock_provider_auth(storage, PROVIDER)?;
-    save_tokens(storage, PROVIDER, &tokens)?;
+    let identity = fetch_identity(&tokens).unwrap_or_else(|error| {
+        warn!(%error, "could not read the Anthropic account profile");
+        AccountIdentity::default()
+    });
     println!("Authenticated with Anthropic successfully.");
-    Ok(())
+    Ok(LoginCredential {
+        secret: StoredSecret::OAuth(tokens),
+        identity,
+    })
 }
 
-pub fn logout(storage: &StateDir) -> Result<(), AgentError> {
-    let _lock = lock_provider_auth(storage, PROVIDER)?;
-    if delete_tokens(storage, PROVIDER)? {
-        println!("Logged out of Anthropic OAuth.");
-    } else if delete_provider_credentials(storage, PROVIDER)? {
-        println!("Removed saved Anthropic API key.");
-    } else {
-        println!("Not currently logged in to Anthropic.");
+/// Who `tokens` sign in as, from the OAuth profile.
+fn fetch_identity(tokens: &OAuthTokens) -> Result<AccountIdentity, AgentError> {
+    let request = isahc::Request::builder()
+        .method("GET")
+        .uri(format!("{API_ORIGIN}{}", super::PROFILE_PATH))
+        .header("authorization", format!("Bearer {}", tokens.access))
+        .header("anthropic-version", super::API_VERSION)
+        .header("anthropic-beta", super::OAUTH_BETA)
+        .header(
+            "user-agent",
+            format!("claude-cli/{CLAUDE_CODE_VERSION} (external, cli)"),
+        )
+        .body(())?;
+    let mut response = http_client()?.send(request)?;
+    let status = response.status().as_u16();
+    let text = response.text().unwrap_or_default();
+    if status != 200 {
+        return Err(AgentError::api(
+            status,
+            format!("Anthropic profile request failed ({status})"),
+        ));
     }
-    Ok(())
+    let profile: super::OauthProfile = serde_json::from_str(&text)?;
+    Ok(super::profile_identity(&profile))
 }
 
 fn confirm(message: &str) -> Result<bool, AgentError> {
@@ -550,7 +560,6 @@ fn config_error(message: &str) -> AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use test_case::test_case;
 
     const AUTH_CODE: &str = "auth-code";
@@ -650,26 +659,6 @@ mod tests {
                 r#"{"error":"invalid_grant","error_description":"invalid refresh"}"#,
             ),
             401
-        );
-    }
-
-    #[test]
-    fn expired_tokens_do_not_refresh_during_resolution() {
-        let temp = TempDir::new().unwrap();
-        let storage = StateDir::from_path(temp.path().to_path_buf());
-        let tokens = OAuthTokens {
-            access: "expired-access".into(),
-            refresh: "refresh".into(),
-            expires: 0,
-            account_id: None,
-        };
-        save_tokens(&storage, PROVIDER, &tokens).unwrap();
-
-        let resolved = build_oauth_resolved(&load_oauth_tokens(&storage).unwrap().unwrap());
-
-        assert_eq!(
-            resolved.headers,
-            vec![("authorization".into(), "Bearer expired-access".into())]
         );
     }
 }

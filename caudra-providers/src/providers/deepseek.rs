@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::warn;
 
+use crate::accounts::AccountCredential;
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing};
 use crate::pricing::{PricingSchedule, PricingWindow};
 use crate::provider::{BoxFuture, Provider, WireRequest};
@@ -13,8 +14,8 @@ use crate::{
     AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
 };
 
+use super::ResolvedAuth;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyPool, ResolvedAuth};
 
 const PAD: &str = "";
 const THINKING_PAD_MARKERS: &[&str] = &["deepseek-v4", "deepseek-flash"];
@@ -22,7 +23,6 @@ const BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "deepseek",
-    api_key_env: "DEEPSEEK_API_KEY",
     base_url: "https://api.deepseek.com",
     max_tokens_field: "max_tokens",
     include_stream_usage: true,
@@ -128,6 +128,8 @@ impl From<BalanceResponse> for ProviderUsage {
                         symbol,
                         b.granted_balance
                     )),
+                    window: None,
+                    length_secs: None,
                 }
             })
             .collect();
@@ -138,17 +140,14 @@ impl From<BalanceResponse> for ProviderUsage {
 pub struct DeepSeek {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
-    key_pool: Option<KeyPool>,
     system_prefix: Option<String>,
 }
 
 impl DeepSeek {
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve("deepseek", CONFIG.api_key_env)?;
+    pub fn new(account: &AccountCredential, timeouts: super::Timeouts) -> Result<Self, AgentError> {
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(pool.current()))),
-            key_pool: Some(pool),
+            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(account.api_key()?))),
             system_prefix: None,
         })
     }
@@ -157,7 +156,6 @@ impl DeepSeek {
         Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth,
-            key_pool: None,
             system_prefix: None,
         }
     }
@@ -240,15 +238,6 @@ impl Provider for DeepSeek {
             let body = self.compat.get_text(&auth, BALANCE_URL).await?;
             let parsed: BalanceResponse = serde_json::from_str(&body)?;
             Ok(Some(parsed.into()))
-        })
-    }
-
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            Ok(self
-                .key_pool
-                .as_ref()
-                .is_some_and(|p| p.rotate_auth(&self.auth, ResolvedAuth::bearer)))
         })
     }
 }

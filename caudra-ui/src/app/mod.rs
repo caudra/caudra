@@ -4,6 +4,7 @@
 //! places, one per transition: `start_run`, `handle_cancel`, and
 //! `AgentHandles::respawn`. Everything else only reads it.
 
+mod accounts;
 pub(crate) mod automation;
 pub(crate) mod autopilot;
 pub(crate) mod background_delivery;
@@ -61,6 +62,7 @@ use crate::app::workbench::{MountScope, StoredDocument};
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT, format_with_images};
 use crate::clipboard::{ClipboardState, CopyResult};
+use crate::components::accounts_modal::AccountsModal;
 use crate::components::audit_log::PanelTab;
 use crate::components::automation_inspector::{AutomationAction, AutomationInspector};
 use crate::components::autopilot_panel::AutopilotPanel;
@@ -181,6 +183,7 @@ use caudra_docs::{DocsLibrary, ReleaseNotesSource};
 use caudra_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
 };
+use caudra_providers::accounts::{AccountStatus, RoutedAccount};
 use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::{adjust_model_for_inspection, seed_setup_thinking};
 use caudra_providers::{
@@ -487,6 +490,15 @@ pub struct App {
     pub(super) command_modal: CommandModal,
     pub(super) theme_picker: ThemePicker,
     pub(super) thinking_picker: ThinkingPicker,
+    pub(super) accounts_modal: AccountsModal,
+    /// Where the main agent's latest request went, for the status chip.
+    pub(super) routed_account: Option<RoutedAccount>,
+    /// Filled once a `/accounts` refresh has asked every subscription for
+    /// its quota, with the failures to show.
+    accounts_refresh: Arc<ArcSwapOption<Vec<String>>>,
+    /// What `/usage` lists per account, read when it opens and after each
+    /// quota fetch.
+    pub(super) usage_accounts: Vec<AccountStatus>,
     pub(super) prompt_profile_picker: PromptProfilePicker,
     pub(super) model_picker: ModelPicker,
     pub(super) login_picker: LoginPicker,
@@ -830,6 +842,10 @@ impl App {
             command_modal: CommandModal::new(),
             theme_picker: ThemePicker::new(),
             thinking_picker: ThinkingPicker::new(),
+            accounts_modal: AccountsModal::new(),
+            routed_account: None,
+            accounts_refresh: Arc::new(ArcSwapOption::empty()),
+            usage_accounts: Vec::new(),
             prompt_profile_picker: PromptProfilePicker::new(Arc::clone(&prompt_profiles)),
             model_picker: ModelPicker::new(available_models).with_decision_source({
                 let storage = storage.clone();
@@ -1810,6 +1826,7 @@ impl App {
                 }
                 if self.session_relocation_picker.is_open()
                     || self.worktree_picker.is_open()
+                    || self.accounts_modal.is_open()
                     || self.logs_modal.is_open()
                     || self.docs_modal.is_open()
                 {
@@ -2828,6 +2845,11 @@ impl App {
             let action = self.worktree_picker.handle_key(key);
             return Some(self.handle_worktree_action(action));
         }
+        if self.accounts_modal.is_open() {
+            keyboard_text!(accounts_modal, self.accounts_modal.text_input_active());
+            guard_repeat!(self.accounts_modal.text_input_active());
+            return Some(self.accounts_key(key));
+        }
         if self.task_picker.is_open() {
             keyboard_text!(task_picker, true);
             guard_repeat!(false);
@@ -3257,9 +3279,11 @@ impl App {
             LoginPickerAction::AuthenticateProvider {
                 provider,
                 model_spec,
+                account,
             } => vec![Action::AuthenticateProvider {
                 provider,
                 model_spec,
+                account,
             }],
             LoginPickerAction::DecisionConfigured { name, activate } => activate
                 .then(|| Action::SetDecisionEndpoint(Some(name)))
@@ -3919,6 +3943,10 @@ impl App {
         if leader::CYCLE_DECISION.matches(key) {
             return self.cycle_decision_endpoint(ProvidersConfig::load);
         }
+        if leader::ACCOUNTS.matches(key) {
+            self.open_accounts();
+            return vec![];
+        }
         if leader::WORKFLOWS.matches(key) {
             return self.execute_workflow("");
         }
@@ -4170,6 +4198,7 @@ impl App {
         self.usage_modal.toggle();
         if self.usage_modal.is_open() {
             self.load_lifetime_usage();
+            self.reload_usage_accounts();
             vec![Action::RefreshUsage]
         } else {
             vec![]
@@ -4913,6 +4942,7 @@ impl App {
             self.add_session_spend(cost, billing);
             self.record_model_usage(
                 &provider,
+                None,
                 &model,
                 LedgerPurpose::Title,
                 usage,
@@ -5297,6 +5327,7 @@ impl App {
             }
             self.record_model_usage(
                 &tc.provider,
+                tc.account.as_deref(),
                 &tc.model,
                 tc.purpose,
                 tc.usage,
@@ -5356,7 +5387,7 @@ impl App {
                 if subagent_id.is_some() {
                     self.record_external_spend(usage, cost, billing, purpose);
                 }
-                self.record_model_usage(&provider, &model, purpose, usage, cost, billing);
+                self.record_model_usage(&provider, None, &model, purpose, usage, cost, billing);
                 return vec![];
             }
             AgentEvent::GoalEvaluating { evaluation } => {
@@ -5509,6 +5540,14 @@ impl App {
                     cleared_after_error_row(&condition, &message),
                 ));
                 self.flush_goal_log();
+                return vec![];
+            }
+            AgentEvent::AccountRouted { account, switch } => {
+                self.account_routed(chat_idx, main_agent, &account, switch);
+                return vec![];
+            }
+            AgentEvent::AccountExhausted(exhaustion) => {
+                self.account_exhausted(chat_idx, main_agent, *exhaustion);
                 return vec![];
             }
             event => event,
@@ -6040,6 +6079,10 @@ impl App {
                 vec![Action::RefreshModels]
             }
             "/favorite-next" => self.cycle_favorite_model(),
+            "/accounts" => {
+                self.open_accounts();
+                vec![]
+            }
             "/decision-model" => self.open_decision_model_picker(),
             "/decision-next" => self.cycle_decision_endpoint(ProvidersConfig::load),
             "/system-prompt" => {
@@ -6482,7 +6525,7 @@ impl App {
         inline_image::set_local_root(local.then(|| Path::new(&self.state.session.cwd)));
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 49] {
+    fn overlays(&self) -> [&dyn Overlay; 50] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -6532,11 +6575,12 @@ impl App {
             &self.session_picker,
             &self.session_relocation_picker,
             &self.worktree_picker,
+            &self.accounts_modal,
             &self.permission_prompt,
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 49] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 50] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -6586,6 +6630,7 @@ impl App {
             &mut self.session_picker,
             &mut self.session_relocation_picker,
             &mut self.worktree_picker,
+            &mut self.accounts_modal,
             &mut self.permission_prompt,
         ]
     }
@@ -6848,7 +6893,7 @@ impl App {
             | self.poll_sandbox()
             | self.poll_env()
             | self.model_picker.refresh()
-            | self.usage_modal.poll(&self.usage_slot)
+            | self.poll_usage()
             | self.storage_modal.poll(&self.storage_slot)
             | self.decisions_modal.poll(&self.decisions_slot)
             | self.autopilot_panel.poll()
@@ -6875,7 +6920,17 @@ impl App {
             | self.tick_workbench()
             | self.poll_commit_index()
             | self.thinking_picker.tick()
+            | self.poll_accounts_refresh()
             | Dirty::any(self.chats.iter_mut().map(Chat::tick))
+    }
+
+    /// A settled quota fetch also moved the readings `/usage` lists per account.
+    fn poll_usage(&mut self) -> Dirty {
+        let dirty = self.usage_modal.poll(&self.usage_slot);
+        if dirty == Dirty::YES {
+            self.reload_usage_accounts();
+        }
+        dirty
     }
 
     fn refresh_mcp_picker(&mut self) -> Dirty {
@@ -7192,10 +7247,13 @@ impl App {
     /// `provider` comes from whoever answered rather than from the chat model.
     /// Goal evaluation, compaction and titles can each resolve to another
     /// provider, and billing them to the conversation's provider would make
-    /// `--group-by provider` describe a session that never happened.
+    /// `--group-by provider` describe a session that never happened. `account`
+    /// is the provider account that served the turn, when routing named one.
+    #[allow(clippy::too_many_arguments)]
     fn record_model_usage(
         &mut self,
         provider: &str,
+        account: Option<&str>,
         model: &str,
         purpose: LedgerPurpose,
         usage: TokenUsage,
@@ -7208,6 +7266,7 @@ impl App {
             .add_model_usage(&key, purpose, usage.billed(cost, billing));
         self.storage_writer.record_usage(TurnUsage {
             provider: provider.to_owned(),
+            account: account.unwrap_or_default().to_owned(),
             model: model.to_owned(),
             cwd: self.state.session.cwd.clone(),
             purpose,
@@ -7238,7 +7297,15 @@ impl App {
             Some((provider, model)) => (provider.to_owned(), model.to_owned()),
             None => (self.state.model.provider.to_string(), spec.to_owned()),
         };
-        self.record_model_usage(&provider, &model, LedgerPurpose::Goal, usage, cost, billing);
+        self.record_model_usage(
+            &provider,
+            None,
+            &model,
+            LedgerPurpose::Goal,
+            usage,
+            cost,
+            billing,
+        );
     }
 
     /// The session's running spend, filed under whoever pays for it. Every
@@ -7287,6 +7354,7 @@ impl App {
         add_chat_spend(self.main_chat(), spend.cost, spend.billing);
         self.record_model_usage(
             &spend.provider,
+            None,
             &spend.model,
             spend.purpose,
             spend.usage,
@@ -7461,6 +7529,7 @@ impl App {
         try_picker!(self.session_picker);
         try_picker!(self.session_relocation_picker);
         try_picker!(self.worktree_picker);
+        try_picker!(self.accounts_modal);
         try_picker!(self.question_form);
         try_picker!(self.login_picker);
         if !self.is_main_chat()

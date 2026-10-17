@@ -742,6 +742,7 @@ fn turn_complete_from(
         purpose,
         cost,
         billing: Billing::Api,
+        account: None,
         context_size: None,
         context_window,
     }))
@@ -13355,6 +13356,7 @@ fn the_lifetime_view_reads_spend_the_current_session_never_produced() {
     ledger
         .record(&TurnUsage {
             provider: LEDGER_PROVIDER.into(),
+            account: String::new(),
             model: LEDGER_MODEL.into(),
             cwd: LEDGER_CWD.into(),
             purpose: LedgerPurpose::Chat,
@@ -21299,6 +21301,7 @@ fn unfinished_openai_setup_does_not_seed_thinking(oauth: bool) {
         LoginPickerAction::AuthenticateProvider {
             provider: SubscriptionProvider::OpenAi,
             model_spec: OPENAI_SETUP_MODEL.into(),
+            account: None,
         }
     } else {
         LoginPickerAction::Close
@@ -28578,6 +28581,7 @@ mod theme_colours {
         open_system_prompt_modal, open_tools_modal, open_usage_modal, press_chord, queued_msg,
         test_app,
     };
+    use crate::components::accounts_modal;
     use crate::components::messages::ASSISTANT_LABEL;
     use crate::components::permission_prompt::{MCP_NOTE, mcp_request};
     use crate::components::sandbox_manager::SandboxView;
@@ -28753,6 +28757,11 @@ mod theme_colours {
             name: "decisions_modal",
             open: |app, _| open_decisions_modal(app),
             shown: |app| app.decisions_modal.is_open(),
+        },
+        Surface {
+            name: "accounts_modal",
+            open: |app, _| app.accounts_modal.open(accounts_modal::tests::pool()),
+            shown: |app| app.accounts_modal.is_open(),
         },
         Surface {
             name: "skills_modal",

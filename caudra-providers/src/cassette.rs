@@ -234,10 +234,6 @@ impl Provider for Recording {
         self.inner.reload_auth_if_changed()
     }
 
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        self.inner.rotate_key()
-    }
-
     fn adjust_model(&self, model: &mut Model) {
         self.inner.adjust_model(model);
     }

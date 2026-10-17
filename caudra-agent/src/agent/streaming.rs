@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use caudra_providers::accounts::Failover;
 use caudra_providers::provider::Provider;
 use caudra_providers::retry::{MAX_RETRIES, RetryDecision, RetryState};
 use caudra_providers::{
@@ -28,7 +29,6 @@ const FUNCTIONS_PREFIX: &str = "functions.";
 const EVENT_RETRY: &str = "provider_retry";
 const EVENT_RETRY_EXHAUSTED: &str = "provider_retry_exhausted";
 const EVENT_RETRY_RECOVERED: &str = "provider_retry_recovered";
-const EVENT_KEY_ROTATED: &str = "provider_key_rotated";
 const EVENT_REQUEST_FAILED: &str = "provider_request_failed";
 const EVENT_REQUEST_FINISHED: &str = "provider_request_finished";
 const UNREPRESENTABLE_RETRY_DELAY: &str = "unrepresentable_delay";
@@ -309,6 +309,17 @@ async fn forward_provider_events(
             aliases = current;
             continue;
         }
+        if let ProviderEvent::AccountRouted { account, switch } = pe {
+            if !progress_only
+                && let Some(tx) = event_tx
+                && tx
+                    .send(AgentEvent::AccountRouted { account, switch })
+                    .is_err()
+            {
+                break;
+            }
+            continue;
+        }
         if let ProviderEvent::ThinkingDelta { text } = &pe {
             run_started.get_or_insert_with(Instant::now);
             reasoning_text.push_str(text);
@@ -329,7 +340,7 @@ async fn forward_provider_events(
         let mut ready = (String::new(), Vec::new());
         let mut top_ready = None;
         let ae = match pe {
-            ProviderEvent::ToolAliases { .. } => continue,
+            ProviderEvent::ToolAliases { .. } | ProviderEvent::AccountRouted { .. } => continue,
             ProviderEvent::ToolInputReady {
                 id,
                 name,
@@ -542,6 +553,26 @@ impl From<StreamError> for AgentError {
     }
 }
 
+/// Lets a provider with several accounts move the conversation off one that
+/// refused it. True when another account takes the retry at once; a spent
+/// account nothing took over from is reported so the user can choose.
+async fn fail_over(
+    provider: &dyn Provider,
+    error: &AgentError,
+    cache_key: Option<&CacheKey>,
+    event_tx: Option<&EventSender>,
+) -> bool {
+    match provider.failover(error, cache_key).await {
+        Failover::Switched => true,
+        Failover::Stay { exhausted } => {
+            if let (Some(exhaustion), Some(event_tx)) = (exhausted, event_tx) {
+                let _ = event_tx.send(AgentEvent::AccountExhausted(Box::new(exhaustion)));
+            }
+            false
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct StreamRetry {
     state: RetryState,
@@ -552,7 +583,6 @@ impl StreamRetry {
     pub(crate) async fn wait(
         &mut self,
         error: AgentError,
-        provider: &dyn Provider,
         model: &Model,
         event_tx: Option<&EventSender>,
         cancel: &CancelToken,
@@ -562,18 +592,6 @@ impl StreamRetry {
             return Err(error);
         }
         let first_attempt_at = *self.first_attempt_at.get_or_insert_with(Instant::now);
-        if error.should_rotate_key()
-            && let Ok(true) = provider.rotate_key().await
-        {
-            warn!(
-                target: target::PROVIDER,
-                event = EVENT_KEY_ROTATED,
-                provider = %model.provider,
-                error_kind = error.kind(),
-                status = error.status(),
-                "rotated API key after error"
-            );
-        }
         let hint_ms = error
             .retry_after()
             .and_then(|after| u64::try_from(after.as_millis()).ok());
@@ -868,29 +886,36 @@ async fn stream_with_retry_inner(
                     reasoning,
                 });
             }
-            Err(e) if e.is_retryable() => {
-                emit_api_error(model, &e, retry.state.attempts() + 1, started.elapsed());
-                // The attempt's children outlive their ids: the message they
-                // were dispatched for is gone, so whatever they went on to
-                // report would name a row the retry will never draw. What
-                // already answered is kept, and the retried message either
-                // claims it or reports it.
-                if let Some(runs) = speculative {
-                    runs.abandon_unfinished();
-                }
-                retry
-                    .wait(e, provider, model, event_tx, cancel, retry_now)
-                    .await
-                    .map_err(|error| match error {
-                        AgentError::Cancelled => StreamError::Cancelled {
-                            streamed: String::new(),
-                            reasoning: Vec::new(),
-                        },
-                        error => StreamError::Other(error),
-                    })?;
-            }
             Err(e) => {
                 emit_api_error(model, &e, retry.state.attempts() + 1, started.elapsed());
+                let switched = fail_over(provider, &e, cache_key, event_tx).await;
+                if switched || e.is_retryable() {
+                    // The attempt's children outlive their ids: the message they
+                    // were dispatched for is gone, so whatever they went on to
+                    // report would name a row the retry will never draw. What
+                    // already answered is kept, and the retried message either
+                    // claims it or reports it.
+                    if let Some(runs) = speculative {
+                        runs.abandon_unfinished();
+                    }
+                    if switched {
+                        if forwarded && let Some(event_tx) = event_tx {
+                            event_tx.send(AgentEvent::StreamReset)?;
+                        }
+                        continue;
+                    }
+                    retry
+                        .wait(e, model, event_tx, cancel, retry_now)
+                        .await
+                        .map_err(|error| match error {
+                            AgentError::Cancelled => StreamError::Cancelled {
+                                streamed: String::new(),
+                                reasoning: Vec::new(),
+                            },
+                            error => StreamError::Other(error),
+                        })?;
+                    continue;
+                }
                 // The status is reported but never the body: see
                 // `error_description`.
                 warn!(
@@ -929,7 +954,7 @@ fn emit_api_request(model: &Model, r: &StreamResponse, opts: RequestOptions, too
     let usage = &r.usage;
     // A subscription's rates describe a bill that never arrives, so the spend
     // metric must not see them.
-    let (cost, subscription) = match model.billing {
+    let (cost, subscription) = match r.billing(model) {
         Billing::Api => (model.billed_cost(usage, opts.fast), None),
         Billing::Subscription => (None, model.billed_cost(usage, opts.fast)),
     };
@@ -1060,14 +1085,7 @@ mod tests {
             let nudge = Nudge::default();
             let mut retry = StreamRetry::default();
             retry
-                .wait(
-                    provider.error(),
-                    &provider,
-                    &model,
-                    Some(&sender),
-                    &cancel,
-                    &nudge,
-                )
+                .wait(provider.error(), &model, Some(&sender), &cancel, &nudge)
                 .await
                 .unwrap();
             let first_attempt_at = retry.first_attempt_at;
@@ -1104,7 +1122,7 @@ mod tests {
                 assert_eq!(retry.state.attempts(), 0);
                 assert_eq!(retry.first_attempt_at, None);
                 retry
-                    .wait(provider.error(), &provider, &model, None, &cancel, &nudge)
+                    .wait(provider.error(), &model, None, &cancel, &nudge)
                     .await
                     .unwrap();
                 assert_eq!(retry.state.attempts(), 1);
@@ -1117,14 +1135,7 @@ mod tests {
                 assert_eq!(retry.state.attempts(), MAX_RETRIES);
                 assert_eq!(retry.first_attempt_at, first_attempt_at);
                 let error = retry
-                    .wait(
-                        provider.error(),
-                        &provider,
-                        &model,
-                        Some(&sender),
-                        &cancel,
-                        &nudge,
-                    )
+                    .wait(provider.error(), &model, Some(&sender), &cancel, &nudge)
                     .await
                     .unwrap_err();
                 assert_eq!(error.to_string(), provider.error().to_string());
@@ -1149,14 +1160,7 @@ mod tests {
             let mut trigger = Some(trigger);
             let nudge = Nudge::default();
             let mut retry = StreamRetry::default();
-            let wait = retry.wait(
-                provider.error(),
-                &provider,
-                &model,
-                Some(&sender),
-                &cancel,
-                &nudge,
-            );
+            let wait = retry.wait(provider.error(), &model, Some(&sender), &cancel, &nudge);
             let (result, ()) = futures_lite::future::zip(wait, async {
                 let envelope = rx.recv_async().await.unwrap();
                 assert!(matches!(envelope.event, AgentEvent::Retry {
