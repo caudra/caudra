@@ -146,6 +146,17 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
+      # The release-profile workspace crates peak near the hosted runner's 16 GB at four jobs, and
+      # a runner out of memory stops without an error. Extra swap turns that into a slower build.
+      - name: Add swap for the release-profile build
+        continue-on-error: true
+        run: |
+          sudo fallocate -l 8G /caudra-build.swap
+          sudo chmod 600 /caudra-build.swap
+          sudo mkswap /caudra-build.swap
+          sudo swapon /caudra-build.swap
+          free -m
+
       - name: Build in Alpine container
         env:
           ALPINE_IMAGE: ${{ steps.worker.outputs.image }}
