@@ -97,9 +97,34 @@ Auto keeps subscription conversations on subscriptions. It moves one onto an API
 
 Claude and ChatGPT subscriptions report their quota with every response, so the readings stay current without extra requests. Other providers have a reading when they report usage, as `/usage` shows it. When a reading is older than 10 minutes, Caudra asks for a new one in the background, and no request waits for it. An account without a reading counts as Healthy. Running Caudra processes share readings and rate limits, so a second process skips an account the first found spent.
 
+## Across providers
+
+When every subscription of one provider runs out, Auto can move the conversation to a subscription of another provider. The model changes with it. Moving is off until the global `providers.toml` lists the providers to move across, first to last:
+
+```toml
+[switching]
+providers = ["anthropic", "openai"]
+```
+
+The list needs two or more providers. A conversation moves only while its provider is on Auto. A pinned provider is never left, and a provider the list leaves out is never left or entered. Only subscriptions take a moved conversation, never API keys.
+
+A conversation leaves its provider at its next request when every subscription there is Spent, refused, or rate limited for longer than 30 seconds. At a cold point, it also leaves when none of them is Healthy. It goes to the first provider in the list with a Healthy subscription, else the first with a Low one. When no provider has room, it stays and waits as before.
+
+On the new provider, the conversation takes the first of your [favorite models](/docs/providers/#model-jobs) there in the same [size lane](/docs/providers/#supply-metadata) as the model you chose, such as a flagship for a flagship. Without one, it takes that provider's default for the lane. A provider whose subscriptions cannot serve that model is skipped.
+
+At each cold point, a moved conversation goes back to the model you chose once that provider has a Healthy subscription again, or to a provider earlier in the list. A run moves at most twice, so two providers that both run out do not trade a conversation back and forth.
+
+Every move rebuilds the prompt cache on the new provider. The transcript records the move with its cause and cost:
+
+```text
+Switched to OpenAI gpt-6-astra: every Anthropic subscription is spent (5h 97% used). Prompt cache rebuilds (~84k tokens).
+```
+
+In the TUI, a move changes the model of every session, as choosing a model does, and choosing a model yourself ends the move. `--print` reports a move on stderr, and SDK mode as a `system` event with the subtype `model_rerouted`.
+
 ## In the TUI
 
-`/accounts` or `Ctrl+X i` lists the accounts of the current model's provider, with the quota left in each window, such as the 5-hour and weekly windows of a subscription, and when each one resets. Opening it asks every subscription whose reading is more than a minute old for a new one, and the list updates when they answer.
+`/accounts` or `Ctrl+X i` lists the accounts of every provider you signed in to, the current model's provider first, with the quota left in each window, such as the 5-hour and weekly windows of a subscription, and when each one resets. Opening it asks every subscription whose reading is more than a minute old for a new one, and the list updates when they answer.
 
 | Key | Action |
 |---|---|
@@ -110,9 +135,13 @@ Claude and ChatGPT subscriptions report their quota with every response, so the 
 | `d` | Sign out of the account and remove its `providers.toml` entry. Press it twice |
 | `Ctrl+↑` / `Ctrl+↓` | Move the account in the priority order |
 | `s` | Switch between `ordered` and `paced` |
+| `o` | Add the account's provider to the [order across providers](#across-providers), or drop it |
+| `Alt+↑` / `Alt+↓` | Move the account's provider in the order across providers |
 | `Ctrl+R` | Ask each account for a new quota reading |
 
-The order and the strategy are saved to `providers.toml`, which keeps its comments. Moving an account adds entries for the saved accounts the file does not list yet.
+Each key acts on the provider of the selected account. The first `o` on another provider's account lists the current model's provider first and that provider second.
+
+The orders and the strategy are saved to `providers.toml`, which keeps its comments. Moving an account adds entries for the saved accounts the file does not list yet.
 
 With two or more accounts, the status bar shows the account the conversation uses and the quota it has left, as `[auto·personal 41%]`. `auto·` means Auto is selected. The chip takes the warning color below `prefer_below` and the error color below `switch_below`. Click it to open `/accounts`.
 

@@ -178,6 +178,10 @@ async fn refresh_remote_context(
 pub(crate) struct ModelSlot {
     pub(crate) model: Model,
     pub(crate) provider: Arc<dyn Provider>,
+    /// The model the user chose, while their subscriptions ran out and the
+    /// conversation moved to `model` on another provider. A pick replaces the
+    /// slot, which drops it.
+    pub(crate) home: Option<Model>,
 }
 
 /// The prefix of the last live request and the route that sent it, captured
@@ -1256,6 +1260,7 @@ mod tests {
         let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
             model: crate::components::test_model(),
             provider,
+            home: None,
         }));
         let permissions = Arc::new(PermissionManager::new_nonpersistent(
             PermissionsConfig::default(),
@@ -1427,6 +1432,7 @@ mod tests {
         model_slot.store(Arc::new(ModelSlot {
             model: switched,
             provider,
+            home: None,
         }));
         let rebuilt = ask(&handles, &received, FIRST_RUN);
 
@@ -1576,6 +1582,7 @@ mod tests {
         model_slot.store(Arc::new(ModelSlot {
             model: switched,
             provider,
+            home: None,
         }));
         let rebuilt = ask(&handles, &received, app.run_id);
 
@@ -1738,6 +1745,7 @@ mod tests {
         handles.effective_model_slot.store(Arc::new(ModelSlot {
             model,
             provider: Arc::clone(&selected.provider),
+            home: None,
         }));
         assert_eq!((host.mode)(), mode);
         assert_eq!((host.model)().1.id, COMMITTED_MODEL);
@@ -1815,6 +1823,7 @@ mod tests {
         model_slot.store(Arc::new(ModelSlot {
             model: selected_model,
             provider: Arc::clone(&committed.provider),
+            home: None,
         }));
         app.state.mode = if mode.is_planning() {
             Mode::Build
@@ -1886,12 +1895,14 @@ mod tests {
         handles.effective_model_slot.store(Arc::new(ModelSlot {
             model: committed_model.clone(),
             provider: Arc::clone(&provider),
+            home: None,
         }));
         let mut selected_model = committed_model;
         selected_model.id = SELECTED_MODEL.into();
         model_slot.store(Arc::new(ModelSlot {
             model: selected_model,
             provider,
+            home: None,
         }));
         respawn(&mut handles, &model_slot, &permissions, &mut app);
         if workflow {
@@ -2134,6 +2145,7 @@ mod tests {
         handles.effective_model_slot.store(Arc::new(ModelSlot {
             model: crate::components::test_model(),
             provider: Arc::new(StubProvider(Some(requests))),
+            home: None,
         }));
         fixture.script(
             &fixture.user_scripts(),

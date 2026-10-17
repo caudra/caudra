@@ -21,7 +21,7 @@ use caudra_storage::thinking::{EFFORT_NONE, StoredThinking, effort_rank};
 use caudra_storage::tool_outputs::ToolOutputRef;
 use serde::{Deserialize, Serialize};
 
-use crate::accounts::{AccountSwitch, QuotaWindow, RoutedAccount, WindowKind};
+use crate::accounts::{AccountSwitch, CrossRoute, QuotaWindow, RoutedAccount, WindowKind};
 use serde_json::{Map, Value, json};
 use strum::{Display, IntoStaticStr};
 use tracing::warn;
@@ -1521,6 +1521,9 @@ pub struct RequestOptions {
     pub thinking: ThinkingConfig,
     /// Raw user preference, reconciled by [`RequestOptions::clamped`] before use.
     pub fast: bool,
+    /// Where the conversation may go once its provider's subscriptions run
+    /// low, when `providers.toml` lists a provider order.
+    pub cross: Option<Arc<CrossRoute>>,
 }
 
 impl RequestOptions {
@@ -1536,6 +1539,7 @@ impl RequestOptions {
                 ThinkingConfig::Off
             },
             fast: self.fast && model.supports_fast(),
+            cross: self.cross.clone(),
         }
     }
 }
@@ -2479,6 +2483,7 @@ mod tests {
         let thinking = RequestOptions {
             thinking: ThinkingConfig::Off,
             fast: false,
+            ..RequestOptions::default()
         }
         .clamped(&model)
         .thinking;
@@ -2569,6 +2574,7 @@ mod tests {
         let opts = RequestOptions {
             thinking,
             fast: false,
+            ..RequestOptions::default()
         };
         assert_eq!(opts.clamped(&model).thinking, expected);
     }
@@ -2579,6 +2585,7 @@ mod tests {
         let opts = RequestOptions {
             thinking: ThinkingConfig::Off,
             fast: true,
+            ..RequestOptions::default()
         };
         assert!(!opts.clamped(&model).fast);
     }

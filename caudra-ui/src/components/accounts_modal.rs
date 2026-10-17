@@ -1,6 +1,7 @@
-//! `/accounts`: where each of a provider's accounts stands, which one
-//! requests go to, and the card a spent account raises so the user can move
-//! elsewhere instead of waiting for it to refill.
+//! `/accounts`: where every provider's accounts stand, which one requests go
+//! to, the order Auto moves conversations across providers in, and the card a
+//! spent account raises so the user can move elsewhere instead of waiting for
+//! it to refill.
 
 use std::mem;
 
@@ -55,6 +56,10 @@ const NOT_SAVED: &str = "is not a saved account";
 const WAIT: &str = "Wait for it to refill";
 const BROWSE: &str = "Choose another account…";
 const TURN_ON_AUTO: &str = "Switch and turn on Auto";
+const ORDER_ARROW: &str = " → ";
+const ORDER_HINT: &str = "o adds or drops a provider, Alt+↑↓ moves it.";
+const SAME_PROVIDER: &str =
+    "Select another provider's account: o lets Auto move conversations there.";
 
 const AUTO_KEY: Bind = letter('a', "a");
 const ADD_KEY: Bind = letter('n', "n");
@@ -71,6 +76,17 @@ const MOVE_DOWN_KEY: Bind = Bind {
     modifiers: KeyModifiers::CONTROL,
     label: "Ctrl+↓",
 };
+const ORDER_KEY: Bind = letter('o', "o");
+const PROVIDER_UP_KEY: Bind = Bind {
+    code: KeyCode::Up,
+    modifiers: KeyModifiers::ALT,
+    label: "Alt+↑",
+};
+const PROVIDER_DOWN_KEY: Bind = Bind {
+    code: KeyCode::Down,
+    modifiers: KeyModifiers::ALT,
+    label: "Alt+↓",
+};
 
 const fn letter(char: char, label: &'static str) -> Bind {
     Bind {
@@ -80,8 +96,9 @@ const fn letter(char: char, label: &'static str) -> Bind {
     }
 }
 
-/// What the user asked of the provider's accounts. The modal changes
-/// nothing itself: the app applies it and hands back a fresh [`AccountsView`].
+/// What the user asked of the selected provider's accounts, or of the order
+/// across providers. The modal changes nothing itself: the app applies it and
+/// hands back a fresh [`AccountsView`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum AccountsAction {
     Consumed,
@@ -106,6 +123,8 @@ pub enum AccountsAction {
         offset: isize,
     },
     Strategy(SwitchStrategy),
+    /// The providers Auto moves a conversation across, first to last.
+    ProviderOrder(Vec<String>),
     Refresh,
     /// The card's way to the full list.
     Browse,
@@ -113,18 +132,44 @@ pub enum AccountsAction {
 
 /// One provider's pool as `/accounts` lists it.
 #[derive(Debug, Clone)]
-pub struct AccountsView {
+pub struct ProviderAccounts {
     pub provider: String,
     pub display: String,
     pub pool: PoolStatus,
-    /// The account this session's last request went to.
+    /// The account this session's last request to it went to.
     pub current: Option<String>,
+}
+
+/// Every provider with an account, the model's first.
+#[derive(Debug, Clone)]
+pub struct AccountsView {
+    pub providers: Vec<ProviderAccounts>,
+    /// The providers Auto moves a conversation across, empty while it keeps
+    /// every conversation on its provider.
+    pub order: Vec<String>,
     pub now_ms: u64,
     pub clock: ClockFormat,
 }
 
-struct AccountRow {
+impl AccountsView {
+    fn pool(&self, provider: &str) -> Option<&ProviderAccounts> {
+        self.providers.iter().find(|pool| pool.provider == provider)
+    }
+
+    fn display<'a>(&'a self, provider: &'a str) -> &'a str {
+        self.pool(provider)
+            .map_or(provider, |pool| pool.display.as_str())
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct RowKey {
+    provider: String,
     name: String,
+}
+
+struct AccountRow {
+    key: RowKey,
     label: String,
     detail: String,
     info: String,
@@ -175,7 +220,7 @@ impl PickerItem for CardRow {
 
 enum Stage {
     List { pending_remove: Option<String> },
-    Rename(String, Box<TextField>),
+    Rename(RowKey, Box<TextField>),
     Card(Box<AccountExhaustion>),
 }
 
@@ -222,23 +267,21 @@ impl AccountsModal {
         let Some(flow) = &mut self.flow else {
             return;
         };
-        if flow.view.provider != view.provider {
-            return;
-        }
-        let keep = self.picker.selected_item().map(|row| row.name.clone());
+        let keep = self.picker.selected_item().map(|row| row.key.clone());
         flow.view = view;
         if matches!(flow.stage, Stage::List { .. }) {
             flow.stage = Stage::List {
                 pending_remove: None,
             };
-            self.show_list(keep.as_deref());
+            self.show_list(keep.as_ref());
             self.picker.set_error_text(error);
         }
     }
 
     /// Selects `name` once the list is redrawn, as after a move.
-    pub fn select(&mut self, name: &str) {
-        self.picker.select_item_by(|row| row.name == name);
+    pub fn select(&mut self, provider: &str, name: &str) {
+        self.picker
+            .select_item_by(|row| row.key.provider == provider && row.key.name == name);
         self.sync_info();
     }
 
@@ -261,7 +304,7 @@ impl AccountsModal {
             return;
         }
         let rows = card_rows(&exhaustion, view.now_ms, view.clock);
-        let title = card_title(&view.display, &exhaustion);
+        let title = card_title(view.display(&exhaustion.provider), &exhaustion);
         let info = card_info(&exhaustion, view.now_ms, view.clock);
         self.picker.close();
         self.flow = Some(Flow {
@@ -273,8 +316,17 @@ impl AccountsModal {
         self.card.open(rows, title);
     }
 
+    /// The provider a key acts on: the selected account's, the one being
+    /// renamed, or the spent one the card is about.
     pub fn provider(&self) -> Option<&str> {
-        self.flow.as_ref().map(|flow| flow.view.provider.as_str())
+        match &self.flow.as_ref()?.stage {
+            Stage::Card(exhaustion) => Some(&exhaustion.provider),
+            Stage::Rename(key, _) => Some(&key.provider),
+            Stage::List { .. } => self
+                .picker
+                .selected_item()
+                .map(|row| row.key.provider.as_str()),
+        }
     }
 
     pub fn is_open(&self) -> bool {
@@ -402,7 +454,7 @@ impl AccountsModal {
 
     #[cfg(test)]
     pub(crate) fn selected_name(&self) -> Option<&str> {
-        self.picker.selected_item().map(|row| row.name.as_str())
+        self.picker.selected_item().map(|row| row.key.name.as_str())
     }
 
     #[cfg(test)]
@@ -435,18 +487,29 @@ impl AccountsModal {
             return AccountsAction::SignIn(None);
         }
         if STRATEGY_KEY.matches(event) {
-            let strategy = match self.flow.as_ref().map(|flow| flow.view.pool.strategy) {
+            let strategy = match self.selected_pool().map(|pool| pool.pool.strategy) {
                 Some(SwitchStrategy::Ordered) => SwitchStrategy::Paced,
                 _ => SwitchStrategy::Ordered,
             };
             return AccountsAction::Strategy(strategy);
+        }
+        if ORDER_KEY.matches(event) {
+            return self.answer_order(toggled_order);
+        }
+        for (bind, offset) in [(PROVIDER_UP_KEY, -1), (PROVIDER_DOWN_KEY, 1)] {
+            if bind.matches(event) {
+                return self.answer_order(|view, provider| moved_order(view, provider, offset));
+            }
         }
         let Some(account) = selected else {
             return self.forward_to_list(event);
         };
         if RENAME_KEY.matches(event) {
             return match orderable(&account) {
-                true => self.start_rename(account.name),
+                true => self.start_rename(RowKey {
+                    provider: self.provider().unwrap_or_default().to_owned(),
+                    name: account.name,
+                }),
                 false => self.refuse(&account),
             };
         }
@@ -515,7 +578,7 @@ impl AccountsModal {
                 AccountsAction::Closed
             }
             PickerAction::Select(row) => {
-                let Some(name) = parse_name(&row.name) else {
+                let Some(name) = parse_name(&row.key.name) else {
                     return AccountsAction::Consumed;
                 };
                 match row.signed_out {
@@ -564,15 +627,35 @@ impl AccountsModal {
         }
     }
 
+    fn selected_pool(&self) -> Option<&ProviderAccounts> {
+        let provider = &self.picker.selected_item()?.key.provider;
+        self.flow.as_ref()?.view.pool(provider)
+    }
+
     fn selected_account(&self) -> Option<&AccountStatus> {
-        let name = &self.picker.selected_item()?.name;
-        self.flow
-            .as_ref()?
-            .view
+        let name = &self.picker.selected_item()?.key.name;
+        self.selected_pool()?
             .pool
             .accounts
             .iter()
             .find(|account| &account.name == name)
+    }
+
+    /// The order a key asks for, or why it cannot have one.
+    fn answer_order(
+        &mut self,
+        change: impl FnOnce(&AccountsView, &str) -> Result<Vec<String>, String>,
+    ) -> AccountsAction {
+        let (Some(flow), Some(row)) = (&self.flow, self.picker.selected_item()) else {
+            return AccountsAction::Consumed;
+        };
+        match change(&flow.view, &row.key.provider) {
+            Ok(order) => AccountsAction::ProviderOrder(order),
+            Err(error) => {
+                self.picker.set_error_text(Some(error));
+                AccountsAction::Consumed
+            }
+        }
     }
 
     fn refuse(&mut self, account: &AccountStatus) -> AccountsAction {
@@ -588,13 +671,13 @@ impl AccountsModal {
         AccountsAction::Consumed
     }
 
-    fn start_rename(&mut self, name: String) -> AccountsAction {
+    fn start_rename(&mut self, key: RowKey) -> AccountsAction {
         let Some(flow) = &mut self.flow else {
             return AccountsAction::Consumed;
         };
-        let field = Box::new(TextField::with_text(FieldKind::Line, &name));
-        let title = format!(" Rename {name} ");
-        flow.stage = Stage::Rename(name, field);
+        let field = Box::new(TextField::with_text(FieldKind::Line, &key.name));
+        let title = format!(" Rename {} ", key.name);
+        flow.stage = Stage::Rename(key, field);
         self.picker.set_error_text(None);
         self.picker.set_info_text(Some(RENAME_HINT.into()));
         self.picker.set_footer_builder(rename_footer);
@@ -618,7 +701,7 @@ impl AccountsModal {
             return AccountsAction::Consumed;
         };
         let typed = field.text().trim().to_owned();
-        let from = from.clone();
+        let from = from.name.clone();
         if typed == from {
             self.back_to_list();
             return AccountsAction::Consumed;
@@ -646,35 +729,48 @@ impl AccountsModal {
                 pending_remove: None,
             },
         ) {
-            Stage::Rename(name, _) => Some(name),
+            Stage::Rename(key, _) => Some(key),
             Stage::Card(shown) => {
                 self.waiting = Some(shown);
                 None
             }
             Stage::List { .. } => None,
         };
-        self.show_list(keep.as_deref());
+        self.show_list(keep.as_ref());
     }
 
-    fn show_list(&mut self, keep: Option<&str>) {
+    fn show_list(&mut self, keep: Option<&RowKey>) {
         let Some(flow) = &self.flow else {
             return;
         };
         let view = &flow.view;
+        let several = view.providers.len() > 1;
         let rows: Vec<AccountRow> = view
-            .pool
-            .accounts
+            .providers
             .iter()
-            .map(|account| account_row(view, account))
+            .flat_map(|pool| {
+                pool.pool
+                    .accounts
+                    .iter()
+                    .map(move |account| account_row(view, pool, account, several))
+            })
             .collect();
-        let in_use = in_use(view).map(str::to_owned);
+        let target = keep.cloned().or_else(|| {
+            let pool = view.providers.first()?;
+            Some(RowKey {
+                provider: pool.provider.clone(),
+                name: in_use(pool)?.to_owned(),
+            })
+        });
+        let title = match (several, view.providers.first()) {
+            (false, Some(pool)) => format!(" Accounts{SEPARATOR}{} ", pool.display),
+            _ => " Accounts ".to_owned(),
+        };
         self.picker.set_error_text(None);
         self.picker.set_footer_builder(list_footer);
-        self.picker
-            .open(rows, format!(" Accounts{SEPARATOR}{} ", view.display));
-        let target = keep.map(str::to_owned).or(in_use);
+        self.picker.open(rows, title);
         if let Some(target) = target {
-            self.picker.select_item_by(|row| row.name == target);
+            self.picker.select_item_by(|row| row.key == target);
         }
         self.sync_info();
     }
@@ -689,11 +785,15 @@ impl AccountsModal {
         }
         let view = &flow.view;
         let lines = view
-            .pool
-            .accounts
-            .iter()
-            .find(|account| account.name == row.name)
-            .map(|account| info_lines(view, account))
+            .pool(&row.key.provider)
+            .and_then(|pool| {
+                let account = pool
+                    .pool
+                    .accounts
+                    .iter()
+                    .find(|account| account.name == row.key.name)?;
+                Some(info_lines(view, pool, account))
+            })
             .unwrap_or_default();
         self.picker.set_info_lines(Some(lines));
     }
@@ -743,11 +843,73 @@ fn orderable(account: &AccountStatus) -> bool {
         )
 }
 
-fn in_use(view: &AccountsView) -> Option<&str> {
-    match &view.pool.selection {
+fn in_use(pool: &ProviderAccounts) -> Option<&str> {
+    match &pool.pool.selection {
         AccountSelection::Pinned(name) => Some(name.as_str()),
-        AccountSelection::Auto => view.current.as_deref(),
+        AccountSelection::Auto => pool.current.as_deref(),
     }
+}
+
+/// `provider` joins the order last, or leaves it. The first provider to join
+/// comes after the model's, so its conversations have somewhere to go.
+fn toggled_order(view: &AccountsView, provider: &str) -> Result<Vec<String>, String> {
+    let mut order = view.order.clone();
+    if let Some(index) = order.iter().position(|entry| entry == provider) {
+        order.remove(index);
+        return Ok(order);
+    }
+    if order.is_empty() {
+        let home = view
+            .providers
+            .first()
+            .map(|pool| pool.provider.clone())
+            .filter(|home| home != provider)
+            .ok_or_else(|| SAME_PROVIDER.to_owned())?;
+        order.push(home);
+    }
+    order.push(provider.to_owned());
+    Ok(order)
+}
+
+fn moved_order(view: &AccountsView, provider: &str, offset: isize) -> Result<Vec<String>, String> {
+    let mut order = view.order.clone();
+    let index = order
+        .iter()
+        .position(|entry| entry == provider)
+        .ok_or_else(|| {
+            format!(
+                "{} is not in the order across providers. o adds it.",
+                view.display(provider)
+            )
+        })?;
+    let target = index
+        .checked_add_signed(offset)
+        .filter(|target| *target < order.len())
+        .unwrap_or(index);
+    order.swap(index, target);
+    Ok(order)
+}
+
+/// Shown only once there is another provider to move to.
+fn order_line(view: &AccountsView) -> Option<String> {
+    if view.order.is_empty() {
+        let home = view.providers.first()?;
+        return (view.providers.len() > 1).then(|| {
+            format!(
+                "Conversations stay on their provider. o on another provider's account lets Auto move them there once every {} subscription is spent.",
+                home.display
+            )
+        });
+    }
+    let order: Vec<&str> = view
+        .order
+        .iter()
+        .map(|provider| view.display(provider))
+        .collect();
+    Some(format!(
+        "Across providers: {}, once every subscription of one is spent. {ORDER_HINT}",
+        order.join(ORDER_ARROW)
+    ))
 }
 
 fn tier_style(tier: AccountTier) -> Style {
@@ -786,19 +948,31 @@ fn policy_line(pool: &PoolStatus) -> String {
     }
 }
 
-fn account_row(view: &AccountsView, account: &AccountStatus) -> AccountRow {
-    let mark = match in_use(view) == Some(account.name.as_str()) {
+fn account_row(
+    view: &AccountsView,
+    pool: &ProviderAccounts,
+    account: &AccountStatus,
+    several: bool,
+) -> AccountRow {
+    let mark = match in_use(pool) == Some(account.name.as_str()) {
         true => IN_USE_MARK,
         false => IDLE_MARK,
     };
-    let info = info_lines(view, account)
+    let info = info_lines(view, pool, account)
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
+    let label = match several {
+        true => format!("{mark} {}{SEPARATOR}{}", pool.display, account.name),
+        false => format!("{mark} {}", account.name),
+    };
     AccountRow {
-        name: account.name.clone(),
-        label: format!("{mark} {}", account.name),
+        key: RowKey {
+            provider: pool.provider.clone(),
+            name: account.name.clone(),
+        },
+        label,
         detail: account_detail(account, view.now_ms),
         info,
         tier: account.tier,
@@ -853,10 +1027,15 @@ fn left_percent(window: &QuotaWindow, now_ms: u64) -> u8 {
     window.left_percent(now_ms).round().clamp(0.0, FULL_PERCENT) as u8
 }
 
-fn info_lines(view: &AccountsView, account: &AccountStatus) -> Vec<Line<'static>> {
+fn info_lines(
+    view: &AccountsView,
+    pool: &ProviderAccounts,
+    account: &AccountStatus,
+) -> Vec<Line<'static>> {
     let theme = theme::current();
     let dim = theme.status_dim;
-    let mut lines = vec![Line::from(policy_line(&view.pool))];
+    let mut lines = vec![Line::from(policy_line(&pool.pool))];
+    lines.extend(order_line(view).map(Line::from));
     let note = |text: &str| Line::from(Span::styled(format!("{INDENT}{text}"), dim));
     if account.kind == AccountKind::SignedOut {
         lines.push(note(SIGNED_OUT_HINT));
@@ -894,21 +1073,26 @@ fn info_lines(view: &AccountsView, account: &AccountStatus) -> Vec<Line<'static>
                 account
                     .windows
                     .iter()
-                    .map(|window| quota_line(window, width, view)),
+                    .map(|window| quota_line(window, width, view, &pool.pool)),
             );
         }
     }
     lines
 }
 
-fn quota_line(window: &QuotaWindow, width: usize, view: &AccountsView) -> Line<'static> {
+fn quota_line(
+    window: &QuotaWindow,
+    width: usize,
+    view: &AccountsView,
+    pool: &PoolStatus,
+) -> Line<'static> {
     let theme = theme::current();
     let left = left_percent(window, view.now_ms);
     let used = usize::from(100 - left);
     let (filled, cells) = fill(used * GAUGE_CELLS * CELL_EIGHTHS / 100);
     let tier = match left {
-        left if left < view.pool.switch_below => AccountTier::Spent,
-        left if left < view.pool.prefer_below => AccountTier::Low,
+        left if left < pool.switch_below => AccountTier::Spent,
+        left if left < pool.prefer_below => AccountTier::Low,
         _ => AccountTier::Healthy,
     };
     let mut spans = vec![
@@ -1010,6 +1194,7 @@ fn list_footer() -> Vec<Hint> {
         Hint::bind(REMOVE_KEY, "remove"),
         Hint::inert("Ctrl+↑↓", "order"),
         Hint::bind(STRATEGY_KEY, "strategy"),
+        Hint::bind(ORDER_KEY, "across providers"),
         Hint::bind(key::REFRESH, "refresh"),
         Hint::bind(key::ESC, "close"),
     ]
@@ -1040,6 +1225,8 @@ pub(crate) mod tests {
 
     const PROVIDER: &str = "anthropic";
     const DISPLAY: &str = "Anthropic";
+    const OPENAI: &str = "openai";
+    const OPENAI_DISPLAY: &str = "OpenAI";
     const PERSONAL: &str = "personal";
     const WORK: &str = "work";
     const API: &str = "api";
@@ -1070,12 +1257,17 @@ pub(crate) mod tests {
         account(name, AccountKind::Subscription, Billing::Subscription)
     }
 
-    fn view(selection: AccountSelection, accounts: Vec<AccountStatus>) -> AccountsView {
-        AccountsView {
-            provider: PROVIDER.into(),
-            display: DISPLAY.into(),
+    fn provider(
+        provider: &str,
+        display: &str,
+        selection: AccountSelection,
+        accounts: Vec<AccountStatus>,
+    ) -> ProviderAccounts {
+        ProviderAccounts {
+            provider: provider.into(),
+            display: display.into(),
             pool: PoolStatus {
-                provider: PROVIDER.into(),
+                provider: provider.into(),
                 selection,
                 overridden: false,
                 strategy: SwitchStrategy::Ordered,
@@ -1084,9 +1276,94 @@ pub(crate) mod tests {
                 accounts,
             },
             current: None,
+        }
+    }
+
+    fn view(selection: AccountSelection, accounts: Vec<AccountStatus>) -> AccountsView {
+        AccountsView {
+            providers: vec![provider(PROVIDER, DISPLAY, selection, accounts)],
+            order: Vec::new(),
             now_ms: NOW_MS,
             clock: ClockFormat::default(),
         }
+    }
+
+    /// Anthropic's pool, then OpenAI's, in `order`.
+    fn two_providers(order: &[&str]) -> AccountsView {
+        let mut shown = pool();
+        shown.providers.push(provider(
+            OPENAI,
+            OPENAI_DISPLAY,
+            AccountSelection::Auto,
+            vec![subscription(PERSONAL)],
+        ));
+        shown.order = order
+            .iter()
+            .map(|provider| (*provider).to_owned())
+            .collect();
+        shown
+    }
+
+    fn to_openai(modal: &mut AccountsModal) {
+        for _ in 0..3 {
+            down(modal);
+        }
+        assert_eq!(modal.provider(), Some(OPENAI));
+    }
+
+    fn order(providers: &[&str]) -> AccountsAction {
+        AccountsAction::ProviderOrder(
+            providers
+                .iter()
+                .map(|provider| (*provider).to_owned())
+                .collect(),
+        )
+    }
+
+    #[test_case(&[], ORDER_KEY, order(&[PROVIDER, OPENAI]) ; "o_routes_the_model_provider_to_it")]
+    #[test_case(&[PROVIDER, OPENAI], ORDER_KEY, order(&[PROVIDER]) ; "o_drops_it_again")]
+    #[test_case(&[PROVIDER, OPENAI], PROVIDER_UP_KEY, order(&[OPENAI, PROVIDER]) ; "alt_up_moves_it_earlier")]
+    #[test_case(&[PROVIDER, OPENAI], PROVIDER_DOWN_KEY, order(&[PROVIDER, OPENAI]) ; "alt_down_stops_at_the_end")]
+    fn a_key_changes_the_order_across_providers(
+        current: &[&str],
+        bind: Bind,
+        expected: AccountsAction,
+    ) {
+        let mut modal = opened(two_providers(current));
+        to_openai(&mut modal);
+
+        assert_eq!(press(&mut modal, bind), expected);
+    }
+
+    #[test_case(ORDER_KEY ; "the_model_provider_cannot_route_to_itself")]
+    #[test_case(PROVIDER_UP_KEY ; "a_provider_outside_the_order_cannot_move")]
+    fn an_order_change_that_cannot_apply_is_refused(bind: Bind) {
+        let mut modal = opened(two_providers(&[]));
+
+        assert_eq!(press(&mut modal, bind), AccountsAction::Consumed);
+    }
+
+    #[test]
+    fn every_provider_is_listed_under_its_name() {
+        let mut modal = opened(two_providers(&[]));
+        to_openai(&mut modal);
+
+        assert_eq!(modal.selected_name(), Some(PERSONAL));
+        assert_eq!(
+            modal.picker.selected_item().map(|row| row.label.as_str()),
+            Some("○ OpenAI · personal")
+        );
+    }
+
+    #[test_case(&[], Some("Conversations stay on their provider. o on another provider's account lets Auto move them there once every Anthropic subscription is spent.") ; "off")]
+    #[test_case(&[OPENAI, PROVIDER], Some("Across providers: OpenAI → Anthropic, once every subscription of one is spent. o adds or drops a provider, Alt+↑↓ moves it.") ; "on")]
+    fn the_order_line_says_where_conversations_go(current: &[&str], expected: Option<&str>) {
+        assert_eq!(order_line(&two_providers(current)).as_deref(), expected);
+    }
+
+    #[test]
+    fn one_provider_has_no_order_line() {
+        assert_eq!(order_line(&pool()), None);
     }
 
     pub(crate) fn pool() -> AccountsView {
@@ -1328,10 +1605,10 @@ pub(crate) mod tests {
             None => view(AccountSelection::Auto, vec![subscription(PERSONAL)]),
         };
         if let Some(strategy) = strategy {
-            shown.pool.strategy = strategy;
+            shown.providers[0].pool.strategy = strategy;
         }
 
-        assert_eq!(policy_line(&shown.pool), expected);
+        assert_eq!(policy_line(&shown.providers[0].pool), expected);
     }
 
     #[test]

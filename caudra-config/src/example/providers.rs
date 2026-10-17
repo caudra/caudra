@@ -1,8 +1,9 @@
 use crate::decisions::DecisionEndpoint;
 use crate::files;
 use crate::providers::{
-    AccountDef, BUILTIN_IGNORED_FIELDS, BUILTIN_MODEL_FIELDS, ModelDef, ModelFields,
-    OverrideFields, PROVIDERS_VERSION, PURPOSE_FIELDS, ProviderDef, ProviderOverride, SwitchingDef,
+    AccountDef, BUILTIN_IGNORED_FIELDS, BUILTIN_MODEL_FIELDS, GlobalSwitchingDef, ModelDef,
+    ModelFields, OverrideFields, PROVIDERS_VERSION, PURPOSE_FIELDS, ProviderDef, ProviderOverride,
+    SWITCHING_KEY, SwitchingDef,
 };
 
 use super::{Document, Header, RECORDS_USAGE, Table, code_list, global_location, preamble};
@@ -15,6 +16,7 @@ pub const SWITCHING: &str = "my-provider.switching";
 pub const ACCOUNTS: &str = "my-provider.accounts";
 pub const UPSTREAM: &str = "aperture.overrides.llmserver";
 pub const DECISION_ENDPOINT: &str = "decisions.my-endpoint";
+pub const PROVIDER_ORDER: &str = SWITCHING_KEY;
 const REWRITES: &str = "`caudra auth login` and `caudra auth logout` replace only the table they \
      change, and keep the rest of the file and its comments.";
 const PURPOSES_ABOUT: &str = "Which models of my-provider are small and which are flagships. Each \
@@ -36,6 +38,9 @@ const UPSTREAM_ABOUT: &str = "Aperture routes the models of upstream providers a
 const DECISION_ENDPOINT_ABOUT: &str = "One decision endpoint, named my-endpoint here. Configuring \
      it is the consent to send decision context to it, and `/decision-model` or `caudra decisions \
      use` makes it the active one.";
+const PROVIDER_ORDER_ABOUT: &str = "Lets Auto move a conversation to another provider's \
+     subscription when its own provider's subscriptions run low. It applies only to a provider \
+     whose selection is Auto, and every move loses the prompt cache.";
 
 /// Every `providers.toml` key, on an example custom provider, an Aperture
 /// upstream, and a decision endpoint.
@@ -77,6 +82,11 @@ pub fn document() -> Document {
                 DecisionEndpoint::FIELDS,
             )
             .about(DECISION_ENDPOINT_ABOUT),
+            Table::of(
+                Header::Record(PROVIDER_ORDER.into()),
+                GlobalSwitchingDef::FIELDS,
+            )
+            .about(PROVIDER_ORDER_ABOUT),
         ],
     }
 }
@@ -103,15 +113,15 @@ mod tests {
     use serde::Serialize;
 
     use super::{
-        ACCOUNTS, DECISION_ENDPOINT, MODEL_DEFAULTS, MODELS, PROVIDER, PURPOSES, SWITCHING,
-        UPSTREAM, document,
+        ACCOUNTS, DECISION_ENDPOINT, MODEL_DEFAULTS, MODELS, PROVIDER, PROVIDER_ORDER, PURPOSES,
+        SWITCHING, UPSTREAM, document,
     };
     use crate::decisions::{DecisionEndpoint, DecisionEndpointDef, DecisionProtocol};
     use crate::example::Render;
     use crate::providers::{
-        AccountDef, ModelDef, ModelFields, ModelPurpose, OverrideFields, Protocol, ProviderDef,
-        ProviderOverride, ProvidersConfig, PurposeModels, QuotaWindowName, SwitchStrategy,
-        SwitchingDef,
+        AccountDef, GlobalSwitchingDef, ModelDef, ModelFields, ModelPurpose, OverrideFields,
+        Protocol, ProviderDef, ProviderOverride, ProvidersConfig, PurposeModels, QuotaWindowName,
+        SwitchStrategy, SwitchingDef,
     };
 
     const TEXT: &str = "text";
@@ -187,6 +197,7 @@ mod tests {
         let reference = parse(Render::Reference);
         assert!(reference.providers.is_empty());
         assert!(reference.decisions.is_empty());
+        assert!(reference.switching.is_none());
     }
 
     #[test]
@@ -252,5 +263,11 @@ mod tests {
         assert_eq!(names(ACCOUNTS), keys(account));
         assert_eq!(names(UPSTREAM), keys(upstream));
         assert_eq!(names(DECISION_ENDPOINT), keys(endpoint));
+        assert_eq!(
+            names(PROVIDER_ORDER),
+            keys(GlobalSwitchingDef {
+                providers: vec![TEXT.into()],
+            })
+        );
     }
 }

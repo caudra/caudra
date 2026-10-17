@@ -14,6 +14,7 @@ use futures_lite::future;
 use serde_json::{Map, Value, json};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
+use caudra_providers::accounts::{self, Reroute};
 use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::{self, Provider};
 use caudra_providers::{
@@ -109,6 +110,9 @@ use caudra_storage::usage_ledger::LedgerPurpose;
 use caudra_workspace::WorkspaceSession;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
+/// Moves to another provider one request may make before the run gives up,
+/// enough to leave a spent provider and skip one that turned out spent too.
+const MAX_REROUTES: u32 = 2;
 const SKILL_NONE: &str = "none";
 const SKILL_QUESTION_SET: &str = "skill.v1";
 const SKILL_QUESTION: &str = "skill";
@@ -389,6 +393,13 @@ pub struct AgentParams {
     pub workflow: Option<WorkflowHandle>,
 }
 
+/// See [`Agent::conversation_route`].
+pub struct ConversationRoute {
+    pub provider: Arc<dyn Provider>,
+    pub model: Model,
+    pub home: Option<Model>,
+}
+
 pub struct AgentRunParams<'h> {
     pub history: &'h mut History,
     pub system: String,
@@ -475,6 +486,10 @@ pub struct Agent<'h> {
     tool_output_lines: ToolOutputLines,
     tool_output_store: Option<Arc<ToolOutputStore>>,
     reauth_attempts: u32,
+    reroutes: u32,
+    /// The model the user chose, when the conversation runs on another
+    /// provider's model it moved to. It returns there once it can.
+    home_model: Option<Arc<Model>>,
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
@@ -656,6 +671,8 @@ impl<'h> Agent<'h> {
             mcp: None,
             code,
             reauth_attempts: 0,
+            reroutes: 0,
+            home_model: None,
             opts: RequestOptions::default(),
             session_id: params.session_id,
             tool_output_store: params.tool_output_store,
@@ -769,6 +786,27 @@ impl<'h> Agent<'h> {
         if steering.bind_model(&self.model, &self.config.steering) {
             self.recent_calls = RecentCalls::with_threshold(steering.repeat_threshold());
         }
+    }
+
+    /// Where the conversation stands after the run, for a caller that builds
+    /// an agent per run: the chat provider and model, which differ from the
+    /// ones it started with once it moved to another provider, and the model
+    /// the user chose while it is away.
+    pub fn conversation_route(&self) -> ConversationRoute {
+        ConversationRoute {
+            provider: Arc::clone(&self.chat_provider),
+            model: Model::clone(&self.chat_model),
+            home: self.home_model.as_deref().cloned(),
+        }
+    }
+
+    /// Runs a conversation that moved to another provider's model, so it
+    /// keeps `home`, the model the user chose, to return to.
+    pub fn with_home_model(mut self, home: Option<Model>) -> Self {
+        self.home_model = home
+            .filter(|home| home.spec() != self.model.spec())
+            .map(Arc::new);
+        self
     }
 
     pub fn with_user_response_rx(
@@ -1221,6 +1259,11 @@ impl<'h> Agent<'h> {
         self.opts = RequestOptions {
             thinking: latest.thinking.clone(),
             fast: latest.fast,
+            cross: accounts::cross_route(
+                self.home_model.as_deref().unwrap_or(&self.model),
+                &self.model_policy,
+            )
+            .map(Arc::new),
         };
 
         // One budget for every attachment the turn carries, spent in the order
@@ -2409,6 +2452,7 @@ impl<'h> Agent<'h> {
             }
             Ok(r) => {
                 self.reauth_attempts = 0;
+                self.reroutes = 0;
                 r
             }
             Err(StreamError::Cancelled {
@@ -2450,6 +2494,9 @@ impl<'h> Agent<'h> {
             }
             Err(StreamError::Auth { error, forwarded }) => {
                 return self.wait_for_reauth(error, forwarded).await;
+            }
+            Err(StreamError::Reroute { reroute, forwarded }) => {
+                return self.reroute(*reroute, forwarded).await;
             }
             Err(StreamError::Other(e)) => {
                 error!(error = %e, model = %self.model.id, turns = self.num_turns, "stream_message failed");
@@ -3520,6 +3567,56 @@ impl<'h> Agent<'h> {
                 },
             }
         }
+    }
+
+    /// Moves the conversation to the model its provider routed it to, so the
+    /// request goes out again there. A route that keeps bouncing between
+    /// providers ends the run instead.
+    async fn reroute(
+        &mut self,
+        reroute: Reroute,
+        reset_stream: bool,
+    ) -> Result<TurnOutcome, AgentError> {
+        if reset_stream {
+            self.event_tx.send(AgentEvent::StreamReset)?;
+        }
+        if self.reroutes >= MAX_REROUTES {
+            warn!(from = %reroute.from, to = %reroute.to, reroutes = self.reroutes, "provider moves keep bouncing, stopping");
+            return Err(AgentError::Rerouted(Box::new(reroute)));
+        }
+        self.reroutes += 1;
+        let mut model =
+            Model::from_spec_with_policy(&reroute.to, &self.model_policy).map_err(|error| {
+                AgentError::Config {
+                    message: format!("cannot move the conversation to {}: {error}", reroute.to),
+                }
+            })?;
+        let provider: Arc<dyn Provider> =
+            Arc::from(provider::from_model_async(&mut model, self.timeouts).await?);
+        let chat_follows_model = Arc::ptr_eq(&self.model, &self.chat_model);
+        let chat_follows_provider = Arc::ptr_eq(&self.provider, &self.chat_provider);
+        let home = self
+            .home_model
+            .take()
+            .unwrap_or_else(|| Arc::clone(&self.model));
+        self.home_model = (home.spec() != model.spec()).then_some(home);
+        self.model = Arc::new(model);
+        self.provider = provider;
+        if chat_follows_model {
+            self.chat_model = Arc::clone(&self.model);
+        }
+        if chat_follows_provider {
+            self.chat_provider = Arc::clone(&self.provider);
+        }
+        let mut steering = steering::lock(&self.steering);
+        if steering.bind_model(&self.model, &self.config.steering) {
+            self.recent_calls = RecentCalls::with_threshold(steering.repeat_threshold());
+        }
+        drop(steering);
+        self.measured = None;
+        self.event_tx
+            .send(AgentEvent::ModelRerouted(Box::new(reroute)))?;
+        Ok(TurnOutcome::Continue)
     }
 
     fn emit_turn_complete(&self, response: &StreamResponse) -> Result<(), AgentError> {

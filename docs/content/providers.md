@@ -608,6 +608,19 @@ Each `[[SLUG.accounts]]` entry takes these keys:
 
 See [How Auto switches](/docs/accounts/#how-auto-switches) for what the thresholds do.
 
+A top-level `[switching]` table lets Auto move a conversation to another provider's subscription once its own provider's subscriptions run low. It is off until the table lists at least two providers:
+
+```toml
+[switching]
+providers = ["anthropic", "openai"]
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `providers` | string[] | required | The provider slugs Auto may move a conversation across, in the order it tries them, when every subscription of the conversation's provider is spent or running low. The conversation moves to a subscription account of the next provider with quota left, on a model of the same size, and comes back once its own provider has quota again. Leave the table out to keep every conversation on its provider |
+
+See [Across providers](/docs/accounts/#across-providers) for which model the conversation moves to and when it comes back.
+
 ### Decision endpoints
 
 The optional typed decision engine behind [Auto mode](/docs/permissions/#auto-mode), workflow [`decide()` calls](/docs/workflows/#typed-decisions), and the [`decide()` and `rerank()` helpers](/docs/code/#decisions-and-reranking) sends its requests to a decision endpoint. Each endpoint is a `[decisions.<name>]` table in this file. One endpoint is active at a time, and with none active the engine is off. The settings every endpoint shares, such as deadlines, features, and thresholds, stay in [`[decisions]`](/docs/configuration/#decisions) in `caudra.toml`.

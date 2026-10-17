@@ -761,6 +761,7 @@ impl AgentLoop {
         let opts = RequestOptions {
             thinking: input.thinking.clone(),
             fast: input.fast,
+            ..RequestOptions::default()
         };
         let prompt_slots = self
             .lua_handle
@@ -801,7 +802,8 @@ impl AgentLoop {
         .with_retry_now(self.retry_now.clone())
         .with_goal(self.goal.clone())
         .with_mcp(self.mcp.clone())
-        .with_code(self.code.clone());
+        .with_code(self.code.clone())
+        .with_home_model(selected_slot.home.clone());
         if let Some(autopilot) = self.permissions.autopilot() {
             agent = agent.with_autopilot(autopilot);
         }
@@ -867,7 +869,14 @@ impl AgentLoop {
             &self.model_policy,
         )
         .await?;
-        Ok((selected_slot, Arc::new(ModelSlot { model, provider })))
+        Ok((
+            selected_slot,
+            Arc::new(ModelSlot {
+                model,
+                provider,
+                home: None,
+            }),
+        ))
     }
 
     fn install(
@@ -899,6 +908,7 @@ impl AgentLoop {
         self.context_options = RequestOptions {
             thinking: input.thinking,
             fast: input.fast,
+            ..RequestOptions::default()
         };
         self.publish_btw_prompt(
             &effective_slot,

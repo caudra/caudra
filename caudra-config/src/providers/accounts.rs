@@ -5,8 +5,9 @@ use std::collections::HashSet;
 use std::mem;
 
 use caudra_storage::accounts::{AccountName, AccountNameError};
+use serde::de::Error as _;
 use serde::ser::Error as _;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, Value};
 
@@ -17,8 +18,11 @@ use crate::{ConfigField, ConfigValue};
 pub const DEFAULT_SWITCH_BELOW: u8 = 5;
 pub const DEFAULT_PREFER_BELOW: u8 = 20;
 const MAX_PERCENT: u8 = 100;
+/// `[SLUG.switching]` within a provider, and the cross-provider
+/// `[switching]` at the top of the file.
+pub const SWITCHING_KEY: &str = "switching";
+pub const MIN_PROVIDER_ORDER: usize = 2;
 const ACCOUNTS_KEY: &str = "accounts";
-const SWITCHING_KEY: &str = "switching";
 const NAME_KEY: &str = "name";
 const DUPLICATE_ACCOUNT_MESSAGE: &str = "account names must be unique per provider";
 const EMPTY_API_KEY_ENV_MESSAGE: &str = "must name an environment variable";
@@ -28,6 +32,10 @@ const EMPTY_WINDOWS_MESSAGE: &str =
 const UNKNOWN_WINDOW_MESSAGE: &str = "`switching.windows` has an unknown quota window";
 const UNKNOWN_ACCOUNT_MESSAGE: &str = "has no account named";
 const ACCOUNT_EXISTS_MESSAGE: &str = "already has an account named";
+const SHORT_PROVIDER_ORDER_MESSAGE: &str =
+    "must list at least two providers, or be left out to keep conversations on their provider";
+const DUPLICATE_PROVIDER_MESSAGE: &str = "lists a provider more than once";
+const BLANK_PROVIDER_MESSAGE: &str = "has an empty provider slug";
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum AccountsConfigError {
@@ -56,6 +64,12 @@ pub enum AccountsConfigError {
     UnknownAccount { provider: String, name: String },
     #[error("{provider}.accounts {ACCOUNT_EXISTS_MESSAGE} `{name}`")]
     AccountExists { provider: String, name: String },
+    #[error("{SWITCHING_KEY}.providers {SHORT_PROVIDER_ORDER_MESSAGE}, but lists {count}")]
+    ShortProviderOrder { count: usize },
+    #[error("{SWITCHING_KEY}.providers {DUPLICATE_PROVIDER_MESSAGE}: `{provider}`")]
+    DuplicateProvider { provider: String },
+    #[error("{SWITCHING_KEY}.providers {BLANK_PROVIDER_MESSAGE}")]
+    BlankProvider,
 }
 
 /// One `[[SLUG.accounts]]` entry. The list order is the priority order.
@@ -274,6 +288,58 @@ impl SwitchingDef {
     }
 }
 
+/// The top-level `[switching]`: the providers Auto may move a conversation
+/// across once every subscription of its own provider runs low, in the order
+/// it tries them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalSwitchingDef {
+    pub providers: Vec<String>,
+}
+
+impl GlobalSwitchingDef {
+    pub(crate) const FIELDS: &[ConfigField] = &[ConfigField {
+        name: "providers",
+        ty: "string[]",
+        default: ConfigValue::Required("[\"anthropic\", \"openai\"]"),
+        min: None,
+        max: None,
+        env: None,
+        description: "The provider slugs Auto may move a conversation across, in the order it tries them, when every subscription of the conversation's provider is spent or running low. The conversation moves to a subscription account of the next provider with quota left, on a model of the same size, and comes back once its own provider has quota again. Leave the table out to keep every conversation on its provider",
+    }];
+
+    fn validate(&self) -> Result<(), AccountsConfigError> {
+        if self.providers.len() < MIN_PROVIDER_ORDER {
+            return Err(AccountsConfigError::ShortProviderOrder {
+                count: self.providers.len(),
+            });
+        }
+        let mut seen = HashSet::new();
+        for provider in &self.providers {
+            if provider.trim().is_empty() {
+                return Err(AccountsConfigError::BlankProvider);
+            }
+            if !seen.insert(provider.as_str()) {
+                return Err(AccountsConfigError::DuplicateProvider {
+                    provider: provider.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn deserialize_global_switching<'de, D>(
+    deserializer: D,
+) -> Result<Option<GlobalSwitchingDef>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let def = GlobalSwitchingDef::deserialize(deserializer)?;
+    def.validate().map_err(D::Error::custom)?;
+    Ok(Some(def))
+}
+
 fn is_default_strategy(strategy: &SwitchStrategy) -> bool {
     *strategy == SwitchStrategy::default()
 }
@@ -468,6 +534,30 @@ impl ProvidersFile {
         Ok(())
     }
 
+    /// The cross-provider order. An empty one drops `[switching]`, which
+    /// keeps every conversation on its provider.
+    pub fn set_provider_order(&mut self, providers: &[String]) -> Result<(), ProvidersFileError> {
+        if providers.is_empty() {
+            self.document.remove(SWITCHING_KEY);
+            self.config.switching = None;
+            return Ok(());
+        }
+        let switching = GlobalSwitchingDef {
+            providers: providers.to_vec(),
+        };
+        switching.validate()?;
+        let previous = rendered(self.config.switching.as_ref())?;
+        let desired = Item::Table(to_table(&switching)?);
+        merge_item(
+            self.document.as_table_mut(),
+            SWITCHING_KEY,
+            previous.as_ref(),
+            &desired,
+        );
+        self.config.switching = Some(switching);
+        Ok(())
+    }
+
     fn configured_accounts(&self, provider: &str) -> &[AccountDef] {
         self.config
             .get(provider)
@@ -566,6 +656,9 @@ mod tests {
 
     const PROVIDER: &str = "anthropic";
     const UNLISTED: &str = "xai";
+    const OTHER_PROVIDER: &str = "openai";
+    const UNKNOWN_STRATEGY_FIELD_MESSAGE: &str = "unknown field `strategy`";
+    const ORDER_COMMENT: &str = "# order note";
     const PERSONAL: &str = "personal";
     const TEAM: &str = "team";
     const API: &str = "api";
@@ -969,6 +1062,87 @@ base_url = "https://openai.example/v1"
         let error = file.set_switching(PROVIDER, &switching).unwrap_err();
 
         assert!(error.to_string().contains(THRESHOLDS_MESSAGE), "{error}");
+    }
+
+    #[test]
+    fn the_provider_order_parses_ahead_of_the_providers() {
+        let config: ProvidersConfig =
+            toml::from_str("[switching]\nproviders = [\"anthropic\", \"openai\"]\n").unwrap();
+
+        assert_eq!(config.provider_order(), [PROVIDER, OTHER_PROVIDER]);
+        assert!(config.get(SWITCHING_KEY).is_none());
+    }
+
+    #[test_case("[switching]\nproviders = [\"anthropic\"]\n", SHORT_PROVIDER_ORDER_MESSAGE ; "one_provider")]
+    #[test_case("[switching]\nproviders = []\n", SHORT_PROVIDER_ORDER_MESSAGE ; "no_provider")]
+    #[test_case("[switching]\nproviders = [\"openai\", \"xai\", \"openai\"]\n", DUPLICATE_PROVIDER_MESSAGE ; "duplicate_provider")]
+    #[test_case("[switching]\nproviders = [\"openai\", \" \"]\n", BLANK_PROVIDER_MESSAGE ; "blank_provider")]
+    #[test_case("[switching]\nproviders = [\"openai\", \"xai\"]\nstrategy = \"paced\"\n", UNKNOWN_STRATEGY_FIELD_MESSAGE ; "unknown_field")]
+    fn invalid_provider_order_fails(text: &str, expected: &str) {
+        let error = parse_error(text);
+
+        assert!(error.contains(expected), "{error}");
+    }
+
+    #[test]
+    fn setting_the_provider_order_keeps_the_file() {
+        let mut file = edited();
+        let order = [OTHER_PROVIDER.to_owned(), PROVIDER.to_owned()];
+
+        file.set_provider_order(&order).unwrap();
+        let rendered = file.render();
+
+        assert_survives(&rendered, &KEPT);
+        assert!(
+            rendered.ends_with(&format!(
+                "\n[{SWITCHING_KEY}]\nproviders = [\"{OTHER_PROVIDER}\", \"{PROVIDER}\"]\n"
+            )),
+            "{rendered}"
+        );
+        assert_eq!(reparsed(&file).provider_order(), order);
+    }
+
+    #[test]
+    fn reordering_keeps_the_comment_on_the_order() {
+        let text = format!(
+            "{EDITED_FILE}\n{ORDER_COMMENT}\n[switching]\nproviders = [\"anthropic\", \"openai\"]\n"
+        );
+        let mut file = ProvidersFile::parse(&text).unwrap();
+        let order = [
+            OTHER_PROVIDER.to_owned(),
+            UNLISTED.to_owned(),
+            PROVIDER.to_owned(),
+        ];
+
+        file.set_provider_order(&order).unwrap();
+
+        assert_survives(&file.render(), &[ORDER_COMMENT]);
+        assert_eq!(reparsed(&file).provider_order(), order);
+    }
+
+    #[test]
+    fn an_empty_provider_order_drops_the_table() {
+        let mut file = edited();
+        file.set_provider_order(&[PROVIDER.to_owned(), OTHER_PROVIDER.to_owned()])
+            .unwrap();
+
+        file.set_provider_order(&[]).unwrap();
+
+        assert_eq!(file.render(), EDITED_FILE);
+        assert!(file.provider_order().is_empty());
+    }
+
+    #[test]
+    fn a_short_provider_order_is_refused() {
+        let mut file = edited();
+
+        let error = file.set_provider_order(&[PROVIDER.to_owned()]).unwrap_err();
+
+        assert!(
+            error.to_string().contains(SHORT_PROVIDER_ORDER_MESSAGE),
+            "{error}"
+        );
+        assert_eq!(file.render(), EDITED_FILE);
     }
 
     #[test]

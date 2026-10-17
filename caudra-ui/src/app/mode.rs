@@ -909,6 +909,7 @@ mod tests {
         app.effective_model_slot = Some(Arc::new(ArcSwap::from_pointee(ModelSlot {
             model,
             provider: Arc::from(provider),
+            home: None,
         })));
     }
 

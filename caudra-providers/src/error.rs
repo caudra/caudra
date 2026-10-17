@@ -9,6 +9,8 @@ use futures_lite::io::AsyncReadExt;
 use isahc::http::HeaderMap;
 use serde_json::Value;
 
+use crate::accounts::Reroute;
+
 /// Enough of an error body to diagnose one, and no more: a non-200 can be an
 /// endless stream, and nothing downstream reads past the first screenful.
 const ERROR_BODY_CAP: u64 = 64 * 1024;
@@ -84,6 +86,10 @@ pub enum AgentError {
     EmptySummary,
     #[error("automatic recovery exhausted for {rule}")]
     SteeringExhausted { rule: String },
+    /// Nothing was sent: the conversation moves to another provider's model,
+    /// which the agent switches to before sending the request again.
+    #[error("moving from {} to {}", .0.from, .0.to)]
+    Rerouted(Box<Reroute>),
 }
 
 impl AgentError {
@@ -120,6 +126,7 @@ impl AgentError {
             Self::Timeout { .. } => "timeout",
             Self::EmptySummary => "empty_summary",
             Self::SteeringExhausted { .. } => "steering_exhausted",
+            Self::Rerouted(_) => "rerouted",
         }
     }
 
@@ -151,6 +158,7 @@ impl AgentError {
             | Self::Cancelled
             | Self::EmptySummary
             | Self::SteeringExhausted { .. }
+            | Self::Rerouted(_)
             | Self::HttpRequest(_) => false,
         }
     }
@@ -271,6 +279,10 @@ impl AgentError {
             Self::EmptySummary => "compaction returned no summary, history kept as is".into(),
             Self::SteeringExhausted { rule } => format!(
                 "automatic recovery limit reached for {rule}; review the partial output and resume or adjust steering limits"
+            ),
+            Self::Rerouted(reroute) => format!(
+                "the conversation moved from {} to {}, send it again",
+                reroute.from, reroute.to
             ),
         }
     }

@@ -13,6 +13,7 @@ use futures::future::join_all;
 use serde_json::Value;
 use tracing::{info, warn};
 
+use super::across::{self, CrossRoute, Departure};
 use super::credential::AccountCredential;
 use super::health::{AccountHealth, BLOCKED_BILLING, BLOCKED_RATE_LIMITED, QUOTA_STALE};
 use super::policy::{
@@ -21,8 +22,8 @@ use super::policy::{
 };
 use super::registry::{PoolSnapshot, SlugState, no_account_error, percent, slug_state};
 use super::route::{
-    AccountAlternative, AccountExhaustion, AccountSwitch, AccountTier, Failover, RoutedAccount,
-    SwitchReason,
+    AccountAlternative, AccountExhaustion, AccountSwitch, AccountTier, Failover, Reroute,
+    RoutedAccount, SwitchReason,
 };
 use crate::AgentError;
 use crate::model::{Model, ModelInfo};
@@ -50,6 +51,7 @@ const STATUS_FORBIDDEN: u16 = 403;
 const STATUS_NOT_FOUND: u16 = 404;
 const EVENT_ACCOUNT_SWITCHED: &str = "account_switched";
 const EVENT_ACCOUNT_FAILOVER: &str = "account_failover";
+const EVENT_PROVIDER_REROUTED: &str = "provider_rerouted";
 
 /// What the router remembers about one conversation's last request.
 struct LineageState {
@@ -61,6 +63,8 @@ struct LineageState {
     prompt_tokens: u32,
     /// Set by a failover, reported with the request that follows it.
     pending: Option<(String, SwitchReason)>,
+    /// Where the conversation may go once this provider runs out.
+    cross: Option<Arc<CrossRoute>>,
 }
 
 #[derive(Default)]
@@ -408,27 +412,55 @@ impl RoutedProvider {
         }
     }
 
-    fn record_lineage(
+    fn record_lineage(&self, key: &str, lineage: LineageState) {
+        self.state
+            .lineages
+            .lock()
+            .unwrap()
+            .insert(key.to_owned(), lineage);
+    }
+
+    /// The other provider the conversation should move to, reading their
+    /// pools only when this one gives a reason to.
+    async fn cross_reroute(
         &self,
-        key: &str,
-        account: &str,
-        model: &Model,
-        system_hash: u64,
-        messages: usize,
-        prompt_tokens: u32,
-    ) {
-        self.state.lineages.lock().unwrap().insert(
-            key.to_owned(),
-            LineageState {
-                account: account.to_owned(),
-                model: model.id.clone(),
-                system_hash,
-                messages,
-                used_at: Instant::now(),
-                prompt_tokens,
-                pending: None,
-            },
+        model_id: &str,
+        cross: Arc<CrossRoute>,
+        cold: bool,
+        cached_tokens: u32,
+    ) -> Option<Reroute> {
+        let departure = Departure {
+            state: &self.state,
+            model_id,
+            cold,
+            cached_tokens,
+        };
+        if !across::worth_weighing(&departure, &cross) {
+            return None;
+        }
+        let state = Arc::clone(&self.state);
+        let model_id = model_id.to_owned();
+        let reroute = smol::unblock(move || {
+            across::weigh(
+                &Departure {
+                    state: &state,
+                    model_id: &model_id,
+                    cold,
+                    cached_tokens,
+                },
+                &cross,
+            )
+        })
+        .await?;
+        info!(
+            event = EVENT_PROVIDER_REROUTED,
+            from = %reroute.from,
+            to = %reroute.to,
+            reason = ?reroute.reason,
+            cached_tokens = reroute.cached_tokens,
+            "moving a conversation to another provider"
         );
+        Some(reroute)
     }
 
     fn take_pending(&self, key: Option<&str>) -> Option<(String, SwitchReason)> {
@@ -563,6 +595,18 @@ impl Provider for RoutedProvider {
                 })
                 .await;
             }
+            if let Some(cross) = opts.cross.clone()
+                && let Some(reroute) = self
+                    .cross_reroute(
+                        &model.id,
+                        cross,
+                        !matches!(standing, Standing::Warm { .. }),
+                        standing.prompt_tokens(),
+                    )
+                    .await
+            {
+                return Err(AgentError::Rerouted(Box::new(reroute)));
+            }
             let snapshot = self.state.snapshot();
             let now_ms = self.state.now_ms();
             let decision = self.decide(&snapshot, &model.id, standing.lineage(), now_ms);
@@ -579,11 +623,16 @@ impl Provider for RoutedProvider {
             if let Some(key) = key {
                 self.record_lineage(
                     key,
-                    &name,
-                    model,
-                    system_hash,
-                    messages.len(),
-                    standing.prompt_tokens(),
+                    LineageState {
+                        account: name.clone(),
+                        model: model.id.clone(),
+                        system_hash,
+                        messages: messages.len(),
+                        used_at: Instant::now(),
+                        prompt_tokens: standing.prompt_tokens(),
+                        pending: None,
+                        cross: opts.cross.clone(),
+                    },
                 );
                 if moved_from.is_some() || matches!(standing, Standing::New { .. }) {
                     let switch = moved_from.map(|from| AccountSwitch {
@@ -805,12 +854,24 @@ impl Provider for RoutedProvider {
                     .unwrap()
                     .map
                     .get(key)
-                    .map(|lineage| (lineage.account.clone(), lineage.model.clone()))
+                    .map(|lineage| {
+                        (
+                            lineage.account.clone(),
+                            lineage.model.clone(),
+                            lineage.cross.clone(),
+                            lineage.prompt_tokens,
+                        )
+                    })
             });
-            let (current_name, model_id) = match lineage {
+            let (current_name, model_id, cross, prompt_tokens) = match lineage {
                 Some(found) => found,
                 None => match self.preferred(&snapshot, "") {
-                    Ok(routed) => (routed.credential.id.name.to_string(), String::new()),
+                    Ok(routed) => (
+                        routed.credential.id.name.to_string(),
+                        String::new(),
+                        None,
+                        0,
+                    ),
                     Err(_) => return Failover::STAY,
                 },
             };
@@ -851,6 +912,13 @@ impl Provider for RoutedProvider {
             };
             if pinned {
                 return exhausted(self);
+            }
+            if let Some(cross) = cross
+                && let Some(reroute) = self
+                    .cross_reroute(&model_id, cross, false, prompt_tokens)
+                    .await
+            {
+                return Failover::Reroute(Box::new(reroute));
             }
             let decision = self.decide(
                 &snapshot,

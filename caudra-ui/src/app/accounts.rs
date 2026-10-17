@@ -1,7 +1,7 @@
-//! Where a session's requests go among a provider's accounts: `/accounts`,
-//! the row a switch leaves in the transcript, kept so a restore draws it
-//! again, and the card and row a spent account raises so the user can move
-//! elsewhere.
+//! Where a session's requests go among a provider's accounts, and across
+//! providers when their subscriptions run out: `/accounts`, the row a switch
+//! or a move leaves in the transcript, kept so a restore draws it again, and
+//! the card and row a spent account raises so the user can move elsewhere.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,8 +10,9 @@ use caudra_agent::automation::clock::{Clock, SystemClock};
 use caudra_config::providers::{ProvidersConfig, resolve_display_name};
 use caudra_providers::accounts::{
     AccountAlternative, AccountExhaustion, AccountKind, AccountStatus, AccountSwitch, PoolStatus,
-    RoutedAccount, SelectionMode, SwitchReason, fetch_account_usage, forget_account, move_account,
-    pool_status, rename_account, select_account, set_process_selection, set_strategy,
+    Reroute, RerouteReason, RoutedAccount, SelectionMode, SwitchReason, WindowKind,
+    account_providers, fetch_account_usage, forget_account, move_account, pool_status,
+    rename_account, select_account, set_process_selection, set_provider_order, set_strategy,
 };
 use caudra_providers::{AgentError, Billing, Timeouts};
 use caudra_storage::account_switches::StoredAccountSwitch;
@@ -23,7 +24,7 @@ use tracing::warn;
 use super::App;
 use super::goal::LogPlace;
 use crate::agent::AgentCommand;
-use crate::components::accounts_modal::{AccountsAction, AccountsView};
+use crate::components::accounts_modal::{AccountsAction, AccountsView, ProviderAccounts};
 use crate::components::status_bar::AccountChip;
 use crate::components::{Action, DisplayMessage, DisplayRole, format_compact, format_elapsed};
 use crate::repaint::Dirty;
@@ -41,18 +42,17 @@ impl App {
     /// Opens on the latest readings and asks the subscriptions whose reading
     /// is older than [`OPEN_REFRESH_AGE`] for a new one.
     pub(super) fn open_accounts(&mut self) {
-        let provider = self.state.model.provider.to_string();
-        let view = match self.accounts_view(&provider) {
+        let view = match self.accounts_view() {
             Ok(view) => view,
             Err(error) => {
                 self.flash(error.to_string());
                 return;
             }
         };
-        let stale = stale_subscriptions(&view.pool.accounts, view.now_ms);
+        let stale = subscriptions(&view, |account| stale(account, view.now_ms));
         self.accounts_modal.open(view);
         if !stale.is_empty() {
-            self.fetch_quotas(provider, stale);
+            self.fetch_quotas(stale);
         }
     }
 
@@ -94,7 +94,7 @@ impl App {
                 return self.handle_login_picker_action(action);
             }
             AccountsAction::Refresh => {
-                self.refresh_accounts(provider);
+                self.refresh_accounts();
                 return Vec::new();
             }
             AccountsAction::Select { selection, retry } => {
@@ -125,25 +125,21 @@ impl App {
                 move_account(&provider, &name, offset).map(drop)
             }
             AccountsAction::Strategy(strategy) => set_strategy(&provider, strategy),
+            AccountsAction::ProviderOrder(order) => set_provider_order(&order),
             AccountsAction::Browse => Ok(()),
         };
-        self.reload_accounts(&provider, result.err().map(|error| error.to_string()));
+        self.reload_accounts(result.err().map(|error| error.to_string()));
         if let Some(name) = keep {
-            self.accounts_modal.select(&name);
+            self.accounts_modal.select(&provider, &name);
         }
         Vec::new()
     }
 
     /// Asks every signed-in subscription for its quota off the UI thread;
     /// [`Self::poll_accounts_refresh`] redraws the list once all have answered.
-    fn refresh_accounts(&mut self, provider: String) {
-        let accounts: Vec<String> = match pool_status(&provider, None) {
-            Ok(pool) => pool
-                .accounts
-                .into_iter()
-                .filter(|account| account.kind == AccountKind::Subscription)
-                .map(|account| account.name)
-                .collect(),
+    fn refresh_accounts(&mut self) {
+        let accounts = match self.accounts_view() {
+            Ok(view) => subscriptions(&view, |_| true),
             Err(error) => {
                 self.accounts_modal.show_error(error.to_string());
                 return;
@@ -153,18 +149,18 @@ impl App {
             self.accounts_modal.show_error(NO_SUBSCRIPTION.into());
             return;
         }
-        self.fetch_quotas(provider, accounts);
+        self.fetch_quotas(accounts);
     }
 
-    fn fetch_quotas(&mut self, provider: String, accounts: Vec<String>) {
+    fn fetch_quotas(&mut self, accounts: Vec<(String, String)>) {
         let slot = Arc::clone(&self.accounts_refresh);
         smol::spawn(async move {
             let mut failures = Vec::new();
-            for account in accounts {
+            for (provider, account) in accounts {
                 if let Err(error) =
                     fetch_account_usage(&provider, &account, Timeouts::default()).await
                 {
-                    failures.push(format!("{account}: {error}"));
+                    failures.push(format!("{provider} {account}: {error}"));
                 }
             }
             slot.store(Some(Arc::new(failures)));
@@ -176,35 +172,50 @@ impl App {
         let Some(failures) = self.accounts_refresh.swap(None) else {
             return Dirty::NO;
         };
-        let Some(provider) = self.accounts_modal.provider().map(str::to_owned) else {
+        if !self.accounts_modal.is_open() {
             return Dirty::NO;
-        };
-        self.reload_accounts(
-            &provider,
-            (!failures.is_empty()).then(|| failures.join("; ")),
-        );
+        }
+        self.reload_accounts((!failures.is_empty()).then(|| failures.join("; ")));
         Dirty::YES
     }
 
-    fn reload_accounts(&mut self, provider: &str, error: Option<String>) {
-        match self.accounts_view(provider) {
+    fn reload_accounts(&mut self, error: Option<String>) {
+        match self.accounts_view() {
             Ok(view) => self.accounts_modal.refresh(view, error),
             Err(error) => self.accounts_modal.show_error(error.to_string()),
         }
     }
 
-    fn accounts_view(&self, provider: &str) -> Result<AccountsView, AgentError> {
+    /// Every provider with an account, the model's first. Only the model's
+    /// own pool failing to load fails the view; another's is left out.
+    fn accounts_view(&self) -> Result<AccountsView, AgentError> {
         let model = &self.state.model;
-        let model_id = (*model.provider == *provider).then_some(model.id.as_str());
+        let home = model.provider.to_string();
+        let mut providers = Vec::new();
+        for provider in account_providers(&home) {
+            let model_id = (provider == home).then_some(model.id.as_str());
+            let pool = match pool_status(&provider, model_id) {
+                Ok(pool) => pool,
+                Err(error) if provider == home => return Err(error),
+                Err(error) => {
+                    warn!(%provider, %error, "provider left out of /accounts");
+                    continue;
+                }
+            };
+            providers.push(ProviderAccounts {
+                display: display_name(&provider),
+                current: self
+                    .routed_account
+                    .as_ref()
+                    .filter(|account| account.provider == provider)
+                    .map(|account| account.name.clone()),
+                provider,
+                pool,
+            });
+        }
         Ok(AccountsView {
-            provider: provider.to_owned(),
-            display: display_name(provider),
-            pool: pool_status(provider, model_id)?,
-            current: self
-                .routed_account
-                .as_ref()
-                .filter(|account| account.provider == provider)
-                .map(|account| account.name.clone()),
+            providers,
+            order: ProvidersConfig::load().provider_order().to_vec(),
             now_ms: now_ms(),
             clock: self.ui_config.clock_format,
         })
@@ -234,9 +245,7 @@ impl App {
         }
     }
 
-    /// A switch is drawn in the chat that made it, and kept for a restore
-    /// only when it is the main agent's: a subagent starts on its parent's
-    /// account, so its own moves are live detail.
+    /// A switch is drawn in the chat that made it.
     pub(super) fn account_routed(
         &mut self,
         chat_idx: usize,
@@ -257,20 +266,62 @@ impl App {
             &account.name,
             now_ms(),
         );
+        self.place_route_row(
+            chat_idx,
+            main_agent,
+            StoredAccountSwitch {
+                seq: 0,
+                at_ms: now_ms(),
+                history_len: self.autopilot_history_len(),
+                provider: account.provider.clone(),
+                from_account: switch.from,
+                to_account: account.name.clone(),
+                summary,
+            },
+        );
+    }
+
+    /// Drawn and kept as an account switch is. The main agent's move also
+    /// takes the model every session runs on along, so the next turn starts
+    /// where this one ended.
+    pub(super) fn model_rerouted(
+        &mut self,
+        chat_idx: usize,
+        main_agent: bool,
+        reroute: Reroute,
+    ) -> Vec<Action> {
+        let from = display_name(spec_provider(&reroute.from));
+        let to_provider = spec_provider(&reroute.to);
+        let summary = reroute_row(&from, &display_name(to_provider), &reroute);
+        self.place_route_row(
+            chat_idx,
+            main_agent,
+            StoredAccountSwitch {
+                seq: 0,
+                at_ms: now_ms(),
+                history_len: self.autopilot_history_len(),
+                provider: to_provider.to_owned(),
+                from_account: reroute.from.clone(),
+                to_account: reroute.to.clone(),
+                summary,
+            },
+        );
+        if main_agent {
+            vec![Action::FollowReroute(Box::new(reroute))]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// A row in the chat that moved, kept for a restore only when it is the
+    /// main agent's: a subagent starts on its parent's route, so its own
+    /// moves are live detail.
+    fn place_route_row(&mut self, chat_idx: usize, main_agent: bool, row: StoredAccountSwitch) {
+        let summary = row.summary.clone();
         if main_agent {
             self.checkpoint_now();
-            self.storage_writer.record_account_switch(
-                self.state.session.id,
-                StoredAccountSwitch {
-                    seq: 0,
-                    at_ms: now_ms(),
-                    history_len: self.autopilot_history_len(),
-                    provider: account.provider.clone(),
-                    from_account: switch.from,
-                    to_account: account.name.clone(),
-                    summary: summary.clone(),
-                },
-            );
+            self.storage_writer
+                .record_account_switch(self.state.session.id, row);
         }
         let chat = &mut self.chats[chat_idx];
         chat.flush();
@@ -294,7 +345,7 @@ impl App {
         if !main_agent || (self.any_overlay_open() && !self.accounts_modal.is_open()) {
             return;
         }
-        match self.accounts_view(&exhaustion.provider) {
+        match self.accounts_view() {
             Ok(view) => self.accounts_modal.show_exhaustion(view, exhaustion),
             Err(error) => warn!(%error, "spent account card unavailable"),
         }
@@ -333,16 +384,26 @@ pub(super) fn account_chip<'a>(
         })
 }
 
-/// The signed-in subscriptions whose quota reading, if any, is older than
-/// [`OPEN_REFRESH_AGE`]. Keys report no quota to ask for.
-fn stale_subscriptions(accounts: &[AccountStatus], now_ms: u64) -> Vec<String> {
-    let fresh_after = now_ms.saturating_sub(OPEN_REFRESH_AGE.as_millis() as u64);
-    accounts
+/// Whether the quota reading, if any, is older than [`OPEN_REFRESH_AGE`].
+fn stale(account: &AccountStatus, now_ms: u64) -> bool {
+    account.observed_at < now_ms.saturating_sub(OPEN_REFRESH_AGE.as_millis() as u64)
+}
+
+/// Every provider's signed-in subscriptions that `wanted` keeps, as
+/// `(provider, account)`. Keys report no quota to ask for.
+fn subscriptions(
+    view: &AccountsView,
+    wanted: impl Fn(&AccountStatus) -> bool,
+) -> Vec<(String, String)> {
+    view.providers
         .iter()
-        .filter(|account| {
-            account.kind == AccountKind::Subscription && account.observed_at < fresh_after
+        .flat_map(|pool| {
+            pool.pool
+                .accounts
+                .iter()
+                .filter(|account| account.kind == AccountKind::Subscription && wanted(account))
+                .map(|account| (pool.provider.clone(), account.name.clone()))
         })
-        .map(|account| account.name.clone())
         .collect()
 }
 
@@ -396,14 +457,61 @@ fn switch_row(provider: &str, switch: &AccountSwitch, to: &str, now_ms: u64) -> 
         SwitchReason::Rebalanced => format!("{to} had more room while the cache was cold"),
         SwitchReason::Selected => format!("you selected {to}"),
     };
-    let mut row = format!("Switched {provider} account {from} → {to}: {reason}.");
-    if switch.cached_tokens > 0 {
+    let row = format!("Switched {provider} account {from} → {to}: {reason}.");
+    with_cache_cost(row, switch.cached_tokens)
+}
+
+/// `from` and `to` are the providers' display names.
+fn reroute_row(from: &str, to: &str, reroute: &Reroute) -> String {
+    let model = spec_model(&reroute.to);
+    let row = match &reroute.reason {
+        RerouteReason::Spent {
+            window,
+            used_percent,
+        } => format!(
+            "Switched to {to} {model}: every {from} subscription is spent{}.",
+            standing(window.as_ref(), *used_percent)
+        ),
+        RerouteReason::Low {
+            window,
+            used_percent,
+        } => format!(
+            "Switched to {to} {model}: every {from} subscription runs low{} and the cache was cold.",
+            standing(window.as_ref(), *used_percent)
+        ),
+        RerouteReason::Home => {
+            format!("Switched back to {to} {model}: its subscriptions have room again.")
+        }
+        RerouteReason::Rebalanced => format!(
+            "Switched to {to} {model}: it comes before {from} in your order and has room again."
+        ),
+    };
+    with_cache_cost(row, reroute.cached_tokens)
+}
+
+fn standing(window: Option<&WindowKind>, used_percent: Option<u8>) -> String {
+    match (window, used_percent) {
+        (Some(window), Some(used_percent)) => format!(" ({} {used_percent}% used)", window.label()),
+        _ => String::new(),
+    }
+}
+
+fn with_cache_cost(mut row: String, cached_tokens: u32) -> String {
+    if cached_tokens > 0 {
         row.push_str(&format!(
             " Prompt cache rebuilds (~{} tokens).",
-            format_compact(u64::from(switch.cached_tokens))
+            format_compact(u64::from(cached_tokens))
         ));
     }
     row
+}
+
+fn spec_provider(spec: &str) -> &str {
+    spec.split_once('/').map_or(spec, |(provider, _)| provider)
+}
+
+fn spec_model(spec: &str) -> &str {
+    spec.split_once('/').map_or(spec, |(_, model)| model)
 }
 
 fn exhausted_row(provider: &str, exhaustion: &AccountExhaustion, now_ms: u64) -> String {
@@ -447,7 +555,7 @@ fn display_name(provider: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use caudra_providers::accounts::{AccountTier, WindowKind};
+    use caudra_providers::accounts::AccountTier;
     use test_case::test_case;
 
     use super::*;
@@ -457,6 +565,7 @@ mod tests {
     const MINUTE_MS: u64 = 60_000;
     const PROVIDER: &str = "anthropic";
     const DISPLAY: &str = "Anthropic";
+    const OPENAI_DISPLAY: &str = "OpenAI";
     const PERSONAL: &str = "personal";
     const WORK: &str = "work";
     const API: &str = "api";
@@ -530,6 +639,44 @@ mod tests {
         assert_eq!(switch_row(DISPLAY, &switch, WORK, NOW_MS), expected);
     }
 
+    fn reroute(reason: RerouteReason, cached_tokens: u32) -> Reroute {
+        Reroute {
+            from: format!("{PROVIDER}/claude-opus-5-5"),
+            to: "openai/gpt-6-astra".into(),
+            reason,
+            cached_tokens,
+        }
+    }
+
+    #[test_case(
+        reroute(RerouteReason::Spent { window: Some(WindowKind::FiveHour), used_percent: Some(97) }, 84_000),
+        "Switched to OpenAI gpt-6-astra: every Anthropic subscription is spent (5h 97% used). Prompt cache rebuilds (~84k tokens)."
+        ; "spent_names_the_window_and_the_cache_cost"
+    )]
+    #[test_case(
+        reroute(RerouteReason::Spent { window: None, used_percent: None }, 0),
+        "Switched to OpenAI gpt-6-astra: every Anthropic subscription is spent."
+        ; "spent_without_a_reading"
+    )]
+    #[test_case(
+        reroute(RerouteReason::Low { window: Some(WindowKind::Weekly), used_percent: Some(91) }, 0),
+        "Switched to OpenAI gpt-6-astra: every Anthropic subscription runs low (weekly 91% used) and the cache was cold."
+        ; "low_moves_at_a_cold_point"
+    )]
+    #[test_case(
+        reroute(RerouteReason::Home, 0),
+        "Switched back to OpenAI gpt-6-astra: its subscriptions have room again."
+        ; "home_says_back"
+    )]
+    #[test_case(
+        reroute(RerouteReason::Rebalanced, 0),
+        "Switched to OpenAI gpt-6-astra: it comes before Anthropic in your order and has room again."
+        ; "rebalanced_names_the_order"
+    )]
+    fn a_reroute_row_names_the_model_and_why(reroute: Reroute, expected: &str) {
+        assert_eq!(reroute_row(DISPLAY, OPENAI_DISPLAY, &reroute), expected);
+    }
+
     #[test_case(
         exhaustion(SelectionMode::Pinned, Some(NOW_MS + HOUR_MS), vec![subscription(WORK, Some(62)), metered(API, true)]),
         "Anthropic account personal is spent, refills in 1h00m. Others: work 62% left, api pay per token (fallback). Ctrl+X i chooses another account."
@@ -573,7 +720,30 @@ mod tests {
     #[test_case(AccountKind::StoredKey, 0, false ; "a_key_reports_no_quota")]
     #[test_case(AccountKind::SignedOut, 0, false ; "signed_out_cannot_be_asked")]
     fn opening_asks_only_stale_subscriptions(kind: AccountKind, observed_at: u64, asked: bool) {
-        let accounts = [status(PERSONAL, kind, observed_at)];
-        assert_eq!(stale_subscriptions(&accounts, NOW_MS) == [PERSONAL], asked);
+        let view = AccountsView {
+            providers: vec![ProviderAccounts {
+                provider: PROVIDER.into(),
+                display: DISPLAY.into(),
+                pool: PoolStatus {
+                    provider: PROVIDER.into(),
+                    selection: AccountSelection::Auto,
+                    overridden: false,
+                    strategy: Default::default(),
+                    switch_below: 5,
+                    prefer_below: 20,
+                    accounts: vec![status(PERSONAL, kind, observed_at)],
+                },
+                current: None,
+            }],
+            order: Vec::new(),
+            now_ms: NOW_MS,
+            clock: Default::default(),
+        };
+        let expected = [(PROVIDER.to_owned(), PERSONAL.to_owned())];
+
+        assert_eq!(
+            subscriptions(&view, |account| stale(account, NOW_MS)) == expected,
+            asked
+        );
     }
 }

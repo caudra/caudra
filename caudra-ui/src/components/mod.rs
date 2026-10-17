@@ -113,6 +113,7 @@ use caudra_agent::{
     ToolOutput,
 };
 use caudra_config::InboundPolicy;
+use caudra_providers::accounts::Reroute;
 use caudra_providers::copilot_auth::CopilotIdentity;
 use caudra_providers::model_registry::Binding;
 use caudra_providers::{
@@ -1117,6 +1118,9 @@ pub enum Action {
     RefreshProvider {
         slug: String,
     },
+    /// Every session follows the main agent onto the model its conversation
+    /// moved to on another provider, unless the user picked another meanwhile.
+    FollowReroute(Box<Reroute>),
     AuthenticateProvider {
         provider: SubscriptionProvider,
         model_spec: String,

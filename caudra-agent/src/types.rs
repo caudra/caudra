@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use caudra_providers::accounts::{AccountExhaustion, AccountSwitch, RoutedAccount};
+use caudra_providers::accounts::{AccountExhaustion, AccountSwitch, Reroute, RoutedAccount};
 use caudra_providers::{
     AgentError, AutomationEventOrigin, AutopilotOrigin, Billing, ContentBlock, DocumentSource,
     ImageSource, Message, PEER_SCRIPT_SENDER, PEER_SESSION_SENDER, PeerMessageOrigin, Role,
@@ -3145,6 +3145,10 @@ pub enum AgentEvent {
     /// The conversation's account ran out and no other took over, so the user
     /// may choose one instead of waiting.
     AccountExhausted(Box<AccountExhaustion>),
+    /// The conversation moved to another provider's model, because its own
+    /// provider's subscriptions ran low or because it came back. Every later
+    /// request of the run goes to `to`.
+    ModelRerouted(Box<Reroute>),
     Error {
         message: String,
     },

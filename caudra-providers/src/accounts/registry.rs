@@ -18,7 +18,8 @@ use caudra_config::providers::{
 use caudra_storage::StateDir;
 use caudra_storage::accounts::{
     AccountId, AccountIdentity, AccountName, AccountSelection, StoredAccount, StoredSecret,
-    list_accounts, persist_account_selection, read_account_selection, save_account_health,
+    list_account_providers, list_accounts, persist_account_selection, read_account_selection,
+    save_account_health,
 };
 use caudra_storage::auth::now_millis;
 use tracing::warn;
@@ -374,6 +375,70 @@ pub(crate) fn slug_state(slug: &str) -> Result<Arc<SlugState>, AgentError> {
             .entry(slug.to_owned())
             .or_insert(state),
     ))
+}
+
+/// The providers `/accounts` lists: `current` first, then the order Auto
+/// moves conversations across, then every other provider with a stored or
+/// configured account.
+pub fn account_providers(current: &str) -> Vec<String> {
+    let config = ProvidersConfig::load();
+    let stored = registry_storage()
+        .map(|dir| {
+            list_account_providers(&dir).unwrap_or_else(|error| {
+                warn!(%error, "failed to list providers with stored accounts");
+                Vec::new()
+            })
+        })
+        .unwrap_or_default();
+    let mut configured: Vec<&String> = config
+        .providers
+        .iter()
+        .filter(|(_, definition)| !definition.accounts.is_empty())
+        .map(|(slug, _)| slug)
+        .collect();
+    configured.sort();
+    let mut providers = vec![current.to_owned()];
+    for provider in config
+        .provider_order()
+        .iter()
+        .chain(&stored)
+        .chain(configured)
+    {
+        if !providers.contains(provider) {
+            providers.push(provider.clone());
+        }
+    }
+    providers
+}
+
+/// Another provider's state, for weighing a move to it: its pool and quota
+/// readings as fresh as the refresh interval keeps them, and `None` when it
+/// has no signed-in account. Blocks on storage, so callers run it unblocked.
+pub(crate) fn peer_state(slug: &str) -> Option<Arc<SlugState>> {
+    let existing = POOLS.lock().unwrap().get(slug).cloned();
+    let state = match existing {
+        Some(state) => {
+            state.refresh(false);
+            state
+        }
+        None => {
+            let state = Arc::new(SlugState::live(slug).ok()?);
+            Arc::clone(
+                POOLS
+                    .lock()
+                    .unwrap()
+                    .entry(slug.to_owned())
+                    .or_insert(state),
+            )
+        }
+    };
+    state.reload_health();
+    Some(state)
+}
+
+#[cfg(test)]
+pub(crate) fn register_pool(state: Arc<SlugState>) {
+    POOLS.lock().unwrap().insert(state.slug.clone(), state);
 }
 
 fn build_snapshot(slug: &str, storage: Option<&StateDir>) -> Result<PoolSnapshot, AgentError> {

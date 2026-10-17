@@ -764,6 +764,7 @@ impl App {
                 RequestOptions {
                     thinking: self.state.thinking.clone(),
                     fast: self.state.fast,
+                    ..RequestOptions::default()
                 }
                 .clamped(model)
                 .thinking

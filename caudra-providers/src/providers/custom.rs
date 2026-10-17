@@ -739,6 +739,7 @@ mod tests {
         let requested = RequestOptions {
             thinking: ThinkingConfig::Effort("max".into()),
             fast: false,
+            ..RequestOptions::default()
         };
 
         assert_eq!(model.supports_thinking(), expected, "{protocol}");

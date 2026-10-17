@@ -365,6 +365,7 @@ impl Chat {
             AgentEvent::StreamReset
             | AgentEvent::AccountRouted { .. }
             | AgentEvent::AccountExhausted(_)
+            | AgentEvent::ModelRerouted(_)
             | AgentEvent::TaskAdmitted(_)
             | AgentEvent::Retry { .. }
             | AgentEvent::SubagentProgress { .. }

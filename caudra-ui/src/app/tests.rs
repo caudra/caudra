@@ -1412,6 +1412,7 @@ mod background_runtime {
         let slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
             model: app.state.model.clone(),
             provider: Arc::new(ControlledProvider(requests)),
+            home: None,
         }));
         let history = SubagentHistoryStore::default();
         let handles = AgentHandles::spawn(
@@ -5233,6 +5234,7 @@ fn active_context_snapshot_accepts_the_running_plan_model() {
     app.effective_model_slot = Some(Arc::new(ArcSwap::from_pointee(crate::agent::ModelSlot {
         model,
         provider: Arc::from(provider),
+        home: None,
     })));
     app.status = Status::Streaming;
     let store = ContextStore::new();
@@ -5276,6 +5278,7 @@ fn idle_plan_status_uses_the_last_validated_effective_snapshot() {
     app.effective_model_slot = Some(Arc::new(ArcSwap::from_pointee(crate::agent::ModelSlot {
         model,
         provider: Arc::from(provider),
+        home: None,
     })));
     app.state.mode = Mode::Plan;
     app.state.applied_mode = Mode::Plan;
@@ -8565,6 +8568,7 @@ fn projection_holds_the_bound_prompt_and_leaves_a_running_call_open() {
         RequestOptions {
             thinking: app.state.thinking.clone(),
             fast: true,
+            ..RequestOptions::default()
         },
         "{PROJECTION_OPTIONS_STALE}"
     );
@@ -19128,6 +19132,7 @@ fn extract_on_a_session_without_user_turns_flashes_instead_of_opening() {
     let chat = crate::agent::ModelSlot {
         model: test_model(),
         provider: Arc::new(PendingProvider),
+        home: None,
     };
     app.start_extract(caudra_providers::Timeouts::default(), &chat);
     assert!(!app.stream_modal.is_open());

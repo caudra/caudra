@@ -100,11 +100,51 @@ pub struct AccountExhaustion {
     pub alternatives: Vec<AccountAlternative>,
 }
 
+/// Why a conversation moved to another provider.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum RerouteReason {
+    /// Every subscription of the provider it left is spent or refused.
+    Spent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<WindowKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        used_percent: Option<u8>,
+    },
+    /// Every subscription of the provider it left runs low, and the cache
+    /// was cold anyway.
+    Low {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<WindowKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        used_percent: Option<u8>,
+    },
+    /// Back to the model the user chose, whose provider has quota again.
+    Home,
+    /// A provider earlier in the order has quota again.
+    Rebalanced,
+}
+
+/// A conversation leaving one provider for another, which the agent carries
+/// out by switching models before it sends the request again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Reroute {
+    /// The model spec the conversation leaves.
+    pub from: String,
+    /// The model spec it moves to.
+    pub to: String,
+    pub reason: RerouteReason,
+    /// The prompt the old provider had cached, which the new one rebuilds.
+    pub cached_tokens: u32,
+}
+
 /// What a provider did about a failed request before the agent retries it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Failover {
     /// Another account takes the retry, which should go out at once.
     Switched,
+    /// Another provider takes the retry, on another model.
+    Reroute(Box<Reroute>),
     /// The same account retries after the usual wait. `exhausted` is set when
     /// it is spent and the wait is long, so the user can choose instead.
     Stay {

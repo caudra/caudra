@@ -3257,6 +3257,7 @@ async fn spawn_prepared_session(
         mut store,
         changes,
     } = prepared;
+    let mut home_model: Option<Model> = None;
     let decisions = initialize_decisions(&params.decisions_config, &store.dir)?;
     if !params.config.features.enabled(Feature::Workflows) {
         params.workflow_mode = None;
@@ -4404,6 +4405,7 @@ async fn spawn_prepared_session(
                     .filter(|candidate| params.model_policy.allows(&candidate.spec()))
                     && new_model.spec() != model.spec()
                 {
+                    home_model = None;
                     let routed = live_model.load_full();
                     if routed.1.spec() == new_model.spec() {
                         provider = Arc::clone(&routed.0);
@@ -4588,13 +4590,21 @@ async fn spawn_prepared_session(
                 .with_goal(goal.clone())
                 .with_interrupt_source(Arc::new(QueuedPrompts(input_rx.clone())))
                 .with_mcp(turn_mcp)
-                .with_code(code.clone());
+                .with_code(code.clone())
+                .with_home_model(home_model.clone());
                 if let Some(autopilot) = &autopilot {
                     agent = agent.with_autopilot(autopilot.clone());
                 }
 
                 let result = agent.run(input).await;
+                let route = agent.conversation_route();
                 drop(agent);
+                if route.model.spec() != model.spec() {
+                    provider = route.provider;
+                    model = route.model;
+                    live_model.store(Arc::new((Arc::clone(&provider), Arc::new(model.clone()))));
+                }
+                home_model = route.home;
                 surface.touch(Instant::now());
                 cancel_task.cancel().await;
                 if let Some(pump) = &memory_pump {

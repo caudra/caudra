@@ -4,7 +4,7 @@
 //! routed provider of the slug re-read its pool.
 
 use caudra_config::providers::{
-    AccountDef, ProvidersFile, ProvidersFileError, SwitchStrategy, SwitchingDef,
+    AccountDef, MIN_PROVIDER_ORDER, ProvidersFile, ProvidersFileError, SwitchStrategy, SwitchingDef,
 };
 use caudra_storage::StateDir;
 use caudra_storage::accounts::{
@@ -148,6 +148,19 @@ pub fn set_strategy(provider: &str, strategy: SwitchStrategy) -> Result<(), Agen
         .map_err(config_error)?;
     invalidate(Some(provider));
     Ok(())
+}
+
+/// The providers Auto moves a conversation across, first to last. Fewer
+/// than two drops the order, which keeps every conversation on its provider.
+pub fn set_provider_order(providers: &[String]) -> Result<(), AgentError> {
+    let providers: &[String] = match providers.len() < MIN_PROVIDER_ORDER {
+        true => &[],
+        false => providers,
+    };
+    let mut file = ProvidersFile::load().map_err(config_error)?;
+    file.set_provider_order(providers)
+        .and_then(|()| file.save())
+        .map_err(config_error)
 }
 
 /// What `providers.toml` can list: its own entries and the credentials

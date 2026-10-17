@@ -363,3 +363,17 @@ version = 1
 # protection you control, such as a trusted encrypted tunnel.
 # Type: boolean.
 # allow_http = false
+
+# [switching]
+# Lets Auto move a conversation to another provider's subscription when its own
+# provider's subscriptions run low. It applies only to a provider whose
+# selection is Auto, and every move loses the prompt cache.
+
+# The provider slugs Auto may move a conversation across, in the order it tries
+# them, when every subscription of the conversation's provider is spent or
+# running low. The conversation moves to a subscription account of the next
+# provider with quota left, on a model of the same size, and comes back once
+# its own provider has quota again. Leave the table out to keep every
+# conversation on its provider.
+# Type: string[]. Required.
+# providers = ["anthropic", "openai"]

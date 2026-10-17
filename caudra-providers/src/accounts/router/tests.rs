@@ -9,8 +9,9 @@ use test_case::test_case;
 use super::*;
 use crate::accounts::credential::{AccountSecret, CredentialSource};
 use crate::accounts::quota::{QuotaWindow, WindowKind};
-use crate::accounts::registry::ProviderFactory;
 use crate::accounts::registry::test_support::{slot, snapshot};
+use crate::accounts::registry::{ProviderFactory, register_pool};
+use crate::accounts::route::RerouteReason;
 use crate::accounts::route::SelectionMode;
 
 const SLUG: &str = "test-provider";
@@ -25,6 +26,12 @@ const HOUR_MS: u64 = 60 * 60 * 1000;
 const LONG_WAIT: Duration = Duration::from_secs(120);
 const SHORT_WAIT: Duration = Duration::from_secs(10);
 const REFUSED: &str = "refused";
+const HOME_SLUG: &str = "test-home";
+const AWAY_SLUG: &str = "test-away";
+const HOME_MODEL: &str = "test-home/claude-opus-4-8";
+const AWAY_MODEL: &str = "test-away/claude-opus-4-8";
+const LOW_PERCENT: f32 = 90.0;
+const HEALTHY_PERCENT: f32 = 10.0;
 
 #[derive(Default)]
 struct Script {
@@ -69,12 +76,17 @@ struct Harness {
     state: Arc<SlugState>,
     script: Arc<Mutex<Script>>,
     model: Model,
+    opts: RequestOptions,
     events_tx: Sender<ProviderEvent>,
     events: Receiver<ProviderEvent>,
 }
 
 impl Harness {
     fn new(accounts: &[&str], selection: AccountSelection) -> Self {
+        Self::on(SLUG, accounts, selection)
+    }
+
+    fn on(slug: &str, accounts: &[&str], selection: AccountSelection) -> Self {
         let script = Arc::new(Mutex::new(Script::default()));
         let factory_script = Arc::clone(&script);
         let factory: ProviderFactory = Arc::new(move |credential: &AccountCredential, _| {
@@ -85,9 +97,9 @@ impl Harness {
         });
         let slots = accounts
             .iter()
-            .map(|name| slot(subscription(name), false))
+            .map(|name| slot(subscription_on(slug, name), false))
             .collect();
-        let state = Arc::new(SlugState::fixed(SLUG, factory, snapshot(slots, selection)));
+        let state = Arc::new(SlugState::fixed(slug, factory, snapshot(slots, selection)));
         let router = RoutedProvider::with_state(Arc::clone(&state), Timeouts::default()).unwrap();
         let (events_tx, events) = flume::unbounded();
         Self {
@@ -95,9 +107,36 @@ impl Harness {
             state,
             script,
             model: Model::from_spec(MODEL_SPEC).unwrap(),
+            opts: RequestOptions::default(),
             events_tx,
             events,
         }
+    }
+
+    /// Lets the conversation move along `targets` in order, with the other
+    /// providers registered from `peers`.
+    fn across(mut self, home: &str, targets: &[&str], peers: &[&Harness]) -> Self {
+        for peer in peers {
+            register_pool(Arc::clone(&peer.state));
+        }
+        self.opts.cross = Some(Arc::new(CrossRoute {
+            home: home.to_owned(),
+            targets: targets.iter().map(|spec| (*spec).to_owned()).collect(),
+        }));
+        self
+    }
+
+    fn observe(&self, account: &str, used_percent: f32) {
+        let now_ms = now_millis();
+        self.state.health.observe(
+            account,
+            vec![QuotaWindow::new(
+                WindowKind::FiveHour,
+                used_percent,
+                Some(now_ms + HOUR_MS),
+            )],
+            now_ms,
+        );
     }
 
     fn reply(&self, account: &str, response: StreamResponse) {
@@ -118,7 +157,7 @@ impl Harness {
             "",
             &Value::Null,
             &self.events_tx,
-            RequestOptions::default(),
+            self.opts.clone(),
             Some(&key),
         ))
     }
@@ -150,8 +189,12 @@ impl Harness {
 }
 
 fn subscription(name: &str) -> AccountCredential {
+    subscription_on(SLUG, name)
+}
+
+fn subscription_on(slug: &str, name: &str) -> AccountCredential {
     AccountCredential {
-        id: AccountId::new(SLUG, AccountName::new(name).unwrap()),
+        id: AccountId::new(slug, AccountName::new(name).unwrap()),
         secret: AccountSecret::OAuth(OAuthTokens {
             access: name.to_owned(),
             refresh: name.to_owned(),
@@ -350,6 +393,155 @@ fn an_idle_conversation_turns_cold() {
         .router
         .standing(Some(SESSION), &harness.model, hash_text(""), 0);
     assert!(matches!(standing, Standing::Cold { .. }));
+}
+
+fn rerouted(result: Result<StreamResponse, AgentError>) -> Reroute {
+    match result {
+        Err(AgentError::Rerouted(reroute)) => *reroute,
+        other => panic!("expected a move to another provider, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_spent_provider_moves_the_conversation_to_the_next_one() {
+    let away = Harness::on(AWAY_SLUG, &[PRIMARY], AccountSelection::Auto);
+    let home = Harness::on(HOME_SLUG, &[PRIMARY], AccountSelection::Auto).across(
+        HOME_MODEL,
+        &[HOME_MODEL, AWAY_MODEL],
+        &[&away],
+    );
+    home.reply(PRIMARY, spent_reply());
+    home.send(SESSION).unwrap();
+
+    let reroute = rerouted(home.send(SESSION));
+
+    assert_eq!(
+        reroute,
+        Reroute {
+            from: HOME_MODEL.into(),
+            to: AWAY_MODEL.into(),
+            reason: RerouteReason::Spent {
+                window: Some(WindowKind::FiveHour),
+                used_percent: Some(SPENT_PERCENT as u8),
+            },
+            cached_tokens: 0,
+        }
+    );
+    assert_eq!(home.served(), vec![PRIMARY]);
+}
+
+#[test]
+fn a_spent_provider_with_nowhere_to_go_keeps_the_conversation() {
+    let away = Harness::on(AWAY_SLUG, &[PRIMARY], AccountSelection::Auto);
+    away.observe(PRIMARY, SPENT_PERCENT);
+    let home = Harness::on(HOME_SLUG, &[PRIMARY], AccountSelection::Auto).across(
+        HOME_MODEL,
+        &[HOME_MODEL, AWAY_MODEL],
+        &[&away],
+    );
+    home.reply(PRIMARY, spent_reply());
+    home.send(SESSION).unwrap();
+
+    home.send(SESSION).unwrap();
+
+    assert_eq!(home.served(), vec![PRIMARY, PRIMARY]);
+}
+
+#[test]
+fn a_pinned_provider_is_never_left() {
+    let away = Harness::on(AWAY_SLUG, &[PRIMARY], AccountSelection::Auto);
+    let home = Harness::on(HOME_SLUG, &[PRIMARY], pinned(PRIMARY)).across(
+        HOME_MODEL,
+        &[HOME_MODEL, AWAY_MODEL],
+        &[&away],
+    );
+    home.reply(PRIMARY, spent_reply());
+    home.send(SESSION).unwrap();
+
+    home.send(SESSION).unwrap();
+
+    assert_eq!(home.served(), vec![PRIMARY, PRIMARY]);
+}
+
+#[test]
+fn a_low_provider_moves_only_at_a_cold_point() {
+    let away = Harness::on(AWAY_SLUG, &[PRIMARY], AccountSelection::Auto);
+    let home = Harness::on(HOME_SLUG, &[PRIMARY], AccountSelection::Auto).across(
+        HOME_MODEL,
+        &[HOME_MODEL, AWAY_MODEL],
+        &[&away],
+    );
+    home.send(SESSION).unwrap();
+    home.observe(PRIMARY, LOW_PERCENT);
+
+    home.send(SESSION).unwrap();
+    home.state
+        .lineages
+        .lock()
+        .unwrap()
+        .age(SESSION, UNKNOWN_CACHE_IDLE);
+    let reroute = rerouted(home.send(SESSION));
+
+    assert_eq!(home.served(), vec![PRIMARY, PRIMARY]);
+    assert_eq!(
+        (reroute.to.as_str(), reroute.reason),
+        (
+            AWAY_MODEL,
+            RerouteReason::Low {
+                window: Some(WindowKind::FiveHour),
+                used_percent: Some(LOW_PERCENT as u8),
+            }
+        )
+    );
+}
+
+#[test]
+fn a_moved_conversation_returns_home_at_a_cold_point() {
+    let home = Harness::on(HOME_SLUG, &[PRIMARY], AccountSelection::Auto);
+    home.observe(PRIMARY, LOW_PERCENT);
+    let away = Harness::on(AWAY_SLUG, &[PRIMARY], AccountSelection::Auto).across(
+        HOME_MODEL,
+        &[HOME_MODEL, AWAY_MODEL],
+        &[&home],
+    );
+    away.send(SESSION).unwrap();
+    home.observe(PRIMARY, HEALTHY_PERCENT);
+
+    away.send(SESSION).unwrap();
+    away.state
+        .lineages
+        .lock()
+        .unwrap()
+        .age(SESSION, UNKNOWN_CACHE_IDLE);
+    let reroute = rerouted(away.send(SESSION));
+
+    assert_eq!(away.served(), vec![PRIMARY, PRIMARY]);
+    assert_eq!(
+        (reroute.from.as_str(), reroute.to.as_str(), reroute.reason),
+        (AWAY_MODEL, HOME_MODEL, RerouteReason::Home)
+    );
+}
+
+#[test_case(AccountSelection::Auto, true ; "auto_moves")]
+#[test_case(pinned(PRIMARY), false ; "pinned_stays")]
+fn a_long_rate_limit_on_the_last_subscription_moves_providers(
+    selection: AccountSelection,
+    moves: bool,
+) {
+    let away = Harness::on(AWAY_SLUG, &[PRIMARY], AccountSelection::Auto);
+    let home = Harness::on(HOME_SLUG, &[PRIMARY], selection).across(
+        HOME_MODEL,
+        &[HOME_MODEL, AWAY_MODEL],
+        &[&away],
+    );
+    home.send(SESSION).unwrap();
+
+    let failover = home.failover(SESSION, &refusal(STATUS_RATE_LIMITED, Some(LONG_WAIT)));
+
+    assert_eq!(
+        matches!(failover, Failover::Reroute(reroute) if reroute.to == AWAY_MODEL),
+        moves
+    );
 }
 
 #[test]

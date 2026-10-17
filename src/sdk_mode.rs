@@ -49,7 +49,7 @@ use caudra_config::{
     AutomationsConfig, AutopilotConfig, ExecutionMode, Feature, FeatureDisabled, ModelPolicy,
     SnapshotsConfig, effective_shell_execution, effective_task_execution,
 };
-use caudra_providers::accounts::{AccountExhaustion, AccountSwitch, RoutedAccount};
+use caudra_providers::accounts::{AccountExhaustion, AccountSwitch, Reroute, RoutedAccount};
 use caudra_providers::model::Model;
 use caudra_providers::{
     AutomationEventOrigin, AutopilotMessageKind, Billing, HistoryItem, HistoryItemKind,
@@ -136,6 +136,7 @@ pub(crate) const AUTOPILOT_SYSTEM_SUBTYPE: &str = "autopilot";
 const DECISION_SYSTEM_SUBTYPE: &str = "decision";
 pub(crate) const ACCOUNT_SWITCH_SYSTEM_SUBTYPE: &str = "account_switch";
 pub(crate) const ACCOUNT_EXHAUSTED_SYSTEM_SUBTYPE: &str = "account_exhausted";
+pub(crate) const MODEL_REROUTED_SYSTEM_SUBTYPE: &str = "model_rerouted";
 const AUTOPILOT_START: &str = "autopilot_start";
 const AUTOPILOT_STOP: &str = "autopilot_stop";
 const AUTOPILOT_STATUS: &str = "autopilot_status";
@@ -408,6 +409,15 @@ pub(crate) struct AccountSwitchPayload<'a> {
 #[derive(Serialize)]
 pub(crate) struct AccountExhaustedPayload<'a> {
     pub(crate) exhaustion: &'a AccountExhaustion,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) parent_tool_use_id: Option<&'a str>,
+}
+
+/// The `system` / `model_rerouted` body: the conversation moved to another
+/// provider's model, and why.
+#[derive(Serialize)]
+pub(crate) struct ModelReroutedPayload<'a> {
+    pub(crate) reroute: &'a Reroute,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) parent_tool_use_id: Option<&'a str>,
 }
@@ -3878,6 +3888,13 @@ impl EventPump {
                 ACCOUNT_EXHAUSTED_SYSTEM_SUBTYPE,
                 serde_json::to_value(AccountExhaustedPayload {
                     exhaustion,
+                    parent_tool_use_id: parent_tool_use_id.as_deref(),
+                })?,
+            )?,
+            AgentEvent::ModelRerouted(reroute) => self.writer.emit_system(
+                MODEL_REROUTED_SYSTEM_SUBTYPE,
+                serde_json::to_value(ModelReroutedPayload {
+                    reroute,
                     parent_tool_use_id: parent_tool_use_id.as_deref(),
                 })?,
             )?,

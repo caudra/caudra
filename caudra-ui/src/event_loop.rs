@@ -67,7 +67,7 @@ use caudra_lua::{
     TaskRequest, UiAction, UiReply,
 };
 use caudra_providers::Timeouts;
-use caudra_providers::accounts::save_login;
+use caudra_providers::accounts::{Reroute, save_login};
 use caudra_providers::manifest::ManifestRegistry;
 use caudra_providers::openai_auth;
 use caudra_providers::provider::{Provider, fetch_all_models, from_model};
@@ -1704,7 +1704,8 @@ fn spawn_model_fetch(
     let task = smol::spawn(async move {
         let warn_tx = warn_tx_bg;
         let done = Box::new(move || {
-            let spec = model_slot.load().model.spec();
+            let current = model_slot.load_full();
+            let spec = current.model.spec();
             let mut resolved = match Model::from_spec(&spec) {
                 Ok(m) => m,
                 Err(e) => {
@@ -1722,6 +1723,7 @@ fn spawn_model_fetch(
             model_slot.store(Arc::new(ModelSlot {
                 model: resolved,
                 provider: Arc::from(provider),
+                home: current.home.clone(),
             }));
         });
         fetch_all_models(
@@ -1850,6 +1852,7 @@ impl<'t> EventLoop<'t> {
         let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
             model: model.clone(),
             provider,
+            home: None,
         }));
         let bg = spawn_model_fetch(&model_slot, timeouts, Arc::clone(&model_policy));
         let storage_writer = Arc::new(StorageWriter::new(storage.clone(), bg.warn_tx.clone()));
@@ -4492,6 +4495,7 @@ impl<'t> EventLoop<'t> {
                     self.ctx.model_slot.store(Arc::new(ModelSlot {
                         model: new_model,
                         provider: Arc::from(new_provider),
+                        home: None,
                     }));
                 }
                 self.respawn_agent(idx, loaded.messages);
@@ -4674,6 +4678,7 @@ impl<'t> EventLoop<'t> {
                 self.change_system_prompt_profile(idx, &name);
             }
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
+            Action::FollowReroute(reroute) => self.follow_reroute(idx, &reroute),
             Action::AuthenticateProvider {
                 provider,
                 model_spec,
@@ -4892,6 +4897,7 @@ impl<'t> EventLoop<'t> {
         self.ctx.model_slot.store(Arc::new(ModelSlot {
             model: new_model,
             provider: Arc::from(new_provider),
+            home: None,
         }));
         Ok(())
     }
@@ -5006,8 +5012,41 @@ impl<'t> EventLoop<'t> {
         .detach();
     }
 
+    /// Moving back to the model the user chose drops the record of it.
+    fn follow_reroute(&mut self, idx: usize, reroute: &Reroute) {
+        let current = self.ctx.model_slot.load_full();
+        if current.model.spec() != reroute.from {
+            return;
+        }
+        let home = current
+            .home
+            .clone()
+            .unwrap_or_else(|| current.model.clone());
+        let resolved = Model::from_spec_with_policy(&reroute.to, &self.ctx.model_policy)
+            .map_err(|error| error.to_string())
+            .and_then(|mut model| {
+                from_model(&mut model, self.ctx.timeouts)
+                    .map(|provider| (model, provider))
+                    .map_err(|error| error.to_string())
+            });
+        let (model, provider) = match resolved {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                warn!(to = %reroute.to, %error, "cannot follow the conversation to another provider");
+                return;
+            }
+        };
+        self.sessions[idx].app.usage_slot.store(None);
+        self.ctx.model_slot.store(Arc::new(ModelSlot {
+            home: (home.spec() != model.spec()).then_some(home),
+            model,
+            provider: Arc::from(provider),
+        }));
+    }
+
     fn refresh_provider(&mut self, slug: String) {
-        let mut model = self.ctx.model_slot.load().model.clone();
+        let current = self.ctx.model_slot.load_full();
+        let mut model = current.model.clone();
         if model.provider.to_string() == slug {
             if let Ok(provider) =
                 caudra_providers::provider::from_model(&mut model, self.ctx.timeouts)
@@ -5016,6 +5055,7 @@ impl<'t> EventLoop<'t> {
                 self.ctx.model_slot.store(Arc::new(ModelSlot {
                     model,
                     provider: Arc::from(provider),
+                    home: current.home.clone(),
                 }));
             }
         } else if let Some(builtin) = caudra_config::providers::builtin_provider(&slug)
@@ -5449,6 +5489,7 @@ mod tests {
             model_slot: Arc::new(ArcSwap::from_pointee(ModelSlot {
                 model: test_model(),
                 provider: Arc::new(PlanProvider),
+                home: None,
             })),
             available_models: Arc::new(ArcSwapOption::empty()),
             storage_writer: Arc::new(StorageWriter::new(

@@ -28,8 +28,9 @@ use crate::{ConfigField, ConfigValue};
 mod accounts;
 
 pub use accounts::{
-    AccountDef, AccountsConfigError, DEFAULT_PREFER_BELOW, DEFAULT_SWITCH_BELOW, QuotaWindowName,
-    SwitchStrategy, SwitchingDef,
+    AccountDef, AccountsConfigError, DEFAULT_PREFER_BELOW, DEFAULT_SWITCH_BELOW,
+    GlobalSwitchingDef, MIN_PROVIDER_ORDER, QuotaWindowName, SWITCHING_KEY, SwitchStrategy,
+    SwitchingDef,
 };
 
 pub const PROVIDERS_FILE: &str = "providers.toml";
@@ -571,7 +572,8 @@ pub enum ProviderSlugError {
 }
 
 /// Slug for a new custom provider. Top-level keys of `providers.toml` are
-/// slugs, so the file's own `version` and `decisions` keys cannot be one.
+/// slugs, so the file's own `version`, `decisions`, and `switching` keys
+/// cannot be one.
 pub fn custom_provider_slug(name: &str) -> Result<String, ProviderSlugError> {
     let slug = slugify(name);
     match slug.as_str() {
@@ -582,6 +584,7 @@ pub fn custom_provider_slug(name: &str) -> Result<String, ProviderSlugError> {
         DECISIONS_TABLE => Err(ProviderSlugError::Reserved {
             key: DECISIONS_TABLE,
         }),
+        SWITCHING_KEY => Err(ProviderSlugError::Reserved { key: SWITCHING_KEY }),
         _ => Ok(slug),
     }
 }
@@ -985,6 +988,13 @@ pub struct ProvidersConfig {
     /// Named decision endpoints, `[decisions.<name>]`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub decisions: BTreeMap<String, DecisionEndpointDef>,
+    /// The cross-provider order, `[switching]`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "accounts::deserialize_global_switching"
+    )]
+    pub switching: Option<GlobalSwitchingDef>,
     #[serde(flatten, deserialize_with = "deserialize_providers")]
     pub providers: HashMap<String, ProviderDef>,
 }
@@ -1103,6 +1113,14 @@ impl ProvidersConfig {
     pub fn upsert(&mut self, slug: String, def: ProviderDef) {
         self.providers.insert(slug, def);
     }
+
+    /// The providers Auto moves a conversation across, empty when it keeps
+    /// every conversation on its provider.
+    pub fn provider_order(&self) -> &[String] {
+        self.switching
+            .as_ref()
+            .map_or(&[], |switching| switching.providers.as_slice())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -1192,6 +1210,10 @@ impl ProvidersFile {
 
     pub fn get(&self, slug: &str) -> Option<&ProviderDef> {
         self.config.get(slug)
+    }
+
+    pub fn provider_order(&self) -> &[String] {
+        self.config.provider_order()
     }
 
     pub fn upsert(&mut self, slug: String, def: ProviderDef) -> Result<(), ProvidersFileError> {
@@ -1922,6 +1944,7 @@ best = "gpt-4.1"
     #[test_case(" -- ", Err(ProviderSlugError::Empty) ; "separators_only")]
     #[test_case(" Version ", Err(ProviderSlugError::Reserved { key: CONFIG_VERSION_KEY }) ; "reserved_after_slugify")]
     #[test_case("Decisions", Err(ProviderSlugError::Reserved { key: DECISIONS_TABLE }) ; "decisions_reserved")]
+    #[test_case("Switching", Err(ProviderSlugError::Reserved { key: SWITCHING_KEY }) ; "switching_reserved")]
     fn custom_provider_slug_refuses_unusable_names(
         name: &str,
         expected: Result<String, ProviderSlugError>,

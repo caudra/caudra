@@ -4388,6 +4388,7 @@ impl App {
             opts: RequestOptions {
                 thinking: self.state.thinking.clone(),
                 fast: self.state.fast,
+                ..RequestOptions::default()
             },
         }));
     }
@@ -5549,6 +5550,9 @@ impl App {
             AgentEvent::AccountExhausted(exhaustion) => {
                 self.account_exhausted(chat_idx, main_agent, *exhaustion);
                 return vec![];
+            }
+            AgentEvent::ModelRerouted(reroute) => {
+                return self.model_rerouted(chat_idx, main_agent, *reroute);
             }
             event => event,
         };

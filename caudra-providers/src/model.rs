@@ -1007,7 +1007,17 @@ impl Model {
         anchor: &Self,
         policy: &ModelPolicy,
     ) -> Option<Self> {
-        let slug = anchor.provider.as_ref();
+        Self::default_on(&anchor.provider, purpose, &anchor.id, policy)
+    }
+
+    /// [`Self::provider_default`] on `slug`, which need not be the anchor's
+    /// provider: the generation of `anchor_id` picks among a manifest's lines.
+    pub fn default_on(
+        slug: &str,
+        purpose: ModelPurpose,
+        anchor_id: &str,
+        policy: &ModelPolicy,
+    ) -> Option<Self> {
         let cheapest = (purpose == ModelPurpose::Fast)
             .then(|| {
                 model_registry::cheapest_known(slug)
@@ -1017,7 +1027,7 @@ impl Model {
         custom::declared_purpose(slug, purpose)
             .into_iter()
             .chain(
-                ManifestRegistry::prefixes_for_purpose(slug, purpose, &anchor.id)
+                ManifestRegistry::prefixes_for_purpose(slug, purpose, anchor_id)
                     .into_iter()
                     .map(str::to_string),
             )

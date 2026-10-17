@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use caudra_providers::accounts::Failover;
+use caudra_providers::accounts::{Failover, Reroute};
 use caudra_providers::provider::Provider;
 use caudra_providers::retry::{MAX_RETRIES, RetryDecision, RetryState};
 use caudra_providers::{
@@ -533,6 +533,12 @@ pub(crate) enum StreamError {
         error: AgentError,
         forwarded: bool,
     },
+    /// The conversation moves to another provider's model before the request
+    /// goes out again.
+    Reroute {
+        reroute: Box<Reroute>,
+        forwarded: bool,
+    },
     Other(AgentError),
 }
 
@@ -547,28 +553,40 @@ impl From<StreamError> for AgentError {
         match e {
             StreamError::Cancelled { .. } => Self::Cancelled,
             StreamError::Auth { error, .. } => error,
+            StreamError::Reroute { reroute, .. } => Self::Rerouted(reroute),
             StreamError::Partial { error, .. } => error,
             StreamError::Other(e) => e,
         }
     }
 }
 
+/// What a failed request leads to once its provider had its say.
+enum Recovery {
+    /// Another account takes the retry at once.
+    Switched,
+    /// Another provider's model takes it, which the agent switches to.
+    Rerouted(Box<Reroute>),
+    /// The same account, after the usual wait if the error is retryable.
+    Stay,
+}
+
 /// Lets a provider with several accounts move the conversation off one that
-/// refused it. True when another account takes the retry at once; a spent
-/// account nothing took over from is reported so the user can choose.
+/// refused it. A spent account nothing took over from is reported so the
+/// user can choose.
 async fn fail_over(
     provider: &dyn Provider,
     error: &AgentError,
     cache_key: Option<&CacheKey>,
     event_tx: Option<&EventSender>,
-) -> bool {
+) -> Recovery {
     match provider.failover(error, cache_key).await {
-        Failover::Switched => true,
+        Failover::Switched => Recovery::Switched,
+        Failover::Reroute(reroute) => Recovery::Rerouted(reroute),
         Failover::Stay { exhausted } => {
             if let (Some(exhaustion), Some(event_tx)) = (exhausted, event_tx) {
                 let _ = event_tx.send(AgentEvent::AccountExhausted(Box::new(exhaustion)));
             }
-            false
+            Recovery::Stay
         }
     }
 }
@@ -829,6 +847,9 @@ async fn stream_with_retry_inner(
                 retry.recovered(model);
                 return Ok(r);
             }
+            Err(AgentError::Rerouted(reroute)) => {
+                return Err(StreamError::Reroute { reroute, forwarded });
+            }
             Err(e) if speculative.is_some_and(|runs| runs.has_admitted()) => {
                 if !matches!(e, AgentError::Cancelled) {
                     emit_api_error(model, &e, retry.state.attempts() + 1, started.elapsed());
@@ -888,7 +909,16 @@ async fn stream_with_retry_inner(
             }
             Err(e) => {
                 emit_api_error(model, &e, retry.state.attempts() + 1, started.elapsed());
-                let switched = fail_over(provider, &e, cache_key, event_tx).await;
+                let switched = match fail_over(provider, &e, cache_key, event_tx).await {
+                    Recovery::Rerouted(reroute) => {
+                        if let Some(runs) = speculative {
+                            runs.abandon_unfinished();
+                        }
+                        return Err(StreamError::Reroute { reroute, forwarded });
+                    }
+                    Recovery::Switched => true,
+                    Recovery::Stay => false,
+                };
                 if switched || e.is_retryable() {
                     // The attempt's children outlive their ids: the message they
                     // were dispatched for is gone, so whatever they went on to

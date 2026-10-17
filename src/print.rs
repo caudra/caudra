@@ -40,6 +40,7 @@ use serde_json::{Value, json};
 use crate::sdk_mode::{
     ACCOUNT_EXHAUSTED_SYSTEM_SUBTYPE, ACCOUNT_SWITCH_SYSTEM_SUBTYPE, AUTOPILOT_SYSTEM_SUBTYPE,
     AccountExhaustedPayload, AccountSwitchPayload, AutopilotSystemPayload,
+    MODEL_REROUTED_SYSTEM_SUBTYPE, ModelReroutedPayload,
 };
 
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -528,6 +529,17 @@ pub fn run(
                 ),
             },
             AgentEvent::AccountRouted { switch: None, .. } => {}
+            AgentEvent::ModelRerouted(reroute) => match &mut verbose_out {
+                Some(out) => out.emit(&SystemEvent::new(
+                    MODEL_REROUTED_SYSTEM_SUBTYPE,
+                    ModelReroutedPayload {
+                        reroute,
+                        parent_tool_use_id,
+                    },
+                    &session_id,
+                ))?,
+                None => eprintln!("Switched model {} → {}", reroute.from, reroute.to),
+            },
             AgentEvent::AccountExhausted(exhaustion) => match &mut verbose_out {
                 Some(out) => out.emit(&SystemEvent::new(
                     ACCOUNT_EXHAUSTED_SYSTEM_SUBTYPE,

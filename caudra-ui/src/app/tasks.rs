@@ -270,6 +270,7 @@ impl App {
         let opts = RequestOptions {
             thinking: self.state.thinking.clone(),
             fast: self.state.fast,
+            ..RequestOptions::default()
         };
         let (sender, reply) = flume::bounded(1);
         let continuation = async move {

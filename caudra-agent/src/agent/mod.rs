@@ -53,7 +53,7 @@ pub use instructions::{
 };
 pub use provider_projection::{ProjectedHistory, project_for_inspection, project_request};
 pub use run::{
-    Agent, AgentParams, AgentRunParams, ModelRoute, estimate_message_tokens,
+    Agent, AgentParams, AgentRunParams, ConversationRoute, ModelRoute, estimate_message_tokens,
     resolve_compaction_model, resolve_model_for_purpose, resolve_purpose_model,
 };
 #[cfg(test)]
