@@ -2,7 +2,7 @@
 //! it said it reads: ACP's own subagent sessions, Caudra's `_caudra/*`
 //! notifications, or else the child's tool calls on the parent's transcript.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,11 +18,13 @@ use caudra_agent::types::AgentEvent;
 use caudra_agent::{SubagentActivity, SubagentEnd, SubagentInfo, TaskCard, ToolOutput};
 use caudra_storage::background::JobKind;
 use caudra_storage::id::CaudraId;
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::asks::{
     ask_permission, present_permission_update, resolve_presented_permission, shown_call,
 };
+use crate::errors::invalid_target;
 use crate::locked;
 use crate::outbound::{Outbound, PendingState};
 use crate::translate::{self, META_NAMESPACE, MessageCursor, OpenCalls};
@@ -38,8 +40,11 @@ pub(crate) const TASK_BACKGROUNDED: &str = "_caudra/task/backgrounded";
 pub(crate) const TASK_COMPLETED: &str = "_caudra/task/completed";
 pub(crate) const SUBAGENT_CANCEL: &str = "_caudra/subagent/cancel";
 pub(crate) const TASK_KILL: &str = "_caudra/task/kill";
-pub(crate) const UNKNOWN_SUBAGENT: &str = "the session has no running subagent";
-pub(crate) const UNKNOWN_TASK: &str = "the session has no running background task";
+pub(crate) const UNKNOWN_SUBAGENT: &str = "the session ran no such subagent";
+pub(crate) const UNKNOWN_TASK: &str = "the session ran no such background task";
+/// How many ended subagents a session remembers, so a late cancel for one
+/// still answers `not_running`.
+const MAX_ENDED_SUBAGENTS: usize = 256;
 /// The largest `_caudra/*` frame, envelope included.
 pub(crate) const MAX_FRAME_BYTES: usize = 32 * 1024;
 /// The longest descriptive text field; output fields fill the frame instead.
@@ -91,23 +96,75 @@ impl ChildTier {
     }
 }
 
-/// The subagents a session is running, by task id, which the dispatcher
-/// checks before it cancels one.
+/// What `_caudra/subagent/cancel` and `_caudra/task/kill` answer for a
+/// target the session knows.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub(crate) enum StopOutcome {
+    Stopped,
+    NotRunning { status: String },
+}
+
+#[derive(Default)]
+struct Ledger {
+    running: HashSet<String>,
+    /// The most recently ended last, with the status they ended in.
+    ended: VecDeque<(String, &'static str)>,
+}
+
+/// The subagents a session is running and the ones it saw end, by task id,
+/// which the dispatcher checks before it cancels one.
 #[derive(Clone, Default)]
-pub(crate) struct Children(Arc<Mutex<HashSet<String>>>);
+pub(crate) struct Children(Arc<Mutex<Ledger>>);
 
 impl Children {
     pub(crate) fn running(&self, subagent_id: &str) -> bool {
-        locked(&self.0).contains(subagent_id)
+        locked(&self.0).running.contains(subagent_id)
+    }
+
+    pub(crate) fn ended(&self, subagent_id: &str) -> Option<&'static str> {
+        locked(&self.0)
+            .ended
+            .iter()
+            .rev()
+            .find(|(ended, _)| ended == subagent_id)
+            .map(|(_, status)| *status)
     }
 
     fn insert(&self, subagent_id: &str) {
-        locked(&self.0).insert(subagent_id.to_owned());
+        let mut ledger = locked(&self.0);
+        ledger.ended.retain(|(ended, _)| ended != subagent_id);
+        ledger.running.insert(subagent_id.to_owned());
     }
 
-    fn remove(&self, subagent_id: &str) {
-        locked(&self.0).remove(subagent_id);
+    fn finish(&self, subagent_id: &str, status: &'static str) {
+        let mut ledger = locked(&self.0);
+        ledger.running.remove(subagent_id);
+        ledger.ended.push_back((subagent_id.to_owned(), status));
+        if ledger.ended.len() > MAX_ENDED_SUBAGENTS {
+            ledger.ended.pop_front();
+        }
     }
+}
+
+/// Whether the shell `card` shows still runs, so a kill stops it, or what
+/// the kill answers at once: `not_running` with how it ended, or invalid
+/// params for a task that is no shell this session ran.
+pub(crate) fn shell_stop(
+    card: Option<TaskCard>,
+    task_id: &str,
+) -> Result<Option<StopOutcome>, AcpError> {
+    match card {
+        Some(card) if card.kind == JobKind::Shell && card.active() => Ok(None),
+        Some(card) if card.kind == JobKind::Shell => {
+            Ok(Some(StopOutcome::NotRunning { status: card.state }))
+        }
+        _ => Err(unknown_task(task_id)),
+    }
+}
+
+pub(crate) fn unknown_task(task_id: &str) -> AcpError {
+    invalid_target(&format!("{UNKNOWN_TASK}: {task_id}"))
 }
 
 /// The session a standard-tier client knows a subagent by.
@@ -220,7 +277,7 @@ impl ChildWork {
             tracked.insert(info.task_id.clone(), Tracked::new(info, now));
         }
         if let AgentEvent::SubagentFinished { end } = &event {
-            children.remove(&info.task_id);
+            children.finish(&info.task_id, end_status(end));
             if let Some(child) = tracked.remove(&info.task_id) {
                 route.finish(ctx, info, child, end, now);
             }
@@ -399,19 +456,17 @@ impl Route {
                 ctx.parent_update(&self.parent, SessionUpdate::SubagentUpdate(update));
             }
             ChildTier::Vendor => {
-                let (status, error, output) = match end {
-                    SubagentEnd::Completed { output } => (STATUS_COMPLETED, None, Some(output)),
+                let (error, output) = match end {
+                    SubagentEnd::Completed { output } => (None, Some(output)),
                     SubagentEnd::Failed { error, partial } => {
-                        (STATUS_FAILED, Some(capped(error)), partial.as_ref())
+                        (Some(capped(error)), partial.as_ref())
                     }
-                    SubagentEnd::Cancelled { partial } => {
-                        (STATUS_CANCELLED, None, partial.as_ref())
-                    }
+                    SubagentEnd::Cancelled { partial } => (None, partial.as_ref()),
                 };
                 let params = json!({
                     "sessionId": self.parent,
                     "subagentId": info.task_id,
-                    "status": status,
+                    "status": end_status(end),
                     "error": error,
                     "durationMs": millis(now, child.started),
                     "toolCalls": child.tool_calls,
@@ -508,6 +563,15 @@ fn naming(meta: Option<Meta>, subagent_id: &str) -> Meta {
         caudra.insert(META_SUBAGENT_ID.to_owned(), json!(subagent_id));
     }
     meta
+}
+
+/// The `status` a subagent ended in, as `_caudra/subagent/finished` names it.
+fn end_status(end: &SubagentEnd) -> &'static str {
+    match end {
+        SubagentEnd::Completed { .. } => STATUS_COMPLETED,
+        SubagentEnd::Failed { .. } => STATUS_FAILED,
+        SubagentEnd::Cancelled { .. } => STATUS_CANCELLED,
+    }
 }
 
 fn describe(activity: &SubagentActivity) -> String {
@@ -1263,8 +1327,86 @@ mod tests {
         let params = json!({"sessionId": test.sid, "subagentId": SUBAGENT});
         test.server.handle_message(request(SUBAGENT_CANCEL, params));
 
-        assert_eq!(test.next_message()["result"], json!({}));
+        assert_eq!(test.next_message()["result"], json!({"outcome": "stopped"}));
         assert!(token.is_cancelled());
+    }
+
+    #[test_case(STATUS_COMPLETED ; "completed")]
+    #[test_case(STATUS_FAILED ; "failed")]
+    #[test_case(STATUS_CANCELLED ; "cancelled")]
+    fn cancelling_an_ended_subagent_answers_how_it_ended(status: &'static str) {
+        let mut test = TestServer::with_session();
+        test.session().children.insert(SUBAGENT);
+        test.session().children.finish(SUBAGENT, status);
+        let params = json!({"sessionId": test.sid, "subagentId": SUBAGENT});
+        test.server.handle_message(request(SUBAGENT_CANCEL, params));
+
+        assert_eq!(
+            test.next_message()["result"],
+            json!({"outcome": "not_running", "status": status})
+        );
+    }
+
+    #[test_case(SUBAGENT_CANCEL ; "subagent_cancel")]
+    #[test_case(TASK_KILL ; "task_kill")]
+    fn a_missing_target_is_invalid_params(method: &str) {
+        let mut test = TestServer::with_session();
+        let params = json!({"sessionId": test.sid});
+        test.server.handle_message(request(method, params));
+
+        assert_eq!(test.next_message()["error"]["code"], INVALID_PARAMS);
+    }
+
+    #[test]
+    fn a_session_forgets_its_oldest_ended_subagents_past_the_cap() {
+        let children = Children::default();
+        let ids: Vec<String> = (0..=MAX_ENDED_SUBAGENTS)
+            .map(|index| format!("{SUBAGENT}-{index}"))
+            .collect();
+        for id in &ids {
+            children.insert(id);
+            children.finish(id, STATUS_COMPLETED);
+        }
+
+        assert_eq!(children.ended(&ids[0]), None);
+        assert_eq!(children.ended(&ids[1]), Some(STATUS_COMPLETED));
+        assert_eq!(
+            children.ended(&ids[MAX_ENDED_SUBAGENTS]),
+            Some(STATUS_COMPLETED)
+        );
+    }
+
+    #[test_case(Some(shell_card(RUNNING, None)), Some(None) ; "running_shell_is_stopped")]
+    #[test_case(Some(shell_card(FAILED_STATE, None)), Some(Some(StopOutcome::NotRunning { status: FAILED_STATE.into() })) ; "ended_shell_is_not_running")]
+    #[test_case(Some(TaskCard { kind: JobKind::Agent, ..shell_card(RUNNING, None) }), None ; "agent_task_is_unknown")]
+    #[test_case(None, None ; "unseen_task_is_unknown")]
+    fn a_kill_follows_the_shell_card(
+        card: Option<TaskCard>,
+        expected: Option<Option<StopOutcome>>,
+    ) {
+        match (shell_stop(card, TASK), expected) {
+            (Ok(stop), Some(expected)) => assert_eq!(stop, expected),
+            (Err(error), None) => {
+                assert_eq!(error.code, AcpError::invalid_params().code);
+                assert!(error.message.starts_with(UNKNOWN_TASK));
+            }
+            (stop, expected) => panic!("{stop:?} is not {expected:?}"),
+        }
+    }
+
+    #[test]
+    fn a_child_session_cancel_for_an_ended_subagent_is_a_no_op() {
+        let mut test = TestServer::with_session();
+        test.session().children.insert(SUBAGENT);
+        test.session().children.finish(SUBAGENT, STATUS_COMPLETED);
+        let child = child_session_id(&test.sid, SUBAGENT);
+        test.server.handle_message(json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "method": "session/cancel",
+            "params": {"sessionId": child},
+        }));
+
+        assert!(test.frames.try_recv().is_err());
     }
 
     #[test]

@@ -19,7 +19,9 @@ use caudra_storage::sessions::change_stores::{
 use caudra_storage::sessions::sweep::{
     self, Action, ExecuteReport, OutcomeKind, Plan, PruneReport,
 };
-use caudra_storage::sessions::{SESSIONS_DB_FILE, SessionDatabase, UsageBucket, cache_hit_rate};
+use caudra_storage::sessions::{
+    SESSIONS_DB_FILE, SessionDatabase, SessionPreview, UsageBucket, cache_hit_rate,
+};
 use caudra_storage::tool_ledger::ToolLedger;
 use caudra_storage::usage_ledger::UsageLedger;
 use color_eyre::Result;
@@ -27,6 +29,7 @@ use color_eyre::eyre::{Context, bail, eyre};
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, Zoned};
 use serde::Serialize;
+use tracing::warn;
 
 use crate::cli::{Cli, KeepPolicyArgs, PolicyScopeArgs, StorageAction, UsageGrouping};
 use crate::setup;
@@ -86,6 +89,17 @@ struct SessionRow<'a> {
     facts: &'a SessionFacts,
     artifact_bytes: u64,
     trimmed: bool,
+    #[serde(flatten)]
+    preview: Option<SessionPreview>,
+}
+
+/// A history that cannot be read previews nothing rather than failing the
+/// listing.
+fn preview(database: &SessionDatabase, id: CaudraId) -> SessionPreview {
+    database.session_preview(id).unwrap_or_else(|error| {
+        warn!(session = %id, %error, "could not preview a session");
+        SessionPreview::default()
+    })
 }
 
 #[derive(Serialize)]
@@ -188,6 +202,7 @@ pub fn run(action: StorageAction, cli: &Cli) -> Result<()> {
                     facts,
                     artifact_bytes: database.artifact_bytes(facts.id),
                     trimmed: facts.is_trimmed(),
+                    preview: json.then(|| preview(&database, facts.id)),
                 })
                 .collect();
             if json {
@@ -402,6 +417,7 @@ fn apply_by_ids(
                         facts,
                         artifact_bytes: database.artifact_bytes(facts.id),
                         trimmed: facts.is_trimmed(),
+                        preview: None,
                     })
                     .ok_or_else(|| color_eyre::eyre::eyre!("unknown session {id}"))
             })
@@ -1048,6 +1064,40 @@ mod tests {
     const OPEN_RECORDS: u32 = 222;
     const PENDING_REVERTS: u32 = 333;
     const RECLAIMABLE_FIELD: &str = "snapshot_garbage_bytes";
+
+    #[test_case(Some(SessionPreview { model: Some("anthropic/claude-opus-4-6".into()), first_prompt: Some("fix the build".into()), last_prompt: None }), json!(["anthropic/claude-opus-4-6", "fix the build", null]); "previewed")]
+    #[test_case(None, json!([null, null, null]); "not_previewed")]
+    fn a_session_row_carries_its_preview_in_snake_case(
+        preview: Option<SessionPreview>,
+        expected: serde_json::Value,
+    ) {
+        let facts = SessionFacts {
+            id: CaudraId::generate(),
+            title: String::new(),
+            cwd: WORKSPACE_ROOT.into(),
+            created_at: 0,
+            updated_at: 0,
+            last_opened_at: None,
+            pinned: false,
+            trimmed_at: None,
+            pending_revert: false,
+            logical_bytes: 0,
+        };
+        let row = SessionRow {
+            facts: &facts,
+            artifact_bytes: 0,
+            trimmed: false,
+            preview,
+        };
+
+        let wire = serde_json::to_value(&row).unwrap();
+
+        assert_eq!(
+            json!([wire["model"], wire["first_prompt"], wire["last_prompt"]]),
+            expected
+        );
+        assert_eq!(wire["cwd"], WORKSPACE_ROOT);
+    }
 
     fn bucket(bucket_start: i64, provider: &str, model: &str, cwd: &str, cost: f64) -> UsageBucket {
         purposed_bucket(

@@ -11,6 +11,7 @@ mod index;
 mod query;
 mod snippet;
 
+pub(crate) use extract::strip_reminders;
 pub use query::highlight_history;
 
 use std::fmt;

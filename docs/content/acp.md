@@ -79,7 +79,7 @@ ACP session ids are Caudra session ids, the same ones the TUI's session picker a
 | `session/new` | Opens a session in the given working directory. |
 | `session/load` | Opens a stored session and replays the full conversation. It resumes on the model it recorded while your model policy still allows it. Loading a session that is already open replays it again. |
 | `session/resume` | Opens a stored session without replaying it. |
-| `session/list` | Your local sessions, newest first, 100 per page with a cursor, optionally filtered by directory. Each entry has its title, last-update time, and `_meta.caudra.model`. |
+| `session/list` | Your local sessions, newest first, 100 per page with a cursor, optionally filtered by directory. Each entry has its title, last-update time, and `_meta.caudra` with `model`, `firstPrompt`, and `lastPrompt`: the first and last prompt you typed, trimmed and cut to 280 characters, without images, file mentions, or Caudra's reminders, or `null` when there is none. |
 | `session/fork` | Copies a stored session into a new one that carries the conversation and permission mode, without its conversation approvals. |
 | `session/close` | Cancels a running turn, then closes the session. |
 | `session/delete` | Deletes a stored session, and closes it first when it is open. |
@@ -139,7 +139,7 @@ When a skill and an MCP prompt share a name, the skill wins, and `compact` wins 
 
 ## Prompts, cancellation, and steering
 
-Every prompt has an id. Caudra takes it from the request's `_meta.promptId` when that is a string and generates one otherwise. Every `session/update` the turn sends carries it in `_meta.caudra.promptId`. The prompt response carries `_meta.caudra` with `promptId`, `durationMs`, and `usage`, the turn's token usage in full.
+Every prompt has an id. Caudra takes it from the request's `_meta.promptId` when that is a string and generates one otherwise. Every `session/update` the turn sends carries it in `_meta.caudra.promptId`. The prompt response carries `_meta.caudra` with `promptId`, `durationMs`, and `usage`, the turn's token usage in full. A turn Caudra starts on its own, such as the one that reports a finished background task, answers no prompt, and its updates carry no `promptId`. A prompt sent while it runs waits for it to end.
 
 A second prompt to a busy session is refused with `invalid_request` (`-32600`), unless its turn was cancelled or the prompt steers.
 
@@ -203,10 +203,10 @@ Caudra advertises `agentCapabilities._meta.caudra.childWork: true`. An editor th
 | `_caudra/subagent/finished` | Notification | `sessionId`, `subagentId`, `status` (`completed`, `failed`, or `cancelled`), `error`, `durationMs`, `toolCalls`, `turns`, `tokensUsed`, `output` |
 | `_caudra/task/backgrounded` | Notification | `sessionId`, `toolCallId`, `taskId`, `command`, `cwd` |
 | `_caudra/task/completed` | Notification | `sessionId`, `taskId`, `state` (such as `succeeded`, `failed`, or `cancelled`), `exitCode`, `signal`, `output`, `truncated`, `outputTotalBytes` |
-| `_caudra/subagent/cancel` | Request | `sessionId`, `subagentId`. Cancels that subagent and answers `{}`. |
-| `_caudra/task/kill` | Request | `sessionId`, `taskId`. Stops that background shell command and answers `{}` once it has stopped. |
+| `_caudra/subagent/cancel` | Request | `sessionId`, `subagentId`. Cancels that subagent and answers `{"outcome": "stopped"}`. |
+| `_caudra/task/kill` | Request | `sessionId`, `taskId`. Stops that background shell command and answers `{"outcome": "stopped"}` once it has stopped. |
 
-`parentPromptId` is the id of the prompt whose turn spawned the subagent. `progress` is sent only when a count or the activity changed, and at most every 2 seconds per subagent. `finished` carries the final answer as `output`, or the partial answer of a subagent that failed or was cancelled. `truncated` is `true` when `output` holds less than the `outputTotalBytes` the command wrote. A cancel or kill naming a subagent or task that is not running gets an `invalid_params` (`-32602`) error that says so.
+`parentPromptId` is the id of the prompt whose turn spawned the subagent. `progress` is sent only when a count or the activity changed, and at most every 2 seconds per subagent. `finished` carries the final answer as `output`, or the partial answer of a subagent that failed or was cancelled. `truncated` is `true` when `output` holds less than the `outputTotalBytes` the command wrote. A cancel or kill naming a subagent or task that already ended answers `{"outcome": "not_running", "status": ...}` instead, with the `status` its `finished` notification carried or the `state` of its `completed` one. A session remembers its last 256 ended subagents and every background command it ran. A cancel or kill naming a subagent or task the session never ran, or none at all, gets an `invalid_params` (`-32602`) error. `session/cancel` naming the child session of a subagent that already ended does nothing.
 
 ## Errors
 
@@ -236,4 +236,4 @@ A desktop app or orchestrator such as [Orca](https://github.com/stablyai/orca) r
 - **Steering.** Cancel and prompt again at once, and the new prompt starts as soon as the cancelled turn ends. A host that wants the message to join the running turn instead sends it with `_meta.caudra.delivery: "steer"`.
 - **Child work.** Advertise `clientCapabilities._meta["caudra/childWork"]: true` for `_caudra/*` subagent and background task notifications, with `_caudra/subagent/cancel` and `_caudra/task/kill` to stop one. Advertise `clientCapabilities.subagents` for ACP subagent sessions instead. See [Subagents and background tasks](#subagents-and-background-tasks).
 - **Questions.** Advertise form elicitation, or set `clientCapabilities._meta["caudra/questionsViaPermission"]: true` and claim permission requests whose tool call id starts with `interaction_`, so a full-access host does not answer them on its own. See [Permissions and questions](#permissions-and-questions).
-- **History.** `session/list` lists the sessions, and `caudra storage sessions --json` lists them without a running server. To continue a chat in a terminal, close it with `session/close` and run `caudra --resume <id>` in its directory, or `session/fork` it and resume the copy while the chat stays open.
+- **History.** `session/list` lists the sessions, and `caudra storage sessions --json` lists them without a running server, with each session's `model`, `first_prompt`, and `last_prompt`. To continue a chat in a terminal, close it with `session/close` and run `caudra --resume <id>` in its directory, or `session/fork` it and resume the copy while the chat stays open.

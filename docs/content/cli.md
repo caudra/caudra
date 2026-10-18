@@ -16,7 +16,7 @@ Caudra takes no positional argument. A bare word is read as a subcommand, so `ca
 
 When interactive Caudra starts in a Herdr pane, it automatically reports native `caudra` lifecycle state through Herdr's inherited environment and public custom-agent API. `--print` and SDK mode do not claim pane lifecycle authority. The report names the prompt that blocks the agent, and the sidebar shows the focused session's title, model and context usage. Each report also carries a resume command, so Herdr can restore the pane after a restart. It is `caudra --session <id>` for the focused session once that session is saved, and a bare `caudra` before then. Herdr receives the command only when `caudra` is on `PATH`, because Herdr types it into the pane's shell. Exiting Caudra withdraws it. A hangup or a stopped Herdr server leaves it in place. See [Worktrees](/docs/worktrees/#herdr-integration).
 
-In an Orca terminal, interactive Caudra reports its state to Orca in the terminal output instead. The report carries the state, the model and the label of the blocking prompt, with no resume command. See [Notifications](/docs/notifications/#orca).
+In an Orca terminal, interactive Caudra reports its state to Orca in the terminal output instead. The report carries the state, the model, the label of the blocking prompt, and, once the session is saved, the session id that `caudra --resume <id>` takes. See [Notifications](/docs/notifications/#orca).
 
 `caudra --session <id>` opens a local session in the directory it works in, wherever you run the command, so project config, plugins and MCP servers come from that directory. A session left in a removed worktree moves back to a remaining checkout first.
 
@@ -637,6 +637,8 @@ caudra storage vacuum [--pages N]
 caudra storage usage  [--group-by GROUP] [--since DURATION] [--json]
 caudra storage usage  --prune-older-than DURATION
 ```
+
+`sessions --json` gives each session its `model` and its `first_prompt` and `last_prompt`: the first and last prompt you typed, trimmed and cut to 280 characters, without images, file mentions, or Caudra's reminders. Each is `null` when the session has none.
 
 Application state, peer-message history, and decision logs share `caudra.db`. The remote-operation recovery journal remains separate at `recovery/remote-operations.db`.
 

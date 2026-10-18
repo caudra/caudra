@@ -11,20 +11,21 @@ use agent_client_protocol_schema::v1::{
 };
 use caudra_config::ModelPolicy;
 use caudra_providers::model::Model;
-use caudra_storage::background::JobKind;
 use caudra_storage::id::SessionRef;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use serde_json::value::to_raw_value;
-use serde_json::{Map, Value};
 use tracing::{debug, warn};
 
 use crate::asks::{ClientProfile, settle};
 use crate::auth::{AUTHENTICATE, auth_method};
 use crate::catalog::MODELS_LIST;
-use crate::child_work::{SUBAGENT_CANCEL, TASK_KILL, UNKNOWN_TASK, split_child_session};
+use crate::child_work::{
+    SUBAGENT_CANCEL, StopOutcome, TASK_KILL, shell_stop, split_child_session, unknown_task,
+};
 use crate::errors::{
-    INITIALIZE_FIRST, SHUTTING_DOWN, internal, invalid_params, invalid_request, invalid_target,
-    params, parse_params, request_cancelled, unknown_session,
+    INITIALIZE_FIRST, SHUTTING_DOWN, internal, invalid_params, invalid_request, params,
+    parse_params, request_cancelled, unknown_session,
 };
 use crate::lifecycle::{
     CloseContext, Closing, FailedRuntime, Reopen, StartContext, StartRequest, load_response,
@@ -135,9 +136,10 @@ impl Server {
             }
             SUBAGENT_CANCEL => {
                 let result = parse_params::<SubagentTarget>(&raw).and_then(|target| {
-                    self.active(&target.session_id)?
+                    let outcome = self
+                        .active(&target.session_id)?
                         .cancel_subagent(&target.subagent_id)?;
-                    acknowledged()
+                    ext_response(&outcome)
                 });
                 self.outbound.respond(id, result);
             }
@@ -370,7 +372,8 @@ impl Server {
     }
 
     /// Stops a running background shell; the answer waits until the task
-    /// runtime recorded the stop.
+    /// runtime recorded the stop. One that already ended is answered with
+    /// the state it ended in.
     fn kill_task(&self, id: RequestId, raw: &Value) {
         let target = match parse_params::<TaskTarget>(raw) {
             Ok(target) => target,
@@ -380,21 +383,24 @@ impl Server {
             Ok(state) => state.handle.background.clone(),
             Err(error) => return self.outbound.respond(id, Err(error)),
         };
-        let Some(background) = background.filter(|background| {
-            background
-                .resident_status(&target.task_id)
-                .is_some_and(|card| card.kind == JobKind::Shell && card.active())
-        }) else {
-            let error = invalid_target(&format!("{UNKNOWN_TASK}: {}", target.task_id));
-            return self.outbound.respond(id, Err(error));
+        let Some(background) = background else {
+            return self
+                .outbound
+                .respond(id, Err(unknown_task(&target.task_id)));
         };
         let outbound = self.outbound.clone();
         smol::spawn(async move {
-            let result = match background.cancel(&target.task_id).await {
-                Ok(_) => acknowledged(),
-                Err(error) => Err(internal(&error)),
+            let card = background.status_async(&target.task_id).await.ok();
+            let outcome = match shell_stop(card, &target.task_id) {
+                Ok(Some(ended)) => Ok(ended),
+                Ok(None) => background
+                    .cancel(&target.task_id)
+                    .await
+                    .map(|_| StopOutcome::Stopped)
+                    .map_err(|error| internal(&error)),
+                Err(error) => Err(error),
             };
-            outbound.respond(id, result);
+            outbound.respond(id, outcome.and_then(|outcome| ext_response(&outcome)));
         })
         .detach();
     }
@@ -432,11 +438,16 @@ impl Server {
         let Some((parent, subagent)) = split_child_session(child) else {
             return debug!(session = %child, "session/cancel for an unknown session");
         };
-        match self.active(&parent) {
-            Ok(state) => {
-                if let Err(error) = state.cancel_subagent(subagent) {
-                    debug!(session = %child, error = %error.message, "session/cancel names no running subagent");
-                }
+        match self
+            .active(&parent)
+            .map(|state| state.cancel_subagent(subagent))
+        {
+            Ok(Ok(StopOutcome::Stopped)) => {}
+            Ok(Ok(StopOutcome::NotRunning { status })) => {
+                debug!(session = %child, status, "session/cancel for a subagent that already ended");
+            }
+            Ok(Err(error)) => {
+                debug!(session = %child, error = %error.message, "session/cancel names no subagent");
             }
             Err(_) => debug!(session = %child, "session/cancel for an unknown session"),
         }
@@ -520,11 +531,6 @@ fn target<'a>(
         Some(SessionSlot::Active(state)) => Ok(Target::Active(state)),
         None => Ok(Target::Stored(session)),
     }
-}
-
-/// The empty result an extension request answers with once it took effect.
-fn acknowledged() -> Result<AgentResponse, AcpError> {
-    ext_response(&Map::new())
 }
 
 fn ext_response(result: &impl Serialize) -> Result<AgentResponse, AcpError> {

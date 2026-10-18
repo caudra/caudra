@@ -56,6 +56,8 @@ const INPUT_TOKENS: u32 = 120;
 const OUTPUT_TOKENS: u32 = 8;
 const PROTOCOL_VERSION: u64 = 1;
 const EMPTY_INPUT: &str = "{}";
+/// Arguments cut off mid-value, which still name the call's title.
+const PARTIAL_INPUT: &str = r#"{"path": "READ"#;
 
 const SESSION_UPDATE: &str = "session/update";
 const REQUEST_PERMISSION: &str = "session/request_permission";
@@ -102,6 +104,11 @@ fn isolated(scenario: impl FnOnce()) {
 enum Reply {
     Text(&'static str),
     Tool {
+        id: &'static str,
+    },
+    /// Starts a call and never finishes its input, as a model still writing
+    /// the call when the turn is cancelled.
+    StreamingTool {
         id: &'static str,
     },
     /// Never answers, as a model still thinking when the turn is cancelled.
@@ -156,6 +163,18 @@ impl Provider for ScriptedModel {
                         },
                         StopReason::ToolUse,
                     )
+                }
+                Reply::StreamingTool { id } => {
+                    let _ = event_tx.send(ProviderEvent::ToolUseStart {
+                        id: id.into(),
+                        name: GUARDED_TOOL_NAME.into(),
+                        source_ordinal: None,
+                    });
+                    let _ = event_tx.send(ProviderEvent::ToolInputDelta {
+                        id: id.into(),
+                        delta: PARTIAL_INPUT.into(),
+                    });
+                    smol::future::pending().await
                 }
                 Reply::Hang => smol::future::pending().await,
             };
@@ -506,8 +525,9 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        Client, INPUT_TOKENS, OUTPUT_TOKENS, PROTOCOL_VERSION, REQUEST_PERMISSION, Reply, Script,
-        is_response, isolated, methods, option_of_kind, prompt_params, update_kind, updates,
+        Client, INPUT_TOKENS, OUTPUT_TOKENS, PROTOCOL_VERSION, REQUEST_PERMISSION, Reply,
+        SESSION_UPDATE, Script, is_response, isolated, methods, option_of_kind, prompt_params,
+        update_kind, updates,
     };
     use crate::outbound::CANCEL_REQUEST_METHOD;
     use crate::test_support::{CANCELLED, OFFLINE_SPEC, SELECTED_SPEC};
@@ -519,6 +539,7 @@ mod tests {
     const REPLY: &str = "Renamed.";
     const OTHER_REPLY: &str = "Nothing to rename.";
     const CLIENT_PROMPT_ID: &str = "client-prompt-1";
+    const STEER_PROMPT_ID: &str = "client-prompt-2";
     const TOOL_ID: &str = "toolu_guarded";
     const END_TURN: &str = "end_turn";
     const COMPLETED: &str = "completed";
@@ -972,6 +993,68 @@ mod tests {
             for answered in client.responses(&[first, waiting]) {
                 assert_eq!(answered["result"]["stopReason"], CANCELLED, "{answered}");
             }
+        });
+    }
+
+    /// Whether `frame` is about the call `id`: an update to it, or an ask for it.
+    fn names_call(frame: &Value, id: &str) -> bool {
+        let params = &frame["params"];
+        params["update"]["toolCallId"] == id || params["toolCall"]["toolCallId"] == id
+    }
+
+    fn prompt_id_of(frame: &Value) -> &Value {
+        &frame["params"]["_meta"]["caudra"]["promptId"]
+    }
+
+    /// Orca steers by cancelling and prompting at once. The cancelled turn's
+    /// call ends with it, and the prompt behind it runs as a turn of its own.
+    #[test_case(Reply::StreamingTool { id: TOOL_ID }, SESSION_UPDATE ; "while_its_input_streams")]
+    #[test_case(Reply::Tool { id: TOOL_ID }, REQUEST_PERMISSION ; "while_it_awaits_permission")]
+    fn a_steer_past_a_call_in_flight_runs_the_new_prompt_alone(in_flight: Reply, seen: &str) {
+        isolated(|| {
+            let mut client = Client::start();
+            client.initialize();
+            let (cwd, script) = client.project(PROJECT);
+            let (sid, _) = client.open(&cwd);
+            script.reply(in_flight);
+            let mut params = prompt_params(&sid, PROMPT);
+            params["_meta"] = json!({"promptId": CLIENT_PROMPT_ID});
+            let first = client.request(methods::SESSION_PROMPT, params);
+            client.until(|frame| frame["method"] == seen && names_call(frame, TOOL_ID));
+
+            client.cancel(&sid);
+            script.reply(Reply::Text(OTHER_REPLY));
+            let mut params = prompt_params(&sid, PROMPT);
+            params["_meta"] = json!({"promptId": STEER_PROMPT_ID});
+            let steering = client.request(methods::SESSION_PROMPT, params);
+            let frames = client.until_response(steering);
+
+            let answered = &frames[position(&frames, |frame| is_response(frame, first))];
+            assert_eq!(answered["result"]["stopReason"], CANCELLED, "{answered}");
+            let steered = frames.last().unwrap();
+            assert_eq!(steered["result"]["stopReason"], END_TURN, "{steered}");
+            assert_eq!(
+                steered["result"]["_meta"]["caudra"]["promptId"],
+                STEER_PROMPT_ID
+            );
+            let chunk = position(&frames, |frame| {
+                update_kind(frame) == Some(updates::AGENT_MESSAGE_CHUNK)
+            });
+            assert_eq!(prompt_id_of(&frames[chunk]), STEER_PROMPT_ID);
+            assert_eq!(
+                frames[chunk]["params"]["update"]["content"]["text"],
+                OTHER_REPLY
+            );
+            for frame in frames.iter().filter(|frame| names_call(frame, TOOL_ID)) {
+                assert_ne!(prompt_id_of(frame), STEER_PROMPT_ID, "{frame}");
+            }
+            let (_, rest) = client.hang_up();
+            assert!(
+                !rest
+                    .iter()
+                    .any(|frame| is_response(frame, first) || is_response(frame, steering)),
+                "{rest:#?}"
+            );
         });
     }
 

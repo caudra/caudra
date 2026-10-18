@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,7 +11,7 @@ use agent_client_protocol_schema::v1::{
     StopReason, TextContent,
 };
 use caudra_agent::background::BackgroundTasks;
-use caudra_agent::headless::{InteractiveHandle, billed_cost};
+use caudra_agent::headless::{InteractiveHandle, InteractiveRun, billed_cost};
 use caudra_agent::mcp::McpHandle;
 use caudra_agent::tools::ToolRegistry;
 use caudra_agent::tools::native::plan::PlanTarget;
@@ -33,7 +34,7 @@ use crate::asks::{
     withdraw_asks,
 };
 use crate::child_work::{
-    ChildContext, ChildTier, ChildWork, Children, UNKNOWN_SUBAGENT, watch_tasks,
+    ChildContext, ChildTier, ChildWork, Children, StopOutcome, UNKNOWN_SUBAGENT, watch_tasks,
 };
 use crate::commands::{CommandCatalog, Invocation};
 use crate::errors::{
@@ -343,17 +344,21 @@ impl SessionState {
     }
 
     /// Stops one running subagent, leaving the turn that delegated to it
-    /// running with the subagent's cancelled result.
-    pub(crate) fn cancel_subagent(&self, subagent_id: &str) -> Result<(), AcpError> {
-        if !self.children.running(subagent_id) {
-            return Err(invalid_target(&format!(
-                "{UNKNOWN_SUBAGENT}: {subagent_id}"
-            )));
+    /// running with the subagent's cancelled result. One that already ended
+    /// is left alone and answered with how it ended.
+    pub(crate) fn cancel_subagent(&self, subagent_id: &str) -> Result<StopOutcome, AcpError> {
+        if self.children.running(subagent_id) {
+            self.handle
+                .subagent_cancels
+                .cancel_or_precancel(subagent_id.to_owned());
+            return Ok(StopOutcome::Stopped);
         }
-        self.handle
-            .subagent_cancels
-            .cancel_or_precancel(subagent_id.to_owned());
-        Ok(())
+        self.children
+            .ended(subagent_id)
+            .map(|status| StopOutcome::NotRunning {
+                status: status.to_owned(),
+            })
+            .ok_or_else(|| invalid_target(&format!("{UNKNOWN_SUBAGENT}: {subagent_id}")))
     }
 
     /// Whether `id` is a `session/prompt` this session still owes an answer,
@@ -397,6 +402,7 @@ impl SessionState {
     ) -> EventPump {
         EventPump {
             events: self.handle.event_rx.clone(),
+            runs: self.handle.run_rx.clone(),
             cancel: self.handle.cancel_tx.clone(),
             input: self.handle.input_tx.downgrade(),
             steering: self.handle.steering.clone(),
@@ -433,6 +439,9 @@ enum Wake {
 /// Turns one session's agent events into the client's session updates.
 pub(crate) struct EventPump {
     pub(crate) events: Receiver<Envelope>,
+    /// Each run as it starts, ahead of its events, saying whether a prompt
+    /// started it or the agent did on its own.
+    pub(crate) runs: Receiver<InteractiveRun>,
     /// Stops a run the client was told failed, so it does not carry on unseen.
     pub(crate) cancel: Sender<()>,
     /// Where a steer no turn took starts the next one. Weak, so the agent
@@ -472,6 +481,7 @@ impl EventPump {
     async fn run(self) {
         let Self {
             events,
+            runs,
             cancel,
             input,
             steering,
@@ -508,11 +518,13 @@ impl EventPump {
         let mut announced = OpenCalls::new();
         // The assistant message being streamed, which names its chunks.
         let mut reply: Option<MessageCursor> = None;
-        // The run serving the owed prompt, once one of its events named it.
+        // The run serving the owed prompt, once its start or one of its
+        // events named it.
         let mut turn_run: Option<u64> = None;
-        // A run whose prompt was answered without it, so its own end, should
-        // it ever come, answers nothing.
-        let mut stale_run: Option<u64> = None;
+        // Runs that answer no prompt: those the agent started on its own, and
+        // those whose prompt was answered without them. Their events name no
+        // prompt, and their end, should it ever come, answers nothing.
+        let mut answerless: HashSet<u64> = HashSet::new();
         // When a cancelled turn stops waiting for its own end.
         let mut drain_deadline: Option<Instant> = None;
 
@@ -536,6 +548,15 @@ impl EventPump {
                 ),
             )
             .await;
+            // A run is announced before its first event, so every run whose
+            // events or drain are handled below is known here.
+            for run in runs.try_iter() {
+                if run.automatic {
+                    answerless.insert(run.run_id);
+                } else if turn_run.is_none() && turn.owed() {
+                    turn_run = Some(run.run_id);
+                }
+            }
             let Envelope {
                 event,
                 subagent,
@@ -559,8 +580,8 @@ impl EventPump {
                         drain_timeout_ms = drain_timeout.as_millis(),
                         "cancelled turn did not end in time; answering its prompt cancelled"
                     );
-                    stale_run = turn_run.take();
-                    turn.settle_open_calls(&mut announced);
+                    answerless.extend(turn_run.take());
+                    turn.settle_open_calls(&mut announced, true);
                     let spend = mem::take(&mut turn_spend);
                     turn.answer(TurnEnd::Stopped {
                         stop: StopReason::Cancelled,
@@ -569,7 +590,7 @@ impl EventPump {
                     continue;
                 }
                 Err(Wake::Ended) => {
-                    turn.settle_open_calls(&mut announced);
+                    turn.settle_open_calls(&mut announced, true);
                     let mut owed = locked(&pending);
                     owed.agent_gone = true;
                     if let Some(prompt) = owed.prompt.take() {
@@ -596,8 +617,7 @@ impl EventPump {
                 child.observe(&ctx, info, event, Instant::now());
                 continue;
             }
-            // A stale run's end must not answer the prompt that followed it.
-            let answers = stale_run != Some(run_id);
+            let answers = !answerless.contains(&run_id);
             if answers && turn_run.is_none() && is_run_activity(&event) && turn.owed() {
                 turn_run = Some(run_id);
             }
@@ -650,7 +670,7 @@ impl EventPump {
                     // A finished todo_write is the agent's plan changing, which
                     // ACP reports separately from the call that caused it.
                     if let Some(plan) = translate::plan_update(&event.output) {
-                        turn.update(plan);
+                        turn.update(plan, answers);
                     }
                     translate::tool_done(&event, &cwd, home.as_deref())
                 }
@@ -694,10 +714,10 @@ impl EventPump {
                 AgentEvent::Done { reason, .. } => {
                     if let Some(id) = compaction.take() {
                         let status = translate::compaction_outcome(&reason);
-                        turn.update(translate::compaction_update(&id, status, None));
+                        turn.update(translate::compaction_update(&id, status, None), answers);
                     }
                     let spend = mem::take(&mut turn_spend);
-                    turn.settle_open_calls(&mut announced);
+                    turn.settle_open_calls(&mut announced, answers);
                     if answers {
                         drain_deadline = None;
                         turn_run = None;
@@ -705,6 +725,8 @@ impl EventPump {
                             stop: translate::map_done_reason(reason),
                             spend,
                         });
+                    } else {
+                        answerless.remove(&run_id);
                     }
                     // A run may have changed the skills or MCP prompts on offer.
                     if let Some(server) = server.upgrade() {
@@ -719,9 +741,9 @@ impl EventPump {
                             CompactionStatus::Failed,
                             Some(message.clone()),
                         );
-                        turn.update(failed);
+                        turn.update(failed, answers);
                     }
-                    turn.settle_open_calls(&mut announced);
+                    turn.settle_open_calls(&mut announced, answers);
                     if answers {
                         drain_deadline = None;
                         turn_run = None;
@@ -735,9 +757,9 @@ impl EventPump {
                 // answers nothing.
                 AgentEvent::AuthRequired => {
                     if turn.owed() {
-                        turn.settle_open_calls(&mut announced);
+                        turn.settle_open_calls(&mut announced, true);
                         drain_deadline = None;
-                        stale_run = turn_run.take();
+                        answerless.extend(turn_run.take());
                         turn.answer(TurnEnd::Failed(auth_required(AUTH_REQUIRED_DETAILS)));
                         let _ = cancel.try_send(());
                     }
@@ -761,7 +783,7 @@ impl EventPump {
                 }
                 _ => continue,
             };
-            turn.update(update);
+            turn.update(update, answers);
         }
     }
 }
@@ -788,16 +810,17 @@ impl TurnOutput<'_> {
             .is_some_and(|owed| owed.cancelled)
     }
 
-    fn update(&self, update: SessionUpdate) {
-        let meta = locked(self.pending).update_meta();
+    /// Sends `update`, naming the owed prompt only when its run serves it.
+    fn update(&self, update: SessionUpdate, owned: bool) {
+        let meta = owned.then(|| locked(self.pending).update_meta()).flatten();
         self.outbound.session_update_meta(self.sid, update, meta);
     }
 
     /// Calls still open when their turn ends never finish, so the client is
     /// told they failed before it reads the turn's answer.
-    fn settle_open_calls(&self, open: &mut OpenCalls) {
+    fn settle_open_calls(&self, open: &mut OpenCalls, owned: bool) {
         for update in translate::cancel_open_calls(open) {
-            self.update(update);
+            self.update(update, owned);
         }
     }
 
@@ -948,6 +971,11 @@ mod tests {
     const CLIENT_PROMPT_ID: &str = "client-prompt-7";
     const SECOND_PROMPT: i64 = 9;
     const STALE_RUN: u64 = 4;
+    const AUTOMATIC_RUN: u64 = 6;
+    const PROMPTED_RUN: u64 = 7;
+    const TOOL_CALL: &str = "tool_call";
+    const TOOL_CALL_UPDATE: &str = "tool_call_update";
+    const END_TURN: &str = "end_turn";
     const STALE_END_ANSWERS_NOTHING: &str =
         "the cancelled run's late end must not answer the prompt that followed it";
 
@@ -998,6 +1026,7 @@ mod tests {
         let session_id = SessionId::from(SessionRef::generate().to_string());
         EventPump {
             events,
+            runs: flume::unbounded().1,
             cancel: flume::unbounded().0,
             input: flume::unbounded().0.downgrade(),
             steering: steering_queue().0,
@@ -1581,6 +1610,71 @@ mod tests {
         assert_eq!(caudra[META_PROMPT_ID], CLIENT_PROMPT_ID);
         assert!(caudra[META_DURATION_MS].is_u64());
         assert_eq!(caudra["usage"]["costUsd"], TURN_COST);
+    }
+
+    fn started_run(run_id: u64, automatic: bool) -> InteractiveRun {
+        InteractiveRun {
+            run_id,
+            started: Instant::now(),
+            automatic,
+            task_event_ids: Vec::new(),
+            workflow_events: Vec::new(),
+            automation_events: Vec::new(),
+        }
+    }
+
+    /// A prompt queued behind a run the agent started on its own, such as
+    /// one reporting a finished background task, is answered by its own run:
+    /// the earlier run's updates name no prompt and its end answers nothing,
+    /// however it ends.
+    #[test_case(DoneReason::EndTurn ; "automatic_run_ends")]
+    #[test_case(DoneReason::Cancelled ; "automatic_run_cancelled")]
+    fn a_run_the_agent_started_on_its_own_answers_no_prompt(automatic_end: DoneReason) {
+        smol::block_on(async {
+            let (event_tx, events) = flume::unbounded();
+            let (run_tx, runs) = flume::unbounded();
+            let (outbound, out_rx) = Outbound::channel();
+            let pending = PendingState::default();
+            locked(&pending).prompt = Some(OwedPrompt::new(
+                RequestId::Number(PROMPT_ID),
+                PromptIdentity::new(CLIENT_PROMPT_ID.into()),
+            ));
+            EventPump {
+                pending,
+                runs,
+                ..test_pump(events, outbound)
+            }
+            .spawn(Written::settled());
+
+            run_tx.send(started_run(AUTOMATIC_RUN, true)).unwrap();
+            for event in [shell_start(OPEN_CALL), done(automatic_end)] {
+                event_tx.send(run_envelope(event, AUTOMATIC_RUN)).unwrap();
+            }
+            for kind in [TOOL_CALL, TOOL_CALL_UPDATE] {
+                let frame = out_rx.recv_async().await.unwrap().message;
+                let update = &frame["params"]["update"];
+                assert_eq!(update["sessionUpdate"], kind, "{frame}");
+                assert_eq!(update["toolCallId"], OPEN_CALL, "{frame}");
+                assert!(frame["params"]["_meta"].is_null(), "{frame}");
+            }
+
+            run_tx.send(started_run(PROMPTED_RUN, false)).unwrap();
+            for event in [
+                AgentEvent::TextDelta { text: TITLE.into() },
+                done(DoneReason::EndTurn),
+            ] {
+                event_tx.send(run_envelope(event, PROMPTED_RUN)).unwrap();
+            }
+            let chunk = out_rx.recv_async().await.unwrap().message;
+            assert_eq!(chunk["params"]["update"]["content"]["text"], TITLE);
+            assert_eq!(
+                chunk["params"]["_meta"][translate::META_NAMESPACE][META_PROMPT_ID],
+                CLIENT_PROMPT_ID
+            );
+            let answered = out_rx.recv_async().await.unwrap().message;
+            assert_eq!(answered["id"], PROMPT_ID);
+            assert_eq!(answered["result"]["stopReason"], END_TURN);
+        });
     }
 
     /// A cancelled turn whose agent never reports its end still gets its open

@@ -5802,7 +5802,7 @@ pub(crate) fn deserialize_json<T: DeserializeOwned>(
 /// The single point where a payload becomes stored bytes. Callers keep the
 /// uncompressed length for `byte_count`, which `logical_bytes`, the trim
 /// threshold and the history-discovery bounds all read.
-fn compress_payload(payload: &str) -> Result<Vec<u8>, SessionError> {
+pub(super) fn compress_payload(payload: &str) -> Result<Vec<u8>, SessionError> {
     zstd::bulk::compress(payload.as_bytes(), PAYLOAD_COMPRESSION_LEVEL).map_err(|error| {
         SessionError::CorruptDatabaseValue {
             field: "payload",

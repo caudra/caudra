@@ -104,7 +104,7 @@ fn flag(payload: &Value, name: &str) -> bool {
 
 /// Removes every `<system-reminder>` block, and an unterminated one to the
 /// end, since only Caudra writes them.
-fn strip_reminders(text: &str) -> String {
+pub(crate) fn strip_reminders(text: &str) -> String {
     let mut kept = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find(REMINDER_OPEN) {

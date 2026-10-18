@@ -5,9 +5,10 @@ use agent_client_protocol_schema::v1::{
 };
 use caudra_storage::StateDir;
 use caudra_storage::id::{CaudraId, SessionRef};
-use caudra_storage::sessions::{SessionDatabase, SessionListing};
+use caudra_storage::sessions::{SessionDatabase, SessionListing, SessionPreview};
 use jiff::Timestamp;
 use serde_json::json;
+use tracing::warn;
 
 use crate::errors::{internal, invalid_params};
 use crate::translate::META_NAMESPACE;
@@ -30,8 +31,9 @@ pub(crate) fn list_sessions(
         cwd => cwd.map(Path::to_string_lossy),
     };
     let after = request.cursor.as_deref().map(decode_cursor).transpose()?;
-    let mut page = SessionDatabase::open(storage)
-        .and_then(|database| database.local_session_page(cwd.as_deref(), after, PAGE_SIZE + 1))
+    let database = SessionDatabase::open(storage).map_err(|error| internal(&error))?;
+    let mut page = database
+        .local_session_page(cwd.as_deref(), after, PAGE_SIZE + 1)
         .map_err(|error| internal(&error))?;
     let next_cursor = if page.len() > PAGE_SIZE {
         page.truncate(PAGE_SIZE);
@@ -42,19 +44,32 @@ pub(crate) fn list_sessions(
     let sessions = page
         .into_iter()
         .filter(|row| Path::new(&row.cwd).is_absolute())
-        .map(session_info)
+        .map(|row| session_info(&database, row))
         .collect();
     Ok(ListSessionsResponse::new(sessions).next_cursor(next_cursor))
 }
 
-fn session_info(row: SessionListing) -> SessionInfo {
+/// A session as listed. A history that cannot be read previews nothing
+/// rather than failing the page.
+fn session_info(database: &SessionDatabase, row: SessionListing) -> SessionInfo {
+    let preview = database.session_preview(row.id).unwrap_or_else(|error| {
+        warn!(session = %row.id, %error, "session/list could not preview a session");
+        SessionPreview::default()
+    });
     let title = if row.title.trim().is_empty() {
         UNTITLED.to_owned()
     } else {
         row.title
     };
     let updated_at = rfc3339(row.updated_at);
-    let meta = Meta::from_iter([(META_NAMESPACE.to_owned(), json!({ "model": row.model }))]);
+    let meta = Meta::from_iter([(
+        META_NAMESPACE.to_owned(),
+        json!({
+            "model": row.model,
+            "firstPrompt": preview.first_prompt,
+            "lastPrompt": preview.last_prompt,
+        }),
+    )]);
     SessionInfo::new(
         SessionId::from(SessionRef::from(row.id).to_string()),
         row.cwd,
@@ -88,6 +103,7 @@ mod tests {
     use std::path::PathBuf;
 
     use caudra_agent::StoredSession;
+    use caudra_providers::{Message, expand_message};
     use serde_json::Value;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -100,10 +116,29 @@ mod tests {
     const TITLE: &str = "rename foo to bar";
     const UPDATED_AT: u64 = 1_700_000_000;
     const UPDATED_AT_RFC3339: &str = "2023-11-14T22:13:20Z";
+    const FIRST_PROMPT: &str = "find the flaky test";
+    const LAST_PROMPT: &str = "now fix it";
 
     fn save(storage: &StateDir, cwd: &str, updated_at: u64, title: &str) -> SessionId {
+        save_with(storage, cwd, updated_at, title, &[])
+    }
+
+    fn save_with(
+        storage: &StateDir,
+        cwd: &str,
+        updated_at: u64,
+        title: &str,
+        prompts: &[&str],
+    ) -> SessionId {
         let mut session = StoredSession::new(OFFLINE_SPEC, cwd);
         session.set_title(title.to_owned());
+        let mut parent = None;
+        for prompt in prompts {
+            for item in expand_message(&Message::user((*prompt).to_owned()), parent) {
+                parent = Some(item.id);
+                session.push_message(item);
+            }
+        }
         session.updated_at = updated_at;
         SessionDatabase::open(storage)
             .unwrap()
@@ -145,7 +180,13 @@ mod tests {
     fn a_listed_session_reports_its_title_time_and_model() {
         let temp = TempDir::new().unwrap();
         let storage = StateDir::from_path(temp.path().to_path_buf());
-        save(&storage, PROJECT, UPDATED_AT, " ");
+        save_with(
+            &storage,
+            PROJECT,
+            UPDATED_AT,
+            " ",
+            &[FIRST_PROMPT, LAST_PROMPT],
+        );
 
         let response = listed(&storage, ListSessionsRequest::new());
         let wire = serde_json::to_value(&response.sessions[0]).unwrap();
@@ -153,7 +194,23 @@ mod tests {
         assert_eq!(wire["cwd"], PROJECT);
         assert_eq!(wire["title"], UNTITLED);
         assert_eq!(wire["updatedAt"], UPDATED_AT_RFC3339);
-        assert_eq!(wire["_meta"][META_NAMESPACE]["model"], OFFLINE_SPEC);
+        let caudra = &wire["_meta"][META_NAMESPACE];
+        assert_eq!(caudra["model"], OFFLINE_SPEC);
+        assert_eq!(caudra["firstPrompt"], FIRST_PROMPT);
+        assert_eq!(caudra["lastPrompt"], LAST_PROMPT);
+    }
+
+    #[test]
+    fn a_session_without_prompts_previews_null() {
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        save(&storage, PROJECT, UPDATED_AT, TITLE);
+
+        let response = listed(&storage, ListSessionsRequest::new());
+        let wire = serde_json::to_value(&response.sessions[0]).unwrap();
+
+        assert_eq!(wire["_meta"][META_NAMESPACE]["firstPrompt"], Value::Null);
+        assert_eq!(wire["_meta"][META_NAMESPACE]["lastPrompt"], Value::Null);
     }
 
     #[test]

@@ -39,6 +39,8 @@ mod database;
 mod lease;
 #[path = "sessions/progress.rs"]
 pub mod progress;
+#[path = "sessions/prompts.rs"]
+mod prompts;
 #[path = "sessions/sweep.rs"]
 pub mod sweep;
 #[path = "sessions/types.rs"]
@@ -56,6 +58,7 @@ pub use database::{
     eager_load_limit, set_eager_load_limit,
 };
 pub use lease::SessionLease;
+pub use prompts::SessionPreview;
 pub use types::PermissionMode;
 
 const SESSION_VERSION: u32 = 1;
