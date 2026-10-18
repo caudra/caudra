@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
+use crate::components::docs_link::BADGE_COLUMNS;
 use crate::components::hover_style;
 use crate::theme;
 
@@ -141,7 +142,7 @@ impl FooterLine {
         if !self.fits(area.width) {
             return Vec::new();
         }
-        let width = u16::try_from(self.width()).unwrap_or(u16::MAX);
+        let width = self.columns();
         let Some(row) = total.saturating_sub(1).checked_sub(offset) else {
             return Vec::new();
         };
@@ -154,14 +155,20 @@ impl FooterLine {
         let left = area
             .x
             .saturating_add((area.width / 2).saturating_sub(width / 2));
-        let y = area.y.saturating_add(row);
+        self.hits_at(Position::new(left, area.y.saturating_add(row)))
+    }
+
+    /// Where each command lands for the line drawn left-aligned from `origin`.
+    pub(crate) fn hits_at(&self, origin: Position) -> Vec<Rect> {
         self.targets
             .iter()
             .map(|target| {
                 let start = self.width_of(0..target.start);
                 Rect::new(
-                    left.saturating_add(u16::try_from(start).unwrap_or(u16::MAX)),
-                    y,
+                    origin
+                        .x
+                        .saturating_add(u16::try_from(start).unwrap_or(u16::MAX)),
+                    origin.y,
                     u16::try_from(self.width_of(target.clone())).unwrap_or(u16::MAX),
                     FOOTER_HIT_ROWS,
                 )
@@ -169,10 +176,33 @@ impl FooterLine {
             .collect()
     }
 
+    /// The columns the line takes on one row.
+    pub(crate) fn columns(&self) -> u16 {
+        u16::try_from(self.width()).unwrap_or(u16::MAX)
+    }
+
+    /// The line on a modal's top border, ending clear of its docs `?`, with the
+    /// control under the pointer reversed. Returns where each control landed,
+    /// or none when the popup has no room for the line.
+    pub(crate) fn draw_on_title(
+        &self,
+        frame: &mut Frame,
+        popup: Rect,
+        hovered: Option<usize>,
+    ) -> Vec<Rect> {
+        let reserved = self.columns().saturating_add(1 + BADGE_COLUMNS);
+        if reserved >= popup.width {
+            return Vec::new();
+        }
+        let area = Rect::new(popup.right() - reserved, popup.y, self.columns(), 1);
+        frame.render_widget(self.line(hovered).left_aligned(), area);
+        self.hits_at(area.as_position())
+    }
+
     /// Whether the line draws on one row of `columns`, which is what decides
     /// whether it answers the pointer at all.
     pub(crate) fn fits(&self, columns: u16) -> bool {
-        columns > 0 && u16::try_from(self.width()).unwrap_or(u16::MAX) <= columns
+        columns > 0 && self.columns() <= columns
     }
 
     fn width(&self) -> usize {
@@ -265,6 +295,8 @@ mod tests {
     const WRONG_WIDTH: &str = "the popup is not the width the terminal allows it";
     const PHRASE_SPLIT: &str = "a description must belong to the command it glosses";
     const ORPHAN_CLAIMED: &str = "a description with no command before it must stay inert";
+    const BADGE_CROWDED: &str = "a title line must end a column short of the docs `?`";
+    const HITS_OFF_GLYPHS: &str = "a title control must claim only the cells it is drawn in";
 
     /// A percentage alone leaves a small terminal drawing a sliver and then
     /// cutting the content it made room for, and a large one is still handed its
@@ -444,5 +476,47 @@ mod tests {
 
         state.reset();
         assert_eq!(state.hovered(), None);
+    }
+
+    fn drawn_on_title(popup: Rect) -> (Vec<Rect>, String) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(AREA.right(), 2)).unwrap();
+        let mut hits = Vec::new();
+        terminal
+            .draw(|frame| hits = footer().draw_on_title(frame, popup, None))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = (0..buffer.area.width)
+            .map(|x| buffer[(x, popup.y)].symbol())
+            .collect();
+        (hits, row)
+    }
+
+    #[test]
+    fn a_title_line_ends_clear_of_the_docs_badge() {
+        let popup = Rect::new(AREA.x, 0, AREA.width, 2);
+        let (hits, row) = drawn_on_title(popup);
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[1].right(),
+            popup.right() - 1 - BADGE_COLUMNS,
+            "{BADGE_CROWDED}"
+        );
+        let first: String = row
+            .chars()
+            .skip(usize::from(hits[0].x))
+            .take(FIRST.width())
+            .collect();
+        assert_eq!(first, FIRST, "{HITS_OFF_GLYPHS}");
+    }
+
+    #[test]
+    fn a_title_line_too_wide_for_its_popup_is_not_drawn() {
+        let popup = Rect::new(AREA.x, 0, footer().columns() + BADGE_COLUMNS, 2);
+        let (hits, row) = drawn_on_title(popup);
+
+        assert!(hits.is_empty(), "{HITS_OFF_GLYPHS}");
+        assert!(!row.contains(FIRST), "{HITS_OFF_GLYPHS}");
     }
 }

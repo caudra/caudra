@@ -7,7 +7,7 @@ use caudra_agent::tools::report::{CATALOG_SOURCE, REASON_CATALOG};
 use caudra_grab::grab_scope;
 use caudra_providers::{format_tokens_u64, token_label};
 use caudra_storage::tool_ledger::{ToolOutcome, ToolSlice, ToolStats};
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
@@ -15,9 +15,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use std::time::Duration;
 
-use crate::components::docs_link::{BADGE_COLUMNS, DocsTopic};
+use crate::components::docs_link::DocsTopic;
 use crate::components::keybindings::key;
-use crate::components::modal::{CHROME_LINES, Modal};
+use crate::components::modal::{CHROME_LINES, FooterHits, FooterLine, Modal};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{ModalScroll, Overlay, bar_area, escape_terminal_controls};
 use crate::theme::{self, Theme};
@@ -102,6 +102,8 @@ pub struct ToolsModal {
     /// columns, which owes nothing to the terminal, so on a small screen this
     /// is what reaches the right-hand columns.
     pan_bar: Scrollbar,
+    /// The scope hint on the top border, which a click presses.
+    title: FooterHits,
     popup: Rect,
 }
 
@@ -113,6 +115,7 @@ impl ToolsModal {
             scroll: ModalScroll::new_top(),
             scrollbar: Scrollbar::default(),
             pan_bar: Scrollbar::horizontal(),
+            title: FooterHits::default(),
             popup: Rect::default(),
         }
     }
@@ -126,11 +129,18 @@ impl ToolsModal {
         self.open = false;
         self.scroll.reset();
         self.scrollbar = Scrollbar::default();
+        self.title.reset();
         self.popup = Rect::default();
     }
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Where the title row's control at `index` was drawn.
+    #[cfg(test)]
+    pub(crate) fn title_hit(&self, index: usize) -> Rect {
+        self.title.hit(index)
     }
 
     pub fn scope(&self) -> ToolsScope {
@@ -150,8 +160,7 @@ impl ToolsModal {
             return;
         }
         if key::SCOPE.matches(key_event) {
-            self.scope = self.scope.next();
-            self.scroll.reset();
+            self.next_scope();
             return;
         }
         if !self.scroll.handle_key(key_event) {
@@ -169,7 +178,21 @@ impl ToolsModal {
         self.scroll.pan_by(delta);
     }
 
+    fn next_scope(&mut self) {
+        self.scope = self.scope.next();
+        self.scroll.reset();
+    }
+
+    /// The scope hint is asked first, the way a footer control is: a press on
+    /// it is never the start of a sweep.
     pub fn handle_mouse(&mut self, event: MouseEvent) {
+        if self.title.handle_mouse(event).is_some() {
+            self.next_scope();
+            return;
+        }
+        if event.kind == MouseEventKind::Down(MouseButton::Left) && self.title.hovered().is_some() {
+            return;
+        }
         match self.scrollbar.handle(&event) {
             ScrollbarMouse::Ignored => {}
             ScrollbarMouse::Consumed => return,
@@ -256,10 +279,9 @@ impl ToolsModal {
         if !wrapped {
             self.pan_bar.draw(frame, bar_area(inner), content_w, pan);
         }
-        frame.render_widget(
-            Paragraph::new(scope_hint(self.scope, &theme)),
-            hint_area(popup),
-        );
+        let hint = scope_hint(self.scope, &theme);
+        let hits = hint.draw_on_title(frame, popup, self.title.hovered());
+        self.title.set(hits);
 
         self.popup = popup;
         popup
@@ -279,21 +301,11 @@ pub struct ToolsModalContext<'a> {
 /// Beside the title rather than under the table: the bottom border row belongs
 /// to the pan bar, and a hint sharing it would be overpainted exactly when the
 /// modal is narrow enough to need both.
-fn hint_area(popup: Rect) -> Rect {
-    let width = (key::SCOPE.label.len() + ToolsScope::Global.hint().len()) as u16;
-    Rect {
-        x: popup.x + popup.width.saturating_sub(width + 1 + BADGE_COLUMNS),
-        y: popup.y,
-        width,
-        height: 1,
-    }
-}
-
-fn scope_hint(scope: ToolsScope, theme: &Theme) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(key::SCOPE.label, theme.keybind_key),
-        Span::styled(scope.hint(), theme.tool_dim),
-    ])
+fn scope_hint(scope: ToolsScope, theme: &Theme) -> FooterLine {
+    let mut line = FooterLine::default();
+    line.command(key::SCOPE.label, theme.keybind_key);
+    line.describe(scope.hint(), theme.tool_dim);
+    line
 }
 
 impl Default for ToolsModal {
@@ -686,7 +698,12 @@ mod tests {
 
     use caudra_storage::sessions::StoredToolUsage;
     use caudra_storage::tool_ledger::Latency;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
     use test_case::test_case;
 
     use super::{
@@ -694,7 +711,7 @@ mod tests {
         ContextSnapshot, ESTIMATE_MARKER, FAILURES_HEADING, GLOBAL_TITLE, NO_ACTIVITY,
         NO_ACTIVITY_HINT, NO_MCP, NO_SNAPSHOT, PROJECT_TITLE, REASON_CATALOG, SESSION_TITLE,
         STATS_UNAVAILABLE, TITLE, TOOL_COL_MIN, TOOL_SEARCH, ToolOutcome, ToolStats, ToolsModal,
-        ToolsScope, build_lines, key, stats_lines,
+        ToolsModalContext, ToolsScope, build_lines, key, stats_lines,
     };
     use crate::theme;
 
@@ -710,6 +727,11 @@ mod tests {
     const P95_COLUMN: &str = "p95";
     const PERCENTILE_ORDER: &str = "the median column must be named before the tail column";
     const SLICE_TOKENS: u64 = 100;
+    const SCOPES: usize = 4;
+    const DRAW_WIDTH: u16 = 120;
+    const DRAW_HEIGHT: u16 = 30;
+    const HINT_UNDRAWN: &str = "the scope hint must be drawn on the title row";
+    const SCOPE_NOT_CYCLED: &str = "clicks on the scope hint must visit every scope and return";
     const SCOPE_KEEPS_MODAL_OPEN: &str =
         "the scope key must move the modal, not dismiss it like any other unhandled key";
 
@@ -975,5 +997,50 @@ mod tests {
             ),
             "{PERCENTILE_ORDER}: {out}"
         );
+    }
+
+    #[test]
+    fn a_click_on_the_scope_hint_cycles_every_scope() {
+        let mut modal = ToolsModal::new();
+        modal.open();
+        let mut seen = vec![modal.scope()];
+        for _ in 0..SCOPES {
+            draw(&mut modal);
+            let hit = modal.title.hit(0);
+            assert!(!hit.is_empty(), "{HINT_UNDRAWN}");
+            modal.handle_mouse(click(MouseEventKind::Down(MouseButton::Left), hit));
+            modal.handle_mouse(click(MouseEventKind::Up(MouseButton::Left), hit));
+            seen.push(modal.scope());
+        }
+
+        assert_eq!(seen.first(), seen.last(), "{SCOPE_NOT_CYCLED}");
+        seen.sort_by_key(|scope| *scope as u8);
+        seen.dedup();
+        assert_eq!(seen.len(), SCOPES, "{SCOPE_NOT_CYCLED}");
+        assert!(modal.is_open(), "{SCOPE_KEEPS_MODAL_OPEN}");
+    }
+
+    fn click(kind: MouseEventKind, at: Rect) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: at.x,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn draw(modal: &mut ToolsModal) {
+        let mut terminal = Terminal::new(TestBackend::new(DRAW_WIDTH, DRAW_HEIGHT)).unwrap();
+        let ctx = ToolsModalContext {
+            snapshot: None,
+            basis: "",
+            session: &[],
+            recorded: None,
+        };
+        terminal
+            .draw(|frame| {
+                modal.view(frame, frame.area(), &ctx);
+            })
+            .unwrap();
     }
 }

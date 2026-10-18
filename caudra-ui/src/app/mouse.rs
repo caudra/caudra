@@ -264,7 +264,7 @@ impl App {
         }
         if self.tools_modal.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
-            self.tools_modal.handle_mouse(event);
+            self.on_tools_modal(|modal| modal.handle_mouse(event));
             return Vec::new();
         }
         if self.decisions_modal.is_open() && !self.permission_prompt_holds_input() {
@@ -329,8 +329,12 @@ impl App {
             // no-ops.
             match self.usage_modal.handle_mouse(&event) {
                 UsageMouse::Ignored => {}
-                UsageMouse::Consumed => return Vec::new(),
+                UsageMouse::Consumed => {
+                    self.load_lifetime_usage();
+                    return Vec::new();
+                }
                 UsageMouse::Refresh => return vec![Action::ForceRefreshUsage],
+                UsageMouse::Reload => return self.reload_usage(),
             }
             if self.float_mgr.handle_mouse(&event) {
                 return Vec::new();

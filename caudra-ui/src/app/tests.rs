@@ -37,7 +37,8 @@ use crate::components::storage_modal::{
     EXPANDED_TITLE as STORAGE_EXPANDED_TITLE, TITLE as STORAGE_TITLE,
 };
 use crate::components::stream_modal::{StreamDone, StreamEvent, StreamFooter, StreamUsage};
-use crate::components::usage_modal::SCOPE_KEY;
+use crate::components::tools_modal::ToolsScope;
+use crate::components::usage_modal::{SCOPE_KEY, UsageScope};
 use crate::components::{
     DisplaySource, ExitRequest, ForkedSession, SubscriptionProvider, ToolProgress, ToolStatus,
     buffer_text, key, test_model,
@@ -8850,6 +8851,76 @@ fn the_docs_badge_opens_the_docs_above_the_modal_until_esc(open: fn(&mut App)) {
     let open_now = app.overlays().iter().position(|overlay| overlay.is_open());
     assert_eq!(open_now, opener, "{OPENER_CLOSED}");
     let _ = badge(&mut app);
+}
+
+const USAGE_RELOAD_HINT: usize = 0;
+const USAGE_SCOPE_HINT: usize = 1;
+const TOOLS_SCOPE_HINT: usize = 0;
+const TITLE_HINT_IGNORED: &str = "a click on a title hint must do what its key does";
+const TITLE_HINT_UNDER_BADGE: &str = "a title hint must never share cells with the docs `?`";
+
+#[test]
+fn a_click_on_the_usage_reload_hint_reloads_as_ctrl_r_does() {
+    let mut app = app_without_splash();
+    open_usage_modal(&mut app);
+    let _ = rendered(&mut app);
+
+    let hit = app.usage_modal.title_hit(USAGE_RELOAD_HINT);
+    let actions = click_at(&mut app, hit);
+
+    assert!(
+        matches!(&actions[..], [Action::RefreshUsage]),
+        "{TITLE_HINT_IGNORED}"
+    );
+}
+
+#[test]
+fn a_click_on_the_usage_scope_hint_loads_lifetime_spend() {
+    let mut app = app_without_splash();
+    open_usage_modal(&mut app);
+    let _ = rendered(&mut app);
+
+    let hit = app.usage_modal.title_hit(USAGE_SCOPE_HINT);
+    click_at(&mut app, hit);
+
+    assert_eq!(
+        app.usage_modal.scope(),
+        UsageScope::Lifetime,
+        "{TITLE_HINT_IGNORED}"
+    );
+    assert!(app.lifetime_usage.is_some(), "{TITLE_HINT_IGNORED}");
+}
+
+#[test]
+fn a_click_on_the_tools_scope_hint_reads_the_scope_it_moves_to() {
+    let mut app = app_without_splash();
+    open_tools_modal(&mut app);
+    for scope in [ToolsScope::Session, ToolsScope::Project] {
+        let _ = rendered(&mut app);
+        let hit = app.tools_modal.title_hit(TOOLS_SCOPE_HINT);
+        click_at(&mut app, hit);
+        assert_eq!(app.tools_modal.scope(), scope, "{TITLE_HINT_IGNORED}");
+    }
+    assert!(app.tool_stats.is_some(), "{TITLE_HINT_IGNORED}");
+}
+
+#[test_case(open_usage_modal, 2, 80  ; "usage_narrow")]
+#[test_case(open_usage_modal, 2, 160 ; "usage_wide")]
+#[test_case(open_tools_modal, 1, 80  ; "tools_narrow")]
+#[test_case(open_tools_modal, 1, 160 ; "tools_wide")]
+fn title_hints_keep_clear_of_the_docs_badge(open: fn(&mut App), hints: usize, width: u16) {
+    let mut app = app_without_splash();
+    open(&mut app);
+    let _ = rendered_wide(&mut app, width);
+    let (_, badge) = app.docs_badge.expect(BADGE_MISSING);
+    for index in 0..hints {
+        let hit = match app.usage_modal.is_open() {
+            true => app.usage_modal.title_hit(index),
+            false => app.tools_modal.title_hit(index),
+        };
+        assert!(!hit.is_empty(), "{TITLE_HINT_IGNORED}");
+        assert!(!hit.intersects(badge), "{TITLE_HINT_UNDER_BADGE}");
+    }
 }
 
 #[test]

@@ -24,13 +24,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::components::accounts_modal::account_detail;
-use crate::components::docs_link::{BADGE_COLUMNS, DocsTopic};
+use crate::components::docs_link::DocsTopic;
 use crate::components::keybindings::{Bind, key};
-use crate::components::modal::{FooterHits, Modal};
+use crate::components::modal::{FooterHits, FooterLine, Modal};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{ModalScroll, bar_area, hover_style};
 use crate::repaint::{Dirty, Watch};
-use crate::theme;
+use crate::theme::{self, Theme};
 
 const TITLE: &str = " Token usage ";
 const ACCOUNTS_TITLE: &str = "Accounts";
@@ -209,7 +209,19 @@ pub struct UsageModal {
     toggles: FooterHits,
     /// Which section each of `toggles` flips, in the same order.
     toggle_sections: Vec<LifetimeSection>,
+    /// The key hints on the top border, which a click presses.
+    title: FooterHits,
+    /// What each of `title` does, in the same order.
+    title_actions: Vec<TitleAction>,
     popup: Rect,
+}
+
+/// A key hint on the title row, answering a click as its key does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TitleAction {
+    Reload,
+    Scope,
+    Expand,
 }
 
 /// A lifetime breakdown long enough to be capped. Purposes are a short fixed
@@ -224,11 +236,14 @@ enum LifetimeSection {
 }
 
 /// What the pointer asked of the host. `Ignored` hands the event back.
+/// `Refresh` asks the provider for its quota again, and `Reload` rereads
+/// everything, as `Ctrl+R` does.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum UsageMouse {
     Ignored,
     Consumed,
     Refresh,
+    Reload,
 }
 
 impl UsageModal {
@@ -244,6 +259,8 @@ impl UsageModal {
             expanded: HashSet::new(),
             toggles: FooterHits::default(),
             toggle_sections: Vec::new(),
+            title: FooterHits::default(),
+            title_actions: Vec::new(),
             popup: Rect::default(),
         }
     }
@@ -275,6 +292,7 @@ impl UsageModal {
         self.scroll.reset();
         self.refresh.reset();
         self.toggles.reset();
+        self.title.reset();
         self.expanded.clear();
     }
 
@@ -292,6 +310,12 @@ impl UsageModal {
         } else {
             self.expanded.clear();
         }
+    }
+
+    /// Where the title row's control at `index` was drawn.
+    #[cfg(test)]
+    pub(crate) fn title_hit(&self, index: usize) -> Rect {
+        self.title.hit(index)
     }
 
     pub fn scope(&self) -> UsageScope {
@@ -320,6 +344,15 @@ impl UsageModal {
         if !self.open {
             return UsageMouse::Ignored;
         }
+        if let Some(index) = self.title.handle_mouse(*event) {
+            match self.title_actions.get(index) {
+                Some(TitleAction::Reload) => return UsageMouse::Reload,
+                Some(TitleAction::Scope) => self.toggle_scope(),
+                Some(TitleAction::Expand) => self.flip_all_sections(),
+                None => {}
+            }
+            return UsageMouse::Consumed;
+        }
         if self.refresh.handle_mouse(*event).is_some() {
             return UsageMouse::Refresh;
         }
@@ -330,7 +363,9 @@ impl UsageModal {
             return UsageMouse::Consumed;
         }
         if event.kind == MouseEventKind::Down(MouseButton::Left)
-            && (self.refresh.hovered().is_some() || self.toggles.hovered().is_some())
+            && [&self.title, &self.refresh, &self.toggles]
+                .iter()
+                .any(|hits| hits.hovered().is_some())
         {
             return UsageMouse::Consumed;
         }
@@ -376,6 +411,34 @@ impl UsageModal {
             return;
         }
         self.scroll.handle_key(key_event);
+    }
+
+    /// `Ctrl+R reload`, the scope to switch to, and in lifetime scope with a
+    /// capped breakdown, `e more` or `e less`. Records what each control does.
+    fn title_line(&mut self, theme: &Theme) -> FooterLine {
+        let mut line = FooterLine::default();
+        let mut actions = Vec::new();
+        let mut control = |line: &mut FooterLine, bind: Bind, gloss: &'static str, action| {
+            line.command(bind.label, theme.keybind_key);
+            line.describe(gloss, theme.tool_dim);
+            actions.push(action);
+        };
+        line.text(" ", theme.tool_dim);
+        control(&mut line, key::REFRESH, " reload ", TitleAction::Reload);
+        let scope = match self.scope {
+            UsageScope::Session => " lifetime ",
+            UsageScope::Lifetime => " session ",
+        };
+        control(&mut line, SCOPE_KEY, scope, TitleAction::Scope);
+        if !self.toggle_sections.is_empty() {
+            let expand = match self.expanded.is_empty() {
+                true => " more ",
+                false => " less ",
+            };
+            control(&mut line, EXPAND_KEY, expand, TitleAction::Expand);
+        }
+        self.title_actions = actions;
+        line
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect, ctx: &UsageModalContext) -> Rect {
@@ -458,41 +521,12 @@ impl UsageModal {
         // because a track is only built for content that overflows.
         self.pan_bar.draw(frame, bar_area(inner), content_w, pan);
 
-        let mut hint = Line::from(vec![
-            Span::raw(" "),
-            Span::styled("Ctrl+R", theme.keybind_key),
-            Span::styled(" reload ", theme.tool_dim),
-            Span::styled(SCOPE_KEY.label, theme.keybind_key),
-            Span::styled(
-                match self.scope {
-                    UsageScope::Session => " lifetime ",
-                    UsageScope::Lifetime => " session ",
-                },
-                theme.tool_dim,
-            ),
-        ]);
-        if !self.toggle_sections.is_empty() {
-            hint.push_span(Span::styled(EXPAND_KEY.label, theme.keybind_key));
-            hint.push_span(Span::styled(
-                if self.expanded.is_empty() {
-                    " more "
-                } else {
-                    " less "
-                },
-                theme.tool_dim,
-            ));
-        }
-        let hint_w = hint.width() as u16;
         // Beside the title rather than under the table: the bottom border row
         // belongs to the pan bar, and a hint sharing it would be overpainted
         // exactly when the modal is narrow enough to need both.
-        let hint_area = Rect {
-            x: popup.x + popup.width.saturating_sub(hint_w + 1 + BADGE_COLUMNS),
-            y: popup.y,
-            width: hint_w,
-            height: 1,
-        };
-        frame.render_widget(Paragraph::new(hint), hint_area);
+        let hint = self.title_line(&theme);
+        let hits = hint.draw_on_title(frame, popup, self.title.hovered());
+        self.title.set(hits);
 
         self.popup = popup;
         popup
@@ -1457,6 +1491,9 @@ mod tests {
     /// modal draws and the rest are absorbed by the clamp.
     const TAPS_TO_THE_END: usize = 4;
     const RELOAD_HINT: &str = "Ctrl+R reload";
+    const TITLE_ACTION_MISSING: &str = "the title row must draw the hint under test";
+    const TITLE_CLICK_IGNORED: &str = "a click on a title hint must do what its key does";
+    const HOVER_SPILLED: &str = "only the hovered hint's own cells may be reversed";
     const COST_UNREACHABLE: &str = "panning must bring the cost column into view";
     const HINT_MISPLACED: &str = "the hint must share the title row, not the bar's row";
     const BAR_UNWANTED: &str = "a table that fits must not wear a pan bar";
@@ -2010,6 +2047,67 @@ mod tests {
 
         modal.handle_key(EXPAND_KEY.to_key_event());
         assert!(modal.expanded.is_empty(), "{COLLAPSED_AGAIN}");
+    }
+
+    fn click_title(modal: &mut UsageModal, action: TitleAction) -> UsageMouse {
+        let index = modal
+            .title_actions
+            .iter()
+            .position(|&drawn| drawn == action)
+            .expect(TITLE_ACTION_MISSING);
+        let hit = modal.title.hit(index);
+        modal.handle_mouse(&pointer(MouseEventKind::Down(MouseButton::Left), hit));
+        modal.handle_mouse(&pointer(MouseEventKind::Up(MouseButton::Left), hit))
+    }
+
+    #[test]
+    fn a_click_on_each_title_hint_does_what_its_key_does() {
+        let usage = long_lifetime();
+        let mut modal = UsageModal::new();
+        modal.toggle();
+        shown_models(&mut modal, &usage);
+
+        assert_eq!(
+            click_title(&mut modal, TitleAction::Reload),
+            UsageMouse::Reload
+        );
+        assert_eq!(
+            click_title(&mut modal, TitleAction::Scope),
+            UsageMouse::Consumed
+        );
+        assert_eq!(modal.scope(), UsageScope::Lifetime, "{TITLE_CLICK_IGNORED}");
+
+        shown_models(&mut modal, &usage);
+        assert_eq!(
+            click_title(&mut modal, TitleAction::Expand),
+            UsageMouse::Consumed
+        );
+        assert!(!modal.expanded.is_empty(), "{TITLE_CLICK_IGNORED}");
+    }
+
+    #[test]
+    fn the_hovered_title_hint_alone_is_reversed() {
+        let mut modal = UsageModal::new();
+        modal.toggle();
+        render(&mut modal);
+        let index = modal
+            .title_actions
+            .iter()
+            .position(|&action| action == TitleAction::Scope)
+            .expect(TITLE_ACTION_MISSING);
+        let hit = modal.title.hit(index);
+        modal.handle_mouse(&pointer(MouseEventKind::Moved, hit));
+
+        let buffer = draw_at(&mut modal, WIDE_TERMINAL, &HashMap::new());
+
+        let reversed: Vec<u16> = (0..buffer.area.width)
+            .filter(|&x| buffer[(x, hit.y)].modifier.contains(Modifier::REVERSED))
+            .collect();
+        assert_eq!(
+            reversed,
+            (hit.x..hit.right()).collect::<Vec<_>>(),
+            "{HOVER_SPILLED}"
+        );
     }
 
     #[test]

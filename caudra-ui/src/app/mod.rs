@@ -2518,10 +2518,7 @@ impl App {
         if self.usage_modal.is_open() {
             guard_repeat!(false);
             if key::REFRESH.matches(key) {
-                self.lifetime_usage = None;
-                self.warming_summary = None;
-                self.load_lifetime_usage();
-                return Some(vec![Action::RefreshUsage]);
+                return Some(self.reload_usage());
             }
             self.usage_modal.handle_key(key);
             self.load_lifetime_usage();
@@ -2550,11 +2547,7 @@ impl App {
 
         if self.tools_modal.is_open() {
             guard_repeat!(false);
-            let scope = self.tools_modal.scope();
-            self.tools_modal.handle_key(key);
-            if self.tools_modal.scope() != scope {
-                self.load_tool_stats();
-            }
+            self.on_tools_modal(|modal| modal.handle_key(key));
             return Some(vec![]);
         }
 
@@ -7219,6 +7212,23 @@ impl App {
                 None
             }
         };
+    }
+
+    /// Rereads what `/usage` shows, as `Ctrl+R` or a click on its hint asks.
+    pub(super) fn reload_usage(&mut self) -> Vec<Action> {
+        self.lifetime_usage = None;
+        self.warming_summary = None;
+        self.load_lifetime_usage();
+        vec![Action::RefreshUsage]
+    }
+
+    /// Hands the event to `/tools`, then loads what a scope it moved to reads.
+    pub(super) fn on_tools_modal(&mut self, handle: impl FnOnce(&mut ToolsModal)) {
+        let scope = self.tools_modal.scope();
+        handle(&mut self.tools_modal);
+        if self.tools_modal.scope() != scope {
+            self.load_tool_stats();
+        }
     }
 
     /// Reads the ledger for the scope `/tools` is showing, which is a snapshot
