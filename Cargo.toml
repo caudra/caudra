@@ -375,6 +375,10 @@ debug = false
 [profile.dev.build-override]
 debug = false
 
+[profile.test]
+opt-level = 1
+lto = "off"
+
 # vendor/crossterm is the head of crossterm-rs/crossterm#1030 (3ca5429), which adds VT input on
 # Windows so bracketed paste decodes and a multiline paste no longer submits at the first newline
 # (#336). On top sits our colour-scheme patch in src/event.rs and src/event/sys/parse.rs:
