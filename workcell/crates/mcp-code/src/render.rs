@@ -179,6 +179,7 @@ fn render_inner(object: ObjectRef<'_>, depth: usize) -> Rendered {
         | MontyNode::Path(_)
         | MontyNode::Type(_)
         | MontyNode::ClassType(_)
+        | MontyNode::Module { .. }
         | MontyNode::BuiltinFunction(_)
         | MontyNode::FileHandle(_)
         | MontyNode::Function { .. }
@@ -260,9 +261,68 @@ impl Capture {
 
 #[cfg(test)]
 mod tests {
-    use monty_types::unstable::{MontyGraph, object_from_graph};
+    use monty_types::{
+        MontyUuid,
+        unstable::{MontyGraph, object_from_graph},
+    };
+    use test_case::test_case;
 
     use super::*;
+
+    const MODULE_NAME: &str = "tools";
+    const MODULE_REPR: &str = "<module 'tools'>";
+
+    #[test_case(false ; "module")]
+    #[test_case(true ; "nested_module")]
+    fn modules_cross_as_lossy_reprs_without_exposing_attributes(nested: bool) {
+        let module = MontyObject::module(
+            MODULE_NAME,
+            MontyUuid::from_u128(1),
+            [(MontyObject::string("private"), MontyObject::int(42))],
+        );
+        let (value, expected, expected_repr) = if nested {
+            (
+                MontyObject::list([module]),
+                serde_json::json!([MODULE_REPR]),
+                format!("[{MODULE_REPR}]"),
+            )
+        } else {
+            (
+                module,
+                serde_json::json!(MODULE_REPR),
+                MODULE_REPR.to_owned(),
+            )
+        };
+        assert_eq!(render(&value), (expected.clone(), Some(expected_repr)));
+        assert_eq!(to_json(&value), Some(expected));
+    }
+
+    #[test_case(false ; "oversized_name")]
+    #[test_case(true ; "expanded_attributes")]
+    fn modules_are_bounded_before_rendering(expanded_attributes: bool) {
+        let mut graph = MontyGraph::new();
+        let key = graph.push(MontyNode::String("values".into()));
+        let mut value = graph.push(MontyNode::Int(1));
+        let name = if expanded_attributes {
+            for _ in 0..16 {
+                value = graph.push(MontyNode::List(vec![value, value]));
+            }
+            MODULE_NAME.to_owned()
+        } else {
+            "x".repeat(MAX_RENDER_COST / MAX_ESCAPE_EXPANSION + 1)
+        };
+        let root = graph.push(MontyNode::Module {
+            name,
+            id: MontyUuid::from_u128(1),
+            attrs: vec![(key, value)],
+        });
+        let module = object_from_graph(graph, root).expect("valid module graph");
+        assert_eq!(
+            render(&module),
+            (Value::Null, Some(OMITTED_VALUE.to_owned()))
+        );
+        assert_eq!(to_json(&module), None);
+    }
 
     #[test]
     fn plain_scalars_need_no_repr() {

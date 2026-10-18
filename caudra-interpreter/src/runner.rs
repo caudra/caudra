@@ -1,7 +1,7 @@
 //! Drives the monty interpreter through its execution states.
 //! Sync tool calls resolve immediately; async (`await`) calls are batched via `ResolveFutures`
 //! and dispatched concurrently through [`AsyncResolver`], with results fed back one by one.
-//! `OsCall` is always rejected; the sandbox never touches the OS directly.
+//! Missing imports resume as not found; all other `OsCall`s are rejected.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -10,8 +10,8 @@ use std::time::Duration;
 use monty::{FunctionCall, MontyRun, RunProgress};
 use monty_types::{
     CompileOptions, DateTimeSource, ExcType, ExtFunctionResult, MontyException, MontyObject,
-    NameLookupResult, OsPolicy, PrintWriter, PrintWriterCallback, RandomStart, ResourceLimits,
-    ResourceTracker, SleepMode,
+    NameLookupResult, OsFunctionCall, OsPolicy, PrintWriter, PrintWriterCallback, RandomStart,
+    ResourceLimits, ResourceTracker, SleepMode,
 };
 use serde_json::Value;
 use tracing::debug;
@@ -257,8 +257,14 @@ fn execute(
                     .resume(result, print_writer.reborrow())
                     .map_err(|e| InterpreterError::Runtime(e.to_string()))?;
             }
-            RunProgress::OsCall(_) => {
-                return Err(InterpreterError::Sandboxed(OS_CALL_DENIED.into()));
+            RunProgress::OsCall(call) => {
+                let OsFunctionCall::Import(name) = &call.function_call else {
+                    return Err(InterpreterError::Sandboxed(OS_CALL_DENIED.into()));
+                };
+                let result = ExtFunctionResult::NotFound(name.clone());
+                progress = call
+                    .resume(result, print_writer.reborrow())
+                    .map_err(|e| InterpreterError::Runtime(e.to_string()))?;
             }
             RunProgress::ResolveFutures(state) => {
                 let resolver = resolver.ok_or_else(|| {
@@ -601,6 +607,7 @@ mod tests {
     #[test_case("import time\ntime.sleep(0)" ; "automatic_sleep")]
     #[test_case("import asyncio\nawait asyncio.sleep(0)" ; "async_sleep")]
     #[test_case("try:\n    open('/etc/passwd')\nexcept Exception:\n    pass" ; "denial_is_not_catchable")]
+    #[test_case("try:\n    import missing_module\nexcept ModuleNotFoundError:\n    try:\n        open('/etc/passwd')\n    except Exception:\n        pass" ; "denial_after_missing_import_is_not_catchable")]
     #[test_case("eval(\"open('/etc/passwd')\")" ; "runtime_compilation")]
     fn os_operations_are_denied(code: &str) {
         let err = run_code(code, &empty_tools(), None, default_limits()).unwrap_err();
@@ -625,6 +632,18 @@ mod tests {
             matches!(err, InterpreterError::Runtime(ref message) if message.contains(IMPORT_ERROR)),
             "{err}"
         );
+    }
+
+    #[test_case("import missing_module", "ModuleNotFoundError" ; "missing_module")]
+    #[test_case("from missing_module import value", "ModuleNotFoundError" ; "missing_from_import")]
+    #[test_case("import missing_module.child", "ModuleNotFoundError" ; "missing_dotted_module")]
+    #[test_case("import socket", "ImportError" ; "import_error_base_class")]
+    fn missing_imports_are_catchable(statement: &str, exception: &str) {
+        let code = format!(
+            "caught = False\ntry:\n    {statement}\nexcept {exception}:\n    caught = True\ncaught"
+        );
+        let result = run_code(&code, &empty_tools(), None, default_limits()).unwrap();
+        assert_eq!(result.output, Some(json!(true)));
     }
 
     #[test_case("while True:\n    pass" ; "cpu_loop")]

@@ -177,20 +177,25 @@ const STDLIB_MODULES: &[&str] = &[
     "asyncio",
     "base64",
     "binascii",
+    "bisect",
     "collections",
     "copy",
+    "csv",
     "dataclasses",
     "datetime",
     "functools",
+    "hashlib",
     "itertools",
     "json",
     "math",
     "os",
     "pathlib",
+    "posixpath",
     "random",
     "re",
     "sys",
     "time",
+    "tomllib",
     "typing",
     "unicodedata",
 ];
@@ -207,4 +212,19 @@ pub fn is_reserved(name: &str) -> bool {
     ]
     .iter()
     .any(|reserved| reserved.contains(&name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_reserved;
+    use test_case::test_case;
+
+    #[test_case("bisect")]
+    #[test_case("csv")]
+    #[test_case("hashlib")]
+    #[test_case("posixpath")]
+    #[test_case("tomllib")]
+    fn stdlib_modules_cannot_be_shadowed_by_host_names(name: &str) {
+        assert!(is_reserved(name));
+    }
 }

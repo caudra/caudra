@@ -116,8 +116,8 @@
       #   mismatch that prints the real hash. This is both the recovery
       #   path for updates and a hard stop if pinned content ever changes.
       gitDepHashes = {
-        "git+https://github.com/pydantic/monty.git?tag=v1.1.0#591527397445bf734873252d1ee20c1b6308fe7f" =
-          "sha256-FqJIkEVmKeDWQyb/yrJ0+/2tZ1kCNe2Xc4r9UPgQptU=";
+        "git+https://github.com/pydantic/monty.git?tag=v1.2.0#e8db9aef41aa73f4f709c15a4bc8a2d198be5ead" =
+          "sha256-yOpD/aPZz/BBkICINUhNghfrmkXxwz6eN4fFZ3/DrtE=";
       };
 
       missingGitDepHashes = builtins.filter (s: !(builtins.hasAttr s gitDepHashes)) gitDepSources;
@@ -146,8 +146,8 @@
             type = "github";
             owner = "pydantic";
             repo = "monty";
-            rev = "591527397445bf734873252d1ee20c1b6308fe7f";
-            narHash = "sha256-FqJIkEVmKeDWQyb/yrJ0+/2tZ1kCNe2Xc4r9UPgQptU=";
+            rev = "e8db9aef41aa73f4f709c15a4bc8a2d198be5ead";
+            narHash = "sha256-yOpD/aPZz/BBkICINUhNghfrmkXxwz6eN4fFZ3/DrtE=";
           };
           montyVendorDeps = craneLib.vendorCargoDeps { src = montySrc; };
           montyAttributionVendor = pkgs.runCommandLocal "monty-attribution-vendor" { } (
@@ -155,7 +155,7 @@
           );
           montyWorker = craneLib.buildPackage {
             pname = "caudra-monty-worker";
-            version = "1.1.0";
+            version = "1.2.0";
             src = montySrc;
             cargoVendorDir = montyVendorDeps;
             cargoExtraArgs = "--locked --package monty-runtime --no-default-features";
@@ -172,7 +172,7 @@
               cp target/release/monty $debug/bin/monty
               cp target/release/monty $out/bin/monty
               $STRIP $out/bin/monty
-              $out/bin/monty --version | grep -qx 'monty-runtime 1.1.0'
+              $out/bin/monty --version | grep -qx 'monty-runtime 1.2.0'
             '';
             dontStrip = true;
           };

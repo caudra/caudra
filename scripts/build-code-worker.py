@@ -8,7 +8,7 @@ import tempfile
 import tomllib
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 EXPECTED_VERSION = f"monty-runtime {VERSION}"
 SOURCE_MANIFEST_FILE = "source-manifest-path"
 SOURCE_ERROR = (

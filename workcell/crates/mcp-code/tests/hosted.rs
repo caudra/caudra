@@ -30,6 +30,8 @@ const NO_SUCH_LIST: &str = "no such list";
 const STUBS: &str = "from typing import Any, overload\nclass _Gh:\n    @overload\n    async def list(self, *, owner: str = '') -> dict[str, Any]: ...\n    @overload\n    async def list(self, arguments: dict[str, Any], /) -> dict[str, Any]: ...\n    async def echo(self, value: Any, *, nested: Any) -> Any: ...\n    async def boom(self) -> Any: ...\n    async def hang(self) -> Any: ...\n    async def slow(self) -> str: ...\ngh: _Gh\nclass _Homeassistant:\n    async def homeassistant__GetLiveContext(self) -> Any: ...\n    async def llm__GetDateTime(self) -> Any: ...\n    async def todo__get_items(self, *, todo_list: str, status: str | None = None) -> Any: ...\nhomeassistant: _Homeassistant\nclass _Executor:\n    @overload\n    async def skills(self) -> Any: ...\n    @overload\n    async def skills(self, arguments: dict[str, Any], /) -> Any: ...\nexecutor: _Executor\ndef search(query: str) -> list[str]: ...\n";
 const HOSTED_SUSPENSION_LIMIT_MESSAGE: &str = "The snippet made too many host round trips and was stopped. Batch work into fewer calls, and check for an undefined name read inside a loop.";
 const SHORT_TIMEOUT_SECS: u64 = 1;
+const TIME_LIMIT_TEST_DEADLINE: Duration = Duration::from_secs(10);
+const MODULE_REPR: &str = "Repr(\"<module 'json'>\")";
 /// Well past the short time limit, so a run charged for the wait could not finish within it.
 const HOST_DELAY: Duration = Duration::from_secs(3);
 /// Past the isolated cap of 256 round trips, yet within the hosted cap even at two per call.
@@ -59,11 +61,15 @@ fn worker() -> Option<PathBuf> {
 }
 
 async fn group() -> Option<CodeToolGroup> {
+    group_with_type_check(true).await
+}
+
+async fn group_with_type_check(type_check: bool) -> Option<CodeToolGroup> {
     let worker = worker()?;
     Some(
         CodeToolGroup::new(CodeConfiguration {
             worker: WorkerSource::Path(&worker),
-            type_check: true,
+            type_check,
             pools: CodePools::All,
         })
         .await
@@ -336,6 +342,57 @@ async fn complex_host_arguments_cross_as_json_strings_including_nested_values() 
     group.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn imported_modules_render_and_cross_host_arguments_as_strings() {
+    let Some(group) = group().await else { return };
+    let host = Arc::new(FakeHost::default());
+    let first = run(&group, &host, "import json\njson", None).await;
+    assert_eq!(outcome(&first), Outcome::Completed, "{:?}", output(&first));
+    assert_eq!(result(&first), &json!(MODULE_REPR));
+    assert_eq!(output(&first).result_repr.as_deref(), Some(MODULE_REPR));
+    let second = run(
+        &group,
+        &host,
+        "await gh.echo(json, nested={'modules': [json]})",
+        first.state,
+    )
+    .await;
+    assert_eq!(
+        outcome(&second),
+        Outcome::Completed,
+        "{:?}",
+        output(&second)
+    );
+    assert_eq!(
+        result(&second),
+        &json!({"args": [MODULE_REPR], "kwargs": {"nested": {"modules": [MODULE_REPR]}}})
+    );
+    assert_eq!(output(&second).result_repr, None);
+    assert_eq!(host.calls(), ["echo"]);
+    group.shutdown().await;
+}
+
+#[test_case("import gh", "ModuleNotFoundError" ; "host_namespace_is_not_an_import")]
+#[test_case("import subprocess", "ModuleNotFoundError" ; "host_python_is_not_available")]
+#[test_case("from pathlib import Path\nPath('/etc/passwd').read_text()", "PermissionError" ; "unmounted_path")]
+#[tokio::test(flavor = "multi_thread")]
+async fn import_and_path_requests_never_dispatch_host_tools(code: &str, exception: &str) {
+    let Some(group) = group_with_type_check(false).await else {
+        return;
+    };
+    let host = Arc::new(FakeHost::default());
+    let code = format!("{code}\nawait gh.list(owner='unreachable')");
+    let executed = run(&group, &host, &code, None).await;
+    let failed = output(&executed);
+    assert_eq!(failed.outcome, Outcome::Exception, "{failed:?}");
+    assert_eq!(
+        failed.exception.as_ref().expect("refused").r#type,
+        exception
+    );
+    assert!(host.calls().is_empty());
+    group.shutdown().await;
+}
+
 /// A module used without its import is imported before the snippet runs, whether or not the
 /// session was restored, and the snippet runs as written.
 #[test_case(false ; "fresh")]
@@ -504,6 +561,8 @@ async fn field_snippets_that_cannot_run_say_why(code: &str, explained_by: &str) 
 /// is kept. Names from earlier runs stay unknown to that check, so rebinding one still runs.
 #[test_case("kept = kept['owner']\nawait gh.nope()", Some("snippet.py:2:7:") ; "a_tool_the_server_lacks")]
 #[test_case("await gh.list(owner=kept)\nawait gh.list(owner=1)", Some("snippet.py:2:") ; "an_argument_of_the_wrong_type")]
+#[test_case("import json\nawait gh.list(owner=kept)\nwrong: int = 'bad'", Some("snippet.py:3:") ; "builtin_import_with_independent_type_error")]
+#[test_case("await gh.list(owner=kept)\nimport unavailable_module\nwrong: int = 'bad'", Some("snippet.py:3:") ; "import_stubs_with_independent_type_error")]
 #[test_case("# nothing to run", None ; "only_a_comment")]
 #[test_case("kept = kept['owner']\nkept", None ; "rebinding_an_earlier_name")]
 #[tokio::test(flavor = "multi_thread")]
@@ -680,6 +739,38 @@ async fn a_busy_loop_still_hits_the_time_limit(restored: bool) {
     assert_eq!(limited.outcome, Outcome::Limited, "{limited:?}");
     assert!(limited.timed_out);
     assert_ne!(executed.state_note, Some(StateNote::RestoreFailed));
+    group.shutdown().await;
+}
+
+#[test_case(false ; "restore_tightens_the_saved_limit")]
+#[test_case(true ; "restore_keeps_a_stricter_saved_limit")]
+#[tokio::test(flavor = "multi_thread")]
+async fn changed_restore_limits_keep_the_stricter_time_budget(saved_short: bool) {
+    let Some(group) = group().await else { return };
+    let host = Arc::new(FakeHost::default());
+    let first = if saved_short {
+        run_briefly(&group, &host, "kept = 7", None).await
+    } else {
+        run(&group, &host, "kept = 7", None).await
+    };
+    let state = first.state.expect("saved session");
+    let code = "while True:\n    pass";
+    let executed = tokio::time::timeout(TIME_LIMIT_TEST_DEADLINE, async {
+        if saved_short {
+            run(&group, &host, code, Some(state)).await
+        } else {
+            run_briefly(&group, &host, code, Some(state)).await
+        }
+    })
+    .await
+    .expect("the stricter time limit must stop the restored run");
+    let limited = output(&executed);
+    assert_eq!(limited.outcome, Outcome::Limited, "{limited:?}");
+    assert!(limited.timed_out);
+    assert_ne!(executed.state_note, Some(StateNote::RestoreFailed));
+    assert!(host.calls().is_empty());
+    let after = run(&group, &host, "kept", executed.state).await;
+    assert_eq!(result(&after), &json!(7));
     group.shutdown().await;
 }
 

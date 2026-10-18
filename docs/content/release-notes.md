@@ -53,6 +53,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 ### Changes
 
+- **More Python in `code`**: Monty 1.2 adds CSV parsing, hashing, TOML parsing, bisection, `os.path`, match statements, and dataclass field defaults. Python still has no direct access to the host filesystem or network.
 - **Orca resumes Caudra**: The status Caudra reports in an Orca terminal now carries the session id as `sessionId` once the session is saved, so Orca can reopen it with `caudra --resume <id>`. While subagents run, it also lists them, and Orca shows each as a child row under the agent. Off Windows, clicking a row switches Caudra to that subagent's chat when Orca supports it, and clicking the agent's own row switches back to the main chat. See [Orca](/docs/notifications/#orca).
 - **Docs from any modal**: A `?` on the top border of a modal such as `/accounts`, `/usage`, or `/permissions` opens the section of the manual about it, and `F1` does the same. The docs open above the modal, so `Esc` returns to it. A link from `/changelog` into the docs also opens above the release notes now instead of closing them. See [Docs](/docs/commands/#docs).
 - **Clickable title hints**: The key hints on the top border of `/usage` (reload, lifetime or session, more or less) and `/tools` (the next view) now answer a click as their key does, and highlight under the pointer.

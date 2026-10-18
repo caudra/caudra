@@ -387,7 +387,7 @@ async fn supports_the_advertised_stdlib_modules() {
 /// imported here against a running worker.
 #[tokio::test]
 async fn every_advertised_module_imports() {
-    let group = group_or_skip!();
+    let group = group_or_skip!(true);
     for module in SUBSET_MODULES {
         let output = run(&group, &format!("import {module}\nTrue")).await;
         assert_eq!(
@@ -438,7 +438,6 @@ async fn modules_named_as_absent_really_are() {
         "statistics",
         "enum",
         "contextlib",
-        "hashlib",
         "uuid",
         "urllib",
     ] {
@@ -462,14 +461,6 @@ async fn the_described_cpython_divergences_hold() {
     let eager = run(&group, "[type(zip([1], [2])) is list, type(enumerate('a')) is list, type(reversed([1])) is list, type(i for i in range(2)) is list]").await;
     assert_eq!(eager["result"], json!([true, true, true, true]), "{eager}");
 
-    // Operators ignore user-defined dunders, but the method is still callable directly.
-    let dunder = run(
-        &group,
-        "class A:\n    def __init__(self, v):\n        self.v = v\n    def __add__(self, o):\n        return A(self.v + o.v)\na = A(1)\ntry:\n    a + a\n    r = 'dispatched'\nexcept TypeError:\n    r = 'ignored'\n[r, a.__add__(a).v]",
-    )
-    .await;
-    assert_eq!(dunder["result"], json!(["ignored", 2]), "{dunder}");
-
     // re.sub takes a string replacement only; a callable is refused rather than applied.
     let sub = run(
         &group,
@@ -478,7 +469,6 @@ async fn the_described_cpython_divergences_hold() {
     .await;
     assert_eq!(sub["result"], json!("refused"), "{sub}");
 
-    // os carries constants but no path submodule; pathlib is the advertised replacement.
     let paths = run(
         &group,
         "import os\nfrom pathlib import Path\n[os.sep, str(Path('/a') / 'b.txt'), Path('/a/b.txt').suffix]",
@@ -486,6 +476,134 @@ async fn the_described_cpython_divergences_hold() {
     .await;
     assert_eq!(paths["result"], json!(["/", "/a/b.txt", ".txt"]), "{paths}");
 
+    group.shutdown().await;
+}
+
+#[test_case(
+    "import bisect\nxs = [1, 3, 3, 5]\nleft = bisect.bisect_left(xs, 3)\nright = bisect.bisect_right(xs, 3)\nbisect.insort(xs, 2)\n[left, right, xs]",
+    json!([1, 3, [1, 2, 3, 3, 5]]);
+    "bisect"
+)]
+#[test_case(
+    "import csv\n[list(csv.reader(['name,value', '\"a,b\",2'])), list(csv.DictReader(['name,value', 'x,3']))]",
+    json!([[["name", "value"], ["a,b", "2"]], [{"name": "x", "value": "3"}]]);
+    "csv"
+)]
+#[test_case(
+    "import hashlib\nh = hashlib.sha256(b'a')\nc = h.copy()\nh.update(b'bc')\n[h.hexdigest(), c.hexdigest() == hashlib.sha256(b'a').hexdigest()]",
+    json!(["ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", true]);
+    "hashlib"
+)]
+#[test_case(
+    "import tomllib\ntomllib.loads('[package]\\nname = \"demo\"\\nversions = [1, 2]')",
+    json!({"package": {"name": "demo", "versions": [1, 2]}});
+    "tomllib"
+)]
+#[test_case(
+    "import os.path\nimport posixpath\nfrom os import path\n[os.path.join('/a', 'b'), path.basename('/a/b.txt'), posixpath.normpath('/a/../b'), list(posixpath.splitext('x.csv'))]",
+    json!(["/a/b", "b.txt", "/b", ["x", ".csv"]]);
+    "posix_paths"
+)]
+#[tokio::test]
+async fn new_modules_work_with_default_type_checking(code: &str, expected: Value) {
+    let group = group_or_skip!(true);
+    let output = run(&group, code).await;
+    assert_eq!(output["outcome"], "completed", "{output}");
+    assert_eq!(output["result"], expected, "{output}");
+    group.shutdown().await;
+}
+
+#[test_case(
+    "def classify(value):\n    match value:\n        case {'items': [first, *rest]} if first > 0:\n            return [first, rest]\n        case 0 | None:\n            return 'empty'\n        case _:\n            return 'other'\n[classify({'items': [1, 2, 3]}), classify(None), classify(-1)]",
+    json!([[1, [2, 3]], "empty", "other"]);
+    "match_patterns_and_guards"
+)]
+#[test_case(
+    "xs = [0, 1, 2, 3]\nxs[1:3] = [8, 9, 10]\nxs[::2] = [4, 5, 6]\nxs[1:2] = []\nxs",
+    json!([4, 5, 10, 6]);
+    "list_slice_assignment"
+)]
+#[test_case(
+    "a, b = {1}, frozenset([1, 2])\n[a < b, a <= {1}, b > a, b >= frozenset([1, 2]), a < {2}, {1, 2} > {1, 2}]",
+    json!([true, true, true, true, false, false]);
+    "set_subset_ordering"
+)]
+#[test_case(
+    "import re\n[re.split(r'(a)|b', 'xaybz'), re.compile(r'(,)').split('a,b,c', maxsplit=1)]",
+    json!([["x", "a", "y", null, "z"], ["a", ",", "b,c"]]);
+    "regex_split_capture_groups"
+)]
+#[test_case(
+    "from dataclasses import dataclass\n@dataclass(frozen=True)\nclass Key:\n    value: int\na, b = Key(3), Key(3)\n[a == b, hash(a) == hash(b), {a: 'found'}[b]]",
+    json!([true, true, "found"]);
+    "frozen_dataclass"
+)]
+#[tokio::test]
+async fn new_language_features_work_with_default_type_checking(code: &str, expected: Value) {
+    let group = group_or_skip!(true);
+    let output = run(&group, code).await;
+    assert_eq!(output["outcome"], "completed", "{output}");
+    assert_eq!(output["result"], expected, "{output}");
+    group.shutdown().await;
+}
+
+#[tokio::test]
+async fn dataclass_fields_factories_and_post_init_work_with_default_type_checking() {
+    let group = group_or_skip!(true);
+    let output = run(
+        &group,
+        r#"from dataclasses import dataclass, field, is_dataclass
+@dataclass
+class Record:
+    name: str = field(default='item')
+    values: list[int] = field(default_factory=list)
+    def __post_init__(self):
+        self.values.append(len(self.name))
+a, b = Record(), Record('xy')
+a.values.append(9)
+match b:
+    case Record(name, values):
+        matched = [name, values]
+[a.name, a.values, b.values, is_dataclass(a), matched]"#,
+    )
+    .await;
+    assert_eq!(output["outcome"], "completed", "{output}");
+    assert_eq!(
+        output["result"],
+        json!(["item", [4, 9], [2], true, ["xy", [2]]]),
+        "{output}"
+    );
+    group.shutdown().await;
+}
+
+#[tokio::test]
+async fn operator_dunders_dispatch_with_default_type_checking() {
+    let group = group_or_skip!(true);
+    let output = run(
+        &group,
+        r#"class Number:
+    def __init__(self, value):
+        self.value = value
+    def __add__(self, other):
+        return self.value + other.value
+    def __radd__(self, other):
+        return other + self.value
+    def __neg__(self):
+        return -self.value
+    def __getitem__(self, index):
+        return self.value + index
+    def __setitem__(self, index, value):
+        self.value = index + value
+    def __call__(self, extra):
+        return self.value + extra
+n = Number(3)
+before = [n + Number(4), 2 + n, -n, n[1], n(5)]
+n[2] = 10
+[before, n.value]"#,
+    )
+    .await;
+    assert_eq!(output["outcome"], "completed", "{output}");
+    assert_eq!(output["result"], json!([[7, 5, -3, 4, 8], 12]), "{output}");
     group.shutdown().await;
 }
 
@@ -615,7 +733,7 @@ async fn annotations_are_never_required_and_only_add_constraints() {
     group.shutdown().await;
 }
 
-/// The checker resolves five modules the interpreter does not implement, because the stubs need
+/// The checker resolves modules the interpreter does not implement, because the stubs need
 /// them. An agent told only that snippets are checked before running would read a clean check as a
 /// guarantee, so the description says otherwise and this holds it to that.
 #[tokio::test]
@@ -911,6 +1029,54 @@ async fn unmounted_reads_writes_and_process_modules_stay_unavailable() {
 }
 
 #[tokio::test]
+async fn directory_scans_cannot_reach_the_host() {
+    let group = group_or_skip!(false);
+    for code in [
+        "import os\nlist(os.scandir('/'))",
+        "import os\ndef fail(error):\n    raise error\nlist(os.walk('/', onerror=fail))",
+        "from pathlib import Path\ndef fail(error):\n    raise error\nlist(Path('/').walk(on_error=fail))",
+    ] {
+        let output = run(&group, code).await;
+        assert_eq!(output["outcome"], "exception", "{code}: {output}");
+        assert_eq!(output["exception"]["type"], "PermissionError", "{output}");
+        assert!(
+            output["diagnostic"]
+                .as_str()
+                .expect("isolation guidance")
+                .contains("no filesystem, network, or environment access"),
+            "{output}"
+        );
+    }
+    let output = run(
+        &group,
+        "from pathlib import Path\n[list(Path('/').glob('*')), list(Path('/').rglob('*'))]",
+    )
+    .await;
+    assert_eq!(output["outcome"], "completed", "{output}");
+    assert_eq!(output["result"], json!([[], []]), "{output}");
+    group.shutdown().await;
+}
+
+#[tokio::test]
+async fn unstubbed_directory_scan_is_rejected_before_execution() {
+    let group = group_or_skip!(true);
+    let output = run(
+        &group,
+        "import os\nprint('unreachable')\nlist(os.scandir('/'))",
+    )
+    .await;
+    assert_eq!(output["outcome"], "rejected", "{output}");
+    assert_eq!(output["stdout"], "");
+    assert!(
+        output["diagnostic"]
+            .as_str()
+            .expect("type diagnostic")
+            .contains("scandir")
+    );
+    group.shutdown().await;
+}
+
+#[tokio::test]
 async fn shared_and_cyclic_wire_values_render_without_unbounded_expansion() {
     let group = group_or_skip!();
     let shared = run(&group, "a = [1, 2]\n[a, a]").await;
@@ -954,13 +1120,8 @@ async fn network_modules_are_absent() {
 
 #[tokio::test]
 async fn unsupported_syntax_is_rejected_before_running() {
-    let group = group_or_skip!();
-    // A `match` statement is refused by the parser, so the preceding print must never run.
-    let output = run(
-        &group,
-        "print('should not appear')\nmatch 1:\n    case 1:\n        pass",
-    )
-    .await;
+    let group = group_or_skip!(true);
+    let output = run(&group, "print('should not appear')\nvalue = 1\ndel value").await;
     assert_eq!(output["outcome"], "rejected");
     assert_eq!(output["stdout"], "");
     let diagnostic = output["diagnostic"].as_str().expect("guidance");
@@ -1094,6 +1255,28 @@ async fn type_checking_rejects_before_execution_when_enabled() {
             .expect("guidance")
             .contains("nothing was executed")
     );
+    group.shutdown().await;
+}
+
+#[tokio::test]
+async fn expanding_codecs_and_float_formats_respect_the_memory_budget() {
+    const INPUT_BYTES: usize = 128 * 1024 * 1024;
+    const FLOAT_PRECISION: usize = 1_000_000_000;
+    let group = group_or_skip!(true);
+    for code in [
+        format!("import base64\nsrc = b'x' * {INPUT_BYTES}\nlen(base64.b64encode(src))"),
+        format!("import binascii\nsrc = b'x' * {INPUT_BYTES}\nlen(binascii.hexlify(src))"),
+        format!("f'{{1.0:.{FLOAT_PRECISION}f}}'"),
+        format!("'%.{FLOAT_PRECISION}f' % 1.0"),
+    ] {
+        let output = run(&group, &code).await;
+        assert_eq!(output["outcome"], "limited", "{code}: {output}");
+        assert_eq!(output["exception"]["type"], "MemoryError", "{output}");
+        assert_eq!(output["memoryExceeded"], true, "{output}");
+        let recovery = run(&group, "21 * 2").await;
+        assert_eq!(recovery["outcome"], "completed", "{recovery}");
+        assert_eq!(recovery["result"], 42, "{recovery}");
+    }
     group.shutdown().await;
 }
 

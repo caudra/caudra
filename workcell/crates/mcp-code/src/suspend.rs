@@ -60,7 +60,8 @@ fn empty_environment(function_name: &str) -> MontyObject {
 
 #[cfg(test)]
 mod tests {
-    use monty_types::SourceRange;
+    use monty_types::{IMPORT_CALL, IMPORT_STUBS_CALL, SourceRange};
+    use test_case::test_case;
 
     use super::*;
 
@@ -86,6 +87,15 @@ mod tests {
                 "{name} must be refused so the sandbox raises PermissionError"
             );
         }
+    }
+
+    #[test_case(IMPORT_CALL ; "module_import")]
+    #[test_case(IMPORT_STUBS_CALL ; "module_stubs")]
+    fn module_requests_are_not_handled(name: &str) {
+        assert!(matches!(
+            answer(&os_call(name)),
+            Answer::Resume(ResumeValue::NotHandled)
+        ));
     }
 
     #[test]

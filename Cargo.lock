@@ -1135,7 +1135,7 @@ name = "caudra-interpreter"
 version = "0.2.0-preview.10"
 dependencies = [
  "monty",
- "monty-types 1.1.0 (git+https://github.com/pydantic/monty.git?tag=v1.1.0)",
+ "monty-types 1.2.0 (git+https://github.com/pydantic/monty.git?tag=v1.2.0)",
  "serde_json",
  "test-case",
  "thiserror 2.0.21",
@@ -5374,8 +5374,8 @@ dependencies = [
 
 [[package]]
 name = "monty"
-version = "1.1.0"
-source = "git+https://github.com/pydantic/monty.git?tag=v1.1.0#591527397445bf734873252d1ee20c1b6308fe7f"
+version = "1.2.0"
+source = "git+https://github.com/pydantic/monty.git?tag=v1.2.0#e8db9aef41aa73f4f709c15a4bc8a2d198be5ead"
 dependencies = [
  "ahash",
  "chrono",
@@ -5389,8 +5389,8 @@ dependencies = [
  "libm",
  "memchr",
  "minicbor-serde",
- "monty-macros 1.1.0 (git+https://github.com/pydantic/monty.git?tag=v1.1.0)",
- "monty-types 1.1.0 (git+https://github.com/pydantic/monty.git?tag=v1.1.0)",
+ "monty-macros 1.2.0 (git+https://github.com/pydantic/monty.git?tag=v1.2.0)",
+ "monty-types 1.2.0 (git+https://github.com/pydantic/monty.git?tag=v1.2.0)",
  "num-bigint",
  "num-integer",
  "num-traits",
@@ -5403,7 +5403,8 @@ dependencies = [
  "ruff_text_size",
  "serde",
  "serde_bytes",
- "sha2 0.10.9",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
  "smallvec",
  "speedate",
  "strum 0.27.2",
@@ -5414,21 +5415,21 @@ dependencies = [
 
 [[package]]
 name = "monty-fs"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e1edf72887e131762ef991f67d4a8fd126554460e0ea8b0dec8a068cf7cf167"
+checksum = "03daf656e21e09bf2bfcca964c6e68ce8eb95237ff3fd7f763be07877246cccb"
 dependencies = [
  "ahash",
  "cap-std",
- "monty-types 1.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "monty-types 1.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustix",
 ]
 
 [[package]]
 name = "monty-macros"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff5176d386cd79f7e181c703e10314375ffd3d550285da672da9ae8e5952b751"
+checksum = "82ae4a49b9211b7ca43b124f95becb0c286af6df49421f5f99c65cd6a6f51f9e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5437,8 +5438,8 @@ dependencies = [
 
 [[package]]
 name = "monty-macros"
-version = "1.1.0"
-source = "git+https://github.com/pydantic/monty.git?tag=v1.1.0#591527397445bf734873252d1ee20c1b6308fe7f"
+version = "1.2.0"
+source = "git+https://github.com/pydantic/monty.git?tag=v1.2.0#e8db9aef41aa73f4f709c15a4bc8a2d198be5ead"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5447,14 +5448,14 @@ dependencies = [
 
 [[package]]
 name = "monty-pool"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce5d1666e27e0fcdad9e0f1aec467d5cd7f595b8f1f270e4f7a1d4ea6867b14"
+checksum = "5a3a86ba1eff96c8accaa67b04131ef7ceea3c9f5d68187e687ab20ecc31cd94"
 dependencies = [
  "futures-util",
  "monty-fs",
  "monty-proto",
- "monty-types 1.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "monty-types 1.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustls",
  "tokio",
  "tokio-tungstenite",
@@ -5462,26 +5463,27 @@ dependencies = [
 
 [[package]]
 name = "monty-proto"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f62ede58a8426cfcd96ef1a8222579980c771f54ee63b5c20dabcfa7d3d72f85"
+checksum = "831fb817f8b462cbfa2abc4ca072fcac7f937a0cc19f83527358198c3b0fb8a0"
 dependencies = [
- "monty-types 1.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "monty-types 1.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "num-bigint",
  "prost",
 ]
 
 [[package]]
 name = "monty-types"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d80ebea7f98c1e7ad4075c111e03c59ef80d18abd813f1fad8984f8c4827d95d"
+checksum = "09956030c0cd340d5db97b88fd3744f57ed304083093a592ab2a29a3dcab88cb"
 dependencies = [
  "chrono",
  "jiff",
- "monty-macros 1.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "monty-macros 1.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "num-bigint",
  "num-traits",
+ "ruff_python_stdlib",
  "serde",
  "serde_bytes",
  "strum 0.27.2",
@@ -5491,14 +5493,15 @@ dependencies = [
 
 [[package]]
 name = "monty-types"
-version = "1.1.0"
-source = "git+https://github.com/pydantic/monty.git?tag=v1.1.0#591527397445bf734873252d1ee20c1b6308fe7f"
+version = "1.2.0"
+source = "git+https://github.com/pydantic/monty.git?tag=v1.2.0#e8db9aef41aa73f4f709c15a4bc8a2d198be5ead"
 dependencies = [
  "chrono",
  "jiff",
- "monty-macros 1.1.0 (git+https://github.com/pydantic/monty.git?tag=v1.1.0)",
+ "monty-macros 1.2.0 (git+https://github.com/pydantic/monty.git?tag=v1.2.0)",
  "num-bigint",
  "num-traits",
+ "ruff_python_stdlib",
  "serde",
  "serde_bytes",
  "strum 0.27.2",
@@ -7844,6 +7847,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.1",
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "sha1dc"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9347,7 +9361,7 @@ dependencies = [
  "rand 0.9.5",
  "rustls",
  "rustls-pki-types",
- "sha1",
+ "sha1 0.10.7",
  "thiserror 2.0.21",
  "utf-8",
 ]
@@ -10378,7 +10392,7 @@ name = "workcell-mcp-code"
 version = "0.2.0-preview.10"
 dependencies = [
  "monty-pool",
- "monty-types 1.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "monty-types 1.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rmcp",
  "schemars 1.2.3",
  "serde",

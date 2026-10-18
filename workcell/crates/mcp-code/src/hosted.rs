@@ -21,7 +21,9 @@ use std::{
 };
 
 use monty_pool::{Checkout, PoolError, ReplConfig, ResumeValue, TurnEvent, on_print_sync};
-use monty_types::{CallArgs, ExcType, MontyException, MontyObject, MontyUuid, NameLookupResult};
+use monty_types::{
+    CallArgs, ExcType, IMPORT_STUBS_CALL, MontyException, MontyObject, MontyUuid, NameLookupResult,
+};
 use serde_json::{Map, Value};
 use tokio::task::{Id, JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -66,6 +68,8 @@ const CHECK_ONLY_GUARD_LINES: usize = 2;
 const CHECK_ONLY_INDENT: &str = "    ";
 /// Keeps the guarded block valid when the snippet is only comments.
 const CHECK_ONLY_TAIL: &str = "pass";
+const CHECK_ONLY_SUSPENDED_MESSAGE: &str = "the type-check-only snippet unexpectedly suspended";
+const CHECK_ONLY_LIMIT_MESSAGE: &str = "the type-check-only snippet exceeded its suspension limit";
 
 pub type HostReply = Result<Value, HostError>;
 /// A deferred call. It must have no effect until first polled: an unawaited call is dropped unpolled.
@@ -418,7 +422,7 @@ impl CodeToolGroup {
     async fn check_alone(&self, repl: &ReplConfig, code: &str) -> Result<(), PoolError> {
         let mut session = self.hosted.checkout(repl).await?;
         let mut no_print = on_print_sync(|_, _| {});
-        let fed = session
+        let mut event = session
             .feed(
                 &check_only(code),
                 Vec::new(),
@@ -427,13 +431,27 @@ impl CodeToolGroup {
                 &mut no_print,
             )
             .await;
-        let standing = match fed {
-            Err(PoolError::Typing(diagnostics)) => standing_diagnostics(&diagnostics),
-            Ok(TurnEvent::Complete(_)) | Err(PoolError::Runtime(_)) => None,
-            Ok(_) | Err(_) => return Ok(()),
-        };
-        let _ = session.finish().await;
-        standing.map_or(Ok(()), |standing| Err(PoolError::Typing(standing)))
+        for _ in 0..MAX_HOSTED_SUSPENSIONS {
+            match event {
+                Ok(TurnEvent::Complete(_)) => {
+                    let _ = session.finish().await;
+                    return Ok(());
+                }
+                Err(PoolError::Typing(diagnostics)) => {
+                    let _ = session.finish().await;
+                    return standing_diagnostics(&diagnostics)
+                        .map_or(Ok(()), |standing| Err(PoolError::Typing(standing)));
+                }
+                Ok(TurnEvent::OsCall { function_name, .. })
+                    if function_name == IMPORT_STUBS_CALL =>
+                {
+                    event = session.resume(ResumeValue::NotHandled, &mut no_print).await;
+                }
+                Ok(_) => return Err(PoolError::Protocol(CHECK_ONLY_SUSPENDED_MESSAGE.into())),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(PoolError::Protocol(CHECK_ONLY_LIMIT_MESSAGE.into()))
     }
 
     /// Checks out a worker holding the prior session, or a fresh one when there is none or it
@@ -854,6 +872,27 @@ mod tests {
     const MISSING_TOOL: &str =
         "error[unresolved-attribute] Object of type `_Gh` has no attribute `nope`";
     const EARLIER_NAME: &str = "error[unresolved-reference] Name `kept` used when not defined";
+    const MODULE_REPR: &str = "<module 'tools'>";
+
+    #[test]
+    fn module_arguments_and_host_replies_remain_json_values() {
+        let module = MontyObject::module("tools", MontyUuid::from_u128(1), []);
+        let mut args = CallArgs::new();
+        args.push_arg(module.clone());
+        args.push_kwarg("nested", MontyObject::list([module]));
+        let call = host_call("echo", None, &args, &HashMap::new()).expect("module argument");
+        assert_eq!(call.args, [Value::String(MODULE_REPR.into())]);
+        let nested = serde_json::json!([MODULE_REPR]);
+        assert_eq!(call.kwargs.get("nested"), Some(&nested));
+        let ResumeValue::Return(reply) = resume_reply(Ok(nested.clone())) else {
+            panic!("a JSON reply returns a value");
+        };
+        assert_eq!(to_json(&reply), Some(nested));
+        assert_eq!(
+            reply.as_ref().items().expect("list")[0].as_str(),
+            Some(MODULE_REPR)
+        );
+    }
 
     /// The guard adds two lines above the snippet and indents it, so a position the checker gives is
     /// moved back by both before the caller reads it.

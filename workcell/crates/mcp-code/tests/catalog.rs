@@ -34,8 +34,13 @@ fn description_enumerates_the_subset_an_agent_will_trip_over() {
         "eager",
         "fancy-regex",
         "type stubs",
-        "do not dispatch to user-defined dunders",
-        "no os.path",
+        "Arithmetic dunders",
+        "os.path and posixpath",
+        "list slice assignment",
+        "set/frozenset subset ordering",
+        "default_factory",
+        "__post_init__",
+        "re.split includes captured groups",
         "No variables, definitions, or imports persist between calls",
     ] {
         assert!(
@@ -72,13 +77,13 @@ fn description_distinguishes_new_modules_from_modules_still_absent() {
         .split_once('.')
         .expect("the enumeration is a sentence")
         .0;
-    for available in ["base64", "binascii", "copy", "functools", "random", "time"] {
+    for available in SUBSET_MODULES {
         assert!(
             advertised.split(", ").any(|name| name == available),
             "{available} must be advertised"
         );
     }
-    for absent in ["statistics", "hashlib", "urllib"] {
+    for absent in ["statistics", "gc", "urllib"] {
         assert!(
             !advertised.contains(absent),
             "{absent} is advertised as available: {advertised}"

@@ -140,14 +140,17 @@ mod tests {
         MAX_VALUE_DEPTH, VALUE_TOO_LARGE, call_args_to_json, json_to_monty, monty_to_json,
     };
     use crate::error::InterpreterError;
-    use monty_types::MontyObject;
     use monty_types::unstable::{self, MontyGraph, MontyNode};
+    use monty_types::{MontyObject, MontyUuid};
     use serde_json::{Value, json};
     use test_case::test_case;
 
     const ARGUMENT_BUDGET: usize = 8 * 1024;
     const ALIASED_STRING_BYTES: usize = 1024;
     const BYTE_ARRAY_LENGTH: usize = 128;
+    const MODULE_NAME: &str = "tools";
+    const MODULE_REPR: &str = "<module 'tools'>";
+    const MODULE_ID: MontyUuid = MontyUuid::from_u128(1);
 
     #[test_case(json!(null),    MontyObject::none()          ; "null_to_none")]
     #[test_case(json!(true),    MontyObject::bool(true)      ; "bool_true")]
@@ -180,6 +183,22 @@ mod tests {
     fn nan_float_becomes_null() {
         let obj = MontyObject::float(f64::NAN);
         assert_eq!(monty_to_json(obj.as_ref()).unwrap(), Value::Null);
+    }
+
+    #[test_case(false ; "module")]
+    #[test_case(true ; "nested_module")]
+    fn modules_use_repr_fallback(nested: bool) {
+        let module = MontyObject::module(
+            MODULE_NAME,
+            MODULE_ID,
+            [(MontyObject::string("value"), MontyObject::int(42))],
+        );
+        let (obj, expected) = if nested {
+            (MontyObject::list([module]), json!([MODULE_REPR]))
+        } else {
+            (module, json!(MODULE_REPR))
+        };
+        assert_eq!(monty_to_json(obj.as_ref()).unwrap(), expected);
     }
 
     #[test_case(2, 0 ; "positional_aliases")]
@@ -217,9 +236,11 @@ mod tests {
         );
     }
 
-    #[test_case(false ; "deep_value")]
-    #[test_case(true ; "exponentially_shared_value")]
-    fn flat_values_cannot_overflow_or_explode_json_conversion(shared: bool) {
+    #[test_case(false, false ; "deep_value")]
+    #[test_case(true, false ; "exponentially_shared_value")]
+    #[test_case(false, true ; "deep_module_attribute")]
+    #[test_case(true, true ; "exponentially_shared_module_attribute")]
+    fn flat_values_cannot_overflow_or_explode_json_conversion(shared: bool, module: bool) {
         let mut graph = MontyGraph::new();
         let mut root = graph.push(MontyNode::None);
         let depth = if shared {
@@ -233,6 +254,14 @@ mod tests {
             } else {
                 vec![root]
             }));
+        }
+        if module {
+            let key = graph.push(MontyNode::String("value".into()));
+            root = graph.push(MontyNode::Module {
+                name: MODULE_NAME.into(),
+                id: MODULE_ID,
+                attrs: vec![(key, root)],
+            });
         }
         let value = unstable::object_from_graph(graph, root).unwrap();
         let err = monty_to_json(value.as_ref()).unwrap_err();

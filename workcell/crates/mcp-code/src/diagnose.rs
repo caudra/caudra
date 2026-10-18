@@ -74,7 +74,7 @@ pub(crate) fn diagnose_for(exception: &MontyException, surface: Surface) -> Diag
             Diagnosis {
                 outcome: Outcome::Rejected,
                 diagnostic: Some(format!(
-                    "This Python construct is not supported and the snippet did not run. Unavailable: class inheritance and metaclasses, super(), decorators on methods (@classmethod, @staticmethod, @property), yield and generator functions, match, del, try*/except* groups, async with, async for, PEP 695 type aliases, wildcard imports, and t-strings. Rewrite without it, or use the shell tool if the task genuinely needs full Python. ({message})"
+                    "This Python construct is not supported and the snippet did not run. Unavailable: class inheritance and metaclasses, super(), decorators on methods (@classmethod, @staticmethod, @property), yield and generator functions, del, try*/except* groups, async with, async for, PEP 695 type aliases, wildcard imports, and t-strings. Rewrite without it, or use the shell tool if the task genuinely needs full Python. ({message})"
                 )),
             }
         }
@@ -462,12 +462,13 @@ mod tests {
     fn unsupported_syntax_is_rejected_not_raised() {
         let diagnosis = diagnose(&exception(
             ExcType::NotImplementedError,
-            "The monty syntax parser does not yet support match statements",
+            "The monty syntax parser does not yet support del statements",
         ));
         assert_eq!(diagnosis.outcome, Outcome::Rejected);
         let text = diagnosis.diagnostic.expect("guidance");
         assert!(text.contains("did not run"));
-        assert!(text.contains("match"));
+        assert!(text.contains("del"));
+        assert!(!text.contains("match"));
     }
 
     #[test]

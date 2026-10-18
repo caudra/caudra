@@ -30,7 +30,7 @@ Isolation:
 
 This is a Python subset, not CPython. It rejects or fails on:
 - Class inheritance, metaclasses, super(), and decorators on methods, so @classmethod, @staticmethod, and @property are unavailable. Simple classes and @dataclass do work.
-- yield and generator functions, match statements, del, try*/except* groups, async with, async for, PEP 695 type aliases, wildcard imports, and t-strings.
+- yield and generator functions, del, try*/except* groups, async with, async for, PEP 695 type aliases, wildcard imports, and t-strings.
 - str.translate() and str.maketrans(). str.format(), %-formatting, and f-strings work.
 - Defining exception classes, since classes cannot inherit. Raise a built-in such as ValueError. Exception constructors take at most one string, so OSError(errno, message, path) fails, and raise X from Y parses but silently drops the cause.
 - These builtins, which are undefined and raise NameError: "#,
@@ -40,19 +40,19 @@ This is a Python subset, not CPython. It rejects or fails on:
 
 Only these standard library modules exist, each covering part of its CPython surface: "#,
     available_modules!(),
-    r#". There are no third-party packages, and no gc, io, string, struct, operator, statistics, enum, contextlib, hashlib, uuid, or urllib.
+    r#". There are no third-party packages, and no gc, io, string, struct, operator, statistics, enum, contextlib, uuid, or urllib.
 
-Unpacking supports subscript and attribute targets, including x[i], x[j] = x[j], x[i]. eval(), exec(), and locals() work inside the same isolated interpreter; dynamic code gains no host access. Generic aliases such as list[int] work as values as well as annotations.
+Unpacking supports subscript and attribute targets, including x[i], x[j] = x[j], x[i]. match statements, list slice assignment, and set/frozenset subset ordering work. eval(), exec(), and locals() work inside the same isolated interpreter; dynamic code gains no host access. Generic aliases such as list[int] work as values as well as annotations.
 
 Behaviour that differs from CPython even where the API exists:
 - "#,
     untyped_builtins!(),
     r#" exist at runtime but are missing from the type stubs, so type checking rejects them before the snippet runs. Use a comprehension instead of map or filter, and f-strings instead of format(). getattr and hasattr also cannot see methods, so hasattr returns False for attributes that do exist. object exists as a type but object() cannot create instances.
 - enumerate, zip, reversed, and generator expressions are eager and return lists, so an infinite iterator never terminates. iter() and the itertools functions stay lazy and single-use.
-- Operators do not dispatch to user-defined dunders, so +, -, <, len(), [], and () ignore __add__, __neg__, __lt__, __len__, __getitem__, and __call__ on your own classes. __init__, __repr__, __str__, __eq__, __hash__, __bool__, __iter__, and __contains__ do work; reach anything else by calling the method directly.
-- re is backed by fancy-regex: no bytes patterns, no VERBOSE flag, no re.subn, and re.sub takes a string replacement only, never a callable.
-- os has no os.path. Use pathlib for path manipulation. sys includes version, version_info, platform, maxsize, and the streams, not the host environment.
-- dataclasses provides @dataclass with no arguments plus is_dataclass; field, asdict, astuple, fields, replace, and options such as frozen= are absent.
+- Arithmetic dunders (including reflected operators), __getitem__, __setitem__, and __call__ dispatch on user classes. Ordering dunders such as __lt__, as well as __len__, are still not dispatched. Arithmetic and subscript dunders cannot suspend for host calls.
+- re is backed by fancy-regex: re.split includes captured groups; no bytes patterns, no VERBOSE flag, no re.subn, and re.sub takes a string replacement only, never a callable.
+- os.path and posixpath provide POSIX path manipulation, not host access. Filesystem scans and reads remain refused; os.scandir is also absent from the type stubs. sys includes version, version_info, platform, maxsize, and the streams, not the host environment.
+- dataclasses provides @dataclass with eq/frozen options, field(default=..., default_factory=...), __post_init__, MISSING, and is_dataclass. asdict, astuple, fields, and replace are absent; other non-default decorator/field options are unsupported. Factories and __post_init__ cannot suspend for host calls.
 - Only the utf-8, ascii, utf-16, and utf-32 codecs exist.
 
 Usage notes:
