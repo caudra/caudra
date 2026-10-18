@@ -11,8 +11,10 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{Arc, OnceLock},
+    time::Duration,
 };
 
+use async_io::Timer;
 use async_lock::{Mutex as AsyncMutex, MutexGuardArc};
 use serde_json::{Map, Value};
 
@@ -23,6 +25,7 @@ pub type ScriptReply = Result<Value, ScriptError>;
 /// dropped unpolled.
 pub type ScriptFuture = Pin<Box<dyn Future<Output = ScriptReply> + Send>>;
 pub type RunFuture = Pin<Box<dyn Future<Output = ScriptOutcome> + Send>>;
+pub type WaitFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 static INSTALLED: OnceLock<Arc<dyn ScriptRunner>> = OnceLock::new();
 
@@ -88,6 +91,12 @@ pub trait ScriptHost: Send + Sync {
     fn call(&self, call: ScriptCall) -> ScriptInvocation;
     /// Type stubs for everything the host exposes, checked before the snippet runs.
     fn stubs(&self) -> String;
+    /// Waits out a `time.sleep` or `asyncio.sleep`, doing nothing until first polled.
+    fn sleep(&self, delay: Duration) -> WaitFuture {
+        Box::pin(async move {
+            Timer::after(delay).await;
+        })
+    }
 }
 
 /// A saved interpreter session. Only the runner that produced it can read it.

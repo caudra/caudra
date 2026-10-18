@@ -48,7 +48,6 @@ use crate::history::{self, PoolJudgement};
 use crate::memory::relevance::{self, Advice, Judge};
 use crate::memory::search::{Candidate, Hit};
 use crate::permissions::{PermissionResource, decision_state};
-use crate::tools::deferral::rank_tool_search;
 use crate::tools::native::skill::{SkillInventoryEntry, SkillScope};
 use crate::types::{TodoItem, TodoPriority, TodoStatus};
 use crate::{CancelToken, SubagentTaskMode};
@@ -199,13 +198,6 @@ struct Described {
 struct SkillCase {
     request: String,
     skills: Vec<Described>,
-    expect: String,
-}
-
-#[derive(Deserialize)]
-struct ToolCase {
-    query: String,
-    candidates: Vec<Described>,
     expect: String,
 }
 
@@ -392,12 +384,6 @@ fn decision_eval() {
             })
             .await,
             run(
-                "tool_search",
-                include_str!("eval/tool_search.json"),
-                |case| tool_search_case(decisions, case),
-            )
-            .await,
-            run(
                 "question_tool_nudge",
                 include_str!("eval/question_tool_nudge.json"),
                 |case| question_tool_nudge_case(decisions, case),
@@ -480,7 +466,6 @@ fn service(url: &str, state_dir: StateDir) -> Decisions {
     features.shell_effect = FeatureMode::Advise;
     features.content_screening = FeatureMode::Advise;
     features.shell_duration = FeatureMode::Enforce;
-    features.tool_search = FeatureMode::Enforce;
     features.skill_suggestions = FeatureMode::Advise;
     features.goal_prescreen = FeatureMode::Enforce;
     features.subagent_routing = FeatureMode::Enforce;
@@ -1061,39 +1046,6 @@ async fn skill_case(decisions: &Decisions, case: SkillCase) -> Scored {
         chosen,
         vec![verdict],
         outcome.latency_ms,
-    )
-}
-
-async fn tool_search_case(decisions: &Decisions, case: ToolCase) -> Scored {
-    let definitions: Vec<_> = case
-        .candidates
-        .iter()
-        .map(|tool| json!({"description": tool.description}))
-        .collect();
-    let candidates = case
-        .candidates
-        .iter()
-        .zip(&definitions)
-        .map(|(tool, definition)| (tool.name.as_str(), definition));
-    let started = Instant::now();
-    let ranking = rank_tool_search(
-        &case.query,
-        candidates,
-        Some(decisions),
-        &DecisionContext::default(),
-    )
-    .await;
-    let latency_ms = latency_since(started);
-    let chosen = ranking
-        .ok()
-        .and_then(|ranking| ranking.top())
-        .map(|index| case.candidates[index].name.as_str());
-    let verdict = matched(true, chosen, expected_choice(&case.expect));
-    scored(
-        (&case.query, &case.expect),
-        chosen,
-        vec![verdict],
-        latency_ms,
     )
 }
 

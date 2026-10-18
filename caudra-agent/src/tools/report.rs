@@ -1,12 +1,12 @@
-use caudra_config::{AgentConfig, ProfileToolExposure, ProfileToolPolicy};
+use caudra_config::{AgentConfig, CODE_HOSTED_TOOLS, ProfileToolExposure, ProfileToolPolicy};
 use caudra_providers::Model;
 
 use crate::tools::profile_policy::{
     CEILING_DISABLED, LEGACY_LOADING, PROFILE_DISABLED, registered_decision, source_kind,
 };
 use crate::tools::{
-    BuiltinDeferral, DescriptionContext, RegisteredTool, ToolFilter, VIEW_IMAGE_TOOL_NAME,
-    capability_exclusions, credential_exclusions, deferral,
+    DescriptionContext, RegisteredTool, ToolFilter, VIEW_IMAGE_TOOL_NAME, capability_exclusions,
+    credential_exclusions,
 };
 
 pub const REASON_DISALLOWED_FLAG: &str = "--disallowed-tools";
@@ -16,23 +16,13 @@ pub const REASON_NOT_ALLOWED: &str = "not in --allowed-tools";
 pub const REASON_COMPANION: &str = "always on (internal companion)";
 pub const REASON_NO_SUBSCRIPTION: &str = "no ChatGPT subscription";
 pub const REASON_OTHER_EDITOR: &str = "model uses the other editing tool";
-pub const REASON_DEFERRED: &str = "deferred behind tool_search";
-pub const REASON_EAGER_CLASS: &str = "declared upfront on a known non-small model";
-pub const REASON_EAGER_CONFIG: &str = "lazy loading disabled by config";
-/// `tool_search` has no registry entry. The request array grows one whenever
-/// something is deferred, so every listing derives the row from that rather
-/// than looking it up.
-pub const REASON_CATALOG: &str = "loads the lazy tools on request";
-pub const CATALOG_SOURCE: &str = "native:caudra";
-pub const REASON_PROFILE_LOADED: &str = "profile lazy tool loaded in this session";
+pub const REASON_CODE_MODULE: &str = "reached through a `code` module";
 
-/// What a tool is doing in this run. `Lazy` is enabled and absent from the
-/// request array at once, which neither `On` nor `Off` can express.
+/// What a tool is doing in this run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolState {
     On,
-    Lazy,
     Off,
 }
 
@@ -40,13 +30,12 @@ impl ToolState {
     pub fn label(self) -> &'static str {
         match self {
             Self::On => "on",
-            Self::Lazy => "lazy",
             Self::Off => "off",
         }
     }
 
     pub fn reaches_model(self) -> bool {
-        !matches!(self, Self::Off)
+        self == Self::On
     }
 }
 
@@ -63,13 +52,7 @@ pub fn profile_report(
     ctx: &DescriptionContext,
     session_plan: bool,
 ) -> ToolReport {
-    let decision = registered_decision(
-        entry,
-        ctx,
-        profile,
-        session_plan,
-        legacy.state == ToolState::Lazy,
-    );
+    let decision = registered_decision(entry, ctx, profile, session_plan);
     if !decision.available() {
         return ToolReport {
             state: ToolState::Off,
@@ -94,7 +77,6 @@ pub fn profile_report(
     ToolReport {
         state: match decision.exposure {
             ProfileToolExposure::Eager => ToolState::On,
-            ProfileToolExposure::Lazy => ToolState::Lazy,
             ProfileToolExposure::Disabled => ToolState::Off,
         },
         reason: Some(decision.reason),
@@ -109,16 +91,12 @@ pub fn profile_report(
 /// `cli_disallowed` is separate from `config.disabled_tools` only so the
 /// report can name the flag the user just typed. A caller that has already
 /// merged the two passes an empty slice and reads `disabled by config`.
-///
-/// `deferral` is passed rather than resolved, because this runs once per
-/// registry entry and resolving it parses `providers.toml`.
 pub fn builtin_report(
     name: &str,
     filter: &ToolFilter,
     cli_disallowed: &[String],
     config: &AgentConfig,
     model: &Model,
-    deferral: BuiltinDeferral,
 ) -> ToolReport {
     let named_off = cli_disallowed.iter().any(|tool| tool == name);
     let config_off = config.disabled_tools.iter().any(|tool| tool == name);
@@ -155,29 +133,11 @@ pub fn builtin_report(
             reason: Some(REASON_COMPANION),
         };
     }
-    if deferral::is_deferred(name, &config.allowed_tools, deferral) {
-        return ToolReport {
-            state: ToolState::Lazy,
-            reason: Some(REASON_DEFERRED),
-        };
-    }
     ToolReport {
         state: ToolState::On,
-        reason: eager_reason(name, deferral),
-    }
-}
-
-/// Why a tool that would normally be lazy is in the array anyway. Nothing for
-/// a tool that was never deferrable, and nothing when an allow list asked for
-/// it upfront, which the caller already got what it wanted from.
-fn eager_reason(name: &str, deferral: BuiltinDeferral) -> Option<&'static str> {
-    if !caudra_config::is_deferred_builtin(name) {
-        return None;
-    }
-    match deferral {
-        BuiltinDeferral::Lazy => None,
-        BuiltinDeferral::EagerByClass => Some(REASON_EAGER_CLASS),
-        BuiltinDeferral::EagerByConfig => Some(REASON_EAGER_CONFIG),
+        reason: CODE_HOSTED_TOOLS
+            .contains(&name)
+            .then_some(REASON_CODE_MODULE),
     }
 }
 
@@ -188,21 +148,21 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        AgentConfig, BuiltinDeferral, Model, REASON_CONFIG, REASON_DEFERRED,
-        REASON_DISALLOWED_FLAG, REASON_EAGER_CLASS, REASON_EAGER_CONFIG, REASON_NOT_ALLOWED,
-        REASON_OTHER_EDITOR, ToolReport, ToolState, builtin_report, profile_report,
+        AgentConfig, Model, REASON_CODE_MODULE, REASON_CONFIG, REASON_DISALLOWED_FLAG,
+        REASON_NOT_ALLOWED, REASON_OTHER_EDITOR, ToolReport, ToolState, builtin_report,
+        profile_report,
     };
     use crate::AgentMode;
     use crate::tools::profile_policy::{
         MODE_DISABLED, PLAN_REQUIRED, PLAN_TOOL_NAME, PROFILE_LOADING, REQUIRED_INFRASTRUCTURE,
     };
     use crate::tools::{
-        DescriptionContext, FILE_APPLY_PATCH_TOOL_NAME, FILE_READ_TOOL_NAME, RegisteredTool,
-        SHELL_TOOL_NAME, ToolAudience, ToolEffect, ToolFilter, ToolSource, test_support::NamedMock,
+        DescriptionContext, FILE_APPLY_PATCH_TOOL_NAME, RegisteredTool, SHELL_TOOL_NAME,
+        ToolAudience, ToolEffect, ToolFilter, ToolSource, test_support::NamedMock,
     };
 
     const MODEL_SPEC: &str = "anthropic/claude-opus-4-8";
-    const DEFERRED_TOOL: &str = "execution_environment";
+    const HOSTED_TOOL: &str = "execution_environment";
     const PLAN_PATH: &str = "plan.md";
     const CUSTOM_SOURCE: &str = "custom_plan";
 
@@ -214,31 +174,18 @@ mod tests {
         }
     }
 
-    /// The deferral is handed in rather than resolved from `MODEL_SPEC`, so
-    /// these cases test the ordering of the rules and not the class lookup,
-    /// which owns its own tests and reads `providers.toml`.
-    fn report(
-        name: &str,
-        cli: &[&str],
-        config: &AgentConfig,
-        deferral: BuiltinDeferral,
-    ) -> ToolReport {
+    fn report(name: &str, cli: &[&str], config: &AgentConfig) -> ToolReport {
         let model = Model::from_spec(MODEL_SPEC).unwrap();
         let cli: Vec<String> = cli.iter().map(|tool| (*tool).to_string()).collect();
         let filter = ToolFilter::from_config(config, &model, &[]);
-        builtin_report(name, &filter, &cli, config, &model, deferral)
-    }
-
-    fn lazy_report(name: &str, cli: &[&str], config: &AgentConfig) -> ToolReport {
-        report(name, cli, config, BuiltinDeferral::Lazy)
+        builtin_report(name, &filter, &cli, config, &model)
     }
 
     #[test_case(SHELL_TOOL_NAME, &[], &["shell"], &[], ToolState::Off, Some(REASON_CONFIG) ; "config_disabled")]
     #[test_case(SHELL_TOOL_NAME, &["shell"], &["shell"], &[], ToolState::Off, Some(REASON_DISALLOWED_FLAG) ; "flag_wins_over_config")]
     #[test_case(SHELL_TOOL_NAME, &[], &[], &["file_read"], ToolState::Off, Some(REASON_NOT_ALLOWED) ; "outside_the_allow_list")]
     #[test_case(SHELL_TOOL_NAME, &[], &[], &[], ToolState::On, None ; "ordinary_tool")]
-    #[test_case(DEFERRED_TOOL, &[], &[], &[], ToolState::Lazy, Some(REASON_DEFERRED) ; "deferred_tool")]
-    #[test_case(DEFERRED_TOOL, &[], &[], &[DEFERRED_TOOL], ToolState::On, None ; "allow_listed_deferred_tool_loads_upfront")]
+    #[test_case(HOSTED_TOOL, &[], &[], &[], ToolState::On, Some(REASON_CODE_MODULE) ; "code_hosted_tool")]
     #[test_case(FILE_APPLY_PATCH_TOOL_NAME, &[], &[], &[], ToolState::Off, Some(REASON_OTHER_EDITOR) ; "the_other_editor")]
     fn a_tool_reports_the_rule_that_decided_it(
         name: &str,
@@ -248,36 +195,9 @@ mod tests {
         state: ToolState,
         reason: Option<&'static str>,
     ) {
-        let report = lazy_report(name, cli, &config(disabled, allowed));
+        let report = report(name, cli, &config(disabled, allowed));
         assert_eq!(report.state, state);
         assert_eq!(report.reason, reason);
-    }
-
-    /// A run that defers nothing still has to say why a tool the docs call
-    /// lazy is sitting in the array.
-    #[test_case(BuiltinDeferral::EagerByClass, REASON_EAGER_CLASS ; "the_model_did_not_need_the_help")]
-    #[test_case(BuiltinDeferral::EagerByConfig, REASON_EAGER_CONFIG ; "the_user_turned_it_off")]
-    fn an_eager_run_names_what_declared_the_lazy_tools(
-        deferral: BuiltinDeferral,
-        reason: &'static str,
-    ) {
-        let report = report(DEFERRED_TOOL, &[], &config(&[], &[]), deferral);
-        assert_eq!(report.state, ToolState::On);
-        assert_eq!(report.reason, Some(reason));
-    }
-
-    /// The reason belongs to the tools deferral would have withheld. A tool
-    /// that was never lazy has nothing to explain.
-    #[test]
-    fn an_ordinary_tool_gains_no_reason_from_an_eager_run() {
-        let report = report(
-            SHELL_TOOL_NAME,
-            &[],
-            &config(&[], &[]),
-            BuiltinDeferral::EagerByClass,
-        );
-        assert_eq!(report.state, ToolState::On);
-        assert_eq!(report.reason, None);
     }
 
     /// Asking for a companion to turn off is not an error, but the report has
@@ -293,7 +213,7 @@ mod tests {
             let report = profile_report(
                 &entry,
                 &ProfileToolPolicy::default(),
-                lazy_report(name, &[], &config(&[name], &[])),
+                report(name, &[], &config(&[name], &[])),
                 &DescriptionContext {
                     filter: &ToolFilter::All,
                     audience: ToolAudience::MAIN,
@@ -361,17 +281,6 @@ mod tests {
                 state,
                 reason: Some(reason),
             }
-        );
-    }
-
-    #[test]
-    fn a_lazy_tool_still_reaches_the_model() {
-        assert!(ToolState::Lazy.reaches_model());
-        assert!(!ToolState::Off.reaches_model());
-        assert!(
-            lazy_report(FILE_READ_TOOL_NAME, &[], &config(&[], &[]))
-                .state
-                .reaches_model()
         );
     }
 }

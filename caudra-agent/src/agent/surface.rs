@@ -22,8 +22,6 @@ use crate::prompt::{
     CHANGES_SLOT, CONFIGURATION_CHANGED_MARKER, CONFIGURATION_CHANGED_PROMPT,
     CONFIGURATION_RESTORED_PROMPT,
 };
-use crate::tools::DeferredTool;
-use crate::tools::deferral::summary;
 use crate::tools::native::plan::PlanTarget;
 
 const REMOVED_HEADING: &str = "Declared tools that no longer exist; calls to them fail:";
@@ -50,19 +48,16 @@ pub struct PrefixKey {
 pub struct Surface {
     pub system: String,
     pub tools: Value,
-    pub deferred: Vec<DeferredTool>,
-    /// By the name the model calls each one, whether declared or deferred.
-    /// What a difference is measured on, so a `tool_search` load is never one.
+    /// By the name the model calls each one: what a difference is measured on.
     definitions: BTreeMap<String, Value>,
 }
 
 impl Surface {
-    pub fn new(system: String, tools: Value, deferred: Vec<DeferredTool>) -> Self {
+    pub fn new(system: String, tools: Value) -> Self {
         let definitions = tools
             .as_array()
             .into_iter()
             .flatten()
-            .chain(deferred.iter().map(|tool| &tool.definition))
             .filter_map(|definition| {
                 Some((definition["name"].as_str()?.to_owned(), definition.clone()))
             })
@@ -70,18 +65,8 @@ impl Surface {
         Self {
             system,
             tools,
-            deferred,
             definitions,
         }
-    }
-
-    fn builtin_names(&self) -> impl Iterator<Item = &str> {
-        self.tools
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|tool| tool["name"].as_str())
-            .chain(self.deferred.iter().map(|tool| tool.name.as_ref()))
     }
 }
 
@@ -151,9 +136,10 @@ impl<K: PartialEq> SurfaceBaseline<K> {
                 let changes = changes(&fixed.surface, &live);
                 let retired = fixed
                     .surface
-                    .builtin_names()
+                    .definitions
+                    .keys()
                     .filter(|name| !live.definitions.contains_key(*name))
-                    .map(str::to_owned)
+                    .cloned()
                     .collect();
                 (fixed, changes, retired)
             }
@@ -263,6 +249,26 @@ fn definition_change(name: &str, fixed: &Value, live: &Value) -> String {
     text
 }
 
+/// The first sentence of a description, derived rather than authored so the
+/// listing cannot drift from the tool it names. A description with no full
+/// stop is short enough to use whole.
+fn summary(definition: &Value) -> &str {
+    let description = definition[DESCRIPTION_KEY]
+        .as_str()
+        .unwrap_or_default()
+        .trim_start();
+    let end = description
+        .match_indices('.')
+        .find(|(index, _)| {
+            description[index + 1..]
+                .chars()
+                .next()
+                .is_none_or(char::is_whitespace)
+        })
+        .map_or(description.len(), |(index, _)| index + 1);
+    description[..end].trim_end()
+}
+
 fn diff(before: &str, after: &str, display_path: &str) -> String {
     crate::diff::unified_text(
         before,
@@ -292,7 +298,6 @@ mod tests {
         ADDED_HEADING, CHANGED_HEADING, REMOVED_HEADING, SYSTEM_HEADING, Surface, SurfaceBaseline,
     };
     use crate::prompt::{CONFIGURATION_CHANGED_MARKER, CONFIGURATION_RESTORED_PROMPT};
-    use crate::tools::DeferredTool;
 
     const KEY: &str = "anthropic/model";
     const OTHER_KEY: &str = "openai/model";
@@ -307,7 +312,6 @@ mod tests {
     const DROPPED: &str = "file_write";
     const ADDED: &str = "image_generate";
     const ADDED_SUMMARY: &str = "Generate an image.";
-    const DEFERRED: &str = "workflow";
     const PATH_PARAMETER: &str = "path";
     const TTL: Duration = Duration::from_secs(300);
 
@@ -316,7 +320,7 @@ mod tests {
     }
 
     fn surface(system: &str, tools: &[Value]) -> Surface {
-        Surface::new(system.to_owned(), Value::from(tools.to_vec()), Vec::new())
+        Surface::new(system.to_owned(), Value::from(tools.to_vec()))
     }
 
     fn base() -> Surface {
@@ -390,22 +394,6 @@ mod tests {
         assert!(notice.contains(&format!("{KEPT} is now defined as: ")));
         assert!(notice.contains(PATH_PARAMETER));
         assert!(!notice.contains(&format!("`{KEPT}` description:")));
-    }
-
-    #[test]
-    fn a_deferred_tool_counts_as_defined() {
-        let mut baseline = fixed_baseline();
-        let deferred = DeferredTool::new(DEFERRED, tool(DEFERRED, "Run workflows."));
-        let live = Surface::new(
-            SYSTEM.to_owned(),
-            Value::from(vec![tool(KEPT, KEPT_DESCRIPTION), tool(DROPPED, "Write.")]),
-            vec![deferred],
-        );
-        let notice = baseline
-            .settle(live, false, KEY, EPOCH, &[])
-            .notice
-            .unwrap();
-        assert!(notice.contains(&format!("{ADDED_HEADING}\n- {DEFERRED}")));
     }
 
     #[test]

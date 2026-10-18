@@ -100,8 +100,8 @@ use crate::session_fork::ReachableTasks;
 use crate::template;
 use crate::tools::native::plan::{self, PlanTarget, PlanWriteResult};
 use crate::tools::{
-    BuiltinDeferral, DeferralSession, DeferredTool, DescriptionContext, FileReadTracker,
-    LocalTools, PathLocks, ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
+    DescriptionContext, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolDefinitions,
+    ToolFilter, ToolRegistry,
 };
 use crate::types::{
     AUTOPILOT_EVENT_RUN_ID, AutopilotEvent, BACKGROUND_EVENT_RUN_ID, BatchToolEntry,
@@ -1301,7 +1301,6 @@ struct AgentSetup {
     vars: template::Vars,
     instructions: agent::Instructions,
     tools: Value,
-    deferred: Vec<DeferredTool>,
     tool_filter: ToolFilter,
 }
 
@@ -1353,7 +1352,6 @@ fn setup(
         vars,
         instructions,
         tools: definitions.declared,
-        deferred: definitions.deferred,
         tool_filter,
     }
 }
@@ -1391,9 +1389,8 @@ async fn resolve_main_turn_model(
     }
 }
 
-/// Base definitions only, split into declared and deferred. MCP definitions
-/// are injected per request by `Agent::request_tools`; storing them here would
-/// freeze the catalog.
+/// Base definitions only, split into declared and `code`-hosted. MCP tools reach the model
+/// through `code`, never as definitions of their own.
 fn tool_definitions(
     vars: &template::Vars,
     model: &Model,
@@ -1424,34 +1421,12 @@ fn tool_definitions(
         &vars,
         &ctx,
         model.supports_tool_examples(),
-        &deferral::deferred_names(
-            &config.allowed_tools,
-            BuiltinDeferral::resolve(config, model),
-        ),
         &task
             .profile
             .map(|profile| profile.tools().clone())
             .unwrap_or_default(),
         task.session_plan,
     )
-}
-
-/// Names advertised to SDK clients: what the first request would actually
-/// carry, so a deferred built-in shows up as `tool_search` rather than as
-/// itself.
-fn advertised_tool_names(
-    tools: &Value,
-    deferred: &[DeferredTool],
-    search_bound: bool,
-) -> Vec<String> {
-    let mut probe = tools.clone();
-    let sections: Vec<String> = DeferralSession::new(deferred.to_vec(), std::iter::empty())
-        .request_snapshot()
-        .extend_declared(&mut probe)
-        .into_iter()
-        .collect();
-    crate::tools::deferral::push_unbound_catalog(&mut probe, &sections, search_bound);
-    extract_tool_names(&probe)
 }
 
 pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveStartError> {
@@ -1496,7 +1471,6 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
         vars,
         instructions,
         mut tools,
-        mut deferred,
         tool_filter,
     } = setup(
         &params.model,
@@ -1518,20 +1492,13 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
         params.remote_environment.as_ref(),
     );
 
-    crate::tools::execution::configure_tools(
-        &mut tools,
-        &mut deferred,
-        &params.config,
-        false,
-        false,
-    );
+    crate::tools::execution::configure_declared(&mut tools, &params.config, false, false);
     params.prompt_slots = crate::tools::execution::execution_slots(
         &params.prompt_slots,
         &params.config,
         false,
         false,
         &tools,
-        &deferred,
     );
     let memory = MemoryBaseline::adopt(
         open_memory_store(
@@ -1554,11 +1521,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
             .with_disabled_tools(&params.config.disabled_tools)
             .with_actor_policy(Arc::clone(&profile_tool_policy))
     });
-    let tool_names = advertised_tool_names(
-        &tools,
-        &deferred,
-        registry.has(crate::tools::TOOL_SEARCH_TOOL_NAME),
-    );
+    let tool_names = extract_tool_names(&tools);
     let memory_store = memory.store().cloned();
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
@@ -1706,7 +1669,6 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                     mode_notice: None,
                     event_tx,
                     tools,
-                    deferred,
                     tools_fixed: false,
                     memory_store,
                 },
@@ -3204,7 +3166,6 @@ async fn spawn_prepared_session(
         mut vars,
         instructions,
         mut tools,
-        mut deferred,
         tool_filter,
     } = setup(
         &model,
@@ -3226,9 +3187,8 @@ async fn spawn_prepared_session(
         params.remote_environment.as_ref(),
     );
 
-    crate::tools::execution::configure_tools(
+    crate::tools::execution::configure_declared(
         &mut tools,
-        &mut deferred,
         &params.config,
         background_enabled,
         background_enabled,
@@ -3256,14 +3216,7 @@ async fn spawn_prepared_session(
                     .unwrap_or_default(),
             ))
     });
-    let tool_names = advertised_tool_names(
-        &tools,
-        &deferred,
-        params
-            .local_tools
-            .contains_key(crate::tools::TOOL_SEARCH_TOOL_NAME)
-            || params.registry.has(crate::tools::TOOL_SEARCH_TOOL_NAME),
-    );
+    let tool_names = extract_tool_names(&tools);
 
     let session_ref = params.session_id.clone();
     let session_id = session_ref.id();
@@ -4493,9 +4446,8 @@ async fn spawn_prepared_session(
                     },
                 );
 
-                crate::tools::execution::configure_tools(
+                crate::tools::execution::configure_declared(
                     &mut definitions.declared,
-                    &mut definitions.deferred,
                     &params.config,
                     background.is_some(),
                     background.is_some(),
@@ -4507,7 +4459,6 @@ async fn spawn_prepared_session(
                     background.is_some(),
                     background.is_some(),
                     &definitions.declared,
-                    &definitions.deferred,
                 );
                 let prefix_key = agent::PrefixKey {
                     model: turn_model.spec(),
@@ -4558,7 +4509,7 @@ async fn spawn_prepared_session(
                     system.push_str(append);
                 }
                 let settled = surface.settle(
-                    agent::Surface::new(system, definitions.declared, definitions.deferred),
+                    agent::Surface::new(system, definitions.declared),
                     rebuild,
                     prefix_key,
                     epoch,
@@ -4566,7 +4517,7 @@ async fn spawn_prepared_session(
                 );
                 let definitions = ToolDefinitions {
                     declared: settled.surface.tools.clone(),
-                    deferred: settled.surface.deferred.clone(),
+                    hosted: definitions.hosted,
                 };
                 let system = settled.surface.system.clone();
                 let turn_mcp = mcp.clone();
@@ -4596,7 +4547,6 @@ async fn spawn_prepared_session(
                         mode_notice: None,
                         event_tx,
                         tools: definitions.declared,
-                        deferred: definitions.deferred,
                         tools_fixed: true,
                         memory_store: memory.store().cloned(),
                     },
@@ -5259,6 +5209,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
             )
             .await
     }
@@ -6318,44 +6269,6 @@ mod tests {
     fn extract_tool_names_filters_valid_entries() {
         let tools = serde_json::json!([{"name": "read"}, {"type": "function"}, {"name": "bash"}]);
         assert_eq!(extract_tool_names(&tools), vec!["read", "bash"]);
-    }
-
-    fn deferred_execution_environment() -> Vec<DeferredTool> {
-        vec![DeferredTool::new(
-            "execution_environment",
-            serde_json::json!({"name": "execution_environment", "description": "Inspect the host"}),
-        )]
-    }
-
-    /// Deferred built-ins collapse into the search tool, so a client is told
-    /// what the first request actually carries.
-    #[test]
-    fn advertised_names_show_tool_search_not_deferred_tools() {
-        let base = serde_json::json!([{"name": "read"}]);
-        let names = advertised_tool_names(&base, &deferred_execution_environment(), false);
-
-        assert_eq!(
-            names,
-            vec!["read", crate::tools::TOOL_SEARCH_TOOL_NAME],
-            "clients must see the search tool, not deferred definitions"
-        );
-        assert_eq!(
-            base,
-            serde_json::json!([{"name": "read"}]),
-            "probing must not bake deferred entries into the base tools"
-        );
-    }
-
-    #[test]
-    fn advertised_names_omit_the_search_tool_when_nothing_is_deferred() {
-        let base = serde_json::json!([{"name": "read"}]);
-        assert_eq!(advertised_tool_names(&base, &[], false), vec!["read"]);
-    }
-
-    #[test]
-    fn advertised_names_respect_hidden_local_search_binding() {
-        let base = serde_json::json!([]);
-        assert!(advertised_tool_names(&base, &deferred_execution_environment(), true).is_empty());
     }
 
     const WORKFLOW_NAME: &str = "echo";

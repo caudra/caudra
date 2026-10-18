@@ -1,5 +1,5 @@
 //! MCP as a host module: every server a namespace whose async methods are its tools, beside the
-//! helpers that find tools and read resources.
+//! `mcp` namespace whose helpers find tools and read resources.
 //!
 //! A tool call is planned the way a direct MCP call was checked: its binding, the agent's
 //! `disabled_tools`, and the permission intent its recognised server shapes. Whether it is
@@ -13,14 +13,16 @@ use serde_json::{Map, Value, json};
 
 use super::catalog::unavailable;
 use super::naming::{CLASS_PREFIX, Names};
-use super::search::{DEFAULT_LIMIT, search};
+use super::search::{DEFAULT_LIMIT, MAX_LIMIT, search};
 use super::signature::stubs;
 use super::view::ServerView;
 use crate::code::args::{bind, count, required_text, text};
 use crate::code::gateway::Permission;
-use crate::code::module::{CallFailure, CallRun, HostCallPlan, HostModule, Prepared};
+use crate::code::module::{
+    CallFailure, CallRun, HostCallPlan, HostModule, MemberDoc, ModuleDoc, Prepared,
+};
 use crate::code::names::{
-    MCP_HELPERS, READ_RESOURCE_HELPER, RESOURCES_HELPER, SEARCH_HELPER, SERVERS_HELPER,
+    MCP_MODULE, READ_RESOURCE_HELPER, RESOURCES_HELPER, SEARCH_HELPER, SERVERS_HELPER,
 };
 use crate::code::output::CodeCall;
 use crate::code::runner::{
@@ -37,6 +39,42 @@ use crate::permissions::{
 use crate::tools::registry::{PermissionIntent, PermissionScopes, TrustedToolSource};
 use crate::tools::{CODE_TOOL_NAME, ToolContext};
 
+pub static DOC: ModuleDoc = ModuleDoc {
+    namespace: MCP_MODULE,
+    summary: "`mcp`: each server the `# MCP servers` reminder lists is a namespace of its own (`await github.list_issues(owner=\"o\")`); `mcp.search(\"query\")` finds the tools it leaves out, `mcp.servers()`, `mcp.resources`, `mcp.read_resource`.",
+    page: "mcp: the MCP servers this session connects. Each server is a namespace whose tools are async methods: `issues = await github.list_issues(owner=\"o\", repo=\"r\")`, or pass the arguments as one dict. Run independent calls together with `await asyncio.gather(...)`.\n\
+A tool returns its structured content, else its text, parsed when it is JSON. Images and other media come back as a dict naming their type and size. A tool that reports an error raises `RuntimeError` with its text.\n\
+`help(\"github\")` lists a server's tools with their signatures, and `help(\"github.list_issues\")` shows one.",
+    members: &[
+        MemberDoc {
+            name: SEARCH_HELPER,
+            signature: "search(query: str, server: str | None = None, limit: int = 10, offset: int = 0) -> list[dict[str, Any]]",
+            awaited: false,
+            page: "Finds tools across the connected servers by name and description, best first, as `[{\"name\", \"signature\", \"doc\"}]` with the exact signature to call. Answers at once, so never `await` it.",
+        },
+        MemberDoc {
+            name: SERVERS_HELPER,
+            signature: "servers() -> list[dict[str, Any]]",
+            awaited: false,
+            page: "Lists every configured server as `{\"name\", \"server\", \"title\", \"status\", \"tools\", \"resources\"}`, where `name` is its namespace and `status` says whether it is connected. Answers at once, so never `await` it.",
+        },
+        MemberDoc {
+            name: RESOURCES_HELPER,
+            signature: "resources(server: str) -> list[dict[str, Any]]",
+            awaited: true,
+            page: "Lists what a server offers to be read, resources and templates, by namespace or configured name.",
+        },
+        MemberDoc {
+            name: READ_RESOURCE_HELPER,
+            signature: "read_resource(server: str, uri: str) -> Any",
+            awaited: true,
+            page: "Reads one resource. It asks first, scoped to the server and URI, and is allowed while planning.",
+        },
+    ],
+};
+const SEARCH_CALL: &str = "mcp.search";
+const RESOURCES_CALL: &str = "mcp.resources";
+const READ_RESOURCE_CALL: &str = "mcp.read_resource";
 const PROPERTIES: &str = "properties";
 const REQUIRED: &str = "required";
 const ADDITIONAL_PROPERTIES: &str = "additionalProperties";
@@ -100,11 +138,11 @@ impl McpModule {
     }
 
     fn search(&self, call: &ScriptCall) -> ScriptReply {
-        let arguments = bind(SEARCH_HELPER, SEARCH_PARAMS, call)?;
-        let query = text(&arguments, SEARCH_HELPER, QUERY_PARAM)?.unwrap_or_default();
-        let server = text(&arguments, SEARCH_HELPER, SERVER_PARAM)?;
-        let limit = count(&arguments, SEARCH_HELPER, LIMIT_PARAM)?.unwrap_or(DEFAULT_LIMIT);
-        let offset = count(&arguments, SEARCH_HELPER, OFFSET_PARAM)?.unwrap_or_default();
+        let arguments = bind(SEARCH_CALL, SEARCH_PARAMS, call)?;
+        let query = text(&arguments, SEARCH_CALL, QUERY_PARAM)?.unwrap_or_default();
+        let server = text(&arguments, SEARCH_CALL, SERVER_PARAM)?;
+        let limit = count(&arguments, SEARCH_CALL, LIMIT_PARAM)?.unwrap_or(DEFAULT_LIMIT);
+        let offset = count(&arguments, SEARCH_CALL, OFFSET_PARAM)?.unwrap_or_default();
         let hits = search(
             &self.servers,
             &self.names,
@@ -126,6 +164,38 @@ impl McpModule {
             .collect())
     }
 
+    /// A server's tools, or one of them, as `help()` shows them: each signature with its doc.
+    fn server_help(&self, namespace: &str, method: Option<&str>) -> Option<String> {
+        let server = self.names.server(namespace)?;
+        let view = self.view(server)?;
+        if let Some(reason) = unavailable(&view.state) {
+            return Some(format!(
+                "MCP server `{namespace}` is not connected ({reason})"
+            ));
+        }
+        let hits = search(
+            &self.servers,
+            &self.names,
+            method.unwrap_or_default(),
+            Some(namespace),
+            MAX_LIMIT,
+            0,
+        )
+        .ok()?;
+        let lines: Vec<String> = hits
+            .into_iter()
+            .filter(|hit| method.is_none_or(|method| hit.method == method))
+            .map(|hit| format!("await {}.{}\n    {}", hit.namespace, hit.signature, hit.doc))
+            .collect();
+        match (method, lines.is_empty()) {
+            (Some(method), true) => Some(no_tool_message(&self.names, namespace, method)),
+            _ => Some(format!(
+                "MCP server `{namespace}` ({server}):\n{}",
+                lines.join("\n")
+            )),
+        }
+    }
+
     fn server_list(&self) -> Value {
         self.names
             .namespaces()
@@ -144,8 +214,8 @@ impl McpModule {
     }
 
     fn resources(&self, call: &ScriptCall) -> ScriptReply {
-        let arguments = bind(RESOURCES_HELPER, RESOURCES_PARAMS, call)?;
-        let requested = required_text(&arguments, RESOURCES_HELPER, SERVER_PARAM)?;
+        let arguments = bind(RESOURCES_CALL, RESOURCES_PARAMS, call)?;
+        let requested = required_text(&arguments, RESOURCES_CALL, SERVER_PARAM)?;
         let server = self.server_named(&requested)?;
         let snapshot = self.session.reader().load_full();
         Ok(snapshot
@@ -162,16 +232,16 @@ impl McpModule {
         ctx: &ToolContext,
         call: &ScriptCall,
     ) -> Result<HostCallPlan, ScriptError> {
-        let arguments = bind(READ_RESOURCE_HELPER, READ_RESOURCE_PARAMS, call)?;
-        let requested = required_text(&arguments, READ_RESOURCE_HELPER, SERVER_PARAM)?;
-        let uri = required_text(&arguments, READ_RESOURCE_HELPER, URI_PARAM)?;
+        let arguments = bind(READ_RESOURCE_CALL, READ_RESOURCE_PARAMS, call)?;
+        let requested = required_text(&arguments, READ_RESOURCE_CALL, SERVER_PARAM)?;
+        let uri = required_text(&arguments, READ_RESOURCE_CALL, URI_PARAM)?;
         let server = self.server_named(&requested)?;
         let input = json!({ URI_PARAM: uri });
         let row = CodeCall {
             server: server.clone(),
             tool: READ_RESOURCE_HELPER.to_owned(),
             called_as: format!(
-                "{READ_RESOURCE_HELPER}({}, {})",
+                "{READ_RESOURCE_CALL}({}, {})",
                 Value::from(requested),
                 Value::from(uri.as_str())
             ),
@@ -210,6 +280,7 @@ impl McpModule {
                         let value = contents_value(&contents);
                         let output = McpOutput {
                             blocks: contents.into_iter().map(read_block).collect(),
+                            kind: session.server_kind(&server),
                             interactions: scope.take_interactions(),
                             ..McpOutput::default()
                         };
@@ -311,12 +382,34 @@ impl McpModule {
 }
 
 impl HostModule for McpModule {
-    fn global(&self, name: &str) -> Option<ScriptName> {
-        if self.names.server(name).is_some() {
-            return Some(ScriptName::Namespace);
+    fn doc(&self) -> &'static ModuleDoc {
+        &DOC
+    }
+
+    fn dynamic_help(&self, topic: &str) -> Option<String> {
+        match topic.split_once('.') {
+            Some((namespace, method)) => self.server_help(namespace, Some(method)),
+            None => self.server_help(topic, None),
         }
-        if MCP_HELPERS.contains(&name) {
-            return Some(ScriptName::Function);
+    }
+
+    fn index_lines(&self) -> Vec<String> {
+        self.names
+            .namespaces()
+            .filter_map(|(namespace, server)| {
+                let view = self.view(server)?;
+                let state = unavailable(&view.state).unwrap_or_else(|| CONNECTED.to_owned());
+                Some(format!(
+                    "{namespace}: MCP server, {} tools ({state})",
+                    view.tools.len()
+                ))
+            })
+            .collect()
+    }
+
+    fn global(&self, name: &str) -> Option<ScriptName> {
+        if name == MCP_MODULE || self.names.server(name).is_some() {
+            return Some(ScriptName::Namespace);
         }
         self.names.suggest_namespace(name).map(|namespace| {
             ScriptName::Undefined(Some(format!(
@@ -326,6 +419,12 @@ impl HostModule for McpModule {
     }
 
     fn member(&self, namespace: &str, name: &str) -> ScriptName {
+        if namespace == MCP_MODULE {
+            return match DOC.member(name) {
+                Some(_) => ScriptName::Function,
+                None => ScriptName::Undefined(Some(DOC.no_member(name))),
+            };
+        }
         let names = &self.names;
         let reachable = names
             .server(namespace)
@@ -339,12 +438,21 @@ impl HostModule for McpModule {
     }
 
     fn stubs(&self) -> String {
-        stubs(&self.names, &self.servers)
+        stubs(&self.names, &self.servers) + DOC.stubs().as_str()
     }
 
     fn prepare(&self, ctx: &ToolContext, call: ScriptCall) -> Prepared {
-        if let Some(namespace) = call.namespace.clone() {
-            return Prepared::Plan(self.call_tool(&namespace, call).map(Box::new));
+        match call.namespace.as_deref() {
+            Some(MCP_MODULE) => {}
+            Some(namespace) => {
+                let namespace = namespace.to_owned();
+                return Prepared::Plan(self.call_tool(&namespace, call).map(Box::new));
+            }
+            None => {
+                return Prepared::Answer(ScriptInvocation::Ready(Err(undefined_namespace(
+                    &call.name,
+                ))));
+            }
         }
         let answer = match call.name.as_str() {
             SEARCH_HELPER => ScriptInvocation::Ready(self.search(&call)),
@@ -356,8 +464,8 @@ impl HostModule for McpModule {
                 return Prepared::Plan(self.read_resource(ctx, &call).map(Box::new));
             }
             name => ScriptInvocation::Ready(Err(ScriptError::new(
-                ScriptErrorKind::Name,
-                format!("name '{name}' is not defined"),
+                ScriptErrorKind::Attribute,
+                DOC.no_member(name),
             ))),
         };
         Prepared::Answer(answer)
@@ -392,7 +500,7 @@ fn no_tool_message(names: &Names, namespace: &str, method: &str) -> String {
         .map(|tool| format!(" Did you mean `{tool}`?"))
         .unwrap_or_default();
     format!(
-        "MCP server `{namespace}` has no tool `{method}`.{suggestion} Find tools with `search(\"...\", server=\"{namespace}\")`."
+        "MCP server `{namespace}` has no tool `{method}`.{suggestion} Find tools with `mcp.search(\"...\", server=\"{namespace}\")`."
     )
 }
 

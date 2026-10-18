@@ -310,11 +310,7 @@ pub(crate) mod tests {
             } else {
                 register(&ctx.registry, FeatureFlags::all()).unwrap();
             }
-            for default in [
-                ProfileToolDefault::Eager,
-                ProfileToolDefault::Lazy,
-                ProfileToolDefault::Disabled,
-            ] {
+            for default in [ProfileToolDefault::Eager, ProfileToolDefault::Disabled] {
                 let definitions = ctx.registry.definitions_split_with_policy(
                     &Vars::new(),
                     &DescriptionContext {
@@ -323,7 +319,6 @@ pub(crate) mod tests {
                         workflows_available: true,
                     },
                     false,
-                    &[],
                     &ProfileToolPolicy {
                         default,
                         ..ProfileToolPolicy::default()

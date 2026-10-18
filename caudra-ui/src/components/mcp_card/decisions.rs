@@ -2,7 +2,7 @@
 //! with a bar per option, or the candidates the rerank kept, best first, each under the label it
 //! was given. Anything that does not read as such an answer is left to the generic card.
 
-use caudra_agent::{McpBlock, McpHelper, McpOutput};
+use caudra_agent::{DecisionHelper, McpBlock, McpHelper, McpOutput};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
@@ -47,7 +47,7 @@ struct Ranked {
 }
 
 pub(super) fn render(
-    helper: McpHelper,
+    helper: DecisionHelper,
     arguments: Option<&Value>,
     output: &McpOutput,
     width: u16,
@@ -56,8 +56,8 @@ pub(super) fn render(
     let width = usize::from(width);
     let theme = theme::current();
     let lines = match helper {
-        McpHelper::Decide => decide_rows(arguments, &answer, width, &theme)?,
-        McpHelper::Rerank => rerank_rows(arguments, &answer, width, &theme)?,
+        DecisionHelper::Decide => decide_rows(arguments, &answer, width, &theme)?,
+        DecisionHelper::Rerank => rerank_rows(arguments, &answer, width, &theme)?,
     };
     let mut rows = Rows::default();
     rows.push(lines);
@@ -67,14 +67,14 @@ pub(super) fn render(
 /// What a settled row's line says in place of its arguments: each verdict, or how many the rerank
 /// kept and the best of them.
 pub(crate) fn summary(
-    helper: McpHelper,
+    helper: DecisionHelper,
     arguments: Option<&Value>,
     output: &McpOutput,
 ) -> Option<String> {
     let answer = answer(output)?;
     match helper {
-        McpHelper::Decide => Some(decision_view::summary(&from_script(arguments, &answer)?)),
-        McpHelper::Rerank => {
+        DecisionHelper::Decide => Some(decision_view::summary(&from_script(arguments, &answer)?)),
+        DecisionHelper::Rerank => {
             let ranked = ranked(&answer)?;
             let total = candidates(arguments).map_or(ranked.len(), <[Value]>::len);
             let kept = format!("{KEPT_PREFIX}{}{KEPT_OF}{total}", ranked.len());
@@ -96,7 +96,9 @@ pub(crate) fn summary(
 /// The answer the snippet received, which is what a selection over the card copies: the bars stand
 /// for it rather than spell any of it.
 pub(crate) fn copied(output: &McpOutput) -> Option<String> {
-    output.helper?;
+    let Some(McpHelper::Decision(_)) = output.helper else {
+        return None;
+    };
     serde_json::to_string_pretty(&answer(output)?).ok()
 }
 
@@ -268,12 +270,12 @@ mod tests {
 
     const QUERY: &str = "tools that add numbers";
 
-    fn output(helper: McpHelper, answer: &Value) -> McpOutput {
+    fn output(helper: DecisionHelper, answer: &Value) -> McpOutput {
         McpOutput {
             blocks: vec![McpBlock::Text {
                 text: serde_json::to_string_pretty(answer).unwrap(),
             }],
-            helper: Some(helper),
+            helper: Some(McpHelper::Decision(helper)),
             ..McpOutput::default()
         }
     }
@@ -297,9 +299,9 @@ mod tests {
     fn a_rerank_lists_what_it_kept_best_first_by_label() {
         let (arguments, answer) = rerank();
         let rows = render(
-            McpHelper::Rerank,
+            DecisionHelper::Rerank,
             Some(&arguments),
-            &output(McpHelper::Rerank, &answer),
+            &output(DecisionHelper::Rerank, &answer),
             80,
         )
         .unwrap();
@@ -320,9 +322,9 @@ mod tests {
         let (arguments, answer) = rerank();
         assert_eq!(
             summary(
-                McpHelper::Rerank,
+                DecisionHelper::Rerank,
                 Some(&arguments),
-                &output(McpHelper::Rerank, &answer)
+                &output(DecisionHelper::Rerank, &answer)
             )
             .as_deref(),
             Some("Kept 2 of 3 \u{b7} get_sum 62.0%")
@@ -337,9 +339,9 @@ mod tests {
         });
         let answer = json!({"model": "m1", "answers": [{"type": "predicate", "name": "parser_bug", "probability": 0.9}]});
         let rows = render(
-            McpHelper::Decide,
+            DecisionHelper::Decide,
             Some(&arguments),
-            &output(McpHelper::Decide, &answer),
+            &output(DecisionHelper::Decide, &answer),
             80,
         )
         .unwrap();
@@ -349,10 +351,10 @@ mod tests {
         assert_eq!(drawn.last().unwrap(), &format!("{MODEL_LABEL}m1"));
     }
 
-    #[test_case(McpHelper::Rerank, json!([{"index": 9, "score": 0.5}]) ; "index_past_the_candidates")]
-    #[test_case(McpHelper::Rerank, json!({"answers": []}) ; "not_a_list")]
-    #[test_case(McpHelper::Decide, json!([{"index": 0, "score": 0.5}]) ; "a_rerank_as_decide")]
-    fn an_answer_it_cannot_read_is_left_to_the_generic_card(helper: McpHelper, answer: Value) {
+    #[test_case(DecisionHelper::Rerank, json!([{"index": 9, "score": 0.5}]) ; "index_past_the_candidates")]
+    #[test_case(DecisionHelper::Rerank, json!({"answers": []}) ; "not_a_list")]
+    #[test_case(DecisionHelper::Decide, json!([{"index": 0, "score": 0.5}]) ; "a_rerank_as_decide")]
+    fn an_answer_it_cannot_read_is_left_to_the_generic_card(helper: DecisionHelper, answer: Value) {
         let (arguments, _) = rerank();
         assert!(render(helper, Some(&arguments), &output(helper, &answer), 80).is_none());
     }

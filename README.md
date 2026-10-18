@@ -358,14 +358,14 @@ Each one links to its documentation. Experimental items are marked and stay off 
 - [File outlines with `file_index`](https://caudra.ai/docs/tools/#file_index)
 - [Source code graph for 37 languages and formats](https://caudra.ai/docs/tools/#code-intelligence)
 - [Shell with output filtering](https://caudra.ai/docs/tools/#shell)
-- [Python for computation, history search, and MCP](https://caudra.ai/docs/code/)
-- [`decide()` and `rerank()` inside snippets](https://caudra.ai/docs/code/#decisions-and-reranking)
+- [Python for computation, history search, MCP, and modules loaded on demand](https://caudra.ai/docs/code/)
+- [`decisions.decide()` and `decisions.rerank()` inside snippets](https://caudra.ai/docs/code/#decisions-and-reranking)
 - [Parallel calls with `batch`](https://caudra.ai/docs/tools/#batch)
 - [Retained output search](https://caudra.ai/docs/tools/#tool_output)
 - [Web search and fetch, with PDFs as text or as the file](https://caudra.ai/docs/tools/#web)
-- [Image generation with a ChatGPT login](https://caudra.ai/docs/tools/#image_generate)
+- [Image generation with a ChatGPT login](https://caudra.ai/docs/code/#image-generation)
 - [Tool-call JSON repair](https://caudra.ai/docs/token-economy/#fewer-round-trips)
-- [Tools loaded on demand](https://caudra.ai/docs/tools/#tools-loaded-on-demand)
+- [Polling and waiting inside snippets](https://caudra.ai/docs/code/#the-python-subset)
 
 </details>
 <details>

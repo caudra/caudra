@@ -38,6 +38,7 @@ pub const PLAN_FILE: &str = "/tmp/caudra-mcp-it-plan.md";
 pub const PLAN_REFUSAL: &str = "plan mode allows only calls that change nothing, such as the MCP tools a recognised server marks read-only";
 
 const WORKER_ENV: &str = "WORKCELL_MCP_CODE_WORKER";
+const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 const HOME_ASSISTANT_URL_ENV: &str = "CAUDRA_IT_HOME_ASSISTANT_URL";
 const HOME_ASSISTANT_TOKEN_ENV: &str = "CAUDRA_IT_HOME_ASSISTANT_TOKEN";
 const HOME_ASSISTANT_MCP_PATH: &str = "/api/mcp";
@@ -159,7 +160,7 @@ impl Servers {
     }
 
     pub fn reset_and_run(&self, code: &str) -> CodeOutput {
-        smol::block_on(gateway::run(&self.ctx, code.to_owned(), true))
+        smol::block_on(gateway::run(&self.ctx, code.to_owned(), true, RUN_TIMEOUT))
     }
 
     /// Runs `code`, giving each permission prompt the next of `answers`, and returns what it
@@ -171,7 +172,7 @@ impl Servers {
     ) -> (CodeOutput, Vec<PermissionRequest>) {
         let mut answers = answers.iter().cloned();
         let mut asked = Vec::new();
-        let run = gateway::run(&self.ctx, code.to_owned(), false);
+        let run = gateway::run(&self.ctx, code.to_owned(), false, RUN_TIMEOUT);
         let answering = async {
             loop {
                 let envelope = self.events.recv_async().await.expect("events stay open");

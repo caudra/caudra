@@ -5,7 +5,6 @@
 //! quotes, camelCase keys, extra wrappers). Plan mode rejects writes to
 //! anything but the plan file before they reach the tool.
 
-pub mod deferral;
 pub mod execution;
 mod file_tracker;
 pub mod grep;
@@ -21,12 +20,8 @@ pub mod schema;
 
 pub use crate::agent::tool_dispatch::ResponseObservations;
 pub use caudra_config::{
-    DEFERRED_BUILTIN_TOOLS, INTERNAL_COMPANION_TOOL_NAMES, all_builtin_tool_names, is_builtin_tool,
-    is_deferred_builtin, is_tool_enabled,
-};
-pub use deferral::{
-    BuiltinDeferral, DeferralSession, DeferralSnapshot, DeferredTool, SearchOutcome,
-    TOOL_SEARCH_TOOL_NAME,
+    CODE_TOOL_NAME, INTERNAL_COMPANION_TOOL_NAMES, all_builtin_tool_names, is_builtin_tool,
+    is_tool_enabled,
 };
 pub use file_tracker::{FileReadTracker, STALE_READ_MSG, stale_read_message};
 pub use path_locks::{LockKey, PathGuards, PathLocks};
@@ -54,6 +49,7 @@ use crate::agent::change_recording::ChangeRecorder;
 use crate::background::{JobScope, ShellLive};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::code::CodeSession;
+use crate::code::hosted::HostedCall;
 use crate::context::ContextPublisher;
 use crate::decisions::{NoteAnchor, NoteDraft, NoteSink};
 use crate::mcp::McpSession;
@@ -340,7 +336,6 @@ fn exclusions_without(openai_subscription: bool) -> &'static [&'static str] {
 
 pub const AUTOMATION_TOOL_NAME: &str = "automation";
 pub const BATCH_TOOL_NAME: &str = "batch";
-pub const CODE_TOOL_NAME: &str = "code";
 /// No longer registered: `code` runs plain computation. Kept so a restored session's earlier
 /// calls still draw as scripts.
 pub const PYTHON_EXECUTION_TOOL_NAME: &str = "python_execution";
@@ -555,10 +550,8 @@ pub struct ToolContext {
     pub mcp: Option<McpSession>,
     /// The variables this agent's `code` runs keep.
     pub code: CodeSession,
-    /// Built-ins withheld from this request until `tool_search` loads them.
-    /// Shared with the agent, so a load inside a batch child reaches the
-    /// array the parent builds next turn.
-    pub deferral: Option<DeferralSession>,
+    /// The `code` module call this tool call serves, `None` for a call the model made itself.
+    pub hosted: Option<HostedCall>,
     pub deadline: Deadline,
     pub config: AgentConfig,
     pub tool_output_lines: ToolOutputLines,
@@ -889,7 +882,7 @@ pub fn interpreter_ctx(
         cancel,
         mcp: None,
         code: CodeSession::default(),
-        deferral: None,
+        hosted: None,
         deadline: Deadline::None,
         config: AgentConfig::default(),
         tool_output_lines: ToolOutputLines::default(),

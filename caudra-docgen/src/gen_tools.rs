@@ -1,9 +1,11 @@
+use caudra_agent::code::hosted::module_call;
 use caudra_agent::template::Vars;
 use caudra_agent::tools::profile_policy::PLAN_REQUIRED;
+use caudra_agent::tools::report::REASON_CODE_MODULE;
 use caudra_agent::tools::{
     DescriptionContext, ToolAudience, ToolFilter, ToolRegistry, ToolSource, feature_exclusions,
 };
-use caudra_config::{Feature, FeatureFlags, PluginsConfig, ProfileToolPolicy};
+use caudra_config::{CODE_HOSTED_TOOLS, Feature, FeatureFlags, PluginsConfig, ProfileToolPolicy};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -105,7 +107,7 @@ fn write_disabling_section(out: &mut String) {
          a tool available but gate every call, use a `deny` or `prompt` default in \
          [Permissions](/docs/permissions/) instead.\n\n\
          [System prompt profiles](/docs/system-prompts/#choose-tool-availability) can make \
-         eligible tools eager, lazy, or disabled for one actor. Pass \
+         eligible tools eager or disabled for one actor. Pass \
          `--system-prompt-profile NAME` to `caudra tools` or `caudra prompt --tools` to inspect \
          that profile. A profile cannot re-enable tools excluded by config, CLI flags, \
          experimental feature gates, mode, or runtime requirements."
@@ -123,46 +125,26 @@ fn code_list(names: &[&str]) -> String {
     }
 }
 
-/// Derived from `DEFERRED_BUILTIN_TOOLS` so the page cannot drift from the set
-/// the agent actually withholds.
-fn write_on_demand_section(out: &mut String) {
-    let deferred = caudra_config::DEFERRED_BUILTIN_TOOLS;
-    let total = deferred.len();
-
+/// Derived from `CODE_HOSTED_TOOLS` so the page cannot drift from the set the
+/// model reaches only through `code`.
+fn write_code_hosted_section(out: &mut String) {
     writeln!(
         out,
-        "\n## Tools loaded on demand\n\n\
-         The default loading policy lets {total} built-in tools start outside the request array. The model sees a \
-         `tool_search` entry instead, and one call with a query loads the best-matching tool for the \
-         rest of the session. Sessions that never need them never pay for their descriptions. \
-         An explicit profile policy can make other native, local or remote Workcell, Lua/plugin, \
-         or local callback tools lazy too. A lazy MCP tool stays out of the \
-         [server list](/docs/mcp/#code-mode) and is found with `search()` inside `code`. \
-         A known-name direct call to an eligible lazy tool is valid and loads its schema. \
-         `tool_search` disappears when no eligible pending tools remain."
+        "\n## Reached from `code`\n\n\
+         Every tool the model can call is declared in the request upfront. These built-ins are \
+         not: a [`code`](/docs/code/#tools-reached-from-code) snippet calls them through a \
+         module, and a direct call is refused \
+         with the module call to make instead. They keep their permission keys, rules, and cards, \
+         so `agent.disabled_tools` and [Permissions](/docs/permissions/) treat them as before. \
+         Turn a module off with its tool's group, and [`caudra tools`](/docs/cli/) lists each one \
+         as `on` with the reason ``{REASON_CODE_MODULE}``.\n\n\
+         | Tool | Module call |\n|------|-------------|"
     )
     .unwrap();
-    writeln!(out, "\n{} each load on their own.", code_list(deferred)).unwrap();
-    writeln!(
-        out,
-        "\nLoading changes the tool array, so the provider's prompt cache prefix resets and the \
-         next request re-reads the history as fresh input. Caudra posts a notice naming what \
-         loaded when it happens.\n\n\
-         ### Which models defer\n\n\
-         That cache reset is why deferral depends on model supply. Caudra defers for every model \
-         recorded as small, whether marked **Small** or **Fast**, and for a model with no supply \
-         facts. A known non-small model takes the eligible tools upfront because it would spend a large \
-         prefix loading a tool it was likely to need.\n\n\
-         Declare `fast` and `best` under `purposes` in `providers.toml` to describe model supply \
-         ([Providers](/docs/providers/#supply-metadata)), or set `agent.defer_builtin_tools` to \
-         `always` or `never` to decide for every model \
-         ([Configuration](/docs/configuration/#agent)).\n\n\
-         Listing a tool in `--allowed-tools` asks for it upfront and skips the search unless \
-         the selected profile explicitly makes it lazy. \
-         [`caudra tools`](/docs/cli/) marks a deferred tool `lazy` and reports whether the \
-         choice came from the selected profile or the default loading policy."
-    )
-    .unwrap();
+    for tool in CODE_HOSTED_TOOLS {
+        let call = module_call(tool).expect("every hosted tool names its module call");
+        writeln!(out, "| `{tool}` | `{call}` |").unwrap();
+    }
 }
 
 struct Param {
@@ -284,8 +266,8 @@ fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &Hash
     if experiment.is_some() {
         badges.push_str(" <span class=\"badge\">experimental</span>");
     }
-    if caudra_config::is_deferred_builtin(name) {
-        badges.push_str(" <span class=\"badge\">on demand</span>");
+    if CODE_HOSTED_TOOLS.contains(&name) {
+        badges.push_str(" <span class=\"badge\">via code</span>");
     }
     writeln!(out, "### `{name}`{badges} {{#{name}}}").unwrap();
     writeln!(out).unwrap();
@@ -443,7 +425,6 @@ pub fn generate() -> String {
             workflows_available: false,
         },
         false,
-        &[],
         &ProfileToolPolicy::default(),
         WITH_SESSION_PLAN,
     );
@@ -497,7 +478,7 @@ pub fn generate() -> String {
     writeln!(out, "\nSecure plan storage currently requires a Unix client. Windows and other non-Unix clients return `UnsupportedPlatform` for secure plan storage operations. This applies to local plans and client-owned plans for remote workspaces, regardless of the Workcell server's platform.").unwrap();
     writeln!(out, "\nThe `memory` tool reads, writes, and deletes named notes in local and remote workspaces. Its `view`, `zoom`, and `search` commands find the notes worth reading, as [Memory](/docs/memory/#zoom-and-search) describes. Writes replace the complete note. Remote notes stay on the client and cannot be edited through remote file tools. Workbench saves retain revision-conflict checks.").unwrap();
     write_disabling_section(&mut out);
-    write_on_demand_section(&mut out);
+    write_code_hosted_section(&mut out);
 
     let mut rendered: HashSet<&str> = HashSet::new();
 
@@ -550,8 +531,8 @@ static DATE_RE: std::sync::LazyLock<Regex> =
 #[cfg(test)]
 mod tests {
     use super::{
-        DATE_PLACEHOLDER, DATE_RE, PLAN_REQUIRED, SECTIONS, extract_default, extract_params,
-        generate, load_registry_with_builtins, redact_path,
+        CODE_HOSTED_TOOLS, DATE_PLACEHOLDER, DATE_RE, PLAN_REQUIRED, SECTIONS, extract_default,
+        extract_params, generate, load_registry_with_builtins, module_call, redact_path,
     };
     use serde_json::{Value, json};
     use std::collections::HashSet;
@@ -617,7 +598,6 @@ mod tests {
             "Windows and other non-Unix clients return `UnsupportedPlatform`",
             "The `memory` tool reads, writes, and deletes named notes",
             "Workbench saves retain revision-conflict checks",
-            "A known-name direct call to an eligible lazy tool is valid",
         ];
         let page = generate();
         assert!(
@@ -632,6 +612,15 @@ mod tests {
         }
         assert!(!page.contains("local_document_"));
         assert!(!page.contains("## Local Documents"));
+    }
+
+    #[test]
+    fn every_code_hosted_tool_names_its_module_call() {
+        let page = generate();
+        for tool in CODE_HOSTED_TOOLS {
+            let row = format!("| `{tool}` | `{}` |", module_call(tool).unwrap());
+            assert!(page.contains(&row), "missing {row}");
+        }
     }
 
     #[test_case("2026-07-05", "YYYY-MM-DD"; "simple date")]

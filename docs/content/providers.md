@@ -47,7 +47,7 @@ Provider catalogs record whether a model is small and whether it is the preferre
 
 A known non-small alternative and a model with no supply facts both have no marker. Markers describe provider supply. They are not capability tiers, and price or list order never creates one. Fast may still use price or parameter count as its final provider fallback without adding a marker.
 
-Aggregators such as OpenRouter borrow supply facts from the upstream vendor entry in a vendor-prefixed model id. Tool deferral also uses the small fact: small and unknown models defer on-demand tools, while known non-small models receive them upfront. See [Tools loaded on demand](/docs/tools/#which-models-defer).
+Aggregators such as OpenRouter borrow supply facts from the upstream vendor entry in a vendor-prefixed model id.
 
 Provider `purposes` entries in `providers.toml` define the same supply facts. `fast` entries are small and `best` entries are non-small. The first entry in each list is preferred, so it receives the Fast or Best marker. Later `fast` entries receive Small, while later `best` entries remain unmarked. Entries match by prefix, so an endpoint serving a family of fine-tunes needs one line rather than one per variant:
 

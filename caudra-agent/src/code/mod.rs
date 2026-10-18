@@ -9,15 +9,30 @@ pub mod args;
 pub mod decide;
 pub mod gateway;
 pub mod history;
+pub mod hosted;
 pub mod module;
 pub mod names;
 pub mod output;
 pub mod runner;
+pub mod tool_module;
 
 use caudra_providers::{ContentBlock, Message};
 
+use self::module::ModuleDoc;
 use self::runner::{ReplSlot, SharedRepl};
 use crate::tools::CODE_TOOL_NAME;
+
+/// Every host module, in the order the `code` tool's description and `help()` list them. The
+/// list is the same for every session; what a session can reach shows in `help()`.
+pub static MODULE_DOCS: &[&ModuleDoc] = &[
+    &history::DOC,
+    &crate::mcp::code::module::DOC,
+    &decide::DOC,
+    &tool_module::IMAGE_DOC,
+    &tool_module::HOST_DOC,
+    &tool_module::WORKFLOW_DOC,
+    &tool_module::AUTOMATION_DOC,
+];
 
 /// One agent's `code` state, so a subagent's variables never mix with its parent's. A module that
 /// keeps per-agent state beyond what [`crate::tools::ToolContext`] already carries holds it here.

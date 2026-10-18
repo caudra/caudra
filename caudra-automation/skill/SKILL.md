@@ -32,7 +32,7 @@ Write a workflow instead when the job is one multi-agent plan that runs to a res
 | Project | `<project root>/.caudra/automations/<name>.rhai` | The user must trust the file's exact digest in `/automations`. Changing any byte revokes it. |
 | User | `<config dir>/automations/<name>.rhai` | Trusted as written |
 
-Call the `automation` tool with `action: "list"` before writing. Its answer names both directories as resolved for this machine and build. Use those paths rather than guessing. The user directory is `~/.config/caudra/automations/` on Linux and macOS (`XDG_CONFIG_HOME` is honoured) and `%APPDATA%\caudra\automations\` on Windows, with `caudra-debug` in place of `caudra` for a debug build.
+Run `await automation.list()` in a `code` snippet before writing. Its `project_dir` and `user_dir` name both directories as resolved for this machine and build, beside the `automations` themselves. Use those paths rather than guessing. The user directory is `~/.config/caudra/automations/` on Linux and macOS (`XDG_CONFIG_HOME` is honoured) and `%APPDATA%\caudra\automations\` on Windows, with `caudra-debug` in place of `caudra` for a debug build.
 
 Choosing a scope:
 
@@ -198,7 +198,7 @@ Without it, `list` shows a script with a `workflow_finished` trigger, or with `m
 
 Both lists hold at most 16 entries, without repeats.
 
-- It fires for every run in this session that reaches a terminal status, whoever started it: the model's `workflow` tool, `/workflow`, or any automation.
+- It fires for every run in this session that reaches a terminal status, whoever started it: the model's `workflow.start()`, `/workflow`, or any automation.
 - A run that is resumed and finishes again fires again, under the same `run_id`. Section 8 shows how to correlate such runs.
 - A run that finishes while the session is closed, or that a shutdown interrupts, does not fire.
 - A paused run, or one stopped at its agent budget, has not finished. It fires once it reaches a terminal status.
@@ -479,7 +479,7 @@ A publication also fails with `rate_limited` when the session has reached its pu
 
 ### `start_workflow(name, args)` and `start_workflow(name, args, options)`
 
-Starts a run of the workflow `name` in this session, in the background, and returns `#{ run_id, name }`, where `name` is the run's display name. `name` must be in `meta.workflows`. `args` is the map of args the workflow reads, passed as it is: a start never checks it, so a missing or mistyped arg fails the run, not the call. The one option, `agent_budget`, is a positive integer: the agents the run may admit in total, as the `workflow` tool takes it.
+Starts a run of the workflow `name` in this session, in the background, and returns `#{ run_id, name }`, where `name` is the run's display name. `name` must be in `meta.workflows`. `args` is the map of args the workflow reads, passed as it is: a start never checks it, so a missing or mistyped arg fails the run, not the call. The one option, `agent_budget`, is a positive integer: the agents the run may admit in total, as `workflow.start()` takes it.
 
 ```rhai
 let run = start_workflow("review-changes", #{ scope: "the last commit" }, #{ agent_budget: 12 });
@@ -488,7 +488,7 @@ state.run = run.run_id;
 
 - The call counts as an action under the automation limits, like `http()`.
 - The run belongs to the session. It runs on even when the firing is stopped or fails afterwards. That firing's `state` changes are discarded, so a run started before a failure goes unrecorded. Catch the failures that may follow a start, as `research-desk` in section 12 does.
-- A session holds at most 4 active runs, and the model's `workflow` tool shares that cap.
+- A session holds at most 4 active runs, and the model's `workflow.start()` shares that cap.
 - `workflow_finished` reports the outcome. Keep `run_id` to recognise it.
 
 A start fails, and `try` catches it, when the run cannot begin:
@@ -661,9 +661,9 @@ Rhai looks like a small JavaScript with Rust flavour. These are the points that 
 
 ## 11. Write, validate, and hand over
 
-1. Call `automation` with `action: "list"`. Note the two directories and check that the name is free.
+1. Run `await automation.list()` in `code`. Note the two directories and check that the name is free.
 2. Write `<dir>/<name>.rhai` with `file_write`. The header comes first.
-3. Validate with `automation`, `action: "validate"`, and `name: "<name>"`. Validation parses the header, compiles the script, checks the args the body reads, and runs the body once per trigger against a canned event. Each run gets every arg's default or `example`, an empty `state`, and a session without a goal, a cost, or an engaged autopilot, and it performs nothing. A `message_received` run gets a message its trigger matches, consumed when the trigger consumes. A `workflow_finished` run gets a run of the first workflow its trigger names, or else the first in `meta.workflows`, with the first of its `statuses`. A stop or an uncaught failure fails the validation with its line and column. Each run follows one path, so branches that depend on real event values are not reached. Fix the file and validate again.
+3. Validate with `await automation.validate("<name>")`. Validation parses the header, compiles the script, checks the args the body reads, and runs the body once per trigger against a canned event. Each run gets every arg's default or `example`, an empty `state`, and a session without a goal, a cost, or an engaged autopilot, and it performs nothing. A `message_received` run gets a message its trigger matches, consumed when the trigger consumes. A `workflow_finished` run gets a run of the first workflow its trigger names, or else the first in `meta.workflows`, with the first of its `statuses`. A stop or an uncaught failure fails the validation with its line and column. Each run follows one path, so branches that depend on real event values are not reached. Fix the file and validate again.
 4. Hand over. Trusting a project script, arming it, and choosing its args belong to the user. You can do none of them, so end your turn with what the user must do. A project script needs their trust in `/automations` first. Then give the exact line that arms it, with the args filled in:
 
    ```
@@ -681,7 +681,7 @@ Rhai looks like a small JavaScript with Rust flavour. These are the points that 
    A messaging script also needs cross-session messaging, which only the user can turn on, and a session with the name, topics, and groups its triggers expect. Give that launch line too, such as `caudra --name worker-1 --group swarm-tasks --automation status-beacon`.
 
    A workflow script also needs `experimental.workflows`, which only the user can turn on. Every workflow in `meta.workflows` must exist, and the user must approve a project workflow in `/workflows`. Name those workflows in the answer.
-5. Debug with `automation` and `action: "history"`. It lists this session's newest firings with their status, only one automation's when you pass `name`. Pass `fire_id` to see one firing's event and its actions, log lines included. A skipped firing shows its reason, and a failed one shows its error and line. When you fix a script that has already fired, add to the hand-over that the user can press `r` on one of its finished firings in `/automations` to replay that event against the edited file, a dry run that performs nothing.
+5. Debug with `await automation.history()`. It lists this session's newest firings with their status, only one automation's when you pass `name`. Pass `fire_id` to see one firing's event and its actions, log lines included. A skipped firing shows its reason, and a failed one shows its error and line. When you fix a script that has already fired, add to the hand-over that the user can press `r` on one of its finished firings in `/automations` to replay that event against the edited file, a dry run that performs nothing.
 
 ## 12. Complete examples
 

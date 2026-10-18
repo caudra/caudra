@@ -9,7 +9,7 @@ Caudra ships three workflows and discovers the ones you write. Runs are durable.
 
 Caudra's workflows are heavily inspired by [Grok Build workflows](https://x.ai/news/workflows) and mostly compatible with them. Agent options accept Grok Build's `capability_mode` spellings, and the built-in `deep-research` workflow is adapted from Grok Build under the Apache License 2.0. Caudra discovers scripts only in its own directories, listed under [Where definitions live](#where-definitions-live).
 
-Workflows are experimental and off by default. Turn them on with `workflows = true` under `[experimental]` in the global `caudra.toml`, then restart Caudra. See [Experimental features](/docs/configuration/#experimental-features). While they are off, Caudra offers no `workflow` tool, workflow commands, status chip, or inspector, and it does not open workflow storage, discover scripts, or resume runs. Saved runs stay on disk.
+Workflows are experimental and off by default. Turn them on with `workflows = true` under `[experimental]` in the global `caudra.toml`, then restart Caudra. See [Experimental features](/docs/configuration/#experimental-features). While they are off, the `code` tool's `workflow` module is unavailable. Caudra offers no workflow commands, status chip, or inspector, and it does not open workflow storage, discover scripts, or resume runs. Saved runs stay on disk.
 
 ## What ships
 
@@ -44,13 +44,13 @@ Other ways to launch:
 
 Plain text after the name becomes `args.query` and `args.objective`. A JSON object passes through as `args`. `--agent-budget N` caps how many agents the run may launch. `review-changes` also reads `args.scope` and `root-cause` reads `args.failure`, so a JSON launch can name the input directly.
 
-The model can launch workflows too, through the `workflow` tool, when the session has a runtime. It sees the same catalog you do and the same trust rules. See [Tools](/docs/tools/#workflow) for the tool contract.
+The model can launch workflows too, from a [`code`](/docs/code/#tools-reached-from-code) snippet, when the session has a runtime: `await workflow.start("review", {"objective": "..."})`, then `await workflow.status(run_id)`. It sees the same catalog you do and the same trust rules. `help("workflow")` gives the model every call, and the calls run the `workflow` tool, so its permission rules apply. A snippet can poll a run with `asyncio.sleep` and a raised `timeoutSec`, as [The Python subset](/docs/code/#the-python-subset) shows.
 
 An [automation](/docs/automations/#workflows) can start a run with `start_workflow()`, such as a nightly review, and act on its result through a `workflow_finished` trigger.
 
 ## Watching a run
 
-A launch draws a card in the transcript, whether you typed the command or the model called the `workflow` tool. The header names the run and reads its status, phase, agents admitted against the budget, and tokens spent. Below it sits the phase strip, the agents working right now, and the last three log lines. When the run settles the log lines give way to the report, the scratch file path, and any error. The report is markdown a model wrote, and the card draws it the way the transcript draws every other model answer. A run that spent its budget says so on the card and asks for a higher one. Click the scratch file path to open it in the [workbench](/docs/workbench/). Click anywhere else on the card to open the inspector on that run. A card the tool drew is part of the tool result and comes back on restore, brought up to date from the runtime, because the stored copy is frozen at the moment of launch and the run is not. The card of a slash launch is not saved with the session, so a resumed transcript keeps a one line notice of what the run came to instead.
+A launch draws a card in the transcript, whether you typed the command or the model called `workflow.start()`. The header names the run and reads its status, phase, agents admitted against the budget, and tokens spent. Below it sits the phase strip, the agents working right now, and the last three log lines. When the run settles the log lines give way to the report, the scratch file path, and any error. The report is markdown a model wrote, and the card draws it the way the transcript draws every other model answer. A run that spent its budget says so on the card and asks for a higher one. Click the scratch file path to open it in the [workbench](/docs/workbench/). Click anywhere else on the card to open the inspector on that run. A card the tool drew is part of the tool result and comes back on restore, brought up to date from the runtime, because the stored copy is frozen at the moment of launch and the run is not. The card of a slash launch is not saved with the session, so a resumed transcript keeps a one line notice of what the run came to instead.
 
 The status bar keeps a chip while any run is going. One active run shows as `[wf: deep-research · Research 2/4]`, with its phase and where that phase sits among the ones the script declared. Several runs, or runs parked waiting on someone, show as `[wf:2+1 · Research]` with the newest run's phase. A narrow bar drops the phase before it drops the chip. Click the chip to open the inspector.
 
@@ -135,7 +135,7 @@ Caudra reads each file once and uses that buffer for the digest, the catalog, co
 
 ## Write one
 
-You can ask the agent to write one. The builtin `caudra-workflow-dev` [skill](/docs/skills/#caudra-workflow-dev) carries this whole reference plus worked examples and the Rhai details that trip people up, and the agent validates the result with the `workflow` tool before handing it over. The `list` action tells it which directory to use.
+You can ask the agent to write one. The builtin `caudra-workflow-dev` [skill](/docs/skills/#caudra-workflow-dev) carries this whole reference plus worked examples and the Rhai details that trip people up, and the agent validates the result with `workflow.validate()` before handing it over. `workflow.list()` tells it which directory to use.
 
 Workflows are [Rhai](https://rhai.rs) scripts. The file name must be `<meta.name>.rhai` and the first statement must be the metadata:
 
@@ -287,7 +287,7 @@ A host failure such as an agent that errors is a catchable Rhai error, which is 
 
 Nothing else is reachable. There is no `import`, `eval`, clock, sleep, or file access. A script sees the host functions above and Rhai's standard string, array, and map functions.
 
-Validate a script from the catalog or with the `workflow` tool's `validate` action. Validation compiles the script and runs it once against a canned host whose agents return empty results, so it exercises one path through the code, not every branch.
+Validate a script from the catalog or with `workflow.validate()` in a `code` snippet. Validation compiles the script and runs it once against a canned host whose agents return empty results, so it exercises one path through the code, not every branch.
 
 ## Patterns that work
 
@@ -365,9 +365,9 @@ Run statuses: `active`, `paused`, `budget_limited`, `interrupted`, `completed`, 
 
 `write_scratch_file` writes below the state directory under `workflow_scratch/<session>/<run>/`. Names are single path components. Each run may write 64 files, 1 MiB each, 16 MiB in total. Scratch files count toward the session's storage and are removed with it.
 
-Runs and their journals live in the session database and are deleted with the session. Each run also keeps a timeline of its phase changes and `log` lines, up to 512 rows, the oldest log lines going first. The inspector reads it, and so does the `workflow` tool's `inspect` action. Trimming a session drops the journals and timelines and marks unfinished runs `interrupted`. A fork does not copy running workflows.
+Runs and their journals live in the session database and are deleted with the session. Each run also keeps a timeline of its phase changes and `log` lines, up to 512 rows, the oldest log lines going first. The inspector reads it, and so does `workflow.inspect()`. Trimming a session drops the journals and timelines and marks unfinished runs `interrupted`. A fork does not copy running workflows.
 
-Runs of earlier sessions in the same state directory stay readable. The inspector lists the twenty most recent under "Earlier sessions", and the `workflow` tool's `history` action returns up to fifty with the session that ran each one.
+Runs of earlier sessions in the same state directory stay readable. The inspector lists the twenty most recent under "Earlier sessions", and `workflow.history()` returns up to fifty with the session that ran each one.
 
 ## Limits
 
@@ -389,4 +389,4 @@ Every workflow agent also takes a slot from `task_max_concurrent`, so a `paralle
 
 The stream-JSON SDK exposes the same catalog and controls over `control_request` and reports runs as `system` messages. Like the TUI, it starts an automatic parent run for pending completion notices at a safe boundary, including after a normal final answer. See [Headless Mode](/docs/headless/#workflows) for wire events and shutdown behavior.
 
-One-shot `--print` and ACP sessions have no workflow runtime. The `workflow` tool is not offered there.
+One-shot `--print` and ACP sessions have no workflow runtime. The `workflow` module is unavailable there.

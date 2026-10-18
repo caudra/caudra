@@ -53,12 +53,31 @@ pub struct McpOutput {
 }
 
 /// A code-mode helper whose answer is not a server's, marked apart from the server name so a
-/// server called `decisions` never reads as one.
+/// server called `decisions` or `history` never reads as one. Each module's card reads only its
+/// own helpers. Stored as the bare helper name, as rows always were.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum McpHelper {
+    Decision(DecisionHelper),
+    History(HistoryHelper),
+}
+
+/// A `decisions` call, its answer the JSON text of its one block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum McpHelper {
+pub enum DecisionHelper {
     Decide,
     Rerank,
+}
+
+/// A `history` call, its answer the value the snippet received, kept as
+/// [`McpOutput::structured`] beside its one summary line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryHelper {
+    Search,
+    Read,
+    Sessions,
 }
 
 /// One thing the server asked the user during the call, and what came of it.

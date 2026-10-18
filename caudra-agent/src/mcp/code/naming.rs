@@ -234,7 +234,6 @@ pub(super) mod tests {
             description: String::new(),
             input_schema: json!({"type": "object"}),
             output_schema: None,
-            search_only: false,
         }
     }
 

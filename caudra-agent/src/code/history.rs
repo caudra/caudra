@@ -23,15 +23,17 @@ use serde_json::{Map, Value, json};
 
 use super::args::{bind, count, required_text, text};
 use super::gateway::Permission;
-use super::module::{CallFailure, CallRun, HostCallPlan, HostModule, Prepared};
+use super::module::{
+    CallFailure, CallRun, HostCallPlan, HostModule, MemberDoc, ModuleDoc, Prepared,
+};
 use super::names::HISTORY_MODULE;
 use super::output::CodeCall;
-use super::runner::{ScriptCall, ScriptError, ScriptErrorKind, ScriptName};
+use super::runner::{ScriptCall, ScriptError, ScriptErrorKind};
 use crate::decisions::{NoteSink, counted};
 use crate::history::{
     self, HistoryProject, HistoryResults, HistorySearch, HistoryStore, Ranking, iso_time,
 };
-use crate::mcp::output::{McpBlock, McpOutput};
+use crate::mcp::output::{HistoryHelper, McpBlock, McpHelper, McpOutput};
 use crate::memory::relevance::Judge;
 use crate::permissions::{
     ALL_PROJECTS_HISTORY, CURRENT_PROJECT_ATTRIBUTE, CURRENT_PROJECT_VALUE, PermissionExecutorKind,
@@ -44,7 +46,6 @@ use crate::tools::{CODE_TOOL_NAME, ToolContext, ToolFailure, expand_tilde, nativ
 const SEARCH_METHOD: &str = "search";
 const READ_METHOD: &str = "read";
 const SESSIONS_METHOD: &str = "sessions";
-const METHODS: &[&str] = &[SEARCH_METHOD, READ_METHOD, SESSIONS_METHOD];
 const SEARCH_HELPER: &str = "history.search";
 const READ_HELPER: &str = "history.read";
 const SESSIONS_HELPER: &str = "history.sessions";
@@ -99,12 +100,38 @@ const HISTORY_OF: &str = "the history of ";
 const ALL_PROJECTS_WORDS: &str = "all projects";
 /// Raised by every call of a session whose conversation is not stored.
 pub const UNSAVED: &str = "history is unavailable: this session is not saved";
-const STUBS: &str = r#"class _History:
-    async def search(self, query: str, scope: str = "project", kinds: list[Literal["user", "assistant", "summary", "reasoning", "tool_call", "tool_result"]] | None = None, tools: list[str] | None = None, since: str | None = None, until: str | None = None, sort: Literal["relevance", "newest"] = "relevance", rerank: bool | None = None, limit: int | None = None, offset: int = 0) -> dict[str, Any]: ...
-    async def read(self, ref: str, offset: int = 0, limit: int = 8000, around: int = 0) -> dict[str, Any]: ...
-    async def sessions(self, scope: str = "project", title: str | None = None, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]: ...
-history: _History
-"#;
+pub static DOC: ModuleDoc = ModuleDoc {
+    namespace: HISTORY_MODULE,
+    summary: "`history`: full-text search over the conversations stored on this machine, compacted parts and subagents included; `history.search`, `history.read`, `history.sessions`.",
+    page: "history: the conversations stored on this machine, compacted parts and subagents included, searched by word with BM25 ranking.\n\
+Scopes: `\"session\"` (this conversation), `\"project\"` (this checkout and its linked worktrees, or this remote workspace), `\"all\"`, or a project path. The current project needs no approval; another project or `\"all\"` asks first.\n\
+Example: `hits = (await history.search(\"flaky snapshot test\", kinds=[\"user\", \"summary\"]))[\"hits\"]`, then `await history.read(hits[0][\"ref\"], around=2)`.",
+    members: &[
+        MemberDoc {
+            name: SEARCH_METHOD,
+            signature: r#"search(query: str, scope: str = "project", kinds: list[Literal["user", "assistant", "summary", "reasoning", "tool_call", "tool_result"]] | None = None, tools: list[str] | None = None, since: str | None = None, until: str | None = None, sort: Literal["relevance", "newest"] = "relevance", rerank: bool | None = None, limit: int | None = None, offset: int = 0) -> dict[str, Any]"#,
+            awaited: true,
+            page: "Returns `{\"hits\": [{\"ref\", \"session\", \"title\", \"project\", \"when\", \"kind\", \"tool\", \"agent\", \"snippet\", \"score\"}], \"ranking\", \"judged_unrelated\", \"more\", \"unindexed_sessions\", \"note\"}`. Matched words in `snippet` are marked «like this».\n\
+- `kinds` keeps only those items; `tools` keeps only calls of, and results from, the named tools.\n\
+- `since` and `until` take ISO dates or times.\n\
+- `sort=\"relevance\"` ranks by keyword score, reranked when the session's decision engine is set to rerank history (`rerank=False` opts out); `sort=\"newest\"` takes the newest matches and keeps time order.\n\
+- `limit` defaults to 10 reranked or 20 by keyword, at most 50; page on with `offset` while `more` is true.\n\
+- `note` says why ranking fell back to keyword order, and `unindexed_sessions` counts sessions not indexed yet.",
+        },
+        MemberDoc {
+            name: READ_METHOD,
+            signature: "read(ref: str, offset: int = 0, limit: int = 8000, around: int = 0) -> dict[str, Any]",
+            awaited: true,
+            page: "Returns one item's full text from byte `offset`, at most `limit` bytes (64 KiB), with `around` neighbours each side (at most 20) as previews. `ref` comes from a `history.search` hit.",
+        },
+        MemberDoc {
+            name: SESSIONS_METHOD,
+            signature: "sessions(scope: str = \"project\", title: str | None = None, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]",
+            awaited: true,
+            page: "Lists sessions newest first, at most 100 per call, optionally only those whose title contains `title`.",
+        },
+    ],
+};
 
 /// The stored history one run reaches. Without a store the session is not saved, and every call
 /// raises.
@@ -130,22 +157,12 @@ impl HistoryModule {
 }
 
 impl HostModule for HistoryModule {
-    fn global(&self, name: &str) -> Option<ScriptName> {
-        (name == HISTORY_MODULE).then_some(ScriptName::Namespace)
+    fn doc(&self) -> &'static ModuleDoc {
+        &DOC
     }
 
-    fn member(&self, _namespace: &str, name: &str) -> ScriptName {
-        match METHODS.contains(&name) {
-            true => ScriptName::Function,
-            false => ScriptName::Undefined(Some(format!(
-                "'{HISTORY_MODULE}' has no attribute '{name}'; it has {}",
-                METHODS.join(", ")
-            ))),
-        }
-    }
-
-    fn stubs(&self) -> String {
-        STUBS.to_owned()
+    fn unavailable(&self) -> Option<String> {
+        self.store.is_none().then(|| UNSAVED.to_owned())
     }
 
     fn prepare(&self, ctx: &ToolContext, call: ScriptCall) -> Prepared {
@@ -383,6 +400,7 @@ impl SearchCall {
             let (reach, caller) = resolve(caller, requested).await?;
             let row = row(
                 SEARCH_METHOD,
+                HistoryHelper::Search,
                 Value::from(query.text.as_str()).to_string(),
                 arguments,
             );
@@ -402,7 +420,7 @@ impl SearchCall {
                     {
                         notes.emit(decision);
                     }
-                    Ok((summary(results.summary()), results_value(&results)))
+                    Ok(answered(results.summary(), results_value(&results)))
                 })
             });
             Ok(plan(row, permission, run))
@@ -475,6 +493,7 @@ impl ReadCall {
                 .ok_or_else(|| value_error(format!("no stored session holds `{reference}`")))?;
             let row = row(
                 READ_METHOD,
+                HistoryHelper::Read,
                 Value::from(reference.to_string()).to_string(),
                 arguments,
             );
@@ -504,7 +523,7 @@ impl ReadCall {
                         entry.offset,
                         entry.total_bytes
                     );
-                    Ok((summary(text), entry_value(&entry)))
+                    Ok(answered(text, entry_value(&entry)))
                 })
             });
             Ok(plan(row, permission, run))
@@ -551,6 +570,7 @@ impl SessionsCall {
             let (reach, _) = resolve(caller, requested).await?;
             let row = row(
                 SESSIONS_METHOD,
+                HistoryHelper::Sessions,
                 Value::from(scope_text).to_string(),
                 arguments,
             );
@@ -565,8 +585,7 @@ impl SessionsCall {
                         .await
                         .map_err(unreadable)?;
                     let text = counted(sessions.len(), SESSION_ONE, SESSION_MANY);
-                    let value = sessions.iter().map(session_value).collect();
-                    Ok((summary(text), value))
+                    Ok(answered(text, sessions.iter().map(session_value).collect()))
                 })
             });
             Ok(plan(row, permission, run))
@@ -592,12 +611,18 @@ fn judge(ctx: &ToolContext) -> Option<Judge> {
     })
 }
 
-fn row(method: &str, first_argument: String, arguments: Map<String, Value>) -> CodeCall {
+fn row(
+    method: &str,
+    helper: HistoryHelper,
+    first_argument: String,
+    arguments: Map<String, Value>,
+) -> CodeCall {
     CodeCall {
         server: HISTORY_MODULE.to_owned(),
         tool: method.to_owned(),
         called_as: format!("{HISTORY_MODULE}.{method}({first_argument})"),
         input: Value::Object(arguments),
+        helper: Some(McpHelper::History(helper)),
         ..CodeCall::default()
     }
 }
@@ -611,11 +636,14 @@ fn plan(row: CodeCall, permission: Permission, run: CallRun) -> Box<HostCallPlan
     })
 }
 
-fn summary(text: String) -> McpOutput {
-    McpOutput {
-        blocks: vec![McpBlock::Text { text }],
+/// The row's summary line, with the value the snippet receives kept for its card to draw.
+fn answered(summary: String, value: Value) -> (McpOutput, Value) {
+    let output = McpOutput {
+        blocks: vec![McpBlock::Text { text: summary }],
+        structured: Some(value.clone()),
         ..McpOutput::default()
-    }
+    };
+    (output, value)
 }
 
 /// What prompts name another project's session by: its main checkout when it is a local one
@@ -814,6 +842,7 @@ mod tests {
     use crate::AgentMode;
     use crate::code::gateway::Gateway;
     use crate::code::output::CodeCallStatus;
+    use crate::code::runner::ScriptName;
     use crate::code::runner::{ScriptHost, ScriptInvocation, ScriptReply};
     use crate::history::tests::{seed, seeded_text, stamped};
     use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager, PermissionMode};
@@ -1066,7 +1095,7 @@ mod tests {
     }
 
     #[test]
-    fn a_search_row_says_how_its_hits_were_ranked() {
+    fn a_search_row_says_how_its_hits_were_ranked_and_keeps_them_for_its_card() {
         let fixture = fixture(AgentMode::Build);
         let gateway = fixture.gateway();
 
@@ -1075,9 +1104,12 @@ mod tests {
         let calls = gateway.finish();
         assert_eq!(calls[0].called_as, format!("history.search(\"{QUERY}\")"));
         assert_eq!(
-            calls[0].output.as_ref().unwrap().display_text(),
-            KEYWORD_SUMMARY
+            calls[0].helper,
+            Some(McpHelper::History(HistoryHelper::Search))
         );
+        let output = calls[0].output.as_ref().unwrap();
+        assert_eq!(output.display_text(), KEYWORD_SUMMARY);
+        assert_eq!(output.structured.as_ref(), Some(&value));
         assert_eq!(value["ranking"], KEYWORD);
         assert_eq!(value["hits"][0]["snippet"], format!("«{QUERY}» 0"));
         assert_eq!(value["hits"][0]["project"], path_text(&fixture.project));

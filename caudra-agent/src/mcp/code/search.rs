@@ -206,10 +206,7 @@ mod tests {
                 vec![
                     described("list_issues", ISSUES_DESCRIPTION),
                     described("issue", "Read one issue."),
-                    ToolView {
-                        search_only: true,
-                        ..described("search_code", "Search code across repositories.")
-                    },
+                    described("search_code", "Search code across repositories."),
                 ],
             ),
             server(
@@ -238,7 +235,7 @@ mod tests {
     #[test_case("issue", &["git_hub.issue", "git_hub.list_issues", "linear.list_tickets"] ; "exact_method_first")]
     #[test_case("git-hub.issue", &["git_hub.issue", "git_hub.list_issues", "git_hub.search_code", "linear.list_tickets"] ; "exact_permission_key")]
     #[test_case("git_hub.list_issues", &["git_hub.list_issues", "linear.list_tickets", "git_hub.issue", "git_hub.search_code"] ; "exact_qualified_method")]
-    #[test_case("code", &["git_hub.search_code"] ; "search_only_tools_are_found")]
+    #[test_case("code", &["git_hub.search_code"] ; "description_match")]
     #[test_case("tickets", &["linear.list_tickets"] ; "unrelated_tools_are_dropped")]
     fn search_ranks_matches(query: &str, expected: &[&str]) {
         assert_eq!(found(query, None), expected);

@@ -1986,6 +1986,18 @@ pub(super) fn highlighted_body(text: &str, language: &str, width: u16) -> Vec<Li
         .collect()
 }
 
+/// A styled row broken to `width`, every display row after the first opening with `indent`
+/// as the first did.
+pub(super) fn indented_rows(
+    indent: &'static str,
+    spans: Vec<Span<'static>>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let mut row = vec![Span::raw(indent)];
+    row.extend(spans);
+    wrapped_lines(wrap_styled(row, 1, indent, width))
+}
+
 /// [`plain_body`]'s rows coloured as JSON by the theme alone, broken at the
 /// same places so a copy reads back the text the rows were painted from. No
 /// grammar runs, so a document of any size paints in one linear pass.
@@ -4169,6 +4181,7 @@ fn merge_syntax_with_diff(
 mod tests {
     use super::*;
     use crate::animation::test_clock::FrozenClock;
+    use crate::components::code_card;
     use crate::components::command_text::deferring;
     use crate::components::command_text::tests::{
         assert_command_coloured, coloured, styled_characters,
@@ -4176,6 +4189,7 @@ mod tests {
     use crate::components::tool_display::{AWAITING_APPROVAL, WRITING_COMMAND};
     use crate::markdown::{EXPAND_AFFORDANCE, TRUNCATION_PREFIX};
     use crate::provenance::Provenance;
+    use caudra_agent::code::output::{CodeCall, CodeCallStatus, CodeOutput, HostedResult};
     use caudra_agent::tools::{
         BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME, SKILL_TOOL_NAME, ToolEffect,
     };
@@ -4185,6 +4199,7 @@ mod tests {
         TextOutput,
     };
     use caudra_config::UiConfig;
+    use serde_json::json;
     use std::{slice::from_ref, time::Duration};
     use test_case::test_case;
 
@@ -6936,6 +6951,51 @@ mod tests {
             assert!(
                 drawn[1..].iter().any(|row| row.contains(line)),
                 "{STREAMED_PROMPT_MSG}: {line:?} missing from {drawn:?}"
+            );
+        }
+    }
+
+    const HOSTED_PROMPT_MSG: &str = "a generation a `code` snippet started draws as the tool's own \
+        card while it waits on the backend: its file on the row and its prompt beneath, not the \
+        module call's arguments";
+    const ARGUMENT_SUFFIX: &str = "prompt=";
+
+    /// The reported bug: `image.generate` in a snippet showed only `image › generate <file>
+    /// [prompt=…]` for the seconds the backend took, where a direct call drew its prompt.
+    #[test]
+    fn a_running_hosted_generation_draws_its_prompt_under_its_file() {
+        let call = CodeCall {
+            server: "image".into(),
+            tool: "generate".into(),
+            called_as: "image.generate".into(),
+            title: Some(GENERATED_PATH.into()),
+            input: json!({"prompt": STREAMED_PROMPT, "out": GENERATED_PATH}),
+            status: CodeCallStatus::Running,
+            hosted: Some(Box::new(HostedResult {
+                input: Some(ToolInput::Code {
+                    language: "markdown".into(),
+                    code: STREAMED_PROMPT.into(),
+                }),
+                ..HostedResult::pending(IMAGE_CHILD)
+            })),
+            ..CodeCall::default()
+        };
+        let entries = code_card::entries(&CodeOutput {
+            calls: vec![call],
+            ..CodeOutput::default()
+        });
+
+        let card = render_batch(&entries, false, &limits(BatchViews::default()));
+
+        let drawn: Vec<String> = card.lines.iter().map(line_text).collect();
+        assert!(
+            drawn[0].contains(GENERATED_PATH) && !drawn[0].contains(ARGUMENT_SUFFIX),
+            "{HOSTED_PROMPT_MSG}: {drawn:?}"
+        );
+        for line in STREAMED_PROMPT.lines() {
+            assert!(
+                drawn[1..].iter().any(|row| row.contains(line)),
+                "{HOSTED_PROMPT_MSG}: {line:?} missing from {drawn:?}"
             );
         }
     }

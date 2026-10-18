@@ -156,7 +156,6 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use caudra_agent::agent::task_runner::WorkflowHostContext;
 use caudra_agent::autopilot::{ActionName, DecisionKind};
 use caudra_agent::background::{BackgroundTasks, ShellSnapshot};
-use caudra_agent::code::output as code_output;
 use caudra_agent::commits::repo;
 use caudra_agent::context::{ContextKey, ContextSnapshot, ContextStore};
 use caudra_agent::mcp::McpSnapshot;
@@ -170,9 +169,9 @@ use caudra_agent::types::{
     QuestionDelivery, WorkflowProvenance,
 };
 use caudra_agent::{
-    AgentEvent, AgentInput, AgentMode, CommitRef, Envelope, GoalVerdict, HistorySnapshot,
-    ImageSource, McpConfigErrors, McpSnapshotReader, Mention, PromptAdmission, QueueItemId,
-    SharedHistory, SteeringQueue, SubagentInfo, ToolOutput, project_for_inspection,
+    AgentEvent, AgentInput, AgentMode, CommitRef, Envelope, GoalVerdict, ImageSource,
+    McpConfigErrors, McpSnapshotReader, Mention, PromptAdmission, QueueItemId, SharedHistory,
+    SteeringQueue, SubagentInfo, ToolOutput, project_for_inspection,
 };
 use caudra_automation::event::{StartedBy, TurnOutcome};
 use caudra_config::providers::ProvidersConfig;
@@ -474,7 +473,6 @@ struct ToolsPreviewKey {
 struct ToolsPreviewCache {
     key: Option<ToolsPreviewKey>,
     source: Watch<ToolsPreviewSource>,
-    history: Watch<HistorySnapshot>,
     mcp: Watch<McpSnapshot>,
     snapshot: Option<Arc<ContextSnapshot>>,
 }
@@ -3349,7 +3347,7 @@ impl App {
 
     pub(crate) fn open_awaiting_mcp_trust(&mut self, needs_login: bool) {
         if !needs_login && self.mcp_picker.has_awaiting_trust() {
-            self.mcp_picker.open(self.main_context_snapshot());
+            self.mcp_picker.open();
         }
     }
 
@@ -3398,7 +3396,7 @@ impl App {
     fn review_pending_trust(&mut self) {
         let pending = self.pending_trust();
         if pending.mcp {
-            self.mcp_picker.open(self.main_context_snapshot());
+            self.mcp_picker.open();
         } else if pending.permissions
             && let Err(error) = self.open_permissions_picker()
         {
@@ -6185,7 +6183,7 @@ impl App {
                 vec![]
             }
             "/mcp" => {
-                self.mcp_picker.open(self.main_context_snapshot());
+                self.mcp_picker.open();
                 vec![]
             }
             "/env" => self.open_env(),
@@ -6994,11 +6992,7 @@ impl App {
     }
 
     fn refresh_mcp_picker(&mut self) -> Dirty {
-        if !self.mcp_picker.is_open() {
-            return Dirty::NO;
-        }
-        let tools = self.main_context_snapshot();
-        self.mcp_picker.refresh(tools)
+        self.mcp_picker.refresh()
     }
 
     fn poll_context_snapshot(&mut self) -> Dirty {
@@ -7080,23 +7074,10 @@ impl App {
         };
         let cache = &mut self.tools_preview_cache;
         let changed = cache.source.poll(Some(Arc::clone(&source)))
-            | cache.history.poll(
-                self.shared_history
-                    .as_ref()
-                    .map(|history| history.load_full()),
-            )
             | cache
                 .mcp
                 .poll(source.mcp.as_ref().map(|mcp| mcp.reader().load_full()));
         if cache.key.as_ref() != Some(&key) || changed == Dirty::YES {
-            cache.key = None;
-            cache.snapshot = None;
-            let messages = cache
-                .history
-                .get()
-                .map(|history| project_messages(&history.messages))
-                .transpose()
-                .ok()?;
             cache.snapshot = Some(Arc::new(source.snapshot(
                 &model,
                 &self.state.model,
@@ -7104,7 +7085,6 @@ impl App {
                 &key.mode,
                 key.session_plan,
                 &key.cwd,
-                messages.as_deref().unwrap_or_default(),
             )));
             cache.key = Some(key);
         }
@@ -7317,9 +7297,10 @@ impl App {
             return;
         };
         for call in &run.calls {
+            let (tool, source) = call.ledger_name();
             self.record_tool_usage(ToolCall {
-                tool: call.qualified_name(),
-                source: code_output::CALL_SOURCE.to_owned(),
+                tool,
+                source,
                 cwd: self.state.session.cwd.clone(),
                 outcome: call.ledger_outcome(),
                 duration_ms: call.duration_ms,

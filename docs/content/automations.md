@@ -20,7 +20,7 @@ automations = true
 
 Triggers and actions that reach other sessions also need `cross_session_messaging = true`, and those that start or watch workflows need `workflows = true`. Each switch is independent. A script that uses a feature that is off stays in the catalog as invalid, with a reason such as `needs experimental.workflows`. See [Experimental features](/docs/configuration/#experimental-features).
 
-While the switch is off, Caudra offers no `/automations` command, `--automation` flag, `automation` tool, or status chip, and it arms nothing. Turning it off keeps the automations, args, and state that sessions saved.
+While the switch is off, Caudra offers no `/automations` command, `--automation` flag, or status chip, the `code` tool's `automation` module is unavailable, and it arms nothing. Turning it off keeps the automations, args, and state that sessions saved.
 
 The session limits live in the global [`[automations]`](/docs/configuration/#automations) table. The builtin `caudra-automation-dev` skill teaches the agent to write automations, and it is on by default while automations are on. Set `automation_dev = false` under [`[plugins.skill]`](/docs/configuration/#plugins-skill) to remove it.
 
@@ -89,7 +89,7 @@ The header is the first statement, `let meta = #{ … };`. Caudra reads it witho
 
 The body is ordinary Rhai that runs top to bottom once per firing, with `event`, `state`, `args`, and `meta` in scope. Conditions are plain `if` statements. `skip(reason)` ends a firing without acting and records why, and `return` ends it early. Actions are calls to host functions.
 
-The agent can write one for you. The builtin `caudra-automation-dev` [skill](/docs/skills/#the-builtins) holds the full reference, from every header key, event field, and host function to the parts of Rhai that trip people up. The agent writes the file, validates it with the [`automation` tool](/docs/tools/#automation), and gives you the line that arms it. Only you can trust and arm it.
+The agent can write one for you. The builtin `caudra-automation-dev` [skill](/docs/skills/#the-builtins) holds the full reference, from every header key, event field, and host function to the parts of Rhai that trip people up. The agent writes the file, validates it with `automation.validate()` in a [`code`](/docs/code/#tools-reached-from-code) snippet, and gives you the line that arms it. Only you can trust and arm it.
 
 ### Triggers
 
@@ -238,7 +238,7 @@ A message goes out as the session, marked as the automation's. Recipients see `s
 
 ## Workflows
 
-With workflows on, an automation can start runs and act on their results. `meta.workflows` lists the workflows that `start_workflow(name, args)` may start. The run belongs to the session and goes on in the background, and the call returns its `run_id` and display name. A session holds at most 4 active runs, shared with the model's `workflow` tool. A project workflow still needs its own approval in `/workflows`. Esc Esc closes background admission until your next prompt, and a start fails until then.
+With workflows on, an automation can start runs and act on their results. `meta.workflows` lists the workflows that `start_workflow(name, args)` may start. The run belongs to the session and goes on in the background, and the call returns its `run_id` and display name. A session holds at most 4 active runs, shared with the model's `workflow` module. A project workflow still needs its own approval in `/workflows`. Esc Esc closes background admission until your next prompt, and a start fails until then.
 
 `workflow_finished` fires when a run in this session reaches a final status, whoever started it, and carries its report and result as untrusted values. A run that finishes while the session is closed does not fire. Every completion also starts a model turn, as it does without automations. See [Workflows](/docs/workflows/).
 

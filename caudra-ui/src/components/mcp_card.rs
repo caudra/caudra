@@ -7,8 +7,8 @@
 
 use caudra_agent::types::Answerer;
 use caudra_agent::{
-    ElicitAction, McpBlock, McpInteraction, McpOutput, McpServerKind, ToolInput, mcp_tool_parts,
-    pretty_json,
+    ElicitAction, McpBlock, McpHelper, McpInteraction, McpOutput, McpServerKind, ToolInput,
+    mcp_tool_parts, pretty_json,
 };
 use ratatui::text::{Line, Span};
 use serde_json::Value;
@@ -22,6 +22,7 @@ use crate::theme;
 
 pub(crate) mod decisions;
 mod executor;
+mod history;
 mod home_assistant;
 
 pub(crate) const OUTPUT_DIVIDER: &str = "────────────";
@@ -45,6 +46,9 @@ const AUDIO_LABEL: &str = "audio";
 const RESOURCE_LABEL: &str = "resource";
 const LINK_LABEL: &str = "link";
 const STRUCTURED_LABEL: &str = "structuredContent";
+/// What a resource's MIME type holds when its text is markdown; any other declared type is drawn
+/// as the server wrote it.
+const MARKDOWN_MIME: &str = "markdown";
 /// Argument keys whose string is code the tool runs, in the order a script is
 /// looked for.
 const SCRIPT_KEYS: &[&str] = &[
@@ -257,7 +261,12 @@ pub(crate) fn render(
 /// `structuredContent` the generic card leaves to the text beside it.
 fn answer_rows(call: &McpCall<'_>, output: &McpOutput, width: u16, whole: bool) -> (Rows, bool) {
     let recognised = match (output.helper, output.kind) {
-        (Some(helper), _) => decisions::render(helper, call.arguments, output, width),
+        (Some(McpHelper::Decision(helper)), _) => {
+            decisions::render(helper, call.arguments, output, width)
+        }
+        (Some(McpHelper::History(helper)), _) => {
+            history::render(helper, call.arguments, output, width)
+        }
         (None, Some(McpServerKind::Executor)) => {
             executor::render(call.raw_tool(), output, width, whole)
         }
@@ -467,16 +476,14 @@ fn block_rows(block: &McpBlock, width: u16, raw: bool) -> Rows {
             text,
             bytes,
         } => {
-            rows.push(vec![label_row(
-                RESOURCE_LABEL,
-                [
-                    Some(uri.clone()),
-                    mime_type.clone(),
-                    bytes.map(|bytes| format_bytes(bytes as u64)),
-                ],
-            )]);
-            if let Some(text) = text {
-                push(&mut rows, text, width);
+            rows.push(vec![resource_label(uri, mime_type, *bytes)]);
+            let markdown = mime_type
+                .as_deref()
+                .is_none_or(|mime| mime.contains(MARKDOWN_MIME));
+            match text {
+                Some(text) if markdown => push(&mut rows, text, width),
+                Some(text) => push_raw_text(&mut rows, text, width),
+                None => {}
             }
         }
         McpBlock::ResourceLink {
@@ -523,6 +530,18 @@ fn escaped_lines(text: &str) -> String {
         .map(escape_terminal_controls)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// `resource · homeassistant://assist/context-snapshot · text/plain`.
+fn resource_label(uri: &str, mime_type: &Option<String>, bytes: Option<usize>) -> Line<'static> {
+    label_row(
+        RESOURCE_LABEL,
+        [
+            Some(uri.to_owned()),
+            mime_type.clone(),
+            bytes.map(|bytes| format_bytes(bytes as u64)),
+        ],
+    )
 }
 
 /// `image · image/png · 12.0 KB`: what the block is, then what is known of it.
@@ -624,6 +643,28 @@ mod tests {
         );
 
         assert_eq!(rendered(&card), [label]);
+    }
+
+    #[test_case(Some("text/plain"), "- names: Alarmo" ; "plain_text_as_written")]
+    #[test_case(Some("text/markdown"), "• names: Alarmo" ; "markdown_rendered")]
+    #[test_case(None, "• names: Alarmo" ; "undeclared_rendered")]
+    fn a_resource_text_is_drawn_as_its_type(mime_type: Option<&str>, first: &str) {
+        let block = McpBlock::Resource {
+            uri: "file:///c".into(),
+            mime_type: mime_type.map(str::to_owned),
+            text: Some("- names: Alarmo\n  domain: alarm".into()),
+            bytes: None,
+        };
+
+        let card = render(
+            &McpCall::default(),
+            false,
+            Some(&output(vec![block])),
+            UNBOUNDED,
+            WIDTH,
+        );
+
+        assert_eq!(rendered(&card)[1], first);
     }
 
     #[test]

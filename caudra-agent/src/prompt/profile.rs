@@ -844,13 +844,14 @@ mod tests {
 
     #[test_case("", true; "omitted")]
     #[test_case("tools: {}", true; "empty")]
-    #[test_case("layout: custom\ntools:\n  default: lazy", true; "custom")]
-    #[test_case("tools:\n  default: inherit\n  groups:\n    messaging: lazy\n    support: eager", true; "groups")]
-    #[test_case("tools:\n  default: disabled\n  overrides:\n    github.*: lazy", true; "mcp_server")]
+    #[test_case("layout: custom\ntools:\n  default: eager", true; "custom")]
+    #[test_case("tools:\n  default: inherit\n  groups:\n    messaging: disabled\n    support: eager", true; "groups")]
+    #[test_case("tools:\n  default: disabled\n  overrides:\n    github.*: eager", true; "mcp_server")]
     #[test_case("tools:\n  groups:\n    bogus: eager", false; "unknown_group")]
-    #[test_case("tools:\n  overrides:\n    file_read: lazy\n    file_read: eager", false; "duplicate_selector")]
-    #[test_case("tools:\n  groups:\n    web: lazy\n    web: eager", false; "duplicate_group")]
-    #[test_case("tools:\n  overrides:\n    tool_search: eager", false; "reserved_loader")]
+    #[test_case("tools:\n  overrides:\n    file_read: disabled\n    file_read: eager", false; "duplicate_selector")]
+    #[test_case("tools:\n  groups:\n    web: disabled\n    web: eager", false; "duplicate_group")]
+    #[test_case("tools:\n  default: lazy", false; "removed_lazy")]
+    #[test_case("tools:\n  overrides:\n    code: disabled", false; "required_code")]
     #[test_case("tools:\n  overrides:\n    structured_output: disabled", false; "required_output")]
     fn profile_tool_frontmatter_is_strict(metadata: &str, valid: bool) {
         let dir = TempDir::new().unwrap();

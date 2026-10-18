@@ -3,11 +3,10 @@ use caudra_config::{
     effective_task_execution,
 };
 use serde_json::Value;
-use std::mem;
 
 use super::{
-    DescriptionContext, LocalToolEntry, LocalTools, RegisteredTool, TOOL_OUTPUT_TOOL_NAME,
-    ToolContext, ToolDefinitions, ToolFilter, ToolRegistry, ToolSource, deferral::DeferredTool,
+    CODE_TOOL_NAME, DescriptionContext, LocalToolEntry, LocalTools, RegisteredTool,
+    TOOL_OUTPUT_TOOL_NAME, ToolContext, ToolDefinitions, ToolFilter, ToolRegistry, ToolSource,
 };
 
 pub const PROFILE_DISABLED: &str = "disabled by the selected profile";
@@ -18,6 +17,9 @@ pub const PROFILE_LOADING: &str = "selected profile loading policy";
 pub const LEGACY_LOADING: &str = "legacy loading policy";
 pub const PLAN_TOOL_NAME: &str = "plan";
 pub const PLAN_REQUIRED: &str = "requires a session plan";
+/// Native tools no filter or profile withholds: the pager for oversized results, and `code`,
+/// which hosts the modules that replaced tools of their own.
+const REQUIRED_TOOLS: &[&str] = &[TOOL_OUTPUT_TOOL_NAME, CODE_TOOL_NAME];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExposureDecision {
@@ -48,7 +50,6 @@ pub fn registered_decision(
     ctx: &DescriptionContext,
     profile: &ProfileToolPolicy,
     session_plan: bool,
-    legacy_lazy: bool,
 ) -> ToolExposureDecision {
     let source = source_kind(&entry.source);
     if source == ProfileToolSource::Native && entry.name() == PLAN_TOOL_NAME && !session_plan {
@@ -59,7 +60,7 @@ pub fn registered_decision(
     {
         return disabled(MODE_DISABLED);
     }
-    if source == ProfileToolSource::Native && entry.name() == TOOL_OUTPUT_TOOL_NAME {
+    if source == ProfileToolSource::Native && REQUIRED_TOOLS.contains(&entry.name()) {
         return ToolExposureDecision {
             exposure: ProfileToolExposure::Eager,
             reason: REQUIRED_INFRASTRUCTURE,
@@ -68,7 +69,7 @@ pub fn registered_decision(
     if !ctx.filter.matches(entry.name()) {
         return disabled(CEILING_DISABLED);
     }
-    exposure_decision(profile, entry.name(), source, legacy_lazy)
+    exposure_decision(profile, entry.name(), source)
 }
 
 pub fn local_decision(
@@ -89,14 +90,13 @@ pub fn local_decision(
     if !filter.matches(name) {
         return disabled(CEILING_DISABLED);
     }
-    exposure_decision(profile, name, ProfileToolSource::Custom, false)
+    exposure_decision(profile, name, ProfileToolSource::Custom)
 }
 
 fn exposure_decision(
     profile: &ProfileToolPolicy,
     name: &str,
     source: ProfileToolSource,
-    legacy_lazy: bool,
 ) -> ToolExposureDecision {
     match profile.exposure(name, source) {
         Some(ProfileToolExposure::Disabled) => disabled(PROFILE_DISABLED),
@@ -105,11 +105,7 @@ fn exposure_decision(
             reason: PROFILE_LOADING,
         },
         None => ToolExposureDecision {
-            exposure: if legacy_lazy {
-                ProfileToolExposure::Lazy
-            } else {
-                ProfileToolExposure::Eager
-            },
+            exposure: ProfileToolExposure::Eager,
             reason: LEGACY_LOADING,
         },
     }
@@ -136,16 +132,10 @@ pub fn append_local_definitions(
         let Some(entry) = bindings.get(name) else {
             continue;
         };
-        match local_decision(name, entry, filter, profile).exposure {
-            ProfileToolExposure::Disabled => {}
-            ProfileToolExposure::Eager => {
-                if let Some(declared) = definitions.declared.as_array_mut() {
-                    declared.push(definition);
-                }
-            }
-            ProfileToolExposure::Lazy => definitions
-                .deferred
-                .push(DeferredTool::new(name, definition.clone())),
+        if local_decision(name, entry, filter, profile).available()
+            && let Some(declared) = definitions.declared.as_array_mut()
+        {
+            declared.push(definition);
         }
     }
 }
@@ -162,14 +152,9 @@ pub fn configure_definitions(definitions: &mut ToolDefinitions, ctx: &ToolContex
         .as_array()
         .cloned()
         .unwrap_or_default();
-    let deferred = mem::take(&mut definitions.deferred);
     let session_plan = ctx.has_session_plan();
     let mut eager = Vec::new();
-    for (definition, was_lazy) in declared
-        .into_iter()
-        .map(|definition| (definition, false))
-        .chain(deferred.into_iter().map(|tool| (tool.definition, true)))
-    {
+    for definition in declared {
         let Some(name) = definition["name"].as_str() else {
             continue;
         };
@@ -188,28 +173,17 @@ pub fn configure_definitions(definitions: &mut ToolDefinitions, ctx: &ToolContex
                 },
                 &ctx.profile_tool_policy,
                 session_plan,
-                was_lazy,
             )
         } else {
-            exposure_decision(
-                &ctx.profile_tool_policy,
-                name,
-                ProfileToolSource::Custom,
-                was_lazy,
-            )
+            exposure_decision(&ctx.profile_tool_policy, name, ProfileToolSource::Custom)
         };
-        match decision.exposure {
-            ProfileToolExposure::Disabled => {}
-            ProfileToolExposure::Eager => eager.push(definition),
-            ProfileToolExposure::Lazy => definitions
-                .deferred
-                .push(DeferredTool::new(name, definition.clone())),
+        if decision.available() {
+            eager.push(definition);
         }
     }
     definitions.declared = Value::Array(eager);
-    super::execution::configure_tools(
+    super::execution::configure_declared(
         &mut definitions.declared,
-        &mut definitions.deferred,
         &ctx.config,
         ctx.background.is_some(),
         ctx.job_scope().is_some(),
@@ -250,7 +224,6 @@ pub fn tool_available(registry: &ToolRegistry, ctx: &ToolContext, name: &str) ->
             },
             &ctx.profile_tool_policy,
             ctx.has_session_plan(),
-            false,
         )
         .available();
     }
@@ -261,8 +234,8 @@ pub fn tool_available(registry: &ToolRegistry, ctx: &ToolContext, name: &str) ->
 mod tests {
     use crate::tools::native::plan::PlanTarget;
     use crate::tools::{
-        DeferralSession, DescriptionContext, TOOL_SEARCH_TOOL_NAME, ToolAudience, ToolDefinitions,
-        ToolEffect, ToolFilter, ToolRegistry, ToolSource, audited_local_tool,
+        DescriptionContext, ToolAudience, ToolDefinitions, ToolEffect, ToolFilter, ToolRegistry,
+        ToolSource, audited_local_tool,
         registry::{ParseError, Tool, ToolInvocation},
         test_support::{NamedMock, stub_ctx},
     };
@@ -271,7 +244,7 @@ mod tests {
         agent::tool_dispatch::{self, Emit},
         template::Vars,
     };
-    use caudra_config::{ProfileToolExposure, ProfileToolPolicy};
+    use caudra_config::ProfileToolPolicy;
     use caudra_storage::tool_ledger::ToolOutcome;
     use serde_json::{Value, json};
     use std::{
@@ -287,6 +260,7 @@ mod tests {
     const READ: &str = "file_read";
     const WRITE: &str = "file_write";
     const PAGER: &str = "tool_output";
+    const CODE: &str = "code";
     const CALL: &str = "profile-call";
     const OK: &str = "completed";
     const PLAN_PATH: &str = "plan.md";
@@ -320,6 +294,7 @@ mod tests {
             (READ, ToolEffect::ReadOnly),
             (WRITE, ToolEffect::Mutating),
             (PAGER, ToolEffect::ReadOnly),
+            (CODE, ToolEffect::ReadOnly),
         ] {
             registry
                 .register_audited(
@@ -332,28 +307,24 @@ mod tests {
         registry
     }
 
-    #[test_case(ProfileToolExposure::Eager, false; "explicit_eager")]
-    #[test_case(ProfileToolExposure::Lazy, true; "explicit_lazy")]
-    fn explicit_loading_overrides_legacy(exposure: ProfileToolExposure, lazy: bool) {
+    #[test_case(ToolFilter::All, json!({"default":"disabled"}); "profile_default_disabled")]
+    #[test_case(ToolFilter::Only(Vec::new()), json!({}); "empty_allow_list")]
+    #[test_case(ToolFilter::AllExcept(vec![CODE.into(), READ.into()]), json!({}); "disabled_list")]
+    fn code_is_declared_whatever_the_filters_say(filter: ToolFilter, policy: Value) {
         let registry = registry();
-        let mut policy = ProfileToolPolicy::default();
-        policy.overrides.insert(READ.into(), exposure);
         let split = registry.definitions_split_with_policy(
             &Vars::new(),
             &DescriptionContext {
-                filter: &ToolFilter::All,
+                filter: &filter,
                 audience: ToolAudience::MAIN,
                 workflows_available: false,
             },
             false,
-            if lazy { &[] } else { &[READ] },
-            &policy,
+            &profile(policy),
             false,
         );
-        assert_eq!(
-            split.deferred.iter().any(|tool| tool.name.as_ref() == READ),
-            lazy
-        );
+        assert!(split.available_filter().matches(CODE));
+        assert!(!split.available_filter().matches(READ));
     }
 
     /// `bound` is the session binding a main agent carries or a task inherits.
@@ -392,7 +363,7 @@ mod tests {
         ctx.profile_tool_policy = profile(json!({"default":"eager"}));
         let mut definitions = ToolDefinitions {
             declared: json!([{"name":super::PLAN_TOOL_NAME,"input_schema":{"type":"object"}}]),
-            deferred: Vec::new(),
+            hosted: Vec::new(),
         };
         super::configure_definitions(&mut definitions, &ctx);
 
@@ -510,18 +481,17 @@ mod tests {
             )]
             .into(),
         );
-        ctx.profile_tool_policy = profile(json!({"default":"lazy"}));
+        ctx.profile_tool_policy = profile(json!({"default":"eager"}));
         if blocked {
             ctx.tool_ceiling = ToolFilter::Only(Vec::new());
         }
         let mut definitions = ToolDefinitions {
             declared: json!([{"name":CUSTOM,"input_schema":{"type":"object"}}]),
-            deferred: Vec::new(),
+            hosted: Vec::new(),
         };
         super::configure_definitions(&mut definitions, &ctx);
         assert_eq!(definitions.available_filter().matches(CUSTOM), !blocked);
         assert_eq!(ctx.tool_available(CUSTOM), !blocked);
-        assert_eq!(definitions.deferred.len(), usize::from(!blocked));
     }
 
     #[test_case(false; "trusted_pager")]
@@ -550,11 +520,11 @@ mod tests {
     }
 
     #[test]
-    fn readonly_loader_discovers_only_safe_eligible_bindings() {
+    fn readonly_dispatch_runs_only_safe_eligible_bindings() {
         smol::block_on(async {
             let mut ctx = stub_ctx(&AgentMode::ReadOnly);
             ctx.registry = registry();
-            ctx.profile_tool_policy = profile(json!({"default":"lazy"}));
+            ctx.profile_tool_policy = profile(json!({"default":"eager"}));
             ctx.tool_filter = ToolFilter::All.for_mode(&ctx.mode);
             let split = ctx.registry.definitions_split_with_policy(
                 &Vars::new(),
@@ -564,26 +534,10 @@ mod tests {
                     workflows_available: false,
                 },
                 false,
-                &[],
                 &ctx.profile_tool_policy,
                 ctx.has_session_plan(),
             );
             assert!(!split.available_filter().matches(WRITE));
-            ctx.deferral = Some(DeferralSession::new(
-                split.deferred,
-                [Arc::from(WRITE)].into_iter(),
-            ));
-            let found = tool_dispatch::run(
-                &ctx.registry,
-                ctx.mcp.as_ref(),
-                CALL.into(),
-                TOOL_SEARCH_TOOL_NAME,
-                &json!({"query":CUSTOM}),
-                &ctx,
-                Emit::Silent,
-            )
-            .await;
-            assert!(!found.is_error, "{}", found.output.as_text());
             let read = tool_dispatch::run(
                 &ctx.registry,
                 ctx.mcp.as_ref(),

@@ -1,24 +1,53 @@
 ---
 title: "Code"
-description: "The code tool: Python snippets for computation, search over past conversations, MCP servers, and decision helpers."
+description: "The code tool: Python snippets for computation and the modules they reach, from past conversations and MCP servers to images, workflows, and the decision engine."
 ---
 
-The model has one tool for running Python, `code`. A snippet computes, reshapes data, and reaches what the session connects it to: the [stored history](#search-past-conversations) of your conversations, your [MCP servers](/docs/mcp/#code-mode), and, with a decision endpoint active, the [decision helpers](#decisions-and-reranking). It filters and summarises before anything reaches the model, so a search over hundreds of results can come back as three lines.
+The model has one tool for running Python, `code`. A snippet computes, reshapes data, and reaches what the session connects it to through [modules](#modules): the [stored history](#search-past-conversations) of your conversations, your [MCP servers](/docs/mcp/#code-mode), [image generation, the host description, workflows, and automations](#tools-reached-from-code), and the [decision engine](#decisions-and-reranking). It filters and summarises before anything reaches the model, so a search over hundreds of results can come back as three lines.
 
 ```python
 hits = await history.search("flaky retry test", since="2026-09-01")
 [(hit["when"], hit["title"], hit["snippet"]) for hit in hits["hits"][:3]]
 ```
 
-`code` is offered in every session, with or without MCP servers. Its definition never changes, so connecting a server, switching decision endpoints, or switching to plan mode leaves the [prompt cache](/docs/configuration/#the-prompt-cache) intact. The [Tools](/docs/tools/#code) page lists its parameters.
+`code` is offered in every session and cannot be turned off. Its definition never changes, so connecting a server, signing in, switching decision endpoints, or switching to plan mode leaves the [prompt cache](/docs/configuration/#the-prompt-cache) intact. The [Tools](/docs/tools/#code) page lists its parameters.
 
 ## Snippets
 
 A snippet is module code rather than a function body. Its last expression is the result, and the model receives it together with anything the snippet printed. Top-level `await` works. `return` at the top level is a mistake, and Caudra drops it from a last line, as [Results and errors](/docs/mcp/#results-and-errors) describes along with its other repairs.
 
-A snippet that calls nothing outside the interpreter has nothing to ask about, so it runs without a prompt. Each call it makes to `history`, an MCP server, or a decision helper is [reviewed on its own](#permissions). A failed call raises `RuntimeError` and a refused one raises `PermissionError`, and the snippet can catch either and carry on. Calls that ran before a failure keep their effects.
+A snippet that calls nothing outside the interpreter has nothing to ask about, so it runs without a prompt. Each call it makes to a module is [reviewed on its own](#permissions). A failed call raises `RuntimeError` and a refused one raises `PermissionError`, and the snippet can catch either and carry on. Calls that ran before a failure keep their effects.
 
 Up to 8 calls run at once, and one run makes at most 100. Run independent calls together with `asyncio.gather`.
+
+## Modules
+
+A module is a namespace of calls that reach beyond the interpreter. Each call is a function to `await`, unless its help says otherwise.
+
+| Module | Calls |
+|---|---|
+| `history` | `search`, `read`, `sessions`: [past conversations](#search-past-conversations) |
+| `mcp` | `search`, `servers`, `resources`, `read_resource`. Each MCP server is also a namespace of its own, such as `github` |
+| `decisions` | `decide`, `rerank`: [judgements from the decision engine](#decisions-and-reranking) |
+| `image` | `generate`: a raster image, as [Image generation](#image-generation) describes |
+| `host` | `environment`: what the machine commands run on offers |
+| `workflow` | `list`, `validate`, `start`, `status`, `inspect`, `history`, `pause`, `resume`, `stop` |
+| `automation` | `list`, `validate`, `history` |
+
+`help` is the one other name a snippet starts with. The `code` description carries one line per module, and `help` loads the rest when the model needs it:
+
+```python
+help()                    # every module, and whether this session can reach it now
+help("workflow")          # a module's page with every call's signature
+help("image.generate")    # one call's full reference
+help("github")            # an MCP server's tools and their signatures
+```
+
+A module the session cannot reach still exists, so a snippet reads the same everywhere. Its calls raise `RuntimeError` with the fix, such as signing in or enabling a tool group, and `help()` lists the same reason.
+
+## Run time
+
+A run stops after `timeoutSec` seconds, 120 by default and at most 3600, counted on the wall clock across computation, waits, and calls. The model raises it for a snippet that polls. A run that times out keeps the rows of the calls it made and the variables from before it ran. What it printed and assigned is lost, and the model reads that it ran past `timeoutSec`.
 
 ## Variables between runs
 
@@ -26,7 +55,17 @@ Variables that a run defines are still there in the next run of the same agent. 
 
 ## The Python subset
 
-Snippets run in a Python subset on the bundled Monty worker. There is no filesystem, network, subprocess, class inheritance, or third-party package. Host clocks, unseeded randomness, and sleep are refused. The standard modules are `asyncio`, `base64`, `binascii`, `collections`, `copy`, `dataclasses`, `datetime`, `functools`, `itertools`, `json`, `math`, `os`, `pathlib`, `random`, `re`, `sys`, `time`, `typing`, and `unicodedata`.
+Snippets run in a Python subset on the bundled Monty worker. There is no filesystem, network, subprocess, class inheritance, or third-party package, and unseeded randomness is refused. The standard modules are `asyncio`, `base64`, `binascii`, `bisect`, `collections`, `copy`, `csv`, `dataclasses`, `datetime`, `functools`, `hashlib`, `itertools`, `json`, `math`, `os`, `pathlib`, `posixpath`, `random`, `re`, `sys`, `time`, `tomllib`, `typing`, and `unicodedata`.
+
+Clocks read the host clock: `time.time()`, `time.monotonic()`, `time.perf_counter()`, and `datetime.now()` answer, and the time zone is UTC. `time.sleep()` and `await asyncio.sleep()` wait for real, up to the run's `timeoutSec`. `asyncio.sleep()` runs beside calls gathered with it, so a snippet can poll:
+
+```python
+import asyncio
+while (await workflow.status(run_id))["status"] == "active":
+    await asyncio.sleep(10)
+```
+
+While a snippet waits, its card notes it, such as `waiting 10s`. `Esc` stops a wait at once. The Workcell `code` tool outside Caudra still refuses clocks and sleep.
 
 Before a snippet runs, it is type-checked against the signatures of what it calls. Type checking can reject `map`, `filter`, `getattr`, `setattr`, `hasattr`, and `format`, so comprehensions and f-strings work better.
 
@@ -38,7 +77,7 @@ Snippets always run on this machine, even when the session's other tools run on 
 >
 > **Snippets run in a worker process of their own, not inside Caudra.** The worker has no filesystem, network, subprocess, or environment access. A snippet reaches the outside only through the calls Caudra answers, and each call passes a permission check. A snippet that crashes the worker ends only that process, and Caudra starts a new one. This is process isolation rather than an operating-system boundary: the worker runs as your user.
 
-A run has 30 seconds of computation. The clock stops while the snippet waits for a call, so a snippet that waits on slow servers still gets its full 30 seconds of its own work. A runaway loop stops when the time is up.
+A run has 30 seconds of computation. The clock stops while the snippet waits for a call or sleeps, so a snippet that waits on slow servers still gets its full 30 seconds of its own work. A runaway loop stops when the time is up. [`timeoutSec`](#run-time) bounds the whole run on top of that.
 
 One agent's runs go one at a time, because they share the agent's variables. To run work in parallel, the model gathers it inside one snippet. A `code` call also waits until the model's response is complete before it starts, even when other tools start while the response streams. A response that is retried or abandoned therefore never leaves a run behind.
 
@@ -46,7 +85,7 @@ Release builds, Nix, and `make install` from a checkout bundle the worker. A bui
 
 ## In the transcript
 
-A `code` card shows the snippet, numbered and highlighted as Python. Below it comes a row for each call the snippet made, labelled like `history › search` or `github › list_issues` with its status, then what the snippet printed, the value it returned, and why it stopped when it did not finish. The rows fill in while the snippet runs. A [Home Assistant](/docs/mcp/#home-assistant) or [Executor](/docs/mcp/#executor) row shows its call's card without a click, and a click folds it. Opening any other row shows that call's own card. Output that runs long scrolls in a window of [`ui.scroll_card_lines`](/docs/configuration/#ui) rows, like a `shell` card. MCP call cards are described in [Results in the transcript](/docs/mcp/#results-in-the-transcript).
+A `code` card shows the snippet, numbered and highlighted as Python. Below it comes a row for each call the snippet made, labelled like `history › search` or `github › list_issues` with its status, then what the snippet printed, the value it returned, and why it stopped when it did not finish. The rows fill in while the snippet runs. A [Home Assistant](/docs/mcp/#home-assistant) or [Executor](/docs/mcp/#executor) row shows its call's card without a click, and a click folds it. Opening any other row shows that call's own card. A row for a [tool reached from `code`](#tools-reached-from-code) opens to the card the tool draws on its own, such as the image thumbnail of `image.generate`. Output that runs long scrolls in a window of [`ui.scroll_card_lines`](/docs/configuration/#ui) rows, like a `shell` card. MCP call cards are described in [Results in the transcript](/docs/mcp/#results-in-the-transcript).
 
 ## Search past conversations
 
@@ -147,29 +186,29 @@ issues = await github.list_issues(owner="caudra", repo="caudra")
 [issue["title"] for issue in issues if issue["comments"] > 10]
 ```
 
-The model learns the servers and their tools from a `# MCP servers` reminder, and `search()` finds the tools the reminder leaves out. [Code mode](/docs/mcp/#code-mode) covers the server list, calls, results, resources, and naming. A server named after a module, such as `history`, gets a trailing `_`: `history_`.
+The model learns the servers and their tools from a `# MCP servers` reminder, and `mcp.search()` finds the tools the reminder leaves out. [Code mode](/docs/mcp/#code-mode) covers the server list, calls, results, resources, and naming. A server named after a module, such as `history`, gets a trailing `_`: `history_`.
 
 ## Decisions and reranking
 
-With a [decision endpoint](/docs/providers/#decision-endpoints) active, snippets get two more functions, `decide()` and `rerank()`. They work on what a snippet gathered: a snippet calls a server or searches history, then judges, filters, or sorts the result before any of it reaches the model, or branches on a judgement without another round trip.
+With a [decision endpoint](/docs/providers/#decision-endpoints) active, the `decisions` module answers `decisions.decide()` and `decisions.rerank()`. They work on what a snippet gathered: a snippet calls a server or searches history, then judges, filters, or sorts the result before any of it reaches the model, or branches on a judgement without another round trip.
 
 ```python
 issues = await github.list_issues(owner="caudra", repo="caudra", state="open")
 titles = [issue["title"] for issue in issues]
-ranked = await rerank("crashes when saving a file", titles, threshold=0.5, top_k=10)
+ranked = await decisions.rerank("crashes when saving a file", titles, threshold=0.5, top_k=10)
 [issues[entry["index"]]["number"] for entry in ranked]
 ```
 
 | Function | What it returns |
 |---|---|
-| `await decide(input, questions, model=None, timeout_ms=None)` | `{"model", "answers", "by_name"}`: typed answers about `input` |
-| `await rerank(query, candidates, threshold=None, top_k=None, model=None, timeout_ms=None)` | `[{"index", "score"}]`: the candidates relevant to `query`, best first |
+| `await decisions.decide(input, questions, model=None, timeout_ms=None)` | `{"model", "answers", "by_name"}`: typed answers about `input` |
+| `await decisions.rerank(query, candidates, threshold=None, top_k=None, model=None, timeout_ms=None)` | `[{"index", "score"}]`: the candidates relevant to `query`, best first |
 
 `decide()` takes the same questions as a workflow's [`decide()`](/docs/workflows/#typed-decisions): a list of `predicate`, `choice`, and `score` questions in the shape of OpenAI Decisions, each with a `name`. `input` is the state the questions are about, and it must stay within 1,500 bytes as JSON. Read an answer by its question's name, as in `result["by_name"]["urgent"]["probability"]`.
 
 `rerank()` judges up to 256 candidates, each a string or a small dict. `index` is a candidate's position in `candidates`, and `score` is the probability that it is relevant. `threshold` drops candidates below it, and `top_k` keeps at most that many. Candidates go out 16 to a request, with up to 4 requests at once. Each request waits up to [`rerank_timeout_ms`](/docs/configuration/#decisions), like Caudra's own reranking, unless the call passes a shorter `timeout_ms`. A `decide()` call waits up to `timeout_ms` from the configuration. An empty list returns `[]` without a request.
 
-The model learns about both functions from the `# MCP servers` reminder, which describes them while an endpoint is active, with or without servers. Without one they do not exist, and a snippet that calls one raises `NameError`.
+The model learns how to use both from the `# MCP servers` reminder, which describes them while an endpoint is active, with or without servers. Without an endpoint, a call raises `RuntimeError` that names `/decision-model`.
 
 The reminder also tells the model how to get reliable answers, following the habits of Caudra's own question sets:
 
@@ -184,6 +223,25 @@ A call needs no approval and works in plan mode, since it only reads. A malforme
 
 The card shows each call as a row. A `decide()` row lists its verdicts, such as `severity high 82.4% · parser_bug yes 91.0%`, and a `rerank()` row says how many candidates it kept and names the best one. Both rows always show in full: a `decide()` row shows each question with a bar for every option. The likeliest option is highlighted, and a winner below 60% is marked uncertain alongside the runner-up. A `rerank()` row shows the candidates it kept, best first, each with its score and the label it was given. Click the row's footer to switch to the JSON the snippet received, and click it again to go back. Selecting any part of either view copies that JSON whole.
 
+## Tools reached from `code`
+
+Four built-in tools are not offered to the model on their own. The model calls them as module calls, which keeps them out of every request until they are needed:
+
+| Call | Runs the tool |
+|---|---|
+| `await image.generate(prompt, out, quality=None, size=None, images=None)` | `image_generate` |
+| `await host.environment()` | `execution_environment` |
+| `await workflow.<action>(...)` | `workflow` |
+| `await automation.<action>(...)` | `automation` |
+
+A module call runs its tool exactly as a direct call did. The tool keeps its permission rules, its [tool group](/docs/system-prompts/#tool-groups), plan mode and read-only checks, change records, [usage](/docs/context/#inspect-the-active-window) under its own name, and its card. `host.environment()` describes the machine the session's commands run on, a [remote Workcell](/docs/remote-workspaces/) included. The snippet receives a dict: the saved `path` of an image, the host's facts and commands, or the workflow and automation runtime's own records.
+
+A direct call of one of these tools, on its own or inside `batch`, fails with the module call to use instead.
+
+### Image generation
+
+`image.generate()` needs a ChatGPT subscription login (`caudra auth login openai`) and bills against that plan. It saves one PNG per call and never overwrites a local file, so read the returned `path`. `help("image.generate")` lists the size rules and how to pass reference images.
+
 ## Permissions
 
 Starting a run never asks: the `code` tool is allowed by default, because a snippet on its own reaches nothing. What the snippet calls is reviewed call by call:
@@ -194,6 +252,8 @@ Starting a run never asks: the `code` tool is allowed by default, because a snip
 | `read_resource()` | Asks, scoped to the server and URI. `resources()` never asks |
 | `history` in the current project | Allowed |
 | `history` in another project, or `scope="all"` | Asks, as [Privacy and permissions](#privacy-and-permissions) describes |
-| `decide()`, `rerank()` | Allowed |
+| `decisions.decide()`, `decisions.rerank()` | Allowed |
+| `image`, `host`, `workflow`, `automation` | Under the rules of the tool the call runs, such as `image_generate`. The prompt shows the call as the snippet made it |
+| `help()`, `mcp.search()`, `mcp.servers()` | Allowed |
 
-A deny rule for `code` itself blocks every run.
+A deny rule for `code` itself blocks every run. `code` cannot be disabled with `disabled_tools` or a profile, because the modules live in it. Turn off a module's [tool group](/docs/system-prompts/#tool-groups) instead.

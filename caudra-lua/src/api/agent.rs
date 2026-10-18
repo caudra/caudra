@@ -234,16 +234,11 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
         &vars,
         &ctx_desc,
         model.supports_tool_examples(),
-        &[],
         &agent.profile_tool_policy,
         agent.has_session_plan(),
     );
-    let mut defs = definitions.declared;
-    if let Some(defs) = defs.as_array_mut() {
-        defs.extend(definitions.deferred.into_iter().map(|tool| tool.definition));
-    }
 
-    Ok((Some(json_to_lua(&lua, &defs)?), None))
+    Ok((Some(json_to_lua(&lua, &definitions.declared)?), None))
 }
 
 /// Run a tool by name and wait for the result. This is how you call built-in
@@ -996,7 +991,7 @@ mod tests {
         .into();
         let mut definitions = ToolDefinitions {
             declared: json!([]),
-            deferred: Vec::new(),
+            hosted: Vec::new(),
         };
         append_local_definitions(
             &mut definitions,
@@ -1009,7 +1004,6 @@ mod tests {
             definitions.declared.as_array().unwrap().len(),
             usize::from(task_mode.is_some())
         );
-        assert!(definitions.deferred.is_empty());
         let done = smol::block_on(tool_dispatch::run(
             &ctx.registry,
             None,

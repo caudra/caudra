@@ -13,11 +13,12 @@ use caudra_automation::snapshot::{
     FiringSummary, WaitReason,
 };
 use jiff::Timestamp;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::automation::catalog::AutomationDirs;
 use crate::automation::handle::AutomationHandle;
 use crate::automation::manager::spelled;
+use crate::code::hosted::HostedCall;
 use crate::tools::registry::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolFailure,
     ToolInvocation,
@@ -42,6 +43,9 @@ const ACTION_FIELD: &str = "action";
 const NAME_FIELD: &str = "name";
 const FIRE_ID_FIELD: &str = "fire_id";
 const LIMIT_FIELD: &str = "limit";
+const AUTOMATIONS_FIELD: &str = "automations";
+const PROJECT_DIR_FIELD: &str = "project_dir";
+const USER_DIR_FIELD: &str = "user_dir";
 const ACTION_LIST: &str = "list";
 const ACTION_VALIDATE: &str = "validate";
 const ACTION_HISTORY: &str = "history";
@@ -182,7 +186,7 @@ impl ToolInvocation for AutomationCall {
             else {
                 return error(ToolFailure::Other, UNAVAILABLE.to_owned());
             };
-            render(&handle, self.request).await
+            render(&handle, self.request, ctx.hosted.as_ref()).await
         })
     }
 }
@@ -234,10 +238,26 @@ fn header(request: &AutomationRequest) -> String {
     }
 }
 
-async fn render(handle: &AutomationHandle, request: AutomationRequest) -> ToolExecResult {
-    match handle.request(request).await {
+async fn render(
+    handle: &AutomationHandle,
+    request: AutomationRequest,
+    hosted: Option<&HostedCall>,
+) -> ToolExecResult {
+    let answer = handle.request(request).await;
+    if let (Some(hosted), Ok(answer)) = (hosted, &answer) {
+        hosted.offer_detail(answer);
+    }
+    match answer {
         Ok(AutomationResponse::Automations(automations)) => {
-            plain(render_list(&automations, handle.directories()))
+            let directories = handle.directories();
+            if let Some(hosted) = hosted {
+                hosted.offer(json!({
+                    AUTOMATIONS_FIELD: automations,
+                    PROJECT_DIR_FIELD: directories.project,
+                    USER_DIR_FIELD: directories.user,
+                }));
+            }
+            plain(render_list(&automations, directories))
         }
         Ok(AutomationResponse::Validation { name, ok, report }) => {
             let verdict = if ok { VALID } else { INVALID };

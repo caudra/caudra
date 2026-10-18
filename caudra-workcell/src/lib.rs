@@ -4782,6 +4782,7 @@ mod tests {
     use caudra_agent::agent::tool_dispatch::{self, Emit};
     use caudra_agent::background::{BackgroundTasks, JobScope, ShellLive};
     use caudra_agent::cancel::CancelToken;
+    use caudra_agent::code::hosted::HostedCall;
     use caudra_agent::code::runner::ScriptRunner;
     use caudra_agent::code::runner::{
         ReplLease, ReplSlot, ScriptCall, ScriptHost, ScriptInvocation, ScriptName, ScriptRun,
@@ -4799,7 +4800,7 @@ mod tests {
         review::{COMMAND_TEMPLATE_EXECUTION_NOTICE, review_for_rule},
     };
     use caudra_agent::template::Vars;
-    use caudra_agent::tools::execution::configure_tools;
+    use caudra_agent::tools::execution::configure_declared;
     use caudra_agent::tools::{
         Deadline, FileReadTracker, PLAN_WRITE_RESTRICTED, READ_ONLY_TOOL_RESTRICTED,
         STALE_READ_MSG, interpreter_ctx,
@@ -4916,6 +4917,8 @@ mod tests {
     /// rendering that ever approached that would have stopped being one.
     const ENVIRONMENT_MAX_MODEL_LINES: usize = 40;
     const ENVIRONMENT_TOOL: &str = "execution_environment";
+    /// The module call that runs the tool: dispatch refuses it called directly.
+    const ENVIRONMENT_CALL: &str = "host.environment()";
     const STATE_DIRECTORY: &str = "state";
     const PLAN_FILE: &str = "plan.md";
     const REMOTE_ENVIRONMENT_MODEL_TEXT: &str = "authoritative remote environment text";
@@ -5148,21 +5151,15 @@ mod tests {
                     workflows_available: false,
                 },
                 false,
-                &[SHELL_TOOL_NAME],
             );
-            configure_tools(
-                &mut definitions.declared,
-                &mut definitions.deferred,
-                &config,
-                false,
-                supported,
-            );
+            configure_declared(&mut definitions.declared, &config, false, supported);
+            let declared = definitions.declared.as_array().unwrap();
             let Some(effective) = mode.effective(supported) else {
-                assert!(definitions.deferred.is_empty());
+                assert!(declared.is_empty());
                 continue;
             };
-            assert_eq!(definitions.deferred.len(), 1);
-            let definition = &definitions.deferred[0].definition;
+            assert_eq!(declared.len(), 1);
+            let definition = &declared[0];
             assert_eq!(definition["input_schema"], original_schema);
             assert!(
                 definition["input_schema"]["properties"]
@@ -9219,7 +9216,7 @@ mod tests {
         permissions.set_seed_mode(permission_mode);
         let (tx, events) = flume::unbounded::<Envelope>();
         let (_responses, responses) = flume::unbounded();
-        let ctx = interpreter_ctx(
+        let mut ctx = interpreter_ctx(
             &mode,
             &EventSender::new(tx, 0),
             CancelToken::none(),
@@ -9230,6 +9227,10 @@ mod tests {
                 .then(|| Arc::new(AsyncMutex::new(responses))),
             Arc::clone(&registry),
         );
+        ctx.hosted = Some(HostedCall::new(
+            ENVIRONMENT_TOOL,
+            ENVIRONMENT_CALL.to_owned(),
+        ));
         let mut prompts = Vec::new();
         let done = smol::block_on(future::or(
             tool_dispatch::run(

@@ -88,7 +88,6 @@ pub enum DecisionFeature {
     ShellEffect,
     ContentScreening,
     ShellDuration,
-    ToolSearch,
     SkillSuggestions,
     GoalPrescreen,
     SubagentRouting,
@@ -104,13 +103,12 @@ pub enum DecisionFeature {
 
 impl DecisionFeature {
     /// Configured features in `[decisions.features]` order, then the script callers.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 18] = [
         Self::PermissionAdvice,
         Self::AutoScreening,
         Self::ShellEffect,
         Self::ContentScreening,
         Self::ShellDuration,
-        Self::ToolSearch,
         Self::SkillSuggestions,
         Self::GoalPrescreen,
         Self::SubagentRouting,
@@ -137,7 +135,6 @@ impl DecisionFeature {
             Self::ShellEffect => "shell_effect",
             Self::ContentScreening => "content",
             Self::ShellDuration => "shell_duration",
-            Self::ToolSearch => "tool_search",
             Self::SkillSuggestions => "skill_suggestions",
             Self::GoalPrescreen => "goal",
             Self::SubagentRouting => "subagent_routing",
@@ -163,7 +160,6 @@ impl DecisionFeature {
             Self::ShellEffect => Some("shell_effect"),
             Self::ContentScreening => Some("content_screening"),
             Self::ShellDuration => Some("shell_duration"),
-            Self::ToolSearch => Some("tool_search"),
             Self::SkillSuggestions => Some("skill_suggestions"),
             Self::GoalPrescreen => Some("goal_prescreen"),
             Self::SubagentRouting => Some("subagent_routing"),
@@ -205,7 +201,6 @@ impl DecisionFeature {
             Self::ShellEffect => &features.shell_effect,
             Self::ContentScreening => &features.content_screening,
             Self::ShellDuration => &features.shell_duration,
-            Self::ToolSearch => &features.tool_search,
             Self::SkillSuggestions => &features.skill_suggestions,
             Self::GoalPrescreen => &features.goal_prescreen,
             Self::SubagentRouting => &features.subagent_routing,
@@ -226,8 +221,7 @@ impl DecisionFeature {
     pub fn timeout_ms(&self, config: &DecisionsConfig) -> u64 {
         match self {
             Self::Workflow | Self::Code => config.timeout_ms.max(config.rerank_timeout_ms),
-            Self::ToolSearch
-            | Self::MemorySearch
+            Self::MemorySearch
             | Self::HistorySearch
             | Self::MemoryDuplicates
             | Self::CompactionRetention
@@ -263,8 +257,7 @@ impl DecisionFeature {
     /// confidence for advice.
     pub fn rerank_threshold(&self, thresholds: &DecisionThresholds) -> Option<f64> {
         match self {
-            Self::ToolSearch
-            | Self::MemorySearch
+            Self::MemorySearch
             | Self::HistorySearch
             | Self::CompactionRetention
             | Self::SourceCodeContext => Some(thresholds.relevance_floor),
@@ -1791,7 +1784,6 @@ mod tests {
     #[test_case(DecisionFeature::AutoScreening, false; "auto_screening")]
     #[test_case(DecisionFeature::QuestionToolNudge, false; "question_tool_nudge")]
     #[test_case(DecisionFeature::MemoryRecall, false; "memory_recall_delays_the_turn")]
-    #[test_case(DecisionFeature::ToolSearch, true; "tool_search")]
     #[test_case(DecisionFeature::MemorySearch, true; "memory_search")]
     #[test_case(DecisionFeature::HistorySearch, true; "history_search")]
     #[test_case(DecisionFeature::MemoryDuplicates, true; "memory_duplicates")]
@@ -1846,7 +1838,6 @@ mod tests {
     #[test_case(DecisionFeature::MemorySearch, Some(RELEVANCE_FLOOR); "enforcing_rerank_uses_the_floor")]
     #[test_case(DecisionFeature::SourceCodeContext, Some(RELEVANCE_FLOOR); "source_code_context_uses_the_floor")]
     #[test_case(DecisionFeature::HistorySearch, Some(RELEVANCE_FLOOR); "history_search_uses_the_floor")]
-    #[test_case(DecisionFeature::ToolSearch, Some(RELEVANCE_FLOOR); "tool_search_uses_the_floor")]
     #[test_case(DecisionFeature::OutputPointers, Some(ROUTING_CONFIDENCE); "advice_uses_routing_confidence")]
     #[test_case(DecisionFeature::SkillSuggestions, None; "choice_features_keep_the_default")]
     fn rerank_stats_score_candidates_at_the_acting_threshold(

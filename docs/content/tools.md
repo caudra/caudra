@@ -3,7 +3,7 @@ title: "Tools"
 description: "Every built-in tool and its parameters."
 ---
 
-Caudra ships with 32 built-in tools in this reference (32 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Caudra ships with 28 built-in tools in this reference (28 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 First-party file, web, shell, index, Python, and environment tools run through protocol-neutral Workcell contracts. Workcell owns schemas, validation, execution bounds, atomic file changes, network policy, subprocess cleanup, cancellation, and the bundled worker lifecycle. Caudra owns registration, authorization, retained session output, and model or UI presentation. Release builds pin an exact Workcell revision.
 
@@ -34,23 +34,18 @@ disabled_tools = ["shell", "file_write", "github.*"]
 
 Run [`caudra tools`](/docs/cli/) to see the resulting set, including which rule turned each tool off, or `/tools` inside a session for a [mode-aware inventory](/docs/context/#inspect-the-active-window). To keep a tool available but gate every call, use a `deny` or `prompt` default in [Permissions](/docs/permissions/) instead.
 
-[System prompt profiles](/docs/system-prompts/#choose-tool-availability) can make eligible tools eager, lazy, or disabled for one actor. Pass `--system-prompt-profile NAME` to `caudra tools` or `caudra prompt --tools` to inspect that profile. A profile cannot re-enable tools excluded by config, CLI flags, experimental feature gates, mode, or runtime requirements.
+[System prompt profiles](/docs/system-prompts/#choose-tool-availability) can make eligible tools eager or disabled for one actor. Pass `--system-prompt-profile NAME` to `caudra tools` or `caudra prompt --tools` to inspect that profile. A profile cannot re-enable tools excluded by config, CLI flags, experimental feature gates, mode, or runtime requirements.
 
-## Tools loaded on demand
+## Reached from `code`
 
-The default loading policy lets 4 built-in tools start outside the request array. The model sees a `tool_search` entry instead, and one call with a query loads the best-matching tool for the rest of the session. Sessions that never need them never pay for their descriptions. An explicit profile policy can make other native, local or remote Workcell, Lua/plugin, or local callback tools lazy too. A lazy MCP tool stays out of the [server list](/docs/mcp/#code-mode) and is found with `search()` inside `code`. A known-name direct call to an eligible lazy tool is valid and loads its schema. `tool_search` disappears when no eligible pending tools remain.
+Every tool the model can call is declared in the request upfront. These built-ins are not: a [`code`](/docs/code/#tools-reached-from-code) snippet calls them through a module, and a direct call is refused with the module call to make instead. They keep their permission keys, rules, and cards, so `agent.disabled_tools` and [Permissions](/docs/permissions/) treat them as before. Turn a module off with its tool's group, and [`caudra tools`](/docs/cli/) lists each one as `on` with the reason ``reached through a `code` module``.
 
-`execution_environment`, `image_generate`, `workflow`, and `automation` each load on their own.
-
-Loading changes the tool array, so the provider's prompt cache prefix resets and the next request re-reads the history as fresh input. Caudra posts a notice naming what loaded when it happens.
-
-### Which models defer
-
-That cache reset is why deferral depends on model supply. Caudra defers for every model recorded as small, whether marked **Small** or **Fast**, and for a model with no supply facts. A known non-small model takes the eligible tools upfront because it would spend a large prefix loading a tool it was likely to need.
-
-Declare `fast` and `best` under `purposes` in `providers.toml` to describe model supply ([Providers](/docs/providers/#supply-metadata)), or set `agent.defer_builtin_tools` to `always` or `never` to decide for every model ([Configuration](/docs/configuration/#agent)).
-
-Listing a tool in `--allowed-tools` asks for it upfront and skips the search unless the selected profile explicitly makes it lazy. [`caudra tools`](/docs/cli/) marks a deferred tool `lazy` and reports whether the choice came from the selected profile or the default loading policy.
+| Tool | Module call |
+|------|-------------|
+| `image_generate` | `await image.generate(prompt, out)` |
+| `execution_environment` | `await host.environment()` |
+| `workflow` | `await workflow.<action>(...)` |
+| `automation` | `await automation.<action>(...)` |
 
 ## File Operations
 
@@ -233,13 +228,7 @@ Enabled servers and their tools reach the model in a `# MCP servers` reminder, s
 |-----------|------|----------|-------------|
 | `code` | string | yes | Python to run. Top-level `await` works |
 | `reset` | boolean | no | Drop the variables earlier runs kept before running |
-
-### `execution_environment` <span class="badge">on demand</span> {#execution_environment}
-
-Inspect the execution host's current sanitized environment.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
+| `timeoutSec` | integer | no | Wall-clock deadline in seconds for the whole run, waits and calls included: 1 to 3600, default 120 |
 
 ### `question` {#question}
 
@@ -284,34 +273,6 @@ Inspect or control jobs visible to this owner. Actions: list, status, cancel. Li
 | `task_id` | string | no | Required except for list. |
 | `before` | object | no | History cursor returned as next by list. |
 | `limit` | integer | no |  |
-
-### `workflow` <span class="badge">experimental</span> <span class="badge">on demand</span> {#workflow}
-
-Run durable, multi-agent workflows: scripted plans that launch subagents in phases, keep a journal, and can be paused and resumed.
-
-Experimental and off by default. Turn it on with `workflows = true` under `[experimental]` in the global `caudra.toml`. See [Experimental features](/docs/configuration/#experimental-features).
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `action` | string | yes | What to do. |
-| `name` | string | no | Workflow name, for validate and start. |
-| `args` | any (JSON) | no | Object the script receives as `args` on start. |
-| `agent_budget` | integer | no | Most agents the run may launch, for start and resume. |
-| `run_id` | string | no | Run id, for status, inspect, pause, resume, and stop. |
-| `limit` | integer | no | Most runs a history answer lists. |
-
-### `automation` <span class="badge">experimental</span> <span class="badge">on demand</span> {#automation}
-
-Read this session's automations: short Rhai scripts that react to events in one session, such as the session going idle, a goal finishing, or a schedule coming due. Load the `caudra-automation-dev` skill before writing or debugging one.
-
-Experimental and off by default. Turn it on with `automations = true` under `[experimental]` in the global `caudra.toml`. See [Experimental features](/docs/configuration/#experimental-features).
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `action` | string | yes | What to do. |
-| `name` | string | no | Automation name: required for validate, and narrows history to one automation. |
-| `fire_id` | string | no | A firing of this session, for history: its event, actions and state patch. |
-| `limit` | integer | no | Most firings a history answer lists: 20 by default, at most 50. |
 
 ### `list_sessions` <span class="badge">experimental</span> {#list_sessions}
 
@@ -409,20 +370,6 @@ Load a skill that provides instructions and workflows for specific tasks.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `name` | string | yes | Name of the skill to load |
-
-## Media
-
-### `image_generate` <span class="badge">on demand</span> {#image_generate}
-
-Generate a raster image from a text prompt and save it as a PNG. Use for AI-created bitmap visuals: illustrations, textures, sprites, photos, and mockups. Requires a ChatGPT subscription login (`caudra auth login openai`) and bills against that plan, not API credits.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `prompt` | string | yes | Description of the image to generate. |
-| `out` | string | yes | Output file path, relative to the project directory unless absolute. Written as a PNG. |
-| `quality` | string | no | Generation quality. Defaults to auto. |
-| `size` | string | no | Image size, either `auto` or `WIDTHxHEIGHT`. Width and height must be multiples of 16, the long edge at most 3840, the long-to-short ratio at most 3:1, and the total between 655,360 and 8,294,400 pixels. |
-| `images` | array | no | Reference image paths, relative to the project directory unless absolute. |
 
 ## Web
 

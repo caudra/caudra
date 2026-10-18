@@ -41,8 +41,6 @@ pub struct ToolView {
     pub description: String,
     pub input_schema: Value,
     pub output_schema: Option<Value>,
-    /// Reachable through `search()` but never listed in the catalog.
-    pub search_only: bool,
 }
 
 /// A server's instructions as the catalog carries them: trimmed, and cut on a character

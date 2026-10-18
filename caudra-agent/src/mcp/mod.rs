@@ -451,6 +451,7 @@ struct ServerRef {
     transport: Arc<dyn McpTransport>,
     resources: bool,
     completions: bool,
+    kind: Option<McpServerKind>,
 }
 
 impl ToolIndex {
@@ -689,14 +690,12 @@ pub enum CompletionTarget {
     },
 }
 
-/// How one MCP tool reaches the model: listed in the `# MCP servers` reminder, found only
-/// through `search()`, or not at all.
+/// How one MCP tool reaches the model: listed in the `# MCP servers` reminder, or not at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpToolStatus {
     pub qualified_name: String,
     pub server: String,
     pub disabled: bool,
-    pub search_only: bool,
     pub reason: Option<&'static str>,
 }
 
@@ -899,13 +898,6 @@ impl McpSession {
         })
     }
 
-    /// A tool the profile loads lazily is reachable through `search()` but never listed.
-    pub fn is_search_only(&self, qualified_name: &str) -> bool {
-        self.profile
-            .exposure(qualified_name, ProfileToolSource::Mcp)
-            == Some(ProfileToolExposure::Lazy)
-    }
-
     pub fn with_profile_policy(
         mut self,
         profile: Arc<ProfileToolPolicy>,
@@ -969,10 +961,7 @@ impl McpSession {
                             descriptor.server == info.name
                                 && !self.is_disabled(&descriptor.qualified_name)
                         })
-                        .map(|descriptor| ToolView {
-                            search_only: self.is_search_only(&descriptor.qualified_name),
-                            ..descriptor.view.clone()
-                        })
+                        .map(|descriptor| descriptor.view.clone())
                         .collect(),
                     resources: snapshot
                         .resources_of(&info.name)
@@ -1010,7 +999,6 @@ impl McpSession {
                     qualified_name: name.to_string(),
                     server: descriptor.server.clone(),
                     disabled,
-                    search_only: !disabled && self.is_search_only(name),
                     reason,
                 }
             })
@@ -1172,6 +1160,11 @@ impl McpHandle {
             Arc::clone(&running.transport)
         };
         resources::read_resource(transport.as_ref(), uri, scope).await
+    }
+
+    /// The kind of the running `server`, when Caudra recognises it.
+    pub fn server_kind(&self, server: &str) -> Option<McpServerKind> {
+        self.index.load().servers.get(server)?.kind
     }
 
     pub async fn shutdown(&self) {
@@ -2031,8 +2024,8 @@ fn parse_entries(config: McpConfig, state_dir: Option<StateDir>) -> McpManagerIn
         });
     }
 
-    // Config maps are unordered; a stable order keeps the tool_search
-    // catalog and tools array byte-identical across runs (prompt cache).
+    // Config maps are unordered; a stable order keeps the MCP catalog
+    // byte-identical across runs (prompt cache).
     entries.sort_by(|a, b| a.name.cmp(&b.name));
 
     McpManagerInner {
@@ -2156,7 +2149,6 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
                         description: t.description.clone(),
                         input_schema: t.input_schema.clone(),
                         output_schema: t.meta.output_schema.clone(),
-                        search_only: false,
                     },
                 });
             }
@@ -2183,6 +2175,7 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
                     transport: Arc::clone(transport),
                     resources: offers_resources,
                     completions,
+                    kind: entry.kind(),
                 },
             );
             if offers_resources {
@@ -3121,21 +3114,6 @@ mod tests {
             input_schema: schema,
             meta: Arc::default(),
         }
-    }
-
-    #[test_case("eager", false; "explicit_eager")]
-    #[test_case("lazy", true; "explicit_lazy")]
-    fn a_lazy_profile_keeps_a_tool_searchable_but_unlisted(exposure: &str, search_only: bool) {
-        let profile =
-            Arc::new(serde_json::from_value(json!({"overrides":{"srv.*":exposure}})).unwrap());
-        let (_inner, session) = setup(vec![fake_entry("srv", FakeTransport::new())]);
-        let session = session.with_actor_policy(profile);
-        let [status] = session.tool_inventory().try_into().unwrap();
-        assert_eq!(
-            (status.disabled, status.search_only, status.reason),
-            (false, search_only, Some(PROFILE_LOADING))
-        );
-        assert_eq!(session.servers()[0].tools[0].search_only, search_only);
     }
 
     #[test_case(AgentMode::Build, false; "build")]

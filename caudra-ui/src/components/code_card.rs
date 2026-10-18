@@ -2,11 +2,12 @@
 //! opens to that call's own MCP card, then what the snippet printed, the value it ended on, and
 //! why it stopped when it did not finish.
 
+use caudra_agent::code::MODULE_DOCS;
 use caudra_agent::code::output::{CodeCall, CodeCallStatus, CodeOutcome, CodeOutput};
 use caudra_agent::tools::ToolEffect;
 use caudra_agent::{
-    BatchToolEntry, BatchToolStatus, MCP_SUMMARY_PREFIX, McpBlock, McpHelper, McpOutput,
-    ToolOutput, pretty_json,
+    BatchToolEntry, BatchToolStatus, DecisionHelper, MCP_SUMMARY_PREFIX, McpBlock, McpHelper,
+    McpOutput, ToolOutput, pretty_json,
 };
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -20,6 +21,7 @@ const RESULT_LABEL: &str = "Result";
 const DID_NOT_RUN: &str = "Did not run: ";
 const STOPPED: &str = "Stopped: ";
 const CANCELLED: &str = "Cancelled";
+const TIMED_OUT: &str = "Timed out after ";
 const KIND_SEPARATOR: &str = ": ";
 const REPAIRED: &str = "Repaired before running: ";
 const REPAIR_SEPARATOR: &str = ", ";
@@ -40,10 +42,32 @@ fn entry(call: &CodeCall) -> BatchToolEntry {
         CodeCallStatus::Success => BatchToolStatus::Success,
         CodeCallStatus::Error | CodeCallStatus::Refused => BatchToolStatus::Error,
     };
+    let refused = call.status == CodeCallStatus::Refused;
+    if let Some(hosted) = &call.hosted {
+        return BatchToolEntry {
+            summary: call.title.clone().unwrap_or_else(|| call.called_as.clone()),
+            tool: hosted.tool.clone(),
+            effect: hosted.effect,
+            status,
+            input: hosted.input.clone(),
+            raw_input: Some(call.input.clone()),
+            annotation: hosted.annotation.clone(),
+            output: hosted.output.clone().or_else(|| {
+                call.error
+                    .clone()
+                    .map(|error| ToolOutput::Plain(error.into()))
+            }),
+            model_suffix: None,
+            refused,
+            accounting: Default::default(),
+        };
+    }
     let output = shown_output(call);
+    let module_call = MODULE_DOCS.iter().any(|doc| doc.namespace == call.server);
     let summary = match call.helper {
-        Some(helper) => helper_summary(call, helper),
-        None => format!("{MCP_SUMMARY_PREFIX}{tool}"),
+        Some(McpHelper::Decision(helper)) => decision_summary(call, helper),
+        _ if module_call => call.title.clone().unwrap_or_else(|| call.called_as.clone()),
+        _ => format!("{MCP_SUMMARY_PREFIX}{tool}"),
     };
     BatchToolEntry {
         summary,
@@ -52,10 +76,13 @@ fn entry(call: &CodeCall) -> BatchToolEntry {
         status,
         input: None,
         raw_input: Some(call.input.clone()),
-        annotation: output.as_ref().and_then(ToolOutput::annotation),
+        annotation: output
+            .as_ref()
+            .filter(|_| !matches!(call.helper, Some(McpHelper::History(_))))
+            .and_then(ToolOutput::annotation),
         output,
         model_suffix: None,
-        refused: call.status == CodeCallStatus::Refused,
+        refused,
         accounting: Default::default(),
     }
 }
@@ -85,9 +112,9 @@ fn shown_output(call: &CodeCall) -> Option<ToolOutput> {
     }))
 }
 
-/// A helper row's line: the verdicts once it has answered, and the call as the snippet made it
+/// A decision row's line: the verdicts once it has answered, and the call as the snippet made it
 /// until then or when it failed.
-fn helper_summary(call: &CodeCall, helper: McpHelper) -> String {
+fn decision_summary(call: &CodeCall, helper: DecisionHelper) -> String {
     call.output
         .as_ref()
         .filter(|_| call.status == CodeCallStatus::Success)
@@ -144,6 +171,7 @@ fn failure(outcome: &CodeOutcome) -> Option<String> {
         CodeOutcome::Limited { message } => Some(format!("{STOPPED}{message}")),
         CodeOutcome::Unavailable { message } => Some(message.clone()),
         CodeOutcome::Cancelled => Some(CANCELLED.to_owned()),
+        CodeOutcome::TimedOut { after_secs } => Some(format!("{TIMED_OUT}{after_secs}s")),
     }
 }
 
@@ -154,7 +182,7 @@ fn label_line(text: &str, style: Style) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use caudra_agent::types::Answerer;
-    use caudra_agent::{ElicitAction, McpInteraction};
+    use caudra_agent::{ElicitAction, HistoryHelper, McpInteraction};
     use serde_json::json;
     use test_case::test_case;
 
@@ -259,6 +287,80 @@ mod tests {
             ),
             None => assert!(matches!(entry.output, Some(ToolOutput::Mcp(_)))),
         }
+    }
+
+    const HISTORY_CALL: &str = "history.sessions(\"project\")";
+
+    /// A history row opens to what it found, which its one summary line cannot count.
+    #[test]
+    fn a_history_row_opens_to_its_answer_without_a_line_count() {
+        let row = CodeCall {
+            server: "history".to_owned(),
+            tool: "sessions".to_owned(),
+            called_as: HISTORY_CALL.to_owned(),
+            helper: Some(McpHelper::History(HistoryHelper::Sessions)),
+            output: Some(McpOutput {
+                blocks: vec![McpBlock::Text {
+                    text: "1 session".to_owned(),
+                }],
+                structured: Some(json!([{"title": "t", "updated": "", "items": 1}])),
+                ..McpOutput::default()
+            }),
+            ..call(CodeCallStatus::Success, None)
+        };
+
+        let [entry] = entries(&CodeOutput {
+            calls: vec![row],
+            ..CodeOutput::default()
+        })
+        .try_into()
+        .unwrap();
+
+        assert_eq!(entry.summary, HISTORY_CALL);
+        assert_eq!(entry.annotation, None);
+        let Some(ToolOutput::Mcp(shown)) = entry.output else {
+            panic!("expected an MCP card");
+        };
+        assert_eq!(
+            shown.helper,
+            Some(McpHelper::History(HistoryHelper::Sessions))
+        );
+    }
+
+    const HOSTED_TOOL: &str = "image_generate";
+    const SAVED_PATH: &str = "fox.png";
+    const HOSTED_HEADER: &str = "generate fox.png";
+
+    /// A module call that ran a tool reads as that tool's own child row, restored from its saved
+    /// card, so a thumbnail draws as it would on its own.
+    #[test]
+    fn a_hosted_call_reads_as_its_tools_card() {
+        let stored = json!({
+            "server": "image",
+            "tool": "generate",
+            "called_as": "image.generate",
+            "title": HOSTED_HEADER,
+            "input": {"prompt": "a fox", "out": SAVED_PATH},
+            "status": "success",
+            "hosted": {
+                "tool": HOSTED_TOOL,
+                "output": serde_json::to_value(ToolOutput::SavedImage {
+                    path: SAVED_PATH.to_owned(),
+                    text: String::new(),
+                })
+                .unwrap(),
+            },
+        });
+        let call: CodeCall = serde_json::from_value(stored).unwrap();
+        let [entry] = entries(&CodeOutput {
+            calls: vec![call],
+            ..CodeOutput::default()
+        })
+        .try_into()
+        .unwrap();
+        assert_eq!(entry.tool, HOSTED_TOOL);
+        assert_eq!(entry.summary, HOSTED_HEADER);
+        assert!(matches!(entry.output, Some(ToolOutput::SavedImage { .. })));
     }
 
     #[test]

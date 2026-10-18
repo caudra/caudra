@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use caudra_agent::code::runner::{
     ReplNote, ReplState, RunFuture, ScriptCall, ScriptError, ScriptErrorKind, ScriptException,
@@ -23,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use workcell::CodeToolGroup;
 use workcell::code::{
     CodeConfiguration, CodeExecution, CodeHost, CodePools, HostCall, HostError, HostErrorKind,
-    HostInvocation, HostName, HostedState, Outcome, StateNote, WorkerSource,
+    HostInvocation, HostName, HostedState, Outcome, SleepFuture, StateNote, WorkerSource,
 };
 
 use crate::HostInner;
@@ -289,6 +290,11 @@ impl CodeHost for Bridge {
 
     fn stubs(&self) -> String {
         self.0.stubs()
+    }
+
+    fn sleep(&self, delay: Duration) -> SleepFuture {
+        let wait = self.0.sleep(delay);
+        Box::pin(async move { smol::spawn(wait).await })
     }
 }
 

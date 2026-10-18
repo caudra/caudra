@@ -493,6 +493,12 @@ impl PermissionRequest {
         }
         request
     }
+    /// Shows the call as its caller wrote it, such as a `code` module call, instead of the
+    /// tool's own summary.
+    pub fn with_action(mut self, action: &str) -> Self {
+        self.presentation.action = action_summary(action);
+        self
+    }
     #[allow(clippy::too_many_arguments)]
     fn from_parts(
         id: String,

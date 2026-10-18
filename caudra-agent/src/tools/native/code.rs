@@ -4,10 +4,11 @@
 
 use std::borrow::Cow;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::code::gateway;
+use crate::code::{MODULE_DOCS, gateway};
 use crate::tools::registry::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolEffect, ToolExecResult,
     ToolInvocation,
@@ -20,20 +21,21 @@ const SNIPPETS: &str = "Run Python in an isolated interpreter: compute, reshape 
 
 - A snippet is module code, not a function body: its last expression is the result, returned with anything printed. Do not use `return` at top level. Top-level `await` works. Filter and summarise in the snippet, and return only what you need.
 - Variables persist between runs; `reset: true` starts empty.";
-const HISTORY: &str = "- `history` searches the conversations stored on this machine, compacted parts and subagents included. `await history.search(\"query\", scope=\"project\", kinds=None, tools=None, since=None, until=None, sort=\"relevance\", rerank=None, limit=None, offset=0)` returns `{\"hits\": [{\"ref\", \"session\", \"title\", \"project\", \"when\", \"kind\", \"tool\", \"agent\", \"snippet\", \"score\"}], \"ranking\", \"judged_unrelated\", \"more\", \"unindexed_sessions\", \"note\"}`; `scope` is `\"session\"` (this conversation), `\"project\"`, `\"all\"` or a project path; `kinds` are `user`, `assistant`, `summary`, `reasoning`, `tool_call` and `tool_result`; `since` and `until` take ISO dates; `sort` is `\"relevance\"` or `\"newest\"`. `await history.read(ref, offset=0, limit=8000, around=0)` returns an item's full text from byte `offset`, with `around` neighbours each side. `await history.sessions(scope=\"project\", title=None, limit=20, offset=0)` lists sessions. Reading another project's history asks first.";
-const MCP_SERVERS: &str = "- MCP servers are namespaces when the `# MCP servers` reminder lists them with their tools' signatures. Call a tool as an async method of its server: `issues = await github.list_issues(owner=\"o\", repo=\"r\")`. Run independent calls together: `import asyncio`, then `await asyncio.gather(...)`.
-- A tool returns its structured content, else its text, parsed when it is JSON. Images and other media come back as a dict naming their type and size.
-- `search(\"query\", server=None, limit=10, offset=0)` finds tools the reminder leaves out and returns their exact signatures. `servers()` lists every server and whether it is connected. Both answer at once, so never `await` them.
-- `await resources(\"server\")` lists what a server offers to be read; `await read_resource(\"server\", uri)` reads one.
-- `await decide(...)` and `await rerank(...)` exist when the reminder describes them.";
+const MODULES: &str = "- Modules are namespaces of calls that reach beyond the interpreter; `await` each call unless its help says otherwise:";
+const HELP: &str = "- `help()` lists the modules and what this session can reach now; `help(\"history\")` shows a module's calls, `help(\"history.search\")` one call's full reference, `help(\"github\")` an MCP server's tools. Read a call's help before using it the first time.";
 const FAILURES: &str = "- A failed call raises `RuntimeError` and a refused one `PermissionError`; catch them to carry on. Calls that ran before a failure keep their effects.";
-const SANDBOX: &str = "- The interpreter runs a Python subset: no filesystem, network, subprocesses, class inheritance or third-party packages. Its modules are `asyncio`, `base64`, `binascii`, `bisect`, `collections`, `copy`, `csv`, `dataclasses`, `datetime`, `functools`, `hashlib`, `itertools`, `json`, `math`, `os`, `pathlib`, `posixpath`, `random`, `re`, `sys`, `time`, `tomllib`, `typing` and `unicodedata`. `os.path` supports POSIX path manipulation, not host access. `match`, list slice assignment, set subset ordering, dataclass fields/factories and `__post_init__`, arithmetic/subscript/call dunders, and `re.split` capture groups work. Type checking can reject `map`, `filter`, `getattr`, `setattr`, `hasattr` and `format`; use comprehensions and f-strings.";
-/// The description in reading order. A host module documents itself with one section of its own,
-/// after `SNIPPETS`. Nothing here depends on what the session connects, so the tool array stays
-/// cache-stable.
-const SECTIONS: &[&str] = &[SNIPPETS, HISTORY, MCP_SERVERS, FAILURES, SANDBOX];
-
-pub static DESCRIPTION: LazyLock<String> = LazyLock::new(|| SECTIONS.join("\n"));
+const SANDBOX: &str = "- The interpreter runs a Python subset: no filesystem, network, subprocesses, class inheritance or third-party packages. Its modules are `asyncio`, `base64`, `binascii`, `bisect`, `collections`, `copy`, `csv`, `dataclasses`, `datetime`, `functools`, `hashlib`, `itertools`, `json`, `math`, `os`, `pathlib`, `posixpath`, `random`, `re`, `sys`, `time`, `tomllib`, `typing` and `unicodedata`. `os.path` supports POSIX path manipulation, not host access. Clocks read the host clock in UTC, and `time.sleep` or `await asyncio.sleep` wait for real within `timeoutSec`; prefer `asyncio.sleep` beside gathered calls, and seed `random` explicitly. `match`, list slice assignment, set subset ordering, dataclass fields/factories and `__post_init__`, arithmetic/subscript/call dunders, and `re.split` capture groups work. Type checking can reject `map`, `filter`, `getattr`, `setattr`, `hasattr` and `format`; use comprehensions and f-strings.";
+/// The description in reading order: each module's one-line summary, then how to load the rest.
+/// Nothing here depends on what the session connects, so the tool array stays cache-stable.
+pub static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
+    let modules = MODULE_DOCS.iter().map(|doc| format!("  - {}", doc.summary));
+    [SNIPPETS.to_owned(), MODULES.to_owned()]
+        .into_iter()
+        .chain(modules)
+        .chain([HELP, FAILURES, SANDBOX].map(str::to_owned))
+        .collect::<Vec<_>>()
+        .join("\n")
+});
 static PERMISSION_CONTRACT: LazyLock<String> =
     LazyLock::new(|| super::permission_contract(&CodeTool, ToolEffect::Orchestrator, &DESCRIPTION));
 
@@ -44,6 +46,9 @@ pub fn permission_contract() -> &'static str {
 
 const CODE_FIELD: &str = "code";
 const RESET_FIELD: &str = "reset";
+const TIMEOUT_FIELD: &str = "timeoutSec";
+const DEFAULT_TIMEOUT_SECS: u64 = 120;
+const MAX_TIMEOUT_SECS: u64 = 3600;
 const PYTHON_LANGUAGE: &str = "python";
 const ONE_LINE: &str = "1 line";
 const LINES: &str = "lines";
@@ -56,9 +61,14 @@ static RESET_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::Bool,
     description: "Drop the variables earlier runs kept before running",
 };
+static TIMEOUT_PARAM: ParamSchema = ParamSchema::Primitive {
+    kind: ParamKind::Integer,
+    description: "Wall-clock deadline in seconds for the whole run, waits and calls included: 1 to 3600, default 120",
+};
 static PROPERTIES: &[Property] = &[
     (CODE_FIELD, &CODE_PARAM, true, &[]),
     (RESET_FIELD, &RESET_PARAM, false, &[]),
+    (TIMEOUT_FIELD, &TIMEOUT_PARAM, false, &[]),
 ];
 static SCHEMA: ParamSchema = ParamSchema::Object {
     properties: PROPERTIES,
@@ -98,13 +108,34 @@ impl Tool for CodeTool {
             .get(RESET_FIELD)
             .and_then(Value::as_bool)
             .unwrap_or_default();
-        Ok(Box::new(CodeRun { code, reset }))
+        let timeout = parse_timeout(input.get(TIMEOUT_FIELD))?;
+        Ok(Box::new(CodeRun {
+            code,
+            reset,
+            timeout,
+        }))
     }
+}
+
+fn parse_timeout(value: Option<&Value>) -> Result<Duration, ParseError> {
+    let Some(value) = value else {
+        return Ok(Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+    };
+    value
+        .as_u64()
+        .filter(|secs| (1..=MAX_TIMEOUT_SECS).contains(secs))
+        .map(Duration::from_secs)
+        .ok_or_else(|| {
+            ParseError::custom(format!(
+                "{TIMEOUT_FIELD} must be a whole number of seconds from 1 to {MAX_TIMEOUT_SECS}, got {value}"
+            ))
+        })
 }
 
 struct CodeRun {
     code: String,
     reset: bool,
+    timeout: Duration,
 }
 
 impl ToolInvocation for CodeRun {
@@ -127,7 +158,7 @@ impl ToolInvocation for CodeRun {
     /// judged on its own, and the gateway records the run once a call could change files.
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
         Box::pin(async move {
-            let output = gateway::run(ctx, self.code, self.reset).await;
+            let output = gateway::run(ctx, self.code, self.reset, self.timeout).await;
             let model_text = output.model_text();
             let failure = output.outcome.failure();
             let result = ToolExecResult::from(Ok(ToolOutput::Code(output)))
@@ -137,5 +168,73 @@ impl ToolInvocation for CodeRun {
                 None => result,
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use caudra_providers::estimate_tokens;
+    use serde_json::json;
+    use test_case::test_case;
+
+    use super::*;
+
+    const SNIPPET: &str = "1";
+    /// What the always-loaded description may cost; the rest of every module loads with `help()`.
+    const DESCRIPTION_TOKENS: usize = 1_000;
+    const SUMMARY_CHARS: usize = 260;
+
+    #[test]
+    fn the_description_lists_every_module_within_its_budget() {
+        for doc in MODULE_DOCS {
+            assert!(DESCRIPTION.contains(doc.summary), "{}", doc.namespace);
+        }
+        let tokens = estimate_tokens(&DESCRIPTION) as usize;
+        assert!(tokens <= DESCRIPTION_TOKENS, "{tokens}");
+    }
+
+    /// Every module documents both layers, and no two share a namespace.
+    #[test]
+    fn every_module_documents_itself_in_both_layers() {
+        let mut namespaces = HashSet::new();
+        for doc in MODULE_DOCS {
+            assert!(namespaces.insert(doc.namespace), "{}", doc.namespace);
+            assert!(doc.summary.len() <= SUMMARY_CHARS, "{}", doc.namespace);
+            assert!(doc.summary.starts_with(&format!("`{}`", doc.namespace)));
+            assert!(
+                !doc.page.is_empty() && !doc.members.is_empty(),
+                "{}",
+                doc.namespace
+            );
+            for member in doc.members {
+                assert!(
+                    member.signature.starts_with(&format!("{}(", member.name))
+                        && !member.page.is_empty(),
+                    "{}.{}",
+                    doc.namespace,
+                    member.name
+                );
+            }
+        }
+    }
+
+    #[test_case(json!(null), Some(DEFAULT_TIMEOUT_SECS) ; "null_means_omitted")]
+    #[test_case(json!(1), Some(1) ; "smallest")]
+    #[test_case(json!(MAX_TIMEOUT_SECS), Some(MAX_TIMEOUT_SECS) ; "largest")]
+    #[test_case(json!(0), None ; "zero_refused")]
+    #[test_case(json!(MAX_TIMEOUT_SECS + 1), None ; "past_the_cap_refused")]
+    #[test_case(json!(-5), None ; "negative_refused")]
+    fn timeout_sec_is_checked_like_shell(timeout: Value, expected: Option<u64>) {
+        let parsed = parse_timeout(
+            validate(
+                &SCHEMA,
+                json!({CODE_FIELD: SNIPPET, TIMEOUT_FIELD: timeout}),
+            )
+            .unwrap()
+            .get(TIMEOUT_FIELD),
+        );
+        assert_eq!(parsed.ok().map(|timeout| timeout.as_secs()), expected);
     }
 }

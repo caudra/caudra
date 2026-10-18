@@ -7,8 +7,8 @@ use serde_json::Value;
 
 use crate::mcp::SEPARATOR;
 use crate::mcp::output::{McpHelper, McpInteraction, McpOutput};
-use crate::tools::ToolFailure;
-use crate::types::counted;
+use crate::tools::{ToolEffect, ToolFailure};
+use crate::types::{ToolInput, ToolOutput, counted};
 
 /// The ledger source of a call a snippet made.
 pub const CALL_SOURCE: &str = "code";
@@ -77,6 +77,10 @@ pub enum CodeOutcome {
         message: String,
     },
     Cancelled,
+    /// It ran past its `timeoutSec`.
+    TimedOut {
+        after_secs: u64,
+    },
 }
 
 /// One host call a snippet made: a server's tool, a resource read, or a decision.
@@ -112,6 +116,60 @@ pub struct CodeCall {
     /// The helper this call was, when it was not a server's tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub helper: Option<McpHelper>,
+    /// The registered tool a module ran for this call, and what it answered as its own card
+    /// would show it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted: Option<Box<HostedResult>>,
+}
+
+/// A hosted tool's own card on a `code` call's row: what it shows from the moment the tool starts,
+/// then what it answered.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HostedResult {
+    /// The tool's registered name, which the ledger counts the call under.
+    pub tool: String,
+    /// Where the tool came from, as the ledger records it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub effect: ToolEffect,
+    /// The body the tool's card draws while it runs, such as an image's prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<ToolInput>,
+    /// `None` until the tool answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<ToolOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<String>,
+}
+
+impl HostedResult {
+    /// A tool that has not started yet: its card is its name and header.
+    pub fn pending(tool: &str) -> Self {
+        Self {
+            tool: tool.to_owned(),
+            ..Self::default()
+        }
+    }
+}
+
+/// `ToolOutput` has no equality of its own, so outputs compare by what they serialize to.
+impl PartialEq for HostedResult {
+    fn eq(&self, other: &Self) -> bool {
+        (
+            &self.tool,
+            &self.source,
+            self.effect,
+            &self.input,
+            &self.annotation,
+        ) == (
+            &other.tool,
+            &other.source,
+            other.effect,
+            &other.input,
+            &other.annotation,
+        ) && serde_json::to_value(&self.output).ok() == serde_json::to_value(&other.output).ok()
+    }
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -156,6 +214,7 @@ impl CodeOutcome {
             Self::Running | Self::Completed => None,
             Self::Rejected { .. } => Some(ToolFailure::InvalidInput),
             Self::Cancelled => Some(ToolFailure::Cancelled),
+            Self::TimedOut { .. } => Some(ToolFailure::Timeout),
             Self::Raised { .. } | Self::Limited { .. } | Self::Unavailable { .. } => {
                 Some(ToolFailure::Other)
             }
@@ -171,6 +230,9 @@ impl CodeOutcome {
             Self::Limited { message } => Some(format!("The snippet was stopped: {message}")),
             Self::Unavailable { message } => Some(message.clone()),
             Self::Cancelled => Some(CANCELLED.to_owned()),
+            Self::TimedOut { after_secs } => Some(format!(
+                "The snippet ran past its timeoutSec of {after_secs}s and was stopped. Its output and assignments are lost, and the variables from before it are kept; pass a larger timeoutSec if it needs longer."
+            )),
         }
     }
 }
@@ -232,6 +294,21 @@ impl CodeCall {
         format!("{}{SEPARATOR}{}", self.server, self.tool)
     }
 
+    /// The tool and source the ledger counts the call under: a hosted tool's own, as when the
+    /// model called it, else the module call's.
+    pub fn ledger_name(&self) -> (String, String) {
+        match &self.hosted {
+            Some(hosted) => (
+                hosted.tool.clone(),
+                hosted
+                    .source
+                    .clone()
+                    .unwrap_or_else(|| CALL_SOURCE.to_owned()),
+            ),
+            None => (self.qualified_name(), CALL_SOURCE.to_owned()),
+        }
+    }
+
     pub fn ledger_outcome(&self) -> LedgerOutcome {
         match (self.status, self.failure) {
             (CodeCallStatus::Success, _) => LedgerOutcome::Ok,
@@ -262,6 +339,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::mcp::output::{DecisionHelper, HistoryHelper};
 
     const RESULT: &str = "5";
     const REPAIR: &str = "imported `asyncio`";
@@ -291,8 +369,9 @@ mod tests {
     /// Calls saved before helpers were marked load as server calls, and a marked one loads as it
     /// was.
     #[test_case(json!({"server": "s", "tool": "t", "input": {}, "status": "success"}), None ; "saved_before_helpers")]
-    #[test_case(json!({"server": "s", "tool": "t", "input": {}, "status": "success", "helper": "rerank"}), Some(McpHelper::Rerank) ; "rerank")]
-    #[test_case(json!({"server": "s", "tool": "t", "input": {}, "status": "success", "helper": "decide"}), Some(McpHelper::Decide) ; "decide")]
+    #[test_case(json!({"server": "s", "tool": "t", "input": {}, "status": "success", "helper": "rerank"}), Some(McpHelper::Decision(DecisionHelper::Rerank)) ; "rerank")]
+    #[test_case(json!({"server": "s", "tool": "t", "input": {}, "status": "success", "helper": "decide"}), Some(McpHelper::Decision(DecisionHelper::Decide)) ; "decide")]
+    #[test_case(json!({"server": "s", "tool": "t", "input": {}, "status": "success", "helper": "sessions"}), Some(McpHelper::History(HistoryHelper::Sessions)) ; "history")]
     fn a_stored_call_keeps_its_helper(stored: Value, helper: Option<McpHelper>) {
         let call: CodeCall = serde_json::from_value(stored).unwrap();
         assert_eq!(call.helper, helper);

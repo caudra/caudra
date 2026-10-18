@@ -505,7 +505,6 @@ pub fn run(
             | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge { .. }
-            | AgentEvent::ToolsLoaded { .. }
             | AgentEvent::Unrecorded { .. }
             | AgentEvent::Decision(_)
             | AgentEvent::CacheWarmEpisode(_)

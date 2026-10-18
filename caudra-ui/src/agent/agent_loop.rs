@@ -27,11 +27,11 @@ use caudra_agent::prompt::profile::{
 };
 use caudra_agent::template;
 use caudra_agent::template::Vars;
-use caudra_agent::tools::execution::{configure_tools, execution_slots};
+use caudra_agent::tools::execution::{configure_declared, execution_slots};
 use caudra_agent::tools::native::plan::PlanTarget;
 use caudra_agent::tools::{
-    BuiltinDeferral, DeferralSession, DeferredTool, DescriptionContext, FileReadTracker, PathLocks,
-    ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
+    DescriptionContext, FileReadTracker, PathLocks, ToolAudience, ToolDefinitions, ToolFilter,
+    ToolRegistry,
 };
 use caudra_agent::types::{MEMORY_EVENT_RUN_ID, TodoItem};
 use caudra_agent::workflow::WorkflowHandle;
@@ -44,8 +44,7 @@ use caudra_agent::{
 use caudra_config::{ModelPolicy, ProfileToolPolicy};
 use caudra_lua::EventHandle;
 use caudra_providers::{
-    AgentError, Billing, CacheKey, HistoryItem, Message, Model, ModelPurpose, RequestOptions,
-    ThinkingConfig,
+    AgentError, Billing, CacheKey, HistoryItem, Model, ModelPurpose, RequestOptions, ThinkingConfig,
 };
 use caudra_storage::id::SessionRef;
 use caudra_storage::local_documents::LocalDocumentStore;
@@ -100,16 +99,11 @@ impl ToolsPreviewSource {
                 workflows_available: self.workflows_available,
             },
             model.supports_tool_examples(),
-            &deferral::deferred_names(
-                &self.config.allowed_tools,
-                BuiltinDeferral::resolve(&self.config, model),
-            ),
             &self.profile,
             session_plan,
         );
-        configure_tools(
+        configure_declared(
             &mut definitions.declared,
-            &mut definitions.deferred,
             &self.config,
             self.background_available,
             self.background_available,
@@ -126,7 +120,6 @@ impl ToolsPreviewSource {
         mode: &AgentMode,
         session_plan: bool,
         cwd: &str,
-        history: &[Message],
     ) -> ContextSnapshot {
         let bindings = self.profiles.bind_for_tasks_for_inspection(
             model,
@@ -147,12 +140,6 @@ impl ToolsPreviewSource {
                 ToolFilter::All.for_mcp_mode(mode),
             )
         });
-        let full_tools = request_tools_from(
-            &self.registry,
-            history,
-            definitions.declared.clone(),
-            definitions.deferred.clone(),
-        );
         let inventory = ContextInventory {
             builtins: BuiltinToolsInput {
                 registry: &self.registry,
@@ -161,8 +148,6 @@ impl ToolsPreviewSource {
                 model,
                 session_plan,
                 audience: ToolAudience::MAIN,
-                deferral: BuiltinDeferral::resolve(&self.config, model),
-                deferred: &definitions.deferred,
             }
             .inventory(&self.profile),
             mcp: mcp
@@ -179,9 +164,7 @@ impl ToolsPreviewSource {
             auto_compact: false,
             compaction_buffer: None,
             system: "",
-            base_tools: &DeferralSession::new(definitions.deferred, std::iter::empty())
-                .accounting_definitions(&definitions.declared),
-            full_tools: &full_tools,
+            tools: &definitions.declared,
             projected_messages: &[],
             measured: None,
             inventory,
@@ -203,9 +186,8 @@ pub(super) struct AgentLoop {
     /// summaries are off or there is no memory.
     memory_pump: Option<Pump>,
     tools: Value,
-    /// Withheld from `tools` until `tool_search` loads them. Rebuilt with
-    /// `tools`, so a model switch reconsiders both halves together.
-    deferred: Vec<DeferredTool>,
+    /// Tools a `code` module dispatches, absent from `tools` yet available.
+    hosted: Vec<String>,
     /// The tools and system prompt every request of the conversation shares,
     /// kept while the configuration changes under them.
     surface: SurfaceBaseline,
@@ -363,7 +345,7 @@ impl AgentLoop {
             memory: MemoryBaseline::default(),
             memory_pump: None,
             tools: Value::Null,
-            deferred: Vec::new(),
+            hosted: Vec::new(),
             surface: SurfaceBaseline::default(),
             bound_profile: system_prompt_profile.clone(),
             mcp,
@@ -794,7 +776,6 @@ impl AgentLoop {
                 mode_notice: None,
                 event_tx,
                 tools: self.tools.clone(),
-                deferred: self.deferred.clone(),
                 tools_fixed: true,
                 memory_store: self.memory.store().cloned(),
             },
@@ -1052,7 +1033,7 @@ impl AgentLoop {
         });
         let definitions = self.build_tools(model, chat_model, thinking);
         self.tools = definitions.declared;
-        self.deferred = definitions.deferred;
+        self.hosted = definitions.hosted;
     }
 
     fn build_tools(
@@ -1111,16 +1092,7 @@ impl AgentLoop {
     }
 
     fn effective_tool_filter(&self) -> ToolFilter {
-        ToolFilter::Only(
-            self.tools
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
-                .chain(self.deferred.iter().map(|tool| tool.name.to_string()))
-                .collect(),
-        )
-        .for_mode(&self.mode.load())
+        session_tool_filter(&self.tools, &self.hosted, &self.mode.load())
     }
 
     /// Takes the settings published since the last turn. A profile that is no
@@ -1150,20 +1122,16 @@ impl AgentLoop {
     }
 
     /// Fixes the prefix just built from the live configuration when `rebuild`,
-    /// and otherwise puts back the one already fixed. Leaves `tools` and
-    /// `deferred` on the prefix, and returns its system prompt, the tools it
-    /// retired, and the configuration notice the turn carries.
+    /// and otherwise puts back the one already fixed. Leaves `tools` on the
+    /// prefix, and returns its system prompt, the tools it retired, and the
+    /// configuration notice the turn carries.
     fn fix_surface(
         &mut self,
         system: String,
         rebuild: bool,
         key: PrefixKey,
     ) -> (String, Vec<String>, Option<String>) {
-        let live = Surface::new(
-            system,
-            std::mem::take(&mut self.tools),
-            std::mem::take(&mut self.deferred),
-        );
+        let live = Surface::new(system, std::mem::take(&mut self.tools));
         if rebuild {
             self.bound_profile.clone_from(&self.system_prompt_profile);
         }
@@ -1175,7 +1143,6 @@ impl AgentLoop {
             self.history.as_slice(),
         );
         self.tools = settled.surface.tools.clone();
-        self.deferred = settled.surface.deferred.clone();
         (
             settled.surface.system.clone(),
             settled.retired,
@@ -1251,19 +1218,6 @@ impl AgentLoop {
         });
     }
 
-    /// The array a request actually carries. `self.tools` is the declared base, and a run
-    /// appends the deferred catalog on top, so anything that has to match the live array has to
-    /// append it too. The loaded set comes from history, which is what the agent seeds its own
-    /// session from. A load that happens mid-turn is not reflected until the next publish.
-    fn request_tools(&self) -> Value {
-        request_tools_from(
-            ToolRegistry::global(),
-            self.history.as_slice(),
-            self.tools.clone(),
-            self.deferred.clone(),
-        )
-    }
-
     fn build_system(
         &self,
         prompt_slots: &caudra_agent::prompt::ResolvedSlots,
@@ -1275,7 +1229,6 @@ impl AgentLoop {
             self.background.is_some(),
             self.background.is_some(),
             &self.tools,
-            &self.deferred,
         );
         agent::build_system_prompt(
             self.instructions.text(),
@@ -1295,17 +1248,16 @@ impl AgentLoop {
             provider: Arc::clone(&slot.provider),
             model: slot.model.clone(),
             system: system.to_owned(),
-            tools: self.request_tools(),
+            tools: self.tools.clone(),
             opts,
             profile: self.bound_profile.clone(),
         }));
     }
 
     fn publish_prepared_context(&self, slot: &ModelSlot) {
-        let tools = self.request_tools();
         let messages = agent::project_request(
             self.history.as_slice(),
-            &tools,
+            &self.tools,
             &slot.model,
             slot.provider.reasoning_transport(&slot.model),
         );
@@ -1335,8 +1287,6 @@ impl AgentLoop {
                 model: &slot.model,
                 session_plan: self.has_session_plan(),
                 audience: ToolAudience::MAIN,
-                deferral: BuiltinDeferral::resolve(&self.config, &slot.model),
-                deferred: &self.deferred,
             }),
             self.mcp.as_ref(),
         );
@@ -1349,9 +1299,7 @@ impl AgentLoop {
                 auto_compact: agent::auto_compact_enabled(),
                 compaction_buffer: self.config.compaction_buffer,
                 system: &self.context_system,
-                base_tools: &DeferralSession::new(self.deferred.clone(), std::iter::empty())
-                    .accounting_definitions(&self.tools),
-                full_tools: &tools,
+                tools: &self.tools,
                 projected_messages: messages.as_ref(),
                 // Published between runs, when nothing the provider billed
                 // describes this transcript: startup has yet to send a request,
@@ -1380,26 +1328,6 @@ impl AgentLoop {
     }
 }
 
-fn request_tools_from(
-    registry: &ToolRegistry,
-    history: &[Message],
-    mut tools: Value,
-    deferred: Vec<DeferredTool>,
-) -> Value {
-    let sections: Vec<String> =
-        DeferralSession::new(deferred, deferral::loaded_tool_names(history))
-            .request_snapshot()
-            .extend_declared(&mut tools)
-            .into_iter()
-            .collect();
-    deferral::push_unbound_catalog(
-        &mut tools,
-        &sections,
-        registry.has(deferral::TOOL_SEARCH_TOOL_NAME),
-    );
-    tools
-}
-
 fn is_automatic_input(input: &AgentInput) -> bool {
     input.message.is_empty()
         && input.images.is_empty()
@@ -1421,6 +1349,21 @@ fn model_purpose(mode: &AgentMode) -> ModelPurpose {
         AgentMode::Plan(_) | AgentMode::RemotePlan(_) => ModelPurpose::Plan,
         AgentMode::Build | AgentMode::ReadOnly => ModelPurpose::Chat,
     }
+}
+
+/// The tools a run may call: the declared ones and those its `code` modules dispatch, which the
+/// request never declares.
+fn session_tool_filter(tools: &Value, hosted: &[String], mode: &AgentMode) -> ToolFilter {
+    ToolFilter::Only(
+        tools
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+            .chain(hosted.iter().cloned())
+            .collect(),
+    )
+    .for_mode(mode)
 }
 
 fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
@@ -1477,14 +1420,16 @@ pub(super) mod tests {
     use caudra_agent::McpPromptRef;
     use caudra_agent::context::{ContextBuiltinState, ContextMcpStatus};
     use caudra_agent::mcp::stub_session;
-    use caudra_agent::tools::native::plan;
+    use caudra_agent::tools::native::{self, plan};
     use caudra_agent::tools::profile_policy::{
         MODE_DISABLED, PLAN_REQUIRED, PROFILE_DISABLED, PROFILE_LOADING,
     };
     use caudra_agent::tools::report::REASON_CONFIG;
+    use caudra_agent::tools::{AUTOMATION_TOOL_NAME, CODE_TOOL_NAME};
     use caudra_agent::tools::{ToolEffect, ToolSource};
     use caudra_config::ProfileToolExposure;
-    use caudra_providers::{ContentBlock, Role};
+    use caudra_config::{Feature, FeatureFlags};
+    use caudra_providers::Message;
     use caudra_workspace::PlanRef;
     use serde_json::json;
     use test_case::test_case;
@@ -1499,7 +1444,6 @@ pub(super) mod tests {
     const PREVIEW_MODEL: &str = "anthropic/claude-sonnet-4-6";
     const PREVIEW_OWNER: &str = "caudra";
     const PREVIEW_CONTRACT: &str = "preview-test";
-    const LOAD_PLAN_CALL: &str = "load-plan";
     const PREVIEW_MCP_TOOL: &str = "preview.lookup";
     const PREVIEW_MCP_DESCRIPTION: &str = "Look up preview data";
     const PREVIEW_PLAN_REF: &str = "plan-preview";
@@ -1533,32 +1477,16 @@ pub(super) mod tests {
         }
     }
 
-    #[test_case(ProfileToolExposure::Eager, false, ContextBuiltinState::Declared; "eager")]
-    #[test_case(ProfileToolExposure::Lazy, false, ContextBuiltinState::Deferred; "lazy")]
-    #[test_case(ProfileToolExposure::Lazy, true, ContextBuiltinState::Declared; "loaded_lazy")]
-    #[test_case(ProfileToolExposure::Disabled, true, ContextBuiltinState::Disabled; "disabled_loaded")]
+    #[test_case(ProfileToolExposure::Eager, ContextBuiltinState::Declared; "eager")]
+    #[test_case(ProfileToolExposure::Disabled, ContextBuiltinState::Disabled; "disabled")]
     fn tools_preview_uses_execution_policy_and_accounting(
         exposure: ProfileToolExposure,
-        loaded: bool,
         expected: ContextBuiltinState,
     ) {
         let mut policy = ProfileToolPolicy::default();
         policy.overrides.insert(plan::NAME.into(), exposure);
         let source = tools_preview_source(AgentConfig::default(), policy);
         let model = Model::from_spec(PREVIEW_MODEL).unwrap();
-        let history = if loaded {
-            vec![Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::tool_use(
-                    LOAD_PLAN_CALL,
-                    plan::NAME,
-                    json!({"action":"read"}),
-                )],
-                ..Message::default()
-            }]
-        } else {
-            Vec::new()
-        };
         for mode in [
             AgentMode::Plan(PLAN_PATH.into()),
             AgentMode::RemotePlan(PlanRef::new(PREVIEW_PLAN_REF).unwrap()),
@@ -1571,7 +1499,6 @@ pub(super) mod tests {
                 &mode,
                 true,
                 PREVIEW_CWD,
-                &history,
             );
             assert_eq!(snapshot.mode, mode);
             assert_eq!(snapshot.audience, ToolAudience::MAIN);
@@ -1614,7 +1541,6 @@ pub(super) mod tests {
             &mode,
             mode.has_session_plan(None),
             PREVIEW_CWD,
-            &[],
         );
         assert_eq!(
             snapshot.inventory.builtins.tools[0].state,
@@ -1629,20 +1555,12 @@ pub(super) mod tests {
                 .count(ContextBuiltinState::Declared),
             0
         );
-        assert_eq!(
-            snapshot
-                .inventory
-                .builtins
-                .count(ContextBuiltinState::Deferred),
-            0
-        );
     }
 
     #[test_case(AgentMode::Build, ProfileToolExposure::Eager, ContextMcpStatus::Available, Some(PROFILE_LOADING); "eager")]
-    #[test_case(AgentMode::Build, ProfileToolExposure::Lazy, ContextMcpStatus::SearchOnly, Some(PROFILE_LOADING); "lazy_is_search_only")]
     #[test_case(AgentMode::Build, ProfileToolExposure::Disabled, ContextMcpStatus::Disabled, Some(PROFILE_DISABLED); "profile_disables")]
     #[test_case(AgentMode::ReadOnly, ProfileToolExposure::Eager, ContextMcpStatus::Disabled, Some(MODE_DISABLED); "read_only_disables_eager")]
-    #[test_case(AgentMode::Plan(PLAN_PATH.into()), ProfileToolExposure::Lazy, ContextMcpStatus::Disabled, Some(MODE_DISABLED); "local_plan_disables_lazy")]
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()), ProfileToolExposure::Eager, ContextMcpStatus::Disabled, Some(MODE_DISABLED); "local_plan_disables_eager")]
     #[test_case(AgentMode::RemotePlan(PlanRef::new(PREVIEW_PLAN_REF).unwrap()), ProfileToolExposure::Eager, ContextMcpStatus::Disabled, Some(MODE_DISABLED); "remote_plan_disables_eager")]
     fn tools_preview_reports_mcp_without_declaring_it(
         mode: AgentMode,
@@ -1667,14 +1585,12 @@ pub(super) mod tests {
             &mode,
             mode.has_session_plan(None),
             PREVIEW_CWD,
-            &[],
         );
         assert_eq!(snapshot.inventory.mcp.tools.len(), 1);
         let tool = &snapshot.inventory.mcp.tools[0];
         assert_eq!(tool.qualified_name, PREVIEW_MCP_TOOL);
         assert_eq!((tool.status, tool.reason), (expected, reason));
         assert_eq!(snapshot.usage.mcp_tools, 0);
-        assert_eq!(snapshot.inventory.builtins.catalog_tokens, 0);
         assert_eq!(source.mcp.as_ref().unwrap().tool_inventory(), before);
     }
 
@@ -1728,5 +1644,36 @@ pub(super) mod tests {
     #[test_case(AgentMode::Plan(PathBuf::from(PLAN_PATH)), ModelPurpose::Plan ; "plan_uses_plan")]
     fn input_mode_selects_model_purpose(mode: AgentMode, purpose: ModelPurpose) {
         assert_eq!(model_purpose(&mode), purpose);
+    }
+
+    #[test]
+    fn a_code_hosted_tool_stays_callable_without_a_declaration() {
+        let registry = ToolRegistry::new();
+        native::register(&registry, FeatureFlags::NONE.with(Feature::Automations)).unwrap();
+        let definitions = registry.definitions_split(
+            &Vars::new(),
+            &DescriptionContext {
+                filter: &ToolFilter::All,
+                audience: ToolAudience::MAIN,
+                workflows_available: false,
+            },
+            false,
+        );
+        let filter = session_tool_filter(
+            &definitions.declared,
+            &definitions.hosted,
+            &AgentMode::Build,
+        );
+
+        assert!(
+            !definitions
+                .declared
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == AUTOMATION_TOOL_NAME)
+        );
+        assert!(filter.matches(CODE_TOOL_NAME));
+        assert!(filter.matches(AUTOMATION_TOOL_NAME));
     }
 }

@@ -86,21 +86,19 @@ tools:
     files: disabled
   overrides:
     file_read: eager
-    "github.*": lazy
+    "github.*": eager
     "github.delete_issue": disabled
 ```
 
 | Field | Values | Default |
 | --- | --- | --- |
-| `tools.default` | `inherit`, `eager`, `lazy`, `disabled` | `inherit` |
-| `tools.groups` | Group name mapped to `eager`, `lazy`, or `disabled` | Empty |
-| `tools.overrides` | Tool selector mapped to `eager`, `lazy`, or `disabled` | Empty |
+| `tools.default` | `inherit`, `eager`, `disabled` | `inherit` |
+| `tools.groups` | Group name mapped to `eager` or `disabled` | Empty |
+| `tools.overrides` | Tool selector mapped to `eager` or `disabled` | Empty |
 
-An `eager` tool starts with its full schema in the request. A `lazy` tool is callable and searchable, but initially contributes only a catalog summary. Calling a lazy tool directly by its known name is valid and loads its schema. A `disabled` tool is absent from schemas and search, and calls are refused before argument repair, permission prompts, or execution.
+An `eager` tool is available: its schema is in the request, or for a tool the model reaches from [`code`](/docs/code/#tools-reached-from-code), its module answers. A `disabled` tool is absent, and calls are refused before argument repair, permission prompts, or execution. `lazy` was removed with `tool_search`, and a profile that uses it fails to load.
 
-MCP tools never put a schema in the request, because the model calls them through [code mode](/docs/mcp/#code-mode). For them, `lazy` leaves the tool out of the [server list](/docs/mcp/#the-server-list), and `search()` still finds it. `disabled` refuses its calls.
-
-Loaded schemas remain session-local. Restored history and MCP reconnects cannot re-enable disabled tools.
+MCP tools never put a schema in the request, because the model calls them through [code mode](/docs/mcp/#code-mode). For them, `disabled` refuses their calls. Restored history and MCP reconnects cannot re-enable disabled tools.
 
 Resolution goes from the most specific rule to the least specific:
 
@@ -110,7 +108,7 @@ Resolution goes from the most specific rule to the least specific:
 4. Profile default.
 5. Existing loading preferences when the default is `inherit`.
 
-Explicit `eager` and `lazy` settings override model-class deferral, `agent.defer_builtin_tools`, and the eager hint from `--allowed-tools`. Loading remains separate from [synchronous and background execution](/docs/sessions/#background-tasks).
+Availability remains separate from [synchronous and background execution](/docs/sessions/#background-tasks).
 
 MCP selectors use `server.tool` names, with the server's configured name and the tool's own MCP name, not the [Python names](/docs/mcp/#naming-and-namespacing) the model calls. Plugin and custom tools use their exact registered names. Unknown groups, invalid states, malformed selectors, duplicate keys, and reserved infrastructure selectors are errors. Bare custom names must resolve in the runtime registry before the profile can run. Qualified MCP selectors may precede a server connection, but an unavailable tool grants no access. Arbitrary globs, custom groups, and profile inheritance are unsupported.
 
@@ -121,13 +119,13 @@ MCP selectors use `server.tool` names, with the server's configured name and the
 | `web` | `websearch`, `webfetch` |
 | `files` | `file_read`, `file_write`, `file_edit`, `file_apply_patch`, `file_glob`, `file_grep`, `file_index` |
 | `source_code` | `source_code_context`, `source_code_refs` |
-| `execution` | `shell`, `execution_environment` |
-| `delegation` | `task`, `task_control`, `workflow` |
+| `execution` | `shell`, `execution_environment` (`host` in `code`) |
+| `delegation` | `task`, `task_control`, `workflow` (`workflow` and `automation` in `code`) |
 | `support` | `batch`, `question`, `todo_write`, `plan` |
-| `images` | `view_image`, `image_generate` |
+| `images` | `view_image`, `image_generate` (`image` in `code`) |
 | `messaging` | `list_sessions`, `send_message`, `publish_message`, `read_topic` |
 
-Select `code`, `memory`, and `skill` individually. Messaging is optional and separate from support and delegation. It still requires its experimental opt-in, an eligible main-session runtime, peer inbound controls, and outgoing permissions.
+Select `memory` and `skill` individually. `code` is always available, so a profile that disables it fails to load. A group that turns off a tool reached from `code` makes its module raise with the reason. Messaging is optional and separate from support and delegation. It still requires its experimental opt-in, an eligible main-session runtime, peer inbound controls, and outgoing permissions.
 
 Groups are authoring shortcuts. They do not guarantee that every member exists in a runtime or cause members to load together. A custom tool using a built-in name does not acquire that built-in's group or infrastructure privileges.
 
@@ -135,7 +133,7 @@ Groups are authoring shortcuts. They do not guarantee that every member exists i
 
 A profile cannot restore tools removed by global or CLI restrictions, disabled experimental features, model compatibility, execution policy, audience, or mode. A task in plan mode stays read-only. Permissions still authorize each call, and explicit denies remain effective.
 
-The trusted `tool_output` pager stays available for truncated results. Host-required task-report and structured-output sinks also remain where their protocol needs them. `tool_search` appears only while an eligible lazy catalog has pending tools. These are infrastructure exceptions, identified by their trusted bindings. `todo_write`, `question`, `batch`, `plan`, `memory`, `skill`, `task`, and `workflow` require normal opt-in under `default: disabled`.
+The trusted `tool_output` pager stays available for truncated results, and `code` stays available as the home of the modules. Host-required task-report and structured-output sinks also remain where their protocol needs them. These are infrastructure exceptions, identified by their trusted bindings. `todo_write`, `question`, `batch`, `plan`, `memory`, `skill`, `task`, and `workflow` require normal opt-in under `default: disabled`.
 
 Tool availability is not a sandbox. Permitted shell commands, trusted plugins, and delegated tasks can perform broader work. Profiles do not isolate prompt history or sandbox plugin code.
 
@@ -150,7 +148,7 @@ tools:
   default: disabled
   groups:
     web: eager
-    support: lazy
+    support: eager
   overrides:
     todo_write: eager
 ---
@@ -171,9 +169,6 @@ tools:
   groups:
     delegation: eager
     support: eager
-  overrides:
-    workflow: lazy
-    plan: lazy
 ---
 Delegate research and implementation to appropriate task profiles.
 Coordinate results, maintain the todo list, and keep the session plan current.
@@ -241,7 +236,7 @@ caudra --system-prompt-profile researcher tools
 caudra --system-prompt-profile scheduler prompt --plan --tools
 ```
 
-`caudra tools` reports the initial eager, lazy, and disabled set. `caudra tools --schemas` and `caudra prompt --tools` show the initial request schemas, including one combined pending catalog when needed. They do not restore a session's previously loaded schemas. Inside a session, `/tools` provides a [mode-aware inventory](/docs/context/#inspect-the-active-window).
+`caudra tools` reports which tools are on and which are off. `caudra tools --schemas` and `caudra prompt --tools` show the request schemas. Inside a session, `/tools` provides a [mode-aware inventory](/docs/context/#inspect-the-active-window).
 
 Inside the TUI, run `/system-prompt` to read the prompt the current session is sending. The modal shows the text the agent bound, so it matches what the provider received rather than a fresh assembly of it. After you edit the session's profile, it keeps that text until the prompt is rebuilt, under a notice that the profile changed. Run `/reload` to rebuild it now. Press `r` to swap between rendered markdown and the source, `y` to copy, and `p` to open the profile picker.
 

@@ -12,14 +12,12 @@ use caudra_agent::decisions::{remove_decision_endpoint, save_decision_endpoint};
 use caudra_agent::mcp::{McpSession, config as mcp_config, oauth as mcp_oauth};
 use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
 use caudra_agent::template::{self, Vars};
-use caudra_agent::tools::deferral::{deferred_names, push_unbound_catalog};
 use caudra_agent::tools::native::skill::{self, SkillDirCandidate, SkillInventoryEntry};
 use caudra_agent::tools::profile_policy::{CEILING_DISABLED, LEGACY_LOADING, registered_decision};
 use caudra_agent::tools::registry::ToolDefinitions;
-use caudra_agent::tools::report::{CATALOG_SOURCE, REASON_CATALOG};
 use caudra_agent::tools::{
-    BuiltinDeferral, DeferralSession, DescriptionContext, SHELL_TOOL_NAME, TOOL_SEARCH_TOOL_NAME,
-    ToolAudience, ToolFilter, ToolRegistry, ToolState, builtin_report, execution, is_tool_enabled,
+    DescriptionContext, SHELL_TOOL_NAME, ToolAudience, ToolFilter, ToolRegistry, ToolState,
+    builtin_report, execution, is_tool_enabled,
 };
 use caudra_config::decisions::{
     DECISION_PRESETS, DecisionEndpointDef, DecisionPreset, DecisionProtocol,
@@ -50,7 +48,6 @@ use caudra_storage::decisions::read_active_decision_endpoint;
 use caudra_storage::model::persist_model_for_every_mode;
 use caudra_storage::sessions::StoredMode;
 use caudra_workspace::PlanRef;
-use serde_json::Value;
 
 use super::accounts;
 use super::decisions::{self, DecisionKey, DecisionRow};
@@ -61,7 +58,6 @@ const PROMPT_PLAN_PATH: &str = "<active plan document>";
 const PROMPT_PLAN_REFERENCE: &str = "active-plan-inspection";
 const REASON_INSPECTION_UNAVAILABLE: &str = "unavailable for this inspection runtime or mode";
 const REASON_VIA_CODE: &str = "via code";
-const REASON_SEARCH_ONLY: &str = "search-only: left out of the server list, found by search()";
 const AUTH_STATUS_EMPTY: &str = "       ";
 const AUTH_STATUS_ENV: &str = "\x1b[33m~ env  \x1b[0m";
 const AUTH_STATUS_KEY: &str = "\x1b[32m✓ key  \x1b[0m";
@@ -1496,7 +1492,6 @@ fn builtin_rows(
     definitions: &ToolDefinitions,
     policy: &ProfileToolPolicy,
 ) -> Vec<ToolRow> {
-    let deferral = BuiltinDeferral::resolve(&config.agent, model);
     let ctx = DescriptionContext {
         filter,
         audience: ToolAudience::MAIN,
@@ -1511,10 +1506,8 @@ fn builtin_rows(
                 SHELL_TOOL_NAME => vec![ToolKey::native(name), ToolKey::native(LEGACY_SHELL_KEY)],
                 _ => vec![ToolKey::native(name)],
             };
-            let mut report =
-                builtin_report(name, filter, cli_disallowed, &config.agent, model, deferral);
-            let decision =
-                registered_decision(entry, &ctx, policy, false, report.state == ToolState::Lazy);
+            let mut report = builtin_report(name, filter, cli_disallowed, &config.agent, model);
+            let decision = registered_decision(entry, &ctx, policy, false);
             if !matches!(decision.reason, CEILING_DISABLED | LEGACY_LOADING) {
                 report.reason = Some(decision.reason);
             }
@@ -1538,27 +1531,6 @@ fn builtin_rows(
     rows
 }
 
-/// Derived, not looked up: `tool_search` is synthesized into the request
-/// array whenever a built-in is deferred, so a lazy row means the model is
-/// offered the catalog too. MCP tools never reach it: they are called from
-/// the `code` tool.
-fn catalog_row(builtin: &[ToolRow]) -> Option<ToolRow> {
-    if builtin
-        .iter()
-        .any(|row| row.name == TOOL_SEARCH_TOOL_NAME && row.state.reaches_model())
-    {
-        return None;
-    }
-    let lazy = builtin.iter().any(|row| row.state == ToolState::Lazy);
-    lazy.then(|| ToolRow {
-        name: TOOL_SEARCH_TOOL_NAME.to_owned(),
-        source: CATALOG_SOURCE.to_owned(),
-        state: ToolState::On,
-        note: Some(REASON_CATALOG),
-        permission: None,
-    })
-}
-
 fn mcp_rows(mcp: Option<&McpSession>, permissions: &PermissionsConfig) -> Vec<ToolRow> {
     let Some(mcp) = mcp else {
         return Vec::new();
@@ -1574,13 +1546,13 @@ fn mcp_rows(mcp: Option<&McpSession>, permissions: &PermissionsConfig) -> Vec<To
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
-            let (state, note) = match (tool.disabled, tool.search_only) {
-                (true, _) => (
+            let (state, note) = if tool.disabled {
+                (
                     ToolState::Off,
                     tool.reason.unwrap_or(REASON_INSPECTION_UNAVAILABLE),
-                ),
-                (false, true) => (ToolState::On, REASON_SEARCH_ONLY),
-                (false, false) => (ToolState::On, REASON_VIA_CODE),
+                )
+            } else {
+                (ToolState::On, REASON_VIA_CODE)
             };
             ToolRow {
                 state,
@@ -1608,21 +1580,15 @@ fn inspection_definitions(
         .validate_bindings(registry.iter().iter().map(|entry| entry.name()))
         .map_err(|error| eyre!(error))
         .context("resolve system prompt profile tools")?;
-    let deferred = deferred_names(
-        &config.allowed_tools,
-        BuiltinDeferral::resolve(config, model),
-    );
     let mut definitions = registry.definitions_split_with_policy(
         vars,
         ctx,
         model.supports_tool_examples(),
-        &deferred,
         policy,
         session_plan,
     );
-    execution::configure_tools(
+    execution::configure_declared(
         &mut definitions.declared,
-        &mut definitions.deferred,
         config,
         ctx.audience == ToolAudience::MAIN,
         true,
@@ -1655,36 +1621,15 @@ fn inspection_vars(
 }
 
 fn inspection_tool_state(definitions: &ToolDefinitions, name: &str) -> ToolState {
-    if definitions
+    let declared = definitions
         .declared
         .as_array()
-        .is_some_and(|tools| tools.iter().any(|tool| tool["name"].as_str() == Some(name)))
-    {
+        .is_some_and(|tools| tools.iter().any(|tool| tool["name"].as_str() == Some(name)));
+    if declared || definitions.hosted.iter().any(|tool| tool == name) {
         ToolState::On
-    } else if definitions
-        .deferred
-        .iter()
-        .any(|tool| tool.name.as_ref() == name)
-    {
-        ToolState::Lazy
     } else {
         ToolState::Off
     }
-}
-
-fn inspection_catalog(mut definitions: ToolDefinitions) -> Value {
-    let deferred = DeferralSession::new(definitions.deferred, std::iter::empty());
-    let sections = Vec::from_iter(
-        deferred
-            .request_snapshot()
-            .extend_declared(&mut definitions.declared),
-    );
-    push_unbound_catalog(
-        &mut definitions.declared,
-        &sections,
-        ToolRegistry::global().has(caudra_agent::tools::TOOL_SEARCH_TOOL_NAME),
-    );
-    definitions.declared
 }
 
 fn inspection_mcp(
@@ -1802,8 +1747,7 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
     let definitions =
         inspection_definitions(reg, &vars, &ctx, &config.agent, &model, &policy, false)?;
     if schemas {
-        let defs = inspection_catalog(definitions);
-        println!("{}", serde_json::to_string_pretty(&defs)?);
+        println!("{}", serde_json::to_string_pretty(&definitions.declared)?);
         return Ok(());
     }
     let mcp = inspection_mcp(
@@ -1829,10 +1773,6 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
         &policy,
     );
     let mut mcp_tools = mcp_rows(mcp.as_ref(), &config.permissions);
-    if let Some(catalog) = catalog_row(&builtin) {
-        let at = builtin.partition_point(|row| row.name < catalog.name);
-        builtin.insert(at, catalog);
-    }
     if enabled_only {
         builtin.retain(|row| row.state.reaches_model());
         mcp_tools.retain(|row| row.state.reaches_model());
@@ -2064,7 +2004,7 @@ pub fn prompt(
         mode.has_session_plan(None),
     )?;
     if tools {
-        let defs = inspection_catalog(definitions);
+        let defs = &definitions.declared;
         if names {
             for name in defs
                 .as_array()
@@ -2075,7 +2015,7 @@ pub fn prompt(
                 println!("{name}");
             }
         } else {
-            println!("{}", serde_json::to_string_pretty(&defs)?);
+            println!("{}", serde_json::to_string_pretty(defs)?);
         }
         return Ok(());
     }
@@ -2086,7 +2026,6 @@ pub fn prompt(
         audience == ToolAudience::MAIN,
         true,
         &definitions.declared,
-        &definitions.deferred,
     );
     let filter = definitions.available_filter().for_mode(&mode);
     let output = match variant {
@@ -2161,13 +2100,13 @@ fn with_announcements(
 mod auth_tests {
     use super::*;
     use caudra_agent::permissions::PermissionManager;
-    use caudra_agent::tools::cli_tool_ctx;
     use caudra_agent::tools::native::plan::SESSION_PLAN_LABEL;
     use caudra_agent::tools::profile_policy::{
         PLAN_REQUIRED, PLAN_TOOL_NAME, PROFILE_DISABLED, PROFILE_LOADING,
     };
-    use caudra_agent::tools::report::REASON_CONFIG;
-    use caudra_config::{Effect, ExecutionMode, FeatureFlags, PermissionRule, RawConfig};
+    use caudra_agent::tools::report::{REASON_CODE_MODULE, REASON_CONFIG};
+    use caudra_agent::tools::{AUTOMATION_TOOL_NAME, cli_tool_ctx};
+    use caudra_config::{Effect, ExecutionMode, Feature, FeatureFlags, PermissionRule, RawConfig};
     use caudra_workcell::WorkcellHost;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -2526,21 +2465,7 @@ Title     default       provider/title\n"
         assert_eq!(custom_protocol(input), expected);
     }
 
-    fn state_rows(states: &[ToolState]) -> Vec<ToolRow> {
-        states
-            .iter()
-            .map(|state| ToolRow {
-                name: String::new(),
-                source: String::new(),
-                state: *state,
-                note: None,
-                permission: None,
-            })
-            .collect()
-    }
-
     #[test_case("eager", false, ToolState::On; "eager")]
-    #[test_case("lazy", false, ToolState::Lazy; "explicitly_lazy")]
     #[test_case("disabled", false, ToolState::Off; "disabled")]
     #[test_case("eager", true, ToolState::Off; "global_disable_wins")]
     fn inspection_profiles_match_schema_catalog_and_report(
@@ -2595,35 +2520,19 @@ Title     default       provider/title\n"
                 PROFILE_LOADING
             })
         );
-        assert_eq!(catalog_row(&rows).is_some(), expected == ToolState::Lazy);
-        let catalog = inspection_catalog(definitions);
-        let tools = catalog.as_array().unwrap();
         assert_eq!(
-            tools.iter().any(|tool| tool["name"] == INSPECTION_TODO),
+            definitions
+                .declared
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == INSPECTION_TODO),
             expected == ToolState::On
         );
-        let search = tools
-            .iter()
-            .find(|tool| tool["name"] == TOOL_SEARCH_TOOL_NAME);
-        assert_eq!(search.is_some(), expected == ToolState::Lazy);
-        if let Some(search) = search {
-            assert!(
-                search["description"]
-                    .as_str()
-                    .unwrap()
-                    .contains(INSPECTION_TODO)
-            );
-            assert!(
-                !search["description"]
-                    .as_str()
-                    .unwrap()
-                    .contains(&format!("\n- {INSPECTION_TASK}:"))
-            );
-        }
     }
 
     #[test_case("eager"; "eager")]
-    #[test_case("lazy"; "lazy")]
+    #[test_case("disabled"; "disabled")]
     fn tools_listing_explains_the_session_plan_requirement(exposure: &str) {
         let registry = ToolRegistry::new();
         caudra_agent::tools::native::register(&registry, FeatureFlags::default()).unwrap();
@@ -2674,7 +2583,7 @@ Title     default       provider/title\n"
         let registry = ToolRegistry::new();
         caudra_agent::tools::native::register(&registry, FeatureFlags::default()).unwrap();
         let policy: ProfileToolPolicy = serde_json::from_value(serde_json::json!({
-            "default": "disabled", "overrides": {"plan": "lazy"}
+            "default": "disabled", "overrides": {"plan": "eager"}
         }))
         .unwrap();
         let definitions = inspection_definitions(
@@ -2694,7 +2603,7 @@ Title     default       provider/title\n"
         assert_eq!(
             inspection_tool_state(&definitions, "plan"),
             if available {
-                ToolState::Lazy
+                ToolState::On
             } else {
                 ToolState::Off
             }
@@ -2718,19 +2627,10 @@ Title     default       provider/title\n"
             assert!(!reminder.contains("`shell`"));
             assert!(!reminder.contains("`file_write`"));
         }
-        assert_eq!(
-            inspection_catalog(definitions)
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|tool| tool["name"] == TOOL_SEARCH_TOOL_NAME),
-            available
-        );
     }
 
-    #[test_case("eager"; "declared")]
-    #[test_case("lazy"; "deferred")]
-    fn inspection_shapes_execution_for_profile_tools(exposure: &str) {
+    #[test]
+    fn inspection_shapes_execution_for_profile_tools() {
         let registry = ToolRegistry::new();
         caudra_agent::tools::native::register(&registry, FeatureFlags::default()).unwrap();
         let config = AgentConfig {
@@ -2738,7 +2638,7 @@ Title     default       provider/title\n"
             ..AgentConfig::default()
         };
         let policy: ProfileToolPolicy = serde_json::from_value(serde_json::json!({
-            "default": "disabled", "overrides": {INSPECTION_TASK: exposure}
+            "default": "disabled", "overrides": {INSPECTION_TASK: "eager"}
         }))
         .unwrap();
         let definitions = inspection_definitions(
@@ -2760,7 +2660,6 @@ Title     default       provider/title\n"
             .as_array()
             .unwrap()
             .iter()
-            .chain(definitions.deferred.iter().map(|tool| &tool.definition))
             .find(|tool| tool["name"] == INSPECTION_TASK)
             .unwrap();
         assert!(
@@ -2796,19 +2695,58 @@ Title     default       provider/title\n"
         assert!(message.contains(INSPECTION_BINDING_ERROR));
     }
 
-    /// The catalog has no registry entry, so the row exists exactly when the
-    /// request would carry one: whenever a built-in is deferred.
-    #[test_case(&[ToolState::On], false ; "nothing_lazy")]
-    #[test_case(&[ToolState::Off], false ; "disabled_is_not_lazy")]
-    #[test_case(&[ToolState::Lazy], true ; "lazy_builtin")]
-    fn the_catalog_row_tracks_whether_anything_is_lazy(builtin: &[ToolState], expected: bool) {
-        let row = catalog_row(&state_rows(builtin));
+    #[test]
+    fn a_code_hosted_tool_is_on_without_a_declaration() {
+        let registry = ToolRegistry::new();
+        caudra_agent::tools::native::register(
+            &registry,
+            FeatureFlags::NONE.with(Feature::Automations),
+        )
+        .unwrap();
+        let mut config = RawConfig::default().into_config(false).unwrap();
+        config.agent.features = FeatureFlags::NONE.with(Feature::Automations);
+        let model = Model::from_spec(BEST_SPEC).unwrap();
+        let filter = ToolFilter::from_config(&config.agent, &model, &[]);
+        let policy = ProfileToolPolicy::default();
+        let definitions = inspection_definitions(
+            &registry,
+            &Vars::new(),
+            &DescriptionContext {
+                filter: &filter,
+                audience: ToolAudience::MAIN,
+                workflows_available: false,
+            },
+            &config.agent,
+            &model,
+            &policy,
+            false,
+        )
+        .unwrap();
+        let rows = builtin_rows(
+            &registry,
+            &filter,
+            &config,
+            &[],
+            &model,
+            &definitions,
+            &policy,
+        );
+        let row = rows
+            .iter()
+            .find(|row| row.name == AUTOMATION_TOOL_NAME)
+            .unwrap();
 
-        assert_eq!(row.is_some(), expected);
-        if let Some(row) = row {
-            assert_eq!(row.name, TOOL_SEARCH_TOOL_NAME);
-            assert_eq!(row.state, ToolState::On);
-            assert!(row.permission.is_none(), "search has no permission gate");
-        }
+        assert_eq!(
+            (row.state, row.note),
+            (ToolState::On, Some(REASON_CODE_MODULE))
+        );
+        assert!(
+            !definitions
+                .declared
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == AUTOMATION_TOOL_NAME)
+        );
     }
 }

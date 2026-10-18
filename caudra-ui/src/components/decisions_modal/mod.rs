@@ -1162,11 +1162,11 @@ mod tests {
     /// project logged a tool search after it.
     fn snapshot() -> DecisionsFetchState {
         let own = decision(SESSION_ID, &DecisionFeature::PermissionAdvice, SESSION);
-        let other = decision(OTHER_ID, &DecisionFeature::ToolSearch, OTHER_SESSION);
+        let other = decision(OTHER_ID, &DecisionFeature::AutoScreening, OTHER_SESSION);
         let project = || ScopeActivity {
             stats: vec![
                 stats(&DecisionFeature::PermissionAdvice),
-                stats(&DecisionFeature::ToolSearch),
+                stats(&DecisionFeature::AutoScreening),
             ],
             recent: vec![other.clone(), own.clone()],
         };
@@ -1281,14 +1281,14 @@ mod tests {
         let fixture = Fixture::new(true);
         let mut modal = opened(snapshot());
         let _ = type_char(&mut modal, '3');
-        let tool_search = DecisionFeature::ToolSearch.label();
+        let other_feature = DecisionFeature::AutoScreening.label();
         let session = draw(&mut modal, &fixture, WIDE, TALL);
 
         assert_eq!(type_char(&mut modal, 'g'), DecisionsAction::Consumed);
 
         let project = draw(&mut modal, &fixture, WIDE, TALL);
-        assert!(!session.contains(tool_search), "{session}");
-        assert!(project.contains(tool_search), "{project}");
+        assert!(!session.contains(other_feature), "{session}");
+        assert!(project.contains(other_feature), "{project}");
         assert_eq!(modal.scope(), DecisionsScope::Project);
         let _ = type_char(&mut modal, 'g');
         let _ = type_char(&mut modal, 'g');
@@ -1606,7 +1606,7 @@ mod tests {
                 .recent
                 .insert(
                     0,
-                    decision(NEWER_ID, &DecisionFeature::ToolSearch, OTHER_SESSION),
+                    decision(NEWER_ID, &DecisionFeature::AutoScreening, OTHER_SESSION),
                 );
         }
 

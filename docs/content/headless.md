@@ -267,7 +267,7 @@ A session keeps its last 200 goals and 2,000 evaluations. The log is deleted wit
 
 ### Automations
 
-Automations are [experimental](/docs/configuration/#experimental-features) and need `experimental.automations`. With it on, a stream-json session runs an automation runtime beside the agent. Its scripts react to session events, such as the session going idle or a schedule coming due, and the messages they queue start runs of their own. The client arms and watches them through controls, and the model can read the same runtime through the [`automation` tool](/docs/tools/#automation).
+Automations are [experimental](/docs/configuration/#experimental-features) and need `experimental.automations`. With it on, a stream-json session runs an automation runtime beside the agent. Its scripts react to session events, such as the session going idle or a schedule coming due, and the messages they queue start runs of their own. The client arms and watches them through controls, and the model can read the same runtime through the [`automation` module](/docs/code/#tools-reached-from-code) of `code`.
 
 The `init` message says whether the runtime is attached and which controls it answers:
 
@@ -562,7 +562,7 @@ When a [decision feature](/docs/permissions/#decision-rows-in-the-transcript) ch
 
 ### Workflows
 
-Workflows are [experimental](/docs/configuration/#experimental-features) and need `experimental.workflows`. With it on, a stream-json session runs a workflow runtime beside the agent. Scripts under `.caudra/workflows/<name>.rhai` in the project can be started, watched, paused, and resumed from the wire, and the model can reach the same runtime through the [`workflow` tool](/docs/tools/#workflow). Runs outlive individual turns and keep a journal. Pause a run before closing the session if you intend to resume it later.
+Workflows are [experimental](/docs/configuration/#experimental-features) and need `experimental.workflows`. With it on, a stream-json session runs a workflow runtime beside the agent. Scripts under `.caudra/workflows/<name>.rhai` in the project can be started, watched, paused, and resumed from the wire, and the model can reach the same runtime through the [`workflow` module](/docs/code/#tools-reached-from-code) of `code`. Runs outlive individual turns and keep a journal. Pause a run before closing the session if you intend to resume it later.
 
 The `init` message says whether the runtime is attached and which controls it answers:
 

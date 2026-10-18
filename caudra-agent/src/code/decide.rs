@@ -1,27 +1,67 @@
-//! `decide()` and `rerank()` in a snippet: the decision dialect workflows use, sent through the
-//! session's decision engine under the `code` feature, so a snippet can judge and sort what its
-//! servers returned before any of it reaches the context.
+//! The `decisions` module: `decisions.decide()` and `decisions.rerank()` in a snippet, the
+//! decision dialect workflows use, sent through the session's decision engine under the `code`
+//! feature, so a snippet can judge and sort what it gathered before any of it reaches the context.
 
 use caudra_decision::DecisionError;
 use caudra_workflow::DecisionRequest;
 use caudra_workflow::decision::{
     PROBABILITY, RERANK_CANDIDATES_TYPE, RERANK_QUERY_TYPE, RERANK_THRESHOLD_RANGE,
-    RERANK_TOP_K_TYPE, RerankRequest, ScriptQuestions, ranked, rerank_batches, rerank_scores,
+    RERANK_TOP_K_TYPE, RerankRequest, ScriptQuestions, decide_label, ranked, rerank_batches,
+    rerank_label, rerank_scores,
 };
 use serde_json::{Map, Value, json};
 
-use super::names::{DECIDE_HELPER, RERANK_HELPER};
-use super::runner::{ScriptError, ScriptErrorKind};
+use super::args::bind;
+use super::gateway::{DECISIONS_ROW, Permission};
+use super::module::{
+    CallFailure, CallRun, HostCallPlan, HostModule, MemberDoc, ModuleDoc, Prepared,
+};
+use super::names::{DECIDE_HELPER, DECISIONS_MODULE, RERANK_HELPER};
+use super::output::CodeCall;
+use super::runner::{ScriptCall, ScriptError, ScriptErrorKind, ScriptInvocation};
 use crate::CancelToken;
 use crate::decisions::{DecisionContext, DecisionFeature, Decisions, join_answered};
+use crate::mcp::output::{DecisionHelper, McpBlock, McpHelper, McpOutput};
+use crate::tools::{ToolContext, ToolFailure};
 
-/// The decision helpers' signatures, for the type checker.
-pub const DECISION_STUBS: [&str; 2] = [
-    "async def decide(input: Any, questions: list[dict[str, Any]], model: str | None = None, timeout_ms: int | None = None) -> dict[str, Any]: ...",
-    "async def rerank(query: str, candidates: list[Any], threshold: float | None = None, top_k: int | None = None, model: str | None = None, timeout_ms: int | None = None) -> list[dict[str, Any]]: ...",
-];
-pub const DECIDE_PARAMS: &[&str] = &[INPUT_PARAM, QUESTIONS_PARAM, MODEL_PARAM, TIMEOUT_PARAM];
-pub const RERANK_PARAMS: &[&str] = &[
+/// The guidance that makes decisions worth having, shown in full by `help("decisions")` and, with
+/// an engine, in the `# MCP servers` reminder.
+pub const GUIDANCE: &str = "Use these on what a snippet gathered, to keep only what matters before it reaches you or to branch on a judgement without another round trip. They change nothing, and their answers are probabilities.\n\
+- `await decisions.decide(input, questions)`: answers every question about `input` in one request. Questions follow the OpenAI Decisions shape: `type`, `name`, `instructions`, as a `predicate`, a `choice` with `choices`, or a `score` with 2 to 10 `levels`, low to high. Read `r[\"by_name\"][name]`.\n\
+- `await decisions.rerank(query, candidates, threshold=None, top_k=None)`: `[{\"index\", \"score\"}]`, best first, for up to 256 strings or small dicts. `score` is the probability of relevance.\n\
+For good answers:\n\
+- Make `input` a dict under 1,500 bytes of only the judged fields, and name them in the questions. `instructions` can be `{\"question\": ..., \"focus\": \"what counts and what does not\"}`.\n\
+- Describe each choice or level by what sets it apart.\n\
+- Write `query` as the need, not keywords, and pass short labels as candidates. `index` maps back to the full item.\n\
+- Act on about 0.85 or more; below 0.6 is a guess.\n\
+- `decide` judges `input` as one item: call it once per item. A local engine queues overlapping calls, and each waits only `timeout_ms` (800 by default), so raise it to `gather` many.\n\
+Examples: `await decisions.decide({\"body\": b}, [{\"type\": \"score\", \"name\": \"severity\", \"instructions\": \"How severe is the bug `body` reports?\", \"levels\": [\"cosmetic\", {\"label\": \"blocking\", \"description\": \"no workaround\"}]}])`, `await decisions.rerank(\"issues reporting a crash at startup\", titles, top_k=10)`.";
+
+pub static DOC: ModuleDoc = ModuleDoc {
+    namespace: DECISIONS_MODULE,
+    summary: "`decisions`: judge or sort what a snippet gathered with the session's decision engine, when one is set up: `decisions.decide`, `decisions.rerank`.",
+    page: GUIDANCE,
+    members: &[
+        MemberDoc {
+            name: DECIDE_HELPER,
+            signature: "decide(input: Any, questions: list[dict[str, Any]], model: str | None = None, timeout_ms: int | None = None) -> dict[str, Any]",
+            awaited: true,
+            page: "Returns `{\"answers\": [...], \"by_name\": {name: answer}, \"model\"}`: a predicate answers `probability`, a choice `choice` with `probabilities`, a score `score` with `probabilities`. It asks no permission, and works while planning.",
+        },
+        MemberDoc {
+            name: RERANK_HELPER,
+            signature: "rerank(query: str, candidates: list[Any], threshold: float | None = None, top_k: int | None = None, model: str | None = None, timeout_ms: int | None = None) -> list[dict[str, Any]]",
+            awaited: true,
+            page: "Returns `[{\"index\", \"score\"}]` best first, keeping only scores at or above `threshold` and at most `top_k`. Judges up to 256 strings or small dicts, 16 to a request. Without `timeout_ms` each request waits the engine's rerank budget.",
+        },
+    ],
+};
+const DECIDE_CALL: &str = "decisions.decide";
+const RERANK_CALL: &str = "decisions.rerank";
+const NO_ENGINE: &str =
+    "decisions is unavailable: no decision engine is set up; choose one with /decision-model";
+const DECIDE_PARAMS: &[&str] = &[INPUT_PARAM, QUESTIONS_PARAM, MODEL_PARAM, TIMEOUT_PARAM];
+const RERANK_PARAMS: &[&str] = &[
     QUERY_PARAM,
     CANDIDATES_PARAM,
     THRESHOLD_PARAM,
@@ -46,7 +86,7 @@ const SCORE_FIELD: &str = "score";
 const MODEL_TYPE: &str = "model must be a non-empty str";
 const TIMEOUT_TYPE: &str = "timeout_ms must be a positive int";
 const TOO_MANY_CANDIDATES: &str =
-    "rerank() judges at most 256 candidates per call; filter the list first or split it";
+    "decisions.rerank() judges at most 256 candidates per call; filter the list first or split it";
 const UNAVAILABLE: &str = "the decision engine could not be reached";
 const TIMED_OUT: &str = "the decision engine did not answer in time";
 const INVALID_ANSWER: &str = "the decision engine sent an invalid answer";
@@ -60,9 +100,9 @@ pub struct Decide {
     pub request: DecisionRequest,
 }
 
-/// Reads `decide(input, questions, model=None, timeout_ms=None)`.
+/// Reads `decisions.decide(input, questions, model=None, timeout_ms=None)`.
 pub fn decide_request(arguments: &Map<String, Value>) -> Result<Decide, ScriptError> {
-    let helper = DECIDE_HELPER;
+    let helper = DECIDE_CALL;
     let input = arguments
         .get(INPUT_PARAM)
         .filter(|input| !input.is_null())
@@ -83,15 +123,15 @@ pub fn decide_request(arguments: &Map<String, Value>) -> Result<Decide, ScriptEr
     })
 }
 
-/// Reads `rerank(query, candidates, threshold=None, top_k=None, model=None, timeout_ms=None)`.
+/// Reads `decisions.rerank(query, candidates, threshold=None, top_k=None, model=None, timeout_ms=None)`.
 pub fn rerank_request(arguments: &Map<String, Value>) -> Result<RerankRequest, ScriptError> {
     let query = match arguments.get(QUERY_PARAM) {
-        None => return Err(missing(RERANK_HELPER, QUERY_PARAM)),
+        None => return Err(missing(RERANK_CALL, QUERY_PARAM)),
         Some(Value::String(query)) if !query.trim().is_empty() => query.clone(),
         Some(_) => return Err(value_error(RERANK_QUERY_TYPE)),
     };
     let candidates = match arguments.get(CANDIDATES_PARAM) {
-        None => return Err(missing(RERANK_HELPER, CANDIDATES_PARAM)),
+        None => return Err(missing(RERANK_CALL, CANDIDATES_PARAM)),
         Some(Value::Array(candidates))
             if candidates
                 .iter()
@@ -131,6 +171,142 @@ pub fn rerank_request(arguments: &Map<String, Value>) -> Result<RerankRequest, S
         threshold,
         top_k,
     })
+}
+
+/// The session's decision engine as a module, which exists in every run so `help()` can say why
+/// it is unavailable.
+pub struct DecisionsModule {
+    decisions: Option<Decisions>,
+}
+
+impl DecisionsModule {
+    pub fn new(decisions: Option<Decisions>) -> Self {
+        Self { decisions }
+    }
+}
+
+impl HostModule for DecisionsModule {
+    fn doc(&self) -> &'static ModuleDoc {
+        &DOC
+    }
+
+    fn unavailable(&self) -> Option<String> {
+        self.decisions.is_none().then(|| NO_ENGINE.to_owned())
+    }
+
+    /// A call shown as a row like any other. It asks no permission: the engine is the user's own,
+    /// and an answer is data that grants nothing.
+    fn prepare(&self, _ctx: &ToolContext, call: ScriptCall) -> Prepared {
+        let Some(decisions) = self.decisions.clone() else {
+            return Prepared::Plan(Err(runtime_error(NO_ENGINE)));
+        };
+        match pending(&call) {
+            Ok((Pending::Rerank(request), _)) if request.candidates.is_empty() => {
+                Prepared::Answer(ScriptInvocation::Ready(Ok(Value::Array(Vec::new()))))
+            }
+            Ok((pending, arguments)) => {
+                Prepared::Plan(Ok(Box::new(pending.plan(arguments, decisions))))
+            }
+            Err(error) => Prepared::Plan(Err(error)),
+        }
+    }
+}
+
+/// What a call asks, with the arguments its row keeps.
+fn pending(call: &ScriptCall) -> Result<(Pending, Map<String, Value>), ScriptError> {
+    match call.name.as_str() {
+        RERANK_HELPER => {
+            let arguments = bind(RERANK_CALL, RERANK_PARAMS, call)?;
+            Ok((Pending::Rerank(rerank_request(&arguments)?), arguments))
+        }
+        DECIDE_HELPER => {
+            let arguments = bind(DECIDE_CALL, DECIDE_PARAMS, call)?;
+            Ok((Pending::Decide(decide_request(&arguments)?), arguments))
+        }
+        name => Err(ScriptError::new(
+            ScriptErrorKind::Attribute,
+            DOC.no_member(name),
+        )),
+    }
+}
+
+/// A decision call whose arguments were read.
+enum Pending {
+    Decide(Decide),
+    Rerank(RerankRequest),
+}
+
+impl Pending {
+    fn plan(self, arguments: Map<String, Value>, decisions: Decisions) -> HostCallPlan {
+        let (helper, marked, called_as) = match &self {
+            Self::Decide(decide) => (
+                DECIDE_HELPER,
+                McpHelper::Decision(DecisionHelper::Decide),
+                decide_label(&decide.request.questions),
+            ),
+            Self::Rerank(request) => (
+                RERANK_HELPER,
+                McpHelper::Decision(DecisionHelper::Rerank),
+                rerank_label(request.candidates.len(), 1, 1),
+            ),
+        };
+        let row = CodeCall {
+            server: DECISIONS_ROW.to_owned(),
+            tool: helper.to_owned(),
+            called_as,
+            input: Value::Object(arguments),
+            helper: Some(marked),
+            ..CodeCall::default()
+        };
+        let run: CallRun = Box::new(move |ctx: ToolContext| {
+            Box::pin(async move { self.answer(&decisions, &ctx).await })
+        });
+        HostCallPlan {
+            row,
+            permission: Permission::none(),
+            read_only: true,
+            run,
+        }
+    }
+
+    async fn answer(
+        &self,
+        decisions: &Decisions,
+        ctx: &ToolContext,
+    ) -> Result<(McpOutput, Value), CallFailure> {
+        let context = ctx.permissions.decision_context(json!({
+            "tool_use_id": ctx.tool_use_id,
+        }));
+        let answered = match self {
+            Self::Decide(decide) => ask(decisions, &context, &decide.request, &ctx.cancel)
+                .await
+                .and_then(|result| {
+                    decide
+                        .questions
+                        .answers(&result)
+                        .map_err(|message| ScriptError::new(ScriptErrorKind::Runtime, message))
+                }),
+            Self::Rerank(request) => rerank(decisions, &context, request, &ctx.cancel).await,
+        };
+        match answered {
+            Ok(value) => {
+                let output = McpOutput {
+                    blocks: vec![McpBlock::Text {
+                        text: serde_json::to_string_pretty(&value).unwrap_or_default(),
+                    }],
+                    ..McpOutput::default()
+                };
+                Ok((output, value))
+            }
+            Err(error) => {
+                let failure = match ctx.cancel.is_cancelled() {
+                    true => ToolFailure::Cancelled,
+                    false => ToolFailure::Other,
+                };
+                Err(CallFailure::new(failure, error.message))
+            }
+        }
+    }
 }
 
 /// Asks one internal request and returns its `{answers, model}`.

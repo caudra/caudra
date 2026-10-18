@@ -880,7 +880,6 @@ fn tools_preview_active_turn_uses_committed_mode(
         &app.execution_agent_mode(),
         true,
         &app.state.session.cwd,
-        &[],
     );
     let store = ContextStore::new();
     store.publisher(ContextKey::Main).publish(snapshot);
@@ -960,7 +959,7 @@ fn tools_preview_idle_build_follows_the_session_plan(
 }
 
 #[test]
-fn tools_preview_refreshes_selection_model_history_and_policy_source() {
+fn tools_preview_refreshes_selection_model_and_policy_source() {
     let mut app = tools_preview_app();
     app.execute_tools();
     app.state.mode = Mode::Plan;
@@ -972,11 +971,7 @@ fn tools_preview_refreshes_selection_model_history_and_policy_source() {
         app.tools_snapshot.get().unwrap().model.spec,
         app.state.model.spec()
     );
-    app.shared_history
-        .as_ref()
-        .unwrap()
-        .store(Arc::new(HistorySnapshot::default()));
-    assert_eq!(app.poll_tools_snapshot(), Dirty::YES);
+    assert_eq!(app.poll_tools_snapshot(), Dirty::NO);
     let policy =
         serde_json::from_value(serde_json::json!({"overrides":{"plan":"disabled"}})).unwrap();
     app.tools_preview_source = Some(Arc::new(tools_preview_source(Default::default(), policy)));
@@ -4754,7 +4749,9 @@ fn delegation_msg(delegations: Vec<caudra_agent::Delegation>) -> Msg {
 /// the `code` run that made it, and costs the context window nothing.
 #[test]
 fn an_mcp_run_counts_each_server_call_it_made() {
-    use caudra_agent::code::output::{CALL_SOURCE, CodeCall, CodeCallStatus, CodeOutput};
+    use caudra_agent::code::output::{
+        CALL_SOURCE, CodeCall, CodeCallStatus, CodeOutput, HostedResult,
+    };
     use caudra_agent::tools::{CODE_TOOL_NAME, ToolFailure};
     use caudra_storage::tool_ledger::ToolOutcome;
 
@@ -4763,6 +4760,8 @@ fn an_mcp_run_counts_each_server_call_it_made() {
     const CREATED: &str = "create_issue";
     const RUN_SOURCE: &str = "native";
     const LISTED_MS: u64 = 40;
+    const HOSTED_TOOL: &str = "image_generate";
+    const HOSTED_MS: u64 = 70;
 
     let mut app = test_app();
     app.status = Status::Streaming;
@@ -4787,6 +4786,15 @@ fn an_mcp_run_counts_each_server_call_it_made() {
                     Some(ToolFailure::Denied),
                     0,
                 ),
+                CodeCall {
+                    hosted: Some(Box::new(HostedResult {
+                        tool: HOSTED_TOOL.into(),
+                        source: Some(RUN_SOURCE.into()),
+                        output: Some(ToolOutput::Plain("".into())),
+                        ..HostedResult::default()
+                    })),
+                    ..call("generate", CodeCallStatus::Success, None, HOSTED_MS)
+                },
             ],
             ..CodeOutput::default()
         }),
@@ -4828,6 +4836,10 @@ fn an_mcp_run_counts_each_server_call_it_made() {
     assert!(
         rows.contains(&(created.as_str(), CALL_SOURCE, ToolOutcome::Denied, 0, 0)),
         "{rows:?}"
+    );
+    assert!(
+        rows.contains(&(HOSTED_TOOL, RUN_SOURCE, ToolOutcome::Ok, HOSTED_MS, 0)),
+        "a module call counts under the tool it ran: {rows:?}"
     );
 }
 
@@ -17692,7 +17704,7 @@ fn deferred_permission_config_trust_does_not_close_a_manual_mcp_picker() {
         McpSnapshotReader::empty(),
         McpConfigErrors::new(PathBuf::new()),
     );
-    app.mcp_picker.open(None);
+    app.mcp_picker.open();
 
     let _ = app.tick();
 
@@ -22561,7 +22573,7 @@ fn open_permission_test_leader(app: &mut App) {
 #[test_case(open_relocation_picker; "relocation_picker")]
 #[test_case(open_permission_test_editor; "paste_editor")]
 #[test_case(open_permission_test_leader; "leader")]
-#[test_case(|app| app.mcp_picker.open(None); "mcp_picker")]
+#[test_case(|app| app.mcp_picker.open(); "mcp_picker")]
 #[test_case(|app| { app.execute_command(cmd("/permissions"), 0); app.finish_permission_jobs(); }; "permissions_picker")]
 fn permission_ownership_survives_overlays_before_and_after_arrival(open: fn(&mut App)) {
     for workbench in [false, true] {

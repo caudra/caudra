@@ -82,7 +82,7 @@ pub mod workcell;
 pub use decisions::{DecisionsConfig, FeatureMode};
 pub use experimental::{Feature, FeatureDisabled, FeatureFlags};
 pub use profile_tools::{
-    ProfileToolDefault, ProfileToolExposure, ProfileToolPolicy, ProfileToolSource,
+    LAZY_REMOVED, ProfileToolDefault, ProfileToolExposure, ProfileToolPolicy, ProfileToolSource,
     TOOL_POLICY_GROUPS, ToolPolicyGroup,
 };
 pub use steering::SteeringConfig;
@@ -111,6 +111,8 @@ const SHELL_ASYNC_UNSUPPORTED: &str = "shell_execution = async requires a fronte
 const TASK_SYNC_REQUIRED: &str = "agent.task_execution requires task calls to wait for completion";
 const TASK_ASYNC_REQUIRED: &str = "agent.task_execution requires background: true or omission";
 pub const CODE_LINES_RENAMED: &str = "`ui.tool_output_lines.python_execution` was renamed to `ui.tool_output_lines.code`, because the `code` tool now runs plain computation. Rename the key";
+pub const DEFER_BUILTIN_TOOLS_REMOVED: &str = "`agent.defer_builtin_tools` was removed with `tool_search`: the tools it deferred are now `code` modules (`image`, `host`, `workflow`, `automation`). Delete the key";
+pub const CODE_REQUIRED: &str = "`code` cannot be disabled: it hosts the `image`, `host`, `workflow`, `automation`, `history`, `mcp` and `decisions` modules; turn off a module's tool group instead (`images`, `execution`, `delegation`)";
 /// Windows that already exclude output need less held back, since the reserve
 /// only has to absorb estimation drift rather than a whole response.
 pub const DEFAULT_INPUT_BUDGET_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(10);
@@ -381,32 +383,18 @@ pub const WORKCELL_NATIVE_TOOL_NAMES: &[&str] = &[
 /// unreadable.
 pub const INTERNAL_COMPANION_TOOL_NAMES: &[&str] = &["tool_output"];
 
-/// Built-ins kept out of the request array until `tool_search` loads them.
-///
-/// Deferred because most sessions never call them, not because there are too
-/// many: `image_generate` needs a subscription and an intent to draw, and
-/// `execution_environment` reports host facts `shell` can also reach.
-/// Everything else is either used constantly or is the only way to do
-/// something. `plan` is the only way to write the plan in Plan mode, and a
-/// small model that never searches for it cannot save one.
-///
-/// A name here must also appear in one of the registration lists above, or it
-/// defers something that does not exist.
-///
-/// Whether a run actually withholds them is decided per model by
-/// [`DeferBuiltinTools`]: the saving is real for a small model and a loss for a
-/// capable one, which pays a prompt-cache prefix to load what it would have
-/// used anyway.
-pub const DEFERRED_BUILTIN_TOOLS: &[&str] = &[
-    "execution_environment",
+/// Hosts the modules that replaced tools of their own, so no filter or profile can withhold it.
+pub const CODE_TOOL_NAME: &str = "code";
+
+/// Built-ins the model reaches only through a `code` module, never declared as tools of their
+/// own. They stay registered, so their permission keys, rules, ledger names and cards are the
+/// same as when the model called them.
+pub const CODE_HOSTED_TOOLS: &[&str] = &[
     "image_generate",
+    "execution_environment",
     "workflow",
     "automation",
 ];
-
-pub fn is_deferred_builtin(name: &str) -> bool {
-    DEFERRED_BUILTIN_TOOLS.contains(&name)
-}
 
 /// `INTERNAL_COMPANION_TOOL_NAMES` overlaps the native list: it marks tools
 /// that stay enabled regardless of `disabled_tools`, which is orthogonal to
@@ -475,6 +463,9 @@ pub fn is_disableable_tool(tool: &str) -> bool {
 }
 
 fn validate_disabled_tool(tool: &str) -> Result<(), ConfigError> {
+    if tool == CODE_TOOL_NAME {
+        return Err(ConfigError::CodeRequired);
+    }
     if is_disableable_tool(tool) {
         return Ok(());
     }
@@ -652,6 +643,8 @@ pub enum ConfigError {
          (built-in tools: {valid}; MCP tools use `server.tool` or `server.*`)"
     )]
     UnknownTool { tool: String, valid: String },
+    #[error("invalid config: agent.disabled_tools: {}", CODE_REQUIRED)]
+    CodeRequired,
     /// A `plugins.<name>` table whose tool is now native: the key is kept for
     /// compatibility, but Rust validates it instead of the plugin.
     #[error("invalid config: plugins.{plugin}.{field}: {message}")]
@@ -1246,21 +1239,6 @@ pub enum NotificationMethod {
     Off,
 }
 
-/// Whether the tools in [`DEFERRED_BUILTIN_TOOLS`] start outside the request
-/// array.
-///
-/// `Auto` declares them upfront for a model known to be non-small, because it
-/// can choose well from a long list and a mid-session load resets a prompt-cache
-/// prefix it was already paying to keep. Small and unknown models defer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DeferBuiltinTools {
-    #[default]
-    Auto,
-    Always,
-    Never,
-}
-
 /// What happens when a shell command does nothing a native tool could not.
 ///
 /// A model that reaches for `rg` or `cat` out of habit pays for unstructured
@@ -1418,6 +1396,15 @@ impl<'de> Deserialize<'de> for RenamedCodeLines {
     }
 }
 
+#[derive(Default, Debug, Clone)]
+struct RemovedDeferBuiltinTools;
+
+impl<'de> Deserialize<'de> for RemovedDeferBuiltinTools {
+    fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+        Err(serde::de::Error::custom(DEFER_BUILTIN_TOOLS_REMOVED))
+    }
+}
+
 impl ToolOutputLinesFile {
     fn merge(&mut self, overlay: ToolOutputLinesFile) {
         merge_option!(
@@ -1523,7 +1510,10 @@ pub struct AgentFileConfig {
     pub shell_output_filter: Option<bool>,
     pub shell_workdir_redirect: Option<bool>,
     pub shell_native_redirect: Option<ShellNativeRedirect>,
-    pub defer_builtin_tools: Option<DeferBuiltinTools>,
+    /// Refuses the removed key, so a file that still sets it fails to load rather than
+    /// silently ignoring it.
+    #[serde(rename = "defer_builtin_tools")]
+    removed_defer_builtin_tools: RemovedDeferBuiltinTools,
     pub image_model: Option<ImageModel>,
     pub cache_warming: Option<CacheWarmingMode>,
     pub disabled_tools: Option<Vec<String>>,
@@ -1568,7 +1558,6 @@ impl AgentFileConfig {
             shell_output_filter,
             shell_workdir_redirect,
             shell_native_redirect,
-            defer_builtin_tools,
             image_model,
             cache_warming
         );
@@ -2839,14 +2828,6 @@ pub struct AgentConfig {
     pub shell_native_redirect: ShellNativeRedirect,
 
     #[config(
-        default = DeferBuiltinTools::Auto,
-        ty = "string",
-        default_doc = "auto",
-        desc = "When the on-demand built-in tools start outside the request array: `auto` defers them for a small model or one with no supply metadata and declares them upfront for a known non-small model, `always` defers for every model, `never` declares them upfront"
-    )]
-    pub defer_builtin_tools: DeferBuiltinTools,
-
-    #[config(
         default = ImageModel::Sunburst,
         ty = "string",
         default_doc = "sunburst",
@@ -2944,7 +2925,6 @@ impl AgentConfig {
             shell_output_filter: !no_rtk && file.shell_output_filter.unwrap_or(true),
             shell_workdir_redirect: file.shell_workdir_redirect.unwrap_or(true),
             shell_native_redirect: file.shell_native_redirect.unwrap_or_default(),
-            defer_builtin_tools: file.defer_builtin_tools.unwrap_or_default(),
             image_model: file.image_model.unwrap_or_default(),
             cache_warming: file.cache_warming.unwrap_or_default(),
             max_turns: None,
@@ -5433,15 +5413,16 @@ mod tests {
         );
     }
 
-    #[test_case("auto", DeferBuiltinTools::Auto ; "auto")]
-    #[test_case("always", DeferBuiltinTools::Always ; "always")]
-    #[test_case("never", DeferBuiltinTools::Never ; "never")]
-    fn defer_builtin_tools_deserialize(value: &str, expected: DeferBuiltinTools) {
-        let raw: RawConfig =
-            toml::from_str(&format!("[agent]\ndefer_builtin_tools = \"{value}\"\n")).unwrap();
-        assert_eq!(
-            raw.into_config(false).unwrap().agent.defer_builtin_tools,
-            expected
+    #[test_case("auto" ; "auto")]
+    #[test_case("always" ; "always")]
+    #[test_case("never" ; "never")]
+    fn removed_defer_builtin_tools_names_its_removal(value: &str) {
+        let error =
+            toml::from_str::<RawConfig>(&format!("[agent]\ndefer_builtin_tools = \"{value}\"\n"))
+                .unwrap_err();
+        assert!(
+            error.to_string().contains(DEFER_BUILTIN_TOOLS_REMOVED),
+            "{error}"
         );
     }
 
@@ -7763,6 +7744,21 @@ mod tests {
             .expect("unknown tool")
             .to_string();
         assert!(error.contains("no tool is named"), "{error}");
+    }
+
+    #[test_case("[agent]\ndisabled_tools = [\"code\"]\n", None ; "global")]
+    #[test_case("[agent]\ndisabled_tools = [\"shell\"]\n", Some("[agent]\ndisabled_tools = [\"code\"]\n") ; "project")]
+    fn disabling_code_names_why_it_is_required(global: &str, project: Option<&str>) {
+        let mut merged: RawConfig = toml::from_str(global).unwrap();
+        if let Some(project) = project {
+            merged.merge(toml::from_str(project).unwrap());
+        }
+        let error = merged
+            .into_config(false)
+            .err()
+            .expect("code is required")
+            .to_string();
+        assert!(error.contains(CODE_REQUIRED), "{error}");
     }
 
     #[test]

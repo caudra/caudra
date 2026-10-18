@@ -64,8 +64,6 @@ const COMPACTION_BORDER_TEXT: &str =
 /// What a batch appends to its own id to run a child under, from
 /// `batch::child_tool_use_id`.
 const BATCH_CHILD_ID_SEPARATOR: char = ':';
-const TOOLS_LOADED_PREFIX: &str = "Loaded ";
-const TOOLS_LOADED_SUFFIX: &str = " - the tools array changed, so the prompt cache prefix resets.";
 /// What parts an implement message's header from the plan it carries.
 const IMPLEMENT_HEADER_END: &str = "\n\n";
 
@@ -489,15 +487,6 @@ impl Chat {
                     }
                 }
                 self.stall_pending = false;
-            }
-            AgentEvent::ToolsLoaded { names } => {
-                self.messages_panel.flush();
-                let text = format!(
-                    "{TOOLS_LOADED_PREFIX}{}{TOOLS_LOADED_SUFFIX}",
-                    names.join(", ")
-                );
-                self.messages_panel
-                    .push(DisplayMessage::new(DisplayRole::Notice, text));
             }
             AgentEvent::SubagentHistory { .. } | AgentEvent::Workflow(_) => {}
             AgentEvent::LiveToolBuf { id, body } => {

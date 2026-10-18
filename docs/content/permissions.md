@@ -425,7 +425,7 @@ A glob that [shell parsing](#shell-parsing) can check, such as `src/*`, is expan
 
 A read-only agent's file tools can also read this project's plans and memory notes without asking, as described under [Plan mode](#plan-mode). A shell line reading them is refused, because they sit outside the project. A task can read the session plan with the `plan` tool but cannot replace it. An agent a workflow starts while the session is in Plan can read it too. One started in Build gets no plan.
 
-Profiles cannot relax this restriction. Safe lazy tools remain discoverable through `tool_search`, but loading a schema cannot grant write access or the main agent's right to replace the plan.
+Profiles cannot relax this restriction or grant write access or the main agent's right to replace the plan.
 
 ## Stored rules
 
@@ -765,7 +765,7 @@ The initial working directory is context, not confinement. An approved shell com
 
 The builtin read-only classifier is conservative about mutation flags, executable paths, expansions, and named file operands. For example, `git branch -D`, tag creation, and reflog expiration do not receive read-only authority. A path-qualified executable such as `./cat` does not inherit the builtin reader allowance, and an explicitly named protected operand such as `.env` requires review. These checks do not guarantee containment of recursive reads, program configuration, or repository code. Build and test commands are not read-only exemptions.
 
-`execution_environment` still requires explicit approval under normal prompting policy. Its fixed probes can invoke sudo policy hooks or refresh credentials. A remembered exact grant can avoid repeated prompts without treating the tool as a pure read. Plan mode asks before running it as well, and [Plan mode](#plan-mode) describes which grants apply there.
+`execution_environment`, which a snippet calls as `host.environment()`, still requires explicit approval under normal prompting policy. Its fixed probes can invoke sudo policy hooks or refresh credentials. A remembered exact grant can avoid repeated prompts without treating the tool as a pure read. Plan mode asks before running it as well, and [Plan mode](#plan-mode) describes which grants apply there.
 
 ### Path components
 

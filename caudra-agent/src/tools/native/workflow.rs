@@ -13,6 +13,7 @@ use caudra_workflow::{
 };
 use serde_json::Value;
 
+use crate::code::hosted::HostedCall;
 use crate::tools::registry::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolFailure,
     ToolInvocation,
@@ -225,7 +226,7 @@ impl ToolInvocation for WorkflowCall {
             let Some(handle) = ctx.workflow.as_ref() else {
                 return error(ToolFailure::Other, UNAVAILABLE.to_owned());
             };
-            render(handle, self.request).await
+            render(handle, self.request, ctx.hosted.as_ref()).await
         })
     }
 }
@@ -243,8 +244,16 @@ fn header(action: &str, request: &WorkflowRequest) -> String {
     }
 }
 
-async fn render(handle: &WorkflowHandle, request: WorkflowRequest) -> ToolExecResult {
-    match handle.request(request).await {
+async fn render(
+    handle: &WorkflowHandle,
+    request: WorkflowRequest,
+    hosted: Option<&HostedCall>,
+) -> ToolExecResult {
+    let answer = handle.request(request).await;
+    if let (Some(hosted), Ok(answer)) = (hosted, &answer) {
+        hosted.offer_detail(answer);
+    }
+    match answer {
         Ok(WorkflowResponse::Catalog(catalog)) => plain(render_catalog(&catalog)),
         Ok(WorkflowResponse::Validation { name, ok, report }) => {
             let verdict = if ok { "valid" } else { "invalid" };

@@ -25,6 +25,8 @@ const SYNTAX_GUIDANCE: &str = "The snippet is not valid Python, so nothing ran."
 /// How the interpreter's `NameError` starts, before the name.
 const NAME_ERROR_PREFIX: &str = "name '";
 const NAME_ERROR_QUOTE: char = '\'';
+/// The withheld builtin a hosted run's host answers itself.
+const HOSTED_HELP: &str = "help";
 
 /// Classification of a raised exception plus the guidance that accompanies it.
 pub(crate) struct Diagnosis {
@@ -158,9 +160,13 @@ pub(crate) fn hosted_timeout_guidance(detail: &str) -> String {
 }
 
 fn hosted_name_guidance(detail: &str) -> String {
+    let withheld: Vec<&str> = WITHHELD_BUILTINS
+        .into_iter()
+        .filter(|name| *name != HOSTED_HELP)
+        .collect();
     format!(
-        "Undefined name. Use only the names the catalog lists, or find one with search(). Note that {} are not implemented. ({detail})",
-        withheld_builtins!()
+        "Undefined name. Use only the names the catalog lists, or find one with help(). Note that {} are not implemented. ({detail})",
+        oxford(&withheld)
     )
 }
 
@@ -240,7 +246,7 @@ pub(crate) fn diagnose_type_errors_for(diagnostics: &str, surface: Surface) -> S
     if surface == Surface::Hosted {
         if trimmed.contains(UNRESOLVED_ATTRIBUTE_RULE) {
             return format!(
-                "A name the snippet calls does not exist, so nothing was executed. Check the exact name and signature with search() before calling it.\n{trimmed}"
+                "A name the snippet calls does not exist, so nothing was executed. Check the exact name and signature with help(\"module\") before calling it.\n{trimmed}"
             );
         }
         if let Some(name) = unresolved_reference(trimmed)
@@ -256,7 +262,7 @@ pub(crate) fn diagnose_type_errors_for(diagnostics: &str, surface: Surface) -> S
         }
         if unresolved_import(trimmed).is_none() && !trimmed.contains(UNRESOLVED_REFERENCE_RULE) {
             return format!(
-                "Type checking rejected this snippet before running it, so nothing was executed. Arguments are checked against each tool's signature; search() shows the exact signature. Annotations are never required, so widen or drop an annotation the diagnostic names rather than adding more.\n{trimmed}"
+                "Type checking rejected this snippet before running it, so nothing was executed. Arguments are checked against each tool's signature; help(\"module.name\") shows the exact signature. Annotations are never required, so widen or drop an annotation the diagnostic names rather than adding more.\n{trimmed}"
             );
         }
     }
@@ -332,13 +338,23 @@ mod tests {
     }
 
     #[test]
-    fn hosted_unknown_attributes_point_at_search() {
+    fn hosted_unknown_attributes_point_at_help() {
         let text = diagnose_type_errors_for(
             "snippet.py:1:7: error[unresolved-attribute] Object of type `_Github` has no attribute `nope`",
             Surface::Hosted,
         );
-        assert!(text.contains("search()"), "{text}");
+        assert!(text.contains("help("), "{text}");
         assert!(!text.contains("between code calls"), "{text}");
+    }
+
+    #[test]
+    fn a_hosted_undefined_name_never_calls_help_withheld() {
+        let text = diagnose_type_errors_for(
+            "snippet.py:1:1: error[unresolved-reference] Name `decide` used when not defined",
+            Surface::Hosted,
+        );
+        assert!(text.contains("find one with help()"), "{text}");
+        assert!(!text.contains("breakpoint, help"), "{text}");
     }
 
     /// Type checking is the default, so these are the messages an agent actually receives. Each must

@@ -4,6 +4,7 @@
 //! servers and cheapest first, so one large server cannot crowd out the rest.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::LazyLock;
 
 use caudra_providers::{Message, estimate_tokens};
 
@@ -11,6 +12,7 @@ use super::naming::Names;
 use super::signature::{one_line, signature, summary};
 use super::view::{ServerState, ServerView};
 use crate::agent::{last_announced, standing_notice};
+use crate::code::decide::GUIDANCE;
 use crate::mcp::McpSession;
 use crate::prompt::{
     CATALOG_SLOT, MCP_SERVERS_MARKER, MCP_SERVERS_PROMPT, MCP_SERVERS_WITHDRAWN_PROMPT,
@@ -21,7 +23,7 @@ pub const CATALOG_BUDGET_TOKENS: usize = 2_000;
 const USAGE: &str = "Call these with the `code` tool: `await <server>.<tool>(...)`.";
 const NO_SERVERS: &str = "No MCP server is enabled.";
 const COMPLETE: &str = "This list is complete: do not guess other names.";
-const PARTIAL: &str = "Some tools are not listed: find them with `search(\"query\")`, which returns exact signatures.";
+const PARTIAL: &str = "Some tools are not listed: find them with `mcp.search(\"query\")`, which returns exact signatures.";
 const CONNECTED: &str = "connected";
 const CONNECTING: &str = "connecting";
 const AWAITING_TRUST: &str = "awaiting trust";
@@ -31,18 +33,10 @@ const RESOURCES: &str = "resources";
 const TOOL: &str = "tool";
 const TOOLS: &str = "tools";
 const MAX_FAILURE_CHARS: usize = 120;
-/// Appended when the session has a decision engine, which the helpers need.
-const DECISIONS_SECTION: &str = "\n\n## Decision helpers\n\
-Use these in a `code` snippet on what it gathered, to keep only what matters before it reaches you or to branch on a judgement without another round trip. They change nothing, and their answers are probabilities.\n\
-- `await decide(input, questions)`: answers every question about `input` in one request. Questions follow the OpenAI Decisions shape: `type`, `name`, `instructions`, as a `predicate`, a `choice` with `choices`, or a `score` with 2 to 10 `levels`, low to high. Read `r[\"by_name\"][name]`.\n\
-- `await rerank(query, candidates, threshold=None, top_k=None)`: `[{\"index\", \"score\"}]`, best first, for up to 256 strings or small dicts. `score` is the probability of relevance.\n\
-For good answers:\n\
-- Make `input` a dict under 1,500 bytes of only the judged fields, and name them in the questions. `instructions` can be `{\"question\": ..., \"focus\": \"what counts and what does not\"}`.\n\
-- Describe each choice or level by what sets it apart.\n\
-- Write `query` as the need, not keywords, and pass short labels as candidates. `index` maps back to the full item.\n\
-- Act on about 0.85 or more; below 0.6 is a guess.\n\
-- `decide()` judges `input` as one item: call it once per item. A local engine queues overlapping calls, and each waits only `timeout_ms` (800 by default), so raise it to `gather` many.\n\
-Examples: `await decide({\"body\": b}, [{\"type\": \"score\", \"name\": \"severity\", \"instructions\": \"How severe is the bug `body` reports?\", \"levels\": [\"cosmetic\", {\"label\": \"blocking\", \"description\": \"no workaround\"}]}])`, `await rerank(\"issues reporting a crash at startup\", titles, top_k=10)`.";
+const DECISIONS_HEADING: &str = "\n\n## Decision helpers\n";
+/// Appended when the session has a decision engine, which the `decisions` module needs.
+static DECISIONS_SECTION: LazyLock<String> =
+    LazyLock::new(|| format!("{DECISIONS_HEADING}{GUIDANCE}"));
 
 /// What keeps a server's tools out of reach, or `None` when it is connected.
 pub fn unavailable(state: &ServerState) -> Option<String> {
@@ -78,7 +72,7 @@ pub fn notice(
     let listed = (catalog.is_some() || decisions).then(|| {
         let mut body = catalog.unwrap_or_else(|| NO_SERVERS.to_owned());
         if decisions {
-            body.push_str(DECISIONS_SECTION);
+            body.push_str(&DECISIONS_SECTION);
         }
         MCP_SERVERS_PROMPT.replace(CATALOG_SLOT, &body)
     });
@@ -156,7 +150,6 @@ impl<'a> Section<'a> {
             names
                 .tools(server)
                 .into_iter()
-                .filter(|(_, tool)| !tool.search_only)
                 .map(|(method, tool)| {
                     let signature = signature(method, tool);
                     let summary = summary(tool);
@@ -381,22 +374,6 @@ mod tests {
         assert!(!catalog.contains("- a_"), "{catalog}");
     }
 
-    #[test_case(true, PARTIAL, "showing 1 of 2 tools" ; "search_only_is_never_listed")]
-    #[test_case(false, COMPLETE, "2 tools" ; "listed_tools_are_complete")]
-    fn search_only_tools_stay_out_of_the_list(search_only: bool, sentence: &str, count: &str) {
-        let hidden = ToolView {
-            search_only,
-            ..described("hidden")
-        };
-        let catalog = catalog(&[server("alpha", vec![described("shown"), hidden])]);
-        assert!(catalog.contains(sentence), "{catalog}");
-        assert!(
-            catalog.contains(&format!("## alpha (connected, {count})")),
-            "{catalog}"
-        );
-        assert_eq!(catalog.contains("- hidden("), !search_only, "{catalog}");
-    }
-
     #[test]
     fn listed_tools_print_in_method_order() {
         let tools = vec![
@@ -440,13 +417,17 @@ mod tests {
         let session = crate::mcp::stub_session(&[(STUB_TOOL, LONG_DESCRIPTION)]);
         let listed = notice(&[], Some(&session), decisions).expect(LISTED);
         let text = listed.user_text().unwrap();
-        assert_eq!(text.contains(DECISIONS_SECTION), decisions, "{text}");
+        assert_eq!(
+            text.contains(DECISIONS_SECTION.as_str()),
+            decisions,
+            "{text}"
+        );
     }
 
     #[test]
     fn decision_helpers_are_stated_without_a_server() {
-        let expected =
-            MCP_SERVERS_PROMPT.replace(CATALOG_SLOT, &format!("{NO_SERVERS}{DECISIONS_SECTION}"));
+        let expected = MCP_SERVERS_PROMPT
+            .replace(CATALOG_SLOT, &format!("{NO_SERVERS}{}", *DECISIONS_SECTION));
         let listed = notice(&[], None, true).expect(LISTED);
         assert_eq!(listed.user_text(), Some(expected.as_str()));
         let history = [listed];
@@ -457,7 +438,7 @@ mod tests {
     fn decision_helpers_stay_within_their_budget() {
         const DECISIONS_SECTION_TOKENS: usize = 420;
         const OVER_BUDGET: &str = "the decision helpers outgrew their share of the reminder";
-        let tokens = estimate_tokens(DECISIONS_SECTION) as usize;
+        let tokens = estimate_tokens(&DECISIONS_SECTION) as usize;
         assert!(
             tokens <= DECISIONS_SECTION_TOKENS,
             "{OVER_BUDGET}: {tokens}"

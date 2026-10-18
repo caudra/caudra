@@ -5,7 +5,9 @@ use serde::{
     de::{self, MapAccess, Visitor},
 };
 
-use crate::{INTERNAL_COMPANION_TOOL_NAMES, ToolKey, is_builtin_tool};
+use crate::{
+    CODE_REQUIRED, CODE_TOOL_NAME, INTERNAL_COMPANION_TOOL_NAMES, ToolKey, is_builtin_tool,
+};
 
 pub const TOOL_POLICY_GROUPS: &[(ToolPolicyGroup, &[&str])] = &[
     (ToolPolicyGroup::Web, &["websearch", "webfetch"]),
@@ -49,7 +51,14 @@ pub const TOOL_POLICY_GROUPS: &[(ToolPolicyGroup, &[&str])] = &[
         ],
     ),
 ];
-const RESERVED_SELECTORS: &[&str] = &["tool_search", "report_to_parent", "structured_output"];
+const RESERVED_SELECTORS: &[&str] = &["report_to_parent", "structured_output"];
+pub const LAZY_REMOVED: &str = "`lazy` was removed with `tool_search`; use `eager` or `disabled`";
+const INHERIT: &str = "inherit";
+const EAGER: &str = "eager";
+const DISABLED: &str = "disabled";
+const LAZY: &str = "lazy";
+const DEFAULT_STATES: &[&str] = &[INHERIT, EAGER, DISABLED];
+const EXPOSURE_STATES: &[&str] = &[EAGER, DISABLED];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,22 +73,43 @@ pub enum ToolPolicyGroup {
     Messaging,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProfileToolExposure {
     Eager,
-    Lazy,
     Disabled,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ProfileToolDefault {
     #[default]
     Inherit,
     Eager,
-    Lazy,
     Disabled,
+}
+
+impl<'de> Deserialize<'de> for ProfileToolDefault {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let state = String::deserialize(deserializer)?;
+        match state.as_str() {
+            INHERIT => Ok(Self::Inherit),
+            EAGER => Ok(Self::Eager),
+            DISABLED => Ok(Self::Disabled),
+            LAZY => Err(de::Error::custom(LAZY_REMOVED)),
+            other => Err(de::Error::unknown_variant(other, DEFAULT_STATES)),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProfileToolExposure {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match ProfileToolDefault::deserialize(deserializer)? {
+            ProfileToolDefault::Inherit => {
+                Err(de::Error::unknown_variant(INHERIT, EXPOSURE_STATES))
+            }
+            ProfileToolDefault::Eager => Ok(Self::Eager),
+            ProfileToolDefault::Disabled => Ok(Self::Disabled),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,7 +151,6 @@ impl ProfileToolPolicy {
         match self.default {
             ProfileToolDefault::Inherit => None,
             ProfileToolDefault::Eager => Some(ProfileToolExposure::Eager),
-            ProfileToolDefault::Lazy => Some(ProfileToolExposure::Lazy),
             ProfileToolDefault::Disabled => Some(ProfileToolExposure::Disabled),
         }
     }
@@ -152,7 +181,10 @@ fn selectors<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<BTreeMap<String, ProfileToolExposure>, D::Error> {
     let selectors: BTreeMap<String, ProfileToolExposure> = unique_map(deserializer)?;
-    for name in selectors.keys() {
+    for (name, exposure) in &selectors {
+        if name == CODE_TOOL_NAME && *exposure == ProfileToolExposure::Disabled {
+            return Err(de::Error::custom(CODE_REQUIRED));
+        }
         if RESERVED_SELECTORS.contains(&name.as_str())
             || INTERNAL_COMPANION_TOOL_NAMES.contains(&name.as_str())
         {
@@ -209,25 +241,29 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{ProfileToolExposure, ProfileToolPolicy, ProfileToolSource, TOOL_POLICY_GROUPS};
+    use super::{
+        LAZY_REMOVED, ProfileToolExposure, ProfileToolPolicy, ProfileToolSource, TOOL_POLICY_GROUPS,
+    };
+    use crate::CODE_REQUIRED;
     use std::collections::HashSet;
     use test_case::test_case;
 
     #[test_case("{}", true; "empty")]
     #[test_case(r#"{"default":"inherit"}"#, true; "inherit")]
-    #[test_case(r#"{"default":"lazy","groups":{"support":"eager"}}"#, true; "states")]
+    #[test_case(r#"{"default":"disabled","groups":{"support":"eager"}}"#, true; "states")]
+    #[test_case(r#"{"default":"disabled"}"#, true; "default_disabled_keeps_code")]
+    #[test_case(r#"{"overrides":{"code":"eager"}}"#, true; "code_eager")]
     #[test_case(r#"{"extra":true}"#, false; "unknown_field")]
     #[test_case(r#"{"groups":{"unknown":"eager"}}"#, false; "unknown_group")]
     #[test_case(r#"{"groups":{"documents":"eager"}}"#, false; "removed_document_group")]
     #[test_case(r#"{"groups":{"source_code":"eager"}}"#, true; "source_code_group")]
     #[test_case(r#"{"groups":{"code_graph":"eager"}}"#, false; "renamed_code_graph_group")]
     #[test_case(r#"{"groups":{"web":"inherit"}}"#, false; "entry_inherit")]
-    #[test_case(r#"{"overrides":{"web*":"lazy"}}"#, false; "glob")]
-    #[test_case(r#"{"overrides":{"a..b":"lazy"}}"#, false; "malformed_mcp")]
-    #[test_case(r#"{"overrides":{"tool_search":"lazy"}}"#, false; "loader")]
+    #[test_case(r#"{"overrides":{"web*":"eager"}}"#, false; "glob")]
+    #[test_case(r#"{"overrides":{"a..b":"eager"}}"#, false; "malformed_mcp")]
     #[test_case(r#"{"overrides":{"tool_output":"disabled"}}"#, false; "pager")]
-    #[test_case(r#"{"overrides":{"file_read":"lazy","file_read":"eager"}}"#, false; "duplicate_selector")]
-    #[test_case(r#"{"groups":{"web":"lazy","web":"eager"}}"#, false; "duplicate_group")]
+    #[test_case(r#"{"overrides":{"file_read":"disabled","file_read":"eager"}}"#, false; "duplicate_selector")]
+    #[test_case(r#"{"groups":{"web":"disabled","web":"eager"}}"#, false; "duplicate_group")]
     fn strict_policy(json: &str, valid: bool) {
         assert_eq!(
             serde_json::from_str::<ProfileToolPolicy>(json).is_ok(),
@@ -235,13 +271,22 @@ mod tests {
         );
     }
 
+    #[test_case(r#"{"default":"lazy"}"#, LAZY_REMOVED; "lazy_default")]
+    #[test_case(r#"{"groups":{"web":"lazy"}}"#, LAZY_REMOVED; "lazy_group")]
+    #[test_case(r#"{"overrides":{"github.*":"lazy"}}"#, LAZY_REMOVED; "lazy_override")]
+    #[test_case(r#"{"overrides":{"code":"disabled"}}"#, CODE_REQUIRED; "code_disabled")]
+    fn removed_or_required_states_name_why(json: &str, expected: &str) {
+        let error = serde_json::from_str::<ProfileToolPolicy>(json).unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
     #[test_case("file_read", ProfileToolSource::Native, ProfileToolExposure::Eager; "exact")]
-    #[test_case("file_write", ProfileToolSource::Native, ProfileToolExposure::Lazy; "group")]
+    #[test_case("file_write", ProfileToolSource::Native, ProfileToolExposure::Eager; "group")]
     #[test_case("file_write", ProfileToolSource::Custom, ProfileToolExposure::Disabled; "shadow")]
-    #[test_case("github.read", ProfileToolSource::Mcp, ProfileToolExposure::Lazy; "server")]
+    #[test_case("github.read", ProfileToolSource::Mcp, ProfileToolExposure::Eager; "server")]
     #[test_case("github.delete", ProfileToolSource::Mcp, ProfileToolExposure::Disabled; "mcp_exact")]
     fn resolution(name: &str, source: ProfileToolSource, expected: ProfileToolExposure) {
-        let policy: ProfileToolPolicy = serde_json::from_str(r#"{"default":"disabled","groups":{"files":"lazy"},"overrides":{"file_read":"eager","github.*":"lazy","github.delete":"disabled"}}"#).unwrap();
+        let policy: ProfileToolPolicy = serde_json::from_str(r#"{"default":"disabled","groups":{"files":"eager"},"overrides":{"file_read":"eager","github.*":"eager","github.delete":"disabled"}}"#).unwrap();
         assert_eq!(policy.exposure(name, source), Some(expected));
     }
 

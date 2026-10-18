@@ -33,6 +33,7 @@ const INVALID_CREDENTIAL_MESSAGE: &str =
     "credential must be nonempty and contain no control characters";
 const STORED_KEY_FIELD: &str = "api_key";
 const API_KEY_ENV_FIELD: &str = "api_key_env";
+pub const TOOL_SEARCH_FEATURE_REMOVED: &str = "`decisions.features.tool_search` was removed with `tool_search`: no tool is loaded on demand any more. Delete the key";
 
 /// A ready-made endpoint the login flows offer by name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +212,15 @@ fn invalid(field: &'static str, message: &'static str) -> DecisionsConfigError {
     DecisionsConfigError::Invalid { field, message }
 }
 
+#[derive(Debug, Clone, Default)]
+struct RemovedToolSearch;
+
+impl<'de> Deserialize<'de> for RemovedToolSearch {
+    fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+        Err(serde::de::Error::custom(TOOL_SEARCH_FEATURE_REMOVED))
+    }
+}
+
 macro_rules! features {
     ($($field:ident: [$($mode:ident),+], $description:literal);+ $(;)?) => {
         #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -222,6 +232,9 @@ macro_rules! features {
         #[serde(default, deny_unknown_fields)]
         pub struct RawDecisionFeatures {
             $(pub $field: Option<FeatureMode>,)+
+            /// Refuses the removed feature, so a file that still sets it fails to load.
+            #[serde(rename = "tool_search")]
+            removed_tool_search: RemovedToolSearch,
         }
 
         impl RawDecisionFeatures {
@@ -280,8 +293,6 @@ features! {
         "Add caution to flagged web/MCP output and tighten upload/credential Auto screening for the session. Content remains available.";
     shell_duration: [Advise, Enforce],
         "Advise with local shell estimates. Enforce may fill an omitted timeout and select delivery at admission. Explicit timeouts stay unchanged.";
-    tool_search: [Enforce],
-        "Rerank the existing lexical tool shortlist. This neither loads arbitrary names nor grants execution permission.";
     skill_suggestions: [Advise],
         "Suggest a shortlisted skill. The agent still chooses whether to load it.";
     goal_prescreen: [Enforce],
@@ -1514,7 +1525,6 @@ mod tests {
     #[test_case("shell_effect", true, false)]
     #[test_case("content_screening", true, false)]
     #[test_case("shell_duration", true, true)]
-    #[test_case("tool_search", false, true)]
     #[test_case("skill_suggestions", true, false)]
     #[test_case("goal_prescreen", false, true)]
     #[test_case("subagent_routing", false, true)]
@@ -1536,6 +1546,20 @@ mod tests {
                 toml::from_str(&format!("[features]\n{feature} = '{mode}'")).unwrap();
             assert_eq!(raw.resolve().is_ok(), allowed, "{feature}: {mode}");
         }
+    }
+
+    #[test_case("off" ; "off")]
+    #[test_case("enforce" ; "enforce")]
+    fn removed_tool_search_feature_names_its_removal(mode: &str) {
+        let error =
+            toml::from_str::<RawConfig>(&format!("[decisions.features]\ntool_search = '{mode}'"))
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(super::TOOL_SEARCH_FEATURE_REMOVED),
+            "{error}"
+        );
     }
 
     #[test]

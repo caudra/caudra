@@ -559,6 +559,7 @@ impl PermissionManager {
             plan_path,
             None,
             true,
+            None,
         )
         .await
     }
@@ -576,6 +577,7 @@ impl PermissionManager {
         plan_path: Option<&Path>,
         identity: Option<(PermissionSubject, PermissionExecutorKind)>,
         include_builtin_allows: bool,
+        action: Option<&str>,
     ) -> Result<(), PermissionError> {
         self.enforce_inner(
             tool,
@@ -590,6 +592,7 @@ impl PermissionManager {
             include_builtin_allows,
             None,
             None,
+            action,
         )
         .await
     }
@@ -620,6 +623,7 @@ impl PermissionManager {
             identity,
             include_builtin_allows,
             Some(intent),
+            None,
             None,
         )
         .await
@@ -655,6 +659,7 @@ impl PermissionManager {
             true,
             Some(intent),
             Some(access),
+            None,
         )
         .await
     }
@@ -674,6 +679,7 @@ impl PermissionManager {
         include_builtin_allows: bool,
         intent: Option<&PermissionIntent>,
         verified_plan: Option<PlanAccess>,
+        action: Option<&str>,
     ) -> Result<(), PermissionError> {
         // A plan-scoped call is unreviewable in the same way a forced prompt
         // is, so it is built and presented the same way. The difference is what
@@ -749,7 +755,7 @@ impl PermissionManager {
                     ),
                 };
             }
-            match &identity {
+            let request = match &identity {
                 Some((subject, executor)) => PermissionRequest::from_legacy_with_identity(
                     request_id.to_owned(),
                     tool,
@@ -768,6 +774,10 @@ impl PermissionManager {
                     &cwd,
                     force_prompt,
                 ),
+            };
+            match action {
+                Some(action) => request.with_action(action),
+                None => request,
             }
         };
         let initial_request = make_request(tool.clone(), scopes.scopes.clone(), unreviewed);

@@ -34,12 +34,13 @@ Three scopes are searched, in this order. The first scope that defines a name wi
 | Project | `<project root>/.caudra/workflows/<name>.rhai` | the user must approve the exact bytes in `/workflows` | plans specific to this repository |
 | User | `<config dir>/workflows/<name>.rhai` | trusted as written | personal routines the user wants everywhere |
 
-Call the `workflow` tool with `action: "list"` before writing. The last lines of its answer name the project directory and the user directory resolved for this machine and build, for example:
+Run `await workflow.list()` in a `code` snippet before writing. Besides the `entries` and `invalid` scripts, its answer names the directories resolved for this machine and build, for example:
 
 ```
-Project scripts (need approval in /workflows before they can start): /home/me/repo/.caudra/workflows
-User scripts (trusted as written): /home/me/.config/caudra/workflows
+{"project_dir": "/home/me/repo/.caudra/workflows", "user_dir": "/home/me/.config/caudra/workflows", ...}
 ```
+
+`project_dir` is missing when the session has no project root. Project scripts need approval in `/workflows` before they can start, and user scripts are trusted as written.
 
 Use those paths rather than guessing. The user directory follows the platform rules: `~/.config/caudra/workflows/` on Linux and macOS (`XDG_CONFIG_HOME` is honoured), `%APPDATA%\caudra\workflows\` on Windows, and `caudra-debug` in place of `caudra` for a debug build. Caudra creates the user directory at startup, so it exists even before the first script.
 
@@ -47,7 +48,7 @@ Choosing a scope:
 
 - The user asked for something tied to this codebase, or the script mentions its paths, commands, or conventions: project scope. Tell the user they must open `/workflows` and approve it before it can start. You cannot approve it. Neither can the script.
 - The user asked for a personal or general routine: user scope. It runs as soon as the file is saved.
-- If the `workflow` tool is not offered in this session there is no runtime here (one-shot `--print` and ACP sessions have none). The file is still valid and the next interactive session picks it up.
+- If `help()` lists the `workflow` module as unavailable, there is no runtime here (one-shot `--print` and ACP sessions have none). The file is still valid and the next interactive session picks it up.
 
 Name the file `<meta.name>.rhai`. The catalog keys on `meta.name`, and within one scope two files declaring the same name are both rejected as ambiguous. A file that fails to parse stays visible in `list` under `Invalid:` with the reason, so a typo is found in the catalog rather than at launch.
 
@@ -361,14 +362,14 @@ Prompt size: a prompt is a string in a Rhai script, so it may be as long as 16 M
 
 ## 8. Write, validate, run
 
-1. Call `workflow` with `action: "list"`. Note the scope directories and check that the name is free.
+1. Run `await workflow.list()` in `code`. Note the scope directories and check that the name is free.
 2. Write `<dir>/<name>.rhai` with `file_write`. The `meta` header comes first.
-3. Validate: `workflow` with `action: "validate", name: "<name>"`. This parses the header, compiles the script, and runs it once against a canned host where every agent returns `success: true` with `{}` as output and every scratch write succeeds. It reports the phases seen and the number of host calls. It exercises one path through the script, so branches that depend on real agent output are not reached. A failure names the line.
+3. Validate: `await workflow.validate("<name>")`. This parses the header, compiles the script, and runs it once against a canned host where every agent returns `success: true` with `{}` as output and every scratch write succeeds. It reports the phases seen and the number of host calls. It exercises one path through the script, so branches that depend on real agent output are not reached. A failure names the line.
 
    Because the canned output is `{}`, every schema-backed key reads as `()` during validation. A script that does `for f in r.output.findings` fails there with `For loop expects iterable type`. Guard the shape before using it, which also protects a real run: `if type_of(r.output.findings) == "array" { ... }`, and compare booleans with `== true` so a missing key counts as false.
 4. For a project script, ask the user to approve it in `/workflows`. `start` refuses an untrusted script with a hint that says so.
-5. Start: `workflow` with `action: "start", name: "<name>", args: { ... }, agent_budget: N`. The answer is the run id and a reminder that the run continues in the background.
-6. Do not poll in a loop. Continue with other work, or end your turn. Caudra reports completion to you as a new message that begins `Workflow <run> (<name>) finished with status <status>.` followed by `Report:` or `Result:`, and `Scratch file:` when the result has a `path`. Use `action: "status"` only when the user asks how it is going or when you need the full result.
+5. Start: `await workflow.start("<name>", {...}, agent_budget=N)`. The answer is the run's snapshot with its `run_id`, and the run continues in the background.
+6. Do not poll in a loop. Continue with other work, or end your turn. Caudra reports completion to you as a new message that begins `Workflow <run> (<name>) finished with status <status>.` followed by `Report:` or `Result:`, and `Scratch file:` when the result has a `path`. Use `await workflow.status(run_id)` only when the user asks how it is going or when you need the full result.
 7. `pause`, `resume`, and `stop` take a `run_id`. The user has the same controls in `/workflow`.
 
 When a validation or a run fails, the message names the line and position in the script. Fix the file and validate again. Editing the file does not change runs already started.

@@ -51,8 +51,8 @@ use crate::prompt::profile::SystemPromptProfile;
 use crate::tools::native::batch::{self, MAX_BATCH_SIZE};
 use crate::tools::native::plan::PlanTarget;
 use crate::tools::{
-    BuiltinDeferral, Deadline, DeferredTool, DescriptionContext, FileReadTracker, LocalTools,
-    ToolAudience, ToolContext, ToolFilter, ToolLive, deferral,
+    Deadline, DescriptionContext, FileReadTracker, LocalTools, ToolAudience, ToolContext,
+    ToolFilter, ToolLive,
 };
 use crate::{
     ActivityChild, Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
@@ -396,7 +396,6 @@ pub struct Subagent {
     params: AgentParams,
     system: String,
     tools: JsonValue,
-    deferred: Vec<DeferredTool>,
     mode: AgentMode,
     /// The parent's session plan, which this child may read but never write.
     plan: Option<PlanTarget>,
@@ -404,8 +403,6 @@ pub struct Subagent {
     mode_notice: Option<String>,
     thinking: ThinkingConfig,
     fast: bool,
-    /// Fresh per session so `tool_search` loads never leak between a
-    /// subagent and its parent.
     mcp: Option<McpSession>,
     /// Its own, so its `code` variables never mix with its parent's.
     code: CodeSession,
@@ -665,7 +662,6 @@ impl Subagent {
                 system: self.system.clone(),
                 event_tx: self.sub_event_tx.clone(),
                 tools: self.tools.clone(),
-                deferred: self.deferred.clone(),
                 tools_fixed: false,
                 memory_store: None,
             },
@@ -774,10 +770,8 @@ struct Resolved {
     provider: Arc<dyn provider::Provider>,
     system: String,
     tools: JsonValue,
-    /// Held back behind `tool_search` for this child. A subagent starts with
-    /// nothing loaded: what the parent searched for says nothing about what
-    /// the child needs.
-    deferred: Vec<DeferredTool>,
+    /// Tools the child reaches only through a `code` module, so absent from `tools`.
+    hosted: Vec<String>,
     mode: AgentMode,
     /// Announced to the child rather than assembled into `system`, so its
     /// prompt carries nothing that varies between runs. Both are `None` for a
@@ -1103,16 +1097,11 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
             workflows_available: false,
         },
         model.supports_tool_examples(),
-        &deferral::deferred_names(
-            &ctx.config.allowed_tools,
-            BuiltinDeferral::resolve(&ctx.config, &model),
-        ),
         &profile_tool_policy,
         ctx.has_session_plan(),
     );
-    crate::tools::execution::configure_tools(
+    crate::tools::execution::configure_declared(
         &mut definitions.declared,
-        &mut definitions.deferred,
         &ctx.config,
         false,
         ctx.job_scope().is_some(),
@@ -1139,7 +1128,7 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
             provider,
             system: vars.apply(&assembled).into_owned(),
             tools: definitions.declared,
-            deferred: definitions.deferred,
+            hosted: definitions.hosted,
             mode,
             environment: Some(environment),
             mode_notice: Some(mode_notice.to_owned()),
@@ -1217,7 +1206,7 @@ pub async fn open_generic(ctx: &ToolContext, opts: GenericOptions) -> Result<Sub
             tool_ceiling,
             profile_tool_policy: Arc::clone(&ctx.profile_tool_policy),
             tools: opts.tools,
-            deferred: Vec::new(),
+            hosted: Vec::new(),
             mode: AgentMode::Build,
             environment: None,
             mode_notice: None,
@@ -1678,10 +1667,8 @@ fn build(
     fast: bool,
     name: String,
 ) -> Result<Subagent, String> {
-    // A deferred definition starts outside the request, so it is absent from
-    // `tools`. Leaving it out of the filter too would let the child load a tool
-    // with `tool_search` that dispatch then refuses. It goes in ahead of the
-    // config intersect, which is what keeps a disabled tool disabled.
+    // A hosted tool is absent from `tools`, yet its `code` module dispatches it. It goes in
+    // ahead of the config intersect, which is what keeps a disabled tool disabled.
     let tool_filter = ToolFilter::Only(
         resolved
             .tools
@@ -1691,7 +1678,7 @@ fn build(
             .filter_map(|definition| definition.get("name")?.as_str().map(str::to_owned))
             .collect(),
     )
-    .including(resolved.deferred.iter().map(|tool| tool.name.to_string()))
+    .including(resolved.hosted)
     .intersect(&ToolFilter::from_config(&ctx.config, &resolved.model, &[]))
     .intersect(&resolved.tool_ceiling)
     .including(
@@ -1799,7 +1786,6 @@ fn build(
         },
         system: resolved.system,
         tools: resolved.tools,
-        deferred: resolved.deferred,
         mode: resolved.mode,
         plan: ctx.session_plan(),
         environment: resolved.environment,
@@ -2192,7 +2178,7 @@ mod tests {
                     .unwrap()
                     .complete(vec![Message {
                         role: Role::Assistant,
-                        content: vec![ContentBlock::tool_use(TOOL_ID, DEFERRED_TOOL, json!({})); 2],
+                        content: vec![ContentBlock::tool_use(TOOL_ID, HOSTED_TOOL, json!({})); 2],
                         ..Message::default()
                     }]);
                 options.task_id = TaskIdentity::Reserved(
@@ -2413,8 +2399,7 @@ mod tests {
     const BOUND_PLAN: &str = "bound.md";
     const PLAN_CONTENT: &str = "# Plan";
     const ENVIRONMENT_MISSING: &str = "a task must be told its environment";
-    /// A real entry of `DEFERRED_BUILTIN_TOOLS`, so the split under test happens.
-    const DEFERRED_TOOL: &str = "execution_environment";
+    const HOSTED_TOOL: &str = "execution_environment";
     const MAIN_ONLY_TOOL: &str = "main_only_mock";
     const PUBLISHER_MISSING: &str = "subagent must inherit a task-scoped context publisher";
     const IGNORED_ERROR: &str = "handled by the session caller";
@@ -2487,7 +2472,7 @@ mod tests {
             let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
             ctx.registry
                 .register_audited(
-                    Arc::new(NamedMock::new(DEFERRED_TOOL, ToolAudience::all())),
+                    Arc::new(NamedMock::new(HOSTED_TOOL, ToolAudience::all())),
                     NamedMock::source(),
                     crate::tools::ToolEffect::ReadOnly,
                 )
@@ -2500,12 +2485,12 @@ mod tests {
             }
             let mut child = if generic {
                 let mut options = generic_options();
-                options.tools = json!([{"name":DEFERRED_TOOL,"input_schema":{"type":"object"}}]);
+                options.tools = json!([{"name":HOSTED_TOOL,"input_schema":{"type":"object"}}]);
                 open_generic(&ctx, options).await.unwrap()
             } else {
                 open_task(&ctx, task_options(None)).await.unwrap()
             };
-            assert_eq!(child.params.tool_filter.matches(DEFERRED_TOOL), allowed);
+            assert_eq!(child.params.tool_filter.matches(HOSTED_TOOL), allowed);
             child.close();
         });
     }
@@ -2783,22 +2768,18 @@ mod tests {
         });
     }
 
-    /// `tool_search` can load a deferred builtin into the child's next request,
-    /// so the filter dispatch judges it by has to know the name too. What the
-    /// child's audience never offered stays out.
-    #[test_case(DEFERRED_TOOL, true ; "a_loadable_builtin_stays_callable")]
+    /// A `code` module dispatches a hosted tool the child's request never declares, so the
+    /// filter dispatch judges it by has to know the name too. What the child's audience never
+    /// offered stays out.
+    #[test_case(HOSTED_TOOL, true ; "a_hosted_builtin_stays_callable")]
     #[test_case(MAIN_ONLY_TOOL, false ; "a_tool_outside_the_audience_does_not")]
-    fn a_task_may_call_what_it_was_allowed_to_load(tool: &str, callable: bool) {
+    fn a_task_may_call_what_its_code_modules_host(tool: &str, callable: bool) {
         smol::block_on(async {
-            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
-            // Pinned rather than left to the model's class, so the split under
-            // test happens wherever this runs.
-            ctx.config.defer_builtin_tools = caudra_config::DeferBuiltinTools::Always;
+            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
             ctx.registry
                 .register_many([
                     (
-                        Arc::new(NamedMock::new(DEFERRED_TOOL, ToolAudience::all()))
-                            as Arc<dyn Tool>,
+                        Arc::new(NamedMock::new(HOSTED_TOOL, ToolAudience::all())) as Arc<dyn Tool>,
                         NamedMock::source(),
                     ),
                     (
@@ -2929,11 +2910,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|tool| tool["name"] == PLAN_TOOL);
-            let deferred = child
-                .deferred
-                .iter()
-                .any(|tool| tool.name.as_ref() == PLAN_TOOL);
-            assert_eq!(declared || deferred, offered);
+            assert_eq!(declared, offered);
             child.close();
         });
     }

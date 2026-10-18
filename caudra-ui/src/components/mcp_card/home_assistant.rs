@@ -1,6 +1,6 @@
 //! The answer of a Home Assistant call. An intent says what it did and to
-//! which devices; `GetLiveContext` lists the exposed entities, which read
-//! best as a table.
+//! which devices; `GetLiveContext`, and a resource such as the Assist context
+//! snapshot, list the exposed entities, which read best as a table.
 
 use caudra_agent::{McpBlock, McpOutput};
 use ratatui::style::Style;
@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
-use super::{Rows, one_line};
+use super::{Rows, one_line, resource_label};
 use crate::components::command_text::ellipsize_spans;
 use crate::theme;
 
@@ -97,6 +97,20 @@ pub(crate) fn render(
     output: &McpOutput,
     width: u16,
 ) -> Option<Rows> {
+    if let [
+        McpBlock::Resource {
+            uri,
+            mime_type,
+            text: Some(text),
+            bytes,
+        },
+    ] = output.blocks.as_slice()
+    {
+        let mut rows = Rows::default();
+        rows.push(vec![resource_label(uri, mime_type, *bytes)]);
+        rows.push(live_context_lines(&parse_live_context(text)?, width));
+        return Some(rows);
+    }
     let tool = tool.rsplit(NAMESPACE_SEPARATOR).next().unwrap_or(tool);
     let text = output.blocks.iter().find_map(|block| match block {
         McpBlock::Text { text } => Some(text.as_str()),
@@ -327,6 +341,9 @@ mod tests {
     const SPEECH: &str = "Turned on the lights";
     const KITCHEN_LIGHT: &str = "Kitchen Light";
     const PORCH_LAMP: &str = "Porch Lamp";
+    const SNAPSHOT_URI: &str = "homeassistant://assist/context-snapshot";
+    const PLAIN_MIME: &str = "text/plain";
+    const READ_RESOURCE: &str = "read_resource";
     const LIVE_CONTEXT: &str = "Live Context: An overview of the areas and the devices in this smart home:\n\
         - names: Kitchen Light, Ceiling\n  domain: light\n  state: 'on'\n  areas: Kitchen, Cooking\n  attributes:\n    brightness: '255'\n\
         - names: Outside Temperature\n  domain: sensor\n  state: '12.5'\n  attributes:\n    unit_of_measurement: °C\n";
@@ -422,6 +439,43 @@ mod tests {
         assert_eq!(cells[0], TABLE_HEADINGS);
         assert_eq!(cells[1], ["Kitchen", "Light", "light", "on", "Kitchen"]);
         assert_eq!(cells[2], ["Outside", "Temperature", "sensor", "12.5"]);
+    }
+
+    #[test]
+    fn a_live_context_resource_is_a_table_under_its_label() {
+        let output = McpOutput {
+            blocks: vec![McpBlock::Resource {
+                uri: SNAPSHOT_URI.into(),
+                mime_type: Some(PLAIN_MIME.into()),
+                text: Some(LIVE_CONTEXT.into()),
+                bytes: None,
+            }],
+            ..output("")
+        };
+
+        let rows = rows_text(&render(READ_RESOURCE, None, &output, WIDTH).unwrap());
+
+        assert_eq!(rows[0], format!("resource · {SNAPSHOT_URI} · {PLAIN_MIME}"));
+        assert_eq!(
+            rows[1].split_whitespace().collect::<Vec<_>>(),
+            TABLE_HEADINGS
+        );
+        assert_eq!(rows.len(), 4);
+    }
+
+    #[test]
+    fn a_resource_that_is_not_a_live_context_is_left_to_the_generic_card() {
+        let output = McpOutput {
+            blocks: vec![McpBlock::Resource {
+                uri: SNAPSHOT_URI.into(),
+                mime_type: Some(PLAIN_MIME.into()),
+                text: Some("Live Context: nothing exposed".into()),
+                bytes: None,
+            }],
+            ..output("")
+        };
+
+        assert!(render(READ_RESOURCE, None, &output, WIDTH).is_none());
     }
 
     #[test_case("GetLiveContext", "{\"error\": \"No entities\"}" ; "an_error_object")]

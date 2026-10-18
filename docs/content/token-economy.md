@@ -48,7 +48,7 @@ one line stays              ~20k tokens stay outside main
 
 **MCP code mode.** An MCP server with 100 tools would ship 100 definitions in every request. Caudra sends none of them, and the model calls your servers from Python in the one fixed [`code`](/docs/code/) tool. It learns their tools from a compact server list, searches for the rest, and filters results in the snippet, so only what it keeps reaches the context. A server that connects or changes its tools never touches the cached prefix. See [Code mode](/docs/mcp/#code-mode).
 
-**Deferred built-in tools.** Selected built-ins can start outside the request array behind a `tool_search` entry. Caudra defers them for small and supply-unknown models, where the shorter array helps and the prompt cache is cheap to rebuild. Known non-small models receive them upfront because loading one mid-session can cost more than carrying the full set. See [Tools loaded on demand](/docs/tools/#which-models-defer).
+**Tools as `code` modules.** Image generation, the host description, workflows, and automations are [modules of the `code` tool](/docs/code/#modules) rather than tools of their own. The `code` description carries one line for each, and the model loads a module's full reference with `help()` only when it needs it. The request array stays short for every model and never changes mid-session, so the prompt cache holds.
 
 **Managed tool output.** The host enforces `agent.max_output_bytes` and `agent.max_output_lines` after every tool dispatch. The same boundary covers Lua and MCP tools, batch children, nested calls, and local tools. `output_limits` can replace those defaults for one result. The host still performs limiting and retention after dispatch.
 

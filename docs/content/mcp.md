@@ -92,13 +92,13 @@ The model learns what it can call from a `# MCP servers` [reminder](/docs/contex
 
 Each server has a header line with its state: connected with its tool count, `connecting`, `awaiting trust`, `needs login`, or `failed` with the error. The server's [instructions](#server-instructions) follow its header. Then come its tools, one line each, as a Python signature with the first sentence of the tool's description.
 
-The list aims to stay within about 2,000 tokens. Every server keeps its header and instructions, and the tool lines share the rest. Servers take turns adding their cheapest remaining tool, so one large server cannot push the others out. The list says whether it is complete. When it is not, a header reads like `showing 40 of 117 tools`, and the model finds the rest with `search()`.
+The list aims to stay within about 2,000 tokens. Every server keeps its header and instructions, and the tool lines share the rest. Servers take turns adding their cheapest remaining tool, so one large server cannot push the others out. The list says whether it is complete. When it is not, a header reads like `showing 40 of 117 tools`, and the model finds the rest with `mcp.search()`.
 
 Caudra sends the list again only when its text changes, such as when a server connects or its tools change, and after compaction. When no server is enabled any more, a short reminder tells the model to disregard the list.
 
 Each agent gets its own list. Tools that `agent.disabled_tools` or a profile turns off are left out. A [read-only agent](/docs/permissions/#read-only-agents) sees only the read-only tools of [recognised servers](#recognised-servers). In plan mode the main agent keeps its whole list, and a call that plan mode does not allow is refused when it runs.
 
-A [system prompt profile](/docs/system-prompts/#choose-tool-availability) can make an MCP tool `lazy`, which leaves it out of the list but lets `search()` find it. `disabled` refuses it.
+A [system prompt profile](/docs/system-prompts/#choose-tool-availability) can make an MCP tool `disabled`, which leaves it out of the list and refuses its calls.
 
 ### Calling tools
 
@@ -113,14 +113,14 @@ issue, pulls = await asyncio.gather(
 )
 ```
 
-Up to 8 calls run at once, and one run makes at most 100. Four functions sit beside the namespaces:
+Up to 8 calls run at once, and one run makes at most 100. The `mcp` module answers four calls beside the namespaces, and `help("github")` lists one server's tools with their signatures:
 
 | Function | What it returns |
 |---|---|
-| `search(query, server=None, limit=10, offset=0)` | The connected tools that match `query`, best first, with their exact signatures and full descriptions. It finds tools the list leaves out. `limit` goes up to 50 |
-| `servers()` | Every enabled server, with its state, tool count, and whether it offers resources |
-| `await resources(server)` | The [resources](#resources) and resource templates a server offers |
-| `await read_resource(server, uri)` | The contents of one resource |
+| `mcp.search(query, server=None, limit=10, offset=0)` | The connected tools that match `query`, best first, with their exact signatures and full descriptions. It finds tools the list leaves out. `limit` goes up to 50 |
+| `mcp.servers()` | Every enabled server, with its state, tool count, and whether it offers resources |
+| `await mcp.resources(server)` | The [resources](#resources) and resource templates a server offers |
+| `await mcp.read_resource(server, uri)` | The contents of one resource |
 
 Snippets run in a Python subset on the bundled Monty worker. Top-level `await` works. There is no filesystem, network, subprocess, class inheritance, or third-party package. [The Python subset](/docs/code/#the-python-subset) lists the standard modules it offers.
 
@@ -132,7 +132,7 @@ A failed call raises `RuntimeError`: the server reported an error, the server is
 
 Before a snippet runs, it is checked against the signatures of the tools it calls, so a misspelt tool or an argument of the wrong type stops it before any call is made, with the closest name and the line. Later runs of the same agent are checked too, but not the variables they take from earlier runs, because those runs alone knew their types.
 
-Some slips have only one possible meaning, so Caudra fixes them before the snippet runs. It imports a standard module the snippet uses without importing it, such as `asyncio` in `asyncio.gather`. It drops `await` before `search()` and `servers()`, removes a Markdown fence around the whole snippet, and drops `return` from a snippet's last line, since a snippet ends on its value. `asyncio.gather(..., return_exceptions=True)` works: each failed call settles as its exception while the others still answer. Each fix keeps the snippet's line numbers, so errors still point at the line the model wrote. The card lists the fixes, and the model reads in the result what it did wrong, so it can avoid the slip next time. The conversation keeps the snippet as the model wrote it.
+Some slips have only one possible meaning, so Caudra fixes them before the snippet runs. It imports a standard module the snippet uses without importing it, such as `asyncio` in `asyncio.gather`. It drops `await` before `help()`, removes a Markdown fence around the whole snippet, and drops `return` from a snippet's last line, since a snippet ends on its value. `asyncio.gather(..., return_exceptions=True)` works: each failed call settles as its exception while the others still answer. Each fix keeps the snippet's line numbers, so errors still point at the line the model wrote. The card lists the fixes, and the model reads in the result what it did wrong, so it can avoid the slip next time. The conversation keeps the snippet as the model wrote it.
 
 Code that is not valid Python never runs. The error says what kind of code a snippet is: module code, so `return` belongs only inside a function, and Python, so JavaScript such as `const` or `Promise.all` is named as such.
 
@@ -140,12 +140,12 @@ Calls that ran before a failure keep their effects. When a run fails, the model 
 
 ### Decisions and reranking
 
-With a [decision endpoint](/docs/providers/#decision-endpoints) active, a snippet can judge what a server returned before any of it reaches the model. `decide()` gives typed answers about one item, and `rerank()` keeps the candidates relevant to a query, best first:
+With a [decision endpoint](/docs/providers/#decision-endpoints) active, a snippet can judge what a server returned before any of it reaches the model. `decisions.decide()` gives typed answers about one item, and `decisions.rerank()` keeps the candidates relevant to a query, best first:
 
 ```python
 issues = await github.list_issues(owner="caudra", repo="caudra", state="open")
 titles = [issue["title"] for issue in issues]
-ranked = await rerank("crashes when saving a file", titles, threshold=0.5, top_k=10)
+ranked = await decisions.rerank("crashes when saving a file", titles, threshold=0.5, top_k=10)
 [issues[entry["index"]]["number"] for entry in ranked]
 ```
 
@@ -178,7 +178,7 @@ A conversation from before code mode resumes and sends as before. When the model
 
 Server names are ASCII letters, digits, and hyphens, with no dots, and cannot be the name of a built-in tool. Permission rules, `agent.disabled_tools`, and profiles name a tool as `server.tool`, with the server's configured name and the tool's own MCP name, such as `github.list_issues`.
 
-In `code`, a server is a Python namespace and its tools are its functions. Each character other than an ASCII letter, digit, or `_` becomes `_`, so the `my-server` server is `my_server`, and a name that starts with a digit gets a leading `_`. A name that is a Python keyword gets a trailing `_`, such as `class_`. A namespace also gets a trailing `_` when it would hide a Python builtin, a standard module, a function such as `search` or `rerank`, or a module of the `code` tool such as `history`. So a server named `json` is `json_`. When two names come out the same, the later one in name order gets `_2`, then `_3`, so names stay the same whatever order servers connect in. The server list and `search()` always show the names to call.
+In `code`, a server is a Python namespace and its tools are its functions. Each character other than an ASCII letter, digit, or `_` becomes `_`, so the `my-server` server is `my_server`, and a name that starts with a digit gets a leading `_`. A name that is a Python keyword gets a trailing `_`, such as `class_`. A namespace also gets a trailing `_` when it would hide a Python builtin, a standard module, a name earlier versions used such as `search` or `rerank`, `help`, or a module of the `code` tool such as `history` or `image`. So a server named `json` is `json_`. When two names come out the same, the later one in name order gets `_2`, then `_3`, so names stay the same whatever order servers connect in. The server list and `mcp.search()` always show the names to call.
 
 See [Permissions](/docs/permissions/#mcp-tool-calls) for MCP call review and remembered decisions.
 
@@ -319,7 +319,7 @@ Print, SDK, and ACP sessions fail with an actionable error when project startup 
 
 Open the MCP picker with `/mcp`. Turn servers on or off there; changes save back to your config (project or global, depending on which file defined the server).
 
-A running server's row reads like `stdio · 12 tools via code as my_server · 3 search-only`. The model reaches its tools through the `code` tool, and `as` names the [namespace](#naming-and-namespacing) to call when it differs from the server name. The search-only count is how many tools the main agent's [profile](/docs/system-prompts/#choose-tool-availability) leaves out of the [server list](#the-server-list), as `/tools` reports them.
+A running server's row reads like `stdio · 12 tools via code as my_server`. The model reaches its tools through the `code` tool, and `as` names the [namespace](#naming-and-namespacing) to call when it differs from the server name.
 
 Select a running server to see what it reported when it connected: its name and version, the protocol version, the features it offers (resources, completions, and list changes), and the first lines of its [instructions](#server-instructions). A [recognised server](#recognised-servers) shows its kind beside its name.
 
@@ -387,7 +387,7 @@ A mention resolves only when its server is running and the URI is one the server
 
 When you send the message, Caudra reads the resource and adds it ahead of your message, the way it adds a [mentioned file](/docs/context/#mention-a-file-with): text inline, and an image as a real image when the model supports vision. Anything else becomes a line with its type and size. Resource text shares the per-turn budget of mentioned files, and text past it is cut with a note.
 
-The model reads resources from Python in [`code`](#calling-tools): `await resources(server)` lists the resources and templates a server offers, and `await read_resource(server, uri)` reads one. `servers()` says which servers offer any. Reading works in plan mode and in [read-only agents](/docs/permissions/#read-only-agents). It asks first, and the prompt offers to always allow reads from that server for the conversation, the project, or every project.
+The model reads resources from Python in [`code`](#calling-tools): `await mcp.resources(server)` lists the resources and templates a server offers, and `await mcp.read_resource(server, uri)` reads one. `mcp.servers()` says which servers offer any. Reading works in plan mode and in [read-only agents](/docs/permissions/#read-only-agents). It asks first, and the prompt offers to always allow reads from that server for the conversation, the project, or every project.
 
 ## Prompts
 

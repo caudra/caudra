@@ -27,10 +27,10 @@ use caudra_agent::tools::{
     TOOL_OUTPUT_TOOL_NAME, ToolEffect, VIEW_IMAGE_TOOL_NAME,
 };
 use caudra_agent::{
-    ActivityChild, GrepFileEntry, GrepMatchGroup, McpBlock, McpHelper, McpOutput, McpServerKind,
-    MemoryNote, MemoryOrigin, MemoryOutput, NO_FILES_FOUND, SearchCap, ShellFilterInfo,
-    ShellOutput, SkillOutput, SnapshotLine, SnapshotSpan, SourceCodeGraphRow, SpanStyle,
-    SubagentActivity, SubagentProgress, ToolAccounting, ToolInput, ToolOutput,
+    ActivityChild, DecisionHelper, GrepFileEntry, GrepMatchGroup, McpBlock, McpHelper, McpOutput,
+    McpServerKind, MemoryNote, MemoryOrigin, MemoryOutput, NO_FILES_FOUND, SearchCap,
+    ShellFilterInfo, ShellOutput, SkillOutput, SnapshotLine, SnapshotSpan, SourceCodeGraphRow,
+    SpanStyle, SubagentActivity, SubagentProgress, ToolAccounting, ToolInput, ToolOutput,
 };
 use caudra_providers::{PeerAudience, PeerMessageOrigin};
 use caudra_storage::background::ShellJobMetadata;
@@ -14321,7 +14321,7 @@ fn a_rerank_row_reads_its_ranking_and_switches_to_its_answer() {
                     }],
                     ..McpOutput::default()
                 }),
-                helper: Some(McpHelper::Rerank),
+                helper: Some(McpHelper::Decision(DecisionHelper::Rerank)),
                 ..CodeCall::default()
             }],
             ..CodeOutput::default()
@@ -14366,7 +14366,7 @@ fn copying_a_rerank_card_copies_its_answer(raw: bool) {
                     }],
                     ..McpOutput::default()
                 }),
-                helper: Some(McpHelper::Rerank),
+                helper: Some(McpHelper::Decision(DecisionHelper::Rerank)),
                 ..CodeCall::default()
             }],
             ..CodeOutput::default()

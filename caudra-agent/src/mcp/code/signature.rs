@@ -9,7 +9,6 @@ use std::iter;
 use serde_json::{Map, Value};
 
 use super::naming::{CLASS_PREFIX, Names, is_identifier};
-use super::search::DEFAULT_LIMIT;
 use super::view::{ServerState, ServerView, ToolView};
 
 const ANY: &str = "Any";
@@ -150,7 +149,7 @@ pub fn doc(signature: &Signature, tool: &ToolView) -> String {
         .join("\n")
 }
 
-/// Stubs declaring every namespace and helper, for the type checker.
+/// Stubs declaring every server's namespace, for the type checker.
 pub fn stubs(names: &Names, servers: &[ServerView]) -> String {
     let by_name: HashMap<&str, &ServerView> = servers
         .iter()
@@ -195,12 +194,6 @@ pub fn stubs(names: &Names, servers: &[ServerView]) -> String {
         }
         lines.push(format!("{namespace}: {class}"));
     }
-    lines.extend([
-        format!("def search(query: str, server: str | None = None, limit: int = {DEFAULT_LIMIT}, offset: int = 0) -> list[{DICT}]: ..."),
-        format!("def servers() -> list[{DICT}]: ..."),
-        format!("async def resources(server: str) -> list[{DICT}]: ..."),
-        format!("async def read_resource(server: str, uri: str) -> {ANY}: ..."),
-    ]);
     let mut stubs = lines.join("\n");
     stubs.push('\n');
     stubs
@@ -502,7 +495,6 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::code::names::MCP_HELPERS;
     use crate::mcp::code::naming::tests::{server, tool};
 
     const METHOD: &str = "run";
@@ -623,10 +615,7 @@ mod tests {
                 with_schema(
                     json!({"properties": {"owner": {"type": "string"}}, "required": ["owner"]}),
                 ),
-                ToolView {
-                    search_only: true,
-                    ..tool("zap")
-                },
+                tool("zap"),
             ],
         );
         let empty = server("empty", Vec::new());
@@ -652,16 +641,7 @@ mod tests {
             "github: _McpServer_github",
             "linear: Any",
         ];
-        let lines: Vec<&str> = stubs.lines().collect();
-        assert_eq!(lines[..expected.len()], expected);
-        for helper in MCP_HELPERS {
-            assert!(
-                lines[expected.len()..]
-                    .iter()
-                    .any(|line| line.contains(&format!("def {helper}("))),
-                "{helper} missing from {stubs}"
-            );
-        }
+        assert_eq!(stubs.lines().collect::<Vec<_>>(), expected);
     }
 
     #[test]

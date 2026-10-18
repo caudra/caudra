@@ -14,12 +14,10 @@ use crate::agent::{compaction_reserve, estimate_message_tokens};
 use crate::mcp::{McpSession, McpToolStatus};
 use crate::memory::tree::Block;
 use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog, TaskProfileBindings};
-use crate::tools::TOOL_SEARCH_TOOL_NAME;
 use crate::tools::native::{memory, skill};
 use crate::tools::{
-    BuiltinDeferral, CODE_TOOL_NAME, DeferredTool, DescriptionContext, MEMORY_TOOL_NAME,
-    SKILL_TOOL_NAME, TASK_TOOL_NAME, ToolAudience, ToolFilter, ToolRegistry, ToolState,
-    builtin_report,
+    CODE_TOOL_NAME, DescriptionContext, MEMORY_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME,
+    ToolAudience, ToolFilter, ToolRegistry, ToolState, builtin_report,
 };
 
 const MEMORY_READ_COMMAND: &str = "read";
@@ -272,8 +270,6 @@ impl ContextSkillInventory {
 pub enum ContextMcpStatus {
     /// Callable from the `code` tool, and in the server catalog when its budget allows.
     Available,
-    /// Kept out of the catalog by the profile; a snippet still finds it with `search()`.
-    SearchOnly,
     Disabled,
 }
 
@@ -303,8 +299,6 @@ impl ContextMcpInventory {
                 reason: status.reason,
                 status: if status.disabled {
                     ContextMcpStatus::Disabled
-                } else if status.search_only {
-                    ContextMcpStatus::SearchOnly
                 } else {
                     ContextMcpStatus::Available
                 },
@@ -323,13 +317,10 @@ impl ContextMcpInventory {
     }
 }
 
-/// Whether a built-in reaches the model in this request. `Deferred` is not a
-/// weaker `Declared`: the definition is absent from the array, so its tokens
-/// are what a load would cost rather than what the request is paying.
+/// Whether a built-in reaches the model in this request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ContextBuiltinState {
     Declared,
-    Deferred,
     Disabled,
 }
 
@@ -347,12 +338,9 @@ pub struct ContextBuiltinTool {
     pub billed_to: Option<&'static str>,
 }
 
-/// `catalog_tokens` is the one `tool_search` entry, which stands in for the
-/// deferred built-ins.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextBuiltinInventory {
     pub tools: Vec<ContextBuiltinTool>,
-    pub catalog_tokens: u32,
     /// What the array costs beyond the definitions it holds, so the section
     /// reconciles with `ContextUsage::system_tools` exactly.
     pub unattributed_tokens: u32,
@@ -367,16 +355,10 @@ impl ContextBuiltinInventory {
             .fold(0, u32::saturating_add)
     }
 
-    /// What the declared built-ins cost this request, catalog included.
+    /// What the declared built-ins cost this request.
     pub fn request_tokens(&self) -> u32 {
         self.tokens_for(ContextBuiltinState::Declared)
-            .saturating_add(self.catalog_tokens)
             .saturating_add(self.unattributed_tokens)
-    }
-
-    /// What loading every deferred built-in would add.
-    pub fn deferred_tokens(&self) -> u32 {
-        self.tokens_for(ContextBuiltinState::Deferred)
     }
 
     pub fn count(&self, state: ContextBuiltinState) -> usize {
@@ -393,9 +375,8 @@ pub struct ContextInventory {
     pub mcp: ContextMcpInventory,
 }
 
-/// Everything the built-in half of an inventory needs: the tools that exist,
-/// the rules that decide their state, and the deferred definitions the array
-/// does not carry.
+/// Everything the built-in half of an inventory needs: the tools that exist
+/// and the rules that decide their state.
 pub struct BuiltinToolsInput<'a> {
     pub registry: &'a ToolRegistry,
     pub filter: &'a ToolFilter,
@@ -403,31 +384,17 @@ pub struct BuiltinToolsInput<'a> {
     pub model: &'a Model,
     pub session_plan: bool,
     pub audience: ToolAudience,
-    pub deferral: BuiltinDeferral,
-    pub deferred: &'a [DeferredTool],
 }
 
 impl BuiltinToolsInput<'_> {
     pub fn inventory(&self, profile: &ProfileToolPolicy) -> ContextBuiltinInventory {
-        let deferred_tokens: HashMap<&str, u32> = self
-            .deferred
-            .iter()
-            .map(|tool| (tool.name.as_ref(), value_tokens(&tool.definition)))
-            .collect();
         let tools = self
             .registry
             .iter()
             .iter()
             .map(|entry| {
                 let name = entry.name();
-                let report = builtin_report(
-                    name,
-                    self.filter,
-                    &[],
-                    self.config,
-                    self.model,
-                    self.deferral,
-                );
+                let report = builtin_report(name, self.filter, &[], self.config, self.model);
                 let report = crate::tools::report::profile_report(
                     entry,
                     profile,
@@ -439,20 +406,16 @@ impl BuiltinToolsInput<'_> {
                     },
                     self.session_plan,
                 );
-                let (state, reason) = match report.state {
-                    ToolState::On => (ContextBuiltinState::Declared, report.reason),
-                    ToolState::Lazy if deferred_tokens.contains_key(name) => {
-                        (ContextBuiltinState::Deferred, report.reason)
-                    }
-                    ToolState::Lazy => (ContextBuiltinState::Disabled, Some(REQUEST_UNAVAILABLE)),
-                    ToolState::Off => (ContextBuiltinState::Disabled, report.reason),
+                let state = match report.state {
+                    ToolState::On => ContextBuiltinState::Declared,
+                    ToolState::Off => ContextBuiltinState::Disabled,
                 };
                 ContextBuiltinTool {
                     name: name.to_owned(),
                     source: entry.source.as_log_field().into_owned(),
                     state,
-                    reason,
-                    tokens: deferred_tokens.get(name).copied().unwrap_or_default(),
+                    reason: report.reason,
+                    tokens: 0,
                     billed_to: None,
                 }
             })
@@ -586,8 +549,7 @@ pub struct ContextCapture<'a> {
     pub auto_compact: bool,
     pub compaction_buffer: Option<CompactionBuffer>,
     pub system: &'a str,
-    pub base_tools: &'a Value,
-    pub full_tools: &'a Value,
+    pub tools: &'a Value,
     pub projected_messages: &'a [Message],
     pub measured: Option<u32>,
     pub inventory: ContextInventory,
@@ -595,21 +557,10 @@ pub struct ContextCapture<'a> {
 
 impl ContextSnapshot {
     pub fn capture(capture: ContextCapture<'_>) -> Self {
-        let mut source_definitions = capture.base_tools.as_array().cloned().unwrap_or_default();
-        source_definitions.extend(
-            capture
-                .inventory
-                .builtins
-                .tools
-                .iter()
-                .filter(|tool| !tool.source.starts_with("mcp:"))
-                .map(|tool| serde_json::json!({"name": tool.name})),
-        );
         let accounting = account_request(
             capture.model,
             capture.system,
-            &Value::Array(source_definitions),
-            capture.full_tools,
+            capture.tools,
             capture.projected_messages,
         );
         let mut inventory = capture.inventory;
@@ -634,11 +585,10 @@ impl ContextSnapshot {
 pub fn estimate_context_usage(
     model: &Model,
     system: &str,
-    base_tools: &Value,
-    full_tools: &Value,
+    tools: &Value,
     projected_messages: &[Message],
 ) -> ContextUsage {
-    account_request(model, system, base_tools, full_tools, projected_messages).usage
+    account_request(model, system, tools, projected_messages).usage
 }
 
 #[derive(Default)]
@@ -671,7 +621,6 @@ struct BuiltinDefinition {
     name: String,
     tokens: u32,
     billed_to: Option<&'static str>,
-    catalog: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -719,12 +668,11 @@ enum LoadedBody<'a> {
 fn account_request(
     model: &Model,
     system: &str,
-    base_tools: &Value,
-    full_tools: &Value,
+    tools: &Value,
     projected_messages: &[Message],
 ) -> RequestAccounting {
     let (system_prompt, memory_prompt_tokens) = account_system(system);
-    let tools = account_tools(base_tools, full_tools);
+    let tools = account_tools(tools);
     let adapted_messages = adapt_attachments_for_model(model, projected_messages);
     let messages = account_messages(adapted_messages.as_ref());
     RequestAccounting {
@@ -765,15 +713,14 @@ fn account_system(system: &str) -> (u32, u32) {
     (total.saturating_sub(memory), memory)
 }
 
-fn account_tools(base_tools: &Value, full_tools: &Value) -> ToolAccounting {
-    let full_tokens = value_tokens(full_tools);
-    let (Some(base), Some(full)) = (base_tools.as_array(), full_tools.as_array()) else {
+fn account_tools(tools: &Value) -> ToolAccounting {
+    let full_tokens = value_tokens(tools);
+    let Some(full) = tools.as_array() else {
         return ToolAccounting {
             system: full_tokens,
             ..ToolAccounting::default()
         };
     };
-    let own_names: HashSet<_> = base.iter().filter_map(tool_name).collect();
     let mut contributions = full
         .iter()
         .map(|definition| {
@@ -801,15 +748,12 @@ fn account_tools(base_tools: &Value, full_tools: &Value) -> ToolAccounting {
                 name: contribution.name.clone(),
                 tokens: contribution.tokens,
                 billed_to: Some(billed_to),
-                catalog: false,
             });
         }
         match contribution.category {
             ToolCategory::System => {
                 add_tokens(&mut accounting.system, contribution.tokens);
                 accounting.builtin_definitions.push(BuiltinDefinition {
-                    catalog: contribution.name == TOOL_SEARCH_TOOL_NAME
-                        && !own_names.contains(contribution.name.as_str()),
                     name: contribution.name,
                     tokens: contribution.tokens,
                     billed_to: None,
@@ -938,7 +882,6 @@ impl ContextBuiltinInventory {
     /// what they cost. A name the array actually carries is declared with its
     /// measured tokens, whatever the filter predicted.
     fn apply_request_tokens(&mut self, definitions: &[BuiltinDefinition], unattributed: u32) {
-        self.catalog_tokens = 0;
         self.unattributed_tokens = unattributed;
 
         for tool in &mut self.tools {
@@ -955,17 +898,12 @@ impl ContextBuiltinInventory {
                 name,
                 tokens,
                 billed_to,
-                catalog,
             } = definition;
             match self.tools.iter_mut().find(|tool| tool.name == *name) {
                 Some(tool) => {
                     let reason = tool.reason;
-                    let deferred = tool.state == ContextBuiltinState::Deferred;
                     tool.state = ContextBuiltinState::Declared;
                     tool.reason = match reason {
-                        Some(crate::tools::profile_policy::PROFILE_LOADING) if deferred => {
-                            Some(crate::tools::report::REASON_PROFILE_LOADED)
-                        }
                         Some(
                             crate::tools::profile_policy::PROFILE_LOADING
                             | crate::tools::profile_policy::REQUIRED_INFRASTRUCTURE,
@@ -975,7 +913,6 @@ impl ContextBuiltinInventory {
                     tool.tokens = *tokens;
                     tool.billed_to = *billed_to;
                 }
-                None if *catalog => add_tokens(&mut self.catalog_tokens, *tokens),
                 None => self.tools.push(ContextBuiltinTool {
                     name: name.clone(),
                     source: String::new(),
@@ -1078,7 +1015,6 @@ mod tests {
     const TASK_A: &str = "task-a";
     const TASK_B: &str = "task-b";
     const AVAILABLE_MCP: &str = "issues.fetch";
-    const SEARCH_ONLY_MCP: &str = "search.query";
     const DISABLED_MCP: &str = "admin.delete";
     const TEST_WINDOW: u32 = 200_000;
     /// Below every reserve the cases expect, so they measure the percentage.
@@ -1098,8 +1034,6 @@ mod tests {
     const CROWDED_EXCESS: u32 = 30;
     const TASK_CONTROL_NAME: &str = "task_control";
     const CONFIG_DISABLED_REASON: &str = "disabled in configuration";
-    const CUSTOM_SEARCH_SOURCE: &str = "plugin:custom-search";
-    const SEARCH_DESCRIPTION: &str = "Search available information";
 
     fn model(context_window: u32, window_excludes_output: bool) -> Model {
         let mut model = Model::from_spec(MODEL_SPEC).unwrap();
@@ -1141,12 +1075,11 @@ mod tests {
         );
     }
 
-    fn mcp_status(qualified_name: &str, disabled: bool, search_only: bool) -> McpToolStatus {
+    fn mcp_status(qualified_name: &str, disabled: bool) -> McpToolStatus {
         McpToolStatus {
             qualified_name: qualified_name.to_owned(),
             server: qualified_name.split_once('.').unwrap().0.to_owned(),
             disabled,
-            search_only,
             reason: None,
         }
     }
@@ -1254,10 +1187,8 @@ mod tests {
     }
 
     #[test_case(ContextBuiltinState::Declared, false, ContextBuiltinState::Disabled, Some(REQUEST_UNAVAILABLE); "capability_removed_control")]
-    #[test_case(ContextBuiltinState::Deferred, false, ContextBuiltinState::Deferred, Some(CONFIG_DISABLED_REASON); "deferred_definition_kept")]
     #[test_case(ContextBuiltinState::Disabled, false, ContextBuiltinState::Disabled, Some(CONFIG_DISABLED_REASON); "disabled_reason_kept")]
     #[test_case(ContextBuiltinState::Declared, true, ContextBuiltinState::Declared, None; "declared_definition")]
-    #[test_case(ContextBuiltinState::Deferred, true, ContextBuiltinState::Declared, None; "loaded_deferred_definition")]
     #[test_case(ContextBuiltinState::Disabled, true, ContextBuiltinState::Declared, None; "request_overrides_prediction")]
     fn builtin_availability_follows_actual_request(
         initial: ContextBuiltinState,
@@ -1281,7 +1212,6 @@ mod tests {
                 name: TASK_CONTROL_NAME.into(),
                 tokens: CROWDED_EXCESS,
                 billed_to: None,
-                catalog: false,
             }]
         } else {
             Vec::new()
@@ -1304,70 +1234,16 @@ mod tests {
         );
     }
 
-    #[test_case(Some(ContextBuiltinState::Declared), true; "registered_eager")]
-    #[test_case(Some(ContextBuiltinState::Deferred), true; "registered_lazy")]
-    #[test_case(None, true; "local_binding")]
-    #[test_case(None, false; "native_catalog")]
-    fn tool_search_tokens_keep_binding_identity(initial: Option<ContextBuiltinState>, bound: bool) {
-        let full = json!([definition(TOOL_SEARCH_TOOL_NAME, SEARCH_DESCRIPTION)]);
-        let sources = if bound { full.clone() } else { json!([]) };
-        let accounting = account_tools(&sources, &full);
-        let mut inventory = ContextBuiltinInventory {
-            tools: initial
-                .into_iter()
-                .map(|state| ContextBuiltinTool {
-                    name: TOOL_SEARCH_TOOL_NAME.into(),
-                    source: CUSTOM_SEARCH_SOURCE.into(),
-                    state,
-                    reason: None,
-                    tokens: 0,
-                    billed_to: None,
-                })
-                .collect(),
-            ..ContextBuiltinInventory::default()
-        };
-        inventory.apply_request_tokens(
-            &accounting.builtin_definitions,
-            accounting.system_unattributed,
-        );
-        assert_eq!(inventory.request_tokens(), accounting.system);
-        if bound {
-            assert_eq!(inventory.catalog_tokens, 0);
-            assert_eq!(inventory.tools.len(), 1);
-            let tool = &inventory.tools[0];
-            assert_eq!(tool.name, TOOL_SEARCH_TOOL_NAME);
-            assert_eq!(tool.state, ContextBuiltinState::Declared);
-            assert_eq!(tool.tokens, value_tokens(&full[0]));
-            assert_eq!(
-                tool.source,
-                if initial.is_some() {
-                    CUSTOM_SEARCH_SOURCE
-                } else {
-                    ""
-                },
-            );
-        } else {
-            assert!(inventory.tools.is_empty());
-            assert!(inventory.catalog_tokens > 0);
-            assert_eq!(inventory.catalog_tokens, value_tokens(&full[0]));
-        }
-    }
-
     #[test]
     fn request_accounting_is_exclusive_and_tracks_inventory_contributions() {
         let model = model(TEST_WINDOW, false);
-        let base_tools = json!([
+        let full_tools = json!([
             definition("file_read", "Read a file"),
             definition(TASK_TOOL_NAME, "Profiles: builtin and review"),
             definition(MEMORY_TOOL_NAME, "Read memory on demand"),
             definition(SKILL_TOOL_NAME, "Skills: deploy"),
             definition(CODE_TOOL_NAME, "Run Python that calls MCP servers")
         ]);
-        let mut full_tools = base_tools.clone();
-        full_tools.as_array_mut().unwrap().push(definition(
-            TOOL_SEARCH_TOOL_NAME,
-            "Deferred tools:\nsearch: query",
-        ));
         let inventory = ContextInventory {
             memory: ContextMemoryInventory {
                 files: vec![ContextMemoryFile {
@@ -1385,9 +1261,8 @@ mod tests {
                 ..ContextSkillInventory::default()
             },
             mcp: ContextMcpInventory::from_statuses(vec![
-                mcp_status(AVAILABLE_MCP, false, false),
-                mcp_status(SEARCH_ONLY_MCP, false, true),
-                mcp_status(DISABLED_MCP, true, false),
+                mcp_status(AVAILABLE_MCP, false),
+                mcp_status(DISABLED_MCP, true),
             ]),
             ..ContextInventory::default()
         };
@@ -1408,8 +1283,7 @@ mod tests {
             auto_compact: true,
             compaction_buffer: None,
             system: &system,
-            base_tools: &base_tools,
-            full_tools: &full_tools,
+            tools: &full_tools,
             projected_messages: &messages,
             measured: None,
             inventory,
@@ -1442,27 +1316,18 @@ mod tests {
             value_tokens(&full_tools)
         );
         let slack = reconciliation_slack(&full_tools);
-        assert_reconciled(snapshot.usage.profiles, &base_tools[1], slack);
+        assert_reconciled(snapshot.usage.profiles, &full_tools[1], slack);
         assert_reconciled(
             snapshot.inventory.memory.definition_tokens,
-            &base_tools[2],
+            &full_tools[2],
             slack,
         );
         assert_reconciled(
             snapshot.inventory.skills.definition_tokens,
-            &base_tools[3],
+            &full_tools[3],
             slack,
         );
         assert_reconciled(snapshot.usage.mcp_tools, &full_tools[4], slack);
-        assert_reconciled(
-            snapshot.inventory.builtins.catalog_tokens,
-            &full_tools[5],
-            slack,
-        );
-        assert!(
-            snapshot.inventory.builtins.catalog_tokens > 0,
-            "the shared catalog is ours, not a server's"
-        );
         assert_eq!(
             snapshot.inventory.builtins.request_tokens(),
             snapshot.usage.system_tools
@@ -1539,22 +1404,9 @@ mod tests {
             statuses,
             [
                 (AVAILABLE_MCP, ContextMcpStatus::Available),
-                (SEARCH_ONLY_MCP, ContextMcpStatus::SearchOnly),
                 (DISABLED_MCP, ContextMcpStatus::Disabled),
             ]
         );
-    }
-
-    #[test_case("file_read"; "native")]
-    #[test_case("plugin_lookup"; "plugin")]
-    #[test_case("local_lookup"; "local")]
-    fn lazy_own_definitions_keep_source_attribution(name: &str) {
-        let own_definition = definition(name, "Deferred lookup");
-        let sources = json!([own_definition]);
-        let full = json!([own_definition]);
-        let accounted = account_tools(&sources, &full);
-        assert_eq!(accounted.builtin_definitions[0].name, name);
-        assert_eq!(accounted.system, value_tokens(&full));
     }
 
     /// The reconciliation grows with the tool count, so a request carrying
@@ -1616,7 +1468,7 @@ mod tests {
                 ..Message::default()
             },
         ];
-        let usage = estimate_context_usage(&model, "", &json!([]), &json!([]), &messages);
+        let usage = estimate_context_usage(&model, "", &json!([]), &messages);
         let special = if tool_name == MEMORY_TOOL_NAME {
             usage.memory
         } else {
@@ -1668,7 +1520,7 @@ mod tests {
                 ..Message::default()
             },
         ];
-        let usage = estimate_context_usage(&model, "", &json!([]), &json!([]), &messages);
+        let usage = estimate_context_usage(&model, "", &json!([]), &messages);
         assert_eq!(usage.memory, estimate_tokens_cached(MEMORY_RESULT));
         assert!(usage.messages >= estimate_tokens_cached(EARLY_RESULT));
         assert_eq!(
@@ -1703,13 +1555,7 @@ mod tests {
         } else {
             0
         };
-        let usage = estimate_context_usage(
-            &model(TEST_WINDOW, false),
-            "",
-            &json!([]),
-            &json!([]),
-            &messages,
-        );
+        let usage = estimate_context_usage(&model(TEST_WINDOW, false), "", &json!([]), &messages);
 
         assert_eq!(usage.memory, body_tokens);
         assert_eq!(usage.skills, 0);
@@ -1907,13 +1753,7 @@ mod tests {
         .chain([estimate_tokens_cached(&tool_input.to_string())])
         .fold(0, u32::saturating_add);
         let total = estimate_message_tokens(&messages);
-        let usage = estimate_context_usage(
-            &model(TEST_WINDOW, false),
-            "",
-            &json!([]),
-            &json!([]),
-            &messages,
-        );
+        let usage = estimate_context_usage(&model(TEST_WINDOW, false), "", &json!([]), &messages);
 
         assert!(total > provider_fields);
         assert_eq!(usage.messages, total);
@@ -1988,14 +1828,8 @@ mod tests {
 
         assert_eq!(estimate_message_tokens(&[message.clone()]), baseline);
         assert_eq!(
-            estimate_context_usage(
-                &model(TEST_WINDOW, false),
-                "",
-                &json!([]),
-                &json!([]),
-                &[message],
-            )
-            .messages,
+            estimate_context_usage(&model(TEST_WINDOW, false), "", &json!([]), &[message],)
+                .messages,
             baseline
         );
     }
@@ -2019,8 +1853,8 @@ mod tests {
             estimate_message_tokens(&large)
         );
         assert_eq!(
-            estimate_context_usage(&model, "", &json!([]), &json!([]), &short).messages,
-            estimate_context_usage(&model, "", &json!([]), &json!([]), &large).messages
+            estimate_context_usage(&model, "", &json!([]), &short).messages,
+            estimate_context_usage(&model, "", &json!([]), &large).messages
         );
     }
 
@@ -2156,8 +1990,7 @@ mod tests {
             auto_compact: false,
             compaction_buffer: None,
             system: "",
-            base_tools: &empty_tools,
-            full_tools: &empty_tools,
+            tools: &empty_tools,
             projected_messages: &[],
             measured: None,
             inventory,

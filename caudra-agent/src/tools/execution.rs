@@ -4,7 +4,7 @@ use serde_json::Value;
 use crate::prompt::{ResolvedSlots, execution_guidance, shell_execution_guidance};
 
 use super::{
-    DeferredTool, SHELL_TOOL_NAME, TASK_TOOL_NAME,
+    SHELL_TOOL_NAME, TASK_TOOL_NAME,
     native::{question, task},
 };
 
@@ -41,39 +41,19 @@ pub fn configure_declared(
     }
 }
 
-pub fn configure_tools(
-    tools: &mut Value,
-    deferred: &mut Vec<DeferredTool>,
-    config: &AgentConfig,
-    tasks_supported: bool,
-    shell_supported: bool,
-) {
-    configure_declared(tools, config, tasks_supported, shell_supported);
-    *deferred = std::mem::take(deferred)
-        .into_iter()
-        .filter_map(|tool| {
-            let mut definitions = Value::Array(vec![tool.definition]);
-            configure_declared(&mut definitions, config, tasks_supported, shell_supported);
-            let definition = definitions.as_array_mut()?.pop()?;
-            Some(DeferredTool::new(&tool.name, definition))
-        })
-        .collect();
-}
-
 pub fn execution_slots(
     slots: &ResolvedSlots,
     config: &AgentConfig,
     tasks_supported: bool,
     shell_supported: bool,
     tools: &Value,
-    deferred: &[DeferredTool],
 ) -> ResolvedSlots {
     let exposed = |name: &str| {
         tools.as_array().is_some_and(|tools| {
             tools
                 .iter()
                 .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
-        }) || deferred.iter().any(|tool| tool.name.as_ref() == name)
+        })
     };
     slots.with_execution_guidance(&execution_guidance(
         config,
@@ -94,14 +74,13 @@ mod tests {
     use serde_json::{Value, json};
     use test_case::test_case;
 
-    use super::{configure_declared, configure_tools, execution_slots};
+    use super::{configure_declared, execution_slots};
     use crate::{
         agent::build_system_prompt,
         prompt::{self, PromptId, ResolvedSlots, Slot, SlotEntry},
         template::Vars,
         tools::{
             DescriptionContext, ToolAudience, ToolFilter,
-            deferral::DeferralSession,
             native::{task::TaskTool, task_control::TaskControl},
             registry::{
                 ParseError, Tool, ToolDefinitions, ToolInvocation, ToolRegistry, ToolSource,
@@ -164,7 +143,6 @@ mod tests {
     fn definitions(
         registry: &ToolRegistry,
         audience: ToolAudience,
-        deferred: bool,
         examples: bool,
     ) -> ToolDefinitions {
         registry.definitions_split(
@@ -175,7 +153,6 @@ mod tests {
                 workflows_available: false,
             },
             examples,
-            if deferred { TOOL_NAMES } else { &[] },
         )
     }
 
@@ -285,25 +262,15 @@ mod tests {
             for (task_cap, shell_cap) in
                 [(false, false), (false, true), (true, false), (true, true)]
             {
-                for (defer, examples) in
-                    [(false, false), (false, true), (true, false), (true, true)]
-                {
-                    let mut definitions =
-                        definitions(&registry, ToolAudience::MAIN, defer, examples);
-                    configure_tools(
-                        &mut definitions.declared,
-                        &mut definitions.deferred,
-                        &config,
-                        task_cap,
-                        shell_cap,
-                    );
+                for examples in [false, true] {
+                    let mut definitions = definitions(&registry, ToolAudience::MAIN, examples);
+                    configure_declared(&mut definitions.declared, &config, task_cap, shell_cap);
                     let slots = execution_slots(
                         &ResolvedSlots::default(),
                         &config,
                         task_cap,
                         shell_cap,
                         &definitions.declared,
-                        &definitions.deferred,
                     );
                     let system = build_system_prompt(
                         "",
@@ -329,25 +296,7 @@ mod tests {
                     } else {
                         assert!(!system.contains("Shell calls"));
                     }
-                    let session = DeferralSession::new(definitions.deferred, std::iter::empty());
-                    let mut catalog = definitions.declared.clone();
-                    session.request_snapshot().extend_tools(&mut catalog);
-                    for (name, available) in [
-                        ("task", effective_task.is_some()),
-                        ("shell", effective_shell.is_some()),
-                        ("task_control", task_cap || shell_cap),
-                    ] {
-                        if defer {
-                            let result = session.fresh().search(name).unwrap();
-                            assert_eq!(
-                                result.loaded.iter().any(|loaded| loaded.as_ref() == name),
-                                available
-                            );
-                            session.mark_loaded(name);
-                        }
-                    }
                     let mut published = definitions.declared;
-                    session.request_snapshot().extend_tools(&mut published);
                     assert_contract(find(&published, "task"), effective_task.clone(), true);
                     assert_contract(find(&published, "shell"), effective_shell.clone(), false);
                     if let Some(control) = find(&published, "task_control") {
@@ -363,10 +312,9 @@ mod tests {
                             .as_ref()
                             .is_none_or(|mode| *mode == ExecutionMode::Sync)
                     {
-                        let all = format!("{system}\n{published}\n{catalog}").to_lowercase();
+                        let all = format!("{system}\n{published}").to_lowercase();
                         for forbidden in ["background", "async"] {
                             assert!(!all.contains(forbidden), "{forbidden}: {all}");
-                            assert!(session.fresh().search(forbidden).unwrap().loaded.is_empty());
                         }
                     }
                     let once = published.clone();
@@ -381,7 +329,7 @@ mod tests {
     #[test_case(true; "structured_examples")]
     fn execution_reconfiguration_preserves_examples_and_canonical_facts(examples: bool) {
         let registry = registry();
-        let mut definitions = definitions(&registry, ToolAudience::MAIN, true, examples);
+        let mut definitions = definitions(&registry, ToolAudience::MAIN, examples);
         for mode in [
             ExecutionMode::Auto,
             ExecutionMode::Async,
@@ -394,22 +342,11 @@ mod tests {
                 shell_async_threshold_secs: CUSTOM_THRESHOLD,
                 ..AgentConfig::default()
             };
-            configure_tools(
-                &mut definitions.declared,
-                &mut definitions.deferred,
-                &config,
-                true,
-                true,
-            );
-            let session = DeferralSession::new(definitions.deferred.clone(), std::iter::empty());
-            for name in TOOL_NAMES {
-                session.mark_loaded(name);
-            }
-            let mut published = definitions.declared.clone();
-            session.request_snapshot().extend_tools(&mut published);
-            assert_contract(find(&published, "task"), Some(mode.clone()), true);
-            assert_contract(find(&published, "shell"), Some(mode.clone()), false);
-            let description = find(&published, "task").unwrap()["description"]
+            configure_declared(&mut definitions.declared, &config, true, true);
+            let published = &definitions.declared;
+            assert_contract(find(published, "task"), Some(mode.clone()), true);
+            assert_contract(find(published, "shell"), Some(mode.clone()), false);
+            let description = find(published, "task").unwrap()["description"]
                 .as_str()
                 .unwrap();
             assert_eq!(
@@ -418,26 +355,6 @@ mod tests {
                     .count(),
                 1
             );
-            if mode == ExecutionMode::Sync {
-                assert!(
-                    session
-                        .fresh()
-                        .search("background")
-                        .unwrap()
-                        .loaded
-                        .is_empty()
-                );
-            }
-            if mode == ExecutionMode::Async {
-                assert!(
-                    session
-                        .fresh()
-                        .search("foreground")
-                        .unwrap()
-                        .loaded
-                        .is_empty()
-                );
-            }
         }
     }
 
@@ -463,37 +380,15 @@ mod tests {
             },
         );
         for supported in [false, true] {
-            let mut definitions = definitions(&registry, ToolAudience::GENERAL_SUB, true, false);
-            configure_tools(
-                &mut definitions.declared,
-                &mut definitions.deferred,
-                &config,
-                false,
-                supported,
-            );
-            let slots = execution_slots(
-                &inherited,
-                &config,
-                false,
-                supported,
-                &definitions.declared,
-                &definitions.deferred,
-            );
+            let mut definitions = definitions(&registry, ToolAudience::GENERAL_SUB, false);
+            configure_declared(&mut definitions.declared, &config, false, supported);
+            let slots =
+                execution_slots(&inherited, &config, false, supported, &definitions.declared);
             let rendered = prompt::assemble_task(PromptId::General, &slots, "", None);
             assert!(rendered.contains(CUSTOM_INSTRUCTION));
             assert!(!rendered.contains("Task calls"));
-            let session = DeferralSession::new(definitions.deferred, std::iter::empty());
-            assert!(
-                !session
-                    .search("task")
-                    .unwrap()
-                    .loaded
-                    .iter()
-                    .any(|name| name.as_ref() == "task")
-            );
-            session.search("task_control").unwrap();
-            let mut published = definitions.declared;
-            session.request_snapshot().extend_tools(&mut published);
+            let published = definitions.declared;
+            assert!(find(&published, "task").is_none());
             assert_eq!(find(&published, "task_control").is_some(), supported);
             if let Some(control) = find(&published, "task_control") {
                 assert!(!control.to_string().contains("background"));

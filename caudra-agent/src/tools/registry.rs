@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bitflags::bitflags;
-use caudra_config::{ProfileToolExposure, ProfileToolPolicy};
+use caudra_config::{CODE_HOSTED_TOOLS, ProfileToolPolicy};
 use caudra_providers::DocumentSource;
 use caudra_storage::local_documents::LocalDocumentError;
 use caudra_storage::tool_ledger::ToolOutcome;
@@ -31,7 +31,6 @@ use crate::permissions::{
 use crate::template::Vars;
 use crate::{AgentMode, BufferSnapshot, ToolInput, ToolOutput, ToolOutputLimits};
 
-use super::deferral::DeferredTool;
 use super::native::plan::PlanAccess;
 use super::{DescriptionContext, LockKey, ToolContext, ToolFilter};
 
@@ -1142,27 +1141,23 @@ impl ToolRegistry {
         ctx: &DescriptionContext,
         supports_examples: bool,
     ) -> Value {
-        self.definitions_split(vars, ctx, supports_examples, &[])
+        self.definitions_split(vars, ctx, supports_examples)
             .declared
     }
 
-    /// The same definitions, split into what the request declares and what is
-    /// held back for `tool_search`. `deferred` names tools to withhold;
-    /// anything not registered, filtered out, or wrong for the audience is
-    /// absent from both halves, so a disabled tool cannot be searched into
-    /// existence.
+    /// The same definitions, split into what the request declares and what only a `code` module
+    /// reaches. Anything not registered, filtered out, or wrong for the audience is absent from
+    /// both halves.
     pub fn definitions_split(
         &self,
         vars: &Vars,
         ctx: &DescriptionContext,
         supports_examples: bool,
-        deferred: &[&str],
     ) -> ToolDefinitions {
         self.definitions_split_with_policy(
             vars,
             ctx,
             supports_examples,
-            deferred,
             &ProfileToolPolicy::default(),
             false,
         )
@@ -1173,22 +1168,20 @@ impl ToolRegistry {
         vars: &Vars,
         ctx: &DescriptionContext,
         supports_examples: bool,
-        deferred: &[&str],
         profile: &ProfileToolPolicy,
         session_plan: bool,
     ) -> ToolDefinitions {
         let snapshot = self.tools.load();
         let mut out = Vec::with_capacity(snapshot.len());
-        let mut held = Vec::new();
+        let mut hosted = Vec::new();
         for entry in snapshot.iter() {
-            let decision = super::profile_policy::registered_decision(
-                entry,
-                ctx,
-                profile,
-                session_plan,
-                deferred.contains(&entry.name()),
-            );
+            let decision =
+                super::profile_policy::registered_decision(entry, ctx, profile, session_plan);
             if !decision.available() {
+                continue;
+            }
+            if CODE_HOSTED_TOOLS.contains(&entry.name()) {
+                hosted.push(entry.name().to_owned());
                 continue;
             }
             let description = vars.apply(&entry.tool.description(ctx)).into_owned();
@@ -1206,14 +1199,11 @@ impl ToolRegistry {
                     def["description"] = Value::String(merged);
                 }
             }
-            match decision.exposure == ProfileToolExposure::Lazy {
-                true => held.push(DeferredTool::new(entry.name(), def)),
-                false => out.push(def),
-            }
+            out.push(def);
         }
         ToolDefinitions {
             declared: Value::Array(out),
-            deferred: held,
+            hosted,
         }
     }
 
@@ -1227,14 +1217,8 @@ impl ToolRegistry {
             self.iter()
                 .iter()
                 .filter(|entry| {
-                    super::profile_policy::registered_decision(
-                        entry,
-                        ctx,
-                        profile,
-                        session_plan,
-                        false,
-                    )
-                    .available()
+                    super::profile_policy::registered_decision(entry, ctx, profile, session_plan)
+                        .available()
                 })
                 .map(|entry| entry.name().to_owned())
                 .collect(),
@@ -1251,10 +1235,11 @@ impl ToolRegistry {
     }
 }
 
-/// What one request declares, and what it holds back behind `tool_search`.
+/// What one request declares, and what only a `code` module reaches.
 pub struct ToolDefinitions {
     pub declared: Value,
-    pub deferred: Vec<DeferredTool>,
+    /// Available tools of [`CODE_HOSTED_TOOLS`]: never declared, run only for a `code` module call.
+    pub hosted: Vec<String>,
 }
 
 impl ToolDefinitions {
@@ -1265,7 +1250,7 @@ impl ToolDefinitions {
                 .into_iter()
                 .flatten()
                 .filter_map(|definition| definition["name"].as_str().map(str::to_owned))
-                .chain(self.deferred.iter().map(|tool| tool.name.to_string()))
+                .chain(self.hosted.iter().cloned())
                 .collect(),
         )
     }

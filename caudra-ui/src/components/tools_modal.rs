@@ -2,8 +2,6 @@ use caudra_agent::context::{
     ContextBuiltinState, ContextBuiltinTool, ContextMcpStatus, ContextSnapshot,
 };
 use caudra_agent::format_settled_duration;
-use caudra_agent::tools::TOOL_SEARCH_TOOL_NAME as TOOL_SEARCH;
-use caudra_agent::tools::report::{CATALOG_SOURCE, REASON_CATALOG};
 use caudra_grab::grab_scope;
 use caudra_providers::{format_tokens_u64, token_label};
 use caudra_storage::tool_ledger::{ToolOutcome, ToolSlice, ToolStats};
@@ -31,7 +29,6 @@ const MAX_HEIGHT_PERCENT: u16 = 82;
 const H_PAD: u16 = 2;
 const H_PAD_STEP_WIDTH: u16 = 16;
 const DECLARED_GLYPH: &str = "\u{25cf}";
-const DEFERRED_GLYPH: &str = "\u{25cb}";
 const DISABLED_GLYPH: &str = "\u{d7}";
 const NO_SNAPSHOT: &str = "No tool report is available yet.";
 const NO_SNAPSHOT_HINT: &str = "A report appears when a request is prepared.";
@@ -350,7 +347,6 @@ fn build_lines(
 
 fn summary_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>> {
     let builtins = &snapshot.inventory.builtins;
-    let deferred = builtins.count(ContextBuiltinState::Deferred);
     vec![
         labeled_line(
             "Model",
@@ -367,14 +363,6 @@ fn summary_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>
             theme,
         ),
         labeled_line(
-            "On demand",
-            format!(
-                "{deferred} built-in \u{b7} {} if loaded",
-                token_label(builtins.deferred_tokens())
-            ),
-            theme,
-        ),
-        labeled_line(
             "Off",
             format!("{} built-in", builtins.count(ContextBuiltinState::Disabled)),
             theme,
@@ -384,30 +372,12 @@ fn summary_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>
 
 fn builtin_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = vec![Line::default(), section_line("Built-in", theme)];
-    // `tool_search` has no registry entry, so it is derived from the catalog
-    // it costs rather than listed like the tools it stands in for.
-    let catalog_tokens = snapshot.inventory.builtins.catalog_tokens;
-    if catalog_tokens > 0 {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{DECLARED_GLYPH} "), theme.tool_success),
-            Span::styled(TOOL_SEARCH.to_owned(), theme.tool_path),
-            Span::styled("  on", theme.tool_success),
-            Span::raw(format!(
-                " \u{b7} {} in context",
-                token_label(catalog_tokens)
-            )),
-            Span::styled(format!(" \u{b7} {REASON_CATALOG}"), theme.status_dim),
-            Span::styled(format!(" \u{b7} {CATALOG_SOURCE}"), theme.status_dim),
-        ]));
-    }
     for tool in &snapshot.inventory.builtins.tools {
         lines.push(builtin_line(tool, theme));
     }
     lines
 }
 
-/// A deferred tool's tokens are a quote, not a charge, so the row says what
-/// the number means rather than leaving both readings open.
 fn builtin_line(tool: &ContextBuiltinTool, theme: &Theme) -> Line<'static> {
     let (glyph, state, style, tokens) = match tool.state {
         ContextBuiltinState::Declared => (
@@ -415,12 +385,6 @@ fn builtin_line(tool: &ContextBuiltinTool, theme: &Theme) -> Line<'static> {
             "on",
             theme.tool_success,
             format!("{} in context", token_label(tool.tokens)),
-        ),
-        ContextBuiltinState::Deferred => (
-            DEFERRED_GLYPH,
-            "lazy",
-            theme.tool_dim,
-            format!("{} if loaded", token_label(tool.tokens)),
         ),
         ContextBuiltinState::Disabled => (DISABLED_GLYPH, "off", theme.error, String::new()),
     };
@@ -460,7 +424,6 @@ fn mcp_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>> {
     for tool in &inventory.tools {
         let (glyph, state, style) = match tool.status {
             ContextMcpStatus::Available => (DECLARED_GLYPH, "via code", theme.tool_success),
-            ContextMcpStatus::SearchOnly => (DEFERRED_GLYPH, "search-only", theme.tool_dim),
             ContextMcpStatus::Disabled => (DISABLED_GLYPH, "off", theme.error),
         };
         let mut spans = vec![
@@ -707,18 +670,17 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        CATALOG_SOURCE, COUNT_COL, ContextBuiltinState, ContextBuiltinTool, ContextMcpStatus,
-        ContextSnapshot, ESTIMATE_MARKER, FAILURES_HEADING, GLOBAL_TITLE, NO_ACTIVITY,
-        NO_ACTIVITY_HINT, NO_MCP, NO_SNAPSHOT, PROJECT_TITLE, REASON_CATALOG, SESSION_TITLE,
-        STATS_UNAVAILABLE, TITLE, TOOL_COL_MIN, TOOL_SEARCH, ToolOutcome, ToolStats, ToolsModal,
-        ToolsModalContext, ToolsScope, build_lines, key, stats_lines,
+        COUNT_COL, ContextBuiltinState, ContextBuiltinTool, ContextMcpStatus, ContextSnapshot,
+        ESTIMATE_MARKER, FAILURES_HEADING, GLOBAL_TITLE, NO_ACTIVITY, NO_ACTIVITY_HINT, NO_MCP,
+        NO_SNAPSHOT, PROJECT_TITLE, SESSION_TITLE, STATS_UNAVAILABLE, TITLE, TOOL_COL_MIN,
+        ToolOutcome, ToolStats, ToolsModal, ToolsModalContext, ToolsScope, build_lines, key,
+        stats_lines,
     };
     use crate::theme;
 
     const MODEL_SPEC: &str = "test/model";
     const WINDOW_TOKENS: u32 = 1_000;
     const DECLARED: &str = "file_read";
-    const DEFERRED: &str = "execution_environment";
     const DISABLED: &str = "file_edit";
     const SHELL: &str = "shell";
     const DISABLED_REASON: &str = "model uses the other editing tool";
@@ -765,10 +727,8 @@ mod tests {
                 builtins: ContextBuiltinInventory {
                     tools: vec![
                         tool(DECLARED, ContextBuiltinState::Declared, 55),
-                        tool(DEFERRED, ContextBuiltinState::Deferred, 90),
                         tool(DISABLED, ContextBuiltinState::Disabled, 0),
                     ],
-                    catalog_tokens: 20,
                     unattributed_tokens: 0,
                 },
                 mcp: ContextMcpInventory {
@@ -797,18 +757,14 @@ mod tests {
         join(build_lines(snapshot, "Executing Build", &theme::current()))
     }
 
-    /// A deferred tool costs nothing yet, so its number has to read as a
-    /// quote. A disabled one has no number at all and carries the rule
-    /// instead.
+    /// A disabled tool has no number at all and carries the rule instead.
     #[test]
     fn every_state_says_what_its_number_means() {
         let out = rendered(Some(&snapshot(Vec::new())));
         for expected in [
-            "Declared  1 built-in · ~75 tokens in context",
-            "On demand  1 built-in · ~90 tokens if loaded",
+            "Declared  1 built-in · ~55 tokens in context",
             "Off  1 built-in",
             "file_read  on · ~55 tokens in context · native:workcell",
-            "execution_environment  lazy · ~90 tokens if loaded · native:workcell",
             "file_edit  off · model uses the other editing tool · native:workcell",
             NO_MCP,
         ] {
@@ -822,40 +778,15 @@ mod tests {
         let out = rendered(Some(&snapshot(vec![ContextMcpTool {
             qualified_name: "issues.fetch".to_owned(),
             server: "issues".to_owned(),
-            status: ContextMcpStatus::SearchOnly,
+            status: ContextMcpStatus::Available,
             reason,
         }])));
-        assert!(out.contains("issues.fetch  search-only · "), "{out}");
+        assert!(out.contains("issues.fetch  via code · "), "{out}");
         assert!(out.contains("· issues"), "{out}");
         assert!(!out.contains(NO_MCP), "{out}");
         if let Some(reason) = reason {
             assert!(out.contains(reason), "{out}");
         }
-    }
-
-    /// `tool_search` has no registry row to inherit, so the report derives it
-    /// from the catalog it costs.
-    #[test]
-    fn the_catalog_is_reported_when_the_request_carries_one() {
-        let out = rendered(Some(&snapshot(Vec::new())));
-
-        assert!(
-            out.contains(&format!(
-                "{TOOL_SEARCH}  on · ~20 tokens in context · {REASON_CATALOG} · {CATALOG_SOURCE}"
-            )),
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn no_catalog_row_without_a_catalog() {
-        let mut without = snapshot(Vec::new());
-        without.inventory.builtins.catalog_tokens = 0;
-
-        assert!(
-            !rendered(Some(&without)).contains(TOOL_SEARCH),
-            "{TOOL_SEARCH}"
-        );
     }
 
     #[test]

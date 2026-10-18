@@ -15,8 +15,8 @@ use tokio_util::sync::CancellationToken;
 use workcell_mcp_code::{
     CodeConfiguration, CodeHost, CodeInput, CodeOutput, CodePools, CodeToolGroup, HostCall,
     HostError, HostErrorKind, HostInvocation, HostName, HostedExecution, HostedState,
-    MAX_HOST_CALLS_PER_RUN, Outcome, PreparedCode, Repair, StateNote, WORKER_FILE_NAME,
-    WorkerSource,
+    MAX_HOST_CALLS_PER_RUN, Outcome, PreparedCode, Repair, SleepFuture, StateNote,
+    WORKER_FILE_NAME, WorkerSource,
 };
 
 const NAMESPACE: &str = "gh";
@@ -39,6 +39,10 @@ const ROUND_TRIPS_PAST_THE_ISOLATED_CAP: usize = 300;
 /// Each call is at least one round trip, so this overruns the hosted cap of 1,024.
 const ROUND_TRIPS_PAST_THE_HOSTED_CAP: usize = 2_000;
 const CALLS_BEFORE_RESTORE: usize = 60;
+/// A sleep the fake host never ends, so only cancelling the run ends it.
+const FOREVER: Duration = Duration::from_secs(1_000_000);
+/// Short enough to keep the suite fast, long enough to measure.
+const REAL_SLEEP: Duration = Duration::from_millis(50);
 const GATHER_UNIMPORTED: &str =
     "a, b = await asyncio.gather(gh.list(owner='a'), gh.list(owner='b'))\n[a['owner'], b['owner']]";
 
@@ -77,15 +81,23 @@ async fn group_with_type_check(type_check: bool) -> Option<CodeToolGroup> {
     )
 }
 
-/// Records each deferred call when it starts, which is when the snippet first awaits it.
+/// Records each deferred call when it starts, which is when the snippet first awaits it, and each
+/// sleep, which it answers at once unless it is [`FOREVER`].
 #[derive(Default)]
 struct FakeHost {
     calls: Arc<Mutex<Vec<String>>>,
+    slept: Arc<Mutex<Vec<Duration>>>,
 }
 
 impl FakeHost {
     fn calls(&self) -> Vec<String> {
         self.calls.lock().expect("calls").clone()
+    }
+
+    fn slept(&self) -> Vec<Duration> {
+        let mut slept = self.slept.lock().expect("slept").clone();
+        slept.sort();
+        slept
     }
 }
 
@@ -133,6 +145,33 @@ impl CodeHost for FakeHost {
 
     fn stubs(&self) -> String {
         STUBS.to_owned()
+    }
+
+    fn sleep(&self, delay: Duration) -> SleepFuture {
+        let slept = Arc::clone(&self.slept);
+        Box::pin(async move {
+            slept.lock().expect("slept").push(delay);
+            if delay >= FOREVER {
+                std::future::pending::<()>().await;
+            }
+        })
+    }
+}
+
+/// A host with nothing to offer but the default sleep, which really waits.
+struct BareHost;
+
+impl CodeHost for BareHost {
+    fn lookup(&self, _namespace: Option<&str>, _name: &str) -> HostName {
+        HostName::Undefined(None)
+    }
+
+    fn call(&self, _call: HostCall) -> HostInvocation {
+        HostInvocation::Ready(Err(HostError::new(HostErrorKind::Name, "no host calls")))
+    }
+
+    fn stubs(&self) -> String {
+        String::new()
     }
 }
 
@@ -802,6 +841,113 @@ async fn cancelling_during_a_host_call_keeps_the_prior_session() {
     let host = Arc::new(FakeHost::default());
     let after = run(&group, &host, "kept", executed.state).await;
     assert_eq!(result(&after), &json!(7));
+    group.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn both_sleeps_wait_through_the_host() {
+    let Some(group) = group().await else { return };
+    let host = Arc::new(FakeHost::default());
+    let code =
+        "import asyncio\nimport time\ntime.sleep(2.5)\nawait asyncio.sleep(0.5, result='done')";
+    let executed = run(&group, &host, code, None).await;
+    assert_eq!(
+        outcome(&executed),
+        Outcome::Completed,
+        "{:?}",
+        output(&executed)
+    );
+    assert_eq!(result(&executed), &json!("done"));
+    assert_eq!(
+        host.slept(),
+        [Duration::from_millis(500), Duration::from_millis(2_500)]
+    );
+    group.shutdown().await;
+}
+
+/// Sleeps take no host call slot, so they run beside the calls they are gathered with.
+#[tokio::test(flavor = "multi_thread")]
+async fn gathered_sleeps_run_beside_host_calls() {
+    let Some(group) = group().await else { return };
+    let host = Arc::new(FakeHost::default());
+    let code = "import asyncio\nr = await asyncio.gather(asyncio.sleep(1), gh.list(owner='a'), asyncio.sleep(2))\nr[1]['owner']";
+    let executed = run(&group, &host, code, None).await;
+    assert_eq!(result(&executed), &json!("a"), "{:?}", output(&executed));
+    assert_eq!(host.calls(), ["list"]);
+    assert_eq!(
+        host.slept(),
+        [Duration::from_secs(1), Duration::from_secs(2)]
+    );
+    group.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_default_sleep_really_waits() {
+    let Some(group) = group().await else { return };
+    let prepared = group
+        .prepare_hosted(format!(
+            "import time\ntime.sleep({})\n1",
+            REAL_SLEEP.as_secs_f64()
+        ))
+        .expect("valid snippet");
+    let executed = group
+        .execute_hosted(prepared, Arc::new(BareHost), None, CancellationToken::new())
+        .await;
+    let completed = output(&executed);
+    assert_eq!(completed.outcome, Outcome::Completed, "{completed:?}");
+    assert!(Duration::from_millis(completed.duration_ms) >= REAL_SLEEP);
+    group.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clocks_read_the_host_while_entropy_stays_refused() {
+    let Some(group) = group().await else { return };
+    let host = Arc::new(FakeHost::default());
+    let clocks = "import time\nfrom datetime import date, datetime\n[time.time() > 1.7e9, time.monotonic() > 0, time.perf_counter() > 0, datetime.now().year > 2000, date.today().year > 2000]";
+    let executed = run(&group, &host, clocks, None).await;
+    assert_eq!(
+        result(&executed),
+        &json!([true, true, true, true, true]),
+        "{:?}",
+        output(&executed)
+    );
+    let entropy = run(&group, &host, "import random\nrandom.random()", None).await;
+    let refused = output(&entropy);
+    assert_eq!(refused.outcome, Outcome::Exception, "{refused:?}");
+    assert_eq!(
+        refused
+            .exception
+            .as_ref()
+            .map(|exception| exception.r#type.as_str()),
+        Some("RuntimeError")
+    );
+    group.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_sleep_stops_the_run() {
+    let Some(group) = group().await else { return };
+    let host = Arc::new(FakeHost::default());
+    let cancellation = CancellationToken::new();
+    let prepared = group
+        .prepare_hosted(format!(
+            "import asyncio\nawait asyncio.sleep({})",
+            FOREVER.as_secs()
+        ))
+        .expect("valid snippet");
+    let trigger = cancellation.clone();
+    let dyn_host: Arc<dyn CodeHost> = host.clone();
+    let executed = tokio::select! {
+        executed = group.execute_hosted(prepared, dyn_host, None, cancellation) => executed,
+        () = async move {
+            while host.slept().is_empty() {
+                tokio::task::yield_now().await;
+            }
+            trigger.cancel();
+            std::future::pending::<()>().await;
+        } => unreachable!("waits forever once cancelled"),
+    };
+    assert!(executed.execution.is_none());
     group.shutdown().await;
 }
 

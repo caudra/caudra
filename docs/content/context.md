@@ -41,13 +41,14 @@ effective system prompt              file contents   file_read / file_index / fi
 tool definitions                     skill bodies    skill tool
 instruction files (AGENTS.md, ...)   memory notes    memory tool
 memory view (up to 32 KiB)           subdir rules    first file_read there
-skill names + descriptions           MCP tool defs   search() in mcp
+skill names + descriptions           MCP tool defs   mcp.search()
+                                     module pages    help() in code
 MCP server list (about 2k tokens)
 ```
 
 The left column is the fixed overhead of every single request, so Caudra keeps it small on purpose. A selected [system prompt profile](/docs/system-prompts/) changes the effective system prompt and its overhead. A skill contributes one description line, memory a [view of its notes](/docs/memory/#the-view) capped at 32 KiB, and your MCP servers a [server list](/docs/mcp/#the-server-list) of about 2,000 tokens, which the `code` tool reaches. The bodies stay on disk until the agent asks.
 
-The `/context` views report what currently contributes without loading deferred material to size it. MCP servers contribute their server list, and a tool's full description arrives only when `search()` returns it. Memory contributes its view and skills contribute their names and descriptions. A note or a skill body enters the transcript only when its tool reads it. These loads belong to the Main or task context that requested them.
+The `/context` views report what currently contributes without loading deferred material to size it. MCP servers contribute their server list, and a tool's full description arrives only when `mcp.search()` returns it. A `code` module's full reference arrives only when `help()` returns it. Memory contributes its view and skills contribute their names and descriptions. A note or a skill body enters the transcript only when its tool reads it. These loads belong to the Main or task context that requested them.
 
 ## Mention a file with @
 

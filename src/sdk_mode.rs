@@ -3543,7 +3543,6 @@ impl EventPump {
             | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge { .. }
-            | AgentEvent::ToolsLoaded { .. }
             | AgentEvent::Unrecorded { .. }
             | AgentEvent::CacheWarmEpisode(_)
             | AgentEvent::CacheHitSamples(_)

@@ -1,11 +1,8 @@
-use std::sync::Arc;
-
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
 use caudra_agent::code::runner as code_runner;
-use caudra_agent::context::{ContextMcpInventory, ContextMcpStatus, ContextSnapshot};
 use caudra_agent::mcp::code::naming::Names;
 use caudra_agent::mcp::code::view::{ServerState, ServerView};
 use caudra_agent::mcp::config::McpConfigSource;
@@ -43,13 +40,9 @@ const EXECUTOR_NATIVE_HINT: &str = "Executor asks the model to approve its runs.
 const EXECUTOR_PASSTHROUGH_HINT: &str = "Executor's own tool takes code, so the model writes Python that sends code to it. Add ?mode=passthrough to the URL for its plain tools.";
 /// Worded as `/tools` and `/context` word the same states.
 const VIA_MCP: &str = "via code";
-const SEARCH_ONLY: &str = "search-only";
 const NAMESPACE_INFIX: &str = " as ";
 
-fn build_entries(
-    infos: &[McpServerInfo],
-    tools: Option<&ContextMcpInventory>,
-) -> (Vec<McpEntry>, Vec<bool>, Vec<bool>) {
+fn build_entries(infos: &[McpServerInfo]) -> (Vec<McpEntry>, Vec<bool>, Vec<bool>) {
     let names = namespaces(infos);
     let entries = infos
         .iter()
@@ -80,10 +73,6 @@ fn build_entries(
                         parts.push(info.transport_kind.to_string());
                         if info.tool_count > 0 {
                             parts.push(tools_text(info, &names));
-                            let search_only = search_only_count(tools, &info.name);
-                            if search_only > 0 {
-                                parts.push(format!("{search_only} {SEARCH_ONLY}"));
-                            }
                         }
                         if info.prompt_count > 0 {
                             parts.push(format!("{} prompts", info.prompt_count));
@@ -171,16 +160,6 @@ fn banner(code_unavailable: Option<String>, errors: &McpConfigErrors) -> Option<
     (!parts.is_empty()).then(|| parts.join(DETAIL_SEPARATOR))
 }
 
-fn search_only_count(tools: Option<&ContextMcpInventory>, server: &str) -> usize {
-    tools.map_or(0, |inventory| {
-        inventory
-            .tools
-            .iter()
-            .filter(|tool| tool.server == server && tool.status == ContextMcpStatus::SearchOnly)
-            .count()
-    })
-}
-
 pub enum McpPickerAction {
     Consumed,
     Toggle { server_name: String, enabled: bool },
@@ -221,8 +200,6 @@ pub struct McpPicker {
     picker: ListPicker<McpEntry>,
     reader: McpSnapshotReader,
     servers: Watch<McpSnapshot>,
-    /// The main agent's inventory, which says which server tools a profile makes search-only.
-    tools: Watch<ContextSnapshot>,
     config_errors: McpConfigErrors,
     pending_confirmation: Option<PendingConfirmation>,
 }
@@ -234,16 +211,14 @@ impl McpPicker {
             picker,
             reader,
             servers: Watch::default(),
-            tools: Watch::default(),
             config_errors,
             pending_confirmation: None,
         }
     }
 
-    pub fn open(&mut self, tools: Option<Arc<ContextSnapshot>>) {
+    pub fn open(&mut self) {
         self.pending_confirmation = None;
         let _ = self.servers.poll(self.reader.load_full());
-        let _ = self.tools.poll(tools);
         let (entries, enabled, toggleable) = self.entries();
         self.show_config_errors();
         self.picker
@@ -268,11 +243,11 @@ impl McpPicker {
             .set_error_text(banner(code_runner::unavailable(), &self.config_errors));
     }
 
-    pub fn refresh(&mut self, tools: Option<Arc<ContextSnapshot>>) -> Dirty {
+    pub fn refresh(&mut self) -> Dirty {
         if !self.picker.is_open() {
             return Dirty::NO;
         }
-        if (self.servers.poll(self.reader.load_full()) | self.tools.poll(tools)) == Dirty::NO {
+        if self.servers.poll(self.reader.load_full()) == Dirty::NO {
             return Dirty::NO;
         }
         let (entries, enabled, toggleable) = self.entries();
@@ -285,12 +260,7 @@ impl McpPicker {
     fn entries(&self) -> (Vec<McpEntry>, Vec<bool>, Vec<bool>) {
         self.servers
             .get()
-            .map(|s| {
-                build_entries(
-                    &s.infos,
-                    self.tools.get().map(|snapshot| &snapshot.inventory.mcp),
-                )
-            })
+            .map(|s| build_entries(&s.infos))
             .unwrap_or_default()
     }
 
@@ -671,16 +641,10 @@ mod tests {
     use crate::components::buffer_text;
     use crate::components::key;
     use crate::components::keybindings::key as kb;
-    use caudra_agent::AgentMode;
-    use caudra_agent::context::{
-        ContextInventory, ContextMcpTool, ContextModel, ContextReadiness, ContextReserve,
-        ContextUsage, ContextWindow,
-    };
     use caudra_agent::mcp::config::{McpReviewSummary, load_config};
     use caudra_agent::mcp::protocol::{
         ListCapability, ServerCapabilities, ServerDiscovery, ServerInfo,
     };
-    use caudra_agent::tools::ToolAudience;
     use caudra_agent::{McpServerInfo, McpSnapshot};
     use caudra_config::PROJECT_DIR;
     use caudra_config::mcp::MCP_FILE;
@@ -745,7 +709,7 @@ mod tests {
     #[test]
     fn toggle_returns_server_name_and_new_state() {
         let mut p = McpPicker::new(test_snapshot(), McpConfigErrors::new(PathBuf::new()));
-        p.open(None);
+        p.open();
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(matches!(
             action,
@@ -757,7 +721,7 @@ mod tests {
     #[test_case(kb::QUIT.to_key_event() ; "ctrl_c_closes")]
     fn close_keys(cancel_key: KeyEvent) {
         let mut p = McpPicker::new(test_snapshot(), McpConfigErrors::new(PathBuf::new()));
-        p.open(None);
+        p.open();
         let action = p.handle_key(cancel_key);
         assert!(matches!(action, McpPickerAction::Close));
         assert!(!p.is_open());
@@ -769,7 +733,7 @@ mod tests {
             McpSnapshotReader::empty(),
             McpConfigErrors::new(PathBuf::new()),
         );
-        p.open(None);
+        p.open();
         assert!(p.is_open());
     }
 
@@ -814,7 +778,7 @@ mod tests {
             McpConfigErrors::new(PathBuf::new()),
         );
         assert!(picker.has_awaiting_trust());
-        picker.open(None);
+        picker.open();
         assert!(matches!(
             picker.handle_key(key(KeyCode::Enter)),
             McpPickerAction::Consumed
@@ -827,7 +791,7 @@ mod tests {
             awaiting_trust_snapshot(),
             McpConfigErrors::new(PathBuf::new()),
         );
-        picker.open(None);
+        picker.open();
         assert!(picker.text_key(None));
         assert!(!picker.text_key(Some(key(KeyCode::Char('o')))));
         picker.handle_text("project", false);
@@ -844,7 +808,7 @@ mod tests {
             awaiting_trust_snapshot(),
             McpConfigErrors::new(PathBuf::new()),
         );
-        picker.open(None);
+        picker.open();
         assert!(matches!(
             picker.handle_key(key(KeyCode::Char(shortcut))),
             McpPickerAction::Consumed
@@ -866,7 +830,7 @@ mod tests {
             awaiting_trust_snapshot(),
             McpConfigErrors::new(PathBuf::new()),
         );
-        picker.open(None);
+        picker.open();
         assert!(matches!(
             picker.handle_key(key(KeyCode::Char('o'))),
             McpPickerAction::TrustOnce { server_name } if server_name == "project-server"
@@ -876,7 +840,7 @@ mod tests {
     #[test]
     fn awaiting_trust_review_is_safe_and_complete() {
         let snapshot = awaiting_trust_snapshot();
-        let (entries, _, _) = build_entries(&snapshot.load().infos, None);
+        let (entries, _, _) = build_entries(&snapshot.load().infos);
         let detail = entries[0].info_text.as_deref().unwrap();
         assert!(detail.contains("command:"));
         assert!(detail.contains("Config: project · /project/.caudra/config.toml"));
@@ -894,7 +858,7 @@ mod tests {
             awaiting_trust_snapshot(),
             McpConfigErrors::new(PathBuf::new()),
         );
-        picker.open(None);
+        picker.open();
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -931,7 +895,7 @@ mod tests {
         let errors = broken_config_errors();
         let expected = errors.to_string();
         let mut picker = McpPicker::new(McpSnapshotReader::empty(), no_errors());
-        picker.open(None);
+        picker.open();
 
         picker.set_config_errors(errors);
         assert_eq!(picker.picker.error_text(), Some(expected.as_str()));
@@ -961,11 +925,11 @@ mod tests {
     #[test]
     fn an_adopted_reader_reaches_an_open_picker_at_the_next_refresh() {
         let mut picker = McpPicker::new(McpSnapshotReader::empty(), no_errors());
-        picker.open(None);
+        picker.open();
 
         picker.set_reader(awaiting_trust_snapshot());
 
-        assert_eq!(picker.refresh(None), Dirty::YES);
+        assert_eq!(picker.refresh(), Dirty::YES);
         assert!(picker.has_awaiting_trust());
     }
 
@@ -1019,10 +983,8 @@ mod tests {
 
     #[test]
     fn a_running_server_shows_what_it_said_about_itself() {
-        let (entries, _, _) = build_entries(
-            &[running(Some(McpServerKind::Executor), EXECUTOR_URL)],
-            None,
-        );
+        let (entries, _, _) =
+            build_entries(&[running(Some(McpServerKind::Executor), EXECUTOR_URL)]);
 
         assert!(
             entries[0]
@@ -1055,7 +1017,7 @@ mod tests {
         native_hinted: bool,
         passthrough_hinted: bool,
     ) {
-        let (entries, _, _) = build_entries(&[running(kind, url)], None);
+        let (entries, _, _) = build_entries(&[running(kind, url)]);
 
         let info = entries[0].info_text.as_deref().unwrap();
         assert_eq!(info.contains(EXECUTOR_NATIVE_HINT), native_hinted);
@@ -1063,24 +1025,18 @@ mod tests {
     }
 
     const TOOL_COUNT: usize = 4;
-    const SEARCH_ONLY_COUNT: usize = 2;
     const PLAIN_SERVER: &str = "linear";
     const HYPHENATED_SERVER: &str = "git-hub";
     const UNDERSCORED_SERVER: &str = "git_hub";
     const SECOND_NAMESPACE: &str = "git_hub_2";
     const RESERVED_SERVER: &str = "json";
     const RESERVED_NAMESPACE: &str = "json_";
-    const OTHER_SERVER: &str = "other";
 
     fn tools_part(namespace: Option<&str>) -> String {
         let infix = namespace.map_or_else(String::new, |namespace| {
             format!("{NAMESPACE_INFIX}{namespace}")
         });
         format!("{TOOL_COUNT} tools {VIA_MCP}{infix}")
-    }
-
-    fn search_only_part() -> String {
-        format!("{SEARCH_ONLY_COUNT} {SEARCH_ONLY}")
     }
 
     fn named(name: &str, status: McpServerStatus) -> McpServerInfo {
@@ -1100,7 +1056,7 @@ mod tests {
     #[test_case(HYPHENATED_SERVER, Some(UNDERSCORED_SERVER) ; "hyphen_becomes_underscore")]
     #[test_case(RESERVED_SERVER, Some(RESERVED_NAMESPACE) ; "standard_module_gets_a_trailing_underscore")]
     fn a_running_server_says_its_tools_are_called_through_mcp(name: &str, namespace: Option<&str>) {
-        let (entries, _, _) = build_entries(&[named(name, McpServerStatus::Running)], None);
+        let (entries, _, _) = build_entries(&[named(name, McpServerStatus::Running)]);
 
         assert!(
             detail_parts(&entries[0]).contains(&tools_part(namespace).as_str()),
@@ -1112,109 +1068,16 @@ mod tests {
     #[test_case(McpServerStatus::Running, Some(SECOND_NAMESPACE) ; "both_enabled_take_turns")]
     #[test_case(McpServerStatus::Disabled, None ; "a_disabled_server_takes_no_name")]
     fn namespaces_follow_the_enabled_servers(hyphenated: McpServerStatus, namespace: Option<&str>) {
-        let (entries, _, _) = build_entries(
-            &[
-                named(HYPHENATED_SERVER, hyphenated),
-                named(UNDERSCORED_SERVER, McpServerStatus::Running),
-            ],
-            None,
-        );
+        let (entries, _, _) = build_entries(&[
+            named(HYPHENATED_SERVER, hyphenated),
+            named(UNDERSCORED_SERVER, McpServerStatus::Running),
+        ]);
 
         assert!(
             detail_parts(&entries[1]).contains(&tools_part(namespace).as_str()),
             "{}",
             entries[1].detail_text
         );
-    }
-
-    fn mcp_tool(server: &str, status: ContextMcpStatus) -> ContextMcpTool {
-        ContextMcpTool {
-            qualified_name: format!("{server}.tool"),
-            server: server.into(),
-            status,
-            reason: None,
-        }
-    }
-
-    fn mcp_inventory() -> ContextMcpInventory {
-        ContextMcpInventory {
-            tools: vec![
-                mcp_tool(PLAIN_SERVER, ContextMcpStatus::Available),
-                mcp_tool(PLAIN_SERVER, ContextMcpStatus::SearchOnly),
-                mcp_tool(PLAIN_SERVER, ContextMcpStatus::SearchOnly),
-                mcp_tool(PLAIN_SERVER, ContextMcpStatus::Disabled),
-                mcp_tool(OTHER_SERVER, ContextMcpStatus::SearchOnly),
-            ],
-            request_tokens: 0,
-        }
-    }
-
-    #[test_case(Some(mcp_inventory()), true ; "counted_from_the_inventory")]
-    #[test_case(None, false ; "unmarked_without_an_inventory")]
-    fn search_only_tools_are_marked(inventory: Option<ContextMcpInventory>, marked: bool) {
-        let (entries, _, _) = build_entries(
-            &[named(PLAIN_SERVER, McpServerStatus::Running)],
-            inventory.as_ref(),
-        );
-
-        assert_eq!(
-            detail_parts(&entries[0]).contains(&search_only_part().as_str()),
-            marked,
-            "{}",
-            entries[0].detail_text
-        );
-    }
-
-    fn context_snapshot(mcp: ContextMcpInventory) -> Arc<ContextSnapshot> {
-        Arc::new(ContextSnapshot {
-            readiness: ContextReadiness::PreparedNextRequest,
-            mode: AgentMode::Build,
-            audience: ToolAudience::MAIN,
-            model: ContextModel {
-                spec: String::new(),
-                provider_display_name: String::new(),
-            },
-            window: ContextWindow {
-                tokens: 0,
-                reserve: ContextReserve::Disabled,
-            },
-            usage: ContextUsage::default(),
-            measured: None,
-            inventory: ContextInventory {
-                mcp,
-                ..ContextInventory::default()
-            },
-        })
-    }
-
-    #[test]
-    fn an_inventory_arriving_after_open_marks_search_only_tools_on_screen() {
-        let reader = McpSnapshotReader::from_snapshot(McpSnapshot {
-            infos: vec![named(PLAIN_SERVER, McpServerStatus::Running)],
-            ..McpSnapshot::default()
-        });
-        let mut picker = McpPicker::new(reader, no_errors());
-        picker.open(None);
-        let before = screen(&mut picker);
-        assert!(before.contains(&tools_part(None)), "{before}");
-        assert!(!before.contains(&search_only_part()), "{before}");
-
-        let snapshot = context_snapshot(mcp_inventory());
-        assert_eq!(picker.refresh(Some(Arc::clone(&snapshot))), Dirty::YES);
-        assert_eq!(picker.refresh(Some(snapshot)), Dirty::NO);
-
-        let after = screen(&mut picker);
-        assert!(after.contains(&search_only_part()), "{after}");
-    }
-
-    fn screen(picker: &mut McpPicker) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
-        terminal
-            .draw(|frame| {
-                picker.view(frame, frame.area());
-            })
-            .unwrap();
-        buffer_text(terminal.backend().buffer())
     }
 
     const STEADY_PICKER_MSG: &str =
@@ -1248,7 +1111,7 @@ mod tests {
             ..McpSnapshot::default()
         });
         let mut picker = McpPicker::new(reader, no_errors());
-        picker.open(None);
+        picker.open();
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         let first = drawn(&mut picker, &mut terminal);
 
@@ -1268,7 +1131,7 @@ mod tests {
             ..running(Some(McpServerKind::HomeAssistant), EXECUTOR_URL)
         };
 
-        let (entries, enabled, toggleable) = build_entries(&[refused], None);
+        let (entries, enabled, toggleable) = build_entries(&[refused]);
 
         assert!(entries[0].detail_text.ends_with(REFUSED_DETAIL));
         let info = entries[0].info_text.as_deref().unwrap();

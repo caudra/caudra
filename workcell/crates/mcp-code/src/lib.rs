@@ -32,7 +32,7 @@ pub use group::{CodeConfiguration, CodeToolGroup};
 pub use hosted::{
     CodeHost, HostCall, HostError, HostErrorKind, HostFuture, HostInvocation, HostName, HostReply,
     HostedExecution, HostedState, MAX_CONCURRENT_HOST_CALLS, MAX_HOST_CALLS_PER_RUN,
-    MAX_STATE_BYTES, StateNote,
+    MAX_STATE_BYTES, SleepFuture, StateNote,
 };
 pub use repair::Repair;
 pub use worker::{

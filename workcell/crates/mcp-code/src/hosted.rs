@@ -2,7 +2,8 @@
 //!
 //! Isolated execution refuses every suspension. A hosted run instead answers name lookups and
 //! function calls through a [`CodeHost`], so the snippet can reach exactly the namespaces and
-//! functions that host chooses to expose, and nothing else: OS calls are still refused the same way.
+//! functions that host chooses to expose, and nothing else: OS calls are still refused the same way,
+//! except that a hosted snippet reads the clock and sleeps for real, through [`CodeHost::sleep`].
 //!
 //! Host functions are either immediate, answered before the snippet resumes, or deferred, which the
 //! snippet sees as awaitables. A deferred call starts only once the snippet awaits it, so a coroutine
@@ -12,17 +13,18 @@
 //! Variables survive between runs through an opaque [`HostedState`] the caller keeps and passes back.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     hash::{DefaultHasher, Hash, Hasher},
     pin::Pin,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use monty_pool::{Checkout, PoolError, ReplConfig, ResumeValue, TurnEvent, on_print_sync};
 use monty_types::{
-    CallArgs, ExcType, IMPORT_STUBS_CALL, MontyException, MontyObject, MontyUuid, NameLookupResult,
+    CallArgs, DateTimeSource, ExcType, IMPORT_STUBS_CALL, MontyException, MontyObject, MontyUuid,
+    NameLookupResult, SleepMode,
 };
 use serde_json::{Map, Value};
 use tokio::task::{Id, JoinError, JoinSet};
@@ -48,6 +50,8 @@ pub const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 /// Every host call costs at least two round trips, so the isolated cap would stop a run long before
 /// its call budget.
 const MAX_HOSTED_SUSPENSIONS: usize = 1_024;
+/// A hosted run's sleeps are bounded by its caller's deadline, not per call.
+const UNCAPPED_SLEEP: Duration = Duration::MAX;
 const CLASS_TAG: u128 = 1;
 const INSTANCE_TAG: u128 = 2;
 const CALL_BUDGET_MESSAGE: &str = "this run reached its limit of host calls; continue in another run, keeping what you need in variables";
@@ -74,6 +78,8 @@ const CHECK_ONLY_LIMIT_MESSAGE: &str = "the type-check-only snippet exceeded its
 pub type HostReply = Result<Value, HostError>;
 /// A deferred call. It must have no effect until first polled: an unawaited call is dropped unpolled.
 pub type HostFuture = Pin<Box<dyn Future<Output = HostReply> + Send>>;
+/// One wait of a `time.sleep` or `asyncio.sleep`, done when the delay has passed.
+pub type SleepFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// What a name the snippet reads resolves to.
 #[derive(Debug, PartialEq, Eq)]
@@ -147,6 +153,12 @@ pub trait CodeHost: Send + Sync {
     fn call(&self, call: HostCall) -> HostInvocation;
     /// Type stubs declaring everything the host exposes, checked against before the snippet runs.
     fn stubs(&self) -> String;
+    /// Waits out a sleep the snippet asked for, doing nothing until first polled, as an
+    /// `asyncio.sleep` that is never awaited is dropped unpolled. Nothing bounds the delay but the
+    /// caller dropping the run, which drops the wait with it.
+    fn sleep(&self, delay: Duration) -> SleepFuture {
+        Box::pin(tokio::time::sleep(delay))
+    }
 }
 
 /// A session saved after a run, restored before the next. It lives only in memory.
@@ -488,6 +500,8 @@ fn hosted_repl_config(type_check: bool, timeout_ms: u64, stubs: Option<String>) 
         .limits
         .map(|limits| limits.max_suspensions(MAX_HOSTED_SUSPENSIONS));
     config.type_check_stubs = stubs;
+    config.os_policy.datetime = DateTimeSource::System;
+    config.os_policy.sleep = SleepMode::System(UNCAPPED_SLEEP);
     config
 }
 
@@ -671,6 +685,21 @@ async fn drive_hosted(
                 let results = calls.settle(&pending_call_ids).await;
                 session.resume_futures(results, &mut on_print).await
             }
+            TurnEvent::OsCall {
+                system_sleep: Some(delay),
+                allow_eager_await,
+                call_id,
+                ..
+            } => {
+                let sleep = host.sleep(delay);
+                let resume = if allow_eager_await {
+                    calls.sleep(call_id, sleep)
+                } else {
+                    sleep.await;
+                    ResumeValue::Return(MontyObject::none())
+                };
+                session.resume(resume, &mut on_print).await
+            }
             ref os_call @ TurnEvent::OsCall { .. } => {
                 let Answer::Resume(value) = answer(os_call) else {
                     unreachable!("OS calls are always answered with a value")
@@ -776,6 +805,8 @@ struct Calls {
     waiting: HashMap<u32, HostFuture>,
     running: JoinSet<(u32, HostReply)>,
     running_ids: HashMap<Id, u32>,
+    /// The `asyncio.sleep` calls among them, which take no host call slot or budget.
+    sleeps: HashSet<u32>,
     made: usize,
 }
 
@@ -786,8 +817,28 @@ impl Calls {
             waiting: HashMap::new(),
             running: JoinSet::new(),
             running_ids: HashMap::new(),
+            sleeps: HashSet::new(),
             made: 0,
         }
+    }
+
+    fn sleep(&mut self, call_id: u32, sleep: SleepFuture) -> ResumeValue {
+        self.sleeps.insert(call_id);
+        self.waiting.insert(
+            call_id,
+            Box::pin(async move {
+                sleep.await;
+                Ok(Value::Null)
+            }),
+        );
+        ResumeValue::Future
+    }
+
+    fn calls_running(&self) -> usize {
+        self.running_ids
+            .values()
+            .filter(|call_id| !self.sleeps.contains(call_id))
+            .count()
     }
 
     fn register(&mut self, call_id: u32, call: HostCall) -> ResumeValue {
@@ -815,7 +866,10 @@ impl Calls {
                 continue;
             }
             match self.waiting.remove(&call_id) {
-                Some(future) if self.running.len() < MAX_CONCURRENT_HOST_CALLS => {
+                Some(future)
+                    if self.sleeps.contains(&call_id)
+                        || self.calls_running() < MAX_CONCURRENT_HOST_CALLS =>
+                {
                     let handle = self.running.spawn(async move { (call_id, future.await) });
                     self.running_ids.insert(handle.id(), call_id);
                 }
@@ -848,10 +902,12 @@ impl Calls {
         match joined {
             Ok((id, (call_id, reply))) => {
                 self.running_ids.remove(&id);
+                self.sleeps.remove(&call_id);
                 (call_id, resume_reply(reply))
             }
             Err(error) => {
                 let call_id = self.running_ids.remove(&error.id()).unwrap_or_default();
+                self.sleeps.remove(&call_id);
                 (
                     call_id,
                     ResumeValue::Error(

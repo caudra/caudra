@@ -966,13 +966,11 @@ To keep the cache through a long task, save your edits and let the next rebuild 
 Until the next rebuild, a `# Configuration changed` [reminder](/docs/context/#what-caudra-writes-on-your-behalf) tells the model how the configuration differs from what it was given. It arrives with your next message and lists:
 
 - tools that are gone. A call to one fails.
-- tools that are new, with the first sentence of their description. They become callable at the next rebuild, and `tool_search` cannot load them before then.
+- tools that are new, with the first sentence of their description. They become callable at the next rebuild.
 - tools whose definition changed, such as the `skill` tool when a skill appears. A call follows the current definition.
 - the system prompt, as a diff that the model applies to what it reads.
 
 Each reminder states the whole difference, so the newest one replaces the others. When the configuration matches what the model was given again, because you put a file back or a rebuild took the change in, a short reminder tells the model to disregard the earlier notice. Instruction files and memory have reminders of their own, `# Instructions changed` and `# Memory updated`, which follow the same rules.
-
-Between rebuilds, only the model changes the prefix. When it loads a deferred tool with `tool_search`, the definition joins the request, and that request reads the conversation again. See [Which models defer](/docs/tools/#which-models-defer).
 
 ### When a file breaks
 
@@ -1108,7 +1106,6 @@ fn example_server(name: &str, tool: &str, description: &str, input_schema: Value
             description: description.to_owned(),
             input_schema,
             output_schema: None,
-            search_only: false,
         }],
         resources: false,
     }
@@ -1126,7 +1123,7 @@ fn configuration_notice(fixed: Surface, live: Surface) -> String {
 }
 
 fn surface(system: &str, tools: Value) -> Surface {
-    Surface::new(system.to_owned(), tools, Vec::new())
+    Surface::new(system.to_owned(), tools)
 }
 
 fn write_config_files_section(out: &mut String) {

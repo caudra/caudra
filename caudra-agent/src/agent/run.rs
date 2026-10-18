@@ -86,7 +86,6 @@ use crate::tools::{
     BATCH_TOOL_NAME, CODE_TOOL_NAME, MEMORY_TOOL_NAME, QUESTION_TOOL_NAME, SKILL_TOOL_NAME,
     TASK_TOOL_NAME,
 };
-use crate::tools::{BuiltinDeferral, DeferralSession, DeferredTool};
 use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolContext};
 use crate::types::{AutopilotEvent, TodoItem};
 use crate::workflow::WorkflowHandle;
@@ -425,10 +424,7 @@ pub struct AgentRunParams<'h> {
     pub mode_notice: Option<String>,
     pub event_tx: EventSender,
     pub tools: Value,
-    /// Definitions the request holds back until `tool_search` loads them.
-    /// Built by the same caller as `tools`, from the same vars and filter.
-    pub deferred: Vec<DeferredTool>,
-    /// Whether `tools` and `deferred` are the prefix the conversation fixed,
+    /// Whether `tools` is the prefix the conversation fixed,
     /// configured when it was fixed. They are then sent as given, and a call
     /// to a tool that is no longer available fails at dispatch.
     pub tools_fixed: bool,
@@ -451,7 +447,6 @@ pub struct Agent<'h> {
     mode_notice: Option<String>,
     event_tx: EventSender,
     tools: Value,
-    deferral: DeferralSession,
     tools_fixed: bool,
     mode: AgentMode,
     plan: Option<PlanTarget>,
@@ -585,17 +580,14 @@ impl<'h> Agent<'h> {
                         .is_some_and(|name| names.contains(&name))
                 });
             }
-            run.deferred
-                .retain(|tool| !names.contains(&tool.name.as_ref()));
         }
         let automation = main_run_automation(&params);
         let jobs = params
             .jobs
             .clone()
             .or_else(|| params.background.as_ref().map(|tasks| tasks.main_scope()));
-        crate::tools::execution::configure_tools(
+        crate::tools::execution::configure_declared(
             &mut run.tools,
-            &mut run.deferred,
             &params.config,
             params.background.is_some(),
             jobs.is_some(),
@@ -615,12 +607,6 @@ impl<'h> Agent<'h> {
             params.chat_provider.adjust_model(&mut chat_model);
             chat_model
         };
-        // Seeded before the history moves in: a restored session keeps the
-        // tools it already searched for rather than hunting them again.
-        let deferral = DeferralSession::new(
-            run.deferred,
-            crate::tools::deferral::loaded_tool_names(run.history.as_slice()),
-        );
         let model = Arc::new(model);
         let chat_model = if shared_route {
             Arc::clone(&model)
@@ -648,7 +634,6 @@ impl<'h> Agent<'h> {
             mode_notice: run.mode_notice,
             event_tx: run.event_tx,
             tools: run.tools,
-            deferral,
             tools_fixed: run.tools_fixed,
             mode: AgentMode::default(),
             plan: None,
@@ -2276,38 +2261,10 @@ impl<'h> Agent<'h> {
         let ctx = self.tool_context();
         let mut definitions = crate::tools::ToolDefinitions {
             declared: self.tools.clone(),
-            deferred: self.deferral.definitions().to_vec(),
+            hosted: Vec::new(),
         };
         crate::tools::profile_policy::configure_definitions(&mut definitions, &ctx);
         self.tools = definitions.declared;
-        self.deferral = DeferralSession::new(
-            definitions.deferred,
-            self.deferral.loaded_names().into_iter(),
-        );
-    }
-
-    /// Deferred tools are recomputed each turn so loads take effect on the
-    /// next request.
-    fn request_tools(&self) -> Cow<'_, Value> {
-        if self.deferral.is_empty() {
-            return Cow::Borrowed(&self.tools);
-        }
-        let mut tools = self.tools.clone();
-        let sections: Vec<String> = self
-            .deferral
-            .request_snapshot()
-            .extend_declared(&mut tools)
-            .into_iter()
-            .collect();
-        crate::tools::deferral::push_unbound_catalog(
-            &mut tools,
-            &sections,
-            self.registry.has(crate::tools::TOOL_SEARCH_TOOL_NAME)
-                || self
-                    .local_tools
-                    .contains_key(crate::tools::TOOL_SEARCH_TOOL_NAME),
-        );
-        Cow::Owned(tools)
     }
 
     fn projected_history<'a>(&'a self, tools: &Value) -> Cow<'a, [Message]> {
@@ -2319,12 +2276,7 @@ impl<'h> Agent<'h> {
         )
     }
 
-    fn publish_context(
-        &self,
-        readiness: ContextReadiness,
-        full_tools: &Value,
-        projected_messages: &[Message],
-    ) {
+    fn publish_context(&self, readiness: ContextReadiness, projected_messages: &[Message]) {
         let Some(publisher) = &self.context_publisher else {
             return;
         };
@@ -2350,8 +2302,6 @@ impl<'h> Agent<'h> {
                 model: &self.model,
                 session_plan: self.mode.has_session_plan(self.plan.as_ref()),
                 audience: self.audience,
-                deferral: BuiltinDeferral::resolve(&self.config, &self.model),
-                deferred: self.deferral.definitions(),
             }),
             self.mcp.as_ref(),
         );
@@ -2363,8 +2313,7 @@ impl<'h> Agent<'h> {
             auto_compact: self.auto_compact,
             compaction_buffer: self.config.compaction_buffer,
             system: &self.system,
-            base_tools: &self.deferral.accounting_definitions(&self.tools),
-            full_tools,
+            tools: &self.tools,
             projected_messages,
             measured: self.context_size(),
             inventory,
@@ -2375,11 +2324,9 @@ impl<'h> Agent<'h> {
         if self.context_publisher.is_none() {
             return;
         }
-        let tools = self.request_tools();
-        let provider_history = self.projected_history(tools.as_ref());
+        let provider_history = self.projected_history(&self.tools);
         self.publish_context(
             ContextReadiness::PreparedNextRequest,
-            tools.as_ref(),
             provider_history.as_ref(),
         );
     }
@@ -2442,12 +2389,11 @@ impl<'h> Agent<'h> {
         self.event_tx
             .send(AgentEvent::MessageStarted { id: message_id })?;
         let (stream_result, warm, prefix) = {
-            let tools = self.request_tools();
-            repair_state.register_definitions(tools.as_ref());
-            let provider_history = self.projected_history(tools.as_ref());
+            let tools = &self.tools;
+            repair_state.register_definitions(tools);
+            let provider_history = self.projected_history(tools);
             self.publish_context(
                 ContextReadiness::CapturedCurrentRequest,
-                tools.as_ref(),
                 provider_history.as_ref(),
             );
             let result = stream_with_retry(
@@ -2455,7 +2401,7 @@ impl<'h> Agent<'h> {
                 &self.model,
                 provider_history.as_ref(),
                 &self.system,
-                tools.as_ref(),
+                tools,
                 &self.event_tx,
                 &self.cancel,
                 &self.retry_now,
@@ -2477,7 +2423,7 @@ impl<'h> Agent<'h> {
                                 &self.model,
                                 provider_history.as_ref(),
                                 &self.system,
-                                tools.as_ref(),
+                                tools,
                                 &opts,
                                 self.cache_key.as_ref(),
                             )
@@ -2492,7 +2438,7 @@ impl<'h> Agent<'h> {
                 .cache_warmer
                 .as_ref()
                 .filter(|_| result.is_ok())
-                .map(|_| prefix_fingerprint(&self.model, &self.system, tools.as_ref(), &opts));
+                .map(|_| prefix_fingerprint(&self.model, &self.system, tools, &opts));
             (result, warm, prefix)
         };
         self.stream_retry = stream_retry;
@@ -3765,10 +3711,7 @@ impl<'h> Agent<'h> {
         {
             return;
         }
-        let has_tools = self
-            .request_tools()
-            .as_array()
-            .is_some_and(|tools| !tools.is_empty());
+        let has_tools = self.tools.as_array().is_some_and(|tools| !tools.is_empty());
         let message = steering::lock(&self.steering).advisory(
             self.history.as_slice(),
             &self.model,
@@ -3938,7 +3881,7 @@ impl<'h> Agent<'h> {
                 })
             }),
             code: self.code.clone(),
-            deferral: Some(self.deferral.clone()),
+            hosted: None,
             deadline: Deadline::None,
             config: self.config.clone(),
             tool_output_lines: self.tool_output_lines,
@@ -3993,16 +3936,10 @@ impl<'h> Agent<'h> {
     }
 
     fn request_context_size(&self) -> u32 {
-        let tools = self.request_tools();
-        let projected = self.projected_history(tools.as_ref());
-        let estimated = estimate_context_usage(
-            &self.model,
-            &self.system,
-            &self.deferral.accounting_definitions(&self.tools),
-            tools.as_ref(),
-            projected.as_ref(),
-        )
-        .used();
+        let projected = self.projected_history(&self.tools);
+        let estimated =
+            estimate_context_usage(&self.model, &self.system, &self.tools, projected.as_ref())
+                .used();
         estimated.max(self.context_size().unwrap_or_default())
     }
 
@@ -6167,14 +6104,7 @@ mod tests {
             if !unreducible {
                 let sent = requests.last().unwrap();
                 assert!(
-                    estimate_context_usage(
-                        &agent.model,
-                        &agent.system,
-                        &agent.tools,
-                        &agent.tools,
-                        sent
-                    )
-                    .used()
+                    estimate_context_usage(&agent.model, &agent.system, &agent.tools, sent).used()
                         < window
                 );
                 assert!(sent.iter().any(|message| message.standing_reminder
@@ -6244,14 +6174,8 @@ mod tests {
             } else {
                 agent.history.as_slice()
             };
-            let input = estimate_context_usage(
-                &agent.model,
-                &agent.system,
-                &agent.tools,
-                &agent.tools,
-                decorated,
-            )
-            .used();
+            let input =
+                estimate_context_usage(&agent.model, &agent.system, &agent.tools, decorated).used();
             assert!(input < window);
             assert!(input >= window - agent.model.max_output_tokens.unwrap());
         });
@@ -7200,7 +7124,6 @@ mod tests {
                 mode_notice: None,
                 event_tx: EventSender::new(raw_tx, 0),
                 tools: serde_json::json!([]),
-                deferred: Vec::new(),
                 tools_fixed: false,
                 memory_store: None,
             },

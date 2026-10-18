@@ -6,39 +6,40 @@
 //! own (`<run>:<n>`) so the prompt and the run's card can find each other. A refusal raises
 //! `PermissionError` where the call was made; only the user cancelling stops the run.
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use async_io::Timer;
 use async_lock::Mutex as AsyncMutex;
 use caudra_config::ToolKey;
 use caudra_storage::tool_ledger::ToolOutcome as LedgerOutcome;
-use caudra_workflow::decision::{RerankRequest, decide_label, rerank_label};
-use serde_json::{Value, json};
+use futures_lite::future;
+use serde_json::Value;
 
-use super::args::bind;
-use super::decide::{
-    self, DECIDE_PARAMS, DECISION_STUBS, Decide, RERANK_PARAMS, decide_request, rerank_request,
-};
+use super::args::{bind, text};
+use super::decide::DecisionsModule;
 use super::history::HistoryModule;
-use super::module::{CallFailure, CallRun, HostCallPlan, HostModule, Prepared};
-use super::names::{DECIDE_HELPER, DECISION_HELPERS, RERANK_HELPER, STUB_IMPORTS};
+use super::hosted::HostedCall;
+use super::module::{AbsentModule, CallFailure, HostCallPlan, HostModule, Prepared, ToolCallPlan};
+use super::names::{HELP, STUB_IMPORTS, renamed};
 use super::output::{
-    CALL_SOURCE, CodeCall, CodeCallStatus, CodeOutcome, CodeOutput, CodeProgressEvent,
+    CALL_SOURCE, CodeCall, CodeCallStatus, CodeOutcome, CodeOutput, CodeProgressEvent, HostedResult,
 };
 use super::runner::{
     ReplLease, ReplNote, ScriptCall, ScriptError, ScriptErrorKind, ScriptHost, ScriptInvocation,
-    ScriptName, ScriptOutput, ScriptReply, ScriptRun, ScriptStatus, installed,
+    ScriptName, ScriptOutput, ScriptReply, ScriptRun, ScriptStatus, WaitFuture, installed,
 };
-use crate::AgentEvent;
+use super::tool_module::{ToolModule, output_value};
 use crate::agent::change_recording::{self, Recording};
-use crate::agent::tool_dispatch::error_type;
-use crate::decisions::Decisions;
-use crate::mcp::code::module::McpModule;
-use crate::mcp::output::{McpBlock, McpHelper, McpInteraction, McpOutput};
+use crate::agent::tool_dispatch::{self, Emit, error_type};
+use crate::mcp::code::module::{DOC as MCP_DOC, McpModule};
+use crate::mcp::output::{McpBlock, McpInteraction, McpOutput};
 use crate::permissions::{PermissionExecutorKind, PermissionSubject};
 use crate::tools::native::batch::child_tool_use_id;
 use crate::tools::registry::PermissionIntent;
 use crate::tools::{READ_ONLY_TOOL_RESTRICTED, ToolContext, ToolEffect, ToolFailure};
+use crate::{AgentEvent, ToolStartEvent};
 
 /// A result larger than this raises rather than reaching the snippet.
 pub const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
@@ -50,6 +51,14 @@ pub const DECISIONS_ROW: &str = "decisions";
 const EXCERPT_MARKER: &str = "\n[cut: the rest of this result was not kept]";
 const BLOCKED_IN_PLAN: &str = "plan mode allows only calls that change nothing, such as the MCP tools a recognised server marks read-only";
 const UNFINISHED: &str = "did not finish: the run stopped first";
+const WAITING_PREFIX: &str = "waiting ";
+const NO_MCP: &str = "mcp is unavailable: no MCP server is enabled; add one in mcp.toml";
+const HELP_PARAMS: &[&str] = &["topic"];
+const HELP_STUB: &str = "def help(topic: str | None = None) -> str: ...";
+const HELP_INDEX: &str = "Modules (`help(\"<module>\")` for one, `help(\"<module>.<name>\")` for a call, `help(\"<server>\")` for an MCP server):";
+const AVAILABLE: &str = "available";
+/// How the worker shows a host namespace passed as a value, so `help(history)` reads its name.
+const MODULE_REPR: (&str, &str) = ("<module '", "'>");
 const NO_RUNNER: &str =
     "The `code` tool is unavailable: no code runner is installed in this process";
 const GONE_NOTE: &str = "Variables from earlier `code` runs in this conversation are gone (Caudra restarted, or the conversation was resumed, rewound or forked); this run started empty. Fetch again what you need.";
@@ -58,8 +67,9 @@ const RESTORE_FAILED_NOTE: &str =
 const RUN_DISCARDED_NOTE: &str =
     "This run's variables could not be kept; the next run sees the variables from before it.";
 
-/// Runs `code` for the agent `ctx` belongs to, holding its variables for the whole run.
-pub async fn run(ctx: &ToolContext, code: String, reset: bool) -> CodeOutput {
+/// Runs `code` for the agent `ctx` belongs to, holding its variables for the whole run, and stops
+/// it once `timeout` has passed.
+pub async fn run(ctx: &ToolContext, code: String, reset: bool, timeout: Duration) -> CodeOutput {
     let Some(modules) = modules(ctx).await else {
         return CodeOutput {
             code,
@@ -83,14 +93,22 @@ pub async fn run(ctx: &ToolContext, code: String, reset: bool) -> CodeOutput {
     };
     let gateway = Gateway::new(ctx.clone(), modules);
     let host: Arc<dyn ScriptHost> = Arc::new(gateway.clone());
-    let outcome = runner
-        .run(ScriptRun {
-            code: code.clone(),
-            host,
-            state: lease,
-            cancel: ctx.cancel.clone(),
-        })
-        .await;
+    let (deadline, cancel) = ctx.cancel.child();
+    let running = runner.run(ScriptRun {
+        code: code.clone(),
+        host,
+        state: lease,
+        cancel,
+    });
+    let timed_out = AtomicBool::new(false);
+    let outcome = future::or(running, async {
+        Timer::after(timeout).await;
+        timed_out.store(!ctx.cancel.is_cancelled(), Ordering::Relaxed);
+        deadline.cancel();
+        future::pending().await
+    })
+    .await;
+    let timed_out = timed_out.into_inner();
     gateway.close_record().await;
     let notes: Vec<String> = [
         forgotten.then(|| GONE_NOTE.to_owned()),
@@ -103,7 +121,12 @@ pub async fn run(ctx: &ToolContext, code: String, reset: bool) -> CodeOutput {
         Some(output) => finished(code, gateway.with_rejection_hints(output)),
         None => CodeOutput {
             code,
-            outcome: CodeOutcome::Cancelled,
+            outcome: match timed_out {
+                true => CodeOutcome::TimedOut {
+                    after_secs: timeout.as_secs(),
+                },
+                false => CodeOutcome::Cancelled,
+            },
             ..CodeOutput::default()
         },
     };
@@ -120,15 +143,24 @@ pub async fn run(ctx: &ToolContext, code: String, reset: bool) -> CodeOutput {
 /// still making their first connection waits for them, so its names cover every server that comes
 /// up; `None` when the run was cancelled first.
 async fn modules(ctx: &ToolContext) -> Option<Vec<Arc<dyn HostModule>>> {
-    let mut modules: Vec<Arc<dyn HostModule>> = Vec::new();
-    if let Some(session) = &ctx.mcp {
-        if session.connecting() && ctx.cancel.race(session.ready()).await.is_err() {
-            return None;
+    let mcp: Arc<dyn HostModule> = match &ctx.mcp {
+        Some(session) => {
+            if session.connecting() && ctx.cancel.race(session.ready()).await.is_err() {
+                return None;
+            }
+            Arc::new(McpModule::new(session.clone()))
         }
-        modules.push(Arc::new(McpModule::new(session.clone())));
-    }
-    modules.push(Arc::new(HistoryModule::for_session(ctx)));
-    Some(modules)
+        None => Arc::new(AbsentModule::new(&MCP_DOC, NO_MCP)),
+    };
+    Some(vec![
+        Arc::new(HistoryModule::for_session(ctx)),
+        mcp,
+        Arc::new(DecisionsModule::new(ctx.permissions.decisions())),
+        Arc::new(ToolModule::image(ctx)),
+        Arc::new(ToolModule::host(ctx)),
+        Arc::new(ToolModule::workflow(ctx)),
+        Arc::new(ToolModule::automation(ctx)),
+    ])
 }
 
 fn note_text(note: ReplNote) -> String {
@@ -215,6 +247,11 @@ struct Enforcement {
 }
 
 impl Permission {
+    /// A call that asks nothing, which only this module's own modules may plan.
+    pub(super) fn none() -> Self {
+        Self(None)
+    }
+
     pub fn ask(
         key: ToolKey,
         intent: PermissionIntent,
@@ -248,20 +285,29 @@ struct Inner {
     calls: Mutex<Vec<CodeCall>>,
     /// The run's change record, `None` until a call that could change files is let through.
     record: AsyncMutex<Option<Recording>>,
-    /// The session's decision engine, which `decide()` and `rerank()` need.
-    decisions: Option<Decisions>,
+    /// Sleeps under way, which the card notes while any is.
+    waits: AtomicUsize,
 }
 
 impl Gateway {
     pub(super) fn new(ctx: ToolContext, modules: Vec<Arc<dyn HostModule>>) -> Self {
-        let decisions = ctx.permissions.decisions();
         Self(Arc::new(Inner {
             ctx,
             modules,
             calls: Mutex::new(Vec::new()),
             record: AsyncMutex::new(None),
-            decisions,
+            waits: AtomicUsize::new(0),
         }))
+    }
+
+    /// What the run's card says beside its header while the run goes on; empty clears it.
+    fn annotate(&self, annotation: String) {
+        if let Some(id) = self.0.ctx.tool_use_id.clone() {
+            self.0
+                .ctx
+                .event_tx
+                .try_send(AgentEvent::ToolAnnotation { id, annotation });
+        }
     }
 
     /// The module that defines `name` as `kind`.
@@ -362,10 +408,12 @@ impl Gateway {
                 output,
                 mut interactions,
                 error,
+                hosted,
             } = ending;
             call.status = status;
             call.failure = failure;
             call.error = error;
+            call.hosted = hosted;
             call.output = output.map(|mut output| {
                 interactions.append(&mut output.interactions);
                 excerpt(&mut output);
@@ -375,8 +423,40 @@ impl Gateway {
             call.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             call.clone()
         };
-        report(&call);
+        if call.hosted.is_none() {
+            report(&call);
+        }
         self.publish(index, call);
+    }
+
+    /// A hosted tool has started: its row takes the card the tool introduced itself with, so the
+    /// header and body it draws on its own show while it works.
+    fn started(&self, index: usize, start: &ToolStartEvent) {
+        let call = {
+            let mut calls = self.calls();
+            let Some(call) = calls.get_mut(index) else {
+                return;
+            };
+            if !start.summary.is_empty() {
+                call.title = Some(start.summary.clone());
+            }
+            let card = call
+                .hosted
+                .get_or_insert_with(|| Box::new(HostedResult::pending(&start.tool)));
+            card.effect = start.effect;
+            card.input.clone_from(&start.input);
+            card.annotation.clone_from(&start.annotation);
+            call.clone()
+        };
+        self.publish(index, call);
+    }
+
+    /// The card the hosted tool at `index` has shown so far.
+    fn hosted_card(&self, index: usize, tool: &str) -> HostedResult {
+        self.calls()
+            .get(index)
+            .and_then(|call| call.hosted.as_deref().cloned())
+            .unwrap_or_else(|| HostedResult::pending(tool))
     }
 
     fn publish(&self, index: usize, call: CodeCall) {
@@ -436,46 +516,160 @@ impl Gateway {
         }
     }
 
-    /// A `decide()` or `rerank()` call, shown as a row like any other call. It asks no
-    /// permission: the engine is the user's own, and an answer is data that grants nothing.
-    async fn decision(self, decisions: Decisions, call: ScriptCall) -> ScriptReply {
-        let rerank = call.name == RERANK_HELPER;
-        let (helper, params, marked) = match rerank {
-            true => (RERANK_HELPER, RERANK_PARAMS, McpHelper::Rerank),
-            false => (DECIDE_HELPER, DECIDE_PARAMS, McpHelper::Decide),
+    /// Runs a registered tool for a module call through tool dispatch, which holds it to the
+    /// session's mode, asks under the tool's own rules and records what it changes, as it would a
+    /// call the model made. The row keeps the tool's own result for its card and the ledger.
+    async fn run_tool(self, plan: ToolCallPlan) -> ScriptReply {
+        let ToolCallPlan {
+            mut row,
+            tool,
+            input,
+        } = plan;
+        let name = row.called_as.clone();
+        let hosted = HostedCall::new(tool, prompt_action(&name, &row.input, None));
+        row.title = Some(self.0.ctx.registry.resolve_header(tool, &input));
+        row.hosted = Some(Box::new(HostedResult::pending(tool)));
+        let index = self.begin(row);
+        let mut child = self.child(index);
+        child.live_sink = None;
+        child.hosted = Some(hosted.clone());
+        let started = Instant::now();
+        let id = child.tool_use_id.clone().unwrap_or_default();
+        let gateway = self.clone();
+        let mut on_start = move |start: &ToolStartEvent| gateway.started(index, start);
+        let done = tool_dispatch::run(
+            &child.registry,
+            child.mcp.as_ref(),
+            id,
+            tool,
+            &input,
+            &child,
+            Emit::Capture(&mut on_start),
+        )
+        .await;
+        let failure = match (done.is_error, done.accounting.outcome) {
+            (false, _) => None,
+            (true, outcome) => Some(outcome.map_or(ToolFailure::Other, failure_of)),
         };
-        let arguments = bind(helper, params, &call)?;
-        let pending = match rerank {
-            true => Pending::Rerank(rerank_request(&arguments)?),
-            false => Pending::Decide(decide_request(&arguments)?),
+        let text = done.composed_model_output();
+        let value = hosted
+            .take()
+            .or_else(|| output_value(&done.output))
+            .unwrap_or_else(|| Value::String(text.clone()));
+        let result = Some(Box::new(HostedResult {
+            source: done.accounting.source.as_deref().map(str::to_owned),
+            output: Some(done.output),
+            annotation: done.annotation,
+            ..self.hosted_card(index, tool)
+        }));
+        let (status, error) = match failure {
+            None => {
+                let size = serde_json::to_vec(&value).map_or(0, |bytes| bytes.len());
+                if size <= MAX_RESULT_BYTES {
+                    self.settle(
+                        index,
+                        started,
+                        Ending {
+                            status: CodeCallStatus::Success,
+                            hosted: result,
+                            ..Ending::default()
+                        },
+                    );
+                    return Ok(value);
+                }
+                (
+                    CodeCallStatus::Error,
+                    ScriptError::new(ScriptErrorKind::Runtime, too_large(&name, size)),
+                )
+            }
+            Some(ToolFailure::Denied) => (
+                CodeCallStatus::Refused,
+                ScriptError::new(ScriptErrorKind::Permission, text),
+            ),
+            Some(_) => (
+                CodeCallStatus::Error,
+                ScriptError::new(ScriptErrorKind::Runtime, text),
+            ),
         };
-        if let Pending::Rerank(request) = &pending
-            && request.candidates.is_empty()
+        self.settle(
+            index,
+            started,
+            Ending {
+                status,
+                failure: failure.or(Some(ToolFailure::Other)),
+                error: Some(error.message.clone()),
+                hosted: result,
+                ..Ending::default()
+            },
+        );
+        Err(error)
+    }
+
+    /// `help()`: the modules and whether each can answer now, or one module's or call's page.
+    /// Answered at once, with no row and nothing to approve.
+    fn help(&self, call: &ScriptCall) -> ScriptReply {
+        let arguments = bind(HELP, HELP_PARAMS, call)?;
+        let Some(topic) = text(&arguments, HELP, HELP_PARAMS[0])? else {
+            return Ok(Value::String(self.help_index()));
+        };
+        let topic = topic
+            .strip_prefix(MODULE_REPR.0)
+            .and_then(|rest| rest.strip_suffix(MODULE_REPR.1))
+            .unwrap_or(&topic);
+        let (namespace, member) = match topic.split_once('.') {
+            Some((namespace, member)) => (namespace, Some(member)),
+            None => (topic, None),
+        };
+        if let Some(module) = self
+            .0
+            .modules
+            .iter()
+            .find(|module| module.doc().namespace == namespace)
         {
-            return Ok(Value::Array(Vec::new()));
+            let doc = module.doc();
+            let page = match member {
+                None => doc.module_help(),
+                Some(member) => doc
+                    .member(member)
+                    .map(|member| doc.member_help(member))
+                    .ok_or_else(|| {
+                        ScriptError::new(ScriptErrorKind::Value, doc.no_member(member))
+                    })?,
+            };
+            return Ok(Value::String(match module.unavailable() {
+                Some(reason) => format!("{page}\n\nNot available now: {reason}"),
+                None => page,
+            }));
         }
-        let called_as = match &pending {
-            Pending::Decide(decide) => decide_label(&decide.request.questions),
-            Pending::Rerank(request) => rerank_label(request.candidates.len(), 1, 1),
-        };
-        let row = CodeCall {
-            server: DECISIONS_ROW.to_owned(),
-            tool: helper.to_owned(),
-            called_as,
-            input: Value::Object(arguments),
-            helper: Some(marked),
-            ..CodeCall::default()
-        };
-        let run: CallRun = Box::new(move |ctx: ToolContext| {
-            Box::pin(async move { pending.answer(&decisions, &ctx).await })
-        });
-        self.execute(HostCallPlan {
-            row,
-            permission: Permission(None),
-            read_only: true,
-            run,
-        })
-        .await
+        self.0
+            .modules
+            .iter()
+            .find_map(|module| module.dynamic_help(topic))
+            .map(Value::String)
+            .ok_or_else(|| {
+                ScriptError::new(
+                    ScriptErrorKind::Value,
+                    format!("help() knows no topic `{topic}`; call help() for the modules"),
+                )
+            })
+    }
+
+    fn help_index(&self) -> String {
+        let mut index = HELP_INDEX.to_owned();
+        for module in &self.0.modules {
+            let doc = module.doc();
+            let state = module.unavailable().unwrap_or_else(|| AVAILABLE.to_owned());
+            let members: Vec<&str> = doc.member_names().collect();
+            index.push_str(&format!(
+                "\n- {}: {} ({state})",
+                doc.namespace,
+                members.join(", ")
+            ));
+            for line in module.index_lines() {
+                index.push_str(&format!("\n  - {line}"));
+            }
+        }
+        index
     }
 
     fn succeeded(
@@ -492,9 +686,7 @@ impl Gateway {
                 .get(index)
                 .map(|call| call.called_as.clone())
                 .unwrap_or_default();
-            let message = format!(
-                "the result of `{name}` is {size} bytes, more than the {MAX_RESULT_BYTES} a snippet can receive; ask the tool for less"
-            );
+            let message = too_large(&name, size);
             return self.failed(
                 index,
                 started,
@@ -538,55 +730,6 @@ impl Gateway {
     }
 }
 
-/// A decision call whose arguments were read.
-enum Pending {
-    Decide(Decide),
-    Rerank(RerankRequest),
-}
-
-impl Pending {
-    async fn answer(
-        &self,
-        decisions: &Decisions,
-        ctx: &ToolContext,
-    ) -> Result<(McpOutput, Value), CallFailure> {
-        let context = ctx.permissions.decision_context(json!({
-            "tool_use_id": ctx.tool_use_id,
-        }));
-        let answered = match self {
-            Self::Decide(decide) => decide::ask(decisions, &context, &decide.request, &ctx.cancel)
-                .await
-                .and_then(|result| {
-                    decide
-                        .questions
-                        .answers(&result)
-                        .map_err(|message| ScriptError::new(ScriptErrorKind::Runtime, message))
-                }),
-            Self::Rerank(request) => {
-                decide::rerank(decisions, &context, request, &ctx.cancel).await
-            }
-        };
-        match answered {
-            Ok(value) => {
-                let output = McpOutput {
-                    blocks: vec![McpBlock::Text {
-                        text: serde_json::to_string_pretty(&value).unwrap_or_default(),
-                    }],
-                    ..McpOutput::default()
-                };
-                Ok((output, value))
-            }
-            Err(error) => {
-                let failure = match ctx.cancel.is_cancelled() {
-                    true => ToolFailure::Cancelled,
-                    false => ToolFailure::Other,
-                };
-                Err(CallFailure::new(failure, error.message))
-            }
-        }
-    }
-}
-
 /// How a call ended, as its row keeps it.
 #[derive(Default)]
 struct Ending {
@@ -595,6 +738,7 @@ struct Ending {
     output: Option<McpOutput>,
     interactions: Vec<McpInteraction>,
     error: Option<String>,
+    hosted: Option<Box<HostedResult>>,
 }
 
 impl From<CallFailure> for Ending {
@@ -605,14 +749,33 @@ impl From<CallFailure> for Ending {
             output: failure.output.map(|output| *output),
             interactions: failure.interactions,
             error: Some(failure.error),
+            hosted: None,
         }
+    }
+}
+
+fn too_large(name: &str, size: usize) -> String {
+    format!(
+        "the result of `{name}` is {size} bytes, more than the {MAX_RESULT_BYTES} a snippet can receive; ask the tool for less"
+    )
+}
+
+/// The failure a hosted tool's ledger outcome stands for.
+fn failure_of(outcome: LedgerOutcome) -> ToolFailure {
+    match outcome {
+        LedgerOutcome::Cancelled => ToolFailure::Cancelled,
+        LedgerOutcome::Timeout => ToolFailure::Timeout,
+        LedgerOutcome::Denied => ToolFailure::Denied,
+        LedgerOutcome::NotFound => ToolFailure::NotFound,
+        LedgerOutcome::InvalidInput => ToolFailure::InvalidInput,
+        LedgerOutcome::Ok | LedgerOutcome::Other => ToolFailure::Other,
     }
 }
 
 impl ScriptHost for Gateway {
     fn lookup(&self, namespace: Option<&str>, name: &str) -> ScriptName {
         let Some(namespace) = namespace else {
-            if DECISION_HELPERS.contains(&name) && self.0.decisions.is_some() {
+            if name == HELP {
                 return ScriptName::Function;
             }
             let mut hint = None;
@@ -623,7 +786,7 @@ impl ScriptHost for Gateway {
                     None => {}
                 }
             }
-            return ScriptName::Undefined(hint);
+            return ScriptName::Undefined(hint.or_else(|| renamed(name)));
         };
         self.defining(namespace, &ScriptName::Namespace)
             .map_or(ScriptName::Undefined(None), |module| {
@@ -632,12 +795,8 @@ impl ScriptHost for Gateway {
     }
 
     fn call(&self, call: ScriptCall) -> ScriptInvocation {
-        if call.namespace.is_none()
-            && DECISION_HELPERS.contains(&call.name.as_str())
-            && let Some(decisions) = self.0.decisions.clone()
-        {
-            let gateway = self.clone();
-            return ScriptInvocation::Deferred(Box::pin(gateway.decision(decisions, call)));
+        if call.namespace.is_none() && call.name == HELP {
+            return ScriptInvocation::Ready(self.help(&call));
         }
         let owner = match &call.namespace {
             Some(namespace) => self.defining(namespace, &ScriptName::Namespace),
@@ -645,11 +804,17 @@ impl ScriptHost for Gateway {
         };
         let Some(module) = owner else {
             let name = call.namespace.as_deref().unwrap_or(&call.name);
-            return ScriptInvocation::Ready(Err(ScriptError::new(
-                ScriptErrorKind::Name,
-                format!("name '{name}' is not defined"),
-            )));
+            let message = renamed(name).unwrap_or_else(|| format!("name '{name}' is not defined"));
+            return ScriptInvocation::Ready(Err(ScriptError::new(ScriptErrorKind::Name, message)));
         };
+        if call.namespace.as_deref() == Some(module.doc().namespace)
+            && let Some(reason) = module.unavailable()
+        {
+            return ScriptInvocation::Ready(Err(ScriptError::new(
+                ScriptErrorKind::Runtime,
+                reason,
+            )));
+        }
         match module.prepare(&self.0.ctx, call) {
             Prepared::Answer(invocation) => invocation,
             Prepared::Plan(plan) => {
@@ -662,21 +827,57 @@ impl ScriptHost for Gateway {
                     async move { gateway.execute(*plan.await?).await },
                 ))
             }
+            Prepared::Tool(plan) => {
+                let gateway = self.clone();
+                ScriptInvocation::Deferred(Box::pin(async move { gateway.run_tool(*plan).await }))
+            }
         }
+    }
+
+    fn sleep(&self, delay: Duration) -> WaitFuture {
+        let gateway = self.clone();
+        Box::pin(async move {
+            let _waiting = Waiting::start(gateway, delay);
+            Timer::after(delay).await;
+        })
     }
 
     fn stubs(&self) -> String {
         let mut stubs = format!("{STUB_IMPORTS}\n");
+        stubs.push_str(HELP_STUB);
+        stubs.push('\n');
         for module in &self.0.modules {
             stubs.push_str(&module.stubs());
         }
-        if self.0.decisions.is_some() {
-            for stub in DECISION_STUBS {
-                stubs.push_str(stub);
-                stubs.push('\n');
-            }
-        }
         stubs
+    }
+}
+
+/// A sleep under way, shown on the run's card until the last one ends.
+struct Waiting(Gateway);
+
+impl Waiting {
+    fn start(gateway: Gateway, delay: Duration) -> Self {
+        gateway.0.waits.fetch_add(1, Ordering::Relaxed);
+        gateway.annotate(format!("{WAITING_PREFIX}{}", seconds(delay)));
+        Self(gateway)
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        if self.0.0.waits.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.0.annotate(String::new());
+        }
+    }
+}
+
+/// `30s`, or `0.5s` for a delay with a fraction.
+fn seconds(delay: Duration) -> String {
+    let seconds = delay.as_secs_f64();
+    match seconds.fract() == 0.0 {
+        true => format!("{seconds:.0}s"),
+        false => format!("{seconds:.1}s"),
     }
 }
 
@@ -758,6 +959,13 @@ fn report(call: &CodeCall) {
 
 /// Keeps what a card draws of `output` within [`MAX_CALL_DISPLAY_BYTES`].
 fn excerpt(output: &mut McpOutput) {
+    if output
+        .structured
+        .as_ref()
+        .is_some_and(|value| value.to_string().len() > MAX_CALL_DISPLAY_BYTES)
+    {
+        output.structured = None;
+    }
     let text = output.display_text();
     if text.len() <= MAX_CALL_DISPLAY_BYTES {
         return;
@@ -789,7 +997,7 @@ mod tests {
     use caudra_providers::{ContentBlock, Message, Role};
     use caudra_storage::StateDir;
     use caudra_workspace::RecordScope;
-    use serde_json::Map;
+    use serde_json::{Map, json};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -797,16 +1005,32 @@ mod tests {
     use crate::AgentMode;
     use crate::agent::change_recording::fixture::{FakeChanges, Step};
     use crate::code::CodeSession;
+    use crate::code::decide;
+    use crate::code::history::{self, UNSAVED};
+    use crate::code::module::{CallRun, MemberDoc, ModuleDoc};
+    use crate::code::names::HISTORY_MODULE;
+    use crate::code::names::{DECIDE_HELPER, DECISIONS_MODULE, RERANK_HELPER, SEARCH_HELPER};
     use crate::code::runner::{ReplState, RunFuture, ScriptOutcome, ScriptRunner, install};
+    use crate::decisions::Decisions;
     use crate::mcp::code::naming::CLASS_PREFIX;
+    use crate::mcp::output::{DecisionHelper, McpHelper};
     use crate::mcp::{McpSession, SEPARATOR, recognised_stub_session, stub_session_replying};
     use crate::permissions::{
         PERMISSION_DENIED_PREFIX, PermissionManager, PermissionMode, PermissionResource,
         PermissionResourceAccess, PermissionResourceKind, PermissionRisk,
     };
-    use crate::tools::CODE_TOOL_NAME;
-    use crate::tools::registry::PermissionScopes;
-    use crate::tools::test_support::{stub_ctx, stub_ctx_with_permissions};
+    use std::borrow::Cow;
+
+    use crate::cancel::CancelToken;
+    use crate::code::names::HOST_MODULE;
+    use crate::tools::registry::{
+        ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes, Tool, ToolExecResult,
+        ToolInvocation, ToolRegistry,
+    };
+    use crate::tools::test_support::{stub_ctx, stub_ctx_with, stub_ctx_with_permissions};
+    use crate::tools::{CODE_TOOL_NAME, DescriptionContext, ToolSource};
+    use crate::types::ToolOutput;
+    use crate::{Envelope, EventSender};
 
     const NAMESPACE: &str = "stub";
     const LOOKUP: &str = "lookup";
@@ -827,14 +1051,45 @@ mod tests {
         Refused,
     }
 
-    struct KeepsVariables;
+    /// Waits until stopped, keeping its variables only once the wait is cancelled, as the real
+    /// runner does: a run dropped instead of cancelled would lose them.
+    const WAIT: &str = "wait";
+    /// Makes one lookup, then waits as `WAIT` does.
+    const LOOKUP_THEN_WAIT: &str = "lookup then wait";
+    const LONG_WAIT: Duration = Duration::from_secs(3600);
+    const KEPT_BYTES: usize = 7;
+    const RUN_ID: &str = "run";
+    const DEADLINE: Duration = Duration::from_secs(120);
+    const SHORT_DEADLINE: Duration = Duration::from_secs(1);
 
-    impl ScriptRunner for KeepsVariables {
+    /// Any other snippet completes at once and returns the size of the variables an earlier run
+    /// kept.
+    struct FakeRunner;
+
+    impl ScriptRunner for FakeRunner {
         fn run(&self, mut run: ScriptRun) -> RunFuture {
-            run.state.keep(Some(ReplState::new(0, ())));
-            Box::pin(async {
+            Box::pin(async move {
+                if run.code == LOOKUP_THEN_WAIT
+                    && let ScriptInvocation::Deferred(call) = run.host.call(ScriptCall {
+                        namespace: Some(NAMESPACE.to_owned()),
+                        name: LOOKUP.to_owned(),
+                        args: Vec::new(),
+                        kwargs: Map::new(),
+                    })
+                {
+                    call.await.expect("the lookup runs");
+                }
+                if run.code == WAIT || run.code == LOOKUP_THEN_WAIT {
+                    let waited = run.cancel.race(run.host.sleep(LONG_WAIT)).await;
+                    assert!(waited.is_err(), "a long wait ends only when stopped");
+                    run.state.keep(Some(ReplState::new(KEPT_BYTES, ())));
+                    return ScriptOutcome::default();
+                }
+                let earlier = run.state.take().map(|state| state.bytes());
+                run.state.keep(Some(ReplState::new(0, ())));
                 ScriptOutcome {
                     output: Some(ScriptOutput {
+                        result: json!(earlier),
                         diagnostic: None,
                         ..ScriptOutput::refused(ScriptStatus::Completed, String::new())
                     }),
@@ -842,6 +1097,16 @@ mod tests {
                 }
             })
         }
+    }
+
+    fn annotations(events: &flume::Receiver<Envelope>) -> Vec<String> {
+        events
+            .try_iter()
+            .filter_map(|envelope| match envelope.event {
+                AgentEvent::ToolAnnotation { annotation, .. } => Some(annotation),
+                _ => None,
+            })
+            .collect()
     }
 
     fn earlier_code_run() -> Message {
@@ -1017,17 +1282,91 @@ mod tests {
         reset: bool,
         expected: Option<&str>,
     ) {
-        install(Arc::new(KeepsVariables));
+        install(Arc::new(FakeRunner));
         let history = match ran_before {
             true => vec![earlier_code_run()],
             false => Vec::new(),
         };
         let mut ctx = stub_ctx(&AgentMode::Build);
         ctx.code = CodeSession::new(&history);
-        let first = smol::block_on(run(&ctx, String::new(), reset));
-        let second = smol::block_on(run(&ctx, String::new(), false));
+        let first = smol::block_on(run(&ctx, String::new(), reset, DEADLINE));
+        let second = smol::block_on(run(&ctx, String::new(), false, DEADLINE));
         assert_eq!(first.state_note.as_deref(), expected);
         assert_eq!(second.state_note, None);
+    }
+
+    /// The deadline stops the run the way a cancel would, so the call it made keeps its row and
+    /// the next run still sees its variables.
+    #[test]
+    fn a_run_past_its_deadline_times_out_keeping_its_calls_and_variables() {
+        install(Arc::new(FakeRunner));
+        let session =
+            recognised_stub_session(HOME_ASSISTANT, &[(LOOKUP_TOOL, true)], lookup_result());
+        let (_dir, permissions) = permissions(PermissionsConfig::default(), PermissionMode::Yolo);
+        let mut ctx = stub_ctx_with_permissions(&AgentMode::Build, permissions);
+        ctx.mcp = Some(session);
+        let timed_out = smol::block_on(run(
+            &ctx,
+            LOOKUP_THEN_WAIT.to_owned(),
+            false,
+            SHORT_DEADLINE,
+        ));
+        assert_eq!(
+            timed_out.outcome,
+            CodeOutcome::TimedOut {
+                after_secs: SHORT_DEADLINE.as_secs()
+            }
+        );
+        assert_eq!(
+            timed_out
+                .calls
+                .iter()
+                .map(|call| call.status)
+                .collect::<Vec<_>>(),
+            [CodeCallStatus::Success]
+        );
+        let next = smol::block_on(run(&ctx, String::new(), false, DEADLINE));
+        assert_eq!(next.result, Some(KEPT_BYTES.to_string()));
+    }
+
+    /// A wait shows on the card until it ends, and the user stopping the run ends it as cancelled,
+    /// not timed out.
+    #[test]
+    fn a_wait_is_noted_on_the_card_and_ends_when_the_user_stops_the_run() {
+        install(Arc::new(FakeRunner));
+        let (tx, events) = flume::unbounded();
+        let mut ctx = stub_ctx_with(
+            &AgentMode::Build,
+            Some(&EventSender::new(tx, 0)),
+            Some(RUN_ID),
+        );
+        let (stop, cancel) = CancelToken::new();
+        ctx.cancel = cancel;
+        let stopping = async {
+            loop {
+                let envelope = events.recv_async().await.expect("events stay open");
+                if let AgentEvent::ToolAnnotation { annotation, .. } = envelope.event {
+                    assert_eq!(
+                        annotation,
+                        format!("{WAITING_PREFIX}{}s", LONG_WAIT.as_secs())
+                    );
+                    break;
+                }
+            }
+            stop.cancel();
+        };
+        let (output, ()) = smol::block_on(future::zip(
+            run(&ctx, WAIT.to_owned(), false, DEADLINE),
+            stopping,
+        ));
+        assert_eq!(output.outcome, CodeOutcome::Cancelled);
+        assert_eq!(annotations(&events), [String::new()]);
+    }
+
+    #[test_case(Duration::from_secs(30), "30s" ; "whole_seconds")]
+    #[test_case(Duration::from_millis(500), "0.5s" ; "a_fraction")]
+    fn waits_read_in_seconds(delay: Duration, expected: &str) {
+        assert_eq!(seconds(delay), expected);
     }
 
     /// One record covers the run, from its first permitted call that could change files to its
@@ -1099,9 +1438,8 @@ mod tests {
         assert_eq!(verdict(&reply), expected, "{reply:?}");
     }
 
-    /// A profile that loads the server lazily leaves its tools callable, only unlisted; one that
-    /// disables them leaves nothing to call.
-    #[test_case("lazy", true ; "lazy_stays_callable")]
+    /// An eager server's tools are callable; a profile that disables them leaves nothing to call.
+    #[test_case("eager", true ; "eager_is_callable")]
     #[test_case("disabled", false ; "disabled_is_gone")]
     fn a_profile_decides_what_a_snippet_can_call(exposure: &str, callable: bool) {
         let profile = Arc::new(
@@ -1301,8 +1639,11 @@ mod tests {
                 Decisions::with_engine(config, &state, engine).unwrap(),
             ));
         }
-        let session = stub_session_replying(&[(LOOKUP_TOOL, "")], None);
-        let gateway = mcp_gateway(session, stub_ctx_with_permissions(&mode, permissions));
+        let decisions = DecisionsModule::new(permissions.decisions());
+        let gateway = Gateway::new(
+            stub_ctx_with_permissions(&mode, permissions),
+            vec![Arc::new(decisions)],
+        );
         (dir, gateway)
     }
 
@@ -1311,7 +1652,7 @@ mod tests {
             panic!("keyword arguments are an object");
         };
         let call = ScriptCall {
-            namespace: None,
+            namespace: Some(DECISIONS_MODULE.to_owned()),
             name: name.to_owned(),
             args: Vec::new(),
             kwargs,
@@ -1362,7 +1703,10 @@ mod tests {
         );
         assert_eq!(calls[0].called_as, "decide: severity, parser_bug, team");
         assert_eq!(calls[0].status, CodeCallStatus::Success);
-        assert_eq!(calls[0].helper, Some(McpHelper::Decide));
+        assert_eq!(
+            calls[0].helper,
+            Some(McpHelper::Decision(DecisionHelper::Decide))
+        );
     }
 
     #[test]
@@ -1384,7 +1728,10 @@ mod tests {
         );
         let calls = gateway.finish();
         assert_eq!(calls[0].called_as, "rerank: 4 candidates");
-        assert_eq!(calls[0].helper, Some(McpHelper::Rerank));
+        assert_eq!(
+            calls[0].helper,
+            Some(McpHelper::Decision(DecisionHelper::Rerank))
+        );
     }
 
     /// A batch of 16 outlasts one decision, so a rerank without a timeout gets the rerank
@@ -1438,17 +1785,137 @@ mod tests {
         assert_eq!(gateway.finish()[0].status, CodeCallStatus::Error);
     }
 
+    /// The names resolve and type-check in every session, so a snippet reads the same with or
+    /// without an engine; without one, a call raises why and `help()` says so.
     #[test_case(DECIDE_HELPER ; "decide")]
     #[test_case(RERANK_HELPER ; "rerank")]
-    fn without_an_engine_the_decision_helpers_do_not_exist(helper: &str) {
+    fn without_an_engine_a_decision_call_raises_why(helper: &str) {
         let (_dir, gateway) = deciding_gateway(AgentMode::Build, None);
-        assert!(matches!(
-            gateway.lookup(None, helper),
-            ScriptName::Undefined(_)
-        ));
-        assert!(!gateway.stubs().contains(&format!("def {helper}(")));
-        let reply = smol::block_on(call_helper(&gateway, helper, json!({})));
-        assert_eq!(reply.unwrap_err().kind, ScriptErrorKind::Name);
+        assert_eq!(
+            gateway.lookup(Some(DECISIONS_MODULE), helper),
+            ScriptName::Function
+        );
+        assert!(
+            gateway
+                .stubs()
+                .contains(&format!("async def {helper}(self, "))
+        );
+        let error = smol::block_on(call_helper(&gateway, helper, json!({}))).unwrap_err();
+        assert_eq!(error.kind, ScriptErrorKind::Runtime);
+        assert!(gateway.help_index().contains(&error.message), "{error:?}");
+        assert!(gateway.finish().is_empty());
+    }
+
+    /// An old global raises `NameError` naming the call that replaced it.
+    #[test_case(DECIDE_HELPER ; "decide")]
+    #[test_case(SEARCH_HELPER ; "search")]
+    fn an_old_global_names_its_replacement(name: &str) {
+        let (_dir, gateway) = deciding_gateway(AgentMode::Build, Some(TypedEngine::default()));
+        let expected = renamed(name).unwrap();
+        assert_eq!(
+            gateway.lookup(None, name),
+            ScriptName::Undefined(Some(expected.clone()))
+        );
+        let error = smol::block_on(invoke(
+            &gateway,
+            ScriptCall {
+                namespace: None,
+                name: name.to_owned(),
+                args: Vec::new(),
+                kwargs: Map::new(),
+            },
+        ))
+        .unwrap_err();
+        assert_eq!(
+            (error.kind, error.message),
+            (ScriptErrorKind::Name, expected)
+        );
+    }
+
+    fn help_gateway() -> Gateway {
+        Gateway::new(
+            stub_ctx(&AgentMode::Build),
+            vec![
+                Arc::new(HistoryModule::new(None)),
+                Arc::new(AbsentModule::new(&MCP_DOC, NO_MCP)),
+                Arc::new(DecisionsModule::new(None)),
+            ],
+        )
+    }
+
+    fn help(gateway: &Gateway, topic: Option<&str>) -> ScriptReply {
+        smol::block_on(invoke(
+            gateway,
+            ScriptCall {
+                namespace: None,
+                name: HELP.to_owned(),
+                args: topic.map(Value::from).into_iter().collect(),
+                kwargs: Map::new(),
+            },
+        ))
+    }
+
+    /// `help()` lists every module with why it cannot answer now, and leaves no row.
+    #[test]
+    fn help_lists_every_module_with_its_availability() {
+        let gateway = help_gateway();
+        assert_eq!(gateway.lookup(None, HELP), ScriptName::Function);
+        let index = help(&gateway, None).unwrap();
+        let index = index.as_str().unwrap();
+        for reason in [UNSAVED, NO_MCP] {
+            assert!(index.contains(reason), "{index}");
+        }
+        for doc in [&history::DOC, &MCP_DOC, &decide::DOC] {
+            assert!(index.contains(&format!("- {}: ", doc.namespace)), "{index}");
+        }
+        assert!(gateway.finish().is_empty());
+    }
+
+    #[test_case(HISTORY_MODULE ; "by_name")]
+    #[test_case("<module 'history'>" ; "by_the_namespace_itself")]
+    fn help_shows_a_module_page_with_its_calls(topic: &str) {
+        let page = help(&help_gateway(), Some(topic)).unwrap();
+        let page = page.as_str().unwrap();
+        assert!(page.starts_with(history::DOC.page), "{page}");
+        for member in history::DOC.members {
+            assert!(
+                page.contains(&format!("await history.{}", member.signature)),
+                "{page}"
+            );
+        }
+        assert!(
+            page.ends_with(&format!("Not available now: {UNSAVED}")),
+            "{page}"
+        );
+    }
+
+    #[test]
+    fn help_shows_one_calls_reference() {
+        let topic = format!("{HISTORY_MODULE}.{}", history::DOC.members[0].name);
+        let page = help(&help_gateway(), Some(&topic)).unwrap();
+        assert!(
+            page.as_str()
+                .unwrap()
+                .contains(history::DOC.members[0].page),
+            "{page}"
+        );
+    }
+
+    #[test_case("nowhere" ; "unknown_topic")]
+    #[test_case("history.nothing" ; "unknown_member")]
+    fn help_on_an_unknown_topic_raises_value_error(topic: &str) {
+        let error = help(&help_gateway(), Some(topic)).unwrap_err();
+        assert_eq!(error.kind, ScriptErrorKind::Value, "{error:?}");
+    }
+
+    /// Every module's names type-check in every session, `help` among them.
+    #[test]
+    fn stubs_declare_help_and_every_module() {
+        let stubs = help_gateway().stubs();
+        assert!(stubs.contains(HELP_STUB), "{stubs}");
+        for doc in [&history::DOC, &MCP_DOC, &decide::DOC] {
+            assert!(stubs.contains(&doc.stubs()), "{stubs}");
+        }
     }
 
     const FAKE_MODULE: &str = "ledger";
@@ -1460,20 +1927,21 @@ mod tests {
         runs: Arc<AtomicUsize>,
     }
 
+    static FAKE_DOC: ModuleDoc = ModuleDoc {
+        namespace: FAKE_MODULE,
+        summary: "",
+        page: "",
+        members: &[MemberDoc {
+            name: FAKE_METHOD,
+            signature: "append() -> Any",
+            awaited: true,
+            page: "",
+        }],
+    };
+
     impl HostModule for FakeModule {
-        fn global(&self, name: &str) -> Option<ScriptName> {
-            (name == FAKE_MODULE).then_some(ScriptName::Namespace)
-        }
-
-        fn member(&self, _namespace: &str, name: &str) -> ScriptName {
-            match name == FAKE_METHOD {
-                true => ScriptName::Function,
-                false => ScriptName::Undefined(None),
-            }
-        }
-
-        fn stubs(&self) -> String {
-            String::new()
+        fn doc(&self) -> &'static ModuleDoc {
+            &FAKE_DOC
         }
 
         fn prepare(&self, _ctx: &ToolContext, call: ScriptCall) -> Prepared {
@@ -1574,5 +2042,174 @@ mod tests {
         let (reply, calls) = lookup(session, stub_ctx(&AgentMode::Build));
         assert_eq!(reply.unwrap_err().kind, ScriptErrorKind::Attribute);
         assert!(calls.is_empty());
+    }
+
+    const HOSTED_TOOL: &str = crate::tools::EXECUTION_ENVIRONMENT_TOOL_NAME;
+    const HOSTED_HEADER: &str = "inspect the host";
+    const HOSTED_HEADLINE: &str = "linux/x86_64";
+    const HOSTED_OWNER: &str = "test";
+    const ENVIRONMENT_METHOD: &str = "environment";
+    const ENVIRONMENT_CALL: &str = "host.environment()";
+
+    /// Stands in for the Workcell tool `host.environment()` runs.
+    struct FakeEnvironment;
+
+    impl Tool for FakeEnvironment {
+        fn name(&self) -> &str {
+            HOSTED_TOOL
+        }
+
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            Cow::Borrowed("")
+        }
+
+        fn schema(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+
+        fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(FakeEnvironmentCall))
+        }
+    }
+
+    struct FakeEnvironmentCall;
+
+    impl ToolInvocation for FakeEnvironmentCall {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain(HOSTED_HEADER.to_owned()))
+        }
+
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async {
+                ToolExecResult::from(Ok(ToolOutput::Environment {
+                    headline: HOSTED_HEADLINE.to_owned(),
+                    summary: String::new(),
+                    facts: Vec::new(),
+                    commands: Vec::new(),
+                }))
+            })
+        }
+    }
+
+    fn hosted_ctx(mode: &AgentMode, effect: ToolEffect) -> ToolContext {
+        hosted_ctx_with(mode, effect, None)
+    }
+
+    fn hosted_ctx_with(
+        mode: &AgentMode,
+        effect: ToolEffect,
+        events: Option<&EventSender>,
+    ) -> ToolContext {
+        let registry = Arc::new(ToolRegistry::new());
+        registry
+            .register_audited(
+                Arc::new(FakeEnvironment),
+                ToolSource::Native {
+                    owner: HOSTED_OWNER.into(),
+                    contract: HOSTED_TOOL.into(),
+                    trusted: true,
+                },
+                effect,
+            )
+            .unwrap();
+        let mut ctx = stub_ctx_with(mode, events, Some(RUN_ID));
+        ctx.registry = registry;
+        ctx
+    }
+
+    fn call_environment(ctx: &ToolContext) -> (ScriptReply, Vec<CodeCall>) {
+        let gateway = Gateway::new(ctx.clone(), vec![Arc::new(ToolModule::host(ctx))]);
+        let call = ScriptCall {
+            namespace: Some(HOST_MODULE.to_owned()),
+            name: ENVIRONMENT_METHOD.to_owned(),
+            args: Vec::new(),
+            kwargs: Map::new(),
+        };
+        let reply = smol::block_on(invoke(&gateway, call));
+        (reply, gateway.finish())
+    }
+
+    /// A module call runs its tool through dispatch: the snippet reads the card's fields, and
+    /// the row keeps the tool's own card and the name the ledger counts it under.
+    #[test]
+    fn a_hosted_call_runs_its_tool_and_keeps_its_card() {
+        let (reply, calls) = call_environment(&hosted_ctx(&AgentMode::Build, ToolEffect::ReadOnly));
+        assert_eq!(reply.unwrap()["headline"], HOSTED_HEADLINE);
+        let [call] = calls.as_slice() else {
+            panic!("one row: {calls:?}");
+        };
+        assert_eq!(call.status, CodeCallStatus::Success);
+        assert_eq!(call.title.as_deref(), Some(HOSTED_HEADER));
+        let hosted = call.hosted.as_ref().expect("the tool's card");
+        assert!(matches!(
+            hosted.output,
+            Some(ToolOutput::Environment { .. })
+        ));
+        assert_eq!(call.ledger_name().0, HOSTED_TOOL);
+    }
+
+    /// The reported bug: a slow tool's row read as a bare module call until the tool answered.
+    /// Its row is the tool's own card from the start, and takes the header and effect the tool
+    /// introduced itself with before it answers.
+    #[test]
+    fn a_hosted_row_shows_its_tools_card_while_the_tool_runs() {
+        let (tx, events) = flume::unbounded();
+        let ctx = hosted_ctx_with(
+            &AgentMode::Build,
+            ToolEffect::ReadOnly,
+            Some(&EventSender::new(tx, 0)),
+        );
+        call_environment(&ctx).0.expect("the tool answers");
+        let running: Vec<CodeCall> = events
+            .try_iter()
+            .filter_map(|envelope| match envelope.event {
+                AgentEvent::CodeProgress(progress) => Some(progress.call),
+                _ => None,
+            })
+            .filter(|call| call.status == CodeCallStatus::Running)
+            .collect();
+
+        let [begun, started] = running.as_slice() else {
+            panic!("a row when it begins and when the tool starts: {running:?}");
+        };
+        for call in [begun, started] {
+            let card = call.hosted.as_ref().expect("the tool's card");
+            assert_eq!(card.tool, HOSTED_TOOL);
+            assert!(card.output.is_none());
+        }
+        assert_eq!(started.title.as_deref(), Some(HOSTED_HEADER));
+        assert_eq!(
+            started.hosted.as_ref().map(|card| card.effect),
+            Some(ToolEffect::ReadOnly)
+        );
+    }
+
+    /// Plan mode holds a hosted tool to its own effect, as when the model called it.
+    #[test]
+    fn plan_mode_refuses_a_hosted_tool_that_writes() {
+        let ctx = hosted_ctx(
+            &AgentMode::Plan(PathBuf::from(PLAN_FILE)),
+            ToolEffect::Mutating,
+        );
+        let (reply, calls) = call_environment(&ctx);
+        assert!(reply.is_err());
+        assert_ne!(calls[0].status, CodeCallStatus::Success);
+    }
+
+    /// Calling a hosted tool directly, at the top level or inside `batch`, names the module call.
+    #[test]
+    fn a_direct_call_of_a_hosted_tool_names_its_module_call() {
+        let ctx = hosted_ctx(&AgentMode::Build, ToolEffect::ReadOnly);
+        let done = smol::block_on(tool_dispatch::run(
+            &ctx.registry,
+            None,
+            RUN_ID.to_owned(),
+            HOSTED_TOOL,
+            &json!({}),
+            &ctx,
+            Emit::Silent,
+        ));
+        assert!(done.is_error);
+        assert!(done.composed_model_output().contains(ENVIRONMENT_CALL));
     }
 }

@@ -169,13 +169,11 @@ To keep the cache through a long task, save your edits and let the next rebuild 
 Until the next rebuild, a `# Configuration changed` [reminder](/docs/context/#what-caudra-writes-on-your-behalf) tells the model how the configuration differs from what it was given. It arrives with your next message and lists:
 
 - tools that are gone. A call to one fails.
-- tools that are new, with the first sentence of their description. They become callable at the next rebuild, and `tool_search` cannot load them before then.
+- tools that are new, with the first sentence of their description. They become callable at the next rebuild.
 - tools whose definition changed, such as the `skill` tool when a skill appears. A call follows the current definition.
 - the system prompt, as a diff that the model applies to what it reads.
 
 Each reminder states the whole difference, so the newest one replaces the others. When the configuration matches what the model was given again, because you put a file back or a rebuild took the change in, a short reminder tells the model to disregard the earlier notice. Instruction files and memory have reminders of their own, `# Instructions changed` and `# Memory updated`, which follow the same rules.
-
-Between rebuilds, only the model changes the prefix. When it loads a deferred tool with `tool_search`, the definition joins the request, and that request reads the conversation again. See [Which models defer](/docs/tools/#which-models-defer).
 
 ### When a file breaks
 
@@ -460,7 +458,6 @@ The `bash`, `code`, and `task` entries apply only when `ui.scroll_card_lines` is
 | `shell_output_filter` | bool | `true` | - | Filter completed model-facing shell output with built-in rules |
 | `shell_workdir_redirect` | bool | `true` | - | Refuse shell commands with a leading literal `cd ... &&` in favor of the shell `workdir` parameter. Set to `false` to disable this nudge independently of `shell_native_redirect` |
 | `shell_native_redirect` | string | `enforce` | - | What happens when a shell command only re-implements a native tool, such as bare `rg` or `cat`: `enforce` refuses it and names the tool to call instead, `annotate` only logs the finding, `off` disables the check. A command using any flag the native tool cannot express is never affected |
-| `defer_builtin_tools` | string | `auto` | - | When the on-demand built-in tools start outside the request array: `auto` defers them for a small model or one with no supply metadata and declares them upfront for a known non-small model, `always` defers for every model, `never` declares them upfront |
 | `image_model` | string | `sunburst` | - | GPT Image 2.5 model behind `image_generate`: `sunburst` is the most capable and the better editor, `flare` is faster at the same price |
 | `cache_warming` | string | `off` | - | Keep the prompt cache from expiring by re-sending the last request with no output, on the Anthropic API only: `running` while a run waits on a long tool, subagent, question or permission prompt, `idle` also for up to 30 minutes after it ends, `off` never. Each refresh is billed as a cache read; global config only |
 | `disabled_tools` | string[] | `[]` | - | Tools to withhold from the model: built-in names, `server.tool`, or `server.*` for a whole MCP server. A project list extends the global one |
@@ -740,7 +737,6 @@ Redaction is best effort. Decision context can include commands, task text, tool
 | `shell_effect` | `off` | `off`, `shadow`, `advise` | Warn about possible project writes during Plan review only when `shell_writes` is configured. Never establish read-only authority. |
 | `content_screening` | `off` | `off`, `shadow`, `advise` | Add caution to flagged web/MCP output and tighten upload/credential Auto screening for the session. Content remains available. |
 | `shell_duration` | `off` | `off`, `shadow`, `advise`, `enforce` | Advise with local shell estimates. Enforce may fill an omitted timeout and select delivery at admission. Explicit timeouts stay unchanged. See [shell duration](#shell-duration). |
-| `tool_search` | `off` | `off`, `shadow`, `enforce` | Rerank the existing lexical tool shortlist. This neither loads arbitrary names nor grants execution permission. |
 | `skill_suggestions` | `off` | `off`, `shadow`, `advise` | Suggest a shortlisted skill. The agent still chooses whether to load it. |
 | `goal_prescreen` | `off` | `off`, `shadow`, `enforce` | Skip an unlikely-to-pass goal evaluation within the continuation budget and continue work. Only the normal evaluator can certify completion. |
 | `subagent_routing` | `off` | `off`, `shadow`, `enforce` | Choose a model job for a new unpinned subagent from its task label, mode, profile, and a redacted prompt excerpt. Explicit jobs, models chosen on the `task` call, profile pins, and continuations keep their routing. |
