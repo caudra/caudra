@@ -137,7 +137,7 @@ cache_warming = "running"
 | `running` | While a run waits on a tool, a subagent, a question, or a permission prompt. |
 | `idle` | Also for up to 30 minutes after a run ends, so a reply after a short break still reads the cache. |
 
-A project `caudra.toml` cannot set it, because it spends your quota. Subagents warm their own conversations, and in `idle` mode they stop when their run ends.
+A project `caudra.toml` cannot set it, because it spends your quota. In the terminal UI an edit to it applies as soon as you save, so turning it off also stops warming already under way; a subagent already running keeps its mode until it ends. Headless runs and ACP read it at startup. Subagents warm their own conversations, and in `idle` mode they stop when their run ends.
 
 Warming covers requests sent straight to the Anthropic API. Bedrock, Vertex, other gateways, and a custom base URL never warm. A request also never warms when it has a fixed thinking budget, structured output, or a forced tool choice, because the provider either refuses `max_tokens: 0` for it or caches it under a different key.
 

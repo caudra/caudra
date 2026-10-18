@@ -99,6 +99,7 @@ pub enum WarmStop {
     Wrote,
     PrefixChanged,
     RequestFailed,
+    ModeChanged,
     Closed,
 }
 
@@ -116,6 +117,7 @@ impl WarmStop {
             Self::Wrote => "wrote",
             Self::PrefixChanged => "prefix_changed",
             Self::RequestFailed => "request_failed",
+            Self::ModeChanged => "mode_changed",
             Self::Closed => "closed",
         }
     }
@@ -444,6 +446,7 @@ struct Shot {
 
 #[derive(Default)]
 struct State {
+    mode: CacheWarmingMode,
     episode: Option<Episode>,
     episodes_armed: u64,
     timer: Option<Task<()>>,
@@ -463,7 +466,6 @@ struct Records {
 }
 
 struct Inner {
-    mode: CacheWarmingMode,
     policy: WarmPolicy,
     context: WarmerContext,
     state: Mutex<State>,
@@ -487,6 +489,12 @@ impl WarmerRef {
             CacheWarmer { inner }.stop(reason);
         }
     }
+
+    pub fn set_mode(&self, mode: CacheWarmingMode) {
+        if let Some(inner) = self.0.upgrade() {
+            CacheWarmer { inner }.set_mode(mode);
+        }
+    }
 }
 
 impl CacheWarmer {
@@ -497,10 +505,12 @@ impl CacheWarmer {
     pub fn with_policy(mode: CacheWarmingMode, policy: WarmPolicy, context: WarmerContext) -> Self {
         Self {
             inner: Arc::new(Inner {
-                mode,
                 policy,
                 context,
-                state: Mutex::default(),
+                state: Mutex::new(State {
+                    mode,
+                    ..State::default()
+                }),
             }),
         }
     }
@@ -518,7 +528,34 @@ impl CacheWarmer {
     /// Whether warms are sent, so a request must bring a [`Warmable::Handle`]
     /// rather than the shadow's cheap lifetime.
     pub fn sends(&self) -> bool {
-        self.inner.mode != CacheWarmingMode::Off
+        self.inner.lock().mode != CacheWarmingMode::Off
+    }
+
+    /// Adopts a mode the config changed to while the conversation runs. The
+    /// open episode ends there, so its row tells one mode's warming apart
+    /// from the next; a warm already sent still lands and is booked.
+    pub fn set_mode(&self, mode: CacheWarmingMode) {
+        let records = {
+            let mut state = self.inner.lock();
+            if state.mode == mode {
+                return;
+            }
+            state.timer = None;
+            let mut records = Records::default();
+            if let Some(episode) = state.episode.take() {
+                self.inner.close(
+                    &mut state,
+                    episode,
+                    None,
+                    None,
+                    WarmStop::ModeChanged,
+                    &mut records,
+                );
+            }
+            state.mode = mode;
+            records
+        };
+        records.emit();
     }
 
     pub fn set_guard(&self, guard: PrefixGuard) {
@@ -600,13 +637,14 @@ impl CacheWarmer {
     /// the end of the run before each warm.
     pub fn run_settled(&self) {
         let mut state = self.inner.lock();
+        let mode = state.mode;
         if let Some(episode) = state.episode.as_mut() {
             episode.settled = Some(episode.elapsed());
-            if episode.kind == EpisodeKind::Real && self.inner.mode != CacheWarmingMode::Idle {
+            if episode.kind == EpisodeKind::Real && mode != CacheWarmingMode::Idle {
                 episode.stopped.get_or_insert(WarmStop::RunEnded);
             }
         }
-        if self.inner.mode != CacheWarmingMode::Idle || state.timer.is_none() {
+        if mode != CacheWarmingMode::Idle || state.timer.is_none() {
             self.inner.schedule(&mut state);
         }
         self.inner.flush_samples(&mut state);
@@ -638,7 +676,7 @@ impl Inner {
         }
         let prices = Prices::of(request.model, prompt, request.fast)?;
         let (handle, ttl): (Option<Arc<dyn CacheWarm>>, Duration) = match request.warm? {
-            Warmable::Handle(handle) if self.mode != CacheWarmingMode::Off => {
+            Warmable::Handle(handle) if state.mode != CacheWarmingMode::Off => {
                 let ttl = handle.ttl();
                 (Some(Arc::from(handle)), ttl)
             }
@@ -692,6 +730,7 @@ impl Inner {
     /// When the next warm is due, or `None` once warming stopped.
     fn plan(&self) -> Option<(Instant, Duration)> {
         let mut state = self.lock();
+        let mode = state.mode;
         let episode = state.episode.as_mut()?;
         if episode.stopped.is_some() {
             return None;
@@ -702,7 +741,7 @@ impl Inner {
         };
         match next_warm(
             &self.policy,
-            self.mode,
+            mode,
             delay,
             episode.prices,
             episode.settled,
@@ -722,6 +761,7 @@ impl Inner {
     fn fire(&self, scheduled: Duration) -> Option<Shot> {
         let mut state = self.lock();
         let prefix_current = state.guard.as_ref().is_none_or(|guard| guard());
+        let mode = state.mode;
         let episode = state.episode.as_mut()?;
         let fired = episode.elapsed();
         let delay = episode.delay(&self.policy)?;
@@ -731,7 +771,7 @@ impl Inner {
             Some(WarmStop::Late)
         } else if let Next::Stop(reason) = next_warm(
             &self.policy,
-            self.mode,
+            mode,
             delay,
             episode.prices,
             episode.settled,
@@ -877,7 +917,7 @@ impl Inner {
                 let row = self.row(
                     &episode,
                     EpisodeKind::Real,
-                    self.mode,
+                    state.mode,
                     &episode.progress,
                     episode.wrote,
                     next.as_ref(),
@@ -1106,6 +1146,9 @@ mod tests {
     const SHADOW_GAP: Duration = Duration::from_secs(1000);
     const WARM_BOOKED: &str = "a warm is booked as cache_warm usage on the warmed model";
     const HELD_WARM_BOOKED: &str = "a warm sent before a real request is booked when it lands";
+    const MODE_CHANGE_STOPS: &str = "turning warming off ends the open episode at once";
+    const MODE_CHANGE_STARTS: &str = "turning warming on warms the next request";
+    const SAME_MODE_KEEPS: &str = "publishing the mode warming already has changes nothing";
     const RUN_END_STOPS: &str = "running mode stops warming when the run settles";
     const WRITE_STOPS: &str = "a warm that wrote stops warming for the conversation";
     const SHADOW_SIMULATES: &str = "warming off still records what each mode would have done";
@@ -1431,6 +1474,67 @@ mod tests {
         let episode = harness.next_episode();
         assert_eq!(episode.outcome, EpisodeOutcome::Wrote, "{WRITE_STOPS}");
         assert!(!harness.warmer.wants_warm(), "{WRITE_STOPS}");
+    }
+
+    #[test]
+    fn turning_warming_off_ends_the_open_episode_at_once() {
+        let harness = Harness::new(CacheWarmingMode::Idle);
+        harness.finish(cached(PROMPT), cached(PROMPT));
+        harness.await_send();
+        harness.release_one();
+        assert!(matches!(
+            harness.next_event(),
+            AgentEvent::ModelUsage { .. }
+        ));
+        harness.warmer.run_settled();
+
+        harness.warmer.set_mode(CacheWarmingMode::Off);
+
+        assert!(!harness.timer_armed(), "{MODE_CHANGE_STOPS}");
+        assert!(!harness.warmer.sends(), "{MODE_CHANGE_STOPS}");
+        assert_eq!(
+            harness.next_episode().stop_reason,
+            WarmStop::ModeChanged.as_str(),
+            "{MODE_CHANGE_STOPS}"
+        );
+    }
+
+    #[test]
+    fn turning_warming_on_warms_from_the_next_request() {
+        let harness = Harness::new(CacheWarmingMode::Off);
+        harness.warmer.set_mode(CacheWarmingMode::Running);
+        assert!(harness.warmer.sends(), "{MODE_CHANGE_STARTS}");
+
+        harness.finish(cached(PROMPT), cached(PROMPT));
+
+        harness.await_send();
+    }
+
+    #[test]
+    fn the_same_mode_leaves_warming_alone() {
+        let harness = Harness::new(CacheWarmingMode::Running);
+        harness.finish(cached(PROMPT), cached(PROMPT));
+
+        harness.warmer.set_mode(CacheWarmingMode::Running);
+
+        assert!(harness.timer_armed(), "{SAME_MODE_KEEPS}");
+    }
+
+    #[test]
+    fn a_warm_in_flight_when_warming_turns_off_is_still_booked() {
+        let harness = Harness::new(CacheWarmingMode::Running);
+        harness.finish(cached(PROMPT), cached(PROMPT));
+        harness.await_send();
+
+        harness.warmer.set_mode(CacheWarmingMode::Off);
+        harness.release_one();
+
+        let booked = loop {
+            if let AgentEvent::ModelUsage { purpose, .. } = harness.next_event() {
+                break purpose;
+            }
+        };
+        assert_eq!(booked, LedgerPurpose::CacheWarm, "{HELD_WARM_BOOKED}");
     }
 
     #[test]

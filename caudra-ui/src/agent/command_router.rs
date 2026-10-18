@@ -28,6 +28,7 @@ pub(super) fn spawn_command_router(
                 }
                 AgentCommand::RetryNow => retry_now.notify(),
                 AgentCommand::PrefixChanged => cache_warmer.stop(WarmStop::PrefixChanged),
+                AgentCommand::CacheWarming(mode) => cache_warmer.set_mode(mode),
             }
         }
     })

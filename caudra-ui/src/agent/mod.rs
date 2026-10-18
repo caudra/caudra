@@ -32,7 +32,7 @@ use caudra_agent::{
 use caudra_automation::event::SessionView;
 use caudra_automation::request::ProfileArming;
 use caudra_automation::snapshot::AutomationEvent;
-use caudra_config::{AutomationsConfig, FeatureFlags, ModelPolicy};
+use caudra_config::{AutomationsConfig, CacheWarmingMode, FeatureFlags, ModelPolicy};
 use caudra_lua::EventHandle;
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
@@ -224,6 +224,9 @@ pub(crate) enum AgentCommand {
     /// The next request sends different thinking or speed settings, so the
     /// cache the last one wrote will not be read again.
     PrefixChanged,
+    /// The config's `cache_warming` as it now reads, applied at once so
+    /// turning it off also ends warming between runs.
+    CacheWarming(CacheWarmingMode),
 }
 
 /// Input channels (`cmd_tx`, `answer_tx`, `queue`) are per-agent, so an old
@@ -371,6 +374,9 @@ impl AgentHandles {
         if self.mcp_handle.is_none() {
             self.mcp_handle.clone_from(&settings.mcp);
         }
+        let _ = self
+            .cmd_tx
+            .try_send(AgentCommand::CacheWarming(settings.config.cache_warming));
         self.settings.publish(settings);
     }
 
