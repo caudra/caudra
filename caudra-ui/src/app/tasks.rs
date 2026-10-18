@@ -16,6 +16,7 @@ use caudra_config::ExecutionMode;
 use caudra_providers::{RequestOptions, project_messages};
 use caudra_storage::background::{JobKind, JobOwner};
 use caudra_storage::id::CaudraId;
+use caudra_terminal_host::status::PaneSubagent;
 use caudra_workflow::{AgentRosterEntry, RosterState, RunSnapshot, RunStatus};
 use serde::Serialize;
 
@@ -30,6 +31,7 @@ use crate::input_document::InputDraft;
 use crate::repaint::Dirty;
 
 pub(crate) const MAIN_TASK_ID: &str = "main";
+const MILLIS_PER_SECOND: u64 = 1_000;
 const UNKNOWN_TASK_ERR: &str = "unknown task: ";
 const TASK_NOUN: &str = "task";
 const TASKS_NOUN: &str = "tasks";
@@ -727,6 +729,37 @@ impl App {
         })
     }
 
+    /// The subagent chats still running, in chat order, as a terminal host
+    /// lists them under the pane. The runtime is read only while a chat is
+    /// unfinished, since this runs on every pass of the event loop.
+    pub(crate) fn running_subagents(&self) -> Vec<PaneSubagent> {
+        let mut unfinished = self
+            .chats
+            .iter()
+            .filter(|chat| chat.task_id().is_some() && !chat.is_finished())
+            .peekable();
+        if unfinished.peek().is_none() {
+            return Vec::new();
+        }
+        let runtime = self
+            .background
+            .as_ref()
+            .map(BackgroundTasks::list)
+            .unwrap_or_default();
+        unfinished
+            .filter_map(|chat| {
+                let id = chat.task_id()?;
+                let card = runtime.iter().find(|task| task.task_id == id.as_ref());
+                card.is_none_or(TaskCard::active).then(|| PaneSubagent {
+                    id: id.to_string(),
+                    name: chat.name.clone(),
+                    started_at_ms: card
+                        .map_or(0, |card| card.created_at.saturating_mul(MILLIS_PER_SECOND)),
+                })
+            })
+            .collect()
+    }
+
     pub(super) fn task_activity(&self) -> TaskActivity {
         let runtime = self
             .background
@@ -863,6 +896,14 @@ impl App {
         };
         self.sync_todo_panel();
         Ok(())
+    }
+
+    /// Back to the main chat from a subagent's, leaving the main chat as it is
+    /// when it already shows.
+    pub(crate) fn open_main_chat(&mut self) {
+        if self.active_chat != 0 {
+            let _ = self.focus_task(MAIN_TASK_ID);
+        }
     }
 
     pub(super) fn sync_todo_panel(&mut self) {

@@ -615,6 +615,9 @@ pub enum Event {
     /// A resize event with new dimensions after resize (columns, rows).
     /// **Note** that resize events can occur in batches.
     Resize(u16, u16),
+    /// The text of an `OSC 9999 ; <text> BEL` (or `ST`) the host wrote to the
+    /// program's input, which is how Orca addresses the agent in a pane.
+    HostMessage(String),
 }
 
 impl Event {

@@ -403,6 +403,8 @@ mod tests {
             title: TITLE.into(),
             model: MODEL.into(),
             context_percent,
+            session_id: None,
+            subagents: Vec::new(),
         }
     }
 

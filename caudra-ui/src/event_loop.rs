@@ -7,6 +7,7 @@
 //! waits on every event source at once and wakes the moment a plugin action,
 //! agent event, or keypress arrives instead of sleeping in `event::poll`.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
 use std::env;
 use std::fs;
@@ -137,9 +138,10 @@ use crate::{load_app_session, open_app_session_with_cursor};
 use crate::pane_signals::PaneSignals;
 use crate::storage_writer::StorageWriter;
 use crate::terminal;
+use caudra_terminal_host::orca::HostRequest;
 use caudra_terminal_host::reporter::ReporterHandle;
 use caudra_terminal_host::resume::{resume_argv, resume_command_line};
-use caudra_terminal_host::status::{self as pane, BlockKind, PaneState, PaneStatus};
+use caudra_terminal_host::status::{self as pane, BlockKind, PaneMetadata, PaneState, PaneStatus};
 use caudra_terminal_host::workspaces::{PaneSite, Workspaces};
 
 /// Max events handled per frame so a flood cannot starve rendering.
@@ -2039,19 +2041,24 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    /// What a host that restores the pane runs in it: nothing outlives an
-    /// ephemeral run, and a session never saved has nothing to reopen, so a
-    /// session handed to another pane is never resumed twice.
-    fn pane_resume(&self) -> Option<Vec<String>> {
+    /// The focused session a host may reopen: nothing outlives an ephemeral
+    /// run, and a session never saved has nothing to reopen, so a session
+    /// handed to another pane is never resumed twice.
+    fn resumable_session(&self) -> Option<String> {
         let session = &self.sessions[self.focused].app.state.session;
-        (!self.ctx.storage.is_ephemeral()).then(|| {
-            resume_argv(
-                session
-                    .is_persisted()
-                    .then(|| session.id.to_string())
-                    .as_deref(),
-            )
-        })
+        (!self.ctx.storage.is_ephemeral() && session.is_persisted()).then(|| session.id.to_string())
+    }
+
+    /// What a host that restores the pane runs in it, and the metadata that
+    /// names the session it reopens.
+    fn pane_report(&self) -> (Option<Vec<String>>, PaneMetadata<'_>) {
+        let session_id = self.resumable_session();
+        let resume = (!self.ctx.storage.is_ephemeral()).then(|| resume_argv(session_id.as_deref()));
+        let metadata = PaneMetadata {
+            session_id: session_id.map(Cow::Owned),
+            ..self.sessions[self.focused].app.pane_metadata()
+        };
+        (resume, metadata)
     }
 
     pub(crate) fn run(mut self, mut initial_prompt: Option<String>) -> Result<ShutdownReport> {
@@ -3036,12 +3043,12 @@ impl<'t> EventLoop<'t> {
         self.pane_signals
             .show_session_title(&self.sessions[self.focused].app.state.session.title);
         if self.pane_signals.reports_status() {
+            let (resume, metadata) = self.pane_report();
             let status = PaneStatus {
-                resume: self.pane_resume(),
+                resume,
                 ..self.pane_status()
             };
-            self.pane_signals
-                .report(status, self.sessions[self.focused].app.pane_metadata());
+            self.pane_signals.report(status, metadata);
         }
         if !self.pane_signals.alerts_notices() {
             return;
@@ -3722,7 +3729,23 @@ impl<'t> EventLoop<'t> {
                 self.wake_appearance();
                 (None, None)
             }
+            Event::HostMessage(text) => {
+                self.handle_host_request(&text);
+                (None, None)
+            }
             _ => (None, None),
+        }
+    }
+
+    fn handle_host_request(&mut self, text: &str) {
+        match HostRequest::parse(text) {
+            Some(HostRequest::OpenSubagent(id)) => {
+                if let Err(error) = self.focused_app().focus_task(&id) {
+                    tracing::debug!(task_id = %id, %error, "host asked to open an unknown subagent");
+                }
+            }
+            Some(HostRequest::OpenMain {}) => self.focused_app().open_main_chat(),
+            None => tracing::debug!(len = text.len(), "ignored host message"),
         }
     }
 

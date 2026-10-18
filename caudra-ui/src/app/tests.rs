@@ -2009,6 +2009,22 @@ mod background_runtime {
         }));
     }
 
+    #[test]
+    fn open_main_chat_leaves_a_subagent_chat() {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let task_id = fixture.handles.background.as_ref().unwrap().list()[0]
+                .task_id
+                .clone();
+            fixture.app.focus_task(&task_id).unwrap();
+
+            fixture.app.open_main_chat();
+
+            assert_eq!(fixture.app.active_chat, 0);
+            fixture.close().await;
+        }));
+    }
+
     #[test_case(false; "draft_preserved")]
     #[test_case(true; "attachments_preserved")]
     fn failed_task_keeps_draft_across_focus_and_rejected_submission(with_image: bool) {

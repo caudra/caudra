@@ -4,6 +4,7 @@
 
 mod cli;
 mod env;
+mod request;
 mod status;
 mod workspaces;
 
@@ -24,8 +25,11 @@ use env::{
 };
 
 pub use env::OrcaEnv;
+pub use request::HostRequest;
 
 pub(crate) const HOST: &str = "Orca";
+/// The `TERM_PROGRAM` Orca's terminals set (`spawn-environment.ts`).
+pub(crate) const TERM_PROGRAM_NAME: &str = "Orca";
 /// What Orca exports to every process in its terminal, so the model's `orca`
 /// calls address the terminal they run in. Orca's hook and launch tokens and
 /// its cloud credentials are left out on purpose.

@@ -158,12 +158,27 @@ the current state. An explicit `osc9` or `bell` setting still applies, and `off`
 stops the bell.
 
 Each report carries the state, the model, and the label of the prompt that
-blocks the agent, such as `Permission requested: shell`. It never carries the
-session title, prompt or response text, tool arguments, or error details. Orca
+blocks the agent, such as `Permission requested: shell`. Once the session is
+saved, it also carries the session id as `sessionId`, which Orca resumes the
+session with as `caudra --resume <id>`. While subagents run, it lists each by
+its task id and description, which Orca shows as child rows under the agent in
+its sidebar. It never carries the session title,
+prompt or response text, tool arguments, or error details. Orca
 still sees the session title as the window title, which it shows on the tab, as
 [Tab names](/docs/sessions/#tab-names) describes. Orca has no field for context
 usage. Starting idle and exiting on purpose report a session boundary, so Orca
 does not announce a finished task.
+
+Off Windows, Caudra also marks its status and each subagent as `openable`.
+Clicking a subagent's child row then switches Caudra to that subagent's chat,
+and clicking the agent's own row switches back to the main chat. Orca writes
+`OSC 9999 ; {"openSubagent":"<task id>"} BEL` or
+`OSC 9999 ; {"openMain":{}} BEL` into the terminal's input, and Caudra reads it
+as a request rather than typing. Caudra ignores any other request it receives
+this way, and one for a task it does not know. The Windows
+console turns such a sequence into keystrokes, so there a click only focuses
+the terminal. An Orca that does not support this also only focuses the
+terminal.
 
 Caudra wraps OSC 9999 for tmux and GNU screen. Inside tmux, set
 `allow-passthrough on` or `all`. Zellij drops the sequence, so Caudra sends no

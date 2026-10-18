@@ -663,6 +663,8 @@ mod tests {
             title: TITLE.into(),
             model: MODEL.into(),
             context_percent: Some(12),
+            session_id: None,
+            subagents: Vec::new(),
         };
 
         assert_eq!(
@@ -892,6 +894,8 @@ echo '{{"id":"cli","result":{{"type":"pane_info","pane":{{"pane_id":"{ROOT_PANE}
             title: "".into(),
             model: MODEL.into(),
             context_percent: None,
+            session_id: None,
+            subagents: Vec::new(),
         };
 
         assert_eq!(

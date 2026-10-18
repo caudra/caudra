@@ -15,6 +15,7 @@ const PROGRAM_STATUS_REPLY_PREFIX: &[u8] = b"\x1b]7501;?";
 const PROGRAM_STATUS_KEY_LIMIT: usize = 16;
 const KITTY_GRAPHICS_REPLY_PREFIX: &[u8] = b"\x1b_G";
 const KITTY_GRAPHICS_OK: &[u8] = b"OK";
+const HOST_MESSAGE_PREFIX: &[u8] = b"\x1b]9999;";
 
 // Event parsing
 //
@@ -138,6 +139,32 @@ pub(crate) fn parse_event(
 
 fn osc_terminated(buffer: &[u8]) -> bool {
     buffer.ends_with(b"\x1b\\") || buffer.ends_with(b"\x07")
+}
+
+/// `OSC 9999 ; <text>` from the host. Text that is not UTF-8 or carries a
+/// control byte is dropped rather than typed.
+fn parse_host_message(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
+    if !osc_terminated(buffer) {
+        return Ok(None);
+    }
+    let text = buffer
+        .strip_suffix(b"\x1b\\")
+        .or_else(|| buffer.strip_suffix(b"\x07"))
+        .and_then(|payload| payload.strip_prefix(HOST_MESSAGE_PREFIX))
+        .and_then(|text| std::str::from_utf8(text).ok())
+        .filter(|text| !text.chars().any(char::is_control))
+        .ok_or_else(could_not_parse_event_error)?;
+    Ok(Some(InternalEvent::Event(Event::HostMessage(
+        text.to_owned(),
+    ))))
+}
+
+/// Whether the buffer may still grow into a host message, so its first bytes
+/// must not be read as Alt+`]` while more input is on the way.
+fn host_message_pending(buffer: &[u8], more: bool) -> bool {
+    more && buffer.len() >= 2
+        && buffer.len() < HOST_MESSAGE_PREFIX.len()
+        && HOST_MESSAGE_PREFIX.starts_with(buffer)
 }
 
 fn parse_osc(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
@@ -2160,6 +2187,35 @@ impl Parser {
         }
     }
 
+    /// Bytes held as the start of a host message that the latest byte turned
+    /// into something else were typed: Alt+`]`, then the digits. The latest
+    /// byte stays buffered to parse on its own.
+    fn release_diverged_host_prefix(&mut self) {
+        let Some((latest, held)) = self.buffer.split_last() else {
+            return;
+        };
+        if !(2..HOST_MESSAGE_PREFIX.len()).contains(&held.len())
+            || !HOST_MESSAGE_PREFIX.starts_with(held)
+            || HOST_MESSAGE_PREFIX.starts_with(&self.buffer)
+        {
+            return;
+        }
+        let latest = *latest;
+        self.internal_events
+            .push_back(InternalEvent::Event(Event::Key(KeyEvent::new(
+                KeyCode::Char(']'),
+                KeyModifiers::ALT,
+            ))));
+        for digit in &held[2..] {
+            self.internal_events
+                .push_back(InternalEvent::Event(Event::Key(
+                    KeyCode::Char(char::from(*digit)).into(),
+                )));
+        }
+        self.buffer.clear();
+        self.buffer.push(latest);
+    }
+
     pub(crate) fn advance(&mut self, buffer: &[u8], more: bool) {
         for (idx, byte) in buffer.iter().enumerate() {
             let more = idx + 1 < buffer.len() || more;
@@ -2187,14 +2243,26 @@ impl Parser {
                 continue;
             }
 
-            let osc_reply = self.program_status_query && self.buffer.starts_with(b"\x1b]");
+            if !self.program_status_query {
+                self.release_diverged_host_prefix();
+            }
+            let host_message = self.buffer.starts_with(HOST_MESSAGE_PREFIX);
+            if !host_message && host_message_pending(&self.buffer, more) {
+                continue;
+            }
+            let osc_reply =
+                !host_message && self.program_status_query && self.buffer.starts_with(b"\x1b]");
             let apc_reply = self.graphics_query && self.buffer.starts_with(b"\x1b_");
-            if (osc_reply || apc_reply)
+            if (host_message || osc_reply || apc_reply)
                 && (self.discarding_osc || self.buffer.len() > OSC_SEQUENCE_LIMIT)
             {
                 self.discarding_osc = !osc_terminated(&self.buffer);
                 if self.discarding_osc {
-                    self.buffer.truncate(2);
+                    self.buffer.truncate(if host_message {
+                        HOST_MESSAGE_PREFIX.len()
+                    } else {
+                        2
+                    });
                     self.buffer.push(*byte);
                 } else {
                     self.buffer.clear();
@@ -2202,7 +2270,9 @@ impl Parser {
                 continue;
             }
 
-            let event = if osc_reply {
+            let event = if host_message {
+                parse_host_message(&self.buffer)
+            } else if osc_reply {
                 parse_osc(&self.buffer)
             } else if apc_reply {
                 parse_apc(&self.buffer)
@@ -2254,7 +2324,7 @@ impl Parser {
     /// the remaining bytes can be completed by subsequent input.
     #[allow(dead_code)]
     pub(crate) fn flush(&mut self) {
-        if self.buffer.is_empty() {
+        if self.buffer.is_empty() || self.buffer.starts_with(HOST_MESSAGE_PREFIX) {
             return;
         }
         match parse_event(&self.buffer, false) {
@@ -2536,6 +2606,104 @@ mod kitty_graphics_tests {
                 KeyModifiers::ALT
             ))))
         );
+    }
+}
+
+#[cfg(test)]
+mod host_message_tests {
+    use super::{HOST_MESSAGE_PREFIX, OSC_SEQUENCE_LIMIT, Parser};
+    use crate::event::{Event, KeyCode, KeyEvent, KeyModifiers, internal::InternalEvent};
+    use test_case::test_case;
+
+    const TEXT: &str = r#"{"openSubagent":"toolu_01"}"#;
+
+    fn message() -> InternalEvent {
+        InternalEvent::Event(Event::HostMessage(TEXT.to_owned()))
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> InternalEvent {
+        InternalEvent::Event(Event::Key(KeyEvent::new(code, modifiers)))
+    }
+
+    fn typed(text: &str) -> Vec<InternalEvent> {
+        text.chars()
+            .map(|char| key(KeyCode::Char(char), KeyModifiers::NONE))
+            .collect()
+    }
+
+    fn parsed(chunks: &[&[u8]]) -> Vec<InternalEvent> {
+        let mut parser = Parser::default();
+        for chunk in chunks {
+            parser.advance(chunk, false);
+        }
+        parser.collect()
+    }
+
+    #[test_case(b"\x07"; "bel")]
+    #[test_case(b"\x1b\\"; "st")]
+    fn a_message_between_keys_is_one_event(terminator: &[u8]) {
+        let input = [b"a", HOST_MESSAGE_PREFIX, TEXT.as_bytes(), terminator, b"b"].concat();
+
+        assert_eq!(
+            parsed(&[&input]),
+            [typed("a"), vec![message()], typed("b")].concat()
+        );
+    }
+
+    #[test]
+    fn a_message_survives_every_split_after_its_prefix() {
+        let input = [HOST_MESSAGE_PREFIX, TEXT.as_bytes(), b"\x07"].concat();
+        for split in HOST_MESSAGE_PREFIX.len()..input.len() {
+            assert_eq!(
+                parsed(&[&input[..split], &input[split..]]),
+                vec![message()],
+                "split at {split}"
+            );
+        }
+    }
+
+    #[test_case(b"\x1b]"; "alone")]
+    #[test_case(b"\x1b]9"; "with_a_digit")]
+    fn alt_bracket_followed_by_typing_stays_typing(start: &[u8]) {
+        let input = [start, b"x"].concat();
+
+        assert_eq!(
+            parsed(&[&input]),
+            [
+                vec![key(KeyCode::Char(']'), KeyModifiers::ALT)],
+                typed(&String::from_utf8_lossy(&start[2..])),
+                typed("x"),
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn a_lone_alt_bracket_is_a_key() {
+        assert_eq!(
+            parsed(&[b"\x1b]"]),
+            vec![key(KeyCode::Char(']'), KeyModifiers::ALT)]
+        );
+    }
+
+    #[test_case(b"\xff\xfe"; "not_utf8")]
+    #[test_case(b"a\x1bb"; "control_byte")]
+    fn a_malformed_message_is_dropped(text: &[u8]) {
+        let input = [HOST_MESSAGE_PREFIX, text, b"\x07z"].concat();
+
+        assert_eq!(parsed(&[&input]), typed("z"));
+    }
+
+    #[test]
+    fn an_oversized_message_is_dropped_without_leaking_its_tail() {
+        let input = [
+            HOST_MESSAGE_PREFIX,
+            &vec![b'x'; OSC_SEQUENCE_LIMIT],
+            b"\x07z",
+        ]
+        .concat();
+
+        assert_eq!(parsed(&[&input]), typed("z"));
     }
 }
 

@@ -110,6 +110,8 @@ mod tests {
             title: TITLE.into(),
             model: "model".into(),
             context_percent: Some(5),
+            session_id: None,
+            subagents: Vec::new(),
         };
 
         assert_eq!(Osc7501Encoder.encode(&status, Some(&metadata)), expected);

@@ -26,6 +26,8 @@ use std::sync::Arc;
 pub use error::HostError;
 pub use host::TerminalHost;
 
+const TERM_PROGRAM: &str = "TERM_PROGRAM";
+
 /// Every variable a host exports to the processes in its pane. Shell commands
 /// receive them too, so a host's CLI sees the pane the way any process in it
 /// would.
@@ -39,11 +41,19 @@ pub fn detect() -> Option<Arc<dyn TerminalHost>> {
 }
 
 /// Herdr first: Herdr running in an Orca terminal owns the pane Caudra is in.
+/// Both leave their variables to everything they start, so a pane Orca opened
+/// from inside Herdr still carries Herdr's; there `TERM_PROGRAM`, which the
+/// innermost terminal sets last, names Orca and Orca wins.
 pub fn detect_from(get: impl Fn(&str) -> Option<OsString>) -> Option<Arc<dyn TerminalHost>> {
-    if let Some(herdr) = herdr::HerdrHost::detect(&get) {
-        return Some(Arc::new(herdr));
+    let orca = orca::OrcaHost::detect(&get).map(|orca| Arc::new(orca) as Arc<dyn TerminalHost>);
+    let innermost_is_orca =
+        get(TERM_PROGRAM).is_some_and(|program| program == orca::TERM_PROGRAM_NAME);
+    if orca.is_some() && innermost_is_orca {
+        return orca;
     }
-    orca::OrcaHost::detect(&get).map(|orca| Arc::new(orca) as Arc<dyn TerminalHost>)
+    herdr::HerdrHost::detect(&get)
+        .map(|herdr| Arc::new(herdr) as Arc<dyn TerminalHost>)
+        .or(orca)
 }
 
 const fn concat<const N: usize>(
@@ -74,6 +84,9 @@ mod tests {
         ("HERDR_SOCKET_PATH", "/tmp/herdr.sock"),
     ];
     const ORCA_VARIABLES: &[(&str, &str)] = &[("ORCA_PANE_KEY", "tab:leaf")];
+    const ORCA_HANDLE_VARIABLES: &[(&str, &str)] = &[("ORCA_TERMINAL_HANDLE", "term_1")];
+    const ORCA_TERM_PROGRAM: &[(&str, &str)] = &[(TERM_PROGRAM, orca::TERM_PROGRAM_NAME)];
+    const HERDR_TERM_PROGRAM: &[(&str, &str)] = &[(TERM_PROGRAM, "herdr")];
 
     fn detected(sets: &[&[(&str, &str)]]) -> Option<&'static str> {
         detect_from(|name| {
@@ -87,6 +100,9 @@ mod tests {
     #[test_case(&[HERDR_VARIABLES], Some(herdr::HOST) ; "herdr")]
     #[test_case(&[ORCA_VARIABLES], Some(orca::HOST) ; "orca")]
     #[test_case(&[ORCA_VARIABLES, HERDR_VARIABLES], Some(herdr::HOST) ; "herdr_inside_orca")]
+    #[test_case(&[HERDR_TERM_PROGRAM, ORCA_VARIABLES, HERDR_VARIABLES], Some(herdr::HOST) ; "herdr_inside_orca_named_by_term_program")]
+    #[test_case(&[ORCA_TERM_PROGRAM, ORCA_HANDLE_VARIABLES, HERDR_VARIABLES], Some(orca::HOST) ; "orca_started_from_herdr")]
+    #[test_case(&[ORCA_TERM_PROGRAM, HERDR_VARIABLES], Some(herdr::HOST) ; "orca_term_program_without_orca_pane")]
     #[test_case(&[], None ; "neither")]
     fn hosts_are_detected_in_order(sets: &[&[(&str, &str)]], expected: Option<&str>) {
         assert_eq!(detected(sets), expected);

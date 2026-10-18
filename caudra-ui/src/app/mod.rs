@@ -1332,6 +1332,8 @@ impl App {
                 )),
             },
             context_percent: (window > 0).then(|| context_share(used, window)),
+            session_id: None,
+            subagents: self.running_subagents(),
         }
     }
 

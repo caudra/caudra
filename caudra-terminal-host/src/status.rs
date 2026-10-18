@@ -60,6 +60,21 @@ pub struct PaneMetadata<'a> {
     pub title: Cow<'a, str>,
     pub model: Cow<'a, str>,
     pub context_percent: Option<u32>,
+    /// The id `caudra --resume` reopens the session by, while there is a
+    /// saved session to reopen.
+    pub session_id: Option<Cow<'a, str>>,
+    /// The subagents still running in the session, oldest first.
+    pub subagents: Vec<PaneSubagent>,
+}
+
+/// A subagent a host may list under the pane that runs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaneSubagent {
+    /// The task id `caudra.task` addresses it by.
+    pub id: String,
+    pub name: String,
+    /// Unix milliseconds, 0 when unknown.
+    pub started_at_ms: u64,
 }
 
 impl PaneMetadata<'_> {
@@ -68,6 +83,10 @@ impl PaneMetadata<'_> {
             title: Cow::Owned(self.title.into_owned()),
             model: Cow::Owned(self.model.into_owned()),
             context_percent: self.context_percent,
+            session_id: self
+                .session_id
+                .map(|session_id| Cow::Owned(session_id.into_owned())),
+            subagents: self.subagents,
         }
     }
 }
