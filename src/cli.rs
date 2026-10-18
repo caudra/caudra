@@ -610,6 +610,10 @@ pub enum Command {
         /// Model spec (provider/model-id)
         #[arg(short, long)]
         model: Option<String>,
+        /// Sign in to a provider interactively instead of serving, as
+        /// `caudra auth login` does. Editors run this for terminal sign-in
+        #[arg(long)]
+        login: bool,
     },
     /// Show the rendered system prompt or tool definitions
     Prompt {

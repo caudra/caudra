@@ -484,6 +484,7 @@ pub fn run(
             | AgentEvent::CodeProgress(_)
             | AgentEvent::Question(_)
             | AgentEvent::QuestionClosed
+            | AgentEvent::MessageStarted { .. }
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueBatchConsumed { .. }
             | AgentEvent::QueueDrained
@@ -498,6 +499,7 @@ pub fn run(
             | AgentEvent::PermissionRequestUpdated(_)
             | AgentEvent::PermissionRequestResolved { .. }
             | AgentEvent::SubagentProgress { .. }
+            | AgentEvent::SubagentFinished { .. }
             | AgentEvent::SubagentHistory { .. }
             | AgentEvent::ToolSnapshot { .. }
             | AgentEvent::ToolHeaderSnapshot { .. }

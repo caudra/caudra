@@ -32,8 +32,8 @@ pub(crate) use compaction::compaction_reserve;
 #[cfg(test)]
 pub(crate) use compaction::retention::{ToolResultView, retention_query, select_tool_results};
 pub use compaction::{
-    COMPACTION_ANCHOR, CompactionSpend, Retention, Spend, auto_compact_enabled, compact,
-    compact_with_session, resolve_extractor,
+    COMPACT_DESCRIPTION, COMPACTION_ANCHOR, CompactionSpend, Retention, Spend,
+    auto_compact_enabled, compact, compact_with_session, resolve_extractor,
 };
 pub use goal::{
     DEFAULT_GOAL_CONTINUATION_LIMIT, GoalError, GoalHandle, GoalResult, GoalSnapshot, GoalStatus,

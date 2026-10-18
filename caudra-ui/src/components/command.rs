@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use caudra_agent::agent::COMPACT_DESCRIPTION;
 use caudra_agent::command::CustomCommand;
 use caudra_agent::mcp::CompletionTarget;
 use caudra_agent::{McpPromptInfo, McpSnapshotReader};
@@ -113,7 +114,7 @@ pub fn disabled_feature(name: &str, features: FeatureFlags) -> Option<Feature> {
 pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "/compact",
-        description: "Summarize and compact conversation history",
+        description: COMPACT_DESCRIPTION,
         max_args: 0,
         scope: ChatScope::MainOnly,
         features: &[],

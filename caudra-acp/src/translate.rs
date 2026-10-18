@@ -1,20 +1,42 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use agent_client_protocol_schema::v1::{
-    Content, ContentBlock, ContentChunk, Cost, Diff, ImageContent, Meta, Plan, PlanEntry,
-    PlanEntryPriority, PlanEntryStatus, PromptResponse, SessionUpdate, StopReason, TextContent,
+    CompactionId, CompactionStatus, CompactionUpdate, Content, ContentBlock, ContentChunk, Cost,
+    Diff, ImageContent, Meta, Notice, NoticeSeverity, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, PromptResponse, SessionInfoUpdate, SessionUpdate, StopReason, TextContent,
     ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
     ToolCallUpdateFields, ToolKind, Usage, UsageUpdate,
 };
-use caudra_agent::DoneReason;
 use caudra_agent::tools::ToolRegistry;
 use caudra_agent::types::{
     TodoPriority, TodoStatus, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
+use caudra_agent::{DoneReason, History};
 use caudra_providers::{
-    ContentBlock as MsgBlock, ImageMediaType, Message, Role as MsgRole, TokenUsage, add_cost,
+    CaudraId, ContentBlock as MsgBlock, ImageMediaType, Message, Role as MsgRole, TokenUsage,
+    add_cost,
 };
+use serde_json::{Value, json};
 
+use crate::turn::{META_USAGE, PromptIdentity};
+
+/// Where Caudra's own fields live in an ACP `_meta`.
+pub(crate) const META_NAMESPACE: &str = "caudra";
+pub(crate) const META_RETRY: &str = "retry";
+pub(crate) const META_ATTEMPT: &str = "attempt";
+pub(crate) const META_DELAY_MS: &str = "delayMs";
+pub(crate) const RETRY_TITLE: &str = "Retrying request, attempt";
+/// The tool a call ran, which the title and kind only describe.
+pub(crate) const META_TOOL_NAME: &str = "toolName";
+/// What a call still open when its turn ended reports.
+pub(crate) const CANCELLED_TOOL_TEXT: &str = "Cancelled";
+/// A thinking block's id is its message's id, this, and its position.
+const THOUGHT_ID_INFIX: &str = ":thought:";
+const RAW_STDOUT: &str = "stdout";
+const RAW_STDERR: &str = "stderr";
+const RAW_EXIT_CODE: &str = "exitCode";
 const MIN_FENCE_LEN: usize = 3;
 /// Model pricing is quoted in US dollars, so that is the reported currency.
 const CURRENCY: &str = "USD";
@@ -57,8 +79,8 @@ fn fenced(text: &str) -> String {
     format!("{fence}\n{text}\n{fence}")
 }
 
-pub fn tool_kind(name: &str) -> ToolKind {
-    let entry = match ToolRegistry::global().get(name) {
+pub fn tool_kind(registry: &ToolRegistry, name: &str) -> ToolKind {
+    let entry = match registry.get(name) {
         Some(e) => e,
         None => return ToolKind::Other,
     };
@@ -84,16 +106,66 @@ fn parse_tool_kind(s: &str) -> ToolKind {
     }
 }
 
-pub fn text_delta(text: &str) -> SessionUpdate {
-    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
-        text.to_string(),
-    ))))
+/// Tool calls the client was told about and that have not finished, by id,
+/// with the tool each runs.
+pub type OpenCalls = HashMap<String, Arc<str>>;
+
+/// Names the chunks of one assistant message. Text carries the message's own
+/// id, and each run of thinking `<id>:thought:<n>`, so a live stream and a
+/// replay of the stored message number them alike.
+pub struct MessageCursor {
+    id: String,
+    thoughts: usize,
+    thinking: bool,
 }
 
-pub fn thinking_delta(text: &str) -> SessionUpdate {
-    SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
-        text.to_string(),
-    ))))
+impl MessageCursor {
+    pub fn new(id: String) -> Self {
+        Self {
+            id,
+            thoughts: 0,
+            thinking: false,
+        }
+    }
+
+    pub fn text(&mut self, text: &str) -> SessionUpdate {
+        self.thinking = false;
+        SessionUpdate::AgentMessageChunk(chunk(
+            ContentBlock::Text(TextContent::new(text)),
+            &self.id,
+        ))
+    }
+
+    pub fn thought(&mut self, text: &str) -> SessionUpdate {
+        if !self.thinking {
+            self.thinking = true;
+            self.thoughts += 1;
+        }
+        let id = format!("{}{THOUGHT_ID_INFIX}{}", self.id, self.thoughts - 1);
+        SessionUpdate::AgentThoughtChunk(chunk(ContentBlock::Text(TextContent::new(text)), &id))
+    }
+
+    /// Something other than thinking came between, so the next thought is a
+    /// new block.
+    pub fn interrupt(&mut self) {
+        self.thinking = false;
+    }
+}
+
+fn chunk(content: ContentBlock, message_id: &str) -> ContentChunk {
+    ContentChunk::new(content).message_id(message_id)
+}
+
+fn tool_meta(name: &str) -> Meta {
+    Meta::from_iter([(META_NAMESPACE.to_owned(), json!({ META_TOOL_NAME: name }))])
+}
+
+fn call_update(id: &str, name: Option<&str>, fields: ToolCallUpdateFields) -> SessionUpdate {
+    let update = ToolCallUpdate::new(ToolCallId::from(id.to_owned()), fields);
+    SessionUpdate::ToolCallUpdate(match name {
+        Some(name) => update.meta(tool_meta(name)),
+        None => update,
+    })
 }
 
 /// ACP treats `tool_call` as the creation and `tool_call_update` as a change to
@@ -103,21 +175,26 @@ pub fn thinking_delta(text: &str) -> SessionUpdate {
 /// never learn what the call actually does.
 ///
 /// The call is still `Pending`: only its title has firmed up.
-pub fn tool_preview(id: &str, name: &str, preview: String, first: bool) -> SessionUpdate {
+pub fn tool_preview(
+    registry: &ToolRegistry,
+    id: &str,
+    name: &str,
+    preview: String,
+    first: bool,
+) -> SessionUpdate {
     if !first {
-        return SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-            ToolCallId::from(id.to_string()),
-            ToolCallUpdateFields::new().title(preview),
-        ));
+        return call_update(id, Some(name), ToolCallUpdateFields::new().title(preview));
     }
     SessionUpdate::ToolCall(
         ToolCall::new(ToolCallId::from(id.to_string()), preview)
-            .kind(tool_kind(name))
-            .status(ToolCallStatus::Pending),
+            .kind(tool_kind(registry, name))
+            .status(ToolCallStatus::Pending)
+            .meta(tool_meta(name)),
     )
 }
 
 pub fn tool_start(
+    registry: &ToolRegistry,
     event: &ToolStartEvent,
     cwd: &Path,
     home: Option<&Path>,
@@ -128,9 +205,10 @@ pub fn tool_start(
 
     if first {
         let mut call = ToolCall::new(id, event.summary.clone())
-            .kind(tool_kind(&event.tool))
+            .kind(tool_kind(registry, &event.tool))
             .status(ToolCallStatus::InProgress)
-            .locations(locations);
+            .locations(locations)
+            .meta(tool_meta(&event.tool));
         if let Some(raw) = &event.raw_input {
             call = call.raw_input(raw.clone());
         }
@@ -146,7 +224,7 @@ pub fn tool_start(
     if !locations.is_empty() {
         fields = fields.locations(locations);
     }
-    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields))
+    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields).meta(tool_meta(&event.tool)))
 }
 
 /// File locations the tool call touches, per ACP "Following the Agent". The
@@ -252,14 +330,46 @@ fn done_locations(event: &ToolDoneEvent, cwd: &Path, home: Option<&Path>) -> Vec
         .collect()
 }
 
-pub fn tool_output(id: &str, content: &str) -> SessionUpdate {
+pub fn tool_output(id: &str, name: Option<&str>, content: &str) -> SessionUpdate {
     let fields = ToolCallUpdateFields::new().content(vec![ToolCallContent::Content(Content::new(
         ContentBlock::Text(TextContent::new(fenced(content))),
     ))]);
-    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-        ToolCallId::from(id.to_string()),
-        fields,
-    ))
+    call_update(id, name, fields)
+}
+
+/// A call the turn ended or was cancelled under before it finished, which a
+/// client would otherwise keep showing as running.
+pub fn tool_cancelled(id: &str, name: &str) -> SessionUpdate {
+    let fields = ToolCallUpdateFields::new()
+        .status(ToolCallStatus::Failed)
+        .content(vec![ToolCallContent::Content(Content::new(
+            ContentBlock::Text(TextContent::new(CANCELLED_TOOL_TEXT)),
+        ))]);
+    call_update(id, Some(name), fields)
+}
+
+/// Settles every call in `open`, in id order.
+pub fn cancel_open_calls(open: &mut OpenCalls) -> Vec<SessionUpdate> {
+    let mut calls: Vec<_> = open.drain().collect();
+    calls.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    calls
+        .iter()
+        .map(|(id, name)| tool_cancelled(id, name))
+        .collect()
+}
+
+/// A shell's streams and exit code as the structured output a client reads,
+/// any other output as the text the model read.
+fn raw_output(output: &ToolOutput) -> Option<Value> {
+    if let ToolOutput::Shell(shell) = output {
+        return Some(json!({
+            RAW_STDOUT: shell.stdout,
+            RAW_STDERR: shell.stderr,
+            RAW_EXIT_CODE: shell.exit_code,
+        }));
+    }
+    let text = output.as_text();
+    (!text.is_empty()).then_some(Value::String(text))
 }
 
 pub fn tool_done(event: &ToolDoneEvent, cwd: &Path, home: Option<&Path>) -> SessionUpdate {
@@ -295,10 +405,9 @@ pub fn tool_done(event: &ToolDoneEvent, cwd: &Path, home: Option<&Path>) -> Sess
         }
     };
 
-    let raw_text = event.output.as_text();
     let mut fields = ToolCallUpdateFields::new().status(status).content(content);
-    if !raw_text.is_empty() {
-        fields = fields.raw_output(serde_json::Value::String(raw_text));
+    if let Some(raw) = raw_output(&event.output) {
+        fields = fields.raw_output(raw);
     }
 
     let locations = done_locations(event, cwd, home);
@@ -306,10 +415,7 @@ pub fn tool_done(event: &ToolDoneEvent, cwd: &Path, home: Option<&Path>) -> Sess
         fields = fields.locations(locations);
     }
 
-    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-        ToolCallId::from(event.id.clone()),
-        fields,
-    ))
+    call_update(&event.id, Some(&event.tool), fields)
 }
 
 pub fn map_done_reason(reason: DoneReason) -> StopReason {
@@ -318,6 +424,7 @@ pub fn map_done_reason(reason: DoneReason) -> StopReason {
         DoneReason::MaxTokens => StopReason::MaxTokens,
         DoneReason::MaxTurns => StopReason::MaxTurnRequests,
         DoneReason::Cancelled => StopReason::Cancelled,
+        DoneReason::Refusal => StopReason::Refusal,
     }
 }
 
@@ -338,8 +445,9 @@ impl TurnSpend {
 
     /// Reports the turn both ways on purpose: `usage` is the ACP field, but it
     /// rides an unstable feature the spec may change or drop, while `_meta` is
-    /// stable extensibility any client can read. Both carry the same numbers.
-    pub fn into_response(self, reason: DoneReason) -> PromptResponse {
+    /// stable extensibility any client can read. Both carry the same numbers,
+    /// which `_meta.caudra` repeats beside the prompt's id and duration.
+    pub(crate) fn into_response(self, stop: StopReason, prompt: &PromptIdentity) -> PromptResponse {
         let input = u64::from(self.usage.input);
         let output = u64::from(self.usage.output);
         let cached_read = u64::from(self.usage.cache_read);
@@ -355,14 +463,15 @@ impl TurnSpend {
         if let Some(cost) = self.cost {
             meta.insert(META_COST_USD.to_string(), cost.into());
         }
+        let mut caudra = prompt.answer_meta();
+        caudra.insert(META_USAGE.to_owned(), Value::Object(meta.clone()));
+        meta.insert(META_NAMESPACE.to_owned(), Value::Object(caudra));
 
         let usage = Usage::new(total, input, output)
             .cached_read_tokens(cached_read)
             .cached_write_tokens(cached_write);
 
-        PromptResponse::new(map_done_reason(reason))
-            .usage(usage)
-            .meta(meta)
+        PromptResponse::new(stop).usage(usage).meta(meta)
     }
 }
 
@@ -399,76 +508,177 @@ pub fn plan_update(output: &ToolOutput) -> Option<SessionUpdate> {
 pub fn usage_update(event: &TurnCompleteEvent, cost_total: Option<f64>) -> SessionUpdate {
     let used = event
         .context_size
-        .unwrap_or_else(|| event.usage.context_tokens()) as u64;
-    let mut update = UsageUpdate::new(used, u64::from(event.context_window));
+        .unwrap_or_else(|| event.usage.context_tokens());
+    context_usage(used, event.context_window, cost_total)
+}
+
+/// The gauge and spend as they stand, `used` of a `size` token window.
+pub fn context_usage(used: u32, size: u32, cost_total: Option<f64>) -> SessionUpdate {
+    let mut update = UsageUpdate::new(u64::from(used), u64::from(size));
     if let Some(cost) = cost_total {
         update = update.cost(Cost::new(cost, CURRENCY));
     }
     SessionUpdate::UsageUpdate(update)
 }
 
-pub fn replay_history(messages: &[Message], cwd: &Path, home: Option<&Path>) -> Vec<SessionUpdate> {
-    let mut updates = Vec::new();
-    for msg in messages {
-        match msg.role {
-            MsgRole::User => replay_user(msg, &mut updates),
-            MsgRole::Assistant => replay_assistant(msg, &mut updates, cwd, home),
-        }
+/// The session's name, and when the session last changed when that is known.
+pub fn session_info(title: String, updated_at: Option<String>) -> SessionUpdate {
+    let mut update = SessionInfoUpdate::new().title(title);
+    if let Some(updated_at) = updated_at {
+        update = update.updated_at(updated_at);
     }
-    updates
+    SessionUpdate::SessionInfoUpdate(update)
 }
 
-fn replay_user(msg: &Message, updates: &mut Vec<SessionUpdate>) {
-    if msg.is_observation() {
-        return;
+/// Where compaction `id` stands; `error` says why a failed one failed.
+pub fn compaction_update(
+    id: &CompactionId,
+    status: CompactionStatus,
+    error: Option<String>,
+) -> SessionUpdate {
+    let mut update = CompactionUpdate::new(id.clone(), status);
+    if let Some(error) = error {
+        update = update.error(error);
     }
-    if let Some(text) = msg.user_text() {
-        updates.push(SessionUpdate::UserMessageChunk(ContentChunk::new(
-            ContentBlock::Text(TextContent::new(text.to_string())),
-        )));
-    }
-    for block in &msg.content {
-        match block {
-            MsgBlock::ToolResult {
-                tool_use_id,
-                content,
-                is_error,
-                ..
-            } => updates.push(replay_tool_result(tool_use_id, content, *is_error)),
-            MsgBlock::Image { source } => {
-                updates.push(SessionUpdate::UserMessageChunk(ContentChunk::new(
-                    ContentBlock::Image(ImageContent::new(
-                        source.data.to_string(),
-                        mime_type(&source.media_type),
-                    )),
-                )));
-            }
-            _ => {}
-        }
+    SessionUpdate::CompactionUpdate(update)
+}
+
+/// How a compaction ended, from how the run that carried it did.
+pub fn compaction_outcome(reason: &DoneReason) -> CompactionStatus {
+    match reason {
+        DoneReason::Cancelled => CompactionStatus::Cancelled,
+        DoneReason::EndTurn
+        | DoneReason::MaxTokens
+        | DoneReason::MaxTurns
+        | DoneReason::Refusal => CompactionStatus::Completed,
     }
 }
 
-fn replay_assistant(
-    msg: &Message,
-    updates: &mut Vec<SessionUpdate>,
+/// A provider request failed and is retried after `delay_ms`.
+pub fn retry_notice(attempt: u32, message: String, delay_ms: u64) -> SessionUpdate {
+    let meta = Meta::from_iter([(
+        META_NAMESPACE.to_owned(),
+        json!({ META_RETRY: { META_ATTEMPT: attempt, META_DELAY_MS: delay_ms } }),
+    )]);
+    let notice = Notice::new(NoticeSeverity::Warning, format!("{RETRY_TITLE} {attempt}"))
+        .description(message)
+        .meta(meta);
+    SessionUpdate::Notice(notice)
+}
+
+/// The id each message of `history` was committed under: the group its
+/// items share, which is also the id its live chunks carried. A history whose
+/// items do not line up with its messages has none.
+fn message_ids(history: &History) -> Option<Vec<CaudraId>> {
+    let ids: Vec<_> = history
+        .active_items()
+        .chunk_by(|a, b| a.group_id == b.group_id)
+        .map(|group| group[0].group_id)
+        .collect();
+    (ids.len() == history.len()).then_some(ids)
+}
+
+pub fn replay_history(
+    registry: &ToolRegistry,
+    history: &History,
     cwd: &Path,
     home: Option<&Path>,
-) {
-    for block in &msg.content {
-        match block {
-            MsgBlock::Text { text } => updates.push(text_delta(text)),
-            MsgBlock::Thinking { thinking, .. } => updates.push(thinking_delta(thinking)),
-            MsgBlock::ToolUse {
-                id, name, input, ..
-            } => {
-                updates.push(replay_tool_call(id, name, input, cwd, home));
+) -> Vec<SessionUpdate> {
+    let ids = message_ids(history);
+    let mut replay = Replay {
+        registry,
+        cwd,
+        home,
+        names: HashMap::new(),
+        updates: Vec::new(),
+    };
+    for (index, msg) in history.as_slice().iter().enumerate() {
+        let id = ids
+            .as_ref()
+            .map_or_else(CaudraId::generate, |ids| ids[index])
+            .to_string();
+        match msg.role {
+            MsgRole::User => replay.user(msg, &id),
+            MsgRole::Assistant => replay.assistant(msg, id),
+        }
+    }
+    replay.updates
+}
+
+struct Replay<'a> {
+    registry: &'a ToolRegistry,
+    cwd: &'a Path,
+    home: Option<&'a Path>,
+    /// The tool each replayed call ran, which its result names again.
+    names: HashMap<&'a str, &'a str>,
+    updates: Vec<SessionUpdate>,
+}
+
+impl<'a> Replay<'a> {
+    fn user(&mut self, msg: &'a Message, id: &str) {
+        if msg.is_observation() {
+            return;
+        }
+        if let Some(text) = msg.user_text() {
+            self.updates.push(SessionUpdate::UserMessageChunk(chunk(
+                ContentBlock::Text(TextContent::new(text)),
+                id,
+            )));
+        }
+        for block in &msg.content {
+            match block {
+                MsgBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                } => {
+                    let name = self.names.get(tool_use_id.as_str()).copied();
+                    self.updates
+                        .push(replay_tool_result(tool_use_id, name, content, *is_error));
+                }
+                MsgBlock::Image { source } => {
+                    self.updates.push(SessionUpdate::UserMessageChunk(chunk(
+                        ContentBlock::Image(ImageContent::new(
+                            source.data.to_string(),
+                            mime_type(&source.media_type),
+                        )),
+                        id,
+                    )));
+                }
+                _ => {}
             }
-            _ => {}
+        }
+    }
+
+    fn assistant(&mut self, msg: &'a Message, id: String) {
+        let mut cursor = MessageCursor::new(id);
+        for block in &msg.content {
+            match block {
+                MsgBlock::Text { text } => self.updates.push(cursor.text(text)),
+                MsgBlock::Thinking { thinking, .. } => self.updates.push(cursor.thought(thinking)),
+                MsgBlock::ToolUse {
+                    id, name, input, ..
+                } => {
+                    cursor.interrupt();
+                    self.names.insert(id, name);
+                    self.updates.push(replay_tool_call(
+                        self.registry,
+                        id,
+                        name,
+                        input,
+                        self.cwd,
+                        self.home,
+                    ));
+                }
+                _ => cursor.interrupt(),
+            }
         }
     }
 }
 
 fn replay_tool_call(
+    registry: &ToolRegistry,
     id: &str,
     name: &str,
     input: &serde_json::Value,
@@ -476,14 +686,20 @@ fn replay_tool_call(
     home: Option<&Path>,
 ) -> SessionUpdate {
     let call = ToolCall::new(ToolCallId::from(id.to_string()), name.to_string())
-        .kind(tool_kind(name))
+        .kind(tool_kind(registry, name))
         .status(ToolCallStatus::Pending)
         .raw_input(input.clone())
-        .locations(tool_locations(name, Some(input), cwd, home));
+        .locations(tool_locations(name, Some(input), cwd, home))
+        .meta(tool_meta(name));
     SessionUpdate::ToolCall(call)
 }
 
-fn replay_tool_result(id: &str, content: &str, is_error: bool) -> SessionUpdate {
+fn replay_tool_result(
+    id: &str,
+    name: Option<&str>,
+    content: &str,
+    is_error: bool,
+) -> SessionUpdate {
     let status = if is_error {
         ToolCallStatus::Failed
     } else {
@@ -495,10 +711,7 @@ fn replay_tool_result(id: &str, content: &str, is_error: bool) -> SessionUpdate 
             ContentBlock::Text(TextContent::new(fenced(content))),
         ))]);
     }
-    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-        ToolCallId::from(id.to_string()),
-        fields,
-    ))
+    call_update(id, name, fields)
 }
 
 fn mime_type(media: &ImageMediaType) -> &'static str {
@@ -514,8 +727,10 @@ fn mime_type(media: &ImageMediaType) -> &'static str {
 mod tests {
     use std::sync::Arc;
 
-    use caudra_agent::types::TodoItem;
-    use caudra_providers::ImageSource;
+    use caudra_agent::tools::{VIEW_IMAGE_TOOL_NAME, native};
+    use caudra_agent::types::{ShellOutput, TodoItem};
+    use caudra_config::FeatureFlags;
+    use caudra_providers::{ImageSource, expand_message_in};
     use caudra_storage::usage_ledger::LedgerPurpose;
     use serde_json::json;
     use test_case::test_case;
@@ -525,6 +740,11 @@ mod tests {
     const CWD: &str = "/home/user/project";
     const HOME: &str = "/home/user";
     const OMITTED_STATUS_IS_PENDING: &str = "a created call must be pending, which the wire omits";
+    const SHELL_TOOL: &str = "shell";
+    const SHELL_STDOUT: &str = "compiled";
+    const SHELL_STDERR: &str = "warning: unused";
+    const SHELL_EXIT: i32 = 101;
+    const SHELL_MODEL_TEXT: &str = "compiled\n[shell status: exit code 101]";
 
     #[test_case("1: mod render\n2: mod segment", "```\n1: mod render\n2: mod segment\n```" ; "plain_text_gets_default_fence")]
     #[test_case("has ```rust\ncode\n``` inside", "````\nhas ```rust\ncode\n``` inside\n````" ; "fence_longer_than_inner_backticks")]
@@ -552,10 +772,15 @@ mod tests {
     }
 
     fn updates_json(messages: &[Message]) -> Vec<serde_json::Value> {
-        replay_history(messages, Path::new(CWD), Some(Path::new(HOME)))
-            .iter()
-            .map(|u| serde_json::to_value(u).unwrap())
-            .collect()
+        replay_history(
+            &ToolRegistry::default(),
+            &History::new(messages.to_vec()),
+            Path::new(CWD),
+            Some(Path::new(HOME)),
+        )
+        .iter()
+        .map(|u| serde_json::to_value(u).unwrap())
+        .collect()
     }
 
     #[test]
@@ -677,9 +902,14 @@ mod tests {
         assert_eq!(parse_tool_kind(input), expected);
     }
 
-    #[test_case("nonexistent_plugin_tool", ToolKind::Other ; "unknown_tool_is_other")]
-    fn tool_kind_from_registry(name: &str, expected: ToolKind) {
-        assert_eq!(tool_kind(name), expected);
+    #[test_case(true, ToolKind::Read ; "registered_in_this_registry")]
+    #[test_case(false, ToolKind::Other ; "registered_only_elsewhere")]
+    fn tool_kind_reads_only_the_given_registry(own: bool, expected: ToolKind) {
+        let registered = ToolRegistry::default();
+        native::register(&registered, FeatureFlags::all()).unwrap();
+        let other = ToolRegistry::default();
+        let registry = if own { &registered } else { &other };
+        assert_eq!(tool_kind(registry, VIEW_IMAGE_TOOL_NAME), expected);
     }
 
     fn start_event(tool: &str, raw_input: Option<serde_json::Value>) -> ToolStartEvent {
@@ -701,6 +931,7 @@ mod tests {
         raw_input: Option<serde_json::Value>,
     ) -> Option<serde_json::Value> {
         let update = tool_start(
+            &ToolRegistry::default(),
             &start_event(tool, raw_input),
             Path::new(CWD),
             Some(Path::new(HOME)),
@@ -749,6 +980,7 @@ mod tests {
     #[test_case(false ; "on_update")]
     fn tool_start_with_no_raw_input_has_no_locations_field(first: bool) {
         let update = tool_start(
+            &ToolRegistry::default(),
             &start_event("read", None),
             Path::new(CWD),
             Some(Path::new(HOME)),
@@ -768,6 +1000,7 @@ mod tests {
         let mut event = start_event("bash", Some(json!({"command": "ls -la"})));
         event.summary = "ls -la".into();
         let json = serde_json::to_value(tool_start(
+            &ToolRegistry::default(),
             &event,
             Path::new(CWD),
             Some(Path::new(HOME)),
@@ -784,6 +1017,7 @@ mod tests {
     #[test]
     fn later_tool_start_updates_the_existing_call() {
         let json = serde_json::to_value(tool_start(
+            &ToolRegistry::default(),
             &start_event("bash", None),
             Path::new(CWD),
             Some(Path::new(HOME)),
@@ -796,8 +1030,14 @@ mod tests {
 
     #[test]
     fn first_preview_creates_a_pending_call_titled_by_the_preview() {
-        let json =
-            serde_json::to_value(tool_preview("t-1", "bash", "cargo test".into(), true)).unwrap();
+        let json = serde_json::to_value(tool_preview(
+            &ToolRegistry::default(),
+            "t-1",
+            "bash",
+            "cargo test".into(),
+            true,
+        ))
+        .unwrap();
 
         assert_eq!(json["sessionUpdate"], json!("tool_call"));
         assert_eq!(json["title"], json!("cargo test"));
@@ -837,8 +1077,14 @@ mod tests {
 
     #[test]
     fn later_preview_only_retitles() {
-        let json =
-            serde_json::to_value(tool_preview("t-1", "bash", "cargo test".into(), false)).unwrap();
+        let json = serde_json::to_value(tool_preview(
+            &ToolRegistry::default(),
+            "t-1",
+            "bash",
+            "cargo test".into(),
+            false,
+        ))
+        .unwrap();
 
         assert_eq!(json["sessionUpdate"], json!("tool_call_update"));
         assert_eq!(json["title"], json!("cargo test"));
@@ -1055,5 +1301,164 @@ mod tests {
         let event = turn_event(None, 200_000, None);
         let json = serde_json::to_value(usage_update(&event, None)).unwrap();
         assert_eq!(json["used"], 51_200);
+    }
+
+    fn tool_name_of(update: SessionUpdate) -> Value {
+        serde_json::to_value(update).unwrap()["_meta"][META_NAMESPACE][META_TOOL_NAME].clone()
+    }
+
+    fn shell_output(exit_code: Option<i32>) -> ToolOutput {
+        ToolOutput::Shell(ShellOutput {
+            model_text: SHELL_MODEL_TEXT.into(),
+            relative_workdir: ".".into(),
+            timeout_ms: 0,
+            duration_ms: 0,
+            exit_code,
+            signal: None,
+            timed_out: false,
+            output_limit_exceeded: false,
+            final_sequence: 0,
+            stdout_utf8_bytes: 0,
+            stderr_utf8_bytes: 0,
+            stdout: SHELL_STDOUT.into(),
+            stderr: SHELL_STDERR.into(),
+            stdout_capture_truncated: false,
+            stderr_capture_truncated: false,
+            stdout_preview_truncated: false,
+            stderr_preview_truncated: false,
+            stdout_redraws_collapsed: 0,
+            stderr_redraws_collapsed: 0,
+            filter: None,
+        })
+    }
+
+    #[test_case(tool_preview(&ToolRegistry::default(), "t-1", SHELL_TOOL, "ls".into(), true) ; "preview_creation")]
+    #[test_case(tool_preview(&ToolRegistry::default(), "t-1", SHELL_TOOL, "ls".into(), false) ; "preview_update")]
+    #[test_case(tool_start(&ToolRegistry::default(), &start_event(SHELL_TOOL, None), Path::new(CWD), None, true) ; "start_creation")]
+    #[test_case(tool_start(&ToolRegistry::default(), &start_event(SHELL_TOOL, None), Path::new(CWD), None, false) ; "start_update")]
+    #[test_case(tool_output("t-1", Some(SHELL_TOOL), SHELL_STDOUT) ; "streamed_output")]
+    #[test_case(tool_done(&done_event(SHELL_TOOL, shell_output(Some(0)), false, None), Path::new(CWD), None) ; "done")]
+    #[test_case(tool_cancelled("t-1", SHELL_TOOL) ; "cancelled")]
+    fn every_tool_update_names_its_tool(update: SessionUpdate) {
+        assert_eq!(tool_name_of(update), SHELL_TOOL);
+    }
+
+    #[test]
+    fn a_replayed_call_and_its_result_name_their_tool() {
+        let json = updates_json(&[
+            assistant(vec![MsgBlock::tool_use(
+                "tu-1",
+                SHELL_TOOL,
+                json!({"command": "ls"}),
+            )]),
+            Message {
+                role: MsgRole::User,
+                content: vec![MsgBlock::ToolResult {
+                    tool_use_id: "tu-1".into(),
+                    content: SHELL_STDOUT.into(),
+                    is_error: false,
+                    output_ref: None,
+                }],
+                ..Default::default()
+            },
+        ]);
+        for update in &json {
+            assert_eq!(update["_meta"][META_NAMESPACE][META_TOOL_NAME], SHELL_TOOL);
+        }
+    }
+
+    /// Orca reads a shell's streams and exit code from `rawOutput`, and the
+    /// fenced text stays for clients that only render content.
+    #[test_case(Some(SHELL_EXIT), json!(SHELL_EXIT) ; "exited")]
+    #[test_case(None, Value::Null ; "killed_without_a_code")]
+    fn a_shell_reports_its_streams_and_exit_code(exit_code: Option<i32>, expected: Value) {
+        let event = done_event(SHELL_TOOL, shell_output(exit_code), true, None);
+        let json = serde_json::to_value(tool_done(&event, Path::new(CWD), None)).unwrap();
+
+        assert_eq!(
+            json["rawOutput"],
+            json!({RAW_STDOUT: SHELL_STDOUT, RAW_STDERR: SHELL_STDERR, RAW_EXIT_CODE: expected})
+        );
+        assert_eq!(
+            json["content"][0]["content"]["text"],
+            fenced(&event.output.as_text())
+        );
+    }
+
+    #[test]
+    fn other_output_stays_raw_text() {
+        let event = done_event(
+            "memory",
+            ToolOutput::Plain(SHELL_STDOUT.into()),
+            false,
+            None,
+        );
+        let json = serde_json::to_value(tool_done(&event, Path::new(CWD), None)).unwrap();
+        assert_eq!(json["rawOutput"], SHELL_STDOUT);
+    }
+
+    #[test]
+    fn open_calls_fail_as_cancelled_in_id_order() {
+        let mut open = OpenCalls::from([
+            ("t-2".to_owned(), Arc::from(SHELL_TOOL)),
+            ("t-1".to_owned(), Arc::from(VIEW_IMAGE_TOOL_NAME)),
+        ]);
+
+        let json: Vec<Value> = cancel_open_calls(&mut open)
+            .into_iter()
+            .map(|update| serde_json::to_value(update).unwrap())
+            .collect();
+
+        assert!(open.is_empty());
+        let ids: Vec<&Value> = json.iter().map(|update| &update["toolCallId"]).collect();
+        assert_eq!(ids, [&json!("t-1"), &json!("t-2")]);
+        for update in &json {
+            assert_eq!(update["status"], "failed");
+            assert_eq!(update["content"][0]["content"]["text"], CANCELLED_TOOL_TEXT);
+        }
+    }
+
+    #[test_case(DoneReason::EndTurn, StopReason::EndTurn ; "end_turn")]
+    #[test_case(DoneReason::Refusal, StopReason::Refusal ; "refusal")]
+    #[test_case(DoneReason::Cancelled, StopReason::Cancelled ; "cancelled")]
+    fn done_reasons_map_to_stop_reasons(reason: DoneReason, expected: StopReason) {
+        assert_eq!(map_done_reason(reason), expected);
+    }
+
+    /// The ids a replay gives, which must be the ones the stored groups carry.
+    #[test]
+    fn replayed_chunks_carry_their_stored_message_ids() {
+        let user = CaudraId::generate();
+        let reply = CaudraId::generate();
+        let mut items = expand_message_in(&Message::user("hello".into()), None, user);
+        let parent = items.last().map(|item| item.id);
+        items.extend(expand_message_in(
+            &assistant(vec![
+                MsgBlock::thinking("plan".into(), None),
+                MsgBlock::Text {
+                    text: "answer".into(),
+                },
+                MsgBlock::thinking("again".into(), None),
+            ]),
+            parent,
+            reply,
+        ));
+        let history = History::restored(items).unwrap();
+
+        let ids: Vec<Value> =
+            replay_history(&ToolRegistry::default(), &history, Path::new(CWD), None)
+                .into_iter()
+                .map(|update| serde_json::to_value(update).unwrap()["messageId"].clone())
+                .collect();
+
+        assert_eq!(
+            ids,
+            [
+                json!(user.to_string()),
+                json!(format!("{reply}{THOUGHT_ID_INFIX}0")),
+                json!(reply.to_string()),
+                json!(format!("{reply}{THOUGHT_ID_INFIX}1")),
+            ]
+        );
     }
 }

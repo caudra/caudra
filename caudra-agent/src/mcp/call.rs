@@ -44,12 +44,22 @@ pub trait Elicitor: Send + Sync {
         server: &'a str,
         request: ElicitRequest,
     ) -> BoxFuture<'a, ElicitResponse>;
+
+    /// The server reported the URL elicitation `elicitation_id` it asked
+    /// this elicitor about complete.
+    fn url_completed(&self, _server: &str, _elicitation_id: &str) {}
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ElicitMode {
-    Form { schema: Value },
-    Url { url: String },
+    Form {
+        schema: Value,
+    },
+    /// `elicitation_id` is the server's own, which its completion notice names.
+    Url {
+        url: String,
+        elicitation_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -171,6 +181,12 @@ impl CallScope {
         std::mem::take(&mut *lock(&self.state.interactions))
     }
 
+    pub(super) fn url_completed(&self, server: &str, elicitation_id: &str) {
+        if let Some(elicitor) = &self.elicitor {
+            elicitor.url_completed(server, elicitation_id);
+        }
+    }
+
     pub(super) fn report_progress(&self, text: String) {
         if let Some(progress) = &self.progress {
             let _ = progress.try_send(ToolLive::Annotation(text));
@@ -221,7 +237,7 @@ impl CallScope {
         let elicitor = self.elicitor.as_ref()?;
         let message = request.message.clone();
         let url = match &request.mode {
-            ElicitMode::Url { url } => Some(url.clone()),
+            ElicitMode::Url { url, .. } => Some(url.clone()),
             ElicitMode::Form { .. } => None,
         };
         let mut response = {

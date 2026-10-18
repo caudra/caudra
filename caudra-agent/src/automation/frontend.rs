@@ -318,7 +318,9 @@ pub fn run_end(event: &AgentEvent) -> Option<(TurnOutcome, Option<String>)> {
     match event {
         AgentEvent::Done { reason, .. } => Some((
             match reason {
-                DoneReason::EndTurn | DoneReason::MaxTokens => TurnOutcome::Completed,
+                DoneReason::EndTurn | DoneReason::MaxTokens | DoneReason::Refusal => {
+                    TurnOutcome::Completed
+                }
                 DoneReason::MaxTurns => TurnOutcome::MaxTurns,
                 DoneReason::Cancelled => TurnOutcome::Cancelled,
             },

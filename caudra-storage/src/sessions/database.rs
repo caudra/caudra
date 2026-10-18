@@ -58,9 +58,10 @@ use super::change_stores::{ChangeStores, registered_change_stores, release_every
 use super::lease::{SessionLease, held_session_ids};
 use super::progress::{MIGRATION, MigrationEvent, PRUNE, PruneEvent};
 use super::{
-    ProjectUsageRelocation, SESSION_VERSION, Session, SessionError, SessionLocation, SessionMeta,
-    SessionRelocation, SessionRelocationResult, SessionSummary, StoredSubagent,
-    StoredSubagentOutcome, StoredSubagentTaskSpec, StoredTokenUsage, StoredToolUsage, next_epoch,
+    ProjectUsageRelocation, SESSION_VERSION, Session, SessionError, SessionListing,
+    SessionLocation, SessionMeta, SessionRelocation, SessionRelocationResult, SessionSummary,
+    StoredSubagent, StoredSubagentOutcome, StoredSubagentTaskSpec, StoredTokenUsage,
+    StoredToolUsage, next_epoch,
 };
 use crate::automation::{
     SESSION_AUTOMATION_BYTES, automation_running, automation_totals, relocate_automations,
@@ -3012,6 +3013,45 @@ impl SessionDatabase {
 
     pub fn local_session_locations(&self) -> Result<Vec<SessionLocation>, SessionError> {
         local_session_locations_on(&self.connection, None)
+    }
+
+    /// Up to `limit` local sessions, newest first, optionally only those in
+    /// `cwd`, starting after the `(updated_at, id)` key a previous page ended on.
+    pub fn local_session_page(
+        &self,
+        cwd: Option<&str>,
+        after: Option<(u64, CaudraId)>,
+        limit: usize,
+    ) -> Result<Vec<SessionListing>, SessionError> {
+        let local = StoredWorkspaceBinding::local_from_cwd("");
+        let after_updated = after
+            .map(|(updated_at, _)| to_i64(updated_at, "sessions.updated_at"))
+            .transpose()?;
+        let after_id = after.map(|(_, id)| id.as_bytes().to_vec());
+        let mut statement = self.connection.prepare(
+            "SELECT id, title, cwd, model, updated_at FROM sessions \
+             WHERE workspace_source IN ('', ?1) AND (?2 IS NULL OR cwd = ?2) \
+             AND (?3 IS NULL OR updated_at < ?3 OR (updated_at = ?3 AND id < ?4)) \
+             ORDER BY updated_at DESC, id DESC LIMIT ?5",
+        )?;
+        let mut rows = statement.query(params![
+            local.trust_anchor().as_str(),
+            cwd,
+            after_updated,
+            after_id,
+            to_i64(limit, "session page limit")?,
+        ])?;
+        let mut listings = Vec::new();
+        while let Some(row) = rows.next()? {
+            listings.push(SessionListing {
+                id: id_from_row(row, 0)?,
+                title: row.get(1)?,
+                cwd: row.get(2)?,
+                model: row.get(3)?,
+                updated_at: from_i64(row.get(4)?, "sessions.updated_at")?,
+            });
+        }
+        Ok(listings)
     }
 
     /// Local sessions working in `root` or anywhere below it. Matched as a
@@ -10133,6 +10173,56 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         assert_eq!(
             database.local_session_cwd(CaudraId::generate()).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn local_session_pages_run_newest_first_and_skip_remote_sessions() {
+        const OTHER_CWD: &str = "/elsewhere";
+        const PAGE: usize = 2;
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let mut saved = Vec::new();
+        for (updated_at, cwd) in [(1, CWD), (3, OTHER_CWD), (3, CWD), (2, CWD)] {
+            let mut session = TestSession::new(MODEL, cwd);
+            session.updated_at = updated_at;
+            database.save(&session, None).unwrap();
+            saved.push(session);
+        }
+        database
+            .save(
+                &TestSession::new_with_workspace(
+                    MODEL,
+                    REMOTE_CWD,
+                    remote_binding("origin", "principal", "project", "cursor"),
+                ),
+                None,
+            )
+            .unwrap();
+        let mut expected: Vec<_> = saved
+            .iter()
+            .filter(|session| session.cwd == CWD)
+            .map(|session| (session.updated_at, session.id))
+            .collect();
+        expected.sort_unstable_by(|left, right| right.cmp(left));
+
+        let first = database.local_session_page(Some(CWD), None, PAGE).unwrap();
+        let last = first.last().map(|row| (row.updated_at, row.id));
+        let second = database.local_session_page(Some(CWD), last, PAGE).unwrap();
+        let paged: Vec<_> = first
+            .iter()
+            .chain(&second)
+            .map(|row| (row.updated_at, row.id))
+            .collect();
+
+        assert_eq!(paged, expected);
+        assert!(first.iter().chain(&second).all(|row| row.model == MODEL));
+        assert_eq!(
+            database
+                .local_session_page(None, None, saved.len() + 1)
+                .unwrap()
+                .len(),
+            saved.len()
         );
     }
 

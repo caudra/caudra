@@ -819,7 +819,9 @@ pub(crate) async fn parse_sse(
                             StopReason::ToolUse
                         }
                     }
-                    "incomplete" => StopReason::MaxTokens,
+                    "incomplete" => StopReason::from_openai_incomplete(
+                        resp["incomplete_details"]["reason"].as_str(),
+                    ),
                     _ => StopReason::EndTurn,
                 });
             }
@@ -833,7 +835,9 @@ pub(crate) async fn parse_sse(
                 if let Some(u) = resp.get("usage") {
                     usage = parse_usage(u);
                 }
-                stop_reason = Some(StopReason::MaxTokens);
+                stop_reason = Some(StopReason::from_openai_incomplete(
+                    resp["incomplete_details"]["reason"].as_str(),
+                ));
                 response_complete = false;
             }
 

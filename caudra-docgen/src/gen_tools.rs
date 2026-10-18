@@ -322,7 +322,7 @@ fn section_notes(section: &str) -> &'static [&'static str] {
 fn tool_notes(name: &str) -> &'static [&'static str] {
     match name {
         "task" => &[
-            "The published task arguments and instructions follow `agent.task_execution`: `sync` waits for final results and omits `background`, `auto` lets the model choose with `background: true`, and `async` always returns an admission receipt. See [background tasks](/docs/sessions/#background-tasks) for automatic continuation, inspection, and shutdown. The TUI and persistent stream-JSON SDK support background work. Print and ACP resolve `auto` to synchronous execution and withhold strict `async` tools. `batch` alone does not make synchronous calls asynchronous. Resume a task ID only after its invocation settles.",
+            "The published task arguments and instructions follow `agent.task_execution`: `sync` waits for final results and omits `background`, `auto` lets the model choose with `background: true`, and `async` always returns an admission receipt. See [background tasks](/docs/sessions/#background-tasks) for automatic continuation, inspection, and shutdown. The TUI, ACP, and persistent stream-JSON SDK support background work. Print resolves `auto` to synchronous execution and withholds strict `async` tools. `batch` alone does not make synchronous calls asynchronous. Resume a task ID only after its invocation settles.",
         ],
         "file_edit" | "file_apply_patch" => &[
             "Each model is offered one editor. GPT-5 and later GPT models and the o3, o4, and Codex families get `file_apply_patch`, the patch format they were trained on. Every other model gets `file_edit`.",
@@ -582,7 +582,7 @@ mod tests {
             "`sync` waits for final results and omits `background`",
             "`async` always returns an admission receipt",
             "[background tasks](/docs/sessions/#background-tasks)",
-            "Print and ACP resolve `auto` to synchronous execution",
+            "Print resolves `auto` to synchronous execution",
             "`batch` alone does not make synchronous calls asynchronous.",
             "Resume a task ID only after its invocation settles.",
             "| `output_schema` | any (JSON) | no | JSON Schema (object)",

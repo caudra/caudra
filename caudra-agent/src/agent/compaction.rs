@@ -38,6 +38,8 @@ pub(super) const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps
 /// alternate, and the transcript already draws that seam as a border, so the
 /// UI skips it by this exact text rather than drawing it twice.
 pub const COMPACTION_ANCHOR: &str = "What did we do so far?";
+/// What the user-facing compact command does, for every front end that offers it.
+pub const COMPACT_DESCRIPTION: &str = "Summarize and compact conversation history";
 const IMAGE_PLACEHOLDER: &str = "[image]";
 const TOOL_RESULT_PLACEHOLDER: &str = "[tool result]";
 const KEEP_LAST_TOOL_RESULTS: usize = 3;

@@ -522,11 +522,12 @@ Set `CAUDRA_INSTALL_DIR` to override the destination. Release checksums detect c
 caudra acp
 caudra acp -m anthropic/claude-sonnet-4-6
 caudra acp --yolo
+caudra acp --login
 caudra --ephemeral acp
 caudra --no-jit acp
 ```
 
-Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are only `-m` / `--model` and `--yolo`. `--ephemeral` must come before the subcommand. `-m`, `--account`, `--no-jit`, `--no-plugins`, `--no-rtk`, `--allowed-tools`, and `--disallowed-tools` work on either side.
+Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are only `-m` / `--model`, `--yolo`, `--auto`, and `--login`. `--login` signs in as `caudra auth login` does and exits instead of serving, which is how editors run [terminal sign-in](/docs/acp/#authentication). `--ephemeral` must come before the subcommand. `-m`, `--account`, `--no-jit`, `--no-plugins`, `--no-rtk`, `--allowed-tools`, and `--disallowed-tools` work on either side.
 
 ### `caudra index`
 

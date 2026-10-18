@@ -15,11 +15,9 @@ use caudra_agent::context::{
     BuiltinToolsInput, ContextCapture, ContextInventory, ContextMcpInventory, ContextPublisher,
     ContextReadiness, ContextSnapshot,
 };
-use caudra_agent::mcp::call::CallScope;
 use caudra_agent::mcp::config::McpServerStatus;
 use caudra_agent::mcp::elicitor::QuestionForms;
-use caudra_agent::mcp::resources::prompt_message;
-use caudra_agent::mcp::{McpHandle, McpSession};
+use caudra_agent::mcp::{McpHandle, McpSession, prompt_preamble};
 use caudra_agent::memory::baseline::MemoryBaseline;
 use caudra_agent::memory::compactor::Pump;
 use caudra_agent::permissions::PermissionManager;
@@ -751,29 +749,13 @@ impl AgentLoop {
         self.install(input, &effective_slot, &selected_slot);
 
         if let Some(ref prompt_ref) = input.prompt {
-            let Some(ref mcp) = self.mcp else {
-                return Err(AgentError::Tool {
-                    tool: "mcp_prompt".into(),
-                    message: "MCP not available".into(),
-                });
-            };
-            let messages = mcp
-                .get_prompt(
-                    &prompt_ref.qualified_name,
-                    &prompt_ref.arguments,
-                    &CallScope::none(),
-                )
-                .await
-                .map_err(|e| AgentError::Tool {
-                    tool: "mcp_prompt".into(),
-                    message: e.to_string(),
-                })?;
-            let vision = effective_slot.model.supports_vision();
-            input.preamble.extend(
-                messages
-                    .into_iter()
-                    .map(|message| prompt_message(message, vision)),
-            );
+            let messages = prompt_preamble(
+                self.mcp.as_deref(),
+                prompt_ref,
+                effective_slot.model.supports_vision(),
+            )
+            .await?;
+            input.preamble.extend(messages);
         }
 
         let opts = RequestOptions {

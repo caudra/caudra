@@ -932,6 +932,7 @@ dependencies = [
  "caudra-workspace",
  "color-eyre",
  "flume",
+ "jiff",
  "serde",
  "serde_json",
  "smol",

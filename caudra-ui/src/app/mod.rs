@@ -171,8 +171,8 @@ use caudra_agent::types::{
 };
 use caudra_agent::{
     AgentEvent, AgentInput, AgentMode, CommitRef, Envelope, GoalVerdict, HistorySnapshot,
-    ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader, Mention, PromptAdmission,
-    QueueItemId, SharedHistory, SteeringQueue, SubagentInfo, ToolOutput, project_for_inspection,
+    ImageSource, McpConfigErrors, McpSnapshotReader, Mention, PromptAdmission, QueueItemId,
+    SharedHistory, SteeringQueue, SubagentInfo, ToolOutput, project_for_inspection,
 };
 use caudra_automation::event::{StartedBy, TurnOutcome};
 use caudra_config::providers::ProvidersConfig;
@@ -6331,12 +6331,11 @@ impl App {
     fn execute_mcp_prompt(&mut self, name: &str, args: &str) -> Vec<Action> {
         let prompt = self.command_palette.find_mcp_prompt(name).unwrap().clone();
 
-        let arguments = Self::parse_prompt_args(&prompt, args);
+        let arguments = prompt.parse_arguments(args);
         let missing: Vec<_> = prompt
-            .arguments
-            .iter()
-            .filter(|a| a.required && !arguments.contains_key(&a.name))
-            .map(|a| format!("<{}>", a.name))
+            .missing_arguments(&arguments)
+            .into_iter()
+            .map(|name| format!("<{name}>"))
             .collect();
         if !missing.is_empty() {
             self.flash(format!("Usage: {} {}", name, missing.join(" ")));
@@ -6362,30 +6361,6 @@ impl App {
         input.prompt = Some(Box::new(prompt_ref));
 
         self.submit_explicit_input(input, display_text)
-    }
-
-    fn parse_prompt_args(prompt: &McpPromptInfo, args: &str) -> HashMap<String, String> {
-        let mut result = HashMap::new();
-        let mut remaining = args.trim();
-        if remaining.is_empty() || prompt.arguments.is_empty() {
-            return result;
-        }
-        let last_idx = prompt.arguments.len() - 1;
-        for (i, arg) in prompt.arguments.iter().enumerate() {
-            if remaining.is_empty() {
-                break;
-            }
-            if i == last_idx {
-                result.insert(arg.name.clone(), remaining.to_string());
-            } else if let Some((word, rest)) = remaining.split_once(char::is_whitespace) {
-                result.insert(arg.name.clone(), word.to_string());
-                remaining = rest.trim_start();
-            } else {
-                result.insert(arg.name.clone(), remaining.to_string());
-                break;
-            }
-        }
-        result
     }
 
     /// A template expands into a prompt, so it follows the composer it was

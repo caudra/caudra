@@ -42,6 +42,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::tools::{ToolContext, ToolFilter};
+use crate::{AgentError, McpPromptRef, Message};
 use arc_swap::{ArcSwap, Guard};
 use caudra_config::{ProfileToolExposure, ProfileToolPolicy, ProfileToolSource};
 use caudra_storage::StateDir;
@@ -80,6 +81,8 @@ pub(crate) const SEPARATOR: &str = ".";
 pub(super) const WIRE_SEPARATOR: &str = "__";
 pub const UNKNOWN_MCP: &str = "unknown_mcp";
 const STARTUP_EPOCH: u64 = 0;
+const PROMPT_TOOL: &str = "mcp_prompt";
+const MCP_UNAVAILABLE: &str = "MCP not available";
 /// How long a server's list changes settle before it is listed again, so a
 /// burst of them costs one listing.
 pub const LIST_CHANGE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -578,6 +581,67 @@ pub struct McpPromptArg {
     pub name: String,
     pub description: String,
     pub required: bool,
+}
+
+impl McpPromptInfo {
+    /// Splits typed `args` across the declared arguments in order, one word
+    /// each, the last taking the rest of the line.
+    pub fn parse_arguments(&self, args: &str) -> HashMap<String, String> {
+        let mut result = HashMap::new();
+        let mut remaining = args.trim();
+        let Some(last_idx) = self.arguments.len().checked_sub(1) else {
+            return result;
+        };
+        for (i, arg) in self.arguments.iter().enumerate() {
+            if remaining.is_empty() {
+                break;
+            }
+            if i == last_idx {
+                result.insert(arg.name.clone(), remaining.to_string());
+            } else if let Some((word, rest)) = remaining.split_once(char::is_whitespace) {
+                result.insert(arg.name.clone(), word.to_string());
+                remaining = rest.trim_start();
+            } else {
+                result.insert(arg.name.clone(), remaining.to_string());
+                break;
+            }
+        }
+        result
+    }
+
+    /// The required arguments `arguments` leaves out, in declaration order.
+    pub fn missing_arguments(&self, arguments: &HashMap<String, String>) -> Vec<&str> {
+        self.arguments
+            .iter()
+            .filter(|arg| arg.required && !arguments.contains_key(&arg.name))
+            .map(|arg| arg.name.as_str())
+            .collect()
+    }
+}
+
+/// What `prompt` expands to: the messages its turn carries ahead of its own.
+pub async fn prompt_preamble(
+    mcp: Option<&McpHandle>,
+    prompt: &McpPromptRef,
+    vision: bool,
+) -> Result<Vec<Message>, AgentError> {
+    let prompt_error = |message: String| AgentError::Tool {
+        tool: PROMPT_TOOL.into(),
+        message,
+    };
+    let mcp = mcp.ok_or_else(|| prompt_error(MCP_UNAVAILABLE.into()))?;
+    let messages = mcp
+        .get_prompt(
+            &prompt.qualified_name,
+            &prompt.arguments,
+            &CallScope::none(),
+        )
+        .await
+        .map_err(|error| prompt_error(error.to_string()))?;
+    Ok(messages
+        .into_iter()
+        .map(|message| resources::prompt_message(message, vision))
+        .collect())
 }
 
 #[derive(Clone, Default)]

@@ -427,11 +427,15 @@ async fn complete_url_elicitations(
         match response.map(|response| response.action) {
             Some(ElicitAction::Accept) => {
                 if let (Some(inbound), Some(id)) = (transport.inbound(), elicitation_id) {
-                    future::or(inbound.completion(&id, URL_COMPLETION_WAIT), async {
-                        scope.cancel.cancelled().await;
-                        false
-                    })
-                    .await;
+                    let completed =
+                        future::or(inbound.completion(&id, URL_COMPLETION_WAIT), async {
+                            scope.cancel.cancelled().await;
+                            false
+                        })
+                        .await;
+                    if completed {
+                        scope.url_completed(server, &id);
+                    }
                 }
             }
             Some(_) => return Err(refused(URL_ELICITATION_DECLINED)),

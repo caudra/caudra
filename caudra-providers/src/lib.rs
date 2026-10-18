@@ -21,10 +21,10 @@ pub mod tokens;
 pub(crate) mod types;
 
 pub use caudra_storage::sessions::add_cost;
-pub use error::AgentError;
+pub use error::{AgentError, UserFailure};
 pub use history::{
     AssistantTextState, CaudraId, HistoryItem, HistoryItemKind, HistoryProjectionError, UserOrigin,
-    active_history_items, expand_message, merge_history_items, project_messages,
+    active_history_items, expand_message, expand_message_in, merge_history_items, project_messages,
     resolve_history_head, transcript_history_items, validate_history_items,
 };
 pub use model::{

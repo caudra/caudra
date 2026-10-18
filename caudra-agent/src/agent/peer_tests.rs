@@ -935,7 +935,7 @@ mod peer_tests {
             );
             fixture.bind(&mut agent);
             let (tx, events) = if done_channel_full {
-                flume::bounded(1)
+                flume::bounded(2)
             } else {
                 flume::unbounded()
             };
@@ -946,7 +946,13 @@ mod peer_tests {
             let events: Vec<_> = events.try_iter().map(|envelope| envelope.event).collect();
             if done_channel_full {
                 assert!(matches!(result, Err(AgentError::Channel)));
-                assert!(matches!(events.as_slice(), [AgentEvent::TurnComplete(_)]));
+                assert!(matches!(
+                    events.as_slice(),
+                    [
+                        AgentEvent::MessageStarted { .. },
+                        AgentEvent::TurnComplete(_)
+                    ]
+                ));
             } else {
                 assert_eq!(result.unwrap(), DoneReason::EndTurn);
                 assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));

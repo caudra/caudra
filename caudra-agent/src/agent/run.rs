@@ -104,7 +104,7 @@ use caudra_storage::background::JobOwner;
 use caudra_storage::cache_warming::Boundary;
 use caudra_storage::decision_log::{DecisionEffect, DecisionLabel};
 use caudra_storage::goal_log::GoalEvaluationOutcome;
-use caudra_storage::id::SessionRef;
+use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::now_epoch;
 use caudra_storage::tool_outputs::ToolOutputStore;
@@ -2384,8 +2384,8 @@ impl<'h> Agent<'h> {
         );
     }
 
-    fn push_assistant_message(&mut self, message: Message) {
-        self.history.push(message);
+    fn push_assistant_message(&mut self, message: Message, message_id: CaudraId) {
+        self.history.push_in(message, message_id);
         self.publish_prepared_context();
     }
 
@@ -2438,6 +2438,9 @@ impl<'h> Agent<'h> {
         };
         let request_epoch = self.history.epoch();
         let request_started = Instant::now();
+        let message_id = CaudraId::generate();
+        self.event_tx
+            .send(AgentEvent::MessageStarted { id: message_id })?;
         let (stream_result, warm, prefix) = {
             let tools = self.request_tools();
             repair_state.register_definitions(tools.as_ref());
@@ -2547,15 +2550,18 @@ impl<'h> Agent<'h> {
                     content.push(ContentBlock::Text { text });
                 }
                 if !content.is_empty() {
-                    self.history.push(Message {
-                        role: Role::Assistant,
-                        content,
-                        reasoning_source: Some(ReasoningSource::new(
-                            &self.model,
-                            self.provider.reasoning_transport(&self.model),
-                        )),
-                        ..Default::default()
-                    });
+                    self.history.push_in(
+                        Message {
+                            role: Role::Assistant,
+                            content,
+                            reasoning_source: Some(ReasoningSource::new(
+                                &self.model,
+                                self.provider.reasoning_transport(&self.model),
+                            )),
+                            ..Default::default()
+                        },
+                        message_id,
+                    );
                 }
                 return Err(AgentError::Cancelled);
             }
@@ -2641,7 +2647,8 @@ impl<'h> Agent<'h> {
                 .is_some_and(|text| steering::abandons_turn(&text));
         let (observed, all_repairable) = if has_tools {
             self.response_text = None;
-            self.process_tool_calls(response, repair_state).await?
+            self.process_tool_calls(response, repair_state, message_id)
+                .await?
         } else {
             self.record_response_text(steering::visible_text(&response.message));
             if empty {
@@ -2651,7 +2658,7 @@ impl<'h> Agent<'h> {
                     .retain(|block| !matches!(block, ContentBlock::Text { .. }));
                 response.message.padding = true;
             }
-            self.push_assistant_message(response.message);
+            self.push_assistant_message(response.message, message_id);
             (Observed::default(), false)
         };
         self.continuing_response = false;
@@ -2780,6 +2787,8 @@ impl<'h> Agent<'h> {
             None
         } else if !has_tools && stop_reason == Some(StopReason::MaxTokens) {
             Some(Recovery::Truncated)
+        } else if stop_reason == Some(StopReason::Refusal) {
+            None
         } else if empty {
             Some(Recovery::Empty {
                 after_tools,
@@ -3775,6 +3784,7 @@ impl<'h> Agent<'h> {
         &mut self,
         response: StreamResponse,
         repair_state: Arc<RepairState>,
+        message_id: CaudraId,
     ) -> Result<(Observed, bool), AgentError> {
         let tool_uses = response
             .message
@@ -3797,7 +3807,7 @@ impl<'h> Agent<'h> {
         for (id, invalid) in response.invalid_tool_inputs {
             ctx.json_repair.register_invalid(&id, invalid);
         }
-        self.push_assistant_message(response.message);
+        self.push_assistant_message(response.message, message_id);
         self.observe_autopilot();
         let result = tool_dispatch::process_tool_calls(
             tool_uses,
@@ -7405,7 +7415,11 @@ mod tests {
                 drop(event_rx);
             }
             let result = agent
-                .process_tool_calls(empty_response(), ctx.json_repair.clone())
+                .process_tool_calls(
+                    empty_response(),
+                    ctx.json_repair.clone(),
+                    CaudraId::generate(),
+                )
                 .await;
             assert_eq!(result.is_ok(), cancelled);
             agent.drain_repair_usage(&ctx.json_repair);
@@ -7505,6 +7519,7 @@ mod tests {
                 agent.process_tool_calls(
                     tool_use_response(BLOCKING_TOOL_NAME, serde_json::json!({})),
                     Arc::new(RepairState::default()),
+                    CaudraId::generate(),
                 ),
                 inspect_pending_context,
             )
@@ -7652,10 +7667,12 @@ mod tests {
             assert!(matches!(
                 events.as_slice(),
                 [
+                    AgentEvent::MessageStarted { .. },
                     AgentEvent::TextDelta { text },
                     AgentEvent::StreamReset,
                     AgentEvent::AuthRequired,
                     AgentEvent::AuthRestored,
+                    AgentEvent::MessageStarted { .. },
                     AgentEvent::TurnComplete(_),
                     AgentEvent::Done { .. }
                 ] if text == PARTIAL_RESPONSE

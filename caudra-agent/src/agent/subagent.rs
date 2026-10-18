@@ -57,9 +57,10 @@ use crate::tools::{
 use crate::{
     ActivityChild, Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
     BatchToolStatus, CallStage, DoneReason, Envelope, EventSender, History, InterruptSource,
-    McpSession, SteeringQueue, SteeringQueueReceiver, SubagentActivity, SubagentHistoryError,
-    SubagentHistoryLease, SubagentHistoryStore, SubagentInfo, SubagentProgress, SubagentTaskMode,
-    SubagentTaskSpec, SubagentTaskSpecCandidate, ToolOutput, reasoning_summary, steering_queue,
+    McpSession, SteeringQueue, SteeringQueueReceiver, SubagentActivity, SubagentEnd,
+    SubagentHistoryError, SubagentHistoryLease, SubagentHistoryStore, SubagentInfo,
+    SubagentProgress, SubagentTaskMode, SubagentTaskSpec, SubagentTaskSpecCandidate, ToolOutput,
+    reasoning_summary, steering_queue,
 };
 
 pub const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
@@ -132,6 +133,7 @@ async fn relay_session_events(
             AgentEvent::ToolPending { .. }
             | AgentEvent::ToolInputDelta { .. }
             | AgentEvent::ToolOutput { .. }
+            | AgentEvent::SubagentFinished { .. }
                 if envelope.subagent.is_some() =>
             {
                 continue;
@@ -738,11 +740,22 @@ impl Subagent {
             Ok(DoneReason::MaxTokens) => Some(TRUNCATED.to_owned()),
             Ok(_) => None,
         };
+        let partial = (!text.is_empty()).then(|| text.clone());
+        let end = match &cut_short {
+            None => SubagentEnd::Completed {
+                output: text.clone(),
+            },
+            Some(_) if matches!(result, Ok(DoneReason::Cancelled)) => SubagentEnd::Cancelled {
+                partial: partial.clone(),
+            },
+            Some(error) => SubagentEnd::Failed {
+                error: error.clone(),
+                partial: partial.clone(),
+            },
+        };
+        let _ = self.sub_event_tx.send(AgentEvent::SubagentFinished { end });
         if let Some(error) = cut_short {
-            return Err(PromptFailure {
-                error,
-                partial: (!text.is_empty()).then_some(text),
-            });
+            return Err(PromptFailure { error, partial });
         }
         Ok(PromptResult {
             text,

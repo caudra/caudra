@@ -10,7 +10,6 @@ use async_lock::Mutex as AsyncMutex;
 use caudra_agent::agent::subagent::{self, STRUCTURED_OUTPUT_TOOL, Subagent};
 use caudra_agent::agent::tool_dispatch::{self, Emit};
 use caudra_agent::tools::interpreter_bridge;
-use caudra_agent::tools::registry::ToolRegistry;
 use caudra_agent::tools::schema::sanitize_tool_input_schema;
 use caudra_agent::tools::{
     Deadline, DescriptionContext, LocalToolFn, LocalTools, ToolAudience, ToolContext, ToolEffect,
@@ -231,7 +230,7 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
     };
     // MCP servers reach the model through the `code` tool and its reminder,
     // never as definitions of their own.
-    let definitions = ToolRegistry::global().definitions_split_with_policy(
+    let definitions = agent.registry.definitions_split_with_policy(
         &vars,
         &ctx_desc,
         model.supports_tool_examples(),

@@ -26,7 +26,7 @@ pub use quota::{QuotaWindow, WindowKind};
 pub use registry::{
     AccountKind, AccountOverrideError, AccountStatus, PoolStatus, account_providers,
     fetch_account_usage, invalidate, oauth_account, parse_account_override,
-    parse_account_overrides, pool_status, select_account, set_process_selection,
+    parse_account_overrides, pool_status, require_account, select_account, set_process_selection,
 };
 pub use route::{
     AccountAlternative, AccountExhaustion, AccountSwitch, AccountTier, Failover, Reroute,

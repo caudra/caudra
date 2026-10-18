@@ -3,14 +3,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use caudra_acp::{AcpRuntime, AcpRuntimeGuard, AcpRuntimeResolver};
+use caudra_acp::{AcpAccounts, AcpRuntime, AcpRuntimeGuard, AcpRuntimeResolver};
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
 use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::tools::ToolRegistry;
-use caudra_config::load_permissions;
+use caudra_config::{ProviderConfig, load_permissions};
 use caudra_lua::PluginHost;
+use caudra_providers::Timeouts;
+use caudra_providers::model::Model;
+use caudra_providers::provider::available_model_specs;
 use caudra_storage::StateDir;
 use caudra_storage::sessions::StoredMode;
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
@@ -40,6 +43,44 @@ impl Drop for SessionResources {
             tracing::error!(%error, "ACP plugin shutdown failed");
         }
     }
+}
+
+/// The accounts as `caudra acp` was started on: the same model resolution
+/// and provider config, read again whenever the server asks.
+struct CliAccounts {
+    model_arg: Option<String>,
+    provider: ProviderConfig,
+    storage: StateDir,
+}
+
+impl AcpAccounts for CliAccounts {
+    fn check(&self, model: &Model) -> std::result::Result<(), String> {
+        caudra_acp::check_credentials(model)
+    }
+
+    fn default_model(&self) -> std::result::Result<Model, String> {
+        resolve_acp_model(self.model_arg.as_deref(), &self.provider, &self.storage)
+            .map_err(|error| error.to_string())
+    }
+
+    fn model_specs(&self) -> Vec<String> {
+        available_model_specs(&self.provider.model_policy)
+    }
+}
+
+/// A machine signed in nowhere still starts when nothing names a model, so
+/// the editor connects and its sessions ask for the sign-in.
+fn resolve_acp_model(
+    model_arg: Option<&str>,
+    provider: &ProviderConfig,
+    storage: &StateDir,
+) -> Result<Model> {
+    setup::resolve_model(model_arg, provider, storage, StoredMode::Build).or_else(|error| {
+        if model_arg.is_some() || provider.default_model.is_some() {
+            return Err(error);
+        }
+        setup::signed_out_model(&provider.model_policy).ok_or(error)
+    })
 }
 
 fn runtime_resolver(
@@ -168,12 +209,12 @@ pub fn run(model_arg: Option<&str>, cli: &Cli) -> Result<()> {
         .load_production_builtins(&config.plugins)
         .context("load builtin plugins")?;
 
-    let timeouts = caudra_providers::Timeouts {
+    let timeouts = Timeouts {
         connect: config.provider.connect_timeout,
         stream: config.provider.stream_timeout,
     };
 
-    let model = setup::resolve_model(model_arg, &config.provider, &storage, StoredMode::Build)?;
+    let model = resolve_acp_model(model_arg, &config.provider, &storage)?;
     let build_stack_ms = lap();
 
     let _logging = setup::init_logging(&config.storage);
@@ -201,15 +242,20 @@ pub fn run(model_arg: Option<&str>, cli: &Cli) -> Result<()> {
         .unwrap_or_default();
 
     plugin_host.shutdown_checked()?;
+    let accounts = Arc::new(CliAccounts {
+        model_arg: model_arg.map(str::to_owned),
+        provider: config.provider.clone(),
+        storage: storage.clone(),
+    });
     caudra_acp::run(caudra_acp::AcpParams {
         model,
         timeouts,
-        initial_wd: cwd,
         thinking,
         prompt_profiles,
         system_prompt_profile_override: cli.system_prompt_profile.clone(),
         permission_mode: cli.permission_mode_override(),
         model_policy: Arc::new(config.provider.model_policy.clone()),
+        accounts,
         runtime_resolver: runtime_resolver(
             storage,
             cli.workcell.clone(),

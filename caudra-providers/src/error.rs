@@ -40,6 +40,8 @@ const RETRY_RATE_LIMIT_LABEL: &str = "Rate limited";
 const RETRY_OVERLOADED_LABEL: &str = "Provider is overloaded";
 const GATEWAY_401: &str = "authentication failed: request was blocked by a gateway or proxy, your token may be missing or expired, run `caudra auth login` or check your API key";
 const GATEWAY_403: &str = "forbidden: request was blocked by a gateway or proxy, check your account and provider settings";
+/// Every credential failure names this command, whichever provider raised it.
+const AUTH_LOGIN_COMMAND: &str = "caudra auth login";
 
 /// Auth and billing never become healthy by waiting, whatever the body says.
 const NEVER_TRANSIENT_STATUSES: [u16; 3] = [401, 402, 403];
@@ -53,6 +55,29 @@ const TRANSIENT_PHRASES: [&str; 5] = [
     "service unavailable",
     "please retry",
 ];
+
+/// What a user-facing failure reports, for a frontend that only holds its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserFailure {
+    /// Credentials are missing, signed out, or rejected.
+    Auth,
+    /// The provider kept rate limiting after every retry.
+    RateLimit,
+}
+
+impl UserFailure {
+    /// Read from the wording this crate gives the text: a credential failure
+    /// names `caudra auth login`, and a rate limit leads with its label.
+    pub fn of(message: &str) -> Option<Self> {
+        if message.contains(AUTH_LOGIN_COMMAND) {
+            Some(Self::Auth)
+        } else if message.starts_with(RATE_LIMIT_LABEL) {
+            Some(Self::RateLimit)
+        } else {
+            None
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -555,6 +580,17 @@ mod tests {
     const QUOTA_RESET_HEADER: &str = "46800";
     const QUOTA_RESET_BODY: &str = r#"{"error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."}}"#;
     const QUOTA_RESET_MESSAGE: &str = "rate limited: rate_limit_error: This request would exceed your account's rate limit. Please try again later. (retry after 13h)";
+
+    #[test_case(AgentError::api(401, BODY), Some(UserFailure::Auth) ; "rejected_credentials")]
+    #[test_case(AgentError::api(401, GATEWAY_HTML), Some(UserFailure::Auth) ; "gateway_rejected_credentials")]
+    #[test_case(AgentError::Config { message: format!("no saved credentials for 'xai' — run `{AUTH_LOGIN_COMMAND} xai`") }, Some(UserFailure::Auth) ; "missing_credentials")]
+    #[test_case(AgentError::api(429, ANTHROPIC_RATE_LIMIT), Some(UserFailure::RateLimit) ; "rate_limited")]
+    #[test_case(AgentError::api(429, ""), Some(UserFailure::RateLimit) ; "rate_limited_without_detail")]
+    #[test_case(AgentError::api(500, BODY), None ; "server_error")]
+    #[test_case(AgentError::api(403, GATEWAY_HTML), None ; "forbidden")]
+    fn a_user_message_names_its_failure(error: AgentError, expected: Option<UserFailure>) {
+        assert_eq!(UserFailure::of(&error.user_message()), expected);
+    }
 
     #[test_case(STEERING_RULE)]
     fn steering_exhaustion_is_not_a_transport_retry(rule: &str) {

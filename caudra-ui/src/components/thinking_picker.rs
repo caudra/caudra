@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use caudra_grab::grab_scope;
-use caudra_providers::{Model, ResolvedThinking, ThinkingConfig};
+use caudra_providers::{Model, ThinkingConfig};
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -17,7 +17,6 @@ const MAX_VISIBLE: u16 = 10;
 /// enough to read the row that just changed, short enough that it never feels
 /// like a window that has to be dismissed.
 const FLASH: Duration = Duration::from_millis(1000);
-const OFF_LABEL: &str = "off";
 
 pub enum ThinkingPickerAction {
     Consumed,
@@ -33,13 +32,11 @@ struct ThinkingItem {
     /// row has none, since its only other spelling is a synonym.
     detail: Option<String>,
     config: ThinkingConfig,
-    resolved: ResolvedThinking,
 }
 
 impl ThinkingItem {
     fn new(label: String, config: ThinkingConfig, model: &Model) -> Self {
-        let resolved = config.resolve(model);
-        let rendered = resolved.to_string();
+        let rendered = config.resolve(model).to_string();
         let detail = match &config {
             // `off` is the only row whose resolution can be a synonym rather
             // than a different mode: a model with an explicit opt-out spells off
@@ -52,7 +49,6 @@ impl ThinkingItem {
             label,
             detail,
             config,
-            resolved,
         }
     }
 }
@@ -168,38 +164,19 @@ impl ThinkingPicker {
     /// shallowest level, and a budget model resolves every level to a token
     /// count. Matching labels would leave both of them on the wrong row.
     fn fill(&mut self, model: &Model, current: &ThinkingConfig) {
-        let items = Self::rows(model);
+        let choices = ThinkingConfig::choices(model);
+        let chosen = current.matching_choice(model, &choices).cloned();
+        let items = choices
+            .into_iter()
+            .map(|choice| ThinkingItem::new(choice.to_string(), choice, model))
+            .collect();
         self.picker.open(items, TITLE);
-        let resolved = current.resolve(model);
-        if !self.picker.select_item_by(|item| item.resolved == resolved) {
+        if !self
+            .picker
+            .select_item_by(|item| Some(&item.config) == chosen.as_ref())
+        {
             self.picker.select(0);
         }
-    }
-
-    /// The modes the keyboard cycle walks, so the two never disagree.
-    fn rows(model: &Model) -> Vec<ThinkingItem> {
-        let mut items = Vec::new();
-        if !model.requires_thinking() {
-            items.push(ThinkingItem::new(
-                OFF_LABEL.to_owned(),
-                ThinkingConfig::Off,
-                model,
-            ));
-        }
-        items.extend(
-            model
-                .reasoning_options()
-                .effort_ladder()
-                .into_iter()
-                .map(|level| {
-                    ThinkingItem::new(
-                        level.to_owned(),
-                        ThinkingConfig::Effort(level.into()),
-                        model,
-                    )
-                }),
-        );
-        items
     }
 
     fn map_action(action: PickerAction<ThinkingItem>) -> ThinkingPickerAction {
@@ -237,17 +214,18 @@ impl Overlay for ThinkingPicker {
 
 #[cfg(test)]
 mod tests {
-    use caudra_providers::{ReasoningOption, ReasoningOptions, ThinkingSupport};
+    use caudra_providers::{ReasoningOption, ReasoningOptions, ResolvedThinking, ThinkingSupport};
+    use caudra_storage::thinking::EFFORT_NONE;
     use crossterm::event::KeyCode;
     use test_case::test_case;
 
     use super::{
-        Cadence, Dirty, Instant, Model, OFF_LABEL, Overlay, ResolvedThinking, ThinkingConfig,
-        ThinkingItem, ThinkingPicker, ThinkingPickerAction,
+        Cadence, Dirty, Instant, Model, Overlay, ThinkingConfig, ThinkingItem, ThinkingPicker,
+        ThinkingPickerAction,
     };
     use crate::components::{key, test_model};
-    use caudra_storage::thinking::EFFORT_NONE;
 
+    const OFF_LABEL: &str = "off";
     const OFF_OFFERED: &str = "a model that can stop reasoning must offer the off row";
     const OFF_WITHHELD: &str = "a model that cannot stop reasoning has no off row to offer";
     const PRESELECTED: &str = "the picker must open on the mode already in force";
@@ -352,7 +330,7 @@ mod tests {
 
         let off = row(&picker, OFF_LABEL).expect(OFF_OFFERED);
         assert_eq!(
-            off.resolved,
+            off.config.resolve(&opt_out_model()),
             ResolvedThinking::Effort(EFFORT_NONE.to_owned()),
             "{OFF_SENDS_THE_OPT_OUT}"
         );

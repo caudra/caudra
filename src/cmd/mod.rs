@@ -612,7 +612,14 @@ pub fn dispatch(mut cli: Cli, startup: Result<Startup, ConfigFileError>) -> Resu
         Some(Command::Rollback) => {
             update::rollback().map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         }
-        Some(Command::Acp { model }) => {
+        Some(Command::Acp { login: true, .. }) => {
+            let storage = StateDir::resolve().context("resolve data directory")?;
+            subcmd::auth_login(None, false, None, None, None, &storage)?;
+        }
+        Some(Command::Acp {
+            model,
+            login: false,
+        }) => {
             acp::run(model.as_deref(), &cli)?;
         }
         Some(Command::Tools {

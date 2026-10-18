@@ -2869,6 +2869,8 @@ pub enum DoneReason {
     MaxTokens,
     MaxTurns,
     Cancelled,
+    /// The provider declined to answer.
+    Refusal,
 }
 
 impl From<Option<StopReason>> for DoneReason {
@@ -2877,6 +2879,7 @@ impl From<Option<StopReason>> for DoneReason {
     fn from(reason: Option<StopReason>) -> Self {
         match reason {
             Some(StopReason::MaxTokens) => Self::MaxTokens,
+            Some(StopReason::Refusal) => Self::Refusal,
             Some(StopReason::EndTurn | StopReason::ToolUse) | None => Self::EndTurn,
         }
     }
@@ -2929,6 +2932,11 @@ pub enum AutopilotEvent {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     TaskAdmitted(TaskCard),
+    /// The assistant message the deltas that follow belong to, under the id
+    /// its history items are committed with.
+    MessageStarted {
+        id: CaudraId,
+    },
     TextDelta {
         text: String,
     },
@@ -3210,6 +3218,11 @@ pub enum AgentEvent {
     /// so the parent knows which task header to update.
     SubagentProgress {
         progress: SubagentProgress,
+    },
+    /// One prompt of a subagent ended. Stamped with [`SubagentInfo`] like
+    /// [`Self::SubagentProgress`], and sent after the run's last event.
+    SubagentFinished {
+        end: SubagentEnd,
     },
     SubagentHistory {
         task_id: String,
@@ -3818,6 +3831,23 @@ impl SubagentProgress {
     pub fn tally_now(&self) -> String {
         Self::tally(self.tools, self.elapsed)
     }
+}
+
+/// How one subagent prompt ended. A run cut short by the turn limit or the
+/// token ceiling failed: its task never reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SubagentEnd {
+    Completed {
+        output: String,
+    },
+    Failed {
+        error: String,
+        partial: Option<String>,
+    },
+    Cancelled {
+        partial: Option<String>,
+    },
 }
 
 /// Tenth-second resolution, because this redraws while the clock runs and a

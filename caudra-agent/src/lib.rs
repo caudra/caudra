@@ -56,6 +56,7 @@ pub mod permissions;
 pub mod prompt;
 pub mod remote_project_context;
 pub mod scratch;
+pub mod session_fork;
 mod stored_session;
 mod subagent_history;
 pub mod template;
@@ -103,9 +104,9 @@ pub use types::{
     MemoryNoteEntry, MemoryOrigin, MemoryOutput, MemoryTagGroup, NO_FILES_FOUND, PatchedFile,
     PeerOutput, QueueConsumedItem, SearchCap, SharedBuf, ShellFilterInfo, ShellOutput, SkillOutput,
     SnapshotLine, SnapshotSpan, SourceCodeGraphRow, SourceCodeGraphSource, SpanStyle,
-    SubagentActivity, SubagentInfo, SubagentProgress, TaskCard, TaskOutput, TaskProvenance,
-    TextOutput, ToolAccounting, ToolDoneEvent, ToolInput, ToolOutput, ToolOutputLimits,
-    ToolStartEvent, TurnCompleteEvent,
+    SubagentActivity, SubagentEnd, SubagentInfo, SubagentProgress, TaskCard, TaskOutput,
+    TaskProvenance, TextOutput, ToolAccounting, ToolDoneEvent, ToolInput, ToolOutput,
+    ToolOutputLimits, ToolStartEvent, TurnCompleteEvent,
 };
 pub use types::{
     ReasoningSummary, format_live_duration, format_settled_duration, reasoning_summary,

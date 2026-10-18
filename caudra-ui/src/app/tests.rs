@@ -75,9 +75,9 @@ use caudra_agent::types::{
 use caudra_agent::{
     BatchProgressEvent, BatchToolEntry, BatchToolStatus, CallStage, CancelToken, DoneReason,
     EventSender, GoalResult, GoalStatus, GoalVerdict, HistorySnapshot, ImageMediaType,
-    McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, SharedBuf,
-    SubagentActivity, SubagentProgress, TaskProvenance, TextOutput, ToolAccounting, ToolDoneEvent,
-    ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    McpConfigErrors, McpPromptInfo, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader,
+    SharedBuf, SubagentActivity, SubagentProgress, TaskProvenance, TextOutput, ToolAccounting,
+    ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
 use caudra_config::decisions::{DecisionEndpoint, DecisionProtocol, DecisionsConfig};
 use caudra_config::sandbox::SandboxName;

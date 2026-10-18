@@ -115,7 +115,7 @@ impl FormElicitor {
             message: request.message,
         };
         match request.mode {
-            ElicitMode::Url { url } => self.open(&asked, url).await,
+            ElicitMode::Url { url, .. } => self.open(&asked, url).await,
             ElicitMode::Form { schema } => match ElicitForm::parse(&schema) {
                 Ok(form) => self.fill(&asked, &form).await,
                 Err(error) => {
@@ -472,7 +472,10 @@ cat >/dev/null
     }
 
     fn url() -> ElicitMode {
-        ElicitMode::Url { url: URL.into() }
+        ElicitMode::Url {
+            url: URL.into(),
+            elicitation_id: None,
+        }
     }
 
     fn content(field: &str, value: Value) -> Option<Map<String, Value>> {

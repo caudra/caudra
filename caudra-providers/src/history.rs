@@ -231,7 +231,16 @@ impl HistoryItemKind {
 /// Expands one provider-facing message into parent-linked atomic items sharing
 /// a newly generated group id.
 pub fn expand_message(message: &Message, parent_id: Option<CaudraId>) -> Vec<HistoryItem> {
-    let group_id = CaudraId::generate();
+    expand_message_in(message, parent_id, CaudraId::generate())
+}
+
+/// [`expand_message`] into `group_id`, for a message whose id was announced
+/// before it was complete.
+pub fn expand_message_in(
+    message: &Message,
+    parent_id: Option<CaudraId>,
+    group_id: CaudraId,
+) -> Vec<HistoryItem> {
     let kinds = match message.role {
         Role::User => expand_user_message(message),
         Role::Assistant => expand_assistant_message(message),

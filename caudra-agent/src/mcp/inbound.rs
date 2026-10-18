@@ -172,6 +172,7 @@ impl ElicitParams {
             },
             Some(URL_MODE) => ElicitMode::Url {
                 url: self.url.ok_or_else(|| invalid(MISSING_URL))?,
+                elicitation_id: self.elicitation_id,
             },
             Some(other) => return Err(invalid(&format!("{UNSUPPORTED_MODE} {other}"))),
         };
@@ -425,6 +426,13 @@ impl Inbound {
         completed.push_back(id.to_owned());
         drop(completed);
         self.completion.notify(usize::MAX);
+        let scopes: Vec<CallScope> = lock(&self.calls)
+            .iter()
+            .map(|(_, route)| route.scope.clone())
+            .collect();
+        for scope in scopes {
+            scope.url_completed(&self.server, id);
+        }
     }
 }
 

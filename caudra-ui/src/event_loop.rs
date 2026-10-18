@@ -372,7 +372,9 @@ impl RunNotificationState {
                 match reason {
                     DoneReason::EndTurn => Some(PaneState::Done),
                     DoneReason::Cancelled => None,
-                    DoneReason::MaxTurns | DoneReason::MaxTokens => Some(PaneState::Error),
+                    DoneReason::MaxTurns | DoneReason::MaxTokens | DoneReason::Refusal => {
+                        Some(PaneState::Error)
+                    }
                 },
             ),
             AgentEvent::Error { .. } => {

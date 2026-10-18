@@ -56,7 +56,7 @@ In shell `auto` mode, omitted `timeoutSec` uses Workcell's 120-second default. W
 
 Tool descriptions, instructions, and task arguments follow the effective policy. A `batch` still waits for calls that use synchronous execution. With task `auto`, each task that should return early needs its own `background: true`.
 
-One-shot `--print` and ACP resolve `auto` to synchronous execution. Strict `async` withholds the affected tool and rejects stale calls. Use `sync` or `auto` there, or switch to the TUI or persistent stream-JSON SDK.
+One-shot `--print` resolves `auto` to synchronous execution. Strict `async` withholds the affected tool and rejects stale calls. Use `sync` or `auto` there, or switch to the TUI, [ACP](/docs/acp/#subagents-and-background-tasks), or the persistent stream-JSON SDK.
 
 ### Results and continuation
 

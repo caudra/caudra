@@ -117,7 +117,7 @@ echo '{"type":"user","message":{"content":"explain this repo"}}' \
 
 Persistent stream-JSON sessions support [background tasks and shell jobs](/docs/sessions/#background-tasks). The `init` message advertises `background_jobs`, `background_tasks`, `background_shell`, `job_kinds`, and `task_controls`. The `task_execution` and `shell_execution` objects include configured and effective policies. `shell_execution.async_threshold_secs` gives the requested-timeout threshold.
 
-One-shot `--print`, including `--output-format stream-json` without stream input, and ACP resolve `auto` to synchronous execution. Strict `async` has no effective policy there: the affected tool is withheld and stale calls fail with an actionable error. See [execution policies](/docs/sessions/#execution-policies) for defaults and timeout boundaries.
+One-shot `--print`, including `--output-format stream-json` without stream input, resolves `auto` to synchronous execution. Strict `async` has no effective policy there: the affected tool is withheld and stale calls fail with an actionable error. See [execution policies](/docs/sessions/#execution-policies) for defaults and timeout boundaries.
 
 Task controls use the same `control_request` envelope as workflow controls:
 

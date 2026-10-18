@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -27,9 +26,9 @@ use caudra_providers::model::{Billing, Model, ModelPurpose};
 use caudra_providers::pricing::settle_session;
 use caudra_providers::provider::{self, Provider};
 use caudra_providers::{
-    AutomationEventOrigin, AutopilotMessageKind, AutopilotOrigin, CacheKey, HistoryItem,
-    HistoryItemKind, Message, TokenUsage, WorkflowEventOrigin, active_history_items,
-    merge_history_items, resolve_history_head, transcript_history_items,
+    AutomationEventOrigin, AutopilotMessageKind, AutopilotOrigin, CacheKey, HistoryItem, Message,
+    TokenUsage, WorkflowEventOrigin, active_history_items, merge_history_items,
+    resolve_history_head, transcript_history_items,
 };
 #[cfg(test)]
 use caudra_providers::{ContentBlock, Role};
@@ -88,6 +87,7 @@ use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::code::CodeSession;
 use crate::commits;
 use crate::mcp::elicitor::ElicitorFactory;
+use crate::mcp::prompt_preamble;
 use crate::memory::baseline::{MemoryBaseline, open_store as open_memory_store};
 use crate::memory::compactor::{Ledger, Pump};
 use crate::mentions;
@@ -96,6 +96,7 @@ use crate::permissions::editor::{PermissionEditError, PermissionPublication};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
 use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile};
+use crate::session_fork::ReachableTasks;
 use crate::template;
 use crate::tools::native::plan::{self, PlanTarget, PlanWriteResult};
 use crate::tools::{
@@ -109,10 +110,11 @@ use crate::types::{
 use crate::workflow::{RuntimeDeps, WorkflowHandle, WorkflowRuntime, WorkspaceRebind};
 use crate::{
     Agent, AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
-    DoneReason, Envelope, EventSender, ExtractedCommand, GoalHandle, ImageSource, InterruptSource,
-    McpHandle, McpSession, PermissionsConfig, SessionMailbox, StoredSession,
-    SubagentHistorySnapshot, SubagentHistoryStore, ThinkingConfig, ToolOutput, ToolOutputLines,
-    open_stored_session,
+    BackgroundReminderContext, DoneReason, Envelope, EventSender, ExtractedCommand, GoalHandle,
+    ImageSource, InterruptSource, McpHandle, McpSession, PermissionsConfig, SessionMailbox,
+    SteeringQueue, SteeringQueueReceiver, StoredSession, SubagentHistorySnapshot,
+    SubagentHistoryStore, ThinkingConfig, ToolOutput, ToolOutputLines, open_stored_session,
+    steering_queue,
 };
 
 /// Bytes of a run's report or result carried into the next prompt.
@@ -305,51 +307,27 @@ impl SessionStore {
                 warn!(%error, "failed to resolve active history for subagent restoration");
                 Vec::new()
             });
-        let mut reachable = reachable_subagent_ids(&active_history, &session);
-        let mut versions =
-            crate::active_task_history_versions_with_outputs(&active_history, |call_id| {
-                session.tool_outputs().get(call_id).map(Arc::as_ref)
-            });
-        reachable.extend(versions.keys().cloned());
-        for subagent in session.subagents() {
-            if reachable.contains(&subagent.tool_use_id)
-                && !versions.contains_key(&subagent.tool_use_id)
-                && let Some(version_id) = &subagent.parent_tool_use_id
-                && session.subagent_messages().contains_key(version_id)
-            {
-                versions.insert(subagent.tool_use_id.clone(), version_id.clone());
-            }
-        }
-        let version_ids: HashSet<&str> = versions
-            .iter()
-            .filter_map(|(task_id, version_id)| {
-                (task_id != version_id && session.subagent_messages().contains_key(version_id))
-                    .then_some(version_id.as_str())
-            })
-            .collect();
-        let subagent_messages = reachable
-            .iter()
-            .filter(|task_id| !version_ids.contains(task_id.as_str()))
-            .filter_map(|task_id| {
-                let version_id = versions.get(task_id).unwrap_or(task_id);
-                let items = session.subagent_messages().get(version_id)?;
-                match History::restored(items.as_ref().clone()) {
+        let tasks = ReachableTasks::of(&active_history, &session);
+        let subagent_messages = tasks
+            .histories(&session)
+            .filter_map(
+                |(task_id, items)| match History::restored(items.as_ref().clone()) {
                     Ok(history) => Some((task_id.clone(), Arc::new(history.into_vec()))),
                     Err(error) => {
                         warn!(%task_id, %error, "failed to restore subagent history");
                         None
                     }
-                }
-            })
+                },
+            )
             .collect();
         let specs = session
             .subagent_task_specs()
             .iter()
-            .filter(|(task_id, spec)| reachable.contains(*task_id) && !spec.is_version())
+            .filter(|(task_id, spec)| tasks.ids.contains(*task_id) && !spec.is_version())
             .map(|(task_id, spec)| (task_id.clone(), spec.clone()))
             .collect();
         let subagent_history =
-            SubagentHistoryStore::seeded_with_versions(subagent_messages, specs, versions);
+            SubagentHistoryStore::seeded_with_versions(subagent_messages, specs, tasks.versions);
         let persisted_subagent_history = subagent_history.snapshot();
         Self {
             dir,
@@ -642,6 +620,13 @@ impl SessionStore {
         };
     }
 
+    /// The reasoning a turn ran with, as asked rather than as snapped, so a
+    /// resume reopens on the level the user chose.
+    fn set_reasoning(&mut self, thinking: &ThinkingConfig, fast: bool) {
+        self.session.meta.thinking = Some(thinking.clone().into());
+        self.session.meta.fast = fast;
+    }
+
     fn bind_plan(&mut self, plan: PlanTarget) {
         let meta = &mut self.session.meta;
         match plan {
@@ -900,164 +885,6 @@ impl SessionStore {
             _ => return Ok(()),
         }
         self.save()
-    }
-}
-
-fn reachable_subagent_ids(history: &[HistoryItem], session: &StoredSession) -> HashSet<String> {
-    let mut reachable = history_task_ids(history);
-    let mut active_calls = crate::history_tool_call_ids(history);
-    expand_reachable_subagents(&mut reachable, &mut active_calls, session);
-    let legacy_fallback = reachable.is_empty()
-        || history.iter().any(|item| {
-            matches!(
-                &item.kind,
-                HistoryItemKind::AssistantText {
-                    retained_subagent_ids,
-                    is_compaction_summary: true,
-                    ..
-                } if retained_subagent_ids.is_empty()
-            )
-        });
-    reachable.extend(
-        session
-            .subagent_task_specs()
-            .iter()
-            .filter(|(task_id, spec)| {
-                if !spec.is_generic() {
-                    return false;
-                }
-                let descriptor = session
-                    .subagents()
-                    .iter()
-                    .find(|subagent| subagent.tool_use_id == **task_id);
-                descriptor.is_none()
-                    || active_calls.contains(*task_id)
-                    || descriptor
-                        .and_then(|subagent| subagent.root_tool_use_id.as_ref())
-                        .is_some_and(|root| active_calls.contains(root))
-            })
-            .map(|(task_id, _)| task_id.clone()),
-    );
-    if legacy_fallback {
-        reachable.extend(
-            session
-                .subagent_messages()
-                .keys()
-                .filter(|task_id| !session.subagent_task_specs().contains_key(*task_id))
-                .filter(|task_id| {
-                    !session.subagents().iter().any(|subagent| {
-                        subagent.tool_use_id.as_str() != task_id.as_str()
-                            && subagent.parent_tool_use_id.as_ref() == Some(*task_id)
-                    })
-                })
-                .cloned(),
-        );
-    }
-    expand_reachable_subagents(&mut reachable, &mut active_calls, session);
-    reachable
-}
-
-fn expand_reachable_subagents(
-    reachable: &mut HashSet<String>,
-    active_calls: &mut HashSet<String>,
-    session: &StoredSession,
-) {
-    let mut visited = HashSet::new();
-    loop {
-        for subagent in session.subagents() {
-            if subagent
-                .parent_tool_use_id
-                .as_ref()
-                .is_some_and(|parent| reachable.contains(parent) || active_calls.contains(parent))
-                || subagent
-                    .root_tool_use_id
-                    .as_ref()
-                    .is_some_and(|root| active_calls.contains(root))
-            {
-                reachable.insert(subagent.tool_use_id.clone());
-            }
-        }
-        let Some(task_id) = reachable
-            .iter()
-            .find(|task_id| !visited.contains(*task_id))
-            .cloned()
-        else {
-            break;
-        };
-        visited.insert(task_id.clone());
-        if let Some(state) = session
-            .tool_outputs()
-            .get(&task_id)
-            .and_then(|output| output.state())
-        {
-            collect_task_metadata_from_value(state, reachable);
-        }
-        if let Some(nested) = session.subagent_messages().get(&task_id) {
-            reachable.extend(history_task_ids(nested));
-            active_calls.extend(crate::history_tool_call_ids(nested));
-        }
-    }
-}
-
-fn history_task_ids(items: &[HistoryItem]) -> HashSet<String> {
-    let mut ids = HashSet::new();
-    for item in items {
-        match &item.kind {
-            HistoryItemKind::ToolCall { call_id, name, .. }
-                if crate::tools::is_container_tool(name) =>
-            {
-                ids.insert(call_id.clone());
-            }
-            HistoryItemKind::AssistantText {
-                retained_subagent_ids,
-                ..
-            } => ids.extend(retained_subagent_ids.iter().cloned()),
-            _ => {}
-        }
-    }
-    ids
-}
-
-fn collect_task_metadata_from_value(value: &Value, ids: &mut HashSet<String>) {
-    match value {
-        Value::String(text) => collect_task_metadata(text, ids),
-        Value::Array(values) => {
-            for value in values {
-                collect_task_metadata_from_value(value, ids);
-            }
-        }
-        Value::Object(values) => {
-            if let Some(tool) = values.get("tool").and_then(Value::as_str) {
-                if tool == "task" {
-                    if let Some(invocation_id) = values.get("invocation_id").and_then(Value::as_str)
-                    {
-                        ids.insert(invocation_id.to_owned());
-                    }
-                    if let Some(output) = values.get("output").and_then(Value::as_str) {
-                        collect_task_metadata(output, ids);
-                    }
-                }
-                return;
-            }
-            for value in values.values() {
-                collect_task_metadata_from_value(value, ids);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_task_metadata(content: &str, ids: &mut HashSet<String>) {
-    for block in content.split("<task_metadata>").skip(1) {
-        let Some(metadata) = block.split("</task_metadata>").next() else {
-            continue;
-        };
-        if let Some(task_id) = metadata
-            .lines()
-            .find_map(|line| line.trim().strip_prefix("task_id: "))
-        {
-            ids.insert(task_id.to_owned());
-        }
     }
 }
 
@@ -1494,6 +1321,7 @@ fn setup(
     model: &Model,
     config: &AgentConfig,
     excluded_tools: &[&'static str],
+    registry: &ToolRegistry,
     workflows_available: bool,
     task: TaskDescriptionContext<'_>,
     remote_environment: Option<&RemoteEnvironment>,
@@ -1515,7 +1343,7 @@ fn setup(
         model,
         config,
         excluded_tools,
-        ToolRegistry::global(),
+        registry,
         workflows_available,
         task,
     );
@@ -1614,7 +1442,7 @@ fn tool_definitions(
 fn advertised_tool_names(
     tools: &Value,
     deferred: &[DeferredTool],
-    local_search_binding: bool,
+    search_bound: bool,
 ) -> Vec<String> {
     let mut probe = tools.clone();
     let sections: Vec<String> = DeferralSession::new(deferred.to_vec(), std::iter::empty())
@@ -1622,15 +1450,12 @@ fn advertised_tool_names(
         .extend_declared(&mut probe)
         .into_iter()
         .collect();
-    crate::tools::deferral::push_unbound_catalog(
-        &mut probe,
-        &sections,
-        local_search_binding || ToolRegistry::global().has(crate::tools::TOOL_SEARCH_TOOL_NAME),
-    );
+    crate::tools::deferral::push_unbound_catalog(&mut probe, &sections, search_bound);
     extract_tool_names(&probe)
 }
 
 pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveStartError> {
+    let registry = ToolRegistry::global_arc();
     let profile_tool_policy = Arc::new(
         params
             .system_prompt_profile
@@ -1639,12 +1464,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
             .unwrap_or_default(),
     );
     profile_tool_policy
-        .validate_bindings(
-            ToolRegistry::global()
-                .iter()
-                .iter()
-                .map(|entry| entry.name()),
-        )
+        .validate_bindings(registry.iter().iter().map(|entry| entry.name()))
         .map_err(InteractiveStartError)?;
     let tool_ceiling = ToolFilter::ceiling_from_config(&params.config, &params.excluded_tools);
     let peer_host = if params.workspace_session.is_some() || params.host_cwd.is_some() {
@@ -1682,6 +1502,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
         &params.model,
         &params.config,
         &params.excluded_tools,
+        registry,
         false,
         TaskDescriptionContext {
             profile: params.system_prompt_profile.as_deref(),
@@ -1733,7 +1554,11 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
             .with_disabled_tools(&params.config.disabled_tools)
             .with_actor_policy(Arc::clone(&profile_tool_policy))
     });
-    let tool_names = advertised_tool_names(&tools, &deferred, false);
+    let tool_names = advertised_tool_names(
+        &tools,
+        &deferred,
+        registry.has(crate::tools::TOOL_SEARCH_TOOL_NAME),
+    );
     let memory_store = memory.store().cloned();
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
@@ -1860,7 +1685,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                     active_prompt_profile_name: Some(active_prompt_profile_name),
                     subagent_cancels: Arc::new(CancelMap::new()),
                     subagent_history: SubagentHistoryStore::default(),
-                    registry: Arc::clone(ToolRegistry::global_arc()),
+                    registry: Arc::clone(registry),
                     audience: ToolAudience::MAIN,
                     tool_filter,
                     tool_ceiling,
@@ -1973,6 +1798,9 @@ pub struct InteractiveParams {
     pub system_prompt_profile_name: Option<String>,
     pub prompt_profiles: Arc<PromptProfileCatalog>,
     pub excluded_tools: Vec<&'static str>,
+    /// The tools this session and every agent it spawns dispatch to. A host
+    /// running one session per process passes the global registry.
+    pub registry: Arc<ToolRegistry>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
     pub session_id: SessionRef,
@@ -2040,8 +1868,20 @@ pub struct InteractiveHandle {
     pub background: Option<BackgroundTasks>,
     pub tool_names: Vec<String>,
     pub input_tx: flume::Sender<AgentInput>,
+    /// The prompts no run has taken yet, which a host withdraws to cancel them
+    /// before they start.
+    pub pending_inputs: PendingInputs,
+    /// Steers the running run: it takes what waits here at its next boundary,
+    /// as the TUI's steering queue does. What no run took stays queued.
+    pub steering: SteeringQueue,
+    /// Compacts the conversation between runs, as the TUI's `/compact` does,
+    /// and reports it as one run ending in `Done`.
+    pub compact_tx: flume::Sender<()>,
     pub answer_tx: flume::Sender<String>,
     pub cancel_tx: flume::Sender<()>,
+    /// The session's subagents by task id, so a host can stop one without
+    /// stopping the run that waits on it.
+    pub subagent_cancels: Arc<CancelMap<String>>,
     pub model_tx: flume::Sender<Model>,
     pub model_route: Option<InteractiveModelRoute>,
     /// Stopped by a model change, which leaves the warmed prefix behind.
@@ -2120,18 +1960,52 @@ impl Drop for BackgroundDelivery {
     }
 }
 
+/// The prompts a session's task has not taken yet. Only while the task lives,
+/// so a prompt sent after it ended still fails to send.
+#[derive(Clone, Default)]
+pub struct PendingInputs(Arc<StdMutex<Option<Receiver<AgentInput>>>>);
+
+impl PendingInputs {
+    pub fn new(inputs: Receiver<AgentInput>) -> Self {
+        Self(Arc::new(StdMutex::new(Some(inputs))))
+    }
+
+    /// Takes back every prompt no run has started, and says how many.
+    pub fn withdraw(&self) -> usize {
+        self.lock()
+            .as_ref()
+            .map_or(0, |inputs| inputs.drain().count())
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Option<Receiver<AgentInput>>> {
+        self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+/// Lets go of the session's input queue once its task ends.
+struct ClosePendingInputs(PendingInputs);
+
+impl Drop for ClosePendingInputs {
+    fn drop(&mut self) {
+        self.0.lock().take();
+    }
+}
+
 /// The session's prompt queue as a run sees it: a waiting prompt holds back the goal check and
 /// the guide and peer deliveries a run takes. Each prompt starts a run of its own, so a run never
-/// takes one.
-struct QueuedPrompts(Receiver<AgentInput>);
+/// takes one; it takes only what the host steers it with.
+struct QueuedPrompts {
+    prompts: Receiver<AgentInput>,
+    steering: Arc<SteeringQueueReceiver>,
+}
 
 impl InterruptSource for QueuedPrompts {
     fn poll(&self) -> Option<ExtractedCommand> {
-        None
+        self.steering.poll()
     }
 
     fn has_pending_input(&self) -> bool {
-        !self.0.is_empty()
+        !self.prompts.is_empty()
     }
 }
 
@@ -2382,7 +2256,7 @@ fn routed_mode(route: &Arc<InteractiveModeRoute>, mode: ModeResolver) -> ModeRes
 }
 
 /// What `event` adds to the session's API spend, in USD; a subscription pays for the rest.
-fn billed_cost(event: &AgentEvent) -> Option<f64> {
+pub fn billed_cost(event: &AgentEvent) -> Option<f64> {
     let (cost, billing) = match event {
         AgentEvent::TurnComplete(turn) => (turn.cost, turn.billing),
         AgentEvent::ModelUsage { cost, billing, .. }
@@ -2872,8 +2746,12 @@ impl InteractiveHandle {
             background: None,
             tool_names: Vec::new(),
             input_tx: flume::unbounded().0,
+            pending_inputs: PendingInputs::default(),
+            steering: steering_queue().0,
+            compact_tx: flume::unbounded().0,
             answer_tx,
             cancel_tx: flume::unbounded().0,
+            subagent_cancels: Arc::default(),
             model_tx: flume::unbounded().0,
             model_route: None,
             cache_warmer: WarmerRef::default(),
@@ -3129,6 +3007,49 @@ impl PreparedInteractive {
     pub fn set_mcp_handle(&mut self, mcp_handle: Option<McpHandle>) {
         self.params.mcp_handle = mcp_handle;
     }
+
+    /// Replaces the provider the model resolved to, so a frontend's tests can
+    /// script the model while the rest of the session runs for real.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
+        self.provider = provider;
+    }
+}
+
+/// The TUI's `/compact` between runs: the conversation's summary replaces its
+/// history, and the goal pays for it. Reports `Compacting`, then `Done`.
+#[allow(clippy::too_many_arguments)]
+async fn compact_conversation(
+    (provider, model): (&Arc<dyn Provider>, &Model),
+    history: &mut History,
+    event_tx: &EventSender,
+    config: &AgentConfig,
+    (timeouts, model_policy): (Timeouts, &ModelPolicy),
+    permissions: &Arc<PermissionManager>,
+    goal: &GoalHandle,
+    session: BackgroundReminderContext<'_>,
+) -> Result<(), AgentError> {
+    let (compact_provider, compact_model) =
+        agent::resolve_compaction_model(provider, model, timeouts, model_policy)?;
+    let extractor = agent::resolve_extractor(config, provider, model, timeouts, model_policy).await;
+    let retention = agent::Retention::new(permissions, goal, history);
+    let spend = agent::compact_with_session(
+        &*compact_provider,
+        &compact_model,
+        history,
+        event_tx,
+        config,
+        extractor.as_ref(),
+        session,
+        retention,
+    )
+    .await?;
+    let cost = compact_model.billed_cost(&spend.usage, false);
+    goal.record_external_usage(spend.usage, cost, compact_model.billing);
+    if let Some(extraction) = spend.extraction {
+        goal.record_external_usage(extraction.usage, extraction.cost, extraction.billing);
+    }
+    Ok(())
 }
 
 pub async fn prepare_interactive(
@@ -3141,12 +3062,7 @@ pub async fn prepare_interactive(
     if let Some(profile) = &params.system_prompt_profile {
         profile
             .tools()
-            .validate_bindings(
-                ToolRegistry::global()
-                    .iter()
-                    .iter()
-                    .map(|entry| entry.name()),
-            )
+            .validate_bindings(params.registry.iter().iter().map(|entry| entry.name()))
             .map_err(InteractiveStartError)?;
     }
     params
@@ -3256,7 +3172,14 @@ pub async fn spawn_prepared_interactive(
 pub async fn spawn_persistent_interactive(
     params: InteractiveParams,
 ) -> Result<InteractiveHandle, InteractiveStartError> {
-    spawn_prepared_session(prepare_interactive(params).await?, true).await
+    spawn_prepared_persistent_interactive(prepare_interactive(params).await?).await
+}
+
+/// A prepared session that runs background tasks and delivers their outcomes.
+pub async fn spawn_prepared_persistent_interactive(
+    prepared: PreparedInteractive,
+) -> Result<InteractiveHandle, InteractiveStartError> {
+    spawn_prepared_session(prepared, true).await
 }
 
 async fn spawn_prepared_session(
@@ -3287,6 +3210,7 @@ async fn spawn_prepared_session(
         &model,
         &params.config,
         &params.excluded_tools,
+        &params.registry,
         workflows_available,
         TaskDescriptionContext {
             profile: params.system_prompt_profile.as_deref(),
@@ -3337,7 +3261,8 @@ async fn spawn_prepared_session(
         &deferred,
         params
             .local_tools
-            .contains_key(crate::tools::TOOL_SEARCH_TOOL_NAME),
+            .contains_key(crate::tools::TOOL_SEARCH_TOOL_NAME)
+            || params.registry.has(crate::tools::TOOL_SEARCH_TOOL_NAME),
     );
 
     let session_ref = params.session_id.clone();
@@ -3372,6 +3297,10 @@ async fn spawn_prepared_session(
     let (agent_tx, agent_rx) = flume::unbounded::<Envelope>();
     let autopilot_events = agent_tx.downgrade();
     let (input_tx, input_rx) = flume::unbounded::<AgentInput>();
+    let pending_inputs = PendingInputs::new(input_rx.clone());
+    let (steering, steering_rx) = steering_queue();
+    let steering_rx = Arc::new(steering_rx);
+    let (compact_tx, compact_rx) = flume::unbounded::<()>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
@@ -3549,7 +3478,7 @@ async fn spawn_prepared_session(
         active_prompt_profile_name: Some(active_prompt_profile_name),
         subagent_cancels: Arc::new(CancelMap::new()),
         subagent_history,
-        registry: Arc::clone(ToolRegistry::global_arc()),
+        registry: Arc::clone(&params.registry),
         audience: ToolAudience::MAIN,
         tool_filter: tool_filter.clone(),
         tool_ceiling: ToolFilter::ceiling_from_config(&params.config, &params.excluded_tools),
@@ -3646,6 +3575,7 @@ async fn spawn_prepared_session(
         workflow: workflow.clone(),
         ..base
     };
+    let subagent_cancels = Arc::clone(&base.subagent_cancels);
 
     let task = smol::spawn({
         let mode_route = Arc::clone(&mode_route);
@@ -3658,7 +3588,9 @@ async fn spawn_prepared_session(
         let automations = automations.clone();
         let autopilot = autopilot.clone();
         let autopilot_events = autopilot_events.clone();
+        let pending_inputs = pending_inputs.clone();
         async move {
+            let _pending_inputs = ClosePendingInputs(pending_inputs);
             let event_forwarder = smol::spawn({
                 let store = Arc::clone(&store);
                 let raw_tx = raw_tx.clone();
@@ -3757,6 +3689,7 @@ async fn spawn_prepared_session(
                 }
                 enum NextInput {
                     Prompt(Box<Result<AgentInput, flume::RecvError>>),
+                    Compact,
                     Workspace(Box<Result<WorkspaceChangeRequest, flume::RecvError>>),
                     Stop,
                     Background,
@@ -3865,57 +3798,65 @@ async fn spawn_prepared_session(
                             async { NextInput::Prompt(Box::new(input_rx.recv_async().await)) },
                             futures_lite::future::or(
                                 async {
-                                    NextInput::Workspace(Box::new(
-                                        workspace_change_rx.recv_async().await,
-                                    ))
+                                    if compact_rx.recv_async().await.is_err() {
+                                        futures_lite::future::pending::<()>().await;
+                                    }
+                                    NextInput::Compact
                                 },
                                 futures_lite::future::or(
                                     async {
-                                        if let Some(background) = &background {
-                                            background.notified().await;
-                                        } else {
-                                            futures_lite::future::pending::<()>().await;
-                                        }
-                                        NextInput::Background
+                                        NextInput::Workspace(Box::new(
+                                            workspace_change_rx.recv_async().await,
+                                        ))
                                     },
                                     futures_lite::future::or(
                                         async {
-                                            if !background_enabled {
+                                            if let Some(background) = &background {
+                                                background.notified().await;
+                                            } else {
                                                 futures_lite::future::pending::<()>().await;
                                             }
-                                            if workflow_wake_rx.recv_async().await.is_err() {
-                                                futures_lite::future::pending::<()>().await;
-                                            }
-                                            NextInput::Workflow
+                                            NextInput::Background
                                         },
                                         futures_lite::future::or(
                                             async {
-                                                until_due(
-                                                    || {
-                                                        implement_due()
-                                                            || ((background_enabled
-                                                                || resumed_checkin)
-                                                                && checkin_due())
-                                                    },
-                                                    &goal_deferral,
-                                                    &goal,
-                                                    background.as_ref(),
-                                                    &base.subagent_cancels,
-                                                )
-                                                .await;
-                                                if implement_due() {
-                                                    NextInput::Implement
-                                                } else {
-                                                    NextInput::GoalCheckin
+                                                if !background_enabled {
+                                                    futures_lite::future::pending::<()>().await;
                                                 }
+                                                if workflow_wake_rx.recv_async().await.is_err() {
+                                                    futures_lite::future::pending::<()>().await;
+                                                }
+                                                NextInput::Workflow
                                             },
-                                            async {
-                                                let Some(automations) = &automations else {
-                                                    return futures_lite::future::pending().await;
-                                                };
-                                                // Runtime news, or blockers the runtime has not
-                                                // heard.
-                                                futures_lite::future::or(
+                                            futures_lite::future::or(
+                                                async {
+                                                    until_due(
+                                                        || {
+                                                            implement_due()
+                                                                || ((background_enabled
+                                                                    || resumed_checkin)
+                                                                    && checkin_due())
+                                                        },
+                                                        &goal_deferral,
+                                                        &goal,
+                                                        background.as_ref(),
+                                                        &base.subagent_cancels,
+                                                    )
+                                                    .await;
+                                                    if implement_due() {
+                                                        NextInput::Implement
+                                                    } else {
+                                                        NextInput::GoalCheckin
+                                                    }
+                                                },
+                                                async {
+                                                    let Some(automations) = &automations else {
+                                                        return futures_lite::future::pending()
+                                                            .await;
+                                                    };
+                                                    // Runtime news, or blockers the runtime has not
+                                                    // heard.
+                                                    futures_lite::future::or(
                                                     async {
                                                         if automation_wake_rx
                                                             .recv_async()
@@ -3939,8 +3880,9 @@ async fn spawn_prepared_session(
                                                     ),
                                                 )
                                                 .await;
-                                                NextInput::Automation
-                                            },
+                                                    NextInput::Automation
+                                                },
+                                            ),
                                         ),
                                     ),
                                 ),
@@ -3989,6 +3931,41 @@ async fn spawn_prepared_session(
                         mode_route.control_epoch.fetch_add(1, Ordering::AcqRel);
                         goal.end_wait();
                         stop_session_work(background.as_ref(), workflow.as_ref()).await;
+                        continue;
+                    }
+                    NextInput::Compact => {
+                        let event_tx = EventSender::new(agent_tx.clone(), run_id);
+                        run_id += 1;
+                        let compacted = compact_conversation(
+                            (&provider, &model),
+                            &mut history,
+                            &event_tx,
+                            &params.config,
+                            (params.timeouts, &params.model_policy),
+                            &permissions,
+                            &goal,
+                            BackgroundReminderContext {
+                                background: background.as_ref(),
+                                jobs: None,
+                                workflow: workflow.as_ref(),
+                            },
+                        )
+                        .await;
+                        if let Err(error) = compacted {
+                            error!(%error, "compaction failed");
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: error.user_message(),
+                            });
+                            continue;
+                        }
+                        if let Some(store) = &mut *store.lock().await
+                            && let Err(error) =
+                                store.record_turn(&history, model.spec(), &permissions)
+                        {
+                            let _ = event_tx.send(AgentEvent::Error {
+                                message: format!("{PERSIST_FAILED}: {error}"),
+                            });
+                        }
                         continue;
                     }
                     NextInput::Background | NextInput::Workflow => {
@@ -4300,6 +4277,7 @@ async fn spawn_prepared_session(
                     automations.run_started(run_id, started_by, &title, &goal);
                 }
                 let input_mode = input.mode.clone();
+                let input_reasoning = (input.thinking.clone(), input.fast);
                 let session_plan = input.session_plan();
                 let (trigger, cancel) = CancelToken::new();
                 *mode_route
@@ -4478,12 +4456,29 @@ async fn spawn_prepared_session(
                         continue;
                     }
                 };
+                if let Some(prompt) = &input.prompt {
+                    match prompt_preamble(mcp.as_deref(), prompt, turn_model.supports_vision())
+                        .await
+                    {
+                        Ok(messages) => input.preamble.extend(messages),
+                        Err(e) => {
+                            error!(error = %e, "failed to expand MCP prompt");
+                            let _ = error_tx.send(AgentEvent::Error {
+                                message: e.user_message(),
+                            });
+                            cancel_task.cancel().await;
+                            stop_session_work(background.as_ref(), workflow.as_ref()).await;
+                            run_id += 1;
+                            continue;
+                        }
+                    }
+                }
                 let mut definitions = tool_definitions(
                     &vars,
                     &turn_model,
                     &params.config,
                     &params.excluded_tools,
-                    ToolRegistry::global(),
+                    &params.registry,
                     workflows_available,
                     TaskDescriptionContext {
                         profile: params.system_prompt_profile.as_deref(),
@@ -4611,7 +4606,10 @@ async fn spawn_prepared_session(
                 .with_cancel(cancel.clone())
                 .with_local_tools(Arc::clone(&params.local_tools))
                 .with_goal(goal.clone())
-                .with_interrupt_source(Arc::new(QueuedPrompts(input_rx.clone())))
+                .with_interrupt_source(Arc::new(QueuedPrompts {
+                    prompts: input_rx.clone(),
+                    steering: Arc::clone(&steering_rx),
+                }))
                 .with_mcp(turn_mcp)
                 .with_code(code.clone())
                 .with_home_model(home_model.clone())
@@ -4650,6 +4648,7 @@ async fn spawn_prepared_session(
                 let mut persisted = false;
                 if let Some(store) = &mut *store.lock().await {
                     store.set_mode(&input_mode);
+                    store.set_reasoning(&input_reasoning.0, input_reasoning.1);
                     if let Some(plan) = session_plan {
                         store.bind_plan(plan);
                     }
@@ -4743,8 +4742,12 @@ async fn spawn_prepared_session(
         background,
         tool_names,
         input_tx,
+        pending_inputs,
+        steering,
+        compact_tx,
         answer_tx,
         cancel_tx,
+        subagent_cancels,
         model_tx,
         model_route,
         cache_warmer: warmer_ref,
@@ -4966,8 +4969,8 @@ mod tests {
     use caudra_automation::snapshot::{ArmOrigin, FiringStatus, FiringSummary, WaitReason};
     use caudra_config::decisions::FeatureMode;
     use caudra_providers::{
-        AgentError, ProviderEvent, RequestOptions, StandingReminderKind, StopReason,
-        StreamResponse, TaskEventOrigin,
+        AgentError, HistoryItemKind, ProviderEvent, RequestOptions, StandingReminderKind,
+        StopReason, StreamResponse, TaskEventOrigin,
     };
     use caudra_storage::autopilot::{AutopilotBudget, StoredAutopilot};
     use caudra_storage::background::TaskRecord;
@@ -4999,7 +5002,7 @@ mod tests {
     use crate::remote_project_context::tests::AssetService;
     use crate::tools::native::plan::{self, PlanTarget, PlanWriteResult};
     use crate::tools::registry::BoxFuture;
-    use crate::tools::test_support::stub_ctx_with;
+    use crate::tools::test_support::{MOCK_TOOL_OUTPUT, NamedMock, stub_ctx_with};
     use crate::tools::{PermissionScopes, TODOWRITE_TOOL_NAME};
     #[cfg(unix)]
     use crate::types::ToolDoneEvent;
@@ -6208,80 +6211,6 @@ mod tests {
     }
 
     #[test]
-    fn batch_state_accepts_task_metadata_only_from_task_children() {
-        let metadata =
-            |task_id: &str| format!("<task_metadata>\ntask_id: {task_id}\n</task_metadata>");
-        let mut ids = HashSet::new();
-
-        collect_task_metadata_from_value(
-            &serde_json::json!([
-                { "tool": "task", "output": metadata("real-task") },
-                { "tool": "bash", "output": metadata("forged-task") },
-            ]),
-            &mut ids,
-        );
-
-        assert!(ids.contains("real-task"));
-        assert!(!ids.contains("forged-task"));
-    }
-
-    #[test]
-    fn reachability_follows_nested_generic_session_parents() {
-        let tool_call = |id: &str| {
-            History::new(vec![Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::tool_use(
-                    id,
-                    "custom_session_tool",
-                    serde_json::json!({}),
-                )],
-                ..Default::default()
-            }])
-            .into_items()
-        };
-        let main = tool_call("generic-root");
-        let mut session = StoredSession::new(MODEL_SPEC, CWD);
-        session.replace_messages(main.clone());
-        session.set_subagent_history(
-            "generic-root".into(),
-            tool_call("generic-nested"),
-            Some(crate::SubagentTaskSpec::generic()),
-        );
-        session.set_subagent_history(
-            "generic-nested".into(),
-            Vec::new(),
-            Some(crate::SubagentTaskSpec::generic()),
-        );
-        session.set_subagents(vec![
-            StoredSubagent {
-                tool_use_id: "generic-root".into(),
-                parent_tool_use_id: Some("generic-root".into()),
-                root_tool_use_id: Some("generic-root".into()),
-                name: "root".into(),
-                model: None,
-                thinking: None,
-                fast: false,
-                outcome: StoredSubagentOutcome::Unknown,
-            },
-            StoredSubagent {
-                tool_use_id: "generic-nested".into(),
-                parent_tool_use_id: Some("generic-nested".into()),
-                root_tool_use_id: Some("generic-root".into()),
-                name: "nested".into(),
-                model: None,
-                thinking: None,
-                fast: false,
-                outcome: StoredSubagentOutcome::Unknown,
-            },
-        ]);
-
-        let reachable = reachable_subagent_ids(&main, &session);
-
-        assert!(reachable.contains("generic-root"));
-        assert!(reachable.contains("generic-nested"));
-    }
-
-    #[test]
     fn record_turn_persists_continuation_version() {
         let tmp = TempDir::new().unwrap();
         let mut store = store_in(&tmp);
@@ -6548,6 +6477,7 @@ complete(#{ report: first.output });
         /// The checkout a local session's plan lives in, which is otherwise the test's own
         /// working directory.
         host_cwd: Option<PathBuf>,
+        registry: Arc<ToolRegistry>,
     }
 
     impl WorkflowSession {
@@ -6577,6 +6507,7 @@ complete(#{ report: first.output });
                 features: FeatureFlags::all(),
                 local_documents: None,
                 host_cwd: None,
+                registry: Arc::new(ToolRegistry::default()),
                 _temp: temp,
             }
         }
@@ -6663,6 +6594,7 @@ complete(#{ report: first.output });
                 system_prompt_profile_name: None,
                 prompt_profiles: Arc::new(PromptProfileCatalog::default()),
                 excluded_tools: Vec::new(),
+                registry: Arc::clone(&self.registry),
                 mcp_handle: None,
                 initial_wd: cwd.clone(),
                 session_id: SessionRef::from(session_id()),
@@ -7462,8 +7394,8 @@ complete(#{ report: first.output });
         const PLAN_CALL: &str = "plan-read";
         const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
         smol::block_on(async {
-            crate::tools::native::register(ToolRegistry::global(), FeatureFlags::all()).unwrap();
             let mut session = WorkflowSession::new(false);
+            crate::tools::native::register(&session.registry, FeatureFlags::all()).unwrap();
             std::fs::set_permissions(
                 session.state_dir.persistent_path(),
                 Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
@@ -7545,6 +7477,68 @@ complete(#{ report: first.output });
                 stored.meta.plan_target,
                 planned.then_some(StoredPlanTarget::PlanRef { reference })
             );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test_case(true; "its_own_registry_runs_the_tool")]
+    #[test_case(false; "another_registry_is_never_consulted")]
+    fn a_session_dispatches_only_to_its_own_registry(own: bool) {
+        const SESSION_TOOL: &str = "session_scoped";
+        const SESSION_CALL: &str = "session-call";
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let other = Arc::new(ToolRegistry::default());
+            let holder = if own { &session.registry } else { &other };
+            holder
+                .register(
+                    Arc::new(NamedMock::new(SESSION_TOOL, ToolAudience::MAIN)),
+                    NamedMock::source(),
+                )
+                .unwrap();
+            let handle = session.spawn(false).await;
+            assert_eq!(
+                handle.tool_names.iter().any(|name| name == SESSION_TOOL),
+                own
+            );
+            let (responses, rx) = flume::unbounded();
+            *session.provider.responses.lock().unwrap() = Some(rx);
+            for (content, stop_reason) in [
+                (
+                    ContentBlock::tool_use(SESSION_CALL, SESSION_TOOL, serde_json::json!({})),
+                    StopReason::ToolUse,
+                ),
+                (
+                    ContentBlock::Text {
+                        text: ANSWER.into(),
+                    },
+                    StopReason::EndTurn,
+                ),
+            ] {
+                responses
+                    .send(StreamResponse {
+                        message: Message {
+                            role: Role::Assistant,
+                            content: vec![content],
+                            ..Default::default()
+                        },
+                        stop_reason: Some(stop_reason),
+                        ..Default::default()
+                    })
+                    .unwrap();
+            }
+            handle.input_tx.send(prompt(PROMPT)).unwrap();
+            let done = tool_done(&handle.event_rx, SESSION_CALL).await;
+            assert_eq!(done.is_error, !own, "{:?}", done.output);
+            assert_eq!(
+                done.output.as_text().contains(MOCK_TOOL_OUTPUT),
+                own,
+                "{:?}",
+                done.output
+            );
+            wait_for_turn(&handle.event_rx).await;
+            shutdown_interactive(handle).await;
+            assert!(!ToolRegistry::global().has(SESSION_TOOL));
         });
     }
 
@@ -9440,8 +9434,8 @@ complete(#{ report: first.output });
     #[test]
     fn the_plan_autopilot_chose_runs_in_build_mode_under_its_implement_message() {
         smol::block_on(async {
-            crate::tools::native::register(ToolRegistry::global(), FeatureFlags::all()).unwrap();
             let mut session = WorkflowSession::new(false);
+            crate::tools::native::register(&session.registry, FeatureFlags::all()).unwrap();
             session.host_cwd = Some(session.project.clone());
             for private in [session.state_dir.persistent_path(), &session.project] {
                 std::fs::set_permissions(private, Permissions::from_mode(PRIVATE_DIRECTORY_MODE))

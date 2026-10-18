@@ -358,6 +358,8 @@ impl Chat {
             | AgentEvent::SessionTitle { .. }
             | AgentEvent::MemoryChanged
             | AgentEvent::QuestionClosed
+            | AgentEvent::MessageStarted { .. }
+            | AgentEvent::SubagentFinished { .. }
             | AgentEvent::Autopilot(_) => {}
             AgentEvent::Decision(note) => {
                 if self.show_decisions {

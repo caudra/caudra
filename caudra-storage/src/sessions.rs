@@ -761,6 +761,16 @@ pub struct SessionLocation {
     pub write_version: i64,
 }
 
+/// One row of a paged listing of local sessions, newest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionListing {
+    pub id: CaudraId,
+    pub title: String,
+    pub cwd: String,
+    pub model: String,
+    pub updated_at: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRelocation {
     pub sessions: Vec<SessionLocation>,

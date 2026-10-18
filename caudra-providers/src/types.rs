@@ -1037,6 +1037,8 @@ pub enum StopReason {
     EndTurn,
     ToolUse,
     MaxTokens,
+    /// The provider declined to answer, or a content filter stopped the answer.
+    Refusal,
 }
 
 impl StopReason {
@@ -1045,6 +1047,7 @@ impl StopReason {
             "end_turn" => Self::EndTurn,
             "tool_use" => Self::ToolUse,
             "max_tokens" => Self::MaxTokens,
+            "refusal" => Self::Refusal,
             _ => Self::EndTurn,
         }
     }
@@ -1054,7 +1057,16 @@ impl StopReason {
             "stop" => Self::EndTurn,
             "tool_calls" => Self::ToolUse,
             "length" => Self::MaxTokens,
+            "content_filter" => Self::Refusal,
             _ => Self::EndTurn,
+        }
+    }
+
+    /// An incomplete Responses API answer, from `incomplete_details.reason`.
+    pub fn from_openai_incomplete(reason: Option<&str>) -> Self {
+        match reason {
+            Some("content_filter") => Self::Refusal,
+            _ => Self::MaxTokens,
         }
     }
 
@@ -1064,10 +1076,7 @@ impl StopReason {
             // Long decode stopped at the per-request cap and the answer is not
             // finished, which is a cut-off reply as far as the turn goes.
             "MAX_TOKENS" | "CONTINUATION" => Self::MaxTokens,
-            "SAFETY" | "RECITATION" => {
-                warn!("Gemini stop reason: {s}, treating as end_turn");
-                Self::EndTurn
-            }
+            "SAFETY" | "RECITATION" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "SPII" => Self::Refusal,
             _ => Self::EndTurn,
         }
     }
@@ -1348,6 +1357,33 @@ impl ThinkingConfig {
             }
             _ => Ok(resolved),
         }
+    }
+
+    /// The reasoning modes a picker offers on `model`, in order: `off` unless
+    /// the model cannot stop reasoning, then its effort ladder. Every frontend
+    /// lists these, so a level means the same thing wherever it is chosen.
+    pub fn choices(model: &Model) -> Vec<Self> {
+        let off = (!model.requires_thinking()).then_some(Self::Off);
+        off.into_iter()
+            .chain(
+                model
+                    .reasoning_options()
+                    .effort_ladder()
+                    .into_iter()
+                    .map(|level| Self::Effort(level.into())),
+            )
+            .collect()
+    }
+
+    /// The choice in `choices` that sends what this setting sends on `model`,
+    /// matched by resolution rather than name: a model that cannot stop
+    /// resolves `off` to its shallowest level, and a budget model resolves
+    /// every level to a token count.
+    pub fn matching_choice<'a>(&self, model: &Model, choices: &'a [Self]) -> Option<&'a Self> {
+        let resolved = self.resolve(model);
+        choices
+            .iter()
+            .find(|choice| choice.resolve(model) == resolved)
     }
 
     /// Anthropic messages API body. Adaptive-thinking models get the native
@@ -1901,6 +1937,7 @@ mod tests {
     #[test_case("end_turn", StopReason::EndTurn   ; "end_turn")]
     #[test_case("tool_use", StopReason::ToolUse   ; "tool_use")]
     #[test_case("max_tokens", StopReason::MaxTokens ; "max_tokens")]
+    #[test_case("refusal", StopReason::Refusal    ; "refusal")]
     #[test_case("unknown", StopReason::EndTurn    ; "unknown_defaults_to_end_turn")]
     fn stop_reason_from_anthropic(input: &str, expected: StopReason) {
         assert_eq!(StopReason::from_anthropic(input), expected);
@@ -1909,9 +1946,17 @@ mod tests {
     #[test_case("stop", StopReason::EndTurn       ; "stop_maps_to_end_turn")]
     #[test_case("tool_calls", StopReason::ToolUse ; "tool_calls_maps_to_tool_use")]
     #[test_case("length", StopReason::MaxTokens   ; "length_maps_to_max_tokens")]
+    #[test_case("content_filter", StopReason::Refusal ; "content_filter_maps_to_refusal")]
     #[test_case("unknown", StopReason::EndTurn    ; "unknown_defaults_to_end_turn")]
     fn stop_reason_from_openai(input: &str, expected: StopReason) {
         assert_eq!(StopReason::from_openai(input), expected);
+    }
+
+    #[test_case(Some("content_filter"), StopReason::Refusal ; "content_filter")]
+    #[test_case(Some("max_output_tokens"), StopReason::MaxTokens ; "max_output_tokens")]
+    #[test_case(None, StopReason::MaxTokens ; "no_reason")]
+    fn stop_reason_from_openai_incomplete(reason: Option<&str>, expected: StopReason) {
+        assert_eq!(StopReason::from_openai_incomplete(reason), expected);
     }
 
     #[test]

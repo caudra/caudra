@@ -770,6 +770,21 @@ pub fn oauth_account(provider: &str) -> Option<AccountCredential> {
     pinned.or_else(|| snapshot.accounts.iter().find_map(oauth))
 }
 
+/// Whether the slug has an account to sign with, as stored and configured
+/// now, without building a provider. A keyless provider always has one. The
+/// error names the `caudra auth login` to run.
+pub fn require_account(provider: &str) -> Result<(), AgentError> {
+    let snapshot = slug_state(provider)?.snapshot();
+    if snapshot
+        .accounts
+        .iter()
+        .any(|slot| slot.credential.is_some())
+    {
+        return Ok(());
+    }
+    Err(no_account_error(provider))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountKind {
     Subscription,
@@ -967,6 +982,7 @@ mod tests {
     use super::*;
 
     const SLUG: &str = "test-provider";
+    const KEYLESS_SLUG: &str = "ollama";
 
     fn spec(env_vars: &[&str], keyless: bool, config_key: Option<&str>) -> CredentialSpec {
         CredentialSpec {
@@ -1068,6 +1084,11 @@ mod tests {
     fn keyless_providers_get_one_account(keyless: bool, expected: Vec<(String, bool)>) {
         let slots = union(SLUG, &spec(&[], keyless, None), &[], Vec::new());
         assert_eq!(names(&slots), expected);
+    }
+
+    #[test]
+    fn a_keyless_provider_always_has_an_account() {
+        assert!(require_account(KEYLESS_SLUG).is_ok());
     }
 
     #[test_case("anthropic:team", "anthropic", "team" ; "pinned")]

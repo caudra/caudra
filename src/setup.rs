@@ -128,6 +128,15 @@ fn from_spec_or_warm_catalog(spec: &str) -> Result<Model, ModelError> {
     }
 }
 
+/// The model an ACP server opens on before any provider is signed in, so an
+/// editor can still connect and offer the sign-in its sessions ask for.
+pub fn signed_out_model(policy: &caudra_config::ModelPolicy) -> Option<Model> {
+    PROVIDER_PRIORITY
+        .iter()
+        .filter_map(|slug| Model::curated_default(slug, ModelPurpose::Best))
+        .find(|model| policy.allows(&model.spec()))
+}
+
 fn auto_detect_model(policy: &caudra_config::ModelPolicy) -> Option<Model> {
     for purpose in [ModelPurpose::Best, ModelPurpose::Fast] {
         for &slug in PROVIDER_PRIORITY {

@@ -76,7 +76,7 @@ pub fn mcp_request(
                 serde_json::from_value(schema.clone()).map_err(|error| error.to_string())?;
             CreateElicitationRequest::new(ElicitationFormMode::new(scope, schema), message)
         }
-        ElicitMode::Url { url } => CreateElicitationRequest::new(
+        ElicitMode::Url { url, .. } => CreateElicitationRequest::new(
             ElicitationUrlMode::new(scope, ElicitationId::new(elicitation_id), url.clone()),
             message,
         ),
@@ -554,7 +554,10 @@ mod tests {
 
     #[test]
     fn an_mcp_url_is_forwarded_with_an_id_scoped_to_the_call() {
-        let json = mcp_request_json(ElicitMode::Url { url: URL.into() });
+        let json = mcp_request_json(ElicitMode::Url {
+            url: URL.into(),
+            elicitation_id: None,
+        });
 
         assert_eq!(json["mode"], "url");
         assert_eq!(json["url"], URL);

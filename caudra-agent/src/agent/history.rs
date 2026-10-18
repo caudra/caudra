@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use caudra_providers::{
     CaudraId, ContentBlock, HistoryItem, HistoryItemKind, HistoryProjectionError, Message, Role,
-    UserOrigin, expand_message, project_messages,
+    UserOrigin, expand_message, expand_message_in, project_messages,
 };
 use caudra_storage::sessions::next_epoch;
 use tracing::warn;
@@ -160,6 +160,15 @@ impl History {
 
     pub fn push(&mut self, msg: Message) {
         self.extend([msg]);
+    }
+
+    /// Commits `msg` under the group id it was announced with.
+    pub fn push_in(&mut self, msg: Message, group_id: CaudraId) {
+        let items = Arc::make_mut(&mut self.snapshot.messages);
+        let parent_id = items.last().map(|item| item.id);
+        items.extend(expand_message_in(&msg, parent_id, group_id));
+        self.messages.push(msg);
+        self.publish();
     }
 
     pub fn len(&self) -> usize {

@@ -1030,8 +1030,9 @@ mod tests {
     #[test_case("STOP", StopReason::EndTurn ; "stop")]
     #[test_case("MAX_TOKENS", StopReason::MaxTokens ; "max_tokens")]
     #[test_case("CONTINUATION", StopReason::MaxTokens ; "long_decode_stopped_mid_answer")]
-    #[test_case("SAFETY", StopReason::EndTurn ; "safety")]
-    #[test_case("RECITATION", StopReason::EndTurn ; "recitation")]
+    #[test_case("SAFETY", StopReason::Refusal ; "safety")]
+    #[test_case("RECITATION", StopReason::Refusal ; "recitation")]
+    #[test_case("PROHIBITED_CONTENT", StopReason::Refusal ; "prohibited_content")]
     #[test_case("unknown", StopReason::EndTurn ; "unknown")]
     fn stop_reason_from_google(input: &str, expected: StopReason) {
         assert_eq!(StopReason::from_google(input), expected);

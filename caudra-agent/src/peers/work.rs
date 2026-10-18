@@ -385,7 +385,9 @@ fn pause_reason(stage: &Stage, ending: Option<DoneReason>) -> &'static str {
     match (stage, ending) {
         (Stage::Pausing(reason), _) => reason,
         (_, Some(DoneReason::Cancelled)) => PAUSED_BY_CANCEL,
-        (_, Some(DoneReason::EndTurn | DoneReason::MaxTokens)) => COMPLETION_REQUIRED,
+        (_, Some(DoneReason::EndTurn | DoneReason::MaxTokens | DoneReason::Refusal)) => {
+            COMPLETION_REQUIRED
+        }
         (_, Some(DoneReason::MaxTurns)) => TURN_LIMIT,
         (_, None) => TURN_FAILED,
     }
