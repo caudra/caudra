@@ -193,6 +193,11 @@ impl Chat {
         self.task_id = Some(id.into());
     }
 
+    /// Whether decisions from here on get a row; rows already drawn stay.
+    pub(crate) fn set_show_decisions(&mut self, shown: bool) {
+        self.show_decisions = shown;
+    }
+
     /// Grows the instruction this task is being given, before the subagent
     /// that will receive it exists.
     pub(crate) fn prompt_delta(&mut self, text: &str) {

@@ -81,15 +81,31 @@ pub(crate) fn merge_item(
 /// The space before an inline table's closing brace belongs to its last value,
 /// so it moves to whichever value is last after the merge.
 fn merge_inline_table(table: &mut InlineTable, previous: &dyn TableLike, desired: &dyn TableLike) {
+    keeping_closing_space(table, |table| merge_table(table, previous, desired));
+}
+
+fn keeping_closing_space(table: &mut InlineTable, edit: impl FnOnce(&mut InlineTable)) {
     let closing = last_value(table).and_then(|value| {
         let closing = value.decor().suffix().cloned();
         value.decor_mut().set_suffix("");
         closing
     });
-    merge_table(table, previous, desired);
+    edit(table);
     if let (Some(closing), Some(value)) = (closing, last_value(table)) {
         value.decor_mut().set_suffix(closing);
     }
+}
+
+/// [`set_value`] in a table or an inline table, `false` when `item` is neither. An inline
+/// table keeps the space before its closing brace after its last value.
+pub(crate) fn set_item_value(item: &mut Item, key: &str, value: Value) -> bool {
+    if let Some(inline) = item.as_inline_table_mut() {
+        keeping_closing_space(inline, |inline| set_value(inline, key, value));
+        return true;
+    }
+    item.as_table_like_mut()
+        .map(|table| set_value(table, key, value))
+        .is_some()
 }
 
 fn last_value(table: &mut InlineTable) -> Option<&mut Value> {

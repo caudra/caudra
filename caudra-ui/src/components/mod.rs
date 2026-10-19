@@ -105,7 +105,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use caudra_agent::AgentInput;
-use caudra_agent::decisions::NoteOutcome;
+use caudra_agent::decisions::{DecisionFeature, NoteOutcome};
 use caudra_agent::peers::{PeerDecision, PeerReviewToken};
 use caudra_agent::tools::native::plan::PlanTarget;
 use caudra_agent::tools::{SHELL_TOOL_NAME, ToolEffect};
@@ -114,7 +114,7 @@ use caudra_agent::{
     BufferSnapshot, CallStage, ImageSource, SubagentActivity, SubagentProgress, ToolInput,
     ToolOutput,
 };
-use caudra_config::InboundPolicy;
+use caudra_config::{FeatureMode, InboundPolicy};
 use caudra_providers::accounts::Reroute;
 use caudra_providers::copilot_auth::CopilotIdentity;
 use caudra_providers::model_registry::Binding;
@@ -1138,6 +1138,12 @@ pub enum Action {
     /// Makes the named decision endpoint active in every open session, or
     /// turns decisions off for `None`.
     SetDecisionEndpoint(Option<String>),
+    /// Saves `mode` for `feature` in the global `caudra.toml`, which every
+    /// open session then screens with.
+    SetDecisionFeature {
+        feature: DecisionFeature,
+        mode: FeatureMode,
+    },
     RefreshModels,
     RefreshUsage,
     /// A click on the quota's age: the user has seen the retry window and asks

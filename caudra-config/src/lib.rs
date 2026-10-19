@@ -88,10 +88,12 @@ static ENV_FILE_KEYS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 pub mod config_file;
 pub mod config_version;
+pub mod decision_features_file;
 pub mod decisions;
 pub mod example;
 pub mod experimental;
 pub mod files;
+pub mod global_file;
 pub mod interpolation;
 pub mod mcp;
 pub mod own_writes;

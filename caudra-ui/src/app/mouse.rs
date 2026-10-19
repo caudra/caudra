@@ -272,8 +272,7 @@ impl App {
         if self.decisions_modal.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
             let action = self.decisions_modal.handle_mouse(event);
-            self.handle_decisions_action(action);
-            return Vec::new();
+            return self.handle_decisions_action(action);
         }
         if self.skills_modal.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();

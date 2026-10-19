@@ -53,7 +53,10 @@ pub use content::Screening;
 pub use note::{
     DecisionNote, NoteAnchor, NoteDraft, NoteOutcome, NoteSink, counted, placement, score_line,
 };
-pub use permission::{PermissionAction, PermissionDecision, PermissionFlag, PermissionPurpose};
+pub use permission::{
+    PERMISSION_QUESTION_FILE, PermissionAction, PermissionDecision, PermissionFlag,
+    PermissionPurpose,
+};
 pub(crate) use rerank::join_answered;
 pub use rerank::{
     CANDIDATE_KEY, CANDIDATE_TEXT_OMITTED, MAX_CANDIDATE_INPUT_BYTES, MAX_RERANK_BATCH, Relevance,

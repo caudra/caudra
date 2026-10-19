@@ -9,7 +9,7 @@ pub(crate) mod automation;
 pub(crate) mod autopilot;
 pub(crate) mod background_delivery;
 mod btw;
-mod decisions;
+pub(crate) mod decisions;
 mod delegation;
 mod env;
 mod extract;
@@ -2552,8 +2552,7 @@ impl App {
         if self.decisions_modal.is_open() {
             guard_repeat!(false);
             let action = self.decisions_modal.handle_key(key);
-            self.handle_decisions_action(action);
-            return Some(vec![]);
+            return Some(self.handle_decisions_action(action));
         }
 
         if self.skills_modal.is_open() {

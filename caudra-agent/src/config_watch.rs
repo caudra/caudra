@@ -32,6 +32,7 @@ use crate::command::{
     COMMANDS_SUBDIR, GLOBAL_THIRD_PARTY_COMMAND_DIRS, PROJECT_COMMAND_DIRS,
     find_project_ancestor_dirs,
 };
+use crate::decisions::PERMISSION_QUESTION_FILE;
 use crate::prompt::profile::PROFILE_DIR;
 use crate::tools::native::skill::{GLOBAL_SKILL_DIRS, PROJECT_SKILL_DIRS, SKILLS_SUBDIR};
 use crate::workflow::catalog::WORKFLOWS_SUBDIR;
@@ -58,6 +59,7 @@ const GLOBAL_RULES: &[Rule] = &[
     (PERMISSIONS.name, &[ConfigSource::Permissions]),
     (MCP_FILE, &[ConfigSource::Mcp]),
     (PROVIDERS.name, &[ConfigSource::Providers]),
+    (PERMISSION_QUESTION_FILE, &[ConfigSource::DecisionQuestions]),
     (WORKCELL.name, &[ConfigSource::Workcell]),
     (SANDBOX_FILE, &[ConfigSource::Sandboxes]),
     (INIT_LUA_FILE, &[ConfigSource::InitLua]),
@@ -117,6 +119,8 @@ pub enum ConfigSource {
     Permissions,
     Mcp,
     Providers,
+    /// The user-global permission question set override.
+    DecisionQuestions,
     Workcell,
     Sandboxes,
     Skills,
@@ -145,6 +149,7 @@ impl ConfigSource {
             | Self::Permissions
             | Self::Mcp
             | Self::Providers
+            | Self::DecisionQuestions
             | Self::Workcell
             | Self::Sandboxes
             | Self::GlobalEnv
@@ -548,6 +553,7 @@ mod tests {
     };
     use crate::automation::catalog::AUTOMATIONS_SUBDIR;
     use crate::command::{COMMANDS_SUBDIR, GLOBAL_THIRD_PARTY_COMMAND_DIRS, PROJECT_COMMAND_DIRS};
+    use crate::decisions::PERMISSION_QUESTION_FILE;
     use crate::prompt::profile::PROFILE_DIR;
     use crate::tools::native::skill::{GLOBAL_SKILL_DIRS, PROJECT_SKILL_DIRS, SKILLS_SUBDIR};
     use crate::workflow::catalog::WORKFLOWS_SUBDIR;
@@ -672,6 +678,7 @@ mod tests {
     #[test_case(Base::Global, &[PERMISSIONS.name], &[ConfigSource::Permissions]; "global_permissions")]
     #[test_case(Base::Global, &[MCP_FILE], &[ConfigSource::Mcp]; "global_mcp")]
     #[test_case(Base::Global, &[PROVIDERS.name], &[ConfigSource::Providers]; "global_providers")]
+    #[test_case(Base::Global, &[PERMISSION_QUESTION_FILE], &[ConfigSource::DecisionQuestions]; "global_permission_questions")]
     #[test_case(Base::Global, &[WORKCELL.name], &[ConfigSource::Workcell]; "global_workcell")]
     #[test_case(Base::Global, &[SANDBOX_FILE], &[ConfigSource::Sandboxes]; "global_sandboxes")]
     #[test_case(Base::Global, &[INIT_LUA_FILE], &[ConfigSource::InitLua]; "global_init_lua")]
@@ -756,6 +763,7 @@ mod tests {
     #[test_case(ConfigSource::Permissions, &[PERMISSIONS.name, ENV.name], &[PERMISSIONS.name]; "permissions")]
     #[test_case(ConfigSource::Mcp, &[MCP_FILE, ENV.name], &[MCP_FILE]; "mcp")]
     #[test_case(ConfigSource::Providers, &[PROVIDERS.name, ENV.name], &[]; "providers")]
+    #[test_case(ConfigSource::DecisionQuestions, &[PERMISSION_QUESTION_FILE], &[]; "permission_questions")]
     #[test_case(ConfigSource::Workcell, &[WORKCELL.name, ENV.name], &[]; "workcell")]
     #[test_case(ConfigSource::Sandboxes, &[SANDBOX_FILE], &[]; "sandboxes_are_read_literally")]
     #[test_case(ConfigSource::GlobalEnv, &[ENV.name], &[]; "global_env")]

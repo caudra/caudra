@@ -815,7 +815,9 @@ fn write_decisions_section(out: &mut String) {
          `~/.config/caudra/decisions/permission.json`. It must be a regular JSON file no larger \
          than 64 KiB, retain all required question IDs as `noul`, and pass question validation. \
          It is read when a base URL is set and permission advice or Auto screening is enabled. \
-         Projects cannot supply this override. Other feature question sets have no file override.\n\n",
+         Projects cannot supply this override. Other feature question sets have no file override. \
+         While the terminal UI runs, an edit to the file applies at once, and a file that fails \
+         to load keeps the questions in use, see [Hot reload](#hot-reload).\n\n",
     );
 }
 
@@ -914,10 +916,11 @@ While the terminal UI runs, Caudra watches its config files, skill and command d
 
 | What changed | When it applies |
 |--------------|-----------------|
-| `caudra.toml` | `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
+| `caudra.toml` | [`[decisions]`](#decisions) and `ui.show_decisions` at once, in every open session. `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
 | `permissions.toml` | Before the next tool call. |
 | `mcp.toml` | At once. New servers start, even when Caudra started with none. Removed and disabled servers stop, and changed servers restart. The other servers keep running. |
-| `providers.toml` | The next time Caudra reads it, such as when a model list opens. |
+| `providers.toml` | The next time Caudra reads it, such as when a model list opens. An edit to the active [decision endpoint](/docs/providers/#decision-endpoints) applies at once, and removing its table turns decisions off. |
+| `decisions/permission.json` | At once. See [Question overrides](#question-overrides). |
 | Skills | At once. |
 | System prompt profiles | From the next turn. |
 | Custom commands | At once. |

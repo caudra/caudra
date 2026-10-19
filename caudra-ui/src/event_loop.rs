@@ -39,6 +39,7 @@ use caudra_agent::background::BackgroundTransition;
 use caudra_agent::code::runner as code_runner;
 use caudra_agent::command::CustomCommand;
 use caudra_agent::config_watch::ConfigSource;
+use caudra_agent::decisions::{DecisionFeature, Decisions};
 use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::{
     BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile,
@@ -56,11 +57,12 @@ use caudra_agent::{
 };
 use caudra_automation::request::ProfileArming;
 use caudra_automation::snapshot::{AutomationEvent, SettleBlocker};
+use caudra_config::decision_features_file::set_decision_feature_mode;
 use caudra_config::providers::ProvidersConfig;
 use caudra_config::sandbox::SandboxName;
 use caudra_config::{
-    AutomationsConfig, AutopilotConfig, Feature, ModelPolicy, SnapshotsConfig, UiConfig,
-    fail_closed_permissions,
+    AutomationsConfig, AutopilotConfig, Feature, FeatureMode, ModelPolicy, SnapshotsConfig,
+    UiConfig, fail_closed_permissions,
 };
 use caudra_docs::{DocsLibrary, ReleaseNotesSource};
 use caudra_lua::{
@@ -103,6 +105,7 @@ use tracing::{info, warn};
 
 use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
 use crate::app::background_delivery::DeliveryReply;
+use crate::app::decisions::feature_saved;
 use crate::app::file_revert::{self, RecorderSlot};
 use crate::app::permission_editor::{ConversationPermissions, attach_session_permissions};
 use crate::app::shell::{
@@ -146,6 +149,7 @@ use caudra_terminal_host::workspaces::{PaneSite, Workspaces};
 
 /// Max events handled per frame so a flood cannot starve rendering.
 const DRAIN_BUDGET: usize = 256;
+const NO_GLOBAL_CONFIG: &str = "No global config directory to save the decision feature in";
 /// Messages from other sessions wait for the user to let them in.
 const PEER_MESSAGES_BLOCKER: &str = "Peer messages await approval";
 /// How much further one notch of an Alt-held wheel carries.
@@ -4777,6 +4781,9 @@ impl<'t> EventLoop<'t> {
                 self.sessions[idx].app.flash(message);
             }
             Action::SetDecisionEndpoint(name) => self.set_decision_endpoint(idx, name.as_deref()),
+            Action::SetDecisionFeature { feature, mode } => {
+                self.set_decision_feature(idx, &feature, &mode);
+            }
             Action::Compact => {
                 let rt = &mut self.sessions[idx];
                 rt.reset_run_notifications();
@@ -4897,6 +4904,48 @@ impl<'t> EventLoop<'t> {
                 runtime.app.adopt_decisions(&decisions);
             }
         }
+    }
+
+    /// Every open session, and every one opened later, screens with `decisions`.
+    pub(super) fn install_decisions(&mut self, decisions: &Decisions) {
+        self.ctx.permissions.set_decisions(Some(decisions.clone()));
+        for runtime in &self.sessions {
+            runtime.app.adopt_decisions(decisions);
+        }
+    }
+
+    /// Saves `mode` in the global `caudra.toml` and applies it at once, quietly, as
+    /// Caudra's own write. The footer says which mode is in force.
+    fn set_decision_feature(&mut self, idx: usize, feature: &DecisionFeature, mode: &FeatureMode) {
+        let Some(key) = feature.config_key() else {
+            return;
+        };
+        let written = caudra_config::global_config_path()
+            .ok_or_else(|| NO_GLOBAL_CONFIG.to_owned())
+            .and_then(|path| {
+                set_decision_feature_mode(&path, key, mode).map_err(|error| error.to_string())
+            });
+        if let Err(error) = written {
+            warn!(feature = key, mode = mode.as_str(), %error, "decision feature mode not saved");
+            self.sessions[idx].app.flash(error);
+            return;
+        }
+        self.apply_config_changes(BTreeSet::from([ConfigSource::Settings]));
+        let running = self
+            .ctx
+            .permissions
+            .decisions()
+            .map(|decisions| decisions.config().clone())
+            .unwrap_or_default();
+        info!(
+            feature = key,
+            mode = mode.as_str(),
+            in_force = feature.mode(&running.features).as_str(),
+            "decision feature mode saved"
+        );
+        self.sessions[idx]
+            .app
+            .flash(feature_saved(feature, mode, &running));
     }
 
     fn change_model(&mut self, spec: &str) -> Result<(), String> {

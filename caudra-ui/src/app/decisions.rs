@@ -7,12 +7,12 @@ use std::sync::{Arc, LazyLock};
 
 use caudra_agent::automation::clock::{Clock, SystemClock};
 use caudra_agent::decisions::{
-    DecisionNote, Decisions, DecisionsError, endpoint_api_key, resolve_decision_endpoint,
-    stats_thresholds,
+    DecisionFeature, DecisionNote, Decisions, DecisionsError, endpoint_api_key,
+    resolve_decision_endpoint, stats_thresholds,
 };
-use caudra_config::ClockFormat;
 use caudra_config::decisions::{DecisionEndpoint, DecisionThresholds, DecisionsConfig};
 use caudra_config::providers::ProvidersConfig;
+use caudra_config::{ClockFormat, FeatureMode};
 use caudra_storage::StateDir;
 use caudra_storage::decision_log::{DecisionFilter, DecisionLog, DecisionLogError};
 use caudra_storage::decisions::persist_active_decision_endpoint;
@@ -38,6 +38,7 @@ static UNCONFIGURED: LazyLock<DecisionsConfig> = LazyLock::new(DecisionsConfig::
 
 const DECISIONS_OFF: &str = "Decisions off";
 const NO_DECISION_ENDPOINTS: &str = "No decision endpoints configured: add one with /login";
+const NO_FEATURE_MODE: &str = "Runs whenever an endpoint is active; it has no mode to set";
 
 type Scopes = [ScopeActivity; DecisionsScope::ALL.len()];
 
@@ -100,6 +101,45 @@ fn switch_decisions(
     let decisions = Decisions::new(shared.clone().with_endpoint(endpoint), state_dir)?;
     persist_active_decision_endpoint(state_dir, name).map_err(DecisionsError::ActiveRow)?;
     Ok(decisions)
+}
+
+/// A fresh engine for `config`, or `None` when `current` already runs it and nothing asks
+/// to `reread` what the engine loads on its own, such as the permission question override.
+pub(crate) fn rebuilt_decisions(
+    current: Option<&Decisions>,
+    config: DecisionsConfig,
+    reread: bool,
+    state_dir: &StateDir,
+) -> Option<Result<Decisions, DecisionsError>> {
+    let running = current.map_or(&*UNCONFIGURED, Decisions::config);
+    (reread || *running != config).then(|| Decisions::new(config, state_dir))
+}
+
+/// The mode after `current` among `modes`, wrapping; the first when `current` is not one.
+fn next_mode(modes: &[FeatureMode], current: &FeatureMode) -> FeatureMode {
+    let next = modes
+        .iter()
+        .position(|mode| mode == current)
+        .map_or(0, |index| (index + 1) % modes.len());
+    modes.get(next).cloned().unwrap_or_default()
+}
+
+/// What the footer says once `requested` is saved for `feature` and the settings reloaded
+/// into `running`, which a project file can still hold off.
+pub(crate) fn feature_saved(
+    feature: &DecisionFeature,
+    requested: &FeatureMode,
+    running: &DecisionsConfig,
+) -> String {
+    let label = feature.label();
+    match feature.mode(&running.features) {
+        mode if mode == requested => format!("{label}: {}", requested.as_str()),
+        mode => format!(
+            "{label}: saved {}, but {} is in force; the project caudra.toml can turn a feature off",
+            requested.as_str(),
+            mode.as_str()
+        ),
+    }
 }
 
 fn switched(decisions: &Decisions) -> String {
@@ -171,9 +211,26 @@ impl App {
         }
     }
 
+    /// Screens with `decisions` from now on. Content this session already flagged stays
+    /// flagged, so a rebuilt engine never loosens what the session may do.
     pub(crate) fn adopt_decisions(&self, decisions: &Decisions) {
-        self.permissions
-            .set_decisions(Some(decisions.for_session(self.state.session.id)));
+        let adopted = decisions.for_session(self.state.session.id);
+        if self
+            .permissions
+            .decisions()
+            .is_some_and(|current| current.is_tainted())
+        {
+            adopted.mark_tainted();
+        }
+        self.permissions.set_decisions(Some(adopted));
+    }
+
+    /// Decisions from here on get a row in every chat, or none.
+    pub(crate) fn set_show_decisions(&mut self, shown: bool) {
+        self.ui_config.show_decisions = shown;
+        for chat in &mut self.chats {
+            chat.set_show_decisions(shown);
+        }
     }
 
     pub(super) fn execute_decisions(&mut self, args: &str) {
@@ -210,14 +267,48 @@ impl App {
         .detach();
     }
 
-    pub(super) fn handle_decisions_action(&mut self, action: DecisionsAction) {
+    pub(super) fn handle_decisions_action(&mut self, action: DecisionsAction) -> Vec<Action> {
         match action {
             DecisionsAction::Consumed => {}
             DecisionsAction::Close => self.decisions_modal.close(),
             DecisionsAction::Refresh => self.refresh_decisions(),
             DecisionsAction::Copy { text, label } => self.copy_labelled(&text, label),
             DecisionsAction::Flash(message) => self.flash(message.into()),
+            DecisionsAction::CycleFeature(index) => {
+                return self.decision_feature_mode(index, next_mode);
+            }
+            DecisionsAction::PickFeatureMode { feature, mode } => {
+                return self.decision_feature_mode(feature, |_, _| mode);
+            }
         }
+        Vec::new()
+    }
+
+    /// The mode `pick` chooses for the feature from its allowed modes and the one in force,
+    /// for the event loop to save. Picking the mode in force saves nothing.
+    fn decision_feature_mode(
+        &mut self,
+        index: usize,
+        pick: impl FnOnce(&[FeatureMode], &FeatureMode) -> FeatureMode,
+    ) -> Vec<Action> {
+        let Some(feature) = DecisionFeature::ALL.get(index) else {
+            return Vec::new();
+        };
+        let Some(setting) = feature.setting() else {
+            self.flash(NO_FEATURE_MODE.into());
+            return Vec::new();
+        };
+        let decisions = self.permissions.decisions();
+        let config = decisions.as_ref().map_or(&*UNCONFIGURED, Decisions::config);
+        let running = feature.mode(&config.features);
+        let mode = pick(setting.modes, running);
+        if mode == *running || !setting.modes.contains(&mode) {
+            return Vec::new();
+        }
+        vec![Action::SetDecisionFeature {
+            feature: feature.clone(),
+            mode,
+        }]
     }
 
     pub(super) fn view_decisions_modal(&mut self, frame: &mut Frame, area: Rect) -> Rect {
@@ -338,9 +429,9 @@ mod tests {
 
     use arc_swap::ArcSwapOption;
     use async_trait::async_trait;
-    use caudra_agent::decisions::{DecisionContext, DecisionFeature, PermissionPurpose};
+    use caudra_agent::decisions::{DecisionContext, PermissionPurpose};
     use caudra_config::decisions::{
-        DecisionEndpoint, DecisionEndpointDef, DecisionFeatures, DecisionProtocol, FeatureMode,
+        DecisionEndpoint, DecisionEndpointDef, DecisionFeatures, DecisionProtocol,
     };
     use caudra_decision::{DecisionEngine, DecisionError, DecisionRequest, DecisionResponse};
     use caudra_storage::decision_log::{DecisionEffect, DecisionRecord, EndpointKind};
@@ -787,6 +878,133 @@ mod tests {
             &actions[..],
             [Action::SetDecisionEndpoint(picked)] if picked.as_deref() == name
         ));
+    }
+
+    const IN_FORCE_FLASH: &str = "memory_search: enforce";
+    const HELD_OFF_FLASH: &str = "memory_search: saved enforce, but off is in force; the project caudra.toml can turn a feature off";
+
+    fn memory_search(mode: FeatureMode) -> DecisionsConfig {
+        let mut config = DecisionsConfig::default();
+        config.features.memory_search = mode;
+        config
+    }
+
+    #[test_case(FeatureMode::Off, false, false; "unchanged_settings_keep_the_engine")]
+    #[test_case(FeatureMode::Off, true, true; "a_reread_rebuilds_it")]
+    #[test_case(FeatureMode::Enforce, false, true; "changed_settings_rebuild_it")]
+    fn an_engine_is_rebuilt_only_when_something_changed(
+        mode: FeatureMode,
+        reread: bool,
+        rebuilt: bool,
+    ) {
+        let (_tmp, app) = isolated_app();
+        let current = Decisions::new(DecisionsConfig::default(), &app.storage).unwrap();
+
+        let fresh = rebuilt_decisions(
+            Some(&current),
+            memory_search(mode.clone()),
+            reread,
+            &app.storage,
+        );
+
+        assert_eq!(fresh.is_some(), rebuilt);
+        if let Some(fresh) = fresh {
+            assert_eq!(fresh.unwrap().config().features.memory_search, mode);
+        }
+    }
+
+    #[test_case(true; "flagged")]
+    #[test_case(false; "clean")]
+    fn an_adopted_engine_keeps_what_the_session_flagged(tainted: bool) {
+        let (_tmp, app) = isolated_app();
+        let running = Decisions::new(DecisionsConfig::default(), &app.storage).unwrap();
+        app.adopt_decisions(&running);
+        if tainted {
+            app.permissions.decisions().unwrap().mark_tainted();
+        }
+
+        app.adopt_decisions(
+            &Decisions::new(memory_search(FeatureMode::Enforce), &app.storage).unwrap(),
+        );
+
+        let adopted = app.permissions.decisions().unwrap();
+        assert_eq!(adopted.is_tainted(), tainted);
+        assert_eq!(adopted.session(), Some(app.state.session.id));
+        assert_eq!(
+            adopted.config().features.memory_search,
+            FeatureMode::Enforce
+        );
+    }
+
+    #[test_case(FeatureMode::Off, FeatureMode::Shadow; "off_to_shadow")]
+    #[test_case(FeatureMode::Shadow, FeatureMode::Enforce; "shadow_to_enforce")]
+    #[test_case(FeatureMode::Enforce, FeatureMode::Off; "enforce_wraps_to_off")]
+    fn the_feature_cycles_through_its_allowed_modes(running: FeatureMode, next: FeatureMode) {
+        let (_tmp, mut app) = isolated_app();
+        app.adopt_decisions(&Decisions::new(memory_search(running), &app.storage).unwrap());
+        let index = DecisionFeature::ALL
+            .iter()
+            .position(|feature| *feature == DecisionFeature::MemorySearch)
+            .unwrap();
+
+        let actions = app.handle_decisions_action(DecisionsAction::CycleFeature(index));
+
+        assert!(matches!(
+            &actions[..],
+            [Action::SetDecisionFeature { feature: DecisionFeature::MemorySearch, mode }] if *mode == next
+        ));
+    }
+
+    #[test_case(FeatureMode::Shadow, Some(FeatureMode::Enforce); "another_mode_is_saved")]
+    #[test_case(FeatureMode::Enforce, None; "the_mode_in_force_saves_nothing")]
+    fn a_clicked_mode_is_picked(running: FeatureMode, saved: Option<FeatureMode>) {
+        let (_tmp, mut app) = isolated_app();
+        app.adopt_decisions(&Decisions::new(memory_search(running), &app.storage).unwrap());
+        let index = DecisionFeature::ALL
+            .iter()
+            .position(|feature| *feature == DecisionFeature::MemorySearch)
+            .unwrap();
+
+        let actions = app.handle_decisions_action(DecisionsAction::PickFeatureMode {
+            feature: index,
+            mode: FeatureMode::Enforce,
+        });
+
+        let picked: Vec<_> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::SetDecisionFeature { mode, .. } => Some(mode.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(picked, saved.into_iter().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_feature_without_a_mode_is_not_cycled() {
+        let (_tmp, mut app) = isolated_app();
+        let index = DecisionFeature::ALL
+            .iter()
+            .position(|feature| feature.setting().is_none())
+            .unwrap();
+
+        let actions = app.handle_decisions_action(DecisionsAction::CycleFeature(index));
+
+        assert!(actions.is_empty());
+        assert_eq!(app.status_bar.flash_text(), Some(NO_FEATURE_MODE));
+    }
+
+    #[test_case(FeatureMode::Enforce, IN_FORCE_FLASH; "in_force")]
+    #[test_case(FeatureMode::Off, HELD_OFF_FLASH; "held_off_by_the_project")]
+    fn the_saved_mode_names_what_is_in_force(running: FeatureMode, expected: &str) {
+        assert_eq!(
+            feature_saved(
+                &DecisionFeature::MemorySearch,
+                &FeatureMode::Enforce,
+                &memory_search(running)
+            ),
+            expected
+        );
     }
 
     #[test]

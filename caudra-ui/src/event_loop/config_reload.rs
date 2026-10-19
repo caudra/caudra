@@ -11,12 +11,14 @@ use std::sync::Arc;
 use caudra_agent::McpConfigErrors;
 use caudra_agent::command::{CustomCommand, discover_commands};
 use caudra_agent::config_watch::{ConfigSource, ConfigWatcher, WatchRoots, source_files};
+use caudra_agent::decisions::{Decisions, PERMISSION_QUESTION_FILE, resolve_active_decisions};
 use caudra_agent::mcp::config::try_load_config;
 use caudra_agent::mcp::start_with_config;
 use caudra_agent::prompt::profile::{PROFILE_EXTENSION, PromptProfileCatalog};
 use caudra_agent::tools::ToolRegistry;
 use caudra_agent::tools::native::skill;
 use caudra_config::config_file::{global_config_path, project_config_path};
+use caudra_config::decisions::DecisionsConfig;
 use caudra_config::own_writes::{self, fingerprint};
 use caudra_config::providers::ProvidersConfig;
 use caudra_config::{Config, PermissionsConfig, fail_closed_permissions, try_load_permissions};
@@ -25,6 +27,7 @@ use tracing::{debug, info, warn};
 
 use super::EventLoop;
 use crate::agent::Settings;
+use crate::app::decisions::rebuilt_decisions;
 
 const SEPARATOR: &str = " · ";
 const LIST_SEPARATOR: &str = ", ";
@@ -43,10 +46,19 @@ const PROFILES_KEPT: &str = "a session using one keeps the version it loaded";
 const PERMISSIONS_FAILED_CLOSED: &str = "every tool call is denied until the file loads again";
 const PERMISSIONS_REVIEW: &str = "project rules wait for review in /permissions";
 const MCP_ERROR_PREFIX: &str = "MCP config error: ";
+const DECISION_ENGINE: &str = "decision engine";
+const DECISION_ENGINE_KEPT: &str = "keeping the running decision engine";
+const DECISIONS_TURNED_OFF: &str =
+    "the active decision endpoint is gone from providers.toml, so decisions are off";
+/// The tables every session screens with as soon as the file is saved.
+const NOW_TABLES: [&str; 1] = ["decisions"];
+/// Keys that apply as soon as the file is saved, in a table whose other keys wait.
+const NOW_KEYS: [(&str, &str); 1] = [("ui", "show_decisions")];
 /// The tables whose settings a session adopts at its next turn.
 const LIVE_TABLES: [&str; 2] = ["agent", "autopilot"];
 /// The table read once, at startup.
 const STARTUP_TABLE: &str = "experimental";
+const NOW_SUFFIX: &str = "at once";
 const LIVE_SUFFIX: &str = "from the next turn";
 const RELOAD_SUFFIX: &str = "after /reload";
 const RESTART_SUFFIX: &str = "after a restart";
@@ -58,11 +70,12 @@ const PROJECT_ENV_CHANGED: &str = "the project .env changed; restart Caudra to a
 const REMOTE_PROJECT: &str = "project files of a remote workspace apply after /reload";
 /// Sources read from files, as opposed to directories, so their bytes tell
 /// an edit from a save that changed nothing.
-const FILE_SOURCES: [ConfigSource; 8] = [
+const FILE_SOURCES: [ConfigSource; 9] = [
     ConfigSource::Settings,
     ConfigSource::Permissions,
     ConfigSource::Mcp,
     ConfigSource::Providers,
+    ConfigSource::DecisionQuestions,
     ConfigSource::Workcell,
     ConfigSource::Sandboxes,
     ConfigSource::GlobalEnv,
@@ -186,15 +199,27 @@ impl SettingsTables {
         }
     }
 
-    /// The top-level keys whose values differ in either file. The project
-    /// file counts only when `project` is read at all.
+    /// The top-level keys whose values differ in either file, with each of
+    /// [`NOW_KEYS`] named as `table.key` apart from the rest of its table.
+    /// The project file counts only when `project` is read at all.
     fn changed_keys(&self, after: &Self, project: bool) -> BTreeMap<String, bool> {
         let mut changed = BTreeMap::new();
         let mut compare = |before: &Table, after: &Table| {
             for key in before.keys().chain(after.keys()) {
-                let (old, new) = (before.get(key), after.get(key));
+                let (mut old, mut new) = (before.get(key).cloned(), after.get(key).cloned());
+                for (table, now_key) in NOW_KEYS.iter().filter(|(table, _)| table == key) {
+                    let take = |value: &mut Option<toml::Value>| {
+                        value
+                            .as_mut()
+                            .and_then(toml::Value::as_table_mut)
+                            .and_then(|table| table.remove(*now_key))
+                    };
+                    if take(&mut old) != take(&mut new) {
+                        changed.insert(format!("{table}.{now_key}"), false);
+                    }
+                }
                 if old != new {
-                    let table = old.or(new).is_some_and(toml::Value::is_table);
+                    let table = old.or(new).is_some_and(|value| value.is_table());
                     changed.insert(key.clone(), table);
                 }
             }
@@ -207,9 +232,9 @@ impl SettingsTables {
     }
 }
 
-/// When each changed key applies, by name only: `[agent]` and `[autopilot]`
-/// from the next turn, `[experimental]` after a restart, everything else after `/reload`.
-/// `None` when no key changed, as for an edit to a comment.
+/// When each changed key applies, by name only: `[decisions]` and `ui.show_decisions` at
+/// once, `[agent]` and `[autopilot]` from the next turn, `[experimental]` after a restart,
+/// everything else after `/reload`. `None` when no key changed, as for an edit to a comment.
 fn settings_note(changed: &BTreeMap<String, bool>) -> Option<String> {
     let label = |key: &str, table: bool| {
         if table {
@@ -218,11 +243,19 @@ fn settings_note(changed: &BTreeMap<String, bool>) -> Option<String> {
             key.to_owned()
         }
     };
+    let applies_now = |key: &str| {
+        NOW_TABLES.contains(&key)
+            || key
+                .split_once('.')
+                .is_some_and(|split| NOW_KEYS.contains(&split))
+    };
+    let mut now = Vec::new();
     let mut live = Vec::new();
     let mut reload = Vec::new();
     let mut restart = Vec::new();
     for (key, &table) in changed {
         let bucket = match key.as_str() {
+            key if applies_now(key) => &mut now,
             key if LIVE_TABLES.contains(&key) => &mut live,
             STARTUP_TABLE => &mut restart,
             _ => &mut reload,
@@ -230,6 +263,7 @@ fn settings_note(changed: &BTreeMap<String, bool>) -> Option<String> {
         bucket.push(label(key, table));
     }
     let parts: Vec<String> = [
+        (now, NOW_SUFFIX),
         (live, LIVE_SUFFIX),
         (reload, RELOAD_SUFFIX),
         (restart, RESTART_SUFFIX),
@@ -239,6 +273,13 @@ fn settings_note(changed: &BTreeMap<String, bool>) -> Option<String> {
     .map(|(keys, suffix)| format!("{} {suffix}", keys.join(LIST_SEPARATOR)))
     .collect();
     (!parts.is_empty()).then(|| parts.join(LIST_SEPARATOR))
+}
+
+/// The settings `current` runs with, the defaults while none is installed.
+fn running_decisions(current: Option<&Decisions>) -> DecisionsConfig {
+    current.map_or_else(DecisionsConfig::default, |decisions| {
+        decisions.config().clone()
+    })
 }
 
 /// Each profile that failed to load, as `{name}.md: {reason}`. `None` once
@@ -412,7 +453,18 @@ impl EventLoop<'_> {
                 }
             }
             ConfigSource::Permissions | ConfigSource::Commands => report.note(REMOTE_PROJECT),
-            ConfigSource::Providers => self.check_providers(report),
+            ConfigSource::Providers => {
+                if self.check_providers(report) {
+                    self.reload_decision_endpoint(report);
+                }
+            }
+            ConfigSource::DecisionQuestions => {
+                let current = self.ctx.permissions.decisions();
+                let config = running_decisions(current.as_ref());
+                if self.rebuild_decisions(current, config, true, report) {
+                    report.reloaded.push(PERMISSION_QUESTION_FILE);
+                }
+            }
             ConfigSource::Skills => {
                 skill::refresh(ToolRegistry::global());
                 report.reloaded.push(SKILLS_LABEL);
@@ -477,18 +529,89 @@ impl EventLoop<'_> {
         loaded
     }
 
-    fn check_providers(&mut self, report: &mut Report) {
+    /// Whether `providers.toml` loads.
+    fn check_providers(&mut self, report: &mut Report) -> bool {
         match ProvidersConfig::check() {
             Ok(()) => {
                 self.ctx.config_problems.clear(PROVIDERS_FILE);
                 report.reloaded.push(PROVIDERS_FILE);
+                true
             }
             Err(error) => {
                 report.problems.push(format!("{error}; {PROVIDERS_KEPT}"));
                 self.ctx
                     .config_problems
                     .set(PROVIDERS_FILE, error, PROVIDERS_KEPT);
+                false
             }
+        }
+    }
+
+    /// The active endpoint as `providers.toml` defines it now. A table that is gone turns
+    /// decisions off, as at startup; one that does not resolve keeps the running engine.
+    fn reload_decision_endpoint(&mut self, report: &mut Report) {
+        let current = self.ctx.permissions.decisions();
+        let running = running_decisions(current.as_ref());
+        match resolve_active_decisions(&running, &self.ctx.storage, ProvidersConfig::load) {
+            Ok(config) => {
+                let turned_off = running.endpoint.is_some() && config.endpoint.is_none();
+                if self.rebuild_decisions(current, config, false, report) && turned_off {
+                    report.note(DECISIONS_TURNED_OFF);
+                }
+            }
+            Err(error) => {
+                warn!(%error, "active decision endpoint does not resolve");
+                report
+                    .problems
+                    .push(format!("{error}; {DECISION_ENGINE_KEPT}"));
+            }
+        }
+    }
+
+    /// Every session screens with an engine built from `config`, unless the running one
+    /// already is and nothing asks to `reread` its files. Whether it was rebuilt; a failure
+    /// keeps the running engine.
+    fn rebuild_decisions(
+        &mut self,
+        current: Option<Decisions>,
+        config: DecisionsConfig,
+        reread: bool,
+        report: &mut Report,
+    ) -> bool {
+        match rebuilt_decisions(current.as_ref(), config, reread, &self.ctx.storage) {
+            None => false,
+            Some(Ok(decisions)) => {
+                self.ctx.config_problems.clear(DECISION_ENGINE);
+                self.install_decisions(&decisions);
+                info!(
+                    endpoint = decisions.endpoint().map(|endpoint| endpoint.name.as_str()),
+                    reread, "decision engine rebuilt"
+                );
+                true
+            }
+            Some(Err(error)) => {
+                warn!(%error, "decision engine rebuild failed");
+                report
+                    .problems
+                    .push(format!("{error}; {DECISION_ENGINE_KEPT}"));
+                self.ctx.config_problems.set(
+                    DECISION_ENGINE,
+                    error.to_string(),
+                    DECISION_ENGINE_KEPT,
+                );
+                false
+            }
+        }
+    }
+
+    /// `ui.show_decisions` as saved, in every session.
+    fn apply_show_decisions(&mut self, shown: bool) {
+        if self.ctx.ui_config.show_decisions == shown {
+            return;
+        }
+        self.ctx.ui_config.show_decisions = shown;
+        for runtime in &mut self.sessions {
+            runtime.app.set_show_decisions(shown);
         }
     }
 
@@ -509,6 +632,17 @@ impl EventLoop<'_> {
                         .set_limits(config.autopilot.clone());
                 }
                 self.ctx.autopilot = config.autopilot;
+                let current = self.ctx.permissions.decisions();
+                let endpoint = current
+                    .as_ref()
+                    .and_then(|decisions| decisions.endpoint().cloned());
+                self.rebuild_decisions(
+                    current,
+                    config.decisions.with_endpoint(endpoint),
+                    false,
+                    report,
+                );
+                self.apply_show_decisions(config.ui.show_decisions);
                 if let Some(note) = settings_note(&self.config_reload.settings_changes(local)) {
                     report.reloaded.push(SETTINGS_FILE);
                     report.note(note);
@@ -646,8 +780,9 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        Change, Fingerprints, LIST_SEPARATOR, LIVE_SUFFIX, RELOAD_SUFFIX, RELOADED, RESTART_SUFFIX,
-        Report, SEPARATOR, SETTINGS_FILE, SettingsTables, profile_problem, settings_note,
+        Change, Fingerprints, LIST_SEPARATOR, LIVE_SUFFIX, NOW_SUFFIX, RELOAD_SUFFIX, RELOADED,
+        RESTART_SUFFIX, Report, SEPARATOR, SETTINGS_FILE, SettingsTables, profile_problem,
+        settings_note,
     };
 
     const PROBLEM: &str = "providers.toml: expected `=`";
@@ -659,6 +794,11 @@ mod tests {
     const AGENT_EDITED: &str = "[agent]\nmax_output_lines = 20\n\n[ui]\ntheme = \"dark\"\n";
     const UI_AND_FLAG_EDITED: &str =
         "always_yolo = true\n[agent]\nmax_output_lines = 10\n\n[ui]\ntheme = \"light\"\n";
+    const SHOW_DECISIONS_EDITED: &str =
+        "[agent]\nmax_output_lines = 10\n\n[ui]\ntheme = \"dark\"\nshow_decisions = false\n";
+    const UI_AND_SHOW_DECISIONS_EDITED: &str =
+        "[agent]\nmax_output_lines = 10\n\n[ui]\ntheme = \"light\"\nshow_decisions = false\n";
+    const DECISIONS_ADDED: &str = "[agent]\nmax_output_lines = 10\n\n[ui]\ntheme = \"dark\"\n\n[decisions.features]\nmemory_search = \"enforce\"\n";
     const LOADING_PROFILE: (&str, &str) = ("review", "Review carefully.");
     const EMPTY_PROFILE: (&str, &str) = ("blank", "");
     const UNCLOSED_PROFILE: (&str, &str) = ("draft", "---\nlayout: custom\nReview.");
@@ -766,6 +906,9 @@ mod tests {
     #[test_case(COMMENTED, &[] ; "a_comment")]
     #[test_case(AGENT_EDITED, &[("agent", true)] ; "the_agent_table")]
     #[test_case(UI_AND_FLAG_EDITED, &[("always_yolo", false), ("ui", true)] ; "a_table_and_a_key")]
+    #[test_case(SHOW_DECISIONS_EDITED, &[("ui.show_decisions", false)] ; "a_key_that_applies_at_once")]
+    #[test_case(UI_AND_SHOW_DECISIONS_EDITED, &[("ui", true), ("ui.show_decisions", false)] ; "that_key_beside_the_rest_of_its_table")]
+    #[test_case(DECISIONS_ADDED, &[("decisions", true)] ; "the_decisions_table")]
     fn only_keys_whose_values_changed_count(edited: &str, expected: &[(&str, bool)]) {
         let dir = TempDir::new().unwrap();
         fs::write(settings_file(&dir), SETTINGS).unwrap();
@@ -796,6 +939,23 @@ mod tests {
             settings_note(&changed).unwrap(),
             format!(
                 "[agent]{LIST_SEPARATOR}[autopilot] {LIVE_SUFFIX}{LIST_SEPARATOR}always_yolo{LIST_SEPARATOR}[ui] {RELOAD_SUFFIX}{LIST_SEPARATOR}[experimental] {RESTART_SUFFIX}"
+            )
+        );
+    }
+
+    #[test]
+    fn decision_settings_apply_at_once_and_the_rest_of_ui_waits() {
+        let changed = BTreeMap::from([
+            ("agent".to_owned(), true),
+            ("decisions".to_owned(), true),
+            ("ui".to_owned(), true),
+            ("ui.show_decisions".to_owned(), false),
+        ]);
+
+        assert_eq!(
+            settings_note(&changed).unwrap(),
+            format!(
+                "[decisions]{LIST_SEPARATOR}ui.show_decisions {NOW_SUFFIX}{LIST_SEPARATOR}[agent] {LIVE_SUFFIX}{LIST_SEPARATOR}[ui] {RELOAD_SUFFIX}"
             )
         );
     }

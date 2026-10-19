@@ -2,7 +2,7 @@
 //! what it decided. Overview and Features read the configuration and the
 //! service's cached health on every frame. Activity and Recent read
 //! the decision log in `caudra.db`, loaded for every scope by a background task.
-//! Nothing here changes the engine or contacts it.
+//! Features asks the app to save a feature's mode; nothing here contacts the engine.
 
 mod lines;
 
@@ -11,7 +11,7 @@ use std::path::Path;
 use arc_swap::ArcSwapOption;
 use caudra_agent::decisions::{DecisionFeature, DecisionStatus};
 use caudra_config::ClockFormat;
-use caudra_config::decisions::{DecisionKeySource, DecisionsConfig};
+use caudra_config::decisions::{DecisionKeySource, DecisionsConfig, FeatureMode};
 use caudra_grab::grab_scope;
 use caudra_storage::decision_log::{DecisionStats, LoggedDecision};
 use caudra_storage::sessions::PermissionMode;
@@ -32,6 +32,7 @@ use crate::components::section_tabs::{SectionTab, tab_strip};
 use crate::components::{ModalScroll, Overlay, PAN_STEP, bar_area, hover_style, now_secs};
 use crate::repaint::{Dirty, Watch};
 use crate::theme::{self, Theme};
+use lines::ModeChips;
 
 pub(crate) const TITLE: &str = " Decisions ";
 pub(crate) const COPY_LABEL: &str = "y";
@@ -228,6 +229,13 @@ pub enum DecisionsAction {
         label: &'static str,
     },
     Flash(&'static str),
+    /// Move the feature at this place in [`DecisionFeature::ALL`] to its next mode.
+    CycleFeature(usize),
+    /// Put the feature at this place in [`DecisionFeature::ALL`] in `mode`.
+    PickFeatureMode {
+        feature: usize,
+        mode: FeatureMode,
+    },
 }
 
 pub struct DecisionsModal {
@@ -263,6 +271,8 @@ pub struct DecisionsModal {
     /// Recent shows a decision's answers as the JSON it logged rather than as bars.
     json_answers: bool,
     footer_hits: FooterHits,
+    /// Where each of the selected feature's modes was drawn, which a click picks.
+    mode_hits: Vec<(Rect, FeatureMode)>,
     fetch: Watch<DecisionsFetchState>,
 }
 
@@ -289,6 +299,7 @@ impl DecisionsModal {
             drawn: Vec::new(),
             json_answers: false,
             footer_hits: FooterHits::default(),
+            mode_hits: Vec::new(),
             fetch: Watch::default(),
         }
     }
@@ -344,6 +355,11 @@ impl DecisionsModal {
                     self.set_tab(tab);
                 }
             }
+            _ if self.tab == Tab::Features
+                && (key::SPACE.matches(key) || key::ENTER.matches(key)) =>
+            {
+                return DecisionsAction::CycleFeature(self.feature);
+            }
             KeyCode::Left if plain => self.pane = Pane::List,
             KeyCode::Right if plain => self.pane = Pane::Detail,
             _ if self.tab.listed() && self.pane == Pane::List && self.step_by_key(key) => {}
@@ -382,6 +398,12 @@ impl DecisionsModal {
             MouseEventKind::ScrollLeft => self.pan(-PAN_STEP),
             MouseEventKind::ScrollRight => self.pan(PAN_STEP),
             MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((_, mode)) = self.mode_hits.iter().find(|(hit, _)| hit.contains(pos)) {
+                    return DecisionsAction::PickFeatureMode {
+                        feature: self.feature,
+                        mode: mode.clone(),
+                    };
+                }
                 if let Some(&(_, tab)) = self.tab_hits.iter().find(|(hit, _)| hit.contains(pos)) {
                     self.set_tab(tab);
                 } else if self.list_area.contains(pos) {
@@ -451,14 +473,28 @@ impl DecisionsModal {
             0 => self.list_bar = Scrollbar::default(),
             _ => self.render_list(frame, list, rows, logged, &theme),
         }
-        let lines = self.body_lines(ctx, logged, now, usize::from(detail.width), &theme);
+        let hovered_mode = self
+            .pointer
+            .and_then(|at| self.mode_hits.iter().position(|(hit, _)| hit.contains(at)));
+        let (lines, modes) = self.body_lines(
+            ctx,
+            logged,
+            now,
+            usize::from(detail.width),
+            hovered_mode,
+            &theme,
+        );
         match detail.width {
             0 => {
                 self.body_bar = Scrollbar::default();
                 self.pan_bar = Scrollbar::horizontal();
                 self.drawn = lines;
+                self.mode_hits.clear();
             }
-            _ => self.render_body(frame, detail, footer.bottom(), lines),
+            _ => {
+                self.render_body(frame, detail, footer.bottom(), lines);
+                self.mode_hits = self.mode_hits_in(detail, modes);
+            }
         }
         self.render_footer(frame, footer, &theme);
         popup
@@ -502,6 +538,7 @@ impl DecisionsModal {
             return;
         }
         self.tab = tab;
+        self.mode_hits.clear();
         self.pane = Pane::List;
         self.list_scroll.reset();
         self.body_scroll.reset();
@@ -568,7 +605,10 @@ impl DecisionsModal {
             return;
         }
         match self.tab {
-            Tab::Features => self.feature = index,
+            Tab::Features => {
+                self.feature = index;
+                self.mode_hits.clear();
+            }
             Tab::Recent => self.selected = self.recent().get(index).map(|decision| decision.id),
             Tab::Overview | Tab::Activity => return,
         }
@@ -805,22 +845,35 @@ impl DecisionsModal {
         );
     }
 
+    /// The body, and on Features where its mode line lies.
     fn body_lines(
         &self,
         ctx: &DecisionsModalContext,
         logged: Logged<'_>,
         now: u64,
         width: usize,
+        hovered_mode: Option<usize>,
         theme: &Theme,
-    ) -> Vec<Line<'static>> {
-        match self.tab {
+    ) -> (Vec<Line<'static>>, Option<ModeChips>) {
+        let lines = match self.tab {
             Tab::Overview => lines::overview(ctx, theme),
-            Tab::Features => DecisionFeature::ALL
-                .get(self.feature)
-                .map(|feature| {
-                    lines::feature_detail(feature, ctx.config, logged, self.scope, now, theme)
-                })
-                .unwrap_or_default(),
+            Tab::Features => {
+                return DecisionFeature::ALL
+                    .get(self.feature)
+                    .map(|feature| {
+                        let detail = lines::feature_detail(
+                            feature,
+                            ctx.config,
+                            logged,
+                            self.scope,
+                            now,
+                            hovered_mode,
+                            theme,
+                        );
+                        (detail.lines, detail.modes)
+                    })
+                    .unwrap_or_default();
+            }
             Tab::Activity => lines::activity(ctx.config, logged, self.scope, now, theme),
             Tab::Recent => {
                 let mut body = Vec::new();
@@ -841,7 +894,45 @@ impl DecisionsModal {
                 }
                 body
             }
+        };
+        (lines, None)
+    }
+
+    /// Where each mode of the drawn mode line landed in `area`. None while that line wraps
+    /// or is scrolled out of view, so a click never picks a mode it was not on.
+    fn mode_hits_in(&self, area: Rect, modes: Option<ModeChips>) -> Vec<(Rect, FeatureMode)> {
+        let Some(ModeChips { line, chips }) = modes else {
+            return Vec::new();
+        };
+        if self
+            .drawn
+            .get(line)
+            .is_none_or(|drawn| drawn.width() > usize::from(area.width))
+        {
+            return Vec::new();
         }
+        let above = Paragraph::new(self.drawn[..line].to_vec())
+            .wrap(Wrap { trim: false })
+            .line_count(area.width);
+        let Some(row) = u16::try_from(above)
+            .ok()
+            .and_then(|above| above.checked_sub(self.body_scroll.offset()))
+            .filter(|row| *row < area.height)
+        else {
+            return Vec::new();
+        };
+        chips
+            .into_iter()
+            .map(|(columns, mode)| {
+                let hit = Rect::new(
+                    area.x.saturating_add(columns.start),
+                    area.y.saturating_add(row),
+                    columns.end.saturating_sub(columns.start),
+                    1,
+                );
+                (hit, mode)
+            })
+            .collect()
     }
 
     /// `bottom` is the row under the footer, the border the pan bar lies on.
@@ -1064,6 +1155,7 @@ mod tests {
     const CLICKED_ROW: u16 = 1;
     const DESCRIPTION_PREFIX: usize = 24;
     const NO_HIT: &str = "every footer key must answer a click";
+    const SELECTED_FEATURE: usize = 2;
     const NOT_COPIED: &str = "y must copy";
 
     struct Fixture {
@@ -1625,6 +1717,67 @@ mod tests {
         let mut modal = opened(snapshot());
 
         assert_eq!(modal.handle_key(key), expected);
+    }
+
+    #[test_case('2', KeyCode::Char(' '), Some(SELECTED_FEATURE); "space_on_features")]
+    #[test_case('2', KeyCode::Enter, Some(SELECTED_FEATURE); "enter_on_features")]
+    #[test_case('1', KeyCode::Char(' '), None; "space_on_overview")]
+    #[test_case('4', KeyCode::Enter, None; "enter_on_recent")]
+    fn only_the_features_tab_cycles_the_selected_feature(
+        tab: char,
+        code: KeyCode,
+        cycled: Option<usize>,
+    ) {
+        let mut modal = opened(snapshot());
+        let _ = type_char(&mut modal, tab);
+        for _ in 0..SELECTED_FEATURE {
+            let _ = modal.handle_key(press(KeyCode::Down));
+        }
+
+        let action = modal.handle_key(press(code));
+
+        assert_eq!(
+            action,
+            cycled.map_or(DecisionsAction::Consumed, DecisionsAction::CycleFeature)
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_mode_picks_it() {
+        let fixture = Fixture::new(true);
+        let mut modal = opened(snapshot());
+        let _ = type_char(&mut modal, '2');
+        let screen = render(&mut modal, &fixture, WIDE, TALL);
+        let (hit, mode) = modal.mode_hits.last().cloned().unwrap();
+        let under: String = (hit.x..hit.right())
+            .map(|x| screen[(x, hit.y)].symbol())
+            .collect();
+        assert_eq!(under, mode.as_str());
+
+        let action = modal.handle_mouse(left_down(hit.x, hit.y));
+
+        assert_eq!(
+            action,
+            DecisionsAction::PickFeatureMode { feature: 0, mode }
+        );
+    }
+
+    #[test]
+    fn hovering_a_mode_highlights_it() {
+        let fixture = Fixture::new(true);
+        let mut modal = opened(snapshot());
+        let _ = type_char(&mut modal, '2');
+        let resting = render(&mut modal, &fixture, WIDE, TALL);
+        let (hit, _) = modal.mode_hits.last().cloned().unwrap();
+        let at = Position::new(hit.x, hit.y);
+
+        let _ = modal.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            ..left_down(hit.x, hit.y)
+        });
+        let hovered = render(&mut modal, &fixture, WIDE, TALL);
+
+        assert_ne!(resting[at].style(), hovered[at].style());
     }
 
     #[test]

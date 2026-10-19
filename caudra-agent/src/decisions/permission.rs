@@ -10,7 +10,8 @@ use serde_json::Value;
 
 use super::{DecisionContext, DecisionFeature, DecisionOutcome, Decisions, questions};
 
-const QUESTION_FILE: &str = "decisions/permission.json";
+/// The user-global override of the permission question set, under the global config directory.
+pub const PERMISSION_QUESTION_FILE: &str = "decisions/permission.json";
 const MAX_QUESTION_FILE_BYTES: u64 = 64 * 1024;
 const TAINT_THRESHOLD_FACTOR: f64 = 0.75;
 pub(super) const FLAGS: [&str; 5] = [
@@ -148,7 +149,7 @@ pub(super) fn load_questions(global_dir: Option<&Path>) -> Result<QuestionSet, D
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_NONBLOCK);
-    let file = match options.open(global_dir.join(QUESTION_FILE)) {
+    let file = match options.open(global_dir.join(PERMISSION_QUESTION_FILE)) {
         Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(defaults),
         Err(_) => {
@@ -199,8 +200,8 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        DecisionFeature, Decisions, MAX_QUESTION_FILE_BYTES, PermissionAction, QUESTION_FILE,
-        load_questions,
+        DecisionFeature, Decisions, MAX_QUESTION_FILE_BYTES, PERMISSION_QUESTION_FILE,
+        PermissionAction, load_questions,
     };
 
     const TAINT_PROBABILITY: f64 = 0.8;
@@ -261,7 +262,7 @@ mod tests {
             let mut questions = defaults.questions().clone();
             questions.get_mut("deletes").unwrap().instructions =
                 json!("Will local data be deleted?");
-            let path = root.path().join(QUESTION_FILE);
+            let path = root.path().join(PERMISSION_QUESTION_FILE);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, serde_json::to_vec(&questions).unwrap()).unwrap();
         }
@@ -285,7 +286,7 @@ mod tests {
         } else {
             questions.remove("deletes");
         }
-        let path = root.path().join(QUESTION_FILE);
+        let path = root.path().join(PERMISSION_QUESTION_FILE);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, serde_json::to_vec(&questions).unwrap()).unwrap();
         assert!(load_questions(Some(root.path())).is_err());
@@ -295,7 +296,7 @@ mod tests {
     #[test_case(true; "not_regular")]
     fn override_files_are_bounded_regular_files(directory: bool) {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join(QUESTION_FILE);
+        let path = root.path().join(PERMISSION_QUESTION_FILE);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         if directory {
             fs::create_dir(path).unwrap();

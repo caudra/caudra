@@ -1,6 +1,8 @@
 //! What each tab says, built from plain values so a tab can be read without
 //! drawing the modal.
 
+use std::ops::Range;
+
 use caudra_agent::decisions::{DecisionFeature, endpoint_kind};
 use caudra_config::ClockFormat;
 use caudra_config::decisions::{
@@ -18,7 +20,9 @@ use unicode_width::UnicodeWidthStr;
 use super::{DecisionsModalContext, DecisionsScope, Logged};
 use crate::clock::hms;
 use crate::components::session_picker::age;
-use crate::components::{decision_view, escape_terminal_controls, format_integer, json_text};
+use crate::components::{
+    decision_view, escape_terminal_controls, format_integer, hover_style, json_text,
+};
 use crate::theme::Theme;
 
 const INDENT: &str = "  ";
@@ -46,7 +50,8 @@ const ACTIVITY_HEADING: &str = "Activity";
 const CONFIGURE_HEADING: &str = "Configure";
 const FEATURES_POINTER: &str = " (2 Features lists each)";
 const FEATURES_TABLE: &str = "[decisions.features]";
-const GLOBAL_CONFIG: &str = "in the global caudra.toml";
+pub(super) const CYCLE_HINT: &str =
+    "in the global caudra.toml. Click a mode above, or press Space, to save it there";
 const THIS_SESSION: &str = " (this session)";
 const CURRENT_MODE: &str = " (current)";
 const TOTAL_LABEL: &str = "Total";
@@ -287,14 +292,28 @@ pub(super) fn feature_row(
     ]
 }
 
+/// Which line of a feature's detail lists its modes, and the columns each mode spans
+/// on it, so a click on one picks it.
+pub(super) struct ModeChips {
+    pub(super) line: usize,
+    pub(super) chips: Vec<(Range<u16>, FeatureMode)>,
+}
+
+pub(super) struct FeatureDetail {
+    pub(super) lines: Vec<Line<'static>>,
+    pub(super) modes: Option<ModeChips>,
+}
+
+/// `hovered` is the place in the feature's modes of the one under the pointer.
 pub(super) fn feature_detail(
     feature: &DecisionFeature,
     config: &DecisionsConfig,
     logged: Logged<'_>,
     scope: DecisionsScope,
     now: u64,
+    hovered: Option<usize>,
     theme: &Theme,
-) -> Vec<Line<'static>> {
+) -> FeatureDetail {
     let mode = feature_mode(feature, config);
     let setting = feature.setting();
     let mut lines = vec![
@@ -306,23 +325,37 @@ pub(super) fn feature_detail(
         Line::default(),
         field_styled("Mode", mode.as_str(), mode_style(mode, theme), theme),
     ];
-    if let Some(setting) = setting {
+    let modes = setting.map(|setting| {
         let mut spans = vec![label_span("Modes", theme)];
+        let mut chips = Vec::with_capacity(setting.modes.len());
+        let column = |spans: &[Span]| {
+            u16::try_from(spans.iter().map(Span::width).sum::<usize>()).unwrap_or(u16::MAX)
+        };
         for (index, allowed) in setting.modes.iter().enumerate() {
             if index > 0 {
                 spans.push(Span::styled(LIST_GAP, theme.tool_dim));
             }
-            match allowed == mode {
-                true => {
-                    let style = mode_style(allowed, theme).add_modifier(Modifier::BOLD);
-                    spans.push(Span::styled(allowed.as_str(), style));
-                    spans.push(Span::styled(CURRENT_MODE, theme.tool_dim));
-                }
-                false => spans.push(Span::styled(allowed.as_str(), theme.tool_dim)),
+            let current = allowed == mode;
+            let style = match current {
+                true => mode_style(allowed, theme).add_modifier(Modifier::BOLD),
+                false => theme.tool_dim,
+            };
+            let start = column(&spans);
+            spans.push(Span::styled(
+                allowed.as_str(),
+                hover_style(style, hovered == Some(index)),
+            ));
+            chips.push((start..column(&spans), allowed.clone()));
+            if current {
+                spans.push(Span::styled(CURRENT_MODE, theme.tool_dim));
             }
         }
         lines.push(Line::from(spans));
-    }
+        ModeChips {
+            line: lines.len() - 1,
+            chips,
+        }
+    });
     lines.push(field("Logged as", feature.name(), theme));
     if *mode == FeatureMode::Shadow && !config.log {
         lines.push(hint(SHADOW_UNLOGGED, theme));
@@ -358,9 +391,9 @@ pub(super) fn feature_detail(
             format!("{INDENT}{key} = \"{}\"", mode.as_str()),
             theme.inline_code,
         ));
-        lines.push(hint(GLOBAL_CONFIG, theme));
+        lines.push(hint(CYCLE_HINT, theme));
     }
-    lines
+    FeatureDetail { lines, modes }
 }
 
 fn stats_fields(stats: &DecisionStats, now: u64, theme: &Theme) -> Vec<Line<'static>> {
