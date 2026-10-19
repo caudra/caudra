@@ -4952,7 +4952,9 @@ mod tests {
     use crate::remote_project_context::tests::AssetService;
     use crate::tools::native::plan::{self, PlanTarget, PlanWriteResult};
     use crate::tools::registry::BoxFuture;
-    use crate::tools::test_support::{MOCK_TOOL_OUTPUT, NamedMock, stub_ctx_with};
+    use crate::tools::test_support::stub_ctx_with;
+    #[cfg(unix)]
+    use crate::tools::test_support::{MOCK_TOOL_OUTPUT, NamedMock};
     use crate::tools::{PermissionScopes, TODOWRITE_TOOL_NAME};
     #[cfg(unix)]
     use crate::types::ToolDoneEvent;

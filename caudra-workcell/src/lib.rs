@@ -4963,11 +4963,17 @@ mod tests {
     const SHELL_ENV_CONFIGURED: &str = "configured-canary";
     const SHELL_ENV_UNLISTED: (&str, &str) = ("CAUDRA_SHELL_ENV_UNLISTED", "unlisted-canary");
     const SHELL_ENV_NO_COLOR: (&str, &str) = ("NO_COLOR", "1");
+    #[cfg(target_os = "linux")]
     const SLEEPER_PID_FILE: &str = "sleeper.pid";
+    #[cfg(target_os = "linux")]
     const SLEEPER_SECONDS: u64 = 60;
+    #[cfg(target_os = "linux")]
     const PROCESS_POLL: Duration = Duration::from_millis(20);
+    #[cfg(target_os = "linux")]
     const PROCESS_BOUND: Duration = Duration::from_secs(10);
+    #[cfg(target_os = "linux")]
     const EXPECT_SLEEPER_STARTED: &str = "the shell command recorded its sleeper";
+    #[cfg(target_os = "linux")]
     const EXPECT_SLEEPER_TERMINATED: &str =
         "a dropped shell call must terminate its subprocess, not detach it";
 
@@ -10860,6 +10866,7 @@ mod tests {
         assert_eq!(result.output.expect_err(SHELL_CANCELLED), SHELL_CANCELLED);
     }
 
+    #[cfg(target_os = "linux")]
     async fn eventually(mut condition: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + PROCESS_BOUND;
         while !condition() {

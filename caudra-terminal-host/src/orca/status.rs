@@ -146,6 +146,7 @@ mod tests {
     const SESSION: &str = "01990000-0000-7000-8000-000000000001";
     const SUBAGENT_ID: &str = "toolu_01";
     const SUBAGENT_NAME: &str = "Research the parser";
+    #[cfg(not(windows))]
     const STARTED_AT_MS: u64 = 1_760_000_000_000;
 
     fn metadata() -> PaneMetadata<'static> {

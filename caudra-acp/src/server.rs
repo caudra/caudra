@@ -85,7 +85,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Discovery {
     Live,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     Off,
 }
 
