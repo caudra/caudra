@@ -108,6 +108,9 @@ impl EventSource for UnixInternalEventSource {
     }
 
     fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>> {
+        if let Some(event) = self.parser.next() {
+            return Ok(Some(event));
+        }
         let timeout = PollTimeout::new(timeout);
 
         fn make_pollfd<F: AsRawFd>(fd: &F) -> pollfd {
@@ -136,7 +139,7 @@ impl EventSource for UnixInternalEventSource {
             if let Some(event) = self.parser.next() {
                 return Ok(Some(event));
             }
-            match poll(&mut fds, timeout.leftover()) {
+            match poll(&mut fds, self.parser.poll_timeout(timeout.leftover())) {
                 Err(filedescriptor::Error::Poll(e)) | Err(filedescriptor::Error::Io(e)) => {
                     match e.kind() {
                         // retry on EINTR
@@ -151,6 +154,9 @@ impl EventSource for UnixInternalEventSource {
                 }
                 Ok(_) => (),
             };
+            if let Some(event) = self.parser.next() {
+                return Ok(Some(event));
+            }
             if fds[0].revents & POLLIN != 0 {
                 loop {
                     let read_count = read_complete(&self.tty, &mut self.tty_buffer)?;
@@ -165,7 +171,7 @@ impl EventSource for UnixInternalEventSource {
                         return Ok(Some(event));
                     }
 
-                    if read_count == 0 {
+                    if read_count == 0 || timeout.elapsed() {
                         break;
                     }
                 }
@@ -226,6 +232,7 @@ mod tests {
     use signal_hook::consts::SIGWINCH;
 
     #[test]
+    #[serial_test::serial]
     fn resize_signal_writes_to_the_owned_pipe_and_is_drained_once() {
         let (input, _writer) = UnixStream::pair().unwrap();
         input.set_nonblocking(true).unwrap();

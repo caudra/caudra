@@ -66,7 +66,10 @@ impl EventSource for WindowsEventSource {
         let poll_timeout = PollTimeout::new(timeout);
 
         loop {
-            if let Some(event_ready) = self.poll.poll(poll_timeout.leftover())? {
+            if let Some(event_ready) = self
+                .poll
+                .poll(self.parser.poll_timeout(poll_timeout.leftover()))?
+            {
                 let number = self.console.number_of_console_input_events()?;
                 if event_ready && number != 0 {
                     // Process all available input records as a batch.
@@ -172,6 +175,9 @@ impl EventSource for WindowsEventSource {
                 }
             }
 
+            if let Some(event) = self.parser.next() {
+                return Ok(Some(event));
+            }
             if poll_timeout.elapsed() {
                 return Ok(None);
             }

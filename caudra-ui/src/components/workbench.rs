@@ -6,9 +6,9 @@
 
 use std::path::Path;
 
-use caudra_workbench::{PaintedMarkdown, Workbench, WorkbenchStyles};
+use caudra_workbench::{ImageViewport, PaintedImage, PaintedMarkdown, Workbench, WorkbenchStyles};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
 
 use crate::components::Overlay;
 use crate::inline_image::{self, ImageRef};
@@ -74,9 +74,13 @@ pub(crate) fn paint_markdown(text: &str, width: u16) -> PaintedMarkdown {
 
 /// The transcript's picture renderer, lent to the workbench so an image tab
 /// shows the picture instead of the binary-file notice.
-pub(crate) fn paint_image(path: &Path, cols: u16, rows: u16) -> Option<Vec<Line<'static>>> {
+pub(crate) fn paint_image(
+    path: &Path,
+    viewport: &mut ImageViewport,
+    area: Rect,
+) -> Option<PaintedImage> {
     let image = ImageRef::from_file(path, "")?;
-    inline_image::draw_fitted(&image, cols, rows)
+    inline_image::draw_viewport(&image, viewport, area)
 }
 
 impl Overlay for Workbench {

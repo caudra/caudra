@@ -24,6 +24,7 @@ use history::History;
 use rendered::{PaintMarkdown, Painting, Rendered};
 use text_field::{FieldKind, TextCommand, decode};
 
+use crate::ImageViewport;
 use crate::fs::backend::{LoadedFile, ResourceEntry, WorkbenchPath};
 use crate::fs::read::{self, LineEnding, LoadError, ReadOnly, SaveError, Source};
 use crate::scm::diff::DiffRow;
@@ -90,6 +91,7 @@ pub struct Tab {
     pub preview: bool,
     /// Set while a Markdown tab shows its rendered view instead of its source.
     rendered: Option<Rendered>,
+    pub(crate) image: ImageViewport,
     revision: u64,
     scroll: usize,
     /// Which visual row of `scroll` sits at the top of the pane. Always zero
@@ -132,6 +134,7 @@ impl Tab {
             remote_reload: false,
             preview: false,
             rendered: None,
+            image: ImageViewport::default(),
             revision: 0,
             scroll: 0,
             scroll_row: 0,
@@ -188,6 +191,7 @@ impl Tab {
             remote_reload: false,
             preview: false,
             rendered: None,
+            image: ImageViewport::default(),
             revision: 0,
             scroll: 0,
             scroll_row: 0,
@@ -239,6 +243,7 @@ impl Tab {
             remote_reload: false,
             preview: false,
             rendered: None,
+            image: ImageViewport::default(),
             revision: 0,
             scroll: 0,
             scroll_row: 0,
@@ -1049,6 +1054,9 @@ impl Editor {
 
     pub fn select(&mut self, index: usize) {
         if index < self.tabs.len() {
+            if let Some(tab) = self.active_mut() {
+                tab.image.clear_geometry();
+            }
             self.active = index;
         }
     }
@@ -1058,7 +1066,7 @@ impl Editor {
             return;
         }
         let count = self.tabs.len() as isize;
-        self.active = (self.active as isize + delta).rem_euclid(count) as usize;
+        self.select((self.active as isize + delta).rem_euclid(count) as usize);
     }
 
     pub fn set_theme_generation(&mut self, generation: u64) {

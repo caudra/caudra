@@ -1,4 +1,4 @@
-//! Which terminals show OSC 9 notifications.
+//! Terminal notification support and graphics transport policy.
 
 use std::env;
 use std::process::{Child, Command, Stdio};
@@ -6,11 +6,12 @@ use std::time::Duration;
 
 use wait_timeout::ChildExt;
 
+use crate::mux::TerminalMux;
+
 /// Raw mode is already on when the tmux query runs, so a wedged tmux server
 /// must not be able to hang startup with Ctrl-C disabled.
 const TMUX_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 const TMUX: &str = "tmux";
-const TMUX_ENV: &str = "TMUX";
 const ALLOW_PASSTHROUGH: &str = "allow-passthrough";
 
 #[derive(Default)]
@@ -120,12 +121,12 @@ pub fn tmux_passes_kitty_graphics() -> bool {
 
 /// Whether Caudra runs inside tmux, which answers terminal queries itself.
 pub fn inside_tmux() -> bool {
-    env::var_os(TMUX_ENV).is_some()
+    TerminalMux::detect() == TerminalMux::Tmux
 }
 
 /// Whether Caudra runs in a Herdr pane, which composes its own grid.
 pub fn inside_herdr() -> bool {
-    env::var_os(crate::herdr::HERDR_ENV).is_some()
+    crate::detect().is_some_and(|host| host.name() == crate::herdr::HOST)
 }
 
 fn passthrough_enabled(value: &str) -> bool {

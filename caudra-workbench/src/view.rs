@@ -959,13 +959,35 @@ impl Workbench {
             return;
         };
         if let Some(notice) = tab.notice() {
+            let reason = notice.reason();
             self.panes.text = Rect::default();
+            let picture_area = Rect {
+                height: area.height.saturating_sub(1),
+                ..area
+            };
             match paint_image
                 .zip(tab.path.local())
-                .and_then(|(paint, path)| paint(path, area.width, area.height))
+                .and_then(|(paint, path)| paint(path, &mut tab.image, picture_area))
             {
-                Some(picture) => render_picture(buf, area, picture),
-                None => placeholder(buf, area, notice.reason(), self.styles.dim),
+                Some(picture) => {
+                    for (offset, line) in picture.lines.into_iter().enumerate() {
+                        chrome::render_line(buf, line_at(picture.geometry.area, offset), line);
+                    }
+                    let status = format!(
+                        "{}  +/− zoom  0 fit  1 actual  arrows/drag pan  s sampling",
+                        picture.status
+                    );
+                    placeholder(
+                        buf,
+                        line_at(area, area.height.saturating_sub(1).into()),
+                        &status,
+                        self.styles.dim,
+                    );
+                }
+                None => {
+                    tab.image.clear_geometry();
+                    placeholder(buf, area, reason, self.styles.dim);
+                }
             }
             return;
         }
@@ -1565,27 +1587,6 @@ fn overwrite(buf: &mut Surface, at: (u16, u16), symbol: &str, style: Style) {
     if let Some(cell) = buf.cell_mut(at) {
         cell.set_symbol(symbol);
         cell.set_style(style);
-    }
-}
-
-/// A picture centred in `area`, for a file the editor cannot show as text.
-fn render_picture(buf: &mut Surface, area: Rect, picture: Vec<Line<'static>>) {
-    let width = picture.iter().map(Line::width).max().unwrap_or_default() as u16;
-    let height = picture.len() as u16;
-    let [_, column, _] = Layout::horizontal([
-        Constraint::Fill(1),
-        Constraint::Length(width),
-        Constraint::Fill(1),
-    ])
-    .areas(area);
-    let [_, centred, _] = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(height),
-        Constraint::Fill(1),
-    ])
-    .areas(column);
-    for (offset, line) in picture.into_iter().enumerate() {
-        chrome::render_line(buf, line_at(centred, offset), line);
     }
 }
 

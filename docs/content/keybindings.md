@@ -102,6 +102,20 @@ These keys work the same in every text field: the composer, a picker's filter, f
 | `Ctrl+S` | Save pasted text |
 | `Esc` | Cancel editing |
 
+## Image Viewer
+
+| Key | Action |
+|-----|--------|
+| `o` | Open the picture in the system's image viewer |
+| `+ / - / wheel` | Zoom the picture (wheel anchors at the pointer) |
+| `0` | Fit the picture |
+| `1` | Inspect at actual pixels (block renderers: samples) |
+| `↑ ↓ ← → / drag` | Pan the picture |
+| `s` | Switch smooth / nearest sampling |
+| `w` | Open the picture's file in the workbench |
+| `y` | Copy the picture's path |
+| `Esc` | Close the viewer |
+
 ## Review
 
 | Key | Action |

@@ -22,6 +22,7 @@ const MAIN_CONTEXTS: &[KeybindContext] = &[
     KeybindContext::Editing,
     KeybindContext::TextFields,
     KeybindContext::PasteEditor,
+    KeybindContext::ImageViewer,
     KeybindContext::Review,
     KeybindContext::Streaming,
     KeybindContext::FormInput,

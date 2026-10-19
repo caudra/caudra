@@ -1,15 +1,21 @@
 #[cfg(unix)]
 use std::io::{self, stdout};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 
 use crate::event::KeyboardEnhancementFlags;
+#[cfg(unix)]
+use crate::event::TerminalGraphics;
 use crate::event::{Event, filter::Filter, read::InternalEventReader, timeout::PollTimeout};
 
 /// Static instance of `InternalEventReader`.
 /// This needs to be static because there can be one event reader.
 static EVENT_READER: Mutex<Option<InternalEventReader>> = parking_lot::const_mutex(None);
+#[cfg(unix)]
+static GRAPHICS_QUERY_ID: AtomicU32 = AtomicU32::new(0xca00_0001);
 
 pub(crate) fn lock_event_reader() -> MappedMutexGuard<'static, InternalEventReader> {
     MutexGuard::map(EVENT_READER.lock(), |reader| {
@@ -28,11 +34,21 @@ pub(crate) fn query_program_status(timeout: Duration) -> io::Result<bool> {
 
 #[cfg(unix)]
 pub(crate) fn query_kitty_graphics(timeout: Duration) -> io::Result<bool> {
+    query_terminal_graphics(timeout).map(|reply| reply.kitty)
+}
+
+#[cfg(unix)]
+pub(crate) fn query_terminal_graphics(timeout: Duration) -> io::Result<TerminalGraphics> {
     let timeout = PollTimeout::new(Some(timeout));
     let Some(mut reader) = try_lock_event_reader_for(timeout.leftover().unwrap_or_default()) else {
-        return Ok(false);
+        return Ok(TerminalGraphics::default());
     };
-    reader.query_kitty_graphics(timeout.leftover().unwrap_or_default(), &mut stdout().lock())
+    let id = GRAPHICS_QUERY_ID.fetch_add(1, Ordering::Relaxed).max(1);
+    reader.query_terminal_graphics(
+        timeout.leftover().unwrap_or_default(),
+        &mut stdout().lock(),
+        id,
+    )
 }
 
 fn try_lock_event_reader_for(
@@ -96,5 +112,8 @@ pub(crate) enum InternalEvent {
     PrimaryDeviceAttributes,
     ProgramStatusSupported,
     /// The terminal's answer to a Kitty graphics query: whether it said `OK`.
-    KittyGraphicsReply(bool),
+    KittyGraphicsReply(u32, bool),
+    /// Cell width and height in terminal-reported pixels, without device scaling.
+    CellSize(u16, u16),
+    GraphicsQueryLimit,
 }

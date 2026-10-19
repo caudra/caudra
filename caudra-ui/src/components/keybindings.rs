@@ -229,6 +229,11 @@ pub mod key {
     };
 
     /// The image viewer's keys. Bare, since nothing in it takes text.
+    pub const IMAGE_ZOOM_IN: Bind = Bind::from_workbench(wb::IMAGE_ZOOM_IN);
+    pub const IMAGE_ZOOM_OUT: Bind = Bind::from_workbench(wb::IMAGE_ZOOM_OUT);
+    pub const IMAGE_FIT: Bind = Bind::from_workbench(wb::IMAGE_FIT);
+    pub const IMAGE_ACTUAL: Bind = Bind::from_workbench(wb::IMAGE_ACTUAL);
+    pub const IMAGE_SAMPLING: Bind = Bind::from_workbench(wb::IMAGE_SAMPLING);
     pub const IMAGE_OPEN_EXTERNAL: Bind = Bind {
         code: KeyCode::Char('o'),
         modifiers: KeyModifiers::NONE,
@@ -1110,6 +1115,31 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::IMAGE_OPEN_EXTERNAL.label),
         description: "Open the picture in the system's image viewer",
+        context: KeybindContext::ImageViewer,
+    },
+    Keybind {
+        label: KeyLabel::Single("+ / - / wheel"),
+        description: "Zoom the picture (wheel anchors at the pointer)",
+        context: KeybindContext::ImageViewer,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::IMAGE_FIT.label),
+        description: "Fit the picture",
+        context: KeybindContext::ImageViewer,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::IMAGE_ACTUAL.label),
+        description: "Inspect at actual pixels (block renderers: samples)",
+        context: KeybindContext::ImageViewer,
+    },
+    Keybind {
+        label: KeyLabel::Single("↑ ↓ ← → / drag"),
+        description: "Pan the picture",
+        context: KeybindContext::ImageViewer,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::IMAGE_SAMPLING.label),
+        description: "Switch smooth / nearest sampling",
         context: KeybindContext::ImageViewer,
     },
     Keybind {

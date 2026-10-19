@@ -12,6 +12,7 @@ use caudra_config::InlineImages;
 use caudra_terminal_host::terminal_detect::{
     inside_herdr, inside_tmux, tmux_passes_kitty_graphics,
 };
+use crossterm::event::TerminalGraphics;
 
 use super::ImageMode;
 
@@ -27,6 +28,11 @@ pub(crate) struct Surroundings {
     pub tmux_passes_kitty: bool,
 }
 
+pub(crate) struct Detection {
+    pub mode: ImageMode,
+    pub cell_pixels: Option<(u16, u16)>,
+}
+
 impl Surroundings {
     fn current() -> Self {
         let tmux = inside_tmux();
@@ -39,9 +45,9 @@ impl Surroundings {
 }
 
 /// Resolves the configured setting, asking the terminal only when nothing
-/// else decides. Herdr stays on blocks unless Kitty is asked for by
-/// name, because its placeholders have been seen drawing blank. Inside tmux
-/// the query would reach tmux rather than the terminal, so its passthrough
+/// else decides. Herdr still draws blank placeholders despite accepting PNG
+/// queries, so automatic mode retains its character fallback.
+/// Inside tmux the query would reach tmux rather than the terminal, so its passthrough
 /// setting and client terminal answer instead.
 pub(crate) fn resolve(
     setting: InlineImages,
@@ -53,14 +59,29 @@ pub(crate) fn resolve(
         InlineImages::Blocks => ImageMode::Blocks,
         InlineImages::Sextants => ImageMode::Sextants,
         InlineImages::Kitty => ImageMode::Kitty,
-        InlineImages::Auto if around.herdr => ImageMode::Blocks,
+        InlineImages::Auto if around.herdr => {
+            tracing::debug!(
+                reason = "herdr_placeholders_unverified",
+                "inline image fallback"
+            );
+            ImageMode::Blocks
+        }
         InlineImages::Auto if around.tmux => match around.tmux_passes_kitty {
             true => ImageMode::Kitty,
-            false => ImageMode::Blocks,
+            false => {
+                tracing::debug!(
+                    reason = "tmux_passthrough_or_placeholders_unavailable",
+                    "inline image fallback"
+                );
+                ImageMode::Blocks
+            }
         },
         InlineImages::Auto => match probe() {
             Ok(true) => ImageMode::Kitty,
-            Ok(false) => ImageMode::Blocks,
+            Ok(false) => {
+                tracing::debug!(reason = "no_matching_png_reply", "inline image fallback");
+                ImageMode::Blocks
+            }
             Err(error) => {
                 tracing::debug!(%error, "kitty graphics query failed");
                 ImageMode::Blocks
@@ -71,20 +92,34 @@ pub(crate) fn resolve(
 
 /// Settles the mode for this terminal. Has to run in raw mode and before the
 /// input reader starts, since the query reads the reply off the terminal.
-pub(crate) fn detect(setting: InlineImages) -> ImageMode {
-    let mode = resolve(setting, Surroundings::current(), query_kitty);
-    tracing::info!(?setting, ?mode, "inline image mode");
-    mode
+pub(crate) fn detect(setting: InlineImages) -> Detection {
+    let around = Surroundings::current();
+    let mut cell_pixels = None;
+    let mode = resolve(setting, around, || {
+        let reply = query_kitty()?;
+        cell_pixels = reply.cell_pixels;
+        Ok(reply.kitty)
+    });
+    tracing::info!(
+        ?setting,
+        ?mode,
+        herdr = around.herdr,
+        tmux = around.tmux,
+        tmux_passthrough = around.tmux_passes_kitty,
+        ?cell_pixels,
+        "inline image mode"
+    );
+    Detection { mode, cell_pixels }
 }
 
-fn query_kitty() -> io::Result<bool> {
+fn query_kitty() -> io::Result<TerminalGraphics> {
     #[cfg(unix)]
     {
-        crossterm::event::query_kitty_graphics(KITTY_QUERY_TIMEOUT)
+        crossterm::event::query_terminal_graphics(KITTY_QUERY_TIMEOUT)
     }
     #[cfg(not(unix))]
     {
-        Ok(false)
+        Ok(TerminalGraphics::default())
     }
 }
 
@@ -125,7 +160,9 @@ mod tests {
     #[test_case(InlineImages::Auto, PLAIN, Reply::Ok => ImageMode::Kitty ; "auto_terminal_answers_ok")]
     #[test_case(InlineImages::Auto, PLAIN, Reply::Refused => ImageMode::Blocks ; "auto_terminal_refuses")]
     #[test_case(InlineImages::Auto, PLAIN, Reply::Silent => ImageMode::Blocks ; "auto_terminal_silent")]
-    #[test_case(InlineImages::Auto, HERDR, Reply::Ok => ImageMode::Blocks ; "auto_herdr_stays_blocks")]
+    #[test_case(InlineImages::Auto, HERDR, Reply::Ok => ImageMode::Blocks ; "png_reply_does_not_prove_herdr_placement")]
+    #[test_case(InlineImages::Auto, HERDR, Reply::Refused => ImageMode::Blocks ; "auto_herdr_disabled")]
+    #[test_case(InlineImages::Auto, HERDR, Reply::Silent => ImageMode::Blocks ; "auto_herdr_unknown")]
     #[test_case(InlineImages::Kitty, HERDR, Reply::Refused => ImageMode::Kitty ; "kitty_by_name_inside_herdr")]
     #[test_case(InlineImages::Auto, TMUX_CLOSED, Reply::Ok => ImageMode::Blocks ; "auto_tmux_without_passthrough")]
     #[test_case(InlineImages::Auto, TMUX_PASSING, Reply::Refused => ImageMode::Kitty ; "auto_tmux_with_passthrough")]
@@ -144,10 +181,18 @@ mod tests {
         })
     }
 
-    #[test_case(HERDR ; "herdr")]
     #[test_case(TMUX_CLOSED ; "tmux")]
     #[test_case(TMUX_PASSING ; "tmux_passing")]
-    fn a_multiplexer_is_never_probed(around: Surroundings) {
+    #[test_case(HERDR ; "herdr_unverified")]
+    fn guarded_hosts_are_never_probed(around: Surroundings) {
         resolve(InlineImages::Auto, around, || unreachable!("probed"));
+    }
+
+    #[test_case(InlineImages::Off)]
+    #[test_case(InlineImages::Blocks)]
+    #[test_case(InlineImages::Sextants)]
+    #[test_case(InlineImages::Kitty)]
+    fn explicit_modes_never_probe(setting: InlineImages) {
+        resolve(setting, HERDR, || unreachable!("probed"));
     }
 }

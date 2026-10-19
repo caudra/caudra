@@ -204,6 +204,22 @@ pub fn query_kitty_graphics(timeout: Duration) -> io::Result<bool> {
     internal::query_kitty_graphics(timeout)
 }
 
+/// Results of the bounded startup graphics and cell-size query.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TerminalGraphics {
+    /// PNG query acceptance, not proof of placeholder rendering by every host.
+    pub kitty: bool,
+    /// Cell width and height in the terminal's reported pixel units.
+    pub cell_pixels: Option<(u16, u16)>,
+}
+
+/// Queries PNG graphics and cell pixels through the existing input reader under
+/// one deadline. Call in raw mode before starting the application's event loop.
+#[cfg(unix)]
+pub fn query_terminal_graphics(timeout: Duration) -> io::Result<TerminalGraphics> {
+    internal::query_terminal_graphics(timeout)
+}
+
 /// Reads a single [`Event`](enum.Event.html).
 ///
 /// This function blocks until an [`Event`](enum.Event.html) is available. Combine it with the

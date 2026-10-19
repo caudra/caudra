@@ -182,9 +182,15 @@ The transcript draws pictures as thumbnails up to 16 rows tall. They appear on `
 
 Markdown images load only from local files. A relative path resolves against the session's working directory, and a `file:` URL works too. Caudra never fetches an image over the network, and a session on a remote workspace never reads this machine's disk. When a picture cannot be drawn, its alt text stays as a label.
 
-Click a picture to open it at full size. In the viewer, `o` opens the file in your system viewer, `w` opens it in the workbench, `y` copies its path, and `Esc` closes it. A pasted image has no file, so only `Esc` applies to it. Each image attached to a draft shows as an `[Image #1]` chip under the composer, and a click on a chip opens the same viewer. The workbench shows an image file as a picture instead of the binary file notice.
+Click a picture to open the image viewer. Each image attached to a draft shows as an `[Image #1]` chip under the composer, and a click on a chip opens the same viewer.
 
-A terminal that answers the Kitty graphics query draws the picture itself, at full resolution. Every other terminal gets coloured block characters, two by two pixels to a cell. Inside tmux, Caudra uses Kitty graphics only when `allow-passthrough` is on, and inside Herdr only when you ask for it.
+Use `+` and `-` to zoom, `0` to fit the picture, `1` for actual-size inspection, and the arrow keys to pan. The mouse wheel zooms around the pointer, and dragging pans the picture. Press `s` to switch between smooth resampling and nearest-neighbour sampling for pixel detail. These controls work on pasted images too.
+
+`Esc` or a click outside the picture closes the viewer, including a click in the blank margins inside the modal. Hint buttons still perform their actions, and dragging beyond the picture does not close it. For an image with a file, `o` opens it in your system viewer, `w` opens it in the workbench, and `y` copies its path.
+
+Actual-size inspection uses one source pixel per terminal pixel with pixel graphics. With character graphics, it uses one source pixel per sample along the coarser axis and preserves the picture's proportions. When the terminal does not report its pixel size, the viewer uses an estimate. Block graphics still approximate each cell with two colours, even when zoomed in. The workbench uses the same inspection controls for local image files.
+
+With `"auto"`, Caudra probes for Kitty image graphics. When the terminal answers, it draws image pixels sized to the display area. Otherwise Caudra uses coloured block characters, two by two samples to a cell. The terminal and any multiplexer between it and Caudra must support the image protocol and its Unicode placeholders. Inside tmux, Caudra requires `allow-passthrough` and a compatible client terminal. Inside Herdr, automatic mode keeps block rendering because accepting a graphics query does not yet guarantee visible placeholders. Forcing `"kitty"` can produce a blank image there.
 
 Set `"sextants"` for sharper blocks, two by three pixels to a cell. They need a font that has the Unicode 13 sextant characters, or a terminal that draws them itself, such as Ghostty, kitty, WezTerm, or foot. Without one, pictures show as boxes.
 

@@ -11,6 +11,7 @@ mod chrome;
 mod editor;
 mod explorer;
 mod fs;
+mod image_viewport;
 pub mod keys;
 mod menu;
 mod pointer;
@@ -23,7 +24,7 @@ pub mod transfer;
 mod view;
 
 pub use action::WorkbenchAction;
-pub use editor::rendered::{PaintImage, PaintMarkdown, PaintedMarkdown};
+pub use editor::rendered::{PaintImage, PaintMarkdown, PaintedImage, PaintedMarkdown};
 pub use editor::{DocumentKey, TabLabel, buffer, history, render, text_field};
 pub use fs::backend::{
     BackendDriver, BackendError, BackendEvent, BackendRevision, ListResult, LoadedFile,
@@ -33,6 +34,7 @@ pub use fs::backend::{
 };
 pub use fs::read::LocalSourceError;
 pub use fs::tree::HostMount;
+pub use image_viewport::{ImageGeometry, ImageSampling, ImageViewport};
 pub use pointer::Clicks;
 pub use style::WorkbenchStyles;
 use unicode_width::UnicodeWidthStr;
@@ -734,6 +736,7 @@ impl Workbench {
         self.cancel_pending_opens();
         for tab in self.editor.tabs_mut() {
             tab.remote_reload = false;
+            tab.image.clear_geometry();
         }
         self.watch = None;
         self.host_watch = None;
@@ -2047,6 +2050,15 @@ impl Workbench {
         if let Some(action) = self.scrollbar_mouse(&event) {
             return action;
         }
+        if self.menu.is_none()
+            && self.confirm.is_none()
+            && self.focused_field().is_none()
+            && let Some(tab) = self.editor.active_mut()
+            && tab.image.handle_mouse(event)
+        {
+            self.focus = Focus::Editor;
+            return WorkbenchAction::Consumed;
+        }
         let delta = match event.kind {
             MouseEventKind::ScrollUp => -SCROLL_LINES,
             MouseEventKind::ScrollDown => SCROLL_LINES,
@@ -2164,6 +2176,14 @@ impl Workbench {
     pub fn scroll(&mut self, column: u16, row: u16, delta: isize) {
         if self.transfer_input_active() {
             self.transfer.scroll(delta);
+            return;
+        }
+        if self.menu.is_none()
+            && self.confirm.is_none()
+            && self.focused_field().is_none()
+            && let Some(tab) = self.editor.active_mut()
+            && tab.image.scroll(column, row, -(delta as f64))
+        {
             return;
         }
         let at = (column, row);
@@ -4263,6 +4283,9 @@ impl Workbench {
         let Some(tab) = self.editor.active_mut() else {
             return WorkbenchAction::Consumed;
         };
+        if tab.image.geometry().is_some() && tab.image.handle_key(key) {
+            return WorkbenchAction::Consumed;
+        }
         if keys::SELECT_ALL.matches(key)
             && let Some(paint) = self.markdown
         {

@@ -1,4 +1,6 @@
 #[cfg(unix)]
+use crate::event::TerminalGraphics;
+#[cfg(unix)]
 use crate::event::filter::{KittyGraphicsFilter, ProgramStatusFilter};
 #[cfg(unix)]
 use std::io::Write;
@@ -13,6 +15,9 @@ use crate::event::sys::Waker;
 use crate::event::{
     filter::Filter, internal::InternalEvent, source::EventSource, timeout::PollTimeout,
 };
+
+#[cfg(unix)]
+const GRAPHICS_QUERY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
 /// Can be used to read `InternalEvent`s.
 pub(crate) struct InternalEventReader {
@@ -73,31 +78,45 @@ impl InternalEventReader {
     }
 
     #[cfg(unix)]
-    pub(crate) fn query_kitty_graphics(
+    pub(crate) fn query_terminal_graphics(
         &mut self,
         timeout: Duration,
         output: &mut impl Write,
-    ) -> io::Result<bool> {
-        const QUERY: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c";
+        id: u32,
+    ) -> io::Result<TerminalGraphics> {
+        if timeout.is_zero() {
+            return Ok(TerminalGraphics::default());
+        }
+        self.events.retain(|event| !KittyGraphicsFilter.eval(event));
         if let Some(source) = self.source.as_mut() {
             source.set_graphics_query(true);
         }
         let result = (|| {
             let timeout = PollTimeout::new(Some(timeout));
-            output.write_all(QUERY)?;
+            write!(
+                output,
+                "\x1b_Gi={id},a=q,t=d,f=100;{GRAPHICS_QUERY_PNG}\x1b\\\x1b[16t\x1b[c"
+            )?;
             output.flush()?;
-            let mut supported = false;
+            let mut reply = TerminalGraphics::default();
             while self.poll(timeout.leftover(), &KittyGraphicsFilter)? {
                 match self.try_read(&KittyGraphicsFilter) {
-                    Some(InternalEvent::KittyGraphicsReply(ok)) => supported = ok,
-                    Some(InternalEvent::PrimaryDeviceAttributes) => return Ok(supported),
-                    _ => return Ok(false),
+                    Some(InternalEvent::KittyGraphicsReply(reply_id, ok)) if reply_id == id => {
+                        reply.kitty = ok
+                    }
+                    Some(InternalEvent::CellSize(width, height)) => {
+                        reply.cell_pixels = Some((width, height))
+                    }
+                    Some(
+                        InternalEvent::PrimaryDeviceAttributes | InternalEvent::GraphicsQueryLimit,
+                    ) => break,
+                    _ => {}
                 }
                 if timeout.elapsed() {
                     break;
                 }
             }
-            Ok(supported)
+            Ok(reply)
         })();
         if let Some(source) = self.source.as_mut() {
             source.set_graphics_query(false);
@@ -129,6 +148,11 @@ impl InternalEventReader {
         let poll_timeout = PollTimeout::new(timeout);
 
         loop {
+            if self.events.len().saturating_add(self.skipped_events.len()) >= filter.pending_limit()
+            {
+                self.events.extend(self.skipped_events.drain(..));
+                return Ok(false);
+            }
             let maybe_event = match event_source.try_read(poll_timeout.leftover()) {
                 Ok(None) => {
                     self.events.extend(self.skipped_events.drain(..));
@@ -324,18 +348,24 @@ mod program_status_tests {
         assert!(reader.events.is_empty());
     }
 
-    const GRAPHICS_QUERY: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c";
+    const GRAPHICS_ID: u32 = 31;
+    const GRAPHICS_QUERY: &[u8] = b"\x1b_Gi=31,a=q,t=d,f=100;iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==\x1b\\\x1b[16t\x1b[c";
 
     #[test_case(b"\x1b_Gi=31;OK\x1b\\\x1b[?62;4c", true; "ok_then_fence")]
     #[test_case(b"\x1b_Gi=31;ENOTSUPPORTED:no\x1b\\\x1b[?62c", false; "error_then_fence")]
     #[test_case(b"\x1b[?62c", false; "fence_only")]
     #[test_case(b"", false; "timeout")]
+    #[test_case(b"\x1b_Gi=32;OK\x1b\\\x1b[?62c", false; "unrelated_id")]
+    #[test_case(b"\x1b_Gi=32;OK\x1b\\\x1b_Gi=31;OK\x1b\\\x1b[?62c", true; "unrelated_then_matching")]
     fn kitty_graphics_query_needs_ok_before_fence(reply: &[u8], expected: bool) {
         for chunk_size in [1, 3, usize::MAX] {
             let mut reader = reader(&[b"a".as_slice(), reply].concat(), chunk_size, None);
             let mut output = Vec::new();
             assert_eq!(
-                reader.query_kitty_graphics(TIMEOUT, &mut output).unwrap(),
+                reader
+                    .query_terminal_graphics(TIMEOUT, &mut output, GRAPHICS_ID)
+                    .unwrap()
+                    .kitty,
                 expected
             );
             assert_eq!(output, GRAPHICS_QUERY);
@@ -344,6 +374,103 @@ mod program_status_tests {
                 vec![InternalEvent::Event(Event::Key(KeyCode::Char('a').into()))]
             );
         }
+    }
+
+    #[test]
+    fn graphics_and_size_share_one_fence_and_preserve_input() {
+        let input = b"a\x1b_Gi=31;OK\x1b\\\x1b[6;20;10t\x1b[?62cz";
+        for chunk_size in [1, 3, usize::MAX] {
+            let mut reader = reader(input, chunk_size, None);
+            let reply = reader
+                .query_terminal_graphics(TIMEOUT, &mut Vec::new(), GRAPHICS_ID)
+                .unwrap();
+            assert!(reply.kitty);
+            assert_eq!(reply.cell_pixels, Some((10, 20)));
+            assert_eq!(
+                remaining_input(&mut reader),
+                vec![
+                    InternalEvent::Event(Event::Key(KeyCode::Char('a').into())),
+                    InternalEvent::Event(Event::Key(KeyCode::Char('z').into())),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn graphics_input_budget_stops_without_losing_keys() {
+        const KEY_COUNT: usize = 2048;
+        let mut reader = reader(&vec![b'a'; KEY_COUNT], 1, None);
+        assert!(
+            !reader
+                .query_terminal_graphics(TIMEOUT, &mut Vec::new(), GRAPHICS_ID)
+                .unwrap()
+                .kitty
+        );
+        assert!(reader.events.len() < KEY_COUNT);
+        assert_eq!(remaining_input(&mut reader).len(), KEY_COUNT);
+    }
+
+    #[test]
+    fn expired_graphics_budget_sends_nothing() {
+        let mut reader = reader(b"a", 1, None);
+        let mut output = Vec::new();
+        assert!(
+            !reader
+                .query_terminal_graphics(Duration::ZERO, &mut output, GRAPHICS_ID)
+                .unwrap()
+                .kitty
+        );
+        assert!(output.is_empty());
+        assert_eq!(remaining_input(&mut reader).len(), 1);
+    }
+
+    #[test]
+    fn graphics_reply_after_fence_cannot_enable_support() {
+        let mut reader = reader(b"\x1b[?62c\x1b_Gi=31;OK\x1b\\z", usize::MAX, None);
+        assert!(
+            !reader
+                .query_terminal_graphics(TIMEOUT, &mut Vec::new(), GRAPHICS_ID)
+                .unwrap()
+                .kitty
+        );
+        assert_eq!(
+            remaining_input(&mut reader),
+            vec![InternalEvent::Event(Event::Key(KeyCode::Char('z').into()))]
+        );
+    }
+
+    #[test_case(io::ErrorKind::BrokenPipe; "io_error")]
+    #[test_case(io::ErrorKind::Interrupted; "interrupted")]
+    fn graphics_errors_retain_unrelated_input(error: io::ErrorKind) {
+        let mut reader = reader("a界\x1b".as_bytes(), 1, Some(error));
+        let result = reader.query_terminal_graphics(TIMEOUT, &mut Vec::new(), GRAPHICS_ID);
+        if error == io::ErrorKind::Interrupted {
+            assert!(!result.unwrap().kitty);
+        } else {
+            assert_eq!(result.unwrap_err().kind(), error);
+        }
+        assert_eq!(
+            remaining_input(&mut reader),
+            vec![
+                InternalEvent::Event(Event::Key(KeyCode::Char('a').into())),
+                InternalEvent::Event(Event::Key(KeyCode::Char('界').into())),
+                InternalEvent::Event(Event::Key(KeyCode::Esc.into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn queued_replies_from_earlier_queries_do_not_enable_support() {
+        let mut reader = reader(b"\x1b[?62c", 1, None);
+        reader
+            .events
+            .push_back(InternalEvent::KittyGraphicsReply(GRAPHICS_ID, true));
+        reader.events.push_back(InternalEvent::CellSize(8, 16));
+        let reply = reader
+            .query_terminal_graphics(TIMEOUT, &mut Vec::new(), GRAPHICS_ID)
+            .unwrap();
+        assert!(!reply.kitty);
+        assert_eq!(reply.cell_pixels, None);
     }
 
     #[test_case(io::ErrorKind::BrokenPipe; "io_error")]

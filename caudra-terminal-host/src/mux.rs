@@ -1,9 +1,15 @@
 use std::env;
 use std::ffi::OsString;
 
+use crate::herdr::HerdrEnv;
+use crate::orca::OrcaEnv;
+
 const ZELLIJ: &str = "ZELLIJ";
 const TMUX: &str = "TMUX";
 const SCREEN: &str = "STY";
+const HERDR_TERM_PROGRAM: &str = "herdr";
+const TMUX_TERM_PROGRAM: &str = "tmux";
+const TERM: &str = "TERM";
 
 /// The terminal multiplexer between Caudra and the terminal, if any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +26,25 @@ impl TerminalMux {
     }
 
     pub fn detect_from(get: impl Fn(&str) -> Option<OsString>) -> Self {
+        let program = get(crate::TERM_PROGRAM);
+        // Screen preserves TERM_PROGRAM from its parent, unlike tmux.
+        if get(SCREEN).is_some()
+            && program.as_deref() != Some(TMUX_TERM_PROGRAM.as_ref())
+            && get(TERM).is_some_and(|term| {
+                term.to_str().is_some_and(|term| {
+                    term == "screen" || term.starts_with("screen-") || term.starts_with("screen.")
+                })
+            })
+        {
+            return Self::Screen;
+        }
+        if (program.as_deref() == Some(crate::orca::TERM_PROGRAM_NAME.as_ref())
+            && OrcaEnv::from_env(&get).is_some())
+            || (program.as_deref() == Some(HERDR_TERM_PROGRAM.as_ref())
+                && HerdrEnv::from_env(&get).is_some())
+        {
+            return Self::None;
+        }
         if get(ZELLIJ).is_some() {
             Self::Zellij
         } else if get(TMUX).is_some() {
@@ -112,6 +137,55 @@ mod tests {
     #[test_case(&[], TerminalMux::None ; "none")]
     fn the_innermost_known_multiplexer_is_detected(set: &[&str], expected: TerminalMux) {
         assert_eq!(detect(set), expected);
+    }
+
+    #[test_case("herdr", true, false, TerminalMux::None ; "herdr_inside_tmux")]
+    #[test_case("Orca", true, true, TerminalMux::None ; "orca_inherits_herdr_and_tmux")]
+    #[test_case("tmux", true, true, TerminalMux::Tmux ; "tmux_inside_hosts")]
+    #[test_case("Orca", true, false, TerminalMux::Tmux ; "unconfirmed_orca_keeps_transport")]
+    #[test_case("herdr", false, false, TerminalMux::Tmux ; "partial_herdr_keeps_transport")]
+    fn confirmed_inner_hosts_do_not_wrap_for_inherited_muxes(
+        program: &str,
+        herdr: bool,
+        orca: bool,
+        expected: TerminalMux,
+    ) {
+        let mux = TerminalMux::detect_from(|name| {
+            match name {
+                crate::TERM_PROGRAM => Some(program),
+                TMUX => Some("inherited"),
+                "HERDR_ENV" if herdr => Some("1"),
+                "HERDR_PANE_ID" if herdr => Some("w1:p1"),
+                "HERDR_SOCKET_PATH" if herdr => Some("/tmp/herdr.sock"),
+                "ORCA_PANE_KEY" if orca => Some("tab:leaf"),
+                _ => None,
+            }
+            .map(OsString::from)
+        });
+        assert_eq!(mux, expected);
+    }
+
+    #[test_case("herdr", "screen", TerminalMux::Screen ; "screen_inside_herdr")]
+    #[test_case("Orca", "screen-256color", TerminalMux::Screen ; "screen_inside_orca")]
+    #[test_case("Orca", "screen.xterm-256color", TerminalMux::Screen ; "screen_extended_terminal_name")]
+    #[test_case("herdr", "xterm-256color", TerminalMux::None ; "herdr_inside_screen")]
+    #[test_case("Orca", "xterm-256color", TerminalMux::None ; "orca_inside_screen")]
+    #[test_case("tmux", "screen-256color", TerminalMux::Tmux ; "tmux_inside_screen")]
+    fn screen_nesting_uses_its_terminal_identity(program: &str, term: &str, expected: TerminalMux) {
+        let mux = TerminalMux::detect_from(|name| {
+            match name {
+                crate::TERM_PROGRAM => Some(program),
+                TERM => Some(term),
+                SCREEN | TMUX => Some("inherited"),
+                "HERDR_ENV" => Some("1"),
+                "HERDR_PANE_ID" => Some("w1:p1"),
+                "HERDR_SOCKET_PATH" => Some("/tmp/herdr.sock"),
+                "ORCA_PANE_KEY" => Some("tab:leaf"),
+                _ => None,
+            }
+            .map(OsString::from)
+        });
+        assert_eq!(mux, expected);
     }
 
     #[test_case(TerminalMux::None ; "none")]

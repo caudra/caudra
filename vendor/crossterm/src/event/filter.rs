@@ -1,9 +1,16 @@
 use crate::event::internal::InternalEvent;
 
+#[cfg(unix)]
+const QUERY_PENDING_EVENT_LIMIT: usize = 1024;
+
 /// Interface for filtering an `InternalEvent`.
 pub(crate) trait Filter: Send + Sync + 'static {
     /// Returns whether the given event fulfills the filter.
     fn eval(&self, event: &InternalEvent) -> bool;
+
+    fn pending_limit(&self) -> usize {
+        usize::MAX
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -67,8 +74,15 @@ impl Filter for KittyGraphicsFilter {
     fn eval(&self, event: &InternalEvent) -> bool {
         matches!(
             event,
-            InternalEvent::KittyGraphicsReply(_) | InternalEvent::PrimaryDeviceAttributes
+            InternalEvent::KittyGraphicsReply(..)
+                | InternalEvent::CellSize(..)
+                | InternalEvent::GraphicsQueryLimit
+                | InternalEvent::PrimaryDeviceAttributes
         )
+    }
+
+    fn pending_limit(&self) -> usize {
+        QUERY_PENDING_EVENT_LIMIT
     }
 }
 

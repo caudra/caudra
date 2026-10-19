@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::io;
+use std::time::{Duration, Instant};
 
 use crate::event::{
     ColorScheme, Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
@@ -16,6 +17,8 @@ const PROGRAM_STATUS_KEY_LIMIT: usize = 16;
 const KITTY_GRAPHICS_REPLY_PREFIX: &[u8] = b"\x1b_G";
 const KITTY_GRAPHICS_OK: &[u8] = b"OK";
 const HOST_MESSAGE_PREFIX: &[u8] = b"\x1b]9999;";
+const GRAPHICS_QUERY_BYTE_LIMIT: usize = 64 * 1024;
+const APC_RECOVERY_TIMEOUT: Duration = Duration::from_millis(250);
 
 // Event parsing
 //
@@ -199,10 +202,33 @@ fn parse_apc(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
         .filter(|fields| !fields.contains(&b'\x1b'))
         .and_then(|fields| {
             let separator = fields.iter().position(|byte| *byte == b';')?;
-            Some(&fields[separator + 1..] == KITTY_GRAPHICS_OK)
+            let keys = std::str::from_utf8(&fields[..separator]).ok()?;
+            let mut id = None;
+            let mut placement = None;
+            for key in keys.split(',') {
+                let (name, value) = key.split_once('=')?;
+                let slot = match name {
+                    "i" => &mut id,
+                    "p" => &mut placement,
+                    _ => return None,
+                };
+                if slot.is_some() {
+                    return None;
+                }
+                *slot = Some(parse_decimal(value).ok()?);
+            }
+            let message = &fields[separator + 1..];
+            if message.is_empty()
+                || !message
+                    .iter()
+                    .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+            {
+                return None;
+            }
+            Some((id.filter(|id| *id != 0)?, message == KITTY_GRAPHICS_OK))
         });
     match reply {
-        Some(ok) => Ok(Some(InternalEvent::KittyGraphicsReply(ok))),
+        Some((id, ok)) => Ok(Some(InternalEvent::KittyGraphicsReply(id, ok))),
         None => Err(could_not_parse_event_error()),
     }
 }
@@ -340,6 +366,7 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
                         b'~' => return parse_csi_special_key_code(buffer),
                         b'u' => return parse_csi_u_encoded_key_code(buffer),
                         b'R' => return parse_csi_cursor_position(buffer),
+                        b't' => return parse_cell_size(buffer),
                         _ => return parse_csi_modifier_key_code(buffer),
                     }
                 }
@@ -349,6 +376,27 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
     };
 
     Ok(input_event.map(InternalEvent::Event))
+}
+
+fn parse_cell_size(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
+    let fields = buffer
+        .strip_prefix(b"\x1b[6;")
+        .and_then(|value| value.strip_suffix(b"t"))
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .ok_or_else(could_not_parse_event_error)?;
+    let (height, width) = fields
+        .split_once(';')
+        .ok_or_else(could_not_parse_event_error)?;
+    let dimension = |value: &str| {
+        u16::try_from(parse_decimal(value)?)
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(could_not_parse_event_error)
+    };
+    Ok(Some(InternalEvent::CellSize(
+        dimension(width)?,
+        dimension(height)?,
+    )))
 }
 
 pub(crate) fn next_parsed<T>(iter: &mut dyn Iterator<Item = &str>) -> io::Result<T>
@@ -1165,6 +1213,8 @@ mod tests {
     }
 
     #[test_case(b"\x1b[97;1;", 0, b"xy\r"; "short_ascii_tail")]
+    #[test_case(b"\x1b[97;1;", 0, b"txy\r"; "window_final_is_not_a_cell_report")]
+    #[test_case(b"\x1b[0;;", CSI_SEQUENCE_LIMIT, b"txy\r"; "oversize_window_final")]
     #[test_case(b"\x1b[0;;", CSI_SEQUENCE_LIMIT, b"xy\r"; "oversize_ascii_tail")]
     #[test_case(b"\x1b[97;1;", 0, b"97Dy\r"; "short_legacy_key_final")]
     #[test_case(b"\x1b[0;;", CSI_SEQUENCE_LIMIT, b"97Dy\r"; "oversize_legacy_key_final")]
@@ -2132,6 +2182,8 @@ pub(crate) struct Parser {
     discarding_csi: Option<CsiDiscard>,
     program_status_query: bool,
     graphics_query: bool,
+    graphics_query_bytes: usize,
+    apc_deadline: Option<Instant>,
 }
 
 impl Default for Parser {
@@ -2158,6 +2210,8 @@ impl Default for Parser {
             discarding_csi: None,
             program_status_query: false,
             graphics_query: false,
+            graphics_query_bytes: 0,
+            apc_deadline: None,
         }
     }
 }
@@ -2170,7 +2224,9 @@ impl Parser {
             if self.buffer.starts_with(b"\x1b]") && self.buffer.len() > 2 {
                 self.buffer.clear();
             }
-            self.discarding_osc = false;
+            if self.apc_deadline.is_none() {
+                self.discarding_osc = false;
+            }
             self.flush();
         }
     }
@@ -2178,11 +2234,16 @@ impl Parser {
     #[cfg(unix)]
     pub(crate) fn set_graphics_query(&mut self, enabled: bool) {
         self.graphics_query = enabled;
+        self.graphics_query_bytes = 0;
         if !enabled {
-            if self.buffer.starts_with(b"\x1b_") && self.buffer.len() > 2 {
-                self.buffer.clear();
-            }
-            self.discarding_osc = false;
+            self.internal_events.retain(|event| {
+                !matches!(
+                    event,
+                    InternalEvent::KittyGraphicsReply(..)
+                        | InternalEvent::CellSize(..)
+                        | InternalEvent::GraphicsQueryLimit
+                )
+            });
             self.flush();
         }
     }
@@ -2217,8 +2278,48 @@ impl Parser {
     }
 
     pub(crate) fn advance(&mut self, buffer: &[u8], more: bool) {
+        self.advance_at(buffer, more, Instant::now());
+    }
+
+    pub(crate) fn poll_timeout(&self, timeout: Option<Duration>) -> Option<Duration> {
+        match self.apc_deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                Some(timeout.map_or(remaining, |timeout| timeout.min(remaining)))
+            }
+            None => timeout,
+        }
+    }
+
+    fn expire_apc(&mut self, now: Instant) {
+        // The fixed deadline also covers discard mode: a missing ST must not
+        // capture subsequent typing forever, even if bytes keep arriving.
+        if self.apc_deadline.is_some_and(|deadline| now >= deadline) {
+            if self.buffer == b"\x1b_" {
+                self.internal_events
+                    .push_back(InternalEvent::Event(Event::Key(KeyEvent::new(
+                        KeyCode::Char('_'),
+                        KeyModifiers::ALT,
+                    ))));
+            }
+            self.buffer.clear();
+            self.discarding_osc = false;
+            self.apc_deadline = None;
+        }
+    }
+
+    fn advance_at(&mut self, buffer: &[u8], more: bool, now: Instant) {
+        self.expire_apc(now);
         for (idx, byte) in buffer.iter().enumerate() {
             let more = idx + 1 < buffer.len() || more;
+
+            if self.graphics_query {
+                self.graphics_query_bytes = self.graphics_query_bytes.saturating_add(1);
+                if self.graphics_query_bytes == GRAPHICS_QUERY_BYTE_LIMIT {
+                    self.internal_events
+                        .push_back(InternalEvent::GraphicsQueryLimit);
+                }
+            }
 
             if let Some(discard) = &self.discarding_csi {
                 if discard.terminated(*byte) {
@@ -2246,26 +2347,54 @@ impl Parser {
             if !self.program_status_query {
                 self.release_diverged_host_prefix();
             }
+            if !self.graphics_query
+                && self.buffer.len() == KITTY_GRAPHICS_REPLY_PREFIX.len()
+                && self.buffer.starts_with(b"\x1b_")
+                && *byte != b'G'
+            {
+                self.internal_events
+                    .push_back(InternalEvent::Event(Event::Key(KeyEvent::new(
+                        KeyCode::Char('_'),
+                        KeyModifiers::ALT,
+                    ))));
+                self.buffer.clear();
+                self.buffer.push(*byte);
+                self.apc_deadline = None;
+            }
             let host_message = self.buffer.starts_with(HOST_MESSAGE_PREFIX);
             if !host_message && host_message_pending(&self.buffer, more) {
                 continue;
             }
             let osc_reply =
                 !host_message && self.program_status_query && self.buffer.starts_with(b"\x1b]");
-            let apc_reply = self.graphics_query && self.buffer.starts_with(b"\x1b_");
+            if self.buffer == b"\x1b_" {
+                self.apc_deadline.get_or_insert(now + APC_RECOVERY_TIMEOUT);
+                continue;
+            }
+            let apc_reply = (self.graphics_query && self.buffer.starts_with(b"\x1b_"))
+                || self.buffer.starts_with(KITTY_GRAPHICS_REPLY_PREFIX);
             if (host_message || osc_reply || apc_reply)
                 && (self.discarding_osc || self.buffer.len() > OSC_SEQUENCE_LIMIT)
             {
-                self.discarding_osc = !osc_terminated(&self.buffer);
+                self.discarding_osc = if apc_reply {
+                    !self.buffer.ends_with(b"\x1b\\")
+                } else {
+                    !osc_terminated(&self.buffer)
+                };
                 if self.discarding_osc {
                     self.buffer.truncate(if host_message {
                         HOST_MESSAGE_PREFIX.len()
+                    } else if apc_reply {
+                        KITTY_GRAPHICS_REPLY_PREFIX.len()
                     } else {
                         2
                     });
                     self.buffer.push(*byte);
                 } else {
                     self.buffer.clear();
+                    if apc_reply {
+                        self.apc_deadline = None;
+                    }
                 }
                 continue;
             }
@@ -2286,19 +2415,33 @@ impl Parser {
                 Ok(None) => {}
                 _ if *byte != b'u'
                     && csi_has_associated_text(&self.buffer)
-                    && !matches!(&event, Ok(Some(InternalEvent::Event(Event::Mouse(_))))) =>
+                    && !matches!(
+                        &event,
+                        Ok(Some(
+                            InternalEvent::Event(Event::Mouse(_)) | InternalEvent::CellSize(..)
+                        ))
+                    ) =>
                 {
                     self.discarding_csi = Some(CsiDiscard::AssociatedText);
                     self.buffer.clear();
                 }
                 Ok(Some(ie)) => {
-                    self.internal_events.push_back(ie);
+                    if self.graphics_query
+                        || !matches!(
+                            ie,
+                            InternalEvent::KittyGraphicsReply(..) | InternalEvent::CellSize(..)
+                        )
+                    {
+                        self.internal_events.push_back(ie);
+                    }
                     self.buffer.clear();
+                    self.apc_deadline = None;
                 }
                 Err(_) => {
                     // Event can't be parsed (not enough parameters, parameter is not a number, ...).
                     // Clear the buffer and continue with another sequence.
                     self.buffer.clear();
+                    self.apc_deadline = None;
                 }
             }
         }
@@ -2324,6 +2467,9 @@ impl Parser {
     /// the remaining bytes can be completed by subsequent input.
     #[allow(dead_code)]
     pub(crate) fn flush(&mut self) {
+        if self.apc_deadline.is_some() {
+            return;
+        }
         if self.buffer.is_empty() || self.buffer.starts_with(HOST_MESSAGE_PREFIX) {
             return;
         }
@@ -2350,6 +2496,9 @@ impl Iterator for Parser {
     type Item = InternalEvent;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.apc_deadline.is_some() {
+            self.expire_apc(Instant::now());
+        }
         self.internal_events.pop_front()
     }
 }
@@ -2528,8 +2677,11 @@ mod parser_flush_tests {
 
 #[cfg(all(test, unix))]
 mod kitty_graphics_tests {
-    use super::{OSC_SEQUENCE_LIMIT, Parser, parse_apc};
+    use super::{
+        APC_RECOVERY_TIMEOUT, GRAPHICS_QUERY_BYTE_LIMIT, OSC_SEQUENCE_LIMIT, Parser, parse_apc,
+    };
     use crate::event::{Event, KeyCode, KeyEvent, KeyModifiers, internal::InternalEvent};
+    use std::time::Instant;
     use test_case::test_case;
 
     const OK: &[u8] = b"\x1b_Gi=31;OK\x1b\\";
@@ -2538,7 +2690,7 @@ mod kitty_graphics_tests {
     #[test_case(b"\x1b_Gi=31,p=2;OK\x1b\\", true; "extra_keys")]
     #[test_case(b"\x1b_Gi=31;ENOENT:no such image\x1b\\", false; "error")]
     fn complete_reply_survives_every_split(reply: &[u8], ok: bool) {
-        let expected = Some(InternalEvent::KittyGraphicsReply(ok));
+        let expected = Some(InternalEvent::KittyGraphicsReply(31, ok));
         assert_eq!(parse_apc(reply).unwrap(), expected);
         for split in 1..reply.len() {
             let mut parser = Parser::default();
@@ -2554,6 +2706,12 @@ mod kitty_graphics_tests {
     #[test_case(b"\x1b_Gi=31\x1b\\"; "missing_message")]
     #[test_case(b"\x1b_Xi=31;OK\x1b\\"; "not_graphics")]
     #[test_case(b"\x1b_Gi=31;\x1b[31mOK\x1b\\"; "embedded_escape")]
+    #[test_case(b"\x1b_G;OK\x1b\\"; "missing_id")]
+    #[test_case(b"\x1b_Gi=0;OK\x1b\\"; "zero_id")]
+    #[test_case(b"\x1b_Gi=31,i=32;OK\x1b\\"; "duplicate_id")]
+    #[test_case(b"\x1b_Gi=+31;OK\x1b\\"; "signed_id")]
+    #[test_case(b"\x1b_Gi=4294967296;OK\x1b\\"; "overflow_id")]
+    #[test_case(b"\x1b_Gi=31;\x07OK\x1b\\"; "control_in_message")]
     fn malformed_reply_never_becomes_input(reply: &[u8]) {
         assert!(parse_apc(reply).is_err());
         let mut parser = Parser::default();
@@ -2563,19 +2721,26 @@ mod kitty_graphics_tests {
             parser.collect::<Vec<_>>(),
             vec![
                 InternalEvent::Event(Event::Key(KeyCode::Char('a').into())),
-                InternalEvent::KittyGraphicsReply(true),
+                InternalEvent::KittyGraphicsReply(31, true),
             ]
         );
     }
 
-    #[test]
-    fn truncated_reply_does_not_capture_input_after_query() {
+    #[test_case(false; "partial_reply")]
+    #[test_case(true; "oversized_reply")]
+    fn unterminated_reply_has_a_fixed_recovery_deadline(oversized: bool) {
         let mut parser = Parser::default();
+        let now = Instant::now();
         parser.set_graphics_query(true);
-        parser.advance(b"\x1b_Gi=31;O", false);
+        parser.advance_at(b"\x1b_Gi=31;O", false, now);
+        if oversized {
+            parser.advance_at(&vec![b'x'; OSC_SEQUENCE_LIMIT], false, now);
+        }
         parser.set_graphics_query(false);
+        parser.advance_at(b"more", false, now + APC_RECOVERY_TIMEOUT / 2);
         assert_eq!(parser.next(), None);
-        parser.advance(b"a", false);
+        assert!(parser.buffer.len() <= OSC_SEQUENCE_LIMIT);
+        parser.advance_at(b"a", false, now + APC_RECOVERY_TIMEOUT);
         assert_eq!(
             parser.next(),
             Some(InternalEvent::Event(Event::Key(KeyCode::Char('a').into())))
@@ -2596,9 +2761,12 @@ mod kitty_graphics_tests {
     }
 
     #[test]
-    fn alt_underscore_outside_a_query_stays_a_key() {
+    fn bare_alt_underscore_is_released_after_prefix_grace() {
         let mut parser = Parser::default();
-        parser.advance(b"\x1b_", false);
+        let now = Instant::now();
+        parser.advance_at(b"\x1b_", false, now);
+        assert_eq!(parser.next(), None);
+        parser.advance_at(b"", false, now + APC_RECOVERY_TIMEOUT);
         assert_eq!(
             parser.next(),
             Some(InternalEvent::Event(Event::Key(KeyEvent::new(
@@ -2606,6 +2774,120 @@ mod kitty_graphics_tests {
                 KeyModifiers::ALT
             ))))
         );
+    }
+
+    #[test_case(false; "query_disabled")]
+    #[test_case(true; "timeout_between_chunks")]
+    fn late_replies_preserve_every_prefix_split(timeout_between: bool) {
+        for split in 2..OK.len() {
+            let now = Instant::now();
+            let mut parser = Parser::default();
+            if timeout_between {
+                parser.set_graphics_query(true);
+            }
+            parser.advance_at(&OK[..split], false, now);
+            if timeout_between {
+                parser.set_graphics_query(false);
+            }
+            parser.flush();
+            assert_eq!(parser.next(), None, "split {split}");
+            parser.advance_at(&OK[split..], false, now);
+            parser.advance_at(b"z", false, now);
+            assert_eq!(
+                parser.collect::<Vec<_>>(),
+                vec![InternalEvent::Event(Event::Key(KeyCode::Char('z').into()))],
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn late_reply_split_after_escape_uses_pending_input_contract() {
+        let mut parser = Parser::default();
+        parser.advance(&OK[..1], true);
+        parser.advance(&OK[1..], false);
+        assert_eq!(parser.next(), None);
+    }
+
+    #[test]
+    fn oversized_reply_discard_survives_query_timeout() {
+        let mut parser = Parser::default();
+        parser.set_graphics_query(true);
+        parser.advance(b"\x1b_Gi=31;", false);
+        parser.advance(&vec![b'x'; OSC_SEQUENCE_LIMIT], false);
+        parser.set_graphics_query(false);
+        parser.advance(b"tail\x1b", false);
+        parser.advance(b"\\z", false);
+        assert_eq!(
+            parser.collect::<Vec<_>>(),
+            vec![InternalEvent::Event(Event::Key(KeyCode::Char('z').into()))]
+        );
+    }
+
+    #[test]
+    fn alt_underscore_followed_by_typing_is_preserved() {
+        let mut parser = Parser::default();
+        parser.advance(b"\x1b_x", false);
+        assert_eq!(
+            parser.collect::<Vec<_>>(),
+            vec![
+                InternalEvent::Event(Event::Key(KeyEvent::new(
+                    KeyCode::Char('_'),
+                    KeyModifiers::ALT
+                ))),
+                InternalEvent::Event(Event::Key(KeyCode::Char('x').into())),
+            ]
+        );
+    }
+
+    #[test_case(b"\x1b[6;20;10t", Some((10, 20)); "cell_size")]
+    #[test_case(b"\x1b[6;0;10t", None; "zero_height")]
+    #[test_case(b"\x1b[6;20;0t", None; "zero_width")]
+    #[test_case(b"\x1b[6;20;65536t", None; "overflow")]
+    #[test_case(b"\x1b[6;20;10;1t", None; "extra_field")]
+    #[test_case(b"\x1b[4;800;600t", None; "window_is_not_cell")]
+    fn cell_size_reports_are_strict(reply: &[u8], expected: Option<(u16, u16)>) {
+        for split in 1..reply.len() {
+            let mut parser = Parser::default();
+            parser.set_graphics_query(true);
+            parser.advance(&reply[..split], false);
+            parser.advance(&reply[split..], false);
+            assert_eq!(
+                parser.next(),
+                expected.map(|(width, height)| InternalEvent::CellSize(width, height))
+            );
+            assert_eq!(parser.next(), None);
+        }
+    }
+
+    #[test]
+    fn late_coalesced_graphics_and_size_reports_are_not_keys() {
+        let mut parser = Parser::default();
+        parser.advance(&[OK, b"\x1b[6;20;10tz"].concat(), false);
+        assert_eq!(
+            parser.collect::<Vec<_>>(),
+            vec![InternalEvent::Event(Event::Key(KeyCode::Char('z').into()))]
+        );
+    }
+
+    #[cfg(feature = "bracketed-paste")]
+    #[test]
+    fn query_byte_budget_preserves_incomplete_paste() {
+        let mut parser = Parser::default();
+        parser.set_graphics_query(true);
+        parser.advance(b"\x1b[200~", false);
+        let text = vec![b'a'; GRAPHICS_QUERY_BYTE_LIMIT];
+        parser.advance(&text, false);
+        assert_eq!(parser.next(), Some(InternalEvent::GraphicsQueryLimit));
+        parser.set_graphics_query(false);
+        parser.advance(b"\x1b[201~", false);
+        assert_eq!(
+            parser.next(),
+            Some(InternalEvent::Event(Event::Paste(
+                String::from_utf8(text).unwrap()
+            )))
+        );
+        assert_eq!(parser.next(), None);
     }
 }
 

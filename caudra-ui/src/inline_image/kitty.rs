@@ -21,6 +21,7 @@ const ESCAPE_END: &str = "\u{1b}\\";
 const CHUNK_BYTES: usize = 4096;
 /// Ids travel as a 256-colour index, which the colour downgrade leaves alone.
 const MAX_IMAGE_ID: u8 = u8::MAX;
+const UPLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Row and column numbers, in the order the protocol assigns them.
 const DIACRITICS: [char; 297] = [
@@ -356,11 +357,6 @@ pub(super) fn delete(id: u8) -> String {
     format!("{ESCAPE_START}a=d,d=I,q=2,i={id}{ESCAPE_END}")
 }
 
-/// Frees every image this program uploaded, on the way out.
-pub(super) fn delete_all() -> String {
-    format!("{ESCAPE_START}a=d,d=A,q=2{ESCAPE_END}")
-}
-
 /// The cells that show image `id`: every cell names its own row and column,
 /// so a redraw of any one of them stands on its own.
 pub(super) fn placeholder_lines(id: u8, layout: ImageLayout) -> Vec<Line<'static>> {
@@ -396,7 +392,9 @@ impl KittyIds {
     /// caller has to delete from the terminal and forget.
     pub fn assign(&mut self, key: DrawKey) -> (u8, Option<DrawKey>) {
         if self.assigned.len() < self.assigned.cap().get() {
-            let id = self.assigned.len() as u8 + 1;
+            let id = (1..=MAX_IMAGE_ID)
+                .find(|id| !self.assigned.contains(id))
+                .expect("a non-full cache has a free id");
             self.assigned.put(id, key);
             return (id, None);
         }
@@ -413,8 +411,39 @@ impl KittyIds {
         self.assigned.get(&id);
     }
 
+    pub fn find(&mut self, key: &DrawKey) -> Option<u8> {
+        let id = self
+            .assigned
+            .iter()
+            .find_map(|(id, assigned)| (assigned == key).then_some(*id))?;
+        self.touch(id);
+        Some(id)
+    }
+
     pub fn clear(&mut self) {
         self.assigned.clear();
+    }
+
+    pub fn remove(&mut self, id: u8) {
+        self.assigned.pop(&id);
+    }
+
+    pub fn make_room(&mut self, key: &DrawKey) -> Vec<(u8, DrawKey)> {
+        let bytes = |key: &DrawKey| u64::from(key.target.0) * u64::from(key.target.1) * 4;
+        let mut evicted = Vec::new();
+        while self.assigned.iter().map(|(_, key)| bytes(key)).sum::<u64>() + bytes(key)
+            > UPLOAD_BYTES
+        {
+            let Some(entry) = self.assigned.pop_lru() else {
+                break;
+            };
+            evicted.push(entry);
+        }
+        evicted
+    }
+
+    pub fn ids(&self) -> Vec<u8> {
+        self.assigned.iter().map(|(id, _)| *id).collect()
     }
 }
 
@@ -439,6 +468,11 @@ mod tests {
             image: ImageKey::Bytes(n),
             layout: LAYOUT,
             mode: ImageMode::Kitty,
+            crop: (0, 0, 3, 2),
+            target: (3, 2),
+            content: (3, 2),
+            offset: (0, 0),
+            sampling: caudra_workbench::ImageSampling::Smooth,
         }
     }
 

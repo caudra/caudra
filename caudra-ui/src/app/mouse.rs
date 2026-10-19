@@ -122,6 +122,13 @@ impl App {
                 None => Vec::new(),
             };
         }
+        if self.image_viewer.is_open() && !self.permission_prompt_holds_input() {
+            self.clear_control_hovers();
+            self.autoscroll = None;
+            self.selection_state = None;
+            let action = self.image_viewer.handle_mouse(event);
+            return self.handle_image_viewer_action(action);
+        }
         if self.permissions_picker.is_open() && self.permissions_picker.editor_mut().is_some() {
             self.clear_control_hovers();
             if self.permission_mutation_pending() {
@@ -233,11 +240,6 @@ impl App {
             }
             let action = self.workbench.handle_mouse(event);
             return self.handle_workbench_action(action);
-        }
-        if self.image_viewer.is_open() {
-            self.clear_control_hovers();
-            let action = self.image_viewer.handle_mouse(event);
-            return self.handle_image_viewer_action(action);
         }
         if self.paste_editor.is_open() {
             self.clear_control_hovers();
@@ -1010,8 +1012,15 @@ impl App {
     }
 
     pub(super) fn handle_scroll(&mut self, column: u16, row: u16, delta: i32) {
+        if self.leader_holds_pointer() {
+            return;
+        }
         if self.docs_holds_input() {
             self.docs_modal.scroll_at(Position::new(column, row), delta);
+            return;
+        }
+        if self.image_viewer.is_open() && !self.permission_prompt_holds_input() {
+            self.image_viewer.scroll(column, row, delta);
             return;
         }
         if self.sandbox_manager.is_open() {
@@ -1747,5 +1756,65 @@ impl App {
                 Rect::new(a.x, a.y, a.width.saturating_sub(1), a.height)
             })
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod image_viewer_tests {
+    use crate::app::tests::test_app;
+    use crate::components::Overlay;
+    use crate::inline_image::{ImageMode, ImageRef, set_mode, tests::png_source};
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    const SCREEN: (u16, u16) = (100, 50);
+
+    fn click() -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn image_viewer_dismissal_never_clicks_through_to_lower_overlays() {
+        let mut app = test_app();
+        app.help_modal.toggle();
+        app.open_image_viewer(ImageRef::from_source(&png_source(32, 32), "").unwrap());
+        assert!(app.handle_mouse(click()).is_empty());
+        assert!(!app.image_viewer.is_open());
+        assert!(app.help_modal.is_open());
+    }
+
+    #[test]
+    fn image_viewer_leaves_higher_docs_overlay_in_control() {
+        let mut app = test_app();
+        app.open_image_viewer(ImageRef::from_source(&png_source(32, 32), "").unwrap());
+        app.docs_modal.open("");
+        app.handle_mouse(click());
+        assert!(!app.docs_modal.is_open());
+        assert!(app.image_viewer.is_open());
+    }
+
+    #[test]
+    fn image_viewer_receives_aggregated_wheel_events() {
+        set_mode(ImageMode::Blocks);
+        let mut app = test_app();
+        app.open_image_viewer(ImageRef::from_source(&png_source(32, 32), "").unwrap());
+        let mut terminal = Terminal::new(TestBackend::new(SCREEN.0, SCREEN.1)).unwrap();
+        terminal.draw(|frame| app.view(frame)).unwrap();
+        app.handle_scroll(SCREEN.0 / 2, SCREEN.1 / 2, 1);
+        terminal.draw(|frame| app.view(frame)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("125%"));
+        assert!(app.image_viewer.is_open());
     }
 }

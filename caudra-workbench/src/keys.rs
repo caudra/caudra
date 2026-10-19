@@ -81,6 +81,16 @@ pub const LEADER: Bind = Bind {
 };
 
 pub const CLOSE: Bind = bind!(KeyCode::Esc, NONE, "Esc");
+pub const IMAGE_ZOOM_IN: Bind = bind!(KeyCode::Char('+'), NONE, "+");
+pub const IMAGE_ZOOM_IN_ALT: Bind = bind!(KeyCode::Char('='), NONE, "=");
+pub const IMAGE_ZOOM_OUT: Bind = bind!(KeyCode::Char('-'), NONE, "-");
+pub const IMAGE_FIT: Bind = bind!(KeyCode::Char('0'), NONE, "0");
+pub const IMAGE_ACTUAL: Bind = bind!(KeyCode::Char('1'), NONE, "1");
+pub const IMAGE_SAMPLING: Bind = bind!(KeyCode::Char('s'), NONE, "s");
+pub const IMAGE_LEFT: Bind = bind!(KeyCode::Left, NONE, "←");
+pub const IMAGE_RIGHT: Bind = bind!(KeyCode::Right, NONE, "→");
+pub const IMAGE_UP: Bind = bind!(KeyCode::Up, NONE, "↑");
+pub const IMAGE_DOWN: Bind = bind!(KeyCode::Down, NONE, "↓");
 /// Takes whatever the focused pane offers: the highlighted answer, the menu
 /// item, the typed name, the search. Each pane reads the key itself, so this
 /// only exists for a status hint to name it and a click on that hint to press

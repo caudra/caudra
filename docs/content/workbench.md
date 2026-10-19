@@ -153,6 +153,8 @@ Cut is `Shift+Delete`, not `Ctrl+X`. `Ctrl+X` is Caudra's leader everywhere, inc
 
 Files the editor cannot take still open. Binaries, files over 8 MiB, and files that are not valid UTF-8 open read-only, and the status row says which of the three it is.
 
+Supported local image files open as pictures. Use `+` and `-` to zoom, `0` to fit, `1` for actual-size inspection, and the arrow keys to pan. The wheel zooms around the pointer, and dragging pans. Press `s` to switch between smooth and nearest-neighbour sampling. Each image tab keeps its own view while open. See [Images](/docs/markdown/#images) for rendering modes and the limits of character graphics.
+
 ### When the agent writes the same file
 
 The workbench watches the project while it is open. A file that changes on disk reloads in place when its tab has no unsaved edits, keeping the cursor where it was.

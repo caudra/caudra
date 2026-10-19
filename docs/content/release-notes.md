@@ -73,6 +73,8 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 ### Changes
 
+- **Image inspection**: The image viewer and workbench image tabs now support zoom and pan, with fit and actual-size views. Clicking outside the picture closes the viewer, including its blank margins, without activating the transcript underneath.
+- **Image sizing**: The image graphics probe now checks PNG support and asks for cell pixel dimensions when the terminal can report them. Resizing or changing the font no longer reuses a raster made for a different pixel size. Automatic mode retains block rendering inside Herdr while its placeholder path remains unverified.
 - **More Python in `code`**: Monty 1.2 adds CSV parsing, hashing, TOML parsing, bisection, `os.path`, match statements, and dataclass field defaults. Python still has no direct access to the host filesystem or network.
 - **Orca resumes Caudra**: The status Caudra reports in an Orca terminal now carries the session id as `sessionId` once the session is saved, so Orca can reopen it with `caudra --resume <id>`. While subagents run, it also lists them, and Orca shows each as a child row under the agent. Off Windows, clicking a row switches Caudra to that subagent's chat when Orca supports it, and clicking the agent's own row switches back to the main chat. See [Orca](/docs/notifications/#orca).
 - **Docs from any modal**: A `?` on the top border of a modal such as `/accounts`, `/usage`, or `/permissions` opens the section of the manual about it, and `F1` does the same. The docs open above the modal, so `Esc` returns to it. A link from `/changelog` into the docs also opens above the release notes now instead of closing them. See [Docs](/docs/commands/#docs).

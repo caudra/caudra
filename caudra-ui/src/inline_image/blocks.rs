@@ -79,12 +79,20 @@ pub(super) fn render(
     layout: ImageLayout,
     glyphs: Glyphs,
 ) -> Vec<Line<'static>> {
-    let resized = image.resize_exact(
+    let dimensions = (
         u32::from(layout.cols) * CELL_COLS,
         u32::from(layout.rows) * glyphs.rows(),
-        FilterType::CatmullRom,
     );
-    lines(&resized.to_rgba8(), glyphs)
+    if (image.width(), image.height()) == dimensions {
+        lines(&image.to_rgba8(), glyphs)
+    } else {
+        lines(
+            &image
+                .resize_exact(dimensions.0, dimensions.1, FilterType::CatmullRom)
+                .to_rgba8(),
+            glyphs,
+        )
+    }
 }
 
 fn lines(image: &RgbaImage, glyphs: Glyphs) -> Vec<Line<'static>> {

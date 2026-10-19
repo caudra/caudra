@@ -81,11 +81,17 @@ impl EventSource for UnixInternalEventSource {
         let timeout = PollTimeout::new(timeout);
 
         loop {
-            if let Err(e) = self.poll.poll(&mut self.events, timeout.leftover()) {
+            if let Err(e) = self.poll.poll(
+                &mut self.events,
+                self.parser.poll_timeout(timeout.leftover()),
+            ) {
                 // Mio will throw an interrupted error in case of cursor position retrieval. We need to retry until it succeeds.
                 // Previous versions of Mio (< 0.7) would automatically retry the poll call if it was interrupted (if EINTR was returned).
                 // https://docs.rs/mio/0.7.0/mio/struct.Poll.html#notes
                 if e.kind() == io::ErrorKind::Interrupted {
+                    if timeout.elapsed() {
+                        return Ok(None);
+                    }
                     continue;
                 } else {
                     return Err(e);
@@ -93,8 +99,13 @@ impl EventSource for UnixInternalEventSource {
             };
 
             if self.events.is_empty() {
-                // No readiness events = timeout
-                return Ok(None);
+                if let Some(event) = self.parser.next() {
+                    return Ok(Some(event));
+                }
+                if timeout.elapsed() {
+                    return Ok(None);
+                }
+                continue;
             }
 
             for token in self.events.iter().map(|x| x.token()) {
@@ -103,6 +114,9 @@ impl EventSource for UnixInternalEventSource {
                         loop {
                             match self.tty_fd.read(&mut self.tty_buffer) {
                                 Ok(read_count) => {
+                                    if read_count == 0 {
+                                        return Ok(None);
+                                    }
                                     if read_count > 0 {
                                         self.parser.advance(
                                             &self.tty_buffer[..read_count],
@@ -117,13 +131,20 @@ impl EventSource for UnixInternalEventSource {
                                     }
                                     // once more data is available to read.
                                     else if e.kind() == io::ErrorKind::Interrupted {
+                                        if timeout.elapsed() {
+                                            return Ok(None);
+                                        }
                                         continue;
                                     }
+                                    return Err(e);
                                 }
                             };
 
                             if let Some(event) = self.parser.next() {
                                 return Ok(Some(event));
+                            }
+                            if timeout.elapsed() {
+                                return Ok(None);
                             }
                         }
                     }
@@ -177,6 +198,7 @@ mod tests {
     const SIGNAL_TIMEOUT: Duration = Duration::from_secs(1);
 
     #[test]
+    #[serial_test::serial]
     fn resize_signal_wakes_mio_and_is_drained_once() {
         let (input, _writer) = UnixStream::pair().unwrap();
         input.set_nonblocking(true).unwrap();

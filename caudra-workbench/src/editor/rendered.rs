@@ -6,7 +6,9 @@
 //! frame, so the painted lines are kept until the text, the width or the theme
 //! moves.
 
+use crate::{ImageGeometry, ImageViewport};
 use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::layout::Rect;
 use ratatui::text::Line;
 use std::ops::Range;
 use std::path::Path;
@@ -17,10 +19,16 @@ use super::{buffer::Cursor, words::is_word};
 /// Paints Markdown wrapped to a width, the way the host's transcript does.
 pub type PaintMarkdown = fn(&str, u16) -> PaintedMarkdown;
 
-/// Draws the picture in a local file within `cols` by `rows` cells, or `None`
+/// Draws the picture in a local file within the supplied rectangle, or `None`
 /// when the file is no picture the host can draw. The workbench has no image
 /// decoder of its own, so a file that is not text is shown through this.
-pub type PaintImage = fn(&Path, u16, u16) -> Option<Vec<Line<'static>>>;
+pub type PaintImage = fn(&Path, &mut ImageViewport, Rect) -> Option<PaintedImage>;
+
+pub struct PaintedImage {
+    pub lines: Vec<Line<'static>>,
+    pub geometry: ImageGeometry,
+    pub status: String,
+}
 
 type ExtractMarkdown =
     dyn Fn(&[Line<'static>], (usize, usize), (usize, usize)) -> Option<String> + Send + Sync;
