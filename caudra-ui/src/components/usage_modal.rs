@@ -684,8 +684,8 @@ fn provider_rows(models: &[BreakdownRow], fallback: &str) -> Vec<BreakdownRow> {
     folded
 }
 
-/// The session's spend by why each model was called, dearest in tokens first,
-/// ties by name so the order holds still between frames.
+/// The session's spend by why each model was called, dearest first, then by
+/// tokens, ties by name so the order holds still between frames.
 fn purpose_rows(by_purpose: &HashMap<String, StoredTokenUsage>) -> Vec<BreakdownRow> {
     let mut rows: Vec<BreakdownRow> = by_purpose
         .iter()
@@ -696,9 +696,11 @@ fn purpose_rows(by_purpose: &HashMap<String, StoredTokenUsage>) -> Vec<Breakdown
         })
         .collect();
     rows.sort_by(|a, b| {
-        b.usage
-            .total()
-            .cmp(&a.usage.total())
+        b.spend
+            .usd
+            .unwrap_or(0.0)
+            .total_cmp(&a.spend.usd.unwrap_or(0.0))
+            .then_with(|| b.usage.total().cmp(&a.usage.total()))
             .then_with(|| a.label.cmp(&b.label))
     });
     rows
@@ -1484,7 +1486,7 @@ mod tests {
     const TOGGLE_UNREACHABLE: &str = "the more line must be where a pointer reaches it";
     const EXPANDED_WHOLE: &str = "an expanded section shows every row and offers to collapse";
     const COLLAPSED_AGAIN: &str = "a second click puts the cap back";
-    const PURPOSE_ORDER: &str = "the purpose that used the most tokens comes first";
+    const PURPOSE_ORDER: &str = "the purpose that cost the most comes first";
     const LONG_MODEL: &str = "a-model-with-a-deliberately-long-identifier";
     const PANS_TO_THE_END: usize = 8;
     /// A tap covers half a viewport, so a couple reach the end of any table this
@@ -2146,18 +2148,18 @@ mod tests {
             .unwrap_or_else(|| panic!("no purpose table: {rows:?}"));
         assert!(rows[heading + 1].trim_start().starts_with(PURPOSE_COLUMN));
         assert!(
-            rows[heading + 2].trim_start().starts_with(CHAT_PURPOSE),
-            "{PURPOSE_ORDER}: {rows:?}"
-        );
-        assert!(rows[heading + 2].ends_with(RECORDED_TEXT), "{rows:?}");
-        assert!(
-            rows[heading + 3].trim_start().starts_with(GOAL_PURPOSE),
+            rows[heading + 2].trim_start().starts_with(GOAL_PURPOSE),
             "{PURPOSE_ORDER}: {rows:?}"
         );
         assert!(
-            rows[heading + 3].ends_with(&format!("{NOT_BILLED_MARK}{SUBSCRIPTION_TEXT}")),
+            rows[heading + 2].ends_with(&format!("{NOT_BILLED_MARK}{SUBSCRIPTION_TEXT}")),
             "{rows:?}"
         );
+        assert!(
+            rows[heading + 3].trim_start().starts_with(CHAT_PURPOSE),
+            "{PURPOSE_ORDER}: {rows:?}"
+        );
+        assert!(rows[heading + 3].ends_with(RECORDED_TEXT), "{rows:?}");
     }
 
     #[test_case(Some(RECORDED_COST), None, Some(RECORDED_COST), Billing::Api ; "billed")]
