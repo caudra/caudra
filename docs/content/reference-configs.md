@@ -170,11 +170,15 @@ version = 1
 
 # Tools whose card never opens on its own: the call stays a single row in every
 # view mode until you click it. A server-qualified name still matches, so
-# `file_read` also covers `mcp_File_read`. `memory_read` covers the `memory`
-# tool's view, zoom, search, and read calls and leaves its writes open, while
-# `memory` covers all of them. Set to `[]` to opt out.
+# `file_read` also covers `mcp_File_read`. A `code` snippet's history calls are
+# named `history.search`, `history.read`, and `history.sessions`, and its
+# `host.environment` call is `execution_environment`. `memory_read`,
+# `plan_read`, `workflow_read`, and `task_control_read` cover only the calls of
+# `memory`, `plan`, `workflow`, and `task_control` that read, and leave the
+# calls that change something open. The bare tool name covers all of its calls.
+# Set to `[]` to opt out.
 # Type: string[].
-# always_collapsed = ["file_read", "file_glob", "file_grep", "file_index", "webfetch", "source_code_context", "source_code_refs", "memory_read"]
+# always_collapsed = ["file_read", "file_glob", "file_grep", "file_index", "webfetch", "source_code_context", "source_code_refs", "history.search", "history.read", "history.sessions", "tool_output", "skill", "execution_environment", "list_sessions", "read_topic", "automation", "memory_read", "plan_read", "workflow_read", "task_control_read"]
 
 # Maximum visible input lines.
 # Type: u32, at least 1.

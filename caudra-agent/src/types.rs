@@ -144,10 +144,14 @@ const PEER_QUEUED_LABEL: &str = "queued for groups";
 const PEER_WORK_QUEUED_NOTE: &str =
     "Queued work waits for a member of its group to complete it; queued is not done.";
 const PEER_ASSIGNMENT_NOUN: &str = "assignment";
+const TASK_NOUN: &str = "task";
 const PEER_NO_ASSIGNMENTS: &str = "This session holds no work assignment.";
 const PEER_WORK_NOTICE: &str = "Work this session holds, then paused work it last owned. Report an outcome by work name; a paused item waits for a person, though you may still report it.";
 
 const STATE_KIND_FIELD: &str = "kind";
+/// The line a text result reports on its folded row in place of its size,
+/// kept in the stored state so a restored session reports the same.
+const STATE_SUMMARY_FIELD: &str = "summary";
 /// Results sized by what they cost the model rather than by their lines: a
 /// page's line count only says how its extractor happened to wrap it.
 const TOKEN_SIZED_KINDS: &[&str] = &["webfetch", "websearch"];
@@ -685,9 +689,25 @@ pub struct TextOutput {
 }
 
 impl TextOutput {
+    /// A text result whose folded row says what it found, such as a status or
+    /// a count, rather than how many lines it runs to.
+    pub fn summarized(text: impl Into<String>, summary: String) -> Self {
+        Self {
+            state: Some(serde_json::json!({ STATE_SUMMARY_FIELD: summary })),
+            ..Self::from(text.into())
+        }
+    }
+
+    fn summary(&self) -> Option<&str> {
+        self.state.as_ref()?.get(STATE_SUMMARY_FIELD)?.as_str()
+    }
+
     /// Keyed on the stored state rather than the tool name, so a reopened
     /// session sizes the card the same way the live run did.
     fn size_label(&self) -> String {
+        if let Some(summary) = self.summary() {
+            return summary.to_owned();
+        }
         let kind = self
             .state
             .as_ref()
@@ -2257,7 +2277,9 @@ impl ToolOutput {
             } else {
                 "exit unknown".into()
             }),
-            Self::Plain(text) | Self::Markdown(text) if !text.text.is_empty() => {
+            Self::Plain(text) | Self::Markdown(text)
+                if !text.text.is_empty() || text.summary().is_some() =>
+            {
                 Some(text.size_label())
             }
             Self::Image { text, .. } => Some(
@@ -2267,7 +2289,10 @@ impl ToolOutput {
                     .to_string(),
             ),
             Self::WorkflowRun(card) => Some(card.headline()),
-            Self::Tasks(cards) => Some(counted(cards.len(), "task")),
+            Self::Tasks(cards) => Some(match cards.as_slice() {
+                [card] => card.state.clone(),
+                _ => counted(cards.len(), TASK_NOUN),
+            }),
             Self::Environment { headline, .. } => Some(headline.clone()),
             Self::Mcp(output) => output.annotation(),
             Self::Code(output) => output.annotation(),
@@ -5040,6 +5065,42 @@ mod tests {
     #[test_case(skill(), Some("3 lines") ; "skill_counts_its_body_not_its_location")]
     fn annotation_cases(output: ToolOutput, expected: Option<&str>) {
         assert_eq!(output.annotation().as_deref(), expected);
+    }
+
+    const SUMMARY: &str = "3 runs";
+    const RUNNING_STATE: &str = "running";
+    const DONE_STATE: &str = "completed";
+
+    /// A summarized result's row says what it found, empty or not, and says it
+    /// again once the session is reopened.
+    #[test_case(WEB_RESULT ; "with_text")]
+    #[test_case("" ; "empty")]
+    fn a_summary_names_the_row_and_survives_restore(text: &str) {
+        let output = ToolOutput::Plain(TextOutput::summarized(text, SUMMARY.to_owned()));
+        let restored: ToolOutput =
+            serde_json::from_value(serde_json::to_value(&output).unwrap()).unwrap();
+        assert_eq!(output.annotation().as_deref(), Some(SUMMARY));
+        assert_eq!(restored.annotation().as_deref(), Some(SUMMARY));
+    }
+
+    fn task(state: &str) -> TaskCard {
+        serde_json::from_value(json!({
+            "task_id": "shell-1", "invocation_id": "i", "call_id": "c", "root_call_id": "c",
+            "label": "build", "state": state, "background": true, "mode": "build",
+            "generation": 0, "created_at": 0, "updated_at": 0,
+        }))
+        .unwrap()
+    }
+
+    /// A status call's row names the one task's state; a listing counts them.
+    #[test_case(vec![task(RUNNING_STATE)], RUNNING_STATE ; "one_task_names_its_state")]
+    #[test_case(vec![task(RUNNING_STATE), task(DONE_STATE)], "2 tasks" ; "a_listing_counts")]
+    #[test_case(Vec::new(), "0 tasks" ; "an_empty_listing_says_so")]
+    fn a_task_row_says_what_it_found(cards: Vec<TaskCard>, expected: &str) {
+        assert_eq!(
+            ToolOutput::Tasks(cards).annotation().as_deref(),
+            Some(expected)
+        );
     }
 
     const WEB_RESULT: &str = "# Title\n\nFirst paragraph.\nSecond paragraph.";

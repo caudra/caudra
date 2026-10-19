@@ -15,12 +15,12 @@ use serde_json::Value;
 
 use crate::code::hosted::HostedCall;
 use crate::tools::registry::{
-    ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolFailure,
-    ToolInvocation,
+    ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolEffect, ToolExecResult,
+    ToolFailure, ToolInvocation,
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{DescriptionContext, ToolAudience, ToolContext};
-use crate::types::{ToolOutput, WorkflowRunCard, format_live_duration};
+use crate::types::{TextOutput, ToolOutput, WorkflowRunCard, counted, format_live_duration};
 use crate::workflow::WorkflowHandle;
 
 pub const DESCRIPTION: &str = "Run durable, multi-agent workflows: scripted plans that launch subagents in phases, keep a journal, and can be paused and resumed.
@@ -101,6 +101,20 @@ const MAX_ROSTER_ROWS: usize = 10;
 /// Bytes of a run's `result` kept in a `status` answer.
 const MAX_STATUS_RESULT_BYTES: usize = 8 * 1024;
 const TRUNCATED_RESULT_SUFFIX: &str = "…[truncated]";
+const WORKFLOW_NOUN: &str = "workflow";
+const RUN_NOUN: &str = "run";
+const CALL_NOUN: &str = "call";
+const VALID: &str = "valid";
+const INVALID: &str = "invalid";
+/// The actions that only read the runtime. They never change a run, so their
+/// cards fold like any other lookup's.
+const READ_ACTIONS: &[&str] = &[
+    ACTION_LIST,
+    ACTION_VALIDATE,
+    ACTION_STATUS,
+    ACTION_INSPECT,
+    ACTION_HISTORY,
+];
 
 static ACTION_PARAM: ParamSchema = ParamSchema::Enum {
     variants: ACTIONS,
@@ -221,6 +235,13 @@ impl ToolInvocation for WorkflowCall {
         HeaderFuture::Ready(HeaderResult::plain(header(&self.action, &self.request)))
     }
 
+    fn call_effect(&self, registered: ToolEffect) -> ToolEffect {
+        match READ_ACTIONS.contains(&self.action.as_str()) {
+            true => ToolEffect::ReadOnly,
+            false => registered,
+        }
+    }
+
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
         Box::pin(async move {
             let Some(handle) = ctx.workflow.as_ref() else {
@@ -254,10 +275,12 @@ async fn render(
         hosted.offer_detail(answer);
     }
     match answer {
-        Ok(WorkflowResponse::Catalog(catalog)) => plain(render_catalog(&catalog)),
+        Ok(WorkflowResponse::Catalog(catalog)) => {
+            summarized(render_catalog(&catalog), catalog_summary(&catalog))
+        }
         Ok(WorkflowResponse::Validation { name, ok, report }) => {
-            let verdict = if ok { "valid" } else { "invalid" };
-            plain(format!("{name}: {verdict}. {report}"))
+            let verdict = if ok { VALID } else { INVALID };
+            summarized(format!("{name}: {verdict}. {report}"), verdict.to_owned())
         }
         Ok(WorkflowResponse::Started(run)) => ToolExecResult {
             model_output: Some(format!(
@@ -268,11 +291,24 @@ async fn render(
                 WorkflowRunCard::from(run.as_ref()),
             ))))
         },
-        Ok(WorkflowResponse::Run(run)) => plain(render_runs(std::slice::from_ref(&run))),
-        Ok(WorkflowResponse::Runs(runs)) => plain(render_runs(&runs)),
-        Ok(WorkflowResponse::Detail(detail)) => plain(render_detail(&detail)),
-        Ok(WorkflowResponse::CallBodies(bodies)) => plain(render_call_bodies(&bodies)),
-        Ok(WorkflowResponse::History(entries)) => plain(render_history(&entries)),
+        Ok(WorkflowResponse::Run(run)) => summarized(
+            render_runs(std::slice::from_ref(&run)),
+            WorkflowRunCard::from(run.as_ref()).headline(),
+        ),
+        Ok(WorkflowResponse::Runs(runs)) => {
+            summarized(render_runs(&runs), counted(runs.len(), RUN_NOUN))
+        }
+        Ok(WorkflowResponse::Detail(detail)) => summarized(
+            render_detail(&detail),
+            WorkflowRunCard::from(&detail.run).headline(),
+        ),
+        Ok(WorkflowResponse::CallBodies(bodies)) => summarized(
+            render_call_bodies(&bodies),
+            counted(bodies.len(), CALL_NOUN),
+        ),
+        Ok(WorkflowResponse::History(entries)) => {
+            summarized(render_history(&entries), counted(entries.len(), RUN_NOUN))
+        }
         Ok(WorkflowResponse::Trusted { name }) => plain(format!("{name} is now trusted.")),
         Ok(WorkflowResponse::Acked(_) | WorkflowResponse::Ack) => plain(String::new()),
         Err(WorkflowError::TrustRequired { name, digest, path }) => error(
@@ -535,8 +571,21 @@ fn render_history(entries: &[RunHistoryEntry]) -> String {
         .join(BLOCK_SEPARATOR)
 }
 
+fn catalog_summary(catalog: &WorkflowCatalog) -> String {
+    let available = counted(catalog.entries.len(), WORKFLOW_NOUN);
+    match catalog.invalid.len() {
+        0 => available,
+        invalid => format!("{available}{FIELD_SEPARATOR}{invalid} {INVALID}"),
+    }
+}
+
 fn plain(text: String) -> ToolExecResult {
     ToolExecResult::from(Ok(ToolOutput::Plain(text.into())))
+}
+
+/// A read's answer, with what it found kept for the folded row.
+fn summarized(text: String, summary: String) -> ToolExecResult {
+    ToolExecResult::from(Ok(ToolOutput::Plain(TextOutput::summarized(text, summary))))
 }
 
 fn error(failure: ToolFailure, message: String) -> ToolExecResult {
@@ -888,5 +937,36 @@ mod tests {
             result.len() <= MAX_STATUS_RESULT_BYTES + TRUNCATED_RESULT_SUFFIX.len(),
             "{RESULT_IS_BOUNDED}"
         );
+    }
+
+    /// A read folds like a file read; a start or a control keeps its card open.
+    #[test_case(json!({"action": "list"}) => ToolEffect::ReadOnly; "list")]
+    #[test_case(json!({"action": "validate", "name": NAME}) => ToolEffect::ReadOnly; "validate")]
+    #[test_case(json!({"action": "status"}) => ToolEffect::ReadOnly; "status")]
+    #[test_case(json!({"action": "inspect", "run_id": RUN_ID}) => ToolEffect::ReadOnly; "inspect")]
+    #[test_case(json!({"action": "history"}) => ToolEffect::ReadOnly; "history")]
+    #[test_case(json!({"action": "start", "name": NAME}) => ToolEffect::Orchestrator; "start")]
+    #[test_case(json!({"action": "stop", "run_id": RUN_ID}) => ToolEffect::Orchestrator; "stop")]
+    fn only_reads_take_a_read_effect(input: Value) -> ToolEffect {
+        WorkflowTool
+            .parse(&input)
+            .unwrap()
+            .call_effect(ToolEffect::Orchestrator)
+    }
+
+    fn row(answer: WorkflowResponse, input: Value) -> Option<String> {
+        let ctx = with_runtime(move |_| Ok(answer.clone()));
+        run(input, &ctx).output.ok()?.annotation()
+    }
+
+    /// The folded row says what the read found rather than how long it runs.
+    #[test_case(WorkflowResponse::Validation { name: NAME.into(), ok: true, report: String::new() }, json!({"action": "validate", "name": NAME}), VALID.to_owned(); "valid_script")]
+    #[test_case(WorkflowResponse::Validation { name: NAME.into(), ok: false, report: "meta: missing name".into() }, json!({"action": "validate", "name": NAME}), INVALID.to_owned(); "invalid_script")]
+    #[test_case(WorkflowResponse::Runs(Vec::new()), json!({"action": "status"}), counted(0, RUN_NOUN); "no_runs")]
+    #[test_case(WorkflowResponse::Runs(vec![snapshot(), snapshot()]), json!({"action": "status"}), counted(2, RUN_NOUN); "runs_are_counted")]
+    #[test_case(WorkflowResponse::Catalog(WorkflowCatalog::default()), json!({"action": "list"}), counted(0, WORKFLOW_NOUN); "empty_catalog")]
+    #[test_case(WorkflowResponse::Run(Box::new(snapshot())), json!({"action": "status", "run_id": RUN_ID}), WorkflowRunCard::from(&snapshot()).headline(); "one_run_names_its_state")]
+    fn a_read_row_says_what_it_found(answer: WorkflowResponse, input: Value, expected: String) {
+        assert_eq!(row(answer, input), Some(expected));
     }
 }

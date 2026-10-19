@@ -34,6 +34,7 @@ pub const WRITE_RESULT_PREFIX: &str = "caudra_plan_write:";
 /// nothing to them: a session has one plan.
 pub const SESSION_PLAN_LABEL: &str = "this session's plan";
 const WRITE_RECEIPT: &str = "Active plan saved.";
+const EMPTY_PLAN: &str = "empty";
 pub(crate) const WRITE_DENIED: &str =
     "only the main agent may replace the session plan, and not in read-only mode";
 const NO_TARGET: &str = "the plan tool requires a session plan";
@@ -472,9 +473,11 @@ fn execute(call: PlanCall, ctx: &ToolContext) -> Result<ToolExecResult, ToolErro
     let target = authority.verified(call.access())?;
     let PlanCall::Write { content } = call else {
         let content = authority.read_target(&target)?;
-        return Ok(ToolExecResult::from(Ok(ToolOutput::Markdown(
-            content.into(),
-        ))));
+        let read = match content.is_empty() {
+            true => TextOutput::summarized(content, EMPTY_PLAN.to_owned()),
+            false => content.into(),
+        };
+        return Ok(ToolExecResult::from(Ok(ToolOutput::Markdown(read))));
     };
     let written_path = match &target {
         PlanTarget::Local(path) => {
@@ -552,8 +555,8 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        CWD, INVALID_TARGET, NAME, NO_TARGET, PLANS_DIR, PlanAccess, PlanAuthority, PlanTarget,
-        PlanTool, PlanWriteResult, STORE_UNAVAILABLE, WRITE_DENIED, WRITE_RECEIPT,
+        CWD, EMPTY_PLAN, INVALID_TARGET, NAME, NO_TARGET, PLANS_DIR, PlanAccess, PlanAuthority,
+        PlanTarget, PlanTool, PlanWriteResult, STORE_UNAVAILABLE, WRITE_DENIED, WRITE_RECEIPT,
         WRITE_RESULT_PREFIX, host_cwd, parse_write_result, permission_contract, verified_target,
         write_target,
     };
@@ -1097,6 +1100,20 @@ mod tests {
 
     fn run(ctx: &ToolContext, input: Value) -> ToolExecResult {
         smol::block_on(PlanTool.parse(&input).unwrap().execute(ctx))
+    }
+
+    /// A folded read row says the plan is empty rather than saying nothing.
+    #[test_case("", Some(EMPTY_PLAN) ; "empty")]
+    #[test_case(CONTENT, None ; "written")]
+    fn an_empty_plan_read_says_so(content: &str, summary: Option<&str>) {
+        let (_root, ctx, path) = local();
+        PlanFile::new(path).unwrap().write(content).unwrap();
+        let output = run(&ctx, json!({"action":"read"})).output.unwrap();
+        let annotation = output.annotation();
+        match summary {
+            Some(summary) => assert_eq!(annotation.as_deref(), Some(summary)),
+            None => assert_ne!(annotation.as_deref(), Some(EMPTY_PLAN)),
+        }
     }
 
     #[test_case(json!({"action":"read", "path":"plan.md"}); "no_path")]

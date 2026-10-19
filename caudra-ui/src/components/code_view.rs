@@ -27,18 +27,18 @@ use super::{
 };
 use caudra_agent::code::output::CodeOutput;
 use caudra_agent::tools::{
-    CODE_TOOL_NAME, MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME,
-    ToolEffect, timeout_annotation,
+    CODE_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, ToolEffect,
+    timeout_annotation,
 };
 use caudra_agent::types::{AnswerSheet, TodoItem, TodoStatus};
 use caudra_agent::{
     BatchToolEntry, BatchToolStatus, GrepFileEntry, INDEX_TRUNCATED, IndexDirectoryEntryKind,
-    IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange, InstructionBlock, McpOutput,
-    PatchedFile, SearchCap, SkillOutput, SourceCodeGraphRow, SourceCodeGraphSource,
+    IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange, InstructionBlock, McpHelper,
+    McpOutput, PatchedFile, SearchCap, SkillOutput, SourceCodeGraphRow, SourceCodeGraphSource,
     SubagentProgress, ToolInput, ToolOutput, format_live_duration, format_settled_duration,
     pretty_json,
 };
-use caudra_config::{MEMORY_READ_ENTRY, ToolOutputLines};
+use caudra_config::{READ_ENTRIES, ToolOutputLines};
 use caudra_diff::{DiffHunk, DiffLine, DiffSpan, compute_hunks};
 use caudra_markdown::Source;
 use caudra_markdown::render::SpanSource;
@@ -3127,12 +3127,13 @@ impl BatchViews {
 }
 
 /// A child whose answer is its whole point and reads short, a snippet's `decide()` or `rerank()`,
-/// always draws whole: it has no fold, no window, and no click of its own.
+/// always draws whole: it has no fold, no window, and no click of its own. A history call is a
+/// lookup instead, whose answer can run to a whole conversation, so it folds and opens like one.
 fn always_whole(entry: &BatchToolEntry) -> bool {
     matches!(
         &entry.output,
         Some(ToolOutput::Mcp(McpOutput {
-            helper: Some(_),
+            helper: Some(McpHelper::Decision(_)),
             ..
         }))
     )
@@ -3270,12 +3271,15 @@ pub struct CardPolicy {
 
 impl CardPolicy {
     /// Whether no view mode opens this call's body. An entry names a tool,
-    /// except [`MEMORY_READ_ENTRY`], which names the `memory` calls that only
-    /// read, so the effect the call ran with is asked as well.
+    /// except one of [`READ_ENTRIES`], which names only the calls of a tool
+    /// that read, so the effect the call ran with is asked as well.
     pub fn stays_collapsed(&self, tool: &str, effect: ToolEffect) -> bool {
-        let memory_read = effect.is_collapsible() && names_tool(MEMORY_TOOL_NAME, tool);
+        let reads = effect.is_collapsible();
         self.always_collapsed.iter().any(|pattern| {
-            names_tool(pattern, tool) || (memory_read && pattern == MEMORY_READ_ENTRY)
+            match READ_ENTRIES.iter().find(|(entry, _)| pattern == entry) {
+                Some((_, of)) => reads && names_tool(of, tool),
+                None => names_tool(pattern, tool),
+            }
         })
     }
 
@@ -4190,8 +4194,12 @@ mod tests {
     use crate::markdown::{EXPAND_AFFORDANCE, TRUNCATION_PREFIX};
     use crate::provenance::Provenance;
     use caudra_agent::code::output::{CodeCall, CodeCallStatus, CodeOutput, HostedResult};
+    use caudra_agent::tools::native::peers::{LIST_NAME, READ_NAME};
+    use caudra_agent::tools::profile_policy::PLAN_TOOL_NAME;
     use caudra_agent::tools::{
-        BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME, SKILL_TOOL_NAME, ToolEffect,
+        AUTOMATION_TOOL_NAME, BATCH_TOOL_NAME, EXECUTION_ENVIRONMENT_TOOL_NAME,
+        FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME, MEMORY_TOOL_NAME, SKILL_TOOL_NAME,
+        TOOL_OUTPUT_TOOL_NAME, ToolEffect, WORKFLOW_TOOL_NAME,
     };
     use caudra_agent::types::{Answer, Answerer, QuestionOption};
     use caudra_agent::{
@@ -4213,6 +4221,9 @@ mod tests {
     use ratatui::style::Color;
 
     const READ_MAX_LINES: usize = 5;
+    const TASK_CONTROL_TOOL: &str = "task_control";
+    const HISTORY_ROW_FOLDS: &str = "a history row rests folded";
+    const HISTORY_ROW_OPENS_WHOLE: &str = "a click opens a history row whole";
     const RHAI_PATH: &str = "automation.rhai";
     const RHAI_CODE: &str = "/* comment\nlet hidden = true;\n*/\nlet message = \"é\";";
     const RHAI_BEFORE: &str = "/* comment\nlet hidden = true;\n*/\nlet message = \"old\";";
@@ -8476,20 +8487,63 @@ mod tests {
         limits.child(0, &entry).map(|child| child.is_expanded())
     }
 
-    /// The default list folds the lookups the way it folds a file read, and
-    /// `memory_read` only the `memory` calls that read, so a write keeps the
-    /// note it stored on screen.
+    /// The default list folds the lookups the way it folds a file read. The
+    /// read entries fold only the calls of their tool that read, so a write,
+    /// a start, or a cancel keeps its card open.
     #[test_case("source_code_refs", ToolEffect::ReadOnly => true; "source_graph")]
     #[test_case("mcp_source_code_context", ToolEffect::ReadOnly => true; "server_qualified_source_graph")]
+    #[test_case("history.read", ToolEffect::Unknown => true; "history_read")]
+    #[test_case("history.search", ToolEffect::Unknown => true; "history_search")]
+    #[test_case("history.sessions", ToolEffect::Unknown => true; "history_sessions")]
+    #[test_case(TOOL_OUTPUT_TOOL_NAME, ToolEffect::ReadOnly => true; "saved_output")]
+    #[test_case(SKILL_TOOL_NAME, ToolEffect::ReadOnly => true; "skill")]
+    #[test_case(EXECUTION_ENVIRONMENT_TOOL_NAME, ToolEffect::ReadOnly => true; "environment")]
+    #[test_case(LIST_NAME, ToolEffect::ReadOnly => true; "session_list")]
+    #[test_case(READ_NAME, ToolEffect::ReadOnly => true; "topic")]
+    #[test_case(AUTOMATION_TOOL_NAME, ToolEffect::ReadOnly => true; "automation")]
     #[test_case(MEMORY_TOOL_NAME, ToolEffect::ReadOnly => true; "memory_read")]
     #[test_case(MEMORY_TOOL_NAME, ToolEffect::Mutating => false; "memory_write")]
-    #[test_case(SKILL_TOOL_NAME, ToolEffect::ReadOnly => false; "unlisted_read")]
+    #[test_case(PLAN_TOOL_NAME, ToolEffect::ReadOnly => true; "plan_read")]
+    #[test_case(PLAN_TOOL_NAME, ToolEffect::Mutating => false; "plan_write")]
+    #[test_case(WORKFLOW_TOOL_NAME, ToolEffect::ReadOnly => true; "workflow_read")]
+    #[test_case(WORKFLOW_TOOL_NAME, ToolEffect::Orchestrator => false; "workflow_control")]
+    #[test_case(TASK_CONTROL_TOOL, ToolEffect::ReadOnly => true; "task_control_read")]
+    #[test_case(TASK_CONTROL_TOOL, ToolEffect::Orchestrator => false; "task_control_action")]
+    #[test_case("history.read", ToolEffect::Mutating => true; "history_read_by_name")]
+    #[test_case("websearch", ToolEffect::ReadOnly => false; "unlisted_read")]
+    #[test_case("workflow_read", ToolEffect::ReadOnly => false; "read_entry_names_no_tool")]
     fn the_default_list_folds_lookups(tool: &str, effect: ToolEffect) -> bool {
         let policy = CardPolicy {
             always_collapsed: UiConfig::default().always_collapsed.into(),
             ..CardPolicy::default()
         };
         policy.stays_collapsed(tool, effect)
+    }
+
+    /// A history row of a `code` card folds under the default list in every
+    /// view, a click opens its whole answer, and the next folds it again.
+    #[test_case(false; "expanded_or_auto")]
+    #[test_case(true; "compact")]
+    fn a_history_row_folds_and_opens_whole(compact: bool) {
+        let [entry] = code_card::entries(&CodeOutput {
+            calls: vec![code_card::tests::history_row(false)],
+            ..CodeOutput::default()
+        })
+        .try_into()
+        .unwrap();
+        let policy = CardPolicy {
+            always_collapsed: UiConfig::default().always_collapsed.into(),
+            compact,
+            ..CardPolicy::default()
+        };
+        let mut limits = limits(BatchViews::default()).with_policy(policy, Arc::default());
+        let drawn = |limits: &RenderLimits| limits.child(0, &entry).map(|c| c.is_expanded());
+
+        assert_eq!(drawn(&limits), None, "{HISTORY_ROW_FOLDS}");
+        limits.views = limits.views.toggled(0, rests_open(&limits.policy, &entry));
+        assert_eq!(drawn(&limits), Some(true), "{HISTORY_ROW_OPENS_WHOLE}");
+        limits.views = limits.views.toggled(0, rests_open(&limits.policy, &entry));
+        assert_eq!(drawn(&limits), None, "{HISTORY_ROW_FOLDS}");
     }
 
     /// A `memory` write child stays drawn under the default list, while a

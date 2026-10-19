@@ -41,8 +41,10 @@ const MCP_WHOLE_SERVER: &str = "*";
 /// document, and a glob, a grep and an index are ordered by path or by source
 /// rather than by relevance, so the visible lines are the alphabetically
 /// first ones rather than the answer. Each already states its result in the
-/// row annotation, so the fold loses no summary. The source-code lookups and a
-/// memory read are lookups too: what they found is read on a click, whole.
+/// row annotation, so the fold loses no summary. The source-code lookups, the
+/// history and session lookups, a loaded skill or saved output, and the reads
+/// of the stores and runtimes are lookups too: each row says what it found,
+/// and the whole answer is a click away.
 const DEFAULT_ALWAYS_COLLAPSED: &[&str] = &[
     "file_read",
     "file_glob",
@@ -51,12 +53,33 @@ const DEFAULT_ALWAYS_COLLAPSED: &[&str] = &[
     "webfetch",
     "source_code_context",
     "source_code_refs",
+    "history.search",
+    "history.read",
+    "history.sessions",
+    "tool_output",
+    "skill",
+    "execution_environment",
+    "list_sessions",
+    "read_topic",
+    "automation",
     MEMORY_READ_ENTRY,
+    PLAN_READ_ENTRY,
+    WORKFLOW_READ_ENTRY,
+    TASK_CONTROL_READ_ENTRY,
 ];
-/// An `ui.always_collapsed` entry for the `memory` tool's reading calls alone,
-/// since one tool both reads notes and writes them and a write's card is the
-/// only record of the note it stored.
-pub const MEMORY_READ_ENTRY: &str = "memory_read";
+const MEMORY_READ_ENTRY: &str = "memory_read";
+const PLAN_READ_ENTRY: &str = "plan_read";
+const WORKFLOW_READ_ENTRY: &str = "workflow_read";
+const TASK_CONTROL_READ_ENTRY: &str = "task_control_read";
+/// `ui.always_collapsed` entries for the reading calls of a tool that both
+/// reads and changes things, paired with the tool they cover. Its other calls
+/// stay open, since their card is the record of what they changed or started.
+pub const READ_ENTRIES: &[(&str, &str)] = &[
+    (MEMORY_READ_ENTRY, "memory"),
+    (PLAN_READ_ENTRY, "plan"),
+    (WORKFLOW_READ_ENTRY, "workflow"),
+    (TASK_CONTROL_READ_ENTRY, "task_control"),
+];
 /// Set only by the process that starts Caudra, never by a `.env` file, like
 /// every terminal host's pane variables.
 const PROCESS_ONLY_ENV_VARS: &[&str] = &["WORKCELL_MCP_CODE_WORKER"];
@@ -2332,8 +2355,8 @@ pub struct UiConfig {
     #[config(
         ty = "string[]",
         default = "DEFAULT_ALWAYS_COLLAPSED.iter().map(|t| (*t).to_owned()).collect()",
-        default_doc = "[\"file_read\", \"file_glob\", \"file_grep\", \"file_index\", \"webfetch\", \"source_code_context\", \"source_code_refs\", \"memory_read\"]",
-        desc = "Tools whose card never opens on its own: the call stays a single row in every view mode until you click it. A server-qualified name still matches, so `file_read` also covers `mcp_File_read`. `memory_read` covers the `memory` tool's view, zoom, search, and read calls and leaves its writes open, while `memory` covers all of them. Set to `[]` to opt out"
+        default_doc = "[\"file_read\", \"file_glob\", \"file_grep\", \"file_index\", \"webfetch\", \"source_code_context\", \"source_code_refs\", \"history.search\", \"history.read\", \"history.sessions\", \"tool_output\", \"skill\", \"execution_environment\", \"list_sessions\", \"read_topic\", \"automation\", \"memory_read\", \"plan_read\", \"workflow_read\", \"task_control_read\"]",
+        desc = "Tools whose card never opens on its own: the call stays a single row in every view mode until you click it. A server-qualified name still matches, so `file_read` also covers `mcp_File_read`. A `code` snippet's history calls are named `history.search`, `history.read`, and `history.sessions`, and its `host.environment` call is `execution_environment`. `memory_read`, `plan_read`, `workflow_read`, and `task_control_read` cover only the calls of `memory`, `plan`, `workflow`, and `task_control` that read, and leave the calls that change something open. The bare tool name covers all of its calls. Set to `[]` to opt out"
     )]
     pub always_collapsed: Vec<String>,
 

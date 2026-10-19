@@ -9,8 +9,8 @@ use crate::{
     tools::{
         DescriptionContext, ToolAudience, ToolContext,
         registry::{
-            ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolError, ToolExecResult,
-            ToolFailure, ToolInvocation,
+            ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolEffect, ToolError,
+            ToolExecResult, ToolFailure, ToolInvocation,
         },
     },
 };
@@ -20,6 +20,8 @@ const PROMOTION_GUIDANCE: &str =
     "The background action promotes a running foreground task without restarting it.";
 const PROMOTION_DENIED: &str =
     "task promotion requires agent.task_execution = auto and a supported session";
+/// The actions that only report on jobs, so their cards fold like any lookup's.
+const READ_ACTIONS: &[&str] = &["list", "status"];
 
 pub fn configure_execution(definition: &mut Value, task_mode: Option<&ExecutionMode>) {
     let promote = task_mode == Some(&ExecutionMode::Auto);
@@ -117,7 +119,16 @@ impl Tool for TaskControl {
 
 impl ToolInvocation for ControlCall {
     fn start_header(&self) -> HeaderFuture {
-        HeaderFuture::Ready(HeaderResult::plain(self.action.clone()))
+        HeaderFuture::Ready(HeaderResult::plain(match &self.task_id {
+            Some(id) => format!("{} {id}", self.action),
+            None => self.action.clone(),
+        }))
+    }
+    fn call_effect(&self, registered: ToolEffect) -> ToolEffect {
+        match READ_ACTIONS.contains(&self.action.as_str()) {
+            true => ToolEffect::ReadOnly,
+            false => registered,
+        }
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
         Box::pin(async move {
@@ -215,10 +226,11 @@ fn invisible(message: String) -> ToolError {
 mod tests {
     use super::{DESCRIPTION, PROMOTION_DENIED, TaskControl, configure_execution};
     use crate::AgentMode;
+    use crate::tools::ToolEffect;
     use crate::tools::registry::{Tool, ToolFailure};
     use crate::tools::test_support::stub_ctx;
     use caudra_config::ExecutionMode;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use test_case::test_case;
 
     #[test_case(None; "shell_only")]
@@ -260,5 +272,18 @@ mod tests {
             assert_eq!(result.failure, Some(ToolFailure::Denied));
             assert_eq!(result.output.err().as_deref(), Some(PROMOTION_DENIED));
         });
+    }
+
+    /// Listing and checking fold like a file read; a cancel or a promotion
+    /// keeps the effect the tool was registered with.
+    #[test_case(json!({"action":"list"}) => ToolEffect::ReadOnly; "list")]
+    #[test_case(json!({"action":"status", "task_id":"shell-1"}) => ToolEffect::ReadOnly; "status")]
+    #[test_case(json!({"action":"cancel", "task_id":"shell-1"}) => ToolEffect::Orchestrator; "cancel")]
+    #[test_case(json!({"action":"background", "task_id":"shell-1"}) => ToolEffect::Orchestrator; "background")]
+    fn only_reads_take_a_read_effect(input: Value) -> ToolEffect {
+        TaskControl
+            .parse(&input)
+            .unwrap()
+            .call_effect(ToolEffect::Orchestrator)
     }
 }

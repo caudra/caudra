@@ -72,15 +72,29 @@ fn entry(call: &CodeCall) -> BatchToolEntry {
         status,
         input: None,
         raw_input: Some(call.input.clone()),
-        annotation: output
-            .as_ref()
-            .filter(|_| !matches!(call.helper, Some(McpHelper::History(_))))
-            .and_then(ToolOutput::annotation),
+        annotation: match (call.helper, &output) {
+            (Some(McpHelper::History(_)), Some(ToolOutput::Mcp(answer))) => history_summary(answer),
+            (Some(McpHelper::History(_)), _) => None,
+            (_, output) => output.as_ref().and_then(ToolOutput::annotation),
+        },
         output,
         model_suffix: None,
         refused,
         accounting: Default::default(),
     }
+}
+
+/// What a history call found, in the line it answered with: how a search ranked its hits, which
+/// session a read came from, how many sessions a listing holds. A row folds a history card, so
+/// this is what it says in its place, where a count of the card's lines would say nothing.
+fn history_summary(answer: &McpOutput) -> Option<String> {
+    if answer.is_error {
+        return None;
+    }
+    answer.blocks.iter().find_map(|block| match block {
+        McpBlock::Text { text } => Some(text.clone()),
+        _ => None,
+    })
 }
 
 /// What a call's row opens to: the server's answer when it gave one the call stands on, else why
@@ -176,7 +190,7 @@ fn label_line(text: &str, style: Style) -> Line<'static> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use caudra_agent::types::Answerer;
     use caudra_agent::{ElicitAction, HistoryHelper, McpInteraction};
     use serde_json::json;
@@ -286,34 +300,41 @@ mod tests {
     }
 
     const HISTORY_CALL: &str = "history.sessions(\"project\")";
+    const HISTORY_FOUND: &str = "1 session";
 
-    /// A history row opens to what it found, which its one summary line cannot count.
-    #[test]
-    fn a_history_row_opens_to_its_answer_without_a_line_count() {
-        let row = CodeCall {
+    pub(crate) fn history_row(is_error: bool) -> CodeCall {
+        CodeCall {
             server: "history".to_owned(),
             tool: "sessions".to_owned(),
             called_as: HISTORY_CALL.to_owned(),
             helper: Some(McpHelper::History(HistoryHelper::Sessions)),
             output: Some(McpOutput {
                 blocks: vec![McpBlock::Text {
-                    text: "1 session".to_owned(),
+                    text: HISTORY_FOUND.to_owned(),
                 }],
                 structured: Some(json!([{"title": "t", "updated": "", "items": 1}])),
+                is_error,
                 ..McpOutput::default()
             }),
             ..call(CodeCallStatus::Success, None)
-        };
+        }
+    }
 
+    /// A history row says what it found in the line it answered with, in place of a line count
+    /// that would say nothing, and opens to the whole answer. A failed call's row says nothing of
+    /// a finding it never made.
+    #[test_case(false, Some(HISTORY_FOUND) ; "found")]
+    #[test_case(true, None ; "failed")]
+    fn a_history_row_says_what_it_found(is_error: bool, expected: Option<&str>) {
         let [entry] = entries(&CodeOutput {
-            calls: vec![row],
+            calls: vec![history_row(is_error)],
             ..CodeOutput::default()
         })
         .try_into()
         .unwrap();
 
         assert_eq!(entry.summary, HISTORY_CALL);
-        assert_eq!(entry.annotation, None);
+        assert_eq!(entry.annotation.as_deref(), expected);
         let Some(ToolOutput::Mcp(shown)) = entry.output else {
             panic!("expected an MCP card");
         };

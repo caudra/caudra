@@ -7,6 +7,16 @@ Each release lists what changed, newest first. After an update, the first intera
 
 To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run [`caudra update`](/docs/cli/#caudra-update-caudra-rollback). Each release links to its GitHub page, which holds the downloads.
 
+## Caudra 0.2 Preview 12 {#v0-2-0-preview-12}
+
+[v0.2.0-preview.12 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.12)
+
+- More lookups rest as one row that says what they found, and a click opens the whole answer.
+
+### Changes
+
+- **More lookups fold like a file read**: `history.search`, `history.read`, `history.sessions`, `tool_output`, `skill`, `host.environment`, `list_sessions`, `read_topic`, and `automation` calls now rest as one row in every `/view`, and so do the calls of `plan`, `workflow`, and `task_control` that only read: reading the plan, listing, validating, and checking the status, details, or history of a workflow run, and listing tasks or checking one. A click on the row opens the whole answer and the next folds it, on its own card and as a row of a `code` or `batch` card. The row says what the call found, such as how many hits a search kept, which session a read came from, how many runs or automations a listing holds, a run's or task's state, whether a script is valid, or that the plan is empty. Plan writes, workflow starts and controls, and cancelling or backgrounding a task keep their cards open, and `websearch` is unchanged. The new `plan_read`, `workflow_read`, and `task_control_read` entries of the default `ui.always_collapsed` list cover those reading calls. If you set your own `always_collapsed` list, add the entries you want from the [default](/docs/configuration/#ui) to get this.
+
 ## Caudra 0.2 Preview 11 {#v0-2-0-preview-11}
 
 [v0.2.0-preview.11 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.11)

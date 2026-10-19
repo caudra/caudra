@@ -401,10 +401,15 @@ impl SearchCall {
                 limit,
             } = self;
             let (reach, caller) = resolve(caller, requested).await?;
+            let words = Value::from(query.text.as_str());
+            let first_arguments = match arguments.get(SCOPE_PARAM).and_then(Value::as_str) {
+                Some(scope) => format!("{words}, {SCOPE_PARAM}={}", Value::from(scope)),
+                None => words.to_string(),
+            };
             let row = row(
                 SEARCH_METHOD,
                 HistoryHelper::Search,
-                Value::from(query.text.as_str()).to_string(),
+                first_arguments,
                 arguments,
             );
             let permission = reach.permission(SEARCHES);
@@ -1098,6 +1103,23 @@ mod tests {
         assert_eq!(error.kind, ScriptErrorKind::Runtime);
         assert_eq!(error.message, UNSAVED);
         assert!(gateway.finish().is_empty());
+    }
+
+    /// A folded row names the history it searched when the snippet chose one, so a search of
+    /// every project reads apart from one of this checkout.
+    #[test_case(Value::Null, format!("history.search(\"{QUERY}\")") ; "default_scope")]
+    #[test_case(
+        Value::from(PROJECT_SCOPE),
+        format!("history.search(\"{QUERY}\", scope=\"{PROJECT_SCOPE}\")") ;
+        "chosen_scope"
+    )]
+    fn a_search_row_names_the_scope_it_was_given(scope: Value, expected: String) {
+        let fixture = fixture(AgentMode::Build);
+        let gateway = fixture.gateway();
+
+        invoke(&gateway, search(SEARCH_METHOD, scope)).unwrap();
+
+        assert_eq!(gateway.finish()[0].called_as, expected);
     }
 
     #[test]

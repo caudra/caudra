@@ -2900,13 +2900,19 @@ pub(super) fn shell_clock_ticks(msg: &DisplayMessage, status: ToolStatus) -> boo
 /// counting past its last report and a stored string would show it stopped.
 /// The card is rebuilt every frame for the spinner, so this is measured as
 /// often as it is drawn.
-fn header_annotation(msg: &DisplayMessage) -> Option<String> {
+/// An open task card names its one task's state in its body, so its header
+/// leaves out the state its folded row carries.
+fn header_annotation(msg: &DisplayMessage, open: bool) -> Option<String> {
     let tally = msg
         .progress
         .as_ref()
         .map(|progress| SubagentProgress::tally(progress.report.tools, progress.elapsed()));
     let own = match msg.tool_output.as_deref() {
         Some(ToolOutput::Peers(output)) => Some(output.annotation()),
+        Some(ToolOutput::Tasks(tasks)) if open => msg
+            .annotation
+            .clone()
+            .filter(|annotation| !matches!(tasks.as_slice(), [task] if *annotation == task.state)),
         _ => msg.annotation.clone(),
     };
     match (tally, own) {
@@ -2976,7 +2982,7 @@ pub fn build_tool_lines(
     );
     b.stage = msg.tool_stage;
     b.apply_output_format(msg.tool_output.as_deref());
-    let mut report = header_annotation(msg);
+    let mut report = header_annotation(msg, expansion.is_some());
     if let Some(timeout) = header_timeout(tool_name, msg.tool_raw_input.as_deref()) {
         append_annotation(&mut report, &timeout_annotation(timeout));
     }

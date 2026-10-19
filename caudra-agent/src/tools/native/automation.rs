@@ -25,7 +25,7 @@ use crate::tools::registry::{
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{AUTOMATION_TOOL_NAME, DescriptionContext, ToolAudience, ToolContext};
-use crate::types::ToolOutput;
+use crate::types::{TextOutput, ToolOutput, counted};
 
 pub const DESCRIPTION: &str = "Read this session's automations: short Rhai scripts that react to events in one session, such as the session going idle, a goal finishing, or a schedule coming due. Load the `caudra-automation-dev` skill before writing or debugging one.
 
@@ -56,6 +56,8 @@ const UNKNOWN_ACTION: &str = "unknown action";
 const UNEXPECTED_RESPONSE: &str =
     "the automation runtime answered with something this tool does not read";
 
+const AUTOMATION_NOUN: &str = "automation";
+const FIRING_NOUN: &str = "firing";
 const VALID: &str = "valid";
 const INVALID: &str = "invalid";
 const ARMED: &str = "armed";
@@ -257,14 +259,22 @@ async fn render(
                     USER_DIR_FIELD: directories.user,
                 }));
             }
-            plain(render_list(&automations, directories))
+            summarized(
+                render_list(&automations, directories),
+                counted(automations.len(), AUTOMATION_NOUN),
+            )
         }
         Ok(AutomationResponse::Validation { name, ok, report }) => {
             let verdict = if ok { VALID } else { INVALID };
-            plain(format!("{name}: {verdict}. {report}"))
+            summarized(format!("{name}: {verdict}. {report}"), verdict.to_owned())
         }
-        Ok(AutomationResponse::Firings(firings)) => plain(render_firings(&firings)),
-        Ok(AutomationResponse::Firing(detail)) => plain(render_firing(&detail)),
+        Ok(AutomationResponse::Firings(firings)) => summarized(
+            render_firings(&firings),
+            counted(firings.len(), FIRING_NOUN),
+        ),
+        Ok(AutomationResponse::Firing(detail)) => {
+            summarized(render_firing(&detail), detail.firing.status.to_string())
+        }
         Ok(_) => error(ToolFailure::Other, UNEXPECTED_RESPONSE.to_owned()),
         Err(failure) => error(failure_of(&failure), failure.to_string()),
     }
@@ -580,8 +590,12 @@ fn bounded(mut text: String) -> String {
     text
 }
 
-fn plain(text: String) -> ToolExecResult {
-    ToolExecResult::from(Ok(ToolOutput::Plain(bounded(text).into())))
+/// The answer, bounded, with what it found kept for the folded row.
+fn summarized(text: String, summary: String) -> ToolExecResult {
+    ToolExecResult::from(Ok(ToolOutput::Plain(TextOutput::summarized(
+        bounded(text),
+        summary,
+    ))))
 }
 
 fn error(failure: ToolFailure, message: String) -> ToolExecResult {
