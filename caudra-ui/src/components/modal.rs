@@ -3,6 +3,7 @@ use std::ops::Range;
 
 use crate::components::docs_link::BADGE_COLUMNS;
 use crate::components::hover_style;
+use crate::components::tooltip::{Tip, TipKey};
 use crate::theme;
 
 use caudra_grab::grab_scope;
@@ -230,6 +231,13 @@ impl FooterHits {
 
     pub(crate) fn hovered(&self) -> Option<usize> {
         self.pointer.and_then(|pointer| self.index_at(pointer))
+    }
+
+    /// The tooltip of the hovered title control, worded by `text` from its index.
+    pub(crate) fn title_tip(&self, text: impl FnOnce(usize) -> Option<String>) -> Option<Tip> {
+        let index = self.hovered()?;
+        let area = self.hits.get(index).copied()?;
+        Some(Tip::at(TipKey::TitleHint(index), area, text(index)?))
     }
 
     /// Reports the command a release completed. Press and release must land on

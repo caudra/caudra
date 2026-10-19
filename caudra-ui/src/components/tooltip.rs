@@ -55,6 +55,8 @@ pub(crate) enum TipKey {
     TodoHeader,
     UpdateClose,
     DocsBadge,
+    /// A control on the top border of the one modal that is open.
+    TitleHint(usize),
 }
 
 /// Where the box hangs from.

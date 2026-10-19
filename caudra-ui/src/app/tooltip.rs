@@ -578,6 +578,32 @@ mod tests {
         assert_eq!(row_of(&screen(&mut app, WIDE), &click), None, "{LINGERED}");
     }
 
+    fn usage_title_hint(app: &mut App) -> Rect {
+        app.usage_modal.toggle();
+        let _ = screen(app, WIDE);
+        app.usage_modal.title_hit(0)
+    }
+
+    fn tools_title_hint(app: &mut App) -> Rect {
+        app.tools_modal.open();
+        let _ = screen(app, WIDE);
+        app.tools_modal.title_hit(0)
+    }
+
+    #[test_case(usage_title_hint ; "usage")]
+    #[test_case(tools_title_hint ; "tools")]
+    fn a_title_hint_explains_itself_over_its_modal(open: fn(&mut App) -> Rect) {
+        let mut app = app_without_splash();
+        let hint = open(&mut app);
+        assert!(!hint.is_empty(), "{CONTROL_MISSING}");
+
+        let rows = rest_at(&mut app, WIDE, hint);
+
+        let tip = app.tooltip_candidate().expect(SHOWN);
+        assert_eq!(tip.key, TipKey::TitleHint(0), "{WRONG_TIP}");
+        assert!(row_of(&rows, CLICK_OR_PRESS).is_some(), "{SHOWN}");
+    }
+
     #[test]
     fn the_docs_badge_names_where_it_leads_over_the_modal_tips() {
         let mut app = app_without_splash();

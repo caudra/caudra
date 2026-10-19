@@ -14,9 +14,11 @@ use ratatui::widgets::{Paragraph, Wrap};
 use std::time::Duration;
 
 use crate::components::docs_link::DocsTopic;
+use crate::components::input::control_tip;
 use crate::components::keybindings::key;
 use crate::components::modal::{CHROME_LINES, FooterHits, FooterLine, Modal};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
+use crate::components::tooltip::Tip;
 use crate::components::{ModalScroll, Overlay, bar_area, escape_terminal_controls};
 use crate::theme::{self, Theme};
 
@@ -24,6 +26,10 @@ pub(crate) const TITLE: &str = " Tools ";
 const SESSION_TITLE: &str = " Tools - session ";
 const PROJECT_TITLE: &str = " Tools - project ";
 const GLOBAL_TITLE: &str = " Tools - global ";
+const TIP_SESSION: &str = "Shows the calls made in the open transcript";
+const TIP_PROJECT: &str = "Shows the calls made from this directory, across every session";
+const TIP_GLOBAL: &str = "Shows every call Caudra has recorded";
+const TIP_INVENTORY: &str = "Shows the tools the model is offered";
 const WIDTH_PERCENT: u16 = 72;
 const MAX_HEIGHT_PERCENT: u16 = 82;
 const H_PAD: u16 = 2;
@@ -86,6 +92,16 @@ impl ToolsScope {
             Self::Session => " project ",
             Self::Project => " global ",
             Self::Global => " inventory ",
+        }
+    }
+
+    /// What the view the hint moves to counts.
+    fn tip(self) -> &'static str {
+        match self {
+            Self::Inventory => TIP_SESSION,
+            Self::Session => TIP_PROJECT,
+            Self::Project => TIP_GLOBAL,
+            Self::Global => TIP_INVENTORY,
         }
     }
 }
@@ -314,6 +330,11 @@ impl Default for ToolsModal {
 impl Overlay for ToolsModal {
     fn docs_topic(&self) -> Option<DocsTopic> {
         Some(DocsTopic::Tools)
+    }
+
+    fn tooltip(&self) -> Option<Tip> {
+        self.title
+            .title_tip(|_| Some(control_tip(self.scope.tip(), key::SCOPE.label)))
     }
 
     fn is_open(&self) -> bool {
@@ -672,10 +693,11 @@ mod tests {
     use super::{
         COUNT_COL, ContextBuiltinState, ContextBuiltinTool, ContextMcpStatus, ContextSnapshot,
         ESTIMATE_MARKER, FAILURES_HEADING, GLOBAL_TITLE, NO_ACTIVITY, NO_ACTIVITY_HINT, NO_MCP,
-        NO_SNAPSHOT, PROJECT_TITLE, SESSION_TITLE, STATS_UNAVAILABLE, TITLE, TOOL_COL_MIN,
-        ToolOutcome, ToolStats, ToolsModal, ToolsModalContext, ToolsScope, build_lines, key,
-        stats_lines,
+        NO_SNAPSHOT, Overlay, PROJECT_TITLE, SESSION_TITLE, STATS_UNAVAILABLE, TIP_GLOBAL,
+        TIP_INVENTORY, TIP_PROJECT, TIP_SESSION, TITLE, TOOL_COL_MIN, ToolOutcome, ToolStats,
+        ToolsModal, ToolsModalContext, ToolsScope, build_lines, control_tip, key, stats_lines,
     };
+    use crate::components::tooltip::TipKey;
     use crate::theme;
 
     const MODEL_SPEC: &str = "test/model";
@@ -694,6 +716,8 @@ mod tests {
     const DRAW_HEIGHT: u16 = 30;
     const HINT_UNDRAWN: &str = "the scope hint must be drawn on the title row";
     const SCOPE_NOT_CYCLED: &str = "clicks on the scope hint must visit every scope and return";
+    const TIP_MISSING: &str = "the scope hint must explain the view a click moves to";
+    const TIP_OFF_HINT: &str = "a pointer off the scope hint must raise no tooltip";
     const SCOPE_KEEPS_MODAL_OPEN: &str =
         "the scope key must move the modal, not dismiss it like any other unhandled key";
 
@@ -949,6 +973,33 @@ mod tests {
         seen.dedup();
         assert_eq!(seen.len(), SCOPES, "{SCOPE_NOT_CYCLED}");
         assert!(modal.is_open(), "{SCOPE_KEEPS_MODAL_OPEN}");
+    }
+
+    #[test_case(0, TIP_SESSION ; "inventory_offers_session")]
+    #[test_case(1, TIP_PROJECT ; "session_offers_project")]
+    #[test_case(2, TIP_GLOBAL ; "project_offers_global")]
+    #[test_case(3, TIP_INVENTORY ; "global_offers_inventory")]
+    fn the_scope_hint_tip_names_the_view_it_moves_to(clicks: usize, meaning: &str) {
+        let mut modal = ToolsModal::new();
+        modal.open();
+        for _ in 0..clicks {
+            modal.next_scope();
+        }
+        draw(&mut modal);
+        let hit = modal.title.hit(0);
+        assert!(!hit.is_empty(), "{HINT_UNDRAWN}");
+        modal.handle_mouse(click(MouseEventKind::Moved, Rect::new(0, 0, 1, 1)));
+        assert_eq!(Overlay::tooltip(&modal), None, "{TIP_OFF_HINT}");
+
+        modal.handle_mouse(click(MouseEventKind::Moved, hit));
+
+        let tip = Overlay::tooltip(&modal).expect(TIP_MISSING);
+        assert_eq!(tip.key, TipKey::TitleHint(0), "{TIP_MISSING}");
+        assert_eq!(
+            tip.text,
+            control_tip(meaning, key::SCOPE.label),
+            "{TIP_MISSING}"
+        );
     }
 
     fn click(kind: MouseEventKind, at: Rect) -> MouseEvent {

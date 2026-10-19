@@ -82,6 +82,11 @@ const TIP_GUIDE: &str = "Joins this run before its next model request, without s
 const TIP_REPLACE: &str = "Stops this run and its background work, then sends this instead";
 pub(crate) const CLICK_OR_PRESS: &str = "Click or press ";
 
+/// What a control means, then the key that does the same without the mouse.
+pub(crate) fn control_tip(meaning: &str, key: &str) -> String {
+    format!("{meaning}\n{CLICK_OR_PRESS}{key}")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AdmissionHit {
     pub area: Rect,
@@ -102,7 +107,7 @@ impl AdmissionHit {
         Some(Tip::at(
             TipKey::Admission(self.admission),
             self.area,
-            format!("{meaning}\n{CLICK_OR_PRESS}{key}"),
+            control_tip(meaning, key),
         ))
     }
 }

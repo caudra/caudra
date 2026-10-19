@@ -25,9 +25,11 @@ use ratatui::widgets::Paragraph;
 
 use crate::components::accounts_modal::account_detail;
 use crate::components::docs_link::DocsTopic;
+use crate::components::input::control_tip;
 use crate::components::keybindings::{Bind, key};
 use crate::components::modal::{FooterHits, FooterLine, Modal};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
+use crate::components::tooltip::Tip;
 use crate::components::{ModalScroll, bar_area, hover_style};
 use crate::repaint::{Dirty, Watch};
 use crate::theme::{self, Theme};
@@ -36,6 +38,11 @@ const TITLE: &str = " Token usage ";
 const ACCOUNTS_TITLE: &str = "Accounts";
 const LIFETIME_TITLE: &str = " Token usage - lifetime ";
 const SLICE_LIMIT: usize = 8;
+const TIP_RELOAD: &str = "Rereads recorded spend and the provider's usage limits";
+const TIP_LIFETIME: &str = "Shows spend across every session and project ever recorded";
+const TIP_SESSION: &str = "Shows the spend of this session alone";
+const TIP_MORE: &str = "Shows every row of the lists cut at ";
+const TIP_LESS: &str = "Folds every list back to its costliest ";
 /// A cap hides rows only when it hides at least two: the line saying one row
 /// is hidden takes the room the row would have.
 const COLLAPSE_ABOVE: usize = SLICE_LIMIT + 1;
@@ -1199,6 +1206,24 @@ impl crate::components::Overlay for UsageModal {
         Some(DocsTopic::Usage)
     }
 
+    /// Mirrors `title_line`, so a tip always explains the gloss drawn beside it.
+    fn tooltip(&self) -> Option<Tip> {
+        self.title.title_tip(|index| {
+            let (meaning, bind) = match self.title_actions.get(index)? {
+                TitleAction::Reload => (TIP_RELOAD.into(), key::REFRESH),
+                TitleAction::Scope => match self.scope {
+                    UsageScope::Session => (TIP_LIFETIME.into(), SCOPE_KEY),
+                    UsageScope::Lifetime => (TIP_SESSION.into(), SCOPE_KEY),
+                },
+                TitleAction::Expand => match self.expanded.is_empty() {
+                    true => (format!("{TIP_MORE}{SLICE_LIMIT}"), EXPAND_KEY),
+                    false => (format!("{TIP_LESS}{SLICE_LIMIT}"), EXPAND_KEY),
+                },
+            };
+            Some(control_tip(&meaning, bind.label))
+        })
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }
@@ -1400,7 +1425,8 @@ fn relative(seconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::{buffer_text, test_model};
+    use crate::components::tooltip::TipKey;
+    use crate::components::{Overlay, buffer_text, test_model};
     use crate::repaint::expect::{OWED, QUIET};
     use caudra_providers::UsageLimit;
     use caudra_storage::cache_warming::{EpisodeOutcome, WarmingTotals};
@@ -1496,6 +1522,8 @@ mod tests {
     const TITLE_ACTION_MISSING: &str = "the title row must draw the hint under test";
     const TITLE_CLICK_IGNORED: &str = "a click on a title hint must do what its key does";
     const HOVER_SPILLED: &str = "only the hovered hint's own cells may be reversed";
+    const TIP_MISSING: &str = "a title hint must explain what its gloss says";
+    const TIP_OFF_HINT: &str = "a pointer off every title hint must raise no tooltip";
     const COST_UNREACHABLE: &str = "panning must bring the cost column into view";
     const HINT_MISPLACED: &str = "the hint must share the title row, not the bar's row";
     const BAR_UNWANTED: &str = "a table that fits must not wear a pan bar";
@@ -2085,6 +2113,45 @@ mod tests {
             UsageMouse::Consumed
         );
         assert!(!modal.expanded.is_empty(), "{TITLE_CLICK_IGNORED}");
+    }
+
+    #[test_case(TitleAction::Reload, false, false, TIP_RELOAD.into(), key::REFRESH ; "reload")]
+    #[test_case(TitleAction::Scope, false, false, TIP_LIFETIME.into(), SCOPE_KEY ; "scope_from_session")]
+    #[test_case(TitleAction::Scope, true, false, TIP_SESSION.into(), SCOPE_KEY ; "scope_from_lifetime")]
+    #[test_case(TitleAction::Expand, true, false, format!("{TIP_MORE}{SLICE_LIMIT}"), EXPAND_KEY ; "expand_when_collapsed")]
+    #[test_case(TitleAction::Expand, true, true, format!("{TIP_LESS}{SLICE_LIMIT}"), EXPAND_KEY ; "collapse_when_expanded")]
+    fn a_title_hint_tip_explains_what_its_gloss_says(
+        action: TitleAction,
+        lifetime: bool,
+        expanded: bool,
+        meaning: String,
+        bind: Bind,
+    ) {
+        let usage = long_lifetime();
+        let mut modal = UsageModal::new();
+        modal.toggle();
+        shown_models(&mut modal, &usage);
+        if lifetime {
+            modal.toggle_scope();
+            shown_models(&mut modal, &usage);
+        }
+        if expanded {
+            modal.flip_all_sections();
+            shown_models(&mut modal, &usage);
+        }
+        let index = modal
+            .title_actions
+            .iter()
+            .position(|&drawn| drawn == action)
+            .expect(TITLE_ACTION_MISSING);
+        modal.handle_mouse(&pointer(MouseEventKind::Moved, Rect::new(0, 0, 1, 1)));
+        assert_eq!(Overlay::tooltip(&modal), None, "{TIP_OFF_HINT}");
+
+        modal.handle_mouse(&pointer(MouseEventKind::Moved, modal.title.hit(index)));
+
+        let tip = Overlay::tooltip(&modal).expect(TIP_MISSING);
+        assert_eq!(tip.key, TipKey::TitleHint(index), "{TIP_MISSING}");
+        assert_eq!(tip.text, control_tip(&meaning, bind.label), "{TIP_MISSING}");
     }
 
     #[test]
