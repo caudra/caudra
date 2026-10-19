@@ -91,6 +91,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 ### Fixes
 
+- **Cancelling stops the running command**: Cancelling a turn while a `shell` command runs, with `Esc` in the TUI or a cancel from an ACP editor such as Orca's Stop button, now stops the command and every process it started. Before, the command kept running to the end, and `caudra acp` could wait for it before exiting.
 - **Config edits keep your comments**: Saving a provider or decision endpoint, toggling an MCP server, or saving sandbox records now changes only the keys that changed. Comments on the other keys, quoting, inline tables, and table order stay as you wrote them, and a new table goes after the existing ones of its kind.
 
 ## Caudra 0.2 Preview 10 {#v0-2-0-preview-10}

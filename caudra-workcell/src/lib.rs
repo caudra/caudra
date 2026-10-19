@@ -335,7 +335,9 @@ impl HostInner {
 
     /// Fails only for reasons of its own: the caller's deadline, or a runtime
     /// task that never returned. A cancelled caller still gets the operation's
-    /// result, because the operation is what knows how it stopped.
+    /// result, because the operation is what knows how it stopped. A caller
+    /// that drops this future instead stops the operation too, so its
+    /// subprocesses never outlive the call on the detached runtime task.
     async fn run<T, F, Fut>(&self, ctx: &ToolContext, operation: F) -> Result<T, ToolError>
     where
         T: Send + 'static,
@@ -350,6 +352,7 @@ impl HostInner {
         if ctx.cancel.is_cancelled() {
             cancellation.cancel();
         }
+        let _cancel_on_drop = cancellation.clone().drop_guard();
         let operation_cancellation = cancellation.clone();
         let operation = operation(operation_cancellation.clone());
         let mut task = Box::pin(self.runtime.spawn(async move {
@@ -4956,6 +4959,13 @@ mod tests {
     const SHELL_ENV_CONFIGURED: &str = "configured-canary";
     const SHELL_ENV_UNLISTED: (&str, &str) = ("CAUDRA_SHELL_ENV_UNLISTED", "unlisted-canary");
     const SHELL_ENV_NO_COLOR: (&str, &str) = ("NO_COLOR", "1");
+    const SLEEPER_PID_FILE: &str = "sleeper.pid";
+    const SLEEPER_SECONDS: u64 = 60;
+    const PROCESS_POLL: Duration = Duration::from_millis(20);
+    const PROCESS_BOUND: Duration = Duration::from_secs(10);
+    const EXPECT_SLEEPER_STARTED: &str = "the shell command recorded its sleeper";
+    const EXPECT_SLEEPER_TERMINATED: &str =
+        "a dropped shell call must terminate its subprocess, not detach it";
 
     async fn bounded_shell_test<T>(operation: impl Future<Output = T>) -> T {
         future::race(operation, async {
@@ -10844,6 +10854,68 @@ mod tests {
         assert!(result.is_error);
         assert_eq!(result.failure, Some(ToolFailure::Cancelled));
         assert_eq!(result.output.expect_err(SHELL_CANCELLED), SHELL_CANCELLED);
+    }
+
+    async fn eventually(mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + PROCESS_BOUND;
+        while !condition() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            smol::Timer::after(PROCESS_POLL).await;
+        }
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_running(pid: &str) -> bool {
+        fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, fields)| !fields.starts_with('Z'))
+        })
+    }
+
+    /// A cancelled turn drops a speculative tool call rather than awaiting
+    /// it, so dropping the call is a cancellation the shell must obey.
+    /// `exec` keeps the recorded PID on a grandchild that only a process-group
+    /// kill reaches.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dropped_shell_call_terminates_its_subprocess() {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let command =
+            format!("sh -c 'echo $$ > {SLEEPER_PID_FILE} && exec sleep {SLEEPER_SECONDS}'");
+        let invocation = registry
+            .get("shell")
+            .expect("registered shell")
+            .tool
+            .parse(&json!({ "command": command }))
+            .expect("valid shell input");
+        smol::block_on(invocation.preflight(&ctx)).expect("shell preflight");
+        let pid_file = root.path().join(SLEEPER_PID_FILE);
+        let recorded = || {
+            fs::read_to_string(&pid_file)
+                .ok()
+                .map(|pid| pid.trim().to_owned())
+                .filter(|pid| !pid.is_empty())
+        };
+
+        let started = smol::block_on(future::or(
+            async {
+                invocation.execute(&ctx).await;
+                false
+            },
+            eventually(|| recorded().is_some()),
+        ));
+        assert!(started, "{EXPECT_SLEEPER_STARTED}");
+        let pid = recorded().expect(EXPECT_SLEEPER_STARTED);
+
+        assert!(
+            smol::block_on(eventually(|| !process_running(&pid))),
+            "{EXPECT_SLEEPER_TERMINATED}"
+        );
     }
 
     #[test]
