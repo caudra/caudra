@@ -36,7 +36,7 @@ use crate::{
         Captured, CapturedOutput, CodeToolGroup, Completion, SCRIPT_NAME, captured_empty, execution,
     },
     render::{from_json, to_json},
-    repair::{Repair, SETTLED_HELPER, looks_like_javascript, repair},
+    repair::{Repair, SETTLED_HELPER, looks_like_javascript, reads_as_python, repair},
     suspend::{Answer, answer},
     types::{CodeExecution, MAX_CODE_BYTES, MAX_TIMEOUT_MS, Outcome, PreparedCode},
 };
@@ -63,7 +63,7 @@ const KEYWORD_NAME_MESSAGE: &str = "keyword argument names must be strings";
 const HOSTED_SUSPENSION_LIMIT_MESSAGE: &str = "The snippet made too many host round trips and was stopped. Batch work into fewer calls, and check for an undefined name read inside a loop.";
 /// The checker's builtins lack `PermissionError`, which a refused host call raises, so a snippet that
 /// catches it would be rejected before it ran.
-const JAVASCRIPT_GUIDANCE: &str = "This looks like JavaScript, and `mcp` runs Python. Rewrite it in Python: `await` each call, and use `asyncio.gather` for several at once.";
+const JAVASCRIPT_GUIDANCE: &str = "This looks like JavaScript, and `code` runs Python. Rewrite it in Python: `await` each call, and use `asyncio.gather` for several at once.";
 const HOSTED_STUBS_PRELUDE: &str = "class PermissionError(Exception): ...\n";
 /// The checker reads the body as reachable and the interpreter skips it, so a snippet under it is
 /// checked without running.
@@ -208,6 +208,9 @@ pub struct HostedExecution {
     pub state_note: Option<StateNote>,
     /// What was changed in the snippet before it ran.
     pub repairs: Vec<Repair>,
+    /// The snippet with only the changes that undid the caller's own slips, line for line with
+    /// what it sent, so the caller can see what it should have written.
+    pub taught_code: Option<String>,
 }
 
 impl CodeToolGroup {
@@ -239,8 +242,9 @@ impl CodeToolGroup {
         cancellation: CancellationToken,
     ) -> HostedExecution {
         let stubs = host.stubs();
-        let javascript = looks_like_javascript(&prepared.code);
+        let looked_like_javascript = looks_like_javascript(&prepared.code);
         let repaired = repair(prepared.code, &stubs);
+        let javascript = looked_like_javascript && !reads_as_python(&repaired.code);
         let prelude = Prelude {
             imports: repaired.imports(),
             settles: repaired.settles(),
@@ -257,6 +261,7 @@ impl CodeToolGroup {
                 state,
                 state_note: None,
                 repairs: Vec::new(),
+                taught_code: None,
             },
             executed = self.run_hosted(
                 prepared,
@@ -279,11 +284,15 @@ impl CodeToolGroup {
             .into_iter()
             .filter(|repair| match repair {
                 Repair::Imported(module) => imported.contains(module),
-                Repair::Unfenced | Repair::Unawaited(_) | Repair::FinalReturn | Repair::Settled => {
-                    true
-                }
+                Repair::Unfenced
+                | Repair::Undeclared(_)
+                | Repair::Unpacked(_)
+                | Repair::Unawaited(_)
+                | Repair::FinalReturn
+                | Repair::Settled => true,
             })
             .collect();
+        executed.taught_code = repaired.taught;
         executed
     }
 
@@ -317,6 +326,7 @@ impl CodeToolGroup {
                 state,
                 state_note: note,
                 repairs: Vec::new(),
+                taught_code: None,
             };
 
         if type_check
@@ -399,6 +409,7 @@ impl CodeToolGroup {
                     state,
                     state_note: note,
                     repairs: Vec::new(),
+                    taught_code: None,
                 };
             }
         };
@@ -423,6 +434,7 @@ impl CodeToolGroup {
             state,
             state_note: note,
             repairs: Vec::new(),
+            taught_code: None,
         }
     }
 

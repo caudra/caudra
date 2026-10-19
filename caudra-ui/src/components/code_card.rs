@@ -23,7 +23,7 @@ const STOPPED: &str = "Stopped: ";
 const CANCELLED: &str = "Cancelled";
 const TIMED_OUT: &str = "Timed out after ";
 const KIND_SEPARATOR: &str = ": ";
-const REPAIRED: &str = "Repaired before running: ";
+const REPAIRED: &str = "Repaired: ";
 const REPAIR_SEPARATOR: &str = ", ";
 
 /// A run of the card's lines, and the text a selection over them copies. `None` is chrome.

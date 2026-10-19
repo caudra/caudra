@@ -226,7 +226,7 @@ Enabled servers and their tools reach the model in a `# MCP servers` reminder, s
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `code` | string | yes | Python to run. Top-level `await` works |
+| `code` | string | yes | Python to run, not JavaScript. Top-level `await` works |
 | `reset` | boolean | no | Drop the variables earlier runs kept before running |
 | `timeoutSec` | integer | no | Wall-clock deadline in seconds for the whole run, waits and calls included: 1 to 3600, default 120 |
 

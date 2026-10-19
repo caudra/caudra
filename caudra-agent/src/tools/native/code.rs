@@ -23,7 +23,8 @@ const SNIPPETS: &str = "Run Python in an isolated interpreter: compute, reshape 
 - A snippet is module code, not a function body: its last expression is the result, returned with anything printed. Do not use `return` at top level. Top-level `await` works. Filter and summarise in the snippet, and return only what you need.
 - Variables persist between runs; `reset: true` starts empty.";
 const MODULES: &str = "- Modules are namespaces of calls that reach beyond the interpreter; `await` each call unless its help says otherwise:";
-const HELP: &str = "- `help()` lists the modules and what this session can reach now; `help(\"history\")` shows a module's calls, `help(\"history.search\")` one call's full reference, `help(\"github\")` an MCP server's tools. A call a module line says to read `help` for first raises with its reference instead of running until this agent has read it; then call it again.";
+const CALLS: &str = "- Calls take Python arguments, positional or keyword: `r = await history.search(\"flaky test\", scope=\"all\")`. Never write JavaScript: no `const` or `let`, and no single object such as `history.search({query: ...})`.";
+const HELP: &str = "- `help()` lists the modules and what this session can reach now; `help(\"history\")` shows a module's calls, `help(\"history.search\")` one call's full reference, `help(\"github\")` an MCP server's tools. A call a module line says to read `help(...)` for first raises with its reference instead of running until this agent has read it; then call it again.";
 const READ_FIRST_LEAD: &str = " Before the first ";
 const READ_FIRST_JOIN: &str = " or ";
 const READ_FIRST_HELP: &str = ", read ";
@@ -38,7 +39,7 @@ pub static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     [SNIPPETS.to_owned(), MODULES.to_owned()]
         .into_iter()
         .chain(modules)
-        .chain([HELP, FAILURES, SANDBOX].map(str::to_owned))
+        .chain([CALLS, HELP, FAILURES, SANDBOX].map(str::to_owned))
         .collect::<Vec<_>>()
         .join("\n")
 });
@@ -78,7 +79,7 @@ const LINES: &str = "lines";
 
 static CODE_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::String,
-    description: "Python to run. Top-level `await` works",
+    description: "Python to run, not JavaScript. Top-level `await` works",
 };
 static RESET_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::Bool,

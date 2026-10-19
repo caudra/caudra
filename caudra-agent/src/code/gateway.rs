@@ -26,7 +26,8 @@ use super::module::{
 };
 use super::names::{HELP, STUB_IMPORTS, renamed};
 use super::output::{
-    CALL_SOURCE, CodeCall, CodeCallStatus, CodeOutcome, CodeOutput, CodeProgressEvent, HostedResult,
+    CALL_SOURCE, CodeCall, CodeCallStatus, CodeOutcome, CodeOutput, CodeProgressEvent,
+    HostedResult, repaired_lines,
 };
 use super::runner::{
     ReplLease, ReplNote, ScriptCall, ScriptError, ScriptErrorKind, ScriptHost, ScriptInvocation,
@@ -137,6 +138,9 @@ pub async fn run(ctx: &ToolContext, code: String, reset: bool, timeout: Duration
     for repair in outcome.repairs {
         output.lessons.extend(repair.lesson);
         output.repairs.push(repair.done);
+    }
+    if let Some(taught) = outcome.taught_code {
+        output.repaired_lines = repaired_lines(&output.code, &taught);
     }
     output
 }

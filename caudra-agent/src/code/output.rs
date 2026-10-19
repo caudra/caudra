@@ -19,8 +19,15 @@ const CALL_NOUN: &str = "call";
 const PRINTED_LABEL: &str = "Printed:";
 const RESULT_LABEL: &str = "Result:";
 const NOTE_LABEL: &str = "Note:";
-const REPAIRED_LABEL: &str = "Repaired before running:";
+const REPAIRED_LABEL: &str = "Repaired:";
 const LESSON_SEPARATOR: &str = "; ";
+const AS_REPAIRED_LABEL: &str = "The lines as repaired:";
+const LINE_NUMBER_WIDTH: usize = 4;
+const LINE_BREAK: char = '\n';
+/// Repaired lines the model reads before the rest are only counted.
+const MAX_REPAIRED_LINES: usize = 20;
+const MORE_REPAIRED_LEAD: &str = "… and ";
+const MORE_REPAIRED_TAIL: &str = " more";
 const NOTHING: &str = "The snippet ended on None and printed nothing.";
 const CANCELLED: &str = "The user cancelled the run.";
 const CALLS_LABEL: &str =
@@ -51,6 +58,35 @@ pub struct CodeOutput {
     /// What the model should write next time, for each repair that undid a slip of its own.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lessons: Vec<String>,
+    /// The lines those repairs changed, as they ran, so the model sees the code it should have
+    /// written beside the lessons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repaired_lines: Vec<RepairedLine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairedLine {
+    /// 1-based, as the model wrote the snippet.
+    pub line: usize,
+    pub text: String,
+}
+
+/// The lines of `taught` that differ from `written`, which a repair keeps line for line; a line a
+/// repair blanked, such as a Markdown fence, has nothing to teach.
+pub fn repaired_lines(written: &str, taught: &str) -> Vec<RepairedLine> {
+    if written.split(LINE_BREAK).count() != taught.split(LINE_BREAK).count() {
+        return Vec::new();
+    }
+    written
+        .split(LINE_BREAK)
+        .zip(taught.split(LINE_BREAK))
+        .enumerate()
+        .filter(|(_, (written, taught))| written != taught && !taught.trim().is_empty())
+        .map(|(index, (_, taught))| RepairedLine {
+            line: index + 1,
+            text: taught.to_owned(),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -260,6 +296,9 @@ impl CodeOutput {
                 self.lessons.join(LESSON_SEPARATOR)
             ));
         }
+        if !self.repaired_lines.is_empty() {
+            parts.push(self.lines_as_repaired());
+        }
         if let Some(note) = &self.state_note {
             parts.push(format!("{NOTE_LABEL} {note}"));
         }
@@ -271,6 +310,27 @@ impl CodeOutput {
 
     pub fn annotation(&self) -> Option<String> {
         (!self.calls.is_empty()).then(|| counted(self.calls.len(), CALL_NOUN))
+    }
+
+    fn lines_as_repaired(&self) -> String {
+        let mut lines = vec![AS_REPAIRED_LABEL.to_owned()];
+        lines.extend(
+            self.repaired_lines
+                .iter()
+                .take(MAX_REPAIRED_LINES)
+                .map(|repaired| {
+                    format!("{:>LINE_NUMBER_WIDTH$} | {}", repaired.line, repaired.text)
+                }),
+        );
+        if let Some(rest) = self
+            .repaired_lines
+            .len()
+            .checked_sub(MAX_REPAIRED_LINES)
+            .filter(|rest| *rest > 0)
+        {
+            lines.push(format!("{MORE_REPAIRED_LEAD}{rest}{MORE_REPAIRED_TAIL}"));
+        }
+        lines.join("\n")
     }
 
     fn calls_made(&self) -> String {
@@ -364,6 +424,36 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains(REPAIR), "{text}");
+    }
+
+    const WRITTEN: &str = "```python\nconst r = await gh.list({state: \"open\"}); r\nx = 1\n```";
+    const TAUGHT: &str = "\nr = await gh.list(state=\"open\"); r\nx = 1\n";
+    const TAUGHT_LINE: &str = "r = await gh.list(state=\"open\"); r";
+
+    /// Only the lines a repair rewrote reach the model, numbered as it wrote them; a blanked fence
+    /// line has nothing to teach.
+    #[test]
+    fn the_model_reads_the_lines_a_repair_rewrote() {
+        let output = CodeOutput {
+            outcome: CodeOutcome::Completed,
+            lessons: vec![IMPORT_LESSON.to_owned()],
+            repaired_lines: repaired_lines(WRITTEN, TAUGHT),
+            ..CodeOutput::default()
+        };
+        let text = output.model_text();
+        assert!(
+            text.contains(&format!(
+                "{AS_REPAIRED_LABEL}\n{:>LINE_NUMBER_WIDTH$} | {TAUGHT_LINE}",
+                2
+            )),
+            "{text}"
+        );
+        assert_eq!(output.repaired_lines.len(), 1, "{text}");
+    }
+
+    #[test]
+    fn lines_that_moved_teach_nothing() {
+        assert!(repaired_lines(WRITTEN, TAUGHT_LINE).is_empty());
     }
 
     /// Calls saved before helpers were marked load as server calls, and a marked one loads as it

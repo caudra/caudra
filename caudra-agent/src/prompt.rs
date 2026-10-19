@@ -306,7 +306,7 @@ const NATIVE_HINTS: &[(&str, Slot, &str)] = &[
     (
         "code",
         Slot::ToolUsage,
-        "- Use **code** for Python computation over values already in context. It cannot access files, processes, or the network; it reaches only the host modules its description lists.",
+        "- Use **code** for Python computation over values already in context. It cannot access files, processes, or the network; it reaches only the host modules its description lists. Snippets are Python, never JavaScript: write `r = await module.call(\"text\", key=value)`, not `const r = await module.call({key: value})`.",
     ),
     (
         "file_read",

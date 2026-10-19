@@ -228,6 +228,9 @@ pub struct ScriptOutcome {
     pub note: Option<ReplNote>,
     /// What the runner changed in the snippet before running it.
     pub repairs: Vec<ScriptRepair>,
+    /// The snippet with only the changes that undid the model's own slips, line for line with
+    /// what it wrote.
+    pub taught_code: Option<String>,
 }
 
 /// One change made to a snippet before it ran.

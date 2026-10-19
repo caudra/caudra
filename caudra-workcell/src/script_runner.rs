@@ -219,6 +219,7 @@ async fn run_hosted(
                 lesson: repair.lesson(),
             })
             .collect(),
+        taught_code: executed.taught_code,
     };
     (outcome, executed.state)
 }
