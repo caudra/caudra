@@ -7031,6 +7031,7 @@ mod retained_progress_tests {
                     tool: SHELL_TOOL_NAME.into(),
                     summary: CHILD_SUMMARY.into(),
                     status: BatchToolStatus::Running,
+                    host_call: false,
                 }],
             )
             .with_call_id(id),

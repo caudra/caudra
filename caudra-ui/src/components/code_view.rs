@@ -7053,6 +7053,7 @@ mod tests {
             tool: Arc::from(tool),
             summary: summary.to_owned(),
             status,
+            host_call: false,
         }
     }
 
@@ -7063,7 +7064,8 @@ mod tests {
     const HISTORY_WINDOW_MSG: &str = "a task windows output and retained activity rows together";
     const HISTORY_REACHABLE_MSG: &str = "every retained row remains reachable in the task window";
     const HISTORY_COLLAPSED_MSG: &str = "folding output must not hide the task's status tree";
-    const HISTORY_HEIGHTS: [usize; 5] = [3, 4, 6, 6, 6];
+    /// The opening batch is a row of its own, so the window fills one report sooner.
+    const HISTORY_HEIGHTS: [usize; 5] = [4, 5, 6, 6, 6];
 
     fn history_report(batch: usize, count: usize) -> SubagentProgress {
         SubagentProgress {

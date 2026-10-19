@@ -27,7 +27,7 @@ use super::module::{
 use super::names::{HELP, STUB_IMPORTS, renamed};
 use super::output::{
     CALL_SOURCE, CodeCall, CodeCallStatus, CodeOutcome, CodeOutput, CodeProgressEvent,
-    HostedResult, repaired_lines,
+    HostedResult, repaired_lines, written_call,
 };
 use super::runner::{
     ReplLease, ReplNote, ScriptCall, ScriptError, ScriptErrorKind, ScriptHost, ScriptInvocation,
@@ -465,6 +465,15 @@ impl Gateway {
             .unwrap_or_else(|| HostedResult::pending(tool))
     }
 
+    /// The call at `index` again, once let through: a row a watcher marked as waiting on the
+    /// user's answer reads as running from here.
+    fn republish(&self, index: usize) {
+        let call = self.calls().get(index).cloned();
+        if let Some(call) = call {
+            self.publish(index, call);
+        }
+    }
+
     fn publish(&self, index: usize, call: CodeCall) {
         let Some(id) = self.0.ctx.tool_use_id.clone() else {
             return;
@@ -509,6 +518,7 @@ impl Gateway {
         if let Err(error) = authorize(&child, &name, &input, permission, read_only).await {
             return self.refused(index, started, error);
         }
+        self.republish(index);
         if let Err(message) = self.open_record(read_only).await {
             return self.failed(
                 index,
@@ -967,16 +977,7 @@ async fn authorize(
 /// The call as the snippet made it, `history.read(ref="…", limit=5000)`, then the module's
 /// context, so a prompt names what runs rather than the `code` tool around it.
 fn prompt_action(name: &str, input: &Value, context: Option<&str>) -> String {
-    let arguments = match input {
-        Value::Object(arguments) => arguments
-            .iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect::<Vec<_>>()
-            .join(", "),
-        Value::Null => String::new(),
-        value => value.to_string(),
-    };
-    let call = format!("{name}({arguments})");
+    let call = written_call(name, input);
     match context {
         Some(context) => format!("{call}\n{context}"),
         None => call,

@@ -1280,23 +1280,19 @@ pub struct ToolProgress {
 }
 
 impl ToolProgress {
+    /// Every activity a live run reports is kept as a row, so a reader sees what it has done as
+    /// well as what it is doing.
     pub fn live(report: SubagentProgress) -> Self {
-        let history = if report.activity.children().is_empty() {
-            Vec::new()
-        } else {
-            vec![report.activity.clone()]
-        };
-        let current_activity = (!history.is_empty()).then_some(0);
         Self {
+            history: vec![report.activity.clone()],
             report,
             since: Some(Instant::now()),
-            history,
-            current_activity,
+            current_activity: Some(0),
         }
     }
 
     pub fn update(&mut self, mut report: SubagentProgress) {
-        if self.has_history() || !report.activity.children().is_empty() {
+        if self.is_live() {
             let existing = match &report.activity {
                 SubagentActivity::Tool { call_id: Some(id), .. } => {
                     self.history.iter().position(|activity| {
@@ -1720,8 +1716,9 @@ pub(crate) fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent
 mod tool_progress_tests {
     use super::ToolProgress;
     use super::tool_display::progress_lines;
-    use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME};
+    use caudra_agent::tools::{BATCH_TOOL_NAME, CODE_TOOL_NAME, SHELL_TOOL_NAME};
     use caudra_agent::{ActivityChild, BatchToolStatus, SubagentActivity, SubagentProgress};
+    use std::iter;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use test_case::test_case;
@@ -1757,6 +1754,7 @@ mod tool_progress_tests {
                     tool: Arc::from(SHELL_TOOL_NAME),
                     summary: CHILD_SUMMARY.into(),
                     status,
+                    host_call: false,
                 })
                 .collect(),
         );
@@ -1946,28 +1944,50 @@ mod tool_progress_tests {
         );
     }
 
-    #[test_case(false ; "before_any_batch")]
-    #[test_case(true ; "after_first_batch")]
-    fn thinking_title_updates_reuse_the_current_phase(retained: bool) {
-        let batch = batch_report(Some(FIRST_CALL), &[BatchToolStatus::Running]);
-        let mut progress = ToolProgress::live(if retained {
-            batch.clone()
-        } else {
-            report(SubagentActivity::Responding)
-        });
+    /// The reported bug: a subagent that never batched showed one row, each step replacing the
+    /// one before. Every step is a row, and only the newest is current.
+    #[test]
+    fn every_step_of_a_live_run_keeps_its_row() {
+        let shell =
+            SubagentActivity::tool(Arc::from(SHELL_TOOL_NAME), FIRST_CALL).with_call_id(FIRST_CALL);
+        let thinking = SubagentActivity::Thinking { title: None };
+        let code = SubagentActivity::tool(Arc::from(CODE_TOOL_NAME), SECOND_CALL)
+            .with_call_id(SECOND_CALL);
+        let mut progress = ToolProgress::live(report(shell.clone()));
+
+        for next in [&thinking, &code, &SubagentActivity::Responding] {
+            progress.update(report(next.clone()));
+        }
+
+        assert_eq!(
+            progress.activities().collect::<Vec<_>>(),
+            [
+                (&shell, false),
+                (&thinking, false),
+                (&code, false),
+                (&SubagentActivity::Responding, true)
+            ]
+        );
+    }
+
+    #[test_case(false ; "after_a_reply")]
+    #[test_case(true ; "after_a_batch")]
+    fn thinking_title_updates_reuse_the_current_phase(batch: bool) {
+        let first = match batch {
+            true => batch_report(Some(FIRST_CALL), &[BatchToolStatus::Running]),
+            false => report(SubagentActivity::Responding),
+        };
+        let mut progress = ToolProgress::live(first.clone());
 
         for title in [None, Some(THINKING_TITLE), Some(UPDATED_THINKING_TITLE)] {
             let thinking = SubagentActivity::Thinking {
                 title: title.map(str::to_owned),
             };
             progress.update(report(thinking.clone()));
-            let mut expected = Vec::new();
-            if retained {
-                expected.push((&batch.activity, false));
-            }
-            expected.push((&thinking, true));
-            assert_eq!(progress.activities().collect::<Vec<_>>(), expected);
-            assert_eq!(progress.has_history(), retained);
+            assert_eq!(
+                progress.activities().collect::<Vec<_>>(),
+                [(&first.activity, false), (&thinking, true)]
+            );
         }
     }
 
@@ -2004,24 +2024,27 @@ mod tool_progress_tests {
     fn successive_batches_survive_thinking_phases(sizes: &[usize]) {
         let thinking = SubagentActivity::Thinking { title: None };
         let mut progress = ToolProgress::live(report(thinking.clone()));
-        assert!(!progress.has_history());
 
         for (index, &size) in sizes.iter().enumerate() {
             progress.update(batch_report(
                 Some(&index.to_string()),
                 &vec![BatchToolStatus::Running; size],
             ));
-            assert_eq!(progress.activities().count(), index * 2 + 1);
+            assert_eq!(progress.activities().count(), index * 2 + 2);
             progress.update(report(thinking.clone()));
+            let earlier_thought = (0, false);
             assert_eq!(
                 progress
                     .activities()
                     .map(|(activity, current)| (activity.children().len(), current))
                     .collect::<Vec<_>>(),
-                sizes[..=index]
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(batch, &size)| [(size, false), (0, batch == index)])
+                iter::once(earlier_thought)
+                    .chain(
+                        sizes[..=index]
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(batch, &size)| [(size, false), (0, batch == index)])
+                    )
                     .collect::<Vec<_>>()
             );
         }

@@ -12544,6 +12544,7 @@ fn batching_report(jobs: usize) -> SubagentProgress {
                     tool: Arc::from(SHELL_TOOL_NAME),
                     summary: format!("job {job}"),
                     status: caudra_agent::BatchToolStatus::Running,
+                    host_call: false,
                 })
                 .collect(),
         ),

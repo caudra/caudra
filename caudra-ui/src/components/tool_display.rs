@@ -373,6 +373,7 @@ const LIVE_MARKDOWN_TOOLS: &[&str] = &[MEMORY_TOOL_NAME, plan::NAME, TASK_TOOL_N
 pub(super) const WRITING_PROMPT: &str = "Writing prompt";
 pub(super) const WRITING_COMMAND: &str = "Writing command";
 pub(super) const WRITING_SCRIPT: &str = "Writing script";
+pub(super) const WRITING_CODE: &str = "Writing code";
 pub(super) const WRITING_BRIEF: &str = "Writing brief";
 /// What a call is doing while the model still writes its arguments, for the
 /// tools whose arguments take long enough to watch arrive. Every other tool
@@ -382,7 +383,7 @@ const DRAFTING_LABELS: &[(&str, &str)] = &[
     (IMAGE_GENERATE_TOOL_NAME, WRITING_PROMPT),
     (SHELL_TOOL_NAME, WRITING_COMMAND),
     (PYTHON_EXECUTION_TOOL_NAME, WRITING_SCRIPT),
-    (CODE_TOOL_NAME, WRITING_SCRIPT),
+    (CODE_TOOL_NAME, WRITING_CODE),
     (TASK_TOOL_NAME, WRITING_BRIEF),
 ];
 /// What any call whose permission prompt is open is doing.
@@ -716,6 +717,9 @@ pub(super) fn activity_sigil(activity: &SubagentActivity, tense: Tense) -> Optio
 /// draws the same call: the connector, then the sigil in its outcome colour,
 /// then the tense the child's status puts the verb in.
 pub(super) fn activity_child_spans(child: &ActivityChild, prefix: String) -> Vec<Span<'static>> {
+    if child.host_call {
+        return host_call_spans(child, prefix);
+    }
     let theme = theme::current();
     let (sigil, label, tense) = title(&child.tool, child.status.into(), child.status.stage());
     let mut spans = vec![
@@ -731,6 +735,18 @@ pub(super) fn activity_child_spans(child: &ActivityChild, prefix: String) -> Vec
         ));
     }
     spans
+}
+
+/// A host call a `code` run made, written as the snippet made it: `history.search(query="…")`.
+fn host_call_spans(child: &ActivityChild, prefix: String) -> Vec<Span<'static>> {
+    let theme = theme::current();
+    let (sigil, _) = compact_sigil_label(CODE_TOOL_NAME, child.status.into());
+    vec![
+        Span::styled(prefix, theme.tool_dim),
+        Span::styled(format!("{sigil} "), batch_sigil_style(child.status, None)),
+        Span::styled(escape_terminal_controls(&child.tool), theme.tool_prefix),
+        Span::styled(escape_terminal_controls(&child.summary), theme.tool_dim),
+    ]
 }
 
 fn append_activity_spans(
@@ -4690,6 +4706,7 @@ mod tests {
         WRITING_SCRIPT
         ; "a_script_being_written"
     )]
+    #[test_case(CODE_TOOL_NAME, Some(CallStage::Drafting), WRITING_CODE ; "code_being_written")]
     #[test_case(TASK_TOOL_NAME, Some(CallStage::Drafting), WRITING_BRIEF ; "a_brief_being_written")]
     #[test_case(
         FILE_READ_TOOL_NAME,
@@ -6684,6 +6701,7 @@ mod tests {
             tool: Arc::from(tool),
             summary: summary.to_owned(),
             status,
+            host_call: false,
         }
     }
 
@@ -7105,6 +7123,42 @@ mod tests {
                 "      └── ⌕ Grep fn main",
             ],
             "{NESTED_ROSTER_MSG}"
+        );
+    }
+
+    const HOST_CALL_NAME: &str = "history.search";
+    const HOST_CALL_ARGS: &str = "(query=\"flaky\")";
+
+    /// A `code` run's host calls read as the snippet wrote them, with no verb before them.
+    #[test]
+    fn a_subagents_code_row_lists_its_host_calls_as_written() {
+        let host_call = |status| ActivityChild {
+            host_call: true,
+            ..batch_child(HOST_CALL_NAME, HOST_CALL_ARGS, status)
+        };
+        let activity = SubagentActivity::batch(
+            Arc::from(CODE_TOOL_NAME),
+            "2 calls",
+            vec![
+                host_call(BatchToolStatus::Success),
+                host_call(BatchToolStatus::Running),
+            ],
+        );
+        let msg = subagent_msg(ToolStatus::InProgress, Some(report(activity, 1)));
+
+        let tl = build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(80), None);
+
+        let rows: Vec<String> = tl.lines.iter().skip(2).map(line_text).collect();
+        let row = |connector: &str, status: BatchToolStatus| {
+            let (sigil, _) = compact_sigil_label(CODE_TOOL_NAME, status.into());
+            format!("      {connector}{sigil} {HOST_CALL_NAME}{HOST_CALL_ARGS}")
+        };
+        assert_eq!(
+            rows,
+            [
+                row(TREE_BRANCH, BatchToolStatus::Success),
+                row(TREE_LAST, BatchToolStatus::Running)
+            ]
         );
     }
 

@@ -37,11 +37,7 @@ pub(crate) fn entries(output: &CodeOutput) -> Vec<BatchToolEntry> {
 
 fn entry(call: &CodeCall) -> BatchToolEntry {
     let tool = call.qualified_name();
-    let status = match call.status {
-        CodeCallStatus::Running => BatchToolStatus::Running,
-        CodeCallStatus::Success => BatchToolStatus::Success,
-        CodeCallStatus::Error | CodeCallStatus::Refused => BatchToolStatus::Error,
-    };
+    let status = BatchToolStatus::from(call.status);
     let refused = call.status == CodeCallStatus::Refused;
     if let Some(hosted) = &call.hosted {
         return BatchToolEntry {

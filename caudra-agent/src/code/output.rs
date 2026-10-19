@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::mcp::SEPARATOR;
 use crate::mcp::output::{McpHelper, McpInteraction, McpOutput};
 use crate::tools::{ToolEffect, ToolFailure};
-use crate::types::{ToolInput, ToolOutput, counted};
+use crate::types::{BatchToolStatus, ToolInput, ToolOutput, counted};
 
 /// The ledger source of a call a snippet made.
 pub const CALL_SOURCE: &str = "code";
@@ -36,6 +36,59 @@ const SUCCEEDED: &str = "succeeded";
 const FAILED: &str = "failed";
 const REFUSED: &str = "refused";
 const RUNNING: &str = "did not finish";
+const ARGUMENT_SEPARATOR: &str = ", ";
+const COMMENT: char = '#';
+const FENCE: &str = "```";
+const ELLIPSIS: char = '…';
+const SUMMARY_SEPARATOR: &str = " · ";
+const LINE_NOUN: &str = "line";
+/// How much of a longer snippet's first statement its row shows, so the line count after it
+/// survives the one-row clamp.
+const MAX_SNIPPET_PREVIEW_CHARS: usize = 60;
+
+/// `history.read(ref="abc", limit=5000)`: a call as the snippet made it, with the values it ran
+/// with, which a permission prompt and a subagent's row both spell this way.
+pub fn written_call(name: &str, input: &Value) -> String {
+    format!("{name}({})", call_arguments(input))
+}
+
+fn call_arguments(input: &Value) -> String {
+    match input {
+        Value::Object(arguments) => arguments
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(ARGUMENT_SEPARATOR),
+        Value::Null => String::new(),
+        value => value.to_string(),
+    }
+}
+
+/// What a `code` run that has made no host calls is doing: a one-line snippet is its line, a
+/// longer one its first statement and how long it is.
+pub fn snippet_summary(code: &str) -> String {
+    let count = code.lines().count();
+    let first = code
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with(COMMENT) && !line.starts_with(FENCE));
+    match (first, count) {
+        (Some(line), 1) => line.to_owned(),
+        (Some(line), _) => format!(
+            "{}{SUMMARY_SEPARATOR}{}",
+            preview(line),
+            counted(count, LINE_NOUN)
+        ),
+        (None, _) => counted(count, LINE_NOUN),
+    }
+}
+
+fn preview(line: &str) -> String {
+    match line.char_indices().nth(MAX_SNIPPET_PREVIEW_CHARS) {
+        Some((end, _)) => format!("{}{ELLIPSIS}", line[..end].trim_end()),
+        None => line.to_owned(),
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CodeOutput {
@@ -239,6 +292,17 @@ impl CodeCallStatus {
     }
 }
 
+/// A call's row reads like a batch child's, and a refusal is a failure there.
+impl From<CodeCallStatus> for BatchToolStatus {
+    fn from(status: CodeCallStatus) -> Self {
+        match status {
+            CodeCallStatus::Running => Self::Running,
+            CodeCallStatus::Success => Self::Success,
+            CodeCallStatus::Error | CodeCallStatus::Refused => Self::Error,
+        }
+    }
+}
+
 impl CodeOutcome {
     pub fn is_failure(&self) -> bool {
         self.failure().is_some()
@@ -354,6 +418,19 @@ impl CodeCall {
         format!("{}{SEPARATOR}{}", self.server, self.tool)
     }
 
+    /// The name the snippet called, else the qualified one.
+    pub fn written_name(&self) -> String {
+        match self.called_as.is_empty() {
+            true => self.qualified_name(),
+            false => self.called_as.clone(),
+        }
+    }
+
+    /// `(key=value, …)`, what follows [`Self::written_name`] when the call is spelled out.
+    pub fn written_arguments(&self) -> String {
+        format!("({})", call_arguments(&self.input))
+    }
+
     /// The tool and source the ledger counts the call under: a hosted tool's own, as when the
     /// model called it, else the module call's.
     pub fn ledger_name(&self) -> (String, String) {
@@ -454,6 +531,50 @@ mod tests {
     #[test]
     fn lines_that_moved_teach_nothing() {
         assert!(repaired_lines(WRITTEN, TAUGHT_LINE).is_empty());
+    }
+
+    const SEARCH: &str = "history.search";
+
+    #[test_case("search", json!({"query": "flaky", "limit": 5}), "history.search(query=\"flaky\", limit=5)" ; "keywords")]
+    #[test_case("search", json!(null), "history.search()" ; "no_arguments")]
+    #[test_case("", json!({}), "history.search()" ; "named_by_server_and_tool")]
+    #[test_case("search", json!(["a"]), "history.search([\"a\"])" ; "not_an_object")]
+    fn a_call_is_written_as_the_snippet_made_it(called_as: &str, input: Value, expected: &str) {
+        let call = CodeCall {
+            server: "history".to_owned(),
+            tool: "search".to_owned(),
+            called_as: match called_as {
+                "" => String::new(),
+                _ => SEARCH.to_owned(),
+            },
+            input,
+            ..CodeCall::default()
+        };
+        assert_eq!(
+            format!("{}{}", call.written_name(), call.written_arguments()),
+            expected
+        );
+        assert_eq!(written_call(&call.written_name(), &call.input), expected);
+    }
+
+    const LONG_STATEMENT: &str = "rows = sorted(records, key=lambda record: (record['when'], record['who'], record['what']))";
+
+    #[test_case("sum(x for x in rows)", "sum(x for x in rows)" ; "one_line")]
+    #[test_case("rows = load()\nlen(rows)", "rows = load() · 2 lines" ; "several_lines")]
+    #[test_case("# tally\n\nrows = load()\nlen(rows)", "rows = load() · 4 lines" ; "after_comments_and_blanks")]
+    #[test_case("```python\nrows = load()\n```", "rows = load() · 3 lines" ; "inside_a_fence")]
+    #[test_case("# only\n# comments", "2 lines" ; "nothing_but_comments")]
+    fn a_snippet_without_calls_reads_as_its_first_statement(code: &str, expected: &str) {
+        assert_eq!(snippet_summary(code), expected);
+    }
+
+    #[test]
+    fn a_long_first_statement_is_cut_before_the_line_count() {
+        let summary = snippet_summary(&format!("{LONG_STATEMENT}\nrows"));
+        let (statement, count) = summary.split_once(SUMMARY_SEPARATOR).unwrap();
+        assert_eq!(statement.chars().count(), MAX_SNIPPET_PREVIEW_CHARS + 1);
+        assert!(statement.ends_with(ELLIPSIS), "{summary}");
+        assert_eq!(count, counted(2, LINE_NOUN));
     }
 
     /// Calls saved before helpers were marked load as server calls, and a marked one loads as it

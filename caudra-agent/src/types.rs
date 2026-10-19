@@ -36,7 +36,7 @@ use crate::agent::{GoalResult, GoalVerdict};
 use crate::autopilot::{
     AutopilotDecision, DecisionKind, DecisionOutcome, EngagementSpend, StoodDown,
 };
-use crate::code::output::{CodeOutput, CodeProgressEvent};
+use crate::code::output::{CodeCall, CodeOutput, CodeProgressEvent};
 use crate::decisions::DecisionNote;
 use crate::mcp::kind::McpServerKind;
 use crate::mcp::output::McpOutput;
@@ -3618,20 +3618,36 @@ pub struct ActivityChild {
     pub tool: Arc<str>,
     pub summary: String,
     pub status: BatchToolStatus,
+    /// A host call a `code` run made: `tool` is the call as the snippet named it and `summary`
+    /// its arguments, drawn as written rather than as a tool's verb and header.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_call: bool,
 }
 
 impl From<&BatchToolEntry> for ActivityChild {
     fn from(entry: &BatchToolEntry) -> Self {
         Self {
             tool: Arc::from(entry.tool.as_str()),
-            summary: entry
-                .summary
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" "),
+            summary: flattened(&entry.summary),
             status: entry.status,
+            host_call: false,
         }
     }
+}
+
+impl From<&CodeCall> for ActivityChild {
+    fn from(call: &CodeCall) -> Self {
+        Self {
+            tool: Arc::from(call.written_name()),
+            summary: flattened(&call.written_arguments()),
+            status: call.status.into(),
+            host_call: true,
+        }
+    }
+}
+
+fn flattened(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// What a subagent is doing right now, so a parent watching only the task
@@ -3669,7 +3685,7 @@ impl SubagentActivity {
     pub fn tool(name: Arc<str>, summary: &str) -> Self {
         Self::Tool {
             name,
-            summary: summary.split_whitespace().collect::<Vec<_>>().join(" "),
+            summary: flattened(summary),
             call_id: None,
             stage: None,
             children: Vec::new(),

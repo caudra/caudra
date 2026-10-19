@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_lock::Mutex as AsyncMutex;
-use caudra_config::ProfileToolPolicy;
 use caudra_config::decisions::FeatureMode;
+use caudra_config::{CODE_TOOL_NAME, ProfileToolPolicy};
 use caudra_decision::{Answer, DecisionResponse, ScoreAnswer};
 use serde_json::{Value as JsonValue, json};
 use tracing::info;
@@ -40,6 +40,7 @@ use super::{ModelRoute, resolve_model_for_purpose, resolve_purpose_model_for_ins
 use crate::background::JobScope;
 use crate::cancel::{CancelMap, CancelSlot};
 use crate::code::CodeSession;
+use crate::code::output::snippet_summary;
 use crate::decisions::questions as decision_questions;
 use crate::decisions::{
     DecisionFeature, DecisionReceipt, DecisionState, Decisions, NoteDraft, NoteOutcome,
@@ -54,13 +55,14 @@ use crate::tools::{
     Deadline, DescriptionContext, FileReadTracker, LocalTools, ToolAudience, ToolContext,
     ToolFilter, ToolLive,
 };
+use crate::types::counted;
 use crate::{
     ActivityChild, Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
     BatchToolStatus, CallStage, DoneReason, Envelope, EventSender, History, InterruptSource,
     McpSession, SteeringQueue, SteeringQueueReceiver, SubagentActivity, SubagentEnd,
     SubagentHistoryError, SubagentHistoryLease, SubagentHistoryStore, SubagentInfo,
-    SubagentProgress, SubagentTaskMode, SubagentTaskSpec, SubagentTaskSpecCandidate, ToolOutput,
-    reasoning_summary, steering_queue,
+    SubagentProgress, SubagentTaskMode, SubagentTaskSpec, SubagentTaskSpecCandidate, ToolInput,
+    ToolOutput, reasoning_summary, steering_queue,
 };
 
 pub const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
@@ -93,6 +95,10 @@ const BASELINE_LABEL: &str = "baseline";
 const CHOSEN_LABEL: &str = "chosen";
 const MODEL_SPEC_SEPARATOR: char = '/';
 const LIVE_MODEL_LISTING_DEADLINE: Duration = Duration::from_secs(15);
+/// Host calls a subagent's `code` row shows beneath it, newest last; its own
+/// text counts them all.
+const MAX_CODE_CALL_ROWS: usize = 8;
+const CALL_NOUN: &str = "call";
 
 /// Forwards subagent events to the parent, stamped with the subagent identity.
 /// Usage takes two paths: live on the tool header while the run goes on (last
@@ -147,9 +153,41 @@ async fn relay_session_events(
 
 /// The batch a subagent is working through, so each child's state change can
 /// patch one row instead of resending the roster the `ToolStart` already gave.
+/// A `code` run is watched the same way, its host calls as the children.
 struct BatchWatch {
     id: String,
     children: Vec<ActivityChild>,
+    /// How many host calls a `code` run has started, of which `children` holds
+    /// the newest [`MAX_CODE_CALL_ROWS`]. `None` for a batch.
+    calls: Option<usize>,
+}
+
+impl BatchWatch {
+    /// The row a child's index lands on, `None` once a `code` run's window
+    /// has moved past it.
+    fn slot(&self, index: usize) -> Option<usize> {
+        match self.calls {
+            Some(total) => index.checked_sub(total - self.children.len()),
+            None => Some(index),
+        }
+    }
+
+    /// One host call changed: a new one joins the window, pushing the oldest
+    /// out past the bound, and a known one is patched where it sits.
+    fn code_call(&mut self, index: usize, call: ActivityChild) -> Option<()> {
+        let total = self.calls?;
+        if index >= total {
+            self.calls = Some(index + 1);
+            self.children.push(call);
+            if self.children.len() > MAX_CODE_CALL_ROWS {
+                self.children.remove(0);
+            }
+            return Some(());
+        }
+        let slot = self.slot(index)?;
+        *self.children.get_mut(slot)? = call;
+        Some(())
+    }
 }
 
 /// Keeps the running digest one subagent reports to its parent.
@@ -201,10 +239,16 @@ impl ProgressRelay {
                 summary,
                 call_id: Some(call_id),
                 ..
-            }) if call_id == &watch.id => Some(
-                SubagentActivity::batch(Arc::clone(name), summary, watch.children.clone())
-                    .with_call_id(&watch.id),
-            ),
+            }) if call_id == &watch.id => {
+                let summary = match watch.calls {
+                    Some(total) if total > 0 => counted(total, CALL_NOUN),
+                    _ => summary.clone(),
+                };
+                Some(
+                    SubagentActivity::batch(Arc::clone(name), &summary, watch.children.clone())
+                        .with_call_id(&watch.id),
+                )
+            }
             _ => None,
         }
     }
@@ -230,10 +274,16 @@ impl ProgressRelay {
     /// landing on a row that is still watched.
     fn awaiting_approval(&mut self, id: &str) -> SubagentActivity {
         if let Some(watch) = self.batch.as_mut()
-            && let Some(child) =
-                batch::child_index(&watch.id, id).and_then(|index| watch.children.get_mut(index))
+            && let Some(slot) =
+                batch::child_index(&watch.id, id).and_then(|index| watch.slot(index))
+            && let Some(child) = watch.children.get_mut(slot)
         {
-            child.status = child.status.max(BatchToolStatus::AwaitingApproval);
+            // A host call's row is running from the moment it is made, and is
+            // republished as running once let through.
+            child.status = match child.host_call {
+                true if !child.status.is_terminal() => BatchToolStatus::AwaitingApproval,
+                _ => child.status.max(BatchToolStatus::AwaitingApproval),
+            };
             if let Some(row) = self.watched_batch() {
                 return row;
             }
@@ -283,6 +333,12 @@ impl ProgressRelay {
             AgentEvent::ToolStart(start) => {
                 self.thought.clear();
                 self.thought_title = None;
+                let snippet = match &start.input {
+                    Some(ToolInput::Code { code, .. }) if &*start.tool == CODE_TOOL_NAME => {
+                        Some(snippet_summary(code))
+                    }
+                    _ => None,
+                };
                 self.batch = match &start.output {
                     Some(ToolOutput::Batch { entries, .. }) => Some(BatchWatch {
                         id: start.id.clone(),
@@ -291,20 +347,32 @@ impl ProgressRelay {
                             .take(MAX_BATCH_SIZE)
                             .map(ActivityChild::from)
                             .collect(),
+                        calls: None,
                     }),
-                    _ => None,
+                    _ => snippet.is_some().then(|| BatchWatch {
+                        id: start.id.clone(),
+                        children: Vec::new(),
+                        calls: Some(0),
+                    }),
                 };
+                let summary = snippet.as_deref().unwrap_or(&start.summary);
                 Some(
                     match &self.batch {
                         Some(watch) => SubagentActivity::batch(
                             Arc::clone(&start.tool),
-                            &start.summary,
+                            summary,
                             watch.children.clone(),
                         ),
-                        None => SubagentActivity::tool(Arc::clone(&start.tool), &start.summary),
+                        None => SubagentActivity::tool(Arc::clone(&start.tool), summary),
                     }
                     .with_call_id(&start.id),
                 )
+            }
+            // A host call of the watched `code` run joined it or moved.
+            AgentEvent::CodeProgress(event) => {
+                let watch = self.batch.as_mut().filter(|w| w.id == event.id)?;
+                watch.code_call(event.index, ActivityChild::from(&event.call))?;
+                self.watched_batch()
             }
             // One child moved. The row it names is patched in place, and the
             // digest republished so the parent's tree redraws that row alone.
@@ -1854,6 +1922,7 @@ mod tests {
     use crate::agent::change_recording::ChangeRecorder;
     use crate::agent::change_recording::fixture::{FakeChanges, holder};
     use crate::agent::task_runner::{HostExtras, ModelResolver, WorkflowHostContext};
+    use crate::code::output::{CodeCall, CodeCallStatus, CodeProgressEvent};
     use crate::context::{
         ContextInventory, ContextKey, ContextReadiness, ContextSnapshot, ContextStore,
         ContextUsage, ContextWindow,
@@ -3523,6 +3592,160 @@ mod tests {
             relay
                 .activity(&batch_progress(TOOL_ID, 0, BatchToolStatus::Success))
                 .is_none()
+        );
+    }
+
+    const SNIPPET: &str = "rows = history.search('flaky')\nrows";
+    const SNIPPET_SUMMARY: &str = "rows = history.search('flaky') · 2 lines";
+    const HOST_CALL: &str = "history.search";
+    const ONE_CALL: &str = "1 call";
+
+    fn code_start(code: &str) -> AgentEvent {
+        let AgentEvent::ToolStart(mut start) = tool_start(CODE_TOOL_NAME) else {
+            unreachable!("tool_start builds a start event")
+        };
+        start.summary = "2 lines".to_owned();
+        start.input = Some(ToolInput::Code {
+            language: "python".to_owned(),
+            code: code.to_owned(),
+        });
+        AgentEvent::ToolStart(start)
+    }
+
+    fn code_progress(id: &str, index: usize, status: CodeCallStatus) -> AgentEvent {
+        AgentEvent::CodeProgress(Box::new(CodeProgressEvent {
+            id: id.to_owned(),
+            index,
+            call: CodeCall {
+                server: "history".to_owned(),
+                tool: "search".to_owned(),
+                called_as: HOST_CALL.to_owned(),
+                input: json!({ "query": format!("q{index}") }),
+                status,
+                ..CodeCall::default()
+            },
+        }))
+    }
+
+    /// A published `code` row: its text, then each call row written out with its status.
+    type CodeRow = (Option<String>, Vec<(String, BatchToolStatus)>);
+
+    /// Each published `code` row as its text and its call rows written out.
+    fn code_rows(events: Vec<AgentEvent>) -> Vec<CodeRow> {
+        let mut relay = ProgressRelay::new();
+        events
+            .into_iter()
+            .filter_map(|event| {
+                let activity = relay.activity(&event)?;
+                relay.last = Some(activity.clone());
+                let calls = activity
+                    .children()
+                    .iter()
+                    .inspect(|child| assert!(child.host_call))
+                    .map(|child| (format!("{}{}", child.tool, child.summary), child.status))
+                    .collect();
+                Some((activity.detail().map(str::to_owned), calls))
+            })
+            .collect()
+    }
+
+    fn written(index: usize) -> String {
+        format!("{HOST_CALL}(query=\"q{index}\")")
+    }
+
+    /// The reported bug: a subagent's `code` row read `code 1 line` whatever it did. Before any
+    /// host call it reads as its snippet, then as its calls, each written as the snippet made it.
+    #[test]
+    fn a_code_row_reads_as_its_snippet_then_as_its_host_calls() {
+        let rows = code_rows(vec![
+            code_start(SNIPPET),
+            code_progress(TOOL_ID, 0, CodeCallStatus::Running),
+            code_progress(TOOL_ID, 0, CodeCallStatus::Success),
+            code_progress(TOOL_ID, 1, CodeCallStatus::Refused),
+        ]);
+
+        assert_eq!(
+            rows,
+            [
+                (Some(SNIPPET_SUMMARY.to_owned()), vec![]),
+                (
+                    Some(ONE_CALL.to_owned()),
+                    vec![(written(0), BatchToolStatus::Running)]
+                ),
+                (
+                    Some(ONE_CALL.to_owned()),
+                    vec![(written(0), BatchToolStatus::Success)]
+                ),
+                (
+                    Some(counted(2, CALL_NOUN)),
+                    vec![
+                        (written(0), BatchToolStatus::Success),
+                        (written(1), BatchToolStatus::Error)
+                    ]
+                ),
+            ]
+        );
+    }
+
+    /// A loop of calls keeps the row bounded: it counts them all and shows the newest, and a
+    /// late report for a call that scrolled out changes nothing.
+    #[test]
+    fn a_code_row_shows_its_newest_calls_and_counts_them_all() {
+        let total = MAX_CODE_CALL_ROWS + 2;
+        let mut relay = ProgressRelay::new();
+        relay.last = relay.activity(&code_start(SNIPPET));
+        for index in 0..total {
+            relay.last = relay.activity(&code_progress(TOOL_ID, index, CodeCallStatus::Running));
+        }
+        let activity = relay.last.clone().expect("a row");
+
+        assert_eq!(activity.detail(), Some(counted(total, CALL_NOUN).as_str()));
+        let shown: Vec<String> = activity
+            .children()
+            .iter()
+            .map(|child| format!("{}{}", child.tool, child.summary))
+            .collect();
+        let newest: Vec<String> = (total - MAX_CODE_CALL_ROWS..total).map(written).collect();
+        assert_eq!(shown, newest);
+        assert!(
+            relay
+                .activity(&code_progress(TOOL_ID, 0, CodeCallStatus::Success))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn another_runs_host_calls_change_nothing() {
+        let mut relay = ProgressRelay::new();
+        relay.last = relay.activity(&code_start(SNIPPET));
+
+        assert!(
+            relay
+                .activity(&code_progress(NEXT_TOOL_ID, 0, CodeCallStatus::Running))
+                .is_none()
+        );
+    }
+
+    /// A host call waiting on the user says so on its own row, and reads as running again once
+    /// the gateway republishes it.
+    #[test]
+    fn a_host_call_awaiting_approval_marks_its_own_row() {
+        let rows = code_rows(vec![
+            code_start(SNIPPET),
+            code_progress(TOOL_ID, 0, CodeCallStatus::Running),
+            permission_request(&batch::child_tool_use_id(Some(TOOL_ID), 0)),
+            code_progress(TOOL_ID, 0, CodeCallStatus::Running),
+        ]);
+
+        let statuses: Vec<BatchToolStatus> =
+            rows.iter().skip(1).map(|(_, calls)| calls[0].1).collect();
+        assert_eq!(
+            statuses,
+            [
+                BatchToolStatus::Running,
+                BatchToolStatus::AwaitingApproval,
+                BatchToolStatus::Running
+            ]
         );
     }
 
