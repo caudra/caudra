@@ -1,5 +1,6 @@
 use caudra_agent::CancelToken;
 use caudra_agent::code::output::CodeOutcome;
+use caudra_agent::code::repeats::python_repr;
 use caudra_agent::code::runner::{
     self as script_runner, ReplLease, ReplSlot, ScriptCall, ScriptHost, ScriptInvocation,
     ScriptName, ScriptRun, ScriptRunner, ScriptStatus,
@@ -97,4 +98,66 @@ fn production_host_runs_mcp_snippets_with_the_embedded_worker() {
     assert_eq!(output.status, ScriptStatus::Completed, "{output:?}");
     assert_eq!(output.result, json!(ECHOED));
     assert!(smol::block_on(ReplLease::acquire(&repl)).take().is_some());
+}
+
+const ANSWER_METHOD: &str = "answer";
+const ANSWER_STUBS: &str =
+    "from typing import Any\nclass _S:\n    async def answer(self) -> Any: ...\nsrv: _S\n";
+const PRINT_ANSWER: &str = "print(await srv.answer())";
+const REPR_MATCHES: &str = "a printed answer must read as the card's repr of it, or no dump folds";
+
+/// Answers every call with the same value.
+struct Fixed(Value);
+
+impl ScriptHost for Fixed {
+    fn lookup(&self, namespace: Option<&str>, name: &str) -> ScriptName {
+        match (namespace, name) {
+            (None, NAMESPACE) => ScriptName::Namespace,
+            (Some(NAMESPACE), ANSWER_METHOD) => ScriptName::Function,
+            _ => ScriptName::Undefined(None),
+        }
+    }
+
+    fn call(&self, _call: ScriptCall) -> ScriptInvocation {
+        let value = self.0.clone();
+        ScriptInvocation::Deferred(Box::pin(async move { Ok(value) }))
+    }
+
+    fn stubs(&self) -> String {
+        ANSWER_STUBS.to_owned()
+    }
+}
+
+/// The interpreter prints a call's answer exactly as the `code` card writes its `repr`, which
+/// is what lets the card fold a dump of it.
+#[test]
+fn production_host_prints_an_answer_as_its_repr() {
+    assert!(bundled_worker_available(), "{MISSING_REQUIRED_WORKER}");
+    let answer = json!({
+        "runtime": "workcell · server-process",
+        "apostrophe": "it's",
+        "quotes": "say \"hi\" it's",
+        "commands": [{"id": "bash", "available": true, "version": null}],
+        "numbers": [1, -2, 2.5, 3.0],
+        "text": "café 界\n\ttab\\",
+        "empty": {},
+    });
+    let root = TempDir::new().expect("tempdir");
+    let host = WorkcellHost::new_production(root.path(), None).expect("Workcell host");
+    let repl = ReplSlot::shared(false);
+    let outcome = smol::block_on(async {
+        host.script_runner()
+            .run(ScriptRun {
+                code: PRINT_ANSWER.to_owned(),
+                host: Arc::new(Fixed(answer.clone())),
+                state: ReplLease::acquire(&repl).await,
+                cancel: CancelToken::none(),
+            })
+            .await
+    });
+
+    let output = outcome.output.expect("the snippet ran");
+    assert_eq!(output.status, ScriptStatus::Completed, "{output:?}");
+    let expected = format!("{}\n", python_repr(&answer).expect("a certain repr"));
+    assert_eq!(output.stdout, expected, "{REPR_MATCHES}");
 }

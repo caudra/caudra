@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::ops::Range;
 use std::path::Path;
@@ -22,8 +22,8 @@ use super::tool_display::{
     repeats_tool, report_header, report_markdown, report_message, scroll_footer_text, title,
 };
 use super::{
-    ToolProgress, code_card, environment_card, is_collapsible, json_text, mcp_card, memory_card,
-    peer_card, task_card, workflow_card,
+    ToolProgress, code_card, environment_card, is_collapsible, json_text, json_tree, mcp_card,
+    memory_card, peer_card, task_card, workflow_card,
 };
 use caudra_agent::code::output::CodeOutput;
 use caudra_agent::tools::{
@@ -44,11 +44,15 @@ use caudra_markdown::Source;
 use caudra_markdown::render::SpanSource;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use serde_json::Value;
 use syntect::parsing::SyntaxReference;
 use syntect::util::LinesWithEndings;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub(crate) const MAX_INSTRUCTION_LINES: usize = 15;
+/// The child a card that is not a batch answers its own clicks as, so its trees fold by the same
+/// views a batch child's do.
+pub(crate) const STANDALONE_CHILD: usize = 0;
 /// What a child's body clears past the trunk it hangs from, so its text lands
 /// under the label the connector and sigil pushed across.
 const BATCH_BODY_PAD: &str = "  ";
@@ -1097,6 +1101,7 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
                 &child,
                 limits.live.get(&index),
                 limits.views.is_raw(index),
+                limits.views.tree_folds(index),
             )
         });
         let has_body = body.as_ref().is_some_and(|body| !body.lines.is_empty());
@@ -1245,6 +1250,12 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
             rows.extend((0..body.lines.len()).map(|row| {
                 if let Some(Some(RowTarget::Raw(_))) = body.rows.get(row) {
                     Some(RowTarget::Raw(index))
+                } else if let Some(Some(RowTarget::Node { tree, node, .. })) = body.rows.get(row) {
+                    Some(RowTarget::Node {
+                        child: index,
+                        tree: *tree,
+                        node: *node,
+                    })
                 } else if let Some(output) = entry.output.as_ref()
                     && let Some(Some(task)) = body.rows.get(row)
                     && let Some(task) = task_card::target_index(output, *task)
@@ -1287,6 +1298,14 @@ fn render_code_card(
     limits: &RenderLimits,
 ) -> (BatchCard, bool) {
     let entries = code_card::entries(output);
+    // The tail's trees answer for a child past the roster, so no click on them reaches a call.
+    let tail_child = entries.len();
+    let limits = &RenderLimits {
+        stands_in: (0..tail_child)
+            .filter(|index| output.stands_in(*index))
+            .collect(),
+        ..limits.clone()
+    };
     let mut card = render_batch(&entries, highlight, limits);
     let mut trace = SourceTrace::default();
     match card.source.take() {
@@ -1294,12 +1313,16 @@ fn render_code_card(
         None if !card.lines.is_empty() => trace.abandon(),
         None => {}
     }
-    let window = limits.scroll.filter(|_| !limits.is_expanded());
+    let tail = code_card::Tail::new(output);
+    let window = limits
+        .scroll
+        .filter(|_| !limits.is_expanded() && !tail.has_tree());
     let budget = match window {
         Some(_) => usize::MAX,
         None => limits.bounded_budget(),
     };
-    let (blocks, mut truncated) = code_card::tail(output, budget, limits.width);
+    let folds = limits.views.tree_folds(tail_child);
+    let (blocks, mut truncated) = code_card::tail(tail, budget, limits.width, &folds);
     let (blocks, windowed) = match window {
         Some(window) => {
             let (blocks, windowed) = window_code_tail(blocks, window);
@@ -1313,13 +1336,19 @@ fn render_code_card(
         card.lines.push(Line::default());
     }
     let tail_start = card.lines.len();
-    for (lines, source) in blocks {
-        if let Some(source) = source {
+    for block in blocks {
+        if let Some(source) = block.source {
             trace.record(card.lines.len(), source);
         }
-        card.links.rows.extend(LinkMap::none_for(&lines).rows);
-        card.rows.resize(card.rows.len() + lines.len(), None);
-        card.lines.extend(lines);
+        card.links.rows.extend(LinkMap::none_for(&block.lines).rows);
+        card.rows.extend(block.nodes.into_iter().map(|node| {
+            node.map(|(tree, node)| RowTarget::Node {
+                child: tail_child,
+                tree,
+                node,
+            })
+        }));
+        card.lines.extend(block.lines);
     }
     if let Some(WindowedTail { start, end, total }) = windowed {
         card.spans.push(ScrollSpan {
@@ -1356,20 +1385,18 @@ fn window_code_tail(
     blocks: Vec<code_card::Block>,
     window: ScrollWindow,
 ) -> (Vec<code_card::Block>, WindowedTail) {
-    let total = blocks.iter().map(|(lines, _)| lines.len()).sum();
+    let total = blocks.iter().map(|block| block.lines.len()).sum();
     let (start, end) = window.range(total);
     let mut first = 0;
     let mut kept = Vec::new();
-    for (lines, source) in blocks {
-        let block = first..first + lines.len();
-        first = block.end;
-        let shown = block.start.max(start)..block.end.min(end);
+    for block in blocks {
+        let rows = first..first + block.lines.len();
+        first = rows.end;
+        let shown = rows.start.max(start)..rows.end.min(end);
         if shown.is_empty() {
             continue;
         }
-        let local = shown.start - block.start..shown.end - block.start;
-        let source = source.and_then(|source| source.keep_rows(local.clone()));
-        kept.push((lines[local].to_vec(), source));
+        kept.push(block.keep(shown.start - rows.start..shown.end - rows.start));
     }
     (kept, WindowedTail { start, end, total })
 }
@@ -1522,6 +1549,7 @@ fn child_body(
     limits: &RenderLimits,
     live: Option<&String>,
     raw: bool,
+    folds: TreeFolds,
 ) -> ChildBody {
     let output = entry.output.as_ref();
     if let Some(message) = report_message(&entry.tool, entry.raw_input.as_ref()) {
@@ -1561,6 +1589,7 @@ fn child_body(
             tool: &entry.tool,
             arguments: entry.raw_input.as_ref(),
             raw,
+            folds,
             ..McpCall::default()
         };
         let (content, has_raw_view) = render_mcp_content(None, &call, Some(answer), limits);
@@ -2014,6 +2043,34 @@ pub(super) fn json_body(text: &str, width: u16) -> (Vec<Line<'static>>, BodySour
         })
         .collect();
     (lines, plain_body(text, width).1)
+}
+
+/// `value` as a tree with the nodes in `folded` closed, broken to `width`, copying as the text it
+/// shows, with the node each drawn row folds or opens. `None` for anything but a dict or a list.
+pub(super) fn tree_body(
+    value: &Value,
+    folded: &HashSet<usize>,
+    width: u16,
+) -> Option<(Vec<Line<'static>>, BodySource, Vec<Option<usize>>)> {
+    let rows = json_tree::rows(value, folded)?;
+    let text: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            row.line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        })
+        .collect();
+    let mut lines = Vec::new();
+    let mut nodes = Vec::new();
+    for row in rows {
+        let broken = wrapped_lines(wrap_styled(row.line.spans, 0, "", width));
+        nodes.resize(nodes.len() + broken.len(), row.fold);
+        lines.extend(broken);
+    }
+    Some((lines, plain_body(&text.join("\n"), width).1, nodes))
 }
 
 /// One piece of a styled row, on the display row the break put it on.
@@ -3068,6 +3125,29 @@ pub struct BatchViews {
     folded: Arc<[usize]>,
     /// The children drawn as their answer came rather than as their card.
     raw: Arc<[usize]>,
+    /// The tree nodes a click moved from where they rest, as (child, tree, node).
+    nodes: Arc<[(usize, usize, usize)]>,
+}
+
+/// The nodes a click moved from where they rest in each of one child's trees, as (tree, node).
+#[derive(Clone, Default)]
+pub(crate) struct TreeFolds(Vec<(usize, usize)>);
+
+impl TreeFolds {
+    /// The nodes of `tree` drawn closed. A tree rests whole or as its root row, and every click
+    /// on a node undoes where it rests.
+    pub(crate) fn folded(&self, tree: usize, rests_folded: bool) -> HashSet<usize> {
+        let moved = self
+            .0
+            .iter()
+            .filter(|(moved_tree, _)| *moved_tree == tree)
+            .map(|(_, node)| *node);
+        let mut folded: HashSet<usize> = moved.collect();
+        if rests_folded && !folded.remove(&json_tree::ROOT) {
+            folded.insert(json_tree::ROOT);
+        }
+        folded
+    }
 }
 
 impl BatchViews {
@@ -3114,7 +3194,7 @@ impl BatchViews {
         Self {
             open,
             folded,
-            raw: Arc::clone(&self.raw),
+            ..self.clone()
         }
     }
 
@@ -3123,6 +3203,30 @@ impl BatchViews {
             raw: toggled_index(&self.raw, index),
             ..self.clone()
         }
+    }
+
+    /// A click on a tree's node. One on the root also forgets every node folded under it, so
+    /// opening a tree opens all of it.
+    pub fn node_toggled(&self, child: usize, tree: usize, node: usize) -> Self {
+        let clicked = (child, tree, node);
+        let moved = self.nodes.contains(&clicked);
+        let kept = self.nodes.iter().copied().filter(|kept| {
+            *kept != clicked && !(node == json_tree::ROOT && (kept.0, kept.1) == (child, tree))
+        });
+        Self {
+            nodes: kept.chain((!moved).then_some(clicked)).collect(),
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn tree_folds(&self, child: usize) -> TreeFolds {
+        TreeFolds(
+            self.nodes
+                .iter()
+                .filter(|(moved_child, _, _)| *moved_child == child)
+                .map(|(_, tree, node)| (*tree, *node))
+                .collect(),
+        )
     }
 }
 
@@ -3137,6 +3241,17 @@ fn always_whole(entry: &BatchToolEntry) -> bool {
             ..
         }))
     )
+}
+
+/// Whether a `code` card's child rests open: as any child does, or because the snippet only
+/// printed or ended on its answer, so its card is read in place of that dump's folded tree.
+pub(crate) fn code_child_rests_open(
+    policy: &CardPolicy,
+    output: &CodeOutput,
+    index: usize,
+    entry: &BatchToolEntry,
+) -> bool {
+    rests_open(policy, entry) || (!policy.compact && output.stands_in(index))
 }
 
 /// Whether a child that is a recognised server's answer rests whole: Caudra
@@ -3338,6 +3453,9 @@ pub struct RenderLimits {
     /// The session's working directory, which a child's `workdir` argument is
     /// resolved against until its result says where the child ran.
     pub cwd: Option<Arc<Path>>,
+    /// The children of a `code` card whose answers the snippet only printed or ended on, by index
+    /// in the roster. Each one's card stands in for that dump, so it rests open.
+    pub stands_in: Arc<[usize]>,
 }
 
 impl RenderLimits {
@@ -3355,6 +3473,7 @@ impl RenderLimits {
             tool_lines,
             width: UNCONSTRAINED_WIDTH,
             cwd: None,
+            stands_in: Arc::default(),
         }
     }
 
@@ -3460,9 +3579,10 @@ impl RenderLimits {
         if !whole && self.views.is_folded(index) {
             return None;
         }
+        let stands_in = !self.policy.compact && self.stands_in.contains(&index);
         let open = whole
             || self.views.is_open(index)
-            || (!self.body_taken && rests_open(&self.policy, entry));
+            || (!self.body_taken && (stands_in || rests_open(&self.policy, entry)));
         if (self.policy.compact || self.body_taken) && !open {
             return None;
         }
@@ -3511,6 +3631,7 @@ impl RenderLimits {
             tool_lines: self.tool_lines,
             width: self.width.saturating_sub(batch_child_indent_width()),
             cwd: self.cwd.clone(),
+            stands_in: Arc::default(),
         })
     }
 }
@@ -3542,13 +3663,20 @@ pub enum RowTarget {
     },
     /// The switch between a child's card and its answer as it came.
     Raw(usize),
+    /// A node of one of the JSON trees under `child`, numbered in the order they draw, which a
+    /// click folds or opens.
+    Node {
+        child: usize,
+        tree: usize,
+        node: usize,
+    },
 }
 
 impl RowTarget {
     pub fn index(self) -> usize {
         match self {
             Self::Item(index) | Self::Raw(index) => index,
-            Self::Task { child, .. } => child,
+            Self::Task { child, .. } | Self::Node { child, .. } => child,
         }
     }
 }
@@ -4064,12 +4192,20 @@ pub(crate) fn render_mcp_content(
     }
     let mut links = LinkMap::none_for(&lines);
     links.rows.extend(card.links.rows);
+    let mut rows = vec![None; lines.len()];
+    rows.extend(card.nodes.into_iter().map(|node| {
+        node.map(|(tree, node)| RowTarget::Node {
+            child: STANDALONE_CHILD,
+            tree,
+            node,
+        })
+    }));
     lines.extend(card.lines);
     let source = trace.finish(&lines);
     let content = wrapped_content(
         ToolContent {
             highlights,
-            rows: vec![None; lines.len()],
+            rows,
             links,
             lines,
             truncation: card.truncated,
@@ -4224,6 +4360,7 @@ mod tests {
     const TASK_CONTROL_TOOL: &str = "task_control";
     const HISTORY_ROW_FOLDS: &str = "a history row rests folded";
     const HISTORY_ROW_OPENS_WHOLE: &str = "a click opens a history row whole";
+    const DUMP_TARGET_MSG: &str = "a printed dict rests as a root row that a click opens";
     const RHAI_PATH: &str = "automation.rhai";
     const RHAI_CODE: &str = "/* comment\nlet hidden = true;\n*/\nlet message = \"é\";";
     const RHAI_BEFORE: &str = "/* comment\nlet hidden = true;\n*/\nlet message = \"old\";";
@@ -5955,7 +6092,14 @@ mod tests {
                 offset,
                 follow,
             }));
-        let body = child_body(&markdown_entry(COPY_FENCE), false, &limits, None, false);
+        let body = child_body(
+            &markdown_entry(COPY_FENCE),
+            false,
+            &limits,
+            None,
+            false,
+            TreeFolds::default(),
+        );
         let source = body.source.expect(COPY_SOURCE_MISSING);
         let provenance = Provenance::new(source.text.into(), source.rows);
         let last = body.lines.len() - 1;
@@ -8544,6 +8688,88 @@ mod tests {
         assert_eq!(drawn(&limits), Some(true), "{HISTORY_ROW_OPENS_WHOLE}");
         limits.views = limits.views.toggled(0, rests_open(&limits.policy, &entry));
         assert_eq!(drawn(&limits), None, "{HISTORY_ROW_FOLDS}");
+    }
+
+    /// A tail that holds a tree draws whole, every row of an opened tree included, since the tree
+    /// folds by itself; a tail of text alone keeps its scroll window.
+    #[test_case(false => (false, true) ; "text_scrolls")]
+    #[test_case(true => (true, false) ; "a_tree_draws_whole")]
+    fn a_tail_holding_a_tree_is_not_windowed(tree: bool) -> (bool, bool) {
+        const ITEMS: usize = 20;
+        const WINDOW_ROWS: usize = 3;
+        let items: Vec<String> = (1..=ITEMS).map(|item| item.to_string()).collect();
+        let stdout = match tree {
+            true => format!("[{}]", items.join(", ")),
+            false => items.join("\n"),
+        };
+        let output = CodeOutput {
+            stdout,
+            ..CodeOutput::default()
+        };
+        let limits = RenderLimits {
+            scroll: Some(ScrollWindow {
+                height: WINDOW_ROWS,
+                offset: 0,
+                follow: false,
+            }),
+            ..limits(BatchViews::default().node_toggled(0, 0, json_tree::ROOT))
+        };
+        let (card, _) = render_code_card(&output, false, &limits);
+        let last = ITEMS.to_string();
+        let whole = card
+            .lines
+            .iter()
+            .map(line_text)
+            .any(|line| line.trim() == last);
+        (whole, !card.spans.is_empty())
+    }
+
+    /// A history call the snippet only printed rests open beside the dump, which folds to its
+    /// tree's root row that a click opens; a click on the card folds it. Compact keeps the card
+    /// to its row, and a dump that is not a repeat leaves the card folded.
+    #[test_case(code_card::tests::repeating_run(), false, BatchViews::default() => (Some(true), false); "the_card_stands_in")]
+    #[test_case(code_card::tests::repeating_run(), false, BatchViews::default().node_toggled(1, 0, 0) => (Some(true), true); "a_click_opens_the_tree")]
+    #[test_case(code_card::tests::repeating_run(), false, BatchViews::default().toggled(0, true) => (None, false); "a_click_folds_the_card")]
+    #[test_case(code_card::tests::repeating_run(), true, BatchViews::default() => (None, false); "compact_keeps_rows")]
+    #[test_case(CodeOutput { printed_repeats: Vec::new(), ..code_card::tests::repeating_run() }, false, BatchViews::default() => (None, false); "no_repeat_keeps_the_card_folded")]
+    fn a_card_stands_in_for_a_dump_of_its_answer(
+        output: CodeOutput,
+        compact: bool,
+        views: BatchViews,
+    ) -> (Option<bool>, bool) {
+        let policy = CardPolicy {
+            always_collapsed: UiConfig::default().always_collapsed.into(),
+            compact,
+            ..CardPolicy::default()
+        };
+        let limits = RenderLimits {
+            views,
+            ..limits(BatchViews::default()).with_policy(policy, Arc::default())
+        };
+        let stands_in = RenderLimits {
+            stands_in: (0..output.calls.len())
+                .filter(|index| output.stands_in(*index))
+                .collect(),
+            ..limits.clone()
+        };
+        let [entry] = code_card::entries(&output).try_into().unwrap();
+        let (card, _) = render_code_card(&output, false, &limits);
+        assert!(
+            card.rows.contains(&Some(RowTarget::Node {
+                child: 1,
+                tree: 0,
+                node: 0
+            })),
+            "{DUMP_TARGET_MSG}"
+        );
+        let drawn: Vec<String> = card.lines.iter().map(line_text).collect();
+        let dump_drawn = drawn
+            .iter()
+            .any(|line| line.contains(code_card::tests::DUMP_FIELD));
+        (
+            stands_in.child(0, &entry).map(|child| child.is_expanded()),
+            dump_drawn,
+        )
     }
 
     /// A `memory` write child stays drawn under the default list, while a

@@ -31,6 +31,7 @@ pub(crate) mod json_tree;
 pub(crate) mod key_freshness;
 pub mod keybindings;
 pub(crate) mod list_picker;
+pub(crate) mod literal;
 pub(crate) mod login_picker;
 pub(crate) mod logs_modal;
 pub(crate) mod lua_float;

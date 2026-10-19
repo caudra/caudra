@@ -850,8 +850,11 @@ mod tests {
     use crate::AgentMode;
     use crate::code::gateway::Gateway;
     use crate::code::output::CodeCallStatus;
+    use crate::code::repeats::python_repr;
     use crate::code::runner::ScriptName;
-    use crate::code::runner::{ScriptHost, ScriptInvocation, ScriptReply};
+    use crate::code::runner::{
+        ScriptHost, ScriptInvocation, ScriptOutput, ScriptReply, ScriptStatus,
+    };
     use crate::history::tests::{seed, seeded_text, stamped};
     use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager, PermissionMode};
     use crate::tools::registry::PermissionIntent;
@@ -1120,6 +1123,41 @@ mod tests {
         invoke(&gateway, search(SEARCH_METHOD, scope)).unwrap();
 
         assert_eq!(gateway.finish()[0].called_as, expected);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Printed {
+        Answer,
+        Hits,
+        Words,
+        AnswerBesideAnError,
+    }
+
+    /// A print of what the search handed the snippet, whole or the hits it kept, is a repeat of
+    /// the call; words of the snippet's own, or output beside an error, are not. Ending on the
+    /// answer repeats it too.
+    #[test_case(Printed::Answer => (vec![0], Some(0)) ; "the_answer")]
+    #[test_case(Printed::Hits => (vec![0], Some(0)) ; "its_hits")]
+    #[test_case(Printed::Words => (Vec::new(), Some(0)) ; "own_words")]
+    #[test_case(Printed::AnswerBesideAnError => (Vec::new(), Some(0)) ; "beside_an_error")]
+    fn a_print_of_a_calls_answer_repeats_it(printed: Printed) -> (Vec<usize>, Option<usize>) {
+        let fixture = fixture(AgentMode::Build);
+        let gateway = fixture.gateway();
+        let answer = invoke(&gateway, search(SEARCH_METHOD, Value::Null)).unwrap();
+        let repr = |value: &Value| python_repr(value).unwrap();
+        let (stdout, stderr) = match printed {
+            Printed::Answer => (repr(&answer), String::new()),
+            Printed::Hits => (repr(&answer["hits"]), String::new()),
+            Printed::Words => (QUERY.to_owned(), String::new()),
+            Printed::AnswerBesideAnError => (repr(&answer), QUERY.to_owned()),
+        };
+
+        gateway.repeats(&ScriptOutput {
+            stdout: format!("{stdout}\n"),
+            stderr,
+            result: answer,
+            ..ScriptOutput::refused(ScriptStatus::Completed, String::new())
+        })
     }
 
     #[test]

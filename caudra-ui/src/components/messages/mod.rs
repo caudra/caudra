@@ -4095,6 +4095,9 @@ impl MessagesPanel {
             let tool_id = tool_id.to_owned();
             match target {
                 RowTarget::Raw(index) => self.toggle_batch_raw(&tool_id, index),
+                RowTarget::Node { child, tree, node } => {
+                    self.change_batch_views(&tool_id, |views| views.node_toggled(child, tree, node))
+                }
                 _ => self.toggle_batch_child(&tool_id, target.index()),
             }
             return true;
@@ -4171,12 +4174,17 @@ impl MessagesPanel {
         let Some((msg_index, _)) = self.tool_card(tool_id) else {
             return false;
         };
-        let entry = match self.messages[msg_index].tool_output.as_deref() {
-            Some(ToolOutput::Batch { entries, .. }) => entries.get(index).cloned(),
-            Some(ToolOutput::Code(output)) => code_card::entries(output).into_iter().nth(index),
-            _ => None,
-        };
-        entry.is_some_and(|entry| code_view::rests_open(&self.policy, &entry))
+        match self.messages[msg_index].tool_output.as_deref() {
+            Some(ToolOutput::Batch { entries, .. }) => entries
+                .get(index)
+                .is_some_and(|entry| code_view::rests_open(&self.policy, entry)),
+            Some(ToolOutput::Code(output)) => {
+                code_card::entries(output).get(index).is_some_and(|entry| {
+                    code_view::code_child_rests_open(&self.policy, output, index, entry)
+                })
+            }
+            _ => false,
+        }
     }
 
     /// One child's MCP answer switches between its card and its data.

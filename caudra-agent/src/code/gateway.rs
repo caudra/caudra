@@ -6,6 +6,7 @@
 //! own (`<run>:<n>`) so the prompt and the run's card can find each other. A refusal raises
 //! `PermissionError` where the call was made; only the user cancelling stops the run.
 
+use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -29,6 +30,7 @@ use super::output::{
     CALL_SOURCE, CodeCall, CodeCallStatus, CodeOutcome, CodeOutput, CodeProgressEvent,
     HostedResult, repaired_lines, written_call,
 };
+use super::repeats::{Answer, printed_repeats, result_repeats};
 use super::runner::{
     ReplLease, ReplNote, ScriptCall, ScriptError, ScriptErrorKind, ScriptHost, ScriptInvocation,
     ScriptName, ScriptOutput, ScriptReply, ScriptRun, ScriptStatus, WaitFuture, installed,
@@ -121,7 +123,14 @@ pub async fn run(ctx: &ToolContext, code: String, reset: bool, timeout: Duration
     .flatten()
     .collect();
     let mut output = match outcome.output {
-        Some(output) => finished(code, gateway.with_rejection_hints(output)),
+        Some(output) => {
+            let (printed_repeats, result_repeats) = gateway.repeats(&output);
+            CodeOutput {
+                printed_repeats,
+                result_repeats,
+                ..finished(code, gateway.with_rejection_hints(output))
+            }
+        }
         None => CodeOutput {
             code,
             outcome: match timed_out {
@@ -289,6 +298,9 @@ struct Inner {
     ctx: ToolContext,
     modules: Vec<Arc<dyn HostModule>>,
     calls: Mutex<Vec<CodeCall>>,
+    /// What each call that succeeded handed the snippet, kept for the run so the card can tell a
+    /// print of it from output of the snippet's own.
+    answers: Mutex<Vec<Answer>>,
     /// The run's change record, `None` until a call that could change files is let through.
     record: AsyncMutex<Option<Recording>>,
     /// Sleeps under way, which the card notes while any is.
@@ -301,6 +313,7 @@ impl Gateway {
             ctx,
             modules,
             calls: Mutex::new(Vec::new()),
+            answers: Mutex::new(Vec::new()),
             record: AsyncMutex::new(None),
             waits: AtomicUsize::new(0),
         }))
@@ -378,7 +391,7 @@ impl Gateway {
 
     /// The calls the run made, any still running settled as unfinished.
     pub(super) fn finish(&self) -> Vec<CodeCall> {
-        let mut calls = std::mem::take(&mut *self.calls());
+        let mut calls = mem::take(&mut *self.calls());
         for call in calls.iter_mut().filter(|call| !call.status.is_terminal()) {
             call.status = CodeCallStatus::Error;
             call.error = Some(UNFINISHED.to_owned());
@@ -389,6 +402,29 @@ impl Gateway {
 
     fn calls(&self) -> MutexGuard<'_, Vec<CodeCall>> {
         self.0.calls.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn answers(&self) -> MutexGuard<'_, Vec<Answer>> {
+        self.0
+            .answers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The call at `index` handed the snippet `value`.
+    fn answered(&self, index: usize, value: Value) -> ScriptReply {
+        self.answers().push((index, value.clone()));
+        Ok(value)
+    }
+
+    /// Which calls the run's printed output and ending value only repeat.
+    pub(super) fn repeats(&self, output: &ScriptOutput) -> (Vec<usize>, Option<usize>) {
+        let answers = mem::take(&mut *self.answers());
+        let printed = match output.stderr.is_empty() {
+            true => printed_repeats(&output.stdout, &answers),
+            false => Vec::new(),
+        };
+        (printed, result_repeats(&output.result, &answers))
     }
 
     fn begin(&self, call: CodeCall) -> usize {
@@ -591,7 +627,7 @@ impl Gateway {
                             ..Ending::default()
                         },
                     );
-                    return Ok(value);
+                    return self.answered(index, value);
                 }
                 (
                     CodeCallStatus::Error,
@@ -748,7 +784,7 @@ impl Gateway {
                 ..Ending::default()
             },
         );
-        Ok(value)
+        self.answered(index, value)
     }
 
     fn failed(&self, index: usize, started: Instant, failure: CallFailure) -> ScriptReply {

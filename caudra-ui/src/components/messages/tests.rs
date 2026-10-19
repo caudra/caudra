@@ -14297,6 +14297,56 @@ fn a_recognised_code_call_opens_whole_and_folds_on_a_click() {
     assert!(shows_data(&panel), "{OWN_CARD_MODE_KEEPS_MSG}");
 }
 
+const DUMP_FOLDED_MSG: &str = "a printed dict rests as its tree's root row";
+const DUMP_OPENS_MSG: &str = "a click on the root row opens the tree whole, and the next folds it";
+
+/// A printed dict rests as its tree's root row, which a click opens whole and the next folds, in
+/// every view that draws the card.
+#[test_case(ViewMode::Expanded ; "expanded")]
+#[test_case(ViewMode::Auto ; "auto")]
+fn a_printed_dict_opens_whole_on_a_click(view: ViewMode) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(view);
+    panel.tool_start(start(TOOL_ID, CODE_TOOL_NAME));
+    panel.tool_done(ToolDoneEvent {
+        tool: CODE_TOOL_NAME.into(),
+        output: ToolOutput::Code(code_card::tests::repeating_run()),
+        ..done(TOOL_ID)
+    });
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    let dumped =
+        |panel: &MessagesPanel| seg_text(panel, TOOL_ID).contains(code_card::tests::DUMP_FIELD);
+    assert!(!dumped(&panel), "{DUMP_FOLDED_MSG}");
+
+    assert!(panel.toggle_expansion_at(
+        batch_row(
+            &panel,
+            RowTarget::Node {
+                child: 1,
+                tree: 0,
+                node: 0,
+            }
+        ),
+        area
+    ));
+    render(&mut panel, 80, 24);
+    assert!(dumped(&panel), "{DUMP_OPENS_MSG}");
+    assert!(panel.toggle_expansion_at(
+        batch_row(
+            &panel,
+            RowTarget::Node {
+                child: 1,
+                tree: 0,
+                node: 0,
+            }
+        ),
+        area
+    ));
+    render(&mut panel, 80, 24);
+    assert!(!dumped(&panel), "{DUMP_OPENS_MSG}");
+}
+
 /// A `rerank()` row names what it kept on its line rather than its arguments, always shows the
 /// ranked candidates, and switches to the answer it returned.
 #[test]

@@ -2,6 +2,8 @@
 //! opens to that call's own MCP card, then what the snippet printed, the value it ended on, and
 //! why it stopped when it did not finish.
 
+use std::ops::Range;
+
 use caudra_agent::code::MODULE_DOCS;
 use caudra_agent::code::output::{CodeCall, CodeCallStatus, CodeOutcome, CodeOutput};
 use caudra_agent::tools::ToolEffect;
@@ -11,8 +13,12 @@ use caudra_agent::{
 };
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use serde_json::Value;
 
-use super::code_view::{BodySource, body_window, json_body, plain_body, truncation_line};
+use super::code_view::{
+    BodySource, TreeFolds, body_window, json_body, plain_body, tree_body, truncation_line,
+};
+use super::literal;
 use super::mcp_card::decisions;
 use crate::theme;
 
@@ -25,9 +31,50 @@ const TIMED_OUT: &str = "Timed out after ";
 const KIND_SEPARATOR: &str = ": ";
 const REPAIRED: &str = "Repaired: ";
 const REPAIR_SEPARATOR: &str = ", ";
+const LINE_BREAK: char = '\n';
 
-/// A run of the card's lines, and the text a selection over them copies. `None` is chrome.
-pub(crate) type Block = (Vec<Line<'static>>, Option<BodySource>);
+/// A run of the card's lines, the text a selection over them copies (`None` is chrome), and for
+/// each line the tree and node a click on it folds or opens.
+pub(crate) struct Block {
+    pub(crate) lines: Vec<Line<'static>>,
+    pub(crate) source: Option<BodySource>,
+    pub(crate) nodes: Vec<Option<(usize, usize)>>,
+}
+
+impl Block {
+    fn chrome(line: Line<'static>) -> Self {
+        Self {
+            lines: vec![line],
+            source: None,
+            nodes: vec![None],
+        }
+    }
+
+    fn text((lines, source): (Vec<Line<'static>>, BodySource)) -> Self {
+        Self {
+            nodes: vec![None; lines.len()],
+            lines,
+            source: Some(source),
+        }
+    }
+
+    /// A tree's first row is always its root, which a click folds.
+    fn is_tree(&self) -> bool {
+        self.nodes.first().is_some_and(Option::is_some)
+    }
+
+    /// The lines in `kept`, with the part of the source they came from.
+    pub(crate) fn keep(&self, kept: Range<usize>) -> Self {
+        Self {
+            lines: self.lines[kept.clone()].to_vec(),
+            source: self
+                .source
+                .clone()
+                .and_then(|source| source.keep_rows(kept.clone())),
+            nodes: self.nodes[kept].to_vec(),
+        }
+    }
+}
 
 /// Each call as a batch child, so its row reads, folds and opens as a direct MCP call's card
 /// would.
@@ -132,45 +179,168 @@ fn decision_summary(call: &CodeCall, helper: DecisionHelper) -> String {
         .unwrap_or_else(|| call.called_as.clone())
 }
 
-/// What the snippet printed and ended on, each held to `budget` lines, then how it failed. The
-/// flag says the budget left something out.
-pub(crate) fn tail(output: &CodeOutput, budget: usize, width: u16) -> (Vec<Block>, bool) {
+/// What the snippet printed and ended on, read once, so the card can ask whether it holds a tree
+/// before it decides how to draw it.
+pub(crate) struct Tail<'a> {
+    output: &'a CodeOutput,
+    printed: Option<Vec<Piece<'a>>>,
+    result: Option<Vec<Piece<'a>>>,
+}
+
+impl<'a> Tail<'a> {
+    pub(crate) fn new(output: &'a CodeOutput) -> Self {
+        let stdout = output.stdout.trim_end();
+        Self {
+            output,
+            printed: (!stdout.is_empty()).then(|| printed_pieces(stdout)),
+            result: output
+                .result
+                .as_deref()
+                .map(|result| match literal::tree(result) {
+                    Some(value) => vec![Piece::Tree(value)],
+                    None => vec![Piece::Result(result)],
+                }),
+        }
+    }
+
+    /// A tree folds by itself, so a tail holding one is drawn whole rather than in a window.
+    pub(crate) fn has_tree(&self) -> bool {
+        [&self.printed, &self.result]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|piece| matches!(piece, Piece::Tree(_)))
+    }
+}
+
+/// What the snippet printed and ended on, the text of each held to `budget` lines, then how it
+/// failed. The flag says the budget left something out.
+///
+/// A dict or a list printed on its own, or ended on, is a tree that rests as its root row, which
+/// opens whole, and `folds` says which nodes a click moved, each tree numbered in the order it
+/// draws. A tree is never cut short: what it hides is the reader's to fold.
+pub(crate) fn tail(
+    tail: Tail<'_>,
+    budget: usize,
+    width: u16,
+    folds: &TreeFolds,
+) -> (Vec<Block>, bool) {
+    let Tail {
+        output,
+        printed,
+        result,
+    } = tail;
     let theme = theme::current();
     let mut blocks = Vec::new();
     let mut truncated = false;
-    let stdout = output.stdout.trim_end();
-    let printed = (!stdout.is_empty()).then(|| plain_body(stdout, width));
-    let result = output
-        .result
-        .as_deref()
-        .map(|result| match pretty_json(result) {
-            Some(pretty) => json_body(&pretty, width),
-            None => plain_body(result, width),
-        });
-    for (label, body) in [(PRINTED_LABEL, printed), (RESULT_LABEL, result)] {
-        let Some((mut lines, source)) = body else {
+    let mut trees = 0;
+    for (label, pieces) in [(PRINTED_LABEL, printed), (RESULT_LABEL, result)] {
+        let Some(pieces) = pieces else {
             continue;
         };
-        blocks.push((vec![label_line(label, theme.accent)], None));
-        let (shown, hidden) = body_window(lines.len(), budget);
-        lines.truncate(shown);
-        blocks.push((lines, Some(source)));
+        blocks.push(Block::chrome(label_line(label, theme.accent)));
+        let mut body = Vec::new();
+        for piece in pieces {
+            match piece {
+                Piece::Text(text) => body.push(Block::text(plain_body(text, width))),
+                Piece::Result(result) => body.push(Block::text(match pretty_json(result) {
+                    Some(pretty) => json_body(&pretty, width),
+                    None => plain_body(result, width),
+                })),
+                Piece::Tree(value) => {
+                    let folded = folds.folded(trees, true);
+                    if let Some((lines, source, nodes)) = tree_body(&value, &folded, width) {
+                        let nodes = nodes
+                            .into_iter()
+                            .map(|node| node.map(|node| (trees, node)))
+                            .collect();
+                        body.push(Block {
+                            lines,
+                            source: Some(source),
+                            nodes,
+                        });
+                    }
+                    trees += 1;
+                }
+            }
+        }
+        let hidden = hold(&mut body, budget);
+        blocks.extend(body);
         if hidden > 0 {
-            blocks.push((vec![truncation_line(hidden)], None));
+            blocks.push(Block::chrome(truncation_line(hidden)));
             truncated = true;
         }
     }
     if let Some(failure) = failure(&output.outcome) {
-        blocks.push((vec![label_line(&failure, theme.tool_error)], None));
+        blocks.push(Block::chrome(label_line(&failure, theme.tool_error)));
     }
     if let Some(note) = &output.state_note {
-        blocks.push((vec![label_line(note, theme.tool_dim)], None));
+        blocks.push(Block::chrome(label_line(note, theme.tool_dim)));
     }
     if !output.repairs.is_empty() {
         let repairs = format!("{REPAIRED}{}", output.repairs.join(REPAIR_SEPARATOR));
-        blocks.push((vec![label_line(&repairs, theme.tool_dim)], None));
+        blocks.push(Block::chrome(label_line(&repairs, theme.tool_dim)));
     }
     (blocks, truncated)
+}
+
+/// A part of what the snippet printed or ended on, as it draws.
+enum Piece<'a> {
+    Text(&'a str),
+    Result(&'a str),
+    Tree(Value),
+}
+
+/// `stdout` as one tree when it is all one value, else a tree for each line that is one, between
+/// runs of text, as a loop printing several answers writes them.
+fn printed_pieces(stdout: &str) -> Vec<Piece<'_>> {
+    if let Some(value) = literal::tree(stdout) {
+        return vec![Piece::Tree(value)];
+    }
+    let mut pieces = Vec::new();
+    let mut text_start = 0;
+    let mut at = 0;
+    for line in stdout.split_inclusive(LINE_BREAK) {
+        let next = at + line.len();
+        if let Some(value) = literal::tree(line) {
+            if text_start < at {
+                pieces.push(Piece::Text(
+                    stdout[text_start..at].trim_end_matches(LINE_BREAK),
+                ));
+            }
+            pieces.push(Piece::Tree(value));
+            text_start = next;
+        }
+        at = next;
+    }
+    if text_start < stdout.len() {
+        pieces.push(Piece::Text(&stdout[text_start..]));
+    }
+    pieces
+}
+
+/// Keeps the first rows of text in `body` that fit `budget`, and every tree whole, and says how
+/// many rows it dropped.
+fn hold(body: &mut Vec<Block>, budget: usize) -> usize {
+    let total: usize = body
+        .iter()
+        .filter(|block| !block.is_tree())
+        .map(|block| block.lines.len())
+        .sum();
+    let (mut room, hidden) = body_window(total, budget);
+    if hidden == 0 {
+        return 0;
+    }
+    body.retain_mut(|block| {
+        if block.is_tree() {
+            return true;
+        }
+        let kept = block.lines.len().min(room);
+        room -= kept;
+        *block = block.keep(0..kept);
+        kept > 0
+    });
+    hidden
 }
 
 fn failure(outcome: &CodeOutcome) -> Option<String> {
@@ -197,6 +367,7 @@ pub(crate) mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::components::code_view::BatchViews;
 
     const SERVER: &str = "github";
     const QUESTION: &str = "Which repository?";
@@ -258,7 +429,7 @@ pub(crate) mod tests {
     fn texts(blocks: &[Block]) -> Vec<String> {
         blocks
             .iter()
-            .flat_map(|(lines, _)| lines)
+            .flat_map(|block| &block.lines)
             .map(|line| {
                 line.spans
                     .iter()
@@ -391,7 +562,7 @@ pub(crate) mod tests {
             },
             ..CodeOutput::default()
         };
-        let (blocks, truncated) = tail(&output, 2, WIDTH);
+        let (blocks, truncated) = tail(Tail::new(&output), 2, WIDTH, &TreeFolds::default());
         let texts = texts(&blocks);
         assert!(truncated);
         assert_eq!(texts[0], PRINTED_LABEL);
@@ -401,9 +572,135 @@ pub(crate) mod tests {
         assert_eq!(texts.last().map(String::as_str), Some("RuntimeError: boom"));
     }
 
+    pub(crate) const DUMP: &str = "{'title': 't'}";
+
+    /// A run that printed only what its history call answered.
+    pub(crate) fn repeating_run() -> CodeOutput {
+        CodeOutput {
+            calls: vec![history_row(false)],
+            stdout: format!("{DUMP}\n"),
+            printed_repeats: vec![0],
+            ..CodeOutput::default()
+        }
+    }
+
+    pub(crate) const DUMP_ROOT: &str = "\u{25b8} {\u{2026}} 1 key";
+    pub(crate) const DUMP_FIELD: &str = "    \"title\": \"t\"";
+    const DUMP_OPEN: &str = "\u{25be} {";
+    const DUMP_CLOSE: &str = "  }";
+    const LIST: &str = "[1]";
+    const LIST_ROOT: &str = "\u{25b8} [\u{2026}] 1 item";
+
+    fn printing(stdout: &str, result: Option<&str>) -> CodeOutput {
+        CodeOutput {
+            stdout: stdout.to_owned(),
+            result: result.map(str::to_owned),
+            ..CodeOutput::default()
+        }
+    }
+
+    const NESTED: &str = "{'a': {'b': 1}}";
+    const NESTED_OPEN: &str = "  \u{25be} \"a\": {";
+    const NESTED_FOLDED: &str = "  \u{25b8} \"a\": {\u{2026}} 1 key";
+    const NESTED_FIELD: &str = "      \"b\": 1";
+    const NESTED_CLOSE: &str = "    }";
+    const ROOT: (usize, usize) = (0, 0);
+    const INNER: (usize, usize) = (0, 1);
+    /// The child a tail's trees answer for in these tests.
+    const TAIL: usize = 0;
+
+    type Row = (String, Option<(usize, usize)>);
+
+    /// What the reader clicked, as (tree, node), in order.
+    fn clicked(clicks: &[(usize, usize)]) -> TreeFolds {
+        clicks
+            .iter()
+            .fold(BatchViews::default(), |views, (tree, node)| {
+                views.node_toggled(TAIL, *tree, *node)
+            })
+            .tree_folds(TAIL)
+    }
+
+    /// Each row's text and the node a click on it folds or opens.
+    fn targets(blocks: &[Block]) -> Vec<Row> {
+        blocks
+            .iter()
+            .flat_map(|block| {
+                texts(std::slice::from_ref(block))
+                    .into_iter()
+                    .zip(block.nodes.iter().copied())
+            })
+            .collect()
+    }
+
+    fn row(text: &str, node: Option<(usize, usize)>) -> Row {
+        (text.to_owned(), node)
+    }
+
+    /// A dict or a list rests as its root row, which a click opens whole and folds again; a line
+    /// of it among text is a tree of its own, and the value the snippet ended on is another.
+    #[test_case(printing(DUMP, None), &[] => vec![row(PRINTED_LABEL, None), row(DUMP_ROOT, Some(ROOT))] ; "a_printed_value_rests_folded")]
+    #[test_case(printing(DUMP, None), &[ROOT] => vec![row(PRINTED_LABEL, None), row(DUMP_OPEN, Some(ROOT)), row(DUMP_FIELD, None), row(DUMP_CLOSE, None)] ; "a_click_opens_it_whole")]
+    #[test_case(printing(&format!("found 1\n{DUMP}\ndone"), None), &[] => vec![row(PRINTED_LABEL, None), row("found 1", None), row(DUMP_ROOT, Some(ROOT)), row("done", None)] ; "a_line_among_text")]
+    #[test_case(printing(DUMP, Some(LIST)), &[(1, 0)] => vec![row(PRINTED_LABEL, None), row(DUMP_ROOT, Some(ROOT)), row(RESULT_LABEL, None), row("\u{25be} [", Some((1, 0))), row("    1", None), row("  ]", None)] ; "the_result_is_the_next_tree")]
+    #[test_case(printing("found 1", None), &[] => vec![row(PRINTED_LABEL, None), row("found 1", None)] ; "text_stays_text")]
+    fn a_printed_value_is_a_tree(output: CodeOutput, clicks: &[(usize, usize)]) -> Vec<Row> {
+        let (blocks, _) = tail(Tail::new(&output), usize::MAX, WIDTH, &clicked(clicks));
+        targets(&blocks)
+    }
+
+    /// Under an open root every node folds and opens on its own, and folding the root forgets
+    /// them, so opening it again opens all of it.
+    #[test_case(&[ROOT] => vec![row(DUMP_OPEN, Some(ROOT)), row(NESTED_OPEN, Some(INNER)), row(NESTED_FIELD, None), row(NESTED_CLOSE, None), row(DUMP_CLOSE, None)] ; "opened_whole")]
+    #[test_case(&[ROOT, INNER] => vec![row(DUMP_OPEN, Some(ROOT)), row(NESTED_FOLDED, Some(INNER)), row(DUMP_CLOSE, None)] ; "a_child_folds")]
+    #[test_case(&[ROOT, INNER, INNER] => vec![row(DUMP_OPEN, Some(ROOT)), row(NESTED_OPEN, Some(INNER)), row(NESTED_FIELD, None), row(NESTED_CLOSE, None), row(DUMP_CLOSE, None)] ; "and_opens_again")]
+    #[test_case(&[ROOT, INNER, ROOT, ROOT] => vec![row(DUMP_OPEN, Some(ROOT)), row(NESTED_OPEN, Some(INNER)), row(NESTED_FIELD, None), row(NESTED_CLOSE, None), row(DUMP_CLOSE, None)] ; "reopening_the_root_opens_all")]
+    fn every_node_of_an_open_tree_folds(clicks: &[(usize, usize)]) -> Vec<Row> {
+        let (blocks, _) = tail(
+            Tail::new(&printing(NESTED, None)),
+            usize::MAX,
+            WIDTH,
+            &clicked(clicks),
+        );
+        targets(&blocks[1..])
+    }
+
+    const TREE_CUT_SHORT: &str = "the budget holds back text, never part of a tree";
+
+    #[test]
+    fn a_tree_is_never_cut_short() {
+        let output = printing(&format!("{PRINTED}\n{NESTED}"), None);
+
+        let (blocks, truncated) = tail(Tail::new(&output), 2, WIDTH, &clicked(&[ROOT]));
+
+        let texts = texts(&blocks);
+        assert!(truncated, "{TREE_CUT_SHORT}");
+        assert!(!texts.iter().any(|text| text == "last"), "{TREE_CUT_SHORT}");
+        assert!(
+            texts.iter().any(|text| text == NESTED_FIELD),
+            "{TREE_CUT_SHORT}: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_folded_list_says_how_much_it_holds() {
+        let (blocks, _) = tail(
+            Tail::new(&printing("", Some(LIST))),
+            usize::MAX,
+            WIDTH,
+            &clicked(&[]),
+        );
+        assert_eq!(targets(&blocks)[1], row(LIST_ROOT, Some(ROOT)));
+    }
+
     #[test]
     fn a_quiet_completed_run_has_no_tail() {
-        let (blocks, truncated) = tail(&CodeOutput::default(), usize::MAX, WIDTH);
+        let (blocks, truncated) = tail(
+            Tail::new(&CodeOutput::default()),
+            usize::MAX,
+            WIDTH,
+            &TreeFolds::default(),
+        );
         assert!(blocks.is_empty() && !truncated);
     }
 
@@ -416,7 +713,7 @@ pub(crate) mod tests {
             ],
             ..CodeOutput::default()
         };
-        let (blocks, _) = tail(&output, usize::MAX, WIDTH);
+        let (blocks, _) = tail(Tail::new(&output), usize::MAX, WIDTH, &TreeFolds::default());
         assert_eq!(
             texts(&blocks),
             [format!(

@@ -11,8 +11,8 @@ use caudra_config::{ClockFormat, ToolOutputLines};
 use caudra_storage::background::JobKind;
 use code_view::{
     BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, BatchViews, BodySource,
-    CardPolicy, CodeRole, Disclosure, HighlightRegion, RenderLimits, RowTarget, ScrollSpan,
-    ScrollWindow, SourceTrace, ToolContent, UNCONSTRAINED_WIDTH, WrappedRows,
+    CardPolicy, CodeRole, Disclosure, HighlightRegion, RenderLimits, RowTarget, STANDALONE_CHILD,
+    ScrollSpan, ScrollWindow, SourceTrace, ToolContent, UNCONSTRAINED_WIDTH, WrappedRows,
 };
 
 use std::borrow::Cow;
@@ -3118,6 +3118,7 @@ pub fn build_tool_lines(
                 show_arguments: expanded.full || b.is_in_progress(),
                 script_key: script.as_ref().map(|script| script.key.as_str()),
                 raw: expanded.raw_view,
+                folds: b.limits.views.tree_folds(STANDALONE_CHILD),
             },
             match msg.tool_output.as_deref() {
                 Some(ToolOutput::Mcp(output)) => Some(output),

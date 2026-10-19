@@ -13,6 +13,7 @@ pub mod hosted;
 pub mod module;
 pub mod names;
 pub mod output;
+pub mod repeats;
 pub mod runner;
 pub mod tool_module;
 

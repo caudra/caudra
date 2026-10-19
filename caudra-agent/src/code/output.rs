@@ -115,6 +115,13 @@ pub struct CodeOutput {
     /// written beside the lessons.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repaired_lines: Vec<RepairedLine>,
+    /// The calls whose answers `stdout` only repeats, in the order printed, so the card can show
+    /// their cards in its place. Empty when it printed anything else.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub printed_repeats: Vec<usize>,
+    /// The call whose answer the snippet ended on, when it ended on nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_repeats: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -338,6 +345,12 @@ impl CodeOutcome {
 }
 
 impl CodeOutput {
+    /// Whether the printed output or the ending value only repeats this call's answer, so its
+    /// card stands in for them.
+    pub fn stands_in(&self, call: usize) -> bool {
+        self.printed_repeats.contains(&call) || self.result_repeats == Some(call)
+    }
+
     /// What the model reads: printed output, the result, and for a failed run why, with the
     /// calls already made so their side effects are not blindly repeated.
     pub fn model_text(&self) -> String {

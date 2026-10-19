@@ -5,6 +5,8 @@
 //! wall of base64. A server Caudra recognises draws its answer its own way,
 //! and every card says what the server asked the user along the way.
 
+use std::collections::HashSet;
+
 use caudra_agent::types::Answerer;
 use caudra_agent::{
     ElicitAction, McpBlock, McpHelper, McpInteraction, McpOutput, McpServerKind, ToolInput,
@@ -14,9 +16,9 @@ use ratatui::text::{Line, Span};
 use serde_json::Value;
 
 use crate::components::code_view::{
-    body_window, json_body, markdown_body, plain_body, truncation_line,
+    TreeFolds, body_window, json_body, markdown_body, plain_body, tree_body, truncation_line,
 };
-use crate::components::{escape_terminal_controls, format_bytes};
+use crate::components::{escape_terminal_controls, format_bytes, literal};
 use crate::markdown::LinkMap;
 use crate::theme;
 
@@ -135,6 +137,8 @@ fn script_language(key: &str, code: &str) -> &'static str {
 pub(crate) struct McpCard {
     pub(crate) lines: Vec<Line<'static>>,
     pub(crate) links: LinkMap,
+    /// For each line, the tree and node a click on it folds or opens.
+    pub(crate) nodes: Vec<Option<(usize, usize)>>,
     pub(crate) truncated: bool,
     pub(crate) has_raw_view: bool,
 }
@@ -152,6 +156,8 @@ pub(crate) struct McpCall<'a> {
     /// Draw the answer as the data it came as, where that differs from its
     /// card.
     pub(crate) raw: bool,
+    /// The nodes of the data's trees a click folded or opened.
+    pub(crate) folds: TreeFolds,
 }
 
 impl McpCall<'_> {
@@ -161,26 +167,42 @@ impl McpCall<'_> {
     }
 }
 
-/// Lines and their link rows, kept parallel as they grow.
+/// Lines, their link rows, and the tree node each one folds, kept parallel as they grow.
 #[derive(Default)]
 pub(crate) struct Rows {
     pub(crate) lines: Vec<Line<'static>>,
     pub(crate) links: LinkMap,
+    nodes: Vec<Option<(usize, usize)>>,
 }
 
 impl Rows {
     pub(crate) fn push(&mut self, lines: Vec<Line<'static>>) {
         self.links.rows.extend(LinkMap::none_for(&lines).rows);
+        self.nodes.resize(self.nodes.len() + lines.len(), None);
         self.lines.extend(lines);
     }
 
     fn push_linked(&mut self, lines: Vec<Line<'static>>, links: LinkMap) {
         self.links.rows.extend(links.rows);
+        self.nodes.resize(self.nodes.len() + lines.len(), None);
         self.lines.extend(lines);
     }
 
     pub(crate) fn append(&mut self, other: Rows) {
-        self.push_linked(other.lines, other.links);
+        self.links.rows.extend(other.links.rows);
+        self.nodes.extend(other.nodes);
+        self.lines.extend(other.lines);
+    }
+
+    /// `value` as tree number `tree`, each row the node a click on it folds or opens.
+    fn push_tree(&mut self, value: &Value, tree: usize, folded: &HashSet<usize>, width: u16) {
+        let Some((lines, _, nodes)) = tree_body(value, folded, width) else {
+            return;
+        };
+        self.links.rows.extend(LinkMap::none_for(&lines).rows);
+        self.nodes
+            .extend(nodes.into_iter().map(|node| node.map(|node| (tree, node))));
+        self.lines.extend(lines);
     }
 
     /// `other` after one blank row, when both have something to show.
@@ -194,6 +216,7 @@ impl Rows {
     fn truncate(&mut self, len: usize) {
         self.lines.truncate(len);
         self.links.rows.truncate(len);
+        self.nodes.truncate(len);
     }
 }
 
@@ -236,6 +259,11 @@ pub(crate) fn render(
             theme::current().tool_dim,
         ))]);
     }
+    // A tree folds by itself, so an answer drawn as one is never cut short.
+    let budget = match answer.nodes.iter().any(Option::is_some) {
+        true => usize::MAX,
+        false => budget,
+    };
     let (shown, hidden) = body_window(answer.lines.len(), budget);
     answer.truncate(shown);
     body.append_apart(answer);
@@ -249,6 +277,7 @@ pub(crate) fn render(
     McpCard {
         lines: card.lines,
         links: card.links,
+        nodes: card.nodes,
         truncated: hidden > 0,
         has_raw_view,
     }
@@ -277,7 +306,7 @@ fn answer_rows(call: &McpCall<'_>, output: &McpOutput, width: u16, whole: bool) 
     };
     let has_raw_view = recognised.is_some() || unspelled_structured(output).is_some();
     let rows = match recognised {
-        _ if call.raw && has_raw_view => raw_rows(output, width),
+        _ if call.raw && has_raw_view => raw_rows(output, &call.folds, width),
         Some(card) => card,
         None => blocks_rows(&output.blocks, width),
     };
@@ -292,14 +321,32 @@ pub(crate) fn blocks_rows<'a>(blocks: impl IntoIterator<Item = &'a McpBlock>, wi
     rows
 }
 
-/// The answer as the data it came as: a JSON document indented and coloured
-/// the way the generic card draws one, any other text exactly as the server
-/// wrote it, and a `structuredContent` no text block spells out under its
-/// name.
-fn raw_rows(output: &McpOutput, width: u16) -> Rows {
+/// The answer as the data it came as: a dict or a list as a tree whose nodes
+/// a click folds, any other text exactly as the server wrote it, and a
+/// `structuredContent` no text block spells out under its name. The trees rest
+/// whole, since the reader asked for the data.
+fn raw_rows(output: &McpOutput, folds: &TreeFolds, width: u16) -> Rows {
     let mut rows = Rows::default();
+    let mut trees = 0;
+    let mut push_tree = |rows: &mut Rows, value: &Value| {
+        rows.push_tree(value, trees, &folds.folded(trees, false), width);
+        trees += 1;
+    };
     for block in &output.blocks {
-        rows.append_apart(block_rows(block, width, true));
+        let tree = match block {
+            McpBlock::Text { text } => literal::tree(text),
+            McpBlock::Structured { value } => Some(value.clone()).filter(is_tree),
+            _ => None,
+        };
+        let drawn = match tree {
+            Some(value) => {
+                let mut drawn = Rows::default();
+                push_tree(&mut drawn, &value);
+                drawn
+            }
+            None => block_rows(block, width, true),
+        };
+        rows.append_apart(drawn);
     }
     if let Some(value) = unspelled_structured(output) {
         let mut structured = Rows::default();
@@ -307,10 +354,17 @@ fn raw_rows(output: &McpOutput, width: u16) -> Rows {
             format!("{STRUCTURED_LABEL}{KEY_SUFFIX}"),
             theme::current().accent,
         ))]);
-        push_value(&mut structured, value, width);
+        match is_tree(value) {
+            true => push_tree(&mut structured, value),
+            false => push_value(&mut structured, value, width),
+        }
         rows.append_apart(structured);
     }
     rows
+}
+
+fn is_tree(value: &Value) -> bool {
+    value.is_object() || value.is_array()
 }
 
 /// The `structuredContent` kept beside the text, unless a text block is the
@@ -560,6 +614,7 @@ fn label_row<const N: usize>(kind: &str, details: [Option<String>; N]) -> Line<'
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::code_view::BatchViews;
     use test_case::test_case;
 
     const WIDTH: u16 = 80;
@@ -979,7 +1034,7 @@ mod tests {
             true,
         ));
 
-        assert_eq!(rows[..2], ["{", "  \"status\": \"completed\","]);
+        assert_eq!(rows[..2], ["\u{25be} {", "    \"status\": \"completed\","]);
     }
 
     #[test]
@@ -992,11 +1047,63 @@ mod tests {
                 MARKDOWN_TEXT,
                 "",
                 format!("{STRUCTURED_LABEL}{KEY_SUFFIX}").as_str(),
-                "{",
-                "  \"id\": 7",
-                "}",
+                "\u{25be} {",
+                "    \"id\": 7",
+                "  }",
             ]
         );
+    }
+
+    const NESTED_STRUCTURED: &str = "{\"a\":{\"b\":1}}";
+    const RAW_CHILD: usize = 0;
+    const TREE_ROOT: (usize, usize) = (0, 0);
+    const TREE_INNER: (usize, usize) = (0, 1);
+    /// Where the tree starts, below the text block and the structured content's label.
+    const TREE_START: usize = 3;
+
+    /// A raw tree rests whole, and a click on any of its nodes folds that node alone.
+    #[test_case(&[] => vec!["\u{25be} {".to_owned(), "  \u{25be} \"a\": {".to_owned(), "      \"b\": 1".to_owned(), "    }".to_owned(), "  }".to_owned()] ; "rests_whole")]
+    #[test_case(&[TREE_INNER] => vec!["\u{25be} {".to_owned(), "  \u{25b8} \"a\": {\u{2026}} 1 key".to_owned(), "  }".to_owned()] ; "an_inner_node_folds")]
+    #[test_case(&[TREE_ROOT] => vec!["\u{25b8} {\u{2026}} 1 key".to_owned()] ; "the_root_folds")]
+    fn a_raw_tree_folds_where_clicked(clicks: &[(usize, usize)]) -> Vec<String> {
+        let views = clicks
+            .iter()
+            .fold(BatchViews::default(), |views, (tree, node)| {
+                views.node_toggled(RAW_CHILD, *tree, *node)
+            });
+        let call = McpCall {
+            tool: GENERIC_TOOL,
+            raw: true,
+            folds: views.tree_folds(RAW_CHILD),
+            ..McpCall::default()
+        };
+        let card = render(
+            &call,
+            false,
+            Some(&generic(Some(NESTED_STRUCTURED))),
+            UNBOUNDED,
+            WIDTH,
+        );
+        assert_eq!(card.nodes[TREE_START], Some(TREE_ROOT));
+        assert_eq!(card.nodes.len(), card.lines.len());
+        rendered(&card)[TREE_START..].to_vec()
+    }
+
+    #[test]
+    fn a_raw_tree_is_never_cut_short() {
+        const TIGHT_BUDGET: usize = 1;
+        let call = McpCall {
+            tool: GENERIC_TOOL,
+            raw: true,
+            ..McpCall::default()
+        };
+        let answer = generic(Some(NESTED_STRUCTURED));
+
+        let tight = render(&call, false, Some(&answer), TIGHT_BUDGET, WIDTH);
+
+        let whole = render(&call, false, Some(&answer), UNBOUNDED, WIDTH);
+        assert!(!tight.truncated);
+        assert_eq!(rendered(&tight), rendered(&whole));
     }
 
     #[test]

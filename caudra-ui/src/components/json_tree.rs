@@ -16,6 +16,8 @@ use serde_json::Value;
 use crate::components::json_text::scalar_spans;
 use crate::theme;
 
+/// The name the walk gives the value itself, which is the first node it meets.
+pub(crate) const ROOT: usize = 0;
 const INDENT: &str = "  ";
 const OPEN_MARK: &str = "\u{25be} ";
 const CLOSED_MARK: &str = "\u{25b8} ";
