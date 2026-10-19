@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 async-io = { workspace = true }
 async-trait = { workspace = true }
+caudra-proxy = { workspace = true }
 fastrand = { workspace = true }
 futures-lite = { workspace = true }
 isahc = { workspace = true }

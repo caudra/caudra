@@ -276,6 +276,17 @@ The `execution_environment` tool lists the forwarded names without their values,
 
 Docker contexts already work without this: `docker context use` stores the choice under `~/.docker`, and `HOME` is forwarded.
 
+### Network proxies
+
+Caudra sends its own requests through the proxy that `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, and `NO_PROXY` name. This covers model providers and their sign-in, [MCP servers](/docs/mcp/), [decision endpoints](/docs/providers/#decision-endpoints), telemetry, update checks and downloads, the web tools, automations' `http()`, and Lua's `caudra.net`.
+
+- An `https://` endpoint uses `HTTPS_PROXY`, and an `http://` endpoint uses `HTTP_PROXY`. Either falls back to `ALL_PROXY`. The uppercase name wins over the lowercase one, and an empty value counts as unset.
+- `NO_PROXY` lists hosts, domains, and address ranges, separated by commas, that Caudra reaches directly.
+- A numeric loopback address such as `127.0.0.1` or `[::1]` is always reached directly. A name such as `localhost` follows the variables.
+- The values come from the environment Caudra started with and the global `.env`. A project `.env` never supplies them, so a repository cannot send Caudra's traffic through a proxy of its choosing. Shell commands still receive the variables listed in [Shell host configuration](#shell-host-configuration).
+- An unreadable proxy URL is ignored with a warning in the log, and those requests connect directly.
+- A plain `http://` endpoint, such as a decision endpoint with `allow_http = true`, sends its requests and any bearer key to the proxy unencrypted.
+
 ## Subcommands
 
 ### `caudra permissions`

@@ -660,7 +660,8 @@ async fn save_cached_catalog_async(index: &schema::CatalogIndex) {
 }
 
 fn catalog_http_client() -> Result<HttpClient, AgentError> {
-    isahc::HttpClient::builder()
+    caudra_config::https_proxy_route()
+        .apply(isahc::HttpClient::builder())
         .connect_timeout(Duration::from_secs(10))
         .low_speed_timeout(1, Duration::from_secs(30))
         // curl carries http2 for OTLP.

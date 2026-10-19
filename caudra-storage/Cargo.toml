@@ -7,6 +7,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+caudra-proxy = { workspace = true }
 caudra-workspace = { workspace = true }
 flume = { workspace = true }
 getrandom = { workspace = true }

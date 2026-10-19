@@ -1,6 +1,7 @@
 use std::net::{IpAddr, ToSocketAddrs};
 use std::time::Duration;
 
+use caudra_config::ProxyRoute;
 use caudra_lua_macro::{lua_fn, lua_table};
 use futures_lite::io::AsyncReadExt;
 use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
@@ -85,7 +86,7 @@ lua_table! {
     /// HTTP client for fetching web content. All traffic goes over HTTPS
     /// (plain HTTP is upgraded). Private and metadata IP addresses are
     /// blocked to prevent SSRF. Failed requests (5xx) are retried
-    /// automatically.
+    /// automatically. Requests use the same network proxy as Caudra's own.
     ///
     /// ```lua
     /// local res, err = caudra.net.request("https://example.com")
@@ -180,7 +181,7 @@ async fn do_request(params: RequestParams) -> Result<ResponseData, String> {
 
     loop {
         let target = resolve_target(&current_url)?;
-        let client = build_client(&target, timeout)?;
+        let client = build_client(&target, &caudra_config::proxy_route(&current_url), timeout)?;
         let response = send_with_retries(
             &client,
             current_url.as_str(),
@@ -215,17 +216,21 @@ async fn do_request(params: RequestParams) -> Result<ResponseData, String> {
     }
 }
 
-fn build_client(target: &ResolvedTarget, timeout: Duration) -> Result<HttpClient, String> {
+fn build_client(
+    target: &ResolvedTarget,
+    proxy: &ProxyRoute,
+    timeout: Duration,
+) -> Result<HttpClient, String> {
     let resolve_map = target
         .addresses
         .iter()
         .fold(ResolveMap::new(), |map, address| {
             map.add(&target.host, target.port, *address)
         });
-    HttpClient::builder()
+    proxy
+        .apply(HttpClient::builder())
         .timeout(timeout)
         .redirect_policy(RedirectPolicy::None)
-        .proxy(None::<isahc::http::Uri>)
         .version_negotiation(VersionNegotiation::http11())
         .dns_resolve(resolve_map)
         .build()

@@ -837,7 +837,7 @@ Decision features are opt-in and configured in the `[decisions]` table of the gl
 
 Configuring an endpoint, by hand or through login, is the consent to send decision context to it. HTTPS needs no other opt-in, and neither does plain HTTP to numeric loopback. Plain HTTP to any other host needs `allow_http = true` on the endpoint. Use it only when you control the transport protection, such as an encrypted tunnel. Private and CGNAT addresses do not prove that a tunnel exists. Workcell transport rules remain unchanged. Both protocols send text only.
 
-Decision requests connect directly to the endpoint. They ignore ambient proxy variables and do not follow HTTP redirects, so project environment settings cannot redirect a loopback request.
+Decision requests do not follow HTTP redirects. A request to a numeric loopback endpoint always connects directly. Other endpoints use the [network proxy](/docs/cli/#network-proxies), which a project `.env` cannot set.
 
 With an endpoint active, this `caudra.toml` evaluates permission advice and Auto screening without changing any prompt:
 

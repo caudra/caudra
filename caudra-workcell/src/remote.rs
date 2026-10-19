@@ -10,6 +10,7 @@ use crate::transfer::PrivateStaging;
 use async_trait::async_trait;
 use caudra_agent::tools::SHELL_TOOL_NAME;
 use caudra_config::workcell::{RemoteWorkcellSelection, WorkcellEndpoint};
+use caudra_proxy::numeric_loopback;
 use caudra_storage::auth::{WorkcellCredential, WorkcellCredentialName};
 use caudra_storage::id::CaudraId;
 use caudra_storage::remote_operation_journal::{
@@ -56,7 +57,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
-use url::{Host, Url};
+use url::Url;
 use workcell::host_contract as contract;
 use workcell::{CatalogRevision, OwnedToolSpec, ToolAnnotations, ToolManifest};
 
@@ -424,14 +425,11 @@ impl RemoteTransport {
         if endpoint_url.scheme() == "http" && !numeric_loopback(endpoint_url) {
             return Err(RemoteWorkcellError::InsecureTransport);
         }
-        let mut builder = HttpClient::builder()
+        let client = caudra_config::proxy_route(endpoint_url)
+            .apply(HttpClient::builder())
             .redirect_policy(RedirectPolicy::None)
             .version_negotiation(VersionNegotiation::http11())
-            .timeout(DEFAULT_TIMEOUT);
-        if numeric_loopback(endpoint_url) {
-            builder = builder.proxy(None);
-        }
-        let client = builder
+            .timeout(DEFAULT_TIMEOUT)
             .build()
             .map_err(|_| RemoteWorkcellError::Transport)?;
         let (events, receiver) = flume::bounded(EVENT_QUEUE_CAPACITY);
@@ -4905,11 +4903,6 @@ async fn read_bounded(
         }
         bytes.extend_from_slice(&chunk[..read]);
     }
-}
-
-fn numeric_loopback(url: &Url) -> bool {
-    matches!(url.host(), Some(Host::Ipv4(address)) if address.is_loopback())
-        || matches!(url.host(), Some(Host::Ipv6(address)) if address.is_loopback())
 }
 
 fn validate_credential_selection(

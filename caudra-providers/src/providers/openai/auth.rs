@@ -54,7 +54,8 @@ struct TokenResponse {
 }
 
 fn http_client(timeout: Duration) -> Result<isahc::HttpClient, AgentError> {
-    isahc::HttpClient::builder()
+    caudra_config::https_proxy_route()
+        .apply(isahc::HttpClient::builder())
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(timeout)
         // curl carries http2 for OTLP.

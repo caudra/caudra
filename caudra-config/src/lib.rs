@@ -21,6 +21,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::warn;
+use url::Url;
 
 use crate::config_version::ConfigVersion;
 use crate::interpolation::Lookup;
@@ -79,6 +80,7 @@ pub mod steering;
 pub mod toml_document;
 pub mod workcell;
 
+pub use caudra_proxy::{ProxyEnv, ProxyRoute};
 pub use decisions::{DecisionsConfig, FeatureMode};
 pub use experimental::{Feature, FeatureDisabled, FeatureFlags};
 pub use profile_tools::{
@@ -4314,6 +4316,20 @@ pub fn global_env_value(key: &str) -> Result<Option<String>, std::env::VarError>
     }
 }
 
+/// The proxies Caudra's own requests use. A value only the project's `.env`
+/// set never applies, so a repository cannot route Caudra's traffic.
+pub fn proxy_env() -> ProxyEnv {
+    ProxyEnv::from_lookup(|name| global_env_value(name).ok().flatten())
+}
+
+pub fn proxy_route(url: &Url) -> ProxyRoute {
+    proxy_env().route(url)
+}
+
+pub fn https_proxy_route() -> ProxyRoute {
+    proxy_env().https_route()
+}
+
 /// Where Caudra's own value of a variable came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvSource {
@@ -6958,6 +6974,53 @@ mod tests {
         assert_eq!(std::env::var(KEY).unwrap(), VALUE);
         assert_eq!(decision_env_key(&decision_endpoint(KEY)), None);
         unsafe { std::env::remove_var(KEY) };
+    }
+
+    #[test]
+    fn project_env_cannot_set_caudra_proxies() {
+        const PROXY_VARIABLES: [&str; 8] = [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ];
+        const HTTPS_PROXY: &str = "HTTPS_PROXY";
+        const GLOBAL_PROXY: &str = "http://global-proxy.test:3128";
+        const PROJECT_PROXY: &str = "http://project-proxy.test:3128";
+
+        for name in PROXY_VARIABLES {
+            unsafe { env::remove_var(name) };
+        }
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        fs::create_dir_all(&global).unwrap();
+        let project = dir.path().join(PROJECT_DIR);
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            global.join(ENV_FILE),
+            format!("{HTTPS_PROXY}={GLOBAL_PROXY}"),
+        )
+        .unwrap();
+        fs::write(
+            project.join(ENV_FILE),
+            format!(
+                "{HTTPS_PROXY}={PROJECT_PROXY}\nHTTP_PROXY={PROJECT_PROXY}\nNO_PROXY=api.openai.com"
+            ),
+        )
+        .unwrap();
+        load_env_files_scoped(dir.path(), Some(&global), true);
+        assert_eq!(env::var(HTTPS_PROXY).unwrap(), PROJECT_PROXY);
+        assert_eq!(
+            proxy_env(),
+            ProxyEnv::from_lookup(|name| (name == HTTPS_PROXY).then(|| GLOBAL_PROXY.to_owned()))
+        );
+        for name in PROXY_VARIABLES {
+            unsafe { env::remove_var(name) };
+        }
     }
 
     #[test]

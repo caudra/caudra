@@ -2813,7 +2813,7 @@ caudra.keymap.set("n", "<M-t>", function() caudra.model.set({ thinking = "" }) e
 HTTP client for fetching web content. All traffic goes over HTTPS
 (plain HTTP is upgraded). Private and metadata IP addresses are
 blocked to prevent SSRF. Failed requests (5xx) are retried
-automatically.
+automatically. Requests use the same network proxy as Caudra's own.
 
 ```lua
 local res, err = caudra.net.request("https://example.com")

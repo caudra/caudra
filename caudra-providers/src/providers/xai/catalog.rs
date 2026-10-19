@@ -226,7 +226,8 @@ fn curated_fallback() -> Vec<CachedModel> {
 }
 
 fn fetch_catalog(access: &str) -> FetchOutcome {
-    let client = match isahc::HttpClient::builder()
+    let client = match caudra_config::https_proxy_route()
+        .apply(isahc::HttpClient::builder())
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(FETCH_TIMEOUT)
         .redirect_policy(RedirectPolicy::None)

@@ -572,7 +572,7 @@ impl Anthropic {
         let resolved_base_url = resolve_anthropic_base_url();
         let auth = native_auth(&account.secret, resolved_base_url.clone())?;
         Ok(Self {
-            client: super::http_client(timeouts),
+            client: super::http_client(timeouts, &super::proxy_route(resolved_base_url.as_deref())),
             auth_state: Mutex::new(AuthState {
                 resolved: Arc::new(Mutex::new(auth.resolved)),
                 mode: auth.mode,
@@ -591,7 +591,7 @@ impl Anthropic {
 
     pub(crate) fn with_auth(auth: Arc<Mutex<super::ResolvedAuth>>, timeouts: Timeouts) -> Self {
         Self {
-            client: super::http_client(timeouts),
+            client: super::http_client(timeouts, &super::auth_proxy_route(&auth)),
             auth_state: Mutex::new(AuthState {
                 resolved: auth,
                 mode: AuthMode::Injected,

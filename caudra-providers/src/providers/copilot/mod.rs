@@ -643,7 +643,7 @@ impl Copilot {
 
     fn with_source(source: AuthSource, timeouts: super::Timeouts) -> Self {
         Self {
-            client: super::http_client(timeouts),
+            client: super::http_client(timeouts, &caudra_config::https_proxy_route()),
             stream_timeout: timeouts.stream,
             auth: Arc::default(),
             source,
@@ -1365,6 +1365,8 @@ impl Provider for Copilot {
 
 #[cfg(test)]
 mod tests {
+    use caudra_config::ProxyRoute;
+
     use super::*;
     use crate::TokenUsage;
     use crate::providers::test_support::CREDENTIAL_IN_URL;
@@ -1782,7 +1784,7 @@ mod tests {
     /// call and no public fallback can happen.
     #[test]
     fn enterprise_endpoint_is_derived_without_discovery() {
-        let client = crate::providers::http_client(Timeouts::default());
+        let client = crate::providers::http_client(Timeouts::default(), &ProxyRoute::direct());
 
         let endpoint = smol::block_on(resolve_endpoint(&client, &enterprise_credentials()));
 

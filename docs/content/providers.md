@@ -666,7 +666,7 @@ model = "systemone-decision-v7"
 allow_http = true
 ```
 
-Requests ignore ambient proxies and do not follow redirects. These settings do not change Workcell transport policy.
+Requests to an endpoint that is not a numeric loopback address go through the [network proxy](/docs/cli/#network-proxies). Requests do not follow redirects. These settings do not change Workcell transport policy.
 
 A key saved by login, in `auth/decisions/<name>.json` under the state directory, wins. Otherwise Caudra reads the global environment variable that `api_key_env` names, never a value from a project `.env` file. A custom endpoint has no `api_key_env` until you add one, and an endpoint with no key sends none, which suits a local server. To take the base URL from the environment, write `base_url = "{env:TYPESAFE_BASE_URL}"`. The `TYPESAFE_BASE_URL` and `OPENAI_BASE_URL` variables do not change a decision endpoint on their own.
 

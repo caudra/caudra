@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 caudra-config = { workspace = true }
 isahc = { workspace = true }
+url = { workspace = true }
 serde_json = { workspace = true }
 smol = { workspace = true }
 flume = { workspace = true }

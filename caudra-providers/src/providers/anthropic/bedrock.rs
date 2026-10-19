@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
+use caudra_config::ProxyRoute;
 use flume::Sender;
 use hmac::{Hmac, KeyInit, Mac};
 use isahc::config::{Configurable, VersionNegotiation};
@@ -172,7 +173,10 @@ fn fetch_container_credentials(
         Err(_) => env::var("AWS_CONTAINER_AUTHORIZATION_TOKEN").ok(),
     };
 
-    let client = HttpClient::builder()
+    // The container credential endpoint is node-local and the token it takes
+    // must never reach a proxy.
+    let client = ProxyRoute::direct()
+        .apply(HttpClient::builder())
         .connect_timeout(CONTAINER_METADATA_TIMEOUT)
         .timeout(CONTAINER_METADATA_TIMEOUT)
         // curl carries http2 for OTLP.
@@ -490,10 +494,14 @@ impl Bedrock {
         let auth = resolve_bedrock_auth().inspect_err(|e| {
             warn!(error = %e, "Bedrock auth resolution failed");
         })?;
+        let base_url = env::var(BASE_URL_ENV).ok();
         Ok(Self {
-            client: super::super::http_client(timeouts),
+            client: super::super::http_client(
+                timeouts,
+                &super::super::proxy_route(base_url.as_deref()),
+            ),
             auth: Arc::new(Mutex::new(auth)),
-            base_url: env::var(BASE_URL_ENV).ok(),
+            base_url,
             model_override: env::var(MODEL_ENV).ok(),
         })
     }
@@ -786,7 +794,7 @@ mod tests {
 
     fn bedrock(base_url: Option<&str>, model_override: Option<&str>) -> Bedrock {
         Bedrock {
-            client: http_client(Timeouts::default()),
+            client: http_client(Timeouts::default(), &ProxyRoute::direct()),
             auth: Arc::new(Mutex::new(BedrockAuth {
                 kind: AuthKind::None,
                 region: REGION.into(),

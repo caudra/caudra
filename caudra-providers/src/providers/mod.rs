@@ -1,10 +1,13 @@
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use caudra_config::ProxyRoute;
 use futures_lite::StreamExt;
 use futures_lite::io::AsyncBufRead;
 use isahc::config::{Configurable, VersionNegotiation};
 use isahc::http::request::Builder;
 use serde::Deserialize;
+use url::Url;
 
 use crate::AgentError;
 
@@ -184,8 +187,23 @@ fn is_sse_filler(line: &str) -> bool {
     line.is_empty() || line.starts_with(':')
 }
 
-pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
-    isahc::HttpClient::builder()
+/// The proxy for a provider's client, chosen by the base URL known when it is
+/// built. A provider without one talks to its public HTTPS API.
+pub(crate) fn proxy_route(base_url: Option<&str>) -> ProxyRoute {
+    base_url
+        .and_then(|base_url| Url::parse(base_url).ok())
+        .map_or_else(caudra_config::https_proxy_route, |url| {
+            caudra_config::proxy_route(&url)
+        })
+}
+
+pub(crate) fn auth_proxy_route(auth: &Mutex<ResolvedAuth>) -> ProxyRoute {
+    proxy_route(auth.lock().unwrap().base_url.as_deref())
+}
+
+pub(crate) fn http_client(timeouts: Timeouts, proxy: &ProxyRoute) -> isahc::HttpClient {
+    proxy
+        .apply(isahc::HttpClient::builder())
         .connect_timeout(timeouts.connect)
         // A server that accepts a request and then computes in silence is
         // normal: a cold prefill of a long conversation sends nothing for a

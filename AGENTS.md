@@ -61,6 +61,7 @@ Rust workspace, key crates in root dir:
 - caudra-interpreter: legacy Lua interpreter API using pydantic/monty
 - caudra-storage: Persistent state across runs (e.g. sessions, auth)
 - caudra-config: User config
+- caudra-proxy: Explicit outbound proxy selection (`ProxyEnv`, `ProxyRoute`) for Caudra's own HTTP clients
 - caudra-lua: Lua plugin system (API mirrored from neovim for plugin compatibility), built-in plugins in ./plugins dir
 - caudra-acp: ACP ndjson stdio server
 - caudra-workcell: Native Workcell adapter, Caudra authorization integration, and tool-result presentation
@@ -89,8 +90,14 @@ limits clamp to the file group's. Envelope bounding uses Workcell's own `fit`/`S
 `SelectorRefusal` is a successful call that returned no rows, not a tool error.
 
 Web tools are built with `production_with_proxy`. `ambient_proxy()` reads `HTTP(S)_PROXY`,
-`ALL_PROXY`, and `NO_PROXY` so web tools honour the same proxy shell children already inherit. An
+`ALL_PROXY`, and `NO_PROXY` through `global_env_value`, so a project `.env` cannot set them. An
 unparseable value degrades to direct dialling with a warning that never logs the URL.
+
+Every isahc client Caudra builds for its own traffic sets its proxy explicitly with
+`caudra_config::proxy_route(&url).apply(builder)` (or `https_proxy_route()` for fixed public HTTPS
+endpoints), never libcurl's env lookup. `caudra-proxy` owns the selection: per-scheme variable,
+then `ALL_PROXY`, uppercase first, numeric loopback always direct, and the bypass list always set.
+A `curl` child gets the same settings through `ProxyEnv::configure_command`.
 
 Automations' `http()` sends through `automation_http_client()` in `caudra-workcell`: Workcell's bounded
 `HttpClient::request` with same-origin redirects and no retries, on one process-wide Tokio runtime

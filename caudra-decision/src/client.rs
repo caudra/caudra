@@ -3,6 +3,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use async_io::Timer;
 use async_trait::async_trait;
+use caudra_proxy::ProxyRoute;
 use futures_lite::{future, io::AsyncReadExt};
 use isahc::config::{Configurable, RedirectPolicy};
 use isahc::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
@@ -37,17 +38,26 @@ enum Protocol {
 }
 
 impl HttpDecisionClient {
-    pub fn new(endpoint: &str, api_key: Option<&str>) -> Result<Self, DecisionError> {
-        Self::with_protocol(endpoint, api_key, Protocol::TypeSafe)
+    pub fn new(
+        endpoint: &str,
+        api_key: Option<&str>,
+        proxy: &ProxyRoute,
+    ) -> Result<Self, DecisionError> {
+        Self::with_protocol(endpoint, api_key, proxy, Protocol::TypeSafe)
     }
 
-    pub fn openai(endpoint: &str, api_key: Option<&str>) -> Result<Self, DecisionError> {
-        Self::with_protocol(endpoint, api_key, Protocol::OpenAi)
+    pub fn openai(
+        endpoint: &str,
+        api_key: Option<&str>,
+        proxy: &ProxyRoute,
+    ) -> Result<Self, DecisionError> {
+        Self::with_protocol(endpoint, api_key, proxy, Protocol::OpenAi)
     }
 
     fn with_protocol(
         endpoint: &str,
         api_key: Option<&str>,
+        proxy: &ProxyRoute,
         protocol: Protocol,
     ) -> Result<Self, DecisionError> {
         let url = Url::parse(endpoint).map_err(|_| {
@@ -81,9 +91,8 @@ impl HttpDecisionClient {
                 Ok(value)
             })
             .transpose()?;
-        let client = HttpClient::builder()
-            .proxy(None)
-            .redirect_policy(RedirectPolicy::None)
+        let client = proxy
+            .apply(HttpClient::builder().redirect_policy(RedirectPolicy::None))
             .build()
             .map_err(|_| DecisionError::Unreachable)?;
         Ok(Self {
@@ -256,6 +265,7 @@ mod tests {
     use std::time::{Duration, Instant, UNIX_EPOCH};
 
     use async_io::{Async, Timer};
+    use caudra_proxy::ProxyRoute;
     use futures_lite::future;
     use isahc::http::{HeaderMap, HeaderName, HeaderValue};
     use serde_json::{Value, json};
@@ -358,12 +368,12 @@ mod tests {
     }
 
     fn client(endpoint: &str) -> HttpDecisionClient {
-        HttpDecisionClient::new(endpoint, Some(TEST_TOKEN)).unwrap()
+        HttpDecisionClient::new(endpoint, Some(TEST_TOKEN), &ProxyRoute::direct()).unwrap()
     }
 
     fn client_for(endpoint: &str, openai: bool) -> HttpDecisionClient {
         if openai {
-            HttpDecisionClient::openai(endpoint, Some(TEST_TOKEN)).unwrap()
+            HttpDecisionClient::openai(endpoint, Some(TEST_TOKEN), &ProxyRoute::direct()).unwrap()
         } else {
             client(endpoint)
         }
@@ -812,11 +822,11 @@ mod tests {
     #[test_case("https://example.test/v1/systemone#fragment"; "fragment")]
     fn rejects_unsafe_endpoint(endpoint: &str) {
         assert!(matches!(
-            HttpDecisionClient::new(endpoint, None),
+            HttpDecisionClient::new(endpoint, None, &ProxyRoute::direct()),
             Err(DecisionError::Rejected(_))
         ));
         assert!(matches!(
-            HttpDecisionClient::openai(endpoint, None),
+            HttpDecisionClient::openai(endpoint, None, &ProxyRoute::direct()),
             Err(DecisionError::Rejected(_))
         ));
     }

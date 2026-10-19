@@ -537,7 +537,8 @@ fn build_http_client(
             "OAuth endpoint resolves to a private or reserved address".into(),
         ));
     }
-    let mut builder = HttpClient::builder()
+    let mut builder = caudra_config::proxy_route(&endpoint_url)
+        .apply(HttpClient::builder())
         .redirect_policy(RedirectPolicy::None)
         // Same pin as mcp::http, so oauth and data traffic match.
         .version_negotiation(VersionNegotiation::http11())

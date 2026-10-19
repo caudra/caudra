@@ -6,11 +6,13 @@ use std::io::Write;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
+use caudra_config::ProxyRoute;
 use flate2::Compression as GzipLevel;
 use flate2::write::GzEncoder;
 use isahc::config::{Configurable, VersionNegotiation};
 use isahc::{AsyncReadResponseExt, HttpClient, ResponseExt};
 use thiserror::Error;
+use url::Url;
 
 use crate::encode::otlp::{LogsPayload, MetricsPayload};
 use crate::encode::{json, otlp};
@@ -98,7 +100,11 @@ pub struct OtlpTransport {
 
 impl OtlpTransport {
     pub fn new(settings: SignalSettings) -> Result<Self, isahc::Error> {
-        let mut builder = HttpClient::builder().timeout(settings.timeout);
+        let proxy = Url::parse(&settings.url).map_or_else(
+            |_| ProxyRoute::direct(),
+            |url| caudra_config::proxy_route(&url),
+        );
+        let mut builder = proxy.apply(HttpClient::builder()).timeout(settings.timeout);
         if settings.protocol == Protocol::Grpc {
             // Cleartext h2c needs prior knowledge; curl will not upgrade for us.
             builder = builder.version_negotiation(VersionNegotiation::http2());

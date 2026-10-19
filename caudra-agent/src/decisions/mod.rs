@@ -439,9 +439,14 @@ impl Decisions {
                 let api_key = endpoint_api_key(endpoint, state_dir)?;
                 let key = api_key.as_ref().map(|key| key.value.as_str());
                 let url = endpoint.endpoint();
+                let proxy = caudra_config::proxy_route(&url);
                 let client = match endpoint.protocol {
-                    DecisionProtocol::TypeSafe => HttpDecisionClient::new(url.as_str(), key),
-                    DecisionProtocol::OpenAI => HttpDecisionClient::openai(url.as_str(), key),
+                    DecisionProtocol::TypeSafe => {
+                        HttpDecisionClient::new(url.as_str(), key, &proxy)
+                    }
+                    DecisionProtocol::OpenAI => {
+                        HttpDecisionClient::openai(url.as_str(), key, &proxy)
+                    }
                 }?;
                 (
                     Some(Arc::new(CachedDecisionEngine::new(client, CACHE_ENTRIES))

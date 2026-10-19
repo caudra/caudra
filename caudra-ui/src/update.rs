@@ -80,7 +80,8 @@ pub fn spawn_check(configured: bool, channel: UpdateChannel) {
 
 fn check(channel: UpdateChannel, lookup: Lookup) -> Result<Option<Available>, VersionError> {
     let channel = channel.resolve()?;
-    let release = version::fetch_release_cached(channel.clone(), lookup)?;
+    let release =
+        version::fetch_release_cached(channel.clone(), lookup, &caudra_config::proxy_env())?;
     Ok(release
         .filter(|release| is_newer(&release.version, CURRENT))
         .map(|release| Available {

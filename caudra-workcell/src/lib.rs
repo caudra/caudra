@@ -897,7 +897,7 @@ impl Tool for WorkcellTool {
 }
 
 /// The outbound proxy for the web tools and automations' `http()`, read from the
-/// ambient environment.
+/// process environment or the global `.env`, never from a project's `.env`.
 ///
 /// Workcell already forwards these variables to every `shell` child, so without
 /// this the two disagree: behind an enforcing proxy `shell curl` would reach the
@@ -908,7 +908,11 @@ impl Tool for WorkcellTool {
 /// affects outbound requests, so callers degrade to a direct dial and say so.
 /// The error never carries the value: a proxy URL may hold credentials.
 fn ambient_proxy() -> Result<ProxyConfiguration, ProxyConfigurationError> {
-    let first = |names: &[&str]| names.iter().find_map(|name| std::env::var(name).ok());
+    let first = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|name| caudra_config::global_env_value(name).ok().flatten())
+    };
     ProxyConfiguration::from_values(
         first(PROXY_HTTP_VARS).as_deref(),
         first(PROXY_HTTPS_VARS).as_deref(),

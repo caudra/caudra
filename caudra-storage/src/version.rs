@@ -13,6 +13,7 @@ use std::process::{ChildStdin, Command, Stdio};
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use caudra_proxy::ProxyEnv;
 use isahc::Request;
 use isahc::config::{Configurable, VersionNegotiation};
 use isahc::http::header::AUTHORIZATION;
@@ -376,12 +377,14 @@ fn fetch_page(
     read_bounded(response.into_body(), MAX_RESPONSE_BYTES)
 }
 
-pub fn fetch_release(channel: UpdateChannel) -> Result<Release, VersionError> {
+pub fn fetch_release(channel: UpdateChannel, proxies: &ProxyEnv) -> Result<Release, VersionError> {
     let channel = channel.resolve()?;
     let target = current_target()?;
     let authorization = github_authorization(|name| env::var_os(name))?;
     let started = Instant::now();
-    let client = isahc::HttpClient::builder()
+    let client = proxies
+        .https_route()
+        .apply(isahc::HttpClient::builder())
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .version_negotiation(VersionNegotiation::http11())
@@ -397,6 +400,7 @@ pub fn fetch_release(channel: UpdateChannel) -> Result<Release, VersionError> {
                 &url,
                 remaining(started)?.min(REQUEST_TIMEOUT),
                 authorization,
+                proxies,
             )
             .map_err(|_| error)
         })
@@ -405,14 +409,15 @@ pub fn fetch_release(channel: UpdateChannel) -> Result<Release, VersionError> {
     Ok(release)
 }
 
-pub fn curl_fetch(url: &str) -> io::Result<Vec<u8>> {
-    curl_fetch_bounded(url, REQUEST_TIMEOUT, None)
+pub fn curl_fetch(url: &str, proxies: &ProxyEnv) -> io::Result<Vec<u8>> {
+    curl_fetch_bounded(url, REQUEST_TIMEOUT, None, proxies)
 }
 
 /// An authorized command reads its header from stdin, so the token never
 /// appears in the process list.
-fn curl_command(url: &str, timeout: Duration, authorized: bool) -> Command {
+fn curl_command(url: &str, timeout: Duration, authorized: bool, proxies: &ProxyEnv) -> Command {
     let mut command = Command::new("curl");
+    proxies.configure_command(&mut command);
     command
         .args([
             "--disable",
@@ -453,8 +458,9 @@ fn curl_fetch_bounded(
     url: &str,
     timeout: Duration,
     authorization: Option<&HeaderValue>,
+    proxies: &ProxyEnv,
 ) -> io::Result<Vec<u8>> {
-    let mut child = curl_command(url, timeout, authorization.is_some()).spawn()?;
+    let mut child = curl_command(url, timeout, authorization.is_some(), proxies).spawn()?;
     let result = authorization
         .map_or(Ok(()), |authorization| {
             send_authorization(child.stdin.take(), authorization)
@@ -511,6 +517,7 @@ impl CacheEntry {
 pub fn fetch_release_cached(
     channel: UpdateChannel,
     lookup: Lookup,
+    proxies: &ProxyEnv,
 ) -> Result<Option<Release>, VersionError> {
     let channel = channel.resolve()?;
     let target = current_target()?;
@@ -524,7 +531,7 @@ pub fn fetch_release_cached(
         target,
         now,
         lookup,
-        || fetch_release(channel),
+        || fetch_release(channel, proxies),
     )
 }
 
@@ -595,6 +602,7 @@ mod tests {
     use std::thread;
     use std::time::Instant;
 
+    use caudra_proxy::ProxyEnv;
     use isahc::HttpClient;
     use isahc::config::Configurable;
     use isahc::http::HeaderValue;
@@ -1451,7 +1459,12 @@ mod tests {
     #[test_case(true; "authorized")]
     #[test_case(false; "anonymous")]
     fn curl_reads_headers_from_stdin_only_when_authorized(authorized: bool) {
-        let command = curl_command(RELEASES_URL, REQUEST_TIMEOUT, authorized);
+        let command = curl_command(
+            RELEASES_URL,
+            REQUEST_TIMEOUT,
+            authorized,
+            &ProxyEnv::direct(),
+        );
         let reads_stdin = command
             .get_args()
             .collect::<Vec<_>>()

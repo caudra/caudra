@@ -8,7 +8,7 @@ use isahc::{
     http::{HeaderValue, Method},
 };
 use serde::{Serialize, de::DeserializeOwned};
-use std::{net::IpAddr, time::Duration};
+use std::time::Duration;
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
@@ -93,18 +93,12 @@ impl LifecycleClient {
             return Err(Error::Credential);
         }
         let url = Url::parse(origin.as_str()).map_err(|_| Error::Protocol)?;
-        let mut builder = HttpClient::builder()
+        let builder = caudra_config::proxy_route(&url)
+            .apply(HttpClient::builder())
             .redirect_policy(RedirectPolicy::None)
             .version_negotiation(VersionNegotiation::http11())
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(timeout);
-        if url.host_str().is_some_and(|host| {
-            host.trim_matches(['[', ']'])
-                .parse::<IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-        }) {
-            builder = builder.proxy(None);
-        }
         Ok(Self {
             origin,
             key,

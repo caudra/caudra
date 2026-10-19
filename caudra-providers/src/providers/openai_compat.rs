@@ -50,7 +50,12 @@ impl OpenAiCompatProvider {
             caudra_config::providers::configured_base_url(config.slug, providers.get(config.slug))
         };
         Self {
-            client: super::http_client(timeouts),
+            client: super::http_client(
+                timeouts,
+                &super::proxy_route(Some(
+                    resolved_base_url.as_deref().unwrap_or(config.base_url),
+                )),
+            ),
             config,
             stream_timeout: timeouts.stream,
             resolved_base_url,

@@ -454,7 +454,8 @@ struct NetworkIo {
 
 impl NetworkIo {
     fn new() -> Result<Self, AgentError> {
-        let client = HttpClient::builder()
+        let client = caudra_config::https_proxy_route()
+            .apply(HttpClient::builder())
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .redirect_policy(RedirectPolicy::None)

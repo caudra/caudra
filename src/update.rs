@@ -195,7 +195,8 @@ fn asset_url(release: &Release, name: &str) -> String {
 /// Follows redirects by hand so every hop stays on an allowed HTTPS origin.
 /// `deadline` bounds the whole transfer; without one, only a stall ends it.
 fn open_asset(url: &str, deadline: Option<Duration>) -> io::Result<Response<Body>> {
-    let client = HttpClient::builder()
+    let client = caudra_config::https_proxy_route()
+        .apply(HttpClient::builder())
         .connect_timeout(CONNECT_TIMEOUT)
         .low_speed_timeout(LOW_SPEED_BYTES, LOW_SPEED_WINDOW)
         .redirect_policy(RedirectPolicy::None)
@@ -245,7 +246,7 @@ fn fetch_asset(url: &str, limit: u64) -> Result<Vec<u8>, UpdateError> {
                     .get_ref()
                     .is_some_and(|inner| inner.is::<isahc::Error>()) =>
             {
-                return version::curl_fetch(url).map_err(|_| error);
+                return version::curl_fetch(url, &caudra_config::proxy_env()).map_err(|_| error);
             }
             Err(error) => return Err(error),
         };
@@ -877,7 +878,7 @@ pub fn update(
         return Err(UpdateError::Managed(manager));
     }
     let channel = channel.unwrap_or_else(configured_channel);
-    let release = version::fetch_release(channel)?;
+    let release = version::fetch_release(channel, &caudra_config::proxy_env())?;
     if !version::is_newer(&release.version, version::CURRENT) {
         println!(
             "No newer eligible release (installed v{}, selected {}).",

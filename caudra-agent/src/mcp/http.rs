@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use async_lock::Mutex;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use caudra_config::ProxyRoute;
 use caudra_storage::StateDir;
 use caudra_storage::auth::load_mcp_auth;
 use futures_lite::io::BufReader;
@@ -142,7 +143,11 @@ impl HttpTransport {
         timeout: Duration,
         storage: Option<StateDir>,
     ) -> Result<Self, McpError> {
-        let builder = HttpClient::builder()
+        let parsed = Url::parse(url);
+        let builder = parsed
+            .as_ref()
+            .map_or_else(|_| ProxyRoute::direct(), caudra_config::proxy_route)
+            .apply(HttpClient::builder())
             // A trusted public endpoint must not redirect MCP traffic or
             // credentials into a private network target that was never reviewed.
             .redirect_policy(RedirectPolicy::None)
@@ -153,7 +158,7 @@ impl HttpTransport {
             // Only connecting is bounded here: a call's idle timeout, which
             // progress extends, and the GET stream outlive any fixed total.
             .connect_timeout(timeout);
-        let builder = match (Url::parse(url), resolved.is_empty()) {
+        let builder = match (parsed, resolved.is_empty()) {
             (Ok(url), false) => match (url.host(), url.port_or_known_default()) {
                 (Some(Host::Domain(host)), Some(port)) => {
                     let mappings = resolved.iter().fold(ResolveMap::new(), |map, address| {

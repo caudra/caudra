@@ -21,7 +21,7 @@ use crate::{
     StreamResponse, ThinkingConfig, TokenUsage,
 };
 
-use super::{ResolvedAuth, http_client, next_sse_line};
+use super::{ResolvedAuth, auth_proxy_route, http_client, next_sse_line, proxy_route};
 
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const ENV_VAR: &str = "GEMINI_API_KEY";
@@ -202,7 +202,7 @@ impl Google {
     pub fn new(account: &AccountCredential, timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let resolved = resolve_auth_from_key(account.api_key()?, resolve_google_base_url());
         Ok(Self {
-            client: http_client(timeouts),
+            client: http_client(timeouts, &proxy_route(resolved.base_url.as_deref())),
             auth: Arc::new(Mutex::new(resolved)),
             stream_timeout: timeouts.stream,
         })
@@ -213,7 +213,7 @@ impl Google {
         timeouts: super::Timeouts,
     ) -> Self {
         Self {
-            client: http_client(timeouts),
+            client: http_client(timeouts, &auth_proxy_route(&auth)),
             auth,
             stream_timeout: timeouts.stream,
         }

@@ -12,6 +12,7 @@ rust-version.workspace = true
 caudra-agent = { workspace = true }
 caudra-automation = { workspace = true }
 caudra-config = { workspace = true }
+caudra-proxy = { workspace = true }
 caudra-storage = { workspace = true }
 caudra-terminal-host = { workspace = true }
 caudra-workspace = { workspace = true }

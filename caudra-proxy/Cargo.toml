@@ -1,0 +1,17 @@
+[package]
+name = "caudra-proxy"
+description = "Explicit outbound proxy selection for Caudra's own HTTP clients"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+isahc = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }

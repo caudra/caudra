@@ -78,7 +78,8 @@ struct CallbackResult {
 }
 
 fn http_client() -> Result<isahc::HttpClient, AgentError> {
-    isahc::HttpClient::builder()
+    caudra_config::https_proxy_route()
+        .apply(isahc::HttpClient::builder())
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(TOKEN_TIMEOUT)
         .redirect_policy(RedirectPolicy::None)

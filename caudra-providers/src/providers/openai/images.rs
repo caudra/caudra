@@ -99,7 +99,7 @@ pub async fn generate(dir: &StateDir, req: &ImageRequest<'_>) -> Result<Vec<u8>,
     let storage = dir.clone();
     let auth = smol::unblock(move || resolve_auth(&storage)).await?;
     let timeouts = Timeouts::default();
-    let client = http_client(timeouts);
+    let client = http_client(timeouts, &caudra_config::https_proxy_route());
     let body = serde_json::to_vec(&build_body(req))?;
 
     let request = auth
