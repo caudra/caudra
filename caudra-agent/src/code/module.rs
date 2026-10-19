@@ -15,6 +15,9 @@ use crate::tools::{ToolContext, ToolFailure};
 
 /// Names the class a module's namespace is typed as, apart from any MCP server's.
 const MODULE_CLASS_PREFIX: &str = "_Module_";
+/// Follows the call's name in what a read-first call raises before its reference was read.
+pub const UNREAD_NOTE: &str =
+    " did not run: its reference comes first, and follows. Call it again with what it says.";
 
 /// Makes a permitted call under the call's own context: what its row shows and what the snippet
 /// receives, or why it failed.
@@ -40,6 +43,9 @@ pub struct MemberDoc {
     /// Whether a call returns something to `await`, as every call that reaches beyond what the
     /// run already holds does.
     pub awaited: bool,
+    /// Whether its reference must be read before its first call: an agent's first call raises
+    /// with the page instead of running, unless `help` already showed it.
+    pub read_first: bool,
     /// What `help("<namespace>.<name>")` returns after the signature.
     pub page: &'static str,
 }
@@ -85,18 +91,41 @@ impl ModuleDoc {
         self.members.iter().map(|member| member.name)
     }
 
-    /// The module page followed by every member's signature.
+    /// The module page followed by every member's signature, with the whole page of each member
+    /// that must be read before its first call, so this page reads them too.
     pub fn module_help(&self) -> String {
         let mut help = format!("{}\n", self.page);
         for member in self.members {
             help.push('\n');
             help.push_str(&member.written(self.namespace));
+            if member.read_first {
+                help.push_str(&format!("\n{}\n", member.page));
+            }
         }
         help
     }
 
     pub fn member_help(&self, member: &MemberDoc) -> String {
         format!("{}\n\n{}", member.written(self.namespace), member.page)
+    }
+
+    /// `image.generate`: what a read-first member is remembered as read under.
+    pub fn qualified(&self, member: &MemberDoc) -> String {
+        format!("{}.{}", self.namespace, member.name)
+    }
+
+    /// The members whose reference must be read before their first call.
+    pub fn read_first(&self) -> impl Iterator<Item = &MemberDoc> {
+        self.members.iter().filter(|member| member.read_first)
+    }
+
+    /// What a read-first member's first call raises instead of running.
+    pub fn unread(&self, member: &MemberDoc) -> String {
+        format!(
+            "`{}`{UNREAD_NOTE}\n\n{}",
+            self.qualified(member),
+            self.member_help(member)
+        )
     }
 
     /// What a snippet reading a member the module lacks is told.

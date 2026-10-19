@@ -7,14 +7,29 @@ use std::sync::{Arc, Mutex, PoisonError};
 use serde::Serialize;
 use serde_json::Value;
 
+use super::names::{AUTOMATION_MODULE, HOST_MODULE, IMAGE_MODULE, WORKFLOW_MODULE};
+
 const DETAIL_FIELD: &str = "detail";
 
-/// Each of [`caudra_config::CODE_HOSTED_TOOLS`] with the module call that replaced calling it directly.
-const HOSTED_CALLS: &[(&str, &str)] = &[
-    ("image_generate", "await image.generate(prompt, out)"),
-    ("execution_environment", "await host.environment()"),
-    ("workflow", "await workflow.<action>(...)"),
-    ("automation", "await automation.<action>(...)"),
+/// Each of [`caudra_config::CODE_HOSTED_TOOLS`] with the module that reaches it and the module
+/// call that replaced calling it directly.
+const HOSTED_CALLS: &[(&str, &str, &str)] = &[
+    (
+        "image_generate",
+        IMAGE_MODULE,
+        "await image.generate(prompt, out)",
+    ),
+    (
+        "execution_environment",
+        HOST_MODULE,
+        "await host.environment()",
+    ),
+    ("workflow", WORKFLOW_MODULE, "await workflow.<action>(...)"),
+    (
+        "automation",
+        AUTOMATION_MODULE,
+        "await automation.<action>(...)",
+    ),
 ];
 
 /// One module call of a hosted tool, carried on the call's context: dispatch accepts the tool for
@@ -62,10 +77,16 @@ impl HostedCall {
 
 /// The module call a snippet makes in place of calling hosted `tool` directly.
 pub fn module_call(tool: &str) -> Option<&'static str> {
-    HOSTED_CALLS
-        .iter()
-        .find(|(hosted, _)| *hosted == tool)
-        .map(|(_, call)| *call)
+    hosted(tool).map(|(_, _, call)| *call)
+}
+
+/// The module a snippet reaches hosted `tool` through.
+pub fn hosted_module(tool: &str) -> Option<&'static str> {
+    hosted(tool).map(|(_, module, _)| *module)
+}
+
+fn hosted(tool: &str) -> Option<&'static (&'static str, &'static str, &'static str)> {
+    HOSTED_CALLS.iter().find(|(hosted, _, _)| *hosted == tool)
 }
 
 /// Why a direct call of `tool` does not run, when only a module call may run it.
@@ -85,6 +106,7 @@ mod tests {
     fn every_hosted_tool_names_its_module_call() {
         for tool in CODE_HOSTED_TOOLS {
             assert!(direct_call_refusal(tool).is_some(), "{tool}");
+            assert!(hosted_module(tool).is_some(), "{tool}");
         }
         assert_eq!(HOSTED_CALLS.len(), CODE_HOSTED_TOOLS.len());
     }

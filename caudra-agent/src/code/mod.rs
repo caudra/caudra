@@ -16,6 +16,9 @@ pub mod output;
 pub mod runner;
 pub mod tool_module;
 
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
 use caudra_providers::{ContentBlock, Message};
 
 use self::module::ModuleDoc;
@@ -40,6 +43,9 @@ pub static MODULE_DOCS: &[&ModuleDoc] = &[
 pub struct CodeSession {
     /// Held for the whole of a run, so one agent's runs never interleave.
     repl: SharedRepl,
+    /// The read-first calls, as `image.generate`, whose reference this agent has been shown since
+    /// its context last lost it.
+    references: Arc<Mutex<HashSet<String>>>,
 }
 
 impl CodeSession {
@@ -51,11 +57,31 @@ impl CodeSession {
         );
         Self {
             repl: ReplSlot::shared(ran_before),
+            references: Arc::default(),
         }
     }
 
     pub fn repl(&self) -> &SharedRepl {
         &self.repl
+    }
+
+    pub fn has_read(&self, call: &str) -> bool {
+        self.read().contains(call)
+    }
+
+    pub fn mark_read(&self, calls: impl IntoIterator<Item = String>) {
+        self.read().extend(calls);
+    }
+
+    /// After the context dropped the references it was shown, as a compaction does.
+    pub fn forget_references(&self) {
+        self.read().clear();
+    }
+
+    fn read(&self) -> MutexGuard<'_, HashSet<String>> {
+        self.references
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 

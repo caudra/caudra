@@ -36,6 +36,11 @@ const H_PAD: u16 = 2;
 const H_PAD_STEP_WIDTH: u16 = 16;
 const DECLARED_GLYPH: &str = "\u{25cf}";
 const DISABLED_GLYPH: &str = "\u{d7}";
+/// A built-in the model reaches through a `code` module, as MCP tools are, so it costs nothing in
+/// the request.
+const HOSTED_STATE: &str = "via code";
+const HOSTED_LABEL: &str = "Via code";
+const MODULE_SUFFIX: &str = " module";
 const NO_SNAPSHOT: &str = "No tool report is available yet.";
 const NO_SNAPSHOT_HINT: &str = "A report appears when a request is prepared.";
 const NO_MCP: &str = "No MCP tools.";
@@ -362,6 +367,7 @@ fn build_lines(
     let mut lines = vec![basis];
     lines.extend(summary_lines(snapshot, theme));
     lines.extend(builtin_lines(snapshot, theme));
+    lines.extend(hosted_lines(snapshot, theme));
     lines.extend(mcp_lines(snapshot, theme));
     lines
 }
@@ -384,6 +390,11 @@ fn summary_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>
             theme,
         ),
         labeled_line(
+            HOSTED_LABEL,
+            format!("{} built-in", builtins.count(ContextBuiltinState::Hosted)),
+            theme,
+        ),
+        labeled_line(
             "Off",
             format!("{} built-in", builtins.count(ContextBuiltinState::Disabled)),
             theme,
@@ -393,9 +404,33 @@ fn summary_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>
 
 fn builtin_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = vec![Line::default(), section_line("Built-in", theme)];
-    for tool in &snapshot.inventory.builtins.tools {
-        lines.push(builtin_line(tool, theme));
+    lines.extend(
+        snapshot
+            .inventory
+            .builtins
+            .tools
+            .iter()
+            .filter(|tool| tool.module.is_none())
+            .map(|tool| builtin_line(tool, theme)),
+    );
+    lines
+}
+
+/// The built-ins no request declares, reached through their `code` module, on or off.
+fn hosted_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>> {
+    let hosted: Vec<Line<'static>> = snapshot
+        .inventory
+        .builtins
+        .tools
+        .iter()
+        .filter(|tool| tool.module.is_some())
+        .map(|tool| builtin_line(tool, theme))
+        .collect();
+    if hosted.is_empty() {
+        return hosted;
     }
+    let mut lines = vec![Line::default(), section_line(HOSTED_LABEL, theme)];
+    lines.extend(hosted);
     lines
 }
 
@@ -407,6 +442,12 @@ fn builtin_line(tool: &ContextBuiltinTool, theme: &Theme) -> Line<'static> {
             theme.tool_success,
             format!("{} in context", token_label(tool.tokens)),
         ),
+        ContextBuiltinState::Hosted => (
+            DECLARED_GLYPH,
+            HOSTED_STATE,
+            theme.tool_success,
+            String::new(),
+        ),
         ContextBuiltinState::Disabled => (DISABLED_GLYPH, "off", theme.error, String::new()),
     };
     let mut spans = vec![
@@ -416,6 +457,9 @@ fn builtin_line(tool: &ContextBuiltinTool, theme: &Theme) -> Line<'static> {
     ];
     if !tokens.is_empty() {
         spans.push(Span::raw(format!(" \u{b7} {tokens}")));
+    }
+    if let Some(module) = tool.module {
+        spans.push(Span::raw(format!(" \u{b7} {module}{MODULE_SUFFIX}")));
     }
     if let Some(billed_to) = tool.billed_to {
         spans.push(Span::styled(
@@ -692,10 +736,11 @@ mod tests {
 
     use super::{
         COUNT_COL, ContextBuiltinState, ContextBuiltinTool, ContextMcpStatus, ContextSnapshot,
-        ESTIMATE_MARKER, FAILURES_HEADING, GLOBAL_TITLE, NO_ACTIVITY, NO_ACTIVITY_HINT, NO_MCP,
-        NO_SNAPSHOT, Overlay, PROJECT_TITLE, SESSION_TITLE, STATS_UNAVAILABLE, TIP_GLOBAL,
-        TIP_INVENTORY, TIP_PROJECT, TIP_SESSION, TITLE, TOOL_COL_MIN, ToolOutcome, ToolStats,
-        ToolsModal, ToolsModalContext, ToolsScope, build_lines, control_tip, key, stats_lines,
+        DECLARED_GLYPH, DISABLED_GLYPH, ESTIMATE_MARKER, FAILURES_HEADING, GLOBAL_TITLE,
+        HOSTED_LABEL, NO_ACTIVITY, NO_ACTIVITY_HINT, NO_MCP, NO_SNAPSHOT, Overlay, PROJECT_TITLE,
+        SESSION_TITLE, STATS_UNAVAILABLE, TIP_GLOBAL, TIP_INVENTORY, TIP_PROJECT, TIP_SESSION,
+        TITLE, TOOL_COL_MIN, ToolOutcome, ToolStats, ToolsModal, ToolsModalContext, ToolsScope,
+        build_lines, control_tip, key, stats_lines,
     };
     use crate::components::tooltip::TipKey;
     use crate::theme;
@@ -704,6 +749,8 @@ mod tests {
     const WINDOW_TOKENS: u32 = 1_000;
     const DECLARED: &str = "file_read";
     const DISABLED: &str = "file_edit";
+    const HOSTED: &str = "execution_environment";
+    const HOSTED_MODULE: &str = "host";
     const SHELL: &str = "shell";
     const DISABLED_REASON: &str = "model uses the other editing tool";
     const TOOL_SOURCE: &str = "native";
@@ -727,6 +774,7 @@ mod tests {
             source: "native:workcell".to_owned(),
             state,
             reason: (state == ContextBuiltinState::Disabled).then_some(DISABLED_REASON),
+            module: (state == ContextBuiltinState::Hosted).then_some(HOSTED_MODULE),
             tokens,
             billed_to: None,
         }
@@ -751,6 +799,7 @@ mod tests {
                 builtins: ContextBuiltinInventory {
                     tools: vec![
                         tool(DECLARED, ContextBuiltinState::Declared, 55),
+                        tool(HOSTED, ContextBuiltinState::Hosted, 0),
                         tool(DISABLED, ContextBuiltinState::Disabled, 0),
                     ],
                     unattributed_tokens: 0,
@@ -787,12 +836,51 @@ mod tests {
         let out = rendered(Some(&snapshot(Vec::new())));
         for expected in [
             "Declared  1 built-in · ~55 tokens in context",
+            "Via code  1 built-in",
             "Off  1 built-in",
             "file_read  on · ~55 tokens in context · native:workcell",
+            "execution_environment  via code · host module · native:workcell",
             "file_edit  off · model uses the other editing tool · native:workcell",
             NO_MCP,
         ] {
             assert!(out.contains(expected), "missing {expected}:\n{out}");
+        }
+    }
+
+    /// Tools reached through a `code` module, on or off, get their own section between the
+    /// built-ins the request declares and MCP; with none, the section is left out.
+    #[test_case(true ; "hosted_tools")]
+    #[test_case(false ; "no_hosted_tools")]
+    fn hosted_tools_have_their_own_section_above_mcp(has_hosted: bool) {
+        let mut snapshot = snapshot(Vec::new());
+        let tools = &mut snapshot.inventory.builtins.tools;
+        if has_hosted {
+            tools.push(ContextBuiltinTool {
+                module: Some(HOSTED_MODULE),
+                ..tool(SHELL, ContextBuiltinState::Disabled, 0)
+            });
+        } else {
+            tools.retain(|tool| tool.module.is_none());
+        }
+        let out = rendered(Some(&snapshot));
+        let rows: Vec<&str> = out.lines().map(str::trim).collect();
+        let at = |prefix: &str| rows.iter().position(|row| row.starts_with(prefix));
+        let section = rows.iter().position(|row| *row == HOSTED_LABEL);
+        let mcp = at("MCP").unwrap();
+        assert_eq!(section.is_some(), has_hosted, "{out}");
+        if let Some(section) = section {
+            let built_in = at("Built-in").unwrap();
+            let hosted = at(&format!("{DECLARED_GLYPH} {HOSTED}")).unwrap();
+            let hosted_off = at(&format!("{DISABLED_GLYPH} {SHELL}")).unwrap();
+            assert!(
+                at(&format!("{DECLARED_GLYPH} {DECLARED}")).unwrap() < section,
+                "{out}"
+            );
+            assert!(
+                built_in < section && section < hosted && hosted < mcp,
+                "{out}"
+            );
+            assert!(section < hosted_off && hosted_off < mcp, "{out}");
         }
     }
 

@@ -111,6 +111,7 @@ Example: `hits = (await history.search(\"flaky snapshot test\", kinds=[\"user\",
             name: SEARCH_METHOD,
             signature: r#"search(query: str, scope: str = "project", kinds: list[Literal["user", "assistant", "summary", "reasoning", "tool_call", "tool_result"]] | None = None, tools: list[str] | None = None, since: str | None = None, until: str | None = None, sort: Literal["relevance", "newest"] = "relevance", rerank: bool | None = None, limit: int | None = None, offset: int = 0) -> dict[str, Any]"#,
             awaited: true,
+            read_first: true,
             page: "Returns `{\"hits\": [{\"ref\", \"session\", \"title\", \"project\", \"when\", \"kind\", \"tool\", \"agent\", \"snippet\", \"score\"}], \"ranking\", \"judged_unrelated\", \"more\", \"unindexed_sessions\", \"note\"}`. Matched words in `snippet` are marked «like this».\n\
 - `kinds` keeps only those items; `tools` keeps only calls of, and results from, the named tools.\n\
 - `since` and `until` take ISO dates or times.\n\
@@ -122,12 +123,14 @@ Example: `hits = (await history.search(\"flaky snapshot test\", kinds=[\"user\",
             name: READ_METHOD,
             signature: "read(ref: str, offset: int = 0, limit: int = 8000, around: int = 0) -> dict[str, Any]",
             awaited: true,
+            read_first: true,
             page: "Returns one item's full text from byte `offset`, at most `limit` bytes (64 KiB), with `around` neighbours each side (at most 20) as previews. `ref` comes from a `history.search` hit.",
         },
         MemberDoc {
             name: SESSIONS_METHOD,
             signature: "sessions(scope: str = \"project\", title: str | None = None, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]",
             awaited: true,
+            read_first: false,
             page: "Lists sessions newest first, at most 100 per call, optionally only those whose title contains `title`.",
         },
     ],
@@ -879,7 +882,8 @@ mod tests {
     }
 
     /// A saved session working in `project`, with one matching message there and one in `other`,
-    /// whose permissions ask about anything no rule allows and have no one to ask.
+    /// whose permissions ask about anything no rule allows and have no one to ask, and whose agent
+    /// has read the module's reference.
     fn fixture(mode: AgentMode) -> Fixture {
         let (project, other, state) = (temp(), temp(), temp());
         let item = |index| vec![(stamped(BASE_MS, index), seeded_text(QUERY, index))];
@@ -893,6 +897,8 @@ mod tests {
         permissions.set_session_mode(Some(PermissionMode::Ask));
         let mut ctx = stub_ctx_with_permissions(&mode, Arc::clone(&permissions));
         ctx.session_id = Some(SessionRef::from_id(session));
+        ctx.code
+            .mark_read(DOC.read_first().map(|member| DOC.qualified(member)));
         Fixture {
             project,
             other,

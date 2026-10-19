@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::AgentMode;
 use crate::agent::{compaction_reserve, estimate_message_tokens};
+use crate::code::hosted::hosted_module;
 use crate::mcp::{McpSession, McpToolStatus};
 use crate::memory::tree::Block;
 use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog, TaskProfileBindings};
@@ -321,6 +322,8 @@ impl ContextMcpInventory {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ContextBuiltinState {
     Declared,
+    /// Never declared, reached through a `code` module instead.
+    Hosted,
     Disabled,
 }
 
@@ -331,6 +334,8 @@ pub struct ContextBuiltinTool {
     pub state: ContextBuiltinState,
     /// The rule that decided the state, when one had to.
     pub reason: Option<&'static str>,
+    /// The `code` module the tool is reached through, whether it is on or off.
+    pub module: Option<&'static str>,
     pub tokens: u32,
     /// The category row already paying for this definition. `task`, `memory`
     /// and `skill` are charged to the feature they serve, so their tokens are
@@ -406,15 +411,18 @@ impl BuiltinToolsInput<'_> {
                     },
                     self.session_plan,
                 );
-                let state = match report.state {
-                    ToolState::On => ContextBuiltinState::Declared,
-                    ToolState::Off => ContextBuiltinState::Disabled,
+                let module = hosted_module(name);
+                let (state, reason) = match (report.state, module) {
+                    (ToolState::On, Some(_)) => (ContextBuiltinState::Hosted, None),
+                    (ToolState::On, None) => (ContextBuiltinState::Declared, report.reason),
+                    (ToolState::Off, _) => (ContextBuiltinState::Disabled, report.reason),
                 };
                 ContextBuiltinTool {
                     name: name.to_owned(),
                     source: entry.source.as_log_field().into_owned(),
                     state,
-                    reason: report.reason,
+                    reason,
+                    module,
                     tokens: 0,
                     billed_to: None,
                 }
@@ -918,6 +926,7 @@ impl ContextBuiltinInventory {
                     source: String::new(),
                     state: ContextBuiltinState::Declared,
                     reason: None,
+                    module: None,
                     tokens: *tokens,
                     billed_to: *billed_to,
                 }),
@@ -1001,7 +1010,11 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::code::names::HOST_MODULE;
     use crate::memory::tree::{Line, Part};
+    use crate::tools::EXECUTION_ENVIRONMENT_TOOL_NAME;
+    use crate::tools::report::REASON_CONFIG;
+    use crate::tools::test_support::NamedMock;
 
     const MODEL_SPEC: &str = "anthropic/claude-sonnet-4-6";
     const SYSTEM_TEXT: &str = "system policy";
@@ -1190,6 +1203,7 @@ mod tests {
     #[test_case(ContextBuiltinState::Disabled, false, ContextBuiltinState::Disabled, Some(CONFIG_DISABLED_REASON); "disabled_reason_kept")]
     #[test_case(ContextBuiltinState::Declared, true, ContextBuiltinState::Declared, None; "declared_definition")]
     #[test_case(ContextBuiltinState::Disabled, true, ContextBuiltinState::Declared, None; "request_overrides_prediction")]
+    #[test_case(ContextBuiltinState::Hosted, false, ContextBuiltinState::Hosted, Some(CONFIG_DISABLED_REASON); "hosted_never_declared")]
     fn builtin_availability_follows_actual_request(
         initial: ContextBuiltinState,
         present: bool,
@@ -1202,6 +1216,7 @@ mod tests {
                 source: String::new(),
                 state: initial,
                 reason: Some(CONFIG_DISABLED_REASON),
+                module: None,
                 tokens: CROWDED_ROW_TOKENS,
                 billed_to: None,
             }],
@@ -1231,6 +1246,52 @@ mod tests {
             } else {
                 CROWDED_ROW_TOKENS
             }
+        );
+    }
+
+    /// A tool reached through a `code` module is never in the request, so it reads as hosted
+    /// rather than as missing from it, unless something really turned it off.
+    #[test_case(&[], ContextBuiltinState::Hosted, None ; "on")]
+    #[test_case(&[EXECUTION_ENVIRONMENT_TOOL_NAME], ContextBuiltinState::Disabled, Some(REASON_CONFIG) ; "disabled_by_config")]
+    fn a_hosted_tool_reads_as_reached_through_its_module(
+        disabled: &[&str],
+        state: ContextBuiltinState,
+        reason: Option<&'static str>,
+    ) {
+        let registry = ToolRegistry::new();
+        registry
+            .register(
+                Arc::new(NamedMock::new(
+                    EXECUTION_ENVIRONMENT_TOOL_NAME,
+                    ToolAudience::all(),
+                )),
+                NamedMock::source(),
+            )
+            .unwrap();
+        let config = AgentConfig {
+            disabled_tools: disabled.iter().map(|tool| (*tool).to_owned()).collect(),
+            ..AgentConfig::default()
+        };
+        let model = model(TEST_WINDOW, false);
+        let filter = ToolFilter::from_config(&config, &model, &[]);
+        let mut inventory = BuiltinToolsInput {
+            registry: &registry,
+            filter: &filter,
+            config: &config,
+            model: &model,
+            session_plan: false,
+            audience: ToolAudience::MAIN,
+        }
+        .inventory(&ProfileToolPolicy::default());
+
+        inventory.apply_request_tokens(&[], 0);
+
+        let [tool] = inventory.tools.as_slice() else {
+            panic!("one tool: {:?}", inventory.tools);
+        };
+        assert_eq!(
+            (tool.state, tool.reason, tool.module, tool.tokens),
+            (state, reason, Some(HOST_MODULE), 0)
         );
     }
 

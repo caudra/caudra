@@ -685,11 +685,11 @@ fn builtin_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>
         labeled_line("In context", token_label(inventory.request_tokens()), theme),
     ];
     for tool in &inventory.tools {
-        // A disabled tool contributes nothing and belongs to `/tools`, which
-        // is about what exists rather than about what the window holds.
+        // A disabled or `code`-hosted tool contributes nothing and belongs to
+        // `/tools`, which is about what exists rather than what the window holds.
         let (glyph, status, status_style) = match tool.state {
             ContextBuiltinState::Declared => ("●", "declared", theme.tool_success),
-            ContextBuiltinState::Disabled => continue,
+            ContextBuiltinState::Hosted | ContextBuiltinState::Disabled => continue,
         };
         let mut spans = vec![
             Span::styled(format!("{glyph} "), status_style),
@@ -1046,6 +1046,7 @@ mod tests {
                             source: "native:workcell".to_owned(),
                             state: ContextBuiltinState::Declared,
                             reason: None,
+                            module: None,
                             tokens: 55,
                             billed_to: None,
                         },
@@ -1054,6 +1055,7 @@ mod tests {
                             source: "native:caudra".to_owned(),
                             state: ContextBuiltinState::Declared,
                             reason: None,
+                            module: None,
                             tokens: 30,
                             billed_to: Some(BILLED_TO),
                         },

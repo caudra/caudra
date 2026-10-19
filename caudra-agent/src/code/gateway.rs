@@ -21,7 +21,9 @@ use super::args::{bind, text};
 use super::decide::DecisionsModule;
 use super::history::HistoryModule;
 use super::hosted::HostedCall;
-use super::module::{AbsentModule, CallFailure, HostCallPlan, HostModule, Prepared, ToolCallPlan};
+use super::module::{
+    AbsentModule, CallFailure, HostCallPlan, HostModule, ModuleDoc, Prepared, ToolCallPlan,
+};
 use super::names::{HELP, STUB_IMPORTS, renamed};
 use super::output::{
     CALL_SOURCE, CodeCall, CodeCallStatus, CodeOutcome, CodeOutput, CodeProgressEvent, HostedResult,
@@ -628,13 +630,23 @@ impl Gateway {
         {
             let doc = module.doc();
             let page = match member {
-                None => doc.module_help(),
-                Some(member) => doc
-                    .member(member)
-                    .map(|member| doc.member_help(member))
-                    .ok_or_else(|| {
+                None => {
+                    self.0
+                        .ctx
+                        .code
+                        .mark_read(doc.read_first().map(|member| doc.qualified(member)));
+                    doc.module_help()
+                }
+                Some(member) => {
+                    let member = doc.member(member).ok_or_else(|| {
                         ScriptError::new(ScriptErrorKind::Value, doc.no_member(member))
-                    })?,
+                    })?;
+                    self.0
+                        .ctx
+                        .code
+                        .mark_read(member.read_first.then(|| doc.qualified(member)));
+                    doc.member_help(member)
+                }
             };
             return Ok(Value::String(match module.unavailable() {
                 Some(reason) => format!("{page}\n\nNot available now: {reason}"),
@@ -652,6 +664,26 @@ impl Gateway {
                     format!("help() knows no topic `{topic}`; call help() for the modules"),
                 )
             })
+    }
+
+    /// A read-first call this agent has not been shown the reference of raises with it instead of
+    /// running, before any row, prompt or spend. It counts as read from then on, so the retry
+    /// runs: the gate guides the model, it does not guard anything.
+    fn unread(&self, doc: &ModuleDoc, call: &ScriptCall) -> Option<ScriptError> {
+        if call.namespace.as_deref() != Some(doc.namespace) {
+            return None;
+        }
+        let member = doc.member(&call.name).filter(|member| member.read_first)?;
+        let qualified = doc.qualified(member);
+        let code = &self.0.ctx.code;
+        if code.has_read(&qualified) {
+            return None;
+        }
+        code.mark_read([qualified]);
+        Some(ScriptError::new(
+            ScriptErrorKind::Runtime,
+            doc.unread(member),
+        ))
     }
 
     fn help_index(&self) -> String {
@@ -814,6 +846,9 @@ impl ScriptHost for Gateway {
                 ScriptErrorKind::Runtime,
                 reason,
             )));
+        }
+        if let Some(refusal) = self.unread(module.doc(), &call) {
+            return ScriptInvocation::Ready(Err(refusal));
         }
         match module.prepare(&self.0.ctx, call) {
             Prepared::Answer(invocation) => invocation,
@@ -1007,7 +1042,7 @@ mod tests {
     use crate::code::CodeSession;
     use crate::code::decide;
     use crate::code::history::{self, UNSAVED};
-    use crate::code::module::{CallRun, MemberDoc, ModuleDoc};
+    use crate::code::module::{CallRun, MemberDoc, UNREAD_NOTE};
     use crate::code::names::HISTORY_MODULE;
     use crate::code::names::{DECIDE_HELPER, DECISIONS_MODULE, RERANK_HELPER, SEARCH_HELPER};
     use crate::code::runner::{ReplState, RunFuture, ScriptOutcome, ScriptRunner, install};
@@ -1920,6 +1955,8 @@ mod tests {
 
     const FAKE_MODULE: &str = "ledger";
     const FAKE_METHOD: &str = "append";
+    const FAKE_READ_FIRST_METHOD: &str = "post";
+    const FAKE_READ_FIRST_PAGE: &str = "Posts the ledger; `amount` is in cents.";
 
     /// A module that plans one call which could change files, and counts the times it ran.
     #[derive(Default)]
@@ -1931,12 +1968,22 @@ mod tests {
         namespace: FAKE_MODULE,
         summary: "",
         page: "",
-        members: &[MemberDoc {
-            name: FAKE_METHOD,
-            signature: "append() -> Any",
-            awaited: true,
-            page: "",
-        }],
+        members: &[
+            MemberDoc {
+                name: FAKE_METHOD,
+                signature: "append() -> Any",
+                awaited: true,
+                read_first: false,
+                page: "",
+            },
+            MemberDoc {
+                name: FAKE_READ_FIRST_METHOD,
+                signature: "post() -> Any",
+                awaited: true,
+                read_first: true,
+                page: FAKE_READ_FIRST_PAGE,
+            },
+        ],
     };
 
     impl HostModule for FakeModule {
@@ -2019,6 +2066,92 @@ mod tests {
             usize::from(expected == Verdict::Ran)
         );
         assert_eq!(gateway.finish().len(), 1);
+    }
+
+    fn read_first_gateway() -> (tempfile::TempDir, Gateway, Arc<AtomicUsize>) {
+        let module = FakeModule::default();
+        let runs = Arc::clone(&module.runs);
+        let (dir, permissions) = permissions(PermissionsConfig::default(), PermissionMode::Yolo);
+        let gateway = Gateway::new(
+            stub_ctx_with_permissions(&AgentMode::Build, permissions),
+            vec![Arc::new(module)],
+        );
+        (dir, gateway, runs)
+    }
+
+    fn call_fake(gateway: &Gateway, method: &str) -> ScriptReply {
+        smol::block_on(invoke(
+            gateway,
+            ScriptCall {
+                namespace: Some(FAKE_MODULE.to_owned()),
+                name: method.to_owned(),
+                args: Vec::new(),
+                kwargs: Map::new(),
+            },
+        ))
+    }
+
+    /// A read-first call made before its reference was shown raises with the reference instead
+    /// of running, leaving no row; the call after it runs.
+    #[test]
+    fn a_read_first_call_raises_with_its_reference_then_runs() {
+        let (_dir, gateway, runs) = read_first_gateway();
+
+        let error = call_fake(&gateway, FAKE_READ_FIRST_METHOD).unwrap_err();
+
+        assert_eq!(error.kind, ScriptErrorKind::Runtime);
+        assert!(
+            error.message.starts_with(&format!(
+                "`{FAKE_MODULE}.{FAKE_READ_FIRST_METHOD}`{UNREAD_NOTE}"
+            )),
+            "{error:?}"
+        );
+        assert!(error.message.ends_with(FAKE_READ_FIRST_PAGE), "{error:?}");
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert!(gateway.finish().is_empty());
+
+        assert_eq!(
+            verdict(&call_fake(&gateway, FAKE_READ_FIRST_METHOD)),
+            Verdict::Ran
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[test_case(Some(FAKE_MODULE) ; "the_module")]
+    #[test_case(Some("ledger.post") ; "the_call")]
+    fn a_read_first_call_runs_at_once_after_its_help(topic: Option<&str>) {
+        let (_dir, gateway, runs) = read_first_gateway();
+
+        let page = help(&gateway, topic).unwrap();
+
+        assert!(
+            page.as_str().unwrap().contains(FAKE_READ_FIRST_PAGE),
+            "{page}"
+        );
+        assert_eq!(
+            verdict(&call_fake(&gateway, FAKE_READ_FIRST_METHOD)),
+            Verdict::Ran
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_call_not_marked_read_first_never_waits_for_help() {
+        let (_dir, gateway, runs) = read_first_gateway();
+
+        assert_eq!(verdict(&call_fake(&gateway, FAKE_METHOD)), Verdict::Ran);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// Once the context lost the reference, as a compaction drops it, the next call asks again.
+    #[test]
+    fn forgetting_references_gates_a_read_first_call_again() {
+        let (_dir, gateway, _) = read_first_gateway();
+        help(&gateway, Some(FAKE_MODULE)).unwrap();
+
+        gateway.0.ctx.code.forget_references();
+
+        assert!(call_fake(&gateway, FAKE_READ_FIRST_METHOD).is_err());
     }
 
     const HISTORY_READ: &str = "history.read";

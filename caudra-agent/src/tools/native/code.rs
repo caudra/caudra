@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::code::module::ModuleDoc;
 use crate::code::{MODULE_DOCS, gateway};
 use crate::tools::registry::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolEffect, ToolExecResult,
@@ -22,13 +23,18 @@ const SNIPPETS: &str = "Run Python in an isolated interpreter: compute, reshape 
 - A snippet is module code, not a function body: its last expression is the result, returned with anything printed. Do not use `return` at top level. Top-level `await` works. Filter and summarise in the snippet, and return only what you need.
 - Variables persist between runs; `reset: true` starts empty.";
 const MODULES: &str = "- Modules are namespaces of calls that reach beyond the interpreter; `await` each call unless its help says otherwise:";
-const HELP: &str = "- `help()` lists the modules and what this session can reach now; `help(\"history\")` shows a module's calls, `help(\"history.search\")` one call's full reference, `help(\"github\")` an MCP server's tools. Read a call's help before using it the first time.";
+const HELP: &str = "- `help()` lists the modules and what this session can reach now; `help(\"history\")` shows a module's calls, `help(\"history.search\")` one call's full reference, `help(\"github\")` an MCP server's tools. A call a module line says to read `help` for first raises with its reference instead of running until this agent has read it; then call it again.";
+const READ_FIRST_LEAD: &str = " Before the first ";
+const READ_FIRST_JOIN: &str = " or ";
+const READ_FIRST_HELP: &str = ", read ";
 const FAILURES: &str = "- A failed call raises `RuntimeError` and a refused one `PermissionError`; catch them to carry on. Calls that ran before a failure keep their effects.";
 const SANDBOX: &str = "- The interpreter runs a Python subset: no filesystem, network, subprocesses, class inheritance or third-party packages. Its modules are `asyncio`, `base64`, `binascii`, `bisect`, `collections`, `copy`, `csv`, `dataclasses`, `datetime`, `functools`, `hashlib`, `itertools`, `json`, `math`, `os`, `pathlib`, `posixpath`, `random`, `re`, `sys`, `time`, `tomllib`, `typing` and `unicodedata`. `os.path` supports POSIX path manipulation, not host access. Clocks read the host clock in UTC, and `time.sleep` or `await asyncio.sleep` wait for real within `timeoutSec`; prefer `asyncio.sleep` beside gathered calls, and seed `random` explicitly. `match`, list slice assignment, set subset ordering, dataclass fields/factories and `__post_init__`, arithmetic/subscript/call dunders, and `re.split` capture groups work. Type checking can reject `map`, `filter`, `getattr`, `setattr`, `hasattr` and `format`; use comprehensions and f-strings.";
 /// The description in reading order: each module's one-line summary, then how to load the rest.
 /// Nothing here depends on what the session connects, so the tool array stays cache-stable.
 pub static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
-    let modules = MODULE_DOCS.iter().map(|doc| format!("  - {}", doc.summary));
+    let modules = MODULE_DOCS
+        .iter()
+        .map(|doc| format!("  - {}{}", doc.summary, read_first_note(doc)));
     [SNIPPETS.to_owned(), MODULES.to_owned()]
         .into_iter()
         .chain(modules)
@@ -36,6 +42,23 @@ pub static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
         .collect::<Vec<_>>()
         .join("\n")
 });
+/// ` Before the first `image.generate`, read `help("image")`.`: what a module line adds when some
+/// of its calls need their reference first, which `help("<module>")` shows in full.
+fn read_first_note(doc: &ModuleDoc) -> String {
+    let calls: Vec<String> = doc
+        .read_first()
+        .map(|member| format!("`{}`", doc.qualified(member)))
+        .collect();
+    match calls.is_empty() {
+        true => String::new(),
+        false => format!(
+            "{READ_FIRST_LEAD}{}{READ_FIRST_HELP}`help(\"{}\")`.",
+            calls.join(READ_FIRST_JOIN),
+            doc.namespace
+        ),
+    }
+}
+
 static PERMISSION_CONTRACT: LazyLock<String> =
     LazyLock::new(|| super::permission_contract(&CodeTool, ToolEffect::Orchestrator, &DESCRIPTION));
 
@@ -218,6 +241,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Exactly the calls whose reference must be read first are named in the description, which
+    /// says to read their module's help.
+    #[test]
+    fn the_description_names_the_calls_to_read_help_for_first() {
+        let marked: Vec<String> = MODULE_DOCS
+            .iter()
+            .flat_map(|doc| doc.read_first().map(|member| doc.qualified(member)))
+            .collect();
+
+        assert_eq!(
+            marked,
+            [
+                "history.search",
+                "history.read",
+                "image.generate",
+                "workflow.start"
+            ]
+        );
+        for line in [
+            "Before the first `history.search` or `history.read`, read `help(\"history\")`.",
+            "Before the first `image.generate`, read `help(\"image\")`.",
+            "Before the first `workflow.start`, read `help(\"workflow\")`.",
+        ] {
+            assert!(DESCRIPTION.contains(line), "{line}");
+        }
+        assert_eq!(DESCRIPTION.matches(READ_FIRST_LEAD).count(), 3);
     }
 
     #[test_case(json!(null), Some(DEFAULT_TIMEOUT_SECS) ; "null_means_omitted")]

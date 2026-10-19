@@ -256,6 +256,31 @@ mod tests {
         }
     }
 
+    /// Only the calls whose arguments are easy to get wrong wait for their reference, and a
+    /// module's page carries the whole reference of each, so reading the module reads them.
+    #[test]
+    fn only_calls_easy_to_get_wrong_are_read_first() {
+        let read_first: Vec<String> = MODULE_DOCS
+            .iter()
+            .flat_map(|doc| doc.read_first().map(|member| doc.qualified(member)))
+            .collect();
+        assert_eq!(
+            read_first,
+            [
+                "history.search",
+                "history.read",
+                "image.generate",
+                "workflow.start"
+            ]
+        );
+        for doc in MODULE_DOCS {
+            let help = doc.module_help();
+            for member in doc.read_first() {
+                assert!(help.contains(member.page), "{}", doc.qualified(member));
+            }
+        }
+    }
+
     #[test]
     fn an_old_global_names_its_replacement() {
         assert_eq!(

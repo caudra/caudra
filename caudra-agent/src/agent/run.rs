@@ -4063,6 +4063,7 @@ impl<'h> Agent<'h> {
         self.measured = None;
         self.rollback_len = self.history.len();
         steering::lock(&self.steering).reset_patterns();
+        self.code.forget_references();
         self.recent_calls =
             RecentCalls::with_threshold(steering::lock(&self.steering).repeat_threshold());
         self.event_tx.send(AgentEvent::CompactionDone)?;

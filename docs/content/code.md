@@ -45,6 +45,8 @@ help("github")            # an MCP server's tools and their signatures
 
 A module the session cannot reach still exists, so a snippet reads the same everywhere. Its calls raise `RuntimeError` with the fix, such as signing in or enabling a tool group, and `help()` lists the same reason.
 
+Four calls take arguments that are easy to get wrong, so their reference comes first: `history.search`, `history.read`, `image.generate`, and `workflow.start`. The `code` description marks them. The first such call in a conversation does not run. It raises `RuntimeError` carrying that call's full reference, with no transcript row, prompt, or spend, and the same call made again runs. Reading `help` for the call or its module first lets the first call run at once. After a compaction, or in a resumed or forked session, the next call asks again, because the reference is no longer in the context. A subagent keeps its own record. Every other call runs without it.
+
 ## Run time
 
 A run stops after `timeoutSec` seconds, 120 by default and at most 3600, counted on the wall clock across computation, waits, and calls. The model raises it for a snippet that polls. A run that times out keeps the rows of the calls it made and the variables from before it ran. What it printed and assigned is lost, and the model reads that it ran past `timeoutSec`.
