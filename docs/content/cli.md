@@ -394,7 +394,7 @@ Output reports the database path, retried, repaired, recovered, and unavailable 
 
 Before applying, stop every Caudra session and close all storage readers using this database, including old Caudra versions and sessions in other projects. Run `caudra storage path` with the production binary to locate its database, and check the repair report's database path. Apply requires exclusive administrative access and rechecks the stored metadata before committing the replacements atomically.
 
-When there are reviews to repair, apply automatically creates an owner-only, checked SQLite backup beside the database, named `caudra.db.permission-review-<ID>.bak`. Human output prints its exact path after `SQLite backup:`. JSON output reports it in `backup`. A no-op apply creates no backup. Keep the backup private because it contains the full database, including the old metadata, session history, messages, and decision records.
+When there are reviews to repair, apply automatically creates an owner-only, checked SQLite backup in the `backups/` directory beside the database, named `caudra.db.permission-review-<ID>.bak`. Human output prints its exact path after `SQLite backup:`. JSON output reports it in `backup`. A no-op apply creates no backup. Keep the backup private because it contains the full database, including the old metadata, session history, messages, and decision records.
 
 After a successful apply, restart Caudra with the updated version and inspect `/permissions` or `caudra permissions inventory` against the same database. A failed access check requires closing the remaining readers and rerunning the dry run before applying again. No permission re-approval is needed for a metadata-only repair.
 
@@ -609,13 +609,17 @@ caudra config files                           # every config file, where it live
 caudra config example                         # every caudra.toml setting, commented out
 caudra config example mcp                     # every mcp.toml key, commented out
 caudra config example > caudra.example.toml   # keep a copy to read or diff
+caudra config migrate                         # upgrade the global config files to this release's format
+caudra config migrate --project --dry-run     # show what upgrading the project files too would change
 ```
 
 `files` lists every file Caudra reads settings from. For each one it shows what the file holds, the experimental switch it needs, each global and project path with whether the file is there, its docs page, and its `example` command. It follows `CAUDRA_NAMESPACE` and debug builds, and it creates nothing.
 
 `example` prints every setting of one TOML file with its type, default, allowed range, environment variable, and description. FILE names one of the TOML files that `caudra config files` lists, with or without `.toml`, and defaults to `caudra`. Everything is commented out apart from `version` and the table headers a file needs, so the whole output is a valid file that changes nothing. To use a setting, copy its line into your file under the same table and remove the `#`. For a record such as `[mcp.NAME]`, copy the header too and put your own name in it.
 
-Neither command needs your settings, so both work even when `caudra.toml` has an error. [Reference configs](/docs/reference-configs/) shows what `example` prints for every TOML file, with a download for each. See [Config files](/docs/configuration/#config-files).
+`migrate` upgrades each global config file that is behind this release's format, after it saves a backup, and `--project` adds the files in the current directory's `.caudra/`. It prints each change and where the backup is. While another Caudra process is running it writes nothing, lists the open sessions, and exits with an error. `--dry-run` prints each change with a diff, writes nothing, and works while sessions are open. Caudra upgrades global files at startup on its own, so `migrate` is for project files and for upgrading global files without starting a session. See [Config file versions](/docs/configuration/#config-file-versions).
+
+None of these commands needs your settings, so they work even when `caudra.toml` has an error. [Reference configs](/docs/reference-configs/) shows what `example` prints for every TOML file, with a download for each. See [Config files](/docs/configuration/#config-files).
 
 ### `caudra logs`
 

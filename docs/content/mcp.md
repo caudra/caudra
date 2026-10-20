@@ -69,7 +69,7 @@ Set `command` for stdio, `url` for HTTP. Pick one.
 
 The file starts with `version = 2`. A file without it counts as version 1, which Caudra upgrades as it reads it. When the version is newer than this build reads, no server in the file starts and Caudra shows the error. See [Config file versions](/docs/configuration/#config-file-versions).
 
-Earlier versions read a top-level `defer_tools` key and a per-server `always_load` key. MCP tools now load nothing up front (see [Code mode](#code-mode)), so a file that still sets either key fails to load until you delete it.
+Earlier versions read a top-level `defer_tools` key and a per-server `always_load` key. MCP tools now load nothing up front (see [Code mode](#code-mode)), so the upgrade to version 2 comments out either key.
 
 ## Code mode
 

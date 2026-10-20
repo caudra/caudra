@@ -11,7 +11,9 @@ pub(crate) const FIRST_VERSION: u32 = 1;
 pub enum ConfigVersionError {
     #[error("`{key}` must be a positive integer", key = CONFIG_VERSION_KEY)]
     Invalid,
-    #[error("version {found} needs a newer Caudra: this build reads up to version {latest}")]
+    #[error(
+        "version {found} needs a newer Caudra: this build reads up to version {latest}. To keep using this build, restore the file's copy from backups/config/ in Caudra's state directory"
+    )]
     Newer { found: i64, latest: u32 },
     #[error(
         "`{key}` is missing: add `{key} = {latest}` at the top of the file",

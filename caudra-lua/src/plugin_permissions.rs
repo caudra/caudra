@@ -7,7 +7,7 @@ use tracing::warn;
 
 const MANIFEST_FILE: &str = "plugin.toml";
 const MANIFEST_VERSION: u32 = 1;
-const MANIFEST_FORMAT: ConfigFormat = ConfigFormat {
+pub const MANIFEST_FORMAT: ConfigFormat = ConfigFormat {
     file: MANIFEST_FILE,
     latest: MANIFEST_VERSION,
     steps: &[],

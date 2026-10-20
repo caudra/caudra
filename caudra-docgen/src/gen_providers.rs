@@ -278,7 +278,7 @@ supports_thinking = true
 supports_vision = false
 ```
 
-The file can start with `version = 1`, and a file without it counts as version 1. Caudra writes the key whenever it saves the file. A newer version stops Caudra with an error rather than being misread. Because `version` belongs to the file, a custom provider cannot use it as a name. See [Config file versions](/docs/configuration/#config-file-versions).
+The file starts with `version = 1`. A file without it counts as version 1, and Caudra adds the key when it saves or upgrades the file. A newer version stops Caudra with an error rather than being misread. Because `version` belongs to the file, a custom provider cannot use it as a name. See [Config file versions](/docs/configuration/#config-file-versions).
 
 {reference}
 

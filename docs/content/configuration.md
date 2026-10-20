@@ -69,7 +69,7 @@ timeout_secs = 180
 max_file_size_mb = 4
 ```
 
-All fields are optional. A file may start with `version = 2`, and a file without it counts as version 2. Typos in field names and values of the wrong type cause an error right away, with the file and line.
+All fields are optional. A file starts with `version = 2`, and Caudra upgrades one without it, see [Config file versions](#config-file-versions). Typos in field names and values of the wrong type cause an error right away, with the file and line.
 
 For every setting in one file, with its type, default, and description, see [Reference configs](/docs/reference-configs/#caudra-toml) or run [`caudra config example`](/docs/cli/#caudra-config).
 
@@ -708,7 +708,7 @@ Inside a Herdr pane, `auto` asks Herdr to create and remove worktrees, so each o
 
 The `[decisions]` table holds the settings every decision endpoint shares: deadlines, logging, features, and thresholds. The endpoints themselves are `[decisions.<name>]` tables in the global `providers.toml`, and the engine runs only while one of them is active. `caudra auth login --decision` adds one and makes it active. See [Decision endpoints](/docs/providers/#decision-endpoints). With no active endpoint, Caudra still validates this table. It starts no engine, sends no decision requests, reads no engine credentials, and leaves decision logs and shell duration history untouched. No passive feature or decision logging is enabled by default. Explicit workflow [`decide()` calls](/docs/workflows/#typed-decisions) and the MCP [`decide()` and `rerank()` helpers](/docs/mcp/#decisions-and-reranking) need an active endpoint but no passive feature. Shell duration history works without an endpoint.
 
-These settings are global-only. Projects may set individual features to `"off"`, set `log = false`, or keep or shorten inherited log retention. Other project overrides are errors, even when they repeat a global value. Disabling globally required Auto screening or its active content screening restores prompting for eligible Auto calls. `base_url`, `protocol`, `model`, `api_key_env`, `allow_remote`, and `allow_http` are not accepted here. The error for each one shows the `providers.toml` table that replaces it.
+These settings are global-only. Projects may set individual features to `"off"`, set `log = false`, or keep or shorten inherited log retention. Other project overrides are errors, even when they repeat a global value. Disabling globally required Auto screening or its active content screening restores prompting for eligible Auto calls. `base_url`, `protocol`, `model`, `api_key_env`, and `allow_http` are not accepted here. The error for each one shows the `providers.toml` table that replaces it. The [upgrade](#config-file-versions) comments out `allow_remote`, because configuring an endpoint is now the consent to send decision context to it.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -887,7 +887,7 @@ Caudra follows platform directory conventions. On Linux and macOS that is XDG. O
 | Cache | `~/.cache/caudra/` | `%LOCALAPPDATA%\caudra\` |
 | Scratch | `$TMPDIR/caudra/` | `%TEMP%\caudra\` |
 
-Config holds `caudra.toml`, `permissions.toml`, `mcp.toml`, `providers.toml`, `workcell.toml`, `sandboxes.toml`, `init.lua`, `.env` and `commands/`. State holds sessions, auth tokens, memories, plans, model-job bindings, sandbox lifecycle records and transfer recovery journals. The install script puts the binary under `%LOCALAPPDATA%\caudra` on Windows; that is separate from these runtime dirs.
+Config holds `caudra.toml`, `permissions.toml`, `mcp.toml`, `providers.toml`, `workcell.toml`, `sandboxes.toml`, `init.lua`, `.env` and `commands/`. State holds sessions, auth tokens, memories, plans, model-job bindings, sandbox lifecycle records, transfer recovery journals, and the [backups](#backups) Caudra saves before it upgrades a file. The install script puts the binary under `%LOCALAPPDATA%\caudra` on Windows; that is separate from these runtime dirs.
 
 Scratch holds work that belongs outside your project, such as a file the model writes while thinking or a temporary a command leaves behind. Each project gets its own subdirectory, named by the project directory plus a three-word phrase derived from its path, as in `caudra-heroic-easy-grouse`. Two checkouts sharing a name get different phrases, so they cannot overwrite each other. The phrase is derived rather than drawn at random, so a project returns to the same directory on every run. Caudra creates it at startup and points `TMPDIR`, `TMP`, and `TEMP` at it, so every command Caudra runs puts its own temporary files there instead of the shared temp root. The model is told the path, and writing anywhere under the scratch root needs no approval. Paths beside the root still ask.
 
@@ -901,19 +901,86 @@ Set `CAUDRA_NAMESPACE` to choose the directory name yourself instead of letting 
 
 ## Config file versions
 
-Each TOML config file takes a top-level `version`. Where the key is optional, a file without it counts as version 1. A build that finds a newer version than it reads refuses the file instead of guessing what it means. For a file with an optional key, the error says the file needs a newer Caudra.
+Each TOML config file starts with a top-level `version`, the version of its format. A file without the key predates versioning, so Caudra reads it as version 1 and adds the key when it upgrades the file. `workcell.toml` and `sandboxes.toml` always required the key and reject a file without it. A build that finds a newer version than it reads refuses the file instead of guessing what it means, with an error that says the file needs a newer Caudra and where its backup is.
 
-| File | `version` | Newer than this build reads |
-|------|-----------|-----------------------------|
-| `caudra.toml` | Optional | Caudra stops with an error |
-| `permissions.toml` | Optional | Fails closed. Tool calls are denied until the file is fixed |
-| `mcp.toml` | Optional | Servers from that file do not start, and Caudra shows the error |
-| `providers.toml` | Optional | Caudra stops with an error |
-| `plugin.toml` | Optional | Every permission of that plugin is denied |
-| `workcell.toml` | Required | Rejected with an error |
-| `sandboxes.toml` | Required | Rejected with an error |
+| File | Version | Without `version` | Newer than this build reads |
+|------|---------|-------------------|-----------------------------|
+| `caudra.toml` | 2 | Read as version 1 | Caudra stops with an error |
+| `permissions.toml` | 2 | Read as version 1 | Fails closed. Tool calls are denied until the file is fixed |
+| `mcp.toml` | 2 | Read as version 1 | Servers from that file do not start, and Caudra shows the error |
+| `providers.toml` | 1 | Read as version 1 | Caudra stops with an error |
+| `plugin.toml` | 1 | Read as version 1 | Every permission of that plugin is denied |
+| `workcell.toml` | 1 | Rejected | Rejected with an error |
+| `sandboxes.toml` | 1 | Rejected | Rejected with an error |
 
-Caudra writes `version = 1` whenever it saves `providers.toml`. `init.lua`, which runs only with Lua plugins turned on, has no version because it is a script. To share one `init.lua` across releases, branch on [`caudra.version()`](/docs/lua-api/#caudra-version).
+When a release changes a format, it raises the version and Caudra upgrades older files as it reads them. A renamed key or tool name gets its new name, and a removed key is commented out rather than deleted. If an old key and its new name are both set, or the upgraded file would not load, Caudra leaves the file unchanged and shows the error.
+
+`init.lua`, which runs only with Lua plugins turned on, has no version because it is a script. To share one `init.lua` across releases, branch on [`caudra.version()`](/docs/lua-api/#caudra-version).
+
+### Global and project files
+
+At startup, Caudra rewrites each global file that is behind its format, after it saves a [backup](#backups). It does this only while no other Caudra process is running, because an older Caudra that is still open would refuse the upgraded file the next time it reloads it. While another session is open, Caudra reads the file upgraded in memory and leaves it unchanged on disk. A notice names the open sessions, and the next start tries again. Until then, saving to that file from inside Caudra fails with an error that says how to finish the upgrade. That covers `/env`, switching a feature in `/decisions`, turning a server on or off in `/mcp`, saving a key in `/login`, and the `/sandbox` manager.
+
+Caudra never rewrites the files in a project's `.caudra/` directory on its own, because they are usually committed and your teammates may run an older Caudra. It reads them upgraded in memory and shows a notice that names the command to update them.
+
+`caudra config migrate` upgrades the global files on demand, and `--project` adds the project files of the current directory. It prints what changed in each file and where the backup is. While another Caudra process is running it writes nothing, lists the open sessions, and exits with an error. `--dry-run` prints each change with a diff and writes nothing, so it works while sessions are open. After `--project`, teammates need the same Caudra release or a newer one to read the files.
+
+### Upgrade notes
+
+Every line the upgrade changes gets a comment above it with the Caudra release, the date, what changed, and why. The comments you wrote on that line stay below a lone `#`. A removed key stays as a commented-out line. For example, this file:
+
+```toml
+# My settings
+
+[ui.tool_output_lines]
+# keep code output short
+python_execution = 40
+
+[agent]
+defer_builtin_tools = true
+```
+
+reads like this after the upgrade:
+
+```toml
+# My settings
+
+# Added by Caudra 0.2.0-preview.12 on 2026-10-20: the format version of this file, which Caudra now requires.
+version = 2
+
+[ui.tool_output_lines]
+# Upgraded by Caudra 0.2.0-preview.12 on 2026-10-20: renamed `ui.tool_output_lines.python_execution` to `code`, because the `code` tool now runs plain computation.
+#
+# keep code output short
+code = 40
+
+[agent]
+# Upgraded by Caudra 0.2.0-preview.12 on 2026-10-20: retired `agent.defer_builtin_tools`, because the tools it deferred are now `code` modules (`image`, `host`, `workflow`, `automation`).
+# defer_builtin_tools = true
+```
+
+### Backups
+
+Before Caudra rewrites a file, it copies the original byte for byte into `backups/` in the [state directory](#directory-layout). Backups are owner-only, and Caudra never deletes them. The time in a name is UTC, so a later upgrade never overwrites an earlier backup.
+
+| Backup | Path under `backups/` |
+|--------|-----------------------|
+| A global config file | `config/global/<file>.v<from>.<YYYYMMDDTHHMMSSZ>.bak` |
+| A project config file | `config/projects/<project-id>/<file>.v<from>.<YYYYMMDDTHHMMSSZ>.bak` |
+| `caudra.db` before a schema upgrade | `caudra.db.v<from>.bak` |
+| `caudra.db` before `caudra permissions repair-review --apply` | `caudra.db.permission-review-<ID>.bak` |
+
+`<from>` is the version the file had, and `<project-id>` is the same id as in the project's state directory. Database backups that earlier releases made stay beside `caudra.db`.
+
+### Rolling back
+
+An older Caudra cannot read a file at a newer version. To go back to an older release, copy the backup over the file, for example:
+
+```bash
+cp ~/.local/state/caudra/backups/config/global/caudra.toml.v1.20261020T101500Z.bak ~/.config/caudra/caudra.toml
+```
+
+`caudra rollback` restores only the previous binary. The restored file loses any change made after the upgrade. The next time a newer Caudra starts with no other session open, it upgrades the file again.
 
 ## Personal Instructions
 
